@@ -1712,16 +1712,23 @@ class ModelRunner:
                 raise RuntimeError(
                     "PAGE-backed state checkpoints require a PAGE sub-pool"
                 )
+            slot_bytes = int(plan.entry_bytes[STATE_SLOT_CLASS])
+            # None means the backend has not narrowed its image: carry it all.
+            narrowed = self.attn_metadata_builder.checkpoint_image_bytes()
             checkpoint_spec = PagedStateCheckpointSpec(
                 page_unit_bytes=int(plan.entry_bytes[plan.paged_class]),
-                slot_bytes=int(plan.entry_bytes[STATE_SLOT_CLASS]),
+                slot_bytes=slot_bytes,
+                image_bytes=slot_bytes if narrowed is None else int(narrowed),
                 layout_id=transfer.paged_layout_id,
             )
             logger.info(
                 "PAGE-backed state checkpoints enabled: unit_bytes=%d, "
-                "slot_bytes=%d, units_per_checkpoint=%d, layout=%s",
+                "slot_bytes=%d, image_bytes=%d (%.1f%% of a slot), "
+                "units_per_checkpoint=%d, layout=%s",
                 checkpoint_spec.page_unit_bytes,
                 checkpoint_spec.slot_bytes,
+                checkpoint_spec.image_bytes,
+                100.0 * checkpoint_spec.image_bytes / checkpoint_spec.slot_bytes,
                 checkpoint_spec.units_per_checkpoint,
                 checkpoint_spec.layout_id,
             )
@@ -1876,6 +1883,10 @@ class ModelRunner:
         )
         for name, value in per_req_state.items():
             setattr(self, name, value)
+        # The pools are reachable through `self` only now, which is the
+        # earliest the builder can touch its own addresses — and the last
+        # moment before a request could.
+        self.attn_metadata_builder.warmup_per_req_cache()
 
         # Build KVCacheConfig
         # lirong TODO: This is a simple solution to build KVCacheConfig,

@@ -374,6 +374,7 @@ class LLMEngine:
                 "checkpoints_dropped",
                 "checkpoints_evicted",
                 "demands_recorded",
+                "demands_declined_no_room",
                 "chunks_cut_for_demand",
             )
         }
@@ -451,6 +452,7 @@ class LLMEngine:
             "checkpoints_evicted",
             "checkpoints_orphaned",
             "demands_recorded",
+            "demands_declined_no_room",
             "chunks_cut_for_demand",
         )
         cache_totals = {

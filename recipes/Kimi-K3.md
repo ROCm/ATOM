@@ -44,13 +44,15 @@ Prefix caching remains disabled because the KDA recurrent state is maintained pe
 
 Start the server as above, then run the full 1319-question GSM8K evaluation:
 
+
 ```bash
-lm_eval \
-  --model local-completions \
-  --model_args "model=Kimi-K3,base_url=http://localhost:8000/v1/completions,num_concurrent=64,max_retries=3,tokenized_requests=False,trust_remote_code=True" \
-  --tasks gsm8k \
-  --num_fewshot 5 \
-  --seed 42
+# download inferenceX gsm8k yaml from https://github.com/SemiAnalysisAI/InferenceX/blob/main/utils/evals/gsm8k.yaml
+
+lm_eval --model local-chat-completions \
+  --apply_chat_template \
+  --tasks /path-to-gsm8k-yaml \
+  --model_args "model=${MODEL},base_url=http://localhost:8000/v1/chat/completions,api_key=EMPTY,eos_string=</s>,max_retries=5,num_concurrent=10,timeout=1800,tokenized_requests=False,max_length=16384" \
+  --gen_kwargs max_tokens=12288,temperature=0,top_p=1
 ```
 
 Validated true-MLA result range on gfx950 TP8:
@@ -58,8 +60,8 @@ Validated true-MLA result range on gfx950 TP8:
 ```text
 | Filter           | Minimum | Maximum |
 |------------------|--------:|--------:|
-| flexible-extract |  0.9538 |  0.9591 |
-| strict-match     |  0.9538 |  0.9591 |
+| flexible-extract |  0.9659 |  0.9591 |
+| strict-match     |  0.9666 |  0.9591 |
 ```
 
 Run on an uncontended GPU set and verify the evaluation completes without server disconnects or worker failures.

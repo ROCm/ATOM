@@ -13,6 +13,7 @@ import zmq
 
 from atom.config import Config, ParallelConfig
 from atom.kv_transfer.disaggregation import KVOutputAggregator
+from atom.kv_transfer.disaggregation.types import connector_metadata_has_work
 from atom.model_engine.async_proc import AsyncIOProcManager
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import EngineUtilityHandler
@@ -369,7 +370,7 @@ class EngineCore:
         if connector is None or not getattr(connector, "is_offload", False):
             return
         meta = connector.build_connector_meta()
-        if meta is None or not getattr(meta, "requests", None):
+        if not connector_metadata_has_work(meta):
             return
         self.runner_mgr.call_func("process_kvconnector_output", meta)
 

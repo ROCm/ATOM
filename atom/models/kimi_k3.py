@@ -1109,6 +1109,18 @@ class KimiKDAAttention(nn.Module):
 
         conv_weights = self.conv_weight
         state_indices = kda_metadata.non_spec_state_indices_tensor
+        # Slot the incoming state is READ from. It differs from the write slot
+        # for exactly one forward: the prefix-cache hit that forks off a
+        # checkpoint (BlockManager._attach_state_group reads `state_fork_src`
+        # and writes a freshly popped group). Reading the write slot there
+        # resumes from whatever the recycled group still held. Only prefill can
+        # carry a fork -- prepare_state_indices asserts it, and min_fork_tokens
+        # keeps the chunk long enough -- so the decode branches below stay on
+        # `state_indices`. Falling back to the write slot leaves every non-fork
+        # forward bit-identical. Mirrors attention_gdn.py.
+        state_indices_in = kda_metadata.non_spec_state_indices_in_tensor
+        if state_indices_in is None:
+            state_indices_in = state_indices
         query_start_loc = kda_metadata.non_spec_query_start_loc
 
         if kda_metadata.num_prefills > 0:
@@ -1120,6 +1132,7 @@ class KimiKDAAttention(nn.Module):
                 conv_states=conv_state,
                 has_initial_state=kda_metadata.has_initial_state,
                 cache_indices=state_indices,
+                cache_indices_in=state_indices_in,
                 query_start_loc=query_start_loc,
                 k_dim_size=self.local_proj_size,
                 v_dim_size=self.local_proj_size,
@@ -1134,7 +1147,7 @@ class KimiKDAAttention(nn.Module):
             from atom.model_ops.kimi_k3 import gather_kda_initial_state
 
             initial = gather_kda_initial_state(
-                ssm_state, state_indices, kda_metadata.has_initial_state
+                ssm_state, state_indices_in, kda_metadata.has_initial_state
             )
             kda_out, last_state = self._run_kda(
                 q,

@@ -70,10 +70,16 @@ from atom.model_ops.attentions.backends import (
     AttentionMetadataBuilder,
     CommonAttentionBuilder,
 )
+from atom.model_ops.attentions.paged_state_copy import (
+    SegmentedCopyPlan,
+    launch_copy_descriptor,
+    plan_segmented_copy,
+)
 from atom.model_ops.attentions.state_arena import (
     SplitStateArena,
     StateArena,
     StateField,
+    checkpoint_ranges_for,
     plan_field_planes,
     plan_regions,
 )
@@ -89,6 +95,7 @@ from atom.model_ops.attentions.v4_pool_geometry import (
     HCA_RATIO,
     UnifiedPoolGeometry,
     WindowParams,
+    merge_abutting,
 )
 from atom.model_ops.v4_kernels import (
     FP4_MQA_BLOCK_K,
@@ -109,6 +116,14 @@ from atom.utils.forward_context import (
 )
 
 logger = logging.getLogger("atom")
+
+
+def _uses_pd_staging(kv_transfer_config: dict | None) -> bool:
+    """Whether this transfer topology needs compressor-only P/D staging."""
+
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+    return KVConnectorFactory.topology_uses_pd_staging(kv_transfer_config)
 
 
 # AF_PIECEWISE: attn-core capture/replay (keyed layer, bucket_bs, q_eff, nt_pad).
@@ -691,8 +706,18 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         self._alloc_v4_metadata_buffers()
 
         self._ubatch_decode_meta: list | None = None
-        # Filled on the first checkpoint copy — the pools do not exist yet here.
+        # Filled on the first checkpoint copy — the pools do not exist yet
+        # here. Four of the five hold raw addresses read out of the pool
+        # tensors, so a re-carve invalidates them all; that is what
+        # `_invalidate_pool_caches` is for, and `allocate_per_req_cache`
+        # calls it.
         self._slot_view_cache: list[list[torch.Tensor]] | None = None
+        self._checkpoint_range_cache: list[list[tuple[int, int]]] | None = None
+        self._page_unit_region_cache: tuple[np.ndarray, np.ndarray] | None = None
+        self._page_unit_region_owners: tuple[int, ...] = ()
+        self._checkpoint_plan_cache: SegmentedCopyPlan | None = None
+        self._checkpoint_slot_base_cache: np.ndarray | None = None
+        self._checkpoint_descriptor: CpuGpuBuffer | None = None
 
     @property
     def prep_stream(self):
@@ -833,8 +858,28 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             StateField("csa_main_score", n_csa, self.csa_main_state_shape, dt, neg_inf),
             StateField("csa_idx_kv", n_csa, self.csa_idx_state_shape, dt),
             StateField("csa_idx_score", n_csa, self.csa_idx_state_shape, dt, neg_inf),
-            StateField("hca_main_kv", n_hca, self.hca_main_state_shape, dt),
-            StateField("hca_main_score", n_hca, self.hca_main_state_shape, dt, neg_inf),
+            # HCA owes a checkpoint nothing. It pools `ratio` tokens with no
+            # overlap, so the first compression at or after a boundary P
+            # covers `[P, P + 128)` — every row of it written by the very
+            # forward that reads it — and a checkpoint sits on a multiple of
+            # `hash_block_size`, which `_assert_ratios_divide_the_alignment` keeps a
+            # multiple of 128. The rows past `K_pool` are speculative
+            # rollback slack and are never read at all.
+            StateField(
+                "hca_main_kv",
+                n_hca,
+                self.hca_main_state_shape,
+                dt,
+                in_checkpoint=False,
+            ),
+            StateField(
+                "hca_main_score",
+                n_hca,
+                self.hca_main_state_shape,
+                dt,
+                neg_inf,
+                in_checkpoint=False,
+            ),
         ]
         if self._field_window_dtype is not None:
             fields.append(
@@ -854,8 +899,15 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
     def state_transfer(self) -> StateTransfer:
         """Declare PAGE-copy checkpoints with the versioned DSV4 layout."""
         ratios = ",".join(str(r) for r in self._geometry_ratios())
+        nocopy = ",".join(f.name for f in self._state_fields() if not f.in_checkpoint)
         layout_id = (
-            "dsv4-paged-state-v1"
+            # v2: an image holds part of a slot, not all of it. Two workers
+            # disagreeing about which part would read one image at two
+            # layouts, so `nocopy` names the rule and the version fences it.
+            # v3: it also drops the entry's interleave padding, so the image
+            # is no longer a subsequence of the slot's rows and a v2 reader
+            # would gather every window row shifted.
+            "dsv4-paged-state-v3"
             f":block={self.block_size}:ring={self.win_with_spec}"
             f":dims={self.head_dim},{self.rope_head_dim},{self.index_head_dim}"
             f":state={self.csa_main_state_shape},{self.csa_idx_state_shape},"
@@ -863,6 +915,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             f":main={'fp8-2buff' if self._kv_fp8 else 'bf16'}"
             f":index={'fp4' if self._indexer_fp4 else 'fp8'}"
             f":ratios={ratios}"
+            f":nocopy={nocopy}"
+            ":entry=packed"
         )
         return StateTransfer.copy(layout_id)
 
@@ -881,25 +935,45 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         store_ops: Sequence[CheckpointStoreOp],
         restore_ops: Sequence[CheckpointRestoreOp],
     ) -> None:
-        """Copy raw checkpoint bytes between slots and non-contiguous PAGEs."""
-        from atom.model_ops.attentions.paged_state_copy import (
-            launch_copy_spans,
-            plan_segmented_copy,
-        )
+        """Copy raw checkpoint bytes between slots and non-contiguous PAGEs.
 
-        spans = []
-        device = self._kv_planes()[0].device
-        for op in store_ops:
+        Every op of either direction goes into one descriptor and one launch.
+        A store and a restore are the same intersection read opposite ways, so
+        they share the plan too — and each direction is described in a single
+        vectorised pass, which is why they are batched apart rather than
+        interleaved.
+        """
+        if not store_ops and not restore_ops:
+            return
+        for op in (*store_ops, *restore_ops):
             self._validate_paged_state_op(op)
-            src = self._active_slot_segments(op.src_slot)
-            dst = self._page_unit_segments(op.unit_ids)
-            spans.extend(plan_segmented_copy(src, dst, op.total_bytes))
-        for op in restore_ops:
-            self._validate_paged_state_op(op)
-            src = self._page_unit_segments(op.unit_ids)
-            dst = self._active_slot_segments(op.dst_slot)
-            spans.extend(plan_segmented_copy(src, dst, op.total_bytes))
-        launch_copy_spans(spans, device)
+
+        plan = self._checkpoint_copy_plan()
+        slot_bases = self._checkpoint_slot_bases()
+        per_op = plan.num_spans
+        total = (len(store_ops) + len(restore_ops)) * per_op
+        staging = self._checkpoint_descriptor_buffer()
+        if total > staging.np.shape[0]:
+            raise RuntimeError(
+                f"a step asked to copy {total // per_op} checkpoints, more "
+                f"than the {staging.np.shape[0] // per_op} its descriptor was "
+                "sized for"
+            )
+        descriptor = staging.np[:total]
+        at = 0
+        for ops, storing in ((store_ops, True), (restore_ops, False)):
+            if not ops:
+                continue
+            end = at + len(ops) * per_op
+            groups = [op.src_slot if storing else op.dst_slot for op in ops]
+            plan.write_descriptor(
+                descriptor[at:end],
+                slot_bases[groups],
+                self._page_unit_bases([op.unit_ids for op in ops]),
+                forward=storing,
+            )
+            at = end
+        launch_copy_descriptor(staging.copy_to_gpu(total), plan)
 
     def _validate_paged_state_op(
         self, op: CheckpointStoreOp | CheckpointRestoreOp
@@ -912,10 +986,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 f"state checkpoint layout mismatch: {op.layout_id!r} != "
                 f"{spec.layout_id!r}"
             )
-        if op.total_bytes != spec.slot_bytes:
+        if op.total_bytes != spec.image_bytes:
             raise RuntimeError(
                 f"state checkpoint size mismatch: op={op.total_bytes}, "
-                f"active_slot={spec.slot_bytes}"
+                f"image={spec.image_bytes}"
             )
         if len(op.unit_ids) != spec.units_per_checkpoint:
             raise RuntimeError(
@@ -925,38 +999,316 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         if any(unit_id < 0 or unit_id >= num_blocks for unit_id in op.unit_ids):
             raise RuntimeError("state checkpoint PAGE unit is out of range")
 
-    def _active_slot_segments(self, group: int):
-        from atom.model_ops.attentions.paged_state_copy import tensor_segment
+    def _checkpoint_slot_ranges(self) -> list[list[tuple[int, int]]]:
+        """Per plane, the `(offset, num_bytes)` of a slot a checkpoint holds.
 
-        return [tensor_segment(view) for view in self._slot_views()[group]]
+        A slot is a request's compressor state and then its sliding windows
+        (`v4_pool_geometry`). The two halves answer differently: a window is a
+        sliding window, so a resumer needs every row of it, while most of the
+        state is dead at a boundary and says so through
+        `StateField.in_checkpoint`.
 
-    def _one_page_unit_segments(self, block_id: int):
-        """All physical regions owned by one logical DSV4 PAGE block id."""
-        from atom.model_ops.attentions.paged_state_copy import tensor_segment
+        Three kinds of byte belong to neither and are left out: the padding
+        the state's byte count is rounded up by, the slot's own tail
+        alignment, and the entry's interleave padding — rows no `ring_row`
+        reaches, so no window is missing anything without them
+        (`UnifiedPoolGeometry.entry_row_runs`).
 
-        runner = self.model_runner
-        geo = self.pool_geometry
-        start = block_id * geo.envelope_rows
-        stop = start + geo.envelope_rows
-        segments = [tensor_segment(plane[start:stop]) for plane in self._kv_planes()]
-        segments.extend(
-            tensor_segment(runner.v4_csa_idx_kv[layer, block_id])
-            for layer in range(len(self.csa_layers))
+        A property of the layout, not of any one slot, so it is computed once.
+        """
+        if self._checkpoint_range_cache is None:
+            self._assert_ratios_divide_the_alignment()
+            geo = self.pool_geometry
+            # Rows, so the same for every plane; only the width they are
+            # priced at differs.
+            window_runs = geo.entry_row_runs()
+            self._checkpoint_range_cache = [
+                # The last state field can end exactly where the entry begins.
+                merge_abutting(
+                    [
+                        *checkpoint_ranges_for(fields),
+                        *(
+                            ((geo.arena_rows + start) * width, count * width)
+                            for start, count in window_runs
+                        ),
+                    ]
+                )
+                for fields, width in zip(
+                    self._arena_planes, self._plane_row_widths(), strict=True
+                )
+            ]
+        return self._checkpoint_range_cache
+
+    def _checkpoint_segment_sizes(self) -> list[int]:
+        """The image as the copy planner reads it: one size per source segment.
+
+        The one place the per-plane ranges are flattened. Sizing wants their
+        total and the planner wants the list, and the two answering from
+        different comprehensions is how an image gets priced at one shape and
+        cut at another.
+        """
+        return [
+            nbytes for ranges in self._checkpoint_slot_ranges() for _, nbytes in ranges
+        ]
+
+    def checkpoint_image_bytes(self) -> int:
+        """Bytes one checkpoint image holds. Priced before the pool exists."""
+        return sum(self._checkpoint_segment_sizes())
+
+    def _assert_ratios_divide_the_alignment(self) -> None:
+        """A checkpoint boundary has to be a compression boundary too.
+
+        `StateField.in_checkpoint` says a compressor without overlap owes a
+        checkpoint nothing, because the first pool at or after the boundary
+        starts exactly on it. That holds only while every ratio divides the
+        quantity a checkpoint is aligned to, and HCA's ratio is 128 — let the
+        alignment drop under that and HCA silently starts needing rows it is
+        no longer given. No crash, just a resumer reading stale KV for its
+        first pool, which reads as a small accuracy loss and nothing else.
+
+        The quantity is `BlockManager`'s `hash_block_size`, not this class's
+        own `block_size`: the ladder rounds a checkpoint to the prefix-cache
+        hash granularity, which is `kv_cache_block_size * dcp_world_size`.
+
+        The ratios come from the model rather than from the two constants this
+        file happens to name, and that is what makes the guard reachable at
+        all. `config.py` forces `kv_cache_block_size` to 256 for every
+        `DeepseekV4*` architecture, so the alignment is always a multiple of
+        4 and of 128 and a check written against `CSA_RATIO`/`HCA_RATIO` could
+        never fire — it would only restate what the config already pins. What
+        is genuinely free to change is `hf_config.compress_ratios`: a variant
+        that pools on some other stride is the edit that breaks the premise,
+        and this is what catches it.
+        """
+        config = self.model_runner.config
+        # Raw, like `BlockManager.__init__` reads it: a zero would give an
+        # alignment of zero, which every ratio divides, so a `or 1` here would
+        # answer a question about a pool geometry that cannot exist.
+        alignment = int(config.kv_cache_block_size) * int(
+            config.decode_context_parallel_size
         )
-        if self._indexer_fp4:
-            segments.extend(
-                tensor_segment(runner.v4_csa_idx_kv_scale[layer, block_id])
-                for layer in range(len(self.csa_layers))
+        # Its own check, not folded into the one below: every ratio divides
+        # zero, so a non-positive alignment reaches that test with nothing to
+        # report and would raise saying it is not a multiple of `[]`.
+        if alignment <= 0:
+            raise ValueError(
+                f"a checkpoint aligns to {alignment} tokens "
+                "(kv_cache_block_size x decode_context_parallel_size), which "
+                "is not a pool geometry that can exist"
             )
-        return segments
+        bad = sorted({r for r in self.compress_ratios if r > 0 and alignment % r})
+        if bad:
+            raise ValueError(
+                f"a checkpoint aligns to {alignment} tokens "
+                f"(kv_cache_block_size x decode_context_parallel_size), which "
+                f"is not a multiple of compress ratios {bad}, so a checkpoint "
+                "boundary is not a compression boundary, so what "
+                "`_state_fields` leaves out of the image is no longer dead"
+            )
 
-    def _page_unit_segments(self, unit_ids):
-        segments = []
-        for block_id in unit_ids:
-            if not 0 <= block_id < self.model_runner.num_physical_kvcache_blocks:
-                raise RuntimeError(f"PAGE unit id {block_id} is out of range")
-            segments.extend(self._one_page_unit_segments(block_id))
-        return segments
+    def _invalidate_pool_caches(self) -> None:
+        """Forget everything derived from the pools' layout or addresses.
+
+        A slot's address is a function of the *split*, not just of its group
+        (`UnifiedPoolGeometry.physical_slot` counts back from the topmost
+        position), so a re-carve moves every one of them. Whoever wires an
+        elastic pool has to call this; it is here so that is one line rather
+        than a list of fields to remember.
+
+        `_page_unit_region_cache` is deliberately not in it: half of what it
+        holds comes from pools this method's caller does not own, so being on
+        the list would make it look covered when it is not. It keys on its own
+        addresses instead.
+        """
+        self._slot_view_cache = None
+        self._checkpoint_range_cache = None
+        self._checkpoint_plan_cache = None
+        self._checkpoint_slot_base_cache = None
+        self._checkpoint_descriptor = None
+
+    def warmup_per_req_cache(self) -> None:
+        """Run one checkpoint copy now, so the first real one is only a copy.
+
+        `execute_paged_state_copies` is reachable only from `build()`, so
+        everything it builds lazily -- the copy plan, the slot views, the slot
+        base table, the tiling's upload, the pinned descriptor, and the Triton
+        JIT of `_copy_tiles_kernel` -- otherwise lands inside the batch of
+        whichever request first crosses a rung. Hundreds of milliseconds, once,
+        on one unlucky request.
+
+        Slot 0 into the pool's first units. Both are real addresses, which is
+        the point: a warmup on scratch would compile a kernel and fill nothing.
+        The bytes it writes are read by nobody -- a KV block is written before
+        it is read, and this runs before any block has been handed out.
+        """
+        if self.model_runner.state_runtime.checkpoint_spec is None:
+            return
+        plan = self._checkpoint_copy_plan()
+        if not plan.num_spans:
+            return
+        units = self.model_runner.state_runtime.checkpoint_spec.units_per_checkpoint
+        staging = self._checkpoint_descriptor_buffer()
+        plan.write_descriptor(
+            staging.np[: plan.num_spans],
+            self._checkpoint_slot_bases()[:1],
+            self._page_unit_bases([list(range(units))]),
+        )
+        launch_copy_descriptor(staging.copy_to_gpu(plan.num_spans), plan)
+
+    def _checkpoint_descriptor_buffer(self) -> CpuGpuBuffer:
+        """Pinned staging for a step's whole descriptor, sized for the worst step.
+
+        Pinned because the alternative synchronizes: a pageable H2D from
+        `build()` makes the host wait out the forward already enqueued, which
+        measured 2.9 ms behind 4 ms of work against 0.1 ms staged. Reused
+        because allocating pinned memory is itself a synchronizing call.
+
+        A step can carry at most one store and one restore per sequence, so
+        two per Active Slot bounds it -- 1.6 MB at the shipped geometry. The
+        caller checks that bound rather than growing on demand: a descriptor
+        that did not fit would otherwise be silently truncated into a copy of
+        the wrong shape.
+        """
+        if self._checkpoint_descriptor is None:
+            plan = self._checkpoint_copy_plan()
+            max_ops = 2 * int(self.model_runner.config.max_num_seqs)
+            self._checkpoint_descriptor = CpuGpuBuffer(
+                max_ops * plan.num_spans,
+                3,
+                dtype=torch.int64,
+                device=self._kv_planes()[0].device,
+            )
+        return self._checkpoint_descriptor
+
+    def _checkpoint_copy_plan(self) -> SegmentedCopyPlan:
+        """Where a slot's checkpoint ranges meet a whole image's PAGE regions.
+
+        Both streams are geometry. The ranges come from the layout, and every
+        image is `units_per_checkpoint` units of identical region sizes —
+        `_validate_paged_state_op` refuses anything else. So the cut points are
+        the same for every store and every restore this worker will ever do,
+        and the walk that finds them runs once instead of once an op.
+        """
+        if self._checkpoint_plan_cache is None:
+            spec = self.model_runner.state_runtime.checkpoint_spec
+            self._checkpoint_plan_cache = plan_segmented_copy(
+                self._checkpoint_segment_sizes(),
+                # Sizes from the same array `_page_unit_bases` takes addresses
+                # from, tiled the way it ravels. Spelling the destination
+                # stream out a second time here would let the two orders
+                # diverge, and a plan cut against one order and addressed
+                # through the other lands whole regions in the wrong unit.
+                self._page_unit_stream_sizes(spec.units_per_checkpoint),
+                spec.image_bytes,
+            )
+        return self._checkpoint_plan_cache
+
+    def _checkpoint_slot_bases(self) -> np.ndarray:
+        """`[group, segment]` start address of every source segment of a copy.
+
+        One row per pool group, segments in the order
+        `_checkpoint_slot_ranges` walks the planes — which is the order
+        `_checkpoint_copy_plan` built the source stream in, so a plan's
+        segment indices address a row of this directly.
+
+        Materialized rather than recomputed because a group's slot sits at a
+        fixed address for the pool's whole life, which leaves the entire
+        per-op source side as one row lookup.
+        """
+        if self._checkpoint_slot_base_cache is None:
+            self._checkpoint_slot_base_cache = np.array(
+                [
+                    [
+                        view.data_ptr() + offset
+                        for view, ranges in zip(
+                            views, self._checkpoint_slot_ranges(), strict=True
+                        )
+                        for offset, _ in ranges
+                    ]
+                    for views in self._slot_views()
+                ],
+                dtype=np.int64,
+            )
+        return self._checkpoint_slot_base_cache
+
+    def _page_unit_regions(self) -> tuple[np.ndarray, np.ndarray]:
+        """Base address and per-block stride of every region a PAGE id owns.
+
+        Blocks sit back to back in every pool, so a block's stride there is
+        its size and its address is `base + block_id * num_bytes` — affine,
+        and a property of the pools rather than of any block, so it is worked
+        out once. Slicing the tensors instead, which is what this replaced,
+        built 22 views per unit per op and threw them away to learn addresses
+        that are one multiplication each.
+
+        Two arrays rather than a list of pairs because both callers want
+        columns: one multiplies the strides by an id, the other tiles them.
+
+        The contiguity a slice would have been checked for is asked here
+        instead: once of the layout, rather than every time of a slice.
+
+        Keyed on the addresses it was built from rather than cleared by
+        `_invalidate_pool_caches`. Half of these come from the KV planes,
+        which that hook covers, and half from the indexer pools, which
+        `allocate_kv_cache_tensors` owns and it does not -- so the hook would
+        be an invariant this cache cannot check and the next reader cannot
+        see. The key is the two planes and the one or two indexer pools, so
+        finding out costs four `data_ptr()`s against a copy path measured in
+        milliseconds, and the
+        failure it removes is a scatter into whatever the allocator handed
+        that address range to next.
+        """
+        runner = self.model_runner
+        planes = self._kv_planes()
+        pools = [runner.v4_csa_idx_kv]
+        if self._indexer_fp4:
+            pools.append(runner.v4_csa_idx_kv_scale)
+        owners = tuple(t.data_ptr() for t in (*planes, *pools))
+        # The whole test: there is always at least one plane, so the owners of
+        # a built cache are never the empty tuple this starts as, and an
+        # `is None` beside this would be a second condition that cannot differ
+        # from it.
+        if self._page_unit_region_owners != owners:
+            geo = self.pool_geometry
+            bases, strides = [], []
+            for plane, width in zip(planes, self._plane_row_widths(), strict=True):
+                if not plane.is_contiguous():
+                    raise RuntimeError("a KV plane must be contiguous to be copied")
+                bases.append(plane.data_ptr())
+                strides.append(geo.envelope_rows * width)
+            for pool in pools:
+                if not pool.is_contiguous():
+                    raise RuntimeError(
+                        "an indexer pool must be contiguous to be copied"
+                    )
+                per_layer = pool.stride(0) * pool.element_size()
+                per_block = pool.stride(1) * pool.element_size()
+                for layer in range(len(self.csa_layers)):
+                    bases.append(pool.data_ptr() + layer * per_layer)
+                    strides.append(per_block)
+            self._page_unit_region_cache = (
+                np.array(bases, dtype=np.int64),
+                np.array(strides, dtype=np.int64),
+            )
+            self._page_unit_region_owners = owners
+        return self._page_unit_region_cache
+
+    def _page_unit_bases(self, unit_ids: Sequence[Sequence[int]]) -> np.ndarray:
+        """Start address of every destination segment, one row per image.
+
+        `unit_ids` is `(images, units_per_checkpoint)`. A unit's regions are
+        each at `base + id * stride`, so one image's worth is an outer product
+        and a batch's is the same product with an image axis in front. Unit
+        major, region minor — the order `_checkpoint_copy_plan` built the
+        destination stream in.
+        """
+        base, stride = self._page_unit_regions()
+        ids = np.asarray(unit_ids, dtype=np.int64)
+        return (base + ids[..., None] * stride).reshape(len(ids), -1)
+
+    def _page_unit_stream_sizes(self, units: int) -> np.ndarray:
+        """Bytes in each destination segment of an image of `units` units."""
+        return np.tile(self._page_unit_regions()[1], units)
 
     def _slot_views(self) -> list[list[torch.Tensor]]:
         """Per-group views of that request's whole slot in each plane.
@@ -1162,6 +1514,18 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         dtype = self._swa_dtype
         rope_dtype = self._rope_dtype
 
+        # Anything already worked out from the old layout or the old pools is
+        # now wrong, and wrong quietly: four of these hold raw addresses, so a
+        # stale one is a copy to the wrong slot rather than a crash. Cleared
+        # here, before `pool_geometry` is replaced, so that nothing between
+        # this line and that one can answer from the old split.
+        #
+        # Below that line they refill freely, and the cross-check further down
+        # depends on it: `checkpoint_image_bytes()` is what re-derives the
+        # ranges, and it has to derive them from the geometry just installed.
+        # What is not allowed is a *second* clear after that point — it would
+        # throw away the answer the check just validated.
+        self._invalidate_pool_caches()
         # The layout at the split sizing chose. Everything below — and every
         # index formula any kernel evaluates — reads its offsets from here.
         geo = self.pool_geometry.with_capacity(num_blocks, num_slots)
@@ -1179,15 +1543,18 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         if checkpoint_spec is None:
             raise RuntimeError("DSV4 PAGE/state checkpoint sizing spec is missing")
         layout_id = state_runtime.transfer.paged_layout_id
+        actual_image_bytes = self.checkpoint_image_bytes()
         if (
             actual_page_bytes != checkpoint_spec.page_unit_bytes
             or actual_slot_bytes != checkpoint_spec.slot_bytes
+            or actual_image_bytes != checkpoint_spec.image_bytes
             or layout_id != checkpoint_spec.layout_id
         ):
             raise RuntimeError(
                 "DSV4 PAGE/state checkpoint geometry differs from sizing: "
                 f"page={actual_page_bytes}/{checkpoint_spec.page_unit_bytes}, "
                 f"slot={actual_slot_bytes}/{checkpoint_spec.slot_bytes}, "
+                f"image={actual_image_bytes}/{checkpoint_spec.image_bytes}, "
                 f"layout={layout_id!r}/{checkpoint_spec.layout_id!r}"
             )
 
@@ -1255,7 +1622,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         )
 
         # ---- RDMA staging pool, only allocated in PD disaggregation mode --
-        is_pd = bool(getattr(self.model_runner.config, "kv_transfer_config", None))
+        is_pd = _uses_pd_staging(
+            getattr(self.model_runner.config, "kv_transfer_config", None)
+        )
         state_slot_stride = arena.entry_bytes // self._state_dtype.itemsize
         if is_pd:
             pool_size = int(os.environ.get("ATOM_PD_STAGING_POOL", "32"))
@@ -1489,6 +1858,15 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         return super().build_kv_cache_tensor(layer_id, module)
 
     def get_kv_transfer_tensors(self):
+        """Describe V4's compressed PAGE and full per-request SLOT storage.
+
+        ``block_regions`` are forward-indexed compressed PAGE units: one unit
+        from each shared KV plane plus each CSA indexer region.
+        ``swa_block_regions`` is a legacy field name; each reverse-indexed unit
+        is one complete request SLOT, including compressor state and SWA rows.
+        ``staging_region`` and ``gather_slot`` describe only compressor-state
+        PD staging and must never be used as the source of a SLOT sidecar.
+        """
         from atom.kv_transfer.disaggregation.types import (
             KVTransferRegion,
             KVTransferTensors,
@@ -1499,24 +1877,23 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             return None
 
         # `get_kv_transfer_tensors` is called unconditionally on every
-        # `allocate_kv_cache` (not just under disagg); returning None means
-        # "no transfer region." Only fail when disaggregated serving is
-        # actually enabled — the FP4 indexer's separate uint8 e8m0 scale pool
-        # is not yet described by the region map below, so a real transfer
-        # would move a half-described cache.
-        is_pd = bool(getattr(runner.config, "kv_transfer_config", None))
-        if self._indexer_fp4 and is_pd:
+        # `allocate_kv_cache`; returning None means "no transfer region." Only
+        # fail when transfer or offload is active. The FP4 indexer's separate
+        # uint8 e8m0 scale pool is not yet described by the region map below,
+        # so registering it would expose a half-described cache.
+        transfer_active = bool(getattr(runner.config, "kv_transfer_config", None))
+        if self._indexer_fp4 and transfer_active:
             raise NotImplementedError(
-                "KV transfer (disaggregated serving) is not supported with "
-                "--index_cache_dtype fp4 yet (FP4 indexer scale pool unmapped)."
+                "DeepSeek-V4 KV transfer/offload with --index_cache_dtype fp4 "
+                "is unsupported because the unmapped FP4 indexer scale pool "
+                "would be omitted; use the FP8 indexer or disable transfer/offload."
             )
-        if is_pd and getattr(runner.config, "pipeline_parallel_size", 1) > 1:
+        if transfer_active and getattr(runner.config, "pipeline_parallel_size", 1) > 1:
             raise NotImplementedError(
-                "DeepSeek-V4 KV transfer registers one region per plane, "
-                "covering every layer at once, so there is no per-layer region "
-                "list for `_consumer_region_map` to shift by `start_layer`. "
-                "Pipeline parallelism with disaggregated serving needs the "
-                "region map keyed by something other than the layer index."
+                "DeepSeek-V4 KV transfer/PD and sidecar offload with pipeline "
+                "parallelism (pipeline_parallel_size > 1) is unsupported "
+                "because each PAGE/SLOT plane region covers every layer; use "
+                "PP=1 or disable DeepSeek-V4 transfer/offload."
             )
         if self._indexer_fp4:
             # Single-node FP4 indexer: the FP8 region map below references the
@@ -1532,37 +1909,59 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         swa_block_regions: list[KVTransferRegion] = []
         slot_regions: list[KVTransferRegion] = []
 
-        # One region per plane, not per layer. A block's compressed rows are one
-        # envelope — every layer of it, contiguous — so the transfer unit the
-        # connector already zips over (`base + id * unit_bytes`, `unit_bytes`
-        # long) describes it exactly, and a layer no longer needs a region of
-        # its own. Under the layer-major predecessor a layer's rows for a block
-        # were the contiguous thing and the envelope was the strided one.
+        # Compressed PAGE: one region per plane, not per layer. A block's rows
+        # are one envelope — every layer of it, contiguous — so the transfer
+        # unit the connector already zips over (`base + id * unit_bytes`,
+        # `unit_bytes` long) describes it exactly. Under the layer-major
+        # predecessor a layer's rows for a block were the contiguous thing and
+        # the envelope was the strided one.
         #
         # A stage that holds a subset of the layers still holds whole envelopes
         # of that subset, so its plane is its own; `_consumer_region_map`'s
         # per-layer alignment has nothing left to align, which is why PP is
         # rejected below.
-        planes = list(zip(self._kv_planes(), self._plane_row_widths(), strict=True))
-        for plane, row_bytes in planes:
+        plane_roles = [
+            role
+            for role, row_bytes in (
+                ("dsv4.main_kv.nope", self.nope_row_bytes()),
+                ("dsv4.main_kv.rope", self.rope_row_bytes()),
+            )
+            if row_bytes
+        ]
+        planes = list(
+            zip(
+                self._kv_planes(),
+                self._plane_row_widths(),
+                plane_roles,
+                strict=True,
+            )
+        )
+        for plane, row_bytes, role in planes:
             block_regions.append(
                 KVTransferRegion(
                     plane.data_ptr(),
                     runner.num_physical_kvcache_blocks * geo.block_bytes(row_bytes),
                     geo.block_bytes(row_bytes),
+                    semantic_role=role,
                 )
             )
 
-        # Block regions: CSA Indexer KV (FP8)
-        for pos in range(len(self.csa_layers)):
+        # Compressed PAGE regions: CSA Indexer KV (FP8).
+        for pos, layer_id in enumerate(self.csa_layers):
             t = runner.v4_csa_idx_kv[pos]
             bpb = self.csa_rows_per_block * self._index_row_bytes
             block_regions.append(
-                KVTransferRegion(t.data_ptr(), t.numel() * t.element_size(), bpb)
+                KVTransferRegion(
+                    t.data_ptr(),
+                    t.numel() * t.element_size(),
+                    bpb,
+                    semantic_role=f"dsv4.csa_indexer.layer_{layer_id}",
+                )
             )
 
-        # A request's state is one slot per plane — again every layer at once —
-        # and the id the connector zips over is its pool group.
+        # Full per-request SLOT (legacy field name: `swa_block_regions`) is one
+        # slot per plane — compressor state and SWA, every layer at once — and
+        # the id the connector zips over is its pool group.
         #
         # A slot has no window-freeing and no sentinel rows: every row of a live
         # one travels. `reverse_indexed` is what the geometry's numbering costs
@@ -1575,7 +1974,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         slot_start, _ = (
             geo.slot_span(geo.physical_slot(num_slots - 1)) if num_slots else (0, 0)
         )
-        for plane, row_bytes in planes:
+        for plane, row_bytes, role in planes:
             unit = geo.slot_bytes(row_bytes)
             swa_block_regions.append(
                 KVTransferRegion(
@@ -1583,11 +1982,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                     num_slots * unit,
                     unit,
                     reverse_indexed=True,
+                    semantic_role=role,
                 )
             )
 
-        # Staging pool for compressor states (not in slot_regions — managed
-        # separately by the connector with pool acquire/release).
+        # Compressor-only PD staging. It omits SWA rows, is managed separately
+        # with pool acquire/release, and is invalid as a sidecar SLOT source.
         staging_region = None
         gather_slot = None
         scatter_slot = None
@@ -1599,6 +1999,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 pool.data_ptr(),
                 pool.numel() * elem_fp32,
                 stride * elem_fp32,
+                semantic_role="dsv4.pd_staging.compressor_state",
             )
             gather_slot = self._make_gather_slot(
                 pool, stride, runner.v4_state_arena, self.pool_geometry
@@ -1613,6 +2014,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             slot_regions=slot_regions,
             num_blocks=runner.num_physical_kvcache_blocks,
             num_slots=num_slots,
+            expected_full_slot_region_count=len(planes),
             staging_region=staging_region,
             staging_pool_size=pool_size if staging_region else 0,
             gather_slot=gather_slot,
@@ -1991,7 +2393,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         assert self._mtp_layers_are_swa_only, (
             "prepare_mtp_decode fast path only supports MTP layers the pool "
             "serves from the dense class; got compress_ratios[mtp]="
-            f"{self.compress_ratios[self._n_main_layers:]} and field-window "
+            f"{self.compress_ratios[self._n_main_layers :]} and field-window "
             f"layers {self._field_window_layers}"
         )
 
