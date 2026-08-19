@@ -11,15 +11,11 @@ import triton
 from aiter import (
     decode_update_mla_metadata_v1,
     dtypes,
+    get_mla_decode_fwd_max_splits,
+    get_mla_decode_fwd_occupancy,
     get_mla_metadata_info_v1,
     get_mla_metadata_v1,
 )
-
-try:
-    from aiter import get_mla_decode_fwd_max_splits, get_mla_decode_fwd_occupancy
-except ImportError:  # aiter without the host-side cluster-count helpers
-    get_mla_decode_fwd_max_splits = None
-    get_mla_decode_fwd_occupancy = None
 
 from atom.distributed.dcp_utils import (
     dcp_persistent_supported,
@@ -99,18 +95,16 @@ def _mla_decode_split_budget(
     tile_cnt=512, num_clusters=256).
 
     Falls back to the historical 16 when that identity cannot be established:
-      - aiter cannot be told the cap at sizing time (older build), or
+      - aiter cannot be told the cap at sizing time (its metadata sizing predates
+        the parameter -- the two helpers above are older than it, aiter #3391 vs
+        #3459, so they are a hard import while this stays a probe), or
       - some q-len this builder can dispatch has a *higher* cluster count than
         the q-len the buffers were sized for. Occupancy is a point condition on
         ``num_heads * q_len == 64`` (not monotonic in q_len) and the kernel
         recomputes it per call from the actual q-len, so the raised budget is
         only safe when the sizing shape dominates every shape we can reach.
     """
-    if (
-        not _MLA_META_SUPPORTS_MAX_SPLIT
-        or get_mla_decode_fwd_max_splits is None
-        or get_mla_decode_fwd_occupancy is None
-    ):
+    if not _MLA_META_SUPPORTS_MAX_SPLIT:
         return _MLA_HISTORICAL_MAX_SPLIT_PER_BATCH
     sized_occupancy = get_mla_decode_fwd_occupancy(
         num_heads, max_seqlen_qo, dtype_q, dtype_kv
