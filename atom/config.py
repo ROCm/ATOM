@@ -992,12 +992,24 @@ class SpeculativeConfig:
     draft_model_hf_config: PretrainedConfig | None = None
     use_aux_hidden_state: bool = False
     eagle3_aux_layer_ids: list[int] = field(default_factory=list)
-    # Debug/benchmark knob: when set (float in [0, 1]), the rejection sampler
-    # force-accepts draft tokens with a position-decaying probability calibrated
-    # so the measured mean acceptance rate matches this value, independent of the
-    # real draft/target agreement. Mirrors vLLM's synthetic_acceptance_rate. See
-    # ROCm/ATOM#555.
+    # Debug/benchmark knobs: force a speculative acceptance curve independent of
+    # the real draft/target agreement, so a run can replay a published
+    # acceptance-length figure (an InferenceX golden AL, say) while the draft head
+    # is still training. Set at most one; both resolve into
+    # `synthetic_acceptance_rates`. See ROCm/ATOM#555.
+    #
+    # Mean acceptance length in [1, num_speculative_tokens + 1], counting the
+    # target's own guaranteed token -- the same unit as vLLM's
+    # synthetic_acceptance_length and SGLang's SGLANG_SIMULATE_ACC_LEN, so a
+    # published AL can be pasted in without conversion.
+    synthetic_acceptance_length: float | None = None
+    # The same target expressed as a mean acceptance RATE in [0, 1]
+    # (accepted_draft / total_draft), i.e. (length - 1) / num_speculative_tokens.
     synthetic_acceptance_rate: float | None = None
+    # Resolved per-position *unconditional* acceptance rates (entry i = marginal
+    # probability that the first i+1 draft tokens are all accepted), filled in by
+    # __post_init__. None => real draft/target rejection sampling.
+    synthetic_acceptance_rates: list[float] | None = None
 
     # model_type → mtp_model_type mapping
     _MTP_TYPE_MAP: ClassVar[dict[str, str]] = {
@@ -1059,14 +1071,63 @@ class SpeculativeConfig:
         cfg = self.draft_model_hf_config
         return bool(getattr(cfg, "dspark_with_draft", False))
 
-    def __post_init__(self):
-        if self.synthetic_acceptance_rate is not None and not (
-            0.0 <= self.synthetic_acceptance_rate <= 1.0
+    def _resolve_synthetic_acceptance(self) -> None:
+        """Validate the forced-acceptance knobs and resolve to per-position rates.
+
+        Both knobs describe the same curve, so exactly one may be set; the rate
+        form is converted to a length and everything downstream reads only
+        ``synthetic_acceptance_rates``.
+        """
+        # Local import: the schedule lives next to the kernel that consumes it,
+        # and that module pulls in triton, which has no business loading just
+        # because someone imported a config.
+        from atom.model_ops.rejection_sampler import acceptance_length_to_rates
+
+        if (
+            self.synthetic_acceptance_length is not None
+            and self.synthetic_acceptance_rate is not None
         ):
             raise ValueError(
-                "synthetic_acceptance_rate (--spec-decode-acceptance-rate) must "
-                f"be in [0, 1], but got {self.synthetic_acceptance_rate}."
+                "--spec-decode-acceptance-length and --spec-decode-acceptance-rate "
+                "describe the same curve; set at most one."
             )
+        length = self.synthetic_acceptance_length
+        if self.synthetic_acceptance_rate is None and length is None:
+            return
+
+        n = self.num_speculative_tokens
+        if not n:
+            raise ValueError(
+                "Forced speculative acceptance needs --num-speculative-tokens, "
+                f"but it is {n!r}."
+            )
+        if self.synthetic_acceptance_rate is not None:
+            rate = self.synthetic_acceptance_rate
+            if not 0.0 <= rate <= 1.0:
+                raise ValueError(
+                    "synthetic_acceptance_rate (--spec-decode-acceptance-rate) "
+                    f"must be in [0, 1], but got {rate}."
+                )
+            length = 1.0 + n * rate
+        if not 1.0 <= length <= float(n + 1):
+            raise ValueError(
+                "synthetic_acceptance_length (--spec-decode-acceptance-length) "
+                f"must be in [1, {n + 1}] for num_speculative_tokens={n}, but got "
+                f"{length}."
+            )
+        self.synthetic_acceptance_length = length
+        self.synthetic_acceptance_rates = acceptance_length_to_rates(length, n)
+        logger.info(
+            "Forced speculative acceptance ON: mean acceptance length %.4f over "
+            "%d draft positions (per-position rates %s). Throughput numbers from "
+            "this run are synthetic; output text and accuracy are meaningless.",
+            length,
+            n,
+            [round(r, 4) for r in self.synthetic_acceptance_rates],
+        )
+
+    def __post_init__(self):
+        self._resolve_synthetic_acceptance()
         if self.draft_model_hf_config is None:
             self.draft_model_hf_config = get_hf_config(
                 self.model, trust_remote_code=True
@@ -1461,6 +1522,32 @@ class Config:
         else:
             raise TypeError("eplb_config must be EPLBConfig or dict")
         # assert os.path.isdir(self.model)
+
+        # The forced-acceptance schedule spends its whole budget on the first
+        # ceil(length - 1) positions, and the sampler can only accept what was
+        # actually drafted. The DSpark confidence scheduler hands each request
+        # its own verify length ell_r, so whenever ell_r falls below that many
+        # positions the run quietly lands under the acceptance length it was
+        # asked to reproduce (measured at length 3.78 over 7 positions: exact
+        # while ell_r >= 3, 3.39 at ell_r = 2, 2.89 at ell_r = 1). ell_r is
+        # chosen at runtime from the confidence head, so there is no upfront
+        # check that would catch it -- and a benchmark reporting a number it
+        # never hit is worse than one that refuses to start.
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.synthetic_acceptance_rates is not None
+            and self.dspark.confidence_schedule
+        ):
+            raise ValueError(
+                "Forced speculative acceptance (--spec-decode-acceptance-length "
+                "/ --spec-decode-acceptance-rate) cannot be combined with the "
+                "DSpark confidence scheduler (--dspark-config "
+                "'{\"confidence_schedule\": true}'): it sizes each request's "
+                "verify length at runtime, and a short one caps acceptance below "
+                "the requested length with no way to detect it upfront. Drop "
+                "confidence_schedule (and ragged, which needs it) for "
+                "forced-acceptance runs."
+            )
 
         # RapidServe (intra-GPU prefill/decode disagg) needs a specialized
         # runner in both the prefill and decode processes. Select it unless the
