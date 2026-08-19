@@ -617,6 +617,23 @@ def test_dynamic_prefill_chunk_uses_prefix_length():
     assert sched._prefill_chunk_for_budget(10000, 1024, 0, history_len=1024) == 384
 
 
+def test_dynamic_prefill_chunk_yields_to_a_filled_pipeline():
+    # With pp_size requests already prefilling, the budget refills from the
+    # others whatever this one gets, so shrinking its chunk would only add
+    # forwards for the request itself.
+    sched = Scheduler(
+        _pp_config(
+            max_num_batched_tokens=1024,
+            enable_dynamic_chunking=True,
+            dynamic_chunking_smooth_factor=1.0,
+            dynamic_chunking_coefficients=(1.0, 0.0, 0.0),
+        )
+    )
+    sched.waiting.extend(_make_seq(64) for _ in range(4))
+
+    assert sched._prefill_chunk_for_budget(10000, 1024, 0, history_len=1024) == 1024
+
+
 def test_prefill_chunk_not_aligned_when_chunked_prefill_disabled():
     # num_new (200) > budget (100): with chunked prefill enabled this would
     # align down to 64; disabled, the whole request is returned unaligned.

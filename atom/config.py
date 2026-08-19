@@ -1532,7 +1532,8 @@ class Config:
     dynamic_chunking_smooth_factor: float = 0.75
     # Populated by PP startup profiling before Scheduler construction. Kept out
     # of the public CLI because coefficients are hardware/model specific.
-    dynamic_chunking_coefficients: tuple[float, float, float] | None = None
+    # (a, b, c, gamma) of the chunk latency model in dynamic_chunking.py.
+    dynamic_chunking_coefficients: tuple[float, ...] | None = None
     port: int = 8006
     torch_profiler_dir: str | None = field(
         default_factory=lambda: envs.ATOM_TORCH_PROFILER_DIR

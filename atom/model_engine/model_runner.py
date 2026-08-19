@@ -1251,8 +1251,62 @@ class ModelRunner:
             f"{self.label}: warmup_model {time.time() - start_time:.2f} seconds with {num_seqs} reqs {total_tokens_num} tokens"
         )
 
+    def _dynamic_chunking_profile_grid(
+        self, alignment: int, max_chunk: int
+    ) -> list[tuple[int, int]]:
+        """Build the ``(prefix_len, chunk_size)`` grid for startup profiling.
+
+        Two families of samples:
+
+        * A prefix-free sweep over the range chunk sizes are actually chosen
+          from. Far below that range the curve is a flat plateau of per-forward
+          overhead, and including it drags the linear term negative without
+          describing any chunk the scheduler can pick.
+        * A prefix ladder at several chunk sizes. Backends that rebuild a
+          compressed prefix per chunk only reveal that cost here, and without
+          it the fit cannot tell prefix work apart from attention area. The
+          small chunks in the ladder carry that separation: prefix rebuild is
+          flat in the chunk size while attention area is not, so the two only
+          come apart where the chunk is small next to the prefix.
+        """
+        chunk_floor = max(alignment, max_chunk // 8)
+
+        def align(value: int) -> int:
+            return max(alignment, int(value) // alignment * alignment)
+
+        prefix_free = [
+            align(chunk)
+            for chunk in np.linspace(max_chunk, chunk_floor, num=24, dtype=np.int64)
+        ]
+        grid = [(0, chunk) for chunk in dict.fromkeys(prefix_free)]
+
+        # Room for prefix + chunk has to exist both in the KV pool and inside
+        # the model's context window.
+        prefix_cap = (
+            min(
+                self.config.max_model_len,
+                self.config.num_kvcache_blocks * self.block_size,
+                16 * max_chunk,
+            )
+            - max_chunk
+        )
+        prefix_cap -= prefix_cap % alignment
+        if prefix_cap >= 4 * alignment:
+            prefixes = list(
+                dict.fromkeys(
+                    align(prefix_cap // (2**rung))
+                    for rung in range(4)
+                    if prefix_cap // (2**rung) >= 4 * alignment
+                )
+            )
+            chunks = list(
+                dict.fromkeys(align(max_chunk // divisor) for divisor in (1, 2, 4, 8))
+            )
+            grid.extend((prefix, chunk) for prefix in prefixes for chunk in chunks)
+        return grid
+
     def profile_dynamic_chunking(self):
-        """Profile this PP stage and return a quadratic latency model on TP rank 0.
+        """Profile this PP stage and return a latency model on TP rank 0.
 
         Every PP/TP worker executes the same dummy forwards so pipeline and TP
         collectives remain ordered. Only local TP rank 0 returns data through
@@ -1266,92 +1320,126 @@ class ModelRunner:
             return None
 
         alignment = max(self.block_size, 64)
-        max_profile_len = min(
+        max_chunk = min(
             self.config.max_num_batched_tokens,
             self.config.max_model_len,
             self.config.num_kvcache_blocks * self.block_size,
         )
-        max_profile_len -= max_profile_len % alignment
-        if max_profile_len < 8 * alignment:
+        max_chunk -= max_chunk % alignment
+        if max_chunk < 8 * alignment:
             raise ValueError(
                 "Dynamic chunking needs room for at least 8 aligned profiling "
-                f"lengths, got max_profile_len={max_profile_len}, "
-                f"alignment={alignment}"
+                f"lengths, got max_chunk={max_chunk}, alignment={alignment}"
             )
 
-        # Descending lengths mirror SGLang's profiler. A separate full-size
-        # warmup absorbs first-shape compilation and lazy communicator costs.
-        candidates = np.linspace(
-            max_profile_len, alignment, num=32, dtype=np.int64
-        ).tolist()
-        profile_lengths = list(
-            dict.fromkeys(
-                max(alignment, int(length) // alignment * alignment)
-                for length in candidates
-            )
-        )
+        grid = self._dynamic_chunking_profile_grid(alignment, max_chunk)
 
-        def make_batch(length: int) -> ScheduledBatch:
-            seq = Sequence([0] * length, block_size=self.block_size, id=-2)
+        # Real token ids, not a run of zeros: an all-zero prompt makes every
+        # token pick the same MoE experts, which is both faster and a shape the
+        # scheduler will never see.
+        rng = np.random.default_rng(0)
+        vocab_size = int(self.config.hf_config.vocab_size)
+
+        def make_batch(prefix_len: int, chunk_size: int) -> ScheduledBatch:
+            total = prefix_len + chunk_size
+            tokens = rng.integers(0, vocab_size, size=total, dtype=np.int64).tolist()
+            seq = Sequence(tokens, block_size=self.block_size, id=-2)
             seq.status = SequenceStatus.RUNNING
             seq.type = SequenceType.PREFILL
-            num_blocks = math.ceil(length / self.block_size)
+            num_blocks = math.ceil(total / self.block_size)
             seq.block_table = list(range(num_blocks))
             return ScheduledBatch(
                 seqs={seq.id: seq},
-                num_scheduled_tokens=[length],
-                total_tokens_num=length,
-                total_tokens_num_prefill=length,
+                num_scheduled_tokens=[chunk_size],
+                total_tokens_num=chunk_size,
+                total_tokens_num_prefill=chunk_size,
                 total_seqs_num=1,
                 total_seqs_num_prefill=1,
                 is_dummy_run=True,
-                num_cached_tokens=[0],
+                num_cached_tokens=[prefix_len],
                 is_final_chunk=[False],
             )
 
         logger.info(
-            "%s: profiling dynamic chunking at %d lengths (max=%d)",
+            "%s: profiling dynamic chunking at %d (prefix, chunk) points "
+            "(max chunk=%d, max prefix=%d)",
             self.label,
-            len(profile_lengths),
-            max_profile_len,
+            len(grid),
+            max_chunk,
+            max(prefix for prefix, _ in grid),
         )
-        self.forward(make_batch(max_profile_len))
-        self.flush_pp_send()
-        torch.cuda.synchronize(self.device)
-
-        latencies_ms: list[float] = []
-        for length in profile_lengths:
-            torch.cuda.synchronize(self.device)
-            start = time.perf_counter()
-            self.forward(make_batch(length))
+        # Separate warmups absorb first-shape compilation and lazy communicator
+        # costs, once for the prefix-free path and once for the prefix path.
+        for prefix_len, chunk_size in (grid[0], grid[-1]):
+            self.forward(make_batch(prefix_len, chunk_size))
             self.flush_pp_send()
             torch.cuda.synchronize(self.device)
-            latencies_ms.append((time.perf_counter() - start) * 1000.0)
+
+        prefix_lens: list[int] = []
+        chunk_sizes: list[int] = []
+        latencies_ms: list[float] = []
+        for prefix_len, chunk_size in grid:
+            # Best of two: the model is a floor on achievable time, and a
+            # straggler on a shared node biases the fit far more than it
+            # biases the minimum.
+            best_ms = math.inf
+            for _ in range(2):
+                torch.cuda.synchronize(self.device)
+                start = time.perf_counter()
+                self.forward(make_batch(prefix_len, chunk_size))
+                self.flush_pp_send()
+                torch.cuda.synchronize(self.device)
+                best_ms = min(best_ms, (time.perf_counter() - start) * 1000.0)
+            prefix_lens.append(prefix_len)
+            chunk_sizes.append(chunk_size)
+            latencies_ms.append(best_ms)
 
         local_result = None
         try:
-            predictor = ChunkSizePredictor.fit(profile_lengths, latencies_ms)
+            predictor = ChunkSizePredictor.fit(prefix_lens, chunk_sizes, latencies_ms)
             local_result = {
                 "coefficients": (
                     predictor.quadratic_coeff,
                     predictor.linear_coeff,
                     predictor.constant_coeff,
+                    predictor.prefix_coeff,
                 ),
-                "sequence_lengths": profile_lengths,
+                "prefix_lens": prefix_lens,
+                "chunk_sizes": chunk_sizes,
                 "latencies_ms": latencies_ms,
             }
+            residuals = [
+                predictor.predicted_latency(prefix, chunk) - latency
+                for prefix, chunk, latency in zip(
+                    prefix_lens, chunk_sizes, latencies_ms
+                )
+            ]
             logger.info(
-                "%s: dynamic chunking local fit a=%.3e b=%.3e c=%.3e",
+                "%s: dynamic chunking local fit a=%.3e b=%.3e c=%.3e gamma=%.3e "
+                "(residual rms=%.1fms max=%.1fms of mean=%.1fms)",
                 self.label,
                 *local_result["coefficients"],
+                float(np.sqrt(np.mean(np.square(residuals)))),
+                max(abs(value) for value in residuals),
+                float(np.mean(latencies_ms)),
+            )
+            logger.info(
+                "%s: dynamic chunking samples (prefix, chunk, ms) %s",
+                self.label,
+                [
+                    (prefix, chunk, round(latency, 2))
+                    for prefix, chunk, latency in zip(
+                        prefix_lens, chunk_sizes, latencies_ms
+                    )
+                ],
             )
         except ValueError as exc:
             logger.warning("%s: dynamic chunking fit failed: %s", self.label, exc)
 
         # The PP head owns scheduling, but its layers are not necessarily the
         # bottleneck. Gather every stage's fit and use the stage with the largest
-        # modeled full-chunk increment. This preserves a single quadratic
-        # predictor while targeting the pipeline cycle-time bottleneck.
+        # modeled full-chunk increment. This preserves a single predictor while
+        # targeting the pipeline cycle-time bottleneck.
         pp_group = get_pp_group()
         stage_results: list[dict | None] = [None] * pp_group.world_size
         torch.distributed.all_gather_object(
@@ -1361,17 +1449,40 @@ class ModelRunner:
         if not valid_results:
             return {"error": "dynamic chunking fit failed on every PP stage"}
 
-        def full_chunk_increment(result):
-            a, b, _ = result["coefficients"]
-            return a * max_profile_len * max_profile_len + b * max_profile_len
+        # Cycle time is set by the slowest stage in the regime that matters,
+        # which is a full chunk landing on a long prefix - not a prefix-free one.
+        reference_prefix = max(prefix for prefix, _ in grid)
 
-        result = max(valid_results, key=full_chunk_increment)
+        def full_chunk_cost(result):
+            a, b, _, gamma = result["coefficients"]
+            return (
+                a * (2.0 * reference_prefix * max_chunk + max_chunk * max_chunk)
+                + b * max_chunk
+                + gamma * reference_prefix
+            )
+
+        result = max(valid_results, key=full_chunk_cost)
         selected_stage = stage_results.index(result)
         result = dict(result)
         result["selected_pp_stage"] = selected_stage
+
+        selected = ChunkSizePredictor.from_coefficients(result["coefficients"])
+        if not selected.predicts_useful_shrink(
+            base_chunk_size=max_chunk, history_len=reference_prefix
+        ):
+            return {
+                "error": (
+                    "profiled chunk latency barely grows with the cached prefix "
+                    f"(a={selected.quadratic_coeff:.3e} b={selected.linear_coeff:.3e} "
+                    f"gamma={selected.prefix_coeff:.3e}): a chunk after a "
+                    f"{reference_prefix}-token prefix is predicted to cost the "
+                    "same as one after none, so equal-latency chunking would "
+                    "only add chunks"
+                )
+            }
         logger.info(
             "%s: dynamic chunking selected PP stage %d fit "
-            "a=%.3e b=%.3e c=%.3e",
+            "a=%.3e b=%.3e c=%.3e gamma=%.3e",
             self.label,
             selected_stage,
             *result["coefficients"],

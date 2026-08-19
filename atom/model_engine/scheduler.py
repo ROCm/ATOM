@@ -740,6 +740,7 @@ class Scheduler:
         self._detailed_annotation_enabled = envs.ATOM_ENABLE_DETAILED_ANNOTATION
 
         self.enable_chunked_prefill = config.enable_chunked_prefill
+        self.pipeline_parallel_size = getattr(config, "pipeline_parallel_size", 1)
         self.dynamic_chunking_smooth_factor = getattr(
             config, "dynamic_chunking_smooth_factor", 0.75
         )
@@ -1794,6 +1795,32 @@ class Scheduler:
         )
         self.running.append(seq)
 
+    def _dynamic_chunk_limit(self, history_len: int) -> int | None:
+        """Chunk ceiling from the startup latency model, or None to keep it fixed.
+
+        Shrinking a chunk only removes pipeline bubbles while the pipeline is
+        short of microbatches. Once at least `pipeline_parallel_size` requests
+        are prefilling, the token budget refills from the other requests
+        whatever this one is given, so the batch still goes out full and the
+        number of forwards does not move — the smaller chunk just makes the
+        request take more of them, and every extra chunk re-pays whatever the
+        backend spends per chunk on the cached prefix. Dynamic chunking is
+        therefore an under-filled-pipeline tool, and the equal-latency solver
+        only runs when the pipeline is actually short of work.
+        """
+        if self.dynamic_chunk_predictor is None:
+            return None
+        prefill_supply = self._partial_prefill_count + len(self.waiting)
+        if prefill_supply >= self.pipeline_parallel_size:
+            return None
+        return self.dynamic_chunk_predictor.predict(
+            history_len=history_len,
+            base_chunk_size=self.max_num_batched_tokens,
+            smooth_factor=self.dynamic_chunking_smooth_factor,
+            alignment=max(self.block_manager.block_size, 64),
+            max_chunk_size=self.max_num_batched_tokens,
+        )
+
     def _chunked_prefill_size(
         self,
         num_new_tokens: int,
@@ -1815,15 +1842,7 @@ class Scheduler:
         Never 0 for an empty batch: something has to go out each step, or a
         `max_num_batched_tokens` below the alignment would stall forever.
         """
-        dynamic_limit = None
-        if self.dynamic_chunk_predictor is not None:
-            dynamic_limit = self.dynamic_chunk_predictor.predict(
-                history_len=history_len,
-                base_chunk_size=self.max_num_batched_tokens,
-                smooth_factor=self.dynamic_chunking_smooth_factor,
-                alignment=max(self.block_manager.block_size, 64),
-                max_chunk_size=self.max_num_batched_tokens,
-            )
+        dynamic_limit = self._dynamic_chunk_limit(history_len)
         chunk = min(
             num_new_tokens,
             budget_remaining,
