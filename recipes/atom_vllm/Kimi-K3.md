@@ -122,16 +122,6 @@ vllm serve "${MODEL}" \
     --additional-config '{"online_quant_config":{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*self_attn.[qkv]_conv1d*","*block_sparse_moe.experts*","*block_sparse_moe.routed_expert_*","*vision_tower*","*mm_projector*"]}}'
 ```
 
-`num_speculative_tokens=2` with `--gpu-memory-utilization 0.85` is the
-validated pair: the draft's own paged cache has to fit alongside the target's,
-and 0.85 leaves 30.1 GiB of KV cache against the 35.7 GiB the target alone
-gets at the same utilization. The draft inherits the engine's fp8 cache dtype;
-setting it to bf16 halves the draft's page size relative to the target's, which
-prefix caching's hash block size rejects.
-
-Both graph modes stay in force: the target captures FULL graphs for pure decode
-and Piecewise for prefill, and the draft block captures its own FULL graphs.
-
 ### Validated accuracy and acceptance
 
 Full 1,319-example GSM8K, 5-shot, 64 concurrent, TP8, `FULL_AND_PIECEWISE`,
