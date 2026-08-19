@@ -104,12 +104,6 @@ if [ "$ENABLE_STATE_OFFLOAD" == 1 ]; then
     export OFFLOAD_STATE_STAGING_GROUPS="${OFFLOAD_STATE_STAGING_GROUPS:-8}"
     export OFFLOAD_STATE_MIN_LOAD_TOKENS="${OFFLOAD_STATE_MIN_LOAD_TOKENS:-0}"
     export OFFLOAD_GPU_STAGING_CHUNKS="${OFFLOAD_GPU_STAGING_CHUNKS:-16}"
-    # Left at 0 (rightmost rung wins, paid or free). Raise it if the
-    # `joint kv:` line shows boundaries dominated by `tier=` -- each of those
-    # paid an entry-sized H2D plus a park for whatever prefix it reached past
-    # the nearest free checkpoint, and this is how many tokens that has to be
-    # worth. `demoted=` then counts the trades it declined.
-    # export OFFLOAD_STATE_TIER_MARGIN_TOKENS=4096
 fi
 
 # LMCache paged-KV offload (L2 CPU tier).

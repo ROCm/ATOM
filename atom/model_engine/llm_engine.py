@@ -389,7 +389,6 @@ class LLMEngine:
                 "joint_boundaries",
                 "joint_boundaries_hbm",
                 "joint_boundaries_tier",
-                "joint_tier_demoted",
             )
         }
         # `reusable`, not `full`: a request's trailing block is never a reuse

@@ -32,14 +32,6 @@ from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
-#: Rungs `_joint_kv_boundary` may examine before giving up. Each one costs a
-#: fixpoint scan over the whole hash chain, on the admission path, so the walk
-#: is bounded rather than exhaustive -- and a rung the walk cannot reach says
-#: nothing about how far down the next one is, so there is no cheaper stopping
-#: rule than a count. Only `OFFLOAD_STATE_TIER_MARGIN_TOKENS > 0` ever spends
-#: more than one: without a margin to earn, the first rung found is taken.
-_JOINT_WALK_TRIES = 4
-
 
 def _make_block_stored(
     hashes: list[int],
@@ -216,7 +208,6 @@ class BlockManager:
             kv_connector_hosts_state_tier,
             kv_offload_for_hybrid,
             state_offload_staging_groups,
-            state_offload_tier_margin_tokens,
         )
 
         staging = state_offload_staging_groups()
@@ -225,9 +216,6 @@ class BlockManager:
         # path, and a flag that could change under it would let one request's
         # two legs disagree.
         self._joint_kv_loads = kv_offload_for_hybrid()
-        # How far right a tier rung must reach before it is preferred over a
-        # free HBM one. Read once, beside the flag, for the same reason.
-        self._joint_tier_margin = state_offload_tier_margin_tokens()
         # Admissions that found a boundary for both legs, split by what the
         # state leg cost: `hbm` forked a checkpoint already resident and moved
         # nothing, `tier` paid an entry-sized H2D and a park. Read as a ratio --
@@ -238,7 +226,6 @@ class BlockManager:
         self.joint_boundaries = 0
         self.joint_boundaries_hbm = 0
         self.joint_boundaries_tier = 0
-        self.joint_tier_demoted = 0
         # Why the rest got none, keyed by the gate that stopped them.
         self.joint_skips: dict[str, int] = {}
         # The LMCache chunk size in tokens, read where the config is rather than
@@ -623,72 +610,46 @@ class BlockManager:
         if cap <= hbm_boundary:
             return self._no_joint("no_room_above_hbm")
         chain = self._chain_to(seq, block_hashes, cap)
-        # Walk right to left looking for a rung whose state is already in HBM,
-        # remembering the rightmost one that would have to be fetched. The walk
-        # is what `_joint_tier_margin` needs and the only thing that needs it:
-        # at margin 0 the first paid rung wins immediately, which is
-        # rightmost-wins and one iteration, exactly as before.
-        candidate = cap
-        paid = None  # (blocks, tokens, hash) of the rightmost tier rung seen
-        for _ in range(_JOINT_WALK_TRIES):
-            candidate = self._gated_hit(seq, candidate, chain)
-            if candidate <= hbm_boundary:
-                break
-            tokens = candidate * hbs
-            h = chain[candidate - 1]
-            # The chunk that covers B has to be one LMCache actually holds.
-            # Cannot fail: `lmc_tokens` is chunk-floored and `tokens` is at
-            # most `cap * hbs <= lmc_tokens`, so the smallest covering multiple
-            # is at most `lmc_tokens` too. Kept as the invariant's own
-            # assertion, and walking on is the safe answer if it ever does.
-            kv_tokens = -(-tokens // chunk) * chunk
-            if kv_tokens > lmc_tokens:
-                candidate -= 1
-                continue
-            if self.state.lookup(h) >= 0:
-                # Free: the state forks out of a resident slot and nothing
-                # moves. Beaten only by a paid rung far enough right to pay
-                # for its own transfer and park.
-                if paid is not None and paid[1] - tokens >= self._joint_tier_margin:
-                    return self._accept_joint(seq, *paid, chunk, tier=True)
-                if paid is not None:
-                    self.joint_tier_demoted += 1
-                return self._accept_joint(seq, candidate, tokens, h, chunk, tier=False)
-            if paid is None:
-                paid = (candidate, tokens, h)
-            if self._joint_tier_margin <= 0:
-                # No margin to earn, so nothing further left can win. Stop
-                # rather than spend another fixpoint scan proving it.
-                break
-            candidate -= 1
-        if paid is not None:
-            return self._accept_joint(seq, *paid, chunk, tier=True)
-        return self._no_joint("no_rung_above_hbm")
-
-    def _accept_joint(
-        self,
-        seq: Sequence,
-        candidate: int,
-        tokens: int,
-        h: int,
-        chunk: int,
-        *,
-        tier: bool,
-    ) -> int:
-        """Publish `candidate` as the boundary both legs are aimed at.
-
-        `state_joint_kv_tokens` is recomputed here rather than passed in, so a
-        rung remembered during the walk and one accepted on the spot cannot be
-        published with a KV target derived at different times.
-        """
+        # One scan, and there is nothing a second one could find. `_gated_hit`
+        # already returns the rightmost rung `_resumable_from` accepts, and
+        # every test below it either restates that predicate or is true by
+        # construction, so a walk that decremented and rescanned would spend a
+        # fixpoint pass per rung to reach the same answer.
+        #
+        # An earlier version of this did walk, to prefer a rung whose state was
+        # already in HBM over a further one the tier would have to fetch. The
+        # asymmetry it priced is not there. A joint boundary always issues a KV
+        # load, so the park is paid either way and is not the paid rung's to
+        # carry. The two legs run on separate threads (`lmc-offload-load` and
+        # `lmc-state`) and `_JointPark` releases on the slower one, so the state
+        # fetch hides behind the KV transfer from the point that transfer is the
+        # larger -- about one entry's worth of tokens. What is left is a few
+        # hundred tokens of break-even, against rungs that in every production
+        # configuration sit a whole conversational turn apart. It declined
+        # nothing, and cost a scan per rung to decline it.
+        candidate = self._gated_hit(seq, cap, chain)
+        if candidate <= hbm_boundary:
+            return self._no_joint("no_rung_above_hbm")
+        tokens = candidate * hbs
+        h = chain[candidate - 1]
+        # The chunk that covers B has to be one LMCache actually holds. Cannot
+        # fail: `lmc_tokens` is chunk-floored and `tokens` is at most
+        # `cap * hbs <= lmc_tokens`, so the smallest covering multiple is at
+        # most `lmc_tokens` too. Kept, and named, as the invariant's own
+        # assertion -- if it ever counts, one of those two premises moved.
+        kv_tokens = -(-tokens // chunk) * chunk
+        if kv_tokens > lmc_tokens:
+            return self._no_joint("covering_chunk_beyond_lookup")
         seq.state_joint_boundary_tokens = tokens
         seq.state_joint_boundary_hash = h
-        seq.state_joint_kv_tokens = -(-tokens // chunk) * chunk
+        seq.state_joint_kv_tokens = kv_tokens
         self.joint_boundaries += 1
-        if tier:
-            self.joint_boundaries_tier += 1
-        else:
+        # Which pool the state leg will come out of. `_attach_state_slots` makes
+        # the same lookup and acts on it; this only records what it will find.
+        if self.state.lookup(h) >= 0:
             self.joint_boundaries_hbm += 1
+        else:
+            self.joint_boundaries_tier += 1
         return candidate
 
     def _no_joint(self, reason: str) -> int:
@@ -1652,7 +1613,6 @@ class BlockManager:
             "joint_boundaries": self.joint_boundaries,
             "joint_boundaries_hbm": self.joint_boundaries_hbm,
             "joint_boundaries_tier": self.joint_boundaries_tier,
-            "joint_tier_demoted": self.joint_tier_demoted,
         } | self._state_checkpoint_cache.checkpoint_fates()
 
     def pool_pressure(self) -> dict[str, int]:
