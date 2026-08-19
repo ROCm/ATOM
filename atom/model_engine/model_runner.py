@@ -3369,7 +3369,6 @@ class ModelRunner:
                 get_forward_context().context.positions,
                 hidden_states,
                 batch.next_token_ids,
-                not self._is_pure_middle_chunk(batch),
             )
         if pp_non_last or self._is_pure_middle_chunk(batch):
             reset_forward_context()
