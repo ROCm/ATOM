@@ -48,13 +48,14 @@ case "$CONC" in
     ENABLE_STATE_OFFLOAD="${ENABLE_STATE_OFFLOAD:-0}"
     ;;
   8)
-    MAX_NUM_SEQS="${MAX_NUM_SEQS:-32}"
+    MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"
     MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"
     GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.88}"
     ATOM_ENABLE_REPLAYSSM="${ATOM_ENABLE_REPLAYSSM:-1}"
-    STATE_CHECKPOINT_SLOTS="${STATE_CHECKPOINT_SLOTS:-96}"
-    ENABLE_LMCACHE="${ENABLE_LMCACHE:-0}"
-    ENABLE_STATE_OFFLOAD="${ENABLE_STATE_OFFLOAD:-0}"
+    STATE_CHECKPOINT_SLOTS="${STATE_CHECKPOINT_SLOTS:-16}"
+    ENABLE_LMCACHE="${ENABLE_LMCACHE:-1}"
+    LMCACHE_MAX_LOCAL_CPU_SIZE="${LMCACHE_MAX_LOCAL_CPU_SIZE:-32}"
+    ENABLE_STATE_OFFLOAD="${ENABLE_STATE_OFFLOAD:-1}"
     ;;
   10)
     MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"
@@ -98,11 +99,14 @@ if [ -n "$STATE_CHECKPOINT_SLOTS" ]; then
   STATE_CKPT_ARGS=(--state-checkpoint-slots "$STATE_CHECKPOINT_SLOTS")
 fi
 
-# CPU state-offload tier — spills recurrent SSM state off-GPU (c10 profile).
+# CPU state-offload tier — spills recurrent SSM state off-GPU (c8/c10 profiles).
 if [ "$ENABLE_STATE_OFFLOAD" == 1 ]; then
     export OFFLOAD_STATE=1
     export OFFLOAD_STATE_STAGING_GROUPS="${OFFLOAD_STATE_STAGING_GROUPS:-8}"
     export OFFLOAD_STATE_MIN_LOAD_TOKENS="${OFFLOAD_STATE_MIN_LOAD_TOKENS:-0}"
+    # Must be set: the staging buffer defaults to 2 chunks (8 MiB), one K3
+    # state entry is 54.78 MiB, and a buffer too small to hold one entry makes
+    # the tier decline to build — logged once, then nothing offloads.
     export OFFLOAD_GPU_STAGING_CHUNKS="${OFFLOAD_GPU_STAGING_CHUNKS:-16}"
 fi
 
@@ -111,8 +115,14 @@ KV_TRANSFER_ARGS=()
 if [ "$ENABLE_LMCACHE" == 1 ]; then
     export PYTHONHASHSEED=0
     export LMCACHE_LOCAL_CPU=True
-    export LMCACHE_MAX_LOCAL_CPU_SIZE="${LMCACHE_MAX_LOCAL_CPU_SIZE:-200}"
+    # GiB per rank, and every rank allocates its own — 200 never finishes
+    # pinning and hangs the launch partway through (observed at rank 2).
+    export LMCACHE_MAX_LOCAL_CPU_SIZE="${LMCACHE_MAX_LOCAL_CPU_SIZE:-32}"
     export LMCACHE_CHUNK_SIZE="${LMCACHE_CHUNK_SIZE:-256}"
+    # OFFLOAD_SAVE_PER_REQ_CACHE stays at its default 0: a sequence that owns
+    # per-request state has its KV load leg refused, so saving that KV writes
+    # bytes this engine never reads back — ~8% throughput for nothing. Only
+    # worth 1 when a separate stateless consumer shares this LMCache instance.
     export OFFLOAD_PROFILE="${OFFLOAD_PROFILE:-1}"
     KV_TRANSFER_ARGS=(--kv-transfer-config '{"kv_connector":"lmcache_offload","kv_role":"offload"}')
 fi
