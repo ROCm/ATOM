@@ -56,7 +56,7 @@ def joint_config(**overrides):
 def tier_on(monkeypatch):
     monkeypatch.setenv("OFFLOAD_STATE", "1")
     monkeypatch.setenv("OFFLOAD_STATE_STAGING_GROUPS", "2")
-    monkeypatch.setenv("OFFLOAD_STATE_JOINT_KV", "1")
+    monkeypatch.setenv("OFFLOAD_KV_FOR_HYBRID", "1")
 
 
 def make_bm():
@@ -91,6 +91,14 @@ def spilled_checkpoint(bm: BlockManager, h: int) -> None:
     assert slot >= 0
     bm.state_offload.confirm_spill(h)
     assert h in bm.state_offload.hashes
+
+
+def hbm_checkpoint(bm: BlockManager, h: int, slot: int = 0) -> None:
+    """Put `h` in the HBM state pool and nowhere else -- `spilled_checkpoint`'s
+    other half, and the case aiming only at the tier used to walk past."""
+    bm.state._index(h, slot)
+    assert bm.state.lookup(h) >= 0
+    assert h not in bm.state_offload.hashes
 
 
 def admit(bm: BlockManager, seq: Sequence, *, lmc_tokens: int) -> int:
@@ -128,7 +136,7 @@ def test_a_boundary_only_lmcache_can_reach_becomes_a_joint_load(tier_on):
 def test_the_flag_off_leaves_the_old_hbm_only_boundary(monkeypatch):
     monkeypatch.setenv("OFFLOAD_STATE", "1")
     monkeypatch.setenv("OFFLOAD_STATE_STAGING_GROUPS", "2")
-    monkeypatch.delenv("OFFLOAD_STATE_JOINT_KV", raising=False)
+    monkeypatch.setenv("OFFLOAD_KV_FOR_HYBRID", "0")
     bm = BlockManager(joint_config(), state_runtime=RUNTIME)  # flag off: real ctor
     seq = hybrid_seq()
     spilled_checkpoint(bm, chain_hash(bm, seq, 4))
@@ -193,4 +201,45 @@ def test_the_boundary_never_exceeds_what_lmcache_holds(tier_on):
     hit = admit(bm, seq, lmc_tokens=16)
 
     assert hit == 0
+    assert seq.state_joint_boundary_tokens == 16
+
+
+def test_a_checkpoint_still_in_hbm_can_carry_a_joint_boundary(tier_on):
+    """The state leg does not have to come from the tier.
+
+    `unindex` drops a checkpoint when its OWN block leaves the block index, but
+    the prefix walk stops at the first miss anywhere in the chain, so an
+    earlier block going is enough to leave a live HBM checkpoint above the HBM
+    boundary -- exactly the subset `unindex` documents as the one it does not
+    reclaim. That pair is the cheapest joint load there is: the KV comes from
+    LMCache and the state costs no transfer at all.
+    """
+    bm = make_bm()
+    seq = hybrid_seq()
+    h = chain_hash(bm, seq, 4)  # tokens [0, 16)
+    hbm_checkpoint(bm, h)
+
+    hit = admit(bm, seq, lmc_tokens=16)
+
+    assert hit == 0, "the KV prefix walk reaches nothing"
+    assert seq.state_joint_boundary_tokens == 16
+    assert seq.state_joint_boundary_hash == h
+
+    bm.allocate(seq, hit)
+
+    assert seq.state_load_hash == -1, "forked in HBM, so no tier load was asked for"
+    assert seq.state_fork_src >= 0
+
+
+def test_the_knob_defaults_on(monkeypatch):
+    """Unset is on. The pairing this file tests is the default configuration,
+    not something a benchmark has to opt into."""
+    monkeypatch.setenv("OFFLOAD_STATE", "1")
+    monkeypatch.setenv("OFFLOAD_STATE_STAGING_GROUPS", "2")
+    monkeypatch.delenv("OFFLOAD_KV_FOR_HYBRID", raising=False)
+    bm = make_bm()
+    seq = hybrid_seq()
+    spilled_checkpoint(bm, chain_hash(bm, seq, 4))
+
+    assert admit(bm, seq, lmc_tokens=16) == 0
     assert seq.state_joint_boundary_tokens == 16

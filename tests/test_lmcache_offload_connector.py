@@ -59,9 +59,10 @@ def _scheduler() -> LMCacheOffloadConnectorScheduler:
     sched.total_load_failures = 0
     sched.total_save_requests = 0
     sched.total_saved_tokens = 0
-    # Paged-KV saves for per-request-cache sequences: off in production because
-    # `_decide_load_after_alloc` refuses their load leg, kept on here so the
-    # save-path tests keep exercising the emission they are about.
+    # Paged-KV saves for per-request-cache sequences. Pinned rather than read
+    # from `kv_offload_for_hybrid()` so the save-path tests keep exercising the
+    # emission they are about whatever the environment says; the knob's own
+    # wiring is covered by the startup tests below.
     sched._save_per_req_cache = True
     sched._config = SimpleNamespace()
     sched.kv_role = "offload"
@@ -1884,9 +1885,7 @@ def _state_meta():
     return SimpleNamespace(model_name="m")
 
 
-def test_an_entry_larger_than_the_kv_buffer_gets_its_own_staging(
-    monkeypatch, caplog
-):
+def test_an_entry_larger_than_the_kv_buffer_gets_its_own_staging(monkeypatch, caplog):
     """A state entry is one entry; the KV buffer is sized in LMCache chunks, and
     at the shipped default of 2 chunks it is ~8 MiB against a ~55 MiB entry.
 
@@ -2377,8 +2376,77 @@ def test_hybrid_model_startup_warning_fires_once_and_names_the_model(caplog):
     text = warnings[0].getMessage()
     assert "qwen3_next" in text
     assert "OFFLOAD_STATE" in text
-    # Saves are unaffected; the user should not read this as "offload is off".
-    assert "SAVES still run" in text
+    # Both legs are off together, so the tier really does hold nothing but
+    # state checkpoints -- the warning must not leave saves sounding alive.
+    assert "no KV SAVE is issued" in text
+
+
+def _kv_offload_env(monkeypatch, value=None):
+    """The knob's two preconditions: the state tier on, and the knob itself."""
+    monkeypatch.setenv("OFFLOAD_STATE", "1")
+    monkeypatch.setenv("OFFLOAD_STATE_STAGING_GROUPS", "2")
+    if value is None:
+        monkeypatch.delenv("OFFLOAD_KV_FOR_HYBRID", raising=False)
+    else:
+        monkeypatch.setenv("OFFLOAD_KV_FOR_HYBRID", value)
+
+
+def test_kv_offload_for_hybrid_is_on_by_default(monkeypatch, caplog):
+    """Unset means on, and a server that offloads has nothing to warn about."""
+    _kv_offload_env(monkeypatch)
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        sched = LMCacheOffloadConnectorScheduler(_warn_config("qwen3_next"))
+
+    assert sched._save_per_req_cache is True
+    assert _hybrid_warnings(caplog) == []
+
+
+def test_kv_offload_for_hybrid_can_be_turned_off(monkeypatch, caplog):
+    _kv_offload_env(monkeypatch, "0")
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        sched = LMCacheOffloadConnectorScheduler(_warn_config("qwen3_next"))
+
+    assert sched._save_per_req_cache is False
+    assert len(_hybrid_warnings(caplog)) == 1
+
+
+def test_the_state_tier_is_a_precondition_for_hybrid_kv_offload(monkeypatch, caplog):
+    """The knob on with no tier is still off. Both legs are held to a boundary
+    `_joint_kv_boundary` picks, and it has none to pick without the tier, so
+    saving would again be storing what nothing can read."""
+    monkeypatch.delenv("OFFLOAD_STATE", raising=False)
+    monkeypatch.delenv("OFFLOAD_STATE_STAGING_GROUPS", raising=False)
+    monkeypatch.setenv("OFFLOAD_KV_FOR_HYBRID", "1")
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        sched = LMCacheOffloadConnectorScheduler(_warn_config("qwen3_next"))
+
+    assert sched._save_per_req_cache is False
+    assert len(_hybrid_warnings(caplog)) == 1
+
+
+def test_a_hybrid_enters_the_save_tracker_only_when_kv_offload_is_on():
+    """The gate the knob feeds. Off, the sequence is never tracked at all --
+    not merely skipped at emission, which would leave `_has_pending_save` true
+    forever and pin the request's blocks for good."""
+
+    def hybrid():
+        return SimpleNamespace(
+            id=77,
+            num_prompt_tokens=12,
+            token_ids=list(range(12)),
+            num_cached_tokens=0,
+            block_table=[1, 2, 3],
+            has_per_req_cache=True,
+        )
+
+    on = _scheduler()
+    on.update_state_after_alloc(hybrid())
+    assert "77" in on._save_tracker
+
+    off = _scheduler()
+    off._save_per_req_cache = False
+    off.update_state_after_alloc(hybrid())
+    assert "77" not in off._save_tracker
 
 
 def test_dense_model_gets_no_hybrid_startup_warning(caplog):
@@ -2623,7 +2691,9 @@ def test_zero_means_share_the_kv_pool(monkeypatch, caplog):
     assert "compete" in caplog.text
 
 
-def test_a_pool_that_cannot_be_built_falls_back_rather_than_failing(monkeypatch, caplog):
+def test_a_pool_that_cannot_be_built_falls_back_rather_than_failing(
+    monkeypatch, caplog
+):
     class _Builder:
         @staticmethod
         def get_or_create(*args, **kwargs):

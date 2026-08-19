@@ -112,7 +112,16 @@ if [ "$ENABLE_LMCACHE" == 1 ]; then
     export PYTHONHASHSEED=0
     export LMCACHE_LOCAL_CPU=True
     export LMCACHE_MAX_LOCAL_CPU_SIZE="${LMCACHE_MAX_LOCAL_CPU_SIZE:-200}"
-    export LMCACHE_CHUNK_SIZE="${LMCACHE_CHUNK_SIZE:-256}"
+    # One chunk == one hash block (--block-size 128), so the KV grid and the
+    # state-checkpoint grid coincide. The joint load then aims both legs at the
+    # same number instead of rounding the KV leg up to the chunk that covers
+    # the state boundary, which removes the overshoot and the
+    # `hbm_off_chunk_grid` refusal. Set 256 to A/B against the old grid.
+    export LMCACHE_CHUNK_SIZE="${LMCACHE_CHUNK_SIZE:-128}"
+    # Paged KV for a hybrid (K3 keeps a KDA recurrent state) is saved and
+    # loaded by default; set 0 to run state-checkpoints-only, which is what
+    # every measurement before the joint load was taken under.
+    export OFFLOAD_KV_FOR_HYBRID="${OFFLOAD_KV_FOR_HYBRID:-1}"
     export OFFLOAD_PROFILE="${OFFLOAD_PROFILE:-1}"
     KV_TRANSFER_ARGS=(--kv-transfer-config '{"kv_connector":"lmcache_offload","kv_role":"offload"}')
 fi
