@@ -36,13 +36,17 @@ DP_LB_DEFAULT = "least_requests"
 # Engine sockets for a multi-node run cannot use IPC paths, and the two ends
 # must derive identical TCP ports without negotiating. Both compute this plan
 # from the shared master port.
-DP_SOCKET_PORT_OFFSET = 100
-DP_PORTS_PER_ENGINE = 3
+INTERNODE_DP_SOCKET_PORT_OFFSET = 100
+INTERNODE_DP_PORTS_PER_ENGINE = 3
 
 
 @dataclass(frozen=True)
-class DPSocketPlan:
-    """The three TCP ports one engine's sockets use."""
+class InternodeDPSocketPlan:
+    """The three TCP ports one engine's sockets use, in a multi-node run.
+
+    Single-node runs never build one of these: their engines are local, so
+    CoreManager hands them IPC paths from ``get_open_zmq_ipc_path()`` instead.
+    """
 
     rank: int
     input_port: int
@@ -50,19 +54,25 @@ class DPSocketPlan:
     control_port: int
 
 
-def build_dp_socket_plan(*, engine_count: int, master_port: int) -> list[DPSocketPlan]:
-    """Derive deterministic per-engine ports from the DP master port.
+def build_internode_dp_socket_plan(
+    *, engine_count: int, master_port: int
+) -> list[InternodeDPSocketPlan]:
+    """Derive deterministic per-engine TCP ports from the DP master port.
+
+    Multi-node only -- ``CoreManager.__init__`` calls this when
+    ``is_multinode_dp`` and passes ``None`` otherwise, and that ``None`` is what
+    selects the IPC path (and, with it, the connect/bind polarity) further down.
 
     Three ports per engine: requests, outputs, and control. Control is separate
     so the request socket keeps a single writer thread (see _send_request).
     """
-    base = master_port + DP_SOCKET_PORT_OFFSET
+    base = master_port + INTERNODE_DP_SOCKET_PORT_OFFSET
     return [
-        DPSocketPlan(
+        InternodeDPSocketPlan(
             rank=rank,
-            input_port=base + rank * DP_PORTS_PER_ENGINE,
-            output_port=base + rank * DP_PORTS_PER_ENGINE + 1,
-            control_port=base + rank * DP_PORTS_PER_ENGINE + 2,
+            input_port=base + rank * INTERNODE_DP_PORTS_PER_ENGINE,
+            output_port=base + rank * INTERNODE_DP_PORTS_PER_ENGINE + 1,
+            control_port=base + rank * INTERNODE_DP_PORTS_PER_ENGINE + 2,
         )
         for rank in range(engine_count)
     ]
@@ -226,7 +236,7 @@ class CoreManager:
         # Global DP rank 0's node owns the router; the others only host engines.
         self.is_coordinator = not multinode or pc.data_parallel_rank == 0
         socket_plan = (
-            build_dp_socket_plan(
+            build_internode_dp_socket_plan(
                 engine_count=global_engine_count,
                 master_port=pc.data_parallel_master_port,
             )
