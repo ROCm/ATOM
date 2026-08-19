@@ -93,15 +93,36 @@ def set_ulimit(target_soft_limit: int = 65535) -> None:
 
 @contextlib.contextmanager
 def set_device_control_env_var(config: "Config", local_dp_rank: int):
-    """
-    Temporarily set CUDA_VISIBLE_DEVICES or equivalent
-    for engine subprocess.
+    """Publish this engine's GPU slice under the RLHF device-map variable.
+
+    Inert for the DP path that calls it, and must stay that way. It sets a
+    variable named by the literal placeholder string; the only reader is
+    ``RLHFModelRunner.DP_DEVICE_MAP_ENV`` (atom/rollout/model_runner_ext.py),
+    which consults it solely when ``data_parallel_size <= 1``. ``CoreManager``
+    only wraps a spawn in this when ``data_parallel_size > 1``, so the two
+    never meet. Do not delete the placeholder string as dead -- it is a live
+    protocol constant for the rollout adapter.
+
+    Making it set a real ``HIP_VISIBLE_DEVICES`` was tried and reverted. The
+    mask renumbers devices in the child (``cuda:0`` becomes the first *visible*
+    GPU), but ``ModelRunner._setup_device_and_distributed`` independently
+    computes an ABSOLUTE index -- ``local_dp_rank * tp_size + rank`` -- and
+    selects ``cuda:{that}``. The two offsets compound: with ``-dp 4 -tp 2``,
+    DP rank 1 would get a mask of "2,3" (two visible devices) and then ask for
+    ``cuda:2``, which no longer exists. Startup dies on the
+    ``local_device_rank >= torch.cuda.device_count()`` check -- every
+    multi-GPU DP run, including ones that ship today.
+
+    Either the mask or the absolute index can own device placement, not both.
+    ATOM uses the absolute index, so this stays inert.
     """
     world_size = config.tensor_parallel_size
     evar = "VLLM_DEVICE_CONTROL_ENV_VAR_PLACEHOLDER"
 
     value = get_device_indices(evar, local_dp_rank, world_size)
-    print(f"Setting DP rank {local_dp_rank} to {value}")
+    logger.debug(
+        "%s=%s for local DP rank %d (inert placeholder)", evar, value, local_dp_rank
+    )
     with patch.dict(os.environ, values=((evar, value),)):
         yield
 
