@@ -51,14 +51,10 @@ try:
 except (TypeError, ValueError):
     _MLA_META_SUPPORTS_MAX_SPLIT = False
 
-# Cap on the decode's KV-split budget: aiter cuts the KV walk into
+# Cap on the KV-split budget: aiter cuts the KV walk into
 # `min(num_clusters, cap * batch_size)` parts, and a negative cap means uncapped
 # -- as many parts as the machine has clusters (v1_2_device.cuh:894).
 _MLA_SPLIT_BUDGET_AUTO = -1
-
-# Prefill caps it: it already has query-dimension parallelism, so extra KV splits
-# there only buy a bigger reduce.
-_MLA_PREFILL_MAX_SPLIT_PER_BATCH = 16
 
 
 def _mla_seg_meta_kwargs() -> dict:
@@ -1050,7 +1046,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 max_seqlen_qo=1,
                 uni_seqlen_qo=1,
                 fast_mode=1,
-                max_split_per_batch=_MLA_PREFILL_MAX_SPLIT_PER_BATCH,
+                max_split_per_batch=_MLA_SPLIT_BUDGET_AUTO,
             )
             attn_metadata.sparse_prefill_work_meta_data = var[
                 "sparse_prefill_work_meta_data"
@@ -1431,7 +1427,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             max_seqlen_qo=1,
             uni_seqlen_qo=1,
             fast_mode=1,
-            max_split_per_batch=_MLA_PREFILL_MAX_SPLIT_PER_BATCH,
+            max_split_per_batch=_MLA_SPLIT_BUDGET_AUTO,
         )
         attn_metadata.sparse_prefill_work_meta_data = var[
             "sparse_prefill_work_meta_data"
