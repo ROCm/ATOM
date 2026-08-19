@@ -77,16 +77,16 @@ class ZeroCopyBuffers:
             self.max_tokens, width, dtype=dtype, device=device
         )
 
-    def get(self, name: str) -> torch.Tensor | None:
-        return self._bufs.get(name)
-
     def fits(self, n: int) -> bool:
         return n <= self.max_tokens
 
     def stage(self, name: str, tensor: torch.Tensor | None):
-        """Copy ``tensor`` (n tokens on dim 0) into ``name``'s buffer and return
-        the fixed-address slice. None-safe both ways: an unregistered name or a
-        None tensor passes the tensor through unchanged."""
+        """Copy an already-computed ``tensor`` (n tokens on dim 0) into ``name``'s
+        buffer and return the fixed-address slice.
+
+        None-safe both ways: an unregistered name or a None tensor passes the
+        tensor through unchanged.
+        """
         buf = self._bufs.get(name)
         if buf is None or tensor is None:
             return tensor
@@ -94,28 +94,21 @@ class ZeroCopyBuffers:
         buf[:n].copy_(tensor)
         return buf[:n]
 
-    def stage_inplace(
-        self,
-        name: str,
-        n: int,
-        produce_out: Callable[[torch.Tensor], Any],
-        produce_plain: Callable[[], torch.Tensor],
-        *,
-        inplace: bool,
-    ) -> torch.Tensor:
-        """Fill ``name``'s buffer from a single-tensor producer.
+    def fill(self, name: str, n: int, produce: Callable[[torch.Tensor], Any]):
+        """Hand ``name``'s first n rows to a producer that writes them in place
+        (a GEMM with ``out=``), and return that slice. Saves the copy `stage`
+        would make.
 
-        ``inplace`` says the producer can write the destination directly (a GEMM
-        with ``out=``), which saves the copy; otherwise it produces normally and
-        the result is copied in. Either way the return is ``buf[:n]``, at the
-        address the graph was captured reading.
+        Returns the slice, NOT what ``produce`` returned: this is for an input the
+        graph captures, which has to be the buffer itself. Only use it for a
+        producer that returns the destination it was handed. `LinearBase.forward`
+        does: it rebinds its result only when ``is_output_padded`` (per_Token fp8,
+        never the per_1x128 path ``out=`` needs) or on a row-parallel all-reduce
+        (``tp_dim == 1``, which neither wqkv_a nor wq_b is).
         """
-        buf = self._bufs[name]
-        if inplace:
-            produce_out(buf[:n])
-        else:
-            buf[:n].copy_(produce_plain())
-        return buf[:n]
+        dst = self._bufs[name][:n]
+        produce(dst)
+        return dst
 
 
 @dataclass(frozen=True)
