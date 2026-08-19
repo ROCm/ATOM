@@ -39,28 +39,38 @@ on:
       run_all_models:
         description: 'Run all models from models_atomesh.yaml'
         required: false
-        default: true
+        default: false
         type: boolean
       model_names:
-        description: 'Optional when run_all_models=false. Comma-separated: DeepSeek-V4-Pro,GLM-5.2-MXFP4,Kimi-K2.5-MXFP4,MiniMax-M3-MXFP4,MiniMax-M3-MXFP8'
+        description: 'When run_all_models=false, run all cases in the selected suite for these model families. Comma-separated: DeepSeek-V4-Pro,GLM-5.2-MXFP4,Kimi-K2.5-MXFP4,MiniMax-M3-MXFP4,MiniMax-M3-MXFP8'
         required: false
         default: ''
         type: string
       case_names:
-        description: >-
-          Overrides model_names. Comma-separated:
-          ds-v4-1p1d-tp8-smoke,ds-v4-1p1d-tp8,ds-v4-1p1d-dpa-tp8,
-          ds-v4-1p1d-tp8-mtp3,ds-v4-1p1d-dpa-tp8-mtp1,
-          glm-52-mxfp4-1p1d-tp4,glm-52-mxfp4-1p1d-tp8,
-          glm-52-mxfp4-1p1d-tp4-agentic-1m-c1,glm-52-mxfp4-1p1d-tp4-agentic-1m-c2,
-          glm-52-mxfp4-1p1d-tp4-agentic-1m-c4,glm-52-mxfp4-1p1d-tp4-agentic-1m-c8,
-          glm-52-mxfp4-1p1d-tp4-agentic-1m-c48,glm-52-mxfp4-1p1d-tp8-dpa-agentic-lmcache-1m-c48,
-          glm-52-mxfp4-1p1d-tp4-pcp2-agentic-lmcache-1m-c48,
-          kimi-k25-1p1d-tp4,kimi-k25-1p1d-tp4-tp8,kimi-k25-2p1d-tp4,kimi-k25-1p2d-tp4,
-          minimax-m3-fp4-1p1d-tp4,minimax-m3-fp4-2p1d-dpa-tp4,
-          minimax-m3-fp4-1p1d-tp4-eagle3,minimax-m3-fp4-2p1d-dpa-tp4-eagle3,
-          minimax-m3-fp8-1p1d-tp4,minimax-m3-fp8-2p1d-dpa-tp4,
-          minimax-m3-fp8-1p1d-tp4-eagle3,minimax-m3-fp8-2p1d-dpa-tp4-eagle3
+        description: |
+          Overrides model_names. Enter comma-separated case names.
+          DeepSeek:
+            ds-v4-1p1d-tp8-smoke,ds-v4-1p1d-tp8,ds-v4-1p1d-dpa-tp8,
+            ds-v4-1p1d-tp8-mtp3,ds-v4-1p1d-dpa-tp8-mtp1
+
+          GLM:
+            glm-52-mxfp4-1p1d-tp4,glm-52-mxfp4-1p1d-tp8,
+            glm-52-mxfp4-1p1d-tp4-agentic-1m-c1,glm-52-mxfp4-1p1d-tp4-agentic-1m-c2,
+            glm-52-mxfp4-1p1d-tp4-agentic-1m-c4,glm-52-mxfp4-1p1d-tp4-agentic-1m-c8,
+            glm-52-mxfp4-1p1d-tp4-agentic-1m-c48,
+            glm-52-mxfp4-1p1d-tp4-dpa-agentic-lmcache-1m-c24,
+            glm-52-mxfp4-1p1d-tp4-dpa-agentic-lmcache-1m-c32,
+            glm-52-mxfp4-1p1d-tp4-dpa-agentic-lmcache-1m-c48
+
+          Kimi:
+            kimi-k25-1p1d-tp4,kimi-k25-1p1d-tp4-tp8,
+            kimi-k25-2p1d-tp4,kimi-k25-1p2d-tp4
+
+          MiniMax:
+            minimax-m3-fp4-1p1d-tp4,minimax-m3-fp4-2p1d-dpa-tp4,
+            minimax-m3-fp4-1p1d-tp4-eagle3,minimax-m3-fp4-2p1d-dpa-tp4-eagle3,
+            minimax-m3-fp8-1p1d-tp4,minimax-m3-fp8-2p1d-dpa-tp4,
+            minimax-m3-fp8-1p1d-tp4-eagle3,minimax-m3-fp8-2p1d-dpa-tp4-eagle3
         required: false
         default: ''
         type: string

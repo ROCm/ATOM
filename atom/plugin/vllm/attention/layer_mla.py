@@ -179,7 +179,9 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
             cache_config.cache_dtype if cache_config is not None else kv_cache_dtype
         )
         calculate_kv_scales = (
-            cache_config.calculate_kv_scales if cache_config is not None else False
+            getattr(cache_config, "calculate_kv_scales", False)
+            if cache_config is not None
+            else False
         )
 
         MLAAttention.__init__(

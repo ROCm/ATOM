@@ -28,6 +28,7 @@ from atom.config import Config, QuantizationConfig, get_current_atom_config
 # forwards (shared with deepseek_v2/v4). Imported for the registration only.
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
 from atom.model_ops.attention_mla import MLAModules
+from atom.model_ops.attention_residual import AttnRes
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.fla_ops.fused_sigmoid_gating import (
@@ -59,7 +60,7 @@ from atom.models.utils import (
 )
 from atom.quant_spec import should_skip_online_quant
 from atom.utils import envs, mark_spliting_op
-from atom.utils.decorators import support_torch_compile
+from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import get_forward_context
 
 
@@ -438,10 +439,29 @@ class KimiSparseMoeBlock(nn.Module):
             cc = get_current_atom_config().compilation_config
             cc.static_forward_context[self.prefix] = self
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Returns ``(routed, shared)``, left unsummed.
+
+        The caller's next apply_attn_res folds both into its prefix on-load, so
+        deferring the add here removes a whole [T, H] elementwise kernel and its
+        HBM round-trip per MoE layer. ``shared`` is None when there are no shared
+        experts, when the two branches had to be summed before a collective (see
+        `split_moe_forward`), or when the dual-stream path ran.
+        """
         if self._use_dual_stream:
-            return torch.ops.aiter.maybe_dual_stream_forward(hidden_states, self.prefix)
-        return self.single_stream_moe_forward(hidden_states)
+            # maybe_dual_stream_forward is a registered custom op, and torch's
+            # schema inference has no representation for a tuple return, so the
+            # deferred add can't cross that boundary. Both dispatch targets sum
+            # internally and the pair collapses to (summed, None). Cheap to give
+            # up: dual-stream only engages at <= ATOM_DUAL_STREAM_MOE_TOKEN_
+            # THRESHOLD tokens, where the [T, H] add it costs us is small.
+            summed = torch.ops.aiter.maybe_dual_stream_forward(
+                hidden_states, self.prefix
+            )
+            return summed, None
+        return self.split_moe_forward(hidden_states)
 
     def routed_expert_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Routed-expert path only. For the latent MoE this includes the routed
@@ -474,25 +494,48 @@ class KimiSparseMoeBlock(nn.Module):
         return routed_output
 
     def single_stream_moe_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Single-tensor dispatch target for `maybe_dual_stream_forward`.
+
+        The op's schema can't carry a tuple, so this sums what
+        `split_moe_forward` hands back. Only reached via the dual-stream
+        dispatcher; `forward` calls `split_moe_forward` directly otherwise.
+        """
+        routed, shared = self.split_moe_forward(hidden_states)
+        return routed if shared is None else routed + shared
+
+    def split_moe_forward(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Routed and shared branches, returned unsummed where deferring is
+        legal. See `forward` for why the add is worth deferring."""
         identity = hidden_states
         routed_output = self.routed_expert_forward(hidden_states)
         if self.use_latent_moe:
             if self.shared_experts is not None:
                 # Shared branch is TP-partial (down_proj is row-parallel); reduce
-                # it separately and add to the already-full routed output.
+                # it separately. Both branches are full after their own
+                # all-reduce, so the add between them is deferrable.
                 shared_output = self.shared_experts(identity)
                 if self.tp_size > 1:
                     shared_output = tensor_model_parallel_all_reduce(shared_output)
-                routed_output = routed_output + shared_output
-            return routed_output
+                return routed_output, shared_output
+            return routed_output, None
         # Non-latent path: routed experts and shared experts are both TP-partial
         # and everything after them is linear, so a single deferred all-reduce
         # over their sum is correct.
         if self.shared_experts is not None:
-            routed_output = routed_output + self.shared_experts(identity)
+            shared_output = self.shared_experts(identity)
+            if self.tp_size == 1:
+                # No collective to batch, so the add is free to defer.
+                return routed_output, shared_output
+            # With TP the branches must be summed BEFORE the all-reduce: both are
+            # partial here, and while all_reduce is linear (so reducing them
+            # separately would also be correct), that would cost two collectives
+            # to save one elementwise add. Sum first, hand back a single tensor.
+            routed_output = routed_output + shared_output
         if self.tp_size > 1:
             routed_output = tensor_model_parallel_all_reduce(routed_output)
-        return routed_output
+        return routed_output, None
 
     def dual_stream_moe_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Queue routed pre-AR work first on the current stream, then run the
@@ -573,7 +616,9 @@ class KimiFullAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.fused_qkv_a_proj",
         )
-        self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=1e-6)
+        self.q_a_layernorm = RMSNorm(
+            self.q_lora_rank, eps=1e-6, prefix=f"{prefix}.q_a_layernorm"
+        )
         self.q_b_proj = ColumnParallelLinear(
             self.q_lora_rank,
             self.num_heads * self.q_head_dim,
@@ -581,7 +626,9 @@ class KimiFullAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.q_b_proj",
         )
-        self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=1e-6)
+        self.kv_a_layernorm = RMSNorm(
+            self.kv_lora_rank, eps=1e-6, prefix=f"{prefix}.kv_a_layernorm"
+        )
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
@@ -958,36 +1005,35 @@ class KimiKDAAttention(nn.Module):
         cu_seqlens: torch.Tensor | None,
         output_final_state: bool,
     ):
-        from fla.ops.kda import chunk_kda
+        from aiter.ops.triton.kimi_delta_attn import chunk_kimi_delta_attn
 
-        kwargs = {
-            "q": q,
-            "k": k,
-            "v": v,
-            "g": g,
-            # Keep beta in fp32: fla computes b = sigmoid(beta) in-kernel with
-            # use_beta_sigmoid_in_kernel, and triton's sigmoid follows the input
-            # dtype -- a bf16 beta yields a bf16 write strength, which erodes the
-            # delta-rule state update across the 71 KDA layers (measured gsm8k
-            # regression). b_proj stays bf16; only this reduction is widened.
-            "beta": beta.float(),
-            "A_log": self.A_log,
-            "dt_bias": self.dt_bias,
-            "initial_state": initial_state,
-            "output_final_state": output_final_state,
-            "use_qk_l2norm_in_kernel": True,
-            "use_gate_in_kernel": True,
-            "use_beta_sigmoid_in_kernel": True,
-            "safe_gate": self._kda_gate_lower_bound is not None,
-            "lower_bound": self._kda_gate_lower_bound,
-            "transpose_state_layout": True,
-            "cu_seqlens": cu_seqlens,
-        }
-        # FLA 0.5.1's default KDA recompute specialization is non-deterministic
-        # for long, packed gfx950 prefills and can emit extreme values. Selecting
-        # disable_recompute enables its STORE_QG specialization, which is stable
-        # and preserves the same chunk-KDA forward semantics.
-        return chunk_kda(**kwargs, disable_recompute=True)
+        return chunk_kimi_delta_attn(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            # Keep beta in fp32: the sigmoid b = sigmoid(beta) is applied
+            # in-kernel with use_beta_sigmoid_in_kernel, and triton's sigmoid
+            # follows the input dtype -- a bf16 beta yields a bf16 write
+            # strength, which erodes the delta-rule state update across the 71
+            # KDA layers (measured gsm8k regression). b_proj stays bf16; only
+            # this reduction is widened.
+            beta=beta.float(),
+            A_log=self.A_log,
+            dt_bias=self.dt_bias,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=True,
+            use_gate_in_kernel=True,
+            use_beta_sigmoid_in_kernel=True,
+            safe_gate=self._kda_gate_lower_bound is not None,
+            lower_bound=self._kda_gate_lower_bound,
+            cu_seqlens=cu_seqlens,
+            # V-first state, matching the layout mamba_v_cache holds and the
+            # fused decode kernel writes. Without it the state comes back
+            # K-first and decode reads it transposed.
+            state_v_first=True,
+        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # hidden_states is a (fp8, scale) tuple when input_layernorm fused the
@@ -1002,14 +1048,19 @@ class KimiKDAAttention(nn.Module):
             hidden_states, hidden_states_scale, self.layer_name
         )
 
+    @mark_trace
     def _forward_impl(
         self,
         hidden_states: torch.Tensor,
         hidden_states_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         fwd_ctx = get_forward_context()
-        gdn_metadata = getattr(fwd_ctx.attn_metadata, "gdn_metadata", None)
-        if gdn_metadata is None:
+        kda_metadata = getattr(fwd_ctx.attn_metadata, "kda_metadata", None)
+        if kda_metadata is None:
+            # Native ATOM/SGLang integrations still expose the shared legacy
+            # field. vLLM 0.26+ uses the dedicated KDA metadata adapter.
+            kda_metadata = getattr(fwd_ctx.attn_metadata, "gdn_metadata", None)
+        if kda_metadata is None:
             # Output is bf16 even when the input activation is fp8 (fused quant).
             return torch.zeros(
                 hidden_states.shape, dtype=torch.bfloat16, device=hidden_states.device
@@ -1021,7 +1072,7 @@ class KimiKDAAttention(nn.Module):
         if conv_state.size(1) != self.local_proj_size * 3:
             conv_state = conv_state.transpose(-1, -2)
 
-        num_actual_tokens = gdn_metadata.num_actual_tokens
+        num_actual_tokens = kda_metadata.num_actual_tokens
         hidden_states = hidden_states[:num_actual_tokens]
         if hidden_states_scale is not None:
             hidden_states_scale = hidden_states_scale[:num_actual_tokens]
@@ -1057,22 +1108,35 @@ class KimiKDAAttention(nn.Module):
         )
 
         conv_weights = self.conv_weight
-        state_indices = gdn_metadata.non_spec_state_indices_tensor
-        query_start_loc = gdn_metadata.non_spec_query_start_loc
+        state_indices = kda_metadata.non_spec_state_indices_tensor
+        # Slot the incoming state is READ from. It differs from the write slot
+        # for exactly one forward: the prefix-cache hit that forks off a
+        # checkpoint (BlockManager._attach_state_group reads `state_fork_src`
+        # and writes a freshly popped group). Reading the write slot there
+        # resumes from whatever the recycled group still held. Only prefill can
+        # carry a fork -- prepare_state_indices asserts it, and min_fork_tokens
+        # keeps the chunk long enough -- so the decode branches below stay on
+        # `state_indices`. Falling back to the write slot leaves every non-fork
+        # forward bit-identical. Mirrors attention_gdn.py.
+        state_indices_in = kda_metadata.non_spec_state_indices_in_tensor
+        if state_indices_in is None:
+            state_indices_in = state_indices
+        query_start_loc = kda_metadata.non_spec_query_start_loc
 
-        if gdn_metadata.num_prefills > 0:
+        if kda_metadata.num_prefills > 0:
             q, k, v = causal_conv1d_fn(
                 mixed_qkv.transpose(0, 1),
                 conv_weights,
                 None,
                 activation=self.activation,
                 conv_states=conv_state,
-                has_initial_state=gdn_metadata.has_initial_state,
+                has_initial_state=kda_metadata.has_initial_state,
                 cache_indices=state_indices,
+                cache_indices_in=state_indices_in,
                 query_start_loc=query_start_loc,
                 k_dim_size=self.local_proj_size,
                 v_dim_size=self.local_proj_size,
-                metadata=gdn_metadata,
+                metadata=kda_metadata,
             )
             q = rearrange(q, "t (h d) -> 1 t h d", d=self.head_dim)
             k = rearrange(k, "t (h d) -> 1 t h d", d=self.head_dim)
@@ -1083,7 +1147,7 @@ class KimiKDAAttention(nn.Module):
             from atom.model_ops.kimi_k3 import gather_kda_initial_state
 
             initial = gather_kda_initial_state(
-                ssm_state, state_indices, gdn_metadata.has_initial_state
+                ssm_state, state_indices_in, kda_metadata.has_initial_state
             )
             kda_out, last_state = self._run_kda(
                 q,
@@ -1100,7 +1164,7 @@ class KimiKDAAttention(nn.Module):
             # so no .to() cast is needed.
             ssm_state[state_indices] = last_state
             out.copy_(kda_out.squeeze(0))
-        elif gdn_metadata.num_decodes > 0:
+        elif kda_metadata.num_decodes > 0:
             # Slice the per-token cache-slot indices once (used for both the
             # conv update and the fused recurrence below).
             decode_state_indices = state_indices[:num_actual_tokens]
@@ -1137,17 +1201,17 @@ class KimiKDAAttention(nn.Module):
                 o=out,
                 initial_state=ssm_state,
                 inplace_final_state=True,
-                cu_seqlens=query_start_loc[: gdn_metadata.num_decodes + 1],
+                cu_seqlens=query_start_loc[: kda_metadata.num_decodes + 1],
                 ssm_state_indices=decode_state_indices,
                 use_qk_l2norm_in_kernel=True,
                 is_kda=True,
                 lower_bound=self._kda_gate_lower_bound,
             )
-        elif gdn_metadata.num_spec_decodes > 0:
+        elif kda_metadata.num_spec_decodes > 0:
             # Speculative-decode pass
-            spec_state_indices = gdn_metadata.spec_state_indices_tensor
-            spec_query_start_loc = gdn_metadata.spec_query_start_loc
-            num_accepted_tokens = gdn_metadata.num_accepted_tokens
+            spec_state_indices = kda_metadata.spec_state_indices_tensor
+            spec_query_start_loc = kda_metadata.spec_query_start_loc
+            num_accepted_tokens = kda_metadata.num_accepted_tokens
             q, k, v = causal_conv1d_update(
                 mixed_qkv,
                 conv_state,
@@ -1159,7 +1223,7 @@ class KimiKDAAttention(nn.Module):
                 # First reserved slot per seq holds the resume state; the kernel
                 # walks forward via num_accepted_tokens + query_start_loc.
                 conv_state_indices=spec_state_indices[:, 0][
-                    : gdn_metadata.num_spec_decodes
+                    : kda_metadata.num_spec_decodes
                 ],
                 num_accepted_tokens=num_accepted_tokens,
                 query_start_loc=spec_query_start_loc,
@@ -1180,7 +1244,7 @@ class KimiKDAAttention(nn.Module):
                 o=out,
                 initial_state=ssm_state,
                 inplace_final_state=True,
-                cu_seqlens=spec_query_start_loc[: gdn_metadata.num_spec_decodes + 1],
+                cu_seqlens=spec_query_start_loc[: kda_metadata.num_spec_decodes + 1],
                 # 2D [bs, 1+num_spec]: per-token snapshot slots. Paired with
                 # num_accepted_tokens the kernel reads the resume state from
                 # slot[num_accepted-1] and writes a snapshot after each token.
@@ -1280,11 +1344,16 @@ class KimiDecoderLayer(nn.Module):
             getattr(config, "attn_res_block_size", None) is not None
         )
         if self.use_attn_residuals:
-            self.attn_res_block_size = config.attn_res_block_size
             self.self_attention_res_norm = RMSNorm(
-                config.hidden_size, eps=config.rms_norm_eps
+                config.hidden_size,
+                eps=config.rms_norm_eps,
+                prefix=f"{prefix}.self_attention_res_norm",
             )
-            self.mlp_res_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.mlp_res_norm = RMSNorm(
+                config.hidden_size,
+                eps=config.rms_norm_eps,
+                prefix=f"{prefix}.mlp_res_norm",
+            )
             self.self_attention_res_proj = ReplicatedLinear(
                 config.hidden_size,
                 1,
@@ -1299,23 +1368,39 @@ class KimiDecoderLayer(nn.Module):
                 quant_config=None,
                 prefix=f"{prefix}.mlp_res_proj",
             )
+        # Built in both modes: a disabled AttnRes is the ordinary pre-norm
+        # residual step, which is exactly what this layer used to open-code.
+        # Both sites feed a rmsnorm, so both fold it into the kernel's store.
+        # The projs/norms above stay the parameter owners; these only alias
+        # them (see AttnRes).
+        self.self_attention_attn_res = AttnRes(
+            getattr(self, "self_attention_res_proj", None),
+            getattr(self, "self_attention_res_norm", None),
+            out_norm=self.input_layernorm,
+            enabled=self.use_attn_residuals,
+            # Only this site banks the running prefix as a candidate.
+            block_size=getattr(config, "attn_res_block_size", None),
+            layer_idx=layer_num,
+        )
+        self.mlp_attn_res = AttnRes(
+            getattr(self, "mlp_res_proj", None),
+            getattr(self, "mlp_res_norm", None),
+            out_norm=self.post_attention_layernorm,
+            enabled=self.use_attn_residuals,
+        )
 
-    def _ffn(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def _ffn(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Run the FFN, leaving the MoE's routed/shared add to the caller.
+
+        The second tensor (when not None) is folded into the next
+        apply_attn_res's prefix as ``add_hidden2``, skipping a [T, H]
+        elementwise kernel. A dense mlp has nothing to defer.
+        """
         if hasattr(self, "block_sparse_moe"):
             return self.block_sparse_moe(hidden_states)
-        return self.mlp(hidden_states)
-
-    def process_weights_after_loading(self) -> None:
-        # Fold each attn-residual (norm.weight * proj.weight) into a single
-        # static score vector consumed by apply_attn_res (see
-        # _attn_res_score_weight). Both operands are load-time constants.
-        if not self.use_attn_residuals:
-            return
-        for proj, norm in (
-            (self.self_attention_res_proj, self.self_attention_res_norm),
-            (self.mlp_res_proj, self.mlp_res_norm),
-        ):
-            proj.score_weight = _attn_res_score_weight(proj, norm)
+        return self.mlp(hidden_states), None
 
     def forward(
         self,
@@ -1323,94 +1408,61 @@ class KimiDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         block_residual: torch.Tensor | None = None,
         pending_add: torch.Tensor | None = None,
+        pending_add2: torch.Tensor | None = None,
     ):
-        if not self.use_attn_residuals:
-            if pending_add is not None:
-                hidden_states = hidden_states + pending_add
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-            if self.is_linear_attn:
-                hidden_states = self.self_attn(hidden_states)
-            else:
-                hidden_states = self.self_attn(positions, hidden_states)
-            hidden_states = residual + hidden_states
-            residual = hidden_states
-            hidden_states = self.post_attention_layernorm(hidden_states)
-            hidden_states = self._ffn(hidden_states)
-            return residual + hidden_states, None, block_residual
+        # Both sites go through AttnRes in either mode: with residuals enabled
+        # it mixes the block candidates, and without it degenerates to the
+        # ordinary pre-norm residual step. input_layernorm and
+        # post_attention_layernorm are its out_norms, so hidden_states comes
+        # back already normed at both.
+        hidden_states, prefix_sum = self.self_attention_attn_res(
+            hidden_states, block_residual, pending_add, pending_add2
+        )
+        block_residual, prefix_sum = self.self_attention_attn_res.maybe_close_block(
+            prefix_sum, block_residual
+        )
 
-        prefix_sum = hidden_states
-        if block_residual is not None and block_residual.shape[1] > 0:
-            hidden_states, prefix_sum = _apply_attn_res(
-                prefix_sum,
-                block_residual,
-                self.self_attention_res_proj,
-                self.self_attention_res_norm,
-                add_hidden=pending_add,
-            )
-        elif pending_add is not None:
-            prefix_sum = prefix_sum + pending_add
-            hidden_states = prefix_sum
-        if self.layer_idx % self.attn_res_block_size == 0:
-            assert block_residual is not None
-            block_residual = torch.cat([block_residual, prefix_sum.unsqueeze(1)], dim=1)
-            prefix_sum = None
-
-        hidden_states = self.input_layernorm(hidden_states)
         if self.is_linear_attn:
             hidden_states = self.self_attn(hidden_states)
         else:
             hidden_states = self.self_attn(positions, hidden_states)
 
+        hidden_states, prefix_sum = self.mlp_attn_res(
+            prefix_sum, block_residual, hidden_states
+        )
+        # Routed and shared expert outputs come back unsummed: the next layer's
+        # attn_res kernel folds both into its prefix on-load, so the [T, H]
+        # elementwise add that would combine them here never runs.
+        hidden_states, shared = self._ffn(hidden_states)
+        return prefix_sum, hidden_states, shared, block_residual
+
+    @staticmethod
+    def aux_hidden_state(output: tuple) -> torch.Tensor | None:
+        """Reconstruct this layer's post-layer hidden state from ``forward``'s
+        return, for a drafter tapping it as an aux hidden state.
+
+        Every DSpark draft is trained on the HF reference's
+        ``output.hidden_states[layer_idx + 1]`` -- the plain residual stream
+        after this layer, which the reference forms as
+        ``prefix_sum = prefix_sum + hidden_states`` before returning. forward()
+        deliberately does not: it hands the FFN output back unapplied so the
+        NEXT layer's attn_res kernel can fold it into its on-load, and an MoE
+        layer defers its routed and shared outputs separately so that same fold
+        absorbs their sum too. So add the pendings back here. Each is None on
+        the layers that already folded it in.
+
+        This lives on the layer rather than in the drafter because it is a
+        property of THIS layer's return protocol -- it has to change in lockstep
+        with forward(), and any drafter trained against a Kimi-K3 target needs
+        the same reconstruction.
+        """
+        prefix_sum, *pendings, _block_residual = output
         if prefix_sum is None:
-            prefix_sum = hidden_states
-            hidden_states, prefix_sum = _apply_attn_res(
-                prefix_sum, block_residual, self.mlp_res_proj, self.mlp_res_norm
-            )
-        else:
-            # Fold prefix_sum = prefix_sum + hidden_states into the fused kernel.
-            hidden_states, prefix_sum = _apply_attn_res(
-                prefix_sum,
-                block_residual,
-                self.mlp_res_proj,
-                self.mlp_res_norm,
-                add_hidden=hidden_states,
-            )
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self._ffn(hidden_states)
-        if prefix_sum is None:
-            return hidden_states, None, block_residual
-        return prefix_sum, hidden_states, block_residual
-
-
-def _attn_res_score_weight(proj: ReplicatedLinear, norm: RMSNorm) -> torch.Tensor:
-    """Fold the static rmsnorm gain and projection into one [H] score vector.
-
-    Both operands are load-time constants, so this is precomputed once in
-    ``process_weights_after_loading`` and cached on ``proj.score_weight``; the
-    apply_attn_res kernel then reads a single vector per H-chunk instead of
-    reloading norm.weight and proj.weight and multiplying them every forward.
-    """
-    return (norm.weight.float() * proj.weight.squeeze(0).float()).contiguous()
-
-
-def _apply_attn_res(
-    prefix_sum: torch.Tensor,
-    block_residual: torch.Tensor,
-    proj: ReplicatedLinear,
-    norm: RMSNorm,
-    add_hidden: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    # Returns (mixed_output, prefix_out). When add_hidden is given the fused path
-    # folds ``prefix_sum = prefix_sum + add_hidden`` into the kernel and returns
-    # the summed prefix; otherwise prefix_out is prefix_sum unchanged.
-    eps = getattr(norm, "variance_epsilon", getattr(norm, "eps", 1e-6))
-    score_weight = getattr(proj, "score_weight", None)
-    if score_weight is None:
-        score_weight = _attn_res_score_weight(proj, norm)
-    from atom.model_ops.kimi_k3 import apply_attn_res
-
-    return apply_attn_res(prefix_sum, block_residual, score_weight, eps, add_hidden)
+            return None
+        for pending in pendings:
+            if pending is not None:
+                prefix_sum = prefix_sum + pending
+        return prefix_sum
 
 
 @support_torch_compile
@@ -1448,11 +1500,16 @@ class KimiLinearModel(nn.Module):
             prefix=f"{prefix}.layers",
             layer_num_offset=0,
         )
+        use_attn_residuals = getattr(config, "attn_res_block_size", None) is not None
         if get_pp_group().is_last_rank:
-            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-            if getattr(config, "attn_res_block_size", None) is not None:
+            self.norm = RMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps, prefix=f"{prefix}.norm"
+            )
+            if use_attn_residuals:
                 self.output_attn_res_norm = RMSNorm(
-                    config.hidden_size, eps=config.rms_norm_eps
+                    config.hidden_size,
+                    eps=config.rms_norm_eps,
+                    prefix=f"{prefix}.output_attn_res_norm",
                 )
                 self.output_attn_res_proj = ReplicatedLinear(
                     config.hidden_size,
@@ -1461,21 +1518,21 @@ class KimiLinearModel(nn.Module):
                     quant_config=None,
                     prefix=f"{prefix}.output_attn_res_proj",
                 )
+            # self.norm folds into the kernel's store, so the mix it returns is
+            # the model's final hidden state. Disabled, this is just self.norm
+            # applied to the pending adds -- the old non-residual tail.
+            self.output_attn_res = AttnRes(
+                getattr(self, "output_attn_res_proj", None),
+                getattr(self, "output_attn_res_norm", None),
+                out_norm=self.norm,
+                enabled=use_attn_residuals,
+            )
         else:
             self.norm = PPMissingLayer()
 
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "block_residual"], config.hidden_size
         )
-
-    def process_weights_after_loading(self) -> None:
-        # Fold the final output attn-residual (norm.weight * proj.weight) into a
-        # single static score vector for apply_attn_res. Present only on the last
-        # PP rank when attn residuals are enabled.
-        if hasattr(self, "output_attn_res_proj"):
-            self.output_attn_res_proj.score_weight = _attn_res_score_weight(
-                self.output_attn_res_proj, self.output_attn_res_norm
-            )
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -1505,32 +1562,31 @@ class KimiLinearModel(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             block_residual = intermediate_tensors["block_residual"]
 
-        pending_add = None
+        # Each layer hands its FFN output back unapplied (pending_add), and an MoE
+        # layer hands its shared-expert output back separately (pending_add2); the
+        # next layer's attn_res kernel folds both into its prefix on-load.
+        pending_add = pending_add2 = None
         for layer in self.layers[self.start_layer : self.end_layer]:
-            hidden_states, pending_add, block_residual = layer(
+            hidden_states, pending_add, pending_add2, block_residual = layer(
                 positions,
                 hidden_states,
                 block_residual,
                 pending_add=pending_add,
+                pending_add2=pending_add2,
             )
 
         if not get_pp_group().is_last_rank:
             if pending_add is not None:
                 hidden_states = hidden_states + pending_add
+            if pending_add2 is not None:
+                hidden_states = hidden_states + pending_add2
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "block_residual": block_residual}
             )
-        if getattr(self.config, "attn_res_block_size", None) is not None:
-            hidden_states, _ = _apply_attn_res(
-                hidden_states,
-                block_residual,
-                self.output_attn_res_proj,
-                self.output_attn_res_norm,
-                add_hidden=pending_add,
-            )
-        elif pending_add is not None:
-            hidden_states = hidden_states + pending_add
-        return self.norm(hidden_states)
+        hidden_states, _ = self.output_attn_res(
+            hidden_states, block_residual, pending_add, pending_add2
+        )
+        return hidden_states
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return FusedMoE.make_expert_params_mapping(
@@ -1660,3 +1716,96 @@ class KimiK3ForCausalLM(nn.Module):
         # names, so keep these generic enough to match each layer's
         # `block_sparse_moe.experts.{id}.w*.weight` entries.
         return self.language_model.get_expert_mapping()
+
+
+class KimiK3ForConditionalGeneration(KimiK3ForCausalLM):
+    """Kimi-K3 with the MoonViT3d vision tower attached.
+
+    Adds `vision_tower` / `mm_projector` next to the language stack, matching
+    the checkpoint layout so no weight renaming is needed. Image embeddings are
+    produced once per prefill by `ModelRunner.run_model` and scattered over the
+    `<|media_pad|>` positions that the input processor expanded.
+    """
+
+    # Vision weights belong to this model, so nothing is skipped by default.
+    # `__init__` re-adds the skips on pipeline ranks that hold no tower.
+    skip_weight_prefixes: ClassVar[list[str]] = []
+    vision_weight_prefixes: ClassVar[tuple[str, ...]] = (
+        "vision_tower.",
+        "mm_projector.",
+    )
+
+    def __init__(self, atom_config: Config, prefix: str = ""):
+        super().__init__(atom_config, prefix=prefix)
+
+        vision_config = getattr(
+            getattr(atom_config, "multimodal_config", None), "vision_config", None
+        )
+        if vision_config is None:
+            raise ValueError(
+                "Kimi-K3 needs the full HF config (with `vision_config`) to "
+                "build its vision tower. Start the server with "
+                "--trust-remote-code."
+            )
+
+        # The tower only runs where the token embeddings are produced.
+        self.has_vision_tower = get_pp_group().is_first_rank
+        if not self.has_vision_tower:
+            self.vision_tower = PPMissingLayer()
+            self.mm_projector = PPMissingLayer()
+            self.skip_weight_prefixes = list(self.vision_weight_prefixes)
+            self.media_placeholder_token_id = None
+            return
+
+        from atom.models.kimi_k3_vl import build_vision_modules
+
+        self.vision_tower, self.mm_projector = build_vision_modules(vision_config)
+        self.media_placeholder_token_id = getattr(
+            atom_config.multimodal_config, "media_placeholder_token_id", 163605
+        )
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.language_model.get_input_embeddings(input_ids)
+
+    def get_vision_embeddings(
+        self, pixel_values: torch.Tensor, grid_thw: torch.Tensor
+    ) -> torch.Tensor:
+        if not self.has_vision_tower:
+            raise RuntimeError(
+                "Kimi-K3 image embeddings were requested on a pipeline rank "
+                "that holds no vision tower; they belong on the first rank."
+            )
+        return self.mm_projector(self.vision_tower(pixel_values, grid_thw))
+
+    def merge_multimodal_embeddings(
+        self,
+        input_ids: torch.Tensor,
+        inputs_embeds: torch.Tensor,
+        vision_embeds: torch.Tensor,
+    ) -> torch.Tensor:
+        mask = input_ids == self.media_placeholder_token_id
+        num_placeholders = int(mask.sum())
+        if num_placeholders != vision_embeds.shape[0]:
+            raise ValueError(
+                f"Kimi-K3 got {vision_embeds.shape[0]} image embeddings for "
+                f"{num_placeholders} placeholder tokens. The prompt's "
+                "`<|media_pad|>` runs must be expanded to (h//2)*(w//2) tokens "
+                "per image, and multimodal prefills must not be chunked."
+            )
+        inputs_embeds[mask] = vision_embeds.to(inputs_embeds.dtype)
+        return inputs_embeds
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor | IntermediateTensors:
+        # Stay on the inputs_embeds path once vision embeddings exist; the
+        # language model would otherwise re-embed input_ids and drop them.
+        if inputs_embeds is None and get_pp_group().is_first_rank:
+            inputs_embeds = self.embed_input_ids(input_ids)
+        return self.language_model(
+            input_ids, positions, intermediate_tensors, inputs_embeds
+        )

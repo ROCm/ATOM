@@ -155,6 +155,14 @@ def register_platform() -> Optional[str]:
 
     _register_hf_configs()
     _register_mxfp8_quantization_config()
+    # DeepSeek-V4's packed proxy arena cannot immediately recycle block ids;
+    # install the targeted scheduler-side queue-order compatibility patch before
+    # any KVCacheManager is constructed.
+    from atom.plugin.vllm.deepseek_v4_prefix_patch import (
+        apply_vllm_v4_block_reuse_patch,
+    )
+
+    apply_vllm_v4_block_reuse_patch()
 
     # return the ATOM platform to vllm
     return "atom.plugin.vllm.platform.ATOMPlatform"
@@ -243,6 +251,13 @@ def register_model() -> None:
         return
 
     _set_plugin_mode()
+    # The general-plugin hook runs in the EngineCore process that owns the
+    # scheduler/KVCacheManager; install this here as well as in the platform hook.
+    from atom.plugin.vllm.deepseek_v4_prefix_patch import (
+        apply_vllm_v4_block_reuse_patch,
+    )
+
+    apply_vllm_v4_block_reuse_patch()
 
     from atom.plugin.vllm.gdn_backend import register_gdn_attention_backend
 
@@ -285,6 +300,15 @@ def register_model() -> None:
     # classes. ATOM-vLLM uses its own metadata classes after attention
     # isolation, so extend that allow-list before MTP/Eagle proposal runs.
     apply_vllm_spec_decode_patch()
+
+    # vLLM 0.26 profiles CUDA graph memory on ROCm by temporarily capturing
+    # and destroying every graph. Skip that pass before it can leave stale
+    # AITER graph-owned state.
+    from atom.plugin.vllm.cudagraph_memory_profiler_patch import (
+        apply_vllm_cudagraph_memory_profiler_patch,
+    )
+
+    apply_vllm_cudagraph_memory_profiler_patch()
 
     # Patch vLLM graph_capture to also enter aiter's ca_comm.capture(),
     # avoiding hipMemcpyAsync in fused_allreduce_rmsnorm when model uses aiter collectives

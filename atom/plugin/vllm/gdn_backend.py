@@ -10,7 +10,6 @@ from __future__ import annotations
 import logging
 
 import torch
-
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionBackend,
@@ -32,9 +31,8 @@ class AtomGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
     """ATOM GDN metadata builder.
 
     Inherits vLLM's GDN builder so runner-side ``isinstance`` checks for spec
-    decode continue to work.  The post-build compaction is intentionally kept
-    here, instead of monkeypatching vLLM's builder class, to handle vLLM versions
-    where FULL-cudagraph padded decode rows can still map to real state slot 0.
+    decode continue to work. The post-build compaction rebuilds request-indexed
+    metadata for FULL-cudagraph padded decode rows.
     """
 
     def build(  # type: ignore[override]
@@ -79,8 +77,6 @@ class AtomGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         if real_num_decodes == attn_metadata.num_decodes:
             return
 
-        # vLLM 0.25.x pads num_actual_tokens for full graph replay, but this
-        # compacted GDN state/query metadata is indexed by request.
         batch_size = int(common_attn_metadata.num_reqs)
         if batch_size > self.decode_cudagraph_max_bs:
             return

@@ -255,13 +255,22 @@ existing TP ranks, so `world = tp` and `tp` must be divisible by `dcp`.
   outputs back to each rank's head slice.
 ```
 
-> **Model support.** DCP supports **MLA** models (e.g. DeepSeek-V3 / R1). Both
-> the ATOM server and the vllm-atom plugin paths are supported.
+> **Model support.** DCP supports both **dense MLA** models (e.g. DeepSeek-V3 /
+> R1) and **DeepSeek Sparse Attention (DSA / sparse MLA)** models (e.g.
+> DeepSeek-V3.2-Exp), covering both prefill and decode. For **dense MLA**, both
+> the ATOM server and the vllm-atom plugin paths are validated. For **sparse MLA
+> (DSA)**, the ATOM server path is validated; the **vllm-atom plugin path is not
+> yet verified**.
+>
+> **Not yet supported: DSA + DCP + MTP.** Speculative decode (MTP, `q > 1`) is
+> only available for dense MLA (gfx950); combining it with sparse attention under
+> DCP is rejected at runtime — see the DCP Constraints & Compatibility table below.
 
 ## When to use DCP
 
-- **Best fit**: long-context / large-batch **decode** on MLA models, where the
-  full-replicated KV cache limits context length or batch size.
+- **Best fit**: long-context / large-batch **decode** on MLA models — both dense
+  MLA (V3 / R1) and sparse MLA / DSA (V3.2-Exp) — where the full-replicated KV
+  cache limits context length or batch size.
 - **Requires**: `tp % dcp == 0`; `world = tp` (DCP reuses TP GPUs, it does *not*
   add any). E.g. `-tp 8 -dcp 8` or `-tp 8 -dcp 2` on 8 GPUs.
 - **Composes with**: prefix caching and chunked prefill (both supported under
@@ -366,6 +375,10 @@ must be applied on **global** token positions. This is handled by a dedicated
 **round-robin CP (`cprr`) MLA kernel**, selected automatically when DCP is on and
 `q > 1`.
 
+> **Dense MLA only.** This applies to dense MLA (V3 / R1). **DSA / sparse MLA
+> (V3.2-Exp) does not support MTP under DCP yet** — sparse decode with `q > 1` is
+> rejected by an assert. Serve DSA + DCP without `--method mtp`.
+
 **Support matrix:**
 
 | | Supported |
@@ -398,11 +411,12 @@ baseline (≈0.95) across bf16/fp8 and `num_speculative_tokens` 1/2/3.
 
 | Constraint | Notes |
 |-----------|-------|
-| Models | MLA only (DeepSeek-V3 / R1, …) |
+| Models | MLA only: **dense** (DeepSeek-V3 / R1, …) and **sparse / DSA** (DeepSeek-V3.2-Exp), both prefill + decode |
 | World size | `world = tp`, `tp % dcp == 0` (DCP does not add GPUs) |
 | fp8 KV cache | Supported, **per-tensor scale only** (per-token / per-group not supported) |
-| prefix caching / chunked prefill | Supported |
-| speculative decode (MTP) | Supported on **gfx950 only** (bf16/fp8, `num_speculative_tokens` 1–3); raises at startup on gfx942 |
+| prefix caching / chunked prefill | Supported (dense and sparse / DSA) |
+| speculative decode (MTP), dense MLA | Supported on **gfx950 only** (bf16/fp8, `num_speculative_tokens` 1–3); raises at startup on gfx942 |
+| speculative decode (MTP), sparse / DSA | **Not supported** — sparse decode with `q > 1` under DCP is rejected by an assert |
 | DCP + PCP | Independent dimensions (different phases); combined use not validated here |
 
 ## Source Files

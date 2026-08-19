@@ -331,7 +331,7 @@ nightly case runs ATOM's local SWE-bench Lite agentic evaluation after the
 performance trace:
 
 - `princeton-nlp/SWE-bench_Lite`, full 300-instance test split.
-- 16 local `mini-swe-agent==2.4.5` workers with a 150-step limit.
+- 32 local `mini-swe-agent==2.4.5` workers with a 150-step limit.
 - Local Docker sandboxes and official `swebench==4.1.0` scoring.
 - Accuracy is `resolved / submitted` from `exact_match,resolved`.
 - The current CI threshold is `0.50`.
@@ -342,7 +342,14 @@ Only c1 runs the full accuracy suite so the five performance jobs do not
 duplicate the same 300-instance evaluation. Rank 0 receives the host Docker
 socket and CLI for this step; no Modal credentials or InferenceX checkout is
 required. Plan for roughly 120 GB of reusable Docker image storage and at least
-16 GB of free memory on the evaluation node.
+16 GB of free memory on the evaluation node. Rank 0 also gets the host Docker
+root bind-mounted read-only so it can measure free space there; the runner
+refuses to start with less than `SWEBENCH_MIN_DISK_GB` (default 150) GiB free on
+it. If that path cannot be resolved the runner warns and proceeds without the
+check rather than blocking the run. Images pulled by the run are removed when it
+ends. Set
+`SWEBENCH_PRUNE_IMAGES=false` on a dedicated node to keep them warm for the next
+run.
 
 For a short AIPerf functional smoke test (not SWE-bench), use:
 
@@ -416,7 +423,7 @@ python3 -m atom.entrypoints.openai_server \
   --server-port 8000 \
   --default-chat-template-kwargs '{"enable_thinking":false}' \
   --kv_cache_dtype fp8 \
-  --no-enable_prefix_caching \
+  --enable_prefix_caching \
   --online_quant_config '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","*expert*"]}' \
   -tp 4 \
   >"${SERVER_LOG}" 2>&1 &
@@ -496,7 +503,7 @@ export SWEBENCH_SCORE_TIMEOUT=7200
 export SWEBENCH_KEEP_TRAJECTORIES=true
 
 # Smoke test: EVAL_LIMIT=10, AGENT_WORKERS=10
-# Full run:   EVAL_LIMIT=full, AGENT_WORKERS=16
+# Full run:   EVAL_LIMIT=full, AGENT_WORKERS=32 (matches the c1 nightly case)
 export EVAL_LIMIT=${EVAL_LIMIT:-10}
 export AGENT_WORKERS=${AGENT_WORKERS:-10}
 run_stamp="$(date +%Y%m%d_%H%M%S)"
@@ -518,7 +525,7 @@ Before starting the full run in the same shell, explicitly reset:
 
 ```bash
 export EVAL_LIMIT=full
-export AGENT_WORKERS=16
+export AGENT_WORKERS=32
 ```
 
 The runner installs pinned `mini-swe-agent==2.4.5` and `swebench==4.1.0`,

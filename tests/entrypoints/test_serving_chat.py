@@ -3,6 +3,7 @@
 
 """Tests for chat completion serving logic (chunk creation, response building)."""
 
+import asyncio
 import json
 
 from atom.entrypoints.openai.serving_chat import (
@@ -10,7 +11,10 @@ from atom.entrypoints.openai.serving_chat import (
     build_chat_response_multi,
     create_chat_chunk,
     normalize_chat_tools,
+    stream_chat_response,
+    stream_chat_response_fanout,
 )
+from atom.entrypoints.openai.streaming_dispatch import StreamOutputCollector
 
 # ============================================================================
 # normalize_chat_tools Tests
@@ -97,6 +101,14 @@ class TestCreateChatChunk:
         chunk_str = create_chat_chunk("req-1", "model")
         data = json.loads(chunk_str[6:])
         assert data["choices"][0]["delta"] == {}
+
+    def test_role_chunk_includes_empty_content(self):
+        chunk_str = create_chat_chunk(
+            "req-1", "model", delta={"role": "assistant", "content": ""}
+        )
+        data = json.loads(chunk_str[6:])
+        assert data["choices"][0]["delta"]["role"] == "assistant"
+        assert data["choices"][0]["delta"]["content"] == ""
 
     def test_finish_reason(self):
         chunk_str = create_chat_chunk("req-1", "model", finish_reason="stop")
@@ -265,3 +277,124 @@ class TestCreateChatChunkWithIndex:
         chunk_str = create_chat_chunk("req", "model", delta={"content": "hi"}, index=3)
         data = json.loads(chunk_str[6:])
         assert data["choices"][0]["index"] == 3
+
+
+# ============================================================================
+# Streaming Role Chunk Content Regression Tests
+# ============================================================================
+
+
+class TestStreamingRoleChunkContent:
+    """End-to-end regression test for the streamed role-announcement chunk.
+
+    The unit test above (test_role_chunk_includes_empty_content) only checks
+    that create_chat_chunk() can serialize a delta it's handed directly. It
+    does not exercise stream_chat_response / stream_chat_response_fanout, so
+    a regression that drops content="" inside those generators would not be
+    caught. This drives both generators directly with a minimal queue
+    payload and asserts the first emitted SSE chunk includes content="".
+    """
+
+    def test_single_stream_role_chunk_has_empty_content(self):
+        async def run():
+            collector = StreamOutputCollector("req-1")
+            collector.put_nowait({"text": "Hi", "token_ids": [1], "finished": True})
+            gen = stream_chat_response(
+                request_id="req-1",
+                model="model",
+                stream_collector=collector,
+                seq_id=0,
+                num_prompt_tokens=1,
+                cleanup_stream=lambda *a, **k: None,
+                cleanup_request=lambda *a, **k: None,
+            )
+            first_chunk = await gen.__anext__()
+            await gen.aclose()
+            return first_chunk
+
+        first_chunk = asyncio.run(run())
+        assert first_chunk.startswith("data: ")
+        data = json.loads(first_chunk[6:])
+        delta = data["choices"][0]["delta"]
+        assert delta["role"] == "assistant"
+        assert delta["content"] == ""
+
+    def test_fanout_stream_role_chunks_have_empty_content(self):
+        async def run():
+            collector = StreamOutputCollector("req-2")
+            # Empty text + finished=False means each pending chunk triggers
+            # *only* the role-announcement yield (no content/finish chunks
+            # in between), so the first two yields are guaranteed to be
+            # sibling 0's and sibling 1's role chunks respectively.
+            collector.put_nowait((0, {"text": "", "token_ids": [], "finished": False}))
+            collector.put_nowait((1, {"text": "", "token_ids": [], "finished": False}))
+            gen = stream_chat_response_fanout(
+                request_id="req-2",
+                model="model",
+                shared_collector=collector,
+                seq_ids=[0, 1],
+                num_prompt_tokens=1,
+                cleanup_stream=lambda *a, **k: None,
+                cleanup_request=lambda *a, **k: None,
+            )
+            chunk_0 = await gen.__anext__()
+            chunk_1 = await gen.__anext__()
+            await gen.aclose()
+            return chunk_0, chunk_1
+
+        chunk_0, chunk_1 = asyncio.run(run())
+        for raw_chunk, expected_index in ((chunk_0, 0), (chunk_1, 1)):
+            assert raw_chunk.startswith("data: ")
+            data = json.loads(raw_chunk[6:])
+            choice = data["choices"][0]
+            assert choice["index"] == expected_index
+            delta = choice["delta"]
+            assert delta["role"] == "assistant"
+            assert delta["content"] == ""
+
+
+class TestFanoutCleanupSplit:
+    """A fan-out has n streams but one request, and teardown reflects that.
+
+    Per-sequence work (dropping the detokenizer state, aborting a seq that is
+    still running) has to happen once per sibling; the per-request bookkeeping
+    only once. Folding both into a single callback ran the request half n
+    times, n-1 of them no-ops, and forced every caller to pass a seq id and a
+    request id together when each half needs only one of them.
+    """
+
+    def _cleanup_calls(self, seq_ids):
+        stream_calls, request_calls = [], []
+
+        async def run():
+            collector = StreamOutputCollector("req-3")
+            for index in range(len(seq_ids)):
+                collector.put_nowait(
+                    (index, {"text": "", "token_ids": [], "finished": True})
+                )
+            gen = stream_chat_response_fanout(
+                request_id="req-3",
+                model="model",
+                shared_collector=collector,
+                seq_ids=seq_ids,
+                num_prompt_tokens=1,
+                cleanup_stream=lambda seq_id, **kwargs: stream_calls.append(seq_id),
+                cleanup_request=request_calls.append,
+            )
+            async for _ in gen:
+                pass
+
+        asyncio.run(run())
+        return stream_calls, request_calls
+
+    def test_every_sibling_seq_is_torn_down(self):
+        seq_ids = [70, 71, 72, 73]
+
+        stream_calls, _ = self._cleanup_calls(seq_ids)
+
+        assert stream_calls == seq_ids
+
+    def test_the_request_is_torn_down_exactly_once(self):
+        _, request_calls = self._cleanup_calls([70, 71, 72, 73])
+
+        assert request_calls == ["req-3"]

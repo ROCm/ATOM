@@ -13,6 +13,7 @@
 
 ## 📢 News
 
+- **[2026/08]** ATOM now supports **Qwen3.8** (`Qwen3_5MoeForCausalLM`, text-only MoE). The [amd/Qwen3.8-2.4T-A95B-Quark-MXFP4](https://huggingface.co/amd/Qwen3.8-2.4T-A95B-Quark-MXFP4) checkpoint, whose MoE (expert) weights are quantized to MXFP4, runs directly on a single 8-rank MI355 machine.
 - **[2026/07] Featured AMD Developer Article:** [Day 0 Kimi-K3 Inference Deployment with ATOM on AMD Instinct MI355X GPUs](https://www.amd.com/en/developer/resources/technical-articles/2026/kimi-k3-on-amd-instinct-gpus.html) walks through Day 0 deployment of the 2.78T-parameter Kimi-K3 (KDA + Gated MLA) on a single 8x MI355X node with TP8 — why the ~1.56 TB checkpoint fits, how the weights are distributed under TP8, and how to bring the model up with ATOM and run a minimal correctness check. See [Kimi-K3 recipe](recipes/Kimi-K3.md).
 - **[2026/07]** ATOM now supports **DeepSeek-V4-Pro DSpark** speculative decoding — a semi-autoregressive block drafter (parallel backbone + Markov head + confidence head) with confidence-scheduled ragged verification, FP8 KV cache, DP attention, and PIECEWISE CUDA graphs. See [DSpark recipe](recipes/DSpark.md).
 - **[2026/06]** ATOM now supports **MiniMax-M3** inference on the native OpenAI-compatible server path, including MXFP4/MXFP8 checkpoints, FP8 KV cache, and EAGLE3 speculative decoding. See [MiniMax-M3 recipe](recipes/MiniMax-M3.md).
@@ -48,6 +49,7 @@
 | [Qwen3](https://huggingface.co/Qwen) | `Qwen3ForCausalLM` | Dense | |
 | [Qwen3-MoE](https://huggingface.co/Qwen) | `Qwen3MoeForCausalLM` | MoE | 128 experts, top-8 routing |
 | [Qwen3-Next](https://huggingface.co/Qwen) | `Qwen3NextForCausalLM` | MoE | Hybrid full attention + Gated DeltaNet |
+| [Qwen3.8](https://huggingface.co/amd/Qwen3.8-2.4T-A95B-Quark-MXFP4) | `Qwen3_5MoeForCausalLM` | MoE | 2.4T total / A95B active, 512 experts top-10, hybrid full attention + Gated DeltaNet, 1-layer MTP. MXFP4 MoE weights |
 | [DeepSeek V2/V3](https://huggingface.co/deepseek-ai) | `DeepseekV3ForCausalLM` | MoE | MLA attention, MTP speculative decoding |
 | [Mixtral](https://huggingface.co/mistralai/Mixtral-8x7B-v0.1) | `MixtralForCausalLM` | MoE | 8 experts, top-2 routing |
 | [GLM-4-MoE](https://huggingface.co/THUDM) | `Glm4MoeForCausalLM` | MoE | |
