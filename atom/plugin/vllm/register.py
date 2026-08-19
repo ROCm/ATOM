@@ -1,5 +1,4 @@
 import logging
-from typing import Optional
 
 import torch
 from transformers import AutoConfig, PretrainedConfig
@@ -12,6 +11,15 @@ logger = logging.getLogger("atom")
 
 # this flag is used to enable the vllm plugin mode
 disable_vllm_plugin = envs.ATOM_DISABLE_VLLM_PLUGIN
+
+if not disable_vllm_plugin:
+    # vLLM may select its built-in RocmPlatform before the platform plugin
+    # callback runs, so patch it at discovery-import time.
+    from atom.plugin.vllm.rocm_dcp_full_graph_patch import (
+        apply_vllm_rocm_dcp_full_graph_patch,
+    )
+
+    apply_vllm_rocm_dcp_full_graph_patch()
 
 # those 2 models are covering most of dense and moe models
 ATOM_CAUSAL_LM_MODEL_WRAPPER = "atom.plugin.vllm.model_wrapper:ATOMForCausalLM"
@@ -141,7 +149,7 @@ def _register_mxfp8_quantization_config() -> None:
             return None
 
 
-def register_platform() -> Optional[str]:
+def register_platform() -> str | None:
 
     if disable_vllm_plugin:
         # return None instead of error because the flag can be used to
