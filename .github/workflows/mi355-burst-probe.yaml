@@ -20,10 +20,9 @@ jobs:
     if: >-
       github.event_name == 'workflow_dispatch'
       || contains(github.event.pull_request.labels.*.name, 'ci:mi355-burst-probe')
-    # This is a Crusoe Slurm submit host, not the direct GPU runner used by
-    # vLLM/SGLang CI. Keep the existing direct runner workflows unchanged until
-    # this probe verifies the allocation and shared-workspace contract.
-    runs-on: atomesh-cicd-crusoe-mi355
+    # Use the existing vLLM/SGLang plugin runner. This probe must not depend on
+    # ATOMesh runners or modify the normal plugin CI execution paths.
+    runs-on: atom-mi355-8gpu-vllm-sgl-ci
     timeout-minutes: 30
     env:
       SLURM_ACCOUNT: amd-aifw-dev
