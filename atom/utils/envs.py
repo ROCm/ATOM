@@ -275,6 +275,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_USE_CUSTOM_ALL_GATHER", "1").lower() == "1"
     ),
     "ATOM_USE_FLYDSL_GDR": lambda: os.getenv("ATOM_USE_FLYDSL_GDR", "0").lower() == "1",
+    # Set "0" to drop both side streams: a win at low decode concurrency on
+    # MI355X, a loss at high (see .github/benchmark/models.json). Read at
+    # construction -- keeping them allocated is what hides MoE from Inductor.
+    "ATOM_USE_SIDE_STREAMS": lambda: os.getenv("ATOM_USE_SIDE_STREAMS", "1") == "1",
     # --- MoE (DeepSeek-style shared experts) ---
     # Dual-stream MoE only when num_tokens <= threshold; 0 disables dual-stream registration.
     "ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD": lambda: int(
