@@ -20,9 +20,9 @@ jobs:
     if: >-
       github.event_name == 'workflow_dispatch'
       || contains(github.event.pull_request.labels.*.name, 'ci:mi355-burst-probe')
-    # Use the existing vLLM/SGLang plugin runner. This probe must not depend on
-    # ATOMesh runners or modify the normal plugin CI execution paths.
-    runs-on: atom-mi355-8gpu-vllm-sgl-ci
+    # Use the existing non-GPU plugin build runner so this path does not wait
+    # for a normal MI355 CI allocation before it can submit to burst QoS.
+    runs-on: build-only-atom
     timeout-minutes: 30
     env:
       SLURM_ACCOUNT: amd-aifw-dev
