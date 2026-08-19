@@ -393,6 +393,30 @@ class PagedStateCheckpointCoordinator:
     """Schedules PAGE-backed checkpoints for per-request state."""
 
     successor_room = 0.0
+    # A PAGE image is written by a copy the runner issues after the forward that
+    # produced the state, out of the slot that forward left behind. There are no
+    # interior positions to slice: unlike a chunk kernel's `h`, the compressor
+    # ring is not materialized at boundaries inside a step. So the engine keeps
+    # cutting prefill chunks onto rungs for this class, and the three methods
+    # below are the no-ops `StateCache` documents for a class that is not
+    # readable midstep — present because `BlockManager` calls them across every
+    # member of `state_caches` without asking which kind it holds.
+    readable_midstep = False
+    # Only the last boundary a seq reached survives to be stored: `checkpoint`
+    # files one pending entry per seq and discards `boundary_blocks`. So the
+    # prompt-end anchor is not worth the prefill chunk it costs here — see
+    # `BlockManager._record_checkpoint_end`, which reads this.
+    keeps_interior_boundaries = False
+
+    def reserve_midstep(self, seq, positions: list[tuple[int, int]]) -> list[tuple]:
+        del seq, positions
+        return []
+
+    def publish_midstep(self, reservations: list[tuple], seq=None) -> None:
+        del reservations, seq
+
+    def cancel_midstep(self, reservations: list[tuple]) -> None:
+        del reservations
 
     def __init__(
         self,
@@ -427,12 +451,12 @@ class PagedStateCheckpointCoordinator:
 
     def checkpoint(self, seq: Sequence, boundary_blocks: int, h: int) -> None:
         del boundary_blocks
-        if self.applies(seq) and seq.per_req_cache_group >= 0:
+        if self.applies(seq) and seq.state_slot >= 0:
             self._pending[id(seq)] = (seq, h)
 
     def forget_pending(self, seq: Sequence) -> None:
         self._pending.pop(id(seq), None)
-        self.store.cancel_queued_restore(seq.per_req_cache_group)
+        self.store.cancel_queued_restore(seq.state_slot)
 
     def begin_restore(self, h: int, dst_slot: int) -> bool:
         return self.store.begin_restore(h, dst_slot) is not None
@@ -442,7 +466,7 @@ class PagedStateCheckpointCoordinator:
     ) -> tuple[tuple[CheckpointStoreOp, ...], tuple[CheckpointRestoreOp, ...]]:
         pending, self._pending = self._pending, {}
         for seq, h in pending.values():
-            src_slot = seq.per_req_cache_group
+            src_slot = seq.state_slot
             if src_slot < 0 or self.store.contains_or_pending(h):
                 continue
             op = self.store.begin_store(h, src_slot)
