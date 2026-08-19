@@ -392,19 +392,28 @@ def state_offload_staging_groups() -> int:
     return depth
 
 
-def state_offload_joint_kv() -> bool:
-    """Whether a sequence with per-request state may also load its paged KV.
+def kv_offload_for_hybrid() -> bool:
+    """Whether a sequence with per-request state offloads its paged KV at all.
 
-    Off by default. On, `BlockManager.can_allocate` may pick a boundary the
-    HBM prefix cache does not reach, with the state leg served by this tier and
-    the KV leg by LMCache, and both legs are held to that one boundary. The
-    connector refuses the KV leg outright while this is off, which is the
-    behaviour every measurement before this flag existed was taken under.
+    One knob for both legs, because the two are not independently useful. The
+    load leg reads the chunks the save leg wrote, so "load without save" is a
+    configuration whose every lookup misses; and "save without load" stores
+    bytes this engine has no reader for, which is what
+    `OFFLOAD_SAVE_PER_REQ_CACHE=0` existed to stop. Splitting them let both
+    be configured, and only two of the four combinations meant anything.
 
-    Same truthiness convention as `OFFLOAD_STATE`, and gated on it: the joint
-    load needs the state leg, so it cannot mean anything with the tier off.
+    On, `BlockManager.can_allocate` may pick a boundary the HBM prefix cache
+    does not reach, with the state leg served by the tier (or by an HBM
+    checkpoint the prefix walk could not get to) and the KV leg by LMCache, and
+    both legs are held to that one boundary. Off, the connector refuses the KV
+    leg outright and never tracks the sequence for saving -- the behaviour
+    every measurement before the joint load existed was taken under.
+
+    Same truthiness convention as `OFFLOAD_STATE`, and gated on it: both legs
+    need a state boundary to agree on, and `_joint_kv_boundary` has none to
+    offer with the tier off, so neither leg can mean anything there.
     """
     if state_offload_staging_groups() <= 0:
         return False
-    raw = os.environ.get("OFFLOAD_STATE_JOINT_KV", "0").strip().lower()
+    raw = os.environ.get("OFFLOAD_KV_FOR_HYBRID", "1").strip().lower()
     return bool(raw) and raw not in ("0", "false", "no", "off")

@@ -106,8 +106,10 @@ class LMCacheOffloadConnector(KVConnectorBase):
 
         # Requests whose KV leg and state leg must both land before the engine
         # is told anything. Inert until something arms it, so it costs a
-        # dictionary lookup per report while `OFFLOAD_STATE_JOINT_KV` is off --
-        # the engine only ever issues both legs for one request with it on.
+        # dictionary lookup per report for every request that does not have
+        # both legs -- which includes every one whose state came from an HBM
+        # checkpoint rather than the tier, since only a tier load is
+        # published on `state_loads` and only those are armed.
         self._joint_park = _JointPark()
 
     # -- lifecycle --------------------------------------------------------
@@ -321,7 +323,9 @@ class LMCacheOffloadConnector(KVConnectorBase):
             world_size=world,
             worker_id=rank,
         )
-        codec.bind_storage_manager(self._state_storage_manager(meta, gpu_connector, rank))
+        codec.bind_storage_manager(
+            self._state_storage_manager(meta, gpu_connector, rank)
+        )
         # No index: `StateOffloadIndex` lives in the engine process. Both
         # directions report and the engine applies.
         self._state_tier = StateOffloadTier(codec)
@@ -873,9 +877,7 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         self._save_stall_s = float(os.environ.get("OFFLOAD_SAVE_STALL_S", "120"))
         # Ceiling on requests whose blocks a save may pin at once. Each one is
         # a request that has finished and cannot be freed.
-        self._save_max_inflight = int(
-            os.environ.get("OFFLOAD_SAVE_MAX_INFLIGHT", "64")
-        )
+        self._save_max_inflight = int(os.environ.get("OFFLOAD_SAVE_MAX_INFLIGHT", "64"))
         self._save_stalled = False
         self._warned_save_stalled = False
         self._load_inflight_tokens: dict[str, int] = {}
@@ -887,19 +889,16 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         self.total_load_failures = 0
         self.total_save_requests = 0
         self.total_saved_tokens = 0
-        # Whether to store paged KV for a sequence that owns per-request state.
-        # Default off: `_decide_load_after_alloc` refuses the load leg for those
-        # sequences unconditionally, so the bytes have no reader inside this
-        # engine. Set `OFFLOAD_SAVE_PER_REQ_CACHE=1` to restore the old
-        # behaviour, which is only useful when a separate stateless consumer
-        # shares this LMCache instance -- and it is what the default should
-        # become the day that refusal is lifted.
-        self._save_per_req_cache = os.environ.get(
-            "OFFLOAD_SAVE_PER_REQ_CACHE", "0"
-        ).strip().lower() not in ("", "0", "false", "no", "off")
+        # Whether a sequence that owns per-request state offloads its paged KV.
+        # The same call `BlockManager` reads for the load leg, so the two
+        # cannot be configured into the one combination that stores bytes this
+        # engine will never read back. See `kv_offload_for_hybrid`.
+        from atom.model_engine.state_offload import kv_offload_for_hybrid
+
+        self._save_per_req_cache = kv_offload_for_hybrid()
         # State offload tier loads admitted this pass, drained by
         # `build_connector_meta`. Not keyed by req_id: two requests may resume
-        # off the same hash in one pass, each into its own group.
+        # off the same hash in one pass, each into its own slot.
         self._pending_state_loads: list[tuple] = []
         # Unaligned handoff is always on: when the HBM prefix-cache hit is not
         # chunk-aligned, recompute the misaligned head up to the next chunk
@@ -933,18 +932,22 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         self._warn_if_per_req_cache_model(config)
 
     def _warn_if_per_req_cache_model(self, config) -> None:
-        """Say once, at startup, that this model will decline every KV load.
+        """Say once, at startup, that this model offloads no paged KV at all.
 
-        `_decide_load_after_alloc` refuses loads for a per-request-cache
-        sequence, which for a hybrid model is every sequence. Without this the
-        operator sees a permanent 0% load rate and reads it as a broken cache
-        rather than a deliberate restriction. Once per server -- the refusal
-        itself is logged per request at DEBUG, and a warning at that position
-        would print on every prefill.
+        Only when it does not. With `kv_offload_for_hybrid()` on -- the default
+        -- a hybrid saves and loads like any other model, held to a boundary
+        both legs share, and there is nothing to warn about. Off, every KV load
+        is refused and no hybrid sequence is even tracked for saving, and the
+        operator sees a permanent 0% hit that reads as a broken cache rather
+        than a deliberate restriction. Once per server -- the refusal itself is
+        logged per request at DEBUG, and a warning at that position would print
+        on every prefill.
 
         The model-type set is imported rather than restated so the two cannot
         drift; the per-sequence check stays on `seq.has_per_req_cache`.
         """
+        if self._save_per_req_cache:
+            return
         model_type = getattr(getattr(config, "hf_config", None), "model_type", None)
         if model_type is None:
             return
@@ -954,14 +957,13 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
             return
         logger.warning(
             "LMCache offload: model_type=%s keeps a per-request recurrent "
-            "state (linear/compressor layers) alongside its paged KV. The "
-            "state cannot be restored from a paged-KV load, so loading KV "
-            "past the state boundary would run the linear layers over history "
-            "their state never saw. Every KV LOAD is therefore declined for "
-            "this model and a 0%% load rate is expected; KV SAVES still run "
-            "normally and populate the tier. Set OFFLOAD_STATE to enable the "
-            "state offload tier, which restores both together and lifts the "
-            "restriction.",
+            "state (linear/compressor layers) alongside its paged KV, and this "
+            "server has paged-KV offload for such models turned OFF. Every KV "
+            "LOAD is declined and no KV SAVE is issued for them, so a 0%% "
+            "offload hit rate is expected and the CPU tier will hold nothing "
+            "but state checkpoints. This is what `OFFLOAD_KV_FOR_HYBRID=0` "
+            "means; it is also what `OFFLOAD_STATE` unset means, since without "
+            "the state tier there is no boundary the two legs could share.",
             model_type,
         )
 
@@ -1131,7 +1133,7 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         # only by coincidence. So `can_allocate` picks B for both
         # (`_joint_kv_boundary`) and this clamps L down to it. Without a B the
         # refusal stands, which is also the whole behaviour with
-        # `OFFLOAD_STATE_JOINT_KV` off.
+        # `OFFLOAD_KV_FOR_HYBRID=0`.
         if getattr(seq, "has_per_req_cache", False):
             joint = int(getattr(seq, "state_joint_boundary_tokens", 0) or 0)
             if joint <= hbm:

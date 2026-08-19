@@ -171,7 +171,7 @@ class BlockManager:
         from atom.model_engine.state_offload import (
             StateOffloadIndex,
             kv_connector_hosts_state_tier,
-            state_offload_joint_kv,
+            kv_offload_for_hybrid,
             state_offload_staging_groups,
         )
 
@@ -180,7 +180,7 @@ class BlockManager:
         # does not reach. Read once: `_joint_kv_boundary` is on the admission
         # path, and a flag that could change under it would let one request's
         # two legs disagree.
-        self._joint_kv_loads = state_offload_joint_kv()
+        self._joint_kv_loads = kv_offload_for_hybrid()
         # Admissions that found a boundary for both legs, and admissions that
         # had an LMCache prefix to work with and could not.
         self.joint_boundaries = 0
@@ -535,6 +535,29 @@ class BlockManager:
         lmc_tokens = int(getattr(seq, "offload_kv_prefix_tokens", 0) or 0)
         if chunk <= 0:
             return self._no_joint("no_chunk_size")
+        # Normalized to the grid everything below compares against. An LMCache
+        # key exists only on a chunk boundary, so the lookup's own answer is a
+        # multiple of `chunk`; what breaks that is `get_num_new_matched_tokens`
+        # subtracting one token on a full-prompt hit, so the forward has
+        # something left to produce logits from. This path withholds that token
+        # anyway, in the `n_hash_blocks - 1` term of `cap`.
+        #
+        # Deliberately not sold as recovering a boundary, because it recovers
+        # none: with `lmc_tokens` off the grid the loop simply spends one of its
+        # four tries failing `kv_tokens <= lmc_tokens` by a token before landing
+        # on the same rung. What it buys is that the comparison below becomes
+        # true by construction rather than by luck -- `lmc_tokens` is now a
+        # multiple of `chunk` and `tokens <= lmc_tokens`, so the smallest
+        # covering multiple cannot exceed it -- which is worth having in a
+        # predicate whose false arm is silent lost reuse.
+        #
+        # The boundary the subtraction really does cost is a checkpoint inside
+        # the top chunk: `kv_tokens` rounds up to a chunk LMCache genuinely
+        # holds and the recorded hit says it does not. Fixing that means not
+        # distorting the hit in the first place, at both readers of it (here
+        # and `_decide_load_after_alloc`, which re-checks against the
+        # connector's own copy), and is not attempted here.
+        lmc_tokens = (lmc_tokens // chunk) * chunk
         if lmc_tokens <= hbm_boundary * hbs:
             return self._no_joint("lmcache_within_hbm")
         # The KV leg starts at the HBM prefix and moves whole chunks, and the
@@ -556,7 +579,7 @@ class BlockManager:
             h = chain[candidate - 1]
             # The chunk that covers B has to be one LMCache actually holds.
             kv_tokens = -(-tokens // chunk) * chunk
-            if kv_tokens <= lmc_tokens and self._tier_can_serve(h):
+            if kv_tokens <= lmc_tokens and self._state_reachable(h):
                 seq.state_joint_boundary_tokens = tokens
                 seq.state_joint_boundary_hash = h
                 seq.state_joint_kv_tokens = kv_tokens
@@ -816,6 +839,38 @@ class BlockManager:
             hit_hash != -1
             and self.state_offload is not None
             and hit_hash in self.state_offload.hashes
+        )
+
+    def _state_reachable(self, hit_hash: int) -> bool:
+        """Whether `hit_hash`'s state can be produced at all, from either tier.
+
+        Deliberately not `_tier_can_serve`, and the two must stay apart because
+        they answer different questions. That one asks "will a load be issued
+        for this hash", which is what decides whether an eviction may spill
+        (`pop(spill=False)` is only correct when a load is about to write the
+        group). This one asks "does this boundary have a state behind it",
+        which is what a joint boundary needs -- and an HBM checkpoint answers
+        yes to that while answering no to the other.
+
+        The HBM branch is reachable rather than redundant. `unindex` drops a
+        checkpoint when *its own* block leaves the index, but the prefix walk
+        in `can_allocate` stops at the first miss anywhere in the chain, so an
+        *earlier* block going is enough to put a live HBM checkpoint above
+        `hbm_boundary` -- exactly the case `unindex` documents as the subset it
+        does not reclaim. Refusing there sent the loop walking down past a
+        boundary whose KV LMCache holds and whose state never left HBM, which
+        is the cheapest joint load there is: no state transfer at all, just the
+        fork `_attach_state_slots` already does.
+
+        Nothing downstream needs telling which branch answered. `allocate`
+        passes the boundary's hash to `_attach_state_slots`, which looks HBM up
+        first and only falls to `_request_state_load` on a miss; and
+        `LMCacheOffloadConnector._arm_joint_loads` arms a pair only for requests
+        that appear in `state_loads`, so a KV-only leg settles through the
+        single-leg channel it already used.
+        """
+        return self._tier_can_serve(hit_hash) or (
+            hit_hash != -1 and self.state.lookup(hit_hash) >= 0
         )
 
     def _request_state_load(self, seq: Sequence, hit_hash: int) -> bool:
