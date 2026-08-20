@@ -150,7 +150,7 @@ class TestCoerceN:
 
 
 class TestBuildSamplingParams:
-    """``_build_sampling_params`` threads ``n`` into SamplingParams."""
+    """``_build_sampling_params`` threads request controls into SamplingParams."""
 
     def test_default_n_is_one(self):
         sp = api_server._build_sampling_params(
@@ -160,6 +160,15 @@ class TestBuildSamplingParams:
             ignore_eos=False,
         )
         assert sp.n == 1
+
+    def test_default_min_tokens_is_zero(self):
+        sp = api_server._build_sampling_params(
+            temperature=0.8,
+            max_tokens=16,
+            stop_strings=None,
+            ignore_eos=False,
+        )
+        assert sp.min_tokens == 0
 
     def test_n_greater_than_one_propagates(self):
         sp = api_server._build_sampling_params(
@@ -171,6 +180,16 @@ class TestBuildSamplingParams:
         )
         assert sp.n == 4
 
+    def test_min_tokens_propagates(self):
+        sp = api_server._build_sampling_params(
+            temperature=0.8,
+            max_tokens=16,
+            stop_strings=None,
+            ignore_eos=False,
+            min_tokens=3,
+        )
+        assert sp.min_tokens == 3
+
     def test_invalid_n_rejected_by_sampling_params(self):
         with pytest.raises(ValueError, match="n must be >= 1"):
             api_server._build_sampling_params(
@@ -180,6 +199,70 @@ class TestBuildSamplingParams:
                 ignore_eos=False,
                 n=0,
             )
+
+
+class TestRequestMinTokens:
+    @staticmethod
+    def _capture_sampling_params(monkeypatch):
+        captured = {}
+        build_sampling_params = api_server._build_sampling_params
+
+        def capture_sampling_params(**kwargs):
+            captured.update(kwargs)
+            return build_sampling_params(**kwargs)
+
+        monkeypatch.setattr(
+            api_server, "_build_sampling_params", capture_sampling_params
+        )
+        return captured
+
+    @staticmethod
+    async def _fake_nonstream(*_args, **_kwargs):
+        return {"text": "ok"}
+
+    def test_chat_request_forwards_min_tokens(self, monkeypatch):
+        captured = self._capture_sampling_params(monkeypatch)
+        monkeypatch.setattr(
+            api_server, "apply_chat_template", lambda *_args, **_kwargs: "prompt"
+        )
+        monkeypatch.setattr(
+            api_server,
+            "_run_nonstream_with_disconnect",
+            self._fake_nonstream,
+        )
+        monkeypatch.setattr(
+            api_server,
+            "build_chat_response",
+            lambda *_args, **_kwargs: SimpleNamespace(model_dump=dict),
+        )
+
+        request = api_server.ChatCompletionRequest.model_validate(
+            {
+                "messages": [{"role": "user", "content": "Hi"}],
+                "min_tokens": 3,
+            }
+        )
+        asyncio.run(api_server.chat_completions(request, None))
+
+        assert captured["min_tokens"] == 3
+
+    def test_completion_request_forwards_min_tokens(self, monkeypatch):
+        captured = self._capture_sampling_params(monkeypatch)
+        monkeypatch.setattr(
+            api_server,
+            "_run_nonstream_with_disconnect",
+            self._fake_nonstream,
+        )
+        monkeypatch.setattr(
+            api_server,
+            "build_completion_response",
+            lambda *_args, **_kwargs: SimpleNamespace(model_dump=dict),
+        )
+
+        request = api_server.CompletionRequest(prompt="Hi", min_tokens=3)
+        asyncio.run(api_server.completions(request, None))
+
+        assert captured["min_tokens"] == 3
 
 
 class TestAnthropicSamplingParams:

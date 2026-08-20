@@ -15,6 +15,10 @@ class TestSamplingParamsDefaults:
         sp = SamplingParams()
         assert sp.max_tokens == 64
 
+    def test_default_min_tokens(self):
+        sp = SamplingParams()
+        assert sp.min_tokens == 0
+
     def test_default_ignore_eos(self):
         sp = SamplingParams()
         assert sp.ignore_eos is False
@@ -53,3 +57,28 @@ class TestSamplingParamsCustom:
     def test_n_negative_rejected(self):
         with pytest.raises(ValueError, match="n must be >= 1"):
             SamplingParams(n=-3)
+
+    def test_min_tokens_accepted_at_max_tokens(self):
+        sp = SamplingParams(min_tokens=4, max_tokens=4)
+        assert sp.min_tokens == 4
+
+    def test_negative_min_tokens_rejected(self):
+        with pytest.raises(ValueError, match="min_tokens must be >= 0"):
+            SamplingParams(min_tokens=-1)
+
+    def test_min_tokens_above_max_tokens_rejected(self):
+        with pytest.raises(ValueError, match="min_tokens must be <= max_tokens"):
+            SamplingParams(min_tokens=5, max_tokens=4)
+
+    def test_default_min_tokens_accepts_an_empty_cap(self):
+        # `max_tokens <= 0` is a legal degenerate cap meaning "emit nothing";
+        # the scheduler's MTP truncation path relies on it. The default
+        # `min_tokens=0` asks for no floor, so it must not be read as a
+        # contradiction of that cap.
+        for max_tokens in (0, -1):
+            sp = SamplingParams(max_tokens=max_tokens)
+            assert sp.min_tokens == 0
+
+    def test_real_min_tokens_still_rejected_against_an_empty_cap(self):
+        with pytest.raises(ValueError, match="min_tokens must be <= max_tokens"):
+            SamplingParams(min_tokens=1, max_tokens=0)

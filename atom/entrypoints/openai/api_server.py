@@ -458,12 +458,14 @@ def _build_sampling_params(
     top_k: int = -1,
     top_p: float = 1.0,
     n: int = 1,
+    min_tokens: int = 0,
 ) -> SamplingParams:
     return SamplingParams(
         temperature=temperature,
         top_k=top_k,
         top_p=top_p,
         max_tokens=max_tokens,
+        min_tokens=min_tokens,
         stop_strings=stop_strings,
         ignore_eos=ignore_eos,
         n=n,
@@ -1556,6 +1558,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             top_k=request.top_k,
             top_p=request.top_p,
             n=effective_n,
+            min_tokens=request.min_tokens,
         )
 
         request_id = f"chatcmpl-{uuid.uuid4().hex}"
@@ -1783,6 +1786,7 @@ async def completions(request: CompletionRequest, raw_request: Request):
             top_k=request.top_k,
             top_p=request.top_p,
             n=effective_n,
+            min_tokens=request.min_tokens,
         )
 
         request_id = f"cmpl-{uuid.uuid4().hex}"

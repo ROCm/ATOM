@@ -187,6 +187,20 @@ class TestSchedule:
         assert seq.status == SequenceStatus.RUNNING
         assert seq.type == SequenceType.PREFILL
 
+    def test_prefill_carries_min_tokens_metadata(self, scheduler, seq_factory):
+        seq = seq_factory(
+            [1, 2, 3, 4],
+            sampling_params=SamplingParams(min_tokens=2),
+            stop_token_sequences=[[7], [8, 9]],
+        )
+        scheduler.add(seq)
+
+        batch, _seqs = scheduler.schedule()
+
+        np.testing.assert_array_equal(batch.min_tokens, [2])
+        np.testing.assert_array_equal(batch.num_completion_tokens, [0])
+        assert batch.single_token_stops == [{7}]
+
     def test_prefill_respects_max_num_seqs(self, seq_factory):
         sched = Scheduler(
             MockConfig(
