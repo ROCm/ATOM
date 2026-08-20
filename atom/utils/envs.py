@@ -29,6 +29,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_SIZE": lambda: int(os.getenv("ATOM_DP_SIZE", "1")),
     "ATOM_DP_MASTER_IP": lambda: os.getenv("ATOM_DP_MASTER_IP", "127.0.0.1"),
     "ATOM_DP_MASTER_PORT": lambda: int(os.getenv("ATOM_DP_MASTER_PORT", "29500")),
+    # Rendezvous base port; set per role when prefill/decode share a node.
+    "ATOM_DP_BASE_PORT": lambda: int(os.getenv("ATOM_DP_BASE_PORT", "0")),
     # Token-equivalent cost of one in-flight request for the "least_tokens" DP
     # load-balance strategy. The per-rank load score is
     #   sum(prompt_tokens) + ATOM_DP_LB_REQ_EQUIV * num_in_flight_requests
@@ -73,8 +75,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FUSED_COMPRESS_USE_FLYDSL": lambda: os.getenv(
         "ATOM_FUSED_COMPRESS_USE_FLYDSL", "auto"
     ).lower(),
-    # QK-norm-rope-cache-quant fusion for Qwen3-MoE; disabled by default.
-    # Enable for Qwen3-MoE to get better performance.
+    # QK-norm-rope-cache-quant fusion for Qwen3 dense and MoE; disabled by default.
     "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION", "0") == "1"
     ),
@@ -89,43 +90,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION", "1") == "1"
-    ),
-    # DeepSeek-V4 paged-SWA: retain the FULL sliding-window KV history in the
-    # content-addressed SWA cache instead of the default window-only prefill
-    # write. Default OFF preserves the window-only optimization (writes only each
-    # prefill chunk's trailing `window` tokens). When ON, swa_write persists the
-    # whole chunk and ensure_for_tokens materializes every block, so cross-request
-    # prefix hits can reuse the middle SWA blocks (agentic branch/replay reuse) —
-    # the live sliding-window free is UNCHANGED (out-of-window refs still released
-    # each chunk/decode; freed blocks stay hash+KV resident until overwritten).
-    # Pairs with a larger SWA pool (swa_pool_num_blocks) so freed-but-cached
-    # blocks survive until replay. Costs ~compressed-pool-magnitude SWA memory.
-    "ATOM_SWA_FULL_RETAIN": lambda: (os.getenv("ATOM_SWA_FULL_RETAIN", "0") == "1"),
-    # DeepSeek-V4 paged-SWA full-retain: fraction of the KV budget given to the
-    # SWA tail pool (the rest goes to the compressed pool). One SWA block is ~7x
-    # the bytes of one compressed block, so a 1:1 mirror starves the compressed
-    # prefix index; a small fraction keeps compressed near full while retaining
-    # the hot-boundary tail working set (LRU-evicted). Only consulted when
-    # ATOM_SWA_FULL_RETAIN=1. Default 0.2; tune 0.15-0.25 with cache-hit
-    # instrumentation. Clamped to (0, 0.9).
-    "ATOM_SWA_TAIL_BUDGET_FRAC": lambda: float(
-        os.getenv("ATOM_SWA_TAIL_BUDGET_FRAC", "0.2")
-    ),
-    # DeepSeek-V4 paged-SWA sparse checkpoint retention (only with
-    # ATOM_SWA_FULL_RETAIN=1). Tokens per retained SWA-tail checkpoint: 0 = dense
-    # (retain every written tail, relies on pool size — floods a small pool);
-    # >0 = keep a tail only once per this-many-tokens segment plus at each prompt
-    # boundary, and PIN those so live-window churn cannot overwrite them (mirrors
-    # vLLM VLLM_PREFIX_CACHE_RETENTION_INTERVAL / SlidingWindowManager sparse
-    # reachable_block_mask). Should be a multiple of the KV block size; 32768
-    # matches the vLLM trace-replay tuning. Default 0 (dense).
-    "ATOM_SWA_RETENTION_INTERVAL": lambda: int(
-        os.getenv("ATOM_SWA_RETENTION_INTERVAL", "0")
-    ),
-    # Fraction of the SWA pool that pinned checkpoint tails may occupy (LRU-capped)
-    # when sparse retention is on; the rest stays free for live-window churn.
-    "ATOM_SWA_CHECKPOINT_FRAC": lambda: float(
-        os.getenv("ATOM_SWA_CHECKPOINT_FRAC", "0.5")
     ),
     # DSA sparse-indexer prefill: KV-dimension chunk size (in tokens) for
     # `fp8_mqa_logits`. The dense logits buffer is [prefill_tokens, total_kv];
@@ -152,8 +116,58 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_GLM_FUSED_INDEXER": lambda: (
         os.getenv("ATOM_ENABLE_GLM_FUSED_INDEXER", "1") == "1"
     ),
+    # Kimi-K3 DSpark draft: fuse the per-layer context-row KV write
+    # (K3DSparkMLAAttention.write_context_kv) into one Triton kernel --
+    # RMSNorm(kv_c) + rope(k_pe) + concat + paged-cache store, versus today's
+    # four launches plus a throwaway `empty_like` for the rope's query side.
+    # That chain runs once per draft layer (5) per drafting step over every
+    # scheduled target token, and each op re-reads the 576-wide latent from HBM
+    # only to hand it to the next, so the win is launch count and round trips,
+    # not FLOPs. Falls back per call when the cache layout or the rope is not
+    # the plain one the kernel understands (see
+    # MLAAttention.write_context_kv_latent). Measured on Kimi-K3 (MI355X, TP8,
+    # fp8 KV): one 4.65us kernel replaces a 14us three-kernel chain, saving 39us
+    # per drafting step at B=1 and ~36us at B=64 -- 0.1% of the step, since the
+    # draft runs under a cudagraph and the launches this removes cost host time,
+    # not device time. Against the per-op chain the stored latent differs on
+    # ~1 element in 5M, where it is the fused kernel that matches an fp64
+    # reference: aiter's RMSNorm rounds x*rstd to bf16 before applying w.
+    # Set to "0" to force the per-op chain if a regression is suspected. That
+    # chain is the eligibility fallback above, not debug code, so it stays
+    # reachable (and runs the first write of every layer) either way.
+    "ATOM_DSPARK_FUSED_CTX_KV": lambda: (
+        os.getenv("ATOM_DSPARK_FUSED_CTX_KV", "1") == "1"
+    ),
     "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION", "1") == "1"
+    ),
+    # DSpark block sampling: replace the Markov head's
+    #   bias = W1[x] @ W2.float().t() ; argmax(base_logits + bias)
+    # with one fused Triton kernel (atom/model_ops/dspark_markov_sample.py).
+    # The unfused spelling casts the whole [V, r] W2 table to fp32 INSIDE the
+    # T-iteration loop (~252MB of traffic per iteration for a table that never
+    # changes) and materializes two [B, V] fp32 tensors per iteration (42MB
+    # each at B=64, V=163840) that only an argmax ever reads. The fused path
+    # keeps W2 bf16, adds the base logits in the GEMM epilogue and reduces to
+    # ids in registers, so W2 is read exactly once per block position and no
+    # [B, V] intermediate exists. Covers both native DSpark block samplers,
+    # Kimi-K3 (r=256) and DeepSeek-V4 (r=512); the op is shape-generic and
+    # hands anything it cannot index back to the reference, but only K3 has
+    # been run on hardware.
+    # The bias GEMV moves from an fp32 matmul over an fp32 copy of W2 to bf16
+    # MFMA with an fp32 accumulator. Every product is exact in fp32 either way,
+    # so the result is equal to the reference up to accumulation order; whether
+    # an argmax anywhere flips on a last-ulp tie is empirical. Measured on
+    # Kimi-K3 (MI355X, TP8, fp8 KV, full GSM8K at 64 concurrency): acceptance
+    # 87.08% against 87.06% unfused, accept-length distribution equal to within
+    # 0.1pp, flexible-extract inside the run-to-run band (0.9477 / 0.9591 fused,
+    # 0.9522 unfused). Saves 145 us per drafting step at B=1 and ~235 us at
+    # B=64. Set to "0" to force the reference spelling if an acceptance-rate
+    # regression is suspected -- the fastest way to rule this kernel in or out,
+    # since the two paths are not bit-identical by construction. Read once when
+    # the Markov head is built, so it must be set before the server starts.
+    "ATOM_DSPARK_FUSED_MARKOV_SAMPLE": lambda: (
+        os.getenv("ATOM_DSPARK_FUSED_MARKOV_SAMPLE", "1") == "1"
     ),
     # Replicate the vocab embedding on every TP rank (full table per rank, purely
     # local lookup) instead of TP-sharding it — eliminates the post-embedding
@@ -179,6 +193,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # --- Profiling & Logging ---
     "ATOM_TORCH_PROFILER_DIR": lambda: os.getenv("ATOM_TORCH_PROFILER_DIR", None),
+    # "t0,t1,t2" for gc.set_threshold(); empty keeps CPython's default.
+    # See _tune_gc in api_server.py.
+    "ATOM_GC_THRESHOLD": lambda: os.getenv("ATOM_GC_THRESHOLD", "").strip(),
     "ATOM_PROFILER_MORE": lambda: os.getenv("ATOM_PROFILER_MORE", "0") == "1",
     # When profiling is active, append detailed attention aggregates (sqsq, sqsk, sk)
     # to the prefill[]/decode[] trace labels emitted by ModelRunner.run_model.
@@ -200,6 +217,37 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # with that many threads; set to 1 to fall back to the original sequential
     # per-expert path.
     "ATOM_LOADER_NUM_THREADS": lambda: int(os.getenv("ATOM_LOADER_NUM_THREADS", "16")),
+    # Warm the page cache with a background sequential reader instead of
+    # leaving it to demand faults through the mmap. Measured on a local NVMe:
+    # the fault-driven pattern sustains 3.2 GB/s where the device does 6.9 and
+    # a single sequential reader alone reaches 6.06, so the gap is the access
+    # pattern rather than queue depth. On DeepSeek-R1 MXFP4 (350 GiB, TP=4)
+    # this takes a cold load from ~156s to ~68s and leaves the warm case
+    # slightly better too, so it is on by default; turn it off for storage
+    # where a second sequential reader competes with the loader instead of
+    # feeding it.
+    "ATOM_LOADER_PREFETCH": lambda: (
+        os.getenv("ATOM_LOADER_PREFETCH", "true").lower() == "true"
+    ),
+    # Shards read concurrently by the prefetcher. Kept small: the device here
+    # saturates at 2 streams, and every thread also competes with the loader.
+    "ATOM_LOADER_PREFETCH_THREADS": lambda: int(
+        os.getenv("ATOM_LOADER_PREFETCH_THREADS", "4")
+    ),
+    "ATOM_LOADER_PREFETCH_BLOCK_MB": lambda: int(
+        os.getenv("ATOM_LOADER_PREFETCH_BLOCK_MB", "16")
+    ),
+    # Hint the kernel to read each shard ahead. Off by default because it never
+    # paid for itself once measured on its own: the read loop runs far ahead of
+    # the workers, so WILLNEED is issued for the whole checkpoint within
+    # seconds, and asking for 350 GiB of read-ahead is bookkeeping the kernel
+    # largely discards. Cold load 193.0s vs 194.2s -- no effect; warm load
+    # 27.3s vs 42.8s -- 15.5s of pure overhead. Kept as a switch rather than
+    # deleted so the behaviour can be restored on storage that behaves
+    # differently. Ignored when prefetching, which supersedes it.
+    "ATOM_LOADER_FADVISE": lambda: (
+        os.getenv("ATOM_LOADER_FADVISE", "false").lower() == "true"
+    ),
     # Fail loading when the checkpoint does not deliver every routed expert of
     # a fused MoE parameter. On by default: the alternative is a model that
     # loads happily with some expert slots left at their init values, which
@@ -235,6 +283,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Gate/Up interleave mode for MoE weight preshuffle and kernel gate_mode.
     # "0" (default) = SEPARATED layout; "1" = INTERLEAVE layout.
     "ATOM_MOE_GU_ITLV": lambda: os.getenv("ATOM_MOE_GU_ITLV", "0") == "1",
+    # --- MoE all2all (MoRI) wire format ---
+    "ATOM_MORI_FP4_DISPATCH": lambda: (os.getenv("ATOM_MORI_FP4_DISPATCH", "0") == "1"),
+    # Combine-side codec. "none" (the MoRI default) sends bf16 back;
+    # "fp8_blockwise" selects EpCombineIntraNodeKernel_*_fp8bwq_*.
+    "ATOM_MORI_COMBINE_QUANT": lambda: os.getenv("ATOM_MORI_COMBINE_QUANT", "none"),
     # --- MTP (relaxed mtp for quantized mtp) ---
     "ATOM_ENABLE_RELAXED_MTP": lambda: (
         os.getenv("ATOM_ENABLE_RELAXED_MTP", "0").lower() == "1"
@@ -310,6 +363,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Default: False (run the draft model normally).
     "ATOM_DEBUG_FORCE_SKIP_DRAFT_MODEL": lambda: (
         os.getenv("ATOM_DEBUG_FORCE_SKIP_DRAFT_MODEL", "0") == "1"
+    ),
+    # Run the DSpark draft model eager, bypassing torch.compile, while leaving
+    # the target compiled. Rollback lever for the draft's compiled path; prefer
+    # it over --level 0, which disables compilation for BOTH models. Note that
+    # --enforce-eager does NOT disable it: support_torch_compile keys off
+    # compilation_config.level only (see atom/utils/decorators.py:485).
+    # Default: False (compile the draft).
+    "ATOM_DSPARK_DISABLE_COMPILE": lambda: (
+        os.getenv("ATOM_DSPARK_DISABLE_COMPILE", "0") == "1"
     ),
     # NOTE: DSpark runtime knobs (confidence_schedule, ragged,
     # ragged_graph_sizes, q_buckets, disable_sps_calib) are no longer env vars.
@@ -409,6 +471,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_CRASH_ON_NUMA_BIND_FAILURE": lambda: (
         os.getenv("ATOM_CRASH_ON_NUMA_BIND_FAILURE", "0") == "1"
     ),
+    # PP-boundary hidden_states/residual are TP-replicated; when on, each rank
+    # sends only its 1/tp_size slice and the receiver all-gathers, cutting PP
+    # link traffic by tp_size. Default on; set "0" for full-tensor sends.
+    "ATOM_PP_SEND_ALLGATHER": lambda: os.getenv("ATOM_PP_SEND_ALLGATHER", "1") == "1",
 }
 
 

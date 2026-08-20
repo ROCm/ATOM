@@ -1,21 +1,12 @@
-from typing import Optional
 import logging
-
+import math
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
-
 from aiter import dtypes, get_mla_metadata_info_v1, get_mla_metadata_v1
 from aiter.dist.parallel_state import get_dp_group, get_tp_group
 from aiter.jit.utils.chip_info import get_gfx
-from atom.config import get_current_atom_config
-from atom.model_ops.attention_mla import _MLA_MIN_HEADS
-from atom.plugin.vllm.attention.layer_mla import (
-    disabled_mla_persistent_metadata,
-    mla_fold_kv_metadata_triton,
-)
-from atom.utils import CpuGpuBuffer
-from atom.utils.block_convert import kv_indices_generate_triton
 from vllm.model_executor.layers.attention.mla_attention import (
     MLACommonMetadataBuilder,
     QueryLenSupport,
@@ -25,10 +16,24 @@ from vllm.v1.attention.backend import (
     AttentionMetadataBuilder,
 )
 
+from atom.config import get_current_atom_config
+from atom.distributed.dcp_utils import dcp_persistent_supported
+from atom.model_ops.attention_mla import _MLA_MIN_HEADS, mla_dcp_kernel_num_heads
+from atom.plugin.vllm.attention.layer_mla import (
+    disabled_mla_persistent_metadata,
+    mla_fold_kv_metadata_triton,
+)
+from atom.utils import CpuGpuBuffer
+from atom.utils.block_convert import kv_indices_generate_triton
+
 logger = logging.getLogger("atom")
 
 _PARTITION_SIZE_ROCM = 256
 _CP_TOKENS_PER_ITER_ROCM = 32 * 1024
+
+# aiter's persistent MLA work plan, matching ATOM's native decode settings.
+_MLA_FAST_MODE = True
+_MLA_MAX_SPLIT_PER_BATCH = 16
 
 
 def get_aiter_kv_cache_dtype(config) -> torch.dtype:
@@ -140,6 +145,10 @@ class AiterMlaDecodeMetadataForVllm:
     max_qo_len: int | None = None
     # Whether dense MLA persistent metadata was built for this decode batch.
     use_persistent_metadata: bool = False
+    # False only for a bidirectional draft block, where every position attends
+    # to the whole block. The asm kernel picks a different .co by this and the
+    # persistent work descriptors are planned for it, so the two have to agree.
+    causal: bool = True
     # The fold factor for handling mqa_ratio=64 in non-persistent mode
     fold_factor: int | None = None
     # Fold buffers for the MLA nhead-fold workaround. These are populated by
@@ -186,6 +195,10 @@ class AiterMlaPrefillMetadataForVllm:
         padded_local_cu_seq_lens: torch.Tensor | None = None
         cu_seq_lens_lst: list[list[int]] | None = None
         chunk_size: int | None = None
+        # Per-chunk local token->seq map for gather_and_maybe_dequant_cache under
+        # fp8 DCP (mirrors token_to_seq but over the padded local per-rank
+        # chunk layout). [num_chunks, max_local_toks].
+        padded_local_token_to_seq: torch.Tensor | None = None
 
     block_table: torch.Tensor
     query_start_loc: torch.Tensor
@@ -435,11 +448,13 @@ class MinimaxM3SparseMetadata:
 
 
 class MinimaxM3SparseAttentionMetadataBuilder(AttentionMetadataBuilder):
-    # Only uniform single-token decode is safe to capture. Prefill/mixed batches
-    # still use build(), where variable query lengths and CPU-side max reduction
-    # are allowed. The decode kernels consume per-step seq_lens/block_table from
-    # vLLM's fixed metadata buffers and keep their grids shape-constant.
-    _cudagraph_support = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    # Uniform decode batches are safe to capture, including spec-decode verify
+    # (query_len == num_spec + 1): the decode index-topk and sparse-attn kernels
+    # thread MAX_Q with per-token causality (causal_len = seq_len - MAX_Q + tok +
+    # 1) and their grids depend only on shape constants, so a captured (batch,
+    # query_len) shape is fixed. Prefill/mixed batches still use build(), where
+    # variable query lengths and CPU-side max reduction are allowed.
+    _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
     reorder_batch_threshold = 1
 
     def __init__(
@@ -990,9 +1005,10 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
         self,
         common_attn_metadata=None,
     ):
-        self.total_tokens = (
-            self.model_config.max_model_len
-            * self.vllm_config.scheduler_config.max_num_partial_prefills
+        self.total_tokens = self.model_config.max_model_len * getattr(
+            self.vllm_config.scheduler_config,
+            "max_num_partial_prefills",
+            1,
         )
         attn_metadata = self.build(
             common_prefix_len=0, common_attn_metadata=common_attn_metadata
@@ -1004,6 +1020,10 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
 class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
     """vLLM-only dense MLA metadata builder."""
 
+    # Multi-token (speculative verify) decode batches are uniform in shape, so
+    # they replay from a full decode graph. vLLM takes the minimum support
+    # across every backend, so anything lower here downgrades the whole model --
+    # the target's verify included -- to piecewise.
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
     reorder_batch_threshold = 1
     query_len_support = QueryLenSupport.UNIFORM
@@ -1045,6 +1065,25 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
 
         self.num_attention_heads = num_attention_heads // get_tp_group().world_size
         self.padded_num_attention_heads = max(self.num_attention_heads, _MLA_MIN_HEADS)
+        # Whether DCP decode can run in persistent mode on this GPU (gfx950 has
+        # the lse persistent kernel, gfx942 does not — see dcp_utils). Cached
+        # once to gate both the metadata sizing and the runtime persistent path.
+        self.dcp_persistent_supported = dcp_persistent_supported()
+        # DCP decode all-gathers Q across the DCP group on the head dim, so the
+        # head count reaching mla_decode_fwd (and thus the persistent decode
+        # metadata) is the gathered width padded up to a dispatchable kernel.
+        # dcp size is sourced from the parallel config so it is available here in
+        # __init__. dcp=1 -> equals padded_num_attention_heads (zero regression
+        # for non-DCP). Only scale by dcp on gfx950 (DCP persistent); gfx942
+        # stays non-persistent where this metadata is unused, so keep the
+        # original per-rank sizing.
+        dcp_size = self.parallel_config.decode_context_parallel_size
+        if dcp_size > 1 and self.dcp_persistent_supported:
+            self.persistent_num_heads = mla_dcp_kernel_num_heads(
+                self.num_attention_heads, dcp_size
+            )
+        else:
+            self.persistent_num_heads = self.padded_num_attention_heads
         self.block_size = kv_cache_spec.block_size
         self.max_bs = max_num_reqs
         self.dtype_kv = get_aiter_kv_cache_dtype(config)
@@ -1063,6 +1102,35 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
         )
         self.qo_indptr = torch.zeros(max_num_reqs + 1, dtype=torch.int32, device=device)
 
+        # reorder_batch_threshold is the widest query split_decodes_and_prefills
+        # can route to _build_decode, so it is what these work descriptors have to
+        # hold: sized for a 1-token decode, they overflow once
+        # _set_mla_persistent_worker_buffers fills them at the real width, and the
+        # persistent kernel spins on a work queue whose indptr disagrees with its
+        # work set. aiter's plan is not monotonic in the query length (bf16 wants
+        # the doubled one from 5 to 7 and the small one again at 8), so take the
+        # worst case over the range.
+        infos = [
+            get_mla_metadata_info_v1(
+                max_num_reqs,
+                qo_len,
+                self.persistent_num_heads,
+                self.dtype_q,
+                self.dtype_kv,
+                is_sparse=False,
+                fast_mode=_MLA_FAST_MODE,
+                max_split_per_batch=_MLA_MAX_SPLIT_PER_BATCH,
+            )
+            for qo_len in range(1, self.reorder_batch_threshold + 1)
+        ]
+
+        def _largest(slot: int):
+            # Each slot is (size, dtype); size is a length or a shape tuple.
+            def numel(size) -> int:
+                return size if isinstance(size, int) else math.prod(size)
+
+            return max((info[slot] for info in infos), key=lambda s: numel(s[0]))
+
         (
             (work_meta_data_size, work_meta_data_type),
             (work_indptr_size, work_indptr_type),
@@ -1070,14 +1138,13 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
             (reduce_indptr_size, reduce_indptr_type),
             (reduce_final_map_size, reduce_final_map_type),
             (reduce_partial_map_size, reduce_partial_map_type),
-        ) = get_mla_metadata_info_v1(
-            max_num_reqs,
-            1,
-            self.padded_num_attention_heads,
-            self.dtype_q,
-            self.dtype_kv,
-            is_sparse=False,
-            fast_mode=True,
+        ) = (
+            _largest(0),
+            _largest(1),
+            _largest(2),
+            _largest(3),
+            _largest(4),
+            _largest(5),
         )
 
         self.mla_persistent_metadata = {
@@ -1144,14 +1211,18 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
 
     # TODO: support mtp and sparse
     def _set_mla_persistent_worker_buffers(
-        self, bs: int, cu_seqlens_q: torch.Tensor, max_q_len: int = 1
+        self,
+        bs: int,
+        cu_seqlens_q: torch.Tensor,
+        max_q_len: int = 1,
+        causal: bool = True,
     ):
         split_params = {
             "kv_granularity": max(self.block_size, 16),
             "max_seqlen_qo": max_q_len,
             "uni_seqlen_qo": max_q_len,
-            "fast_mode": 1,
-            "max_split_per_batch": 16,
+            "fast_mode": int(_MLA_FAST_MODE),
+            "max_split_per_batch": _MLA_MAX_SPLIT_PER_BATCH,
         }
         var = self.mla_persistent_metadata
         work_meta_data = var["work_meta_data"]
@@ -1164,9 +1235,9 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
             cu_seqlens_q,
             self.paged_kv_indptr[: bs + 1],  # TODO: support sparse
             self.paged_kv_last_page_len[:bs],
-            self.padded_num_attention_heads,
+            self.persistent_num_heads,
             1,  # nhead_kv,
-            True,
+            causal,
             work_meta_data,
             work_info_set,
             work_indptr,
@@ -1196,23 +1267,43 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
         query_start_loc_device: torch.Tensor,
         num_decode_tokens: int,
         dcp_tot_seq_lens_device: torch.Tensor | None,
+        causal: bool = True,
     ):
         # kernel block size is always 1, although the kv block size is not 1.
         device = self.device
         num_reqs = seq_lens_device.size(0)
 
+        # Slicing past the end silently truncates, which would hand the metadata
+        # kernel a bs it has no indptr entries for and wedge the persistent kernel.
+        assert num_reqs + 1 <= self.paged_kv_indptr.numel(), (
+            f"decode batch of {num_reqs} requests exceeds the MLA metadata "
+            f"capacity of {self.paged_kv_indptr.numel() - 1}"
+        )
+
         paged_kv_last_page_len = self.paged_kv_last_page_len[:num_reqs]
 
+        qo_len = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+        max_qo_len = qo_len.max().item() if qo_len.numel() > 0 else 1
+
+        # A full decode graph replays at the request count it was captured on, so
+        # vLLM pads the batch with slots carrying no query rows and no sequence.
+        # The persistent work plan is laid out for a uniform query length, and
+        # those empty slots leave the kernel waiting on partials nothing produces.
+        # Give the padding one page of KV and its full share of query rows; what
+        # it computes lands in padded output slots nothing reads. Single-token
+        # decode already does this via the arange below.
+        num_padded_slots = int((qo_len == 0).sum()) if max_qo_len > 1 else 0
+        seq_lens_for_pages = (
+            seq_lens_device.clamp(min=1) if num_padded_slots else seq_lens_device
+        )
+
         torch.cumsum(
-            seq_lens_device,
+            seq_lens_for_pages,
             dim=0,
             dtype=torch.int32,
             out=self.paged_kv_indptr[1 : 1 + num_reqs],
         )
         paged_kv_indptr = self.paged_kv_indptr[: 1 + num_reqs]
-
-        qo_len = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
-        max_qo_len = qo_len.max().item() if qo_len.numel() > 0 else 1
 
         kv_indices_generate_triton(
             block_table_tensor,
@@ -1241,6 +1332,18 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
                     self.qo_indptr[num_reqs + 1 :] = num_reqs
                 self._qo_indptr_arange_ready = True
                 self._qo_indptr_arange_n = num_reqs
+        elif num_padded_slots:
+            self._qo_indptr_arange_ready = False
+            torch.arange(
+                0,
+                (num_reqs + 1) * max_qo_len,
+                max_qo_len,
+                dtype=torch.int32,
+                device=device,
+                out=self.qo_indptr[: num_reqs + 1],
+            )
+            if 1 + num_reqs < self.qo_indptr.shape[0]:
+                self.qo_indptr[1 + num_reqs :] = num_reqs * max_qo_len
         else:
             self._qo_indptr_arange_ready = False
             self.qo_indptr[: 1 + num_reqs].copy_(
@@ -1256,11 +1359,26 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
         use_persistent_metadata = (not dp_enabled) or (
             self._mla_dp_native_persistent_enabled and max_qo_len == 1
         )
+        if (
+            self.parallel_config.decode_context_parallel_size > 1
+            and not self.dcp_persistent_supported
+        ):
+            use_persistent_metadata = False
+        # Fail loudly rather than wedge the persistent kernel in a spin no timeout
+        # recovers from. Falling back to the non-persistent kernel is not an
+        # option: asm_mla.cu rejects gqa_ratio=16 fp8 decode with qo_len > 4.
+        assert (
+            not use_persistent_metadata or max_qo_len <= self.reorder_batch_threshold
+        ), (
+            f"decode query length {max_qo_len} exceeds the persistent MLA "
+            f"work-descriptor capacity {self.reorder_batch_threshold}"
+        )
         if use_persistent_metadata:
             ctx_mla_ps = self._set_mla_persistent_worker_buffers(
                 num_reqs,
                 qo_indptr,
                 max_qo_len,
+                causal=causal,
             )
             self.mla_persistent_metadata.update(ctx_mla_ps)
 
@@ -1313,6 +1431,7 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
             max_qo_len=max_qo_len,
             attn_out_dtype=self.decode_attn_out_dtype,
             use_persistent_metadata=use_persistent_metadata,
+            causal=causal,
             fold_factor=fold_factor,
             fold_kv_indptr=fold_kv_indptr,
             fold_kv_indices=fold_kv_indices,
@@ -1353,7 +1472,11 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
         # it blocks on all previous kernels.
         device = self.device
         block_table_tensor = common_attn_metadata.block_table_tensor
-        slot_mapping = common_attn_metadata.slot_mapping
+        # vLLM pads the slot mapping to the CUDA Graph bucket while counting
+        # query rows unpadded, and leaves the trim to its consumers. The MLA
+        # cache-store kernels take their token count from this tensor, so an
+        # untrimmed one makes them walk past the queries they were given.
+        slot_mapping = common_attn_metadata.slot_mapping[:num_tokens]
 
         query_start_loc = common_attn_metadata.query_start_loc
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
@@ -1418,6 +1541,18 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
                     # cannot handle `context_chunk_starts` that are not aligned
                     # to page_size
                     max_context_chunk = round_down(max_context_chunk, self.page_size)
+
+                if self.dcp_world_size > 1:
+                    # DCP: the chunk must be a whole number of virtual blocks so
+                    # it splits evenly across ranks and the
+                    # `max_context_chunk % dcp_world_size == 0` assert below
+                    # holds. On ROCm `aot_schedule` is False, so the page
+                    # round-down above is skipped — align here regardless
+                    # (dcp_virtual_block_size = cp_kv_cache_interleave_size *
+                    # dcp_world_size, always a multiple of dcp_world_size).
+                    max_context_chunk = round_down(
+                        max_context_chunk, self.dcp_virtual_block_size
+                    )
 
                 assert max_context_chunk > 0
                 num_chunks = cdiv(max_context_len_cpu, max_context_chunk)
@@ -1519,6 +1654,21 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
                         dtype=torch.int32,
                     )
 
+                    # Local token->seq map for gather_and_maybe_dequant_cache
+                    # (fp8 DCP): mirrors token_to_seq but over the padded local
+                    # per-rank chunk layout. Length per chunk == seq_tot[i].
+                    max_local_toks = int(
+                        padded_local_chunk_seq_lens.sum(dim=1).max().item()
+                    )
+                    padded_local_token_to_seq_cpu = torch.zeros(
+                        [num_chunks, max_local_toks], dtype=torch.int32
+                    )
+                    for _c in range(num_chunks):
+                        _t2s = torch.repeat_interleave(
+                            range_idx, padded_local_chunk_seq_lens[_c]
+                        )
+                        padded_local_token_to_seq_cpu[_c, : _t2s.shape[0]] = _t2s
+
                 chunked_context_metadata_cls = (
                     AiterMlaPrefillMetadataForVllm.AiterMlaChunkedContextMetadataForVllm
                 )
@@ -1546,6 +1696,9 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
                         ),
                         cu_seq_lens_lst=cu_seq_lens_cpu.tolist(),
                         chunk_size=padded_local_max_context_chunk_across_ranks,
+                        padded_local_token_to_seq=padded_local_token_to_seq_cpu.to(
+                            device, non_blocking=True
+                        ),
                         prefill_tokens_with_context=prefill_tokens_with_context,
                     )
                 else:
@@ -1600,6 +1753,8 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
                 query_start_loc_device=query_start_loc[: num_decodes + 1],
                 num_decode_tokens=num_decode_tokens,
                 dcp_tot_seq_lens_device=dcp_tot_seq_lens_device,
+                # Resolved per KV cache group by vLLM.
+                causal=common_attn_metadata.causal,
             )
 
         attn_metadata = AiterMlaMetadataForVllm(
@@ -2053,8 +2208,9 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
             from vllm.utils.platform_utils import num_compute_units
         except ImportError:
             from vllm.utils.platform_utils import get_cu_count as num_compute_units
-        from vllm.v1.worker.cp_utils import get_total_cp_world_size
         from vllm.utils.math_utils import cdiv
+        from vllm.v1.worker.cp_utils import get_kv_cache_shard_count
+
         from atom.models.utils import extract_layer_index
 
         assert isinstance(config, VllmConfig)
@@ -2122,7 +2278,7 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
         )
         max_num_blocks_per_req = cdiv(
             self.vllm_config.model_config.max_model_len,
-            self.kv_cache_spec.block_size * get_total_cp_world_size(),
+            self.kv_cache_spec.block_size * get_kv_cache_shard_count(),
         )
         self.expanded_block_table_buffer = torch.zeros(
             (
@@ -2207,8 +2363,13 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
 
         prefill_metadata = None
         if num_prefills > 0:
+            # vLLM 0.26 provides a host-resident upper bound that is exact for
+            # prefill rows. Avoid the deprecated seq_lens_cpu property, whose
+            # fallback performs an implicit device-to-host synchronization.
+            seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
+            assert seq_lens_cpu is not None
             chunk_seq_ids = split_prefill_chunks(
-                common_attn_metadata.seq_lens_cpu[num_decodes:],
+                seq_lens_cpu[num_decodes:],
                 self.max_prefill_buffer_size,
                 request_offset=num_decodes,
             )
@@ -2217,7 +2378,7 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
                     reqs_start,
                     reqs_end,
                     query_start_loc_cpu,
-                    common_attn_metadata.seq_lens_cpu,
+                    seq_lens_cpu,
                     common_attn_metadata.block_table_tensor,
                 )
                 for reqs_start, reqs_end in chunk_seq_ids

@@ -9,22 +9,26 @@ import os
 import re
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
-from typing import Any, ClassVar, Optional, Union
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import torch
-from aiter import QuantType
-from atom.quant_spec import (
-    LayerQuantConfig,
-    get_quant_parser,
-)
-from atom.utils import envs, get_open_port
-from atom.utils.distributed.utils import stateless_init_torch_distributed_process_group
 from torch.distributed import ProcessGroup, ReduceOp
 from transformers import AutoConfig, GenerationConfig, PretrainedConfig
 
 # plugin-related utilities
 from atom.plugin import is_plugin_mode, is_vllm
 from atom.plugin.config import PluginConfig
+from atom.quant_spec import (
+    LayerQuantConfig,
+    get_quant_parser,
+)
+from atom.utils import envs, get_open_port
+from atom.utils.distributed.utils import stateless_init_torch_distributed_process_group
+
+if TYPE_CHECKING:
+    # Annotation only. Importing AITER here would put a GPU kernel build behind
+    # `import atom.config`, which is what `atom.quant_spec` defers on purpose.
+    from aiter import QuantType
 
 logger = logging.getLogger("atom")
 
@@ -36,10 +40,13 @@ class KVCacheTensor:
     """
 
     layer_num: int
-    k_cache: torch.Tensor = torch.tensor([])
-    v_cache: torch.Tensor = torch.tensor([])
+    k_cache: torch.Tensor = field(default_factory=lambda: torch.tensor([]))
+    v_cache: torch.Tensor = field(default_factory=lambda: torch.tensor([]))
     k_scale: torch.Tensor = None
     v_scale: torch.Tensor = None
+    # DSA sparse layers (GLM-5.2 / DeepSeek-V3.2): indexer key cache, block-major
+    # ``(num_blocks, block_size, aligned_index_dim)``. Omitted for non-DSA layers.
+    index_cache: torch.Tensor | None = None
 
 
 @dataclass
@@ -62,12 +69,21 @@ class CUDAGraphMode(enum.Enum):
     FULL = 2
     FULL_DECODE_ONLY = (FULL, NONE)
     FULL_AND_PIECEWISE = (FULL, PIECEWISE)
+    # AF_PIECEWISE ("attention/FFN-wise"): PIECEWISE + attention core in its own
+    # cudagraph (DSpark). Tuple so decode/mixed_mode resolve to PIECEWISE (existing
+    # == PIECEWISE checks treat it as such); extra capture gated by is_attn_ffn_piecewise().
+    AF_PIECEWISE = (PIECEWISE, PIECEWISE)
 
     def decode_mode(self) -> "CUDAGraphMode":
         return CUDAGraphMode(self.value[0]) if self.separate_routine() else self
 
     def mixed_mode(self) -> "CUDAGraphMode":
         return CUDAGraphMode(self.value[1]) if self.separate_routine() else self
+
+    def is_attn_ffn_piecewise(self) -> bool:
+        """True only for AF_PIECEWISE — gates the extra attention-core cudagraph
+        (attention/FFN-wise capture) on top of the standard piecewise pieces."""
+        return self is CUDAGraphMode.AF_PIECEWISE
 
     def requires_piecewise_compilation(self) -> bool:
         return (
@@ -108,7 +124,7 @@ class CompilationConfig:
 
     local_cache_dir: str = field(default=None, init=False)  # type: ignore
     # cudagraph_capture_sizes: Optional[list[int]] = [1,2,4,8]
-    cudagraph_capture_sizes: Optional[list[int]] = None
+    cudagraph_capture_sizes: list[int] | None = None
 
     cuda_graph_sizes: list[int] = field(default_factory=list)
     """Cuda graph capture sizes
@@ -128,7 +144,7 @@ class CompilationConfig:
     use_inductor: bool = True
 
     # CudaGraph compilation
-    cudagraph_mode: Optional[CUDAGraphMode] = None
+    cudagraph_mode: CUDAGraphMode | None = None
     """
     The mode of the cudagraph:
 
@@ -137,6 +153,13 @@ class CompilationConfig:
     - FULL.
     - FULL_DECODE_ONLY.
     - FULL_AND_PIECEWISE.
+    - AF_PIECEWISE.
+
+    AF_PIECEWISE ("attention/FFN-wise") mode: PIECEWISE where the attention
+    core is ALSO captured into its own cudagraph with zero-copy public buffers
+    (DeepSeek-V4 DSpark), so small-batch decode is all-replay with no eager
+    attention gap between the dense pieces. Falls back to plain PIECEWISE
+    behavior for models that don't implement the attention-core capture.
 
     PIECEWISE mode build piecewise cudagraph only, keeping the cudagraph
     incompatiable ops (i.e. some attention ops) outside the cudagraph
@@ -168,7 +191,7 @@ class CompilationConfig:
 
     compilation_time: float = field(default=0.0, init=False)
 
-    splitting_ops: Optional[list[str]] = None
+    splitting_ops: list[str] | None = None
     """A list of ops to split the full graph into subgraphs, used in piecewise
     compilation."""
 
@@ -187,7 +210,7 @@ class CompilationConfig:
     """Additional configurations for inductor.
     - None: use default configurations."""
 
-    compile_sizes: Optional[list[Union[int, str]]] = None
+    compile_sizes: list[int | str] | None = None
     """Sizes to compile for inductor. In addition
     to integers, it also supports "cudagraph_capture_sizes" to
     specify the sizes for cudagraph capture."""
@@ -269,7 +292,7 @@ class QuantizationConfig:
     def __init__(
         self,
         config: PretrainedConfig = None,
-        online_quant_config: Optional[dict] = None,
+        online_quant_config: dict | None = None,
     ):
         if config is None:
             self.torch_dtype = torch.bfloat16
@@ -290,9 +313,7 @@ class QuantizationConfig:
         self.hf_quant_config = getattr(config, "quantization_config", None)
 
         if self.hf_quant_config is None:
-            self.global_spec = LayerQuantConfig(
-                quant_type=QuantType.No, quant_dtype=self.torch_dtype
-            )
+            self.global_spec = LayerQuantConfig.no_quant(self.torch_dtype)
             self.layer_pattern_specs = []
             self.exclude_layers = []
             self.quant_method = ""
@@ -312,8 +333,15 @@ class QuantizationConfig:
             "mxfp4",
             "mxfp8",
             "quark",
+            "compressed-tensors",
         ]:
             self.online_quant = True
+            if self.quant_method == "compressed-tensors":
+                logger.warning(
+                    "Online quant with compressed-tensors is not fully supported. "
+                    "Be careful about the online quant config setting when launching "
+                    "the server."
+                )
             online_parser = get_quant_parser("online_quant")
             online_parsed_quant_config = online_parser.parse(online_quant_config)
             self.online_global_spec = online_parsed_quant_config.global_spec
@@ -379,7 +407,7 @@ class QuantizationConfig:
     # -- convenience properties (delegate to global_spec) ---------------------
 
     @property
-    def quant_type(self) -> QuantType:
+    def quant_type(self) -> "QuantType":
         return self.global_spec.quant_type
 
     @property
@@ -424,7 +452,7 @@ class QuantizationConfig:
     def _is_excluded(
         self,
         layer_name: str,
-        exclude_layers: Optional[list[str]] = None,
+        exclude_layers: list[str] | None = None,
         *,
         check_children: bool = False,
     ) -> bool:
@@ -772,14 +800,31 @@ class ParallelConfig:
     """Number of local data parallel groups."""
     data_parallel_rank: int = 0
     """Rank of the data parallel group."""
-    data_parallel_rank_local: Optional[int] = None
+    data_parallel_rank_local: int | None = None
     """Local rank of the data parallel group,
     set only in SPMD mode."""
     decode_context_parallel_size: int = 1
     """DCP group size. tp_size must be divisible by dcp_size.
     DCP does not increase world_size; it reuses TP GPUs."""
+    pipeline_parallel_rank: int = 0
+    """Pipeline stage index of this EngineCore (0 = first stage). Each PP stage
+    runs as an independent EngineCore process; this identifies which stage."""
+    pp_meta_addrs: list = field(default_factory=list)
+    """ZMQ endpoints (len == pp_size) where each downstream stage receives the
+    scheduled batch from the head. Populated by CoreManager for pp_size > 1."""
+    pp_token_addr: str = ""
+    """ZMQ endpoint where the head receives sampled tokens back from the last
+    stage. Populated by CoreManager for pp_size > 1."""
+    control_address: str = ""
+    """ZMQ endpoint carrying control traffic (utility commands, abort, shutdown)
+    for this EngineCore, separate from the request endpoint. Keeping the two
+    apart leaves the request socket with a single writer thread, so admitting a
+    request needs no synchronization. Populated by launch_engine_core."""
+    pp_kv_status_addr: str = ""
+    """ZMQ endpoint where the head receives KV offload status from downstream
+    PP stages. All downstream stages PUSH; the head PULLs."""
     world_size: int = field(init=False)
-    """world_size is TPxPP, it affects the number of workers we create."""
+    """Vestigial: never assigned or read; engine_core derives worker count directly."""
     data_parallel_master_port: int = 29500
     """Port of the data parallel master."""
 
@@ -860,6 +905,12 @@ class ParallelConfig:
             self.data_parallel_rank = envs.ATOM_DP_RANK
         if envs.is_set("ATOM_DP_RANK_LOCAL"):
             self.data_parallel_rank_local = envs.ATOM_DP_RANK_LOCAL
+        if envs.is_set("ATOM_DP_MASTER_IP"):
+            self.data_parallel_master_ip = envs.ATOM_DP_MASTER_IP
+        if envs.is_set("ATOM_DP_MASTER_PORT"):
+            self.data_parallel_master_port = envs.ATOM_DP_MASTER_PORT
+        if envs.is_set("ATOM_DP_BASE_PORT"):
+            self.data_parallel_base_port = envs.ATOM_DP_BASE_PORT
 
 
 _DSPARK_DEFAULT_MAX_BLOCK = 16
@@ -954,12 +1005,30 @@ def _normalize_moe_config_fields(
 
 @dataclass
 class SpeculativeConfig:
-    method: Optional[str] = ""
-    model: Optional[str] = None
-    num_speculative_tokens: Optional[int] = None
-    draft_model_hf_config: Optional[PretrainedConfig] = None
+    method: str | None = ""
+    model: str | None = None
+    num_speculative_tokens: int | None = None
+    draft_model_hf_config: PretrainedConfig | None = None
     use_aux_hidden_state: bool = False
     eagle3_aux_layer_ids: list[int] = field(default_factory=list)
+    # Debug/benchmark knobs: force a speculative acceptance curve independent of
+    # the real draft/target agreement, so a run can replay a published
+    # acceptance-length figure (an InferenceX golden AL, say) while the draft head
+    # is still training. Set at most one; both resolve into
+    # `synthetic_acceptance_rates`. See ROCm/ATOM#555.
+    #
+    # Mean acceptance length in [1, num_speculative_tokens + 1], counting the
+    # target's own guaranteed token -- the same unit as vLLM's
+    # synthetic_acceptance_length and SGLang's SGLANG_SIMULATE_ACC_LEN, so a
+    # published AL can be pasted in without conversion.
+    synthetic_acceptance_length: float | None = None
+    # The same target expressed as a mean acceptance RATE in [0, 1]
+    # (accepted_draft / total_draft), i.e. (length - 1) / num_speculative_tokens.
+    synthetic_acceptance_rate: float | None = None
+    # Resolved per-position *unconditional* acceptance rates (entry i = marginal
+    # probability that the first i+1 draft tokens are all accepted), filled in by
+    # __post_init__. None => real draft/target rejection sampling.
+    synthetic_acceptance_rates: list[float] | None = None
 
     # model_type → mtp_model_type mapping
     _MTP_TYPE_MAP: ClassVar[dict[str, str]] = {
@@ -1021,7 +1090,63 @@ class SpeculativeConfig:
         cfg = self.draft_model_hf_config
         return bool(getattr(cfg, "dspark_with_draft", False))
 
+    def _resolve_synthetic_acceptance(self) -> None:
+        """Validate the forced-acceptance knobs and resolve to per-position rates.
+
+        Both knobs describe the same curve, so exactly one may be set; the rate
+        form is converted to a length and everything downstream reads only
+        ``synthetic_acceptance_rates``.
+        """
+        # Local import: the schedule lives next to the kernel that consumes it,
+        # and that module pulls in triton, which has no business loading just
+        # because someone imported a config.
+        from atom.model_ops.rejection_sampler import acceptance_length_to_rates
+
+        if (
+            self.synthetic_acceptance_length is not None
+            and self.synthetic_acceptance_rate is not None
+        ):
+            raise ValueError(
+                "--spec-decode-acceptance-length and --spec-decode-acceptance-rate "
+                "describe the same curve; set at most one."
+            )
+        length = self.synthetic_acceptance_length
+        if self.synthetic_acceptance_rate is None and length is None:
+            return
+
+        n = self.num_speculative_tokens
+        if not n:
+            raise ValueError(
+                "Forced speculative acceptance needs --num-speculative-tokens, "
+                f"but it is {n!r}."
+            )
+        if self.synthetic_acceptance_rate is not None:
+            rate = self.synthetic_acceptance_rate
+            if not 0.0 <= rate <= 1.0:
+                raise ValueError(
+                    "synthetic_acceptance_rate (--spec-decode-acceptance-rate) "
+                    f"must be in [0, 1], but got {rate}."
+                )
+            length = 1.0 + n * rate
+        if not 1.0 <= length <= float(n + 1):
+            raise ValueError(
+                "synthetic_acceptance_length (--spec-decode-acceptance-length) "
+                f"must be in [1, {n + 1}] for num_speculative_tokens={n}, but got "
+                f"{length}."
+            )
+        self.synthetic_acceptance_length = length
+        self.synthetic_acceptance_rates = acceptance_length_to_rates(length, n)
+        logger.info(
+            "Forced speculative acceptance ON: mean acceptance length %.4f over "
+            "%d draft positions (per-position rates %s). Throughput numbers from "
+            "this run are synthetic; output text and accuracy are meaningless.",
+            length,
+            n,
+            [round(r, 4) for r in self.synthetic_acceptance_rates],
+        )
+
     def __post_init__(self):
+        self._resolve_synthetic_acceptance()
         if self.draft_model_hf_config is None:
             self.draft_model_hf_config = get_hf_config(
                 self.model, trust_remote_code=True
@@ -1185,7 +1310,7 @@ class DSparkConfig:
     disable_sps_calib: bool = False
 
     @classmethod
-    def from_dict(cls, cfg: Optional[dict]) -> "DSparkConfig":
+    def from_dict(cls, cfg: dict | None) -> "DSparkConfig":
         """Build from the ``--dspark-config`` JSON dict.
 
         ``cfg`` maps directly onto this dataclass' fields; unknown keys raise so
@@ -1251,7 +1376,7 @@ class EPLBConfig:
         }, "eplb.placement_policy must be one of {'naive','biased'}"
 
     @classmethod
-    def from_dict(cls, cfg: Optional[dict]) -> "EPLBConfig":
+    def from_dict(cls, cfg: dict | None) -> "EPLBConfig":
         """Build from the ``--eplb-config`` JSON dict.
 
         ``cfg`` maps directly onto this dataclass' fields; unknown keys raise so
@@ -1268,18 +1393,54 @@ class EPLBConfig:
 
 
 @dataclass
+class DCPConfig:
+    """DCP (Decode Context Parallel) sub-config. Today only interleave
+    granularity; room for future knobs (all-to-all backend, query
+    replication, ...) without growing the top-level CLI surface."""
+
+    interleave_size: int = 1
+
+    def __post_init__(self):
+        self.interleave_size = int(self.interleave_size)
+        assert self.interleave_size >= 1, "dcp.interleave_size must be >= 1"
+
+    @classmethod
+    def from_dict(cls, cfg: dict | None) -> "DCPConfig":
+        """Build from the ``--dcp-config`` JSON dict.
+
+        ``cfg`` maps directly onto this dataclass' fields; unknown keys raise so
+        typos fail fast."""
+        cfg = cfg or {}
+        allowed = {f.name for f in fields(cls)}
+        unknown = set(cfg) - allowed
+        if unknown:
+            raise ValueError(
+                f"Unknown --dcp-config key(s): {sorted(unknown)}. "
+                f"Supported keys: {sorted(allowed)}"
+            )
+        return cls(**cfg)
+
+
+@dataclass
 class Config:
     model: str
     trust_remote_code: bool = False
     max_num_batched_tokens: int = 16384
     long_prefill_token_threshold: int = 0
     attn_prefill_chunk_size: int = 16384
+    # Tokens between rungs of the state-checkpoint ladder, shared by every
+    # Pool.STATE class; 0 = no ladder. Must be a multiple of the prefix-cache
+    # hash block size (asserted in BlockManager). See
+    # BlockManager.checkpointers_at.
+    state_checkpoint_interval_tokens: int = 8192
     scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
     max_model_len: int | None = None
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
     decode_context_parallel_size: int = 1
+    dcp_config: DCPConfig = field(default_factory=DCPConfig)
+    pipeline_parallel_size: int = 1
     prefill_context_parallel_size: int = 1
     enforce_eager: bool = False
     hf_config: PretrainedConfig = field(init=False)
@@ -1302,10 +1463,10 @@ class Config:
     quant_config: QuantizationConfig = field(init=False)
     asyncio_mode: bool = False
     mark_trace: bool = False
-    load_dummy: Optional[str] = None
+    load_dummy: str | None = None
     enable_expert_parallel: bool = False
     master_addr: str = "127.0.0.1"
-    graph_bs: Optional[list[int]] = None
+    graph_bs: list[int] | None = None
     enable_dp_attention: bool = False
     # DP request-routing strategy used by CoreManager to pick an engine rank:
     # "round_robin" | "least_requests" (default) | "least_tokens". Only has an
@@ -1322,7 +1483,7 @@ class Config:
     # atom/plugin/config.py, not queried via is_vllm() at the call site.
     moe_ep_flatten_tp_across_dp: bool = False
     torch_dtype: torch.dtype = field(init=False)
-    speculative_config: Optional[SpeculativeConfig] = None
+    speculative_config: SpeculativeConfig | None = None
     kv_transfer_config: dict = field(default_factory=dict)
     kv_events_config: KVEventsConfig = field(default_factory=KVEventsConfig.from_env)
     # DSpark runtime knobs. Built once in the parent from --dspark-config (see
@@ -1333,16 +1494,19 @@ class Config:
     enable_tbo: bool = False
     enable_tbo_decode: bool = False
     enable_low_latency: bool = False
+    # Post-routing routed-MoE implementation. This is deliberately separate
+    # from all2all backend/mode: Mega owns dispatch, both GEMMs, and combine.
+    moe_backend: str = "standard"
     runner_qualname: str = "atom.model_engine.model_runner.ModelRunner"
     # EPLB master switch + sub-config
     eplb_enable: bool = False
     eplb_config: EPLBConfig = field(default_factory=EPLBConfig)
 
     # only use for plugin mode
-    plugin_config: Optional[PluginConfig] = None
+    plugin_config: PluginConfig | None = None
     # only for quark_online_quantization
-    online_quant_config: Optional[dict] = None
-    hf_overrides: Optional[dict[str, Any]] = None
+    online_quant_config: dict | None = None
+    hf_overrides: dict[str, Any] | None = None
 
     # Intra-GPU prefill/decode disaggregation
     enable_rapidserve: bool = False
@@ -1363,7 +1527,7 @@ class Config:
     disagg_cu_shm_name: str = ""
     # Override max_num_seqs for the prefill process in disagg mode.
     # When None, prefill inherits the base max_num_seqs.
-    disagg_prefill_max_num_seqs: Optional[int] = None
+    disagg_prefill_max_num_seqs: int | None = None
     # When True (and enable_rapidserve=True), use CU-masked streams + shm
     # coordination between prefill and decode. When False (default),
     # use plain separate streams with no CU masking.
@@ -1385,6 +1549,18 @@ class Config:
         if self.index_cache_dtype is None:
             self.index_cache_dtype = self.kv_cache_dtype
 
+        self.moe_backend = self.moe_backend.strip().lower()
+        if self.moe_backend not in ("standard", "mega"):
+            raise ValueError(
+                "moe_backend must be one of {'standard', 'mega'}, "
+                f"got {self.moe_backend!r}"
+            )
+        if self.moe_backend == "mega" and not self.enable_expert_parallel:
+            raise ValueError(
+                "moe_backend='mega' requires expert parallelism; "
+                "pass --enable-expert-parallel."
+            )
+
         if isinstance(self.compilation_config, dict):
             self.compilation_config = CompilationConfig(**self.compilation_config)
         if isinstance(self.eplb_config, dict):
@@ -1394,7 +1570,40 @@ class Config:
             self.eplb_config = EPLBConfig(**self.eplb_config.__dict__)
         else:
             raise TypeError("eplb_config must be EPLBConfig or dict")
+        if isinstance(self.dcp_config, dict):
+            self.dcp_config = DCPConfig(**self.dcp_config)
+        elif isinstance(self.dcp_config, DCPConfig):
+            # Normalize/validate even when constructed programmatically.
+            self.dcp_config = DCPConfig(**self.dcp_config.__dict__)
+        else:
+            raise TypeError("dcp_config must be DCPConfig or dict")
         # assert os.path.isdir(self.model)
+
+        # The forced-acceptance schedule spends its whole budget on the first
+        # ceil(length - 1) positions, and the sampler can only accept what was
+        # actually drafted. The DSpark confidence scheduler hands each request
+        # its own verify length ell_r, so whenever ell_r falls below that many
+        # positions the run quietly lands under the acceptance length it was
+        # asked to reproduce (measured at length 3.78 over 7 positions: exact
+        # while ell_r >= 3, 3.39 at ell_r = 2, 2.89 at ell_r = 1). ell_r is
+        # chosen at runtime from the confidence head, so there is no upfront
+        # check that would catch it -- and a benchmark reporting a number it
+        # never hit is worse than one that refuses to start.
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.synthetic_acceptance_rates is not None
+            and self.dspark.confidence_schedule
+        ):
+            raise ValueError(
+                "Forced speculative acceptance (--spec-decode-acceptance-length "
+                "/ --spec-decode-acceptance-rate) cannot be combined with the "
+                "DSpark confidence scheduler (--dspark-config "
+                "'{\"confidence_schedule\": true}'): it sizes each request's "
+                "verify length at runtime, and a short one caps acceptance below "
+                "the requested length with no way to detect it upfront. Drop "
+                "confidence_schedule (and ragged, which needs it) for "
+                "forced-acceptance runs."
+            )
 
         # RapidServe (intra-GPU prefill/decode disagg) needs a specialized
         # runner in both the prefill and decode processes. Select it unless the
@@ -1413,21 +1622,55 @@ class Config:
                 f"tp_size ({self.tensor_parallel_size}) must be divisible by "
                 f"dcp_size ({self.decode_context_parallel_size})"
             )
-            if self.enable_prefix_caching:
-                logger.warning(
-                    "DCP does not support prefix caching yet; "
-                    "disabling enable_prefix_caching."
+            # Spec-decode + DCP arch gating. Any speculative method (mtp /
+            # eagle3 / dspark) runs a q>1 verify pass, and DCP decode with q>1
+            # uses the round-robin CP (cprr) MLA kernel, which is persistent-only
+            # and ships only on gfx950; on gfx942 the non-persistent fallback
+            # ignores the cprr masking and silently produces WRONG output.
+            if self.speculative_config is not None:
+                from aiter.jit.utils.chip_info import get_gfx
+
+                gfx = get_gfx()
+                assert gfx == "gfx950", (
+                    f"Speculative decode + DCP is only supported on gfx950 (needs "
+                    f"the persistent cprr MLA kernel); got {gfx}. Disable DCP or "
+                    f"speculative decode on this GPU."
                 )
-                self.enable_prefix_caching = False
-            if self.enable_chunked_prefill:
-                logger.warning(
-                    "DCP does not support chunked prefill yet; "
-                    "disabling enable_chunked_prefill."
-                )
-                self.enable_chunked_prefill = False
+        # DCP KV-cache interleave granularity S. S=1 (default) = token-level
+        # round-robin (unchanged). S>1 = block-level interleave; must divide the
+        # KV block so each physical block holds an integer number of S-groups
+        # (the (i//(S*W))*S + i%S local-index math relies on block_size % S == 0),
+        # and only makes sense under DCP.
+        assert 1 <= self.dcp_config.interleave_size <= self.kv_cache_block_size, (
+            f"dcp_config.interleave_size ({self.dcp_config.interleave_size}) must "
+            f"be in [1, kv_cache_block_size={self.kv_cache_block_size}]"
+        )
+        if self.dcp_config.interleave_size > 1:
+            assert self.kv_cache_block_size % self.dcp_config.interleave_size == 0, (
+                f"kv_cache_block_size ({self.kv_cache_block_size}) must be divisible "
+                f"by dcp_config.interleave_size ({self.dcp_config.interleave_size})"
+            )
+            assert self.decode_context_parallel_size > 1, (
+                "dcp_config.interleave_size > 1 only applies under DCP "
+                f"(decode_context_parallel_size={self.decode_context_parallel_size})"
+            )
+            assert self.speculative_config is None, (
+                "dcp_config.interleave_size > 1 (block-level DCP interleave) is "
+                "incompatible with speculative decode (MTP/eagle/dspark): the q>1 "
+                "verify cprr MLA kernel assumes token-level interleave. Use "
+                "dcp_config.interleave_size=1 with speculative decode, or disable "
+                "speculative decode for block-level interleave."
+            )
+        assert 1 <= self.pipeline_parallel_size
         self.hf_config = get_hf_config(
             self.model, trust_remote_code=self.trust_remote_code
         )
+        num_hidden_layers = getattr(self.hf_config, "num_hidden_layers", None)
+        if num_hidden_layers is not None:
+            assert num_hidden_layers >= self.pipeline_parallel_size, (
+                f"num_hidden_layers ({num_hidden_layers}) must be >= "
+                f"pipeline_parallel_size ({self.pipeline_parallel_size})"
+            )
         if self.hf_overrides:
             self.hf_config.update(self.hf_overrides)
             logger.info("Applied HF config overrides: %s", self.hf_overrides)
@@ -1678,7 +1921,7 @@ class Config:
         return hash_str
 
 
-_current_atom_config: Optional[Config] = None
+_current_atom_config: Config | None = None
 
 
 def set_current_atom_config(atom_config: Config):
@@ -1686,22 +1929,24 @@ def set_current_atom_config(atom_config: Config):
     _current_atom_config = atom_config
 
 
-def _get_current_atom_config_from_vllm_forward_context() -> Optional[Config]:
+def _get_current_atom_config_from_vllm_forward_context() -> Config | None:
     # In vLLM plugin mode (especially speculative decode), main/draft models
     # can coexist in one process. Resolve per-forward config first to avoid
     # reading a stale global singleton.
     try:
         from vllm.forward_context import (
             get_forward_context as get_vllm_forward_context,
+        )
+        from vllm.forward_context import (
             is_forward_context_available,
         )
-    except Exception:
+    except (ImportError, AttributeError):
         return None
     if not is_forward_context_available():
         return None
     try:
         return get_vllm_forward_context().additional_kwargs.get("atom_config")
-    except Exception:
+    except (ImportError, AttributeError):
         return None
 
 

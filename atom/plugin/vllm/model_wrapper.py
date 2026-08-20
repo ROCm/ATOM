@@ -1,33 +1,36 @@
-from collections.abc import Iterable
-
 import functools
 import importlib
 import json
+import logging
 import os
 import types
+from collections.abc import Iterable
+
 import torch
-import torch.nn as nn
 from aiter.dist.parallel_state import (
     get_pp_group,
     get_tp_group,
 )
+from torch import nn
 from vllm.config import VllmConfig
+from vllm.forward_context import (
+    get_forward_context as get_vllm_forward_context,
+)
+from vllm.forward_context import (
+    is_forward_context_available,
+)
 from vllm.model_executor.models.interfaces import (
+    MultiModalEmbeddings,
+    SupportsMRoPE,
+    SupportsMultiModal,
     SupportsPP,
     SupportsQuant,
-    SupportsMultiModal,
-    SupportsMRoPE,
-    MultiModalEmbeddings,
 )
 from vllm.model_executor.models.interfaces_base import (
     VllmModel,
     VllmModelForTextGeneration,
 )
 from vllm.sequence import IntermediateTensors
-from vllm.forward_context import (
-    get_forward_context as get_vllm_forward_context,
-    is_forward_context_available,
-)
 
 import atom  # noqa: F401
 from atom.plugin.config import (
@@ -35,8 +38,6 @@ from atom.plugin.config import (
     generate_atom_config_for_plugin_mode,
 )
 from atom.plugin.prepare import _set_framework_backbone
-
-import logging
 
 logger = logging.getLogger("atom")
 
@@ -146,7 +147,7 @@ _ATOM_MODEL_CLASSES: dict[str, str] = {
     "DeepseekV32ForCausalLM": "atom.models.deepseek_v2:DeepseekV3ForCausalLM",
     "Glm4MoeForCausalLM": "atom.models.glm4_moe:Glm4MoeForCausalLM",
     "GlmMoeDsaForCausalLM": "atom.models.deepseek_v2:GlmMoeDsaForCausalLM",
-    "DeepSeekMTPModel": "atom.plugin.vllm.models.deepseek_mtp:DeepSeekMTP",
+    "DeepSeekMTPModel": "atom.models.deepseek_mtp:DeepSeekMTP",
     "DeepSeekV4MTPModel": "atom.plugin.vllm.models.deepseek_v4_mtp:DeepseekV4MTP",
     "Glm4MoeMTPModel": "atom.models.glm4_moe_mtp:Glm4MoeMTP",
     "Qwen3NextForCausalLM": "atom.plugin.vllm.models.qwen3_next:Qwen3NextForCausalLM",
@@ -163,7 +164,12 @@ _ATOM_MODEL_CLASSES: dict[str, str] = {
     "MiniMaxM3SparseForConditionalGeneration": "atom.models.minimax_m3:MiniMaxM3SparseForConditionalGeneration",
     "Eagle3LlamaModel": "atom.models.eagle3_llama:Eagle3LlamaModel",
     "Eagle3DeepseekMLAModel": "atom.models.eagle3_deepseek_mla:Eagle3DeepseekMLAModel",
+    "K3DSparkModel": "atom.plugin.vllm.models.kimi_k3_dspark:KimiK3DSparkDraft",
 }
+
+# DSpark drafts ship as their own checkpoint, so like EAGLE3 they are built from
+# the draft's hf_config and their layers are numbered past the target's.
+_DSPARK_DRAFT_ARCHS: frozenset[str] = frozenset({"K3DSparkModel"})
 
 
 def _normalize_atom_model_arch(model_arch: str) -> str:
@@ -189,7 +195,7 @@ def _get_atom_model_cls(model_arch: str) -> type:
 
 
 def _prepare_env(atom_config) -> None:
-    from atom.plugin.register import set_attn_cls, init_aiter_dist
+    from atom.plugin.register import init_aiter_dist, set_attn_cls
 
     # set global attention class
     logger.info("Set global attention class")
@@ -263,7 +269,7 @@ def _select_model_arch(vllm_config: VllmConfig) -> str:
         model_tag = getattr(
             getattr(vllm_config, "compilation_config", None), "model_tag", None
         )
-    if model_tag in {"eagle_head", "draft_model", "drafter"}:
+    if model_tag in {"eagle_head", "draft_model", "drafter", "dspark_head"}:
         logger.info(
             f"Use draft model architecture {draft_arch} for speculative tag {model_tag}"
         )
@@ -324,7 +330,7 @@ def _patch_required_act_dtype_post_load_hooks(
         def wrapped(act_dtype: torch.dtype = act_dtype, _orig=orig):
             return _orig(act_dtype)
 
-        setattr(wrapped, "_atom_vllm_act_dtype_patched", True)
+        wrapped._atom_vllm_act_dtype_patched = True
         submodule.process_weights_after_loading = wrapped
         patched += 1
 
@@ -359,12 +365,14 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         self.vllm_config = vllm_config
         self.is_mtp = False
         self.is_eagle3 = False
+        self.is_dspark = False
         self._mtp_target_hidden_states = None
         speculative_config = getattr(vllm_config, "speculative_config", None)
         if speculative_config is not None:
             spec_method = speculative_config.method
             self.is_mtp = spec_method == "mtp"
             self.is_eagle3 = spec_method == "eagle3"
+            self.is_dspark = spec_method == "dspark"
 
         main_model_arch = vllm_config.model_config.architectures[0]
         selected_model_arch = _select_model_arch(vllm_config)
@@ -379,14 +387,23 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             and selected_model_arch != main_model_arch
             and _is_eagle3_draft_arch(selected_model_arch)
         )
-        self.is_spec_draft_model = self.is_mtp_draft_model or self.is_eagle3_draft_model
+        self.is_dspark_draft_model = (
+            self.is_dspark and selected_model_arch in _DSPARK_DRAFT_ARCHS
+        )
+        # Both are standalone checkpoints configured off their own hf_config.
+        self._is_standalone_draft = (
+            self.is_eagle3_draft_model or self.is_dspark_draft_model
+        )
+        self.is_spec_draft_model = self.is_mtp_draft_model or self._is_standalone_draft
 
-        if self.is_eagle3_draft_model and draft_hf_config is None:
-            raise ValueError("EAGLE3 draft model config is missing hf_config")
+        if self._is_standalone_draft and draft_hf_config is None:
+            raise ValueError(
+                f"{selected_model_arch} draft model config is missing hf_config"
+            )
 
         self.config = (
             draft_hf_config
-            if self.is_eagle3_draft_model
+            if self._is_standalone_draft
             else vllm_config.model_config.hf_config
         )
         self.text_config = (
@@ -402,9 +419,22 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             main_atom_config = get_current_atom_config()
             self.atom_config = _generate_atom_config_from_vllm_config(vllm_config)
             self.atom_config.hf_config = main_atom_config.hf_config
-        elif self.is_eagle3_draft_model:
+        elif self._is_standalone_draft:
             self.atom_config = _generate_atom_config_from_vllm_config(vllm_config)
-            self.atom_config.hf_config = draft_hf_config
+            # Prefer ATOM's normalized copy: building the atom_config ran
+            # `hf_config_override`, which maps a standalone draft's checkpoint
+            # field names onto the canonical ones the ATOM model reads (e.g.
+            # DSpark's `mask_token_id` -> `dspark_noise_token_id`). vLLM's own
+            # copy never sees that.
+            atom_spec_config = getattr(self.atom_config, "speculative_config", None)
+            normalized_hf_config = getattr(
+                atom_spec_config, "draft_model_hf_config", None
+            )
+            self.atom_config.hf_config = (
+                normalized_hf_config
+                if self.is_dspark_draft_model and normalized_hf_config is not None
+                else draft_hf_config
+            )
         else:
             self.atom_config = generate_atom_config_for_plugin_mode(vllm_config)
             # root HF config so --hf-overrides survive without losing multimodal
@@ -461,12 +491,13 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             # with the draft model's atom_config so that the correct forward context
             # can be registered
             with use_custom_atom_config(self.atom_config):
-                if self.is_eagle3_draft_model:
+                if self._is_standalone_draft:
                     target_layer_num = vllm_config.model_config.get_num_layers(
                         vllm_config.parallel_config
                     )
                     logger.info(
-                        "Construct EAGLE3 draft with layer_offset=%s",
+                        "Construct %s draft with layer_offset=%s",
+                        model_arch,
                         target_layer_num,
                     )
                     self.model = model_cls(
@@ -493,8 +524,14 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             self._adapt_mtp_layers_for_vllm()
         if self.is_eagle3_draft_model:
             self._enable_eagle3_draft_interface()
-        elif self.is_eagle3 and self._eagle3_uses_aux_hidden_state():
+        elif (self.is_eagle3 and self._eagle3_uses_aux_hidden_state()) or (
+            # DSpark targets are tapped through the same SupportsEagle3 surface.
+            self.is_dspark
+            and not self.is_dspark_draft_model
+        ):
             self._enable_eagle3_target_interface()
+        if self.is_mtp:
+            self.get_mtp_target_hidden_states = self._get_mtp_target_hidden_states
         if self.is_mtp or self.is_eagle3:
             # Mirror nested attributes required by vLLM speculative decoding.
             self._expose_spec_decode_attrs()
@@ -541,49 +578,94 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
     # Attributes whose writes on the outer model must propagate to the
     # inner model so vLLM's weight-sharing reaches the forward path.
     _WEIGHT_SHARED_ATTRS = frozenset({"embed_tokens", "embedding", "lm_head"})
+    # Attribute names under which ATOM models nest their inner backbone. Walked
+    # in order at each level to build the inner-model chain. To support a model
+    # that nests under a new name, add it here.
+    _INNER_MODEL_ATTRS = ("model", "language_model")
+
+    def _inner_model_chain(self, outer: nn.Module) -> list[nn.Module]:
+        """`outer` followed by each nested backbone, deepest last.
+
+        ATOM models nest their language backbone at different names and depths:
+          - flat EAGLE3 draft (Eagle3LlamaModel): depth 0, attrs on `outer`
+          - MTP draft / text-only target: depth 1, under `.model`
+          - VL target (MiniMax-M3 ...TextOnly): depth 2,
+            `.language_model` then `.model`
+        Walking `_INNER_MODEL_ATTRS` at each level yields a single chain that
+        covers all of them, so a wanted attribute can be found wherever it lives.
+        """
+        chain: list[nn.Module] = []
+        node: nn.Module | None = outer
+        seen: set[int] = set()
+        while node is not None and id(node) not in seen:
+            seen.add(id(node))
+            chain.append(node)
+            nxt = None
+            for name in self._INNER_MODEL_ATTRS:
+                cand = getattr(node, name, None)
+                if isinstance(cand, nn.Module) and id(cand) not in seen:
+                    nxt = cand
+                    break
+            node = nxt
+        return chain
 
     def _expose_spec_decode_attrs(self) -> None:
         """Bridge the extra nesting level between vLLM and ATOM for spec decode.
 
-        ATOM wraps the HF model with one extra level:
-          vLLM sees:  wrapper.model  (DeepSeekMTP)
-          forward uses:              .model (DeepSeekMultiTokenPredictor)
+        vLLM reads embed_tokens / embedding / layers at ``wrapper.model.<attr>``
+        and the head at ``wrapper.lm_head``. ATOM nests these under one or more
+        backbone levels (see `_inner_model_chain`), so mirror the first holder
+        found in the chain onto the paths vLLM reads.
 
-        vLLM's EagleSpeculator reads/writes embed_tokens, lm_head, layers on
-        the outer model.  The forward path reads them from the inner model.
-
-        We need two things:
-        1. Mirror inner → outer so vLLM can discover the attrs.
-        2. When vLLM later *replaces* embed_tokens / lm_head with shared
-           target-model weights, propagate the write to the inner model
-           so the forward path picks up the shared tensor.
+        Draft vs target differ in one way:
+        - Draft/MTP: vLLM *replaces* embed_tokens / lm_head with shared target
+          weights, so register real submodules (`setattr`) and install a
+          `__setattr__` hook that propagates those writes down to the inner
+          module the forward path reads from.
+        - Target: vLLM only *reads* these attrs, so mirror them as plain aliases
+          (`object.__setattr__`) that stay invisible to the module tree and the
+          weight loader — no ownership change, no sync hook.
         """
         model = self.model
-        inner = getattr(model, "model", None)
-        if inner is None:
-            if hasattr(model, "lm_head") and not hasattr(self, "lm_head"):
-                self.lm_head = model.lm_head
-            return
+        chain = self._inner_model_chain(model)
+        inner = chain[1] if len(chain) > 1 else None
+        is_draft = self.is_spec_draft_model
+        put = setattr if is_draft else object.__setattr__
 
-        # ATOM DeepSeek-V4 names these shared modules `embed` / `head`, while
-        # vLLM's generic MTP proposer expects `embedding` / `lm_head`.
-        if not hasattr(model, "embedding") and hasattr(inner, "embed"):
-            model.embedding = inner.embed
-        if not hasattr(model, "lm_head") and hasattr(inner, "head"):
-            model.lm_head = inner.head
+        def first_holder(attr: str) -> nn.Module | None:
+            for node in chain:
+                if hasattr(node, attr):
+                    return node
+            return None
 
-        # (1) Mirror: make attrs visible on the outer model for vLLM discovery.
+        # ATOM DeepSeek-V4 names these shared modules `embed` / `head` on its
+        # immediate backbone child, while vLLM's generic MTP proposer expects
+        # `embedding` / `lm_head` on the outer model.
+        if inner is not None:
+            if not hasattr(model, "embedding") and hasattr(inner, "embed"):
+                put(model, "embedding", inner.embed)
+            if not hasattr(model, "lm_head") and hasattr(inner, "head"):
+                put(model, "lm_head", inner.head)
+
+        # (1) Mirror backbone attrs onto the outer model, and the head onto self.
         for attr in (*self._WEIGHT_SHARED_ATTRS, "layers"):
-            if not hasattr(model, attr) and hasattr(inner, attr):
-                setattr(model, attr, getattr(inner, attr))
+            if not hasattr(model, attr):
+                holder = first_holder(attr)
+                if holder is not None and holder is not model:
+                    put(model, attr, getattr(holder, attr))
 
-        if not hasattr(self, "lm_head") and hasattr(model, "lm_head"):
-            self.lm_head = model.lm_head
+        if not hasattr(self, "lm_head"):
+            holder = first_holder("lm_head")
+            if holder is not None:
+                put(self, "lm_head", holder.lm_head)
 
-        # (2) Propagate: future writes on the outer model sync to the inner
-        #     model.  We create a one-off subclass so the hook only affects
-        #     this particular draft-model instance, not the base class.
-        #     Create the one-off subclass only once
+        # (2) Draft only: propagate vLLM's later writes on the outer model down
+        #     to the inner module the forward path reads from. Create the one-off
+        #     subclass only once, and only when there is an inner level to sync.
+        if not is_draft:
+            return
+        if inner is None:
+            return
         if getattr(model, "_atom_vllm_shared_attr_sync_patched", False):
             return
         shared = self._WEIGHT_SHARED_ATTRS
@@ -674,13 +756,17 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
                     f"static_forward_context, skipping"
                 )
 
-    def get_mtp_target_hidden_states(self):
+    def _get_mtp_target_hidden_states(self):
         """Return the target hidden state that vLLM should feed to MTP.
 
         DeepSeek V4 target forward returns the pre-hc_head mHC residual
         `[num_tokens, hc, hidden]`; vLLM's generic hidden state path would
         otherwise feed the post-logits hidden shape expected by older MTP
         models.
+
+        Exposed under its public name only on MTP targets (see `__init__`):
+        vLLM decides whether to override the drafter's input by testing for the
+        attribute alone, so any speculator carrying it would be fed this.
         """
         # Prefer the persistent in-graph residual buffer on the native V4 model.
         # It is refreshed by a captured `copy_` every forward (including FULL
@@ -942,11 +1028,12 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             return IntermediateTensors({"hidden_states": hidden_states})
 
         if self.model_arch == "DeepSeekMTPModel":
-            # vLLM samples from the pre-final-norm state, but recycles the
-            # post-final-norm state into the next MTP step.
-            spec_step_idx = int(model_kwargs.get("spec_step_idx", 0))
-            recycle_hidden = self.model.get_recycle_hidden(hidden_states, spec_step_idx)
-            return hidden_states, recycle_hidden
+            # vLLM's DeepSeek-MTP contract wants (sample_hidden, recycle_hidden).
+            # DeepSeekMultiTokenPredictorLayer.forward already returns the
+            # post-final-norm hidden, and compute_logits no longer re-norms, so
+            # the state vLLM samples from and the state it recycles into the
+            # next MTP step are the same tensor.
+            return hidden_states, hidden_states
 
         return hidden_states
 
@@ -970,9 +1057,9 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
                 draft_hf_config = getattr(
                     draft_model_config, "hf_config", draft_model_config
                 )
-        if self.is_eagle3_draft_model:
-            # EAGLE3 drafts are standalone checkpoints, so we need both the draft
-            # hf_config and the draft checkpoint path
+        if self._is_standalone_draft:
+            # EAGLE3 and DSpark drafts are their own checkpoints, so the loader
+            # needs both the draft hf_config and the draft checkpoint path.
             spec_config = getattr(self.vllm_config, "speculative_config", None)
             draft_model_config = getattr(spec_config, "draft_model_config", None)
             if draft_model_config is not None:
@@ -983,7 +1070,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
                     draft_model_config, "model", None
                 ) or getattr(spec_config, "model", None)
             if not draft_model_path:
-                raise ValueError("EAGLE3 draft model path is missing.")
+                raise ValueError(f"{self.model_arch} draft model path is missing.")
 
         loaded_weights_record = load_model_in_plugin_mode(
             model=self.model,
@@ -1023,17 +1110,21 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
 
         vLLM's ``LLMBaseProposer._greedy_sample`` calls this (when
         ``use_local_argmax_reduction`` is enabled) in place of
-        ``compute_logits(...).argmax(-1)``. Bridge it to ATOM's distributed
-        greedy argmax (``compute_draft_token``): each rank reduces its logit
-        shard to ``(max_val, global_idx)`` and only ``[N, 2]`` is all-gathered
-        instead of the full ``[N, vocab]`` logits. Token-identical to
-        ``compute_logits(...).argmax(-1)``; returns ``[N]`` int64 token ids.
+        ``compute_logits(...).argmax(-1)``. Bridge it to the draft model's
+        ``compute_draft_ids``, which returns ``[N]`` int64 token ids and is
+        token-identical to ``compute_logits(...).argmax(-1)``.
+
+        Every arch delivers the ``O(2*tp)`` behaviour vLLM enables this flag
+        for: each rank reduces its own logit shard to ``(max_val, global_idx)``
+        and only ``[N, 2]`` is all-gathered, via
+        ``ParallelLMHead.compute_argmax_token``. Nothing here falls back to the
+        full ``[N, vocab]`` all-gather.
         """
         if getattr(self, "_is_deepseek_v4_mtp", False):
             hidden_states = _deepseek_v4_mtp_unflatten_hidden_states(
                 hidden_states, self.model
             )
-        return self.model.compute_draft_token(hidden_states)
+        return self.model.compute_draft_ids(hidden_states)
 
 
 class ATOMForCausalLM(ATOMModelBase, VllmModelForTextGeneration): ...

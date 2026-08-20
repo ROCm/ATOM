@@ -158,7 +158,6 @@ class Drafter(abc.ABC):
             support_draft_model_arch_dict[draft_hf.architectures[0]]
         )
         self.model = self._build_draft_model(model_class)
-        self._draft_argmax_fused = hasattr(self.model, "compute_draft_token")
 
         # Drafter-owned aux capture state (armed by arm_aux_capture).
         self._captures_aux = False
@@ -307,6 +306,34 @@ class Drafter(abc.ABC):
             return None
         n = target_hidden_states.shape[0]
         return [buf[:n] for buf in self._aux_buffers]
+
+    def anchors_to_gpu(self, anchors: list[int]) -> torch.Tensor:
+        """Scheduler-supplied anchors as an int32 GPU tensor, without blocking.
+
+        `-1` entries survive as-is; callers read them as "sampling supplies it".
+        Uses ``forward_vars`` so the PP ring clones it per in-flight slot.
+        """
+        n = len(anchors)
+        buf = self.runner.forward_vars["draft_next_tokens"]
+        buf.np[:n] = anchors
+        return buf.copy_to_gpu(n)
+
+    def precompute_context_kv(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        next_token_ids: list[int] | None,
+    ) -> None:
+        """Absorb one target forward into whatever context this drafter keeps.
+
+        Called after EVERY target forward, including the ones that sample
+        nothing. `propose()` is reached only from a forward that samples, so a
+        context maintained there covers a chunked prefill's final chunk alone.
+
+        `next_token_ids` is the token one position past this forward, per seq:
+        -1 where sampling supplies it, None on unlabelled batches.
+        """
+        return
 
     # ---- shared machinery ----
     @staticmethod

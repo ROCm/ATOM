@@ -117,6 +117,21 @@ class TestKVCacheDtypeCliAlias:
         assert self._parse(["--tensor_parallel_size", "4"]).tensor_parallel_size == 4
 
 
+class TestMoEBackendCli:
+    def _parse(self, argv):
+        parser = argparse.ArgumentParser()
+        EngineArgs.add_cli_args(parser)
+        return EngineArgs.from_cli_args(parser.parse_args(argv))
+
+    def test_default_is_standard(self):
+        assert self._parse([]).moe_backend == "standard"
+
+    def test_mega_backend(self):
+        args = self._parse(["--moe-backend", "mega"])
+        assert args.moe_backend == "mega"
+        assert args._get_engine_kwargs()["moe_backend"] == "mega"
+
+
 class TestEngineArgsSpeculativeValidation:
     """Regression tests for speculative-config construction in _get_engine_kwargs."""
 
@@ -154,6 +169,8 @@ class TestEngineArgsSpeculativeValidation:
             method="mtp",
             model=args.model,
             num_speculative_tokens=3,
+            synthetic_acceptance_rate=None,
+            synthetic_acceptance_length=None,
         )
         assert kwargs["speculative_config"] is fake_spec_config
 

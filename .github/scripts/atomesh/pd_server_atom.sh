@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+ATOMESH_SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 NODE_RANK="${NODE_RANK:-0}"
 NODE0_ADDR="${NODE0_ADDR:-127.0.0.1}"
 IPADDRS="${IPADDRS:-127.0.0.1}"
@@ -45,6 +46,50 @@ PREFILL_DP_MASTER_PORT="${PREFILL_DP_MASTER_PORT:-29500}"
 PREFILL_DP_BASE_PORT="${PREFILL_DP_BASE_PORT:-29600}"
 DECODE_DP_MASTER_PORT="${DECODE_DP_MASTER_PORT:-29700}"
 DECODE_DP_BASE_PORT="${DECODE_DP_BASE_PORT:-29800}"
+ATOMESH_EXECUTION_PHASE="${ATOMESH_EXECUTION_PHASE:-combined}"
+ATOMESH_SERVICE_PORT_OFFSET="${ATOMESH_SERVICE_PORT_OFFSET:-0}"
+case "${ATOMESH_EXECUTION_PHASE}" in
+  combined|benchmark|eval) ;;
+  *)
+    echo "ERROR: unsupported ATOMESH_EXECUTION_PHASE=${ATOMESH_EXECUTION_PHASE}" >&2
+    exit 2
+    ;;
+esac
+if [[ ! "${ATOMESH_SERVICE_PORT_OFFSET}" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: ATOMESH_SERVICE_PORT_OFFSET must be a non-negative integer" >&2
+  exit 2
+fi
+PREFILL_PORT=$((PREFILL_PORT + ATOMESH_SERVICE_PORT_OFFSET))
+DECODE_PORT=$((DECODE_PORT + ATOMESH_SERVICE_PORT_OFFSET))
+ROUTER_PORT=$((ROUTER_PORT + ATOMESH_SERVICE_PORT_OFFSET))
+PROMETHEUS_PORT=$((PROMETHEUS_PORT + ATOMESH_SERVICE_PORT_OFFSET))
+HANDSHAKE_PORT=$((HANDSHAKE_PORT + ATOMESH_SERVICE_PORT_OFFSET))
+PREFILL_DP_MASTER_PORT=$((PREFILL_DP_MASTER_PORT + ATOMESH_SERVICE_PORT_OFFSET))
+PREFILL_DP_BASE_PORT=$((PREFILL_DP_BASE_PORT + ATOMESH_SERVICE_PORT_OFFSET))
+DECODE_DP_MASTER_PORT=$((DECODE_DP_MASTER_PORT + ATOMESH_SERVICE_PORT_OFFSET))
+DECODE_DP_BASE_PORT=$((DECODE_DP_BASE_PORT + ATOMESH_SERVICE_PORT_OFFSET))
+validate_shifted_port() {
+  local name="$1"
+  local value="${!name}"
+  if (( value < 1 || value > 65535 )); then
+    echo "ERROR: ${name}=${value} is outside the valid TCP/UDP port range" >&2
+    exit 2
+  fi
+}
+for shifted_port_name in \
+  PREFILL_PORT \
+  DECODE_PORT \
+  ROUTER_PORT \
+  PROMETHEUS_PORT \
+  HANDSHAKE_PORT \
+  PREFILL_DP_MASTER_PORT \
+  PREFILL_DP_BASE_PORT \
+  DECODE_DP_MASTER_PORT \
+  DECODE_DP_BASE_PORT; do
+  validate_shifted_port "${shifted_port_name}"
+done
+unset shifted_port_name
+unset -f validate_shifted_port
 USE_EXPLICIT_DP_PORTS=0
 if [[ "${SINGLE_NODE_PD}" == "1" || "${PREFILL_SINGLE_NODE_PD}" == "1" || "${DECODE_SINGLE_NODE_PD}" == "1" ]]; then
   USE_EXPLICIT_DP_PORTS=1
@@ -82,6 +127,14 @@ has_cli_flag() {
   [[ " ${args} " == *" ${flag} "* ]]
 }
 
+is_agentic_dpa() {
+  [[ "${BENCHMARK_KIND}" == "aiperf_agentic" ]] \
+    && {
+      has_cli_flag "${PREFILL_EXTRA_SERVER_ARGS}" "--enable-dp-attention" \
+        || has_cli_flag "${DECODE_EXTRA_SERVER_ARGS}" "--enable-dp-attention"
+    }
+}
+
 ISL_LIST="${ISL_LIST:-8192}"
 OSL="${OSL:-1024}"
 CONC_LIST="${CONC_LIST:-4,8}"
@@ -108,13 +161,14 @@ WAIT_ROUTER_TIMEOUT="${WAIT_ROUTER_TIMEOUT:-300}"
 BENCHMARK_KIND="${BENCHMARK_KIND:-random}"
 AIPERF_DIR="${AIPERF_DIR:-/tmp/atomesh-aiperf}"
 AIPERF_VENV="${AIPERF_VENV:-/tmp/atomesh-aiperf-venv}"
-AIPERF_COMMIT="${AIPERF_COMMIT:-0d2aa0572ac685943d38c580675c4a61023581d3}"
+AIPERF_COMMIT="${AIPERF_COMMIT:-b7b16cf851885567988a643282266bce74e34437}"
 AIPERF_SCENARIO="${AIPERF_SCENARIO:-inferencex-agentx-mvp}"
 AIPERF_PUBLIC_DATASET="${AIPERF_PUBLIC_DATASET:-semianalysis_cc_traces_weka_062126_256k}"
 AIPERF_MAX_CONTEXT_LENGTH="${AIPERF_MAX_CONTEXT_LENGTH:-262144}"
 AIPERF_NUM_DATASET_ENTRIES="${AIPERF_NUM_DATASET_ENTRIES:-393}"
 AIPERF_BENCHMARK_DURATION="${AIPERF_BENCHMARK_DURATION:-1800}"
-AIPERF_AGENTIC_CACHE_WARMUP_DURATION="${AIPERF_AGENTIC_CACHE_WARMUP_DURATION:-600}"
+AIPERF_WARMUP_REQUESTS_PER_LANE="${AIPERF_WARMUP_REQUESTS_PER_LANE:-10}"
+AIPERF_TRACE_IDLE_GAP_CAP_SECONDS="${AIPERF_TRACE_IDLE_GAP_CAP_SECONDS:-300}"
 AIPERF_WARMUP_GRACE_PERIOD="${AIPERF_WARMUP_GRACE_PERIOD:-1800}"
 AIPERF_TRAJECTORY_START_MIN_RATIO="${AIPERF_TRAJECTORY_START_MIN_RATIO:-0.25}"
 AIPERF_TRAJECTORY_START_MAX_RATIO="${AIPERF_TRAJECTORY_START_MAX_RATIO:-0.75}"
@@ -129,8 +183,16 @@ AIPERF_UNSAFE_OVERRIDE="${AIPERF_UNSAFE_OVERRIDE:-}"
 PREFILL_KV_TRANSFER_CONFIG="${PREFILL_KV_TRANSFER_CONFIG:-}"
 DECODE_KV_TRANSFER_CONFIG="${DECODE_KV_TRANSFER_CONFIG:-}"
 
-export ATOM_TORCH_PROFILER_DIR="${ATOM_TORCH_PROFILER_DIR:-${RUN_DIR}/online_quant/rank-${NODE_RANK}}"
-mkdir -p "${RUN_DIR}"/{logs,benchmark_results,eval_results} "${ATOM_TORCH_PROFILER_DIR}"
+default_profiler_dir="${RUN_DIR}/online_quant/rank-${NODE_RANK}"
+if [[ "${ATOMESH_EXECUTION_PHASE}" != "combined" ]]; then
+  default_profiler_dir="${RUN_DIR}/online_quant/${ATOMESH_EXECUTION_PHASE}/rank-${NODE_RANK}"
+fi
+export ATOM_TORCH_PROFILER_DIR="${ATOM_TORCH_PROFILER_DIR:-${default_profiler_dir}}"
+RUNTIME_LOG_DIR="${RUN_DIR}/logs"
+if [[ "${ATOMESH_EXECUTION_PHASE}" != "combined" ]]; then
+  RUNTIME_LOG_DIR="${RUNTIME_LOG_DIR}/${ATOMESH_EXECUTION_PHASE}"
+fi
+mkdir -p "${RUNTIME_LOG_DIR}" "${RUN_DIR}"/{benchmark_results,eval_results} "${ATOM_TORCH_PROFILER_DIR}"
 
 role_tp="${PREFILL_TP_SIZE}"
 if [[ "${PREFILL_SINGLE_NODE_PD}" == "1" && "${NODE_RANK}" -gt 0 ]]; then
@@ -142,6 +204,7 @@ if [[ -z "${HIP_VISIBLE_DEVICES:-}" ]]; then
   export HIP_VISIBLE_DEVICES="$(seq -s, 0 "$((role_tp - 1))")"
 fi
 rm -rf /root/.cache/atom/* 2>/dev/null || true
+echo "[runtime] phase=${ATOMESH_EXECUTION_PHASE} service_port_offset=${ATOMESH_SERVICE_PORT_OFFSET}"
 echo "[runtime] HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES}"
 
 dump_launch_info() {
@@ -434,9 +497,14 @@ cleanup_processes() {
 }
 
 write_metadata() {
-  cat > "${RUN_DIR}/metadata-rank-${NODE_RANK}.json" <<EOF
+  local metadata_file="${RUN_DIR}/metadata-rank-${NODE_RANK}.json"
+  if [[ "${ATOMESH_EXECUTION_PHASE}" != "combined" ]]; then
+    metadata_file="${RUN_DIR}/metadata-rank-${NODE_RANK}-${ATOMESH_EXECUTION_PHASE}.json"
+  fi
+  cat > "${metadata_file}" <<EOF
 {
   "rank": ${NODE_RANK},
+  "execution_phase": "${ATOMESH_EXECUTION_PHASE}",
   "host": "${host_name}",
   "ip": "${host_ip}",
   "model": "${MODEL_NAME}",
@@ -487,7 +555,7 @@ start_prefill() {
     ${PREFILL_SERVER_ARGS}
   )
   dump_launch_info "PREFILL" "${prefill_cmd[@]}"
-  start_logged_process server_pid "${RUN_DIR}/logs/${log_name}.log" env "${prefill_cache_env[@]}" "${prefill_dp_env[@]}" "${prefill_cmd[@]}"
+  start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" env "${prefill_cache_env[@]}" "${prefill_dp_env[@]}" "${prefill_cmd[@]}"
 }
 
 start_decode() {
@@ -540,7 +608,7 @@ start_decode() {
     ${DECODE_SERVER_ARGS}
   )
   dump_launch_info "DECODE" "${decode_cmd[@]}"
-  start_logged_process server_pid "${RUN_DIR}/logs/${log_name}.log" env "${decode_cache_env[@]}" "${decode_dp_env[@]}" "${decode_cmd[@]}"
+  start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" env "${decode_cache_env[@]}" "${decode_dp_env[@]}" "${decode_cmd[@]}"
 }
 
 start_router() {
@@ -553,31 +621,39 @@ start_router() {
       ;;
   esac
 
+  local router_policy="${ROUTER_POLICY}"
   local -a router_rank_mapping_args=()
   if [[ "${ATOM_PD_RANK_MAPPING_POLICY}" != "none" ]] \
     && has_cli_flag "${PREFILL_EXTRA_SERVER_ARGS}" "--enable-dp-attention" \
     && has_cli_flag "${DECODE_EXTRA_SERVER_ARGS}" "--enable-dp-attention"; then
     router_rank_mapping_args=(
       --atom-pd-rank-mapping-policy "${ATOM_PD_RANK_MAPPING_POLICY}"
-      --dp-aware
     )
   fi
+  local -a router_dp_aware_args=()
+  if is_agentic_dpa; then
+    router_policy="dp_sticky"
+    router_dp_aware_args=(--dp-aware)
+  elif [[ "${#router_rank_mapping_args[@]}" -gt 0 ]]; then
+    router_dp_aware_args=(--dp-aware)
+  fi
   local -a router_cmd=(
-    /usr/local/bin/atomesh launch
+    /app/ATOM/atom/mesh/target/release/atomesh launch
     --host 0.0.0.0
     --port "${ROUTER_PORT}"
     --pd-disaggregation
     "${prefill_args[@]}"
     "${decode_args[@]}"
-    --policy "${ROUTER_POLICY}"
+    --policy "${router_policy}"
     "${router_rank_mapping_args[@]}"
+    "${router_dp_aware_args[@]}"
     --backend atom
     --log-level info
     --disable-circuit-breaker
     --prometheus-port "${PROMETHEUS_PORT}"
   )
   dump_launch_info "ROUTER" "${router_cmd[@]}"
-  start_logged_process router_pid "${RUN_DIR}/logs/router.log" "${router_cmd[@]}"
+  start_logged_process router_pid "${RUNTIME_LOG_DIR}/router.log" "${router_cmd[@]}"
 }
 
 run_benchmark() {
@@ -680,8 +756,23 @@ def pct(name, key):
     return None
 
 
+def total_tokens(name):
+    """Return one of AIPerf's profiling-only aggregate token counters."""
+    value = avg(name)
+    return int(value) if isinstance(value, (int, float)) else None
+
+
+# These aggregates contain successful profiling records only: AIPerf excludes
+# its internal warmup and requests cancelled during grace-period draining.
+cache_hit_tokens = total_tokens("total_usage_prompt_cache_read_tokens")
+cache_total_tokens = total_tokens("total_usage_prompt_tokens")
+
 payload = {
     "benchmark_backend": "atom",
+    # Directory holding this run's profile_export.jsonl, so process_result.py can
+    # find the per-request records it needs for p90 e2e normalized interactivity
+    # without reconstructing the directory name.
+    "aiperf_artifact_dir": src.parent.name,
     "benchmark_model_name": os.environ.get("MODEL_NAME")
     or data.get("model")
     or data.get("model_id"),
@@ -720,16 +811,39 @@ payload = {
     or data.get("benchmark_duration_s"),
     "total_input_tokens": avg("total_usage_prompt_tokens"),
     "total_output_tokens": avg("total_usage_completion_tokens"),
+    "cache_hit_tokens": cache_hit_tokens,
+    "cache_total_tokens": cache_total_tokens,
+    "cache_hit_rate": (
+        round(cache_hit_tokens / cache_total_tokens, 4)
+        if cache_hit_tokens is not None and cache_total_tokens
+        else None
+    ),
 }
 
 payload = {key: value for key, value in payload.items() if value is not None}
 dst.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+if cache_hit_tokens is not None and cache_total_tokens:
+    print(
+        f"[aiperf] prefix cache hit: {cache_hit_tokens}/{cache_total_tokens} "
+        f"tokens ({cache_hit_tokens / cache_total_tokens:.2%})"
+    )
+else:
+    print(
+        "[aiperf] prefix cache hit: unavailable "
+        "(AIPerf profiling cache-read counters were not produced)"
+    )
 print(f"[aiperf] dashboard json: {dst}")
 PY
 }
 
 run_aiperf_agentic_benchmark() {
   ensure_aiperf
+
+  if is_agentic_dpa; then
+    export AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID=true
+  else
+    unset AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID
+  fi
 
   local safe_model="${MODEL_NAME//\//-}"
   local -a server_metrics_args=(--server-metrics)
@@ -763,6 +877,7 @@ run_aiperf_agentic_benchmark() {
     AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES="${AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES}" \
     AIPERF_DATASET_CONFIGURATION_TIMEOUT="${AIPERF_DATASET_CONFIGURATION_TIMEOUT}" \
     AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT="${AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT}" \
+    AIPERF_UI_REALTIME_METRICS_ENABLED=true \
       "${AIPERF_VENV}/bin/aiperf" profile \
       "${unsafe_args[@]}" \
       --scenario "${AIPERF_SCENARIO}" \
@@ -773,11 +888,13 @@ run_aiperf_agentic_benchmark() {
       --model "${MODEL_PATH}" \
       --concurrency "${conc}" \
       --benchmark-duration "${AIPERF_BENCHMARK_DURATION}" \
+      --stats-interval 30 \
       --random-seed 42 \
       --failed-request-threshold "${AIPERF_FAILED_REQUEST_THRESHOLD}" \
       --trajectory-start-min-ratio "${AIPERF_TRAJECTORY_START_MIN_RATIO}" \
       --trajectory-start-max-ratio "${AIPERF_TRAJECTORY_START_MAX_RATIO}" \
-      --agentic-cache-warmup-duration "${AIPERF_AGENTIC_CACHE_WARMUP_DURATION}" \
+      --warmup-requests-per-lane "${AIPERF_WARMUP_REQUESTS_PER_LANE}" \
+      --trace-idle-gap-cap-seconds "${AIPERF_TRACE_IDLE_GAP_CAP_SECONDS}" \
       --warmup-grace-period "${AIPERF_WARMUP_GRACE_PERIOD}" \
       --use-server-token-count \
       --no-gpu-telemetry \
@@ -799,8 +916,109 @@ run_aiperf_agentic_benchmark() {
   done
 }
 
+run_swebench_lite_eval() {
+  local -a eval_concs=()
+  local candidate
+  IFS=',' read -r -a candidates <<< "${EVAL_CONCURRENCY}"
+  for candidate in "${candidates[@]}"; do
+    candidate="${candidate//[[:space:]]/}"
+    [[ -n "${candidate}" ]] && eval_concs+=("${candidate}")
+  done
+  if [[ "${#eval_concs[@]}" -ne 1 || ! "${eval_concs[0]}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: SWE-bench Lite requires exactly one positive eval concurrency" >&2
+    return 2
+  fi
+
+  local eval_conc="${eval_concs[0]}"
+  local agent_workers="${SWEBENCH_AGENT_WORKERS}"
+  local tag result_dir result_file runner
+  tag="$(date +%Y%m%d%H%M%S)_swebench_lite_${TOPOLOGY}_c${eval_conc}"
+  result_dir="${RUN_DIR}/eval_results/${tag}"
+  result_file="${result_dir}/results_swebench_lite.json"
+  runner="${ATOMESH_SCRIPT_DIR}/run_swebench_lite.sh"
+  mkdir -p "${result_dir}"
+
+  if [[ ! -f "${runner}" ]]; then
+    echo "ERROR: ATOM SWE-bench runner is missing: ${runner}" >&2
+    return 1
+  fi
+
+  echo ""
+  echo "========================================="
+  echo "[eval] SWE-bench Lite local-Docker evaluation"
+  echo "[eval] workers=${agent_workers} limit=${EVAL_LIMIT:-full}"
+  echo "[eval] mini-swe-agent=2.4.5 swebench=4.1.0"
+  echo "========================================="
+
+  EVAL_LIMIT="${EVAL_LIMIT}" \
+  SWEBENCH_AGENT_STEP_LIMIT="${SWEBENCH_AGENT_STEP_LIMIT}" \
+  SWEBENCH_CASE_TIMEOUT="${SWEBENCH_CASE_TIMEOUT}" \
+  SWEBENCH_AGENT_TIMEOUT="${SWEBENCH_AGENT_TIMEOUT}" \
+  SWEBENCH_SCORE_TIMEOUT="${SWEBENCH_SCORE_TIMEOUT}" \
+  SWEBENCH_MAX_WORKERS="${SWEBENCH_MAX_WORKERS}" \
+  SWEBENCH_EVAL_TIMEOUT="${SWEBENCH_EVAL_TIMEOUT}" \
+  SWEBENCH_MIN_DISK_GB="${SWEBENCH_MIN_DISK_GB}" \
+  SWEBENCH_PRUNE_IMAGES="${SWEBENCH_PRUNE_IMAGES}" \
+    bash "${runner}" \
+      --output-dir "${result_dir}" \
+      --model-name "${MODEL_NAME}" \
+      --api-model "${MODEL_PATH}" \
+      --api-base "http://127.0.0.1:${ROUTER_PORT}/v1" \
+      --run-id "${tag}" \
+      --limit "${EVAL_LIMIT:-full}" \
+      --venv "${SWEBENCH_VENV}" \
+      --agent-workers "${agent_workers}"
+
+  if [[ ! -s "${result_file}" ]]; then
+    echo "ERROR: SWE-bench Lite did not produce ${result_file}" >&2
+    return 1
+  fi
+
+  # Trajectories are useful while the job is live but too large for the
+  # benchmark artifact. Keep predictions, the official report, and score JSON.
+  find "${result_dir}" -type f -name '*.traj*' -delete 2>/dev/null || true
+
+  local score resolved total
+  read -r score resolved total < <(
+    python3 - "${result_file}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+task = data.get("results", {}).get("swebench_lite", {})
+score = task.get("exact_match,resolved")
+details = data.get("swebench", {})
+resolved = details.get("resolved")
+total = details.get("total")
+if score is None or resolved is None or total is None:
+    raise SystemExit("SWE-bench Lite result is missing score details")
+print(score, resolved, total)
+PY
+  )
+  echo "[eval] SWE-bench Lite resolved ${resolved}/${total} = ${score}"
+
+  if [[ -n "${EVAL_THRESHOLD}" ]]; then
+    python3 - "${score}" "${EVAL_THRESHOLD}" <<'PY'
+import sys
+
+score = float(sys.argv[1])
+threshold = float(sys.argv[2])
+if score < threshold:
+    raise SystemExit(
+        f"SWE-bench Lite score {score:.4f} is below threshold {threshold:.4f}"
+    )
+print(f"[eval] SWE-bench Lite threshold passed: {score:.4f} >= {threshold:.4f}")
+PY
+  fi
+}
+
 run_eval() {
   [[ "${RUN_EVAL}" == "true" ]] || [[ "${RUN_EVAL}" == "1" ]] || return 0
+  if [[ "${EVAL_TASK}" == "swebench_lite" ]]; then
+    run_swebench_lite_eval
+    return
+  fi
   if [[ "${EVAL_TASK}" != "gsm8k" ]]; then
     echo "[eval] unsupported task ${EVAL_TASK}; skipping"
     return 0
@@ -884,6 +1102,28 @@ PY
   echo "[eval] gsm8k runs done, results saved to ${RUN_DIR}/eval_results"
 }
 
+run_benchmark_and_eval() {
+  if [[ "${ATOMESH_EXECUTION_PHASE}" == "benchmark" ]]; then
+    run_benchmark
+    return
+  fi
+  if [[ "${ATOMESH_EXECUTION_PHASE}" == "eval" ]]; then
+    run_eval
+    return
+  fi
+  if [[ "${BENCHMARK_KIND}" == "aiperf_agentic" \
+    && "${EVAL_TASK}" == "swebench_lite" \
+    && ( "${RUN_EVAL}" == "true" || "${RUN_EVAL}" == "1" ) ]]; then
+    # Agentic performance cases require a fresh prefix-cache state. Run their
+    # trace benchmark before the independent SWE-bench workload.
+    run_benchmark
+    run_eval
+  else
+    run_eval
+    run_benchmark
+  fi
+}
+
 write_metadata
 
 if [[ "${NODE_RANK}" -eq 0 && "${SINGLE_NODE_PD}" == "1" ]]; then
@@ -901,8 +1141,7 @@ if [[ "${NODE_RANK}" -eq 0 && "${SINGLE_NODE_PD}" == "1" ]]; then
   done
   start_router
   wait_http "http://127.0.0.1:${ROUTER_PORT}/v1/models" "router" "${WAIT_ROUTER_TIMEOUT}"
-  run_eval
-  run_benchmark
+  run_benchmark_and_eval
   cleanup_processes "${router_pid}" "${prefill_pid}" "${decode_pid}"
 elif [[ "${NODE_RANK}" -eq 0 && "${PREFILL_SINGLE_NODE_PD}" == "1" ]]; then
   prefill_pids=()
@@ -930,8 +1169,7 @@ elif [[ "${NODE_RANK}" -eq 0 && "${PREFILL_SINGLE_NODE_PD}" == "1" ]]; then
   done
   start_router
   wait_http "http://127.0.0.1:${ROUTER_PORT}/v1/models" "router" "${WAIT_ROUTER_TIMEOUT}"
-  run_eval
-  run_benchmark
+  run_benchmark_and_eval
   cleanup_processes "${router_pid}" "${prefill_pids[@]}"
 elif [[ "${NODE_RANK}" -eq 0 ]]; then
   start_prefill "prefill-rank-0"
@@ -948,8 +1186,7 @@ elif [[ "${NODE_RANK}" -eq 0 ]]; then
   done
   start_router
   wait_http "http://127.0.0.1:${ROUTER_PORT}/v1/models" "router" "${WAIT_ROUTER_TIMEOUT}"
-  run_eval
-  run_benchmark
+  run_benchmark_and_eval
   kill "${router_pid}" "${server_pid}" 2>/dev/null || true
 elif [[ "${DECODE_SINGLE_NODE_PD}" == "1" && "${NODE_RANK}" -eq "${xP}" ]]; then
   decode_pids=()

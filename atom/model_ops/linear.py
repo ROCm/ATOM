@@ -273,6 +273,39 @@ def gemm_a8w8_blockscale_preshuffle_impl(
     return gemm_a8w8_blockscale_bpreshuffle(x, weight, x_scale, w_scale, dtype)
 
 
+def gemm_a8w8_blockscale_preshuffle_into_output_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    out: torch.Tensor,
+    dtype: torch.dtype = torch.bfloat16,
+    prefix: str = "",
+) -> None:
+    return None
+
+
+@torch_compile_guard(
+    gen_fake=gemm_a8w8_blockscale_preshuffle_into_output_fake, mutates_args=["out"]
+)
+def gemm_a8w8_blockscale_preshuffle_into_output(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    out: torch.Tensor,
+    dtype: torch.dtype = torch.bfloat16,
+    prefix: str = "",
+) -> None:
+    # Same GEMM, but the result lands in the CALLER-owned `out` buffer (a fixed
+    # address) and the op returns None — a mutates_args op must NOT also return
+    # the mutated tensor (Inductor functionalization then emits a getitem it
+    # cannot lower). Lets the downstream attention cudagraph read this output at
+    # a stable address with no per-step input copy. Mirrors 035db69's
+    # unified_attention_into_output.
+    gemm_a8w8_blockscale_bpreshuffle(x, weight, x_scale, w_scale, dtype, out=out)
+
+
 def gemm_a8w8_blockscale_triton_fake(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -371,6 +404,24 @@ def gemm_a8w8_per_token_impl(
         bias=bias,
         dtype=dtype,
     )
+
+
+def _can_use_a8w8_preshuffle(output_size: int, input_size: int) -> bool:
+    """Whether an a8w8 weight can use the AITER bpreshuffle GEMM as-is.
+
+    ``shuffle_weight(..., layout=(16, 16))`` packs the output (N) dim in 16-row
+    tiles and the input (K) dim in ``BK = IK * 2 = 32``-col tiles (it asserts
+    ``x.shape[-1] % 32 == 0``). So N must be 16-aligned and K must be 32-aligned.
+    """
+    return output_size % 16 == 0 and input_size % 32 == 0
+
+
+def _a8w8_preshuffle_output_padding(output_size: int) -> int:
+    """Rows needed to pad an a8w8 weight's output dim (N) up to the GEMM's N-tile
+    (128). Returns 0 when already tile-aligned. Padding N to 128 also makes it
+    16-aligned, so the tuned preshuffle GEMM can run instead of falling back."""
+    remainder = output_size % 128
+    return 0 if remainder == 0 else 128 - remainder
 
 
 class LinearBase(nn.Module):
@@ -487,6 +538,7 @@ class LinearBase(nn.Module):
             self.weight_scale.weight_loader = self.weight_loader
         self.need_normalize_e4m3fn_to_e4m3fnuz = params_dtype == torch.float8_e4m3fnuz
         self.quant_func = get_hip_quant(self.quant_type)
+        self.is_output_padded = False
 
     @staticmethod
     def weight_loader_process(
@@ -688,6 +740,8 @@ class LinearBase(nn.Module):
         }
 
     def process_weights_after_loading(self):
+        if self.weight.numel() == 0:
+            return
         # Re-quantize before process_weights if online quantization is enabled
         if self.quant_config is not None and self.quant_config.online_quant:
             self.online_quantize_weight()
@@ -773,15 +827,51 @@ class LinearBase(nn.Module):
                     self, "needs_preshuffled_weight", False
                 ):
                     need_shuffle = True
-            if need_shuffle:
-                if self.weight.dim() == 2:
-                    shuffle_weights(self.weight)
+            if need_shuffle and self.weight.dim() == 2:
+                self.is_output_padded = self._maybe_pad_a8w8_preshuffle_output()
+                shuffle_weights(self.weight)
                 # self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
         # shuffle weight scale once so no reshuffling for every gemm
         if self.quant_type == QuantType.per_1x32 and (
             self.params_dtype != dtypes.fp4x2 or not use_fp4_non_shuffle_triton_gemm()
         ):
             self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
+
+    def _maybe_pad_a8w8_preshuffle_output(self) -> bool:
+        if not (
+            self.quant_type == QuantType.per_Token and self.params_dtype == dtypes.fp8
+        ):
+            return False
+        if self.weight.dim() != 2:
+            return False
+        output_size, input_size = self.weight.shape
+        padding_size = _a8w8_preshuffle_output_padding(output_size)
+        if not _can_use_a8w8_preshuffle(output_size + padding_size, input_size):
+            # Padding the output (N) cannot make this weight preshuffle-able, i.e.
+            # the input dim K is not 32-aligned. Fail loudly here rather than let
+            # shuffle_weights hit its cryptic `x.shape[-1] % 32 == 0` assertion.
+            raise RuntimeError(
+                f"{self.prefix}: a8w8 bpreshuffle GEMM requires K % 32 == 0, got "
+                f"K={input_size}. Align K or run this layer via the triton a8w8 "
+                f"path (ATOM_USE_TRITON_GEMM=1)."
+            )
+        if padding_size == 0:
+            return False
+        self._output_size_before_padding = output_size
+        self.weight.data = torch.nn.functional.pad(
+            self.weight.data, (0, 0, 0, padding_size)
+        )
+        ws = self.weight_scale.data
+        self.weight_scale.data = torch.cat(
+            [ws, ws.new_ones((padding_size, *ws.shape[1:]))], dim=0
+        )
+        # Bias is also per-output-channel
+        if self.bias is not None:
+            b = self.bias.data
+            self.bias.data = torch.cat(
+                [b, b.new_zeros((padding_size, *b.shape[1:]))], dim=0
+            )
+        return True
 
     # linear mark trace shape/dtype helper
     def get_trace_prefix(
@@ -802,10 +892,30 @@ class LinearBase(nn.Module):
         o_dtype = otype
         return f"{self.prefix}[M={m},N={n},K={k},a={a_dtype},w={w_dtype},o={o_dtype}]"
 
+    def supports_out(self) -> bool:
+        """Whether `forward(out=...)` is wired for this Linear: only the per_1x128
+        preshuffle GEMM writes into a caller-owned destination.
+
+        Computed on access rather than cached at construction -- `quant_type` is
+        rewritten when online quantisation is configured, well after __init__.
+        """
+        return self.quant_type.value == QuantType.per_1x128.value and bool(
+            envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
+        )
+
     @mark_trace
     def forward(
-        self, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None, otype=dtypes.bf16
+        self,
+        x: torch.Tensor,
+        x_scale: torch.Tensor | None = None,
+        otype=dtypes.bf16,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # A quant path that cannot honour out= must not silently ignore it.
+        assert out is None or self.supports_out(), (
+            "Linear out= requested but this quant path does not support it "
+            f"(quant_type={self.quant_type})."
+        )
         if self.quant_type.value == QuantType.No.value:
             y = tgemm.mm(
                 x,
@@ -885,15 +995,34 @@ class LinearBase(nn.Module):
                         y += self.bias
             elif self.quant_type.value == QuantType.per_1x128.value:
                 if envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE:
-                    y = gemm_a8w8_blockscale_preshuffle_impl(
-                        x,
-                        self.weight,
-                        x_scale,
-                        self.weight_scale,
-                        dtype=otype,
-                        prefix=self.prefix,
-                    )
+                    if out is not None:
+                        # Fixed-address output: write into `out` (returns None),
+                        # then use it as y. Separate op because a mutates_args op
+                        # must not also return the mutated tensor.
+                        gemm_a8w8_blockscale_preshuffle_into_output(
+                            x,
+                            self.weight,
+                            x_scale,
+                            self.weight_scale,
+                            out,
+                            dtype=otype,
+                            prefix=self.prefix,
+                        )
+                        y = out
+                    else:
+                        y = gemm_a8w8_blockscale_preshuffle_impl(
+                            x,
+                            self.weight,
+                            x_scale,
+                            self.weight_scale,
+                            dtype=otype,
+                            prefix=self.prefix,
+                        )
                 else:
+                    assert out is None, (
+                        "Linear out= only supported on the per_1x128 preshuffle "
+                        "path (ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE)."
+                    )
                     if use_triton_gemm() and gemm_a8w8_blockscale_triton is not None:
                         y = gemm_a8w8_blockscale_triton_impl(
                             x,
@@ -925,6 +1054,9 @@ class LinearBase(nn.Module):
                 )
                 if self.bias is not None:
                     y += self.bias
+        if self.is_output_padded:
+            # Drop the padded output rows
+            y = y[..., : self._output_size_before_padding]
         if self.tp_dim == 1 and self.tp_size > 1 and self.reduce_results:
             y = tensor_model_parallel_all_reduce(y)
         return y

@@ -259,6 +259,7 @@ def build_cell(
     allow_auto_nodes = slurm_submit_runner in {
         "atomesh-cicd-mi350",
         "atomesh-cicd-crusoe-mi355",
+        "atomesh-cicd-mi355-crusoe",
     }
     requires_explicit_candidate_nodes = slurm_submit_runner == "atomesh-cicd-mi350"
 
@@ -393,6 +394,14 @@ def build_cell(
             "fewshot_as_multiturn": bool(
                 accuracy_cfg.get("fewshot_as_multiturn", False)
             ),
+            "threshold": accuracy_cfg.get("threshold"),
+            "agent_workers": accuracy_cfg.get("agent_workers"),
+            "agent_step_limit": accuracy_cfg.get("agent_step_limit"),
+            "case_timeout": accuracy_cfg.get("case_timeout"),
+            "agent_timeout": accuracy_cfg.get("agent_timeout"),
+            "score_timeout": accuracy_cfg.get("score_timeout"),
+            "max_workers": accuracy_cfg.get("max_workers"),
+            "instance_timeout": accuracy_cfg.get("instance_timeout"),
         },
     }
 

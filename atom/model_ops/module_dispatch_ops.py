@@ -19,18 +19,19 @@ Caller contract (per op): the module registered at `layer_name` must expose
 the methods listed in each op's docstring.
 
 Currently registered:
-  - torch.ops.aiter.maybe_dual_stream_forward — V2/V3.2/V4 MoE
+  - torch.ops.aiter.maybe_dual_stream_forward — V2/V3.2/V4/K3 MoE
   - torch.ops.aiter.indexer_score_topk       — V4 sparse indexer
 """
 
 import torch
 
-from atom.config import get_current_atom_config
+from atom.config import CUDAGraphMode, get_current_atom_config
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
+from atom.utils.forward_context import get_current_cudagraph_runtime_mode
 
 # ---------------------------------------------------------------------------
-# Dual-stream MoE dispatch (V2 / V3.2 / V4)
+# Dual-stream MoE dispatch (V2 / V3.2 / V4 / K3)
 # ---------------------------------------------------------------------------
 #
 # Caller contract (the MoE module looked up by `layer_name`):
@@ -54,13 +55,12 @@ def maybe_dual_stream_forward(
     # Under TBO the two micro-batches already overlap on separate threads
     from atom.utils.tbo.ubatching import tbo_active
 
-    # PIECEWISE cudagraph only: dual_stream_moe_forward forks work onto
-    # `alt_stream` and does a caching-allocator alloc there; under PIECEWISE
-    # per-piece capture close the dual stream
-    compilation_config = get_current_atom_config().compilation_config
-    cudagraph_mode = getattr(compilation_config, "cudagraph_mode", None)
+    # Graph ownership belongs to the active frontend.  Only a concrete
+    # PIECEWISE runtime decision is unsafe here: per-piece capture closes over
+    # the main stream while this forward forks work onto `alt_stream`.  Eager
+    # NONE and whole-model FULL capture both support the fork/join topology.
     is_piecewise_cudagraph = (
-        cudagraph_mode is not None and cudagraph_mode.requires_piecewise_compilation()
+        get_current_cudagraph_runtime_mode() == CUDAGraphMode.PIECEWISE
     )
 
     if (

@@ -92,6 +92,37 @@ Both `ChatCompletionResponse` and `CompletionResponse` include:
 Streaming responses use the SSE (Server-Sent Events) protocol with
 `data: [DONE]\n\n` as the termination signal.
 
+#### Delivery under load
+
+The API server is a single Python process, so at high concurrency the fixed
+per-chunk cost of delivering tokens (detokenize, coroutine wakeup, JSON encode,
+socket write) can cap throughput before the GPU does. Two things keep that cost
+down, neither of which delays a token:
+
+- **Backlog merging.** Each request's chunks land in a `StreamOutputCollector`
+  (`atom/entrypoints/openai/streaming_dispatch.py`), which holds at most one
+  chunk per stream: anything arriving behind an unread one merges into it.
+  Nothing is held back waiting for more, so a consumer that keeps up sees
+  exactly one chunk per engine step and a token is never delivered later than
+  it otherwise would have been.
+- **msgspec frame encoding** (`atom/entrypoints/openai/sse.py`), roughly 5.8x
+  cheaper per frame than `json.dumps`.
+
+One consequence matters when reading benchmark output. ITL is sampled once per
+received SSE chunk (`backend_request_func.py`, `benchmark_serving.py`), so
+merging N tokens into one chunk removes N-1 samples and stretches the gaps that
+remain: **every ITL statistic - mean, median and p99 alike - inflates by roughly
+the merge factor**, without any token being delivered later. Measured on
+Qwen3.5-27B-FP8 tp4 at concurrency 2048, mean ITL read 191.8 ms against a TPOT
+of 126.6 ms, while the same workload with merging disabled read 122.9 ms against
+a TPOT of 123.3 ms.
+
+**Compare TPOT, not ITL, whenever merging is active.** It is the only
+token-normalized latency in the report (`latency - ttft` over `output_len - 1`),
+so it stays honest at any merge factor. The ratio ITL/TPOT is itself the useful
+number: it *is* the merge factor, and a value near 1.0 means the frontend is
+keeping up and nothing ever merged.
+
 ### Server startup
 
 ```bash
@@ -108,6 +139,8 @@ Server-specific CLI arguments:
 |----------|---------|-------------|
 | `--host` | `0.0.0.0` | Bind address |
 | `--server-port` | `8000` | HTTP port (note: `--port` is for internal engine communication) |
+| `--timeout-keep-alive` | `5` | Seconds an idle keep-alive connection is held. Pooling clients hold their end longer (aiohttp defaults to 15s), so a caller that pauses for longer than this reuses a socket the server already closed and has to re-send. Raise it past the caller's idle window to avoid that |
+| `--disable-uvicorn-access-log` | off | Stop uvicorn logging a line per HTTP request. It copies a `LogRecord` and writes to the same stdout as the engine, on the event loop |
 
 All `EngineArgs` arguments are also accepted (see Section 7 for the full list).
 
@@ -441,18 +474,32 @@ During CUDA-graph capture (server bring-up), ATOM can emit one trace file per
 captured batch size instead of a single combined blob. This makes each graph's
 capture cost easy to inspect in isolation and keeps individual trace files
 small. Capture-trace profiling is gated on `--mark-trace` (with
-`--torch-profiler-dir`/`ATOM_TORCH_PROFILER_DIR` set); the warmup phase is
-omitted so only meaningful capture work is retained.
+`--torch-profiler-dir`/`ATOM_TORCH_PROFILER_DIR` set).
 
-The per-batch-size traces are written to:
+Each file covers one full iteration of the capture loop: the warmup forward
+followed by the graph capture itself. Both are needed — inside
+`torch.cuda.graph(...)` the stream is in capture mode, so kernel launches are
+recorded as graph nodes rather than dispatched, and a trace of that region
+alone has an empty GPU track. The warmup forward is where the kernels actually
+run.
+
+The traces are written to:
 
 ```
-{profiler_dir}/capture_traces/bs_<bs>_rank<rank>.json.gz
+{profiler_dir}/capture_traces/bs_<bs>_q_<max_q_len>_rank<rank>.json.gz
 ```
 
-where `<bs>` is the captured batch size and `<rank>` the worker rank. Each file
-is a gzip-compressed Chrome trace viewable with `chrome://tracing` or
-TensorBoard.
+where `<bs>` is the captured batch size, `<max_q_len>` the query-length bucket
+(`1` without speculative decoding, `mtp_k + 1` with a drafter, and one file per
+bucket when DSpark expands them — see
+[Speculative decoding](#speculative-decoding-mtp)), and `<rank>` the worker
+rank. Each file is a gzip-compressed Chrome trace viewable with
+`chrome://tracing` or TensorBoard.
+
+Like the run-phase profiler, these traces carry `record_shapes`, `with_stack`,
+and `profile_memory` only when `ATOM_PROFILER_MORE=1`. Leave it unset unless you
+need the shapes or Python stacks — stack capture runs on every rank and
+noticeably stretches server bring-up.
 
 To additionally annotate the run-phase `prefill[]`/`decode[]` labels with the
 attention FLOP aggregates used for roofline analysis, set
@@ -493,6 +540,8 @@ python -m atom.entrypoints.openai_server \
 | `--method` | `None` | Speculative method: `mtp` (DeepSeek MTP) or `eagle3` (EAGLE 3 / EAGLE 3.1 — see [`eagle3_speculative_decoding.md`](eagle3_speculative_decoding.md)) |
 | `--num-speculative-tokens` | `1` | Number of draft tokens per iteration (draft model runs this many autoregressive steps) |
 | `--draft-model` | `None` | Path or HF repo of the speculative draft model. Required for `--method eagle3`; the draft's `config.json` drives EAGLE 3 vs EAGLE 3.1 toggles automatically |
+| `--spec-decode-acceptance-length` | `None` | Benchmark-only: force a mean acceptance length in `[1, num_speculative_tokens + 1]`, ignoring real draft/target agreement. See [Forced acceptance length](#forced-acceptance-length) |
+| `--spec-decode-acceptance-rate` | `None` | The same knob as a rate in `[0, 1]`, i.e. `(length - 1) / num_speculative_tokens`. Mutually exclusive with the above |
 
 ### MTP statistics
 
@@ -528,6 +577,48 @@ MTP Statistics:
      subsequent draft tokens are discarded.
    - If all draft tokens match, a bonus token from the target model is
      appended.
+
+### Forced acceptance length
+
+Speculative throughput is dominated by how many tokens each target forward
+emits, so a run cannot be compared against another engine unless both accept at
+the same rate. `--spec-decode-acceptance-length` pins that number: the sampler
+stops comparing draft against target and instead accepts draft tokens with a
+fixed per-position probability, hitting the requested mean acceptance length.
+It exists to benchmark the serving system while a draft head is still training,
+and to replay a published acceptance-length figure such as an
+[InferenceX golden AL](https://github.com/SemiAnalysisAI/InferenceX/blob/main/golden_al_distribution/README.md).
+
+```bash
+python -m atom.entrypoints.openai_server \
+    --model /models/Kimi-K3 \
+    --draft-model /models/Kimi-K3-DSpark \
+    --method dspark \
+    --num-speculative-tokens 7 \
+    --spec-decode-acceptance-length 3.78
+```
+
+Acceptance length counts the target's own guaranteed token, matching vLLM's
+`synthetic_acceptance_length` and SGLang's `SGLANG_SIMULATE_ACC_LEN`, so a
+published figure goes in unchanged. The budget is spent on the earliest
+positions — length `3.78` over 7 draft slots accepts 2 tokens always and a 3rd
+with probability `0.78` — which is the minimum-variance schedule vLLM and
+SGLang also use, so the accepted-length distribution matches and not just its
+mean. Read the realized value back from `average_tokens_per_forward` on
+`/debug/mtp_stats` (or the `atom:mtp_average_tokens_per_forward` metric).
+
+Two caveats:
+
+- Generated text is meaningless, because tokens are accepted without agreeing
+  with the target. Never run an accuracy evaluation with this enabled.
+- It cannot be combined with the DSpark confidence scheduler
+  (`--dspark-config '{"confidence_schedule": true}'`), which picks each
+  request's verify length at runtime; a short one silently caps acceptance
+  below the requested length, so the combination is rejected at startup.
+
+The full reference — the resolved schedule, the rate-based spelling, and how to
+replay a golden AL curve — is in
+[`forced_acceptance_length.md`](forced_acceptance_length.md).
 
 ## Deployment examples
 
@@ -647,6 +738,8 @@ server without modification.
 | File | Description |
 |------|-------------|
 | `atom/entrypoints/openai_server.py` | OpenAI-compatible API server (FastAPI + Uvicorn) |
+| `atom/entrypoints/openai/streaming_dispatch.py` | `StreamBatchDispatcher` (per-engine-step cross-thread dispatch) and `StreamOutputCollector` (per-request delivery, folds a backlog) |
+| `atom/entrypoints/openai/sse.py` | SSE frame encoding (`data_frame`, `event_frame`) on a shared msgspec encoder |
 | `atom/model_engine/llm_engine.py` | `LLMEngine` programmatic API |
 | `atom/sampling_params.py` | `SamplingParams` dataclass |
 | `atom/model_engine/arg_utils.py` | `EngineArgs` CLI argument definitions and engine factory |

@@ -46,6 +46,10 @@ no wall-clock skew). See `atom/model_engine/prefill_delayer.py`. Active only whe
 | **ATOM_DISABLE_MMAP** | bool | false | If set to `true`, disable memory-mapped file loading for model weights. Useful in containerized environments where mmap may cause issues. |
 | **ATOM_LOADER_NUM_THREADS** | int | 16 | Worker threads for weight loading. `>1` (default `16`) enables the batched parallel loader (routed expert weights staged in a CPU buffer, flushed with a single H2D copy when every routed expert of that parameter has arrived) with that many threads; set to `1` to fall back to the original sequential per-expert path. Raise on high-core hosts if loading is CPU-bound. |
 | **ATOM_LOADER_STRICT_COVERAGE** | bool | `true` | Fail loading when a fused MoE parameter does not receive every routed expert from the checkpoint. Set to `false` to downgrade to a warning and load anyway, leaving those expert slots at their init values — useful when bringing up a checkpoint known to be partial, misleading otherwise (the symptom is an accuracy drop much later). |
+| **ATOM_LOADER_PREFETCH** | bool | `true` | Warm the page cache by reading this rank's share of the checkpoint sequentially on a background thread, instead of leaving it to demand faults through the mmap. The fault pattern sustains ~3.2 GB/s on a local NVMe that a single sequential reader drives at 6.06 GB/s, so this is an access-pattern fix, not a queue-depth one. Measured on DeepSeek-R1 MXFP4 (350 GiB, TP=4): cold load 154s → 69s. Set to `false` to restore demand faulting. Has no effect when `ATOM_DISABLE_MMAP=true`. |
+| **ATOM_LOADER_PREFETCH_THREADS** | int | 4 | Concurrent sequential readers used by the prefetcher. The device saturates at ~2 streams, so raising this mostly adds contention with the loader; `0` is clamped to `1` (use `ATOM_LOADER_PREFETCH=false` to switch prefetching off). |
+| **ATOM_LOADER_PREFETCH_BLOCK_MB** | int | 16 | Read block size for the prefetcher, in MiB. |
+| **ATOM_LOADER_FADVISE** | bool | `false` | Issue `posix_fadvise(SEQUENTIAL\|WILLNEED)` per shard before reading it. Off by default and ignored while `ATOM_LOADER_PREFETCH` is on: `WILLNEED` is a hint the kernel drops for most of a 350 GiB checkpoint, and running both makes the kernel read ahead over random-ish ranges while the prefetcher streams the same files, so the two compete for the device. Only useful with prefetching disabled. |
 
 ## Plugin mode
 
@@ -60,6 +64,21 @@ no wall-clock skew). See `atom/model_engine/prefill_delayer.py`. Active only whe
 | **ATOM_USE_TRITON_GEMM** | bool | 0 (false) | If set to `1`, use AITER Triton FP4 weight preshuffled GEMM. Otherwise use AITER ASM FP4 weight preshuffled GEMM. |
 | **ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM** | bool | 0 (false) | If set to `1`, use AITER Triton FP4 GEMM with non-shuffled weights. Takes precedence over the FP4 preshuffled GEMM path selected by `ATOM_USE_TRITON_GEMM`. |
 | **ATOM_USE_TRITON_MXFP4_BMM** | bool | 0 (false) | If set to `1`, use FP4 BMM in MLA attention module. |
+
+## MoE all2all (MoRI) wire format
+
+Both are opt-in and default to off; they only apply with DP attention + expert
+parallelism. They are *not* symmetric — FP4 dispatch only moves a quantization
+the MoE GEMM was going to perform anyway (it consumes FP4 activations either
+way, and `per_1x32` is per-row, so it does not matter which rank runs it), while
+FP8 combine adds a quantization that would not otherwise happen, since the
+expert output is bf16. Treat the dispatch knob as format matching and the
+combine knob as a quality/throughput tradeoff.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_MORI_FP4_DISPATCH** | bool | 0 (false) | If set to `1`, quantize activations to packed FP4 (E2M1, `per_1x32`) before the MoE all2all instead of sending bf16 — a quarter of the bytes on the dispatch wire — which selects `EpDispatchIntraNodeKernel_fp4`. MoRI picks its dispatch kernel from the dtype of the tensor handed to `dispatch()` but sizes its staging buffers from the config built at init, so this also switches `scale_dim` to `hidden_dim/32` and the scale type to e8m0. All three are resolved together by `mori_prepare_finalize.resolve_mori_dispatch()`; never set one without the others, as a mismatch strides the staging scale buffer wrong and faults on the first real batch instead of erroring cleanly. |
+| **ATOM_MORI_COMBINE_QUANT** | str | `none` | Combine-side codec passed into the MoRI config. `none` returns bf16; `fp8_blockwise` selects `EpCombineIntraNodeKernel_*_fp8bwq_*`; MoRI also accepts `fp8_direct_cast`. |
 
 ## Fusion passes
 
@@ -78,11 +97,24 @@ no wall-clock skew). See `atom/model_engine/prefill_delayer.py`. Active only whe
 | **ATOM_ENABLE_DS_QKNORM_QUANT_FUSION** | bool | 1 (true) | If set to `1`, fuse QK norm with quantization in MLA attention module. |
 | **ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD** | int | 1024 | Upper bound on MoE token count (`num_tokens` in the MoE forward) for using the dual-stream path: shared experts on a secondary CUDA stream while routed experts run on the default stream. If `num_tokens` exceeds this value, that forward uses single-stream MoE instead. Set to `0` to disable dual-stream setup entirely (no alt stream, no `maybe_dual_stream_forward` registration). |
 
-### Qwen3-MoE style
+### DSpark block sampling
+
+DSpark drafts a `num_speculative_tokens`-wide block in one backbone pass, then
+samples it left-to-right with a low-rank first-order Markov head
+(`logits_k = base_logits_k + W1[x_{k-1}] @ W2ᵀ`, `x_k = argmax(logits_k)`). The
+unfused loop casts the whole `[V, r]` `W2` table to fp32 on every iteration and
+materializes two `[B, V]` fp32 tensors that only an `argmax` reads. See
+`atom/model_ops/dspark_markov_sample.py`.
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| **ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION** | bool | 0 (false) | If set to `1`, fuse QK norm, RoPE, and cache quantization into one kernel. **Enable this for Qwen3-MoE models for better performance.** |
+| **ATOM_DSPARK_FUSED_MARKOV_SAMPLE** | bool | 1 (true) | Sample the DSpark block with a fused Triton kernel that computes the rank-`r` bias GEMV, adds the base logits in the GEMM epilogue and reduces to token ids in registers — so `W2` stays bf16 and is read exactly once per block position, and no `[B, V]` intermediate exists. Covers both native DSpark block samplers, Kimi-K3 (`r=256`) and DeepSeek-V4 (`r=512`); the op is shape-generic and hands anything it cannot index back to the reference, but only K3 has been run on hardware. Tie-breaking matches `torch.argmax` (lowest index). The bias moves from an fp32 matmul to bf16 MFMA with an fp32 accumulator: every product is exact in fp32 either way, so the result is equal to the reference up to accumulation order. Measured on Kimi-K3 (MI355X, TP8, fp8 KV, full GSM8K 5-shot at 64 concurrency): acceptance 87.08% against 87.06% unfused with the accept-length distribution equal to within 0.1pp, and flexible-extract inside the run-to-run band. Saves 145 µs per drafting step at B=1 and ~235 µs at B=64. Set to `0` to force the reference spelling if an acceptance-rate regression is suspected — the two paths are not bit-identical by construction, so this is the fastest way to rule the kernel in or out. Read at Markov-head construction, so set it before the server starts. |
+
+### Qwen3 style
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION** | bool | 0 (false) | If set to `1`, fuse QK norm, RoPE, and cache quantization into one kernel for Qwen3 dense and MoE models. |
 
 ### Llama-style
 
@@ -90,6 +122,17 @@ no wall-clock skew). See `atom/model_engine/prefill_delayer.py`. Active only whe
 |----------|------|---------|-------------|
 | **ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT** | bool | 1 (true) | If set to `1`, use Triton kernel to fuse RMSNorm with quantization. |
 | **ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT** | bool | 1 (true) | If set to `1`, use Triton kernel to fuse SiLU and mul with quantization in MLP module. |
+
+### DSpark drafting
+
+The Kimi-K3 DSpark draft writes the target's context rows into its own paged MLA
+cache once per draft layer per drafting step; the switch below shortens that
+path. The first write of each process logs which path it took, and logs again if
+that ever changes, so a fusion left inert by an unrecognised layout says so.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_DSPARK_FUSED_CTX_KV** | bool | 1 (true) | Write the context rows with one Triton kernel (RMSNorm + RoPE + concat + paged store) instead of four launches plus a throwaway `empty_like` for the RoPE's query side. Falls back per call when the cache layout or the RoPE is not the plain one the kernel understands (seg / shuffled-KV layouts keep their own write kernels), and until the RoPE's cos/sin cache has reached the device. Measured on Kimi-K3 (MI355X, TP8, fp8 KV): one 4.65 µs kernel replaces a 14 µs three-kernel chain, saving ~39 µs per drafting step at B=1 and ~36 µs at B=64. Set to `0` to force the per-op chain; that chain is the fallback above rather than debug code, so it stays reachable either way (it runs the first write of every layer). |
 
 ## V4 attention backend (Migration)
 
@@ -110,7 +153,7 @@ land. See `atom/model_ops/v4_backend_gate.py` for the selector.
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | **ATOM_TORCH_PROFILER_DIR** | str | — | When set, enables PyTorch profiler and writes traces to this directory. Create subdirectories per rank (e.g., `rank_0`, `dp0_tp0`). |
-| **ATOM_PROFILER_MORE** | bool | 0 (false) | When `ATOM_TORCH_PROFILER_DIR` is set and this is `1`, enables detailed profiling: `record_shapes`, `with_stack`, and `profile_memory`. |
+| **ATOM_PROFILER_MORE** | bool | 0 (false) | When `ATOM_TORCH_PROFILER_DIR` is set and this is `1`, enables detailed profiling: `record_shapes`, `with_stack`, and `profile_memory`. Applies to both the run-phase profiler and the CUDA-graph capture profiler. |
 | **ATOM_ENABLE_DETAILED_ANNOTATION** | bool | 0 (false) | When profiling is active, appends detailed attention aggregates to the `prefill[]`/`decode[]` trace labels: `sqsq` (Σ N_Q²), `sqsk` (Σ N_Q·N_KV), and `sk` (Σ N_KV), where N_Q is the scheduled query tokens and N_KV the KV length per request. Used to estimate attention FLOPs for downstream roofline analysis. |
 | **ATOM_LOG_MORE** | bool | 0 (false) | If set to `1`, use verbose logging format (includes process name, PID, path, line number, function name). |
 
