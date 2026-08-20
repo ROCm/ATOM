@@ -2440,7 +2440,9 @@ class DeepseekV2MLAAttention(nn.Module):
         # Gated in Config.__post_init__ (only True with dcp>1, dense/sparse, fp8,
         # no spec). W_K is separately DCP-gathered at load in
         # MLAAttention.process_weights_after_loading.
-        self.qrep_enabled = get_current_atom_config().enable_dcp_query_replication
+        self.qrep_enabled = (
+            get_current_atom_config().dcp_config.enable_query_replication
+        )
         q_qrep_override: dict = {}
         if self.qrep_enabled:
             dcp_size = get_dcp_world_size()

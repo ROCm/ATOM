@@ -1,11 +1,16 @@
 # SPDX-License-Identifier: MIT
-"""DCP merge-path ops in ``atom/model_ops/dcp_ops.py``.
+"""DCP support code: merge-path ops, the QREP config gate, and the QREP row view.
 
-Three ops that the sparse work leans on but that had no coverage:
+Ops from ``atom/model_ops/dcp_ops.py`` that the sparse work leans on:
 
   * ``correct_attn_out``        -- the LSE merge kernel behind ``cp_lse_ag_out_rs``
   * ``get_dcp_local_seq_lens``  -- how many tokens of a sequence this rank holds
   * ``reorg_kvcache``           -- AllGathered chunk blocks -> per-seq contiguous
+
+Plus the two pieces DCP query replication (QREP) rests on:
+
+  * ``DCPConfig`` / ``qrep_unsupported_reason`` -- parsing and feasibility gating
+  * ``ColumnParallelLinear.make_row_view``      -- the narrow q_proj for prefill
 
 The merge is the load-bearing one. ``cp_lse_ag_out_rs`` reconstructs a global
 softmax from per-rank partial attentions, so the test here is not "the kernel
@@ -18,15 +23,25 @@ returns ``o=NaN`` with ``lse=-inf``. Without the ``factor == 0 -> 0`` scrub in
 the kernel, ``NaN * 0 = NaN`` survives the ReduceScatter and poisons EVERY
 rank's output for that row -- silently, with no fault.
 
-``get_dcp_local_seq_lens`` and ``reorg_kvcache`` run on CPU tensors; only the
-merge tests need a GPU.
+``get_dcp_local_seq_lens`` and ``reorg_kvcache`` run on CPU tensors; the merge
+and row-view tests need a GPU. The config tests need neither, which is why the
+`dcp_ops` import below is guarded per-test rather than module-wide: a
+module-level skip would take the config tests down with it on the CPU CI
+runner, and those are the only ones that gate actually runs.
 """
 
 import numpy as np
 import pytest
 import torch
 
+# atom.config imports cleanly without triton/aiter, so the config tests below
+# run on the CPU gate.
+from atom.config import DCPConfig, qrep_unsupported_reason
+
 try:
+    from aiter import dtypes
+
+    from atom.config import QuantizationConfig
     from atom.model_ops.dcp_ops import (
         correct_attn_out,
         dcp_global_pos,
@@ -35,11 +50,19 @@ try:
         get_dcp_local_seq_lens,
         reorg_kvcache,
     )
-except ImportError as _e:  # triton absent on a CPU-only runner
-    pytest.skip(f"requires full atom import env: {_e}", allow_module_level=True)
+    from atom.model_ops.linear import ColumnParallelLinear
+    from atom.quant_spec import LayerQuantConfig, QuantType
 
+    _DCP_OPS_ERR = None
+except ImportError as _e:  # triton absent on a CPU-only runner
+    _DCP_OPS_ERR = str(_e)
+
+needs_dcp_ops = pytest.mark.skipif(
+    _DCP_OPS_ERR is not None, reason=f"requires full atom import env: {_DCP_OPS_ERR}"
+)
 needs_gpu = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="Triton kernel needs a GPU"
+    _DCP_OPS_ERR is not None or not torch.cuda.is_available(),
+    reason="Triton kernel needs a GPU",
 )
 
 DEV = "cuda"
@@ -216,6 +239,7 @@ def _brute_local_len(seq_len, dcp_size, dcp_rank, interleave):
     return sum(1 for i in range(seq_len) if (i // interleave) % dcp_size == dcp_rank)
 
 
+@needs_dcp_ops
 @pytest.mark.parametrize("dcp_size", [1, 2, 4, 8])
 @pytest.mark.parametrize("interleave", [1, 2, 4])
 def test_local_seq_lens_match_the_storage_rule(dcp_size, interleave):
@@ -251,6 +275,7 @@ def _brute_local_index(i, dcp_size, dcp_rank, interleave):
     return sum(1 for j in range(i) if (j // interleave) % dcp_size == dcp_rank)
 
 
+@needs_dcp_ops
 @pytest.mark.parametrize("dcp_size", [1, 2, 4, 8])
 @pytest.mark.parametrize("interleave", [1, 2, 4, 8])
 def test_dcp_owner_and_local_index_match_storage_rule(dcp_size, interleave):
@@ -265,6 +290,7 @@ def test_dcp_owner_and_local_index_match_storage_rule(dcp_size, interleave):
         ), f"local_index i={i} S={interleave} W={dcp_size}"
 
 
+@needs_dcp_ops
 @pytest.mark.parametrize("dcp_size", [1, 2, 4, 8])
 @pytest.mark.parametrize("interleave", [1, 2, 4, 8])
 def test_dcp_global_pos_inverts_local_index(dcp_size, interleave):
@@ -286,6 +312,7 @@ def test_dcp_global_pos_inverts_local_index(dcp_size, interleave):
         )
 
 
+@needs_dcp_ops
 @pytest.mark.parametrize("dcp_size", [1, 2, 4, 8])
 def test_dcp_helpers_reduce_to_round_robin_when_interleave_1(dcp_size):
     # S == 1 must be bit-identical to the old inline round-robin (owner = i%W,
@@ -295,6 +322,7 @@ def test_dcp_helpers_reduce_to_round_robin_when_interleave_1(dcp_size):
     np.testing.assert_array_equal(dcp_local_index(pos, dcp_size, 1), pos // dcp_size)
 
 
+@needs_dcp_ops
 @pytest.mark.parametrize("dcp_size", [1, 2, 4, 8])
 @pytest.mark.parametrize("interleave", [1, 2, 4, 8])
 def test_dcp_local_index_max_equals_local_seq_len(dcp_size, interleave):
@@ -314,6 +342,7 @@ def test_dcp_local_index_max_equals_local_seq_len(dcp_size, interleave):
             assert got == expect, f"L={L} r={r} S={interleave} W={dcp_size}"
 
 
+@needs_dcp_ops
 @pytest.mark.parametrize("dcp_size", [2, 4, 8])
 @pytest.mark.parametrize("interleave", [1, 2, 4, 8])
 @pytest.mark.parametrize("block_size", [8, 16, 64])
@@ -397,6 +426,7 @@ def _build_chunk(cached_lens, dcp, block_size, chunk_size, chunk_idx, dim=4, pe=
     }
 
 
+@needs_dcp_ops
 @pytest.mark.parametrize("chunk_idx", [0, 1, 2, 3])
 def test_reorg_kvcache_rebuilds_each_sequence(chunk_idx):
     dcp, block_size, chunk_size = 4, 4, 4
@@ -448,6 +478,7 @@ def test_reorg_kvcache_rebuilds_each_sequence(chunk_idx):
     assert pos == c["sum_seq_len"]
 
 
+@needs_dcp_ops
 def test_reorg_kvcache_rejects_a_wrong_total():
     """The internal asserts are the only guard the caller has; keep them live."""
     dcp, block_size, chunk_size = 4, 4, 4
@@ -464,3 +495,292 @@ def test_reorg_kvcache_rejects_a_wrong_total():
             chunk_idx=0,
             toks=c["toks"],
         )
+
+
+# ══════════════════════════════════════════ DCPConfig + the QREP gate (CPU) ══
+#
+# DCPConfig parsing and the DCP query-replication (QREP) gate.
+# QREP now defaults to ON, which changes what a missing test costs: a refactor
+# that quietly disables it produces no error and no visible symptom -- just a
+# slower server. That already happened: a merge re-parented the gate under
+# `if dcp_config.interleave_size > 1`, so with the default interleave_size=1
+# QREP was force-disabled in every ordinary configuration while the log blamed
+# `dcp <= 1`. It went unnoticed through a full day of benchmarking. Hence the
+# two guards below: the gate must key off the DCP size and NOT interleave_size,
+# and the shipped default must stay on.
+#
+# These need neither a GPU nor dcp_ops, so they are the DCP tests the CPU gate
+# actually runs.
+
+
+class _Spec:
+    """Stand-in for a speculative_config; only its non-None-ness is read."""
+
+
+# ─────────────────────────────────────────────────────────── DCPConfig parsing ──
+
+
+def test_defaults():
+    cfg = DCPConfig()
+    assert cfg.interleave_size == 1
+    # Deliberately pinned: QREP ships enabled. Flipping this default is a
+    # product decision, so it should require editing a test that says so.
+    assert cfg.enable_query_replication is True
+
+
+def test_from_dict_parses_both_keys():
+    cfg = DCPConfig.from_dict(
+        {"interleave_size": 16, "enable_query_replication": False}
+    )
+    assert cfg.interleave_size == 16
+    assert cfg.enable_query_replication is False
+
+
+def test_from_dict_empty_and_none_give_defaults():
+    for arg in (None, {}):
+        cfg = DCPConfig.from_dict(arg)
+        assert (cfg.interleave_size, cfg.enable_query_replication) == (1, True)
+
+
+def test_from_dict_coerces_types():
+    """JSON is permissive; the dataclass should not be."""
+    cfg = DCPConfig.from_dict({"interleave_size": "8", "enable_query_replication": 0})
+    assert cfg.interleave_size == 8 and isinstance(cfg.interleave_size, int)
+    assert cfg.enable_query_replication is False
+
+
+def test_from_dict_rejects_unknown_key():
+    """Typos must fail loudly -- a silently ignored key reads as 'it did not work'."""
+    with pytest.raises(ValueError, match="Unknown --dcp-config key"):
+        DCPConfig.from_dict({"interleve_size": 4})
+
+
+def test_from_dict_rejects_the_old_flag_name():
+    """`enable_dcp_query_replication` was the pre-DCPConfig top-level flag.
+
+    Anyone carrying an old command line should get an error naming the supported
+    keys, not a server that silently ignores the setting.
+    """
+    with pytest.raises(ValueError, match="enable_dcp_query_replication"):
+        DCPConfig.from_dict({"enable_dcp_query_replication": True})
+
+
+def test_interleave_size_must_be_positive():
+    with pytest.raises(AssertionError, match="interleave_size"):
+        DCPConfig.from_dict({"interleave_size": 0})
+
+
+# ────────────────────────────────────────────────────────────────── QREP gate ──
+
+
+@pytest.mark.parametrize(
+    "dcp, spec, mxfp4, expected",
+    [
+        (8, None, False, None),  # the ordinary case: supported
+        (2, None, False, None),
+        (1, None, False, "decode_context_parallel_size <= 1 (no DCP group)"),
+        (8, _Spec(), False, "speculative decode (qlen>1 cprr path)"),
+        (8, None, True, "fp4 (mxfp4) BMM weights"),
+        # dcp is checked first: with no DCP group the other reasons are moot.
+        (1, _Spec(), True, "decode_context_parallel_size <= 1 (no DCP group)"),
+    ],
+)
+def test_gate_truth_table(dcp, spec, mxfp4, expected):
+    assert qrep_unsupported_reason(dcp, spec, mxfp4) == expected
+
+
+def test_gate_takes_no_interleave_input():
+    """The gate must not be able to see the KV interleave granularity.
+
+    ⚠️ Scope, stated plainly: this checks the FUNCTION, not the call site. The
+    merge bug lived at the call site (the gate was nested inside an
+    ``if interleave_size > 1`` branch in ``Config.__post_init__``), and **this
+    test would not catch that recurring** -- covering it would mean building a
+    real Config, which needs a model directory and an HF config. What this does
+    buy: interleave can no longer reach the decision *through the signature*, so
+    re-coupling the two requires deliberately passing it in, and the docstring
+    on `qrep_unsupported_reason` says not to.
+    """
+    import inspect
+
+    params = inspect.signature(qrep_unsupported_reason).parameters
+    assert "interleave" not in " ".join(params), (
+        "the QREP gate must not depend on the KV interleave granularity; "
+        f"got parameters {list(params)}"
+    )
+
+
+def test_gate_reason_is_human_readable():
+    """The reason string is logged verbatim; it should name the actual cause."""
+    reason = qrep_unsupported_reason(1, None, False)
+    assert "decode_context_parallel_size" in reason
+
+
+# ═══════════════════════════════ ColumnParallelLinear.make_row_view (GPU) ══
+#
+# DCP query replication widens q_proj so decode holds the whole DCP group's
+# heads and can skip its AllGather Q. Prefill needs only this rank's heads, and
+# slicing the *output* of the wide projection still paid for the whole group
+# (measured +14.8 ms/step of prefill on GLM-5.2 tp8/dcp8). make_row_view instead
+# hands prefill a zero-copy row VIEW of the weight.
+#
+# Why a plain row slice is legal on an already-shuffled weight: shuffle_weight
+# reshapes to (N//16, 16, K//BK, BK//K, K) and permutes with N//16 still
+# leading, so elements move only WITHIN a 16-row block and blocks never mix.
+# Get the boundary wrong and there is no error -- the layer quietly serves
+# another rank's heads. Hence bitwise equality below, not a tolerance: this is
+# pure work elimination, not an approximation.
+
+
+DCP = 8
+HEADS_PER_RANK = 8
+QK_HEAD_DIM = 256  # 192 nope + 64 rope, as on GLM-5.2
+ROWS = HEADS_PER_RANK * QK_HEAD_DIM  # 2048 rows per rank
+N_WIDE = ROWS * DCP  # 16384, the whole DCP group
+K = 2048  # q_lora_rank
+TOKENS = 512
+
+
+@pytest.fixture(scope="module")
+def tp_group():
+    """world=1 TP group so ColumnParallelLinear can be constructed.
+
+    Deliberately 1: the layer must not re-shard, so `output_size` stays the
+    group-wide N and the row view is the only slicing under test.
+    """
+    import os
+
+    from aiter.dist.parallel_state import (
+        init_distributed_environment,
+        initialize_model_parallel,
+    )
+    import torch.distributed as dist
+
+    if not dist.is_initialized():
+        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+        os.environ.setdefault("MASTER_PORT", "29578")
+        torch.cuda.set_device(0)
+        init_distributed_environment(
+            world_size=1,
+            rank=0,
+            local_rank=0,
+            distributed_init_method="tcp://127.0.0.1:29578",
+        )
+        initialize_model_parallel(tensor_model_parallel_size=1)
+    yield
+
+
+def _build_layer(quant_type=None, n_wide=N_WIDE):
+    """A group-wide q_proj taken through the real post-loading path.
+
+    `quant_type` defaults inside the body, not in the signature: a default
+    argument is evaluated at import time, and `QuantType` only exists when the
+    guarded aiter import above succeeded. Evaluating it in the signature would
+    turn a missing aiter into a collection-time NameError that takes the
+    CPU-only config tests in this file down with it.
+    """
+    quant_type = QuantType.per_1x128 if quant_type is None else quant_type
+    qc = QuantizationConfig()
+    qc.global_spec = LayerQuantConfig(
+        quant_type=quant_type, quant_dtype=dtypes.fp8, is_dynamic=True
+    )
+    layer = ColumnParallelLinear(
+        input_size=K, output_size=n_wide, bias=False, quant_config=qc, prefix="q_b_proj"
+    ).to(DEV)
+
+    g = torch.Generator(device=DEV).manual_seed(0)
+    w = torch.randn(n_wide, K, generator=g, device=DEV, dtype=torch.bfloat16) * 0.05
+    layer.weight.data = w.to(layer.weight.dtype)
+    if quant_type == QuantType.per_1x128:
+        s = torch.rand(
+            (n_wide + 127) // 128, (K + 127) // 128, generator=g, device=DEV
+        )
+        layer.weight_scale.data = (s * 0.01 + 0.01).to(layer.weight_scale.dtype)
+    layer.process_weights_after_loading()
+    return layer
+
+
+def test_row_view_matches_output_slicing_bitwise(tp_group):
+    """Every rank's view must equal that rank's slice of the wide projection."""
+    layer = _build_layer()
+    g = torch.Generator(device=DEV).manual_seed(1)
+    x = torch.randn(TOKENS, K, generator=g, device=DEV, dtype=torch.bfloat16)
+
+    wide = layer(x).view(-1, DCP * HEADS_PER_RANK, QK_HEAD_DIM)
+    for rank in range(DCP):
+        narrow = layer.make_row_view(rank * ROWS, ROWS)(x).view(
+            -1, HEADS_PER_RANK, QK_HEAD_DIM
+        )
+        want = wide[:, rank * HEADS_PER_RANK : (rank + 1) * HEADS_PER_RANK, :]
+        assert torch.equal(narrow, want), (
+            f"rank {rank}: row view differs from the wide projection's slice "
+            "-- the slice is landing on the wrong rows"
+        )
+
+
+def test_row_view_is_zero_copy(tp_group):
+    """The point is to avoid a second weight, so it must share storage."""
+    layer = _build_layer()
+    view = layer.make_row_view(3 * ROWS, ROWS)
+    assert (
+        view.weight.untyped_storage().data_ptr()
+        == layer.weight.untyped_storage().data_ptr()
+    )
+    assert view.weight.shape == (ROWS, K)
+    assert view.output_size == ROWS
+
+
+def test_row_view_slices_the_blockscale(tp_group):
+    """per_1x128 scale is [N/128, K/128] and unshuffled: it slices by 128."""
+    layer = _build_layer()
+    rank = 5
+    view = layer.make_row_view(rank * ROWS, ROWS)
+    assert view.weight_scale.shape == (ROWS // 128, K // 128)
+    assert torch.equal(
+        view.weight_scale.data,
+        layer.weight_scale.data[rank * ROWS // 128 : (rank + 1) * ROWS // 128],
+    )
+
+
+def test_row_view_does_not_disturb_the_parent(tp_group):
+    """Taking a view must leave the full projection usable and unchanged."""
+    layer = _build_layer()
+    g = torch.Generator(device=DEV).manual_seed(2)
+    x = torch.randn(TOKENS, K, generator=g, device=DEV, dtype=torch.bfloat16)
+
+    before = layer(x).clone()
+    layer.make_row_view(0, ROWS)
+    assert torch.equal(layer(x), before)
+    assert layer.output_size == N_WIDE
+
+
+@pytest.mark.parametrize("start, length", [(8, ROWS), (0, 24), (ROWS + 16, ROWS)])
+def test_row_view_rejects_misaligned_slices(tp_group, start, length):
+    """A shuffled weight may only be cut on 16-row blocks; per_1x128 wants 128.
+
+    Without this the slice silently yields a scrambled weight, so the assert is
+    the only thing standing between a typo and wrong attention output.
+    """
+    layer = _build_layer()
+    with pytest.raises(AssertionError):
+        layer.make_row_view(start, length)
+
+
+def test_row_view_rejects_out_of_range(tp_group):
+    layer = _build_layer()
+    with pytest.raises(AssertionError, match="out of range"):
+        layer.make_row_view(N_WIDE - ROWS + 128, ROWS)
+
+
+def test_row_view_refuses_unhandled_scale_layout(tp_group):
+    """Only the scale layouts that were verified are allowed through.
+
+    per_Tensor has a scalar scale that the shallow copy shares correctly, but a
+    layout with a per-output-channel scale this code has not been taught to
+    slice must raise rather than hand back a mismatched scale.
+    """
+    layer = _build_layer(quant_type=QuantType.per_1x32)
+    if getattr(layer, "quant_type", None) != QuantType.per_1x32:
+        pytest.skip("per_1x32 not constructible in this build")
+    with pytest.raises(NotImplementedError, match="per-output-channel scale"):
+        layer.make_row_view(0, ROWS)

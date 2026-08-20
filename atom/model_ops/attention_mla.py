@@ -503,7 +503,7 @@ class MLAAttention(nn.Module):
         # is reduce-scattered back to local heads before W_V).
         self.qrep_enabled = (
             self.dcp_world_size > 1
-            and get_current_atom_config().enable_dcp_query_replication
+            and get_current_atom_config().dcp_config.enable_query_replication
         )
         self.qrep_num_heads = self.num_heads * self.dcp_world_size
         if self.qrep_enabled:

@@ -38,7 +38,6 @@ class EngineArgs:
     trust_remote_code: bool = False
     tensor_parallel_size: int = 1
     decode_context_parallel_size: int = 1
-    enable_dcp_query_replication: bool = False
     pipeline_parallel_size: int = 1
     prefill_context_parallel_size: int = 1
     data_parallel_size: int = 1
@@ -144,15 +143,6 @@ class EngineArgs:
             type=int,
             default=1,
             help="Decode context parallel size. Must divide tensor_parallel_size.",
-        )
-        parser.add_argument(
-            "--enable-dcp-query-replication",
-            action="store_true",
-            help="Replicate the MLA query projection across the DCP group at load "
-            "time so each rank locally produces the full group head set, removing "
-            "the per-step decode AllGather Q (DCP query replication / QREP). "
-            "First cut: dense+sparse qlen=1 decode, fp8 weights; auto-disabled for "
-            "speculative decode / fp4 / dcp<=1.",
         )
         parser.add_argument(
             "--enforce-eager",
@@ -492,8 +482,14 @@ class EngineArgs:
                 '  - "interleave_size": int, KV-cache interleave granularity S: '
                 "token i is stored on DCP rank (i // S) %% W. Default 1 = "
                 "token-level round-robin.\n"
+                '  - "enable_query_replication": bool, replicate the MLA query '
+                "projection across the DCP group at load time so each rank "
+                "locally produces the full group head set, removing the "
+                "per-step decode AllGather Q (QREP). First cut: dense+sparse "
+                "qlen=1 decode, fp8 weights; auto-disabled for speculative "
+                "decode / fp4 / dcp<=1. Default false.\n"
                 "Example:\n"
-                """  '{"interleave_size": 16}'"""
+                """  '{"interleave_size": 16, "enable_query_replication": true}'"""
             ),
         )
         eplb_group = parser.add_argument_group("EPLB options")
