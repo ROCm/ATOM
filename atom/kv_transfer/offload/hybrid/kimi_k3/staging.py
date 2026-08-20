@@ -17,7 +17,6 @@ from typing import Any
 import torch
 
 from atom.kv_transfer.offload.atom_lmcache_staging import (
-    _env_flag,
     _NullCtx,
     _StagingBuffer,
     _ThreadTransferState,
