@@ -109,9 +109,7 @@ def _partition_inputs(fn: Callable) -> tuple[tuple[str, ...], tuple[str, ...]]:
                 f"'{'**' if p.kind is p.VAR_KEYWORD else '*'}{name}' has no "
                 "declared order for the runner to expand by."
             )
-        (inputs if _annotation_names_tensor(p.annotation) else passthrough).append(
-            name
-        )
+        (inputs if _annotation_names_tensor(p.annotation) else passthrough).append(name)
     return tuple(inputs), tuple(passthrough)
 
 
