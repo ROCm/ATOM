@@ -10,6 +10,13 @@
 
 """Fused attention-residual operations for Kimi-K3.
 
+``apply_attn_res`` (the entry point every AttnRes site calls) dispatches to
+aiter's ``attn_res_gate``. The Triton kernel in this module is the same math with
+the same launch-config-by-token-count dispatch and the same
+``add_hidden``/``add_hidden2``/``out_eps``/``close_block`` surface; it is kept as
+the A/B baseline behind the ``kimi_k3_apply_attn_res*`` custom ops, and does not
+implement the fused output quant that the aiter kernel now offers.
+
 The algorithm is flash-linear-attention's ``fused_attnres``
 (``fla/ops/attnres/fused.py``, MIT; read against fla 0.5.2), which is what the
 reference KDA model calls -- see ``fla/models/kda/modeling_kda.py:135``.
@@ -36,7 +43,6 @@ from __future__ import annotations
 
 import torch
 
-from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.decorators import mark_trace
 
@@ -475,10 +481,9 @@ def apply_attn_res(
     out_eps: float = 1e-6,
     add_hidden2: torch.Tensor | None = None,
     close_block: bool = False,
-) -> (
-    tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    out_quant_dtype: torch.dtype | None = None,
 ):
-    """Dispatch an opaque custom op whose CUDA implementation selects by concrete T.
+    """Run the attn_res mix through aiter's kernel (``attn_res_gate``).
 
     ``out_norm_weight`` folds the caller's rmsnorm of the result into the kernel;
     the returned mixed output is then already normed and scaled by it.
@@ -493,64 +498,28 @@ def apply_attn_res(
     and returns the 3-tuple ``(mixed_output, prefix_out, block_out)`` where
     ``block_out`` is ``cat([block_residual, prefix_out.unsqueeze(1)], dim=1)``.
 
-    ``ATOM_USE_AITER_ATTN_RES=1`` routes to aiter's ported kernel
-    (``aiter.ops.triton.fusions.attn_res.attn_res_gate``) instead of the local
-    Triton kernel below -- same math, same launch-config-by-token-count
-    dispatch, same ``add_hidden``/``add_hidden2``/``out_eps``/``close_block``
-    surface (kept aligned on purpose; see the aiter-vs-atom-attn-res-kimi-k3
-    comparison notes). Default off: the local kernel is the validated
-    production path.
+    ``out_quant_dtype`` additionally folds the output rmsnorm's per-token
+    activation quant into the same kernel, so ``mixed_output`` comes back as an
+    ``(fp8, scale)`` pair -- the shape ``RMSNorm(fused_quant=True)`` returns, and
+    what the consuming Linears take without re-quantizing. Requires
+    ``out_norm_weight``.
+
+    The local Triton kernel above (``_apply_attn_res_impl`` and the
+    ``kimi_k3_apply_attn_res*`` custom ops) is no longer on this path; it stays
+    registered as the A/B baseline for the aiter kernel and is reachable directly
+    via ``torch.ops.aiter.kimi_k3_apply_attn_res*``.
     """
-    if envs.ATOM_USE_AITER_ATTN_RES:
-        from aiter.ops.triton.fusions.attn_res import attn_res_gate
+    from aiter.ops.triton.fusions.attn_res import attn_res_gate
 
-        return attn_res_gate(
-            prefix_sum,
-            block_residual,
-            score_weight,
-            eps,
-            add_hidden,
-            add_hidden2,
-            output_rms_weight=out_norm_weight,
-            output_rms_eps=out_eps,
-            close_block=close_block,
-        )
-
-    if not close_block:
-        if add_hidden is None:
-            if add_hidden2 is not None:
-                raise ValueError("add_hidden2 requires add_hidden")
-            return (
-                torch.ops.aiter.kimi_k3_apply_attn_res(
-                    prefix_sum,
-                    block_residual,
-                    score_weight,
-                    eps,
-                    out_norm_weight,
-                    out_eps,
-                ),
-                prefix_sum,
-            )
-        return torch.ops.aiter.kimi_k3_apply_attn_res_add(
-            prefix_sum,
-            block_residual,
-            score_weight,
-            eps,
-            add_hidden,
-            out_norm_weight,
-            out_eps,
-            add_hidden2,
-        )
-
-    if add_hidden2 is not None and add_hidden is None:
-        raise ValueError("add_hidden2 requires add_hidden")
-    return torch.ops.aiter.kimi_k3_apply_attn_res_close_block(
+    return attn_res_gate(
         prefix_sum,
         block_residual,
         score_weight,
         eps,
         add_hidden,
-        out_norm_weight,
-        out_eps,
         add_hidden2,
+        output_rms_weight=out_norm_weight,
+        output_rms_eps=out_eps,
+        close_block=close_block,
+        out_quant_dtype=out_quant_dtype,
     )

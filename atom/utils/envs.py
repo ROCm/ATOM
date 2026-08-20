@@ -64,16 +64,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
     "ATOM_USE_TRITON_MOE_DECODE": lambda: os.getenv("ATOM_USE_TRITON_MOE_DECODE", "0")
     == "1",
-    # Route Kimi-K3's attn_res (AttnRes.forward -> apply_attn_res) through
-    # aiter's ported kernel (aiter.ops.triton.fusions.attn_res.attn_res_gate)
-    # instead of ATOM's own local Triton kernel
-    # (atom.model_ops.kimi_k3.attention_residual._attn_res_fused_kernel).
-    # Default off: the local kernel is the validated production path. The two
-    # are functionally equivalent (add_hidden/add_hidden2/out_eps/close_block
-    # all match) -- this only matters for perf/rollout comparison.
-    "ATOM_USE_AITER_ATTN_RES": lambda: (
-        os.getenv("ATOM_USE_AITER_ATTN_RES", "0") == "1"
-    ),
     "ATOM_MLA_PAGE_SIZE": lambda: int(os.getenv("ATOM_MLA_PAGE_SIZE", "1")),
     # --- Kernel Fusion Toggles ---
     # fused_compress_attn: switch between Triton (default historical) and a

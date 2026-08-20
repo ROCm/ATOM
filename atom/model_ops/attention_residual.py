@@ -30,6 +30,29 @@ def _rms_eps(norm: RMSNorm) -> float:
     return getattr(norm, "variance_epsilon", getattr(norm, "eps", 1e-6))
 
 
+def _fused_quant_dtype(norm: RMSNorm | None) -> torch.dtype | None:
+    """The activation dtype the attn_res kernel should quantize its store to.
+
+    ``out_norm`` is an RMSNorm the kernel absorbs (see AttnRes), so when that
+    module was built to fuse its activation quant, the kernel -- not a later
+    standalone quant op in each consuming Linear -- is what has to emit it.
+    Resolved per call, not cached: the loader's online-quant realignment
+    (``RMSNorm.online_quantize_activation``) can change the scheme after init.
+
+    None means store unquantized, which is both the no-quant case and the
+    schemes the kernel does not emit yet (only per-token FP8 is fused; per_1x128
+    and per_1x32 still quantize in the consumer).
+    """
+    if norm is None or not getattr(norm, "use_fused_quant", False):
+        return None
+    from aiter import QuantType
+    from aiter.utility.dtypes import fp8
+
+    if norm.quant_type.value != QuantType.per_Token.value:
+        return None
+    return fp8
+
+
 class AttnRes(nn.Module):
     """One attention-residual mixing site.
 
@@ -50,7 +73,11 @@ class AttnRes(nn.Module):
     * ``out_norm`` -- the caller's rmsnorm OF THE RESULT. Passing one is what
       decides the fusion: it is folded into the kernel's store and the returned
       mix comes back already normed and scaled, so the caller must not norm it
-      again. Given None, the mix is returned raw.
+      again. Given None, the mix is returned raw. An out_norm built with
+      ``fused_quant`` also has its activation quant folded into that same store,
+      so the mix comes back as the ``(fp8, scale)`` pair its ``forward()`` would
+      have returned (see ``_fused_quant_dtype``) -- one quant shared by every
+      consumer of the row, instead of one per consuming Linear.
 
     The upshot for callers is that forward() has one shape in every mode:
     hand it the prefix, the block, and any pending addends; get back
@@ -116,7 +143,7 @@ class AttnRes(nn.Module):
         block_residual: torch.Tensor | None = None,
         add_hidden: torch.Tensor | None = None,
         add_hidden2: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor | tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
         """Returns ``(mixed_output, prefix_out)``.
 
         The addends are the caller's ``prefix_sum = prefix_sum + ...``, folded
@@ -124,6 +151,11 @@ class AttnRes(nn.Module):
         ``prefix_out`` is that sum. A None ``prefix_sum`` means the block was
         just closed out and this site starts a fresh one, so the first addend
         IS the prefix.
+
+        ``mixed_output`` is an ``(fp8, scale)`` pair rather than a tensor when
+        ``out_norm`` fuses its activation quant, on both the kernel and the
+        no-candidates path -- the same shape either way, so consumers stay
+        agnostic to which one ran.
         """
         if prefix_sum is None:
             prefix_sum, add_hidden, add_hidden2 = add_hidden, add_hidden2, None
@@ -144,6 +176,7 @@ class AttnRes(nn.Module):
             will_close = (
                 self.block_size is not None and self.layer_idx % self.block_size == 0
             )
+            out_quant_dtype = _fused_quant_dtype(self.out_norm)
             if not will_close:
                 return apply_attn_res(
                     prefix_sum,
@@ -154,6 +187,7 @@ class AttnRes(nn.Module):
                     None if self.out_norm is None else self.out_norm.weight,
                     self.out_eps,
                     add_hidden2,
+                    out_quant_dtype=out_quant_dtype,
                 )
             mixed_output, prefix_out, block_out = apply_attn_res(
                 prefix_sum,
@@ -165,6 +199,7 @@ class AttnRes(nn.Module):
                 self.out_eps,
                 add_hidden2,
                 close_block=True,
+                out_quant_dtype=out_quant_dtype,
             )
             self._pending_block_residual = block_out
             return mixed_output, prefix_out
