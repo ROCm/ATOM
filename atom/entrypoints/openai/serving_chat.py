@@ -506,6 +506,7 @@ async def stream_chat_response_fanout(
     cleanup_stream,
     cleanup_request,
     tools=None,
+    starts_thinking: bool = False,
 ) -> AsyncGenerator[str, None]:
     """Streaming variant that multiplexes ``len(seq_ids)`` fan-out siblings
     into a single SSE stream, tagging every chunk with ``choices[0].index``.
@@ -517,11 +518,18 @@ async def stream_chat_response_fanout(
     ``num_prompt_tokens`` is the engine-computed prompt length shared by all
     siblings (they tokenize the same prompt once); reusing it avoids
     re-tokenizing on the event loop at stream start.
+
+    ``starts_thinking`` says the rendered prompt already opened the reasoning
+    channel, so every sibling's output begins mid-thought with no opening
+    marker. It applies to all of them — siblings share one prompt — and must be
+    seeded here, or their reasoning is emitted as answer content.
     """
     n = len(seq_ids)
     num_tokens_input = num_prompt_tokens
     num_tokens_output = [0] * n
-    reasoning_filters = [ReasoningFilter() for _ in range(n)]
+    reasoning_filters = [
+        ReasoningFilter(starts_thinking=starts_thinking) for _ in range(n)
+    ]
     tool_parsers = [ToolCallStreamParser(tools=tools) for _ in range(n)]
     has_tool_calls = [False] * n
     finished = [False] * n
