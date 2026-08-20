@@ -31,6 +31,25 @@ def test_kimi_k3_plugin_registries_are_synchronized():
     )
 
 
+def test_importing_vllm_plugin_does_not_require_vllm():
+    _run_without_test_stubs("""
+        import builtins
+
+        original_import = builtins.__import__
+
+        def import_without_vllm(name, *args, **kwargs):
+            if name == "vllm" or name.startswith("vllm."):
+                raise ModuleNotFoundError("No module named 'vllm'")
+            return original_import(name, *args, **kwargs)
+
+        builtins.__import__ = import_without_vllm
+        try:
+            import atom.plugin.vllm.register
+        finally:
+            builtins.__import__ = original_import
+        """)
+
+
 def test_atom_patch_preserves_rocm_dcp_full_decode_cuda_graph_mode():
     _run_without_test_stubs("""
         from types import SimpleNamespace

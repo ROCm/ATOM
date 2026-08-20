@@ -12,15 +12,6 @@ logger = logging.getLogger("atom")
 # this flag is used to enable the vllm plugin mode
 disable_vllm_plugin = envs.ATOM_DISABLE_VLLM_PLUGIN
 
-if not disable_vllm_plugin:
-    # vLLM may select its built-in RocmPlatform before the platform plugin
-    # callback runs, so patch it at discovery-import time.
-    from atom.plugin.vllm.rocm_dcp_full_graph_patch import (
-        apply_vllm_rocm_dcp_full_graph_patch,
-    )
-
-    apply_vllm_rocm_dcp_full_graph_patch()
-
 # those 2 models are covering most of dense and moe models
 ATOM_CAUSAL_LM_MODEL_WRAPPER = "atom.plugin.vllm.model_wrapper:ATOMForCausalLM"
 ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER = "atom.plugin.vllm.model_wrapper:ATOMMoEForCausalLM"
@@ -156,6 +147,12 @@ def register_platform() -> str | None:
         # run pure vllm mode without ATOM plugin
         logger.info("Disable ATOM OOT plugin platforms")
         return None
+
+    from atom.plugin.vllm.rocm_dcp_full_graph_patch import (
+        apply_vllm_rocm_dcp_full_graph_patch,
+    )
+
+    apply_vllm_rocm_dcp_full_graph_patch()
 
     # Do not call _set_plugin_mode() here. SGLang (and other stacks) discover
     # vllm.platform_plugins and would set atom's backbone to "vllm" before
