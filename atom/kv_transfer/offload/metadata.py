@@ -30,22 +30,27 @@ class ATOMRawBytesLMCacheMetadata:
         self,
         base_metadata: Any,
         *,
-        atom_block_size: int,
+        atom_hash_block_size: int,
         bytes_per_block: int,
     ) -> None:
         self._atom_base_metadata = base_metadata
         self.__dict__.update(vars(base_metadata))
-        self.atom_block_size = int(atom_block_size)
+        # GLOBAL tokens per block_table entry (`block_size * dcp_world_size`),
+        # which is what LMCache's token counts are denominated in. Pairing it
+        # with the PHYSICAL `bytes_per_block` is what keeps a MemoryObj sized
+        # to this rank's shard rather than the whole virtual block.
+        self.atom_hash_block_size = int(atom_hash_block_size)
         self.atom_bytes_per_block = int(bytes_per_block)
         chunk_size = int(getattr(base_metadata, "chunk_size"))
-        if self.atom_block_size <= 0:
-            raise ValueError("ATOM raw-byte metadata: atom_block_size must be > 0")
+        if self.atom_hash_block_size <= 0:
+            raise ValueError("ATOM raw-byte metadata: atom_hash_block_size must be > 0")
         if self.atom_bytes_per_block <= 0:
             raise ValueError("ATOM raw-byte metadata: bytes_per_block must be > 0")
-        if chunk_size % self.atom_block_size != 0:
+        if chunk_size % self.atom_hash_block_size != 0:
             raise ValueError(
-                "LMCache chunk size must be divisible by ATOM KV block size: "
-                f"chunk_size={chunk_size}, block_size={self.atom_block_size}"
+                "LMCache chunk size must be divisible by ATOM KV hash block size: "
+                f"chunk_size={chunk_size}, "
+                f"hash_block_size={self.atom_hash_block_size}"
             )
 
     def __getattr__(self, name: str) -> Any:
@@ -55,7 +60,7 @@ class ATOMRawBytesLMCacheMetadata:
         if isinstance(other, ATOMRawBytesLMCacheMetadata):
             return (
                 self._atom_base_metadata == other._atom_base_metadata
-                and self.atom_block_size == other.atom_block_size
+                and self.atom_hash_block_size == other.atom_hash_block_size
                 and self.atom_bytes_per_block == other.atom_bytes_per_block
             )
         return False
@@ -69,7 +74,7 @@ class ATOMRawBytesLMCacheMetadata:
     def get_shapes(self, num_tokens: int | None = None) -> list[torch.Size]:
         if num_tokens is None:
             num_tokens = int(self.chunk_size)
-        nblocks = _cdiv(int(num_tokens), self.atom_block_size)
+        nblocks = _cdiv(int(num_tokens), self.atom_hash_block_size)
         return [torch.Size((nblocks * self.atom_bytes_per_block,))]
 
     def get_num_groups(self) -> int:
@@ -109,7 +114,8 @@ class LMCacheReqMeta:
     # for save: computed token ids.
     token_ids: list[int]
     # The sequence's GPU block table (logical block ids). A chunk spanning token
-    # range [start, end) maps to blocks block_ids[start // bs : ceil(end / bs)].
+    # range [start, end) maps to block_ids[start // hbs : ceil(end / hbs)],
+    # where hbs is the hash block size (`block_size * dcp_world_size`).
     block_ids: list[int]
     load_spec: LoadSpec | None = None
     save_spec: SaveSpec | None = None

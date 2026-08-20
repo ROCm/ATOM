@@ -132,7 +132,7 @@ def test_gpu_kv_round_trip_through_cpu_staging_and_nvme(tmp_path: Path):
     assert codec.has_fused_chunk_major_staging
     gpu_connector = ATOMLMCacheGPUConnector(
         codec,
-        block_size=block_size,
+        hash_block_size=block_size,
         chunk_size=chunk_size,
     )
 
@@ -159,7 +159,7 @@ def test_gpu_kv_round_trip_through_cpu_staging_and_nvme(tmp_path: Path):
     )
     metadata = ATOMRawBytesLMCacheMetadata(
         base_metadata,
-        atom_block_size=block_size,
+        atom_hash_block_size=block_size,
         bytes_per_block=codec.bytes_per_block,
     )
 

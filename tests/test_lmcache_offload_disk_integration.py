@@ -97,7 +97,7 @@ def test_lmcache_local_disk_round_trip_without_cpu_hot_cache(tmp_path: Path):
     )
     metadata = ATOMRawBytesLMCacheMetadata(
         base_metadata,
-        atom_block_size=4,
+        atom_hash_block_size=4,
         bytes_per_block=32,
     )
 

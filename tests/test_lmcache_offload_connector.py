@@ -26,6 +26,7 @@ from atom.kv_transfer.offload.atom_lmcache_gpu_connector import (
 from atom.kv_transfer.offload.connector import (
     LMCacheOffloadConnector,
     LMCacheOffloadConnectorScheduler,
+    _hash_block_size,
 )
 from atom.kv_transfer.offload.metadata import (
     ATOMRawBytesLMCacheMetadata,
@@ -143,7 +144,7 @@ def test_raw_bytes_metadata_shapes_are_block_rounded():
     base.is_first_rank = lambda: True
     meta = ATOMRawBytesLMCacheMetadata(
         base,
-        atom_block_size=4,
+        atom_hash_block_size=4,
         bytes_per_block=32,
     )
 
@@ -164,7 +165,7 @@ def test_raw_bytes_metadata_rejects_unaligned_chunk_size():
     with pytest.raises(ValueError, match="chunk size must be divisible"):
         ATOMRawBytesLMCacheMetadata(
             base,
-            atom_block_size=4,
+            atom_hash_block_size=4,
             bytes_per_block=32,
         )
 
@@ -307,7 +308,7 @@ def test_lmcache_connector_maps_token_ranges_to_block_ids():
         )
     }
     codec = ATOMKVByteCodec(kv_caches)
-    connector = ATOMLMCacheGPUConnector(codec, block_size=4, chunk_size=8)
+    connector = ATOMLMCacheGPUConnector(codec, hash_block_size=4, chunk_size=8)
 
     assert connector._ranges_to_block_ids(
         [4],
@@ -325,6 +326,69 @@ def test_lmcache_connector_maps_token_ranges_to_block_ids():
             [8],
             block_ids=[0, 1, 2, 3, 4, 5],
         )
+
+
+def test_lmcache_connector_maps_token_ranges_through_dcp_virtual_blocks():
+    """Under DCP one block_table entry spans `block_size * dcp` GLOBAL tokens.
+
+    Dividing a token offset by the physical block size instead lands on the
+    wrong entry and walks off the end of the (dcp-shrunk) table: in production
+    a 61-entry table was asked for 64 entries because 8192 global tokens were
+    divided by 128 rather than by 128*8.
+    """
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+
+    kv_caches = {
+        "l0": SimpleNamespace(
+            k_cache=torch.arange(6 * 2, dtype=torch.uint8).reshape(6, 2),
+            v_cache=(torch.arange(6 * 3, dtype=torch.uint8).reshape(6, 3) + 51),
+            k_scale=None,
+            v_scale=None,
+        )
+    }
+    codec = ATOMKVByteCodec(kv_caches)
+    # block_size=4, dcp=2: an entry covers 8 global tokens, of which this rank
+    # stores the 4 it owns.
+    connector = ATOMLMCacheGPUConnector(codec, hash_block_size=8, chunk_size=8)
+
+    assert connector._ranges_to_block_ids(
+        [0, 8],
+        [8, 16],
+        block_ids=[0, 1, 2],
+    ) == [[0], [1]]
+    # Three entries cover 24 global tokens. Physical-block indexing would
+    # demand six for the same range and raise.
+    assert connector._ranges_to_block_ids([16], [24], block_ids=[0, 1, 2]) == [[2]]
+    # Alignment is to the virtual block, so a physical-block start is rejected.
+    with pytest.raises(ValueError, match="block-aligned"):
+        connector._ranges_to_block_ids([4], [12], block_ids=[0, 1, 2])
+
+
+def test_raw_bytes_metadata_sizes_a_dcp_chunk_to_this_ranks_shard():
+    """A chunk's MemoryObj holds one physical page per virtual block.
+
+    Rounding the token count up with the physical block size would over-size
+    every buffer by the DCP factor, since a rank only stores the tokens it owns.
+    """
+    import torch
+
+    if not hasattr(torch, "Size"):
+        pytest.skip("real torch is unavailable")
+
+    base = SimpleNamespace(chunk_size=8)
+    base.is_first_rank = lambda: True
+    # block_size=4, dcp=2 -> 8 global tokens per entry, one 32-byte page each.
+    meta = ATOMRawBytesLMCacheMetadata(
+        base,
+        atom_hash_block_size=8,
+        bytes_per_block=32,
+    )
+
+    assert meta.get_shapes(8) == [torch.Size((32,))]
+    assert meta.get_shapes() == [torch.Size((32,))]
 
 
 def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
@@ -353,7 +417,7 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
         )
     }
     codec = ATOMKVByteCodec(kv_caches)
-    connector = ATOMLMCacheGPUConnector(codec, block_size=4, chunk_size=8)
+    connector = ATOMLMCacheGPUConnector(codec, hash_block_size=4, chunk_size=8)
     _install_fake_fused_chunk_major(codec)
     monkeypatch.setattr(connector, "_assert_fused_chunk_major_available", lambda: None)
 
@@ -517,7 +581,7 @@ def test_lmcache_connector_staged_pipeline_really_reaches_staged_transfer(monkey
         )
     }
     codec = ATOMKVByteCodec(kv_caches)
-    connector = ATOMLMCacheGPUConnector(codec, block_size=4, chunk_size=8)
+    connector = ATOMLMCacheGPUConnector(codec, hash_block_size=4, chunk_size=8)
     _install_fake_fused_chunk_major(codec)
     monkeypatch.setattr(connector, "_assert_fused_chunk_major_available", lambda: None)
 
@@ -643,7 +707,7 @@ def test_lmcache_connector_requires_fused_chunk_major_staging():
         )
     }
     codec = ATOMKVByteCodec(kv_caches)
-    connector = ATOMLMCacheGPUConnector(codec, block_size=4, chunk_size=8)
+    connector = ATOMLMCacheGPUConnector(codec, hash_block_size=4, chunk_size=8)
     memory_objs = [
         SimpleNamespace(
             tensor=torch.empty(2 * codec.bytes_per_block, dtype=torch.uint8)
@@ -674,7 +738,7 @@ def test_lmcache_connector_rejects_oversized_memory_obj():
         )
     }
     codec = ATOMKVByteCodec(kv_caches)
-    connector = ATOMLMCacheGPUConnector(codec, block_size=4, chunk_size=4)
+    connector = ATOMLMCacheGPUConnector(codec, hash_block_size=4, chunk_size=4)
     memory_obj = SimpleNamespace(
         tensor=torch.empty(2 * codec.bytes_per_block, dtype=torch.uint8)
     )
@@ -704,7 +768,7 @@ def test_lmcache_connector_respects_staging_buffer_chunks_env(monkeypatch):
         )
     }
     codec = ATOMKVByteCodec(kv_caches)
-    connector = ATOMLMCacheGPUConnector(codec, block_size=4, chunk_size=4)
+    connector = ATOMLMCacheGPUConnector(codec, hash_block_size=4, chunk_size=4)
 
     assert connector.gpu_staging_buffer_chunks == 3
     assert connector.gpu_staging_buffer_bytes == 3 * connector.gpu_staging_chunk_bytes
@@ -728,7 +792,7 @@ def test_lmcache_connector_default_staging_buffer_chunks_is_two(monkeypatch):
         )
     }
     codec = ATOMKVByteCodec(kv_caches)
-    connector = ATOMLMCacheGPUConnector(codec, block_size=4, chunk_size=4)
+    connector = ATOMLMCacheGPUConnector(codec, hash_block_size=4, chunk_size=4)
 
     assert connector.gpu_staging_buffer_chunks == 2
     assert connector.gpu_staging_buffer_bytes == 2 * connector.gpu_staging_chunk_bytes
@@ -2454,6 +2518,17 @@ def test_dense_model_gets_no_hybrid_startup_warning(caplog):
         LMCacheOffloadConnectorScheduler(_warn_config("deepseek_v3"))
 
     assert _hybrid_warnings(caplog) == []
+
+
+@pytest.mark.parametrize(("dcp", "expected"), [(None, 16), (1, 16), (8, 128)])
+def test_offload_block_span_scales_with_dcp(dcp, expected):
+    """`kv_cache_block_size` is the page size; the offload path needs the span."""
+    cfg = _warn_config("deepseek_v3")
+    if dcp is not None:
+        cfg.decode_context_parallel_size = dcp
+
+    assert _hash_block_size(cfg) == expected
+    assert LMCacheOffloadConnectorScheduler(cfg).hash_block_size == expected
 
 
 # ---------------------------------------------------------------------------
