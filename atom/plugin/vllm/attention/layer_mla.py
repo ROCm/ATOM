@@ -953,10 +953,11 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         if self.dcp_world_size == -1:
             vllm_dcp_group = get_dcp_group()
             self.dcp_world_size = vllm_dcp_group.world_size
-            aiter_tp_group = get_aiter_tp_group()
-            _validate_aiter_tp_matches_vllm_dcp(aiter_tp_group, vllm_dcp_group)
-            self.dcp_group = aiter_tp_group
-            self.dcp_rank = aiter_tp_group.rank_in_group
+            if self.dcp_world_size > 1:
+                aiter_tp_group = get_aiter_tp_group()
+                _validate_aiter_tp_matches_vllm_dcp(aiter_tp_group, vllm_dcp_group)
+                self.dcp_group = aiter_tp_group
+                self.dcp_rank = aiter_tp_group.rank_in_group
 
         fp8_attention = self.kv_cache_dtype.startswith("fp8")
 
