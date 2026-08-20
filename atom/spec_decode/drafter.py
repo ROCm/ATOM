@@ -170,9 +170,6 @@ class Drafter(abc.ABC):
         self.cu_num_draft_tokens = CpuGpuBuffer(max_bs, **i32_kwargs)
         self.target_logits_indices = CpuGpuBuffer(max_bs * self.mtp_k, **i64_kwargs)
         self.bonus_logits_indices = CpuGpuBuffer(max_bs, **i64_kwargs)
-        # Scheduler-supplied anchors. Pinned so the H2D stays async; building a
-        # tensor from the python list would block on a per-forward path.
-        self.anchor_staging = CpuGpuBuffer(max_bs, **i32_kwargs)
 
     # ---- flavor hooks ----
     @abc.abstractmethod
@@ -314,16 +311,19 @@ class Drafter(abc.ABC):
         """Scheduler-supplied anchors as an int32 GPU tensor, without blocking.
 
         `-1` entries survive as-is; callers read them as "sampling supplies it".
+        Uses ``forward_vars`` so the PP ring clones it per in-flight slot.
         """
         n = len(anchors)
-        self.anchor_staging.np[:n] = anchors
-        return self.anchor_staging.copy_to_gpu(n)
+        buf = self.runner.forward_vars["draft_next_tokens"]
+        buf.np[:n] = anchors
+        return buf.copy_to_gpu(n)
 
     def precompute_context_kv(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         next_token_ids: list[int] | None,
+        produces_output: bool,
     ) -> None:
         """Absorb one target forward into whatever context this drafter keeps.
 
@@ -332,10 +332,10 @@ class Drafter(abc.ABC):
         context maintained there covers a chunked prefill's final chunk alone.
 
         `next_token_ids` is the token one position past this forward, per seq:
-        -1 where sampling supplies it, None on unlabelled batches. A drafter
-        reading the target's TOKEN stream needs it (it sits one position ahead,
-        so its last row has no token otherwise); one reading hidden states does
-        not. Default is a no-op -- no cross-forward context, nothing to absorb.
+        -1 where sampling supplies it, None on unlabelled batches.
+
+        `produces_output`: True when ``propose()`` will follow; drafters that
+        forward during absorb may skip redundant work.
         """
         return
 

@@ -258,6 +258,109 @@ def build_lmcache_config(
     return cfg
 
 
+def lmcache_engine_id(config) -> str:
+    """Return the LMCache engine id for this process, namespaced by DP rank.
+
+    A scheduler's ``LookupClient`` and its workers' ``LookupServer`` derive the
+    same ZMQ ipc socket path from this id, so it must be identical inside one
+    DP replica and distinct between replicas. Every replica owns a private
+    CPU/NVMe pool; a shared id makes all replicas bind the same socket (only
+    the first wins) and every scheduler then queries replica 0's hit counts,
+    emitting loads its own workers cannot serve.
+
+    Under ``--enable-dp-attention`` this is the normal case, not a corner case:
+    ``CoreManager`` folds TP into DP, so each GPU becomes its own replica with
+    ``tensor_parallel_size == 1``.
+    """
+    dp_rank = int(
+        getattr(
+            getattr(config, "parallel_config", None),
+            "data_parallel_rank",
+            0,
+        )
+        or 0
+    )
+    return f"atom-offload-dp{dp_rank}"
+
+
+def lmcache_replica_world_size(config) -> int:
+    """Return the number of LMCache workers inside one DP replica (PP x TP).
+
+    Worker ids index this replica-local grid rather than the global one.
+    LMCache selects its lookup servers by worker id
+    (``cfg.lookup_server_worker_ids``, pinned to ``[0]`` above), so global
+    numbering would leave every replica except the first without a server.
+    Replica-local ids are also the right cache-key component: id ``i`` means
+    "shard i of the model", which holds the same bytes in every replica, so
+    replicas sharing a disk/remote backend share entries instead of
+    duplicating them.
+    """
+    pp_size = int(getattr(config, "pipeline_parallel_size", 1) or 1)
+    tp_size = int(getattr(config, "tensor_parallel_size", 1) or 1)
+    return max(1, pp_size * tp_size)
+
+
+def scale_cpu_size_for_pp(cfg, config) -> None:
+    """Split the CPU offload budget across PP stages by layer count.
+
+    Give each stage a share proportional to its bound layer count so all
+    stages reach the same token horizon. Loads are all-or-nothing across
+    stages, so unequal horizons waste the longer stage's extra capacity.
+
+    The last PP stage binds the draft KV layer (spec decode), so its
+    layer count is one more than its target-model slice.
+    """
+    pp_size = int(getattr(config, "pipeline_parallel_size", 1) or 1)
+    if pp_size <= 1:
+        return
+
+    configured = float(getattr(cfg, "max_local_cpu_size", 0.0) or 0.0)
+    if configured <= 0:
+        return
+
+    from atom.models.utils import get_pp_indices
+
+    num_hidden_layers = int(config.hf_config.num_hidden_layers)
+    pp_rank = int(
+        getattr(
+            getattr(config, "parallel_config", None),
+            "pipeline_parallel_rank",
+            0,
+        )
+    )
+    start, end = get_pp_indices(num_hidden_layers, pp_rank, pp_size)
+    local_layers = end - start
+
+    spec = getattr(config, "speculative_config", None)
+    draft_layers = 0
+    if spec is not None:
+        draft_hf = getattr(spec, "draft_model_hf_config", None)
+        draft_layers = int(getattr(draft_hf, "num_nextn_predict_layers", 1) or 0)
+    total_layers = num_hidden_layers + draft_layers
+    if pp_rank == pp_size - 1:
+        local_layers += draft_layers
+
+    if local_layers <= 0 or total_layers <= 0:
+        return
+
+    scaled = configured * pp_size * local_layers / total_layers
+    try:
+        cfg.max_local_cpu_size = scaled
+    except AttributeError:
+        return
+    logger.info(
+        "LMCache CPU budget for PP stage %d/%d: %.2fGB -> %.2fGB "
+        "(%d/%d layers; total across stages unchanged at %.2fGB)",
+        pp_rank,
+        pp_size,
+        configured,
+        scaled,
+        local_layers,
+        total_layers,
+        configured * pp_size,
+    )
+
+
 def apply_extra_overrides(cfg, kv_transfer_config: dict[str, Any] | None) -> None:
     """Apply ``{"lmcache.<field>": value}`` extras from kv_transfer_config."""
     if not kv_transfer_config:
@@ -317,12 +420,25 @@ def build_lmcache_metadata(config, cfg, world_size: int, worker_id: int):
     from aiter import dtypes
     from lmcache.v1.metadata import LMCacheMetadata
 
+    from atom.models.utils import get_pp_indices
+
     hf = config.hf_config
-    num_layers = _strict_integer(
+    total_layers = _strict_integer(
         "LMCache layer count",
         hf.num_hidden_layers,
         minimum=1,
     )
+    pp_size = int(getattr(config, "pipeline_parallel_size", 1) or 1)
+    pp_rank = getattr(
+        getattr(config, "parallel_config", None),
+        "pipeline_parallel_rank",
+        0,
+    )
+    if pp_size > 1:
+        start, end = get_pp_indices(total_layers, pp_rank, pp_size)
+        num_layers = end - start
+    else:
+        num_layers = total_layers
     raw_tp = getattr(config, "tensor_parallel_size", world_size)
     tp = _strict_integer(
         "LMCache tensor parallel size",
@@ -391,7 +507,9 @@ def build_lmcache_metadata(config, cfg, world_size: int, worker_id: int):
         kv_shape=kv_shape,
         use_mla=False,
         chunk_size=chunk_size,
-        # Shared id so the scheduler's ZMQ LookupClient and each worker's
-        # LookupServer derive the SAME ipc socket path (get_zmq_rpc_path_lmcache).
-        engine_id="atom-offload",
+        # Shared within a DP replica so the scheduler's ZMQ LookupClient and
+        # each worker's LookupServer derive the SAME ipc socket path
+        # (get_zmq_rpc_path_lmcache), distinct across replicas so they do not
+        # collide on it.
+        engine_id=lmcache_engine_id(config),
     )

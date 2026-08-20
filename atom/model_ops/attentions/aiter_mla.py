@@ -905,11 +905,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             return None
 
         runner = self.model_runner
-        kv_cache = runner.kv_cache[layer_id].view(
-            runner.num_physical_kvcache_blocks * runner.physical_block_size,
-            1,
-            576,
-        )
+        num_slots = runner.num_physical_kvcache_blocks * runner.physical_block_size
+        kv_cache = runner.kv_cache[layer_id].view(num_slots, 1, 576)
         module.max_model_len = runner.config.max_model_len
         if runner.is_deepseek_v32 and module.indexer is not None:
             # Use aligned dimension to avoid memory copy in torch inductor
@@ -919,16 +916,15 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 runner.aligned_index_dim,
             )
         module.kv_cache = kv_cache
-        index_cache = None
-        if runner.is_deepseek_v32 and hasattr(runner, "index_cache"):
-            index_cache = runner.index_cache[layer_id]
         return KVCacheTensor(
             layer_num=layer_id,
             k_cache=kv_cache,
             v_cache=None,
             k_scale=None,
             v_scale=None,
-            index_cache=index_cache,
+            index_cache=(
+                runner.index_cache[layer_id] if runner.is_deepseek_v32 else None
+            ),
         )
 
     def get_kv_transfer_tensors(self):
@@ -984,20 +980,25 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         concat:
 
         ``dcp_indexer_local_cu_seqlens``
-            cumsum of ``Lpad[b] = ceil(g_b / W)`` -- the per-sequence local length
-            PADDED to the max over ranks, so every rank gathers the same count.
-            Reading past a rank's real local length stays inside its allocated
-            blocks (``ceil(g/(bs*W))*bs >= ceil(g/W)``), so the padding slots read
-            uninitialized cache rather than out of bounds; they are dropped by the
-            de-interleave below.
+            cumsum of ``Lpad[b] = ceil(g_b / (S*W)) * S`` -- the per-sequence local
+            length PADDED to the max over ranks (interleave S hands out S tokens
+            per rank per S*W super-block; S=1 -> ``ceil(g/W)``), so every rank
+            gathers the same count. Reading past a rank's real local length stays
+            inside its allocated blocks (``ceil(g/(bs*W))*bs >= ceil(g/(S*W))*S``
+            when ``bs % S == 0``), so the padding slots read uninitialized cache
+            rather than out of bounds; they are dropped by the de-interleave below.
 
         ``dcp_indexer_gather_index``
             output-position -> source index into the flattened all-gathered
             ``[W, sum(Lpad)]`` buffer. Global sequence-local position ``p`` lives on
-            rank ``p % W`` at local index ``p // W``, hence
-            ``src = (p % W) * sum(Lpad) + cu_pad[b] + p // W``.
+            rank ``(p//S) % W`` at local index ``(p//(S*W))*S + p%S`` (S=1 -> the
+            round-robin ``p%W`` / ``p//W``), hence
+            ``src = owner(p) * sum(Lpad) + cu_pad[b] + local_index(p)``.
         """
+        from atom.model_ops.dcp_ops import dcp_local_index, dcp_owner_rank
+
         W = self.dcp_world_size
+        S = self.cp_kv_cache_interleave_size
         if attn_metadata.has_cached:
             g_cu = var["cu_seqlens_k"].np[: bs + 1].astype(np.int64)
         else:
@@ -1005,7 +1006,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         g_lens = g_cu[1:] - g_cu[:bs]
         del counts  # kept for signature symmetry with the caller's other helpers
 
-        lpad = (g_lens + W - 1) // W
+        lpad = ((g_lens + S * W - 1) // (S * W)) * S
         cu_pad = np.zeros(bs + 1, dtype=np.int64)
         np.cumsum(lpad, out=cu_pad[1:])
         local_total = int(cu_pad[bs])
@@ -1013,7 +1014,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         # Position within its sequence for every global KV token.
         pos = np.arange(total_kv, dtype=np.int64) - np.repeat(g_cu[:bs], g_lens)
-        src = (pos % W) * local_total + np.repeat(cu_pad[:bs], g_lens) + pos // W
+        src = (
+            dcp_owner_rank(pos, W, S) * local_total
+            + np.repeat(cu_pad[:bs], g_lens)
+            + dcp_local_index(pos, W, S)
+        )
 
         dev = self.device
         attn_metadata.dcp_indexer_local_total = local_total
@@ -1294,10 +1299,16 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         """DCP variant of `_build_mla_chunk_meta` (compressed-KV AllGather).
 
         The cached context is interleaved across DCP ranks: global token `g`
-        lives on rank `g % dcp_world_size` at local position `g // dcp`. This
-        builder produces, per chunk, the metadata to (1) index_select this
-        rank's local cached tokens, (2) AllGather them, and (3) `reorg_kvcache`
-        them into per-sequence contiguous layout.
+        lives on rank `(g // S) % dcp_world_size` at local index
+        `(g // (S*W)) * S + g % S` (S = cp_kv_cache_interleave_size; S=1 = the
+        original round-robin `g % W` / `g // W`). This builder produces, per
+        chunk, the metadata to (1) index_select this rank's local cached tokens,
+        (2) AllGather them, and (3) `reorg_kvcache` them into per-sequence
+        contiguous layout. `reorg_kvcache` needs only the per-rank *counts*
+        (from `get_dcp_local_seq_lens(..., S)`), not S-aware ordering: the cached
+        context is fully visible (no causal mask) so attention is permutation-
+        invariant over it, and RoPE travels with each key — the existing S=1
+        reorg already emits a non-global order and is correct, so any S is too.
 
         Chunking is per-seq (plugin-style, not the global-axis chunking of the
         non-DCP builder): each chunk covers a `chunk_size`-token local window
@@ -1322,8 +1333,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         # Real local context length per (seq, rank). Shared across chunks;
         # reorg uses it to drop the per-seq padding.
+        s_itl = self.cp_kv_cache_interleave_size
         local_lens_allranks = np.stack(
-            [get_dcp_local_seq_lens(cached_lens, dcp, r) for r in range(dcp)],
+            [get_dcp_local_seq_lens(cached_lens, dcp, r, s_itl) for r in range(dcp)],
             axis=1,
         ).astype(
             np.int64
@@ -1520,16 +1532,21 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         ].contiguous()
 
     def _dcp_round_robin_slot(self, block_table, pos: int) -> int:
-        """DCP round-robin write slot for global position ``pos`` on this rank, or
-        -1 if another rank owns it. KV is token-level round-robin sharded
-        (page_size=1). Shared by the qlen==1 and MTP qlen>1 decode paths."""
-        if pos % self.dcp_world_size != self.dcp_rank:
+        """DCP write slot for global position ``pos`` on this rank, or -1 if
+        another rank owns it. KV is interleave-sharded: token pos lives on rank
+        (pos//S)%W at local index (pos//(S*W))*S + pos%S (S = cp_kv_cache_interleave_size;
+        S=1 = token-level round-robin). Shared by the qlen==1 and MTP qlen>1
+        decode paths."""
+        from atom.model_ops.dcp_ops import dcp_local_index, dcp_owner_rank
+
+        W = self.dcp_world_size
+        S = self.cp_kv_cache_interleave_size
+        if dcp_owner_rank(pos, W, S) != self.dcp_rank:
             return -1
         block_size = self.model_runner.block_size
-        virtual_block_size = block_size * self.dcp_world_size
         return (
-            block_table[pos // virtual_block_size] * block_size
-            + (pos % virtual_block_size) // self.dcp_world_size
+            block_table[pos // (block_size * W)] * block_size
+            + dcp_local_index(pos, W, S) % block_size
         )
 
     def prepare_decode(self, batch: ScheduledBatch, bs: int):
@@ -1599,7 +1616,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             from atom.model_ops.dcp_ops import get_dcp_local_seq_lens
 
             local_context_lens = get_dcp_local_seq_lens(
-                context_lens, self.dcp_world_size, self.dcp_rank
+                context_lens,
+                self.dcp_world_size,
+                self.dcp_rank,
+                self.cp_kv_cache_interleave_size,
             )
             num_blocks_per_seq = cdiv(local_context_lens, self.block_size)
         elif any(batch.is_first_decode_without_local_prefill):

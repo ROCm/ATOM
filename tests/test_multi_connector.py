@@ -13,12 +13,15 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from atom.kv_transfer.disaggregation.types import ConnectorMetadata, KVConnectorOutput
+import pytest
+
+from atom.kv_transfer.disaggregation.multi import multi_connector as mc_module
 from atom.kv_transfer.disaggregation.multi.multi_connector import (
     MultiConnector,
     MultiConnectorMetadata,
     MultiConnectorScheduler,
 )
+from atom.kv_transfer.disaggregation.types import ConnectorMetadata, KVConnectorOutput
 
 # ---------------------------------------------------------------------------
 # Mock sub-connectors
@@ -52,6 +55,7 @@ class FakeSchedSub:
             self.chunk_ret = None
             self.saved = []
             self.load_failed_ids = []
+            self.pending = False
 
     def get_num_new_matched_tokens(self, seq):
         return self._match
@@ -84,6 +88,9 @@ class FakeSchedSub:
     def load_failed(self, req_id):
         self.load_failed_ids.append(req_id)
 
+    def has_pending_work(self):
+        return self.pending
+
     def __getattribute__(self, name):
         # Hide offload-specific methods unless this mock opts in, so
         # MultiConnector's hasattr() guards are exercised realistically.
@@ -94,6 +101,7 @@ class FakeSchedSub:
             "should_defer_free",
             "save_finished",
             "load_failed",
+            "has_pending_work",
         }
         if name in offload_api and not object.__getattribute__(self, "_offload"):
             raise AttributeError(name)
@@ -131,10 +139,11 @@ def _sched(connectors):
     return obj
 
 
-def _worker(connectors):
+def _worker(connectors, pp_is_head=True):
     obj = MultiConnector.__new__(MultiConnector)
     obj._connectors = connectors
     obj.is_producer = any(getattr(c, "is_producer", False) for c in connectors)
+    obj._pp_is_head = pp_is_head
     obj._pending_save = set()
     obj._sent = {}
     obj._saved = {}
@@ -229,6 +238,19 @@ def test_offload_methods_default_when_no_sub_implements():
     assert sched.should_park_partial_prefill_for_load(seq) is False
     assert sched.should_defer_free(seq) is False
     assert sched.adjust_prefill_chunk_after_alloc(seq, 10) == 10  # unchanged
+    assert sched.has_pending_work() is False
+
+
+def test_pending_work_is_the_union_over_subs():
+    # The engine's idle drain keeps running while this holds, so one sub with
+    # an unfinished save has to outvote every drained sibling.
+    a = FakeSchedSub(offload_methods=True)
+    b = FakeSchedSub(offload_methods=True)
+    sched = _sched([a, b])
+    assert sched.has_pending_work() is False
+
+    b.pending = True
+    assert sched.has_pending_work() is True
 
 
 # ---------------------------------------------------------------------------
@@ -346,3 +368,39 @@ def test_save_then_send_also_pairs():
     out2 = w.get_finished()
     assert out2.finished_sending == {9}
     assert out2.finished_saving == {9}
+
+
+def test_non_head_pp_stage_does_not_pair():
+    # Downstream stages never see mooncake's done_sending (it is recorded on
+    # stage 0 only), so pairing there would strand every save.
+    moriio = FakeWorkerSub(is_producer=True)
+    off = FakeWorkerSub(finished=KVConnectorOutput(finished_saving={9}))
+    w = _worker([moriio, off], pp_is_head=False)
+    w.start_load_kv(MultiConnectorMetadata([ConnectorMetadata(), _save_meta(9)]))
+
+    out = w.get_finished()
+    assert out.finished_saving == {9}
+    assert out.finished_sending == set()
+
+
+@pytest.mark.parametrize("pp_rank, holds_send", [(0, True), (1, False)])
+def test_real_constructor_populates_the_pairing_state(monkeypatch, pp_rank, holds_send):
+    # _worker() builds the instance with __new__ and hand-sets its fields, so
+    # it drifts silently whenever __init__ grows one. Drive the real
+    # constructor instead: a field it forgets fails here, not on a GPU node.
+    moriio = FakeWorkerSub(
+        is_producer=True, finished=KVConnectorOutput(finished_sending={9})
+    )
+    off = FakeWorkerSub()
+    monkeypatch.setattr(
+        mc_module, "_build_subconnectors", lambda config, role: [moriio, off]
+    )
+
+    w = MultiConnector(
+        SimpleNamespace(parallel_config=SimpleNamespace(pipeline_parallel_rank=pp_rank))
+    )
+    assert w._pp_is_head is (pp_rank == 0)
+
+    w.start_load_kv(MultiConnectorMetadata([ConnectorMetadata(), _save_meta(9)]))
+    out = w.get_finished()
+    assert out.finished_sending == (set() if holds_send else {9})

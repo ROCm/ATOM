@@ -918,6 +918,104 @@ def test_lmcache_connector_maps_dcp_ranges_on_virtual_block_grid():
     assert connector.gpu_staging_chunk_bytes == 2 * codec.bytes_per_block
 
 
+@pytest.mark.parametrize(
+    ("first_stream_name", "second_stream_name"),
+    [("pack", "copy"), ("copy", "pack")],
+)
+def test_staged_pipeline_allocates_on_first_consumer_stream(
+    first_stream_name,
+    second_stream_name,
+):
+    from atom.kv_transfer.offload.atom_lmcache_staging import (
+        _PipelineStage,
+        run_staged_pipeline,
+    )
+
+    trace = []
+
+    class _FakeStream:
+        def __init__(self, name):
+            self.name = name
+
+        def wait_event(self, event):
+            trace.append(("wait", self.name, event.name))
+
+        def synchronize(self):
+            trace.append(("synchronize", self.name))
+
+    class _FakeEvent:
+        def __init__(self, name):
+            self.name = name
+
+        def record(self, stream):
+            trace.append(("record", self.name, stream.name))
+
+    class _StreamContext:
+        def __init__(self, state, stream):
+            self.state = state
+            self.stream = stream
+
+        def __enter__(self):
+            assert self.state.current_stream is None
+            self.state.current_stream = self.stream
+            trace.append(("enter", self.stream.name))
+
+        def __exit__(self, *_args):
+            trace.append(("exit", self.stream.name))
+            self.state.current_stream = None
+
+    class _FakeState:
+        def __init__(self):
+            self.current_stream = None
+            self.staging_buffer = SimpleNamespace(
+                tensor=None,
+                ready_event=_FakeEvent("ready"),
+                free_event=_FakeEvent("free"),
+                free_event_valid=False,
+            )
+
+        def stream_ctx(self, stream):
+            return _StreamContext(self, stream)
+
+    state = _FakeState()
+    first_stream = _FakeStream(first_stream_name)
+    second_stream = _FakeStream(second_stream_name)
+    device_buf = object()
+
+    def ensure_buffer(_staging_buffer, nbytes):
+        assert nbytes == 8
+        assert state.current_stream is first_stream
+        trace.append(("ensure", state.current_stream.name))
+        return device_buf
+
+    def run_stage(stage_name, expected_stream, _group, actual_buf):
+        assert state.current_stream is expected_stream
+        assert actual_buf is device_buf
+        trace.append(("run", stage_name, state.current_stream.name))
+
+    run_staged_pipeline(
+        state,
+        [SimpleNamespace(nbytes=8)],
+        stage_a=_PipelineStage(
+            first_stream,
+            lambda group, buf: run_stage("a", first_stream, group, buf),
+        ),
+        stage_b=_PipelineStage(
+            second_stream,
+            lambda group, buf: run_stage("b", second_stream, group, buf),
+        ),
+        ensure_buffer=ensure_buffer,
+        group_nbytes=lambda group: group.nbytes,
+    )
+
+    assert trace[:3] == [
+        ("enter", first_stream_name),
+        ("ensure", first_stream_name),
+        ("run", "a", first_stream_name),
+    ]
+    assert ("run", "b", second_stream_name) in trace
+
+
 def _exception_pipeline(monkeypatch, direction: str, *, failed_stream: str | None):
     import torch
 
@@ -3893,6 +3991,23 @@ def test_save_inflight_defers_free_until_save_finishes():
     assert sched.should_defer_free(seq) is False
 
 
+def test_pending_work_tracks_undispatched_loads_and_unreported_saves():
+    # The engine keeps its idle drain alive on this, so it has to stay true
+    # from the moment a load is queued until the matching save reports back.
+    sched = _scheduler()
+    assert sched.has_pending_work() is False
+
+    sched._reqs_need_recv["9"] = object()
+    assert sched.has_pending_work() is True
+
+    sched._reqs_need_recv.clear()
+    sched._save_inflight["9"] = {9}
+    assert sched.has_pending_work() is True
+
+    sched.save_finished(9)
+    assert sched.has_pending_work() is False
+
+
 def test_chunked_prefill_save_uses_computed_frontier_and_serializes_inflight():
     sched = _scheduler()
     seq = SimpleNamespace(
@@ -4297,3 +4412,215 @@ def test_request_cleanup_drops_abandoned_load_statistics():
     assert sched.get_statistics()["loads_pending"] == 0
     assert sched.get_statistics()["load_requests"] == 0
     assert sched.get_statistics()["load_failures"] == 0
+
+
+# ---------------------------------------------------------------------------
+# CPU budget split across PP stages
+# ---------------------------------------------------------------------------
+
+
+def _pp_config(pp_rank: int, pp_size: int, num_hidden: int, draft_layers: int | None):
+    spec = None
+    if draft_layers is not None:
+        spec = SimpleNamespace(
+            draft_model_hf_config=SimpleNamespace(num_nextn_predict_layers=draft_layers)
+        )
+    return SimpleNamespace(
+        pipeline_parallel_size=pp_size,
+        hf_config=SimpleNamespace(num_hidden_layers=num_hidden),
+        parallel_config=SimpleNamespace(pipeline_parallel_rank=pp_rank),
+        speculative_config=spec,
+    )
+
+
+def _budgets(pp_size, num_hidden, draft_layers, configured=256.0, partition=None):
+    from atom.kv_transfer.offload import config as offcfg
+
+    out = []
+    for rank in range(pp_size):
+        cfg = SimpleNamespace(max_local_cpu_size=configured)
+        offcfg.scale_cpu_size_for_pp(
+            cfg, _pp_config(rank, pp_size, num_hidden, draft_layers)
+        )
+        out.append(cfg.max_local_cpu_size)
+    return out
+
+
+def test_cpu_budget_split_preserves_total_and_equalizes_horizon(monkeypatch):
+    # Even split, no spec: every stage holds the same layers, so equal budgets.
+    budgets = _budgets(pp_size=4, num_hidden=80, draft_layers=None)
+    assert budgets == pytest.approx([256.0] * 4)
+    assert sum(budgets) == pytest.approx(1024.0)
+
+
+def test_cpu_budget_split_counts_the_draft_layer_on_the_last_stage(monkeypatch):
+    # Last stage binds the draft KV layer, so its budget must cover 19
+    # layers, not 18.
+    import atom.models.utils as model_utils
+    from atom.kv_transfer.offload import config as offcfg
+
+    partition = [20, 20, 20, 18]
+    starts = [0, 20, 40, 60]
+
+    def fake_pp_indices(num_layers, rank, size):
+        return (starts[rank], starts[rank] + partition[rank])
+
+    monkeypatch.setattr(model_utils, "get_pp_indices", fake_pp_indices)
+    monkeypatch.setattr(offcfg, "get_pp_indices", fake_pp_indices, raising=False)
+
+    budgets = _budgets(pp_size=4, num_hidden=78, draft_layers=1)
+    local = [20, 20, 20, 19]
+    horizons = [b / n for b, n in zip(budgets, local)]
+
+    assert sum(budgets) == pytest.approx(1024.0)
+    assert horizons == pytest.approx([horizons[0]] * 4)
+    assert budgets[3] < budgets[0]
+
+
+# ---------------------------------------------------------------------------
+# LMCache engine identity across DP replicas
+# ---------------------------------------------------------------------------
+
+
+def _dp_config(dp_rank: int, *, pp_size: int = 1, tp_size: int = 1, pp_rank: int = 0):
+    return SimpleNamespace(
+        pipeline_parallel_size=pp_size,
+        tensor_parallel_size=tp_size,
+        parallel_config=SimpleNamespace(
+            data_parallel_rank=dp_rank,
+            pipeline_parallel_rank=pp_rank,
+        ),
+    )
+
+
+def test_engine_id_is_distinct_per_dp_replica():
+    # --enable-dp-attention folds TP into DP, so every GPU becomes a replica
+    # owning a private CPU/NVMe pool. One shared id makes all replicas bind the
+    # same lookup socket, leaving every scheduler reading replica 0's hits.
+    ids = [offcfg.lmcache_engine_id(_dp_config(rank)) for rank in range(8)]
+    assert len(set(ids)) == 8
+
+
+def test_engine_id_pairs_scheduler_and_workers_of_one_replica():
+    # The scheduler's LookupClient and its workers' LookupServer derive the
+    # same ipc path from this id, so it must not vary with PP or TP position.
+    ids = [
+        offcfg.lmcache_engine_id(_dp_config(3, pp_size=2, tp_size=4, pp_rank=pp))
+        for pp in range(2)
+    ]
+    assert ids == ["atom-offload-dp3", "atom-offload-dp3"]
+
+
+def test_engine_id_defaults_to_replica_zero():
+    assert offcfg.lmcache_engine_id(_dp_config(0)) == "atom-offload-dp0"
+    assert offcfg.lmcache_engine_id(SimpleNamespace()) == "atom-offload-dp0"
+
+
+def test_replica_world_size_counts_pp_and_tp_but_not_dp():
+    # Worker ids index the replica-local PP x TP grid. Folding DP in would push
+    # every replica but the first past lookup_server_worker_ids=[0], leaving
+    # them with no lookup server at all.
+    assert offcfg.lmcache_replica_world_size(_dp_config(5, pp_size=4, tp_size=8)) == 32
+    assert offcfg.lmcache_replica_world_size(_dp_config(5)) == 1
+    assert offcfg.lmcache_replica_world_size(SimpleNamespace()) == 1
+
+
+class _RecordingRunnerMgr:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, object]] = []
+
+    def call_func(self, name, *args, **kwargs):
+        self.calls.append((name, args[0] if args else None))
+
+
+class _RecordingPPTransport:
+    def __init__(self) -> None:
+        self.sent: list[object] = []
+
+    def send_metadata(self, batch):
+        self.sent.append(batch)
+
+
+def _idle_meta_with_only_unpins() -> LMCacheOffloadMetadata:
+    meta = LMCacheOffloadMetadata()
+    meta.lookup_requests_in_step = ["7"]
+    return meta
+
+
+def _idle_engine(meta: LMCacheOffloadMetadata):
+    connector = SimpleNamespace(
+        is_offload=True,
+        build_connector_meta=lambda: meta,
+    )
+    return SimpleNamespace(
+        kv_transfer_enabled=True,
+        scheduler=SimpleNamespace(kv_connector=connector),
+        runner_mgr=_RecordingRunnerMgr(),
+        pp_transport=_RecordingPPTransport(),
+    )
+
+
+def test_idle_offload_dispatch_delivers_unpin_only_metadata():
+    # build_connector_meta drains the pending lookup ids as a side effect, so a
+    # metadata carrying nothing but unpins is the only chance those ids get
+    # released. Dropping it pins their CPU chunks until LMCache's watchdog
+    # times them out 300s later.
+    from atom.model_engine.engine_core import EngineCore
+
+    engine = _idle_engine(_idle_meta_with_only_unpins())
+    EngineCore._dispatch_idle_offload_work(engine)
+
+    assert [name for name, _ in engine.runner_mgr.calls] == [
+        "process_kvconnector_output"
+    ]
+    assert engine.runner_mgr.calls[0][1].lookup_requests_in_step == ["7"]
+
+
+def test_pp_connector_only_dispatch_delivers_unpin_only_metadata():
+    from atom.model_engine.pp_engine_core import PPEngineCoreProc
+
+    engine = _idle_engine(LMCacheOffloadMetadata())
+    batch = SimpleNamespace(connector_meta_output=_idle_meta_with_only_unpins())
+    PPEngineCoreProc._dispatch_connector_only_batch(engine, batch)
+
+    assert [name for name, _ in engine.runner_mgr.calls] == [
+        "process_kvconnector_output"
+    ]
+    # Every stage pinned on lookup, so every stage has to hear the unpin.
+    assert engine.pp_transport.sent == [batch]
+
+
+def test_dispatch_skips_metadata_with_no_work_at_all():
+    from atom.model_engine.engine_core import EngineCore
+    from atom.model_engine.pp_engine_core import PPEngineCoreProc
+
+    engine = _idle_engine(LMCacheOffloadMetadata())
+    EngineCore._dispatch_idle_offload_work(engine)
+    PPEngineCoreProc._dispatch_connector_only_batch(
+        engine, SimpleNamespace(connector_meta_output=LMCacheOffloadMetadata())
+    )
+
+    assert engine.runner_mgr.calls == []
+    assert engine.pp_transport.sent == []
+
+
+def test_multi_metadata_exposes_sub_meta_unpins():
+    # The prefill node runs offload inside a `multi` connector, so the idle
+    # dispatch only ever sees the wrapper. Without this aggregate it reads as
+    # empty and the sub-meta's unpins are dropped.
+    from atom.kv_transfer.disaggregation.multi.multi_connector import (
+        MultiConnectorMetadata,
+    )
+
+    wrapper = MultiConnectorMetadata(
+        metas=[SimpleNamespace(), _idle_meta_with_only_unpins()]
+    )
+    assert wrapper.requests == []
+    assert wrapper.lookup_requests_in_step == ["7"]
+
+    from atom.kv_transfer.disaggregation.types import connector_metadata_has_work
+
+    assert connector_metadata_has_work(wrapper)
+    assert not connector_metadata_has_work(
+        MultiConnectorMetadata(metas=[LMCacheOffloadMetadata()])
+    )

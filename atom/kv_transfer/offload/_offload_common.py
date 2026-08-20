@@ -36,6 +36,22 @@ def validated_kv_role(kvc: dict) -> str:
     return role
 
 
+def pp_aware_rank_and_world(config, tp) -> tuple[int, int]:
+    """Return the LMCache rank identity for this worker under PP.
+
+    PP stages hold disjoint layer slices, so the bytes they offload are not
+    interchangeable. The TP rank alone repeats on every stage, which would make
+    all stages share one engine namespace and one IPC socket. Fold the stage
+    index in so each stage gets its own.
+    """
+    pp_rank = int(
+        getattr(getattr(config, "parallel_config", None), "pipeline_parallel_rank", 0)
+        or 0
+    )
+    pp_size = int(getattr(config, "pipeline_parallel_size", 1) or 1)
+    return pp_rank * tp.world_size + tp.rank_in_group, pp_size * tp.world_size
+
+
 def build_offload_engine(
     config,
     *,
@@ -62,6 +78,9 @@ def build_offload_engine(
 
     if cfg is None:
         cfg = offcfg.build_lmcache_config(getattr(config, "kv_transfer_config", None))
+    # Only the worker engine allocates the CPU pool, so the per-stage split is
+    # applied here and not on the scheduler-side lookup clients.
+    offcfg.scale_cpu_size_for_pp(cfg, config)
     base_meta = offcfg.build_lmcache_metadata(config, cfg, world, rank)
     meta = ATOMRawBytesLMCacheMetadata(
         base_meta, atom_block_size=int(block_size), bytes_per_block=int(bytes_per_block)

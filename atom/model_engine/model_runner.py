@@ -583,7 +583,9 @@ class tokenIDProcessor:
         self, batch: ScheduledBatch, draft_token_ids: torch.Tensor
     ) -> np.ndarray:
         if not self.is_deferred_out:
-            ret = draft_token_ids.numpy()
+            # propose() builds this on the drafter's device; the scheduler wants
+            # host rows.
+            ret = draft_token_ids.cpu().numpy()
         else:
             self.draft_token_ids = draft_token_ids
             self.pre_num_decode_token_per_seq = self.num_spec_tokens + 1
@@ -1295,6 +1297,10 @@ class ModelRunner:
                 self.forward_vars["ragged_extend"] = CpuGpuBuffer(
                     self.max_bs, **i32_kwargs
                 )
+            # Per in-flight slot via forward_vars; PP ring clones it.
+            self.forward_vars["draft_next_tokens"] = CpuGpuBuffer(
+                self.max_bs, **i32_kwargs
+            )
 
     def _init_forward_vars_ring(self):
         """Build a ring of independent ``forward_vars`` copies, one per possible
@@ -2879,6 +2885,78 @@ class ModelRunner:
             off += local_len
         return torch.cat(outs)
 
+    def _setup_pp_shared_indexer(self):
+        """Cache per-rank predicates for GLM-5.2 DSA IndexShare PP-boundary
+        top-k transfer. Computed once.
+
+        A "shared" attention layer reuses the prior "full" layer's sparse top-k
+        via the per-rank scratch buffer ``_sparse_kv_indices_gpu``. When a PP
+        boundary splits a shared group, the receiving rank's leading shared
+        layers need the sending rank's top-k, so it is carried across the
+        boundary. No-op for dense models, sparse models with no shared layers,
+        pp=1, or when every rank starts on a "full" layer.
+        """
+        if getattr(self, "_pp_share_indexer_ready", False):
+            return
+        self._pp_share_indexer_ready = True
+        self._pp_send_needs_sparse = False
+        self._pp_recv_needs_sparse = False
+        self._pp_index_topk = 0
+        if not self.is_deepseek_v32:
+            return
+        pp = get_pp_group()
+        if pp.world_size <= 1:
+            return
+        # Unwrap to the module exposing the PP layer range (make_layers sets
+        # start_layer/end_layer on the inner model; UBatchWrapper/CausalLM wrap it).
+        inner = self.model
+        while not hasattr(inner, "start_layer") and hasattr(inner, "model"):
+            inner = inner.model
+        if not hasattr(inner, "start_layer"):
+            return
+
+        # Replicate the model's per-layer shared/full classification
+        # (_should_skip_index_topk in deepseek_v2.py).
+        hf = self.config.hf_config
+        num_layers = int(hf.num_hidden_layers)
+        indexer_types = getattr(hf, "indexer_types", None)
+        index_topk_pattern = getattr(hf, "index_topk_pattern", None)
+        index_topk_freq = int(getattr(hf, "index_topk_freq", 1))
+        index_skip_topk_offset = int(getattr(hf, "index_skip_topk_offset", 1))
+
+        def _is_shared(layer_idx):
+            if not 0 <= layer_idx < num_layers:
+                return False
+            if indexer_types is not None:
+                return indexer_types[layer_idx] == "shared"
+            if index_topk_pattern is not None:
+                return index_topk_pattern[layer_idx] == "S"
+            if index_topk_freq <= 1:
+                return False
+            return max(layer_idx - index_skip_topk_offset, 0) % index_topk_freq != 0
+
+        # This rank consumes the prior rank's top-k iff its first layer is shared.
+        self._pp_recv_needs_sparse = (not pp.is_first_rank) and _is_shared(
+            inner.start_layer
+        )
+        # The next rank consumes this rank's top-k iff ITS first layer
+        # (== this rank's end_layer) is shared.
+        self._pp_send_needs_sparse = (not pp.is_last_rank) and _is_shared(
+            inner.end_layer
+        )
+        self._pp_index_topk = int(self.config.hf_config.index_topk)
+        if self._pp_recv_needs_sparse or self._pp_send_needs_sparse:
+            logger.info(
+                "[%s] PP shared-indexer transfer: recv=%s send=%s "
+                "(layers [%d,%d), index_topk=%d)",
+                self.rank_name,
+                self._pp_recv_needs_sparse,
+                self._pp_send_needs_sparse,
+                inner.start_layer,
+                inner.end_layer,
+                self._pp_index_topk,
+            )
+
     def run_model(
         self,
         input_ids: torch.Tensor,
@@ -2977,10 +3055,20 @@ class ModelRunner:
 
                 pp_group = get_pp_group()
                 pp_enabled = pp_group.world_size > 1
+                if pp_enabled:
+                    self._setup_pp_shared_indexer()
 
                 intermediate_tensors = None
                 if pp_enabled and not pp_group.is_first_rank:
                     intermediate_tensors = recv_intermediate_tensors()
+                    # GLM-5.2 IndexShare: load prior rank's top-k for leading
+                    # shared layers. Pop so compiled model sees only hidden_states.
+                    recv_sparse = intermediate_tensors.tensors.pop(
+                        "sparse_kv_indices", None
+                    )
+                    if recv_sparse is not None and self._pp_recv_needs_sparse:
+                        tgt = self.attn_metadata_builder._sparse_kv_indices_gpu
+                        tgt[: recv_sparse.numel()].copy_(recv_sparse)
 
                 if pp_enabled:
                     model_output = self.model(
@@ -2996,6 +3084,14 @@ class ModelRunner:
                         input_ids, positions, inputs_embeds=inputs_embeds
                     )
                 if pp_enabled and not pp_group.is_last_rank:
+                    # GLM-5.2 IndexShare: carry top-k for next rank's shared layers.
+                    if self._pp_send_needs_sparse:
+                        # Use hidden_states rows (correct under PCP shard).
+                        num_tokens = model_output.tensors["hidden_states"].shape[0]
+                        n = num_tokens * self._pp_index_topk
+                        model_output.tensors["sparse_kv_indices"] = (
+                            self.attn_metadata_builder._sparse_kv_indices_gpu[:n]
+                        )
                     if self._pp_pending_send:
                         commit_pp_send_work(self._pp_pending_send)
                     self._pp_pending_send = async_send_intermediate_tensors(
@@ -3004,12 +3100,11 @@ class ModelRunner:
                     hidden_states = None
                     logits = None
                 elif self._is_pure_middle_chunk(batch):
-                    # Skips `compute_logits` only -- a middle chunk samples
-                    # nothing, but the drafter is still handed its hidden states.
                     if _pcp_tbo_balanced:
                         model_output = self._restore_pcp_balanced_output(
                             model_output, _pcp_bal_groups, _pcp_size
                         )
+                    # Middle chunk: no logits, but drafter needs hidden states.
                     hidden_states = model_output
                     logits = None
                 else:
@@ -3144,7 +3239,10 @@ class ModelRunner:
             num_reject_tokens = self.drafter.mtp_k - num_bonus_tokens
             next_token_locs = num_bonus_tokens
 
-        if get_tp_group().world_size > 1 and self.tokenID_processor.is_deferred_out:
+        # Drafter input must agree across TP ranks.
+        if get_tp_group().world_size > 1 and (
+            self.tokenID_processor.is_deferred_out or hasattr(self, "drafter")
+        ):
             sampled_tokens = get_tp_group().broadcast(sampled_tokens, src=0)
 
         # Compute logprobs if any sequence requested them
@@ -3202,6 +3300,22 @@ class ModelRunner:
         else:
             prev_rejected_num = np.zeros(batch.total_seqs_num, dtype=np.int32)
             prev_bonus_num = np.zeros(batch.total_seqs_num, dtype=np.int32)
+            # PP stages (is_deferred_out=False) still run the drafter.
+            if hasattr(self, "drafter"):
+                # Mid-prompt sequences get their anchor corrected inside
+                # propose_draft_token_ids, from `batch.next_token_ids`.
+                next_token_ids = torch.gather(
+                    sampled_tokens.view(bs, -1), 1, next_token_locs.view(-1, 1)
+                ).view(bs)
+                draft_token_ids = self.propose_draft_token_ids(
+                    batch,
+                    self.tokenID_processor.input_ids.gpu[
+                        1 : batch.total_tokens_num + 1
+                    ],
+                    hidden_states,
+                    next_token_ids,
+                    num_reject_tokens,
+                )
 
         # DSpark Phase 2: carry this step's per-request ell back to the scheduler
         # as a {req_id: ell} dict (req_id-keyed avoids any output/draft batch
@@ -3255,6 +3369,7 @@ class ModelRunner:
                 get_forward_context().context.positions,
                 hidden_states,
                 batch.next_token_ids,
+                not self._is_pure_middle_chunk(batch),
             )
         if pp_non_last or self._is_pure_middle_chunk(batch):
             reset_forward_context()

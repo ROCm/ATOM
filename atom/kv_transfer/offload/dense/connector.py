@@ -45,6 +45,7 @@ from atom.kv_transfer.offload._offload_common import (
     OffloadSchedulerMixin,
     OffloadWorkerMixin,
     build_offload_engine,
+    pp_aware_rank_and_world,
     validated_kv_role,
 )
 from atom.kv_transfer.offload.dense.kv_byte_codec import DenseKVByteCodec
@@ -87,7 +88,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         from aiter.dist.parallel_state import get_tp_group
 
         tp = get_tp_group()
-        rank, world = tp.rank_in_group, tp.world_size
+        rank, world = pp_aware_rank_and_world(self._config, tp)
         self._rank = rank
 
         # num_blocks is the physical block count (num_physical_kvcache_blocks),
@@ -98,7 +99,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         # cfg.chunk_size, so it's built inside the factory once cfg exists.
         self._engine, cfg, meta = build_offload_engine(
             self._config,
-            engine_id=f"atom-offload-{rank}",
+            engine_id=f"{offcfg.lmcache_engine_id(self._config)}-{rank}",
             block_size=self.virtual_block_size,
             bytes_per_block=self._codec.bytes_per_block,
             gpu_connector_factory=lambda cfg, meta: BlockGPUConnector(
@@ -379,14 +380,17 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             cfg.chunk_size,
             minimum=1,
         )
-        world = getattr(config, "tensor_parallel_size", 1)
-        if world is None:
-            world = 1
+        world = offcfg.lmcache_replica_world_size(config)
         meta = offcfg.build_lmcache_metadata(config, cfg, world, 0)
         try:
             from lmcache.v1.lookup_client.factory import LookupClientFactory
 
             self._lookup_client = LookupClientFactory.create_lookup_client(cfg, meta)
+            logger.info(
+                "LMCache offload scheduler: lookup client on %s (world=%d)",
+                meta.engine_id,
+                world,
+            )
         except Exception as e:  # noqa: BLE001  # optional lookup service
             logger.warning(
                 "LMCache offload scheduler: lookup client unavailable: %s", e
@@ -663,6 +667,18 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             return False
         sid = str(seq.id)
         return sid in self._save_inflight or self._has_pending_save(seq)
+
+    def has_pending_work(self) -> bool:
+        """True while a load still needs dispatch or a save is unreported.
+
+        Feeds ``EngineCore.has_pending_kv_work()``, so it reads only state
+        that clears itself: ``_reqs_need_recv`` is emptied by every
+        ``build_connector_meta`` and ``_save_inflight`` by ``save_finished``.
+        Saves that are queued but not yet dispatched are covered there by the
+        scheduler's ``deferred_free_blocks``, which ``should_defer_free``
+        keeps populated for exactly those requests.
+        """
+        return bool(self._reqs_need_recv) or bool(self._save_inflight)
 
     def save_finished(self, req_id) -> None:
         sid = str(req_id.req_id if isinstance(req_id, SaveOperationId) else req_id)

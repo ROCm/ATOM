@@ -134,9 +134,11 @@ class CoreManager:
         # class's spawn loop reads them.
         self.pp_meta_addrs = []
         self.pp_token_addr = ""
+        self.pp_kv_status_addr = ""
         if pp_size > 1:
             self.pp_meta_addrs = [get_open_zmq_ipc_path() for _ in range(pp_size)]
             self.pp_token_addr = get_open_zmq_ipc_path()
+            self.pp_kv_status_addr = get_open_zmq_ipc_path()
 
         self._init_shared_state(
             config, label="Engine Core Mgr", local_engine_count=local_engine_count
@@ -168,6 +170,9 @@ class CoreManager:
                 if self.pp_size > 1:
                     rank_config.parallel_config.pp_meta_addrs = self.pp_meta_addrs
                     rank_config.parallel_config.pp_token_addr = self.pp_token_addr
+                    rank_config.parallel_config.pp_kv_status_addr = (
+                        self.pp_kv_status_addr
+                    )
 
                 engine_core_process, addresses, local_dp_rank = launch_engine_core(
                     rank_config, dp_rank

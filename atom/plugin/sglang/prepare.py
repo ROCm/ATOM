@@ -84,7 +84,29 @@ def prepare_model(config: Any):
     else:
         _remap_quant_config_for_sglang_plugin(atom_config, model_cls)
 
-    register_ops_to_sglang(atom_config=atom_config)
+    # Qwen3-Next/Qwen3.5 model layers are already written against SGLang's
+    # RadixAttention contract. Keep SGLang's native attention backend so
+    # speculative TARGET_VERIFY uses its proven metadata/cache path.
+    if model_arch not in {
+        "Qwen3NextForCausalLM",
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
+    }:
+        register_ops_to_sglang(atom_config=atom_config)
+
+    # Qwen3.5 is the only family that runs DFLASH on the ATOM plugin today.
+    # SGLang's draft greedy sampler assumes a head without `shard_indices` is
+    # not vocab-parallel, which is wrong for ATOM's ParallelLMHead and yields
+    # garbage draft tokens at TP>1; see dflash_lm_head_bridge for the details.
+    if model_arch in {
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
+    }:
+        from atom.plugin.sglang.dflash_lm_head_bridge import (
+            install_dflash_lm_head_patch,
+        )
+
+        install_dflash_lm_head_patch()
     set_attn_cls()
 
     # Init aiter dist for using aiter custom collective ops.
