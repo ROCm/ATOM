@@ -1991,7 +1991,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         on a ragged step, a uniform `next_n` fill on a rectangular one. Sync-free
         — real Σ is baked into `cu_seq_q` on device.
         """
-        from aiter.ops.flydsl.kernels.pa_mqa_logits_fp4_prefill import (
+        from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
             compute_prefill_schedule,
             compute_varqlen_windows,
         )
@@ -2111,7 +2111,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 # pure on-device torch (no host sync) and emits a CONSTANT [P, 4]
                 # cta_info with total_ctas == P fixed — so the captured kernel
                 # reads fresh per-fwd contents from a stable pointer.
-                from aiter.ops.flydsl.kernels.pa_mqa_logits_fp4 import (
+                from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4 import (
                     compute_varctx_schedule,
                 )
 
@@ -2222,7 +2222,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             # call: row_to_batch = batch_id_per_token, local_starts = 0,
             # local_ends = visible_end. block_k / parallel_unit_num MUST match
             # the values passed to the kernel in `_score_topk_prefill_fp4`.
-            from aiter.ops.flydsl.kernels.pa_mqa_logits_fp4_prefill import (
+            from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
                 compute_prefill_schedule,
             )
 
