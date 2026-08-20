@@ -94,6 +94,12 @@ class KimiK3Parser(ToolCallParser):
     """
 
     NAME: ClassVar[str] = "kimi_k3"
+    MARKERS: ClassVar[tuple[str, ...]] = (
+        "<|open|>tools<|sep|>",
+        "<|open|>response<|sep|>",
+        "<|close|>response<|sep|>",
+        "<|end_of_msg|>",
+    )
 
     @classmethod
     def detect(cls, text: str) -> bool:

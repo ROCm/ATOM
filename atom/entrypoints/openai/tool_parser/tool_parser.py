@@ -45,6 +45,13 @@ class ToolCallParser(ABC):
     """
 
     NAME: ClassVar[str]
+    # Every literal this format opens with, declared rather than spelled out
+    # again inside `sniff_stream`'s chain and each parser's own logic. A
+    # streaming reader has to know them to decide how much of its buffer could
+    # still be the start of one, and the property tests enumerate them so a
+    # newly registered format is covered the moment it exists rather than when
+    # someone remembers to write a case for it.
+    MARKERS: ClassVar[tuple[str, ...]] = ()
 
     def __init__(self, tools: list | None = None):
         self.tools = tools

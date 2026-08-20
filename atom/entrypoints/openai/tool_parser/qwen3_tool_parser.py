@@ -67,6 +67,7 @@ def _parse_function(
 
 class QwenXmlParser(BufferedMarkerParser):
     NAME: ClassVar[str] = "qwen"
+    MARKERS: ClassVar[tuple[str, ...]] = ("<tool_call>", QWEN_TOOL_PREFIX)
     START_MARKERS: ClassVar[tuple[str, ...]] = ("<tool_call>", QWEN_TOOL_PREFIX)
 
     @classmethod

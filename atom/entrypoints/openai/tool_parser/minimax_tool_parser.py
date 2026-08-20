@@ -35,6 +35,7 @@ _PARAM_RE = re.compile(r"<([\w-]+)>(.*?)</\1>", re.DOTALL)
 
 class MiniMaxParser(BufferedMarkerParser):
     NAME: ClassVar[str] = "minimax"
+    MARKERS: ClassVar[tuple[str, ...]] = (MINIMAX_NS, MINIMAX_NS + "<tool_call>")
     START_MARKERS: ClassVar[tuple[str, ...]] = (MINIMAX_NS, "<tool_call>")
     # The ns_token starts with ']', so a trailing ']' may be a partial marker.
     HOLDBACK_CHARS: ClassVar[tuple[str, ...]] = ("<", "]")

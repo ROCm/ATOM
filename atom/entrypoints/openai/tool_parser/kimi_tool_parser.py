@@ -62,6 +62,7 @@ class KimiParser(ToolCallParser):
     """States: 0 = plain content, 1 = inside section, 2 = section closed."""
 
     NAME: ClassVar[str] = "kimi"
+    MARKERS: ClassVar[tuple[str, ...]] = (KIMI_SECTION_BEGIN, "<|tool_call_begin|>")
 
     @classmethod
     def detect(cls, text: str) -> bool:

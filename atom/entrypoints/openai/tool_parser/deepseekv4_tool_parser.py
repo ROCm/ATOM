@@ -110,6 +110,7 @@ def _infer_name(arg_names: set, param_types: dict[str, dict[str, Any]]) -> str |
 
 class DsmlParser(BufferedMarkerParser):
     NAME: ClassVar[str] = "dsml"
+    MARKERS: ClassVar[tuple[str, ...]] = ("<tool_calls>", "<invoke name=")
     # Region-start markers, both marked and marker-less variants.
     START_MARKERS: ClassVar[tuple[str, ...]] = (
         "<" + _DSML + "tool_call",  # marked (covers tool_call / tool_calls)
