@@ -540,6 +540,8 @@ python -m atom.entrypoints.openai_server \
 | `--method` | `None` | Speculative method: `mtp` (DeepSeek MTP) or `eagle3` (EAGLE 3 / EAGLE 3.1 — see [`eagle3_speculative_decoding.md`](eagle3_speculative_decoding.md)) |
 | `--num-speculative-tokens` | `1` | Number of draft tokens per iteration (draft model runs this many autoregressive steps) |
 | `--draft-model` | `None` | Path or HF repo of the speculative draft model. Required for `--method eagle3`; the draft's `config.json` drives EAGLE 3 vs EAGLE 3.1 toggles automatically |
+| `--spec-decode-acceptance-length` | `None` | Benchmark-only: force a mean acceptance length in `[1, num_speculative_tokens + 1]`, ignoring real draft/target agreement. See [Forced acceptance length](#forced-acceptance-length) |
+| `--spec-decode-acceptance-rate` | `None` | The same knob as a rate in `[0, 1]`, i.e. `(length - 1) / num_speculative_tokens`. Mutually exclusive with the above |
 
 ### MTP statistics
 
@@ -575,6 +577,48 @@ MTP Statistics:
      subsequent draft tokens are discarded.
    - If all draft tokens match, a bonus token from the target model is
      appended.
+
+### Forced acceptance length
+
+Speculative throughput is dominated by how many tokens each target forward
+emits, so a run cannot be compared against another engine unless both accept at
+the same rate. `--spec-decode-acceptance-length` pins that number: the sampler
+stops comparing draft against target and instead accepts draft tokens with a
+fixed per-position probability, hitting the requested mean acceptance length.
+It exists to benchmark the serving system while a draft head is still training,
+and to replay a published acceptance-length figure such as an
+[InferenceX golden AL](https://github.com/SemiAnalysisAI/InferenceX/blob/main/golden_al_distribution/README.md).
+
+```bash
+python -m atom.entrypoints.openai_server \
+    --model /models/Kimi-K3 \
+    --draft-model /models/Kimi-K3-DSpark \
+    --method dspark \
+    --num-speculative-tokens 7 \
+    --spec-decode-acceptance-length 3.78
+```
+
+Acceptance length counts the target's own guaranteed token, matching vLLM's
+`synthetic_acceptance_length` and SGLang's `SGLANG_SIMULATE_ACC_LEN`, so a
+published figure goes in unchanged. The budget is spent on the earliest
+positions — length `3.78` over 7 draft slots accepts 2 tokens always and a 3rd
+with probability `0.78` — which is the minimum-variance schedule vLLM and
+SGLang also use, so the accepted-length distribution matches and not just its
+mean. Read the realized value back from `average_tokens_per_forward` on
+`/debug/mtp_stats` (or the `atom:mtp_average_tokens_per_forward` metric).
+
+Two caveats:
+
+- Generated text is meaningless, because tokens are accepted without agreeing
+  with the target. Never run an accuracy evaluation with this enabled.
+- It cannot be combined with the DSpark confidence scheduler
+  (`--dspark-config '{"confidence_schedule": true}'`), which picks each
+  request's verify length at runtime; a short one silently caps acceptance
+  below the requested length, so the combination is rejected at startup.
+
+The full reference — the resolved schedule, the rate-based spelling, and how to
+replay a golden AL curve — is in
+[`forced_acceptance_length.md`](forced_acceptance_length.md).
 
 ## Deployment examples
 

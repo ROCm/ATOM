@@ -720,8 +720,8 @@ class ModelRunner:
             with set_model_tag("drafter"):
                 self.drafter = build_drafter(self.config, self.device, self)
             self.rejection_sampler = RejectionSampler(
-                synthetic_acceptance_rate=(
-                    self.config.speculative_config.synthetic_acceptance_rate
+                synthetic_acceptance_rates=(
+                    self.config.speculative_config.synthetic_acceptance_rates
                 )
             )
             torch.set_default_device(None)
