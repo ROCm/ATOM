@@ -19,6 +19,8 @@ on:
           - run_p1
           - run_p2
           - run_all
+          - Qwen3.8-27B TP1
+          - Qwen3.8-2.4T-A95B-Quark-MXFP4 TP8+EP8
           - Qwen3-235B-A22B-Instruct-2507-FP8 TP8+EP8
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP1
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP2
@@ -68,6 +70,8 @@ on:
           - run_p1
           - run_p2
           - run_all
+          - Qwen3.8-27B TP1
+          - Qwen3.8-2.4T-A95B-Quark-MXFP4 TP8+EP8
           - Qwen3-235B-A22B-Instruct-2507-FP8 TP8+EP8
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP1
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP2
@@ -117,6 +121,8 @@ on:
           - run_p1
           - run_p2
           - run_all
+          - Qwen3.8-27B TP1
+          - Qwen3.8-2.4T-A95B-Quark-MXFP4 TP8+EP8
           - Qwen3-235B-A22B-Instruct-2507-FP8 TP8+EP8
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP1
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP2
@@ -166,6 +172,8 @@ on:
           - run_p1
           - run_p2
           - run_all
+          - Qwen3.8-27B TP1
+          - Qwen3.8-2.4T-A95B-Quark-MXFP4 TP8+EP8
           - Qwen3-235B-A22B-Instruct-2507-FP8 TP8+EP8
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP1
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP2
@@ -215,6 +223,8 @@ on:
           - run_p1
           - run_p2
           - run_all
+          - Qwen3.8-27B TP1
+          - Qwen3.8-2.4T-A95B-Quark-MXFP4 TP8+EP8
           - Qwen3-235B-A22B-Instruct-2507-FP8 TP8+EP8
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP1
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP2
@@ -264,6 +274,8 @@ on:
           - run_p1
           - run_p2
           - run_all
+          - Qwen3.8-27B TP1
+          - Qwen3.8-2.4T-A95B-Quark-MXFP4 TP8+EP8
           - Qwen3-235B-A22B-Instruct-2507-FP8 TP8+EP8
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP1
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP2
@@ -313,6 +325,8 @@ on:
           - run_p1
           - run_p2
           - run_all
+          - Qwen3.8-27B TP1
+          - Qwen3.8-2.4T-A95B-Quark-MXFP4 TP8+EP8
           - Qwen3-235B-A22B-Instruct-2507-FP8 TP8+EP8
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP1
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP2
@@ -362,6 +376,8 @@ on:
           - run_p1
           - run_p2
           - run_all
+          - Qwen3.8-27B TP1
+          - Qwen3.8-2.4T-A95B-Quark-MXFP4 TP8+EP8
           - Qwen3-235B-A22B-Instruct-2507-FP8 TP8+EP8
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP1
           - Qwen3-Next-80B-A3B-Instruct-FP8 TP2

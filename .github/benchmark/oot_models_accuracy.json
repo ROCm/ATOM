@@ -1,5 +1,35 @@
 [
   {
+    "model_name": "Qwen3.8-27B TP1",
+    "model_path": "Qwen/Qwen3.8-27B",
+    "client_command": "lm_eval --model local-chat-completions --model_args model=${MODEL_PATH},base_url=http://127.0.0.1:${VLLM_PORT}/v1/chat/completions,num_concurrent=64,max_retries=3,timeout=1200,max_gen_toks=8192,tokenized_requests=False,trust_remote_code=True --tasks gsm8k --num_fewshot ${LM_EVAL_NUM_FEWSHOT} --batch_size 1 --output_path ${OUTPUT_PATH} --gen_kwargs 'do_sample=True,temperature=1.0,top_p=0.95,top_k=20,min_tokens=1,reasoning_effort=low' --apply_chat_template --fewshot_as_multiturn --log_samples",
+    "extra_args": "--tensor-parallel-size 1 --max-model-len 32768 --max-num-seqs 64 --reasoning-parser qwen3",
+    "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
+    "runner": "atom-plugin-acc-validation-runner-vllm",
+    "test_level": "nightly",
+    "priority": "P0",
+    "lm_eval_num_fewshot": 5,
+    "accuracy_test_threshold": 0.96,
+    "accuracy_baseline": 0.9757,
+    "accuracy_baseline_model": "Qwen/Qwen3.8-27B",
+    "_baseline_note": "TP1 BF16, FP8 KV cache, 5-shot GSM8K flexible-extract with reasoning_effort=low."
+  },
+  {
+    "model_name": "Qwen3.8-2.4T-A95B-Quark-MXFP4 TP8+EP8",
+    "model_path": "amd/Qwen3.8-2.4T-A95B-Quark-MXFP4",
+    "client_command": "lm_eval --model local-chat-completions --model_args model=${MODEL_PATH},base_url=http://127.0.0.1:${VLLM_PORT}/v1/chat/completions,num_concurrent=64,max_retries=3,timeout=1800,max_gen_toks=8192,tokenized_requests=False,trust_remote_code=True --tasks gsm8k --num_fewshot ${LM_EVAL_NUM_FEWSHOT} --batch_size 1 --output_path ${OUTPUT_PATH} --gen_kwargs 'do_sample=True,temperature=1.0,top_p=0.95,top_k=20,min_tokens=1,reasoning_effort=low' --apply_chat_template --fewshot_as_multiturn --log_samples",
+    "extra_args": "--tensor-parallel-size 8 --enable-expert-parallel --kv-cache-dtype auto --max-model-len 32768 --max-num-seqs 64 --reasoning-parser qwen3",
+    "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
+    "runner": "atom-plugin-acc-validation-runner-vllm",
+    "test_level": "nightly",
+    "priority": "P0",
+    "lm_eval_num_fewshot": 5,
+    "accuracy_test_threshold": 0.97,
+    "accuracy_baseline": 0.9795,
+    "accuracy_baseline_model": "amd/Qwen3.8-2.4T-A95B-Quark-MXFP4",
+    "_baseline_note": "TP8+EP8, BF16 KV cache, 5-shot GSM8K flexible-extract with reasoning_effort=low."
+  },
+  {
     "model_name": "Qwen3-235B-A22B-Instruct-2507-FP8 TP8+EP8",
     "model_path": "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8",
     "extra_args": "--tensor-parallel-size 8 --enable-expert-parallel",

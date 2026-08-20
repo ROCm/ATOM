@@ -152,6 +152,7 @@ _ATOM_MODEL_CLASSES: dict[str, str] = {
     "Glm4MoeMTPModel": "atom.models.glm4_moe_mtp:Glm4MoeMTP",
     "Qwen3NextForCausalLM": "atom.plugin.vllm.models.qwen3_next:Qwen3NextForCausalLM",
     "Qwen3NextMTP": "atom.models.qwen3_next_mtp:Qwen3NextMTP",
+    "Qwen3_5MoeForCausalLM": "atom.plugin.vllm.models.qwen3_5:Qwen3_5MoeForCausalLM",
     "Qwen3_5MoeForConditionalGeneration": "atom.plugin.vllm.models.qwen3_5:Qwen3_5MoeForConditionalGeneration_",
     "Qwen3_5ForConditionalGeneration": "atom.plugin.vllm.models.qwen3_5:Qwen3_5ForConditionalGeneration_",
     "KimiK25ForConditionalGeneration": "atom.plugin.vllm.models.kimi_k25:KimiK25ForConditionalGeneration_",

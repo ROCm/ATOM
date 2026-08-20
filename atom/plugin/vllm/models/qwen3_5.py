@@ -1,24 +1,8 @@
 from collections.abc import Iterable
 
 import torch
-from torch import nn
-
 from aiter.dist.parallel_state import get_tensor_model_parallel_rank
-from atom.config import Config
-from atom.models import qwen3_5 as qwen3_5_base
-from atom.models.qwen3_5 import (
-    Qwen3_5Config,
-    Qwen3_5ForCausalLM as Qwen3_5ForCausalLMBase,
-    Qwen3_5GatedDeltaNet,
-    Qwen3_5MoeConfig,
-    Qwen3_5MoeForCausalLM as Qwen3_5MoeForCausalLMBase,
-    detect_fused_expert_format,
-    get_fused_expert_mapping,
-    load_fused_expert_weights,
-    maybe_prefix,
-)
-from atom.plugin.vllm.model_wrapper import ATOMForConditionalGeneration
-from atom.model_loader.loader import WeightsMapper, load_model_in_plugin_mode
+from torch import nn
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.mamba.mamba_utils import (
@@ -30,17 +14,44 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 from vllm.model_executor.models.interfaces import IsHybrid
 from vllm.model_executor.models.qwen3_5 import (
     Qwen3_5ForConditionalGeneration as vLLMQwen3_5,
+)
+from vllm.model_executor.models.qwen3_5 import (
     Qwen3_5MoeForConditionalGeneration as vLLMQwen3_5Moe,
+)
+from vllm.model_executor.models.qwen3_5 import (
     Qwen3_5MoeProcessingInfo,
     Qwen3_5ProcessingInfo,
 )
 from vllm.model_executor.models.qwen3_vl import (
+    Qwen3_VisionTransformer,
     Qwen3VLDummyInputsBuilder,
     Qwen3VLMultiModalProcessor,
-    Qwen3_VisionTransformer,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+
+from atom.config import Config
+from atom.model_loader.loader import WeightsMapper, load_model_in_plugin_mode
+from atom.models import qwen3_5 as qwen3_5_base
+from atom.models.qwen3_5 import (
+    Qwen3_5Config,
+    Qwen3_5GatedDeltaNet,
+    Qwen3_5MoeConfig,
+    detect_fused_expert_format,
+    get_fused_expert_mapping,
+    load_fused_expert_weights,
+    maybe_prefix,
+)
+from atom.models.qwen3_5 import (
+    Qwen3_5ForCausalLM as Qwen3_5ForCausalLMBase,
+)
+from atom.models.qwen3_5 import (
+    Qwen3_5MoeForCausalLM as Qwen3_5MoeForCausalLMBase,
+)
+from atom.plugin.vllm.model_wrapper import (
+    ATOMForConditionalGeneration,
+    ATOMMoEForCausalLM,
+)
 
 
 class Qwen3_5GatedDeltaNetVllm(Qwen3_5GatedDeltaNet, MambaBase):
@@ -106,6 +117,49 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoeForCausalLMBase):
             super().__init__(*args, **kwargs)
         finally:
             qwen3_5_base.Qwen3_5GatedDeltaNet = original_gdn_cls
+
+
+class Qwen3_5MoeForCausalLMVllm(ATOMMoEForCausalLM, IsHybrid):
+    """Text-only Qwen3.5/3.8 MoE wrapper for the ATOM vLLM backend."""
+
+    @classmethod
+    def get_mamba_state_dtype_from_config(
+        cls,
+        vllm_config: VllmConfig,
+    ) -> tuple[torch.dtype, torch.dtype]:
+        return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+            vllm_config.model_config.dtype,
+            vllm_config.cache_config.mamba_cache_dtype,
+            vllm_config.cache_config.mamba_ssm_cache_dtype,
+        )
+
+    @classmethod
+    def get_mamba_state_shape_from_config(
+        cls, vllm_config: VllmConfig
+    ) -> tuple[tuple[int, int], tuple[int, int]]:
+        parallel_config = vllm_config.parallel_config
+        hf_config = vllm_config.model_config.hf_text_config
+        tp_size = parallel_config.tensor_parallel_size
+        num_spec = (
+            vllm_config.speculative_config.num_speculative_tokens
+            if vllm_config.speculative_config
+            else 0
+        )
+        return MambaStateShapeCalculator.gated_delta_net_state_shape(
+            tp_size,
+            hf_config.linear_num_key_heads,
+            hf_config.linear_num_value_heads,
+            hf_config.linear_key_head_dim,
+            hf_config.linear_value_head_dim,
+            hf_config.linear_conv_kernel_dim,
+            num_spec,
+        )
+
+    @classmethod
+    def get_mamba_state_copy_func(
+        cls,
+    ) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
+        return MambaStateCopyFuncCalculator.gated_delta_net_state_copy_func()
 
 
 @MULTIMODAL_REGISTRY.register_processor(
