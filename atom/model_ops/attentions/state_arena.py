@@ -35,7 +35,9 @@ A row space with planes of differing width cannot hold one entry contiguously
 at all: a field is one strided tensor, so it lands in one plane or the other.
 `plan_field_planes` decides which, `SplitStateArena` hides the split from
 consumers asking for a field by name, and what stays contiguous is a *slot* —
-which is the range a checkpoint copies and a PD transfer registers anyway.
+which is the range a PD transfer registers, and the range a checkpoint's own
+is carved out of by `checkpoint_ranges_for`, since an image holds only the
+fields a resumer reads (`StateField.in_checkpoint`).
 
 Backends stay in charge of what the fields are; this module only owns the
 arithmetic. The layout is deliberately the one DeepSeek-V4's PD staging path
@@ -46,7 +48,9 @@ physical is what lets that gather collapse into a copy.
 from __future__ import annotations
 
 import math
+from collections.abc import Iterator
 from dataclasses import dataclass
+from itertools import groupby
 
 import torch
 
@@ -190,6 +194,18 @@ class StateField:
     # one of those wider rows, or the row index the kernel computes is off by a
     # fraction of a row and nothing about the view says so.
     align: int = 0
+    # Whether a checkpoint image holds this field at all. A ring whose next
+    # reader starts exactly at the boundary the checkpoint was taken on owes
+    # one nothing: DeepSeek-V4's HCA compressor pools `[P, P + 128)` and a
+    # checkpoint sits on a multiple of 128, so every row its resumer reads is
+    # a row that same resumer writes. Declared by the field rather than worked
+    # out at copy time, so the copy path only reads what a field says about
+    # itself and the geometry stays in one place.
+    #
+    # All-or-nothing on purpose. A field carried in *some* of its rows is a
+    # ring, and which rows those are depends on the position the checkpoint
+    # was taken at — a phase this module is not given and must not guess.
+    in_checkpoint: bool = True
 
     def __post_init__(self):
         if self.align and self.align % _ALIGN:
@@ -208,6 +224,22 @@ class StateField:
         return self.layers * self.per_layer_numel * self.dtype.itemsize
 
 
+def field_extents(
+    fields: list[StateField],
+) -> Iterator[tuple[StateField, int, int]]:
+    """Each field with the `[start, end)` bytes it occupies in an entry.
+
+    The one place the align-place-advance walk is written. An arena's field
+    offsets, the entry's own size and a checkpoint's ranges are three answers
+    to the same question and have to agree, so all three come from here.
+    """
+    offset = 0
+    for field in fields:
+        offset = _align_up(offset, max(_ALIGN, field.align))
+        yield field, offset, offset + field.bytes_per_entry
+        offset += field.bytes_per_entry
+
+
 def entry_bytes_for(fields: list[StateField]) -> int:
     """Bytes one entry costs, including inter-field alignment.
 
@@ -215,10 +247,35 @@ def entry_bytes_for(fields: list[StateField]) -> int:
     function rather than a property of a built arena — the byte budget and
     the allocation must come from the same expression or the two drift.
     """
-    total = 0
-    for field in fields:
-        total = _align_up(total, max(_ALIGN, field.align)) + field.bytes_per_entry
-    return _align_up(total)
+    end = 0
+    for _, _, field_end in field_extents(fields):
+        end = field_end
+    return _align_up(end)
+
+
+def checkpoint_ranges_for(fields: list[StateField]) -> list[tuple[int, int]]:
+    """`(offset, num_bytes)` of an entry a checkpoint image holds.
+
+    Consecutive carried fields merge into one range, so the ordinary
+    all-carried case is a single range, and the alignment padding inside a run
+    rides along with it — splitting a range to shave padding costs more
+    descriptor than it saves. A field left out breaks the run, which is the
+    point: merging across it would put it back in the image.
+    """
+    ranges: list[tuple[int, int]] = []
+    for carried, run in groupby(field_extents(fields), lambda e: e[0].in_checkpoint):
+        if not carried:
+            continue
+        extents = list(run)
+        start = extents[0][1]
+        nbytes = extents[-1][2] - start
+        # A run of zero-byte fields spans nothing, and a zero-length range is
+        # not one: `plan_segmented_copy` refuses empty segments, and it is only
+        # reached on the first copy, so emitting one here would let a config
+        # size, cross-check and start cleanly and then abort mid-serving.
+        if nbytes:
+            ranges.append((start, nbytes))
+    return ranges
 
 
 class StateArena:
@@ -276,12 +333,7 @@ class StateArena:
         if not 0 <= self.live_entries <= entries:
             raise ValueError(f"live_entries {self.live_entries} outside 0..{entries}")
 
-        offset = 0
-        self._offsets: dict[str, int] = {}
-        for field in self.fields:
-            offset = _align_up(offset, max(_ALIGN, field.align))
-            self._offsets[field.name] = offset
-            offset += field.bytes_per_entry
+        self._offsets = {f.name: start for f, start, _ in field_extents(self.fields)}
 
         self._by_name = {f.name: f for f in self.fields}
         # Zeroed, not `empty`: alignment padding falls outside every field

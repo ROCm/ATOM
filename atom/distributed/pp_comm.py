@@ -20,8 +20,9 @@ from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
-# Keys carried between pipeline stages.
-_PP_PROXY_KEYS = ("hidden_states", "residual")
+# Keys carried between pipeline stages. `sparse_kv_indices` is optional: present
+# only when a PP boundary splits a DSA IndexShare group (see model_runner).
+_PP_PROXY_KEYS = ("hidden_states", "residual", "sparse_kv_indices")
 
 
 def pp_send_allgather_group():

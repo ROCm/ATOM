@@ -82,10 +82,20 @@ RUN echo "========== [OOT 3/7] Clone and patch vLLM ==========" && \
 RUN echo "========== [OOT 4/7] Install vLLM ROCm build dependencies ==========" && \
     cd /app/vllm && \
     "${VENV_PYTHON}" -m pip install --upgrade pip && \
+    sed -i -e '/^[[:space:]]*"torch == /d' pyproject.toml && \
     sed -i -e '/xgrammar/d' -e '/compressed-tensors/d' requirements/common.txt && \
     "${VENV_PYTHON}" -m pip install --no-deps "xgrammar>=0.2.1,<1.0.0" "compressed-tensors==0.17.0" loguru && \
     sed -i -e '/peft/d' -e '/tensorizer/d' -e '/runai/d' -e '/timm/d' -e '/tilelang/d' requirements/rocm.txt && \
-    "${VENV_PYTHON}" -m pip install --no-deps peft "tensorizer==2.10.1" "runai-model-streamer[s3,gcs,azure]==0.15.7" "timm>=1.0.17" "tilelang==0.1.10" "torch-c-dlpack-ext==0.1.5" "z3-solver==4.15.4.0" && \
+    "${VENV_PYTHON}" -m pip install --no-deps peft "tensorizer==2.10.1" "runai-model-streamer==0.15.7" "timm>=1.0.17" "tilelang==0.1.10" "torch-c-dlpack-ext==0.1.5" "z3-solver==4.15.4.0" && \
+    "${VENV_PYTHON}" -m pip install --no-deps \
+        "accelerate==1.14.0" "humanize==4.16.0" \
+        "boto3==1.43.62" "botocore==1.43.62" "s3transfer==0.19.2" \
+        "redis==8.1.0" "hiredis==3.4.0" "libnacl==2.1.0" \
+        "runai-model-streamer-s3==0.15.7" \
+        "runai-model-streamer-gcs==0.15.7" \
+        "runai-model-streamer-azure==0.15.7" && \
+    "${VENV_PYTHON}" -m pip install \
+        google-auth google-cloud-storage azure-identity azure-storage-blob && \
     "${VENV_PYTHON}" -m pip install -r requirements/rocm.txt
 
 RUN echo "========== [OOT 5/7] Build and install amd-smi wheel ==========" && \
@@ -110,7 +120,7 @@ RUN echo "========== [OOT 6/7] Build vLLM wheel ==========" && \
 RUN echo "========== [OOT 7/7] Install vLLM runtime dependencies ==========" && \
     cd /app/vllm && \
     "${VENV_PYTHON}" -m pip uninstall -y vllm || true && \
-    "${VENV_PYTHON}" -m pip install /tmp/vllm-wheels/*.whl && \
+    "${VENV_PYTHON}" -m pip install --no-deps /tmp/vllm-wheels/*.whl && \
     if [ "${INSTALL_LM_EVAL}" = "1" ]; then "${VENV_PYTHON}" -m pip install "lm-eval[api]"; else echo "Skip lm-eval install"; fi && \
     if [ "${INSTALL_FASTSAFETENSORS}" = "1" ]; then "${VENV_PYTHON}" -m pip install "git+https://github.com/foundation-model-stack/fastsafetensors.git"; else echo "Skip fastsafetensors install"; fi && \
     "${VENV_PYTHON}" -c "import glob, os, torch; print(f'torch.version.hip: {torch.version.hip}'); print(f'torch.version.cuda: {torch.version.cuda}'); torch_lib_dir=os.path.join(os.path.dirname(torch.__file__), 'lib'); print(f'torch lib dir: {torch_lib_dir}'); print(f'libtorch_hip candidates: {glob.glob(os.path.join(torch_lib_dir, \"libtorch_hip.so*\"))}'); assert torch.version.hip is not None, 'Torch is not ROCm build (torch.version.hip is None).'" && \

@@ -7,7 +7,7 @@ from math import inf, isinf
 import numpy as np
 import xxhash
 
-from atom.config import Config
+from atom.config import Config, DCPConfig
 from atom.distributed.kv_events import (
     MEDIUM_GPU,
     MEDIUM_REMOTE,
@@ -18,9 +18,16 @@ from atom.distributed.kv_events import (
 )
 from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
+from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointCoordinator
 from atom.model_engine.sequence import Sequence
-from atom.model_engine.state_cache import StateCache
-from atom.model_engine.state_pool import StateGroupPool, StateTransfer
+from atom.model_engine.state_cache import StateCache, StateCheckpointCache
+from atom.model_engine.state_pool import StateGroupPool
+from atom.model_engine.state_runtime import (
+    DEFAULT_STATE_RUNTIME,
+    StateMaintenanceOps,
+    StateRuntime,
+    StateTransfer,
+)
 
 logger = logging.getLogger("atom")
 
@@ -51,12 +58,21 @@ def _make_all_cleared() -> AllBlocksCleared:
 
 
 class BlockManager:
-    def __init__(self, config: Config):
+    def __init__(
+        self,
+        config: Config,
+        *,
+        state_runtime: StateRuntime = DEFAULT_STATE_RUNTIME,
+    ):
         block_size = config.kv_cache_block_size
         num_blocks = config.num_kvcache_blocks
         assert num_blocks > 0
         self.block_size = block_size
         self.dcp_world_size = config.decode_context_parallel_size
+        # DCP KV-cache interleave granularity S (1 = token-level round-robin).
+        self.cp_kv_cache_interleave_size = getattr(
+            config, "dcp_config", DCPConfig()
+        ).interleave_size
         # dcp_rank is always 0 here: BlockManager runs only on the scheduler
         # (rank 0). DCP rank is used only to compute local token counts for
         # memory reservation; the actual per-rank routing is done in the workers.
@@ -66,6 +82,7 @@ class BlockManager:
         # tokens (see _hash_block_size). == block_size when DCP is off.
         self.hash_block_size = self.block_size * self.dcp_world_size
         self.enable_prefix_caching = config.enable_prefix_caching
+        self.total_evicted_blocks: int = 0
 
         kv_events = getattr(config, "kv_events_config", None)
         self._events_enabled: bool = bool(kv_events and kv_events.enable)
@@ -98,17 +115,27 @@ class BlockManager:
         self.state_checkpoint_interval_tokens = max(
             0, int(getattr(config, "state_checkpoint_interval_tokens", 0) or 0)
         )
-        # The rolling state class: per-request groups plus a content index over
-        # the free ones. A checkpoint IS a free group whose content is still
-        # valid, so it holds no capacity of its own and never blocks admission.
+        checkpoint_spec = state_runtime.checkpoint_spec
+        self.paged_state_checkpoints: PagedStateCheckpointCoordinator | None = None
+        if checkpoint_spec is not None:
+            enabled = self.enable_prefix_caching and self.num_per_req_cache_groups > 0
+            self.paged_state_checkpoints = PagedStateCheckpointCoordinator(
+                self.kv,
+                checkpoint_spec,
+                enabled=enabled,
+            )
         self.state = StateGroupPool(
             self.num_per_req_cache_groups,
-            transfer=StateTransfer.from_config(
-                getattr(config, "state_transfer_kind", "none") or "none",
-                int(getattr(config, "state_fork_tokens", 0) or 0),
+            transfer=(
+                StateTransfer.none()
+                if self.paged_state_checkpoints is not None
+                else state_runtime.transfer
             ),
             hash_block_size=self.hash_block_size,
             enabled=self.enable_prefix_caching,
+        )
+        self._state_checkpoint_cache: StateCheckpointCache = (
+            self.paged_state_checkpoints or self.state
         )
         # A checkpoint is filed under the content hash of the last block it
         # covers, so a rung that isn't a hash-block boundary can never be looked
@@ -141,7 +168,7 @@ class BlockManager:
         # by the state checkpoint, so it has nothing to say about hit length.
         # Kept plural because GDN's recurrent state is a second member the
         # moment it stops forking (see the state-cache protocol).
-        self.state_caches: tuple[StateCache, ...] = (self.state,)
+        self.state_caches: tuple[StateCache, ...] = (self._state_checkpoint_cache,)
 
         # The demand funnel: recorded at admission, cut for when a prefill
         # chunk is shortened to land on it, kept when the state pool files it.
@@ -149,6 +176,7 @@ class BlockManager:
         # bug, and they are indistinguishable in the hit rate alone.
         self.demands_recorded: int = 0
         self.chunks_cut_for_demand: int = 0
+        self.demands_declined_no_room: int = 0
 
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
@@ -158,25 +186,23 @@ class BlockManager:
         h.update(np.array(token_ids).tobytes())
         return h.intdigest()
 
-    def release_state_pins(self) -> None:
-        """Return the previous step's resume sources to the free list.
-
-        Called once per engine step before scheduling. A source is read by the
-        forward that was already issued when it is handed out again — read
-        directly under a fork, copied out of under a copy — and the next owner's
-        forward is issued after that one on the same stream, so stream ordering
-        covers the overlap either way.
-        """
+    def complete_previous_state_batch(self) -> None:
+        """Complete state reads and copies issued by the previous batch."""
         self.state.release_pins()
+        if self.paged_state_checkpoints is not None:
+            self.paged_state_checkpoints.complete_previous_batch()
 
-    def state_copies_for_batch(self) -> list[tuple[int, int]]:
-        """State copies the batch now being built has to issue before its
-        forward — checkpoints being kept and checkpoints being resumed from.
-
-        Must be called with the batch already decided; see
-        `StateGroupPool.take_copies`. Always empty for a forking backend.
-        """
-        return self.state.take_copies()
+    def take_state_maintenance_ops(self) -> StateMaintenanceOps:
+        """Drain state maintenance for the batch being built."""
+        relocations = self.state.take_relocations()
+        stores = restores = ()
+        if self.paged_state_checkpoints is not None:
+            stores, restores = self.paged_state_checkpoints.take_checkpoint_ops()
+        return StateMaintenanceOps(
+            relocations=relocations,
+            checkpoint_stores=stores,
+            checkpoint_restores=restores,
+        )
 
     def _record_evicted(self, h: int) -> None:
         """A hash the block pool just dropped: report it, and settle the state.
@@ -187,15 +213,73 @@ class BlockManager:
         Without this the state pool keeps handing groups to checkpoints nothing
         can reach and spends live ones to make room for them.
         """
+        self.total_evicted_blocks += 1
         if self._event_log is not None:
             self._event_log.append(_make_block_removed([h]))
-        self.state.unindex(h)
+        self._state_checkpoint_cache.unindex(h)
 
     def _fresh_block(self) -> int:
-        """Take a block for content this step is about to compute."""
+        """Take a block for content this step is about to compute.
+
+        The raise is unreachable through `Scheduler` and the checkpoint cache
+        cannot make it reachable: a READY unpinned checkpoint counts as
+        available, and both callers sit behind a pin-aware check in the same
+        pass. `allocate` protects the one checkpoint it is about to pin and
+        sees the pins taken before it; `may_append` runs only in a pass that
+        scheduled no prefill (`scheduler.py`, `if num_seqs_prefill > 0` returns
+        first), so every pin was already released at the top of that pass.
+        Under contention the reachable outcome is a refused admission, not
+        this.
+
+        That second half rests on prefill and decode never sharing a pass. If
+        the mixed batch that `scheduler.py` has a TODO for lands, `may_append`
+        starts running alongside this pass's pins and the argument has to be
+        redone.
+        """
+        if not self._ensure_page_units(1):
+            raise AssertionError("No PAGE unit available for a fresh KV block")
         block_id = self.kv.pop()
         self.kv.allocate(block_id)
         return block_id
+
+    def _checkpoint_has_room(
+        self, live_blocks: int = 0, protected_hash: int | None = None
+    ) -> bool:
+        """Whether an image still fits once `live_blocks` have been taken.
+
+        `live_blocks` is what the admission asking this is about to allocate.
+        Counting it is the difference between "there is room for an image" and
+        "there is room for this request and an image", and only the second is
+        the question: the request's blocks are taken first.
+
+        `protected_hash` is the checkpoint the same admission is about to pin,
+        excluded from what eviction could reclaim — the same argument
+        `can_allocate` passes to `_has_page_units` on the next line, so the
+        two gates in one pass agree on what is spendable.
+
+        `True` when no PAGE-backed checkpoints exist at all: a fork checkpoint
+        costs the pool nothing, so there is nothing to gate.
+        """
+        if self.paged_state_checkpoints is None:
+            return True
+        return self.paged_state_checkpoints.has_available_units(
+            live_blocks + self.paged_state_checkpoints.store.units_per_checkpoint,
+            protected_hash=protected_hash,
+        )
+
+    def _has_page_units(
+        self, count: int, protected_checkpoint_hash: int | None = None
+    ) -> bool:
+        if self.paged_state_checkpoints is None:
+            return self.kv.has_free(count)
+        return self.paged_state_checkpoints.has_available_units(
+            count, protected_hash=protected_checkpoint_hash
+        )
+
+    def _ensure_page_units(self, count: int) -> bool:
+        if self.paged_state_checkpoints is None:
+            return self.kv.has_free(count)
+        return self.paged_state_checkpoints.ensure_free_units(count)
 
     def _dcp_num_blocks(self, seq_len: int) -> int:
         if self.dcp_world_size <= 1:
@@ -203,20 +287,16 @@ class BlockManager:
         from atom.model_ops.dcp_ops import get_dcp_local_seq_lens
 
         local_len = get_dcp_local_seq_lens(
-            np.array([seq_len]), self.dcp_world_size, self.dcp_rank
+            np.array([seq_len]),
+            self.dcp_world_size,
+            self.dcp_rank,
+            self.cp_kv_cache_interleave_size,
         )[0]
         return int((local_len + self.block_size - 1) // self.block_size)
 
     def _effective_block_size(self):
         return self.block_size * self.dcp_world_size
 
-    # --- Prefix-cache block accounting granularity ---------------------------
-    # Under DCP one entry of `block_table` maps to a VIRTUAL block spanning
-    # `block_size * dcp_world_size` consecutive global tokens (each rank stores
-    # its `block_size` interleaved tokens in that physical block). So prefix
-    # cache hashing / reuse must be done per virtual block, not per physical
-    # block — otherwise the logical block index runs past the (dcp-shrunk)
-    # block_table. For dcp_world_size == 1 this reduces to the physical size.
     def _hash_block_size(self) -> int:
         return self.hash_block_size
 
@@ -275,6 +355,19 @@ class BlockManager:
                 break
         return boundary
 
+    def pool_occupancy(self) -> dict[str, int]:
+        used = self.kv.num_used
+        free = self.kv.num_free
+        hashed = self.kv.num_indexed
+        return {
+            "used": used,
+            "free": free,
+            "total": self.kv.num_blocks,
+            "hashed": hashed,
+            "retained": max(0, hashed - used),
+            "evicted_total": self.total_evicted_blocks,
+        }
+
     def can_allocate(self, seq: Sequence) -> int:
         """Return number of cache-hit blocks (>=0) if seq fits, else -1.
 
@@ -288,13 +381,11 @@ class BlockManager:
         Caller (scheduler) passes the returned hit count to `allocate()`,
         avoiding a second hash pass.
         """
-        # State cache (mamba / V4 compressor ring) has its own pre-allocated
-        # tensor; admission only needs a free slot index, not extra paged
-        # blocks. See `allocate()` for the budget reasoning.
+        # Active Slots are preallocated; PAGE checkpoints share the KV pool.
         if seq.has_per_req_cache and not self.state.has_free():
             return -1
         if not self.enable_prefix_caching:
-            if not self.kv.has_free(self._dcp_num_blocks(len(seq))):
+            if not self._has_page_units(self._dcp_num_blocks(len(seq))):
                 return -1
             return 0
         # Step 1: compressed prefix (CSA/HCA/indexer share the block hash and
@@ -329,19 +420,27 @@ class BlockManager:
         # the gates declined (compressed_hit - num_cached_blocks) from reuse
         # lost to compressed eviction (everything above compressed_hit).
         seq.num_compressed_hit_blocks = compressed_hit
-        self._record_checkpoint_demand(
-            seq,
-            hit=num_cached_blocks,
-            compressed_hit=compressed_hit,
-            block_hashes=block_hashes,
-        )
         # Free-pool demand: blocks we actually reuse minus those already used
         # (shared ref); blocks we drop from the hit become fresh → counted.
         num_new_blocks = self._n_hash_blocks(seq)
         for i in range(num_cached_blocks):
             if self.kv.is_used(self.kv.lookup(block_hashes[i])):
                 num_new_blocks -= 1
-        if not self.kv.has_free(num_new_blocks):
+        protected_hash = (
+            block_hashes[num_cached_blocks - 1] if num_cached_blocks else None
+        )
+        # After `num_new_blocks`, not before: the demand's room check has to
+        # account for what this very admission is about to take, or it reads a
+        # pool it then drains itself.
+        self._record_checkpoint_demand(
+            seq,
+            hit=num_cached_blocks,
+            compressed_hit=compressed_hit,
+            block_hashes=block_hashes,
+            live_blocks=num_new_blocks,
+            protected_hash=protected_hash,
+        )
+        if not self._has_page_units(num_new_blocks, protected_hash):
             return -1
         return num_cached_blocks
 
@@ -363,6 +462,9 @@ class BlockManager:
             block_id = self.kv.lookup(h)
             self.kv.claim(block_id)
             seq.block_table.append(block_id)
+        # Pin the restore before fresh blocks can evict its checkpoint.
+        if seq.has_per_req_cache and self.paged_state_checkpoints is not None:
+            self._attach_state_group(seq, h if num_cached_blocks > 0 else -1)
         for _ in range(num_cached_blocks, self._dcp_num_blocks(len(seq))):
             seq.block_table.append(self._fresh_block())
         seq.num_cached_tokens = num_cached_blocks * self._hash_block_size()
@@ -374,8 +476,10 @@ class BlockManager:
         # paged-block cost. The slot cap
         # (the state pool's free list, size = `max_num_seqs`) is the sole
         # admission bound for state cache.
-        if seq.has_per_req_cache:
+        if seq.has_per_req_cache and self.paged_state_checkpoints is None:
             self._attach_state_group(seq, h if num_cached_blocks > 0 else -1)
+        if seq.has_per_req_cache:
+            seq._state_initialized_after_alloc = False
 
     def _attach_state_group(self, seq: Sequence, hit_hash: int) -> None:
         """Give `seq` a state group, resuming from a checkpoint when one exists.
@@ -384,23 +488,30 @@ class BlockManager:
         start). `can_allocate` already shrank the hit to a boundary that carries
         a checkpoint, so a lookup miss here just means the pool is off.
 
-        Resuming shares: the checkpoint stays indexed and the request gets a
-        group of its own, so a second request hitting the same prefix still
-        finds it. How the state reaches that group is the backend's
-        `StateTransfer` — a fork reads the checkpoint for one forward, a copy is
-        handed the bytes — and the two differ by one line here. When no second
-        group is free the request adopts the checkpoint instead: still correct,
-        the state is exactly the one it wanted, it just spends the checkpoint
-        rather than sharing it, and under either mechanism it needs nothing.
+        PAGE checkpoints gather into a fresh slot; only fork checkpoints can
+        be adopted as request slots.
 
         A checkpoint is read-only, so several requests in one step may resume
         off the same one. The first takes it off the free list and the pin
-        covers every reader until `release_state_pins`; a later one in that same
-        step finds it already pinned and only needs a group to write into.
+        covers every reader until the previous state batch completes; a later
+        one in that step finds it pinned and only needs a group to write into.
         Adopting is then off the table — the pin means someone else's forward
         still has to read it, or copy out of it.
         """
-        src = self.state.lookup(hit_hash) if hit_hash != -1 else -1
+        if self.paged_state_checkpoints is not None:
+            dst = self.state.pop()
+            if hit_hash != -1 and not self.paged_state_checkpoints.begin_restore(
+                hit_hash, dst
+            ):
+                self.state.release(dst)
+                raise RuntimeError(
+                    "gated PAGE checkpoint disappeared before state attach"
+                )
+            seq.per_req_cache_group = dst
+            seq.state_fork_src = -1
+            return
+
+        src = self.state.lookup_group(hit_hash) if hit_hash != -1 else -1
         if src < 0:
             seq.per_req_cache_group = self.state.pop()
             seq.state_fork_src = -1
@@ -411,10 +522,7 @@ class BlockManager:
         if self.state.has_free():
             dst = self.state.pop()
             seq.per_req_cache_group = dst
-            if self.state.transfer.copies:
-                self.state.record_copy(src, dst)
-            else:
-                seq.state_fork_src = src
+            seq.state_fork_src = src
             # Held off the free list until the forward that reads it is issued.
             self.state.pin(src)
             return
@@ -425,6 +533,27 @@ class BlockManager:
         self.state.invalidate(src)
         seq.per_req_cache_group = src
         seq.state_fork_src = -1
+
+    def _chain_parent_hash(self, seq: Sequence, start: int) -> int | None:
+        """Return the chained hash of block ``start - 1``, or ``None`` on a gap.
+
+        All source paths (register_prefill_hashes, postprocess, offload wake)
+        are expected to hash blocks before this is called. A gap means a
+        source-level bug; callers skip the range rather than mint false hashes.
+        """
+        if start <= 0:
+            return -1
+        h = self.kv.block(seq.block_table[start - 1]).hash
+        if h != -1:
+            return h
+        logger.error(
+            "Unhashed parent block %d for seq %s — skipping hash "
+            "registration for blocks %d onward",
+            start - 1,
+            seq.id,
+            start,
+        )
+        return None
 
     def hash_blocks(
         self,
@@ -458,12 +587,17 @@ class BlockManager:
         base = seq.num_cached_tokens if start_tokens is None else start_tokens
         start = base // hbs
         end = (base + num_new_tokens) // hbs
+        # A finished or preempted seq has had its block table released; the
+        # deferred publish paths can still reach it with a stale token count.
+        end = min(end, len(seq.block_table))
         if start >= end:
+            return
+        h = self._chain_parent_hash(seq, start)
+        if h is None:
             return
         # Watermark for the decode-side continuation, maintained here so every
         # prefill path feeds it without knowing about it.
         seq.num_hashed_tokens = max(seq.num_hashed_tokens, end * hbs)
-        h = self.kv.block(seq.block_table[start - 1]).hash if start > 0 else -1
         record = self._event_log is not None
         store_run_parent: int | None = h if h != -1 else None
         store_run_hashes: list[int] = []
@@ -590,7 +724,13 @@ class BlockManager:
         return max(int((seq.num_prompt_tokens - room) // interval) * interval, 0)
 
     def _record_checkpoint_demand(
-        self, seq: Sequence, hit: int, compressed_hit: int, block_hashes: list[int]
+        self,
+        seq: Sequence,
+        hit: int,
+        compressed_hit: int,
+        block_hashes: list[int],
+        live_blocks: int,
+        protected_hash: int | None,
     ) -> None:
         """Ask the hit counterfactually, and turn the gap into a rung.
 
@@ -634,18 +774,45 @@ class BlockManager:
         # Zero interval switches the ladder off entirely — `checkpointers_at`
         # keeps nothing then, so a cut for a demand would buy nothing either.
         interval_on = self.state_checkpoint_interval_tokens > 0
-        previously_demanded = seq.checkpoint_demand_pos
-        seq.checkpoint_demand_pos = (
-            wanted * self.hash_block_size if interval_on and wanted > hit else 0
-        )
-        # `can_allocate` re-runs for a sequence the queue keeps deferring, so
-        # count the demand when it first appears rather than once per attempt —
-        # otherwise one request under pressure inflates the denominator the
-        # convergence check above is read against. `deallocate` clears the
-        # field, so a re-admitted request does count again, which it should.
-        self.demands_recorded += bool(seq.checkpoint_demand_pos) and not (
-            previously_demanded
-        )
+        demand = wanted * self.hash_block_size if interval_on and wanted > hit else 0
+        # A demand is an instruction to cut a prefill chunk onto a rung, and
+        # that cut costs the request a forward. Buying one for a store
+        # `begin_store` is about to refuse is the only part of this funnel
+        # that is pure loss — the attribution above stays either way, because
+        # the reuse really was declined for want of a checkpoint.
+        #
+        # Asked afresh on every attempt, because that is the question: a
+        # demand recorded while the pool had room is not still affordable once
+        # it does not, and letting the earlier answer stand is exactly the cut
+        # this gate exists to withhold. What must not repeat is the *counting*,
+        # which is why the seq carries its own marker rather than the gate
+        # reading the position it is about to overwrite.
+        #
+        # Asked with this admission's own blocks included, because they are
+        # taken first: a pool with room for an image but not for the request
+        # *and* the image would answer yes here and refuse at `begin_store`,
+        # with the cut already bought and the funnel showing nothing.
+        #
+        # It is still a sample. The store happens many forwards later, at the
+        # rung this cut creates, against a pool that has moved since — no
+        # question asked here can be the one `begin_store` asks. What this
+        # gate removes is the loss that was knowable at admission;
+        # `checkpoints_dropped` is what counts the rest, and the two are meant
+        # to be read together.
+        if demand and not self._checkpoint_has_room(live_blocks, protected_hash):
+            self.demands_declined_no_room += not seq.checkpoint_demand_declined
+            seq.checkpoint_demand_declined = True
+            demand = 0
+        seq.checkpoint_demand_pos = demand
+        # Counted when the demand first appears rather than once per attempt —
+        # otherwise one deferred request inflates the denominator the
+        # convergence check above is read against. A separate marker from the
+        # decline above: a decline zeroes the position, so the position alone
+        # would let a recorded demand be counted twice the next time the pool
+        # has room.
+        if demand:
+            self.demands_recorded += not seq.checkpoint_demand_counted
+            seq.checkpoint_demand_counted = True
 
     def checkpoint_cut(self, seq: Sequence, start: int, end: int) -> int:
         """Latest ladder position in `(start, end]`, or 0 if there is none.
@@ -688,8 +855,9 @@ class BlockManager:
         """
         return {
             "demands_recorded": self.demands_recorded,
+            "demands_declined_no_room": self.demands_declined_no_room,
             "chunks_cut_for_demand": self.chunks_cut_for_demand,
-        } | self.state.checkpoint_fates()
+        } | self._state_checkpoint_cache.checkpoint_fates()
 
     def checkpointers_at(
         self,
@@ -825,19 +993,9 @@ class BlockManager:
             )
             return 0
 
-        if start_block == 0:
-            parent_hash = -1
-        else:
-            parent = self.kv.block(seq.block_table[start_block - 1])
-            if parent.hash == -1:
-                logger.warning(
-                    "Cannot publish offload prefix without indexed parent: "
-                    "seq=%s start_block=%d",
-                    seq.id,
-                    start_block,
-                )
-                return 0
-            parent_hash = parent.hash
+        parent_hash = self._chain_parent_hash(seq, start_block)
+        if parent_hash is None:
+            return 0
 
         indexed_tokens = 0
         for i in range(start_block, end_block):
@@ -892,6 +1050,36 @@ class BlockManager:
 
         return indexed_tokens
 
+    def register_received_prefix(self, seq: Sequence) -> int:
+        """Hash received prompt blocks into the prefix cache so subsequent
+        turns can match them locally and transfer only the delta.
+
+        Only whole blocks are registered; trailing partial block left unhashed
+        (matches ``hash_blocks``). Returns the number of blocks hashed.
+        """
+        if not self.enable_prefix_caching:
+            return 0
+        num_full = seq.num_prompt_tokens // self.block_size
+        num_full = min(num_full, len(seq.block_table))
+        h = -1
+        for i in range(num_full):
+            token_ids = seq.block(i)
+            h = self.compute_hash(token_ids, h)
+            block_id = seq.block_table[i]
+            block = self.kv.block(block_id)
+            indexed_block_id = self.kv.lookup(h)
+            if indexed_block_id == -1:
+                self.kv.publish(block_id, h, token_ids)
+            else:
+                indexed_block = self.kv.block(indexed_block_id)
+                if indexed_block.token_ids != token_ids:
+                    raise RuntimeError(
+                        "Hash collision while registering received prefix: "
+                        f"seq={seq.id} block={block_id} indexed={indexed_block_id}"
+                    )
+                block.update(h, token_ids)
+        return num_full
+
     def deallocate(self, seq: Sequence):
         for block_id in reversed(seq.block_table):
             self.kv.free(block_id)
@@ -900,20 +1088,19 @@ class BlockManager:
         # Covers preemption too, which frees through here and re-prefills.
         seq.num_hashed_tokens = 0
         # Likewise the demand: it describes one admission against one cache
-        # state, and a re-admitted seq gets a fresh answer from `can_allocate`.
+        # state, and a re-admitted seq gets a fresh answer from `can_allocate`
+        # — including a fresh place in both funnel counters.
         seq.checkpoint_demand_pos = 0
+        seq.checkpoint_demand_counted = False
+        seq.checkpoint_demand_declined = False
         seq.last_checkpoint_pos = 0
         # An uncommitted checkpoint describes state in a group that is about to
         # go back on the free list, so the intent dies with it.
-        self.state.forget_pending(seq)
+        if self.paged_state_checkpoints is not None:
+            self.paged_state_checkpoints.forget_pending(seq)
         seq.block_table.clear()
         if seq.has_per_req_cache and seq.per_req_cache_group >= 0:
-            # Only the group the seq was writing. A checkpoint it took is
-            # already back on the free list under the state index; the source
-            # it was going to fork off is dropped here rather than left to
-            # `release_state_pins`, because the forward that owed the read is
-            # not going to happen and the group should not sit out a pass for
-            # a reader that no longer exists.
+            # No next forward will read a pending fork source after deallocation.
             self.state.release(seq.per_req_cache_group)
             self.state.drop_reader(seq.state_fork_src)
             seq.per_req_cache_group = -1
@@ -925,7 +1112,7 @@ class BlockManager:
         ebs = self._effective_block_size()
         needed_blocks = (seq_len + num_new_tokens + ebs - 1) // ebs
         new_blocks_needed = max(0, needed_blocks - current_blocks)
-        return self.kv.has_free(new_blocks_needed)
+        return self._has_page_units(new_blocks_needed)
 
     def may_append(self, seq: Sequence, num_new_tokens: int = 1):
         # Note: in disaggregated (P/D) mode the scheduler skips this call on
@@ -960,6 +1147,7 @@ class BlockManager:
         they remain valid via their block_table refs, just unhashable for
         future requests."""
         self.kv.clear_index()
+        self._state_checkpoint_cache.clear_index()
         if self._event_log is not None:
             self._event_log.append(_make_all_cleared())
 

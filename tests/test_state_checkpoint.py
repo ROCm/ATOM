@@ -8,10 +8,9 @@
 # it, a hit hands the resumed forward a group straight off the free list and it
 # reads the previous occupant's state.
 #
-# Capacity model under test: a checkpoint is a FREE group whose content is
-# still valid (the KV block pool's lazy eviction, applied to state groups). So
-# checkpoints must never reduce the number of admissible requests, and the
-# eviction event is hand-out, not free.
+# Fork-transfer checkpoints are FREE groups whose content is still valid.
+# Copy-transfer checkpoints are immutable PAGE-unit images; Active Slots are
+# reserved only for resident requests and never serve as checkpoint backing.
 
 from math import inf, isinf
 from types import SimpleNamespace
@@ -20,13 +19,30 @@ import pytest
 from conftest import MockConfig
 
 from atom.model_engine.block_manager import BlockManager
+from atom.model_engine.block_pool import BlockPool
+from atom.model_engine.page_unit_checkpoint import (
+    PagedStateCheckpointCoordinator,
+    PagedStateCheckpointSpec,
+)
 from atom.model_engine.scheduler import CacheStats, ScheduledBatchOutput, Scheduler
 from atom.model_engine.sequence import Sequence, SequenceType
 from atom.model_engine.state_cache import StateCache
-from atom.model_engine.state_pool import StateGroupPool, StateTransfer
+from atom.model_engine.state_pool import StateGroupPool
+from atom.model_engine.state_runtime import (
+    StateRuntime,
+    StateTransfer,
+)
 
 BLOCK = 4
 MIN_FORK = 8
+PAGED_COPY_SPEC = PagedStateCheckpointSpec(10, 25, "test-layout-v1", image_bytes=25)
+DEFAULT_STATE_TRANSFER = StateTransfer.fork(MIN_FORK)
+PAGED_COPY_TRANSFER = StateTransfer.copy(PAGED_COPY_SPEC.layout_id)
+DEFAULT_STATE_RUNTIME = StateRuntime(transfer=DEFAULT_STATE_TRANSFER)
+PAGED_COPY_RUNTIME = StateRuntime(
+    transfer=PAGED_COPY_TRANSFER,
+    checkpoint_spec=PAGED_COPY_SPEC,
+)
 
 
 def ckpt_config(**overrides):
@@ -43,12 +59,32 @@ def ckpt_config(**overrides):
         "scheduler_delay_factor": 0.0,
         "speculative_config": None,
         "pool_entries": {"state": 4},
-        "state_transfer_kind": "fork",
-        "state_fork_tokens": MIN_FORK,
         "state_checkpoint_interval_tokens": BLOCK,
     }
     defaults.update(overrides)
     return MockConfig(**defaults)
+
+
+def make_block_manager(
+    config,
+    *,
+    state_runtime=DEFAULT_STATE_RUNTIME,
+):
+    return BlockManager(
+        config,
+        state_runtime=state_runtime,
+    )
+
+
+def make_scheduler(
+    config,
+    *,
+    state_runtime=DEFAULT_STATE_RUNTIME,
+):
+    return Scheduler(
+        config,
+        state_runtime=state_runtime,
+    )
 
 
 def stateful_seq(token_ids):
@@ -84,10 +120,10 @@ def publisher_has_read_its_source(bm: BlockManager) -> None:
     reading and writing it at once.
 
     Tests about a resumer, not about the publisher, step over that here rather
-    than each spelling out two `release_state_pins` calls.
+    than each spelling out two lifecycle calls.
     """
-    bm.release_state_pins()
-    bm.release_state_pins()
+    bm.complete_previous_state_batch()
+    bm.complete_previous_state_batch()
 
 
 def run_prompt_on_the_ladder(bm: BlockManager, seq: Sequence) -> list[int]:
@@ -135,7 +171,7 @@ class TestPoolIndex:
     def test_disabled_is_identity(self):
         pool = StateGroupPool(0)
         assert pool.resumable_hit(idx_seq(), 5, [1, 2, 3, 4, 5]) == 5
-        assert pool.lookup(1) == -1
+        assert pool.lookup_group(1) == -1
 
     def test_resumable_hit_picks_rightmost_checkpoint(self):
         pool = StateGroupPool(4, StateTransfer.fork(1), hash_block_size=1)
@@ -161,20 +197,20 @@ class TestPoolIndex:
         pool = StateGroupPool(4)
         pool._index(10, 2)
         pool.invalidate(2)
-        assert pool.lookup(10) == -1
+        assert pool.lookup_group(10) == -1
         # A later invalidate of the same group must not delete a new tenant.
         pool._index(10, 3)
         pool.invalidate(2)
-        assert pool.lookup(10) == 3
+        assert pool.lookup_group(10) == 3
 
     def test_republishing_a_hash_orphans_the_old_group(self):
         pool = StateGroupPool(4)
         pool._index(10, 1)
         pool._index(10, 2)
-        assert pool.lookup(10) == 2
+        assert pool.lookup_group(10) == 2
         # Group 1 no longer backs hash 10; invalidating it leaves 2 indexed.
         pool.invalidate(1)
-        assert pool.lookup(10) == 2
+        assert pool.lookup_group(10) == 2
 
     def test_pins_drain_once(self):
         pool = StateGroupPool(4)
@@ -219,7 +255,7 @@ class TestFreeListHalves:
         pool.release(1)
 
         assert pool.pop() == 1
-        assert pool.lookup(10) == 0
+        assert pool.lookup_group(10) == 0
 
     def test_admission_packs_towards_index_zero(self):
         pool = StateGroupPool(4)
@@ -255,7 +291,7 @@ class TestFreeListHalves:
         pool.release_pins()
 
         assert pool.pop() == 1  # 11 is now the older of the two
-        assert pool.lookup(10) == 0
+        assert pool.lookup_group(10) == 0
 
     def test_republishing_a_hash_returns_the_orphan_to_the_vacant_half(self):
         pool = StateGroupPool(4)
@@ -266,7 +302,7 @@ class TestFreeListHalves:
         pool._index(10, 1)  # group 0 no longer backs anything
 
         assert pool.pop() == 0  # vacant again, so it goes before the checkpoint
-        assert pool.lookup(10) == 1
+        assert pool.lookup_group(10) == 1
 
 
 class TestShrinking:
@@ -307,8 +343,8 @@ class TestShrinking:
 
         assert out.retired == 3 and out.held_checkpoint
         assert out.relocated_to == 0
-        assert pool.lookup(13) == 0  # the hot one survived, at a new address
-        assert pool.lookup(10) == -1  # the cold one is what we spent
+        assert pool.lookup_group(13) == 0  # the hot one survived, at a new address
+        assert pool.lookup_group(10) == -1  # the cold one is what we spent
         assert pool.num_groups == 3
 
     def test_the_top_is_spent_when_it_is_itself_the_oldest(self):
@@ -319,7 +355,7 @@ class TestShrinking:
 
         out = pool.retire_top()
         assert (out.retired, out.relocated_to, out.held_checkpoint) == (1, -1, True)
-        assert pool.lookup(13) == -1
+        assert pool.lookup_group(13) == -1
 
     def test_a_pinned_top_is_refused_rather_than_moved(self):
         """It is being read by the in-flight step; the pin drains next pass."""
@@ -370,7 +406,7 @@ class TestShrinking:
         drain(pool)
         pool.release(2)
         pool._index(12, 2)
-        assert pool.lookup(12) == 2
+        assert pool.lookup_group(12) == 2
 
 
 # ── BlockManager: the hit is shrunk to a resumable boundary ────────────────
@@ -380,7 +416,7 @@ class TestHitShrink:
 
     def test_hit_is_zero_without_a_checkpoint(self):
         """The correctness fix: a stateful model cannot resume a bare KV hit."""
-        bm = BlockManager(ckpt_config())
+        bm = make_block_manager(ckpt_config())
         first = stateful_seq(list(range(40)))
         run_prompt(bm, first)
         # Same prompt again: compressed blocks are all cached, but the first
@@ -390,10 +426,9 @@ class TestHitShrink:
         assert second.num_compressed_hit_blocks > 0
 
     def test_stateless_model_keeps_the_full_hit(self):
-        bm = BlockManager(
-            ckpt_config(
-                pool_entries={}, state_transfer_kind="none", state_fork_tokens=0
-            )
+        bm = make_block_manager(
+            ckpt_config(pool_entries={}),
+            state_runtime=StateRuntime(),
         )
         first = Sequence(list(range(40)), BLOCK, has_per_req_cache=False)
         run_prompt(bm, first)
@@ -402,7 +437,7 @@ class TestHitShrink:
         assert bm.can_allocate(second) == 9
 
     def test_hit_lands_on_the_published_boundary(self):
-        bm = BlockManager(ckpt_config())
+        bm = make_block_manager(ckpt_config())
         first = stateful_seq(list(range(40)))
         publish_at_boundary(bm, first)
         boundary = bm.checkpoint_limit(first)
@@ -411,10 +446,10 @@ class TestHitShrink:
         assert bm.can_allocate(second) * bm.hash_block_size == boundary
 
     def test_resume_reads_the_checkpoint_and_writes_a_fresh_group(self):
-        bm = BlockManager(ckpt_config())
+        bm = make_block_manager(ckpt_config())
         first = stateful_seq(list(range(40)))
         h = publish_at_boundary(bm, first)
-        src = bm.state.lookup(h)
+        src = bm.state.lookup_group(h)
         assert src >= 0
 
         second = stateful_seq(list(range(40)))
@@ -422,7 +457,7 @@ class TestHitShrink:
         assert second.state_fork_src == src
         assert second.per_req_cache_group != src
         # The checkpoint survives the resume, so a third request still finds it.
-        assert bm.state.lookup(h) == src
+        assert bm.state.lookup_group(h) == src
 
 
 # ── Capacity: checkpoints live on the free list, never hold it back ────────
@@ -432,7 +467,7 @@ class TestCapacity:
 
     def test_checkpoints_do_not_reduce_admission(self):
         """A published checkpoint is a free group; concurrency is unchanged."""
-        bm = BlockManager(ckpt_config())
+        bm = make_block_manager(ckpt_config())
         for i in range(4):
             seq = stateful_seq(list(range(100 * i, 100 * i + 20 + 4 * i)))
             publish_at_boundary(bm, seq)
@@ -449,10 +484,10 @@ class TestCapacity:
         assert bm.state.num_free() == 0
 
     def test_handout_evicts_the_checkpoint_it_lands_on(self):
-        bm = BlockManager(ckpt_config())
+        bm = make_block_manager(ckpt_config())
         first = stateful_seq(list(range(40)))
         h = publish_at_boundary(bm, first)
-        group = bm.state.lookup(h)
+        group = bm.state.lookup_group(h)
         bm.deallocate(first)
         # Drain the queue until the checkpoint's group comes back around.
         while bm.state.has_free():
@@ -460,16 +495,16 @@ class TestCapacity:
             bm.allocate(seq, 0)
             if seq.per_req_cache_group == group:
                 break
-        assert bm.state.lookup(h) == -1
+        assert bm.state.lookup_group(h) == -1
 
     def test_resume_without_a_spare_group_adopts_the_checkpoint(self):
         # Two groups: the publisher keeps one, so the only free group when the
         # resume arrives is the checkpoint itself.
-        bm = BlockManager(ckpt_config(pool_entries={"state": 2}))
+        bm = make_block_manager(ckpt_config(pool_entries={"state": 2}))
         first = stateful_seq(list(range(40)))
         h = publish_at_boundary(bm, first)
         publisher_has_read_its_source(bm)
-        group = bm.state.lookup(h)
+        group = bm.state.lookup_group(h)
         assert bm.state.num_free() == 1
 
         second = stateful_seq(list(range(40)))
@@ -478,7 +513,7 @@ class TestCapacity:
         # still exactly the state it wanted, just no longer shareable.
         assert second.per_req_cache_group == group
         assert second.state_fork_src == -1
-        assert bm.state.lookup(h) == -1
+        assert bm.state.lookup_group(h) == -1
 
 
 # ── Fork lifecycle ─────────────────────────────────────────────────────────
@@ -487,7 +522,7 @@ class TestCapacity:
 class TestForkLifecycle:
 
     def test_publish_moves_the_writer_to_a_new_group(self):
-        bm = BlockManager(ckpt_config())
+        bm = make_block_manager(ckpt_config())
         seq = stateful_seq(list(range(40)))
         hit = bm.can_allocate(seq)
         bm.allocate(seq, hit)
@@ -496,10 +531,10 @@ class TestForkLifecycle:
         bm.hash_blocks(seq, boundary - seq.num_cached_tokens)
         assert seq.per_req_cache_group != before
         assert seq.state_fork_src == before
-        assert bm.state.lookup(boundary_hash(bm, seq)) == before
+        assert bm.state.lookup_group(boundary_hash(bm, seq)) == before
 
     def test_no_publish_when_the_forward_misses_the_boundary(self):
-        bm = BlockManager(ckpt_config())
+        bm = make_block_manager(ckpt_config())
         seq = stateful_seq(list(range(40)))
         bm.allocate(seq, bm.can_allocate(seq))
         group = seq.per_req_cache_group
@@ -508,14 +543,14 @@ class TestForkLifecycle:
         assert not bm.state.hash_to_group
 
     def test_boundary_leaves_room_for_the_fork_forward(self):
-        bm = BlockManager(ckpt_config())
+        bm = make_block_manager(ckpt_config())
         seq = stateful_seq(list(range(40)))
         boundary = bm.checkpoint_limit(seq)
         assert boundary % bm.hash_block_size == 0
         assert seq.num_prompt_tokens - boundary >= MIN_FORK
 
     def test_every_block_boundary_up_to_the_limit_qualifies(self):
-        bm = BlockManager(ckpt_config())
+        bm = make_block_manager(ckpt_config())
         seq = stateful_seq(list(range(40)))
         limit = bm.checkpoint_limit(seq)
         assert bm.checkpointers_at(seq, BLOCK)
@@ -526,7 +561,7 @@ class TestForkLifecycle:
 
     def test_chunked_prefill_leaves_a_ladder_of_checkpoints(self):
         """Intermediate boundaries publish too — the CPU-offload resume points."""
-        bm = BlockManager(ckpt_config())
+        bm = make_block_manager(ckpt_config())
         seq = stateful_seq(list(range(40)))
         bm.allocate(seq, bm.can_allocate(seq))
         for _ in range(4):
@@ -534,16 +569,16 @@ class TestForkLifecycle:
             # the next forward, and that forward is what lets the group go.
             # Without the boundary four publishes would hold four sources at
             # once and the pool would run out mid-ladder.
-            bm.release_state_pins()
+            bm.complete_previous_state_batch()
             bm.hash_blocks(seq, 2 * BLOCK, start_tokens=seq.num_cached_tokens)
             seq.num_cached_tokens += 2 * BLOCK
         # Four publishes into four groups: the oldest was recycled to serve the
         # last one, the rest stand as distinct resume points.
         assert len(bm.state.hash_to_group) == 3
-        assert bm.state.lookup(boundary_hash(bm, seq)) >= 0  # the rightmost one
+        assert bm.state.lookup_group(boundary_hash(bm, seq)) >= 0
 
     def test_interval_thins_the_ladder(self):
-        bm = BlockManager(ckpt_config(state_checkpoint_interval_tokens=3 * BLOCK))
+        bm = make_block_manager(ckpt_config(state_checkpoint_interval_tokens=3 * BLOCK))
         seq = stateful_seq(list(range(40)))
         limit = bm.checkpoint_limit(seq)
         published = [
@@ -557,7 +592,7 @@ class TestForkLifecycle:
         assert published == [3 * BLOCK, 6 * BLOCK]
 
     def test_interval_zero_publishes_nothing(self):
-        bm = BlockManager(ckpt_config(state_checkpoint_interval_tokens=0))
+        bm = make_block_manager(ckpt_config(state_checkpoint_interval_tokens=0))
         seq = stateful_seq(list(range(40)))
         assert bm.checkpoint_limit(seq) == 0
         assert not any(bm.checkpointers_at(seq, pos) for pos in range(BLOCK, 40, BLOCK))
@@ -569,7 +604,7 @@ class TestForkLifecycle:
         request on a short-prompt workload pays an extra forward for a
         checkpoint nothing will ever hit.
         """
-        bm = BlockManager(ckpt_config(state_checkpoint_interval_tokens=8 * BLOCK))
+        bm = make_block_manager(ckpt_config(state_checkpoint_interval_tokens=8 * BLOCK))
         seq = stateful_seq(list(range(30)))  # 30 < 8 * BLOCK
         assert bm.checkpoint_limit(seq) == 0
         run_prompt(bm, seq)
@@ -586,11 +621,11 @@ class TestForkLifecycle:
         alternative the pool used to take — refusing to construct — turned a
         block-size choice into a startup failure naming a flag nobody set.
         """
-        bm = BlockManager(ckpt_config(state_checkpoint_interval_tokens=BLOCK + 1))
+        bm = make_block_manager(ckpt_config(state_checkpoint_interval_tokens=BLOCK + 1))
         assert bm.state_checkpoint_interval_tokens == BLOCK
         # Below one block there is no reachable rung at all, so the ladder is
         # off rather than snapped to something unusable.
-        bm = BlockManager(ckpt_config(state_checkpoint_interval_tokens=BLOCK - 1))
+        bm = make_block_manager(ckpt_config(state_checkpoint_interval_tokens=BLOCK - 1))
         assert bm.state_checkpoint_interval_tokens == 0
 
     def test_hit_never_lands_where_swa_cannot_follow(self):
@@ -601,7 +636,7 @@ class TestForkLifecycle:
         somewhere SWA never approved, and `allocate` would then claim an SWA
         hash the pool never promised.
         """
-        bm = BlockManager(ckpt_config())
+        bm = make_block_manager(ckpt_config())
         seq = stateful_seq(list(range(40)))
         published = [2, 5]  # checkpoint boundaries, in blocks
 
@@ -620,13 +655,16 @@ class TestForkLifecycle:
         assert bm._gated_hit(seq, 9, hashes) == 2
 
     def test_no_boundary_when_the_backend_cannot_fork(self):
-        bm = BlockManager(ckpt_config(state_transfer_kind="none", state_fork_tokens=0))
+        bm = make_block_manager(
+            ckpt_config(),
+            state_runtime=StateRuntime(),
+        )
         seq = stateful_seq(list(range(40)))
         assert bm.checkpoint_limit(seq) == 0
         assert not bm.checkpointers_at(seq, 16)
 
     def test_cancel_adopts_the_source_and_returns_the_new_group(self):
-        bm = BlockManager(ckpt_config())
+        bm = make_block_manager(ckpt_config())
         seq = stateful_seq(list(range(40)))
         bm.allocate(seq, bm.can_allocate(seq))
         source = seq.per_req_cache_group
@@ -647,9 +685,9 @@ class TestForkLifecycle:
         # A checkpoint is read-only, so a second request hitting the same prefix
         # before the pins are released must fork off it too — not try to claim a
         # group the first one already took off the free list.
-        bm = BlockManager(ckpt_config(pool_entries={"state": 8}))
+        bm = make_block_manager(ckpt_config(pool_entries={"state": 8}))
         first = stateful_seq(list(range(40)))
-        src = bm.state.lookup(publish_at_boundary(bm, first))
+        src = bm.state.lookup_group(publish_at_boundary(bm, first))
         publisher_has_read_its_source(bm)
 
         resumers = [stateful_seq(list(range(40))) for _ in range(3)]
@@ -664,13 +702,13 @@ class TestForkLifecycle:
         assert src not in groups
         # However many read it, the group goes back exactly once.
         before = bm.state.num_free()
-        bm.release_state_pins()
+        bm.complete_previous_state_batch()
         assert bm.state.num_free() == before + 1
 
     def test_cancel_refuses_to_adopt_a_shared_source(self):
-        bm = BlockManager(ckpt_config())
+        bm = make_block_manager(ckpt_config())
         first = stateful_seq(list(range(40)))
-        src = bm.state.lookup(publish_at_boundary(bm, first))
+        src = bm.state.lookup_group(publish_at_boundary(bm, first))
         publisher_has_read_its_source(bm)
 
         sharers = [stateful_seq(list(range(40))) for _ in range(2)]
@@ -687,9 +725,9 @@ class TestForkLifecycle:
         assert sharers[1].per_req_cache_group == src
 
     def test_cancel_of_a_resume_releases_the_pin(self):
-        bm = BlockManager(ckpt_config())
+        bm = make_block_manager(ckpt_config())
         first = stateful_seq(list(range(40)))
-        src = bm.state.lookup(publish_at_boundary(bm, first))
+        src = bm.state.lookup_group(publish_at_boundary(bm, first))
         publisher_has_read_its_source(bm)
 
         second = stateful_seq(list(range(40)))
@@ -699,18 +737,18 @@ class TestForkLifecycle:
         assert second.per_req_cache_group == src
         assert not bm.state.is_pinned(src)
         # The pin must not also hand the group back — it has an owner now.
-        bm.release_state_pins()
+        bm.complete_previous_state_batch()
         assert not bm.state.is_free(src)
 
     def test_pinned_source_returns_to_the_free_list_next_step(self):
-        bm = BlockManager(ckpt_config())
+        bm = make_block_manager(ckpt_config())
         first = stateful_seq(list(range(40)))
-        src = bm.state.lookup(publish_at_boundary(bm, first))
+        src = bm.state.lookup_group(publish_at_boundary(bm, first))
         publisher_has_read_its_source(bm)
         second = stateful_seq(list(range(40)))
         bm.allocate(second, bm.can_allocate(second))
         assert not bm.state.is_free(src)
-        bm.release_state_pins()
+        bm.complete_previous_state_batch()
         assert bm.state.is_free(src)
 
     def test_a_published_source_is_not_handed_out_before_its_reader_runs(self):
@@ -722,19 +760,19 @@ class TestForkLifecycle:
         free list during the very pass that admits the requests which could pop
         it, and then one kernel reads and writes it at once.
         """
-        bm = BlockManager(ckpt_config())
+        bm = make_block_manager(ckpt_config())
         first = stateful_seq(list(range(40)))
-        src = bm.state.lookup(publish_at_boundary(bm, first))
+        src = bm.state.lookup_group(publish_at_boundary(bm, first))
         assert first.state_fork_src == src
 
         assert not bm.state.is_free(src)  # the pass that admits cannot get it
-        bm.release_state_pins()  # the batch carrying the fork is built
+        bm.complete_previous_state_batch()  # the batch carrying the fork is built
         assert not bm.state.is_free(src)  # its forward has not been issued yet
-        bm.release_state_pins()  # it has now
+        bm.complete_previous_state_batch()  # it has now
         assert bm.state.is_free(src)
         # And it comes back as a checkpoint, at the LRU tail — publishing is
         # not what spends it.
-        assert bm.state.lookup(bm.state.group_hash[src]) == src
+        assert bm.state.lookup_group(bm.state.group_hash[src]) == src
 
     def test_a_finished_publisher_gives_its_source_back_at_once(self):
         """Nobody is left to read it, so the clock should not hold it.
@@ -742,11 +780,11 @@ class TestForkLifecycle:
         This is what keeps publishing capacity-neutral for the common shape —
         a request that crosses a rung and then finishes or is preempted.
         """
-        bm = BlockManager(ckpt_config())
+        bm = make_block_manager(ckpt_config())
         first = stateful_seq(list(range(40)))
         whole = bm.state.num_free()  # nothing handed out yet
         h = publish_at_boundary(bm, first)
-        src = bm.state.lookup(h)
+        src = bm.state.lookup_group(h)
         assert not bm.state.is_free(src)
 
         bm.deallocate(first)
@@ -754,7 +792,7 @@ class TestForkLifecycle:
         # Source and write group both back: the pool is whole again, without
         # waiting out the two passes the clock would have taken.
         assert bm.state.num_free() == whole
-        assert bm.state.lookup(h) == src  # the checkpoint itself survives
+        assert bm.state.lookup_group(h) == src
 
 
 class TestCheckpointsDieWithTheirPrefix:
@@ -768,15 +806,15 @@ class TestCheckpointsDieWithTheirPrefix:
     """
 
     def test_evicting_the_block_frees_the_checkpoint_group(self):
-        bm = BlockManager(ckpt_config())
+        bm = make_block_manager(ckpt_config())
         first = stateful_seq(list(range(40)))
         h = publish_at_boundary(bm, first)
         publisher_has_read_its_source(bm)
-        src = bm.state.lookup(h)
+        src = bm.state.lookup_group(h)
         assert bm.state.holds_checkpoint(src)
 
         bm._record_evicted(h)
-        assert bm.state.lookup(h) == -1
+        assert bm.state.lookup_group(h) == -1
         assert bm.state.is_free(src)
         assert not bm.state.holds_checkpoint(src)  # vacant, spent before live ones
         assert bm.state.checkpoint_fates()["checkpoints_orphaned"] == 1
@@ -791,13 +829,13 @@ class TestCheckpointsDieWithTheirPrefix:
 
         pool.unindex(10)  # group 0's prefix is gone
         assert pool.pop() == 0
-        assert pool.lookup(11) == 1
+        assert pool.lookup_group(11) == 1
 
     def test_unindex_of_an_unknown_hash_is_a_no_op(self):
         pool = StateGroupPool(4)
         pool._index(10, 0)
-        assert pool.unindex(999) == -1
-        assert pool.lookup(10) == 0
+        pool.unindex(999)
+        assert pool.lookup_group(10) == 0
         assert pool.checkpoint_fates()["checkpoints_orphaned"] == 0
 
 
@@ -812,12 +850,12 @@ class TestPrefillChunkAlignment:
     """
 
     def test_prompt_shorter_than_the_interval_is_not_cut(self):
-        sched = Scheduler(ckpt_config(state_checkpoint_interval_tokens=8 * BLOCK))
+        sched = make_scheduler(ckpt_config(state_checkpoint_interval_tokens=8 * BLOCK))
         seq = stateful_seq(list(range(30)))  # 30 < 8 * BLOCK
         assert sched._finalize_prefill_chunk(seq, 0, 30) == 30
 
     def test_chunk_stops_at_the_rung(self):
-        sched = Scheduler(ckpt_config(state_checkpoint_interval_tokens=3 * BLOCK))
+        sched = make_scheduler(ckpt_config(state_checkpoint_interval_tokens=3 * BLOCK))
         seq = stateful_seq(list(range(40)))
         limit = sched.block_manager.checkpoint_limit(seq)
         assert limit == 24
@@ -830,225 +868,247 @@ class TestPrefillChunkAlignment:
         assert sched._finalize_prefill_chunk(seq, limit, 16) == 16
 
 
-# ── Copy lifecycle ─────────────────────────────────────────────────────────
+# ── PAGE-backed copy lifecycle ─────────────────────────────────────────────
 
 
-def copy_config(**overrides):
-    """A backend whose state is one byte range: it checkpoints by copying."""
-    overrides.setdefault("state_transfer_kind", "copy")
-    overrides.setdefault("state_fork_tokens", 0)
+def paged_copy_config(**overrides):
     return ckpt_config(**overrides)
 
 
-class TestCopyLifecycle:
-    """The other half of the protocol: a duplicate goes to the index.
-
-    Everything the fork binds — a successor forward long enough to refill the
-    replacement, and therefore a boundary with room behind it — is gone. What
-    replaces it is a deferral: the bytes need a forward to move them, so the
-    index entry cannot appear until the copy has been scheduled.
-    """
-
+class TestPagedCopyCheckpoint:
     def _admitted(self, bm, tokens=None):
         seq = stateful_seq(tokens or list(range(40)))
         bm.allocate(seq, bm.can_allocate(seq))
         return seq
 
-    def test_the_owner_is_not_disturbed(self):
-        bm = BlockManager(copy_config())
-        seq = self._admitted(bm)
-        group = seq.per_req_cache_group
-        bm.hash_blocks(seq, bm.checkpoint_limit(seq) - seq.num_cached_tokens)
-        # No hand-over: the group and the read slot are exactly as they were.
-        assert seq.per_req_cache_group == group
-        assert seq.state_fork_src == -1
-        assert seq.pending_checkpoint != -1
-        # And nothing is claimable yet — the bytes do not exist.
-        assert not bm.state.hash_to_group
+    def test_allocate_resets_live_slot_readiness(self):
+        bm = make_block_manager(
+            paged_copy_config(),
+            state_runtime=PAGED_COPY_RUNTIME,
+        )
+        seq = stateful_seq(list(range(40)))
+        seq._state_initialized_after_alloc = True
 
-    def test_the_next_batch_turns_it_into_a_pair(self):
-        bm = BlockManager(copy_config())
+        bm.allocate(seq, bm.can_allocate(seq))
+
+        assert seq._state_initialized_after_alloc is False
+
+    def test_validated_runtime_is_explicit_from_wire_through_block_manager(self):
+        config = paged_copy_config()
+        engine_runtime = StateRuntime.from_wire(PAGED_COPY_RUNTIME.to_wire())
+
+        scheduler = make_scheduler(
+            config,
+            state_runtime=engine_runtime,
+        )
+
+        checkpoints = scheduler.block_manager.paged_state_checkpoints
+        assert scheduler.block_manager.state_caches == (checkpoints,)
+        assert checkpoints.store.spec is engine_runtime.checkpoint_spec
+        assert checkpoints.store.units_per_checkpoint == 3
+        assert scheduler.block_manager.state.transfer == StateTransfer.none()
+        assert not hasattr(scheduler.block_manager, "state_runtime")
+        assert not hasattr(scheduler.block_manager, "page_checkpoints")
+        assert not any(
+            hasattr(config, field)
+            for field in (
+                "paged_state_page_unit_bytes",
+                "paged_state_slot_bytes",
+                "paged_state_units_per_checkpoint",
+                "paged_state_layout_id",
+                "state_transfer_kind",
+                "state_fork_tokens",
+            )
+        )
+
+    def test_empty_batch_does_not_drain_state_maintenance(self):
+        scheduler = make_scheduler(
+            paged_copy_config(state_checkpoint_interval_tokens=0),
+            state_runtime=PAGED_COPY_RUNTIME,
+        )
+        scheduler.block_manager.state.record_relocation(1, 2)
+
+        scheduled = scheduler.schedule()
+
+        assert scheduled is None
+        pending = scheduler.block_manager.take_state_maintenance_ops()
+        assert pending.relocations == ((1, 2),)
+        assert scheduler.block_manager.take_state_maintenance_ops().empty
+
+    def test_real_batch_drains_all_state_maintenance_once(self):
+        scheduler = make_scheduler(
+            paged_copy_config(state_checkpoint_interval_tokens=0),
+            state_runtime=PAGED_COPY_RUNTIME,
+        )
+        checkpoints = scheduler.block_manager.paged_state_checkpoints
+        seed = checkpoints.store.begin_store(33, src_slot=0)
+        assert seed is not None
+        checkpoints.store.complete_inflight()
+        assert checkpoints.begin_restore(33, dst_slot=2)
+        publisher = stateful_seq(list(range(BLOCK)))
+        publisher.per_req_cache_group = 1
+        checkpoints.checkpoint(publisher, boundary_blocks=1, h=13)
+        scheduler.block_manager.state.record_relocation(3, 4)
+        scheduler.add(stateful_seq(list(range(BLOCK))))
+
+        batch, scheduled = scheduler.schedule()
+
+        assert scheduled
+        ops = batch.state_maintenance_ops
+        assert ops.relocations == ((3, 4),)
+        assert len(ops.checkpoint_stores) == 1
+        assert ops.checkpoint_stores[0].src_slot == 1
+        assert len(ops.checkpoint_restores) == 1
+        assert ops.checkpoint_restores[0].dst_slot == 2
+        assert scheduler.block_manager.take_state_maintenance_ops().empty
+        assert not hasattr(scheduler.block_manager, "state_copies_for_batch")
+        assert not hasattr(scheduler.block_manager, "state_transfers_for_batch")
+
+    def test_latest_pending_checkpoint_replaces_the_previous_intent(self):
+        bm = make_block_manager(
+            paged_copy_config(),
+            state_runtime=PAGED_COPY_RUNTIME,
+        )
         seq = self._admitted(bm)
-        src = seq.per_req_cache_group
+        checkpoints = bm.paged_state_checkpoints
+
+        checkpoints.checkpoint(seq, boundary_blocks=1, h=101)
+        checkpoints.checkpoint(seq, boundary_blocks=2, h=202)
+        ops = bm.take_state_maintenance_ops()
+
+        assert len(ops.checkpoint_stores) == 1
+        assert not hasattr(seq, "pending_checkpoint")
+        bm.complete_previous_state_batch()
+        assert not checkpoints.store.contains(101)
+        assert checkpoints.store.contains(202)
+
+    def test_prefix_eviction_drops_an_uncommitted_checkpoint(self):
+        bm = make_block_manager(
+            paged_copy_config(),
+            state_runtime=PAGED_COPY_RUNTIME,
+        )
+        seq = self._admitted(bm)
+        checkpoints = bm.paged_state_checkpoints
+
+        checkpoints.checkpoint(seq, boundary_blocks=1, h=101)
+        bm._record_evicted(101)
+
+        assert bm.take_state_maintenance_ops().checkpoint_stores == ()
+        assert checkpoints.checkpoint_fates()["checkpoints_orphaned"] == 1
+
+    def test_checkpoint_uses_page_units_not_an_active_slot(self):
+        bm = make_block_manager(
+            paged_copy_config(),
+            state_runtime=PAGED_COPY_RUNTIME,
+        )
+        seq = self._admitted(bm)
+        free_slots = bm.state.num_free()
+        free_pages = bm.kv.num_free
         bm.hash_blocks(seq, bm.checkpoint_limit(seq) - seq.num_cached_tokens)
         h = boundary_hash(bm, seq)
 
-        copies = bm.state_copies_for_batch()
-        assert seq.pending_checkpoint == -1
-        assert len(copies) == 1
-        got_src, dst = copies[0]
-        assert got_src == src and dst != src
-        assert bm.state.lookup(h) == dst
-        # Capacity-neutral: the destination went straight back on the free list.
-        assert bm.state.is_free(dst)
-        assert not bm.state_copies_for_batch()  # drained once, not twice
+        transfers = bm.take_state_maintenance_ops()
+        assert transfers.relocations == ()
+        assert len(transfers.checkpoint_stores) == 1
+        assert bm.state.num_free() == free_slots
+        assert bm.kv.num_free == free_pages - 3
+        checkpoints = bm.paged_state_checkpoints
+        assert checkpoints.store.lookup(h) == -1
 
-    def test_a_request_freed_before_the_commit_indexes_nothing(self):
-        """Its group is back on the free list, so there is nothing to copy."""
-        bm = BlockManager(copy_config())
-        seq = self._admitted(bm)
-        bm.hash_blocks(seq, bm.checkpoint_limit(seq) - seq.num_cached_tokens)
-        bm.deallocate(seq)
+        bm.complete_previous_state_batch()
+        assert checkpoints.store.contains(h)
 
-        # committed by state_copies_for_batch()
-        assert not bm.state.hash_to_group
-        assert not bm.state_copies_for_batch()
-
-    def test_a_full_pool_keeps_no_checkpoint(self):
-        """Best-effort, exactly as under a fork: no group, no checkpoint."""
-        bm = BlockManager(copy_config())
-        seq = self._admitted(bm)
-        bm.hash_blocks(seq, bm.checkpoint_limit(seq) - seq.num_cached_tokens)
-        while bm.state.has_free():
-            bm.state.pop()
-
-        # committed by state_copies_for_batch()
-        assert not bm.state.hash_to_group
-        assert not bm.state_copies_for_batch()
-
-    @pytest.mark.parametrize(("extra_groups", "kept"), [(0, False), (1, True)])
-    def test_checkpoint_capacity_starts_above_the_live_floor(self, extra_groups, kept):
-        live_floor = 4
-        config = copy_config(
-            max_num_seqs=live_floor,
-            pool_entries={"state": live_floor + extra_groups},
+    def test_hit_gathers_into_a_distinct_contiguous_active_slot(self):
+        bm = make_block_manager(
+            paged_copy_config(),
+            state_runtime=PAGED_COPY_RUNTIME,
         )
-        bm = BlockManager(config)
-        owners = [
-            self._admitted(bm, list(range(100 * i, 100 * i + 40)))
-            for i in range(config.max_num_seqs)
-        ]
-        owner_groups = {seq.per_req_cache_group for seq in owners}
-        assert len(owner_groups) == live_floor
-        assert bm.state.num_free() == extra_groups
-
-        publisher = owners[0]
-        bm.hash_blocks(
-            publisher,
-            bm.checkpoint_limit(publisher) - publisher.num_cached_tokens,
-        )
-        h = boundary_hash(bm, publisher)
-        assert publisher.pending_checkpoint != -1
-
-        copies = bm.state_copies_for_batch()
-        assert publisher.pending_checkpoint == -1
-        assert bool(copies) is kept
-        assert (bm.state.lookup(h) >= 0) is kept
-        assert bm.state.checkpoint_fates() == {
-            "checkpoints_kept": int(kept),
-            "checkpoints_dropped": int(not kept),
-            "checkpoints_evicted": 0,
-            "checkpoints_orphaned": 0,
-        }
-        if kept:
-            src, dst = copies[0]
-            assert src == publisher.per_req_cache_group
-            assert dst == bm.state.lookup(h)
-            assert dst not in owner_groups
-
-    def test_an_existing_free_checkpoint_needs_no_second_copy(self):
-        config = copy_config(max_num_seqs=2, pool_entries={"state": 3})
-        bm = BlockManager(config)
-        first = self._admitted(bm, list(range(40)))
-        second = self._admitted(bm, list(range(40)))
-
-        bm.hash_blocks(first, bm.checkpoint_limit(first) - first.num_cached_tokens)
-        h = boundary_hash(bm, first)
-        copies = bm.state_copies_for_batch()
-        assert len(copies) == 1
-        dst = copies[0][1]
-        assert bm.state.lookup(h) == dst
-        assert bm.state.is_free(dst)
-
-        bm.hash_blocks(second, bm.checkpoint_limit(second) - second.num_cached_tokens)
-        assert boundary_hash(bm, second) == h
-        assert bm.state_copies_for_batch() == []
-        assert second.pending_checkpoint == -1
-        assert bm.state.lookup(h) == dst
-        assert bm.state.checkpoint_fates() == {
-            "checkpoints_kept": 1,
-            "checkpoints_dropped": 0,
-            "checkpoints_evicted": 0,
-            "checkpoints_orphaned": 0,
-        }
-
-    def test_a_resume_is_handed_a_duplicate_not_a_fork(self):
-        bm = BlockManager(copy_config())
         first = self._admitted(bm)
         bm.hash_blocks(first, bm.checkpoint_limit(first) - first.num_cached_tokens)
-        # committed by state_copies_for_batch()
-        src = bm.state_copies_for_batch()[0][1]
+        h = boundary_hash(bm, first)
+        store = bm.take_state_maintenance_ops().checkpoint_stores[0]
+        bm.complete_previous_state_batch()
 
-        # A follow-up turn, not a repeat: with no room reserved behind it the
-        # checkpoint sits on the prompt's last block, and a request of the same
-        # length can never reach it (its own hit stops one block short).
         second = stateful_seq(list(range(48)))
         hit = bm.can_allocate(second)
         assert hit > 0
         bm.allocate(second, hit)
-        # The read side stays untouched; the bytes arrive by copy instead.
+        transfers = bm.take_state_maintenance_ops()
+        assert transfers.checkpoint_stores == ()
+        assert len(transfers.checkpoint_restores) == 1
+        restore = transfers.checkpoint_restores[0]
+        assert restore.unit_ids == store.unit_ids
+        assert restore.dst_slot == second.per_req_cache_group
         assert second.state_fork_src == -1
-        assert bm.state_copies_for_batch() == [(src, second.per_req_cache_group)]
-        # And the source is held until the forward that reads it has been issued.
-        assert bm.state.is_pinned(src)
+        # The checkpoint stays canonical and shareable. Its fragments were not
+        # adopted as the request's kernel-visible slot.
+        assert bm.paged_state_checkpoints.store.contains(h)
 
-    def test_the_checkpoint_is_only_claimable_once_its_batch_is_decided(self):
-        """Why the commit waits for the batch instead of opening the pass.
-
-        The source of a keeper copy is the owner's *live* group. Anything that
-        can preempt that owner between the commit and the batch — an admission,
-        in the same pass — would put the group back on the free list, and the
-        copy would then duplicate the next request's state into a group already
-        indexed as a checkpoint. Waiting until the batch is decided leaves no
-        such window, at the price of the checkpoint landing one pass later.
-        """
-        bm = BlockManager(copy_config())
+    def test_deallocate_cancels_a_queued_restore_before_reusing_its_slot(self):
+        bm = make_block_manager(
+            paged_copy_config(),
+            state_runtime=PAGED_COPY_RUNTIME,
+        )
         first = self._admitted(bm)
         bm.hash_blocks(first, bm.checkpoint_limit(first) - first.num_cached_tokens)
+        h = boundary_hash(bm, first)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
 
-        # An admission in the same pass cannot see it yet.
         second = stateful_seq(list(range(48)))
-        assert bm.can_allocate(second) == 0
+        bm.allocate(second, bm.can_allocate(second))
+        dst = second.per_req_cache_group
+        checkpoint_id = bm.paged_state_checkpoints.store.lookup(h)
+        assert bm.paged_state_checkpoints.store.records[checkpoint_id].pin_count == 1
 
-        bm.state_copies_for_batch()  # the batch is decided; now it exists
-        assert bm.can_allocate(second) > 0
+        bm.deallocate(second)
 
-    def test_admissions_get_the_free_list_before_checkpoints_do(self):
-        """Committing after admissions is also the right priority order."""
-        bm = BlockManager(copy_config())
+        assert bm.take_state_maintenance_ops().checkpoint_restores == ()
+        assert bm.paged_state_checkpoints.store.records[checkpoint_id].pin_count == 0
+        assert bm.state.is_free(dst)
+
+        third = stateful_seq(list(range(100, 140)))
+        bm.allocate(third, bm.can_allocate(third))
+        assert third.per_req_cache_group == dst
+        assert bm.take_state_maintenance_ops().checkpoint_restores == ()
+
+    def test_missing_gated_checkpoint_releases_the_new_slot_and_raises(self):
+        bm = make_block_manager(
+            paged_copy_config(),
+            state_runtime=PAGED_COPY_RUNTIME,
+        )
         first = self._admitted(bm)
         bm.hash_blocks(first, bm.checkpoint_limit(first) - first.num_cached_tokens)
-        # Leave exactly one group: the admission takes it, the checkpoint yields.
-        while bm.state.num_free() > 1:
-            bm.state.pop()
+        h = boundary_hash(bm, first)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        free_slots = bm.state.num_free()
+        bm.paged_state_checkpoints.unindex(h)
 
-        newcomer = stateful_seq(list(range(40)))
-        bm.allocate(newcomer, bm.can_allocate(newcomer))
-        assert newcomer.per_req_cache_group >= 0
-        assert bm.state_copies_for_batch() == []
-        assert not bm.state.hash_to_group
+        second = stateful_seq(list(range(48)))
+        with pytest.raises(RuntimeError, match="disappeared"):
+            bm._attach_state_group(second, h)
 
-    def test_the_batch_carries_what_was_drained(self):
-        """The copies have to reach the forward, which means riding a batch."""
-        sched = Scheduler(copy_config())
-        sched.add(stateful_seq(list(range(BLOCK))))
-        sched.block_manager.state.record_copy(2, 3)
-        batch, _ = sched.schedule()
-        assert batch.state_copy_pairs == [(2, 3)]
-        # Carried once: the next batch is not asked to repeat them.
-        batch, _ = sched.schedule()
-        assert batch.state_copy_pairs == []
+        assert second.per_req_cache_group == -1
+        assert bm.state.num_free() == free_slots
 
-    def test_a_copy_checkpoints_where_a_fork_cannot(self):
-        """Speculation and a one-token step both stop a fork, neither a copy."""
+    def test_copy_transfer_can_checkpoint_a_speculative_decode_boundary(self):
         spec = SimpleNamespace(num_speculative_tokens=3, use_dspark=lambda: False)
         seq = stateful_seq(list(range(40)))
         seq.type = SequenceType.DECODE
-        forking = Scheduler(ckpt_config(state_fork_tokens=1, speculative_config=spec))
-        copying = Scheduler(copy_config(speculative_config=spec))
+        forking = make_scheduler(
+            ckpt_config(speculative_config=spec),
+            state_runtime=StateRuntime(transfer=StateTransfer.fork(1)),
+        )
+        copying = make_scheduler(
+            paged_copy_config(speculative_config=spec),
+            state_runtime=PAGED_COPY_RUNTIME,
+        )
+        assert (
+            copying.block_manager.paged_state_checkpoints.store.spec is PAGED_COPY_SPEC
+        )
         assert forking._checkpoint_room(seq, False) == 0
         assert copying._checkpoint_room(seq, False) == 1
-        # A finishing request still keeps nothing: no next batch to copy on.
         assert copying._checkpoint_room(seq, True) == 0
 
 
@@ -1080,14 +1140,17 @@ class TestDecodePointPublishing:
         return seq
 
     def test_a_rung_past_the_prompt_publishes(self):
-        bm = BlockManager(ckpt_config(state_fork_tokens=1))
+        bm = make_block_manager(
+            ckpt_config(),
+            state_runtime=StateRuntime(transfer=StateTransfer.fork(1)),
+        )
         seq = self._prompt_of_10(bm)
         group = seq.per_req_cache_group
 
         self._generate_to(bm, seq, 3 * BLOCK)
         assert seq.per_req_cache_group != group
         assert seq.state_fork_src == group
-        assert bm.state.lookup(bm.kv.block(seq.block_table[2]).hash) == group
+        assert bm.state.lookup_group(bm.kv.block(seq.block_table[2]).hash) == group
 
     def test_a_backend_needing_a_long_fork_never_publishes_mid_generation(self):
         """Self-gating: no `min_fork` special case, the number decides.
@@ -1095,7 +1158,7 @@ class TestDecodePointPublishing:
         One decode token cannot fill a group that needs `MIN_FORK` of them, so
         the rung is simply not a publish position for this backend.
         """
-        bm = BlockManager(ckpt_config())  # state_fork_tokens=MIN_FORK
+        bm = make_block_manager(ckpt_config())  # DEFAULT_STATE_TRANSFER needs MIN_FORK.
         seq = self._prompt_of_10(bm)
         group = seq.per_req_cache_group
 
@@ -1105,7 +1168,10 @@ class TestDecodePointPublishing:
 
     def test_no_publish_on_the_step_that_finishes_the_request(self):
         """Nothing will fork from it, and the fresh group would go straight back."""
-        bm = BlockManager(ckpt_config(state_fork_tokens=1))
+        bm = make_block_manager(
+            ckpt_config(),
+            state_runtime=StateRuntime(transfer=StateTransfer.fork(1)),
+        )
         seq = self._prompt_of_10(bm)
         group = seq.per_req_cache_group
 
@@ -1115,14 +1181,17 @@ class TestDecodePointPublishing:
 
     def test_blocks_are_still_hashed_where_no_checkpoint_is_taken(self):
         """Prefix caching and state checkpoints are separate gates."""
-        bm = BlockManager(ckpt_config())
+        bm = make_block_manager(ckpt_config())
         seq = self._prompt_of_10(bm)
         self._generate_to(bm, seq, 3 * BLOCK)
         assert seq.num_hashed_tokens == 3 * BLOCK
 
     def test_followup_turn_resumes_from_a_generated_rung(self):
         """The payoff: turn 2 reuses KV *and* the state that goes with it."""
-        bm = BlockManager(ckpt_config(state_fork_tokens=1))
+        bm = make_block_manager(
+            ckpt_config(),
+            state_runtime=StateRuntime(transfer=StateTransfer.fork(1)),
+        )
         seq = self._prompt_of_10(bm)
         self._generate_to(bm, seq, 4 * BLOCK)
 
@@ -1132,7 +1201,7 @@ class TestDecodePointPublishing:
         # left a checkpoint.
         assert bm.can_allocate(followup) == 3
         bm.allocate(followup, 3)
-        assert followup.state_fork_src == bm.state.lookup(
+        assert followup.state_fork_src == bm.state.lookup_group(
             bm.kv.block(seq.block_table[2]).hash
         )
 
@@ -1141,7 +1210,10 @@ class TestDecodePublishGate:
     """`Scheduler._state_publish_room`: who is allowed to checkpoint at decode."""
 
     def _sched(self, **overrides):
-        return Scheduler(ckpt_config(state_fork_tokens=1, **overrides))
+        return make_scheduler(
+            ckpt_config(**overrides),
+            state_runtime=StateRuntime(transfer=StateTransfer.fork(1)),
+        )
 
     def _decoding_seq(self):
         seq = stateful_seq(list(range(40)))
@@ -1205,7 +1277,7 @@ class TestDecodePublishGate:
             batch, _ = sched.schedule()
             forks.extend(s for s in batch.state_fork_srcs if s >= 0)
 
-        published = bm.state.lookup(bm.kv.block(seq.block_table[1]).hash)
+        published = bm.state.lookup_group(bm.kv.block(seq.block_table[1]).hash)
         assert published >= 0
         # The seq moved off the group it gave away, and the forward right after
         # the publish was told to read it.
@@ -1261,6 +1333,10 @@ def second_class(**overrides):
 
 class TestStateCacheProtocol:
 
+    def test_copy_transfer_has_no_slot_backed_fallback(self):
+        with pytest.raises(ValueError, match="do not belong"):
+            StateGroupPool(4, StateTransfer.copy("test-layout"))
+
     def test_both_classes_satisfy_the_protocol(self):
         assert isinstance(second_class(), StateCache)
         assert isinstance(StateGroupPool(4), StateCache)
@@ -1278,7 +1354,7 @@ class TestStateCacheProtocol:
 
     def test_the_limit_follows_the_class_that_reaches_furthest(self):
         """The smallest room reaches furthest right; a larger one must not cap it."""
-        bm = BlockManager(ckpt_config())
+        bm = make_block_manager(ckpt_config())
         seq = stateful_seq(list(range(40)))
         assert bm.checkpoint_limit(seq) == 32  # the ring alone: 40 - MIN_FORK
         bm.state_caches = (*bm.state_caches, StubStateCache(successor_room=0))
@@ -1292,23 +1368,30 @@ class TestStateCacheProtocol:
         are opposite ends of the room scale.
         """
         assert isinf(StateGroupPool(4, StateTransfer.none()).successor_room)
-        assert StateGroupPool(4, StateTransfer.copy()).successor_room == 0
+        assert StateTransfer.copy("test-layout").successor_room == 0
         assert StateGroupPool(4, StateTransfer.fork(7)).successor_room == 7
 
     def test_a_copy_never_asks_the_resumer_for_room(self):
         """`resumable_hit`'s fork test is vacuous under `copy`, not skipped."""
         forking = StateGroupPool(4, StateTransfer.fork(4), hash_block_size=1)
-        copying = StateGroupPool(4, StateTransfer.copy(), hash_block_size=1)
-        for pool in (forking, copying):
-            pool._index(10, 0)
-            pool._index(50, 1)
+        copying = PagedStateCheckpointCoordinator(
+            BlockPool(4),
+            PagedStateCheckpointSpec(1, 1, "test-layout", image_bytes=1),
+            enabled=True,
+        )
+        assert isinstance(copying, StateCache)
+        forking._index(10, 0)
+        forking._index(50, 1)
+        assert copying.store.begin_store(10, 0) is not None
+        assert copying.store.begin_store(50, 1) is not None
+        copying.store.complete_inflight()
         # Five one-token blocks; the rightmost checkpoint leaves no room to
         # forward, so a fork walks back to the first and a copy does not.
         assert forking.resumable_hit(idx_seq(5), 5, [10, 20, 30, 40, 50]) == 1
         assert copying.resumable_hit(idx_seq(5), 5, [10, 20, 30, 40, 50]) == 5
 
     def test_the_immutable_class_qualifies_where_the_rolling_one_cannot(self):
-        bm = BlockManager(ckpt_config())
+        bm = make_block_manager(ckpt_config())
         seq = stateful_seq(list(range(40)))
         # A rung one token from the end: the ring has no room to hand over, an
         # immutable class needs none.
@@ -1319,7 +1402,7 @@ class TestStateCacheProtocol:
 
     def test_cut_and_ladder_agree_position_for_position(self):
         """The chunk is cut where — and only where — something gets kept."""
-        bm = BlockManager(ckpt_config())
+        bm = make_block_manager(ckpt_config())
         seq = stateful_seq(list(range(40)))
         cuts = {
             bm.checkpoint_cut(seq, pos - 1, pos)
@@ -1337,7 +1420,7 @@ class TestGatedHitFixpoint:
 
     def test_the_answer_is_accepted_by_every_class(self):
         """What a fixpoint means, asserted directly rather than by construction."""
-        bm = BlockManager(ckpt_config())
+        bm = make_block_manager(ckpt_config())
         seq = stateful_seq(list(range(40)))
         hashes = [1000 + i for i in range(9)]
         for group, boundary in enumerate([2, 5]):
@@ -1349,7 +1432,7 @@ class TestGatedHitFixpoint:
             assert cache.resumable_hit(seq, answer, hashes) == answer
 
     def test_order_between_classes_does_not_change_the_answer(self):
-        bm = BlockManager(ckpt_config())
+        bm = make_block_manager(ckpt_config())
         seq = stateful_seq(list(range(40)))
         hashes = [1000 + i for i in range(9)]
         for group, boundary in enumerate([2, 5]):
@@ -1367,6 +1450,17 @@ class TestGatedHitFixpoint:
 INTERVAL = 4 * BLOCK
 PROMPT = list(range(44))  # 11 blocks; last never reused, so 10 are hittable
 
+# An image that costs more units than a request's blocks do. That is the shape
+# where the ladder's question and admission's question can disagree: the pool
+# still has room for the request and not for the checkpoint. With an image the
+# size of a couple of blocks the two run out together and there is nothing to
+# test.
+BIG_IMAGE_SPEC = PagedStateCheckpointSpec(10, 400, "test-layout-big", image_bytes=400)
+BIG_IMAGE_RUNTIME = StateRuntime(
+    transfer=StateTransfer.copy(BIG_IMAGE_SPEC.layout_id),
+    checkpoint_spec=BIG_IMAGE_SPEC,
+)
+
 
 def demand_config(**overrides):
     """A grid too coarse to cover the prompt, so demand has room to show.
@@ -1381,6 +1475,17 @@ def demand_config(**overrides):
     return ckpt_config(**overrides)
 
 
+def an_image_fits_on_its_own(checkpoints) -> bool:
+    """What the demand gate used to ask, kept as the contrast it is read against.
+
+    The gate now asks whether an image fits *after* the admission has taken
+    its own blocks, and the tests below turn on the pool state where the two
+    answers differ. Written out here rather than left as a method on the
+    store, which would be a production API nothing in production asks.
+    """
+    return checkpoints.has_available_units(checkpoints.store.units_per_checkpoint)
+
+
 class TestDemandDrivenCheckpoints:
     """A rung placed where a request was seen to want one.
 
@@ -1393,7 +1498,7 @@ class TestDemandDrivenCheckpoints:
     """
 
     def test_the_gap_becomes_a_rung_off_the_grid(self):
-        bm = BlockManager(demand_config())
+        bm = make_block_manager(demand_config())
         run_prompt_on_the_ladder(bm, stateful_seq(PROMPT))
 
         second = stateful_seq(PROMPT)
@@ -1407,7 +1512,7 @@ class TestDemandDrivenCheckpoints:
 
     def test_the_third_request_finds_what_the_second_was_missing(self):
         """Self-limiting: nothing to want, want it once, want nothing again."""
-        bm = BlockManager(demand_config())
+        bm = make_block_manager(demand_config())
 
         first = stateful_seq(PROMPT)
         assert run_prompt_on_the_ladder(bm, first) == [32]  # the grid alone
@@ -1425,6 +1530,185 @@ class TestDemandDrivenCheckpoints:
         assert third.checkpoint_demand_pos == 0  # nothing left to want
         assert forward_on_the_ladder(bm, third) == []
 
+    def test_a_demand_the_floor_would_refuse_is_not_recorded(self):
+        """A cut costs a forward; buying one for a refused store is pure loss.
+
+        `begin_store` drops a checkpoint whose units are not reachable.
+        Recording a demand for it anyway would still shorten the
+        request's prefill chunk, so the ladder asks the same question the
+        store will — and the reuse attribution is unaffected, because that
+        reuse really was declined for want of a checkpoint.
+        """
+        bm = make_block_manager(demand_config(), state_runtime=BIG_IMAGE_RUNTIME)
+        run_prompt_on_the_ladder(bm, stateful_seq(PROMPT))
+        checkpoints = bm.paged_state_checkpoints
+        assert an_image_fits_on_its_own(checkpoints)
+
+        # Live KV takes the pool down to where an image no longer fits but the
+        # resumer's own blocks still do -- the state under real pressure, where
+        # admission goes through and only the store cannot.
+        spare = -(-len(PROMPT) // BLOCK) + 1
+        assert spare < checkpoints.store.units_per_checkpoint
+        bm.kv.reserve_units(bm.kv.num_free - spare, ("live-kv", 0))
+        assert not an_image_fits_on_its_own(checkpoints)
+
+        second = stateful_seq(PROMPT)
+        hit = bm.can_allocate(second)
+        bm.allocate(second, hit)
+
+        # The reuse is still attributed to a missing checkpoint...
+        assert second.num_wanted_hit_blocks > hit, "the attribution was suppressed too"
+        # ...but nothing is cut for a store that would be refused.
+        assert second.checkpoint_demand_pos == 0, "a refused store still cut a chunk"
+        funnel = bm.checkpoint_funnel()
+        assert funnel["demands_declined_no_room"] == 1
+        assert funnel["demands_recorded"] == 0
+        assert funnel["chunks_cut_for_demand"] == 0
+        assert forward_on_the_ladder(bm, second) == [32], "the grid rung, no demand cut"
+
+    def _tighten_past_an_image(self, bm):
+        """Leave room for a resumer's blocks but not for a checkpoint image."""
+        checkpoints = bm.paged_state_checkpoints
+        spare = -(-len(PROMPT) // BLOCK) + 1
+        assert spare < checkpoints.store.units_per_checkpoint
+        bm.kv.reserve_units(bm.kv.num_free - spare, ("live-kv", 0))
+        assert not an_image_fits_on_its_own(checkpoints)
+
+    def test_a_demand_is_refused_when_the_admission_itself_drains_the_pool(self):
+        """The blocks this request takes come first, so they count.
+
+        A pool with room for an image but not for the request *and* the image
+        answers yes to "does an image fit" -- and then the admission takes its
+        block table, `begin_store` refuses many forwards later, and the cut
+        this gate exists to withhold has already been bought. The funnel shows
+        nothing, because the decline happened somewhere that does not count.
+        """
+        bm = make_block_manager(demand_config(), state_runtime=BIG_IMAGE_RUNTIME)
+        run_prompt_on_the_ladder(bm, stateful_seq(PROMPT))
+        checkpoints = bm.paged_state_checkpoints
+        image = checkpoints.store.units_per_checkpoint
+        blocks = -(-len(PROMPT) // BLOCK)
+
+        # Enough for an image on its own, not for this request and an image.
+        bm.kv.reserve_units(bm.kv.num_free - (image + blocks // 2), ("live-kv", 0))
+        assert an_image_fits_on_its_own(checkpoints), "the old question still says yes"
+
+        second = stateful_seq(PROMPT)
+        assert bm.can_allocate(second) >= 0, "admission itself must still go through"
+
+        assert second.checkpoint_demand_pos == 0, "bought a cut the store cannot use"
+        assert bm.checkpoint_funnel()["demands_declined_no_room"] == 1
+
+    def test_both_gates_in_one_pass_protect_the_same_checkpoint(self):
+        """`_checkpoint_has_room` and `_has_page_units` agree on what is spendable.
+
+        The second excludes the checkpoint this admission is about to pin --
+        it is about to be read, so eviction cannot have it. The first used to
+        count it as reclaimable, so with the pool resting on exactly that one
+        image the two gates in a single pass gave opposite answers.
+        """
+        bm = make_block_manager(demand_config(), state_runtime=BIG_IMAGE_RUNTIME)
+        first = stateful_seq(PROMPT)
+        published = publish_at_boundary(bm, first)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        checkpoints = bm.paged_state_checkpoints
+        assert checkpoints.store.contains(published)
+
+        # Nothing spare: the only spendable units are that one checkpoint's.
+        bm.kv.reserve_units(bm.kv.num_free, ("live-kv", 0))
+
+        assert bm._checkpoint_has_room(0, protected_hash=None), "the setup is wrong"
+        assert not bm._checkpoint_has_room(
+            0, protected_hash=published
+        ), "the checkpoint about to be pinned was counted as spendable"
+
+    def test_the_checkpoint_being_resumed_from_is_not_counted_as_spendable(self):
+        """Through `can_allocate`, where the two gates actually meet.
+
+        The seq hits a checkpoint and wants a further one, so the pin and the
+        demand happen in the same call. Rest the pool on exactly that one
+        image and the answer turns on whether the gate knows it is spoken for:
+        counting it leaves the ladder cutting a chunk for a store that has no
+        units left to take.
+        """
+        bm = make_block_manager(demand_config(), state_runtime=BIG_IMAGE_RUNTIME)
+        first = stateful_seq(PROMPT)
+        run_prompt_on_the_ladder(bm, first)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        image = bm.paged_state_checkpoints.store.units_per_checkpoint
+        assert len(bm.paged_state_checkpoints.store.records) == 1, "one image only"
+
+        second = stateful_seq(PROMPT)
+        # Leave the request's own blocks plus half an image: reachable only by
+        # spending the very checkpoint `second` is about to resume from.
+        spare = -(-len(PROMPT) // BLOCK) + image // 2
+        bm.kv.reserve_units(bm.kv.num_free - spare, ("live-kv", 0))
+
+        hit = bm.can_allocate(second)
+
+        assert hit > 0, "the seq is supposed to resume from that checkpoint"
+        assert second.num_wanted_hit_blocks > hit, "and to want a further one"
+        assert second.checkpoint_demand_pos == 0, "spent an image already spoken for"
+        assert bm.checkpoint_funnel()["demands_declined_no_room"] == 1
+
+    def test_a_demand_recorded_while_there_was_room_is_withdrawn_when_it_goes(self):
+        """The gate is the store's question, so it has to be asked afresh.
+
+        `can_allocate` re-runs for a sequence the queue keeps deferring. One
+        that recorded a demand while the pool had room, and is then re-admitted
+        against a pool that does not, is exactly the case the gate exists for:
+        the cut it would buy is now pure loss. Reading the position the gate is
+        about to overwrite made it a one-shot and let that cut through.
+        """
+        bm = make_block_manager(demand_config(), state_runtime=BIG_IMAGE_RUNTIME)
+        run_prompt_on_the_ladder(bm, stateful_seq(PROMPT))
+        second = stateful_seq(PROMPT)
+        assert bm.can_allocate(second) >= 0
+        recorded = second.checkpoint_demand_pos
+        assert recorded, "the first attempt was supposed to record a demand"
+
+        self._tighten_past_an_image(bm)
+        bm.can_allocate(second)
+
+        assert second.checkpoint_demand_pos == 0, "a stale answer bought the cut"
+        assert bm.checkpoint_funnel()["demands_declined_no_room"] == 1
+
+    def test_a_deferred_sequence_is_counted_once_however_often_it_asks(self):
+        """One request under pressure, not one per admission attempt.
+
+        `demands_declined_no_room` is read against `demands_recorded`, so a
+        counter that fires per attempt makes the funnel unreadable under the
+        only pressure anyone reads it in -- and a decline writes 0 into the
+        position, so the position cannot be the marker that stops it.
+        """
+        bm = make_block_manager(demand_config(), state_runtime=BIG_IMAGE_RUNTIME)
+        run_prompt_on_the_ladder(bm, stateful_seq(PROMPT))
+        self._tighten_past_an_image(bm)
+
+        second = stateful_seq(PROMPT)
+        for _ in range(5):
+            bm.can_allocate(second)
+
+        funnel = bm.checkpoint_funnel()
+        assert funnel["demands_declined_no_room"] == 1, "counted per attempt"
+        assert funnel["demands_recorded"] == 0
+
+    def test_a_demand_survives_being_asked_twice_without_being_counted_twice(self):
+        """The mirror: room throughout, so the recorded counter must not move."""
+        bm = make_block_manager(demand_config(), state_runtime=BIG_IMAGE_RUNTIME)
+        run_prompt_on_the_ladder(bm, stateful_seq(PROMPT))
+
+        second = stateful_seq(PROMPT)
+        for _ in range(5):
+            assert bm.can_allocate(second) >= 0
+
+        assert second.checkpoint_demand_pos, "the demand was lost"
+        funnel = bm.checkpoint_funnel()
+        assert funnel["demands_recorded"] == 1, "counted per attempt"
+        assert funnel["demands_declined_no_room"] == 0
+
     def test_reuse_another_class_declines_is_not_charged_to_the_ladder(self):
         """The counterfactual keeps every other gate applied.
 
@@ -1433,7 +1717,7 @@ class TestDemandDrivenCheckpoints:
         the whole gap to the ladder would have every request pay for a
         checkpoint the next one still cannot use.
         """
-        bm = BlockManager(demand_config())
+        bm = make_block_manager(demand_config())
         run_prompt_on_the_ladder(bm, stateful_seq(PROMPT))
         bm.state_caches = (*bm.state_caches, StubStateCache(cap=8))
 
@@ -1454,7 +1738,7 @@ class TestDemandDrivenCheckpoints:
         is no reason to discard the other. This is the workload that motivates
         it: prompts under the interval, sharing a real prefix.
         """
-        bm = BlockManager(demand_config())
+        bm = make_block_manager(demand_config())
         short = list(range(16))
         run_prompt_on_the_ladder(bm, stateful_seq(short))
 
@@ -1471,7 +1755,7 @@ class TestDemandDrivenCheckpoints:
 
     def test_the_demand_is_cut_and_kept_at_the_same_position(self):
         """The cut and the keep read the same call, so they cannot drift."""
-        bm = BlockManager(demand_config())
+        bm = make_block_manager(demand_config())
         run_prompt_on_the_ladder(bm, stateful_seq(PROMPT))
         seq = stateful_seq(PROMPT)
         bm.allocate(seq, bm.can_allocate(seq))
@@ -1490,7 +1774,7 @@ class TestDemandDrivenCheckpoints:
         rather than argued, because the two derivations sit in different files.
         """
         for n in range(20, 60, 3):
-            bm = BlockManager(demand_config())
+            bm = make_block_manager(demand_config())
             tokens = list(range(1000 * n, 1000 * n + n))
             run_prompt_on_the_ladder(bm, stateful_seq(tokens))
             seq = stateful_seq(tokens)
@@ -1499,10 +1783,9 @@ class TestDemandDrivenCheckpoints:
             assert not demand or bm.checkpointers_at(seq, demand), n
 
     def test_a_stateless_model_records_no_demand(self):
-        bm = BlockManager(
-            demand_config(
-                pool_entries={}, state_transfer_kind="none", state_fork_tokens=0
-            )
+        bm = make_block_manager(
+            demand_config(pool_entries={}),
+            state_runtime=StateRuntime(),
         )
         cold = Sequence(PROMPT, BLOCK, has_per_req_cache=False)
         run_prompt_on_the_ladder(bm, cold)
@@ -1530,7 +1813,7 @@ class TestCacheStatsAttribution:
 
     def test_hit_tokens_are_counted_in_hash_blocks(self):
         """Under DCP one block_table entry spans `dcp` blocks of tokens."""
-        sched = Scheduler(demand_config(decode_context_parallel_size=2))
+        sched = make_scheduler(demand_config(decode_context_parallel_size=2))
         assert sched.block_manager.hash_block_size == 2 * BLOCK
         seq = stateful_seq(PROMPT)
         seq.num_compressed_hit_blocks = 3
@@ -1560,25 +1843,25 @@ class TestGenerationIsHeldToSpacingNotTheGrid:
         return bm.checkpointers_at(seq, pos, MIN_FORK, aimed=aimed)
 
     def test_an_aimed_step_is_held_to_the_grid(self):
-        bm = BlockManager(demand_config())
+        bm = make_block_manager(demand_config())
         seq = stateful_seq(PROMPT)
         assert self.keepers(bm, seq, INTERVAL, aimed=True)
         assert not self.keepers(bm, seq, INTERVAL + BLOCK, aimed=True)
 
     def test_an_unaimed_step_keeps_off_the_grid(self):
-        bm = BlockManager(demand_config())
+        bm = make_block_manager(demand_config())
         seq = stateful_seq(PROMPT)
         assert self.keepers(bm, seq, INTERVAL + BLOCK, aimed=False)
 
     def test_an_unaimed_step_still_has_to_land_on_a_block(self):
-        bm = BlockManager(demand_config())
+        bm = make_block_manager(demand_config())
         seq = stateful_seq(PROMPT)
         # The checkpoint is filed under the hash of a whole block, so a landing
         # between two of them has nothing to file it under.
         assert not self.keepers(bm, seq, INTERVAL + 1, aimed=False)
 
     def test_spacing_is_measured_from_the_last_one_kept(self):
-        bm = BlockManager(demand_config())
+        bm = make_block_manager(demand_config())
         seq = stateful_seq(PROMPT)
         seq.last_checkpoint_pos = INTERVAL + BLOCK
         assert not self.keepers(bm, seq, 2 * INTERVAL, aimed=False)
@@ -1587,7 +1870,7 @@ class TestGenerationIsHeldToSpacingNotTheGrid:
     def test_the_grid_ignores_the_watermark(self):
         # An aimed caller answers to `checkpoint_cut`, which knows nothing of
         # the watermark; letting it in here would put the two out of step.
-        bm = BlockManager(demand_config())
+        bm = make_block_manager(demand_config())
         seq = stateful_seq(PROMPT)
         seq.last_checkpoint_pos = INTERVAL
         assert self.keepers(bm, seq, 2 * INTERVAL, aimed=True)
@@ -1597,9 +1880,111 @@ class TestGenerationIsHeldToSpacingNotTheGrid:
         # own hit ceiling, and generation only ever asks about positions at or
         # past the end of the prompt. The unaimed branch omits the demand
         # because of this, so the day it stops holding, this fails first.
-        bm = BlockManager(demand_config())
+        bm = make_block_manager(demand_config())
         seq = stateful_seq(PROMPT)
         bm.allocate(seq, bm.can_allocate(seq))
         second = stateful_seq(PROMPT)
         bm.allocate(second, bm.can_allocate(second))
         assert second.checkpoint_demand_pos < second.num_prompt_tokens
+
+
+class TestTheCacheCannotStarveLiveKv:
+    """Why no floor is held back for live KV.
+
+    `_fresh_block` raises when the pool is dry and nothing is evictable, and
+    the checkpoint cache shares that pool. These pin the three facts that keep
+    the cache from ever taking it there, so that a future reader looking for a
+    reserve finds the argument instead of re-inventing one.
+    """
+
+    def _pool_of_three_with_one_checkpoint(self, pin: bool):
+        """A pool holding exactly one image, optionally being read.
+
+        Three units, one checkpoint, nothing spare -- the tightest state the
+        cache can put the pool in.
+        """
+        bm = make_block_manager(
+            paged_copy_config(num_kvcache_blocks=3, state_checkpoint_interval_tokens=0),
+            state_runtime=PAGED_COPY_RUNTIME,
+        )
+        checkpoints = bm.paged_state_checkpoints
+        assert checkpoints.store.units_per_checkpoint == 3
+        assert checkpoints.store.begin_store(33, src_slot=0) is not None
+        checkpoints.store.complete_inflight()
+        if pin:
+            assert checkpoints.begin_restore(33, dst_slot=1)
+        assert bm.kv.num_free == 0, "the pool is meant to have nothing spare"
+        return bm, checkpoints.store
+
+    def test_a_ready_unpinned_checkpoint_is_available_to_live_kv(self):
+        """The cache's size is not the variable: a spendable image is free space.
+
+        `has_available_units` counts it and `ensure_free_units` spends it, so
+        holding checkpoints costs live KV nothing and there is nothing for a
+        floor to ration.
+        """
+        bm, store = self._pool_of_three_with_one_checkpoint(pin=False)
+        assert store.has_available_units(3), "the image was not counted as free space"
+        assert not store.has_available_units(4), "more was counted than exists"
+
+        seq = stateful_seq(list(range(BLOCK)))
+        assert bm.can_allocate(seq) == 0, "a spendable image was not counted"
+
+        bm.allocate(seq, 0)
+        assert store.lookup(33) < 0, "it was counted but could not be spent"
+
+    def test_a_pinned_cache_refuses_an_admission_rather_than_raising(self):
+        """The reachable outcome under contention, and the one that is not.
+
+        A restore pin is the one thing that makes an image unspendable while
+        allocation is running. Even with the whole cache pinned and the free
+        list empty, the gate answers no and the request waits for the pass that
+        releases the pin -- `_fresh_block` is never reached.
+        """
+        bm, store = self._pool_of_three_with_one_checkpoint(pin=True)
+        assert not store.has_available_units(1), "the cache is meant to be pinned"
+
+        seq = stateful_seq(list(range(BLOCK)))
+
+        assert bm.can_allocate(seq) < 0, "the gate admitted a seq it cannot serve"
+
+    def test_bypassing_the_gate_reaches_the_raise(self):
+        """The sibling that gives the test above its meaning.
+
+        Without this one, `can_allocate` returning -1 would be indistinguishable
+        from a scenario that was never tight enough to matter.
+        """
+        bm, _ = self._pool_of_three_with_one_checkpoint(pin=True)
+        seq = stateful_seq(list(range(BLOCK)))
+
+        with pytest.raises(AssertionError, match="No PAGE unit"):
+            bm.allocate(seq, 0)
+
+    def test_a_pass_releases_the_previous_pins_before_it_allocates(self):
+        """Why the decode loop never sees a pin.
+
+        Pins live one pass: `schedule` releases the previous batch's before it
+        admits anything. Observable here because the admission below is only
+        possible once the pinned image becomes spendable again.
+        """
+        scheduler = make_scheduler(
+            paged_copy_config(num_kvcache_blocks=3, state_checkpoint_interval_tokens=0),
+            state_runtime=PAGED_COPY_RUNTIME,
+        )
+        # The same pinned pool as the tests above, built inside a scheduler,
+        # with the batch that reads the restore gone out -- which is what the
+        # pin is waiting on.
+        checkpoints = scheduler.block_manager.paged_state_checkpoints
+        assert checkpoints.store.begin_store(33, src_slot=0) is not None
+        checkpoints.store.complete_inflight()
+        assert checkpoints.begin_restore(33, dst_slot=1)
+        scheduler.block_manager.take_state_maintenance_ops()
+        assert not checkpoints.store.has_available_units(1)
+        assert (
+            scheduler.block_manager.can_allocate(stateful_seq(list(range(BLOCK)))) < 0
+        )
+
+        scheduler.add(stateful_seq(list(range(BLOCK))))
+        _, scheduled = scheduler.schedule()
+
+        assert scheduled, "the pass allocated before releasing the previous pin"

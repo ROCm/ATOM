@@ -19,6 +19,7 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME = "model.layers.0.atom_deepseek_v4_proxy"
 ATOM_DEEPSEEK_V4_DRAFT_PROXY_LAYER_PREFIX = "atom_deepseek_v4_draft_proxy"
 ATOM_DEEPSEEK_V4_BLOCK_SIZE = 128
+ATOM_DEEPSEEK_V4_PROXY_ALIGNMENT = 256
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +28,7 @@ logger = logging.getLogger(__name__)
 # fp8 KV cache on any other arch degrades to a bf16 cache instead of hard-failing.
 _V4_FP8_SUPPORTED_GFX = ("gfx950", "gfx1250")
 _V4_FP8_DOWNGRADE_WARNED = False
+_V4_SWA_DEST_RATIOS = (0, 4, 128)
 
 
 def _v4_kv_fp8(vllm_config) -> bool:
@@ -68,21 +70,6 @@ def _v4_rope_head_dim(hf_config) -> int:
     return int(getattr(hf_config, "qk_rope_head_dim", 64))
 
 
-def _v4_entry_bytes(head_dim: int, rope_head_dim: int, kv_fp8: bool) -> int:
-    """Per-KV-entry byte size of the (NoPE + RoPE) payload for one V4 slot.
-
-    bf16: a single ``[head_dim]`` bf16 row (NoPE 448 + RoPE 64 concatenated) =
-    ``head_dim * 2``.
-
-    fp8 2buff: a NoPE fp8 pool row ``[head_dim]`` (1 B/elem -- 448 NoPE + 14 e8m0
-    scales + 50 pad = 512 B) PLUS a parallel bf16 RoPE pool row ``[rope_head_dim]``
-    (2 B/elem). RoPE is never quantized, so it lives in its own bf16 buffer.
-    """
-    if kv_fp8:
-        return head_dim * 1 + rope_head_dim * 2
-    return head_dim * 2
-
-
 def deepseek_v4_draft_proxy_layer_name(hf_config) -> str:
     return (
         f"model.layers.{int(hf_config.num_hidden_layers)}."
@@ -107,22 +94,6 @@ def _layer_counts(hf_config) -> tuple[list[int], int, int, int]:
     return ratios, dense, csa, hca
 
 
-def _classical_block_bytes(hf_config, kv_fp8: bool = False) -> int:
-    _ratios, _dense, csa_layers, hca_layers = _layer_counts(hf_config)
-    head_dim = int(getattr(hf_config, "head_dim", 512))
-    rope_head_dim = _v4_rope_head_dim(hf_config)
-    index_head_dim = int(getattr(hf_config, "index_head_dim", 128))
-    index_dim = _index_row_bytes(index_head_dim)
-    # NoPE(+RoPE) payload bytes per classical entry; fp8 splits into a fp8 NoPE
-    # pool + a bf16 RoPE pool (see _v4_entry_bytes). Indexer is always fp8 and
-    # unchanged by the 2buff layout.
-    entry = _v4_entry_bytes(head_dim, rope_head_dim, kv_fp8)
-    csa_main = (ATOM_DEEPSEEK_V4_BLOCK_SIZE // 4) * entry
-    csa_index = (ATOM_DEEPSEEK_V4_BLOCK_SIZE // 4) * index_dim
-    hca_main = (ATOM_DEEPSEEK_V4_BLOCK_SIZE // 128) * entry
-    return csa_layers * (csa_main + csa_index) + hca_layers * hca_main
-
-
 def _v4_spec_steps(vllm_config) -> int:
     spec = getattr(vllm_config, "speculative_config", None)
     if spec is None:
@@ -135,12 +106,105 @@ def _v4_win_with_spec(vllm_config, window_size: int) -> int:
     return int(window_size) + _v4_spec_steps(vllm_config)
 
 
-def _proxy_page_bytes(vllm_config) -> int:
+def _v4_state_layout(vllm_config, kv_fp8: bool):
+    from atom.model_ops.attentions.state_arena import StateField, plan_field_planes
+
     hf = vllm_config.model_config.hf_config
-    ratios, _dense, _csa, _hca = _layer_counts(hf)
+    _ratios, _dense, n_csa, n_hca = _layer_counts(hf)
+    head_dim = int(getattr(hf, "head_dim", 512))
+    index_head_dim = int(getattr(hf, "index_head_dim", 128))
+    ring_extra = _v4_spec_steps(vllm_config)
+    fields = [
+        StateField("csa_main_kv", n_csa, (8 + ring_extra, 2 * head_dim), torch.float32),
+        StateField(
+            "csa_main_score",
+            n_csa,
+            (8 + ring_extra, 2 * head_dim),
+            torch.float32,
+            float("-inf"),
+        ),
+        StateField(
+            "csa_idx_kv",
+            n_csa,
+            (8 + ring_extra, 2 * index_head_dim),
+            torch.float32,
+        ),
+        StateField(
+            "csa_idx_score",
+            n_csa,
+            (8 + ring_extra, 2 * index_head_dim),
+            torch.float32,
+            float("-inf"),
+        ),
+        # `in_checkpoint=False` for the same reason the native list says so
+        # (`deepseek_v4_attn._state_fields`): HCA pools `[P, P + 128)` with no
+        # overlap, so a checkpoint boundary owes it nothing. This list does not
+        # price an image today — only `plan_field_planes`, which ignores the
+        # flag, reads it — but two declarations of one layout disagreeing about
+        # the one rule `layout_id` fences is exactly what that fence cannot
+        # catch, since the id is derived from the native list alone.
+        StateField(
+            "hca_main_kv",
+            n_hca,
+            (128 + ring_extra, head_dim),
+            torch.float32,
+            in_checkpoint=False,
+        ),
+        StateField(
+            "hca_main_score",
+            n_hca,
+            (128 + ring_extra, head_dim),
+            torch.float32,
+            float("-inf"),
+            in_checkpoint=False,
+        ),
+    ]
+    row_widths = [head_dim * (1 if kv_fp8 else 2)]
+    if kv_fp8:
+        row_widths.append(_v4_rope_head_dim(hf) * 2)
+    planes, arena_rows = plan_field_planes(fields, row_widths)
+    return planes, arena_rows, row_widths
+
+
+def _proxy_region_byte_sizes(
+    *,
+    geometry,
+    csa_layers: int,
+    num_blocks: int,
+    head_dim: int,
+    rope_head_dim: int,
+    index_head_dim: int,
+    kv_fp8: bool,
+) -> list[int]:
+    """Linear proxy layout: [NoPE plane][RoPE plane?][CSA indexers].
+
+    Matches native ``allocate_per_req_cache``: both KV planes are adjacent and
+    ``plan_regions``-aligned; indexer bytes follow. Inserting indexers between
+    the planes breaks ``StateArena``'s 256 B retype boundary on the RoPE plane.
+    """
+    nope_row_bytes = head_dim * (1 if kv_fp8 else 2)
+    regions = [geometry.plane_bytes(nope_row_bytes)]
+    if kv_fp8:
+        regions.append(geometry.plane_bytes(rope_head_dim * 2))
+    regions.append(
+        csa_layers
+        * num_blocks
+        * (ATOM_DEEPSEEK_V4_BLOCK_SIZE // 4)
+        * _index_row_bytes(index_head_dim)
+    )
+    return regions
+
+
+def _proxy_page_bytes(vllm_config) -> int:
+    from atom.model_ops.attentions.v4_pool_geometry import UnifiedPoolGeometry
+
+    hf = vllm_config.model_config.hf_config
+    ratios, _dense, csa_layers, _hca = _layer_counts(hf)
     head_dim = int(getattr(hf, "head_dim", 512))
     rope_head_dim = _v4_rope_head_dim(hf)
+    index_head_dim = int(getattr(hf, "index_head_dim", 128))
     kv_fp8 = _v4_kv_fp8(vllm_config)
+    _arena_planes, arena_rows, _row_widths = _v4_state_layout(vllm_config, kv_fp8)
     win = _v4_win_with_spec(vllm_config, int(getattr(hf, "sliding_window", 128)))
     max_num_seqs = int(getattr(vllm_config.scheduler_config, "max_num_seqs", 1))
     max_model_len = int(vllm_config.model_config.max_model_len)
@@ -149,19 +213,36 @@ def _proxy_page_bytes(vllm_config) -> int:
         (max_model_len + ATOM_DEEPSEEK_V4_BLOCK_SIZE - 1)
         // ATOM_DEEPSEEK_V4_BLOCK_SIZE,
     )
-    # SWA prefix bytes per layer scale with the same (NoPE+RoPE) entry size as the
-    # classical pool so bf16 and fp8 2buff geometry stay in lockstep.
-    swa_bytes = (
-        len(ratios)
-        * max_num_seqs
-        * win
-        * _v4_entry_bytes(head_dim, rope_head_dim, kv_fp8)
+    geometry = UnifiedPoolGeometry(
+        ratios,
+        num_blocks=min_blocks,
+        num_slots=max_num_seqs,
+        ring_slots=win,
+        block_size=ATOM_DEEPSEEK_V4_BLOCK_SIZE,
+        arena_rows=arena_rows,
     )
-    # Amortize fixed SWA state into every vLLM page so total proxy storage can
-    # hold both SWA prefix and classical paged KV while remaining a vLLM KV cache.
-    return _classical_block_bytes(hf, kv_fp8) + (
-        (swa_bytes + min_blocks - 1) // min_blocks
+    from atom.model_ops.attentions.state_arena import plan_regions
+
+    regions = _proxy_region_byte_sizes(
+        geometry=geometry,
+        csa_layers=csa_layers,
+        num_blocks=min_blocks,
+        head_dim=head_dim,
+        rope_head_dim=rope_head_dim,
+        index_head_dim=index_head_dim,
+        kv_fp8=kv_fp8,
     )
+    _, total = plan_regions(regions)
+    # vLLM 0.26 may pack this cache after another layer at a non-aligned
+    # storage offset. Budget one-time leading slack so the runtime carve can
+    # move its first plane to the 256B boundary StateArena requires.
+    total += ATOM_DEEPSEEK_V4_PROXY_ALIGNMENT - 1
+    page_bytes = (total + min_blocks - 1) // min_blocks
+    if page_bytes % ATOM_DEEPSEEK_V4_PROXY_ALIGNMENT:
+        page_bytes += ATOM_DEEPSEEK_V4_PROXY_ALIGNMENT - (
+            page_bytes % ATOM_DEEPSEEK_V4_PROXY_ALIGNMENT
+        )
+    return page_bytes
 
 
 def slice_deepseek_v4_proxy_cache_views(
@@ -176,26 +257,18 @@ def slice_deepseek_v4_proxy_cache_views(
     index_head_dim: int = 128,
     kv_fp8: bool = False,
     rope_head_dim: int = 64,
-) -> dict[str, list[torch.Tensor]]:
-    """Carve ATOM V4 KV views from vLLM-managed proxy KV storage.
+    arena_planes=None,
+    arena_rows: int = 0,
+    row_widths: list[int] | None = None,
+) -> dict[str, object]:
+    """Carve native-equivalent unified V4 planes from vLLM proxy storage."""
+    from atom.model_ops.attentions.state_arena import (
+        SplitStateArena,
+        StateArena,
+        plan_regions,
+    )
+    from atom.model_ops.attentions.v4_pool_geometry import UnifiedPoolGeometry
 
-    Two layouts, selected by ``kv_fp8`` and kept byte-consistent with
-    ``_proxy_page_bytes`` / ``_classical_block_bytes``:
-
-    - bf16 (``kv_fp8=False``): per layer a single NoPE+RoPE pool -- SWA prefix
-      ``[num_slots*window, head_dim]`` bf16 then an optional classical tail
-      ``[num_blocks*k, head_dim]`` bf16 (CSA/HCA); CSA indexer blocks follow the
-      CSA main tail as fp8 bytes. All ``*_rope`` views are ``None``.
-
-    - fp8 2buff (``kv_fp8=True``): the NoPE payload becomes an fp8 pool
-      ``[.., head_dim]`` (1 B/elem, packed 448 NoPE + 14 e8m0 scales + 50 pad)
-      plus a PARALLEL bf16 RoPE pool ``[.., rope_head_dim]`` carved right after
-      the indexer. NoPE and RoPE share identical (block, slot) paged addressing.
-      Per-layer linear order is: swa_nope, main_nope, [indexer], swa_rope,
-      main_rope -- so ``unified`` / ``unified_rope`` are each contiguous swa+main
-      spans, and every bf16 (RoPE) region starts at an even byte offset (all
-      preceding fp8/indexer region sizes are even).
-    """
     if compress_ratios is None:
         assert csa_layer_count is not None and hca_layer_count is not None
         compress_ratios = [4] * csa_layer_count + [128] * hca_layer_count
@@ -206,21 +279,27 @@ def slice_deepseek_v4_proxy_cache_views(
         raise ValueError("DeepSeek V4 proxy cache must be block-major contiguous")
     num_blocks = int(physical.shape[0])
     raw = physical.reshape(-1)
+    if raw.dtype is not torch.uint8:
+        raise ValueError(f"DeepSeek V4 proxy cache must be uint8, got {raw.dtype}")
+    # Packed vLLM KV allocations can start an individual layer on only a 128B
+    # boundary. Consume the sizing slack above so every plane and embedded
+    # StateArena starts on the 256B boundary its retyped field views require.
+    alignment_pad = (-raw.storage_offset()) % ATOM_DEEPSEEK_V4_PROXY_ALIGNMENT
+    raw = raw[alignment_pad:]
     offset = 0
-    unified: list[torch.Tensor] = []
-    swa: list[torch.Tensor] = []
-    csa_main: list[torch.Tensor] = []
+    geometry = UnifiedPoolGeometry(
+        ratios,
+        num_blocks=num_blocks,
+        num_slots=num_slots,
+        ring_slots=window_size,
+        block_size=ATOM_DEEPSEEK_V4_BLOCK_SIZE,
+        arena_rows=arena_rows,
+    )
     csa_indexer: list[torch.Tensor] = []
-    hca_main: list[torch.Tensor] = []
-    # Parallel bf16 RoPE pools (fp8 2buff only). In bf16 these carry ``None`` so
-    # callers can index them uniformly by layer_id / csa_i / hca_i.
-    unified_rope: list[torch.Tensor | None] = []
-    swa_rope: list[torch.Tensor | None] = []
-    csa_main_rope: list[torch.Tensor | None] = []
-    hca_main_rope: list[torch.Tensor | None] = []
+    csa_rows = ATOM_DEEPSEEK_V4_BLOCK_SIZE // 4
+    n_csa = sum(1 for r in ratios if r == 4)
 
     nope_dtype = dtypes.fp8 if kv_fp8 else torch.bfloat16
-    nope_elt = 1 if kv_fp8 else 2  # bytes per NoPE-pool element
 
     def take_bytes(n: int) -> torch.Tensor:
         nonlocal offset
@@ -232,99 +311,107 @@ def slice_deepseek_v4_proxy_cache_views(
         offset += n
         return out
 
-    for ratio in ratios:
-        if ratio == 4:
-            k = ATOM_DEEPSEEK_V4_BLOCK_SIZE // 4
-        elif ratio == 128:
-            k = ATOM_DEEPSEEK_V4_BLOCK_SIZE // 128
-        else:
-            k = 0
+    regions = _proxy_region_byte_sizes(
+        geometry=geometry,
+        csa_layers=n_csa,
+        num_blocks=num_blocks,
+        head_dim=head_dim,
+        rope_head_dim=rope_head_dim,
+        index_head_dim=index_head_dim,
+        kv_fp8=kv_fp8,
+    )
+    region_offsets, layout_total = plan_regions(regions)
 
-        # ---- NoPE pool: SWA prefix + optional classical tail (contiguous) ----
-        nope_start = offset
-        swa_nope = (
-            take_bytes(num_slots * window_size * head_dim * nope_elt)
-            .view(nope_dtype)
-            .view(num_slots, window_size, head_dim)
+    def take_region(region_idx: int) -> torch.Tensor:
+        nonlocal offset
+        start = region_offsets[region_idx]
+        offset = max(offset, start)
+        return take_bytes(regions[region_idx])
+
+    kv_plane = take_region(0).view(nope_dtype).view(geometry.plane_rows, head_dim)
+    region_idx = 1
+    kv_plane_rope = None
+    if kv_fp8:
+        kv_plane_rope = (
+            take_region(region_idx)
+            .view(torch.bfloat16)
+            .view(geometry.plane_rows, rope_head_dim)
         )
-        swa.append(swa_nope)
-        if k:
-            main_nope = (
-                take_bytes(num_blocks * k * head_dim * nope_elt)
-                .view(nope_dtype)
-                .as_strided(
-                    size=(num_blocks, k, head_dim),
-                    stride=(k * head_dim, head_dim, 1),
+        region_idx += 1
+    if n_csa:
+        per_layer_indexer = num_blocks * csa_rows * index_dim
+        indexer_blob = take_region(region_idx)
+        for layer_idx in range(n_csa):
+            sl = indexer_blob[
+                layer_idx * per_layer_indexer : (layer_idx + 1) * per_layer_indexer
+            ]
+            csa_indexer.append(
+                sl.view(dtypes.fp8).view(num_blocks, csa_rows, index_dim)
+            )
+    offset = max(offset, layout_total)
+    planes = [kv_plane]
+    if kv_plane_rope is not None:
+        planes.append(kv_plane_rope)
+    if arena_planes is None or row_widths is None:
+        arena = None
+    else:
+        arena = SplitStateArena(
+            [
+                StateArena(
+                    fields,
+                    geometry.slot_positions,
+                    proxy_kv_cache.device,
+                    buf=plane.view(torch.uint8).reshape(-1),
+                    slot_stride=geometry.slot_rows * row_bytes,
+                    live_entries=num_slots,
                 )
-            )
-            unified.append(
-                raw[nope_start:offset]
-                .view(nope_dtype)
-                .view(num_slots * window_size + num_blocks * k, head_dim)
-            )
-        else:
-            main_nope = None
-            unified.append(swa_nope.view(num_slots * window_size, head_dim))
+                for fields, plane, row_bytes in zip(
+                    arena_planes, planes, row_widths, strict=True
+                )
+            ]
+        )
 
-        # ---- CSA indexer (always fp8, unchanged by the 2buff layout) ----
-        if ratio == 4:
-            idx = (
-                take_bytes(num_blocks * k * index_dim)
-                .view(dtypes.fp8)
-                .as_strided(
-                    size=(num_blocks, k, index_dim),
-                    stride=(k * index_dim, index_dim, 1),
-                )
-            )
-            csa_indexer.append(idx)
+    def layer_views(plane):
+        if plane is None:
+            return [None] * len(ratios)
+        return [plane[geometry.layer_base_row(i) :] for i in range(len(ratios))]
 
-        # ---- Parallel bf16 RoPE pool (fp8 2buff only) ----
-        if kv_fp8:
-            rope_start = offset
-            swa_r = (
-                take_bytes(num_slots * window_size * rope_head_dim * 2)
-                .view(torch.bfloat16)
-                .view(num_slots, window_size, rope_head_dim)
-            )
-            swa_rope.append(swa_r)
-            if k:
-                main_r = (
-                    take_bytes(num_blocks * k * rope_head_dim * 2)
-                    .view(torch.bfloat16)
-                    .as_strided(
-                        size=(num_blocks, k, rope_head_dim),
-                        stride=(k * rope_head_dim, rope_head_dim, 1),
-                    )
-                )
-                unified_rope.append(
-                    raw[rope_start:offset]
-                    .view(torch.bfloat16)
-                    .view(num_slots * window_size + num_blocks * k, rope_head_dim)
-                )
-            else:
-                main_r = None
-                unified_rope.append(swa_r.view(num_slots * window_size, rope_head_dim))
-        else:
-            main_r = None
-            swa_rope.append(None)
-            unified_rope.append(None)
+    unified = layer_views(kv_plane)
+    unified_rope = layer_views(kv_plane_rope)
 
-        # ---- Bucket the classical main (+ its RoPE) by ratio ----
-        if ratio == 4:
-            csa_main.append(main_nope)
-            csa_main_rope.append(main_r)
-        elif ratio == 128:
-            hca_main.append(main_nope)
-            hca_main_rope.append(main_r)
+    def compress_view(plane, layer_id: int):
+        cls = geometry.layer_class(layer_id)
+        envelopes = plane[: num_blocks * geometry.envelope_rows].view(
+            num_blocks, geometry.envelope_rows, plane.shape[1]
+        )
+        base = geometry.layer_base_row(layer_id)
+        return envelopes[:, base : base + cls.block_rows]
+
+    csa_main = [
+        compress_view(kv_plane, i) for i, ratio in enumerate(ratios) if ratio == 4
+    ]
+    hca_main = [
+        compress_view(kv_plane, i) for i, ratio in enumerate(ratios) if ratio == 128
+    ]
+    csa_main_rope = [
+        compress_view(kv_plane_rope, i)
+        for i, ratio in enumerate(ratios)
+        if ratio == 4 and kv_plane_rope is not None
+    ]
+    hca_main_rope = [
+        compress_view(kv_plane_rope, i)
+        for i, ratio in enumerate(ratios)
+        if ratio == 128 and kv_plane_rope is not None
+    ]
 
     return {
+        "geometry": geometry,
+        "state_arena": arena,
         "unified": unified,
-        "swa": swa,
         "csa_main": csa_main,
         "csa_indexer": csa_indexer,
         "hca_main": hca_main,
         "unified_rope": unified_rope,
-        "swa_rope": swa_rope,
         "csa_main_rope": csa_main_rope,
         "hca_main_rope": hca_main_rope,
     }
@@ -513,6 +600,8 @@ class AtomDeepseekV4ProxyAttention(nn.Module, AttentionLayerBase):
     def __init__(self, prefix: str = ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME):
         super().__init__()
         self.prefix = prefix
+        self._atom_v4_proxy_layer = True
+        self._atom_v4_profiling_kv_cache = False
         self.kv_cache = torch.tensor([])
         self.impl = nn.Identity()
 
@@ -536,6 +625,11 @@ def register_deepseek_v4_proxy_layer(
     vllm_config,
     layer_name: str = ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME,
 ) -> AtomDeepseekV4ProxyAttention:
+    from atom.plugin.vllm.deepseek_v4_prefix_patch import (
+        apply_vllm_v4_profile_cache_patch,
+    )
+
+    apply_vllm_v4_profile_cache_patch()
     sfc = vllm_config.compilation_config.static_forward_context
     existing = sfc.get(layer_name)
     if isinstance(existing, AtomDeepseekV4ProxyAttention):
@@ -550,24 +644,16 @@ def register_deepseek_v4_proxy_layer(
 def _bind_compressor_state(
     compressor,
     kv_cache: torch.Tensor,
-    num_slots: int,
     head_dim: int,
     *,
+    kv_state: torch.Tensor,
+    score_state: torch.Tensor,
     is_indexer: bool = False,
     write_mode: str = "bf16",
     kv_cache_rope: torch.Tensor | None = None,
 ) -> None:
-    compressor.kv_state = torch.zeros(
-        (num_slots, *compressor.kv_state.shape[1:]),
-        dtype=torch.float32,
-        device=kv_cache.device,
-    )
-    compressor.score_state = torch.full(
-        (num_slots, *compressor.score_state.shape[1:]),
-        float("-inf"),
-        dtype=torch.float32,
-        device=kv_cache.device,
-    )
+    compressor.kv_state = kv_state
+    compressor.score_state = score_state
     compressor.kv_cache = kv_cache
     if is_indexer:
         nb, csa_rows_per_block, index_row_bytes = kv_cache.shape
@@ -584,10 +670,10 @@ def _bind_compressor_state(
         )
     else:
         compressor.cache_scale = None
-    # #1600 contract: Compressor.forward selects its scatter path from
-    # `write_mode` (was: sniff kv_cache.dtype). The indexer-inner cache is always
-    # fp8 -> "indexer_fp8"; CSA/HCA Main is "bf16" or, under the fp8 2buff layout,
-    # "main_2buff_fp8" with a parallel bf16 RoPE pool bound via `kv_cache_rope`.
+    # Compressor.forward selects its scatter path from `quant_mode`. Keep the
+    # legacy write_mode attribute too for integrations that still consume it.
+    # The indexer-inner cache is per-row fp8; CSA/HCA Main is unquantized or,
+    # under the fp8 2buff layout, group-fp8 with a parallel bf16 RoPE pool.
     compressor.kv_cache_rope = kv_cache_rope
     compressor.write_mode = write_mode
     if is_indexer:
@@ -712,6 +798,9 @@ class _V4DecodeMetaBuffers:
         # torch advanced-indexing AND by the fused flydsl SWA scatter (which
         # loads batch_id as int32); matches the in-tree model_runner path.
         self.batch_id = CpuGpuBuffer(T, dtype=torch.int32, device=device)
+        self.swa_dest_rows = {ratio: i32(T) for ratio in _V4_SWA_DEST_RATIOS}
+        self.n_committed_per_token = i32(T)
+        self.block_tables_per_token = i32(T, self.max_blocks)
         # Ragged cumsums (T + 1) and ragged index pools (worst-case per-token
         # slot counts): SWA = win, CSA = win + index_topk, HCA = win + hca.
         self.indptr_swa = i32(T + 1)
@@ -786,16 +875,15 @@ def bind_deepseek_v4_proxy_cache_views(
         return False
     if not isinstance(proxy.kv_cache, torch.Tensor) or proxy.kv_cache.numel() == 0:
         return False
+    if proxy._atom_v4_profiling_kv_cache:
+        return False
     ptr = proxy.kv_cache.untyped_storage().data_ptr()
     if getattr(model, "_atom_vllm_v4_proxy_cache_ptr", None) == ptr:
         return True
     ratios = [int(r) for r in model.args.compress_ratios]
     num_slots = max(1, int(vllm_config.scheduler_config.max_num_seqs))
-    # Stash the per-request state-slot allocator + the metadata params the
-    # bridge needs but cannot read from common_attn_metadata (the SWA ring pool
-    # size, window, ring stride, and indexer topk). `num_slots == max_num_seqs`
-    # is the actual SWA ring boundary in `unified_kv` (see slicing); the bridge
-    # must use it for `swa_pages`, not the per-forward request count.
+    # Stash the per-request state-slot allocator and the geometry parameters
+    # the bridge cannot read from common_attn_metadata.
     if not hasattr(model, "_atom_v4_slot_allocator"):
         model._atom_v4_slot_allocator = _V4StateSlotAllocator(num_slots)
     window_size = int(model.args.window_size)
@@ -805,19 +893,20 @@ def bind_deepseek_v4_proxy_cache_views(
     # meta_params so the metadata builder stages the fp8 op5 per-token decode
     # index tensors (qo_indptr / kv_last_page_lens) only under fp8.
     kv_fp8 = _v4_kv_fp8(vllm_config)
+    arena_planes, arena_rows, row_widths = _v4_state_layout(vllm_config, kv_fp8)
     rope_head_dim = _v4_rope_head_dim(vllm_config.model_config.hf_config)
-    model._atom_v4_meta_params = SimpleNamespace(
-        num_slots=num_slots,
-        window_size=window_size,
-        # Match native V4 MTP: the SWA ring stride includes in-flight draft
-        # steps so MTP>1 writes do not alias the target decode window.
-        cs=win_with_spec,
-        index_topk=int(getattr(model.args, "index_topk", 1024)),
-        kv_fp8=kv_fp8,
-    )
     # CSA/HCA Main scatter mode: fp8 2buff -> "main_2buff_fp8" (nope fp8 + parallel
     # bf16 rope), else the plain bf16 scatter. The indexer is always "indexer_fp8".
     main_write_mode = "main_2buff_fp8" if kv_fp8 else "bf16"
+    physical = proxy.kv_cache.permute(1, 0, 2, 3, 4)
+    if not physical.is_contiguous():
+        raise ValueError("DeepSeek V4 proxy cache must be block-major contiguous")
+    raw = physical.reshape(-1)
+    if raw.storage_offset() % 256:
+        raise RuntimeError(
+            f"DeepSeek V4 proxy KV storage offset {raw.storage_offset()} is not "
+            "256B-aligned; StateArena cannot retype carved planes safely"
+        )
     views = slice_deepseek_v4_proxy_cache_views(
         proxy.kv_cache,
         compress_ratios=ratios,
@@ -827,17 +916,29 @@ def bind_deepseek_v4_proxy_cache_views(
         index_head_dim=int(model.args.index_head_dim),
         kv_fp8=kv_fp8,
         rope_head_dim=rope_head_dim,
+        arena_planes=arena_planes,
+        arena_rows=arena_rows,
+        row_widths=row_widths,
+    )
+    geometry = views["geometry"]
+    model._atom_v4_geometry = geometry
+    arena = views["state_arena"]
+    model._atom_v4_meta_params = SimpleNamespace(
+        num_slots=num_slots,
+        window_size=window_size,
+        cs=win_with_spec,
+        index_topk=int(getattr(model.args, "index_topk", 1024)),
+        kv_fp8=kv_fp8,
+        geometry=geometry,
     )
     for fallback_layer_id, block in enumerate(_deepseek_v4_blocks(model)):
         attn = block.attn
         layer_id = int(getattr(attn, "layer_id", fallback_layer_id))
         ratio = int(attn.compress_ratio)
         attn.unified_kv = views["unified"][layer_id]
-        # The shared kernels address SWA as a per-request ring,
-        # `slot*cache_size + pos%cache_size`, which is the layout this pool
-        # already had; it is exposed flat because the kernels index rows.
-        swa_view = views["swa"][layer_id]
-        attn.swa_kv = swa_view.reshape(-1, swa_view.shape[-1])
+        attn.swa_kv = attn.unified_kv
+        attn.swa_plane = attn.unified_kv
+        attn.swa_window = geometry.window_params(ratio)
         attn.swa_cache_size = int(win_with_spec)
         # #1600 contract: DeepseekV4Attention.forward reads unified_kv_rope /
         # swa_kv_rope unconditionally (the parallel bf16 rope pool of the fp8
@@ -849,18 +950,20 @@ def bind_deepseek_v4_proxy_cache_views(
         attn.kv_fp8 = kv_fp8
         if kv_fp8:
             attn.unified_kv_rope = views["unified_rope"][layer_id]
-            swa_rope_view = views["swa_rope"][layer_id]
-            attn.swa_kv_rope = swa_rope_view.reshape(-1, swa_rope_view.shape[-1])
+            attn.swa_kv_rope = attn.unified_kv_rope
+            attn.swa_plane_rope = attn.unified_kv_rope
         else:
             attn.unified_kv_rope = None
             attn.swa_kv_rope = None
+            attn.swa_plane_rope = None
         if ratio == 4:
             csa_i = _compressed_layer_cache_index(ratios, layer_id, ratio)
             _bind_compressor_state(
                 attn.compressor,
                 views["csa_main"][csa_i],
-                num_slots,
                 int(model.args.head_dim),
+                kv_state=arena.view("csa_main_kv")[csa_i],
+                score_state=arena.view("csa_main_score")[csa_i],
                 write_mode=main_write_mode,
                 kv_cache_rope=views["csa_main_rope"][csa_i],
             )
@@ -871,8 +974,9 @@ def bind_deepseek_v4_proxy_cache_views(
             _bind_compressor_state(
                 attn.indexer.compressor,
                 views["csa_indexer"][csa_i],
-                num_slots,
                 int(model.args.index_head_dim),
+                kv_state=arena.view("csa_idx_kv")[csa_i],
+                score_state=arena.view("csa_idx_score")[csa_i],
                 is_indexer=True,
                 write_mode="indexer_fp8",
             )
@@ -881,8 +985,9 @@ def bind_deepseek_v4_proxy_cache_views(
             _bind_compressor_state(
                 attn.compressor,
                 views["hca_main"][hca_i],
-                num_slots,
                 int(model.args.head_dim),
+                kv_state=arena.view("hca_main_kv")[hca_i],
+                score_state=arena.view("hca_main_score")[hca_i],
                 write_mode=main_write_mode,
                 kv_cache_rope=views["hca_main_rope"][hca_i],
             )
@@ -935,16 +1040,25 @@ def reset_deepseek_v4_state_slots(model, slots) -> None:
             break
     if device is None:
         return
-    idx = torch.as_tensor(
-        sorted(int(s) for s in slots), dtype=torch.long, device=device
-    )
+    physical_slots = sorted(int(s) for s in slots)
+    idx = torch.as_tensor(physical_slots, dtype=torch.long, device=device)
     for block in layers:
         attn = getattr(block, "attn", None)
         if attn is None:
             continue
-        swa = getattr(attn, "swa_kv", None)
-        if isinstance(swa, torch.Tensor):
-            swa[idx] = 0
+        swa = getattr(attn, "swa_plane", None)
+        window = getattr(attn, "swa_window", None)
+        if isinstance(swa, torch.Tensor) and window is not None:
+            rows = [
+                window.index(slot, pos)
+                for slot in physical_slots
+                for pos in range(window.ring_slots)
+            ]
+            row_idx = torch.as_tensor(rows, dtype=torch.long, device=device)
+            swa[row_idx] = 0
+            swa_rope = getattr(attn, "swa_plane_rope", None)
+            if isinstance(swa_rope, torch.Tensor):
+                swa_rope[row_idx] = 0
         for compressor in (
             getattr(attn, "compressor", None),
             getattr(getattr(attn, "indexer", None), "compressor", None),
@@ -1260,10 +1374,11 @@ def build_atom_v4_attention_metadata(
         md.swa_window = int(meta_params.window_size)
         md.swa_cs = int(meta_params.cs)
         md.index_topk = int(meta_params.index_topk)
+        md.pool_geometry = meta_params.geometry
+        md.envelope_rows = int(meta_params.geometry.envelope_rows)
     else:
-        # Standalone/test fallback: per-forward request count is the ring pool,
-        # default window/topk. Production always passes meta_params (bound at
-        # cache-bind time) so swa_pages tracks the real max_num_seqs boundary.
+        # Standalone/test fallback. Production always passes meta_params bound
+        # from the proxy cache before metadata reaches the model forward.
         md.swa_num_slots = num_reqs
         md.swa_window = 128
         md.swa_cs = 128
@@ -1327,7 +1442,11 @@ def build_atom_v4_attention_metadata(
         # -1 so the per-token decode kernels never read them.
         slot_arr = np.zeros(num_reqs, dtype=np.int32)
         slot_arr[:scheduled_bs] = slot_real
-    md.reset_slots = reset_slots
+    physical_slot_arr = np.asarray(
+        [md.pool_geometry.physical_slot(int(slot)) for slot in slot_arr],
+        dtype=np.int32,
+    )
+    md.reset_slots = {md.pool_geometry.physical_slot(int(slot)) for slot in reset_slots}
 
     n_csa_cpu = (seq_np // 4).astype(np.int32)
     n_hca_cpu = (seq_np // 128).astype(np.int32)
@@ -1338,13 +1457,13 @@ def build_atom_v4_attention_metadata(
 
     if decode_persistent:
         bufs = decode_bufs
-        md.state_slot_out_cpu = slot_arr
-        md.state_slot_out = bufs.stage(bufs.state_slot_out, slot_arr)
-        md.state_slot_in = bufs.stage(bufs.state_slot_in, slot_arr)
+        md.state_slot_out_cpu = physical_slot_arr
+        md.state_slot_out = bufs.stage(bufs.state_slot_out, physical_slot_arr)
+        md.state_slot_in = bufs.stage(bufs.state_slot_in, physical_slot_arr)
         # Bridge-local helpers still use the legacy single-slot spelling. It is
         # the write slot because paged-index generation addresses the state
         # populated by this forward.
-        md.state_slot_mapping_cpu = slot_arr
+        md.state_slot_mapping_cpu = physical_slot_arr
         md.state_slot_mapping = md.state_slot_out
         # Per-token seq map padded to T_pad with the -1 sentinel tail.
         if total:
@@ -1376,6 +1495,22 @@ def build_atom_v4_attention_metadata(
             pos_np = (chunk_start_np[batch_np] + within).astype(np.int32)
         else:
             pos_np = np.zeros(0, dtype=np.int32)
+        visible_np = np.zeros(T_pad, dtype=np.int32)
+        if total:
+            visible_np[:total] = np.minimum(
+                (pos_np + 1) // 4, n_csa_cpu[batch_np]
+            ).astype(np.int32)
+        md.n_committed_per_token = bufs.stage(bufs.n_committed_per_token, visible_np)
+        block_cols = int(common_attn_metadata.block_table_tensor.shape[1])
+        block_rows = bufs.block_tables_per_token.gpu[:T_pad, :block_cols]
+        safe_batch_ids = md.batch_id_per_token[:T_pad].clamp_min(0).long()
+        torch.index_select(
+            common_attn_metadata.block_table_tensor,
+            0,
+            safe_batch_ids,
+            out=block_rows,
+        )
+        md.block_tables_per_token = block_rows
         _populate_decode_persistent(
             md,
             common_attn_metadata,
@@ -1415,11 +1550,11 @@ def build_atom_v4_attention_metadata(
         return md
 
     # ---- eager path: prefill, or decode without persistent buffers ----
-    md.state_slot_out = torch.from_numpy(slot_arr).to(device)
+    md.state_slot_out = torch.from_numpy(physical_slot_arr).to(device)
     md.state_slot_in = md.state_slot_out.clone()
-    md.state_slot_out_cpu = slot_arr
+    md.state_slot_out_cpu = physical_slot_arr
     md.state_slot_mapping = md.state_slot_out
-    md.state_slot_mapping_cpu = slot_arr
+    md.state_slot_mapping_cpu = physical_slot_arr
     md.batch_id_per_token = torch.from_numpy(batch_np).to(device)
     md.n_committed_csa_per_seq = torch.from_numpy(n_csa_cpu).to(device)
     md.n_committed_hca_per_seq = torch.from_numpy(n_hca_cpu).to(device)
@@ -1431,6 +1566,10 @@ def build_atom_v4_attention_metadata(
         positions = torch.arange(total, dtype=torch.int64, device=device)
     pos_np = positions[:total].detach().cpu().numpy().astype(np.int32)
     if is_decode:
+        visible_np = np.minimum((pos_np + 1) // 4, n_csa_cpu[batch_np]).astype(np.int32)
+        md.n_committed_per_token = torch.from_numpy(visible_np).to(device)
+        batch_ids = torch.from_numpy(batch_np).to(device=device, dtype=torch.long)
+        md.block_tables_per_token = common_attn_metadata.block_table_tensor[batch_ids]
         _populate_decode(md, common_attn_metadata, batch_np, pos_np, positions)
         # Eager fp8 decode (no persistent buffers -- standalone/tests, or a
         # batch that skips CG capture): fresh per-token op5 index tensors. Not
@@ -1528,13 +1667,13 @@ def _populate_decode_persistent(
     buffer base so their data pointers are stable across builds (the captured
     decode-attention kernels read these addresses on replay).
     """
-    from atom.plugin.vllm.deepseek_v4_ops import write_v4_decode_indices_fused
+    from atom.model_ops.v4_kernels import write_v4_paged_decode_indices
+    from atom.plugin.vllm.deepseek_v4_ops import (
+        write_v4_decode_hca_compress_tail,
+    )
 
     win = int(md.swa_window)
-    cs = int(md.swa_cs)
     index_topk = int(md.index_topk)
-    swa_pages = int(md.swa_num_slots) * cs
-    md.swa_pages = swa_pages
     n_csa_cpu = md.n_committed_csa_per_seq_cpu
     n_hca_cpu = md.n_committed_hca_per_seq_cpu
 
@@ -1560,19 +1699,19 @@ def _populate_decode_persistent(
     hca_indptr_gpu = bufs.stage(bufs.indptr_hca, hca_indptr)
     hca_total = int(hca_indptr[total]) if total else 0
 
-    # Build the whole decode index set on-GPU with one fused Triton kernel
-    # writing directly into the persistent idx buffers. Each token's program
-    # writes both its SWA window prefix (slice tail of SWA / CSA / HCA) and its
-    # HCA compress section (slice head of HCA: `swa_pages + block_tables[seq, j]`,
-    # read straight from GPU). The two segments are disjoint and together cover
+    # Build the decode index set directly in persistent GPU buffers. The core
+    # geometry kernel writes the SWA window prefix at each slice tail; the HCA
+    # helper writes compressed rows at each slice head from the GPU block table.
+    # The two segments are disjoint and together cover
     # the full HCA segment `[hca_indptr[t], hca_indptr[t+1])`, so no `-1`
     # pre-fill is needed. This replaces the prior CPU HCA-tail scatter (a
     # per-step block-table D2H + numpy repeat/cumsum/fancy-index + H2D). T ==
     # real tokens; the `-1` batch_id pad tail is skipped natively by the kernel.
     swa_indices_gpu = bufs.idx_swa.gpu
     csa_indices_gpu = bufs.idx_csa.gpu
-    write_v4_decode_indices_fused(
-        state_slot_per_seq=md.state_slot_mapping,
+    dest_rows = {ratio: buf.gpu for ratio, buf in bufs.swa_dest_rows.items()}
+    write_v4_paged_decode_indices(
+        state_slot_per_seq=md.state_slot_out,
         batch_id_per_token=md.batch_id_per_token,
         positions=positions_gpu,
         swa_indptr=swa_indptr_gpu,
@@ -1581,20 +1720,29 @@ def _populate_decode_persistent(
         swa_indices=swa_indices_gpu,
         csa_indices=csa_indices_gpu,
         hca_indices=bufs.idx_hca.gpu,
-        n_committed_hca_per_seq=md.n_committed_hca_per_seq,
-        block_tables=common.block_table_tensor,
+        dest_rows=dest_rows,
         T=total,
         win=win,
-        cs=cs,
-        swa_pages=swa_pages,
+        geometry=md.pool_geometry,
     )
+    write_v4_decode_hca_compress_tail(
+        batch_id_per_token=md.batch_id_per_token,
+        positions=positions_gpu,
+        hca_indptr=hca_indptr_gpu,
+        n_committed_hca_per_seq=md.n_committed_hca_per_seq,
+        block_tables=common.block_table_tensor,
+        hca_indices=bufs.idx_hca.gpu,
+        T=total,
+        win=win,
+        envelope_rows=md.pool_geometry.envelope_rows,
+    )
+    md.swa_dest_rows = dest_rows
     md.kv_indices_swa = swa_indices_gpu[: int(swa_indptr[total])]
     md.kv_indices_csa = csa_indices_gpu[: int(csa_indptr[total])]
     md.kv_indices_hca = bufs.idx_hca.gpu[: max(hca_total, 0)]
     md.kv_indptr_swa = swa_indptr_gpu
     md.kv_indptr_csa = csa_indptr_gpu
     md.kv_indptr_hca = hca_indptr_gpu
-    md.swa_pages = swa_pages
 
 
 def _populate_indexer(
@@ -1680,10 +1828,7 @@ def _populate_prefill(md, common, batch_np, pos_np, q_np, positions_gpu):
     T = len(batch_np)
     num_reqs = int(common.num_reqs)
     win = int(md.swa_window)
-    cs = int(md.swa_cs)
     index_topk = int(md.index_topk)
-    swa_pages = int(md.swa_num_slots) * cs
-    md.swa_pages = swa_pages
     if T == 0:
         empty = torch.empty(0, dtype=torch.int32, device=device)
         zero1 = torch.zeros(1, dtype=torch.int32, device=device)
@@ -1752,8 +1897,9 @@ def _populate_prefill(md, common, batch_np, pos_np, q_np, positions_gpu):
     csa_indptr = torch.from_numpy(csa_indptr_np).to(device)
     hca_indptr = torch.from_numpy(hca_indptr_np).to(device)
 
-    # scatter on-GPU with native ATOM's Triton kernel (one
-    # program per token; avoids an O(T) Python loop).
+    # Scatter on-GPU with the plugin-local kernel: vLLM's proxy layout keeps
+    # each layer's SWA ring before its compressed pages, unlike native ATOM's
+    # interleaved unified-pool geometry.
     from atom.model_ops.v4_kernels import write_v4_paged_prefill_indices
 
     ext_indices = torch.empty(max(ext_total, 1), dtype=torch.int32, device=device)
@@ -1772,7 +1918,7 @@ def _populate_prefill(md, common, batch_np, pos_np, q_np, positions_gpu):
         bid_per_token=md.batch_id_per_token[:T],
         chunk_start_per_seq=chunk_start_g,
         cu_seqlens_q_per_seq=cu_q_g,
-        state_slot_per_seq=md.state_slot_mapping[:num_reqs],
+        state_slot_per_seq=md.state_slot_out[:num_reqs],
         n_committed_hca_per_seq=n_hca_seq_g,
         block_tables=common.block_table_tensor[:num_reqs],
         extend_indptr=ext_indptr,
@@ -1785,8 +1931,8 @@ def _populate_prefill(md, common, batch_np, pos_np, q_np, positions_gpu):
         prefix_hca_indices=hca_indices,
         T=T,
         win=win,
-        cache_size=cs,
-        swa_pages=swa_pages,
+        geometry=md.pool_geometry,
+        hca_rows_per_block=ATOM_DEEPSEEK_V4_BLOCK_SIZE // 128,
     )
     md.kv_indices_extend = ext_indices[:ext_total]
     md.kv_indices_prefix_swa = swa_indices[:swa_total]
@@ -1803,12 +1949,6 @@ def _populate_prefill(md, common, batch_np, pos_np, q_np, positions_gpu):
 def _populate_decode(md, common, batch_np, pos_np, positions_gpu):
     device = md.state_slot_mapping.device
     win = int(md.swa_window)
-    cs = int(md.swa_cs)
-    # SWA ring boundary in unified_kv is num_slots*cs (the real pool size, ==
-    # max_num_seqs), not the per-forward request count -- the HCA compress tail
-    # (swa_pages + block_id) lands in the wrong region otherwise once a sequence
-    # is long enough to commit HCA entries (>=128 tokens).
-    swa_pages = int(md.swa_num_slots) * cs
     index_topk = int(md.index_topk)
     swa_counts = np.minimum(pos_np + 1, win).astype(np.int32)
     csa_counts = np.minimum(
@@ -1827,9 +1967,7 @@ def _populate_decode(md, common, batch_np, pos_np, positions_gpu):
     hca_indptr = torch.from_numpy(hca_indptr_np).to(device)
     T = len(batch_np)
 
-    # On-GPU build (mirrors the persistent decode path): one kernel writes
-    # the shared SWA window prefix into all three buffers, a second appends
-    # the HCA compress tail straight from the GPU block table
+    # On-GPU build mirrors the persistent path and uses vLLM's proxy layout.
     from atom.model_ops.v4_kernels import write_v4_paged_decode_indices
     from atom.plugin.vllm.deepseek_v4_ops import (
         write_v4_decode_hca_compress_tail,
@@ -1838,8 +1976,12 @@ def _populate_decode(md, common, batch_np, pos_np, positions_gpu):
     swa_indices = torch.empty(max(swa_total, 1), dtype=torch.int32, device=device)
     csa_indices = torch.empty(max(csa_total, 1), dtype=torch.int32, device=device)
     hca_indices = torch.empty(max(hca_total, 1), dtype=torch.int32, device=device)
+    dest_rows = {
+        ratio: torch.empty(max(T, 1), dtype=torch.int32, device=device)
+        for ratio in _V4_SWA_DEST_RATIOS
+    }
     write_v4_paged_decode_indices(
-        state_slot_per_seq=md.state_slot_mapping,
+        state_slot_per_seq=md.state_slot_out,
         batch_id_per_token=md.batch_id_per_token,
         positions=positions_gpu,
         swa_indptr=swa_indptr,
@@ -1848,9 +1990,10 @@ def _populate_decode(md, common, batch_np, pos_np, positions_gpu):
         swa_indices=swa_indices,
         csa_indices=csa_indices,
         hca_indices=hca_indices,
+        dest_rows=dest_rows,
         T=T,
         win=win,
-        cache_size=cs,
+        geometry=md.pool_geometry,
     )
     write_v4_decode_hca_compress_tail(
         batch_id_per_token=md.batch_id_per_token,
@@ -1861,8 +2004,9 @@ def _populate_decode(md, common, batch_np, pos_np, positions_gpu):
         hca_indices=hca_indices,
         T=T,
         win=win,
-        swa_pages=swa_pages,
+        envelope_rows=md.pool_geometry.envelope_rows,
     )
+    md.swa_dest_rows = dest_rows
     md.kv_indices_swa = swa_indices[:swa_total]
     md.kv_indices_csa = csa_indices[:csa_total]
     md.kv_indices_hca = hca_indices[:hca_total]
@@ -1870,7 +2014,6 @@ def _populate_decode(md, common, batch_np, pos_np, positions_gpu):
     md.kv_indptr_swa = swa_indptr
     md.kv_indptr_csa = csa_indptr
     md.kv_indptr_hca = hca_indptr
-    md.swa_pages = swa_pages
 
 
 def get_deepseek_v4_proxy_metadata_from_vllm_context(
@@ -1954,11 +2097,23 @@ def atom_deepseek_v4_forward_context(
         common_attn_metadata = get_deepseek_v4_proxy_metadata_from_vllm_context(
             proxy_layer_name
         )
-    # Fast path: the proxy metadata builder already built the ATOM metadata into
-    # persistent buffers (outside any captured region) and attached it. This is
-    # the only path that is CUDA/HIP-graph safe -- the captured forward merely
-    # reads it. The per-slot reset was already applied in build().
-    attn_metadata = getattr(common_attn_metadata, "atom_v4_md", None)
+    if force_dummy:
+        # vLLM 0.26 captures throwaway graphs while profiling memory with a
+        # deliberately minimal KV cache. V4 attention short-circuits when
+        # Context.is_dummy_run is set, so avoid building real metadata here:
+        # that fallback allocates and copies tensors, which HIP forbids inside
+        # stream capture.
+        attn_metadata = SimpleNamespace(
+            state=SimpleNamespace(value="profile"),
+            in_hipgraph=False,
+        )
+    else:
+        # Fast path: the proxy metadata builder already built the ATOM metadata
+        # into persistent buffers (outside any captured region) and attached it.
+        # This is the only path that is CUDA/HIP-graph safe -- the captured
+        # forward merely reads it. The per-slot reset was already applied in
+        # build().
+        attn_metadata = getattr(common_attn_metadata, "atom_v4_md", None)
     if attn_metadata is None:
         # Fallback (profiling / dummy / standalone, before the proxy cache is
         # bound): build inline with fresh tensors. Never captured.
@@ -1988,10 +2143,11 @@ def atom_deepseek_v4_forward_context(
             reset_slots = getattr(attn_metadata, "reset_slots", None)
             if reset_slots:
                 reset_deepseek_v4_state_slots(state_model, reset_slots)
-    in_hipgraph = bool(getattr(attn_metadata, "in_hipgraph", False)) or (
-        _is_vllm_decode_graph_phase(attn_metadata, atom_config)
+    in_hipgraph = not force_dummy and (
+        bool(getattr(attn_metadata, "in_hipgraph", False))
+        or _is_vllm_decode_graph_phase(attn_metadata, atom_config)
     )
-    is_prefill = attn_metadata.state.value.startswith("prefill")
+    is_prefill = not force_dummy and attn_metadata.state.value.startswith("prefill")
     batch_size = int(
         getattr(common_attn_metadata, "num_reqs", 0)
         or (input_ids.shape[0] if input_ids is not None else 0)

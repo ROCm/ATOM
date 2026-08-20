@@ -1,7 +1,33 @@
 import functools
 import logging
 
+from atom.utils import envs
+
 logger = logging.getLogger("atom")
+
+
+def _make_atom_compatible_eagle3_type(original_cls, atom_model_base):
+    """Return a real type that accepts native and ATOM EAGLE3 models.
+
+    vLLM keeps concrete model classes directly inside an ``isinstance`` tuple.
+    Replacing one of those globals with a tuple creates a nested tuple and makes
+    ``isinstance`` raise ``TypeError``. A type with a custom instance check
+    widens the same guard without changing vLLM's proposer implementation.
+    """
+
+    class _AtomCompatibleEagle3Meta(type):
+        def __instancecheck__(cls, instance):
+            return isinstance(instance, (original_cls, atom_model_base))
+
+    return _AtomCompatibleEagle3Meta(
+        original_cls.__name__,
+        (),
+        {
+            "__module__": original_cls.__module__,
+            "_atom_eagle3_model_type_proxy": True,
+            "_atom_original_type": original_cls,
+        },
+    )
 
 
 def _patch_eagle3_model_type_checks() -> None:
@@ -11,9 +37,10 @@ def _patch_eagle3_model_type_checks() -> None:
     # through the ATOMModelBase wrapper, so patch the type checks to accept the
     # ATOMModelBase wrapper
     try:
+        from vllm.v1.spec_decode import llm_base_proposer
+
         from atom.plugin.vllm.model_wrapper import ATOMModelBase
-        import vllm.v1.spec_decode.llm_base_proposer as llm_base_proposer
-    except Exception:
+    except Exception:  # noqa: BLE001
         logger.warning(
             "vLLM plugin: failed to patch vLLM V1 EAGLE3 proposer type checks. "
             "This can happen if you are using an in-compatible vLLM version. "
@@ -24,19 +51,80 @@ def _patch_eagle3_model_type_checks() -> None:
     if getattr(llm_base_proposer, "_atom_eagle3_model_types_patched", False):
         return
 
-    # Supported archs in vLLM's `llm_base_proposer.py`
+    # Widen one class in vLLM's isinstance tuple. A single proxy is sufficient
+    # because it accepts ATOMModelBase while preserving the native class check.
     for name in ("Eagle3LlamaForCausalLM", "Eagle3DeepseekV2ForCausalLM"):
         original = getattr(llm_base_proposer, name, None)
         if original is None:
             continue
         if isinstance(original, tuple):
-            widened = (*original, ATOMModelBase)
-        else:
-            widened = (original, ATOMModelBase)
-        setattr(llm_base_proposer, name, widened)
+            original = original[0]
+        setattr(
+            llm_base_proposer,
+            name,
+            _make_atom_compatible_eagle3_type(original, ATOMModelBase),
+        )
+        break
 
-    setattr(llm_base_proposer, "_atom_eagle3_model_types_patched", True)
+    llm_base_proposer._atom_eagle3_model_types_patched = True
     logger.info("ATOM plugin: patched vLLM EAGLE3 proposer type checks.")
+
+
+def _patch_dspark_fused_markov_sample() -> None:
+    """Sample the DSpark block with the fused Markov bias+argmax kernel.
+
+    Upstream spells each position as ``argmax(base_logits[:, i] +
+    markov_bias(markov_embed(prev)))``, casting the ``[V, r]`` W2 table to fp32
+    and materializing a ``[B, V]`` bias and sum per position: ~566MB of traffic
+    at B=64, V=163840 to pick one id. ``markov_argmax`` fuses that into one
+    kernel plus a small cross-tile reduce (~106MB), W2 left bf16.
+
+    Greedy only -- the probabilistic branch writes its processed logits out for
+    the target's rejection sampler, so it needs them materialized.
+
+    Gated because the bias GEMV moves from fp32 matmul to bf16 MFMA with an fp32
+    accumulator: equal up to accumulation order, not bit-identical.
+    """
+    if not envs.ATOM_DSPARK_FUSED_MARKOV_SAMPLE:
+        return
+    try:
+        from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
+    except ImportError:
+        return
+
+    original_sample = DSparkSpeculator._sample_sequential
+    if getattr(original_sample, "_atom_dspark_fused_markov_patched", False):
+        return
+
+    @functools.wraps(original_sample)
+    def wrapped_sample_sequential(self, num_reqs: int, head_hidden):
+        markov_argmax = getattr(self.model, "markov_argmax", None)
+        if markov_argmax is None or self.draft_logits is not None:
+            return original_sample(self, num_reqs, head_hidden)
+
+        n_spec = self.num_speculative_steps
+        num_sample = num_reqs * n_spec
+        sample_hidden = head_hidden[self.sample_indices[:num_sample]]
+        base_logits = self.model.compute_draft_logits(sample_hidden)
+        base_logits = base_logits.view(num_reqs, n_spec, base_logits.shape[-1])
+        # Anchor (bonus) token per request, read through upstream's precomputed
+        # persistent index so the capture sees a fixed buffer.
+        prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
+        for i in range(n_spec):
+            # map_draft_to_target is kept in the loop, not just on the output:
+            # upstream feeds the MAPPED id back as the next step's Markov
+            # conditioning token, and that ordering is part of the draft.
+            prev = self.model.map_draft_to_target(
+                markov_argmax(base_logits[:, i], prev)
+            )
+            self.draft_tokens[:num_reqs, i] = prev
+
+    wrapped_sample_sequential._atom_dspark_fused_markov_patched = True
+    DSparkSpeculator._sample_sequential = wrapped_sample_sequential
+    logger.info(
+        "ATOM plugin: sampling the DSpark block with the fused Markov "
+        "bias+argmax kernel (greedy drafting only)."
+    )
 
 
 def _get_attn_backend_block_size(backend) -> int:
@@ -537,10 +625,13 @@ def _patch_vllm_deepseek_v4_mtp_first_pass_inputs() -> None:
 
 def apply_vllm_spec_decode_patch() -> None:
     """Patch vLLM speculative decoding for ATOM metadata compatibility."""
+    _patch_dspark_fused_markov_sample()
     _patch_vllm_llm_base_model_sharing()
     _patch_vllm_draft_kv_group_validation()
     _patch_vllm_draft_positions_on_metadata()
     _patch_vllm_deepseek_v4_mtp_first_pass_inputs()
+
+    from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
 
     from atom.plugin.vllm.attention.metadata import (
         AiterMhaMetadataForVllm,
@@ -551,7 +642,6 @@ def apply_vllm_spec_decode_patch() -> None:
     from atom.utils.forward_context import (
         AttentionMetaData as AtomAttentionMetaData,
     )
-    from vllm.v1.spec_decode.eagle import SpecDecodeBaseProposer
 
     _patch_eagle3_model_type_checks()
     _patch_heterogeneous_eagle3_kv_cache()

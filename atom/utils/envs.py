@@ -45,9 +45,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ATOM remaps the SGLang world into internal TP x PCP groups.
     # 0 means unset.
     "ATOM_SGLANG_PCP_SIZE": lambda: int(os.getenv("ATOM_SGLANG_PCP_SIZE", "0") or "0"),
-    "STATE_CKPT_EXTRA_ENTRIES": lambda: int(
-        os.getenv("STATE_CKPT_EXTRA_ENTRIES", "0") or "0"
-    ),
     # --- Compilation & Execution ---
     "ATOM_USE_TRITON_GEMM": lambda: os.getenv("ATOM_USE_TRITON_GEMM", "0") == "1",
     "ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE": lambda: (
@@ -330,9 +327,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD": lambda: int(
         os.getenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "1024")
     ),
+    # Fuse into a per-rank replica without EPLB. EPLB always fuses it as routed.
+    "ATOM_FUSE_SHARED_EXPERT": lambda: (
+        os.getenv("ATOM_FUSE_SHARED_EXPERT", "1").lower() == "1"
+    ),
     # Gate/Up interleave mode for MoE weight preshuffle and kernel gate_mode.
     # "0" (default) = SEPARATED layout; "1" = INTERLEAVE layout.
     "ATOM_MOE_GU_ITLV": lambda: os.getenv("ATOM_MOE_GU_ITLV", "0") == "1",
+    # --- MoE all2all (MoRI) wire format ---
+    "ATOM_MORI_FP4_DISPATCH": lambda: (os.getenv("ATOM_MORI_FP4_DISPATCH", "0") == "1"),
+    # Combine-side codec. "none" (the MoRI default) sends bf16 back;
+    # "fp8_blockwise" selects EpCombineIntraNodeKernel_*_fp8bwq_*.
+    "ATOM_MORI_COMBINE_QUANT": lambda: os.getenv("ATOM_MORI_COMBINE_QUANT", "none"),
     # --- MTP (relaxed mtp for quantized mtp) ---
     "ATOM_ENABLE_RELAXED_MTP": lambda: (
         os.getenv("ATOM_ENABLE_RELAXED_MTP", "0").lower() == "1"
@@ -408,6 +414,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Default: False (run the draft model normally).
     "ATOM_DEBUG_FORCE_SKIP_DRAFT_MODEL": lambda: (
         os.getenv("ATOM_DEBUG_FORCE_SKIP_DRAFT_MODEL", "0") == "1"
+    ),
+    # Run the DSpark draft model eager, bypassing torch.compile, while leaving
+    # the target compiled. Rollback lever for the draft's compiled path; prefer
+    # it over --level 0, which disables compilation for BOTH models. Note that
+    # --enforce-eager does NOT disable it: support_torch_compile keys off
+    # compilation_config.level only (see atom/utils/decorators.py:485).
+    # Default: False (compile the draft).
+    "ATOM_DSPARK_DISABLE_COMPILE": lambda: (
+        os.getenv("ATOM_DSPARK_DISABLE_COMPILE", "0") == "1"
     ),
     # NOTE: DSpark runtime knobs (confidence_schedule, ragged,
     # ragged_graph_sizes, q_buckets, disable_sps_calib) are no longer env vars.
