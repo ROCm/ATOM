@@ -47,6 +47,13 @@ class KVCacheTensor:
     # DSA sparse layers (GLM-5.2 / DeepSeek-V3.2): indexer key cache, block-major
     # ``(num_blocks, block_size, aligned_index_dim)``. Omitted for non-DSA layers.
     index_cache: torch.Tensor | None = None
+    # True when the tensors above are a hybrid's PER-REQUEST state (GDN/KDA
+    # recurrent state, the V4 compressor ring) rather than paged KV. They belong
+    # in ``kv_cache_data`` -- the linear-attention forward reads them from there
+    # -- but are addressed by request slot, so no block-addressed mover may
+    # touch them. The dense codec skips them; the state tier reaches the same
+    # bytes through ``state_entry_views``.
+    per_request_state: bool = False
 
 
 @dataclass

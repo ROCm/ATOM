@@ -139,6 +139,29 @@ class Sequence:
         # exactly one forward. -1 = read and write the same group, the case for
         # every step in between.
         self.state_fork_src = -1
+        # Content hash of a checkpoint the tier was asked to fetch back into
+        # `per_req_cache_group`, or -1. Tells the scheduler to park, and tells
+        # the failure path that `num_cached_tokens` is claiming undelivered
+        # state.
+        self.state_load_hash = -1
+        # The LMCache-resident KV prefix in tokens, as this admission's lookup
+        # reported it -- the KV leg's ceiling. Written before `can_allocate`,
+        # which is where the two legs agree on one boundary. 0 = no lookup.
+        self.offload_kv_prefix_tokens = 0
+        # The connector's LMCache chunk size, in tokens, or 0. The KV leg moves
+        # whole chunks, so a joint boundary has to be a multiple of it.
+        self.offload_kv_chunk_tokens = 0
+        # The boundary both legs of a joint load are aimed at, or 0. Chosen by
+        # `can_allocate`: the rightmost checkpoint rung the LMCache KV prefix
+        # covers. `num_cached_tokens` stays at the HBM prefix until both legs
+        # report, which keeps the forward honest if either fails.
+        self.state_joint_boundary_tokens = 0
+        # Content hash of that boundary's last block, for the state leg.
+        self.state_joint_boundary_hash = -1
+        # How far the KV leg transfers, in tokens: the LMCache chunk that
+        # *covers* the boundary above, which is at or past it. The request still
+        # only claims the boundary -- see `_claim_after_load`.
+        self.state_joint_kv_tokens = 0
         self.temperature = sampling_params.temperature
         self.top_k = sampling_params.top_k
         self.top_p = sampling_params.top_p

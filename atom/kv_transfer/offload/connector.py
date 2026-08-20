@@ -7,7 +7,8 @@ The public connector name stays stable while the implementation is selected on
 both the scheduler and worker from configuration alone:
 
 * ``dense`` stores ordinary token-indexed KV chunks;
-* ``hybrid`` stores DSV4 compressed PAGE chunks plus complete SLOT sidecars.
+* ``hybrid`` stores DSV4 compressed PAGE chunks plus complete SLOT sidecars;
+* ``kimi_k3`` stores dense MLA KV plus a KDA per-request state tier.
 
 Keeping selection config-only is important because the scheduler process does
 not have access to the worker's transfer tensors.
@@ -42,6 +43,13 @@ def _build_worker(config):
 
         return DSV4OffloadConnector(config)
 
+    if variant == "kimi_k3":
+        from atom.kv_transfer.offload.hybrid.kimi_k3.connector import (
+            KimiK3OffloadConnector,
+        )
+
+        return KimiK3OffloadConnector(config)
+
     from atom.kv_transfer.offload.dense.connector import DenseOffloadConnector
 
     return DenseOffloadConnector(config)
@@ -56,6 +64,13 @@ def _build_scheduler(config):
         )
 
         return DSV4OffloadScheduler(config)
+
+    if variant == "kimi_k3":
+        from atom.kv_transfer.offload.hybrid.kimi_k3.connector import (
+            KimiK3OffloadScheduler,
+        )
+
+        return KimiK3OffloadScheduler(config)
 
     from atom.kv_transfer.offload.dense.connector import DenseOffloadScheduler
 
@@ -140,6 +155,14 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
 
     def process_completions(self, output):
         return self._impl.process_completions(output)
+
+    def enqueue_state_loads(self, loads) -> bool:
+        callback = getattr(self._impl, "enqueue_state_loads", None)
+        return bool(callback(loads)) if callback is not None else False
+
+    def take_state_reports(self):
+        callback = getattr(self._impl, "take_state_reports", None)
+        return callback() if callback is not None else (set(), set(), set())
 
     def get_statistics(self) -> dict[str, int]:
         return self._impl.get_statistics()

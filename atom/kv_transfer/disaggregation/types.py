@@ -337,6 +337,10 @@ def connector_metadata_has_work(metadata: object | None) -> bool:
         bool(getattr(metadata, name, None))
         for name in (
             "requests",
+            # A state load carries no `LMCacheReqMeta` but a request is parked
+            # waiting for each one, so dropping the meta would leave them
+            # parked against a report nobody was asked to produce.
+            "state_loads",
             "lookup_requests_in_step",
             "reqs_to_recv",
             "reqs_to_save",
