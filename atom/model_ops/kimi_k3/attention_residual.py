@@ -470,6 +470,207 @@ direct_register_custom_op(
 )
 
 
+def _gate_call(
+    prefix_sum: torch.Tensor,
+    block_residual: torch.Tensor,
+    score_weight: torch.Tensor,
+    eps: float,
+    add_hidden: torch.Tensor | None,
+    out_norm_weight: torch.Tensor | None,
+    out_eps: float,
+    add_hidden2: torch.Tensor | None,
+    close_block: bool,
+    out_quant_dtype: torch.dtype | None,
+):
+    """The raw aiter call, shared by the four custom ops below."""
+    from aiter.ops.triton.fusions.attn_res import attn_res_gate
+
+    out = attn_res_gate(
+        prefix_sum,
+        block_residual,
+        score_weight,
+        eps,
+        add_hidden,
+        add_hidden2,
+        output_rms_weight=out_norm_weight,
+        output_rms_eps=out_eps,
+        close_block=close_block,
+        out_quant_dtype=out_quant_dtype,
+    )
+    if add_hidden is None:
+        # With no addends the kernel has nothing to write, so attn_res_gate
+        # hands the prefix input straight back. A custom op must not return an
+        # alias of one of its inputs, so give that case its own storage. Only
+        # the model's first layer takes this path (every later one defers an
+        # FFN output into add_hidden), so the copy is not on the hot path.
+        out = (out[0], out[1].clone(), *out[2:])
+    return out
+
+
+def _gate_scale_shape(prefix_sum: torch.Tensor) -> tuple[int, int]:
+    # attn_res_gate flattens the prefix to [N, D] and emits one fp32 scale per
+    # row, returned un-viewed as [N, 1] (the layout the consuming Linears take).
+    return prefix_sum.numel() // prefix_sum.shape[-1], 1
+
+
+def _attn_res_gate_op(
+    prefix_sum: torch.Tensor,
+    block_residual: torch.Tensor,
+    score_weight: torch.Tensor,
+    eps: float,
+    add_hidden: torch.Tensor | None = None,
+    out_norm_weight: torch.Tensor | None = None,
+    out_eps: float = 1e-6,
+    add_hidden2: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _gate_call(
+        prefix_sum, block_residual, score_weight, eps, add_hidden,
+        out_norm_weight, out_eps, add_hidden2, False, None,
+    )
+
+
+def _attn_res_gate_op_fake(
+    prefix_sum: torch.Tensor,
+    block_residual: torch.Tensor,
+    score_weight: torch.Tensor,
+    eps: float,
+    add_hidden: torch.Tensor | None = None,
+    out_norm_weight: torch.Tensor | None = None,
+    out_eps: float = 1e-6,
+    add_hidden2: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(prefix_sum), torch.empty_like(prefix_sum)
+
+
+def _attn_res_gate_close_block_op(
+    prefix_sum: torch.Tensor,
+    block_residual: torch.Tensor,
+    score_weight: torch.Tensor,
+    eps: float,
+    add_hidden: torch.Tensor | None = None,
+    out_norm_weight: torch.Tensor | None = None,
+    out_eps: float = 1e-6,
+    add_hidden2: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return _gate_call(
+        prefix_sum, block_residual, score_weight, eps, add_hidden,
+        out_norm_weight, out_eps, add_hidden2, True, None,
+    )
+
+
+def _attn_res_gate_close_block_op_fake(
+    prefix_sum: torch.Tensor,
+    block_residual: torch.Tensor,
+    score_weight: torch.Tensor,
+    eps: float,
+    add_hidden: torch.Tensor | None = None,
+    out_norm_weight: torch.Tensor | None = None,
+    out_eps: float = 1e-6,
+    add_hidden2: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    T, B, H = block_residual.shape
+    return (
+        torch.empty_like(prefix_sum),
+        torch.empty_like(prefix_sum),
+        torch.empty((T, B + 1, H), device=block_residual.device,
+                    dtype=block_residual.dtype),
+    )
+
+
+def _attn_res_gate_quant_op(
+    prefix_sum: torch.Tensor,
+    block_residual: torch.Tensor,
+    score_weight: torch.Tensor,
+    eps: float,
+    out_quant_dtype: torch.dtype,
+    add_hidden: torch.Tensor | None = None,
+    out_norm_weight: torch.Tensor | None = None,
+    out_eps: float = 1e-6,
+    add_hidden2: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    (y, y_scale), prefix_out = _gate_call(
+        prefix_sum, block_residual, score_weight, eps, add_hidden,
+        out_norm_weight, out_eps, add_hidden2, False, out_quant_dtype,
+    )
+    return y, y_scale, prefix_out
+
+
+def _attn_res_gate_quant_op_fake(
+    prefix_sum: torch.Tensor,
+    block_residual: torch.Tensor,
+    score_weight: torch.Tensor,
+    eps: float,
+    out_quant_dtype: torch.dtype,
+    add_hidden: torch.Tensor | None = None,
+    out_norm_weight: torch.Tensor | None = None,
+    out_eps: float = 1e-6,
+    add_hidden2: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return (
+        torch.empty(prefix_sum.shape, device=prefix_sum.device,
+                    dtype=out_quant_dtype),
+        torch.empty(_gate_scale_shape(prefix_sum), device=prefix_sum.device,
+                    dtype=torch.float32),
+        torch.empty_like(prefix_sum),
+    )
+
+
+def _attn_res_gate_quant_close_block_op(
+    prefix_sum: torch.Tensor,
+    block_residual: torch.Tensor,
+    score_weight: torch.Tensor,
+    eps: float,
+    out_quant_dtype: torch.dtype,
+    add_hidden: torch.Tensor | None = None,
+    out_norm_weight: torch.Tensor | None = None,
+    out_eps: float = 1e-6,
+    add_hidden2: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    (y, y_scale), prefix_out, block_out = _gate_call(
+        prefix_sum, block_residual, score_weight, eps, add_hidden,
+        out_norm_weight, out_eps, add_hidden2, True, out_quant_dtype,
+    )
+    return y, y_scale, prefix_out, block_out
+
+
+def _attn_res_gate_quant_close_block_op_fake(
+    prefix_sum: torch.Tensor,
+    block_residual: torch.Tensor,
+    score_weight: torch.Tensor,
+    eps: float,
+    out_quant_dtype: torch.dtype,
+    add_hidden: torch.Tensor | None = None,
+    out_norm_weight: torch.Tensor | None = None,
+    out_eps: float = 1e-6,
+    add_hidden2: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    T, B, H = block_residual.shape
+    return (
+        torch.empty(prefix_sum.shape, device=prefix_sum.device,
+                    dtype=out_quant_dtype),
+        torch.empty(_gate_scale_shape(prefix_sum), device=prefix_sum.device,
+                    dtype=torch.float32),
+        torch.empty_like(prefix_sum),
+        torch.empty((T, B + 1, H), device=block_residual.device,
+                    dtype=block_residual.dtype),
+    )
+
+
+for _name, _fn, _fake in (
+    ("kimi_k3_attn_res_gate", _attn_res_gate_op, _attn_res_gate_op_fake),
+    ("kimi_k3_attn_res_gate_close_block", _attn_res_gate_close_block_op,
+     _attn_res_gate_close_block_op_fake),
+    ("kimi_k3_attn_res_gate_quant", _attn_res_gate_quant_op,
+     _attn_res_gate_quant_op_fake),
+    ("kimi_k3_attn_res_gate_quant_close_block",
+     _attn_res_gate_quant_close_block_op,
+     _attn_res_gate_quant_close_block_op_fake),
+):
+    direct_register_custom_op(
+        op_name=_name, op_func=_fn, mutates_args=[], fake_impl=_fake
+    )
+
+
 @mark_trace
 def apply_attn_res(
     prefix_sum: torch.Tensor,
@@ -504,22 +705,46 @@ def apply_attn_res(
     what the consuming Linears take without re-quantizing. Requires
     ``out_norm_weight``.
 
+    The call goes through the ``kimi_k3_attn_res_gate*`` custom ops rather than
+    calling ``attn_res_gate`` directly, and that is load-bearing rather than
+    cosmetic: aiter allocates the kernel's outputs with ``torch.empty`` and fills
+    them from a raw Triton launch, and Inductor does not see those stores, so a
+    direct call inside a compiled region returns UNINITIALIZED memory -- silently,
+    with no error. (Dynamo and AOTAutograd are fine; ``backend="eager"`` and
+    ``"aot_eager"`` both match eager bit for bit, only ``"inductor"`` breaks.) The
+    custom op is opaque to Inductor, which restores correctness. Which op runs is
+    a static property of the call site, so the branching costs nothing at runtime
+    and each op keeps a single fixed return arity -- torch's schema inference has
+    no representation for the nested ``((fp8, scale), prefix)`` tuple, hence the
+    flat returns re-nested here.
+
     The local Triton kernel above (``_apply_attn_res_impl`` and the
     ``kimi_k3_apply_attn_res*`` custom ops) is no longer on this path; it stays
     registered as the A/B baseline for the aiter kernel and is reachable directly
     via ``torch.ops.aiter.kimi_k3_apply_attn_res*``.
     """
-    from aiter.ops.triton.fusions.attn_res import attn_res_gate
+    if out_quant_dtype is None:
+        if not close_block:
+            return torch.ops.aiter.kimi_k3_attn_res_gate(
+                prefix_sum, block_residual, score_weight, eps, add_hidden,
+                out_norm_weight, out_eps, add_hidden2,
+            )
+        return torch.ops.aiter.kimi_k3_attn_res_gate_close_block(
+            prefix_sum, block_residual, score_weight, eps, add_hidden,
+            out_norm_weight, out_eps, add_hidden2,
+        )
 
-    return attn_res_gate(
-        prefix_sum,
-        block_residual,
-        score_weight,
-        eps,
-        add_hidden,
-        add_hidden2,
-        output_rms_weight=out_norm_weight,
-        output_rms_eps=out_eps,
-        close_block=close_block,
-        out_quant_dtype=out_quant_dtype,
+    if not close_block:
+        y, y_scale, prefix_out = torch.ops.aiter.kimi_k3_attn_res_gate_quant(
+            prefix_sum, block_residual, score_weight, eps, out_quant_dtype,
+            add_hidden, out_norm_weight, out_eps, add_hidden2,
+        )
+        return (y, y_scale), prefix_out
+
+    y, y_scale, prefix_out, block_out = (
+        torch.ops.aiter.kimi_k3_attn_res_gate_quant_close_block(
+            prefix_sum, block_residual, score_weight, eps, out_quant_dtype,
+            add_hidden, out_norm_weight, out_eps, add_hidden2,
+        )
     )
+    return (y, y_scale), prefix_out, block_out
