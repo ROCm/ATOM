@@ -1,9 +1,11 @@
 import logging
-from typing import Union, NamedTuple, ClassVar, TYPE_CHECKING
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, ClassVar, NamedTuple, Union
+
 import torch
 
 if TYPE_CHECKING:
+    from atom.model_ops.fused_moe.expert_layout import MoEExpertLayout
     from atom.model_ops.moe import FusedMoEParallelConfig
 
 logger = logging.getLogger("atom")
@@ -304,6 +306,7 @@ class FusedMoEConfig:
 
     num_local_experts: int
     moe_parallel_config: "FusedMoEParallelConfig"
+    expert_layout: "MoEExpertLayout"
 
     # The activation type.
     in_dtype: torch.dtype | str | None = None

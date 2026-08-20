@@ -39,6 +39,8 @@ from atom.model_ops.fused_moe.config import (
     mxfp4_w4a16_moe_quant_config,
 )
 from atom.model_ops.fused_moe.expert_layout import (
+    MoEExpertLayout,
+    SharedExpertMode,
     count_local_base_experts,
     determine_expert_map,
     expert_region,
@@ -51,6 +53,7 @@ from atom.model_ops.fused_moe.modular_kernel import (
     FusedMoEPrepareAndFinalize,
 )
 from atom.model_ops.fused_moe.mori_prepare_finalize import MoriPrepareAndFinalize
+from atom.model_ops.fused_moe.shared_expert_dispatch import remap_topk_to_dispatch
 from atom.model_ops.topK import (
     init_aiter_topK_meta_data,
     is_rocm_aiter_fuse_routed_scaling_factor,
@@ -455,14 +458,23 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             custom_routing_function=custom_routing_function,
             scoring_func=scoring_func,
             e_score_correction_bias=e_score_correction_bias,
-            num_routing_experts=layer.global_num_experts - layer.num_redundant_experts,
-            num_fused_shared_experts=layer.num_fused_shared_experts,
+            num_routing_experts=layer.expert_layout.num_routed,
+            num_fused_shared_experts=(
+                0
+                if layer.expert_layout.uses_all2all_fusion
+                else layer.num_fused_shared_experts
+            ),
             fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
             routed_scaling_factor=layer.routed_scaling_factor,
         )
-        # Fused logical->physical remap + expert-load record
+        if layer.expert_layout.shared_is_routed:
+            # EPLB places and records shared experts with routed experts.
+            topk_weights, topk_logical = layer.append_shared_logical_column(
+                topk_weights, topk_logical
+            )
+            return topk_weights, eplb_map_and_record_fused(layer, topk_logical)
         topk_physical = eplb_map_and_record_fused(layer, topk_logical)
-        return topk_weights, topk_physical
+        return layer.to_dispatch_space(topk_weights, topk_physical)
 
     @staticmethod
     def _maybe_make_prepare_finalize(
@@ -523,7 +535,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 "max_num_tokens_per_dp_rank": moe.max_num_tokens,
                 # input_dtype=moe.in_dtype,
                 "input_dtype": moe.in_dtype,
-                "num_local_experts": moe.num_experts // all2all_manager.world_size,
+                "num_local_experts": moe.num_local_experts,
                 "num_experts_per_token": moe.experts_per_token,
                 "gpu_per_node": moe.moe_parallel_config.local_ep_size,
             }
@@ -548,7 +560,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 # Match max_num_tokens_per_dp_rank / max_tokens_per_rank (= moe.max_num_tokens);
                 # leaving this hardcoded 16384 truncates the TBO mori buffer at mbt>16384.
                 "max_num_inp_token_per_rank": moe.max_num_tokens,
-                "num_local_experts": moe.num_experts // all2all_manager.world_size,
+                "num_local_experts": moe.num_local_experts,
                 "num_experts_per_token": moe.experts_per_token,
                 "gpu_per_node": moe.moe_parallel_config.local_ep_size,
                 "data_type_itemsize": moe.in_dtype.itemsize,
@@ -1580,11 +1592,10 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
             quant="a8w4",
         )
 
-    def get_eplb_weight_views(
-        self, layer: torch.nn.Module, num_local_experts: int
-    ) -> list[torch.Tensor]:
-        """Expose live Mega weights as expert-major aliases for EPLB."""
+    def get_eplb_weight_views(self, layer: torch.nn.Module) -> list[torch.Tensor]:
+        """Return expert-major views owned by EPLB."""
         views: list[torch.Tensor] = []
+        local_num_experts = layer.local_num_experts
         for name in (
             "_mega_w1",
             "_mega_w1_scale",
@@ -1594,13 +1605,14 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
             tensor = getattr(layer, name, None)
             if not isinstance(tensor, torch.Tensor):
                 raise TypeError(f"MegaMoE weight {name!r} was not prepared")
-            if not tensor.is_contiguous() or tensor.numel() % num_local_experts != 0:
+            if not tensor.is_contiguous() or tensor.numel() % local_num_experts != 0:
                 raise RuntimeError(
-                    "MegaMoE EPLB weight must be contiguous and evenly divisible "
-                    f"by local experts: name={name!r}, shape={tuple(tensor.shape)}, "
-                    f"num_local_experts={num_local_experts}."
+                    "MegaMoE weight must be contiguous and evenly divisible by "
+                    "local_num_experts: "
+                    f"name={name!r}, shape={tuple(tensor.shape)}, "
+                    f"local_num_experts={local_num_experts}."
                 )
-            views.append(tensor.view(num_local_experts, -1))
+            views.append(tensor.view(local_num_experts, -1))
         return views
 
 
@@ -2540,35 +2552,8 @@ class FusedMoE(torch.nn.Module):
         self.moe_parallel_config = FusedMoEParallelConfig.make(
             tp_size, dp_size, atom_config
         )
-        self.num_redundant_experts = (
-            int(getattr(atom_config.eplb_config, "num_redundant_experts", 0))
-            if self.use_ep and getattr(atom_config, "eplb_enable", False)
-            else 0
-        )
-        # physical slots = routed experts + EPLB redundant replicas
-        self.global_num_experts = num_experts + self.num_redundant_experts
-        if self.use_ep:
-            assert self.global_num_experts % self.ep_size == 0, (
-                "EPLB physical experts must be divisible by ep_size: "
-                f"num_logical={num_experts}, "
-                f"num_redundant={self.num_redundant_experts}, ep_size={self.ep_size}"
-            )
-        self.register_buffer("expert_map", None, persistent=False)
-        self.register_buffer("expert_mask", None, persistent=False)
-        if self.use_ep:
-            self.local_num_experts, self.expert_map = determine_expert_map(
-                ep_size=self.ep_size,
-                ep_rank=self.ep_rank,
-                global_num_experts=self.global_num_experts,
-            )
-        else:
-            self.local_num_experts = self.global_num_experts
-        self.top_k = top_k
-        self.shared_expert_scoring_func = shared_expert_scoring_func
-
         if shared_expert_prefix is None and prefix.endswith(".experts"):
             shared_expert_prefix = prefix[: -len(".experts")] + ".shared_experts"
-
         fuse_shared_experts = (
             is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
                 quant_config,
@@ -2576,27 +2561,61 @@ class FusedMoE(torch.nn.Module):
                 routed_expert_prefix=prefix,
             )
         )
-        self.num_fused_shared_experts = (
-            config.n_shared_experts
-            if config is not None
-            and hasattr(config, "n_shared_experts")
-            and fuse_shared_experts
+        num_fused_shared_experts = (
+            getattr(config, "n_shared_experts", 0) if fuse_shared_experts else 0
+        )
+
+        eplb_enabled = self.use_ep and getattr(atom_config, "eplb_enable", False)
+        num_redundant_experts = (
+            int(getattr(atom_config.eplb_config, "num_redundant_experts", 0))
+            if eplb_enabled
             else 0
         )
+        self.expert_layout = MoEExpertLayout.make(
+            num_routed=num_experts,
+            num_fused_shared_experts=num_fused_shared_experts,
+            num_configured_redundant=num_redundant_experts,
+            ep_size=self.ep_size,
+            use_all2all=self.moe_parallel_config.use_all2all_kernels,
+            eplb_enabled=eplb_enabled,
+        )
+        # Dispatch space: the id bound the kernels see, not the routed width.
+        self.global_num_experts = self.expert_layout.num_physical
+        self.num_redundant_experts = self.expert_layout.num_redundant
+        if self.use_ep:
+            assert self.global_num_experts % self.ep_size == 0, (
+                "EPLB physical experts must be divisible by ep_size: "
+                f"num_logical={self.expert_layout.num_logical}, "
+                f"num_redundant={self.num_redundant_experts}, ep_size={self.ep_size}"
+            )
+        self.register_buffer("expert_map", None, persistent=False)
+        self.register_buffer("expert_mask", None, persistent=False)
+        if self.use_ep:
+            # Routed width: expert_map is indexed by checkpoint expert ids.
+            self.local_num_experts, self.expert_map = determine_expert_map(
+                ep_size=self.ep_size,
+                ep_rank=self.ep_rank,
+                global_num_experts=self.expert_layout.num_routed_physical,
+            )
+        else:
+            self.local_num_experts = self.global_num_experts
+        self.top_k = top_k
+        self.shared_expert_scoring_func = shared_expert_scoring_func
         self.routed_scaling_factor = (
             getattr(config, "routed_scaling_factor", 1.0)
             if config is not None and atom_config.torch_dtype != torch.float16
             else 1.0
         )
-        if self.use_ep:
-            expert_mask = torch.ones(
-                (self.global_num_experts + self.num_fused_shared_experts + 1,),
-                dtype=torch.int32,
-                device=self.expert_map.device,
+        if (
+            self.expert_layout.uses_dispatch_remap
+            and custom_routing_function is not None
+        ):
+            raise NotImplementedError(
+                "Fusing shared experts into the all2all dispatch does not "
+                "support custom routing functions; those still depend on "
+                "the legacy AITER shared-expert metadata."
             )
-            expert_mask[-1] = 0
-            expert_mask[: self.global_num_experts] = self.expert_map > -1
-            self.expert_mask = expert_mask
+        if self.use_ep and not self.expert_layout.shared_is_routed:
             self.expert_map = torch.cat(
                 (
                     self.expert_map,
@@ -2607,15 +2626,35 @@ class FusedMoE(torch.nn.Module):
                         ],
                         dtype=torch.int32,
                     ),
-                    # Sentinel entry for the fake expert ID
-                    # (global_num_experts + num_fused_shared_experts) used by
-                    # aiter topK to mark non-local tokens when EP is active.
-                    # Must map to -1 so that EP remapping zeros their weights.
+                    # Sentinel used by aiter topK for non-local tokens.
                     torch.tensor([-1], dtype=torch.int32),
                 ),
                 dim=0,
             )
-        if fuse_shared_experts and self.num_fused_shared_experts > 0:
+        if self.expert_layout.mode in (
+            SharedExpertMode.LEGACY_AITER,
+            SharedExpertMode.LOCAL_REPLICA,
+        ):
+            self.local_num_experts += self.num_fused_shared_experts
+        if self.expert_layout.uses_all2all_fusion and self.layer_id in (None, 0):
+            logger.info(
+                "Shared expert fusion: mode=%s, local_num_experts=%d, topk=%d",
+                self.expert_layout.mode.name,
+                self.local_num_experts,
+                self.top_k + self.num_fused_shared_experts,
+            )
+        if self.use_ep:
+            if self.expert_layout.uses_dispatch_remap:
+                self.expert_mask = torch.zeros(
+                    self.global_num_experts,
+                    dtype=torch.int32,
+                    device=self.expert_map.device,
+                )
+                start = self.ep_rank * self.local_num_experts
+                self.expert_mask[start : start + self.local_num_experts] = 1
+            else:
+                self.expert_mask = (self.expert_map > -1).to(torch.int32)
+        if self.expert_layout.mode is SharedExpertMode.LEGACY_AITER:
             init_aiter_topK_meta_data(
                 n_routed_experts=num_experts,
                 n_shared_experts=self.num_fused_shared_experts,
@@ -2630,8 +2669,6 @@ class FusedMoE(torch.nn.Module):
                 max_num_tokens=atom_config.max_num_batched_tokens,
                 is_EP=self.use_ep,
             )
-        if fuse_shared_experts:
-            self.local_num_experts += self.num_fused_shared_experts
         assert intermediate_size % self.tp_size == 0
         self.hidden_size = hidden_size
         self.intermediate_size_per_partition = intermediate_size // self.tp_size
@@ -2669,10 +2706,11 @@ class FusedMoE(torch.nn.Module):
 
         moe = FusedMoEConfig(
             num_experts=self.global_num_experts,
-            experts_per_token=self.top_k,
+            experts_per_token=self.top_k + self.num_fused_shared_experts,
             hidden_dim=hidden_size,
             num_local_experts=self.local_num_experts,
             moe_parallel_config=self.moe_parallel_config,
+            expert_layout=self.expert_layout,
             in_dtype=atom_config.torch_dtype,
             a_quant_dtype=a_quant_dtype,
             max_num_tokens=atom_config.max_num_batched_tokens,
@@ -2707,6 +2745,13 @@ class FusedMoE(torch.nn.Module):
             )
 
         assert self.quant_method is not None
+        if self.expert_layout.uses_all2all_fusion and not isinstance(
+            self.quant_method, Mxfp4MoEMethod
+        ):
+            raise NotImplementedError(
+                "Shared-expert fusion is only wired up for the MXFP4 MoE path, got "
+                f"{type(self.quant_method).__name__}"
+            )
 
         # Override weight padding alignment before create_weights consumes it.
         # Must happen here (pre-create_weights) — setting it on quant_method
@@ -2729,6 +2774,65 @@ class FusedMoE(torch.nn.Module):
         compilation_config.static_forward_context[prefix] = self
         self.layer_name = prefix
 
+    @property
+    def num_fused_shared_experts(self) -> int:
+        return self.expert_layout.num_fused_shared_experts
+
+    @property
+    def shared_expert_weight(self) -> float:
+        if is_rocm_aiter_fuse_routed_scaling_factor():
+            return 1.0
+        return 1.0 / self.routed_scaling_factor
+
+    @property
+    def shared_dispatch_base(self) -> int:
+        """This rank's first pinned shared slot, in dispatch space."""
+        return (
+            self.ep_rank * self.local_num_experts
+            + self.expert_layout.routed_physical_per_rank
+        )
+
+    def to_dispatch_space(
+        self, topk_weights: torch.Tensor, topk_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Widen physical ids and pin this rank's shared column onto them."""
+        if not self.expert_layout.uses_dispatch_remap:
+            return topk_weights, topk_ids
+        return remap_topk_to_dispatch(
+            topk_weights,
+            topk_ids,
+            self.expert_layout.num_routed_physical,
+            self.expert_layout.routed_physical_per_rank,
+            self.shared_dispatch_base,
+            self.num_fused_shared_experts,
+            self.shared_expert_weight,
+        )
+
+    def append_shared_logical_column(
+        self,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Append shared experts to routed logical columns."""
+        num_tokens = topk_ids.shape[0]
+        num_fused_shared_experts = self.num_fused_shared_experts
+        shared_ids = torch.arange(
+            self.expert_layout.num_routed,
+            self.expert_layout.num_routed + num_fused_shared_experts,
+            dtype=topk_ids.dtype,
+            device=topk_ids.device,
+        ).expand(num_tokens, num_fused_shared_experts)
+        shared_w = torch.full(
+            (num_tokens, num_fused_shared_experts),
+            self.shared_expert_weight,
+            dtype=topk_weights.dtype,
+            device=topk_weights.device,
+        )
+        return (
+            torch.cat((topk_weights, shared_w), dim=1),
+            torch.cat((topk_ids, shared_ids), dim=1),
+        )
+
     def process_weights_after_loading(self):
         self._online_quant()
         self._validate_moe_backend()
@@ -2740,6 +2844,11 @@ class FusedMoE(torch.nn.Module):
             raise TypeError(
                 "moe_backend='mega' currently supports only MXFP4/A8W4 MoE, "
                 f"got {type(self.quant_method).__name__}"
+            )
+        if self.expert_layout.mode is SharedExpertMode.LEGACY_AITER:
+            raise NotImplementedError(
+                "moe_backend='mega' requires the shared expert to be fused into "
+                "the dispatch space; the legacy AITER fusion is unsupported."
             )
 
     def _online_quant(self):
@@ -3487,7 +3596,7 @@ class FusedMoE(torch.nn.Module):
         """Local slots holding a routed base expert, i.e. slots `[0, n)`."""
         return count_local_base_experts(
             expert_map=self.expert_map,
-            global_num_experts=self.global_num_experts,
+            global_num_experts=self.expert_layout.num_routed_physical,
             num_redundant_experts=self.num_redundant_experts,
             local_num_experts=self.local_num_experts,
             num_fused_shared_experts=self.num_fused_shared_experts,
@@ -3538,9 +3647,7 @@ class FusedMoE(torch.nn.Module):
         # process_weights_after_loading has already read every local slot.
         # create_weights hands them out as torch.empty, so zero them here --
         # the whole-buffer flush this replaced used to do it as a side effect.
-        for slot in range(
-            n_base, self.local_num_experts - self.num_fused_shared_experts
-        ):
+        for slot in range(n_base, self.expert_layout.routed_physical_per_rank):
             dst[slot].zero_()
 
     def weight_loader(

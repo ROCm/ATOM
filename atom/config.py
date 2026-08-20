@@ -69,12 +69,21 @@ class CUDAGraphMode(enum.Enum):
     FULL = 2
     FULL_DECODE_ONLY = (FULL, NONE)
     FULL_AND_PIECEWISE = (FULL, PIECEWISE)
+    # AF_PIECEWISE ("attention/FFN-wise"): PIECEWISE + attention core in its own
+    # cudagraph (DSpark). Tuple so decode/mixed_mode resolve to PIECEWISE (existing
+    # == PIECEWISE checks treat it as such); extra capture gated by is_attn_ffn_piecewise().
+    AF_PIECEWISE = (PIECEWISE, PIECEWISE)
 
     def decode_mode(self) -> "CUDAGraphMode":
         return CUDAGraphMode(self.value[0]) if self.separate_routine() else self
 
     def mixed_mode(self) -> "CUDAGraphMode":
         return CUDAGraphMode(self.value[1]) if self.separate_routine() else self
+
+    def is_attn_ffn_piecewise(self) -> bool:
+        """True only for AF_PIECEWISE — gates the extra attention-core cudagraph
+        (attention/FFN-wise capture) on top of the standard piecewise pieces."""
+        return self is CUDAGraphMode.AF_PIECEWISE
 
     def requires_piecewise_compilation(self) -> bool:
         return (
@@ -144,6 +153,13 @@ class CompilationConfig:
     - FULL.
     - FULL_DECODE_ONLY.
     - FULL_AND_PIECEWISE.
+    - AF_PIECEWISE.
+
+    AF_PIECEWISE ("attention/FFN-wise") mode: PIECEWISE where the attention
+    core is ALSO captured into its own cudagraph with zero-copy public buffers
+    (DeepSeek-V4 DSpark), so small-batch decode is all-replay with no eager
+    attention gap between the dense pieces. Falls back to plain PIECEWISE
+    behavior for models that don't implement the attention-core capture.
 
     PIECEWISE mode build piecewise cudagraph only, keeping the cudagraph
     incompatiable ops (i.e. some attention ops) outside the cudagraph
@@ -995,12 +1011,24 @@ class SpeculativeConfig:
     draft_model_hf_config: PretrainedConfig | None = None
     use_aux_hidden_state: bool = False
     eagle3_aux_layer_ids: list[int] = field(default_factory=list)
-    # Debug/benchmark knob: when set (float in [0, 1]), the rejection sampler
-    # force-accepts draft tokens with a position-decaying probability calibrated
-    # so the measured mean acceptance rate matches this value, independent of the
-    # real draft/target agreement. Mirrors vLLM's synthetic_acceptance_rate. See
-    # ROCm/ATOM#555.
+    # Debug/benchmark knobs: force a speculative acceptance curve independent of
+    # the real draft/target agreement, so a run can replay a published
+    # acceptance-length figure (an InferenceX golden AL, say) while the draft head
+    # is still training. Set at most one; both resolve into
+    # `synthetic_acceptance_rates`. See ROCm/ATOM#555.
+    #
+    # Mean acceptance length in [1, num_speculative_tokens + 1], counting the
+    # target's own guaranteed token -- the same unit as vLLM's
+    # synthetic_acceptance_length and SGLang's SGLANG_SIMULATE_ACC_LEN, so a
+    # published AL can be pasted in without conversion.
+    synthetic_acceptance_length: float | None = None
+    # The same target expressed as a mean acceptance RATE in [0, 1]
+    # (accepted_draft / total_draft), i.e. (length - 1) / num_speculative_tokens.
     synthetic_acceptance_rate: float | None = None
+    # Resolved per-position *unconditional* acceptance rates (entry i = marginal
+    # probability that the first i+1 draft tokens are all accepted), filled in by
+    # __post_init__. None => real draft/target rejection sampling.
+    synthetic_acceptance_rates: list[float] | None = None
 
     # model_type → mtp_model_type mapping
     _MTP_TYPE_MAP: ClassVar[dict[str, str]] = {
@@ -1062,14 +1090,63 @@ class SpeculativeConfig:
         cfg = self.draft_model_hf_config
         return bool(getattr(cfg, "dspark_with_draft", False))
 
-    def __post_init__(self):
-        if self.synthetic_acceptance_rate is not None and not (
-            0.0 <= self.synthetic_acceptance_rate <= 1.0
+    def _resolve_synthetic_acceptance(self) -> None:
+        """Validate the forced-acceptance knobs and resolve to per-position rates.
+
+        Both knobs describe the same curve, so exactly one may be set; the rate
+        form is converted to a length and everything downstream reads only
+        ``synthetic_acceptance_rates``.
+        """
+        # Local import: the schedule lives next to the kernel that consumes it,
+        # and that module pulls in triton, which has no business loading just
+        # because someone imported a config.
+        from atom.model_ops.rejection_sampler import acceptance_length_to_rates
+
+        if (
+            self.synthetic_acceptance_length is not None
+            and self.synthetic_acceptance_rate is not None
         ):
             raise ValueError(
-                "synthetic_acceptance_rate (--spec-decode-acceptance-rate) must "
-                f"be in [0, 1], but got {self.synthetic_acceptance_rate}."
+                "--spec-decode-acceptance-length and --spec-decode-acceptance-rate "
+                "describe the same curve; set at most one."
             )
+        length = self.synthetic_acceptance_length
+        if self.synthetic_acceptance_rate is None and length is None:
+            return
+
+        n = self.num_speculative_tokens
+        if not n:
+            raise ValueError(
+                "Forced speculative acceptance needs --num-speculative-tokens, "
+                f"but it is {n!r}."
+            )
+        if self.synthetic_acceptance_rate is not None:
+            rate = self.synthetic_acceptance_rate
+            if not 0.0 <= rate <= 1.0:
+                raise ValueError(
+                    "synthetic_acceptance_rate (--spec-decode-acceptance-rate) "
+                    f"must be in [0, 1], but got {rate}."
+                )
+            length = 1.0 + n * rate
+        if not 1.0 <= length <= float(n + 1):
+            raise ValueError(
+                "synthetic_acceptance_length (--spec-decode-acceptance-length) "
+                f"must be in [1, {n + 1}] for num_speculative_tokens={n}, but got "
+                f"{length}."
+            )
+        self.synthetic_acceptance_length = length
+        self.synthetic_acceptance_rates = acceptance_length_to_rates(length, n)
+        logger.info(
+            "Forced speculative acceptance ON: mean acceptance length %.4f over "
+            "%d draft positions (per-position rates %s). Throughput numbers from "
+            "this run are synthetic; output text and accuracy are meaningless.",
+            length,
+            n,
+            [round(r, 4) for r in self.synthetic_acceptance_rates],
+        )
+
+    def __post_init__(self):
+        self._resolve_synthetic_acceptance()
         if self.draft_model_hf_config is None:
             self.draft_model_hf_config = get_hf_config(
                 self.model, trust_remote_code=True
@@ -1469,9 +1546,6 @@ class Config:
                 self.graph_bs = cuda_graph_sizes
 
     def __post_init__(self):
-        if self.index_cache_dtype is None:
-            self.index_cache_dtype = self.kv_cache_dtype
-
         self.moe_backend = self.moe_backend.strip().lower()
         if self.moe_backend not in ("standard", "mega"):
             raise ValueError(
@@ -1501,6 +1575,32 @@ class Config:
         else:
             raise TypeError("dcp_config must be DCPConfig or dict")
         # assert os.path.isdir(self.model)
+
+        # The forced-acceptance schedule spends its whole budget on the first
+        # ceil(length - 1) positions, and the sampler can only accept what was
+        # actually drafted. The DSpark confidence scheduler hands each request
+        # its own verify length ell_r, so whenever ell_r falls below that many
+        # positions the run quietly lands under the acceptance length it was
+        # asked to reproduce (measured at length 3.78 over 7 positions: exact
+        # while ell_r >= 3, 3.39 at ell_r = 2, 2.89 at ell_r = 1). ell_r is
+        # chosen at runtime from the confidence head, so there is no upfront
+        # check that would catch it -- and a benchmark reporting a number it
+        # never hit is worse than one that refuses to start.
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.synthetic_acceptance_rates is not None
+            and self.dspark.confidence_schedule
+        ):
+            raise ValueError(
+                "Forced speculative acceptance (--spec-decode-acceptance-length "
+                "/ --spec-decode-acceptance-rate) cannot be combined with the "
+                "DSpark confidence scheduler (--dspark-config "
+                "'{\"confidence_schedule\": true}'): it sizes each request's "
+                "verify length at runtime, and a short one caps acceptance below "
+                "the requested length with no way to detect it upfront. Drop "
+                "confidence_schedule (and ragged, which needs it) for "
+                "forced-acceptance runs."
+            )
 
         # RapidServe (intra-GPU prefill/decode disagg) needs a specialized
         # runner in both the prefill and decode processes. Select it unless the
@@ -1736,10 +1836,28 @@ class Config:
         # Use the preserved `architectures` field (re-injected by get_hf_config,
         # line 567) which keeps the original "DeepseekV4ForCausalLM[NextN]" name.
         arches = getattr(self.hf_config, "architectures", None) or []
-        if any("DeepseekV4" in str(a) for a in arches):
+        is_deepseek_v4 = any("DeepseekV4" in str(a) for a in arches)
+        if is_deepseek_v4:
             v4_block_size = 256
             if self.kv_cache_block_size != v4_block_size:
                 self.kv_cache_block_size = v4_block_size
+
+        # Keep ``None`` intact until the model architecture is known so an
+        # omitted index-cache option remains distinguishable from an explicit
+        # fp8/bf16 override. Native single-node V4 defaults to the FP4 indexer
+        # except on gfx942. Plugin proxy pools and KV-transfer region maps do
+        # not yet describe the separate FP4 scale pool, so those integrations
+        # retain FP8 until their layouts support it. Every other model keeps
+        # the historical KV-cache-dtype default.
+        if self.index_cache_dtype is None and is_deepseek_v4:
+            if self.plugin_config is None and not self.kv_transfer_config:
+                from aiter.jit.utils.chip_info import get_gfx
+
+                self.index_cache_dtype = "fp8" if get_gfx() == "gfx942" else "fp4"
+            else:
+                self.index_cache_dtype = "fp8"
+        elif self.index_cache_dtype is None:
+            self.index_cache_dtype = self.kv_cache_dtype
 
     def compute_hash(self) -> str:
         """

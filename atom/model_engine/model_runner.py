@@ -722,8 +722,8 @@ class ModelRunner:
             with set_model_tag("drafter"):
                 self.drafter = build_drafter(self.config, self.device, self)
             self.rejection_sampler = RejectionSampler(
-                synthetic_acceptance_rate=(
-                    self.config.speculative_config.synthetic_acceptance_rate
+                synthetic_acceptance_rates=(
+                    self.config.speculative_config.synthetic_acceptance_rates
                 )
             )
             torch.set_default_device(None)
@@ -3369,7 +3369,6 @@ class ModelRunner:
                 get_forward_context().context.positions,
                 hidden_states,
                 batch.next_token_ids,
-                not self._is_pure_middle_chunk(batch),
             )
         if pp_non_last or self._is_pure_middle_chunk(batch):
             reset_forward_context()
@@ -3855,8 +3854,67 @@ class ModelRunner:
             return True
         return False
 
+    def _capture_attn_ffn_graphs(
+        self, bs, max_q_len, rectangle_tokens, build_capture, input_ids
+    ):
+        """AF_PIECEWISE: capture the attn_ffn graphs for the smaller ragged buckets
+        (num_tokens_pad = b*max_q_len < this bs's rectangle) a real ragged step at
+        this bs may replay. Runs one PIECEWISE forward per new bucket on a ragged
+        synthetic batch: dense pieces REPLAY (already captured, deduped by
+        num_tokens); the attn_ffn op captures its fresh (bs, q_eff, num_tokens_pad)
+        key. The rectangle bucket was already captured by the caller.
+        """
+        positions = self.forward_vars["positions"].gpu
+        for b in self.graph_bs:
+            num_tokens_pad = b * max_q_len
+            if num_tokens_pad >= rectangle_tokens or num_tokens_pad < bs:
+                # >= rectangle: the rectangle case (already captured) or larger.
+                # < bs: fewer than 1 token/seq — unreachable at real decode.
+                continue
+            if self._piecewise_skip_capture(num_tokens_pad):
+                continue
+            # Ragged synthetic metadata: bs seqs whose lengths sum to num_tokens_pad.
+            attn_metadata, context = build_capture(
+                bs=bs, max_q_len=max_q_len, num_tokens_pad=num_tokens_pad
+            )
+            num_pad, num_tokens_across_dp = self.get_dp_padding(num_tokens_pad)
+            num_tokens_dp = num_tokens_pad + num_pad
+            if num_tokens_across_dp is not None:
+                num_tokens_across_dp = torch.full_like(
+                    num_tokens_across_dp, num_tokens_dp
+                )
+            model_positions = (
+                self._mrope_positions_view(num_tokens_dp)
+                if self.use_mrope
+                else positions[:num_tokens_dp]
+            )
+            set_forward_context(
+                attn_metadata=attn_metadata,
+                atom_config=self.config,
+                context=context,
+                num_tokens=num_tokens_dp,
+                num_tokens_across_dp=num_tokens_across_dp,
+                ubatch_slices=None,
+                in_hipgraph=True,
+            )
+            # Warmup, then the PIECEWISE forward: dense pieces replay (deduped by
+            # num_tokens); attn_ffn op captures its (bs, q_eff, num_tokens_pad) graph.
+            self.model(input_ids[:num_tokens_dp], model_positions)
+            fc = get_forward_context()
+            fc.cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
+            fc.batch_descriptor = BatchDescriptor(num_tokens=num_tokens_dp)
+            self.model(input_ids[:num_tokens_dp], model_positions)
+            fc.cudagraph_runtime_mode = CUDAGraphMode.NONE
+            fc.batch_descriptor = None
+            self._piecewise_captured_tokens.add(num_tokens_dp)
+
     def capture_cudagraph(self):
         _piecewise = self._piecewise_cg_active()
+        # AF_PIECEWISE: also capture the attn core (ragged combos below)
+        cudagraph_mode = getattr(self.config.compilation_config, "cudagraph_mode", None)
+        attn_ffn_piecewise = (
+            cudagraph_mode is not None and cudagraph_mode.is_attn_ffn_piecewise()
+        )
         if _piecewise:
             logger.info(
                 "PIECEWISE cudagraph: capturing per-piece graphs (attention "
@@ -3991,9 +4049,10 @@ class ModelRunner:
 
         # Whether this backend's capture builder supports a dynamic (per-bucket)
         build_capture = self.attn_metadata_builder.build_for_cudagraph_capture
-        supports_dynamic_q_len = (
-            "max_q_len" in inspect.signature(build_capture).parameters
-        )
+        _build_params = inspect.signature(build_capture).parameters
+        supports_dynamic_q_len = "max_q_len" in _build_params
+        # Whether it supports a ragged num_tokens_pad (zero-copy-q attn-core graphs).
+        supports_ragged_capture = "num_tokens_pad" in _build_params
 
         with pause_gc(), graph_capture() as capture_ctx, self.capture_profiler as prof:
             for max_q_len in q_buckets:
@@ -4084,6 +4143,15 @@ class ModelRunner:
                         fc.cudagraph_runtime_mode = CUDAGraphMode.NONE
                         fc.batch_descriptor = None
                         self._piecewise_captured_tokens.add(num_tokens)
+                        # also capture the attn_ffn graphs this bs can replay ragged
+                        if attn_ffn_piecewise and supports_ragged_capture:
+                            self._capture_attn_ffn_graphs(
+                                bs=bs,
+                                max_q_len=max_q_len,
+                                rectangle_tokens=num_tokens,
+                                build_capture=build_capture,
+                                input_ids=input_ids,
+                            )
                         if prof is not None:
                             # Drain before closing the window so this bs's
                             # kernels land in this bs's file. Profiling-only —

@@ -124,6 +124,8 @@ def _uses_pd_staging(kv_transfer_config: dict | None) -> bool:
     return KVConnectorFactory.topology_uses_pd_staging(kv_transfer_config)
 
 
+# AF_PIECEWISE: attn-core capture/replay (keyed layer, bucket_bs, q_eff, nt_pad).
+# Owns its isolated graph pool + per-key graph cache + output buffers.
 # State field carrying the windows of layers whose KV dtype is not the pool's.
 # One field for all of them: they share a dtype (see `_discover_field_windows`)
 # and a ring length, so they differ only in the field's layer dimension.
@@ -499,16 +501,18 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             "be 16-byte aligned: the FP8 data region is read with dwordx4 loads"
         )
 
-        # Opt-in FP4 indexer cache (gfx950). When set, the CSA Indexer KV is
+        # FP4 indexer cache (the native single-node default except on gfx942).
+        # When enabled, the CSA Indexer KV is
         # stored as packed FP4 E2M1 + per-group(32) e8m0 scale in the
         # `pa_mqa_logits_fp4` preshuffle layout (data
         # [NB, k_tiles, 4, rows, 16] uint8 + scale [NB, k_tiles, 4, rows] uint8)
         # written by `fused_compress_attn(quant_mode="fp4")`. The scoring path
-        # auto-detects FP4 via `kv_cache.dtype == uint8`. Default (fp8) → the
-        # existing FP8 (+fp32 scale) path is byte-identical.
-        # Switch: `--index_cache_dtype fp4`. Authoritative decision — this is the
-        # value re-asserted onto every Indexer in `build_kv_cache_tensor`.
-        # `warn=True`: the gfx950 fallback message is emitted here only, since the
+        # auto-detects FP4 via `kv_cache.dtype == uint8`. Explicit fp8 keeps the
+        # existing FP8 (+fp32 scale) path byte-identical.
+        # `--index_cache_dtype` remains an explicit override. This is the
+        # authoritative decision re-asserted onto every Indexer in
+        # `build_kv_cache_tensor`.
+        # `warn=True`: the gfx942 fallback message is emitted here only, since the
         # builder is constructed once while `Indexer.__init__` runs per CSA layer.
         # Shared predicate (see `fp4_indexer_enabled`) so the builder and
         # `Indexer.__init__` cannot drift apart.
@@ -1989,7 +1993,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         on a ragged step, a uniform `next_n` fill on a rectangular one. Sync-free
         — real Σ is baked into `cu_seq_q` on device.
         """
-        from aiter.ops.flydsl.kernels.pa_mqa_logits_fp4_prefill import (
+        from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
             compute_prefill_schedule,
             compute_varqlen_windows,
         )
@@ -2109,7 +2113,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 # pure on-device torch (no host sync) and emits a CONSTANT [P, 4]
                 # cta_info with total_ctas == P fixed — so the captured kernel
                 # reads fresh per-fwd contents from a stable pointer.
-                from aiter.ops.flydsl.kernels.pa_mqa_logits_fp4 import (
+                from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4 import (
                     compute_varctx_schedule,
                 )
 
@@ -2220,7 +2224,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             # call: row_to_batch = batch_id_per_token, local_starts = 0,
             # local_ends = visible_end. block_k / parallel_unit_num MUST match
             # the values passed to the kernel in `_score_topk_prefill_fp4`.
-            from aiter.ops.flydsl.kernels.pa_mqa_logits_fp4_prefill import (
+            from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
                 compute_prefill_schedule,
             )
 
@@ -2544,12 +2548,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             and _drafter.uses_confidence_schedule
         )
         if ragged_lens is not None or _dspark_ragged_graph:
-            # Pinned staging, not `torch.as_tensor(np, device=cuda)`: that is a
-            # pageable H2D and syncs here, which was the ragged decode bubble.
-            _n = extend_lens_np.size
-            _buf = var["ragged_extend"]
-            _buf.np[:_n] = extend_lens_np
-            attn_metadata.dspark_ragged_lens_gpu = _buf.copy_to_gpu(_n)
+            attn_metadata.dspark_ragged_lens_gpu = self._stage_dspark_ragged_lens(
+                "v4_dspark_ragged_lens", extend_lens_np, positions.device, pad_to=bs
+            )
             attn_metadata.dspark_full_q = int(full_q)
 
         padded_bs = int(bs)
@@ -2737,8 +2738,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             if dspark_ragged:
                 ragged_lens_buf = np.zeros(padded_bs, dtype=np.int32)
                 ragged_lens_buf[:ub_real_reqs] = ub_extend_lens_np
-                attn_metadata.dspark_ragged_lens_gpu = torch.as_tensor(
-                    ragged_lens_buf, device=positions_gpu.device
+                attn_metadata.dspark_ragged_lens_gpu = self._stage_dspark_ragged_lens(
+                    f"{p}v4_dspark_ragged_lens",
+                    ragged_lens_buf,
+                    positions_gpu.device,
+                    pad_to=padded_bs,
                 )
                 attn_metadata.dspark_full_q = full_q
 
@@ -4123,13 +4127,18 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         )
 
     def build_for_cudagraph_capture(
-        self, bs: int, max_q_len: int | None = None
+        self, bs: int, max_q_len: int | None = None, num_tokens_pad: int | None = None
     ) -> tuple[AttentionMetaData_DSV4, Context]:
         """Build attn_metadata for CUDAGraph capture using a synthetic decode batch.
 
         Synthesizes bs sequences each at start_pos=window_size (so SWA window
         is full + 1 CSA committed entry — exercises the production decode
         codepath: state-cache reads, sparse_attn gather, indexer fp8 logits).
+
+        AF_PIECEWISE: if num_tokens_pad < bs*max_q_len, build a RAGGED batch of bs
+        seqs summing to num_tokens_pad, so the graph's flat token dim == what the
+        dense pieces write (zero-copy row counts match). max_seqlen_q stays max_q_len
+        (bakes swa write_per_batch). Default (None / == rectangle) = uniform path.
 
         Per-fwd metadata is populated through the SAME helpers prepare_decode
         uses (`_attach_v4_indexer_meta`, `_attach_v4_per_fwd_meta`,
@@ -4160,17 +4169,40 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # (decode_query_len in 1..mtp_k+1). Default = full mtp_k+1 (unchanged).
         if max_q_len is None:
             max_q_len = 1 + self.max_spec_steps
-        total_tokens = bs * max_q_len
-        win = self.window_size
+        rectangle_tokens = bs * max_q_len
+        # Per-seq query lengths of the synthetic batch. One uniform rectangle by
+        # default; AF_PIECEWISE instead asks for a ragged batch summing to
+        # `num_tokens_pad`, so the graph's flat row count equals what the dense
+        # pieces write -- a zero-copy input is read at exactly the captured
+        # length, so a padded tail would be rows nobody wrote that step.
+        if num_tokens_pad is None or int(num_tokens_pad) >= rectangle_tokens:
+            total_tokens = rectangle_tokens
+            extend_lens_np = np.full(bs, max_q_len, dtype=np.int32)
+        else:
+            total_tokens = int(num_tokens_pad)
+            assert total_tokens >= bs, (
+                f"ragged capture needs num_tokens_pad >= bs so every seq gets at "
+                f"least one token; got bs={bs} num_tokens_pad={total_tokens}"
+            )
+            # As even as possible, remainder on the head: every length is then in
+            # [1, max_q_len].
+            extend_lens_np = np.full(bs, total_tokens // bs, dtype=np.int32)
+            extend_lens_np[: total_tokens % bs] += 1
 
-        # Synthetic state: each seq has already produced `win` tokens; this
-        # fwd is `max_q_len` decode/draft steps at positions
-        # [win, win+max_q_len). Hits is_pure_decode (start_pos > 0, uniform
-        # tok-per-seq), exercising Phase B/C/E paths during capture.
-        start_pos = win
-        positions_np = (np.arange(total_tokens, dtype=np.int64) % max_q_len) + start_pos
-        cu_seqlens_q_np = np.arange(0, bs + 1, dtype=np.int32) * max_q_len
-        context_lens_np = np.full(bs, start_pos + max_q_len, dtype=np.int32)
+        # Synthetic state: each seq has already produced `start_pos` tokens, and
+        # this fwd is its own len_i decode/draft steps from there. start_pos > 0
+        # hits is_pure_decode, exercising Phase B/C/E paths during capture.
+        start_pos = self.window_size
+        cu_seqlens_q_np = np.zeros(bs + 1, dtype=np.int32)
+        np.cumsum(extend_lens_np, out=cu_seqlens_q_np[1:])
+        # A token sits at start_pos + its offset within its OWN seq, i.e. flat
+        # index minus where that seq starts. Uniform lengths reduce that to
+        # flat_idx % max_q_len, the classic rectangle.
+        batch_id_per_token = np.repeat(np.arange(bs, dtype=np.int32), extend_lens_np)
+        flat_idx = np.arange(total_tokens, dtype=np.int64)
+        seq_start = cu_seqlens_q_np[batch_id_per_token].astype(np.int64)
+        positions_np = (flat_idx - seq_start) + start_pos
+        context_lens_np = (start_pos + extend_lens_np).astype(np.int32)
         # Slot mapping: pool groups [0..bs-1] crossed to the plane positions
         # every kernel addresses by, the same crossing `prepare_decode` makes.
         # Raw group ids here are not a harmless placeholder: capture runs a
@@ -4199,9 +4231,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # invalidating the graph.
         state_slot_in_gpu = self._stage("v4_meta_state_slot_in", state_slot_np)
 
-        # Synthetic decode batch: start_pos = win > 0 and uniform
-        # max_q_len tokens per seq, so is_pure_decode is True by
-        # construction (capture replays the decode codepath).
+        # Synthetic decode batch: start_pos > 0 and per-seq len_i tokens (ragged
+        # under zero-copy-q, else uniform max_q_len), so is_pure_decode is True
+        # by construction (capture replays the decode codepath).
         attn_metadata = AttentionMetaData_DSV4(
             cu_seqlens_q=cu_seqlens_q_gpu,
             cu_seqlens_k=None,
@@ -4221,8 +4253,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         attn_metadata.state_slot_out_cpu = state_slot_np
 
         # DSpark TRUE-FLAT graph: capture must take the same ragged indexer branch
-        # and rect shape [bs, full_q] as replay, else the graph mismatches. Synthetic
-        # capture gives each seq max_q_len tokens; replay refreshes dst for real lens.
+        # and rect shape [bs, full_q] as replay, else the graph mismatches. The
+        # synthetic batch's per-seq lengths (`extend_lens_np`, ragged under
+        # zero-copy-q else uniform max_q_len) drive the indexer ragged topk — same
+        # construction (`torch.as_tensor`) as replay's prepare_decode branch.
         drafter = getattr(self.model_runner, "drafter", None)
         if (
             self.model_runner.config.dspark.ragged
@@ -4230,14 +4264,14 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             and drafter.uses_confidence_schedule
         ):
             full_q_real = drafter.mtp_k + 1
-            attn_metadata.dspark_ragged_lens_gpu = torch.full(
-                (bs,), max_q_len, dtype=torch.int32, device=positions.device
+            attn_metadata.dspark_ragged_lens_gpu = self._stage_dspark_ragged_lens(
+                "v4_dspark_ragged_lens", extend_lens_np, positions.device, pad_to=bs
             )
             attn_metadata.dspark_full_q = int(full_q_real)
 
         # Build compress_plans + per-fwd meta + indexer meta via the same
-        # helpers used at runtime — guarantees addresses match.
-        extend_lens_np = np.full(bs, max_q_len, dtype=np.int32)
+        # helpers used at runtime — guarantees addresses match. `extend_lens_np`
+        # is the synthetic batch's per-seq lengths (computed above).
         attn_metadata.compress_plans = self._build_compress_plans(
             extend_lens_np,
             context_lens_np,
@@ -4249,7 +4283,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # builder can reuse the shared per-fwd GPU tensors.
         self._attach_v4_per_fwd_meta(
             attn_metadata,
-            extend_lens_np,  # = np.full(bs, max_q_len) — synthetic uniform decode batch
+            extend_lens_np,  # synthetic per-seq lengths (ragged or uniform max_q_len)
             attn_metadata.state_slot_out_cpu,
             bs,
             total_tokens,
@@ -4286,6 +4320,34 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
     # ------------------------------------------------------------------ #
     # Helpers.                                                           #
     # ------------------------------------------------------------------ #
+
+    def _dspark_ragged_lens_needs_staging(self) -> bool:
+        """Fixed-address staging for the dspark ragged verify-lengths: AF+DP needs
+        the baked pointer, everywhere else it costs acceptance (tp8 49.9% vs 60%).
+        """
+        cfg = self.model_runner.config
+        mode = getattr(cfg.compilation_config, "cudagraph_mode", None)
+        if mode is None or not mode.is_attn_ffn_piecewise():
+            return False
+        return getattr(cfg.parallel_config, "data_parallel_size", 1) > 1
+
+    def _stage_dspark_ragged_lens(
+        self, name: str, arr, device, pad_to: int | None = None
+    ) -> torch.Tensor:
+        """Materialize the dspark ragged verify-lengths GPU tensor.
+
+        Fixed-address staging only where correctness needs it (AF + DP); every
+        other path keeps the fresh per-step tensor, which is what the acceptance
+        rate wants. See `_dspark_ragged_lens_needs_staging`.
+        """
+        arr = arr.astype(np.int32, copy=False)
+        if not self._dspark_ragged_lens_needs_staging():
+            return torch.as_tensor(arr, device=device)
+        if pad_to is not None and pad_to > arr.shape[0]:
+            padded = np.zeros(pad_to, dtype=np.int32)
+            padded[: arr.shape[0]] = arr
+            arr = padded
+        return self._stage(name, arr)
 
     def _alloc_v4_metadata_buffers(self) -> None:
         """Pre-allocate every CpuGpuBuffer the V4 metadata builder writes into.
@@ -4327,6 +4389,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # buffer on every path, forked or not, so the captured decode graph sees
         # a stable address.
         bufs["v4_meta_state_slot_in"] = CpuGpuBuffer(bs, **i32)
+        # DSpark ragged verify lengths are read inside the captured AF attention
+        # core via attn_metadata. Stage them into a fixed-address buffer so graph
+        # replay sees refreshed per-step contents instead of the capture-time
+        # torch.as_tensor allocation.
+        bufs["v4_dspark_ragged_lens"] = CpuGpuBuffer(bs, **i32)
 
         # Phase B: paged-decode index buffers (consumed by Phase C/E).
         # Sized to worst-case decode shape `T = max_bs * (1 + max_spec_steps)`
@@ -4509,6 +4576,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             # V4 decode metadata buffers.
             bufs[f"{p}v4_meta_state_slot_out"] = CpuGpuBuffer(bs, **i32)
             bufs[f"{p}v4_meta_state_slot_in"] = CpuGpuBuffer(bs, **i32)
+            bufs[f"{p}v4_dspark_ragged_lens"] = CpuGpuBuffer(bs, **i32)
             bufs[f"{p}v4_kv_indices_swa"] = CpuGpuBuffer(T_dec * win, **i32)
             bufs[f"{p}v4_kv_indices_csa"] = CpuGpuBuffer(
                 T_dec * (win + self.index_topk), **i32

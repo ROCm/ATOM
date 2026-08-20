@@ -171,7 +171,6 @@ class EagleProposer(Drafter):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         next_token_ids: list[int] | None,
-        produces_output: bool,
     ) -> None:
         """Run the draft model over this forward so its KV covers it.
 
@@ -189,7 +188,6 @@ class EagleProposer(Drafter):
         carrying `dspark_block_size` to `DSparkProposer`, and every model on
         hand takes that branch.
         """
-        del produces_output
         if not next_token_ids:
             return
         forward_context = get_forward_context()
