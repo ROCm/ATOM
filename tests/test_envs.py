@@ -28,6 +28,7 @@ _ATOM_ENV_VARS = [
     "ATOM_DISABLE_VLLM_PLUGIN",
     "ATOM_USE_CUSTOM_ALL_GATHER",
     "ATOM_ENABLE_RELAXED_MTP",
+    "ATOM_V4_FP8_INDEXER_PREFILL_BACKEND",
 ]
 
 
@@ -96,6 +97,9 @@ class TestEnvsDefaults:
     def test_atom_enable_gdn_decode_lossy_fast_default(self):
         assert _get_envs().ATOM_ENABLE_GDN_DECODE_LOSSY_FAST is False
 
+    def test_v4_fp8_indexer_prefill_backend_default(self):
+        assert _get_envs().ATOM_V4_FP8_INDEXER_PREFILL_BACKEND == "legacy"
+
     def test_unknown_attr_raises(self):
         with pytest.raises(AttributeError):
             _ = _get_envs().ATOM_NONEXISTENT_VAR
@@ -157,6 +161,16 @@ class TestEnvsOverrides:
     def test_atom_enable_gdn_decode_lossy_fast_enabled(self, monkeypatch):
         monkeypatch.setenv("ATOM_ENABLE_GDN_DECODE_LOSSY_FAST", "1")
         assert _get_envs().ATOM_ENABLE_GDN_DECODE_LOSSY_FAST is True
+
+    @pytest.mark.parametrize("value", ["legacy", "paged", "auto", " PaGeD "])
+    def test_v4_fp8_indexer_prefill_backend_override(self, monkeypatch, value):
+        monkeypatch.setenv("ATOM_V4_FP8_INDEXER_PREFILL_BACKEND", value)
+        assert _get_envs().ATOM_V4_FP8_INDEXER_PREFILL_BACKEND == value.strip().lower()
+
+    def test_v4_fp8_indexer_prefill_backend_rejects_unknown_value(self, monkeypatch):
+        monkeypatch.setenv("ATOM_V4_FP8_INDEXER_PREFILL_BACKEND", "unknown")
+        with pytest.raises(ValueError, match="ATOM_V4_FP8_INDEXER_PREFILL_BACKEND"):
+            _ = _get_envs().ATOM_V4_FP8_INDEXER_PREFILL_BACKEND
 
 
 class TestIsSet:

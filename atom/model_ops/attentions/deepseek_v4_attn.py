@@ -105,7 +105,7 @@ from atom.model_ops.v4_kernels import (
     write_v4_paged_decode_indices,
     write_v4_paged_prefill_indices,
 )
-from atom.utils import CpuGpuBuffer
+from atom.utils import CpuGpuBuffer, envs
 from atom.utils.forward_context import (
     AttentionMetaData,
     AttnState,
@@ -302,6 +302,10 @@ class AttentionMetaData_DSV4(AttentionMetaData):
                                                 fp8_mqa_logits)
       cu_ends_gpu                   [T] int32  per-token end offset for
                                                 fp8_mqa_logits (causal cap)
+      visible_end_gpu              [T] int32  seq-local causal cap
+      paged_prefill_block_tables_per_token
+                                    [T, pages] int32  FP8 prefill page table
+      paged_prefill_max_seq_len     int  logical FP8 prefill logits width
       total_committed               int  sum of n_committed_csa_per_seq
 
     Note: decode logits / topk-indices scratch are allocated per-fwd inside
@@ -519,6 +523,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         self._indexer_fp4 = fp4_indexer_enabled(
             getattr(model_runner.config, "index_cache_dtype", None), warn=True
         )
+        self._fp8_indexer_prefill_backend = envs.ATOM_V4_FP8_INDEXER_PREFILL_BACKEND
         # FP4 KV tile geometry (group_size 32; 16 packed bytes per group).
         self._idx_k_tiles = self.index_head_dim // 128
 
@@ -2215,6 +2220,33 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             # seq-local, vs the FP8 path's GLOBAL packed cu_ends).
             "visible_end_gpu": visible_end_gpu,
         }
+
+        # Optional FP8 paged-prefill metadata. Expand the sequence-level block
+        # table to query rows ONCE here, then reuse the contiguous result across
+        # every CSA layer in this forward. PCP reindex and both TBO paths call
+        # this builder again with their own token ownership, so no table is
+        # cached across forwards or ubatches.
+        if not self._indexer_fp4 and self._fp8_indexer_prefill_backend != "legacy":
+            block_tables = attn_metadata.block_tables
+            max_seq_len = max(int(n_committed_per_seq.max()), 1)
+            live_pages = math.ceil(max_seq_len / self.csa_rows_per_block)
+            metadata_available = (
+                block_tables is not None
+                and block_tables.ndim == 2
+                and block_tables.size(0) >= bs
+                and block_tables.size(1) >= live_pages
+            )
+            if metadata_available:
+                # PCP pads per-token batch ids with -1. Those rows have a zero
+                # visible end, but index_select rejects negative indices; map
+                # them to sequence 0 as a safe unread placeholder.
+                safe_batch_ids = batch_id_per_token_gpu.clamp_min(0)
+                page_table_by_seq = block_tables[:bs, :live_pages]
+                block_tables_per_token = torch.index_select(
+                    page_table_by_seq, 0, safe_batch_ids
+                ).contiguous()
+                meta["paged_prefill_block_tables_per_token"] = block_tables_per_token
+                meta["paged_prefill_max_seq_len"] = max_seq_len
 
         if self._indexer_fp4:
             # Precompute the FP4 prefill persistent-grid schedule here (instead
