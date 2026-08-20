@@ -409,6 +409,19 @@ class ScheduledBatch:
         )
         self.top_ks = np.asarray([seq.top_k for seq in seqs.values()], dtype=np.int32)
         self.top_ps = np.asarray([seq.top_p for seq in seqs.values()], dtype=np.float32)
+        self.min_tokens = np.asarray(
+            [seq.min_tokens for seq in seqs.values()], dtype=np.int32
+        )
+        # Both payloads below are read only while a sequence sits under its
+        # floor, so the min_tokens=0 batch — the common case — skips them.
+        if self.min_tokens.any():
+            self.num_completion_tokens = np.asarray(
+                [seq.num_completion_tokens for seq in seqs.values()], dtype=np.int32
+            )
+            self.single_token_stops = [seq.single_token_stops for seq in seqs.values()]
+        else:
+            self.num_completion_tokens = None
+            self.single_token_stops = None
         # True if any seq in the batch is a fan-out child (SamplingParams.n>1)
         # and therefore requires fresh per-row random noise at the sampler
         # rather than the cached shared exponential tensor.

@@ -2,7 +2,9 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import warnings
+from functools import lru_cache
 
+import numpy as np
 import torch
 from aiter import mixed_sample_outer_exponential
 from aiter.ops.triton.softmax import softmax
@@ -38,6 +40,61 @@ def get_per_token_exponential(vocab_size: int, device) -> torch.Tensor:
     return torch.empty((1, vocab_size), dtype=torch.float, device=device).exponential_(
         1
     )
+
+
+@lru_cache(maxsize=8)
+def _stop_token_id_tensor(
+    token_ids: tuple[int, ...], device: torch.device
+) -> torch.Tensor:
+    """Cache the terminal-token index tensor; it is constant for a served model."""
+    return torch.tensor(token_ids, dtype=torch.long, device=device)
+
+
+def apply_min_tokens_mask(
+    logits: torch.Tensor,
+    min_tokens,
+    num_completion_tokens,
+    eos_token_id: int,
+    stop_token_ids: list[int] | tuple[int, ...] = (),
+    single_token_stops: list[set[int]] | None = None,
+) -> torch.Tensor:
+    """Mask terminal tokens while a request is below ``min_tokens``.
+
+    The mask is applied to logits rather than ignoring EOS after sampling:
+    feeding a sampled EOS back into the model would start a new message and
+    change the requested distribution. Only single-token stop strings can be
+    masked before sampling; multi-token stops continue to be handled by the
+    scheduler after their full suffix is observed.
+    """
+    blocked_rows = np.flatnonzero(
+        np.asarray(num_completion_tokens) < np.asarray(min_tokens)
+    )
+    if blocked_rows.size == 0:
+        return logits
+
+    vocab_size = logits.shape[-1]
+    global_stop_ids = {
+        int(token_id)
+        for token_id in (eos_token_id, *stop_token_ids)
+        if 0 <= int(token_id) < vocab_size
+    }
+    if global_stop_ids:
+        rows = torch.from_numpy(blocked_rows).to(logits.device, non_blocking=True)
+        token_ids = _stop_token_id_tensor(tuple(sorted(global_stop_ids)), logits.device)
+        logits[rows[:, None], token_ids[None, :]] = -torch.inf
+
+    if single_token_stops is not None:
+        for row in blocked_rows.tolist():
+            row_stop_ids = [
+                int(token_id)
+                for token_id in single_token_stops[row]
+                if 0 <= int(token_id) < vocab_size
+                and int(token_id) not in global_stop_ids
+            ]
+            if row_stop_ids:
+                logits[row, row_stop_ids] = -torch.inf
+
+    return logits
 
 
 class Sampler(nn.Module):

@@ -115,6 +115,13 @@ def apply_chat_template(
         messages = custom_encoder.prepare_messages(messages, tools)
         return custom_encoder(messages, **kwargs)
 
+    # ATOM's OpenAI layer normalizes thinking controls for custom encoders.
+    # Mirror them to the names used by Qwen3.8's Hugging Face Jinja template.
+    if "thinking" in kwargs:
+        kwargs.setdefault("enable_thinking", kwargs["thinking"])
+    if "thinking_effort" in kwargs:
+        kwargs.setdefault("reasoning_effort", kwargs["thinking_effort"])
+
     kwargs["tokenize"] = False
     kwargs["add_generation_prompt"] = True
     if tools:

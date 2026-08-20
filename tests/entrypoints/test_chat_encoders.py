@@ -132,3 +132,26 @@ def test_jinja_path_forwards_tools_and_generation_kwargs():
         "add_generation_prompt": True,
         "tools": tools,
     }
+
+
+def test_jinja_path_translates_qwen_thinking_controls():
+    class Tokenizer:
+        def __init__(self):
+            self.kwargs = None
+
+        def apply_chat_template(self, _messages, **kwargs):
+            self.kwargs = kwargs
+            return "jinja-rendered"
+
+    tokenizer = Tokenizer()
+    result = apply_chat_template(
+        tokenizer=tokenizer,
+        custom_encoder=None,
+        messages=[{"role": "user", "content": "hello"}],
+        thinking=True,
+        thinking_effort="low",
+    )
+
+    assert result == "jinja-rendered"
+    assert tokenizer.kwargs["enable_thinking"] is True
+    assert tokenizer.kwargs["reasoning_effort"] == "low"

@@ -28,11 +28,21 @@ class TestSequenceCreation:
         assert seq.id == 42
 
     def test_sampling_params_propagated(self):
-        sp = SamplingParams(temperature=0.5, max_tokens=100, ignore_eos=True)
+        sp = SamplingParams(
+            temperature=0.5,
+            max_tokens=100,
+            min_tokens=3,
+            ignore_eos=True,
+        )
         seq = Sequence([1], 4, sampling_params=sp)
         assert seq.temperature == 0.5
         assert seq.max_tokens == 100
+        assert seq.min_tokens == 3
         assert seq.ignore_eos is True
+
+    def test_single_token_stops_precomputed(self):
+        seq = Sequence([1], 4, stop_token_sequences=[[7], [8, 9]])
+        assert seq.single_token_stops == {7}
 
 
 class TestSequenceNumTokensAndBlocks:
