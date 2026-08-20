@@ -109,7 +109,7 @@ Tips on server configuration:
   forced-acceptance knobs `--spec-decode-acceptance-length` /
   `--spec-decode-acceptance-rate`: a runtime-chosen verify length can cap
   acceptance below the requested length, so ATOM rejects the pair at startup.
-  See [Forced acceptance length](../docs/serving_benchmarking_guide.md#forced-acceptance-length).
+  See [Forced acceptance length](../docs/forced_acceptance_length.md).
 - Clear compile cache before restarting after code changes: `rm -rf /root/.cache/atom/*`
 
 ## Performance baseline (DeepSeek-V4-Pro)

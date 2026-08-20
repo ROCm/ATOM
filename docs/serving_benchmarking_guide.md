@@ -604,9 +604,7 @@ published figure goes in unchanged. The budget is spent on the earliest
 positions — length `3.78` over 7 draft slots accepts 2 tokens always and a 3rd
 with probability `0.78` — which is the minimum-variance schedule vLLM and
 SGLang also use, so the accepted-length distribution matches and not just its
-mean. Accepted positions emit the draft's own tokens.
-
-Read the realized value back from `average_tokens_per_forward` on
+mean. Read the realized value back from `average_tokens_per_forward` on
 `/debug/mtp_stats` (or the `atom:mtp_average_tokens_per_forward` metric).
 
 Two caveats:
@@ -617,6 +615,10 @@ Two caveats:
   (`--dspark-config '{"confidence_schedule": true}'`), which picks each
   request's verify length at runtime; a short one silently caps acceptance
   below the requested length, so the combination is rejected at startup.
+
+The full reference — the resolved schedule, the rate-based spelling, and how to
+replay a golden AL curve — is in
+[`forced_acceptance_length.md`](forced_acceptance_length.md).
 
 ## Deployment examples
 
