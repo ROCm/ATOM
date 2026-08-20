@@ -6,7 +6,10 @@ from aiter_stub import stubbed_aiter
 
 with stubbed_aiter():
     from atom.kv_transfer.disaggregation.pp_kv_aggregator import PPKVAggregator
-    from atom.kv_transfer.disaggregation.types import KVConnectorOutput
+    from atom.kv_transfer.disaggregation.types import (
+        KVConnectorOutput,
+        SaveOperationId,
+    )
     from atom.model_engine.pp_engine_core import PPEngineCoreProc
 
 
@@ -83,6 +86,35 @@ def test_send_waits_for_every_pp_stage_save():
     proc._poll_kv_transfer_progress()
     assert proc.scheduler.released_sending() == {"a"}
     assert proc.scheduler.released_saving() == {"a"}
+    assert proc._held_sending == {}
+
+
+def test_send_pairs_with_a_save_operation_id():
+    # The offload connector reports a SaveOperationId(req_id, generation) once
+    # it tracks save generations, while mooncake reports a bare request id.
+    # Both have to collapse onto the request before they can be paired; keying
+    # the two sides differently releases every send unheld and lets the head
+    # free blocks a downstream stage is still saving from.
+    op = SaveOperationId(9, 2)
+    proc = _head(
+        pp_size=2,
+        local_outputs=[
+            KVConnectorOutput(finished_sending={9}, finished_saving={op}),
+            KVConnectorOutput(),
+        ],
+        downstream_messages=[
+            [],
+            [(1, KVConnectorOutput(finished_saving={op}))],
+        ],
+    )
+
+    proc._poll_kv_transfer_progress()
+    assert proc.scheduler.released_sending() == set()  # stage 1 still saving
+    assert proc._held_sending == {"9": 9}
+
+    proc._poll_kv_transfer_progress()
+    assert proc.scheduler.released_sending() == {9}
+    assert proc.scheduler.released_saving() == {op}
     assert proc._held_sending == {}
 
 
