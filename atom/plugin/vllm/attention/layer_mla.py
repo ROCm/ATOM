@@ -917,18 +917,23 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
             from vllm.distributed.parallel_state import get_dcp_group
             from vllm.platforms import current_platform
 
-            from atom.model_ops.dcp_ops import cp_lse_ag_out_rs
+            from atom.model_ops.dcp_ops import (
+                cp_lse_ag_out_rs,
+                dcp_all_gather_query_heads,
+            )
 
             self._cached_ops = ops
             self._cached_current_platform = current_platform
             self._cached_get_dcp_group = get_dcp_group
             self._cached_get_aiter_tp_group = get_aiter_tp_group
             self._cached_cp_lse_ag_out_rs = cp_lse_ag_out_rs
+            self._cached_dcp_all_gather_query_heads = dcp_all_gather_query_heads
         ops = self._cached_ops
         current_platform = self._cached_current_platform
         get_dcp_group = self._cached_get_dcp_group
         get_aiter_tp_group = self._cached_get_aiter_tp_group
         cp_lse_ag_out_rs = self._cached_cp_lse_ag_out_rs
+        dcp_all_gather_query_heads = self._cached_dcp_all_gather_query_heads
 
         # create the output here, it use query shape
         if attn_metadata is None:
@@ -1162,7 +1167,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                 # decode_q is fp8 when fp8_attention (produced by the fused
                 # kernel); the head-dim all-gather is copy-only, so an fp8
                 # payload is safe (unlike an fp8 all-reduce).
-                decode_q = self._dcp_all_gather_query_heads(decode_q)
+                decode_q = dcp_all_gather_query_heads(self.dcp_group, decode_q)
 
             # call decode attn
             attn_out, lse = self._forward_decode(decode_q, kv_cache, attn_metadata)
