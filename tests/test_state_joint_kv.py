@@ -97,7 +97,7 @@ def hbm_checkpoint(bm: BlockManager, h: int, slot: int = 0) -> None:
     """Put `h` in the HBM state pool and nowhere else -- `spilled_checkpoint`'s
     other half, and the case aiming only at the tier used to walk past."""
     bm.state._index(h, slot)
-    assert bm.state.lookup(h) >= 0
+    assert bm.state.lookup_group(h) >= 0
     assert h not in bm.state_offload.hashes
 
 

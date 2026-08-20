@@ -144,12 +144,14 @@ class CacheStats:
         "_interval_cached_tokens",
         "_interval_compressed_tokens",
         "_interval_full_tokens",
+        "_interval_offload_tokens",
         "_interval_requests",
         "_interval_wanted_tokens",
         "_log_interval",
         "total_cached_tokens",
         "total_compressed_tokens",
         "total_full_tokens",
+        "total_offload_tokens",
         "total_requests",
         "total_wanted_tokens",
     )
@@ -159,6 +161,12 @@ class CacheStats:
         self.total_requests: int = 0
         self.total_cached_tokens: int = 0
         self.total_full_tokens: int = 0
+        # Reuse served by the CPU offload tier, kept out of every series
+        # above. `cached`/`wanted`/`compressed` describe the HBM prefix
+        # walk, and an LMCache load reaches past it by design, so folding
+        # the two together would make `cached > wanted` and turn the
+        # differences this class reports into negative rates.
+        self.total_offload_tokens: int = 0
         # Pre-gate compressed-prefix hit tokens. compressed - cached is reuse
         # the Pool.STATE gates declined; full - compressed is reuse lost to
         # compressed eviction or never there.
@@ -172,6 +180,7 @@ class CacheStats:
         self._interval_requests: int = 0
         self._interval_cached_tokens: int = 0
         self._interval_full_tokens: int = 0
+        self._interval_offload_tokens: int = 0
         self._interval_compressed_tokens: int = 0
         self._interval_wanted_tokens: int = 0
 
@@ -181,13 +190,19 @@ class CacheStats:
         num_full_tokens: int,
         num_compressed_tokens: int,
         num_wanted_tokens: int,
+        num_offload_tokens: int = 0,
     ) -> None:
         """Record cache stats for one prefill sequence.
 
-        All four are required because the reported rates are differences
+        The first four are required because the reported rates are differences
         between them: `cached <= wanted <= compressed <= full`. A defaulted
         argument would silently report a negative rate rather than a missing
         one.
+
+        `num_offload_tokens` is the exception, and defaults because it is not
+        part of that chain: it is reuse the CPU tier served, which sits above
+        the HBM walk rather than inside it. Counting it in `cached` is what
+        would break the nesting -- see `_schedule_prefill_seq`.
         """
         self.total_requests += 1
         self.total_cached_tokens += num_cached_tokens
@@ -199,6 +214,8 @@ class CacheStats:
         self._interval_full_tokens += num_full_tokens
         self._interval_compressed_tokens += num_compressed_tokens
         self._interval_wanted_tokens += num_wanted_tokens
+        self.total_offload_tokens += num_offload_tokens
+        self._interval_offload_tokens += num_offload_tokens
 
         if self.total_requests % self._log_interval == 0:
             self._log()
@@ -223,6 +240,9 @@ class CacheStats:
             "compressed_tokens": self.total_compressed_tokens,
             "wanted_tokens": self.total_wanted_tokens,
             "full_tokens": self.total_full_tokens,
+            # Reuse from the CPU tier. Separate on purpose: it shares no
+            # denominator with the HBM series above.
+            "offload_tokens": self.total_offload_tokens,
         }
 
     def _reset_interval(self) -> None:
@@ -230,6 +250,7 @@ class CacheStats:
         self._interval_cached_tokens = 0
         self._interval_full_tokens = 0
         self._interval_compressed_tokens = 0
+        self._interval_offload_tokens = 0
         self._interval_wanted_tokens = 0
 
     @staticmethod
@@ -264,6 +285,12 @@ class CacheStats:
             self.total_wanted_tokens,
             self.total_full_tokens,
         )
+        if self.total_offload_tokens:
+            logger.info(
+                "[Cache Stats offload] CPU-tier tokens: "
+                f"interval={self._interval_offload_tokens} "
+                f"total={self.total_offload_tokens}"
+            )
 
     @classmethod
     def _log_line(
@@ -1938,11 +1965,24 @@ class Scheduler:
             # `block_size * dcp_world_size` tokens — so scaling by block_size
             # would under-report by the DCP factor.
             hbs = self.block_manager.hash_block_size
+            # `num_cached_tokens` sits above the HBM walk once an offload load
+            # landed: `_mark_offload_load_ready` promotes it to the LMCache
+            # prefix, which `_joint_kv_boundary` picks above what
+            # `can_allocate` could reach -- that is the feature, not a bug.
+            # Those tokens are not paged-pool reuse, so they go in their own
+            # series rather than inflating `cached`, which would make
+            # `wanted - cached` negative. `seq.num_cached_tokens` is
+            # deliberately NOT modified: the forward must still skip the
+            # prefix the load delivered.
+            wanted_tokens = seq.num_wanted_hit_blocks * hbs
+            hbm_cached_tokens = min(seq.num_cached_tokens, wanted_tokens)
+            offload_tokens = seq.num_cached_tokens - hbm_cached_tokens
             self.cache_stats.update(
-                seq.num_cached_tokens,
+                hbm_cached_tokens,
                 seq.num_tokens,
                 seq.num_compressed_hit_blocks * hbs,
-                seq.num_wanted_hit_blocks * hbs,
+                wanted_tokens,
+                num_offload_tokens=offload_tokens,
             )
         num_batched_tokens += chunk
         seq.status = SequenceStatus.RUNNING

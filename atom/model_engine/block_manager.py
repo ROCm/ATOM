@@ -610,9 +610,9 @@ class BlockManager:
         seq.state_joint_boundary_hash = h
         seq.state_joint_kv_tokens = kv_tokens
         self.joint_boundaries += 1
-        # Which pool the state leg will come out of. `_attach_state_slots` makes
+        # Which pool the state leg will come out of. `_attach_state_group` makes
         # the same lookup and acts on it; this only records what it will find.
-        if self.state.lookup(h) >= 0:
+        if self.state.lookup_group(h) >= 0:
             self.joint_boundaries_hbm += 1
         else:
             self.joint_boundaries_tier += 1
@@ -891,17 +891,17 @@ class BlockManager:
         does not reclaim. Refusing there sent the loop walking down past a
         boundary whose KV LMCache holds and whose state never left HBM, which
         is the cheapest joint load there is: no state transfer at all, just the
-        fork `_attach_state_slots` already does.
+        fork `_attach_state_group` already does.
 
         Nothing downstream needs telling which branch answered. `allocate`
-        passes the boundary's hash to `_attach_state_slots`, which looks HBM up
+        passes the boundary's hash to `_attach_state_group`, which looks HBM up
         first and only falls to `_request_state_load` on a miss; and
         `LMCacheOffloadConnector._arm_joint_loads` arms a pair only for requests
         that appear in `state_loads`, so a KV-only leg settles through the
         single-leg channel it already used.
         """
         return self._tier_can_serve(hit_hash) or (
-            hit_hash != -1 and self.state.lookup(hit_hash) >= 0
+            hit_hash != -1 and self.state.lookup_group(hit_hash) >= 0
         )
 
     def _request_state_load(self, seq: Sequence, hit_hash: int) -> bool:
