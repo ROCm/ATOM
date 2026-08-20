@@ -330,6 +330,218 @@ def test_scheduler_multi_request_global_topk():
     assert ell[0] >= ell[1]
 
 
+# ---------------------------------------------------------------------------
+# AF_PIECEWISE generic contract (atom/utils/attn_ffn_piecewise.py)
+# ---------------------------------------------------------------------------
+
+
+def _core_probe(*, piecewise, capturing, graph_ready, dummy=False, capture=True):
+    """Drive a decorated core once against fake collaborators and report which
+    of capture / replay / deliver / bare-core it chose.
+
+    `capture` is the mode gate (AF_PIECEWISE on). Off, the core never records a
+    graph of its own -- plain PIECEWISE, eager core plus a stabilised output."""
+    import types
+
+    from atom.utils.attn_ffn_piecewise import piecewise_core
+
+    log = []
+
+    class FakeRunner:
+        def has_graph(self, key):
+            return graph_ready
+
+        def input_buffers(self, inputs, input_names, upstream):
+            # (what the graph reads, what replay has to refresh)
+            return dict(inputs), {}
+
+        def capture(self, key, read_from, refresh, core, out_buf):
+            log.append("capture")
+
+        def replay(self, key, inputs):
+            log.append("replay")
+            return "replayed"
+
+    class FakeOutputs:
+        def slot(self, key, sample):
+            return sample
+
+        def deliver(self, key, out):
+            log.append("deliver")
+            return out
+
+    @piecewise_core()
+    def core(layer, *, x):
+        log.append("core")
+        return x
+
+    fc = types.SimpleNamespace(
+        context=types.SimpleNamespace(is_dummy_run=dummy),
+        attn_metadata=object(),
+        in_hipgraph=capturing,
+    )
+    core(
+        types.SimpleNamespace(layer_name="l0"),
+        runner=FakeRunner(),
+        outputs=FakeOutputs(),
+        piecewise=piecewise,
+        capture=capture,
+        forward_context=fc,
+        x=torch.ones(4),
+    )
+    return log
+
+
+def test_decorated_core_picks_capture_replay_or_eager():
+    # The decision table, pinned. Every row that is not a replay must end in a
+    # deliver: whatever computed the output still owes it to the fixed address
+    # the downstream dense piece reads.
+    P = _core_probe
+
+    # Not piecewise: no graph cache, and no slot to deliver to either.
+    assert P(piecewise=False, capturing=False, graph_ready=False) == ["core"]
+    assert P(piecewise=False, capturing=True, graph_ready=True) == ["core"]
+
+    # Capture pass, first time this key appears: warm up, record, then compute
+    # the real answer (the recording fed on clones).
+    assert P(piecewise=True, capturing=True, graph_ready=False) == [
+        "core",
+        "capture",
+        "core",
+        "deliver",
+    ]
+    # Real step with a graph ready: replay only.
+    assert P(piecewise=True, capturing=False, graph_ready=True) == ["replay"]
+    # Capture pass revisiting a key, and a real step never captured: eager.
+    assert P(piecewise=True, capturing=True, graph_ready=True) == ["core", "deliver"]
+    assert P(piecewise=True, capturing=False, graph_ready=False) == ["core", "deliver"]
+
+    # A dummy run never touches the cache, but still owes the slot.
+    assert P(piecewise=True, capturing=True, graph_ready=False, dummy=True) == [
+        "core",
+        "deliver",
+    ]
+
+    # Plain PIECEWISE (capture gate off): the core never records or replays a
+    # graph of its own, whatever the capture pass / cache says -- it runs eager
+    # and only stabilises its output. This is the path the three-way branch in
+    # v4_core_attention used to hand-code outside the decorator.
+    assert P(piecewise=True, capturing=True, graph_ready=True, capture=False) == [
+        "core",
+        "deliver",
+    ]
+    assert P(piecewise=True, capturing=False, graph_ready=True, capture=False) == [
+        "core",
+        "deliver",
+    ]
+
+
+def test_non_tensor_params_are_passthrough_not_graph_inputs():
+    # A bool/int/enum config arg on a core is forwarded to the body untouched
+    # (and baked at capture), NOT treated as a graph input to clone or capture
+    # on. This is what lets a model keep its own config flags in its signature --
+    # e.g. V4's `compressor_already_launched` -- without the decorator choking on
+    # a non-tensor. The split comes off the annotations.
+    import torch as _t
+
+    from atom.utils.attn_ffn_piecewise import piecewise_core
+
+    seen = {}
+
+    @piecewise_core()
+    def core(layer, *, x: _t.Tensor, flag: bool = False, n: int = 0):
+        seen["flag"] = flag
+        seen["n"] = n
+        return x
+
+    # Only the tensor is a graph input; the annotated non-tensors are config.
+    assert core.input_names == ("x",)
+    assert core.passthrough_names == ("flag", "n")
+    # piecewise=False just runs the body, and the config args reach it as passed.
+    out = core(object(), piecewise=False, x=_t.ones(3), flag=True, n=7)
+    assert out.shape == (3,)
+    assert seen == {"flag": True, "n": 7}
+
+
+def test_runner_copies_only_what_is_not_zero_copy():
+    import torch as _t
+
+    from atom.utils.cuda_graph import CudagraphCaptureRunner
+
+    r = CudagraphCaptureRunner()
+    inputs = {"x": _t.ones(4, 8), "positions": _t.arange(4)}
+    read_from, refresh = r.input_buffers(inputs, ("x", "positions"), frozenset({"x"}))
+    # A zero-copy input is captured on the caller's own tensor and never
+    # refreshed -- that is what makes its producer responsible for the address.
+    assert read_from["x"] is inputs["x"]
+    assert "x" not in refresh
+    # Everything else is cloned, and the clone is what replay copies into.
+    assert read_from["positions"] is not inputs["positions"]
+    assert refresh["positions"] is read_from["positions"]
+
+
+def test_v4_core_captures_on_everything_but_positions():
+    # Pins the one input the graph must not bake a pointer to. Capturing on it
+    # costs ~2pts of accuracy; the root cause was never found, so this is the
+    # workaround and it has to stay stated somewhere a change would trip over.
+    import pytest
+
+    try:
+        from atom.models.deepseek_v4 import DeepseekV4Attention
+
+        core = DeepseekV4Attention._attn_core
+    except ImportError as e:
+        if "aiter" not in str(e):
+            raise
+        pytest.skip(f"requires aiter to import deepseek_v4: {e}")
+
+    assert set(core.zero_copy_names) == set(core.input_names) - {"positions"}
+
+
+def test_v4_core_inputs_come_from_the_signature():
+    # There is no second declaration to drift from: the inputs and their order
+    # ARE the core's parameter list, minus the leading layer. The runner clones
+    # and refreshes them by it.
+    import pytest
+
+    try:
+        from atom.models.deepseek_v4 import DeepseekV4Attention
+
+        core = DeepseekV4Attention._attn_core
+    except ImportError as e:
+        if "aiter" not in str(e):
+            raise
+        pytest.skip(f"requires aiter to import deepseek_v4: {e}")
+
+    assert core.input_names == (
+        "x",
+        "q",
+        "kv_pre",
+        "qr",
+        "qr_scale",
+        "positions",
+        "idx_q_quant",
+        "idx_weights",
+        "idx_q_scale",
+    )
+
+
+def test_core_with_var_kwargs_is_rejected():
+    # **kwargs carries no order, and the runner expands by order. Better to fail
+    # at decoration than to mis-assign inputs at replay.
+    from atom.utils.attn_ffn_piecewise import piecewise_core
+
+    try:
+
+        @piecewise_core()
+        def _bad(layer, **named):
+            return None
+
+        assert False, "expected TypeError for a **kwargs core"
+    except TypeError as e:
+        assert "explicitly" in str(e)
+
+
 # ----------------------------------------------------------------------------
 # torch.compile boundary
 #
