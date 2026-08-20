@@ -380,8 +380,6 @@ def test_producer_offload_load_completion_uses_loading_state():
     assert out.failed_loading == {"f1"}
 
 
-
-
 def test_state_loads_go_to_the_sub_that_can_carry_them():
     """The scheduler calls `enqueue_state_loads` on whatever connector it
     holds. Under `multi` that is this object, and a load it swallowed would
@@ -424,6 +422,47 @@ def test_no_sub_with_a_tier_leaves_the_composite_tier_none():
     w = _worker([FakeWorkerSub(), FakeWorkerSub()])
     w.register_kv_caches({}, transfer_tensors=None, num_blocks=1)
     assert w._state_tier is None
+
+
+def test_a_state_only_step_under_multi_is_not_dropped():
+    """A step whose only work is a state load must reach the worker.
+
+    `state_loads` carries no `LMCacheReqMeta`, so a wrapper that answers from
+    its own (always empty) fields reports no work, the engine drops the
+    snapshot, and the request parked on that load is woken by nothing.
+    """
+    from atom.kv_transfer.disaggregation.types import connector_metadata_has_work
+    from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata
+
+    sub = LMCacheOffloadMetadata()
+    sub.state_loads = [("req-1", 12345, 7)]
+
+    assert connector_metadata_has_work(sub)
+    assert connector_metadata_has_work(MultiConnectorMetadata(metas=[sub]))
+
+
+def test_a_multi_wrapper_over_idle_subs_still_reports_no_work():
+    from types import SimpleNamespace
+
+    from atom.kv_transfer.disaggregation.types import connector_metadata_has_work
+    from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata
+
+    assert not connector_metadata_has_work(
+        MultiConnectorMetadata(metas=[LMCacheOffloadMetadata(), SimpleNamespace()])
+    )
+
+
+def test_every_metadata_field_a_subclass_adds_is_declared_work_or_not():
+    """`WORK_FIELDS` must name real attributes, or a typo silences a field.
+
+    A misspelled entry is invisible: `getattr` returns None, the field never
+    counts, and the only symptom is a parked request much later.
+    """
+    from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata
+
+    meta = LMCacheOffloadMetadata()
+    for name in LMCacheOffloadMetadata.WORK_FIELDS:
+        assert hasattr(meta, name), f"WORK_FIELDS names a missing attribute: {name}"
 
 
 def test_two_sub_connectors_with_a_tier_is_refused():

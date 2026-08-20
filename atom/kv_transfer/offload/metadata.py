@@ -156,6 +156,17 @@ class LMCacheOffloadMetadata(ConnectorMetadata):
     descriptors the worker consumes in ``start_load_kv``.
     """
 
+    #: `state_loads` is the one that is easy to miss: it carries no
+    #: `LMCacheReqMeta`, so a step whose only work is a state load looks empty
+    #: to anything that only counts requests -- and the requests parked on
+    #: those loads are woken by nothing but the report they would never be
+    #: asked to produce.
+    WORK_FIELDS = ConnectorMetadata.WORK_FIELDS + (
+        "requests",
+        "lookup_requests_in_step",
+        "state_loads",
+    )
+
     def __init__(self) -> None:
         super().__init__()
         self.requests: list[LMCacheReqMeta] = []
