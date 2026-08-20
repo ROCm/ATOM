@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: MIT
 
+import ast
+import importlib.util
 import sys
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -8,6 +11,10 @@ from transformers import PretrainedConfig
 
 import atom.config as config_module
 from atom.config import CompilationConfig, Config
+
+_V4_KERNELS_INIT = (
+    Path(__file__).resolve().parents[1] / "atom/model_ops/v4_kernels/__init__.py"
+)
 
 
 class _GfxProbe:
@@ -37,6 +44,42 @@ def _install_chip_info_stub(monkeypatch, get_gfx) -> None:
     monkeypatch.setitem(sys.modules, "aiter.jit", jit)
     monkeypatch.setitem(sys.modules, "aiter.jit.utils", utils)
     monkeypatch.setitem(sys.modules, "aiter.jit.utils.chip_info", chip_info)
+
+
+def _load_v4_kernels(monkeypatch, gfx: str):
+    import atom.model_ops as model_ops_package
+
+    probe = _GfxProbe(gfx)
+    _install_chip_info_stub(monkeypatch, probe)
+
+    tree = ast.parse(
+        _V4_KERNELS_INIT.read_text(encoding="utf-8"),
+        filename=str(_V4_KERNELS_INIT),
+    )
+    package_prefix = "atom.model_ops.v4_kernels."
+    for node in tree.body:
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        module_name = node.module or ""
+        if not module_name.startswith(package_prefix):
+            continue
+        stub = ModuleType(module_name)
+        for imported in node.names:
+            setattr(stub, imported.name, object())
+        monkeypatch.setitem(sys.modules, module_name, stub)
+
+    module_name = "atom.model_ops.v4_kernels"
+    spec = importlib.util.spec_from_file_location(
+        module_name,
+        _V4_KERNELS_INIT,
+        submodule_search_locations=[str(_V4_KERNELS_INIT.parent)],
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, module_name, module)
+    monkeypatch.setattr(model_ops_package, "v4_kernels", module, raising=False)
+    spec.loader.exec_module(module)
+    return module, probe
 
 
 def _make_config(
@@ -142,22 +185,18 @@ def test_non_v4_indexer_defaults_to_kv_cache_dtype(monkeypatch):
     [("gfx942", False), ("gfx950", True), ("gfx1250", True)],
 )
 def test_fp4_indexer_runtime_predicate(monkeypatch, caplog, gfx, expected):
-    v4_kernels = pytest.importorskip("atom.model_ops.v4_kernels")
-    monkeypatch.setattr(v4_kernels, "get_gfx", lambda: gfx)
+    v4_kernels, probe = _load_v4_kernels(monkeypatch, gfx)
 
     with caplog.at_level("WARNING", logger="atom"):
         enabled = v4_kernels.fp4_indexer_enabled("fp4", warn=True)
 
     assert enabled is expected
+    assert probe.calls == 1
     assert ("unsupported" in caplog.text) is (not expected)
 
 
 def test_non_fp4_indexer_predicate_does_not_query_arch(monkeypatch):
-    v4_kernels = pytest.importorskip("atom.model_ops.v4_kernels")
-
-    def fail_if_called():
-        raise AssertionError("non-FP4 indexers must not query the GPU architecture")
-
-    monkeypatch.setattr(v4_kernels, "get_gfx", fail_if_called)
+    v4_kernels, probe = _load_v4_kernels(monkeypatch, "gfx950")
 
     assert not v4_kernels.fp4_indexer_enabled("fp8")
+    assert probe.calls == 0
