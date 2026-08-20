@@ -173,12 +173,26 @@ class ReasoningFilter:
                 idx, marker = _earliest_marker(self.buf, _THINK_END_MARKERS)
                 if idx != -1:
                     results.extend(self._close_thinking(idx, marker))
-                elif len(self.buf) > 100 and "<" not in self.buf:
+                elif len(self.buf) > 100:
                     # No reasoning markers after significant buffering — emit as
-                    # content. Large threshold gives models time to emit an
-                    # end marker when the template injected the opener.
-                    results.append(("content", self.buf))
-                    self.buf = ""
+                    # content. The threshold gives a model whose template
+                    # injected the opener time to reach its end marker.
+                    #
+                    # Only a partial marker at the *end* of the buffer is worth
+                    # holding: it may complete on the next chunk. Anything
+                    # earlier cannot become a marker any more. Testing instead
+                    # for a bare "<" anywhere withheld the entire stream for as
+                    # long as the answer happened to contain one — and code,
+                    # markup and comparisons are full of them, so a request
+                    # would return 200 and then never emit a byte while the
+                    # engine decoded to max_tokens.
+                    hold = _hold_back_len(
+                        self.buf, _OUTPUT_OPEN_MARKERS + _THINK_END_MARKERS
+                    )
+                    emit = self.buf[: len(self.buf) - hold] if hold else self.buf
+                    if emit:
+                        results.append(("content", emit))
+                        self.buf = self.buf[len(self.buf) - hold :] if hold else ""
 
         elif self.state == 1:
             self.buf += text
