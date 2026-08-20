@@ -26,6 +26,18 @@ export AITER_LOG_LEVEL="${AITER_LOG_LEVEL:-WARNING}"
 export AITER_SITUV2_A4W4=1
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export AITER_FLYDSL_STAGE2_FP8=1
+# Both checkpoint placements beyond the prompt-end anchor are off here, and
+# both were measured against this profile rather than assumed:
+#   ATOM_STATE_CHECKPOINT_DEMAND=1        Lost-to-checkpoint 1.42% -> 1.11%,
+#     combined hit 93.21% -> 94.20%, but P90 interactivity 41.03 -> 37.79
+#     tok/s/user and per-GPU throughput 4784 -> 4663.
+#   --state-checkpoint-interval-tokens 8192   Lost-to-checkpoint -> 0.40%,
+#     combined hit -> 94.31%, spills 1,179 -> 2,201, allocation failures
+#     7,040 -> 15,144, interactivity -> 39.54, per-GPU throughput -> 4678.
+# Both mechanisms work -- the cache numbers move the way they are meant to.
+# Both are a net loss here, because either one cuts the keeper's prefill chunk
+# at the rung, and at c10 (10 lanes, ~120k-token prompts, 91% HBM hit before
+# any of this) the extra forward costs more than the reuse it buys back.
 export ATOM_STATE_CHECKPOINT_DEMAND=0
 export ATOM_MLA_MAX_SPLIT_PER_BATCH=256
 
@@ -63,7 +75,17 @@ case "$CONC" in
     ATOM_ENABLE_REPLAYSSM="${ATOM_ENABLE_REPLAYSSM:-0}"
     STATE_CHECKPOINT_SLOTS="${STATE_CHECKPOINT_SLOTS:-16}"
     ENABLE_LMCACHE="${ENABLE_LMCACHE:-1}"
-    LMCACHE_MAX_LOCAL_CPU_SIZE="${LMCACHE_MAX_LOCAL_CPU_SIZE:-32}"
+    # 128, not 32. MLA KV is 52.31KiB/token here (93 layers x (512+64), fp8),
+    # so 32GiB holds 0.64M tokens against the ~15.8M an hour of c10 writes --
+    # a ~25x turnover that leaves LMCache never holding a prefix deeper than
+    # HBM. Measured: `lmcache_within_hbm` declined 1146 of 1154 admissions,
+    # `loaded_tokens` was 0 for the full hour, and 581,981 allocations failed.
+    # At 128 the failures fall to ~7,000 and the tier serves 2.6M tokens back,
+    # which is P90 interactivity 31.19 -> 41.03 tok/s/user and per-GPU
+    # throughput 4313.71 -> 4784.33 tok/s. 192 was measured too: +0.72pp
+    # combined hit for 512GiB more RAM and no throughput, so this is where it
+    # stops paying.
+    LMCACHE_MAX_LOCAL_CPU_SIZE="${LMCACHE_MAX_LOCAL_CPU_SIZE:-128}"
     ENABLE_STATE_OFFLOAD="${ENABLE_STATE_OFFLOAD:-1}"
     ;;
   *)
@@ -104,6 +126,12 @@ if [ "$ENABLE_STATE_OFFLOAD" == 1 ]; then
     export OFFLOAD_STATE_STAGING_GROUPS="${OFFLOAD_STATE_STAGING_GROUPS:-8}"
     export OFFLOAD_STATE_MIN_LOAD_TOKENS="${OFFLOAD_STATE_MIN_LOAD_TOKENS:-0}"
     export OFFLOAD_GPU_STAGING_CHUNKS="${OFFLOAD_GPU_STAGING_CHUNKS:-16}"
+    # OFFLOAD_STATE_CPU_SIZE stays at its 16GiB default. 64 was measured at
+    # c10: it removes every state-pool allocation failure (7,040 -> 0, and all
+    # of them are the 54.78MiB state entry -- the KV pool stops failing at
+    # 128GiB) and changes nothing else. Lost-to-checkpoint 1.73% -> 1.75%,
+    # loads attempted 50 -> 51. A failed allocation is retried after an
+    # eviction and succeeds, so it costs log lines rather than checkpoints.
 fi
 
 # LMCache paged-KV offload (L2 CPU tier).
