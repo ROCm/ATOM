@@ -254,6 +254,35 @@ class EngineCore:
                 continue  # process object already closed by CoreManager
             if alive:
                 proc.join(timeout=5)
+                # The join above has a timeout; nothing after it did. A worker
+                # that outlives it keeps its VRAM slice and its all-reduce IPC
+                # handles, and `multiprocessing`'s atexit handler then joins the
+                # same process again with NO timeout -- so an engine that is
+                # already on its way out hangs there forever. Seen twice on the
+                # k3-dev line: the MainThread parks in `_exit_function -> join`,
+                # all TP workers stay alive, /metrics keeps answering 200, and
+                # only a manual kill recovers the node. `enable_orphan_reaping`
+                # cannot help, because PR_SET_PDEATHSIG fires when the parent
+                # *dies* and this parent never does.
+                try:
+                    if proc.is_alive():
+                        logger.warning(
+                            "%s: worker pid=%s still alive after 5s; terminating",
+                            self.label,
+                            getattr(proc, "pid", "?"),
+                        )
+                        proc.terminate()
+                        proc.join(timeout=5)
+                    if proc.is_alive():
+                        logger.error(
+                            "%s: worker pid=%s ignored SIGTERM; killing",
+                            self.label,
+                            getattr(proc, "pid", "?"),
+                        )
+                        proc.kill()
+                        proc.join(timeout=5)
+                except (ValueError, OSError):
+                    pass  # process object already closed / already reaped
         self._send_engine_dead()
         logger.debug(f"{self.label}: model runner exit")
 
@@ -473,6 +502,12 @@ class EngineCore:
         connector = getattr(self.scheduler, "kv_connector", None)
         if connector is None or not getattr(connector, "is_offload", False):
             return
+        # getattr for the same reason as `kv_connector` above: this path is
+        # reached with scheduler doubles that implement only the connector
+        # surface.
+        publish = getattr(self.scheduler, "_publish_state_loads", None)
+        if publish is not None:
+            publish()
         meta = connector.build_connector_meta()
         if not connector_metadata_has_work(meta):
             return

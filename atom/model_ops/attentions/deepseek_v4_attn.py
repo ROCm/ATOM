@@ -840,8 +840,47 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         )
         return StateTransfer.copy(layout_id)
 
+    def state_entry_views(self, group: int) -> list[torch.Tensor]:
+        """One contiguous slice per plane — a V4 group is one slot per plane.
+
+        A slot holds the compressor state and then every layer's windows
+        contiguously (see `relocate_state_slots`), so a plane's whole
+        contribution is one range and no per-layer split is needed.
+
+        `group` may address a staging-ring group past the last one the
+        BlockManager leases, and that resolves: `num_state_slots` (:863-866)
+        and the carve that sizes the planes (:1023, feeding `with_capacity` at
+        :1038) both read
+        `entries[STATE_SLOT_CLASS]`, the *allocation* count, which already
+        includes the K extra staging groups — admission is capped by a separate
+        count. So `_slot_views()`'s span and `physical_slot`'s bound both cover
+        the staging groups; `tests/test_state_entry_views.py` pins this.
+        """
+        return self._slot_views()[group]
+
     def relocate_state_slots(self, pairs: Sequence[tuple[int, int]]) -> None:
-        """Relocate a request's whole Active Slot."""
+        """Duplicate a request's whole per-request state: compressor + windows.
+
+        One range per plane, and a plane is all there is: a slot holds the
+        compressor state and then every layer's windows, contiguously, so the
+        two halves of a request's state copy as one slice. Copying the state
+        whole rather than just the rows a resumer reads (the CSA ring's
+        trailing `K - ratio` = 4, HCA's none) is what makes that true — those
+        rows are scattered, and picking them out would cost 84 strided copies
+        against this one.
+
+        **The window half is what makes the private ring safe.** A per-request
+        ring is exactly what #1417 removed, because a request resuming a cached
+        prefix had never written that prefix into its own. Reinstating it is only
+        correct because the checkpoint carries the window across — drop this and
+        the bug returns, silently, as garbage attention over the reused prefix.
+
+        That is also why a window whose dtype differs from the pool's is a state
+        field rather than a plane of its own: a plane of its own would sit
+        outside every slot and so outside this copy, and a resumed request would
+        draft against the slot's previous occupant. Verification would keep the
+        output right and the acceptance rate would just quietly collapse.
+        """
         views = self._slot_views()
         dsts, srcs = [], []
         for src, dst in pairs:
@@ -1310,13 +1349,24 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         No flat margin on the slot: a ring cannot transiently exceed itself the
         way a block-addressed window could while sliding across a boundary, and
         there is no admission-vs-materialization gap to cushion — a slot exists
-        for its request's whole life.
+        for its request's whole life. The checkpoint headroom and the offload
+        tier's staging ring are both added by `state_pool` itself, which is the
+        only reader of the two env vars that size them.
         """
+        from atom.model_engine.state_offload import kv_connector_hosts_state_tier
+
         geo = self.pool_geometry
         row_bytes = self.plane_row_bytes()
         return [
             page_pool(geo.block_bytes(row_bytes) + self._indexer_block_bytes()),
-            state_pool(STATE_SLOT_CLASS, geo.slot_bytes(row_bytes), entries_per_req=1),
+            state_pool(
+                STATE_SLOT_CLASS,
+                geo.slot_bytes(row_bytes),
+                entries_per_req=1,
+                offload_hosted=kv_connector_hosts_state_tier(
+                    getattr(self.model_runner.config, "kv_transfer_config", None)
+                ),
+            ),
         ]
 
     def _plane_row_widths(self) -> list[int]:

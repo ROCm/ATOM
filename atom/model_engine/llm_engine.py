@@ -387,6 +387,13 @@ class LLMEngine:
                 "demands_recorded",
                 "demands_declined_no_room",
                 "chunks_cut_for_demand",
+                # Whether the joint state+KV load found a boundary to work
+                # with, and what the state leg cost when it did. Summed like
+                # the rest: a boundary is per admission and every rank admits
+                # the same request.
+                "joint_boundaries",
+                "joint_boundaries_hbm",
+                "joint_boundaries_tier",
             )
         }
         full = totals["full_tokens"]

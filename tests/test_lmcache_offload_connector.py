@@ -33,7 +33,10 @@ from atom.kv_transfer.disaggregation.types import (
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload._block_gpu_connector import BlockGPUConnector
 from atom.kv_transfer.offload._offload_common import OffloadSchedulerMixin
-from atom.kv_transfer.offload.dense.connector import DenseOffloadConnector
+from atom.kv_transfer.offload.dense.connector import (
+    DenseOffloadConnector,
+    DenseOffloadScheduler,
+)
 from atom.kv_transfer.offload.dense.kv_byte_codec import (
     DenseKVByteCodec,
 )
@@ -50,6 +53,12 @@ from atom.kv_transfer.offload.hybrid.dsv4.connector import (
 )
 from atom.kv_transfer.offload.hybrid.dsv4.policy import (
     _chained_prefix_hashes,
+)
+from atom.kv_transfer.offload.hybrid.kimi_k3.connector import (
+    SAVE_STALL_SECONDS,
+    STATE_INDEX_CHANNEL,
+    STATE_STAGING_CHANNEL,
+    KimiK3OffloadScheduler,
 )
 from atom.kv_transfer.offload.metadata import (
     ATOMRawBytesLMCacheMetadata,
@@ -4624,3 +4633,161 @@ def test_multi_metadata_exposes_sub_meta_unpins():
     assert not connector_metadata_has_work(
         MultiConnectorMetadata(metas=[LMCacheOffloadMetadata()])
     )
+
+
+# ── kimi_k3: joint boundary, save stall, state channels ───────────────────
+
+
+def _k3_scheduler() -> KimiK3OffloadScheduler:
+    """Only the fields the K3 overrides touch; everything else is dense's."""
+    s = KimiK3OffloadScheduler.__new__(KimiK3OffloadScheduler)
+    s.chunk_size = 256
+    s._save_inflight = {}
+    s._save_tracker = {}
+    s._pending_state_loads = []
+    s._save_inflight_since = {}
+    s._save_stalled = False
+    s._warned_save_stalled = False
+    s._state_indexed = set()
+    s._state_index_failed = set()
+    s._state_staging_released = set()
+    s._active_load_operations = {}
+    s._do_save = True
+    s._max_pending_saves = 4
+    return s
+
+
+def _k3_seq(*, hbm: int, joint: int = 0, kv: int = 0):
+    return SimpleNamespace(
+        id=1,
+        has_per_req_cache=True,
+        num_cached_tokens=hbm,
+        state_joint_boundary_tokens=joint,
+        state_joint_kv_tokens=kv,
+    )
+
+
+def test_layout_selection_picks_kimi_k3_for_a_kda_config():
+    """K3's paged KV is ordinary dense MLA, so the layout cannot be read off
+    the KV shape -- the KDA state is what makes it its own family."""
+    cfg = SimpleNamespace(
+        hf_config=SimpleNamespace(model_type="kimi_linear"), kv_transfer_config={}
+    )
+    assert offcfg.select_offload_layout(cfg) == "kimi_k3"
+
+
+@pytest.mark.parametrize(
+    "seq,reason",
+    [
+        (_k3_seq(hbm=512, joint=0), "per_req_cache_state_boundary"),
+        (_k3_seq(hbm=512, joint=256), "per_req_cache_state_boundary"),
+        (_k3_seq(hbm=300, joint=1024), "joint_unaligned_hbm_prefill"),
+        (_k3_seq(hbm=512, joint=9000), "joint_boundary_above_lookup"),
+    ],
+)
+def test_a_hybrid_load_is_refused_unless_both_legs_reach_one_boundary(seq, reason):
+    """A hybrid's state is the compressed history of exactly `[0, hbm)`. Every
+    refusal here is a case where raising the KV-loaded length would have the
+    forward skip tokens the recurrence never saw -- wrong output, no
+    exception."""
+    ls = SimpleNamespace(lmcache_cached_tokens=8192)
+    ok, got, *_ = _k3_scheduler()._decide_load_after_alloc(seq, ls)
+    assert ok is False
+    assert got == reason
+
+
+def test_a_joint_load_clamps_the_kv_leg_to_the_covering_chunk():
+    """The two grids do not line up: the boundary is a hash-block position, the
+    KV leg moves whole chunks. The leg is aimed at the chunk that covers it."""
+    seq = _k3_seq(hbm=512, joint=1000, kv=1024)
+    ls = SimpleNamespace(lmcache_cached_tokens=8192)
+    ok, reason, hbm, lmc, need, _ = _k3_scheduler()._decide_load_after_alloc(seq, ls)
+    assert (ok, reason) == (True, "joint_state_and_kv")
+    assert (hbm, lmc, need) == (512, 1024, 512)
+    assert ls.lmcache_cached_tokens == 1024
+
+
+def test_the_claim_never_exceeds_the_state_boundary():
+    """Overshooting the transfer is one wasted chunk; overshooting the *claim*
+    would have the forward skip tokens the state does not cover."""
+    seq = _k3_seq(hbm=512, joint=1000, kv=1024)
+    assert KimiK3OffloadScheduler._claim_after_load(seq, 512, 1024) == 1000
+    # No joint boundary: dense's own answer.
+    assert KimiK3OffloadScheduler._claim_after_load(_k3_seq(hbm=512), 512, 1024) == 1024
+
+
+def test_a_stalled_save_releases_blocks_it_never_handed_out(monkeypatch):
+    """The deadlock this exists for: with the backend stopped, holding blocks
+    for a save nobody is reading turns a stopped backend into a stopped
+    engine. A save already handed out still holds -- something is reading it."""
+    s = _k3_scheduler()
+    seq = SimpleNamespace(id=7)
+    s._save_inflight["9"] = object()  # a different request, stuck
+    s._save_tracker["7"] = [seq, 0]
+    monkeypatch.setattr(
+        KimiK3OffloadScheduler, "_has_pending_save", lambda self, q: True
+    )
+    s._refresh_save_stall()
+    assert s._save_stalled is False
+
+    # Age the outstanding save rather than the process clock: `time.monotonic`
+    # is the stdlib's, and patching it reaches every other test in the run.
+    s._save_inflight_since["9"] -= 2 * SAVE_STALL_SECONDS
+    s._refresh_save_stall()
+    assert s._save_stalled is True
+    # Never handed out -> dropped, blocks released.
+    assert s.should_defer_free(seq) is False
+    assert "7" not in s._save_tracker
+    # Handed out -> still held, whatever the stall says.
+    assert s.should_defer_free(SimpleNamespace(id=9)) is True
+
+
+def test_state_loads_are_drained_into_the_metadata_exactly_once(monkeypatch):
+    """A second submission would write the same entry into a group the first
+    transfer is already filling."""
+    s = _k3_scheduler()
+    monkeypatch.setattr(
+        DenseOffloadScheduler,
+        "build_connector_meta",
+        lambda self: LMCacheOffloadMetadata(),
+    )
+    assert s.enqueue_state_loads([]) is False
+    assert s.enqueue_state_loads([("1", 111, 0)]) is True
+
+    assert s.build_connector_meta().state_loads == [("1", 111, 0)]
+    assert s.build_connector_meta().state_loads == []
+
+
+def test_the_two_state_channels_are_routed_and_drained():
+    """The tier reports over the generic completion channel rather than extra
+    `KVConnectorOutput` fields, so TP quorum is the aggregator's job."""
+    s = _k3_scheduler()
+    for channel, op, ok in (
+        (STATE_INDEX_CHANNEL, 111, True),
+        (STATE_INDEX_CHANNEL, 222, False),
+        (STATE_STAGING_CHANNEL, 3, True),
+    ):
+        assert s.connector_completion(
+            SimpleNamespace(channel=channel, operation_id=op, succeeded=ok)
+        )
+
+    indexed, released, failed = s.take_state_reports()
+    assert (indexed, released, failed) == ({111}, {3}, {222})
+    assert s.take_state_reports() == (set(), set(), set())
+
+
+def test_no_more_saves_go_out_than_the_pool_can_afford_to_pin():
+    """A queued save pins its request's blocks until it drains, so the queue
+    depth is also how much of the pool a slow backend can hold. Dense has no
+    such bound because it does not pin; K3 does."""
+    s = _k3_scheduler()
+    s._max_pending_saves = 2
+    assert s._may_emit_save() is True
+
+    s._save_inflight = {"1": object(), "2": object()}
+    assert s._may_emit_save() is False
+
+    s._save_inflight = {"1": object()}
+    assert s._may_emit_save() is True
+    s._save_stalled = True
+    assert s._may_emit_save() is False

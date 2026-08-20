@@ -161,6 +161,11 @@ class LMCacheOffloadMetadata(ConnectorMetadata):
         self.requests: list[LMCacheReqMeta] = []
         # req_ids whose worker-side lookup pin can be released this step.
         self.lookup_requests_in_step: list[str] = []
+        # (req_id, state_hash, target_group) for the K3 state tier. A separate
+        # list because a state load shares no shape with a KV transfer -- no
+        # token ids, no block ids, no chunking -- only the park/report
+        # lifecycle, which is why it rides the metadata rather than the batch.
+        self.state_loads: list[tuple] = []
 
     def add_request(self, meta: LMCacheReqMeta) -> None:
         self.requests.append(meta)

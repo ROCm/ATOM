@@ -31,6 +31,7 @@ _PAGE_FINGERPRINT_BYTES = 16
 _OFFLOAD_LAYOUT_ALIASES = {
     "hybrid": "hybrid",
     "dense": "dense",
+    "kimi_k3": "kimi_k3",
     # Compatibility with the names used while the layout split was developed.
     "terminal_unit": "hybrid",
     "page_slot": "hybrid",
@@ -92,7 +93,13 @@ def select_offload_layout(config) -> str:
         )
 
     hf_config = getattr(config, "hf_config", None)
-    if hf_config is not None and getattr(hf_config, "compress_ratios", None):
+    if hf_config is None:
+        return "dense"
+    # K3's paged KV is ordinary dense MLA; what makes it its own family is the
+    # KDA per-request state that a reusable prefix also needs.
+    if getattr(hf_config, "model_type", None) == "kimi_linear":
+        return "kimi_k3"
+    if getattr(hf_config, "compress_ratios", None):
         return "hybrid"
     return "dense"
 

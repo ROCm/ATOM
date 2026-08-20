@@ -52,6 +52,7 @@ from atom.kv_transfer.disaggregation.types import (
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload._block_gpu_connector import BlockGPUConnector
 from atom.kv_transfer.offload._offload_common import (
+    max_pending_saves,
     OffloadSchedulerMixin,
     OffloadWorkerMixin,
     build_offload_engine,
@@ -91,27 +92,6 @@ logger = logging.getLogger("atom")
 DSV4_CHECKPOINT_SAVE_CHANNEL = "atom.dsv4.checkpoint.save"
 
 
-def _max_pending_saves(kvc, save_workers: int) -> int:
-    """Return the maximum running-plus-queued worker save operations."""
-
-    extra = (kvc or {}).get("kv_connector_extra_config", kvc or {}) or {}
-    configured = extra.get("max_pending_saves")
-    if configured is None:
-        configured = os.environ.get(
-            "OFFLOAD_MAX_PENDING_SAVES",
-            str(max(2, 2 * save_workers)),
-        )
-        try:
-            capacity = int(configured)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("max pending saves must be a positive integer") from exc
-    else:
-        if isinstance(configured, bool) or not isinstance(configured, int):
-            raise ValueError("max pending saves must be a positive integer")
-        capacity = configured
-    if capacity <= 0:
-        raise ValueError("max pending saves must be a positive integer")
-    return capacity
 
 
 def _wait_for_publication(
@@ -243,7 +223,7 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         # The ATOM LMCache GPU connector owns per-thread staging streams.
         # OFFLOAD_COPY_WORKERS tunes the SAVE pool only.
         n_save_workers = int(os.environ.get("OFFLOAD_COPY_WORKERS", "1"))
-        self._max_pending_saves = _max_pending_saves(kvc, n_save_workers)
+        self._max_pending_saves = max_pending_saves(kvc, n_save_workers)
         self._save_admission = threading.BoundedSemaphore(self._max_pending_saves)
         self._init_worker_common(
             config,

@@ -38,6 +38,10 @@ Merge strategy mirrors vLLM's ``MultiConnector``, adapted to ATOM's
   index in ``start_load_kv``.
 * ``get_finished`` — union the completion sets, **but** see the send/save
   pairing below.
+* ``_state_tier`` — the state offload tier, if a sub built one, re-exposed on
+  the composite. ``AttentionBackend._submit_state_spills`` reads this attribute
+  off whatever connector the forward context holds, so without it the engine's
+  spills are staged and never submitted.
 
 Send/save pairing (the one tricky correctness point)
 ----------------------------------------------------
@@ -221,6 +225,10 @@ class MultiConnector(KVConnectorBase):
         self._pending_save_ops: dict[str, set[SaveCompletionId]] = {}
         self._sent: dict[str, Any] = {}
         self._saved: dict[str, set[SaveCompletionId]] = {}
+        # The state tier of whichever sub owns one. Always defined:
+        # `_submit_state_spills` probes it every batch, and a composite without
+        # the attribute would swallow every spill and starve the ring.
+        self._state_tier = None
 
     @property
     def _pairs_send_and_save(self) -> bool:
@@ -240,6 +248,29 @@ class MultiConnector(KVConnectorBase):
     ) -> None:
         for c in self._connectors:
             c.register_kv_caches(kv_caches, transfer_tensors, num_blocks)
+        self._adopt_state_tier()
+
+    def _adopt_state_tier(self) -> None:
+        """Take over the one sub-connector's state tier, or refuse two.
+
+        Nothing in ``_build_subconnectors`` stops a config from listing
+        ``lmcache_offload`` twice, which would leave two live tiers and no
+        answer to "which one packs this spill". Picking the first is wrong
+        rather than arbitrary: a hash could be reported indexed by a tier that
+        never stored it, then fetched from one that cannot produce it. Raising
+        at model load costs nothing and is loud.
+        """
+        tiers = [
+            c for c in self._connectors if getattr(c, "_state_tier", None) is not None
+        ]
+        if len(tiers) > 1:
+            names = [type(c).__name__ for c in tiers]
+            raise ValueError(
+                f"multi connector: {len(tiers)} sub-connectors built a state "
+                f"offload tier ({names}); exactly one may. List the offload "
+                "backend once in kv_transfer_config.connectors."
+            )
+        self._state_tier = tiers[0]._state_tier if tiers else None
 
     def start_load_kv(self, metadata: ConnectorMetadata) -> None:
         metas = getattr(metadata, "metas", None)
@@ -388,6 +419,21 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         return (
             c.adjust_prefill_chunk_after_alloc(seq, chunk) if c is not None else chunk
         )
+
+    def enqueue_state_loads(self, loads) -> bool:
+        """First sub that can carry them owns them; False if none can.
+
+        Only one sub may host the tier (the worker raises at model load when
+        two do), so "first" is also "only".
+
+        The False is not a formality: every load here belongs to a parked
+        request only a report can wake, and the caller's `hasattr` guard cannot
+        catch a swallowed one because this method always exists.
+        """
+        c = _first_with(self._connectors, "enqueue_state_loads")
+        if c is None:
+            return False
+        return bool(c.enqueue_state_loads(loads))
 
     def should_park_partial_prefill_for_load(self, seq: Any) -> bool:
         c = _first_with(self._connectors, "should_park_partial_prefill_for_load")
