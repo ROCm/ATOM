@@ -15,7 +15,6 @@ import torch
 from torch.distributed import ProcessGroup, ReduceOp
 from transformers import AutoConfig, GenerationConfig, PretrainedConfig
 
-from atom.model_ops.v4_indexer_config import resolve_v4_index_cache_dtype
 from atom.plugin import is_plugin_mode, is_vllm
 from atom.plugin.config import PluginConfig
 from atom.quant_spec import (
@@ -1747,18 +1746,18 @@ class Config:
         # only for server mode or plugin mode(vllm)
         # for torch compile policy, plugin mode(vllm) uses the ATOM compile policy
         # for cuda graph capture, plugin mode(vllm) uses the vLLM's cuda graph capture policy
-        if not is_plugin_mode() or (
-            self.plugin_config is not None and self.plugin_config.is_vllm
-        ):
-            if self.compilation_config.level == CompilationLevel.PIECEWISE:
-                self.compilation_config.set_splitting_ops_for_v1()
-                self._set_cudagraph_sizes()
-                # Keep an explicit cudagraph_mode (e.g. FULL); default to
-                # PIECEWISE only when unset. splitting_ops/sizes are set either
-                # way so the model is still piece-split-compiled at level 3.
-                if self.compilation_config.cudagraph_mode is None:
-                    self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
-                self.compilation_config.init_with_cudagraph_sizes()
+        if (
+            not is_plugin_mode()
+            or (self.plugin_config is not None and self.plugin_config.is_vllm)
+        ) and self.compilation_config.level == CompilationLevel.PIECEWISE:
+            self.compilation_config.set_splitting_ops_for_v1()
+            self._set_cudagraph_sizes()
+            # Keep an explicit cudagraph_mode (e.g. FULL); default to
+            # PIECEWISE only when unset. splitting_ops/sizes are set either
+            # way so the model is still piece-split-compiled at level 3.
+            if self.compilation_config.cudagraph_mode is None:
+                self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+            self.compilation_config.init_with_cudagraph_sizes()
 
         self.torch_dtype = (
             self.hf_config.dtype
@@ -1849,24 +1848,15 @@ class Config:
         # not yet describe the separate FP4 scale pool, so those integrations
         # retain FP8 until their layouts support it. Every other model keeps
         # the historical KV-cache-dtype default.
-        if self.index_cache_dtype is None:
-            if is_deepseek_v4:
-                allow_fp4_default = (
-                    self.plugin_config is None and not self.kv_transfer_config
-                )
-                gfx = None
-                if allow_fp4_default:
-                    from aiter.jit.utils.chip_info import get_gfx
+        if self.index_cache_dtype is None and is_deepseek_v4:
+            if self.plugin_config is None and not self.kv_transfer_config:
+                from aiter.jit.utils.chip_info import get_gfx
 
-                    gfx = get_gfx()
-
-                self.index_cache_dtype = resolve_v4_index_cache_dtype(
-                    None,
-                    gfx=gfx,
-                    allow_fp4_default=allow_fp4_default,
-                )
+                self.index_cache_dtype = "fp8" if get_gfx() == "gfx942" else "fp4"
             else:
-                self.index_cache_dtype = self.kv_cache_dtype
+                self.index_cache_dtype = "fp8"
+        elif self.index_cache_dtype is None:
+            self.index_cache_dtype = self.kv_cache_dtype
 
     def compute_hash(self) -> str:
         """

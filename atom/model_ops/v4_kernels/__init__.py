@@ -14,7 +14,6 @@ from typing import Any
 
 from aiter.jit.utils.chip_info import get_gfx
 
-from atom.model_ops.v4_indexer_config import v4_fp4_indexer_supported
 from atom.model_ops.v4_kernels.compress_plan import (
     CompressPlan,
     make_compress_plans,
@@ -130,7 +129,7 @@ def fp4_indexer_enabled(index_cache_dtype: Any, *, warn: bool = False) -> bool:
     if index_cache_dtype != "fp4":
         return False
     gfx = get_gfx()
-    if not v4_fp4_indexer_supported(gfx):
+    if gfx == "gfx942":
         if warn:
             logger.warning(
                 "The DeepSeek-V4 FP4 indexer is unsupported on %r. Falling "
