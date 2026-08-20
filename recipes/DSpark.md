@@ -105,6 +105,11 @@ Tips on server configuration:
   removed.
 - Do **not** pass `--enforce-eager` with the ragged CUDA-graph path — ragged
   replays captured `(bs, q_eff)` graphs. Eager also works for correctness checks.
+- `confidence_schedule` (and therefore `ragged`) cannot be combined with the
+  forced-acceptance knobs `--spec-decode-acceptance-length` /
+  `--spec-decode-acceptance-rate`: a runtime-chosen verify length can cap
+  acceptance below the requested length, so ATOM rejects the pair at startup.
+  See [Forced acceptance length](../docs/forced_acceptance_length.md).
 - Clear compile cache before restarting after code changes: `rm -rf /root/.cache/atom/*`
 
 ## Performance baseline (DeepSeek-V4-Pro)

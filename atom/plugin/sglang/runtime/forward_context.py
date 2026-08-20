@@ -11,6 +11,7 @@ from typing import Any
 import torch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
+from atom.models.utils import IntermediateTensors
 from atom.plugin.sglang.runtime.context import bind_current_forward_batch
 
 logger = logging.getLogger("atom.plugin.sglang.runtime.forward_context")
@@ -51,27 +52,55 @@ def _materialize_atom_dummy_forward(
     ForwardBatch,
 ]:
     """Convert an empty SGLang IDLE batch into ATOM-style dummy inputs."""
+    if positions is not None:
+        device = positions.device
+    elif input_ids is not None:
+        device = input_ids.device
+    elif input_embeds is not None:
+        device = input_embeds.device
+    else:
+        raise RuntimeError(
+            "SGLang dummy forward materialization requires at least one of "
+            "positions, input_ids, or input_embeds"
+        )
 
-    if positions is None:
-        raise RuntimeError("SGLang dummy forward materialization requires positions")
-    if input_ids is None:
-        raise RuntimeError("SGLang dummy forward materialization requires input_ids")
-
-    dummy_positions = positions.new_zeros((1,))
-    dummy_input_ids = input_ids.new_zeros((1,))
+    if positions is not None:
+        dummy_positions_shape = (
+            (3, 1) if positions.ndim == 2 and positions.shape[0] == 3 else (1,)
+        )
+        dummy_positions = positions.new_zeros(dummy_positions_shape)
+    else:
+        dummy_positions = torch.zeros((1,), dtype=torch.long, device=device)
+    dummy_input_ids = (
+        input_ids.new_zeros((1,))
+        if input_ids is not None
+        else torch.zeros((1,), dtype=torch.long, device=device)
+    )
     dummy_input_embeds = _pad_dummy_like(input_embeds, length=1, fill_value=0)
 
     model_forward_batch = copy.copy(forward_batch)
     model_forward_batch.positions = dummy_positions
     model_forward_batch.batch_size = 1
     model_forward_batch.seq_lens_sum = 1
-    model_forward_batch.seq_lens = forward_batch.seq_lens.new_ones((1,))
-    model_forward_batch.seq_lens_cpu = forward_batch.seq_lens_cpu.new_ones((1,))
+    seq_lens = getattr(forward_batch, "seq_lens", None)
+    seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+    model_forward_batch.seq_lens = (
+        seq_lens.new_ones((1,))
+        if torch.is_tensor(seq_lens)
+        else torch.ones((1,), dtype=torch.int32, device=device)
+    )
+    model_forward_batch.seq_lens_cpu = (
+        seq_lens_cpu.new_ones((1,))
+        if torch.is_tensor(seq_lens_cpu)
+        else torch.ones((1,), dtype=torch.int32, device="cpu")
+    )
 
     return dummy_input_ids, dummy_positions, dummy_input_embeds, model_forward_batch
 
 
 def _trim_hidden_states_for_output(hidden_states, num_tokens: int):
+    if isinstance(hidden_states, IntermediateTensors):
+        return hidden_states[:num_tokens]
     if torch.is_tensor(hidden_states):
         return hidden_states[:num_tokens]
     if isinstance(hidden_states, tuple):
@@ -86,7 +115,6 @@ def _resolve_num_tokens_across_dp(
     atom_config: Any,
     forward_batch: ForwardBatch,
     num_tokens: int,
-    is_dummy_run: bool,
 ) -> torch.Tensor:
     """Resolve per-DP token counts for ATOM's CPU-side DPMetadata."""
 
@@ -117,11 +145,10 @@ def _resolve_num_tokens_across_dp(
             (dp_size,), num_tokens, dtype=torch.int32, device="cpu"
         )
 
-    if is_dummy_run:
-        # SGLang reports idle ranks as 0 tokens, but ATOM materializes them
-        # as one local dummy token so collectives and DPMetadata stay aligned.
-        dp_rank = atom_config.parallel_config.data_parallel_rank
-        num_tokens_across_dp[dp_rank] = num_tokens
+    # SGLang reports idle ranks as 0 tokens, but ATOM materializes every idle
+    # rank as one physical dummy token. Normalize the complete vector on every
+    # rank so collectives and DPMetadata use identical sizes.
+    num_tokens_across_dp.clamp_min_(1)
     return num_tokens_across_dp
 
 
@@ -744,11 +771,19 @@ def _set_atom_forward_context(
             AttnState.PREFILL_PREFIX,
             AttnState.PREFILL_NATIVE,
         )
-    num_tokens = int(positions.shape[0])
+    # Qwen-VL mRoPE positions use [3, num_tokens], while ordinary position
+    # tensors use [num_tokens]. The token dimension is therefore the last
+    # dimension for mRoPE rather than the leading coordinate dimension.
+    num_tokens = int(
+        positions.shape[-1]
+        if positions.ndim == 2 and positions.shape[0] == 3
+        else positions.shape[0]
+    )
 
-    if bool(atom_config.enable_dp_attention):
+    enable_dp_attention = bool(atom_config.enable_dp_attention)
+    if enable_dp_attention:
         num_tokens_across_dp = _resolve_num_tokens_across_dp(
-            atom_config, forward_batch, num_tokens, is_dummy_run
+            atom_config, forward_batch, num_tokens
         )
         graph_bs = int(torch.max(num_tokens_across_dp).item())
     else:

@@ -44,7 +44,7 @@ if not torch.cuda.is_available():
 DEV = "cuda"
 
 
-def writer_slot(block_table_row, pos, rank, world, page):
+def writer_slot(block_table_row, pos, rank, world, page, interleave=1):
     """Where the WRITE side physically put this token; -1 if another rank owns it.
 
     This is the independent authority the expected values are built from. A
@@ -58,6 +58,7 @@ def writer_slot(block_table_row, pos, rank, world, page):
     stub = SimpleNamespace(
         dcp_world_size=world,
         dcp_rank=rank,
+        cp_kv_cache_interleave_size=interleave,
         model_runner=SimpleNamespace(block_size=page),
     )
     return int(
@@ -98,7 +99,7 @@ def _build_decode_case(g_ctxs, max_blocks, seed):
     return qo_indptr, global_kv_indptr, block_table, token_indices
 
 
-def _decode_reference(g_ctxs, block_table, token_indices, rank):
+def _decode_reference(g_ctxs, block_table, token_indices, rank, interleave=1):
     """Expected compacted slots per request, taken from the write side."""
     out = []
     for b, g in enumerate(g_ctxs):
@@ -109,7 +110,7 @@ def _decode_reference(g_ctxs, block_table, token_indices, rank):
             if tok < 0:
                 continue
             # ownership AND placement both come from the writer
-            slot = writer_slot(block_table[b], tok, rank, DEC_W, DEC_PAGE)
+            slot = writer_slot(block_table[b], tok, rank, DEC_W, DEC_PAGE, interleave)
             if slot >= 0:
                 slots.append(slot)
         out.append(slots)
@@ -192,6 +193,62 @@ def test_decode_filter(name, g_ctxs, seed):
         assert total == n, f"[{name}] req{b}: kept {total} of {n} top-k tokens"
 
 
+@pytest.mark.parametrize("interleave", [2, 4])  # both divide DEC_PAGE=16
+@pytest.mark.parametrize(
+    "g_ctxs, seed",
+    [([13, 100, 7, 300], 12), ([1000, 4096], 13), ([DEC_PAGE * DEC_W + 1], 14)],
+)
+def test_decode_filter_block_interleave(interleave, g_ctxs, seed):
+    """Same partition + writer-agreement checks as test_decode_filter, but with
+    block-level interleave S>1 (cp_kv_cache_interleave_size). The reference
+    slots come from the same _dcp_round_robin_slot writer, now with S, so the
+    filter kernel's owner/offset math is pinned to the write side at S>1."""
+    bs = len(g_ctxs)
+    max_blocks = max(1, (max(g_ctxs) + DEC_PAGE * DEC_W - 1) // (DEC_PAGE * DEC_W)) + 1
+    qo_indptr, global_kv_indptr, block_table, token_indices = _build_decode_case(
+        g_ctxs, max_blocks, seed
+    )
+    qo_g = qo_indptr.to(DEV)
+    gkv_g = global_kv_indptr.to(DEV)
+    bt_g = block_table.to(DEV)
+    ti_g = token_indices.to(DEV)
+
+    per_rank_lens = []
+    for rank in range(DEC_W):
+        out_buf = torch.full((bs * DEC_K,), -999, dtype=torch.int32, device=DEV)
+        out_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=DEV)
+        counts = torch.zeros(bs, dtype=torch.int32, device=DEV)
+
+        triton_filter_and_convert_dcp_index(
+            qo_g,
+            gkv_g,
+            bt_g,
+            ti_g,
+            rank,
+            DEC_W,
+            DEC_PAGE,
+            out_kv_indptr=out_indptr,
+            owned_counts=counts,
+            NUM_TOPK_TOKENS=DEC_K,
+            out=out_buf,
+            cp_kv_cache_interleave_size=interleave,
+        )
+        torch.cuda.synchronize()
+
+        exp = _decode_reference(g_ctxs, block_table, token_indices, rank, interleave)
+        indptr = out_indptr.cpu().tolist()
+        for b in range(bs):
+            got = out_buf[indptr[b] : indptr[b + 1]].cpu().tolist()
+            assert got == exp[b], f"S={interleave} rank{rank} req{b}: {got} != {exp[b]}"
+        assert int((out_buf[: indptr[bs]] < 0).sum()) == 0, "-1 hole in region"
+        per_rank_lens.append([indptr[b + 1] - indptr[b] for b in range(bs)])
+
+    for b, g in enumerate(g_ctxs):
+        n = min(g, DEC_K)
+        total = sum(per_rank_lens[rank][b] for rank in range(DEC_W))
+        assert total == n, f"S={interleave} req{b}: kept {total} of {n}"
+
+
 # ────────────────────────────────────────────────────────────── prefill side ──
 
 PRE_W = 8
@@ -250,7 +307,7 @@ def _build_prefill_case(seq_lens):
     }
 
 
-def _run_prefill(case):
+def _run_prefill(case, interleave=1):
     n = case["num_tokens"]
     g = {
         k: torch.from_numpy(v).to(DEV)
@@ -278,6 +335,7 @@ def _run_prefill(case):
             owned_counts=counts_scratch,
             NUM_TOPK_TOKENS=PRE_TOPK,
             out=out_buf,
+            cp_kv_cache_interleave_size=interleave,
         )
         torch.cuda.synchronize()
         per_rank.append(
@@ -290,12 +348,13 @@ def _run_prefill(case):
     return per_rank
 
 
+@pytest.mark.parametrize("interleave", [1, 4])  # 4 divides PRE_PAGE=16
 @pytest.mark.parametrize(
     "seq_lens", [[400], [300, 240], [17, 5, 1]], ids=["single", "two-seq", "tiny"]
 )
-def test_prefill_filter(seq_lens):
+def test_prefill_filter(seq_lens, interleave):
     case = _build_prefill_case(np.asarray(seq_lens, dtype=np.int32))
-    per_rank = _run_prefill(case)
+    per_rank = _run_prefill(case, interleave)
 
     cu_k = case["cu_k"]
     tts = case["token_to_seq"]
@@ -312,7 +371,7 @@ def test_prefill_filter(seq_lens):
         key = (int(b), int(p))
         if key not in owner_of:
             claims = [
-                (r, writer_slot(bt[b], int(p), r, PRE_W, PRE_PAGE))
+                (r, writer_slot(bt[b], int(p), r, PRE_W, PRE_PAGE, interleave))
                 for r in range(PRE_W)
             ]
             claims = [(r, s) for r, s in claims if s >= 0]

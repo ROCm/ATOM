@@ -69,12 +69,21 @@ class CUDAGraphMode(enum.Enum):
     FULL = 2
     FULL_DECODE_ONLY = (FULL, NONE)
     FULL_AND_PIECEWISE = (FULL, PIECEWISE)
+    # AF_PIECEWISE ("attention/FFN-wise"): PIECEWISE + attention core in its own
+    # cudagraph (DSpark). Tuple so decode/mixed_mode resolve to PIECEWISE (existing
+    # == PIECEWISE checks treat it as such); extra capture gated by is_attn_ffn_piecewise().
+    AF_PIECEWISE = (PIECEWISE, PIECEWISE)
 
     def decode_mode(self) -> "CUDAGraphMode":
         return CUDAGraphMode(self.value[0]) if self.separate_routine() else self
 
     def mixed_mode(self) -> "CUDAGraphMode":
         return CUDAGraphMode(self.value[1]) if self.separate_routine() else self
+
+    def is_attn_ffn_piecewise(self) -> bool:
+        """True only for AF_PIECEWISE — gates the extra attention-core cudagraph
+        (attention/FFN-wise capture) on top of the standard piecewise pieces."""
+        return self is CUDAGraphMode.AF_PIECEWISE
 
     def requires_piecewise_compilation(self) -> bool:
         return (
@@ -144,6 +153,13 @@ class CompilationConfig:
     - FULL.
     - FULL_DECODE_ONLY.
     - FULL_AND_PIECEWISE.
+    - AF_PIECEWISE.
+
+    AF_PIECEWISE ("attention/FFN-wise") mode: PIECEWISE where the attention
+    core is ALSO captured into its own cudagraph with zero-copy public buffers
+    (DeepSeek-V4 DSpark), so small-batch decode is all-replay with no eager
+    attention gap between the dense pieces. Falls back to plain PIECEWISE
+    behavior for models that don't implement the attention-core capture.
 
     PIECEWISE mode build piecewise cudagraph only, keeping the cudagraph
     incompatiable ops (i.e. some attention ops) outside the cudagraph
@@ -804,6 +820,9 @@ class ParallelConfig:
     for this EngineCore, separate from the request endpoint. Keeping the two
     apart leaves the request socket with a single writer thread, so admitting a
     request needs no synchronization. Populated by launch_engine_core."""
+    pp_kv_status_addr: str = ""
+    """ZMQ endpoint where the head receives KV offload status from downstream
+    PP stages. All downstream stages PUSH; the head PULLs."""
     world_size: int = field(init=False)
     """Vestigial: never assigned or read; engine_core derives worker count directly."""
     data_parallel_master_port: int = 29500
@@ -992,12 +1011,24 @@ class SpeculativeConfig:
     draft_model_hf_config: PretrainedConfig | None = None
     use_aux_hidden_state: bool = False
     eagle3_aux_layer_ids: list[int] = field(default_factory=list)
-    # Debug/benchmark knob: when set (float in [0, 1]), the rejection sampler
-    # force-accepts draft tokens with a position-decaying probability calibrated
-    # so the measured mean acceptance rate matches this value, independent of the
-    # real draft/target agreement. Mirrors vLLM's synthetic_acceptance_rate. See
-    # ROCm/ATOM#555.
+    # Debug/benchmark knobs: force a speculative acceptance curve independent of
+    # the real draft/target agreement, so a run can replay a published
+    # acceptance-length figure (an InferenceX golden AL, say) while the draft head
+    # is still training. Set at most one; both resolve into
+    # `synthetic_acceptance_rates`. See ROCm/ATOM#555.
+    #
+    # Mean acceptance length in [1, num_speculative_tokens + 1], counting the
+    # target's own guaranteed token -- the same unit as vLLM's
+    # synthetic_acceptance_length and SGLang's SGLANG_SIMULATE_ACC_LEN, so a
+    # published AL can be pasted in without conversion.
+    synthetic_acceptance_length: float | None = None
+    # The same target expressed as a mean acceptance RATE in [0, 1]
+    # (accepted_draft / total_draft), i.e. (length - 1) / num_speculative_tokens.
     synthetic_acceptance_rate: float | None = None
+    # Resolved per-position *unconditional* acceptance rates (entry i = marginal
+    # probability that the first i+1 draft tokens are all accepted), filled in by
+    # __post_init__. None => real draft/target rejection sampling.
+    synthetic_acceptance_rates: list[float] | None = None
 
     # model_type → mtp_model_type mapping
     _MTP_TYPE_MAP: ClassVar[dict[str, str]] = {
@@ -1059,14 +1090,63 @@ class SpeculativeConfig:
         cfg = self.draft_model_hf_config
         return bool(getattr(cfg, "dspark_with_draft", False))
 
-    def __post_init__(self):
-        if self.synthetic_acceptance_rate is not None and not (
-            0.0 <= self.synthetic_acceptance_rate <= 1.0
+    def _resolve_synthetic_acceptance(self) -> None:
+        """Validate the forced-acceptance knobs and resolve to per-position rates.
+
+        Both knobs describe the same curve, so exactly one may be set; the rate
+        form is converted to a length and everything downstream reads only
+        ``synthetic_acceptance_rates``.
+        """
+        # Local import: the schedule lives next to the kernel that consumes it,
+        # and that module pulls in triton, which has no business loading just
+        # because someone imported a config.
+        from atom.model_ops.rejection_sampler import acceptance_length_to_rates
+
+        if (
+            self.synthetic_acceptance_length is not None
+            and self.synthetic_acceptance_rate is not None
         ):
             raise ValueError(
-                "synthetic_acceptance_rate (--spec-decode-acceptance-rate) must "
-                f"be in [0, 1], but got {self.synthetic_acceptance_rate}."
+                "--spec-decode-acceptance-length and --spec-decode-acceptance-rate "
+                "describe the same curve; set at most one."
             )
+        length = self.synthetic_acceptance_length
+        if self.synthetic_acceptance_rate is None and length is None:
+            return
+
+        n = self.num_speculative_tokens
+        if not n:
+            raise ValueError(
+                "Forced speculative acceptance needs --num-speculative-tokens, "
+                f"but it is {n!r}."
+            )
+        if self.synthetic_acceptance_rate is not None:
+            rate = self.synthetic_acceptance_rate
+            if not 0.0 <= rate <= 1.0:
+                raise ValueError(
+                    "synthetic_acceptance_rate (--spec-decode-acceptance-rate) "
+                    f"must be in [0, 1], but got {rate}."
+                )
+            length = 1.0 + n * rate
+        if not 1.0 <= length <= float(n + 1):
+            raise ValueError(
+                "synthetic_acceptance_length (--spec-decode-acceptance-length) "
+                f"must be in [1, {n + 1}] for num_speculative_tokens={n}, but got "
+                f"{length}."
+            )
+        self.synthetic_acceptance_length = length
+        self.synthetic_acceptance_rates = acceptance_length_to_rates(length, n)
+        logger.info(
+            "Forced speculative acceptance ON: mean acceptance length %.4f over "
+            "%d draft positions (per-position rates %s). Throughput numbers from "
+            "this run are synthetic; output text and accuracy are meaningless.",
+            length,
+            n,
+            [round(r, 4) for r in self.synthetic_acceptance_rates],
+        )
+
+    def __post_init__(self):
+        self._resolve_synthetic_acceptance()
         if self.draft_model_hf_config is None:
             self.draft_model_hf_config = get_hf_config(
                 self.model, trust_remote_code=True
@@ -1313,6 +1393,35 @@ class EPLBConfig:
 
 
 @dataclass
+class DCPConfig:
+    """DCP (Decode Context Parallel) sub-config. Today only interleave
+    granularity; room for future knobs (all-to-all backend, query
+    replication, ...) without growing the top-level CLI surface."""
+
+    interleave_size: int = 1
+
+    def __post_init__(self):
+        self.interleave_size = int(self.interleave_size)
+        assert self.interleave_size >= 1, "dcp.interleave_size must be >= 1"
+
+    @classmethod
+    def from_dict(cls, cfg: dict | None) -> "DCPConfig":
+        """Build from the ``--dcp-config`` JSON dict.
+
+        ``cfg`` maps directly onto this dataclass' fields; unknown keys raise so
+        typos fail fast."""
+        cfg = cfg or {}
+        allowed = {f.name for f in fields(cls)}
+        unknown = set(cfg) - allowed
+        if unknown:
+            raise ValueError(
+                f"Unknown --dcp-config key(s): {sorted(unknown)}. "
+                f"Supported keys: {sorted(allowed)}"
+            )
+        return cls(**cfg)
+
+
+@dataclass
 class Config:
     model: str
     trust_remote_code: bool = False
@@ -1330,6 +1439,7 @@ class Config:
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
     decode_context_parallel_size: int = 1
+    dcp_config: DCPConfig = field(default_factory=DCPConfig)
     pipeline_parallel_size: int = 1
     prefill_context_parallel_size: int = 1
     enforce_eager: bool = False
@@ -1461,7 +1571,40 @@ class Config:
             self.eplb_config = EPLBConfig(**self.eplb_config.__dict__)
         else:
             raise TypeError("eplb_config must be EPLBConfig or dict")
+        if isinstance(self.dcp_config, dict):
+            self.dcp_config = DCPConfig(**self.dcp_config)
+        elif isinstance(self.dcp_config, DCPConfig):
+            # Normalize/validate even when constructed programmatically.
+            self.dcp_config = DCPConfig(**self.dcp_config.__dict__)
+        else:
+            raise TypeError("dcp_config must be DCPConfig or dict")
         # assert os.path.isdir(self.model)
+
+        # The forced-acceptance schedule spends its whole budget on the first
+        # ceil(length - 1) positions, and the sampler can only accept what was
+        # actually drafted. The DSpark confidence scheduler hands each request
+        # its own verify length ell_r, so whenever ell_r falls below that many
+        # positions the run quietly lands under the acceptance length it was
+        # asked to reproduce (measured at length 3.78 over 7 positions: exact
+        # while ell_r >= 3, 3.39 at ell_r = 2, 2.89 at ell_r = 1). ell_r is
+        # chosen at runtime from the confidence head, so there is no upfront
+        # check that would catch it -- and a benchmark reporting a number it
+        # never hit is worse than one that refuses to start.
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.synthetic_acceptance_rates is not None
+            and self.dspark.confidence_schedule
+        ):
+            raise ValueError(
+                "Forced speculative acceptance (--spec-decode-acceptance-length "
+                "/ --spec-decode-acceptance-rate) cannot be combined with the "
+                "DSpark confidence scheduler (--dspark-config "
+                "'{\"confidence_schedule\": true}'): it sizes each request's "
+                "verify length at runtime, and a short one caps acceptance below "
+                "the requested length with no way to detect it upfront. Drop "
+                "confidence_schedule (and ragged, which needs it) for "
+                "forced-acceptance runs."
+            )
 
         # RapidServe (intra-GPU prefill/decode disagg) needs a specialized
         # runner in both the prefill and decode processes. Select it unless the
@@ -1494,6 +1637,31 @@ class Config:
                     f"the persistent cprr MLA kernel); got {gfx}. Disable DCP or "
                     f"speculative decode on this GPU."
                 )
+        # DCP KV-cache interleave granularity S. S=1 (default) = token-level
+        # round-robin (unchanged). S>1 = block-level interleave; must divide the
+        # KV block so each physical block holds an integer number of S-groups
+        # (the (i//(S*W))*S + i%S local-index math relies on block_size % S == 0),
+        # and only makes sense under DCP.
+        assert 1 <= self.dcp_config.interleave_size <= self.kv_cache_block_size, (
+            f"dcp_config.interleave_size ({self.dcp_config.interleave_size}) must "
+            f"be in [1, kv_cache_block_size={self.kv_cache_block_size}]"
+        )
+        if self.dcp_config.interleave_size > 1:
+            assert self.kv_cache_block_size % self.dcp_config.interleave_size == 0, (
+                f"kv_cache_block_size ({self.kv_cache_block_size}) must be divisible "
+                f"by dcp_config.interleave_size ({self.dcp_config.interleave_size})"
+            )
+            assert self.decode_context_parallel_size > 1, (
+                "dcp_config.interleave_size > 1 only applies under DCP "
+                f"(decode_context_parallel_size={self.decode_context_parallel_size})"
+            )
+            assert self.speculative_config is None, (
+                "dcp_config.interleave_size > 1 (block-level DCP interleave) is "
+                "incompatible with speculative decode (MTP/eagle/dspark): the q>1 "
+                "verify cprr MLA kernel assumes token-level interleave. Use "
+                "dcp_config.interleave_size=1 with speculative decode, or disable "
+                "speculative decode for block-level interleave."
+            )
         assert 1 <= self.pipeline_parallel_size
         self.hf_config = get_hf_config(
             self.model, trust_remote_code=self.trust_remote_code
