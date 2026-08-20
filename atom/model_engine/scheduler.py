@@ -1631,8 +1631,14 @@ class Scheduler:
         if skipped_pp_inflight:
             self.running.extend(skipped_pp_inflight)
 
-        if not scheduled_seqs:
-            return None
+        # No early return on an empty `scheduled_seqs`. A step where every
+        # candidate was held back -- under pipeline parallelism, by
+        # `skipped_pp_inflight` -- still owes the caller an empty batch rather
+        # than None: `test_pp.py::test_decode_inflight_block` unpacks the
+        # result and asserts `len(batch.req_ids) == 0`. The construction below
+        # already handles the empty case (the token sums are over empty
+        # slices, the log line is behind `num_seqs_prefill > 0`, and
+        # `state_maintenance_ops` explicitly checks `scheduled_seqs`).
 
         # Recompute prefill/decode token totals from the per-row list. In
         # mixed batches prefill rows come first (Phase 1 + Phase 2 appended),
