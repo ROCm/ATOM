@@ -46,7 +46,7 @@ backends:
 models:
   DeepSeek-V4-Pro:
     backend: atom
-    model_path: "${ATOMESH_MODEL_ROOT}/DeepSeek-V4-Pro/"
+    model_path: "/it-share/models/DeepSeek-V4-Pro/"
     precision: FP4
     env:
       common:

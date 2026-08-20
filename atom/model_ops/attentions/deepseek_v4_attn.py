@@ -1423,6 +1423,22 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                     reverse_indexed=True,
                 )
             )
+            if self._kv_fp8:
+                rope = runner.v4_unified_kv_rope[layer_id]
+                if rope is None:
+                    raise RuntimeError(
+                        "DeepSeek-V4 fp8 SWA transfer requires a parallel RoPE pool"
+                    )
+                rope_swa_bpb = (
+                    self.block_size * self.rope_head_dim * rope.element_size()
+                )
+                swa_block_regions.append(
+                    KVTransferRegion(
+                        rope.data_ptr(),
+                        swa_pages * self.rope_head_dim * rope.element_size(),
+                        rope_swa_bpb,
+                    )
+                )
 
         # Staging pool for compressor states (not in slot_regions — managed
         # separately by the connector with pool acquire/release).
