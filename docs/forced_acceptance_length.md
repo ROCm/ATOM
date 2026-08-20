@@ -105,11 +105,6 @@ across engines and not merely its mean.
 Accepted positions emit the draft's own token IDs, so the drafter still runs and
 is still paid for on every step. Only the accept/reject decision is synthetic.
 
-> `--spec-decode-acceptance-rate` previously resolved to a geometric decay,
-> which hits the same mean with about 15× the variance (2.63 against 0.17 at
-> length 3.78). It now shares the schedule above, so throughput numbers taken
-> before that change are not comparable to ones taken after.
-
 ## Confirming the run hit the target
 
 `GET /debug/mtp_stats` reports what actually happened:
