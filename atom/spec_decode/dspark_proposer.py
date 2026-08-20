@@ -4,6 +4,7 @@ import torch
 from torch import nn
 from torch.profiler import record_function
 
+from atom.distributed.dcp_utils import get_dcp_rank, get_dcp_world_size
 from atom.spec_decode.drafter import AuxCaptureSpec, Drafter
 from atom.spec_decode.dspark_verify import VerifyScheduler
 from atom.utils import envs
@@ -36,6 +37,11 @@ class DSparkProposer(Drafter):
         self._verify_scheduler = (
             VerifyScheduler(runner) if self._confidence_schedule else None
         )
+        # The draft shares the target's block tables and its KV lives in the same
+        # paged pool, so it inherits the pool's DCP sharding: the block pass must
+        # address and size itself in LOCAL (per-rank) terms. 1 when -dcp is unset.
+        self.dcp_world_size = get_dcp_world_size()
+        self.dcp_rank = get_dcp_rank()
         if self._with_draft:
             self._init_draft_block_buffers()
 
@@ -91,9 +97,13 @@ class DSparkProposer(Drafter):
         # on -- read it rather than recomputing, so the work descriptors planned
         # here describe the kernel that will actually run. The ModelRunner itself
         # has no such attribute.
-        self._blk_padded_heads = self.model.layers[
-            0
-        ].self_attn.mla_attn.impl.padded_num_heads
+        impl = self.model.layers[0].self_attn.mla_attn.impl
+        if self.dcp_world_size > 1:
+            # DCP decode all-gathers on the head dim, so the descriptors must be
+            # planned for the padded GATHERED width.
+            self._blk_padded_heads = impl.dcp_kernel_num_heads
+        else:
+            self._blk_padded_heads = impl.padded_num_heads
         # max_split_per_batch only exists in newer aiter builds; feature-detect
         # it (as aiter_mla does) so old builds don't hit a TypeError. Cache the
         # kwargs so the sizing (info) and fill (get_mla_metadata_v1) calls agree.
@@ -520,17 +530,50 @@ class DSparkProposer(Drafter):
 
         if not is_dummy:
             block_tables = self.runner.forward_vars["block_tables"].gpu[:bs]
-            # slot = page_id * block_size + offset_in_page, derived on-device
-            # from the block table so there is no host sync.
-            page_idx = torch.div(block_positions, block_size, rounding_mode="floor")
             slots = self._blk_slots[: bs * T].view(bs, T)  # stable
-            slots.copy_(torch.gather(block_tables, 1, page_idx))
-            slots.mul_(block_size)
-            slots.add_(torch.remainder(block_positions, block_size))
-
             # Each request's KV spans [0, anchor] (context) ++ the T block rows.
             ctx_lens = self._blk_ctx_lens[:bs]  # stable
-            ctx_lens.copy_(anchor_positions + (1 + T))
+            global_lens = anchor_positions + (1 + T)
+            if self.dcp_world_size > 1:
+                # DCP shards KV token-wise round-robin, so one block table entry
+                # covers block_size*dcp_world_size GLOBAL tokens and rank r holds
+                # only the positions p with p % dcp_world_size == r, packed
+                # densely into its page. Rows this rank does not own are written
+                # to -1 (dropped).
+                virtual_block = block_size * self.dcp_world_size
+                page_idx = torch.div(
+                    block_positions, virtual_block, rounding_mode="floor"
+                )
+                local_off = torch.div(
+                    torch.remainder(block_positions, virtual_block),
+                    self.dcp_world_size,
+                    rounding_mode="floor",
+                )
+                slots.copy_(
+                    torch.where(
+                        torch.remainder(block_positions, self.dcp_world_size)
+                        == self.dcp_rank,
+                        torch.gather(block_tables, 1, page_idx) * block_size
+                        + local_off,
+                        -1,
+                    )
+                )
+                # Of L global tokens this rank stores ceil((L - r) / dcp_world_size).
+                ctx_lens.copy_(
+                    torch.div(
+                        global_lens + (self.dcp_world_size - 1 - self.dcp_rank),
+                        self.dcp_world_size,
+                        rounding_mode="floor",
+                    )
+                )
+            else:
+                # slot = page_id * block_size + offset_in_page, derived on-device
+                # from the block table so there is no host sync.
+                page_idx = torch.div(block_positions, block_size, rounding_mode="floor")
+                slots.copy_(torch.gather(block_tables, 1, page_idx))
+                slots.mul_(block_size)
+                slots.add_(torch.remainder(block_positions, block_size))
+                ctx_lens.copy_(global_lens)
 
             attn_metadata.slot_mapping = slots.view(-1)
             attn_metadata.block_tables = block_tables
@@ -544,12 +587,24 @@ class DSparkProposer(Drafter):
             # kv_indptr[0] stays 0 (zero-init, never written). cumsum promotes
             # integers to int64, so land it through copy_ rather than out=.
             kv_indptr[1:].copy_(torch.cumsum(ctx_lens, dim=0))
+            # The generator walks block_tables row by row up to this bound, and
+            # under DCP those rows are LOCAL: one entry covers
+            # block_size*dcp_world_size global tokens. max_seqlen_k stays global
+            # (prepare_decode keeps it that way too), so handing it over unscaled
+            # would run the generator dcp_world_size times past each row's valid
+            # entries and emit slots from unmapped pages. Overestimating is fine
+            # -- kv_indptr caps the real per-seq count.
+            index_max_k = (
+                attn_metadata.max_seqlen_k // self.dcp_world_size + 1
+                if self.dcp_world_size > 1
+                else attn_metadata.max_seqlen_k
+            )
             kv_indices_generate_triton(
                 block_tables,
                 self._blk_kv_indices,
                 kv_indptr,
                 block_size,
-                attn_metadata.max_seqlen_k,
+                index_max_k,
             )
             attn_metadata.kv_indptr = kv_indptr
             attn_metadata.kv_indices = self._blk_kv_indices

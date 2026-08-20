@@ -17,7 +17,7 @@ from vllm.v1.attention.backend import (
 
 from atom.config import get_current_atom_config
 from atom.distributed.dcp_utils import dcp_persistent_supported
-from atom.model_ops.attention_mla import _MLA_MIN_HEADS
+from atom.model_ops.attention_mla import _MLA_MIN_HEADS, mla_dcp_kernel_num_heads
 from atom.plugin.vllm.attention.layer_mla import (
     disabled_mla_persistent_metadata,
     mla_fold_kv_metadata_triton,
@@ -1058,16 +1058,19 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
         self.dcp_persistent_supported = dcp_persistent_supported()
         # DCP decode all-gathers Q across the DCP group on the head dim, so the
         # head count reaching mla_decode_fwd (and thus the persistent decode
-        # metadata) is padded_num_attention_heads * dcp_world_size. Sourced from
-        # the parallel config so it is available here in __init__. dcp=1 ->
-        # equals padded_num_attention_heads (zero regression for non-DCP). Only
-        # scale by dcp on gfx950 (DCP persistent); gfx942 stays non-persistent
-        # where this metadata is unused, so keep the original per-rank sizing.
-        self.persistent_num_heads = self.padded_num_attention_heads * (
-            self.parallel_config.decode_context_parallel_size
-            if self.dcp_persistent_supported
-            else 1
-        )
+        # metadata) is the gathered width padded up to a dispatchable kernel.
+        # dcp size is sourced from the parallel config so it is available here in
+        # __init__. dcp=1 -> equals padded_num_attention_heads (zero regression
+        # for non-DCP). Only scale by dcp on gfx950 (DCP persistent); gfx942
+        # stays non-persistent where this metadata is unused, so keep the
+        # original per-rank sizing.
+        dcp_size = self.parallel_config.decode_context_parallel_size
+        if dcp_size > 1 and self.dcp_persistent_supported:
+            self.persistent_num_heads = mla_dcp_kernel_num_heads(
+                self.num_attention_heads, dcp_size
+            )
+        else:
+            self.persistent_num_heads = self.padded_num_attention_heads
         self.block_size = kv_cache_spec.block_size
         self.max_bs = max_num_reqs
         self.dtype_kv = get_aiter_kv_cache_dtype(config)

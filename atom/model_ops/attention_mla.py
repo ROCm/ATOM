@@ -150,6 +150,54 @@ def mla_min_query_heads(kv_cache_dtype: str, block_width: int) -> int:
     return _MLA_MIN_HEADS
 
 
+def mla_kernel_num_heads(num_heads: int) -> int:
+    """Round a query-head count up to a width ``mla_decode_fwd`` will dispatch.
+
+    aiter accepts nhead 16, and above that only multiples of 16 up to 128 (it
+    folds those onto the 16-head kernel); any other value aborts the dispatch.
+    """
+    if num_heads <= _MLA_MIN_HEADS:
+        return _MLA_MIN_HEADS
+    return -(-num_heads // _MLA_MIN_HEADS) * _MLA_MIN_HEADS
+
+
+# Gathered widths aiter serves with a dedicated kernel. The other multiples of
+# 16 (48, 80, 96, 112) are folded onto the 16-head kernel instead, and that fold
+# reinterprets head groups as extra sequence rows (total_s *= ori_nhead//16)
+# without touching kv_indptr, which desynchronises the row -> global position
+# mapping the round-robin causal mask runs on. DCP decode must avoid them.
+_MLA_DCP_KERNEL_WIDTHS = (16, 32, 64, 128)
+
+_dcp_kernel_width_warned = False
+
+
+def mla_dcp_kernel_num_heads(
+    num_heads: int, dcp_world_size: int, min_kernel_heads: int = _MLA_MIN_HEADS
+) -> int:
+    """Width to pad the GATHERED query heads to for a DCP decode.
+
+    DCP decode all-gathers Q on the head dim before calling the kernel, so what
+    gets dispatched on is ``num_heads * dcp_world_size``; a single rank's head
+    count is never seen and is the wrong thing to pad. Round that gathered width
+    up to one aiter serves natively -- the folded widths are no use here because
+    the fold breaks the round-robin causal mask (see above).
+    """
+    gathered = max(num_heads * dcp_world_size, min_kernel_heads)
+    for width in _MLA_DCP_KERNEL_WIDTHS:
+        if width >= gathered:
+            return width
+    global _dcp_kernel_width_warned
+    if not _dcp_kernel_width_warned:
+        _dcp_kernel_width_warned = True
+        logger.warning(
+            f"DCP decode gathers {gathered} query heads, past the widest natively "
+            f"dispatched MLA kernel ({_MLA_DCP_KERNEL_WIDTHS[-1]}); falling back to "
+            "the folded kernel, which is incorrect for MTP (round-robin causal "
+            "mask). Lower decode_context_parallel_size or raise tp."
+        )
+    return mla_kernel_num_heads(gathered)
+
+
 # The fused seg MLA kernels (fused_qk_rope_concat_and_cache_mla_seg +
 # concat_and_cache_mla_seg + the gfx1250 mla_decode_fwd asm) share a single
 # segmented KV cache layout (all tokens' nope packed first, then all tokens'
@@ -312,9 +360,8 @@ class MLAAttention(nn.Module):
         self.kv_cache_dtype = "fp8" if kv_cache_dtype.startswith("fp8") else "auto"
         self.dtype = dtype
 
-        self.padded_num_heads = max(
-            num_heads, kwargs.get("min_query_heads", _MLA_MIN_HEADS)
-        )
+        self.min_query_heads = kwargs.get("min_query_heads", _MLA_MIN_HEADS)
+        self.padded_num_heads = max(num_heads, self.min_query_heads)
         self.head_repeat_factor = 1
         self.head_pad = 0
         if self.padded_num_heads != num_heads:
@@ -454,6 +501,41 @@ class MLAAttention(nn.Module):
         # metadata builder to the shared buffer (see aiter_mla.py).
         self.dcp_sparse_kv_indptr_buffer = None
         self.dcp_owned_counts_buffer = None
+
+        # DCP decode all-gathers Q on the head dim, so the width reaching
+        # mla_decode_fwd is the gathered num_heads * dcp rounded up to a
+        # dispatchable one. The pad sits entirely inside _forward_decode: it goes
+        # on after the gather and comes off before the cross-rank combine, so it
+        # never costs collective traffic.
+        self.dcp_kernel_num_heads = self.num_heads
+        self.dcp_head_pad = 0
+        if self.dcp_world_size > 1:
+            self.dcp_kernel_num_heads = mla_dcp_kernel_num_heads(
+                self.num_heads, self.dcp_world_size, self.min_query_heads
+            )
+            self.dcp_head_pad = (
+                self.dcp_kernel_num_heads - self.num_heads * self.dcp_world_size
+            )
+
+    def _pad_decode_query_heads(self, q: torch.Tensor) -> torch.Tensor:
+        """Head padding for the decode kernel. Under DCP q arrives already
+        gathered across the DCP group, so it is that width -- not the per-rank
+        one -- that has to reach a dispatchable kernel."""
+        if self.dcp_world_size > 1:
+            if self.dcp_head_pad > 0:
+                return torch.nn.functional.pad(q, (0, 0, 0, self.dcp_head_pad))
+            return q
+        return self._pad_query_heads(q)
+
+    def _restore_decode_query_heads(
+        self, x: torch.Tensor, num_heads: int
+    ) -> torch.Tensor:
+        """Undo `_pad_decode_query_heads` on an output or per-head LSE."""
+        if self.dcp_world_size > 1:
+            if self.dcp_head_pad > 0:
+                return x[:, :num_heads, ...].contiguous()
+            return x
+        return self._restore_query_heads(x, num_heads)
 
     def _pad_query_heads(self, q: torch.Tensor) -> torch.Tensor:
         if self.head_repeat_factor > 1:
@@ -1318,7 +1400,7 @@ class MLAAttention(nn.Module):
         B = q.shape[0]
         num_heads_q = q.shape[1]
 
-        q = self._pad_query_heads(q)
+        q = self._pad_decode_query_heads(q)
 
         # In the seg path q arrives with a padded per-head row stride
         # (_MLA_Q_OUT_PADDED_DIM); slice back to the logical
@@ -1478,11 +1560,13 @@ class MLAAttention(nn.Module):
             # the intra-block causal mask must be applied on GLOBAL positions
             # g(j)=j*W+r. Pass the cprr params (g_kv_indptr + cp world/rank) so the
             # kernel selects the cprr variant and masks correctly. qlen=1 keeps the
-            # plain path (single query sees all local KV -> no mask needed).
+            # plain path (single query sees all local KV -> no mask needed), and so
+            # does a non-causal block (DSpark drafts bidirectionally: every query
+            # legitimately sees every KV row, so there is no mask to place).
             cp_world_size = 1
             cp_rank = 0
             g_kv_indptr = None
-            if self.dcp_world_size > 1 and max_q_len > 1:
+            if self.dcp_world_size > 1 and max_q_len > 1 and causal:
                 cp_world_size = self.dcp_world_size
                 cp_rank = self.dcp_rank
                 g_kv_indptr = getattr(attn_metadata, "g_kv_indptr", None)
@@ -1521,9 +1605,9 @@ class MLAAttention(nn.Module):
                 causal=causal,
             )
 
-        o = self._restore_query_heads(o, num_heads_q)
+        o = self._restore_decode_query_heads(o, num_heads_q)
         if final_lse is not None:
-            final_lse = self._restore_query_heads(final_lse, num_heads_q)
+            final_lse = self._restore_decode_query_heads(final_lse, num_heads_q)
 
         if return_lse:
             return o, final_lse
@@ -1915,9 +1999,15 @@ class MLAAttention(nn.Module):
             elif self.dcp_world_size > 1:
                 # DCP decode: AllGather Q on the head dim, decode locally with LSE,
                 # then combine partial outputs across ranks (AG LSE + correct + RS).
-                from atom.model_ops.dcp_ops import cp_lse_ag_out_rs
+                from atom.model_ops.dcp_ops import (
+                    cp_lse_ag_out_rs,
+                    dcp_all_gather_query_heads,
+                )
 
-                q_out = self.dcp_group.all_gather(q_out, dim=1)
+                # Only real heads cross the wire and enter the combine; the pad the
+                # kernel width needs lives inside _forward_decode (see
+                # dcp_kernel_num_heads).
+                q_out = dcp_all_gather_query_heads(self.dcp_group, q_out)
                 o, lse = self._forward_decode(
                     q_out, kv_cache, attn_metadata, return_lse=True
                 )
