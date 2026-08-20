@@ -455,10 +455,21 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             custom_routing_function=custom_routing_function,
             scoring_func=scoring_func,
             e_score_correction_bias=e_score_correction_bias,
-            num_routing_experts=layer.global_num_experts - layer.num_redundant_experts,
-            num_fused_shared_experts=layer.num_fused_shared_experts,
+            # Routed only: the gate has no logit for the always-on shared expert.
+            num_routing_experts=layer.num_routed_logical_experts,
+            # The dispatch path appends its own shared column below.
+            num_fused_shared_experts=(
+                0
+                if layer.fuse_shared_into_dispatch
+                else layer.num_fused_shared_experts
+            ),
             fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
             routed_scaling_factor=layer.routed_scaling_factor,
+        )
+        # Before the remap, so the shared expert resolves through the same
+        # placement table as everything else.
+        topk_weights, topk_logical = layer.append_shared_logical_column(
+            topk_weights, topk_logical
         )
         # Fused logical->physical remap + expert-load record
         topk_physical = eplb_map_and_record_fused(layer, topk_logical)
@@ -2540,29 +2551,6 @@ class FusedMoE(torch.nn.Module):
         self.moe_parallel_config = FusedMoEParallelConfig.make(
             tp_size, dp_size, atom_config
         )
-        self.num_redundant_experts = (
-            int(getattr(atom_config.eplb_config, "num_redundant_experts", 0))
-            if self.use_ep and getattr(atom_config, "eplb_enable", False)
-            else 0
-        )
-        # physical slots = routed experts + EPLB redundant replicas
-        self.global_num_experts = num_experts + self.num_redundant_experts
-        if self.use_ep:
-            assert self.global_num_experts % self.ep_size == 0, (
-                "EPLB physical experts must be divisible by ep_size: "
-                f"num_logical={num_experts}, "
-                f"num_redundant={self.num_redundant_experts}, ep_size={self.ep_size}"
-            )
-        self.register_buffer("expert_map", None, persistent=False)
-        self.register_buffer("expert_mask", None, persistent=False)
-        if self.use_ep:
-            self.local_num_experts, self.expert_map = determine_expert_map(
-                ep_size=self.ep_size,
-                ep_rank=self.ep_rank,
-                global_num_experts=self.global_num_experts,
-            )
-        else:
-            self.local_num_experts = self.global_num_experts
         self.top_k = top_k
         self.shared_expert_scoring_func = shared_expert_scoring_func
 
@@ -2588,34 +2576,109 @@ class FusedMoE(torch.nn.Module):
             if config is not None and atom_config.torch_dtype != torch.float16
             else 1.0
         )
+        eplb_enabled = self.use_ep and getattr(atom_config, "eplb_enable", False)
+        # Fold the shared expert into the all2all dispatch as one more logical
+        # expert. Both cases below resolve it through the normal EPLB dispatch
+        # table; they differ only in who builds the placement.
+        self.fuse_shared_into_dispatch = (
+            fuse_shared_experts
+            and self.num_fused_shared_experts > 0
+            and self.moe_parallel_config.use_all2all_kernels
+        )
+        num_shared = (
+            self.num_fused_shared_experts if self.fuse_shared_into_dispatch else 0
+        )
+        # EPLB places the shared expert itself; without it the placement is
+        # static, one replica per rank.
+        self.shared_is_placed_by_eplb = bool(num_shared) and eplb_enabled
+
+        configured_redundant = (
+            int(getattr(atom_config.eplb_config, "num_redundant_experts", 0))
+            if eplb_enabled
+            else 0
+        )
+        self.num_logical_experts = num_experts + num_shared
+        if self.shared_is_placed_by_eplb:
+            physical = self.num_logical_experts + configured_redundant
+            # Absorbing the shared expert breaks the even split; the padding
+            # becomes extra redundancy the placement policy can use.
+            physical += -physical % self.ep_size
+        elif num_shared:
+            physical = num_experts + num_shared * self.ep_size
+        else:
+            physical = num_experts + configured_redundant
+        # Physical slots as the kernels index them; `global - redundant` must
+        # stay the logical count for physical_expert_id/count_local_base_experts.
+        self.global_num_experts = physical
+        self.num_redundant_experts = physical - self.num_logical_experts
+        # The loader speaks checkpoint ids, so expert_map covers the routed
+        # slots only unless EPLB placed the shared expert among them.
+        routed_physical = (
+            physical
+            if self.shared_is_placed_by_eplb
+            else num_experts + configured_redundant
+        )
         if self.use_ep:
-            expert_mask = torch.ones(
-                (self.global_num_experts + self.num_fused_shared_experts + 1,),
-                dtype=torch.int32,
-                device=self.expert_map.device,
+            assert self.global_num_experts % self.ep_size == 0, (
+                "EPLB physical experts must be divisible by ep_size: "
+                f"num_logical={self.num_logical_experts}, "
+                f"num_redundant={self.num_redundant_experts}, ep_size={self.ep_size}"
             )
-            expert_mask[-1] = 0
-            expert_mask[: self.global_num_experts] = self.expert_map > -1
-            self.expert_mask = expert_mask
-            self.expert_map = torch.cat(
-                (
-                    self.expert_map,
-                    torch.tensor(
-                        [
-                            self.local_num_experts + i
-                            for i in range(self.num_fused_shared_experts)
-                        ],
-                        dtype=torch.int32,
+        self.register_buffer("expert_map", None, persistent=False)
+        self.register_buffer("expert_mask", None, persistent=False)
+        if self.use_ep:
+            self.local_num_experts, self.expert_map = determine_expert_map(
+                ep_size=self.ep_size,
+                ep_rank=self.ep_rank,
+                global_num_experts=routed_physical,
+            )
+        else:
+            self.local_num_experts = self.global_num_experts
+        if self.use_ep:
+            if self.fuse_shared_into_dispatch:
+                # Placeholder: the mask is indexed by dispatch id, which only the
+                # placement knows. Rebuilt from it in bind_expert_placement.
+                self.expert_mask = torch.ones(
+                    self.global_num_experts,
+                    dtype=torch.int32,
+                    device=self.expert_map.device,
+                )
+            else:
+                expert_mask = torch.ones(
+                    (self.global_num_experts + self.num_fused_shared_experts + 1,),
+                    dtype=torch.int32,
+                    device=self.expert_map.device,
+                )
+                expert_mask[-1] = 0
+                expert_mask[: self.global_num_experts] = self.expert_map > -1
+                self.expert_mask = expert_mask
+            # The shared expert reaches the loader as `experts.{n_routed}`; give
+            # it a tail entry pointing at this rank's slot. Not needed once EPLB
+            # placed it among the routed experts -- it owns a real slot there.
+            if not self.shared_is_placed_by_eplb:
+                self.expert_map = torch.cat(
+                    (
+                        self.expert_map,
+                        torch.tensor(
+                            [
+                                self.local_num_experts + i
+                                for i in range(self.num_fused_shared_experts)
+                            ],
+                            dtype=torch.int32,
+                        ),
+                        # Sentinel for the fake expert ID used by aiter topK to
+                        # mark non-local tokens; must map to -1.
+                        torch.tensor([-1], dtype=torch.int32),
                     ),
-                    # Sentinel entry for the fake expert ID
-                    # (global_num_experts + num_fused_shared_experts) used by
-                    # aiter topK to mark non-local tokens when EP is active.
-                    # Must map to -1 so that EP remapping zeros their weights.
-                    torch.tensor([-1], dtype=torch.int32),
-                ),
-                dim=0,
-            )
-        if fuse_shared_experts and self.num_fused_shared_experts > 0:
+                    dim=0,
+                )
+        # The prebuilt topK buffer splits tokens by `i % tp_size == tp_rank`,
+        # which assumes every rank holds the same batch; DP attention breaks it.
+        if (
+            fuse_shared_experts
+            and self.num_fused_shared_experts > 0
+            and not self.fuse_shared_into_dispatch
+        ):
             init_aiter_topK_meta_data(
                 n_routed_experts=num_experts,
                 n_shared_experts=self.num_fused_shared_experts,
@@ -2630,7 +2693,9 @@ class FusedMoE(torch.nn.Module):
                 max_num_tokens=atom_config.max_num_batched_tokens,
                 is_EP=self.use_ep,
             )
-        if fuse_shared_experts:
+        # An extra local slot for the shared expert -- unless EPLB placed it,
+        # where determine_expert_map already handed it a slot on one rank.
+        if fuse_shared_experts and not self.shared_is_placed_by_eplb:
             self.local_num_experts += self.num_fused_shared_experts
         assert intermediate_size % self.tp_size == 0
         self.hidden_size = hidden_size
@@ -2728,6 +2793,60 @@ class FusedMoE(torch.nn.Module):
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
         self.layer_name = prefix
+
+    @property
+    def num_routed_logical_experts(self) -> int:
+        """Logical experts the gate emits a logit for."""
+        return self.num_logical_experts - (
+            self.num_fused_shared_experts if self.fuse_shared_into_dispatch else 0
+        )
+
+    def append_shared_logical_column(
+        self, topk_weights: torch.Tensor, topk_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Add the always-on shared expert as extra logical columns.
+
+        Its ids follow the routed ones, matching the loader's rename of
+        `shared_experts.*` to `experts.{n_routed}.*`.
+        """
+        if not self.fuse_shared_into_dispatch:
+            return topk_weights, topk_ids
+        num_shared = self.num_fused_shared_experts
+        num_tokens = topk_ids.shape[0]
+        shared_ids = torch.arange(
+            self.num_routed_logical_experts,
+            self.num_routed_logical_experts + num_shared,
+            dtype=topk_ids.dtype,
+            device=topk_ids.device,
+        ).expand(num_tokens, num_shared)
+        weight = (
+            1.0
+            if is_rocm_aiter_fuse_routed_scaling_factor()
+            else 1.0 / self.routed_scaling_factor
+        )
+        shared_w = torch.full(
+            (num_tokens, num_shared),
+            weight,
+            dtype=topk_weights.dtype,
+            device=topk_weights.device,
+        )
+        return (
+            torch.cat((topk_weights, shared_w), dim=1),
+            torch.cat((topk_ids, shared_ids), dim=1),
+        )
+
+    def bind_expert_placement(self, meta) -> None:
+        """Point the kernel mask at the dispatch space the placement defines.
+
+        `expert_map` stays in checkpoint id space for the loader, so it cannot
+        supply this: only the placement knows which dispatch slots are local.
+        """
+        if not self.fuse_shared_into_dispatch or not isinstance(self.layer_id, int):
+            return
+        placement_map = meta.expert_map[self.layer_id]
+        self.expert_mask = (placement_map > -1).to(
+            dtype=torch.int32, device=self.expert_mask.device
+        )
 
     def process_weights_after_loading(self):
         self._online_quant()

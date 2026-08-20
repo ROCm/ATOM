@@ -280,6 +280,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD": lambda: int(
         os.getenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "1024")
     ),
+    # Fold the shared expert into the all2all dispatch when EPLB is off; "0"
+    # keeps it standalone on the alt stream. Ignored under EPLB, which always
+    # fuses because the shared expert is one of the experts it places.
+    "ATOM_FUSE_SHARED_EXPERT": lambda: (
+        os.getenv("ATOM_FUSE_SHARED_EXPERT", "1").lower() == "1"
+    ),
     # Gate/Up interleave mode for MoE weight preshuffle and kernel gate_mode.
     # "0" (default) = SEPARATED layout; "1" = INTERLEAVE layout.
     "ATOM_MOE_GU_ITLV": lambda: os.getenv("ATOM_MOE_GU_ITLV", "0") == "1",

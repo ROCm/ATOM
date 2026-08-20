@@ -772,6 +772,66 @@ class ExpertLocationMetadata:
             max_num_replicas=num_redundant + 1,
         )
 
+    @classmethod
+    def from_shared_replicated(
+        cls,
+        *,
+        num_layers: int,
+        num_routed_experts: int,
+        num_shared_experts: int,
+        ep_size: int,
+        ep_rank: int,
+        device: torch.device | None = None,
+    ) -> ExpertLocationMetadata:
+        """Placement for a fused shared expert with no rebalancing.
+
+        Each rank's block is `[routed ...][shared ...]`, so the shared experts
+        get one replica per rank and `_build_rank_dispatch_map` resolves them to
+        the local one. Routed experts keep one replica each, split evenly.
+
+        Only valid when nothing will rebalance: the shared replicas are ordinary
+        placement here, not protected, so a rebalance would move them.
+        """
+        dev = device if device is not None else torch.device("cpu")
+        assert ep_size > 0
+        assert (
+            num_routed_experts % ep_size == 0
+        ), f"routed experts must divide across ranks: {num_routed_experts}/{ep_size}"
+        assert num_shared_experts > 0
+
+        routed_per_rank = num_routed_experts // ep_size
+        per_rank = routed_per_rank + num_shared_experts
+        num_logical = num_routed_experts + num_shared_experts
+        num_physical = per_rank * ep_size
+
+        p2l_row = torch.empty(num_physical, dtype=torch.int32, device=dev)
+        logcnt_row = torch.ones(num_logical, dtype=torch.int32, device=dev)
+        l2p_row = torch.full(
+            (num_logical, ep_size), -1, dtype=torch.int32, device=dev
+        )
+        for e in range(num_routed_experts):
+            rank, offset = divmod(e, routed_per_rank)
+            slot = rank * per_rank + offset
+            p2l_row[slot] = e
+            l2p_row[e, 0] = slot
+        for j in range(num_shared_experts):
+            logical = num_routed_experts + j
+            for rank in range(ep_size):
+                slot = rank * per_rank + routed_per_rank + j
+                p2l_row[slot] = logical
+                l2p_row[logical, rank] = slot
+            logcnt_row[logical] = ep_size
+
+        expand = lambda row: row.unsqueeze(0).expand(num_layers, *row.shape)  # noqa: E731
+        return cls.from_rebalance_result(
+            physical_to_logical_map=expand(p2l_row).contiguous(),
+            logical_to_physical_map=expand(l2p_row).contiguous(),
+            logical_replica_count=expand(logcnt_row).contiguous(),
+            ep_size=ep_size,
+            ep_rank=ep_rank,
+            max_num_replicas=ep_size,
+        )
+
     def update(self, other: ExpertLocationMetadata, layer_ids: list[int]) -> None:
         """In-place atomic commit of the placement-dependent maps for the given
         layers (module-E §5).
@@ -1603,8 +1663,25 @@ def get_expert_load_monitor(*, enabled: bool, window_size: int) -> ExpertLoadMon
     return _MONITOR
 
 
+_STATIC_METADATA: ExpertLocationMetadata | None = None
+
+
+def set_static_expert_location_metadata(
+    meta: ExpertLocationMetadata | None,
+) -> None:
+    """Install a placement that nothing will rebalance.
+
+    Lets a fused shared expert reuse the normal logical->physical dispatch when
+    EPLB is off: no manager runs, so the initial placement is the final one.
+    """
+    global _STATIC_METADATA
+    _STATIC_METADATA = meta
+
+
 def get_live_expert_location_metadata() -> ExpertLocationMetadata | None:
-    return _MANAGER.live_metadata if _MANAGER is not None else None
+    if _MANAGER is not None:
+        return _MANAGER.live_metadata
+    return _STATIC_METADATA
 
 
 class EPLBManager:
@@ -2376,9 +2453,53 @@ def initialize_eplb_runtime(owner: Any) -> EPLBManager | None:
     """
     manager = _get_configured_eplb_manager()
     if manager is None:
+        _install_static_shared_placement(owner)
         return None
     manager.bind_runtime_owner(owner)
     return manager
+
+
+def _install_static_shared_placement(owner: Any) -> None:
+    """Publish a fixed placement for a fused shared expert when EPLB is off.
+
+    Nothing rebalances here, so the initial placement is the final one and the
+    dispatch remap can use it exactly as it uses a live EPLB one.
+    """
+    model = getattr(owner, "model", None)
+    if model is None:
+        return
+    layers = {
+        layer_id: m
+        for m in model.modules()
+        if getattr(m, "fuse_shared_into_dispatch", False)
+        and isinstance(layer_id := getattr(m, "layer_id", None), int)
+    }
+    if not layers:
+        return
+    if not all(m.expert_mask is not None for m in layers.values()):
+        raise RuntimeError(
+            "fused shared experts reached placement without an expert mask; "
+            "the dispatch would treat every slot as local"
+        )
+    first = layers[min(layers)]
+    meta = ExpertLocationMetadata.from_shared_replicated(
+        num_layers=max(layers) + 1,
+        num_routed_experts=int(first.num_routed_logical_experts),
+        num_shared_experts=int(first.num_fused_shared_experts),
+        ep_size=int(first.ep_size),
+        ep_rank=int(first.ep_rank),
+        device=first.w13_weight.device,
+    )
+    set_static_expert_location_metadata(meta)
+    for layer in layers.values():
+        layer.bind_expert_placement(meta)
+    logger.info(
+        "Fused shared expert: static placement over %d layers, %d routed + %d "
+        "shared per rank",
+        max(layers) + 1,
+        int(first.num_routed_logical_experts) // int(first.ep_size),
+        int(first.num_fused_shared_experts),
+    )
 
 
 def trigger_eplb_profile_rearrange() -> None:
