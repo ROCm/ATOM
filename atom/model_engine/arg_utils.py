@@ -81,10 +81,6 @@ class EngineArgs:
     hf_overrides: dict | None = None
     dspark_config: dict | None = None
 
-    def __post_init__(self) -> None:
-        if self.index_cache_dtype is None:
-            self.index_cache_dtype = self.kv_cache_dtype
-
     eplb_enable: bool = False
     eplb_config: dict | None = None
     dcp_config: dict | None = None
@@ -176,9 +172,9 @@ class EngineArgs:
             choices=["bf16", "fp8", "fp4"],
             type=str,
             default=None,
-            help="Index cache type. Defaults to --kv_cache_dtype. 'fp4' selects "
-            "the DeepSeek-V4 FP4 CSA indexer (gfx950 only; falls back to fp8 "
-            "elsewhere).",
+            help="Index cache type. Native single-node DeepSeek-V4 defaults to "
+            "'fp4' except on gfx942, which defaults to 'fp8'; other models "
+            "default to --kv_cache_dtype.",
         )
         parser.add_argument(
             "--block-size", type=int, default=16, help="KV cache block size."

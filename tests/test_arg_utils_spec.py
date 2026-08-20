@@ -176,16 +176,16 @@ class TestEngineArgsSpeculativeValidation:
 
 
 class TestEngineArgsIndexCacheDtype:
-    """Regression tests for index-cache dtype CLI parity with KV cache dtype."""
+    """Regression tests for index-cache dtype CLI and deferred defaults."""
 
-    def test_index_cache_dtype_defaults_to_kv_cache_dtype(self):
+    def test_index_cache_dtype_default_is_deferred_until_model_is_known(self):
         parser = argparse.ArgumentParser()
         EngineArgs.add_cli_args(parser)
 
         args = EngineArgs.from_cli_args(parser.parse_args(["--kv_cache_dtype", "fp8"]))
 
         assert args.kv_cache_dtype == "fp8"
-        assert args.index_cache_dtype == "fp8"
+        assert args.index_cache_dtype is None
 
     def test_index_cache_dtype_accepts_dashed_spelling(self):
         parser = argparse.ArgumentParser()

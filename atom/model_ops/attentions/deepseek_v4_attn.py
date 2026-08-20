@@ -501,16 +501,18 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             "be 16-byte aligned: the FP8 data region is read with dwordx4 loads"
         )
 
-        # Opt-in FP4 indexer cache (gfx950). When set, the CSA Indexer KV is
+        # FP4 indexer cache (the native single-node default except on gfx942).
+        # When enabled, the CSA Indexer KV is
         # stored as packed FP4 E2M1 + per-group(32) e8m0 scale in the
         # `pa_mqa_logits_fp4` preshuffle layout (data
         # [NB, k_tiles, 4, rows, 16] uint8 + scale [NB, k_tiles, 4, rows] uint8)
         # written by `fused_compress_attn(quant_mode="fp4")`. The scoring path
-        # auto-detects FP4 via `kv_cache.dtype == uint8`. Default (fp8) → the
-        # existing FP8 (+fp32 scale) path is byte-identical.
-        # Switch: `--index_cache_dtype fp4`. Authoritative decision — this is the
-        # value re-asserted onto every Indexer in `build_kv_cache_tensor`.
-        # `warn=True`: the gfx950 fallback message is emitted here only, since the
+        # auto-detects FP4 via `kv_cache.dtype == uint8`. Explicit fp8 keeps the
+        # existing FP8 (+fp32 scale) path byte-identical.
+        # `--index_cache_dtype` remains an explicit override. This is the
+        # authoritative decision re-asserted onto every Indexer in
+        # `build_kv_cache_tensor`.
+        # `warn=True`: the gfx942 fallback message is emitted here only, since the
         # builder is constructed once while `Indexer.__init__` runs per CSA layer.
         # Shared predicate (see `fp4_indexer_enabled`) so the builder and
         # `Indexer.__init__` cannot drift apart.

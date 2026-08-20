@@ -15,7 +15,7 @@ import torch
 from torch.distributed import ProcessGroup, ReduceOp
 from transformers import AutoConfig, GenerationConfig, PretrainedConfig
 
-# plugin-related utilities
+from atom.model_ops.v4_indexer_config import resolve_v4_index_cache_dtype
 from atom.plugin import is_plugin_mode, is_vllm
 from atom.plugin.config import PluginConfig
 from atom.quant_spec import (
@@ -1546,9 +1546,6 @@ class Config:
                 self.graph_bs = cuda_graph_sizes
 
     def __post_init__(self):
-        if self.index_cache_dtype is None:
-            self.index_cache_dtype = self.kv_cache_dtype
-
         self.moe_backend = self.moe_backend.strip().lower()
         if self.moe_backend not in ("standard", "mega"):
             raise ValueError(
@@ -1839,10 +1836,37 @@ class Config:
         # Use the preserved `architectures` field (re-injected by get_hf_config,
         # line 567) which keeps the original "DeepseekV4ForCausalLM[NextN]" name.
         arches = getattr(self.hf_config, "architectures", None) or []
-        if any("DeepseekV4" in str(a) for a in arches):
+        is_deepseek_v4 = any("DeepseekV4" in str(a) for a in arches)
+        if is_deepseek_v4:
             v4_block_size = 256
             if self.kv_cache_block_size != v4_block_size:
                 self.kv_cache_block_size = v4_block_size
+
+        # Keep ``None`` intact until the model architecture is known so an
+        # omitted index-cache option remains distinguishable from an explicit
+        # fp8/bf16 override. Native single-node V4 defaults to the FP4 indexer
+        # except on gfx942. Plugin proxy pools and KV-transfer region maps do
+        # not yet describe the separate FP4 scale pool, so those integrations
+        # retain FP8 until their layouts support it. Every other model keeps
+        # the historical KV-cache-dtype default.
+        if self.index_cache_dtype is None:
+            if is_deepseek_v4:
+                allow_fp4_default = (
+                    self.plugin_config is None and not self.kv_transfer_config
+                )
+                gfx = None
+                if allow_fp4_default:
+                    from aiter.jit.utils.chip_info import get_gfx
+
+                    gfx = get_gfx()
+
+                self.index_cache_dtype = resolve_v4_index_cache_dtype(
+                    None,
+                    gfx=gfx,
+                    allow_fp4_default=allow_fp4_default,
+                )
+            else:
+                self.index_cache_dtype = self.kv_cache_dtype
 
     def compute_hash(self) -> str:
         """
