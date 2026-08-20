@@ -12,6 +12,7 @@ from atom.distributed.pp_transport import PPStageTransport
 from atom.kv_transfer.disaggregation.pp_kv_aggregator import PPKVAggregator
 from atom.kv_transfer.disaggregation.types import (
     KVConnectorOutput,
+    completion_req_key,
     connector_metadata_has_work,
 )
 from atom.model_engine.engine_core import EngineCore
@@ -289,11 +290,14 @@ class PPEngineCoreProc(EngineCore):
         # were already persisted. Holding those would strand them forever: no
         # finished_saving is ever coming. Only the paired sends wait for the
         # PP-wide save quorum.
-        local_saving = {str(rid) for rid in kvoutput.finished_saving or ()}
+        local_saving = {
+            completion_req_key(rid) for rid in kvoutput.finished_saving or ()
+        }
         unpaired_sending = set()
         for rid in kvoutput.finished_sending or ():
-            if str(rid) in local_saving:
-                self._held_sending[str(rid)] = rid
+            key = completion_req_key(rid)
+            if key in local_saving:
+                self._held_sending[key] = rid
             else:
                 unpaired_sending.add(rid)
         if unpaired_sending:
@@ -321,7 +325,7 @@ class PPEngineCoreProc(EngineCore):
         # Release held finished_sending whose global save is now complete.
         rel = set()
         for rid in result.finished_saving or ():
-            held = self._held_sending.pop(str(rid), None)
+            held = self._held_sending.pop(completion_req_key(rid), None)
             if held is not None:
                 rel.add(held)
         if rel:

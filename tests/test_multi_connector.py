@@ -92,6 +92,16 @@ class FakeSchedSub:
     def load_failed(self, req_id):
         self.load_failed_ids.append(req_id)
 
+    def process_completions(self, output):
+        # Mirrors OffloadSchedulerMixin: apply the completions, then hand the
+        # scheduler bare request ids.
+        for value in output.finished_saving:
+            self.save_finished(value)
+        output.finished_saving = {
+            getattr(value, "req_id", value) for value in output.finished_saving
+        }
+        return output
+
     def has_pending_work(self):
         return self.pending
 
@@ -105,6 +115,7 @@ class FakeSchedSub:
             "should_defer_free",
             "save_finished",
             "load_failed",
+            "process_completions",
             "has_pending_work",
         }
         if name in offload_api and not object.__getattribute__(self, "_offload"):
@@ -233,6 +244,22 @@ def test_offload_methods_forwarded_to_owning_sub():
     sched.load_failed("r2")
     assert off.saved == ["r1"]
     assert off.load_failed_ids == ["r2"]
+
+
+def test_process_completions_reaches_the_offload_sub():
+    # The scheduler calls process_completions and nothing else — it is the only
+    # caller of the offload sub's save_finished. Without the fan-out the sub's
+    # inflight saves never clear (has_pending_work stays true forever) and the
+    # exact SaveOperationId reaches a scheduler that looks requests up by id.
+    moriio = FakeSchedSub(is_producer=True)
+    off = FakeSchedSub(offload_methods=True)
+    sched = _sched([moriio, off])
+
+    op = SaveOperationId(9, 1)
+    out = sched.process_completions(KVConnectorOutput(finished_saving={op}))
+
+    assert off.saved == [op]
+    assert out.finished_saving == {9}
 
 
 def test_offload_methods_default_when_no_sub_implements():
