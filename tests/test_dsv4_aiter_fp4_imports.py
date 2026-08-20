@@ -4,7 +4,6 @@
 import ast
 from pathlib import Path
 
-
 ATOM_ROOT = Path(__file__).resolve().parents[1] / "atom"
 CURRENT_MODULES = {
     "aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4",
@@ -17,9 +16,12 @@ def _fp4_aiter_imports() -> list[tuple[Path, int, str]]:
     for path in ATOM_ROOT.rglob("*.py"):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom) and node.module:
-                if "pa_mqa_logits_fp4" in node.module:
-                    imports.append((path, node.lineno, node.module))
+            if (
+                isinstance(node, ast.ImportFrom)
+                and node.module
+                and "pa_mqa_logits_fp4" in node.module
+            ):
+                imports.append((path, node.lineno, node.module))
     return imports
 
 
