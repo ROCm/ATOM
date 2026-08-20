@@ -250,9 +250,11 @@ class CoreManager:
         # class's spawn loop reads them.
         self.pp_meta_addrs = []
         self.pp_token_addr = ""
+        self.pp_kv_status_addr = ""
         if pp_size > 1:
             self.pp_meta_addrs = [get_open_zmq_ipc_path() for _ in range(pp_size)]
             self.pp_token_addr = get_open_zmq_ipc_path()
+            self.pp_kv_status_addr = get_open_zmq_ipc_path()
 
         self._init_shared_state(
             config,
@@ -290,6 +292,9 @@ class CoreManager:
                 if self.pp_size > 1:
                     rank_config.parallel_config.pp_meta_addrs = self.pp_meta_addrs
                     rank_config.parallel_config.pp_token_addr = self.pp_token_addr
+                    rank_config.parallel_config.pp_kv_status_addr = (
+                        self.pp_kv_status_addr
+                    )
 
                 if socket_plan is not None:
                     plan = socket_plan[dp_rank]

@@ -69,12 +69,21 @@ class CUDAGraphMode(enum.Enum):
     FULL = 2
     FULL_DECODE_ONLY = (FULL, NONE)
     FULL_AND_PIECEWISE = (FULL, PIECEWISE)
+    # AF_PIECEWISE ("attention/FFN-wise"): PIECEWISE + attention core in its own
+    # cudagraph (DSpark). Tuple so decode/mixed_mode resolve to PIECEWISE (existing
+    # == PIECEWISE checks treat it as such); extra capture gated by is_attn_ffn_piecewise().
+    AF_PIECEWISE = (PIECEWISE, PIECEWISE)
 
     def decode_mode(self) -> "CUDAGraphMode":
         return CUDAGraphMode(self.value[0]) if self.separate_routine() else self
 
     def mixed_mode(self) -> "CUDAGraphMode":
         return CUDAGraphMode(self.value[1]) if self.separate_routine() else self
+
+    def is_attn_ffn_piecewise(self) -> bool:
+        """True only for AF_PIECEWISE — gates the extra attention-core cudagraph
+        (attention/FFN-wise capture) on top of the standard piecewise pieces."""
+        return self is CUDAGraphMode.AF_PIECEWISE
 
     def requires_piecewise_compilation(self) -> bool:
         return (
@@ -144,6 +153,13 @@ class CompilationConfig:
     - FULL.
     - FULL_DECODE_ONLY.
     - FULL_AND_PIECEWISE.
+    - AF_PIECEWISE.
+
+    AF_PIECEWISE ("attention/FFN-wise") mode: PIECEWISE where the attention
+    core is ALSO captured into its own cudagraph with zero-copy public buffers
+    (DeepSeek-V4 DSpark), so small-batch decode is all-replay with no eager
+    attention gap between the dense pieces. Falls back to plain PIECEWISE
+    behavior for models that don't implement the attention-core capture.
 
     PIECEWISE mode build piecewise cudagraph only, keeping the cudagraph
     incompatiable ops (i.e. some attention ops) outside the cudagraph
@@ -807,6 +823,11 @@ class ParallelConfig:
     for this EngineCore, separate from the request endpoint. Keeping the two
     apart leaves the request socket with a single writer thread, so admitting a
     request needs no synchronization. Populated by launch_engine_core."""
+    pp_kv_status_addr: str = ""
+    """ZMQ endpoint where the head receives KV offload status from downstream
+    PP stages. All downstream stages PUSH; the head PULLs."""
+    world_size: int = field(init=False)
+    """Vestigial: never assigned or read; engine_core derives worker count directly."""
     data_parallel_master_port: int = 29500
     """Port of the data parallel master."""
 
@@ -1352,6 +1373,35 @@ class EPLBConfig:
 
 
 @dataclass
+class DCPConfig:
+    """DCP (Decode Context Parallel) sub-config. Today only interleave
+    granularity; room for future knobs (all-to-all backend, query
+    replication, ...) without growing the top-level CLI surface."""
+
+    interleave_size: int = 1
+
+    def __post_init__(self):
+        self.interleave_size = int(self.interleave_size)
+        assert self.interleave_size >= 1, "dcp.interleave_size must be >= 1"
+
+    @classmethod
+    def from_dict(cls, cfg: dict | None) -> "DCPConfig":
+        """Build from the ``--dcp-config`` JSON dict.
+
+        ``cfg`` maps directly onto this dataclass' fields; unknown keys raise so
+        typos fail fast."""
+        cfg = cfg or {}
+        allowed = {f.name for f in fields(cls)}
+        unknown = set(cfg) - allowed
+        if unknown:
+            raise ValueError(
+                f"Unknown --dcp-config key(s): {sorted(unknown)}. "
+                f"Supported keys: {sorted(allowed)}"
+            )
+        return cls(**cfg)
+
+
+@dataclass
 class Config:
     model: str
     trust_remote_code: bool = False
@@ -1369,6 +1419,7 @@ class Config:
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
     decode_context_parallel_size: int = 1
+    dcp_config: DCPConfig = field(default_factory=DCPConfig)
     pipeline_parallel_size: int = 1
     prefill_context_parallel_size: int = 1
     enforce_eager: bool = False
@@ -1499,6 +1550,13 @@ class Config:
             self.eplb_config = EPLBConfig(**self.eplb_config.__dict__)
         else:
             raise TypeError("eplb_config must be EPLBConfig or dict")
+        if isinstance(self.dcp_config, dict):
+            self.dcp_config = DCPConfig(**self.dcp_config)
+        elif isinstance(self.dcp_config, DCPConfig):
+            # Normalize/validate even when constructed programmatically.
+            self.dcp_config = DCPConfig(**self.dcp_config.__dict__)
+        else:
+            raise TypeError("dcp_config must be DCPConfig or dict")
         # assert os.path.isdir(self.model)
 
         # RapidServe (intra-GPU prefill/decode disagg) needs a specialized
@@ -1532,6 +1590,31 @@ class Config:
                     f"the persistent cprr MLA kernel); got {gfx}. Disable DCP or "
                     f"speculative decode on this GPU."
                 )
+        # DCP KV-cache interleave granularity S. S=1 (default) = token-level
+        # round-robin (unchanged). S>1 = block-level interleave; must divide the
+        # KV block so each physical block holds an integer number of S-groups
+        # (the (i//(S*W))*S + i%S local-index math relies on block_size % S == 0),
+        # and only makes sense under DCP.
+        assert 1 <= self.dcp_config.interleave_size <= self.kv_cache_block_size, (
+            f"dcp_config.interleave_size ({self.dcp_config.interleave_size}) must "
+            f"be in [1, kv_cache_block_size={self.kv_cache_block_size}]"
+        )
+        if self.dcp_config.interleave_size > 1:
+            assert self.kv_cache_block_size % self.dcp_config.interleave_size == 0, (
+                f"kv_cache_block_size ({self.kv_cache_block_size}) must be divisible "
+                f"by dcp_config.interleave_size ({self.dcp_config.interleave_size})"
+            )
+            assert self.decode_context_parallel_size > 1, (
+                "dcp_config.interleave_size > 1 only applies under DCP "
+                f"(decode_context_parallel_size={self.decode_context_parallel_size})"
+            )
+            assert self.speculative_config is None, (
+                "dcp_config.interleave_size > 1 (block-level DCP interleave) is "
+                "incompatible with speculative decode (MTP/eagle/dspark): the q>1 "
+                "verify cprr MLA kernel assumes token-level interleave. Use "
+                "dcp_config.interleave_size=1 with speculative decode, or disable "
+                "speculative decode for block-level interleave."
+            )
         assert 1 <= self.pipeline_parallel_size
         self.hf_config = get_hf_config(
             self.model, trust_remote_code=self.trust_remote_code

@@ -460,12 +460,14 @@ class EagleProposer(Drafter):
                         raw_slots = kv_indices[kv_indptr[1 : bs + 1] - 1]
                         builder = self.runner.attn_metadata_builder
                         if getattr(builder, "dcp_world_size", 1) > 1:
-                            # DCP round-robin: only rank (context_len-1) % W owns
-                            # this draft token; other ranks' kv_indptr didn't grow,
-                            # so raw_slots would point at a stale slot. Emit -1.
+                            # DCP interleave-S: only rank ((ctx-1)//S) % W owns this
+                            # draft token; other ranks' kv_indptr didn't grow, so
+                            # raw_slots would point at a stale slot. Emit -1. S=1 is
+                            # the original round-robin ``(ctx-1) % W``.
+                            S = getattr(builder, "cp_kv_cache_interleave_size", 1)
                             ctx = attn_metadata.context_lens[:bs]
                             owned = (
-                                (ctx - 1) % builder.dcp_world_size
+                                ((ctx - 1) // S) % builder.dcp_world_size
                             ) == builder.dcp_rank
                             slot_mapping[:] = torch.where(owned, raw_slots, -1)
                         else:

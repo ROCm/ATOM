@@ -13,7 +13,7 @@ from atom.model_engine.state_runtime import (
     StateTransfer,
 )
 
-COPY_SPEC = PagedStateCheckpointSpec(10, 25, "layout-v2")
+COPY_SPEC = PagedStateCheckpointSpec(10, 25, "layout-v2", image_bytes=25)
 
 
 def test_wire_round_trip_keeps_the_complete_capability():

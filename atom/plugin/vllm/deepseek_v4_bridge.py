@@ -136,11 +136,19 @@ def _v4_state_layout(vllm_config, kv_fp8: bool):
             torch.float32,
             float("-inf"),
         ),
+        # `in_checkpoint=False` for the same reason the native list says so
+        # (`deepseek_v4_attn._state_fields`): HCA pools `[P, P + 128)` with no
+        # overlap, so a checkpoint boundary owes it nothing. This list does not
+        # price an image today — only `plan_field_planes`, which ignores the
+        # flag, reads it — but two declarations of one layout disagreeing about
+        # the one rule `layout_id` fences is exactly what that fence cannot
+        # catch, since the id is derived from the native list alone.
         StateField(
             "hca_main_kv",
             n_hca,
             (128 + ring_extra, head_dim),
             torch.float32,
+            in_checkpoint=False,
         ),
         StateField(
             "hca_main_score",
@@ -148,6 +156,7 @@ def _v4_state_layout(vllm_config, kv_fp8: bool):
             (128 + ring_extra, head_dim),
             torch.float32,
             float("-inf"),
+            in_checkpoint=False,
         ),
     ]
     row_widths = [head_dim * (1 if kv_fp8 else 2)]
