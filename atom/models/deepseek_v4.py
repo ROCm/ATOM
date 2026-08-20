@@ -45,6 +45,7 @@ from aiter.ops.flydsl.batched_gemm_mxfp4 import (
     flydsl_batched_gemm_a8w4_v2,
     quant_act_mxfp8_mbn,
 )
+from aiter.ops.inverse_rope_group_quant import inverse_rope_group_quant
 from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.fusions.fused_clamp_act_mul import (
@@ -916,6 +917,13 @@ class _V4RoPE(nn.Module):
                 reuse_freqs_front_part=True,
                 nope_first=False,
             )
+
+    def cos_sin_2d(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """2D ``[max_pos, rd//2]`` cos/sin for ops that take the flat cache."""
+        return (
+            self.cos_cache.squeeze(-2).squeeze(-2),
+            self.sin_cache.squeeze(-2).squeeze(-2),
+        )
 
     def inverse(
         self, positions: torch.Tensor, x: torch.Tensor, prefix: str = ""
@@ -2396,6 +2404,8 @@ class DeepseekV4Attention(nn.Module):
         self._use_flydsl_wo_a = self._is_gfx1250 and envs.ATOM_WO_A_USE_FLYDSL
         self.wo_a_fp4 = None  # [B, N//16, (K//2)*16] uint8 MXFP4 codes (shuffled)
         self.wo_a_wscale = None  # [B, N//32, (K//32)*32] uint8 e8m0 n32k4
+        # (a_fp8, a_scales) from inverse_rope_group_quant, consumed by _wo_a_grouped_lora.
+        self._wo_a_prefused: tuple[torch.Tensor, torch.Tensor] | None = None
 
         # ----- Compressor (and Indexer for CSA) -----
         if self.compress_ratio:
@@ -2709,19 +2719,32 @@ class DeepseekV4Attention(nn.Module):
     @mark_trace
     def _wo_a_grouped_lora(self, o: torch.Tensor, prefix: str = "") -> torch.Tensor:
         num_tokens = o.size(0)
-        o = o.view(num_tokens, self.n_local_groups, -1)  # [M, B(groups), K]
+        out_dtype = o.dtype
         if self._use_flydsl_wo_a and self.wo_a_fp4 is not None:
-            a_fp8, a_scales = quant_act_mxfp8_mbn(o)  # [M,B,K], [M//32,B,(K//32)*32]
+            # a8w4 path: MXFP8 activation + flydsl strided-batched a8w4 GEMM against
+            # the preshuffled MXFP4 wo_a. When inverse_rope_group_quant ran in
+            # _attn_core, its (a_fp8, a_scales) are stashed in _wo_a_prefused;
+            # otherwise fall back to quant_act_mxfp8_mbn (no inverse RoPE fused).
+            prefused = self._wo_a_prefused
+            if prefused is not None:
+                a_fp8, a_scales = prefused
+                self._wo_a_prefused = None
+            else:
+                o_mbn = o.view(num_tokens, self.n_local_groups, -1)
+                a_fp8, a_scales = quant_act_mxfp8_mbn(o_mbn)
             y = flydsl_batched_gemm_a8w4_v2(
                 a_fp8,
                 self.wo_a_fp4,
                 a_scales,
                 self.wo_a_wscale,
                 N=self.o_lora_rank,
-                dtype=o.dtype,
+                dtype=out_dtype,
                 layout="mbn",
             )  # [B, M, N] view of a [M, B, N] physical buffer
-            return y.transpose(0, 1)  # -> [M, B, N]
+            # transpose back to the physical [M, B, N] (contiguous) and flatten
+            # to the 2-D [M, B*N] wo_b expects, like the BF16 paths below.
+            return y.transpose(0, 1).flatten(1)
+        o = o.view(num_tokens, self.n_local_groups, -1)  # [M, B(groups), K]
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
         if num_tokens <= 32 or self._is_gfx1250:
             y = torch.empty(
@@ -3172,11 +3195,26 @@ class DeepseekV4Attention(nn.Module):
 
         # Inverse RoPE on output's rope dims to remove absolute-position
         # contribution carried in by the value-side RoPE of the KV entries.
-        self.rotary_emb.inverse(
-            positions,
-            o[..., -rd:],
-            prefix=f"{self.layer_name}.inverse_rope",
-        )
+        if self._use_flydsl_wo_a and self.wo_a_fp4 is not None:
+            # gfx1250 a8w4 wo_a: fuse inverse RoPE + n32k4 MXFP8 group quant so
+            # _wo_a_grouped_lora can feed flydsl_batched_gemm_a8w4_v2 directly.
+            cos, sin = self.rotary_emb.cos_sin_2d()
+            self._wo_a_prefused = inverse_rope_group_quant(
+                o,
+                positions,
+                cos,
+                sin,
+                self.n_local_groups,
+                quant_group_size=32,
+                scale_layout="n32k4",
+            )
+        else:
+            self._wo_a_prefused = None
+            self.rotary_emb.inverse(
+                positions,
+                o[..., -rd:],
+                prefix=f"{self.layer_name}.inverse_rope",
+            )
         # Output LoRA (wo_a/wo_b) now runs in `_attn_post` (graphed piece).
         return o.reshape(num_tokens, -1)  # [num_tokens, n_local_heads*head_dim]
 
