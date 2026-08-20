@@ -507,14 +507,15 @@ class MLAAttention(nn.Module):
         )
         self.qrep_num_heads = self.num_heads * self.dcp_world_size
         if self.qrep_enabled:
-            # QREP feeds group-head tensors to the kernel directly; head
-            # repeat/pad would wrongly duplicate/pad the group set. R1 has
-            # num_local_heads==16==_MLA_MIN_HEADS so this holds.
-            assert self.head_repeat_factor == 1 and self.head_pad == 0, (
-                "DCP query replication requires num_local_heads >= "
-                f"{_MLA_MIN_HEADS} (no head repeat/pad); got num_heads="
-                f"{self.num_heads}."
+            assert self.qrep_num_heads >= _MLA_MIN_HEADS, (
+                "DCP query replication requires the DCP-group head set "
+                f"(num_heads*dcp={self.qrep_num_heads}) >= {_MLA_MIN_HEADS}."
             )
+        # Row view of q_proj used by prefill; see _local_q_proj. Initialized here
+        # rather than in process_weights_after_loading so it exists no matter
+        # which quantization branch that method takes.
+        self._qrep_local_proj = None
+        self._qrep_local_src = None
 
         self.dcp_persistent_supported = dcp_persistent_supported()
         self.dcp_prefill_merge_bf16_ok = dcp_prefill_merge_bf16_ok()
@@ -646,6 +647,26 @@ class MLAAttention(nn.Module):
                     W_K_qrep, dtype=dtypes.fp8
                 )
 
+    def _local_q_proj(self):
+        """This rank's rows of the QREP-widened q_proj, built on first use.
+
+        Prefill needs only its own heads. Projecting the whole DCP group and
+        slicing the result still pays for the group, so prefill projects through a zero-copy row
+        VIEW of the weight instead -- same GEMM cost as without QREP, no extra
+        memory. Decode keeps using the full q_proj, which is what lets it skip
+        the AllGather Q. See `ColumnParallelLinear.make_row_view` for why
+        slicing an already-shuffled weight is legal on these boundaries.
+
+        """
+        w = self.q_proj.weight.data
+        if self._qrep_local_src is not w:
+            rows = self.num_heads * self.qk_head_dim
+            self._qrep_local_proj = self.q_proj.make_row_view(
+                self.dcp_rank * rows, rows
+            )
+            self._qrep_local_src = w
+        return self._qrep_local_proj
+
     @mark_trace(prefix="v_up_proj_and_o_proj", torch_compile=False)
     def _v_up_proj_and_o_proj(self, x):
         # Convert from (B, N, L) to (N, B, L)
@@ -688,11 +709,16 @@ class MLAAttention(nn.Module):
         # the DCP-gathered W_K_qrep, so the caller can skip the AllGather Q.
         # `group=False` (prefill / non-QREP) slices this rank's own heads out of
         # the group projection and uses the per-rank W_K.
-        n_heads_out = self.qrep_num_heads if self.qrep_enabled else self.num_heads
-        q = self.q_proj(x, x_scale).view(-1, n_heads_out, self.qk_head_dim)
         if self.qrep_enabled and not group:
-            start = self.dcp_rank * self.num_heads
-            q = q[:, start : start + self.num_heads, :].contiguous()
+            # Row-view weight: computes only this rank's heads, so the redundant
+            # group-wide GEMM never happens (the old code projected all group
+            # heads and then dropped 7/8 of the result).
+            q = self._local_q_proj()(x, x_scale).view(
+                -1, self.num_heads, self.qk_head_dim
+            )
+        else:
+            n_heads_out = self.qrep_num_heads if self.qrep_enabled else self.num_heads
+            q = self.q_proj(x, x_scale).view(-1, n_heads_out, self.qk_head_dim)
         q_nope, q_pe = q.split(
             [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
         )
@@ -1827,22 +1853,13 @@ class MLAAttention(nn.Module):
         kv_cache = kv_cache_data[f"layer_{self.layer_num}"].k_cache
 
         if context.is_prefill and not use_prefill_mla:
-            n_heads_out = (
-                self.qrep_num_heads if self.qrep_enabled else self.num_heads
+            # QREP: q_proj emits the whole DCP-group head set, but prefill needs
+            # only this rank's heads (QREP optimizes decode's AllGather Q, not
+            # prefill).
+            proj = self._local_q_proj() if self.qrep_enabled else self.q_proj
+            prefill_q = proj(q, x_scale=q_scale).view(
+                -1, self.num_heads, self.qk_head_dim
             )
-            prefill_q = self.q_proj(q, x_scale=q_scale).view(
-                -1, n_heads_out, self.qk_head_dim
-            )
-            if self.qrep_enabled:
-                # QREP: q_proj emits the full DCP-group head set. Prefill only needs
-                # this rank's per-rank heads (QREP optimizes decode's AllGather-Q,
-                # not prefill), so slice back like _q_proj_and_k_up_proj(group=False).
-                # Without this the view(-1, num_heads, ...) would inflate the token
-                # dim by dcp_world_size and corrupt the unified-attention output shape.
-                start = self.dcp_rank * self.num_heads
-                prefill_q = prefill_q[
-                    :, start : start + self.num_heads, :
-                ].contiguous()
             prefill_q_pe = prefill_q[..., self.qk_nope_head_dim :]
             self.rotary_emb(positions, prefill_q_pe, k_rope)
 
