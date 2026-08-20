@@ -497,6 +497,9 @@ class LLMEngine:
             "kv_blocks_total": kv_total,
             "kv_blocks_indexed": summed("kv_blocks_indexed"),
             "kv_cache_usage_ratio": kv_used / kv_total if kv_total else 0.0,
+            # Geometry, not a workload counter: every rank reports the same
+            # block size, so take it rather than sum it.
+            "block_size": int(rank_stats[0].get("block_size", 0)) if rank_stats else 0,
             "mtp": {
                 "enabled": bool(mtp_rank_stats),
                 "total_draft_tokens": mtp_draft,

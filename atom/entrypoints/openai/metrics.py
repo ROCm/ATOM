@@ -94,6 +94,23 @@ class _AtomMetricsCollector:
             metric.add_metric([], float(value))
             yield metric
 
+        # Geometry carried on labels rather than as a value, the convention
+        # vllm:cache_config_info established and that llm-d's prefix-cache
+        # scorer reads by the label names below.
+        metric = GaugeMetricFamily(
+            "atom:cache_config_info",
+            "KV-cache geometry of this engine.",
+            labels=["block_size", "num_gpu_blocks"],
+        )
+        metric.add_metric(
+            [
+                str(int(snapshot.get("block_size", 0))),
+                str(int(snapshot.get("kv_blocks_total", 0))),
+            ],
+            1.0,
+        )
+        yield metric
+
         for name, documentation, value in (
             (
                 "atom:requests_finished",
