@@ -710,34 +710,6 @@ class KimiFullAttention(nn.Module):
         )
         self.input_quant_prefix = f"{prefix}.fused_qkv_a_proj"
 
-    def _quant_hidden_once(
-        self, hidden_states: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Quantize the normed hidden state once for both of its consumers.
-
-        fused_qkv_a_proj and g_proj both read the layer's normed hidden state,
-        and each quantizes its own input when the norm did not fold the quant
-        (AttnRes owns input_layernorm and hands back bf16) -- so the same
-        [T, hidden] activation is quantized twice per layer. Doing it here
-        leaves one of the two passes.
-
-        Only for a purely dynamic per-token scheme shared by both GEMMs: that
-        is the one case where ``LinearBase.forward`` pre-quantizes with no extra
-        layout arguments, so a single call reproduces what both would have done
-        byte-for-byte. per_1x32 defers its quant into the fp4 GEMM and per_1x128
-        needs scale-layout kwargs, so neither is shareable from here.
-        """
-        a, g = self.fused_qkv_a_proj, self.g_proj
-        if (
-            a.quant_type.value != QuantType.per_Token.value
-            or g.quant_type.value != a.quant_type.value
-            or g.params_dtype != a.params_dtype
-            or getattr(a, "input_scale", None) is not None
-            or getattr(g, "input_scale", None) is not None
-        ):
-            return hidden_states, None
-        return a.quant_func(hidden_states, quant_dtype=a.params_dtype)
-
     def forward(
         self, positions: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
@@ -751,8 +723,6 @@ class KimiFullAttention(nn.Module):
         hidden_states_scale = None
         if isinstance(hidden_states, tuple):
             hidden_states, hidden_states_scale = hidden_states
-        else:
-            hidden_states, hidden_states_scale = self._quant_hidden_once(hidden_states)
 
         q_c, kv_c, k_rope = torch.split(
             self.fused_qkv_a_proj(hidden_states, hidden_states_scale),
