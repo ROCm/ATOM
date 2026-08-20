@@ -826,8 +826,6 @@ class ParallelConfig:
     pp_kv_status_addr: str = ""
     """ZMQ endpoint where the head receives KV offload status from downstream
     PP stages. All downstream stages PUSH; the head PULLs."""
-    world_size: int = field(init=False)
-    """Vestigial: never assigned or read; engine_core derives worker count directly."""
     data_parallel_master_port: int = 29500
     """Port of the data parallel master."""
 
