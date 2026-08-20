@@ -45,7 +45,6 @@ class EngineUtilityHandler:
         "get_mtp_stats": "_handle_get_mtp_stats",
         "get_mtp_statistics": "_handle_get_mtp_statistics",
         "get_cache_statistics": "_handle_get_cache_statistics",
-        "get_metrics_statistics": "_handle_get_metrics_statistics",
         "abort_request": "_handle_abort_request",
     }
 
@@ -106,7 +105,7 @@ class EngineUtilityHandler:
     def _execute_utility_command(self, cmd: str, args: dict):
         import time as _time
 
-        log = logger.debug if cmd == "get_metrics_statistics" else logger.info
+        log = logger.info
         log(f"{self.label}: executing utility command: {cmd}")
         t0 = _time.monotonic()
 
@@ -320,8 +319,22 @@ class EngineUtilityHandler:
             ("UTILITY_RESPONSE", {"cmd": "get_cache_statistics", "result": result})
         )
 
-    def _handle_get_metrics_statistics(self, args: dict):
-        """Return one rank's scheduler, KV, MTP, and cache metrics."""
+    def push_metrics(self) -> None:
+        """Publish this rank's metrics snapshot on the output socket.
+
+        Pushed on the engine's own clock rather than answered on demand. The
+        pull version was a synchronous round trip with a 5s deadline fired every
+        5s from the API server; whenever the engine was busy -- a long prefill,
+        a GEMM autotune, a large batch -- it could not answer in time, so under
+        load it failed on essentially every attempt, buried the server log in
+        tracebacks, and left late replies in the response queue for the *next*
+        caller to mistake for its own. Pushing removes the deadline, and with it
+        the last off-loop writer on the control socket.
+        """
+        self.output_queue.put_nowait(("METRICS", self.collect_metrics()))
+
+    def collect_metrics(self) -> dict:
+        """One rank's scheduler, KV, MTP, and cache metrics."""
         if self.scheduler is None:
             result = {"enabled": False}
         else:
@@ -377,6 +390,4 @@ class EngineUtilityHandler:
                 "offload": offload,
             }
 
-        self.output_queue.put_nowait(
-            ("UTILITY_RESPONSE", {"cmd": "get_metrics_statistics", "result": result})
-        )
+        return result

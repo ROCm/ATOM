@@ -15,22 +15,20 @@ else:
     RELAXED_TOP_N = 1
     RELAXED_DELTA = 0.0
 
-# --- Synthetic (forced) acceptance rate for spec-decode debugging ---
-# Enabled via --spec-decode-acceptance-rate (SpeculativeConfig.synthetic_
-# acceptance_rate). When set (float in [0, 1]), the rejection sampler ignores the
-# real draft/target comparison and force-accepts each draft token with a
-# position-dependent probability calibrated so the measured mean acceptance rate
-# converges to the configured value. Purely a benchmarking / bring-up knob (e.g.
-# while an MTP/EAGLE head is still training). Mirrors vLLM's "synthetic"
+# --- Synthetic (forced) acceptance for spec-decode benchmarking ---
+# Enabled via --spec-decode-acceptance-length / --spec-decode-acceptance-rate
+# (SpeculativeConfig.synthetic_acceptance_rates, already resolved to per-position
+# rates by the config). When set, the rejection sampler ignores the real
+# draft/target comparison and force-accepts draft tokens so the measured mean
+# acceptance length converges to the configured value. Purely a benchmarking /
+# bring-up knob (e.g. while an MTP/EAGLE head is still training, or to replay a
+# published acceptance-length curve). Mirrors vLLM's "synthetic"
 # rejection_sample_method. See ROCm/ATOM#555.
 #
-# Lowest per-position conditional-acceptance decay (empirically ~what a
-# well-tuned draft model exhibits); bounds the search so the base rate stays
-# <= 1 while still reaching the requested mean. Matches vLLM's constant.
-MIN_ACCEPTANCE_DECAY_FACTOR = 0.85
-# Cache {(rate, num_spec_steps): (base_rate, decay_factor)} — params depend on
-# both the target rate and the runtime step count.
-_SYNTHETIC_PARAMS_CACHE: dict[tuple[float, int], tuple[float, float]] = {}
+# Cache {(rates, device): conditional-rate tensor} — the kernel walks positions
+# sequentially, so it needs P(accept i | accepted through i-1) rather than the
+# unconditional rates the config carries.
+_SYNTHETIC_COND_CACHE: dict[tuple[tuple[float, ...], torch.device], torch.Tensor] = {}
 # Base seed for the per-step synthetic RNG. The forced accept/reject draw MUST be
 # identical on every TP rank: sampled_tokens is broadcast from rank 0 while
 # num_bonus_tokens stays local, so a per-rank torch.rand would desync the two and
@@ -51,80 +49,64 @@ def _synthetic_generator(device: torch.device) -> torch.Generator:
     return generator
 
 
-def compute_synthetic_rejection_sampler_params(
-    p_avg: float, n: int, tol: float = 1e-9
-) -> tuple[float, float]:
-    """Derive (base_acceptance_rate, decay_factor) for a target mean rate.
+def acceptance_length_to_rates(length: float, n: int) -> list[float]:
+    """Mean acceptance length -> per-position *unconditional* acceptance rates.
 
-    With ``n`` speculative positions the conditional acceptance probability at
-    position ``i`` is ``base_rate * decay_factor**i``. The joint probability of
-    accepting through position ``i`` is therefore
-    ``base_rate**(i+1) * decay_factor**(i*(i+1)/2)`` and the mean of those joint
-    probabilities across the ``n`` positions equals ``p_avg`` (== ATOM's
-    ``accepted_draft_tokens / total_draft_tokens`` acceptance rate).
+    Entry ``i`` is the marginal probability that the first ``i+1`` draft tokens
+    are all accepted, so the mean number of accepted draft tokens is the sum of
+    the list and the mean acceptance length is ``1 + sum`` (the ``1`` being the
+    target's own guaranteed token).
+
+    The schedule is the minimum-variance one: accept ``floor(length - 1)``
+    positions outright and the next with the leftover fraction. Any schedule
+    summing to ``length - 1`` hits the requested mean, but the spread differs
+    wildly between them, and spread is not a free parameter here -- it drives
+    ITL tails and how the batch drains. This is the schedule vLLM resolves
+    ``synthetic_acceptance_length`` to and the one SGLang's ``match-expected``
+    draws, so a forced-length run stays comparable across all three engines.
     """
-
-    def mean_joint_prob(a_0: float, gamma: float, n: int) -> float:
-        total = 0.0
-        for i in range(n):
-            total += a_0 ** (i + 1) * gamma ** (i * (i + 1) // 2)
-        return total / n
-
-    def min_valid_decay_factor(p: float, n: int) -> float:
-        low, high = MIN_ACCEPTANCE_DECAY_FACTOR, 1.0
-        # Even with a base rate of 1, a large decay is required for big p; find
-        # the smallest decay that can still reach p so base_rate stays <= 1.
-        if mean_joint_prob(1.0, low, n) >= p:
-            return low
-        while (high - low) > tol:
-            mid = (low + high) / 2
-            if mean_joint_prob(1.0, mid, n) >= p:
-                high = mid
-            else:
-                low = mid
-        return high
-
-    def compute_base_acceptance_rate(p_avg: float, gamma: float, n: int) -> float:
-        if p_avg <= 0.0:
-            return 0.0
-        if p_avg >= 1.0:
-            return 1.0
-        low, high = 0.0, 1.0
-        while (high - low) > tol:
-            mid = (low + high) / 2
-            if mean_joint_prob(mid, gamma, n) >= p_avg:
-                high = mid
-            else:
-                low = mid
-        return high
-
-    decay_factor = min_valid_decay_factor(p_avg, n)
-    base_rate = compute_base_acceptance_rate(p_avg, decay_factor, n)
-    return base_rate, decay_factor
+    num_accepted_drafts = length - 1
+    num_full = int(num_accepted_drafts)
+    return (
+        [1.0] * num_full + [num_accepted_drafts - num_full] + [0.0] * (n - num_full - 1)
+    )[:n]
 
 
-def _get_synthetic_params(rate: float, num_spec_steps: int) -> tuple[float, float]:
-    key = (rate, num_spec_steps)
-    if key not in _SYNTHETIC_PARAMS_CACHE:
-        _SYNTHETIC_PARAMS_CACHE[key] = compute_synthetic_rejection_sampler_params(
-            rate, num_spec_steps
-        )
-    return _SYNTHETIC_PARAMS_CACHE[key]
+def _get_synthetic_cond_rates(
+    rates: tuple[float, ...], device: torch.device
+) -> torch.Tensor:
+    """Unconditional per-position rates -> conditional, as a device tensor.
+
+    The kernel stops at the first rejection, so at position ``i`` it needs
+    ``P(accept i | accepted through i-1) = rates[i] / rates[i-1]``, not the
+    unconditional ``rates[i]``.
+    """
+    key = (rates, device)
+    cached = _SYNTHETIC_COND_CACHE.get(key)
+    if cached is not None:
+        return cached
+    cond: list[float] = []
+    prev = 1.0
+    for rate in rates:
+        cond.append(rate / prev if prev > 0.0 else 0.0)
+        prev = rate
+    tensor = torch.tensor(cond, dtype=torch.float32, device=device)
+    _SYNTHETIC_COND_CACHE[key] = tensor
+    return tensor
 
 
 class RejectionSampler(nn.Module):
-    def __init__(self, synthetic_acceptance_rate: float | None = None):
+    def __init__(self, synthetic_acceptance_rates: list[float] | None = None):
         super().__init__()
-        # Debug/benchmark override: force a fixed acceptance rate (see module
-        # docstring). None => normal draft/target rejection sampling.
-        if synthetic_acceptance_rate is not None and not (
-            0.0 <= synthetic_acceptance_rate <= 1.0
-        ):
-            raise ValueError(
-                "synthetic_acceptance_rate must be in [0, 1], "
-                f"but got {synthetic_acceptance_rate}"
-            )
-        self.synthetic_acceptance_rate = synthetic_acceptance_rate
+        # Debug/benchmark override: force an acceptance-length curve (see module
+        # docstring). None => normal draft/target rejection sampling. The config
+        # has already validated and resolved whichever knob the user set into
+        # per-position unconditional rates.
+        self.synthetic_acceptance_rates = (
+            tuple(synthetic_acceptance_rates)
+            if synthetic_acceptance_rates is not None
+            else None
+        )
         # Per-step seed for the synthetic RNG, advanced once per forward. Stays in
         # lockstep across TP ranks (SPMD), so the forced accept/reject pattern is
         # identical on every rank while still varying step to step.
@@ -159,10 +141,10 @@ class RejectionSampler(nn.Module):
             None,
             target_logits,
             bonus_token_ids,
-            synthetic_acceptance_rate=self.synthetic_acceptance_rate,
+            synthetic_acceptance_rates=self.synthetic_acceptance_rates,
             synthetic_step=self._synthetic_step,
         )
-        if self.synthetic_acceptance_rate is not None:
+        if self.synthetic_acceptance_rates is not None:
             self._synthetic_step += 1
         return output_token_ids
 
@@ -181,8 +163,9 @@ def rejection_sample(
     target_probs: torch.Tensor,
     # [batch_size, 1]
     bonus_token_ids: torch.Tensor,
-    # Debug override: forced acceptance rate in [0, 1] (None => normal path).
-    synthetic_acceptance_rate: float | None = None,
+    # Debug override: per-position unconditional acceptance rates, one entry per
+    # speculative position (None => normal draft/target path).
+    synthetic_acceptance_rates: tuple[float, ...] | None = None,
     # Per-step seed for the (rank-consistent) synthetic RNG; ignored otherwise.
     synthetic_step: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -212,15 +195,13 @@ def rejection_sample(
     )
     num_bonus_tokens = torch.empty(batch_size, dtype=torch.int32, device=device)
 
-    if synthetic_acceptance_rate is not None:
-        # Synthetic path: force a target acceptance rate independent of the real
-        # draft/target agreement. Draft tokens are accepted with a
-        # position-decaying probability; on the first rejection we emit the
+    if synthetic_acceptance_rates is not None:
+        # Synthetic path: force a target acceptance length independent of the
+        # real draft/target agreement. Draft tokens are accepted with the
+        # configured per-position probability; on the first rejection we emit the
         # target argmax as the correction token and stop (same output layout /
         # num_bonus_tokens semantics as the greedy path).
-        base_rate, decay_factor = _get_synthetic_params(
-            synthetic_acceptance_rate, num_spec_steps
-        )
+        cond_rates = _get_synthetic_cond_rates(synthetic_acceptance_rates, device)
         target_argmax = target_probs.argmax(dim=-1)
         # Rank-consistent uniforms: a dedicated device generator re-seeded from the
         # step counter draws the same Philox stream on every TP rank / GPU, so the
@@ -247,8 +228,7 @@ def rejection_sample(
             target_argmax,
             bonus_token_ids,
             uniform,
-            base_rate,
-            decay_factor,
+            cond_rates,
             num_spec_steps,
             num_warps=1,
         )
@@ -359,8 +339,7 @@ def rejection_synthetic_sample_kernel(
     target_argmax_ptr,  # [num_tokens]
     bonus_token_ids_ptr,  # [batch_size]
     uniform_ptr,  # [num_tokens] — per-position U(0, 1) samples
-    base_acceptance_rate,
-    decay_factor,
+    cond_rates_ptr,  # [num_spec_steps] — P(accept pos | accepted through pos-1)
     num_spec_steps,
 ):
     req_idx = tl.program_id(0)
@@ -375,13 +354,12 @@ def rejection_synthetic_sample_kernel(
     rejected = False
     num_bonus_token = -1
     INVALID_TOKEN: tl.constexpr = -1
-    # Per-position conditional acceptance probability, decaying geometrically.
-    acceptance_rate = base_acceptance_rate
     for pos in range(num_draft_tokens):
         if rejected:
             output_id = INVALID_TOKEN
         else:
             u = tl.load(uniform_ptr + start_idx + pos)
+            acceptance_rate = tl.load(cond_rates_ptr + pos)
             if u < acceptance_rate:
                 # Force-accept: emit the draft's own proposed token.
                 output_id = tl.load(draft_token_ids_ptr + start_idx + pos)
@@ -392,7 +370,6 @@ def rejection_synthetic_sample_kernel(
                 output_id = tl.cast(output_id, tl.int32)
                 rejected = True
             num_bonus_token += 1
-            acceptance_rate = acceptance_rate * decay_factor
         tl.store(
             output_token_ids_ptr + req_idx * (num_spec_steps + 1) + pos,
             output_id,

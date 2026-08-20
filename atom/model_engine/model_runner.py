@@ -38,9 +38,12 @@ from atom.distributed.pp_comm import (
     recv_intermediate_tensors,
 )
 from atom.kv_transfer.disaggregation import KVConnectorOutput
+from atom.model_engine.kv_block import STATE_SLOT_CLASS
+from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
 from atom.model_engine.run_labels import build_run_label
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
+from atom.model_engine.state_runtime import StateRuntime
 from atom.model_loader.loader import load_model
 from atom.model_ops.attentions.sub_pool_spec import (
     InsufficientPoolBudget,
@@ -580,7 +583,9 @@ class tokenIDProcessor:
         self, batch: ScheduledBatch, draft_token_ids: torch.Tensor
     ) -> np.ndarray:
         if not self.is_deferred_out:
-            ret = draft_token_ids.numpy()
+            # propose() builds this on the drafter's device; the scheduler wants
+            # host rows.
+            ret = draft_token_ids.cpu().numpy()
         else:
             self.draft_token_ids = draft_token_ids
             self.pre_num_decode_token_per_seq = self.num_spec_tokens + 1
@@ -717,8 +722,8 @@ class ModelRunner:
             with set_model_tag("drafter"):
                 self.drafter = build_drafter(self.config, self.device, self)
             self.rejection_sampler = RejectionSampler(
-                synthetic_acceptance_rate=(
-                    self.config.speculative_config.synthetic_acceptance_rate
+                synthetic_acceptance_rates=(
+                    self.config.speculative_config.synthetic_acceptance_rates
                 )
             )
             torch.set_default_device(None)
@@ -740,6 +745,7 @@ class ModelRunner:
         # builder through paths that ask for their entry counts, and those must
         # read 0 ("no pool yet") rather than trip over a missing attribute.
         self.pool_plan = PoolPlan.empty()
+        self.state_runtime = StateRuntime()
         # Sanity-check: any builder that allocates a per-request cache must
         # have its model_type listed in `InputOutputProcessor`'s
         # `per_req_cache_model_types` set; otherwise sequences will be
@@ -1149,7 +1155,11 @@ class ModelRunner:
         mtp_factor = mtp_k + 1
         num_tokens_original = mtp_factor
 
-        seq = Sequence([0] * num_tokens_original, block_size=self.block_size, id=-1)
+        seq = Sequence(
+            [0] * num_tokens_original,
+            block_size=self.block_size,
+            id=-1,
+        )
         seq.status = SequenceStatus.RUNNING
         seq.type = SequenceType.DECODE
         seq.block_table = [0]
@@ -1193,21 +1203,31 @@ class ModelRunner:
 
         num_seqs = min(warmup_max_tokens // max_model_len, self.config.max_num_seqs)
 
-        if num_seqs == 0:
-            num_seqs = 1
-            seq_len = min(warmup_max_tokens, max_model_len)
-            if seq_len == 0:
-                seq_len = 1
+        # torch.compile's mark_dynamic can't make a size-1 batch dim dynamic, so
+        # a DSpark block drafter (rows == num_seqs) must first-compile at B >= 2
+        # (EAGLE gets that free -- its first draft step is a many-row prefill).
+        # Other cases only need the usual >= 1 floor.
+        drafter = getattr(self, "drafter", None)
+        min_seqs = 2 if getattr(drafter, "is_block_drafter", False) else 1
+        num_seqs = max(num_seqs, min_seqs)
+
+        # Split the token budget across the seqs so >1 sequences never exceed it
+        # (peak memory unchanged); a lone seq keeps up to max_model_len.
+        seq_len = max(1, min(max_model_len, warmup_max_tokens // num_seqs))
+
+        if warmup_max_tokens < max_model_len:
             logger.warning(
                 f"{self.label}: dp_size={dp_size}, dp_attn={self.config.enable_dp_attention}, "
                 f"warmup_max_tokens={warmup_max_tokens} < max_model_len={max_model_len}. "
-                f"Using {num_seqs} seq with length {seq_len} for warmup."
+                f"Using {num_seqs} seq(s) with length {seq_len} for warmup."
             )
-        else:
-            seq_len = max_model_len
 
         seqs = [
-            Sequence([0] * seq_len, block_size=self.block_size) for _ in range(num_seqs)
+            Sequence(
+                [0] * seq_len,
+                block_size=self.block_size,
+            )
+            for _ in range(num_seqs)
         ]
         seqs = {seq.id: seq for seq in seqs}
 
@@ -1266,6 +1286,19 @@ class ModelRunner:
         if hasattr(self, "drafter"):
             self.forward_vars["mtp_k"] = self.drafter.mtp_k
             self.forward_vars["num_accepted_tokens"] = CpuGpuBuffer(
+                self.max_bs, **i32_kwargs
+            )
+            if self.config.dspark.ragged and self.drafter.uses_confidence_schedule:
+                # Pinned staging for the ragged H2D transfers (pageable would
+                # sync). Separate slots: the two are live at once within a step.
+                self.forward_vars["ragged_lens"] = CpuGpuBuffer(
+                    self.max_bs, **i32_kwargs
+                )
+                self.forward_vars["ragged_extend"] = CpuGpuBuffer(
+                    self.max_bs, **i32_kwargs
+                )
+            # Per in-flight slot via forward_vars; PP ring clones it.
+            self.forward_vars["draft_next_tokens"] = CpuGpuBuffer(
                 self.max_bs, **i32_kwargs
             )
 
@@ -1564,7 +1597,7 @@ class ModelRunner:
             )
         return int(overhead)
 
-    def get_num_blocks(self) -> dict[str, int]:
+    def get_num_blocks(self) -> dict[str, object]:
         torch.set_default_device(self.device)
         config = self.config
         hf_config = config.hf_config
@@ -1665,11 +1698,51 @@ class ModelRunner:
         self.pool_plan = plan
         config.pool_entries = dict(plan.entries)
         config.pool_entries_per_req = dict(plan.entries_per_req)
-        # Two scalars rather than the StateTransfer itself: this travels to the
-        # engine process in a plain dict, where `StateGroupPool` rebuilds it.
+        # Keep runtime state metadata out of Config.
         transfer = self.attn_metadata_builder.state_transfer()
-        config.state_transfer_kind = transfer.kind
-        config.state_fork_tokens = transfer.fork_tokens
+        uses_paged_state = transfer.copies
+        if uses_paged_state and config.pipeline_parallel_size > 1:
+            raise RuntimeError(
+                "PAGE-backed state checkpoints do not yet support pipeline "
+                "parallelism: every stage must first agree on one atomic "
+                "checkpoint/unit ownership transaction"
+            )
+        if uses_paged_state and config.enable_rapidserve:
+            raise RuntimeError(
+                "PAGE-backed state checkpoints do not yet support RapidServe "
+                "prefill/decode disaggregation"
+            )
+        checkpoint_spec = None
+        if uses_paged_state:
+            if plan.paged_class is None:
+                raise RuntimeError(
+                    "PAGE-backed state checkpoints require a PAGE sub-pool"
+                )
+            slot_bytes = int(plan.entry_bytes[STATE_SLOT_CLASS])
+            # None means the backend has not narrowed its image: carry it all.
+            narrowed = self.attn_metadata_builder.checkpoint_image_bytes()
+            checkpoint_spec = PagedStateCheckpointSpec(
+                page_unit_bytes=int(plan.entry_bytes[plan.paged_class]),
+                slot_bytes=slot_bytes,
+                image_bytes=slot_bytes if narrowed is None else int(narrowed),
+                layout_id=transfer.paged_layout_id,
+            )
+            logger.info(
+                "PAGE-backed state checkpoints enabled: unit_bytes=%d, "
+                "slot_bytes=%d, image_bytes=%d (%.1f%% of a slot), "
+                "units_per_checkpoint=%d, layout=%s",
+                checkpoint_spec.page_unit_bytes,
+                checkpoint_spec.slot_bytes,
+                checkpoint_spec.image_bytes,
+                100.0 * checkpoint_spec.image_bytes / checkpoint_spec.slot_bytes,
+                checkpoint_spec.units_per_checkpoint,
+                checkpoint_spec.layout_id,
+            )
+        state_runtime = StateRuntime(
+            transfer=transfer,
+            checkpoint_spec=checkpoint_spec,
+        )
+        self.state_runtime = state_runtime
         for name in sorted(plan.entries):
             logger.info(
                 f"sub-pool {name}: entries={plan.entries[name]}, "
@@ -1693,17 +1766,15 @@ class ModelRunner:
         # Concurrent-capacity table: at each context-length percentage of
         # max_model_len, how many requests can simultaneously hold their
         # KV in the pool. Per-req block usage = ceil(ctx_len/block_size).
-        # STATE classes sit in their own reservation (already excluded from
-        # the paged count at sizing time), so they add no per-block cost and
-        # never bind either: sizing reserves every STATE floor at exactly
-        # `max_num_seqs` requests' worth, so the request cap is max_num_seqs
-        # and the paged pool is the only thing that can run out first.
+        # Active Slots are reserved; PAGE checkpoints borrow from the paged pool.
         max_model_len = config.max_model_len
         cap = config.max_num_seqs
+        dcp_w = max(1, getattr(config, "decode_context_parallel_size", 1) or 1)
         pct_lines = []
         for pct in (10, 30, 50, 70, 90, 100):
             ctx = max(1, max_model_len * pct // 100)
-            blocks_per_req = math.ceil(ctx / self.block_size)
+            local_ctx = math.ceil(ctx / dcp_w)
+            blocks_per_req = math.ceil(local_ctx / self.block_size)
             block_bound = (
                 num_kvcache_blocks // blocks_per_req if blocks_per_req > 0 else 0
             )
@@ -1711,14 +1782,17 @@ class ModelRunner:
             bound_label = (
                 "slots" if cap > 0 and max_conc == cap < block_bound else "blocks"
             )
+            local_note = f" (local {local_ctx:>7})" if dcp_w > 1 else ""
             pct_lines.append(
-                f"  {pct:>3}% ({ctx:>7} tok): {blocks_per_req:>6} blk/req "
+                f"  {pct:>3}% ({ctx:>7} tok){local_note}: {blocks_per_req:>6} blk/req "
                 f"→ max_concurrent={max_conc:<5} (bound by {bound_label})"
             )
         logger.info(
             f"Concurrent capacity vs context length "
             f"(max_model_len={max_model_len}, block_size={self.block_size}, "
-            f"max_slots={cap}, pool_blocks={num_kvcache_blocks}):\n"
+            f"max_slots={cap}, pool_blocks={num_kvcache_blocks}"
+            + (f", dcp={dcp_w} (blk/req is per-rank)" if dcp_w > 1 else "")
+            + "):\n"
             + "\n".join(pct_lines)
         )
 
@@ -1742,8 +1816,7 @@ class ModelRunner:
             "num_kvcache_blocks": num_kvcache_blocks,
             "pool_entries": dict(plan.entries),
             "pool_entries_per_req": dict(plan.entries_per_req),
-            "state_transfer_kind": config.state_transfer_kind,
-            "state_fork_tokens": config.state_fork_tokens,
+            "state_runtime": state_runtime.to_wire(),
         }
 
     def allocate_kv_cache(self, num_kvcache_blocks):
@@ -1816,6 +1889,10 @@ class ModelRunner:
         )
         for name, value in per_req_state.items():
             setattr(self, name, value)
+        # The pools are reachable through `self` only now, which is the
+        # earliest the builder can touch its own addresses — and the last
+        # moment before a request could.
+        self.attn_metadata_builder.warmup_per_req_cache()
 
         # Build KVCacheConfig
         # lirong TODO: This is a simple solution to build KVCacheConfig,
@@ -2109,6 +2186,7 @@ class ModelRunner:
             # Context default — otherwise single-GPU/TP-only decode would
             # be forced into eager and lose the CUDAGraph decode path.
             self._dspark_decode_replay = True
+            self._eplb_any_rank_has_prefill = None
             return (
                 num_input_tokens,
                 None,
@@ -2132,6 +2210,9 @@ class ModelRunner:
             local_is_dummy=bool(getattr(batch, "is_dummy_run", False)),
         )
 
+        # Stash the DP-wide prefill OR for the EPLB prefill gate. Reused for free
+        # by on_forward_pass_end when the DP group == the migration (EP) group.
+        self._eplb_any_rank_has_prefill = sync.any_rank_has_prefill
         max_tokens = int(sync.num_tokens_across_dp.max())
         dp_uniform_decode = (not sync.any_rank_has_prefill) or (
             not self.config.enable_dp_attention
@@ -2180,10 +2261,12 @@ class ModelRunner:
             return
         full_q = self.drafter.mtp_k + 1
 
-        # {req_id: ell} from the PREVIOUS step's propose() (verify_scheduler,
-        # same process). The worker batch copy has req_ids but NOT the
-        # scheduler-side `seqs` dict, so look ell up by req_id. A request with no
-        # prior ell (new this step) -> full length (never under-verify).
+        # {req_id: ell} from an EARLIER step's propose() (verify_scheduler, same
+        # process) — the freshest one whose async D2H has landed, which is a step
+        # or two back while the CPU runs ahead; reading it never syncs. The
+        # worker batch copy has req_ids but NOT the scheduler-side `seqs` dict,
+        # so look ell up by req_id. A request with no ell yet (new this step, or
+        # its copy still in flight) -> full length (never under-verify).
         verify_scheduler = self.drafter.verify_scheduler
         by_req = (
             verify_scheduler.ell_by_req if verify_scheduler is not None else None
@@ -2299,29 +2382,58 @@ class ModelRunner:
         )
         max_nb = int(nb.max()) if nb is not None and nb.size > 0 else 0
 
-        # Per-request forward length = max(ell_i, max_num_bonus) + 1, in [1, full_q].
+        from atom.spec_decode.dspark_scheduler import (
+            quantize_to_bucket,
+            ragged_verify_len,
+            resolve_q_buckets,
+        )
+
+        # Per-request forward length, bounded by BOTH max_nb+1 (the anchor must
+        # stay inside the segment) and old_nst[i] (a stale ell must never grow a
+        # seq past what the scheduler scheduled). See `ragged_verify_len`; None
+        # means the two bounds cross and ragged is not representable this step.
         new_len = np.empty(scheduled_bs, dtype=np.int32)
         any_shrink = False
         for i, rid in enumerate(batch.req_ids[:scheduled_bs]):
-            ell = by_req.get(rid)
-            ell_i = full_q - 1 if ell is None else int(ell)
-            ell_i = max(ell_i, max_nb)
-            li = ell_i + 1
-            if li < 1:
-                li = 1
-            elif li > full_q:
-                li = full_q
+            li = ragged_verify_len(by_req.get(rid), full_q, max_nb, int(old_nst[i]))
+            if li is None:
+                return  # stay rectangular
             new_len[i] = li
             if li < int(old_nst[i]):
                 any_shrink = True
 
-        from atom.spec_decode.dspark_scheduler import (
-            quantize_to_bucket,
-            resolve_q_buckets,
-        )
-
         if not any_shrink:
             return  # nothing to shrink this step -> Phase-1 layout
+
+        # q_eff, and the replay-shape feasibility check, BEFORE anything on the
+        # batch is rewritten. Shrinking the flat token layout is only safe if the
+        # replay can follow it down; when it cannot, the rebuild is what makes
+        # the step unsafe, so the decision has to come first.
+        #   * num_spec_query_tokens (scalar) q_eff : the PER-SEQ length bound
+        #     (>= max(new_len), quantized up to a captured bucket). Per-seq
+        #     structures (compressor grid, rectangular indexer) size by it, so no
+        #     seq can overflow them. It is NOT the total compute size -- that is
+        #     the flat num_tokens bucket (dynamic_num_tokens_pad), sized to the
+        #     real sum, so a long-tail seq no longer inflates the batch row count.
+        buckets = resolve_q_buckets(self.config.dspark.ragged_graph_sizes, full_q)
+        if self.enforce_eager:
+            # Eager: no graph → capacity == exact Σ (no bucket). Scalar = batch max
+            # real len (positions/attn bound); layout is pure flat Σ.
+            q_eff = int(new_len.max()) if scheduled_bs > 0 else full_q
+        else:
+            # Graph: q_eff = smallest bucket >= the real MAX per-seq len, so no
+            # seq ever exceeds q_eff. Per-seq structures (compressor grid,
+            # rectangular indexer) size by q_eff and can't overflow -- no separate
+            # full_q cap needed. The TOTAL compute size is chosen apart from this
+            # by the flat num_tokens bucket (dynamic_num_tokens_pad, sized to the
+            # real sum), so q_eff no longer needs to track the sum/avg.
+            q_eff = (
+                quantize_to_bucket(int(new_len.max()), buckets)
+                if scheduled_bs > 0
+                else full_q
+            )
+            if not self._ragged_flat_bucket_exists(int(new_len.sum()), q_eff):
+                return  # replay cannot follow the shrink -> stay rectangular
 
         # Rebuild scheduled_tokens (flat) to the ragged per-seq layout: keep the
         # first new_len[i] of each seq's old segment (token[0]=anchor, rest=draft
@@ -2348,29 +2460,8 @@ class ModelRunner:
         # Two sources of truth (TRUE FLAT, paper §5.2): tokens are flat-packed
         # [0:Σ] with the per-seq ragged new_len.
         #   * dynamic_spec_query_tokens_per_req : the true ragged per-seq lengths.
-        #   * num_spec_query_tokens (scalar) q_eff : the PER-SEQ length bound
-        #     (>= max(new_len), quantized up to a captured bucket). Per-seq
-        #     structures (compressor grid, rectangular indexer) size by it, so no
-        #     seq can overflow them. It is NOT the total compute size -- that is
-        #     the flat num_tokens bucket (dynamic_num_tokens_pad), sized to the
-        #     real sum, so a long-tail seq no longer inflates the batch row count.
-        buckets = resolve_q_buckets(self.config.dspark.ragged_graph_sizes, full_q)
-        if self.enforce_eager:
-            # Eager: no graph → capacity == exact Σ (no bucket). Scalar = batch max
-            # real len (positions/attn bound); layout is pure flat Σ.
-            q_eff = int(new_len.max()) if scheduled_bs > 0 else full_q
-        else:
-            # Graph: q_eff = smallest bucket >= the real MAX per-seq len, so no
-            # seq ever exceeds q_eff. Per-seq structures (compressor grid,
-            # rectangular indexer) size by q_eff and can't overflow -- no separate
-            # full_q cap needed. The TOTAL compute size is chosen apart from this
-            # by the flat num_tokens bucket (dynamic_num_tokens_pad, sized to the
-            # real sum), so q_eff no longer needs to track the sum/avg.
-            q_eff = (
-                quantize_to_bucket(int(new_len.max()), buckets)
-                if scheduled_bs > 0
-                else full_q
-            )
+        #   * num_spec_query_tokens (scalar) q_eff : computed above, before the
+        #     rebuild, together with the replay-shape feasibility check.
         batch.num_spec_query_tokens = int(q_eff)
         batch.dynamic_spec_query_tokens_per_req = new_len
 
@@ -2794,6 +2885,78 @@ class ModelRunner:
             off += local_len
         return torch.cat(outs)
 
+    def _setup_pp_shared_indexer(self):
+        """Cache per-rank predicates for GLM-5.2 DSA IndexShare PP-boundary
+        top-k transfer. Computed once.
+
+        A "shared" attention layer reuses the prior "full" layer's sparse top-k
+        via the per-rank scratch buffer ``_sparse_kv_indices_gpu``. When a PP
+        boundary splits a shared group, the receiving rank's leading shared
+        layers need the sending rank's top-k, so it is carried across the
+        boundary. No-op for dense models, sparse models with no shared layers,
+        pp=1, or when every rank starts on a "full" layer.
+        """
+        if getattr(self, "_pp_share_indexer_ready", False):
+            return
+        self._pp_share_indexer_ready = True
+        self._pp_send_needs_sparse = False
+        self._pp_recv_needs_sparse = False
+        self._pp_index_topk = 0
+        if not self.is_deepseek_v32:
+            return
+        pp = get_pp_group()
+        if pp.world_size <= 1:
+            return
+        # Unwrap to the module exposing the PP layer range (make_layers sets
+        # start_layer/end_layer on the inner model; UBatchWrapper/CausalLM wrap it).
+        inner = self.model
+        while not hasattr(inner, "start_layer") and hasattr(inner, "model"):
+            inner = inner.model
+        if not hasattr(inner, "start_layer"):
+            return
+
+        # Replicate the model's per-layer shared/full classification
+        # (_should_skip_index_topk in deepseek_v2.py).
+        hf = self.config.hf_config
+        num_layers = int(hf.num_hidden_layers)
+        indexer_types = getattr(hf, "indexer_types", None)
+        index_topk_pattern = getattr(hf, "index_topk_pattern", None)
+        index_topk_freq = int(getattr(hf, "index_topk_freq", 1))
+        index_skip_topk_offset = int(getattr(hf, "index_skip_topk_offset", 1))
+
+        def _is_shared(layer_idx):
+            if not 0 <= layer_idx < num_layers:
+                return False
+            if indexer_types is not None:
+                return indexer_types[layer_idx] == "shared"
+            if index_topk_pattern is not None:
+                return index_topk_pattern[layer_idx] == "S"
+            if index_topk_freq <= 1:
+                return False
+            return max(layer_idx - index_skip_topk_offset, 0) % index_topk_freq != 0
+
+        # This rank consumes the prior rank's top-k iff its first layer is shared.
+        self._pp_recv_needs_sparse = (not pp.is_first_rank) and _is_shared(
+            inner.start_layer
+        )
+        # The next rank consumes this rank's top-k iff ITS first layer
+        # (== this rank's end_layer) is shared.
+        self._pp_send_needs_sparse = (not pp.is_last_rank) and _is_shared(
+            inner.end_layer
+        )
+        self._pp_index_topk = int(self.config.hf_config.index_topk)
+        if self._pp_recv_needs_sparse or self._pp_send_needs_sparse:
+            logger.info(
+                "[%s] PP shared-indexer transfer: recv=%s send=%s "
+                "(layers [%d,%d), index_topk=%d)",
+                self.rank_name,
+                self._pp_recv_needs_sparse,
+                self._pp_send_needs_sparse,
+                inner.start_layer,
+                inner.end_layer,
+                self._pp_index_topk,
+            )
+
     def run_model(
         self,
         input_ids: torch.Tensor,
@@ -2892,10 +3055,20 @@ class ModelRunner:
 
                 pp_group = get_pp_group()
                 pp_enabled = pp_group.world_size > 1
+                if pp_enabled:
+                    self._setup_pp_shared_indexer()
 
                 intermediate_tensors = None
                 if pp_enabled and not pp_group.is_first_rank:
                     intermediate_tensors = recv_intermediate_tensors()
+                    # GLM-5.2 IndexShare: load prior rank's top-k for leading
+                    # shared layers. Pop so compiled model sees only hidden_states.
+                    recv_sparse = intermediate_tensors.tensors.pop(
+                        "sparse_kv_indices", None
+                    )
+                    if recv_sparse is not None and self._pp_recv_needs_sparse:
+                        tgt = self.attn_metadata_builder._sparse_kv_indices_gpu
+                        tgt[: recv_sparse.numel()].copy_(recv_sparse)
 
                 if pp_enabled:
                     model_output = self.model(
@@ -2911,6 +3084,14 @@ class ModelRunner:
                         input_ids, positions, inputs_embeds=inputs_embeds
                     )
                 if pp_enabled and not pp_group.is_last_rank:
+                    # GLM-5.2 IndexShare: carry top-k for next rank's shared layers.
+                    if self._pp_send_needs_sparse:
+                        # Use hidden_states rows (correct under PCP shard).
+                        num_tokens = model_output.tensors["hidden_states"].shape[0]
+                        n = num_tokens * self._pp_index_topk
+                        model_output.tensors["sparse_kv_indices"] = (
+                            self.attn_metadata_builder._sparse_kv_indices_gpu[:n]
+                        )
                     if self._pp_pending_send:
                         commit_pp_send_work(self._pp_pending_send)
                     self._pp_pending_send = async_send_intermediate_tensors(
@@ -2919,12 +3100,11 @@ class ModelRunner:
                     hidden_states = None
                     logits = None
                 elif self._is_pure_middle_chunk(batch):
-                    # Skips `compute_logits` only -- a middle chunk samples
-                    # nothing, but the drafter is still handed its hidden states.
                     if _pcp_tbo_balanced:
                         model_output = self._restore_pcp_balanced_output(
                             model_output, _pcp_bal_groups, _pcp_size
                         )
+                    # Middle chunk: no logits, but drafter needs hidden states.
                     hidden_states = model_output
                     logits = None
                 else:
@@ -3059,7 +3239,10 @@ class ModelRunner:
             num_reject_tokens = self.drafter.mtp_k - num_bonus_tokens
             next_token_locs = num_bonus_tokens
 
-        if get_tp_group().world_size > 1 and self.tokenID_processor.is_deferred_out:
+        # Drafter input must agree across TP ranks.
+        if get_tp_group().world_size > 1 and (
+            self.tokenID_processor.is_deferred_out or hasattr(self, "drafter")
+        ):
             sampled_tokens = get_tp_group().broadcast(sampled_tokens, src=0)
 
         # Compute logprobs if any sequence requested them
@@ -3117,6 +3300,22 @@ class ModelRunner:
         else:
             prev_rejected_num = np.zeros(batch.total_seqs_num, dtype=np.int32)
             prev_bonus_num = np.zeros(batch.total_seqs_num, dtype=np.int32)
+            # PP stages (is_deferred_out=False) still run the drafter.
+            if hasattr(self, "drafter"):
+                # Mid-prompt sequences get their anchor corrected inside
+                # propose_draft_token_ids, from `batch.next_token_ids`.
+                next_token_ids = torch.gather(
+                    sampled_tokens.view(bs, -1), 1, next_token_locs.view(-1, 1)
+                ).view(bs)
+                draft_token_ids = self.propose_draft_token_ids(
+                    batch,
+                    self.tokenID_processor.input_ids.gpu[
+                        1 : batch.total_tokens_num + 1
+                    ],
+                    hidden_states,
+                    next_token_ids,
+                    num_reject_tokens,
+                )
 
         # DSpark Phase 2: carry this step's per-request ell back to the scheduler
         # as a {req_id: ell} dict (req_id-keyed avoids any output/draft batch
@@ -3275,11 +3474,15 @@ class ModelRunner:
             # RAGGED: each seg has its own len_i; anchor offset = len_i - num_bonus_i
             # (num_bonus_i = mtp_k - num_reject_i), applied to cu_seqlens_q ends.
             sbs = batch.total_seqs_num_decode
-            lens_t = torch.as_tensor(
-                np.asarray(ragged_lens)[:sbs],
-                device=num_reject_tokens.device,
-                dtype=num_reject_tokens.dtype,
-            )
+            # Pinned staging + non_blocking: a pageable H2D here would sit
+            # between the target forward and the block draft and synchronize the
+            # stream, forcing the host to wait out the whole target forward.
+            # int32 matches num_reject_tokens (rejection_sampler emits int32 and
+            # default_num_rejected_tokens is int32), so the arithmetic below
+            # keeps the dtype it had before.
+            lens_buf = self.forward_vars["ragged_lens"]
+            lens_buf.np[:sbs] = np.asarray(ragged_lens)[:sbs]
+            lens_t = lens_buf.copy_to_gpu(sbs)
             num_bonus = self.drafter.mtp_k - num_reject_tokens[:sbs]
             last_token_offset = lens_t - num_bonus
         elif (
@@ -3423,6 +3626,33 @@ class ModelRunner:
                     "capture path for cudagraph-safe DP collectives.",
                     getter,
                 )
+
+    def _ragged_flat_bucket_exists(self, total_tokens: int, q: int) -> bool:
+        """Can a captured flat num_tokens bucket hold a ragged step of
+        ``total_tokens`` at per-seq bound ``q``?
+
+        Same predicate ``_dynamic_num_tokens_pad`` searches with -- keep the two
+        in step. Asked BEFORE ``_dspark_apply_ragged`` rewrites the batch,
+        because when no bucket matches that function returns None and every
+        caller falls back to ``bs * max_seqlen_q``: a replay over MORE tokens
+        than the ragged rebuild populated. The ``[total : bs*q]`` tail is then
+        whatever the previous step left in the input buffer, and those stale ids
+        reach the draft's Markov transition-table lookup as out-of-range
+        indices -- a device-side trap attributed to whatever kernel happened to
+        be in flight, nowhere near here.
+
+        The usual way to get here is FULL (non-PIECEWISE) cudagraphs, where no
+        flat bucket set is captured at all: then NO ragged shrink is
+        representable and the caller must stay rectangular. Shrinking buys
+        nothing in that mode anyway -- the replay is rectangular either way.
+        """
+        if not self._piecewise_cg_active():
+            return False
+        from atom.spec_decode.dspark_scheduler import flat_bucket_fits
+
+        return flat_bucket_fits(
+            total_tokens, q, getattr(self, "_piecewise_sorted_tokens", None)
+        )
 
     def _dynamic_num_tokens_pad(self, batch) -> int | None:
         """Flat PIECEWISE replay token count for a ragged decode step, or None so
@@ -3624,8 +3854,67 @@ class ModelRunner:
             return True
         return False
 
+    def _capture_attn_ffn_graphs(
+        self, bs, max_q_len, rectangle_tokens, build_capture, input_ids
+    ):
+        """AF_PIECEWISE: capture the attn_ffn graphs for the smaller ragged buckets
+        (num_tokens_pad = b*max_q_len < this bs's rectangle) a real ragged step at
+        this bs may replay. Runs one PIECEWISE forward per new bucket on a ragged
+        synthetic batch: dense pieces REPLAY (already captured, deduped by
+        num_tokens); the attn_ffn op captures its fresh (bs, q_eff, num_tokens_pad)
+        key. The rectangle bucket was already captured by the caller.
+        """
+        positions = self.forward_vars["positions"].gpu
+        for b in self.graph_bs:
+            num_tokens_pad = b * max_q_len
+            if num_tokens_pad >= rectangle_tokens or num_tokens_pad < bs:
+                # >= rectangle: the rectangle case (already captured) or larger.
+                # < bs: fewer than 1 token/seq — unreachable at real decode.
+                continue
+            if self._piecewise_skip_capture(num_tokens_pad):
+                continue
+            # Ragged synthetic metadata: bs seqs whose lengths sum to num_tokens_pad.
+            attn_metadata, context = build_capture(
+                bs=bs, max_q_len=max_q_len, num_tokens_pad=num_tokens_pad
+            )
+            num_pad, num_tokens_across_dp = self.get_dp_padding(num_tokens_pad)
+            num_tokens_dp = num_tokens_pad + num_pad
+            if num_tokens_across_dp is not None:
+                num_tokens_across_dp = torch.full_like(
+                    num_tokens_across_dp, num_tokens_dp
+                )
+            model_positions = (
+                self._mrope_positions_view(num_tokens_dp)
+                if self.use_mrope
+                else positions[:num_tokens_dp]
+            )
+            set_forward_context(
+                attn_metadata=attn_metadata,
+                atom_config=self.config,
+                context=context,
+                num_tokens=num_tokens_dp,
+                num_tokens_across_dp=num_tokens_across_dp,
+                ubatch_slices=None,
+                in_hipgraph=True,
+            )
+            # Warmup, then the PIECEWISE forward: dense pieces replay (deduped by
+            # num_tokens); attn_ffn op captures its (bs, q_eff, num_tokens_pad) graph.
+            self.model(input_ids[:num_tokens_dp], model_positions)
+            fc = get_forward_context()
+            fc.cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
+            fc.batch_descriptor = BatchDescriptor(num_tokens=num_tokens_dp)
+            self.model(input_ids[:num_tokens_dp], model_positions)
+            fc.cudagraph_runtime_mode = CUDAGraphMode.NONE
+            fc.batch_descriptor = None
+            self._piecewise_captured_tokens.add(num_tokens_dp)
+
     def capture_cudagraph(self):
         _piecewise = self._piecewise_cg_active()
+        # AF_PIECEWISE: also capture the attn core (ragged combos below)
+        cudagraph_mode = getattr(self.config.compilation_config, "cudagraph_mode", None)
+        attn_ffn_piecewise = (
+            cudagraph_mode is not None and cudagraph_mode.is_attn_ffn_piecewise()
+        )
         if _piecewise:
             logger.info(
                 "PIECEWISE cudagraph: capturing per-piece graphs (attention "
@@ -3740,12 +4029,30 @@ class ModelRunner:
         q_buckets = self._dspark_capture_q_buckets(full_q_len)
         if q_buckets != [full_q_len]:
             logger.info("DSpark CUDA-graph query buckets: %s", q_buckets)
+        elif hasattr(self, "drafter") and self.drafter.uses_confidence_schedule:
+            # resolve_q_buckets always folds full_q in, so a spec naming only
+            # full_q (or nothing, or nothing valid) collapses to [full_q] and
+            # every step replays at full length. The step still pays the
+            # confidence schedule + ragged rebuild, so say so rather than look
+            # like it is shrinking anything.
+            dspark = self.config.dspark
+            spec = dspark.ragged_graph_sizes if dspark.ragged else dspark.q_buckets
+            logger.warning(
+                "DSpark %s=%r resolves to [%d] (== full verify length), so no "
+                "query-length shrink is possible and every decode step replays "
+                "at full length. Pass sizes BELOW %d to get any benefit.",
+                "ragged_graph_sizes" if dspark.ragged else "q_buckets",
+                spec,
+                full_q_len,
+                full_q_len,
+            )
 
         # Whether this backend's capture builder supports a dynamic (per-bucket)
         build_capture = self.attn_metadata_builder.build_for_cudagraph_capture
-        supports_dynamic_q_len = (
-            "max_q_len" in inspect.signature(build_capture).parameters
-        )
+        _build_params = inspect.signature(build_capture).parameters
+        supports_dynamic_q_len = "max_q_len" in _build_params
+        # Whether it supports a ragged num_tokens_pad (zero-copy-q attn-core graphs).
+        supports_ragged_capture = "num_tokens_pad" in _build_params
 
         with pause_gc(), graph_capture() as capture_ctx, self.capture_profiler as prof:
             for max_q_len in q_buckets:
@@ -3836,6 +4143,15 @@ class ModelRunner:
                         fc.cudagraph_runtime_mode = CUDAGraphMode.NONE
                         fc.batch_descriptor = None
                         self._piecewise_captured_tokens.add(num_tokens)
+                        # also capture the attn_ffn graphs this bs can replay ragged
+                        if attn_ffn_piecewise and supports_ragged_capture:
+                            self._capture_attn_ffn_graphs(
+                                bs=bs,
+                                max_q_len=max_q_len,
+                                rectangle_tokens=num_tokens,
+                                build_capture=build_capture,
+                                input_ids=input_ids,
+                            )
                         if prof is not None:
                             # Drain before closing the window so this bs's
                             # kernels land in this bs's file. Profiling-only —
@@ -4102,11 +4418,20 @@ class RapidServeModelRunner(ModelRunner):
         safety_margin = int(total_bytes * 0.02)
         return 4 * safety_margin
 
-    def get_num_blocks(self) -> dict[str, int]:
+    def get_num_blocks(self) -> dict[str, object]:
         # Decode in disagg mode owns no GPU memory — kvcache is imported from
         # prefill.
         if self.config.disagg_is_decode:
-            return {"num_kvcache_blocks": 0}
+            transfer = self.attn_metadata_builder.state_transfer()
+            if transfer.copies:
+                raise RuntimeError(
+                    "PAGE-backed state checkpoints do not yet support RapidServe "
+                    "prefill/decode disaggregation"
+                )
+            return {
+                "num_kvcache_blocks": 0,
+                "state_runtime": StateRuntime(transfer=transfer).to_wire(),
+            }
         return super().get_num_blocks()
 
     def allocate_kv_cache(self, num_kvcache_blocks):

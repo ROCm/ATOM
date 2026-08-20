@@ -93,3 +93,13 @@ class StateCache(Protocol):
         nothing, and the hit it later declines is the only consequence.
         """
         ...
+
+
+class StateCheckpointCache(StateCache, Protocol):
+    """State cache lifecycle owned by BlockManager."""
+
+    def unindex(self, h: int) -> None: ...
+
+    def clear_index(self) -> None: ...
+
+    def checkpoint_fates(self) -> dict[str, int]: ...

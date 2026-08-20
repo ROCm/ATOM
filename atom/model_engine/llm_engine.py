@@ -61,6 +61,11 @@ class LLMEngine:
         # `_gather_ids_for_dp` all-gathers using dp_metadata sizes computed on
         # the FULL (un-split) token count, so all_gatherv asserts
         # `1/pcp_size != full`.
+        if config.enable_dp_attention and config.pipeline_parallel_size > 1:
+            raise ValueError(
+                "--enable-dp-attention and pipeline-parallel (pp>1) "
+                "cannot be used together."
+            )
         if config.prefill_context_parallel_size > 1 and config.enable_dp_attention:
             raise ValueError(
                 "prefill_context_parallel_size > 1 (-pcp) combined with "
@@ -374,6 +379,7 @@ class LLMEngine:
                 "checkpoints_dropped",
                 "checkpoints_evicted",
                 "demands_recorded",
+                "demands_declined_no_room",
                 "chunks_cut_for_demand",
             )
         }
@@ -395,15 +401,17 @@ class LLMEngine:
             ),
         }
 
-    def get_metrics_statistics(self, timeout: float = 5.0) -> dict[str, Any]:
-        """Return a DP-aggregated snapshot for the Prometheus exporter."""
-        responses = self.core_mgr.broadcast_utility_command_sync(
-            "get_metrics_statistics", timeout=timeout
-        )
+    def get_metrics_statistics(self) -> dict[str, Any]:
+        """Return a DP-aggregated snapshot for the Prometheus exporter.
+
+        Reads the snapshots each EngineCore pushes on its own clock, so this is
+        a local dict lookup: no round trip, no deadline, and nothing that can
+        fail just because the engine is busy.
+        """
         rank_stats = [
-            resp.get("result", resp)
-            for resp in responses
-            if resp.get("result", resp).get("enabled", False)
+            stats
+            for stats in self.core_mgr.latest_metrics.values()
+            if stats.get("enabled", False)
         ]
 
         def summed(key: str) -> int:
@@ -449,6 +457,7 @@ class LLMEngine:
             "checkpoints_evicted",
             "checkpoints_orphaned",
             "demands_recorded",
+            "demands_declined_no_room",
             "chunks_cut_for_demand",
         )
         cache_totals = {
