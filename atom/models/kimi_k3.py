@@ -926,8 +926,6 @@ class KimiKDAAttention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
 
-        self._use_fused_kda_decode = envs.ATOM_ENABLE_FUSED_KDA_DECODE_TRITON
-
         # The decoder's input_layernorm can fuse its activation quant into the
         # single fused in_proj GEMM (q|k|v|g|b|f_a) that consumes the normed hidden
         # state; the (fp8, scale) rides the splitting custom op into _forward_impl.
@@ -1157,7 +1155,7 @@ class KimiKDAAttention(nn.Module):
             # Slice the per-token cache-slot indices once (used for both the
             # conv update and the fused recurrence below).
             decode_state_indices = state_indices[:num_actual_tokens]
-            if self._use_fused_kda_decode and num_actual_tokens <= 64:
+            if num_actual_tokens <= 64:
                 from aiter.ops.triton.gated_delta_net.fused_kda_decode import (
                     fused_kda_decode,
                 )
