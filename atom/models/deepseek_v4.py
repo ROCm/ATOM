@@ -1853,7 +1853,7 @@ class Indexer(nn.Module):
         fwd). Only when the buffer would exceed budget and the loop actually
         splits does each chunk rebuild the schedule for its rows (cta_info
         encodes absolute row ids, so a slice of the full schedule won't do)."""
-        from aiter.ops.flydsl.kernels.pa_mqa_logits_fp4_prefill import (
+        from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
             compute_prefill_schedule,
             flydsl_pa_mqa_logits_fp4_prefill,
         )
@@ -1968,7 +1968,7 @@ class Indexer(nn.Module):
         `parallel_unit_num` is not passed (it would be ignored); only `block_k`
         must match the value the schedule was built with (see `FP4_MQA_BLOCK_K`).
         """
-        from aiter.ops.flydsl.kernels.pa_mqa_logits_fp4 import (
+        from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4 import (
             flydsl_pa_mqa_logits_fp4,
         )
 
@@ -2102,7 +2102,7 @@ class Indexer(nn.Module):
         so a replay never reads the previous step's stale windows (which faulted
         the bounds-check-off paged-KV load in `pa_mqa_logits_fp4_prefill_kernel_0`).
         """
-        from aiter.ops.flydsl.kernels.pa_mqa_logits_fp4_prefill import (
+        from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
             flydsl_pa_mqa_logits_fp4_prefill,
         )
 

@@ -4,7 +4,7 @@
 import logging
 from dataclasses import dataclass
 from functools import partial as functools_partial
-from typing import ClassVar, Optional, Protocol
+from typing import ClassVar, Protocol
 
 import torch
 import triton
@@ -261,17 +261,17 @@ if is_rocm_aiter_fp4bmm_enabled():
 class MLAModules:
     """Modules used in MLA."""
 
-    q_lora_rank: Optional[int]
+    q_lora_rank: int | None
     kv_lora_rank: int
     qk_nope_head_dim: int
     qk_rope_head_dim: int
     qk_head_dim: int
     v_head_dim: int
     rotary_emb: torch.nn.Module
-    q_proj: Optional[torch.nn.Module]
+    q_proj: torch.nn.Module | None
     kv_b_proj: torch.nn.Module
     o_proj: torch.nn.Module
-    indexer: Optional[torch.nn.Module]
+    indexer: torch.nn.Module | None
     # Model-level sparse flag. A v3.2 / GLM-5.2 model runs sparse MLA on ALL its
     # layers. GLM-5.2 IndexShare "shared" layers carry no indexer module yet must
     # still run sparse attention (reusing the prior "full" layer's top-k), so
@@ -502,6 +502,14 @@ class MLAAttention(nn.Module):
         self.dcp_sparse_kv_indptr_buffer = None
         self.dcp_owned_counts_buffer = None
 
+        self._configure_dcp_decode_head_padding(self.dcp_world_size)
+
+    def _configure_dcp_decode_head_padding(self, dcp_world_size: int) -> None:
+        """Configure the kernel width used after DCP gathers query heads.
+
+        The vLLM plugin initializes its process groups independently from the
+        native ATOM config, so it calls this again with vLLM's DCP size.
+        """
         # DCP decode all-gathers Q on the head dim, so the width reaching
         # mla_decode_fwd is the gathered num_heads * dcp rounded up to a
         # dispatchable one. The pad sits entirely inside _forward_decode: it goes
@@ -509,12 +517,12 @@ class MLAAttention(nn.Module):
         # never costs collective traffic.
         self.dcp_kernel_num_heads = self.num_heads
         self.dcp_head_pad = 0
-        if self.dcp_world_size > 1:
+        if dcp_world_size > 1:
             self.dcp_kernel_num_heads = mla_dcp_kernel_num_heads(
-                self.num_heads, self.dcp_world_size, self.min_query_heads
+                self.num_heads, dcp_world_size, self.min_query_heads
             )
             self.dcp_head_pad = (
-                self.dcp_kernel_num_heads - self.num_heads * self.dcp_world_size
+                self.dcp_kernel_num_heads - self.num_heads * dcp_world_size
             )
 
     def _pad_decode_query_heads(self, q: torch.Tensor) -> torch.Tensor:
@@ -797,8 +805,8 @@ class MLAAttention(nn.Module):
         cu_seqlens_k: torch.Tensor,
         k_out: torch.Tensor,
         v_out: torch.Tensor,
-        shuffle_kv_block_indptr: Optional[torch.Tensor] = None,
-        shuffle_kv_block_indices: Optional[torch.Tensor] = None,
+        shuffle_kv_block_indptr: torch.Tensor | None = None,
+        shuffle_kv_block_indices: torch.Tensor | None = None,
     ) -> None:
         weight = self.kv_b_proj.weight
         if envs.ATOM_USE_TRITON_MLA and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV:
@@ -2026,7 +2034,7 @@ class MLAAttention(nn.Module):
         kv_cache: torch.Tensor = None,
         attn_metadata=None,
         positions: torch.Tensor = None,
-        q_scale: Optional[torch.Tensor] = None,
+        q_scale: torch.Tensor | None = None,
         output: torch.Tensor = None,
         **kwargs,
     ) -> torch.Tensor:
@@ -2124,7 +2132,7 @@ def triton_convert_req_index_to_global_index(
     BLOCK_SIZE: int = 1,  # page_block_size = 1 for now
     NUM_TOPK_TOKENS: int = 2048,
     BLOCK_N: int = 128,  # tile width along columns
-    out: Optional[torch.Tensor] = None,
+    out: torch.Tensor | None = None,
 ):
     """
     out[token_id, indice_id] =
@@ -2287,7 +2295,7 @@ def triton_convert_req_index_to_global_index_dsa_prefill(
     PAGE_SIZE: int = 1,
     NUM_TOPK_TOKENS: int = 2048,
     BLOCK_N: int = 1024,  # tile width along columns
-    out: Optional[torch.Tensor] = None,
+    out: torch.Tensor | None = None,
 ):
 
     assert topk_indices.shape[1] == NUM_TOPK_TOKENS
@@ -2401,7 +2409,7 @@ def triton_gather_kv_indices_sparse(
     kv_indptr: torch.Tensor,
     NUM_TOPK_TOKENS: int = 2048,
     BLOCK_N: int = 1024,
-    out: Optional[torch.Tensor] = None,
+    out: torch.Tensor | None = None,
 ):
     assert topk_indices.shape[1] == NUM_TOPK_TOKENS
     assert NUM_TOPK_TOKENS % BLOCK_N == 0
