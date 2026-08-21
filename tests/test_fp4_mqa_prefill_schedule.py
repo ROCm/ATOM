@@ -6,7 +6,6 @@ from pathlib import Path
 
 import pytest
 
-
 _SCHEDULE = runpy.run_path(
     Path(__file__).parents[1]
     / "atom"
