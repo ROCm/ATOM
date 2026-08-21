@@ -321,7 +321,12 @@ def test_explicit_region_map_supports_compact_index_group():
     # schedule only global layers 18, 22, 26, 30, and 34 own index caches.
     explicit = list(range(18, 38)) + [83, 84, 85, 86, 87]
 
-    assert conn._consumer_region_map(len(explicit), explicit) == explicit
+    assert (
+        conn._consumer_region_map(
+            len(explicit), len(explicit), explicit_indices=explicit
+        )
+        == explicit
+    )
 
 
 def test_compact_index_region_maps_tile_consumer_without_overlap():
@@ -353,7 +358,7 @@ def test_explicit_region_map_rejects_length_mismatch():
     conn = object.__new__(mc.MooncakeConnector)
 
     with pytest.raises(ValueError, match="length does not match"):
-        conn._consumer_region_map(3, [0, 1])
+        conn._consumer_region_map(3, 2, explicit_indices=[0, 1])
 
 
 # ---------------------------------------------------------------------------

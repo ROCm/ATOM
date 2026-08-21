@@ -1416,7 +1416,7 @@ class MooncakeConnector(KVConnectorBase):
             num_regions,
             len(consumer_base_addrs),
             request_data.get("consumer_num_layers"),
-            self._block_region_consumer_indices
+            self._block_region_consumer_indices,
         )
         for region_idx in range(num_regions):
             src_base = self.kv_caches_base_addr[region_idx]
@@ -1476,7 +1476,7 @@ class MooncakeConnector(KVConnectorBase):
             len(self._block_regions),
             len(consumer_block_addrs),
             request_data.get("consumer_num_layers"),
-            self._block_region_consumer_indices
+            self._block_region_consumer_indices,
         )
         for region_idx, (src_base, bpb) in enumerate(self._block_regions):
             cidx = block_cmap[region_idx]
