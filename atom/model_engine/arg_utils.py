@@ -73,6 +73,7 @@ class EngineArgs:
     kv_transfer_config: str = "{}"
     draft_model: str | None = None
     spec_decode_acceptance_rate: float | None = None
+    spec_decode_acceptance_length: float | None = None
     mark_trace: bool = False
     enable_rapidserve: bool = False
     disagg_prefill_max_num_seqs: int | None = None
@@ -299,17 +300,27 @@ class EngineArgs:
             "V4-Pro-DSpark which ships inside the target checkpoint).",
         )
         parser.add_argument(
+            "--spec-decode-acceptance-length",
+            type=float,
+            default=None,
+            help="Debug/benchmark knob: force a fixed speculative-decoding mean "
+            "acceptance length (AL) in [1, num_speculative_tokens + 1]. When "
+            "set, the rejection sampler ignores the real draft/target agreement "
+            "and force-accepts draft tokens so the measured accept length "
+            "converges to this value. AL counts the target's own guaranteed "
+            "token, so it is the same unit as vLLM's synthetic_acceptance_length "
+            "and SGLang's SGLANG_SIMULATE_ACC_LEN and a published golden AL can "
+            "be passed through unchanged. Only meaningful with a speculative "
+            "method; leave unset to disable.",
+        )
+        parser.add_argument(
             "--spec-decode-acceptance-rate",
             type=float,
             default=None,
-            help="Debug/benchmark knob: force a fixed speculative-decoding "
-            "acceptance rate in [0, 1]. When set, the rejection sampler ignores "
-            "the real draft/target agreement and force-accepts each draft token "
-            "with a position-decaying probability calibrated so the measured "
-            "mean acceptance rate (accepted_draft/total_draft) matches this "
-            "value (equivalent accept length = 1 + num_speculative_tokens * "
-            "rate). Mirrors vLLM's 'synthetic' rejection_sample_method. Only "
-            "meaningful with a speculative method; leave unset to disable.",
+            help="The same knob as --spec-decode-acceptance-length, expressed as "
+            "a mean acceptance rate in [0, 1] (accepted_draft/total_draft), i.e. "
+            "(length - 1) / num_speculative_tokens. Mutually exclusive with "
+            "--spec-decode-acceptance-length.",
         )
         parser.add_argument(
             "--max-num-batched-tokens",
@@ -582,6 +593,7 @@ class EngineArgs:
             num_spec_tokens = kwargs.pop("num_speculative_tokens")
             draft_model = kwargs.pop("draft_model")
             synthetic_acceptance_rate = kwargs.pop("spec_decode_acceptance_rate")
+            synthetic_acceptance_length = kwargs.pop("spec_decode_acceptance_length")
             if method == "eagle3" and not draft_model:
                 raise ValueError("--draft-model is required when --method eagle3.")
             if draft_model and method == "mtp":
@@ -594,12 +606,14 @@ class EngineArgs:
                 model=draft_model or self.model,
                 num_speculative_tokens=num_spec_tokens,
                 synthetic_acceptance_rate=synthetic_acceptance_rate,
+                synthetic_acceptance_length=synthetic_acceptance_length,
             )
         else:
             kwargs.pop("method")
             kwargs.pop("num_speculative_tokens")
             kwargs.pop("draft_model")
             kwargs.pop("spec_decode_acceptance_rate")
+            kwargs.pop("spec_decode_acceptance_length")
             kwargs["speculative_config"] = None
 
         # --enable-tbo [prefill|all] → enable_tbo + enable_tbo_decode
