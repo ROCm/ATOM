@@ -101,106 +101,51 @@ impl ParserRegistry {
         creators.get(name).map(|creator| creator())
     }
 
+    /// Resolve a model identifier to a registered parser name.
+    ///
+    /// Namespaced and differently-cased model identifiers are supported by
+    /// case-insensitive substring matching. The longest matching stem wins.
+    pub fn resolve_model_to_parser(&self, model: &str) -> Option<String> {
+        let mapping = self.model_mapping.read().unwrap();
+        if let Some(parser_name) = mapping.get(model) {
+            return Some(parser_name.clone());
+        }
+
+        let model_lower = model.to_lowercase();
+        mapping
+            .iter()
+            .filter_map(|(pattern, parser_name)| {
+                let stem = pattern.strip_suffix('*')?;
+                model_lower
+                    .contains(&stem.to_lowercase())
+                    .then_some((stem.len(), parser_name))
+            })
+            .max_by_key(|(stem_len, _)| *stem_len)
+            .map(|(_, parser_name)| parser_name.clone())
+    }
+
     /// Check if a parser can be created for a specific model without actually creating it.
     /// Returns true if a parser is available (registered) for this model.
     pub fn has_parser_for_model(&self, model: &str) -> bool {
-        // Try exact match first
-        {
-            let mapping = self.model_mapping.read().unwrap();
-            if let Some(parser_name) = mapping.get(model) {
-                let creators = self.creators.read().unwrap();
-                if creators.contains_key(parser_name) {
-                    return true;
-                }
-            }
-        }
-
-        // Try prefix matching
-        let model_mapping = self.model_mapping.read().unwrap();
-        let best_match = model_mapping
-            .iter()
-            .filter(|(pattern, _)| {
-                pattern.ends_with('*') && model.starts_with(&pattern[..pattern.len() - 1])
-            })
-            .max_by_key(|(pattern, _)| pattern.len());
-
-        if let Some((_, parser_name)) = best_match {
-            let creators = self.creators.read().unwrap();
-            if creators.contains_key(parser_name) {
-                return true;
-            }
-        }
-
-        // Return false if no specific parser found for this model
-        // (get_pooled will still fall back to default parser)
-        false
+        self.resolve_model_to_parser(model)
+            .is_some_and(|parser_name| self.has_parser(&parser_name))
     }
 
     /// Create a fresh (non-pooled) parser instance for a specific model.
     /// Returns a new parser instance for each call - useful for streaming where state isolation is needed.
     pub fn create_for_model(&self, model: &str) -> Option<Box<dyn ToolParser>> {
-        // Try exact match first
-        {
-            let mapping = self.model_mapping.read().unwrap();
-            if let Some(parser_name) = mapping.get(model) {
-                if let Some(parser) = self.create_parser(parser_name) {
-                    return Some(parser);
-                }
-            }
-        }
-
-        // Try prefix matching with more specific patterns first
-        let model_mapping = self.model_mapping.read().unwrap();
-        let best_match = model_mapping
-            .iter()
-            .filter(|(pattern, _)| {
-                pattern.ends_with('*') && model.starts_with(&pattern[..pattern.len() - 1])
-            })
-            .max_by_key(|(pattern, _)| pattern.len());
-
-        // Return the best matching parser
-        if let Some((_, parser_name)) = best_match {
-            if let Some(parser) = self.create_parser(parser_name) {
-                return Some(parser);
-            }
-        }
-
-        // Fall back to default parser
-        let default = self.default_parser.read().unwrap().clone();
-        self.create_parser(&default)
+        let parser_name = self
+            .resolve_model_to_parser(model)
+            .unwrap_or_else(|| self.default_parser.read().unwrap().clone());
+        self.create_parser(&parser_name)
     }
 
     /// Get parser for a specific model
     pub fn get_pooled_for_model(&self, model: &str) -> Option<PooledParser> {
-        // Try exact match first
-        {
-            let mapping = self.model_mapping.read().unwrap();
-            if let Some(parser_name) = mapping.get(model) {
-                if let Some(parser) = self.get_pooled_parser(parser_name) {
-                    return Some(parser);
-                }
-            }
-        }
-
-        // Try prefix matching with more specific patterns first
-        let model_mapping = self.model_mapping.read().unwrap();
-        let best_match = model_mapping
-            .iter()
-            .filter(|(pattern, _)| {
-                pattern.ends_with('*') && model.starts_with(&pattern[..pattern.len() - 1])
-            })
-            .max_by_key(|(pattern, _)| pattern.len());
-
-        // Return the best matching parser
-        if let Some((_, parser_name)) = best_match {
-            if let Some(parser) = self.get_pooled_parser(parser_name) {
-                return Some(parser);
-            }
-        }
-
-        // Fall back to default parser
-        let default = self.default_parser.read().unwrap().clone();
-        self.get_pooled_parser(&default)
+        let parser_name = self
+            .resolve_model_to_parser(model)
+            .unwrap_or_else(|| self.default_parser.read().unwrap().clone());
+        self.get_pooled_parser(&parser_name)
     }
 
     /// Clear the parser pool, forcing new instances to be created.
@@ -236,8 +181,9 @@ impl ParserFactory {
         // Register default parsers
         registry.register_parser("passthrough", || Box::new(PassthroughParser::new()));
         registry.register_parser("json", || Box::new(JsonParser::new()));
-        registry.register_parser("qwen", || Box::new(QwenCoderParser::new()));
+        registry.register_parser("qwen", || Box::new(QwenParser::new()));
         registry.register_parser("qwen_json", || Box::new(QwenParser::new()));
+        registry.register_parser("qwen_xml", || Box::new(QwenCoderParser::new()));
         registry.register_parser("qwen_coder", || Box::new(QwenCoderParser::new()));
         registry.register_parser("dsml", || Box::new(DsmlParser::new()));
         registry.register_parser("glm", || Box::new(Glm4MoeParser::glm45()));
@@ -264,14 +210,20 @@ impl ParserFactory {
         registry.map_model("claude-*", "json");
 
         // Qwen models (more specific patterns first - longer patterns take precedence)
-        // Qwen Coder models use XML format: <tool_call><function=name><parameter=key>value</parameter></function></tool_call>
+        // Qwen3.5+ and Qwen3-Coder use the XML parameter format.
+        registry.map_model("Qwen/Qwen3.5*", "qwen_xml");
+        registry.map_model("Qwen3.5*", "qwen_xml");
+        registry.map_model("qwen3.5*", "qwen_xml");
+        registry.map_model("Qwen/Qwen3.6*", "qwen_xml");
+        registry.map_model("Qwen3.6*", "qwen_xml");
+        registry.map_model("qwen3.6*", "qwen_xml");
+        registry.map_model("Qwen/Qwen3.8*", "qwen_xml");
+        registry.map_model("Qwen3.8*", "qwen_xml");
+        registry.map_model("qwen3.8*", "qwen_xml");
         registry.map_model("Qwen/Qwen3-Coder*", "qwen_coder");
         registry.map_model("Qwen3-Coder*", "qwen_coder");
         registry.map_model("qwen3-coder*", "qwen_coder");
-        registry.map_model("Qwen/Qwen2.5-Coder*", "qwen_coder");
-        registry.map_model("Qwen2.5-Coder*", "qwen_coder");
-        registry.map_model("qwen2.5-coder*", "qwen_coder");
-        // Generic Qwen models use JSON format
+        // Qwen3 and earlier, including Qwen2.5-Coder, use JSON-in-tag.
         registry.map_model("qwen*", "qwen");
         registry.map_model("Qwen*", "qwen");
 
@@ -283,6 +235,7 @@ impl ParserFactory {
         registry.map_model("glm-4.5*", "glm45_moe");
         registry.map_model("glm-4.6*", "glm45_moe");
         registry.map_model("glm-4.7*", "glm47_moe");
+        registry.map_model("glm-5*", "glm47_moe");
         registry.map_model("glm-*", "json");
 
         // Kimi models
@@ -292,6 +245,8 @@ impl ParserFactory {
         registry.map_model("kimi-k3*", "kimi_k3");
         registry.map_model("Kimi-K3*", "kimi_k3");
         registry.map_model("moonshot*/Kimi-K3*", "kimi_k3");
+        registry.map_model("kimi_k3*", "kimi_k3");
+        registry.map_model("Kimi_K3*", "kimi_k3");
 
         // MiniMax models
         registry.map_model("minimax-m3*", "minimax");
@@ -330,31 +285,10 @@ impl ParserFactory {
     /// Get a non-pooled parser for the given model ID (creates a fresh instance each time).
     /// This is useful for benchmarks and testing where you want independent parser instances.
     pub fn get_parser(&self, model_id: &str) -> Option<Arc<dyn ToolParser>> {
-        // Determine which parser type to use
-        let parser_type = {
-            let mapping = self.registry.model_mapping.read().unwrap();
-
-            // Try exact match first
-            if let Some(parser_name) = mapping.get(model_id) {
-                parser_name.clone()
-            } else {
-                // Try prefix matching
-                let best_match = mapping
-                    .iter()
-                    .filter(|(pattern, _)| {
-                        pattern.ends_with('*')
-                            && model_id.starts_with(&pattern[..pattern.len() - 1])
-                    })
-                    .max_by_key(|(pattern, _)| pattern.len());
-
-                if let Some((_, parser_name)) = best_match {
-                    parser_name.clone()
-                } else {
-                    // Fall back to default
-                    self.registry.default_parser.read().unwrap().clone()
-                }
-            }
-        };
+        let parser_type = self
+            .registry
+            .resolve_model_to_parser(model_id)
+            .unwrap_or_else(|| self.registry.default_parser.read().unwrap().clone());
 
         let creators = self.registry.creators.read().unwrap();
         creators.get(&parser_type).map(|creator| {

@@ -96,6 +96,18 @@ pub trait ToolParser: Send + Sync {
     /// Returns (remaining_normal_text, tool_calls) tuple
     async fn parse_complete(&self, output: &str) -> ParserResult<(String, Vec<ToolCall>)>;
 
+    /// Parse complete tool calls with access to the request's tool schemas.
+    ///
+    /// XML-style parsers can override this to preserve declared string types
+    /// instead of inferring values from their textual representation.
+    async fn parse_complete_with_tools(
+        &self,
+        output: &str,
+        _tools: &[Tool],
+    ) -> ParserResult<(String, Vec<ToolCall>)> {
+        self.parse_complete(output).await
+    }
+
     /// Parse tool calls from model output (streaming)
     /// Parsers now maintain internal state, so self is mutable
     ///

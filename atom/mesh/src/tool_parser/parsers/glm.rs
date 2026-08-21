@@ -1,5 +1,7 @@
 //! GLM tool-call parser.
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use openai_protocol::common::Tool;
 use regex::Regex;
@@ -88,45 +90,53 @@ impl Glm4MoeParser {
     }
 
     /// Parse arguments from key-value pairs
-    fn parse_arguments(&self, args_text: &str) -> ParserResult<serde_json::Map<String, Value>> {
+    fn parse_arguments(
+        &self,
+        args_text: &str,
+        param_types: &HashMap<String, String>,
+    ) -> serde_json::Map<String, Value> {
         let mut arguments = serde_json::Map::new();
 
         for capture in self.arg_extractor.captures_iter(args_text) {
             let key = capture.get(1).map_or("", |m| m.as_str()).trim();
             let value_str = capture.get(2).map_or("", |m| m.as_str()).trim();
 
-            // Try to parse the value as JSON first, fallback to string
-            let value = if let Ok(json_val) = serde_json::from_str::<Value>(value_str) {
-                json_val
-            } else {
-                // Try parsing as Python literal (similar to Python's ast.literal_eval)
-                if value_str == "true" || value_str == "True" {
-                    Value::Bool(true)
-                } else if value_str == "false" || value_str == "False" {
-                    Value::Bool(false)
-                } else if value_str == "null" || value_str == "None" {
-                    Value::Null
-                } else if let Ok(num) = value_str.parse::<i64>() {
-                    Value::Number(num.into())
-                } else if let Ok(num) = value_str.parse::<f64>() {
-                    if let Some(n) = serde_json::Number::from_f64(num) {
-                        Value::Number(n)
+            let inferred = || {
+                if let Ok(json_val) = serde_json::from_str::<Value>(value_str) {
+                    json_val
+                } else {
+                    // Try parsing as Python literal (similar to Python's ast.literal_eval)
+                    if value_str == "true" || value_str == "True" {
+                        Value::Bool(true)
+                    } else if value_str == "false" || value_str == "False" {
+                        Value::Bool(false)
+                    } else if value_str == "null" || value_str == "None" {
+                        Value::Null
+                    } else if let Ok(num) = value_str.parse::<i64>() {
+                        Value::Number(num.into())
+                    } else if let Ok(num) = value_str.parse::<f64>() {
+                        if let Some(n) = serde_json::Number::from_f64(num) {
+                            Value::Number(n)
+                        } else {
+                            Value::String(value_str.to_string())
+                        }
                     } else {
                         Value::String(value_str.to_string())
                     }
-                } else {
-                    Value::String(value_str.to_string())
                 }
             };
+            let value =
+                helpers::coerce_by_schema_type(value_str, param_types.get(key).map(String::as_str))
+                    .unwrap_or_else(inferred);
 
             arguments.insert(key.to_string(), value);
         }
 
-        Ok(arguments)
+        arguments
     }
 
     /// Parse a single tool call block
-    fn parse_tool_call(&self, block: &str) -> ParserResult<Option<ToolCall>> {
+    fn parse_tool_call(&self, block: &str, tools: &[Tool]) -> ParserResult<Option<ToolCall>> {
         if let Some(captures) = self.func_detail_extractor.captures(block) {
             // Get function name
             let func_name = captures.get(1).map_or("", |m| m.as_str()).trim();
@@ -135,7 +145,8 @@ impl Glm4MoeParser {
             let args_text = captures.get(2).map_or("", |m| m.as_str());
 
             // Parse arguments
-            let arguments = self.parse_arguments(args_text)?;
+            let param_types = helpers::param_types_for_function(tools, func_name);
+            let arguments = self.parse_arguments(args_text, &param_types);
 
             let arguments_str = serde_json::to_string(&arguments)
                 .map_err(|e| ParserError::ParsingFailed(e.to_string()))?;
@@ -152,12 +163,12 @@ impl Glm4MoeParser {
     }
 
     /// Parse all tool calls from text (shared logic for complete and incremental parsing)
-    fn parse_tool_calls_from_text(&self, text: &str) -> ParserResult<Vec<ToolCall>> {
-        let mut tools = Vec::new();
+    fn parse_tool_calls_from_text(&self, text: &str, tools: &[Tool]) -> Vec<ToolCall> {
+        let mut parsed = Vec::new();
 
         for mat in self.tool_call_extractor.find_iter(text) {
-            match self.parse_tool_call(mat.as_str()) {
-                Ok(Some(tool)) => tools.push(tool),
+            match self.parse_tool_call(mat.as_str(), tools) {
+                Ok(Some(tool)) => parsed.push(tool),
                 Ok(None) => continue,
                 Err(e) => {
                     tracing::debug!("Failed to parse tool call: {}", e);
@@ -166,7 +177,26 @@ impl Glm4MoeParser {
             }
         }
 
-        Ok(tools)
+        parsed
+    }
+
+    fn parse_complete_inner(
+        &self,
+        text: &str,
+        tools: &[Tool],
+    ) -> ParserResult<(String, Vec<ToolCall>)> {
+        if !self.has_tool_markers(text) {
+            return Ok((text.to_string(), vec![]));
+        }
+        let Some(idx) = text.find("<tool_call>") else {
+            return Ok((text.to_string(), vec![]));
+        };
+        let normal_text = text[..idx].to_string();
+        let parsed = self.parse_tool_calls_from_text(text, tools);
+        if parsed.is_empty() {
+            return Ok((text.to_string(), vec![]));
+        }
+        Ok((normal_text, parsed))
     }
 }
 
@@ -179,24 +209,15 @@ impl Default for Glm4MoeParser {
 #[async_trait]
 impl ToolParser for Glm4MoeParser {
     async fn parse_complete(&self, text: &str) -> ParserResult<(String, Vec<ToolCall>)> {
-        // Check if text contains GLM-4 MoE format
-        if !self.has_tool_markers(text) {
-            return Ok((text.to_string(), vec![]));
-        }
+        self.parse_complete_inner(text, &[])
+    }
 
-        // Find where tool calls begin
-        let idx = text.find("<tool_call>").unwrap();
-        let normal_text = text[..idx].to_string();
-
-        // Parse all tool calls using shared helper
-        let tools = self.parse_tool_calls_from_text(text)?;
-
-        // If no tools were successfully parsed despite having markers, return entire text as fallback
-        if tools.is_empty() {
-            return Ok((text.to_string(), vec![]));
-        }
-
-        Ok((normal_text, tools))
+    async fn parse_complete_with_tools(
+        &self,
+        text: &str,
+        tools: &[Tool],
+    ) -> ParserResult<(String, Vec<ToolCall>)> {
+        self.parse_complete_inner(text, tools)
     }
 
     async fn parse_incremental(
@@ -245,7 +266,7 @@ impl ToolParser for Glm4MoeParser {
 
             // Parse the complete block using shared helper
             let block_end = end_pos + self.eot_token.len();
-            let parsed_tools = self.parse_tool_calls_from_text(&current_text[..block_end])?;
+            let parsed_tools = self.parse_tool_calls_from_text(&current_text[..block_end], tools);
 
             // Extract normal text before tool calls
             let idx = current_text.find(self.bot_token);

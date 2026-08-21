@@ -2,7 +2,7 @@ use openai_protocol::common::{Function, Tool};
 
 use super::*;
 use crate::tool_parser::{
-    parsers::{JsonParser, QwenCoderParser},
+    parsers::{Glm4MoeParser, JsonParser, QwenCoderParser},
     partial_json::PartialJson,
     traits::ToolParser,
 };
@@ -39,6 +39,7 @@ fn test_supported_tool_parser_registrations_and_model_mappings() {
         "qwen",
         "qwen_coder",
         "qwen_json",
+        "qwen_xml",
         "dsml",
         "glm45_moe",
         "glm47_moe",
@@ -51,9 +52,12 @@ fn test_supported_tool_parser_registrations_and_model_mappings() {
 
     for model in [
         "Qwen3-Coder-480B",
+        "Qwen3.5-32B",
+        "org/QWEN2.5-Instruct",
         "deepseek-v4",
         "glm-4.5-air",
         "glm-4.7",
+        "glm-5",
         "Kimi-K2-Instruct",
         "Kimi-K3-Instruct",
         "MiniMax-M3",
@@ -63,6 +67,25 @@ fn test_supported_tool_parser_registrations_and_model_mappings() {
             "{model} should have a tool parser"
         );
     }
+
+    assert_eq!(
+        registry
+            .resolve_model_to_parser("org/QWEN2.5-Instruct")
+            .as_deref(),
+        Some("qwen")
+    );
+    assert_eq!(
+        registry
+            .resolve_model_to_parser("Qwen/Qwen3-Coder-480B")
+            .as_deref(),
+        Some("qwen_coder")
+    );
+    assert_eq!(
+        registry
+            .resolve_model_to_parser("org/Qwen3.5-32B")
+            .as_deref(),
+        Some("qwen_xml")
+    );
 
     for model in [
         "deepseek-v3",
@@ -76,6 +99,92 @@ fn test_supported_tool_parser_registrations_and_model_mappings() {
             "{model} should not have a tool parser"
         );
     }
+}
+
+#[tokio::test]
+async fn test_generic_qwen_uses_json_parser_and_namespaced_matching() {
+    let factory = ParserFactory::new();
+    let parser = factory
+        .get_parser("org/QWEN2.5-Instruct")
+        .expect("generic Qwen parser");
+    let (_, calls) = parser
+        .parse_complete(
+            "text<tool_call>\n{\"name\":\"search\",\"arguments\":{\"q\":\"rust\"}}\n</tool_call>",
+        )
+        .await
+        .unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].function.name, "search");
+}
+
+fn schema_tool(name: &str, properties: serde_json::Value) -> Vec<Tool> {
+    vec![Tool {
+        tool_type: "function".to_string(),
+        function: Function {
+            name: name.to_string(),
+            description: None,
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": properties
+            }),
+            strict: None,
+        },
+    }]
+}
+
+#[tokio::test]
+async fn test_qwen_xml_schema_coercion_and_literal_entities() {
+    let tools = schema_tool(
+        "search",
+        serde_json::json!({
+            "limit": {"type": "string"},
+            "count": {"type": "integer"},
+            "query": {"type": "string"}
+        }),
+    );
+    let text = "<tool_call><function=search>\
+        <parameter=limit>4</parameter>\
+        <parameter=count>5</parameter>\
+        <parameter=query>Tom &amp; Jerry</parameter>\
+        </function></tool_call>";
+    let (_, calls) = QwenCoderParser::new()
+        .parse_complete_with_tools(text, &tools)
+        .await
+        .unwrap();
+    let arguments: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+    assert_eq!(arguments["limit"], "4");
+    assert_eq!(arguments["count"], 5);
+    assert_eq!(arguments["query"], "Tom &amp; Jerry");
+}
+
+#[tokio::test]
+async fn test_glm_schema_coercion_for_complete_and_streaming() {
+    let tools = schema_tool(
+        "search",
+        serde_json::json!({
+            "limit": {"type": "string"},
+            "count": {"type": "integer"}
+        }),
+    );
+    let text = "<tool_call>search\n\
+        <arg_key>limit</arg_key><arg_value>4</arg_value>\
+        <arg_key>count</arg_key><arg_value>5</arg_value>\
+        </tool_call>";
+    let (_, calls) = Glm4MoeParser::glm45()
+        .parse_complete_with_tools(text, &tools)
+        .await
+        .unwrap();
+    let arguments: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+    assert_eq!(arguments["limit"], "4");
+    assert_eq!(arguments["count"], 5);
+
+    let streamed = Glm4MoeParser::glm45()
+        .parse_incremental(text, &tools)
+        .await
+        .unwrap();
+    let arguments: serde_json::Value = serde_json::from_str(&streamed.calls[0].parameters).unwrap();
+    assert_eq!(arguments["limit"], "4");
+    assert_eq!(arguments["count"], 5);
 }
 
 #[test]
@@ -123,6 +232,15 @@ fn test_partial_json_parser() {
     assert!(value.is_array());
     assert_eq!(value[0], 1);
     assert_eq!(value[1], 2);
+}
+
+#[test]
+fn test_partial_json_reports_utf8_byte_offset() {
+    let parser = PartialJson::default();
+    let input = r#"{"city":"巴黎"}"#;
+    let (value, consumed) = parser.parse_value(input, true).unwrap();
+    assert_eq!(value["city"], "巴黎");
+    assert_eq!(consumed, input.len());
 }
 
 #[test]

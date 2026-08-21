@@ -33,6 +33,7 @@ pub mod types {
 // Re-export types used outside this module.
 pub use core::{FunctionCall, PartialToolCall, StreamingParseResult, ToolCall, ToolParser};
 pub use parsers::{
-    DsmlParser, Glm4MoeParser, JsonParser, KimiK2Parser, KimiK3Parser, MiniMaxParser, QwenParser,
+    DsmlParser, Glm4MoeParser, JsonParser, KimiK2Parser, KimiK3Parser, MiniMaxParser,
+    QwenCoderParser, QwenParser,
 };
 pub use registry::{ParserFactory, PooledParser};

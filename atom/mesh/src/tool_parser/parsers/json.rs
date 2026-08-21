@@ -125,19 +125,17 @@ impl JsonParser {
 
     /// Parse a single JSON object into a ToolCall
     fn parse_single_object(&self, obj: &Value) -> ParserResult<Option<ToolCall>> {
+        let normalized = helpers::normalize_tool_call_fields(obj.clone());
         // Check if this looks like a tool call
-        let name = obj
+        let name = normalized
             .get("name")
-            .or_else(|| obj.get("function"))
+            .or_else(|| normalized.get("function"))
             .and_then(|v| v.as_str());
 
         if let Some(name) = name {
             // Get arguments - support both "arguments" and "parameters" keys
             let empty_obj = Value::Object(serde_json::Map::new());
-            let args = obj
-                .get("arguments")
-                .or_else(|| obj.get("parameters"))
-                .unwrap_or(&empty_obj);
+            let args = normalized.get("arguments").unwrap_or(&empty_obj);
 
             // Convert arguments to JSON string
             let arguments = serde_json::to_string(args)

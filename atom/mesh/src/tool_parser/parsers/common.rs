@@ -3,12 +3,58 @@
 use std::collections::HashMap;
 
 use openai_protocol::common::Tool;
-use serde_json::Value;
+use serde::de::{Deserialize, IgnoredAny};
+use serde_json::{de::Deserializer, Value};
 
 use crate::tool_parser::{
     errors::{ParserError, ParserResult},
     types::{StreamingParseResult, ToolCallItem},
 };
+
+/// Return declared scalar JSON-schema types for a function's parameters.
+pub fn param_types_for_function(tools: &[Tool], func_name: &str) -> HashMap<String, String> {
+    let mut types = HashMap::new();
+    let Some(tool) = tools.iter().find(|tool| tool.function.name == func_name) else {
+        return types;
+    };
+    if let Some(properties) = tool
+        .function
+        .parameters
+        .get("properties")
+        .and_then(Value::as_object)
+    {
+        for (name, schema) in properties {
+            if let Some(declared_type) = schema.get("type").and_then(Value::as_str) {
+                types.insert(name.clone(), declared_type.to_string());
+            }
+        }
+    }
+    types
+}
+
+/// Coerce textual XML parameter content according to its declared schema type.
+pub fn coerce_by_schema_type(text: &str, declared_type: Option<&str>) -> Option<Value> {
+    match declared_type? {
+        "string" => Some(Value::String(
+            serde_json::from_str::<String>(text).unwrap_or_else(|_| text.to_string()),
+        )),
+        "integer" => text
+            .trim()
+            .parse::<i64>()
+            .ok()
+            .map(|value| Value::Number(value.into())),
+        "number" => serde_json::from_str::<Value>(text.trim())
+            .ok()
+            .filter(Value::is_number),
+        "boolean" => match text.trim() {
+            "true" | "True" => Some(Value::Bool(true)),
+            "false" | "False" => Some(Value::Bool(false)),
+            _ => None,
+        },
+        "object" | "array" => serde_json::from_str::<Value>(text).ok(),
+        _ => None,
+    }
+}
 
 /// Get a mapping of tool names to their indices
 pub fn get_tool_indices(tools: &[Tool]) -> HashMap<String, usize> {
@@ -78,7 +124,11 @@ pub fn ends_with_partial_token(buffer: &str, token: &str) -> Option<usize> {
         return None;
     }
 
-    (1..token.len()).find(|&i| buffer.ends_with(&token[..i]))
+    token
+        .char_indices()
+        .skip(1)
+        .map(|(index, _)| index)
+        .find(|&index| buffer.ends_with(&token[..index]))
 }
 
 /// Reset state for the current tool being parsed (used when skipping invalid tools).
@@ -137,7 +187,8 @@ pub fn ensure_capacity(
 
 /// Check if a string contains complete, valid JSON
 pub fn is_complete_json(input: &str) -> bool {
-    serde_json::from_str::<Value>(input).is_ok()
+    let mut deserializer = Deserializer::from_str(input);
+    IgnoredAny::deserialize(&mut deserializer).is_ok() && deserializer.end().is_ok()
 }
 
 /// Normalize the arguments/parameters field in a tool call object.
@@ -158,6 +209,23 @@ pub fn normalize_arguments_field(mut obj: Value) -> Value {
         }
     }
     obj
+}
+
+/// Normalize Cohere-style `tool_name` to the common `name` field.
+pub fn normalize_name_field(mut obj: Value) -> Value {
+    if obj.get("name").is_none() {
+        if let Some(name) = obj.get("tool_name").cloned() {
+            if let Value::Object(ref mut map) = obj {
+                map.insert("name".to_string(), name);
+            }
+        }
+    }
+    obj
+}
+
+/// Normalize all supported aliases used by JSON-style tool calls.
+pub fn normalize_tool_call_fields(obj: Value) -> Value {
+    normalize_arguments_field(normalize_name_field(obj))
 }
 
 /// Handle the entire JSON tool call streaming process for JSON-based parsers.
@@ -228,10 +296,13 @@ pub(crate) fn handle_json_tool_streaming(
             .find(|&i| json_str.is_char_boundary(i))
             .unwrap_or(0)
     };
-    let is_complete = serde_json::from_str::<Value>(&json_str[..safe_end_idx]).is_ok();
+    let is_complete = is_complete_json(&json_str[..safe_end_idx]);
+
+    // Normalize before validation because some formats use tool_name/parameters.
+    let current_tool_call = normalize_tool_call_fields(obj);
 
     // Validate tool name if present
-    if let Some(name) = obj.get("name").and_then(|v| v.as_str()) {
+    if let Some(name) = current_tool_call.get("name").and_then(|v| v.as_str()) {
         if !tool_indices.contains_key(name) {
             // Invalid tool name - skip this tool, preserve indexing for next tool
             tracing::debug!("Invalid tool name '{}' - skipping", name);
@@ -244,9 +315,6 @@ pub(crate) fn handle_json_tool_streaming(
             return Ok(StreamingParseResult::default());
         }
     }
-
-    // Normalize parameters/arguments field
-    let current_tool_call = normalize_arguments_field(obj);
 
     let mut result = StreamingParseResult::default();
 
@@ -363,6 +431,18 @@ mod tests {
     }
 
     #[test]
+    fn test_ends_with_partial_token_multibyte() {
+        let token = "<｜tool_calls_begin｜>";
+        assert_eq!(ends_with_partial_token("plain text", token), None);
+        assert_eq!(ends_with_partial_token("hello <", token), Some(1));
+        assert_eq!(ends_with_partial_token("hello <｜", token), Some(4));
+        assert_eq!(
+            ends_with_partial_token("x <｜tool_calls_begin｜>", token),
+            None
+        );
+    }
+
+    #[test]
     fn test_reset_current_tool_state() {
         let mut buffer = String::from("partial json");
         let mut current_tool_name_sent = true;
@@ -457,6 +537,7 @@ mod tests {
         assert!(is_complete_json("true"));
         assert!(!is_complete_json(r#"{"name": "#));
         assert!(!is_complete_json("[1, 2,"));
+        assert!(!is_complete_json(r#"{"name":"test"} trailing"#));
     }
 
     #[test]
@@ -484,6 +565,22 @@ mod tests {
         let obj = serde_json::json!({"name": "test"});
         let normalized = normalize_arguments_field(obj.clone());
         assert_eq!(normalized, obj);
+    }
+
+    #[test]
+    fn test_schema_type_coercion() {
+        assert_eq!(
+            coerce_by_schema_type("4", Some("string")),
+            Some(serde_json::json!("4"))
+        );
+        assert_eq!(
+            coerce_by_schema_type("4", Some("integer")),
+            Some(serde_json::json!(4))
+        );
+        assert_eq!(
+            coerce_by_schema_type("9007199254740993", Some("number")),
+            Some(serde_json::json!(9007199254740993i64))
+        );
     }
 }
 

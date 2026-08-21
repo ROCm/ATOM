@@ -60,6 +60,7 @@ mod coder {
     /// Decode HTML entities in a string (equivalent to Python's html.unescape)
     ///
     /// Handles common HTML entities like &amp; &lt; &gt; &quot; &#39; and numeric entities
+    #[cfg(test)]
     fn html_unescape(s: &str) -> String {
         let mut result = String::with_capacity(s.len());
         let mut chars = s.chars().peekable();
@@ -134,15 +135,15 @@ mod coder {
     /// 2. Try to parse as JSON (numbers, booleans, null, objects, arrays)
     /// 3. Fall back to string if JSON parsing fails
     fn safe_val(raw: &str) -> Value {
-        let unescaped = html_unescape(raw.trim());
+        let trimmed = raw.trim();
 
         // Try JSON parsing first
-        if let Ok(v) = serde_json::from_str::<Value>(&unescaped) {
+        if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
             return v;
         }
 
         // Handle Python-style literals (True, False, None)
-        match unescaped.as_str() {
+        match trimmed {
             "True" => return Value::Bool(true),
             "False" => return Value::Bool(false),
             "None" => return Value::Null,
@@ -150,7 +151,11 @@ mod coder {
         }
 
         // Fall back to string
-        Value::String(unescaped)
+        Value::String(trimmed.to_string())
+    }
+
+    fn coerce_value(raw: &str, declared_type: Option<&str>) -> Value {
+        helpers::coerce_by_schema_type(raw.trim(), declared_type).unwrap_or_else(|| safe_val(raw))
     }
 
     impl QwenCoderParser {
@@ -184,7 +189,11 @@ mod coder {
         }
 
         /// Parse XML format tool call: <function=name><parameter=key>value</parameter></function>
-        fn parse_xml_format(&self, content: &str) -> ParserResult<Option<ToolCall>> {
+        fn parse_xml_format(
+            &self,
+            content: &str,
+            tools: &[Tool],
+        ) -> ParserResult<Option<ToolCall>> {
             let function_captures = self
                 .xml_function_pattern
                 .captures(content)
@@ -203,13 +212,14 @@ mod coder {
                 return Ok(None);
             }
 
+            let param_types = helpers::param_types_for_function(tools, &function_name);
             let mut parameters = serde_json::Map::new();
 
             for cap in self.xml_param_pattern.captures_iter(content) {
                 if let (Some(key_match), Some(value_match)) = (cap.get(1), cap.get(2)) {
                     let key = key_match.as_str().trim().to_string();
                     let value = value_match.as_str();
-                    let json_value = safe_val(value);
+                    let json_value = coerce_value(value, param_types.get(&key).map(String::as_str));
                     parameters.insert(key, json_value);
                 }
             }
@@ -227,8 +237,9 @@ mod coder {
 
         /// Parse and stream complete parameters from buffer
         /// Returns tool call items to emit (similar to Python's _parse_and_stream_parameters)
-        fn parse_and_stream_parameters(&mut self) -> ParserResult<Vec<ToolCallItem>> {
+        fn parse_and_stream_parameters(&mut self, tools: &[Tool]) -> Vec<ToolCallItem> {
             let mut calls: Vec<ToolCallItem> = vec![];
+            let param_types = helpers::param_types_for_function(tools, &self.current_function_name);
 
             // Find all complete parameter patterns in buffer
             let mut new_params = serde_json::Map::new();
@@ -236,7 +247,7 @@ mod coder {
                 if let (Some(key_match), Some(value_match)) = (cap.get(1), cap.get(2)) {
                     let key = key_match.as_str().trim().to_string();
                     let value = value_match.as_str();
-                    let json_value = safe_val(value);
+                    let json_value = coerce_value(value, param_types.get(&key).map(String::as_str));
                     new_params.insert(key, json_value);
                 }
             }
@@ -300,7 +311,38 @@ mod coder {
                 }
             }
 
-            Ok(calls)
+            calls
+        }
+
+        fn parse_complete_inner(
+            &self,
+            text: &str,
+            tools: &[Tool],
+        ) -> ParserResult<(String, Vec<ToolCall>)> {
+            if !self.has_tool_markers(text) {
+                return Ok((text.to_string(), vec![]));
+            }
+
+            let Some(idx) = text.find(self.tool_call_start_token) else {
+                return Ok((text.to_string(), vec![]));
+            };
+            let normal_text = text[..idx].to_string();
+            let mut parsed = Vec::new();
+            for captures in self.extractor.captures_iter(text) {
+                if let Some(content) = captures.get(1) {
+                    match self.parse_xml_format(content.as_str().trim(), tools) {
+                        Ok(Some(tool)) => parsed.push(tool),
+                        Ok(None) => {}
+                        Err(error) => {
+                            tracing::warn!("Failed to parse XML tool call: {:?}", error);
+                        }
+                    }
+                }
+            }
+            if parsed.is_empty() {
+                return Ok((text.to_string(), vec![]));
+            }
+            Ok((normal_text, parsed))
         }
 
         /// Reset streaming state for next tool call
@@ -321,38 +363,15 @@ mod coder {
     #[async_trait]
     impl ToolParser for QwenCoderParser {
         async fn parse_complete(&self, text: &str) -> ParserResult<(String, Vec<ToolCall>)> {
-            // Check if text contains Qwen Coder format
-            if !self.has_tool_markers(text) {
-                return Ok((text.to_string(), vec![]));
-            }
+            self.parse_complete_inner(text, &[])
+        }
 
-            // Find where the first tool call begins
-            let idx = text.find(self.tool_call_start_token).unwrap();
-            let normal_text = text[..idx].to_string();
-
-            // Extract tool calls
-            let mut tools = Vec::new();
-            for captures in self.extractor.captures_iter(text) {
-                if let Some(content_str) = captures.get(1) {
-                    let content = content_str.as_str().trim();
-
-                    match self.parse_xml_format(content) {
-                        Ok(Some(tool)) => tools.push(tool),
-                        Ok(None) => continue,
-                        Err(e) => {
-                            tracing::warn!("Failed to parse XML tool call: {:?}", e);
-                            continue;
-                        }
-                    }
-                }
-            }
-
-            // If no tools were successfully parsed despite having markers, return entire text
-            if tools.is_empty() {
-                return Ok((text.to_string(), vec![]));
-            }
-
-            Ok((normal_text, tools))
+        async fn parse_complete_with_tools(
+            &self,
+            text: &str,
+            tools: &[Tool],
+        ) -> ParserResult<(String, Vec<ToolCall>)> {
+            self.parse_complete_inner(text, tools)
         }
 
         async fn parse_incremental(
@@ -454,7 +473,7 @@ mod coder {
 
                 // Parse parameters (only complete ones)
                 if self.current_tool_name_sent {
-                    let param_calls = self.parse_and_stream_parameters()?;
+                    let param_calls = self.parse_and_stream_parameters(tools);
                     calls.extend(param_calls);
 
                     // Check if tool call is complete
@@ -584,11 +603,14 @@ mod coder {
         }
 
         #[test]
-        fn test_safe_val_html_entities() {
-            assert_eq!(safe_val("&lt;div&gt;"), Value::String("<div>".to_string()));
+        fn test_safe_val_preserves_html_entities() {
+            assert_eq!(
+                safe_val("&lt;div&gt;"),
+                Value::String("&lt;div&gt;".to_string())
+            );
             assert_eq!(
                 safe_val("Tom &amp; Jerry"),
-                Value::String("Tom & Jerry".to_string())
+                Value::String("Tom &amp; Jerry".to_string())
             );
         }
     }
