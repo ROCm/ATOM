@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1787243964262,
+  "lastUpdate": 1787331777570,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -1757,6 +1757,63 @@ window.BENCHMARK_DATA = {
             "value": 0.884,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/32390560122 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202608201458 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.3904 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "haoyangli0109",
+            "username": "haoyangli0109",
+            "email": "lihaoyang0109@gmail.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "fa5efe5cbbcdbd8502170fe6dd5fbefd47ed8b15",
+          "message": "[Feature] Quantize weights online when loading weights (#1749)\n\n* support streaming onine quantization\n\nSigned-off-by: Haoyang Li <lihaoyang0109@gmail.com>\n\n* fix ep mode\n\nSigned-off-by: Haoyang Li <lihaoyang0109@gmail.com>\n\n* comment\n\nSigned-off-by: Haoyang Li <lihaoyang0109@gmail.com>\n\n* fix test\n\nSigned-off-by: Haoyang Li <lihaoyang0109@gmail.com>\n\n* for ci error\n\nSigned-off-by: Haoyang Li <lihaoyang0109@gmail.com>\n\n* fix(loader): isolate expert staging from quant streaming\n\nKeep expert batching enabled for parameters not managed by the online quant streamer, preventing excluded MoE experts from falling back to thousands of small H2D copies. Add tests covering mixed streamer and expert staging paths.\n\nSigned-off-by: Haoyang Li <lihaoyang0109@gmail.com>\n\n* fix(loader): defer child quantization until parent post-processing for kimi-k3\n\nSigned-off-by: Haoyang Li <lihaoyang0109@gmail.com>\n\n* fix compile err\n\nSigned-off-by: Haoyang Li <lihaoyang0109@gmail.com>\n\n---------\n\nSigned-off-by: Haoyang Li <lihaoyang0109@gmail.com>",
+          "timestamp": "2026-08-21T10:00:44Z",
+          "url": "https://github.com/ROCm/ATOM/commit/fa5efe5cbbcdbd8502170fe6dd5fbefd47ed8b15"
+        },
+        "date": 1787331744696,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.9469,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/32501597679 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202608211514 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9439 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP accuracy (GSM8K)",
+            "value": 0.9484,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/32501597679 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202608211514 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9492 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP MTP acceptance (%)",
+            "value": 66.13,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/32501597679 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202608211514 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9492 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP avg toks/fwd (tok/fwd)",
+            "value": 2.98,
+            "unit": "tok/fwd"
+          },
+          {
+            "name": "ATOMesh::Meta-Llama-3-8B-Instruct accuracy (GSM8K)",
+            "value": 0.7483,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/32501597679 | Threshold: 0.73 | Baseline: 0.75 | BaselineModel: meta-llama/Meta-Llama-3-8B-Instruct | BaselineNote: HF reports 0.796 but 8-shot CoT; CI uses 3-shot, not comparable | Docker: rocm/atom-dev:nightly_202608211514 | GPU: AMD Instinct MI355X | VRAM: 252GB | ROCm: 7.2.4 | strict-match: 0.7468 | fewshot: 3 | Model: /models/meta-llama/Meta-Llama-3-8B-Instruct"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.887,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/32501597679 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202608211514 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.3184 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
