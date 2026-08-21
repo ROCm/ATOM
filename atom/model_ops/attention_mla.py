@@ -362,19 +362,18 @@ class MLAAttention(nn.Module):
 
         self.min_query_heads = kwargs.get("min_query_heads", _MLA_MIN_HEADS)
         self.padded_num_heads = max(num_heads, self.min_query_heads)
-        self.head_repeat_factor = 1
-        self.head_pad = 0
-        if self.padded_num_heads != num_heads:
-            if self.padded_num_heads % num_heads == 0:
-                self.head_repeat_factor = self.padded_num_heads // num_heads
-                if not getattr(MLAAttention, "_head_repeat_logged", False):
-                    MLAAttention._head_repeat_logged = True
-                    logger.info(
-                        f"MLA head repeat enabled: {num_heads} -> {self.padded_num_heads} "
-                        f"(repeat factor {self.head_repeat_factor})"
-                    )
-            else:
-                self.head_pad = self.padded_num_heads - num_heads
+        # Heads past num_heads are dead lanes: the MLA kernels compute them and
+        # `_restore_query_heads` throws them away. They are zeros rather than
+        # repeats of the real heads because zeros are what a producer can write
+        # once, up front -- under `_fused_q_head_pad` the fused q writer fills a
+        # slice of an already-zeroed padded buffer, which a repeat could not do
+        # (no producer kernel writes a head twice).
+        self.head_pad = self.padded_num_heads - num_heads
+        if self.head_pad and not getattr(MLAAttention, "_head_pad_logged", False):
+            MLAAttention._head_pad_logged = True
+            logger.info(
+                f"MLA query-head padding: {num_heads} -> {self.padded_num_heads}"
+            )
 
         self.q_lora_rank = mla_modules.q_lora_rank
         self.kv_lora_rank = mla_modules.kv_lora_rank
@@ -525,6 +524,20 @@ class MLAAttention(nn.Module):
                 self.dcp_kernel_num_heads - self.num_heads * dcp_world_size
             )
 
+        # Fold the query-head pad into the fused q write instead of paying a
+        # separate pad kernel per layer: allocate q_out at the padded width and
+        # hand the writer the real-head slice, which it fills through the
+        # runtime q_out strides it already takes. Restricted to the plain aiter
+        # write -- the seg and shuffled-KV kernels own byte layouts this has not
+        # been checked against, and under DCP q_out is all-gathered on the head
+        # dim, so the pad must go on after the gather, not before it.
+        self._fused_q_head_pad = (
+            self.head_pad > 0
+            and dcp_world_size <= 1
+            and not self.use_seg_mla
+            and not (self.use_triton_mla and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV)
+        )
+
     def _pad_decode_query_heads(self, q: torch.Tensor) -> torch.Tensor:
         """Head padding for the decode kernel. Under DCP q arrives already
         gathered across the DCP group, so it is that width -- not the per-rank
@@ -546,8 +559,6 @@ class MLAAttention(nn.Module):
         return self._restore_query_heads(x, num_heads)
 
     def _pad_query_heads(self, q: torch.Tensor) -> torch.Tensor:
-        if self.head_repeat_factor > 1:
-            return q.repeat_interleave(self.head_repeat_factor, dim=1)
         if self.head_pad > 0:
             return torch.nn.functional.pad(q, (0, 0, 0, self.head_pad))
         return q
@@ -555,10 +566,14 @@ class MLAAttention(nn.Module):
     def _restore_query_heads(
         self, output: torch.Tensor, num_heads: int | None = None
     ) -> torch.Tensor:
-        if self.head_repeat_factor > 1:
-            return output[:, :: self.head_repeat_factor, ...].contiguous()
+        """Drop the dead pad lanes off an MLA output or per-head LSE.
+
+        Returns a view, not a copy: the only consumer is the v-up bmm, which
+        takes its operand strides at runtime and reads the real heads in place.
+        Materialising them instead costs a full-output copy per layer.
+        """
         if self.head_pad > 0:
-            return output[:, : (num_heads or self.num_heads), ...].contiguous()
+            return output[:, : (num_heads or self.num_heads), ...]
         return output
 
     def _seg_kv_cache_view(self, kv_cache: torch.Tensor) -> torch.Tensor:
@@ -622,8 +637,14 @@ class MLAAttention(nn.Module):
 
     @mark_trace(prefix="v_up_proj_and_o_proj", torch_compile=False)
     def _v_up_proj_and_o_proj(self, x):
+        # Under query-head padding `x` is a stride view of the padded attention
+        # output (see _restore_query_heads), so reshape it only when it is not
+        # already [tokens, num_heads, kv_lora_rank] -- a view() would reject the
+        # padded stride and a reshape() would reintroduce the unpad copy.
+        if x.dim() != 3:
+            x = x.view(-1, self.num_heads, self.kv_lora_rank)
         # Convert from (B, N, L) to (N, B, L)
-        x = x.view(-1, self.num_heads, self.kv_lora_rank).transpose(0, 1)
+        x = x.transpose(0, 1)
         # Multiply (N, B, L) x (N, L, V) -> (N, B, V), Convert from (N, B, V) to (B, N, V)
         # x = torch.bmm(x, self.W_UV).transpose(0, 1)
         # Convert from (B, N, L) to (N, B, L)
@@ -1231,12 +1252,18 @@ class MLAAttention(nn.Module):
         kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: AttentionMetaData,
         return_lse: bool = False,
+        q_prepadded: bool = False,
     ) -> torch.Tensor:
         assert attn_metadata is not None
         B = q.shape[0]
-        num_heads_q = q.shape[1]
 
-        q = self._pad_query_heads(q)
+        if q_prepadded:
+            # The fused q write already produced the padded width, so q.shape[1]
+            # is the kernel width and the real head count is this rank's own.
+            num_heads_q = self.num_heads
+        else:
+            num_heads_q = q.shape[1]
+            q = self._pad_query_heads(q)
 
         # In the seg path q arrives with a padded per-head row stride
         # (_MLA_Q_OUT_PADDED_DIM); slice back to the logical
@@ -1367,7 +1394,9 @@ class MLAAttention(nn.Module):
                 o = torch.where(
                     torch.isfinite(final_lse).unsqueeze(-1), o, torch.zeros_like(o)
                 )
-            return o, final_lse
+            # These feed a cross-rank combine, not the bmm, so the head slice
+            # has to be materialised rather than left as a view.
+            return o.contiguous(), final_lse.contiguous()
 
         return self._v_up_proj_and_o_proj(o)
 
@@ -1398,6 +1427,7 @@ class MLAAttention(nn.Module):
         kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: AttentionMetaData,
         return_lse: bool = False,
+        q_prepadded: bool = False,
     ) -> torch.Tensor:
         # attn_metadata.causal is True for the target; False only for DSpark's
         # bidirectional draft block (set by the proposer). The asm kernel picks
@@ -1406,9 +1436,14 @@ class MLAAttention(nn.Module):
         assert kv_c_and_k_pe_cache.numel() > 0
         assert attn_metadata is not None
         B = q.shape[0]
-        num_heads_q = q.shape[1]
 
-        q = self._pad_decode_query_heads(q)
+        if q_prepadded:
+            # The fused q write already produced the padded width, so q.shape[1]
+            # is the kernel width and the real head count is this rank's own.
+            num_heads_q = self.num_heads
+        else:
+            num_heads_q = q.shape[1]
+            q = self._pad_decode_query_heads(q)
 
         # In the seg path q arrives with a padded per-head row stride
         # (_MLA_Q_OUT_PADDED_DIM); slice back to the logical
@@ -1618,7 +1653,8 @@ class MLAAttention(nn.Module):
             final_lse = self._restore_decode_query_heads(final_lse, num_heads_q)
 
         if return_lse:
-            return o, final_lse
+            # Bound for a cross-rank combine rather than the bmm: materialise.
+            return o.contiguous(), final_lse.contiguous()
 
         return self._v_up_proj_and_o_proj(o)
 
@@ -1886,6 +1922,20 @@ class MLAAttention(nn.Module):
                     dtype=attn_metadata.dtype_q,
                     device=q_nope.device,
                 )
+            elif self._fused_q_head_pad:
+                # Allocate at the width the MLA kernels dispatch on, zeroed so
+                # the dead lanes match what F.pad used to produce, and let the
+                # fused write below fill the real-head slice in place. `q_out`
+                # therefore reaches attention already padded.
+                q_out = torch.zeros(
+                    (
+                        q_nope.shape[0],
+                        self.padded_num_heads,
+                        self.kv_lora_rank + self.qk_rope_head_dim,
+                    ),
+                    dtype=attn_metadata.dtype_q,
+                    device=q_nope.device,
+                )
             else:
                 q_out = torch.empty(
                     (
@@ -1896,6 +1946,12 @@ class MLAAttention(nn.Module):
                     dtype=attn_metadata.dtype_q,
                     device=q_nope.device,
                 )
+            # What the fused writer fills: the real heads only. Under
+            # `_fused_q_head_pad` that is a slice of the padded buffer above,
+            # reached through the kernel's runtime q_out strides.
+            q_out_write = (
+                q_out[:, : self.num_heads] if self._fused_q_head_pad else q_out
+            )
             if kv_cache.numel() > 0:
                 if (
                     envs.ATOM_USE_TRITON_MLA
@@ -1952,7 +2008,7 @@ class MLAAttention(nn.Module):
                             -1,
                             self.kv_lora_rank + self.qk_rope_head_dim,
                         ),
-                        q_out,
+                        q_out_write,
                         write_slot_mapping,
                         self._k_scale,
                         self._q_scale,
@@ -2003,7 +2059,12 @@ class MLAAttention(nn.Module):
                         ).to(o.dtype)
                     output = self._v_up_proj_and_o_proj(o)
                 else:
-                    output = self._forward_prefill_mla(q_out, kv_cache, attn_metadata)
+                    output = self._forward_prefill_mla(
+                        q_out,
+                        kv_cache,
+                        attn_metadata,
+                        q_prepadded=self._fused_q_head_pad,
+                    )
             elif self.dcp_world_size > 1:
                 # DCP decode: AllGather Q on the head dim, decode locally with LSE,
                 # then combine partial outputs across ranks (AG LSE + correct + RS).
@@ -2022,7 +2083,12 @@ class MLAAttention(nn.Module):
                 o = cp_lse_ag_out_rs(o, lse, self.dcp_group, ctx=self._cp_triton_ctx)
                 output = self._v_up_proj_and_o_proj(o)
             else:
-                output = self._forward_decode(q_out, kv_cache, attn_metadata)
+                output = self._forward_decode(
+                    q_out,
+                    kv_cache,
+                    attn_metadata,
+                    q_prepadded=self._fused_q_head_pad,
+                )
 
         return output
 
