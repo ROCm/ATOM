@@ -9,8 +9,9 @@ Enable via ``--kv-transfer-config '{"kv_connector":"lmcache_offload","kv_role":"
 plus LMCache env (``LMCACHE_LOCAL_CPU=True``, ``LMCACHE_MAX_LOCAL_CPU_SIZE``,
 ``LMCACHE_CHUNK_SIZE=256``, optional ``LMCACHE_LOCAL_DISK`` for the NVMe L3 tier).
 
-For GLM-5.2 MP mode, start ``lmcache server`` and select
-``{"kv_connector":"lmcache_mp","kv_role":"offload"}`` instead.
+For standalone MP mode, start ``lmcache server`` and select
+``{"kv_connector":"lmcache_mp","kv_role":"offload"}``; the public connector
+selects its model-specific implementation from the model configuration.
 """
 
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
@@ -28,9 +29,9 @@ KVConnectorFactory.register(
 KVConnectorFactory.register(
     "lmcache_mp",
     worker_module="atom.kv_transfer.offload.mp.connector",
-    worker_class="GLM52LMCacheMPConnector",
+    worker_class="LMCacheMPConnector",
     scheduler_module="atom.kv_transfer.offload.mp.connector",
-    scheduler_class="GLM52LMCacheMPConnectorScheduler",
+    scheduler_class="LMCacheMPConnectorScheduler",
     aliases=("LMCacheMPConnector",),
     requires_pd_staging=False,
 )

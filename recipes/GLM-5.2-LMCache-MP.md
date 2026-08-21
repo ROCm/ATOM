@@ -28,6 +28,10 @@ rank-local retrieve failures visible.
 - LMCache native ATOM MP API from
   [LMCache#4662](https://github.com/LMCache/LMCache/pull/4662)
 
+`lmcache_mp` is the stable public connector name. Its plugin registry discovers
+the `atom.kv_transfer.offload.mp.glm52` implementation for
+`model_type == "glm_moe_dsa"`.
+
 ATOM's Docker images install the v0.5.3 ROCm wheel for its prebuilt storage
 extensions, then overlay the complete Python package from the pinned
 LMCache#4662 revision and rebuild both `lmcache_native` and the HIP `c_ops`

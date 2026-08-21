@@ -22,7 +22,7 @@ from atom.kv_transfer.offload.metadata import (
     LoadSpec,
     SaveSpec,
 )
-from atom.kv_transfer.offload.mp import connector as mp_connector
+from atom.kv_transfer.offload.mp.glm52 import connector as mp_connector
 
 
 def _config(
