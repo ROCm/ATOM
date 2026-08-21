@@ -262,13 +262,23 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # kernel and stays non-persistent, where this metadata is unused); scale
         # by dcp only there so gfx942 keeps the original per-rank head sizing.
         dcp_persistent = dcp_persistent_supported()
+        self.sparse_dcp_metadata_rebuild = (
+            self.is_sparse
+            and self.dcp_world_size > 1
+            and dcp_persistent
+            and self.block_size == 1
+            and config.speculative_config is None
+        )
         if self.dcp_world_size > 1 and dcp_persistent:
             self.persistent_num_heads = mla_dcp_kernel_num_heads(
                 self.num_attention_heads,
                 self.dcp_world_size,
                 kv_cache_dtype=config.kv_cache_dtype,
                 persistent=mla_dcp_decode_is_persistent(
-                    self.is_sparse, self.dcp_world_size, dcp_persistent
+                    self.is_sparse,
+                    self.dcp_world_size,
+                    dcp_persistent,
+                    sparse_metadata_rebuild=self.sparse_dcp_metadata_rebuild,
                 ),
             )
         else:
@@ -371,6 +381,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 dtype=torch.int32,
                 device=self.device,
             )
+            sparse_prefill_num_heads = (
+                self.persistent_num_heads
+                if self.sparse_dcp_metadata_rebuild
+                else self.padded_num_attention_heads
+            )
             (
                 (spp_wmd_size, spp_wmd_type),
                 (spp_wi_size, spp_wi_type),
@@ -381,7 +396,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             ) = get_mla_metadata_info_v1(
                 self.max_num_batched_tokens,
                 1,  # sparse prefill treats each query token as q_len=1
-                self.padded_num_attention_heads,
+                sparse_prefill_num_heads,
                 self.dtype_q,
                 self.dtype_kv,
                 is_sparse=True,
