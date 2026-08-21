@@ -564,6 +564,8 @@ class MLAAttention(nn.Module):
             and get_current_atom_config().dcp_config.enable_project_before_merge
             and not is_rocm_aiter_fp4bmm_enabled()
         )
+        # Which collective pattern the output merge uses; see _cp_merge.
+        self.dcp_comm_backend = get_current_atom_config().dcp_config.comm_backend
 
         # Row view of q_proj used by prefill; see _local_q_proj. Initialized here
         # rather than in process_weights_after_loading so it exists no matter
@@ -744,6 +746,20 @@ class MLAAttention(nn.Module):
             )
             self._qrep_local_src = w
         return self._qrep_local_proj
+
+    def _cp_merge(self, o, lse, ctx=None):
+        """Reconstruct the global softmax from the per-rank partials.
+
+        Both backends compute the same weighted sum over KV shards and leave
+        this rank owning the same head slice; they differ only in how many
+        collectives it takes. See the A2A section in ``dcp_ops`` for why one
+        all-to-all can replace AllGather-LSE + ReduceScatter.
+        """
+        from atom.model_ops.dcp_ops import cp_lse_a2a, cp_lse_ag_out_rs
+
+        if self.dcp_comm_backend == "a2a":
+            return cp_lse_a2a(o, lse, self.dcp_group)
+        return cp_lse_ag_out_rs(o, lse, self.dcp_group, ctx=ctx)
 
     def _v_up_proj(self, x, W_V=None, W_V_scale=None, num_heads=None):
         """V up-projection only: ``[B, N, kv_lora_rank] -> [B, N, v_head_dim]``.
@@ -2163,8 +2179,6 @@ class MLAAttention(nn.Module):
                 if self.is_sparse_mla and self.dcp_world_size > 1:
                     # DCP sparse prefill: each rank holds a disjoint slice of the
                     # global top-k, so merge partials like decode.
-                    from atom.model_ops.dcp_ops import cp_lse_ag_out_rs
-
                     q_out = self.dcp_group.all_gather(q_out, dim=1)
                     o, lse = self._forward_prefill_mla(
                         q_out, kv_cache, attn_metadata, return_lse=True
@@ -2182,11 +2196,9 @@ class MLAAttention(nn.Module):
                     # ctx~32k with fp8 KV. Pay the fp32 upcast only where it buys
                     # something -- see dcp_prefill_merge_bf16_ok for the numbers.
                     if self.dcp_prefill_merge_bf16_ok:
-                        o = cp_lse_ag_out_rs(o, lse, self.dcp_group, ctx=None)
+                        o = self._cp_merge(o, lse)
                     else:
-                        o = cp_lse_ag_out_rs(
-                            o.float(), lse, self.dcp_group, ctx=None
-                        ).to(o.dtype)
+                        o = self._cp_merge(o.float(), lse).to(o.dtype)
                     if self.pbm_enabled:
                         output = self.o_proj(
                             o.reshape(-1, self.num_heads * self.v_head_dim)
@@ -2201,10 +2213,7 @@ class MLAAttention(nn.Module):
                 # QREP (use_qrep) skips the AllGather Q -- q_out already carries the
                 # full group head set from the replicated q_proj + W_K_qrep. The
                 # local decode, LSE merge and W_V path are identical either way.
-                from atom.model_ops.dcp_ops import (
-                    cp_lse_ag_out_rs,
-                    dcp_all_gather_query_heads,
-                )
+                from atom.model_ops.dcp_ops import dcp_all_gather_query_heads
 
                 # Only real heads cross the wire and enter the combine; the pad the
                 # kernel width needs lives inside _forward_decode (see
@@ -2221,7 +2230,7 @@ class MLAAttention(nn.Module):
                     o = self._v_up_proj(
                         o, self.W_V_dcp, self.W_V_dcp_scale, num_heads=o.shape[1]
                     )
-                o = cp_lse_ag_out_rs(o, lse, self.dcp_group, ctx=self._cp_triton_ctx)
+                o = self._cp_merge(o, lse, ctx=self._cp_triton_ctx)
                 if self.pbm_enabled:
                     output = self.o_proj(
                         o.reshape(-1, self.num_heads * self.v_head_dim)

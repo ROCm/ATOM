@@ -1392,21 +1392,30 @@ class EPLBConfig:
         return cls(**cfg)
 
 
+DCP_COMM_BACKENDS = ("ag_rs", "a2a")
+
+
 @dataclass
 class DCPConfig:
-    """DCP (Decode Context Parallel) sub-config: interleave granularity and
-    query replication; room for future knobs (all-to-all backend, ...) without
-    growing the top-level CLI surface."""
+    """DCP (Decode Context Parallel) sub-config: interleave granularity, query
+    replication, output-merge placement and the merge collective backend --
+    knobs that would otherwise each grow the top-level CLI surface."""
 
     interleave_size: int = 1
     enable_query_replication: bool = True
     enable_project_before_merge: bool = True
+    comm_backend: str = "a2a"
 
     def __post_init__(self):
         self.interleave_size = int(self.interleave_size)
         assert self.interleave_size >= 1, "dcp.interleave_size must be >= 1"
         self.enable_query_replication = bool(self.enable_query_replication)
         self.enable_project_before_merge = bool(self.enable_project_before_merge)
+        self.comm_backend = str(self.comm_backend)
+        assert self.comm_backend in DCP_COMM_BACKENDS, (
+            f"dcp.comm_backend must be one of {list(DCP_COMM_BACKENDS)}; "
+            f"got {self.comm_backend!r}"
+        )
 
     @classmethod
     def from_dict(cls, cfg: dict | None) -> "DCPConfig":

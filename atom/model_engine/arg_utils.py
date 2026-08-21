@@ -503,6 +503,12 @@ class EngineArgs:
                 "Costs a DCP-group copy of W_V. Covers decode and sparse "
                 "prefill; auto-disabled for fp4 / dcp<=1. Default TRUE -- "
                 "pass false explicitly for a control run.\n"
+                '  - "comm_backend": str, which collective pattern merges the '
+                "per-rank partial attention. 'a2a' (DEFAULT) = one all-to-all "
+                "with the LSE packed alongside the output, combine done "
+                "locally, 1 call. 'ag_rs' = AllGather LSE + local correct + "
+                "ReduceScatter output, 2 calls. Equivalent math, not bitwise "
+                "identical. Pass 'ag_rs' explicitly for a control run. \n"
                 "Example:\n"
                 """  '{"interleave_size": 16, "enable_query_replication": true}'"""
             ),

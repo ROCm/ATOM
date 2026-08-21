@@ -517,36 +517,144 @@ class _Spec:
     """Stand-in for a speculative_config; only its non-None-ness is read."""
 
 
+# ──────────────────────────────────────────────────── project-before-merge ──
+
+
+def _per_head_project(o, w):
+    """The V up-projection: ``[B, H, L] x [H, L, V] -> [B, H, V]``, per head."""
+    return torch.einsum("bhl,hlv->bhv", o, w)
+
+
+def _merge_partials(o_per_rank, lses):
+    """``cp_lse_ag_out_rs`` without the collectives: correct each rank, then sum.
+
+    ``correct_attn_out`` applies rank r's weight in place, and the ReduceScatter
+    that follows it in the real path is a plain sum across ranks -- the head-dim
+    scatter only decides who keeps which slice, it does not change values. So
+    summing here reproduces the merged result.
+    """
+    n = lses.shape[0]
+    acc = None
+    for r in range(n):
+        out_r, _ = correct_attn_out(o_per_rank[r].clone(), lses, r, ctx=None)
+        acc = out_r.clone() if acc is None else acc + out_r
+    return acc
+
+
+@needs_gpu
+@pytest.mark.parametrize("n_ranks", [2, 8])
+def test_projection_commutes_with_the_merge(n_ranks):
+    """The premise project-before-merge rests on.
+
+    The merge is a per-(token, head) SCALAR weighting followed by a sum across
+    ranks; the V up-projection is per-head LINEAR. A scalar commutes with a
+    linear map, and a linear map distributes over the sum, so projecting each
+    rank's partial and then merging must equal merging first and projecting the
+    result. That identity is what lets the merge exchange ``v_head_dim`` per
+    head instead of ``kv_lora_rank``.
+    """
+    b, h, latent, v_dim = 3, 8, 32, 16
+    g = torch.Generator(device=DEV).manual_seed(n_ranks)
+    o = torch.randn(n_ranks, b, h, latent, generator=g, device=DEV)
+    lses = torch.randn(n_ranks, b, h, generator=g, device=DEV)
+    w_v = torch.randn(h, latent, v_dim, generator=g, device=DEV)
+
+    merge_then_project = _per_head_project(_merge_partials(o, lses), w_v)
+    project_then_merge = _merge_partials(
+        torch.stack([_per_head_project(o[r], w_v) for r in range(n_ranks)]), lses
+    )
+
+    # Not bitwise: the two orders sum a different number of terms in a different
+    # sequence. fp32 tolerances, since that is what the kernel accumulates in.
+    torch.testing.assert_close(
+        project_then_merge, merge_then_project, rtol=1e-5, atol=1e-5
+    )
+
+
+@needs_gpu
+def test_projection_does_not_defeat_the_empty_rank_scrub():
+    """A rank owning no KV for a row returns ``o=NaN`` with ``lse=-inf``.
+
+    The merge kernel forces that contribution to zero (``factor == 0 -> 0``).
+    Projecting first puts a matmul in front of the scrub, and ``NaN`` through a
+    matmul is still ``NaN`` -- so the question is whether the scrub still catches
+    it. If it does not, one empty rank poisons EVERY rank's output for that row,
+    silently and with no fault raised.
+    """
+    b, h, latent, v_dim, n_ranks = 2, 4, 32, 16, 2
+    g = torch.Generator(device=DEV).manual_seed(7)
+    o = torch.randn(n_ranks, b, h, latent, generator=g, device=DEV)
+    lses = torch.randn(n_ranks, b, h, generator=g, device=DEV)
+    w_v = torch.randn(h, latent, v_dim, generator=g, device=DEV)
+
+    # Rank 0 owns nothing for row (0, 0): aiter's signature for that case.
+    o[0, 0, 0] = float("nan")
+    lses[0, 0, 0] = NEG_INF
+
+    projected = torch.stack([_per_head_project(o[r], w_v) for r in range(n_ranks)])
+    got = _merge_partials(projected, lses)
+    assert torch.isfinite(got).all(), "empty-rank NaN survived the projection"
+
+    # With rank 0 contributing nothing, the row must equal rank 1 alone -- whose
+    # weight is exp(lse_1 - logsumexp(lse_1)) == 1.
+    torch.testing.assert_close(got[0, 0], projected[1, 0, 0], rtol=1e-5, atol=1e-5)
+
+
 # ─────────────────────────────────────────────────────────── DCPConfig parsing ──
 
 
 def test_defaults():
     cfg = DCPConfig()
     assert cfg.interleave_size == 1
-    # Deliberately pinned: QREP ships enabled. Flipping this default is a
+    # Deliberately pinned: both ship enabled. Flipping either default is a
     # product decision, so it should require editing a test that says so.
+    # It also decides what "pass nothing" means for an A/B control arm, which
+    # is the way a default flip silently turns a comparison into a no-op.
     assert cfg.enable_query_replication is True
+    assert cfg.enable_project_before_merge is True
+    # a2a: measured faster than ag_rs on the decode shapes here. Pinned because
+    # it also decides what an A/B control arm gets when it passes nothing.
+    assert cfg.comm_backend == "a2a"
 
 
 def test_from_dict_parses_both_keys():
     cfg = DCPConfig.from_dict(
-        {"interleave_size": 16, "enable_query_replication": False}
+        {
+            "interleave_size": 16,
+            "enable_query_replication": False,
+            "enable_project_before_merge": False,
+            "comm_backend": "a2a",
+        }
     )
     assert cfg.interleave_size == 16
     assert cfg.enable_query_replication is False
+    assert cfg.enable_project_before_merge is False
+    assert cfg.comm_backend == "a2a"
 
 
 def test_from_dict_empty_and_none_give_defaults():
     for arg in (None, {}):
         cfg = DCPConfig.from_dict(arg)
-        assert (cfg.interleave_size, cfg.enable_query_replication) == (1, True)
+        assert (
+            cfg.interleave_size,
+            cfg.enable_query_replication,
+            cfg.enable_project_before_merge,
+            cfg.comm_backend,
+        ) == (1, True, True, "a2a")
 
 
 def test_from_dict_coerces_types():
     """JSON is permissive; the dataclass should not be."""
-    cfg = DCPConfig.from_dict({"interleave_size": "8", "enable_query_replication": 0})
+    cfg = DCPConfig.from_dict(
+        {
+            "interleave_size": "8",
+            "enable_query_replication": 0,
+            "enable_project_before_merge": 0,
+        }
+    )
     assert cfg.interleave_size == 8 and isinstance(cfg.interleave_size, int)
     assert cfg.enable_query_replication is False
+    assert cfg.enable_project_before_merge is False
 
 
 def test_from_dict_rejects_unknown_key():
@@ -563,6 +671,12 @@ def test_from_dict_rejects_the_old_flag_name():
     """
     with pytest.raises(ValueError, match="enable_dcp_query_replication"):
         DCPConfig.from_dict({"enable_dcp_query_replication": True})
+
+
+def test_comm_backend_rejects_unknown_value():
+    """A typo here would silently keep the default backend, so it must raise."""
+    with pytest.raises(AssertionError, match="comm_backend"):
+        DCPConfig.from_dict({"comm_backend": "all2all"})
 
 
 def test_interleave_size_must_be_positive():
