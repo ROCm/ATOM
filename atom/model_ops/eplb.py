@@ -153,29 +153,63 @@ def _build_logical_to_physical_map(
     ), "physical_rank shape must match physical_to_logical"
     _, num_logical = logcnt.shape
     cur = int(logcnt.max().item())
-    p2l_rows = physical_to_logical.cpu().tolist()
-    prank_rows = physical_rank.cpu().tolist()
-    logcnt_rows = logcnt.cpu().tolist()
-    out_rows: list[list[list[int]]] = []
-    for layer in range(num_layers):
-        p2l_l = p2l_rows[layer]
-        prank_l = prank_rows[layer]
-        cnt_l = logcnt_rows[layer]
-        row = [[-1] * cur for _ in range(num_logical)]
-        for p in range(num_physical):
-            e = p2l_l[p]
-            rank = prank_l[p]
-            assert 0 <= rank < cnt_l[e], "physical rank out of logical expert range"
-            assert row[e][rank] == -1, "duplicate physical rank for logical expert"
-            row[e][rank] = p
-        for e in range(num_logical):
-            need = cnt_l[e]
-            if need == 0:
-                continue
-            got = sum(1 for r in range(need) if row[e][r] >= 0)
-            assert got == need, "logical expert has missing physical ranks"
-        out_rows.append(row)
-    return torch.tensor(out_rows, dtype=torch.int32, device=physical_to_logical.device)
+    assert cur > 0, "every logical expert must have at least one replica"
+
+    p2l = physical_to_logical.to(torch.int64)
+    prank = physical_rank.to(torch.int64)
+    counts = logcnt.to(torch.int64)
+    device = physical_to_logical.device
+    layer = torch.arange(num_layers, dtype=torch.int64, device=device).unsqueeze(1)
+    linear = ((layer * num_logical + p2l) * cur + prank).flatten()
+    physical = (
+        torch.arange(num_physical, dtype=torch.int32, device=device)
+        .unsqueeze(0)
+        .expand(num_layers, -1)
+        .flatten()
+    )
+    out = torch.full(
+        (num_layers * num_logical * cur,),
+        -1,
+        dtype=torch.int32,
+        device=device,
+    )
+    out.scatter_(0, linear, physical)
+
+    return out.view(num_layers, num_logical, cur)
+
+
+def _primary_slots_by_rank_logical(
+    p2l: torch.Tensor, num_gpus: int, num_logical: int
+) -> torch.Tensor:
+    """Return the lowest physical slot for every (layer, rank, logical) pair."""
+    num_layers, num_physical = p2l.shape
+    num_local = num_physical // num_gpus
+    device = p2l.device
+    p2l64 = p2l.to(torch.int64)
+    valid = (p2l64 >= 0) & (p2l64 < num_logical)
+    safe_p2l = torch.where(valid, p2l64, torch.zeros_like(p2l64))
+    slots = torch.arange(num_physical, dtype=torch.int64, device=device)
+    ranks = slots // num_local
+    layer = torch.arange(num_layers, dtype=torch.int64, device=device).unsqueeze(1)
+    key = (
+        layer * (num_gpus * num_logical)
+        + ranks.unsqueeze(0) * num_logical
+        + safe_p2l
+    )
+    primary = torch.full(
+        (num_layers * num_gpus * num_logical,),
+        num_physical,
+        dtype=torch.int64,
+        device=device,
+    )
+    primary.scatter_reduce_(
+        0,
+        key.flatten()[valid.flatten()],
+        slots.unsqueeze(0).expand(num_layers, -1).flatten()[valid.flatten()],
+        reduce="amin",
+        include_self=True,
+    )
+    return primary.view(num_layers, num_gpus, num_logical)
 
 
 def _alias_same_rank_replica_maps(
@@ -192,48 +226,29 @@ def _alias_same_rank_replica_maps(
     num_local = num_physical // num_gpus
     _, num_logical = logcnt.shape
 
+    assert num_local > 0
+    primary = _primary_slots_by_rank_logical(p2l, num_gpus, num_logical)
+    p2l64 = p2l.to(torch.int64)
+    slot = torch.arange(num_physical, dtype=torch.int64, device=p2l.device)
+    rank = slot // num_local
+    safe_p2l = p2l64.clamp_min(0)
+    primary_for_slot = primary[
+        torch.arange(num_layers, device=p2l.device).unsqueeze(1), rank, safe_p2l
+    ]
+    aliases = (p2l64 >= 0) & (slot.unsqueeze(0) != primary_for_slot)
     p2l_unique = p2l.clone()
-    p2l_rows = p2l.cpu().tolist()
-    cnt_rows = logcnt.cpu().tolist()
+    p2l_unique.masked_fill_(aliases, -1)
 
-    for layer in range(num_layers):
-        p2l_l = p2l_rows[layer]
-        cnt_l = cnt_rows[layer]
-
-        primary_by_rank_logical: dict[tuple[int, int], int] = {}
-        for p in range(num_physical):
-            logical = p2l_l[p]
-            if logical < 0:
-                continue
-            ep_rank = p // num_local
-            key = (ep_rank, logical)
-            cur = primary_by_rank_logical.get(key)
-            if cur is None or p < cur:
-                primary_by_rank_logical[key] = p
-
-        alias_to_primary: dict[int, int] = {}
-        for p in range(num_physical):
-            logical = p2l_l[p]
-            if logical < 0:
-                continue
-            ep_rank = p // num_local
-            primary = primary_by_rank_logical[(ep_rank, logical)]
-            if p != primary:
-                alias_to_primary[p] = primary
-                p2l_unique[layer, p] = -1
-
-        if not alias_to_primary:
-            continue
-
-        for logical in range(num_logical):
-            need = int(cnt_l[logical])
-            for replica_idx in range(need):
-                phys = int(l2p[layer, logical, replica_idx].item())
-                if phys >= 0:
-                    primary = alias_to_primary.get(phys)
-                    if primary is not None:
-                        l2p[layer, logical, replica_idx] = primary
-
+    l2p64 = l2p.to(torch.int64)
+    valid = (l2p64 >= 0) & (l2p64 < num_physical)
+    safe_phys = l2p64.clamp(0, num_physical - 1)
+    logical = torch.arange(num_logical, device=p2l.device).view(1, -1, 1)
+    physical_rank = safe_phys // num_local
+    layer = torch.arange(num_layers, device=p2l.device).view(-1, 1, 1)
+    primary_for_l2p = primary[
+        layer, physical_rank, logical.expand(num_layers, -1, l2p.shape[-1])
+    ]
+    l2p.copy_(torch.where(valid, primary_for_l2p.to(l2p.dtype), l2p64).to(l2p.dtype))
     return p2l_unique
 
 

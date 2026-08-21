@@ -66,6 +66,18 @@ def test_build_logical_to_physical_map_rejects_rank_out_of_logical_range():
         _build_logical_to_physical_map(p2l, phyrank, logcnt)
 
 
+def test_build_logical_to_physical_map_covers_expected_replica_slots():
+    p2l = torch.tensor([[0, 0, 0, 1]], dtype=torch.int32)
+    phyrank = torch.tensor([[2, 0, 1, 0]], dtype=torch.int32)
+    logcnt = torch.tensor([[3, 1]], dtype=torch.int32)
+    l2p = _build_logical_to_physical_map(p2l, phyrank, logcnt)
+
+    for logical in range(logcnt.shape[1]):
+        expected = torch.nonzero(p2l[0] == logical, as_tuple=False).flatten()
+        actual = l2p[0, logical, : int(logcnt[0, logical].item())]
+        assert torch.equal(torch.sort(actual).values, expected)
+
+
 def test_rebalance_experts_global_invariants():
     weight = torch.tensor([[8, 6, 2, 1], [1, 2, 6, 8]], dtype=torch.int32)
     p2l_raw, phyrank, logcnt = rebalance_experts(
