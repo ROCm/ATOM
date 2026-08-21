@@ -52,23 +52,31 @@ class ATOMLMCacheGPUConnector:
     def __init__(
         self,
         codec: ATOMKVByteCodec,
-        block_size: int,
+        hash_block_size: int,
         *,
         chunk_size: int | None = None,
     ) -> None:
+        """``hash_block_size`` is the number of GLOBAL tokens one block_table
+        entry spans -- ``block_size * dcp_world_size``, not the page size. The
+        two differ only under DCP, where a rank stores just the ``block_size``
+        interleaved tokens it owns out of that span. Token offsets are global
+        on both the save and load paths, so they must be divided by this span;
+        the bytes moved per entry stay one physical page (`bytes_per_block`).
+        """
         self.codec = codec
-        self.block_size = int(block_size)
-        if self.block_size <= 0:
-            raise ValueError("ATOM LMCache connector: block_size must be > 0")
-        self.chunk_size = int(chunk_size if chunk_size is not None else block_size)
+        self.hash_block_size = int(hash_block_size)
+        if self.hash_block_size <= 0:
+            raise ValueError("ATOM LMCache connector: hash_block_size must be > 0")
+        self.chunk_size = int(chunk_size if chunk_size is not None else hash_block_size)
         if self.chunk_size <= 0:
             raise ValueError("ATOM LMCache connector: chunk_size must be > 0")
-        if self.chunk_size % self.block_size != 0:
+        if self.chunk_size % self.hash_block_size != 0:
             raise ValueError(
-                "LMCache chunk size must be divisible by ATOM KV block size: "
-                f"chunk_size={self.chunk_size}, block_size={self.block_size}"
+                "LMCache chunk size must be divisible by ATOM KV hash block size: "
+                f"chunk_size={self.chunk_size}, "
+                f"hash_block_size={self.hash_block_size}"
             )
-        self._blocks_per_lmcache_chunk = self.chunk_size // self.block_size
+        self._blocks_per_lmcache_chunk = self.chunk_size // self.hash_block_size
         self._gpu_staging_chunk_bytes = (
             self._blocks_per_lmcache_chunk * self.codec.bytes_per_block
         )
@@ -150,13 +158,13 @@ class ATOMLMCacheGPUConnector:
             raise ValueError(
                 f"invalid LMCache token range for ATOM KV blocks: {start}:{end}"
             )
-        if start % self.block_size != 0:
+        if start % self.hash_block_size != 0:
             raise ValueError(
                 "LMCache chunk start must be ATOM block-aligned: "
-                f"start={start}, block_size={self.block_size}"
+                f"start={start}, hash_block_size={self.hash_block_size}"
             )
-        start_block = start // self.block_size
-        end_block = _cdiv(end, self.block_size)
+        start_block = start // self.hash_block_size
+        end_block = _cdiv(end, self.hash_block_size)
         if end_block > len(all_block_ids):
             raise ValueError(
                 "LMCache token range exceeds ATOM block table: "
@@ -199,7 +207,7 @@ class ATOMLMCacheGPUConnector:
                     f"nbytes={nbytes}, capacity={self._gpu_staging_chunk_bytes}, "
                     f"blocks={block_count}, max_blocks="
                     f"{self._blocks_per_lmcache_chunk}, chunk_size="
-                    f"{self.chunk_size}, block_size={self.block_size}"
+                    f"{self.chunk_size}, hash_block_size={self.hash_block_size}"
                 )
             chunks.append(
                 _TransferChunk(

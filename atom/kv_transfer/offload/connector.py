@@ -53,6 +53,21 @@ from atom.kv_transfer.offload.metadata import (
 logger = logging.getLogger("atom")
 
 
+def _hash_block_size(config) -> int:
+    """Global tokens spanned by one entry of a sequence's block table.
+
+    Under DCP an entry maps to a VIRTUAL block of ``block_size *
+    dcp_world_size`` global tokens: rank ``r`` holds only the positions ``p``
+    with ``p % dcp_world_size == r``, packed densely into its own
+    ``block_size``-slot page. So a token offset must be divided by this span to
+    land on the right entry, while the bytes behind that entry stay exactly one
+    physical page -- which is why `bytes_per_block` is left alone. Mirrors
+    `BlockManager.hash_block_size`; == block_size when DCP is off.
+    """
+    dcp = max(1, int(getattr(config, "decode_context_parallel_size", 1) or 1))
+    return int(config.kv_cache_block_size) * dcp
+
+
 # =====================================================================
 # Worker side
 # =====================================================================
@@ -69,7 +84,7 @@ class LMCacheOffloadConnector(KVConnectorBase):
         self.kv_role = kvc.get("kv_role", "offload")
         self._do_save = self.kv_role in ("offload", "kv_both", "kv_producer")
         self._do_load = self.kv_role in ("offload", "kv_both", "kv_consumer")
-        self.block_size = int(config.kv_cache_block_size)
+        self.hash_block_size = _hash_block_size(config)
         self.chunk_size: int | None = None
 
         # Copy daemons: keep GPU<->host copies off the RPC thread. SEPARATE
@@ -136,12 +151,12 @@ class LMCacheOffloadConnector(KVConnectorBase):
         base_meta = offcfg.build_lmcache_metadata(self._config, cfg, world, rank)
         meta = ATOMRawBytesLMCacheMetadata(
             base_meta,
-            atom_block_size=self.block_size,
+            atom_hash_block_size=self.hash_block_size,
             bytes_per_block=self._codec.bytes_per_block,
         )
         gpu_connector = ATOMLMCacheGPUConnector(
             self._codec,
-            self.block_size,
+            self.hash_block_size,
             chunk_size=self.chunk_size,
         )
 
@@ -173,12 +188,14 @@ class LMCacheOffloadConnector(KVConnectorBase):
             logger.warning("LMCache offload: lookup server not started: %s", e)
 
         logger.info(
-            "LMCache offload worker rank=%d: bytes_per_block=%d chunk=%d "
+            "LMCache offload worker rank=%d: bytes_per_block=%d "
+            "hash_block_size=%d chunk=%d "
             "gpu_staging_chunk_bytes=%d gpu_staging_buffer_chunks=%d "
             "gpu_staging_buffer_bytes=%d release_gpu_staging=%s "
             "save=%s load=%s",
             rank,
             self._codec.bytes_per_block,
+            self.hash_block_size,
             self.chunk_size,
             gpu_connector.gpu_staging_chunk_bytes,
             gpu_connector.gpu_staging_buffer_chunks,
@@ -881,7 +898,7 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         self._config = config
         kvc = getattr(config, "kv_transfer_config", {}) or {}
         self.kv_role = kvc.get("kv_role", "offload")
-        self.block_size = int(config.kv_cache_block_size)
+        self.hash_block_size = _hash_block_size(config)
         self.chunk_size: int | None = None
         self._lookup_client = None
 
