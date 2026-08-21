@@ -27,6 +27,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_RANK": lambda: int(os.getenv("ATOM_DP_RANK", "0")),
     "ATOM_DP_RANK_LOCAL": lambda: int(os.getenv("ATOM_DP_RANK_LOCAL", "0")),
     "ATOM_DP_SIZE": lambda: int(os.getenv("ATOM_DP_SIZE", "1")),
+    "ATOM_DP_SIZE_LOCAL": lambda: int(os.getenv("ATOM_DP_SIZE_LOCAL", "1")),
     "ATOM_DP_MASTER_IP": lambda: os.getenv("ATOM_DP_MASTER_IP", "127.0.0.1"),
     "ATOM_DP_MASTER_PORT": lambda: int(os.getenv("ATOM_DP_MASTER_PORT", "29500")),
     # Rendezvous base port; set per role when prefill/decode share a node.

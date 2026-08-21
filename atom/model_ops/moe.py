@@ -563,6 +563,13 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 "num_local_experts": moe.num_local_experts,
                 "num_experts_per_token": moe.experts_per_token,
                 "gpu_per_node": moe.moe_parallel_config.local_ep_size,
+                # The same probe the sync handle uses (aiter sets it from
+                # in_the_same_node_as). Sharing one source keeps prefill and
+                # decode on the same kernel type -- inferring it from
+                # `world_size <= 8` instead let them disagree on a 2-node x
+                # 4-GPU group, running IntraNode kernels across a boundary
+                # that has no P2P mapping.
+                "internode": all2all_manager.internode,
                 "data_type_itemsize": moe.in_dtype.itemsize,
                 "max_token_type_size": moe.in_dtype.itemsize,
                 "scale_type_size": scale_type_size,
@@ -570,7 +577,9 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             }
 
             tbo_mori_ops = None
-            sync_handle = handle  # IntraNode handle for prefill (sync path)
+            # Prefill (sync path). aiter picks its kernel from the same
+            # internode probe, so this is not necessarily IntraNode.
+            sync_handle = handle
             if is_async:
                 from atom.model_ops.fused_moe.mori_prepare_finalize import (
                     _NUM_TBO_UBATCHES,
