@@ -32,7 +32,7 @@ except ImportError:
 from aiter.dist.parallel_state import get_dp_group
 from aiter.mla import mla_decode_fwd, mla_prefill_fwd
 from aiter.ops.triton.attention.mla import (
-    mla_decode_fwd as triton_shuffle_mla_decode_fwd,
+    mla_decode_fwd as triton_mla_decode_fwd,
 )
 from aiter.ops.triton.fusions.fused_kv_cache import (
     fused_qk_rope_cat_and_cache_mla as triton_fused_qk_rope_cat_and_cache_mla,
@@ -111,8 +111,8 @@ mla_decode_fwd = mark_trace(mla_decode_fwd, prefix="mla_decode", torch_compile=F
 # ATOM_USE_TRITON_MLA and ATOM_USE_TRITON_MLA_SHUFFLE_KV:. Write kernels mirror the aiter
 # concat_and_cache / fused_qk_rope_concat_and_cache_mla but store the cache in
 # the shuffled layout the shuffled decode kernel reads back.
-triton_shuffle_mla_decode_fwd = mark_trace(
-    triton_shuffle_mla_decode_fwd, prefix="mla_decode_shuffle", torch_compile=False
+triton_mla_decode_fwd = mark_trace(
+    triton_mla_decode_fwd, prefix="mla_decode_triton", torch_compile=False
 )
 triton_cat_and_cache_mla = mark_trace(
     triton_cat_and_cache_mla, prefix="kv_cache_shuffle", torch_compile=False
@@ -398,6 +398,9 @@ class MLAAttention(nn.Module):
         self._k_scale_device = self._k_scale.to(
             torch.cuda.current_device(), non_blocking=True
         )
+        self._q_scale_device = self._q_scale.to(
+            torch.cuda.current_device(), non_blocking=True
+        )
         atom_config = get_current_atom_config()
         self._dpa_persistent_supported = supports_dpa_persistent_mode(
             atom_config,
@@ -496,6 +499,26 @@ class MLAAttention(nn.Module):
 
         self.dcp_persistent_supported = dcp_persistent_supported()
         self.dcp_prefill_merge_bf16_ok = dcp_prefill_merge_bf16_ok()
+        sparse_dcp = self.is_sparse_mla and self.dcp_world_size > 1
+        self.use_triton_mla_sparse_dcp = bool(
+            envs.ATOM_USE_TRITON_MLA_SPARSE_DCP and sparse_dcp
+        )
+        if sparse_dcp and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV:
+            raise RuntimeError(
+                "Sparse MLA + DCP cannot use ATOM_USE_TRITON_MLA_SHUFFLE_KV: "
+                "per-layer compacted CSR entries are physical token slots, not "
+                "dense shuffled blocks."
+            )
+        if sparse_dcp and self.use_triton_mla and not self.use_triton_mla_sparse_dcp:
+            raise RuntimeError(
+                "ATOM_USE_TRITON_MLA with sparse MLA + DCP would enter the dense "
+                "block-table path. Set ATOM_USE_TRITON_MLA_SPARSE_DCP=1 to use "
+                "the native CSR decode path, or disable ATOM_USE_TRITON_MLA."
+            )
+        if self.use_triton_mla_sparse_dcp and envs.ATOM_MLA_PAGE_SIZE != 1:
+            raise RuntimeError(
+                "ATOM_USE_TRITON_MLA_SPARSE_DCP requires ATOM_MLA_PAGE_SIZE=1"
+            )
 
         # Compacted per-layer sparse offsets for DCP decode; rebound by the
         # metadata builder to the shared buffer (see aiter_mla.py).
@@ -1420,10 +1443,61 @@ class MLAAttention(nn.Module):
 
         final_lse = None
 
-        if envs.ATOM_USE_TRITON_MLA and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV:
+        if self.use_triton_mla_sparse_dcp:
+            if not causal:
+                raise RuntimeError(
+                    "Native CSR sparse-DCP MLA currently supports causal decode only"
+                )
+            num_sparse_rows = q.shape[0]
+            if (
+                self.sparse_kv_indices_buffer is None
+                or self.dcp_sparse_kv_indptr_buffer is None
+                or self.dcp_owned_counts_buffer is None
+            ):
+                raise RuntimeError(
+                    "Sparse-DCP Triton MLA buffers were not rebound by the "
+                    "attention metadata builder"
+                )
+            sparse_cu_seqlens_q = getattr(
+                attn_metadata, "sparse_cu_seqlens_q", None
+            )
+            if sparse_cu_seqlens_q is None:
+                # Ordinary q_len=1 decode (including CUDA-graph capture) already
+                # has one query per sequence, so its regular cumsum is the CSR
+                # row cumsum. The sparse arange is only materialized for
+                # per-token prefill/MTP layouts.
+                sparse_cu_seqlens_q = attn_metadata.cu_seqlens_q
+            sparse_cu_seqlens_q = sparse_cu_seqlens_q[: num_sparse_rows + 1]
+            sparse_kv_indptr = self.dcp_sparse_kv_indptr_buffer[
+                : num_sparse_rows + 1
+            ]
+            owned_counts = self.dcp_owned_counts_buffer[:num_sparse_rows]
+            kv_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
+            o, final_lse = triton_mla_decode_fwd(
+                q=q,
+                kv_buffer=kv_buffer,
+                out=o,
+                cu_seqlens_q=sparse_cu_seqlens_q,
+                seqused_k=owned_counts,
+                max_seqlen_kv=int(self.topk_tokens),
+                block_tables=self.sparse_kv_indices_buffer,
+                softmax_scale=self.scale,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                causal=True,
+                q_descale=self._q_scale_device if q.element_size() == 1 else None,
+                kv_descale=(
+                    self._k_scale_device
+                    if kv_c_and_k_pe_cache.element_size() == 1
+                    else None
+                ),
+                kv_indptr=sparse_kv_indptr,
+                return_lse=True,
+            )
+        elif envs.ATOM_USE_TRITON_MLA and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV:
             # Shuffled block_size=64 Triton/Gluon MLA decode kernel.
             kv_buffer = self._shuffled_kv_view(kv_c_and_k_pe_cache)
-            triton_shuffle_mla_decode_fwd(
+            triton_mla_decode_fwd(
                 q,  # [num_tokens, num_query_heads, kv_lora_rank + qk_rope_head_dim]
                 kv_buffer,  # [num_blocks, 1, block_size, kv_lora_rank + qk_rope_head_dim]
                 o,

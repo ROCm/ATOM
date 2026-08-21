@@ -61,6 +61,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_TRITON_MLA_SHUFFLE_KV": lambda: (
         os.getenv("ATOM_USE_TRITON_MLA_SHUFFLE_KV", "0") == "1"
     ),
+    # Route sparse MLA decode under DCP through the generic Triton kernel's
+    # native CSR gather. Independent of ATOM_USE_TRITON_MLA so the AITER
+    # metadata builder can remain in use; disabled by default while it is
+    # validated model-by-model.
+    "ATOM_USE_TRITON_MLA_SPARSE_DCP": lambda: (
+        os.getenv("ATOM_USE_TRITON_MLA_SPARSE_DCP", "0") == "1"
+    ),
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
     "ATOM_USE_TRITON_MOE_DECODE": lambda: os.getenv("ATOM_USE_TRITON_MOE_DECODE", "0")
     == "1",
