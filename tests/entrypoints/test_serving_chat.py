@@ -403,6 +403,19 @@ class TestFanoutCleanupSplit:
         assert request_calls == ["req-3"]
 
 
+def _forbids_none(node) -> bool:
+    """Is this the expression `tool_choice != "none"`?"""
+    return (
+        isinstance(node, ast.Compare)
+        and isinstance(node.left, ast.Name)
+        and node.left.id == "tool_choice"
+        and len(node.ops) == 1
+        and isinstance(node.ops[0], ast.NotEq)
+        and isinstance(node.comparators[0], ast.Constant)
+        and node.comparators[0].value == "none"
+    )
+
+
 class TestToolChoiceIsHonouredEverywhereItIsEmitted:
     """`tool_choice="none"` forbids tool calls on every path that can emit one.
 
@@ -433,11 +446,14 @@ class TestToolChoiceIsHonouredEverywhereItIsEmitted:
             ):
                 continue
             # The comparison is the left half of `event_type == X and <gate>`;
-            # walk up is not available, so re-find the enclosing BoolOp.
+            # walk up is not available, so re-find the enclosing BoolOp. The
+            # gate must be `tool_choice != "none"` specifically -- an earlier
+            # version asked only whether the name appeared anywhere, and
+            # passed when every gate was inverted to `== "none"`.
             guarded = any(
                 isinstance(b, ast.BoolOp)
                 and node in b.values
-                and any("tool_choice" in ast.dump(v) for v in b.values)
+                and any(_forbids_none(v) for v in b.values)
                 for b in ast.walk(tree)
                 if isinstance(b, ast.BoolOp)
             )
@@ -446,3 +462,26 @@ class TestToolChoiceIsHonouredEverywhereItIsEmitted:
         assert not unguarded, "tool events emitted regardless of tool_choice:\n  " + (
             "\n  ".join(unguarded)
         )
+
+    def test_the_scan_matched_something(self):
+        """A matcher that finds no nodes passes forever.
+
+        `event_type` is one rename away from `etype`, which api_server already
+        uses for the same variable -- and this scan would then be vacuously
+        green.
+        """
+        tree = ast.parse(self.SOURCE.read_text())
+        matched = [
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Compare)
+            and isinstance(n.left, ast.Name)
+            and n.left.id == "event_type"
+        ]
+        assert len(matched) >= 4, f"only {len(matched)} event_type comparisons found"
+
+    def test_an_inverted_gate_is_not_accepted(self):
+        """`tool_choice == "none"` is the opposite rule and must not pass."""
+        assert _forbids_none(ast.parse('tool_choice != "none"', mode="eval").body)
+        assert not _forbids_none(ast.parse('tool_choice == "none"', mode="eval").body)
+        assert not _forbids_none(ast.parse("tool_choice is not None", mode="eval").body)

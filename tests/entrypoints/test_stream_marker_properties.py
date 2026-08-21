@@ -176,6 +176,20 @@ def shapes(dialect, parser) -> dict[str, str]:
         ),
     }
 
+    # Every marker the format has, not just the first: Kimi-K3's parse keys on
+    # its tools token while its first marker is the call prefix, so quoting
+    # only `marks[0]` left a whole branch unreached.
+    for i, extra in enumerate(marks[1:], start=1):
+        out[f"marker {i} quoted inside the answer"] = (
+            f"The model writes {extra} to open a call. " + PROSE * 4
+        )
+
+    # Ends mid-marker: the read-ahead is still holding a partial when the
+    # stream ends, and flush has to release it. Half a marker cannot complete.
+    out["an answer that ends mid-marker"] = (
+        PROSE * 3 + marks[0][: max(1, len(marks[0]) // 2)]
+    )
+
     if dialect.output_open_marker:
         out["reasoning the model opens itself"] = (
             dialect.output_open_marker + PROSE * 3 + end + "The answer is 42."
@@ -217,20 +231,29 @@ def _pairs():
 
 PAIRS = list(_pairs())
 
+
 # Shapes with no marker the pipeline is entitled to honour. Withholding in
 # these is never correct, which is what makes them the bounded-withhold
 # corpus; the reasoning-bearing shapes hold until their end marker by design.
-NOTHING_TO_HONOUR = (
-    "trigger chars in ordinary prose",
-    "a marker quoted inside the answer",
-)
+def carries_no_promise(shape_name: str) -> bool:
+    """Shapes with no marker the pipeline is entitled to act on.
+
+    Withholding or discarding anything in these is never correct, which is
+    what makes them the bounded-withhold and conservation corpus. Matched by
+    prefix rather than listed, because the per-marker shapes are generated
+    -- a named list silently excluded them and left Kimi-K3's truncation
+    uncovered.
+    """
+    return shape_name.startswith(
+        ("trigger chars in ordinary prose", "a marker", "marker ")
+    )
 
 
 def _hold_pairs():
     for dialect in DIALECTS:
         for parser in ALL_PARSERS:
             for shape_name, text in shapes(dialect, parser).items():
-                if shape_name not in NOTHING_TO_HONOUR:
+                if not carries_no_promise(shape_name):
                     continue
                 yield pytest.param(
                     dialect,
@@ -242,6 +265,20 @@ def _hold_pairs():
 
 
 HOLD_PAIRS = list(_hold_pairs())
+
+
+def _partial_pairs():
+    for dialect in DIALECTS:
+        for parser in ALL_PARSERS:
+            yield pytest.param(
+                dialect,
+                parser,
+                shapes(dialect, parser)["an answer that ends mid-marker"],
+                id=f"{dialect.think_end_marker.strip('<>/|')}-{parser.NAME}",
+            )
+
+
+PARTIAL_PAIRS = list(_partial_pairs())
 
 
 class TestEveryFormatIsCovered:
@@ -308,9 +345,26 @@ class TestEverySeedingSiteIsSeeded:
                 )
                 if name not in self.SEEDED:
                     continue
-                if not any(kw.arg == "starts_thinking" for kw in node.keywords):
-                    rel = path.relative_to(self.ROOT.parents[1])
-                    found.append(f"{rel}:{node.lineno} {name}(...)")
+                seed = next(
+                    (kw.value for kw in node.keywords if kw.arg == "starts_thinking"),
+                    None,
+                )
+                # Positional counts: `separate_reasoning(text, seeded)` is a
+                # correct call and an earlier version of this scan rejected it.
+                if seed is None and name == "separate_reasoning":
+                    seed = node.args[1] if len(node.args) > 1 else None
+                rel = path.relative_to(self.ROOT.parents[1])
+                if seed is None:
+                    found.append(f"{rel}:{node.lineno} {name}(...) — not answered")
+                elif isinstance(seed, ast.Constant):
+                    # A literal is not an answer. `starts_thinking=False`
+                    # spells the keyword and reintroduces the bug: the earlier
+                    # scan accepted it, and a test in this very change was
+                    # "repaired" by hardcoding the other literal.
+                    found.append(
+                        f"{rel}:{node.lineno} {name}(starts_thinking={seed.value!r})"
+                        " — a literal, not the prompt"
+                    )
         return found
 
     def test_no_entry_point_builds_one_without_the_seed(self):
@@ -319,14 +373,30 @@ class TestEverySeedingSiteIsSeeded:
             "\n  ".join(unseeded)
         )
 
-    def test_the_scan_can_actually_fail(self):
-        """A source scan that matches nothing would pass forever."""
-        tree = ast.parse("ReasoningFilter()\nseparate_reasoning(x)\n")
-        calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)]
-        assert len(calls) == 2
-        assert all(
-            not any(kw.arg == "starts_thinking" for kw in c.keywords) for c in calls
-        )
+    @pytest.mark.parametrize(
+        "source, ok",
+        [
+            ("ReasoningFilter(starts_thinking=prompt_starts_in_reasoning(p))", True),
+            ("separate_reasoning(t, starts_thinking=seeded or flag)", True),
+            ("separate_reasoning(t, seeded)", True),
+            ("ReasoningFilter()", False),
+            ("ReasoningFilter(starts_thinking=False)", False),
+            ("separate_reasoning(t)", False),
+        ],
+    )
+    def test_the_scan_accepts_answers_and_rejects_literals(self, source, ok, tmp_path):
+        """The scan's own two-sided check.
+
+        Without it the rule drifts: the first version spelled "is the keyword
+        present", which passes `starts_thinking=False` -- exactly the bug --
+        and fails a correct positional call.
+        """
+        f = tmp_path / "atom" / "entrypoints" / "probe.py"
+        f.parent.mkdir(parents=True)
+        f.write_text(source + "\n")
+        scan = TestEverySeedingSiteIsSeeded()
+        scan.ROOT = f.parent
+        assert (scan._unseeded() == []) is ok, scan._unseeded()
 
 
 class TestChunkInvariance:
@@ -337,7 +407,7 @@ class TestChunkInvariance:
         self, dialect, parser, text, split_may_move
     ):
         by_split = {
-            label: drive(text, chunks)
+            label: drive(text, chunks, parser)
             for label, chunks in split_every_way(text).items()
         }
         variants: dict = {}
@@ -360,6 +430,68 @@ class TestChunkInvariance:
                 for k, labels in variants.items()
             )
             pytest.fail(f"{len(variants)} different results for one text:\n{report}")
+
+
+class TestConservation:
+    """Text handed to the pipeline comes back, or is part of a tool call.
+
+    Chunk-invariance cannot see deletion -- text dropped the same way under
+    every chunking is perfectly invariant -- and bounded withhold cannot
+    either, because the bytes before the loss are released on time. A quoted
+    `<tool_call>` in an ordinary answer opened a region that never closed,
+    and everything after it was discarded at flush: no event, no error,
+    `finish_reason` still `stop`. Fifty of eighty-two characters, silently.
+    """
+
+    @pytest.mark.parametrize("dialect, parser, text", HOLD_PAIRS)
+    def test_an_answer_that_calls_nothing_keeps_what_follows_the_marker(
+        self, dialect, parser, text
+    ):
+        """Judged on the tail, not byte-for-byte.
+
+        A format may legitimately consume its own markers -- Kimi-K3 strips
+        channel framing from plain answers by design -- so equality would fail
+        on correct behaviour. What no format may do is swallow the prose that
+        came after one.
+        """
+        marker = next((m for m in parser.START_MARKERS if m in text), None)
+        if marker is None:
+            pytest.skip("this shape carries no marker for this format")
+        # Stripped: a format may trim the edges of what it hands back, and
+        # whether it should is a separate question from whether it kept the
+        # prose at all. This property is only about the prose.
+        tail = text.split(marker, 1)[1].strip()
+        for label, chunks in split_every_way(text).items():
+            seen = drive(text, chunks, parser)
+            if seen.events:
+                continue  # a real tool call consumes its own bytes
+            got = seen.reasoning + seen.content
+            assert tail in got, (
+                f"{label}: everything after {marker!r} was dropped\n"
+                f"  missing: {tail[:60]!r}\n"
+                f"  delivered {len(got)} of {len(text)} characters"
+            )
+
+
+class TestNothingIsHeldPastTheEnd:
+    """Whatever the read-ahead still holds is released at end of stream.
+
+    A partial marker at the end of a response never completes, so it is text.
+    Losing it is invisible to every other property here: the stream is
+    chunk-invariant, the withhold stayed bounded, and the loss is a handful of
+    characters at the very end. `KimiParser.flush` dropped six of them.
+    """
+
+    @pytest.mark.parametrize("dialect, parser, text", PARTIAL_PAIRS)
+    def test_a_dangling_partial_marker_still_arrives(self, dialect, parser, text):
+        for label, chunks in split_every_way(text).items():
+            seen = drive(text, chunks, parser)
+            got = seen.reasoning + seen.content
+            assert got.strip().endswith(text.strip()[-4:]), (
+                f"{label}: the held tail was never released\n"
+                f"  expected to end with {text.strip()[-12:]!r}\n"
+                f"  got {got.strip()[-12:]!r}"
+            )
 
 
 class TestBoundedWithhold:

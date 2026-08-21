@@ -24,6 +24,13 @@ from .schema import build_param_types, coerce_json_or_raw
 from .tool_parser import BufferedMarkerParser, ToolCall, unique_tool_call_id
 
 _TOOLCALL_RE = re.compile(r"<tool_call>(.*?)</tool_call>|<tool_call>(.*)$", re.DOTALL)
+# A tool name is an identifier, which is what the model was given. Without
+# this the unterminated branch above turns any prose after a `<tool_call>`
+# into a call: an answer explaining that "the model writes <tool_call>
+# followed by the name" produced a call named " followed by the name. Hope
+# that helps!", and a Hermes-style `<tool_call>{"name": ...}` produced one
+# named after the whole JSON object. Both reached clients as `tool_calls`.
+_TOOL_NAME_RE = re.compile(r"^[A-Za-z_][\w.\-]*$")
 _ARG_RE = re.compile(
     r"<arg_key>(.*?)</arg_key>\s*<arg_value>"
     r"(.*?)(?:</arg_value>|(?=<arg_key>)|(?=</tool_call>)|$)",
@@ -57,7 +64,7 @@ class GlmParser(BufferedMarkerParser):
                 continue
             ak = body.find("<arg_key>")
             name = (body if ak == -1 else body[:ak]).strip()
-            if not name:
+            if not _TOOL_NAME_RE.match(name):
                 continue
             types = param_types.get(name, {})
             args: dict[str, Any] = {}

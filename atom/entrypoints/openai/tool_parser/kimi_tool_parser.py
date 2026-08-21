@@ -156,11 +156,23 @@ class KimiParser(ToolCallParser):
 
     def flush(self) -> list:
         results: list = []
-        if self.state == 0 and self.buf:
-            results.append(("content", self.buf))
+        if self.state == 0:
+            # The scanner owns the held tail now, and `self.buf` is never
+            # written in this state -- draining only `self.buf` here dropped
+            # whatever was still being read ahead. Six characters on
+            # `process("hello <|tool")`.
+            held = self._scanner_cache.flush() if self._scanner_cache else ""
+            rest = held + self.buf
             self.buf = ""
+            if rest:
+                results.append(("content", rest))
         elif self.state == 1:
             results.extend(self._drain_entries())
             if self.emitted_calls > 0:
                 results.append(("tool_call_end", None))
+            elif self.buf:
+                # The section opened and closed nothing. Same rule as every
+                # other format: a start marker is not a promise.
+                results.append(("content", KIMI_SECTION_BEGIN + self.buf))
+                self.buf = ""
         return results

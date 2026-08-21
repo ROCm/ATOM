@@ -35,6 +35,20 @@ def _clean_registry():
     sd._WAITING_SINCE.clear()
 
 
+async def _already_streaming() -> StreamOutputCollector:
+    """A collector that has delivered once.
+
+    The watchdog measures silence *between* chunks. A stream that has not
+    delivered yet is queued, not stalled -- admission and prefill have not
+    happened -- so every scenario about stalling has to get past that first
+    chunk before it means anything.
+    """
+    collector = StreamOutputCollector()
+    collector.put_nowait({"text": "first"})
+    await collector.get()
+    return collector
+
+
 async def _let_the_loop_run():
     """Yield control so a pending `get()` reaches its await."""
     for _ in range(3):
@@ -47,7 +61,7 @@ class TestWhileItIsHappening:
 
     def test_a_waiting_stream_is_visible(self):
         async def scenario():
-            collector = StreamOutputCollector()
+            collector = await _already_streaming()
             task = asyncio.create_task(collector.get())
             await _let_the_loop_run()
             seen = longest_silence_seconds()
@@ -70,7 +84,7 @@ class TestWhileItIsHappening:
 
     def test_the_oldest_wait_is_the_one_reported(self):
         async def scenario():
-            old, new = StreamOutputCollector(), StreamOutputCollector()
+            old, new = await _already_streaming(), await _already_streaming()
             t1 = asyncio.create_task(old.get())
             await _let_the_loop_run()
             await asyncio.sleep(0.02)
@@ -104,13 +118,52 @@ class TestWhileItIsHappening:
         assert asyncio.run(scenario()) == 0.0
 
 
+class TestQueueingIsNotAStall:
+    """A stream that has not started is waiting its turn, not wedged.
+
+    Both SSE generators await `get()` as the first statement of their loop,
+    before admission and prefill. At the concurrency this server is
+    benchmarked at, that first wait routinely outlives the silence threshold,
+    so counting it would log a line per backlogged request onto the event loop
+    and turn the gauge into a queue-depth proxy that `atom:requests_waiting`
+    already provides.
+    """
+
+    def test_the_first_wait_is_not_silence(self):
+        async def scenario():
+            collector = StreamOutputCollector()
+            task = asyncio.create_task(collector.get())
+            await _let_the_loop_run()
+            seen = longest_silence_seconds()
+            collector.put_nowait({"text": "first"})
+            await task
+            return seen
+
+        assert asyncio.run(scenario()) == 0.0
+
+    def test_the_first_wait_is_not_logged_however_long(self, caplog, monkeypatch):
+        monkeypatch.setattr(sd, "SILENCE_LOG_SECONDS", 0.01)
+
+        async def scenario():
+            collector = StreamOutputCollector()
+            task = asyncio.create_task(collector.get())
+            await _let_the_loop_run()
+            await asyncio.sleep(0.03)
+            collector.put_nowait({"text": "first"})
+            await task
+
+        with caplog.at_level(logging.WARNING, logger="atom"):
+            asyncio.run(scenario())
+        assert not [r for r in caplog.records if "delivered nothing" in r.message]
+
+
 class TestAfterItRecovers:
     def test_a_long_silence_is_logged_when_it_ends(self, caplog, monkeypatch):
         """The gauge cannot see a stall that is already over; this can."""
         monkeypatch.setattr(sd, "SILENCE_LOG_SECONDS", 0.01)
 
         async def scenario():
-            collector = StreamOutputCollector()
+            collector = await _already_streaming()
             task = asyncio.create_task(collector.get())
             await _let_the_loop_run()
             await asyncio.sleep(0.02)

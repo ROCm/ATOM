@@ -36,6 +36,7 @@ from atom.entrypoints.openai.protocol import (
 from atom.entrypoints.openai.reasoning import (
     ReasoningFilter,
     prompt_starts_in_reasoning,
+    template_opens_reasoning_implicitly,
 )
 from atom.entrypoints.openai.serving_chat import (
     build_chat_response,
@@ -524,6 +525,9 @@ class ChatCompletionStreamState:
         stream_queue: queue.Queue[dict[str, Any]],
         n: int,
         tool_parser_cls: type | None = None,
+        model_starts_in_reasoning: bool = False,
+        tools: list | None = None,
+        tool_choice: Any = None,
     ) -> None:
         self.request_id = request_id
         self.model_name = model_name
@@ -535,12 +539,20 @@ class ChatCompletionStreamState:
         # its whole trace delivered as the answer: state 0 no longer infers
         # reasoning from a bare end marker, because inferring it means waiting
         # for one.
-        starts_thinking = prompt_starts_in_reasoning(prompt)
+        starts_thinking = (
+            prompt_starts_in_reasoning(prompt) or model_starts_in_reasoning
+        )
         self.reasoning_filters = [
             ReasoningFilter(starts_thinking=starts_thinking) for _ in range(n)
         ]
+        # `tool_choice="none"` forbids tool calls on this path too, and
+        # `tools` is what type-coerces the arguments. The OpenAI server gated
+        # and passed both; this one had neither, so the same request answered
+        # differently depending on the entrypoint.
+        self.tool_choice = tool_choice
         self.tool_parsers = [
-            ToolCallStreamParser(parser_cls=tool_parser_cls) for _ in range(n)
+            ToolCallStreamParser(tools=tools, parser_cls=tool_parser_cls)
+            for _ in range(n)
         ]
         self.has_tool_calls = [False] * n
         self.finished = [False] * n
@@ -649,7 +661,7 @@ class ChatCompletionStreamState:
                                 index=index,
                             )
                         )
-                    elif event_type == "tool_call_start":
+                    elif event_type == "tool_call_start" and self.tool_choice != "none":
                         self.has_tool_calls[index] = True
                         chunks.append(
                             create_chat_chunk(
@@ -659,7 +671,7 @@ class ChatCompletionStreamState:
                                 index=index,
                             )
                         )
-                    elif event_type == "tool_call_args":
+                    elif event_type == "tool_call_args" and self.tool_choice != "none":
                         chunks.append(
                             create_chat_chunk(
                                 self.request_id,
@@ -682,7 +694,7 @@ class ChatCompletionStreamState:
                             index=index,
                         )
                     )
-                elif event_type == "tool_call_start":
+                elif event_type == "tool_call_start" and self.tool_choice != "none":
                     self.has_tool_calls[index] = True
                     chunks.append(
                         create_chat_chunk(
@@ -692,7 +704,7 @@ class ChatCompletionStreamState:
                             index=index,
                         )
                     )
-                elif event_type == "tool_call_args":
+                elif event_type == "tool_call_args" and self.tool_choice != "none":
                     chunks.append(
                         create_chat_chunk(
                             self.request_id,
@@ -912,6 +924,9 @@ class AtomStandaloneService:
         # Resolved once here, for the same reason the OpenAI server resolves it
         # once: the chat template says which format this model emits, and
         # deciding from the output instead means deciding from a prefix.
+        self.model_starts_in_reasoning = template_opens_reasoning_implicitly(
+            getattr(tokenizer, "chat_template", None) or ""
+        )
         self.tool_parser_cls = resolve_tool_call_parser(
             None, tokenizer, self.custom_message_encoder, model=model_name
         )
@@ -966,7 +981,10 @@ class AtomStandaloneService:
                     request_id,
                     self.model_name,
                     outputs,
-                    starts_thinking=prompt_starts_in_reasoning(prompt),
+                    starts_thinking=prompt_starts_in_reasoning(prompt)
+                    or self.model_starts_in_reasoning,
+                    tools=request_data.get("tools"),
+                    tool_choice=request_data.get("tool_choice"),
                     tool_parser_cls=self.tool_parser_cls,
                 )
             else:
@@ -985,7 +1003,10 @@ class AtomStandaloneService:
                     self.model_name,
                     final_output["text"],
                     final_output,
-                    starts_thinking=prompt_starts_in_reasoning(prompt),
+                    starts_thinking=prompt_starts_in_reasoning(prompt)
+                    or self.model_starts_in_reasoning,
+                    tools=request_data.get("tools"),
+                    tool_choice=request_data.get("tool_choice"),
                     tool_parser_cls=self.tool_parser_cls,
                 )
             return self._json_safe(response.model_dump(exclude_none=True))
@@ -1155,6 +1176,9 @@ class AtomStandaloneService:
                 stream_queue=stream_queue,
                 n=effective_n,
                 tool_parser_cls=self.tool_parser_cls,
+                model_starts_in_reasoning=self.model_starts_in_reasoning,
+                tools=request_data.get("tools"),
+                tool_choice=request_data.get("tool_choice"),
             )
             with self._streams_lock:
                 self._streams[request_id] = stream_state

@@ -108,6 +108,13 @@ class StreamOutputCollector:
         self.request_id = request_id
         self._pending: dict[Any, dict] = {}
         self._ready = Event()
+        # Whether this stream has ever delivered. The first wait is queueing --
+        # admission and prefill have not happened yet -- and at the
+        # concurrencies this server is benchmarked at, that routinely exceeds
+        # the silence threshold. Counting it would make the gauge a
+        # queue-depth proxy, which `atom:requests_waiting` already is, and
+        # would log a line per backlogged request on the event loop.
+        self._delivered = False
 
     def put_nowait(self, payload: dict | tuple[int, dict]) -> None:
         """Accept one prepared chunk. Called on the event loop, never off it."""
@@ -137,13 +144,14 @@ class StreamOutputCollector:
         """
         while not self._pending:
             started = time.monotonic()
-            _WAITING_SINCE[id(self)] = started
+            if self._delivered:
+                _WAITING_SINCE[id(self)] = started
             try:
                 await self._ready.wait()
             finally:
                 _WAITING_SINCE.pop(id(self), None)
             silence = time.monotonic() - started
-            if silence >= SILENCE_LOG_SECONDS:
+            if self._delivered and silence >= SILENCE_LOG_SECONDS:
                 # After the fact, and free: one comparison on a wake that was
                 # going to happen anyway. Catches a stall that recovered,
                 # which the gauge cannot -- by scrape time it is over.
@@ -157,6 +165,7 @@ class StreamOutputCollector:
         del self._pending[tag]
         if not self._pending:
             self._ready.clear()
+        self._delivered = True
         return chunk if tag is None else (tag, chunk)
 
 

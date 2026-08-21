@@ -66,7 +66,15 @@ def parse_tool_calls(
         tool-call sections removed.
     """
     if parser_cls is not None:
-        return parser_cls.parse(text, tools)
+        content, tool_calls = parser_cls.parse(text, tools)
+        if not tool_calls:
+            # No call, so nothing was a tool-call section and nothing should
+            # have been rewritten. Formats strip their content, which for an
+            # ordinary answer means a code block comes back without its
+            # trailing newline -- and only when `stream=false`, since the
+            # streaming path releases bytes as they arrive.
+            return text, []
+        return content, tool_calls
     for parser in _DETECT_ORDER:
         if parser.detect(text):
             return parser.parse(text, tools)
@@ -104,7 +112,14 @@ def resolve_from_prompt(rendered_prompt: str) -> type[ToolCallParser] | None:
     read as "and therefore send nothing", which is how one '<' in an answer
     withheld the rest of the stream.
     """
-    for parser in _DETECT_ORDER:
+    # Kimi is included here though `_DETECT_ORDER` omits it. There it is the
+    # terminal fallback, because its `parse` also defines "no tool calls at
+    # all"; that makes it wrong to try *last* on an output and right to try at
+    # all on a prompt. Omitting it meant a K2 deployment resolved to nothing
+    # and its tool calls arrived as raw section tokens in `delta.content`,
+    # while the non-streaming path still fell through to `KimiParser.parse`
+    # and returned them -- the same request answered two ways.
+    for parser in (*_DETECT_ORDER, KimiParser):
         if parser.detect(rendered_prompt):
             return parser
     return None

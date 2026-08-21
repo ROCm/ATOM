@@ -171,8 +171,17 @@ class BufferedMarkerParser(ToolCallParser):
                 results.append(("content", rest))
             return results
         # state 1: parse the complete (or trailing) tool-call block.
-        _content, tool_calls = self.parse(self.buf, self.tools)
-        self.buf = ""
+        region, self.buf = self.buf, ""
+        _content, tool_calls = self.parse(region, self.tools)
+        if not tool_calls:
+            # A start marker is not a promise. An answer explaining that a
+            # model "writes <tool_call> to call something" opens the region
+            # and never closes it, and this used to drop everything from the
+            # marker on -- no event, no error, `finish_reason` still `stop`.
+            # Fifty characters of eighty-two, on the shapes measured.
+            #
+            # Released verbatim rather than as `parse`'s content, which strips.
+            return [("content", region)] if region else []
         for tc in tool_calls:
             results.extend(self._emit_call(tc))
         if self.emitted_calls > 0:

@@ -8,6 +8,7 @@ from atom.entrypoints.openai.tool_parser import (
     ToolCallStreamParser,
     parse_tool_calls,
 )
+from atom.entrypoints.openai.tool_parser.kimi_k3_tool_parser import KimiK3Parser
 from atom.entrypoints.openai.tool_parser.kimi_tool_parser import KimiParser
 
 # ============================================================================
@@ -217,3 +218,36 @@ class TestToolCallStreamParser:
         assert len(starts) == 1
         ends = [d for t, d in results if t == "tool_call_end"]
         assert len(ends) == 1  # flush should emit tool_call_end
+
+
+class TestAParserOnItsOwnDoesNotEatText:
+    """Driven directly, because the facade cannot reach these states.
+
+    `ToolCallStreamParser` reads ahead over the format's markers itself, so a
+    parser is only ever constructed once a complete marker has arrived — its
+    own pre-region path is unreachable from there. The property suite runs
+    through the facade and therefore cannot see this, which is exactly how a
+    six-character loss in `KimiParser.flush` survived it.
+    """
+
+    def test_kimi_releases_a_partial_marker_it_was_still_holding(self):
+        p = KimiParser()
+        out = p.process("hello <|tool")
+        out += p.flush()
+        assert "".join(d for k, d in out if k == "content") == "hello <|tool"
+
+    def test_kimi_releases_a_section_that_held_no_call(self):
+        """A start marker is not a promise, for this format either."""
+        text = "see <|tool_calls_section_begin|> and nothing else"
+        p = KimiParser()
+        out = p.process(text)
+        out += p.flush()
+        delivered = "".join(d for k, d in out if k == "content")
+        assert "and nothing else" in delivered
+        assert not [k for k, _ in out if k.startswith("tool_call_")]
+
+    def test_kimi_k3_keeps_prose_after_a_tools_token_it_did_not_use(self):
+        text = "the token <|open|>tools<|sep|> opens a section. Nothing follows."
+        content, calls = KimiK3Parser.parse(text, None)
+        assert calls == []
+        assert "Nothing follows." in content

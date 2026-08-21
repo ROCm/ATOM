@@ -31,6 +31,34 @@ _OUTPUT_OPEN_MARKERS = tuple(
 VALID_TEMPLATE_EFFORTS = frozenset().union(*(d.template_efforts for d in DIALECTS))
 
 
+def template_opens_reasoning_implicitly(rendered_template: str) -> bool:
+    """Does this model begin inside the reasoning channel with no marker at all?
+
+    Some families close a reasoning block they never open: DeepSeek-R1 emits
+    `</think>` but neither its prompt nor its output carries `<think>`. Nothing
+    in a single response says so -- the first token is already reasoning and
+    looks like an answer -- so it has to be known before the response starts.
+
+    The chat template says it. A template that mentions an end marker and not
+    the matching opener is describing exactly that shape; one that mentions
+    both (Qwen3) describes a model that opens its own, and one that mentions
+    neither (MiniMax-M3, gpt-oss) has no reasoning channel to speak of.
+
+    This is what vLLM expresses by registering `DeepSeekR1ReasoningParser` for
+    R1 -- an override whose only job is to treat a stream with no start token
+    as reasoning until `</think>`. Same fact, derived instead of listed.
+    """
+    for dialect in DIALECTS:
+        if not dialect.think_end_marker:
+            continue
+        opener = dialect.output_open_marker or dialect.prompt_open_marker
+        if dialect.think_end_marker in rendered_template and (
+            not opener or opener not in rendered_template
+        ):
+            return True
+    return False
+
+
 def prompt_starts_in_reasoning(prompt: str) -> bool:
     """True if the rendered ``prompt`` ends by opening a reasoning channel.
 

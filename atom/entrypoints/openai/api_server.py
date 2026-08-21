@@ -60,6 +60,7 @@ from .protocol import (
 from .reasoning import (
     prompt_starts_in_reasoning,
     prompt_tokens_start_in_reasoning,
+    template_opens_reasoning_implicitly,
 )
 from .serving_anthropic import (
     AnthropicBlocks,
@@ -108,6 +109,12 @@ tokenizer: AutoTokenizer | None = None
 # chat template. `None` means none was recognised and tool calls, if any, are
 # delivered as plain text -- said out loud at startup, never discovered here.
 tool_call_parser_cls: type | None = None
+# Whether this model's output begins inside the reasoning channel even when
+# nothing in the prompt or the output says so -- DeepSeek-R1 closes a block it
+# never opens. Read from the chat template at startup, because a single
+# response cannot tell you: its first token is already reasoning and reads
+# like an answer.
+model_starts_in_reasoning: bool = False
 processor: Any | None = None
 model_name: str = ""
 default_chat_template_kwargs: dict[str, Any] = {}
@@ -1280,7 +1287,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             prompt_tokens_start_in_reasoning(token_ids, tokenizer.decode)
             if is_multimodal
             else prompt_starts_in_reasoning(prompt)
-        )
+        ) or model_starts_in_reasoning
 
         # Streaming
         if request.stream:
@@ -1664,6 +1671,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                 # thinking state while claiming it did not start there.
                 reasoning_filter = ReasoningFilter(
                     starts_thinking=prompt_starts_in_reasoning(prompt)
+                    or model_starts_in_reasoning
                 )
                 tool_parser = ToolCallStreamParser(parser_cls=tool_call_parser_cls)
                 tool_parser.tools = anthropic_to_openai_tools(request.tools)
@@ -1800,7 +1808,9 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
 
         raw_text = final_output["text"]
         reasoning_content, content_with_tools = separate_reasoning(
-            raw_text, starts_thinking=prompt_starts_in_reasoning(prompt)
+            raw_text,
+            starts_thinking=prompt_starts_in_reasoning(prompt)
+            or model_starts_in_reasoning,
         )
         content_text, tool_calls = parse_tool_calls(
             content_with_tools,
@@ -1973,7 +1983,7 @@ async def stop_profile():
 def main():
     """Main entry point for the server."""
     global engine, tokenizer, model_name, default_chat_template_kwargs, _request_logger
-    global tool_call_parser_cls
+    global tool_call_parser_cls, model_starts_in_reasoning
     global custom_message_encoder, _stream_batch_dispatcher
 
     parser = FlexibleArgumentParser(description="ATOM OpenAI API Server")
@@ -2075,6 +2085,15 @@ def main():
 
     logger.info(f"Initializing engine with model {args.model}...")
     engine_args = EngineArgs.from_cli_args(args)
+    model_starts_in_reasoning = template_opens_reasoning_implicitly(
+        getattr(tokenizer, "chat_template", None) or ""
+    )
+    if model_starts_in_reasoning:
+        logger.info(
+            "Chat template closes a reasoning block it never opens; treating "
+            "output as reasoning until the end marker."
+        )
+
     tool_call_parser_cls = resolve_tool_call_parser(
         args.tool_call_parser,
         tokenizer,

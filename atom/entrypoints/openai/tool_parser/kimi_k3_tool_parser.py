@@ -111,8 +111,6 @@ class KimiK3Parser(ToolCallParser):
     @classmethod
     def parse(cls, text: str, tools: list | None) -> tuple[str, list[ToolCall]]:
         """Parse the Kimi-K3 channel format; return (clean_content, tool_calls)."""
-        ts = text.find(KIMI_K3_TOOLS_START)
-        content = _strip_k3_framing(text if ts == -1 else text[:ts])
         tool_calls: list[ToolCall] = []
         for m in _K3_CALL_RE.finditer(text):
             args: dict = {}
@@ -128,7 +126,12 @@ class KimiK3Parser(ToolCallParser):
                     },
                 )
             )
-        return content, tool_calls
+        # Truncated at the tools marker only when the section really held a
+        # call. An answer that merely names the token opened no section, and
+        # cutting there dropped everything after it.
+        ts = text.find(KIMI_K3_TOOLS_START)
+        keep = text if (ts == -1 or not tool_calls) else text[:ts]
+        return _strip_k3_framing(keep), tool_calls
 
     def process(self, text: str) -> list:
         # Buffer everything; K3's interleaved framing is parsed once at flush.

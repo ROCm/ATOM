@@ -63,7 +63,7 @@ def _load_encoder_from_dir(model_path: str) -> MessageEncoderAdapter | None:
         spec = importlib.util.spec_from_file_location(module_name, enc_path)
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-        raw = getattr(mod, "encode_messages")
+        raw = mod.encode_messages
     except Exception as e:
         logger.warning(f"Failed to load encoder from {enc_path}: {e}")
         return None
