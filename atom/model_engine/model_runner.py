@@ -3371,6 +3371,32 @@ class ModelRunner:
                 batch.next_token_ids,
             )
         if pp_non_last or self._is_pure_middle_chunk(batch):
+            # `propose()` carries DP collectives (the drafter's DPMetadata
+            # all_reduce, the draft block's MoE comm) and is reached only from
+            # `postprocess`, which this return skips — so under DP attention
+            # peers block in that all_reduce forever. Run it for the collectives
+            # and drop the ids: a middle chunk sharing a batch with a final-chunk
+            # seq already goes through propose, so this is the existing path;
+            # only the all-middle batch took the shortcut.
+            if (
+                self._middle_chunk_needs_draft_alignment()
+                and self._is_pure_middle_chunk(batch)
+                and not batch.is_dummy_run
+            ):
+                self.propose_draft_token_ids(
+                    batch,
+                    self.tokenID_processor.input_ids.gpu[
+                        1 : batch.total_tokens_num + 1
+                    ],
+                    hidden_states,
+                    torch.zeros(
+                        batch.total_seqs_num, dtype=torch.int32, device=self.device
+                    ),
+                    torch.zeros(
+                        batch.total_seqs_num, dtype=torch.int32, device=self.device
+                    ),
+                    align_only=True,
+                )
             reset_forward_context()
             # Mark this slot's GPU work (attention consumed its metadata) done.
             if not batch.is_dummy_run:
@@ -3402,6 +3428,20 @@ class ModelRunner:
     @staticmethod
     def _is_pure_middle_chunk(batch) -> bool:
         return batch is not None and not batch.produces_output()
+
+    def _middle_chunk_needs_draft_alignment(self) -> bool:
+        """Must an output-less batch still run `propose()` for its collectives?
+
+        Only under DP attention: `_refresh_dp_metadata` returns early at
+        `data_parallel_size <= 1`, so TP-only and single-rank pay nothing here.
+        PP (`is_deferred_out` False) is excluded — its `pp_non_last` arm of the
+        same return is a separate question.
+        """
+        return (
+            hasattr(self, "drafter")
+            and self.config.parallel_config.data_parallel_size > 1
+            and self.tokenID_processor.is_deferred_out
+        )
 
     @torch.inference_mode()
     def process_kvconnector_output(self, connector_meta_output):
@@ -3442,7 +3482,17 @@ class ModelRunner:
         hidden_states: torch.Tensor,
         next_token_ids: torch.Tensor,
         num_reject_tokens: torch.Tensor,
+        align_only: bool = False,
     ):
+        """`align_only` runs the draft purely for its DP collectives.
+
+        Set by the all-middle-chunk caller. Every seq there is mid-prompt, so the
+        `batch.next_token_ids` override below replaces `next_token_ids` wholesale
+        and the zeros it passes are never read. The ids are dropped: publishing
+        them would push an entry the scheduler is not expecting into the
+        deferred-output pipeline, and `record_ell` would file a verify length
+        against seqs that produced no token.
+        """
         forward_context = get_forward_context()
 
         # A sequence still mid-prompt samples nothing usable, so its anchor is
@@ -3509,6 +3559,8 @@ class ModelRunner:
             next_token_ids=next_token_ids,
             last_token_indices=last_token_indices,
         )
+        if align_only:
+            return None
         # DSpark Phase 2: stash this step's scheduler-chosen ell keyed by req_id,
         # so next step's calc_spec_decode_metadata can re-map it onto the (possibly
         # reordered) batch. Keying by req_id (not batch position) is required:
