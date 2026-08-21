@@ -48,7 +48,7 @@ python -m atom.entrypoints.openai_server \
 
 #### GLM-5.2 MXFP4 with DPA
 
-The native ATOM backend supports GLM-5.2 MXFP4 with Data Parallel Attention (DPA) and an FP8 KV cache on MI355/gfx950.
+The native ATOM backend supports GLM-5.2 MXFP4 with Data Parallel Attention (DPA) and FP8 KV cache.
 
 Use `-tp 4` or `-tp 8` for the validated TP4 and TP8 configurations:
 

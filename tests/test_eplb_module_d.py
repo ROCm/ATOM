@@ -189,8 +189,7 @@ def test_collect_expert_weights_uses_quant_method_views():
     live_weight = torch.arange(12, dtype=torch.float32).view(2, 6)
 
     class _BackendAwareQuantMethod:
-        def get_eplb_weight_views(self, layer, num_local_experts):
-            assert num_local_experts == 2
+        def get_eplb_weight_views(self, layer):
             assert layer.quant_method is self
             return [live_weight]
 
@@ -203,8 +202,8 @@ def test_collect_expert_weights_uses_quant_method_views():
 
 def test_collect_expert_weights_rejects_bad_backend_view_shape():
     class _BadQuantMethod:
-        def get_eplb_weight_views(self, layer, num_local_experts):
-            return [torch.zeros((num_local_experts + 1, 4))]
+        def get_eplb_weight_views(self, layer):
+            return [torch.zeros((3, 4))]
 
     layer = SimpleNamespace(quant_method=_BadQuantMethod())
     manager = object.__new__(eplb.EPLBManager)

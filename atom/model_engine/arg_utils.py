@@ -61,6 +61,7 @@ class EngineArgs:
     cudagraph_mode: str = "FULL"
     load_dummy: str | None = None
     enable_expert_parallel: bool = False
+    fake_eplb: bool = False
     torch_profiler_dir: str | None = None
     enable_dp_attention: bool = False
     dp_load_balance: str = DP_LB_DEFAULT
@@ -72,6 +73,7 @@ class EngineArgs:
     kv_transfer_config: str = "{}"
     draft_model: str | None = None
     spec_decode_acceptance_rate: float | None = None
+    spec_decode_acceptance_length: float | None = None
     mark_trace: bool = False
     enable_rapidserve: bool = False
     disagg_prefill_max_num_seqs: int | None = None
@@ -79,10 +81,6 @@ class EngineArgs:
     online_quant_config: dict | None = None
     hf_overrides: dict | None = None
     dspark_config: dict | None = None
-
-    def __post_init__(self) -> None:
-        if self.index_cache_dtype is None:
-            self.index_cache_dtype = self.kv_cache_dtype
 
     eplb_enable: bool = False
     eplb_config: dict | None = None
@@ -175,9 +173,9 @@ class EngineArgs:
             choices=["bf16", "fp8", "fp4"],
             type=str,
             default=None,
-            help="Index cache type. Defaults to --kv_cache_dtype. 'fp4' selects "
-            "the DeepSeek-V4 FP4 CSA indexer (gfx950 only; falls back to fp8 "
-            "elsewhere).",
+            help="Index cache type. Native single-node DeepSeek-V4 defaults to "
+            "'fp4' except on gfx942, which defaults to 'fp8'; other models "
+            "default to --kv_cache_dtype.",
         )
         parser.add_argument(
             "--block-size", type=int, default=16, help="KV cache block size."
@@ -201,10 +199,12 @@ class EngineArgs:
             "--cudagraph-mode",
             type=str,
             default="FULL",
-            choices=["NONE", "PIECEWISE", "FULL", "FULL_AND_PIECEWISE"],
+            choices=["NONE", "PIECEWISE", "FULL", "FULL_AND_PIECEWISE", "AF_PIECEWISE"],
             help="CUDA graph runtime mode. FULL = manual whole-forward capture "
             "(default, existing behavior). PIECEWISE = per-piece cudagraph with "
-            "attention eager (requires --level 3).",
+            "attention eager (requires --level 3). AF_PIECEWISE = PIECEWISE where "
+            "the attention core is also captured into its own cudagraph with "
+            "zero-copy buffers (DeepSeek-V4 DSpark).",
         )
         parser.add_argument(
             "--load_dummy",
@@ -222,6 +222,13 @@ class EngineArgs:
             "--enable-expert-parallel",
             action="store_true",
             help="Enable expert parallel(EP MoE).",
+        )
+        parser.add_argument(
+            "--fake-eplb",
+            action="store_true",
+            help="Replace MoE router logits with a synthetic uniform "
+            "distribution so every expert is selected equally. For "
+            "benchmarking the balanced-load upper bound only.",
         )
         parser.add_argument(
             "--torch-profiler-dir",
@@ -299,17 +306,27 @@ class EngineArgs:
             "V4-Pro-DSpark which ships inside the target checkpoint).",
         )
         parser.add_argument(
+            "--spec-decode-acceptance-length",
+            type=float,
+            default=None,
+            help="Debug/benchmark knob: force a fixed speculative-decoding mean "
+            "acceptance length (AL) in [1, num_speculative_tokens + 1]. When "
+            "set, the rejection sampler ignores the real draft/target agreement "
+            "and force-accepts draft tokens so the measured accept length "
+            "converges to this value. AL counts the target's own guaranteed "
+            "token, so it is the same unit as vLLM's synthetic_acceptance_length "
+            "and SGLang's SGLANG_SIMULATE_ACC_LEN and a published golden AL can "
+            "be passed through unchanged. Only meaningful with a speculative "
+            "method; leave unset to disable.",
+        )
+        parser.add_argument(
             "--spec-decode-acceptance-rate",
             type=float,
             default=None,
-            help="Debug/benchmark knob: force a fixed speculative-decoding "
-            "acceptance rate in [0, 1]. When set, the rejection sampler ignores "
-            "the real draft/target agreement and force-accepts each draft token "
-            "with a position-decaying probability calibrated so the measured "
-            "mean acceptance rate (accepted_draft/total_draft) matches this "
-            "value (equivalent accept length = 1 + num_speculative_tokens * "
-            "rate). Mirrors vLLM's 'synthetic' rejection_sample_method. Only "
-            "meaningful with a speculative method; leave unset to disable.",
+            help="The same knob as --spec-decode-acceptance-length, expressed as "
+            "a mean acceptance rate in [0, 1] (accepted_draft/total_draft), i.e. "
+            "(length - 1) / num_speculative_tokens. Mutually exclusive with "
+            "--spec-decode-acceptance-length.",
         )
         parser.add_argument(
             "--max-num-batched-tokens",
@@ -559,6 +576,7 @@ class EngineArgs:
             num_spec_tokens = kwargs.pop("num_speculative_tokens")
             draft_model = kwargs.pop("draft_model")
             synthetic_acceptance_rate = kwargs.pop("spec_decode_acceptance_rate")
+            synthetic_acceptance_length = kwargs.pop("spec_decode_acceptance_length")
             if method == "eagle3" and not draft_model:
                 raise ValueError("--draft-model is required when --method eagle3.")
             if draft_model and method == "mtp":
@@ -571,12 +589,14 @@ class EngineArgs:
                 model=draft_model or self.model,
                 num_speculative_tokens=num_spec_tokens,
                 synthetic_acceptance_rate=synthetic_acceptance_rate,
+                synthetic_acceptance_length=synthetic_acceptance_length,
             )
         else:
             kwargs.pop("method")
             kwargs.pop("num_speculative_tokens")
             kwargs.pop("draft_model")
             kwargs.pop("spec_decode_acceptance_rate")
+            kwargs.pop("spec_decode_acceptance_length")
             kwargs["speculative_config"] = None
 
         # --enable-tbo [prefill|all] → enable_tbo + enable_tbo_decode
