@@ -98,10 +98,10 @@ from atom.model_ops.triton_rmsnorm_nw import rmsnorm_nw
 from atom.model_ops.utils import atom_parameter
 from atom.model_ops.v4_kernels import (
     FP4_MQA_BLOCK_K,
-    FP4_MQA_PARALLEL_UNIT_NUM,
     CompressPlan,
     csa_translate_pack,
     fp4_indexer_enabled,
+    fp4_mqa_prefill_parallel_unit_num,
     fused_compress_attn,
     inverse_rope_inplace,
     qk_norm_rope_maybe_quant,
@@ -2014,16 +2014,20 @@ class Indexer(nn.Module):
                 cta_info, n_ctas = full_cta_info, full_n_ctas
             else:
                 # Multi-chunk (logits would exceed budget): rebuild the schedule
-                # for this chunk's rows. Prefill has one row per query token, so
-                # the grid MUST cover this chunk's rows or surplus rows are
-                # dropped (their logits stay -inf -> wrong top-k); the shared CTA
-                # floor keeps a small chunk spread across the GPU.
+                # for this chunk's rows. Use the same shape-specific policy as
+                # the full-batch metadata builder so budget chunking retains the
+                # FP4 grid optimization without launching needless empty CTAs.
+                chunk_rows = chunk_end - chunk_start
                 _, cta_info, n_ctas = compute_prefill_schedule(
                     row_to_batch[chunk_start:chunk_end],
                     rs,
                     re,
                     FP4_MQA_BLOCK_K,
-                    max(FP4_MQA_PARALLEL_UNIT_NUM, chunk_end - chunk_start),
+                    fp4_mqa_prefill_parallel_unit_num(
+                        chunk_rows,
+                        max_seq_len,
+                        block_k=FP4_MQA_BLOCK_K,
+                    ),
                     max_seq_len,
                 )
             # Write-once, NOT -inf-filled: the kernel writes every column in

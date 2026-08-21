@@ -101,6 +101,7 @@ from atom.model_ops.v4_kernels import (
     FP4_MQA_BLOCK_K,
     FP4_MQA_PARALLEL_UNIT_NUM,
     fp4_indexer_enabled,
+    fp4_mqa_prefill_parallel_unit_num,
     hca_compress_paged_offsets,
     write_v4_paged_decode_indices,
     write_v4_paged_prefill_indices,
@@ -2274,20 +2275,17 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             fp4_prefill_max_seq_len = max(int(n_committed_per_seq.max()), 1)
 
             local_starts = torch.zeros_like(visible_end_gpu)
-            # parallel_unit_num is the persistent-grid CTA-count CAP; the
-            # schedule uses as many CTAs as it can up to this P (smaller P ->
-            # larger `safe` chunk-fold -> fewer, more-serial CTAs). It bounds
-            # TWO independent axes:
-            #   - rows: every (row, chunk-split) needs a slot. A prefill fwd has
-            #     one row PER QUERY TOKEN, so P must be >= prefill row count or
-            #     surplus rows are silently dropped (logits stay at the -inf/NaN
-            #     pre-fill -> wrong top-k). This is what `prefill_rows` covers.
-            #   - chunks (context length): the 512 floor keeps enough CTAs to
-            #     split a long context across the GPU even when rows are few
-            #     (matters for decode; harmless here where rows dominate).
-            # max() of both axes -> correct rows AND adequate chunk parallelism.
+            # Prefill uses an eager, shape-specific grid. Small Q needs more K
+            # splits to fill gfx950, while a full 16K-row prefill generally does
+            # not; the selector also caps P by the useful row/chunk pair count
+            # because the FlyDSL kernel launches exactly P CTAs. Decode keeps
+            # its fixed 512-CTA CUDAGraph schedule unchanged.
             prefill_rows = int(visible_end_gpu.shape[0])
-            prefill_parallel_unit_num = max(self._fp4_parallel_unit_num, prefill_rows)
+            prefill_parallel_unit_num = fp4_mqa_prefill_parallel_unit_num(
+                prefill_rows,
+                fp4_prefill_max_seq_len,
+                block_k=self._fp4_block_k,
+            )
             _, prefill_cta_info, prefill_n_ctas = compute_prefill_schedule(
                 batch_id_per_token_gpu.to(torch.int32),
                 local_starts,
