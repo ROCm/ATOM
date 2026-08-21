@@ -97,6 +97,7 @@ __all__ = [
 
 logger = logging.getLogger("atom")
 
+
 def fp4_indexer_enabled(index_cache_dtype: Any, *, warn: bool = False) -> bool:
     """Is the FP4 CSA indexer active? Single source of truth for the predicate.
 

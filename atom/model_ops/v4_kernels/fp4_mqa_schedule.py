@@ -35,8 +35,7 @@ def fp4_mqa_prefill_parallel_unit_num(
         raise ValueError(f"block_k must be positive, got {block_k}")
     if min_parallel_unit_num <= 0:
         raise ValueError(
-            "min_parallel_unit_num must be positive, got "
-            f"{min_parallel_unit_num}"
+            "min_parallel_unit_num must be positive, got " f"{min_parallel_unit_num}"
         )
 
     chunks_per_row = max(1, (max_seq_len + block_k - 1) // block_k)
