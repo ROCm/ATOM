@@ -613,7 +613,7 @@ class ModelRunner:
         self.block_size = config.kv_cache_block_size
         self.kv_cache_dtype = config.kv_cache_dtype
         self.enforce_eager = config.enforce_eager
-        self.tp_size = config.tensor_parallel_size
+        self.world_size = config.tensor_parallel_size
         self.tp_world_size = config.tp_world_size
         self.rank = rank
         self.label = f"Model Runner{rank}/{self.tp_world_size}"
@@ -1428,11 +1428,11 @@ class ModelRunner:
     def _get_num_kv_heads(self):
         """Return the per-rank number of KV heads."""
         hf_config = self.config.hf_config
-        if hf_config.num_key_value_heads >= self.tp_size:
-            assert hf_config.num_key_value_heads % self.tp_size == 0
-            return hf_config.num_key_value_heads // self.tp_size
+        if hf_config.num_key_value_heads >= self.world_size:
+            assert hf_config.num_key_value_heads % self.world_size == 0
+            return hf_config.num_key_value_heads // self.world_size
         else:
-            assert self.tp_size % hf_config.num_key_value_heads == 0
+            assert self.world_size % hf_config.num_key_value_heads == 0
             return 1
 
     def _mrope_positions_view(self, num_tokens: int) -> torch.Tensor:
@@ -1851,11 +1851,11 @@ class ModelRunner:
         self.num_physical_kvcache_blocks = (
             num_kvcache_blocks * self.attn_metadata_builder.block_ratio
         )
-        if hf_config.num_key_value_heads >= self.tp_size:
-            assert hf_config.num_key_value_heads % self.tp_size == 0
-            num_kv_heads = hf_config.num_key_value_heads // self.tp_size
+        if hf_config.num_key_value_heads >= self.world_size:
+            assert hf_config.num_key_value_heads % self.world_size == 0
+            num_kv_heads = hf_config.num_key_value_heads // self.world_size
         else:
-            assert self.tp_size % hf_config.num_key_value_heads == 0
+            assert self.world_size % hf_config.num_key_value_heads == 0
             num_kv_heads = 1
         # Promote to self so attention builders' build_kv_cache_tensor()
         # hooks can access it without re-deriving from hf_config.
@@ -4034,7 +4034,7 @@ class ModelRunner:
         self.graph_pool = None
         is_tbo = self.config.enable_tbo and isinstance(self.model, UBatchWrapper)
         # TBO graphs don't capture compute_logits, so disable logits_in_graph.
-        self.logits_in_graph = self.tp_size == 1 and not is_tbo
+        self.logits_in_graph = self.world_size == 1 and not is_tbo
 
         # start capture profiler
         self.start_capture_profiler()
@@ -4582,9 +4582,7 @@ class RapidServeModelRunner(ModelRunner):
         self._disagg_write_rank_file("weights", handles)
         paths = self._disagg_collect_rank_files("weights")
         if paths is not None:
-            logger.info(
-                f"ModelRunner rank 0: all {self.tp_world_size} weight files ready"
-            )
+            logger.info(f"ModelRunner rank 0: all {self.world_size} weight files ready")
         return paths  # non-None only for rank 0
 
     def import_model_weight_ipc_handles(self, paths: list[str]) -> bool:
@@ -4637,7 +4635,7 @@ class RapidServeModelRunner(ModelRunner):
         paths = self._disagg_collect_rank_files("kvcache")
         if paths is not None:
             logger.info(
-                f"ModelRunner rank 0: all {self.tp_world_size} kvcache files ready"
+                f"ModelRunner rank 0: all {self.world_size} kvcache files ready"
             )
         return paths  # non-None only for rank 0
 
@@ -4682,8 +4680,8 @@ class RapidServeModelRunner(ModelRunner):
         allocate_kv_cache() is skipped."""
         config = self.config
         hf_config = config.hf_config
-        if hf_config.num_key_value_heads >= self.tp_size:
-            num_kv_heads = hf_config.num_key_value_heads // self.tp_size
+        if hf_config.num_key_value_heads >= self.world_size:
+            num_kv_heads = hf_config.num_key_value_heads // self.world_size
         else:
             num_kv_heads = 1
         x = 16 // self.kv_cache.element_size()

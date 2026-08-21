@@ -436,8 +436,8 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
 
             _swa_raw = getattr(hf_config, "swa_num_key_value_heads", 0)
             swa_kv_heads = (
-                _swa_raw // runner.tp_size
-                if _swa_raw >= runner.tp_size
+                _swa_raw // runner.world_size
+                if _swa_raw >= runner.world_size
                 else (1 if _swa_raw else 0)
             )
             block_bytes = (

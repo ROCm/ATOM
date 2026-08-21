@@ -33,7 +33,7 @@ class Eagle3DraftBuilder:
         self.num_layers = draft_hf.num_hidden_layers
         self._next_layer_id = 0  # consumed by build_kv_cache_tensor
         self.num_blocks = 0  # set in allocate_kv_cache_tensors
-        self.num_kv_heads = draft_hf.num_key_value_heads // model_runner.tp_size
+        self.num_kv_heads = draft_hf.num_key_value_heads // model_runner.world_size
         self.head_dim = draft_hf.head_dim
 
     def sub_pool_specs(self) -> list[SubPoolSpec]:
