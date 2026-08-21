@@ -109,7 +109,7 @@ slurm_account = runner.get("slurm_account", "amd-frameworks")
 slurm_partition = runner.get("slurm_partition", "amd-frameworks")
 if slurm_submit_runner in crusoe_runner_labels:
     slurm_account = slurm_account or "amd-aifw-dev"
-    slurm_partition = slurm_partition or "default"
+    slurm_partition = ""
 
 exports = {
     "ATOMESH_CELL_ID": cell["id"],
