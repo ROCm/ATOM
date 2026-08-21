@@ -58,8 +58,10 @@ from .protocol import (
     ModelList,
 )
 from .reasoning import (
+    ReasoningFilter,
     prompt_starts_in_reasoning,
     prompt_tokens_start_in_reasoning,
+    separate_reasoning,
     template_opens_reasoning_implicitly,
 )
 from .serving_anthropic import (
@@ -87,7 +89,6 @@ from .serving_completion import (
     stream_completion_response,
     stream_completion_response_fanout,
 )
-from .sse import event_frame
 from .streaming_dispatch import StreamBatchDispatcher, StreamOutputCollector
 from .tool_parser.registry import TOOL_CALL_PARSER_HELP, resolve_tool_call_parser
 
@@ -124,7 +125,42 @@ _stream_loops: dict[str, AbstractEventLoop] = {}
 _request_start_times: dict[str, float] = {}
 _request_logger: logging.Logger | None = None
 _stream_batch_dispatcher: StreamBatchDispatcher | None = None
-_ANTHROPIC_PING_FRAME = event_frame("ping", {"type": "ping"})
+
+
+# The engine's `leave_reason` in Anthropic's vocabulary. `aborted` has no
+# counterpart -- the client is already gone -- so it keeps the default.
+def anthropic_reasoning_split(
+    raw_text: str, *, thinking: bool, starts_thinking: bool
+) -> tuple[str | None, str]:
+    """Separate the reasoning channel, or decline to.
+
+    `thinking` off means the request wants no reasoning channel, so nothing
+    separates one out and the model's output is the text, markers and all.
+    The endpoint used to separate anyway and discard the reasoning half, which
+    returned an empty message for a reasoning model stopped at `max_tokens`;
+    putting the discarded half back as `text` would hand the client the one
+    thing it declined. Not looking is the only answer that does neither -- and
+    the only one with nothing held back, since no marker is being watched for.
+    """
+    if not thinking:
+        return None, raw_text
+    return separate_reasoning(raw_text, starts_thinking=starts_thinking)
+
+
+def anthropic_reasoning_filter(
+    *, thinking: bool, starts_thinking: bool
+) -> ReasoningFilter | None:
+    """The streaming half of :func:`anthropic_reasoning_split`'s rule."""
+    if not thinking:
+        return None
+    return ReasoningFilter(starts_thinking=starts_thinking)
+
+
+_ANTHROPIC_STOP_REASON = {
+    "eos": "end_turn",
+    "max_tokens": "max_tokens",
+    "stop_sequence": "stop_sequence",
+}
 _metrics_exporter = AtomMetricsExporter()
 _metrics_refresh_task: asyncio.Task | None = None
 _METRICS_REFRESH_INTERVAL_SECONDS = 5.0
@@ -1661,7 +1697,6 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
             )
 
             async def generate_anthropic_stream():
-                from .reasoning import ReasoningFilter
                 from .tool_parser import ToolCallStreamParser
 
                 # Asked of every dialect, not of one literal: the K3
@@ -1669,24 +1704,35 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                 # `.endswith("<think>")` does not see, and the assignment it
                 # guarded skipped `__post_init__` so the instance was in the
                 # thinking state while claiming it did not start there.
-                reasoning_filter = ReasoningFilter(
+                # No filter at all when the client did not ask for thinking.
+                # It said it does not want a reasoning channel, so there is
+                # nothing to separate: the model's output is the text, markers
+                # and all. Separating it and then dropping the reasoning was
+                # how a reasoning model stopped at `max_tokens` returned an
+                # empty message, and putting the dropped part back as `text`
+                # would hand the client the very thing it declined.
+                #
+                # Nothing is watched for, so nothing is held back either.
+                reasoning_filter = anthropic_reasoning_filter(
+                    thinking=bool(getattr(request, "thinking", None)),
                     starts_thinking=prompt_starts_in_reasoning(prompt)
-                    or model_starts_in_reasoning
+                    or model_starts_in_reasoning,
                 )
                 tool_parser = ToolCallStreamParser(parser_cls=tool_call_parser_cls)
                 tool_parser.tools = anthropic_to_openai_tools(request.tools)
                 blocks = AnthropicBlocks()
                 has_tool_calls = False
-                # Reasoning the client did not ask for. Dropped, unless it
-                # turns out to be all the model produced -- a reasoning model
-                # stopped at max_tokens emits nothing else, and answering an
-                # empty message is worse than answering its working out.
-                withheld_reasoning: list[str] = []
                 output_tokens = 0
+                # Overwritten by a tool call, and otherwise by whatever the
+                # engine says. It used to be the constant `end_turn`, so a
+                # response cut off at `max_tokens` claimed a normal ending --
+                # and a reasoning model asked for no thinking, which produces
+                # only reasoning and has all of it dropped, delivered an empty
+                # message that also said nothing was wrong. The vocabularies
+                # already line up; they were simply never connected.
                 stop_reason = "end_turn"
 
                 message_started = False
-                _thinking_enabled = bool(getattr(request, "thinking", None))
                 # Assume abort until we reach the normal end of the stream. If
                 # the client disconnects, GeneratorExit unwinds through the
                 # yields and the finally runs with this still True -> abort.
@@ -1702,23 +1748,26 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                             )
                             message_started = True
                         new_text = chunk_data["text"]
+                        if not has_tool_calls:
+                            stop_reason = _ANTHROPIC_STOP_REASON.get(
+                                chunk_data.get("finish_reason"), stop_reason
+                            )
                         output_tokens += len(chunk_data.get("token_ids", []))
                         finished = chunk_data.get("finished", False)
 
                         # Phase 1: Reasoning filter
-                        segments = reasoning_filter.process(new_text)
-                        if finished:
-                            segments.extend(reasoning_filter.flush())
+                        if reasoning_filter is None:
+                            segments = [("content", new_text)]
+                        else:
+                            segments = reasoning_filter.process(new_text)
+                            if finished:
+                                segments.extend(reasoning_filter.flush())
 
                         for field, text in segments:
                             if not text:
                                 continue
 
                             if field == "reasoning_content":
-                                if not _thinking_enabled:
-                                    withheld_reasoning.append(text)
-                                    yield _ANTHROPIC_PING_FRAME
-                                    continue
                                 for _frame in blocks.delta("thinking", text):
                                     yield _frame
                             else:
@@ -1781,15 +1830,6 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                             if not has_tool_calls and blocks.kind != "text":
                                 for _frame in blocks.open("text"):
                                     yield _frame
-                                if blocks.index == 0 and withheld_reasoning:
-                                    # Nothing was ever delivered: this whole
-                                    # response was reasoning the client did
-                                    # not ask for. Send it rather than an
-                                    # empty message.
-                                    for _frame in blocks.delta(
-                                        "text", "".join(withheld_reasoning)
-                                    ):
-                                        yield _frame
                             for _frame in blocks.close():
                                 yield _frame
                             yield stream_message_delta(stop_reason, output_tokens)
@@ -1810,7 +1850,6 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
             )
 
         # Non-streaming response
-        from .reasoning import separate_reasoning
         from .tool_parser import parse_tool_calls
 
         final_output = await _run_nonstream_with_disconnect(
@@ -1822,8 +1861,9 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
             raise RuntimeError("No output generated")
 
         raw_text = final_output["text"]
-        reasoning_content, content_with_tools = separate_reasoning(
+        reasoning_content, content_with_tools = anthropic_reasoning_split(
             raw_text,
+            thinking=bool(getattr(request, "thinking", None)),
             starts_thinking=prompt_starts_in_reasoning(prompt)
             or model_starts_in_reasoning,
         )
@@ -1834,9 +1874,6 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         )
         output_tokens = len(tokenizer.encode(raw_text))
         cache_read_input_tokens = final_output.get("num_cached_tokens", 0)
-        if not getattr(request, "thinking", None):
-            reasoning_content = None
-
         return build_anthropic_response(
             request_id=request_id,
             model=model_name,

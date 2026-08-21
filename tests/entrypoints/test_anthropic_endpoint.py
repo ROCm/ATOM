@@ -9,7 +9,11 @@ functions and response builders.
 """
 
 import json
+import pathlib
 
+import pytest
+
+from atom.entrypoints.openai import api_server
 from atom.entrypoints.openai.serving_anthropic import (
     AnthropicMessage,
     AnthropicMessagesRequest,
@@ -465,3 +469,116 @@ class TestAnthropicMessagesRequest:
         result = anthropic_to_openai_messages(msgs, system=system)
         # No system message when all blocks are attribution headers
         assert result[0]["role"] == "user"
+
+
+class TestTheStopReasonTellsTheTruth:
+    """Why a message ended, not just that it did.
+
+    `stop_reason` was the constant `end_turn` on the streaming path — the
+    engine's own reason was never read. A response cut off at `max_tokens`
+    therefore claimed a normal ending, and so did the one case where that
+    matters most: a reasoning model asked for no `thinking` produces only
+    reasoning, all of which is correctly dropped, and the client got an empty
+    message that also reported nothing was wrong. It did not ask for a chain
+    of thought and must not be handed one; what it can be given is the reason
+    there is nothing else.
+    """
+
+    def test_the_engine_vocabulary_maps_onto_anthropic(self):
+        assert api_server._ANTHROPIC_STOP_REASON == {
+            "eos": "end_turn",
+            "max_tokens": "max_tokens",
+            "stop_sequence": "stop_sequence",
+        }
+
+    @pytest.mark.parametrize(
+        "engine_reason, expected",
+        [
+            ("eos", "end_turn"),
+            ("max_tokens", "max_tokens"),
+            ("stop_sequence", "stop_sequence"),
+        ],
+    )
+    def test_each_reason_survives_the_translation(self, engine_reason, expected):
+        assert api_server._ANTHROPIC_STOP_REASON[engine_reason] == expected
+
+    @pytest.mark.parametrize("unknown", ["aborted", None, "something_new"])
+    def test_an_unmapped_reason_leaves_the_default_alone(self, unknown):
+        """`aborted` has no counterpart; the client is already gone."""
+        default = "end_turn"
+        assert api_server._ANTHROPIC_STOP_REASON.get(unknown, default) == default
+
+
+class TestThinkingOffMeansNoReasoningChannel:
+    """`thinking` absent: nothing separates, so nothing can be dropped.
+
+    The endpoint used to build a seeded filter regardless, split the output
+    into channels, and then discard the reasoning half. That was invisible
+    while an unseeded filter sent most output down the content channel; with
+    seeding correct, a reasoning model stopped at `max_tokens` produces only
+    reasoning and the client got an empty message. Putting the discarded half
+    back as `text` would have handed it the one thing it declined.
+
+    So the decision lives in two functions both entry points call, rather than
+    inline in an async endpoint no test can reach -- an earlier version of
+    this class re-implemented the branch to test it, and passed while the
+    real one did the opposite.
+    """
+
+    RAW = "Working through it. </think>The answer is 42."
+
+    def test_nothing_is_separated_when_thinking_is_off(self):
+        reasoning, content = api_server.anthropic_reasoning_split(
+            self.RAW, thinking=False, starts_thinking=True
+        )
+        assert reasoning is None
+        assert content == self.RAW, "the raw output is the text, markers and all"
+
+    def test_it_is_separated_when_thinking_is_on(self):
+        reasoning, content = api_server.anthropic_reasoning_split(
+            self.RAW, thinking=True, starts_thinking=True
+        )
+        assert reasoning == "Working through it."
+        assert content == "The answer is 42."
+
+    def test_no_filter_is_built_when_thinking_is_off(self):
+        assert (
+            api_server.anthropic_reasoning_filter(thinking=False, starts_thinking=True)
+            is None
+        )
+
+    def test_a_seeded_filter_is_built_when_it_is_on(self):
+        rf = api_server.anthropic_reasoning_filter(thinking=True, starts_thinking=True)
+        assert rf is not None and rf.state == 1
+
+    def test_both_halves_answer_the_same_question(self):
+        """One rule, so the two paths cannot drift apart."""
+        for thinking in (True, False):
+            split = api_server.anthropic_reasoning_split(
+                self.RAW, thinking=thinking, starts_thinking=True
+            )
+            filt = api_server.anthropic_reasoning_filter(
+                thinking=thinking, starts_thinking=True
+            )
+            assert (split[0] is None) == (filt is None)
+
+    @pytest.mark.parametrize(
+        "helper", ["anthropic_reasoning_split", "anthropic_reasoning_filter"]
+    )
+    def test_the_endpoint_actually_calls_the_helper(self, helper):
+        """Extracting a rule only helps if the caller uses it.
+
+        The endpoint's body is an async generator inside a route handler that
+        no unit test reaches, so a mutation putting `separate_reasoning` back
+        inline passed every behavioural test here. Counted from the source:
+        one definition plus at least one call.
+        """
+        src = pathlib.Path(api_server.__file__).read_text()
+        assert (
+            src.count(helper + "(") >= 2
+        ), f"{helper} is defined but never called — the endpoint has its own copy"
+
+    def test_no_ping_frame_survives(self):
+        """Its only branch is gone; a leftover constant reads as live code."""
+        src = pathlib.Path(api_server.__file__).read_text()
+        assert "_ANTHROPIC_PING_FRAME" not in src
