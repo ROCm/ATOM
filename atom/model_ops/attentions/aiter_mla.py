@@ -58,17 +58,20 @@ except (TypeError, ValueError):
 
 
 # The persistent MLA decode's global KV-split budget is
-# `min(cu_num, max_split_per_batch * batch_size)`, so at batch_size=1 the 16 below
-# caps the whole decode at 16 of the 256 gfx950 CUs. A batch-1 decode has no
+# `min(cu_num, max_split_per_batch * batch_size)`; max_split_per_batch < 0 means
+# "auto" -- aiter derives the split count itself. A batch-1 decode has no
 # parallelism other than the KV walk, and this kernel streams the entire context
-# per layer per step, so that cap is an occupancy ceiling rather than a tuning
-# choice. Measured on Kimi-K3 MXFP4 TP8 at concurrency 1 (~180k-token contexts),
-# raising it to 256 takes aiter's mla_a8w8_qh16_qseqlen4_gqaratio16_v3_ps from
-# 416.7us to 48.0us per call, ITL from 12.68ms to 9.76ms (1.30x) and end-to-end
-# replay of a fixed request set 1.19x faster. Its cost is a heavier mla_reduce
-# (7.8us -> 41.0us), which is why the win shrinks as batch_size grows and the
-# budget stops binding.
-_MLA_MAX_SPLIT_PER_BATCH = int(os.getenv("ATOM_MLA_MAX_SPLIT_PER_BATCH", "16"))
+# per layer per step, so it needs the full split budget on long contexts. The old
+# default of 16 capped decode at 16 of the 256 gfx950 CUs and starved long ctx.
+# Measured on Kimi-K3 MXFP4 TP8 at concurrency 1 (~180k-token contexts), the full
+# budget takes aiter's mla_a8w8_qh16_qseqlen4_gqaratio16_v3_ps from 416.7us to
+# 48.0us per call, ITL from 12.68ms to 9.76ms (1.30x) and end-to-end replay of a
+# fixed request set 1.19x faster. Its cost is a heavier mla_reduce (7.8us ->
+# 41.0us), which is why the win shrinks as batch_size grows and the budget stops
+# binding. -1 (auto) == the cluster cap on current aiter and auto-adapts once
+# aiter ships the workload-adaptive split kernel (no short-ctx over-split then).
+# Override with ATOM_MLA_MAX_SPLIT_PER_BATCH.
+_MLA_MAX_SPLIT_PER_BATCH = int(os.getenv("ATOM_MLA_MAX_SPLIT_PER_BATCH", "-1"))
 # kv_granularity is in PAGES, so the historical max(block_size, 16) is 128 pages =
 # 16,384 tokens per split unit at block_size=128. Lowering it is a NET LOSS and is
 # exposed only as an escape hatch: on its own it bought no ITL at all, and stacked
@@ -92,9 +95,7 @@ def _mla_seg_meta_kwargs() -> dict:
     bounds. Sizing and runtime therefore quote the same number."""
     if not _MLA_META_SUPPORTS_MAX_SPLIT:
         return {}
-    if envs.ATOM_MLA_PAGE_SIZE > 1 or _MLA_MAX_SPLIT_PER_BATCH != 16:
-        return {"max_split_per_batch": _MLA_MAX_SPLIT_PER_BATCH}
-    return {}
+    return {"max_split_per_batch": _MLA_MAX_SPLIT_PER_BATCH}
 
 
 @dataclass
