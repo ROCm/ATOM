@@ -677,14 +677,16 @@ def _dequant_fp8_block_to_bf16(w_fp8, scale, block=128):
 # ---------------------------------------------------------------------------
 
 
-def _wo_a_block_scale_to_e8m0(scale: torch.Tensor, n_groups: int) -> torch.Tensor:
+def _wo_a_block_scale_to_e8m0(
+    scale: torch.Tensor, n_groups: int
+) -> torch.Tensor | None:
     """Disk FP8 128x128 block scale ``[G*N/128, K/128]`` -> uint8 e8m0
-    ``[G, N/128, K/128]``.
+    ``[G, N/128, K/128]``, or ``None`` when the scale is not e8m0-representable.
 
-    The V4 ``wo_a`` block scale is already power-of-two (``scale_fmt='ue8m0'``),
-    so the biased e8m0 exponent is recovered exactly by
-    ``round(log2(s)) + 127``. Emitted as plain uint8 (the mxscale kernel reads
-    the e8m0 bytes directly).
+    An e8m0 byte is a bare biased exponent, so only a power-of-two scale has an
+    exact form -- true of V4 ``wo_a`` (``scale_fmt='ue8m0'``). Rounding anything
+    else would alter the weights rather than restate them, so the premise is
+    checked and a failure returns ``None`` to fall back to BF16.
     """
     s = scale.detach()
     if s.element_size() == 1:
@@ -695,9 +697,17 @@ def _wo_a_block_scale_to_e8m0(scale: torch.Tensor, n_groups: int) -> torch.Tenso
         # return 134; a native float8_e8m0fnu byte is the same exponent.
         e = s.view(torch.uint8)
     else:
-        s = s.float().clamp_min(torch.finfo(torch.float32).tiny)
-        e = torch.round(torch.log2(s)).to(torch.int32) + 127
-        e = e.clamp_(0, 255).to(torch.uint8)
+        s = s.float()
+        if not bool(torch.isfinite(s).all()) or bool((s <= 0).any()):
+            return None
+        exp = torch.round(torch.log2(s))
+        # Round-trips exactly only if the input really was a power of two.
+        if not torch.equal(torch.exp2(exp), s):
+            return None
+        biased = exp.to(torch.int32) + 127
+        if int(biased.min()) < 0 or int(biased.max()) > 255:
+            return None
+        e = biased.to(torch.uint8)
     nb, kb = e.shape
     return e.reshape(n_groups, nb // n_groups, kb).contiguous()
 
@@ -2543,30 +2553,43 @@ class DeepseekV4Attention(nn.Module):
             and scale.shape[0] == out_dim // 128
             and scale.shape[1] == K // 128
         ):
-            self._wo_a_fp8_dtype = w.dtype
-            # Cached as module attrs so the forward skips the reshape and the
-            # scale conversion on every call.
-            self._wo_a_w_fp8 = w.data.view(G, N, K)
-            self._wo_a_w_scale = _wo_a_block_scale_to_e8m0(scale.data, G)
-            self._wo_a_mxscale = True
-            log_key = (G, N, K)
-            if log_key not in _WO_A_MXSCALE_LOGGED:
-                _WO_A_MXSCALE_LOGGED.add(log_key)
-                logger.info(
-                    "%s: wo_a using fp8 e8m0 mxscale batched GEMM "
-                    "(G=%d, N=%d, K=%d, keeping FP8 weight) "
-                    "-- logged once per shape, every matching layer takes this path.",
-                    self.layer_name,
-                    G,
-                    N,
-                    K,
-                )
-            # Suppress the LinearBase CK-layout shuffle, same as the BF16 branch
-            # below: the mxscale kernel reads `wo_a.weight` directly and needs
-            # the plain row-major [G*N, K] layout.
-            self.wo_a.quant_type = QuantType.No
-            self.wo_a.need_normalize_e4m3fn_to_e4m3fnuz = False
-            return
+            w_scale = _wo_a_block_scale_to_e8m0(scale.data, G)
+            if w_scale is None:
+                warn_key = (G, N, K, "not-ue8m0")
+                if warn_key not in _WO_A_MXSCALE_LOGGED:
+                    _WO_A_MXSCALE_LOGGED.add(warn_key)
+                    logger.warning(
+                        "%s: wo_a weight_scale is not power-of-two, so it has "
+                        "no exact e8m0 form; falling back to the BF16 wo_a. "
+                        "Re-quantize with scale_fmt='ue8m0' to use the mxscale "
+                        "batched GEMM. -- logged once per shape.",
+                        self.layer_name,
+                    )
+            else:
+                self._wo_a_fp8_dtype = w.dtype
+                # Cached as module attrs so the forward skips the reshape and
+                # the scale conversion on every call.
+                self._wo_a_w_fp8 = w.data.view(G, N, K)
+                self._wo_a_w_scale = w_scale
+                self._wo_a_mxscale = True
+                log_key = (G, N, K)
+                if log_key not in _WO_A_MXSCALE_LOGGED:
+                    _WO_A_MXSCALE_LOGGED.add(log_key)
+                    logger.info(
+                        "%s: wo_a using fp8 e8m0 mxscale batched GEMM "
+                        "(G=%d, N=%d, K=%d, keeping FP8 weight) -- logged once "
+                        "per shape, every matching layer takes this path.",
+                        self.layer_name,
+                        G,
+                        N,
+                        K,
+                    )
+                # Suppress the LinearBase CK-layout shuffle, same as the BF16
+                # branch below: the mxscale kernel reads `wo_a.weight` directly
+                # and needs the plain row-major [G*N, K] layout.
+                self.wo_a.quant_type = QuantType.No
+                self.wo_a.need_normalize_e4m3fn_to_e4m3fnuz = False
+                return
 
         # Dequant: w (FP8 [out, in]) × scale (e8m0 [out/128, in/128]) → BF16
         bf16 = _dequant_fp8_block_to_bf16(
