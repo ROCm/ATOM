@@ -162,6 +162,13 @@ class Sequence:
         # *covers* the boundary above, which is at or past it. The request still
         # only claims the boundary -- see `_claim_after_load`.
         self.state_joint_kv_tokens = 0
+        # How far `allocate` claimed straight out of the HBM prefix cache, in
+        # tokens. Above `num_cached_tokens`, not below it: the blocks in
+        # `(hit, compressed_hit]` hold this prompt's KV and are still indexed --
+        # the state gate cut the hit, the KV never went anywhere. Claiming them
+        # is what keeps the KV leg from paying LMCache to resend what the pool
+        # already has, and it is where that leg starts.
+        self.state_joint_claim_tokens = 0
         self.temperature = sampling_params.temperature
         self.top_k = sampling_params.top_k
         self.top_p = sampling_params.top_p

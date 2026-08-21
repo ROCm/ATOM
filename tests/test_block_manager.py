@@ -52,6 +52,72 @@ class TestCanAllocate:
         assert block_manager.can_allocate(seq) >= 0
 
 
+# ── the widened claim behind a joint boundary ──────────────────────────────
+
+
+class TestJointClaimReusesResidentBlocks:
+    """`can_allocate` returns one number, and the request needs two.
+
+    What it may call *cached* is gated on a resumable state behind it. What it
+    may point its block table at is every block the prefix walk matched -- the
+    state gate cut resumability, not residency. Without the second number the
+    KV leg pays LMCache to resend blocks the pool is already holding, and the
+    reply lands in *fresh* blocks, so HBM ends up with two copies of the same
+    prefix.
+    """
+
+    def _resident_prefix(self, seq_factory):
+        """A 4-block prefix published in the index, then released."""
+        cfg = MockConfig(
+            num_kvcache_blocks=32, kv_cache_block_size=4, enable_prefix_caching=True
+        )
+        bm = BlockManager(cfg)
+        tokens = list(range(20))
+        first = seq_factory(tokens)
+        bm.allocate(first, 0)
+        bm.hash_blocks(first, len(tokens))
+        resident = list(first.block_table[:4])
+        bm.deallocate(first)
+        return bm, tokens, resident
+
+    def test_without_a_joint_boundary_the_claim_stops_at_the_gated_hit(
+        self, seq_factory
+    ):
+        bm, tokens, resident = self._resident_prefix(seq_factory)
+        seq = seq_factory(tokens)
+        bm.allocate(seq, 2)
+        assert seq.block_table[:2] == resident[:2]
+        # Blocks 2 and 3 are resident and match, but nothing above the hit will
+        # ever be treated as computed, so claiming them would pin blocks the
+        # forward is about to overwrite.
+        assert seq.block_table[2] not in resident[2:]
+        assert seq.num_cached_tokens == 8
+
+    def test_a_joint_boundary_widens_the_claim_without_widening_the_hit(
+        self, seq_factory
+    ):
+        bm, tokens, resident = self._resident_prefix(seq_factory)
+        seq = seq_factory(tokens)
+        # The state gate cut the hit to 2 blocks; the walk had matched 4.
+        seq.state_joint_claim_tokens = 16
+        bm.allocate(seq, 2)
+
+        # All four resident blocks are reused -- that is the transfer the KV
+        # leg no longer has to make, and the second copy that no longer lands.
+        assert seq.block_table[:4] == resident
+        # ...and the request still only calls two of them cached, so a failed
+        # leg leaves the forward recomputing rather than skipping.
+        assert seq.num_cached_tokens == 8
+
+    def test_the_widened_claim_still_gives_every_position_a_block(self, seq_factory):
+        bm, tokens, _ = self._resident_prefix(seq_factory)
+        seq = seq_factory(tokens)
+        seq.state_joint_claim_tokens = 16
+        bm.allocate(seq, 2)
+        assert len(seq.block_table) == 5
+        assert len(set(seq.block_table)) == 5
+
+
 # ── allocate / deallocate ──────────────────────────────────────────────────
 
 
@@ -584,6 +650,7 @@ class TestRegisterReceivedPrefix:
         a = seq_factory(list(range(1, 11)))  # 10 tokens, bs=4 -> 2 full + partial
         bm.allocate(a)
         assert bm.register_received_prefix(a) == 2
+
 
 # ── state_offload disabled by default ─────────────────────────────────────
 
