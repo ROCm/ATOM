@@ -587,7 +587,7 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
                 self._clear_pending_load(sid)
                 continue
             # num_cached after load = max(HBM, offload); never drop below HBM.
-            seq.offload_loaded_tokens = max(hbm, lmc)
+            seq.offload_loaded_tokens = self._claim_after_load(seq, hbm, lmc)
             # req_id MUST be the raw seq.id (the type the scheduler compares
             # against in _update_waiting_for_remote_kv); str(seq.id) is only for
             # LMCache's lookup/pin API. A str here silently never wakes the seq.

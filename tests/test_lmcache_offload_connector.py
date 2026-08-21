@@ -4740,13 +4740,35 @@ def test_a_boundary_already_fully_resident_emits_no_kv_leg():
     assert (ok, reason) == (False, "joint_kv_already_resident")
 
 
+def test_the_claim_stops_at_the_boundary_when_the_chunk_overshoots_it():
+    """chunk != hash_block_size aims the transfer past the state boundary. The
+    claim must not follow it there: the forward would start inside a range the
+    recurrence never saw, and nothing raises."""
+    sched = _k3_scheduler()
+    sched.chunk_size = 256
+    # boundary 5120 (a hash-block position), covering chunk ends at 5376
+    seq = _k3_seq(hbm=0, joint=5120, kv=5376, claimed=4096)
+    assert sched._claim_after_load(seq, 4096, 5376) == 5120
+
+
+def test_a_layout_whose_claim_and_transfer_share_a_boundary_claims_the_end():
+    from atom.kv_transfer.offload.dense.connector import DenseOffloadScheduler
+
+    sched = object.__new__(DenseOffloadScheduler)
+    seq = SimpleNamespace(id=1)
+    assert sched._claim_after_load(seq, 4096, 8192) == 8192
+    # Never below the HBM floor, whatever the transfer reported.
+    assert sched._claim_after_load(seq, 4096, 0) == 4096
+
+
 def test_the_claim_never_exceeds_the_state_boundary():
     """Overshooting the transfer is one wasted chunk; overshooting the *claim*
     would have the forward skip tokens the state does not cover."""
+    sched = _k3_scheduler()
     seq = _k3_seq(hbm=512, joint=1000, kv=1024)
-    assert KimiK3OffloadScheduler._claim_after_load(seq, 512, 1024) == 1000
+    assert sched._claim_after_load(seq, 512, 1024) == 1000
     # No joint boundary: dense's own answer.
-    assert KimiK3OffloadScheduler._claim_after_load(_k3_seq(hbm=512), 512, 1024) == 1024
+    assert sched._claim_after_load(_k3_seq(hbm=512), 512, 1024) == 1024
 
 
 def test_a_stalled_save_releases_blocks_it_never_handed_out(monkeypatch):

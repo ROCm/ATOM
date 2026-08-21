@@ -391,6 +391,21 @@ class OffloadSchedulerMixin:
         )
         return True
 
+    def _claim_after_load(self, seq, hbm: int, lmc: int) -> int:
+        """How far the request may call itself cached once the load lands.
+
+        The transfer's end, for every layout whose claim and transfer share a
+        boundary. A layout that aims them at different places overrides this --
+        `kimi_k3` transfers the chunk *covering* its state boundary and may only
+        claim the boundary, and claiming the rounded-up figure there would have
+        the forward skip tokens the recurrent state does not cover.
+
+        A seam rather than four inlined `max`es because getting it wrong is
+        silent: the request simply starts further along than its state
+        supports, and the output is wrong with no exception anywhere.
+        """
+        return max(int(hbm), int(lmc))
+
     def should_park_partial_prefill_for_load(self, seq) -> bool:
         if not self._do_load:
             return False
@@ -417,7 +432,7 @@ class OffloadSchedulerMixin:
         load_spec.can_load = True
         self._reqs_need_recv[sid] = seq
         self._handoff_loads.discard(sid)
-        seq.offload_loaded_tokens = max(hbm, lmc)
+        seq.offload_loaded_tokens = self._claim_after_load(seq, hbm, lmc)
         logger.debug(
             "[OFFLOAD-LOAD-HANDOFF-READY] seq=%s hbm_cached=%d "
             "lmc_cached=%d offload_loaded=%d need=%d",
@@ -471,7 +486,7 @@ class OffloadSchedulerMixin:
             self._mark_load_skip(seq, reason, hbm, lmc, need, chunk)
             self._clear_pending_load(sid)
             return False
-        seq.offload_loaded_tokens = max(hbm, lmc)
+        seq.offload_loaded_tokens = self._claim_after_load(seq, hbm, lmc)
         return True
 
     def _save_frontier(self, seq) -> int:

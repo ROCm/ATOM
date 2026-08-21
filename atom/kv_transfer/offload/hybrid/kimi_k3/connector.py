@@ -441,8 +441,7 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler):
         # whose KV never came.
         return True, "joint_state_and_kv", start, kv_target, kv_target - start, chunk
 
-    @staticmethod
-    def _claim_after_load(seq, hbm: int, lmc: int) -> int:
+    def _claim_after_load(self, seq, hbm: int, lmc: int) -> int:
         """How far the request may call itself cached once the load lands.
 
         For a joint load that is the *state* boundary, which sits at or below

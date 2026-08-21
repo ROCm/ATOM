@@ -2221,7 +2221,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             # combines it with offload_loaded_tokens after all TP workers
             # succeed to publish the restored GPU prefix.
             seq.offload_load_start_tokens = hbm
-            seq.offload_loaded_tokens = max(hbm, lmc)
+            seq.offload_loaded_tokens = self._claim_after_load(seq, hbm, lmc)
             # req_id MUST be the raw seq.id (the type the scheduler compares
             # against in _update_waiting_for_remote_kv); str(seq.id) is only for
             # LMCache's lookup/pin API. A str here silently never wakes the seq.
