@@ -105,6 +105,12 @@ if not spur_controller_addr:
             "SPUR_CONTROLLER_ADDR", "http://134.199.196.72:6817"
         )
 
+slurm_account = runner.get("slurm_account", "amd-frameworks")
+slurm_partition = runner.get("slurm_partition", "amd-frameworks")
+if slurm_submit_runner in crusoe_runner_labels:
+    slurm_account = slurm_account or "amd-aifw-dev"
+    slurm_partition = slurm_partition or "default"
+
 exports = {
     "ATOMESH_CELL_ID": cell["id"],
     "MODEL_NAME": cell["model"],
@@ -220,8 +226,8 @@ exports = {
     "SWEBENCH_MAX_WORKERS": "" if accuracy.get("max_workers") is None else accuracy.get("max_workers"),
     "SWEBENCH_EVAL_TIMEOUT": "" if accuracy.get("instance_timeout") is None else accuracy.get("instance_timeout"),
     "SLURM_SUBMIT_RUNNER": slurm_submit_runner,
-    "SLURM_ACCOUNT": runner.get("slurm_account", "amd-frameworks"),
-    "SLURM_PARTITION": runner.get("slurm_partition", "amd-frameworks"),
+    "SLURM_ACCOUNT": slurm_account,
+    "SLURM_PARTITION": slurm_partition,
     "SLURM_CPUS_PER_TASK": runner.get("cpus_per_task", 114),
     "SLURM_GPUS_PER_NODE": runner.get("gpus_per_node", 8),
     "SLURM_TIME_LIMIT": runner.get("time_limit", "06:00:00"),
