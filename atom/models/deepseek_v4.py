@@ -196,6 +196,10 @@ v4_attn_runner = CudagraphCaptureRunner()
 # `@piecewise_core` decorator itself and is handed these two per call.
 v4_attn_outputs = StableOutputs()
 
+# ATOM_ATTN_CAP_DBG=1: capture-time probe (once per num_tokens) locating which
+# attn sub-op pushes the per-graph cudagraph-pool reservation (the ~22GB).
+_V4_ATTN_CAP_DBG: set = set()
+
 
 def _v4_core_attention_fake(
     x: torch.Tensor,
@@ -238,6 +242,33 @@ def v4_core_attention(
     is_piecewise = (
         getattr(fc, "cudagraph_runtime_mode", None) == CUDAGraphMode.PIECEWISE
     )
+
+    # AF segmented cudagraph: during a segmented capture, the attn core is ONE
+    # captured segment of the whole-forward graph. It reads the dense pieces'
+    # outputs (and positions) zero-copy from the shared pinned pool -- no
+    # copy_per_step -- and the next dense piece reads its output the same way.
+    # Keyed per (layer, bucket, q, num_tokens): the paged kernels' grids vary by
+    # bs/q_eff even at the same num_tokens. No active session -> unchanged below.
+    from atom.utils.attn_ffn_segmented_cudagraph import active_segmented_session
+
+    _session = active_segmented_session()
+    if _session is not None:
+        bucket_bs, q_eff = decode_bucket_key(fc)
+        seg_key = ("attn", layer_name, bucket_bs, q_eff, int(x.shape[0]))
+        return _session.run_segment(
+            seg_key,
+            self._attn_core,
+            piecewise=False,
+            x=x,
+            q=q,
+            kv_pre=kv_pre,
+            qr=qr,
+            qr_scale=qr_scale,
+            positions=positions,
+            idx_q_quant=idx_q_quant,
+            idx_weights=idx_weights,
+            idx_q_scale=idx_q_scale,
+        )
 
     # One path for every mode. The `@piecewise_core`-decorated `_attn_core` reads
     # the two flags and routes:
@@ -2899,6 +2930,21 @@ class DeepseekV4Attention(nn.Module):
         # / qkn.k_packed / qkn.k_rope populated (the 2buff layout nope-fp8 [.,512] +
         # rope-bf16 [.,64] that op4 (prefill) / op5 (decode) consume with no
         # requant). The inactive path's fields stay None.
+        # Capture-time reserved-highwater probe: locate WHICH attn sub-op pushes the
+        # per-graph pool reservation (the 22GB). Fires ONLY during the SEGMENTED
+        # capture (active session), not the additive piecewise capture, so we
+        # measure the segmented path directly. No sync (not allowed in capture;
+        # memory_reserved() is a host query). Once per nt.
+        from atom.utils.attn_ffn_segmented_cudagraph import active_segmented_session
+
+        _cap_dbg = (
+            os.environ.get("ATOM_ATTN_CAP_DBG") == "1"
+            and num_tokens not in _V4_ATTN_CAP_DBG
+            and active_segmented_session() is not None
+        )
+        if _cap_dbg:
+            _cr0 = torch.cuda.memory_reserved()
+            _cr_qk = _cr_idx = _cr_sparse = _cr0
         qkn = qk_norm_rope_maybe_quant(
             q,
             kv_pre,
@@ -2928,6 +2974,8 @@ class DeepseekV4Attention(nn.Module):
             swa_rope_buff=self.swa_plane_rope if (is_decode and self.kv_fp8) else None,
             prefix=f"{self.layer_name}.qk_norm_rope_maybe_quant",
         )
+        if _cap_dbg:
+            _cr_qk = torch.cuda.memory_reserved()
         if _V4_USE_REF_QUANT and not self.kv_fp8:
             act_quant_inplace(qkn.kv[..., :-rd], 64, self.scale_fmt)
 
@@ -2957,6 +3005,8 @@ class DeepseekV4Attention(nn.Module):
             self._fill_csa_paged_compress(
                 attn_md, indexer_topk_batched, positions, num_tokens
             )
+        if _cap_dbg:
+            _cr_idx = torch.cuda.memory_reserved()
 
         # ===== Sparse attention dispatch =====
         # Decode SWA write fires upstream of this dispatch via the
@@ -2990,6 +3040,8 @@ class DeepseekV4Attention(nn.Module):
                 qo_indptr=attn_md.qo_indptr,
                 prefix=f"{self.layer_name}.sparse_attn_decode",
             )  # [S, H, head_dim]
+            if _cap_dbg:
+                _cr_sparse = torch.cuda.memory_reserved()
         else:
             # Two-source paged prefill: prefix from `unified_kv` (per-ratio
             # buffer with SWA history + compress section), extend from per-fwd
@@ -3144,6 +3196,19 @@ class DeepseekV4Attention(nn.Module):
             o[..., -rd:],
             prefix=f"{self.layer_name}.inverse_rope",
         )
+        if _cap_dbg:
+            _cr_end = torch.cuda.memory_reserved()
+            _V4_ATTN_CAP_DBG.add(num_tokens)
+            logging.getLogger("atom").info(
+                "[attn-cap] nt=%d | reserved pushed by: qk_norm=+%.1f idxr=+%.1f "
+                "sparse=+%.1f rest=+%.1f MB (total +%.1fMB this graph)",
+                num_tokens,
+                (_cr_qk - _cr0) / 1e6,
+                (_cr_idx - _cr_qk) / 1e6,
+                (_cr_sparse - _cr_idx) / 1e6,
+                (_cr_end - _cr_sparse) / 1e6,
+                (_cr_end - _cr0) / 1e6,
+            )
         # Output LoRA (wo_a/wo_b) now runs in `_attn_post` (graphed piece).
         return o.reshape(num_tokens, -1)  # [num_tokens, n_local_heads*head_dim]
 
@@ -3430,6 +3495,11 @@ class MoE(nn.Module):
             self.shared_experts is not None
             and self.alt_stream is not None
             and envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0
+            # AF segmented cudagraph captures each piece as its own graph, so a
+            # per-layer alt_stream fork is NOT reused across pieces -> replay spawns
+            # a side stream per layer (hundreds). Disable the MoE overlap here; the
+            # decode-time overlap benefit is small next to that stream blowup.
+            and os.environ.get("ATOM_AF_SEGMENTED", "0") != "1"
         )
         # Register self in static_forward_context so the custom op dispatcher
         # can look us up by `layer_name` (= self.prefix). Needed by

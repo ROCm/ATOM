@@ -163,6 +163,23 @@ class CUDAGraphWrapper:
         global _shared_graph_pool
 
         forward_context = get_forward_context()
+
+        # AF segmented cudagraph: during a segmented capture, this dense piece is
+        # ONE captured segment of the whole-forward graph (not self-captured).
+        # Dedup keys it by (piece identity, num_tokens) so the same piece at the
+        # same shape shares one exec across ragged buckets. No active session
+        # (the default) -> unchanged behavior below.
+        from atom.utils.attn_ffn_segmented_cudagraph import active_segmented_session
+
+        _session = active_segmented_session()
+        if _session is not None:
+            num_tokens = getattr(
+                getattr(forward_context, "batch_descriptor", None), "num_tokens", None
+            )
+            return _session.run_segment(
+                ("dense", id(self), num_tokens), self.runnable, *args, **kwargs
+            )
+
         batch_descriptor = forward_context.batch_descriptor
         cudagraph_runtime_mode = forward_context.cudagraph_runtime_mode
 

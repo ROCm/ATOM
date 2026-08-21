@@ -656,6 +656,25 @@ class ModelRunner:
         # capture never ran (enforce_eager), so the ragged-bucket paths no-op.
         self._piecewise_captured_tokens: set[int] = set()
         self._piecewise_sorted_tokens: list[int] = []
+        # AF segmented cudagraph (ATOM_AF_SEGMENTED=1): capture the AF_PIECEWISE
+        # forward as per-piece SEGMENTS sharing one pinned pool + dedup registry, so
+        # the attn core reads its inputs zero-copy (no copy_per_step) AND dense
+        # segments dedup across ragged buckets. Piecewise (many launches), unlike
+        # FULL. v1 = rectangle decode; ragged is a follow-up. Off by default.
+        self._af_segmented = os.environ.get("ATOM_AF_SEGMENTED", "0") == "1"
+        self._af_segmented_graphs: dict = {}
+        self._af_dedup = None  # HipGraphDedupRegistry, built lazily at capture
+        # ONE pool per num_tokens (NOT per-bucket, NOT fully shared):
+        #  - fully shared across ALL buckets corrupts V4 decode (ragged ~0.4);
+        #  - per-bucket is correct but duplicates dense activations N times (OOM);
+        #  - per-num_tokens isolates across num_tokens (the granularity the dense
+        #    pieces' `_graph_pools` use, proven safe at 0.96 in cuda_graph.py) while
+        #    letting buckets with the SAME num_tokens reuse each other's freed pool
+        #    blocks via natural forward-local lifetime -> memory ~= Σ distinct
+        #    num_tokens, not Σ buckets. Attn segments are bs-dependent, so whether
+        #    same-num_tokens/cross-bs sharing stays clean for V4 is the open point.
+        self._af_segmented_pools: dict = {}
+        self._af_seg_logged: set = set()  # keys already logged hit/miss (diagnostic)
 
         init_exit_handler(self)
         default_dtype = self.config.torch_dtype
@@ -3140,8 +3159,40 @@ class ModelRunner:
                         if self.use_mrope
                         else self.forward_vars["positions"].gpu[:num_tokens_pad]
                     )
+                    # AF segmented cudagraph: replay the whole-forward graph for this
+                    # (bs, max_q_len, num_tokens_pad) bucket -- rectangle AND ragged.
+                    # Inputs were refreshed into the fixed forward_vars above; the
+                    # graph reads them + the pinned pool zero-copy. A shape never
+                    # captured (skip_capture) falls through to the per-piece path.
+                    if self._af_segmented:
+                        _seg_key = (graph_bs, max_q_len, num_tokens_pad)
+                        _bg = self._af_segmented_graphs.get(_seg_key)
+                        if _seg_key not in self._af_seg_logged:
+                            self._af_seg_logged.add(_seg_key)
+                            logger.info(
+                                "AF_SEGMENTED replay %s -> %s (captured keys: %s)",
+                                _seg_key,
+                                "HIT" if _bg is not None else "MISS(fallthrough)",
+                                sorted(self._af_segmented_graphs)[:16],
+                            )
+                        if _bg is not None:
+                            _bg.replay()
+                            hidden_states = self.forward_vars["outputs"][
+                                :num_tokens_pad
+                            ]
+                            _is_spec = hasattr(self, "drafter")
+                            _slice = num_tokens_pad if _is_spec else num_tokens
+                            hidden_states = hidden_states[:_slice]
+                            logits = self.model.compute_logits(hidden_states)
+                            return logits, hidden_states
+                    # AF segmented skips recording the per-piece PIECEWISE graphs
+                    # (a segmented HIT returned above), so a MISS must fall back to
+                    # eager (NONE), not PIECEWISE which would replay graphs that were
+                    # never captured.
                     forward_context.cudagraph_runtime_mode = (
-                        CUDAGraphMode.PIECEWISE if _captured else CUDAGraphMode.NONE
+                        CUDAGraphMode.PIECEWISE
+                        if (_captured and not self._af_segmented)
+                        else CUDAGraphMode.NONE
                     )
                     forward_context.batch_descriptor = BatchDescriptor(
                         num_tokens=num_tokens_pad
@@ -3854,6 +3905,110 @@ class ModelRunner:
             return True
         return False
 
+    def _capture_af_segmented(
+        self, *, bs, max_q_len, num_tokens, input_ids, model_positions, outputs,
+        capture_stream,
+    ):  # fmt: skip
+        """Capture the forward as per-piece SEGMENTS for this (bs, max_q_len)
+        bucket, sharing a pinned pool + dedup registry so the dense pieces and attn
+        core (captured segments via the per-piece hooks) read each other zero-copy,
+        and dense segments dedup across buckets. Piecewise (many launches); stored
+        by (bs, max_q_len) and replayed in run_model.
+        """
+        from atom.utils.attn_ffn_segmented_cudagraph import (
+            SegmentedCudaGraph,
+            SegmentedCudaGraphCapture,
+        )
+        from atom.utils.hip_graph_dedup import HipGraphDedupRegistry
+
+        if self._af_dedup is None:
+            self._af_dedup = HipGraphDedupRegistry()
+        # ONE pool per num_tokens (see __init__): isolates across num_tokens (dense
+        # `_graph_pools` granularity, proven safe) but lets same-num_tokens buckets
+        # reuse freed pool blocks -> memory ~= Σ distinct num_tokens, not Σ buckets.
+        # Dedup shares execs across buckets (exec-level, pool-independent).
+        pool = self._af_segmented_pools.get(num_tokens)
+        if pool is None:
+            pool = torch.cuda.graph_pool_handle()
+            self._af_segmented_pools[num_tokens] = pool
+        fc = get_forward_context()
+        # NONE so nothing self-captures; the per-piece hooks route to run_segment
+        # off the active session, not off the runtime mode.
+        fc.cudagraph_runtime_mode = CUDAGraphMode.NONE
+        fc.batch_descriptor = BatchDescriptor(num_tokens=num_tokens)
+        g = SegmentedCudaGraph()
+        with SegmentedCudaGraphCapture(
+            cuda_graph=g,
+            pool=pool,
+            stream=capture_stream,
+            dedup=self._af_dedup,
+        ) as sess:
+            out = self.model(input_ids[:num_tokens], model_positions)
+            sess.run_segment(
+                ("af_output", num_tokens),
+                lambda o: outputs[:num_tokens].copy_(o),
+                out,
+            )
+            if self.logits_in_graph:
+                sess.run_segment(
+                    ("af_logits", num_tokens),
+                    lambda: self.model.compute_logits(outputs[:num_tokens]),
+                )
+        fc.batch_descriptor = None
+        self._af_segmented_graphs[(bs, max_q_len, num_tokens)] = g
+
+    def _capture_af_segmented_ragged(
+        self, *, bs, max_q_len, rectangle_tokens, build_capture, input_ids, outputs,
+        capture_stream,
+    ):  # fmt: skip
+        """AF segmented cudagraph, ragged: for each smaller ragged sub-bucket
+        (num_tokens_pad = b*max_q_len < this bs's rectangle) a real ragged step may
+        replay, set up its synthetic ragged metadata and capture a whole-forward
+        segmented graph (dense segments dedup with the rectangle's). Mirrors
+        `_capture_attn_ffn_graphs`'s bucket enumeration.
+        """
+        positions = self.forward_vars["positions"].gpu
+        for b in self.graph_bs:
+            num_tokens_pad = b * max_q_len
+            if num_tokens_pad >= rectangle_tokens or num_tokens_pad < bs:
+                continue
+            if self._piecewise_skip_capture(num_tokens_pad):
+                continue
+            attn_metadata, context = build_capture(
+                bs=bs, max_q_len=max_q_len, num_tokens_pad=num_tokens_pad
+            )
+            num_pad, num_tokens_across_dp = self.get_dp_padding(num_tokens_pad)
+            num_tokens_dp = num_tokens_pad + num_pad
+            if num_tokens_across_dp is not None:
+                num_tokens_across_dp = torch.full_like(
+                    num_tokens_across_dp, num_tokens_dp
+                )
+            model_positions = (
+                self._mrope_positions_view(num_tokens_dp)
+                if self.use_mrope
+                else positions[:num_tokens_dp]
+            )
+            set_forward_context(
+                attn_metadata=attn_metadata,
+                atom_config=self.config,
+                context=context,
+                num_tokens=num_tokens_dp,
+                num_tokens_across_dp=num_tokens_across_dp,
+                ubatch_slices=None,
+                in_hipgraph=True,
+            )
+            self.model(input_ids[:num_tokens_dp], model_positions)  # warmup
+            self._capture_af_segmented(
+                bs=bs,
+                max_q_len=max_q_len,
+                num_tokens=num_tokens_dp,
+                input_ids=input_ids,
+                model_positions=model_positions,
+                outputs=outputs,
+                capture_stream=capture_stream,
+            )
+            self._piecewise_captured_tokens.add(num_tokens_dp)
+
     def _capture_attn_ffn_graphs(
         self, bs, max_q_len, rectangle_tokens, build_capture, input_ids
     ):
@@ -4056,9 +4211,15 @@ class ModelRunner:
 
         with pause_gc(), graph_capture() as capture_ctx, self.capture_profiler as prof:
             for max_q_len in q_buckets:
-                capture_range = (
-                    tqdm.tqdm(self.graph_bs) if self.rank == 0 else self.graph_bs
+                # AF segmented shares ONE pool across buckets: capture largest bs
+                # first (sgl parity) so smaller buckets reuse the max allocation
+                # instead of each growing the pool.
+                _bs_order = (
+                    list(reversed(self.graph_bs))
+                    if self._af_segmented
+                    else list(self.graph_bs)
                 )
+                capture_range = tqdm.tqdm(_bs_order) if self.rank == 0 else _bs_order
                 for bs in capture_range:
                     if self.rank == 0:
                         capture_range.set_description(f"Capturing {bs=}, {max_q_len=}")
@@ -4136,15 +4297,30 @@ class ModelRunner:
                     if _piecewise:
                         # PIECEWISE: no manual whole-forward graph; the compiled
                         # per-piece wrappers self-capture. Replay once to register.
+                        #
+                        # Under AF segmented, replay uses the whole-forward
+                        # segmented graphs (captured below), so these per-piece
+                        # PIECEWISE graphs are never replayed -- pure dead weight
+                        # (~11GB). Skip recording them; keep the
+                        # `_piecewise_captured_tokens` bookkeeping (run_model bucket
+                        # dispatch keys off it) and rely on the segmented MISS
+                        # fallback going eager (NONE), not PIECEWISE.
                         fc = get_forward_context()
-                        fc.cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
-                        fc.batch_descriptor = BatchDescriptor(num_tokens=num_tokens)
-                        self.model(input_ids[:num_tokens], model_positions)
-                        fc.cudagraph_runtime_mode = CUDAGraphMode.NONE
-                        fc.batch_descriptor = None
+                        if not self._af_segmented:
+                            fc.cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
+                            fc.batch_descriptor = BatchDescriptor(num_tokens=num_tokens)
+                            self.model(input_ids[:num_tokens], model_positions)
+                            fc.cudagraph_runtime_mode = CUDAGraphMode.NONE
+                            fc.batch_descriptor = None
                         self._piecewise_captured_tokens.add(num_tokens)
                         # also capture the attn_ffn graphs this bs can replay ragged
-                        if attn_ffn_piecewise and supports_ragged_capture:
+                        # (skipped under AF segmented -- its ragged capture below
+                        # replaces this old attn-core-only path).
+                        if (
+                            attn_ffn_piecewise
+                            and supports_ragged_capture
+                            and not self._af_segmented
+                        ):
                             self._capture_attn_ffn_graphs(
                                 bs=bs,
                                 max_q_len=max_q_len,
@@ -4152,6 +4328,31 @@ class ModelRunner:
                                 build_capture=build_capture,
                                 input_ids=input_ids,
                             )
+                        # AF segmented cudagraph: capture the whole forward as
+                        # per-piece segments for this rectangle bucket, then for the
+                        # smaller ragged sub-buckets this bs can replay. Both are
+                        # keyed (bs, max_q_len, num_tokens) and replayed zero-copy in
+                        # run_model; dense segments dedup across buckets.
+                        if self._af_segmented:
+                            self._capture_af_segmented(
+                                bs=bs,
+                                max_q_len=max_q_len,
+                                num_tokens=num_tokens,
+                                input_ids=input_ids,
+                                model_positions=model_positions,
+                                outputs=outputs,
+                                capture_stream=capture_ctx.stream,
+                            )
+                            if supports_ragged_capture:
+                                self._capture_af_segmented_ragged(
+                                    bs=bs,
+                                    max_q_len=max_q_len,
+                                    rectangle_tokens=num_tokens,
+                                    build_capture=build_capture,
+                                    input_ids=input_ids,
+                                    outputs=outputs,
+                                    capture_stream=capture_ctx.stream,
+                                )
                         if prof is not None:
                             # Drain before closing the window so this bs's
                             # kernels land in this bs's file. Profiling-only —
@@ -4208,6 +4409,13 @@ class ModelRunner:
                         prof.step()
                         self._capture_trace_tag = None
         self.graph_bs.sort(reverse=False)
+
+        # AF segmented: where the captured-segment pool footprint actually went
+        # (dense vs attn vs af_output), summed over all buckets.
+        if self._af_segmented and self.rank == 0:
+            from atom.utils.attn_ffn_segmented_cudagraph import log_segment_mem_stats
+
+            log_segment_mem_stats()
 
         # PIECEWISE: sorted 1D num_tokens buckets for run_model's round_up_1d(Σ)
         # dispatch (bisect_left over this to pick the tightest captured shape).
