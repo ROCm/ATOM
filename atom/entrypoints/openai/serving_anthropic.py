@@ -362,9 +362,19 @@ def tool_event_frames(events, blocks: AnthropicBlocks):
             yield from blocks.close()
 
 
-def starts_a_tool_call(events) -> bool:
-    """Whether this batch opened a tool call, which is its own `stop_reason`."""
-    return any(etype == "tool_call_start" for etype, _ in events)
+def completes_a_tool_call(events) -> bool:
+    """Whether this batch produced a *usable* tool call.
+
+    Keyed on the arguments and not the name, which is what makes announcing a
+    name early safe. A name can be sent before the call is known to close --
+    the point of announcing it -- so a response truncated at `max_tokens`
+    mid-call has sent a name and nothing else. Reporting `tool_use` there
+    would tell the client to run a tool whose arguments never arrived.
+
+    Every parser emits name and arguments together unless it announced early,
+    so this reads the same as the name for every format that does not.
+    """
+    return any(etype == "tool_call_args" for etype, _ in events)
 
 
 def stream_content_block_start(

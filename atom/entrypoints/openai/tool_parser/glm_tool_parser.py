@@ -45,9 +45,19 @@ _ARG_RE = re.compile(
 )
 
 
+_PEEK_NAME_RE = re.compile(r"<tool_call>\s*(\w[\w.\-]*)\s*<arg_key>")
+
+
 class GlmParser(BufferedMarkerParser):
     NAME: ClassVar[str] = "glm"
     START_MARKERS: ClassVar[tuple[str, ...]] = ("<tool_call>",)
+
+    @classmethod
+    def peek_name(cls, region: str) -> str | None:
+        """`<tool_call>NAME<arg_key>` -- the name is what precedes the first
+        argument key, so it is legible only once that key arrives."""
+        m = _PEEK_NAME_RE.search(region)
+        return m.group(1) if m else None
 
     @classmethod
     def detect(cls, text: str) -> bool:

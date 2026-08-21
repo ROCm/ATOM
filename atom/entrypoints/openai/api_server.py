@@ -75,7 +75,7 @@ from .serving_anthropic import (
     anthropic_to_openai_messages,
     anthropic_to_openai_tools,
     build_anthropic_response,
-    starts_a_tool_call,
+    completes_a_tool_call,
     stream_message_delta,
     stream_message_start,
     stream_message_stop,
@@ -96,7 +96,11 @@ from .serving_completion import (
     stream_completion_response,
     stream_completion_response_fanout,
 )
-from .streaming_dispatch import StreamBatchDispatcher, StreamOutputCollector
+from .streaming_dispatch import (
+    FrameWait,
+    StreamBatchDispatcher,
+    StreamOutputCollector,
+)
 from .tool_parser.registry import TOOL_CALL_PARSER_HELP, resolve_tool_call_parser
 
 # Configure logging
@@ -235,11 +239,30 @@ def _log_request_event(event_type: str, request_id: str, data: Any) -> None:
     _request_logger.info(json.dumps(entry, default=str))
 
 
-async def _logged_stream(
+async def _client_stream(
     gen: AsyncGenerator[str, None], request_id: str
 ) -> AsyncGenerator[str, None]:
-    """Wrap a streaming generator to log each SSE chunk."""
-    async for chunk in gen:
+    """Every SSE frame on its way to the client: logged, and timed.
+
+    The last point a frame passes through before uvicorn writes it, which is
+    why the silence watchdog lives here rather than at the collector it
+    started at. Between the collector and this line sit the reasoning
+    channel's read-ahead and the tool-call format's, and while either
+    withholds, the collector keeps waking on schedule -- so the gauge read
+    zero for exactly the stall it exists to report.
+
+    Wrapping every streaming response and not two of the three: this was
+    `_logged_stream`, and the Anthropic endpoint never used it. A watchdog
+    with an endpoint-shaped hole in it is worse than none, because the zero it
+    reports looks like an answer.
+    """
+    it = gen.__aiter__()
+    while True:
+        with FrameWait(request_id):
+            try:
+                chunk = await it.__anext__()
+            except StopAsyncIteration:
+                return
         if _request_logger is not None and chunk.startswith("data: "):
             payload = chunk[6:].strip()
             if payload != "[DONE]":
@@ -1438,7 +1461,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     tool_parser_cls=tool_call_parser_cls,
                 )
             return StreamingResponse(
-                _logged_stream(gen, request_id),
+                _client_stream(gen, request_id),
                 media_type="text/event-stream",
             )
 
@@ -1617,7 +1640,7 @@ async def completions(request: CompletionRequest, raw_request: Request):
                     cleanup_request,
                 )
             return StreamingResponse(
-                _logged_stream(gen, request_id),
+                _client_stream(gen, request_id),
                 media_type="text/event-stream",
             )
 
@@ -1834,7 +1857,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                             else:
                                 # Phase 2: Tool call detection on content
                                 events = tool_parser.process(text)
-                                if starts_a_tool_call(events):
+                                if completes_a_tool_call(events):
                                     has_tool_calls = True
                                     stop_reason = "tool_use"
                                 for _frame in tool_event_frames(events, blocks):
@@ -1843,7 +1866,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                         if finished:
                             # Flush remaining tool call events
                             events = tool_parser.flush()
-                            if starts_a_tool_call(events):
+                            if completes_a_tool_call(events):
                                 has_tool_calls = True
                                 stop_reason = "tool_use"
                             for _frame in tool_event_frames(events, blocks):
@@ -1867,7 +1890,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                     cleanup_request(request_id)
 
             return StreamingResponse(
-                generate_anthropic_stream(),
+                _client_stream(generate_anthropic_stream(), request_id),
                 media_type="text/event-stream",
                 headers={
                     "anthropic-version": "2023-06-01",

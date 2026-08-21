@@ -108,6 +108,9 @@ def _infer_name(arg_names: set, param_types: dict[str, dict[str, Any]]) -> str |
     return best
 
 
+_PEEK_NAME_RE = re.compile(r'invoke name="([^"]+)"')
+
+
 class DsmlParser(BufferedMarkerParser):
     NAME: ClassVar[str] = "dsml"
     # Region-start markers, both marked and marker-less variants.
@@ -117,6 +120,13 @@ class DsmlParser(BufferedMarkerParser):
         "<invoke name=",  # marker-less invoke (common malform)
         "<tool_calls>",  # marker-less section open
     )
+
+    @classmethod
+    def peek_name(cls, region: str) -> str | None:
+        """`<｜DSML｜invoke name="NAME">`, and the bare `<invoke ...>` the
+        model often emits instead -- both carry the name in the opener."""
+        m = _PEEK_NAME_RE.search(region)
+        return m.group(1) if m else None
 
     # detect() is inherited: any start marker present means DSML.
 

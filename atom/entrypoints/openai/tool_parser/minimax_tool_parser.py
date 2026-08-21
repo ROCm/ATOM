@@ -33,9 +33,18 @@ _INVOKE_RE = re.compile(
 _PARAM_RE = re.compile(r"<([\w-]+)>(.*?)</\1>", re.DOTALL)
 
 
+_PEEK_NAME_RE = re.compile(r'<invoke name="([^"]+)"')
+
+
 class MiniMaxParser(BufferedMarkerParser):
     NAME: ClassVar[str] = "minimax"
     START_MARKERS: ClassVar[tuple[str, ...]] = (MINIMAX_NS, "<tool_call>")
+
+    @classmethod
+    def peek_name(cls, region: str) -> str | None:
+        """`<invoke name="NAME">`, ns_token stripped first as `parse` does."""
+        m = _PEEK_NAME_RE.search(region.replace(MINIMAX_NS, ""))
+        return m.group(1) if m else None
 
     @classmethod
     def detect(cls, text: str) -> bool:

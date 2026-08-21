@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import Any, ClassVar
 
 from ..marker_scanner import MarkerScanner
+from .schema import build_param_types
 
 
 def unique_tool_call_id() -> str:
@@ -55,6 +56,36 @@ class ToolCallParser(ABC):
     # covered the moment it exists rather than when someone writes a case.
     START_MARKERS: ClassVar[tuple[str, ...]] = ()
 
+    @classmethod
+    def peek_name(cls, region: str) -> str | None:
+        """The tool being called, from a region that has not closed yet.
+
+        ``None`` while the name is not yet legible, and ``None`` by default:
+        a format that does not override this simply announces nothing early,
+        which is what every format did before.
+
+        The point is latency, and it is not small. A region is buffered until
+        it closes, so on a 20 KB file write the client learned *which tool*
+        only after 5030 of 5040 tokens; every one of these locates the name
+        inside the first 30-70 characters. SGLang streams the whole call this
+        way; only the name is taken here, because arguments arriving in
+        fragments cannot be made coherent when the stream is cut short.
+        """
+        return None
+
+    @classmethod
+    def opens_region(cls, marker: str) -> bool:
+        """Does this marker hand the rest of the stream to this format?
+
+        `START_MARKERS` answers "which literals must not be split across a
+        chunk boundary", and for most formats every one of them also opens a
+        tool-call region, so the two questions have the same answer and this
+        is that default. Kimi-K3 is where they come apart: three of its five
+        are channel framing that wraps *every* answer, tool call or not, and
+        treating those as a handover stopped it streaming at all.
+        """
+        return True
+
     def __init__(self, tools: list | None = None):
         self.tools = tools
         self.buf = ""
@@ -64,6 +95,9 @@ class ToolCallParser(ABC):
         self.current_index = 0
         self.emitted_calls = 0
         self._scanner_cache: MarkerScanner | None = None
+        # The name already sent for the call being buffered, if any; cleared
+        # when that call's arguments go out. See `announce`.
+        self._announced: str | None = None
 
     @property
     def _scanner(self) -> MarkerScanner:
@@ -115,26 +149,88 @@ class ToolCallParser(ABC):
     def flush(self) -> list:
         """Drain whatever is buffered at end of stream."""
 
-    def _emit_call(self, tc: ToolCall) -> list:
-        """Render one parsed ToolCall as start+args stream events."""
-        events = [
+    def announce(self, region: str) -> list:
+        """Send the tool's name as soon as the region reveals it, once.
+
+        Only for a name the request actually declared. That check is what
+        makes an early name safe to send: it cannot be taken back, and an
+        answer merely quoting `<tool_call><function=NAME>` opens a region too.
+        A name the client never offered is overwhelmingly likelier to be prose
+        than a call, so it waits for the region to close like everything else.
+
+        SGLang's cursor parsers announce with no such check and will emit a
+        call named after whatever follows the tag.
+        """
+        if self._announced is not None or not self.tools:
+            return []
+        name = self.peek_name(region)
+        if name is None or name not in build_param_types(self.tools):
+            return []
+        self._announced = name
+        return [
             (
                 "tool_call_start",
                 {
                     "index": self.current_index,
-                    "id": tc.id,
+                    "id": unique_tool_call_id(),
                     "type": "function",
-                    "function": {"name": tc.function["name"], "arguments": ""},
+                    "function": {"name": name, "arguments": ""},
                 },
-            ),
+            )
+        ]
+
+    def _start_event(self, index: int, call_id: str, name: str) -> list:
+        """The `tool_call_start` for a call, unless its name already went out.
+
+        Both places that emit a call go through here: `_emit_call` for the
+        formats that parse a whole region, and Kimi's own drain loop, which
+        builds the event inline because its id and index come off the wire.
+        Two copies of "have we announced this already" is how the announcement
+        was sent twice for one call.
+
+        A mismatch is raised, not smoothed over: `peek_name` and the parse
+        disagreeing about the same bytes is a bug in that format, and the name
+        is already on the wire where it cannot be corrected.
+        """
+        if self._announced is None:
+            return [
+                (
+                    "tool_call_start",
+                    {
+                        "index": index,
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": name, "arguments": ""},
+                    },
+                )
+            ]
+        if self._announced != name:
+            raise AssertionError(
+                f"{type(self).__name__} announced {self._announced!r} and then "
+                f"parsed {name!r} from the same region"
+            )
+        self._announced = None  # binds to the first call only
+        return []
+
+    def _emit_call(self, tc: ToolCall) -> list:
+        """Render one parsed ToolCall as start+args stream events.
+
+        The name is skipped when it has already gone out, and its id is
+        reused so the client sees one call rather than two. A mismatch means
+        `peek_name` and `parse` disagree about the same bytes, which is a bug
+        in that format and is raised rather than papered over -- the name is
+        already on the wire and cannot be corrected.
+        """
+        events = self._start_event(self.current_index, tc.id, tc.function["name"])
+        events.append(
             (
                 "tool_call_args",
                 {
                     "index": self.current_index,
                     "function": {"arguments": tc.function["arguments"]},
                 },
-            ),
-        ]
+            )
+        )
         self.current_index += 1
         self.emitted_calls += 1
         return events
@@ -178,9 +274,14 @@ class BufferedMarkerParser(ToolCallParser):
                 return results
             self.buf = scan.hit + scan.rest
             self.state = 1
-            return results
+            # Also here: a coarse chunk can carry the opener and the name
+            # together, and waiting for the next one would give that back.
+            return results + self.announce(self.buf)
         self.buf += text
-        return results
+        # The name is legible long before the region closes, and the
+        # region is what the wait is for: on a 20 KB file write the
+        # client learned the tool only after 5030 of 5040 tokens.
+        return results + self.announce(self.buf)
 
     def flush(self) -> list:
         results: list = []
@@ -201,6 +302,13 @@ class BufferedMarkerParser(ToolCallParser):
             # Fifty characters of eighty-two, on the shapes measured.
             #
             # Released verbatim rather than as `parse`'s content, which strips.
+            #
+            # A name may already have gone out, and there is no retracting it.
+            # What there is: no arguments follow, so nothing downstream counts
+            # this as a usable call and `finish_reason` stays `stop`. The text
+            # is still delivered -- the promise costs a dangling name, not the
+            # answer.
+            self._announced = None
             return [("content", region)] if region else []
         for tc in tool_calls:
             results.extend(self._emit_call(tc))

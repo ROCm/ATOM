@@ -129,14 +129,42 @@ a single frame at end of stream, indistinguishable from a hang to a streaming
 client, and the scan over that ever-growing buffer made the cost quadratic in
 the response length.
 
-Two waits are longer than that and are not stalls. Text inside the reasoning
-channel is held until its end marker — it is reasoning, and it is delivered as
-`reasoning_content` as it arrives. And once a *complete* start marker appears,
-everything from it onward belongs to the tool-call format until the format can
-parse it, which for a real call is its closing tag and for Kimi-K3 — whose
-channel framing interleaves and is parsed once at EOS — is the whole response.
-The bound above is on the read-ahead *before* a marker, which is the part an
-ordinary answer pays.
+Two waits are longer than that. Text inside the reasoning channel is held until
+its end marker — not a stall: it is reasoning, and it is delivered as
+`reasoning_content` as it arrives. And once a marker that *opens a tool-call
+region* appears, everything from it onward belongs to the format until it can
+parse the region, which for a real call is its closing tag and for an answer
+that merely quotes a marker is end of stream. Nothing is lost there — the
+region is released verbatim once it turns out not to be a call — but it does
+arrive late, and `atom:stream_longest_silence_seconds` now reports it while it
+is happening.
+
+"Opens a region" is asked of the format, not assumed of every marker it
+declares. Kimi-K3 declares five and only two of them mean a tool call; the
+other three are channel framing that wraps every answer it gives, including
+`<|open|>response<|sep|>` at the very start. Treating those as a handover meant
+a K3 response streamed *nothing* — measured, 324 of 324 characters in one frame
+at EOS — which was the common path for that model rather than an edge case.
+
+**The tool's name does not wait for its arguments.** A region is buffered
+until it closes, so on a 20 KB file write the client learned *which* tool was
+being called only after 5030 of 5040 tokens. Every format carries the name in
+its opener, so it is sent as soon as the region reveals it — measured across
+all six, chunk 11–21 instead of 225–248.
+
+Only for a name the request declared in `tools`. That check is what makes the
+early name safe: it cannot be retracted, and an answer quoting
+`<tool_call><function=NAME>` opens a region too, so a name the client never
+offered waits for the region to close like everything else. SGLang's cursor
+parsers announce with no such check and will emit a call named after whatever
+follows the tag.
+
+Arguments still wait for the region to close. SGLang streams those too, as
+JSON fragments; a response cut short then leaves the client holding an
+unterminated object. The residual cost here is narrower: a response truncated
+mid-call has sent a name and no arguments, and `finish_reason` / `stop_reason`
+key on the *arguments* precisely so that dangling name is not reported as a
+tool the client should run.
 
 **Which tool-call format a model uses is decided at startup, not from its
 output.** `--tool-call-parser` defaults to `auto`, which renders the model's
@@ -188,24 +216,28 @@ field for truthiness read the standard off-switch as on; and an *absent*
 `thinking` leaves the model's own default alone rather than switching reasoning
 off, so an existing caller's answers do not change.
 
-**A stalled response is visible while it is stalled.**
-`StreamOutputCollector.get` is the single point at which any stream waits for
-its next chunk, so it records when each wait started, and
-`atom:stream_longest_silence_seconds` reports the age of the oldest one. Zero
-when nothing is waiting; non-zero and growing is a response that has stopped
-delivering while its client waits. A wait that ends after more than 30 seconds
-also logs a line naming the request — the gauge cannot see a stall that has
-already recovered by scrape time. Neither costs a timer: `asyncio.wait_for`
-around that await measured 1.38 us per token per stream against 0.07 us for a
-timestamp and a dict entry. This exists because the symptom that started this
-work was ten minutes of silence with every metric looking healthy.
+**A stalled response is visible while it is stalled.** Every SSE frame leaves
+through `_client_stream`, which times the gap before each one and registers it,
+and `atom:stream_longest_silence_seconds` reports the age of the oldest gap
+in flight. Zero when every stream has just been served; non-zero and growing is
+a response whose client is receiving nothing. A gap longer than 30 seconds also
+logs a line naming the request — the gauge cannot see a stall that has already
+recovered by scrape time. Neither costs a timer: `asyncio.wait_for` measured
+1.38 us per frame per stream against 0.07 us for a timestamp and a dict entry.
+This exists because the symptom that started this work was ten minutes of
+silence with every metric looking healthy.
 
-Two silences it cannot see, so do not read zero as "nothing is stuck". It is
-armed only after a stream has delivered once — otherwise every queued request
-would register, duplicating `atom:requests_waiting` — so a request admitted and
-never producing a first token contributes nothing. And it measures upstream of
-the two withholding stages, so a stream whose bytes are arriving on schedule
-and being held by the tool-call read-ahead reads as healthy here.
+Measured at the frame and not at `StreamOutputCollector.get`, which is where it
+started and which cannot see the thing it was built for. The collector is where
+a stream waits for the *engine*, but the reasoning read-ahead and the tool-call
+read-ahead sit between it and the socket, and while either withholds, the
+collector wakes on every token. Measured: an answer quoting a tool marker fed
+126 tokens and sent the client 6 frames, and the gauge read zero. At the frame
+it reads the silence. Moving out also retired the "ignore the first wait" rule
+— at the collector that first wait is admission and prefill, which would have
+made the gauge a queue-depth proxy `atom:requests_waiting` already provides;
+out here the response's opening frame goes out immediately, so every gap after
+it is real.
 
 One consequence matters when reading benchmark output. ITL is sampled once per
 received SSE chunk (`backend_request_func.py`, `benchmark_serving.py`), so

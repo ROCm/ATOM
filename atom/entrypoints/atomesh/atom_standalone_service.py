@@ -663,7 +663,6 @@ class ChatCompletionStreamState:
                             )
                         )
                     elif event_type == "tool_call_start" and self.tool_choice != "none":
-                        self.has_tool_calls[index] = True
                         chunks.append(
                             create_chat_chunk(
                                 self.request_id,
@@ -673,6 +672,7 @@ class ChatCompletionStreamState:
                             )
                         )
                     elif event_type == "tool_call_args" and self.tool_choice != "none":
+                        self.has_tool_calls[index] = True
                         chunks.append(
                             create_chat_chunk(
                                 self.request_id,
@@ -696,7 +696,6 @@ class ChatCompletionStreamState:
                         )
                     )
                 elif event_type == "tool_call_start" and self.tool_choice != "none":
-                    self.has_tool_calls[index] = True
                     chunks.append(
                         create_chat_chunk(
                             self.request_id,
@@ -706,6 +705,7 @@ class ChatCompletionStreamState:
                         )
                     )
                 elif event_type == "tool_call_args" and self.tool_choice != "none":
+                    self.has_tool_calls[index] = True
                     chunks.append(
                         create_chat_chunk(
                             self.request_id,

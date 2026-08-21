@@ -22,7 +22,7 @@ import pytest
 
 from atom.entrypoints.openai.serving_anthropic import (
     AnthropicBlocks,
-    starts_a_tool_call,
+    completes_a_tool_call,
     tool_event_frames,
 )
 
@@ -220,10 +220,17 @@ class TestToolEventFrames:
         [
             ([], False),
             ([("content", "hi")], False),
-            ([("tool_call_args", {}), ("tool_call_end", None)], False),
-            ([("content", "hi"), START], True),
+            # A name and nothing else: announced early, then the stream was
+            # cut off. Not a usable call, so not `tool_use`.
+            ([("content", "hi"), START], False),
+            ([START, ARGS], True),
+            ([("tool_call_args", {}), ("tool_call_end", None)], True),
         ],
     )
-    def test_starts_a_tool_call_reads_the_batch(self, events, expected):
-        """`stop_reason` turns on this, and it is asked of both batches."""
-        assert starts_a_tool_call(events) is expected
+    def test_completes_a_tool_call_reads_the_batch(self, events, expected):
+        """`stop_reason` turns on this, and it is asked of both batches.
+
+        Keyed on the arguments: a name can be sent before the call is known
+        to close, so a name alone does not mean the client has a tool to run.
+        """
+        assert completes_a_tool_call(events) is expected

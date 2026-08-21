@@ -55,18 +55,27 @@ class ToolCallStreamParser:
         if self.parser_cls is None:
             return [("content", text)] if text else []
 
-        if self._parser is None:
+        out: list = []
+        while self._parser is None:
             scan = self._scanner.feed(text)
-            out: list = [("content", scan.released)] if scan.released else []
+            if scan.released:
+                out.append(("content", scan.released))
             if scan.hit is None:
                 return out
+            if not self.parser_cls.opens_region(scan.hit):
+                # Framing this format wraps *every* answer in, which the
+                # non-streaming path also removes. Dropping it and carrying on
+                # is what lets such a format stream at all: treating it as a
+                # handover meant a Kimi-K3 answer, which opens with
+                # `<|open|>response<|sep|>`, buffered its entire body to EOS
+                # -- measured, 324 of 324 characters arriving in one frame.
+                text = scan.rest
+                continue
             # The region has opened. It and everything after it belong to the
             # format, not to the client.
             self._scanner = None
             self._parser = self.parser_cls(tools=self.tools)
             text = scan.hit + scan.rest
-        else:
-            out = []
 
         self._parser.tools = self.tools
         return out + self._parser.process(text)

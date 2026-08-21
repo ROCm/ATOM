@@ -299,13 +299,13 @@ async def stream_chat_response(
                                 request_id, model, delta={"content": data}
                             )
                         elif event_type == "tool_call_start" and tool_choice != "none":
-                            has_tool_calls = True
                             yield create_chat_chunk(
                                 request_id,
                                 model,
                                 delta={"tool_calls": [data]},
                             )
                         elif event_type == "tool_call_args" and tool_choice != "none":
+                            has_tool_calls = True
                             yield create_chat_chunk(
                                 request_id,
                                 model,
@@ -320,11 +320,11 @@ async def stream_chat_response(
                             request_id, model, delta={"content": data}
                         )
                     elif event_type == "tool_call_start" and tool_choice != "none":
-                        has_tool_calls = True
                         yield create_chat_chunk(
                             request_id, model, delta={"tool_calls": [data]}
                         )
                     elif event_type == "tool_call_args" and tool_choice != "none":
+                        has_tool_calls = True
                         yield create_chat_chunk(
                             request_id, model, delta={"tool_calls": [data]}
                         )
@@ -601,7 +601,6 @@ async def stream_chat_response_fanout(
                                 request_id, model, delta={"content": data}, index=idx
                             )
                         elif event_type == "tool_call_start" and tool_choice != "none":
-                            has_tool_calls[idx] = True
                             yield create_chat_chunk(
                                 request_id,
                                 model,
@@ -609,6 +608,7 @@ async def stream_chat_response_fanout(
                                 index=idx,
                             )
                         elif event_type == "tool_call_args" and tool_choice != "none":
+                            has_tool_calls[idx] = True
                             yield create_chat_chunk(
                                 request_id,
                                 model,
@@ -623,7 +623,6 @@ async def stream_chat_response_fanout(
                             request_id, model, delta={"content": data}, index=idx
                         )
                     elif event_type == "tool_call_start" and tool_choice != "none":
-                        has_tool_calls[idx] = True
                         yield create_chat_chunk(
                             request_id,
                             model,
@@ -631,6 +630,7 @@ async def stream_chat_response_fanout(
                             index=idx,
                         )
                     elif event_type == "tool_call_args" and tool_choice != "none":
+                        has_tool_calls[idx] = True
                         yield create_chat_chunk(
                             request_id,
                             model,

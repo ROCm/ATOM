@@ -65,9 +65,18 @@ def _parse_function(
     )
 
 
+_PEEK_NAME_RE = re.compile(r"<function=([^>\n]+)>")
+
+
 class QwenXmlParser(BufferedMarkerParser):
     NAME: ClassVar[str] = "qwen"
     START_MARKERS: ClassVar[tuple[str, ...]] = ("<tool_call>", QWEN_TOOL_PREFIX)
+
+    @classmethod
+    def peek_name(cls, region: str) -> str | None:
+        """`<function=NAME>` -- legible once the tag closes."""
+        m = _PEEK_NAME_RE.search(region)
+        return m.group(1) if m else None
 
     @classmethod
     def detect(cls, text: str) -> bool:

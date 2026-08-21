@@ -58,6 +58,9 @@ def _parse_entries(section_text: str) -> list[ToolCall]:
     return tool_calls
 
 
+_PEEK_NAME_RE = re.compile(r"<\|tool_call_begin\|>functions\.([^:\s]+):")
+
+
 class KimiParser(ToolCallParser):
     """States: 0 = plain content, 1 = inside section, 2 = section closed."""
 
@@ -65,6 +68,12 @@ class KimiParser(ToolCallParser):
     # The section opener, and the only literal detection keys on. The entry
     # markers inside it are `_drain_entries`' business, never a reader's.
     START_MARKERS: ClassVar[tuple[str, ...]] = (KIMI_SECTION_BEGIN,)
+
+    @classmethod
+    def peek_name(cls, region: str) -> str | None:
+        """`<|tool_call_begin|>functions.NAME:0` -- the entry header."""
+        m = _PEEK_NAME_RE.search(region)
+        return m.group(1) if m else None
 
     @classmethod
     def detect(cls, text: str) -> bool:
@@ -103,6 +112,7 @@ class KimiParser(ToolCallParser):
             if scan.hit is not None:
                 self.state = 1
                 self.buf = scan.rest
+                results.extend(self.announce(self.buf))
                 results.extend(self._drain_entries())
 
         elif self.state == 1:
@@ -114,6 +124,10 @@ class KimiParser(ToolCallParser):
                 self.state = 2
                 self.buf = ""
             else:
+                # This format drains per *completed* entry, so a call with a
+                # large argument payload still waited for its closing token.
+                # The name is in the entry header; it can go now.
+                results.extend(self.announce(self.buf))
                 results.extend(self._drain_entries())
 
         return results
@@ -130,17 +144,7 @@ class KimiParser(ToolCallParser):
             index = int(match.group(2))
             arguments = match.group(3).strip()
 
-            results.append(
-                (
-                    "tool_call_start",
-                    {
-                        "index": index,
-                        "id": f"functions.{name}:{index}",
-                        "type": "function",
-                        "function": {"name": name, "arguments": ""},
-                    },
-                )
-            )
+            results.extend(self._start_event(index, f"functions.{name}:{index}", name))
             if arguments:
                 results.append(
                     (

@@ -41,7 +41,9 @@ import pytest
 
 from atom.entrypoints.openai.reasoning import ReasoningFilter
 from atom.entrypoints.openai.reasoning_dialects import DIALECTS
+from atom.entrypoints.openai.serving_anthropic import completes_a_tool_call
 from atom.entrypoints.openai.tool_parser.kimi_tool_parser import KimiParser
+from atom.entrypoints.openai.tool_parser.qwen3_tool_parser import QwenXmlParser
 from atom.entrypoints.openai.tool_parser.registry import _DETECT_ORDER
 from atom.entrypoints.openai.tool_parser.stream import ToolCallStreamParser
 
@@ -642,3 +644,274 @@ class TestARealCallSurvivesTheStream:
         text = "Let me look. " + REAL_CALLS[parser.NAME]
         seen = drive(text, split_every_way(text)["fixed-3"], parser)
         assert "Let me look." in seen.content
+
+
+# Markers a format declares so the read-ahead will not split them, but which
+# do not hand the stream over: channel framing that wraps every answer. Only
+# Kimi-K3 has any; a format absent here declares none, which is the default.
+FRAMING_NOT_A_REGION: dict[str, set[str]] = {
+    "kimi_k3": {
+        "<|open|>response<|sep|>",
+        "<|close|>response<|sep|>",
+        "<|end_of_msg|>",
+    },
+}
+
+
+class TestAPlainAnswerDoesNotWaitForTheEnd:
+    """A format's own framing is not a reason to stop streaming.
+
+    `START_MARKERS` answers "which literals must not be split"; `opens_region`
+    answers "which of them hand the rest of the stream to this format". For
+    most formats those are the same set. Kimi-K3 is where they are not: three
+    of its five wrap every answer it gives, including `<|open|>response<|sep|>`
+    at the very start, so reading any marker as a handover meant a K3 response
+    delivered nothing until EOS -- 324 of 324 characters in one frame.
+
+    Chunk-invariance cannot see this and neither can the agreement property:
+    delivering everything at flush is perfectly invariant and the text is
+    identical. What separates them is *when*.
+    """
+
+    @staticmethod
+    def _split_by_arrival(parser, text) -> tuple[int, int]:
+        stream = ToolCallStreamParser(parser_cls=parser)
+        during = 0
+        for i in range(0, len(text), 4):
+            during += sum(
+                len(d) for k, d in stream.process(text[i : i + 4]) if k == "content"
+            )
+        at_flush = sum(len(d) for k, d in stream.flush() if k == "content")
+        return during, at_flush
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_the_partition_is_the_declared_one(self, parser):
+        """Which markers open a region, stated here and not read off the code.
+
+        Asking `opens_region` for the shape *and* the expectation makes the
+        test agree with whatever the code says: flipping every answer to True
+        emptied the framing list below and the behavioural test skipped itself
+        clean through the mutation.
+        """
+        declared = {m for m in parser.START_MARKERS if not parser.opens_region(m)}
+        assert declared == FRAMING_NOT_A_REGION.get(parser.NAME, set())
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_framing_that_opens_no_region_does_not_stop_delivery(self, parser):
+        framing = sorted(FRAMING_NOT_A_REGION.get(parser.NAME, ()))
+        if not framing:
+            pytest.skip("every marker this format declares opens a region")
+        text = framing[0] + PROSE * 6 + framing[-1]
+        during, at_flush = self._split_by_arrival(parser, text)
+        assert during > at_flush, (
+            f"{parser.NAME} held {at_flush} characters to EOS and streamed "
+            f"{during}; its framing is being read as a tool region"
+        )
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_an_answer_with_no_marker_at_all_streams_whole(self, parser):
+        """The floor: nothing to hold means nothing held."""
+        during, at_flush = self._split_by_arrival(parser, PROSE * 6)
+        assert at_flush == 0 and during == len(PROSE * 6)
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_a_region_marker_still_hands_over(self, parser):
+        """The other half: what does open a region must still be buffered,
+        or a half-written call would be emitted as text."""
+        opener = next(m for m in parser.START_MARKERS if parser.opens_region(m))
+        during, _ = self._split_by_arrival(parser, "Before. " + opener + "junk")
+        assert during == len("Before. "), f"{parser.NAME} leaked past its opener"
+
+
+DECLARED_TOOLS = [
+    {"type": "function", "function": {"name": "get_weather", "parameters": {}}}
+]
+
+
+class TestTheNameArrivesBeforeTheArguments:
+    """Which tool is being called, sent as soon as the region reveals it.
+
+    A region is buffered until it closes, so the client learned the tool only
+    after the whole payload: measured on a 20 KB file write, 5030 of 5040
+    tokens of nothing. Every format carries the name in its opener or close
+    behind it, so it can go out first.
+
+    Arguments stay buffered. SGLang streams those too, in JSON fragments, and
+    a stream cut short then leaves the client holding an unterminated object.
+    The name is the part worth the risk and the only part taken here.
+
+    Judged on *when* each event lands and not on where it sits in the event
+    list: the payload between the name and the arguments produces no events at
+    all, so the two are adjacent either way. An earlier version of these
+    checked adjacency and passed on every arm.
+    """
+
+    @staticmethod
+    def _drive(parser, text, tools):
+        """(chunks, chunk the name landed on, chunk the arguments landed on,
+        every event kind in order)."""
+        stream = ToolCallStreamParser(parser_cls=parser)
+        stream.tools = tools
+        events, at = [], {}
+        chunks = [text[i : i + 4] for i in range(0, len(text), 4)]
+        for n, chunk in enumerate(chunks, 1):
+            for kind, _ in stream.process(chunk):
+                events.append(kind)
+                at.setdefault(kind, n)
+        for kind, _ in stream.flush():
+            events.append(kind)
+            at.setdefault(kind, len(chunks))
+        return len(chunks), at.get("tool_call_start"), at.get("tool_call_args"), events
+
+    @staticmethod
+    def _big_call(parser) -> str:
+        """The registry's own call for this format, with a large payload."""
+        return "Let me look. " + REAL_CALLS[parser.NAME].replace(
+            "Paris", "Paris" + "x" * 800
+        )
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_a_declared_tool_is_named_early(self, parser):
+        total, at, args_at, _ = self._drive(
+            parser, self._big_call(parser), DECLARED_TOOLS
+        )
+        assert at is not None and args_at is not None
+        assert at < args_at, f"{parser.NAME} sent the name with its arguments"
+        assert at < total // 4, (
+            f"{parser.NAME} announced at chunk {at} of {total}; the name is in "
+            "the opener and should not wait for the payload"
+        )
+
+    @pytest.mark.parametrize(
+        "tools, label",
+        [
+            ([{"type": "function", "function": {"name": "something_else"}}], "other"),
+            (None, "none"),
+            ([], "empty"),
+        ],
+    )
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_an_undeclared_tool_is_not_announced(self, parser, tools, label):
+        """The check that makes an early name safe: it cannot be retracted,
+        and prose quoting a tool tag opens a region too."""
+        _, at, args_at, _ = self._drive(parser, self._big_call(parser), tools)
+        assert at == args_at, (
+            f"{parser.NAME} sent the name of an undeclared tool ({label}) at "
+            f"chunk {at}, ahead of its arguments at {args_at}"
+        )
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_declaring_it_is_what_moves_the_name_earlier(self, parser):
+        """Same input, one variable: the arms differ only in `tools`."""
+        text = self._big_call(parser)
+        _, early, _, _ = self._drive(parser, text, DECLARED_TOOLS)
+        _, late, _, _ = self._drive(parser, text, None)
+        assert early < late, f"{parser.NAME}: declared {early}, undeclared {late}"
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_the_client_still_sees_exactly_one_call(self, parser):
+        """The announcement replaces the parse's own start, never doubles it.
+
+        Kimi builds its start event inline rather than through `_emit_call`,
+        so the deduplication had to be shared rather than written twice -- it
+        was not, and the name went out twice for one call.
+        """
+        for tools in (DECLARED_TOOLS, None):
+            _, _, _, events = self._drive(parser, self._big_call(parser), tools)
+            assert events.count("tool_call_start") == 1, events
+            assert events.count("tool_call_args") == 1, events
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_announcing_changes_nothing_but_the_timing(self, parser):
+        """Same events, same order, whether or not the name went early."""
+        text = self._big_call(parser)
+        _, _, _, announced = self._drive(parser, text, DECLARED_TOOLS)
+        _, _, _, plain = self._drive(parser, text, None)
+        assert announced == plain
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_an_answer_that_only_quotes_a_marker_announces_nothing(self, parser):
+        """No name to peek, so nothing is promised and the text still lands."""
+        opener = next(m for m in parser.START_MARKERS if parser.opens_region(m))
+        text = f"The model writes {opener} to open one. " + PROSE * 3
+        _, _, _, events = self._drive(parser, text, DECLARED_TOOLS)
+        assert "tool_call_start" not in events
+
+
+class TestAPromiseCannotBeTakenBack:
+    """The cost of announcing early, stated rather than discovered.
+
+    A name goes out before the call is known to close, so a response cut off
+    at `max_tokens` mid-call has sent a name and may never send arguments.
+    Nothing can retract it. What can be arranged is that it is not mistaken
+    for a call the client should run: `completes_a_tool_call` keys on the
+    arguments, so `stop_reason` / `finish_reason` stay ordinary and the text
+    is still delivered.
+    """
+
+    @staticmethod
+    def _drive(parser, text):
+        stream = ToolCallStreamParser(parser_cls=parser)
+        stream.tools = DECLARED_TOOLS
+        events = []
+        for i in range(0, len(text), 4):
+            events += stream.process(text[i : i + 4])
+        return events + stream.flush()
+
+    @staticmethod
+    def _drive_without_tools(parser, text):
+        stream = ToolCallStreamParser(parser_cls=parser)
+        events = []
+        for i in range(0, len(text), 4):
+            events += stream.process(text[i : i + 4])
+        return events + stream.flush()
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_a_call_cut_off_before_it_parses_is_not_a_usable_call(self, parser):
+        """Truncated mid-call, against the same input with nothing declared.
+
+        Compared arm to arm rather than asserted outright: GLM's unterminated
+        branch salvages `<tool_call>get_weather` into a call with empty
+        arguments all by itself, which predates announcing and is that
+        format's own business. What must hold is that announcing adds no call
+        the parse did not already find.
+        """
+        head = REAL_CALLS[parser.NAME].split("get_weather")[0] + "get_weather"
+        text = "Sure. " + head
+        kinds = [k for k, _ in self._drive(parser, text)]
+        baseline = [k for k, _ in self._drive_without_tools(parser, text)]
+        if "tool_call_args" in baseline:
+            pytest.skip("this format salvages a call from this much on its own")
+        assert (
+            "tool_call_args" not in kinds
+        ), "arguments were invented for a call that never parsed"
+        assert not completes_a_tool_call(
+            self._drive(parser, text)
+        ), "a name with no arguments must not report as a usable tool call"
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_the_answer_still_arrives_when_the_call_does_not(self, parser):
+        head = REAL_CALLS[parser.NAME].split("get_weather")[0] + "get_weather"
+        events = self._drive(parser, "Sure. " + head)
+        delivered = "".join(d for k, d in events if k == "content")
+        assert "Sure." in delivered, "the text before the call was dropped"
+
+    def test_peeking_a_different_name_than_the_parse_is_raised(self):
+        """`peek_name` and `parse` disagreeing about the same bytes is a bug
+        in that format, and the name is already on the wire. Loud, not
+        smoothed over -- there is nothing to smooth it into."""
+
+        class Liar(QwenXmlParser):
+            @classmethod
+            def peek_name(cls, region):
+                return "get_weather" if "<function=" in region else None
+
+            @classmethod
+            def parse(cls, text, tools):
+                content, calls = QwenXmlParser.parse(text, tools)
+                for c in calls:
+                    c.function["name"] = "something_else"
+                return content, calls
+
+        with pytest.raises(AssertionError, match="announced"):
+            self._drive(Liar, "Sure. " + REAL_CALLS["qwen"])

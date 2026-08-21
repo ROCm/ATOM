@@ -26,9 +26,9 @@ logger = logging.getLogger("atom")
 # enough that a wedged response is named while the client is still waiting.
 SILENCE_LOG_SECONDS = 30.0
 
-# Every stream currently blocked in `StreamOutputCollector.get`, and since
-# when. Keyed by `id()`: entries are added and removed around a single await
-# in one place, so an id cannot outlive its collector here.
+# Every stream currently waiting to hand its client a frame, and since when.
+# Keyed by `id()`: entries are added and removed around a single await in one
+# place, so an id cannot outlive the watch that owns it.
 _WAITING_SINCE: dict[int, float] = {}
 
 # Fields a later chunk overrides on the one it merges into, when it has a value
@@ -108,13 +108,6 @@ class StreamOutputCollector:
         self.request_id = request_id
         self._pending: dict[Any, dict] = {}
         self._ready = Event()
-        # Whether this stream has ever delivered. The first wait is queueing --
-        # admission and prefill have not happened yet -- and at the
-        # concurrencies this server is benchmarked at, that routinely exceeds
-        # the silence threshold. Counting it would make the gauge a
-        # queue-depth proxy, which `atom:requests_waiting` already is, and
-        # would log a line per backlogged request on the event loop.
-        self._delivered = False
 
     def put_nowait(self, payload: dict | tuple[int, dict]) -> None:
         """Accept one prepared chunk. Called on the event loop, never off it."""
@@ -130,43 +123,62 @@ class StreamOutputCollector:
         self._ready.set()
 
     async def get(self) -> dict | tuple[int, dict]:
-        """Await the next chunk, carrying whatever merged into it.
-
-        Records when the wait started, which is the whole watchdog. A stalled
-        response is a stream that never wakes, and this is the one place any
-        stream waits, so a reader of `longest_silence_seconds` sees it while
-        it is happening -- the reported symptom of this bug class was ten
-        minutes of silence with every metric looking healthy.
-
-        A timestamp and a dict entry rather than `asyncio.wait_for`: this runs
-        once per token per stream, and arming a timer costs 1.38 us against
-        0.07 us for this. No timer also means no background task to own.
-        """
+        """Await the next chunk, carrying whatever merged into it."""
         while not self._pending:
-            started = time.monotonic()
-            if self._delivered:
-                _WAITING_SINCE[id(self)] = started
-            try:
-                await self._ready.wait()
-            finally:
-                _WAITING_SINCE.pop(id(self), None)
-            silence = time.monotonic() - started
-            if self._delivered and silence >= SILENCE_LOG_SECONDS:
-                # After the fact, and free: one comparison on a wake that was
-                # going to happen anyway. Catches a stall that recovered,
-                # which the gauge cannot -- by scrape time it is over.
-                logger.warning(
-                    f"request {self.request_id or '<unnamed>'} delivered "
-                    f"nothing for {silence:.1f}s before recovering; if this "
-                    f"repeats, the engine or the marker read-ahead is holding "
-                    f"output back"
-                )
+            await self._ready.wait()
         tag, chunk = next(iter(self._pending.items()))
         del self._pending[tag]
         if not self._pending:
             self._ready.clear()
-        self._delivered = True
         return chunk if tag is None else (tag, chunk)
+
+
+class FrameWait:
+    """Times one gap between frames the client actually receives.
+
+    Measured here and not at :meth:`StreamOutputCollector.get`, which is where
+    it started. That is the one place a stream waits for the *engine*, but two
+    stages sit between it and the socket -- the reasoning channel's read-ahead
+    and the tool-call format's -- and while either withholds, `get` keeps
+    returning on schedule. The gauge read zero while the client received
+    nothing, which is the exact symptom it was built for.
+
+    Wrapping the yield also removes the other blind spot. The old shape had to
+    ignore a stream's first wait, because at `get` that wait is admission and
+    prefill and would have made the gauge a queue-depth proxy that
+    `atom:requests_waiting` already is. Out here the first frame goes out as
+    soon as the response opens, so every wait after it is real silence and
+    none of them need excluding.
+
+    A timestamp and a dict entry rather than `asyncio.wait_for`: this runs
+    once per frame per stream, and arming a timer costs 1.38 us against
+    0.07 us for this. No timer also means no background task to own.
+    """
+
+    __slots__ = ("_started", "request_id")
+
+    def __init__(self, request_id: str = "") -> None:
+        self.request_id = request_id
+        self._started = 0.0
+
+    def __enter__(self) -> None:
+        # No `as`: nothing needs the watch itself, only its lifetime.
+        self._started = time.monotonic()
+        _WAITING_SINCE[id(self)] = self._started
+
+    def __exit__(self, *exc) -> None:
+        _WAITING_SINCE.pop(id(self), None)
+        silence = time.monotonic() - self._started
+        if silence >= SILENCE_LOG_SECONDS:
+            # After the fact, and free: one comparison on a frame that was
+            # going to arrive anyway. Catches a stall that recovered, which
+            # the gauge cannot -- by scrape time it is over.
+            logger.warning(
+                f"request {self.request_id or '<unnamed>'} sent the client "
+                f"nothing for {silence:.1f}s before recovering; if this "
+                f"repeats, the engine or one of the marker read-aheads is "
+                f"holding output back"
+            )
 
 
 def longest_silence_seconds() -> float:

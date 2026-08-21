@@ -93,12 +93,22 @@ def _strip_k3_framing(text: str) -> str:
     return _K3_FRAMING_RE.sub("", text)
 
 
-class KimiK3Parser(ToolCallParser):
-    """Kimi-K3 channel format: buffer the whole output, parse + emit at flush.
+_PEEK_NAME_RE = re.compile(r'<\|open\|>call tool="([^"]+)"')
 
-    K3's channel framing interleaves think/response/tools, so partial-chunk
-    parsing is unreliable; buffering to EOS and parsing once is simplest and the
-    outputs are short.
+
+class KimiK3Parser(ToolCallParser):
+    """Kimi-K3 channel format: buffer the tools section, parse + emit at flush.
+
+    A tools section is parsed whole because K3's arguments interleave and a
+    partial one emits garbage. The *response* channel is not a tools section
+    and streams as it arrives: it is plain text wrapped in framing this format
+    also removes when it is not streaming.
+
+    Buffering everything was simpler and was justified by "the outputs are
+    short". Every K3 answer opens with `<|open|>response<|sep|>`, which is one
+    of the markers below, so that read as a tool region and the whole body
+    arrived in one frame at EOS -- measured on a 324-character answer, 324 of
+    them. It is the common path for this model, not an edge case.
     """
 
     NAME: ClassVar[str] = "kimi_k3"
@@ -111,6 +121,22 @@ class KimiK3Parser(ToolCallParser):
         KIMI_K3_RESPONSE_END,
         KIMI_K3_END_OF_MSG,
     )
+    # Of those five, the two that mean a tool call is coming. The other three
+    # wrap every answer this model gives, so they are literals the read-ahead
+    # must not split and nothing more.
+    _REGION_MARKERS: ClassVar[frozenset[str]] = frozenset(
+        {KIMI_K3_CALL_PREFIX, KIMI_K3_TOOLS_START}
+    )
+
+    @classmethod
+    def peek_name(cls, region: str) -> str | None:
+        """`<|open|>call tool="NAME"` -- the name travels in the opener."""
+        m = _PEEK_NAME_RE.search(region)
+        return m.group(1) if m else None
+
+    @classmethod
+    def opens_region(cls, marker: str) -> bool:
+        return marker in cls._REGION_MARKERS
 
     @classmethod
     def detect(cls, text: str) -> bool:
@@ -150,8 +176,10 @@ class KimiK3Parser(ToolCallParser):
 
     def process(self, text: str) -> list:
         # Buffer everything; K3's interleaved framing is parsed once at flush.
+        # The name is the exception: it travels in the call opener, so it can
+        # go out now rather than after the arguments -- see `announce`.
         self.buf += text
-        return []
+        return self.announce(self.buf)
 
     def flush(self) -> list:
         content, tool_calls = self.parse(self.buf, self.tools)
