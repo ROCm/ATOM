@@ -107,8 +107,13 @@ class DSparkProposer(Drafter):
         # max_split_per_batch only exists in newer aiter builds; feature-detect
         # it (as aiter_mla does) so old builds don't hit a TypeError. Cache the
         # kwargs so the sizing (info) and fill (get_mla_metadata_v1) calls agree.
+        # The block MLA streams the full (~256k) context non-causally; the old
+        # literal 16 starves it of KV-splits (262k: 16 splits/329us vs 253/81us,
+        # 4.07x). Pass -1 for full split budget -- identical to the cluster cap
+        # (256) on current aiter, and auto-adaptive once aiter ships the adaptive
+        # split kernel (no short-ctx penalty then). This branch is long-seq only.
         self._blk_split_kwargs = (
-            {"max_split_per_batch": 16} if _MLA_META_SUPPORTS_MAX_SPLIT else {}
+            {"max_split_per_batch": -1} if _MLA_META_SUPPORTS_MAX_SPLIT else {}
         )
         (
             (wmd_sz, wmd_ty),
