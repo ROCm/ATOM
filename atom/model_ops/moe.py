@@ -2020,6 +2020,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 if (
                     a8w4_prefill_scales is not None
                     and not use_triton_gfx1250_silu
+                    and activation == ActivationType.Swiglu
                     and get_forward_context().context.is_prefill
                 ):
                     runtime_act_quant = MoEActivationQuant.FP8

@@ -281,7 +281,27 @@ def _sparse_pa_ran_on_asm(
     return True
 
 
-def _sparse_unified_attention(
+def _kv_head_collapsed_scales(
+    k_cache: torch.Tensor,
+    k_scale: torch.Tensor | None,
+    v_scale: torch.Tensor | None,
+    nph16: int,
+    hkv: int,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Collapse the fp8 per-token KV scales exactly like the cache view.
+
+    ``[num_phys16, Hkv, 16] -> [num_phys16 * Hkv, 1, 16]``, so a scale row is
+    addressed by the same kv-head-encoded page id (``phys16 * Hkv + kvh``) that
+    ``sparse_bt`` carries. Zero-copy (the scale tensor is contiguous), and
+    ``(None, None)`` for a bf16 cache.
+    """
+    if not _is_fp8_kv_cache_tensor(k_cache) or k_scale is None:
+        return None, None
+    pbs = k_scale.shape[-1]
+    return k_scale.view(nph16 * hkv, 1, pbs), v_scale.view(nph16 * hkv, 1, pbs)
+
+
+def _sparse_decode_unified_attention(
     q_view: torch.Tensor,  # [num_seqs, gqa_group, head_dim] (kv-head collapsed)
     out_view: torch.Tensor,  # [num_seqs, gqa_group, head_dim]
     k_cache_view: torch.Tensor,  # SHUFFLE 5D, num_kv_heads collapsed to 1
@@ -290,20 +310,26 @@ def _sparse_unified_attention(
     sparse_ctx: torch.Tensor,  # [num_seqs] per-row effective context length
     sm_scale: float,
     num_seqs: int,
+    k_scale_view: torch.Tensor | None = None,  # [num_pages16, 1, 16] fp32, fp8 only
+    v_scale_view: torch.Tensor | None = None,
 ) -> None:
-    """gfx1250 fallback for the sparse per-token-as-decode gluon kernel.
+    """Large-batch fp8 fallback for the gfx1250 sparse decode.
 
-    gfx1250 has no `pa_decode_gluon` kernel (gluon supports gfx942 /
-    gfx950 only). The sparse runners have already compacted the indexer's
-    selected blocks into a dense physical-16 `sparse_bt` + exact `sparse_ctx`
-    over the (kv-head collapsed) SHUFFLE cache — which is exactly the
-    `(block_table, seqused_k)` contract `unified_attention` consumes with
-    `shuffled_kv_cache=True`. Each token is a length-1 causal "sequence",
-    mirroring the gluon `max_seqlen_q=1` per-token-as-decode setup.
+    Reads the same inputs as :func:`_sparse_decode_pa_sparse` through
+    ``unified_attention``: the compacted physical-16 ``sparse_bt`` + exact
+    ``sparse_ctx`` over the (kv-head collapsed) SHUFFLE cache are exactly the
+    ``(block_table, seqused_k)`` contract it consumes with
+    ``shuffled_kv_cache=True``, with each token a length-1 causal "sequence"
+    (mirroring the gluon ``max_seqlen_q=1`` per-token-as-decode setup).
 
-    bf16 KV cache only: fp8 sparse decode plumbs per-token (per-page) descales
-    into the gluon kernel, which does not map onto ``unified_attention``'s descale
-    contract here; the caller raises NotImplementedError for fp8 on gfx1250.
+    fp8: M3 quantizes KV per token, so the descale cannot be a scalar. The
+    per-token scales go in as ``k_descale``/``v_descale`` shaped
+    ``[num_pages16, 1, 16]`` -- the same kv-head-collapsed view as the cache --
+    which the gfx1250 3D gluon kernel folds onto the score columns (K) and the
+    softmax probabilities (V). aiter validates that shape and refuses the
+    kernels that cannot carry it, rather than dropping the descale.
+
+    See :func:`_sparse_decode_gfx1250` for when this is preferred.
     """
     from aiter.ops.triton.unified_attention import unified_attention
 
@@ -333,10 +359,111 @@ def _sparse_unified_attention(
         block_table=sparse_bt,
         softcap=0,
         q_descale=None,
-        k_descale=None,
-        v_descale=None,
+        k_descale=k_scale_view,
+        v_descale=v_scale_view,
         sinks=None,
         shuffled_kv_cache=True,
+    )
+
+
+def _sparse_decode_pa_sparse(
+    q_view: torch.Tensor,  # [num_seqs, gqa_group, head_dim] (kv-head collapsed)
+    out_view: torch.Tensor,  # [num_seqs, gqa_group, head_dim]
+    k_cache_view: torch.Tensor,  # SHUFFLE 5D, num_kv_heads collapsed to 1
+    v_cache_view: torch.Tensor,
+    sparse_bt: torch.Tensor,  # [num_seqs, max_pages] physical-16 block table
+    sparse_ctx: torch.Tensor,  # [num_seqs] per-row effective context length
+    sm_scale: float,
+    num_seqs: int,
+    k_scale_view: torch.Tensor | None = None,  # [num_pages16, 1, 16] fp32, fp8 only
+    v_scale_view: torch.Tensor | None = None,
+) -> None:
+    """gfx1250 replacement for the sparse per-token-as-decode gluon kernel.
+
+    gfx1250 has no ``pa_decode_gluon`` kernel (gluon supports gfx942 / gfx950
+    only). AITER's ``pa_decode_sparse_shuffled`` is the split-K sparse decode
+    written for exactly this contract: the runners have already compacted the
+    indexer's selected blocks into a dense physical-16 ``sparse_bt`` + exact
+    ``sparse_ctx`` over the (kv-head collapsed) SHUFFLE cache, which is the
+    ``(block_table, context_lens)`` pair it consumes. Each token is its own
+    length-1 "sequence", mirroring the gluon ``max_seqlen_q=1`` setup, and the
+    GQA group rides in as the kernel's head axis so one CTA covers all of a
+    token's heads (no KV re-fetch per head block).
+
+    fp8: M3 quantizes KV per token, so the descale cannot be a scalar. The
+    per-token scales go in shaped ``[num_pages16, 1, 16]`` -- the same
+    kv-head-collapsed view as the cache -- and the kernel folds K's onto the
+    score columns and V's onto the softmax probabilities.
+
+    Measured against the ``unified_attention`` path this replaces (MI455, q
+    [N, 16, 128], top-k 32 blocks, num_seqs 4..1024 x context 1k..4k): bf16 KV
+    1.29-2.41x across the whole range; fp8 KV 1.04-2.13x up to num_seqs 64,
+    which is why ``_sparse_decode_gfx1250`` gates fp8 above that.
+    """
+    from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse_shuffled
+
+    del num_seqs  # implied by q_view.shape[0]
+    pa_decode_sparse_shuffled(
+        q_view,
+        k_cache_view,
+        v_cache_view,
+        sparse_bt,
+        sparse_ctx,
+        sm_scale,
+        out=out_view,
+        k_scale=k_scale_view,
+        v_scale=v_scale_view,
+    )
+
+
+# Batch (num_seqs == query tokens x kv heads) at which AITER's pa_decode_sparse
+# stops beating unified_attention for an fp8 KV cache on gfx1250. fp8 forces a
+# widen to bf16 in front of the WMMA and Triton stages the widened K/V tiles
+# through LDS to do it; once the batch alone fills the CUs that LDS traffic is
+# pure overhead, whereas unified_attention's gluon kernel pipelines it. Below
+# the threshold the split-K decode still wins -- 1.1-1.2x at 64, 2.0x at 4.
+# bf16 has no such crossover (it wins across the whole range), so the gate only
+# applies to fp8. Measured on MI455, q [N, 16, 128], top-k 32 blocks, over
+# num_seqs 4..1024 x context 1k..4k: parity at 128, 0.86-0.90x by 1024.
+_PA_SPARSE_FP8_MAX_SEQS = 64
+
+
+def _sparse_decode_gfx1250(
+    q_view: torch.Tensor,
+    out_view: torch.Tensor,
+    k_cache_view: torch.Tensor,
+    v_cache_view: torch.Tensor,
+    sparse_bt: torch.Tensor,
+    sparse_ctx: torch.Tensor,
+    sm_scale: float,
+    num_seqs: int,
+    k_scale_view: torch.Tensor | None = None,
+    v_scale_view: torch.Tensor | None = None,
+) -> None:
+    """Run the gfx1250 sparse per-token-as-decode attention.
+
+    gfx1250 (MI455) has no ``pa_decode_gluon`` kernel (gluon supports gfx942 /
+    gfx950 only), so both branches here are triton. Prefer AITER's
+    ``pa_decode_sparse``; fall back to ``unified_attention`` only for the fp8
+    large-batch corner it loses (see ``_PA_SPARSE_FP8_MAX_SEQS``).
+    """
+    is_fp8 = k_scale_view is not None
+    runner = (
+        _sparse_decode_unified_attention
+        if is_fp8 and num_seqs > _PA_SPARSE_FP8_MAX_SEQS
+        else _sparse_decode_pa_sparse
+    )
+    runner(
+        q_view,
+        out_view,
+        k_cache_view,
+        v_cache_view,
+        sparse_bt,
+        sparse_ctx,
+        sm_scale,
+        num_seqs,
+        k_scale_view,
+        v_scale_view,
     )
 
 
@@ -1461,6 +1588,32 @@ def _sparse_pa_per_row(
     k_cache_view = k_cache.view(nph16 * _hkv, 1, *k_cache.shape[2:])
     v_cache_view = v_cache.view(nph16 * _hkv, 1, *v_cache.shape[2:])
 
+    num_seqs = T * num_kv_heads
+
+    # gfx1250: no gluon pa_decode kernel (gluon supports gfx942 / gfx950 only),
+    # so both the decode and the per-token-as-decode prefill go through AITER's
+    # triton pa_decode_sparse. fp8 carries the per-token descales; the scale
+    # tensor collapses the kv-head exactly like the cache, so its page ids line
+    # up with sparse_bt. Ahead of the ASM attempt: gfx1250 ships no per-token
+    # fp8 ``pa`` ASM kernels for run_pa_fwd_asm (only pa_decode_bf16).
+    if get_gfx() == "gfx1250":
+        k_scale_view, v_scale_view = _kv_head_collapsed_scales(
+            k_cache, k_scale, v_scale, nph16, _hkv
+        )
+        _sparse_decode_gfx1250(
+            q_view,
+            out_view,
+            k_cache_view,
+            v_cache_view,
+            sparse_bt,
+            sparse_ctx,
+            sm_scale,
+            num_seqs,
+            k_scale_view,
+            v_scale_view,
+        )
+        return
+
     if _sparse_pa_ran_on_asm(
         q_view,
         k_cache_view,
@@ -1471,29 +1624,6 @@ def _sparse_pa_per_row(
         v_scale,
         out_view,
     ):
-        return
-
-    num_seqs = T * num_kv_heads
-
-    # gfx1250: no gluon pa_decode kernel (gluon supports gfx942 / gfx950 only).
-    # Serves both the decode and prefill sparse paths.
-    if get_gfx() == "gfx1250":
-        if _is_fp8_kv_cache_tensor(k_cache):
-            raise NotImplementedError(
-                "MiniMax-M3 fp8 sparse attention is not yet supported on gfx1250: "
-                "the gluon per-page descale path has no unified_attention "
-                "equivalent here. Use a bf16 KV cache on gfx1250."
-            )
-        _sparse_unified_attention(
-            q_view,
-            out_view,
-            k_cache_view,
-            v_cache_view,
-            sparse_bt,
-            sparse_ctx,
-            sm_scale,
-            num_seqs,
-        )
         return
 
     num_kv_heads_view = 1
