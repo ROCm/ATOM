@@ -1172,6 +1172,30 @@ class KimiKDAAttention(nn.Module):
             # Slice the per-token cache-slot indices once (used for both the
             # conv update and the fused recurrence below).
             decode_state_indices = state_indices[:num_actual_tokens]
+            if num_actual_tokens <= 64:
+                from aiter.ops.triton.gated_delta_net.fused_kda_decode import (
+                    fused_kda_decode,
+                )
+
+                fused_out = fused_kda_decode(
+                    mixed_qkv=mixed_qkv,
+                    conv_state=conv_state,
+                    conv_weight=conv_weights,
+                    gate=gate,
+                    beta=beta,
+                    out_gate=out_gate,
+                    A_log=self.A_log,
+                    dt_bias=self.dt_bias,
+                    ssm_state=ssm_state,
+                    ssm_state_indices=decode_state_indices,
+                    cu_seqlens=query_start_loc[: kda_metadata.num_decodes + 1],
+                    norm_weight=self.o_norm.weight,
+                    norm_eps=self.o_norm.variance_epsilon,
+                    head_dim=self.head_dim,
+                    num_local_heads=self.num_local_heads,
+                    lower_bound=self._kda_gate_lower_bound,
+                )
+                return self.o_proj(fused_out)
             q, k, v = causal_conv1d_update(
                 mixed_qkv,
                 conv_state,
