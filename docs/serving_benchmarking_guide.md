@@ -97,16 +97,38 @@ Streaming responses use the SSE (Server-Sent Events) protocol with
 The API server is a single Python process, so at high concurrency the fixed
 per-chunk cost of delivering tokens (detokenize, coroutine wakeup, JSON encode,
 socket write) can cap throughput before the GPU does. Two things keep that cost
-down, neither of which delays a token:
+down:
 
 - **Backlog merging.** Each request's chunks land in a `StreamOutputCollector`
   (`atom/entrypoints/openai/streaming_dispatch.py`), which holds at most one
   chunk per stream: anything arriving behind an unread one merges into it.
   Nothing is held back waiting for more, so a consumer that keeps up sees
-  exactly one chunk per engine step and a token is never delivered later than
-  it otherwise would have been.
+  exactly one chunk per engine step.
 - **msgspec frame encoding** (`atom/entrypoints/openai/sse.py`), roughly 5.8x
   cheaper per frame than `json.dumps`.
+
+**A token *can* be delivered later than the engine produced it, by a bounded
+amount.** Two stages downstream of the collector read the text for markers —
+the reasoning channel's delimiters
+(`atom/entrypoints/openai/reasoning.py`) and the tool-call formats' opening
+tags (`atom/entrypoints/openai/tool_parser/`) — and neither may hand out a
+byte that could turn out to be the first character of one. Both ask the same
+question through `MarkerScanner`
+(`atom/entrypoints/openai/marker_scanner.py`): release everything except the
+longest *suffix* of the buffer that is a prefix of some marker. The wait is
+therefore bounded by the longest marker a format declares, a few dozen bytes,
+and is usually zero — a chunk whose tail cannot begin a marker is released
+whole.
+
+This is worth stating because it used to be unbounded. The rule was "hold
+everything once a marker's first character appears *anywhere* in the buffer",
+which one `<` in an ordinary answer — `if (a < b)` — satisfied forever, and
+the buffer was never cleared while it held. The whole answer then arrived in
+a single frame at end of stream, indistinguishable from a hang to a streaming
+client, and the scan over that ever-growing buffer made the cost quadratic in
+the response length. Text inside the reasoning channel is held until its end
+marker, which is not a stall: it is reasoning, and it is delivered as
+`reasoning_content` as it arrives.
 
 One consequence matters when reading benchmark output. ITL is sampled once per
 received SSE chunk (`backend_request_func.py`, `benchmark_serving.py`), so
@@ -740,6 +762,9 @@ server without modification.
 | `atom/entrypoints/openai_server.py` | OpenAI-compatible API server (FastAPI + Uvicorn) |
 | `atom/entrypoints/openai/streaming_dispatch.py` | `StreamBatchDispatcher` (per-engine-step cross-thread dispatch) and `StreamOutputCollector` (per-request delivery, folds a backlog) |
 | `atom/entrypoints/openai/sse.py` | SSE frame encoding (`data_frame`, `event_frame`) on a shared msgspec encoder |
+| `atom/entrypoints/openai/marker_scanner.py` | `MarkerScanner` — the one rule for how much of a stream is safe to release |
+| `atom/entrypoints/openai/reasoning.py` | Splits the reasoning channel from the answer; seeded per request by `prompt_starts_in_reasoning` |
+| `atom/entrypoints/openai/tool_parser/` | Per-format tool-call parsing; each format declares its `MARKERS` |
 | `atom/model_engine/llm_engine.py` | `LLMEngine` programmatic API |
 | `atom/sampling_params.py` | `SamplingParams` dataclass |
 | `atom/model_engine/arg_utils.py` | `EngineArgs` CLI argument definitions and engine factory |

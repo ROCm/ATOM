@@ -16,6 +16,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
+from ..marker_scanner import MarkerScanner
+
 
 def unique_tool_call_id() -> str:
     # OpenAI tool_call ids must be unique across the whole conversation, not just
@@ -45,13 +47,13 @@ class ToolCallParser(ABC):
     """
 
     NAME: ClassVar[str]
-    # Every literal this format opens with, declared rather than spelled out
-    # again inside `sniff_stream`'s chain and each parser's own logic. A
-    # streaming reader has to know them to decide how much of its buffer could
-    # still be the start of one, and the property tests enumerate them so a
-    # newly registered format is covered the moment it exists rather than when
-    # someone remembers to write a case for it.
-    MARKERS: ClassVar[tuple[str, ...]] = ()
+    # Every literal that opens this format's tool-call region. Declared once,
+    # here, rather than spelled out again in each parser's own logic: a reader
+    # ahead of detection needs them to know how much of its buffer could still
+    # be the start of one, `BufferedMarkerParser` locates the region with them,
+    # and the property tests enumerate them so a newly registered format is
+    # covered the moment it exists rather than when someone writes a case.
+    START_MARKERS: ClassVar[tuple[str, ...]] = ()
 
     def __init__(self, tools: list | None = None):
         self.tools = tools
@@ -61,6 +63,10 @@ class ToolCallParser(ABC):
         self.state = 0
         self.current_index = 0
         self.emitted_calls = 0
+        # Only `BufferedMarkerParser` reads it, but every parser is built
+        # through here, so a subclass that forgot to initialise it would fail
+        # on its first chunk rather than at construction.
+        self._scanner_cache = None
 
     # -- non-streaming ------------------------------------------------------
     @classmethod
@@ -117,13 +123,6 @@ class BufferedMarkerParser(ToolCallParser):
     Subclasses declare ``START_MARKERS`` and implement ``parse``.
     """
 
-    # Any of these opening the tool-call region; the earliest one wins.
-    START_MARKERS: ClassVar[tuple[str, ...]] = ()
-    # While no marker has been seen, a trailing run starting with one of these
-    # may be the first bytes of a marker, so it is held back rather than emitted
-    # as content (it would otherwise leak '<' into the user-visible text).
-    HOLDBACK_CHARS: ClassVar[tuple[str, ...]] = ("<",)
-
     @classmethod
     def find_start(cls, text: str) -> int:
         """Index of the earliest start marker, or -1."""
@@ -134,35 +133,42 @@ class BufferedMarkerParser(ToolCallParser):
     def detect(cls, text: str) -> bool:
         return cls.find_start(text) != -1
 
+    @property
+    def _scanner(self) -> MarkerScanner:
+        """Reads the pre-region text; built on first use, per instance."""
+        if self._scanner_cache is None:
+            self._scanner_cache = MarkerScanner(self.START_MARKERS)
+        return self._scanner_cache
+
     def process(self, text: str) -> list:
         results: list = []
-        self.buf += text
         if self.state == 0:
-            m = self.find_start(self.buf)
-            if m != -1:
-                before = self.buf[:m]
-                if before:
-                    results.append(("content", before))
-                self.buf = self.buf[m:]
-                self.state = 1
-            else:
-                # Emit content but hold back a possible partial marker tail.
-                cut = max(self.buf.rfind(c) for c in self.HOLDBACK_CHARS)
-                if cut == -1:
-                    if self.buf:
-                        results.append(("content", self.buf))
-                        self.buf = ""
-                elif cut > 0:
-                    results.append(("content", self.buf[:cut]))
-                    self.buf = self.buf[cut:]
+            # Held back: only a suffix that could still grow into a start
+            # marker. This used to hold from the *last* holdback character
+            # anywhere in the buffer, which had no branch for that character
+            # landing at index 0 -- and after one emission the buffer always
+            # began with one, so the parser stopped emitting for the rest of
+            # the stream and delivered the remainder in a single frame at EOS.
+            # `HOLDBACK_CHARS` went with it: it was a hand-kept copy of the
+            # first characters of `START_MARKERS`, which the scanner derives.
+            scan = self._scanner.feed(text)
+            if scan.released:
+                results.append(("content", scan.released))
+            if scan.hit is None:
+                return results
+            self.buf = scan.hit + scan.rest
+            self.state = 1
+            return results
+        self.buf += text
         return results
 
     def flush(self) -> list:
         results: list = []
         if self.state == 0:
-            if self.buf:
-                results.append(("content", self.buf))
-                self.buf = ""
+            rest = self._scanner.flush() + self.buf
+            self.buf = ""
+            if rest:
+                results.append(("content", rest))
             return results
         # state 1: parse the complete (or trailing) tool-call block.
         _content, tool_calls = self.parse(self.buf, self.tools)

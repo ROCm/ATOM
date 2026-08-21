@@ -33,7 +33,10 @@ from atom.entrypoints.openai.protocol import (
     TEXT_COMPLETION_OBJECT,
     CompletionRequest,
 )
-from atom.entrypoints.openai.reasoning import ReasoningFilter
+from atom.entrypoints.openai.reasoning import (
+    ReasoningFilter,
+    prompt_starts_in_reasoning,
+)
 from atom.entrypoints.openai.serving_chat import (
     build_chat_response,
     build_chat_response_multi,
@@ -525,7 +528,15 @@ class ChatCompletionStreamState:
         self.stream_queue = stream_queue
         self.num_tokens_input = len(tokenizer.encode(prompt))
         self.num_tokens_output = [0] * n
-        self.reasoning_filters = [ReasoningFilter() for _ in range(n)]
+        # Same prompt for every sibling, so the same starting state. Without
+        # this a template that opens the reasoning channel in the prompt has
+        # its whole trace delivered as the answer: state 0 no longer infers
+        # reasoning from a bare end marker, because inferring it means waiting
+        # for one.
+        starts_thinking = prompt_starts_in_reasoning(prompt)
+        self.reasoning_filters = [
+            ReasoningFilter(starts_thinking=starts_thinking) for _ in range(n)
+        ]
         self.tool_parsers = [ToolCallStreamParser() for _ in range(n)]
         self.has_tool_calls = [False] * n
         self.finished = [False] * n
@@ -942,7 +953,10 @@ class AtomStandaloneService:
                 if not outputs:
                     raise RuntimeError("No output generated")
                 response = build_chat_response_multi(
-                    request_id, self.model_name, outputs
+                    request_id,
+                    self.model_name,
+                    outputs,
+                    starts_thinking=prompt_starts_in_reasoning(prompt),
                 )
             else:
                 outputs = self.engine_service.generate(
@@ -956,7 +970,11 @@ class AtomStandaloneService:
                     raise RuntimeError("No output generated")
                 final_output = outputs[0]
                 response = build_chat_response(
-                    request_id, self.model_name, final_output["text"], final_output
+                    request_id,
+                    self.model_name,
+                    final_output["text"],
+                    final_output,
+                    starts_thinking=prompt_starts_in_reasoning(prompt),
                 )
             return self._json_safe(response.model_dump(exclude_none=True))
         except Exception:

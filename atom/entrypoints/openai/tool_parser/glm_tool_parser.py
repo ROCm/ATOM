@@ -33,7 +33,6 @@ _ARG_RE = re.compile(
 
 class GlmParser(BufferedMarkerParser):
     NAME: ClassVar[str] = "glm"
-    MARKERS: ClassVar[tuple[str, ...]] = ("<tool_call>", "<arg_key>")
     START_MARKERS: ClassVar[tuple[str, ...]] = ("<tool_call>",)
 
     @classmethod

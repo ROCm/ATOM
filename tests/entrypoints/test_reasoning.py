@@ -84,17 +84,55 @@ class TestSeparateReasoning:
 
     def test_no_think_start_tag(self):
         """MiniMax M2.7 pattern: model doesn't generate <think>, only </think>.
-        The chat template injects <think> as part of the prompt."""
+
+        The chat template injects <think> into the prompt, which is what
+        `starts_thinking` carries -- the text itself cannot say so, and this
+        used to be inferred from the bare `</think>`. Inferring it is what the
+        streaming path cannot do without waiting for an end marker that may
+        never come, so the two disagreed; the caller answers it once now.
+        """
         text = "The user wants hello world...\n</think>\n\nprint('Hello')"
-        reasoning, content = separate_reasoning(text)
+        reasoning, content = separate_reasoning(text, starts_thinking=True)
         assert reasoning == "The user wants hello world..."
         assert content == "print('Hello')"
 
     def test_no_think_start_tag_empty_content(self):
         text = "Reasoning only\n</think>"
-        reasoning, content = separate_reasoning(text)
+        reasoning, content = separate_reasoning(text, starts_thinking=True)
         assert reasoning == "Reasoning only"
         assert content == ""
+
+    def test_an_unopened_end_tag_is_text_when_the_prompt_did_not_open_one(self):
+        """The other side of the same switch, and the reason it is a switch.
+
+        Unseeded, nothing opened a reasoning channel, so a stray `</think>`
+        is a string the model wrote. Claiming it as a delimiter is a guess,
+        and the guess is what made an ordinary answer wait for an end marker
+        that was never coming.
+        """
+        text = "The user wants hello world...\n</think>\n\nprint('Hello')"
+        reasoning, content = separate_reasoning(text)
+        assert reasoning is None
+        assert content == text
+
+    def test_streaming_and_non_streaming_agree_on_a_truncated_trace(self):
+        """Same prompt, same output, same split -- whether streamed or not.
+
+        A reasoning model stopped at `max_tokens` emits no end marker. Seeded,
+        both paths must call the whole thing reasoning; the streaming path did
+        while this one called it content, so a client reading `content` saw
+        the trace and a client reading `delta.content` saw nothing.
+        """
+        raw = "Let me consider whether the user wants a GLM parser. " * 4
+        reasoning, content = separate_reasoning(raw, starts_thinking=True)
+
+        rf = ReasoningFilter(starts_thinking=True)
+        segments = rf.process(raw) + rf.flush()
+        streamed_reasoning = "".join(s for f, s in segments if f == "reasoning_content")
+        streamed_content = "".join(s for f, s in segments if f == "content")
+
+        assert (reasoning or "") == streamed_reasoning
+        assert content == streamed_content
 
 
 # ============================================================================

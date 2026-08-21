@@ -1304,6 +1304,8 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     cleanup_stream,
                     cleanup_request,
                     tools=request.tools,
+                    tool_choice=request.tool_choice,
+                    starts_thinking=_starts_thinking,
                 )
             else:
                 seq_id, stream_collector, num_prompt_tokens = (
@@ -1355,6 +1357,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 outputs,
                 tools=request.tools,
                 tool_choice=request.tool_choice,
+                starts_thinking=_starts_thinking,
             )
         elif is_multimodal:
             final_output = await _run_nonstream_with_disconnect(
@@ -1377,6 +1380,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 final_output,
                 tools=request.tools,
                 tool_choice=request.tool_choice,
+                starts_thinking=_starts_thinking,
             )
         elif effective_n > 1:
             outputs = await _race_disconnect(
@@ -1398,6 +1402,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 outputs,
                 tools=request.tools,
                 tool_choice=request.tool_choice,
+                starts_thinking=_starts_thinking,
             )
         else:
             final_output = await _run_nonstream_with_disconnect(
@@ -1420,6 +1425,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 final_output,
                 tools=request.tools,
                 tool_choice=request.tool_choice,
+                starts_thinking=_starts_thinking,
             )
         _log_request_event("response", request_id, resp.model_dump())
         return resp
@@ -1643,9 +1649,14 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                 from .reasoning import ReasoningFilter
                 from .tool_parser import ToolCallStreamParser
 
-                reasoning_filter = ReasoningFilter()
-                if prompt.rstrip().endswith("<think>"):
-                    reasoning_filter.state = 1
+                # Asked of every dialect, not of one literal: the K3
+                # template opens with `<|open|>think<|sep|>`, which
+                # `.endswith("<think>")` does not see, and the assignment it
+                # guarded skipped `__post_init__` so the instance was in the
+                # thinking state while claiming it did not start there.
+                reasoning_filter = ReasoningFilter(
+                    starts_thinking=prompt_starts_in_reasoning(prompt)
+                )
                 tool_parser = ToolCallStreamParser()
                 tool_parser.tools = anthropic_to_openai_tools(request.tools)
                 block_index = 0
@@ -1825,7 +1836,9 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
             raise RuntimeError("No output generated")
 
         raw_text = final_output["text"]
-        reasoning_content, content_with_tools = separate_reasoning(raw_text)
+        reasoning_content, content_with_tools = separate_reasoning(
+            raw_text, starts_thinking=prompt_starts_in_reasoning(prompt)
+        )
         content_text, tool_calls = parse_tool_calls(
             content_with_tools, anthropic_to_openai_tools(request.tools)
         )

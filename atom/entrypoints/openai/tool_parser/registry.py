@@ -68,11 +68,37 @@ def parse_tool_calls(
 # discriminator may not have arrived yet. These two sentinels say "cannot decide
 # from what I have":
 
-# Enough plain text to be sure no marker is starting -> release it as content
-# and stay undecided.
-EMIT_CONTENT = object()
-# Might still become a tool call -> keep buffering, emit nothing.
+# Might still become a tool call -> the caller keeps this text.
+#
+# `WAIT` is only about the *format*, never about whether text may be released.
+# It used to be both, alongside an `EMIT_CONTENT` that meant "no '<' anywhere,
+# so nothing can be starting". That conflation was the stall: one '<' in an
+# ordinary answer -- `if (a < b)` -- made every branch here miss forever, and
+# `ToolCallStreamParser` never cleared the buffer it was accumulating, so the
+# answer arrived in a single frame at end of stream. Deciding how much text is
+# safe to send is now `MarkerScanner`'s, over the union of every registered
+# format's `MARKERS`, and it is asked before this function is.
 WAIT = object()
+
+
+# Literals the cascade below discriminates by that open no region of their
+# own, so no parser declares them and a reader would not otherwise hold them
+# back. `<arg_key>` is what tells GLM from Qwen -- both open with
+# `<tool_call>` -- and it appears *inside* that region, which is why it is not
+# one of GLM's `START_MARKERS`: `find_start` would take it for the region's
+# beginning and parse from the wrong offset.
+_SNIFF_ONLY: tuple[str, ...] = ("<arg_key>",)
+
+
+def all_markers() -> tuple[str, ...]:
+    """Every literal that could be starting before the format is known.
+
+    A suffix that could still grow into one of these is not safe to send. Taken
+    from the parsers' own `START_MARKERS` plus the cascade's own discriminators,
+    so a format added to `_DETECT_ORDER` is covered without a second edit here.
+    """
+    formats = {m for p in (*_DETECT_ORDER, KimiParser) for m in p.START_MARKERS}
+    return tuple(formats | set(_SNIFF_ONLY))
 
 
 def sniff_stream(buf: str):
@@ -105,11 +131,4 @@ def sniff_stream(buf: str):
         return WAIT
     if KIMI_SECTION_BEGIN in buf:
         return KimiParser
-    if "<" not in buf and len(buf) > 8:
-        # No '<' anywhere, so no tag has started: release the text. The length
-        # floor is an unexplained heuristic carried over verbatim from the
-        # original parser — it trades a little first-token latency for not
-        # committing on a 1-2 char buffer. Note it does not actually rule out a
-        # partial MiniMax ns_token, whose first char is ']'.
-        return EMIT_CONTENT
     return WAIT

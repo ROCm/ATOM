@@ -13,6 +13,7 @@ this module contains no per-model conditions. Add a model there, not here.
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
+from .marker_scanner import partial_suffix_len
 from .reasoning_dialects import DIALECTS
 
 # Marker tables derived from the dialect registry (no model literals here).
@@ -71,30 +72,43 @@ def _earliest_marker(buf: str, markers) -> tuple[int, str | None]:
 
 def _hold_back_len(buf: str, markers) -> int:
     """Length of the longest suffix of ``buf`` that is a strict prefix of any
-    marker, so a marker split across chunk boundaries isn't emitted as text."""
-    n = 0
-    for m in markers:
-        limit = min(len(buf), len(m) - 1)
-        for k in range(limit, 0, -1):
-            if m.startswith(buf[-k:]):
-                n = max(n, k)
-                break
-    return n
+    marker, so a marker split across chunk boundaries isn't emitted as text.
+
+    Delegates, because the tool-call path asks the same question and answering
+    it twice is how the two sides drifted apart.
+    """
+    return max((partial_suffix_len(buf, m) for m in markers), default=0)
 
 
-def separate_reasoning(text: str) -> tuple[str | None, str]:
+def separate_reasoning(
+    text: str, starts_thinking: bool = False
+) -> tuple[str | None, str]:
     """Separate reasoning content from the final answer.
 
     Tries each registered dialect in priority order; the first that applies wins.
+
+    ``starts_thinking`` is the same answer :class:`ReasoningFilter` takes, and
+    for the same reason: an output that begins inside the reasoning channel
+    carries no opening marker, so nothing in the text says so. Both paths have
+    to be told, or the same response is split one way when streamed and
+    another when not -- measured, a reasoning model truncated at ``max_tokens``
+    returned its whole trace as ``content`` here and as ``reasoning_content``
+    when streamed.
 
     Returns:
         Tuple of (reasoning_content, content). reasoning_content is None if no
         thinking block was found.
     """
     for dialect in DIALECTS:
-        result = dialect.split(text)
+        result = dialect.split(text, starts_thinking)
         if result is not None:
             return result
+    if starts_thinking:
+        # The prompt opened the channel and the model never closed it, which
+        # is what a reasoning model stopped at `max_tokens` looks like. It
+        # produced reasoning and no answer; the streaming filter says exactly
+        # that from state 1, and this has to agree.
+        return (text, "")
     # No reasoning markers — return content as-is (tool calls parsed separately).
     return (None, text)
 
@@ -168,17 +182,28 @@ class ReasoningFilter:
                 self.buf = self.buf[oidx + len(omark) :]
                 results.extend(self._drain_thinking())
             else:
-                # No explicit opener, but a think-end marker means the model
-                # started reasoning without one (template injected the opener).
-                idx, marker = _earliest_marker(self.buf, _THINK_END_MARKERS)
-                if idx != -1:
-                    results.extend(self._close_thinking(idx, marker))
-                elif len(self.buf) > 100 and "<" not in self.buf:
-                    # No reasoning markers after significant buffering — emit as
-                    # content. Large threshold gives models time to emit an
-                    # end marker when the template injected the opener.
-                    results.append(("content", self.buf))
-                    self.buf = ""
+                # No opener, so this is the answer: release it, holding back
+                # only a suffix that could still grow into one.
+                #
+                # State 0 no longer honours a `</think>` it never saw opened,
+                # and no longer buffers 100 characters hoping for one. Both
+                # were the same guess -- that the template had injected the
+                # opener -- made at run time about something the prompt
+                # answers: `starts_thinking` is that answer, and a filter in
+                # state 0 has been told the output does *not* begin inside the
+                # reasoning channel. The guess cost an unbounded first byte
+                # (its `"<" not in self.buf` gate could never be satisfied
+                # again once an ordinary answer contained a '<') and it let
+                # pre-`</think>` text reach the tool-call sniffer, which is
+                # how reasoning that merely mentions `<tool_call>` came to be
+                # emitted as a tool call. vLLM's streaming path resolves this
+                # from the token vocabulary and buffers nothing; this is the
+                # same position, reached from the prompt.
+                hold = _hold_back_len(self.buf, _OUTPUT_OPEN_MARKERS)
+                cut = len(self.buf) - hold
+                if cut:
+                    results.append(("content", self.buf[:cut]))
+                    self.buf = self.buf[cut:]
 
         elif self.state == 1:
             self.buf += text

@@ -20,6 +20,7 @@ rather than a random one, and ``index`` comes from the wire too.
 import re
 from typing import ClassVar
 
+from ..marker_scanner import MarkerScanner
 from .tool_parser import ToolCall, ToolCallParser
 
 KIMI_SECTION_BEGIN = "<|tool_calls_section_begin|>"
@@ -62,7 +63,9 @@ class KimiParser(ToolCallParser):
     """States: 0 = plain content, 1 = inside section, 2 = section closed."""
 
     NAME: ClassVar[str] = "kimi"
-    MARKERS: ClassVar[tuple[str, ...]] = (KIMI_SECTION_BEGIN, "<|tool_call_begin|>")
+    # The section opener, and the only literal detection keys on. The entry
+    # markers inside it are `_drain_entries`' business, never a reader's.
+    START_MARKERS: ClassVar[tuple[str, ...]] = (KIMI_SECTION_BEGIN,)
 
     @classmethod
     def detect(cls, text: str) -> bool:
@@ -86,18 +89,21 @@ class KimiParser(ToolCallParser):
         results: list = []
 
         if self.state == 0:
-            self.buf += text
-            if KIMI_SECTION_BEGIN in self.buf:
-                before = self.buf.split(KIMI_SECTION_BEGIN)[0]
-                if before:
-                    results.append(("content", before))
+            # Held back: only a suffix that could still grow into the section
+            # marker. It used to be `"<|tool" not in self.buf` over a buffer
+            # that was never cleared while that held, so a single `<|tool` --
+            # or an answer merely discussing one -- withheld everything after
+            # it until the stream ended. The 30-character floor went with it;
+            # the scanner's bound is the marker's own length.
+            if self._scanner_cache is None:
+                self._scanner_cache = MarkerScanner((KIMI_SECTION_BEGIN,))
+            scan = self._scanner_cache.feed(text)
+            if scan.released:
+                results.append(("content", scan.released))
+            if scan.hit is not None:
                 self.state = 1
-                self.buf = self.buf.split(KIMI_SECTION_BEGIN, 1)[1]
+                self.buf = scan.rest
                 results.extend(self._drain_entries())
-            elif "<|tool" not in self.buf and len(self.buf) > 30:
-                # No partial special token possible yet -> safe to release.
-                results.append(("content", self.buf))
-                self.buf = ""
 
         elif self.state == 1:
             self.buf += text

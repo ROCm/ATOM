@@ -3,9 +3,12 @@
 
 """Tests for chat completion serving logic (chunk creation, response building)."""
 
+import ast
 import asyncio
 import json
+import pathlib
 
+from atom.entrypoints.openai import serving_chat
 from atom.entrypoints.openai.serving_chat import (
     build_chat_response,
     build_chat_response_multi,
@@ -398,3 +401,48 @@ class TestFanoutCleanupSplit:
         _, request_calls = self._cleanup_calls([70, 71, 72, 73])
 
         assert request_calls == ["req-3"]
+
+
+class TestToolChoiceIsHonouredEverywhereItIsEmitted:
+    """`tool_choice="none"` forbids tool calls on every path that can emit one.
+
+    The single-choice stream gated on it and the fan-out did not, so the same
+    request with `n=2, stream=true` returned `tool_calls` deltas and
+    `finish_reason="tool_calls"` that `n=1` suppressed. Checked by walking the
+    source rather than by listing the four call sites, because the gap was a
+    site nobody listed.
+    """
+
+    SOURCE = pathlib.Path(serving_chat.__file__)
+
+    def test_no_tool_event_is_emitted_without_checking_tool_choice(self):
+        tree = ast.parse(self.SOURCE.read_text())
+        unguarded = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Compare):
+                continue
+            left = node.left
+            if not (isinstance(left, ast.Name) and left.id == "event_type"):
+                continue
+            const = node.comparators[0]
+            if not (
+                isinstance(const, ast.Constant)
+                and isinstance(const.value, str)
+                and const.value.startswith("tool_call_")
+                and const.value != "tool_call_end"
+            ):
+                continue
+            # The comparison is the left half of `event_type == X and <gate>`;
+            # walk up is not available, so re-find the enclosing BoolOp.
+            guarded = any(
+                isinstance(b, ast.BoolOp)
+                and node in b.values
+                and any("tool_choice" in ast.dump(v) for v in b.values)
+                for b in ast.walk(tree)
+                if isinstance(b, ast.BoolOp)
+            )
+            if not guarded:
+                unguarded.append(f"line {node.lineno}: {const.value}")
+        assert not unguarded, "tool events emitted regardless of tool_choice:\n  " + (
+            "\n  ".join(unguarded)
+        )

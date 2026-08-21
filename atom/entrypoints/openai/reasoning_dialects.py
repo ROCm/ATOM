@@ -63,7 +63,7 @@ class ReasoningDialect:
     prompt_open_marker: str
     output_open_marker: str | None
     think_end_marker: str
-    split: Callable[[str], SplitResult | None]
+    split: Callable[[str, bool], SplitResult | None]
     template_efforts: frozenset[str] = frozenset()
 
 
@@ -85,7 +85,7 @@ def _strip_channel_response_markers(text: str) -> str:
     return text.strip()
 
 
-def _split_channel(text: str) -> SplitResult | None:
+def _split_channel(text: str, starts_thinking: bool = False) -> SplitResult | None:
     combined = CHANNEL_THINK_END + CHANNEL_RESPONSE_START
     if combined in text:
         reasoning, _, content = text.partition(combined)
@@ -93,7 +93,7 @@ def _split_channel(text: str) -> SplitResult | None:
     if CHANNEL_RESPONSE_START in text:
         _, _, content = text.partition(CHANNEL_RESPONSE_START)
         return (None, _strip_channel_response_markers(content))
-    if CHANNEL_THINK_END in text:
+    if CHANNEL_THINK_END in text and starts_thinking:
         reasoning, _, content = text.partition(CHANNEL_THINK_END)
         return (reasoning.strip() or None, _strip_channel_response_markers(content))
     return None
@@ -105,13 +105,18 @@ _THINK_CLOSED_RE = re.compile(r"<think>(.*?)</think>\s*(.*)", flags=re.DOTALL)
 _THINK_OPEN_RE = re.compile(r"<think>(.*)", flags=re.DOTALL)
 
 
-def _split_think_tag(text: str) -> SplitResult | None:
+def _split_think_tag(text: str, starts_thinking: bool = False) -> SplitResult | None:
     # Closed block: <think>...</think> answer
     match = _THINK_CLOSED_RE.match(text)
     if match:
         return (match.group(1).strip() or None, match.group(2).strip())
-    # </think> without <think> — template injected the opening tag into the prompt.
-    if "</think>" in text:
+    # `</think>` with no `<think>`. Only reasoning if the prompt really did open
+    # the channel -- which `starts_thinking` now says, instead of this guessing.
+    # Ungated it disagreed with the streaming path, which cannot honour an end
+    # marker it has no opener for without waiting for one, and waiting is the
+    # stall. vLLM's non-streaming path still guesses here and its streaming path
+    # does not; the two do not agree, and this is the half worth copying.
+    if "</think>" in text and starts_thinking:
         reasoning, _, content = text.partition("</think>")
         return (reasoning.strip() or None, content.strip())
     # Unclosed block (truncated response).

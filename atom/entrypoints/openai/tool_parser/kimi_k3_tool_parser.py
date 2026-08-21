@@ -94,11 +94,14 @@ class KimiK3Parser(ToolCallParser):
     """
 
     NAME: ClassVar[str] = "kimi_k3"
-    MARKERS: ClassVar[tuple[str, ...]] = (
-        "<|open|>tools<|sep|>",
-        "<|open|>response<|sep|>",
-        "<|close|>response<|sep|>",
-        "<|end_of_msg|>",
+    # The same five `is_kimi_k3` decides by, named rather than spelled out:
+    # a hand-written copy of this list had four of them.
+    START_MARKERS: ClassVar[tuple[str, ...]] = (
+        KIMI_K3_CALL_PREFIX,
+        KIMI_K3_TOOLS_START,
+        KIMI_K3_RESPONSE_START,
+        KIMI_K3_RESPONSE_END,
+        KIMI_K3_END_OF_MSG,
     )
 
     @classmethod

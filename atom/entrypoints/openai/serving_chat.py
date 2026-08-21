@@ -368,6 +368,7 @@ def _build_chat_choice(
     index: int = 0,
     tools=None,
     tool_choice=None,
+    starts_thinking: bool = False,
 ) -> dict[str, Any]:
     """Build one entry of ``choices[...]`` from a raw output string.
 
@@ -375,7 +376,9 @@ def _build_chat_choice(
     (SamplingParams.n>1) can reuse the reasoning + tool-call separation
     without duplicating the logic.
     """
-    reasoning_content, content_with_tools = separate_reasoning(raw_text)
+    reasoning_content, content_with_tools = separate_reasoning(
+        raw_text, starts_thinking=starts_thinking
+    )
     content, tool_calls = parse_tool_calls(content_with_tools, tools)
 
     # tool_choice="none" forbids tool calls: any the model emitted anyway are
@@ -406,6 +409,7 @@ def build_chat_response(
     final_output: dict[str, Any],
     tools=None,
     tool_choice=None,
+    starts_thinking: bool = False,
 ) -> ChatCompletionResponse:
     """Build a non-streaming chat completion response (single choice)."""
     response = ChatCompletionResponse(
@@ -419,6 +423,7 @@ def build_chat_response(
                 index=0,
                 tools=tools,
                 tool_choice=tool_choice,
+                starts_thinking=starts_thinking,
             )
         ],
         usage={
@@ -449,6 +454,7 @@ def build_chat_response_multi(
     final_outputs: list[dict[str, Any]],
     tools=None,
     tool_choice=None,
+    starts_thinking: bool = False,
 ) -> ChatCompletionResponse:
     """Build a non-streaming response with one choice per fan-out sibling.
 
@@ -466,6 +472,7 @@ def build_chat_response_multi(
             index=i,
             tools=tools,
             tool_choice=tool_choice,
+            starts_thinking=starts_thinking,
         )
         for i, out in enumerate(final_outputs)
     ]
@@ -506,6 +513,8 @@ async def stream_chat_response_fanout(
     cleanup_stream,
     cleanup_request,
     tools=None,
+    tool_choice=None,
+    starts_thinking: bool = False,
 ) -> AsyncGenerator[str, None]:
     """Streaming variant that multiplexes ``len(seq_ids)`` fan-out siblings
     into a single SSE stream, tagging every chunk with ``choices[0].index``.
@@ -521,7 +530,10 @@ async def stream_chat_response_fanout(
     n = len(seq_ids)
     num_tokens_input = num_prompt_tokens
     num_tokens_output = [0] * n
-    reasoning_filters = [ReasoningFilter() for _ in range(n)]
+    # Every sibling answers the same prompt, so they start in the same state.
+    reasoning_filters = [
+        ReasoningFilter(starts_thinking=starts_thinking) for _ in range(n)
+    ]
     tool_parsers = [ToolCallStreamParser(tools=tools) for _ in range(n)]
     has_tool_calls = [False] * n
     finished = [False] * n
@@ -577,7 +589,7 @@ async def stream_chat_response_fanout(
                             yield create_chat_chunk(
                                 request_id, model, delta={"content": data}, index=idx
                             )
-                        elif event_type == "tool_call_start":
+                        elif event_type == "tool_call_start" and tool_choice != "none":
                             has_tool_calls[idx] = True
                             yield create_chat_chunk(
                                 request_id,
@@ -585,7 +597,7 @@ async def stream_chat_response_fanout(
                                 delta={"tool_calls": [data]},
                                 index=idx,
                             )
-                        elif event_type == "tool_call_args":
+                        elif event_type == "tool_call_args" and tool_choice != "none":
                             yield create_chat_chunk(
                                 request_id,
                                 model,
@@ -599,7 +611,7 @@ async def stream_chat_response_fanout(
                         yield create_chat_chunk(
                             request_id, model, delta={"content": data}, index=idx
                         )
-                    elif event_type == "tool_call_start":
+                    elif event_type == "tool_call_start" and tool_choice != "none":
                         has_tool_calls[idx] = True
                         yield create_chat_chunk(
                             request_id,
@@ -607,7 +619,7 @@ async def stream_chat_response_fanout(
                             delta={"tool_calls": [data]},
                             index=idx,
                         )
-                    elif event_type == "tool_call_args":
+                    elif event_type == "tool_call_args" and tool_choice != "none":
                         yield create_chat_chunk(
                             request_id,
                             model,
