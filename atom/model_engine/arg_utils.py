@@ -62,6 +62,10 @@ class EngineArgs:
     enable_chunked_prefill: bool = True
     enable_dynamic_chunking: bool = False
     dynamic_chunking_smooth_factor: float = 0.75
+    dynamic_chunking_calibration: str = ""
+    dynamic_chunking_calibration_logging: bool = False
+    dynamic_chunking_base_size: int = 0
+    dynamic_chunking_min_chunk_size: int = 4096
     scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
     gpu_memory_utilization: float = 0.9
@@ -433,8 +437,11 @@ class EngineArgs:
             "--enable-dynamic-chunking",
             action="store_true",
             help=(
-                "Dynamically reduce PP prefill chunks using a startup-profiled "
-                "quadratic latency model. Requires --pipeline-parallel-size > 1."
+                "Equalize the runtime of a PP prefill request's chunks to shorten "
+                "pipeline fill/drain. Requires --pipeline-parallel-size > 1. Helps "
+                "single-stream long prefill and costs throughput once several "
+                "requests prefill at once, so it is meant for latency-bound "
+                "deployments; see docs/dynamic_chunked_pipeline_parallelism.md."
             ),
         )
         parser.add_argument(
@@ -445,6 +452,47 @@ class EngineArgs:
                 "Interpolation between the initial chunk size (0) and the "
                 "equal-latency prediction (1). Defaults to "
                 "ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR or 0.75."
+            ),
+        )
+        parser.add_argument(
+            "--dynamic-chunking-calibration",
+            type=str,
+            default="",
+            help=(
+                "Latency model coefficients 'a,b,c,gamma' fitted from real "
+                "requests, replacing startup profiling. Startup profiling drives "
+                "the model with dummy batches, which carry no cached prefix and so "
+                "underestimate the prefix terms enough to make the solver a no-op; "
+                "MLA models need this to get useful chunk sizes."
+            ),
+        )
+        parser.add_argument(
+            "--dynamic-chunking-calibration-logging",
+            action="store_true",
+            help=(
+                "Log one (chunk, prefix, model_ms) sample per prefill forward to "
+                "fit --dynamic-chunking-calibration. Synchronizes every prefill "
+                "and perturbs pipeline overlap: calibration runs only."
+            ),
+        )
+        parser.add_argument(
+            "--dynamic-chunking-base-size",
+            type=int,
+            default=0,
+            help=(
+                "Chunk size the solver equalizes against. 0 uses "
+                "--max-num-batched-tokens, which ties the starting chunk to the "
+                "batch budget and lets the solver only ever add chunks; set it to "
+                "2-3x the best fixed chunk size to keep the chunk count neutral."
+            ),
+        )
+        parser.add_argument(
+            "--dynamic-chunking-min-chunk-size",
+            type=int,
+            default=4096,
+            help=(
+                "Floor for solved chunk sizes. Every extra chunk rebuilds the "
+                "cached prefix again, so this bounds how much work shrinking adds."
             ),
         )
         parser.add_argument(

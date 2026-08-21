@@ -15,6 +15,8 @@ import torch
 from torch.distributed import ProcessGroup, ReduceOp
 from transformers import AutoConfig, GenerationConfig, PretrainedConfig
 
+from atom.model_engine.dynamic_chunking import parse_chunking_calibration
+
 # plugin-related utilities
 from atom.plugin import is_plugin_mode, is_vllm
 from atom.plugin.config import PluginConfig
@@ -1530,10 +1532,26 @@ class Config:
     enable_chunked_prefill: bool = True
     enable_dynamic_chunking: bool = False
     dynamic_chunking_smooth_factor: float = 0.75
-    # Populated by PP startup profiling before Scheduler construction. Kept out
-    # of the public CLI because coefficients are hardware/model specific.
+    # Populated by PP startup profiling before Scheduler construction, or parsed
+    # from `dynamic_chunking_calibration` when that is given.
     # (a, b, c, gamma) of the chunk latency model in dynamic_chunking.py.
     dynamic_chunking_coefficients: tuple[float, ...] | None = None
+    # "a,b,c,gamma" fitted offline from real requests. Startup profiling drives
+    # the model with dummy batches, which underestimates the prefix terms by
+    # orders of magnitude on MLA backends, so a real fit has to be supplied to
+    # get useful chunk sizes. See docs/dynamic_chunked_pipeline_parallelism.md.
+    dynamic_chunking_calibration: str = ""
+    # Log one `(chunk, prefix, model_ms)` sample per real prefill forward, for
+    # fitting the coefficients above. Synchronizes every prefill, so this is for
+    # calibration runs only.
+    dynamic_chunking_calibration_logging: bool = False
+    # Chunk the solver equalizes against. 0 uses max_num_batched_tokens, which
+    # couples it to the batch budget and lets chunk counts only grow; set it to
+    # 2-3x the best fixed chunk size to keep the count roughly neutral.
+    dynamic_chunking_base_size: int = 0
+    # Floor for solved chunks. Every extra chunk re-pays the cached-prefix
+    # rebuild, so the floor is what bounds that amplification.
+    dynamic_chunking_min_chunk_size: int = 4096
     port: int = 8006
     torch_profiler_dir: str | None = field(
         default_factory=lambda: envs.ATOM_TORCH_PROFILER_DIR
@@ -1785,12 +1803,20 @@ class Config:
         assert 1 <= self.pipeline_parallel_size
         if not 0.0 <= self.dynamic_chunking_smooth_factor <= 1.0:
             raise ValueError("dynamic_chunking_smooth_factor must be in [0, 1]")
+        if self.dynamic_chunking_base_size < 0:
+            raise ValueError("dynamic_chunking_base_size must be non-negative")
+        if self.dynamic_chunking_min_chunk_size <= 0:
+            raise ValueError("dynamic_chunking_min_chunk_size must be positive")
         if self.enable_dynamic_chunking:
             if self.pipeline_parallel_size <= 1:
                 raise ValueError("Dynamic chunking requires pipeline_parallel_size > 1")
             if not self.enable_chunked_prefill:
                 raise ValueError(
                     "Dynamic chunking requires enable_chunked_prefill=True"
+                )
+            if self.dynamic_chunking_calibration:
+                self.dynamic_chunking_coefficients = parse_chunking_calibration(
+                    self.dynamic_chunking_calibration
                 )
         self.hf_config = get_hf_config(
             self.model, trust_remote_code=self.trust_remote_code

@@ -29,7 +29,11 @@ import numpy as np
 from atom.config import Config
 from atom.kv_transfer.disaggregation import KVConnectorOutput
 from atom.model_engine.block_manager import BlockManager
-from atom.model_engine.dynamic_chunking import ChunkSizePredictor
+from atom.model_engine.dynamic_chunking import (
+    GATE_SUPPLY_WINDOW,
+    ChunkSizePredictor,
+    has_sole_prefill,
+)
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import (
     Sequence,
@@ -744,6 +748,13 @@ class Scheduler:
         self.dynamic_chunking_smooth_factor = getattr(
             config, "dynamic_chunking_smooth_factor", 0.75
         )
+        self.dynamic_chunking_base_size = (
+            getattr(config, "dynamic_chunking_base_size", 0)
+            or self.max_num_batched_tokens
+        )
+        self.dynamic_chunking_min_chunk_size = getattr(
+            config, "dynamic_chunking_min_chunk_size", 4096
+        )
         dynamic_coefficients = getattr(config, "dynamic_chunking_coefficients", None)
         self.dynamic_chunk_predictor = (
             ChunkSizePredictor.from_coefficients(dynamic_coefficients)
@@ -751,6 +762,9 @@ class Scheduler:
             and dynamic_coefficients is not None
             else None
         )
+        # Peak prefill supply over the last `GATE_SUPPLY_WINDOW` schedules, so a
+        # momentary lull does not commit a request to a long chunk sequence.
+        self._recent_prefill_supply: deque[int] = deque(maxlen=GATE_SUPPLY_WINDOW)
         if (
             getattr(config, "enable_dynamic_chunking", False)
             and self.dynamic_chunk_predictor is None
@@ -1163,6 +1177,12 @@ class Scheduler:
         decoding already-running sequences.
         """
         self._schedule_tick += 1
+        if self.dynamic_chunk_predictor is not None:
+            # Sampled before the queues move, so `_dynamic_chunk_limit` sees how
+            # much prefill work the pipeline has had, not just what is left now.
+            self._recent_prefill_supply.append(
+                self._partial_prefill_count + len(self.waiting)
+            )
         # Sources borrowed by the previous batch: its forward has been issued,
         # so they can go back on the free list.
         self.block_manager.complete_previous_state_batch()
@@ -1226,6 +1246,7 @@ class Scheduler:
                     budget_remaining,
                     num_batched_tokens,
                     history_len=seq.num_cached_tokens,
+                    already_prefilling=True,
                 )
                 if chunk:
                     chunk = self._finalize_prefill_chunk(
@@ -1795,30 +1816,46 @@ class Scheduler:
         )
         self.running.append(seq)
 
-    def _dynamic_chunk_limit(self, history_len: int) -> int | None:
-        """Chunk ceiling from the startup latency model, or None to keep it fixed.
+    def _dynamic_chunk_limit(
+        self, history_len: int, *, already_prefilling: bool = False
+    ) -> int | None:
+        """Chunk ceiling from the latency model, or None to keep the chunk fixed.
 
-        Shrinking a chunk only removes pipeline bubbles while the pipeline is
-        short of microbatches. Once at least `pipeline_parallel_size` requests
-        are prefilling, the token budget refills from the other requests
-        whatever this one is given, so the batch still goes out full and the
-        number of forwards does not move — the smaller chunk just makes the
-        request take more of them, and every extra chunk re-pays whatever the
-        backend spends per chunk on the cached prefix. Dynamic chunking is
-        therefore an under-filled-pipeline tool, and the equal-latency solver
-        only runs when the pipeline is actually short of work.
+        Equal-latency chunking rebalances the microbatches *of one request*. With
+        a fixed chunk size that request's chunks grow more expensive along the
+        prompt, so the stages end up waiting on its last and costliest chunk;
+        evening them out shortens that drain.
+
+        It only buys anything while that request is the pipeline's only prefill.
+        A second prefilling request feeds the stages its own chunks, the token
+        budget refills from it whatever this one is given, and the forward count
+        does not move — so shrinking here just splits this request into more
+        chunks, each re-paying the per-chunk cached-prefix rebuild (`gamma * L`
+        for MLA) and another per-forward overhead. That is why the condition is
+        `has_sole_prefill` over a trailing window rather than a headroom test:
+        the chunk sizes committed now are executed alongside whatever arrives
+        behind them.
+
+        `already_prefilling` says whether this request is itself in
+        `_partial_prefill_count`, which it is when resuming a partial prefill out
+        of `running` but not when being admitted straight off `waiting`.
         """
         if self.dynamic_chunk_predictor is None:
             return None
-        prefill_supply = self._partial_prefill_count + len(self.waiting)
-        if prefill_supply >= self.pipeline_parallel_size:
+        prefill_sources = (
+            self._partial_prefill_count
+            + len(self.waiting)
+            + (0 if already_prefilling else 1)
+        )
+        if not has_sole_prefill(prefill_sources, self._recent_prefill_supply):
             return None
         return self.dynamic_chunk_predictor.predict(
             history_len=history_len,
-            base_chunk_size=self.max_num_batched_tokens,
+            base_chunk_size=self.dynamic_chunking_base_size,
             smooth_factor=self.dynamic_chunking_smooth_factor,
             alignment=max(self.block_manager.block_size, 64),
             max_chunk_size=self.max_num_batched_tokens,
+            min_chunk_size=self.dynamic_chunking_min_chunk_size,
         )
 
     def _chunked_prefill_size(
@@ -1828,6 +1865,7 @@ class Scheduler:
         num_batched_tokens: int,
         *,
         history_len: int = 0,
+        already_prefilling: bool = False,
     ) -> int:
         """Tokens to forward this step, or 0 to leave the request for the next.
 
@@ -1842,7 +1880,9 @@ class Scheduler:
         Never 0 for an empty batch: something has to go out each step, or a
         `max_num_batched_tokens` below the alignment would stall forever.
         """
-        dynamic_limit = self._dynamic_chunk_limit(history_len)
+        dynamic_limit = self._dynamic_chunk_limit(
+            history_len, already_prefilling=already_prefilling
+        )
         chunk = min(
             num_new_tokens,
             budget_remaining,
@@ -1860,6 +1900,7 @@ class Scheduler:
         num_batched_tokens: int,
         *,
         history_len: int = 0,
+        already_prefilling: bool = False,
     ) -> int | None:
         if self.enable_chunked_prefill:
             return (
@@ -1868,6 +1909,7 @@ class Scheduler:
                     budget_remaining,
                     num_batched_tokens,
                     history_len=history_len,
+                    already_prefilling=already_prefilling,
                 )
                 or None
             )

@@ -1312,6 +1312,13 @@ class ModelRunner:
         collectives remain ordered. Only local TP rank 0 returns data through
         the runner RPC channel; the PP head's EngineCore installs its result in
         the scheduler configuration.
+
+        These are single-sequence forwards over a block table that was never
+        filled by a real prefill, so the cached prefix they walk is not the one
+        serving walks. On MLA models that puts `gamma` more than an order of
+        magnitude below its served value, and the solver fitted on it barely
+        shrinks anything. Prefer `--dynamic-chunking-calibration` with
+        coefficients fitted from `--dynamic-chunking-calibration-logging`.
         """
         if (
             not self.config.enable_dynamic_chunking
@@ -1468,7 +1475,8 @@ class ModelRunner:
 
         selected = ChunkSizePredictor.from_coefficients(result["coefficients"])
         if not selected.predicts_useful_shrink(
-            base_chunk_size=max_chunk, history_len=reference_prefix
+            base_chunk_size=self.config.dynamic_chunking_base_size or max_chunk,
+            history_len=reference_prefix,
         ):
             return {
                 "error": (
@@ -3051,6 +3059,32 @@ class ModelRunner:
             f" sk={batch.detailed_sk}"
         )
 
+    def _log_dynamic_chunking_sample(
+        self, batch: ScheduledBatch, model_elapsed_ms: float
+    ) -> None:
+        """Log one real prefill sample for fitting the chunk latency model.
+
+        Only transformer time is timed - after the PP receive and before the PP
+        send - so the sample measures the chunk itself rather than how well this
+        stage happened to overlap with its neighbours. Fit `a,b,c,gamma` from
+        these lines and pass them to `--dynamic-chunking-calibration`.
+        """
+        num_prefills = int(batch.total_seqs_num_prefill)
+        if num_prefills <= 0:
+            return
+        chunks = np.asarray(batch.num_scheduled_tokens[:num_prefills], dtype=np.int64)
+        prefixes = np.asarray(batch.num_cached_tokens[:num_prefills], dtype=np.int64)
+        logger.info(
+            "DYNAMIC_CHUNKING_SAMPLE stage=%d reqs=%d chunks=%s prefixes=%s "
+            "area=%d model_ms=%.3f",
+            get_pp_group().rank_in_group,
+            num_prefills,
+            chunks.tolist(),
+            prefixes.tolist(),
+            int((2 * prefixes * chunks + chunks * chunks).sum()),
+            model_elapsed_ms,
+        )
+
     def _build_pcp_balanced_slices(
         self,
         batch: ScheduledBatch,
@@ -3347,6 +3381,15 @@ class ModelRunner:
                         tgt = self.attn_metadata_builder._sparse_kv_indices_gpu
                         tgt[: recv_sparse.numel()].copy_(recv_sparse)
 
+                calibrate_chunking = (
+                    self.config.dynamic_chunking_calibration_logging
+                    and batch is not None
+                    and not context.is_dummy_run
+                )
+                if calibrate_chunking:
+                    chunk_calib_start = torch.cuda.Event(enable_timing=True)
+                    chunk_calib_end = torch.cuda.Event(enable_timing=True)
+                    chunk_calib_start.record()
                 if pp_enabled:
                     model_output = self.model(
                         input_ids,
@@ -3359,6 +3402,12 @@ class ModelRunner:
                 else:
                     model_output = self.model(
                         input_ids, positions, inputs_embeds=inputs_embeds
+                    )
+                if calibrate_chunking:
+                    chunk_calib_end.record()
+                    chunk_calib_end.synchronize()
+                    self._log_dynamic_chunking_sample(
+                        batch, chunk_calib_start.elapsed_time(chunk_calib_end)
                     )
                 if pp_enabled and not pp_group.is_last_rank:
                     # GLM-5.2 IndexShare: carry top-k for next rank's shared layers.
