@@ -2548,8 +2548,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             and _drafter.uses_confidence_schedule
         )
         if ragged_lens is not None or _dspark_ragged_graph:
+            # Pinned staging, not `torch.as_tensor(np, device=cuda)`: that is a
+            # pageable H2D and syncs here, which was the ragged decode bubble.
             attn_metadata.dspark_ragged_lens_gpu = self._stage_dspark_ragged_lens(
-                "v4_dspark_ragged_lens", extend_lens_np, positions.device, pad_to=bs
+                extend_lens_np, self._dspark_ragged_lens_pad_to(bs)
             )
             attn_metadata.dspark_full_q = int(full_q)
 
@@ -2738,11 +2740,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             if dspark_ragged:
                 ragged_lens_buf = np.zeros(padded_bs, dtype=np.int32)
                 ragged_lens_buf[:ub_real_reqs] = ub_extend_lens_np
-                attn_metadata.dspark_ragged_lens_gpu = self._stage_dspark_ragged_lens(
-                    f"{p}v4_dspark_ragged_lens",
-                    ragged_lens_buf,
-                    positions_gpu.device,
-                    pad_to=padded_bs,
+                attn_metadata.dspark_ragged_lens_gpu = torch.as_tensor(
+                    ragged_lens_buf, device=positions_gpu.device
                 )
                 attn_metadata.dspark_full_q = full_q
 
@@ -4255,8 +4254,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # DSpark TRUE-FLAT graph: capture must take the same ragged indexer branch
         # and rect shape [bs, full_q] as replay, else the graph mismatches. The
         # synthetic batch's per-seq lengths (`extend_lens_np`, ragged under
-        # zero-copy-q else uniform max_q_len) drive the indexer ragged topk — same
-        # construction (`torch.as_tensor`) as replay's prepare_decode branch.
+        # zero-copy-q else uniform max_q_len) drive the indexer ragged topk.
         drafter = getattr(self.model_runner, "drafter", None)
         if (
             self.model_runner.config.dspark.ragged
@@ -4264,9 +4262,23 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             and drafter.uses_confidence_schedule
         ):
             full_q_real = drafter.mtp_k + 1
-            attn_metadata.dspark_ragged_lens_gpu = self._stage_dspark_ragged_lens(
-                "v4_dspark_ragged_lens", extend_lens_np, positions.device, pad_to=bs
-            )
+            pad_to = self._dspark_ragged_lens_pad_to(bs)
+            if pad_to is not None:
+                # AF + DP: the core captured here bakes this tensor's address, so
+                # capture has to write the SAME buffer replay does — otherwise
+                # every replay reads this capture's throwaway allocation.
+                attn_metadata.dspark_ragged_lens_gpu = self._stage_dspark_ragged_lens(
+                    extend_lens_np, pad_to
+                )
+            else:
+                # Nothing captures the core here and this is a capture-time
+                # allocation, so a pageable H2D costs nothing: main's
+                # `torch.full((bs,), max_q_len)`, widened to the ragged lengths
+                # (identical when the synthetic batch is the uniform rectangle).
+                attn_metadata.dspark_ragged_lens_gpu = torch.as_tensor(
+                    extend_lens_np.astype(np.int32, copy=False),
+                    device=positions.device,
+                )
             attn_metadata.dspark_full_q = int(full_q_real)
 
         # Build compress_plans + per-fwd meta + indexer meta via the same
@@ -4321,33 +4333,40 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
     # Helpers.                                                           #
     # ------------------------------------------------------------------ #
 
-    def _dspark_ragged_lens_needs_staging(self) -> bool:
-        """Fixed-address staging for the dspark ragged verify-lengths: AF+DP needs
-        the baked pointer, everywhere else it costs acceptance (tp8 49.9% vs 60%).
+    def _dspark_ragged_lens_pad_to(self, bs: int) -> int | None:
+        """Row count the dspark ragged verify-lengths must be padded to, or None
+        to keep the real per-seq count.
+
+        AF + DP replays a captured attention core that baked BOTH this tensor's
+        address and its row count, so every step has to present `bs` rows with
+        the tail zeroed or the core reads whatever the shorter copy left behind.
+        Nothing else captures the core, and padding costs acceptance there, so
+        every other configuration keeps the real count.
         """
         cfg = self.model_runner.config
         mode = getattr(cfg.compilation_config, "cudagraph_mode", None)
         if mode is None or not mode.is_attn_ffn_piecewise():
-            return False
-        return getattr(cfg.parallel_config, "data_parallel_size", 1) > 1
+            return None
+        if getattr(cfg.parallel_config, "data_parallel_size", 1) <= 1:
+            return None
+        return int(bs)
 
-    def _stage_dspark_ragged_lens(
-        self, name: str, arr, device, pad_to: int | None = None
-    ) -> torch.Tensor:
-        """Materialize the dspark ragged verify-lengths GPU tensor.
+    def _stage_dspark_ragged_lens(self, extend_lens_np, pad_to: int | None):
+        """Pinned async H2D of the per-seq verify lengths, returning the GPU view.
 
-        Fixed-address staging only where correctness needs it (AF + DP); every
-        other path keeps the fresh per-step tensor, which is what the acceptance
-        rate wants. See `_dspark_ragged_lens_needs_staging`.
+        Pinned staging, never `torch.as_tensor(np, device=cuda)`: that is a
+        pageable H2D and synchronizes, which was the ragged decode bubble #1861
+        removed. `forward_vars["ragged_extend"]` is one buffer at one address for
+        both capture and replay, which is also what the AF captured core needs --
+        so the fixed address costs nothing extra and only `pad_to` varies.
         """
-        arr = arr.astype(np.int32, copy=False)
-        if not self._dspark_ragged_lens_needs_staging():
-            return torch.as_tensor(arr, device=device)
-        if pad_to is not None and pad_to > arr.shape[0]:
-            padded = np.zeros(pad_to, dtype=np.int32)
-            padded[: arr.shape[0]] = arr
-            arr = padded
-        return self._stage(name, arr)
+        buf = self.model_runner.forward_vars["ragged_extend"]
+        n = int(extend_lens_np.size)
+        buf.np[:n] = extend_lens_np
+        if pad_to is not None and pad_to > n:
+            buf.np[n:pad_to] = 0
+            n = int(pad_to)
+        return buf.copy_to_gpu(n)
 
     def _alloc_v4_metadata_buffers(self) -> None:
         """Pre-allocate every CpuGpuBuffer the V4 metadata builder writes into.
@@ -4389,11 +4408,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # buffer on every path, forked or not, so the captured decode graph sees
         # a stable address.
         bufs["v4_meta_state_slot_in"] = CpuGpuBuffer(bs, **i32)
-        # DSpark ragged verify lengths are read inside the captured AF attention
-        # core via attn_metadata. Stage them into a fixed-address buffer so graph
-        # replay sees refreshed per-step contents instead of the capture-time
-        # torch.as_tensor allocation.
-        bufs["v4_dspark_ragged_lens"] = CpuGpuBuffer(bs, **i32)
 
         # Phase B: paged-decode index buffers (consumed by Phase C/E).
         # Sized to worst-case decode shape `T = max_bs * (1 + max_spec_steps)`
@@ -4576,7 +4590,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             # V4 decode metadata buffers.
             bufs[f"{p}v4_meta_state_slot_out"] = CpuGpuBuffer(bs, **i32)
             bufs[f"{p}v4_meta_state_slot_in"] = CpuGpuBuffer(bs, **i32)
-            bufs[f"{p}v4_dspark_ragged_lens"] = CpuGpuBuffer(bs, **i32)
             bufs[f"{p}v4_kv_indices_swa"] = CpuGpuBuffer(T_dec * win, **i32)
             bufs[f"{p}v4_kv_indices_csa"] = CpuGpuBuffer(
                 T_dec * (win + self.index_topk), **i32
