@@ -133,9 +133,7 @@ def test_native_v4_defaults_indexer_to_fp4_on_gfx950(monkeypatch):
 
 
 @pytest.mark.parametrize("gfx", ["gfx1250", "future_gfx"])
-def test_native_v4_defaults_indexer_to_kv_cache_dtype_off_gfx950(
-    monkeypatch, gfx
-):
+def test_native_v4_defaults_indexer_to_kv_cache_dtype_off_gfx950(monkeypatch, gfx):
     config, probe = _make_config(monkeypatch, gfx=gfx)
 
     assert config.index_cache_dtype == config.kv_cache_dtype == "fp8"
