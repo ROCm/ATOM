@@ -405,19 +405,41 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler):
         joint = int(getattr(seq, "state_joint_boundary_tokens", 0) or 0)
         if joint <= hbm:
             return False, "per_req_cache_state_boundary", hbm, lmc, lmc - hbm, chunk
-        # The KV leg moves whole chunks and the blocks below `hbm` are shared,
+        # Where the transfer starts, which is NOT where the request may call
+        # itself cached. `allocate` claimed every block the prefix walk matched,
+        # not just the resumable ones, so the KV below this is already in the
+        # pool and asking LMCache to send it back would move bytes the GPU
+        # holds -- and land a second copy of them in HBM, since
+        # `publish_loaded_prefix` keeps the existing canonical mapping and the
+        # freshly written blocks stay private to this request.
+        #
+        # `state_joint_claim_tokens` is floored to the chunk grid by
+        # `_joint_kv_boundary`, so this start is aligned whenever `hbm` was.
+        start = max(hbm, int(getattr(seq, "state_joint_claim_tokens", 0) or 0))
+        # The KV leg moves whole chunks and the blocks below `start` are shared,
         # so an unaligned start cannot be rounded down.
-        if hbm % chunk != 0:
-            return False, "joint_unaligned_hbm_prefill", hbm, lmc, lmc - hbm, chunk
+        if start % chunk != 0:
+            return False, "joint_unaligned_hbm_prefill", start, lmc, lmc - start, chunk
         # Transfer the chunk covering the boundary, claim only the boundary.
         kv_target = int(getattr(seq, "state_joint_kv_tokens", 0) or 0) or joint
         if joint > lmc or kv_target > lmc:
-            return False, "joint_boundary_above_lookup", hbm, lmc, lmc - hbm, chunk
+            return False, "joint_boundary_above_lookup", start, lmc, lmc - start, chunk
+        if kv_target <= start:
+            # The whole boundary is already resident. Unreachable while
+            # `_gated_hit` returns the rightmost rung -- a boundary at or below
+            # the compressed hit would have been the plain hit -- but a state
+            # leg with no KV leg is a shape this must not emit silently.
+            return False, "joint_kv_already_resident", start, lmc, 0, chunk
+        # Both ends of the transfer, together: the base class writes the start
+        # back on its own path and the worker reads `[hbm_cached_tokens,
+        # lmcache_cached_tokens)`, so leaving the start at the value the lookup
+        # recorded would fetch from token 0 every time.
+        ls.hbm_cached_tokens = start
         ls.lmcache_cached_tokens = kv_target
         # Deliberately past the min-load floor: the boundary was chosen for both
         # legs, and refusing on size would leave the state leg claiming a prefix
         # whose KV never came.
-        return True, "joint_state_and_kv", hbm, kv_target, kv_target - hbm, chunk
+        return True, "joint_state_and_kv", start, kv_target, kv_target - start, chunk
 
     @staticmethod
     def _claim_after_load(seq, hbm: int, lmc: int) -> int:

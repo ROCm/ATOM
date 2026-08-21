@@ -4657,13 +4657,14 @@ def _k3_scheduler() -> KimiK3OffloadScheduler:
     return s
 
 
-def _k3_seq(*, hbm: int, joint: int = 0, kv: int = 0):
+def _k3_seq(*, hbm: int, joint: int = 0, kv: int = 0, claimed: int = 0):
     return SimpleNamespace(
         id=1,
         has_per_req_cache=True,
         num_cached_tokens=hbm,
         state_joint_boundary_tokens=joint,
         state_joint_kv_tokens=kv,
+        state_joint_claim_tokens=claimed,
     )
 
 
@@ -4705,6 +4706,38 @@ def test_a_joint_load_clamps_the_kv_leg_to_the_covering_chunk():
     assert (ok, reason) == (True, "joint_state_and_kv")
     assert (hbm, lmc, need) == (512, 1024, 512)
     assert ls.lmcache_cached_tokens == 1024
+
+
+def test_the_kv_leg_starts_where_the_claim_ended_not_where_the_hit_did():
+    """`allocate` claims every block the prefix walk matched, which is past the
+    gated hit. Starting the transfer at the hit would fetch back what the pool
+    already holds, and land a second copy of it in HBM."""
+    seq = _k3_seq(hbm=0, joint=5120, kv=5120, claimed=4096)
+    ls = SimpleNamespace(hbm_cached_tokens=0, lmcache_cached_tokens=7168)
+    ok, reason, start, lmc, need, _ = _k3_scheduler()._decide_load_after_alloc(seq, ls)
+    assert (ok, reason) == (True, "joint_state_and_kv")
+    assert (start, lmc, need) == (4096, 5120, 1024)
+    # Both ends land on the spec: the worker reads the pair, and a start left
+    # at the value the lookup recorded fetches from token 0 every time.
+    assert ls.hbm_cached_tokens == 4096
+    assert ls.lmcache_cached_tokens == 5120
+
+
+def test_without_a_widened_claim_the_leg_still_starts_at_the_hit():
+    seq = _k3_seq(hbm=512, joint=1024, kv=1024)
+    ls = SimpleNamespace(hbm_cached_tokens=0, lmcache_cached_tokens=8192)
+    ok, _, start, _, need, _ = _k3_scheduler()._decide_load_after_alloc(seq, ls)
+    assert (ok, start, need) == (True, 512, 512)
+    assert ls.hbm_cached_tokens == 512
+
+
+def test_a_boundary_already_fully_resident_emits_no_kv_leg():
+    """Unreachable while `_gated_hit` returns the rightmost rung, but a state
+    leg paired with an empty KV leg must not be emitted silently."""
+    seq = _k3_seq(hbm=0, joint=4096, kv=4096, claimed=4096)
+    ls = SimpleNamespace(hbm_cached_tokens=0, lmcache_cached_tokens=7168)
+    ok, reason, *_ = _k3_scheduler()._decide_load_after_alloc(seq, ls)
+    assert (ok, reason) == (False, "joint_kv_already_resident")
 
 
 def test_the_claim_never_exceeds_the_state_boundary():

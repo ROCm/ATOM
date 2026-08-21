@@ -186,6 +186,7 @@ class BlockManager:
             kv_connector_hosts_state_tier,
             state_offload_staging_groups,
         )
+
         staging = state_offload_staging_groups()
         # Joint boundaries, split by what the state leg cost: `hbm` forked a
         # resident checkpoint, `tier` paid an entry-sized H2D and a park. Almost
@@ -200,17 +201,18 @@ class BlockManager:
         self._joint_chunk_tokens = 0
         try:
             from atom.kv_transfer.offload import config as offcfg
+
             self._joint_chunk_tokens = int(
                 offcfg.build_lmcache_config(
                     getattr(config, "kv_transfer_config", None)
                 ).chunk_size
             )
         except Exception:
-                logger.warning(
-                    "state offload: could not read the LMCache chunk size; the "
-                    "joint KV load needs it and stays off",
-                    exc_info=True,
-                )
+            logger.warning(
+                "state offload: could not read the LMCache chunk size; the "
+                "joint KV load needs it and stays off",
+                exc_info=True,
+            )
         kv_offload_enabled = kv_connector_hosts_state_tier(
             getattr(config, "kv_transfer_config", None)
         )
@@ -280,6 +282,7 @@ class BlockManager:
             checkpoint_stores=stores,
             checkpoint_restores=restores,
         )
+
     def state_spills_for_batch(self) -> list[tuple[int, int, int, int]]:
         """`(src_group, dst_entry, staging_slot, hash)` the batch being built
         must copy out before its forward.
@@ -314,6 +317,7 @@ class BlockManager:
                 # Never observed in correct operation; release rather than leak.
                 offload.release_staging(slot)
         return out
+
     def state_checkpoint_fates(self) -> dict[str, int]:
         """Summed fates across every state class, for the periodic stats line.
 
@@ -339,6 +343,7 @@ class BlockManager:
             for k, v in fates_fn().items():
                 totals[k] = totals.get(k, 0) + v
         return totals
+
     def _record_evicted(self, h: int) -> None:
         """A hash the block pool just dropped: report it, and settle the state.
 
@@ -511,6 +516,7 @@ class BlockManager:
             "retained": max(0, hashed - used),
             "evicted_total": self.total_evicted_blocks,
         }
+
     def _joint_kv_boundary(
         self,
         seq: Sequence,
@@ -534,6 +540,7 @@ class BlockManager:
         seq.state_joint_boundary_tokens = 0
         seq.state_joint_boundary_hash = -1
         seq.state_joint_kv_tokens = 0
+        seq.state_joint_claim_tokens = 0
         if self.state_offload is None:
             return self._no_joint("off")
         # PAGE checkpoints live in the KV pool, so their state leg has no tier
@@ -580,12 +587,29 @@ class BlockManager:
         seq.state_joint_boundary_tokens = tokens
         seq.state_joint_boundary_hash = h
         seq.state_joint_kv_tokens = kv_tokens
+        # Everything up to the compressed hit is this prompt's KV and is still
+        # in the pool -- what `_gated_hit` cut was resumability, not residency.
+        # Below the joint boundary those blocks are read-only for this request
+        # (the forward starts at the boundary), so claiming them is free, and
+        # it is the difference between the KV leg fetching `[hit, B)` and
+        # fetching `[0, B)` with the front half already sitting in HBM.
+        #
+        # `candidate > hbm_boundary` and `hbm_boundary` is the RIGHTMOST rung
+        # `<= compressed_hit`, so the boundary is always past the compressed
+        # hit and this min is always the compressed hit. Written as a min
+        # anyway: the invariant belongs to `_gated_hit`, not here.
+        claim_blocks = min(len(block_hashes), candidate)
+        # Floored to the chunk grid so the KV leg starts aligned and writes
+        # only into blocks below it that nobody else can be reading.
+        claim_tokens = ((claim_blocks * hbs) // chunk) * chunk
+        seq.state_joint_claim_tokens = max(claim_tokens, hbm_boundary * hbs)
         self.joint_boundaries += 1
         if self.state.lookup_group(h) >= 0:
             self.joint_boundaries_hbm += 1
         else:
             self.joint_boundaries_tier += 1
         return candidate
+
     def _no_joint(self, reason: str) -> int:
         """Record why this admission got no joint boundary, and return 0.
         Every reason is counted, including "this build is not even trying",
@@ -594,6 +618,7 @@ class BlockManager:
         """
         self.joint_skips[reason] = self.joint_skips.get(reason, 0) + 1
         return 0
+
     def _chain_to(
         self, seq: Sequence, block_hashes: list[int], blocks: int
     ) -> list[int]:
@@ -609,6 +634,7 @@ class BlockManager:
             h = self.compute_hash(self._hash_block_tokens(seq, i), h)
             chain.append(h)
         return chain
+
     def can_allocate(self, seq: Sequence) -> int:
         """Return number of cache-hit blocks (>=0) if seq fits, else -1.
 
@@ -701,21 +727,49 @@ class BlockManager:
         a hash until fully filled.
         """
         assert not seq.block_table
+        # Two extents, and they are not the same number. `num_cached_blocks` is
+        # what the request may call cached -- it needs a resumable state behind
+        # it. `claim_blocks` is what it may point its block table at: every
+        # block the prefix walk matched, whether or not a checkpoint sits there.
+        # The gap between them is real reuse that the state gate declined, and
+        # taking it costs nothing: those blocks are below the joint boundary the
+        # forward will start from, so nobody writes them.
+        #
+        # Only a joint boundary widens it -- without one there is nothing above
+        # `num_cached_blocks` this request will ever treat as computed, and
+        # claiming further would pin blocks the forward is about to overwrite.
+        hbs = self._hash_block_size()
+        claim_blocks = max(
+            num_cached_blocks,
+            int(getattr(seq, "state_joint_claim_tokens", 0) or 0) // hbs,
+        )
         h = -1
-        for i in range(num_cached_blocks):
+        hit_hash = -1
+        for i in range(claim_blocks):
             token_ids = self._hash_block_tokens(seq, i)
             h = self.compute_hash(token_ids, h)
             block_id = self.kv.lookup(h)
+            if block_id == -1:
+                # Evicted between `can_allocate` and here. Unreachable for the
+                # cached range (nothing evicts inside one admission), so only
+                # the widened tail can land here: stop claiming and let the rest
+                # come from the free pool.
+                assert (
+                    i >= num_cached_blocks
+                ), f"cached block {i} of {num_cached_blocks} vanished during allocate"
+                seq.state_joint_claim_tokens = i * hbs
+                break
             self.kv.claim(block_id)
             seq.block_table.append(block_id)
-        hit_hash = h if num_cached_blocks > 0 else -1
+            if i + 1 == num_cached_blocks:
+                hit_hash = h
         # Pin the restore before fresh blocks can evict its checkpoint.
         state_holds = True
         if seq.has_per_req_cache and self.paged_state_checkpoints is not None:
             state_holds = self._attach_state_group(seq, hit_hash)
-        for _ in range(num_cached_blocks, self.num_pool_blocks(len(seq))):
+        for _ in range(len(seq.block_table), self.num_pool_blocks(len(seq))):
             seq.block_table.append(self._fresh_block())
-        seq.num_cached_tokens = num_cached_blocks * self._hash_block_size()
+        seq.num_cached_tokens = num_cached_blocks * hbs
 
         # Per-request cache: claim one slot index from the pre-allocated
         # state tensor (e.g. GDN mamba_k_cache, the V4 compressor ring). The
@@ -743,6 +797,7 @@ class BlockManager:
             seq.num_cached_tokens = 0
             seq.state_joint_boundary_tokens = 0
             seq.state_joint_boundary_hash = -1
+
     def _attach_state_group(self, seq: Sequence, hit_hash: int) -> bool:
         """Give `seq` a state group, resuming from a checkpoint when one exists.
 
@@ -815,6 +870,7 @@ class BlockManager:
         seq.per_req_cache_group = src
         seq.state_fork_src = -1
         return True
+
     def _tier_can_serve(self, hit_hash: int) -> bool:
         """Whether the tier believes it holds `hit_hash`.
         Asked twice per admission -- before `pop`, to decide whether that
@@ -845,6 +901,7 @@ class BlockManager:
         return self._tier_can_serve(hit_hash) or (
             hit_hash != -1 and self.state.lookup_group(hit_hash) >= 0
         )
+
     def _request_state_load(self, seq: Sequence, hit_hash: int) -> bool:
         """Ask the tier to fetch `hit_hash` into the group `seq` just took.
 
@@ -880,6 +937,7 @@ class BlockManager:
         seq.state_load_hash = hit_hash
         self._state_loads.append((seq.id, hit_hash, seq.per_req_cache_group))
         return True
+
     def cancel_state_load(self, seq: Sequence) -> None:
         """Withdraw a load requested this pass, before anything was issued.
         Only legal before `take_state_loads` handed it over; afterwards the
@@ -893,6 +951,7 @@ class BlockManager:
             self.state_offload.abandon_load(seq.id)
         seq.state_load_hash = -1
         seq.num_cached_tokens = 0
+
     def abandon_state_load(self, req_id) -> None:
         """Give up on a load without blaming the bytes for it.
         For a load nothing could carry. `settle_state_load(ok=False)` would
@@ -905,6 +964,7 @@ class BlockManager:
         group = self._orphan_load_groups.pop(req_id, None)
         if group is not None:
             self.state.release(group)
+
     def settle_state_load(self, req_id, ok: bool) -> None:
         """Apply one worker load report. Keyed by request, like the KV load.
 
@@ -923,6 +983,7 @@ class BlockManager:
         group = self._orphan_load_groups.pop(req_id, None)
         if group is not None:
             self.state.release(group)
+
     def take_state_loads(self) -> list[tuple]:
         """`(req_id, hash, target_group)` for loads admitted since the last call.
         Drained once per pass by the scheduler, which hands them to the
@@ -933,6 +994,7 @@ class BlockManager:
             return []
         out, self._state_loads = self._state_loads, []
         return out
+
     def _chain_parent_hash(self, seq: Sequence, start: int) -> int | None:
         """Return the chained hash of block ``start - 1``, or ``None`` on a gap.
 
@@ -1263,6 +1325,7 @@ class BlockManager:
             "joint_boundaries_hbm": self.joint_boundaries_hbm,
             "joint_boundaries_tier": self.joint_boundaries_tier,
         } | self.state_checkpoint_fates()
+
     def checkpointers_at(
         self,
         seq: Sequence,
@@ -1529,6 +1592,7 @@ class BlockManager:
             seq.state_fork_src = -1
 
         seq.state_load_hash = -1
+
     def can_append(self, seq: Sequence, num_new_tokens: int = 1) -> bool:
         seq_len = len(seq)
         current_blocks = len(seq.block_table)
