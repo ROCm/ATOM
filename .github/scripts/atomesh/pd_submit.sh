@@ -257,6 +257,13 @@ fi
 SLURM_LOG_POLL_INTERVAL="${SLURM_LOG_POLL_INTERVAL:-30}"
 SLURM_ACCOUNTING_TIMEOUT="${SLURM_ACCOUNTING_TIMEOUT:-30}"
 SLURM_ACCOUNTING_POLL_INTERVAL="${SLURM_ACCOUNTING_POLL_INTERVAL:-2}"
+if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-crusoe-mi355" || "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi355-crusoe" ]]; then
+  export SLURM_NODELIST="${SLURM_NODELIST:-crsuse2-m2m-v2-028,crsuse2-m2m-v2-029}"
+fi
+if [[ -z "${NODE_LIST:-}" && -n "${SLURM_NODELIST:-}" ]]; then
+  NODE_LIST="${SLURM_NODELIST}"
+fi
+SLURM_NODELIST="${SLURM_NODELIST:-${NODE_LIST}}"
 USES_SPUR_CONTROLLER=0
 if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" || "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-crusoe-mi355" || "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi355-crusoe" ]]; then
   USES_SPUR_CONTROLLER=1
@@ -266,7 +273,7 @@ echo "=== ATOMesh benchmark cell ==="
 echo "cell=${ATOMESH_CELL_ID}"
 echo "model=${MODEL_NAME}"
 echo "topology=${DISPLAY_TOPOLOGY}"
-echo "nodes=${NODE_LIST}"
+echo "nodes=${SLURM_NODELIST:-<auto>}"
 echo "isl=${ISL_LIST} osl=${OSL} concurrency=${CONC_LIST}"
 echo "slurm_job_name=${SLURM_JOB_NAME}"
 echo "log_root=${LOG_ROOT}"
@@ -620,8 +627,8 @@ if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
 #SBATCH --time=${SLURM_TIME_LIMIT}
 #SBATCH --chdir=/tmp
 EOF
-  if [[ -n "${NODE_LIST}" ]]; then
-    printf '#SBATCH --nodelist=%s\n' "${NODE_LIST}" >> "${SUBMIT_SCRIPT}"
+  if [[ -n "${SLURM_NODELIST}" ]]; then
+    printf '#SBATCH --nodelist=%s\n' "${SLURM_NODELIST}" >> "${SUBMIT_SCRIPT}"
   fi
   cat >> "${SUBMIT_SCRIPT}" <<EOF
 #SBATCH --output=${SLURM_OUTPUT}
@@ -655,15 +662,17 @@ else
   fi
   SBATCH_CMD+=(
     --nodes "${NUM_NODES}"
+  )
+  if [[ -n "${SLURM_NODELIST}" ]]; then
+    SBATCH_CMD+=(--nodelist "${SLURM_NODELIST}")
+  fi
+  SBATCH_CMD+=(
     --ntasks "${NUM_NODES}"
     --ntasks-per-node 1
     --cpus-per-task "${SLURM_CPUS_PER_TASK}"
     --gres "gpu:${SLURM_GPUS_PER_NODE}"
     --time "${SLURM_TIME_LIMIT}"
   )
-  if [[ -n "${NODE_LIST}" ]]; then
-    SBATCH_CMD+=(--nodelist "${NODE_LIST}")
-  fi
   SBATCH_CMD+=(
     --output "${SLURM_OUTPUT}"
     --error "${SLURM_ERROR}"
