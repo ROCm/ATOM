@@ -1617,7 +1617,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 num_local_tokens = topk_ids.new_empty(
                     1, dtype=torch.int32
                 ).fill_(M)
-                routing_data, gather_idx, scatter_idx, gate_valid = (
+                # No scatter geometry: this path has no EP transport to deliver
+                # into, so GEMM2 reduces locally and dst_row is unused.
+                routing_data, gather_idx, scatter_idx, gate_valid, _dst_row = (
                     routing_from_dispatched(
                         topk_weights,
                         topk_ids,

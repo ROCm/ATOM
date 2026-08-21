@@ -102,6 +102,7 @@ def routing_from_dispatched(
     expert_map: torch.Tensor,
     num_local_experts: int,
     num_local_tokens: torch.Tensor,
+    ep_scatter_geometry=None,
 ):
     """Build triton RoutingData / gather / scatter from mori-dispatched rows.
     Thin wrapper over aiter's ``ep_sort_routing``, which owns the sort itself
@@ -124,9 +125,10 @@ def routing_from_dispatched(
        It is REQUIRED, not optional: the mori buffer always has M > R, so
        skipping the row mask would fold garbage rows into the histogram as live
        gates -- silently wrong rather than an error.
-    Returns ``(routing_data, gather_indx, scatter_indx, gate_valid)`` -- the first
-    three match ``routing()``; ``gate_valid`` is the extra piece EP needs, since
-    ``routing()`` never produces dead gates.
+    Returns ``(routing_data, gather_indx, scatter_indx, gate_valid, dst_row)`` --
+    the first three match ``routing()``; ``gate_valid`` is the extra piece EP
+    needs, since ``routing()`` never produces dead gates. ``dst_row`` is None
+    unless ``ep_scatter_geometry`` asked for the combine-scatter map.
     """
     from aiter.ops.triton.moe.moe_routing.routing import (
         ExptData,
@@ -165,7 +167,7 @@ def routing_from_dispatched(
         expt_data_bufs
     )
 
-    hist_full, topk_indx, gate_indx, gate_scal, gate_valid = ep_sort_routing(
+    hist_full, topk_indx, gate_indx, gate_scal, gate_valid, dst_row = ep_sort_routing(
         dispatch_weights,
         dispatch_ids,
         expert_map,
@@ -175,6 +177,7 @@ def routing_from_dispatched(
         topk,
         n_gates,
         expt_data_bufs,
+        ep_scatter_geometry=ep_scatter_geometry,
     )
     # The tail bin holds the sentinel (non-local) count, which the matmul must
     # schedule no tile for.
@@ -184,7 +187,7 @@ def routing_from_dispatched(
     routing_data = RoutingData(
         block_m, gate_scal, hist, num_local_experts, topk, expt_data
     )
-    return routing_data, topk_indx, gate_indx, gate_valid
+    return routing_data, topk_indx, gate_indx, gate_valid, dst_row
 
 
 def _resize_cache(x: torch.Tensor, v: tuple[int, ...]) -> torch.Tensor:
@@ -204,7 +207,7 @@ def _gluon_fused_quant_supported(m, n, k, routing_data) -> bool:
     moe_gemm_a8w4 chooses between three gluon kernels, in this order, and only
     the middle one implements the fused MXFP8 requant epilogue:
 
-        config["use_persistent"]  -> _moe_gemm_a8w4_decode_persistent   no
+        persistent_iters > 1      -> _moe_gemm_a8w4_decode_persistent   no
         block_m == 16             -> _moe_gemm_a8w4_decode              YES
         (otherwise)               -> _moe_gemm_a8w4_prefill             no
 
@@ -220,11 +223,14 @@ def _gluon_fused_quant_supported(m, n, k, routing_data) -> bool:
     kernel. So this has to be recomputed per call, not cached per layer.
 
     Defers the persistent decision to aiter's own selector instead of restating
-    its thresholds, so this stays correct if that heuristic moves.
+    its thresholds, so this stays correct if that heuristic moves. The selector
+    reports it as `persistent_iters` -- the count of N-tiles one program walks --
+    and the persistent kernel is the one launched when that exceeds 1, matching
+    moe_gemm_a8w4's own `config["persistent_iters"] > 1` test.
     """
     if routing_data is None or getattr(routing_data, "block_m", None) is None:
         return False
-    return not get_kernel_config_gluon(m, n, k, routing_data)["use_persistent"]
+    return get_kernel_config_gluon(m, n, k, routing_data)["persistent_iters"] <= 1
 
 
 def _fused_experts_silu_gugu(
@@ -248,6 +254,7 @@ def _fused_experts_silu_gugu(
     preshuffled: bool | None = None,
     act_quant: MoEActivationQuant = MoEActivationQuant.BF16,
     y_out: torch.Tensor | None = None,
+    ep_scatter=None,
 ) -> torch.Tensor:
     """Fused-SiLU MoE experts over GUGU (interleaved ``[gate, up]``) weights.
 
@@ -278,9 +285,18 @@ def _fused_experts_silu_gugu(
     the leading rows of a taller caller-owned buffer, so the EP path can hand
     mori's combine a full-M tensor without copying this result into it. It is
     GEMM2's output only; GEMM1's intermediate is always kernel-allocated.
+
+    ``ep_scatter`` replaces that reduction entirely: GEMM2 delivers its un-reduced
+    rows into a peer combine-staging window and the sum happens in the EP combine,
+    once every rank has delivered. Mutually exclusive with ``y_out`` -- one names a
+    reduced output, the other says there is no local reduction to produce one.
     """
     assert hidden_states.ndim == 2
     assert hidden_states.dtype == torch.bfloat16
+    assert y_out is None or ep_scatter is None, (
+        "y_out and ep_scatter are alternatives: the first names GEMM2's reduced "
+        "output, the second says the rows leave unreduced"
+    )
 
     gammas = routing_data.gate_scal if routing_data else None
 
@@ -291,6 +307,10 @@ def _fused_experts_silu_gugu(
     )
 
     if envs.ATOM_USE_TRITON_MOE_A4W4 or act_quant == MoEActivationQuant.FP4:
+        assert ep_scatter is None, (
+            "the scatter-fused EP combine is wired through moe_gemm_a8w4 only; "
+            "moe_gemm_a4w4 has no ep_scatter, so a4w4 must use the gather combine"
+        )
         # ``moe_gemm_a4w4`` has no ``preshuffled`` parameter, so it can only
         # consume the plain (E, K, N) weight -- i.e. a4w4 is a CDNA-only variant.
         # Handed a gfx1250 WMMA-preshuffled weight it reads N as N // 16 and
@@ -408,6 +428,7 @@ def _fused_experts_silu_gugu(
         # dead slots are already skipped by the sentinel histogram.
         gate_valid=gate_valid,
         y_out=y_out,
+        ep_scatter=ep_scatter,
     )
 
 
@@ -517,6 +538,10 @@ def triton_kernel_fused_experts(
     # `output_tensor`, which the GGUU path resizes to (M, K) and which the GUGU
     # path ignores. The kernel asserts shape/dtype/device/last-dim-contiguity.
     y_out: torch.Tensor | None = None,
+    # GUGU only. Deliver GEMM2's un-reduced rows to an EP combine-staging window
+    # instead of reducing them locally (aiter's EpCombineScatter). Alternative to
+    # y_out, not a companion.
+    ep_scatter=None,
 ) -> torch.Tensor:
     # type check, uint8 means mxfp4
     assert hidden_states.dtype == torch.bfloat16
@@ -560,11 +585,12 @@ def triton_kernel_fused_experts(
             preshuffled=preshuffled,
             act_quant=act_quant,
             y_out=y_out,
+            ep_scatter=ep_scatter,
         )
 
-    assert y_out is None, (
-        "y_out is only wired through the GUGU fused-SiLU path; the GGUU path "
-        "writes its result into `output_tensor`."
+    assert y_out is None and ep_scatter is None, (
+        "y_out / ep_scatter are only wired through the GUGU fused-SiLU path; the "
+        "GGUU path writes its result into `output_tensor`."
     )
 
     # aiter kernels expect 2d inputs/outputs

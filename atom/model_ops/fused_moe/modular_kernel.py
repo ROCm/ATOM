@@ -447,6 +447,19 @@ class FusedMoEModularKernel(torch.nn.Module):
                 triton_kernel_fused_experts,
             )
 
+            # Scatter-fused combine: when the transport offers a combine staging
+            # window, GEMM2 delivers its un-reduced rows straight into it and the
+            # EP combine does the summing. The prepare/finalize pair owns the
+            # transport, so it is the one that knows whether the window exists --
+            # None means the plain gather combine, which needs a locally reduced
+            # per-token output instead.
+            ep_scatter_target = getattr(
+                self.prepare_finalize, "combine_scatter_target", None
+            )
+            ep_scatter_target = (
+                ep_scatter_target() if ep_scatter_target is not None else None
+            )
+
             # --- Direction-3: shrink the ROUTED work, not the mori buffer -----
             # The trim above leaves graph_bs*topk*dp rows, but mori de-duplicates
             # per destination rank -- a token whose top-k spans several experts
@@ -484,6 +497,17 @@ class FusedMoEModularKernel(torch.nn.Module):
                 a1_eff = dispatch_a1[:M_eff]
                 ids_eff = dispatch_ids[:M_eff]
                 wts_eff = dispatch_weights[:M_eff]
+            else:
+                a1_eff, ids_eff, wts_eff = dispatch_a1, dispatch_ids, dispatch_weights
+
+            if ep_scatter_target is not None:
+                # Nothing is reduced here, so there is no per-token output to
+                # place -- GEMM2's rows go to the staging window and combine
+                # produces the tokens. Both of the buffers below would be dead
+                # weight, so neither is allocated.
+                full_out = None
+                y_out = None
+            elif M_eff < M_full:
                 # Allocate the row count mori's combine expects UP FRONT and let
                 # GEMM2's reduction write straight into its leading M_eff rows,
                 # so the shrink costs no copy at all. The tail is left
@@ -503,16 +527,31 @@ class FusedMoEModularKernel(torch.nn.Module):
                 )
                 y_out = full_out[:M_eff]
             else:
-                a1_eff, ids_eff, wts_eff = dispatch_a1, dispatch_ids, dispatch_weights
                 full_out = None
                 y_out = None
 
-            routing_data, gather_idx, scatter_idx, gate_valid = routing_from_dispatched(
+            (
+                routing_data,
+                gather_idx,
+                scatter_idx,
+                gate_valid,
+                dst_row,
+            ) = routing_from_dispatched(
                 wts_eff,
                 ids_eff,
                 expert_map,
                 local_num_experts,
                 expert_tokens_meta.expert_num_tokens,
+                ep_scatter_geometry=(
+                    None
+                    if ep_scatter_target is None
+                    else ep_scatter_target.sort_geometry
+                ),
+            )
+            ep_scatter = (
+                None
+                if ep_scatter_target is None
+                else ep_scatter_target.make_scatter(dst_row)
             )
             # gate_scal carries the dispatched router weights, and
             # apply_router_weight_on_input is False (mori asserts it), so GEMM2
@@ -539,6 +578,7 @@ class FusedMoEModularKernel(torch.nn.Module):
                 apply_router_weight_on_input=apply_router_weight_on_input,
                 gate_valid=gate_valid,
                 y_out=y_out,
+                ep_scatter=ep_scatter,
             )
 
             if full_out is not None:
@@ -554,7 +594,6 @@ class FusedMoEModularKernel(torch.nn.Module):
                 topk_ids,
                 apply_router_weight_on_input,
             )
-
         fused_out = fused_moe(
             dispatch_a1,
             w1,
