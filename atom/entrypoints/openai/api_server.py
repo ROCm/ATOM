@@ -91,6 +91,7 @@ from .serving_completion import (
 )
 from .sse import event_frame
 from .streaming_dispatch import StreamBatchDispatcher, StreamOutputCollector
+from .tool_parser.registry import resolve_tool_call_parser
 
 # Configure logging
 logger = logging.getLogger("atom")
@@ -106,6 +107,10 @@ DEFAULT_PORT = 8000
 
 engine = None
 tokenizer: AutoTokenizer | None = None
+# The tool-call format this model emits, resolved once at startup from its
+# chat template. `None` means none was recognised and tool calls, if any, are
+# delivered as plain text -- said out loud at startup, never discovered here.
+tool_call_parser_cls: type | None = None
 processor: Any | None = None
 model_name: str = ""
 default_chat_template_kwargs: dict[str, Any] = {}
@@ -1306,6 +1311,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     tools=request.tools,
                     tool_choice=request.tool_choice,
                     starts_thinking=_starts_thinking,
+                    tool_parser_cls=tool_call_parser_cls,
                 )
             else:
                 seq_id, stream_collector, num_prompt_tokens = (
@@ -1329,6 +1335,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     tools=request.tools,
                     tool_choice=request.tool_choice,
                     starts_thinking=_starts_thinking,
+                    tool_parser_cls=tool_call_parser_cls,
                 )
             return StreamingResponse(
                 _logged_stream(gen, request_id),
@@ -1358,6 +1365,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 tools=request.tools,
                 tool_choice=request.tool_choice,
                 starts_thinking=_starts_thinking,
+                tool_parser_cls=tool_call_parser_cls,
             )
         elif is_multimodal:
             final_output = await _run_nonstream_with_disconnect(
@@ -1381,6 +1389,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 tools=request.tools,
                 tool_choice=request.tool_choice,
                 starts_thinking=_starts_thinking,
+                tool_parser_cls=tool_call_parser_cls,
             )
         elif effective_n > 1:
             outputs = await _race_disconnect(
@@ -1403,6 +1412,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 tools=request.tools,
                 tool_choice=request.tool_choice,
                 starts_thinking=_starts_thinking,
+                tool_parser_cls=tool_call_parser_cls,
             )
         else:
             final_output = await _run_nonstream_with_disconnect(
@@ -1426,6 +1436,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 tools=request.tools,
                 tool_choice=request.tool_choice,
                 starts_thinking=_starts_thinking,
+                tool_parser_cls=tool_call_parser_cls,
             )
         _log_request_event("response", request_id, resp.model_dump())
         return resp
@@ -1657,7 +1668,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                 reasoning_filter = ReasoningFilter(
                     starts_thinking=prompt_starts_in_reasoning(prompt)
                 )
-                tool_parser = ToolCallStreamParser()
+                tool_parser = ToolCallStreamParser(parser_cls=tool_call_parser_cls)
                 tool_parser.tools = anthropic_to_openai_tools(request.tools)
                 block_index = 0
                 started_text = False
@@ -1840,7 +1851,9 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
             raw_text, starts_thinking=prompt_starts_in_reasoning(prompt)
         )
         content_text, tool_calls = parse_tool_calls(
-            content_with_tools, anthropic_to_openai_tools(request.tools)
+            content_with_tools,
+            anthropic_to_openai_tools(request.tools),
+            parser_cls=tool_call_parser_cls,
         )
         output_tokens = len(tokenizer.encode(raw_text))
         cache_read_input_tokens = final_output.get("num_cached_tokens", 0)
@@ -2008,11 +2021,23 @@ async def stop_profile():
 def main():
     """Main entry point for the server."""
     global engine, tokenizer, model_name, default_chat_template_kwargs, _request_logger
+    global tool_call_parser_cls
     global custom_message_encoder, _stream_batch_dispatcher
 
     parser = FlexibleArgumentParser(description="ATOM OpenAI API Server")
     EngineArgs.add_cli_args(parser)
     parser.add_argument("--host", type=str, default=DEFAULT_HOST, help="Server host")
+    parser.add_argument(
+        "--tool-call-parser",
+        type=str,
+        default="auto",
+        help=(
+            "Tool-call wire format. 'auto' (default) reads it off the model's "
+            "chat template at startup; an explicit name overrides that. When "
+            "neither resolves, tool calls are delivered as plain text and the "
+            "startup log says so — the format is never guessed from output."
+        ),
+    )
     parser.add_argument(
         "--server-port",
         type=int,
@@ -2098,6 +2123,13 @@ def main():
 
     logger.info(f"Initializing engine with model {args.model}...")
     engine_args = EngineArgs.from_cli_args(args)
+    tool_call_parser_cls = resolve_tool_call_parser(
+        args.tool_call_parser,
+        tokenizer,
+        custom_message_encoder,
+        model=args.model,
+    )
+
     engine = engine_args.create_engine(tokenizer=tokenizer)
     _stream_batch_dispatcher = StreamBatchDispatcher(tokenizer)
 

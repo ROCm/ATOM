@@ -3,19 +3,24 @@
 
 """Format detection.
 
-The wire format is sniffed from the model's own output rather than configured,
-so detection order is load-bearing: several formats share tags and are only
-told apart by a discriminator that a later entry would also match. The order
-below is the single place that ordering is expressed — do not reorder without
-re-reading the notes on each entry.
+Several formats share tags and are only told apart by a discriminator that a
+later entry would also match, so detection order is load-bearing. `_DETECT_ORDER`
+is the single place that ordering is expressed — do not reorder without
+re-reading the notes on each entry — and both callers use it: `parse_tool_calls`
+on a complete output, and `resolve_from_prompt` on a rendered chat template at
+startup.
 """
 
+import logging
+from typing import Any
+
+from ..chat_encoders import apply_chat_template
 from .deepseekv4_tool_parser import DsmlParser
 from .glm_tool_parser import GlmParser
-from .kimi_k3_tool_parser import KimiK3Parser, is_kimi_k3
-from .kimi_tool_parser import KIMI_SECTION_BEGIN, KimiParser
-from .minimax_tool_parser import MINIMAX_NS, MiniMaxParser
-from .qwen3_tool_parser import QWEN_TOOL_PREFIX, QwenXmlParser
+from .kimi_k3_tool_parser import KimiK3Parser
+from .kimi_tool_parser import KimiParser
+from .minimax_tool_parser import MiniMaxParser
+from .qwen3_tool_parser import QwenXmlParser
 from .tool_parser import ToolCall, ToolCallParser
 
 # Checked in order on a COMPLETE output. Kimi (K2) is not listed: it is the
@@ -40,7 +45,9 @@ _DETECT_ORDER: tuple[type[ToolCallParser], ...] = (
 
 
 def parse_tool_calls(
-    text: str, tools: list | None = None
+    text: str,
+    tools: list | None = None,
+    parser_cls: "type[ToolCallParser] | None" = None,
 ) -> tuple[str, list[ToolCall]]:
     """Parse tool calls from a complete model output.
 
@@ -48,11 +55,18 @@ def parse_tool_calls(
         text: Raw model output that may contain tool calls.
         tools: Optional request tool definitions; used to type-coerce parameter
             values to their declared JSON-Schema types.
+        parser_cls: The format resolved for this model at startup. Given, it is
+            used and the cascade below is not consulted — the streaming path
+            reads the same output as that same format, and the two answering
+            differently is a divergence a client sees as a tool call appearing
+            only when it does not stream.
 
     Returns:
         Tuple of (content_text, list_of_tool_calls). ``content_text`` has the
         tool-call sections removed.
     """
+    if parser_cls is not None:
+        return parser_cls.parse(text, tools)
     for parser in _DETECT_ORDER:
         if parser.detect(text):
             return parser.parse(text, tools)
@@ -62,73 +76,114 @@ def parse_tool_calls(
     return KimiParser.parse(text, tools)
 
 
-# -- streaming sniff --------------------------------------------------------
-#
-# Deciding on a PREFIX is strictly harder than on a complete output: a format's
-# discriminator may not have arrived yet. These two sentinels say "cannot decide
-# from what I have":
+# -- format resolution -----------------------------------------------------
 
-# Might still become a tool call -> the caller keeps this text.
-#
-# `WAIT` is only about the *format*, never about whether text may be released.
-# It used to be both, alongside an `EMIT_CONTENT` that meant "no '<' anywhere,
-# so nothing can be starting". That conflation was the stall: one '<' in an
-# ordinary answer -- `if (a < b)` -- made every branch here miss forever, and
-# `ToolCallStreamParser` never cleared the buffer it was accumulating, so the
-# answer arrived in a single frame at end of stream. Deciding how much text is
-# safe to send is now `MarkerScanner`'s, over the union of every registered
-# format's `MARKERS`, and it is asked before this function is.
-WAIT = object()
+# Every format by the name `--tool-call-parser` takes. Derived from the same
+# order, so a newly registered format is selectable without a second edit.
+PARSERS_BY_NAME: dict[str, type[ToolCallParser]] = {
+    p.NAME: p for p in (*_DETECT_ORDER, KimiParser)
+}
 
 
-# Literals the cascade below discriminates by that open no region of their
-# own, so no parser declares them and a reader would not otherwise hold them
-# back. `<arg_key>` is what tells GLM from Qwen -- both open with
-# `<tool_call>` -- and it appears *inside* that region, which is why it is not
-# one of GLM's `START_MARKERS`: `find_start` would take it for the region's
-# beginning and parse from the wrong offset.
-_SNIFF_ONLY: tuple[str, ...] = ("<arg_key>",)
+def resolve_from_prompt(rendered_prompt: str) -> type[ToolCallParser] | None:
+    """Which format this model will emit, decided before it emits anything.
 
+    A chat template rendered with a tools payload *is* the model's instructions
+    for how to call one, so the same cascade `parse_tool_calls` runs on a
+    complete output answers the question on the prompt instead -- earlier, and
+    without depending on what the model happens to produce first.
 
-def all_markers() -> tuple[str, ...]:
-    """Every literal that could be starting before the format is known.
+    Asked once at startup. `None` means no registered format recognised the
+    prompt, which is the honest answer for a model with no tool syntax ATOM
+    knows; the caller says so out loud rather than falling back to guessing,
+    because a guess here is a tool call fabricated out of ordinary text.
 
-    A suffix that could still grow into one of these is not safe to send. Taken
-    from the parsers' own `START_MARKERS` plus the cascade's own discriminators,
-    so a format added to `_DETECT_ORDER` is covered without a second edit here.
+    This replaces `sniff_stream`, which decided from a *prefix* of the output.
+    That was strictly harder -- a format's discriminator may not have arrived
+    yet, so the answer needed a "cannot tell yet" state, and that state was
+    read as "and therefore send nothing", which is how one '<' in an answer
+    withheld the rest of the stream.
     """
-    formats = {m for p in (*_DETECT_ORDER, KimiParser) for m in p.START_MARKERS}
-    return tuple(formats | set(_SNIFF_ONLY))
+    for parser in _DETECT_ORDER:
+        if parser.detect(rendered_prompt):
+            return parser
+    return None
 
 
-def sniff_stream(buf: str):
-    """Pick a parser from a partial stream, or return EMIT_CONTENT / WAIT.
+logger = logging.getLogger("atom")
 
-    Deliberately NOT the same rules as the per-parser ``detect``: on a prefix,
-    GLM is only accepted on the unambiguous ``<arg_key>`` (a bare ``<tool_call>``
-    could still turn out to be Qwen once ``<function=`` arrives).
+AUTO = "auto"
+
+# The smallest request that makes a template render its tool instructions. The
+# tool is never called; only the framing the template wraps it in matters.
+_PROBE_MESSAGES = [{"role": "user", "content": "hi"}]
+_PROBE_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the weather in a city",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        },
+    }
+]
+
+
+def resolve_tool_call_parser(
+    override: str | None,
+    tokenizer: Any,
+    custom_encoder: Any = None,
+    *,
+    model: str = "",
+) -> type[ToolCallParser] | None:
+    """The format this model's tool calls will arrive in, or ``None``.
+
+    ``override`` is ``--tool-call-parser``: a format name, or ``"auto"``/``None``
+    to read it off the chat template. An unknown name raises rather than
+    falling back, because a typo that silently disables tool parsing is the
+    failure this whole path exists to stop.
+
+    ``None`` is a real answer, not an error: gpt-oss and DeepSeek-R1 render no
+    tool syntax ATOM knows, and for them parsing nothing is correct. It is
+    logged either way.
+
+    Rendering is best-effort — a template can raise on a tools payload it does
+    not accept — and a failure to render is reported and treated as
+    unrecognised, never as a reason to fall back to reading the output.
     """
-    # K3's channel tokens (``<|open|>response<|sep|>`` / ``<|open|>call tool=``)
-    # are disjoint from every other format, so a complete one decides immediately.
-    # K3 buffers to EOS and strips its own framing, so plain answers route here
-    # too rather than leaking channel tokens through the undecided-content path.
-    if is_kimi_k3(buf):
-        return KimiK3Parser
-    if MINIMAX_NS in buf:
-        return MiniMaxParser
-    if DsmlParser.detect(buf):
-        return DsmlParser
-    if "<arg_key>" in buf:
-        return GlmParser
-    if QWEN_TOOL_PREFIX in buf:
-        return QwenXmlParser
-    if "<tool_call>" in buf:
-        # '<tool_call>' seen but neither '<function=' (Qwen) nor '<arg_key>'
-        # (GLM) yet. A no-arg GLM call is complete once the closing tag arrives;
-        # otherwise wait for the sub-marker.
-        if "</tool_call>" in buf:
-            return GlmParser
-        return WAIT
-    if KIMI_SECTION_BEGIN in buf:
-        return KimiParser
-    return WAIT
+    if override and override != AUTO:
+        parser = PARSERS_BY_NAME.get(override)
+        if parser is None:
+            raise ValueError(
+                f"--tool-call-parser={override!r} is not a known format; "
+                f"choose one of {sorted(PARSERS_BY_NAME)} or {AUTO!r}"
+            )
+        logger.info(f"Tool-call format: {parser.NAME} (from --tool-call-parser)")
+        return parser
+
+    try:
+        rendered = apply_chat_template(
+            tokenizer, custom_encoder, _PROBE_MESSAGES, tools=_PROBE_TOOLS
+        )
+    except Exception as e:  # noqa: BLE001 - any template failure means "cannot tell"
+        logger.warning(
+            f"Could not render {model or 'the model'}'s chat template with a tools "
+            f"payload, so its tool-call format is unknown and tool calls will be "
+            f"delivered as plain text: {e}. Pass --tool-call-parser to set it."
+        )
+        return None
+
+    parser = resolve_from_prompt(rendered)
+    if parser is None:
+        logger.info(
+            f"No known tool-call format in {model or 'the model'}'s chat template; "
+            f"tool calls will be delivered as plain text. Pass --tool-call-parser "
+            f"if this model does emit one."
+        )
+    else:
+        logger.info(f"Tool-call format: {parser.NAME} (from the chat template)")
+    return parser

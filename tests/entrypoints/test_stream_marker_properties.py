@@ -42,7 +42,7 @@ import pytest
 from atom.entrypoints.openai.reasoning import ReasoningFilter
 from atom.entrypoints.openai.reasoning_dialects import DIALECTS
 from atom.entrypoints.openai.tool_parser.kimi_tool_parser import KimiParser
-from atom.entrypoints.openai.tool_parser.registry import _DETECT_ORDER, _SNIFF_ONLY
+from atom.entrypoints.openai.tool_parser.registry import _DETECT_ORDER
 from atom.entrypoints.openai.tool_parser.stream import ToolCallStreamParser
 
 # Kimi is the terminal fallback and so is not in the detect order, but it is a
@@ -83,9 +83,14 @@ class Seen:
         return (self.reasoning, self.content, tuple(self.events), finish)
 
 
-def drive(text: str, chunks: list[str]) -> Seen:
-    """Replay the serving loop over one chunking."""
-    rf, tp = ReasoningFilter(), ToolCallStreamParser()
+def drive(text: str, chunks: list[str], parser=None) -> Seen:
+    """Replay the serving loop over one chunking.
+
+    `parser` is what the server resolved from the chat template at startup, so
+    each case reads its own format explicitly rather than relying on the shape
+    of the text to select one.
+    """
+    rf, tp = ReasoningFilter(), ToolCallStreamParser(parser_cls=parser)
     seen = Seen()
     consumed = 0
 
@@ -170,16 +175,6 @@ def shapes(dialect, parser) -> dict[str, str]:
             + "It is sunny in Paris."
         ),
     }
-    # A literal the sniffer picks the format by that is *not* a region
-    # opener: the parser is chosen and then handed text its own
-    # `START_MARKERS` do not match, so it reads on in content mode. That is
-    # the path whose holdback used to stop emitting entirely once its buffer
-    # began with a marker character. Generated from the difference between
-    # the two declarations, so a future format with the same split is covered.
-    if _SNIFF_ONLY:
-        out["detected by a literal that opens no region"] = (
-            _SNIFF_ONLY[0] + "city</arg_key> then a < b and " + PROSE * 4
-        )
 
     if dialect.output_open_marker:
         out["reasoning the model opens itself"] = (
@@ -378,11 +373,11 @@ class TestBoundedWithhold:
         control = defuse(text, triggers)
 
         fine = split_every_way(text)["fixed-1"]
-        seen = drive(text, fine)
+        seen = drive(text, fine, parser)
         if not seen.content:
             pytest.skip("no content channel in this shape; nothing to hold back")
 
-        ctl = drive(control, split_every_way(control)["fixed-1"])
+        ctl = drive(control, split_every_way(control)["fixed-1"], parser)
         held = seen.first_content_at or len(text)
         baseline = ctl.first_content_at or len(control)
         assert held - baseline <= SLACK, (

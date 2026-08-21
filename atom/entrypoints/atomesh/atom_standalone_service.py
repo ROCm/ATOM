@@ -49,6 +49,7 @@ from atom.entrypoints.openai.serving_completion import (
 )
 from atom.entrypoints.openai.sse import data_frame
 from atom.entrypoints.openai.tool_parser import ToolCallStreamParser
+from atom.entrypoints.openai.tool_parser.registry import resolve_tool_call_parser
 from atom.model_engine.sequence import new_token_ids
 
 logger = logging.getLogger("atom")
@@ -522,6 +523,7 @@ class ChatCompletionStreamState:
         tokenizer: Any,
         stream_queue: queue.Queue[dict[str, Any]],
         n: int,
+        tool_parser_cls: type | None = None,
     ) -> None:
         self.request_id = request_id
         self.model_name = model_name
@@ -537,7 +539,9 @@ class ChatCompletionStreamState:
         self.reasoning_filters = [
             ReasoningFilter(starts_thinking=starts_thinking) for _ in range(n)
         ]
-        self.tool_parsers = [ToolCallStreamParser() for _ in range(n)]
+        self.tool_parsers = [
+            ToolCallStreamParser(parser_cls=tool_parser_cls) for _ in range(n)
+        ]
         self.has_tool_calls = [False] * n
         self.finished = [False] * n
         self.role_sent = [False] * n
@@ -905,6 +909,12 @@ class AtomStandaloneService:
         self.model_name = model_name
         self.default_chat_template_kwargs = default_chat_template_kwargs or {}
         self.custom_message_encoder = load_custom_message_encoder(model_name)
+        # Resolved once here, for the same reason the OpenAI server resolves it
+        # once: the chat template says which format this model emits, and
+        # deciding from the output instead means deciding from a prefix.
+        self.tool_parser_cls = resolve_tool_call_parser(
+            None, tokenizer, self.custom_message_encoder, model=model_name
+        )
         self.engine_service = AtomEngineService(engine, tokenizer)
         self._streams: dict[str, ChatCompletionStreamState] = {}
         self._completion_streams: dict[str, CompletionStreamState] = {}
@@ -957,6 +967,7 @@ class AtomStandaloneService:
                     self.model_name,
                     outputs,
                     starts_thinking=prompt_starts_in_reasoning(prompt),
+                    tool_parser_cls=self.tool_parser_cls,
                 )
             else:
                 outputs = self.engine_service.generate(
@@ -975,6 +986,7 @@ class AtomStandaloneService:
                     final_output["text"],
                     final_output,
                     starts_thinking=prompt_starts_in_reasoning(prompt),
+                    tool_parser_cls=self.tool_parser_cls,
                 )
             return self._json_safe(response.model_dump(exclude_none=True))
         except Exception:
@@ -1142,6 +1154,7 @@ class AtomStandaloneService:
                 tokenizer=self.tokenizer,
                 stream_queue=stream_queue,
                 n=effective_n,
+                tool_parser_cls=self.tool_parser_cls,
             )
             with self._streams_lock:
                 self._streams[request_id] = stream_state

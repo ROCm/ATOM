@@ -233,6 +233,7 @@ async def stream_chat_response(
     tools=None,
     tool_choice=None,
     starts_thinking: bool = False,
+    tool_parser_cls=None,
 ) -> AsyncGenerator[str, None]:
     """Generate streaming chat completion response with reasoning and tool calls.
 
@@ -249,7 +250,7 @@ async def stream_chat_response(
     num_tokens_output = 0
     num_cached_tokens = 0
     reasoning_filter = ReasoningFilter(starts_thinking=starts_thinking)
-    tool_parser = ToolCallStreamParser(tools=tools)
+    tool_parser = ToolCallStreamParser(tools=tools, parser_cls=tool_parser_cls)
     has_tool_calls = False
 
     kv_transfer_params_value = None
@@ -369,6 +370,7 @@ def _build_chat_choice(
     tools=None,
     tool_choice=None,
     starts_thinking: bool = False,
+    tool_parser_cls=None,
 ) -> dict[str, Any]:
     """Build one entry of ``choices[...]`` from a raw output string.
 
@@ -379,7 +381,9 @@ def _build_chat_choice(
     reasoning_content, content_with_tools = separate_reasoning(
         raw_text, starts_thinking=starts_thinking
     )
-    content, tool_calls = parse_tool_calls(content_with_tools, tools)
+    content, tool_calls = parse_tool_calls(
+        content_with_tools, tools, parser_cls=tool_parser_cls
+    )
 
     # tool_choice="none" forbids tool calls: any the model emitted anyway are
     # dropped so they never surface in the response.
@@ -410,6 +414,7 @@ def build_chat_response(
     tools=None,
     tool_choice=None,
     starts_thinking: bool = False,
+    tool_parser_cls=None,
 ) -> ChatCompletionResponse:
     """Build a non-streaming chat completion response (single choice)."""
     response = ChatCompletionResponse(
@@ -424,6 +429,7 @@ def build_chat_response(
                 tools=tools,
                 tool_choice=tool_choice,
                 starts_thinking=starts_thinking,
+                tool_parser_cls=tool_parser_cls,
             )
         ],
         usage={
@@ -455,6 +461,7 @@ def build_chat_response_multi(
     tools=None,
     tool_choice=None,
     starts_thinking: bool = False,
+    tool_parser_cls=None,
 ) -> ChatCompletionResponse:
     """Build a non-streaming response with one choice per fan-out sibling.
 
@@ -473,6 +480,7 @@ def build_chat_response_multi(
             tools=tools,
             tool_choice=tool_choice,
             starts_thinking=starts_thinking,
+            tool_parser_cls=tool_parser_cls,
         )
         for i, out in enumerate(final_outputs)
     ]
@@ -515,6 +523,7 @@ async def stream_chat_response_fanout(
     tools=None,
     tool_choice=None,
     starts_thinking: bool = False,
+    tool_parser_cls=None,
 ) -> AsyncGenerator[str, None]:
     """Streaming variant that multiplexes ``len(seq_ids)`` fan-out siblings
     into a single SSE stream, tagging every chunk with ``choices[0].index``.
@@ -534,7 +543,9 @@ async def stream_chat_response_fanout(
     reasoning_filters = [
         ReasoningFilter(starts_thinking=starts_thinking) for _ in range(n)
     ]
-    tool_parsers = [ToolCallStreamParser(tools=tools) for _ in range(n)]
+    tool_parsers = [
+        ToolCallStreamParser(tools=tools, parser_cls=tool_parser_cls) for _ in range(n)
+    ]
     has_tool_calls = [False] * n
     finished = [False] * n
     kv_transfer_params_value = None

@@ -110,9 +110,10 @@ down:
 **A token *can* be delivered later than the engine produced it, by a bounded
 amount.** Two stages downstream of the collector read the text for markers —
 the reasoning channel's delimiters
-(`atom/entrypoints/openai/reasoning.py`) and the tool-call formats' opening
-tags (`atom/entrypoints/openai/tool_parser/`) — and neither may hand out a
-byte that could turn out to be the first character of one. Both ask the same
+(`atom/entrypoints/openai/reasoning.py`) and the opening tags of whichever
+tool-call format this model uses (`atom/entrypoints/openai/tool_parser/`) —
+and neither may hand out a byte that could turn out to be the first character
+of one. Both ask the same
 question through `MarkerScanner`
 (`atom/entrypoints/openai/marker_scanner.py`): release everything except the
 longest *suffix* of the buffer that is a prefix of some marker. The wait is
@@ -129,6 +130,18 @@ client, and the scan over that ever-growing buffer made the cost quadratic in
 the response length. Text inside the reasoning channel is held until its end
 marker, which is not a stall: it is reasoning, and it is delivered as
 `reasoning_content` as it arrives.
+
+**Which tool-call format a model uses is decided at startup, not from its
+output.** `--tool-call-parser` defaults to `auto`, which renders the model's
+chat template with a tools payload — the template's own instructions for
+calling one — and runs the same detection cascade `parse_tool_calls` runs on
+a complete output. It reads a Jinja template or a model-side Python encoder
+(`<model>/encoding/encoding_*.py`, which is how DeepSeek-V4 ships its), and
+logs the format it chose. When nothing is recognised it says so and tool
+calls are delivered as plain text; it does not fall back to reading the
+output, because a wrong guess there is silent — a Hermes-style
+`<tool_call>{"name": ...}` claimed by the GLM parser delivers the whole JSON
+blob as the tool's *name*. Pass a format name to override.
 
 One consequence matters when reading benchmark output. ITL is sampled once per
 received SSE chunk (`backend_request_func.py`, `benchmark_serving.py`), so
@@ -764,7 +777,8 @@ server without modification.
 | `atom/entrypoints/openai/sse.py` | SSE frame encoding (`data_frame`, `event_frame`) on a shared msgspec encoder |
 | `atom/entrypoints/openai/marker_scanner.py` | `MarkerScanner` — the one rule for how much of a stream is safe to release |
 | `atom/entrypoints/openai/reasoning.py` | Splits the reasoning channel from the answer; seeded per request by `prompt_starts_in_reasoning` |
-| `atom/entrypoints/openai/tool_parser/` | Per-format tool-call parsing; each format declares its `MARKERS` |
+| `atom/entrypoints/openai/tool_parser/registry.py` | Which format a model emits, resolved once at startup from its chat template |
+| `atom/entrypoints/openai/tool_parser/` | Per-format tool-call parsing; each format declares its `START_MARKERS` |
 | `atom/model_engine/llm_engine.py` | `LLMEngine` programmatic API |
 | `atom/sampling_params.py` | `SamplingParams` dataclass |
 | `atom/model_engine/arg_utils.py` | `EngineArgs` CLI argument definitions and engine factory |

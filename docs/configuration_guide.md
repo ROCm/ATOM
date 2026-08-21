@@ -365,6 +365,7 @@ all flags via `add_cli_args()` and converts them into a `Config` via
 | `--load_dummy` | | `{empty,zero,xavier}` (optional value) | `None` | Dummy weights: bare/`=empty` skip load; `=zero` all-zero; `=xavier` xavier(bf16)/constant-magnitude(fp4/fp8) |
 | `--enable-expert-parallel` | | flag | `False` | Enable Expert Parallelism (EP MoE) |
 | `--torch-profiler-dir` | | `str` | `None` | Directory for torch profiler traces |
+| `--tool-call-parser` | | `str` | `"auto"` | Tool-call wire format. `auto` reads it from the model's chat template at startup (Jinja or a model-side `encoding/encoding_*.py`); a name (`dsml`, `glm`, `kimi`, `kimi_k3`, `minimax`, `qwen`) overrides. When neither resolves, tool calls are delivered as plain text and the startup log says so — the format is never guessed from output. An unknown name is refused rather than silently disabling tool parsing |
 | `--enable-dp-attention` | | flag | `False` | Enable DP attention |
 | `--method` | | `str` | `None` | Speculative method; choices: `mtp` |
 | `--num-speculative-tokens` | | `int` | `1` | Number of speculative tokens per iteration |

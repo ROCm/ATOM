@@ -8,6 +8,7 @@ from atom.entrypoints.openai.tool_parser import (
     ToolCallStreamParser,
     parse_tool_calls,
 )
+from atom.entrypoints.openai.tool_parser.kimi_tool_parser import KimiParser
 
 # ============================================================================
 # parse_tool_calls() Tests
@@ -123,9 +124,14 @@ class TestParseToolCalls:
 class TestToolCallStreamParser:
     """Tests for the ToolCallStreamParser streaming state machine."""
 
-    def _run_parser(self, tokens):
-        """Helper: run tokens through parser and return all events."""
-        parser = ToolCallStreamParser()
+    def _run_parser(self, tokens, parser_cls=KimiParser):
+        """Helper: run tokens through parser and return all events.
+
+        The format is given, as the server gives it: resolved once from the
+        chat template at startup rather than guessed from the output. These
+        cases are all Kimi's section syntax, so that is the default.
+        """
+        parser = ToolCallStreamParser(parser_cls=parser_cls)
         results = []
         for token in tokens:
             results.extend(parser.process(token))
