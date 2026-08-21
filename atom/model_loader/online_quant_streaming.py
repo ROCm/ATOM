@@ -30,6 +30,13 @@ class _CopyCounter(torch.utils._python_dispatch.TorchDispatchMode):
         self.copied_numel = 0
         self.moe_arrival = None
 
+    @classmethod
+    def ignore_compile_internals(cls) -> bool:
+        # TorchDispatchMode keeps its compile-internal state in process-global
+        # booleans. Concurrent counter scopes can restore those booleans out of
+        # order and leave Dynamo believing that a mode is still active.
+        return True
+
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         if kwargs is None:
             kwargs = {}
