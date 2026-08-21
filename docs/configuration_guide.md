@@ -40,6 +40,7 @@ Defined in `atom/config.py`. The root dataclass that the engine consumes.
 | `kv_cache_block_size` | `int` | `16` | Block size for paged KV cache; must be a multiple of 16 or exactly 1 |
 | `num_kvcache_blocks` | `int` | `-1` | Number of KV cache blocks (`-1` = auto) |
 | `kv_cache_dtype` | `str` | `"bf16"` | KV cache data type (`"bf16"` or `"fp8"`) |
+| `index_cache_dtype` | `str \| None` | `None` | Indexer-cache dtype, resolved after model detection. Native single-node DeepSeek-V4 defaults to `"fp4"` except on gfx942; plugin and KV-transfer integrations retain `"fp8"`. Other models inherit `kv_cache_dtype`. An explicit `"bf16"`, `"fp8"`, or `"fp4"` value is preserved. |
 | `enable_prefix_caching` | `bool` | `False` | Enable prefix caching to reuse KV blocks across requests sharing the same prefix |
 | `state_checkpoint_interval_tokens` | `int` | `8192` | For models with per-request state (DeepSeek-V4 compressor ring, GDN recurrent state): keep a state checkpoint every N tokens of context, so a later prefix hit can resume there. A prompt shorter than N checkpoints nothing. Must be a multiple of the prefix-cache hash block size; `0` disables checkpoints. See the state-checkpoint section of the [scheduling & KV cache guide](scheduling_kv_cache_guide.md) |
 | `port` | `int` | `8006` | Engine internal communication port |
@@ -356,6 +357,7 @@ all flags via `add_cli_args()` and converts them into a `Config` via
 | `--enable_prefix_caching` | | flag | `False` | Enable prefix caching |
 | `--port` | | `int` | `8006` | Engine internal port |
 | `--kv_cache_dtype` | | `str` | `"bf16"` | KV cache dtype; choices: `bf16`, `fp8` |
+| `--index-cache-dtype`, `--index_cache_dtype` | | `str` | `None` | Indexer-cache dtype; choices: `bf16`, `fp8`, `fp4`. When omitted, uses the architecture- and integration-aware `Config.index_cache_dtype` defaults described above. |
 | `--block-size` | | `int` | `16` | KV cache block size (maps to `kv_cache_block_size`) |
 | `--max-model-len` | | `int` | `None` | Maximum model context length; defaults to `hf_config.max_position_embeddings` |
 | `--cudagraph-capture-sizes` | | `str` | `"[1,2,4,8,16,32,48,64,128,256]"` | CUDA graph capture sizes as a Python list string |

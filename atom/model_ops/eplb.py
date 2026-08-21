@@ -1840,7 +1840,7 @@ class EPLBManager:
         quant_method = getattr(layer, "quant_method", None)
         provider = getattr(quant_method, "get_eplb_weight_views", None)
         if callable(provider):
-            method_views = provider(layer, num_local)
+            method_views = provider(layer)
             if method_views is not None:
                 if not method_views:
                     raise RuntimeError(
