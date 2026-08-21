@@ -552,6 +552,19 @@ class MLAAttention(nn.Module):
                 "DCP query replication requires the DCP-group head set "
                 f"(num_heads*dcp={self.qrep_num_heads}) >= {_MLA_MIN_HEADS}."
             )
+        # Project-before-merge (PBM): apply W_V to the head-gathered output
+        # BEFORE cp_lse_ag_out_rs, so the merge exchanges v_head_dim per head
+        # instead of kv_lora_rank. Legal because the merge is a per-(token,head)
+        # scalar weighting followed by a cross-rank sum, and W_V is per-head
+        # linear -- the two commute. Covers both cp_lse_ag_out_rs call sites
+        # (decode and sparse prefill). fp4 is excluded: its W_V scale is block
+        # structured, so the gather-then-requantize recipe does not carry over.
+        self.pbm_enabled = (
+            self.dcp_world_size > 1
+            and get_current_atom_config().dcp_config.enable_project_before_merge
+            and not is_rocm_aiter_fp4bmm_enabled()
+        )
+
         # Row view of q_proj used by prefill; see _local_q_proj. Initialized here
         # rather than in process_weights_after_loading so it exists no matter
         # which quantization branch that method takes.
@@ -703,6 +716,14 @@ class MLAAttention(nn.Module):
                 self.W_K_qrep, self.W_K_qrep_scale = dynamic_per_batched_tensor_quant(
                     W_K_qrep, dtype=dtypes.fp8
                 )
+            if self.pbm_enabled:
+                # Project-before-merge needs W_V for the whole DCP group, because
+                # the projection now runs on the head-gathered output (before the
+                # ReduceScatter that would have cut it back to this rank's heads).
+                W_V_dcp = self.dcp_group.all_gather(W_V.contiguous(), dim=0)
+                self.W_V_dcp, self.W_V_dcp_scale = dynamic_per_batched_tensor_quant(
+                    W_V_dcp, dtype=dtypes.fp8
+                )
 
     def _local_q_proj(self):
         """This rank's rows of the QREP-widened q_proj, built on first use.
@@ -724,10 +745,22 @@ class MLAAttention(nn.Module):
             self._qrep_local_src = w
         return self._qrep_local_proj
 
-    @mark_trace(prefix="v_up_proj_and_o_proj", torch_compile=False)
-    def _v_up_proj_and_o_proj(self, x):
-        # Convert from (B, N, L) to (N, B, L)
-        x = x.view(-1, self.num_heads, self.kv_lora_rank).transpose(0, 1)
+    def _v_up_proj(self, x, W_V=None, W_V_scale=None, num_heads=None):
+        """V up-projection only: ``[B, N, kv_lora_rank] -> [B, N, v_head_dim]``.
+
+        Split out of ``_v_up_proj_and_o_proj`` so DCP decode can run it BEFORE
+        the cross-rank merge (project-before-merge). The weight/head count are
+        arguments because that path projects the whole DCP group's heads with
+        the gathered ``W_V_dcp``, while every other caller uses this rank's
+        ``self.W_V`` and ``self.num_heads``.
+        """
+        W_V = self.W_V if W_V is None else W_V
+        W_V_scale = self.W_V_scale if W_V_scale is None else W_V_scale
+        num_heads = self.num_heads if num_heads is None else num_heads
+        # Convert from (B, N, L) to (N, B, L). reshape, not view: the PBM caller
+        # passes the raw decode output, which is not guaranteed contiguous the
+        # way the post-ReduceScatter tensor is.
+        x = x.reshape(-1, num_heads, self.kv_lora_rank).transpose(0, 1)
         # Multiply (N, B, L) x (N, L, V) -> (N, B, V), Convert from (N, B, V) to (B, N, V)
         # x = torch.bmm(x, self.W_UV).transpose(0, 1)
         # Convert from (B, N, L) to (N, B, L)
@@ -735,29 +768,32 @@ class MLAAttention(nn.Module):
             output = torch.empty(
                 x.shape[1],
                 x.shape[0],
-                self.W_V.shape[1],
+                W_V.shape[1],
                 device=x.device,
                 dtype=torch.bfloat16,
             )
             output = batched_gemm_a16wfp4(
                 x,
-                self.W_V,
-                self.W_V_scale,
+                W_V,
+                W_V_scale,
                 y=output,
                 transpose_bm=True,
                 prequant=True,
                 y_scale=None,
             )
             # x = x.transpose(0, 1).flatten(1, 2)
-            output = output.view(-1, self.num_heads * self.v_head_dim)
             x = output
         else:
             x = _aiter_triton_fp8_bmm(
-                x, self.W_V, self.W_V_scale, group_size=128, transpose_bm=True
+                x, W_V, W_V_scale, group_size=128, transpose_bm=True
             )
-            # Convert from (B, N, V) to (B, N * V)
-            x = x.reshape(-1, self.num_heads * self.v_head_dim)
-        return self.o_proj(x)
+        return x.reshape(-1, num_heads, self.v_head_dim)
+
+    @mark_trace(prefix="v_up_proj_and_o_proj", torch_compile=False)
+    def _v_up_proj_and_o_proj(self, x):
+        x = self._v_up_proj(x)
+        # Convert from (B, N, V) to (B, N * V)
+        return self.o_proj(x.reshape(-1, self.num_heads * self.v_head_dim))
 
     @mark_trace(prefix="q_proj_and_k_up_proj", torch_compile=False)
     def _q_proj_and_k_up_proj(self, x, x_scale=None, group=False):
@@ -2133,6 +2169,14 @@ class MLAAttention(nn.Module):
                     o, lse = self._forward_prefill_mla(
                         q_out, kv_cache, attn_metadata, return_lse=True
                     )
+                    # Project-before-merge, same as decode below. Worth more here
+                    # than there: this merge carries num_tokens rows, not batch
+                    # rows. It also shrinks the fp32 branch below -- projecting
+                    # first makes the fp32 merge cheaper than today's bf16 one.
+                    if self.pbm_enabled:
+                        o = self._v_up_proj(
+                            o, self.W_V_dcp, self.W_V_dcp_scale, num_heads=o.shape[1]
+                        )
                     # Merge dtype is platform-dependent: on gfx942 the bf16
                     # ReduceScatter sum costs ~3.5pp, on gfx950 it is free even at
                     # ctx~32k with fp8 KV. Pay the fp32 upcast only where it buys
@@ -2143,7 +2187,12 @@ class MLAAttention(nn.Module):
                         o = cp_lse_ag_out_rs(
                             o.float(), lse, self.dcp_group, ctx=None
                         ).to(o.dtype)
-                    output = self._v_up_proj_and_o_proj(o)
+                    if self.pbm_enabled:
+                        output = self.o_proj(
+                            o.reshape(-1, self.num_heads * self.v_head_dim)
+                        )
+                    else:
+                        output = self._v_up_proj_and_o_proj(o)
                 else:
                     output = self._forward_prefill_mla(q_out, kv_cache, attn_metadata)
             elif self.dcp_world_size > 1:
@@ -2165,8 +2214,20 @@ class MLAAttention(nn.Module):
                 o, lse = self._forward_decode(
                     q_out, kv_cache, attn_metadata, return_lse=True
                 )
+                # Project-before-merge: run W_V on the whole group's head set
+                # BEFORE the merge, so the merge moves v_head_dim per head
+                # instead of kv_lora_rank.
+                if self.pbm_enabled:
+                    o = self._v_up_proj(
+                        o, self.W_V_dcp, self.W_V_dcp_scale, num_heads=o.shape[1]
+                    )
                 o = cp_lse_ag_out_rs(o, lse, self.dcp_group, ctx=self._cp_triton_ctx)
-                output = self._v_up_proj_and_o_proj(o)
+                if self.pbm_enabled:
+                    output = self.o_proj(
+                        o.reshape(-1, self.num_heads * self.v_head_dim)
+                    )
+                else:
+                    output = self._v_up_proj_and_o_proj(o)
             else:
                 output = self._forward_decode(q_out, kv_cache, attn_metadata)
 

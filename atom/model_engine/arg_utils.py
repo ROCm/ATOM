@@ -494,7 +494,15 @@ class EngineArgs:
                 "locally produces the full group head set, removing the "
                 "per-step decode AllGather Q (QREP). First cut: dense+sparse "
                 "qlen=1 decode, fp8 weights; auto-disabled for speculative "
-                "decode / fp4 / dcp<=1. Default false.\n"
+                "decode / fp4 / dcp<=1. Default TRUE -- pass false explicitly "
+                "for a non-QREP control run.\n"
+                '  - "enable_project_before_merge": bool, run the V '
+                "up-projection before the DCP output merge so the merge "
+                "exchanges v_head_dim per head instead of kv_lora_rank "
+                "(kv_lora/v_head x less: 4x on DeepSeek, 2x on GLM-5.2). "
+                "Costs a DCP-group copy of W_V. Covers decode and sparse "
+                "prefill; auto-disabled for fp4 / dcp<=1. Default TRUE -- "
+                "pass false explicitly for a control run.\n"
                 "Example:\n"
                 """  '{"interleave_size": 16, "enable_query_replication": true}'"""
             ),

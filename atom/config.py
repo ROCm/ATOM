@@ -1400,11 +1400,13 @@ class DCPConfig:
 
     interleave_size: int = 1
     enable_query_replication: bool = True
+    enable_project_before_merge: bool = True
 
     def __post_init__(self):
         self.interleave_size = int(self.interleave_size)
         assert self.interleave_size >= 1, "dcp.interleave_size must be >= 1"
         self.enable_query_replication = bool(self.enable_query_replication)
+        self.enable_project_before_merge = bool(self.enable_project_before_merge)
 
     @classmethod
     def from_dict(cls, cfg: dict | None) -> "DCPConfig":
