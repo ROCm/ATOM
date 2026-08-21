@@ -2528,11 +2528,14 @@ class DeepseekV4Attention(nn.Module):
         # ---- fp8 e8m0 mxscale batched-GEMM path (gfx950) --------------------
         # The 128x128 weight block scale and per-128 activation groups need
         # N % 128 == 0 and K % 128 == 0; anything else falls through to BF16.
+        # ATOM_WO_A_MXSCALE=0 forces that fallthrough, which is the only way to
+        # measure this path against the BF16 one on hardware that qualifies.
         G = self.n_local_groups
         N = self.o_lora_rank
         out_dim, K = int(w.shape[0]), int(w.shape[1])
         if (
             self._is_gfx950
+            and os.environ.get("ATOM_WO_A_MXSCALE", "1") != "0"
             and out_dim == G * N
             and N % 128 == 0
             and K % 128 == 0
