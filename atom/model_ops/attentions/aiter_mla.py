@@ -806,7 +806,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             base = ctx_g // W
             remainder = (ctx_g - base * W - r).clamp_(0, 1)
             local_ctx = (base + remainder).to(torch.int32)  # local KV tokens/blocks
-            kv_indptr[0] = 0
+            # Device-side fill: a scalar assignment here would be a blocking
+            # host->device copy, stalling this rank ahead of the forward's
+            # collectives (see the prefill path's kv_indptr for the deadlock).
+            kv_indptr[:1].zero_()
             kv_indptr[1 : bs + 1] = torch.cumsum(local_ctx, dim=0, dtype=torch.int32)
             var["kv_last_page_lens"].gpu[:bs] = (local_ctx > 0).to(
                 var["kv_last_page_lens"].gpu.dtype
@@ -1194,7 +1197,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
             attn_metadata.kv_indices = var["kv_indices"].gpu
             attn_metadata.kv_indptr = var["kv_indptr"].gpu[: bs + 1]
-            attn_metadata.kv_indptr[0] = 0
+            # `.zero_()`, not `[0] = 0`: assigning a Python scalar into a device
+            # tensor is a blocking host->device copy that drains the stream, and
+            # this runs before the forward posts its collectives. Under DCP a
+            # rank stalled here cannot join the cached-prefix AllGather, so the
+            # ranks already in it wait until the NCCL watchdog kills the job.
+            attn_metadata.kv_indptr[:1].zero_()
             attn_metadata.kv_indptr[1 : bs + 1] = torch.cumsum(
                 attn_metadata.context_lens, 0
             )
@@ -1834,7 +1842,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             self._token_to_seq_idxs_gpu[:sum_scheduled_tokens] = torch.arange(
                 scheduled_bs, dtype=torch.int32, device=self.device
             ).repeat_interleave(max_seqlen_q)
-            self._token_to_seq_idxs_gpu[sum_scheduled_tokens:sum_tokens] = 0
+            self._token_to_seq_idxs_gpu[sum_scheduled_tokens:sum_tokens].zero_()
             attn_metadata.token_to_seq_idxs = self._token_to_seq_idxs_gpu[:sum_tokens]
         elif self.is_sparse:
             # Non-MTP sparse decode (single token per seq): the sparse KV is
