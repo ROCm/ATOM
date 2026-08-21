@@ -495,6 +495,7 @@ class TestSchedule:
 
         assert failed.offload_load_failed is True
         assert failed in sched.running
+        assert failed.block_table == [0]
         assert sched._num_parked_remote_kv == 0
 
     def test_partial_prefill_ready_for_offload_load_moves_to_waiting(self):
