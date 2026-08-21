@@ -766,25 +766,13 @@ class DSparkLayer(Block):  # type: ignore[misc]
         )  # [B, T, n_heads, head_dim]
 
         # Output projection: mirror DeepseekV4Attention's output stage exactly
-        # (`_attn_core` + `_attn_post`): inverse-RoPE on the rope lanes, grouped
-        # output-LoRA, then wo_b. The draft shares the target attention's wo_a, so
-        # it also inherits the mxscale layout: the weight stays FP8 (unusable by a
-        # bf16 einsum) and the inverse RoPE is fused into the group-quant inside
-        # `_wo_a_grouped_lora`, hence it must not be applied here.
+        # (`_attn_core` + `_attn_post`). `_wo_a_grouped_lora` owns the inverse
+        # RoPE on both wo_a paths, so hand it the un-inverse-RoPE'd output and
+        # inherit whichever path the shared wo_a is on.
         # GPU-VERIFY: numerics validated against the V4 reference output stage.
         o = out.view(B * T, a.n_local_heads, a.head_dim)
         draft_pos_flat = draft_pos.view(-1)
-        if a._wo_a_mxscale:
-            o = a._wo_a_grouped_lora(
-                o, draft_pos_flat, prefix=f"{a.layer_name}.dspark_wo_a"
-            )
-        else:
-            rope_dim = a.rope_head_dim
-            # Remove the absolute-position contribution carried in via value-side RoPE.
-            a.rotary_emb.inverse(draft_pos_flat, o[..., -rope_dim:])
-            o = o.view(B * T, a.n_local_groups, -1)
-            wo_a = a.wo_a.weight.view(a.n_local_groups, a.o_lora_rank, -1)
-            o = torch.einsum("sgd,grd->sgr", o, wo_a).flatten(1)
+        o = a._wo_a_grouped_lora(o, draft_pos_flat, prefix=f"{a.layer_name}.dspark_wo_a")
         out_final = _linear_out(a.wo_b(o)).view(B, T, -1)
         return out_final
 

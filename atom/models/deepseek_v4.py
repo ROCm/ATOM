@@ -941,14 +941,20 @@ class _V4RoPE(nn.Module):
             )
 
     def inverse(
-        self, positions: torch.Tensor, x: torch.Tensor, prefix: str = ""
+        self,
+        positions: torch.Tensor,
+        x: torch.Tensor,
+        rope_dim: int,
+        prefix: str = "",
     ) -> None:
         """In-place inverse RoPE via fused Triton kernel.
 
-        ``x`` must be the rope-slice only (last dim == rotary_dim).
+        ``x`` is the whole ``[num_tokens, n_heads, head_dim]`` output; the kernel
+        slices the trailing ``rope_dim`` lanes itself, so no caller hands it a
+        strided view to mutate.
         """
         inverse_rope_inplace(
-            x, self.cos_cache, self.sin_cache, positions, prefix=prefix
+            x, self.cos_cache, self.sin_cache, positions, rope_dim, prefix=prefix
         )
 
 
@@ -2755,17 +2761,21 @@ class DeepseekV4Attention(nn.Module):
     def _wo_a_grouped_lora(
         self,
         o: torch.Tensor,
-        positions: torch.Tensor | None = None,
+        positions: torch.Tensor,
         prefix: str = "",
     ) -> torch.Tensor:
+        """Output inverse RoPE + grouped output LoRA.
+
+        `o` arrives un-inverse-RoPE'd from `_attn_core` on both paths. Owning the
+        inverse RoPE here is what lets the mxscale branch fuse it into the
+        group-quant, and keeps `_attn_core` free of wo_a path knowledge.
+        """
         num_tokens = o.size(0)
         if self._wo_a_mxscale:
-            # `o` arrives un-inverse-RoPE'd (see `_attn_core`):
             # `inverse_rope_group_quant` fuses the output inverse RoPE into the
             # per-token e8m0 group-quant, saving a bf16 round trip. The output
             # is token-major [M, G, N] with N contiguous, so the `.flatten(1)`
             # this branch ends with is a free view.
-            assert positions is not None, "wo_a mxscale needs positions for fused RoPE"
             H = self.n_local_heads
             G = self.n_local_groups
             D = H * self.head_dim // G
@@ -2803,6 +2813,12 @@ class DeepseekV4Attention(nn.Module):
             # read (M, K) off the first two dims, so K comes out as the group
             # count and the GEMM is rejected for a shape that never existed.
             return y.flatten(1)
+        self.rotary_emb.inverse(
+            positions,
+            o.view(num_tokens, self.n_local_heads, self.head_dim),
+            self.rope_head_dim,
+            prefix=f"{self.layer_name}.inverse_rope",
+        )
         o = o.view(num_tokens, self.n_local_groups, -1)
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
         if num_tokens <= 32 or self._is_gfx1250:
@@ -2820,21 +2836,17 @@ class DeepseekV4Attention(nn.Module):
     def _attn_post(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         """Grouped output LoRA + wo_b (graphable, num_tokens-shaped).
 
-        `o` is the un-inverse-RoPE'd attention output when `_wo_a_mxscale` is on;
-        `positions` is forwarded so the fused `inverse_rope_group_quant` can apply
-        the output inverse RoPE inside the wo_a group-quant.
+        `o` is the un-inverse-RoPE'd attention output; `positions` is forwarded
+        for the inverse RoPE that `_wo_a_grouped_lora` applies.
 
         wo_b's RowParallelLinear TP all_reduce goes through the ATOM AR layer,
         which routes it through the TBO-aware custom op on the pure-TP+TBO path
         (overlaps the partner ubatch's compute) and a plain reduce otherwise.
         """
-        if self._wo_a_mxscale:
-            # The AITER BMM entry is itself compile-guarded, so only its
-            # tuned-CSV lookup/kernel dispatch stays opaque; quantization and
-            # surrounding tensor work remain visible to the compiled graph.
-            o = self._wo_a_grouped_lora(o, positions, prefix=f"{self.layer_name}.wo_a")
-        else:
-            o = self._wo_a_grouped_lora(o, prefix=f"{self.layer_name}.wo_a")
+        # The AITER BMM entry is itself compile-guarded, so only its tuned-CSV
+        # lookup/kernel dispatch stays opaque; quantization and surrounding
+        # tensor work remain visible to the compiled graph.
+        o = self._wo_a_grouped_lora(o, positions, prefix=f"{self.layer_name}.wo_a")
         return self.wo_b(o)
 
     def forward_impl(
@@ -3248,18 +3260,9 @@ class DeepseekV4Attention(nn.Module):
                 prefix=f"{self.layer_name}.swa_write",
             )
 
-        # Inverse RoPE on output's rope dims to remove absolute-position
-        # contribution carried in by the value-side RoPE of the KV entries.
-        # Under the wo_a mxscale path this step is fused into the group-quant
-        # (`inverse_rope_group_quant` in `_wo_a_grouped_lora`), so `o` is left
-        # un-inverse-RoPE'd here and the positions are forwarded downstream.
-        if not self._wo_a_mxscale:
-            self.rotary_emb.inverse(
-                positions,
-                o[..., -rd:],
-                prefix=f"{self.layer_name}.inverse_rope",
-            )
-        # Output LoRA (wo_a/wo_b) now runs in `_attn_post` (graphed piece).
+        # `o` is returned un-inverse-RoPE'd: `_wo_a_grouped_lora` removes the
+        # absolute-position contribution the value-side RoPE carried in, on both
+        # paths, so the positions travel downstream instead.
         return o.reshape(num_tokens, -1)  # [num_tokens, n_local_heads*head_dim]
 
     def _fill_csa_paged_compress(
