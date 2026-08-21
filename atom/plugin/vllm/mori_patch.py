@@ -60,6 +60,56 @@ def _try_get_exact_valid_rows(dispatch_recv_token_num: torch.Tensor) -> Optional
     return int(dispatch_recv_token_num.reshape(-1)[0].item())
 
 
+def _is_qwen35_vllm_plugin_model() -> bool:
+    try:
+        from atom.config import get_current_atom_config
+
+        atom_config = get_current_atom_config()
+        if atom_config is None or not getattr(atom_config.plugin_config, "is_vllm", False):
+            return False
+        archs = getattr(atom_config.hf_config, "architectures", None) or []
+        qwen35_archs = {
+            "Qwen3_5MoeForConditionalGeneration",
+            "Qwen3_5ForConditionalGeneration",
+        }
+        if any(a in qwen35_archs for a in archs):
+            return True
+        model_type = getattr(atom_config.hf_config, "model_type", "") or ""
+        text_config = getattr(atom_config.hf_config, "text_config", None)
+        text_model_type = getattr(text_config, "model_type", "") if text_config else ""
+        return model_type.startswith("qwen3_5") or text_model_type.startswith("qwen3_5")
+    except Exception:
+        return False
+
+
+def _trim_qwen35_uniform_full_graph(
+    dispatch_a1: torch.Tensor,
+    dispatch_scale: torch.Tensor | None,
+    dispatch_ids: torch.Tensor,
+    dispatch_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]:
+    from vllm.distributed.parallel_state import get_dp_group
+    from vllm.forward_context import get_forward_context
+
+    forward_context = get_forward_context()
+    context = forward_context.context if forward_context is not None else None
+    if context is None:
+        return dispatch_a1, dispatch_scale, dispatch_ids, dispatch_weights
+
+    dp_size = get_dp_group().world_size
+    topk = topk_ids.shape[1]
+    total_valid_tokens = context.graph_bs * topk * dp_size
+    all_ranks_decode = getattr(context, "dp_uniform_decode", not context.is_prefill)
+    if total_valid_tokens < dispatch_a1.shape[0] and all_ranks_decode:
+        dispatch_a1 = dispatch_a1[:total_valid_tokens]
+        dispatch_ids = dispatch_ids[:total_valid_tokens]
+        dispatch_weights = dispatch_weights[:total_valid_tokens]
+        if dispatch_scale is not None:
+            dispatch_scale = dispatch_scale[:total_valid_tokens]
+    return dispatch_a1, dispatch_scale, dispatch_ids, dispatch_weights
+
+
 def trim_vllm_mori_dispatch_tensors(
     dispatch_a1: torch.Tensor,
     dispatch_scale: torch.Tensor | None,
@@ -69,6 +119,15 @@ def trim_vllm_mori_dispatch_tensors(
     ep_world_size: int,
     dispatch_recv_token_num: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]:
+    if _is_qwen35_vllm_plugin_model() and _is_uniform_full_graph_batch():
+        return _trim_qwen35_uniform_full_graph(
+            dispatch_a1,
+            dispatch_scale,
+            dispatch_ids,
+            dispatch_weights,
+            topk_ids,
+        )
+
     # Only trim in full-cudagraph uniform-decode settings.
     # All DP/TP ranks are padded to a common token count only under full-graph
     # settings. In piecewise or eager batches, token counts per rank can differ

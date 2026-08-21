@@ -19,10 +19,32 @@ from atom.utils.selector import get_attn_backend
 
 # frontend interface class for constructing attention
 # op in model file
+def _use_qwen35_legacy_vllm_mha() -> bool:
+    """Qwen3.5 hybrid models use the 0526 PagedAttention wrapper on vLLM 0.27+."""
+    atom_config = get_current_atom_config()
+    if atom_config is None:
+        return False
+    archs = getattr(atom_config.hf_config, "architectures", None) or []
+    qwen35_archs = {
+        "Qwen3_5MoeForConditionalGeneration",
+        "Qwen3_5ForConditionalGeneration",
+    }
+    if any(a in qwen35_archs for a in archs):
+        return True
+    model_type = getattr(atom_config.hf_config, "model_type", "") or ""
+    text_config = getattr(atom_config.hf_config, "text_config", None)
+    text_model_type = getattr(text_config, "model_type", "") if text_config else ""
+    return model_type.startswith("qwen3_5") or text_model_type.startswith("qwen3_5")
+
+
 class Attention:
     def __new__(cls, *args, **kwargs):
         from atom.plugin.prepare import is_rtpllm, is_sglang, is_vllm
 
+        if is_vllm() and _use_qwen35_legacy_vllm_mha():
+            from atom.model_ops.paged_attention import PagedAttention
+
+            return PagedAttention(*args, **kwargs)
         if is_vllm():
             from atom.plugin.vllm.attention.layer import AttentionForVllm
 
@@ -36,9 +58,9 @@ class Attention:
 
             return AttentionForRTPLLM(*args, **kwargs)
 
-        from atom.model_ops.paged_attention import Attention as AttentionForAtom
+        from atom.model_ops.paged_attention import PagedAttention
 
-        return AttentionForAtom(*args, **kwargs)
+        return PagedAttention(*args, **kwargs)
 
 
 def run_pa_fwd_asm(

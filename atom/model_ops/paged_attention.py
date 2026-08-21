@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-# from flash_attn import flash_attn_with_kvcache
 from typing import Optional
+
 import torch
 from torch import nn
 
@@ -10,13 +10,11 @@ from .attention_mla import MLAModules
 from .base_attention import BaseAttention
 from atom.config import get_current_atom_config
 from atom.utils.selector import get_attn_backend
-from atom.plugin.prepare import is_plugin_mode
+from atom.plugin.prepare import is_sglang, is_vllm
 
 
-class Attention(BaseAttention):
-    """
-    Attention paged implementation
-    """
+class PagedAttention(BaseAttention):
+    """Paged attention for ATOM server mode and vLLM plugin mode."""
 
     def __init__(
         self,
@@ -39,8 +37,8 @@ class Attention(BaseAttention):
         **kwargs,
     ):
         assert (
-            not is_plugin_mode()
-        ), "ATOM native Attention is only supported for ATOM native/server mode"
+            not is_sglang()
+        ), "PagedAttention is not supported for plugin mode(sglang) for now"
         super().__init__(
             num_heads=num_heads,
             head_dim=head_dim,
@@ -58,6 +56,82 @@ class Attention(BaseAttention):
         )
 
         self.use_mla = use_mla
+        if is_vllm():
+            self.rotary_emb = mla_modules.rotary_emb if use_mla else rotary_emb
+
+            try:
+                from vllm.attention.layer import Attention, MLAAttention, AttentionType
+            except ImportError:
+                from vllm.model_executor.layers.attention import Attention, MLAAttention
+                from vllm.v1.attention.backend import AttentionType
+
+            atom_config = get_current_atom_config()
+            assert atom_config is not None, "atom_config is required for vLLM plugin"
+
+            cache_config = atom_config.plugin_config.vllm_cache_config
+            quant_config = atom_config.plugin_config.vllm_quant_config
+
+            # vLLM 0.27 RocmAttentionImpl rejects legacy ATOM impl kwargs
+            # (rotary_emb/q_norm). RoPE is applied in the plugin bridge instead.
+            extra_impl_args: dict = {}
+
+            if use_mla:
+                self.num_heads = num_heads
+                self.v_head_dim = mla_modules.v_head_dim
+                self.qk_head_dim = mla_modules.qk_head_dim
+                self.qk_nope_head_dim = mla_modules.qk_nope_head_dim
+                self.q_proj = mla_modules.q_proj
+                self.o_proj = mla_modules.o_proj
+
+                self.attn = MLAAttention(
+                    num_heads=num_heads,
+                    scale=scale,
+                    qk_nope_head_dim=mla_modules.qk_nope_head_dim,
+                    qk_rope_head_dim=mla_modules.qk_rope_head_dim,
+                    v_head_dim=mla_modules.v_head_dim,
+                    q_lora_rank=mla_modules.q_lora_rank,
+                    kv_lora_rank=mla_modules.kv_lora_rank,
+                    cache_config=cache_config,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.attn",
+                    kv_b_proj=mla_modules.kv_b_proj,
+                    use_sparse=mla_modules.indexer is not None,
+                    indexer=mla_modules.indexer,
+                    **extra_impl_args,
+                )
+            else:
+                self.attn = Attention(
+                    num_heads=num_heads,
+                    head_size=head_dim,
+                    scale=scale,
+                    num_kv_heads=num_kv_heads,
+                    alibi_slopes=alibi_slopes,
+                    cache_config=cache_config,
+                    quant_config=quant_config,
+                    logits_soft_cap=None,
+                    per_layer_sliding_window=per_layer_sliding_window,
+                    prefix=f"{prefix}",
+                    attn_type=AttentionType.DECODER,
+                    kv_sharing_target_layer_name=None,
+                    **extra_impl_args,
+                )
+
+            compilation_config = atom_config.compilation_config
+            self.layer_name = prefix
+            if self.layer_name in compilation_config.static_forward_context:
+                raise ValueError(f"Duplicate layer: {self.layer_name}")
+            compilation_config.static_forward_context[self.layer_name] = self
+
+            if self.use_mla:
+                if "positions" not in compilation_config.static_forward_context:
+                    max_num_tokens = (
+                        atom_config.plugin_config.vllm_scheduler_config.max_num_batched_tokens
+                    )
+                    compilation_config.static_forward_context["positions"] = (
+                        torch.zeros(max_num_tokens, dtype=torch.int64, device="cuda")
+                    )
+            return
+
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.scale = scale
@@ -80,9 +154,6 @@ class Attention(BaseAttention):
             block_size,
             use_mla=self.use_mla,
         )
-        # Allow a model to plug in a specialized impl (e.g. the MiniMax-M3 sparse
-        # attention impl) while still reusing the backend's metadata builder.
-        # Falls back to the backend default when not overridden.
         impl_cls = impl_cls or self.attn_backend.get_impl_cls()
         self.impl = impl_cls(
             num_heads=num_heads,
@@ -105,7 +176,7 @@ class Attention(BaseAttention):
         default_name = f"MLA_{layer_num}" if self.use_mla else f"MHA_{layer_num}"
         self.layer_name = prefix if prefix is not None else default_name
         if self.layer_name in compilation_config.static_forward_context:
-            raise ValueError("Duplicate layer: {}".format(self.layer_name))
+            raise ValueError(f"Duplicate layer: {self.layer_name}")
         compilation_config.static_forward_context[self.layer_name] = self
 
     def forward(
@@ -118,6 +189,22 @@ class Attention(BaseAttention):
         qkv: torch.Tensor = None,
         **kwargs,
     ):
+        if is_vllm():
+            from atom.plugin.attention import (
+                unified_attention_with_output_base_for_plugin_mode,
+            )
+
+            return unified_attention_with_output_base_for_plugin_mode(
+                query,
+                q_scale,
+                key,
+                value,
+                positions,
+                layer_name=self.layer_name,
+                use_mla=self.use_mla,
+                qkv=qkv,
+            )
+
         output = torch.ops.aiter.unified_attention_with_output_base(
             query, q_scale, key, value, positions, self.layer_name, self.use_mla, qkv
         )
