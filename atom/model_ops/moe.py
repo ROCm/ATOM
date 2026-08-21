@@ -1501,7 +1501,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 # TTFT) with no measured accuracy loss; decode (small M,
                 # memory-bound) keeps a16w4. Enabled by default on gfx1250.
                 runtime_act_quant = self.act_quant
-                if self.is_gfx1250 and get_forward_context().context.is_prefill:
+                if self.is_gfx1250 and get_forward_context().context.is_prefill and activation == ActivationType.Swiglu:
                     runtime_act_quant = MoEActivationQuant.FP8
 
                 output = torch.empty_like(x)
