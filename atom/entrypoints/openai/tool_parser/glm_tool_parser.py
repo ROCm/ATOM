@@ -30,7 +30,14 @@ _TOOLCALL_RE = re.compile(r"<tool_call>(.*?)</tool_call>|<tool_call>(.*)$", re.D
 # followed by the name" produced a call named " followed by the name. Hope
 # that helps!", and a Hermes-style `<tool_call>{"name": ...}` produced one
 # named after the whole JSON object. Both reached clients as `tool_calls`.
-_TOOL_NAME_RE = re.compile(r"^[A-Za-z_][\w.\-]*$")
+#
+# `\w` and not `[A-Za-z_]`: OpenAI's own grammar is `^[a-zA-Z0-9_-]{1,64}$`,
+# so a leading digit is legal (`7z_extract`), and `\w` is Unicode-aware, so a
+# CJK name is too -- which matters rather a lot on a Chinese model family.
+# Rejecting one is silent, and prose is still rejected because a space cannot
+# appear in the tail. `\Z` and not `$`, which also matches before a trailing
+# newline and would admit a name with one.
+_TOOL_NAME_RE = re.compile(r"^\w[\w.\-]*\Z")
 _ARG_RE = re.compile(
     r"<arg_key>(.*?)</arg_key>\s*<arg_value>"
     r"(.*?)(?:</arg_value>|(?=<arg_key>)|(?=</tool_call>)|$)",
@@ -55,7 +62,7 @@ class GlmParser(BufferedMarkerParser):
         param_types = build_param_types(tools)
         start = text.find("<tool_call>")
         if start == -1:
-            return text.strip(), []
+            return text, []  # no call -> verbatim; see ToolCallParser.parse
         content = text[:start]
         tool_calls: list[ToolCall] = []
         for m in _TOOLCALL_RE.finditer(text):
@@ -82,4 +89,4 @@ class GlmParser(BufferedMarkerParser):
                     },
                 )
             )
-        return content.strip(), tool_calls
+        return (content.strip() if tool_calls else text), tool_calls

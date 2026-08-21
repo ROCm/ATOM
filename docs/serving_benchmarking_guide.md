@@ -127,21 +127,66 @@ which one `<` in an ordinary answer — `if (a < b)` — satisfied forever, and
 the buffer was never cleared while it held. The whole answer then arrived in
 a single frame at end of stream, indistinguishable from a hang to a streaming
 client, and the scan over that ever-growing buffer made the cost quadratic in
-the response length. Text inside the reasoning channel is held until its end
-marker, which is not a stall: it is reasoning, and it is delivered as
-`reasoning_content` as it arrives.
+the response length.
+
+Two waits are longer than that and are not stalls. Text inside the reasoning
+channel is held until its end marker — it is reasoning, and it is delivered as
+`reasoning_content` as it arrives. And once a *complete* start marker appears,
+everything from it onward belongs to the tool-call format until the format can
+parse it, which for a real call is its closing tag and for Kimi-K3 — whose
+channel framing interleaves and is parsed once at EOS — is the whole response.
+The bound above is on the read-ahead *before* a marker, which is the part an
+ordinary answer pays.
 
 **Which tool-call format a model uses is decided at startup, not from its
 output.** `--tool-call-parser` defaults to `auto`, which renders the model's
 chat template with a tools payload — the template's own instructions for
-calling one — and runs the same detection cascade `parse_tool_calls` runs on
-a complete output. It reads a Jinja template or a model-side Python encoder
-(`<model>/encoding/encoding_*.py`, which is how DeepSeek-V4 ships its), and
-logs the format it chose. When nothing is recognised it says so and tool
-calls are delivered as plain text; it does not fall back to reading the
-output, because a wrong guess there is silent — a Hermes-style
-`<tool_call>{"name": ...}` claimed by the GLM parser delivers the whole JSON
-blob as the tool's *name*. Pass a format name to override.
+calling one — and runs the `_DETECT_ORDER` cascade on the result. It reads a
+Jinja template or a model-side Python encoder (`<model>/encoding/encoding_*.py`,
+which is how DeepSeek-V4 ships its), and logs the format it chose. When nothing
+is recognised it says so and tool calls are delivered as plain text. There is
+no fallback to reading the output — not on either path, which is the point: the
+non-streaming path used to run the cascade over the response whenever no format
+had been resolved, so an answer that merely quoted another format's section
+token had everything from the token onward deleted with `stream=false` and
+arrived whole with `stream=true`. A guess is silent, and it is also two
+different answers to one request.
+
+**`stream=false` and `stream=true` deliver the same text.** A format's `parse`
+returns the content byte-for-byte when it found no tool call; the only thing it
+may remove is a marker it declares itself (Kimi-K3's channel tokens, which the
+streaming path removes too). Whitespace is not that — every format used to
+`.strip()`, which cost a code-block answer its trailing newline on one path
+only. The property suite generates this check from the parser registry, so a
+format added later is held to it without a new case being written.
+
+**`thinking` is answered in the prompt, not in the response.** On
+`/v1/messages`, `thinking: {"type": "disabled"}` sets the chat template's own
+reasoning switch, so the model emits no chain of thought — there is then none
+to separate, none to discard, and none for the tool parser to misread.
+Everything downstream is unconditional: the reasoning channel is always
+separated and always reported, exactly as on `/v1/chat/completions`.
+
+That ordering is the whole of it. Handling an unwanted chain of thought *after*
+generating it fails three different ways — discarding it returns an empty
+message for a reasoning model stopped at `max_tokens`; relabelling it as `text`
+hands the client the thing it declined; and leaving it unseparated feeds it to
+the tool parser, which is a second reader of the same text and read one model's
+musing about `<function=NAME>` as a call to a tool named `NAME`. SGLang answers
+the same field the same way (`apply_reasoning_enabled`), and vLLM gets it
+structurally by having no such field: its reasoning parser runs unconditionally
+and `include_reasoning` only suppresses the result after the split.
+
+Which kwarg carries the switch is resolved at startup by rendering the template
+twice and comparing, because a template silently ignores a kwarg it does not
+read. On this box: Qwen3/Qwen3.5 `enable_thinking`, Kimi-K3 `thinking`,
+MiniMax-M3 `thinking_mode="disabled"`, DeepSeek-V4 `thinking_mode="chat"`.
+A model whose template has no switch is named in the startup log; its reasoning
+cannot be turned off, and is separated and reported rather than dropped. Two
+details that bite: `{"type": "disabled"}` is a non-empty object, so testing the
+field for truthiness read the standard off-switch as on; and an *absent*
+`thinking` leaves the model's own default alone rather than switching reasoning
+off, so an existing caller's answers do not change.
 
 **A stalled response is visible while it is stalled.**
 `StreamOutputCollector.get` is the single point at which any stream waits for
@@ -154,6 +199,13 @@ already recovered by scrape time. Neither costs a timer: `asyncio.wait_for`
 around that await measured 1.38 us per token per stream against 0.07 us for a
 timestamp and a dict entry. This exists because the symptom that started this
 work was ten minutes of silence with every metric looking healthy.
+
+Two silences it cannot see, so do not read zero as "nothing is stuck". It is
+armed only after a stream has delivered once — otherwise every queued request
+would register, duplicating `atom:requests_waiting` — so a request admitted and
+never producing a first token contributes nothing. And it measures upstream of
+the two withholding stages, so a stream whose bytes are arriving on schedule
+and being held by the tool-call read-ahead reads as healthy here.
 
 One consequence matters when reading benchmark output. ITL is sampled once per
 received SSE chunk (`backend_request_func.py`, `benchmark_serving.py`), so
@@ -188,7 +240,7 @@ Server-specific CLI arguments:
 | `--server-port` | `8000` | HTTP port (note: `--port` is for internal engine communication) |
 | `--timeout-keep-alive` | `5` | Seconds an idle keep-alive connection is held. Pooling clients hold their end longer (aiohttp defaults to 15s), so a caller that pauses for longer than this reuses a socket the server already closed and has to re-send. Raise it past the caller's idle window to avoid that |
 | `--disable-uvicorn-access-log` | off | Stop uvicorn logging a line per HTTP request. It copies a `LogRecord` and writes to the same stdout as the engine, on the event loop |
-| `--tool-call-parser` | `auto` | Tool-call wire format. `auto` reads it from the model's chat template at startup (Jinja, or a model-side `encoding/encoding_*.py`); a name — `dsml`, `glm`, `kimi`, `kimi_k3`, `minimax`, `qwen` — overrides. When neither resolves, tool calls are delivered as plain text and the startup log says so; the format is never guessed from output. An unknown name is refused rather than silently disabling tool parsing. Accepted by the atomesh entrypoint too |
+| `--tool-call-parser` | `auto` | Tool-call wire format. `auto` reads it from the model's chat template at startup (Jinja, or a model-side `encoding/encoding_*.py`); a name — `dsml`, `glm`, `kimi`, `kimi_k3`, `minimax`, `qwen` — overrides. When neither resolves, tool calls are delivered as plain text and the startup log says so; the format is never guessed from output. An unknown name is refused rather than silently disabling tool parsing, and on atomesh that refusal happens before the weights load. Accepted by the atomesh entrypoint too, where it is also forwarded to the mesh router, which declares a flag of the same name and its own vocabulary for it |
 
 All `EngineArgs` arguments are also accepted (see Section 7 for the full list).
 
@@ -790,6 +842,7 @@ server without modification.
 | `atom/entrypoints/openai/sse.py` | SSE frame encoding (`data_frame`, `event_frame`) on a shared msgspec encoder |
 | `atom/entrypoints/openai/marker_scanner.py` | `MarkerScanner` — the one rule for how much of a stream is safe to release |
 | `atom/entrypoints/openai/reasoning.py` | Splits the reasoning channel from the answer; seeded per request by `prompt_starts_in_reasoning` |
+| `atom/entrypoints/openai/chat_encoders.py` | Renders the chat template, and the two startup probes of it: `render_probe_prompt` (what the prompt tells the model) and `chat_template_source` (what the template does with a reply) |
 | `atom/entrypoints/openai/tool_parser/registry.py` | Which format a model emits, resolved once at startup from its chat template |
 | `atom/entrypoints/openai/tool_parser/` | Per-format tool-call parsing; each format declares its `START_MARKERS` |
 | `atom/model_engine/llm_engine.py` | `LLMEngine` programmatic API |

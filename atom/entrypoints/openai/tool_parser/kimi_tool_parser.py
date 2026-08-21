@@ -79,11 +79,14 @@ class KimiParser(ToolCallParser):
             # complete entries it managed to emit.
             unclosed = _UNCLOSED_RE.search(text)
             if unclosed:
+                entries = _parse_entries(unclosed.group(1))
                 content = text[: unclosed.start()]
-                return content.strip(), _parse_entries(unclosed.group(1))
+                # No call -> verbatim; see ToolCallParser.parse.
+                return (content.strip() if entries else text), entries
             return text, []
+        entries = _parse_entries(section_match.group(1))
         content = text[: section_match.start()]
-        return content.strip(), _parse_entries(section_match.group(1))
+        return (content.strip() if entries else text), entries
 
     def process(self, text: str) -> list:
         results: list = []

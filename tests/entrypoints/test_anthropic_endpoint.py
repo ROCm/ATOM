@@ -14,6 +14,7 @@ import pathlib
 import pytest
 
 from atom.entrypoints.openai import api_server
+from atom.entrypoints.openai.reasoning import separate_reasoning
 from atom.entrypoints.openai.serving_anthropic import (
     AnthropicMessage,
     AnthropicMessagesRequest,
@@ -28,6 +29,8 @@ from atom.entrypoints.openai.serving_anthropic import (
     stream_message_start,
     stream_message_stop,
 )
+from atom.entrypoints.openai.tool_parser.qwen3_tool_parser import QwenXmlParser
+from atom.entrypoints.openai.tool_parser.registry import parse_tool_calls
 
 # ============================================================================
 # Message Conversion Tests
@@ -508,77 +511,160 @@ class TestTheStopReasonTellsTheTruth:
         default = "end_turn"
         assert api_server._ANTHROPIC_STOP_REASON.get(unknown, default) == default
 
-
-class TestThinkingOffMeansNoReasoningChannel:
-    """`thinking` absent: nothing separates, so nothing can be dropped.
-
-    The endpoint used to build a seeded filter regardless, split the output
-    into channels, and then discard the reasoning half. That was invisible
-    while an unseeded filter sent most output down the content channel; with
-    seeding correct, a reasoning model stopped at `max_tokens` produces only
-    reasoning and the client got an empty message. Putting the discarded half
-    back as `text` would have handed it the one thing it declined.
-
-    So the decision lives in two functions both entry points call, rather than
-    inline in an async endpoint no test can reach -- an earlier version of
-    this class re-implemented the branch to test it, and passed while the
-    real one did the opposite.
-    """
-
-    RAW = "Working through it. </think>The answer is 42."
-
-    def test_nothing_is_separated_when_thinking_is_off(self):
-        reasoning, content = api_server.anthropic_reasoning_split(
-            self.RAW, thinking=False, starts_thinking=True
-        )
-        assert reasoning is None
-        assert content == self.RAW, "the raw output is the text, markers and all"
-
-    def test_it_is_separated_when_thinking_is_on(self):
-        reasoning, content = api_server.anthropic_reasoning_split(
-            self.RAW, thinking=True, starts_thinking=True
-        )
-        assert reasoning == "Working through it."
-        assert content == "The answer is 42."
-
-    def test_no_filter_is_built_when_thinking_is_off(self):
-        assert (
-            api_server.anthropic_reasoning_filter(thinking=False, starts_thinking=True)
-            is None
-        )
-
-    def test_a_seeded_filter_is_built_when_it_is_on(self):
-        rf = api_server.anthropic_reasoning_filter(thinking=True, starts_thinking=True)
-        assert rf is not None and rf.state == 1
-
-    def test_both_halves_answer_the_same_question(self):
-        """One rule, so the two paths cannot drift apart."""
-        for thinking in (True, False):
-            split = api_server.anthropic_reasoning_split(
-                self.RAW, thinking=thinking, starts_thinking=True
-            )
-            filt = api_server.anthropic_reasoning_filter(
-                thinking=thinking, starts_thinking=True
-            )
-            assert (split[0] is None) == (filt is None)
-
     @pytest.mark.parametrize(
-        "helper", ["anthropic_reasoning_split", "anthropic_reasoning_filter"]
+        "engine_reason, expected",
+        [
+            ("eos", "end_turn"),
+            ("max_tokens", "max_tokens"),
+            ("stop_sequence", "stop_sequence"),
+            # The scheduler's fourth ending, and the one a lookup misses: a
+            # stop token fired, spelled with the token's own id.
+            ("stop_163586", "stop_sequence"),
+            ("aborted", "end_turn"),
+            ("unschedulable: no free blocks", "end_turn"),
+            ("", "end_turn"),
+            (None, "end_turn"),
+        ],
     )
-    def test_the_endpoint_actually_calls_the_helper(self, helper):
-        """Extracting a rule only helps if the caller uses it.
+    def test_every_shape_the_scheduler_emits(self, engine_reason, expected):
+        """All seven, enumerated from `scheduler.py`, plus the unset default."""
+        assert api_server.anthropic_stop_reason(engine_reason) == expected
 
-        The endpoint's body is an async generator inside a route handler that
-        no unit test reaches, so a mutation putting `separate_reasoning` back
-        inline passed every behavioural test here. Counted from the source:
-        one definition plus at least one call.
+    def test_the_non_streaming_path_passes_one(self):
+        """It read `end_turn` from a default while the reason sat unused.
+
+        The map was wired into the streaming generator only, so the same
+        response reported two different endings depending on `stream`. Both
+        bodies are unreachable from a unit test; this counts call sites.
         """
         src = pathlib.Path(api_server.__file__).read_text()
         assert (
-            src.count(helper + "(") >= 2
-        ), f"{helper} is defined but never called — the endpoint has its own copy"
+            src.count("anthropic_stop_reason(") >= 3
+        ), "anthropic_stop_reason is defined but not called by both paths"
+        assert "stop_reason=(" in src, "the non-streaming response omits stop_reason"
 
-    def test_no_ping_frame_survives(self):
-        """Its only branch is gone; a leftover constant reads as live code."""
+
+class TestTheOffSwitchIsRecognised:
+    """`{"type": "disabled"}` is how a client turns thinking off.
+
+    It is also a non-empty dict, so `bool(request.thinking)` read it as on --
+    the standard spelling of "off" was the one spelling that did not work.
+    """
+
+    class Req:
+        def __init__(self, thinking):
+            self.thinking = thinking
+
+    @pytest.mark.parametrize(
+        "thinking, enabled",
+        [
+            (None, False),
+            ({}, False),
+            ({"type": "disabled"}, False),
+            ({"type": "enabled"}, True),
+            ({"type": "enabled", "budget_tokens": 1024}, True),
+        ],
+    )
+    def test_each_spelling(self, thinking, enabled):
+        assert api_server.anthropic_thinking_enabled(self.Req(thinking)) is enabled
+
+    def test_a_request_without_the_field_at_all(self):
+        assert api_server.anthropic_thinking_enabled(object()) is False
+
+
+class TestThinkingIsAnsweredInThePrompt:
+    """`thinking: disabled` tells the *model* not to think.
+
+    Three attempts to deal with an unwanted chain of thought after generating
+    it each broke something else -- discarding it returned an empty message,
+    relabelling it as `text` handed the client what it declined, and declining
+    to separate it fed the reasoning to the tool parser, which read one model's
+    musing about `<function=NAME>` as a call to a tool named `NAME`. Setting
+    the template's own switch means there is no chain of thought to deal with.
+
+    This is SGLang's design for the same field (`apply_reasoning_enabled`), and
+    what vLLM gets structurally by having no such field on its Anthropic
+    request at all -- its reasoning parser runs unconditionally and
+    `include_reasoning` only suppresses the field after the split.
+    """
+
+    TOGGLE = ("enable_thinking", False)
+
+    class Req:
+        def __init__(self, thinking):
+            self.thinking = thinking
+
+    def test_disabled_sets_the_template_switch(self):
+        kwargs = api_server.anthropic_template_kwargs(
+            self.Req({"type": "disabled"}), self.TOGGLE
+        )
+        assert kwargs == {"enable_thinking": False}
+
+    def test_enabled_leaves_the_template_alone(self):
+        assert (
+            api_server.anthropic_template_kwargs(
+                self.Req({"type": "enabled"}), self.TOGGLE
+            )
+            == {}
+        )
+
+    def test_an_absent_field_is_unstated_not_off(self):
+        """Anthropic defaults to off, but reading absence as "switch this
+        model's reasoning off" would silently change what every existing
+        caller gets back. SGLang keys on the field being present too."""
+        assert api_server.anthropic_template_kwargs(self.Req(None), self.TOGGLE) == {}
+
+    def test_a_model_with_no_switch_gets_no_kwarg(self):
+        assert (
+            api_server.anthropic_template_kwargs(self.Req({"type": "disabled"}), None)
+            == {}
+        )
+
+    def test_the_endpoint_renders_the_prompt_with_them(self):
+        """The request's `thinking` used to be dropped on the floor here: the
+        Anthropic path built `merged_kwargs` from server defaults only."""
         src = pathlib.Path(api_server.__file__).read_text()
-        assert "_ANTHROPIC_PING_FRAME" not in src
+        assert src.count("anthropic_template_kwargs(") >= 2
+        assert "merged_kwargs.update(anthropic_template_kwargs(" in src
+
+
+class TestSeparationIsUnconditional:
+    """Whatever reasoning arrives is separated and reported, always.
+
+    Not gated on `thinking`, for the same reason the chat path is not: the
+    tool parser reads the same text, and a chain of thought left in it is a
+    chain of thought the tool parser will try to parse.
+    """
+
+    RAW = (
+        "<think>User wants weather. The syntax is <tool_call> then "
+        "<function=NAME>...</think>Checking now. "
+        "<tool_call><function=get_weather><parameter=city>Paris</parameter>"
+        "</function></tool_call>"
+    )
+
+    def test_no_call_is_fabricated_from_reasoning(self):
+        reasoning, body = separate_reasoning(self.RAW, starts_thinking=False)
+        _, calls = parse_tool_calls(body, None, parser_cls=QwenXmlParser)
+        names = [c.function["name"] for c in calls]
+        assert names == ["get_weather"], f"fabricated {names}"
+        assert reasoning is not None and "syntax" in reasoning
+
+    def test_tool_use_survives_a_request_that_declined_thinking(self):
+        """The cost of the answer this replaces: tying the parse to `thinking`
+        meant no `tool_use` block for any request that did not opt in, which
+        is most of them."""
+        _, body = separate_reasoning(self.RAW, starts_thinking=False)
+        _, calls = parse_tool_calls(body, None, parser_cls=QwenXmlParser)
+        assert len(calls) == 1
+
+    @pytest.mark.parametrize("helper", ["separate_reasoning", "ReasoningFilter"])
+    def test_neither_path_gates_it(self, helper):
+        """Both endpoint bodies are unreachable from a unit test, so this
+        counts call sites and asserts the gate that used to wrap them is
+        gone."""
+        src = pathlib.Path(api_server.__file__).read_text()
+        assert helper + "(" in src
+        assert "anthropic_reasoning_split" not in src
+        assert "anthropic_reasoning_filter" not in src
+        assert "anthropic_tool_format" not in src

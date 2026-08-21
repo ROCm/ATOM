@@ -6,15 +6,21 @@
 Several formats share tags and are only told apart by a discriminator that a
 later entry would also match, so detection order is load-bearing. `_DETECT_ORDER`
 is the single place that ordering is expressed — do not reorder without
-re-reading the notes on each entry — and both callers use it: `parse_tool_calls`
-on a complete output, and `resolve_from_prompt` on a rendered chat template at
-startup.
+re-reading the notes on each entry.
+
+It is consulted on a *rendered chat template*, at startup, and nowhere else.
+Running it on a model's output as well was the same question asked of worse
+evidence: a template states the format it taught the model, while an output
+only exhibits whatever it happens to contain, so an ordinary answer quoting
+`<|tool_calls_section_begin|>` was read as a Kimi section and everything after
+it deleted — on the non-streaming path only, because streaming had already
+been given the startup answer. One question, one place to ask it.
 """
 
 import logging
 from typing import Any
 
-from ..chat_encoders import apply_chat_template
+from ..chat_encoders import render_probe_prompt
 from .deepseekv4_tool_parser import DsmlParser
 from .glm_tool_parser import GlmParser
 from .kimi_k3_tool_parser import KimiK3Parser
@@ -55,33 +61,23 @@ def parse_tool_calls(
         text: Raw model output that may contain tool calls.
         tools: Optional request tool definitions; used to type-coerce parameter
             values to their declared JSON-Schema types.
-        parser_cls: The format resolved for this model at startup. Given, it is
-            used and the cascade below is not consulted — the streaming path
-            reads the same output as that same format, and the two answering
-            differently is a divergence a client sees as a tool call appearing
-            only when it does not stream.
+        parser_cls: The format resolved for this model at startup, or ``None``
+            for "do not parse". ``None`` is not "work it out from the text":
+            the streaming path is handed the same ``None`` and emits
+            everything as content, so guessing here would answer the same
+            request two ways — measured, an answer describing
+            `<|tool_calls_section_begin|>` lost 30 characters when
+            `stream=false` and arrived whole when `stream=true`.
 
     Returns:
         Tuple of (content_text, list_of_tool_calls). ``content_text`` has the
-        tool-call sections removed.
+        tool-call sections removed, and is ``text`` byte-for-byte when there
+        are none — the rule each format's ``parse`` states and the property
+        tests enforce across the registry.
     """
-    if parser_cls is not None:
-        content, tool_calls = parser_cls.parse(text, tools)
-        if not tool_calls:
-            # No call, so nothing was a tool-call section and nothing should
-            # have been rewritten. Formats strip their content, which for an
-            # ordinary answer means a code block comes back without its
-            # trailing newline -- and only when `stream=false`, since the
-            # streaming path releases bytes as they arrive.
-            return text, []
-        return content, tool_calls
-    for parser in _DETECT_ORDER:
-        if parser.detect(text):
-            return parser.parse(text, tools)
-    # Kimi is terminal: when it finds no section either, it returns the text
-    # unchanged. Note that path does NOT strip, unlike every format that did
-    # match — preserved as-is, callers rely on plain content surviving verbatim.
-    return KimiParser.parse(text, tools)
+    if parser_cls is None:
+        return text, []
+    return parser_cls.parse(text, tools)
 
 
 # -- format resolution -----------------------------------------------------
@@ -112,13 +108,12 @@ def resolve_from_prompt(rendered_prompt: str) -> type[ToolCallParser] | None:
     read as "and therefore send nothing", which is how one '<' in an answer
     withheld the rest of the stream.
     """
-    # Kimi is included here though `_DETECT_ORDER` omits it. There it is the
-    # terminal fallback, because its `parse` also defines "no tool calls at
-    # all"; that makes it wrong to try *last* on an output and right to try at
-    # all on a prompt. Omitting it meant a K2 deployment resolved to nothing
-    # and its tool calls arrived as raw section tokens in `delta.content`,
-    # while the non-streaming path still fell through to `KimiParser.parse`
-    # and returned them -- the same request answered two ways.
+    # Kimi is included here though `_DETECT_ORDER` omits it. Its `parse` also
+    # defines "no tool calls at all", which is why it is not an entry in an
+    # ordering meant to tell formats apart -- but a K2 prompt does carry K2's
+    # section tokens, so on a prompt it is a real answer. Omitting it meant a
+    # K2 deployment resolved to nothing and delivered its tool calls as raw
+    # section tokens in `delta.content`.
     for parser in (*_DETECT_ORDER, KimiParser):
         if parser.detect(rendered_prompt):
             return parser
@@ -139,23 +134,24 @@ TOOL_CALL_PARSER_HELP = (
     "says so \u2014 the format is never guessed from output."
 )
 
-# The smallest request that makes a template render its tool instructions. The
-# tool is never called; only the framing the template wraps it in matters.
-_PROBE_MESSAGES = [{"role": "user", "content": "hi"}]
-_PROBE_TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "get_weather",
-            "description": "Get the weather in a city",
-            "parameters": {
-                "type": "object",
-                "properties": {"city": {"type": "string"}},
-                "required": ["city"],
-            },
-        },
-    }
-]
+
+def validate_tool_call_parser(override: str | None) -> type[ToolCallParser] | None:
+    """The format `override` names, or ``None`` for "read the template".
+
+    Separate from :func:`resolve_tool_call_parser` because the name can be
+    checked before a tokenizer exists, and therefore before the weights load:
+    atomesh resolved inside the service constructor, so a typo was reported
+    only after a full model load.
+    """
+    if not override or override == AUTO:
+        return None
+    parser = PARSERS_BY_NAME.get(override)
+    if parser is None:
+        raise ValueError(
+            f"--tool-call-parser={override!r} is not a known format; "
+            f"choose one of {sorted(PARSERS_BY_NAME)} or {AUTO!r}"
+        )
+    return parser
 
 
 def resolve_tool_call_parser(
@@ -180,25 +176,17 @@ def resolve_tool_call_parser(
     not accept — and a failure to render is reported and treated as
     unrecognised, never as a reason to fall back to reading the output.
     """
-    if override and override != AUTO:
-        parser = PARSERS_BY_NAME.get(override)
-        if parser is None:
-            raise ValueError(
-                f"--tool-call-parser={override!r} is not a known format; "
-                f"choose one of {sorted(PARSERS_BY_NAME)} or {AUTO!r}"
-            )
+    parser = validate_tool_call_parser(override)
+    if parser is not None:
         logger.info(f"Tool-call format: {parser.NAME} (from --tool-call-parser)")
         return parser
 
-    try:
-        rendered = apply_chat_template(
-            tokenizer, custom_encoder, _PROBE_MESSAGES, tools=_PROBE_TOOLS
-        )
-    except Exception as e:  # noqa: BLE001 - any template failure means "cannot tell"
+    rendered = render_probe_prompt(tokenizer, custom_encoder, tools=True)
+    if rendered is None:
         logger.warning(
             f"Could not render {model or 'the model'}'s chat template with a tools "
             f"payload, so its tool-call format is unknown and tool calls will be "
-            f"delivered as plain text: {e}. Pass --tool-call-parser to set it."
+            f"delivered as plain text. Pass --tool-call-parser to set it."
         )
         return None
 

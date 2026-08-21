@@ -13,7 +13,7 @@ this module contains no per-model conditions. Add a model there, not here.
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
-from .marker_scanner import partial_suffix_len
+from .marker_scanner import held_suffix_len
 from .reasoning_dialects import DIALECTS
 
 # Marker tables derived from the dialect registry (no model literals here).
@@ -31,7 +31,7 @@ _OUTPUT_OPEN_MARKERS = tuple(
 VALID_TEMPLATE_EFFORTS = frozenset().union(*(d.template_efforts for d in DIALECTS))
 
 
-def template_opens_reasoning_implicitly(rendered_template: str) -> bool:
+def template_opens_reasoning_implicitly(template_source: str) -> bool:
     """Does this model begin inside the reasoning channel with no marker at all?
 
     Some families close a reasoning block they never open: DeepSeek-R1 emits
@@ -44,6 +44,15 @@ def template_opens_reasoning_implicitly(rendered_template: str) -> bool:
     both (Qwen3) describes a model that opens its own, and one that mentions
     neither (MiniMax-M3, gpt-oss) has no reasoning channel to speak of.
 
+    ``template_source`` is the template's own text, which is the only place
+    this shows: an end marker is what the template does with a *reply*, so it
+    never reaches a fresh prompt. Measured -- Qwen3.5's source carries both
+    markers while its rendered prompt carries only the opener, and Qwen3-8B's
+    rendered prompt carries neither, so asking a render would answer False for
+    every model alive. Get it from `chat_encoders.chat_template_source`, which
+    also handles the two shapes that answer False by accident: a ``dict`` of
+    named templates, and the ``None`` of a model that ships a Python encoder.
+
     This is what vLLM expresses by registering `DeepSeekR1ReasoningParser` for
     R1 -- an override whose only job is to treat a stream with no start token
     as reasoning until `</think>`. Same fact, derived instead of listed.
@@ -52,8 +61,8 @@ def template_opens_reasoning_implicitly(rendered_template: str) -> bool:
         if not dialect.think_end_marker:
             continue
         opener = dialect.output_open_marker or dialect.prompt_open_marker
-        if dialect.think_end_marker in rendered_template and (
-            not opener or opener not in rendered_template
+        if dialect.think_end_marker in template_source and (
+            not opener or opener not in template_source
         ):
             return True
     return False
@@ -103,9 +112,12 @@ def _hold_back_len(buf: str, markers) -> int:
     marker, so a marker split across chunk boundaries isn't emitted as text.
 
     Delegates, because the tool-call path asks the same question and answering
-    it twice is how the two sides drifted apart.
+    it twice is how the two sides drifted apart. Delegating the *whole*
+    question and not just its inner loop also buys the first-character reject,
+    which this path had gone without: it runs once per token on every stream,
+    including the models with no reasoning channel at all.
     """
-    return max((partial_suffix_len(buf, m) for m in markers), default=0)
+    return held_suffix_len(buf, tuple(markers))
 
 
 def separate_reasoning(

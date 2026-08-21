@@ -46,7 +46,12 @@ from atom.utils.gc_utils import (
     tune_gc,
 )
 
-from .chat_encoders import apply_chat_template, load_custom_message_encoder
+from .chat_encoders import (
+    apply_chat_template,
+    chat_template_source,
+    load_custom_message_encoder,
+    resolve_reasoning_toggle,
+)
 from .metrics import AtomMetricsExporter
 from .protocol import (
     DEFAULT_TEMPERATURE,
@@ -116,6 +121,9 @@ tool_call_parser_cls: type | None = None
 # response cannot tell you: its first token is already reasoning and reads
 # like an answer.
 model_starts_in_reasoning: bool = False
+# (kwarg, off-value) the chat template reads to switch reasoning off, resolved
+# at startup by asking it; None when the template offers no such switch.
+reasoning_toggle: tuple[str, Any] | None = None
 processor: Any | None = None
 model_name: str = ""
 default_chat_template_kwargs: dict[str, Any] = {}
@@ -127,40 +135,81 @@ _request_logger: logging.Logger | None = None
 _stream_batch_dispatcher: StreamBatchDispatcher | None = None
 
 
-# The engine's `leave_reason` in Anthropic's vocabulary. `aborted` has no
-# counterpart -- the client is already gone -- so it keeps the default.
-def anthropic_reasoning_split(
-    raw_text: str, *, thinking: bool, starts_thinking: bool
-) -> tuple[str | None, str]:
-    """Separate the reasoning channel, or decline to.
+def anthropic_thinking_enabled(request: Any) -> bool:
+    """Did this request ask for a reasoning channel?
 
-    `thinking` off means the request wants no reasoning channel, so nothing
-    separates one out and the model's output is the text, markers and all.
-    The endpoint used to separate anyway and discard the reasoning half, which
-    returned an empty message for a reasoning model stopped at `max_tokens`;
-    putting the discarded half back as `text` would hand the client the one
-    thing it declined. Not looking is the only answer that does neither -- and
-    the only one with nothing held back, since no marker is being watched for.
+    `thinking` is absent on most requests and `{"type": "disabled"}` is the
+    spelling for switching it off, which is a non-empty dict and therefore
+    truthy -- so `bool(request.thinking)` read the standard off-switch as on.
     """
-    if not thinking:
-        return None, raw_text
-    return separate_reasoning(raw_text, starts_thinking=starts_thinking)
+    thinking = getattr(request, "thinking", None) or {}
+    return bool(thinking) and thinking.get("type") != "disabled"
 
 
-def anthropic_reasoning_filter(
-    *, thinking: bool, starts_thinking: bool
-) -> ReasoningFilter | None:
-    """The streaming half of :func:`anthropic_reasoning_split`'s rule."""
-    if not thinking:
-        return None
-    return ReasoningFilter(starts_thinking=starts_thinking)
+def anthropic_template_kwargs(request: Any, toggle: tuple[str, Any] | None) -> dict:
+    """How `thinking` reaches the model: by not asking it to think.
+
+    `thinking: disabled` is answered where the answer costs nothing -- in the
+    prompt. The chat template's own switch is set, so the model emits no
+    reasoning, so there is none to separate, none to discard, and none for the
+    tool parser to misread. This is what SGLang does with the same field and
+    what vLLM gets structurally by having no such field at all.
+
+    Everything downstream is then unconditional, which is the point. Three
+    attempts to handle an unwanted chain of thought *after* generating it each
+    broke something else: discarding it returned an empty message, relabelling
+    it as `text` handed the client the thing it declined, and declining to
+    separate it fed a chain of thought to the tool parser, which read one
+    model's musing about `<function=NAME>` as a call to a tool named `NAME`.
+    The reasoning that is never produced needs none of that.
+
+    Only when the field is actually present, which is also what SGLang keys
+    on. Anthropic's default is thinking-off, but reading an absent field as
+    "switch this model's reasoning off" would silently change what every
+    existing caller gets back from a reasoning model. Absent means unstated,
+    and unstated leaves the model's own default alone.
+
+    ``toggle`` is ``None`` for a model whose template has no switch. The
+    request is then honoured as far as it can be -- the reasoning is separated
+    and reported as a `thinking` block, never discarded -- and startup has
+    already said so.
+    """
+    if getattr(request, "thinking", None) is None:
+        return {}
+    if toggle is None or anthropic_thinking_enabled(request):
+        return {}
+    name, off_value = toggle
+    return {name: off_value}
 
 
+# The engine's `leave_reason` in Anthropic's vocabulary. The scheduler emits
+# exactly seven shapes; the three here line up by name, `stop_<token_id>` is
+# handled below, and `aborted` / `unschedulable: ...` / "" have no counterpart
+# in Anthropic's vocabulary and keep the default.
 _ANTHROPIC_STOP_REASON = {
     "eos": "end_turn",
     "max_tokens": "max_tokens",
     "stop_sequence": "stop_sequence",
 }
+
+
+def anthropic_stop_reason(finish_reason: Any) -> str:
+    """The engine's leave reason as Anthropic spells it.
+
+    Not routed through `_normalize_finish_reason`: that maps into OpenAI's
+    vocabulary (`stop` / `length`), which shares no member with the keys here,
+    so chaining them would send every reason to the default.
+
+    `stop_<token_id>` is its own case for the same reason it exists -- a stop
+    token fired, which is Anthropic's `stop_sequence`. Falling through would
+    have reported a normal ending for a response that was cut short.
+    """
+    reason = finish_reason or ""
+    if reason.startswith("stop_") and reason != "stop_sequence":
+        return "stop_sequence"
+    return _ANTHROPIC_STOP_REASON.get(reason, "end_turn")
+
+
 _metrics_exporter = AtomMetricsExporter()
 _metrics_refresh_task: asyncio.Task | None = None
 _METRICS_REFRESH_INTERVAL_SECONDS = 5.0
@@ -1272,7 +1321,16 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             merged_kwargs["tool_choice"] = request.tool_choice
         if request.thinking is not None or request.reasoning_effort is not None:
             _th_enabled, _th_effort = resolve_thinking(request)
-            merged_kwargs["thinking"] = _th_enabled
+            # By the name this template actually reads. `thinking` was
+            # hardcoded, which is right for Kimi-K3 and a silent no-op for the
+            # whole Qwen family, whose templates read `enable_thinking` --
+            # measured, `thinking=False` left the `<think>` prefill in place.
+            # A template ignores a kwarg it does not know, so the failure was
+            # invisible: the model reasoned anyway.
+            if not _th_enabled and reasoning_toggle is not None:
+                merged_kwargs[reasoning_toggle[0]] = reasoning_toggle[1]
+            elif _th_enabled:
+                merged_kwargs["thinking"] = True
             if _th_effort is not None:
                 merged_kwargs["thinking_effort"] = _th_effort
 
@@ -1628,6 +1686,10 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         messages = [ChatMessage(**m) for m in openai_messages]
 
         merged_kwargs = dict(default_chat_template_kwargs)
+        # The request's `thinking` was dropped on the floor here, so the model
+        # was never told not to think and the endpoint spent three attempts
+        # dealing with a chain of thought it had asked for by omission.
+        merged_kwargs.update(anthropic_template_kwargs(request, reasoning_toggle))
         prompt = apply_chat_template(
             tokenizer,
             custom_message_encoder,
@@ -1699,22 +1761,19 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
             async def generate_anthropic_stream():
                 from .tool_parser import ToolCallStreamParser
 
-                # Asked of every dialect, not of one literal: the K3
-                # template opens with `<|open|>think<|sep|>`, which
-                # `.endswith("<think>")` does not see, and the assignment it
-                # guarded skipped `__post_init__` so the instance was in the
-                # thinking state while claiming it did not start there.
-                # No filter at all when the client did not ask for thinking.
-                # It said it does not want a reasoning channel, so there is
-                # nothing to separate: the model's output is the text, markers
-                # and all. Separating it and then dropping the reasoning was
-                # how a reasoning model stopped at `max_tokens` returned an
-                # empty message, and putting the dropped part back as `text`
-                # would hand the client the very thing it declined.
+                # Unconditional, like the chat path and like both upstreams:
+                # whatever reasoning arrives is separated and reported. The
+                # request's `thinking` was answered in the prompt, so there is
+                # nothing left here for it to decide -- and separating always
+                # is what keeps the reasoning out of the tool parser, which is
+                # a second reader of this same text.
                 #
-                # Nothing is watched for, so nothing is held back either.
-                reasoning_filter = anthropic_reasoning_filter(
-                    thinking=bool(getattr(request, "thinking", None)),
+                # Asked of every dialect, not of one literal: the K3 template
+                # opens with `<|open|>think<|sep|>`, which `.endswith("<think>")`
+                # does not see, and the assignment it guarded skipped
+                # `__post_init__` so the instance was in the thinking state
+                # while claiming it did not start there.
+                reasoning_filter = ReasoningFilter(
                     starts_thinking=prompt_starts_in_reasoning(prompt)
                     or model_starts_in_reasoning,
                 )
@@ -1748,9 +1807,9 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                             )
                             message_started = True
                         new_text = chunk_data["text"]
-                        if not has_tool_calls:
-                            stop_reason = _ANTHROPIC_STOP_REASON.get(
-                                chunk_data.get("finish_reason"), stop_reason
+                        if not has_tool_calls and chunk_data.get("finish_reason"):
+                            stop_reason = anthropic_stop_reason(
+                                chunk_data["finish_reason"]
                             )
                         output_tokens += len(chunk_data.get("token_ids", []))
                         finished = chunk_data.get("finished", False)
@@ -1861,9 +1920,10 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
             raise RuntimeError("No output generated")
 
         raw_text = final_output["text"]
-        reasoning_content, content_with_tools = anthropic_reasoning_split(
+        # Unconditional, and the same call the chat path makes. See the
+        # streaming branch above for why `thinking` has no say here.
+        reasoning_content, content_with_tools = separate_reasoning(
             raw_text,
-            thinking=bool(getattr(request, "thinking", None)),
             starts_thinking=prompt_starts_in_reasoning(prompt)
             or model_starts_in_reasoning,
         )
@@ -1883,6 +1943,16 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             cache_read_input_tokens=cache_read_input_tokens,
+            # A tool call is its own ending; otherwise whatever the engine
+            # said. Omitting this left the parameter's `end_turn` default in
+            # place, so the same response cut off at `max_tokens` reported a
+            # normal ending with `stream=false` and `max_tokens` with
+            # `stream=true`.
+            stop_reason=(
+                "tool_use"
+                if tool_calls
+                else anthropic_stop_reason(final_output.get("finish_reason"))
+            ),
         )
 
     except _ClientDisconnected:
@@ -2035,7 +2105,7 @@ async def stop_profile():
 def main():
     """Main entry point for the server."""
     global engine, tokenizer, model_name, default_chat_template_kwargs, _request_logger
-    global tool_call_parser_cls, model_starts_in_reasoning
+    global tool_call_parser_cls, model_starts_in_reasoning, reasoning_toggle
     global custom_message_encoder, _stream_batch_dispatcher
 
     parser = FlexibleArgumentParser(description="ATOM OpenAI API Server")
@@ -2133,12 +2203,22 @@ def main():
     logger.info(f"Initializing engine with model {args.model}...")
     engine_args = EngineArgs.from_cli_args(args)
     model_starts_in_reasoning = template_opens_reasoning_implicitly(
-        getattr(tokenizer, "chat_template", None) or ""
+        chat_template_source(tokenizer, custom_message_encoder)
     )
     if model_starts_in_reasoning:
         logger.info(
             "Chat template closes a reasoning block it never opens; treating "
             "output as reasoning until the end marker."
+        )
+
+    reasoning_toggle = resolve_reasoning_toggle(tokenizer, custom_message_encoder)
+    if reasoning_toggle is not None:
+        logger.info(f"Reasoning is switched off with {reasoning_toggle[0]}=off.")
+    else:
+        logger.info(
+            "This chat template has no switch for reasoning, so a request "
+            "asking for none cannot stop the model producing it. Any that "
+            "arrives is still separated and reported, never discarded."
         )
 
     tool_call_parser_cls = resolve_tool_call_parser(

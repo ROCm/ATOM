@@ -126,7 +126,7 @@ class DsmlParser(BufferedMarkerParser):
         param_types = build_param_types(tools)
         start = cls.find_start(text)
         if start == -1:
-            return text.strip(), []
+            return text, []  # no call -> verbatim; see ToolCallParser.parse
         content = text[:start]
         region = text[start:]
 
@@ -183,4 +183,4 @@ class DsmlParser(BufferedMarkerParser):
         ]
         if _DSML in content:  # scrub any stray marker fragment
             content = content.split("<" + _DSML, 1)[0]
-        return content.strip(), tool_calls
+        return (content.strip() if tool_calls else text), tool_calls

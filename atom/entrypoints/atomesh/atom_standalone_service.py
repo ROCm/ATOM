@@ -21,6 +21,7 @@ from atom import SamplingParams
 from atom.entrypoints.openai.api_server import _build_sampling_params, _coerce_n
 from atom.entrypoints.openai.chat_encoders import (
     apply_chat_template,
+    chat_template_source,
     load_custom_message_encoder,
 )
 from atom.entrypoints.openai.protocol import (
@@ -926,7 +927,7 @@ class AtomStandaloneService:
         # once: the chat template says which format this model emits, and
         # deciding from the output instead means deciding from a prefix.
         self.model_starts_in_reasoning = template_opens_reasoning_implicitly(
-            getattr(tokenizer, "chat_template", None) or ""
+            chat_template_source(tokenizer, self.custom_message_encoder)
         )
         self.tool_parser_cls = resolve_tool_call_parser(
             tool_call_parser, tokenizer, self.custom_message_encoder, model=model_name

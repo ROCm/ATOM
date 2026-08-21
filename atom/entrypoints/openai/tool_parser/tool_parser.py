@@ -77,7 +77,23 @@ class ToolCallParser(ABC):
     @classmethod
     @abstractmethod
     def parse(cls, text: str, tools: list | None) -> tuple[str, list[ToolCall]]:
-        """Parse a complete output into ``(leading_content, tool_calls)``."""
+        """Parse a complete output into ``(leading_content, tool_calls)``.
+
+        **With no tool calls, the content must come back byte-for-byte.** This
+        is the one rule that keeps `stream=false` answering what `stream=true`
+        answers: the streaming path releases bytes as they arrive and has
+        nothing to trim them with, so any tidying done only here is a
+        divergence a client sees. A trailing `.strip()` cost a code-block
+        answer its final newline in exactly that way.
+
+        It binds the *no-call* case only. Trimming the content that precedes a
+        real call is a choice each format may keep, and normalising framing a
+        format wraps every answer in (Kimi-K3's channel tokens) is required
+        rather than forbidden -- the streaming path strips those too, so
+        leaving them would be the divergence. The test that enforces this
+        enumerates the registry, so a format added later is bound by it
+        without anyone remembering to add a case.
+        """
 
     # -- streaming ----------------------------------------------------------
     @abstractmethod

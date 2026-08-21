@@ -3,11 +3,14 @@
 
 """Tests for tool call parsing."""
 
+import pytest
+
 from atom.entrypoints.openai.tool_parser import (
     ToolCall,
     ToolCallStreamParser,
     parse_tool_calls,
 )
+from atom.entrypoints.openai.tool_parser.glm_tool_parser import GlmParser
 from atom.entrypoints.openai.tool_parser.kimi_k3_tool_parser import KimiK3Parser
 from atom.entrypoints.openai.tool_parser.kimi_tool_parser import KimiParser
 
@@ -26,7 +29,7 @@ class TestParseToolCalls:
             '<|tool_call_begin|>functions.exec:0<|tool_call_argument_begin|>{"command": "ls"}<|tool_call_end|>'
             "<|tool_calls_section_end|>"
         )
-        content, tool_calls = parse_tool_calls(text)
+        content, tool_calls = parse_tool_calls(text, parser_cls=KimiParser)
         assert content == "I'll run that."
         assert len(tool_calls) == 1
         assert tool_calls[0].function["name"] == "exec"
@@ -41,7 +44,7 @@ class TestParseToolCalls:
             '<|tool_call_begin|>functions.fetch:1<|tool_call_argument_begin|>{"url": "http://example.com"}<|tool_call_end|>'
             "<|tool_calls_section_end|>"
         )
-        content, tool_calls = parse_tool_calls(text)
+        content, tool_calls = parse_tool_calls(text, parser_cls=KimiParser)
         assert content == "Let me search."
         assert len(tool_calls) == 2
         assert tool_calls[0].function["name"] == "search"
@@ -49,7 +52,7 @@ class TestParseToolCalls:
 
     def test_no_tool_calls(self):
         text = "Just a regular response."
-        content, tool_calls = parse_tool_calls(text)
+        content, tool_calls = parse_tool_calls(text, parser_cls=KimiParser)
         assert content == "Just a regular response."
         assert len(tool_calls) == 0
 
@@ -59,7 +62,7 @@ class TestParseToolCalls:
             '<|tool_call_begin|>functions.run:0<|tool_call_argument_begin|>{"cmd": "echo hi"}<|tool_call_end|>'
             "<|tool_calls_section_end|>"
         )
-        content, tool_calls = parse_tool_calls(text)
+        content, tool_calls = parse_tool_calls(text, parser_cls=KimiParser)
         assert content == ""
         assert len(tool_calls) == 1
 
@@ -69,7 +72,7 @@ class TestParseToolCalls:
             "<|tool_calls_section_begin|>"
             '<|tool_call_begin|>functions.exec:0<|tool_call_argument_begin|>{"cmd": "ls"}<|tool_call_end|>'
         )
-        content, tool_calls = parse_tool_calls(text)
+        content, tool_calls = parse_tool_calls(text, parser_cls=KimiParser)
         assert content == "Here:"
         assert len(tool_calls) == 1
 
@@ -93,7 +96,7 @@ class TestParseToolCalls:
             "<|tool_call_end|>"
             "<|tool_calls_section_end|>"
         )
-        content, tool_calls = parse_tool_calls(text)
+        content, tool_calls = parse_tool_calls(text, parser_cls=KimiParser)
         assert content == "I'll fetch that URL for you."
         assert len(tool_calls) == 1
         assert tool_calls[0].function["name"] == "curl"
@@ -112,7 +115,7 @@ class TestParseToolCalls:
             f"<|tool_call_begin|>functions.chat:0<|tool_call_argument_begin|>{args}<|tool_call_end|>"
             "<|tool_calls_section_end|>"
         )
-        content, tool_calls = parse_tool_calls(text)
+        content, tool_calls = parse_tool_calls(text, parser_cls=KimiParser)
         assert len(tool_calls) == 1
         assert tool_calls[0].function["arguments"] == args
 
@@ -251,3 +254,83 @@ class TestAParserOnItsOwnDoesNotEatText:
         content, calls = KimiK3Parser.parse(text, None)
         assert calls == []
         assert "Nothing follows." in content
+
+
+# ============================================================================
+# What counts as a tool name
+# ============================================================================
+
+
+class TestOnlyAnIdentifierIsAToolName:
+    """GLM's unterminated branch takes everything after `<tool_call>` as the
+    name, so the name check is the only thing between prose and a fabricated
+    call. It has to reject prose without rejecting names models really use.
+    """
+
+    def _call(self, name):
+        text = (
+            f"<tool_call>{name}"
+            "<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>"
+        )
+        return GlmParser.parse(text, None)[1]
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "get_weather",
+            "7z_extract",  # OpenAI's grammar allows a leading digit
+            "天气查询",  # and nothing forbids a CJK name on a Chinese family
+            "read-file",
+            "fs.read",
+            "x",
+        ],
+    )
+    def test_a_legal_name_is_accepted(self, name):
+        calls = self._call(name)
+        assert [c.function["name"] for c in calls] == [name]
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            " followed by the name. Hope that helps!",
+            '{"name": "get_weather", "arguments": {}}',  # Hermes-style JSON
+            "two words",
+        ],
+    )
+    def test_prose_is_not_a_name(self, name):
+        assert self._call(name) == []
+
+
+class TestATruncatedCallIsNotContent:
+    """A call cut off by `max_tokens` parses to nothing, and "nothing parsed"
+    was the test for whether a section had opened -- so the half-written
+    payload was kept and shipped as the answer.
+    """
+
+    TRUNCATED = (
+        "I will look it up."
+        '<|open|>tools<|sep|><|open|>call tool="get_weather"'
+        '<|open|>argument name="city"<|sep|>Paris<|close|>argument'
+    )
+
+    def test_the_partial_payload_does_not_reach_the_client(self):
+        content, calls = KimiK3Parser.parse(self.TRUNCATED, None)
+        assert calls == []
+        assert content == "I will look it up."
+
+    def test_an_answer_that_only_names_the_token_still_keeps_its_tail(self):
+        """The case the gate was added for, which must keep working."""
+        text = "the token <|open|>tools<|sep|> opens a section. Nothing follows."
+        content, calls = KimiK3Parser.parse(text, None)
+        assert calls == [] and "Nothing follows." in content
+
+    def test_a_complete_call_still_truncates_there(self):
+        text = (
+            "Looking._"
+            '<|open|>tools<|sep|><|open|>call tool="get_weather"<|sep|>'
+            '<|open|>argument key="city"<|sep|>Paris<|close|>argument'
+            "<|close|>call"
+        )
+        content, calls = KimiK3Parser.parse(text, None)
+        assert [c.function["name"] for c in calls] == ["get_weather"]
+        assert content == "Looking._"

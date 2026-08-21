@@ -17,7 +17,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from atom.entrypoints.openai.tool_parser.registry import TOOL_CALL_PARSER_HELP
+from atom.entrypoints.openai.tool_parser.registry import (
+    TOOL_CALL_PARSER_HELP,
+    validate_tool_call_parser,
+)
 from atom.utils.gc_utils import (
     freeze_gc_heap,
     maybe_attach_gc_debug_callback,
@@ -140,6 +143,20 @@ def split_standalone_mesh_args(raw_args: list[str]) -> tuple[list[str], list[str
     return python_args, mesh_args
 
 
+def _forward_tool_call_parser(value: str | None) -> list[str]:
+    """Give the mesh router back the flag the Python parser just consumed.
+
+    `--tool-call-parser` has two consumers with two vocabularies: the Rust
+    router declares its own (`cliargs.rs`, sglang spelling) and reads it in
+    `app_context`, and the Python service resolves it to a `ToolCallParser`.
+    Until this entrypoint registered the flag it reached the router as an
+    unrecognised arg and was passed straight through; registering it made
+    `parse_known_args` swallow it, so the router silently lost a setting that
+    had been reaching it. Both need it, so both get it.
+    """
+    return [] if value is None else ["--tool-call-parser", value]
+
+
 def json_object_arg(raw_value: str) -> dict[str, Any]:
     try:
         parsed = json.loads(raw_value)
@@ -166,7 +183,9 @@ def parse_standalone_args(raw_args: list[str]) -> StandaloneArgs:
     parser.add_argument(
         "--tool-call-parser",
         type=str,
-        default="auto",
+        # Not "auto": that is what *unset* resolves to anyway, and telling the
+        # two apart is what decides whether the mesh router is told as well.
+        default=None,
         help=TOOL_CALL_PARSER_HELP,
     )
     parser.add_argument(
@@ -182,9 +201,18 @@ def parse_standalone_args(raw_args: list[str]) -> StandaloneArgs:
     python_raw_args, mesh_network_args = split_standalone_mesh_args(raw_args)
     engine_args, mesh_args = parser.parse_known_args(python_raw_args)
 
+    # Before the engine loads, not after. `AtomStandaloneService.__init__`
+    # raises on an unknown name, and it is constructed once the weights are
+    # already in memory -- so a typo cost a full model load before saying so.
+    validate_tool_call_parser(engine_args.tool_call_parser)
+
     return StandaloneArgs(
         engine_args=engine_args,
-        mesh_args=mesh_args + mesh_network_args,
+        mesh_args=(
+            mesh_args
+            + mesh_network_args
+            + _forward_tool_call_parser(engine_args.tool_call_parser)
+        ),
         default_chat_template_kwargs=engine_args.default_chat_template_kwargs or {},
     )
 

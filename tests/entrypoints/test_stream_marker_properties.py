@@ -494,6 +494,58 @@ class TestNothingIsHeldPastTheEnd:
             )
 
 
+class TestNonStreamingAgreesWithStreaming:
+    """An answer with no tool call comes back the same on both paths.
+
+    The non-streaming path runs the format's `parse`; the streaming path
+    releases bytes as they arrive and owns nothing to tidy them with. So any
+    tidying `parse` does to an answer it found no call in is a difference the
+    client sees between `stream=true` and `stream=false` -- and every format
+    did some, `.strip()`, which cost a code-block answer its trailing newline.
+
+    Generated from the registry rather than listed, so the rule binds a format
+    added later without anyone remembering to add a case. It is stated on
+    `ToolCallParser.parse`, and this is what holds formats to it.
+    """
+
+    @pytest.mark.parametrize("dialect, parser, text", HOLD_PAIRS)
+    def test_the_two_paths_deliver_the_same_text(self, dialect, parser, text):
+        non_streaming, calls = parser.parse(text, None)
+        if calls:
+            pytest.skip("this shape parsed a call; the rule binds the no-call case")
+        streamed = drive(text, split_every_way(text)["fixed-3"], parser)
+        assert streamed.content == non_streaming, (
+            f"{parser.NAME} answers the same request two ways\n"
+            f"  stream=false {non_streaming[-60:]!r}\n"
+            f"  stream=true  {streamed.content[-60:]!r}"
+        )
+
+    @pytest.mark.parametrize("dialect, parser, text", HOLD_PAIRS)
+    def test_no_call_means_nothing_but_this_format_s_own_framing_goes(
+        self, dialect, parser, text
+    ):
+        """Agreement is necessary but not sufficient: both could delete it.
+
+        What may be removed is a marker this format declares. Everything else
+        -- in particular whitespace, which is what every format's trailing
+        `.strip()` took -- has to survive.
+        """
+        content, calls = parser.parse(text, None)
+        if calls:
+            pytest.skip("this shape parsed a call; the rule binds the no-call case")
+        rebuilt = content
+        for marker in parser.START_MARKERS:
+            rebuilt = rebuilt.replace(marker, "")
+        expected = text
+        for marker in parser.START_MARKERS:
+            expected = expected.replace(marker, "")
+        assert rebuilt == expected, (
+            f"{parser.NAME} removed something that was not one of its markers\n"
+            f"  in  {expected[-60:]!r}\n"
+            f"  out {rebuilt[-60:]!r}"
+        )
+
+
 class TestBoundedWithhold:
     """Text must not be held back longer than a marker could justify."""
 

@@ -18,6 +18,7 @@ from atom.entrypoints.openai.serving_chat import (
     stream_chat_response_fanout,
 )
 from atom.entrypoints.openai.streaming_dispatch import StreamOutputCollector
+from atom.entrypoints.openai.tool_parser.kimi_tool_parser import KimiParser
 
 # ============================================================================
 # normalize_chat_tools Tests
@@ -178,7 +179,12 @@ class TestBuildChatResponse:
             "<|tool_calls_section_end|>"
         )
         output = self._make_output(text=raw)
-        resp = build_chat_response("req-1", "model", raw, output)
+        # The format is the one resolved at startup, so it has to be passed.
+        # Leaving it off used to reach a cascade over the *output*, which is
+        # how an answer quoting these tokens got its text deleted.
+        resp = build_chat_response(
+            "req-1", "model", raw, output, tool_parser_cls=KimiParser
+        )
         assert resp.choices[0]["message"]["content"] == "Hi"
         assert "tool_calls" in resp.choices[0]["message"]
         tc = resp.choices[0]["message"]["tool_calls"][0]

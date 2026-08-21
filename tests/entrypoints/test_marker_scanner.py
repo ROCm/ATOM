@@ -12,12 +12,14 @@ on the inputs someone thought of".
 from __future__ import annotations
 
 import random
+from typing import ClassVar
 
 import pytest
 
 from atom.entrypoints.openai.marker_scanner import (
     MarkerScanner,
     Scan,
+    held_suffix_len,
     partial_suffix_len,
 )
 
@@ -172,3 +174,50 @@ class TestConstruction:
         a = MarkerScanner(TOOL).feed("x<tool_call>y")
         b = MarkerScanner(TOOL + ("<tool_call>",)).feed("x<tool_call>y")
         assert a == b == Scan("x", "<tool_call>", "y")
+
+
+class TestThePrecomputedPlanChangesNothing:
+    """The suffix sweep was rewritten for speed; speed is not the assertion.
+
+    It used to re-slice every marker at every length (`partial_suffix_len` per
+    marker); it now indexes precomputed prefixes by length and rejects most
+    lengths on the first character. `partial_suffix_len` is kept and is the
+    oracle here -- an optimisation of a rule needs the rule to compare against,
+    not a hand-written table of what the optimisation happens to do.
+    """
+
+    ALPHABET = '<|>abctoolcalfunin/_="s '
+    MARKER_SETS: ClassVar[list] = [
+        ("<tool_call>",),
+        ("<think>", "<thinking>", "</think>"),
+        ('<|open|>call tool="', "<|open|>tools<|sep|>", "<|end_of_msg|>"),
+        ("<tool_call>", "<function="),
+        ("a",),
+        ("ab", "abc", "b"),
+    ]
+
+    @pytest.mark.parametrize("markers", MARKER_SETS, ids=lambda m: f"{len(m)}-markers")
+    def test_it_agrees_with_the_one_marker_form_everywhere(self, markers):
+        rng = random.Random(0)
+        scanner = MarkerScanner(markers)
+        for _ in range(3000):
+            buf = "".join(rng.choice(self.ALPHABET) for _ in range(rng.randint(0, 16)))
+            oracle = max(partial_suffix_len(buf, m) for m in scanner._markers)
+            assert scanner._held_suffix_len(buf) == oracle, buf
+
+    @pytest.mark.parametrize("markers", MARKER_SETS, ids=lambda m: f"{len(m)}-markers")
+    def test_the_stateless_form_agrees_too(self, markers):
+        """`reasoning` owns its buffer and asks the same question."""
+        rng = random.Random(1)
+        for _ in range(2000):
+            buf = "".join(rng.choice(self.ALPHABET) for _ in range(rng.randint(0, 16)))
+            oracle = max(partial_suffix_len(buf, m) for m in markers)
+            assert held_suffix_len(buf, markers) == oracle, buf
+
+    def test_the_plan_is_shared_between_scanners(self):
+        """It is cached on the marker set: a scanner is built per request and
+        the sets are class constants, so building it per scanner cost 8.7 us
+        of setup to save 4.5 us per chunk."""
+        a = MarkerScanner(("<tool_call>", "<function="))
+        b = MarkerScanner(("<function=", "<tool_call>"))
+        assert a._prefixes_by_len is b._prefixes_by_len

@@ -74,4 +74,9 @@ class MiniMaxParser(BufferedMarkerParser):
             )
         for mk in ("<tool_call>", "</tool_call>"):
             content = content.replace(mk, "")
-        return content.strip(), tool_calls
+        # No call -> verbatim; see ToolCallParser.parse. `text` and not
+        # `clean`: the ns_token is a start marker, so an answer that merely
+        # mentions it opens a region that parses to nothing, and the streaming
+        # path then releases that region unchanged -- measured, ns_token and
+        # all. Returning `clean` here would delete it on one path only.
+        return (content.strip() if tool_calls else text), tool_calls

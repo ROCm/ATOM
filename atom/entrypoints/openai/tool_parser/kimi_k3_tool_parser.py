@@ -82,7 +82,15 @@ def _k3_coerce(val: str, ptype: str | None):
 
 
 def _strip_k3_framing(text: str) -> str:
-    return _K3_FRAMING_RE.sub("", text).strip()
+    """Remove the channel tokens, and nothing else.
+
+    No `.strip()`. Removing framing is this format's own normalization and
+    both paths do it; trimming whitespace is position-dependent and so cannot
+    agree between them -- streaming applies it to the region after a marker
+    and non-streaming to the whole answer, which turned `writes <tok> to` into
+    `writes to` on one path and `writes  to` on the other.
+    """
+    return _K3_FRAMING_RE.sub("", text)
 
 
 class KimiK3Parser(ToolCallParser):
@@ -126,12 +134,19 @@ class KimiK3Parser(ToolCallParser):
                     },
                 )
             )
-        # Truncated at the tools marker only when the section really held a
-        # call. An answer that merely names the token opened no section, and
-        # cutting there dropped everything after it.
+        # Truncated at the tools marker only when a section really opened
+        # there. An answer that merely names the token opened none, and
+        # cutting at it dropped everything after.
+        #
+        # "A call parsed" is the wrong test for that, and was: a call cut off
+        # by `max_tokens` parses to nothing, so the half-written payload was
+        # kept and shipped as content -- `_K3_FRAMING_RE` has no alternative
+        # for the dangling `<|close|>argument`, so it survived too. What
+        # separates the two cases is a call *prefix* after the marker, which
+        # a truncated call still has and a mention of the token does not.
         ts = text.find(KIMI_K3_TOOLS_START)
-        keep = text if (ts == -1 or not tool_calls) else text[:ts]
-        return _strip_k3_framing(keep), tool_calls
+        opened = ts != -1 and KIMI_K3_CALL_PREFIX in text[ts:]
+        return _strip_k3_framing(text[:ts] if opened else text), tool_calls
 
     def process(self, text: str) -> list:
         # Buffer everything; K3's interleaved framing is parsed once at flush.

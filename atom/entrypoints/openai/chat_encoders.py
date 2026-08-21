@@ -12,11 +12,13 @@ when one was found, or to ``tokenizer.apply_chat_template`` otherwise.
 
 import glob
 import importlib.util
+import inspect
 import logging
 import os
 from typing import Any
 
 from huggingface_hub import snapshot_download
+from jinja2 import TemplateError
 
 from .chat_encoder_adapters import (
     MessageEncoderAdapter,
@@ -86,6 +88,161 @@ def load_custom_message_encoder(model_path: str) -> MessageEncoderAdapter | None
     filesystem IO and a Python import.
     """
     return _load_encoder_from_dir(_resolve_model_path(model_path))
+
+
+# The smallest request that makes a template show its framing. Nothing is
+# ever sent to the model; only what the template wraps a turn in matters.
+PROBE_MESSAGES: list[dict] = [{"role": "user", "content": "hi"}]
+PROBE_TOOLS: list[dict] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the weather in a city",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        },
+    }
+]
+
+
+def chat_template_source(
+    tokenizer: Any, custom_encoder: MessageEncoderAdapter | None = None
+) -> str:
+    """The model's chat template as text to search, or ``""`` if it ships none.
+
+    Deliberately not a rendered prompt, and the two are not interchangeable:
+    a marker that appears only in the template's own logic is absent from a
+    fresh prompt. Measured on this box -- Qwen3.5's source carries `<think>`
+    and `</think>`, its rendered prompt carries only `<think>`, and
+    Qwen3-8B's rendered prompt carries neither. A question about what the
+    template *does with a reply* has to read the source; a question about what
+    the prompt *tells the model* has to read the render
+    (:func:`render_probe_prompt`).
+
+    Two shapes bite anyone reaching for the raw attribute, which is why this
+    exists rather than `getattr(tokenizer, "chat_template", "")`:
+    multi-template tokenizers hold a ``dict``, and `"</think>" in <dict>`
+    silently tests the *keys*; and it is ``None`` for every model that ships a
+    Python encoder instead of Jinja (Kimi-K3, DeepSeek-V4), whose literals
+    live in that module's source instead.
+    """
+    template = getattr(tokenizer, "chat_template", None)
+    if isinstance(template, str):
+        return template
+    if isinstance(template, dict):
+        # Every named variant, so a marker in any of them counts. Searching
+        # the dict itself would have searched the names.
+        return "\n".join(str(v) for v in template.values())
+    if custom_encoder is not None:
+        try:
+            return inspect.getsource(inspect.getmodule(custom_encoder.encode))
+        except (OSError, TypeError) as e:
+            logger.warning(
+                "Could not read the source of message encoder %s: %s",
+                custom_encoder.name,
+                e,
+            )
+    return ""
+
+
+# (kwarg, value) pairs that switch reasoning off, tried in order. Every family
+# on this box is covered: Qwen reads `enable_thinking`, Kimi-K3 `thinking`, and
+# `thinking_mode` is read by two families with disjoint vocabularies --
+# MiniMax-M3 wants "disabled" and DeepSeek-V4's encoder asserts on anything
+# outside {"chat", "thinking"}. Hence pairs rather than one value per name, and
+# hence the order: "disabled" first, so MiniMax matches before V4's rejection
+# of it sends the probe on to "chat".
+REASONING_OFF_KWARGS: tuple[tuple[str, Any], ...] = (
+    ("enable_thinking", False),
+    ("thinking", False),
+    ("thinking_mode", "disabled"),
+    ("thinking_mode", "chat"),
+)
+
+# A template refusing a probe value, by name. A model-shipped Python encoder
+# validates with a bare `assert`; Jinja raises its own; a signature that does
+# not take the kwarg raises TypeError. Refusal means "not this pair, try the
+# next" -- anything else is a bug and is left to propagate.
+_PROBE_REFUSALS = (TemplateError, TypeError, ValueError, AssertionError)
+
+
+def resolve_reasoning_toggle(
+    tokenizer: Any, custom_encoder: MessageEncoderAdapter | None = None
+) -> tuple[str, Any] | None:
+    """The kwarg that turns this model's reasoning off, and the value, or None.
+
+    Rendered twice and compared, rather than matched against a table of model
+    families: a Jinja template silently ignores a kwarg it does not read, so
+    "the prompt changed" *is* the evidence that it read this one. That silence
+    is also why the question has to be asked at all -- the chat path passed a
+    hardcoded ``thinking=`` to every model, which is correct for Kimi-K3 and a
+    no-op for the entire Qwen family, whose templates read `enable_thinking`.
+    A no-op here is invisible: the model reasons anyway and the client that
+    asked for no reasoning simply pays for it.
+
+    ``None`` means the template offers no switch, and for a model that begins
+    inside the reasoning channel that means reasoning cannot be turned off at
+    all -- worth saying out loud at startup, because the request can then only
+    be honoured as far as separating the reasoning and reporting it, never by
+    discarding it. On this box only gpt-oss and DeepSeek-R1 answer ``None``,
+    and neither opens a channel this way to begin with.
+
+    Verified against every model on this box: Qwen3/Qwen3.5 `enable_thinking`,
+    Kimi-K3 `thinking`, MiniMax-M3 `thinking_mode="disabled"`, DeepSeek-V4
+    `thinking_mode="chat"` -- and for all six that start inside the channel,
+    applying the pair takes the rendered prompt back out of it.
+    """
+    baseline = render_probe_prompt(tokenizer, custom_encoder, tools=False)
+    if baseline is None:
+        return None
+    for name, off_value in REASONING_OFF_KWARGS:
+        try:
+            rendered = apply_chat_template(
+                tokenizer, custom_encoder, PROBE_MESSAGES, **{name: off_value}
+            )
+        except _PROBE_REFUSALS:
+            continue
+        if rendered != baseline:
+            return name, off_value
+    return None
+
+
+def render_probe_prompt(
+    tokenizer: Any,
+    custom_encoder: MessageEncoderAdapter | None,
+    *,
+    tools: bool,
+) -> str | None:
+    """Render a throwaway turn, to ask the template about itself at startup.
+
+    What a template renders *into the prompt* is the model's own instructions
+    -- notably how to call a tool -- so a question about those is asked here
+    and not of the template source. The reverse question reads the source
+    instead; see :func:`chat_template_source` for why one is not a cheaper
+    version of the other.
+
+    ``None`` means the template refused the probe, which is a real answer and
+    the only one that is caught: a template may reject the synthetic tools
+    payload, and a model that does not do tool calls should still start.
+    `TemplateError` is that refusal by name and `TypeError` is a signature
+    that does not take ``tools``. Nothing else is caught -- an unexpected
+    failure here is a bug, and a bug that silently turns into "this model has
+    no tool-call format" is the class of silence this path exists to end.
+    """
+    try:
+        return apply_chat_template(
+            tokenizer,
+            custom_encoder,
+            PROBE_MESSAGES,
+            tools=PROBE_TOOLS if tools else None,
+        )
+    except (TemplateError, TypeError) as e:
+        logger.warning("The model's chat template refused the probe: %s", e)
+        return None
 
 
 def apply_chat_template(

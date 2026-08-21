@@ -89,4 +89,5 @@ class QwenXmlParser(BufferedMarkerParser):
             tc = _parse_function(fn_text, param_types)
             if tc is not None:
                 tool_calls.append(tc)
-        return content.strip(), tool_calls
+        # No call -> verbatim; see ToolCallParser.parse.
+        return (content.strip() if tool_calls else text), tool_calls
