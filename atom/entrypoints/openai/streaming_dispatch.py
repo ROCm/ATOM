@@ -143,33 +143,36 @@ class FrameWait:
     returning on schedule. The gauge read zero while the client received
     nothing, which is the exact symptom it was built for.
 
-    Wrapping the yield also removes the other blind spot. The old shape had to
-    ignore a stream's first wait, because at `get` that wait is admission and
-    prefill and would have made the gauge a queue-depth proxy that
-    `atom:requests_waiting` already is. Out here the first frame goes out as
-    soon as the response opens, so every wait after it is real silence and
-    none of them need excluding.
+    The first frame still has to be excluded, and the docstring here once
+    claimed otherwise. Every response generator awaits the collector before
+    yielding anything, so the wait for frame one is admission, queueing and
+    prefill -- measured, a request 200 ms into a queue with no token yet
+    produced put 0.2 s on the gauge, which is `atom:requests_waiting` wearing
+    a different name, and at a deep queue would log a line per admitted
+    request blaming the read-ahead. `armed` is off for that one wait.
 
     A timestamp and a dict entry rather than `asyncio.wait_for`: this runs
     once per frame per stream, and arming a timer costs 1.38 us against
     0.07 us for this. No timer also means no background task to own.
     """
 
-    __slots__ = ("_started", "request_id")
+    __slots__ = ("_started", "armed", "request_id")
 
-    def __init__(self, request_id: str = "") -> None:
+    def __init__(self, request_id: str = "", *, armed: bool = True) -> None:
         self.request_id = request_id
+        self.armed = armed
         self._started = 0.0
 
     def __enter__(self) -> None:
         # No `as`: nothing needs the watch itself, only its lifetime.
         self._started = time.monotonic()
-        _WAITING_SINCE[id(self)] = self._started
+        if self.armed:
+            _WAITING_SINCE[id(self)] = self._started
 
     def __exit__(self, *exc) -> None:
         _WAITING_SINCE.pop(id(self), None)
         silence = time.monotonic() - self._started
-        if silence >= SILENCE_LOG_SECONDS:
+        if self.armed and silence >= SILENCE_LOG_SECONDS:
             # After the fact, and free: one comparison on a frame that was
             # going to arrive anyway. Catches a stall that recovered, which
             # the gauge cannot -- by scrape time it is over.

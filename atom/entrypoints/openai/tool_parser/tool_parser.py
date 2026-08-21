@@ -19,6 +19,12 @@ from typing import Any, ClassVar
 from ..marker_scanner import MarkerScanner
 from .schema import build_param_types
 
+# How far into a region a name may be before the peek gives up. Every
+# format on this box puts it in the first 30-70 characters; the margin is
+# for a long name or leading whitespace, and the bound is what keeps the
+# peek from re-scanning a growing buffer once per token.
+_PEEK_WINDOW = 256
+
 
 def unique_tool_call_id() -> str:
     # OpenAI tool_call ids must be unique across the whole conversation, not just
@@ -98,6 +104,11 @@ class ToolCallParser(ABC):
         # The name already sent for the call being buffered, if any; cleared
         # when that call's arguments go out. See `announce`.
         self._announced: str | None = None
+        # Set once no name can still turn up, so the peek stops running
+        # per token over a region that will never yield one.
+        self._peek_exhausted = False
+        # The request's declared names, built once rather than per token.
+        self._declared: frozenset[str] | None = None
 
     @property
     def _scanner(self) -> MarkerScanner:
@@ -160,11 +171,25 @@ class ToolCallParser(ABC):
 
         SGLang's cursor parsers announce with no such check and will emit a
         call named after whatever follows the tag.
+
+        Asked of a bounded prefix and asked at most once more after that. The
+        first version ran the format's regex over the whole region on every
+        chunk, which is quadratic in the response and measured 3.0 -> 9.8 ->
+        36 -> 137 ms across 2k/4k/8k/16k tokens -- the shape `marker_scanner`
+        exists to retire, put back one layer up. A name that is not in the
+        first `_PEEK_WINDOW` bytes is not going to appear later either, so a
+        region that reaches that length without one stops being asked.
         """
-        if self._announced is not None or not self.tools:
+        if self._announced is not None or self._peek_exhausted or not self.tools:
             return []
-        name = self.peek_name(region)
-        if name is None or name not in build_param_types(self.tools):
+        name = self.peek_name(region[:_PEEK_WINDOW])
+        if name is None:
+            self._peek_exhausted = len(region) >= _PEEK_WINDOW
+            return []
+        if self._declared is None:
+            self._declared = frozenset(build_param_types(self.tools))
+        if name not in self._declared:
+            self._peek_exhausted = True
             return []
         self._announced = name
         return [

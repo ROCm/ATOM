@@ -45,15 +45,19 @@ async def frames(source, request_id: str = "req"):
 
     Kept here rather than importing the endpoint's copy: that one also does
     request logging and lives in a module that pulls in the engine. What is
-    under test is the timing, and this is the timing verbatim.
+    under test is the timing, and this is the timing verbatim -- including
+    `armed`, without which every scenario below would pass while the endpoint
+    timed the queue.
     """
     it = source.__aiter__()
+    delivered = False
     while True:
-        with FrameWait(request_id):
+        with FrameWait(request_id, armed=delivered):
             try:
                 chunk = await it.__anext__()
             except StopAsyncIteration:
                 return
+        delivered = True
         yield chunk
 
 
@@ -268,8 +272,8 @@ class TestTheEndpointUsesIt:
         from atom.entrypoints.openai import api_server
 
         src = inspect.getsource(api_server._client_stream)
-        assert "with FrameWait(request_id):" in src
-        body = src.split("with FrameWait(request_id):", 1)[1]
+        assert "with FrameWait(request_id" in src
+        body = src.split("with FrameWait(request_id", 1)[1]
         assert (
             "__anext__()" in body.split("yield")[0]
         ), "the watch does not cover the await that produces the next frame"
@@ -283,3 +287,97 @@ class TestTheEndpointUsesIt:
 
         src = pathlib.Path(api_server.__file__).read_text()
         assert "_logged_stream(" not in src
+
+
+class TestQueueingIsNotSilence:
+    """The wait for the *first* frame is admission, queueing and prefill.
+
+    Every response generator awaits the collector before yielding anything, so
+    timing that wait puts queue depth on the gauge -- which
+    `atom:requests_waiting` already reports -- and, past the threshold, logs a
+    line per admitted request blaming the marker read-ahead. Moving the watch
+    out to the frame did not remove this by itself; the docstring said it did.
+    """
+
+    def test_a_queued_request_reads_as_no_silence(self):
+        gate = asyncio.Event()
+
+        async def slow_to_start():
+            await gate.wait()  # admission + prefill
+            yield "data: first\n\n"
+
+        async def scenario():
+            out = frames(slow_to_start())
+            task = asyncio.create_task(out.__anext__())
+            await _let_the_loop_run()
+            await asyncio.sleep(0.02)
+            queued = longest_silence_seconds()
+            gate.set()
+            await task
+            return queued
+
+        assert asyncio.run(scenario()) == 0.0
+
+    def test_a_slow_first_frame_is_not_logged_however_long(self, caplog, monkeypatch):
+        monkeypatch.setattr(sd, "SILENCE_LOG_SECONDS", 0.01)
+
+        async def slow_to_start():
+            await asyncio.sleep(0.03)
+            yield "data: first\n\n"
+
+        async def scenario():
+            out = frames(slow_to_start(), "queued-req")
+            await out.__anext__()
+
+        with caplog.at_level(logging.WARNING, logger="atom"):
+            asyncio.run(scenario())
+        assert not [r for r in caplog.records if "sent the client" in r.message]
+
+    def test_the_gap_after_the_first_frame_is_still_seen(self):
+        """The other half: disarming one wait must not disarm the rest."""
+        gate = asyncio.Event()
+
+        async def stalls_after_one():
+            yield "data: first\n\n"
+            await gate.wait()
+            yield "data: second\n\n"
+
+        async def scenario():
+            out = frames(stalls_after_one())
+            await out.__anext__()
+            task = asyncio.create_task(out.__anext__())
+            await _let_the_loop_run()
+            await asyncio.sleep(0.02)
+            seen = longest_silence_seconds()
+            gate.set()
+            await task
+            return seen
+
+        assert asyncio.run(scenario()) >= 0.02
+
+    def test_the_endpoint_disarms_the_first_wait(self):
+        """Its body is unreachable from a unit test; this reads the source.
+
+        By AST, and for the *shape*: `armed` must be a variable, not a
+        constant. `assert "armed=" in src` passed with `armed=True`, which is
+        the bug -- and the harness above is a local copy of this loop, so
+        mutating the endpoint could not reach it either.
+        """
+        import ast
+        import inspect
+        import textwrap
+
+        from atom.entrypoints.openai import api_server
+
+        tree = ast.parse(textwrap.dedent(inspect.getsource(api_server._client_stream)))
+        waits = [
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "FrameWait"
+        ]
+        assert len(waits) == 1, f"{len(waits)} FrameWait calls; expected one"
+        armed = [k for k in waits[0].keywords if k.arg == "armed"]
+        assert armed, "the endpoint arms every wait, the queue included"
+        assert not isinstance(
+            armed[0].value, ast.Constant
+        ), "`armed` is a constant, so the first wait is timed like the rest"

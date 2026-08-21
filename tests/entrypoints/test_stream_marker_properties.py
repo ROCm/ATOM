@@ -650,10 +650,21 @@ class TestARealCallSurvivesTheStream:
 # do not hand the stream over: channel framing that wraps every answer. Only
 # Kimi-K3 has any; a format absent here declares none, which is the default.
 FRAMING_NOT_A_REGION: dict[str, set[str]] = {
+    # Every channel token K3 wraps an answer in. Only the call prefix and the
+    # tools wrapper mean a call; the rest are removed on both paths, so the
+    # read-ahead has to know them to keep the two in step.
     "kimi_k3": {
         "<|open|>response<|sep|>",
         "<|close|>response<|sep|>",
         "<|end_of_msg|>",
+        "<|open|>think<|sep|>",
+        "<|close|>think<|sep|>",
+        "<|open|>message<|sep|>",
+        "<|close|>message<|sep|>",
+        "<|close|>response",
+        "<|close|>think",
+        "<|close|>message",
+        "<|sep|>",
     },
 }
 
@@ -728,6 +739,14 @@ DECLARED_TOOLS = [
 ]
 
 
+# Formats that deliberately do not announce a name early, and why. Stated
+# here rather than read off `peek_name`, so removing an override is a failing
+# test and not a silently skipped one.
+NO_EARLY_NAME = {
+    "kimi": "index and id come off the wire, after the peek would have to fire",
+}
+
+
 class TestTheNameArrivesBeforeTheArguments:
     """Which tool is being called, sent as soon as the region reveals it.
 
@@ -771,7 +790,18 @@ class TestTheNameArrivesBeforeTheArguments:
         )
 
     @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_the_opt_outs_are_the_declared_ones(self, parser):
+        """Whether a format announces at all, pinned rather than inferred."""
+        peeks = parser.peek_name(REAL_CALLS[parser.NAME]) is not None
+        assert peeks is (parser.NAME not in NO_EARLY_NAME), (
+            f"{parser.NAME}: peek_name says {peeks}, NO_EARLY_NAME says "
+            f"{parser.NAME in NO_EARLY_NAME}"
+        )
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
     def test_a_declared_tool_is_named_early(self, parser):
+        if parser.NAME in NO_EARLY_NAME:
+            pytest.skip(NO_EARLY_NAME[parser.NAME])
         total, at, args_at, _ = self._drive(
             parser, self._big_call(parser), DECLARED_TOOLS
         )
@@ -803,6 +833,8 @@ class TestTheNameArrivesBeforeTheArguments:
     @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
     def test_declaring_it_is_what_moves_the_name_earlier(self, parser):
         """Same input, one variable: the arms differ only in `tools`."""
+        if parser.NAME in NO_EARLY_NAME:
+            pytest.skip(NO_EARLY_NAME[parser.NAME])
         text = self._big_call(parser)
         _, early, _, _ = self._drive(parser, text, DECLARED_TOOLS)
         _, late, _, _ = self._drive(parser, text, None)
@@ -868,26 +900,20 @@ class TestAPromiseCannotBeTakenBack:
 
     @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
     def test_a_call_cut_off_before_it_parses_is_not_a_usable_call(self, parser):
-        """Truncated mid-call, against the same input with nothing declared.
+        """Stated as an invariant, not as "this input parses nothing".
 
-        Compared arm to arm rather than asserted outright: GLM's unterminated
-        branch salvages `<tool_call>get_weather` into a call with empty
-        arguments all by itself, which predates announcing and is that
-        format's own business. What must hold is that announcing adds no call
-        the parse did not already find.
+        Whether a format salvages a call from a given prefix is its own
+        business and now depends on the tool being declared: GLM reads
+        `<tool_call>get_weather` as a cut-off call to a declared tool, which
+        it is. What must hold either way is that a name with no arguments
+        behind it is never reported as something the client can run.
         """
         head = REAL_CALLS[parser.NAME].split("get_weather")[0] + "get_weather"
-        text = "Sure. " + head
-        kinds = [k for k, _ in self._drive(parser, text)]
-        baseline = [k for k, _ in self._drive_without_tools(parser, text)]
-        if "tool_call_args" in baseline:
-            pytest.skip("this format salvages a call from this much on its own")
-        assert (
-            "tool_call_args" not in kinds
-        ), "arguments were invented for a call that never parsed"
-        assert not completes_a_tool_call(
-            self._drive(parser, text)
-        ), "a name with no arguments must not report as a usable tool call"
+        events = self._drive(parser, "Sure. " + head)
+        if "tool_call_args" not in [k for k, _ in events]:
+            assert not completes_a_tool_call(
+                events
+            ), "a name with no arguments must not report as a usable call"
 
     @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
     def test_the_answer_still_arrives_when_the_call_does_not(self, parser):
@@ -915,3 +941,55 @@ class TestAPromiseCannotBeTakenBack:
 
         with pytest.raises(AssertionError, match="announced"):
             self._drive(Liar, "Sure. " + REAL_CALLS["qwen"])
+
+
+class TestThePeekIsBounded:
+    """Asking per token over a growing region is the shape this branch retired.
+
+    The first version ran the format's regex over the whole buffer on every
+    chunk: 3.0 -> 9.8 -> 36 -> 137 ms across 2k/4k/8k/16k tokens, quadratic,
+    against a 1383 ns/token budget for the entire pipeline. Bounded to a
+    prefix, and stopped once that prefix has gone by without a name.
+    """
+
+    @staticmethod
+    def _count_peeks(parser_cls, text, tools):
+        calls = []
+
+        class Counting(parser_cls):
+            @classmethod
+            def peek_name(cls, region):
+                calls.append(len(region))
+                return parser_cls.peek_name(region)
+
+        stream = ToolCallStreamParser(parser_cls=Counting)
+        stream.tools = tools
+        for i in range(0, len(text), 4):
+            stream.process(text[i : i + 4])
+        stream.flush()
+        return calls
+
+    def test_no_peek_ever_sees_more_than_the_window(self):
+        from atom.entrypoints.openai.tool_parser.tool_parser import _PEEK_WINDOW
+
+        text = "The model writes <tool_call> to open one. " + "x" * 4000
+        sizes = self._count_peeks(QwenXmlParser, text, DECLARED_TOOLS)
+        assert sizes, "the peek never ran"
+        assert max(sizes) <= _PEEK_WINDOW, f"peeked {max(sizes)} characters"
+
+    def test_it_stops_once_the_window_has_gone_by_without_a_name(self):
+        from atom.entrypoints.openai.tool_parser.tool_parser import _PEEK_WINDOW
+
+        text = "The model writes <tool_call> to open one. " + "x" * 4000
+        sizes = self._count_peeks(QwenXmlParser, text, DECLARED_TOOLS)
+        # One per chunk until the region passes the window, then never again.
+        assert len(sizes) <= _PEEK_WINDOW // 4 + 2, (
+            f"{len(sizes)} peeks over a {len(text)}-character answer; the "
+            "latch is not holding and the cost is quadratic again"
+        )
+
+    def test_an_undeclared_name_also_stops_it(self):
+        other = [{"type": "function", "function": {"name": "something_else"}}]
+        text = "Sure. " + REAL_CALLS["qwen"].replace("Paris", "x" * 4000)
+        sizes = self._count_peeks(QwenXmlParser, text, other)
+        assert len(sizes) <= 40, f"{len(sizes)} peeks after the name was rejected"

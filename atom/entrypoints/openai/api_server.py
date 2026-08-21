@@ -129,7 +129,7 @@ tool_call_parser_cls: type | None = None
 model_starts_in_reasoning: bool = False
 # (kwarg, off-value) the chat template reads to switch reasoning off, resolved
 # at startup by asking it; None when the template offers no such switch.
-reasoning_toggle: tuple[str, Any] | None = None
+reasoning_toggle: tuple[str, Any, Any] | None = None
 processor: Any | None = None
 model_name: str = ""
 default_chat_template_kwargs: dict[str, Any] = {}
@@ -152,7 +152,9 @@ def anthropic_thinking_enabled(request: Any) -> bool:
     return bool(thinking) and thinking.get("type") != "disabled"
 
 
-def anthropic_template_kwargs(request: Any, toggle: tuple[str, Any] | None) -> dict:
+def anthropic_template_kwargs(
+    request: Any, toggle: tuple[str, Any, Any] | None
+) -> dict:
     """How `thinking` reaches the model: by not asking it to think.
 
     `thinking: disabled` is answered where the answer costs nothing -- in the
@@ -175,6 +177,11 @@ def anthropic_template_kwargs(request: Any, toggle: tuple[str, Any] | None) -> d
     existing caller gets back from a reasoning model. Absent means unstated,
     and unstated leaves the model's own default alone.
 
+    Both directions go through the resolved toggle. Writing a hardcoded
+    `thinking=True` for the on direction is a no-op on any template that reads
+    another name -- the whole Qwen family -- so an explicit opt-in was
+    discarded silently against a server default of off.
+
     ``toggle`` is ``None`` for a model whose template has no switch. The
     request is then honoured as far as it can be -- the reasoning is separated
     and reported as a `thinking` block, never discarded -- and startup has
@@ -182,10 +189,10 @@ def anthropic_template_kwargs(request: Any, toggle: tuple[str, Any] | None) -> d
     """
     if getattr(request, "thinking", None) is None:
         return {}
-    if toggle is None or anthropic_thinking_enabled(request):
+    if toggle is None:
         return {}
-    name, off_value = toggle
-    return {name: off_value}
+    name, off_value, on_value = toggle
+    return {name: on_value if anthropic_thinking_enabled(request) else off_value}
 
 
 # The engine's `leave_reason` in Anthropic's vocabulary. The scheduler emits
@@ -257,12 +264,16 @@ async def _client_stream(
     reports looks like an answer.
     """
     it = gen.__aiter__()
+    delivered = False
     while True:
-        with FrameWait(request_id):
+        # The first wait is the queue, not silence: every generator awaits the
+        # collector before its opening frame.
+        with FrameWait(request_id, armed=delivered):
             try:
                 chunk = await it.__anext__()
             except StopAsyncIteration:
                 return
+        delivered = True
         if _request_logger is not None and chunk.startswith("data: "):
             payload = chunk[6:].strip()
             if payload != "[DONE]":
@@ -1352,10 +1363,9 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             # measured, `thinking=False` left the `<think>` prefill in place.
             # A template ignores a kwarg it does not know, so the failure was
             # invisible: the model reasoned anyway.
-            if not _th_enabled and reasoning_toggle is not None:
-                merged_kwargs[reasoning_toggle[0]] = reasoning_toggle[1]
-            elif _th_enabled:
-                merged_kwargs["thinking"] = True
+            if reasoning_toggle is not None:
+                name, off_value, on_value = reasoning_toggle
+                merged_kwargs[name] = on_value if _th_enabled else off_value
             if _th_effort is not None:
                 merged_kwargs["thinking_effort"] = _th_effort
 
@@ -2203,7 +2213,8 @@ def main():
 
     reasoning_toggle = resolve_reasoning_toggle(tokenizer, custom_message_encoder)
     if reasoning_toggle is not None:
-        logger.info(f"Reasoning is switched off with {reasoning_toggle[0]}=off.")
+        _name, _off, _on = reasoning_toggle
+        logger.info(f"Reasoning switches on {_name}: {_on!r} on, {_off!r} off.")
     else:
         logger.info(
             "This chat template has no switch for reasoning, so a request "

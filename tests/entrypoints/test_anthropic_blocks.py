@@ -234,3 +234,53 @@ class TestToolEventFrames:
         to close, so a name alone does not mean the client has a tool to run.
         """
         assert completes_a_tool_call(events) is expected
+
+
+class TestNoBlockWithoutAnIdAndAName:
+    """`delta("tool_use", ...)` opens a block when none is open, and it was
+    given nothing to open one with.
+
+    Anything landing between a call's name and its arguments -- text, another
+    kind, a stray event -- re-opened the tool_use block with `id: ""` and
+    `name: ""`. That is syntactically a complete tool_use: a client cannot
+    dispatch it (no name) and cannot return a result for it (no id), and
+    Claude Code treats a well-formed zero-argument block as a call to make.
+    """
+
+    START = (
+        "tool_call_start",
+        {"id": "call_1", "function": {"name": "get_weather", "arguments": ""}},
+    )
+    ARGS = ("tool_call_args", {"function": {"arguments": '{"city": "Paris"}'}})
+
+    @staticmethod
+    def _blocks(events):
+        out = []
+        for frame in tool_event_frames(events, AnthropicBlocks()):
+            payload = json.loads(frame.split("data: ", 1)[1])
+            if payload["type"] == "content_block_start":
+                out.append(payload["content_block"])
+        return out
+
+    def test_arguments_with_no_name_open_nothing(self):
+        assert self._blocks([self.ARGS, ("tool_call_end", None)]) == []
+
+    def test_text_between_the_name_and_the_arguments_keeps_both(self):
+        blocks = self._blocks(
+            [self.START, ("content", "oops"), self.ARGS, ("tool_call_end", None)]
+        )
+        tool_blocks = [b for b in blocks if b["type"] == "tool_use"]
+        assert len(tool_blocks) == 2, "the re-opened block went missing"
+        for b in tool_blocks:
+            assert b["id"] == "call_1" and b["name"] == "get_weather"
+
+    def test_no_tool_use_block_is_ever_nameless(self):
+        for events in (
+            [self.ARGS],
+            [self.ARGS, self.ARGS],
+            [self.START, ("content", "x"), self.ARGS],
+            [("tool_call_end", None), self.ARGS],
+        ):
+            for block in self._blocks(events):
+                if block["type"] == "tool_use":
+                    assert block["id"] and block["name"], block

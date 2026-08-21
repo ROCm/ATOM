@@ -33,7 +33,8 @@ _INVOKE_RE = re.compile(
 _PARAM_RE = re.compile(r"<([\w-]+)>(.*?)</\1>", re.DOTALL)
 
 
-_PEEK_NAME_RE = re.compile(r'<invoke name="([^"]+)"')
+# Name plus the token that must follow; see QwenXmlParser for why.
+_PEEK_NAME_RE = re.compile(r'<invoke name="([^"]+)">\s*<[^>]*(?:parameter|/)')
 
 
 class MiniMaxParser(BufferedMarkerParser):

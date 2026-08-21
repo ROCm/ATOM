@@ -42,6 +42,10 @@ class MessageEncoderAdapter:
     encode: MessageEncoder
     prepare_messages: MessagePreparer
     supports_tools: bool = False
+    # The file the encoder was loaded from. `encode` is a closure defined in
+    # `chat_encoders`, so `inspect.getmodule(encode)` names *that* module --
+    # reading the model's own source needs the path carried here.
+    source_path: str = ""
 
     def __call__(self, messages: list[dict], **kwargs: Any) -> str:
         """Preserve the callable behavior of the former encoder return value."""
@@ -54,7 +58,7 @@ _PREPARERS: dict[str, tuple[MessagePreparer, bool]] = {
 
 
 def build_message_encoder_adapter(
-    module_name: str, encoder: MessageEncoder
+    module_name: str, encoder: MessageEncoder, source_path: str = ""
 ) -> MessageEncoderAdapter:
     """Build an adapter registered for ``module_name`` or an identity adapter."""
     prepare_messages, supports_tools = _PREPARERS.get(
@@ -65,4 +69,5 @@ def build_message_encoder_adapter(
         encode=encoder,
         prepare_messages=prepare_messages,
         supports_tools=supports_tools,
+        source_path=source_path,
     )

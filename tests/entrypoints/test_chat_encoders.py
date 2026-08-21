@@ -14,7 +14,7 @@ from atom.entrypoints.openai.chat_encoder_adapters import (
     build_message_encoder_adapter,
 )
 from atom.entrypoints.openai.chat_encoders import (
-    REASONING_OFF_KWARGS,
+    REASONING_TOGGLES,
     _load_encoder_from_dir,
     apply_chat_template,
     chat_template_source,
@@ -174,16 +174,29 @@ class TestChatTemplateSource:
         assert chat_template_source(self.Tok(None)) == ""
         assert chat_template_source(object()) == ""
 
-    def test_a_python_encoder_contributes_its_source(self):
+    def test_a_python_encoder_contributes_its_source(self, tmp_path):
         """`chat_template` is None for every model shipping one of these, so
         the literals live in the module instead."""
 
         def encode(messages, **kwargs):
-            return "<|open|>think<|sep|>"
+            return "unused"
 
-        adapter = build_message_encoder_adapter("encoding_probe", encode)
+        # The path, not the function: `encode` is a closure defined in
+        # `chat_encoders`, so asking `inspect.getmodule` for it returned
+        # ATOM's own source -- 11 KB of this repo instead of the model's
+        # 27 KB encoder, and the answer keyed on ATOM's own comments.
+        model_file = tmp_path / "encoding_probe.py"
+        model_file.write_text("MARKER = '<|open|>think<|sep|>'\n")
+        adapter = build_message_encoder_adapter(
+            "encoding_probe", encode, str(model_file)
+        )
         src = chat_template_source(self.Tok(None), adapter)
         assert "<|open|>think<|sep|>" in src
+        assert "_load_encoder_from_dir" not in src, "it read ATOM's own source"
+
+    def test_an_encoder_with_no_path_contributes_nothing(self):
+        adapter = build_message_encoder_adapter("x", lambda m, **k: "")
+        assert chat_template_source(self.Tok(None), adapter) == ""
 
     def test_the_startup_callers_use_it(self):
         """Both entry points asked `getattr(tokenizer, "chat_template", None)`
@@ -227,11 +240,14 @@ class TestResolveReasoningToggle:
         "name, off", [("enable_thinking", False), ("thinking", False)]
     )
     def test_it_finds_the_kwarg_the_template_reads(self, name, off):
-        assert resolve_reasoning_toggle(self.Tok(name, off)) == (name, off)
+        expected_on = next(
+            on for k, o, on in REASONING_TOGGLES if (k, o) == (name, off)
+        )
+        assert resolve_reasoning_toggle(self.Tok(name, off)) == (name, off, expected_on)
 
     def test_it_finds_a_non_boolean_switch(self):
         tok = self.Tok("thinking_mode", "disabled")
-        assert resolve_reasoning_toggle(tok) == ("thinking_mode", "disabled")
+        assert resolve_reasoning_toggle(tok) == ("thinking_mode", "disabled", "enabled")
 
     def test_a_template_with_no_switch_answers_none(self):
         """gpt-oss and DeepSeek-R1 on this box; saying so is the point."""
@@ -253,10 +269,14 @@ class TestResolveReasoningToggle:
                 assert mode in ("chat", "thinking"), f"bad mode {mode}"
                 return "PROMPT" if mode == "chat" else "PROMPT<think>"
 
-        assert resolve_reasoning_toggle(Picky()) == ("thinking_mode", "chat")
+        assert resolve_reasoning_toggle(Picky()) == (
+            "thinking_mode",
+            "chat",
+            "thinking",
+        )
 
     def test_the_candidates_cover_both_thinking_mode_vocabularies(self):
-        modes = [v for k, v in REASONING_OFF_KWARGS if k == "thinking_mode"]
+        modes = [off for k, off, _ in REASONING_TOGGLES if k == "thinking_mode"]
         assert modes == ["disabled", "chat"], (
             "order matters: MiniMax must match before DeepSeek-V4's rejection "
             "of 'disabled' sends the probe on to 'chat'"
@@ -274,18 +294,52 @@ class TestResolveReasoningToggle:
     def test_every_candidate_switches_reasoning_off_not_on(self):
         """The values are the *off* values; a typo turning one on would be
         invisible in the probe, which only checks that the render changed."""
-        assert {v for _, v in REASONING_OFF_KWARGS} == {False, "disabled", "chat"}
+        assert {off for _, off, _ in REASONING_TOGGLES} == {False, "disabled", "chat"}
+        assert {on for _, _, on in REASONING_TOGGLES} == {True, "enabled", "thinking"}
+        for name, off, on in REASONING_TOGGLES:
+            assert off != on, name
 
-    def test_both_endpoints_use_the_resolved_name(self):
-        """A hardcoded kwarg is a no-op on any template that reads another,
-        and a no-op here is invisible -- the model reasons anyway. Neither
-        endpoint body is reachable from a unit test, so this reads the source.
+    @pytest.mark.parametrize("enabled", [True, False])
+    def test_both_directions_use_the_resolved_name(self, enabled):
+        """Asserted on the kwargs produced, not on a source literal.
+
+        The previous version checked that the string
+        `merged_kwargs["thinking"] = _th_enabled` was absent. Splitting that
+        line into an `if`/`elif` and writing `= True` in the enable branch
+        satisfied it while leaving the enable direction hardcoded -- a no-op
+        on every template that reads another name, which is all of Qwen.
         """
-        src = pathlib.Path(api_server.__file__).read_text()
-        assert "resolve_reasoning_toggle(" in src, "the toggle is never resolved"
-        assert (
-            src.count("reasoning_toggle") >= 4
-        ), "resolved but not used by both the chat and Anthropic paths"
-        assert (
-            'merged_kwargs["thinking"] = _th_enabled' not in src
-        ), "the chat path still writes a hardcoded kwarg name for every model"
+        toggle = ("enable_thinking", False, True)
+
+        class Req:
+            thinking = {"type": "enabled"} if enabled else {"type": "disabled"}
+
+        kwargs = api_server.anthropic_template_kwargs(Req(), toggle)
+        assert kwargs == {"enable_thinking": enabled}
+        assert "thinking" not in kwargs, "a hardcoded kwarg name came back"
+
+    def test_the_chat_path_writes_no_hardcoded_reasoning_kwarg(self):
+        """That body is inside a route handler no unit test reaches, so this
+        reads the source -- but for the shape of the answer, not a literal:
+        no `merged_kwargs["<anything about thinking>"] = ...` at all."""
+        import ast
+        import inspect
+        import textwrap
+
+        # Only the on/off names. `thinking_effort` is a separate control --
+        # an effort level, validated against the dialects' own vocabulary --
+        # and is not what the resolved toggle answers.
+        _TOGGLE_NAMES = {name for name, _, _ in REASONING_TOGGLES}
+        src = inspect.getsource(api_server.chat_completions)
+        tree = ast.parse(textwrap.dedent(src))
+        hardcoded = [
+            n.slice.value
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Subscript)
+            and isinstance(n.ctx, ast.Store)
+            and getattr(n.value, "id", "") == "merged_kwargs"
+            and isinstance(n.slice, ast.Constant)
+            and str(n.slice.value) in _TOGGLE_NAMES
+        ]
+        assert not hardcoded, f"hardcoded reasoning kwarg name(s): {hardcoded}"
+        assert "reasoning_toggle" in src, "it never consults the resolved name"

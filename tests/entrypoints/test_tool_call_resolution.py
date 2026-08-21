@@ -26,6 +26,7 @@ from atom.entrypoints.openai.tool_parser import registry
 from atom.entrypoints.openai.tool_parser.registry import (
     PARSERS_BY_NAME,
     parse_tool_calls,
+    resolve_from_prompt,
     resolve_tool_call_parser,
     validate_tool_call_parser,
 )
@@ -230,3 +231,73 @@ class TestTheMeshRouterStillGetsItsFlag:
             [*self.BASE, "--tool-call-parser", "glm"]
         )
         assert args.mesh_args[:2] == ["--port", "9000"]
+
+
+class TestGlmDoesNotClaimEveryTemplate:
+    """`<tool_call>` is not GLM's discriminator; `<arg_key>` is.
+
+    Detection now runs on a rendered chat template, where a Hermes-JSON model
+    shows the same `<tool_call>` tag and has no `<arg_key>` anywhere.
+    Accepting the tag alone bound every such model to GlmParser for the
+    process lifetime and logged it as a success -- /mnt/Qwen3-8B resolved to
+    `glm` while /data/Qwen3.5-27B resolved to `qwen`, one family, two answers.
+    GLM then produced no call (its name check rejects the JSON body) and the
+    whole region, tool call and following answer alike, arrived in one frame.
+    """
+
+    HERMES = (
+        "You may call tools. Emit:\n<tool_call>\n"
+        '{"name": <function-name>, "arguments": <args-json>}\n</tool_call>'
+    )
+    GLM = (
+        "You may call tools. Emit:\n<tool_call>NAME"
+        "<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>"
+    )
+
+    def test_a_hermes_template_is_not_glm(self):
+        assert resolve_from_prompt(self.HERMES) is not PARSERS_BY_NAME["glm"]
+
+    def test_a_hermes_template_resolves_to_nothing(self):
+        """`None` is the honest answer: ATOM has no Hermes parser, so its
+        calls are delivered as text rather than swallowed by the wrong one."""
+        assert resolve_from_prompt(self.HERMES) is None
+
+    def test_a_real_glm_template_still_resolves(self):
+        assert resolve_from_prompt(self.GLM) is PARSERS_BY_NAME["glm"]
+
+
+class TestTheTwoVocabulariesCoexist:
+    """`--tool-call-parser` has two consumers that do not share a vocabulary.
+
+    The Rust router takes `json` / `python` / `xml` / `hermes`; ATOM's
+    resolver takes `dsml` / `glm` / `kimi` / `kimi_k3` / `minimax` / `qwen`.
+    Validating the flag against ATOM's set would have killed any existing
+    standalone deployment launched with a router name -- before the flag was
+    registered here at all, those passed straight through untouched.
+    """
+
+    BASE: ClassVar[list] = ["--model", "/x", "--port", "9000"]
+
+    def _parse(self, name):
+        return atomesh_server.parse_standalone_args(
+            [*self.BASE, "--tool-call-parser", name]
+        )
+
+    @pytest.mark.parametrize("name", ["json", "python", "xml", "hermes"])
+    def test_a_router_name_starts_and_reaches_the_router(self, name):
+        args = self._parse(name)
+        assert args.mesh_args[-2:] == ["--tool-call-parser", name]
+        assert (
+            args.engine_args.tool_call_parser is None
+        ), "a name ATOM does not know must leave ATOM reading the template"
+
+    @pytest.mark.parametrize("name", sorted(PARSERS_BY_NAME))
+    def test_an_atom_name_binds_atom_and_still_reaches_the_router(self, name):
+        args = self._parse(name)
+        assert args.engine_args.tool_call_parser == name
+        assert args.mesh_args[-2:] == ["--tool-call-parser", name]
+
+    def test_unset_forwards_nothing_and_binds_nothing(self):
+        args = atomesh_server.parse_standalone_args(self.BASE)
+        assert args.engine_args.tool_call_parser is None
+        assert "--tool-call-parser" not in args.mesh_args

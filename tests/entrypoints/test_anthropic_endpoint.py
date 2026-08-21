@@ -588,7 +588,7 @@ class TestThinkingIsAnsweredInThePrompt:
     `include_reasoning` only suppresses the field after the split.
     """
 
-    TOGGLE = ("enable_thinking", False)
+    TOGGLE = ("enable_thinking", False, True)
 
     class Req:
         def __init__(self, thinking):
@@ -600,13 +600,14 @@ class TestThinkingIsAnsweredInThePrompt:
         )
         assert kwargs == {"enable_thinking": False}
 
-    def test_enabled_leaves_the_template_alone(self):
-        assert (
-            api_server.anthropic_template_kwargs(
-                self.Req({"type": "enabled"}), self.TOGGLE
-            )
-            == {}
+    def test_enabled_writes_the_on_value(self):
+        """Both directions go through the resolved name. Writing a hardcoded
+        `thinking=True` here was a no-op on every template that reads another
+        one, so an explicit opt-in was discarded against a server default."""
+        kwargs = api_server.anthropic_template_kwargs(
+            self.Req({"type": "enabled"}), self.TOGGLE
         )
+        assert kwargs == {"enable_thinking": True}
 
     def test_an_absent_field_is_unstated_not_off(self):
         """Anthropic defaults to off, but reading absence as "switch this

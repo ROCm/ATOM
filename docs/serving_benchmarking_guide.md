@@ -152,12 +152,28 @@ being called only after 5030 of 5040 tokens. Every format carries the name in
 its opener, so it is sent as soon as the region reveals it — measured across
 all six, chunk 11–21 instead of 225–248.
 
-Only for a name the request declared in `tools`. That check is what makes the
-early name safe: it cannot be retracted, and an answer quoting
-`<tool_call><function=NAME>` opens a region too, so a name the client never
-offered waits for the region to close like everything else. SGLang's cursor
-parsers announce with no such check and will emit a call named after whatever
-follows the tag.
+Two things have to be true before a name goes out. It is one the request
+declared in `tools`, and what follows it is this format's own next token
+rather than English -- prose can name a real tool, so the first test alone let
+"the model writes `<tool_call><function=get_weather>` and then..." announce
+`get_weather`. SGLang's cursor parsers announce with neither check and will
+emit a call named after whatever follows the tag.
+
+The same pair gates the *unclosed-region* branch of `parse`, which exists for
+a call cut off at `max_tokens` and could not tell that from prose: it produced
+a complete zero-argument call, deleted the rest of the sentence and reported
+`finish_reason: tool_calls`, so an agentic client ran a tool nobody asked for.
+
+The peek reads a bounded prefix and stops once that prefix has gone by without
+a name. Running the format's regex over the whole region on every chunk is
+quadratic in the response -- 3.0 → 9.8 → 36 → 137 ms across 2k/4k/8k/16k
+tokens, which is the shape `marker_scanner` exists to retire, one layer up.
+
+Kimi-K2 does not announce at all. Its call index and id travel on the wire
+(`functions.NAME:INDEX`) and an announcement has to carry both before the
+entry that supplies them has arrived; every announced call went out at index
+0, so a client accumulating by index overwrote the first call with the
+second.
 
 Arguments still wait for the region to close. SGLang streams those too, as
 JSON fragments; a response cut short then leaves the client holding an
@@ -233,11 +249,15 @@ a stream waits for the *engine*, but the reasoning read-ahead and the tool-call
 read-ahead sit between it and the socket, and while either withholds, the
 collector wakes on every token. Measured: an answer quoting a tool marker fed
 126 tokens and sent the client 6 frames, and the gauge read zero. At the frame
-it reads the silence. Moving out also retired the "ignore the first wait" rule
-— at the collector that first wait is admission and prefill, which would have
-made the gauge a queue-depth proxy `atom:requests_waiting` already provides;
-out here the response's opening frame goes out immediately, so every gap after
-it is real.
+it reads the silence.
+
+The wait for the *first* frame is still excluded, and moving out did not
+change that — a claim this paragraph made and did not hold. Every response
+generator awaits the collector before yielding anything, so that wait is
+admission, queueing and prefill: timing it put 0.2 s on the gauge for a
+request 200 ms into a queue with no token yet produced, which is
+`atom:requests_waiting` under another name, and past the threshold would log a
+line per admitted request blaming the read-ahead.
 
 One consequence matters when reading benchmark output. ITL is sampled once per
 received SSE chunk (`backend_request_func.py`, `benchmark_serving.py`), so

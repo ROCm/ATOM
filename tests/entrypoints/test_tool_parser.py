@@ -3,6 +3,8 @@
 
 """Tests for tool call parsing."""
 
+from typing import ClassVar
+
 import pytest
 
 from atom.entrypoints.openai.tool_parser import (
@@ -13,6 +15,7 @@ from atom.entrypoints.openai.tool_parser import (
 from atom.entrypoints.openai.tool_parser.glm_tool_parser import GlmParser
 from atom.entrypoints.openai.tool_parser.kimi_k3_tool_parser import KimiK3Parser
 from atom.entrypoints.openai.tool_parser.kimi_tool_parser import KimiParser
+from atom.entrypoints.openai.tool_parser.qwen3_tool_parser import QwenXmlParser
 
 # ============================================================================
 # parse_tool_calls() Tests
@@ -115,7 +118,7 @@ class TestParseToolCalls:
             f"<|tool_call_begin|>functions.chat:0<|tool_call_argument_begin|>{args}<|tool_call_end|>"
             "<|tool_calls_section_end|>"
         )
-        content, tool_calls = parse_tool_calls(text, parser_cls=KimiParser)
+        _content, tool_calls = parse_tool_calls(text, parser_cls=KimiParser)
         assert len(tool_calls) == 1
         assert tool_calls[0].function["arguments"] == args
 
@@ -309,8 +312,8 @@ class TestATruncatedCallIsNotContent:
 
     TRUNCATED = (
         "I will look it up."
-        '<|open|>tools<|sep|><|open|>call tool="get_weather"'
-        '<|open|>argument name="city"<|sep|>Paris<|close|>argument'
+        '<|open|>tools<|sep|><|open|>call tool="get_weather"<|sep|>'
+        '<|open|>argument key="city"<|sep|>Paris<|close|>argument'
     )
 
     def test_the_partial_payload_does_not_reach_the_client(self):
@@ -334,3 +337,153 @@ class TestATruncatedCallIsNotContent:
         content, calls = KimiK3Parser.parse(text, None)
         assert [c.function["name"] for c in calls] == ["get_weather"]
         assert content == "Looking._"
+
+
+class TestTheAnnouncedNameIsTheOneThatParses:
+    """A name sent early has to be the *first* call's, in wire order.
+
+    GLM's peek required `<arg_key>` after the name, so it skipped a call that
+    takes no arguments and announced the one after it. `parse` then returned
+    them in wire order and the mismatch raised -- out of `flush`, on a live
+    SSE generator with no `except` above it, from well-formed output. Zero-
+    argument tools are ordinary.
+    """
+
+    TOOLS: ClassVar[list] = [
+        {"type": "function", "function": {"name": "alpha"}},
+        {"type": "function", "function": {"name": "beta"}},
+    ]
+
+    def _drive(self, text):
+        stream = ToolCallStreamParser(parser_cls=GlmParser)
+        stream.tools = self.TOOLS
+        events = []
+        for i in range(0, len(text), 4):
+            events += stream.process(text[i : i + 4])
+        return events + stream.flush()
+
+    def test_a_zero_argument_call_before_a_real_one(self):
+        events = self._drive(
+            "<tool_call>alpha</tool_call>"
+            "<tool_call>beta<arg_key>city</arg_key><arg_value>Q</arg_value></tool_call>"
+        )
+        names = [d["function"]["name"] for k, d in events if k == "tool_call_start"]
+        assert names == ["alpha", "beta"]
+
+    def test_the_peek_reads_a_zero_argument_call(self):
+        assert GlmParser.peek_name("<tool_call>alpha</tool_call>") == "alpha"
+
+    def test_the_peek_reads_the_first_of_two(self):
+        assert (
+            GlmParser.peek_name(
+                "<tool_call>alpha</tool_call><tool_call>beta<arg_key>c</arg_key>"
+            )
+            == "alpha"
+        )
+
+
+class TestProseIsNotATruncatedCall:
+    """The unclosed-region branch exists for a call cut off by `max_tokens`.
+
+    It cannot tell that from an answer explaining how to call a tool, and used
+    to accept both: an agentic client executed `get_weather({})` and the rest
+    of the sentence was deleted. Prose has to fail two tests -- a name the
+    request declared, and nothing after the name but this format's own next
+    token -- because prose can name a real tool.
+    """
+
+    TOOLS: ClassVar[list] = [{"type": "function", "function": {"name": "get_weather"}}]
+
+    @pytest.mark.parametrize(
+        "parser, text",
+        [
+            (
+                QwenXmlParser,
+                (
+                    "To call it the model writes <tool_call>"
+                    "<function=get_weather> and then the parameters."
+                ),
+            ),
+            (
+                GlmParser,
+                "To call it write <tool_call>get_weather and then the keys follow.",
+            ),
+        ],
+        ids=["qwen", "glm"],
+    )
+    def test_prose_naming_a_declared_tool_is_not_a_call(self, parser, text):
+        content, calls = parser.parse(text, self.TOOLS)
+        assert calls == [], f"fabricated {[c.function['name'] for c in calls]}"
+        assert content == text, "the answer was truncated at the quoted tag"
+
+    @pytest.mark.parametrize(
+        "parser, text",
+        [
+            (
+                QwenXmlParser,
+                "Sure. <tool_call><function=get_weather><parameter=city>Par",
+            ),
+            (QwenXmlParser, "Sure. <tool_call><function=get_weather>"),
+            (
+                GlmParser,
+                "Sure. <tool_call>get_weather<arg_key>city</arg_key><arg_value>Pa",
+            ),
+        ],
+        ids=["qwen-mid-param", "qwen-after-name", "glm-mid-arg"],
+    )
+    def test_a_genuinely_truncated_call_still_parses(self, parser, text):
+        _, calls = parser.parse(text, self.TOOLS)
+        assert [c.function["name"] for c in calls] == ["get_weather"]
+
+    def test_an_undeclared_name_is_never_salvaged(self):
+        text = "Sure. <tool_call><function=made_up><parameter=x>1"
+        content, calls = QwenXmlParser.parse(text, self.TOOLS)
+        assert calls == [] and content == text
+
+
+class TestKimiKeepsWhatItDidNotParse:
+    """A start marker is not a promise, for this format too.
+
+    State 1 truncated the buffer at the section end and moved to a terminal
+    state, so an answer quoting both section tokens lost its body *and*
+    everything after it -- and the `flush` fallback that was meant to cover
+    this could not see it, because the bytes were already gone. Measured: 26
+    of 135 characters at four-character chunks, 135 in one shot.
+    """
+
+    QUOTES_BOTH = (
+        "Kimi emits a tool call as <|tool_calls_section_begin|> then one entry "
+        "per call and finally <|tool_calls_section_end|>. Hope that helps!"
+    )
+
+    @staticmethod
+    def _stream(text, size):
+        parser = ToolCallStreamParser(parser_cls=KimiParser)
+        events = []
+        for i in range(0, len(text), size):
+            events += parser.process(text[i : i + size])
+        events += parser.flush()
+        return "".join(d for k, d in events if k == "content"), [
+            k for k, _ in events if k.startswith("tool_call")
+        ]
+
+    @pytest.mark.parametrize("size", [1, 2, 4, 17, 999])
+    def test_every_byte_survives_at_every_chunk_size(self, size):
+        delivered, calls = self._stream(self.QUOTES_BOTH, size)
+        assert delivered == self.QUOTES_BOTH
+        assert calls == [], "a quoted section token is not a tool call"
+
+    def test_it_agrees_with_the_non_streaming_path(self):
+        delivered, _ = self._stream(self.QUOTES_BOTH, 4)
+        assert delivered == parse_tool_calls(self.QUOTES_BOTH, parser_cls=KimiParser)[0]
+
+    def test_text_after_a_real_section_still_arrives(self):
+        """`state = 2` discarded the rest of the stream unconditionally."""
+        text = (
+            "Sure. <|tool_calls_section_begin|><|tool_call_begin|>"
+            'functions.get_weather:0<|tool_call_argument_begin|>{"city":"Paris"}'
+            "<|tool_call_end|><|tool_calls_section_end|> Done."
+        )
+        delivered, calls = self._stream(text, 4)
+        assert "Sure." in delivered and "Done." in delivered
+        assert "tool_call_start" in calls

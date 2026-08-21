@@ -38,6 +38,7 @@ _TOOLCALL_RE = re.compile(r"<tool_call>(.*?)</tool_call>|<tool_call>(.*)$", re.D
 # appear in the tail. `\Z` and not `$`, which also matches before a trailing
 # newline and would admit a name with one.
 _TOOL_NAME_RE = re.compile(r"^\w[\w.\-]*\Z")
+_ARG_OPENER = "<arg_key>"
 _ARG_RE = re.compile(
     r"<arg_key>(.*?)</arg_key>\s*<arg_value>"
     r"(.*?)(?:</arg_value>|(?=<arg_key>)|(?=</tool_call>)|$)",
@@ -45,7 +46,12 @@ _ARG_RE = re.compile(
 )
 
 
-_PEEK_NAME_RE = re.compile(r"<tool_call>\s*(\w[\w.\-]*)\s*<arg_key>")
+# Both call shapes, so `search` finds the *first* call rather than the
+# first one that happens to take arguments. Requiring `<arg_key>` skipped
+# a zero-argument call, announced the name of the one after it, and
+# `parse` then returned them in wire order -- an AssertionError raised
+# out of `flush` on a live SSE stream, from well-formed output.
+_PEEK_NAME_RE = re.compile(r"<tool_call>\s*(\w[\w.\-]*)\s*(?:<arg_key>|</tool_call>)")
 
 
 class GlmParser(BufferedMarkerParser):
@@ -64,7 +70,13 @@ class GlmParser(BufferedMarkerParser):
         """Detect the GLM ``<tool_call>...<arg_key>`` format (never Qwen/DSML)."""
         if QWEN_TOOL_PREFIX in text:  # '<function=' -> Qwen, not GLM
             return False
-        return "<arg_key>" in text or "<tool_call>" in text
+        # `<arg_key>` and not a bare `<tool_call>`: this runs on a rendered
+        # chat template, where a Hermes-JSON model shows the same tag and has
+        # no `<arg_key>` anywhere. Accepting the tag alone bound every such
+        # model to this parser for the process lifetime and logged it as a
+        # success -- /mnt/Qwen3-8B resolved to `glm` while /data/Qwen3.5-27B
+        # resolved to `qwen`, two members of one family disagreeing.
+        return "<arg_key>" in text
 
     @classmethod
     def parse(cls, text: str, tools: list | None) -> tuple[str, list[ToolCall]]:
@@ -76,13 +88,24 @@ class GlmParser(BufferedMarkerParser):
         content = text[:start]
         tool_calls: list[ToolCall] = []
         for m in _TOOLCALL_RE.finditer(text):
-            body = m.group(1) if m.group(1) is not None else m.group(2)
+            closed = m.group(1) is not None
+            body = m.group(1) if closed else m.group(2)
             if not body:
                 continue
             ak = body.find("<arg_key>")
             name = (body if ak == -1 else body[:ak]).strip()
             if not _TOOL_NAME_RE.match(name):
                 continue
+            if not closed:
+                # See `QwenXmlParser._is_truncated_call`: an unclosed region
+                # is a cut-off call or prose quoting the tag, and prose has to
+                # fail both tests -- a declared name, and nothing after it but
+                # this format's own next token.
+                rest = body[len(name) :].lstrip() if ak == -1 else ""
+                if name not in param_types or not (
+                    not rest or _ARG_OPENER.startswith(rest[: len(_ARG_OPENER)])
+                ):
+                    continue
             types = param_types.get(name, {})
             args: dict[str, Any] = {}
             for pm in _ARG_RE.finditer(body):

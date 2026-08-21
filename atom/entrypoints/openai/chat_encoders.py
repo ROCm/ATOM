@@ -12,9 +12,9 @@ when one was found, or to ``tokenizer.apply_chat_template`` otherwise.
 
 import glob
 import importlib.util
-import inspect
 import logging
 import os
+import pathlib
 from typing import Any
 
 from huggingface_hub import snapshot_download
@@ -77,7 +77,7 @@ def _load_encoder_from_dir(model_path: str) -> MessageEncoderAdapter | None:
         return raw(messages, **kwargs)
 
     logger.info(f"Loaded message encoder from {enc_path}")
-    return build_message_encoder_adapter(module_name, encode)
+    return build_message_encoder_adapter(module_name, encode, enc_path)
 
 
 def load_custom_message_encoder(model_path: str) -> MessageEncoderAdapter | None:
@@ -137,30 +137,32 @@ def chat_template_source(
         # Every named variant, so a marker in any of them counts. Searching
         # the dict itself would have searched the names.
         return "\n".join(str(v) for v in template.values())
-    if custom_encoder is not None:
+    if custom_encoder is not None and custom_encoder.source_path:
         try:
-            return inspect.getsource(inspect.getmodule(custom_encoder.encode))
-        except (OSError, TypeError) as e:
-            logger.warning(
-                "Could not read the source of message encoder %s: %s",
-                custom_encoder.name,
-                e,
-            )
+            return pathlib.Path(custom_encoder.source_path).read_text()
+        except OSError as e:
+            logger.warning("Could not read %s: %s", custom_encoder.source_path, e)
     return ""
 
 
-# (kwarg, value) pairs that switch reasoning off, tried in order. Every family
-# on this box is covered: Qwen reads `enable_thinking`, Kimi-K3 `thinking`, and
+# (kwarg, off-value, on-value) triples, tried in order. Every family on this
+# box is covered: Qwen reads `enable_thinking`, Kimi-K3 `thinking`, and
 # `thinking_mode` is read by two families with disjoint vocabularies --
-# MiniMax-M3 wants "disabled" and DeepSeek-V4's encoder asserts on anything
-# outside {"chat", "thinking"}. Hence pairs rather than one value per name, and
+# MiniMax-M3 wants "disabled"/"enabled" and DeepSeek-V4's encoder asserts on
+# anything outside {"chat", "thinking"}. Hence pairs of the same name, and
 # hence the order: "disabled" first, so MiniMax matches before V4's rejection
 # of it sends the probe on to "chat".
-REASONING_OFF_KWARGS: tuple[tuple[str, Any], ...] = (
-    ("enable_thinking", False),
-    ("thinking", False),
-    ("thinking_mode", "disabled"),
-    ("thinking_mode", "chat"),
+#
+# The on-value is the off-value's counterpart and is not probed for. It cannot
+# be: most templates default to reasoning on, so passing their on-value renders
+# identically to passing nothing, and "the render changed" -- the evidence the
+# off-probe runs on -- is absent by construction. Only MiniMax, whose default
+# is off, differs when switched on.
+REASONING_TOGGLES: tuple[tuple[str, Any, Any], ...] = (
+    ("enable_thinking", False, True),
+    ("thinking", False, True),
+    ("thinking_mode", "disabled", "enabled"),
+    ("thinking_mode", "chat", "thinking"),
 )
 
 # A template refusing a probe value, by name. A model-shipped Python encoder
@@ -172,7 +174,7 @@ _PROBE_REFUSALS = (TemplateError, TypeError, ValueError, AssertionError)
 
 def resolve_reasoning_toggle(
     tokenizer: Any, custom_encoder: MessageEncoderAdapter | None = None
-) -> tuple[str, Any] | None:
+) -> tuple[str, Any, Any] | None:
     """The kwarg that turns this model's reasoning off, and the value, or None.
 
     Rendered twice and compared, rather than matched against a table of model
@@ -199,7 +201,7 @@ def resolve_reasoning_toggle(
     baseline = render_probe_prompt(tokenizer, custom_encoder, tools=False)
     if baseline is None:
         return None
-    for name, off_value in REASONING_OFF_KWARGS:
+    for name, off_value, on_value in REASONING_TOGGLES:
         try:
             rendered = apply_chat_template(
                 tokenizer, custom_encoder, PROBE_MESSAGES, **{name: off_value}
@@ -207,7 +209,7 @@ def resolve_reasoning_toggle(
         except _PROBE_REFUSALS:
             continue
         if rendered != baseline:
-            return name, off_value
+            return name, off_value, on_value
     return None
 
 

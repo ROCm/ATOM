@@ -28,10 +28,35 @@ from .tool_parser import BufferedMarkerParser, ToolCall, unique_tool_call_id
 QWEN_TOOL_PREFIX = "<function="
 
 _FUNCTION_RE = re.compile(r"<function=(.*?)</function>|<function=(.*)$", re.DOTALL)
+_PARAM_OPENER = "<parameter="
 _PARAM_RE = re.compile(
     r"<parameter=(.*?)(?:</parameter>|(?=<parameter=)|(?=</function>)|$)",
     re.DOTALL,
 )
+
+
+def _is_truncated_call(fn_text: str, param_types: dict) -> bool:
+    """Is this unclosed `<function=...` a cut-off call, or prose quoting a tag?
+
+    The unclosed branch exists for a call the model was cut off mid-way
+    through. It cannot tell that from an answer explaining how to call a tool,
+    and used to accept both: "the model writes <tool_call><function=get_weather>
+    and then the parameters" produced `get_weather({})`, deleted the rest of
+    the sentence and reported `finish_reason: tool_calls`, so an agentic
+    client ran a tool nobody asked for.
+
+    Two things separate them, and prose has to fail both. The name is one the
+    request declared -- prose can name a real tool, so this alone is not
+    enough. And what follows the name is a parameter or nothing: a cut-off
+    call stops inside its own syntax, while prose continues in English.
+    """
+    gt = fn_text.find(">")
+    if gt == -1:
+        return False
+    if fn_text[:gt].strip() not in param_types:
+        return False
+    rest = fn_text[gt + 1 :].lstrip()
+    return not rest or _PARAM_OPENER.startswith(rest[: len(_PARAM_OPENER)])
 
 
 def _parse_function(
@@ -65,7 +90,14 @@ def _parse_function(
     )
 
 
-_PEEK_NAME_RE = re.compile(r"<function=([^>\n]+)>")
+# The name *and* the token that must follow it. A name alone matches prose
+# explaining how to call a tool, and an announcement cannot be retracted --
+# "the model writes <tool_call><function=get_weather> and then..." announced
+# `get_weather`. Waiting for the structure costs a few characters against
+# the thousands this saves.
+_PEEK_NAME_RE = re.compile(
+    r"<function=([^>\n]+)>\s*(?:<parameter=|</function>|</tool_call>)"
+)
 
 
 class QwenXmlParser(BufferedMarkerParser):
@@ -92,11 +124,15 @@ class QwenXmlParser(BufferedMarkerParser):
         content = text[:start] if start != -1 else text
         tool_calls: list[ToolCall] = []
         for fm in _FUNCTION_RE.finditer(text):
-            fn_text = fm.group(1) if fm.group(1) is not None else fm.group(2)
+            closed = fm.group(1) is not None
+            fn_text = fm.group(1) if closed else fm.group(2)
             if not fn_text:
                 continue
             tc = _parse_function(fn_text, param_types)
-            if tc is not None:
-                tool_calls.append(tc)
+            if tc is None:
+                continue
+            if not closed and not _is_truncated_call(fn_text, param_types):
+                continue
+            tool_calls.append(tc)
         # No call -> verbatim; see ToolCallParser.parse.
         return (content.strip() if tool_calls else text), tool_calls

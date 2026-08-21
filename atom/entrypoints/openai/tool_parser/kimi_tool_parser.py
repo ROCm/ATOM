@@ -58,9 +58,6 @@ def _parse_entries(section_text: str) -> list[ToolCall]:
     return tool_calls
 
 
-_PEEK_NAME_RE = re.compile(r"<\|tool_call_begin\|>functions\.([^:\s]+):")
-
-
 class KimiParser(ToolCallParser):
     """States: 0 = plain content, 1 = inside section, 2 = section closed."""
 
@@ -69,11 +66,12 @@ class KimiParser(ToolCallParser):
     # markers inside it are `_drain_entries`' business, never a reader's.
     START_MARKERS: ClassVar[tuple[str, ...]] = (KIMI_SECTION_BEGIN,)
 
-    @classmethod
-    def peek_name(cls, region: str) -> str | None:
-        """`<|tool_call_begin|>functions.NAME:0` -- the entry header."""
-        m = _PEEK_NAME_RE.search(region)
-        return m.group(1) if m else None
+    # No `peek_name`, deliberately. This format carries the call's index and
+    # id on the wire (`functions.NAME:INDEX`), and an announcement has to be
+    # stamped with both before the entry that supplies them has arrived --
+    # every announced call went out at index 0, so a client accumulating by
+    # index overwrote the first call with the second. It also drains per
+    # completed entry rather than at flush, so it has the least to gain.
 
     @classmethod
     def detect(cls, text: str) -> bool:
@@ -112,22 +110,32 @@ class KimiParser(ToolCallParser):
             if scan.hit is not None:
                 self.state = 1
                 self.buf = scan.rest
-                results.extend(self.announce(self.buf))
                 results.extend(self._drain_entries())
 
         elif self.state == 1:
             self.buf += text
             if KIMI_SECTION_END in self.buf:
-                self.buf = self.buf.split(KIMI_SECTION_END)[0]
+                section, _, after = self.buf.partition(KIMI_SECTION_END)
+                self.buf = section
                 results.extend(self._drain_entries())
-                results.append(("tool_call_end", None))
-                self.state = 2
+                if self.emitted_calls:
+                    results.append(("tool_call_end", None))
+                else:
+                    # A start marker is not a promise, for this format too.
+                    # The section body was dropped here and `state = 2` then
+                    # discarded the rest of the stream: an answer quoting both
+                    # section tokens delivered 26 of its 135 characters when
+                    # fed four at a time, and all 135 in one shot. `flush`'s
+                    # fallback could not see it -- the bytes were already gone.
+                    kept = KIMI_SECTION_BEGIN + section + KIMI_SECTION_END
+                    results.append(("content", kept))
+                # Back to plain content, not a terminal state: text after the
+                # section is still the answer.
+                self.state = 0
                 self.buf = ""
+                if after:
+                    results.extend(self.process(after))
             else:
-                # This format drains per *completed* entry, so a call with a
-                # large argument payload still waited for its closing token.
-                # The name is in the entry header; it can go now.
-                results.extend(self.announce(self.buf))
                 results.extend(self._drain_entries())
 
         return results
@@ -145,13 +153,16 @@ class KimiParser(ToolCallParser):
             arguments = match.group(3).strip()
 
             results.extend(self._start_event(index, f"functions.{name}:{index}", name))
-            if arguments:
-                results.append(
-                    (
-                        "tool_call_args",
-                        {"index": index, "function": {"arguments": arguments}},
-                    )
+            # Unconditional, empty arguments included: a zero-parameter tool
+            # is a call the client should run, and `finish_reason` keys on
+            # this event. Gating it here reported `stop` for a response that
+            # had already sent a `tool_calls` delta.
+            results.append(
+                (
+                    "tool_call_args",
+                    {"index": index, "function": {"arguments": arguments}},
                 )
+            )
 
             self.buf = self.buf[match.end() :]
             self.emitted_calls += 1

@@ -345,20 +345,31 @@ def tool_event_frames(events, blocks: AnthropicBlocks):
     returning it from a generator would need the `yield from` that cannot be
     written there.
     """
+    open_call: dict | None = None
     for etype, edata in events:
         if etype == "content":
             yield from blocks.delta("text", edata)
         elif etype == "tool_call_start":
             fn = edata.get("function", {})
-            yield from blocks.open(
-                "tool_use",
-                tool_use_id=edata.get("id", ""),
-                tool_name=fn.get("name", ""),
-            )
+            open_call = {
+                "tool_use_id": edata.get("id", ""),
+                "tool_name": fn.get("name", ""),
+            }
+            yield from blocks.open("tool_use", **open_call)
         elif etype == "tool_call_args":
+            if open_call is None:
+                # No name and no id to open a block with, so there is no block
+                # to open. `delta` would have started one with both fields
+                # empty -- syntactically a tool_use the client can neither
+                # dispatch nor return a result for. Arguments with no call are
+                # a parser bug; dropping them is the only honest frame.
+                continue
             fn = edata.get("function", {})
-            yield from blocks.delta("tool_use", fn.get("arguments", ""))
+            # The id and name again: `delta` re-opens the block if anything
+            # landed in between, and without them it would re-open it blank.
+            yield from blocks.delta("tool_use", fn.get("arguments", ""), **open_call)
         elif etype == "tool_call_end":
+            open_call = None
             yield from blocks.close()
 
 

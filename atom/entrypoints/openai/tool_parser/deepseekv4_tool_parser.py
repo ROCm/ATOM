@@ -108,7 +108,8 @@ def _infer_name(arg_names: set, param_types: dict[str, dict[str, Any]]) -> str |
     return best
 
 
-_PEEK_NAME_RE = re.compile(r'invoke name="([^"]+)"')
+# Name plus the token that must follow; see QwenXmlParser for why.
+_PEEK_NAME_RE = re.compile(r'invoke name="([^"]+)">\s*<[^>]*(?:parameter|/)')
 
 
 class DsmlParser(BufferedMarkerParser):
