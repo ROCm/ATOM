@@ -19,11 +19,20 @@ prefix even when the chunk itself stays small. That work is paid once per
 chunk, so it is invariant to ``x`` and invisible to a model fitted only on
 prefix-free prefills - which is what makes an equal-latency solver shrink
 chunks far past the point where the extra chunks pay for themselves.
+
+``gamma`` is therefore what decides whether the feature helps, and it is also
+the coefficient startup profiling gets most wrong: dummy batches carry no real
+cached prefix, so a fit taken from them underestimates ``gamma`` by more than an
+order of magnitude on MLA models and predicts chunk sizes that do not shrink.
+Coefficients fitted from real requests are supplied through
+``--dynamic-chunking-calibration``; see
+``docs/dynamic_chunked_pipeline_parallelism.md`` for how to collect them.
 """
 
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 import numpy as np
@@ -42,6 +51,47 @@ MIN_PROFILE_SAMPLES = 8
 # predicted chunk at the profiled prefix to be at least this much smaller than
 # the initial chunk before dynamic chunking is allowed to run at all.
 MIN_USEFUL_SHRINK_FRACTION = 0.05
+
+# Concurrent prefills at which the equal-latency solver stops being useful.
+#
+# Rebalancing one request's chunks changes how well the pipeline is occupied
+# only while that request is its only source of prefill microbatches. A second
+# prefilling request interleaves its own chunks into the stages, so the fill and
+# drain cost is already amortized and shrinking this request's chunks only adds
+# chunks - each one re-paying `gamma * L`.
+SOLE_PREFILL_THRESHOLD = 2
+
+# Trailing schedule ticks `has_sole_prefill` takes the peak supply over.
+#
+# The condition has to hold for the whole of a request's prefill, not just the
+# instant a chunk is sized: an instantaneous reading drops to one prefill for a
+# step or two whenever a request finishes just before the next is admitted, and
+# a chunk sequence committed in that dip then executes alongside everything that
+# arrives behind it. One tick is one forward, so this window spans a good part of
+# a long prompt's prefill.
+GATE_SUPPLY_WINDOW = 16
+
+
+def has_sole_prefill(sources: int, recent_sources: Iterable[int] = ()) -> bool:
+    """Whether one request has been the pipeline's only prefill work recently.
+
+    ``sources`` counts every request with prefill left to do, including the one
+    being chunked, so 1 is the sole-prefill case.
+    """
+    return max((sources, *recent_sources)) < SOLE_PREFILL_THRESHOLD
+
+
+def parse_chunking_calibration(text: str) -> tuple[float, ...]:
+    """Parse ``"a,b,c,gamma"`` (or ``"a,b,c"``) into latency model coefficients."""
+    try:
+        coefficients = tuple(float(value) for value in text.split(","))
+    except ValueError as exc:
+        raise ValueError(
+            f"Dynamic chunking calibration must be comma-separated floats, got {text!r}"
+        ) from exc
+    # Reuse the predictor's own validation so a bad fit fails at startup.
+    ChunkSizePredictor.from_coefficients(coefficients)
+    return coefficients
 
 
 @dataclass(frozen=True)
@@ -160,7 +210,7 @@ class ChunkSizePredictor:
         model that is technically valid but flat in the prefix - see
         ``MIN_USEFUL_SHRINK_FRACTION``.
         """
-        raw = self._solve_chunk(history_len, self.target_latency(base_chunk_size))
+        raw = self.equal_latency_chunk(history_len, base_chunk_size)
         if not math.isfinite(raw) or raw <= 0:
             return False
         return raw <= base_chunk_size * (1.0 - MIN_USEFUL_SHRINK_FRACTION)
@@ -179,6 +229,24 @@ class ChunkSizePredictor:
         b = 2.0 * a * history_len + self.linear_coeff
         return (-b + math.sqrt(b * b + 4.0 * a * target)) / (2.0 * a)
 
+    def equal_latency_chunk(self, history_len: int, base_chunk_size: int) -> float:
+        """Chunk after ``history_len`` tokens that costs as much as the first one.
+
+        The budget is the initial chunk's runtime *minus* the prefix rebuild this
+        chunk owes, because ``gamma * L`` is a floor the chunk pays before any of
+        its own tokens are attended to. Equalizing only the attention-area terms
+        instead - as a model without ``gamma`` has to - leaves every chunk paying
+        that floor on top of an already-equal budget, so the later chunks come
+        out both too large to be equal-latency and too numerous.
+
+        Returns ``nan`` when the floor alone exceeds the budget: no chunk size
+        matches the first chunk's runtime, and the caller should stop shrinking.
+        """
+        target = self.target_latency(base_chunk_size) - self.prefix_coeff * history_len
+        if target <= 0.0:
+            return math.nan
+        return self._solve_chunk(history_len, target)
+
     def prefix_bounded_chunk(self, history_len: int) -> float:
         """Smallest chunk whose prefix rebuild stays inside its overhead budget."""
         if self.prefix_coeff <= 0.0 or history_len <= 0:
@@ -195,22 +263,26 @@ class ChunkSizePredictor:
         smooth_factor: float,
         alignment: int,
         max_chunk_size: int,
+        min_chunk_size: int,
     ) -> int | None:
-        """Solve ``f(L+x)-f(L)=f(base)-f(0)`` and apply serving constraints."""
+        """Solve for the equal-latency chunk and apply serving constraints."""
         if history_len < 0:
             raise ValueError("history_len must be non-negative")
         if base_chunk_size <= 0 or alignment <= 0 or max_chunk_size <= 0:
             raise ValueError("Chunk sizes and alignment must be positive")
+        if min_chunk_size <= 0:
+            raise ValueError("min_chunk_size must be positive")
         if not 0.0 <= smooth_factor <= 1.0:
             raise ValueError("smooth_factor must be in [0, 1]")
 
-        raw = self._solve_chunk(history_len, self.target_latency(base_chunk_size))
+        raw = self.equal_latency_chunk(history_len, base_chunk_size)
         if not math.isfinite(raw) or raw <= 0:
             return None
 
         smoothed = base_chunk_size + smooth_factor * (raw - base_chunk_size)
         lower_bound = max(
-            base_chunk_size // 4,
+            alignment,
+            min_chunk_size,
             int(self.prefix_bounded_chunk(history_len)),
         )
         constrained = min(
