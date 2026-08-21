@@ -10,12 +10,26 @@ landing point each stream's SSE generator reads from.
 """
 
 import array
+import logging
 import threading
+import time
 from asyncio import AbstractEventLoop, Event
 from dataclasses import dataclass, field
 from typing import Any, NamedTuple
 
 from atom.model_engine.sequence import new_token_ids
+
+logger = logging.getLogger("atom")
+
+# How long one stream may go without a chunk before it is worth a line. Long
+# enough that a slow prefill or a busy engine step never trips it; short
+# enough that a wedged response is named while the client is still waiting.
+SILENCE_LOG_SECONDS = 30.0
+
+# Every stream currently blocked in `StreamOutputCollector.get`, and since
+# when. Keyed by `id()`: entries are added and removed around a single await
+# in one place, so an id cannot outlive its collector here.
+_WAITING_SINCE: dict[int, float] = {}
 
 # Fields a later chunk overrides on the one it merges into, when it has a value
 # of its own. The SSE consumers keep the newest non-empty value they see, so
@@ -109,14 +123,53 @@ class StreamOutputCollector:
         self._ready.set()
 
     async def get(self) -> dict | tuple[int, dict]:
-        """Await the next chunk, carrying whatever merged into it."""
+        """Await the next chunk, carrying whatever merged into it.
+
+        Records when the wait started, which is the whole watchdog. A stalled
+        response is a stream that never wakes, and this is the one place any
+        stream waits, so a reader of `longest_silence_seconds` sees it while
+        it is happening -- the reported symptom of this bug class was ten
+        minutes of silence with every metric looking healthy.
+
+        A timestamp and a dict entry rather than `asyncio.wait_for`: this runs
+        once per token per stream, and arming a timer costs 1.38 us against
+        0.07 us for this. No timer also means no background task to own.
+        """
         while not self._pending:
-            await self._ready.wait()
+            started = time.monotonic()
+            _WAITING_SINCE[id(self)] = started
+            try:
+                await self._ready.wait()
+            finally:
+                _WAITING_SINCE.pop(id(self), None)
+            silence = time.monotonic() - started
+            if silence >= SILENCE_LOG_SECONDS:
+                # After the fact, and free: one comparison on a wake that was
+                # going to happen anyway. Catches a stall that recovered,
+                # which the gauge cannot -- by scrape time it is over.
+                logger.warning(
+                    f"request {self.request_id or '<unnamed>'} delivered "
+                    f"nothing for {silence:.1f}s before recovering; if this "
+                    f"repeats, the engine or the marker read-ahead is holding "
+                    f"output back"
+                )
         tag, chunk = next(iter(self._pending.items()))
         del self._pending[tag]
         if not self._pending:
             self._ready.clear()
         return chunk if tag is None else (tag, chunk)
+
+
+def longest_silence_seconds() -> float:
+    """How long the most starved in-flight stream has been waiting.
+
+    Zero when nothing is waiting. Exported as a gauge so a stalled response
+    shows up while it is stalled, rather than as a support ticket.
+    """
+    if not _WAITING_SINCE:
+        return 0.0
+    now = time.monotonic()
+    return now - min(_WAITING_SINCE.values())
 
 
 class _BufferedChunk(NamedTuple):

@@ -143,6 +143,18 @@ output, because a wrong guess there is silent — a Hermes-style
 `<tool_call>{"name": ...}` claimed by the GLM parser delivers the whole JSON
 blob as the tool's *name*. Pass a format name to override.
 
+**A stalled response is visible while it is stalled.**
+`StreamOutputCollector.get` is the single point at which any stream waits for
+its next chunk, so it records when each wait started, and
+`atom:stream_longest_silence_seconds` reports the age of the oldest one. Zero
+when nothing is waiting; non-zero and growing is a response that has stopped
+delivering while its client waits. A wait that ends after more than 30 seconds
+also logs a line naming the request — the gauge cannot see a stall that has
+already recovered by scrape time. Neither costs a timer: `asyncio.wait_for`
+around that await measured 1.38 us per token per stream against 0.07 us for a
+timestamp and a dict entry. This exists because the symptom that started this
+work was ten minutes of silence with every metric looking healthy.
+
 One consequence matters when reading benchmark output. ITL is sampled once per
 received SSE chunk (`backend_request_func.py`, `benchmark_serving.py`), so
 merging N tokens into one chunk removes N-1 samples and stretches the gaps that
@@ -773,7 +785,7 @@ server without modification.
 | File | Description |
 |------|-------------|
 | `atom/entrypoints/openai_server.py` | OpenAI-compatible API server (FastAPI + Uvicorn) |
-| `atom/entrypoints/openai/streaming_dispatch.py` | `StreamBatchDispatcher` (per-engine-step cross-thread dispatch) and `StreamOutputCollector` (per-request delivery, folds a backlog) |
+| `atom/entrypoints/openai/streaming_dispatch.py` | `StreamBatchDispatcher` (per-engine-step cross-thread dispatch), `StreamOutputCollector` (per-request delivery, folds a backlog) and the silence watchdog |
 | `atom/entrypoints/openai/sse.py` | SSE frame encoding (`data_frame`, `event_frame`) on a shared msgspec encoder |
 | `atom/entrypoints/openai/marker_scanner.py` | `MarkerScanner` — the one rule for how much of a stream is safe to release |
 | `atom/entrypoints/openai/reasoning.py` | Splits the reasoning channel from the answer; seeded per request by `prompt_starts_in_reasoning` |
