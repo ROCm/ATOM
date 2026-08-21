@@ -772,7 +772,9 @@ class DSparkLayer(Block):  # type: ignore[misc]
         # GPU-VERIFY: numerics validated against the V4 reference output stage.
         o = out.view(B * T, a.n_local_heads, a.head_dim)
         draft_pos_flat = draft_pos.view(-1)
-        o = a._wo_a_grouped_lora(o, draft_pos_flat, prefix=f"{a.layer_name}.dspark_wo_a")
+        o = a._wo_a_grouped_lora(
+            o, draft_pos_flat, prefix=f"{a.layer_name}.dspark_wo_a"
+        )
         out_final = _linear_out(a.wo_b(o)).view(B, T, -1)
         return out_final
 

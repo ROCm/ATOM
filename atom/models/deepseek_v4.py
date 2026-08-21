@@ -120,12 +120,6 @@ from atom.utils.forward_context import AttnState, get_forward_context
 
 logger = logging.getLogger(__name__)
 
-# wo_a shapes already announced on the mxscale path. Every V4 layer (plus the
-# DSpark draft) reaches `process_weights_after_loading` with identical dims, so
-# logging per layer buried the rank's startup in ~60 identical rows; keying on
-# the shape still surfaces a layer that lands somewhere unexpected.
-_WO_A_MXSCALE_LOGGED: set[tuple] = set()
-
 # ---------------------------------------------------------------------------
 # Classical KV cache scatter / gather helpers (PR3-pre2c-B).
 #
@@ -2543,15 +2537,14 @@ class DeepseekV4Attention(nn.Module):
 
         # ---- fp8 e8m0 mxscale batched-GEMM path (gfx950) --------------------
         # The 128x128 weight block scale and per-128 activation groups need
-        # N % 128 == 0 and K % 128 == 0; anything else falls through to BF16.
-        # ATOM_WO_A_MXSCALE=0 forces that fallthrough, which is the only way to
-        # measure this path against the BF16 one on hardware that qualifies.
+        # N % 128 == 0 and K % 128 == 0; anything else falls through to BF16,
+        # as does a block scale with no exact e8m0 form.
         G = self.n_local_groups
         N = self.o_lora_rank
         out_dim, K = int(w.shape[0]), int(w.shape[1])
+        w_scale = None
         if (
             self._is_gfx950
-            and os.environ.get("ATOM_WO_A_MXSCALE", "1") != "0"
             and out_dim == G * N
             and N % 128 == 0
             and K % 128 == 0
@@ -2560,42 +2553,28 @@ class DeepseekV4Attention(nn.Module):
             and scale.shape[1] == K // 128
         ):
             w_scale = _wo_a_block_scale_to_e8m0(scale.data, G)
-            if w_scale is None:
-                warn_key = (G, N, K, "not-ue8m0")
-                if warn_key not in _WO_A_MXSCALE_LOGGED:
-                    _WO_A_MXSCALE_LOGGED.add(warn_key)
-                    logger.warning(
-                        "%s: wo_a weight_scale is not power-of-two, so it has "
-                        "no exact e8m0 form; falling back to the BF16 wo_a. "
-                        "Re-quantize with scale_fmt='ue8m0' to use the mxscale "
-                        "batched GEMM. -- logged once per shape.",
-                        self.layer_name,
-                    )
-            else:
-                self._wo_a_fp8_dtype = w.dtype
-                # Cached as module attrs so the forward skips the reshape and
-                # the scale conversion on every call.
-                self._wo_a_w_fp8 = w.data.view(G, N, K)
-                self._wo_a_w_scale = w_scale
-                self._wo_a_mxscale = True
-                log_key = (G, N, K)
-                if log_key not in _WO_A_MXSCALE_LOGGED:
-                    _WO_A_MXSCALE_LOGGED.add(log_key)
-                    logger.info(
-                        "%s: wo_a using fp8 e8m0 mxscale batched GEMM "
-                        "(G=%d, N=%d, K=%d, keeping FP8 weight) -- logged once "
-                        "per shape, every matching layer takes this path.",
-                        self.layer_name,
-                        G,
-                        N,
-                        K,
-                    )
-                # Suppress the LinearBase CK-layout shuffle, same as the BF16
-                # branch below: the mxscale kernel reads `wo_a.weight` directly
-                # and needs the plain row-major [G*N, K] layout.
-                self.wo_a.quant_type = QuantType.No
-                self.wo_a.need_normalize_e4m3fn_to_e4m3fnuz = False
-                return
+        if w_scale is not None:
+            self._wo_a_fp8_dtype = w.dtype
+            # Cached as module attrs so the forward skips the reshape and the
+            # scale conversion on every call.
+            self._wo_a_w_fp8 = w.data.view(G, N, K)
+            self._wo_a_w_scale = w_scale
+            self._wo_a_mxscale = True
+            if self.layer_id == 0:
+                logger.info(
+                    "wo_a using fp8 e8m0 mxscale batched GEMM "
+                    "(G=%d, N=%d, K=%d, keeping FP8 weight); "
+                    "every layer with this shape takes the same path.",
+                    G,
+                    N,
+                    K,
+                )
+            # Suppress the LinearBase CK-layout shuffle, same as the BF16 branch
+            # below: the mxscale kernel reads `wo_a.weight` directly and needs
+            # the plain row-major [G*N, K] layout.
+            self.wo_a.quant_type = QuantType.No
+            self.wo_a.need_normalize_e4m3fn_to_e4m3fnuz = False
+            return
 
         # Dequant: w (FP8 [out, in]) × scale (e8m0 [out/128, in/128]) → BF16
         bf16 = _dequant_fp8_block_to_bf16(
