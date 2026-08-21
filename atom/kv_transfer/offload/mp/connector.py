@@ -374,16 +374,13 @@ class _LookupState:
 @dataclass
 class _PendingLoad:
     completion: LoadCompletionId
-    blocks: set[int]
     future: Any | None
-    event: Any
 
 
 @dataclass
 class _PendingSave:
     completion: SaveCompletionId
     future: Any | None
-    event: Any
 
 
 def _terminal_future_result(future: Any | None) -> tuple[bool, Any]:
@@ -650,7 +647,7 @@ class GLM52LMCacheMPConnector(KVConnectorBase):
 
     def _block_slice(
         self, req: LMCacheReqMeta, start: int, end: int
-    ) -> tuple[list[int], set[int]]:
+    ) -> list[int]:
         if start < 0 or end < start:
             raise ValueError(f"invalid LMCache MP token range [{start}, {end})")
         if start % self.block_size or end % self.block_size:
@@ -667,7 +664,7 @@ class GLM52LMCacheMPConnector(KVConnectorBase):
                 f"LMCache MP request {req.req_id} needs {expected} blocks for "
                 f"[{start}, {end}), got {len(block_ids)}"
             )
-        return block_ids, set(block_ids)
+        return block_ids
 
     def _submit_load(self, req: LMCacheReqMeta, event: Any) -> None:
         from lmcache.integration.atom import AtomMPTransferSpec
@@ -699,7 +696,7 @@ class GLM52LMCacheMPConnector(KVConnectorBase):
                     f"load range [{start}, {end}) is not LMCache chunk aligned "
                     f"({self.chunk_size})"
                 )
-            block_ids, block_set = self._block_slice(req, start, end)
+            block_ids = self._block_slice(req, start, end)
             op = AtomMPTransferSpec(
                 token_ids=list(req.token_ids),
                 block_ids=[block_ids],
@@ -710,7 +707,6 @@ class GLM52LMCacheMPConnector(KVConnectorBase):
                 request_id,
                 op,
                 event,
-                operation_id=operation_id,
             )
         except Exception:
             logger.exception(
@@ -725,9 +721,7 @@ class GLM52LMCacheMPConnector(KVConnectorBase):
             self._submitting_loads.discard(operation_id)
             self._pending_loads[operation_id] = _PendingLoad(
                 completion=completion,
-                blocks=block_set,
                 future=transfer,
-                event=event,
             )
 
     def _submit_save(self, req: LMCacheReqMeta, event: Any) -> None:
@@ -758,7 +752,7 @@ class GLM52LMCacheMPConnector(KVConnectorBase):
                 self._immediate_saves.add(completion)
             return
         try:
-            block_ids, _ = self._block_slice(req, start, end)
+            block_ids = self._block_slice(req, start, end)
             op = AtomMPTransferSpec(
                 token_ids=list(req.token_ids),
                 block_ids=[block_ids],
@@ -769,7 +763,6 @@ class GLM52LMCacheMPConnector(KVConnectorBase):
                 request_id,
                 op,
                 event,
-                operation_id=operation_id,
             )
         except Exception:
             logger.exception(
@@ -785,7 +778,6 @@ class GLM52LMCacheMPConnector(KVConnectorBase):
             self._pending_saves[operation_id] = _PendingSave(
                 completion=completion,
                 future=transfer,
-                event=event,
             )
 
     def get_finished(self) -> KVConnectorOutput:
@@ -795,6 +787,29 @@ class GLM52LMCacheMPConnector(KVConnectorBase):
         failed_load: set[LoadCompletionId] = set()
         done_save: set[SaveCompletionId] = set()
         with self._lock:
+            # Match vLLM's degraded-mode policy: once the MP server is
+            # unhealthy, abandon every pending retrieve and let the scheduler
+            # recompute into the blocks it already allocated. Stores are
+            # terminal from the scheduler's perspective because losing one
+            # cache opportunity must not retain finished-request blocks.
+            if not self._adapter.is_healthy:
+                done_save.update(
+                    pending.completion for pending in self._pending_saves.values()
+                )
+                failed_load.update(
+                    pending.completion for pending in self._pending_loads.values()
+                )
+                self._pending_saves.clear()
+                self._pending_loads.clear()
+                done_save.update(self._immediate_saves)
+                failed_load.update(self._immediate_load_failures)
+                self._immediate_saves.clear()
+                self._immediate_load_failures.clear()
+                return KVConnectorOutput(
+                    failed_loading=failed_load,
+                    finished_saving=done_save,
+                )
+
             for operation_id, pending in list(self._pending_saves.items()):
                 terminal, _result = _terminal_future_result(pending.future)
                 if terminal:

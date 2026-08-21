@@ -487,44 +487,26 @@ class _WorkerAdapter:
     lmcache_tokens_per_chunk = 8
 
     def __init__(self) -> None:
+        self.is_healthy = True
         self.registered = None
         self.groups = None
         self.loads = []
         self.saves = []
-        self.load_handles = {}
-        self.save_handles = {}
-        self.operation_ids = {}
         self.shutdown_called = False
 
     def register_kv_caches(self, tensors, *, engine_group_infos):
         self.registered = tensors
         self.groups = engine_group_infos
 
-    def submit_retrieve_request(self, request_id, op, event, *, operation_id=None):
-        self.loads.append((request_id, op, event))
-        assert operation_id is not None
-        handle = _WorkerFuture()
-        self.load_handles[operation_id] = handle
-        self.operation_ids.setdefault(("load", request_id), []).append(operation_id)
-        return handle
+    def submit_retrieve_request(self, request_id, op, event):
+        future = _WorkerFuture()
+        self.loads.append((request_id, op, event, future))
+        return future
 
-    def submit_store_request(self, request_id, op, event, *, operation_id=None):
-        self.saves.append((request_id, op, event))
-        assert operation_id is not None
-        handle = _WorkerFuture()
-        self.save_handles[operation_id] = handle
-        self.operation_ids.setdefault(("save", request_id), []).append(operation_id)
-        return handle
-
-    def finish_load(self, operation_id, *, result=True):
-        future = self.load_handles[operation_id]
-        future.value = result
-        future.ready = True
-
-    def finish_save(self, operation_id, *, result=True):
-        future = self.save_handles[operation_id]
-        future.value = result
-        future.ready = True
+    def submit_store_request(self, request_id, op, event):
+        future = _WorkerFuture()
+        self.saves.append((request_id, op, event, future))
+        return future
 
     def shutdown(self):
         self.shutdown_called = True
@@ -535,6 +517,28 @@ def _worker(adapter: _WorkerAdapter) -> mp_connector.GLM52LMCacheMPConnector:
     worker._adapter = adapter
     worker.chunk_size = 8
     return worker
+
+
+def _finish_load(
+    worker: mp_connector.GLM52LMCacheMPConnector,
+    operation_id: str,
+    *,
+    result: bool = True,
+) -> None:
+    future = worker._pending_loads[operation_id].future
+    future.value = result
+    future.ready = True
+
+
+def _finish_save(
+    worker: mp_connector.GLM52LMCacheMPConnector,
+    operation_id: str,
+    *,
+    result: bool = True,
+) -> None:
+    future = worker._pending_saves[operation_id].future
+    future.value = result
+    future.ready = True
 
 
 def test_worker_uses_transfer_boundary_and_exact_completion(fake_lmcache_modules):
@@ -559,13 +563,12 @@ def test_worker_uses_transfer_boundary_and_exact_completion(fake_lmcache_modules
     assert submitted.start == 0
     assert submitted.end == 8
     assert submitted.block_ids == [[10, 11]]
-    assert adapter.operation_ids[("load", "5")] == ["load:5:3"]
 
-    adapter.finish_load("load:5:3")
+    _finish_load(worker, "load:5:3")
     assert worker.get_finished().finished_loading == {operation}
 
 
-def test_worker_reports_failed_load_from_transfer_handle(fake_lmcache_modules):
+def test_worker_reports_failed_load_from_future(fake_lmcache_modules):
     adapter = _WorkerAdapter()
     worker = _worker(adapter)
     operation = LoadOperationId(req_id=6, generation=4)
@@ -577,22 +580,20 @@ def test_worker_reports_failed_load_from_transfer_handle(fake_lmcache_modules):
         load_operation=operation,
     )
     worker._submit_load(request, object())
-    adapter.finish_load("load:6:4", result=False)
+    _finish_load(worker, "load:6:4", result=False)
 
     output = worker.get_finished()
     assert output.finished_loading == set()
     assert output.failed_loading == {operation}
 
 
-def test_worker_handle_query_exception_preserves_inflight_transfers(
+def test_worker_future_query_exception_preserves_inflight_transfers(
     fake_lmcache_modules,
 ):
     adapter = _WorkerAdapter()
     worker = _worker(adapter)
     load_operation = LoadOperationId(req_id=10, generation=1)
     save_operation = SaveOperationId(req_id=11, generation=2)
-    load_event = object()
-    save_event = object()
     worker._submit_load(
         LMCacheReqMeta(
             req_id=10,
@@ -601,7 +602,7 @@ def test_worker_handle_query_exception_preserves_inflight_transfers(
             load_spec=LoadSpec(0, 8, can_load=True),
             load_operation=load_operation,
         ),
-        load_event,
+        object(),
     )
     worker._submit_save(
         LMCacheReqMeta(
@@ -611,23 +612,25 @@ def test_worker_handle_query_exception_preserves_inflight_transfers(
             save_spec=SaveSpec(skip_leading_tokens=0),
             save_operation=save_operation,
         ),
-        save_event,
+        object(),
     )
 
-    adapter.load_handles["load:10:1"].query_error = RuntimeError("load query failed")
-    adapter.save_handles["save:11:2"].query_error = RuntimeError("save query failed")
+    load_future = worker._pending_loads["load:10:1"].future
+    save_future = worker._pending_saves["save:11:2"].future
+    load_future.query_error = RuntimeError("load query failed")
+    save_future.query_error = RuntimeError("save query failed")
     output = worker.get_finished()
 
     assert output.finished_loading == set()
     assert output.failed_loading == set()
     assert output.finished_saving == set()
-    assert worker._pending_loads["load:10:1"].event is load_event
-    assert worker._pending_saves["save:11:2"].event is save_event
+    assert set(worker._pending_loads) == {"load:10:1"}
+    assert set(worker._pending_saves) == {"save:11:2"}
 
-    adapter.load_handles["load:10:1"].query_error = None
-    adapter.save_handles["save:11:2"].query_error = None
-    adapter.finish_load("load:10:1")
-    adapter.finish_save("save:11:2", result=False)
+    load_future.query_error = None
+    save_future.query_error = None
+    _finish_load(worker, "load:10:1")
+    _finish_save(worker, "save:11:2", result=False)
     output = worker.get_finished()
 
     assert output.finished_loading == {load_operation}
@@ -635,6 +638,44 @@ def test_worker_handle_query_exception_preserves_inflight_transfers(
     # A failed store loses this cache opportunity but is terminal and safe to
     # release, matching the legacy connector's save-failure semantics.
     assert output.finished_saving == {save_operation}
+
+
+def test_worker_unhealthy_drains_pending_for_same_block_recompute(
+    fake_lmcache_modules,
+):
+    adapter = _WorkerAdapter()
+    worker = _worker(adapter)
+    load_operation = LoadOperationId(req_id=12, generation=1)
+    save_operation = SaveOperationId(req_id=13, generation=1)
+    worker._submit_load(
+        LMCacheReqMeta(
+            req_id=12,
+            token_ids=list(range(8)),
+            block_ids=[70, 71],
+            load_spec=LoadSpec(0, 8, can_load=True),
+            load_operation=load_operation,
+        ),
+        object(),
+    )
+    worker._submit_save(
+        LMCacheReqMeta(
+            req_id=13,
+            token_ids=list(range(8)),
+            block_ids=[80, 81],
+            save_spec=SaveSpec(skip_leading_tokens=0),
+            save_operation=save_operation,
+        ),
+        object(),
+    )
+
+    adapter.is_healthy = False
+    output = worker.get_finished()
+
+    assert output.finished_loading == set()
+    assert output.failed_loading == {load_operation}
+    assert output.finished_saving == {save_operation}
+    assert worker._pending_loads == {}
+    assert worker._pending_saves == {}
 
 
 def test_worker_save_slices_chunk_blocks_and_preserves_operation(
@@ -656,9 +697,8 @@ def test_worker_save_slices_chunk_blocks_and_preserves_operation(
     assert submitted.start == 8
     assert submitted.end == 16
     assert submitted.block_ids == [[32, 33]]
-    assert adapter.operation_ids[("save", "8")] == ["save:8:2"]
 
-    adapter.finish_save("save:8:2")
+    _finish_save(worker, "save:8:2")
     assert worker.get_finished().finished_saving == {operation}
 
 
@@ -684,12 +724,11 @@ def test_worker_tracks_two_load_generations_for_one_raw_request(
         )
 
     assert set(worker._pending_loads) == {"load:20:1", "load:20:2"}
-    assert adapter.operation_ids[("load", "20")] == ["load:20:1", "load:20:2"]
 
-    adapter.finish_load("load:20:2")
+    _finish_load(worker, "load:20:2")
     assert worker.get_finished().finished_loading == {operations[1]}
     assert set(worker._pending_loads) == {"load:20:1"}
-    adapter.finish_load("load:20:1")
+    _finish_load(worker, "load:20:1")
     assert worker.get_finished().finished_loading == {operations[0]}
 
 
@@ -715,12 +754,11 @@ def test_worker_tracks_two_save_generations_for_one_raw_request(
         )
 
     assert set(worker._pending_saves) == {"save:21:1", "save:21:2"}
-    assert adapter.operation_ids[("save", "21")] == ["save:21:1", "save:21:2"]
 
-    adapter.finish_save("save:21:1")
+    _finish_save(worker, "save:21:1")
     assert worker.get_finished().finished_saving == {operations[0]}
     assert set(worker._pending_saves) == {"save:21:2"}
-    adapter.finish_save("save:21:2")
+    _finish_save(worker, "save:21:2")
     assert worker.get_finished().finished_saving == {operations[1]}
 
 
@@ -752,8 +790,8 @@ def test_worker_load_and_save_coexist_for_same_raw_request(fake_lmcache_modules)
 
     assert set(worker._pending_loads) == {"load:22:4"}
     assert set(worker._pending_saves) == {"save:22:5"}
-    adapter.finish_load("load:22:4")
-    adapter.finish_save("save:22:5")
+    _finish_load(worker, "load:22:4")
+    _finish_save(worker, "save:22:5")
     output = worker.get_finished()
     assert output.finished_loading == {load_operation}
     assert output.finished_saving == {save_operation}
@@ -778,14 +816,16 @@ def test_worker_rejects_exact_operation_replay(fake_lmcache_modules, kind):
         save_operation=operation if kind == "save" else None,
     )
     submit = worker._submit_load if kind == "load" else worker._submit_save
-    finish = adapter.finish_load if kind == "load" else adapter.finish_save
     operation_id = f"{kind}:23:6"
 
     submit(request, object())
     with pytest.raises(RuntimeError, match="duplicate LMCache MP"):
         submit(request, object())
 
-    finish(operation_id)
+    if kind == "load":
+        _finish_load(worker, operation_id)
+    else:
+        _finish_save(worker, operation_id)
     worker.get_finished()
     with pytest.raises(RuntimeError, match="duplicate LMCache MP"):
         submit(request, object())

@@ -30,13 +30,12 @@ rank-local retrieve failures visible.
 
 ATOM's Docker images install the v0.5.3 ROCm wheel for its prebuilt storage
 extensions, then overlay the complete Python package from the pinned
-LMCache#4662 commit `4232f111ea967b419662c404f5e4b8ee1f2f6c7d` and rebuild
-both `lmcache_native` and the HIP `c_ops` extension against the image's
-PyTorch. This full overlay is required:
+LMCache#4662 revision and rebuild both `lmcache_native` and the HIP `c_ops`
+extension against the image's PyTorch. This full overlay is required:
 overriding only LMCache's vLLM adapter does not install
-`lmcache.integration.atom`, `EngineType.ATOM`, or the public transfer-handle
-API. Until LMCache#4662 merges, external images must fetch that PR ref (or the
-same immutable commit) rather than installing the v0.5.3 wheel alone.
+`lmcache.integration.atom`, `EngineType.ATOM`, or ATOM cache-format detection.
+Until LMCache#4662 merges, external images must fetch that PR ref (or the same
+immutable commit) rather than installing the v0.5.3 wheel alone.
 
 The connector uses a layout-specific model namespace, so its objects cannot be
 mixed with objects written by vLLM's connector or ATOM's legacy connector.
