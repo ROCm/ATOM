@@ -13,6 +13,11 @@ this module contains no per-model conditions. Add a model there, not here.
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
+# Called directly and not through a local wrapper: the tool-call path asks the
+# same question, and a rename in between is how the two sides drifted apart in
+# the first place. It also carries the first-character reject this path had
+# gone without, which it pays for once per token on every stream -- including
+# models whose reasoning markers never appear.
 from .marker_scanner import held_suffix_len
 from .reasoning_dialects import DIALECTS
 
@@ -107,19 +112,6 @@ def _earliest_marker(buf: str, markers) -> tuple[int, str | None]:
     return best_i, best_m
 
 
-def _hold_back_len(buf: str, markers) -> int:
-    """Length of the longest suffix of ``buf`` that is a strict prefix of any
-    marker, so a marker split across chunk boundaries isn't emitted as text.
-
-    Delegates, because the tool-call path asks the same question and answering
-    it twice is how the two sides drifted apart. Delegating the *whole*
-    question and not just its inner loop also buys the first-character reject,
-    which this path had gone without: it runs once per token on every stream,
-    including the models with no reasoning channel at all.
-    """
-    return held_suffix_len(buf, tuple(markers))
-
-
 def separate_reasoning(
     text: str, starts_thinking: bool = False
 ) -> tuple[str | None, str]:
@@ -201,7 +193,7 @@ class ReasoningFilter:
         idx, marker = _earliest_marker(self.buf, _THINK_END_MARKERS)
         if idx != -1:
             return self._close_thinking(idx, marker)
-        hold = _hold_back_len(self.buf, _THINK_END_MARKERS)
+        hold = held_suffix_len(self.buf, _THINK_END_MARKERS)
         emit = self.buf[: len(self.buf) - hold] if hold else self.buf
         self.buf = self.buf[len(self.buf) - hold :] if hold else ""
         return [("reasoning_content", emit)] if emit else []
@@ -239,7 +231,7 @@ class ReasoningFilter:
                 # emitted as a tool call. vLLM's streaming path resolves this
                 # from the token vocabulary and buffers nothing; this is the
                 # same position, reached from the prompt.
-                hold = _hold_back_len(self.buf, _OUTPUT_OPEN_MARKERS)
+                hold = held_suffix_len(self.buf, _OUTPUT_OPEN_MARKERS)
                 cut = len(self.buf) - hold
                 if cut:
                     results.append(("content", self.buf[:cut]))

@@ -20,7 +20,11 @@ import json
 
 import pytest
 
-from atom.entrypoints.openai.serving_anthropic import AnthropicBlocks
+from atom.entrypoints.openai.serving_anthropic import (
+    AnthropicBlocks,
+    starts_a_tool_call,
+    tool_event_frames,
+)
 
 KINDS = ("text", "thinking", "tool_use")
 
@@ -153,3 +157,73 @@ class TestAResponseIsNeverEmpty:
         blocks = AnthropicBlocks()
         list(blocks.open("text"))
         assert blocks.index == 0
+
+
+class TestToolEventFrames:
+    """The tool-parser's events as Anthropic frames, in one place.
+
+    This dispatch was written out twice in the streaming endpoint -- once for
+    `process` and once for `flush` -- twenty-two identical lines each. Two
+    copies of a dispatch is a fix that lands in one of them and says nothing,
+    which is the hazard `AnthropicBlocks` itself was extracted to remove. It
+    was also untestable there: the endpoint body is an async generator inside
+    a route handler no unit test reaches.
+    """
+
+    @staticmethod
+    def _kinds(events, blocks=None):
+        frames = list(tool_event_frames(events, blocks or AnthropicBlocks()))
+        return [json.loads(f.split("data: ", 1)[1])["type"] for f in frames]
+
+    START = (
+        "tool_call_start",
+        {"id": "call_1", "function": {"name": "get_weather", "arguments": ""}},
+    )
+    ARGS = ("tool_call_args", {"function": {"arguments": '{"city":'}})
+    END = ("tool_call_end", None)
+
+    def test_a_whole_call_opens_streams_and_closes(self):
+        assert self._kinds([self.START, self.ARGS, self.END]) == [
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+        ]
+
+    def test_content_before_a_call_lands_in_a_text_block(self):
+        frames = list(
+            tool_event_frames([("content", "Checking."), self.START], AnthropicBlocks())
+        )
+        payloads = [json.loads(f.split("data: ", 1)[1]) for f in frames]
+        assert payloads[0]["type"] == "content_block_start"
+        assert payloads[0]["content_block"]["type"] == "text"
+        # The text block is closed before the tool block opens.
+        assert [p["type"] for p in payloads[1:]] == [
+            "content_block_delta",
+            "content_block_stop",
+            "content_block_start",
+        ]
+        assert payloads[-1]["content_block"]["type"] == "tool_use"
+
+    def test_the_call_carries_its_id_and_name(self):
+        frames = list(tool_event_frames([self.START], AnthropicBlocks()))
+        block = json.loads(frames[0].split("data: ", 1)[1])["content_block"]
+        assert block["id"] == "call_1" and block["name"] == "get_weather"
+
+    def test_an_unknown_event_type_is_ignored_not_crashed(self):
+        assert self._kinds([("something_new", {})]) == []
+
+    def test_no_events_emit_nothing(self):
+        assert self._kinds([]) == []
+
+    @pytest.mark.parametrize(
+        "events, expected",
+        [
+            ([], False),
+            ([("content", "hi")], False),
+            ([("tool_call_args", {}), ("tool_call_end", None)], False),
+            ([("content", "hi"), START], True),
+        ],
+    )
+    def test_starts_a_tool_call_reads_the_batch(self, events, expected):
+        """`stop_reason` turns on this, and it is asked of both batches."""
+        assert starts_a_tool_call(events) is expected

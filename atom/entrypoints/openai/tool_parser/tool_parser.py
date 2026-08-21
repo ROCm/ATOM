@@ -63,10 +63,21 @@ class ToolCallParser(ABC):
         self.state = 0
         self.current_index = 0
         self.emitted_calls = 0
-        # Only `BufferedMarkerParser` reads it, but every parser is built
-        # through here, so a subclass that forgot to initialise it would fail
-        # on its first chunk rather than at construction.
-        self._scanner_cache = None
+        self._scanner_cache: MarkerScanner | None = None
+
+    @property
+    def _scanner(self) -> MarkerScanner:
+        """Reads the text before the region; built on first use, per instance.
+
+        On the base rather than on `BufferedMarkerParser`, because Kimi is not
+        one of those and had grown its own copy -- lazy build and all -- with
+        the marker written out a second time instead of read from
+        `START_MARKERS`. A format's markers are declared once; a reader that
+        spells them again is the shape this module removed everywhere else.
+        """
+        if self._scanner_cache is None:
+            self._scanner_cache = MarkerScanner(self.START_MARKERS)
+        return self._scanner_cache
 
     # -- non-streaming ------------------------------------------------------
     @classmethod
@@ -148,13 +159,6 @@ class BufferedMarkerParser(ToolCallParser):
     @classmethod
     def detect(cls, text: str) -> bool:
         return cls.find_start(text) != -1
-
-    @property
-    def _scanner(self) -> MarkerScanner:
-        """Reads the pre-region text; built on first use, per instance."""
-        if self._scanner_cache is None:
-            self._scanner_cache = MarkerScanner(self.START_MARKERS)
-        return self._scanner_cache
 
     def process(self, text: str) -> list:
         results: list = []

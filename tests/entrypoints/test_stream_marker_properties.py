@@ -568,3 +568,77 @@ class TestBoundedWithhold:
             f"first content byte at input offset {held}/{len(text)}, against "
             f"{baseline} for the same text with {sorted(triggers)} neutralised"
         )
+
+
+# One real tool call per registered format, in that format's own syntax. Not
+# generated: a call's payload is the one thing each format spells differently,
+# so the table is written out and `test_every_format_has_a_call` is what stops
+# a new format from joining the registry without one.
+_NS = "]<]minimax[>["
+_D = "｜DSML｜"
+REAL_CALLS: dict[str, str] = {
+    "kimi": (
+        "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0"
+        '<|tool_call_argument_begin|>{"city": "Paris"}<|tool_call_end|>'
+        "<|tool_calls_section_end|>"
+    ),
+    "glm": (
+        "<tool_call>get_weather<arg_key>city</arg_key>"
+        "<arg_value>Paris</arg_value></tool_call>"
+    ),
+    "qwen": (
+        "<tool_call><function=get_weather><parameter=city>Paris</parameter>"
+        "</function></tool_call>"
+    ),
+    "kimi_k3": (
+        '<|open|>tools<|sep|><|open|>call tool="get_weather"<|sep|>'
+        '<|open|>argument key="city"<|sep|>Paris<|close|>argument<|close|>call'
+    ),
+    "dsml": (
+        f'<{_D}tool_calls><{_D}invoke name="get_weather">'
+        f'<{_D}parameter name="city" string="true">Paris</{_D}parameter>'
+        f"</{_D}invoke></{_D}tool_calls>"
+    ),
+    "minimax": (
+        f'{_NS}<tool_call>{_NS}<invoke name="get_weather">'
+        f'{_NS}<parameter name="city">Paris</{_NS}parameter>'
+        f"{_NS}</invoke>{_NS}</tool_call>"
+    ),
+}
+
+
+class TestARealCallSurvivesTheStream:
+    """The corpus above is all *non*-calls -- text that merely looks like one.
+
+    That is deliberate and it left a hole: nothing drove an actual tool call
+    through the streaming facade, so the wiring between the facade, each
+    format's read-ahead and its parser was unasserted. Pointing every parser's
+    scanner at another format's marker broke tool calls on four formats and
+    the whole suite stayed green.
+    """
+
+    def test_every_format_has_a_call(self):
+        assert set(REAL_CALLS) == {p.NAME for p in ALL_PARSERS}, (
+            "a registered format has no real call here, so nothing checks that "
+            "its streaming path produces one"
+        )
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_the_non_streaming_path_reads_the_call(self, parser):
+        """The fixture is a real call in this format, and this says so."""
+        _, calls = parser.parse(REAL_CALLS[parser.NAME], None)
+        assert [c.function["name"] for c in calls] == ["get_weather"]
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_the_call_arrives_however_it_is_chunked(self, parser):
+        text = "Let me look. " + REAL_CALLS[parser.NAME]
+        for label, chunks in split_every_way(text).items():
+            seen = drive(text, chunks, parser)
+            starts = seen.events.count("tool_call_start")
+            assert starts == 1, f"{label}: {starts} calls, events {seen.events}"
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_the_text_before_it_still_arrives(self, parser):
+        text = "Let me look. " + REAL_CALLS[parser.NAME]
+        seen = drive(text, split_every_way(text)["fixed-3"], parser)
+        assert "Let me look." in seen.content

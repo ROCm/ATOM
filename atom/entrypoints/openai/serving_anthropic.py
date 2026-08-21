@@ -331,6 +331,42 @@ class AnthropicBlocks:
         yield stream_content_block_delta(self.index, text, kind)
 
 
+def tool_event_frames(events, blocks: AnthropicBlocks):
+    """One batch of tool-parser events as Anthropic frames.
+
+    Written out twice in the streaming endpoint, once for `process` and once
+    for `flush`, twenty-two lines each. That is the same hazard
+    :class:`AnthropicBlocks` exists to remove one level up -- two copies of a
+    dispatch means a fix that lands in one of them, and nothing says so.
+
+    A plain generator and not `yield from` at the call site, because the
+    endpoint is an *async* generator and `yield from` is a syntax error inside
+    one. Whether a call started is left to the caller to read off `events`;
+    returning it from a generator would need the `yield from` that cannot be
+    written there.
+    """
+    for etype, edata in events:
+        if etype == "content":
+            yield from blocks.delta("text", edata)
+        elif etype == "tool_call_start":
+            fn = edata.get("function", {})
+            yield from blocks.open(
+                "tool_use",
+                tool_use_id=edata.get("id", ""),
+                tool_name=fn.get("name", ""),
+            )
+        elif etype == "tool_call_args":
+            fn = edata.get("function", {})
+            yield from blocks.delta("tool_use", fn.get("arguments", ""))
+        elif etype == "tool_call_end":
+            yield from blocks.close()
+
+
+def starts_a_tool_call(events) -> bool:
+    """Whether this batch opened a tool call, which is its own `stop_reason`."""
+    return any(etype == "tool_call_start" for etype, _ in events)
+
+
 def stream_content_block_start(
     index: int,
     block_type: str = "text",

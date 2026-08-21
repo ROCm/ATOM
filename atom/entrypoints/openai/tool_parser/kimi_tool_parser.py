@@ -20,7 +20,6 @@ rather than a random one, and ``index`` comes from the wire too.
 import re
 from typing import ClassVar
 
-from ..marker_scanner import MarkerScanner
 from .tool_parser import ToolCall, ToolCallParser
 
 KIMI_SECTION_BEGIN = "<|tool_calls_section_begin|>"
@@ -98,9 +97,7 @@ class KimiParser(ToolCallParser):
             # or an answer merely discussing one -- withheld everything after
             # it until the stream ended. The 30-character floor went with it;
             # the scanner's bound is the marker's own length.
-            if self._scanner_cache is None:
-                self._scanner_cache = MarkerScanner((KIMI_SECTION_BEGIN,))
-            scan = self._scanner_cache.feed(text)
+            scan = self._scanner.feed(text)
             if scan.released:
                 results.append(("content", scan.released))
             if scan.hit is not None:

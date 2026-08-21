@@ -199,20 +199,26 @@ class TestThePrecomputedPlanChangesNothing:
     @pytest.mark.parametrize("markers", MARKER_SETS, ids=lambda m: f"{len(m)}-markers")
     def test_it_agrees_with_the_one_marker_form_everywhere(self, markers):
         rng = random.Random(0)
-        scanner = MarkerScanner(markers)
         for _ in range(3000):
-            buf = "".join(rng.choice(self.ALPHABET) for _ in range(rng.randint(0, 16)))
-            oracle = max(partial_suffix_len(buf, m) for m in scanner._markers)
-            assert scanner._held_suffix_len(buf) == oracle, buf
-
-    @pytest.mark.parametrize("markers", MARKER_SETS, ids=lambda m: f"{len(m)}-markers")
-    def test_the_stateless_form_agrees_too(self, markers):
-        """`reasoning` owns its buffer and asks the same question."""
-        rng = random.Random(1)
-        for _ in range(2000):
             buf = "".join(rng.choice(self.ALPHABET) for _ in range(rng.randint(0, 16)))
             oracle = max(partial_suffix_len(buf, m) for m in markers)
             assert held_suffix_len(buf, markers) == oracle, buf
+
+    def test_the_scanner_holds_exactly_what_that_says(self):
+        """The scanner and the stateless form are one function now, and this
+        is what says so from the outside: what `feed` withholds is what
+        `held_suffix_len` reports, for every chunk of every marker set."""
+        rng = random.Random(1)
+        for markers in self.MARKER_SETS:
+            for _ in range(1500):
+                buf = "".join(
+                    rng.choice(self.ALPHABET) for _ in range(rng.randint(0, 16))
+                )
+                scanner = MarkerScanner(markers)
+                scan = scanner.feed(buf)
+                if scan.hit is not None:
+                    continue  # a completed marker is a different branch
+                assert len(scanner.held) == held_suffix_len(buf, markers), buf
 
     def test_the_plan_is_shared_between_scanners(self):
         """It is cached on the marker set: a scanner is built per request and

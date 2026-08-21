@@ -75,9 +75,11 @@ from .serving_anthropic import (
     anthropic_to_openai_messages,
     anthropic_to_openai_tools,
     build_anthropic_response,
+    starts_a_tool_call,
     stream_message_delta,
     stream_message_start,
     stream_message_stop,
+    tool_event_frames,
 )
 from .serving_chat import (
     build_chat_response,
@@ -1832,55 +1834,20 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                             else:
                                 # Phase 2: Tool call detection on content
                                 events = tool_parser.process(text)
-                                for etype, edata in events:
-                                    if etype == "content":
-                                        for _frame in blocks.delta("text", edata):
-                                            yield _frame
-                                    elif etype == "tool_call_start":
-                                        has_tool_calls = True
-                                        stop_reason = "tool_use"
-                                        fn = edata.get("function", {})
-                                        for _frame in blocks.open(
-                                            "tool_use",
-                                            tool_use_id=edata.get("id", ""),
-                                            tool_name=fn.get("name", ""),
-                                        ):
-                                            yield _frame
-                                    elif etype == "tool_call_args":
-                                        fn = edata.get("function", {})
-                                        for _frame in blocks.delta(
-                                            "tool_use", fn.get("arguments", "")
-                                        ):
-                                            yield _frame
-                                    elif etype == "tool_call_end":
-                                        for _frame in blocks.close():
-                                            yield _frame
+                                if starts_a_tool_call(events):
+                                    has_tool_calls = True
+                                    stop_reason = "tool_use"
+                                for _frame in tool_event_frames(events, blocks):
+                                    yield _frame
 
                         if finished:
                             # Flush remaining tool call events
-                            for etype, edata in tool_parser.flush():
-                                if etype == "content":
-                                    for _frame in blocks.delta("text", edata):
-                                        yield _frame
-                                elif etype == "tool_call_start":
-                                    has_tool_calls = True
-                                    stop_reason = "tool_use"
-                                    fn = edata.get("function", {})
-                                    for _frame in blocks.open(
-                                        "tool_use",
-                                        tool_use_id=edata.get("id", ""),
-                                        tool_name=fn.get("name", ""),
-                                    ):
-                                        yield _frame
-                                elif etype == "tool_call_args":
-                                    fn = edata.get("function", {})
-                                    for _frame in blocks.delta(
-                                        "tool_use", fn.get("arguments", "")
-                                    ):
-                                        yield _frame
-                                elif etype == "tool_call_end":
-                                    for _frame in blocks.close():
-                                        yield _frame
+                            events = tool_parser.flush()
+                            if starts_a_tool_call(events):
+                                has_tool_calls = True
+                                stop_reason = "tool_use"
+                            for _frame in tool_event_frames(events, blocks):
+                                yield _frame
 
                             # A response with no tool call must end on a text
                             # block even when it produced none, because a reply

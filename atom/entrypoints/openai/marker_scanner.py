@@ -27,6 +27,12 @@ as equivalent are not: `frozenset.intersection(buf)` hashes every character of
 `buf` (2.9 us on 900 chars) where `any(c in buf ...)` is a C substring search
 per marker character (0.12 us, 25x), and the buffer is not bounded by a marker
 on the way in -- callers concatenate a backlog into `text`.
+
+Judge a change here on a whole response through the real pipeline -- reasoning
+filter into tool parser, four-character tokens -- and not on one function.
+Alternating arms, three rounds each: 1579 -> 1383 ns/token on plain prose and
+1652 -> 1537 on an answer ending in a tool call. A single cross-process pair
+said the opposite before the arms were alternated.
 """
 
 from __future__ import annotations
@@ -53,15 +59,45 @@ def partial_suffix_len(text: str, marker: str) -> int:
     return 0
 
 
+@functools.lru_cache(maxsize=64)
 def _plan_for(markers) -> tuple[tuple[str, ...], tuple[str, ...], dict]:
     """:func:`_plan`, keyed on the marker *set* rather than how it was spelled.
 
-    The cache key is the argument, so without this the same markers in a
-    different order are a second entry holding an equal copy -- and the two
-    declaration sites for one format (its own `START_MARKERS` and a dialect's
-    tuple) do not have to agree on order for that to happen.
+    Two caches, and both earn their place. `_plan` is keyed on the normalised
+    set, so two spellings of one set share a single plan *object*. This one is
+    keyed on the spelling, so the callers that ask once per token -- always
+    with the same module-level constant -- skip the normalisation as well:
+    `sorted(set(...))` on every call was 148 ns of the 193 it took to answer.
     """
     return _plan(tuple(sorted(set(markers))))
+
+
+def _suffix_len(text: str, ordered: tuple, firsts: tuple, by_len: dict) -> int:
+    """Longest suffix of `text` that is a proper prefix of one of the markers.
+
+    The one loop. It was written twice -- once here for callers holding their
+    own buffer and once as a method on the scanner -- in a module whose whole
+    thesis is that asking this question in more than one place is how the
+    answers drift apart.
+
+    Nothing can be held unless the tail *starts* a marker, so a marker's first
+    character has to appear within the last `longest - 1` bytes. One substring
+    search over that window answers that, and it is a bet rather than a free
+    win: 2.4x when it rejects (737 ns -> 307 ns) against 1.3x slower when it
+    does not (847 ns -> 1108 ns), because the loop then repeats the search it
+    just paid for. A chunk whose last twenty bytes contain a marker's opening
+    character is the rare one, and this runs once per token on every stream
+    including models whose markers never appear at all.
+    """
+    longest = len(ordered[0])
+    if longest == 1:
+        return 0  # a one-character marker has no proper prefix
+    if not any(c in text[-(longest - 1) :] for c in firsts):
+        return 0
+    for k in range(min(longest - 1, len(text)), 0, -1):
+        if text[-k] in firsts and text[-k:] in by_len[k]:
+            return k
+    return 0
 
 
 @functools.lru_cache(maxsize=64)
@@ -91,16 +127,12 @@ def held_suffix_len(text: str, markers: tuple[str, ...]) -> int:
     """Longest suffix of `text` that is a proper prefix of any of `markers`.
 
     The stateless form of what :class:`MarkerScanner` withholds, for callers
-    that own their own buffer. Same cached plan, so they get the same answer
-    and the same first-character reject rather than a second implementation.
+    that own their own buffer. Same cached plan and the same loop, so they get
+    the same answer rather than a second implementation of the rule.
     """
     if not markers:
         return 0
-    ordered, firsts, by_len = _plan_for(markers)
-    for k in range(min(len(ordered[0]) - 1, len(text)), 0, -1):
-        if text[-k] in firsts and text[-k:] in by_len[k]:
-            return k
-    return 0
+    return _suffix_len(text, *_plan_for(markers))
 
 
 @dataclass(frozen=True)
@@ -130,7 +162,8 @@ class MarkerScanner:
     def __init__(self, markers: tuple[str, ...]):
         if not markers or any(not m for m in markers):
             raise ValueError("a scanner needs at least one non-empty marker")
-        self._markers, self._firsts, self._prefixes_by_len = _plan_for(markers)
+        self._plan = _plan_for(markers)
+        self._markers, self._firsts, self._prefixes_by_len = self._plan
         self._longest = len(self._markers[0])
         self._buf = ""
 
@@ -155,7 +188,7 @@ class MarkerScanner:
             self._buf = ""
             return Scan(buf[:at], hit, buf[at + len(hit) :])
 
-        cut = len(buf) - self._held_suffix_len(buf)
+        cut = len(buf) - _suffix_len(buf, *self._plan)
         self._buf = buf[cut:]
         # The invariant the whole class exists for: a stall is not something
         # to test for here, it is something that cannot be represented.
@@ -166,18 +199,6 @@ class MarkerScanner:
         """Release the held tail at end of stream; it never became a marker."""
         out, self._buf = self._buf, ""
         return out
-
-    def _held_suffix_len(self, buf: str) -> int:
-        """Longest suffix of `buf` that is a proper prefix of some marker.
-
-        Longest first, so the first hit is the answer. `buf[-k]` is that
-        suffix's first character, and a marker's first characters are few, so
-        the check rejects most lengths before the slice is even taken.
-        """
-        for k in range(min(self._longest - 1, len(buf)), 0, -1):
-            if buf[-k] in self._firsts and buf[-k:] in self._prefixes_by_len[k]:
-                return k
-        return 0
 
     def _earliest_complete(self, buf: str) -> tuple[int, str | None]:
         """Where the first complete marker starts, and which one it is.
