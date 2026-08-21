@@ -89,7 +89,7 @@ from .serving_completion import (
 )
 from .sse import event_frame
 from .streaming_dispatch import StreamBatchDispatcher, StreamOutputCollector
-from .tool_parser.registry import resolve_tool_call_parser
+from .tool_parser.registry import TOOL_CALL_PARSER_HELP, resolve_tool_call_parser
 
 # Configure logging
 logger = logging.getLogger("atom")
@@ -1677,6 +1677,11 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                 tool_parser.tools = anthropic_to_openai_tools(request.tools)
                 blocks = AnthropicBlocks()
                 has_tool_calls = False
+                # Reasoning the client did not ask for. Dropped, unless it
+                # turns out to be all the model produced -- a reasoning model
+                # stopped at max_tokens emits nothing else, and answering an
+                # empty message is worse than answering its working out.
+                withheld_reasoning: list[str] = []
                 output_tokens = 0
                 stop_reason = "end_turn"
 
@@ -1711,6 +1716,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
 
                             if field == "reasoning_content":
                                 if not _thinking_enabled:
+                                    withheld_reasoning.append(text)
                                     yield _ANTHROPIC_PING_FRAME
                                     continue
                                 for _frame in blocks.delta("thinking", text):
@@ -1775,6 +1781,15 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                             if not has_tool_calls and blocks.kind != "text":
                                 for _frame in blocks.open("text"):
                                     yield _frame
+                                if blocks.index == 0 and withheld_reasoning:
+                                    # Nothing was ever delivered: this whole
+                                    # response was reasoning the client did
+                                    # not ask for. Send it rather than an
+                                    # empty message.
+                                    for _frame in blocks.delta(
+                                        "text", "".join(withheld_reasoning)
+                                    ):
+                                        yield _frame
                             for _frame in blocks.close():
                                 yield _frame
                             yield stream_message_delta(stop_reason, output_tokens)
@@ -1993,12 +2008,7 @@ def main():
         "--tool-call-parser",
         type=str,
         default="auto",
-        help=(
-            "Tool-call wire format. 'auto' (default) reads it off the model's "
-            "chat template at startup; an explicit name overrides that. When "
-            "neither resolves, tool calls are delivered as plain text and the "
-            "startup log says so — the format is never guessed from output."
-        ),
+        help=TOOL_CALL_PARSER_HELP,
     )
     parser.add_argument(
         "--server-port",

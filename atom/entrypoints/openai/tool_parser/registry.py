@@ -129,6 +129,16 @@ logger = logging.getLogger("atom")
 
 AUTO = "auto"
 
+# Written once and used by both entrypoints, which is also the shape of the
+# bug it replaces: the flag existed on the OpenAI server and not on atomesh,
+# so the documented escape hatch did not exist there.
+TOOL_CALL_PARSER_HELP = (
+    "Tool-call wire format. 'auto' (default) reads it off the model's chat "
+    "template at startup; an explicit name overrides that. When neither "
+    "resolves, tool calls are delivered as plain text and the startup log "
+    "says so \u2014 the format is never guessed from output."
+)
+
 # The smallest request that makes a template render its tool instructions. The
 # tool is never called; only the framing the template wraps it in matters.
 _PROBE_MESSAGES = [{"role": "user", "content": "hi"}]

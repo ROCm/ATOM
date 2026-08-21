@@ -188,6 +188,7 @@ Server-specific CLI arguments:
 | `--server-port` | `8000` | HTTP port (note: `--port` is for internal engine communication) |
 | `--timeout-keep-alive` | `5` | Seconds an idle keep-alive connection is held. Pooling clients hold their end longer (aiohttp defaults to 15s), so a caller that pauses for longer than this reuses a socket the server already closed and has to re-send. Raise it past the caller's idle window to avoid that |
 | `--disable-uvicorn-access-log` | off | Stop uvicorn logging a line per HTTP request. It copies a `LogRecord` and writes to the same stdout as the engine, on the event loop |
+| `--tool-call-parser` | `auto` | Tool-call wire format. `auto` reads it from the model's chat template at startup (Jinja, or a model-side `encoding/encoding_*.py`); a name — `dsml`, `glm`, `kimi`, `kimi_k3`, `minimax`, `qwen` — overrides. When neither resolves, tool calls are delivered as plain text and the startup log says so; the format is never guessed from output. An unknown name is refused rather than silently disabling tool parsing. Accepted by the atomesh entrypoint too |
 
 All `EngineArgs` arguments are also accepted (see Section 7 for the full list).
 

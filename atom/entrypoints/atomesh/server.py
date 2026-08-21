@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from atom.entrypoints.openai.tool_parser.registry import TOOL_CALL_PARSER_HELP
 from atom.utils.gc_utils import (
     freeze_gc_heap,
     maybe_attach_gc_debug_callback,
@@ -112,6 +113,7 @@ def initialize_standalone_service(
         tokenizer=tokenizer,
         model_name=args.model,
         default_chat_template_kwargs=default_chat_template_kwargs,
+        tool_call_parser=getattr(args, "tool_call_parser", None),
     )
 
 
@@ -161,6 +163,12 @@ def parse_standalone_args(raw_args: list[str]) -> StandaloneArgs:
         allow_abbrev=False,
     )
     EngineArgs.add_cli_args(parser)
+    parser.add_argument(
+        "--tool-call-parser",
+        type=str,
+        default="auto",
+        help=TOOL_CALL_PARSER_HELP,
+    )
     parser.add_argument(
         "--default-chat-template-kwargs",
         type=json_object_arg,

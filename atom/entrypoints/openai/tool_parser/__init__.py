@@ -3,8 +3,11 @@
 
 """Tool call parsing for models that emit tool calls in their text output.
 
-Six on-the-wire formats are auto-detected and normalized into the OpenAI
-``tool_calls`` structure:
+Six on-the-wire formats, normalized into the OpenAI ``tool_calls`` structure.
+Which one a model uses is resolved once at startup from its chat template
+(:func:`~.registry.resolve_tool_call_parser`) or set explicitly with
+``--tool-call-parser``; it is not inferred from the output, because inferring
+it means deciding from a prefix that may not carry the discriminator yet.
 
 ==============================  ===============================================
 Module                          Format
@@ -36,9 +39,11 @@ OpenAI format::
 To add a format: implement :class:`~.tool_parser.ToolCallParser` (or, if it
 buffers from a start marker like most do,
 :class:`~.tool_parser.BufferedMarkerParser`) in its own
-``<model>_tool_parser.py``, then register it in :mod:`.registry` — in both
-``_DETECT_ORDER`` and ``sniff_stream``, whose ordering constraints are
-documented there.
+``<model>_tool_parser.py`` declaring its ``START_MARKERS``, then add it to
+``_DETECT_ORDER`` in :mod:`.registry`, whose ordering constraints are
+documented there. That one entry is enough: startup resolution, the streaming
+read-ahead, ``--tool-call-parser``\'s accepted names and the property tests
+are all derived from it.
 """
 
 from .deepseekv4_tool_parser import DsmlParser

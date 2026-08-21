@@ -915,6 +915,7 @@ class AtomStandaloneService:
         tokenizer: Any,
         model_name: str,
         default_chat_template_kwargs: dict[str, Any] | None = None,
+        tool_call_parser: str | None = None,
     ) -> None:
         self.engine = engine
         self.tokenizer = tokenizer
@@ -928,7 +929,7 @@ class AtomStandaloneService:
             getattr(tokenizer, "chat_template", None) or ""
         )
         self.tool_parser_cls = resolve_tool_call_parser(
-            None, tokenizer, self.custom_message_encoder, model=model_name
+            tool_call_parser, tokenizer, self.custom_message_encoder, model=model_name
         )
         self.engine_service = AtomEngineService(engine, tokenizer)
         self._streams: dict[str, ChatCompletionStreamState] = {}

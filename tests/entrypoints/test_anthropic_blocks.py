@@ -122,3 +122,34 @@ class TestBlockFraming:
 
     def test_closing_before_anything_opened_emits_nothing(self):
         assert list(AnthropicBlocks().close()) == []
+
+
+class TestAResponseIsNeverEmpty:
+    """A reply that produced only reasoning still says something.
+
+    `/v1/messages` drops reasoning when the request did not ask for thinking.
+    That was safe while an unseeded filter sent most output down the content
+    channel; once seeding is right, a reasoning model stopped at `max_tokens`
+    produces *nothing else*, and the client got pings, an empty text block and
+    `stop_reason=end_turn`. Measured: 20 pings, zero delta frames.
+
+    The block machine cannot fix this on its own -- the decision is the
+    endpoint's -- so what is pinned here is the shape the endpoint relies on:
+    an untouched machine reports `index == 0`, which is how it knows nothing
+    was delivered.
+    """
+
+    def test_an_untouched_machine_reports_nothing_delivered(self):
+        assert AnthropicBlocks().index == 0
+
+    def test_one_delivered_block_advances_the_index(self):
+        blocks = AnthropicBlocks()
+        list(blocks.delta("text", "hi"))
+        list(blocks.close())
+        assert blocks.index == 1
+
+    def test_opening_without_delivering_does_not_advance_it(self):
+        """The endpoint opens a trailing text block before it checks."""
+        blocks = AnthropicBlocks()
+        list(blocks.open("text"))
+        assert blocks.index == 0
