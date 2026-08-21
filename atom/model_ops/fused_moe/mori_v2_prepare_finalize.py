@@ -41,13 +41,13 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
+from aiter import ActivationType, QuantType
+from aiter.dist.parallel_state import get_dp_group
+from aiter.ops.flydsl.moe_common import GateMode
 
 import atom.model_ops.fused_moe.modular_kernel as mk
 from atom.model_ops.fused_moe.config import FusedMoEQuantConfig
 from atom.utils.forward_context import get_forward_context
-from aiter import ActivationType, QuantType
-from aiter.dist.parallel_state import get_dp_group
-from aiter.ops.flydsl.moe_common import GateMode
 
 try:
     import mori
@@ -88,6 +88,8 @@ def _import_v2_from_mori():
     try:
         from mori.ops.dispatch_combine_v2.dispatch_combine_op import (  # type: ignore
             EpDispatchCombineConfig as _Cfg,
+        )
+        from mori.ops.dispatch_combine_v2.dispatch_combine_op import (
             EpDispatchCombineOp as _Op,
         )
     except ImportError:
@@ -99,8 +101,10 @@ def _import_v2_from_mori():
         )
         if v2_dir not in sys.path:
             sys.path.insert(0, v2_dir)
-        from dispatch_combine_op import (  # type: ignore  # noqa: E402
+        from dispatch_combine_op import (  # type: ignore
             EpDispatchCombineConfig as _Cfg,
+        )
+        from dispatch_combine_op import (
             EpDispatchCombineOp as _Op,
         )
 
@@ -127,7 +131,7 @@ def _import_v2() -> None:
 
 
 def _resolve_transport() -> str:
-    """"mega" when ATOM_MORI_V2_FUSED is on, else mori's plain gather op-layer."""
+    """ "mega" when ATOM_MORI_V2_FUSED is on, else mori's plain gather op-layer."""
     from atom.utils import envs as _atom_envs
 
     return "mega" if _atom_envs.ATOM_MORI_V2_FUSED else "gather"
@@ -440,7 +444,7 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
 
         # bf16 dispatch, no wire quant: scales=None. indices carry global expert
         # ids (0..global_num_experts-1); mori routes id -> rank = id // EPR.
-        recv_x, recv_w, _recv_s, recv_idx, total_recv_t, routing = self._op.dispatch(
+        recv_x, recv_w, _recv_s, recv_idx, _total_recv_t, routing = self._op.dispatch(
             a1,
             topk_weights.to(torch.float32),
             None,
@@ -524,9 +528,7 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
         context = get_forward_context().context
         if context is None:
             return None
-        all_ranks_decode = getattr(
-            context, "dp_uniform_decode", not context.is_prefill
-        )
+        all_ranks_decode = getattr(context, "dp_uniform_decode", not context.is_prefill)
         if not all_ranks_decode:
             return None
         bound = context.graph_bs * topk_ids.shape[1] * get_dp_group().world_size
@@ -641,16 +643,16 @@ def make_mori_v2_prepare_finalize(moe, all2all_manager) -> MoriV2PrepareAndFinal
             None,
             max_tokens_per_rank=moe.max_num_tokens,
             num_dispatchers=ep_size,
-            mega_geometry=dict(
-                ep_rank=all2all_manager.rank,
-                ep_size=ep_size,
-                ep_src_global_rank=ep_src_global_rank,
-                hidden_dim=moe.hidden_dim,
-                max_num_inp_token_per_rank=moe.max_num_tokens,
-                num_experts=moe.num_experts,
-                num_experts_per_token=moe.experts_per_token,
-                data_type_itemsize=moe.in_dtype.itemsize,
-            ),
+            mega_geometry={
+                "ep_rank": all2all_manager.rank,
+                "ep_size": ep_size,
+                "ep_src_global_rank": ep_src_global_rank,
+                "hidden_dim": moe.hidden_dim,
+                "max_num_inp_token_per_rank": moe.max_num_tokens,
+                "num_experts": moe.num_experts,
+                "num_experts_per_token": moe.experts_per_token,
+                "data_type_itemsize": moe.in_dtype.itemsize,
+            },
         )
 
     op = init_mori_v2_op(
