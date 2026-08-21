@@ -39,7 +39,6 @@ export AITER_FLYDSL_STAGE2_FP8=1
 # at the rung, and at c10 (10 lanes, ~120k-token prompts, 91% HBM hit before
 # any of this) the extra forward costs more than the reuse it buys back.
 export ATOM_STATE_CHECKPOINT_DEMAND=0
-export ATOM_MLA_MAX_SPLIT_PER_BATCH=256
 
 CONC="${CONC:-1}"
 PORT="${PORT:-8000}"
