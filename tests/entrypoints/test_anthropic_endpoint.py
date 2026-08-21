@@ -10,7 +10,6 @@ functions and response builders.
 
 import json
 
-
 from atom.entrypoints.openai.serving_anthropic import (
     AnthropicMessage,
     AnthropicMessagesRequest,

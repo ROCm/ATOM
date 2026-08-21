@@ -9,6 +9,7 @@ value at the last slot with unfilled slots zeroed. No model / engine needed."""
 
 import pytest
 import torch
+from import_guard import skip_if_dependency_missing
 
 # Broad on purpose: under bare non-GPU pytest this import chain fails in more
 # ways than ImportError, and every one of them means the same thing here.
@@ -17,7 +18,7 @@ try:
 
     import atom.model_ops.v4_kernels  # noqa: F401  (heavy import chain)
 except Exception as _e:  # noqa: BLE001
-    pytest.skip(f"requires full atom import env: {_e}", allow_module_level=True)
+    skip_if_dependency_missing(_e, "requires full atom import env")
 
 from atom.model_ops.attentions.v4_pool_geometry import (
     CSA_RATIO,

@@ -62,17 +62,14 @@ from .reasoning import (
     prompt_tokens_start_in_reasoning,
 )
 from .serving_anthropic import (
+    AnthropicBlocks,
     AnthropicMessagesRequest,
     anthropic_to_openai_messages,
     anthropic_to_openai_tools,
     build_anthropic_response,
-    stream_content_block_delta,
-    stream_content_block_start,
-    stream_content_block_stop,
     stream_message_delta,
     stream_message_start,
     stream_message_stop,
-    stream_signature_delta,
 )
 from .serving_chat import (
     build_chat_response,
@@ -1670,9 +1667,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                 )
                 tool_parser = ToolCallStreamParser(parser_cls=tool_call_parser_cls)
                 tool_parser.tools = anthropic_to_openai_tools(request.tools)
-                block_index = 0
-                started_text = False
-                started_thinking = False
+                blocks = AnthropicBlocks()
                 has_tool_calls = False
                 output_tokens = 0
                 stop_reason = "end_turn"
@@ -1710,113 +1705,70 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                                 if not _thinking_enabled:
                                     yield _ANTHROPIC_PING_FRAME
                                     continue
-                                if not started_thinking and not started_text:
-                                    yield stream_content_block_start(
-                                        block_index, "thinking"
-                                    )
-                                    started_thinking = True
-                                if started_thinking:
-                                    yield stream_content_block_delta(
-                                        block_index, text, "thinking"
-                                    )
+                                for _frame in blocks.delta("thinking", text):
+                                    yield _frame
                             else:
                                 # Phase 2: Tool call detection on content
                                 events = tool_parser.process(text)
                                 for etype, edata in events:
                                     if etype == "content":
-                                        if started_thinking and not started_text:
-                                            yield stream_signature_delta(block_index)
-                                            yield stream_content_block_stop(block_index)
-                                            block_index += 1
-                                        if not started_text:
-                                            yield stream_content_block_start(
-                                                block_index, "text"
-                                            )
-                                            started_text = True
-                                        yield stream_content_block_delta(
-                                            block_index, edata, "text"
-                                        )
+                                        for _frame in blocks.delta("text", edata):
+                                            yield _frame
                                     elif etype == "tool_call_start":
                                         has_tool_calls = True
                                         stop_reason = "tool_use"
-                                        if started_text:
-                                            yield stream_content_block_stop(block_index)
-                                            block_index += 1
-                                            started_text = False
-                                        elif started_thinking:
-                                            yield stream_signature_delta(block_index)
-                                            yield stream_content_block_stop(block_index)
-                                            block_index += 1
-                                            started_thinking = False
                                         fn = edata.get("function", {})
-                                        yield stream_content_block_start(
-                                            block_index,
+                                        for _frame in blocks.open(
                                             "tool_use",
                                             tool_use_id=edata.get("id", ""),
                                             tool_name=fn.get("name", ""),
-                                        )
+                                        ):
+                                            yield _frame
                                     elif etype == "tool_call_args":
                                         fn = edata.get("function", {})
-                                        yield stream_content_block_delta(
-                                            block_index,
-                                            fn.get("arguments", ""),
-                                            "tool_use",
-                                        )
+                                        for _frame in blocks.delta(
+                                            "tool_use", fn.get("arguments", "")
+                                        ):
+                                            yield _frame
                                     elif etype == "tool_call_end":
-                                        yield stream_content_block_stop(block_index)
-                                        block_index += 1
+                                        for _frame in blocks.close():
+                                            yield _frame
 
                         if finished:
                             # Flush remaining tool call events
                             for etype, edata in tool_parser.flush():
                                 if etype == "content":
-                                    if not started_text:
-                                        if started_thinking:
-                                            yield stream_signature_delta(block_index)
-                                            yield stream_content_block_stop(block_index)
-                                            block_index += 1
-                                            started_thinking = False
-                                        yield stream_content_block_start(
-                                            block_index, "text"
-                                        )
-                                        started_text = True
-                                    yield stream_content_block_delta(
-                                        block_index, edata, "text"
-                                    )
+                                    for _frame in blocks.delta("text", edata):
+                                        yield _frame
                                 elif etype == "tool_call_start":
                                     has_tool_calls = True
                                     stop_reason = "tool_use"
-                                    if started_text:
-                                        yield stream_content_block_stop(block_index)
-                                        block_index += 1
-                                        started_text = False
                                     fn = edata.get("function", {})
-                                    yield stream_content_block_start(
-                                        block_index,
+                                    for _frame in blocks.open(
                                         "tool_use",
                                         tool_use_id=edata.get("id", ""),
                                         tool_name=fn.get("name", ""),
-                                    )
+                                    ):
+                                        yield _frame
                                 elif etype == "tool_call_args":
                                     fn = edata.get("function", {})
-                                    yield stream_content_block_delta(
-                                        block_index,
-                                        fn.get("arguments", ""),
-                                        "tool_use",
-                                    )
+                                    for _frame in blocks.delta(
+                                        "tool_use", fn.get("arguments", "")
+                                    ):
+                                        yield _frame
                                 elif etype == "tool_call_end":
-                                    yield stream_content_block_stop(block_index)
-                                    block_index += 1
+                                    for _frame in blocks.close():
+                                        yield _frame
 
-                            if not started_text and not has_tool_calls:
-                                if started_thinking:
-                                    yield stream_signature_delta(block_index)
-                                    yield stream_content_block_stop(block_index)
-                                    block_index += 1
-                                yield stream_content_block_start(block_index, "text")
-                                started_text = True
-                            if started_text:
-                                yield stream_content_block_stop(block_index)
+                            # A response with no tool call must end on a text
+                            # block even when it produced none, because a reply
+                            # of pure reasoning still has to carry a `text`
+                            # block for clients that read only that.
+                            if not has_tool_calls and blocks.kind != "text":
+                                for _frame in blocks.open("text"):
+                                    yield _frame
+                            for _frame in blocks.close():
+                                yield _frame
                             yield stream_message_delta(stop_reason, output_tokens)
                             yield stream_message_stop()
                             aborted = False

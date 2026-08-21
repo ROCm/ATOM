@@ -7,12 +7,14 @@ import json
 import queue
 
 import pytest
+from import_guard import skip_if_dependency_missing
 
 try:
     from atom.entrypoints.atomesh.atom_standalone_service import (
         ChatCompletionStreamState,
     )
 except Exception as exc:  # noqa: BLE001 pragma: no cover
+    skip_if_dependency_missing(exc, "atomesh service import unavailable")
     ChatCompletionStreamState = None  # type: ignore[assignment]
     _import_error = exc
 else:

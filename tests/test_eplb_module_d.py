@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
+from import_guard import skip_if_dependency_missing
 
 torch = pytest.importorskip("torch")
 
@@ -12,9 +13,9 @@ torch = pytest.importorskip("torch")
 # (aiter/triton) is unavailable.
 try:
     import atom.config  # noqa: F401
-    import atom.model_ops.eplb as eplb
+    from atom.model_ops import eplb
 except Exception as _e:  # aiter/triton absent under bare non-GPU pytest
-    pytest.skip(f"requires full atom import env: {_e}", allow_module_level=True)
+    skip_if_dependency_missing(_e, "requires full atom import env")
 
 
 def test_assign_sender_for_receiver_even_split():

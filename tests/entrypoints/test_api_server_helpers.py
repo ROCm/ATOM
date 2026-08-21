@@ -19,6 +19,7 @@ import types
 from types import SimpleNamespace
 
 import pytest
+from import_guard import skip_if_dependency_missing
 
 
 def _install_api_server_stubs() -> list[str]:
@@ -54,14 +55,14 @@ def _install_api_server_stubs() -> list[str]:
             sys.modules[mod_name] = stub
             injected.append(mod_name)
 
-    class _StubCoreManager:  # noqa: D401 - placeholder
+    class _StubCoreManager:
         def __init__(self, *a, **kw):
             pass
 
         def add_request(self, reqs):
             return None
 
-    class _StubEngineArgs:  # noqa: D401 - placeholder
+    class _StubEngineArgs:
         @classmethod
         def add_cli_args(cls, parser):
             return parser
@@ -87,6 +88,10 @@ try:
 
     api_server = importlib.import_module("atom.entrypoints.openai.api_server")
 except Exception as exc:  # pragma: no cover - environment-dependent skip
+    # Re-raises unless a third-party dependency is what is missing. It used to
+    # skip on anything, so a syntax error in `api_server.py` silenced this
+    # whole module and the suite still reported a clean run.
+    skip_if_dependency_missing(exc, "api_server import unavailable")
     api_server = None  # type: ignore[assignment]
     _import_error = exc
     # NB: do NOT reset _injected_modules here. When api_server import fails

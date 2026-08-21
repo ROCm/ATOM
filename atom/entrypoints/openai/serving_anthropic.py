@@ -287,6 +287,50 @@ def stream_message_start(
     )
 
 
+class AnthropicBlocks:
+    """One open content block at a time, closed before the next one opens.
+
+    Anthropic frames a response as indexed blocks of a kind -- text, thinking,
+    tool_use -- and a change of kind is a close and an open. Those transitions
+    used to be written out at each of the four places a segment could arrive,
+    each covering the subset its author needed. The one nobody needed,
+    text -> thinking, was missing: a reasoning segment arriving after content
+    had started matched no branch and was dropped, with no error and no log.
+    Measured on a model that answers, opens a `<think>` block and answers
+    again, 29 characters of reasoning went nowhere.
+
+    So the transition is asked for rather than written out: `delta` says which
+    kind this text belongs to and the switching is this class's problem. It
+    cannot silently do nothing, because there is no branch left to fall off.
+    """
+
+    def __init__(self) -> None:
+        self.index = 0
+        self.kind: str | None = None
+
+    def close(self):
+        """End the open block, if any. A thinking block signs off first."""
+        if self.kind is None:
+            return
+        if self.kind == "thinking":
+            yield stream_signature_delta(self.index)
+        yield stream_content_block_stop(self.index)
+        self.index += 1
+        self.kind = None
+
+    def open(self, kind: str, **start_kwargs):
+        """Start a block of `kind`, closing whatever was open."""
+        yield from self.close()
+        yield stream_content_block_start(self.index, kind, **start_kwargs)
+        self.kind = kind
+
+    def delta(self, kind: str, text: str, **start_kwargs):
+        """Emit `text` as `kind`, switching blocks if that is not the open one."""
+        if self.kind != kind:
+            yield from self.open(kind, **start_kwargs)
+        yield stream_content_block_delta(self.index, text, kind)
+
+
 def stream_content_block_start(
     index: int,
     block_type: str = "text",
