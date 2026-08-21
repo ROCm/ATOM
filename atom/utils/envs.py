@@ -29,6 +29,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_SIZE": lambda: int(os.getenv("ATOM_DP_SIZE", "1")),
     "ATOM_DP_MASTER_IP": lambda: os.getenv("ATOM_DP_MASTER_IP", "127.0.0.1"),
     "ATOM_DP_MASTER_PORT": lambda: int(os.getenv("ATOM_DP_MASTER_PORT", "29500")),
+    # Rendezvous base port; set per role when prefill/decode share a node.
+    "ATOM_DP_BASE_PORT": lambda: int(os.getenv("ATOM_DP_BASE_PORT", "0")),
     # Token-equivalent cost of one in-flight request for the "least_tokens" DP
     # load-balance strategy. The per-rank load score is
     #   sum(prompt_tokens) + ATOM_DP_LB_REQ_EQUIV * num_in_flight_requests
@@ -43,9 +45,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ATOM remaps the SGLang world into internal TP x PCP groups.
     # 0 means unset.
     "ATOM_SGLANG_PCP_SIZE": lambda: int(os.getenv("ATOM_SGLANG_PCP_SIZE", "0") or "0"),
-    "STATE_CKPT_EXTRA_ENTRIES": lambda: int(
-        os.getenv("STATE_CKPT_EXTRA_ENTRIES", "0") or "0"
-    ),
     # --- Compilation & Execution ---
     "ATOM_USE_TRITON_GEMM": lambda: os.getenv("ATOM_USE_TRITON_GEMM", "0") == "1",
     "ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE": lambda: (
@@ -117,8 +116,58 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_GLM_FUSED_INDEXER": lambda: (
         os.getenv("ATOM_ENABLE_GLM_FUSED_INDEXER", "1") == "1"
     ),
+    # Kimi-K3 DSpark draft: fuse the per-layer context-row KV write
+    # (K3DSparkMLAAttention.write_context_kv) into one Triton kernel --
+    # RMSNorm(kv_c) + rope(k_pe) + concat + paged-cache store, versus today's
+    # four launches plus a throwaway `empty_like` for the rope's query side.
+    # That chain runs once per draft layer (5) per drafting step over every
+    # scheduled target token, and each op re-reads the 576-wide latent from HBM
+    # only to hand it to the next, so the win is launch count and round trips,
+    # not FLOPs. Falls back per call when the cache layout or the rope is not
+    # the plain one the kernel understands (see
+    # MLAAttention.write_context_kv_latent). Measured on Kimi-K3 (MI355X, TP8,
+    # fp8 KV): one 4.65us kernel replaces a 14us three-kernel chain, saving 39us
+    # per drafting step at B=1 and ~36us at B=64 -- 0.1% of the step, since the
+    # draft runs under a cudagraph and the launches this removes cost host time,
+    # not device time. Against the per-op chain the stored latent differs on
+    # ~1 element in 5M, where it is the fused kernel that matches an fp64
+    # reference: aiter's RMSNorm rounds x*rstd to bf16 before applying w.
+    # Set to "0" to force the per-op chain if a regression is suspected. That
+    # chain is the eligibility fallback above, not debug code, so it stays
+    # reachable (and runs the first write of every layer) either way.
+    "ATOM_DSPARK_FUSED_CTX_KV": lambda: (
+        os.getenv("ATOM_DSPARK_FUSED_CTX_KV", "1") == "1"
+    ),
     "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION", "1") == "1"
+    ),
+    # DSpark block sampling: replace the Markov head's
+    #   bias = W1[x] @ W2.float().t() ; argmax(base_logits + bias)
+    # with one fused Triton kernel (atom/model_ops/dspark_markov_sample.py).
+    # The unfused spelling casts the whole [V, r] W2 table to fp32 INSIDE the
+    # T-iteration loop (~252MB of traffic per iteration for a table that never
+    # changes) and materializes two [B, V] fp32 tensors per iteration (42MB
+    # each at B=64, V=163840) that only an argmax ever reads. The fused path
+    # keeps W2 bf16, adds the base logits in the GEMM epilogue and reduces to
+    # ids in registers, so W2 is read exactly once per block position and no
+    # [B, V] intermediate exists. Covers both native DSpark block samplers,
+    # Kimi-K3 (r=256) and DeepSeek-V4 (r=512); the op is shape-generic and
+    # hands anything it cannot index back to the reference, but only K3 has
+    # been run on hardware.
+    # The bias GEMV moves from an fp32 matmul over an fp32 copy of W2 to bf16
+    # MFMA with an fp32 accumulator. Every product is exact in fp32 either way,
+    # so the result is equal to the reference up to accumulation order; whether
+    # an argmax anywhere flips on a last-ulp tie is empirical. Measured on
+    # Kimi-K3 (MI355X, TP8, fp8 KV, full GSM8K at 64 concurrency): acceptance
+    # 87.08% against 87.06% unfused, accept-length distribution equal to within
+    # 0.1pp, flexible-extract inside the run-to-run band (0.9477 / 0.9591 fused,
+    # 0.9522 unfused). Saves 145 us per drafting step at B=1 and ~235 us at
+    # B=64. Set to "0" to force the reference spelling if an acceptance-rate
+    # regression is suspected -- the fastest way to rule this kernel in or out,
+    # since the two paths are not bit-identical by construction. Read once when
+    # the Markov head is built, so it must be set before the server starts.
+    "ATOM_DSPARK_FUSED_MARKOV_SAMPLE": lambda: (
+        os.getenv("ATOM_DSPARK_FUSED_MARKOV_SAMPLE", "1") == "1"
     ),
     # Replicate the vocab embedding on every TP rank (full table per rank, purely
     # local lookup) instead of TP-sharding it — eliminates the post-embedding
@@ -234,6 +283,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Gate/Up interleave mode for MoE weight preshuffle and kernel gate_mode.
     # "0" (default) = SEPARATED layout; "1" = INTERLEAVE layout.
     "ATOM_MOE_GU_ITLV": lambda: os.getenv("ATOM_MOE_GU_ITLV", "0") == "1",
+    # --- MoE all2all (MoRI) wire format ---
+    "ATOM_MORI_FP4_DISPATCH": lambda: (os.getenv("ATOM_MORI_FP4_DISPATCH", "0") == "1"),
+    # Combine-side codec. "none" (the MoRI default) sends bf16 back;
+    # "fp8_blockwise" selects EpCombineIntraNodeKernel_*_fp8bwq_*.
+    "ATOM_MORI_COMBINE_QUANT": lambda: os.getenv("ATOM_MORI_COMBINE_QUANT", "none"),
     # --- MTP (relaxed mtp for quantized mtp) ---
     "ATOM_ENABLE_RELAXED_MTP": lambda: (
         os.getenv("ATOM_ENABLE_RELAXED_MTP", "0").lower() == "1"
@@ -309,6 +363,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Default: False (run the draft model normally).
     "ATOM_DEBUG_FORCE_SKIP_DRAFT_MODEL": lambda: (
         os.getenv("ATOM_DEBUG_FORCE_SKIP_DRAFT_MODEL", "0") == "1"
+    ),
+    # Run the DSpark draft model eager, bypassing torch.compile, while leaving
+    # the target compiled. Rollback lever for the draft's compiled path; prefer
+    # it over --level 0, which disables compilation for BOTH models. Note that
+    # --enforce-eager does NOT disable it: support_torch_compile keys off
+    # compilation_config.level only (see atom/utils/decorators.py:485).
+    # Default: False (compile the draft).
+    "ATOM_DSPARK_DISABLE_COMPILE": lambda: (
+        os.getenv("ATOM_DSPARK_DISABLE_COMPILE", "0") == "1"
     ),
     # NOTE: DSpark runtime knobs (confidence_schedule, ragged,
     # ragged_graph_sizes, q_buckets, disable_sps_calib) are no longer env vars.

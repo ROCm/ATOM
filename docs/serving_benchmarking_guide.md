@@ -92,6 +92,37 @@ Both `ChatCompletionResponse` and `CompletionResponse` include:
 Streaming responses use the SSE (Server-Sent Events) protocol with
 `data: [DONE]\n\n` as the termination signal.
 
+#### Delivery under load
+
+The API server is a single Python process, so at high concurrency the fixed
+per-chunk cost of delivering tokens (detokenize, coroutine wakeup, JSON encode,
+socket write) can cap throughput before the GPU does. Two things keep that cost
+down, neither of which delays a token:
+
+- **Backlog merging.** Each request's chunks land in a `StreamOutputCollector`
+  (`atom/entrypoints/openai/streaming_dispatch.py`), which holds at most one
+  chunk per stream: anything arriving behind an unread one merges into it.
+  Nothing is held back waiting for more, so a consumer that keeps up sees
+  exactly one chunk per engine step and a token is never delivered later than
+  it otherwise would have been.
+- **msgspec frame encoding** (`atom/entrypoints/openai/sse.py`), roughly 5.8x
+  cheaper per frame than `json.dumps`.
+
+One consequence matters when reading benchmark output. ITL is sampled once per
+received SSE chunk (`backend_request_func.py`, `benchmark_serving.py`), so
+merging N tokens into one chunk removes N-1 samples and stretches the gaps that
+remain: **every ITL statistic - mean, median and p99 alike - inflates by roughly
+the merge factor**, without any token being delivered later. Measured on
+Qwen3.5-27B-FP8 tp4 at concurrency 2048, mean ITL read 191.8 ms against a TPOT
+of 126.6 ms, while the same workload with merging disabled read 122.9 ms against
+a TPOT of 123.3 ms.
+
+**Compare TPOT, not ITL, whenever merging is active.** It is the only
+token-normalized latency in the report (`latency - ttft` over `output_len - 1`),
+so it stays honest at any merge factor. The ratio ITL/TPOT is itself the useful
+number: it *is* the merge factor, and a value near 1.0 means the frontend is
+keeping up and nothing ever merged.
+
 ### Server startup
 
 ```bash
@@ -108,6 +139,8 @@ Server-specific CLI arguments:
 |----------|---------|-------------|
 | `--host` | `0.0.0.0` | Bind address |
 | `--server-port` | `8000` | HTTP port (note: `--port` is for internal engine communication) |
+| `--timeout-keep-alive` | `5` | Seconds an idle keep-alive connection is held. Pooling clients hold their end longer (aiohttp defaults to 15s), so a caller that pauses for longer than this reuses a socket the server already closed and has to re-send. Raise it past the caller's idle window to avoid that |
+| `--disable-uvicorn-access-log` | off | Stop uvicorn logging a line per HTTP request. It copies a `LogRecord` and writes to the same stdout as the engine, on the event loop |
 
 All `EngineArgs` arguments are also accepted (see Section 7 for the full list).
 
@@ -661,6 +694,8 @@ server without modification.
 | File | Description |
 |------|-------------|
 | `atom/entrypoints/openai_server.py` | OpenAI-compatible API server (FastAPI + Uvicorn) |
+| `atom/entrypoints/openai/streaming_dispatch.py` | `StreamBatchDispatcher` (per-engine-step cross-thread dispatch) and `StreamOutputCollector` (per-request delivery, folds a backlog) |
+| `atom/entrypoints/openai/sse.py` | SSE frame encoding (`data_frame`, `event_frame`) on a shared msgspec encoder |
 | `atom/model_engine/llm_engine.py` | `LLMEngine` programmatic API |
 | `atom/sampling_params.py` | `SamplingParams` dataclass |
 | `atom/model_engine/arg_utils.py` | `EngineArgs` CLI argument definitions and engine factory |

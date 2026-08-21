@@ -651,7 +651,7 @@ else
     SBATCH_CMD+=(--partition "${SLURM_PARTITION}")
   fi
   if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-crusoe-mi355" || "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi355-crusoe" ]]; then
-    SBATCH_CMD+=(-q amd-burst-qos)
+    SBATCH_CMD+=(--qos amd-aifw-dev-qos)
   fi
   SBATCH_CMD+=(
     --nodes "${NUM_NODES}"

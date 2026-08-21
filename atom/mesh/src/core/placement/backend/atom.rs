@@ -47,10 +47,11 @@ impl AtomAdapter {
             })?;
         obj.insert("remote_dp_size".to_string(), json!(ctx.prefill_dp_size));
         obj.insert("remote_tp_size".to_string(), json!(tp_size));
-        let remote_dp_rank = ctx
-            .prefill_dp_rank
-            .map(|r| json!(r))
-            .or_else(|| obj.get("dp_rank").filter(|v| v.is_number()).cloned());
+        let remote_dp_rank = obj
+            .get("dp_rank")
+            .filter(|v| v.is_number())
+            .cloned()
+            .or_else(|| ctx.prefill_dp_rank.map(|r| json!(r)));
         if let Some(dp_rank) = remote_dp_rank {
             obj.insert("remote_dp_rank".to_string(), dp_rank);
         }

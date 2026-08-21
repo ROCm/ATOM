@@ -65,6 +65,21 @@ no wall-clock skew). See `atom/model_engine/prefill_delayer.py`. Active only whe
 | **ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM** | bool | 0 (false) | If set to `1`, use AITER Triton FP4 GEMM with non-shuffled weights. Takes precedence over the FP4 preshuffled GEMM path selected by `ATOM_USE_TRITON_GEMM`. |
 | **ATOM_USE_TRITON_MXFP4_BMM** | bool | 0 (false) | If set to `1`, use FP4 BMM in MLA attention module. |
 
+## MoE all2all (MoRI) wire format
+
+Both are opt-in and default to off; they only apply with DP attention + expert
+parallelism. They are *not* symmetric — FP4 dispatch only moves a quantization
+the MoE GEMM was going to perform anyway (it consumes FP4 activations either
+way, and `per_1x32` is per-row, so it does not matter which rank runs it), while
+FP8 combine adds a quantization that would not otherwise happen, since the
+expert output is bf16. Treat the dispatch knob as format matching and the
+combine knob as a quality/throughput tradeoff.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_MORI_FP4_DISPATCH** | bool | 0 (false) | If set to `1`, quantize activations to packed FP4 (E2M1, `per_1x32`) before the MoE all2all instead of sending bf16 — a quarter of the bytes on the dispatch wire — which selects `EpDispatchIntraNodeKernel_fp4`. MoRI picks its dispatch kernel from the dtype of the tensor handed to `dispatch()` but sizes its staging buffers from the config built at init, so this also switches `scale_dim` to `hidden_dim/32` and the scale type to e8m0. All three are resolved together by `mori_prepare_finalize.resolve_mori_dispatch()`; never set one without the others, as a mismatch strides the staging scale buffer wrong and faults on the first real batch instead of erroring cleanly. |
+| **ATOM_MORI_COMBINE_QUANT** | str | `none` | Combine-side codec passed into the MoRI config. `none` returns bf16; `fp8_blockwise` selects `EpCombineIntraNodeKernel_*_fp8bwq_*`; MoRI also accepts `fp8_direct_cast`. |
+
 ## Fusion passes
 
 ### TP AllReduce fusion
@@ -82,6 +97,19 @@ no wall-clock skew). See `atom/model_engine/prefill_delayer.py`. Active only whe
 | **ATOM_ENABLE_DS_QKNORM_QUANT_FUSION** | bool | 1 (true) | If set to `1`, fuse QK norm with quantization in MLA attention module. |
 | **ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD** | int | 1024 | Upper bound on MoE token count (`num_tokens` in the MoE forward) for using the dual-stream path: shared experts on a secondary CUDA stream while routed experts run on the default stream. If `num_tokens` exceeds this value, that forward uses single-stream MoE instead. Set to `0` to disable dual-stream setup entirely (no alt stream, no `maybe_dual_stream_forward` registration). |
 
+### DSpark block sampling
+
+DSpark drafts a `num_speculative_tokens`-wide block in one backbone pass, then
+samples it left-to-right with a low-rank first-order Markov head
+(`logits_k = base_logits_k + W1[x_{k-1}] @ W2ᵀ`, `x_k = argmax(logits_k)`). The
+unfused loop casts the whole `[V, r]` `W2` table to fp32 on every iteration and
+materializes two `[B, V]` fp32 tensors that only an `argmax` reads. See
+`atom/model_ops/dspark_markov_sample.py`.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_DSPARK_FUSED_MARKOV_SAMPLE** | bool | 1 (true) | Sample the DSpark block with a fused Triton kernel that computes the rank-`r` bias GEMV, adds the base logits in the GEMM epilogue and reduces to token ids in registers — so `W2` stays bf16 and is read exactly once per block position, and no `[B, V]` intermediate exists. Covers both native DSpark block samplers, Kimi-K3 (`r=256`) and DeepSeek-V4 (`r=512`); the op is shape-generic and hands anything it cannot index back to the reference, but only K3 has been run on hardware. Tie-breaking matches `torch.argmax` (lowest index). The bias moves from an fp32 matmul to bf16 MFMA with an fp32 accumulator: every product is exact in fp32 either way, so the result is equal to the reference up to accumulation order. Measured on Kimi-K3 (MI355X, TP8, fp8 KV, full GSM8K 5-shot at 64 concurrency): acceptance 87.08% against 87.06% unfused with the accept-length distribution equal to within 0.1pp, and flexible-extract inside the run-to-run band. Saves 145 µs per drafting step at B=1 and ~235 µs at B=64. Set to `0` to force the reference spelling if an acceptance-rate regression is suspected — the two paths are not bit-identical by construction, so this is the fastest way to rule the kernel in or out. Read at Markov-head construction, so set it before the server starts. |
+
 ### Qwen3 style
 
 | Variable | Type | Default | Description |
@@ -94,6 +122,17 @@ no wall-clock skew). See `atom/model_engine/prefill_delayer.py`. Active only whe
 |----------|------|---------|-------------|
 | **ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT** | bool | 1 (true) | If set to `1`, use Triton kernel to fuse RMSNorm with quantization. |
 | **ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT** | bool | 1 (true) | If set to `1`, use Triton kernel to fuse SiLU and mul with quantization in MLP module. |
+
+### DSpark drafting
+
+The Kimi-K3 DSpark draft writes the target's context rows into its own paged MLA
+cache once per draft layer per drafting step; the switch below shortens that
+path. The first write of each process logs which path it took, and logs again if
+that ever changes, so a fusion left inert by an unrecognised layout says so.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_DSPARK_FUSED_CTX_KV** | bool | 1 (true) | Write the context rows with one Triton kernel (RMSNorm + RoPE + concat + paged store) instead of four launches plus a throwaway `empty_like` for the RoPE's query side. Falls back per call when the cache layout or the RoPE is not the plain one the kernel understands (seg / shuffled-KV layouts keep their own write kernels), and until the RoPE's cos/sin cache has reached the device. Measured on Kimi-K3 (MI355X, TP8, fp8 KV): one 4.65 µs kernel replaces a 14 µs three-kernel chain, saving ~39 µs per drafting step at B=1 and ~36 µs at B=64. Set to `0` to force the per-op chain; that chain is the fallback above rather than debug code, so it stays reachable either way (it runs the first write of every layer). |
 
 ## V4 attention backend (Migration)
 
