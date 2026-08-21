@@ -524,8 +524,16 @@ def _attn_res_gate_op(
     add_hidden2: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return _gate_call(
-        prefix_sum, block_residual, score_weight, eps, add_hidden,
-        out_norm_weight, out_eps, add_hidden2, False, None,
+        prefix_sum,
+        block_residual,
+        score_weight,
+        eps,
+        add_hidden,
+        out_norm_weight,
+        out_eps,
+        add_hidden2,
+        False,
+        None,
     )
 
 
@@ -553,8 +561,16 @@ def _attn_res_gate_close_block_op(
     add_hidden2: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return _gate_call(
-        prefix_sum, block_residual, score_weight, eps, add_hidden,
-        out_norm_weight, out_eps, add_hidden2, True, None,
+        prefix_sum,
+        block_residual,
+        score_weight,
+        eps,
+        add_hidden,
+        out_norm_weight,
+        out_eps,
+        add_hidden2,
+        True,
+        None,
     )
 
 
@@ -572,8 +588,9 @@ def _attn_res_gate_close_block_op_fake(
     return (
         torch.empty_like(prefix_sum),
         torch.empty_like(prefix_sum),
-        torch.empty((T, B + 1, H), device=block_residual.device,
-                    dtype=block_residual.dtype),
+        torch.empty(
+            (T, B + 1, H), device=block_residual.device, dtype=block_residual.dtype
+        ),
     )
 
 
@@ -589,8 +606,16 @@ def _attn_res_gate_quant_op(
     add_hidden2: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     (y, y_scale), prefix_out = _gate_call(
-        prefix_sum, block_residual, score_weight, eps, add_hidden,
-        out_norm_weight, out_eps, add_hidden2, False, out_quant_dtype,
+        prefix_sum,
+        block_residual,
+        score_weight,
+        eps,
+        add_hidden,
+        out_norm_weight,
+        out_eps,
+        add_hidden2,
+        False,
+        out_quant_dtype,
     )
     return y, y_scale, prefix_out
 
@@ -607,10 +632,10 @@ def _attn_res_gate_quant_op_fake(
     add_hidden2: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return (
-        torch.empty(prefix_sum.shape, device=prefix_sum.device,
-                    dtype=out_quant_dtype),
-        torch.empty(_gate_scale_shape(prefix_sum), device=prefix_sum.device,
-                    dtype=torch.float32),
+        torch.empty(prefix_sum.shape, device=prefix_sum.device, dtype=out_quant_dtype),
+        torch.empty(
+            _gate_scale_shape(prefix_sum), device=prefix_sum.device, dtype=torch.float32
+        ),
         torch.empty_like(prefix_sum),
     )
 
@@ -627,8 +652,16 @@ def _attn_res_gate_quant_close_block_op(
     add_hidden2: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     (y, y_scale), prefix_out, block_out = _gate_call(
-        prefix_sum, block_residual, score_weight, eps, add_hidden,
-        out_norm_weight, out_eps, add_hidden2, True, out_quant_dtype,
+        prefix_sum,
+        block_residual,
+        score_weight,
+        eps,
+        add_hidden,
+        out_norm_weight,
+        out_eps,
+        add_hidden2,
+        True,
+        out_quant_dtype,
     )
     return y, y_scale, prefix_out, block_out
 
@@ -646,25 +679,34 @@ def _attn_res_gate_quant_close_block_op_fake(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     T, B, H = block_residual.shape
     return (
-        torch.empty(prefix_sum.shape, device=prefix_sum.device,
-                    dtype=out_quant_dtype),
-        torch.empty(_gate_scale_shape(prefix_sum), device=prefix_sum.device,
-                    dtype=torch.float32),
+        torch.empty(prefix_sum.shape, device=prefix_sum.device, dtype=out_quant_dtype),
+        torch.empty(
+            _gate_scale_shape(prefix_sum), device=prefix_sum.device, dtype=torch.float32
+        ),
         torch.empty_like(prefix_sum),
-        torch.empty((T, B + 1, H), device=block_residual.device,
-                    dtype=block_residual.dtype),
+        torch.empty(
+            (T, B + 1, H), device=block_residual.device, dtype=block_residual.dtype
+        ),
     )
 
 
 for _name, _fn, _fake in (
     ("kimi_k3_attn_res_gate", _attn_res_gate_op, _attn_res_gate_op_fake),
-    ("kimi_k3_attn_res_gate_close_block", _attn_res_gate_close_block_op,
-     _attn_res_gate_close_block_op_fake),
-    ("kimi_k3_attn_res_gate_quant", _attn_res_gate_quant_op,
-     _attn_res_gate_quant_op_fake),
-    ("kimi_k3_attn_res_gate_quant_close_block",
-     _attn_res_gate_quant_close_block_op,
-     _attn_res_gate_quant_close_block_op_fake),
+    (
+        "kimi_k3_attn_res_gate_close_block",
+        _attn_res_gate_close_block_op,
+        _attn_res_gate_close_block_op_fake,
+    ),
+    (
+        "kimi_k3_attn_res_gate_quant",
+        _attn_res_gate_quant_op,
+        _attn_res_gate_quant_op_fake,
+    ),
+    (
+        "kimi_k3_attn_res_gate_quant_close_block",
+        _attn_res_gate_quant_close_block_op,
+        _attn_res_gate_quant_close_block_op_fake,
+    ),
 ):
     direct_register_custom_op(
         op_name=_name, op_func=_fn, mutates_args=[], fake_impl=_fake
@@ -726,25 +768,51 @@ def apply_attn_res(
     if out_quant_dtype is None:
         if not close_block:
             return torch.ops.aiter.kimi_k3_attn_res_gate(
-                prefix_sum, block_residual, score_weight, eps, add_hidden,
-                out_norm_weight, out_eps, add_hidden2,
+                prefix_sum,
+                block_residual,
+                score_weight,
+                eps,
+                add_hidden,
+                out_norm_weight,
+                out_eps,
+                add_hidden2,
             )
         return torch.ops.aiter.kimi_k3_attn_res_gate_close_block(
-            prefix_sum, block_residual, score_weight, eps, add_hidden,
-            out_norm_weight, out_eps, add_hidden2,
+            prefix_sum,
+            block_residual,
+            score_weight,
+            eps,
+            add_hidden,
+            out_norm_weight,
+            out_eps,
+            add_hidden2,
         )
 
     if not close_block:
         y, y_scale, prefix_out = torch.ops.aiter.kimi_k3_attn_res_gate_quant(
-            prefix_sum, block_residual, score_weight, eps, out_quant_dtype,
-            add_hidden, out_norm_weight, out_eps, add_hidden2,
+            prefix_sum,
+            block_residual,
+            score_weight,
+            eps,
+            out_quant_dtype,
+            add_hidden,
+            out_norm_weight,
+            out_eps,
+            add_hidden2,
         )
         return (y, y_scale), prefix_out
 
     y, y_scale, prefix_out, block_out = (
         torch.ops.aiter.kimi_k3_attn_res_gate_quant_close_block(
-            prefix_sum, block_residual, score_weight, eps, out_quant_dtype,
-            add_hidden, out_norm_weight, out_eps, add_hidden2,
+            prefix_sum,
+            block_residual,
+            score_weight,
+            eps,
+            out_quant_dtype,
+            add_hidden,
+            out_norm_weight,
+            out_eps,
+            add_hidden2,
         )
     )
     return (y, y_scale), prefix_out, block_out
