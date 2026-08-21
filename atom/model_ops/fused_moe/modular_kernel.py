@@ -414,35 +414,6 @@ class FusedMoEModularKernel(torch.nn.Module):
             expert_tokens_meta,
         )
 
-        # TEMPORARY: capture for _test/bench_ep_moe.py. No-op unless
-        # ATOM_EP_MOE_DUMP_DIR is set; delete with ep_moe_dump.py.
-        from atom.model_ops.fused_moe.ep_moe_dump import maybe_dump_dispatched
-
-        maybe_dump_dispatched(
-            dispatch_a1,
-            dispatch_scale,
-            dispatch_ids,
-            dispatch_weights,
-            expert_tokens_meta.expert_num_tokens,
-            expert_map,
-            expert_mask,
-            local_num_experts,
-            w1,
-            w2,
-            {
-                "activation": activation,
-                "quant_type": quant_type,
-                "global_num_experts": global_num_experts,
-                "hidden_pad": hidden_pad,
-                "intermediate_pad": intermediate_pad,
-                "apply_router_weight_on_input": apply_router_weight_on_input,
-                "gate_mode": (moe_extra_args or {}).get("gate_mode"),
-                "swiglu_limit": (moe_extra_args or {}).get("swiglu_limit"),
-                "w1_scale": w1_scale,
-                "w2_scale": w2_scale,
-            },
-        )
-
         # aiter fused_moe expects a *binary* (0/1) expert_mask in this slot, not
         # the index-style expert_map (which carries -1 sentinels for non-local
         # experts). Passing expert_map here makes moe_sorting mis-classify
@@ -490,32 +461,51 @@ class FusedMoEModularKernel(torch.nn.Module):
             # written back into a full-M tensor below. A measured probe
             # (ATOM_EP_TRIM_PROBE) saw R reach exactly graph_bs*dp and never
             # exceed it, so the bound is exact -- but it has NO margin, hence the
-            # env gate and the all_ranks_decode guard (a non-uniform batch makes
-            # graph_bs this rank's size only, which under-counts the cluster).
+            # all_ranks_decode guard below (a non-uniform batch makes graph_bs
+            # this rank's size only, which under-counts the cluster).
             M_full = dispatch_a1.shape[0]
             M_eff = M_full
-            if envs.ATOM_EP_SHRINK_ROUTING:
-                _fwd_ctx = get_forward_context()
-                _ctx = _fwd_ctx.context
-                if _ctx is not None and getattr(
-                    _ctx, "dp_uniform_decode", not _ctx.is_prefill
-                ):
-                    # All host-side ints (max_seqlen_q is `int`, see
-                    # forward_context.ForwardMetadata) -- no sync, and constant
-                    # per captured graph exactly like graph_bs itself.
-                    tokens_per_rank = _ctx.graph_bs
-                    attn_md = _fwd_ctx.attn_metadata
-                    if attn_md is not None:
-                        tokens_per_rank *= attn_md.max_seqlen_q
-                    M_eff = min(M_full, tokens_per_rank * get_dp_group().world_size)
+            _fwd_ctx = get_forward_context()
+            _ctx = _fwd_ctx.context
+            if _ctx is not None and getattr(
+                _ctx, "dp_uniform_decode", not _ctx.is_prefill
+            ):
+                # All host-side ints (max_seqlen_q is `int`, see
+                # forward_context.ForwardMetadata) -- no sync, and constant
+                # per captured graph exactly like graph_bs itself.
+                tokens_per_rank = _ctx.graph_bs
+                attn_md = _fwd_ctx.attn_metadata
+                if attn_md is not None:
+                    tokens_per_rank *= attn_md.max_seqlen_q
+                M_eff = min(M_full, tokens_per_rank * get_dp_group().world_size)
 
             if M_eff < M_full:
                 # Views, not copies.
                 a1_eff = dispatch_a1[:M_eff]
                 ids_eff = dispatch_ids[:M_eff]
                 wts_eff = dispatch_weights[:M_eff]
+                # Allocate the row count mori's combine expects UP FRONT and let
+                # GEMM2's reduction write straight into its leading M_eff rows,
+                # so the shrink costs no copy at all. The tail is left
+                # UNINITIALISED on purpose: combine is driven by the routing
+                # handle and only touches slots < total_recv <= M_eff, so those
+                # rows are never read. Zeroing them would cost a ~147 MB memset
+                # per layer and buy nothing.
+                #
+                # GEMM2's output width is w2's N, which is the hidden size the
+                # activations came in with -- the experts are a K->N->K round
+                # trip -- so a1's trailing dim sizes this without reaching into
+                # the (pre-shuffled, hence misleading) weight shape.
+                full_out = torch.empty(
+                    (M_full, dispatch_a1.shape[-1]),
+                    dtype=dispatch_a1.dtype,
+                    device=dispatch_a1.device,
+                )
+                y_out = full_out[:M_eff]
             else:
                 a1_eff, ids_eff, wts_eff = dispatch_a1, dispatch_ids, dispatch_weights
+                full_out = None
+                y_out = None
 
             routing_data, gather_idx, scatter_idx, gate_valid = routing_from_dispatched(
                 wts_eff,
@@ -528,7 +518,7 @@ class FusedMoEModularKernel(torch.nn.Module):
             # apply_router_weight_on_input is False (mori asserts it), so GEMM2
             # applies them -- same split as flydsl's doweight_stage1=False.
             fused_out = triton_kernel_fused_experts(
-                None,  # output_tensor: unused, the GUGU path allocates its own
+                None,  # output_tensor: GGUU-only; the GUGU path takes `y_out`
                 a1_eff,
                 triton_experts["w13_weight"],
                 triton_experts["w2_weight"],
@@ -548,20 +538,12 @@ class FusedMoEModularKernel(torch.nn.Module):
                 swiglu_limit=triton_experts.get("swiglu_limit", 10.0),
                 apply_router_weight_on_input=apply_router_weight_on_input,
                 gate_valid=gate_valid,
+                y_out=y_out,
             )
 
-            if M_eff < M_full:
-                # Restore the row count mori's combine expects. The tail is left
-                # UNINITIALISED on purpose: combine is driven by the routing
-                # handle and only touches slots < total_recv <= M_eff, so those
-                # rows are never read. Zeroing them would cost a ~147 MB memset
-                # per layer and buy nothing.
-                full_out = torch.empty(
-                    (M_full, fused_out.shape[-1]),
-                    dtype=fused_out.dtype,
-                    device=fused_out.device,
-                )
-                full_out[:M_eff] = fused_out
+            if full_out is not None:
+                # GEMM2 already wrote fused_out (== full_out[:M_eff]) in place;
+                # widening back to M_full is just handing over the parent.
                 fused_out = full_out
 
             return self._finalize(

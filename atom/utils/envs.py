@@ -69,16 +69,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # moe_gemm_a16w4 / a4w4 / a8w4 path. Defaults to on for gfx94x, and for
     # gfx95x when ATOM_USE_TRITON_GEMM is set.
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
-    # Run the routed experts with the same Triton a8w4 GUGU kernel *inside* the
-    # EP modular kernel, i.e. between the mori dispatch and combine. Only the
-    # routing front end differs from the TP path (routing_from_dispatched after
-    # the all-to-all, rather than routing() from the raw logits). Forced off when
-    # EPLB is enabled.
-    "ATOM_USE_TRITON_MOE_EP": lambda: os.getenv("ATOM_USE_TRITON_MOE_EP", "0") == "1",
     # Select the a4w4 Triton wrapper instead of the a8w4 default, on both the TP
     # and EP paths. Only chooses *which* wrapper runs -- it cannot enable the
-    # Triton path on its own, and asserts if set without one of the two flags
-    # above. The weights are identical (both are w4); only the activation quant
+    # Triton path on its own, and asserts if set without ATOM_USE_TRITON_MOE.
+    # The weights are identical (both are w4); only the activation quant
     # differs, so no extra weight prep or memory is involved.
     "ATOM_USE_TRITON_MOE_A4W4": lambda: (
         os.getenv("ATOM_USE_TRITON_MOE_A4W4", "0") == "1"
@@ -88,29 +82,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the full (max_batched_tokens * ep_size) buffer, so the expert GEMMs run
     # over rows that are entirely padding.
     "ATOM_EP_TRIM_PREFILL": lambda: os.getenv("ATOM_EP_TRIM_PREFILL", "0") == "1",
-    # Run the Triton EP experts over only the rows that can actually be live --
-    # graph_bs * max_seqlen_q * dp (the cluster-token count mori's per-destination
-    # dedup permits) -- instead of the graph_bs * topk * dp the dispatch trim
-    # leaves. Cuts routing / quant / GEMM / reduce work by up to topk, since all
-    # of them are sized by M (and n_gates = M * topk).
-    #
-    # The mori buffer and the tensor handed to combine are NOT changed: the
-    # result is written back into a full-M tensor, so _prepare/_finalize see
-    # exactly what they see today. Only fires under all_ranks_decode, because
-    # graph_bs is this rank's size and a non-uniform batch would under-count the
-    # cluster. The bound is exact with NO margin (measured: R reaches it exactly),
-    # so this is opt-in until it has soaked.
-    "ATOM_EP_SHRINK_ROUTING": lambda: (
-        os.getenv("ATOM_EP_SHRINK_ROUTING", "0") == "1"
-    ),
-    # Which post-dispatch expert-sort implementation routing_from_dispatched uses.
-    # 2 (default) = ep_sort_routing_v2, the no-mesh prep+sort with the scatter and
-    # ExptData stages fused into one launch (3 kernels).
-    # 1 = ep_sort_routing_v1, the flydsl-style (E, M) uint8 mesh path (2 kernels),
-    # kept as the reference. v1's mesh holds one slot per (expert, token) cell, so
-    # it silently drops a repeat if a token picks the same local expert twice.
-    # Must be 1 or 2; routing_from_dispatched asserts otherwise.
-    "ATOM_EP_SORT_VERSION": lambda: int(os.getenv("ATOM_EP_SORT_VERSION", "2")),
     "ATOM_MLA_PAGE_SIZE": lambda: int(os.getenv("ATOM_MLA_PAGE_SIZE", "1")),
     # --- Kernel Fusion Toggles ---
     # fused_compress_attn: switch between Triton (default historical) and a

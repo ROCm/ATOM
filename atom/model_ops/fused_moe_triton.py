@@ -22,29 +22,13 @@ from math import prod
 
 import torch
 import triton
-import triton.language as tl
 from aiter import ActivationType
 from aiter.ops.triton.fusions.fused_clamp_act_mul import fused_clamp_act_mul
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 from atom.utils import envs
 
-if (
-    envs.ATOM_USE_TRITON_GEMM
-    or envs.ATOM_USE_TRITON_MOE
-    # The EP path reaches these same helpers from inside the modular kernel, so
-    # it must pull the imports in too -- otherwise they are NameErrors at call
-    # time when only the EP flag is set.
-    or envs.ATOM_USE_TRITON_MOE_EP
-):
-    from aiter.ops.triton.moe.moe_routing.routing import routing
-    # Module level, not function local: `_ep_scatter_expt_data_kernel` calls these
-    # from inside a @triton.jit body, so they must be resolvable in the kernel's
-    # global namespace when it is compiled on first launch.
-    from aiter.ops.triton._triton_kernels.moe.moe_routing.expt_data import (
-        _expt_data_compute_stage1,
-        _expt_data_compute_stage2,
-    )
+if envs.ATOM_USE_TRITON_GEMM or envs.ATOM_USE_TRITON_MOE:
     from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
         moe_gemm_a4w4,
         mxfp4_quant,
@@ -112,754 +96,6 @@ def _swizzle_mxfp4(
     )
 
 
-@triton.jit
-def _ep_gate_prep_kernel(
-    DispatchIds,  # (M, topk) int32, GLOBAL expert ids, row-major
-    ExpertMap,  # (E_map,) int32, global id -> local id, -1 if not owned here
-    NumLocalTokens,  # (1,) int32, valid row count R (device-side)
-    GateValid,  # (G,) int32 out
-    ExptIndx,  # (G,) int32 out, local id or SENTINEL
-    PartialHist,  # (n_ctas, N_BINS) int32 out, this CTA's private per-bin counts
-    n_gates,
-    e_map_numel,
-    TOPK: tl.constexpr,
-    SENTINEL: tl.constexpr,
-    N_BINS: tl.constexpr,  # next_pow2(SENTINEL + 1)
-    BLOCK: tl.constexpr,
-):
-    """Kernel A: gate gating + per-CTA private histogram. No atomics.
-    Replaces ~9 elementwise launches that all share the G = M*topk axis:
-        ids   = dispatch_ids.long().clamp_(0, E_map-1)
-        local = expert_map[ids]
-        local = where(row < R, local, -1)
-        gate_valid = (local >= 0).reshape(-1).int()
-        expt_indx  = where(local < 0, SENTINEL, local).reshape(-1).int()
-    The histogram is built as a one-hot reduction inside each CTA rather than
-    with `atomic_add` into shared bins: at prefill G is ~786k against 49 bins,
-    which serialises badly. Each CTA writes its own row of PartialHist, and the
-    cross-CTA combine happens in the scan kernel. This is the same two-level
-    scheme aiter's sort_tokens gets from `bitmatrix.sum(partials_block_size=...)`
-    -- we just build the partials directly instead of via a bitmatrix, which we
-    do not have post-dispatch.
-    """
-    pid = tl.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < n_gates
-
-    # Garbage rows can hold out-of-range ids; clamp so the ExpertMap gather stays
-    # in bounds. The last slot of ExpertMap is the sentinel entry, which is -1.
-    ids = tl.load(DispatchIds + offs, mask=mask, other=0)
-    ids = tl.minimum(tl.maximum(ids, 0), e_map_numel - 1)
-    local = tl.load(ExpertMap + ids, mask=mask, other=-1)
-
-    # Rows past R hold garbage from the over-allocated receive buffer.
-    row = offs // TOPK
-    r = tl.load(NumLocalTokens)
-    valid = (local >= 0) & (row < r) & mask
-
-    tl.store(GateValid + offs, valid.to(tl.int32), mask=mask)
-    expt = tl.where(valid, local, SENTINEL).to(tl.int32)
-    tl.store(ExptIndx + offs, expt, mask=mask)
-
-    # Private per-bin counts: (BLOCK, N_BINS) one-hot reduced along the gate axis.
-    # Out-of-range lanes are excluded via `mask`, or they would all land in bin 0.
-    bins = tl.arange(0, N_BINS)
-    onehot = ((expt[:, None] == bins[None, :]) & mask[:, None]).to(tl.int32)
-    tl.store(PartialHist + pid * N_BINS + bins, tl.sum(onehot, 0))
-
-
-@triton.jit
-def _ep_scan_partials_kernel(
-    PartialHist,  # (n_ctas, N_BINS) int32 in
-    CtaBase,  # (n_ctas, N_BINS) int32 out, exclusive scan down the CTA axis
-    Hist,  # (N_BINS,) int32 out, column totals
-    n_ctas,
-    N_BINS: tl.constexpr,
-    C_BLOCK: tl.constexpr,
-):
-    """Kernel A': exclusive scan of PartialHist down the CTA axis, per bin.
-    Grid is (N_BINS,) -- one program per bin, so the bins run in parallel and
-    each does a strided sequential scan over n_ctas. Gives every (CTA, bin) pair
-    its own write cursor, which is what lets the scatter avoid atomics entirely.
-    Separate launch by necessity: A's axis is G and this one's is the bin axis, so
-    no CTA arrangement serves both, and the scan needs every CTA's partial counts.
-    """
-    e = tl.program_id(0)
-    acc = tl.zeros([1], dtype=tl.int32)
-    for c0 in range(0, n_ctas, C_BLOCK):
-        offs = c0 + tl.arange(0, C_BLOCK)
-        m = offs < n_ctas
-        v = tl.load(PartialHist + offs * N_BINS + e, mask=m, other=0)
-        tl.store(CtaBase + offs * N_BINS + e, tl.cumsum(v, 0) - v + acc, mask=m)
-        acc += tl.sum(v, 0)
-    tl.store(Hist + e, tl.sum(acc, 0))
-
-
-@triton.jit
-def _ep_scatter_body(
-    pid,  # gate-axis CTA index (NOT program_id -- v2 offsets it)
-    ExptIndx,  # (G,) int32 in
-    DispatchWeights,  # (M, topk) f32 in, read flat as (G,)
-    CtaBase,  # (n_ctas, N_BINS) int32 in, from A'
-    Hist,  # (N_BINS,) int32 in, from A'
-    GatherIndx,  # (G,) int32 out == topk_indx
-    ScatterIndx,  # (G,) int32 out == gate_indx (inverse permutation)
-    GateScal,  # (G,) f32 out, router weights in sorted order
-    n_gates,
-    N_BINS: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    """Kernel B's body: the atomic-free scatter into expert-sorted order.
-    Takes `pid` as an argument rather than reading `tl.program_id(0)`, because it
-    occupies the upper part of v2's wider grid and must be shifted down by the
-    expt_data CTA count.
-    Deterministic, atomic-free scatter into expert-sorted order.
-    Destination of gate `i` in CTA `c` with bin `e`:
-        pos = bin_base[e] + cta_base[c][e] + rank_of_i_within_(c, e)
-    `bin_base` is the exclusive cumsum of Hist over bins -- only N_BINS (64)
-    elements, so every CTA recomputes it rather than reading a separate buffer.
-    `rank` comes from an exclusive cumsum of the same one-hot matrix Kernel A
-    built; recomputing it is cheaper than storing (BLOCK, N_BINS) per CTA, and is
-    the same trade aiter's P23 makes when it re-reads topk_ids.
-    Because the sentinel is the largest bin, live gates tile [0, sum(hist[:E]))
-    and dead gates land in the tail -- so the matmul, which only reads
-    GatherIndx[start_m + j] for j < hist[e], never sees them.
-    Both permutations and the permuted weights fall out of the same `pos`, so
-    GateScal cannot drift out of alignment, and outputs are int32 directly (no
-    trailing .int() copies).
-    """
-    idx = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = idx < n_gates
-
-    expt = tl.load(ExptIndx + idx, mask=mask, other=0)
-    bins = tl.arange(0, N_BINS)
-    h = tl.load(Hist + bins)
-    bin_base = tl.cumsum(h, 0) - h
-    cta = tl.load(CtaBase + pid * N_BINS + bins)
-
-    onehot = ((expt[:, None] == bins[None, :]) & mask[:, None]).to(tl.int32)
-    rank = tl.sum((tl.cumsum(onehot, 0) - onehot) * onehot, 1)
-    base = tl.sum((bin_base + cta)[None, :] * onehot, 1)
-    pos = base + rank
-
-    tl.store(GatherIndx + pos, idx.to(tl.int32), mask=mask)
-    tl.store(ScatterIndx + idx, pos.to(tl.int32), mask=mask)
-    w = tl.load(DispatchWeights + idx, mask=mask, other=0.0)
-    tl.store(GateScal + pos, w.to(tl.float32), mask=mask)
-
-
-@triton.jit
-def _ep_scatter_expt_data_kernel(
-    # --- scatter half, pid >= N_EXPTS ---
-    ExptIndx,  # (G,) int32 in
-    DispatchWeights,  # (M, topk) f32 in
-    CtaBase,  # (n_ctas, N_BINS) int32 in
-    Hist,  # (N_BINS,) int32 in -- shared by BOTH halves
-    GatherIndx,  # (G,) int32 out
-    ScatterIndx,  # (G,) int32 out
-    GateScal,  # (G,) f32 out
-    n_gates,  # also read by stage1 for TokenStart[N_EXPTS]
-    # --- expt_data half, pid < N_EXPTS ---
-    TokenStart,  # (N_EXPTS+1,) int32 out == token_offs_raw
-    TileStart,  # (N_EXPTS+1,) int32 out == token_offs_pad
-    MDTileInfo,  # (max_num_tiles,) int32 out == block_pid_map
-    max_num_tiles,
-    N_EXPTS: tl.constexpr,  # == blocks1a, the expt_data CTA count
-    tile_dim_log2: tl.constexpr,
-    BLOCK_A: tl.constexpr,  # next_pow2(N_EXPTS), stage1's tile width
-    EQUAL_A: tl.constexpr,  # N_EXPTS == BLOCK_A
-    N_BINS: tl.constexpr,
-    GATE_BLOCK: tl.constexpr,
-):
-    """v2 Kernel B+C: scatter and ExptData in ONE launch, split by CTA index.
-    Grid is ``(N_EXPTS + n_ctas,)``, borrowing the layout of aiter's
-    ``_combined_routing_fused`` (``blocks1a + blocks1b`` with an ``if pid <
-    blocks1a`` split). Legal because, given ``Hist``, the two halves are
-    independent: both only *read* the histogram, and their writes are disjoint --
-    scatter owns GatherIndx/ScatterIndx/GateScal, expt_data owns
-    TokenStart/TileStart/MDTileInfo.
-    Two deliberate differences from the aiter reference:
-    1. **No grid-wide dependency, so no barrier before the split.** The reference
-       must build its histogram inside the same launch, which it can only do
-       because ``_sum_bitmatrix_rows_fused`` has no ``pid`` in it: *every* CTA
-       recomputes the whole histogram from the compact bitmatrix and plain-stores
-       identical values. Its ``tl.debug_barrier()`` is intra-CTA and would not
-       have made a cooperative reduction safe. We have no bitmatrix, so our
-       histogram comes from ``_ep_gate_prep`` + ``_ep_scan_partials`` -- a real
-       cross-CTA reduction, hence a hard launch boundary that stays in place. It
-       also means Hist is already visible here and needs no barrier.
-    2. **stage1 is guarded by the branch.** The reference calls it for all pids,
-       including the gate-axis half; at our prefill that is ~3000 CTAs each
-       redundantly prefix-summing 48 bins for nothing. ``pid == 0``, which owns
-       stage1's terminal writes and the 0xFFFFFFFF tail memset, is still inside
-       the guard.
-    The one barrier we do keep is *within* the expt_data half: stage1 writes
-    TileStart lane-wise and stage2 reads TileStart[pid] as a scalar, so the
-    producing lane need not be the consuming one. `pid` is CTA-uniform, so the
-    branch is uniform and the barrier is well-formed.
-    Cost of branch fusion: one register/LDS budget and one `num_warps` for both
-    halves, sized by whichever is heavier (the scatter's (GATE_BLOCK, N_BINS)
-    one-hot). Measure before trusting it -- see _test/bench_ep_sort.py.
-    """
-    pid = tl.program_id(0)
-    if pid >= N_EXPTS:
-        _ep_scatter_body(
-            pid - N_EXPTS,
-            ExptIndx,
-            DispatchWeights,
-            CtaBase,
-            Hist,
-            GatherIndx,
-            ScatterIndx,
-            GateScal,
-            n_gates,
-            N_BINS=N_BINS,
-            BLOCK=GATE_BLOCK,
-        )
-    else:
-        # Hist has N_BINS entries but stage1 is told N_EXPTS, so it masks the
-        # sentinel bin out of both prefix sums -- the matmul must schedule no
-        # tile for gates this rank does not own.
-        _expt_data_compute_stage1(
-            pid,
-            Hist,
-            N_EXPTS,
-            TokenStart,
-            TileStart,
-            MDTileInfo,
-            max_num_tiles,
-            n_gates,
-            tile_dim_log2,
-            BLOCK_A,
-            EQUAL_A,
-        )
-        tl.debug_barrier()
-        # Last statement in the kernel on purpose: stage2 early-returns for
-        # empty experts, so nothing may follow it in this branch.
-        _expt_data_compute_stage2(pid, Hist, TileStart, MDTileInfo, tile_dim_log2)
-
-
-@triton.jit
-def _ep_mesh_build_kernel(
-    DispatchIds,  # (M, topk) int32, GLOBAL expert ids
-    ExpertMap,  # (E_map,) int32
-    NumLocalTokens,  # (1,) int32
-    Mesh,  # (E, M) uint8 out: slot+1 if this token picked expert e, else 0
-    Hist,  # (E,) int32 out
-    GateValid,  # (G,) int32 out, written by program 0 only
-    M,
-    e_map_numel,
-    TOPK: tl.constexpr,
-    T_BLOCK: tl.constexpr,
-):
-    """v1 phase 1 -- mirrors flydsl's MoeSortingMultiPhaseKernel_P0_v2.
-    Grid is (E,): one program per LOCAL expert, which scans every gate and writes
-    its own contiguous mesh row. That layout is the whole point -- phase 2 then
-    walks a single row and emits a contiguous run, so it needs no rank arithmetic
-    and its stores coalesce. flydsl calls this `p_expert_mesh` [expert, tokens].
-    The trade versus v2: E-fold redundant reads of DispatchIds/ExpertMap, in
-    exchange for exact per-expert counts with no atomics and no cross-CTA
-    histogram barrier (each program owns a row, so `Hist[e]` is just its own
-    count). The row is written in full including zeros, so no memset is needed.
-    ASSUMPTION -- a token's topk selections must be DISTINCT experts. The mesh
-    holds one slot per (expert, token) cell, so if a token named the same expert
-    twice the second write overwrites the first and that gate is silently dropped
-    (measured: hist 27 vs 28 on synthetic duplicate ids). Real topk selects
-    distinct experts, and v2 has no such constraint because each gate is
-    independent -- so if a router ever emits duplicates, v2 is the correct path.
-    flydsl's decode mesh is `int` rather than `unsigned char`, which would allow a
-    per-slot bitmask instead; worth revisiting if duplicates are ever possible.
-    GateValid is gate-indexed, not expert-indexed, so program 0 alone emits it
-    while it already has `local` in registers. Avoids both a memset and a race.
-    """
-    e = tl.program_id(0)
-    cnt = tl.zeros([1], dtype=tl.int32)
-    r = tl.load(NumLocalTokens)
-    for t0 in range(0, M, T_BLOCK):
-        rows = t0 + tl.arange(0, T_BLOCK)
-        rmask = rows < M
-        sel = tl.zeros([T_BLOCK], dtype=tl.int32)
-        for sl in tl.static_range(TOPK):
-            g = rows * TOPK + sl
-            ids = tl.load(DispatchIds + g, mask=rmask, other=0)
-            ids = tl.minimum(tl.maximum(ids, 0), e_map_numel - 1)
-            local = tl.load(ExpertMap + ids, mask=rmask, other=-1)
-            live = (local >= 0) & (rows < r) & rmask
-            sel = tl.where(live & (local == e), sl + 1, sel)
-            if e == 0:
-                tl.store(GateValid + g, live.to(tl.int32), mask=rmask)
-        tl.store(Mesh + e * M + rows, sel.to(tl.uint8), mask=rmask)
-        cnt += tl.sum((sel > 0).to(tl.int32), 0)
-    tl.store(Hist + e, tl.sum(cnt, 0))
-
-
-@triton.jit
-def _ep_mesh_scatter_kernel(
-    Mesh,  # (E, M) uint8 in
-    Hist,  # (E,) int32 in
-    DispatchWeights,  # (M, topk) f32 in, read flat
-    GatherIndx,  # (G,) int32 out
-    ScatterIndx,  # (G,) int32 out, PRE-ZEROED (dead gates keep 0)
-    GateScal,  # (G,) f32 out
-    M,
-    E: tl.constexpr,
-    E_PAD: tl.constexpr,
-    TOPK: tl.constexpr,
-    T_BLOCK: tl.constexpr,
-):
-    """v1 phase 2 -- mirrors flydsl's MoeSortingMultiPhaseKernel_P23.
-    Grid is (E,). Each program redundantly cumsums the E-element histogram to get
-    its own base (48 elements, cheaper than a separate buffer + launch -- the same
-    reason v2's scatter recomputes `bin_base`), then walks its mesh row and emits
-    a CONTIGUOUS run of GatherIndx/GateScal. That contiguity is what v2 lacks:
-    there a CTA's 256 gates scatter to up to 49 distant regions.
-    Dead gates never appear in the mesh, so their ScatterIndx entry is left at the
-    pre-zeroed 0 -- harmless because reduce_grouped clamps masked slots via
-    indx_valid before dereferencing.
-    """
-    e = tl.program_id(0)
-    bins = tl.arange(0, E_PAD)
-    h = tl.load(Hist + bins, mask=bins < E, other=0)
-    base = tl.sum(tl.where(bins < e, h, 0), 0)  # exclusive prefix over experts
-
-    run = tl.zeros([1], dtype=tl.int32)
-    for t0 in range(0, M, T_BLOCK):
-        rows = t0 + tl.arange(0, T_BLOCK)
-        rmask = rows < M
-        sel = tl.load(Mesh + e * M + rows, mask=rmask, other=0).to(tl.int32)
-        hit = sel > 0
-        # Position within this expert's contiguous region.
-        rank = tl.cumsum(hit.to(tl.int32), 0) - hit.to(tl.int32)
-        pos = base + run + rank
-        gate = rows * TOPK + (sel - 1)
-        tl.store(GatherIndx + pos, gate.to(tl.int32), mask=hit)
-        tl.store(ScatterIndx + gate, pos.to(tl.int32), mask=hit)
-        w = tl.load(DispatchWeights + gate, mask=hit, other=0.0)
-        tl.store(GateScal + pos, w.to(tl.float32), mask=hit)
-        run += tl.sum(hit.to(tl.int32), 0)
-
-
-def ep_sort_routing_v1(
-    dispatch_weights,
-    dispatch_ids,
-    expert_map,
-    num_local_experts,
-    num_local_tokens,
-    M,
-    topk,
-    n_gates,
-):
-    """Mesh prep+sort: 2 kernels, mirroring flydsl's opus_moe_sorting.
-    P0-equivalent: grid (E,), each program writes its own [expert, token] mesh row
-                   and its exact count -- no atomics, no histogram barrier.
-    P23-equivalent: grid (E,), redundant E-element cumsum for the base, then walk
-                   the row emitting a CONTIGUOUS run.
-    Costs an (E, M) uint8 mesh and E-fold redundant reads of dispatch_ids, and
-    buys coalesced stores plus no rank arithmetic -- the two things that make
-    flydsl's sort 9.4 ms where the no-mesh scatter's is 30 ms.
-    """
-    device = dispatch_ids.device
-    E = num_local_experts
-    T_BLOCK = 256
-    mesh = torch.empty((E, M), dtype=torch.uint8, device=device)
-    hist = torch.empty(E, dtype=torch.int32, device=device)
-    gate_valid = torch.empty(n_gates, dtype=torch.int32, device=device)
-    _ep_mesh_build_kernel[(E,)](
-        dispatch_ids,
-        expert_map,
-        num_local_tokens,
-        mesh,
-        hist,
-        gate_valid,
-        M,
-        expert_map.numel(),
-        TOPK=topk,
-        T_BLOCK=T_BLOCK,
-    )
-
-    topk_indx = torch.empty(n_gates, dtype=torch.int32, device=device)
-    # Zeroed: dead gates are absent from the mesh, so phase 2 never writes them.
-    # reduce_grouped clamps masked slots via indx_valid, so 0 is safe.
-    gate_indx = torch.zeros(n_gates, dtype=torch.int32, device=device)
-    gate_scal = torch.empty(n_gates, dtype=torch.float32, device=device)
-    _ep_mesh_scatter_kernel[(E,)](
-        mesh,
-        hist,
-        dispatch_weights,
-        topk_indx,
-        gate_indx,
-        gate_scal,
-        M,
-        E=E,
-        E_PAD=triton.next_power_of_2(E),
-        TOPK=topk,
-        T_BLOCK=T_BLOCK,
-    )
-    return hist, topk_indx, gate_indx, gate_scal, gate_valid
-
-
-@triton.jit
-def _ep_gate_prep_scan_kernel(
-    DispatchIds,  # (M, topk) int32, GLOBAL expert ids
-    ExpertMap,  # (E_map,) int32
-    NumLocalTokens,  # (1,) int32
-    GateValid,  # (G,) int32 out
-    ExptIndx,  # (G,) int32 out, local id or SENTINEL
-    HistAtomic,  # (N_BINS,) int32 scratch, ZERO on entry, left ZERO on exit
-    Ticket,  # (1,) int32 scratch, ditto -- the grid-wide join counter
-    Hist,  # (N_BINS,) int32 out, the durable histogram
-    Cursor,  # (N_BINS,) int32 out, bin_base; the scatter bumps it
-    TokenStart,  # (N_EXPTS+1,) int32 out == token_offs_raw
-    TileStart,  # (N_EXPTS+1,) int32 out == token_offs_pad
-    MDTileInfo,  # (max_num_tiles,) int32 out == block_pid_map
-    max_num_tiles,
-    n_gates,
-    e_map_numel,
-    N_EXPTS: tl.constexpr,
-    TOPK: tl.constexpr,
-    SENTINEL: tl.constexpr,
-    N_BINS: tl.constexpr,
-    BLOCK: tl.constexpr,
-    tile_dim_log2: tl.constexpr,
-    BLOCK_A: tl.constexpr,
-    EQUAL_A: tl.constexpr,
-    N_CTAS: tl.constexpr,
-):
-    """v3 Kernel A: gating + histogram + (in the last CTA) the scan and ExptData
-    stage1. One launch where v2 needed two.
-
-    Two changes from ``_ep_gate_prep_kernel``, both aimed at the same thing --
-    kernel count is the budget here, because on gfx1250 an EMPTY kernel costs
-    ~4.7us of device time whatever its grid (measured: grid=1 and grid=2048 are
-    indistinguishable), so v2's 3 launches start 14us in the hole:
-
-    1. **No one-hot.** v2 built a (BLOCK, N_BINS) one-hot and reduced it. At
-       N_BINS=128 that is 128 int ops per gate to count 1. Here the histogram is
-       ``atomic_add`` on LIVE gates only -- under EP ~3/4 of gates are dead, so
-       the atomic traffic is a quarter of the gate count and it spreads over
-       N_EXPTS addresses, which is nothing like the single-address contention
-       that forced flydsl into its LDS two-level scheme.
-    2. **The scan rides along.** The cross-CTA reduction that made v2's scan a
-       separate launch is resolved by a ticket: each CTA bumps ``Ticket`` after
-       its histogram atomics, and whoever draws the last number owns the scan.
-       No spin-waiting, so this is safe at any occupancy -- the last CTA is by
-       definition the one that had nothing left to wait for.
-
-    ``HistAtomic``/``Ticket`` are caller-persistent and this kernel leaves both
-    zeroed, which is what removes the ``torch.zeros`` launch (another 4.7us) from
-    the steady state.
-    """
-    pid = tl.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < n_gates
-
-    ids = tl.load(DispatchIds + offs, mask=mask, other=0)
-    ids = tl.minimum(tl.maximum(ids, 0), e_map_numel - 1)
-    local = tl.load(ExpertMap + ids, mask=mask, other=-1)
-    row = offs // TOPK
-    r = tl.load(NumLocalTokens)
-    valid = (local >= 0) & (row < r) & mask
-
-    tl.store(GateValid + offs, valid.to(tl.int32), mask=mask)
-    expt = tl.where(valid, local, SENTINEL).to(tl.int32)
-    tl.store(ExptIndx + offs, expt, mask=mask)
-
-    # `release`: these must be visible to whichever CTA later draws the last
-    # ticket. Dead gates are skipped entirely -- the sentinel bin is never
-    # counted, so it needs no slot in the prefix sum.
-    tl.atomic_add(HistAtomic + expt, 1, mask=valid, sem="release", scope="gpu")
-
-    # Grid-wide join. `acquire` pairs with the release above, so the CTA that
-    # sees N_CTAS-1 predecessors also sees all their histogram increments.
-    one = tl.arange(0, 1)
-    prev = tl.atomic_add(Ticket + one, 1, sem="acq_rel", scope="gpu")
-    if tl.sum(prev, 0) == N_CTAS - 1:
-        bins = tl.arange(0, N_BINS)
-        h = tl.load(HistAtomic + bins)
-        tl.store(Hist + bins, h)
-        # Exclusive prefix over bins == where each expert's run starts. The
-        # scatter takes this as its initial cursor and bumps it per gate.
-        tl.store(Cursor + bins, tl.cumsum(h, 0) - h)
-        # Re-arm the scratch for the next call. Safe here and only here: drawing
-        # the last ticket means every other CTA is done with both buffers.
-        tl.store(HistAtomic + bins, 0)
-        tl.store(Ticket + one, 0)
-        # stage1 re-reads Hist lane-wise under a different offset layout than the
-        # store above used, so the CTA has to be made coherent with itself first.
-        tl.debug_barrier()
-        # pid=0, not `pid`: stage1 is pid-independent apart from its terminal
-        # writes and the 0xFFFFFFFF tail memset, which are exactly what the
-        # `pid == 0` guard inside it selects. v2 had all N_EXPTS CTAs recompute
-        # the identical prefix sums; one CTA is enough.
-        _expt_data_compute_stage1(
-            0,
-            Hist,
-            N_EXPTS,
-            TokenStart,
-            TileStart,
-            MDTileInfo,
-            max_num_tiles,
-            n_gates,
-            tile_dim_log2,
-            BLOCK_A,
-            EQUAL_A,
-        )
-
-
-@triton.jit
-def _ep_scatter_atomic_expt_data_kernel(
-    ExptIndx,  # (G,) int32 in
-    DispatchWeights,  # (M, topk) f32 in, read flat
-    Cursor,  # (N_BINS,) int32 in/out, bin_base on entry
-    GatherIndx,  # (G,) int32 out
-    ScatterIndx,  # (G,) int32 out
-    GateScal,  # (G,) f32 out
-    Hist,  # (N_BINS,) int32 in -- stage2 half only
-    TileStart,  # (N_EXPTS+1,) int32 in -- stage2 half only
-    MDTileInfo,  # (max_num_tiles,) int32 out -- stage2 half only
-    n_gates,
-    N_EXPTS: tl.constexpr,
-    SENTINEL: tl.constexpr,
-    tile_dim_log2: tl.constexpr,
-    GATE_BLOCK: tl.constexpr,
-):
-    """v3 Kernel B: atomic-cursor scatter | ExptData stage2, split by CTA index.
-
-    Replaces v2's ``_ep_scatter_expt_data_kernel``. Same split-grid trick, but
-    the scatter half no longer computes rank from a ``tl.cumsum`` over a
-    (GATE_BLOCK, N_BINS) one-hot -- 32K int32 of live values per CTA, which is
-    what made that kernel 29.10us where this one is 7.96 on the same input.
-    A gate's destination is now just ``atomic_add(&Cursor[e], 1)``, since Cursor
-    starts at the expert's base.
-
-    ORDER WITHIN AN EXPERT IS NO LONGER ASCENDING BY GATE INDEX. That is
-    invisible downstream and the final output stays bitwise reproducible: each
-    sorted row's dot product is independent of where it lands, and the combine
-    sums per (token, slot) via ScatterIndx, not in sorted order. flydsl's route
-    kernel makes the same trade ("order within a bucket is unspecified").
-    """
-    pid = tl.program_id(0)
-    if pid >= N_EXPTS:
-        idx = (pid - N_EXPTS) * GATE_BLOCK + tl.arange(0, GATE_BLOCK)
-        mask = idx < n_gates
-        expt = tl.load(ExptIndx + idx, mask=mask, other=SENTINEL)
-        live = mask & (expt != SENTINEL)
-        # Contention is per-expert, not global: ~hist[e]/n_ctas lanes per address.
-        pos = tl.atomic_add(Cursor + expt, 1, mask=live, sem="relaxed", scope="gpu")
-        tl.store(GatherIndx + pos, idx.to(tl.int32), mask=live)
-        # Dead gates get 0, as in v1's pre-zeroed gate_indx -- reduce_grouped
-        # clamps them via indx_valid before dereferencing. Written unmasked over
-        # `mask` so the buffer needs no separate memset.
-        tl.store(ScatterIndx + idx, tl.where(live, pos, 0).to(tl.int32), mask=mask)
-        w = tl.load(DispatchWeights + idx, mask=live, other=0.0)
-        tl.store(GateScal + pos, w.to(tl.float32), mask=live)
-    else:
-        # Last statement in the branch on purpose: stage2 early-returns for empty
-        # experts, so nothing may follow it.
-        _expt_data_compute_stage2(pid, Hist, TileStart, MDTileInfo, tile_dim_log2)
-
-
-# Persistent per-(device, n_bins) scratch for v3's histogram and join counter.
-# Both are left zeroed by _ep_gate_prep_scan_kernel, so the torch.zeros below is
-# paid once per process rather than once per layer per step.
-_EP_V3_SCRATCH = {}
-
-
-def _ep_v3_scratch(device, n_bins):
-    key = (device, n_bins)
-    bufs = _EP_V3_SCRATCH.get(key)
-    if bufs is None:
-        bufs = (
-            torch.zeros(n_bins, dtype=torch.int32, device=device),
-            torch.zeros(1, dtype=torch.int32, device=device),
-        )
-        _EP_V3_SCRATCH[key] = bufs
-    return bufs
-
-
-def ep_sort_routing_v3(
-    dispatch_weights,
-    dispatch_ids,
-    expert_map,
-    num_local_experts,
-    num_local_tokens,
-    M,
-    topk,
-    n_gates,
-    expt_data_bufs,
-):
-    """Atomic-cursor prep+sort: 2 kernels, no memset.
-
-    A  : gating + histogram + (last CTA) scan + ExptData stage1  (grid: n_ctas)
-    B  : atomic-cursor scatter | ExptData stage2                 (grid: E + n_ctas)
-
-    v2 does the same work in 3 launches plus a torch.zeros, and pays a
-    (BLOCK, N_BINS) one-hot cumsum in the scatter. Same 5-tuple, same ExptData
-    buffers filled in place; the only observable difference is the order of gates
-    within an expert (see _ep_scatter_atomic_expt_data_kernel).
-
-    SINGLE STREAM ONLY. The histogram and join counter are process-persistent and
-    re-armed by the kernel that drains them, so two concurrent calls sharing a
-    device would interleave into the same counters. That holds for ATOM (MoE
-    layers are issued in order on one stream) but it is an assumption, not
-    something the code can check. Cheap escape hatch if it is ever violated: key
-    _EP_V3_SCRATCH on the current stream as well as the device.
-    """
-    device = dispatch_ids.device
-    sentinel = num_local_experts
-    GATE_BLOCK = 256
-    # next_pow2(E + 1), not next_pow2(E): keeps SENTINEL a valid index so the
-    # masked-off atomic on a dead gate still forms an in-bounds address.
-    n_bins = triton.next_power_of_2(sentinel + 1)
-    n_ctas = triton.cdiv(n_gates, GATE_BLOCK)
-    token_offs_raw, token_offs_pad, block_pid_map, blocks1, BLOCK_A, block_m_log2 = (
-        expt_data_bufs
-    )
-    assert blocks1 == num_local_experts, f"{blocks1} != {num_local_experts}"
-
-    hist_atomic, ticket = _ep_v3_scratch(device, n_bins)
-    gate_valid = torch.empty(n_gates, dtype=torch.int32, device=device)
-    expt_indx = torch.empty(n_gates, dtype=torch.int32, device=device)
-    hist = torch.empty(n_bins, dtype=torch.int32, device=device)
-    cursor = torch.empty(n_bins, dtype=torch.int32, device=device)
-    _ep_gate_prep_scan_kernel[(n_ctas,)](
-        dispatch_ids,
-        expert_map,
-        num_local_tokens,
-        gate_valid,
-        expt_indx,
-        hist_atomic,
-        ticket,
-        hist,
-        cursor,
-        token_offs_raw,
-        token_offs_pad,
-        block_pid_map,
-        block_pid_map.shape[0],
-        n_gates,
-        expert_map.numel(),
-        N_EXPTS=num_local_experts,
-        TOPK=topk,
-        SENTINEL=sentinel,
-        N_BINS=n_bins,
-        BLOCK=GATE_BLOCK,
-        tile_dim_log2=block_m_log2,
-        BLOCK_A=BLOCK_A,
-        EQUAL_A=(num_local_experts == BLOCK_A),
-        N_CTAS=n_ctas,
-    )
-
-    topk_indx = torch.empty(n_gates, dtype=torch.int32, device=device)
-    gate_indx = torch.empty(n_gates, dtype=torch.int32, device=device)
-    gate_scal = torch.empty(n_gates, dtype=torch.float32, device=device)
-    _ep_scatter_atomic_expt_data_kernel[(num_local_experts + n_ctas,)](
-        expt_indx,
-        dispatch_weights,
-        cursor,
-        topk_indx,
-        gate_indx,
-        gate_scal,
-        hist,
-        token_offs_pad,
-        block_pid_map,
-        n_gates,
-        N_EXPTS=num_local_experts,
-        SENTINEL=sentinel,
-        tile_dim_log2=block_m_log2,
-        GATE_BLOCK=GATE_BLOCK,
-    )
-    return hist, topk_indx, gate_indx, gate_scal, gate_valid
-
-
-def ep_sort_routing_v2(
-    dispatch_weights,
-    dispatch_ids,
-    expert_map,
-    num_local_experts,
-    num_local_tokens,
-    M,
-    topk,
-    n_gates,
-    expt_data_bufs,
-):
-    """No-mesh prep+sort with the scatter and ExptData stages fused: 3 kernels.
-    A  : gating + per-CTA private histogram          (grid: n_ctas)
-    A' : per-bin exclusive scan down the CTA axis    (grid: N_BINS)
-    B+C: scatter | ExptData, split by CTA index      (grid: N_EXPTS + n_ctas)
-    A and A' cannot join anything -- A' consumes every CTA's partials, which is a
-    grid-wide reduction. But B and C are both pure consumers of `hist` with
-    disjoint outputs, so they collapse into one launch. See
-    `_ep_scatter_expt_data_kernel` for why this mirrors aiter's
-    `_combined_routing_fused` layout without needing its barrier.
-    `expt_data_bufs` is the tuple `_compute_expt_data_internal` returns; the
-    caller allocates it (it is allocation-only and version-independent) so v1 can
-    keep launching the standalone `_expt_data_only_kernel` unchanged.
-    Returns the same 5-tuple as v1; the ExptData buffers are filled in place.
-    """
-    device = dispatch_ids.device
-    sentinel = num_local_experts
-    GATE_BLOCK = 256
-    n_bins = triton.next_power_of_2(sentinel + 1)
-    n_ctas = triton.cdiv(n_gates, GATE_BLOCK)
-    token_offs_raw, token_offs_pad, block_pid_map, blocks1, BLOCK_A, block_m_log2 = (
-        expt_data_bufs
-    )
-    # blocks1a. _compute_expt_data_internal returns blocks1 == n_expts_tot; the
-    # fused grid assumes that, since it recovers the gate CTA as pid - N_EXPTS.
-    assert blocks1 == num_local_experts, f"{blocks1} != {num_local_experts}"
-
-    gate_valid = torch.empty(n_gates, dtype=torch.int32, device=device)
-    expt_indx = torch.empty(n_gates, dtype=torch.int32, device=device)
-    partial_hist = torch.empty((n_ctas, n_bins), dtype=torch.int32, device=device)
-    _ep_gate_prep_kernel[(n_ctas,)](
-        dispatch_ids,
-        expert_map,
-        num_local_tokens,
-        gate_valid,
-        expt_indx,
-        partial_hist,
-        n_gates,
-        expert_map.numel(),
-        TOPK=topk,
-        SENTINEL=sentinel,
-        N_BINS=n_bins,
-        BLOCK=GATE_BLOCK,
-    )
-
-    cta_base = torch.empty_like(partial_hist)
-    hist_full = torch.empty(n_bins, dtype=torch.int32, device=device)
-    _ep_scan_partials_kernel[(n_bins,)](
-        partial_hist, cta_base, hist_full, n_ctas, N_BINS=n_bins, C_BLOCK=128
-    )
-
-    topk_indx = torch.empty(n_gates, dtype=torch.int32, device=device)
-    gate_indx = torch.empty(n_gates, dtype=torch.int32, device=device)
-    gate_scal = torch.empty(n_gates, dtype=torch.float32, device=device)
-    # hist_full, not hist_full[:E]: the scatter half needs the sentinel bin to
-    # place dead gates in the tail, and stage1 masks at N_EXPTS anyway.
-    _ep_scatter_expt_data_kernel[(num_local_experts + n_ctas,)](
-        expt_indx,
-        dispatch_weights,
-        cta_base,
-        hist_full,
-        topk_indx,
-        gate_indx,
-        gate_scal,
-        n_gates,
-        token_offs_raw,
-        token_offs_pad,
-        block_pid_map,
-        block_pid_map.shape[0],
-        N_EXPTS=num_local_experts,
-        tile_dim_log2=block_m_log2,
-        BLOCK_A=BLOCK_A,
-        EQUAL_A=(num_local_experts == BLOCK_A),
-        N_BINS=n_bins,
-        GATE_BLOCK=GATE_BLOCK,
-    )
-    return hist_full, topk_indx, gate_indx, gate_scal, gate_valid
-
-
 def routing_from_dispatched(
     dispatch_weights: torch.Tensor,
     dispatch_ids: torch.Tensor,
@@ -868,11 +104,12 @@ def routing_from_dispatched(
     num_local_tokens: torch.Tensor,
 ):
     """Build triton RoutingData / gather / scatter from mori-dispatched rows.
-    The EP path cannot use aiter's ``routing()``: that starts from router logits,
-    but after the all-to-all the top-k choice is already made and the rows have
-    been permuted across ranks. This is ``routing_torch``'s second half --
-    everything from ``(expt_scal, expt_indx)`` onward -- adapted for three facts
-    about the post-dispatch buffer:
+    Thin wrapper over aiter's ``ep_sort_routing``, which owns the sort itself
+    (gating, histogram, scatter) because the EP path cannot use ``routing()``:
+    that starts from router logits, but after the all-to-all the top-k choice is
+    already made and the rows have been permuted across ranks. What stays here is
+    the tile geometry, the ExptData allocation and the packaging -- shaped by
+    three facts about the post-dispatch buffer:
     1. Rows are per-token: mori sends one copy per (token, destination rank), so
        a row carries the full top-k tuple with only *some* entries owned here.
        Non-local entries go to a sentinel bin that is sliced off the histogram,
@@ -891,13 +128,11 @@ def routing_from_dispatched(
     three match ``routing()``; ``gate_valid`` is the extra piece EP needs, since
     ``routing()`` never produces dead gates.
     """
-    from aiter.ops.triton._triton_kernels.moe.moe_routing.expt_data import (
-        _expt_data_only_kernel,
-    )
     from aiter.ops.triton.moe.moe_routing.routing import (
         ExptData,
         RoutingData,
         _compute_expt_data_internal,
+        ep_sort_routing,
     )
 
     M, topk = dispatch_ids.shape
@@ -917,77 +152,33 @@ def routing_from_dispatched(
     # `offs_x_m % hist[e]` and masks stores with `offs_m < hist[e]`, so a
     # mostly-empty tile recomputes a live row rather than reading garbage.
     #
-    # Hoisted above the version dispatch because it is allocation-only (no
-    # kernel) and version-independent -- v2 needs the buffers up front so it can
-    # fill them in the same launch as the scatter.
-    # tokens_per_expt = max(1, n_gates // max(num_local_experts, 1))
+    # Allocation-only (no kernel), and hoisted above the sort because
+    # ep_sort_routing fills these buffers in the same launches as the histogram
+    # and the scatter.
     global_num_experts = max(1, expert_map.numel() - 1)
     tokens_per_expt = max(1, n_gates // global_num_experts)
     block_m = max(16, min(triton.next_power_of_2(tokens_per_expt), 128))
     expt_data_bufs = _compute_expt_data_internal(
         num_local_experts, n_gates, block_m, device
     )
-    token_offs_raw, token_offs_pad, block_pid_map, blocks1, BLOCK, block_m_log2 = (
+    token_offs_raw, token_offs_pad, block_pid_map, _blocks1, _BLOCK, _block_m_log2 = (
         expt_data_bufs
     )
 
-    version = envs.ATOM_EP_SORT_VERSION
-    assert version in (1, 2, 3), f"ATOM_EP_SORT_VERSION must be 1, 2 or 3, got {version}"
-    if version == 3:
-        hist_full, topk_indx, gate_indx, gate_scal, gate_valid = ep_sort_routing_v3(
-            dispatch_weights,
-            dispatch_ids,
-            expert_map,
-            num_local_experts,
-            num_local_tokens,
-            M,
-            topk,
-            n_gates,
-            expt_data_bufs,
-        )
-        hist = hist_full[:num_local_experts]
-    elif version == 2:
-        hist_full, topk_indx, gate_indx, gate_scal, gate_valid = ep_sort_routing_v2(
-            dispatch_weights,
-            dispatch_ids,
-            expert_map,
-            num_local_experts,
-            num_local_tokens,
-            M,
-            topk,
-            n_gates,
-            expt_data_bufs,
-        )
-        hist = hist_full[:num_local_experts]
-    else:
-        hist_full, topk_indx, gate_indx, gate_scal, gate_valid = ep_sort_routing_v1(
-            dispatch_weights,
-            dispatch_ids,
-            expert_map,
-            num_local_experts,
-            num_local_tokens,
-            M,
-            topk,
-            n_gates,
-        )
-        hist = hist_full[:num_local_experts]
-
-        # No fill_(-1): stage1's pid==0 memsets [tile_off_last, max_num_tiles)
-        # and stage2 writes exactly [0, tile_off_last), so the union covers the
-        # whole buffer. Verified with a poison fill -- zero survivors, including
-        # empty experts where stage2 returns early.
-        _expt_data_only_kernel[(blocks1,)](
-            hist,
-            num_local_experts,
-            token_offs_raw,
-            token_offs_pad,
-            block_pid_map,
-            block_pid_map.shape[0],
-            n_gates,
-            block_m_log2,
-            BLOCK,
-            EQUAL_BLOCK=(num_local_experts == BLOCK),
-        )
+    hist_full, topk_indx, gate_indx, gate_scal, gate_valid = ep_sort_routing(
+        dispatch_weights,
+        dispatch_ids,
+        expert_map,
+        num_local_experts,
+        num_local_tokens,
+        M,
+        topk,
+        n_gates,
+        expt_data_bufs,
+    )
+    # The tail bin holds the sentinel (non-local) count, which the matmul must
+    # schedule no tile for.
+    hist = hist_full[:num_local_experts]
     expt_data = ExptData(hist, token_offs_raw, token_offs_pad, block_pid_map)
 
     routing_data = RoutingData(
@@ -1056,6 +247,7 @@ def _fused_experts_silu_gugu(
     gate_valid: torch.Tensor | None = None,
     preshuffled: bool | None = None,
     act_quant: MoEActivationQuant = MoEActivationQuant.BF16,
+    y_out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Fused-SiLU MoE experts over GUGU (interleaved ``[gate, up]``) weights.
 
@@ -1081,6 +273,11 @@ def _fused_experts_silu_gugu(
     intermediate separately. Measured on gfx950 that was 1.22-1.28x overall (see
     _test/ep_moe_bench_report.md): the a4w4 GEMMs are genuinely faster (halved
     weight traffic) but the doubled quant costs more than the GEMM saving.
+
+    ``y_out``, when given, is where GEMM2's grouped reduction writes -- typically
+    the leading rows of a taller caller-owned buffer, so the EP path can hand
+    mori's combine a full-M tensor without copying this result into it. It is
+    GEMM2's output only; GEMM1's intermediate is always kernel-allocated.
     """
     assert hidden_states.ndim == 2
     assert hidden_states.dtype == torch.bfloat16
@@ -1139,6 +336,7 @@ def _fused_experts_silu_gugu(
             # Only GEMM2 feeds reduce_grouped, so the mask belongs here. GEMM1's
             # dead slots are already skipped by the sentinel histogram.
             gate_valid=gate_valid,
+            y_out=y_out,
         )
 
     x_fp8, x_scale = downcast_to_mxfp(hidden_states, torch.float8_e4m3fn, axis=-1)
@@ -1209,6 +407,7 @@ def _fused_experts_silu_gugu(
         # Only GEMM2 feeds reduce_grouped, so the mask belongs here. GEMM1's
         # dead slots are already skipped by the sentinel histogram.
         gate_valid=gate_valid,
+        y_out=y_out,
     )
 
 
@@ -1313,6 +512,11 @@ def triton_kernel_fused_experts(
     # process_weights_after_loading's is_gfx1250 branch without needing a
     # reference implementation.
     preshuffled: bool | None = None,
+    # GUGU only. Buffer GEMM2's grouped reduction writes into, in place of a
+    # kernel-allocated one; may be a row-slice of a taller tensor. Distinct from
+    # `output_tensor`, which the GGUU path resizes to (M, K) and which the GUGU
+    # path ignores. The kernel asserts shape/dtype/device/last-dim-contiguity.
+    y_out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     # type check, uint8 means mxfp4
     assert hidden_states.dtype == torch.bfloat16
@@ -1355,7 +559,13 @@ def triton_kernel_fused_experts(
             gate_valid=gate_valid,
             preshuffled=preshuffled,
             act_quant=act_quant,
+            y_out=y_out,
         )
+
+    assert y_out is None, (
+        "y_out is only wired through the GUGU fused-SiLU path; the GGUU path "
+        "writes its result into `output_tensor`."
+    )
 
     # aiter kernels expect 2d inputs/outputs
     M, K = hidden_states.shape[-2:]
