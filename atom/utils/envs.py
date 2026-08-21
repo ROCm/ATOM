@@ -301,6 +301,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FUSE_SHARED_EXPERT": lambda: (
         os.getenv("ATOM_FUSE_SHARED_EXPERT", "1").lower() == "1"
     ),
+    # Opt-in: MoE shared||routed fork inside a PIECEWISE-captured piece. Capture
+    # holds it and GSM8K is unmoved; off until a throughput win is shown. Shared
+    # dispatcher, so this moves V2/V3.2/K3 too. See docs.
+    "ATOM_DUAL_STREAM_PIECEWISE": lambda: os.getenv("ATOM_DUAL_STREAM_PIECEWISE", "0")
+    == "1",
     # Gate/Up interleave mode for MoE weight preshuffle and kernel gate_mode.
     # "0" (default) = SEPARATED layout; "1" = INTERLEAVE layout.
     "ATOM_MOE_GU_ITLV": lambda: os.getenv("ATOM_MOE_GU_ITLV", "0") == "1",
