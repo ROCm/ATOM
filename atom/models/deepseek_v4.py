@@ -652,7 +652,6 @@ def _dequant_fp8_block_to_bf16(w_fp8, scale, block=128):
     Mirrors convert.py:137-141. The wo_a weight is stored FP8 on disk but
     used as BF16 in inference because aiter doesn't support FP8 grouped einsum.
     """
-    out_dim, in_dim = w_fp8.shape
     w = w_fp8.unflatten(0, (-1, block)).unflatten(-1, (-1, block)).float()
     s = scale.float()
     deq = w * s[:, None, :, None]
