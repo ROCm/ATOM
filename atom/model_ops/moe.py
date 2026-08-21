@@ -6,6 +6,7 @@ from abc import abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
+from functools import lru_cache
 
 import torch
 from aiter import ActivationType, QuantType, dtypes, get_hip_quant, topk_gating
@@ -69,8 +70,13 @@ from atom.model_ops.utils import (
     shuffle_weights,
 )
 from atom.plugin.vllm.moe import FusedMoEDecoratorForPluginMode
-from atom.quant_spec import LayerQuantConfig, should_skip_online_quant
+from atom.quant_spec import (
+    LayerQuantConfig,
+    should_skip_online_quant,
+    should_stream_online_quant,
+)
 from atom.quantization.quark.utils import (
+    dequant_moe_weight_online,
     dequant_weight_online,
     quant_weight_online,
 )
@@ -108,6 +114,71 @@ class FusedMoeWeightScaleSupported(Enum):
     BLOCK = "block"
 
 
+# Saturating magnitude for the synthetic logits. The picked/unpicked gap after
+# sigmoid (or softmax / sqrtsoftplus) then swamps a router correction bias, which
+# is added to the score before top-k. sigmoid caps that gap at 1.0, so a bias
+# spread wider than 1.0 can still reorder the selection.
+_FAKE_EPLB_LOGIT = 10.0
+
+
+@lru_cache(maxsize=1)
+def init_balance_router_logits(
+    n_routed_experts: int,
+    topk: int,
+    ep_size: int = 1,
+    dp_size: int = 1,
+    dp_rank: int = 0,
+    n_group: int = 1,
+    topk_group: int = 1,
+    dtype: torch.dtype = torch.bfloat16,
+    max_num_tokens: int = 32768,
+):
+    # Synthetic router logits whose top-k is balanced across both experts and EP
+    # ranks. ATOM shards experts contiguously (rank r owns [r*L, (r+1)*L), with
+    # L = E // ep_size), so we walk one flat ring: position p = t * topk + j takes
+    # rank p % ep_size and slot (p // ep_size) % L. Consecutive positions step the
+    # rank by one, so a token's experts land on distinct ranks and rank load stays
+    # even at any batch size -- down to single-token decode, unlike a per-row
+    # rotation.
+    #
+    # t = dp_rank + i * dp_size rather than plain i: the table is substituted per
+    # device before the MoE gather, so the axis to interleave on is the token-shard
+    # axis, which is DP. TP ranks inside a DP group see the same tokens and must
+    # share one table; pure TP-attn + EP collapses to dp_size == 1.
+    device = "cuda"
+    E = n_routed_experts
+    L = max(1, E // ep_size)  # experts per rank; a remainder is left unused
+    t = dp_rank + torch.arange(max_num_tokens, device=device) * dp_size  # (T,)
+
+    if n_group > 1 and 0 < topk_group < n_group and topk % topk_group == 0:
+        # Group-limited routing (DeepSeek): every group but topk_group of n_group
+        # is masked out before top-k, so a ring laid across all groups loses the
+        # choices that fall in the masked ones. Run it inside a rotating set of
+        # groups instead, and inside each group across the EP ranks that group
+        # spans. A token can only reach topk_group groups by construction, so rank
+        # load evens out over ceil(n_group / topk_group) tokens, not at T == 1.
+        gs = E // n_group  # experts per group
+        rg = max(1, gs // L)  # EP ranks spanned by one group
+        sub = gs // rg  # experts per (group, rank) pair
+        c = topk // topk_group  # choices placed in each selected group
+        m = torch.arange(topk_group, device=device).view(1, -1, 1)
+        k = torch.arange(c, device=device).view(1, 1, -1)
+        q = t.view(-1, 1, 1) * topk_group + m  # position on the group ring
+        p = (q // n_group) * c + k  # visits to that group so far
+        slot = (p % rg) * sub + (p // rg) % sub
+        expert_ids = ((q % n_group) * gs + slot).reshape(max_num_tokens, topk)
+    else:
+        j = torch.arange(topk, device=device).unsqueeze(0)
+        p = t.unsqueeze(1) * topk + j
+        expert_ids = (p % ep_size) * L + (p // ep_size) % L  # (T, topk)
+
+    router_logits = torch.full(
+        (max_num_tokens, E), -_FAKE_EPLB_LOGIT, dtype=dtype, device=device
+    )
+    router_logits.scatter_(1, expert_ids, _FAKE_EPLB_LOGIT)
+    return router_logits
+
+
 @dataclass
 class FusedMoEParallelConfig:
     tp_size: int
@@ -120,10 +191,23 @@ class FusedMoEParallelConfig:
     use_ep: bool  # whether to use EP or not
     local_ep_size: int
 
+    # Config.dp_logical_size / dp_size: >1 when DP-attention simulates a
+    # deployment wider than the box, in which case experts shard that many
+    # times finer and each rank repeats the gathered tokens that many times.
+    dp_logical_ratio: int = 1
+
     @property
     def use_all2all_kernels(self):
-        # Only use mori all2all kernels when expert parallel is enabled
-        return self.dp_size > 1 and self.use_ep and _has_module("mori")
+        # Only use mori all2all kernels when expert parallel is enabled.
+        # Never while simulating: mori is real peer-to-peer, so absent ranks
+        # cannot be stood in for, and it derives a token's destination from
+        # num_experts // real peer count -- which disagrees with a finer map.
+        return (
+            self.dp_size > 1
+            and self.use_ep
+            and self.dp_logical_ratio == 1
+            and _has_module("mori")
+        )
 
     @property
     def use_mori_kernels(self):
@@ -133,11 +217,16 @@ class FusedMoEParallelConfig:
     def make(
         tp_size_: int, dp_size_: int, parallel_config: Config
     ) -> "FusedMoEParallelConfig":
+        # Width the expert sharding is cut for; wider than the real DP size only
+        # while simulating. The rank stays real, so this device keeps the slice
+        # it would own in the full deployment.
+        dp_logical = getattr(parallel_config, "dp_logical_size", 0) or dp_size_
+
         def flatten_tp_across_dp(dp_rank: int):
             tp_rank = 0 if tp_size_ == 1 else get_tp_group().rank_in_group
-            # There are actually dp_size_ * tp_size_ devices. Update tp_size
+            # There are actually dp_logical * tp_size_ devices. Update tp_size
             # and tp_rank so we shard across all devices.
-            tp_size = dp_size_ * tp_size_
+            tp_size = dp_logical * tp_size_
             tp_rank = dp_rank * tp_size_ + tp_rank
             return tp_size, tp_rank
 
@@ -151,7 +240,10 @@ class FusedMoEParallelConfig:
             enable_dp_attention or parallel_config.moe_ep_flatten_tp_across_dp
         )
 
-        use_ep = dp_size_ * tp_size_ > 1 and parallel_config.enable_expert_parallel
+        # dp_logical, not dp_size_: with DP-attention simulated down to a single
+        # rank the real product is 1, but the deployment being reproduced still
+        # shards experts, so EP must stay on.
+        use_ep = dp_logical * tp_size_ > 1 and parallel_config.enable_expert_parallel
 
         dp_size = dp_size_
         dp_rank = get_dp_group().rank_in_group if dp_size > 1 else 0
@@ -213,6 +305,10 @@ class FusedMoEParallelConfig:
             ep_size=ep_size,
             ep_rank=ep_rank,
             use_ep=True,
+            # CoreManager guarantees the division is exact.
+            dp_logical_ratio=(
+                dp_logical // dp_size if flatten_tp_across_dp_for_moe else 1
+            ),
             local_ep_size=atom_config.parallel_config.data_parallel_size_local
             * tp_size_,
         )
@@ -303,6 +399,21 @@ def all_gather_with_padding(
         padded_x, use_custom=use_cag, dim=0
     )
     return gathered_hidden_states, original_batch_size
+
+
+def repeat_rows(x: torch.Tensor, times: int) -> torch.Tensor:
+    """Repeat `x` along dim 0 so it holds `times` copies of what was gathered.
+
+    Stands in for the token shards of the DP ranks a simulated run did not
+    launch, giving the expert GEMMs the full deployment's token volume. Under
+    `--fake-eplb` the gathered rows cover a whole number of turns of the
+    balanced expert ring, so copying them keeps every expert's count equal.
+
+    The caller drops the copies before the reduce scatter.
+    """
+    if times <= 1:
+        return x
+    return x.repeat(times, *([1] * (x.dim() - 1)))
 
 
 def reduce_scatter_with_unpadding(
@@ -654,6 +765,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        # Streaming source weights start on meta; target weights remain real.
+        stream_online_quant = getattr(layer, "_stream_online_quant", False)
+        weight_device = "meta" if stream_online_quant else None
+
         # Fused gate_up_proj (column parallel)
         w13_weight = atom_parameter(
             torch.empty(
@@ -661,6 +776,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
                 2 * intermediate_size_per_partition,
                 hidden_size,
                 dtype=params_dtype,
+                device=weight_device,
             )
         )
         layer.register_parameter("w13_weight", w13_weight)
@@ -673,6 +789,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
                 hidden_size,
                 intermediate_size_per_partition,
                 dtype=params_dtype,
+                device=weight_device,
             )
         )
         layer.register_parameter("w2_weight", w2_weight)
@@ -945,6 +1062,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.intermediate_pad = (
             self.intermediate_size - layer.intermediate_size_per_partition
         )
+        # MXFP4 is target-only; online dequantization accepts only FP8 sources.
         # Fused gate_up_proj (column parallel)
         w13_weight = atom_parameter(
             torch.empty(
@@ -2054,6 +2172,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     ):
         self.num_experts = num_experts
         intermediate_size_for_weight = intermediate_size_per_partition
+        # Transient sources use checkpoint shapes; target-only kernel padding
+        # would prevent streaming coverage from completing.
+        stream_online_quant = getattr(layer, "_stream_online_quant", False)
 
         if self.block_quant:
             if self.quant_type == QuantType.per_1x128:
@@ -2080,10 +2201,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     f"{intermediate_size_per_partition} is not divisible by "
                     f"weight quantization block_k = {block_k}."
                 )
-            if self.quant_type == QuantType.per_1x32:
+            if self.quant_type == QuantType.per_1x32 and not stream_online_quant:
                 # aiter's GU-interleaved MXFP8 scale shuffle packs 8 scale
                 # columns, i.e. 256 weight columns for 1x32 scales. TP8 on
                 # MiniMax-M3 has local intermediate=384, so pad to 512.
+                # For stream online quantization
+                # Streaming sources skip this padding because they are temporary
+                # checkpoint storage and never enter the shuffled kernel. Keeping
+                # their logical shape also lets loaded coverage reach the expected
+                # numel. This does not change the quantized target: _online_quant
+                # clears the streaming flag before creating its target buffers.
                 scale_pack_k = block_k * 8
                 intermediate_size_for_weight = (
                     (intermediate_size_per_partition + scale_pack_k - 1)
@@ -2092,16 +2219,19 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 )
 
         # WEIGHTS
+        weight_device = "meta" if stream_online_quant else None
         w13_weight = atom_parameter(
             torch.empty(
                 num_experts,
                 2 * intermediate_size_for_weight,
                 hidden_size,
                 dtype=params_dtype,
+                device=weight_device,
             )
         )
         layer.register_parameter("w13_weight", w13_weight)
-        if self.quant_type == QuantType.per_1x32:
+        # Only target buffers contain padding bytes.
+        if self.quant_type == QuantType.per_1x32 and not stream_online_quant:
             w13_weight.data.view(torch.uint8).zero_()
         set_weight_attrs(w13_weight, extra_weight_attrs)
 
@@ -2111,10 +2241,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 hidden_size,
                 intermediate_size_for_weight,
                 dtype=params_dtype,
+                device=weight_device,
             )
         )
         layer.register_parameter("w2_weight", w2_weight)
-        if self.quant_type == QuantType.per_1x32:
+        if self.quant_type == QuantType.per_1x32 and not stream_online_quant:
             w2_weight.data.view(torch.uint8).zero_()
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
@@ -2767,12 +2898,39 @@ class FusedMoE(torch.nn.Module):
             "params_dtype": self.params_dtype,
             "weight_loader": self.weight_loader,
         }
+        # Set before create_weights so streaming sources allocate on meta.
+        self._stream_online_quant = should_stream_online_quant(
+            quant_config,
+            prefix,
+            layer_quant_config.quant_type if layer_quant_config else QuantType.No,
+            self.params_dtype,
+        )
+        self._load_device = torch.empty(0).device if self._stream_online_quant else None
         self.quant_method.create_weights(layer=self, **self.moe_quant_params)
         compilation_config = atom_config.compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
         self.layer_name = prefix
+        # Interleave the synthetic logits across the token-shard (DP) axis only
+        # when DP-attention actually shards tokens per DP group; otherwise every
+        # device sees the same tokens and must share one table (dp_size=1).
+        _dp_shard = self.use_ep and atom_config.enable_dp_attention
+        self.balance_router_logits = (
+            init_balance_router_logits(
+                self.global_num_experts,
+                top_k,
+                self.ep_size if self.use_ep else 1,
+                self.dp_size if _dp_shard else 1,
+                self.dp_rank if _dp_shard else 0,
+                (self.num_expert_group or 1) if self.use_grouped_topk else 1,
+                (self.topk_group or 1) if self.use_grouped_topk else 1,
+                torch.get_default_dtype(),
+                atom_config.max_num_batched_tokens,
+            )
+            if atom_config.fake_eplb
+            else None
+        )
 
     @property
     def num_fused_shared_experts(self) -> int:
@@ -2851,6 +3009,140 @@ class FusedMoE(torch.nn.Module):
                 "the dispatch space; the legacy AITER fusion is unsupported."
             )
 
+    def _online_quant_row_local_batched(
+        self,
+        old_w13_data: torch.Tensor,
+        old_w2_data: torch.Tensor,
+        old_w13_scale: torch.Tensor | None,
+        old_w2_scale: torch.Tensor | None,
+        source_quant_type: QuantType,
+        source_quant_dtype: torch.dtype | None,
+        online_quant_type: QuantType,
+        online_quant_dtype: torch.dtype,
+    ) -> None:
+        """Batch row-local experts to accelerate streaming online quantization."""
+        batch_size = 8
+
+        def _quantize(source, scale):
+            bf16 = dequant_moe_weight_online(
+                source,
+                scale,
+                source_quant_type,
+                source_quant_dtype,
+            )
+            quantized, quant_scale = quant_weight_online(
+                bf16,
+                online_quant_type=online_quant_type,
+                online_quant_dtype=online_quant_dtype,
+            )
+            del bf16
+            return quantized, quant_scale
+
+        def _reshape_scale(scale: torch.Tensor, count: int) -> torch.Tensor:
+            assert scale.dim() == 2, (
+                "row-local online quantization must return a 2D scale, "
+                f"got shape={tuple(scale.shape)}"
+            )
+            assert scale.shape[0] % count == 0
+            return scale.reshape(count, scale.shape[0] // count, scale.shape[1])
+
+        def _copy_scale(
+            target: torch.Tensor,
+            source: torch.Tensor,
+            *,
+            split_gate_up: bool,
+        ) -> None:
+            # PTPC stores [E, rows], while block schemes store
+            # [E, scale_rows, scale_cols].
+            if online_quant_type == QuantType.per_Token:
+                assert source.shape[2] == 1
+                source = source.squeeze(2)
+            assert source.dim() == target.dim()
+
+            def _copy_rows(
+                target_start: int,
+                source_start: int,
+                rows: int,
+            ) -> None:
+                if target.dim() == 2:
+                    target_region = target[:, target_start : target_start + rows]
+                    source_region = source[:, source_start : source_start + rows]
+                else:
+                    target_region = target[
+                        :,
+                        target_start : target_start + rows,
+                        : source.shape[2],
+                    ]
+                    source_region = source[
+                        :,
+                        source_start : source_start + rows,
+                    ]
+                FusedMoE._copy_quant_storage(target_region, source_region)
+
+            if split_gate_up:
+                source_half_rows = source.shape[1] // 2
+                target_half_rows = target.shape[1] // 2
+                _copy_rows(0, 0, source_half_rows)
+                _copy_rows(
+                    target_half_rows,
+                    source_half_rows,
+                    source_half_rows,
+                )
+            else:
+                _copy_rows(0, 0, source.shape[1])
+
+        for start in range(0, self.local_num_experts, batch_size):
+            end = min(start + batch_size, self.local_num_experts)
+            count = end - start
+
+            # Copy gate/up separately to support target-side padding between
+            # the two halves; without padding their offsets are identical.
+            source_w13 = old_w13_data[start:end]
+            source_w13_scale = (
+                old_w13_scale[start:end] if old_w13_scale is not None else None
+            )
+            w13_q, w13_s = _quantize(source_w13, source_w13_scale)
+            source_w13_rows = source_w13.shape[1]
+            source_half_rows = source_w13_rows // 2
+            w13_q = w13_q.reshape(count, source_w13_rows, w13_q.shape[1])
+            w13_s = _reshape_scale(w13_s, count)
+
+            target_w13 = self.w13_weight.data[start:end]
+            target_w13_scale = self.w13_weight_scale.data[start:end]
+            target_half_rows = target_w13.shape[1] // 2
+            FusedMoE._copy_quant_storage(
+                target_w13[:, :source_half_rows, : w13_q.shape[2]],
+                w13_q[:, :source_half_rows],
+            )
+            FusedMoE._copy_quant_storage(
+                target_w13[
+                    :,
+                    target_half_rows : target_half_rows + source_half_rows,
+                    : w13_q.shape[2],
+                ],
+                w13_q[:, source_half_rows:],
+            )
+            _copy_scale(target_w13_scale, w13_s, split_gate_up=True)
+            del w13_q, w13_s
+
+            source_w2 = old_w2_data[start:end]
+            source_w2_scale = (
+                old_w2_scale[start:end] if old_w2_scale is not None else None
+            )
+            w2_q, w2_s = _quantize(source_w2, source_w2_scale)
+            source_w2_rows = source_w2.shape[1]
+            w2_q = w2_q.reshape(count, source_w2_rows, w2_q.shape[1])
+            w2_s = _reshape_scale(w2_s, count)
+
+            target_w2 = self.w2_weight.data[start:end]
+            target_w2_scale = self.w2_weight_scale.data[start:end]
+            FusedMoE._copy_quant_storage(
+                target_w2[:, :source_w2_rows, : w2_q.shape[2]],
+                w2_q,
+            )
+            _copy_scale(target_w2_scale, w2_s, split_gate_up=False)
+            del w2_q, w2_s
+
     def _online_quant(self):
         """Handle online quantization: (optionally dequant →) quantize weights,
         then switch quant_method.
@@ -2861,6 +3153,7 @@ class FusedMoE(torch.nn.Module):
           2. Switch quant_method and allocate target quantized buffers
           3. Per-expert: quantize bf16 → write into buffers via
              _load_model_weight_or_group_weight_scale (reuses TP-shard + padding)
+             Row-local targets may batch experts before writing the same layout.
           4. Loader then calls target method's process_weights_after_loading
              which does fn→fnuz normalization and shuffle on the already-FP8 weights.
         """
@@ -2918,13 +3211,14 @@ class FusedMoE(torch.nn.Module):
         # w13 (column parallel): (E, (2*intermediate/tp, hidden)) — TP dim 0
         # w2  (row parallel):    (E, (hidden, intermediate/tp)) — TP dim 1
         # w13 [e, m, n]->[e, m//tp, n//2]->[e, m//tp, n//32]
+        # Streaming tails must remain collective-free across ranks.
         def check_need_allgather():
             if self.use_ep:
                 assert self.tp_size == 1, "EP MoE should not TP-shard expert weights"
                 return False
 
             need_gather_w2 = False
-            if self.tp_size > 1:
+            if not self._stream_online_quant and self.tp_size > 1:
                 # self.intermediate_size_per_partition = intermediate_size // self.tp_size
                 w2_in = self.intermediate_size_per_partition
                 if online_quant_type == QuantType.per_Token:
@@ -2957,11 +3251,40 @@ class FusedMoE(torch.nn.Module):
                 f"Unsupported online quant_dtype for MoE: {online_quant_dtype}"
             )
         self.moe_quant_params["params_dtype"] = online_quant_dtype
+        # Target buffers must use real storage.
+        self._stream_online_quant = False
         with torch.device(device):
             self.quant_method.create_weights(layer=self, **self.moe_quant_params)
 
         self.w13_input_scale = None
         self.w2_input_scale = None
+
+        # Batch row-local formats; per-tensor and gathered formats stay expertwise.
+        row_local_target = online_quant_type in (
+            QuantType.per_Token,
+            QuantType.per_1x32,
+            QuantType.per_1x128,
+        )
+        target_rows_are_batchable = online_quant_type != QuantType.per_1x128 or (
+            old_w13_data.shape[1] // 2 % 128 == 0 and old_w2_data.shape[1] % 128 == 0
+        )
+        if row_local_target and target_rows_are_batchable and not need_gather_w2:
+            self._online_quant_row_local_batched(
+                old_w13_data=old_w13_data,
+                old_w2_data=old_w2_data,
+                old_w13_scale=old_w13_scale,
+                old_w2_scale=old_w2_scale,
+                source_quant_type=source_quant_type,
+                source_quant_dtype=source_quant_dtype,
+                online_quant_type=online_quant_type,
+                online_quant_dtype=online_quant_dtype,
+            )
+            self._online_quant_info = {
+                "layer": self.layer_name,
+                "quant_type": online_quant_type.name,
+                "quant_dtype": str(online_quant_dtype),
+            }
+            return
 
         for expert_id in range(self.local_num_experts):
             # --- w13 column-parallel ---
@@ -3591,6 +3914,20 @@ class FusedMoE(torch.nn.Module):
             return n_local_base
         return None
 
+    def batched_expert_region_numel(
+        self,
+        param: torch.nn.Parameter,
+        local_expert_id: int,
+        shard_id: str,
+    ) -> int:
+        """Return the physical size of one staged ``(expert, shard)`` region."""
+        return expert_region(
+            param.data,
+            local_expert_id,
+            shard_id,
+            getattr(param, "is_transposed", False),
+        ).numel()
+
     @property
     def num_local_base_experts(self) -> int:
         """Local slots holding a routed base expert, i.e. slots `[0, n)`."""
@@ -3876,6 +4213,8 @@ class FusedMoE(torch.nn.Module):
         return topk_weights, topk_ids
 
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+        if self.balance_router_logits is not None:
+            router_logits = self.balance_router_logits[: hidden_states.shape[0]]
         return torch.ops.aiter.moe_forward(
             hidden_states, router_logits, self.layer_name
         )
@@ -3920,6 +4259,14 @@ class FusedMoE(torch.nn.Module):
                 hidden_states, router_logits, dp_eager_mode, ctx, dp_group
             )
 
+            # Stand in for the DP ranks a simulated run did not launch. Same row
+            # order for both, so a copied token keeps its own routing.
+            dp_repeat = self.moe_parallel_config.dp_logical_ratio
+            gathered_rows = hidden_states.shape[0]
+            if dp_repeat > 1:
+                hidden_states = repeat_rows(hidden_states, dp_repeat)
+                router_logits = repeat_rows(router_logits, dp_repeat)
+
             if _tbo:
                 tbo_switch_to_compute_sync()
 
@@ -3946,6 +4293,9 @@ class FusedMoE(torch.nn.Module):
 
         # Use reduce_scatter when DP > 1 but not using mori all2all kernels
         if use_dp_gather_scatter:
+            # `sizes` and the scatter below are sized for the real ranks.
+            if dp_repeat > 1:
+                final_hidden_states = final_hidden_states[:gathered_rows]
             if _tbo:
                 tbo_yield_and_switch_from_compute_to_comm()
             if dp_eager_mode:
@@ -3982,6 +4332,15 @@ class FusedMoE(torch.nn.Module):
             hidden_states = naive_multicast(hidden_states, cu_tokens_across_dp_cpu)
             router_logits = naive_multicast(router_logits, cu_tokens_across_dp_cpu)
 
+        # Simulated DP with no peers to gather from: the absent ranks' token
+        # shards are stood in for locally, same as after the gather in
+        # forward_impl_graph. Dropped again below.
+        dp_repeat = self.moe_parallel_config.dp_logical_ratio
+        local_rows = hidden_states.shape[0]
+        if dp_repeat > 1:
+            hidden_states = repeat_rows(hidden_states, dp_repeat)
+            router_logits = repeat_rows(router_logits, dp_repeat)
+
         # Matrix multiply.
         final_hidden_states = self.quant_method.apply(
             layer=self,
@@ -4002,6 +4361,9 @@ class FusedMoE(torch.nn.Module):
             apply_router_weight_on_input=self.apply_router_weight_on_input,
             prefix=f"{self.prefix}.fused_moe",
         )
+
+        if dp_repeat > 1:
+            final_hidden_states = final_hidden_states[:local_rows]
 
         dp_group = get_dp_group()
         if dp_group.world_size > 1:

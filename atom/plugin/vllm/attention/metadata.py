@@ -1080,7 +1080,14 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
         dcp_size = self.parallel_config.decode_context_parallel_size
         if dcp_size > 1 and self.dcp_persistent_supported:
             self.persistent_num_heads = mla_dcp_kernel_num_heads(
-                self.num_attention_heads, dcp_size
+                self.num_attention_heads,
+                dcp_size,
+                kv_cache_dtype=config.cache_config.cache_dtype,
+                # These descriptors are only ever handed to the kernel on the
+                # persistent path (`if use_persistent_metadata` in
+                # build()), so the width they must describe is the persistent
+                # one whatever the step later decides.
+                persistent=True,
             )
         else:
             self.persistent_num_heads = self.padded_num_attention_heads

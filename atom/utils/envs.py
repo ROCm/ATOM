@@ -256,6 +256,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_LOADER_STRICT_COVERAGE": lambda: (
         os.getenv("ATOM_LOADER_STRICT_COVERAGE", "true").lower() == "true"
     ),
+    # Quantize eligible modules as they load to reduce peak memory. Streaming
+    # quantizes local TP shards, so results may differ slightly from offline.
+    "ATOM_ONLINE_QUANT_STREAMING": lambda: (
+        os.getenv("ATOM_ONLINE_QUANT_STREAMING", "1").lower() in ("1", "true")
+    ),
+    # Tail workers for H2D, quantization, and source release. More workers
+    # increase overlap and in-flight memory; 0 runs inline.
+    "ATOM_ONLINE_QUANT_STREAMING_THREADS": lambda: int(
+        os.getenv("ATOM_ONLINE_QUANT_STREAMING_THREADS", "4")
+    ),
+    # Stage on the host and upload once per completed parameter. Disabling this
+    # buffers loader calls on meta and forces a single-threaded checkpoint walk.
+    "ATOM_ONLINE_QUANT_STREAMING_HOST_STAGING": lambda: (
+        os.getenv("ATOM_ONLINE_QUANT_STREAMING_HOST_STAGING", "1").lower()
+        in ("1", "true")
+    ),
     # --- Attention Backend ---
     # Use unified_attention (flash-style) for MHA paged/prefill attention instead
     # of pa_decode_gluon. Set to 1 to enable the unified_attention path.
@@ -284,6 +300,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FUSE_SHARED_EXPERT": lambda: (
         os.getenv("ATOM_FUSE_SHARED_EXPERT", "1").lower() == "1"
     ),
+    # Opt-in: MoE shared||routed fork inside a PIECEWISE-captured piece. Capture
+    # holds it and GSM8K is unmoved; off until a throughput win is shown. Shared
+    # dispatcher, so this moves V2/V3.2/K3 too. See docs.
+    "ATOM_DUAL_STREAM_PIECEWISE": lambda: os.getenv("ATOM_DUAL_STREAM_PIECEWISE", "0")
+    == "1",
     # Gate/Up interleave mode for MoE weight preshuffle and kernel gate_mode.
     # "0" (default) = SEPARATED layout; "1" = INTERLEAVE layout.
     "ATOM_MOE_GU_ITLV": lambda: os.getenv("ATOM_MOE_GU_ITLV", "0") == "1",

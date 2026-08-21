@@ -31,6 +31,7 @@ from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mla import (
     _MLA_MIN_HEADS,
     MLAAttention,
+    mla_dcp_decode_is_persistent,
     mla_dcp_kernel_num_heads,
 )
 from atom.utils import CpuGpuBuffer, envs
@@ -173,13 +174,21 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         # DCP decode all-gathers Q on the head dim, so the head count reaching
         # mla_decode_fwd (and thus the persistent decode metadata) is the padded
-        # gathered width, not the per-rank one.
+        # gathered width, not the per-rank one. Pad it the same way the module
+        # does (mla_dcp_decode_is_persistent picks the width set), so these
+        # descriptors always describe the kernel that will actually run.
         # Only gfx950 runs DCP in persistent mode (gfx942 lacks the lse persistent
         # kernel and stays non-persistent, where this metadata is unused); scale
         # by dcp only there so gfx942 keeps the original per-rank head sizing.
-        if self.dcp_world_size > 1 and dcp_persistent_supported():
+        dcp_persistent = dcp_persistent_supported()
+        if self.dcp_world_size > 1 and dcp_persistent:
             self.persistent_num_heads = mla_dcp_kernel_num_heads(
-                self.num_attention_heads, self.dcp_world_size
+                self.num_attention_heads,
+                self.dcp_world_size,
+                kv_cache_dtype=config.kv_cache_dtype,
+                persistent=mla_dcp_decode_is_persistent(
+                    self.is_sparse, self.dcp_world_size, dcp_persistent
+                ),
             )
         else:
             self.persistent_num_heads = self.padded_num_attention_heads

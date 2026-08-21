@@ -89,13 +89,13 @@ class AsyncIOProc:
         # (mooncake) thread spawn so the mask is inherited by child threads and
         # first-touch lands memory locally. The global GPU index is
         # dp_rank*tp_size+tp_rank (engine_core_mgr GPU assignment).
+        # Best-effort: any failure here is logged and skipped rather than
+        # taking the worker down, hence the blanket except.
         try:
             cfg = args[0]
-            gpu = (
-                cfg.parallel_config.data_parallel_rank * cfg.tensor_parallel_size + rank
-            )
+            gpu = cfg.parallel_config.data_parallel_rank * cfg.tp_world_size + rank
             numa_bind_to_node(gpu, label)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.warning(f"AsyncIOProc({label}): NUMA bind skipped: {e}")
         self.label = f"AsyncIOProc({label})"
         # Set process title so this GPU worker is distinguishable by rank in
