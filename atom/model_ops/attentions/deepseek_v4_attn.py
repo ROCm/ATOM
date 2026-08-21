@@ -106,7 +106,7 @@ from atom.model_ops.v4_kernels import (
     write_v4_paged_decode_indices,
     write_v4_paged_prefill_indices,
 )
-from atom.utils import CpuGpuBuffer, envs
+from atom.utils import CpuGpuBuffer
 from atom.utils.forward_context import (
     AttentionMetaData,
     AttnState,
@@ -524,7 +524,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         self._indexer_fp4 = fp4_indexer_enabled(
             getattr(model_runner.config, "index_cache_dtype", None), warn=True
         )
-        self._fp8_indexer_prefill_backend = envs.ATOM_V4_FP8_INDEXER_PREFILL_BACKEND
         # FP4 KV tile geometry (group_size 32; 16 packed bytes per group).
         self._idx_k_tiles = self.index_head_dim // 128
 
@@ -2222,12 +2221,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             "visible_end_gpu": visible_end_gpu,
         }
 
-        # Optional FP8 paged-prefill metadata. Expand the sequence-level block
+        # FP8 paged-prefill metadata. Expand the sequence-level block
         # table to query rows ONCE here, then reuse the contiguous result across
         # every CSA layer in this forward. PCP reindex and both TBO paths call
         # this builder again with their own token ownership, so no table is
         # cached across forwards or ubatches.
-        if not self._indexer_fp4 and self._fp8_indexer_prefill_backend != "legacy":
+        if not self._indexer_fp4:
             block_tables = attn_metadata.block_tables
             max_seq_len = max(int(n_committed_per_seq.max()), 1)
             live_pages = math.ceil(max_seq_len / self.csa_rows_per_block)

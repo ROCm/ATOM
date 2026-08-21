@@ -116,11 +116,10 @@ def v4_module():
     return module
 
 
-def _builder(v4_module, *, backend: str = "auto"):
+def _builder(v4_module):
     builder_cls = v4_module.DeepseekV4AttentionMetadataBuilder
     builder = builder_cls.__new__(builder_cls)
     builder._indexer_fp4 = False
-    builder._fp8_indexer_prefill_backend = backend
     builder.csa_rows_per_block = _ROWS_PER_PAGE
     # Production stages the legacy committed cumsum through a CpuGpuBuffer.
     # A fresh CPU tensor preserves its value and, importantly, its per-build
@@ -183,17 +182,9 @@ def test_page_table_expansion_covers_zero_and_64_row_boundaries(v4_module):
     assert torch.equal(pages, md.block_tables[:, :2])
 
 
-@pytest.mark.parametrize(
-    ("backend", "table_width"),
-    [
-        pytest.param("legacy", 2, id="legacy-never-publishes"),
-        pytest.param("auto", 1, id="auto-missing-live-page"),
-        pytest.param("paged", 1, id="forced-paged-missing-live-page"),
-    ],
-)
-def test_unusable_paged_metadata_is_not_published(v4_module, backend, table_width):
-    builder = _builder(v4_module, backend=backend)
-    rows = [[11, 12][:table_width], [21, 22][:table_width]]
+def test_unusable_paged_metadata_is_not_published(v4_module):
+    builder = _builder(v4_module)
+    rows = [[11], [21]]
     md = _metadata(
         v4_module,
         counts=[64, 65],

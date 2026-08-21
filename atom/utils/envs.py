@@ -22,16 +22,6 @@ import os
 from collections.abc import Callable
 from typing import Any
 
-
-def _env_choice(name: str, default: str, choices: tuple[str, ...]) -> str:
-    """Read a case-insensitive string environment variable from ``choices``."""
-    value = os.getenv(name, default).strip().lower()
-    if value not in choices:
-        expected = ", ".join(repr(choice) for choice in choices)
-        raise ValueError(f"{name} must be one of {{{expected}}}, got {value!r}")
-    return value
-
-
 environment_variables: dict[str, Callable[[], Any]] = {
     # --- Data Parallelism ---
     "ATOM_DP_RANK": lambda: int(os.getenv("ATOM_DP_RANK", "0")),
@@ -117,16 +107,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 0 to disable chunking (always single-shot).
     "ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB": lambda: int(
         os.getenv("ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB", "2048")
-    ),
-    # DeepSeek-V4 FP8 indexer prefill scorer. ``legacy`` gathers every
-    # sequence's committed K into one dense packed buffer before scoring;
-    # ``paged`` reads the paged FP8 cache directly and emits seq-local logits;
-    # ``auto`` selects paged whenever its per-forward metadata is available.
-    # FP4 indexer prefill has its own paged kernel and ignores this switch.
-    "ATOM_V4_FP8_INDEXER_PREFILL_BACKEND": lambda: _env_choice(
-        "ATOM_V4_FP8_INDEXER_PREFILL_BACKEND",
-        "legacy",
-        ("legacy", "paged", "auto"),
     ),
     # GLM-5.2 (glm_moe_dsa): enable the fused indexer qk-rope + fp8-quant + kv-cache
     # kernel (indexer_qk_rope_quant_and_cache), same path DeepSeek-V3.2 uses. GLM's

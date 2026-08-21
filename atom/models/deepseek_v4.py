@@ -1316,11 +1316,6 @@ class Indexer(nn.Module):
         self._indexer_fp4 = fp4_indexer_enabled(
             get_current_atom_config().index_cache_dtype
         )
-        # Static process-start choice for the explicit FP8 indexer path. The
-        # native FP4 indexer has its own paged prefill implementation and does
-        # not consult this switch.
-        self._fp8_indexer_prefill_backend = envs.ATOM_V4_FP8_INDEXER_PREFILL_BACKEND
-
         self.compressor = Compressor(
             args,
             compress_ratio,
@@ -1586,24 +1581,18 @@ class Indexer(nn.Module):
             paged_ready = paged_metadata_ready and paged_cache_ready
             # Model warmup runs before the paged KV pool is bound. Its one-block
             # fallback cache deliberately has shape [1, max_seq_len/4, D]; keep
-            # that dry run on the legacy scorer even in forced-paged mode.
+            # that dry run on the legacy scorer. Real FP8 prefill always uses
+            # the paged scorer and requires the matching metadata/cache shape.
             warmup_cache = (
                 self.kv_cache.size(0) == 1
                 and self.kv_cache.size(1) == self._max_model_len_idx
             )
-            if (
-                self._fp8_indexer_prefill_backend == "paged"
-                and not paged_ready
-                and not warmup_cache
-            ):
+            if not paged_ready and not warmup_cache:
                 raise RuntimeError(
-                    "ATOM_V4_FP8_INDEXER_PREFILL_BACKEND=paged requires "
-                    "per-token metadata and a 64-row paged indexer cache"
+                    "FP8 indexer prefill requires per-token metadata and a "
+                    "64-row paged indexer cache"
                 )
-            if paged_ready and self._fp8_indexer_prefill_backend in (
-                "paged",
-                "auto",
-            ):
+            if paged_ready:
                 return self._score_topk_prefill_paged(
                     q_quant, weights, indexer_meta, topk
                 )
