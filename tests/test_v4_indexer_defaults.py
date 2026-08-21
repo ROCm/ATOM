@@ -124,11 +124,21 @@ def _make_config(
     return config, probe
 
 
-@pytest.mark.parametrize("gfx", ["gfx950", "gfx1250", "future_gfx"])
-def test_native_v4_defaults_indexer_to_fp4(monkeypatch, gfx):
-    config, probe = _make_config(monkeypatch, gfx=gfx)
+def test_native_v4_defaults_indexer_to_fp4_on_gfx950(monkeypatch):
+    config, probe = _make_config(monkeypatch, gfx="gfx950")
 
     assert config.index_cache_dtype == "fp4"
+    assert config.kv_cache_block_size == 256
+    assert probe.calls == 1
+
+
+@pytest.mark.parametrize("gfx", ["gfx1250", "future_gfx"])
+def test_native_v4_defaults_indexer_to_kv_cache_dtype_off_gfx950(
+    monkeypatch, gfx
+):
+    config, probe = _make_config(monkeypatch, gfx=gfx)
+
+    assert config.index_cache_dtype == config.kv_cache_dtype == "fp8"
     assert config.kv_cache_block_size == 256
     assert probe.calls == 1
 
@@ -182,7 +192,7 @@ def test_non_v4_indexer_defaults_to_kv_cache_dtype(monkeypatch):
 
 @pytest.mark.parametrize(
     ("gfx", "expected"),
-    [("gfx942", False), ("gfx950", True), ("gfx1250", True)],
+    [("gfx942", False), ("gfx950", True), ("gfx1250", False)],
 )
 def test_fp4_indexer_runtime_predicate(monkeypatch, caplog, gfx, expected):
     v4_kernels, probe = _load_v4_kernels(monkeypatch, gfx)
@@ -192,7 +202,7 @@ def test_fp4_indexer_runtime_predicate(monkeypatch, caplog, gfx, expected):
 
     assert enabled is expected
     assert probe.calls == 1
-    assert ("unsupported" in caplog.text) is (not expected)
+    assert ("Falling back" in caplog.text) is (not expected)
 
 
 def test_non_fp4_indexer_predicate_does_not_query_arch(monkeypatch):
