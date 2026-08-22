@@ -1119,35 +1119,6 @@ class ModelRunner:
         if self.rank == 0:
             logger.info(*args)
 
-    def _run_dummy_drafter(self, hidden_states, draft_bs=None):
-        """Run drafter forward for DP synchronization (no real proposal)."""
-        if not hasattr(self, "drafter"):
-            return
-        forward_context = get_forward_context()
-        forward_context.context.is_draft = True
-        if draft_bs is None:
-            draft_bs = forward_context.context.graph_bs
-        for i in range(self.drafter.mtp_k):
-            self.drafter._refresh_dp_metadata(forward_context, hidden_states.shape[0])
-            hidden_states = self.drafter.model(
-                input_ids=torch.zeros(
-                    hidden_states.shape[0],
-                    dtype=torch.int32,
-                    device=self.device,
-                ),
-                positions=torch.zeros(
-                    hidden_states.shape[0],
-                    dtype=torch.int64,
-                    device=self.device,
-                ),
-                hidden_states=hidden_states,
-            )
-            if i == 0:
-                hidden_states = hidden_states[:draft_bs]
-                # pad_for_all_gather uses graph_bs * 1, consistent with
-                # ranks running propose
-                forward_context.attn_metadata.max_seqlen_q = 1
-
     def dummy_execution(self):
         """Execute dummy decode batch for DP synchronization."""
         has_drafter = hasattr(self, "drafter")
@@ -3361,11 +3332,33 @@ class ModelRunner:
 
         pp_group = get_pp_group()
         pp_non_last = pp_group.world_size > 1 and not pp_group.is_last_rank
-        # Before the batch is classified as producing a token or not: `propose()`
-        # is reached only from `postprocess`, so a drafter context maintained
-        # there would cover a chunked prefill's final chunk alone.
-        if hasattr(self, "drafter") and not pp_non_last and not batch.is_dummy_run:
-            self.drafter.precompute_context_kv(
+
+        # ---- draft passes ----------------------------------------------------
+        # The target forward above cannot run one, so the accounting window opens
+        # here; both returns below close it with _verify_draft_pass_count().
+        drafter = getattr(self, "drafter", None)
+        if drafter is not None:
+            drafter.reset_draft_passes()
+
+        # An output-less batch still runs `propose()` (below) purely to keep its
+        # DP collectives in step.
+        will_align_draft = (
+            self._dp_draft_lockstep_active()
+            and self._is_pure_middle_chunk(batch)
+            and not batch.is_dummy_run
+        )
+        # Runs after EVERY target forward -- `postprocess` (hence `propose`) is
+        # skipped for a middle chunk. Not on the aligning step, though: a context
+        # pass that duplicates propose's first draft step is one the peers on
+        # `dummy_execution` never mirror.
+        run_context_pass = (
+            drafter is not None
+            and not pp_non_last
+            and not batch.is_dummy_run
+            and not (will_align_draft and drafter.precompute_duplicates_propose)
+        )
+        if run_context_pass:
+            drafter.precompute_context_kv(
                 get_forward_context().context.positions,
                 hidden_states,
                 batch.next_token_ids,
@@ -3378,11 +3371,7 @@ class ModelRunner:
             # and drop the ids: a middle chunk sharing a batch with a final-chunk
             # seq already goes through propose, so this is the existing path;
             # only the all-middle batch took the shortcut.
-            if (
-                self._middle_chunk_needs_draft_alignment()
-                and self._is_pure_middle_chunk(batch)
-                and not batch.is_dummy_run
-            ):
+            if will_align_draft:
                 self.propose_draft_token_ids(
                     batch,
                     self.tokenID_processor.input_ids.gpu[
@@ -3397,6 +3386,10 @@ class ModelRunner:
                     ),
                     align_only=True,
                 )
+            # A PP non-last rank runs no draft at all -- its own arm of this
+            # return, not a divergence from the DP peers it shares a stage with.
+            if not pp_non_last:
+                self._verify_draft_pass_count(batch)
             reset_forward_context()
             # Mark this slot's GPU work (attention consumed its metadata) done.
             if not batch.is_dummy_run:
@@ -3420,6 +3413,7 @@ class ModelRunner:
             needs_independent_noise=needs_independent_noise,
         )
 
+        self._verify_draft_pass_count(batch)
         reset_forward_context()
         if not batch.is_dummy_run:
             self._record_forward_vars_event()
@@ -3429,18 +3423,50 @@ class ModelRunner:
     def _is_pure_middle_chunk(batch) -> bool:
         return batch is not None and not batch.produces_output()
 
-    def _middle_chunk_needs_draft_alignment(self) -> bool:
-        """Must an output-less batch still run `propose()` for its collectives?
+    def _dp_draft_lockstep_active(self) -> bool:
+        """Are draft passes on this rank bound to what the DP peers run?
 
         Only under DP attention: `_refresh_dp_metadata` returns early at
-        `data_parallel_size <= 1`, so TP-only and single-rank pay nothing here.
-        PP (`is_deferred_out` False) is excluded — its `pp_non_last` arm of the
-        same return is a separate question.
+        `data_parallel_size <= 1`, so TP-only and single-rank pay nothing here --
+        and an output-less batch there legitimately runs no draft at all, which
+        is why `draft_passes_per_forward` is only enforced when this holds. PP
+        (`is_deferred_out` False) is excluded — its `pp_non_last` arm is a
+        separate question.
+
+        Two callers, one fact: whether an output-less batch must still run
+        `propose()` for its collectives, and whether the pass count is checked.
         """
         return (
             hasattr(self, "drafter")
             and self.config.parallel_config.data_parallel_size > 1
             and self.tokenID_processor.is_deferred_out
+        )
+
+    def _verify_draft_pass_count(self, batch) -> None:
+        """Hold this forward to the drafter's declared draft-pass count.
+
+        The DP lockstep contract in one place. Off lockstep this is skipped
+        entirely (see `_dp_draft_lockstep_active`); on it, a mismatch means this
+        rank is about to issue a different number of collectives than its peers,
+        so it raises HERE -- naming the rank, the batch and the count -- instead
+        of leaving all eight workers spinning at 99% CPU with the GPUs idle,
+        which is what this same divergence cost twice before.
+        """
+        drafter = getattr(self, "drafter", None)
+        if drafter is None or not self._dp_draft_lockstep_active():
+            return
+        expected = drafter.draft_passes_per_forward
+        actual = drafter.draft_passes_counted
+        if actual == expected:
+            return
+        raise RuntimeError(
+            f"{self.label}: DP draft lockstep broken -- ran {actual} draft "
+            f"pass(es), {type(drafter).__name__} declares {expected} per "
+            f"forward. "
+            f"Peers issue {expected} and will block on the difference. "
+            f"batch: dummy={batch.is_dummy_run} seqs={batch.total_seqs_num} "
+            f"tokens={batch.total_tokens_num} "
+            f"produces_output={batch.produces_output()}"
         )
 
     @torch.inference_mode()

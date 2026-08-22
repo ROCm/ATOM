@@ -166,6 +166,19 @@ class EagleProposer(Drafter):
             buf[: aux.shape[0]].copy_(aux)
         return hidden
 
+    @property
+    def precompute_duplicates_propose(self) -> bool:
+        # The pass below is the draft model over the same rows with the same
+        # anchors that `propose()`'s i==0 step runs -- see its docstring.
+        return True
+
+    @property
+    def draft_passes_per_forward(self) -> int:
+        # One heavyweight backbone pass per drafted token: `propose()` loops
+        # `mtp_k` times. `precompute_context_kv` adds a pass on the steps it
+        # runs, which is why it and `propose()` are mutually exclusive.
+        return self.mtp_k
+
     def precompute_context_kv(
         self,
         positions: torch.Tensor,
@@ -183,6 +196,12 @@ class EagleProposer(Drafter):
         the same anchors (`propose_draft_token_ids` applies them too). Hence the
         early return: repeating it would be duplicate work. The test is on the
         data -- nothing here asks what kind of chunk this is.
+
+        The all-middle batch (no -1 at all) is the remaining case, and under DP
+        attention it now runs `propose(align_only=True)` for its collectives --
+        the same redo. `precompute_duplicates_propose` is how the runner skips
+        this call there; without it this pass is one draft forward that the peer
+        ranks' `dummy_execution` never mirrors, which deadlocks them.
 
         NOTE: unverified against real weights. `build_drafter` routes anything
         carrying `dspark_block_size` to `DSparkProposer`, and every model on
@@ -217,6 +236,7 @@ class EagleProposer(Drafter):
 
         was_draft = context.is_draft
         context.is_draft = True
+        self.count_draft_pass()
         try:
             self.model(
                 input_ids=input_ids,
@@ -333,6 +353,7 @@ class EagleProposer(Drafter):
                 # steps 1+ skip it and read the compacted sparse_kv buffer.
                 if self._share_mtp_indices and i == 0:
                     self.model.model.set_skip_topk(False)
+                self.count_draft_pass()
                 ret_hidden_states = self.model(
                     input_ids=d_input_ids,
                     positions=d_positions,

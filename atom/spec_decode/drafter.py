@@ -163,6 +163,9 @@ class Drafter(abc.ABC):
         self._captures_aux = False
         self._aux_buffers: list[torch.Tensor] = []
 
+        # DP lockstep accounting; see `draft_passes_per_forward`.
+        self._draft_passes_counted = 0
+
         i32_kwargs = {"dtype": torch.int32, "device": self.device}
         i64_kwargs = {"dtype": torch.int64, "device": self.device}
         max_bs = self.config.max_num_seqs
@@ -224,6 +227,70 @@ class Drafter(abc.ABC):
         """Confidence-schedule verify planner (DSpark Level B), or None when the
         drafter uses fixed-length verification."""
         return None
+
+    @property
+    def precompute_duplicates_propose(self) -> bool:
+        """Does `precompute_context_kv` redo work `propose()` would do anyway?
+
+        True for drafters whose context pass IS the draft model's first pass over
+        the same rows with the same anchors (EAGLE/MTP), so running both on one
+        step is duplicate work — and, because it is a draft-model forward with
+        collectives that peer ranks running `dummy_execution` do not mirror, a DP
+        deadlock. False for drafters whose context pass writes storage `propose()`
+        only reads (DSpark's rolling target-KV window): skipping it would leave
+        that chunk's context unwritten.
+        """
+        return False
+
+    # ---- DP lockstep: declared draft-pass count ----
+    #
+    # Under DP attention every rank must issue the SAME sequence of collectives
+    # every step; a rank with nothing to run issues them from
+    # `dummy_execution`. Draft passes are where that keeps breaking, because
+    # each site decides on its own whether to run, from DATA (`is_dummy_run`,
+    # `produces_output()`, an anchor of -1) rather than from what the peers will
+    # do. Two deadlocks came out of that: an output-less batch skipping
+    # `propose()` entirely (one pass short), then EAGLE's context pass running
+    # beside the propose that replaced it (one pass long).
+    #
+    # So the count is declared here and checked in one place. Every drafter
+    # states how many collective-carrying draft-model passes one target forward
+    # runs, calls `count_draft_pass()` immediately before each, and
+    # `ModelRunner.forward` verifies the total before it returns -- turning a
+    # silent cross-rank hang into an immediate local error.
+
+    @property
+    def draft_passes_per_forward(self) -> int:
+        """Collective-carrying draft-model passes per target forward.
+
+        Counts passes that talk to other ranks (draft backbone forwards: MoE
+        all-to-all, TP all-reduce, the DPMetadata all_reduce that sizes them).
+        Local draft work is not a pass -- DSpark's `write_context_kv` projects
+        and scatters into its own window without a single collective, which is
+        exactly why peers skipping it costs nothing.
+
+        Must not depend on the batch: it is the contract peers hold you to, and
+        they cannot see your batch.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} must declare draft_passes_per_forward -- how "
+            "many collective-carrying draft passes it runs per target forward. "
+            "See Drafter.draft_passes_per_forward."
+        )
+
+    def reset_draft_passes(self) -> None:
+        """Reset the per-forward pass counter. Called by the runner."""
+        self._draft_passes_counted = 0
+
+    def count_draft_pass(self) -> None:
+        """Record one collective-carrying draft pass. Call immediately before
+        launching it, so a pass that raises still counts as attempted."""
+        self._draft_passes_counted += 1
+
+    @property
+    def draft_passes_counted(self) -> int:
+        """Passes recorded since the last `reset_draft_passes()`."""
+        return self._draft_passes_counted
 
     # ---- aux-hidden-state ownership (drafter-owned, hook-based) ----
     def arm_aux_capture(self, target_model: nn.Module) -> None:
