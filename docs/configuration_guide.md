@@ -40,7 +40,7 @@ Defined in `atom/config.py`. The root dataclass that the engine consumes.
 | `kv_cache_block_size` | `int` | `16` | Block size for paged KV cache; must be a multiple of 16 or exactly 1 |
 | `num_kvcache_blocks` | `int` | `-1` | Number of KV cache blocks (`-1` = auto) |
 | `kv_cache_dtype` | `str` | `"bf16"` | KV cache data type (`"bf16"` or `"fp8"`) |
-| `index_cache_dtype` | `str \| None` | `None` | Indexer-cache dtype, resolved after model detection. Native single-node DeepSeek-V4 defaults to `"fp4"` except on gfx942; plugin and KV-transfer integrations retain `"fp8"`. Other models inherit `kv_cache_dtype`. An explicit `"bf16"`, `"fp8"`, or `"fp4"` value is preserved. |
+| `index_cache_dtype` | `str \| None` | `None` | Indexer-cache dtype, resolved after model detection. Native single-node DeepSeek-V4 defaults to `"fp4"` on gfx950, `"fp8"` on gfx942, and `kv_cache_dtype` elsewhere (typically `"bf16"` → FP8 indexer kernels on gfx1250). Plugin and KV-transfer integrations retain `"fp8"`. Other models inherit `kv_cache_dtype`. An explicit `"bf16"`, `"fp8"`, or `"fp4"` value is preserved. |
 | `enable_prefix_caching` | `bool` | `False` | Enable prefix caching to reuse KV blocks across requests sharing the same prefix |
 | `state_checkpoint_interval_tokens` | `int` | `8192` | For models with per-request state (DeepSeek-V4 compressor ring, GDN recurrent state): keep a state checkpoint every N tokens of context, so a later prefix hit can resume there. A prompt shorter than N checkpoints nothing. Must be a multiple of the prefix-cache hash block size; `0` disables checkpoints. See the state-checkpoint section of the [scheduling & KV cache guide](scheduling_kv_cache_guide.md) |
 | `port` | `int` | `8006` | Engine internal communication port |

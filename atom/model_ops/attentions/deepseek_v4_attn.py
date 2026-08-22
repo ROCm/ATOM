@@ -501,7 +501,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             "be 16-byte aligned: the FP8 data region is read with dwordx4 loads"
         )
 
-        # FP4 indexer cache (the native single-node default except on gfx942).
+        # FP4 indexer cache (the native single-node default on gfx950 only).
         # When enabled, the CSA Indexer KV is
         # stored as packed FP4 E2M1 + per-group(32) e8m0 scale in the
         # `pa_mqa_logits_fp4` preshuffle layout (data
@@ -512,7 +512,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # `--index_cache_dtype` remains an explicit override. This is the
         # authoritative decision re-asserted onto every Indexer in
         # `build_kv_cache_tensor`.
-        # `warn=True`: the gfx942 fallback message is emitted here only, since the
+        # `warn=True`: the non-gfx950 fallback message is emitted here only, since the
         # builder is constructed once while `Indexer.__init__` runs per CSA layer.
         # Shared predicate (see `fp4_indexer_enabled`) so the builder and
         # `Indexer.__init__` cannot drift apart.
