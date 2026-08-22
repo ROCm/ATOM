@@ -3333,11 +3333,7 @@ class ModelRunner:
         pp_group = get_pp_group()
         pp_non_last = pp_group.world_size > 1 and not pp_group.is_last_rank
 
-        # ---- draft passes: counted from here, verified at both returns ----
         drafter = getattr(self, "drafter", None)
-        if drafter is not None:
-            drafter.reset_draft_passes()
-
         # An output-less batch still runs propose() for its DP collectives.
         will_align_draft = (
             self._dp_draft_lockstep_active()
@@ -3377,10 +3373,6 @@ class ModelRunner:
                     ),
                     align_only=True,
                 )
-            # A PP non-last rank runs no draft at all -- its own arm, not a
-            # divergence from the peers it shares a stage with.
-            if not pp_non_last:
-                self._verify_draft_pass_count(batch)
             reset_forward_context()
             # Mark this slot's GPU work (attention consumed its metadata) done.
             if not batch.is_dummy_run:
@@ -3404,7 +3396,6 @@ class ModelRunner:
             needs_independent_noise=needs_independent_noise,
         )
 
-        self._verify_draft_pass_count(batch)
         reset_forward_context()
         if not batch.is_dummy_run:
             self._record_forward_vars_event()
@@ -3425,28 +3416,6 @@ class ModelRunner:
             hasattr(self, "drafter")
             and self.config.parallel_config.data_parallel_size > 1
             and self.tokenID_processor.is_deferred_out
-        )
-
-    def _verify_draft_pass_count(self, batch) -> None:
-        """Hold this forward to the drafter's declared draft-pass count.
-
-        A mismatch means this rank is about to issue a different number of
-        collectives than its peers, so it fails here instead of hanging them.
-        """
-        drafter = getattr(self, "drafter", None)
-        if drafter is None or not self._dp_draft_lockstep_active():
-            return
-        expected = drafter.draft_passes_per_forward
-        actual = drafter.draft_passes_counted
-        if actual == expected:
-            return
-        raise RuntimeError(
-            f"{self.label}: DP draft lockstep broken -- ran {actual} draft "
-            f"pass(es), {type(drafter).__name__} declares {expected} per "
-            f"forward, and the peers issue {expected}. "
-            f"batch: dummy={batch.is_dummy_run} seqs={batch.total_seqs_num} "
-            f"tokens={batch.total_tokens_num} "
-            f"produces_output={batch.produces_output()}"
         )
 
     @torch.inference_mode()

@@ -163,8 +163,6 @@ class Drafter(abc.ABC):
         self._captures_aux = False
         self._aux_buffers: list[torch.Tensor] = []
 
-        self._draft_passes_counted = 0
-
         i32_kwargs = {"dtype": torch.int32, "device": self.device}
         i64_kwargs = {"dtype": torch.int64, "device": self.device}
         max_bs = self.config.max_num_seqs
@@ -236,36 +234,6 @@ class Drafter(abc.ABC):
         means it writes storage propose only reads, so it always runs.
         """
         return False
-
-    # ---- DP lockstep ----
-    # Every rank must issue the same collectives each step, an idle one from
-    # `dummy_execution`. Draft sites each decided that from data
-    # (`is_dummy_run`, `produces_output()`), which cost two deadlocks -- so the
-    # count is declared here and `ModelRunner.forward` checks it.
-
-    @property
-    def draft_passes_per_forward(self) -> int:
-        """Collective-carrying draft-model passes per target forward.
-
-        Local draft work does not count: DSpark's `write_context_kv` scatters
-        into its own window without a collective. Must not depend on the batch,
-        which the peers holding you to this cannot see.
-        """
-        raise NotImplementedError(
-            f"{type(self).__name__} must declare draft_passes_per_forward -- how "
-            "many collective-carrying draft passes it runs per target forward."
-        )
-
-    def reset_draft_passes(self) -> None:
-        self._draft_passes_counted = 0
-
-    def count_draft_pass(self) -> None:
-        """Call immediately before launching one, so a pass that raises counts."""
-        self._draft_passes_counted += 1
-
-    @property
-    def draft_passes_counted(self) -> int:
-        return self._draft_passes_counted
 
     # ---- aux-hidden-state ownership (drafter-owned, hook-based) ----
     def arm_aux_capture(self, target_model: nn.Module) -> None:

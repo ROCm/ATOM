@@ -171,10 +171,6 @@ class EagleProposer(Drafter):
         # The pass below is propose's i==0 step: same rows, same anchors.
         return True
 
-    @property
-    def draft_passes_per_forward(self) -> int:
-        return self.mtp_k  # one backbone pass per drafted token
-
     def precompute_context_kv(
         self,
         positions: torch.Tensor,
@@ -230,7 +226,6 @@ class EagleProposer(Drafter):
 
         was_draft = context.is_draft
         context.is_draft = True
-        self.count_draft_pass()
         try:
             self.model(
                 input_ids=input_ids,
@@ -347,7 +342,6 @@ class EagleProposer(Drafter):
                 # steps 1+ skip it and read the compacted sparse_kv buffer.
                 if self._share_mtp_indices and i == 0:
                     self.model.model.set_skip_topk(False)
-                self.count_draft_pass()
                 ret_hidden_states = self.model(
                     input_ids=d_input_ids,
                     positions=d_positions,

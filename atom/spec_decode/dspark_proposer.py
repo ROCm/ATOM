@@ -279,10 +279,6 @@ class DSparkProposer(Drafter):
     def verify_scheduler(self):
         return self._verify_scheduler
 
-    @property
-    def draft_passes_per_forward(self) -> int:
-        return 1  # one `forward_spec` block pass, both flavors
-
     # ---- aux-hidden-state ownership (declarative; base owns the hook machinery) ----
     def _aux_capture_spec(self, target_model: nn.Module) -> AuxCaptureSpec:
         """DSpark taps the configured target layers and reconstructs each one's
@@ -465,7 +461,6 @@ class DSparkProposer(Drafter):
         window = int(self.model.window_size)
         num_draft = min(self.mtp_k, window)
         self._refresh_dp_metadata(forward_context, bs * num_draft)
-        self.count_draft_pass()
         with record_function(f"dspark[bs={bs} T={num_draft}]"):
             draft_token_ids, confidence = self.model.forward_spec(
                 anchor_ids,
@@ -672,7 +667,6 @@ class DSparkProposer(Drafter):
         forward_context.attn_metadata.dtype_q = dtype_q
 
         # ---- 3. Block pass + Markov sampling ---------------------------------
-        self.count_draft_pass()
         with record_function(f"dspark[bs={bs} T={T}]"):
             draft_token_ids, confidence = self.model.forward_spec(
                 anchor_ids,
