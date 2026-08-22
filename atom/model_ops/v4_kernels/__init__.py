@@ -22,6 +22,11 @@ from atom.model_ops.v4_kernels.csa_translate_pack import (
     csa_translate_pack,
     csa_translate_pack_reference,
 )
+from atom.model_ops.v4_kernels.fp4_mqa_schedule import (
+    FP4_MQA_BLOCK_K,
+    FP4_MQA_PARALLEL_UNIT_NUM,
+    fp4_mqa_prefill_parallel_unit_num,
+)
 from atom.model_ops.v4_kernels.fused_compress import (
     fused_compress_attn,
     fused_compress_attn_reference,
@@ -67,6 +72,7 @@ __all__ = [
     "csa_translate_pack",
     "csa_translate_pack_reference",
     "fp4_indexer_enabled",
+    "fp4_mqa_prefill_parallel_unit_num",
     "fused_compress_attn",
     "fused_compress_attn_reference",
     "hca_compress_paged_offsets",
@@ -90,15 +96,6 @@ __all__ = [
 ]
 
 logger = logging.getLogger("atom")
-
-# FP4 indexer persistent-grid schedule params, shared by the decode
-# (`pa_mqa_logits_fp4`) and prefill (`pa_mqa_logits_fp4_prefill`) kernels.
-# The attention metadata builder precomputes each path's cta_info with these
-# and the scorer passes the matching block_k, so layout and grid agree. They
-# live here (rather than in either caller) because both the builder and the
-# model-side scorer must use the SAME values. Mirrors the kernel defaults.
-FP4_MQA_PARALLEL_UNIT_NUM = 512
-FP4_MQA_BLOCK_K = 256
 
 
 def fp4_indexer_enabled(index_cache_dtype: Any, *, warn: bool = False) -> bool:

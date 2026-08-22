@@ -100,10 +100,10 @@ from atom.model_ops.triton_rmsnorm_nw import rmsnorm_nw
 from atom.model_ops.utils import atom_parameter
 from atom.model_ops.v4_kernels import (
     FP4_MQA_BLOCK_K,
-    FP4_MQA_PARALLEL_UNIT_NUM,
     CompressPlan,
     csa_translate_pack,
     fp4_indexer_enabled,
+    fp4_mqa_prefill_parallel_unit_num,
     fused_compress_attn,
     inverse_rope_inplace,
     qk_norm_rope_maybe_quant,
@@ -142,6 +142,10 @@ logger = logging.getLogger(__name__)
 # a constant so Compressor code does not need to import the builder. MUST match
 # DeepseekV4AttentionMetadataBuilder.block_size and config.kv_cache_block_size.
 _V4_BLOCK_SIZE: int = 256
+# The AITER FP8 paged-MQA preshuffle kernel processes K in 256-row chunks and
+# may issue a full-chunk store for a partial logical tail. Give each logits row
+# a 256-column-aligned physical stride so that tail cannot overlap the next row.
+_V4_FP8_PAGED_MQA_CHUNK_K: int = 256
 
 _V4_RMSNORM_BACKEND = os.environ.get("ATOM_V4_RMSNORM_BACKEND", "triton")
 _V4_USE_TRITON_RMSNORM = _V4_RMSNORM_BACKEND == "triton"
@@ -1366,7 +1370,6 @@ class Indexer(nn.Module):
         self._indexer_fp4 = fp4_indexer_enabled(
             get_current_atom_config().index_cache_dtype
         )
-
         self.compressor = Compressor(
             args,
             compress_ratio,
@@ -1618,12 +1621,62 @@ class Indexer(nn.Module):
         # underlying top-k kernels write -1 sentinels across the row, and
         # `csa_translate_pack` skips them via its `topk >= 0` mask.
         if fc.context.is_prefill:
+            paged_metadata_ready = (
+                indexer_meta is not None
+                and indexer_meta.get("paged_prefill_block_tables_per_token") is not None
+                and indexer_meta.get("paged_prefill_max_seq_len") is not None
+            )
+            paged_cache_ready = (
+                self.kv_cache.ndim == 3
+                and self.kv_cache.size(1) == 64
+                and self.kv_cache.size(2) == self.head_dim + 4
+                and self.kv_cache.element_size() == 1
+            )
+            paged_ready = paged_metadata_ready and paged_cache_ready
+            # Model warmup runs before the paged KV pool is bound. Its one-block
+            # fallback cache deliberately has shape [1, max_seq_len/4, D]; keep
+            # that dry run on the legacy scorer. Real FP8 prefill always uses
+            # the paged scorer and requires the matching metadata/cache shape.
+            warmup_cache = (
+                self.kv_cache.size(0) == 1
+                and self.kv_cache.size(1) == self._max_model_len_idx
+            )
+            if not paged_ready and not warmup_cache:
+                raise RuntimeError(
+                    "FP8 indexer prefill requires per-token metadata and a "
+                    "64-row paged indexer cache"
+                )
+            if paged_ready:
+                return self._score_topk_prefill_paged(
+                    q_quant, weights, indexer_meta, topk
+                )
             return self._score_topk_prefill(
                 q_quant, weights, block_tables, indexer_meta, topk
             )  # [total_tokens, topk] int32
         return self._score_topk_decode(
             q_quant, weights, block_tables, indexer_meta, topk
         )  # [total_tokens, topk] int32
+
+    @staticmethod
+    def _prefill_chunk_rows(total_tokens: int, row_width: int) -> int:
+        """Choose a query-row chunk size for a dense fp32 logits buffer."""
+        budget_bytes = SPARSE_INDEXER_LOGITS_BUDGET_MB * 1024 * 1024
+        if (
+            budget_bytes > 0
+            and row_width > 0
+            and budget_bytes // (row_width * 4) < total_tokens
+        ):
+            # 4 bytes per fp32 logit; row_width * 4 is one row's footprint. Round
+            # the budget-derived row count DOWN: a multiple of 128 (aligned to the
+            # kernel's row tiling) in the normal regime, avoiding coarse power-of-2
+            # doubling. Below 128 rows (extreme row_width), fall back to a
+            # power-of-2 floor so it degrades 64/32/.../1 instead of collapsing to 1.
+            budget_rows = budget_bytes // (row_width * 4)
+            if budget_rows >= 128:
+                return (budget_rows // 128) * 128
+            return 1 << (max(1, budget_rows).bit_length() - 1)
+        # Budget disabled, or a single chunk already fits all rows.
+        return total_tokens
 
     def _prefill_chunked_topk(
         self,
@@ -1659,25 +1712,7 @@ class Indexer(nn.Module):
         Returns ``[total_tokens, topk]`` int32 (raw kernel output; caller remaps).
         """
         topk_out = torch.empty((total_tokens, topk), dtype=torch.int32, device=device)
-        budget_bytes = SPARSE_INDEXER_LOGITS_BUDGET_MB * 1024 * 1024
-        if (
-            budget_bytes > 0
-            and row_width > 0
-            and budget_bytes // (row_width * 4) < total_tokens
-        ):
-            # 4 bytes per fp32 logit; row_width * 4 is one row's footprint. Round
-            # the budget-derived row count DOWN: a multiple of 128 (aligned to the
-            # kernel's row tiling) in the normal regime, avoiding coarse power-of-2
-            # doubling. Below 128 rows (extreme row_width), fall back to a
-            # power-of-2 floor so it degrades 64/32/.../1 instead of collapsing to 1.
-            budget_rows = budget_bytes // (row_width * 4)
-            if budget_rows >= 128:
-                chunk_tokens = (budget_rows // 128) * 128
-            else:
-                chunk_tokens = 1 << (max(1, budget_rows).bit_length() - 1)
-        else:
-            # Budget disabled, or a single chunk already fits all rows.
-            chunk_tokens = total_tokens
+        chunk_tokens = self._prefill_chunk_rows(total_tokens, row_width)
         for chunk_start in range(0, total_tokens, chunk_tokens):
             chunk_end = min(chunk_start + chunk_tokens, total_tokens)
             rs = row_starts[chunk_start:chunk_end]
@@ -1778,6 +1813,79 @@ class Indexer(nn.Module):
             topk_global,  # preserve -1 sentinel
             topk_global - seq_base,
         )  # [total_tokens, topk] int32, raw seq-local with -1 in tail
+
+    def _score_topk_prefill_paged(
+        self,
+        q_fp8: torch.Tensor,  # [total_tokens, n_heads, head_dim] fp8
+        weights: torch.Tensor,  # [total_tokens, n_heads] fp32
+        indexer_meta: dict,
+        topk: int,
+    ) -> torch.Tensor:
+        """FP8 prefill scorer that reads each sequence's paged cache directly.
+
+        The metadata builder expands the sequence block table to one contiguous
+        row per query once per forward. Treating every query as an independent
+        ``next_n=1`` item preserves the ratio-4 causal boundary carried by
+        ``visible_end_gpu``. Logits and top-k indices are sequence-local, so this
+        path needs neither a packed cross-sequence gather nor a seq-base remap.
+        """
+        device = q_fp8.device
+        total_tokens = q_fp8.size(0)
+        max_seq_len = indexer_meta["paged_prefill_max_seq_len"]
+        logits_width = (
+            math.ceil(max_seq_len / _V4_FP8_PAGED_MQA_CHUNK_K)
+            * _V4_FP8_PAGED_MQA_CHUNK_K
+        )
+        visible_ends = indexer_meta["visible_end_gpu"]
+        block_tables_per_token = indexer_meta["paged_prefill_block_tables_per_token"]
+        kv_block_size = self.kv_cache.size(1)
+        if (
+            self.kv_cache.ndim != 3
+            or kv_block_size != 64
+            or self.kv_cache.size(2) != self.head_dim + 4
+            or self.kv_cache.element_size() != 1
+        ):
+            raise RuntimeError(
+                "V4 FP8 paged indexer prefill requires a packed uint8/FP8 "
+                f"[num_blocks, 64, {self.head_dim + 4}] cache, got "
+                f"shape={tuple(self.kv_cache.shape)}, "
+                f"element_size={self.kv_cache.element_size()}"
+            )
+
+        q_4d = q_fp8.view(total_tokens, 1, self.n_heads, self.head_dim)
+        kv_cache_4d = self.kv_cache.unsqueeze(-2)
+        topk_local = torch.empty(total_tokens, topk, dtype=torch.int32, device=device)
+        chunk_tokens = self._prefill_chunk_rows(total_tokens, logits_width)
+        for chunk_start in range(0, total_tokens, chunk_tokens):
+            chunk_end = min(chunk_start + chunk_tokens, total_tokens)
+            chunk_rows = chunk_end - chunk_start
+            chunk_ends = visible_ends[chunk_start:chunk_end]
+            logits = torch.empty(
+                chunk_rows, logits_width, dtype=torch.float32, device=device
+            )
+            deepgemm_fp8_paged_mqa_logits(
+                q_4d[chunk_start:chunk_end],
+                kv_cache_4d,
+                weights[chunk_start:chunk_end],
+                logits,
+                chunk_ends,
+                block_tables_per_token[chunk_start:chunk_end],
+                max_seq_len,
+                KVBlockSize=kv_block_size,
+                ChunkK=_V4_FP8_PAGED_MQA_CHUNK_K,
+                Preshuffle=True,
+            )
+            top_k_per_row_decode(
+                logits,
+                1,
+                chunk_ends,
+                topk_local[chunk_start:chunk_end],
+                chunk_rows,
+                logits.stride(0),
+                logits.stride(1),
+                k=topk,
+            )
+        return topk_local
 
     def _score_topk_decode(
         self,
@@ -1949,16 +2057,20 @@ class Indexer(nn.Module):
                 cta_info, n_ctas = full_cta_info, full_n_ctas
             else:
                 # Multi-chunk (logits would exceed budget): rebuild the schedule
-                # for this chunk's rows. Prefill has one row per query token, so
-                # the grid MUST cover this chunk's rows or surplus rows are
-                # dropped (their logits stay -inf -> wrong top-k); the shared CTA
-                # floor keeps a small chunk spread across the GPU.
+                # for this chunk's rows. Use the same shape-specific policy as
+                # the full-batch metadata builder so budget chunking retains the
+                # FP4 grid optimization without launching needless empty CTAs.
+                chunk_rows = chunk_end - chunk_start
                 _, cta_info, n_ctas = compute_prefill_schedule(
                     row_to_batch[chunk_start:chunk_end],
                     rs,
                     re,
                     FP4_MQA_BLOCK_K,
-                    max(FP4_MQA_PARALLEL_UNIT_NUM, chunk_end - chunk_start),
+                    fp4_mqa_prefill_parallel_unit_num(
+                        chunk_rows,
+                        max_seq_len,
+                        block_k=FP4_MQA_BLOCK_K,
+                    ),
                     max_seq_len,
                 )
             # Write-once, NOT -inf-filled: the kernel writes every column in

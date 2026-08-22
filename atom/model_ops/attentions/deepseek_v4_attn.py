@@ -101,6 +101,7 @@ from atom.model_ops.v4_kernels import (
     FP4_MQA_BLOCK_K,
     FP4_MQA_PARALLEL_UNIT_NUM,
     fp4_indexer_enabled,
+    fp4_mqa_prefill_parallel_unit_num,
     hca_compress_paged_offsets,
     write_v4_paged_decode_indices,
     write_v4_paged_prefill_indices,
@@ -302,6 +303,10 @@ class AttentionMetaData_DSV4(AttentionMetaData):
                                                 fp8_mqa_logits)
       cu_ends_gpu                   [T] int32  per-token end offset for
                                                 fp8_mqa_logits (causal cap)
+      visible_end_gpu              [T] int32  seq-local causal cap
+      paged_prefill_block_tables_per_token
+                                    [T, pages] int32  FP8 prefill page table
+      paged_prefill_max_seq_len     int  logical FP8 prefill logits width
       total_committed               int  sum of n_committed_csa_per_seq
 
     Note: decode logits / topk-indices scratch are allocated per-fwd inside
@@ -2216,6 +2221,33 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             "visible_end_gpu": visible_end_gpu,
         }
 
+        # FP8 paged-prefill metadata. Expand the sequence-level block
+        # table to query rows ONCE here, then reuse the contiguous result across
+        # every CSA layer in this forward. PCP reindex and both TBO paths call
+        # this builder again with their own token ownership, so no table is
+        # cached across forwards or ubatches.
+        if not self._indexer_fp4:
+            block_tables = attn_metadata.block_tables
+            max_seq_len = max(int(n_committed_per_seq.max()), 1)
+            live_pages = math.ceil(max_seq_len / self.csa_rows_per_block)
+            metadata_available = (
+                block_tables is not None
+                and block_tables.ndim == 2
+                and block_tables.size(0) >= bs
+                and block_tables.size(1) >= live_pages
+            )
+            if metadata_available:
+                # PCP pads per-token batch ids with -1. Those rows have a zero
+                # visible end, but index_select rejects negative indices; map
+                # them to sequence 0 as a safe unread placeholder.
+                safe_batch_ids = batch_id_per_token_gpu.clamp_min(0)
+                page_table_by_seq = block_tables[:bs, :live_pages]
+                block_tables_per_token = torch.index_select(
+                    page_table_by_seq, 0, safe_batch_ids
+                ).contiguous()
+                meta["paged_prefill_block_tables_per_token"] = block_tables_per_token
+                meta["paged_prefill_max_seq_len"] = max_seq_len
+
         if self._indexer_fp4:
             # Precompute the FP4 prefill persistent-grid schedule here (instead
             # of inside flydsl_pa_mqa_logits_fp4_prefill) so the kernel call is
@@ -2242,20 +2274,17 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             fp4_prefill_max_seq_len = max(int(n_committed_per_seq.max()), 1)
 
             local_starts = torch.zeros_like(visible_end_gpu)
-            # parallel_unit_num is the persistent-grid CTA-count CAP; the
-            # schedule uses as many CTAs as it can up to this P (smaller P ->
-            # larger `safe` chunk-fold -> fewer, more-serial CTAs). It bounds
-            # TWO independent axes:
-            #   - rows: every (row, chunk-split) needs a slot. A prefill fwd has
-            #     one row PER QUERY TOKEN, so P must be >= prefill row count or
-            #     surplus rows are silently dropped (logits stay at the -inf/NaN
-            #     pre-fill -> wrong top-k). This is what `prefill_rows` covers.
-            #   - chunks (context length): the 512 floor keeps enough CTAs to
-            #     split a long context across the GPU even when rows are few
-            #     (matters for decode; harmless here where rows dominate).
-            # max() of both axes -> correct rows AND adequate chunk parallelism.
+            # Prefill uses an eager, shape-specific grid. Small Q needs more K
+            # splits to fill gfx950, while a full 16K-row prefill generally does
+            # not; the selector also caps P by the useful row/chunk pair count
+            # because the FlyDSL kernel launches exactly P CTAs. Decode keeps
+            # its fixed 512-CTA CUDAGraph schedule unchanged.
             prefill_rows = int(visible_end_gpu.shape[0])
-            prefill_parallel_unit_num = max(self._fp4_parallel_unit_num, prefill_rows)
+            prefill_parallel_unit_num = fp4_mqa_prefill_parallel_unit_num(
+                prefill_rows,
+                fp4_prefill_max_seq_len,
+                block_k=self._fp4_block_k,
+            )
             _, prefill_cta_info, prefill_n_ctas = compute_prefill_schedule(
                 batch_id_per_token_gpu.to(torch.int32),
                 local_starts,
