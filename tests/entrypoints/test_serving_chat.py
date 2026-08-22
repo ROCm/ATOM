@@ -398,3 +398,86 @@ class TestFanoutCleanupSplit:
         _, request_calls = self._cleanup_calls([70, 71, 72, 73])
 
         assert request_calls == ["req-3"]
+
+
+class TestFanoutSeedsImplicitReasoning:
+    """A template-injected opener must reach every fan-out sibling's filter.
+
+    When the chat template opens the reasoning channel itself, the output
+    begins mid-thought with no ``<think>`` in it, and only ``starts_thinking``
+    tells the filter so. ``stream_chat_response_fanout`` used to build bare
+    ``ReasoningFilter()`` instances, so an n>1 request emitted its reasoning to
+    the client as answer content. A direct ``ReasoningFilter(starts_thinking=
+    True)`` unit test cannot catch that: the defect is in the wiring, not the
+    filter.
+    """
+
+    # Long enough to pass state 0's 100-character grace period, and carrying a
+    # '<' — the two conditions that decide whether unseeded reasoning leaks.
+    REASONING = "Checking the bound: if (a < b) we return a. " + "Considering. " * 12
+
+    def _deltas(self, starts_thinking):
+        """Every delta the fan-out yields for a two-sibling reasoning stream."""
+
+        async def run():
+            collector = StreamOutputCollector("req-rs")
+            for index in (0, 1):
+                collector.put_nowait(
+                    (
+                        index,
+                        {
+                            "text": self.REASONING,
+                            "token_ids": [1],
+                            "finished": False,
+                        },
+                    )
+                )
+            gen = stream_chat_response_fanout(
+                request_id="req-rs",
+                model="model",
+                shared_collector=collector,
+                seq_ids=[0, 1],
+                num_prompt_tokens=1,
+                cleanup_stream=lambda *a, **k: None,
+                cleanup_request=lambda *a, **k: None,
+                starts_thinking=starts_thinking,
+            )
+            out = []
+            for _ in range(6):
+                try:
+                    raw = await asyncio.wait_for(gen.__anext__(), timeout=2)
+                except (StopAsyncIteration, asyncio.TimeoutError):
+                    break
+                if raw.startswith("data: ") and not raw.startswith("data: [DONE]"):
+                    out.append(json.loads(raw[6:])["choices"][0]["delta"])
+            await gen.aclose()
+            return out
+
+        return asyncio.run(run())
+
+    def test_pre_close_text_is_reasoning_not_content(self):
+        deltas = self._deltas(starts_thinking=True)
+
+        leaked = [d for d in deltas if d.get("content")]
+        assert not leaked, f"reasoning leaked to content: {leaked}"
+        assert any(
+            d.get("reasoning_content") for d in deltas
+        ), f"no reasoning_content was emitted at all: {deltas}"
+
+    def test_without_the_seed_the_same_text_is_not_reasoning(self):
+        # The contrast that shows the seed is what classified it, not the text.
+        # Asserting the text arrives as *content* here would not work: content
+        # segments pass through the tool-call parser, which holds them until the
+        # stream finishes, while reasoning_content is forwarded immediately.
+        deltas = self._deltas(starts_thinking=False)
+
+        assert not any(d.get("reasoning_content") for d in deltas)
+
+    def test_both_streaming_entry_points_accept_the_seed(self):
+        # The wiring bug was a missing parameter, so pin the shape of both.
+        import inspect
+
+        for fn in (stream_chat_response, stream_chat_response_fanout):
+            assert (
+                "starts_thinking" in inspect.signature(fn).parameters
+            ), f"{fn.__name__} cannot be told the prompt opened reasoning"

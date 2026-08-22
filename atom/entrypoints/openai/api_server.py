@@ -1318,6 +1318,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     cleanup_stream,
                     cleanup_request,
                     tools=request.tools,
+                    starts_thinking=_starts_thinking,
                 )
             else:
                 seq_id, stream_collector, num_prompt_tokens = (

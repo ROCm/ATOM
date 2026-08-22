@@ -33,7 +33,10 @@ from atom.entrypoints.openai.protocol import (
     TEXT_COMPLETION_OBJECT,
     CompletionRequest,
 )
-from atom.entrypoints.openai.reasoning import ReasoningFilter
+from atom.entrypoints.openai.reasoning import (
+    ReasoningFilter,
+    prompt_starts_in_reasoning,
+)
 from atom.entrypoints.openai.serving_chat import (
     build_chat_response,
     build_chat_response_multi,
@@ -521,7 +524,13 @@ class ChatCompletionStreamState:
         self.stream_queue = stream_queue
         self.num_tokens_input = len(tokenizer.encode(prompt))
         self.num_tokens_output = [0] * n
-        self.reasoning_filters = [ReasoningFilter() for _ in range(n)]
+        # Seeded from the rendered prompt, exactly as the OpenAI server does:
+        # a template that injects the opening marker leaves the output starting
+        # mid-thought, and an unseeded filter emits that reasoning as content.
+        starts_thinking = prompt_starts_in_reasoning(prompt)
+        self.reasoning_filters = [
+            ReasoningFilter(starts_thinking=starts_thinking) for _ in range(n)
+        ]
         self.tool_parsers = [ToolCallStreamParser() for _ in range(n)]
         self.has_tool_calls = [False] * n
         self.finished = [False] * n

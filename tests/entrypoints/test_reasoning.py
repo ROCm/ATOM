@@ -185,3 +185,71 @@ class TestReasoningFilter:
         results.extend(rf.flush())
         content = "".join(t for f, t in results if f == "content")
         assert "Hi" in content
+
+
+class TestNonReasoningOutputIsNotWithheld:
+    """A stream that never opens a reasoning channel must still reach the client.
+
+    Regression for an observed production stall: 1.5-2.4% of requests on a
+    Claude-Code agent corpus returned HTTP 200 and then **zero body bytes** until
+    the client's 600s read timeout, while the engine kept decoding to
+    max_tokens. The cause was state 0 refusing to release the buffer whenever a
+    '<' appeared anywhere in it -- and code-bearing answers are full of '<'.
+    Holding back a partial *trailing* marker is correct; holding the whole
+    buffer because it contains a '<' somewhere is not.
+    """
+
+    def _emit(self, chunks):
+        f = ReasoningFilter()
+        out = []
+        for c in chunks:
+            out.extend(f.process(c))
+        return out
+
+    def test_angle_bracket_in_plain_output_does_not_withhold_forever(self):
+        # A '<' that is not a reasoning marker: the classic case is code.
+        text = "Here is the fix:\n\nif (a < b) { return a; }\n" + "x" * 200
+        emitted = self._emit([text])
+        assert emitted, "nothing was emitted: the stream would stall"
+        assert "".join(t for f, t in emitted if f == "content").startswith(
+            "Here is the fix:"
+        )
+
+    def test_html_like_output_does_not_withhold_forever(self):
+        text = "<div class='x'>hello</div>\n" + "y" * 200
+        emitted = self._emit([text])
+        assert emitted, "nothing was emitted: the stream would stall"
+
+    def test_token_by_token_code_output_streams(self):
+        # The real shape: many small chunks, one of which contains '<'.
+        chunks = ["Sure. ", "Use ", "a < b ", "to compare. "] + [
+            "word " for _ in range(60)
+        ]
+        emitted = self._emit(chunks)
+        assert emitted, "nothing was emitted: the stream would stall"
+
+    def test_a_real_think_block_still_separates(self):
+        # The fix must not cost the feature it guards.
+        f = ReasoningFilter()
+        out = []
+        for c in ["<think>", "pondering", "</think>", "answer"]:
+            out.extend(f.process(c))
+        assert ("reasoning_content", "pondering") in out
+        assert ("content", "answer") in out
+
+    def test_partial_end_marker_is_still_held_back(self):
+        # A marker split across chunks must not leak as content.
+        f = ReasoningFilter()
+        out = []
+        for c in ["<think>", "abc", "</thi"]:
+            out.extend(f.process(c))
+        assert not any("</thi" in t for _, t in out), "leaked a partial marker"
+
+    def test_template_injected_opener_still_reaches_end_marker(self):
+        # starts_thinking=True => state 1; unchanged by this fix.
+        f = ReasoningFilter(starts_thinking=True)
+        out = []
+        for c in ["reasoning here", "</think>", "final"]:
+            out.extend(f.process(c))
+        assert ("reasoning_content", "reasoning here") in out
+        assert ("content", "final") in out
