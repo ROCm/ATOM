@@ -107,6 +107,39 @@ def test_v4_marshal_is_bit_exact_and_stays_in_its_rows(bs):
     assert (dst[bs:] == POISON).all(), "wrote past the scheduled rows"
 
 
+def test_a_non_contiguous_destination_raises_rather_than_dropping_writes():
+    """Flattening a non-contiguous buffer with `reshape(-1)` yields a copy, so
+    every row would be written into a temporary and lost with it. `.cast`
+    refuses instead, and unlike an assert it still refuses under `python -O`.
+    """
+    backing = np.full((MAX_BS, MAX_COLS * 2), POISON, dtype=np.int32)
+    dst = backing[:, :MAX_COLS]  # a view, so rows are not adjacent
+    assert not dst.flags.c_contiguous
+
+    with pytest.raises(TypeError, match="C-contiguous"):
+        CommonAttentionBuilder.prepare_block_tables(
+            _stub(dst), SimpleNamespace(block_tables=_rows(4))
+        )
+
+    # Positive control: the failure mode being guarded is real and silent.
+    assert not np.shares_memory(dst.reshape(-1), dst)
+
+
+def test_an_over_wide_row_raises_instead_of_reaching_the_next_one():
+    """`block_tables[i, :n] = row` raised when a row was too wide; a flat write
+    would land the overflow in the next request's row instead, leaving it a
+    block table that points at someone else's KV.
+    """
+    dst = np.full((MAX_BS, MAX_COLS), POISON, dtype=np.int32)
+    rows = _rows(3)
+    rows[1] = new_block_table(range(MAX_COLS + 1))
+
+    with pytest.raises(ValueError, match="exceeds"):
+        CommonAttentionBuilder.prepare_block_tables(
+            _stub(dst), SimpleNamespace(block_tables=rows)
+        )
+
+
 def test_empty_batch_writes_nothing():
     """A warmup batch carries no block tables and must leave the buffer alone."""
     dst = np.full((MAX_BS, MAX_COLS), POISON, dtype=np.int32)

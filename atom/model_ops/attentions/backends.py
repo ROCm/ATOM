@@ -308,11 +308,27 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         var = self.model_runner.forward_vars
         block_tables = var["block_tables"].np
         rows = batch.block_tables if limit is None else batch.block_tables[:limit]
-        # One memset over the rows in play, not one per row. `zip` stops at
-        # `rows`, so nothing past the batch is read or written.
+        # One memset over the rows in play, not one per row.
         block_tables[: len(rows)] = 0
-        for out, block_table in zip(block_tables, rows):
-            out[: len(block_table)] = block_table
+        # Rows go in through a memoryview: numpy's slice assignment costs ~250ns
+        # of dispatch per row whatever the row's length, which at a large batch
+        # of short rows is the whole marshal. `.cast` is what makes flattening
+        # safe — it refuses a non-contiguous buffer, where `reshape(-1)` would
+        # hand back a copy and drop every write.
+        flat = memoryview(block_tables).cast("B").cast("i")
+        cols = block_tables.shape[1]  # stride comes from what is written
+        base = 0
+        for block_table in rows:
+            n = len(block_table)
+            # A flat write has no row edge: where the numpy form raised, this
+            # one would land the overflow in the next request's row.
+            if n > cols:
+                raise ValueError(
+                    f"block table of {n} blocks exceeds the {cols}-column "
+                    "block_tables buffer"
+                )
+            flat[base : base + n] = block_table
+            base += cols
 
     def _mrope_cpu_view(self, num_tokens: int) -> np.ndarray:
         return (
