@@ -1,16 +1,10 @@
 # SPDX-License-Identifier: MIT
 """The DP draft-pass lockstep contract.
 
-Under DP attention every rank must issue the same collective sequence each
-step, and an idle rank issues it from ``dummy_execution``. Draft passes are
-where that broke twice: an output-less batch skipping ``propose()`` (one pass
-short), then EAGLE's context pass running beside the propose that replaced it
-(one pass long). Both showed up only as an eight-worker hang on a GPU node.
-
-``ModelRunner._verify_draft_pass_count`` turns that hang into a local error, so
-these tests pin the accounting itself: what the drafters declare, that a pass is
-counted where it is launched, and that the check fires on a mismatch and only
-when lockstep is in force.
+Draft passes broke it twice -- an output-less batch skipping ``propose()`` (one
+pass short), then EAGLE's context pass running beside the propose that replaced
+it (one pass long) -- each time as an eight-worker hang and nothing else. These
+pin the accounting that turns such a divergence into a local error.
 """
 
 import pytest

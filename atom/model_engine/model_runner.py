@@ -3333,24 +3333,20 @@ class ModelRunner:
         pp_group = get_pp_group()
         pp_non_last = pp_group.world_size > 1 and not pp_group.is_last_rank
 
-        # ---- draft passes ----------------------------------------------------
-        # The target forward above cannot run one, so the accounting window opens
-        # here; both returns below close it with _verify_draft_pass_count().
+        # ---- draft passes: counted from here, verified at both returns ----
         drafter = getattr(self, "drafter", None)
         if drafter is not None:
             drafter.reset_draft_passes()
 
-        # An output-less batch still runs `propose()` (below) purely to keep its
-        # DP collectives in step.
+        # An output-less batch still runs propose() for its DP collectives.
         will_align_draft = (
             self._dp_draft_lockstep_active()
             and self._is_pure_middle_chunk(batch)
             and not batch.is_dummy_run
         )
-        # Runs after EVERY target forward -- `postprocess` (hence `propose`) is
-        # skipped for a middle chunk. Not on the aligning step, though: a context
-        # pass that duplicates propose's first draft step is one the peers on
-        # `dummy_execution` never mirror.
+        # Runs after EVERY target forward -- `postprocess` (hence propose) is
+        # skipped for a middle chunk. Not on the aligning step: that pass is one
+        # the peers never mirror.
         run_context_pass = (
             drafter is not None
             and not pp_non_last
@@ -3364,13 +3360,8 @@ class ModelRunner:
                 batch.next_token_ids,
             )
         if pp_non_last or self._is_pure_middle_chunk(batch):
-            # `propose()` carries DP collectives (the drafter's DPMetadata
-            # all_reduce, the draft block's MoE comm) and is reached only from
-            # `postprocess`, which this return skips — so under DP attention
-            # peers block in that all_reduce forever. Run it for the collectives
-            # and drop the ids: a middle chunk sharing a batch with a final-chunk
-            # seq already goes through propose, so this is the existing path;
-            # only the all-middle batch took the shortcut.
+            # This return skips `postprocess`, hence propose() and the DP
+            # collectives it carries. Run it for those and drop the ids.
             if will_align_draft:
                 self.propose_draft_token_ids(
                     batch,
@@ -3386,8 +3377,8 @@ class ModelRunner:
                     ),
                     align_only=True,
                 )
-            # A PP non-last rank runs no draft at all -- its own arm of this
-            # return, not a divergence from the DP peers it shares a stage with.
+            # A PP non-last rank runs no draft at all -- its own arm, not a
+            # divergence from the peers it shares a stage with.
             if not pp_non_last:
                 self._verify_draft_pass_count(batch)
             reset_forward_context()
@@ -3424,17 +3415,11 @@ class ModelRunner:
         return batch is not None and not batch.produces_output()
 
     def _dp_draft_lockstep_active(self) -> bool:
-        """Are draft passes on this rank bound to what the DP peers run?
+        """Are this rank's draft passes bound to what the DP peers run?
 
-        Only under DP attention: `_refresh_dp_metadata` returns early at
-        `data_parallel_size <= 1`, so TP-only and single-rank pay nothing here --
-        and an output-less batch there legitimately runs no draft at all, which
-        is why `draft_passes_per_forward` is only enforced when this holds. PP
-        (`is_deferred_out` False) is excluded — its `pp_non_last` arm is a
-        separate question.
-
-        Two callers, one fact: whether an output-less batch must still run
-        `propose()` for its collectives, and whether the pass count is checked.
+        Only under DP attention -- `_refresh_dp_metadata` returns early at
+        `data_parallel_size <= 1`, where an output-less batch legitimately
+        drafts nothing. PP is excluded via `is_deferred_out`.
         """
         return (
             hasattr(self, "drafter")
@@ -3445,12 +3430,8 @@ class ModelRunner:
     def _verify_draft_pass_count(self, batch) -> None:
         """Hold this forward to the drafter's declared draft-pass count.
 
-        The DP lockstep contract in one place. Off lockstep this is skipped
-        entirely (see `_dp_draft_lockstep_active`); on it, a mismatch means this
-        rank is about to issue a different number of collectives than its peers,
-        so it raises HERE -- naming the rank, the batch and the count -- instead
-        of leaving all eight workers spinning at 99% CPU with the GPUs idle,
-        which is what this same divergence cost twice before.
+        A mismatch means this rank is about to issue a different number of
+        collectives than its peers, so it fails here instead of hanging them.
         """
         drafter = getattr(self, "drafter", None)
         if drafter is None or not self._dp_draft_lockstep_active():
@@ -3462,8 +3443,7 @@ class ModelRunner:
         raise RuntimeError(
             f"{self.label}: DP draft lockstep broken -- ran {actual} draft "
             f"pass(es), {type(drafter).__name__} declares {expected} per "
-            f"forward. "
-            f"Peers issue {expected} and will block on the difference. "
+            f"forward, and the peers issue {expected}. "
             f"batch: dummy={batch.is_dummy_run} seqs={batch.total_seqs_num} "
             f"tokens={batch.total_tokens_num} "
             f"produces_output={batch.produces_output()}"
@@ -3512,12 +3492,10 @@ class ModelRunner:
     ):
         """`align_only` runs the draft purely for its DP collectives.
 
-        Set by the all-middle-chunk caller. Every seq there is mid-prompt, so the
-        `batch.next_token_ids` override below replaces `next_token_ids` wholesale
-        and the zeros it passes are never read. The ids are dropped: publishing
-        them would push an entry the scheduler is not expecting into the
-        deferred-output pipeline, and `record_ell` would file a verify length
-        against seqs that produced no token.
+        Its caller is the all-middle-chunk batch, where every seq is mid-prompt:
+        the `batch.next_token_ids` override below replaces `next_token_ids`
+        wholesale, so the zeros it passes are never read. The ids are dropped --
+        the scheduler is not expecting a draft for a seq that produced no token.
         """
         forward_context = get_forward_context()
 

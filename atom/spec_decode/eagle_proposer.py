@@ -168,16 +168,12 @@ class EagleProposer(Drafter):
 
     @property
     def precompute_duplicates_propose(self) -> bool:
-        # The pass below is the draft model over the same rows with the same
-        # anchors that `propose()`'s i==0 step runs -- see its docstring.
+        # The pass below is propose's i==0 step: same rows, same anchors.
         return True
 
     @property
     def draft_passes_per_forward(self) -> int:
-        # One heavyweight backbone pass per drafted token: `propose()` loops
-        # `mtp_k` times. `precompute_context_kv` adds a pass on the steps it
-        # runs, which is why it and `propose()` are mutually exclusive.
-        return self.mtp_k
+        return self.mtp_k  # one backbone pass per drafted token
 
     def precompute_context_kv(
         self,
@@ -197,11 +193,9 @@ class EagleProposer(Drafter):
         early return: repeating it would be duplicate work. The test is on the
         data -- nothing here asks what kind of chunk this is.
 
-        The all-middle batch (no -1 at all) is the remaining case, and under DP
-        attention it now runs `propose(align_only=True)` for its collectives --
-        the same redo. `precompute_duplicates_propose` is how the runner skips
-        this call there; without it this pass is one draft forward that the peer
-        ranks' `dummy_execution` never mirrors, which deadlocks them.
+        The all-middle batch (no -1) is the remaining case; under DP it runs
+        `propose(align_only=True)` for its collectives -- the same redo -- so
+        `precompute_duplicates_propose` has the runner skip this call there.
 
         NOTE: unverified against real weights. `build_drafter` routes anything
         carrying `dspark_block_size` to `DSparkProposer`, and every model on

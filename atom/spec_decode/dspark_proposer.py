@@ -281,11 +281,7 @@ class DSparkProposer(Drafter):
 
     @property
     def draft_passes_per_forward(self) -> int:
-        # One block pass, both flavors: the whole block comes out of a single
-        # `forward_spec` (the sequential dependency lives in the Markov head,
-        # not in repeated backbone passes). `precompute_context_kv` adds none --
-        # `write_context_kv` is local projections plus a Triton scatter.
-        return 1
+        return 1  # one `forward_spec` block pass, both flavors
 
     # ---- aux-hidden-state ownership (declarative; base owns the hook machinery) ----
     def _aux_capture_spec(self, target_model: nn.Module) -> AuxCaptureSpec:
