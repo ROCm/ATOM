@@ -19,9 +19,12 @@ These ops do NOT change tensor shape or dtype — they round-trip the values
 in-place to simulate the precision loss of low-bit storage.
 """
 
+import os
 from typing import Optional
 
 import torch
+import triton
+import triton.language as tl
 
 # FP4 e2m1 representable magnitudes (positive half). Symmetric around 0.
 # Reference: /data/DeepSeek-V4-Pro/inference/convert.py:11-14
@@ -191,40 +194,185 @@ def fp4_act_quant_inplace(x: torch.Tensor, block_size: int = 32) -> None:
     x.copy_(dequant.reshape(*prefix, n).to(x.dtype))
 
 
+# ---------------------------------------------------------------------------
+# Walsh-Hadamard Transform — Triton kernel
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _wht_pass_1d_kernel(
+    x_ptr,
+    y_ptr,
+    N,
+    h: tl.constexpr,
+    num_rows,
+    NG: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    """One pass of the Walsh-Hadamard butterfly — 1D grid, loop over groups.
+
+    Each program processes all ``NG`` groups for its ``BLOCK_M`` rows in a
+    single kernel invocation.  The ``tl.static_range(NG)`` loop is fully unrolled
+    at JIT time — keep ``NG ≤ 64`` to avoid kernel bloat.
+
+    Grid: ``(ceil(num_rows / BLOCK_M),)``.
+    """
+    pid = tl.program_id(0)
+    rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    row_mask = rows < num_rows
+
+    k_offs = tl.arange(0, h)
+
+    for g in tl.static_range(NG):
+        a_start = g * (2 * h) + k_offs
+        b_start = a_start + h
+
+        a_base = rows[:, None] * N + a_start[None, :]
+        b_base = rows[:, None] * N + b_start[None, :]
+
+        a = tl.load(x_ptr + a_base, mask=row_mask[:, None], other=0.0)
+        b = tl.load(x_ptr + b_base, mask=row_mask[:, None], other=0.0)
+
+        tl.store(y_ptr + a_base, a + b, mask=row_mask[:, None])
+        tl.store(y_ptr + b_base, a - b, mask=row_mask[:, None])
+
+
+@triton.jit
+def _wht_pass_2d_kernel(
+    x_ptr,
+    y_ptr,
+    N,
+    h: tl.constexpr,
+    num_rows,
+    BLOCK_M: tl.constexpr,
+):
+    """One pass — 2D grid, one group per program (no static_range unrolling).
+
+    Grid: ``(ceil(num_rows / BLOCK_M), NG)`` where ``NG = N // (2 * h)``.
+    Use when ``NG > 64`` to keep kernel size bounded.
+    """
+    pid_m = tl.program_id(0)
+    pid_g = tl.program_id(1)
+
+    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    row_mask = rows < num_rows
+
+    k_offs = tl.arange(0, h)
+    g_start = pid_g * (2 * h)
+
+    a_base = rows[:, None] * N + (g_start + k_offs)[None, :]
+    b_base = rows[:, None] * N + (g_start + h + k_offs)[None, :]
+
+    a = tl.load(x_ptr + a_base, mask=row_mask[:, None], other=0.0)
+    b = tl.load(x_ptr + b_base, mask=row_mask[:, None], other=0.0)
+
+    tl.store(y_ptr + a_base, a + b, mask=row_mask[:, None])
+    tl.store(y_ptr + b_base, a - b, mask=row_mask[:, None])
+
+
+def _rotate_activation_triton(
+    x_flat: torch.Tensor, n: int, num_rows: int, orig_dtype: torch.dtype
+) -> torch.Tensor:
+    """Triton Walsh-Hadamard transform (log2(N) double-buffered passes).
+
+    Hybrid grid strategy:
+    - NG ≤ 64: 1D grid + ``tl.static_range(NG)`` → low launch overhead
+    - NG > 64: 2D grid → small kernel binary, bounded launch count
+
+    Supports all power-of-2 N (128 and 512 tested on MI300X).
+    """
+    cur = x_flat.float().contiguous()
+    if not cur.is_cuda:
+        cur = cur.cuda()
+    nxt = torch.empty_like(cur)
+
+    # Tune BLOCK_M to row count for occupancy
+    if num_rows >= 256:
+        BLOCK_M = 128
+    elif num_rows >= 64:
+        BLOCK_M = 64
+    else:
+        BLOCK_M = 32
+
+    h = 1
+    while h < n:
+        ngroups: int = n // (2 * h)
+        if ngroups <= 64:
+            grid = (triton.cdiv(num_rows, BLOCK_M),)
+            _wht_pass_1d_kernel[grid](cur, nxt, n, h, num_rows, NG=ngroups, BLOCK_M=BLOCK_M)
+        else:
+            grid = (triton.cdiv(num_rows, BLOCK_M), ngroups)
+            _wht_pass_2d_kernel[grid](cur, nxt, n, h, num_rows, BLOCK_M=BLOCK_M)
+        cur, nxt = nxt, cur
+        h *= 2
+
+    inv_sqrt_n = n**-0.5
+    if cur.dtype == torch.float32:
+        cur.mul_(inv_sqrt_n)
+    else:
+        cur = cur.float().mul_(inv_sqrt_n).to(orig_dtype)
+
+    return cur
+
+
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     """Apply Walsh-Hadamard transform along last dim with 1/sqrt(N) scaling.
 
     Reference: inference/model.py:rotate_activation, which delegates to the
-    `fast_hadamard_transform` package. We provide a pure-torch fallback since
-    that package fails to build on AMD ROCm.
+    `fast_hadamard_transform` package.
+
+    Uses a Triton kernel for the iterative radix-2 butterfly on AMD ROCm;
+    falls back to a pure-torch implementation when the Triton env-var
+    ``ATOM_WHT_TORCH_FALLBACK=1`` is set or ``num_rows * N`` is tiny.
 
     Iterative radix-2 butterfly (FFT-style): O(N log N) ops, log2(N) passes.
-    For each pass `h` = 1, 2, 4, ..., N/2: pair (x[k+j], x[k+j+h]) becomes
-    (a+b, a-b). After all passes, multiply by 1/sqrt(N) for normalization.
+    For each pass ``h`` = 1, 2, 4, ..., N/2: pair ``(x[k+j], x[k+j+h])``
+    becomes ``(a+b, a-b)``. After all passes, multiply by ``1/sqrt(N)``.
 
     Args:
-        x: tensor whose last dim is a power of 2 (typically 128 or 512)
+        x: tensor whose last dim is a power of 2 (typically 128 or 512).
     Returns:
-        Hadamard-transformed tensor, same shape and dtype as x
+        Hadamard-transformed tensor, same shape and dtype as ``x``.
     """
     n = x.shape[-1]
     assert n > 0 and (n & (n - 1)) == 0, f"last dim {n} must be a power of 2"
 
     orig_dtype = x.dtype
     *prefix, _ = x.shape
-    flat = x.reshape(-1, n).float().contiguous()
+    flat = x.reshape(-1, n)
+    num_rows = flat.shape[0]
+
+    # Dispatch: Triton for any power-of-2 N with sufficient rows.
+    # Cross-over point is ~32 rows for N=128 and ~16 rows for N=512
+    # (torch view ops have zero-copy advantage below these thresholds).
+    _use_triton = (
+        os.environ.get("ATOM_WHT_TORCH_FALLBACK", "0") != "1"
+        and num_rows * n >= 4096
+    )
+
+    if _use_triton:
+        result = _rotate_activation_triton(flat, n, num_rows, orig_dtype)
+    else:
+        result = _rotate_activation_torch(flat, n, orig_dtype)
+
+    return result.reshape(*prefix, n).to(device=x.device, dtype=orig_dtype)
+
+
+def _rotate_activation_torch(
+    flat: torch.Tensor, n: int, orig_dtype: torch.dtype
+) -> torch.Tensor:
+    """Pure-torch Walsh-Hadamard fallback (kept as reference and for tiny tensors)."""
+    flat = flat.float()
 
     h = 1
     while h < n:
-        # Group consecutive 2h-element segments; pair element j with element j+h.
         view = flat.view(-1, n // (2 * h), 2, h)
         a = view[..., 0, :]
         b = view[..., 1, :]
         flat = torch.stack([a + b, a - b], dim=-2).reshape(-1, n)
         h *= 2
 
-    flat = flat * (n**-0.5)
-    return flat.reshape(*prefix, n).to(orig_dtype)
+    return flat.mul_(n**-0.5).to(orig_dtype)
 
 
 # ---------------------------------------------------------------------------
