@@ -917,9 +917,11 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         # from previous steps). A straddled/ubatch request's FULL visible K is
         # num_cached + (its tokens in this ubatch), so the gather must include it.
         self._tbo_prefill_state = TokenSplitPrefillState(
-            block_tables=[
-                np.asarray(bt, dtype=np.int32) for bt in batch.block_tables[:bs]
-            ],
+            # Handed over as-is: the reader wants `len(row)` and a slice
+            # assignment, which the rows serve directly. Referencing is safe
+            # because BlockManager only appends between steps, and stash and
+            # read are both inside this one forward.
+            block_tables=batch.block_tables[:bs],
             cu_tokens=np.asarray(
                 self.model_runner.forward_vars["cu_seqlens_q"].np[: bs + 1],
                 dtype=np.int64,

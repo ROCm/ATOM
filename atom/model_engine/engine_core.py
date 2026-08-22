@@ -18,7 +18,12 @@ from atom.model_engine.async_proc import AsyncIOProcManager
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import EngineUtilityHandler
 from atom.model_engine.scheduler import DecodeScheduler, PrefillScheduler, Scheduler
-from atom.model_engine.sequence import Sequence, SequenceStatus, get_exit_sequence
+from atom.model_engine.sequence import (
+    Sequence,
+    SequenceStatus,
+    get_exit_sequence,
+    new_block_table,
+)
 from atom.model_engine.state_runtime import StateRuntime
 from atom.utils import (
     envs,
@@ -904,7 +909,7 @@ class PrefillEngineCore(EngineCore):
             for seq in self.scheduler.waiting:
                 if seq.id in self._pending_assignments:
                     assignment = self._pending_assignments.pop(seq.id)
-                    seq.block_table = list(assignment.block_table)
+                    seq.block_table = new_block_table(assignment.block_table)
                     seq.num_cached_tokens = assignment.num_cached_tokens
 
     def _process_engine_step(self):

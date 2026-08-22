@@ -4040,15 +4040,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         """Populate `forward_vars["block_tables"]` from the batch and return
         the GPU view sliced to `scheduled_bs` rows.
 
-        Mirrors `CommonAttentionBuilder.prepare_block_tables` but is invoked
-        unconditionally (parent only calls it when has_cached).
+        Defers the marshal to `CommonAttentionBuilder.prepare_block_tables`,
+        but is invoked unconditionally (parent only calls it when has_cached).
         """
-        var = self.model_runner.forward_vars
-        block_tables_np = var["block_tables"].np
-        for i, block_table in enumerate(batch.block_tables[:scheduled_bs]):
-            block_tables_np[i] = 0
-            block_tables_np[i, : len(block_table)] = block_table
-        return var["block_tables"].copy_to_gpu(scheduled_bs)
+        self.prepare_block_tables(batch, limit=scheduled_bs)
+        return self.model_runner.forward_vars["block_tables"].copy_to_gpu(scheduled_bs)
 
     def _populate_state_slot_mappings(
         self, batch: ScheduledBatch, scheduled_bs: int, return_cpu: bool = False

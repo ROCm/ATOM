@@ -1098,7 +1098,7 @@ class BlockManager:
         # go back on the free list, so the intent dies with it.
         if self.paged_state_checkpoints is not None:
             self.paged_state_checkpoints.forget_pending(seq)
-        seq.block_table.clear()
+        del seq.block_table[:]  # `array("i")` has no `.clear()`
         if seq.has_per_req_cache and seq.per_req_cache_group >= 0:
             # No next forward will read a pending fork source after deallocation.
             self.state.release(seq.per_req_cache_group)

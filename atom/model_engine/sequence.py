@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import array
 from collections.abc import Callable
 from copy import copy
 from enum import Enum, auto
@@ -10,6 +11,18 @@ from typing import Any
 import numpy as np
 
 from atom.sampling_params import SamplingParams
+
+
+def new_block_table(block_ids=()) -> array.array:
+    """A sequence's physical block ids.
+
+    An `array("i")` rather than a list because every forward marshals these
+    into the int32 `block_tables` buffer, where a list costs one CPython int
+    unboxing per block (~17k per step at 50 seqs x 100k ctx) and an array is a
+    memcpy. It behaves as a list for append/pop/index/len/iterate; it has no
+    `.clear()` (use `del bt[:]`) and no `.copy()` (use `list(bt)`).
+    """
+    return array.array("i", block_ids)
 
 
 class SequenceStatus(Enum):
@@ -127,7 +140,7 @@ class Sequence:
         # garbage sampled tokens from intermediate chunks and to skip the
         # scheduler's Phase 1 scan when no partials exist.
         self.is_partial_prefill = False
-        self.block_table = []
+        self.block_table = new_block_table()
         # Per-request cache slot index (filled by BlockManager.allocate()).
         # -1 = unallocated. The slot indexes into the per-req cache tensors
         # owned by ModelRunner (e.g. mamba_k_cache for GDN).

@@ -299,12 +299,20 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         self.model_runner.forward_vars.update(attn_metadata)
         self.has_sliding_window = hasattr(hf_config, "sliding_window")
 
-    def prepare_block_tables(self, batch: ScheduledBatch):
+    def prepare_block_tables(self, batch: ScheduledBatch, limit: int | None = None):
+        """Marshal the batch's block tables into `forward_vars["block_tables"]`.
+
+        `limit` caps how many rows are taken, for callers scheduling fewer
+        sequences than the batch carries.
+        """
         var = self.model_runner.forward_vars
         block_tables = var["block_tables"].np
-        for i, block_table in enumerate(batch.block_tables):
-            block_tables[i] = 0
-            block_tables[i, : len(block_table)] = block_table
+        rows = batch.block_tables if limit is None else batch.block_tables[:limit]
+        # One memset over the rows in play, not one per row. `zip` stops at
+        # `rows`, so nothing past the batch is read or written.
+        block_tables[: len(rows)] = 0
+        for out, block_table in zip(block_tables, rows):
+            out[: len(block_table)] = block_table
 
     def _mrope_cpu_view(self, num_tokens: int) -> np.ndarray:
         return (

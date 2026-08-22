@@ -43,7 +43,12 @@ from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
 from atom.model_engine.run_labels import build_run_label
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
-from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
+from atom.model_engine.sequence import (
+    Sequence,
+    SequenceStatus,
+    SequenceType,
+    new_block_table,
+)
 from atom.model_engine.state_runtime import StateRuntime
 from atom.model_loader.loader import load_model
 from atom.model_ops.attentions.sub_pool_spec import (
@@ -1146,7 +1151,7 @@ class ModelRunner:
         )
         seq.status = SequenceStatus.RUNNING
         seq.type = SequenceType.DECODE
-        seq.block_table = [0]
+        seq.block_table = new_block_table([0])
 
         spec_tokens = {seq.id: np.zeros(mtp_k, dtype=np.int32)} if mtp_k > 0 else None
         dummy_batch = ScheduledBatch(

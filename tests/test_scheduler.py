@@ -430,7 +430,7 @@ class TestSchedule:
         sched.schedule()
 
         assert pinned.status == SequenceStatus.WAITING
-        assert pinned.block_table == []
+        assert len(pinned.block_table) == 0
         assert sched.waiting.popleft() is pinned
         sched.kv_connector = None
         replacement = seq_factory([10, 11, 12, 13])
@@ -1086,7 +1086,7 @@ class TestPreempt:
         scheduler.schedule()
         scheduler.preempt(seq)
         assert seq.status == SequenceStatus.WAITING
-        assert seq.block_table == []
+        assert len(seq.block_table) == 0
 
 
 # ── postprocess ────────────────────────────────────────────────────────────
