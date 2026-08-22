@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1787331777570,
+  "lastUpdate": 1787417141834,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -1814,6 +1814,63 @@ window.BENCHMARK_DATA = {
             "value": 0.887,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/32501597679 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202608211514 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.3184 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "ZhangLirong",
+            "username": "ZhangLirong-amd",
+            "email": "lirzhang@amd.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "ffdf3bb5ddf8a15a64d521a2eeb3bc7438f9ac21",
+          "message": "Fix dpa spec middle chunk collective align for agentic (#1987)\n\n* Fix DP-attention deadlock on an all-middle-chunk prefill step\n\nA batch that produces no output (every seq mid-prompt in a chunked\nprefill) returns from ModelRunner.forward before postprocess, so it never\nreaches propose_draft_token_ids. propose() carries DP collectives -- the\ndrafter's DPMetadata.make all_reduce and the draft block's MoE comm --\nso under DP attention that rank silently drops out of the step while its\npeers (real decode, or the dummy decode dummy_execution hands an idle\nrank) block in that all_reduce forever. All workers spin at 99% CPU with\nthe GPUs at 0% and the log frozen after \"Scheduled prefill batch\".\n\nNeeds all three of --enable-dp-attention, a drafter (--method mtp/dspark)\nand a prompt over max-num-batched-tokens; _refresh_dp_metadata returns\nearly at data_parallel_size <= 1, which is why TP-only never hangs.\n\nRun propose for its collectives and drop the ids. A middle chunk sharing\na batch with a final-chunk seq already goes through propose, anchored by\nthe scheduler's successor token in batch.next_token_ids, so this is the\nexisting path for this case -- only the all-middle batch took the\nshortcut. Aligning by making the peers skip instead would strand a\nreal-decode rank without drafts and desync the deferred-output pipeline.\n\nVerified on DeepSeek-V4-Pro-DSpark, 8xMI355X, TP8/DP8, --level 3\n--cudagraph-mode FULL --method mtp -k 3, with and without --enable-tbo:\n19805-token (2 chunks) and 49405-token (4 chunks) prompts both deadlocked\nbefore and now answer in 2.7s / 5.5s, single-chunk prompts unaffected,\n8-way concurrent mixed lengths all complete.\n\n* Hold draft passes to a count the drafter declares, under DP attention\n\nThe all-middle-chunk fix left EAGLE running two collective-carrying draft\npasses where its DP peers run one. `precompute_context_kv` is a full draft\nmodel forward, and it fires on exactly the batch that now also runs\n`propose(align_only=True)` -- same rows, same anchors, which is why its own\ndocstring calls that case duplicate work. `dummy_execution` mirrors only\npropose, so the peers deadlock on the extra pass: one step later than the\nfirst deadlock and parked in recv_async_output_draft rather than the\ndrafter's all_reduce, but the same divergence.\n\nSkip the context pass on the aligning step, for drafters where it\nduplicates propose (`precompute_duplicates_propose`). DSpark keeps it:\n`write_context_kv` is local projections plus a Triton scatter, carries no\ncollectives, and propose only reads what it writes -- which is also why\nDSpark never hung here.\n\nThen close the class rather than the instance. Every draft site decided on\nits own whether to run, from data (`is_dummy_run`, `produces_output()`, an\nanchor of -1) rather than from what the peers would do, and that cost two\ndeadlocks in one code path. Drafters now declare\n`draft_passes_per_forward` (EAGLE mtp_k, DSpark 1), count each launch, and\nModelRunner.forward verifies the total before returning -- a local error\nnaming the rank and the counts, instead of eight workers at 99% CPU with\nthe GPUs idle and nothing in the log. The base property raises rather than\ndefaulting, so a new drafter has to state its count. Enforced only under DP\nattention, where the count is a contract at all: off lockstep an\noutput-less batch legitimately drafts nothing.\n\nDrops `_run_dummy_drafter`, an earlier unfinished pass at the same job --\nuncalled, and hardcoding mtp_k, which is wrong for DSpark's single block\npass.\n\nUnit tests cover the accounting and both deadlock shapes. Not GPU-verified\nhere; the Flash (EAGLE) agentic run that reproduced the second hang now\ncompletes.\n\n* Trim the draft-lockstep comments to what the code does not say\n\nThe prose around the pass accounting restated the mechanism the names and\nthe code already carry. Keep what a reader cannot derive: why DSpark's\ncontext pass stays, why count_draft_pass() is called before the launch,\nwhy the check is DP-only, and that the zeros passed to align_only are\nplaceholders the anchor override replaces rather than fake inputs.\n\nComments only -- no behavior change.\n\n* Drop the draft-pass accounting",
+          "timestamp": "2026-08-22T13:31:44Z",
+          "url": "https://github.com/ROCm/ATOM/commit/ffdf3bb5ddf8a15a64d521a2eeb3bc7438f9ac21"
+        },
+        "date": 1787417103045,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.9538,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/32583726138 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202608221457 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9492 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP accuracy (GSM8K)",
+            "value": 0.95,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/32583726138 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202608221457 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9507 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP MTP acceptance (%)",
+            "value": 66.12,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/32583726138 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202608221457 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9507 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP avg toks/fwd (tok/fwd)",
+            "value": 2.98,
+            "unit": "tok/fwd"
+          },
+          {
+            "name": "ATOMesh::Meta-Llama-3-8B-Instruct accuracy (GSM8K)",
+            "value": 0.7491,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/32583726138 | Threshold: 0.73 | Baseline: 0.75 | BaselineModel: meta-llama/Meta-Llama-3-8B-Instruct | BaselineNote: HF reports 0.796 but 8-shot CoT; CI uses 3-shot, not comparable | Docker: rocm/atom-dev:nightly_202608221457 | GPU: AMD Instinct MI355X | VRAM: 252GB | ROCm: 7.2.4 | strict-match: 0.7445 | fewshot: 3 | Model: /models/meta-llama/Meta-Llama-3-8B-Instruct"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.8832,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/32583726138 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202608221457 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.3397 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
