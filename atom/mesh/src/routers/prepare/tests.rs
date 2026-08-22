@@ -692,10 +692,12 @@ mod c_stop_decoder_builder {
 
 mod d_parser_factory_lookup {
     use crate::routers::prepare::parser_factory_lookup::{
-        check_reasoning_parser_availability, check_tool_parser_availability,
-        create_reasoning_parser, create_tool_parser, get_reasoning_parser, get_tool_parser,
+        check_reasoning_parser_availability, create_reasoning_parser, get_reasoning_parser,
     };
     use crate::routers::test_mocks;
+    use crate::tool_parser::registry::{
+        check_tool_parser_availability, create_tool_parser, get_tool_parser,
+    };
 
     #[test]
     fn test_check_reasoning_parser_known_model_returns_ok() {
