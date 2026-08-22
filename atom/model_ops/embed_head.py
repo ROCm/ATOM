@@ -174,7 +174,7 @@ class VocabParallelEmbedding(nn.Module):
             )
             y = get_tp_group().all_reduce(y, ca_fp8_quant=False)
         else:
-            y = F.embedding(x, self.weight)
+            y = replicated_embedding(x, self.weight)
         return y
         # if self.tp_size > 1:
         #     mask = torch.logical_and(x >= self.vocab_start_idx, x < self.vocab_end_idx)
