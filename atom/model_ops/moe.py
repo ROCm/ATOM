@@ -602,6 +602,17 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         # TODO: could allow this now
         # assert not moe.use_flashinfer_cutlass_kernels, "Must be created in modelopt.py"
         if moe.use_mori_kernels:
+            from atom.utils import envs as _atom_envs
+
+            # gfx1250: use mori dispatch_combine_v2 (cco/FlyDSL) instead of the
+            # gfx942/950-only v1 kernels. Gated by ATOM_MORI_V2.
+            if _atom_envs.ATOM_MORI_V2:
+                from atom.model_ops.fused_moe.mori_v2_prepare_finalize import (
+                    make_mori_v2_prepare_finalize,
+                )
+
+                return make_mori_v2_prepare_finalize(moe, all2all_manager)
+
             assert quant_config is not None
 
             from atom.model_ops.fused_moe.mori_prepare_finalize import (
@@ -741,12 +752,30 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             ), f"Attempt to override experts for {id(self)}!"
             self.topk_indices_dtype = prepare_finalize.topk_indices_dtype()
             # experts = self.select_gemm_impl(prepare_finalize, layer)
-            self.fused_experts = FusedMoEModularKernel(
+            from atom.model_ops.fused_moe.mori_v2_prepare_finalize import (
+                MoriV2ModularKernel,
+                MoriV2PrepareAndFinalize,
+            )
+
+            modular_cls = (
+                MoriV2ModularKernel
+                if isinstance(prepare_finalize, MoriV2PrepareAndFinalize)
+                else FusedMoEModularKernel
+            )
+            self.fused_experts = modular_cls(
                 prepare_finalize,
                 # experts,
                 # layer.shared_experts,
                 quant_config=self.moe_quant_config,
             )
+
+            # The v2 fused transport (MegaMoE) runs the whole layer, so it must be
+            # told the expert-GEMM recipe that only the layer + this quant method
+            # know. Here is also the last point before any cudagraph capture, and
+            # it allocates a cco arena and JIT-compiles its kernels.
+            bind_mega = getattr(prepare_finalize, "bind_mega_transport", None)
+            if bind_mega is not None:
+                bind_mega(layer, self)
 
     @property
     def using_modular_kernel(self) -> bool:

@@ -166,6 +166,11 @@ class EagleProposer(Drafter):
             buf[: aux.shape[0]].copy_(aux)
         return hidden
 
+    @property
+    def precompute_duplicates_propose(self) -> bool:
+        # The pass below is propose's i==0 step: same rows, same anchors.
+        return True
+
     def precompute_context_kv(
         self,
         positions: torch.Tensor,
@@ -183,6 +188,10 @@ class EagleProposer(Drafter):
         the same anchors (`propose_draft_token_ids` applies them too). Hence the
         early return: repeating it would be duplicate work. The test is on the
         data -- nothing here asks what kind of chunk this is.
+
+        The all-middle batch (no -1) is the remaining case; under DP it runs
+        `propose(align_only=True)` for its collectives -- the same redo -- so
+        `precompute_duplicates_propose` has the runner skip this call there.
 
         NOTE: unverified against real weights. `build_drafter` routes anything
         carrying `dspark_block_size` to `DSparkProposer`, and every model on
