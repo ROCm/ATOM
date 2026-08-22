@@ -133,11 +133,18 @@ Two waits are longer than that. Text inside the reasoning channel is held until
 its end marker — not a stall: it is reasoning, and it is delivered as
 `reasoning_content` as it arrives. And once a marker that *opens a tool-call
 region* appears, everything from it onward belongs to the format until it can
-parse the region, which for a real call is its closing tag and for an answer
-that merely quotes a marker is end of stream. Nothing is lost there — the
-region is released verbatim once it turns out not to be a call — but it does
-arrive late, and `atom:stream_longest_silence_seconds` now reports it while it
-is happening.
+parse the region. For a real call that is its closing tag. For an answer that
+merely quotes a marker it used to be end of stream — measured on a GLM answer
+naming the tag at character 29 and then explaining for 1234 more, 98% of it
+arrived in one frame at EOS, and "how do I make you call a tool" is a common
+question. A region that has grown past `_FIRST_PROBE` bytes and still parses
+to no call is now given up on: its opening marker goes into the answer and the
+rest is read again, so a real call later in the same reply still opens a
+region of its own. Only formats that can recognise a call still arriving are
+asked — a Kimi entry is invisible until its end token, so a large argument
+would look exactly like prose. Nothing is lost either way; what is left is
+`atom:stream_longest_silence_seconds`, which reports the wait while it
+happens.
 
 "Opens a region" is asked of the format, not assumed of every marker it
 declares. Kimi-K3 declares thirteen and only two of them mean a tool call; the
@@ -154,73 +161,54 @@ characters with no event and `finish_reason` still `stop`.
 
 **The tool's name does not wait for its arguments.** A region is buffered
 until it closes, so on a 20 KB file write the client learned *which* tool was
-being called only after 5030 of 5040 tokens. Every format carries the name in
-its opener, so it is sent as soon as the region reveals it — measured across
-all six, chunk 11–21 instead of 225–248.
+being called only after 5030 of 5040 tokens. Four of the six formats can
+recognise a call that has not finished arriving, and for those the name is
+sent as soon as the region reveals it — chunk 11–21 instead of 225–248.
 
-Two things have to be true before a name goes out. It is one the request
-declared in `tools`, and what follows it is this format's own next token
-rather than English -- prose can name a real tool, so the first test alone let
-"the model writes `<tool_call><function=get_weather>` and then..." announce
-`get_weather`. SGLang's cursor parsers announce with neither check and will
-emit a call named after whatever follows the tag.
+The name is read out of `parse_region` itself, over the region so far and with
+`at_end=False`. That is what makes the early name and the parsed call agree:
+same function, same enumeration, the second run seeing a superset of the
+first's bytes. Every format used to answer this with a regex of its own, and
+four of the five that had one disagreed with their own parse — Qwen's peek
+accepted `</tool_call>`, which closes the *outer* wrapper and leaves the
+`<function=` block open; DeepSeek-V4's skipped a self-closing
+`<invoke name="x"/>` its parse returned first, putting three tool calls on the
+`/v1/messages` wire for a response containing two. There is no separate peek
+now, so there is nothing left to disagree.
 
-The same pair gates the *unclosed-region* branch of `parse` in all five XML-ish
-formats, which exists for a call cut off at `max_tokens` and could not tell
-that from prose: it produced a complete zero-argument call, deleted the rest of
-the sentence and reported `finish_reason: tool_calls`, so an agentic client ran
-a tool nobody asked for. K3 applies only the second test — it carries argument
-types on the wire, so it is never handed `tools` and has no declared names to
-check a name against.
+`at_end` is the only difference between the two questions. With it — the
+region has closed, or the stream has — a token cut off part-way through is all
+there will ever be, so a prefix counts, which is what a call truncated by
+`max_tokens` looks like. Without it a prefix means "not yet", and accepting
+one let a chunk boundary landing one character into `<br>` name a tool for
+prose. Same bytes, announced at one chunk size and silent at another.
 
-Where the model *wrote* the name, that name wins. DSML also infers a dropped
-tool name from the parameter signature, for a documented malform that omits the
-`<invoke>` wrapper entirely; reaching that inference for a merely *truncated*
-call scored a different declared tool than the one in the opener — which is
-also the opener `peek_name` reads, so the announcement and the parse then
-disagreed about the same bytes.
+A name only goes out for a tool the request declared. Prose can name a real
+tool, so that alone is not enough — the follower test above is the other half.
+SGLang's cursor parsers announce with neither check and will emit a call named
+after whatever follows the tag.
 
-The peek reads a bounded prefix and stops once that prefix has gone by without
-a name. Running the format's regex over the whole region on every chunk is
-quadratic in the response -- 3.0 → 9.8 → 36 → 137 ms across 2k/4k/8k/16k
-tokens, which is the shape `marker_scanner` exists to retire, one layer up.
+The read is bounded to `Region.head` and stops once that prefix has gone by
+without a name. Running the format's regex over the whole region on every
+chunk is quadratic in the response — 3.0 → 9.8 → 36 → 137 ms across
+2k/4k/8k/16k tokens, the shape `marker_scanner` exists to retire, one layer up.
 
-Peek and parse read *one* rule. Each format writes down the tokens that may
-follow the name inside a call -- another parameter, or the close of the very
-block the name opened -- and both callers test against that tuple. They used
-to encode it twice, a follower set in the peek regex and a truncation test in
-`parse`, and four of the five disagreed: Qwen's peek accepted `</tool_call>`,
-which closes the *outer* wrapper and leaves the `<function=` block open, so
-`parse` read the same bytes as prose and the name went out for a call that
-never came. The peek also takes the request's `tools` now, because MiniMax
-names a parameter by its own tag and telling `<city>` from `<br>` needs the
-schema.
-
-What remains is the honest case: a call the model really was making, cut off
-by `max_tokens`. The name is correct information, and `finish_reason` keys on
-the arguments so nothing downstream counts it as a call.
-
-Should a format's peek and its parse disagree anyway, the mismatch is logged
-and recovered from, not raised. The caller is `flush`, on a stream whose 200
-is already sent, so an exception there reaches the client as a connection cut
-mid-frame with no `[DONE]` — and on the `n>1` path takes the other choices
-with it. The announced name cannot be retracted, but it can be left with no
-arguments, which is the same shape every unfulfilled announcement takes and
-which nothing downstream counts as a call; the parsed call goes out whole at
-the next index.
-
-Kimi-K2 does not announce at all. Its call index and id travel on the wire
-(`functions.NAME:INDEX`) and an announcement has to carry both before the
-entry that supplies them has arrived; every announced call went out at index
-0, so a client accumulating by index overwrote the first call with the
-second.
+Kimi-K2 and Kimi-K3 name nothing early, and `RECOGNISES_A_CALL_IN_PROGRESS`
+says so. A K2 entry is invisible until `<|tool_call_end|>` and a K3 call until
+`<|close|>call`, so for them the name arrives with the arguments. The flag is
+measured rather than trusted: the property suite drives each format's own call
+with an 800-byte payload and checks that the name lands before the arguments
+exactly when the flag says it will.
 
 Arguments still wait for the region to close. SGLang streams those too, as
 JSON fragments; a response cut short then leaves the client holding an
-unterminated object. The residual cost here is narrower: a response truncated
-mid-call has sent a name and no arguments, and `finish_reason` / `stop_reason`
-key on the *arguments* precisely so that dangling name is not reported as a
-tool the client should run.
+unterminated object. On `/v1/chat/completions` a name with no arguments is
+harmless — clients accumulate by index and wait for `finish_reason`, which
+keys on the arguments. On `/v1/messages` it is not: a `content_block_start` of
+type `tool_use` carries `"input": {}` and is, on its own, a complete
+zero-argument call, with no frame for "the name is known, the arguments are
+coming". So that endpoint opens the block when the arguments arrive, not when
+the name does.
 
 **Which tool-call format a model uses is decided at startup, not from its
 output.** `--tool-call-parser` defaults to `auto`, which renders the model's
@@ -236,13 +224,29 @@ token had everything from the token onward deleted with `stream=false` and
 arrived whole with `stream=true`. A guess is silent, and it is also two
 different answers to one request.
 
-**`stream=false` and `stream=true` deliver the same text.** A format's `parse`
-returns the content byte-for-byte when it found no tool call; the only thing it
-may remove is a marker it declares itself (Kimi-K3's channel tokens, which the
-streaming path removes too). Whitespace is not that — every format used to
-`.strip()`, which cost a code-block answer its trailing newline on one path
-only. The property suite generates this check from the parser registry, so a
-format added later is held to it without a new case being written.
+**`stream=false` and `stream=true` deliver the same text**, and not because a
+test compares them: `stream=false` is `read_whole`, which is the streaming
+engine over a single chunk. There is no second implementation to disagree
+with. A format used to be read twice — once by a `parse` taking the whole
+output, once by a `process`/`flush` state machine of its own — and both had to
+decide where content ends, whether an unclosed tag is a call, what a region
+that parses to nothing means, and which bytes are framing. Six formats, two
+copies, four rules; three rounds of review found the copies disagreeing about
+all four.
+
+A format now declares only what is particular to it: the literals that must
+not be split (`START_MARKERS`), which of those hand the stream over
+(`opens_region`, the rest being framing the reader drops), and what one
+region's bytes mean (`parse_region`, returning the calls and the two offsets
+that bracket its own markup). Everything else — reading ahead, releasing
+content, the rule that a start marker is not a promise, stamping call indices,
+and handing back the answer that follows the markup — is the engine's, once.
+
+The content comes back byte-for-byte except for markers the format declares.
+Whitespace is not one — every format used to `.strip()`, which cost a
+code-block answer its trailing newline on one path only. Text *after* a call
+is not one either: five of the six deleted it, and the property suite now
+holds every registered format to delivering it, at four chunk sizes.
 
 The *reasoning* split is held to the same rule one stage earlier, and was not.
 Two ways: `</think>` was matched only at position 0, so a model that answers,
@@ -262,17 +266,55 @@ same answer kept those bytes at one chunk size and lost them at another —
 there was no chunk-invariant behaviour on that whitespace for the other path
 to match even if it had wanted to.
 
+**Which reasoning dialect a model speaks is decided at startup too**, from the
+same evidence as the tool-call format and by the same kind of function
+(`resolve_dialect`, on the chat-template source). It used to be decided twice
+per response and differently each time: the non-streaming split tried each
+registered dialect in order and took the first that matched, while the
+streaming filter carried no dialect at all and closed the channel on the
+*union* of every dialect's end markers. A `<think>` model answering a question
+about Kimi's wire format therefore ended its chain of thought at the quoted
+`<|open|>response<|sep|>` when streamed and at the real `</think>` when not —
+24 characters of the answer filed as reasoning on one path, a raw `</think>`
+shipped to the user on the other. `ReasoningChannel` now carries the dialect
+and whether the output begins inside the channel, with one accessor per
+delivery mode, so the two cannot be handed different answers. A template that
+names no dialect falls back to the inline-`<think>` one, which is a no-op for
+a model that never writes the tag.
+
+Whether the output *begins* inside the channel is per request, not per model.
+A request that switches reasoning off renders a prompt that does not open it,
+and the model-level fact — a template that closes a block it never opens, as
+DeepSeek-R1's does — used to be OR-ed in regardless. On such a model an
+ordinary answer to a request that had asked for no thinking came back entirely
+as `reasoning_content`, with `content` empty.
+
 **`tool_choice: "none"` suppresses the call, not the answer.** It used to be
 enforced where the events are *sent* — twelve places across two endpoints —
 while the parser went on consuming the region, so the model's own words were
 deleted and nothing took their place: 89 characters of a 95-character answer,
 no event, `finish_reason: stop`. The rule now lives at the one place the
-parser is chosen, which is also the right reading — the request said this
-cannot be a call, so it is prose — and it costs less, since nothing is parsed
-in order to be discarded. `/v1/messages` reads the field too, in Anthropic's
+parser is *asked*, as `suppress_calls`, which is also the right reading — the
+request said this cannot be a call, so it is prose.
+
+Not by using no parser at all, which is where the first fix for that went.
+Dropping the parser drops everything else a parser does, and a format whose
+framing wraps *every* answer then leaks it: Kimi-K3's `Hello there.` arrived
+as `<|open|>response<|sep|>Hello there.<|close|>response<|sep|><|end_of_msg|>`
+the moment a request said `none`. The format is still read; only dispatch is
+suppressed. `/v1/messages` reads the field too, in Anthropic's
 `{"type": "none"}` spelling; it previously parsed it off the request and used
 it nowhere, so a client that forbade tool calls got `tool_use` blocks and
 `stop_reason: tool_use` anyway.
+
+Forwarding it to the chat template is a separate step, and one that used to be
+a 500. The handler passes template controls it cannot know the model reads —
+`response_format`, `tool_choice`, `thinking_effort`, and whatever a client puts
+in `chat_template_kwargs`. A Jinja template silently ignores a kwarg it does
+not read; a model-shipped Python encoder raises `TypeError`. So on DeepSeek-V4
+and Kimi-K3, which ship encoders instead of templates, any request carrying one
+of those was an unhandled exception. The adapter now reads the encoder's
+signature once at startup and passes on only what it can take.
 
 **`thinking` is answered in the prompt, not in the response.** On
 `/v1/messages`, `thinking: {"type": "disabled"}` sets the chat template's own
@@ -970,10 +1012,12 @@ server without modification.
 | `atom/entrypoints/openai/streaming_dispatch.py` | `StreamBatchDispatcher` (per-engine-step cross-thread dispatch), `StreamOutputCollector` (per-request delivery, folds a backlog) and the silence watchdog |
 | `atom/entrypoints/openai/sse.py` | SSE frame encoding (`data_frame`, `event_frame`) on a shared msgspec encoder |
 | `atom/entrypoints/openai/marker_scanner.py` | `MarkerScanner` — the one rule for how much of a stream is safe to release |
-| `atom/entrypoints/openai/reasoning.py` | Splits the reasoning channel from the answer; seeded per request by `prompt_starts_in_reasoning` |
+| `atom/entrypoints/openai/reasoning.py` | Splits the reasoning channel from the answer; `ReasoningChannel` carries the model's dialect and whether the output begins inside the channel, and has one accessor per delivery mode |
+| `atom/entrypoints/openai/reasoning_dialects.py` | The dialects, and `resolve_dialect`, which picks one from the chat template at startup |
+| `atom/entrypoints/openai/tool_parser/stream.py` | The one reader: the engine both delivery modes run through |
 | `atom/entrypoints/openai/chat_encoders.py` | Renders the chat template, and the two startup probes of it: `render_probe_prompt` (what the prompt tells the model) and `chat_template_source` (what the template does with a reply) |
 | `atom/entrypoints/openai/tool_parser/registry.py` | Which format a model emits, resolved once at startup from its chat template |
-| `atom/entrypoints/openai/tool_parser/` | Per-format tool-call parsing; each format declares its `START_MARKERS` |
+| `atom/entrypoints/openai/tool_parser/` | Per-format tool-call syntax; each format declares its markers and a `parse_region`, and writes no reader of its own |
 | `atom/model_engine/llm_engine.py` | `LLMEngine` programmatic API |
 | `atom/sampling_params.py` | `SamplingParams` dataclass |
 | `atom/model_engine/arg_utils.py` | `EngineArgs` CLI argument definitions and engine factory |

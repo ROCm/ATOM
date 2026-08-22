@@ -22,8 +22,9 @@ from typing import Any, ClassVar
 from .kimi_tool_parser import KIMI_SECTION_BEGIN
 from .schema import build_param_types, coerce_param_value
 from .tool_parser import (
-    BufferedMarkerParser,
+    RegionParse,
     ToolCall,
+    ToolCallParser,
     continues_a_call,
     unique_tool_call_id,
 )
@@ -32,7 +33,18 @@ from .tool_parser import (
 # apart from GLM's identically-named tag.
 QWEN_TOOL_PREFIX = "<function="
 
-_FUNCTION_RE = re.compile(r"<function=(.*?)</function>|<function=(.*)$", re.DOTALL)
+# A call's body may not contain another opener -- that literal is what opens
+# one. Without the guard the non-greedy body ran from a *quoted* opener in
+# prose all the way to the real call's closer, so an answer explaining
+# "you write <function=NAME>" before making a real call produced one call named after the
+# placeholder, carrying the real call's arguments, with the sentence deleted.
+# `finditer` then resumed past the real call, so the call the model actually
+# made never went out. GLM was given this guard first; this is the sweep.
+_NOT_NESTED = r"(?:(?!<function=).)"
+_FUNCTION_RE = re.compile(
+    r"<function=(" + _NOT_NESTED + r"*?)</function>|<function=(" + _NOT_NESTED + r"*)",
+    re.DOTALL,
+)
 _PARAM_OPENER = "<parameter="
 _PARAM_RE = re.compile(
     r"<parameter=(.*?)(?:</parameter>|(?=<parameter=)|(?=</function>)|$)",
@@ -57,7 +69,7 @@ def _name_and_rest(fn_text: str) -> tuple[str, str] | None:
     return fn_text[:gt].strip(), fn_text[gt + 1 :].lstrip()
 
 
-def _is_truncated_call(fn_text: str, param_types: dict) -> bool:
+def _is_truncated_call(fn_text: str, param_types: dict, *, at_end: bool) -> bool:
     """Is this unclosed `<function=...` a cut-off call, or prose quoting a tag?
 
     The unclosed branch exists for a call the model was cut off mid-way
@@ -71,14 +83,16 @@ def _is_truncated_call(fn_text: str, param_types: dict) -> bool:
     request declared -- prose can name a real tool, so this alone is not
     enough. And what follows the name is this format's own next token: a
     cut-off call stops inside its own syntax, while prose continues in
-    English. `peek_name` applies the same two, from the same code.
+    English. The early announcement runs this same function over the region
+    so far, so the two cannot answer differently.
     """
     split = _name_and_rest(fn_text)
     if split is None:
         return False
     name, rest = split
     return name in param_types and (
-        not rest or continues_a_call(rest, _CALL_CONTINUES, arrived=False)
+        (not rest and at_end)
+        or continues_a_call(rest, _CALL_CONTINUES, arrived=not at_end)
     )
 
 
@@ -113,35 +127,17 @@ def _parse_function(
     )
 
 
-# The name, and enough of what follows to tell a call from prose. A name
-# alone matches an answer explaining how to call a tool, and an announcement
-# cannot be retracted -- "the model writes <tool_call><function=get_weather>
-# and then..." announced `get_weather`. Waiting for the structure costs a few
-# characters against the thousands this saves.
-_PEEK_NAME_RE = re.compile(r"<function=([^>\n]+)>(.*)", re.DOTALL)
-
-
-class QwenXmlParser(BufferedMarkerParser):
+class QwenXmlParser(ToolCallParser):
     NAME: ClassVar[str] = "qwen"
+    RECOGNISES_A_CALL_IN_PROGRESS: ClassVar[bool] = True
     START_MARKERS: ClassVar[tuple[str, ...]] = ("<tool_call>", QWEN_TOOL_PREFIX)
-
-    @classmethod
-    def peek_name(cls, region: str, tools: list | None = None) -> str | None:
-        """`<function=NAME>` -- legible once the tag closes and something
-        follows it that only a call would write.
-
-        The follower must have *arrived*, unlike in `_is_truncated_call`,
-        which accepts nothing-after because it runs at end of stream where
-        nothing more is coming. Here more is coming, so an empty tail is
-        "not yet" rather than "cut off".
-        """
-        m = _PEEK_NAME_RE.search(region)
-        if m is None:
-            return None
-        rest = m.group(2).lstrip()
-        if not continues_a_call(rest, _CALL_CONTINUES, arrived=True):
-            return None
-        return m.group(1)
+    # `</tool_call>` closes the wrapper the calls sit in, so it is markup too
+    # -- and so is the newline between it and `</function>`. Not a
+    # `REGION_END_MARKER`: a model writing *about* tool calls puts the literal
+    # inside a `<parameter=` value, where closing the region on it would cut a
+    # real call in half.
+    CALL_OPENERS: ClassVar[tuple[str, ...]] = ("<tool_call>",)
+    CALL_CLOSERS: ClassVar[tuple[str, ...]] = ("</tool_call>",)
 
     @classmethod
     def detect(cls, text: str) -> bool:
@@ -149,14 +145,13 @@ class QwenXmlParser(BufferedMarkerParser):
         return QWEN_TOOL_PREFIX in text and KIMI_SECTION_BEGIN not in text
 
     @classmethod
-    def parse(cls, text: str, tools: list | None) -> tuple[str, list[ToolCall]]:
-        """Parse Qwen3 XML tool calls; return (leading_content, tool_calls)."""
+    def parse_region(
+        cls, region: str, tools: list | None, *, at_end: bool
+    ) -> RegionParse:
         param_types = build_param_types(tools)
-        # Content precedes the first tool marker.
-        start = cls.find_start(text)
-        content = text[:start] if start != -1 else text
-        tool_calls: list[ToolCall] = []
-        for fm in _FUNCTION_RE.finditer(text):
+        calls: list[ToolCall] = []
+        begin = end = 0
+        for fm in _FUNCTION_RE.finditer(region):
             closed = fm.group(1) is not None
             fn_text = fm.group(1) if closed else fm.group(2)
             if not fn_text:
@@ -164,8 +159,12 @@ class QwenXmlParser(BufferedMarkerParser):
             tc = _parse_function(fn_text, param_types)
             if tc is None:
                 continue
-            if not closed and not _is_truncated_call(fn_text, param_types):
+            if not closed and not _is_truncated_call(
+                fn_text, param_types, at_end=at_end
+            ):
                 continue
-            tool_calls.append(tc)
-        # No call -> verbatim; see ToolCallParser.parse.
-        return (content.strip() if tool_calls else text), tool_calls
+            if not calls:
+                begin = cls.markup_begin(region, fm.start())
+            calls.append(tc)
+            end = cls.markup_end(region, fm.end())
+        return RegionParse(tuple(calls), begin, end)

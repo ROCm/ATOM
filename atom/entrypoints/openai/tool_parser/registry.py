@@ -27,6 +27,7 @@ from .kimi_k3_tool_parser import KimiK3Parser
 from .kimi_tool_parser import KimiParser
 from .minimax_tool_parser import MiniMaxParser
 from .qwen3_tool_parser import QwenXmlParser
+from .stream import read_whole
 from .tool_parser import ToolCall, ToolCallParser
 
 # Checked in order on a COMPLETE output. Kimi (K2) is not listed: it is the
@@ -54,6 +55,8 @@ def parse_tool_calls(
     text: str,
     tools: list | None = None,
     parser_cls: "type[ToolCallParser] | None" = None,
+    *,
+    suppress_calls: bool = False,
 ) -> tuple[str, list[ToolCall]]:
     """Parse tool calls from a complete model output.
 
@@ -68,16 +71,19 @@ def parse_tool_calls(
             request two ways — measured, an answer describing
             `<|tool_calls_section_begin|>` lost 30 characters when
             `stream=false` and arrived whole when `stream=true`.
+        suppress_calls: ``tool_choice: "none"``. See the note above
+            :func:`forbids_tool_calls` for why this is a flag and not
+            "use no parser".
 
     Returns:
         Tuple of (content_text, list_of_tool_calls). ``content_text`` has the
-        tool-call sections removed, and is ``text`` byte-for-byte when there
-        are none — the rule each format's ``parse`` states and the property
-        tests enforce across the registry.
+        tool-call regions and this format's declared framing removed, and is
+        ``text`` byte-for-byte when there is neither.
+
+    This is :func:`~.stream.read_whole` — the streaming engine over one chunk —
+    and deliberately not a second implementation of it.
     """
-    if parser_cls is None:
-        return text, []
-    return parser_cls.parse(text, tools)
+    return read_whole(parser_cls, text, tools, suppress_calls=suppress_calls)
 
 
 # -- format resolution -----------------------------------------------------
@@ -150,25 +156,24 @@ def forbids_tool_calls(tool_choice: Any) -> bool:
     return False
 
 
-def parser_for_tool_choice(
-    parser_cls: type[ToolCallParser] | None, tool_choice: Any
-) -> type[ToolCallParser] | None:
-    """The format to read this request's output as -- none, if it forbade calls.
+"""Why ``tool_choice: "none"`` is a flag and not "use no parser".
 
-    `tool_choice: "none"` used to be enforced where the events were *sent*,
-    twelve places across two endpoints, while the parser went on consuming the
-    region. So the model's own words were deleted rather than its call
-    suppressed: a 95-character answer reached the client as its first six,
-    with no event and `finish_reason: stop`. Not parsing is both the correct
-    reading -- the output is prose, because the request said it could not be a
-    call -- and the cheaper one, since nothing is parsed to be thrown away.
+`tool_choice: "none"` used to be enforced where the events were *sent*, twelve
+places across two endpoints, while the parser went on consuming the region. So
+the model's own words were deleted rather than its call suppressed: a
+95-character answer reached the client as its first six, with no event and
+`finish_reason: stop`.
 
-    Every construction site goes through here, so the two protocols cannot
-    drift: the Anthropic endpoint read `tool_choice` off the request and then
-    ignored it entirely, and the sweep that added the gates to the OpenAI path
-    never reached it.
-    """
-    return None if forbids_tool_calls(tool_choice) else parser_cls
+The fix for that dropped the parser instead -- and dropping the parser also
+drops everything else a parser does. A format whose framing wraps *every*
+answer then leaks that framing: Kimi-K3's `Hello there.` arrived as
+`<|open|>response<|sep|>Hello there.<|close|>response<|sep|><|end_of_msg|>`
+the moment a request said `none`. The format still has to be read; what is
+suppressed is dispatch. `ToolCallStreamParser(suppress_calls=True)` and
+:func:`parse_tool_calls(..., suppress_calls=True)` are that, and both leave
+the region's bytes in the answer -- which is the correct reading, since the
+request said they could not be a call.
+"""
 
 
 def validate_tool_call_parser(override: str | None) -> type[ToolCallParser] | None:

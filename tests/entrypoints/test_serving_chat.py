@@ -14,6 +14,7 @@ from atom.entrypoints.atomesh import atom_standalone_service
 from atom.entrypoints.openai import api_server, serving_chat
 from atom.entrypoints.openai.serving_anthropic import completes_a_tool_call
 from atom.entrypoints.openai.serving_chat import (
+    finish_reason_with_calls,
     _build_chat_choice,
     _normalize_finish_reason,
     build_chat_response,
@@ -27,7 +28,8 @@ from atom.entrypoints.openai.streaming_dispatch import StreamOutputCollector
 from atom.entrypoints.openai.tool_parser import ToolCallStreamParser, parse_tool_calls
 from atom.entrypoints.openai.tool_parser.kimi_tool_parser import KimiParser
 from atom.entrypoints.openai.tool_parser.qwen3_tool_parser import QwenXmlParser
-from atom.entrypoints.openai.tool_parser.registry import parser_for_tool_choice
+from atom.entrypoints.openai.tool_parser.kimi_k3_tool_parser import KimiK3Parser
+from atom.entrypoints.openai.tool_parser.registry import forbids_tool_calls
 
 # ============================================================================
 # normalize_chat_tools Tests
@@ -444,23 +446,32 @@ class TestForbiddingToolCallsDoesNotDeleteTheAnswer:
     was eaten and nothing took its place. Measured on the answer below: 89 of
     95 characters gone, no event, `finish_reason: stop`.
 
-    The rule now lives at the one place the parser is chosen, which is also
-    the reading that makes sense: the request said this cannot be a call, so
-    it is prose. Stated behaviourally and not as a scan of the source -- the
-    scan this replaces was mutation-checked and accepted `or tool_choice !=
-    "none"`, and it hardcoded one module while the same gap sat in three
-    others.
+    The rule now lives at the one place the parser is *asked*, as a
+    `suppress_calls` flag, which is also the reading that makes sense: the
+    request said this cannot be a call, so it is prose.
+
+    Not by dropping the parser, which is where the first fix went. Dropping
+    it drops everything else a parser does -- and a format whose framing
+    wraps *every* answer then leaks that framing the moment a request says
+    `none`: Kimi-K3's `Hello there.` arrived as
+    `<|open|>response<|sep|>Hello there.<|close|>response<|sep|><|end_of_msg|>`.
+    `test_a_format_that_normalises_its_framing_still_does` is that.
+
+    Stated behaviourally and not as a scan of the source -- the scan this
+    replaces was mutation-checked and accepted `or tool_choice != "none"`,
+    and it hardcoded one module while the same gap sat in three others.
     """
 
     @staticmethod
-    def _stream(tool_choice, chunk=7):
+    def _stream(tool_choice, chunk=7, text=A_CALL, parser_cls=QwenXmlParser):
         parser = ToolCallStreamParser(
             tools=TOOLS,
-            parser_cls=parser_for_tool_choice(QwenXmlParser, tool_choice),
+            parser_cls=parser_cls,
+            suppress_calls=forbids_tool_calls(tool_choice),
         )
         events = []
-        for i in range(0, len(A_CALL), chunk):
-            events += parser.process(A_CALL[i : i + chunk])
+        for i in range(0, len(text), chunk):
+            events += parser.process(text[i : i + chunk])
         events += parser.flush()
         return events
 
@@ -497,9 +508,55 @@ class TestForbiddingToolCallsDoesNotDeleteTheAnswer:
     def test_the_two_paths_agree(self):
         streamed = "".join(d for k, d in self._stream("none") if k == "content")
         non_streaming, calls = parse_tool_calls(
-            A_CALL, TOOLS, parser_cls=parser_for_tool_choice(QwenXmlParser, "none")
+            A_CALL, TOOLS, parser_cls=QwenXmlParser, suppress_calls=True
         )
         assert calls == [] and non_streaming == streamed
+
+    def test_the_answer_is_not_withheld_to_the_end(self):
+        """A region that can never be a call has nothing to wait for.
+
+        Suppressing dispatch but still buffering meant a request that had
+        already said "no tool calls" got the rest of its answer in one frame
+        at end of stream -- the marker opened a region, and a region is held
+        until it can be parsed.
+        """
+        held = [d for k, d in self._held_back("none") if k == "content"]
+        assert sum(map(len, held)) == 0, f"{sum(map(len, held))} characters held to EOS"
+
+    @staticmethod
+    def _held_back(tool_choice, chunk=7):
+        """Only what `flush` produced -- what streaming failed to deliver."""
+        parser = ToolCallStreamParser(
+            tools=TOOLS,
+            parser_cls=QwenXmlParser,
+            suppress_calls=forbids_tool_calls(tool_choice),
+        )
+        for i in range(0, len(A_CALL), chunk):
+            parser.process(A_CALL[i : i + chunk])
+        return parser.flush()
+
+    def test_a_format_that_normalises_its_framing_still_does(self):
+        """Suppressing a call must not also switch off reading the format.
+
+        Kimi-K3 wraps every answer, tool call or not, in channel tokens that
+        the reader removes. Answering `tool_choice: "none"` by using no
+        parser removed nothing, so the client was handed the wire.
+        """
+        framed = (
+            "<|open|>response<|sep|>Hello there."
+            "<|close|>response<|sep|><|end_of_msg|>"
+        )
+        forbidden = "".join(
+            d
+            for k, d in self._stream("none", text=framed, parser_cls=KimiK3Parser)
+            if k == "content"
+        )
+        allowed = "".join(
+            d
+            for k, d in self._stream(None, text=framed, parser_cls=KimiK3Parser)
+            if k == "content"
+        )
+        assert forbidden == allowed == "Hello there."
 
     def test_every_construction_site_goes_through_the_helper(self):
         """The gap this had was a site nobody listed, so count them rather
@@ -520,14 +577,17 @@ class TestForbiddingToolCallsDoesNotDeleteTheAnswer:
                 if name not in ("ToolCallStreamParser", "parse_tool_calls"):
                     continue
                 built += 1
-                arg = next(
+                parser_arg = next(
                     (k.value for k in node.keywords if k.arg == "parser_cls"), None
                 )
-                via_helper = (
-                    isinstance(arg, ast.Call)
-                    and getattr(arg.func, "id", None) == "parser_for_tool_choice"
+                suppress = next(
+                    (k.value for k in node.keywords if k.arg == "suppress_calls"), None
                 )
-                if not (via_helper or _is_none(arg)):
+                via_helper = (
+                    isinstance(suppress, ast.Call)
+                    and getattr(suppress.func, "id", None) == "forbids_tool_calls"
+                )
+                if not (via_helper or _is_none(parser_arg)):
                     unguarded += 1
         assert built >= 4, f"only {built} construction sites found; matcher is stale"
         assert unguarded == 0, f"{unguarded} of {built} sites bypass the helper"
@@ -582,3 +642,42 @@ class TestTheStreamReportsWhyItStopped:
             f"{hardcoded} streaming path(s) still report `stop` regardless of "
             "why the engine stopped"
         )
+
+
+class TestBeingCutShortOutranksHavingMadeACall:
+    """`tool_calls` says "act on this"; `length` says "this is not all of it".
+
+    A response the engine cut off mid-call still parses to a call -- every
+    format's unclosed-region branch exists to salvage exactly that -- but its
+    last argument value is silently truncated. Reporting `tool_calls` told the
+    client to run the tool with half its arguments and no sign anything was
+    missing. OpenAI reports `length` for a truncated response whatever else is
+    in it.
+    """
+
+    @pytest.mark.parametrize(
+        "engine_reason, has_calls, expected",
+        [
+            ("max_tokens", True, "length"),
+            ("max_tokens", False, "length"),
+            ("length", True, "length"),
+            ("eos", True, "tool_calls"),
+            ("stop_163586", True, "tool_calls"),
+            ("eos", False, "stop"),
+            (None, True, "tool_calls"),
+            (None, False, "stop"),
+        ],
+    )
+    def test_the_rule(self, engine_reason, has_calls, expected):
+        assert finish_reason_with_calls(engine_reason, has_calls) == expected
+
+    def test_end_to_end_on_a_call_the_engine_cut_off(self):
+        truncated = "<tool_call><function=get_weather><parameter=city>Par"
+        choice = _build_chat_choice(
+            truncated,
+            "max_tokens",
+            tools=TOOLS,
+            tool_parser_cls=QwenXmlParser,
+        )
+        assert choice["message"]["tool_calls"], "the salvaged call is the premise"
+        assert choice["finish_reason"] == "length"

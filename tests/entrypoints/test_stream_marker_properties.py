@@ -41,6 +41,7 @@ import random
 import re
 import sys
 import time
+from typing import ClassVar
 
 import pytest
 
@@ -50,8 +51,11 @@ from atom.entrypoints.openai.serving_anthropic import completes_a_tool_call
 from atom.entrypoints.openai.tool_parser.kimi_tool_parser import KimiParser
 from atom.entrypoints.openai.tool_parser.qwen3_tool_parser import QwenXmlParser
 from atom.entrypoints.openai.tool_parser.registry import _DETECT_ORDER
-from atom.entrypoints.openai.tool_parser.stream import ToolCallStreamParser
-from atom.entrypoints.openai.tool_parser.tool_parser import _PEEK_WINDOW
+from atom.entrypoints.openai.tool_parser import RegionParse, ToolCall, parse_tool_calls
+from atom.entrypoints.openai.tool_parser.stream import (
+    _PEEK_WINDOW,
+    ToolCallStreamParser,
+)
 
 # Kimi is the terminal fallback and so is not in the detect order, but it is a
 # registered format with markers of its own.
@@ -643,7 +647,7 @@ class TestNonStreamingAgreesWithStreaming:
 
     @pytest.mark.parametrize("dialect, parser, text", HOLD_PAIRS)
     def test_the_two_paths_deliver_the_same_text(self, dialect, parser, text):
-        non_streaming, calls = parser.parse(text, None)
+        non_streaming, calls = parse_tool_calls(text, None, parser)
         if calls:
             pytest.skip("this shape parsed a call; the rule binds the no-call case")
         streamed = drive(text, split_every_way(text)["fixed-3"], parser)
@@ -663,7 +667,7 @@ class TestNonStreamingAgreesWithStreaming:
         -- in particular whitespace, which is what every format's trailing
         `.strip()` took -- has to survive.
         """
-        content, calls = parser.parse(text, None)
+        content, calls = parse_tool_calls(text, None, parser)
         if calls:
             pytest.skip("this shape parsed a call; the rule binds the no-call case")
         rebuilt = content
@@ -763,7 +767,7 @@ class TestARealCallSurvivesTheStream:
     @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
     def test_the_non_streaming_path_reads_the_call(self, parser):
         """The fixture is a real call in this format, and this says so."""
-        _, calls = parser.parse(REAL_CALLS[parser.NAME], DECLARED_TOOLS)
+        _, calls = parse_tool_calls(REAL_CALLS[parser.NAME], DECLARED_TOOLS, parser)
         assert [c.function["name"] for c in calls] == ["get_weather"]
 
     @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
@@ -774,7 +778,7 @@ class TestARealCallSurvivesTheStream:
         parameter syntax parsed to `get_weather({})` and passed everything
         here -- minimax's was, for as long as the table existed.
         """
-        _, calls = parser.parse(REAL_CALLS[parser.NAME], DECLARED_TOOLS)
+        _, calls = parse_tool_calls(REAL_CALLS[parser.NAME], DECLARED_TOOLS, parser)
         assert json.loads(calls[0].function["arguments"]) == {"city": "Paris"}
 
     @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
@@ -888,8 +892,8 @@ class TestAFormatDeclaresEveryTokenItStrips:
         bad = []
         for a, b in itertools.product(tokens, repeat=2):
             text = f"A {a} B {b} C"
-            non = parser.parse(text, DECLARED_TOOLS)[0]
-            if parser.parse(text, DECLARED_TOOLS)[1]:
+            non = parse_tool_calls(text, DECLARED_TOOLS, parser)[0]
+            if parse_tool_calls(text, DECLARED_TOOLS, parser)[1]:
                 continue  # a real call; the no-call rule is what binds here
             for size in (1, 3, 999):
                 got = "".join(
@@ -1039,11 +1043,28 @@ DECLARED_TOOLS = [
 ]
 
 
-# Formats that deliberately do not announce a name early, and why. Stated
-# here rather than read off `peek_name`, so removing an override is a failing
-# test and not a silently skipped one.
+def early_name(parser, region: str, tools) -> str | None:
+    """The name the engine would announce for `region`.
+
+    There is no separate peek to ask any more, and that is the point: the
+    announcement is the first call of `parse_region` over the bytes so far,
+    with `at_end=False`. The declared-name filter lives in the engine, so a
+    test that wants it drives the engine instead.
+    """
+    calls = parser.parse_region(region, tools, at_end=False).calls
+    return calls[0].function["name"] if calls else None
+
+
+# A format that cannot see a call still arriving cannot name one before its
+# arguments: a Kimi entry is invisible until `<|tool_call_end|>` and a K3 call
+# until `<|close|>call`. Derived from the declaration the engine itself reads,
+# so the table and the behaviour cannot drift -- and pinned by
+# `test_the_declaration_matches_the_timing`, which measures rather than
+# re-derives.
 NO_EARLY_NAME = {
-    "kimi": "index and id come off the wire, after the peek would have to fire",
+    p.NAME: "a call of this format is invisible until its own end token"
+    for p in ALL_PARSERS
+    if not p.RECOGNISES_A_CALL_IN_PROGRESS
 }
 
 
@@ -1090,12 +1111,23 @@ class TestTheNameArrivesBeforeTheArguments:
         )
 
     @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
-    def test_the_opt_outs_are_the_declared_ones(self, parser):
-        """Whether a format announces at all, pinned rather than inferred."""
-        peeks = parser.peek_name(REAL_CALLS[parser.NAME], DECLARED_TOOLS) is not None
-        assert peeks is (parser.NAME not in NO_EARLY_NAME), (
-            f"{parser.NAME}: peek_name says {peeks}, NO_EARLY_NAME says "
-            f"{parser.NAME in NO_EARLY_NAME}"
+    def test_the_declaration_matches_the_timing(self, parser):
+        """`RECOGNISES_A_CALL_IN_PROGRESS` is read by the engine for two
+        different decisions -- whether a name can go out early, and whether a
+        region that is producing nothing can be given up on. Declaring it
+        wrong the second way delivers a real call as prose, so it is measured
+        here rather than trusted: drive a call with an 800-byte payload and
+        see whether the name actually arrives before the arguments.
+        """
+        total, at, args_at, _ = self._drive(
+            parser, self._big_call(parser), DECLARED_TOOLS
+        )
+        assert at is not None and args_at is not None
+        early = at < args_at
+        assert early is parser.RECOGNISES_A_CALL_IN_PROGRESS, (
+            f"{parser.NAME} declares RECOGNISES_A_CALL_IN_PROGRESS="
+            f"{parser.RECOGNISES_A_CALL_IN_PROGRESS} but the name landed on "
+            f"chunk {at} of {total} and the arguments on {args_at}"
         )
 
     @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
@@ -1175,6 +1207,7 @@ class TestTheNameArrivesBeforeTheArguments:
 # re-peeking instead, the corpus moved whenever `peek_name` did and the
 # property below went quietly vacuous.
 CALL_OPENERS: dict[str, str] = {
+    "kimi": ("<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0"),
     "glm": "<tool_call>get_weather",
     "qwen": "<tool_call><function=get_weather>",
     "kimi_k3": '<|open|>tools<|sep|><|open|>call tool="get_weather"<|sep|>',
@@ -1186,9 +1219,12 @@ CALL_OPENERS: dict[str, str] = {
 # the name go out. Without a positive row the property below is satisfied by
 # a peek that never announces anything.
 CALL_CONTINUATIONS: dict[str, str] = {
+    "kimi": '<|tool_call_argument_begin|>{"city":"Paris"}<|tool_call_end|>',
     "glm": "<arg_key>city</arg_key>",
     "qwen": "<parameter=city>Paris</parameter>",
-    "kimi_k3": '<|open|>argument key="city"<|sep|>Paris',
+    "kimi_k3": (
+        '<|open|>argument key="city"<|sep|>Paris<|close|>argument<|close|>call'
+    ),
     "dsml": f'<{_D}parameter name="city">Paris',
     "minimax": f"{_NS}<city>Paris",
 }
@@ -1199,6 +1235,7 @@ CALL_CONTINUATIONS: dict[str, str] = {
 # very block the name opened and `<tool_call>get_weather</tool_call>` is a
 # real zero-argument call.
 FOREIGN_CLOSERS: dict[str, str] = {
+    "kimi": "</tool_call>",
     "glm": "</function>",
     "qwen": "</tool_call>",
     "kimi_k3": "<|close|>response<|sep|>",
@@ -1231,7 +1268,12 @@ PEEK_TOOLS = [
 
 
 class TestThePeekNeverNamesWhatTheParseCallsProse:
-    """`peek_name` and `parse` must agree about what a call looks like.
+    """The early name and the parse must agree about what a call looks like.
+
+    Every format is held to this, including the two whose name cannot go out
+    before their arguments: "does not name prose" is a different claim from
+    "names a real call early", and only the second is format-specific. Gating
+    both on the same table skipped ten cases that pass.
 
     A name cannot be retracted. If the peek names a region and the parse then
     reads that same region as prose, the client has been told about a call
@@ -1257,8 +1299,6 @@ class TestThePeekNeverNamesWhatTheParseCallsProse:
     @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
     def test_the_opener_matches_this_format(self, parser):
         """Otherwise the regions below are not this format's syntax at all."""
-        if parser.NAME in NO_EARLY_NAME:
-            pytest.skip(NO_EARLY_NAME[parser.NAME])
         opener = CALL_OPENERS[parser.NAME]
         assert REAL_CALLS[parser.NAME].startswith(
             opener
@@ -1267,15 +1307,11 @@ class TestThePeekNeverNamesWhatTheParseCallsProse:
     @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
     @pytest.mark.parametrize("tail, why", PROSE_TAILS, ids=lambda x: x)
     def test_prose_after_the_opener_names_nothing(self, parser, tail, why):
-        if parser.NAME in NO_EARLY_NAME:
-            pytest.skip(NO_EARLY_NAME[parser.NAME])
         self._check(parser, CALL_OPENERS[parser.NAME] + tail, why, expected=None)
 
     @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
     def test_a_closer_that_is_not_this_format_s_names_nothing(self, parser):
         """The shape Qwen got wrong: a closer that ends some *other* block."""
-        if parser.NAME in NO_EARLY_NAME:
-            pytest.skip(NO_EARLY_NAME[parser.NAME])
         region = (
             CALL_OPENERS[parser.NAME] + FOREIGN_CLOSERS[parser.NAME] + ", like that."
         )
@@ -1283,8 +1319,6 @@ class TestThePeekNeverNamesWhatTheParseCallsProse:
 
     @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
     def test_this_format_s_own_next_token_does_name_it(self, parser):
-        if parser.NAME in NO_EARLY_NAME:
-            pytest.skip(NO_EARLY_NAME[parser.NAME])
         region = CALL_OPENERS[parser.NAME] + CALL_CONTINUATIONS[parser.NAME]
         self._check(parser, region, "this format's own next token", "get_weather")
 
@@ -1298,7 +1332,7 @@ class TestThePeekNeverNamesWhatTheParseCallsProse:
         keyed on that passed while K3 announced a tool for a sentence merely
         quoting a call opener.
         """
-        got = parser.peek_name(region, PEEK_TOOLS)
+        got = early_name(parser, region, PEEK_TOOLS)
         assert got == expected, (
             f"{parser.NAME} with {why} after its opener: peek said {got!r}, "
             f"expected {expected!r} -- region {region!r}"
@@ -1318,11 +1352,9 @@ class TestThePeekNeverNamesWhatTheParseCallsProse:
         salvages a truncated call, so the client was left holding a name for
         a call that produced no arguments and no event.
         """
-        if parser.NAME in NO_EARLY_NAME:
-            pytest.skip(NO_EARLY_NAME[parser.NAME])
         opener = CALL_OPENERS[parser.NAME]
         assert (
-            parser.peek_name(opener, DECLARED_TOOLS) is None
+            early_name(parser, opener, DECLARED_TOOLS) is None
         ), f"{parser.NAME} named a tool off its opener alone: {opener!r}"
 
     def test_a_looser_peek_is_caught(self):
@@ -1332,9 +1364,16 @@ class TestThePeekNeverNamesWhatTheParseCallsProse:
             NAME = "loose"
 
             @classmethod
-            def peek_name(cls, region, tools=None):
+            def parse_region(cls, region, tools, *, at_end):
                 m = re.search(r"<function=([^>\n]+)>", region)
-                return m.group(1) if m else None
+                if m is None:
+                    return RegionParse()
+                call = ToolCall(
+                    id="loose",
+                    type="function",
+                    function={"name": m.group(1), "arguments": "{}"},
+                )
+                return RegionParse((call,), m.start(), len(region))
 
         with pytest.raises(AssertionError, match="peek said"):
             self._check(Loose, CALL_OPENERS["qwen"] + " and then...", "English", None)
@@ -1342,10 +1381,8 @@ class TestThePeekNeverNamesWhatTheParseCallsProse:
     @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
     def test_a_real_call_is_still_named_early(self, parser):
         """And the rule above is not satisfied by never announcing anything."""
-        if parser.NAME in NO_EARLY_NAME:
-            pytest.skip(NO_EARLY_NAME[parser.NAME])
         assert (
-            parser.peek_name(REAL_CALLS[parser.NAME], DECLARED_TOOLS) == "get_weather"
+            early_name(parser, REAL_CALLS[parser.NAME], DECLARED_TOOLS) == "get_weather"
         )
 
 
@@ -1409,15 +1446,12 @@ class TestAPromiseCannotBeTakenBack:
 
         class Liar(QwenXmlParser):
             @classmethod
-            def peek_name(cls, region, tools=None):
-                return "get_weather" if "<function=" in region else None
-
-            @classmethod
-            def parse(cls, text, tools):
-                content, calls = QwenXmlParser.parse(text, tools)
-                for c in calls:
-                    c.function["name"] = "something_else"
-                return content, calls
+            def parse_region(cls, region, tools, *, at_end):
+                parsed = QwenXmlParser.parse_region(region, tools, at_end=at_end)
+                if at_end:
+                    for c in parsed.calls:
+                        c.function["name"] = "something_else"
+                return parsed
 
         return Liar
 
@@ -1523,26 +1557,40 @@ class TestTheRegionIsNotCopiedPerChunk:
             )
         return best * 1000
 
-    def test_announce_is_never_handed_the_whole_region(self):
-        """The deterministic half: materialising the buffer per chunk is the
-        cost, so nothing on that path may ask for it."""
+    @staticmethod
+    def _scans_of_an_open_region(text, parser_cls=QwenXmlParser):
+        """Every length the format was asked about while the region was open."""
         seen: list[int] = []
 
-        class Watching(QwenXmlParser):
+        class Watching(parser_cls):
             @classmethod
-            def peek_name(cls, region, tools=None):
-                seen.append(len(region))
-                return QwenXmlParser.peek_name(region, tools)
+            def parse_region(cls, region, tools, *, at_end):
+                if not at_end:
+                    seen.append(len(region))
+                return parser_cls.parse_region(region, tools, at_end=at_end)
 
-        text = _big_call(8 * 1024)
         parser = ToolCallStreamParser(tools=DECLARED_TOOLS, parser_cls=Watching)
         for i in range(0, len(text), 4):
             parser.process(text[i : i + 4])
         parser.flush()
-        assert seen, "the peek never ran; this asserts nothing"
-        assert (
-            max(seen) <= _PEEK_WINDOW
-        ), f"a peek was handed {max(seen)} characters, window is {_PEEK_WINDOW}"
+        return seen
+
+    def test_the_open_region_is_never_scanned_beyond_the_window(self):
+        """Nothing on the per-chunk path may be handed the whole region.
+
+        Running a format's regex over the growing buffer once per chunk is
+        quadratic in the response, and a probe that did it on a doubling
+        schedule was tried and reverted -- see
+        `TestTheDeclarationAboutACallInProgressIsMeasured`. So the bound is
+        flat again: `Region.head`, and nothing larger, ever.
+        """
+        text = _big_call(8 * 1024)
+        seen = self._scans_of_an_open_region(text)
+        assert seen, "nothing asked; this asserts nothing"
+        assert max(seen) <= _PEEK_WINDOW, (
+            f"a scan of an open region was handed {max(seen)} characters; the "
+            f"window is {_PEEK_WINDOW}"
+        )
 
     @pytest.mark.parametrize(
         "parser, build",
@@ -1610,9 +1658,10 @@ class TestThePeekIsBounded:
 
         class Counting(parser_cls):
             @classmethod
-            def peek_name(cls, region, tools=None):
-                calls.append(len(region))
-                return parser_cls.peek_name(region, tools)
+            def parse_region(cls, region, tools, *, at_end):
+                if not at_end:
+                    calls.append(len(region))
+                return parser_cls.parse_region(region, tools, at_end=at_end)
 
         stream = ToolCallStreamParser(parser_cls=Counting)
         stream.tools = tools
@@ -1621,15 +1670,15 @@ class TestThePeekIsBounded:
         stream.flush()
         return calls
 
-    def test_no_peek_ever_sees_more_than_the_window(self):
+    def test_the_announcement_never_sees_more_than_the_window(self):
         text = "The model writes <tool_call> to open one. " + "x" * 4000
         sizes = self._count_peeks(QwenXmlParser, text, DECLARED_TOOLS)
         assert sizes, "the peek never ran"
-        assert max(sizes) <= _PEEK_WINDOW, f"peeked {max(sizes)} characters"
+        assert (
+            max(sizes) <= _PEEK_WINDOW
+        ), f"the announcement was handed {max(sizes)} characters"
 
     def test_it_stops_once_the_window_has_gone_by_without_a_name(self):
-        from atom.entrypoints.openai.tool_parser.tool_parser import _PEEK_WINDOW
-
         text = "The model writes <tool_call> to open one. " + "x" * 4000
         sizes = self._count_peeks(QwenXmlParser, text, DECLARED_TOOLS)
         # One per chunk until the region passes the window, then never again.
@@ -1639,7 +1688,402 @@ class TestThePeekIsBounded:
         )
 
     def test_an_undeclared_name_also_stops_it(self):
+        """A name the request never offered is prose to every format's own
+        truncated-call test, so nothing parses and the window runs out --
+        the same latch, reached one step later than when the peek had its
+        own name check."""
         other = [{"type": "function", "function": {"name": "something_else"}}]
         text = "Sure. " + REAL_CALLS["qwen"].replace("Paris", "x" * 4000)
         sizes = self._count_peeks(QwenXmlParser, text, other)
-        assert len(sizes) <= 40, f"{len(sizes)} peeks after the name was rejected"
+        assert len(sizes) <= _PEEK_WINDOW // 4 + 2, (
+            f"{len(sizes)} peeks over a {len(text)}-character answer; the "
+            "latch is not holding and the cost is quadratic again"
+        )
+
+
+class TestOneReaderPerFormat:
+    """A format may not grow a second way of reading the stream.
+
+    Everything this branch fixed twice over came from the same shape: a
+    format read once by ``parse`` and again by a ``process``/``flush`` state
+    machine of its own, with four rules -- where content ends, whether an
+    unclosed tag is a call, what a region that parses to nothing means, which
+    bytes are framing -- written out in both. The engine owns all four now,
+    and a format that defines any of these names has taken one back.
+    """
+
+    FORBIDDEN = ("parse", "process", "flush", "peek_name")
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_it_defines_no_reader_of_its_own(self, parser):
+        own = [name for name in self.FORBIDDEN if name in vars(parser)]
+        assert not own, f"{parser.NAME} defines {own}; the engine owns those"
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_it_holds_no_per_request_state(self, parser):
+        """Class-side only, so one request cannot leak into the next and one
+        region cannot leak into the one after it."""
+        instance_attrs = [
+            name
+            for name, value in vars(parser).items()
+            if not name.startswith("_")
+            and not isinstance(value, (classmethod, staticmethod, property))
+            and not name.isupper()
+        ]
+        assert not instance_attrs, f"{parser.NAME} carries {instance_attrs}"
+
+
+class TestARegionIsAccountedForByteByByte:
+    """What a region's bytes become, stated as a conservation law.
+
+    `parse_region` reports two offsets, and everything outside them is the
+    answer. Getting either wrong is silent: too small a `begins` leaves markup
+    in the answer, too large swallows a sentence, and a `consumed` that does
+    not advance hands the same region back forever.
+    """
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_a_region_that_is_exactly_one_call_leaves_no_answer(self, parser):
+        """The whole of this format's own call is markup, opener to closer."""
+        call = REAL_CALLS[parser.NAME]
+        content, calls = parse_tool_calls(call, DECLARED_TOOLS, parser)
+        assert len(calls) == 1, f"{parser.NAME} did not parse its own call"
+        assert content == "", f"{parser.NAME} left {content!r} in the answer"
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_the_offsets_bracket_something(self, parser):
+        """`begins < consumed <= len(region)` whenever a call was found.
+
+        The lower bound is what stops the engine looping: it hands
+        `region[consumed:]` back to be read again, so a `consumed` that did
+        not advance would find the same marker and parse it again forever.
+        """
+        region = REAL_CALLS[parser.NAME]
+        parsed = parser.parse_region(region, DECLARED_TOOLS, at_end=True)
+        assert parsed.calls
+        assert 0 <= parsed.begins < parsed.consumed <= len(region), (
+            f"{parser.NAME}: begins={parsed.begins} consumed={parsed.consumed} "
+            f"len={len(region)}"
+        )
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_a_sentence_between_a_quotation_and_a_real_call_survives(self, parser):
+        """A region opens at the *first* marker in the text, which an answer
+        that quotes one before calling for real puts in the wrong place: the
+        sentence in between is inside the region and is not markup.
+
+        This is what `RegionParse.begins` is for. Reported as the first call's
+        own match and widened back over the wrapper enclosing it, so it stops
+        where the prose ends -- and not at the region's start, which would
+        swallow the sentence, nor at the call's match, which would leave the
+        wrapper in the answer.
+        """
+        marker = next(m for m in parser.START_MARKERS if parser.opens_region(m))
+        prefix = f"Explaining: {marker} is how. Now: "
+        text = prefix + REAL_CALLS[parser.NAME] + " done"
+        content, calls = parse_tool_calls(text, DECLARED_TOOLS, parser)
+        assert len(calls) == 1, f"{parser.NAME} did not find the real call"
+        assert content == prefix + " done", f"{parser.NAME}: {content!r}"
+        for size in (1, 5, len(text)):
+            stream = ToolCallStreamParser(tools=DECLARED_TOOLS, parser_cls=parser)
+            events = []
+            for i in range(0, len(text), size):
+                events += stream.process(text[i : i + size])
+            events += stream.flush()
+            streamed = "".join(d for k, d in events if k == "content")
+            assert streamed == content, f"{parser.NAME} at chunk {size}: {streamed!r}"
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_prose_around_a_call_survives_on_both_paths(self, parser):
+        """Before and after, and the same either way it is delivered."""
+        text = "Sure. " + REAL_CALLS[parser.NAME] + "\nAnything else?"
+        content, calls = parse_tool_calls(text, DECLARED_TOOLS, parser)
+        assert len(calls) == 1
+        assert content == "Sure. \nAnything else?", content
+        for size in (1, 3, 17, len(text)):
+            stream = ToolCallStreamParser(tools=DECLARED_TOOLS, parser_cls=parser)
+            events = []
+            for i in range(0, len(text), size):
+                events += stream.process(text[i : i + size])
+            events += stream.flush()
+            streamed = "".join(d for k, d in events if k == "content")
+            assert streamed == content, f"{parser.NAME} at chunk {size}: {streamed!r}"
+
+
+class TestTheDeclarationAboutACallInProgressIsMeasured:
+    """`RECOGNISES_A_CALL_IN_PROGRESS` says a format's `parse_region` can see a
+    call that has not finished arriving. The engine reads it to decide whether
+    a name may go out early.
+
+    It was also read for a second decision -- whether a region producing
+    nothing could be given up on and released as prose -- and that is why the
+    rows below about long calls exist. The give-up is gone: it rests on
+    acceptance being monotone in how many bytes have arrived, and that is
+    false for three of the six formats, so real calls over the probe size were
+    delivered as raw markup with `finish_reason: stop` while `stream=false`
+    returned the call. These rows are what catches it coming back.
+    """
+
+    @staticmethod
+    def _cut_inside_an_argument(parser) -> str:
+        """This format's own call, cut off in the middle of a value.
+
+        "One byte short of complete" is the wrong probe: a Kimi entry cut
+        there is still whole and it is the *section* that is unterminated,
+        while the case the flag is about is a single call whose argument is
+        still arriving.
+        """
+        long_value = "x" * 4000
+        call = REAL_CALLS[parser.NAME].replace("Paris", long_value)
+        return call[: call.index(long_value) + 2000]
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_the_declaration_matches_the_parse(self, parser):
+        partial = self._cut_inside_an_argument(parser)
+        seen = parser.parse_region(partial, DECLARED_TOOLS, at_end=False).calls
+        assert bool(seen) is parser.RECOGNISES_A_CALL_IN_PROGRESS, (
+            f"{parser.NAME} declares {parser.RECOGNISES_A_CALL_IN_PROGRESS} but a "
+            f"call cut off mid-argument parsed to {len(seen)} call(s)"
+        )
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_no_size_at_which_a_call_stops_being_one(self, parser):
+        call = REAL_CALLS[parser.NAME].replace("Paris", "x" * 8192)
+        stream = ToolCallStreamParser(tools=DECLARED_TOOLS, parser_cls=parser)
+        events = []
+        for i in range(0, len(call), 4):
+            events += stream.process(call[i : i + 4])
+        events += stream.flush()
+        args = [d for k, d in events if k == "tool_call_args"]
+        assert len(args) == 1, f"{parser.NAME} lost a {len(call)}-character call"
+        assert "x" * 32 in args[0]["function"]["arguments"]
+        assert (
+            "".join(d for k, d in events if k == "content") == ""
+        ), f"{parser.NAME} delivered part of a call as text"
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_a_long_call_costs_what_it_is_and_not_its_square(self, parser):
+        """The other half of why the give-up came out.
+
+        Giving up re-fed bytes that immediately reopened a region with a fresh
+        budget, and the probe re-ran a failing match over the whole growing
+        region: 1.19 ms to 18.2 s on a 250 KB answer, synchronously inside the
+        request coroutine, stalling every other in-flight request.
+        """
+
+        def ms(payload):
+            text = REAL_CALLS[parser.NAME].replace("Paris", "x" * payload)
+            best = None
+            for _ in range(3):
+                stream = ToolCallStreamParser(tools=DECLARED_TOOLS, parser_cls=parser)
+                start = time.perf_counter()
+                for i in range(0, len(text), 64):
+                    stream.process(text[i : i + 64])
+                stream.flush()
+                took = time.perf_counter() - start
+                best = took if best is None else min(best, took)
+            return best * 1000
+
+        small, large = ms(8 * 1024), ms(64 * 1024)
+        assert large / max(small, 1e-6) < 16, (
+            f"{parser.NAME}: 8x the payload cost {large / small:.1f}x the time "
+            f"({small:.2f} -> {large:.2f} ms)"
+        )
+
+
+class TestAQuotedCallOpenerIsNotTheCallTheModelMade:
+    """A format's call opener written in prose, before a real call.
+
+    The non-greedy body ran from the quoted opener all the way to the real
+    call's closer, so the client got one call named after the placeholder,
+    carrying the real call's arguments, with the explanatory sentence deleted
+    and `finish_reason: tool_calls`. `finditer` then resumed past the real
+    call, so the call the model actually made never went out at all.
+
+    A call's body cannot contain another opener -- that literal is what opens
+    one -- and every format says so now. GLM was given the guard first, for a
+    different shape; this is the sweep, and the row that keeps it swept.
+    """
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_the_placeholder_never_becomes_the_call(self, parser):
+        quoted = CALL_OPENERS[parser.NAME].replace("get_weather", "NAME")
+        text = f"To call it you write {quoted} and then the arguments. Now: "
+        text += REAL_CALLS[parser.NAME]
+        content, calls = parse_tool_calls(text, DECLARED_TOOLS, parser)
+        assert [c.function["name"] for c in calls] == ["get_weather"], (
+            f"{parser.NAME} produced {[c.function['name'] for c in calls]} from an "
+            "answer that quotes an opener before making one real call"
+        )
+        assert "and then the arguments" in content, f"{parser.NAME}: {content!r}"
+        for size in (1, 6, len(text)):
+            stream = ToolCallStreamParser(tools=DECLARED_TOOLS, parser_cls=parser)
+            events = []
+            for i in range(0, len(text), size):
+                events += stream.process(text[i : i + size])
+            events += stream.flush()
+            assert [
+                d["function"]["name"] for k, d in events if k == "tool_call_start"
+            ] == ["get_weather"], f"{parser.NAME} at chunk {size}"
+            assert (
+                "".join(d for k, d in events if k == "content") == content
+            ), f"{parser.NAME} at chunk {size}"
+
+
+class TestAnUnclosedCallDoesNotSwallowTheNextOne:
+    """A call the model forgot to close ends where the next one opens.
+
+    Anchoring the unclosed alternative at end of *stream* meant a call
+    followed by a second call matched neither alternative at the first opener,
+    so the first call was skipped entirely and the client got the second one
+    where the model had made two -- and a different one from the name already
+    announced.
+    """
+
+    CLOSERS: ClassVar[dict[str, str]] = {
+        "qwen": "</function></tool_call>",
+        "glm": "</tool_call>",
+        "dsml": f"</{_D}invoke></{_D}tool_calls>",
+        "minimax": f"{_NS}</invoke>{_NS}</tool_call>",
+        "kimi": "<|tool_calls_section_end|>",
+        "kimi_k3": "<|close|>call",
+    }
+
+    def _unclosed_then_real(self, parser) -> str:
+        first = REAL_CALLS[parser.NAME]
+        closer = self.CLOSERS[parser.NAME]
+        assert first.endswith(
+            closer
+        ), f"{parser.NAME}: corpus does not end on {closer!r}"
+        return first[: -len(closer)] + first
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_the_complete_call_is_never_lost(self, parser):
+        """The invariant every format holds. Whether the *unclosed* one is
+        also recovered is per format -- Qwen, GLM and MiniMax read it, DSML
+        and the two token formats do not, and never did -- but the complete
+        one must always go out, and nothing may be invented.
+        """
+        text = self._unclosed_then_real(parser)
+        _, calls = parse_tool_calls(text, DECLARED_TOOLS, parser)
+        names = [c.function["name"] for c in calls]
+        assert (
+            "get_weather" in names
+        ), f"{parser.NAME} lost the complete call behind an unclosed one: {names}"
+        declared = {t["function"]["name"] for t in DECLARED_TOOLS}
+        assert set(names) <= declared, f"{parser.NAME} invented {set(names) - declared}"
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_and_the_two_delivery_modes_agree_about_how_many(self, parser):
+        """However many that is, it is the same number either way. The
+        anchoring bug made `stream=false` and `stream=true` disagree here."""
+        text = self._unclosed_then_real(parser)
+        _, calls = parse_tool_calls(text, DECLARED_TOOLS, parser)
+        for size in (1, 9, len(text)):
+            stream = ToolCallStreamParser(tools=DECLARED_TOOLS, parser_cls=parser)
+            events = []
+            for i in range(0, len(text), size):
+                events += stream.process(text[i : i + size])
+            events += stream.flush()
+            streamed = [d for k, d in events if k == "tool_call_args"]
+            assert len(streamed) == len(calls), (
+                f"{parser.NAME} at chunk {size}: {len(streamed)} streamed vs "
+                f"{len(calls)} not"
+            )
+
+
+class TestTheEarlyNameCannotDisagreeWithTheParse:
+    """The property the whole announcement design rests on.
+
+    The name is read out of `parse_region` over the region so far; the call
+    that goes out is `parse_region` over the whole region. They agree iff
+    acceptance is *monotone* in how many bytes have arrived -- if a prefix
+    yields a first call named N, so does every longer prefix, and so does the
+    finished region.
+
+    Asserted by fuzzing rather than by argument, because the argument has been
+    wrong before: a probe added last round rested on the same claim and it is
+    false for three formats when the question is asked at `at_end=False` on a
+    *region* rather than a prefix.
+    """
+
+    SHAPES: ClassVar[list[str]] = [
+        "{call}",
+        PROSE + "{call}",
+        "{call}" + PROSE,
+        "{call}{call}",
+        PROSE + "{half}" + PROSE + "{call}",
+        "{half}{call}",
+    ]
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_no_prefix_of_a_head_ever_names_a_different_tool(self, parser):
+        call = REAL_CALLS[parser.NAME]
+        texts = [
+            shape.format(call=call, half=call[: len(call) // 2])
+            for shape in self.SHAPES
+        ]
+        texts.append(call.replace("Paris", "x" * 300))
+        texts.append(call.replace("get_weather", "undeclared_tool"))
+        for text in texts:
+            head = text[:_PEEK_WINDOW]
+            first = None
+            for n in range(1, len(head) + 1):
+                calls = parser.parse_region(
+                    head[:n], DECLARED_TOOLS, at_end=False
+                ).calls
+                if not calls:
+                    continue
+                name = calls[0].function["name"]
+                if first is None:
+                    first = (n, name)
+                else:
+                    assert name == first[1], (
+                        f"{parser.NAME}: {head[:first[0]]!r} names {first[1]!r} but "
+                        f"{head[:n]!r} names {name!r}"
+                    )
+            if first is None:
+                continue
+            whole = parser.parse_region(text, DECLARED_TOOLS, at_end=True).calls
+            if whole:
+                assert whole[0].function["name"] == first[1], (
+                    f"{parser.NAME}: announced {first[1]!r}, parsed "
+                    f"{whole[0].function['name']!r} from {text[:80]!r}"
+                )
+
+    def test_and_a_format_that_breaks_it_leaves_no_index_behind(self):
+        """The recovery, driven by a format built to break the property.
+
+        A name that goes out and never gets arguments has still used its
+        index. A later real call landing on the same one is merged into it by
+        any accumulator that keys on index -- the OpenAI streaming contract --
+        so the client ends up with a single call whose name is two names glued
+        together and which no tool answers to.
+        """
+
+        class Fickle(QwenXmlParser):
+            NAME = "fickle"
+
+            @classmethod
+            def parse_region(cls, region, tools, *, at_end):
+                if not at_end and "<parameter=" in region:
+                    call = ToolCall(
+                        id="fickle",
+                        type="function",
+                        function={"name": "get_weather", "arguments": "{}"},
+                    )
+                    return RegionParse((call,), 0, len(region))
+                return RegionParse()
+
+        text = "<tool_call><function=get_weather><parameter=city>Paris"
+        stream = ToolCallStreamParser(tools=DECLARED_TOOLS, parser_cls=Fickle)
+        events = []
+        for i in range(0, len(text), 4):
+            events += stream.process(text[i : i + 4])
+        events += stream.flush()
+        announced = [d["index"] for k, d in events if k == "tool_call_start"]
+        assert announced, "the announcement is the premise of this test"
+        assert stream._index > announced[-1], (
+            "the index of a name that produced no call was not stepped past; a "
+            "later call would land on it"
+        )

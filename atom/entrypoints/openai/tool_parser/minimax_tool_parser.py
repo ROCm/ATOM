@@ -22,19 +22,45 @@ import re
 from typing import Any, ClassVar
 
 from .schema import build_param_types, coerce_json_or_raw
-from .tool_parser import BufferedMarkerParser, ToolCall, unique_tool_call_id
+from .tool_parser import RegionParse, ToolCall, ToolCallParser, unique_tool_call_id
 
 MINIMAX_NS = "]<]minimax[>["
 
+# The ns_token is matched optionally wherever a tag can appear, as DSML does
+# with its own marker, rather than deleted from a copy of the text first.
+# Deleting it made every offset in the parsed copy meaningless against the
+# bytes that actually arrived, which is why `parse` could only ever report
+# "content precedes the call" and never "and this follows it".
+_NS = r"(?:" + re.escape(MINIMAX_NS) + r")?"
+
+# A call's body may not contain another opener -- that literal is what opens
+# one. Without the guard the non-greedy body ran from a *quoted* opener in
+# prose all the way to the real call's closer, so an answer explaining
+# "you write <invoke name="NAME">" before making a real call produced one call named after the
+# placeholder, carrying the real call's arguments, with the sentence deleted.
+# `finditer` then resumed past the real call, so the call the model actually
+# made never went out. GLM was given this guard first; this is the sweep.
+_NOT_NESTED = r"(?:(?!" + _NS + r"<invoke\s).)"
 _INVOKE_RE = re.compile(
-    r'<invoke\s+name="(.*?)"\s*>(.*?)</invoke>|<invoke\s+name="(.*?)"\s*>(.*)$',
+    _NS
+    + r'<invoke\s+name="([^"]*)"\s*>('
+    + _NOT_NESTED
+    + r"*?)"
+    + _NS
+    + r"</invoke>|"
+    + _NS
+    + r'<invoke\s+name="([^"]*)"\s*>('
+    + _NOT_NESTED
+    + r"*)",
     re.DOTALL,
 )
-_PARAM_RE = re.compile(r"<([\w-]+)>(.*?)</\1>", re.DOTALL)
-_FIRST_TAG_RE = re.compile(r"^<([\w-]+)>")
+_PARAM_RE = re.compile(_NS + r"<([\w-]+)>(.*?)" + _NS + r"</\1>", re.DOTALL)
+_FIRST_TAG_RE = re.compile(r"^" + _NS + r"<([\w-]+)>")
 
 
-def _is_truncated_call(name: str, body: str, param_types: dict) -> bool:
+def _is_truncated_call(
+    name: str, body: str, param_types: dict, *, at_end: bool
+) -> bool:
     """Is this unclosed `<invoke name=...>` a cut-off call, or prose?
 
     See :func:`QwenXmlParser._is_truncated_call`. The sweep that added that
@@ -53,22 +79,14 @@ def _is_truncated_call(name: str, body: str, param_types: dict) -> bool:
         return False
     rest = body.lstrip()
     if not rest:
-        return True
+        return at_end
     tag = _FIRST_TAG_RE.match(rest)
     return bool(tag) and (not types or tag.group(1) in types)
 
 
-# Name plus whatever follows it; `_is_truncated_call` judges that part, so
-# the rule lives in one place. Not DSML's `<...parameter`, which this was
-# copied from: MiniMax names a parameter by the tag itself, so the DSML
-# spelling matched no call that took arguments -- the feature was dead for
-# every real call, and `search` then slid forward to announce the name of
-# some *later* zero-argument one.
-_PEEK_NAME_RE = re.compile(r'<invoke\s+name="([^"]+)"\s*>(.*)', re.DOTALL)
-
-
-class MiniMaxParser(BufferedMarkerParser):
+class MiniMaxParser(ToolCallParser):
     NAME: ClassVar[str] = "minimax"
+    RECOGNISES_A_CALL_IN_PROGRESS: ClassVar[bool] = True
     # `<invoke name="` too: `_INVOKE_RE` matches it anywhere, so an invoke the
     # model wrote without the ns_token was a call when parsed whole and plain
     # text when streamed -- the read-ahead never opened a region for it. DSML
@@ -78,25 +96,19 @@ class MiniMaxParser(BufferedMarkerParser):
         "<tool_call>",
         '<invoke name="',
     )
+    CALL_OPENERS: ClassVar[tuple[str, ...]] = ("<tool_call>",)
+    CALL_CLOSERS: ClassVar[tuple[str, ...]] = ("</tool_call>",)
+    CALL_FILLERS: ClassVar[tuple[str, ...]] = (MINIMAX_NS,)
 
-    @classmethod
-    def peek_name(cls, region: str, tools: list | None = None) -> str | None:
-        """`<invoke name="NAME">`, ns_token stripped first as `parse` does.
-
-        Judged by the same `_is_truncated_call` the unclosed branch of `parse`
-        uses -- including its schema lookup, which is why this takes `tools`:
-        a parameter here is named by its own tag, so `<city>` and `<br>` are
-        the same shape and only the request can tell them apart.
-        """
-        m = _PEEK_NAME_RE.search(region.replace(MINIMAX_NS, ""))
-        if m is None:
-            return None
-        name, rest = m.group(1).strip(), m.group(2)
-        if not rest.lstrip():
-            return None  # nothing has followed yet; not "cut off", just early
-        return (
-            name if _is_truncated_call(name, rest, build_param_types(tools)) else None
-        )
+    # The ns_token opens a region like the other two, rather than being
+    # framing the reader drops. It prefixes every tag including ones inside a
+    # call, so calling it framing would delete it from an answer that merely
+    # *mentions* it while an answer that mentions the tag it prefixes keeps
+    # both -- the same token surviving or not depending on what followed it.
+    # `parse` had exactly that split (every occurrence deleted from a copy of
+    # the text when a call was found, all of them left when one was not); a
+    # region that parses to nothing is released whole, so this way both
+    # answers keep their bytes.
 
     @classmethod
     def detect(cls, text: str) -> bool:
@@ -104,29 +116,22 @@ class MiniMaxParser(BufferedMarkerParser):
         return MINIMAX_NS in text
 
     @classmethod
-    def parse(cls, text: str, tools: list | None) -> tuple[str, list[ToolCall]]:
-        """Parse MiniMax-M3 tool calls; return (leading_content, tool_calls)."""
+    def parse_region(
+        cls, region: str, tools: list | None, *, at_end: bool
+    ) -> RegionParse:
         param_types = build_param_types(tools)
-        clean = text.replace(MINIMAX_NS, "")
-        # Content is what precedes the *call*, and the call may open with
-        # either token. Cutting only at `<tool_call>` -- which this format's
-        # primary ns_token shape does not contain -- left `content` holding
-        # the entire `<invoke>` markup alongside the parsed call, so the user
-        # was shown the raw XML while the streaming path showed nothing.
-        starts = [
-            i for i in (clean.find("<tool_call>"), clean.find("<invoke")) if i != -1
-        ]
-        cut = min(starts) if starts else -1
-        content = clean[:cut] if cut != -1 else clean
         tool_calls: list[ToolCall] = []
-        for m in _INVOKE_RE.finditer(clean):
+        begin = end = 0
+        for m in _INVOKE_RE.finditer(region):
             closed = m.group(1) is not None
             name = m.group(1) if closed else m.group(3)
             body = m.group(2) if closed else (m.group(4) or "")
             if not name:
                 continue
             name = name.strip()
-            if not closed and not _is_truncated_call(name, body, param_types):
+            if not closed and not _is_truncated_call(
+                name, body, param_types, at_end=at_end
+            ):
                 continue
             types = param_types.get(name, {})
             args: dict[str, Any] = {}
@@ -134,6 +139,8 @@ class MiniMaxParser(BufferedMarkerParser):
                 k = pm.group(1).strip()
                 if k:
                     args[k] = coerce_json_or_raw(pm.group(2), types.get(k))
+            if not tool_calls:
+                begin = cls.markup_begin(region, m.start())
             tool_calls.append(
                 ToolCall(
                     id=unique_tool_call_id(),
@@ -144,11 +151,5 @@ class MiniMaxParser(BufferedMarkerParser):
                     },
                 )
             )
-        for mk in ("<tool_call>", "</tool_call>"):
-            content = content.replace(mk, "")
-        # No call -> verbatim; see ToolCallParser.parse. `text` and not
-        # `clean`: the ns_token is a start marker, so an answer that merely
-        # mentions it opens a region that parses to nothing, and the streaming
-        # path then releases that region unchanged -- measured, ns_token and
-        # all. Returning `clean` here would delete it on one path only.
-        return (content.strip() if tool_calls else text), tool_calls
+            end = cls.markup_end(region, m.end())
+        return RegionParse(tuple(tool_calls), begin, end)

@@ -77,7 +77,7 @@ def _load_encoder_from_dir(model_path: str) -> MessageEncoderAdapter | None:
         return raw(messages, **kwargs)
 
     logger.info(f"Loaded message encoder from {enc_path}")
-    return build_message_encoder_adapter(module_name, encode, enc_path)
+    return build_message_encoder_adapter(module_name, encode, enc_path, raw)
 
 
 def load_custom_message_encoder(model_path: str) -> MessageEncoderAdapter | None:

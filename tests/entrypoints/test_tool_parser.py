@@ -19,6 +19,18 @@ from atom.entrypoints.openai.tool_parser.kimi_tool_parser import KimiParser
 from atom.entrypoints.openai.tool_parser.minimax_tool_parser import MiniMaxParser
 from atom.entrypoints.openai.tool_parser.qwen3_tool_parser import QwenXmlParser
 
+
+def early_name(parser, region: str, tools=None) -> str | None:
+    """The name the engine would announce for `region`.
+
+    There is no separate peek to ask: the announcement is the first call of
+    `parse_region` over the bytes so far, with `at_end=False`. Naming that
+    here rather than in each test keeps these tests about the formats.
+    """
+    calls = parser.parse_region(region, tools, at_end=False).calls
+    return calls[0].function["name"] if calls else None
+
+
 # ============================================================================
 # parse_tool_calls() Tests
 # ============================================================================
@@ -239,7 +251,7 @@ class TestAParserOnItsOwnDoesNotEatText:
     """
 
     def test_kimi_releases_a_partial_marker_it_was_still_holding(self):
-        p = KimiParser()
+        p = ToolCallStreamParser(parser_cls=KimiParser)
         out = p.process("hello <|tool")
         out += p.flush()
         assert "".join(d for k, d in out if k == "content") == "hello <|tool"
@@ -247,7 +259,7 @@ class TestAParserOnItsOwnDoesNotEatText:
     def test_kimi_releases_a_section_that_held_no_call(self):
         """A start marker is not a promise, for this format either."""
         text = "see <|tool_calls_section_begin|> and nothing else"
-        p = KimiParser()
+        p = ToolCallStreamParser(parser_cls=KimiParser)
         out = p.process(text)
         out += p.flush()
         delivered = "".join(d for k, d in out if k == "content")
@@ -256,7 +268,7 @@ class TestAParserOnItsOwnDoesNotEatText:
 
     def test_kimi_k3_keeps_prose_after_a_tools_token_it_did_not_use(self):
         text = "the token <|open|>tools<|sep|> opens a section. Nothing follows."
-        content, calls = KimiK3Parser.parse(text, None)
+        content, calls = parse_tool_calls(text, None, KimiK3Parser)
         assert calls == []
         assert "Nothing follows." in content
 
@@ -277,7 +289,7 @@ class TestOnlyAnIdentifierIsAToolName:
             f"<tool_call>{name}"
             "<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>"
         )
-        return GlmParser.parse(text, None)[1]
+        return parse_tool_calls(text, None, GlmParser)[1]
 
     @pytest.mark.parametrize(
         "name",
@@ -306,10 +318,21 @@ class TestOnlyAnIdentifierIsAToolName:
         assert self._call(name) == []
 
 
-class TestATruncatedCallIsNotContent:
-    """A call cut off by `max_tokens` parses to nothing, and "nothing parsed"
-    was the test for whether a section had opened -- so the half-written
-    payload was kept and shipped as the answer.
+class TestATruncatedCallIsDeliveredRatherThanDeleted:
+    """A call cut off by `max_tokens` parses to nothing, and a region that
+    parses to nothing is released unchanged -- for this format as for every
+    other, which is the change.
+
+    K3 used to cut the answer at the tools marker instead, on a second opener
+    regex that accepted shapes the call regex rejects, and the two ways of
+    getting that wrong were opposite: an answer *quoting* an opener lost 62
+    characters, and a truncated call kept its half-written payload with the
+    dangling `<|close|>argument` still in it. Both are now the same rule.
+
+    Kimi already behaved this way (a section with no complete entry comes back
+    whole), so this is the two token formats agreeing rather than a new
+    policy. The four XML-ish formats do not reach it: they salvage a truncated
+    call into a real one, so there is no half-written markup to show.
     """
 
     TRUNCATED = (
@@ -318,15 +341,15 @@ class TestATruncatedCallIsNotContent:
         '<|open|>argument key="city"<|sep|>Paris<|close|>argument'
     )
 
-    def test_the_partial_payload_does_not_reach_the_client(self):
-        content, calls = KimiK3Parser.parse(self.TRUNCATED, None)
+    def test_the_partial_payload_is_delivered_not_dropped(self):
+        content, calls = parse_tool_calls(self.TRUNCATED, None, KimiK3Parser)
         assert calls == []
-        assert content == "I will look it up."
+        assert content == self.TRUNCATED, "bytes were deleted with no event"
 
     def test_an_answer_that_only_names_the_token_still_keeps_its_tail(self):
         """The case the gate was added for, which must keep working."""
         text = "the token <|open|>tools<|sep|> opens a section. Nothing follows."
-        content, calls = KimiK3Parser.parse(text, None)
+        content, calls = parse_tool_calls(text, None, KimiK3Parser)
         assert calls == [] and "Nothing follows." in content
 
     def test_a_complete_call_still_truncates_there(self):
@@ -336,7 +359,7 @@ class TestATruncatedCallIsNotContent:
             '<|open|>argument key="city"<|sep|>Paris<|close|>argument'
             "<|close|>call"
         )
-        content, calls = KimiK3Parser.parse(text, None)
+        content, calls = parse_tool_calls(text, None, KimiK3Parser)
         assert [c.function["name"] for c in calls] == ["get_weather"]
         assert content == "Looking._"
 
@@ -372,13 +395,14 @@ class TestTheAnnouncedNameIsTheOneThatParses:
         names = [d["function"]["name"] for k, d in events if k == "tool_call_start"]
         assert names == ["alpha", "beta"]
 
-    def test_the_peek_reads_a_zero_argument_call(self):
-        assert GlmParser.peek_name("<tool_call>alpha</tool_call>") == "alpha"
+    def test_the_early_name_reads_a_zero_argument_call(self):
+        assert early_name(GlmParser, "<tool_call>alpha</tool_call>") == "alpha"
 
-    def test_the_peek_reads_the_first_of_two(self):
+    def test_the_early_name_reads_the_first_of_two(self):
         assert (
-            GlmParser.peek_name(
-                "<tool_call>alpha</tool_call><tool_call>beta<arg_key>c</arg_key>"
+            early_name(
+                GlmParser,
+                "<tool_call>alpha</tool_call><tool_call>beta<arg_key>c</arg_key>",
             )
             == "alpha"
         )
@@ -443,7 +467,7 @@ class TestProseIsNotATruncatedCall:
         ids=["qwen", "glm", "qwen-outer-closer", "dsml", "minimax"],
     )
     def test_prose_naming_a_declared_tool_is_not_a_call(self, parser, text):
-        content, calls = parser.parse(text, self.TOOLS)
+        content, calls = parse_tool_calls(text, self.TOOLS, parser)
         assert calls == [], f"fabricated {[c.function['name'] for c in calls]}"
         assert content == text, "the answer was truncated at the quoted tag"
 
@@ -491,12 +515,12 @@ class TestProseIsNotATruncatedCall:
         ],
     )
     def test_a_genuinely_truncated_call_still_parses(self, parser, text):
-        _, calls = parser.parse(text, self.TOOLS)
+        _, calls = parse_tool_calls(text, self.TOOLS, parser)
         assert [c.function["name"] for c in calls] == ["get_weather"]
 
     def test_an_undeclared_name_is_never_salvaged(self):
         text = "Sure. <tool_call><function=made_up><parameter=x>1"
-        content, calls = QwenXmlParser.parse(text, self.TOOLS)
+        content, calls = parse_tool_calls(text, self.TOOLS, QwenXmlParser)
         assert calls == [] and content == text
 
 
@@ -621,17 +645,17 @@ class TestTheNameTheModelWroteWins:
             f'<{self.D}parameter name="city">Paris</{self.D}parameter>'
             f'<{self.D}parameter name="tz">UTC</{self.D}parameter>'
         )
-        _, calls = DsmlParser.parse(text, self.TOOLS)
+        _, calls = parse_tool_calls(text, self.TOOLS, DsmlParser)
         assert [c.function["name"] for c in calls] == ["get_weather"]
 
-    def test_the_peek_and_the_parse_agree_on_it(self):
+    def test_the_early_name_and_the_parse_agree_on_it(self):
         text = (
             f'<invoke name="get_weather">'
             f'<{self.D}parameter name="city">Paris</{self.D}parameter>'
             f'<{self.D}parameter name="tz">UTC</{self.D}parameter>'
         )
-        _, calls = DsmlParser.parse(text, self.TOOLS)
-        assert DsmlParser.peek_name(text) == calls[0].function["name"]
+        _, calls = parse_tool_calls(text, self.TOOLS, DsmlParser)
+        assert early_name(DsmlParser, text, self.TOOLS) == calls[0].function["name"]
 
     def test_the_wrapper_less_malform_still_infers(self):
         """The shape the inference was written for, unchanged."""
@@ -640,7 +664,7 @@ class TestTheNameTheModelWroteWins:
             f'<{self.D}parameter name="tz">UTC</{self.D}parameter>'
             f'<{self.D}parameter name="city">Paris</{self.D}parameter>'
         )
-        _, calls = DsmlParser.parse(text, self.TOOLS)
+        _, calls = parse_tool_calls(text, self.TOOLS, DsmlParser)
         assert [c.function["name"] for c in calls] == ["get_time"]
 
 
@@ -683,28 +707,38 @@ class TestKimiK3KeepsAQuotedOpener:
         delivered, _ = self._stream(self.QUOTED, 5)
         assert delivered == parse_tool_calls(self.QUOTED, parser_cls=KimiK3Parser)[0]
 
-    def test_a_real_truncated_call_is_still_cut_there(self):
-        """The branch this shares with the quotation, and must keep."""
-        content, _ = KimiK3Parser.parse(self.TRUNCATED, None)
-        assert "Par" not in content and "argument" not in content
+    def test_a_real_truncated_call_is_delivered_whole(self):
+        """The branch this shares with the quotation: no call parsed, so the
+        bytes are released rather than cut away. See
+        `TestATruncatedCallIsDeliveredRatherThanDeleted` for why that is now
+        the same answer for both shapes."""
+        content, calls = parse_tool_calls(self.TRUNCATED, None, KimiK3Parser)
+        assert calls == []
+        assert content == self.TRUNCATED
 
-    def test_no_dangling_name_is_left_behind(self):
-        """`flush` never cleared the announcement, so the next call's parse
-        was compared against a name from a region that produced none.
+    def test_a_region_that_produced_nothing_leaves_no_announcement_behind(self):
+        """An announcement is per region. Carried past the region it was made
+        in, it was matched against the *next* region's parse and reported as
+        a mismatch.
 
-        Driven with TRUNCATED and not QUOTED: this format never salvages a
-        cut-off call into a ToolCall, so that is the one shape where the peek
-        legitimately fires and the parse yields nothing -- which is exactly
-        the state `flush` has to clean up. Against QUOTED the peek no longer
-        fires at all, so the assertion held for the wrong reason.
+        Driven through the engine, which is where the announcement lives now,
+        and with a shape where the region genuinely produces no call: this
+        format cannot salvage a cut-off one.
         """
-        parser = KimiK3Parser(
-            tools=[{"type": "function", "function": {"name": "get_weather"}}]
-        )
-        events = parser.process(self.TRUNCATED)
-        assert any(
-            k == "tool_call_start" for k, _ in events
-        ), "the announcement is the premise of this test"
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                },
+            }
+        ]
+        parser = ToolCallStreamParser(tools=tools, parser_cls=KimiK3Parser)
+        parser.process(self.TRUNCATED)
         parser.flush()
         assert parser._announced is None
 
@@ -751,27 +785,39 @@ class TestAFollowerHasToHaveArrived:
 
     def test_a_call_cut_off_inside_its_own_token_still_parses(self):
         """The other half: `parse` must keep accepting a partial follower."""
-        _, calls = QwenXmlParser.parse(
-            "<tool_call><function=get_weather><par", self.TOOLS
+        _, calls = parse_tool_calls(
+            "<tool_call><function=get_weather><par", self.TOOLS, QwenXmlParser
         )
         assert [c.function["name"] for c in calls] == ["get_weather"]
 
 
-class TestGlmPeeksAtItsOwnFirstCall:
-    """`parse` reads the unclosed case from the *first* `<tool_call>`.
+class TestGlmReadsPastAnOpenerThatCarriesNoCall:
+    """A `<tool_call>` with nothing usable behind it is not the end of the region.
 
-    So when that one carries no usable name it produces nothing at all, while
-    a `search` in the peek slid forward to a later opener and announced its
-    name -- at every chunk size, no boundary needed. The peek is anchored to
-    the same opener `parse` starts from.
+    The body of a call cannot contain another `<tool_call>` -- that tag is
+    what opens one. Matching non-greedily from the *first* opener to the first
+    close ignored that: the region below produced a "name" of everything up to
+    the second opener, which is not an identifier, and `finditer` then resumed
+    past the real call and found nothing at all. An answer that quotes the tag
+    and then calls for real is the same shape.
+
+    The early name reads the same enumeration, so whatever the parse finds
+    here is what gets announced -- which is the property, rather than any
+    particular answer to "how many calls are in this string".
     """
 
     TOOLS: ClassVar[list] = [{"type": "function", "function": {"name": "get_weather"}}]
     UNUSABLE_FIRST = "<tool_call><arg_key><tool_call>get_weather<arg_key>"
 
-    def test_it_does_not_name_a_call_the_parse_cannot_find(self):
-        assert GlmParser.peek_name(self.UNUSABLE_FIRST, self.TOOLS) is None
-        assert GlmParser.parse(self.UNUSABLE_FIRST, self.TOOLS)[1] == []
+    def test_the_call_behind_the_unusable_opener_is_found(self):
+        _, calls = parse_tool_calls(self.UNUSABLE_FIRST, self.TOOLS, GlmParser)
+        assert [c.function["name"] for c in calls] == ["get_weather"]
+
+    def test_and_the_early_name_is_that_same_call(self):
+        _, calls = parse_tool_calls(self.UNUSABLE_FIRST, self.TOOLS, GlmParser)
+        assert early_name(GlmParser, self.UNUSABLE_FIRST, self.TOOLS) == (
+            calls[0].function["name"] if calls else None
+        )
 
     @pytest.mark.parametrize(
         "text",
@@ -786,7 +832,7 @@ class TestGlmPeeksAtItsOwnFirstCall:
         ids=["with-args", "zero-arg", "cut-mid-arg"],
     )
     def test_a_real_first_call_is_still_named(self, text):
-        assert GlmParser.peek_name(text, self.TOOLS) == "get_weather"
+        assert early_name(GlmParser, text, self.TOOLS) == "get_weather"
 
 
 class TestBothPathsAgreeOnWhatFollowsACall:
@@ -813,7 +859,10 @@ class TestBothPathsAgreeOnWhatFollowsACall:
         """`parse` truncated at the section; the streaming path stopped doing
         so when its terminal state went, leaving the two disagreeing."""
         text = self.SECTION + "tail text"
-        assert self._stream(text, size) == KimiParser.parse(text, self.TOOLS)[0]
+        assert (
+            self._stream(text, size)
+            == parse_tool_calls(text, self.TOOLS, KimiParser)[0]
+        )
         assert "tail text" in self._stream(text, size)
 
     @pytest.mark.parametrize("size", [1, 5, 999])
@@ -821,7 +870,11 @@ class TestBothPathsAgreeOnWhatFollowsACall:
         """`elif self.buf` skipped the recovery when nothing followed the
         marker, so all 29 characters of it went missing."""
         text = "hello <|tool_calls_section_begin|>"
-        assert self._stream(text, size) == KimiParser.parse(text, self.TOOLS)[0] == text
+        assert (
+            self._stream(text, size)
+            == parse_tool_calls(text, self.TOOLS, KimiParser)[0]
+            == text
+        )
 
 
 class TestMiniMaxCutsAtItsOwnCall:
@@ -861,7 +914,7 @@ class TestMiniMaxCutsAtItsOwnCall:
 
     def test_the_ns_token_call_leaves_no_markup_in_content(self):
         text = f'{self.NS}<invoke name="get_weather"><city>Paris</city></invoke>'
-        content, calls = MiniMaxParser.parse(text, self.TOOLS)
+        content, calls = parse_tool_calls(text, self.TOOLS, MiniMaxParser)
         assert [c.function["name"] for c in calls] == ["get_weather"]
         assert "<invoke" not in content, f"raw markup shown to the user: {content!r}"
         assert content == self._stream(text)[0]
@@ -869,6 +922,6 @@ class TestMiniMaxCutsAtItsOwnCall:
     @pytest.mark.parametrize("size", [1, 5, 999])
     def test_a_bare_invoke_is_a_call_on_both_paths(self, size):
         text = 'hi <invoke name="get_weather"> <city>Paris</city> bye'
-        _, calls = MiniMaxParser.parse(text, self.TOOLS)
+        _, calls = parse_tool_calls(text, self.TOOLS, MiniMaxParser)
         _, streamed = self._stream(text, size)
         assert bool(calls) == bool(streamed) is True

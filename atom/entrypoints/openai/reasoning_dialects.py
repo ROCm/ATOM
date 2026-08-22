@@ -78,6 +78,11 @@ class ReasoningDialect:
     think_end_marker: str
     split: Callable[[str, bool], SplitResult | None]
     template_efforts: frozenset[str] = frozenset()
+    # The literals whose presence in a *chat template* says the model speaks
+    # this dialect. Read once at startup, exactly as the tool-call format is:
+    # a template states what it taught the model, while an output only
+    # exhibits whatever it happens to contain.
+    template_markers: tuple[str, ...] = ()
     # Every marker that ends the reasoning channel, `think_end_marker`
     # included. A channel format can leave the think channel by *opening*
     # another one, and the streaming filter knew only the explicit close: a
@@ -91,23 +96,12 @@ class ReasoningDialect:
     def end_markers(self) -> tuple[str, ...]:
         return (self.think_end_marker, *self.extra_end_markers)
 
+    def taught_by(self, template_source: str) -> bool:
+        """Does this template teach the model this dialect?"""
+        return any(m in template_source for m in self.template_markers)
+
 
 # --- Structured-channel dialect ---
-
-
-def _strip_channel_response_markers(text: str) -> str:
-    # Preserve tool-call sections: they follow <|close|>response<|sep|> (an
-    # empty response channel), so truncating at CHANNEL_RESPONSE_END would drop
-    # the whole tools block. Leave it intact for parse_tool_calls to handle.
-    if CHANNEL_TOOLS_START in text or CHANNEL_CALL_PREFIX in text:
-        return text
-
-    text = text.removeprefix(CHANNEL_RESPONSE_START)
-
-    for marker in (CHANNEL_RESPONSE_END, CHANNEL_MESSAGE_END, CHANNEL_END_OF_MSG):
-        if marker in text:
-            text = text.partition(marker)[0]
-    return text
 
 
 _CHANNEL_END_MARKERS = (CHANNEL_THINK_END, CHANNEL_RESPONSE_START)
@@ -122,6 +116,16 @@ def _split_channel(text: str, starts_thinking: bool = False) -> SplitResult | No
     byte between the two markers was enough to reach it, and the chain of
     thought then appeared in neither field. Silent data loss, not a
     divergence.
+
+    The content comes back with its channel framing still on it, and that is
+    deliberate: removing a tool-format's literals is the tool parser's job and
+    it does it on both delivery paths, from one declared list. Doing it here
+    too meant the reasoning stage removed them when the response was not
+    streamed and left them when it was -- the streaming filter has no such
+    step -- so the two paths only agreed by way of a *third* stage, and only
+    when a K3 parser had been resolved. This one also truncated at
+    `<|end_of_msg|>` rather than removing it, so anything after that token was
+    deleted on one path alone.
 
     Gated on `starts_thinking`, which the two other branches were not: these
     markers only mean anything if a reasoning channel was actually opened.
@@ -144,7 +148,7 @@ def _split_channel(text: str, starts_thinking: bool = False) -> SplitResult | No
         return None
     reasoning = text[:best_at]
     content = text[best_at + len(best) :]
-    return (reasoning or None, _strip_channel_response_markers(content))
+    return (reasoning or None, content)
 
 
 # --- Generic <think>...</think> dialect (K2/DeepSeek/Qwen3/MiniMax/...) ---
@@ -233,6 +237,7 @@ DIALECTS: tuple[ReasoningDialect, ...] = (
         extra_end_markers=(CHANNEL_RESPONSE_START,),
         split=_split_channel,
         template_efforts=frozenset({"low", "high", "max"}),  # Kimi-K3
+        template_markers=(CHANNEL_THINK_START, CHANNEL_THINK_END),
     ),
     # Generic <think>...</think> (K2/DeepSeek/Qwen3/MiniMax/...)
     ReasoningDialect(
@@ -240,5 +245,50 @@ DIALECTS: tuple[ReasoningDialect, ...] = (
         output_open_marker=THINK_OPEN_MARKER,
         think_end_marker=THINK_END_MARKER,
         split=_split_think_tag,
+        template_markers=(THINK_OPEN_MARKER, THINK_END_MARKER),
     ),
 )
+
+# The dialect a model speaks when its template names none of them. The
+# inline-`<think>` one, and not "no dialect at all": a template that renders
+# the tag conditionally may not carry it in the source we can read, and the
+# cost of guessing wrong here is nil -- a model that never writes `<think>`
+# never matches its markers, so the split is a no-op. Guessing the other way
+# would ship a chain of thought to the client as the answer.
+FALLBACK_DIALECT = DIALECTS[-1]
+
+
+def resolve_dialect(
+    template_source: str, rendered_prompt: str = ""
+) -> tuple[ReasoningDialect, bool]:
+    """Which reasoning dialect this model speaks, and whether it was stated.
+
+    Asked once, at startup -- the same question, in the same place and by the
+    same means, as the tool-call format. It used to be asked twice per response
+    and differently each time: the non-streaming split tried every dialect in
+    order and took the first that matched, while the streaming filter used the
+    *union* of every dialect's end markers and closed on whichever came first.
+    So a `<think>` model answering a question about Kimi's wire format ended
+    its chain of thought at the quoted `<|open|>response<|sep|>` when streamed
+    and at the real `</think>` when not.
+
+    Both kinds of evidence, and the *render* first, because the source is not
+    always readable. Kimi-K3 ships neither a Jinja template nor an encoder
+    under the path the loader looks in, so `chat_template_source` returns ""
+    for it -- and falling back to the inline-`<think>` dialect on that made a
+    K3 answer come back as `reasoning_content` with `content` empty, on both
+    delivery modes, while the tool-call format resolved correctly off the
+    rendered probe. Same model, two answers to "what does this model speak",
+    from two different pieces of evidence. Now it is one function reading
+    both.
+
+    The second return value is whether a dialect was actually named, so the
+    caller can say at startup which one it is and whether it was a fallback.
+    """
+    for evidence in (rendered_prompt, template_source):
+        if not evidence:
+            continue
+        for dialect in DIALECTS:
+            if dialect.taught_by(evidence):
+                return dialect, True
+    return FALLBACK_DIALECT, False

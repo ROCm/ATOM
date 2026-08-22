@@ -23,6 +23,7 @@ from atom.entrypoints.openai.chat_encoders import (
     apply_chat_template,
     chat_template_source,
     load_custom_message_encoder,
+    render_probe_prompt,
 )
 from atom.entrypoints.openai.protocol import (
     CHAT_COMPLETION_CHUNK_OBJECT,
@@ -35,12 +36,15 @@ from atom.entrypoints.openai.protocol import (
     CompletionRequest,
 )
 from atom.entrypoints.openai.reasoning import (
-    ReasoningFilter,
+    NO_REASONING,
+    ReasoningChannel,
     prompt_starts_in_reasoning,
     template_opens_reasoning_implicitly,
 )
+from atom.entrypoints.openai.reasoning_dialects import resolve_dialect
 from atom.entrypoints.openai.serving_chat import (
     _normalize_finish_reason,
+    finish_reason_with_calls,
     build_chat_response,
     build_chat_response_multi,
     create_chat_chunk,
@@ -53,7 +57,7 @@ from atom.entrypoints.openai.serving_completion import (
 from atom.entrypoints.openai.sse import data_frame
 from atom.entrypoints.openai.tool_parser import ToolCallStreamParser
 from atom.entrypoints.openai.tool_parser.registry import (
-    parser_for_tool_choice,
+    forbids_tool_calls,
     resolve_tool_call_parser,
 )
 from atom.model_engine.sequence import new_token_ids
@@ -95,6 +99,21 @@ class AtomEngineService:
             set()
         )
         self._active_futures_lock = threading.Lock()
+        # The engine sequences behind each open stream, so closing one can
+        # stop it. Nothing here used to: `close_*_stream` popped the Python
+        # state and the sequence kept decoding to `max_tokens` on the GPU,
+        # putting into a queue no one would ever read again and holding its
+        # KV blocks for the life of the process. The OpenAI server does this
+        # from a generator's `finally`; this service is polled, so it has to
+        # be done where the caller says it is done.
+        self._stream_seqs: dict[str, list[Any]] = {}
+        # Streams closed before the worker thread got round to submitting
+        # them. `start_stream` only enqueues; the sequences do not exist until
+        # `_submit_stream_request` runs, so a close in between had nothing to
+        # abort and the sequence was added to the engine *afterwards* -- the
+        # exact case the abort exists for, and the one it missed.
+        self._abandoned: set[str] = set()
+        self._stream_seqs_lock = threading.Lock()
         self._worker = threading.Thread(
             target=self._worker_loop,
             name="AtomStandaloneEngineService",
@@ -220,11 +239,65 @@ class AtomEngineService:
         return stream_queue
 
     def _submit_stream_request(self, request: EngineStreamRequest) -> None:
+        if self._take_abandoned(request.request_id):
+            return
         if request.effective_n > 1:
             seqs = self._preprocess_fanout_stream_request(request)
         else:
             seqs = [self._preprocess_single_stream_request(request)]
+        with self._stream_seqs_lock:
+            # Checked again: the close may have arrived while this was
+            # preprocessing. Sequences built and never added to the engine
+            # cost nothing to drop -- there is no abort to do.
+            if request.request_id in self._abandoned:
+                self._abandoned.discard(request.request_id)
+                return
+            self._stream_seqs[request.request_id] = list(seqs)
         self.engine.core_mgr.add_request(seqs)
+
+    def _take_abandoned(self, request_id: str) -> bool:
+        with self._stream_seqs_lock:
+            if request_id not in self._abandoned:
+                return False
+            self._abandoned.discard(request_id)
+            return True
+
+    def forget_stream(self, request_id: str) -> None:
+        """Drop what is remembered about a stream that ended on its own.
+
+        Without this the sequence list for every completed stream stays for
+        the life of the process; `abort_stream` only removes the ones a caller
+        closes, and the engine has already forgotten those sequences by then
+        anyway.
+        """
+        with self._stream_seqs_lock:
+            self._stream_seqs.pop(request_id, None)
+            self._abandoned.discard(request_id)
+
+    def abort_stream(self, request_id: str) -> None:
+        """Stop the sequences behind a stream the caller has finished with.
+
+        Idempotent, and safe to call on a stream that ended normally: the
+        engine has already forgotten those sequences and says so by raising,
+        which is not an error here.
+        """
+        with self._stream_seqs_lock:
+            seqs = self._stream_seqs.pop(request_id, None)
+            if seqs is None:
+                # Not submitted yet. Remember, so it never is.
+                self._abandoned.add(request_id)
+                return
+        for seq in seqs:
+            seq_id = getattr(seq, "id", None)
+            if seq_id is None:
+                continue
+            try:
+                self.engine.core_mgr.abort_request(seq_id)
+            except (AttributeError, KeyError, RuntimeError, ValueError) as exc:
+                logger.debug("abort_request(%s): %s", seq_id, exc)
+            requests = getattr(self.engine.io_processor, "requests", None)
+            if requests is not None:
+                requests.pop(seq_id, None)
 
     def _preprocess_single_stream_request(self, request: EngineStreamRequest) -> Any:
         state = StreamRequestState(
@@ -530,7 +603,7 @@ class ChatCompletionStreamState:
         stream_queue: queue.Queue[dict[str, Any]],
         n: int,
         tool_parser_cls: type | None = None,
-        model_starts_in_reasoning: bool = False,
+        reasoning: ReasoningChannel = NO_REASONING,
         tools: list | None = None,
         tool_choice: Any = None,
     ) -> None:
@@ -544,12 +617,7 @@ class ChatCompletionStreamState:
         # its whole trace delivered as the answer: state 0 no longer infers
         # reasoning from a bare end marker, because inferring it means waiting
         # for one.
-        starts_thinking = (
-            prompt_starts_in_reasoning(prompt) or model_starts_in_reasoning
-        )
-        self.reasoning_filters = [
-            ReasoningFilter(starts_thinking=starts_thinking) for _ in range(n)
-        ]
+        self.reasoning_filters = [reasoning.stream() for _ in range(n)]
         # `tool_choice="none"` forbids tool calls on this path too, and
         # `tools` is what type-coerces the arguments. The OpenAI server gated
         # and passed both; this one had neither, so the same request answered
@@ -558,7 +626,8 @@ class ChatCompletionStreamState:
         self.tool_parsers = [
             ToolCallStreamParser(
                 tools=tools,
-                parser_cls=parser_for_tool_choice(tool_parser_cls, tool_choice),
+                parser_cls=tool_parser_cls,
+                suppress_calls=forbids_tool_calls(tool_choice),
             )
             for _ in range(n)
         ]
@@ -583,8 +652,8 @@ class ChatCompletionStreamState:
         chunks: list[str] = []
         with self._lock:
             self._append_initial_role_chunks(chunks, max_items)
-            if not self.completed and all(self.finished):
-                chunks.extend(self._final_chunks(max_items - len(chunks)))
+            if not self.completed:
+                chunks.extend(self._hand_out(max_items - len(chunks)))
             if chunks or self.completed or self.closed:
                 return chunks
 
@@ -593,8 +662,8 @@ class ChatCompletionStreamState:
                 event = self.stream_queue.get(timeout=timeout if not chunks else 0.0)
             except queue.Empty:
                 with self._lock:
-                    if not self.completed and all(self.finished):
-                        chunks.extend(self._final_chunks(max_items - len(chunks)))
+                    if not self.completed:
+                        chunks.extend(self._hand_out(max_items - len(chunks)))
                 break
 
             with self._lock:
@@ -633,11 +702,9 @@ class ChatCompletionStreamState:
                     self._error_chunk(str(event["error"])),
                     STREAM_DONE_MESSAGE,
                 ]
-            return self._drain_pending_final_chunks(remaining_capacity)
+            return self._hand_out(remaining_capacity)
         if event.get("done"):
-            if not self.completed and all(self.finished):
-                return self._final_chunks(remaining_capacity)
-            return []
+            return [] if self.completed else self._hand_out(remaining_capacity)
 
         index = int(event["index"])
         if self.finished[index]:
@@ -733,46 +800,40 @@ class ChatCompletionStreamState:
         self._pending_chunks.extend(chunks)
         return self._hand_out(remaining_capacity)
 
-    def _final_chunks(self, remaining_capacity: int) -> list[str]:
-        if self._pending_final_chunks is None:
-            chunks: list[str] = []
-            for index, has_tool_calls in enumerate(self.has_tool_calls):
-                finish_reason = (
-                    "tool_calls"
-                    if has_tool_calls
-                    else (
-                        _normalize_finish_reason(self.engine_finish_reasons[index])
-                        or "stop"
-                    )
+    def _build_final_chunks(self) -> list[str]:
+        """The finish/usage/[DONE] tail, built once. Only `_hand_out` calls
+        this, and only once nothing built is still queued."""
+        chunks: list[str] = []
+        for index, has_tool_calls in enumerate(self.has_tool_calls):
+            finish_reason = finish_reason_with_calls(
+                self.engine_finish_reasons[index], has_tool_calls
+            )
+            chunks.append(
+                create_chat_chunk(
+                    self.request_id,
+                    self.model_name,
+                    finish_reason=finish_reason,
+                    index=index,
                 )
-                chunks.append(
-                    create_chat_chunk(
-                        self.request_id,
-                        self.model_name,
-                        finish_reason=finish_reason,
-                        index=index,
-                    )
-                )
-            completion_tokens = sum(self.num_tokens_output)
-            usage = {
-                "prompt_tokens": self.num_tokens_input,
-                "completion_tokens": completion_tokens,
-                "total_tokens": self.num_tokens_input + completion_tokens,
-            }
-            if len(self.num_tokens_output) > 1:
-                usage["num_choices"] = len(self.num_tokens_output)
-            usage_chunk = {
-                "id": self.request_id,
-                "object": CHAT_COMPLETION_CHUNK_OBJECT,
-                "created": int(time.time()),
-                "model": self.model_name,
-                "usage": usage,
-            }
-            chunks.append(data_frame(usage_chunk))
-            chunks.append(STREAM_DONE_MESSAGE)
-            self._pending_final_chunks = chunks
-
-        return self._drain_pending_final_chunks(remaining_capacity)
+            )
+        completion_tokens = sum(self.num_tokens_output)
+        usage = {
+            "prompt_tokens": self.num_tokens_input,
+            "completion_tokens": completion_tokens,
+            "total_tokens": self.num_tokens_input + completion_tokens,
+        }
+        if len(self.num_tokens_output) > 1:
+            usage["num_choices"] = len(self.num_tokens_output)
+        usage_chunk = {
+            "id": self.request_id,
+            "object": CHAT_COMPLETION_CHUNK_OBJECT,
+            "created": int(time.time()),
+            "model": self.model_name,
+            "usage": usage,
+        }
+        chunks.append(data_frame(usage_chunk))
+        chunks.append(STREAM_DONE_MESSAGE)
+        return chunks
 
     def _take_pending(self, remaining_capacity: int) -> list[str]:
         """As many built chunks as the caller has room for; the rest wait."""
@@ -783,15 +844,31 @@ class ChatCompletionStreamState:
         return out
 
     def _hand_out(self, remaining_capacity: int) -> list[str]:
-        """Queued chunks first, then the final ones once nothing is queued."""
+        """The one exit. Queued chunks first; terminal ones only after them.
+
+        Every producer returns through here, and that is the whole of the
+        rule: "every sibling finished" is not the same fact as "everything
+        built has been sent", and three places used the first as a proxy for
+        the second. The terminal chunks were then handed out while built
+        chunks were still queued -- and once the finals go, `completed` is set
+        and the caller pops the state, so the queued ones are gone. Measured
+        at the production `max_items`: a response with nine tool calls
+        delivered eight and reported `finish_reason: tool_calls`; at
+        `max_items=1` a single call reported `tool_calls` having sent no
+        `tool_calls` delta at all.
+        """
         out = self._take_pending(remaining_capacity)
-        if (
-            all(self.finished)
-            and not self._pending_chunks
-            and len(out) < remaining_capacity
-        ):
-            out.extend(self._final_chunks(remaining_capacity - len(out)))
-        return out
+        # `_take_pending` never returns more than the caller asked for, so no
+        # room left means chunks are still queued -- there is nothing to test
+        # for beyond that, and a second condition here would be a guard that
+        # cannot fail.
+        if len(out) >= remaining_capacity:
+            return out
+        if self._pending_final_chunks is None:
+            if not all(self.finished):
+                return out
+            self._pending_final_chunks = self._build_final_chunks()
+        return out + self._drain_pending_final_chunks(remaining_capacity - len(out))
 
     def _drain_pending_final_chunks(self, remaining_capacity: int) -> list[str]:
         if not self._pending_final_chunks or remaining_capacity <= 0:
@@ -840,8 +917,8 @@ class CompletionStreamState:
         max_items = max(1, int(max_items))
         chunks: list[str] = []
         with self._lock:
-            if not self.completed and all(self.finished):
-                chunks.extend(self._final_chunks(max_items))
+            if not self.completed:
+                chunks.extend(self._hand_out(max_items - len(chunks)))
             if chunks or self.completed or self.closed:
                 return chunks
 
@@ -850,8 +927,8 @@ class CompletionStreamState:
                 event = self.stream_queue.get(timeout=timeout if not chunks else 0.0)
             except queue.Empty:
                 with self._lock:
-                    if not self.completed and all(self.finished):
-                        chunks.extend(self._final_chunks(max_items - len(chunks)))
+                    if not self.completed:
+                        chunks.extend(self._hand_out(max_items - len(chunks)))
                 break
 
             with self._lock:
@@ -875,11 +952,9 @@ class CompletionStreamState:
                     self._error_chunk(str(event["error"])),
                     STREAM_DONE_MESSAGE,
                 ]
-            return self._drain_pending_final_chunks(remaining_capacity)
+            return self._hand_out(remaining_capacity)
         if event.get("done"):
-            if not self.completed and all(self.finished):
-                return self._final_chunks(remaining_capacity)
-            return []
+            return [] if self.completed else self._hand_out(remaining_capacity)
 
         index = int(event["index"])
         if self.finished[index]:
@@ -893,12 +968,20 @@ class CompletionStreamState:
             extra_fields["kv_transfer_params"] = event["kv_transfer_params"]
 
         self.num_tokens_output[index] += len(event.get("token_ids", []))
+        if event.get("finish_reason"):
+            self.engine_finish_reasons[index] = event["finish_reason"]
         chunks = [
             create_completion_chunk(
                 self.request_id,
                 self.model_name,
                 event.get("text") or "",
-                finish_reason=event.get("finish_reason"),
+                # The reason goes on the final chunk, as it does on every
+                # other streaming path here and in the OpenAI server. It used
+                # to go on this one too, unnormalised -- so a client saw the
+                # engine's own `max_tokens` on a content chunk and `stop` on
+                # the terminal one, and `engine_finish_reasons`, which exists
+                # to carry it to the terminal one, was never written at all.
+                finish_reason=None,
                 index=index,
                 **extra_fields,
             )
@@ -910,39 +993,45 @@ class CompletionStreamState:
         self._pending_chunks.extend(chunks)
         return self._hand_out(remaining_capacity)
 
-    def _final_chunks(self, remaining_capacity: int) -> list[str]:
-        if self._pending_final_chunks is None:
-            chunks: list[str] = []
-            for index in range(len(self.num_tokens_output)):
-                chunks.append(
-                    create_completion_chunk(
-                        self.request_id,
-                        self.model_name,
-                        "",
-                        finish_reason="stop",
-                        index=index,
-                    )
+    def _build_final_chunks(self) -> list[str]:
+        """The finish/usage/[DONE] tail, built once. Only `_hand_out` calls
+        this, and only once nothing built is still queued."""
+        chunks: list[str] = []
+        for index in range(len(self.num_tokens_output)):
+            # The engine's own reason, as the chat path reports it. This
+            # was recorded per sibling and then never read: every
+            # completion said `stop`, including one the engine cut off at
+            # `max_tokens`, which `stream=false` reported as `length`.
+            chunks.append(
+                create_completion_chunk(
+                    self.request_id,
+                    self.model_name,
+                    "",
+                    finish_reason=(
+                        _normalize_finish_reason(self.engine_finish_reasons[index])
+                        or "stop"
+                    ),
+                    index=index,
                 )
-            completion_tokens = sum(self.num_tokens_output)
-            usage = {
-                "prompt_tokens": self.num_tokens_input,
-                "completion_tokens": completion_tokens,
-                "total_tokens": self.num_tokens_input + completion_tokens,
-            }
-            if len(self.num_tokens_output) > 1:
-                usage["num_choices"] = len(self.num_tokens_output)
-            usage_chunk = {
-                "id": self.request_id,
-                "object": TEXT_COMPLETION_OBJECT,
-                "created": int(time.time()),
-                "model": self.model_name,
-                "usage": usage,
-            }
-            chunks.append(data_frame(usage_chunk))
-            chunks.append(STREAM_DONE_MESSAGE)
-            self._pending_final_chunks = chunks
-
-        return self._drain_pending_final_chunks(remaining_capacity)
+            )
+        completion_tokens = sum(self.num_tokens_output)
+        usage = {
+            "prompt_tokens": self.num_tokens_input,
+            "completion_tokens": completion_tokens,
+            "total_tokens": self.num_tokens_input + completion_tokens,
+        }
+        if len(self.num_tokens_output) > 1:
+            usage["num_choices"] = len(self.num_tokens_output)
+        usage_chunk = {
+            "id": self.request_id,
+            "object": TEXT_COMPLETION_OBJECT,
+            "created": int(time.time()),
+            "model": self.model_name,
+            "usage": usage,
+        }
+        chunks.append(data_frame(usage_chunk))
+        chunks.append(STREAM_DONE_MESSAGE)
+        return chunks
 
     def _take_pending(self, remaining_capacity: int) -> list[str]:
         """As many built chunks as the caller has room for; the rest wait."""
@@ -953,15 +1042,31 @@ class CompletionStreamState:
         return out
 
     def _hand_out(self, remaining_capacity: int) -> list[str]:
-        """Queued chunks first, then the final ones once nothing is queued."""
+        """The one exit. Queued chunks first; terminal ones only after them.
+
+        Every producer returns through here, and that is the whole of the
+        rule: "every sibling finished" is not the same fact as "everything
+        built has been sent", and three places used the first as a proxy for
+        the second. The terminal chunks were then handed out while built
+        chunks were still queued -- and once the finals go, `completed` is set
+        and the caller pops the state, so the queued ones are gone. Measured
+        at the production `max_items`: a response with nine tool calls
+        delivered eight and reported `finish_reason: tool_calls`; at
+        `max_items=1` a single call reported `tool_calls` having sent no
+        `tool_calls` delta at all.
+        """
         out = self._take_pending(remaining_capacity)
-        if (
-            all(self.finished)
-            and not self._pending_chunks
-            and len(out) < remaining_capacity
-        ):
-            out.extend(self._final_chunks(remaining_capacity - len(out)))
-        return out
+        # `_take_pending` never returns more than the caller asked for, so no
+        # room left means chunks are still queued -- there is nothing to test
+        # for beyond that, and a second condition here would be a guard that
+        # cannot fail.
+        if len(out) >= remaining_capacity:
+            return out
+        if self._pending_final_chunks is None:
+            if not all(self.finished):
+                return out
+            self._pending_final_chunks = self._build_final_chunks()
+        return out + self._drain_pending_final_chunks(remaining_capacity - len(out))
 
     def _drain_pending_final_chunks(self, remaining_capacity: int) -> list[str]:
         if not self._pending_final_chunks or remaining_capacity <= 0:
@@ -994,16 +1099,48 @@ class AtomStandaloneService:
         # Resolved once here, for the same reason the OpenAI server resolves it
         # once: the chat template says which format this model emits, and
         # deciding from the output instead means deciding from a prefix.
+        _template_source = chat_template_source(tokenizer, self.custom_message_encoder)
+        # Which dialect this model's reasoning is written in, once, from the
+        # same evidence and by the same function the OpenAI server uses. Both
+        # paths through this service then read it the same way; they used to
+        # share only a boolean, and the streaming half closed the channel on
+        # any registered dialect's marker.
+        self.reasoning_dialect, _stated = resolve_dialect(
+            _template_source,
+            render_probe_prompt(tokenizer, self.custom_message_encoder, tools=False)
+            or "",
+        )
         self.model_starts_in_reasoning = template_opens_reasoning_implicitly(
-            chat_template_source(tokenizer, self.custom_message_encoder)
+            _template_source
         )
         self.tool_parser_cls = resolve_tool_call_parser(
             tool_call_parser, tokenizer, self.custom_message_encoder, model=model_name
         )
+
         self.engine_service = AtomEngineService(engine, tokenizer)
+
         self._streams: dict[str, ChatCompletionStreamState] = {}
         self._completion_streams: dict[str, CompletionStreamState] = {}
         self._streams_lock = threading.Lock()
+
+    def _reasoning_channel(self, prompt: str) -> ReasoningChannel:
+        """How to read this response's reasoning channel.
+
+        One function, read by both delivery modes, so they cannot be given
+        different dialects -- which is what they were: the non-streaming split
+        tried each registered dialect in turn and the streaming filter closed
+        on the union of all their end markers.
+
+        This service threads neither `thinking` nor `reasoning_effort` into
+        the template, so there is no request-level opt-out to honour here yet.
+        When there is, it belongs in this function, as it does on the OpenAI
+        server.
+        """
+        return ReasoningChannel(
+            dialect=self.reasoning_dialect,
+            starts_open=prompt_starts_in_reasoning(prompt)
+            or self.model_starts_in_reasoning,
+        )
 
     def chat_completions(self, request_data: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -1051,8 +1188,7 @@ class AtomStandaloneService:
                     request_id,
                     self.model_name,
                     outputs,
-                    starts_thinking=prompt_starts_in_reasoning(prompt)
-                    or self.model_starts_in_reasoning,
+                    reasoning=self._reasoning_channel(prompt),
                     tools=request_data.get("tools"),
                     tool_choice=request_data.get("tool_choice"),
                     tool_parser_cls=self.tool_parser_cls,
@@ -1073,8 +1209,7 @@ class AtomStandaloneService:
                     self.model_name,
                     final_output["text"],
                     final_output,
-                    starts_thinking=prompt_starts_in_reasoning(prompt)
-                    or self.model_starts_in_reasoning,
+                    reasoning=self._reasoning_channel(prompt),
                     tools=request_data.get("tools"),
                     tool_choice=request_data.get("tool_choice"),
                     tool_parser_cls=self.tool_parser_cls,
@@ -1185,6 +1320,11 @@ class AtomStandaloneService:
         if stream_state.completed or stream_state.closed:
             with self._streams_lock:
                 self._completion_streams.pop(stream_id, None)
+            # A stream that ends on its own is never closed by the caller, so
+            # this is the only place its sequence list is dropped. Without it
+            # the engine service remembers every completed stream for the life
+            # of the process.
+            self.engine_service.forget_stream(stream_id)
         return chunks
 
     def poll_completions_stream(
@@ -1204,6 +1344,7 @@ class AtomStandaloneService:
             stream_state = self._completion_streams.pop(stream_id, None)
         if stream_state is not None:
             stream_state.close()
+        self.engine_service.abort_stream(stream_id)
 
     def start_chat_completions_stream(self, request_data: dict[str, Any]) -> str:
         try:
@@ -1246,7 +1387,7 @@ class AtomStandaloneService:
                 stream_queue=stream_queue,
                 n=effective_n,
                 tool_parser_cls=self.tool_parser_cls,
-                model_starts_in_reasoning=self.model_starts_in_reasoning,
+                reasoning=self._reasoning_channel(prompt),
                 tools=request_data.get("tools"),
                 tool_choice=request_data.get("tool_choice"),
             )
@@ -1272,6 +1413,11 @@ class AtomStandaloneService:
         if stream_state.completed or stream_state.closed:
             with self._streams_lock:
                 self._streams.pop(stream_id, None)
+            # A stream that ends on its own is never closed by the caller, so
+            # this is the only place its sequence list is dropped. Without it
+            # the engine service remembers every completed stream for the life
+            # of the process.
+            self.engine_service.forget_stream(stream_id)
         return chunks
 
     def poll_chat_completions_stream(
@@ -1291,11 +1437,15 @@ class AtomStandaloneService:
             stream_state = self._streams.pop(stream_id, None)
         if stream_state is not None:
             stream_state.close()
+        self.engine_service.abort_stream(stream_id)
 
     def close(self) -> None:
         with self._streams_lock:
+            open_streams = [*self._streams, *self._completion_streams]
             self._streams.clear()
             self._completion_streams.clear()
+        for stream_id in open_streams:
+            self.engine_service.abort_stream(stream_id)
         if hasattr(self, "engine_service"):
             self.engine_service.close()
         if hasattr(self.engine, "close"):

@@ -23,8 +23,9 @@ from typing import Any, ClassVar
 
 from .schema import build_param_types, coerce_param_value
 from .tool_parser import (
-    BufferedMarkerParser,
+    RegionParse,
     ToolCall,
+    ToolCallParser,
     continues_a_call,
     unique_tool_call_id,
 )
@@ -42,8 +43,22 @@ _PARAM_RE = re.compile(
 # Long-form `<invoke name="x">...</invoke>` OR self-closing `<invoke name="x"/>`
 # (the zero-arg shape; group(2) is None for self-closing). Matches SGLang's V4
 # detector, which accepts both.
+# A call's body may not contain another opener -- that literal is what opens
+# one. Without the guard the non-greedy body ran from a *quoted* opener in
+# prose all the way to the real call's closer, so an answer explaining
+# "you write <invoke name="NAME">" before making a real call produced one call named after the
+# placeholder, carrying the real call's arguments, with the sentence deleted.
+# `finditer` then resumed past the real call, so the call the model actually
+# made never went out. GLM was given this guard first; this is the sweep.
+_NOT_NESTED = r"(?:(?!<" + _OPT + r"invoke\s).)"
 _INVOKE_RE = re.compile(
-    r"<" + _OPT + r'invoke\s+name="(.*?)"\s*(?:/>|>(.*?)</' + _OPT + r"invoke>)",
+    r"<"
+    + _OPT
+    + r'invoke\s+name="([^"]*)"\s*(?:/>|>('
+    + _NOT_NESTED
+    + r"*?)</"
+    + _OPT
+    + r"invoke>)",
     re.DOTALL,
 )
 
@@ -113,10 +128,6 @@ def _infer_name(arg_names: set, param_types: dict[str, dict[str, Any]]) -> str |
     return best
 
 
-# Name plus whatever follows it; `_continues_a_call` judges that part, so the
-# rule lives in one place. See QwenXmlParser for why a follower is required.
-_PEEK_NAME_RE = re.compile(r'invoke\s+name="([^"]+)"\s*>(.*)', re.DOTALL)
-
 # The same opener with no closing tag: a call the model was cut off inside.
 _TRUNCATED_INVOKE_RE = re.compile(
     r"<" + _OPT + r'invoke\s+name="([^"]*)"\s*>(.*)$', re.DOTALL
@@ -124,9 +135,9 @@ _TRUNCATED_INVOKE_RE = re.compile(
 # What may follow that opener in a real call: another parameter, or the
 # close of the invoke the name opened. Either spelling of the marker, which
 # the model drops about as often as it writes. One tuple, read by both
-# `_is_truncated_call` and `peek_name` -- they used to encode this
-# separately and the peek's version accepted any tag with a slash in it,
-# `<br/>` included.
+# `_is_truncated_call` at both ends of a region's life -- the peek used to
+# encode this separately and accepted any tag with a slash in it, `<br/>`
+# included.
 _CALL_CONTINUES = (
     "<" + _DSML + "parameter",
     "<parameter",
@@ -135,7 +146,9 @@ _CALL_CONTINUES = (
 )
 
 
-def _is_truncated_call(name: str, body: str, param_types: dict) -> bool:
+def _is_truncated_call(
+    name: str, body: str, param_types: dict, *, at_end: bool
+) -> bool:
     """Is this unclosed `<invoke name=...>` a cut-off call, or prose?
 
     See :func:`QwenXmlParser._is_truncated_call`, which this is the DSML
@@ -146,11 +159,14 @@ def _is_truncated_call(name: str, body: str, param_types: dict) -> bool:
     if name not in param_types:
         return False
     rest = body.lstrip()
-    return not rest or continues_a_call(rest, _CALL_CONTINUES, arrived=False)
+    return (not rest and at_end) or continues_a_call(
+        rest, _CALL_CONTINUES, arrived=not at_end
+    )
 
 
-class DsmlParser(BufferedMarkerParser):
+class DsmlParser(ToolCallParser):
     NAME: ClassVar[str] = "dsml"
+    RECOGNISES_A_CALL_IN_PROGRESS: ClassVar[bool] = True
     # Region-start markers, both marked and marker-less variants.
     START_MARKERS: ClassVar[tuple[str, ...]] = (
         "<" + _DSML + "tool_call",  # marked (covers tool_call / tool_calls)
@@ -158,40 +174,37 @@ class DsmlParser(BufferedMarkerParser):
         "<invoke name=",  # marker-less invoke (common malform)
         "<tool_calls>",  # marker-less section open
     )
-
-    @classmethod
-    def peek_name(cls, region: str, tools: list | None = None) -> str | None:
-        """`<｜DSML｜invoke name="NAME">`, and the bare `<invoke ...>` the
-        model often emits instead -- both carry the name in the opener.
-
-        The self-closing `<invoke name="X"/>` shape has no `>` after the
-        quote and so is not matched: it is a complete zero-argument call that
-        `parse` reads on its own, and there is nothing to announce early
-        about a region that is already finished.
-        """
-        m = _PEEK_NAME_RE.search(region)
-        if m is None:
-            return None
-        rest = m.group(2).lstrip()
-        if not continues_a_call(rest, _CALL_CONTINUES, arrived=True):
-            return None
-        return m.group(1)
+    # The section wrapper closing after the last invoke -- markup, not answer.
+    # Both spellings, since the model drops the marker about as often as it
+    # writes it, and both arities, since it writes the singular too.
+    CALL_OPENERS: ClassVar[tuple[str, ...]] = (
+        "<" + _DSML + "tool_calls>",
+        "<" + _DSML + "tool_call>",
+        "<tool_calls>",
+        "<tool_call>",
+    )
+    CALL_CLOSERS: ClassVar[tuple[str, ...]] = (
+        "</" + _DSML + "tool_calls>",
+        "</" + _DSML + "tool_call>",
+        "</tool_calls>",
+        "</tool_call>",
+    )
 
     # detect() is inherited: any start marker present means DSML.
 
     @classmethod
-    def parse(cls, text: str, tools: list | None) -> tuple[str, list[ToolCall]]:
-        """Parse DeepSeek-V4 DSML tool calls; return (leading_content, tool_calls)."""
+    def parse_region(
+        cls, region: str, tools: list | None, *, at_end: bool
+    ) -> RegionParse:
         param_types = build_param_types(tools)
-        start = cls.find_start(text)
-        if start == -1:
-            return text, []  # no call -> verbatim; see ToolCallParser.parse
-        content = text[:start]
-        region = text[start:]
-
         calls: list[tuple[str, dict[str, Any]]] = []
+        # A truncated or wrapper-less call runs to the end of what arrived;
+        # complete invokes start and end where their own matches do.
+        begin, end = 0, len(region)
         invokes = list(_INVOKE_RE.finditer(region))
         if invokes:
+            begin = cls.markup_begin(region, invokes[0].start())
+            end = cls.markup_end(region, invokes[-1].end())
             for m in invokes:
                 name = m.group(1)
                 body = m.group(2) or ""  # None for self-closing <invoke .../>
@@ -234,7 +247,7 @@ class DsmlParser(BufferedMarkerParser):
             }
             if opener is not None:
                 name = opener.group(1).strip()
-                keep = _is_truncated_call(name, body, param_types)
+                keep = _is_truncated_call(name, body, param_types, at_end=at_end)
             else:
                 name = _infer_name(set(raw), param_types) or "unknown"
                 keep = bool(raw)
@@ -244,7 +257,7 @@ class DsmlParser(BufferedMarkerParser):
                 args = _unwrap_wrapper_args(args, set(types))
                 calls.append((name, args))
 
-        tool_calls = [
+        tool_calls = tuple(
             ToolCall(
                 id=unique_tool_call_id(),
                 type="function",
@@ -254,7 +267,5 @@ class DsmlParser(BufferedMarkerParser):
                 },
             )
             for name, args in calls
-        ]
-        if _DSML in content:  # scrub any stray marker fragment
-            content = content.split("<" + _DSML, 1)[0]
-        return (content.strip() if tool_calls else text), tool_calls
+        )
+        return RegionParse(tool_calls, begin, end)

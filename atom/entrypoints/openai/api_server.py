@@ -50,6 +50,7 @@ from .chat_encoders import (
     apply_chat_template,
     chat_template_source,
     load_custom_message_encoder,
+    render_probe_prompt,
     resolve_reasoning_toggle,
 )
 from .metrics import AtomMetricsExporter
@@ -63,12 +64,12 @@ from .protocol import (
     ModelList,
 )
 from .reasoning import (
-    ReasoningFilter,
+    ReasoningChannel,
     prompt_starts_in_reasoning,
     prompt_tokens_start_in_reasoning,
-    separate_reasoning,
     template_opens_reasoning_implicitly,
 )
+from .reasoning_dialects import resolve_dialect
 from .serving_anthropic import (
     AnthropicBlocks,
     AnthropicMessagesRequest,
@@ -106,7 +107,6 @@ from .tool_parser import ToolCallStreamParser, parse_tool_calls
 from .tool_parser.registry import (
     TOOL_CALL_PARSER_HELP,
     forbids_tool_calls,
-    parser_for_tool_choice,
     resolve_tool_call_parser,
 )
 
@@ -134,6 +134,7 @@ tool_call_parser_cls: type | None = None
 # response cannot tell you: its first token is already reasoning and reads
 # like an answer.
 model_starts_in_reasoning: bool = False
+reasoning_dialect: Any = None
 # (kwarg, off-value) the chat template reads to switch reasoning off, resolved
 # at startup by asking it; None when the template offers no such switch.
 reasoning_toggle: tuple[str, Any, Any] | None = None
@@ -146,6 +147,37 @@ _stream_loops: dict[str, AbstractEventLoop] = {}
 _request_start_times: dict[str, float] = {}
 _request_logger: logging.Logger | None = None
 _stream_batch_dispatcher: StreamBatchDispatcher | None = None
+
+
+def reasoning_channel(prompt_opens: bool, *, thinking_off: bool) -> ReasoningChannel:
+    """How to read this request's reasoning channel.
+
+    One place, because it is one answer and both endpoints and both delivery
+    modes need the same one. The dialect is the model's, resolved at startup;
+    what varies per request is whether the output begins inside the channel.
+
+    ``thinking_off`` is why that is not just the model-level fact. A request
+    that switches reasoning off renders a prompt that does not open the
+    channel, and `model_starts_in_reasoning` -- which describes the template
+    with reasoning *on* -- was OR-ed in regardless. On a model that begins
+    inside the channel implicitly, an ordinary answer to a request that had
+    asked for no thinking came back entirely as `reasoning_content`, with
+    `content` empty.
+
+    And it only counts when the template has a switch to honour it with. Ask
+    DeepSeek-R1 for no thinking and nothing goes into the prompt -- it has no
+    such kwarg (`resolve_reasoning_toggle` answers ``None`` for it) -- so the
+    model reasons exactly as always. Believing the request there stops the
+    channel being separated at all, and the client gets the chain of thought
+    and a literal `</think>` inside `content`. Reasoning that was asked not to
+    happen and happened anyway is still reasoning; `anthropic_drop_reasoning`
+    exists to withhold it, and it can only withhold what was separated.
+    """
+    honoured = thinking_off and reasoning_toggle is not None
+    return ReasoningChannel(
+        dialect=reasoning_dialect,
+        starts_open=prompt_opens or (model_starts_in_reasoning and not honoured),
+    )
 
 
 def anthropic_thinking_enabled(request: Any) -> bool:
@@ -236,6 +268,18 @@ _ANTHROPIC_STOP_REASON = {
     "max_tokens": "max_tokens",
     "stop_sequence": "stop_sequence",
 }
+
+
+def anthropic_stop_reason_with_calls(finish_reason: Any, has_calls: bool) -> str:
+    """`max_tokens` outranks `tool_use`, for the reason `length` outranks
+    `tool_calls` on the other endpoint (see
+    :func:`~.serving_chat.finish_reason_with_calls`): only one of the two is a
+    warning, and a response cut off mid-call parses to a call with a silently
+    truncated argument value."""
+    reason = anthropic_stop_reason(finish_reason)
+    if reason == "max_tokens":
+        return reason
+    return "tool_use" if has_calls else reason
 
 
 def anthropic_stop_reason(finish_reason: Any) -> str:
@@ -1427,8 +1471,8 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             merged_kwargs["response_format"] = request.response_format
         if isinstance(request.tool_choice, str):
             merged_kwargs["tool_choice"] = request.tool_choice
+        _th_enabled, _th_effort = resolve_thinking(request)
         if request.thinking is not None or request.reasoning_effort is not None:
-            _th_enabled, _th_effort = resolve_thinking(request)
             # By the name this template actually reads. `thinking` was
             # hardcoded, which is right for Kimi-K3 and a silent no-op for the
             # whole Qwen family, whose templates read `enable_thinking` --
@@ -1488,11 +1532,14 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         # The K3 template may inject the opening reasoning marker into the prompt
         # itself; if so the stream begins mid-thought and the ReasoningFilter must
         # start in the thinking state. Multimodal inputs arrive pre-tokenized.
-        _starts_thinking = (
-            prompt_tokens_start_in_reasoning(token_ids, tokenizer.decode)
-            if is_multimodal
-            else prompt_starts_in_reasoning(prompt)
-        ) or model_starts_in_reasoning
+        _reasoning = reasoning_channel(
+            (
+                prompt_tokens_start_in_reasoning(token_ids, tokenizer.decode)
+                if is_multimodal
+                else prompt_starts_in_reasoning(prompt)
+            ),
+            thinking_off=_th_enabled is False,
+        )
 
         # Streaming
         if request.stream:
@@ -1519,7 +1566,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     cleanup_request,
                     tools=request.tools,
                     tool_choice=request.tool_choice,
-                    starts_thinking=_starts_thinking,
+                    reasoning=_reasoning,
                     tool_parser_cls=tool_call_parser_cls,
                 )
             else:
@@ -1543,7 +1590,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     cleanup_request,
                     tools=request.tools,
                     tool_choice=request.tool_choice,
-                    starts_thinking=_starts_thinking,
+                    reasoning=_reasoning,
                     tool_parser_cls=tool_call_parser_cls,
                 )
             return StreamingResponse(
@@ -1573,7 +1620,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 outputs,
                 tools=request.tools,
                 tool_choice=request.tool_choice,
-                starts_thinking=_starts_thinking,
+                reasoning=_reasoning,
                 tool_parser_cls=tool_call_parser_cls,
             )
         elif is_multimodal:
@@ -1597,7 +1644,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 final_output,
                 tools=request.tools,
                 tool_choice=request.tool_choice,
-                starts_thinking=_starts_thinking,
+                reasoning=_reasoning,
                 tool_parser_cls=tool_call_parser_cls,
             )
         elif effective_n > 1:
@@ -1620,7 +1667,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 outputs,
                 tools=request.tools,
                 tool_choice=request.tool_choice,
-                starts_thinking=_starts_thinking,
+                reasoning=_reasoning,
                 tool_parser_cls=tool_call_parser_cls,
             )
         else:
@@ -1644,7 +1691,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 final_output,
                 tools=request.tools,
                 tool_choice=request.tool_choice,
-                starts_thinking=_starts_thinking,
+                reasoning=_reasoning,
                 tool_parser_cls=tool_call_parser_cls,
             )
         _log_request_event("response", request_id, resp.model_dump())
@@ -1811,6 +1858,11 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         # no such spelling, and are not answered here or on the chat path.
         if forbids_tool_calls(request.tool_choice):
             merged_kwargs["tool_choice"] = "none"
+        # Thinking is "unstated" unless the field is present, exactly as
+        # `anthropic_template_kwargs` and `anthropic_drop_reasoning` read it.
+        thinking_off = request.thinking is not None and not anthropic_thinking_enabled(
+            request
+        )
         prompt = apply_chat_template(
             tokenizer,
             custom_message_encoder,
@@ -1891,15 +1943,15 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                 # opens with `<|open|>think<|sep|>`, which `.endswith("<think>")`
                 # does not see, and the assignment it guarded skipped
                 # `__post_init__` so the instance was in the thinking state
-                # while claiming it did not start there.
-                reasoning_filter = ReasoningFilter(
-                    starts_thinking=prompt_starts_in_reasoning(prompt)
-                    or model_starts_in_reasoning,
-                )
+                # while claiming it did not start there. Which dialect closes
+                # it is the model's, resolved at startup -- the filter used to
+                # carry none and closed on any registered dialect's marker.
+                reasoning_filter = reasoning_channel(
+                    prompt_starts_in_reasoning(prompt), thinking_off=thinking_off
+                ).stream()
                 tool_parser = ToolCallStreamParser(
-                    parser_cls=parser_for_tool_choice(
-                        tool_call_parser_cls, request.tool_choice
-                    )
+                    parser_cls=tool_call_parser_cls,
+                    suppress_calls=forbids_tool_calls(request.tool_choice),
                 )
                 tool_parser.tools = anthropic_to_openai_tools(request.tools)
                 blocks = AnthropicBlocks()
@@ -1913,6 +1965,9 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                 # message that also said nothing was wrong. The vocabularies
                 # already line up; they were simply never connected.
                 stop_reason = "end_turn"
+                # The engine's own reason, kept so a call parsed out of a
+                # response it cut short does not overwrite it.
+                engine_reason: Any = None
 
                 message_started = False
                 # Assume abort until we reach the normal end of the stream. If
@@ -1930,6 +1985,8 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                             )
                             message_started = True
                         new_text = chunk_data["text"]
+                        if chunk_data.get("finish_reason"):
+                            engine_reason = chunk_data["finish_reason"]
                         if not has_tool_calls and chunk_data.get("finish_reason"):
                             stop_reason = anthropic_stop_reason(
                                 chunk_data["finish_reason"]
@@ -1960,7 +2017,9 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                                 events = tool_parser.process(text)
                                 if completes_a_tool_call(events):
                                     has_tool_calls = True
-                                    stop_reason = "tool_use"
+                                    stop_reason = anthropic_stop_reason_with_calls(
+                                        engine_reason, True
+                                    )
                                 for _frame in tool_event_frames(events, blocks):
                                     yield _frame
 
@@ -1969,7 +2028,9 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                             events = tool_parser.flush()
                             if completes_a_tool_call(events):
                                 has_tool_calls = True
-                                stop_reason = "tool_use"
+                                stop_reason = anthropic_stop_reason_with_calls(
+                                    engine_reason, True
+                                )
                             for _frame in tool_event_frames(events, blocks):
                                 yield _frame
 
@@ -1980,11 +2041,19 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                             if not has_tool_calls and blocks.kind != "text":
                                 for _frame in blocks.open("text"):
                                     yield _frame
+                            # Before the last frames, not after. The flag means
+                            # "the engine sequence may still be running", and
+                            # the engine is done the moment its finished chunk
+                            # arrived -- a client hanging up between the two
+                            # yields below fired a broadcast abort for a
+                            # sequence that had already ended, which is the
+                            # control-path flood the flag exists to prevent.
+                            # `serving_chat` already sets it here.
+                            aborted = False
                             for _frame in blocks.close():
                                 yield _frame
                             yield stream_message_delta(stop_reason, output_tokens)
                             yield stream_message_stop()
-                            aborted = False
                             break
                 finally:
                     cleanup_stream(seq_id, aborted=aborted)
@@ -2013,19 +2082,16 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         # and what keeps a chain of thought out of the tool parser. Only
         # whether the client is shown it is a question, and the same one the
         # streaming branch above asks.
-        reasoning_content, content_with_tools = separate_reasoning(
-            raw_text,
-            starts_thinking=prompt_starts_in_reasoning(prompt)
-            or model_starts_in_reasoning,
-        )
+        reasoning_content, content_with_tools = reasoning_channel(
+            prompt_starts_in_reasoning(prompt), thinking_off=thinking_off
+        ).split(raw_text)
         if drop_reasoning:
             reasoning_content = None
         content_text, tool_calls = parse_tool_calls(
             content_with_tools,
             anthropic_to_openai_tools(request.tools),
-            parser_cls=parser_for_tool_choice(
-                tool_call_parser_cls, request.tool_choice
-            ),
+            parser_cls=tool_call_parser_cls,
+            suppress_calls=forbids_tool_calls(request.tool_choice),
         )
         output_tokens = len(tokenizer.encode(raw_text))
         cache_read_input_tokens = final_output.get("num_cached_tokens", 0)
@@ -2043,10 +2109,8 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
             # place, so the same response cut off at `max_tokens` reported a
             # normal ending with `stream=false` and `max_tokens` with
             # `stream=true`.
-            stop_reason=(
-                "tool_use"
-                if tool_calls
-                else anthropic_stop_reason(final_output.get("finish_reason"))
+            stop_reason=anthropic_stop_reason_with_calls(
+                final_output.get("finish_reason"), bool(tool_calls)
             ),
         )
 
@@ -2201,6 +2265,7 @@ def main():
     """Main entry point for the server."""
     global engine, tokenizer, model_name, default_chat_template_kwargs, _request_logger
     global tool_call_parser_cls, model_starts_in_reasoning, reasoning_toggle
+    global reasoning_dialect
     global custom_message_encoder, _stream_batch_dispatcher
 
     parser = FlexibleArgumentParser(description="ATOM OpenAI API Server")
@@ -2297,9 +2362,17 @@ def main():
 
     logger.info(f"Initializing engine with model {args.model}...")
     engine_args = EngineArgs.from_cli_args(args)
-    model_starts_in_reasoning = template_opens_reasoning_implicitly(
-        chat_template_source(tokenizer, custom_message_encoder)
+    _template_source = chat_template_source(tokenizer, custom_message_encoder)
+    reasoning_dialect, _dialect_stated = resolve_dialect(
+        _template_source,
+        render_probe_prompt(tokenizer, custom_message_encoder, tools=False) or "",
     )
+    logger.info(
+        "Reasoning channel: %s%s",
+        reasoning_dialect.think_end_marker,
+        "" if _dialect_stated else " (no dialect named in the chat template)",
+    )
+    model_starts_in_reasoning = template_opens_reasoning_implicitly(_template_source)
     if model_starts_in_reasoning:
         logger.info(
             "Chat template closes a reasoning block it never opens; treating "

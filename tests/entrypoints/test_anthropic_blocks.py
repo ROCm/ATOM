@@ -26,6 +26,7 @@ from atom.entrypoints.openai.serving_anthropic import (
     completes_a_tool_call,
     tool_event_frames,
 )
+from atom.entrypoints.openai.tool_parser import ToolCallStreamParser
 from atom.entrypoints.openai.tool_parser.glm_tool_parser import GlmParser
 
 KINDS = ("text", "thinking", "tool_use")
@@ -193,7 +194,9 @@ class TestToolEventFrames:
 
     def test_content_before_a_call_lands_in_a_text_block(self):
         frames = list(
-            tool_event_frames([("content", "Checking."), self.START], AnthropicBlocks())
+            tool_event_frames(
+                [("content", "Checking."), self.START, self.ARGS], AnthropicBlocks()
+            )
         )
         payloads = [json.loads(f.split("data: ", 1)[1]) for f in frames]
         assert payloads[0]["type"] == "content_block_start"
@@ -203,13 +206,26 @@ class TestToolEventFrames:
             "content_block_delta",
             "content_block_stop",
             "content_block_start",
+            "content_block_delta",
         ]
-        assert payloads[-1]["content_block"]["type"] == "tool_use"
+        assert payloads[-2]["content_block"]["type"] == "tool_use"
 
     def test_the_call_carries_its_id_and_name(self):
-        frames = list(tool_event_frames([self.START], AnthropicBlocks()))
+        frames = list(tool_event_frames([self.START, self.ARGS], AnthropicBlocks()))
         block = json.loads(frames[0].split("data: ", 1)[1])["content_block"]
         assert block["id"] == "call_1" and block["name"] == "get_weather"
+
+    def test_a_name_with_no_arguments_puts_no_block_on_the_wire(self):
+        """`content_block_start` of type `tool_use` carries `"input": {}` and
+        is, on its own, a complete zero-argument call -- there is no frame for
+        "the name is known, the arguments are coming". So the name cannot be
+        sent early on this protocol, and a response that announced one and was
+        then cut off must leave nothing behind. It used to leave a
+        syntactically perfect call the model never made."""
+        assert self._kinds([("content", "hi"), self.START]) == [
+            "content_block_start",
+            "content_block_delta",
+        ]
 
     def test_an_unknown_event_type_is_ignored_not_crashed(self):
         assert self._kinds([("something_new", {})]) == []
@@ -332,15 +348,38 @@ class TestOneCallSpansTwoParserBatches:
         "<arg_value>Paris</arg_value></tool_call>"
     )
 
-    def _frames(self, chunk_size):
-        parser = GlmParser(tools=self.TOOLS)
+    def _frames(self, chunk_size, text=None, reasoning_at=None):
+        parser = ToolCallStreamParser(tools=self.TOOLS, parser_cls=GlmParser)
         blocks = AnthropicBlocks()
+        text = self.CALL if text is None else text
         out = []
-        for i in range(0, len(self.CALL), chunk_size):
-            batch = parser.process(self.CALL[i : i + chunk_size])
+        for i in range(0, len(text), chunk_size):
+            if reasoning_at is not None and i >= reasoning_at:
+                # One thinking segment, delivered between the name and the
+                # arguments. It closes whatever block was open, which is the
+                # whole point: the call's identity has to outlive that.
+                out += list(blocks.delta("thinking", "hm"))
+                reasoning_at = None
+            batch = parser.process(text[i : i + chunk_size])
             out += list(tool_event_frames(batch, blocks))
         out += list(tool_event_frames(parser.flush(), blocks))
         return [json.loads(f.split("data: ", 1)[1]) for f in out]
+
+    @pytest.mark.parametrize("chunk_size", [1, 7])
+    def test_a_thinking_block_in_between_does_not_lose_the_arguments(self, chunk_size):
+        """The shape that broke it: reasoning arriving after the name was
+        announced closed the tool block, and the id and name lived on that
+        block. The arguments then had nothing to open a block with and were
+        dropped -- `tool_use` with `input: {}` and `stop_reason: tool_use`,
+        while the same bytes returned `{"city": "Paris"}` unstreamed."""
+        frames = self._frames(chunk_size, reasoning_at=chunk_size)
+        deltas = [
+            p["delta"]["partial_json"]
+            for p in frames
+            if p["type"] == "content_block_delta"
+            and p["delta"]["type"] == "input_json_delta"
+        ]
+        assert "".join(deltas) == '{"city": "Paris"}'
 
     @pytest.mark.parametrize("chunk_size", [1, 7, len(CALL)])
     def test_the_arguments_reach_the_client(self, chunk_size):
@@ -369,21 +408,25 @@ class TestOneCallSpansTwoParserBatches:
         ]
         assert named and set(argued) <= set(named), (named, argued)
 
-    def test_a_call_that_ended_does_not_adopt_the_next_arguments(self):
-        """It survives a batch boundary, which is all it has to.
-
-        Nothing closes the block between the name (from `process`) and the
-        arguments (from `flush`), so surviving `close` was never needed --
-        and carrying it across one is what let a second block open on the
-        same id.
-        """
+    def test_arguments_for_a_call_that_was_never_named_are_dropped(self):
+        """Every call is keyed by the index it was named at, so a batch that
+        closes one block cannot make the next batch's arguments land on it --
+        and arguments for an index nobody named open nothing at all."""
         blocks = AnthropicBlocks()
         start = (
             "tool_call_start",
-            {"id": "call_1", "function": {"name": "get_weather", "arguments": ""}},
+            {
+                "index": 0,
+                "id": "call_1",
+                "function": {"name": "get_weather", "arguments": ""},
+            },
         )
-        orphan = ("tool_call_args", {"function": {"arguments": '{"city": "Rome"}'}})
-        list(tool_event_frames([start, ("tool_call_end", None)], blocks))
-        assert blocks.open_call is None
-        frames = list(tool_event_frames([orphan], blocks))
-        assert frames == [], "arguments were adopted by a call that had ended"
+        args = ("tool_call_args", {"index": 0, "function": {"arguments": "{}"}})
+        later = (
+            "tool_call_args",
+            {"index": 1, "function": {"arguments": '{"city": "Rome"}'}},
+        )
+        list(tool_event_frames([start, args, ("tool_call_end", None)], blocks))
+        assert blocks.open_call_index is None
+        frames = list(tool_event_frames([later], blocks))
+        assert frames == [], "arguments were adopted by a call that never existed"

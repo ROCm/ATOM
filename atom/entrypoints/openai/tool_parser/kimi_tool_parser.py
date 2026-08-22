@@ -7,35 +7,26 @@
     <|tool_call_begin|>functions.NAME:INDEX<|tool_call_argument_begin|>ARGS_JSON<|tool_call_end|>
     <|tool_calls_section_end|>
 
-Unlike the XML-ish formats this one is self-delimiting, so entries can be
-emitted as soon as their ``<|tool_call_end|>`` arrives rather than buffering the
-whole block. It therefore implements streaming itself instead of inheriting
-:class:`~.tool_parser.BufferedMarkerParser`.
-
 Arguments are already JSON on the wire, so no schema coercion is applied and
-``tools`` is unused. The call id is the model's own ``functions.NAME:INDEX``
-rather than a random one, and ``index`` comes from the wire too.
+``tools`` is unused for parsing. The call id is the model's own
+``functions.NAME:INDEX``.
+
+The section end is a special token that cannot occur inside an argument value,
+so this is the one format that can say where a region closes without waiting
+for end of stream -- see ``REGION_END_MARKERS``. That is what lets a second
+section, and the answer after the last one, be read at all: both used to be
+swallowed, differently, by the two readers this format used to have.
 """
 
 import re
 from typing import ClassVar
 
-from .tool_parser import ToolCall, ToolCallParser
+from .tool_parser import RegionParse, ToolCall, ToolCallParser
 
 KIMI_SECTION_BEGIN = "<|tool_calls_section_begin|>"
 KIMI_SECTION_END = "<|tool_calls_section_end|>"
 KIMI_ENTRY_END = "<|tool_call_end|>"
-# Nothing in a chunk can complete an entry or the section unless one of these
-# lands in it, so nothing before one arrives needs the buffer materialised.
-# See `KimiParser.process`.
-_DRAIN_TRIGGERS = (KIMI_ENTRY_END, KIMI_SECTION_END)
-_TRIGGER_TAIL = max(len(m) for m in _DRAIN_TRIGGERS) - 1
 
-_SECTION_RE = re.compile(
-    re.escape(KIMI_SECTION_BEGIN) + r"(.*?)" + re.escape(KIMI_SECTION_END),
-    re.DOTALL,
-)
-_UNCLOSED_RE = re.compile(re.escape(KIMI_SECTION_BEGIN) + r"(.*?)$", re.DOTALL)
 _ENTRY_RE = re.compile(
     r"<\|tool_call_begin\|>"
     r"functions\.(\w+):(\d+)"
@@ -65,192 +56,44 @@ def _parse_entries(section_text: str) -> list[ToolCall]:
 
 
 class KimiParser(ToolCallParser):
-    """States: 0 = plain content, 1 = inside a section. There is no third.
-
-    A section closing returns to 0 because the answer continues after it; the
-    terminal state this used to have swallowed everything that followed.
-    """
-
     NAME: ClassVar[str] = "kimi"
     # The section opener, and the only literal detection keys on. The entry
-    # markers inside it are `_drain_entries`' business, never a reader's.
+    # markers inside it are `parse_region`'s business, never a reader's.
     START_MARKERS: ClassVar[tuple[str, ...]] = (KIMI_SECTION_BEGIN,)
-
-    # No `peek_name`, deliberately. This format carries the call's index and
-    # id on the wire (`functions.NAME:INDEX`), and an announcement has to be
-    # stamped with both before the entry that supplies them has arrived --
-    # every announced call went out at index 0, so a client accumulating by
-    # index overwrote the first call with the second. It also drains per
-    # completed entry rather than at flush, so it has the least to gain.
-
-    def __init__(self, tools: list | None = None):
-        super().__init__(tools)
-        # Calls drained from the section currently open. `emitted_calls` is
-        # the running total for the whole stream and answers a different
-        # question; using it as this one made the not-a-promise branch dead
-        # code from the first real call onwards.
-        self._section_calls = 0
-        # The tail a drain trigger split across a chunk boundary would need.
-        self._trigger_tail = ""
+    # A special token, so it cannot appear inside a JSON argument value. That
+    # is the whole licence for closing a region on it: the XML formats' own
+    # closers fail this test, because a model writing about tool calls puts
+    # one inside a parameter.
+    REGION_END_MARKERS: ClassVar[tuple[str, ...]] = (KIMI_SECTION_END,)
 
     @classmethod
     def detect(cls, text: str) -> bool:
         return KIMI_SECTION_BEGIN in text
 
     @classmethod
-    def parse(cls, text: str, tools: list | None) -> tuple[str, list[ToolCall]]:
-        section_match = _SECTION_RE.search(text)
-        if not section_match:
-            # Unclosed section: the model was cut off mid-block; salvage whatever
-            # complete entries it managed to emit.
-            unclosed = _UNCLOSED_RE.search(text)
-            if unclosed:
-                entries = _parse_entries(unclosed.group(1))
-                content = text[: unclosed.start()]
-                # No call -> verbatim; see ToolCallParser.parse.
-                return (content.strip() if entries else text), entries
-            return text, []
-        entries = _parse_entries(section_match.group(1))
-        # What follows the section is the answer continuing, not spare bytes.
-        # Truncating here dropped it, and the streaming path stopped doing so
-        # when its terminal state was replaced -- leaving the two disagreeing
-        # about the same output.
-        before = text[: section_match.start()]
-        after = text[section_match.end() :]
-        return ((before.strip() + after) if entries else text), entries
+    def region_end(cls, region: str) -> int:
+        at = region.find(KIMI_SECTION_END)
+        return at + len(KIMI_SECTION_END) if at != -1 else 0
 
-    def process(self, text: str) -> list:
-        results: list = []
+    @classmethod
+    def parse_region(
+        cls, region: str, tools: list | None, *, at_end: bool
+    ) -> RegionParse:
+        """One section: everything between its two markers, or what arrived.
 
-        if self.state == 0:
-            # Held back: only a suffix that could still grow into the section
-            # marker. It used to be `"<|tool" not in self.buf` over a buffer
-            # that was never cleared while that held, so a single `<|tool` --
-            # or an answer merely discussing one -- withheld everything after
-            # it until the stream ended. The 30-character floor went with it;
-            # the scanner's bound is the marker's own length.
-            scan = self._scanner.feed(text)
-            if scan.released:
-                results.append(("content", scan.released))
-            if scan.hit is None:
-                return results
-            self.state = 1
-            self.buf = ""
-            self._section_calls = 0
-            self._trigger_tail = ""
-            # Falls through rather than returning: the whole section, and the
-            # answer after it, can arrive in the same chunk. Returning here
-            # left the section-end handling below unreached and `flush` then
-            # discarded the buffer, so the same text delivered in full at
-            # seven characters a chunk lost its last 18 in one -- and one big
-            # chunk is exactly what `merge_chunk` coalesces to under load.
-            text = scan.rest
-
-        # Accumulated in a list and searched only when something could have
-        # completed. `self.buf += text` on an attribute is quadratic -- see
-        # `Region` -- and scanning the whole buffer per chunk is a second
-        # factor on top of it: a 50 KB argument cost 55 ms of event-loop CPU
-        # against Qwen's 4 for the same payload, and the gap widens with size.
-        # Only these two markers can end an entry or the section, so until one
-        # of them arrives there is nothing to look at. The tail carries the
-        # bytes a marker split across the boundary would need.
-        self.region.append(text)
-        probe = self._trigger_tail + text
-        self._trigger_tail = probe[-_TRIGGER_TAIL:]
-        if not any(m in probe for m in _DRAIN_TRIGGERS):
-            return results
-
-        self.buf += self.region.take()
-        if KIMI_SECTION_END not in self.buf:
-            results.extend(self._drain_entries())
-            # Whatever is left is the entry still arriving; back it goes, so
-            # the next chunk appends rather than copies it again.
-            self.region.append(self.buf)
-            self.buf = ""
-            return results
-
-        section, _, after = self.buf.partition(KIMI_SECTION_END)
-        self.buf = section
-        results.extend(self._drain_entries())
-        # This section's own count, not the running total. `emitted_calls` is
-        # cumulative, so after one real call every later section read as
-        # fulfilled and the branch below stopped running for the rest of the
-        # stream: prose quoting both section tokens was deleted outright.
-        if self._section_calls:
-            results.append(("tool_call_end", None))
-        else:
-            # A start marker is not a promise, for this format too. The
-            # section body was dropped here and `state = 2` then discarded the
-            # rest of the stream: an answer quoting both section tokens
-            # delivered 26 of its 135 characters when fed four at a time.
-            kept = KIMI_SECTION_BEGIN + section + KIMI_SECTION_END
-            results.append(("content", kept))
-        # Back to plain content, not a terminal state: text after the section
-        # is still the answer.
-        self.state = 0
-        self.buf = ""
-        self._trigger_tail = ""
-        if after:
-            results.extend(self.process(after))
-
-        return results
-
-    def _drain_entries(self) -> list:
-        """Emit every complete tool-call entry sitting in the buffer."""
-        results: list = []
-        while "<|tool_call_begin|>" in self.buf and "<|tool_call_end|>" in self.buf:
-            match = _ENTRY_RE.search(self.buf)
-            if not match:
-                break
-
-            name = match.group(1)
-            index = int(match.group(2))
-            arguments = match.group(3).strip()
-
-            results.extend(self._start_event(index, f"functions.{name}:{index}", name))
-            # Unconditional, empty arguments included: a zero-parameter tool
-            # is a call the client should run, and `finish_reason` keys on
-            # this event. Gating it here reported `stop` for a response that
-            # had already sent a `tool_calls` delta.
-            results.append(
-                (
-                    "tool_call_args",
-                    {"index": index, "function": {"arguments": arguments}},
-                )
-            )
-
-            self.buf = self.buf[match.end() :]
-            self.emitted_calls += 1
-            self._section_calls += 1
-
-        return results
-
-    def flush(self) -> list:
-        results: list = []
-        if self.state == 0:
-            # The scanner owns the held tail now, and `self.buf` is never
-            # written in this state -- draining only `self.buf` here dropped
-            # whatever was still being read ahead. Six characters on
-            # `process("hello <|tool")`.
-            held = self._scanner_cache.flush() if self._scanner_cache else ""
-            rest = held + self.buf
-            self.buf = ""
-            if rest:
-                results.append(("content", rest))
-        elif self.state == 1:
-            # Whatever `process` left unexamined, because no drain trigger had
-            # arrived yet. At end of stream there is nothing more coming, so
-            # this is the one place it always has to be looked at.
-            self.buf += self.region.take()
-            self._trigger_tail = ""
-            results.extend(self._drain_entries())
-            if self._section_calls > 0:
-                results.append(("tool_call_end", None))
-            else:
-                # The section opened and closed nothing. Same rule as every
-                # other format: a start marker is not a promise -- including
-                # when the answer stops on the marker itself, where `self.buf`
-                # is empty and an `elif` on it dropped all 29 characters.
-                results.append(("content", KIMI_SECTION_BEGIN + self.buf))
-                self.buf = ""
-        return results
+        `region_end` hands this exactly one section at a time, so a response
+        with two of them is two regions and the text between and after them
+        reaches the client. Reading the *first* section out of the whole
+        output -- which is what `_SECTION_RE.search` did -- lost the second
+        call entirely and delivered the raw wire tokens of both as content.
+        """
+        entries = _parse_entries(region)
+        if not entries:
+            return RegionParse()
+        # The region opens at the *first* section marker in the text, which an
+        # answer that quotes one before making a real call puts in the wrong
+        # place. The section that matters is the last one opened before the
+        # first entry; everything before it is the answer.
+        first = _ENTRY_RE.search(region)
+        opened = region.rfind(KIMI_SECTION_BEGIN, 0, first.start())
+        return RegionParse(tuple(entries), max(opened, 0), len(region))

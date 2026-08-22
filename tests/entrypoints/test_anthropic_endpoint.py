@@ -541,9 +541,35 @@ class TestTheStopReasonTellsTheTruth:
         """
         src = pathlib.Path(api_server.__file__).read_text()
         assert (
-            src.count("anthropic_stop_reason(") >= 3
+            src.count("anthropic_stop_reason") >= 4
         ), "anthropic_stop_reason is defined but not called by both paths"
-        assert "stop_reason=(" in src, "the non-streaming response omits stop_reason"
+        assert (
+            "stop_reason=anthropic_stop_reason_with_calls(" in src
+        ), "the non-streaming response omits stop_reason"
+
+    @pytest.mark.parametrize(
+        "engine_reason, has_calls, expected",
+        [
+            ("max_tokens", True, "max_tokens"),
+            ("max_tokens", False, "max_tokens"),
+            ("eos", True, "tool_use"),
+            ("eos", False, "end_turn"),
+            ("stop_163586", True, "tool_use"),
+        ],
+    )
+    def test_being_cut_short_outranks_having_made_a_call(
+        self, engine_reason, has_calls, expected
+    ):
+        """`tool_use` says "act on this"; `max_tokens` says "this is not all of
+        it". A response cut off mid-call parses to a call with a silently
+        truncated argument value -- every format's unclosed-region branch
+        exists to salvage exactly that -- and reporting `tool_use` for it told
+        the client to run a tool with half its arguments and no sign anything
+        was missing."""
+        assert (
+            api_server.anthropic_stop_reason_with_calls(engine_reason, has_calls)
+            == expected
+        )
 
 
 class TestTheOffSwitchIsRecognised:
@@ -661,13 +687,18 @@ class TestSeparationIsUnconditional:
         _, calls = parse_tool_calls(body, None, parser_cls=QwenXmlParser)
         assert len(calls) == 1
 
-    @pytest.mark.parametrize("helper", ["separate_reasoning", "ReasoningFilter"])
+    @pytest.mark.parametrize("helper", [".split(", ".stream("])
     def test_neither_path_gates_it(self, helper):
         """Both endpoint bodies are unreachable from a unit test, so this
         counts call sites and asserts the gate that used to wrap them is
-        gone."""
+        gone.
+
+        Spelled as the two `ReasoningChannel` accessors: separating is now one
+        object with one method per delivery mode, and the endpoint reaches the
+        module-level helpers through it rather than by name.
+        """
         src = pathlib.Path(api_server.__file__).read_text()
-        assert helper + "(" in src
+        assert helper in src
         assert "anthropic_reasoning_split" not in src
         assert "anthropic_reasoning_filter" not in src
         assert "anthropic_tool_format" not in src

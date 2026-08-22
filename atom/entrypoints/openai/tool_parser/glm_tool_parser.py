@@ -21,10 +21,36 @@ from typing import Any, ClassVar
 
 from .qwen3_tool_parser import QWEN_TOOL_PREFIX
 from .schema import build_param_types, coerce_json_or_raw
-from .tool_parser import BufferedMarkerParser, ToolCall, unique_tool_call_id
+from .tool_parser import (
+    RegionParse,
+    ToolCall,
+    ToolCallParser,
+    continues_a_call,
+    unique_tool_call_id,
+)
 
 TOOL_CALL_OPEN = "<tool_call>"
-_TOOLCALL_RE = re.compile(r"<tool_call>(.*?)</tool_call>|<tool_call>(.*)$", re.DOTALL)
+# A call's body may not contain another `<tool_call>`. Without that the
+# non-greedy match ran from the *first* opener in the region to the first
+# close, so an answer that quotes the tag and then makes a real call produced
+# a "name" of the whole sentence -- rejected by `_TOOL_NAME_RE`, after which
+# `finditer` resumed past the real call and found nothing at all. The tag is
+# what this format opens a call with, so it cannot appear inside one.
+_NOT_NESTED = r"(?:(?!<tool_call>).)"
+_TOOLCALL_RE = re.compile(
+    r"<tool_call>("
+    + _NOT_NESTED
+    + r"*?)</tool_call>|<tool_call>("
+    + _NOT_NESTED
+    + r"*)",
+    re.DOTALL,
+)
+# No `$` on the unclosed alternative. An unclosed call ends where the next one
+# opens, not only at end of stream: with the anchor, a call the model forgot
+# to close followed by a second call matched neither alternative at the first
+# opener, so `finditer` skipped the first call entirely and returned the
+# second -- one call where the model made two, and a different one from the
+# one the early name had already announced.
 # A tool name is an identifier, which is what the model was given. Without
 # this the unterminated branch above turns any prose after a `<tool_call>`
 # into a call: an answer explaining that "the model writes <tool_call>
@@ -47,38 +73,12 @@ _ARG_RE = re.compile(
 )
 
 
-# Both call shapes, so the *first* call is what matches rather than the first
-# one that happens to take arguments. Requiring `<arg_key>` skipped a
-# zero-argument call and announced the name of the one after it.
-#
-# Anchored at the region's own first `<tool_call>`, not searched for: `parse`
-# reads the unclosed case from the first one to end-of-string, so when that
-# one carries no usable name it produces nothing at all -- while a `search`
-# here slid forward to a later opener and announced its name. Measured on
-# `<tool_call><arg_key><tool_call>get_weather<arg_key>`, at every chunk size.
-_PEEK_NAME_RE = re.compile(r"<tool_call>\s*(\w[\w.\-]*)\s*(?:<arg_key>|</tool_call>)")
-
-
-class GlmParser(BufferedMarkerParser):
+class GlmParser(ToolCallParser):
     NAME: ClassVar[str] = "glm"
+    RECOGNISES_A_CALL_IN_PROGRESS: ClassVar[bool] = True
     START_MARKERS: ClassVar[tuple[str, ...]] = ("<tool_call>",)
-
-    @classmethod
-    def peek_name(cls, region: str, tools: list | None = None) -> str | None:
-        """`<tool_call>NAME<arg_key>` -- the name is what precedes the first
-        argument key, so it is legible only once that key arrives.
-
-        The one format whose peek and `parse` already agreed. Both followers
-        it accepts are real: `<arg_key>` starts the arguments and
-        `</tool_call>` closes the very block the name opened -- unlike Qwen's,
-        where `</tool_call>` closes an *outer* wrapper and left the inner
-        block unterminated.
-        """
-        start = region.find(TOOL_CALL_OPEN)
-        if start == -1:
-            return None
-        m = _PEEK_NAME_RE.match(region, start)
-        return m.group(1) if m else None
+    # No `CALL_CLOSERS`: this format's `</tool_call>` closes the call itself
+    # rather than a wrapper around it, so `_TOOLCALL_RE` already spans it.
 
     @classmethod
     def detect(cls, text: str) -> bool:
@@ -94,21 +94,26 @@ class GlmParser(BufferedMarkerParser):
         return "<arg_key>" in text
 
     @classmethod
-    def parse(cls, text: str, tools: list | None) -> tuple[str, list[ToolCall]]:
-        """Parse GLM tool calls; return (leading_content, tool_calls)."""
+    def parse_region(
+        cls, region: str, tools: list | None, *, at_end: bool
+    ) -> RegionParse:
         param_types = build_param_types(tools)
-        start = text.find("<tool_call>")
-        if start == -1:
-            return text, []  # no call -> verbatim; see ToolCallParser.parse
-        content = text[:start]
         tool_calls: list[ToolCall] = []
-        for m in _TOOLCALL_RE.finditer(text):
+        begin = end = 0
+        for m in _TOOLCALL_RE.finditer(region):
             closed = m.group(1) is not None
             body = m.group(1) if closed else m.group(2)
             if not body:
                 continue
             ak = body.find("<arg_key>")
-            if closed or ak != -1:
+            # The argument opener having arrived *is* the follower evidence,
+            # and it is consumed into the name/body split rather than left in
+            # `rest` -- so an empty `rest` here means "the follower came and
+            # went", not "nothing came". Reading the two the same way made a
+            # call whose arguments were still arriving unnameable, which is
+            # the one shape announcing early exists for.
+            arg_key_arrived = ak != -1
+            if closed or arg_key_arrived:
                 name, rest = body[:ak].strip() if ak != -1 else body.strip(), ""
             else:
                 # Unclosed and no complete `<arg_key>` yet. The name runs to
@@ -132,7 +137,11 @@ class GlmParser(BufferedMarkerParser):
             # used to be rejected along with the prose.
             if not closed and not (
                 name in param_types
-                and (not rest or _ARG_OPENER.startswith(rest[: len(_ARG_OPENER)]))
+                and (
+                    arg_key_arrived
+                    or (not rest and at_end)
+                    or continues_a_call(rest, (_ARG_OPENER,), arrived=not at_end)
+                )
             ):
                 continue
             types = param_types.get(name, {})
@@ -141,6 +150,8 @@ class GlmParser(BufferedMarkerParser):
                 k = pm.group(1).strip()
                 if k:
                     args[k] = coerce_json_or_raw(pm.group(2), types.get(k))
+            if not tool_calls:
+                begin = m.start()
             tool_calls.append(
                 ToolCall(
                     id=unique_tool_call_id(),
@@ -151,4 +162,5 @@ class GlmParser(BufferedMarkerParser):
                     },
                 )
             )
-        return (content.strip() if tool_calls else text), tool_calls
+            end = cls.markup_end(region, m.end())
+        return RegionParse(tuple(tool_calls), begin, end)

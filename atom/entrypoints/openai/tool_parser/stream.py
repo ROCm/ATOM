@@ -1,89 +1,537 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Streaming facade: read ahead of the chosen format, then delegate to it."""
+"""The engine: one reader of a model's output, for both delivery modes.
 
-from dataclasses import dataclass, field
+A format (:class:`~.tool_parser.ToolCallParser`) says what its own bytes mean.
+Everything a reader has to decide that is *not* particular to a format is
+decided here, once: how far ahead of a region it is safe to release, which
+markers are framing and get dropped, what a region that parses to no call
+means, which index a call is stamped with, and what happens to the answer that
+follows the markup.
+
+`stream=false` is :func:`read_whole`, which is this engine over a single chunk.
+That is the whole of why the two delivery modes agree -- not a test that
+compares them, but no second implementation to compare against.
+"""
+
+import logging
 
 from ..marker_scanner import MarkerScanner
-from .tool_parser import ToolCallParser
+from .schema import build_param_types
+from .tool_parser import NO_CALLS, ToolCall, ToolCallParser, unique_tool_call_id
+
+logger = logging.getLogger("atom")
+
+# How far into a region a name may be before the peek gives up. Every
+# format on this box puts it in the first 30-70 characters; the margin is
+# for a long name or leading whitespace, and the bound is what keeps the
+# peek from re-scanning a growing buffer once per token.
+_PEEK_WINDOW = 256
+
+# KNOWN LIMIT, and deliberately not fixed here: a region runs from its opening
+# marker to wherever it closes, and for the four XML-ish formats that is end of
+# stream. An answer that merely *mentions* `<tool_call>` therefore arrives in
+# one frame at the end -- measured on a GLM answer naming the tag at character
+# 29 and then explaining for 1234 more, 98% of it at EOS.
+#
+# A "give up on a region that has produced nothing after N bytes" probe was
+# tried and reverted. It rests on acceptance being monotone in how many bytes
+# have arrived, and that is false: MiniMax gates its in-progress test on the
+# first tag being in the declared schema, and DSML's wrapper-less and
+# direct-JSON branches cannot match any prefix at all -- so real calls over
+# N bytes were delivered as text, differently from `stream=false`, on three of
+# the six formats. It was also quadratic, because giving up re-feeds bytes that
+# immediately reopen a region with a fresh budget: 1.19 ms -> 18.2 s on a
+# 250 KB answer, in the request coroutine, stalling the event loop for
+# everything else.
+#
+# Fixing the latency needs the *format* to say "this can no longer become a
+# call", which is a different question from "does not parse yet" and one no
+# format answers today.
 
 
-@dataclass
+class Region:
+    """The bytes buffered since a tool-call region opened.
+
+    A list and a join, not `self.buf += text`. Appending to a *string
+    attribute* is quadratic in CPython: the instance dict holds a reference,
+    so the in-place fast path never applies and every chunk copies the whole
+    buffer. Measured on a 128 KB tool call, streamed four characters at a
+    time: 23 ms of event-loop CPU in `process` alone, growing 17x for an 8x
+    payload while `flush` stayed linear. The same loop over a *local* string
+    is linear, which is why a microbenchmark of `s += x` finds nothing.
+
+    `head` is the first `_PEEK_WINDOW` bytes, kept separately so the early
+    name announcement never needs the region materialised -- it only ever
+    looks that far in, and handing it the whole buffer is how the quadratic
+    scan it already fixed once could come back.
+    """
+
+    __slots__ = ("_len", "_parts", "head")
+
+    def __init__(self) -> None:
+        self._parts: list[str] = []
+        self._len = 0
+        self.head = ""
+
+    def append(self, text: str) -> None:
+        if not text:
+            return
+        self._parts.append(text)
+        self._len += len(text)
+        if len(self.head) < _PEEK_WINDOW:
+            self.head = (self.head + text)[:_PEEK_WINDOW]
+
+    def text(self) -> str:
+        """Everything buffered, without giving it up.
+
+        Collapses the parts as a side effect, so asking twice costs one join
+        rather than two. Only the region-close probe asks, and only once a
+        literal that could close the region has actually arrived.
+        """
+        if len(self._parts) > 1:
+            self._parts = ["".join(self._parts)]
+        return self._parts[0] if self._parts else ""
+
+    def take(self) -> str:
+        """Everything buffered, and start again."""
+        out = self.text()
+        self._parts.clear()
+        self._len = 0
+        self.head = ""
+        return out
+
+    def __len__(self) -> int:
+        return self._len
+
+    def __bool__(self) -> bool:
+        return self._len > 0
+
+
+def _peek_declared(tools: list | None) -> frozenset[str]:
+    return frozenset(build_param_types(tools))
+
+
 class ToolCallStreamParser:
-    """Stateful streaming parser for one request's output.
+    """Reads one request's output, in chunks or all at once.
 
-    Emits structured events:
-    - ("content", text) — regular content before tool calls
-    - ("tool_call_start", {"index": N, "id": ..., "function": {"name": ..., "arguments": ""}})
-    - ("tool_call_args", {"index": N, "function": {"arguments": chunk}})
-    - ("tool_call_end", None) — all tool calls complete
+    Emits ``(event_type, data)`` tuples:
+
+    - ``("content", text)`` -- answer text, in the order the model wrote it
+    - ``("tool_call_start", {"index", "id", "type", "function": {"name", ...}})``
+    - ``("tool_call_args", {"index", "function": {"arguments": ...}})``
+    - ``("tool_call_end", None)`` -- a region's calls are complete
 
     ``parser_cls`` is the format this model was resolved to at startup, from
     its chat template (`registry.resolve_from_prompt`). ``None`` means no
-    registered format recognised it: this then emits everything as content and
-    parses nothing, which the server announced at startup. It is deliberately
-    not a fallback to guessing — the guess this replaces mis-read a Hermes
-    `<tool_call>{...}` as GLM and delivered the whole JSON blob as the tool's
-    *name*.
+    registered format recognised it: everything is emitted as content and
+    nothing is parsed, which the server announced at startup. It is
+    deliberately not a fallback to guessing -- the guess this replaces
+    mis-read a Hermes `<tool_call>{...}` as GLM and delivered the whole JSON
+    blob as the tool's *name*.
+
+    ``suppress_calls`` is ``tool_choice: "none"``. The format is still read --
+    that is the difference from ``parser_cls=None``, and it matters, because a
+    format whose framing wraps *every* answer would otherwise leak that
+    framing to the client the moment a request forbade tool calls. What is
+    suppressed is dispatch: a region's bytes are released as the prose the
+    request said they must be.
 
     ``tools`` enables JSON-Schema type coercion of parameter values. It may be
-    assigned after construction (several call sites do) and is re-read on every
-    delegated call, so it takes effect as long as it is set before the stream
-    ends.
+    assigned after construction (several call sites do) and is read when a
+    region closes, so it takes effect as long as it is set before then.
     """
 
-    tools: list | None = None
-    parser_cls: type[ToolCallParser] | None = None
-    _parser: ToolCallParser | None = field(default=None, repr=False)
-    # Reads ahead of the region: releases everything that cannot begin one of
-    # `parser_cls`'s own openers. `None` once the region has started, or when
-    # there is no format to look for.
-    _scanner: MarkerScanner | None = field(default=None, repr=False)
-
-    def __post_init__(self):
-        if self.parser_cls is not None:
-            self._scanner = MarkerScanner(self.parser_cls.START_MARKERS)
+    def __init__(
+        self,
+        tools: list | None = None,
+        parser_cls: type[ToolCallParser] | None = None,
+        *,
+        suppress_calls: bool = False,
+    ) -> None:
+        self.tools = tools
+        self.parser_cls = parser_cls
+        self.suppress_calls = suppress_calls
+        # Reads ahead of the region: releases everything that cannot begin one
+        # of `parser_cls`'s own markers, and drops the ones that are framing.
+        # One scanner, not one here and another on the format -- two readers
+        # of the same marker set is how framing came to be dropped before a
+        # region and kept inside one.
+        self._scanner = (
+            MarkerScanner(parser_cls.START_MARKERS) if parser_cls is not None else None
+        )
+        self._region: Region | None = None
+        # The tail a region-closing literal split across a chunk boundary
+        # would need, and nothing more.
+        self._end_markers = parser_cls.REGION_END_MARKERS if parser_cls else ()
+        self._end_tail_len = max((len(m) for m in self._end_markers), default=1) - 1
+        self._end_tail = ""
+        # Stamped by the engine, so no format has to. Kimi took its index off
+        # the wire, where every section restarts at 0, and a client
+        # accumulating arguments by index merged two calls into one.
+        self._index = 0
+        self._emitted = 0
+        # The name already sent for the region being buffered, if any.
+        self._announced: str | None = None
+        # Set once no name can still turn up, so the peek stops running per
+        # token over a region that will never yield one.
+        self._peek_exhausted = False
+        # The request's declared names, built once rather than per token.
+        self._declared: frozenset[str] | None = None
 
     @property
     def fmt(self) -> str | None:
         """The format this stream is being read as, or None."""
         return self.parser_cls.NAME if self.parser_cls is not None else None
 
+    # -- public ------------------------------------------------------------
     def process(self, text: str) -> list:
-        """Process a text chunk and return list of (event_type, data) tuples."""
+        """Consume one chunk; return the events it completed."""
         if self.parser_cls is None:
             return [("content", text)] if text else []
-
-        out: list = []
-        while self._parser is None:
-            scan = self._scanner.feed(text)
-            if scan.released:
-                out.append(("content", scan.released))
-            if scan.hit is None:
-                return out
-            if not self.parser_cls.opens_region(scan.hit):
-                # Framing this format wraps *every* answer in, which the
-                # non-streaming path also removes. Dropping it and carrying on
-                # is what lets such a format stream at all: treating it as a
-                # handover meant a Kimi-K3 answer, which opens with
-                # `<|open|>response<|sep|>`, buffered its entire body to EOS
-                # -- measured, 324 of 324 characters arriving in one frame.
-                text = scan.rest
-                continue
-            # The region has opened. It and everything after it belong to the
-            # format, not to the client.
-            self._scanner = None
-            self._parser = self.parser_cls(tools=self.tools)
-            text = scan.hit + scan.rest
-
-        self._parser.tools = self.tools
-        return out + self._parser.process(text)
+        return self._pump(text, final=False)
 
     def flush(self) -> list:
-        """Flush whatever is still held; at EOS none of it became a region."""
-        if self._parser is None:
-            rest = self._scanner.flush() if self._scanner is not None else ""
-            return [("content", rest)] if rest else []
-        self._parser.tools = self.tools
-        return self._parser.flush()
+        """End of stream: nothing more is coming, so nothing is held back."""
+        if self.parser_cls is None:
+            return []
+        return self._pump("", final=True)
+
+    # -- the loop ----------------------------------------------------------
+    def _pump(self, text: str, *, final: bool) -> list:
+        """Read `text`, and whatever a closing region hands back, to a stop.
+
+        The one loop. Content before a region, framing, the region itself and
+        the answer after it are all reached from here, so "what happens to
+        these bytes" has a single answer per byte rather than one per format
+        per delivery mode.
+        """
+        out: list = []
+        while True:
+            if self._region is None:
+                if text:
+                    scan = self._scanner.feed(text)
+                    text = ""
+                    if scan.released:
+                        out.append(("content", scan.released))
+                    if scan.hit is not None:
+                        if not self.parser_cls.opens_region(scan.hit):
+                            # Framing this format wraps every answer in.
+                            # Dropping it and carrying on is what lets such a
+                            # format stream at all: treating it as a handover
+                            # meant a Kimi-K3 answer, which opens with
+                            # `<|open|>response<|sep|>`, buffered its entire
+                            # body to EOS -- 324 of 324 characters in one
+                            # frame at the end.
+                            text = scan.rest
+                        elif self.suppress_calls:
+                            # The request forbade tool calls, so this region
+                            # cannot become one and there is nothing to wait
+                            # for. The marker is answer text like everything
+                            # around it. Buffering it anyway would hold the
+                            # rest of the reply to end of stream for a request
+                            # that had already said what the answer is.
+                            out.append(("content", scan.hit))
+                            text = scan.rest
+                        else:
+                            # The region has opened. Opened, but not read
+                            # here: the marker goes back through the region
+                            # branch below, so a chunk carrying a whole call
+                            # is closed on this pass rather than one late.
+                            self._region = Region()
+                            self._end_tail = ""
+                            text = scan.hit + scan.rest
+                        continue
+                if not final:
+                    return out
+                held = self._scanner.flush()
+                if held:
+                    out.append(("content", held))
+                return out
+
+            probe = ""
+            if text:
+                if self._end_markers:
+                    probe = self._end_tail + text
+                    self._end_tail = (
+                        probe[-self._end_tail_len :] if self._end_tail_len else ""
+                    )
+                self._region.append(text)
+                text = ""
+                out.extend(self._announce())
+            end = len(self._region) if final else self._closed_len(probe)
+            if end <= 0:
+                return out
+            body = self._region.take()
+            self._region = None
+            self._end_tail = ""
+            events, rest = self._close_region(body[:end])
+            out.extend(events)
+            text = rest + body[end:]
+
+    def _closed_len(self, probe: str) -> int:
+        """Whether the open region has closed, without materialising it.
+
+        The probe is the literal itself: nothing in a chunk can close a region
+        unless one of `REGION_END_MARKERS` lands in it, so until one does
+        there is nothing to look at. Asking the format instead would mean
+        joining the buffer once per chunk, which is quadratic in the region --
+        measured at 55 ms of event-loop CPU on a 50 KB argument against 4 ms
+        for the same payload in a format that did not do it.
+
+        `probe` is the incoming chunk with the tail a marker split across the
+        boundary would need, so a section end arriving one character at a time
+        is still seen.
+        """
+        if not probe or not any(m in probe for m in self._end_markers):
+            return 0
+        return self.parser_cls.region_end(self._region.text())
+
+    def _close_region(self, body: str) -> tuple[list, str]:
+        """One region's events, and the bytes that were not its markup.
+
+        The announcement is per region and is settled here either way: bound
+        to the region's first call, or dropped. Carrying it past the region it
+        was made in is how one region's peek came to be matched against the
+        next region's parse, and reported as a mismatch.
+        """
+        parsed = (
+            NO_CALLS
+            if self.suppress_calls
+            else self.parser_cls.parse_region(body, self.tools, at_end=True)
+        )
+        events: list = []
+        rest = ""
+        if parsed.calls:
+            begins = min(max(parsed.begins, 0), len(body))
+            if begins:
+                events.append(("content", body[:begins]))
+            for call in parsed.calls:
+                events.extend(self._emit_call(call))
+            events.append(("tool_call_end", None))
+            # Bounded to at least one byte past `begins`. A format that
+            # reported less would have the engine hand the whole region back,
+            # find the same marker and parse it again forever; the property
+            # tests hold every registered format to
+            # `begins < consumed <= len(region)`.
+            consumed = min(max(parsed.consumed, begins + 1), len(body))
+            rest = body[consumed:]
+        elif body:
+            # A start marker is not a promise. An answer explaining that a
+            # model "writes <tool_call> to call something" opens the region
+            # and never closes it, and this used to drop everything from the
+            # marker on -- no event, no error, `finish_reason` still `stop`.
+            # Fifty characters of eighty-two, on the shapes measured.
+            #
+            # Released verbatim, and released here rather than handed back:
+            # handing it back would find the same marker again.
+            #
+            # A name may already have gone out, and there is no retracting it.
+            # What there is: no arguments follow, so nothing downstream counts
+            # this as a usable call and `finish_reason` stays `stop`. The text
+            # is still delivered -- the promise costs a dangling name, not the
+            # answer.
+            events.append(("content", body))
+        if self._announced is not None and not parsed.calls:
+            # The name went out and nothing will follow it. Step past the index
+            # it was sent at, exactly as `_start_event` does when it drops one:
+            # a later call landing on an index the client has already bound to
+            # a name is merged into it by any accumulator that keys on index,
+            # which is the OpenAI streaming contract.
+            #
+            # Not reachable while every format's acceptance is monotone in how
+            # many bytes have arrived -- an announcement is the first call of
+            # `parse_region` over a prefix of these same bytes. That property
+            # is fuzzed rather than assumed
+            # (`TestTheEarlyNameCannotDisagreeWithTheParse`), and this is what
+            # the wire looks like if it ever stops holding.
+            self._index += 1
+        self._announced = None
+        self._peek_exhausted = False
+        return events, rest
+
+    # -- events ------------------------------------------------------------
+    def _announce(self) -> list:
+        """Send the tool's name as soon as the region reveals it, once.
+
+        The name is read out of ``parse_region`` itself, over the region so
+        far and with ``at_end=False``. That is what makes it agree with the
+        call that eventually goes out: same function, same enumeration, the
+        second run seeing a superset of the first's bytes. Every format used
+        to answer this with a regex of its own, and four of the five had it
+        disagree with their parse -- most recently over a self-closing
+        ``<invoke name="x"/>`` the peek skipped and the parse returned first,
+        which put three tool calls on the wire for a response containing two.
+
+        Only for a name the request actually declared. That check is what
+        makes an early name safe to send: it cannot be taken back, and an
+        answer merely quoting `<tool_call><function=NAME>` opens a region too.
+        A name the client never offered is overwhelmingly likelier to be prose
+        than a call, so it waits for the region to close like everything else.
+        SGLang's cursor parsers announce with no such check and will emit a
+        call named after whatever follows the tag.
+
+        Asked of `Region.head` -- the first `_PEEK_WINDOW` bytes and no more
+        -- and asked at most once more after it fills. Running a format's
+        regex over the whole region on every chunk is quadratic in the
+        response and measured 3.0 -> 9.8 -> 36 -> 137 ms across 2k/4k/8k/16k
+        tokens: the shape `marker_scanner` exists to retire, put back one
+        layer up.
+        """
+        if (
+            self._announced is not None
+            or self._peek_exhausted
+            or self.suppress_calls
+            or not self.tools
+        ):
+            return []
+        head = self._region.head
+        calls = self.parser_cls.parse_region(head, self.tools, at_end=False).calls
+        if not calls:
+            self._peek_exhausted = len(head) >= _PEEK_WINDOW
+            return []
+        name = calls[0].function["name"]
+        if self._declared is None:
+            self._declared = _peek_declared(self.tools)
+        if name not in self._declared:
+            self._peek_exhausted = True
+            return []
+        self._announced = name
+        return [
+            (
+                "tool_call_start",
+                {
+                    "index": self._index,
+                    "id": unique_tool_call_id(),
+                    "type": "function",
+                    "function": {"name": name, "arguments": ""},
+                },
+            )
+        ]
+
+    def _start_event(self, call: ToolCall) -> list:
+        """The `tool_call_start` for a call, unless its name already went out.
+
+        A mismatch is not reachable: the announcement is the first call of
+        ``parse_region`` over a prefix of these same bytes, and acceptance is
+        monotone in what has arrived. It is checked rather than asserted
+        because the caller is on a live SSE stream that has already sent its
+        200 -- an exception here reached the client as a connection cut
+        mid-frame with no `[DONE]` and, on the `n>1` path, took the other
+        choices with it.
+
+        So it is logged and recovered from. The announced name is already on
+        the wire and cannot be retracted, but it can be left with no arguments
+        -- the shape every other unfulfilled announcement takes, and one that
+        `completes_a_tool_call` and `finish_reason` both read as "not a call".
+        The real call goes out at the next index, whole.
+        """
+        name = call.function["name"]
+        if self._announced is not None and self._announced != name:
+            logger.warning(
+                "%s announced %r and then parsed %r from the same region; "
+                "sending %r as a new call and leaving %r without arguments",
+                self.parser_cls.__name__,
+                self._announced,
+                name,
+                name,
+                self._announced,
+            )
+            self._announced = None
+            # Past the dangling announcement, so the real call does not land
+            # on an index the client has already bound to the wrong name.
+            self._index += 1
+            return self._start_event(call)
+        if self._announced is not None:
+            self._announced = None  # binds to the first call of the region only
+            return []
+        return [
+            (
+                "tool_call_start",
+                {
+                    "index": self._index,
+                    "id": call.id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": ""},
+                },
+            )
+        ]
+
+    def _emit_call(self, call: ToolCall) -> list:
+        """One parsed call as start+args events, at the engine's own index.
+
+        The arguments go out unconditionally, empty ones included: a
+        zero-parameter tool is still a call the client should run, and
+        `finish_reason` keys on this event. Gating it reported `stop` for a
+        response that had already sent a `tool_calls` delta.
+        """
+        events = self._start_event(call)
+        events.append(
+            (
+                "tool_call_args",
+                {
+                    "index": self._index,
+                    "function": {"arguments": call.function["arguments"]},
+                },
+            )
+        )
+        self._index += 1
+        self._emitted += 1
+        return events
+
+
+def read_whole(
+    parser_cls: type[ToolCallParser] | None,
+    text: str,
+    tools: list | None = None,
+    *,
+    suppress_calls: bool = False,
+) -> tuple[str, list[ToolCall]]:
+    """A complete output as ``(content, calls)`` -- the engine, in one chunk.
+
+    Not a second implementation of anything. `stream=false` and `stream=true`
+    read the model's words with the same code, so the four rules they used to
+    answer separately -- where content ends, whether an unclosed tag is a call,
+    what a region that parses to nothing means, which bytes are framing -- have
+    one answer each and no way to drift.
+
+    Content comes back byte-for-byte except for markers the format declares:
+    the region a call occupied, and the framing `opens_region` says no to.
+    Nothing is trimmed. A trailing `.strip()` here cost a code-block answer its
+    final newline, which streaming had no way to reproduce.
+    """
+    engine = ToolCallStreamParser(
+        tools=tools, parser_cls=parser_cls, suppress_calls=suppress_calls
+    )
+    events = engine.process(text)
+    events.extend(engine.flush())
+    content: list[str] = []
+    calls: list[ToolCall] = []
+    pending: dict | None = None
+    for etype, data in events:
+        if etype == "content":
+            content.append(data)
+        elif etype == "tool_call_start":
+            fn = data["function"]
+            pending = {"id": data["id"], "name": fn["name"]}
+        elif etype == "tool_call_args":
+            if pending is None:
+                # An announcement is what normally supplies the name, and it
+                # cannot go missing between the two events of one call -- but
+                # a format whose peek and parse disagree leaves a start event
+                # behind without one. Dropping the arguments is what the
+                # streaming clients do with the same pair.
+                continue
+            calls.append(
+                ToolCall(
+                    id=pending["id"],
+                    type="function",
+                    function={
+                        "name": pending["name"],
+                        "arguments": data["function"]["arguments"],
+                    },
+                )
+            )
+            pending = None
+    return "".join(content), calls

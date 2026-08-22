@@ -19,17 +19,13 @@ from dataclasses import dataclass
 # gone without, which it pays for once per token on every stream -- including
 # models whose reasoning markers never appear.
 from .marker_scanner import held_suffix_len
-from .reasoning_dialects import DIALECTS
+from .reasoning_dialects import DIALECTS, FALLBACK_DIALECT, ReasoningDialect
 
-# Marker tables derived from the dialect registry (no model literals here).
-_THINK_END_MARKERS = tuple(m for d in DIALECTS for m in d.end_markers)
 # Markers a rendered prompt ends with when the template already opened reasoning
 # (the output then begins inside the reasoning channel with no opening tag).
+# Every dialect's, because this is asked of a *prompt* before the response's
+# dialect matters, and a prompt carries at most one of them.
 _REASONING_OPEN_MARKERS = tuple(d.prompt_open_marker for d in DIALECTS)
-# Markers the model itself emits mid-output to open reasoning (e.g. "<think>").
-_OUTPUT_OPEN_MARKERS = tuple(
-    d.output_open_marker for d in DIALECTS if d.output_open_marker
-)
 # Reasoning-effort levels accepted across all loaded dialects' chat templates.
 # resolve_thinking() clamps a request's effort to this set before forwarding it,
 # so an effort no template understands is never passed through.
@@ -113,11 +109,20 @@ def _earliest_marker(buf: str, markers) -> tuple[int, str | None]:
 
 
 def separate_reasoning(
-    text: str, starts_thinking: bool = False
+    text: str,
+    starts_thinking: bool = False,
+    dialect: ReasoningDialect | None = None,
 ) -> tuple[str | None, str]:
     """Separate reasoning content from the final answer.
 
-    Tries each registered dialect in priority order; the first that applies wins.
+    ``dialect`` is the one this model speaks, resolved from its chat template
+    at startup (:func:`~.reasoning_dialects.resolve_dialect`). One, not each in
+    turn: trying them in order let any model's answer be split by a dialect it
+    does not speak, so an answer *about* Kimi's wire format lost the text
+    before a quoted channel token -- and the streaming filter, which used a
+    different rule again, kept it. Callers should go through
+    :class:`ReasoningChannel`, which carries this and ``starts_thinking``
+    together so the two paths cannot be given different ones.
 
     ``starts_thinking`` is the same answer :class:`ReasoningFilter` takes, and
     for the same reason: an output that begins inside the reasoning channel
@@ -131,16 +136,21 @@ def separate_reasoning(
         Tuple of (reasoning_content, content). reasoning_content is None if no
         thinking block was found.
     """
-    for dialect in DIALECTS:
-        result = dialect.split(text, starts_thinking)
-        if result is not None:
-            return result
+    result = (dialect or FALLBACK_DIALECT).split(text, starts_thinking)
+    if result is not None:
+        return result
     if starts_thinking:
         # The prompt opened the channel and the model never closed it, which
         # is what a reasoning model stopped at `max_tokens` looks like. It
         # produced reasoning and no answer; the streaming filter says exactly
         # that from state 1, and this has to agree.
-        return (text, "")
+        #
+        # `or None` because it has to agree on the empty case too: the filter
+        # emits no segment at all for an empty output, so a bare `text` here
+        # put `reasoning_content: ""` in the non-streaming body and nothing in
+        # the streamed one. Every other return in this function spells absence
+        # as `None`.
+        return (text or None, "")
     # No reasoning markers — return content as-is (tool calls parsed separately).
     return (None, text)
 
@@ -162,15 +172,29 @@ class ReasoningFilter:
     into the prompt itself (e.g. Kimi-K3 ends the prompt with its think opener):
     the output then begins *inside* the reasoning channel with no opening tag, so
     the filter must start in state 1.
+
+    ``dialect`` is the one this model speaks, and it is the same object
+    :func:`separate_reasoning` is given. This used to hold no dialect at all --
+    it closed the channel on the *union* of every registered dialect's end
+    markers -- so a `<think>` model quoting a K3 channel token ended its chain
+    of thought there while the non-streaming split ended it at the real
+    `</think>`. Go through :class:`ReasoningChannel` rather than passing this
+    by hand; that is what keeps the two paths on one answer.
     """
 
     state: int = 0
     buf: str = ""
     starts_thinking: bool = False
+    dialect: ReasoningDialect | None = None
 
     def __post_init__(self):
         if self.starts_thinking and self.state == 0:
             self.state = 1
+        speaking = self.dialect or FALLBACK_DIALECT
+        self._end_markers = speaking.end_markers
+        self._open_markers = (
+            (speaking.output_open_marker,) if speaking.output_open_marker else ()
+        )
 
     def _close_thinking(self, idx: int, marker: str) -> list:
         """A think-end marker was found at ``idx``: emit everything before it as
@@ -194,10 +218,10 @@ class ReasoningFilter:
         """State-1 helper: emit buffered reasoning up to a think-end marker; on
         match switch to content. Otherwise emit what's safe, holding back a
         partial trailing marker so it isn't split across chunks."""
-        idx, marker = _earliest_marker(self.buf, _THINK_END_MARKERS)
+        idx, marker = _earliest_marker(self.buf, self._end_markers)
         if idx != -1:
             return self._close_thinking(idx, marker)
-        hold = held_suffix_len(self.buf, _THINK_END_MARKERS)
+        hold = held_suffix_len(self.buf, self._end_markers)
         emit = self.buf[: len(self.buf) - hold] if hold else self.buf
         self.buf = self.buf[len(self.buf) - hold :] if hold else ""
         return [("reasoning_content", emit)] if emit else []
@@ -209,7 +233,7 @@ class ReasoningFilter:
         if self.state == 0:
             self.buf += text
             # A reasoning opener emitted in the output (e.g. "<think>").
-            oidx, omark = _earliest_marker(self.buf, _OUTPUT_OPEN_MARKERS)
+            oidx, omark = _earliest_marker(self.buf, self._open_markers)
             if oidx != -1:
                 before = self.buf[:oidx]
                 if before:
@@ -235,7 +259,7 @@ class ReasoningFilter:
                 # emitted as a tool call. vLLM's streaming path resolves this
                 # from the token vocabulary and buffers nothing; this is the
                 # same position, reached from the prompt.
-                hold = held_suffix_len(self.buf, _OUTPUT_OPEN_MARKERS)
+                hold = held_suffix_len(self.buf, self._open_markers)
                 cut = len(self.buf) - hold
                 if cut:
                     results.append(("content", self.buf[:cut]))
@@ -266,3 +290,37 @@ class ReasoningFilter:
                 results.append(("reasoning_content", self.buf))
             self.buf = ""
         return results
+
+
+@dataclass(frozen=True)
+class ReasoningChannel:
+    """How to read one response's reasoning channel, decided before it starts.
+
+    Two facts, and they have to travel together: which dialect the model
+    speaks, and whether its output begins inside the channel already. Passed
+    separately, they were passed differently -- the streaming filter got the
+    second and never the first, and answered with the union of every dialect's
+    markers instead. This is one object with one accessor per delivery mode,
+    so the two cannot be handed different answers.
+
+    ``starts_open`` is not simply "this template opens the channel": a request
+    that turns thinking off renders a prompt that does not, and OR-ing the
+    model-level fact in regardless made an ordinary answer come back as
+    ``reasoning_content`` with empty ``content``. The caller resolves it.
+    """
+
+    dialect: ReasoningDialect | None = None
+    starts_open: bool = False
+
+    def split(self, text: str) -> tuple[str | None, str]:
+        """A complete output as ``(reasoning, content)``."""
+        return separate_reasoning(text, self.starts_open, self.dialect)
+
+    def stream(self) -> ReasoningFilter:
+        """A filter over the same output arriving in chunks."""
+        return ReasoningFilter(starts_thinking=self.starts_open, dialect=self.dialect)
+
+
+# For a caller with no model behind it -- tests, and the completions endpoint,
+# which has no chat template and therefore no reasoning channel to read.
+NO_REASONING = ReasoningChannel()

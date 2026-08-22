@@ -78,3 +78,59 @@ class TestWhatItBuys:
         # `"\n\n2 + 2 = 4."` on the wire.
         assert (reasoning or "") == streamed_r
         assert content == streamed_c
+
+
+class TestAskingForNoThinkingOnlyCountsWhereItCanBeHonoured:
+    """`thinking: disabled` reaches the model through the chat template's own
+    switch. A template with no such switch cannot carry it.
+
+    DeepSeek-R1 is that model: it begins inside the reasoning channel with no
+    marker, and `resolve_reasoning_toggle` answers `None` for it. Asking it not
+    to think puts nothing in the prompt, so it reasons exactly as always --
+    and believing the request anyway stopped the channel being separated, so
+    the client got the chain of thought and a literal `</think>` inside
+    `content`. Reasoning that was asked not to happen and happened anyway is
+    still reasoning; `anthropic_drop_reasoning` exists to withhold it, and it
+    can only withhold what was separated.
+    """
+
+    ANSWER = "The user wants the capital.</think>Paris."
+
+    @staticmethod
+    def _channel(toggle, thinking_off):
+        import atom.entrypoints.openai.api_server as api
+        from atom.entrypoints.openai.reasoning_dialects import resolve_dialect
+
+        before = (
+            api.reasoning_dialect,
+            api.model_starts_in_reasoning,
+            api.reasoning_toggle,
+        )
+        try:
+            api.reasoning_dialect, _ = resolve_dialect("<think></think>")
+            api.model_starts_in_reasoning = True
+            api.reasoning_toggle = toggle
+            return api.reasoning_channel(False, thinking_off=thinking_off)
+        finally:
+            (
+                api.reasoning_dialect,
+                api.model_starts_in_reasoning,
+                api.reasoning_toggle,
+            ) = before
+
+    def test_a_model_with_no_switch_is_separated_anyway(self):
+        channel = self._channel(None, thinking_off=True)
+        assert channel.split(self.ANSWER) == ("The user wants the capital.", "Paris.")
+
+    def test_a_model_with_a_switch_takes_the_request_at_its_word(self):
+        channel = self._channel(("enable_thinking", False, True), thinking_off=True)
+        assert channel.split(self.ANSWER) == (None, self.ANSWER)
+
+    @pytest.mark.parametrize(
+        "toggle", [None, ("enable_thinking", False, True)], ids=["no-switch", "switch"]
+    )
+    def test_an_unstated_request_always_separates(self, toggle):
+        """Absent means unstated, and unstated leaves the model's own default
+        alone -- at this layer as at the prompt layer."""
+        channel = self._channel(toggle, thinking_off=False)
+        assert channel.split(self.ANSWER) == ("The user wants the capital.", "Paris.")

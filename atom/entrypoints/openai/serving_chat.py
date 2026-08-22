@@ -17,14 +17,14 @@ from .protocol import (
     ChatCompletionResponse,
 )
 from .reasoning import (
+    NO_REASONING,
     VALID_TEMPLATE_EFFORTS,
-    ReasoningFilter,
-    separate_reasoning,
+    ReasoningChannel,
 )
 from .sse import data_frame
 from .streaming_dispatch import StreamOutputCollector
 from .tool_parser import ToolCallStreamParser, parse_tool_calls
-from .tool_parser.registry import parser_for_tool_choice
+from .tool_parser.registry import forbids_tool_calls
 
 logger = logging.getLogger("atom")
 
@@ -199,6 +199,24 @@ def _normalize_finish_reason(finish_reason: str | None) -> str | None:
     return "stop"
 
 
+def finish_reason_with_calls(engine_reason: str | None, has_calls: bool) -> str:
+    """The reason to report when a call was parsed and the engine had its own.
+
+    `length` outranks `tool_calls`, because they answer different questions
+    and only one of them is a warning: `tool_calls` says "act on this", and
+    `length` says "this is not all of it". A response cut off mid-call parses
+    to a call with a silently truncated argument value -- every format's
+    unclosed-region branch exists to salvage exactly that -- and reporting
+    `tool_calls` for it told the client to run a tool with half its arguments
+    and no indication anything was missing. OpenAI reports `length` for a
+    truncated response whatever else is in it.
+    """
+    normalized = _normalize_finish_reason(engine_reason)
+    if normalized == "length":
+        return "length"
+    return "tool_calls" if has_calls else (normalized or "stop")
+
+
 def create_chat_chunk(
     request_id: str,
     model: str,
@@ -241,7 +259,7 @@ async def stream_chat_response(
     cleanup_request,
     tools=None,
     tool_choice=None,
-    starts_thinking: bool = False,
+    reasoning: ReasoningChannel = NO_REASONING,
     tool_parser_cls=None,
 ) -> AsyncGenerator[str, None]:
     """Generate streaming chat completion response with reasoning and tool calls.
@@ -264,9 +282,11 @@ async def stream_chat_response(
     # `length` for the same generation -- and a `stop_<token_id>` stop, which
     # the Anthropic path maps to `stop_sequence`, collapsed the same way.
     engine_finish_reason: str | None = None
-    reasoning_filter = ReasoningFilter(starts_thinking=starts_thinking)
+    reasoning_filter = reasoning.stream()
     tool_parser = ToolCallStreamParser(
-        tools=tools, parser_cls=parser_for_tool_choice(tool_parser_cls, tool_choice)
+        tools=tools,
+        parser_cls=tool_parser_cls,
+        suppress_calls=forbids_tool_calls(tool_choice),
     )
     has_tool_calls = False
 
@@ -352,11 +372,7 @@ async def stream_chat_response(
         aborted = False
 
         # Final chunks
-        finish_reason = (
-            "tool_calls"
-            if has_tool_calls
-            else (_normalize_finish_reason(engine_finish_reason) or "stop")
-        )
+        finish_reason = finish_reason_with_calls(engine_finish_reason, has_tool_calls)
         usage = {
             "prompt_tokens": num_tokens_input,
             "completion_tokens": num_tokens_output,
@@ -392,7 +408,7 @@ def _build_chat_choice(
     index: int = 0,
     tools=None,
     tool_choice=None,
-    starts_thinking: bool = False,
+    reasoning: ReasoningChannel = NO_REASONING,
     tool_parser_cls=None,
 ) -> dict[str, Any]:
     """Build one entry of ``choices[...]`` from a raw output string.
@@ -401,13 +417,12 @@ def _build_chat_choice(
     (SamplingParams.n>1) can reuse the reasoning + tool-call separation
     without duplicating the logic.
     """
-    reasoning_content, content_with_tools = separate_reasoning(
-        raw_text, starts_thinking=starts_thinking
-    )
+    reasoning_content, content_with_tools = reasoning.split(raw_text)
     content, tool_calls = parse_tool_calls(
         content_with_tools,
         tools,
-        parser_cls=parser_for_tool_choice(tool_parser_cls, tool_choice),
+        parser_cls=tool_parser_cls,
+        suppress_calls=forbids_tool_calls(tool_choice),
     )
 
     message: dict[str, Any] = {"role": "assistant", "content": content}
@@ -417,7 +432,9 @@ def _build_chat_choice(
         message["tool_calls"] = [tc.to_dict() for tc in tool_calls]
 
     effective_finish_reason = (
-        "tool_calls" if tool_calls else _normalize_finish_reason(finish_reason)
+        finish_reason_with_calls(finish_reason, bool(tool_calls))
+        if (tool_calls or finish_reason)
+        else None
     )
     return {
         "index": index,
@@ -433,7 +450,7 @@ def build_chat_response(
     final_output: dict[str, Any],
     tools=None,
     tool_choice=None,
-    starts_thinking: bool = False,
+    reasoning: ReasoningChannel = NO_REASONING,
     tool_parser_cls=None,
 ) -> ChatCompletionResponse:
     """Build a non-streaming chat completion response (single choice)."""
@@ -448,7 +465,7 @@ def build_chat_response(
                 index=0,
                 tools=tools,
                 tool_choice=tool_choice,
-                starts_thinking=starts_thinking,
+                reasoning=reasoning,
                 tool_parser_cls=tool_parser_cls,
             )
         ],
@@ -480,7 +497,7 @@ def build_chat_response_multi(
     final_outputs: list[dict[str, Any]],
     tools=None,
     tool_choice=None,
-    starts_thinking: bool = False,
+    reasoning: ReasoningChannel = NO_REASONING,
     tool_parser_cls=None,
 ) -> ChatCompletionResponse:
     """Build a non-streaming response with one choice per fan-out sibling.
@@ -499,7 +516,7 @@ def build_chat_response_multi(
             index=i,
             tools=tools,
             tool_choice=tool_choice,
-            starts_thinking=starts_thinking,
+            reasoning=reasoning,
             tool_parser_cls=tool_parser_cls,
         )
         for i, out in enumerate(final_outputs)
@@ -542,7 +559,7 @@ async def stream_chat_response_fanout(
     cleanup_request,
     tools=None,
     tool_choice=None,
-    starts_thinking: bool = False,
+    reasoning: ReasoningChannel = NO_REASONING,
     tool_parser_cls=None,
 ) -> AsyncGenerator[str, None]:
     """Streaming variant that multiplexes ``len(seq_ids)`` fan-out siblings
@@ -560,12 +577,12 @@ async def stream_chat_response_fanout(
     num_tokens_input = num_prompt_tokens
     num_tokens_output = [0] * n
     # Every sibling answers the same prompt, so they start in the same state.
-    reasoning_filters = [
-        ReasoningFilter(starts_thinking=starts_thinking) for _ in range(n)
-    ]
+    reasoning_filters = [reasoning.stream() for _ in range(n)]
     tool_parsers = [
         ToolCallStreamParser(
-            tools=tools, parser_cls=parser_for_tool_choice(tool_parser_cls, tool_choice)
+            tools=tools,
+            parser_cls=tool_parser_cls,
+            suppress_calls=forbids_tool_calls(tool_choice),
         )
         for _ in range(n)
     ]
@@ -691,12 +708,8 @@ async def stream_chat_response_fanout(
                 create_chat_chunk(
                     request_id,
                     model,
-                    finish_reason=(
-                        "tool_calls"
-                        if has_tool_calls[i]
-                        else (
-                            _normalize_finish_reason(engine_finish_reasons[i]) or "stop"
-                        )
+                    finish_reason=finish_reason_with_calls(
+                        engine_finish_reasons[i], has_tool_calls[i]
                     ),
                     index=i,
                 )

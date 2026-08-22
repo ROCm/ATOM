@@ -22,12 +22,7 @@ import json
 import re
 from typing import ClassVar
 
-from .tool_parser import (
-    ToolCall,
-    ToolCallParser,
-    continues_a_call,
-    unique_tool_call_id,
-)
+from .tool_parser import RegionParse, ToolCall, ToolCallParser, unique_tool_call_id
 
 # K3 channel tokens this parser matches on. Kept local so the parser is
 # self-contained; the reasoning splitter declares its own copies.
@@ -37,27 +32,36 @@ KIMI_K3_RESPONSE_START = "<|open|>response<|sep|>"
 KIMI_K3_RESPONSE_END = "<|close|>response<|sep|>"
 KIMI_K3_END_OF_MSG = "<|end_of_msg|>"
 
+# A call's body may not contain another call opener, nor an argument's value
+# another argument opener -- those literals are what open one. Without the
+# guard the non-greedy body ran from an opener *quoted in prose* to the real
+# call's closer, so an answer explaining `<|open|>call tool="NAME"<|sep|>`
+# before making a real call produced one call named `NAME` carrying the real
+# call's arguments. Every registered format carries this guard now.
+_NOT_NESTED_CALL = r'(?:(?!<\|open\|>call tool=").)'
+_NOT_NESTED_ARG = r'(?:(?!<\|open\|>argument key=").)'
 _K3_CALL_RE = re.compile(
     r'<\|open\|>call tool="(?P<name>[^"]*)"(?:\s+index="(?P<index>\d+)")?<\|sep\|>'
-    r"(?P<body>.*?)<\|close\|>call",
+    r"(?P<body>" + _NOT_NESTED_CALL + r"*?)<\|close\|>call",
     re.DOTALL,
 )
 _K3_ARG_RE = re.compile(
     r'<\|open\|>argument key="(?P<key>[^"]*)"(?:\s+type="(?P<type>[^"]*)")?<\|sep\|>'
-    r"(?P<val>.*?)<\|close\|>argument",
+    r"(?P<val>" + _NOT_NESTED_ARG + r"*?)<\|close\|>argument",
     re.DOTALL,
 )
-# What `parse` removes from *content*. Every alternative here is a literal
-# this format also declares in `START_MARKERS`, and it has to be: the two
-# answer the same question -- which bytes are framing rather than answer --
-# and the streaming path can only hold back a literal. `call` and `argument`
-# were in this list and could not be declared, because they carry data
-# (`tool="..."`, `key="..."`); the bare `<|sep|>` at their end *was* declared,
-# so a quoted `<|open|>argument key="city"<|sep|>` came out stripped when
-# parsed whole and with only its separator removed when streamed -- text
-# matching neither path. They are removed inside a tools section by
-# `_K3_CALL_RE` and `_K3_ARG_RE`, which is the only place they occur in a
-# real answer, so nothing needs them here.
+# The channel framing this format wraps every answer in, tool call or not.
+# Declared once and consumed once: `START_MARKERS` lists these so the
+# read-ahead cannot split one, `opens_region` says no to them so the reader
+# drops them, and that is the only place they are removed. There used to be a
+# second removal inside `parse` -- a regex built from a hand-kept copy of this
+# list -- and the two disagreed about four tokens, which reached the client
+# verbatim when streamed and were deleted when not.
+#
+# `call` and `argument` are deliberately absent: they carry data
+# (`tool="..."`, `key="..."`) so they cannot be declared as literals, and they
+# only ever occur inside a tools section, where `_K3_CALL_RE` and `_K3_ARG_RE`
+# account for them.
 _K3_CONTENT_FRAMING = (
     "<|open|>response<|sep|>",
     "<|close|>response<|sep|>",
@@ -74,10 +78,6 @@ _K3_CONTENT_FRAMING = (
     "<|close|>call",
     "<|end_of_msg|>",
     "<|sep|>",
-)
-# Longest first, so a token that is a prefix of another does not truncate it.
-_K3_FRAMING_RE = re.compile(
-    "|".join(re.escape(t) for t in sorted(_K3_CONTENT_FRAMING, key=len, reverse=True))
 )
 
 
@@ -113,42 +113,6 @@ def _k3_coerce(val: str, ptype: str | None):
         return v
 
 
-def _is_truncated_call(text: str, after_opener: int, *, arrived: bool) -> bool:
-    """Is the call opener at ``after_opener`` a cut-off call, or a quotation?
-
-    See :func:`QwenXmlParser._is_truncated_call`. Only the second of its two
-    tests applies here: K3 carries argument types on the wire, so this parser
-    is never given `tools` and has no declared names to check against. What
-    follows the opener is enough -- a call stops inside its own syntax and
-    prose continues in English.
-    """
-    rest = text[after_opener:].lstrip()
-    return not rest or continues_a_call(rest, _CALL_CONTINUES, arrived=arrived)
-
-
-def _strip_k3_framing(text: str) -> str:
-    """Remove the channel tokens, and nothing else.
-
-    No `.strip()`. Removing framing is this format's own normalization and
-    both paths do it; trimming whitespace is position-dependent and so cannot
-    agree between them -- streaming applies it to the region after a marker
-    and non-streaming to the whole answer, which turned `writes <tok> to` into
-    `writes to` on one path and `writes  to` on the other.
-    """
-    return _K3_FRAMING_RE.sub("", text)
-
-
-# Name plus the separator that must follow; see QwenXmlParser for why.
-_CALL_OPENER_RE = re.compile(r'<\|open\|>call tool="[^"]*"[^<]*<\|sep\|>')
-_PEEK_NAME_RE = re.compile(
-    r'<\|open\|>call tool="([^"]+)"[^<]*<\|sep\|>(.*)', re.DOTALL
-)
-# What may follow that opener in a call: an argument, or the close of the
-# call itself. One tuple, read by `_is_truncated_call` and by `peek_name`.
-_ARG_OPENER = '<|open|>argument key="'
-_CALL_CONTINUES = (_ARG_OPENER, "<|close|>call")
-
-
 class KimiK3Parser(ToolCallParser):
     """Kimi-K3 channel format: buffer the tools section, parse + emit at flush.
 
@@ -181,21 +145,11 @@ class KimiK3Parser(ToolCallParser):
     _REGION_MARKERS: ClassVar[frozenset[str]] = frozenset(
         {KIMI_K3_CALL_PREFIX, KIMI_K3_TOOLS_START}
     )
-
-    @classmethod
-    def peek_name(cls, region: str, tools: list | None = None) -> str | None:
-        """`<|open|>call tool="NAME"` -- the name travels in the opener.
-
-        Judged by the same `_is_truncated_call` that decides whether `parse`
-        cuts the answer there. This used to announce on the opener alone, so
-        an answer *quoting* one named a tool the client never called.
-        """
-        m = _PEEK_NAME_RE.search(region)
-        if m is None or not m.group(2).lstrip():
-            return None
-        if not _is_truncated_call(region, m.start(2), arrived=True):
-            return None
-        return m.group(1)
+    # The tools channel closing after the last call. Framing would drop it
+    # anyway once it is handed back, but naming it here keeps the newline
+    # between the two tokens out of the answer.
+    CALL_OPENERS: ClassVar[tuple[str, ...]] = ("<|open|>tools<|sep|>",)
+    CALL_CLOSERS: ClassVar[tuple[str, ...]] = ("<|close|>tools",)
 
     @classmethod
     def opens_region(cls, marker: str) -> bool:
@@ -206,13 +160,28 @@ class KimiK3Parser(ToolCallParser):
         return is_kimi_k3(text)
 
     @classmethod
-    def parse(cls, text: str, tools: list | None) -> tuple[str, list[ToolCall]]:
-        """Parse the Kimi-K3 channel format; return (clean_content, tool_calls)."""
+    def parse_region(
+        cls, region: str, tools: list | None, *, at_end: bool
+    ) -> RegionParse:
+        """Every complete call in the section, and where the section ends.
+
+        A call cut off by `max_tokens` has no `<|close|>call` and so parses to
+        nothing, which means the region was not a call after all and its bytes
+        are released unchanged -- the same answer this format now gives to an
+        answer that merely quotes the opener. Both used to be decided here, by
+        a second opener regex that accepted shapes `_K3_CALL_RE` rejects, and
+        the two ways of getting it wrong were opposite: a quotation lost 62
+        characters, and a truncated call kept its half-written payload with the
+        dangling `<|close|>argument` still in it.
+        """
         tool_calls: list[ToolCall] = []
-        for m in _K3_CALL_RE.finditer(text):
+        begin = end = 0
+        for m in _K3_CALL_RE.finditer(region):
             args: dict = {}
             for a in _K3_ARG_RE.finditer(m.group("body")):
                 args[a.group("key")] = _k3_coerce(a.group("val"), a.group("type"))
+            if not tool_calls:
+                begin = cls.markup_begin(region, m.start())
             tool_calls.append(
                 ToolCall(
                     id=unique_tool_call_id(),
@@ -223,63 +192,5 @@ class KimiK3Parser(ToolCallParser):
                     },
                 )
             )
-        # Truncated at the tools marker only when a section really opened
-        # there. An answer that merely names the token opened none, and
-        # cutting at it dropped everything after.
-        #
-        # "A call parsed" is the wrong test for that, and was: a call cut off
-        # by `max_tokens` parses to nothing, so the half-written payload was
-        # kept and shipped as content -- `_K3_FRAMING_RE` has no alternative
-        # for the dangling `<|close|>argument`, so it survived too. What
-        # separates the two cases is a call *prefix* after the marker, which
-        # a truncated call still has and a mention of the token does not.
-        # Cut at whichever of the two region markers actually opened one, and
-        # the gate has to agree with `opens_region`: that hands the stream
-        # over on a bare call prefix, while this looked only for the tools
-        # wrapper, so a call region without one delivered its argument values
-        # as content as well as as a tool call.
-        # A *real* call opener, not a mention of the prefix: the same shape
-        # `_PEEK_NAME_RE` requires. Cutting on the bare prefix truncated an
-        # answer that merely quoted it, which is the promise rule this format
-        # has to keep like every other.
-        m = _CALL_OPENER_RE.search(text)
-        if (
-            m is not None
-            and not tool_calls
-            and not _is_truncated_call(text, m.end(), arrived=False)
-        ):
-            # A start marker is not a promise, and this format had no branch
-            # for it. Nothing parsed to a call and what follows the opener is
-            # English, so the opener is a quotation: cutting there deleted 62
-            # characters of the answer with no event and `finish_reason`
-            # still `stop`. `_CALL_OPENER_RE` cannot tell the two apart on
-            # its own -- it accepts openers `_K3_CALL_RE` rejects.
-            m = None
-        if m is None:
-            return _strip_k3_framing(text), tool_calls
-        ts = text.find(KIMI_K3_TOOLS_START)
-        cut = ts if 0 <= ts < m.start() else m.start()
-        return _strip_k3_framing(text[:cut]), tool_calls
-
-    def process(self, text: str) -> list:
-        # Buffer everything; K3's interleaved framing is parsed once at flush.
-        # The name is the exception: it travels in the call opener, so it can
-        # go out now rather than after the arguments -- see `announce`.
-        self.region.append(text)
-        return self.announce(self.region.head)
-
-    def flush(self) -> list:
-        content, tool_calls = self.parse(self.region.take(), self.tools)
-        results: list = []
-        if not tool_calls:
-            # Nothing to bind an announced name to, and `_emit_call` -- which
-            # is what normally consumes it -- never runs. Left set, it made
-            # the *next* call's name mismatch its own parse.
-            self._announced = None
-        if content:
-            results.append(("content", content))
-        for tc in tool_calls:
-            results.extend(self._emit_call(tc))
-        if self.emitted_calls > 0:
-            results.append(("tool_call_end", None))
-        return results
+            end = cls.markup_end(region, m.end())
+        return RegionParse(tuple(tool_calls), begin, end)

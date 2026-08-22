@@ -199,7 +199,13 @@ def build_anthropic_response(
             }
         )
 
-    if content_text:
+    # A text block whenever the reply is not a tool call, even an empty one.
+    # The streaming path forces exactly this at the end of a response with no
+    # call, so a reply that was nothing but reasoning came back as
+    # `['thinking', 'text']` when streamed and `['thinking']` when not --
+    # and a client that reads only text blocks got nothing at all from the
+    # second.
+    if content_text or not tool_calls:
         content.append(
             {
                 "type": "text",
@@ -307,20 +313,17 @@ class AnthropicBlocks:
     def __init__(self) -> None:
         self.index = 0
         self.kind: str | None = None
-        # The id and name of the open `tool_use` block. Here and not in
-        # `tool_event_frames`, which runs once per parser batch: announcing a
-        # name early splits the two events that describe one call across two
-        # of those batches -- the name from `process`, the arguments from
-        # `flush` -- so a local was reset between them and every streamed
-        # tool call on this endpoint reached the client with `input: {}`.
-        # Nothing closes the block between those two batches, so surviving
-        # them is all that was needed.
-        #
-        # Cleared by `close`, and that matters: carrying it across a close
-        # let `delta` re-open a *second* `tool_use` block with the same id,
-        # so one call arrived as two -- the first with no input, which a
-        # client iterating content blocks runs as a zero-argument call.
-        self.open_call: dict | None = None
+        # Every call the parser has named, by the index it named it at, and
+        # kept for the life of the response. A call spans two parser batches
+        # -- the name when the region reveals it, the arguments when the
+        # region closes -- and anything at all can arrive in between: a
+        # reasoning segment lands as a `thinking` block, which closes whatever
+        # was open. Held on the open block instead, the id and name were gone
+        # by the time the arguments came and the call reached the client as
+        # `tool_use` with `input: {}`.
+        self.calls: dict[int, dict] = {}
+        # Which call's block is open, so two calls in a row are two blocks.
+        self.open_call_index: int | None = None
 
     def close(self):
         """End the open block, if any. A thinking block signs off first."""
@@ -331,21 +334,49 @@ class AnthropicBlocks:
         yield stream_content_block_stop(self.index)
         self.index += 1
         self.kind = None
-        self.open_call = None
+        self.open_call_index = None
 
     def open(self, kind: str, **start_kwargs):
         """Start a block of `kind`, closing whatever was open."""
         yield from self.close()
         yield stream_content_block_start(self.index, kind, **start_kwargs)
         self.kind = kind
-        if kind == "tool_use":
-            self.open_call = dict(start_kwargs)
 
     def delta(self, kind: str, text: str, **start_kwargs):
         """Emit `text` as `kind`, switching blocks if that is not the open one."""
         if self.kind != kind:
             yield from self.open(kind, **start_kwargs)
         yield stream_content_block_delta(self.index, text, kind)
+
+    def tool_delta(self, index: int, arguments: str):
+        """Arguments for the call named at ``index``, opening its block.
+
+        The block is opened *here*, when the arguments arrive, and not when
+        the name did. On this protocol a `content_block_start` of type
+        `tool_use` already carries `"input": {}` and is, on its own, a
+        complete zero-argument call -- there is no frame for "the name is
+        known, the arguments are still coming". So a name sent before its
+        arguments cannot be represented, and sending one anyway put a
+        syntactically perfect call the model never made in front of the
+        client: measured on a DeepSeek-V4 response containing two calls,
+        which reached `/v1/messages` as three.
+
+        OpenAI's wire has the same shape -- a `tool_calls` delta with
+        `arguments: ""` -- and is safe with it, because a client there
+        accumulates by index and waits for `finish_reason`. That is why the
+        name still goes out early on the other endpoint and not on this one.
+        """
+        call = self.calls.get(index)
+        if call is None:
+            # Arguments for a call whose name never came. There is nothing to
+            # open a block with, and opening one with empty fields would be a
+            # `tool_use` the client can neither dispatch nor return a result
+            # for. A parser bug; dropping the frame is the only honest option.
+            return
+        if self.kind != "tool_use" or self.open_call_index != index:
+            yield from self.open("tool_use", **call)
+            self.open_call_index = index
+        yield stream_content_block_delta(self.index, arguments, "tool_use")
 
 
 def tool_event_frames(events, blocks: AnthropicBlocks):
@@ -369,25 +400,16 @@ def tool_event_frames(events, blocks: AnthropicBlocks):
         if etype == "content":
             yield from blocks.delta("text", edata)
         elif etype == "tool_call_start":
+            # Recorded, not sent. See `AnthropicBlocks.tool_delta` for why a
+            # name on its own cannot be put on this wire.
             fn = edata.get("function", {})
-            yield from blocks.open(
-                "tool_use",
-                tool_use_id=edata.get("id", ""),
-                tool_name=fn.get("name", ""),
-            )
+            blocks.calls[edata.get("index", 0)] = {
+                "tool_use_id": edata.get("id", ""),
+                "tool_name": fn.get("name", ""),
+            }
         elif etype == "tool_call_args":
-            if blocks.open_call is None:
-                # No name and no id to open a block with, so there is no block
-                # to open. `delta` would have started one with both fields
-                # empty -- syntactically a tool_use the client can neither
-                # dispatch nor return a result for. Arguments with no call are
-                # a parser bug; dropping them is the only honest frame.
-                continue
-            fn = edata.get("function", {})
-            # The id and name again: `delta` re-opens the block if anything
-            # landed in between, and without them it would re-open it blank.
-            yield from blocks.delta(
-                "tool_use", fn.get("arguments", ""), **blocks.open_call
+            yield from blocks.tool_delta(
+                edata.get("index", 0), edata.get("function", {}).get("arguments", "")
             )
         elif etype == "tool_call_end":
             yield from blocks.close()
