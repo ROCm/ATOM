@@ -50,13 +50,60 @@ def test_plan_single_layer_migration_remote_plus_free_rider():
     )
 
     assert local_copies == []
-    # primary recv into dst-0, dst-1 is free-rider from temp slot 0
-    assert plan == [(0, 0), (0, 1)]
+    # primary recv into dst-0; dst-1 is a same-rank metadata-only free-rider
+    assert plan == [(0, 0)]
     assert len(recvs) == 1
     assert recvs[0].logical_expert_id == 2
     assert recvs[0].peer_rank == 1
     assert recvs[0].local_slot == 0
     assert sends == []
+
+
+def test_plan_single_layer_migration_same_rank_replica_is_remap_only():
+    # Expert 0 already in slot-0; slot-1 becomes a second same-rank replica.
+    old_p2l = torch.tensor([0, 1], dtype=torch.int32)
+    new_p2l = torch.tensor([0, 0], dtype=torch.int32)
+
+    plan, local_copies, sends, recvs = eplb._plan_single_layer_migration(
+        old_p2l_layer=old_p2l,
+        new_p2l_layer=new_p2l,
+        num_local_physical_experts=2,
+        num_gpu_per_node=1,
+        rank=0,
+        world_size=1,
+    )
+
+    assert plan == []
+    assert local_copies == []
+    assert sends == []
+    assert recvs == []
+
+
+def test_migrate_single_layer_same_rank_replica_skips_weight_copy():
+    old_p2l = torch.tensor([0, 1], dtype=torch.int32)
+    new_p2l = torch.tensor([0, 0], dtype=torch.int32)
+    w = torch.tensor([[100.0], [200.0]], dtype=torch.float32)
+    temp = torch.zeros_like(w)
+
+    plan = eplb._migrate_single_layer(
+        routed_experts_weights=[w],
+        temp_buffers=[temp],
+        old_p2l_layer=old_p2l,
+        new_p2l_layer=new_p2l,
+        num_local_physical_experts=2,
+        num_gpu_per_node=1,
+        rank=0,
+        world_size=1,
+        ep_group=None,
+        num_logical_experts=2,
+        p2p_batch_chunk_size=32,
+    )
+
+    assert plan == []
+    assert temp[0, 0].item() == pytest.approx(0.0)
+    assert temp[1, 0].item() == pytest.approx(0.0)
+    assert w[0, 0].item() == pytest.approx(100.0)
+    assert w[1, 0].item() == pytest.approx(200.0)
 
 
 def test_migrate_single_layer_local_copy_only():

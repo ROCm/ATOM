@@ -112,15 +112,18 @@ def test_update_is_inplace_and_correct():
     )
     # A different placement (swap logicals via a skewed load) for layer 0.
     skew = torch.tensor([[100, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 100]], dtype=torch.int32)
-    from atom.model_ops.eplb import rebalance_experts
+    from atom.model_ops.eplb import postprocess_eplb_maps, rebalance_experts
 
-    p2l, l2p, cnt = rebalance_experts(
+    p2l_raw, phyrank, cnt = rebalance_experts(
         skew,
         num_physical=8,
         num_groups=1,
         num_nodes=1,
         num_gpus=2,
         enable_hierarchical=False,
+    )
+    p2l, l2p, cnt, p2l_unique = postprocess_eplb_maps(
+        p2l_raw, phyrank, cnt, num_gpus=2
     )
     new = ExpertLocationMetadata.from_rebalance_result(
         physical_to_logical_map=p2l,
@@ -129,6 +132,7 @@ def test_update_is_inplace_and_correct():
         ep_size=2,
         ep_rank=0,
         max_num_replicas=3,
+        p2l_unique=p2l_unique,
     )
     # capture addresses of all live tensors
     ptrs = {

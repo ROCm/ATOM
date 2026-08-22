@@ -9,6 +9,7 @@ try:
     from atom.model_ops.eplb import (
         _build_logical_to_physical_map,
         balanced_packing,
+        postprocess_eplb_maps,
         rebalance_experts,
         replicate_experts,
     )
@@ -65,9 +66,21 @@ def test_build_logical_to_physical_map_rejects_rank_out_of_logical_range():
         _build_logical_to_physical_map(p2l, phyrank, logcnt)
 
 
+def test_build_logical_to_physical_map_covers_expected_replica_slots():
+    p2l = torch.tensor([[0, 0, 0, 1]], dtype=torch.int32)
+    phyrank = torch.tensor([[2, 0, 1, 0]], dtype=torch.int32)
+    logcnt = torch.tensor([[3, 1]], dtype=torch.int32)
+    l2p = _build_logical_to_physical_map(p2l, phyrank, logcnt)
+
+    for logical in range(logcnt.shape[1]):
+        expected = torch.nonzero(p2l[0] == logical, as_tuple=False).flatten()
+        actual = l2p[0, logical, : int(logcnt[0, logical].item())]
+        assert torch.equal(torch.sort(actual).values, expected)
+
+
 def test_rebalance_experts_global_invariants():
     weight = torch.tensor([[8, 6, 2, 1], [1, 2, 6, 8]], dtype=torch.int32)
-    p2l, l2p, logcnt = rebalance_experts(
+    p2l_raw, phyrank, logcnt = rebalance_experts(
         weight,
         num_physical=8,
         num_groups=1,
@@ -75,7 +88,11 @@ def test_rebalance_experts_global_invariants():
         num_gpus=4,
         enable_hierarchical=False,
     )
+    p2l, l2p, logcnt, p2l_unique = postprocess_eplb_maps(
+        p2l_raw, phyrank, logcnt, num_gpus=4
+    )
     assert p2l.shape == (2, 8)
+    assert p2l_unique.shape == (2, 8)
     assert logcnt.shape == (2, 4)
     assert l2p.shape[0] == 2 and l2p.shape[1] == 4
     assert l2p.shape[2] == int(logcnt.max().item())
@@ -86,7 +103,29 @@ def test_rebalance_experts_global_invariants():
             physical_ids = l2p[layer, logical_id]
             valid = physical_ids[physical_ids >= 0]
             assert valid.numel() == expected
+            # Raw p2l still maps every occupied slot to its logical expert.
             assert torch.all(p2l[layer, valid.to(torch.int64)] == logical_id)
+            # Runtime l2p only routes to primary slots (alias slots are p2l_unique=-1).
+            primaries = {
+                p
+                for p in range(p2l_unique.shape[1])
+                if int(p2l_unique[layer, p].item()) == logical_id
+            }
+            assert len(primaries) >= 1
+            for phys in valid.tolist():
+                assert phys in primaries
+
+
+def test_same_rank_replica_alias_maps():
+    p2l = torch.tensor([[0, 0]], dtype=torch.int32)
+    phyrank = torch.tensor([[0, 1]], dtype=torch.int32)
+    logcnt = torch.tensor([[2]], dtype=torch.int32)
+    p2l_out, l2p, logcnt, p2l_unique = postprocess_eplb_maps(
+        p2l, phyrank, logcnt, num_gpus=1
+    )
+    assert p2l_out[0].tolist() == [0, 0]
+    assert p2l_unique[0].tolist() == [0, -1]
+    assert l2p[0, 0].tolist() == [0, 0]
 
 
 @pytest.mark.parametrize(
@@ -142,7 +181,7 @@ def test_rebalance_experts_constraints(kwargs, err):
 
 def test_rebalance_experts_hierarchical_invariants():
     weight = torch.tensor([[100, 80, 1, 1, 60, 40, 1, 1]], dtype=torch.int32)
-    p2l, l2p, logcnt = rebalance_experts(
+    p2l_raw, phyrank, logcnt = rebalance_experts(
         weight,
         num_physical=8,
         num_groups=4,
@@ -150,7 +189,11 @@ def test_rebalance_experts_hierarchical_invariants():
         num_gpus=4,
         enable_hierarchical=True,
     )
+    p2l, l2p, logcnt, p2l_unique = postprocess_eplb_maps(
+        p2l_raw, phyrank, logcnt, num_gpus=4
+    )
     assert p2l.shape == (1, 8)
+    assert p2l_unique.shape == (1, 8)
     assert logcnt.shape == (1, 8)
     assert l2p.shape[0] == 1 and l2p.shape[1] == 8
     assert int(logcnt.sum().item()) == 8
