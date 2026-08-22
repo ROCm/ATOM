@@ -6,11 +6,12 @@ from typing import Optional
 import torch
 from torch import nn
 
+from atom.config import get_current_atom_config
+from atom.plugin.prepare import is_sglang, is_vllm
+from atom.utils.selector import get_attn_backend
+
 from .attention_mla import MLAModules
 from .base_attention import BaseAttention
-from atom.config import get_current_atom_config
-from atom.utils.selector import get_attn_backend
-from atom.plugin.prepare import is_sglang, is_vllm
 
 
 class PagedAttention(BaseAttention):
@@ -60,7 +61,7 @@ class PagedAttention(BaseAttention):
             self.rotary_emb = mla_modules.rotary_emb if use_mla else rotary_emb
 
             try:
-                from vllm.attention.layer import Attention, MLAAttention, AttentionType
+                from vllm.attention.layer import Attention, AttentionType, MLAAttention
             except ImportError:
                 from vllm.model_executor.layers.attention import Attention, MLAAttention
                 from vllm.v1.attention.backend import AttentionType
@@ -122,14 +123,16 @@ class PagedAttention(BaseAttention):
                 raise ValueError(f"Duplicate layer: {self.layer_name}")
             compilation_config.static_forward_context[self.layer_name] = self
 
-            if self.use_mla:
-                if "positions" not in compilation_config.static_forward_context:
-                    max_num_tokens = (
-                        atom_config.plugin_config.vllm_scheduler_config.max_num_batched_tokens
-                    )
-                    compilation_config.static_forward_context["positions"] = (
-                        torch.zeros(max_num_tokens, dtype=torch.int64, device="cuda")
-                    )
+            if (
+                self.use_mla
+                and "positions" not in compilation_config.static_forward_context
+            ):
+                max_num_tokens = (
+                    atom_config.plugin_config.vllm_scheduler_config.max_num_batched_tokens
+                )
+                compilation_config.static_forward_context["positions"] = torch.zeros(
+                    max_num_tokens, dtype=torch.int64, device="cuda"
+                )
             return
 
         self.num_heads = num_heads

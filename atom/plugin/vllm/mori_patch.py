@@ -17,14 +17,13 @@ overridable methods and injected here, so native files stay clean:
 from __future__ import annotations
 
 import functools
-from typing import Optional
 
 import torch
+from aiter.jit.utils.chip_info import get_cu_num
 
 import atom.model_ops.fused_moe.modular_kernel as mk
 from atom.model_ops.fused_moe.mori_prepare_finalize import MoriPrepareAndFinalize
 from atom.plugin.config import VLLM_MORI_LAUNCH_CONFIG_TOKEN_THRESHOLD
-from aiter.jit.utils.chip_info import get_cu_num
 
 _MORI_PATCH_APPLIED = False
 
@@ -32,7 +31,7 @@ _MORI_PATCH_APPLIED = False
 def _is_stream_capturing() -> bool:
     try:
         return torch.cuda.is_current_stream_capturing()
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -54,7 +53,7 @@ def _is_uniform_full_graph_batch() -> bool:
     )
 
 
-def _try_get_exact_valid_rows(dispatch_recv_token_num: torch.Tensor) -> Optional[int]:
+def _try_get_exact_valid_rows(dispatch_recv_token_num: torch.Tensor) -> int | None:
     if dispatch_recv_token_num.numel() == 0 or _is_stream_capturing():
         return None
     return int(dispatch_recv_token_num.reshape(-1)[0].item())
@@ -65,7 +64,9 @@ def _is_qwen35_vllm_plugin_model() -> bool:
         from atom.config import get_current_atom_config
 
         atom_config = get_current_atom_config()
-        if atom_config is None or not getattr(atom_config.plugin_config, "is_vllm", False):
+        if atom_config is None or not getattr(
+            atom_config.plugin_config, "is_vllm", False
+        ):
             return False
         archs = getattr(atom_config.hf_config, "architectures", None) or []
         qwen35_archs = {
@@ -78,7 +79,7 @@ def _is_qwen35_vllm_plugin_model() -> bool:
         text_config = getattr(atom_config.hf_config, "text_config", None)
         text_model_type = getattr(text_config, "model_type", "") if text_config else ""
         return model_type.startswith("qwen3_5") or text_model_type.startswith("qwen3_5")
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -177,7 +178,7 @@ def apply_vllm_mori_patch() -> None:
             return min(128, mp), 16
         return min(64, mp), 4
 
-    setattr(vllm_get_dispatch_config, "_atom_vllm_mori_patched", True)
+    vllm_get_dispatch_config._atom_vllm_mori_patched = True
     MoriPrepareAndFinalize._get_dispatch_config = vllm_get_dispatch_config
 
     original_trim = mk.FusedMoEModularKernel._maybe_trim_dispatch_output
@@ -206,7 +207,7 @@ def apply_vllm_mori_patch() -> None:
             expert_tokens_meta.expert_num_tokens,
         )
 
-    setattr(vllm_maybe_trim_dispatch_output, "_atom_vllm_mori_patched", True)
+    vllm_maybe_trim_dispatch_output._atom_vllm_mori_patched = True
     mk.FusedMoEModularKernel._maybe_trim_dispatch_output = (
         vllm_maybe_trim_dispatch_output
     )
