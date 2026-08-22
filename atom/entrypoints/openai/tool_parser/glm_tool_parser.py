@@ -68,7 +68,7 @@ _TOOL_NAME_RE = re.compile(r"^\w[\w.\-]*\Z")
 _ARG_OPENER = "<arg_key>"
 _ARG_RE = re.compile(
     r"<arg_key>(.*?)</arg_key>\s*<arg_value>"
-    r"(.*?)(?:</arg_value>|(?=<arg_key>)|(?=</tool_call>)|$)",
+    r"(.*?)(?:</arg_value>|(?=<arg_key>)|(?=</tool_call>)|\Z)",
     re.DOTALL,
 )
 
@@ -78,6 +78,13 @@ class GlmParser(ToolCallParser):
     START_MARKERS: ClassVar[tuple[str, ...]] = ("<tool_call>",)
     # No `CALL_CLOSERS`: this format's `</tool_call>` closes the call itself
     # rather than a wrapper around it, so `_TOOLCALL_RE` already spans it.
+
+    @classmethod
+    def render_call(cls, name: str, args: dict[str, str]) -> str:
+        body = "".join(
+            f"<arg_key>{k}</arg_key><arg_value>{v}</arg_value>" for k, v in args.items()
+        )
+        return f"<tool_call>{name}{body}</tool_call>"
 
     @classmethod
     def detect(cls, text: str) -> bool:

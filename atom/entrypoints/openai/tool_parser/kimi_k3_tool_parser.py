@@ -23,7 +23,14 @@ import re
 from typing import ClassVar
 
 from .. import kimi_k3_tokens as k3
-from .tool_parser import RegionParse, ToolCall, ToolCallParser, unique_tool_call_id
+from .schema import build_param_types
+from .tool_parser import (
+    RegionParse,
+    ToolCall,
+    ToolCallParser,
+    continues_a_call,
+    unique_tool_call_id,
+)
 
 # K3 channel tokens this parser matches on. Kept local so the parser is
 # self-contained; the reasoning splitter declares its own copies.
@@ -41,14 +48,22 @@ KIMI_K3_END_OF_MSG = "<|end_of_msg|>"
 # call's arguments. Every registered format carries this guard now.
 _NOT_NESTED_CALL = r'(?:(?!<\|open\|>call tool=").)'
 _NOT_NESTED_ARG = r'(?:(?!<\|open\|>argument key=").)'
+# What may follow a call's opener in a real call: an argument, or the close of
+# the call the name opened. One tuple, read by `_is_truncated_call`.
+_CALL_CONTINUES = ('<|open|>argument key="', "<|close|>call")
+# Closed, or cut off at end of input. Without it a call truncated by
+# `max_tokens` parsed to nothing and its raw tokens went out as the answer.
 _K3_CALL_RE = re.compile(
     r'<\|open\|>call tool="(?P<name>[^"]*)"(?:\s+index="(?P<index>\d+)")?<\|sep\|>'
-    r"(?P<body>" + _NOT_NESTED_CALL + r"*?)<\|close\|>call",
+    r"(?P<body>" + _NOT_NESTED_CALL + r"*?)"
+    r"(?:(?P<closed><\|close\|>call)|(?=<\|close\|>tools)|\Z)",
     re.DOTALL,
 )
 _K3_ARG_RE = re.compile(
     r'<\|open\|>argument key="(?P<key>[^"]*)"(?:\s+type="(?P<type>[^"]*)")?<\|sep\|>'
-    r"(?P<val>" + _NOT_NESTED_ARG + r"*?)<\|close\|>argument",
+    # Same alternation, so a value the model was cut off inside survives.
+    r"(?P<val>" + _NOT_NESTED_ARG + r"*?)"
+    r"(?:<\|close\|>argument|(?=<\|close\|>call)|\Z)",
     re.DOTALL,
 )
 # The channel framing this format wraps every answer in, tool call or not.
@@ -109,6 +124,22 @@ def _k3_coerce(val: str, ptype: str | None):
         return v
 
 
+def _is_truncated_call(
+    name: str, body: str, param_types: dict, *, at_end: bool
+) -> bool:
+    """Is this unclosed `<|open|>call tool=...` a cut-off call, or prose?
+
+    The gate travels with the unclosed alternative or a sentence that merely
+    *quotes* the opener parses as a call.
+    """
+    if name not in param_types:
+        return False
+    rest = body.lstrip()
+    return (not rest and at_end) or continues_a_call(
+        rest, _CALL_CONTINUES, arrived=not at_end
+    )
+
+
 class KimiK3Parser(ToolCallParser):
     """Kimi-K3 channel format: buffer the tools section, parse + emit at flush.
 
@@ -144,8 +175,23 @@ class KimiK3Parser(ToolCallParser):
     # The tools channel closing after the last call. Framing would drop it
     # anyway once it is handed back, but naming it here keeps the newline
     # between the two tokens out of the answer.
-    CALL_OPENERS: ClassVar[tuple[str, ...]] = ("<|open|>tools<|sep|>",)
+    CALL_OPENERS: ClassVar[tuple[str, ...]] = (k3.TOOLS_START,)
     CALL_CLOSERS: ClassVar[tuple[str, ...]] = ("<|close|>tools",)
+    # NOT `CALL_FILLERS = (k3.BARE_SEPARATOR,)`, though a `<|sep|>` between
+    # `<|close|>call` and `<|close|>tools` does then reach the client. That
+    # tuple feeds the *call*-level walkers too, so declaring it there moved
+    # every K3 call's span and broke four properties at once. The separator
+    # would have to be a wrapper-only filler, and no format needs that yet.
+
+    @classmethod
+    def render_call(cls, name: str, args: dict[str, str]) -> str:
+        body = "".join(
+            f'<|open|>argument key="{k}"<|sep|>{v}<|close|>argument'
+            for k, v in args.items()
+        )
+        return (
+            f'{k3.TOOLS_START}<|open|>call tool="{name}"<|sep|>' f"{body}<|close|>call"
+        )
 
     @classmethod
     def opens_region(cls, marker: str) -> bool:
@@ -170,9 +216,14 @@ class KimiK3Parser(ToolCallParser):
         characters, and a truncated call kept its half-written payload with the
         dangling `<|close|>argument` still in it.
         """
+        param_types = build_param_types(tools)
         tool_calls: list[ToolCall] = []
         spans: list[tuple[int, int]] = []
         for m in _K3_CALL_RE.finditer(region):
+            if m.group("closed") is None and not _is_truncated_call(
+                m.group("name"), m.group("body"), param_types, at_end=at_end
+            ):
+                continue
             args: dict = {}
             for a in _K3_ARG_RE.finditer(m.group("body")):
                 args[a.group("key")] = _k3_coerce(a.group("val"), a.group("type"))

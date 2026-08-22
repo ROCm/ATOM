@@ -19,7 +19,12 @@ import logging
 
 from ..marker_scanner import MarkerScanner
 from .schema import ParamTypes, build_param_types
-from .tool_parser import RegionParse, ToolCall, ToolCallParser
+from .tool_parser import (
+    RegionParse,
+    ToolCall,
+    ToolCallParser,
+    begin_of_markup,
+)
 
 logger = logging.getLogger("atom")
 
@@ -105,6 +110,35 @@ class Region:
 
 def _peek_declared(tools: list | None) -> frozenset[str]:
     return frozenset(build_param_types(tools))
+
+
+def _region_tail(body: str, parser_cls) -> int:
+    """Where the wrapper closing this region starts, or ``len(body)``.
+
+    `markup_begin`/`markup_end` walk a *call's* edges and stop at prose, so a
+    sentence between the last call and `</tool_calls>` left that tag belonging
+    to nobody and it reached the client verbatim.
+
+    An offset, not a span. Splicing the wrapper in as one made it compete for
+    a call: two adjacent calls merge into a single span, so the wrapper span
+    became the last, took the leftover call, and emitted the prose before it
+    -- the same output ordered differently depending on whether the closing
+    tag had arrived.
+
+    Found at the edge, never reconstructed. Counting openers minus closers
+    inside the spans cannot tell markup from an argument value that quotes it,
+    and that attempt deleted a `</tool_call>` out of the answer.
+
+    Trailing edge only. A wrapper opener followed by prose is byte-identical
+    to an answer quoting the opener before calling for real, and
+    `RegionParse.begins` already resolves that in favour of keeping the text;
+    a leading scan here deleted exactly such a quotation. So an opening
+    wrapper with prose after it still leaks, which is the smaller harm.
+    """
+    closers = parser_cls.CALL_CLOSERS
+    if not closers:
+        return len(body)
+    return begin_of_markup(body, len(body), closers, parser_cls.CALL_FILLERS)
 
 
 def _markup_spans(
@@ -415,7 +449,10 @@ class ToolCallStreamParser:
                 # completed" -- `completes_a_tool_call` says so, and the
                 # Anthropic path closes a block on it.
                 events.append(("tool_call_end", None))
-            rest = body[at:]
+            # Up to the region's own closing wrapper, which belongs to no
+            # call. What is left goes back through the scanner as ordinary
+            # answer text.
+            rest = body[at : _region_tail(body, self.parser_cls)]
         elif body:
             # A start marker is not a promise. An answer explaining that a
             # model "writes <tool_call> to call something" opens the region

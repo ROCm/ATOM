@@ -227,6 +227,18 @@ class ToolCallParser(ABC):
     CALL_OPENERS: ClassVar[tuple[str, ...]] = ()
     CALL_CLOSERS: ClassVar[tuple[str, ...]] = ()
     CALL_FILLERS: ClassVar[tuple[str, ...]] = ()
+    # The literals that *identify* this format, where that is narrower than
+    # "what must not be split". Empty means the two coincide, as they do for
+    # five of the six.
+    #
+    # They came apart because DSML matches its `｜DSML｜` marker optionally --
+    # the V4-Flash malform drops it -- so `<invoke name=` is a start marker,
+    # and that is also how MiniMax opens a call. DSML claimed MiniMax's
+    # templates and only `_DETECT_ORDER` kept it from winning them.
+    #
+    # Leniency about what to *parse* stays: once identified, a format should
+    # read the malforms its own model emits. Only the claim must be single.
+    DETECT_MARKERS: ClassVar[tuple[str, ...]] = ()
 
     @classmethod
     def opens_region(cls, marker: str) -> bool:
@@ -266,8 +278,12 @@ class ToolCallParser(ABC):
 
     @classmethod
     def detect(cls, text: str) -> bool:
-        """Whether a rendered chat template teaches this format."""
-        return cls.find_start(text) != -1
+        """Is this text this format's, as opposed to merely readable by it?
+
+        Keyed on `DETECT_MARKERS` where a format declares them: the literals
+        that must not be split are not always the literals that identify.
+        """
+        return any(m in text for m in (cls.DETECT_MARKERS or cls.START_MARKERS))
 
     @classmethod
     def region_end(cls, region: str) -> int:
@@ -285,6 +301,21 @@ class ToolCallParser(ABC):
         puts one inside a parameter.
         """
         return 0
+
+    @classmethod
+    def render_call(cls, name: str, args: dict[str, str]) -> str:
+        """One call, in this format's own syntax. The inverse of `parse_region`.
+
+        Nothing in the engine renders; this exists so the test corpus can be
+        generated from the registry rather than hand-written. A hand-written
+        sample can be wrong in a way that makes every assertion about it
+        vacuous -- MiniMax's was written in DSML's spelling and parsed to
+        `get_weather({})`, exercising none of the parameter path.
+
+        Not `@abstractmethod`: nothing here is ever instantiated, so ABC would
+        not enforce it. `test_every_format_can_write_its_own_syntax` does.
+        """
+        raise NotImplementedError(f"{cls.NAME} cannot render its own syntax")
 
     @classmethod
     @abstractmethod

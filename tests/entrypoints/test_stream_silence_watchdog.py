@@ -30,7 +30,6 @@ import pytest
 from atom.entrypoints.openai import api_server
 from atom.entrypoints.openai import streaming_dispatch as sd
 from atom.entrypoints.openai.streaming_dispatch import (
-    FrameWait,
     longest_silence_seconds,
 )
 
@@ -42,25 +41,16 @@ def _clean_registry():
     sd._WAITING_SINCE.clear()
 
 
-async def frames(source, request_id: str = "req"):
-    """The shape `_client_stream` wraps a response generator in.
+def frames(source, request_id: str = "req"):
+    """The shipped wrapper, not a copy of it.
 
-    Kept here rather than importing the endpoint's copy: that one also does
-    request logging and lives in a module that pulls in the engine. What is
-    under test is the timing, and this is the timing verbatim -- including
-    `armed`, without which every scenario below would pass while the endpoint
-    timed the queue.
+    This was a hand-written reimplementation, justified by the endpoint module
+    pulling in the engine -- which this file already imports anyway. Measured:
+    hoisting `delivered = True` above the `with` makes the real endpoint
+    report 0.02 s of phantom silence for a merely queued request, and every
+    test here stayed green.
     """
-    it = source.__aiter__()
-    delivered = False
-    while True:
-        with FrameWait(request_id, armed=delivered):
-            try:
-                chunk = await it.__anext__()
-            except StopAsyncIteration:
-                return
-        delivered = True
-        yield chunk
+    return api_server._client_stream(source, request_id)
 
 
 async def _let_the_loop_run():

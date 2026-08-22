@@ -61,11 +61,15 @@ CHANNEL_FRAMING: tuple[str, ...] = (
 # survives, and `<|close|>think<|sep|>` -- the token that ends the reasoning
 # channel -- never matches, so at four bytes per chunk the whole answer stays
 # in `reasoning_content`. They are a set or they are nothing.
+# Named on its own as well, because it is also what sits between a call's
+# closer and the section's -- the wrapper walk has to step over it there.
+BARE_SEPARATOR = "<|sep|>"
+
 UNPAIRED_FRAMING: tuple[str, ...] = (
     "<|close|>response",
     "<|close|>think",
     "<|close|>message",
-    "<|sep|>",
+    BARE_SEPARATOR,
 )
 
 # Brackets around a tool call. The tool parser's, for the reason in the module

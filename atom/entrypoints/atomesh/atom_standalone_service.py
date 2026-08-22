@@ -1568,11 +1568,25 @@ class AtomStandaloneService:
         self.engine_service.abort_stream(stream_id)
 
     def close(self) -> None:
+        """Shut down, in the order `close_*_stream` uses.
+
+        `stream_state.close()` is the only thing that sets `closed`, and a
+        router thread already inside `drain()` does not hold `_streams_lock`:
+        it wakes from its queue, reads `closed` as False and hands out chunks
+        for a sequence this method just aborted -- and if `all(finished)`
+        happens to hold, a finish/usage/`[DONE]` tail as well, so the caller
+        records `finish_reason: stop` on a truncated answer. Clearing the
+        registry is not what stops a drain; closing the state is.
+        """
         with self._streams_lock:
-            open_streams = [*self._streams, *self._completion_streams]
+            open_streams = [
+                *self._streams.items(),
+                *self._completion_streams.items(),
+            ]
             self._streams.clear()
             self._completion_streams.clear()
-        for stream_id in open_streams:
+        for stream_id, stream_state in open_streams:
+            stream_state.close()
             self.engine_service.abort_stream(stream_id)
         if hasattr(self, "engine_service"):
             self.engine_service.close()

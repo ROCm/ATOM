@@ -9,6 +9,19 @@ import json
 
 import pytest
 
+from atom.entrypoints.openai.tool_parser import read_whole_events
+from atom.entrypoints.openai.tool_parser.registry import PARSERS_BY_NAME
+from entrypoints.wire_corpus import (
+    PAYLOAD,
+    complete,
+    REAL_CALLS,
+    TYPED_TOOLS,
+    check_corpus,
+    quoting_the_opener,
+    truncated,
+    truncated_after_complete,
+)
+
 from atom.entrypoints.openai.tool_parser.schema import ParamTypes
 from atom.entrypoints.openai.tool_parser.stream import _resolved_tools
 
@@ -1134,9 +1147,297 @@ class TestAZeroArgumentCallLooksTheSameInEveryFormat:
         "kimi_k3": KimiK3Parser,
     }
 
+    @pytest.mark.parametrize("tool_name", ["get_weather", "get-weather", "server.tool"])
+    def test_and_every_format_accepts_the_names_openai_allows(self, tool_name):
+        """`^[a-zA-Z0-9_-]{1,64}$` is OpenAI's grammar, and MCP namespaces
+        with a dot. Kimi-K2 matched `functions\\.(\\w+)`, so a hyphenated or
+        namespaced name did not match at all -- the section was not a call and
+        the whole thing, special tokens included, went out as `content` with
+        `finish_reason: stop`."""
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": tool_name,
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+        for name, template in self.ZERO_ARG.items():
+            text = template.replace("now", tool_name)
+            _, calls = parse_tool_calls(text, tools, self.PARSERS[name])
+            assert [c.function["name"] for c in calls] == [
+                tool_name
+            ], f"{name} could not read a call to {tool_name!r}"
+
     @pytest.mark.parametrize("name", sorted(ZERO_ARG))
     def test_the_arguments_are_parseable_json(self, name):
         _, calls = parse_tool_calls(self.ZERO_ARG[name], self.TOOLS, self.PARSERS[name])
         assert len(calls) == 1, f"{name} did not read its own zero-argument call"
         args = calls[0].function["arguments"]
         assert json.loads(args) == {}, f"{name} sent {args!r}"
+
+
+class TestTheWrapperClosingTagIsNeverTheAnswer:
+    """Prose between the last call and the section's closing tag.
+
+    `end_of_markup` walks forward over whitespace and closers and stops at the
+    first other byte, so a model that writes a sentence before closing its
+    section left the raw `</tool_call>` in `content`. The bytes are markup
+    whatever sits in front of them -- but only while the region still owes a
+    closing tag, which is what keeps an answer that *quotes* one after a real
+    call from losing the quote.
+    """
+
+    TOOLS = TestACallStillArrivingWhenTheStreamEnds.TOOLS
+    CALL = (
+        "<tool_call><function=get_weather>"
+        "<parameter=city>Paris</parameter></function>"
+    )
+
+    def test_prose_before_the_closing_tag_keeps_the_prose(self):
+        content, calls = parse_tool_calls(
+            self.CALL + "\nOK, checking.\n</tool_call>", self.TOOLS, QwenXmlParser
+        )
+        assert len(calls) == 1
+        assert "OK, checking." in content
+        assert "</tool_call>" not in content, f"raw markup delivered: {content!r}"
+
+    def test_but_a_quoted_closing_tag_after_a_closed_call_survives(self):
+        """Only the region's own trailing edge is consumed."""
+        text = self.CALL + "</tool_call> you end it with </tool_call>."
+        content, calls = parse_tool_calls(text, self.TOOLS, QwenXmlParser)
+        assert len(calls) == 1
+        assert (
+            content.count("</tool_call>") == 1
+        ), f"the quoted tag was eaten: {content!r}"
+
+    WRITE_TOOLS = [
+        {
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "content": {"type": "string"},
+                    },
+                },
+            },
+        }
+    ]
+
+    def test_and_a_markup_literal_inside_an_argument_value_changes_nothing(self):
+        """The first version counted openers minus closers inside the spans
+        and consumed that many closers from the tail. The count saw literals
+        in argument *values*, so a call whose payload mentioned `<tool_call>`
+        invented a debt and the mechanism deleted a `</tool_call>` out of the
+        answer -- the very thing it was written to protect. An edge needs no
+        count."""
+        text = (
+            "<tool_call><function=write_file><parameter=path>d.md</parameter>"
+            "<parameter=content>open with <tool_call> and close.</parameter>"
+            "</function></tool_call>\nDone. Pair is <tool_call> ... </tool_call>."
+        )
+        content, calls = parse_tool_calls(text, self.WRITE_TOOLS, QwenXmlParser)
+        assert len(calls) == 1
+        assert content == "\nDone. Pair is <tool_call> ... </tool_call>.", content
+
+    def test_and_a_quoted_closer_in_the_middle_is_not_taken_for_the_real_one(self):
+        """The count also discharged its debt against the earliest closer in
+        document order, so DSML deleted twelve bytes of a sentence *and* left
+        the real closer in."""
+        d = "\uff5cDSML\uff5c"
+        text = (
+            f'<{d}tool_calls><{d}invoke name="get_weather">'
+            f'<{d}parameter name="city">Paris</{d}parameter></{d}invoke>'
+            f"\nClose with </tool_call> normally.\n</{d}tool_calls>"
+        )
+        content, calls = parse_tool_calls(text, self.TOOLS, DsmlParser)
+        assert len(calls) == 1
+        assert content == "\nClose with </tool_call> normally.\n", content
+
+    def test_and_a_formats_filler_before_the_closer_goes_with_it(self):
+        """MiniMax repeats its namespace token before every tag, so the walk
+        has to step over one to reach the closer."""
+        ns = "]<]minimax[>["
+        text = (
+            f'{ns}<tool_call>{ns}<invoke name="get_weather">{ns}<city>Paris</city>'
+            f"{ns}</invoke>\nDone.\n{ns}</tool_call>"
+        )
+        content, calls = parse_tool_calls(text, self.TOOLS, MiniMaxParser)
+        assert len(calls) == 1
+        assert content == "\nDone.\n", content
+
+    def test_two_calls_then_prose_keeps_the_prose_after_both(self):
+        """Order must not depend on whether the closing tag arrived.
+
+        The wrapper was spliced in as a span, and two adjacent calls merge
+        into one -- so the wrapper span became the last, took the leftover
+        call, and emitted the prose before it. Same output, two orders,
+        depending on the presence of `</tool_call>`. On `/v1/messages` that
+        put a text block between the two `tool_use` blocks.
+        """
+        a = self.CALL
+        b = self.CALL.replace("get_weather", "get_time").replace("Paris", "Rome")
+        tools = self.TOOLS + [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_time",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                },
+            }
+        ]
+        orders = []
+        for tail in ("\nBoth running.\n</tool_call>", "\nBoth running."):
+            events = read_whole_events(QwenXmlParser, a + b + tail, tools)
+            orders.append([k for k, _ in events if k in ("content", "tool_call_start")])
+        assert (
+            orders[0] == orders[1]
+        ), f"the closing tag changed the order: {orders[0]} vs {orders[1]}"
+        assert orders[0] == ["tool_call_start", "tool_call_start", "content"], orders[0]
+
+    def test_and_a_quoted_opener_before_a_real_call_still_survives(self):
+        """The mirror edge is deliberately not swept. A wrapper opener
+        followed by prose looks exactly like an answer quoting the opener
+        before calling for real, and `RegionParse.begins` already decided that
+        one in favour of keeping the text. A leading scan was written here and
+        deleted the quotation; the opener leaks instead, the smaller harm."""
+        text = "Explaining: <tool_call> is how. Now: " + self.CALL + "</tool_call> done"
+        content, calls = parse_tool_calls(text, self.TOOLS, QwenXmlParser)
+        assert len(calls) == 1
+        assert "Explaining: <tool_call> is how." in content, content
+
+
+class TestWhatEveryFormatDoesWithACallCutOffMidWay:
+    """The axis five separate review findings have each been one cell of.
+
+    A response stopped at `max_tokens` mid-call is the single most common
+    malform there is, and the six formats answer it three different ways.
+    Every previous finding here was reported against one format, fixed on that
+    format, and left the others unstated -- so the next cell stayed invisible
+    until someone reported it too:
+
+      MiniMax  a zero-parameter tool's truncated call was unrecoverable
+      DSML     truncation was unreachable whenever a complete call existed
+      Kimi-K2  a truncated entry beside a complete one is dropped
+      Kimi-K3  a truncated call is never recovered at all
+      DSML/MiniMax  a mid-value cut yields `{}` where Qwen/GLM keep the partial
+
+    So the table is declared here instead of discovered. It is not an
+    endorsement -- three of these cells are worse than the other three -- it
+    is a statement of what is true today, in one place, so that changing a
+    format shows up as a diff and adding one forces an answer.
+    """
+
+    TOOLS = TYPED_TOOLS
+
+    def _row(self, name):
+        parser = PARSERS_BY_NAME[name]
+        _, cut_calls = parse_tool_calls(truncated(name), self.TOOLS, parser)
+        recovers = bool(cut_calls)
+        # `"Par" in ...` rather than a JSON compare: Kimi-K2 passes the
+        # model's own bytes through as `arguments`, so a value cut off mid-way
+        # is *invalid JSON there by construction* and any format-independent
+        # assertion has to be about the bytes, not the decode.
+        keeps = recovers and PAYLOAD[:-2] in cut_calls[0].function["arguments"]
+        _, both = parse_tool_calls(truncated_after_complete(name), self.TOOLS, parser)
+        return recovers, keeps, len(both) == 2
+
+    def test_every_format_can_write_its_own_syntax(self):
+        """The one thing a new format's author has to provide.
+
+        `render_call` is the inverse of `parse_region`; the whole corpus is
+        generated from it, so a format that has one is covered by every
+        property here without a line being added to the tests.
+        """
+        cannot = sorted(
+            name for name, cls in PARSERS_BY_NAME.items() if name not in REAL_CALLS
+        )
+        assert not cannot, (
+            f"{cannot} cannot render their own syntax, so nothing here covers "
+            "them. Implement `render_call(name, args)` on the parser."
+        )
+
+    def test_the_corpus_is_sound_and_covers_every_registered_format(self):
+        """The fixture has to be real, and there has to be one per format.
+
+        Both halves have failed here before. A format with no entry goes
+        unasserted -- which is how five separate findings each came back as
+        one more cell. And an entry written in another format's spelling
+        parses to a call with no arguments, passing everything while touching
+        none of the parameter path; MiniMax's did exactly that.
+        """
+        problems = check_corpus(PARSERS_BY_NAME, parse_tool_calls)
+        assert not problems, "the wire corpus is unsound:\n  " + "\n  ".join(problems)
+
+    @pytest.mark.parametrize("name", sorted(REAL_CALLS))
+    def test_a_truncated_call_is_recovered(self, name):
+        recovers, _, _ = self._row(name)
+        assert recovers, (
+            f"{name} delivers a call cut off by max_tokens as raw markup "
+            "instead of recovering it"
+        )
+
+    @pytest.mark.parametrize("name", sorted(REAL_CALLS))
+    def test_and_the_part_of_the_value_that_arrived_is_kept(self, name):
+        _, keeps, _ = self._row(name)
+        assert keeps, (
+            f"{name} recovers the call but drops the argument value the model "
+            "had already produced"
+        )
+
+    @pytest.mark.parametrize("name", sorted(REAL_CALLS))
+    def test_and_it_is_recovered_beside_a_complete_call(self, name):
+        _, _, beside = self._row(name)
+        assert beside, (
+            f"{name} drops a truncated call whenever a complete one exists in "
+            "the same region"
+        )
+
+    @pytest.mark.parametrize("name", sorted(REAL_CALLS))
+    @pytest.mark.parametrize("order", ["complete-first", "truncated-first"])
+    def test_and_the_chunk_size_does_not_change_the_answer(self, name, order):
+        """The invariant the whole reader is built on, on the truncated shape.
+
+        DSML broke exactly this: over a prefix that stopped before the
+        complete call, its `else:` branch was live and named the truncated
+        one; over the whole region the parse returned the other. The client
+        got two `tool_call_start` deltas at small chunk sizes and one for the
+        same generation in a single chunk.
+        """
+        whole, cut = complete(name), truncated(name)
+        text = whole + cut if order == "complete-first" else cut + whole
+        seen = set()
+        for size in (1, 4, 13, 10**6):
+            parser = ToolCallStreamParser(
+                tools=self.TOOLS, parser_cls=PARSERS_BY_NAME[name]
+            )
+            events = []
+            for i in range(0, len(text), size):
+                events += parser.process(text[i : i + size])
+            events += parser.flush()
+            seen.add(
+                tuple(
+                    d["function"]["name"] for k, d in events if k == "tool_call_start"
+                )
+            )
+        assert len(seen) == 1, f"{name} {order}: chunking changed the calls: {seen}"
+
+    @pytest.mark.parametrize("name", sorted(REAL_CALLS))
+    def test_but_prose_that_quotes_the_opener_is_still_not_a_call(self, name):
+        """The other half of the pair.
+
+        An unclosed alternative without a `_is_truncated_call` gate turns
+        every sentence *about* the wire format into a tool call. Kimi-K3 was
+        given the alternation alone and did exactly that.
+        """
+        _, calls = parse_tool_calls(
+            quoting_the_opener(name), self.TOOLS, PARSERS_BY_NAME[name]
+        )
+        assert calls == [], f"{name} read a sentence about calls as a call"

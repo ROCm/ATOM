@@ -21,7 +21,13 @@ swallowed, differently, by the two readers this format used to have.
 import re
 from typing import ClassVar
 
-from .tool_parser import RegionParse, ToolCall, ToolCallParser
+from .schema import build_param_types
+from .tool_parser import (
+    RegionParse,
+    ToolCall,
+    ToolCallParser,
+    continues_a_call,
+)
 
 KIMI_SECTION_BEGIN = "<|tool_calls_section_begin|>"
 KIMI_SECTION_END = "<|tool_calls_section_end|>"
@@ -29,20 +35,55 @@ KIMI_ENTRY_END = "<|tool_call_end|>"
 
 _ENTRY_RE = re.compile(
     r"<\|tool_call_begin\|>"
-    r"functions\.(\w+):(\d+)"
-    r"<\|tool_call_argument_begin\|>"
+    # `[\w.\-]`, not `\w`: function names are `^[a-zA-Z0-9_-]{1,64}$` and MCP
+    # servers namespace theirs `server.tool`. With `\w` the entry did not
+    # match, so the whole section -- special tokens included -- went out as
+    # `content` with `finish_reason: stop`.
+    r"functions\.([\w.\-]+):(\d+)" r"<\|tool_call_argument_begin\|>"
+    # Ends at `<|tool_call_end|>`, the next entry, the section close, or end of
+    # input. Without that last one a `max_tokens` truncation matched nothing
+    # and went out as raw special tokens -- and beside a complete entry, was
+    # dropped entirely.
     r"(.*?)"
-    r"<\|tool_call_end\|>",
+    r"(?:(?P<closed><\|tool_call_end\|>)"
+    r"|(?=<\|tool_call_begin\|>)"
+    r"|(?=<\|tool_calls_section_end\|>)"
+    r"|\Z)",
     re.DOTALL,
 )
 
 
-def _parse_entries(section_text: str) -> list[ToolCall]:
+def _is_truncated_call(
+    name: str, args: str, param_types: dict, *, at_end: bool
+) -> bool:
+    """Is this unclosed entry a cut-off call, or prose about the format?
+
+    The gate that travels with an unclosed alternative. Without it a sentence
+    quoting `<|tool_call_begin|>functions.x:0<|tool_call_argument_begin|>`
+    parses as a call -- the same pair-error K3 had, and it was reintroduced
+    here in the very commit that fixed it there.
+
+    The follower is `{`: this format's arguments are JSON on the wire, so a
+    real call continues with an object or, at end of region, with nothing.
+    """
+    if name not in param_types:
+        return False
+    rest = args.lstrip()
+    return (not rest and at_end) or continues_a_call(rest, ("{",), arrived=not at_end)
+
+
+def _parse_entries(
+    section_text: str, param_types: dict, *, at_end: bool
+) -> list[ToolCall]:
     """Parse individual tool call entries from the section content."""
     tool_calls = []
     for match in _ENTRY_RE.finditer(section_text):
         name = match.group(1)
         index = match.group(2)
+        if match.group("closed") is None and not _is_truncated_call(
+            name, match.group(3), param_types, at_end=at_end
+        ):
+            continue
         # `"{}"` and not `""` for a zero-argument call. This format passes
         # the wire bytes through where the other five build a JSON object, so
         # it was the one format whose no-argument call reached the client as
@@ -72,6 +113,16 @@ class KimiParser(ToolCallParser):
     REGION_END_MARKERS: ClassVar[tuple[str, ...]] = (KIMI_SECTION_END,)
 
     @classmethod
+    def render_call(cls, name: str, args: dict[str, str]) -> str:
+        import json as _json
+
+        return (
+            f"{KIMI_SECTION_BEGIN}<|tool_call_begin|>functions.{name}:0"
+            f"<|tool_call_argument_begin|>{_json.dumps(args)}"
+            f"{KIMI_ENTRY_END}{KIMI_SECTION_END}"
+        )
+
+    @classmethod
     def detect(cls, text: str) -> bool:
         return KIMI_SECTION_BEGIN in text
 
@@ -92,7 +143,7 @@ class KimiParser(ToolCallParser):
         output -- which is what `_SECTION_RE.search` did -- lost the second
         call entirely and delivered the raw wire tokens of both as content.
         """
-        entries = _parse_entries(region)
+        entries = _parse_entries(region, build_param_types(tools), at_end=at_end)
         if not entries:
             return RegionParse()
         # The region opens at the *first* section marker in the text, which an

@@ -35,9 +35,14 @@ _DSML = "｜DSML｜"
 # ``<invoke name=...>``/``<parameter ...>``/``<tool_calls>`` tags, so the marker
 # is matched OPTIONALLY everywhere.
 _OPT = r"(?:" + re.escape(_DSML) + r")?"  # optional ｜DSML｜ prefix
+# The end-of-input alternative is what keeps the part of a value that
+# arrived before `max_tokens`; requiring `</parameter>` yielded `{}`.
 _PARAM_RE = re.compile(
     r"<" + _OPT + r'parameter\s+name="(.*?)"(?:\s+string="(true|false)")?\s*>'
-    r"(.*?)</" + _OPT + r"parameter>",
+    r"(.*?)(?:</" + _OPT + r"parameter>"
+    r"|(?=<" + _OPT + r"parameter\s)"
+    r"|(?=</" + _OPT + r"invoke>)"
+    r"|\Z)",
     re.DOTALL,
 )
 # Long-form `<invoke name="x">...</invoke>` OR self-closing `<invoke name="x"/>`
@@ -51,6 +56,11 @@ _PARAM_RE = re.compile(
 # `finditer` then resumed past the real call, so the call the model actually
 # made never went out. GLM was given this guard first; this is the sweep.
 _NOT_NESTED = r"(?:(?!<" + _OPT + r"invoke\s).)"
+# `closed | self-closing | unclosed`, in one pattern. Recovering truncation
+# in an `else:` under `if invokes:` instead meant no cut-off call could be
+# recovered once any complete invoke existed in the region -- the ordinary
+# `max_tokens` shape -- and it was not monotone in arrived bytes, which the
+# early announcement (`parse_region` over a prefix) requires.
 _INVOKE_RE = re.compile(
     r"<"
     + _OPT
@@ -58,7 +68,12 @@ _INVOKE_RE = re.compile(
     + _NOT_NESTED
     + r"*?)</"
     + _OPT
-    + r"invoke>)",
+    + r"invoke>)"
+    + r"|<"
+    + _OPT
+    + r'invoke\s+name="([^"]*)"\s*>('
+    + _NOT_NESTED
+    + r"*)",
     re.DOTALL,
 )
 
@@ -128,11 +143,7 @@ def _infer_name(arg_names: set, param_types: dict[str, dict[str, Any]]) -> str |
     return best
 
 
-# The same opener with no closing tag: a call the model was cut off inside.
-_TRUNCATED_INVOKE_RE = re.compile(
-    r"<" + _OPT + r'invoke\s+name="([^"]*)"\s*>(.*)$', re.DOTALL
-)
-# What may follow that opener in a real call: another parameter, or the
+# What may follow an unclosed opener in a real call: another parameter, or the
 # close of the invoke the name opened. Either spelling of the marker, which
 # the model drops about as often as it writes. One tuple, read by both
 # `_is_truncated_call` at both ends of a region's life -- the peek used to
@@ -172,16 +183,23 @@ class DsmlParser(ToolCallParser):
         "<" + _DSML + "invoke",  # marked invoke
         "<invoke name=",  # marker-less invoke (common malform)
         "<tool_calls>",  # marker-less section open
-        # NOT the marker-less singular `<tool_call>`, though `CALL_OPENERS`
-        # claims it as markup. Adding it here leaves that wrapper in the
-        # answer when a model writes it -- the region opens at `<invoke name=`
-        # by which point it has gone out as content, and `markup_begin` only
-        # looks inside the region -- but this tuple is also what `detect`
-        # keys on, and `<tool_call>` is the Hermes and Qwen opener too. So
-        # declaring it makes DSML claim every one of their templates, which
-        # costs a whole model family its parser to save one stray tag.
-        # Fixing it properly means separating "must not be split" from
-        # "identifies this format", which no format needs yet.
+        # ...and its singular spelling, which `CALL_OPENERS` already claims as
+        # markup. Declaring it here was impossible while this tuple was also
+        # the fingerprint -- `<tool_call>` is the Hermes and Qwen opener too,
+        # so DSML would have claimed their templates. `DETECT_MARKERS` is that
+        # separation, and this is the first thing it buys: the wrapper stops
+        # being released as content before the region opens.
+        "<tool_call>",
+    )
+    # What makes a text DSML's, which is narrower than what must not be split:
+    # the marker-bearing spellings only. The marker-less ones above are
+    # malform recovery, and `<invoke name=` is also how MiniMax opens a call
+    # -- keying identification on them had DSML claiming MiniMax's templates
+    # with nothing but `_DETECT_ORDER` in the way.
+    DETECT_MARKERS: ClassVar[tuple[str, ...]] = (
+        "<" + _DSML + "tool_call",
+        "<" + _DSML + "invoke",
+        "<" + _DSML + "parameter",
     )
     # The section wrapper closing after the last invoke -- markup, not answer.
     # Both spellings, since the model drops the marker about as often as it
@@ -202,6 +220,17 @@ class DsmlParser(ToolCallParser):
     # detect() is inherited: any start marker present means DSML.
 
     @classmethod
+    def render_call(cls, name: str, args: dict[str, str]) -> str:
+        body = "".join(
+            f'<{_DSML}parameter name="{k}" string="true">{v}</{_DSML}parameter>'
+            for k, v in args.items()
+        )
+        return (
+            f'<{_DSML}tool_calls><{_DSML}invoke name="{name}">'
+            f"{body}</{_DSML}invoke></{_DSML}tool_calls>"
+        )
+
+    @classmethod
     def parse_region(
         cls, region: str, tools: list | None, *, at_end: bool
     ) -> RegionParse:
@@ -214,14 +243,21 @@ class DsmlParser(ToolCallParser):
         invokes = list(_INVOKE_RE.finditer(region))
         if invokes:
             for m in invokes:
+                closed = m.group(1) is not None
+                name = m.group(1) if closed else m.group(3)
+                # `None` for a self-closing `<invoke .../>`, which is closed
+                # and carries no body.
+                body = (m.group(2) if closed else m.group(4)) or ""
+                if not closed and not _is_truncated_call(
+                    name, body, param_types, at_end=at_end
+                ):
+                    continue
                 spans.append(
                     (
                         cls.markup_begin(region, m.start()),
                         cls.markup_end(region, m.end()),
                     )
                 )
-                name = m.group(1)
-                body = m.group(2) or ""  # None for self-closing <invoke .../>
                 types = param_types.get(name, {})
                 args: dict[str, Any] = {
                     pm.group(1): _coerce(
@@ -244,38 +280,23 @@ class DsmlParser(ToolCallParser):
                 args = _unwrap_wrapper_args(args, set(types))
                 calls.append((name, args))
         else:
-            # No complete invoke wrapper. Two shapes reach here and they want
-            # opposite things: a call cut off mid-way, whose name is written
-            # in the opener, and the documented V4-Flash malform that drops
-            # the wrapper entirely, whose name has to be inferred from the
-            # parameters. Inferring in both cases scored `get_time` for a
-            # truncated `<invoke name="get_weather">` because it happened to
-            # share more parameters -- a different tool than the one the model
-            # named, and than the one the streaming path had already
-            # announced off the same opener.
-            opener = _TRUNCATED_INVOKE_RE.search(region)
-            body = opener.group(2) if opener else region
+            # No `<invoke>` at all: the documented V4-Flash malform that drops
+            # the wrapper and writes bare `<parameter>` lines. The name has to
+            # be inferred from the parameter signature, which is why this is
+            # its own branch -- a *truncated* call has its name in the opener
+            # and is read by the loop above. Inferring for both scored
+            # `get_time` for a cut-off `<invoke name="get_weather">` because
+            # it happened to share more parameters, so the parse named a
+            # different tool than the announcement had.
             raw = {
                 pm.group(1): (pm.group(3), pm.group(2))
-                for pm in _PARAM_RE.finditer(body)
+                for pm in _PARAM_RE.finditer(region)
             }
-            if opener is not None:
-                name = opener.group(1).strip()
-                keep = _is_truncated_call(name, body, param_types, at_end=at_end)
-                # Where this call's markup starts, like the branch above. It
-                # was left at 0, so every byte between the region's opening
-                # marker and a cut-off `<invoke>` was counted as markup and
-                # deleted: 500 characters of an answer, on both delivery
-                # paths, and the only one of the four XML formats that did it.
-                span_begin = cls.markup_begin(region, opener.start())
-            else:
+            if raw:
                 name = _infer_name(set(raw), param_types) or "unknown"
-                keep = bool(raw)
-                # The wrapper-less malform has no opener to anchor to; the
-                # parameters run from wherever the region began.
-                span_begin = 0
-            if keep:
-                spans.append((span_begin, len(region)))
+                # Nothing to anchor to, so the parameters run from wherever
+                # the region began to the end of what arrived.
+                spans.append((0, len(region)))
                 types = param_types.get(name, {})
                 args = {k: _coerce(v, s, types.get(k)) for k, (v, s) in raw.items()}
                 args = _unwrap_wrapper_args(args, set(types))

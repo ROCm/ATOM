@@ -610,6 +610,25 @@ class TestTheSubmitWindowClosesOnEveryPath:
         return AtomEngineService(self._Engine(), _StubTokenizer())
 
     @staticmethod
+    def _settled(service, deadline: float = 5.0) -> bool:
+        """Wait for the worker to finish, not for the queue to drain.
+
+        `queue.empty()` goes true when the worker *takes* the last item, which
+        is before it has run `_submit_stream_request` or the `finally` that
+        closes the window -- so asserting after a fixed sleep is a race, and
+        it failed about one run in ten here. Polls the condition under test
+        with a deadline instead.
+        """
+        import time
+
+        end = time.monotonic() + deadline
+        while time.monotonic() < end:
+            if service._queue.empty() and not service._awaiting_submit:
+                return True
+            time.sleep(0.01)
+        return not service._awaiting_submit
+
+    @staticmethod
     def _request(rid):
         from atom.entrypoints.atomesh.atom_standalone_service import (
             EngineStreamRequest,
@@ -670,7 +689,6 @@ class TestTheSubmitWindowClosesOnEveryPath:
     def test_and_the_worker_loop_is_the_one_calling_it(self):
         """Through the real loop, not the helper -- otherwise this tests the
         test's own `finally` rather than the service's."""
-        import time
 
         service = self._service()
         service.engine.boom = True
@@ -678,12 +696,10 @@ class TestTheSubmitWindowClosesOnEveryPath:
             rid = f"loop-{i}"
             service._expect_stream(rid)
             service._queue.put(self._request(rid))
-        for _ in range(100):
-            if service._queue.empty():
-                break
-            time.sleep(0.02)
-        time.sleep(0.2)
-        assert service._awaiting_submit == set()
+        assert self._settled(service), (
+            f"{len(service._awaiting_submit)} ids left after the worker loop "
+            "handled every request"
+        )
         service.close()
 
     def test_and_the_window_closes_after_the_submit_never_before(self):
@@ -696,18 +712,13 @@ class TestTheSubmitWindowClosesOnEveryPath:
         nothing -- and the worker adds the sequences to the engine a moment
         later. They decode to `max_tokens` into a queue nobody will read.
         """
-        import time
 
         service = self._service()
         rid = "ordering"
         service._expect_stream(rid)
         service.engine.gate = lambda: service.abort_stream(rid)
         service._queue.put(self._request(rid))
-        for _ in range(100):
-            if service._queue.empty():
-                break
-            time.sleep(0.02)
-        time.sleep(0.2)
+        assert self._settled(service)
         assert (
             service.engine.added == []
         ), "a stream closed while it was preprocessing still reached the engine"
@@ -715,7 +726,6 @@ class TestTheSubmitWindowClosesOnEveryPath:
         service.close()
 
     def test_and_a_stream_the_shutdown_path_never_submits(self):
-        import time
 
         service = self._service()
         service._closed.set()
@@ -723,5 +733,61 @@ class TestTheSubmitWindowClosesOnEveryPath:
             rid = f"shut-{i}"
             service._expect_stream(rid)
             service._queue.put(self._request(rid))
-        time.sleep(0.3)
-        assert service._awaiting_submit == set()
+        assert self._settled(service)
+
+
+class TestShuttingDownStopsTheDrains:
+    """`close()` must close the states, not just forget them.
+
+    `stream_state.close()` is the only thing that sets `closed`, and a router
+    thread already inside `drain()` does not hold `_streams_lock` -- it wakes
+    from its queue, reads `closed` as False and hands out chunks for a
+    sequence that was just aborted. If `all(finished)` happens to hold it also
+    emits the finish/usage/`[DONE]` tail, so the caller records
+    `finish_reason: stop` on a truncated answer. `close_*_stream` gets the
+    order right; the shutdown path cleared the registry and stopped there.
+    """
+
+    def test_every_open_stream_is_closed_before_its_sequences_are_aborted(self):
+        import threading
+        from unittest.mock import MagicMock
+
+        from atom.entrypoints.atomesh.atom_standalone_service import (
+            AtomStandaloneService,
+        )
+
+        service = object.__new__(AtomStandaloneService)
+        service._streams, service._completion_streams = {}, {}
+        service._streams_lock = threading.Lock()
+        service.engine_service = MagicMock()
+        service.engine = MagicMock()
+
+        order = []
+        states = {}
+        for name, registry in (
+            ("chat", service._streams),
+            ("completion", service._completion_streams),
+        ):
+            state = MagicMock()
+            state.closed = False
+
+            def _close(s=state, n=name):
+                s.closed = True
+                order.append(f"close:{n}")
+
+            state.close.side_effect = _close
+            registry[name] = state
+            states[name] = state
+        service.engine_service.abort_stream.side_effect = lambda i: order.append(
+            f"abort:{i}"
+        )
+
+        service.close()
+
+        for name, state in states.items():
+            assert state.closed, f"the {name} stream was aborted but never closed"
+        for name in states:
+            assert order.index(f"close:{name}") < order.index(f"abort:{name}"), (
+                f"{name}: aborted before it was closed, so a drain in flight can "
+                "still hand out chunks for a killed sequence"
+            )

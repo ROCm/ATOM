@@ -60,7 +60,18 @@ _INVOKE_RE = re.compile(
     + r"*)",
     re.DOTALL,
 )
-_PARAM_RE = re.compile(_NS + r"<([\w-]+)>(.*?)" + _NS + r"</\1>", re.DOTALL)
+# Ends at the matching close tag, at the next parameter, at the close of the
+# invoke, or at end of input. That last alternative is what keeps a value the
+# model was cut off inside; without it a `max_tokens` truncation arrived as a
+# call with `{}` arguments while Qwen and GLM returned the partial value.
+_PARAM_RE = re.compile(
+    _NS + r"<([\w-]+)>(.*?)"
+    r"(?:" + _NS + r"</\1>"
+    r"|(?=" + _NS + r"<[\w-]+>)"
+    r"|(?=" + _NS + r"</invoke>)"
+    r"|\Z)",
+    re.DOTALL,
+)
 _FIRST_TAG_RE = re.compile(r"^" + _NS + r"<([\w-]+)>")
 
 
@@ -130,6 +141,16 @@ class MiniMaxParser(ToolCallParser):
     # the text when a call was found, all of them left when one was not); a
     # region that parses to nothing is released whole, so this way both
     # answers keep their bytes.
+
+    @classmethod
+    def render_call(cls, name: str, args: dict[str, str]) -> str:
+        body = "".join(
+            f"{MINIMAX_NS}<{k}>{v}{MINIMAX_NS}</{k}>" for k, v in args.items()
+        )
+        return (
+            f'{MINIMAX_NS}<tool_call>{MINIMAX_NS}<invoke name="{name}">'
+            f"{body}{MINIMAX_NS}</invoke>{MINIMAX_NS}</tool_call>"
+        )
 
     @classmethod
     def detect(cls, text: str) -> bool:

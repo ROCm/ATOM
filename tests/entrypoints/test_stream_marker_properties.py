@@ -45,10 +45,16 @@ from typing import ClassVar
 
 import pytest
 
-from atom.entrypoints.openai.reasoning import ReasoningFilter, separate_reasoning
+from atom.entrypoints.openai.reasoning import (
+    ReasoningChannel,
+    ReasoningFilter,
+    separate_reasoning,
+)
 from atom.entrypoints.openai.reasoning_dialects import DIALECTS, resolve_dialect
+from entrypoints.wire_corpus import DECLARED_TOOLS, REAL_CALLS
 from atom.entrypoints.openai.serving_anthropic import completes_a_tool_call
 from atom.entrypoints.openai.tool_parser import RegionParse, ToolCall, parse_tool_calls
+from atom.entrypoints.openai.tool_parser.kimi_k3_tool_parser import KimiK3Parser
 from atom.entrypoints.openai.tool_parser.kimi_tool_parser import KimiParser
 from atom.entrypoints.openai.tool_parser.qwen3_tool_parser import QwenXmlParser
 from atom.entrypoints.openai.tool_parser.registry import _DETECT_ORDER
@@ -88,6 +94,12 @@ class Seen:
         self.content = ""
         self.events: list[str] = []
         self.first_content_at: int | None = None
+        # Bytes consumed when each event arrived. A name announced early and
+        # the same name emitted when the region closes are the same event
+        # kind, so a test that only sees the kinds cannot tell whether the
+        # announcement ran at all -- which is how the harness came to run
+        # every property with it switched off.
+        self.event_at: list[int] = []
 
     @property
     def key(self):
@@ -96,7 +108,13 @@ class Seen:
 
 
 def drive(
-    text: str, chunks: list[str], parser=None, *, suppress_calls: bool = False
+    text: str,
+    chunks: list[str],
+    parser=None,
+    *,
+    suppress_calls: bool = False,
+    tools=None,
+    reasoning=None,
 ) -> Seen:
     """Replay the serving loop over one chunking.
 
@@ -105,9 +123,28 @@ def drive(
     of the text to select one. `suppress_calls` is `tool_choice: "none"`,
     which is a property of the request and not of the text, so it has to be
     passed in the same way.
+
+    `tools` defaults to the declared pair rather than to `None`, because
+    `_announce` returns immediately on `not self.tools` -- so with no tools
+    every property here ran with the early-announcement path switched off,
+    which is the newest thing in the reader and the one that broke. A case
+    that specifically wants the no-tools reader passes `tools=()`.
+
+    `reasoning` likewise: a bare `ReasoningFilter()` falls back to the inline
+    `<think>` dialect and `starts_thinking=False`, so nothing drove Kimi-K3's
+    channel into the Kimi-K3 tool parser -- the one composition where the
+    reasoning stage consumes markers the tool stage also declares.
+
+    A whole `ReasoningChannel`, not a bare dialect: K3's channel is opened by
+    the *prompt*, so a dialect without `starts_open` reads the chain of
+    thought as answer. `TestTheTwoStagesCompose` is what passes it; a
+    parameter no caller uses claims coverage without delivering it.
     """
-    rf, tp = ReasoningFilter(), ToolCallStreamParser(
-        parser_cls=parser, suppress_calls=suppress_calls
+    rf = ReasoningFilter() if reasoning is None else reasoning.stream()
+    tp = ToolCallStreamParser(
+        tools=DECLARED_TOOLS if tools is None else (tools or None),
+        parser_cls=parser,
+        suppress_calls=suppress_calls,
     )
     seen = Seen()
     consumed = 0
@@ -121,6 +158,7 @@ def drive(
             seen.content += payload
         else:
             seen.events.append(kind)
+            seen.event_at.append(consumed)
 
     for i, chunk in enumerate(chunks):
         consumed += len(chunk)
@@ -346,14 +384,38 @@ class TestEverySeedingSiteIsSeeded:
     endpoint added later is covered the moment it exists. Three of the four
     sites that exist today were unseeded before this change, including the one
     the original bug was reported against.
+
+    The names it walks have to be the ones the endpoints actually call. They
+    were `ReasoningFilter` / `separate_reasoning`, and then every endpoint was
+    moved to `ReasoningChannel` -- so the scan matched two sites, both inside
+    `reasoning.py`'s own accessors, and zero endpoints. Green, and inert, for
+    two rounds. `test_the_scan_sees_the_endpoints` is the positive control:
+    it asserts the walk finds work to do, so the same silent retirement
+    cannot happen again on the next rename.
     """
 
     ROOT = pathlib.Path(__file__).resolve().parents[2] / "atom" / "entrypoints"
-    SEEDED = ("ReasoningFilter", "separate_reasoning")
+    # `ReasoningChannel(...)` is what the endpoints build now; the other two
+    # are what it is built from, and a caller reaching past it must answer the
+    # same question.
+    SEEDED = ("ReasoningChannel", "ReasoningFilter", "separate_reasoning")
+    # The keyword each of them spells the answer with.
+    SEED_KWARG = {
+        "ReasoningChannel": "starts_open",
+        "ReasoningFilter": "starts_thinking",
+        "separate_reasoning": "starts_thinking",
+    }
 
     def _unseeded(self) -> list[str]:
         found = []
         for path in sorted(self.ROOT.rglob("*.py")):
+            if path.name == "reasoning.py":
+                # The module that defines the class: its two accessors build
+                # one from the object's own fields, and `NO_REASONING` is the
+                # deliberate sentinel for a caller with no model behind it.
+                # Exempting it cannot hollow out the scan --
+                # `test_the_scan_sees_the_endpoints` requires sites elsewhere.
+                continue
             tree = ast.parse(path.read_text())
             for node in ast.walk(tree):
                 if not isinstance(node, ast.Call):
@@ -364,7 +426,11 @@ class TestEverySeedingSiteIsSeeded:
                 if name not in self.SEEDED:
                     continue
                 seed = next(
-                    (kw.value for kw in node.keywords if kw.arg == "starts_thinking"),
+                    (
+                        kw.value
+                        for kw in node.keywords
+                        if kw.arg == self.SEED_KWARG[name]
+                    ),
                     None,
                 )
                 # Positional counts: `separate_reasoning(text, seeded)` is a
@@ -380,10 +446,36 @@ class TestEverySeedingSiteIsSeeded:
                     # scan accepted it, and a test in this very change was
                     # "repaired" by hardcoding the other literal.
                     found.append(
-                        f"{rel}:{node.lineno} {name}(starts_thinking={seed.value!r})"
+                        f"{rel}:{node.lineno} {name}"
+                        f"({self.SEED_KWARG[name]}={seed.value!r})"
                         " — a literal, not the prompt"
                     )
         return found
+
+    def test_the_scan_sees_the_endpoints(self):
+        """The positive control: the walk must find sites outside reasoning.py.
+
+        The scan is only a guard while its names are the ones in use. When
+        every endpoint moved to `ReasoningChannel` and the scan still looked
+        for `ReasoningFilter`, it matched two sites -- both inside
+        `reasoning.py` itself -- and reported success for a codebase it was no
+        longer reading.
+        """
+        sites = []
+        for path in sorted(self.ROOT.rglob("*.py")):
+            for node in ast.walk(ast.parse(path.read_text())):
+                if not isinstance(node, ast.Call):
+                    continue
+                name = getattr(node.func, "id", None) or getattr(
+                    node.func, "attr", None
+                )
+                if name in self.SEEDED:
+                    sites.append(f"{path.name}:{node.lineno} {name}")
+        outside = [s for s in sites if not s.startswith("reasoning.py:")]
+        assert outside, (
+            "the scan matches no endpoint at all, so it is checking nothing: "
+            f"all it found was {sites}"
+        )
 
     def test_no_entry_point_builds_one_without_the_seed(self):
         unseeded = self._unseeded()
@@ -719,39 +811,6 @@ class TestBoundedWithhold:
 # a new format from joining the registry without one.
 _NS = "]<]minimax[>["
 _D = "｜DSML｜"
-REAL_CALLS: dict[str, str] = {
-    "kimi": (
-        "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0"
-        '<|tool_call_argument_begin|>{"city": "Paris"}<|tool_call_end|>'
-        "<|tool_calls_section_end|>"
-    ),
-    "glm": (
-        "<tool_call>get_weather<arg_key>city</arg_key>"
-        "<arg_value>Paris</arg_value></tool_call>"
-    ),
-    "qwen": (
-        "<tool_call><function=get_weather><parameter=city>Paris</parameter>"
-        "</function></tool_call>"
-    ),
-    "kimi_k3": (
-        '<|open|>tools<|sep|><|open|>call tool="get_weather"<|sep|>'
-        '<|open|>argument key="city"<|sep|>Paris<|close|>argument<|close|>call'
-    ),
-    "dsml": (
-        f'<{_D}tool_calls><{_D}invoke name="get_weather">'
-        f'<{_D}parameter name="city" string="true">Paris</{_D}parameter>'
-        f"</{_D}invoke></{_D}tool_calls>"
-    ),
-    # Parameters named by the tag, which is what tells this format from DSML.
-    # This entry was written in DSML's `<parameter name="...">` spelling and
-    # so parsed to `get_weather({})` -- a call with no arguments, passing
-    # every test here while exercising none of the parameter path.
-    "minimax": (
-        f'{_NS}<tool_call>{_NS}<invoke name="get_weather">'
-        f"{_NS}<city>Paris{_NS}</city>"
-        f"{_NS}</invoke>{_NS}</tool_call>"
-    ),
-}
 
 
 class TestARealCallSurvivesTheStream:
@@ -1089,6 +1148,134 @@ class TestAPrefixPairCannotChangeTheHandover:
             self.test_both_halves_agree_about_opening_a_region(Synthetic)
 
 
+class TestTheTwoStagesCompose:
+    """The reasoning stage feeding the tool stage, on the format where it bites.
+
+    Kimi-K3 is the one composition where the reasoning channel's markers and
+    the tool format's overlap: `<|sep|>` ends a channel token and separates a
+    call's, and `<|open|>tools<|sep|>` both closes the think channel and opens
+    a tool region. Every property in this file ran with `ReasoningFilter()` --
+    no dialect, so the inline `<think>` fallback -- which cannot exercise any
+    of that.
+
+    Driven at many chunk sizes because the composition is where a marker split
+    across a boundary would be consumed by the wrong stage.
+    """
+
+    K3_CALL = (
+        '<|open|>tools<|sep|><|open|>call tool="get_weather"<|sep|>'
+        '<|open|>argument key="city"<|sep|>Paris<|close|>argument<|close|>call'
+    )
+
+    def _drive(self, text, size):
+        dialect, _ = resolve_dialect("<|open|>think<|sep|>")
+        return drive(
+            text,
+            [text[i : i + size] for i in range(0, len(text), size)],
+            KimiK3Parser,
+            reasoning=ReasoningChannel(dialect=dialect, starts_open=True),
+        )
+
+    @pytest.mark.parametrize("size", [1, 3, 7, 40, 10**6])
+    def test_the_channel_closes_and_the_call_still_arrives(self, size):
+        text = "Thinking.<|close|>think<|sep|>" + self.K3_CALL
+        seen = self._drive(text, size)
+        assert seen.reasoning == "Thinking.", f"size={size}: {seen.reasoning!r}"
+        assert "tool_call_start" in seen.events, f"size={size}: {seen.events}"
+
+    @pytest.mark.parametrize("size", [1, 3, 7, 40, 10**6])
+    def test_and_an_answer_between_them_is_neither(self, size):
+        text = (
+            "Thinking.<|close|>think<|sep|><|open|>response<|sep|>"
+            "Here you go.<|close|>response<|sep|>" + self.K3_CALL
+        )
+        seen = self._drive(text, size)
+        assert seen.reasoning == "Thinking.", f"size={size}: {seen.reasoning!r}"
+        assert "Here you go." in seen.content, f"size={size}: {seen.content!r}"
+
+    def test_and_every_chunk_size_agrees(self):
+        text = "Thinking.<|close|>think<|sep|>" + self.K3_CALL
+        keys = {self._drive(text, n).key for n in (1, 2, 3, 5, 11, 40, 10**6)}
+        assert len(keys) == 1, f"chunking changed the answer: {keys}"
+
+
+class TestTheHarnessDrivesTheWholeReader:
+    """What `drive()` switches off, no property below can see.
+
+    `_announce` returns on its first line when the parser has no tools, so
+    passing none ran all 850-odd properties with the early-announcement path
+    disabled -- the newest thing in the reader, and the one that broke. This
+    asserts the harness reaches it, so the omission cannot come back silently.
+    """
+
+    # A format can only announce early if its call pattern accepts a prefix
+    # of the region -- the announcement is `parse_region` with `at_end=False`.
+    # The four XML formats carry `closed | unclosed` in one regex, and Kimi-K2
+    # qualifies for a different reason: its *entry* closes on
+    # `<|tool_call_end|>` independently of the section, so a complete entry in
+    # an unfinished section parses. Only Kimi-K3 needs `<|close|>call` before
+    # anything matches, so it alone cannot name a call before it finishes --
+    # and alone cannot recover one truncated by `max_tokens`.
+    #
+    # Declared rather than discovered, because DSML was silently in this list
+    # until it was given the alternation and nothing said so. The test below
+    # is what keeps the list honest: I had K2 in it on the same assumption and
+    # the check refused it.
+    # Empty, and it was not always: Kimi-K3 needed `<|close|>call` before
+    # anything matched, so it alone could not name a call before it finished.
+    # The truncation sweep gave every format the `closed | unclosed`
+    # alternation, and announcing early is what that alternation *is*.
+    CANNOT_ANNOUNCE_EARLY: frozenset = frozenset()
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_the_list_of_formats_that_cannot_announce_is_accurate(self, parser):
+        """Asked the way the engine asks it: over every prefix.
+
+        `_announce` runs `parse_region(head, at_end=False)` as the bytes
+        arrive, so "can this format announce early" means "does some proper
+        prefix of a real call parse to one". Chopping a fixed twelve
+        characters instead asked a different and weaker question -- measured,
+        it left a fully closed call inside the prefix for qwen, minimax and
+        dsml, so for half the registry it was asking whether a complete call
+        parses, which every format does. Chopping at the payload asks a
+        third question, "can it read a call cut off mid-entry", and Kimi-K2
+        answers no to that while still announcing early off a complete entry
+        in an unfinished section. Only the prefix scan matches the claim.
+        """
+        call = REAL_CALLS[parser.NAME]
+        accepts = any(
+            parser.parse_region(call[:n], DECLARED_TOOLS, at_end=False).calls
+            for n in range(1, len(call))
+        )
+        expected = parser.NAME not in self.CANNOT_ANNOUNCE_EARLY
+        assert accepts == expected, (
+            f"{parser.NAME} {'now' if accepts else 'no longer'} names a call "
+            "before the whole call has arrived; update CANNOT_ANNOUNCE_EARLY "
+            "and say why"
+        )
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_a_real_call_announces_its_name_through_the_harness(self, parser):
+        if parser.NAME in self.CANNOT_ANNOUNCE_EARLY:
+            pytest.skip("this format cannot name a call before it closes")
+        text = "Let me look. " + REAL_CALLS[parser.NAME]
+        seen = drive(text, split_every_way(text)["fixed-3"], parser)
+        starts = [
+            at
+            for kind, at in zip(seen.events, seen.event_at)
+            if kind == "tool_call_start"
+        ]
+        assert starts, f"{parser.NAME}: no call at all came out of the harness"
+        # Strictly before the last byte: the announcement fires while the
+        # region is still open, where the close-time emission cannot.
+        assert min(starts) < len(text), (
+            f"{parser.NAME}: the only name arrived at byte {min(starts)} of "
+            f"{len(text)}, i.e. when the region closed -- the early "
+            "announcement never ran, so every property using this harness is "
+            "running with that path switched off"
+        )
+
+
 class TestAFormatThatReportsNoUsableMarkup:
     """The boundary six hand-written `parse_region` implementations feed.
 
@@ -1195,11 +1382,6 @@ class TestAPlainAnswerDoesNotWaitForTheEnd:
         opener = next(m for m in parser.START_MARKERS if parser.opens_region(m))
         during, _ = self._split_by_arrival(parser, "Before. " + opener + "junk")
         assert during == len("Before. "), f"{parser.NAME} leaked past its opener"
-
-
-DECLARED_TOOLS = [
-    {"type": "function", "function": {"name": "get_weather", "parameters": {}}}
-]
 
 
 def early_name(parser, region: str, tools) -> str | None:
@@ -2193,15 +2375,62 @@ class TestTheEarlyNameCannotDisagreeWithTheParse:
         "{call}{call}",
         PROSE + "{half}" + PROSE + "{call}",
         "{half}{call}",
+        # The shapes that need two *names* to say anything. A truncated call
+        # followed by a complete one for a different tool is the ordinary
+        # `max_tokens` malform, and it is what broke: the prefix announced the
+        # truncated call's name and the finished region returned the other.
+        "{half}{other}",
+        "{other_half}{call}",
+        PROSE + "{half}" + PROSE + "{other}",
+        "{other}{call}",
     ]
+
+    @staticmethod
+    def _texts(parser):
+        call = REAL_CALLS[parser.NAME]
+        other = call.replace("get_weather", "get_time")
+        assert other != call, f"{parser.NAME}'s fixture has no name to vary"
+        return [
+            shape.format(
+                call=call,
+                half=call[: len(call) // 2],
+                other=other,
+                other_half=other[: len(other) // 2],
+            )
+            for shape in TestTheEarlyNameCannotDisagreeWithTheParse.SHAPES
+        ]
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_the_corpus_can_express_a_disagreement(self, parser):
+        """The positive control: at least one shape names both tools.
+
+        Without it the property below is green because nothing in its corpus
+        can name a second tool, which is how it stayed green through a real
+        violation. This asserts the corpus has the ingredient, not that the
+        property holds.
+        """
+        seen = set()
+        for text in self._texts(parser):
+            for at_end in (False, True):
+                for call in parser.parse_region(
+                    text, DECLARED_TOOLS, at_end=at_end
+                ).calls:
+                    seen.add(call.function["name"])
+        declared = {tool["function"]["name"] for tool in DECLARED_TOOLS}
+        assert len(declared) >= 2, (
+            f"only {declared} is declared, so no shape can name a second tool "
+            "and the property below cannot fail"
+        )
+        assert declared <= seen, (
+            f"{parser.NAME}: the corpus produces {seen or '{}'} but "
+            f"{declared - seen} is declared and never appears, so a name "
+            "disagreement involving it is unrepresentable"
+        )
 
     @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
     def test_no_prefix_of_a_head_ever_names_a_different_tool(self, parser):
         call = REAL_CALLS[parser.NAME]
-        texts = [
-            shape.format(call=call, half=call[: len(call) // 2])
-            for shape in self.SHAPES
-        ]
+        texts = self._texts(parser)
         texts.append(call.replace("Paris", "x" * 300))
         texts.append(call.replace("get_weather", "undeclared_tool"))
         for text in texts:

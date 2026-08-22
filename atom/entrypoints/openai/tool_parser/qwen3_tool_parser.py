@@ -47,7 +47,9 @@ _FUNCTION_RE = re.compile(
 )
 _PARAM_OPENER = "<parameter="
 _PARAM_RE = re.compile(
-    r"<parameter=(.*?)(?:</parameter>|(?=<parameter=)|(?=</function>)|$)",
+    # `\Z`, not `$`: `$` also matches before a trailing newline, so a value
+    # ending in one was cut a byte short.
+    r"<parameter=(.*?)(?:</parameter>|(?=<parameter=)|(?=</function>)|\Z)",
     re.DOTALL,
 )
 
@@ -137,6 +139,11 @@ class QwenXmlParser(ToolCallParser):
     # real call in half.
     CALL_OPENERS: ClassVar[tuple[str, ...]] = ("<tool_call>",)
     CALL_CLOSERS: ClassVar[tuple[str, ...]] = ("</tool_call>",)
+
+    @classmethod
+    def render_call(cls, name: str, args: dict[str, str]) -> str:
+        body = "".join(f"<parameter={k}>{v}</parameter>" for k, v in args.items())
+        return f"<tool_call><function={name}>{body}</function></tool_call>"
 
     @classmethod
     def detect(cls, text: str) -> bool:
