@@ -46,7 +46,7 @@ from typing import ClassVar
 import pytest
 
 from atom.entrypoints.openai.reasoning import ReasoningFilter, separate_reasoning
-from atom.entrypoints.openai.reasoning_dialects import DIALECTS
+from atom.entrypoints.openai.reasoning_dialects import DIALECTS, resolve_dialect
 from atom.entrypoints.openai.serving_anthropic import completes_a_tool_call
 from atom.entrypoints.openai.tool_parser import RegionParse, ToolCall, parse_tool_calls
 from atom.entrypoints.openai.tool_parser.kimi_tool_parser import KimiParser
@@ -95,14 +95,20 @@ class Seen:
         return (self.reasoning, self.content, tuple(self.events), finish)
 
 
-def drive(text: str, chunks: list[str], parser=None) -> Seen:
+def drive(
+    text: str, chunks: list[str], parser=None, *, suppress_calls: bool = False
+) -> Seen:
     """Replay the serving loop over one chunking.
 
     `parser` is what the server resolved from the chat template at startup, so
     each case reads its own format explicitly rather than relying on the shape
-    of the text to select one.
+    of the text to select one. `suppress_calls` is `tool_choice: "none"`,
+    which is a property of the request and not of the text, so it has to be
+    passed in the same way.
     """
-    rf, tp = ReasoningFilter(), ToolCallStreamParser(parser_cls=parser)
+    rf, tp = ReasoningFilter(), ToolCallStreamParser(
+        parser_cls=parser, suppress_calls=suppress_calls
+    )
     seen = Seen()
     consumed = 0
 
@@ -795,6 +801,82 @@ class TestARealCallSurvivesTheStream:
         seen = drive(text, split_every_way(text)["fixed-3"], parser)
         assert "Let me look." in seen.content
 
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_and_so_does_the_text_written_between_two_calls(self, parser):
+        """The sentence a model writes while making a second call.
+
+        `TestConservation` cannot see this: it `continue`s the moment a shape
+        produces events, on the grounds that "a real tool call consumes its
+        own bytes" -- true of the call, not of the prose beside it. And the
+        two chunk-invariance properties cannot see it either, because both
+        delivery paths are the same engine and agreed on deleting it. Five of
+        the six formats did, silently, with `finish_reason: tool_calls`.
+        """
+        call = REAL_CALLS[parser.NAME]
+        middle = "Now let me also check Rome."
+        text = f"Before. {call} {middle} {call.replace('Paris', 'Rome')} After."
+        content, calls = parse_tool_calls(text, DECLARED_TOOLS, parser)
+        assert len(calls) == 2, f"{len(calls)} calls, so this shape proves nothing"
+        assert (
+            middle in content
+        ), f"the sentence between two calls was deleted: {content!r}"
+        for label, chunks in split_every_way(text).items():
+            seen = drive(text, chunks, parser)
+            assert middle in seen.content, f"{label}: {seen.content!r}"
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_forbidding_calls_delivers_the_answer_and_not_the_wire_format(self, parser):
+        """`tool_choice: "none"` on every format, not just the one tested.
+
+        Suppression used to skip opening the region, so the call's own bytes
+        streamed out as `content`: the whole `<invoke name=...>` payload, on
+        all six. The single-format test that covered this asserted the raw
+        text came back *verbatim* and so encoded the leak as the contract --
+        and on Kimi-K3 even that was untrue, because the read-ahead drops its
+        framing mid-region and the client got a mangled fragment.
+        """
+        text = "Sure. " + REAL_CALLS[parser.NAME] + " Done."
+        content, calls = parse_tool_calls(
+            text, DECLARED_TOOLS, parser, suppress_calls=True
+        )
+        assert calls == [], "a forbidden call was dispatched"
+        assert (
+            "Sure." in content and "Done." in content
+        ), f"the answer around the call was eaten: {content!r}"
+        for marker in parser.START_MARKERS:
+            assert (
+                marker not in content
+            ), f"raw wire markup shown to the user: {marker!r} in {content!r}"
+        for label, chunks in split_every_way(text).items():
+            seen = drive(text, chunks, parser, suppress_calls=True)
+            assert seen.content == content, f"{label}: {seen.content!r}"
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_and_it_arrives_between_them_rather_than_ahead_of_both(self, parser):
+        """Order is part of the answer.
+
+        Emitting both calls and then the prose would put the same characters
+        on the wire in the wrong place: a client rendering deltas in arrival
+        order shows "let me also check Rome" after the Rome call it introduces.
+        """
+        call = REAL_CALLS[parser.NAME]
+        middle = "Now let me also check Rome."
+        text = f"Before. {call} {middle} {call.replace('Paris', 'Rome')} After."
+        parser_obj = ToolCallStreamParser(tools=DECLARED_TOOLS, parser_cls=parser)
+        events = parser_obj.process(text) + parser_obj.flush()
+        order, said = [], ""
+        for kind, data in events:
+            if kind == "content":
+                said += data
+                if middle in said and "middle" not in order:
+                    order.append("middle")
+            elif kind == "tool_call_start":
+                order.append(data["function"]["name"])
+        assert order.count("middle") == 1
+        assert order.index("middle") > order.index(
+            "get_weather"
+        ), f"the sentence introducing the second call arrived first: {order}"
+
 
 # Markers a format declares so the read-ahead will not split them, but which
 # do not hand the stream over: channel framing that wraps every answer. Only
@@ -957,6 +1039,40 @@ class TestAPrefixPairCannotChangeTheHandover:
         found = {p.NAME: prefix_pairs(p) for p in ALL_PARSERS}
         total = sum(len(v) for v in found.values())
         assert total >= 3, f"no prefix pairs left to check: {found}"
+
+    @pytest.mark.parametrize(
+        "source", ["<think></think>", "<|open|>think<|sep|>"], ids=["think", "channel"]
+    )
+    def test_a_dialect_declares_no_pair_that_changes_the_channel(self, source):
+        """The same rule on the reasoning side, where it was not being asked.
+
+        `ReasoningFilter` watches this dialect's framing *and* its end markers
+        in one scanner, and the two do opposite things: framing is dropped and
+        the state is unchanged, an end marker closes the channel. So a bare
+        closer that is a proper prefix of a paired end marker is precisely the
+        disagreeing pair `_plan` warns about -- the short one fires, the
+        channel never closes, and at four bytes per chunk the whole answer
+        comes back as `reasoning_content` while `stream=false` splits it
+        correctly. Adding `<|close|>think` to Kimi-K3's channel framing did
+        exactly that; the tool-parser version of this test could not see it,
+        because a dialect is not a parser.
+        """
+        dialect, _ = resolve_dialect(source)
+        framing, ends = set(dialect.content_framing), set(dialect.end_markers)
+        watched = framing | ends
+        disagreeing = [
+            (short, long)
+            for short in watched
+            for long in watched
+            if short != long
+            and long.startswith(short)
+            and ((short in ends) != (long in ends))
+        ]
+        assert not disagreeing, (
+            f"{source!r} watches a marker that is a prefix of another and only "
+            f"one of them closes the reasoning channel, so which happens "
+            f"depends on the chunk boundary: {disagreeing}"
+        )
 
     def test_a_disagreeing_pair_is_rejected(self):
         """And that the check can fail at all -- built rather than waited for."""
@@ -1403,7 +1519,7 @@ class TestThePeekNeverNamesWhatTheParseCallsProse:
                     type="function",
                     function={"name": m.group(1), "arguments": "{}"},
                 )
-                return RegionParse((call,), m.start(), len(region))
+                return RegionParse((call,), ((m.start(), len(region)),))
 
         with pytest.raises(AssertionError, match="peek said"):
             self._check(Loose, CALL_OPENERS["qwen"] + " and then...", "English", None)
@@ -2092,7 +2208,7 @@ class TestTheEarlyNameCannotDisagreeWithTheParse:
                         type="function",
                         function={"name": "get_weather", "arguments": "{}"},
                     )
-                    return RegionParse((call,), 0, len(region))
+                    return RegionParse((call,), ((0, len(region)),))
                 return RegionParse()
 
         text = "<tool_call><function=get_weather><parameter=city>Paris"

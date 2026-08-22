@@ -381,6 +381,10 @@ class TestAStreamClosedBeforeItStartedIsStillStopped:
         )
 
         service = self._service()
+        # What `start_stream` does before putting it on the worker queue.
+        # Registering here rather than reaching into the set keeps the test on
+        # the same registrar production uses.
+        service._expect_stream("r1")
         request = EngineStreamRequest(
             request_id="r1",
             prompt="hi",
@@ -412,6 +416,7 @@ class TestAStreamClosedBeforeItStartedIsStillStopped:
         )
 
         service = self._service()
+        service._expect_stream("r4")
         building = threading.Event()
         may_finish = threading.Event()
         original = service.engine.preprocess
@@ -482,6 +487,40 @@ class TestAStreamClosedBeforeItStartedIsStillStopped:
         assert "r3" not in service._stream_seqs and "r3" not in service._abandoned
         service.close()
 
+    def test_and_closing_it_afterwards_does_not_remember_it_instead(self):
+        """The documented teardown is drain-until-DONE then close.
+
+        `forget_stream` runs on the drain, so the close that follows finds
+        nothing to pop -- which `abort_stream` reads as "not submitted yet"
+        and remembers forever. One retained id per *successful* request, which
+        is exactly the growth `forget_stream` was added to stop, re-entering
+        through the other door.
+        """
+        from atom.entrypoints.atomesh.atom_standalone_service import (
+            EngineStreamRequest,
+        )
+
+        service = self._service()
+        for i in range(50):
+            rid = f"done-{i}"
+            service._submit_stream_request(
+                EngineStreamRequest(
+                    request_id=rid,
+                    prompt="hi",
+                    sampling_params=None,
+                    effective_n=1,
+                    stream_queue=queue.Queue(),
+                )
+            )
+            service.forget_stream(rid)  # what the drain does on completion
+            service.abort_stream(rid)  # what a caller that closes anyway did
+        assert not service._stream_seqs
+        assert len(service._abandoned) == 0, (
+            f"{len(service._abandoned)} completed stream ids retained for the "
+            "life of the process"
+        )
+        service.close()
+
     def test_closing_between_add_request_and_publication_aborts(self):
         """The third window, and the one publication order decides.
 
@@ -498,6 +537,7 @@ class TestAStreamClosedBeforeItStartedIsStillStopped:
         )
 
         service = self._service()
+        service._expect_stream("r5")
         added = threading.Event()
         may_publish = threading.Event()
         original = service.engine.add_request

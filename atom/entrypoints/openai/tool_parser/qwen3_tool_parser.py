@@ -149,7 +149,7 @@ class QwenXmlParser(ToolCallParser):
     ) -> RegionParse:
         param_types = build_param_types(tools)
         calls: list[ToolCall] = []
-        begin = end = 0
+        spans: list[tuple[int, int]] = []
         for fm in _FUNCTION_RE.finditer(region):
             closed = fm.group(1) is not None
             fn_text = fm.group(1) if closed else fm.group(2)
@@ -162,8 +162,11 @@ class QwenXmlParser(ToolCallParser):
                 fn_text, param_types, at_end=at_end
             ):
                 continue
-            if not calls:
-                begin = cls.markup_begin(region, fm.start())
             calls.append(tc)
-            end = cls.markup_end(region, fm.end())
-        return RegionParse(tuple(calls), begin, end)
+            spans.append(
+                (
+                    cls.markup_begin(region, fm.start()),
+                    cls.markup_end(region, fm.end()),
+                )
+            )
+        return RegionParse(tuple(calls), tuple(spans))

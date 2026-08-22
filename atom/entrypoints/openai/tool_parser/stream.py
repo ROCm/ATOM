@@ -19,7 +19,7 @@ import logging
 
 from ..marker_scanner import MarkerScanner
 from .schema import ParamTypes, build_param_types
-from .tool_parser import NO_CALLS, ToolCall, ToolCallParser
+from .tool_parser import RegionParse, ToolCall, ToolCallParser
 
 logger = logging.getLogger("atom")
 
@@ -111,6 +111,31 @@ class Region:
 
 def _peek_declared(tools: list | None) -> frozenset[str]:
     return frozenset(build_param_types(tools))
+
+
+def _markup_spans(
+    spans: tuple[tuple[int, int], ...], length: int
+) -> list[tuple[int, int]]:
+    """A format's markup intervals, clamped and merged into a partition.
+
+    The engine walks these in order and treats the gaps as answer, so they
+    have to be ascending and non-overlapping whatever a format reports.
+
+    At least one byte is always consumed, which is what keeps the engine from
+    handing a region back, finding the same marker and parsing it forever:
+    every span kept here is non-empty, and a region with none at all gets the
+    one-byte span on the last line.
+    """
+    merged: list[tuple[int, int]] = []
+    for start, stop in sorted(spans):
+        start, stop = max(0, min(start, length)), max(0, min(stop, length))
+        if stop <= start:
+            continue
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], stop))
+        else:
+            merged.append((start, stop))
+    return merged or ([(0, 1)] if length else [])
 
 
 def _resolved_tools(tools: list | None):
@@ -256,20 +281,18 @@ class ToolCallStreamParser:
                             # body to EOS -- 324 of 324 characters in one
                             # frame at the end.
                             text = scan.rest
-                        elif self.suppress_calls:
-                            # The request forbade tool calls, so this region
-                            # cannot become one and there is nothing to wait
-                            # for. The marker is answer text like everything
-                            # around it. Buffering it anyway would hold the
-                            # rest of the reply to end of stream for a request
-                            # that had already said what the answer is.
-                            out.append(("content", scan.hit))
-                            text = scan.rest
                         else:
                             # The region has opened. Opened, but not read
                             # here: the marker goes back through the region
                             # branch below, so a chunk carrying a whole call
                             # is closed on this pass rather than one late.
+                            #
+                            # Not skipped for `suppress_calls`: releasing the
+                            # marker as content there let the rest of the
+                            # region stream out as content too, putting raw
+                            # wire tokens in the answer. A region is buffered
+                            # the same way whatever the request said about
+                            # dispatch; only `_close_region` differs.
                             self._region = Region()
                             self._end_tail = ""
                             text = scan.hit + scan.rest
@@ -327,27 +350,53 @@ class ToolCallStreamParser:
         was made in is how one region's peek came to be matched against the
         next region's parse, and reported as a mismatch.
         """
-        parsed = (
-            NO_CALLS
-            if self.suppress_calls
-            else self.parser_cls.parse_region(body, self.tools, at_end=True)
-        )
+        parsed = self.parser_cls.parse_region(body, self.tools, at_end=True)
+        if self.suppress_calls and parsed.calls:
+            # `tool_choice: "none"`. The format is read either way -- that is
+            # what separates this from `parser_cls=None` -- and what is
+            # suppressed is dispatch, not reading. Skipping the parse instead
+            # put the model's raw wire tokens in `content`, on every format
+            # and both delivery paths. The markup is now located exactly as it
+            # is for a dispatched call and only the answer around it goes out,
+            # so a response that was nothing but a call has empty content.
+            logger.debug(
+                "tool_choice=none: dropped %d %s call(s) from the response",
+                len(parsed.calls),
+                self.parser_cls.NAME,
+            )
+            parsed = RegionParse((), parsed.spans)
         events: list = []
         rest = ""
-        if parsed.calls:
-            begins = min(max(parsed.begins, 0), len(body))
-            if begins:
-                events.append(("content", body[:begins]))
-            for call in parsed.calls:
+        if parsed.spans and (parsed.calls or self.suppress_calls):
+            # Everything outside the format's markup is answer, including
+            # whatever the model wrote *between* two calls. Reading only the
+            # outer pair deleted that -- "let me also check Rome" between two
+            # `<tool_call>` blocks, on five of the six formats, silently.
+            spans = _markup_spans(parsed.spans, len(body))
+            pending = list(parsed.calls)
+            at = 0
+            for i, (start, stop) in enumerate(spans):
+                if start > at:
+                    events.append(("content", body[at:start]))
+                at = stop
+                # In the order the model wrote them, so a client sees the
+                # sentence between two calls between them and not hoisted in
+                # front of both. One call per span, and the last span takes
+                # whatever is left -- which is how Kimi-K2's single
+                # section-wide span carries all of its entries.
+                take = len(pending) if i == len(spans) - 1 else 1
+                for call in pending[:take]:
+                    events.extend(self._emit_call(call))
+                del pending[:take]
+            for call in pending:
                 events.extend(self._emit_call(call))
-            events.append(("tool_call_end", None))
-            # Bounded to at least one byte past `begins`. A format that
-            # reported less would have the engine hand the whole region back,
-            # find the same marker and parse it again forever; the property
-            # tests hold every registered format to
-            # `begins < consumed <= len(region)`.
-            consumed = min(max(parsed.consumed, begins + 1), len(body))
-            rest = body[consumed:]
+            if parsed.calls:
+                # Not for a suppressed region: there is no call to end, and a
+                # bare `tool_call_end` is read downstream as "a call just
+                # completed" -- `completes_a_tool_call` says so, and the
+                # Anthropic path closes a block on it.
+                events.append(("tool_call_end", None))
+            rest = body[at:]
         elif body:
             # A start marker is not a promise. An answer explaining that a
             # model "writes <tool_call> to call something" opens the region

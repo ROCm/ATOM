@@ -553,8 +553,13 @@ class TestTheStopReasonTellsTheTruth:
             ("max_tokens", "max_tokens"),
             ("stop_sequence", "stop_sequence"),
             # The scheduler's fourth ending, and the one a lookup misses: a
-            # stop token fired, spelled with the token's own id.
-            ("stop_163586", "stop_sequence"),
+            # model stop *token* fired, spelled with the token's own id. That
+            # is an ordinary end of turn, not the client's `stop_sequences`
+            # matching -- which is what `stop_sequence` means to Anthropic,
+            # and what it pairs with the matched string. Mapping it there
+            # gives any model with a second declared EOS a `stop_sequence:
+            # null` for a request that supplied no stop sequences.
+            ("stop_163586", "end_turn"),
             ("aborted", "end_turn"),
             ("unschedulable: no free blocks", "end_turn"),
             ("", "end_turn"),

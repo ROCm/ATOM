@@ -299,13 +299,20 @@ def anthropic_stop_reason(finish_reason: Any) -> str:
     vocabulary (`stop` / `length`), which shares no member with the keys here,
     so chaining them would send every reason to the default.
 
-    `stop_<token_id>` is its own case for the same reason it exists -- a stop
-    token fired, which is Anthropic's `stop_sequence`. Falling through would
-    have reported a normal ending for a response that was cut short.
+    `stop_<token_id>` is *not* `stop_sequence`, though it was mapped to it.
+    The two come from different branches of the scheduler and mean opposite
+    things: `stop_sequence` is one of the client's own `stop_sequences`
+    matching, and Anthropic pairs it with the matched string in the response;
+    `stop_<id>` is a model end-of-turn token from `stop_token_ids` firing,
+    which is an ordinary `end_turn`.
+
+    `stop_token_ids` is `generation_config.eos_token_id` minus the single
+    `tokenizer.eos_token_id`, so any model declaring more than one EOS reaches
+    this branch in normal operation -- Qwen3, Qwen3.5, gpt-oss.
     """
     reason = finish_reason or ""
     if reason.startswith("stop_") and reason != "stop_sequence":
-        return "stop_sequence"
+        return "end_turn"
     return _ANTHROPIC_STOP_REASON.get(reason, "end_turn")
 
 
@@ -316,6 +323,11 @@ def anthropic_stop_reason(finish_reason: Any) -> str:
 # 5016 of them. Long enough to trip proxy and SDK idle-read timeouts, and the
 # stall watchdog can only report it, not prevent it.
 _ANTHROPIC_PING_FRAME = event_frame("ping", {"type": "ping"})
+# Paced by the clock, not by the model: one ping per dropped reasoning
+# *segment* is one per engine chunk, i.e. O(reasoning tokens) socket writes of
+# 35 discarded bytes. The keepalive only has to beat proxy and SDK idle-read
+# timeouts, which are tens of seconds.
+_ANTHROPIC_PING_INTERVAL_SECONDS = 5.0
 _metrics_exporter = AtomMetricsExporter()
 _metrics_refresh_task: asyncio.Task | None = None
 _METRICS_REFRESH_INTERVAL_SECONDS = 5.0
@@ -1984,6 +1996,8 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                 engine_reason: Any = None
 
                 message_started = False
+                # See `_ANTHROPIC_PING_INTERVAL_SECONDS`.
+                last_ping = 0.0
                 # Assume abort until we reach the normal end of the stream. If
                 # the client disconnects, GeneratorExit unwinds through the
                 # yields and the finally runs with this still True -> abort.
@@ -2001,18 +2015,17 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                         new_text = chunk_data["text"]
                         if chunk_data.get("finish_reason"):
                             engine_reason = chunk_data["finish_reason"]
-                        if chunk_data.get("finish_reason"):
-                            engine_reason = chunk_data["finish_reason"]
                         output_tokens += len(chunk_data.get("token_ids", []))
                         finished = chunk_data.get("finished", False)
 
-                        # Phase 1: Reasoning filter
-                        if reasoning_filter is None:
-                            segments = [("content", new_text)]
-                        else:
-                            segments = reasoning_filter.process(new_text)
-                            if finished:
-                                segments.extend(reasoning_filter.flush())
+                        # Phase 1: Reasoning filter. Never None --
+                        # `reasoning_channel(...).stream()` always returns a
+                        # `ReasoningFilter`. Do not add a skip path back: it
+                        # would feed an unseparated chain of thought straight
+                        # into the tool parser.
+                        segments = reasoning_filter.process(new_text)
+                        if finished:
+                            segments.extend(reasoning_filter.flush())
 
                         for field, text in segments:
                             if not text:
@@ -2020,7 +2033,12 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
 
                             if field == "reasoning_content":
                                 if drop_reasoning:
-                                    yield _ANTHROPIC_PING_FRAME
+                                    now = time.monotonic()
+                                    if now - last_ping >= (
+                                        _ANTHROPIC_PING_INTERVAL_SECONDS
+                                    ):
+                                        last_ping = now
+                                        yield _ANTHROPIC_PING_FRAME
                                     continue
                                 for _frame in blocks.delta("thinking", text):
                                     yield _frame

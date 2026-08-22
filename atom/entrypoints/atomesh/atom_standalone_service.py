@@ -114,6 +114,11 @@ class AtomEngineService:
         # abort and the sequence was added to the engine *afterwards* -- the
         # exact case the abort exists for, and the one it missed.
         self._abandoned: set[str] = set()
+        # Stream ids handed to the worker queue and not yet published or
+        # forgotten -- the only ids for which "no sequence list" can still
+        # mean "not submitted yet" rather than "already finished". Bounded by
+        # requests actually in flight.
+        self._awaiting_submit: set[str] = set()
         self._stream_seqs_lock = threading.Lock()
         self._worker = threading.Thread(
             target=self._worker_loop,
@@ -226,6 +231,7 @@ class AtomEngineService:
             raise RuntimeError("ATOM standalone engine service is closed")
 
         stream_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+        self._expect_stream(request_id)
         self._queue.put(
             EngineStreamRequest(
                 request_id=request_id,
@@ -238,6 +244,15 @@ class AtomEngineService:
             )
         )
         return stream_queue
+
+    def _expect_stream(self, request_id: str) -> None:
+        """This id is on the worker queue and its sequences do not exist yet.
+
+        The one registrar, so that "could still be submitted" has a single
+        definition; the window closes in `_submit_stream_request`.
+        """
+        with self._stream_seqs_lock:
+            self._awaiting_submit.add(request_id)
 
     def _submit_stream_request(self, request: EngineStreamRequest) -> None:
         if self._take_abandoned(request.request_id):
@@ -263,6 +278,7 @@ class AtomEngineService:
         # whether a close in that window aborts or leaks; this way one of the
         # two branches below always fires.
         with self._stream_seqs_lock:
+            self._awaiting_submit.discard(request.request_id)
             if request.request_id in self._abandoned:
                 self._abandoned.discard(request.request_id)
                 abandoned = seqs
@@ -275,8 +291,13 @@ class AtomEngineService:
     def _take_abandoned(self, request_id: str) -> bool:
         with self._stream_seqs_lock:
             if request_id not in self._abandoned:
+                # Still to be submitted, so the window `_awaiting_submit`
+                # marks stays open: an abort arriving while this request is
+                # being preprocessed has no sequences to stop yet either, and
+                # closing the window here let it through to the engine.
                 return False
             self._abandoned.discard(request_id)
+            self._awaiting_submit.discard(request_id)
             return True
 
     def forget_stream(self, request_id: str) -> None:
@@ -290,19 +311,27 @@ class AtomEngineService:
         with self._stream_seqs_lock:
             self._stream_seqs.pop(request_id, None)
             self._abandoned.discard(request_id)
+            self._awaiting_submit.discard(request_id)
 
     def abort_stream(self, request_id: str) -> None:
-        """Stop the sequences behind a stream the caller has finished with.
+        """Stop the sequences behind a stream that is still live.
 
-        Idempotent, and safe to call on a stream that ended normally: the
-        engine has already forgotten those sequences and says so by raising,
-        which is not an error here.
+        Call this only for a stream the caller has just taken ownership of --
+        `close_*_stream` does it under the same lock that removes the stream
+        from the registry. It cannot be used as a blanket "make sure this is
+        gone", because a missing sequence list is ambiguous: it means either
+        "not submitted yet" or "already finished and forgotten", and this has
+        to assume the first or the pre-submit abort window reopens. Calling it
+        on a stream that already ended therefore remembers that id forever.
         """
         with self._stream_seqs_lock:
             seqs = self._stream_seqs.pop(request_id, None)
             if seqs is None:
-                # Not submitted yet. Remember, so it never is.
-                self._abandoned.add(request_id)
+                # The ambiguity the docstring names: `_awaiting_submit` is the
+                # only thing in here that can say "not submitted yet" rather
+                # than "already finished", and remembering a finished id leaks.
+                if request_id in self._awaiting_submit:
+                    self._abandoned.add(request_id)
                 return
         for seq in seqs:
             self._abort_seq(seq)
@@ -1167,8 +1196,12 @@ class AtomStandaloneService:
         the rendered prompt does not open the channel. OR-ing the model-level
         fact in regardless made a DeepSeek-R1-shaped model return its whole
         answer as `reasoning_content` with `content` empty, on both delivery
-        modes. The OpenAI server gates this the same way; the docstring that
-        used to sit here said no request could reach it, and that was wrong.
+        modes.
+
+        The OpenAI server does *not* gate it the same way: there `thinking_off`
+        comes only from the request's own `thinking` / `reasoning_effort`
+        fields, never from the merged template kwargs. That is a latent bug
+        there, not a form to copy back into here.
         """
         return ReasoningChannel(
             dialect=self.reasoning_dialect,
@@ -1390,10 +1423,28 @@ class AtomStandaloneService:
         return chunks[0]
 
     def close_completions_stream(self, stream_id: str) -> None:
+        """Close a stream the caller is finished with.
+
+        The abort is conditional on this call being the one that removed the
+        stream. A stream that ended on its own was already removed by
+        `drain_*`, which called `forget_stream`; the router then closes it
+        anyway, as it is documented to. Aborting unconditionally at that point
+        reached `abort_stream` with nothing left to pop, which reads as "not
+        submitted yet" and permanently remembered the id -- one leaked entry
+        per *successful* request, which is the same unbounded growth
+        `forget_stream` exists to prevent.
+
+        `_completion_streams` is the liveness answer and it is exact: the entry is
+        added before the engine request is submitted and removed either here
+        or by the drain that saw the stream finish. So a stream closed during
+        the pre-submit window still aborts, which is the case `_abandoned` was
+        built for.
+        """
         with self._streams_lock:
             stream_state = self._completion_streams.pop(stream_id, None)
-        if stream_state is not None:
-            stream_state.close()
+        if stream_state is None:
+            return
+        stream_state.close()
         self.engine_service.abort_stream(stream_id)
 
     def start_chat_completions_stream(self, request_data: dict[str, Any]) -> str:
@@ -1483,10 +1534,17 @@ class AtomStandaloneService:
         return chunks[0]
 
     def close_chat_completions_stream(self, stream_id: str) -> None:
+        """Close a stream the caller is finished with.
+
+        Identical to `close_completions_stream` over `_streams` instead of
+        `_completion_streams` -- see there for why the abort is conditional on
+        this call being the one that removed the stream.
+        """
         with self._streams_lock:
             stream_state = self._streams.pop(stream_id, None)
-        if stream_state is not None:
-            stream_state.close()
+        if stream_state is None:
+            return
+        stream_state.close()
         self.engine_service.abort_stream(stream_id)
 
     def close(self) -> None:

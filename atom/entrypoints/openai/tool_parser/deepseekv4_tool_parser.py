@@ -198,13 +198,18 @@ class DsmlParser(ToolCallParser):
         param_types = build_param_types(tools)
         calls: list[tuple[str, dict[str, Any]]] = []
         # A truncated or wrapper-less call runs to the end of what arrived;
-        # complete invokes start and end where their own matches do.
-        begin, end = 0, len(region)
+        # complete invokes start and end where their own matches do, one span
+        # each.
+        spans: list[tuple[int, int]] = []
         invokes = list(_INVOKE_RE.finditer(region))
         if invokes:
-            begin = cls.markup_begin(region, invokes[0].start())
-            end = cls.markup_end(region, invokes[-1].end())
             for m in invokes:
+                spans.append(
+                    (
+                        cls.markup_begin(region, m.start()),
+                        cls.markup_end(region, m.end()),
+                    )
+                )
                 name = m.group(1)
                 body = m.group(2) or ""  # None for self-closing <invoke .../>
                 types = param_types.get(name, {})
@@ -252,14 +257,15 @@ class DsmlParser(ToolCallParser):
                 # marker and a cut-off `<invoke>` was counted as markup and
                 # deleted: 500 characters of an answer, on both delivery
                 # paths, and the only one of the four XML formats that did it.
-                begin = cls.markup_begin(region, opener.start())
+                span_begin = cls.markup_begin(region, opener.start())
             else:
                 name = _infer_name(set(raw), param_types) or "unknown"
                 keep = bool(raw)
                 # The wrapper-less malform has no opener to anchor to; the
                 # parameters run from wherever the region began.
-                begin = 0
+                span_begin = 0
             if keep:
+                spans.append((span_begin, len(region)))
                 types = param_types.get(name, {})
                 args = {k: _coerce(v, s, types.get(k)) for k, (v, s) in raw.items()}
                 args = _unwrap_wrapper_args(args, set(types))
@@ -276,4 +282,4 @@ class DsmlParser(ToolCallParser):
             )
             for name, args in calls
         )
-        return RegionParse(tool_calls, begin, end)
+        return RegionParse(tool_calls, tuple(spans))

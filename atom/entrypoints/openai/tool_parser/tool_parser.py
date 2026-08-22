@@ -155,24 +155,44 @@ class ToolCall:
 class RegionParse:
     """What one format made of a region's bytes.
 
-    ``begins`` and ``consumed`` bracket the format's own markup: everything
-    before is the answer leading up to it, everything after is the answer
-    resuming. Both are handed back to the reader, so a region is accounted for
-    byte by byte and no format has to remember to return either half.
+    ``spans`` is every stretch of this region that is the format's own markup,
+    in ascending order and not overlapping: everything inside a span is
+    markup, everything outside every span is answer. The region is accounted
+    for byte by byte and no format has to remember to return the leftovers.
 
-    ``begins`` is the first accepted call's own match; the engine widens it
-    back to the start marker enclosing it. A region opens at the *first*
-    marker in the text, which an answer that quotes one before making a real
-    call puts in the wrong place -- the sentence between the two used to be
-    swallowed with the markup.
+    Several spans and not one outer pair, because a region can hold more than
+    one call and a model writes between them -- "let me also check Rome"
+    between two `<tool_call>` blocks is the ordinary shape of a parallel-call
+    answer. A single outer pair calls that sentence markup and deletes it. Kimi-K2 is
+    the exception, and only because it is the one format whose
+    `REGION_END_MARKERS` close a region per section, so the question never
+    reached here -- which is also why it still returns a single span covering
+    its whole section, where the others return one per call.
+
+    Each span is a call's own match widened by :meth:`ToolCallParser.
+    markup_begin` / :meth:`~ToolCallParser.markup_end`, which walk over that
+    format's wrappers and fillers and stop at prose -- so the wrapper opening
+    the first call and the one closing the last belong to those calls' spans,
+    and whitespace between two markers is markup while whitespace between
+    prose and a marker is not.
 
     ``calls`` empty means the region was a quotation rather than a call, and
-    the engine releases its bytes unchanged; both offsets are then ignored.
+    the engine releases its bytes unchanged; ``spans`` is then ignored.
     """
 
     calls: tuple[ToolCall, ...] = ()
-    begins: int = 0
-    consumed: int = 0
+    spans: tuple[tuple[int, int], ...] = ()
+
+    @property
+    def begins(self) -> int:
+        """Where the first call's markup starts. Derived, so that the answer
+        cannot drift from ``spans``."""
+        return self.spans[0][0] if self.spans else 0
+
+    @property
+    def consumed(self) -> int:
+        """Where the last call's markup ends."""
+        return self.spans[-1][1] if self.spans else 0
 
 
 NO_CALLS = RegionParse()

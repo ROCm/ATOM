@@ -447,9 +447,14 @@ class TestForbiddingToolCallsDoesNotDeleteTheAnswer:
     was eaten and nothing took its place. Measured on the answer below: 89 of
     95 characters gone, no event, `finish_reason: stop`.
 
-    The rule now lives at the one place the parser is *asked*, as a
-    `suppress_calls` flag, which is also the reading that makes sense: the
-    request said this cannot be a call, so it is prose.
+    The rule lives at the one place the parser is *asked*, as a
+    `suppress_calls` flag. What that flag suppresses is *dispatch*, not
+    reading. It used to also skip opening the region, on the reading that
+    "the request said this cannot be a call, so it is prose" -- and that
+    reading turned out to be false in its own terms: the bytes released were
+    the model's wire markup, `<invoke name="get_weather">` and payload, on
+    every format. The region is now buffered and parsed exactly as it is for
+    a permitted call, and only the calls are dropped.
 
     Not by dropping the parser, which is where the first fix went. Dropping
     it drops everything else a parser does -- and a format whose framing
@@ -481,10 +486,18 @@ class TestForbiddingToolCallsDoesNotDeleteTheAnswer:
         ["none", {"type": "none"}],
         ids=["openai-string", "anthropic-object"],
     )
-    def test_the_whole_answer_is_delivered(self, tool_choice):
-        """Both protocols' spellings, because both endpoints ask."""
+    def test_the_answer_is_delivered_and_the_markup_is_not(self, tool_choice):
+        """Both protocols' spellings, because both endpoints ask.
+
+        The answer around the call survives. What does not survive is the
+        call's own bytes: a client that asked for no tool calls is not asking
+        to be shown the wire format.
+        """
         events = self._stream(tool_choice)
-        assert "".join(d for k, d in events if k == "content") == A_CALL
+        content = "".join(d for k, d in events if k == "content")
+        assert "Sure." in content, "the answer was eaten again"
+        for token in ("<tool_call>", "<function=", "<parameter=", "</function>"):
+            assert token not in content, f"raw markup shown to the user: {token}"
 
     @pytest.mark.parametrize(
         "tool_choice",
@@ -513,16 +526,22 @@ class TestForbiddingToolCallsDoesNotDeleteTheAnswer:
         )
         assert calls == [] and non_streaming == streamed
 
-    def test_the_answer_is_not_withheld_to_the_end(self):
-        """A region that can never be a call has nothing to wait for.
+    def test_forbidding_calls_withholds_no_more_than_allowing_them(self):
+        """Parity, not zero.
 
-        Suppressing dispatch but still buffering meant a request that had
-        already said "no tool calls" got the rest of its answer in one frame
-        at end of stream -- the marker opened a region, and a region is held
-        until it can be parsed.
+        Reading the format costs a region's worth of buffering, and that cost
+        is the same whatever the request said about dispatch -- it is the
+        latency `_PEEK_WINDOW` and `REGION_END_MARKERS` exist to bound, not
+        something `tool_choice` should change. Zero was the old promise, and
+        it was bought by not reading the format at all, which is what put the
+        raw markup in the answer.
         """
-        held = [d for k, d in self._held_back("none") if k == "content"]
-        assert sum(map(len, held)) == 0, f"{sum(map(len, held))} characters held to EOS"
+        forbidden = sum(len(d) for k, d in self._held_back("none") if k == "content")
+        allowed = sum(len(d) for k, d in self._held_back("auto") if k == "content")
+        assert forbidden <= allowed, (
+            f"forbidding calls held {forbidden} characters to EOS where "
+            f"allowing them held {allowed}"
+        )
 
     @staticmethod
     def _held_back(tool_choice, chunk=7):
@@ -604,7 +623,8 @@ class TestTheStreamReportsWhyItStopped:
     So a response the engine cut off at `max_tokens` reported completion
     while `stream=false` reported `length` for the same generation, and an
     agentic client kept a truncated answer as final. A `stop_<token_id>`
-    stop -- which the Anthropic endpoint maps to `stop_sequence` -- collapsed
+    stop -- a model EOS token other than the primary one, which both
+    endpoints report as an ordinary ending -- collapsed
     the same way. All three lines sat next to edits this branch made.
     """
 

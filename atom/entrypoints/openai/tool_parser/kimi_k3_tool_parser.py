@@ -22,6 +22,7 @@ import json
 import re
 from typing import ClassVar
 
+from .. import kimi_k3_tokens as k3
 from .tool_parser import RegionParse, ToolCall, ToolCallParser, unique_tool_call_id
 
 # K3 channel tokens this parser matches on. Kept local so the parser is
@@ -62,22 +63,17 @@ _K3_ARG_RE = re.compile(
 # (`tool="..."`, `key="..."`) so they cannot be declared as literals, and they
 # only ever occur inside a tools section, where `_K3_CALL_RE` and `_K3_ARG_RE`
 # account for them.
+
+# This format's own framing: what wraps every answer, plus what brackets a
+# call. Both halves come from `kimi_k3_tokens`, which the reasoning dialect
+# reads too -- do not re-spell these literals here, that is how the two
+# copies came to disagree.
 _K3_CONTENT_FRAMING = (
-    "<|open|>response<|sep|>",
-    "<|close|>response<|sep|>",
-    "<|open|>think<|sep|>",
-    "<|close|>think<|sep|>",
-    "<|open|>message<|sep|>",
-    "<|close|>message<|sep|>",
-    "<|open|>tools<|sep|>",
-    "<|close|>response",
-    "<|close|>think",
-    "<|close|>message",
-    "<|close|>tools",
-    "<|close|>argument",
-    "<|close|>call",
-    "<|end_of_msg|>",
-    "<|sep|>",
+    *k3.CHANNEL_FRAMING,
+    k3.THINK_START,
+    k3.THINK_END,
+    *k3.TOOL_REGION_FRAMING,
+    *k3.UNPAIRED_FRAMING,
 )
 
 
@@ -175,13 +171,14 @@ class KimiK3Parser(ToolCallParser):
         dangling `<|close|>argument` still in it.
         """
         tool_calls: list[ToolCall] = []
-        begin = end = 0
+        spans: list[tuple[int, int]] = []
         for m in _K3_CALL_RE.finditer(region):
             args: dict = {}
             for a in _K3_ARG_RE.finditer(m.group("body")):
                 args[a.group("key")] = _k3_coerce(a.group("val"), a.group("type"))
-            if not tool_calls:
-                begin = cls.markup_begin(region, m.start())
+            spans.append(
+                (cls.markup_begin(region, m.start()), cls.markup_end(region, m.end()))
+            )
             tool_calls.append(
                 ToolCall(
                     id=unique_tool_call_id(),
@@ -192,5 +189,4 @@ class KimiK3Parser(ToolCallParser):
                     },
                 )
             )
-            end = cls.markup_end(region, m.end())
-        return RegionParse(tuple(tool_calls), begin, end)
+        return RegionParse(tuple(tool_calls), tuple(spans))

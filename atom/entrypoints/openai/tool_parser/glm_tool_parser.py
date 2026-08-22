@@ -98,7 +98,7 @@ class GlmParser(ToolCallParser):
     ) -> RegionParse:
         param_types = build_param_types(tools)
         tool_calls: list[ToolCall] = []
-        begin = end = 0
+        spans: list[tuple[int, int]] = []
         for m in _TOOLCALL_RE.finditer(region):
             closed = m.group(1) is not None
             body = m.group(1) if closed else m.group(2)
@@ -149,8 +149,7 @@ class GlmParser(ToolCallParser):
                 k = pm.group(1).strip()
                 if k:
                     args[k] = coerce_json_or_raw(pm.group(2), types.get(k))
-            if not tool_calls:
-                begin = m.start()
+            spans.append((m.start(), cls.markup_end(region, m.end())))
             tool_calls.append(
                 ToolCall(
                     id=unique_tool_call_id(),
@@ -161,5 +160,4 @@ class GlmParser(ToolCallParser):
                     },
                 )
             )
-            end = cls.markup_end(region, m.end())
-        return RegionParse(tuple(tool_calls), begin, end)
+        return RegionParse(tuple(tool_calls), tuple(spans))

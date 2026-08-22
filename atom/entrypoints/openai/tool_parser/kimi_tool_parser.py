@@ -96,4 +96,8 @@ class KimiParser(ToolCallParser):
         # first entry; everything before it is the answer.
         first = _ENTRY_RE.search(region)
         opened = region.rfind(KIMI_SECTION_BEGIN, 0, first.start())
-        return RegionParse(tuple(entries), max(opened, 0), len(region))
+        # One span for the whole section, not one per entry: `region_end`
+        # already hands this exactly one section, and between two entries
+        # there is only `<|tool_call_end|><|tool_call_begin|>` -- special
+        # tokens a model cannot write prose between.
+        return RegionParse(tuple(entries), ((max(opened, 0), len(region)),))

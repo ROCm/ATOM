@@ -362,8 +362,9 @@ the field for truthiness read the standard off-switch as on; and an *absent*
 `thinking` leaves the model's own default alone rather than switching reasoning
 off, at both layers or neither, so an existing caller's answers do not change.
 
-**A stalled response is visible while it is stalled.** Every SSE frame leaves
-through `_client_stream`, which times the gap before each one and registers it,
+**A stalled response is visible while it is stalled — on the OpenAI server.**
+Every SSE frame from `openai_server` leaves through `_client_stream`, which
+times the gap before each one and registers it,
 and `atom:stream_longest_silence_seconds` reports the age of the oldest gap
 in flight. Zero when every stream has just been served; non-zero and growing is
 a response whose client is receiving nothing. A gap longer than 30 seconds also
@@ -372,6 +373,13 @@ recovered by scrape time. Neither costs a timer: `asyncio.wait_for` measured
 1.38 us per frame per stream against 0.07 us for a timestamp and a dict entry.
 This exists because the symptom that started this work was ten minutes of
 silence with every metric looking healthy.
+
+The atomesh standalone entrypoint has none of it. Its frames leave through
+`ChatCompletionStreamState.drain` / `CompletionStreamState.drain`, polled by
+the Rust router, which builds no `FrameWait`; and `AtomMetricsExporter` is
+constructed only by `openai_server`, so that deployment exposes no `/metrics`
+route at all. A stalled atomesh stream is therefore invisible rather than
+reported as zero.
 
 Measured at the frame and not at `StreamOutputCollector.get`, which is where it
 started and which cannot see the thing it was built for. The collector is where
@@ -422,7 +430,7 @@ Server-specific CLI arguments:
 | `--server-port` | `8000` | HTTP port (note: `--port` is for internal engine communication) |
 | `--timeout-keep-alive` | `5` | Seconds an idle keep-alive connection is held. Pooling clients hold their end longer (aiohttp defaults to 15s), so a caller that pauses for longer than this reuses a socket the server already closed and has to re-send. Raise it past the caller's idle window to avoid that |
 | `--disable-uvicorn-access-log` | off | Stop uvicorn logging a line per HTTP request. It copies a `LogRecord` and writes to the same stdout as the engine, on the event loop |
-| `--tool-call-parser` | `auto` | Tool-call wire format. `auto` reads it from the model's chat template at startup (Jinja, or a model-side `encoding/encoding_*.py`); a name — `dsml`, `glm`, `kimi`, `kimi_k3`, `minimax`, `qwen` — overrides. When neither resolves, tool calls are delivered as plain text and the startup log says so; the format is never guessed from output. An unknown name is refused rather than silently disabling tool parsing, and on atomesh that refusal happens before the weights load. Accepted by the atomesh entrypoint too, where it is also forwarded to the mesh router, which declares a flag of the same name and its own vocabulary for it |
+| `--tool-call-parser` | `auto` | Tool-call wire format. `auto` reads it from the model's chat template at startup (Jinja, or a model-side `encoding/encoding_*.py`); a name — `dsml`, `glm`, `kimi`, `kimi_k3`, `minimax`, `qwen` — overrides. When neither resolves, tool calls are delivered as plain text and the startup log says so; the format is never guessed from output. On the OpenAI server an unknown name is refused at startup, before the weights load, rather than silently disabling tool parsing. The atomesh entrypoint deliberately does not refuse: it shares the flag with the mesh router, which declares its own vocabulary for it, so a name ATOM does not recognise is logged at INFO, forwarded to the router, and ATOM falls back to reading the chat template. Check the log for `is not one of ATOM's formats` if a format you specified is not taking effect |
 
 All `EngineArgs` arguments are also accepted (see Section 7 for the full list).
 

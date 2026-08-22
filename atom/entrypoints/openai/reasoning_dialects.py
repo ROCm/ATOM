@@ -24,6 +24,8 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from . import kimi_k3_tokens as k3
+
 # Structured-channel format tokens (``<|open|>SECTION<|sep|>`` ... framing).
 # Named by the format concept, not the model: channel formats are a cross-model
 # pattern (e.g. gpt-oss/Harmony uses the same idea with different framing tokens).
@@ -116,7 +118,12 @@ class ReasoningDialect:
 # --- Structured-channel dialect ---
 
 
-_CHANNEL_END_MARKERS = (CHANNEL_THINK_END, CHANNEL_RESPONSE_START)
+# Every literal that ends this format's reasoning channel, and the only place
+# they are listed. `_split_channel` reads this and `_CHANNEL_DIALECT` derives
+# `extra_end_markers` from it, so the non-streaming split and the streaming
+# filter cannot be told different things; adding a marker in
+# one place alone used to change only the streamed path.
+_CHANNEL_END_MARKERS = (CHANNEL_THINK_END, CHANNEL_RESPONSE_START, k3.TOOLS_START)
 
 
 def _split_channel(text: str, starts_thinking: bool = False) -> SplitResult | None:
@@ -240,18 +247,25 @@ def _split_think_tag(text: str, starts_thinking: bool = False) -> SplitResult | 
 # so a specific channel marker is tried before the generic <think> tag.
 # separate_reasoning() returns the first dialect whose split() matches. A dialect
 # is identified by its markers/split behavior, not a label.
-_CHANNEL_CONTENT_FRAMING = (
-    CHANNEL_RESPONSE_START,
-    CHANNEL_RESPONSE_END,
-    CHANNEL_MESSAGE_END,
-    CHANNEL_END_OF_MSG,
-)
+
+# Read from the module both consumers read, not restated here -- a second
+# hand-kept copy is how the two lists drifted apart. The tool-region brackets
+# stay out: the reasoning stage cannot remove what is between them (see
+# `kimi_k3_tokens`).
+_CHANNEL_CONTENT_FRAMING = k3.CHANNEL_FRAMING
 
 _CHANNEL_DIALECT = ReasoningDialect(
     prompt_open_marker=CHANNEL_THINK_START,
     output_open_marker=None,  # template-injected; not emitted in output
     think_end_marker=CHANNEL_THINK_END,
-    extra_end_markers=(CHANNEL_RESPONSE_START,),
+    # `response` is what the trained format always opens next -- Kimi-K3's
+    # encoder emits a complete response section before any tools section, so
+    # `tools` is reachable only from a malformed generation. Listed anyway,
+    # and cheaply: without it a think block that jumps straight to
+    # `<|open|>tools<|sep|>` puts the entire tool call in `reasoning_content`
+    # with empty `content`, on both delivery paths, and on `/v1/messages`
+    # where reasoning is dropped by default the client gets nothing at all.
+    extra_end_markers=tuple(m for m in _CHANNEL_END_MARKERS if m != CHANNEL_THINK_END),
     split=_split_channel,
     template_efforts=frozenset({"low", "high", "max"}),  # Kimi-K3
     template_markers=(CHANNEL_THINK_START, CHANNEL_THINK_END),

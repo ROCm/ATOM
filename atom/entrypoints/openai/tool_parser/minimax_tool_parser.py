@@ -137,7 +137,7 @@ class MiniMaxParser(ToolCallParser):
     ) -> RegionParse:
         param_types = build_param_types(tools)
         tool_calls: list[ToolCall] = []
-        begin = end = 0
+        spans: list[tuple[int, int]] = []
         for m in _INVOKE_RE.finditer(region):
             closed = m.group(1) is not None
             name = m.group(1) if closed else m.group(3)
@@ -155,8 +155,9 @@ class MiniMaxParser(ToolCallParser):
                 k = pm.group(1).strip()
                 if k:
                     args[k] = coerce_json_or_raw(pm.group(2), types.get(k))
-            if not tool_calls:
-                begin = cls.markup_begin(region, m.start())
+            spans.append(
+                (cls.markup_begin(region, m.start()), cls.markup_end(region, m.end()))
+            )
             tool_calls.append(
                 ToolCall(
                     id=unique_tool_call_id(),
@@ -167,5 +168,4 @@ class MiniMaxParser(ToolCallParser):
                     },
                 )
             )
-            end = cls.markup_end(region, m.end())
-        return RegionParse(tuple(tool_calls), begin, end)
+        return RegionParse(tuple(tool_calls), tuple(spans))
