@@ -23,6 +23,7 @@ from .qwen3_tool_parser import QWEN_TOOL_PREFIX
 from .schema import build_param_types, coerce_json_or_raw
 from .tool_parser import BufferedMarkerParser, ToolCall, unique_tool_call_id
 
+TOOL_CALL_OPEN = "<tool_call>"
 _TOOLCALL_RE = re.compile(r"<tool_call>(.*?)</tool_call>|<tool_call>(.*)$", re.DOTALL)
 # A tool name is an identifier, which is what the model was given. Without
 # this the unterminated branch above turns any prose after a `<tool_call>`
@@ -46,11 +47,15 @@ _ARG_RE = re.compile(
 )
 
 
-# Both call shapes, so `search` finds the *first* call rather than the
-# first one that happens to take arguments. Requiring `<arg_key>` skipped
-# a zero-argument call, announced the name of the one after it, and
-# `parse` then returned them in wire order -- an AssertionError raised
-# out of `flush` on a live SSE stream, from well-formed output.
+# Both call shapes, so the *first* call is what matches rather than the first
+# one that happens to take arguments. Requiring `<arg_key>` skipped a
+# zero-argument call and announced the name of the one after it.
+#
+# Anchored at the region's own first `<tool_call>`, not searched for: `parse`
+# reads the unclosed case from the first one to end-of-string, so when that
+# one carries no usable name it produces nothing at all -- while a `search`
+# here slid forward to a later opener and announced its name. Measured on
+# `<tool_call><arg_key><tool_call>get_weather<arg_key>`, at every chunk size.
 _PEEK_NAME_RE = re.compile(r"<tool_call>\s*(\w[\w.\-]*)\s*(?:<arg_key>|</tool_call>)")
 
 
@@ -69,7 +74,10 @@ class GlmParser(BufferedMarkerParser):
         where `</tool_call>` closes an *outer* wrapper and left the inner
         block unterminated.
         """
-        m = _PEEK_NAME_RE.search(region)
+        start = region.find(TOOL_CALL_OPEN)
+        if start == -1:
+            return None
+        m = _PEEK_NAME_RE.match(region, start)
         return m.group(1) if m else None
 
     @classmethod

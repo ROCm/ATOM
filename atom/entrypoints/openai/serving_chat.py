@@ -68,18 +68,26 @@ def normalize_chat_tools(tools: Any) -> Any:
     return normalized
 
 
-def resolve_thinking(request: ChatCompletionRequest) -> tuple[bool, str | None]:
+def resolve_thinking(request: ChatCompletionRequest) -> tuple[bool | None, str | None]:
     """Resolve (enabled, effort) from the request's thinking / reasoning_effort.
 
     ``thinking`` (extra_body) takes precedence over ``reasoning_effort``.
     Thinking is disabled when ``thinking.type == "disabled"`` or
     ``reasoning_effort == "none"``. Effort is only returned when it is one of
     the values the template understands.
+
+    ``enabled`` is ``None`` when the request stated no preference -- setting
+    an effort is not asking for reasoning to be switched *on*. Collapsing
+    that to ``True`` was harmless while the caller wrote a key no template
+    read; once it wrote the template's real switch, a request carrying only
+    `reasoning_effort` re-enabled reasoning over an operator's
+    `--default-chat-template-kwargs '{"enable_thinking": false}'`, and over a
+    client's own `chat_template_kwargs`, because the toggle is merged last.
     """
     thinking = request.thinking or {}
-    enabled = True
-    if isinstance(thinking, dict) and thinking.get("type") == "disabled":
-        enabled = False
+    enabled: bool | None = None
+    if isinstance(thinking, dict) and thinking.get("type") is not None:
+        enabled = thinking.get("type") != "disabled"
     if request.reasoning_effort == "none":
         enabled = False
 
@@ -250,6 +258,12 @@ async def stream_chat_response(
     num_tokens_input = num_prompt_tokens
     num_tokens_output = 0
     num_cached_tokens = 0
+    # The engine's own reason, kept so the final chunk can report it. The
+    # streaming paths hardcoded `stop`, so a response the engine cut off at
+    # `max_tokens` was reported as complete while `stream=false` reported
+    # `length` for the same generation -- and a `stop_<token_id>` stop, which
+    # the Anthropic path maps to `stop_sequence`, collapsed the same way.
+    engine_finish_reason: str | None = None
     reasoning_filter = ReasoningFilter(starts_thinking=starts_thinking)
     tool_parser = ToolCallStreamParser(
         tools=tools, parser_cls=parser_for_tool_choice(tool_parser_cls, tool_choice)
@@ -273,6 +287,8 @@ async def stream_chat_response(
                 )
                 role_sent = True
             new_text = chunk_data["text"]
+            if chunk_data.get("finish_reason"):
+                engine_finish_reason = chunk_data["finish_reason"]
             num_tokens_output += len(chunk_data.get("token_ids", []))
             _ct = chunk_data.get("num_cached_tokens", 0)
             if _ct:
@@ -336,7 +352,11 @@ async def stream_chat_response(
         aborted = False
 
         # Final chunks
-        finish_reason = "tool_calls" if has_tool_calls else "stop"
+        finish_reason = (
+            "tool_calls"
+            if has_tool_calls
+            else (_normalize_finish_reason(engine_finish_reason) or "stop")
+        )
         usage = {
             "prompt_tokens": num_tokens_input,
             "completion_tokens": num_tokens_output,
@@ -550,6 +570,8 @@ async def stream_chat_response_fanout(
         for _ in range(n)
     ]
     has_tool_calls = [False] * n
+    # See the single-choice path: the engine's reason, per sibling.
+    engine_finish_reasons: list[str | None] = [None] * n
     finished = [False] * n
     kv_transfer_params_value = None
     num_cached_tokens = 0
@@ -576,6 +598,8 @@ async def stream_chat_response_fanout(
                 # Defensive: should not happen, engine emits finished once per seq.
                 continue
             new_text = chunk_data["text"]
+            if chunk_data.get("finish_reason"):
+                engine_finish_reasons[idx] = chunk_data["finish_reason"]
             num_tokens_output[idx] += len(chunk_data.get("token_ids", []))
             _ct = chunk_data.get("num_cached_tokens", 0)
             if _ct:
@@ -667,7 +691,13 @@ async def stream_chat_response_fanout(
                 create_chat_chunk(
                     request_id,
                     model,
-                    finish_reason="tool_calls" if has_tool_calls[i] else "stop",
+                    finish_reason=(
+                        "tool_calls"
+                        if has_tool_calls[i]
+                        else (
+                            _normalize_finish_reason(engine_finish_reasons[i]) or "stop"
+                        )
+                    ),
                     index=i,
                 )
                 for i in range(n)

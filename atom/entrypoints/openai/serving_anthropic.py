@@ -307,17 +307,19 @@ class AnthropicBlocks:
     def __init__(self) -> None:
         self.index = 0
         self.kind: str | None = None
-        # What it takes to reopen the tool call in flight: its id and name.
-        # Set when one starts, cleared when it ends, and deliberately NOT
-        # cleared by `close` -- text arriving between a call's name and its
-        # arguments closes the block but does not end the call, and the
-        # arguments still have to find their way back into one.
+        # The id and name of the open `tool_use` block. Here and not in
+        # `tool_event_frames`, which runs once per parser batch: announcing a
+        # name early splits the two events that describe one call across two
+        # of those batches -- the name from `process`, the arguments from
+        # `flush` -- so a local was reset between them and every streamed
+        # tool call on this endpoint reached the client with `input: {}`.
+        # Nothing closes the block between those two batches, so surviving
+        # them is all that was needed.
         #
-        # Here and not in `tool_event_frames`, which runs once per parser
-        # batch: announcing a name early split those two events across two
-        # batches -- the name from `process`, the arguments from `flush` --
-        # so a local was reset between them and every streamed tool call on
-        # this endpoint reached the client with `input: {}`.
+        # Cleared by `close`, and that matters: carrying it across a close
+        # let `delta` re-open a *second* `tool_use` block with the same id,
+        # so one call arrived as two -- the first with no input, which a
+        # client iterating content blocks runs as a zero-argument call.
         self.open_call: dict | None = None
 
     def close(self):
@@ -329,6 +331,7 @@ class AnthropicBlocks:
         yield stream_content_block_stop(self.index)
         self.index += 1
         self.kind = None
+        self.open_call = None
 
     def open(self, kind: str, **start_kwargs):
         """Start a block of `kind`, closing whatever was open."""
@@ -387,7 +390,6 @@ def tool_event_frames(events, blocks: AnthropicBlocks):
                 "tool_use", fn.get("arguments", ""), **blocks.open_call
             )
         elif etype == "tool_call_end":
-            blocks.open_call = None
             yield from blocks.close()
 
 

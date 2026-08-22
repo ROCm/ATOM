@@ -96,6 +96,7 @@ from .serving_completion import (
     stream_completion_response,
     stream_completion_response_fanout,
 )
+from .sse import event_frame
 from .streaming_dispatch import (
     FrameWait,
     StreamBatchDispatcher,
@@ -254,6 +255,13 @@ def anthropic_stop_reason(finish_reason: Any) -> str:
     return _ANTHROPIC_STOP_REASON.get(reason, "end_turn")
 
 
+# Anthropic's own keepalive. Sent in place of a reasoning segment the request
+# asked not to see: the bytes are being generated either way, and with nothing
+# going out the socket is silent for the whole chain of thought -- on an
+# R1-shaped 5019-character trace the first client-visible frame arrived after
+# 5016 of them. Long enough to trip proxy and SDK idle-read timeouts, and the
+# stall watchdog can only report it, not prevent it.
+_ANTHROPIC_PING_FRAME = event_frame("ping", {"type": "ping"})
 _metrics_exporter = AtomMetricsExporter()
 _metrics_refresh_task: asyncio.Task | None = None
 _METRICS_REFRESH_INTERVAL_SECONDS = 5.0
@@ -1427,7 +1435,11 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             # measured, `thinking=False` left the `<think>` prefill in place.
             # A template ignores a kwarg it does not know, so the failure was
             # invisible: the model reasoned anyway.
-            if reasoning_toggle is not None:
+            # Only when the request said something about it. An effort is
+            # not an opt-in, and this is merged after the server defaults and
+            # after the client's own `chat_template_kwargs` -- so writing it
+            # unconditionally overrode both.
+            if reasoning_toggle is not None and _th_enabled is not None:
                 name, off_value, on_value = reasoning_toggle
                 merged_kwargs[name] = on_value if _th_enabled else off_value
             if _th_effort is not None:
@@ -1939,6 +1951,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
 
                             if field == "reasoning_content":
                                 if drop_reasoning:
+                                    yield _ANTHROPIC_PING_FRAME
                                     continue
                                 for _frame in blocks.delta("thinking", text):
                                     yield _frame

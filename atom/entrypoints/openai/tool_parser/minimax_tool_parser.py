@@ -69,7 +69,15 @@ _PEEK_NAME_RE = re.compile(r'<invoke\s+name="([^"]+)"\s*>(.*)', re.DOTALL)
 
 class MiniMaxParser(BufferedMarkerParser):
     NAME: ClassVar[str] = "minimax"
-    START_MARKERS: ClassVar[tuple[str, ...]] = (MINIMAX_NS, "<tool_call>")
+    # `<invoke name="` too: `_INVOKE_RE` matches it anywhere, so an invoke the
+    # model wrote without the ns_token was a call when parsed whole and plain
+    # text when streamed -- the read-ahead never opened a region for it. DSML
+    # lists the same marker-less malform for the same reason.
+    START_MARKERS: ClassVar[tuple[str, ...]] = (
+        MINIMAX_NS,
+        "<tool_call>",
+        '<invoke name="',
+    )
 
     @classmethod
     def peek_name(cls, region: str, tools: list | None = None) -> str | None:
@@ -100,8 +108,16 @@ class MiniMaxParser(BufferedMarkerParser):
         """Parse MiniMax-M3 tool calls; return (leading_content, tool_calls)."""
         param_types = build_param_types(tools)
         clean = text.replace(MINIMAX_NS, "")
-        tc = clean.find("<tool_call>")
-        content = clean[:tc] if tc > 0 else ("" if tc == 0 else clean)
+        # Content is what precedes the *call*, and the call may open with
+        # either token. Cutting only at `<tool_call>` -- which this format's
+        # primary ns_token shape does not contain -- left `content` holding
+        # the entire `<invoke>` markup alongside the parsed call, so the user
+        # was shown the raw XML while the streaming path showed nothing.
+        starts = [
+            i for i in (clean.find("<tool_call>"), clean.find("<invoke")) if i != -1
+        ]
+        cut = min(starts) if starts else -1
+        content = clean[:cut] if cut != -1 else clean
         tool_calls: list[ToolCall] = []
         for m in _INVOKE_RE.finditer(clean):
             closed = m.group(1) is not None

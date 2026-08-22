@@ -29,6 +29,26 @@ logger = logging.getLogger("atom")
 _PEEK_WINDOW = 256
 
 
+def continues_a_call(rest: str, tokens: tuple[str, ...], *, arrived: bool) -> bool:
+    """Is what follows a call's name this format's own next token?
+
+    One implementation, because four formats had a copy and the copies were
+    the point of failure: each format supplies the tokens, this decides.
+
+    `arrived` is the difference between the two callers and the whole of it.
+    `parse` runs at end of stream, where a token cut off part-way through is
+    all there will ever be, so a *prefix* counts -- that is what a call
+    truncated by `max_tokens` looks like. `peek_name` runs mid-stream, where a
+    prefix means "not yet" and more is coming; requiring it there let a chunk
+    boundary landing one character into `<br>` announce a tool for prose,
+    since `<` is a prefix of `<parameter=`. Same text, same parser: announced
+    at one chunk size, silent at another.
+    """
+    if arrived:
+        return any(rest.startswith(tok) for tok in tokens)
+    return any(tok.startswith(rest[: len(tok)]) for tok in tokens)
+
+
 def unique_tool_call_id() -> str:
     # OpenAI tool_call ids must be unique across the whole conversation, not just
     # within one response. A per-response index (call_0, call_1, ...) collides

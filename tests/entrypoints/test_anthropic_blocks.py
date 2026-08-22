@@ -267,14 +267,26 @@ class TestNoBlockWithoutAnIdAndAName:
     def test_arguments_with_no_name_open_nothing(self):
         assert self._blocks([self.ARGS, ("tool_call_end", None)]) == []
 
-    def test_text_between_the_name_and_the_arguments_keeps_both(self):
+    def test_one_call_never_arrives_as_two_blocks(self):
+        """Re-opening on the same id is worse than dropping the arguments.
+
+        A client iterating content blocks sees two `tool_use` entries with one
+        id, the first carrying no input -- so it runs `get_weather({})` and
+        then `get_weather({"city": "Paris"})`. Anthropic has no spelling for
+        "the block you already closed, continued".
+
+        The shape is not reachable from any registered parser -- driven over
+        every format's real call, three leading shapes and every chunking,
+        content never once landed between an announced name and its arguments
+        -- so this pins the degradation rather than a behaviour anyone gets.
+        """
         blocks = self._blocks(
             [self.START, ("content", "oops"), self.ARGS, ("tool_call_end", None)]
         )
         tool_blocks = [b for b in blocks if b["type"] == "tool_use"]
-        assert len(tool_blocks) == 2, "the re-opened block went missing"
-        for b in tool_blocks:
-            assert b["id"] == "call_1" and b["name"] == "get_weather"
+        assert len(tool_blocks) == 1, f"one call, {len(tool_blocks)} blocks"
+        ids = [b["id"] for b in tool_blocks]
+        assert len(set(ids)) == len(ids), f"a tool id was used twice: {ids}"
 
     def test_no_tool_use_block_is_ever_nameless(self):
         for events in (
@@ -358,11 +370,12 @@ class TestOneCallSpansTwoParserBatches:
         assert named and set(argued) <= set(named), (named, argued)
 
     def test_a_call_that_ended_does_not_adopt_the_next_arguments(self):
-        """The call outlives a block close, but not its own end.
+        """It survives a batch boundary, which is all it has to.
 
-        Surviving `close` is what fixes the case above; surviving
-        `tool_call_end` would hand a later orphan batch of arguments to a
-        call the client has already been told is finished.
+        Nothing closes the block between the name (from `process`) and the
+        arguments (from `flush`), so surviving `close` was never needed --
+        and carrying it across one is what let a second block open on the
+        same id.
         """
         blocks = AnthropicBlocks()
         start = (

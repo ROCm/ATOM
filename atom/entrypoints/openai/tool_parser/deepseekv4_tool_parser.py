@@ -22,7 +22,12 @@ import re
 from typing import Any, ClassVar
 
 from .schema import build_param_types, coerce_param_value
-from .tool_parser import BufferedMarkerParser, ToolCall, unique_tool_call_id
+from .tool_parser import (
+    BufferedMarkerParser,
+    ToolCall,
+    continues_a_call,
+    unique_tool_call_id,
+)
 
 _DSML = "｜DSML｜"
 # The model often DROPS the ``｜DSML｜`` marker and emits bare
@@ -130,11 +135,6 @@ _CALL_CONTINUES = (
 )
 
 
-def _continues_a_call(rest: str) -> bool:
-    """Is `rest` the start of this format's own next token?"""
-    return any(tok.startswith(rest[: len(tok)]) for tok in _CALL_CONTINUES)
-
-
 def _is_truncated_call(name: str, body: str, param_types: dict) -> bool:
     """Is this unclosed `<invoke name=...>` a cut-off call, or prose?
 
@@ -146,7 +146,7 @@ def _is_truncated_call(name: str, body: str, param_types: dict) -> bool:
     if name not in param_types:
         return False
     rest = body.lstrip()
-    return not rest or _continues_a_call(rest)
+    return not rest or continues_a_call(rest, _CALL_CONTINUES, arrived=False)
 
 
 class DsmlParser(BufferedMarkerParser):
@@ -173,7 +173,9 @@ class DsmlParser(BufferedMarkerParser):
         if m is None:
             return None
         rest = m.group(2).lstrip()
-        return m.group(1) if rest and _continues_a_call(rest) else None
+        if not continues_a_call(rest, _CALL_CONTINUES, arrived=True):
+            return None
+        return m.group(1)
 
     # detect() is inherited: any start marker present means DSML.
 

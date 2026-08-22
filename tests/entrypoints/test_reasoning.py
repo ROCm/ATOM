@@ -3,6 +3,8 @@
 
 """Tests for reasoning/thinking content separation."""
 
+import pytest
+
 from atom.entrypoints.openai.reasoning import (
     ReasoningFilter,
     separate_reasoning,
@@ -231,3 +233,53 @@ class TestReasoningFilter:
         results.extend(rf.flush())
         content = "".join(t for f, t in results if f == "content")
         assert "Hi" in content
+
+
+class TestTheChannelEndsAtWhicheverCloserComesFirst:
+    """One rule, where there were three branches and one of them lost data.
+
+    A channel format can leave the think channel by *opening* another one, so
+    `<|close|>think<|sep|>` and `<|open|>response<|sep|>` both end it. The
+    branch for the second returned `reasoning=None` and discarded everything
+    ahead of the marker: a single byte between the two was enough to reach
+    it, and the chain of thought then appeared in neither field.
+
+    And all three were ungated, so a model that merely *quotes* one of these
+    tokens had the text before it deleted -- the inference `parse_tool_calls`
+    was changed to stop making, in the half still making it.
+    """
+
+    THINK_END = "<|close|>think<|sep|>"
+    RESPONSE = "<|open|>response<|sep|>"
+
+    def test_a_byte_between_the_markers_keeps_the_reasoning(self):
+        text = f"my reasoning{self.THINK_END}\n{self.RESPONSE}the answer"
+        reasoning, content = separate_reasoning(text, starts_thinking=True)
+        assert reasoning == "my reasoning"
+        assert "the answer" in content
+
+    def test_opening_the_response_channel_ends_the_reasoning(self):
+        text = f"my reasoning{self.RESPONSE}the answer"
+        reasoning, content = separate_reasoning(text, starts_thinking=True)
+        assert reasoning == "my reasoning"
+        assert content == "the answer"
+
+    @pytest.mark.parametrize("marker_attr", ["THINK_END", "RESPONSE"])
+    def test_a_quoted_token_is_text_when_no_channel_was_opened(self, marker_attr):
+        marker = getattr(self, marker_attr)
+        text = f"The K3 format uses {marker} to open the answer."
+        assert separate_reasoning(text, starts_thinking=False) == (None, text)
+
+    @pytest.mark.parametrize("chunk", [1, 3, 999])
+    def test_the_streaming_filter_closes_on_the_same_markers(self, chunk):
+        """It knew only the explicit close, so a K3 answer that goes straight
+        to the response channel -- its own docs call that the common path --
+        streamed entirely as `reasoning_content` with an empty `content`."""
+        text = f"{self.RESPONSE}Hello world"
+        f = ReasoningFilter(starts_thinking=True)
+        segs = []
+        for i in range(0, len(text), chunk):
+            segs += f.process(text[i : i + chunk])
+        segs += f.flush()
+        assert "".join(s for k, s in segs if k == "content") == "Hello world"
+        assert "".join(s for k, s in segs if k == "reasoning_content") == ""

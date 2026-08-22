@@ -40,6 +40,7 @@ from atom.entrypoints.openai.reasoning import (
     template_opens_reasoning_implicitly,
 )
 from atom.entrypoints.openai.serving_chat import (
+    _normalize_finish_reason,
     build_chat_response,
     build_chat_response_multi,
     create_chat_chunk,
@@ -567,6 +568,14 @@ class ChatCompletionStreamState:
         self.completed = False
         self.closed = False
         self._pending_final_chunks: list[str] | None = None
+        # Chunks built but not yet handed out. The drain takes `max_items` at
+        # a time and this used to `break` out of the build loop when it hit
+        # that -- discarding every event past the first, permanently, since
+        # the parser had already yielded them. At `max_items=1` a tool call
+        # lost its arguments and reported `finish_reason: stop`.
+        self._pending_chunks: list[str] = []
+        # The engine's own reason per sibling; see serving_chat.
+        self.engine_finish_reasons: list[str | None] = [None] * n
         self._lock = threading.Lock()
 
     def drain(self, max_items: int = 16, timeout: float = 0.05) -> list[str]:
@@ -632,19 +641,22 @@ class ChatCompletionStreamState:
 
         index = int(event["index"])
         if self.finished[index]:
-            return []
+            # Still hand out whatever is queued, and the final chunks once it
+            # is empty -- returning early here left a fully drained stream
+            # with no `finish_reason`, no usage and no `[DONE]`.
+            return self._hand_out(remaining_capacity)
 
         chunks: list[str] = []
         text = event.get("text") or ""
         self.num_tokens_output[index] += len(event.get("token_ids", []))
+        if event.get("finish_reason"):
+            self.engine_finish_reasons[index] = event["finish_reason"]
 
         segments = self.reasoning_filters[index].process(text)
         if event.get("finished", False):
             segments.extend(self.reasoning_filters[index].flush())
 
         for field, segment_text in segments:
-            if len(chunks) >= remaining_capacity:
-                break
             if field == "reasoning_content":
                 if segment_text:
                     chunks.append(
@@ -657,8 +669,6 @@ class ChatCompletionStreamState:
                     )
             elif field == "content":
                 for event_type, data in self.tool_parsers[index].process(segment_text):
-                    if len(chunks) >= remaining_capacity:
-                        break
                     if event_type == "content":
                         chunks.append(
                             create_chat_chunk(
@@ -690,8 +700,6 @@ class ChatCompletionStreamState:
 
         if event.get("finished", False):
             for event_type, data in self.tool_parsers[index].flush():
-                if len(chunks) >= remaining_capacity:
-                    break
                 if event_type == "content":
                     chunks.append(
                         create_chat_chunk(
@@ -722,15 +730,21 @@ class ChatCompletionStreamState:
                     )
             self.finished[index] = True
 
-        if all(self.finished) and len(chunks) < remaining_capacity:
-            chunks.extend(self._final_chunks(remaining_capacity - len(chunks)))
-        return chunks
+        self._pending_chunks.extend(chunks)
+        return self._hand_out(remaining_capacity)
 
     def _final_chunks(self, remaining_capacity: int) -> list[str]:
         if self._pending_final_chunks is None:
             chunks: list[str] = []
             for index, has_tool_calls in enumerate(self.has_tool_calls):
-                finish_reason = "tool_calls" if has_tool_calls else "stop"
+                finish_reason = (
+                    "tool_calls"
+                    if has_tool_calls
+                    else (
+                        _normalize_finish_reason(self.engine_finish_reasons[index])
+                        or "stop"
+                    )
+                )
                 chunks.append(
                     create_chat_chunk(
                         self.request_id,
@@ -759,6 +773,25 @@ class ChatCompletionStreamState:
             self._pending_final_chunks = chunks
 
         return self._drain_pending_final_chunks(remaining_capacity)
+
+    def _take_pending(self, remaining_capacity: int) -> list[str]:
+        """As many built chunks as the caller has room for; the rest wait."""
+        if remaining_capacity <= 0:
+            return []
+        out = self._pending_chunks[:remaining_capacity]
+        del self._pending_chunks[:remaining_capacity]
+        return out
+
+    def _hand_out(self, remaining_capacity: int) -> list[str]:
+        """Queued chunks first, then the final ones once nothing is queued."""
+        out = self._take_pending(remaining_capacity)
+        if (
+            all(self.finished)
+            and not self._pending_chunks
+            and len(out) < remaining_capacity
+        ):
+            out.extend(self._final_chunks(remaining_capacity - len(out)))
+        return out
 
     def _drain_pending_final_chunks(self, remaining_capacity: int) -> list[str]:
         if not self._pending_final_chunks or remaining_capacity <= 0:
@@ -793,6 +826,14 @@ class CompletionStreamState:
         self.completed = False
         self.closed = False
         self._pending_final_chunks: list[str] | None = None
+        # Chunks built but not yet handed out. The drain takes `max_items` at
+        # a time and this used to `break` out of the build loop when it hit
+        # that -- discarding every event past the first, permanently, since
+        # the parser had already yielded them. At `max_items=1` a tool call
+        # lost its arguments and reported `finish_reason: stop`.
+        self._pending_chunks: list[str] = []
+        # The engine's own reason per sibling; see serving_chat.
+        self.engine_finish_reasons: list[str | None] = [None] * n
         self._lock = threading.Lock()
 
     def drain(self, max_items: int = 16, timeout: float = 0.05) -> list[str]:
@@ -842,7 +883,10 @@ class CompletionStreamState:
 
         index = int(event["index"])
         if self.finished[index]:
-            return []
+            # Still hand out whatever is queued, and the final chunks once it
+            # is empty -- returning early here left a fully drained stream
+            # with no `finish_reason`, no usage and no `[DONE]`.
+            return self._hand_out(remaining_capacity)
 
         extra_fields: dict[str, Any] = {}
         if "kv_transfer_params" in event:
@@ -863,9 +907,8 @@ class CompletionStreamState:
         if event.get("finished", False):
             self.finished[index] = True
 
-        if all(self.finished) and len(chunks) < remaining_capacity:
-            chunks.extend(self._final_chunks(remaining_capacity - len(chunks)))
-        return chunks
+        self._pending_chunks.extend(chunks)
+        return self._hand_out(remaining_capacity)
 
     def _final_chunks(self, remaining_capacity: int) -> list[str]:
         if self._pending_final_chunks is None:
@@ -900,6 +943,25 @@ class CompletionStreamState:
             self._pending_final_chunks = chunks
 
         return self._drain_pending_final_chunks(remaining_capacity)
+
+    def _take_pending(self, remaining_capacity: int) -> list[str]:
+        """As many built chunks as the caller has room for; the rest wait."""
+        if remaining_capacity <= 0:
+            return []
+        out = self._pending_chunks[:remaining_capacity]
+        del self._pending_chunks[:remaining_capacity]
+        return out
+
+    def _hand_out(self, remaining_capacity: int) -> list[str]:
+        """Queued chunks first, then the final ones once nothing is queued."""
+        out = self._take_pending(remaining_capacity)
+        if (
+            all(self.finished)
+            and not self._pending_chunks
+            and len(out) < remaining_capacity
+        ):
+            out.extend(self._final_chunks(remaining_capacity - len(out)))
+        return out
 
     def _drain_pending_final_chunks(self, remaining_capacity: int) -> list[str]:
         if not self._pending_final_chunks or remaining_capacity <= 0:

@@ -14,6 +14,8 @@ from atom.entrypoints.atomesh import atom_standalone_service
 from atom.entrypoints.openai import api_server, serving_chat
 from atom.entrypoints.openai.serving_anthropic import completes_a_tool_call
 from atom.entrypoints.openai.serving_chat import (
+    _build_chat_choice,
+    _normalize_finish_reason,
     build_chat_response,
     build_chat_response_multi,
     create_chat_chunk,
@@ -533,3 +535,50 @@ class TestForbiddingToolCallsDoesNotDeleteTheAnswer:
 
 def _is_none(node) -> bool:
     return isinstance(node, ast.Constant) and node.value is None
+
+
+class TestTheStreamReportsWhyItStopped:
+    """`stop` was hardcoded on every streaming path.
+
+    So a response the engine cut off at `max_tokens` reported completion
+    while `stream=false` reported `length` for the same generation, and an
+    agentic client kept a truncated answer as final. A `stop_<token_id>`
+    stop -- which the Anthropic endpoint maps to `stop_sequence` -- collapsed
+    the same way. All three lines sat next to edits this branch made.
+    """
+
+    @pytest.mark.parametrize(
+        "engine_reason, expected",
+        [
+            ("max_tokens", "length"),
+            ("length", "length"),
+            ("stop", "stop"),
+            ("stop_163586", "stop"),
+        ],
+    )
+    def test_the_two_paths_agree_on_the_reason(self, engine_reason, expected):
+        assert _build_chat_choice("hi", engine_reason)["finish_reason"] == expected
+        assert (_normalize_finish_reason(engine_reason) or "stop") == expected
+
+    def test_no_reason_at_all_still_ends_the_stream(self):
+        """The engine always gives one for a finished generation; if it did
+        not, a stream still has to close on something."""
+        assert (_normalize_finish_reason(None) or "stop") == "stop"
+
+    def test_no_streaming_path_hardcodes_stop(self):
+        """Counted rather than listed: the gap was a site nobody listed."""
+        hardcoded = 0
+        for path in (
+            pathlib.Path(serving_chat.__file__),
+            pathlib.Path(atom_standalone_service.__file__),
+        ):
+            for node in ast.walk(ast.parse(path.read_text())):
+                if not isinstance(node, ast.IfExp):
+                    continue
+                orelse = node.orelse
+                if isinstance(orelse, ast.Constant) and orelse.value == "stop":
+                    hardcoded += 1
+        assert hardcoded == 0, (
+            f"{hardcoded} streaming path(s) still report `stop` regardless of "
+            "why the engine stopped"
+        )

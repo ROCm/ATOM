@@ -30,6 +30,7 @@ from atom.entrypoints.openai.serving_anthropic import (
     stream_message_start,
     stream_message_stop,
 )
+from atom.entrypoints.openai.serving_chat import resolve_thinking
 from atom.entrypoints.openai.tool_parser.qwen3_tool_parser import QwenXmlParser
 from atom.entrypoints.openai.tool_parser.registry import parse_tool_calls
 
@@ -734,3 +735,100 @@ class TestASwitchlessModelStillHonoursDisabled:
             "the streaming and non-streaming branches must both consult it; "
             f"found {len(reads)} read(s)"
         )
+
+
+class TestWithheldReasoningStillSendsSomething:
+    """Dropping the blocks must not drop the frames.
+
+    `anthropic_drop_reasoning` suppresses `thinking` blocks for a request that
+    said `disabled` on a model whose template has no switch -- and the branch
+    was `continue`, with nothing in its place. The bytes are generated either
+    way, so the socket went silent for the whole chain of thought: on an
+    R1-shaped 5019-character trace the first client-visible frame arrived
+    after 5016 of them. Long enough to trip proxy and SDK idle-read timeouts,
+    and the stall watchdog this branch added can only report that, not
+    prevent it.
+    """
+
+    def test_a_ping_frame_exists(self):
+        assert api_server._ANTHROPIC_PING_FRAME.startswith("event: ping")
+
+    def test_the_drop_branch_yields_it(self):
+        """Read off the syntax tree: the branch must not be a bare
+        `continue` again."""
+        tree = ast.parse(pathlib.Path(api_server.__file__).read_text())
+        fn = next(
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.AsyncFunctionDef) and n.name == "anthropic_messages"
+        )
+        drops = [
+            n
+            for n in ast.walk(fn)
+            if isinstance(n, ast.If)
+            and isinstance(n.test, ast.Name)
+            and n.test.id == "drop_reasoning"
+        ]
+        assert drops, "the suppression branch is gone; this asserts nothing"
+        # The streaming branch is the one that `continue`s past a segment the
+        # socket would otherwise have carried. The non-streaming sibling just
+        # clears a field and has nothing to send.
+        skipping = [
+            n for n in drops if any(isinstance(c, ast.Continue) for c in ast.walk(n))
+        ]
+        assert skipping, "no branch skips a segment; matcher is stale"
+        for node in skipping:
+            assert [
+                y for y in ast.walk(node) if isinstance(y, ast.Yield)
+            ], "a reasoning segment is skipped with no frame in its place"
+
+
+class TestAnEffortIsNotAnOptIn:
+    """`resolve_thinking` returns `None` for "the request did not say".
+
+    Collapsing that to `True` was harmless while the caller wrote a key no
+    template read. Once it wrote the template's real switch -- merged after
+    the server defaults and after the client's own `chat_template_kwargs` --
+    a request carrying only `reasoning_effort` re-enabled reasoning over an
+    operator's `--default-chat-template-kwargs '{"enable_thinking": false}'`.
+    """
+
+    class Req:
+        def __init__(self, thinking=None, reasoning_effort=None):
+            self.thinking = thinking
+            self.reasoning_effort = reasoning_effort
+
+    @pytest.mark.parametrize(
+        "req, expected",
+        [
+            (Req(), None),
+            (Req(reasoning_effort="high"), None),
+            (Req(thinking={"type": "enabled"}), True),
+            (Req(thinking={"type": "disabled"}), False),
+            (Req(reasoning_effort="none"), False),
+        ],
+        ids=["nothing", "effort-only", "on", "off", "effort-none"],
+    )
+    def test_only_an_explicit_statement_resolves(self, req, expected):
+        assert resolve_thinking(req)[0] is expected
+
+    def test_the_toggle_is_written_only_when_stated(self):
+        """Read off the syntax tree, not grepped: the guard has to be on the
+        resolved value, not on the toggle merely existing."""
+        tree = ast.parse(pathlib.Path(api_server.__file__).read_text())
+        writes = [
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Subscript)
+            and isinstance(n.ctx, ast.Store)
+            and getattr(n.value, "id", None) == "merged_kwargs"
+            and isinstance(n.slice, ast.Name)
+        ]
+        assert writes, "no name-keyed write to merged_kwargs; matcher is stale"
+        guarded = [
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.If)
+            and "_th_enabled is not None" in ast.unparse(n.test)
+        ]
+        assert guarded, "the toggle is written without asking whether it was stated"

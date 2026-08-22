@@ -78,6 +78,18 @@ class ReasoningDialect:
     think_end_marker: str
     split: Callable[[str, bool], SplitResult | None]
     template_efforts: frozenset[str] = frozenset()
+    # Every marker that ends the reasoning channel, `think_end_marker`
+    # included. A channel format can leave the think channel by *opening*
+    # another one, and the streaming filter knew only the explicit close: a
+    # K3 answer that goes straight to `<|open|>response<|sep|>` -- which its
+    # own docs call the common path -- was streamed entirely as
+    # `reasoning_content` with an empty `content`, while the non-streaming
+    # split read it correctly.
+    extra_end_markers: tuple[str, ...] = ()
+
+    @property
+    def end_markers(self) -> tuple[str, ...]:
+        return (self.think_end_marker, *self.extra_end_markers)
 
 
 # --- Structured-channel dialect ---
@@ -98,18 +110,41 @@ def _strip_channel_response_markers(text: str) -> str:
     return text
 
 
+_CHANNEL_END_MARKERS = (CHANNEL_THINK_END, CHANNEL_RESPONSE_START)
+
+
 def _split_channel(text: str, starts_thinking: bool = False) -> SplitResult | None:
-    combined = CHANNEL_THINK_END + CHANNEL_RESPONSE_START
-    if combined in text:
-        reasoning, _, content = text.partition(combined)
-        return (reasoning or None, _strip_channel_response_markers(content))
-    if CHANNEL_RESPONSE_START in text:
-        _, _, content = text.partition(CHANNEL_RESPONSE_START)
-        return (None, _strip_channel_response_markers(content))
-    if CHANNEL_THINK_END in text and starts_thinking:
-        reasoning, _, content = text.partition(CHANNEL_THINK_END)
-        return (reasoning or None, _strip_channel_response_markers(content))
-    return None
+    """One rule: the reasoning channel ends at whichever closer comes first.
+
+    This was three branches, and the middle one -- `<|open|>response<|sep|>`
+    with no `<|close|>think<|sep|>` immediately before it -- returned
+    `reasoning=None` and threw away everything ahead of the marker. A single
+    byte between the two markers was enough to reach it, and the chain of
+    thought then appeared in neither field. Silent data loss, not a
+    divergence.
+
+    Gated on `starts_thinking`, which the two other branches were not: these
+    markers only mean anything if a reasoning channel was actually opened.
+    Ungated, any model's answer that *quotes* one had the text before it
+    deleted -- an answer about K3's wire format lost 19 characters on
+    `stream=false` and kept them on `stream=true`. That is the inference
+    `parse_tool_calls` was changed to stop making, in the half that was left
+    still making it; a prompt that opens some *other* dialect's channel can
+    still reach this one, and the structural answer is to resolve the dialect
+    at startup as the tool-call format now is.
+    """
+    if not starts_thinking:
+        return None
+    best_at, best = len(text), None
+    for marker in _CHANNEL_END_MARKERS:
+        at = text.find(marker)
+        if 0 <= at < best_at:
+            best_at, best = at, marker
+    if best is None:
+        return None
+    reasoning = text[:best_at]
+    content = text[best_at + len(best) :]
+    return (reasoning or None, _strip_channel_response_markers(content))
 
 
 # --- Generic <think>...</think> dialect (K2/DeepSeek/Qwen3/MiniMax/...) ---
@@ -195,6 +230,7 @@ DIALECTS: tuple[ReasoningDialect, ...] = (
         prompt_open_marker=CHANNEL_THINK_START,
         output_open_marker=None,  # template-injected; not emitted in output
         think_end_marker=CHANNEL_THINK_END,
+        extra_end_markers=(CHANNEL_RESPONSE_START,),
         split=_split_channel,
         template_efforts=frozenset({"low", "high", "max"}),  # Kimi-K3
     ),

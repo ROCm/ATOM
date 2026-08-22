@@ -39,6 +39,7 @@ import json
 import pathlib
 import random
 import re
+import sys
 import time
 
 import pytest
@@ -797,7 +798,12 @@ class TestARealCallSurvivesTheStream:
 FRAMING_NOT_A_REGION: dict[str, set[str]] = {
     # Every channel token K3 wraps an answer in. Only the call prefix and the
     # tools wrapper mean a call; the rest are removed on both paths, so the
-    # read-ahead has to know them to keep the two in step.
+    # read-ahead has to know them to keep the two in step. Written out rather
+    # than read off `_K3_CONTENT_FRAMING`, for the reason in the test below:
+    # a copy that agrees with the code by construction agrees with a broken
+    # code too. It went from eleven to fourteen when the last three -- which
+    # `parse` stripped and the scanner had never heard of -- were declared;
+    # they leaked verbatim into streamed content and vanished when not.
     "kimi_k3": {
         "<|open|>response<|sep|>",
         "<|close|>response<|sep|>",
@@ -809,6 +815,9 @@ FRAMING_NOT_A_REGION: dict[str, set[str]] = {
         "<|close|>response",
         "<|close|>think",
         "<|close|>message",
+        "<|close|>tools",
+        "<|close|>argument",
+        "<|close|>call",
         "<|sep|>",
     },
 }
@@ -818,6 +827,81 @@ def prefix_pairs(parser) -> list[tuple[str, str]]:
     """Every (short, long) pair of this format's markers where short opens long."""
     ms = parser.START_MARKERS
     return [(a, b) for a in ms for b in ms if a != b and b.startswith(a)]
+
+
+def _drive_parser(parser, text, size):
+    stream = ToolCallStreamParser(tools=DECLARED_TOOLS, parser_cls=parser)
+    events = []
+    for i in range(0, len(text), size):
+        events += stream.process(text[i : i + size])
+    return events + stream.flush()
+
+
+def channel_tokens(parser) -> list[str]:
+    """Framing-token-shaped strings this format's own module names.
+
+    Harvested from the module rather than from `START_MARKERS`, and that is
+    the whole point: a corpus built from the declared list cannot contain a
+    token the format strips but never declared, which is exactly the drift
+    this looks for. Kimi-K3 stripped `<|close|>tools`, `<|close|>call` and
+    `<|close|>argument` and declared none of them.
+    """
+    module = sys.modules[parser.__module__]
+    found: set[str] = set()
+    for value in vars(module).values():
+        if isinstance(value, str):
+            found.add(value)
+        elif isinstance(value, tuple):
+            found.update(v for v in value if isinstance(v, str))
+        elif isinstance(value, re.Pattern):
+            # `<|close|>tools` and its siblings exist only inside an
+            # alternation, so the pattern is where they have to be read from
+            # -- unescaped, since that is how they arrive on the wire.
+            found.update(
+                re.findall(r"(?:<\\\|[^|]*\\\|>)+\w*", value.pattern),
+            )
+    return sorted(
+        {
+            t.replace("\\", "")
+            for t in found
+            if t.startswith(("<", "]<")) and "(" not in t
+        }
+    )
+
+
+class TestAFormatDeclaresEveryTokenItStrips:
+    """What `parse` removes from content, the read-ahead has to know.
+
+    They answer the same question -- which bytes are framing rather than
+    answer -- and the streaming path can only hold back a literal it was told
+    about. Kimi-K3 kept two lists and they drifted: three tokens were
+    stripped and undeclared, so they reached the client verbatim when
+    streamed and vanished when not, and a quoted
+    `<|open|>argument key="city"<|sep|>` came out with only its separator
+    removed -- text matching neither path.
+    """
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_framing_comes_out_the_same_whether_or_not_it_is_streamed(self, parser):
+        tokens = channel_tokens(parser)
+        assert tokens, f"{parser.NAME}: no tokens harvested, this asserts nothing"
+        bad = []
+        for a, b in itertools.product(tokens, repeat=2):
+            text = f"A {a} B {b} C"
+            non = parser.parse(text, DECLARED_TOOLS)[0]
+            if parser.parse(text, DECLARED_TOOLS)[1]:
+                continue  # a real call; the no-call rule is what binds here
+            for size in (1, 3, 999):
+                got = "".join(
+                    d for k, d in _drive_parser(parser, text, size) if k == "content"
+                )
+                if got != non:
+                    bad.append((text, non, got))
+                    break
+        assert not bad, (
+            f"{len(bad)} of {len(tokens) ** 2} token pairs split two ways, "
+            f"first: {bad[0]}"
+        )
 
 
 class TestAPrefixPairCannotChangeTheHandover:

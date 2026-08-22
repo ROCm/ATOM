@@ -22,7 +22,7 @@ from .marker_scanner import held_suffix_len
 from .reasoning_dialects import DIALECTS
 
 # Marker tables derived from the dialect registry (no model literals here).
-_THINK_END_MARKERS = tuple(d.think_end_marker for d in DIALECTS)
+_THINK_END_MARKERS = tuple(m for d in DIALECTS for m in d.end_markers)
 # Markers a rendered prompt ends with when the template already opened reasoning
 # (the output then begins inside the reasoning channel with no opening tag).
 _REASONING_OPEN_MARKERS = tuple(d.prompt_open_marker for d in DIALECTS)

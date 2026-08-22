@@ -707,3 +707,168 @@ class TestKimiK3KeepsAQuotedOpener:
         ), "the announcement is the premise of this test"
         parser.flush()
         assert parser._announced is None
+
+
+class TestAFollowerHasToHaveArrived:
+    """`peek_name` requires the next token whole; `parse` accepts a prefix.
+
+    The two run at different moments and that is the whole difference. `parse`
+    runs at end of stream, where a token cut off part-way is all there will
+    ever be -- a call truncated by `max_tokens`. `peek_name` runs mid-stream,
+    where a prefix means "not yet".
+
+    Sharing one prefix-accepting test made a chunk boundary decide: `<` is a
+    prefix of `<parameter=`, so the same prose announced a tool at chunk sizes
+    1 and 2 and stayed silent at 5. Announced, it reaches the client as a
+    dispatchable zero-argument call.
+    """
+
+    PROSE = "the model writes <tool_call><function=get_weather><br> and stops"
+    TOOLS: ClassVar[list] = [{"type": "function", "function": {"name": "get_weather"}}]
+
+    @pytest.mark.parametrize("size", [1, 2, 3, 5, 17, 999])
+    def test_prose_never_announces_at_any_chunk_size(self, size):
+        parser = ToolCallStreamParser(tools=self.TOOLS, parser_cls=QwenXmlParser)
+        events = []
+        for i in range(0, len(self.PROSE), size):
+            events += parser.process(self.PROSE[i : i + size])
+        events += parser.flush()
+        assert [k for k, _ in events if k == "tool_call_start"] == []
+
+    @pytest.mark.parametrize("size", [1, 2, 3, 5, 17, 999])
+    def test_a_real_call_still_announces_at_any_chunk_size(self, size):
+        text = (
+            "<tool_call><function=get_weather><parameter=city>Paris</parameter>"
+            "</function></tool_call>"
+        )
+        parser = ToolCallStreamParser(tools=self.TOOLS, parser_cls=QwenXmlParser)
+        events = []
+        for i in range(0, len(text), size):
+            events += parser.process(text[i : i + size])
+        events += parser.flush()
+        starts = [d["function"]["name"] for k, d in events if k == "tool_call_start"]
+        assert starts == ["get_weather"]
+
+    def test_a_call_cut_off_inside_its_own_token_still_parses(self):
+        """The other half: `parse` must keep accepting a partial follower."""
+        _, calls = QwenXmlParser.parse(
+            "<tool_call><function=get_weather><par", self.TOOLS
+        )
+        assert [c.function["name"] for c in calls] == ["get_weather"]
+
+
+class TestGlmPeeksAtItsOwnFirstCall:
+    """`parse` reads the unclosed case from the *first* `<tool_call>`.
+
+    So when that one carries no usable name it produces nothing at all, while
+    a `search` in the peek slid forward to a later opener and announced its
+    name -- at every chunk size, no boundary needed. The peek is anchored to
+    the same opener `parse` starts from.
+    """
+
+    TOOLS: ClassVar[list] = [{"type": "function", "function": {"name": "get_weather"}}]
+    UNUSABLE_FIRST = "<tool_call><arg_key><tool_call>get_weather<arg_key>"
+
+    def test_it_does_not_name_a_call_the_parse_cannot_find(self):
+        assert GlmParser.peek_name(self.UNUSABLE_FIRST, self.TOOLS) is None
+        assert GlmParser.parse(self.UNUSABLE_FIRST, self.TOOLS)[1] == []
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            (
+                "<tool_call>get_weather<arg_key>city</arg_key>"
+                "<arg_value>Paris</arg_value></tool_call>"
+            ),
+            "<tool_call>get_weather</tool_call>",
+            "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Pa",
+        ],
+        ids=["with-args", "zero-arg", "cut-mid-arg"],
+    )
+    def test_a_real_first_call_is_still_named(self, text):
+        assert GlmParser.peek_name(text, self.TOOLS) == "get_weather"
+
+
+class TestBothPathsAgreeOnWhatFollowsACall:
+    """Text after a section, and a section marker with nothing behind it."""
+
+    TOOLS: ClassVar[list] = [{"type": "function", "function": {"name": "get_weather"}}]
+    SECTION = (
+        "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0"
+        '<|tool_call_argument_begin|>{"city":"Paris"}<|tool_call_end|>'
+        "<|tool_calls_section_end|>"
+    )
+
+    @staticmethod
+    def _stream(text, size):
+        parser = ToolCallStreamParser(parser_cls=KimiParser)
+        events = []
+        for i in range(0, len(text), size):
+            events += parser.process(text[i : i + size])
+        events += parser.flush()
+        return "".join(d for k, d in events if k == "content")
+
+    @pytest.mark.parametrize("size", [1, 5, 999])
+    def test_the_tail_after_a_section_survives_both_ways(self, size):
+        """`parse` truncated at the section; the streaming path stopped doing
+        so when its terminal state went, leaving the two disagreeing."""
+        text = self.SECTION + "tail text"
+        assert self._stream(text, size) == KimiParser.parse(text, self.TOOLS)[0]
+        assert "tail text" in self._stream(text, size)
+
+    @pytest.mark.parametrize("size", [1, 5, 999])
+    def test_an_answer_ending_on_the_marker_keeps_it(self, size):
+        """`elif self.buf` skipped the recovery when nothing followed the
+        marker, so all 29 characters of it went missing."""
+        text = "hello <|tool_calls_section_begin|>"
+        assert self._stream(text, size) == KimiParser.parse(text, self.TOOLS)[0] == text
+
+
+class TestMiniMaxCutsAtItsOwnCall:
+    """Content is what precedes the call, and the call has two openers.
+
+    Cutting only at `<tool_call>` -- which this format's primary ns_token
+    shape does not contain -- left the entire `<invoke>` markup in `content`
+    *alongside* the parsed call, so the user was shown raw XML while the
+    streaming path showed nothing. And `<invoke name="` was not a scanner
+    marker at all, so a bare invoke was a call one way and text the other.
+    """
+
+    TOOLS: ClassVar[list] = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                },
+            },
+        }
+    ]
+    NS = "]<]minimax[>["
+
+    def _stream(self, text, size=7):
+        parser = ToolCallStreamParser(tools=self.TOOLS, parser_cls=MiniMaxParser)
+        events = []
+        for i in range(0, len(text), size):
+            events += parser.process(text[i : i + size])
+        events += parser.flush()
+        return (
+            "".join(d for k, d in events if k == "content"),
+            [d["function"]["name"] for k, d in events if k == "tool_call_start"],
+        )
+
+    def test_the_ns_token_call_leaves_no_markup_in_content(self):
+        text = f'{self.NS}<invoke name="get_weather"><city>Paris</city></invoke>'
+        content, calls = MiniMaxParser.parse(text, self.TOOLS)
+        assert [c.function["name"] for c in calls] == ["get_weather"]
+        assert "<invoke" not in content, f"raw markup shown to the user: {content!r}"
+        assert content == self._stream(text)[0]
+
+    @pytest.mark.parametrize("size", [1, 5, 999])
+    def test_a_bare_invoke_is_a_call_on_both_paths(self, size):
+        text = 'hi <invoke name="get_weather"> <city>Paris</city> bye'
+        _, calls = MiniMaxParser.parse(text, self.TOOLS)
+        _, streamed = self._stream(text, size)
+        assert bool(calls) == bool(streamed) is True

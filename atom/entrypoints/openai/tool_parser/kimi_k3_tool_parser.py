@@ -22,7 +22,12 @@ import json
 import re
 from typing import ClassVar
 
-from .tool_parser import ToolCall, ToolCallParser, unique_tool_call_id
+from .tool_parser import (
+    ToolCall,
+    ToolCallParser,
+    continues_a_call,
+    unique_tool_call_id,
+)
 
 # K3 channel tokens this parser matches on. Kept local so the parser is
 # self-contained; the reasoning splitter declares its own copies.
@@ -42,10 +47,37 @@ _K3_ARG_RE = re.compile(
     r"(?P<val>.*?)<\|close\|>argument",
     re.DOTALL,
 )
+# What `parse` removes from *content*. Every alternative here is a literal
+# this format also declares in `START_MARKERS`, and it has to be: the two
+# answer the same question -- which bytes are framing rather than answer --
+# and the streaming path can only hold back a literal. `call` and `argument`
+# were in this list and could not be declared, because they carry data
+# (`tool="..."`, `key="..."`); the bare `<|sep|>` at their end *was* declared,
+# so a quoted `<|open|>argument key="city"<|sep|>` came out stripped when
+# parsed whole and with only its separator removed when streamed -- text
+# matching neither path. They are removed inside a tools section by
+# `_K3_CALL_RE` and `_K3_ARG_RE`, which is the only place they occur in a
+# real answer, so nothing needs them here.
+_K3_CONTENT_FRAMING = (
+    "<|open|>response<|sep|>",
+    "<|close|>response<|sep|>",
+    "<|open|>think<|sep|>",
+    "<|close|>think<|sep|>",
+    "<|open|>message<|sep|>",
+    "<|close|>message<|sep|>",
+    "<|open|>tools<|sep|>",
+    "<|close|>response",
+    "<|close|>think",
+    "<|close|>message",
+    "<|close|>tools",
+    "<|close|>argument",
+    "<|close|>call",
+    "<|end_of_msg|>",
+    "<|sep|>",
+)
+# Longest first, so a token that is a prefix of another does not truncate it.
 _K3_FRAMING_RE = re.compile(
-    r"<\|(?:open|close)\|>(?:response|message|tools|think|call|argument)[^<]*?<\|sep\|>"
-    r"|<\|close\|>(?:response|message|tools|think)"
-    r"|<\|end_of_msg\|>|<\|sep\|>"
+    "|".join(re.escape(t) for t in sorted(_K3_CONTENT_FRAMING, key=len, reverse=True))
 )
 
 
@@ -81,7 +113,7 @@ def _k3_coerce(val: str, ptype: str | None):
         return v
 
 
-def _is_truncated_call(text: str, after_opener: int) -> bool:
+def _is_truncated_call(text: str, after_opener: int, *, arrived: bool) -> bool:
     """Is the call opener at ``after_opener`` a cut-off call, or a quotation?
 
     See :func:`QwenXmlParser._is_truncated_call`. Only the second of its two
@@ -91,7 +123,7 @@ def _is_truncated_call(text: str, after_opener: int) -> bool:
     prose continues in English.
     """
     rest = text[after_opener:].lstrip()
-    return not rest or any(tok.startswith(rest[: len(tok)]) for tok in _CALL_CONTINUES)
+    return not rest or continues_a_call(rest, _CALL_CONTINUES, arrived=arrived)
 
 
 def _strip_k3_framing(text: str) -> str:
@@ -133,34 +165,19 @@ class KimiK3Parser(ToolCallParser):
     """
 
     NAME: ClassVar[str] = "kimi_k3"
-    # The same five `is_kimi_k3` decides by, named rather than spelled out:
-    # a hand-written copy of this list had four of them.
-    # Every channel token that can reach *streamed* content, not just the
-    # five `is_kimi_k3` keys on. The read-ahead must not split them and the
-    # facade drops the ones that open no region, which is how streamed text
-    # comes to match what `parse` strips -- with only the five, four other
-    # framing tokens reached the client verbatim while `stream=false` removed
-    # them. The parameterised shapes `_K3_FRAMING_RE` also matches
-    # (`<|open|>argument key=...<|sep|>`) occur only inside a tools section,
-    # which is buffered whole.
+    # Every token `parse` strips from content, plus the call prefix that opens
+    # a region. Derived from `_K3_CONTENT_FRAMING` rather than written out
+    # again: the read-ahead must not split a token the stripper removes, and a
+    # hand-kept second copy of the list is how four of them came to be missing
+    # -- they reached the client verbatim when streamed and were deleted when
+    # not. `is_kimi_k3` keys on five of these; this is not that list.
     START_MARKERS: ClassVar[tuple[str, ...]] = (
         KIMI_K3_CALL_PREFIX,
-        KIMI_K3_TOOLS_START,
-        KIMI_K3_RESPONSE_START,
-        KIMI_K3_RESPONSE_END,
-        KIMI_K3_END_OF_MSG,
-        "<|open|>think<|sep|>",
-        "<|close|>think<|sep|>",
-        "<|open|>message<|sep|>",
-        "<|close|>message<|sep|>",
-        "<|close|>response",
-        "<|close|>think",
-        "<|close|>message",
-        "<|sep|>",
+        *_K3_CONTENT_FRAMING,
     )
-    # Of those five, the two that mean a tool call is coming. The other three
-    # wrap every answer this model gives, so they are literals the read-ahead
-    # must not split and nothing more.
+    # The two that mean a tool call is coming. Every other marker above is
+    # channel framing that wraps every answer this model gives, so they are
+    # literals the read-ahead must not split and nothing more.
     _REGION_MARKERS: ClassVar[frozenset[str]] = frozenset(
         {KIMI_K3_CALL_PREFIX, KIMI_K3_TOOLS_START}
     )
@@ -176,7 +193,9 @@ class KimiK3Parser(ToolCallParser):
         m = _PEEK_NAME_RE.search(region)
         if m is None or not m.group(2).lstrip():
             return None
-        return m.group(1) if _is_truncated_call(region, m.start(2)) else None
+        if not _is_truncated_call(region, m.start(2), arrived=True):
+            return None
+        return m.group(1)
 
     @classmethod
     def opens_region(cls, marker: str) -> bool:
@@ -224,7 +243,11 @@ class KimiK3Parser(ToolCallParser):
         # answer that merely quoted it, which is the promise rule this format
         # has to keep like every other.
         m = _CALL_OPENER_RE.search(text)
-        if m is not None and not tool_calls and not _is_truncated_call(text, m.end()):
+        if (
+            m is not None
+            and not tool_calls
+            and not _is_truncated_call(text, m.end(), arrived=False)
+        ):
             # A start marker is not a promise, and this format had no branch
             # for it. Nothing parsed to a call and what follows the opener is
             # English, so the opener is a quotation: cutting there deleted 62

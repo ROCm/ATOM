@@ -21,7 +21,12 @@ from typing import Any, ClassVar
 
 from .kimi_tool_parser import KIMI_SECTION_BEGIN
 from .schema import build_param_types, coerce_param_value
-from .tool_parser import BufferedMarkerParser, ToolCall, unique_tool_call_id
+from .tool_parser import (
+    BufferedMarkerParser,
+    ToolCall,
+    continues_a_call,
+    unique_tool_call_id,
+)
 
 # Also read by GlmParser.detect: '<function=' is what tells Qwen's <tool_call>
 # apart from GLM's identically-named tag.
@@ -42,11 +47,6 @@ _PARAM_RE = re.compile(
 # it and `parse` did not, which is the whole of the mismatch this shared
 # tuple exists to prevent: one spelling, both readers.
 _CALL_CONTINUES = (_PARAM_OPENER, "</function>")
-
-
-def _continues_a_call(rest: str) -> bool:
-    """Is `rest` the start of this format's own next token?"""
-    return any(tok.startswith(rest[: len(tok)]) for tok in _CALL_CONTINUES)
 
 
 def _name_and_rest(fn_text: str) -> tuple[str, str] | None:
@@ -77,7 +77,9 @@ def _is_truncated_call(fn_text: str, param_types: dict) -> bool:
     if split is None:
         return False
     name, rest = split
-    return name in param_types and (not rest or _continues_a_call(rest))
+    return name in param_types and (
+        not rest or continues_a_call(rest, _CALL_CONTINUES, arrived=False)
+    )
 
 
 def _parse_function(
@@ -137,7 +139,9 @@ class QwenXmlParser(BufferedMarkerParser):
         if m is None:
             return None
         rest = m.group(2).lstrip()
-        return m.group(1) if rest and _continues_a_call(rest) else None
+        if not continues_a_call(rest, _CALL_CONTINUES, arrived=True):
+            return None
+        return m.group(1)
 
     @classmethod
     def detect(cls, text: str) -> bool:

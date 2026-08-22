@@ -5,6 +5,7 @@
 
 import json
 import queue
+from typing import ClassVar
 
 import pytest
 from import_guard import skip_if_dependency_missing
@@ -87,3 +88,99 @@ class TestChatCompletionStreamStateRoleChunkContent:
 
         second = state.drain(max_items=16, timeout=0.01)
         assert second == []
+
+
+class TestTheDrainKeepsWhatItCannotHandOutYet:
+    """`max_items` is a batch size, not a licence to discard.
+
+    The build loop `break`ed when it reached that count -- after the parser
+    had already yielded the events -- so everything past the first was gone
+    permanently. At `max_items=1` a tool call lost its arguments and, once
+    `has_tool_calls` moved onto the argument event, reported
+    `finish_reason: stop` for a call it had just announced.
+    """
+
+    TOOLS: ClassVar[list] = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                },
+            },
+        }
+    ]
+    CALL = (
+        "<tool_call><function=get_weather><parameter=city>Paris</parameter>"
+        "</function></tool_call>"
+    )
+
+    def _state(self):
+        from atom.entrypoints.openai.tool_parser.qwen3_tool_parser import QwenXmlParser
+
+        return ChatCompletionStreamState(
+            request_id="chatcmpl-test",
+            model_name="model",
+            prompt="hello",
+            tokenizer=_StubTokenizer(),
+            stream_queue=queue.Queue(),
+            n=1,
+            tool_parser_cls=QwenXmlParser,
+            tools=self.TOOLS,
+        )
+
+    @staticmethod
+    def _drain_all(state, event, max_items):
+        out = state._event_to_chunks(event, max_items)
+        idle = {"index": 0, "text": "", "token_ids": [], "finished": True}
+        for _ in range(20):
+            more = state._event_to_chunks(idle, max_items)
+            if not more:
+                break
+            out += more
+        return out
+
+    @pytest.mark.parametrize("max_items", [1, 2, 16])
+    def test_the_arguments_survive_any_batch_size(self, max_items):
+        state = self._state()
+        event = {"index": 0, "text": self.CALL, "token_ids": [1], "finished": True}
+        payloads = [
+            json.loads(c.split("data: ", 1)[1])
+            for c in self._drain_all(state, event, max_items)
+            if c.split("data: ", 1)[1].strip() != "[DONE]"
+        ]
+        arguments = "".join(
+            tc.get("function", {}).get("arguments", "")
+            for p in payloads
+            for tc in (
+                (p.get("choices") or [{}])[0].get("delta", {}).get("tool_calls") or []
+            )
+        )
+        assert '"city"' in arguments, f"arguments lost at max_items={max_items}"
+
+    @pytest.mark.parametrize("max_items", [1, 2, 16])
+    def test_and_the_finish_reason_says_a_tool_was_called(self, max_items):
+        state = self._state()
+        event = {"index": 0, "text": self.CALL, "token_ids": [1], "finished": True}
+        self._drain_all(state, event, max_items)
+        assert state.has_tool_calls == [True]
+
+    @pytest.mark.parametrize("max_items", [1, 2, 16])
+    def test_the_stream_still_closes_at_any_batch_size(self, max_items):
+        """Queueing the overflow made the early return the common path, and
+        it returned before the final chunks -- a fully drained stream with no
+        `finish_reason`, no usage and no `[DONE]`."""
+        state = self._state()
+        event = {"index": 0, "text": self.CALL, "token_ids": [1], "finished": True}
+        chunks = self._drain_all(state, event, max_items)
+        assert chunks[-1].split("data: ", 1)[1].strip() == "[DONE]"
+        reasons = [
+            c["finish_reason"]
+            for raw in chunks
+            if raw.split("data: ", 1)[1].strip() != "[DONE]"
+            for c in json.loads(raw.split("data: ", 1)[1]).get("choices", [])
+            if c.get("finish_reason")
+        ]
+        assert reasons == ["tool_calls"], reasons

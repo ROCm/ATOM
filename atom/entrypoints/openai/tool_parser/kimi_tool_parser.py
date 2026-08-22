@@ -103,8 +103,13 @@ class KimiParser(ToolCallParser):
                 return (content.strip() if entries else text), entries
             return text, []
         entries = _parse_entries(section_match.group(1))
-        content = text[: section_match.start()]
-        return (content.strip() if entries else text), entries
+        # What follows the section is the answer continuing, not spare bytes.
+        # Truncating here dropped it, and the streaming path stopped doing so
+        # when its terminal state was replaced -- leaving the two disagreeing
+        # about the same output.
+        before = text[: section_match.start()]
+        after = text[section_match.end() :]
+        return ((before.strip() + after) if entries else text), entries
 
     def process(self, text: str) -> list:
         results: list = []
@@ -207,9 +212,11 @@ class KimiParser(ToolCallParser):
             results.extend(self._drain_entries())
             if self._section_calls > 0:
                 results.append(("tool_call_end", None))
-            elif self.buf:
+            else:
                 # The section opened and closed nothing. Same rule as every
-                # other format: a start marker is not a promise.
+                # other format: a start marker is not a promise -- including
+                # when the answer stops on the marker itself, where `self.buf`
+                # is empty and an `elif` on it dropped all 29 characters.
                 results.append(("content", KIMI_SECTION_BEGIN + self.buf))
                 self.buf = ""
         return results
