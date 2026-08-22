@@ -77,6 +77,7 @@ from .serving_anthropic import (
     anthropic_to_openai_tools,
     build_anthropic_response,
     completes_a_tool_call,
+    stream_error,
     stream_message_delta,
     stream_message_start,
     stream_message_stop,
@@ -233,14 +234,14 @@ def anthropic_template_kwargs(
     return {name: on_value if anthropic_thinking_enabled(request) else off_value}
 
 
-def anthropic_drop_reasoning(request: Any, toggle: tuple[str, Any, Any] | None) -> bool:
-    """Must this response's reasoning be withheld after the fact?
+def anthropic_drop_reasoning(request: Any) -> bool:
+    """Must this response's reasoning be withheld from the client?
 
-    Only when the request said `thinking: disabled` *and* the model's template
-    has no switch to say it in the prompt -- gpt-oss-120b and DeepSeek-R1 both
-    measure that way. Answering in the prompt is strictly better and
-    `anthropic_template_kwargs` does it wherever it can; this is the remainder,
-    and without it an explicit opt-out was honoured at neither layer.
+    Whenever the request did not ask for it. Answering in the prompt is
+    strictly better and `anthropic_template_kwargs` does it wherever it can,
+    but that only reaches models whose template has a switch -- and it only
+    reaches the ones that *asked*, since an absent field leaves the model's
+    default alone. This is everything else.
 
     Withheld, not left unseparated: the reasoning still goes through the
     reasoning filter, so the tool parser never sees a model musing about
@@ -250,13 +251,22 @@ def anthropic_drop_reasoning(request: Any, toggle: tuple[str, Any, Any] | None) 
     the previous three attempts to fix this downstream all failed by trying to
     salvage content out of it.
 
-    Keyed on the field being *present* and off, exactly as the prompt-level
-    answer is. An absent `thinking` is unstated, and unstated leaves the
-    model's own default alone at both layers or neither.
+    Absent counts as off *here*, and that is deliberately not what the
+    prompt-level answer does. The two are different questions. What to put in
+    the prompt is about the model's own default, and overriding a default
+    nobody asked about would change what every existing caller gets from a
+    reasoning model. What to put in the *response* is about this protocol's
+    default, and Anthropic's is thinking-off: a client that never sends the
+    field has no reason to expect `thinking` blocks, and one that validates
+    block types or verifies the signature rejects them. Reading absent as
+    "show it" sent a random-signature `thinking` block to every Claude Code
+    and Anthropic-SDK caller talking to a Qwen3 or DeepSeek deployment.
+
+    Separated either way -- only whether the client is *shown* it is decided
+    here. That is what keeps a chain of thought out of the tool parser, which
+    is a second reader of the same text.
     """
-    if getattr(request, "thinking", None) is None:
-        return False
-    return toggle is None and not anthropic_thinking_enabled(request)
+    return not anthropic_thinking_enabled(request)
 
 
 # The engine's `leave_reason` in Anthropic's vocabulary. The scheduler emits
@@ -1848,7 +1858,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         # was never told not to think and the endpoint spent three attempts
         # dealing with a chain of thought it had asked for by omission.
         merged_kwargs.update(anthropic_template_kwargs(request, reasoning_toggle))
-        drop_reasoning = anthropic_drop_reasoning(request, reasoning_toggle)
+        drop_reasoning = anthropic_drop_reasoning(request)
         # Same answer-it-in-the-prompt rule as `thinking` above, and the chat
         # path already forwards its own spelling of this. `tool_choice` was
         # read off the Anthropic request and then used nowhere at all -- a
@@ -1964,9 +1974,13 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                 # only reasoning and has all of it dropped, delivered an empty
                 # message that also said nothing was wrong. The vocabularies
                 # already line up; they were simply never connected.
-                stop_reason = "end_turn"
-                # The engine's own reason, kept so a call parsed out of a
-                # response it cut short does not overwrite it.
+                # Computed once, at the end, from the two facts that decide
+                # it -- exactly as `serving_chat` does. Recomputing it at each
+                # send point meant whichever fact arrived last won: a call
+                # completing mid-stream froze it at `tool_use`, and the
+                # `max_tokens` that arrived three chunks later could never be
+                # folded in. Kimi-K2 is the one registered format whose region
+                # closes mid-stream, so it is the one that reaches this.
                 engine_reason: Any = None
 
                 message_started = False
@@ -1987,10 +2001,8 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                         new_text = chunk_data["text"]
                         if chunk_data.get("finish_reason"):
                             engine_reason = chunk_data["finish_reason"]
-                        if not has_tool_calls and chunk_data.get("finish_reason"):
-                            stop_reason = anthropic_stop_reason(
-                                chunk_data["finish_reason"]
-                            )
+                        if chunk_data.get("finish_reason"):
+                            engine_reason = chunk_data["finish_reason"]
                         output_tokens += len(chunk_data.get("token_ids", []))
                         finished = chunk_data.get("finished", False)
 
@@ -2015,22 +2027,18 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                             else:
                                 # Phase 2: Tool call detection on content
                                 events = tool_parser.process(text)
-                                if completes_a_tool_call(events):
-                                    has_tool_calls = True
-                                    stop_reason = anthropic_stop_reason_with_calls(
-                                        engine_reason, True
-                                    )
+                                has_tool_calls = has_tool_calls or (
+                                    completes_a_tool_call(events)
+                                )
                                 for _frame in tool_event_frames(events, blocks):
                                     yield _frame
 
                         if finished:
                             # Flush remaining tool call events
                             events = tool_parser.flush()
-                            if completes_a_tool_call(events):
-                                has_tool_calls = True
-                                stop_reason = anthropic_stop_reason_with_calls(
-                                    engine_reason, True
-                                )
+                            has_tool_calls = has_tool_calls or (
+                                completes_a_tool_call(events)
+                            )
                             for _frame in tool_event_frames(events, blocks):
                                 yield _frame
 
@@ -2052,9 +2060,25 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                             aborted = False
                             for _frame in blocks.close():
                                 yield _frame
+                            stop_reason = anthropic_stop_reason_with_calls(
+                                engine_reason, has_tool_calls
+                            )
                             yield stream_message_delta(stop_reason, output_tokens)
                             yield stream_message_stop()
                             break
+                except Exception as exc:
+                    # Every block this stream opened has to be closed, and the
+                    # client has to be told why. There was no `except` at all:
+                    # the endpoint's own handler has already returned by the
+                    # time the generator runs, so a raise from the collector,
+                    # the reasoning filter or a tool parser cut the response
+                    # mid-frame with an open block and no terminator.
+                    logger.exception("Error streaming anthropic response")
+                    for _frame in blocks.close():
+                        yield _frame
+                    yield stream_error(str(exc))
+                    yield stream_message_delta("end_turn", output_tokens)
+                    yield stream_message_stop()
                 finally:
                     cleanup_stream(seq_id, aborted=aborted)
                     cleanup_request(request_id)

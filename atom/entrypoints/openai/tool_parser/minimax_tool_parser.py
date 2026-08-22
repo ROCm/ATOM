@@ -22,7 +22,13 @@ import re
 from typing import Any, ClassVar
 
 from .schema import build_param_types, coerce_json_or_raw
-from .tool_parser import RegionParse, ToolCall, ToolCallParser, unique_tool_call_id
+from .tool_parser import (
+    RegionParse,
+    ToolCall,
+    ToolCallParser,
+    continues_a_call,
+    unique_tool_call_id,
+)
 
 MINIMAX_NS = "]<]minimax[>["
 
@@ -81,12 +87,22 @@ def _is_truncated_call(
     if not rest:
         return at_end
     tag = _FIRST_TAG_RE.match(rest)
-    return bool(tag) and (not types or tag.group(1) in types)
+    if tag is not None:
+        return not types or tag.group(1) in types
+    # A tag that has not finished arriving. At end of region that is all
+    # there will ever be, so a prefix counts -- the rule `continues_a_call`
+    # states and the other three formats have applied since it was written.
+    # The sweep that added it missed this one, because this format names a
+    # parameter by the tag itself and so had no keyword to hand it; the
+    # followers are the declared tags, built from the request.
+    openers = tuple(f"{MINIMAX_NS}<{t}>" for t in types) + tuple(
+        f"<{t}>" for t in types
+    )
+    return bool(openers) and continues_a_call(rest, openers, arrived=not at_end)
 
 
 class MiniMaxParser(ToolCallParser):
     NAME: ClassVar[str] = "minimax"
-    RECOGNISES_A_CALL_IN_PROGRESS: ClassVar[bool] = True
     # `<invoke name="` too: `_INVOKE_RE` matches it anywhere, so an invoke the
     # model wrote without the ns_token was a call when parsed whole and plain
     # text when streamed -- the read-ahead never opened a region for it. DSML

@@ -14,21 +14,22 @@ from atom.entrypoints.atomesh import atom_standalone_service
 from atom.entrypoints.openai import api_server, serving_chat
 from atom.entrypoints.openai.serving_anthropic import completes_a_tool_call
 from atom.entrypoints.openai.serving_chat import (
-    finish_reason_with_calls,
     _build_chat_choice,
     _normalize_finish_reason,
     build_chat_response,
     build_chat_response_multi,
     create_chat_chunk,
+    finish_reason_with_calls,
     normalize_chat_tools,
     stream_chat_response,
     stream_chat_response_fanout,
 )
+from atom.entrypoints.openai.reasoning import NO_REASONING
 from atom.entrypoints.openai.streaming_dispatch import StreamOutputCollector
 from atom.entrypoints.openai.tool_parser import ToolCallStreamParser, parse_tool_calls
+from atom.entrypoints.openai.tool_parser.kimi_k3_tool_parser import KimiK3Parser
 from atom.entrypoints.openai.tool_parser.kimi_tool_parser import KimiParser
 from atom.entrypoints.openai.tool_parser.qwen3_tool_parser import QwenXmlParser
-from atom.entrypoints.openai.tool_parser.kimi_k3_tool_parser import KimiK3Parser
 from atom.entrypoints.openai.tool_parser.registry import forbids_tool_calls
 
 # ============================================================================
@@ -681,3 +682,25 @@ class TestBeingCutShortOutranksHavingMadeACall:
         )
         assert choice["message"]["tool_calls"], "the salvaged call is the premise"
         assert choice["finish_reason"] == "length"
+
+
+class TestTheReasonAResponseEnded:
+    """`""` is a reason the engine really forwards, and it is not absence.
+
+    `Sequence.leave_reason` starts as the empty string, and a response with no
+    recorded reason arrives carrying it. A truthiness test put
+    `finish_reason: null` in the body, which the OpenAI schema reserves for a
+    choice that is still being generated -- clients wait on it, and some SDKs
+    reject the response outright.
+    """
+
+    def _choice(self, finish_reason):
+        return _build_chat_choice(
+            "the answer", finish_reason, 0, None, None, NO_REASONING, None
+        )
+
+    def test_an_empty_engine_reason_still_terminates_the_choice(self):
+        assert self._choice("")["finish_reason"] == "stop"
+
+    def test_and_a_genuinely_absent_one_is_still_null(self):
+        assert self._choice(None)["finish_reason"] is None

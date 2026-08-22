@@ -241,6 +241,7 @@ class TestBuildAnthropicResponse:
             content_text="Hello!",
             input_tokens=10,
             output_tokens=5,
+            stop_reason="end_turn",
         )
         assert resp["type"] == "message"
         assert resp["role"] == "assistant"
@@ -261,6 +262,7 @@ class TestBuildAnthropicResponse:
             reasoning_content="Let me think about this...",
             input_tokens=20,
             output_tokens=15,
+            stop_reason="end_turn",
         )
         assert len(resp["content"]) == 2
         assert resp["content"][0]["type"] == "thinking"
@@ -273,6 +275,7 @@ class TestBuildAnthropicResponse:
             request_id="test789",
             model="m",
             content_text="Direct answer.",
+            stop_reason="end_turn",
         )
         assert len(resp["content"]) == 1
         assert resp["content"][0]["type"] == "text"
@@ -290,6 +293,7 @@ class TestBuildAnthropicResponse:
             model="m",
             content_text="Let me read that file.",
             tool_calls=[tc],
+            stop_reason="tool_use",
         )
         assert resp["stop_reason"] == "tool_use"
         types = [b["type"] for b in resp["content"]]
@@ -314,10 +318,38 @@ class TestBuildAnthropicResponse:
             content_text="I'll run a command.",
             reasoning_content="The user wants to list files.",
             tool_calls=[tc],
+            stop_reason="tool_use",
         )
         types = [b["type"] for b in resp["content"]]
         assert types == ["thinking", "text", "tool_use"]
         assert resp["stop_reason"] == "tool_use"
+
+    def test_the_caller_s_stop_reason_is_the_one_returned(self):
+        """It used to be overwritten whenever there were tool calls, which
+        discarded the answer the call site had already computed: a response
+        cut off at `max_tokens` mid-call came back as an ordinary `tool_use`
+        with silently truncated arguments, disagreeing with the streaming path
+        for the same generation. Checked by value; the test this replaces
+        grepped the source for the call and passed while the value was thrown
+        away."""
+        from atom.entrypoints.openai.tool_parser import ToolCall
+
+        tc = ToolCall(
+            id="call_3",
+            type="function",
+            function={"name": "bash", "arguments": '{"command": "l'},
+        )
+        for asked in ("max_tokens", "tool_use", "end_turn", "stop_sequence"):
+            resp = build_anthropic_response(
+                request_id="r",
+                model="m",
+                content_text="",
+                tool_calls=[tc],
+                stop_reason=asked,
+            )
+            assert (
+                resp["stop_reason"] == asked
+            ), f"asked for {asked!r}, got {resp['stop_reason']!r}"
 
     def test_response_empty_content_with_tool_call(self):
         from atom.entrypoints.openai.tool_parser import ToolCall
@@ -332,6 +364,7 @@ class TestBuildAnthropicResponse:
             model="m",
             content_text="",
             tool_calls=[tc],
+            stop_reason="tool_use",
         )
         types = [b["type"] for b in resp["content"]]
         assert "tool_use" in types
@@ -725,24 +758,22 @@ class TestASwitchlessModelStillHonoursDisabled:
             self.thinking = thinking
 
     @pytest.mark.parametrize(
-        "thinking, toggle, expected",
+        "thinking, expected",
         [
-            ({"type": "disabled"}, None, True),
-            # Answered in the prompt instead, which is strictly better.
-            ({"type": "disabled"}, TOGGLE, False),
-            # Absent is unstated at both layers or neither.
-            (None, None, False),
-            (None, TOGGLE, False),
-            ({"type": "enabled"}, None, False),
+            ({"type": "disabled"}, True),
+            # Anthropic's default is thinking-off, so a client that never sent
+            # the field has no reason to expect `thinking` blocks -- and one
+            # that validates block types or verifies the signature rejects
+            # them. What goes in the *prompt* answers a different question and
+            # still leaves an absent field alone.
+            (None, True),
+            ({"type": "enabled"}, False),
+            ({}, True),
         ],
-        ids=["switchless-off", "switched-off", "absent", "absent-switched", "on"],
+        ids=["off", "absent", "on", "empty"],
     )
-    def test_only_an_explicit_opt_out_with_nowhere_else_to_go(
-        self, thinking, toggle, expected
-    ):
-        assert (
-            api_server.anthropic_drop_reasoning(self.Req(thinking), toggle) is expected
-        )
+    def test_the_client_is_shown_reasoning_only_if_it_asked(self, thinking, expected):
+        assert api_server.anthropic_drop_reasoning(self.Req(thinking)) is expected
 
     def test_both_endpoint_paths_consult_it(self):
         """Read off the syntax tree, not grepped for: a literal check passes

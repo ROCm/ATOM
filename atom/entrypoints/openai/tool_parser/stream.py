@@ -18,8 +18,8 @@ compares them, but no second implementation to compare against.
 import logging
 
 from ..marker_scanner import MarkerScanner
-from .schema import build_param_types
-from .tool_parser import NO_CALLS, ToolCall, ToolCallParser, unique_tool_call_id
+from .schema import ParamTypes, build_param_types
+from .tool_parser import NO_CALLS, ToolCall, ToolCallParser
 
 logger = logging.getLogger("atom")
 
@@ -113,6 +113,17 @@ def _peek_declared(tools: list | None) -> frozenset[str]:
     return frozenset(build_param_types(tools))
 
 
+def _resolved_tools(tools: list | None):
+    """The request's tools as the parsers want them: built once, not per chunk.
+
+    Falls back to whatever was passed when nothing usable comes out, so a
+    caller's truthiness test sees the same answer either way.
+    """
+    if tools is None or isinstance(tools, ParamTypes):
+        return tools
+    return build_param_types(tools) or tools
+
+
 class ToolCallStreamParser:
     """Reads one request's output, in chunks or all at once.
 
@@ -140,7 +151,11 @@ class ToolCallStreamParser:
 
     ``tools`` enables JSON-Schema type coercion of parameter values. It may be
     assigned after construction (several call sites do) and is read when a
-    region closes, so it takes effect as long as it is set before then.
+    region closes, so it takes effect as long as it is set before then. It is
+    resolved to :class:`~.schema.ParamTypes` on the way in -- the catalogue is
+    walked once per request rather than once per chunk. A request whose tools
+    declare no usable name keeps the list it was given, so that ``not
+    self.tools`` still asks what it always asked.
     """
 
     def __init__(
@@ -150,7 +165,7 @@ class ToolCallStreamParser:
         *,
         suppress_calls: bool = False,
     ) -> None:
-        self.tools = tools
+        self.tools = tools  # type: ignore[assignment]
         self.parser_cls = parser_cls
         self.suppress_calls = suppress_calls
         # Reads ahead of the region: releases everything that cannot begin one
@@ -162,6 +177,7 @@ class ToolCallStreamParser:
             MarkerScanner(parser_cls.START_MARKERS) if parser_cls is not None else None
         )
         self._region: Region | None = None
+
         # The tail a region-closing literal split across a chunk boundary
         # would need, and nothing more.
         self._end_markers = parser_cls.REGION_END_MARKERS if parser_cls else ()
@@ -179,6 +195,21 @@ class ToolCallStreamParser:
         self._peek_exhausted = False
         # The request's declared names, built once rather than per token.
         self._declared: frozenset[str] | None = None
+
+    @property
+    def tools(self):
+        """The request's tools, resolved once (see :func:`_resolved_tools`).
+
+        A property and not a line in ``__init__`` because several call sites
+        assign it afterwards, and the resolution has to happen for those too
+        or they are the slow path again.
+        """
+        return self._tools
+
+    @tools.setter
+    def tools(self, value: list | None) -> None:
+        self._tools = _resolved_tools(value)
+        self._declared = None
 
     @property
     def fmt(self) -> str | None:
@@ -387,11 +418,21 @@ class ToolCallStreamParser:
         ):
             return []
         head = self._region.head
-        calls = self.parser_cls.parse_region(head, self.tools, at_end=False).calls
-        if not calls:
+        parsed = self.parser_cls.parse_region(head, self.tools, at_end=False)
+        if not parsed.calls:
             self._peek_exhausted = len(head) >= _PEEK_WINDOW
             return []
-        name = calls[0].function["name"]
+        if parsed.begins > 0:
+            # There is answer text ahead of the call *inside* this region --
+            # an answer that quotes a marker and then calls for real. That
+            # text is only released when the region closes, so announcing now
+            # would put the call in front of prose that `stream=false` puts
+            # behind it, and a client that closes its text pane on a tool call
+            # renders the explanation after the call. The name still goes out,
+            # with the arguments, in the right order.
+            self._peek_exhausted = True
+            return []
+        name = parsed.calls[0].function["name"]
         if self._declared is None:
             self._declared = _peek_declared(self.tools)
         if name not in self._declared:
@@ -403,7 +444,12 @@ class ToolCallStreamParser:
                 "tool_call_start",
                 {
                     "index": self._index,
-                    "id": unique_tool_call_id(),
+                    # The parsed call's own id, not a fresh one. Announcing
+                    # skips the start event the call would otherwise send, so
+                    # whatever goes out here is the only id the client sees --
+                    # and Kimi's is the model's `functions.NAME:INDEX`, which
+                    # survived only for requests that declared no tools.
+                    "id": parsed.calls[0].id,
                     "type": "function",
                     "function": {"name": name, "arguments": ""},
                 },

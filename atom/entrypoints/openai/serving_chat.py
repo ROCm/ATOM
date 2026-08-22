@@ -431,9 +431,13 @@ def _build_chat_choice(
     if tool_calls:
         message["tool_calls"] = [tc.to_dict() for tc in tool_calls]
 
+    # `is not None`, not truthiness: `""` is `Sequence.leave_reason`'s initial
+    # value and what the engine forwards for a response with no recorded
+    # reason. A truthiness test reported `finish_reason: null` for it, which an
+    # OpenAI client reads as "still in progress" and some SDKs raise on.
     effective_finish_reason = (
         finish_reason_with_calls(finish_reason, bool(tool_calls))
-        if (tool_calls or finish_reason)
+        if (tool_calls or finish_reason is not None)
         else None
     )
     return {

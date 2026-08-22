@@ -133,22 +133,29 @@ Two waits are longer than that. Text inside the reasoning channel is held until
 its end marker — not a stall: it is reasoning, and it is delivered as
 `reasoning_content` as it arrives. And once a marker that *opens a tool-call
 region* appears, everything from it onward belongs to the format until it can
-parse the region. For a real call that is its closing tag. For an answer that
-merely quotes a marker it used to be end of stream — measured on a GLM answer
-naming the tag at character 29 and then explaining for 1234 more, 98% of it
-arrived in one frame at EOS, and "how do I make you call a tool" is a common
-question. A region that has grown past `_FIRST_PROBE` bytes and still parses
-to no call is now given up on: its opening marker goes into the answer and the
-rest is read again, so a real call later in the same reply still opens a
-region of its own. Only formats that can recognise a call still arriving are
-asked — a Kimi entry is invisible until its end token, so a large argument
-would look exactly like prose. Nothing is lost either way; what is left is
-`atom:stream_longest_silence_seconds`, which reports the wait while it
-happens.
+parse the region. For a real call that is its closing tag; for an answer that
+merely quotes a marker it is end of stream. That is a known cost, measured on
+a GLM answer naming the tag at character 29 and then explaining for 1234 more:
+98% of it arrives in one frame at EOS, and "how do I make you call a tool" is
+a common question. Nothing is lost — the region is released verbatim once it
+turns out not to be a call — and `atom:stream_longest_silence_seconds` reports
+the wait while it happens.
+
+A probe that gave up on a region producing nothing after N bytes was written
+for this and reverted. It rests on acceptance being monotone in how many bytes
+have arrived, and that is false: MiniMax gates its in-progress test on the
+first tag being in the declared schema, and DSML's wrapper-less and
+direct-JSON branches match no prefix at all — so real calls over N bytes were
+delivered as raw text with `finish_reason: stop` on three of the six formats.
+It was quadratic besides, because giving up re-fed bytes that immediately
+reopened a region with a fresh budget: 1.19 ms to 18.2 s on a 250 KB answer,
+in the request coroutine. Fixing the latency needs the *format* to say "this
+can no longer become a call", which is a different question from "does not
+parse yet" and one no format answers today.
 
 "Opens a region" is asked of the format, not assumed of every marker it
-declares. Kimi-K3 declares thirteen and only two of them mean a tool call; the
-other eleven are channel framing that wraps every answer it gives, including
+declares. Kimi-K3 declares 16 and only two of them mean a tool call; the
+rest are channel framing that wraps every answer it gives, including
 `<|open|>response<|sep|>` at the very start. Treating those as a handover meant
 a K3 response streamed *nothing* — measured, 324 of 324 characters in one frame
 at EOS — which was the common path for that model rather than an edge case.
@@ -193,12 +200,16 @@ without a name. Running the format's regex over the whole region on every
 chunk is quadratic in the response — 3.0 → 9.8 → 36 → 137 ms across
 2k/4k/8k/16k tokens, the shape `marker_scanner` exists to retire, one layer up.
 
-Kimi-K2 and Kimi-K3 name nothing early, and `RECOGNISES_A_CALL_IN_PROGRESS`
-says so. A K2 entry is invisible until `<|tool_call_end|>` and a K3 call until
-`<|close|>call`, so for them the name arrives with the arguments. The flag is
-measured rather than trusted: the property suite drives each format's own call
-with an 800-byte payload and checks that the name lands before the arguments
-exactly when the flag says it will.
+Kimi-K2 and Kimi-K3 do not name a call whose *arguments are still arriving*: a
+K2 entry is invisible until `<|tool_call_end|>` and a K3 call until
+`<|close|>call`, so on a large payload the name arrives with the arguments.
+A call short enough to fit inside `Region.head` is named early by all six,
+because the whole call is in the window and `parse_region` sees a finished one.
+Nothing declares which formats are which -- the property suite measures both
+facts independently (can the parse read a call in progress; did the name land
+before the arguments on an 800-byte payload) and asserts they agree. A class
+attribute used to stand in for this, outlived its only reader when the
+give-up probe below was reverted, and took these two paragraphs false with it.
 
 Arguments still wait for the region to close. SGLang streams those too, as
 JSON fragments; a response cut short then leaves the client holding an

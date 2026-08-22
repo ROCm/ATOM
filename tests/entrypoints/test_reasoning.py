@@ -280,10 +280,18 @@ class TestTheChannelEndsAtWhicheverCloserComesFirst:
         assert content == "the answer"
 
     @pytest.mark.parametrize("marker_attr", ["THINK_END", "RESPONSE"])
-    def test_a_quoted_token_is_text_when_no_channel_was_opened(self, marker_attr):
+    def test_a_quoted_token_does_not_open_a_channel_that_was_closed(self, marker_attr):
+        """It stays content. Whether the *token* survives is a separate
+        question -- `<|open|>response<|sep|>` is framing this format wraps
+        every answer in, so it is removed on both delivery paths, while
+        `<|close|>think<|sep|>` is a channel delimiter and only means anything
+        once a channel is open."""
         marker = getattr(self, marker_attr)
         text = f"The K3 format uses {marker} to open the answer."
-        assert self.K3_CLOSED.split(text) == (None, text)
+        reasoning, content = self.K3_CLOSED.split(text)
+        assert reasoning is None
+        assert content == self.K3_CLOSED.dialect.strip_framing(text)
+        assert "The K3 format uses" in content and "to open the answer." in content
 
     @pytest.mark.parametrize("chunk", [1, 3, 999])
     def test_the_streaming_filter_closes_on_the_same_markers(self, chunk):
@@ -430,7 +438,11 @@ class TestTheReasoningStageAgreesWithItselfWithoutHelp:
         markers and nothing else."""
         dialect, _ = resolve_dialect(source)
         channel = ReasoningChannel(dialect=dialect, starts_open=starts_open)
-        declared = (dialect.output_open_marker, *dialect.end_markers)
+        declared = (
+            dialect.output_open_marker,
+            *dialect.end_markers,
+            *dialect.content_framing,
+        )
         for text in self.SHAPES:
             reasoning, content = channel.split(text)
             rebuilt = (reasoning or "") + content
@@ -442,3 +454,26 @@ class TestTheReasoningStageAgreesWithItselfWithoutHelp:
                 f"{text!r} -> {rebuilt!r}: bytes went missing that no marker "
                 "accounts for"
             )
+
+
+class TestTheDialectsAsRegistered:
+    """The properties above are checked on dialects; these check the registry.
+
+    A property test that builds its own dialect proves the mechanism and
+    nothing about what any model is actually served with. The channel format's
+    answer framing was declared in exactly one place, and blanking it there
+    left every mechanism test green while a Kimi-K3 client got
+    `<|open|>response<|sep|>` in its content.
+    """
+
+    def test_the_channel_dialect_declares_the_framing_it_wraps_answers_in(self):
+        dialect, _ = resolve_dialect("<|open|>think<|sep|>")
+        framed = "<|open|>response<|sep|>Hi there.<|close|>response<|sep|>"
+        assert ReasoningChannel(dialect=dialect).split(framed) == (None, "Hi there.")
+
+    def test_and_the_inline_think_dialect_declares_none(self):
+        dialect, _ = resolve_dialect("<think></think>")
+        assert dialect.content_framing == (), (
+            "a dialect that wraps nothing must declare nothing, or it deletes "
+            "literals out of ordinary answers"
+        )

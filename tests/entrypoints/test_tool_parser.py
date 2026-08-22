@@ -7,6 +7,9 @@ from typing import ClassVar
 
 import pytest
 
+from atom.entrypoints.openai.tool_parser.schema import ParamTypes
+from atom.entrypoints.openai.tool_parser.stream import _resolved_tools
+
 from atom.entrypoints.openai.tool_parser import (
     ToolCall,
     ToolCallStreamParser,
@@ -925,3 +928,90 @@ class TestMiniMaxCutsAtItsOwnCall:
         _, calls = parse_tool_calls(text, self.TOOLS, MiniMaxParser)
         _, streamed = self._stream(text, size)
         assert bool(calls) == bool(streamed) is True
+
+
+class TestACallStillArrivingWhenTheStreamEnds:
+    """A region whose last tag is half-written, and no more bytes are coming.
+
+    Every format has to answer this the same way, and MiniMax was the one that
+    did not: it required a *complete* tag, so a call cut off inside its first
+    parameter name was delivered as text.
+    """
+
+    TOOLS = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                },
+            },
+        }
+    ]
+    NS = "]<]minimax[>["
+
+    @pytest.mark.parametrize("tail", ["<ci", "<city>Par", ""])
+    def test_a_half_written_declared_tag_is_a_call_at_end_of_region(self, tail):
+        region = f'{self.NS}<invoke name="get_weather">\n{self.NS}{tail}'
+        assert MiniMaxParser.parse_region(region, self.TOOLS, at_end=True).calls, (
+            f"a call cut off at {tail!r} was read as prose; the client is told "
+            "the model answered when it was calling a tool"
+        )
+
+    def test_but_not_while_more_bytes_may_still_arrive(self):
+        region = f'{self.NS}<invoke name="get_weather">\n{self.NS}<ci'
+        assert not MiniMaxParser.parse_region(
+            region, self.TOOLS, at_end=False
+        ).calls, "announced a call from a prefix that has not finished arriving"
+
+
+class TestTheAnswerAheadOfACallThatWasCutOff:
+    """DSML anchored a truncated `<invoke>` at the region's start.
+
+    Everything between the opening marker and the opener was therefore counted
+    as this call's markup and deleted -- the one XML format of the four that
+    did it, on both delivery paths.
+    """
+
+    TOOLS = TestACallStillArrivingWhenTheStreamEnds.TOOLS
+
+    def test_prose_before_a_truncated_invoke_is_not_counted_as_markup(self):
+        prose = "Let me check the weather for you right now. " * 12
+        region = (
+            "<｜DSML｜tool_calls>"
+            + prose
+            + '<｜DSML｜invoke name="get_weather">\n'
+            + '<｜DSML｜parameter name="city">Paris'
+        )
+        parsed = DsmlParser.parse_region(region, self.TOOLS, at_end=True)
+        assert parsed.calls, "the truncated call itself was lost"
+        assert parsed.begins >= len(prose), (
+            f"markup starts at {parsed.begins} but the answer runs to "
+            f"{len(prose)}: {len(prose) - parsed.begins} characters of it are "
+            "about to be deleted"
+        )
+
+
+class TestTheRequestsToolsAreResolvedOnce:
+    """Built once per request rather than once per chunk (`_resolved_tools`).
+
+    The substitution has to be invisible: the reader asks `not self.tools` in
+    the announcement path, so a request whose tools yield nothing usable must
+    still look the way the list looked, or a name is announced for a request
+    that declared no names.
+    """
+
+    def test_a_real_catalogue_is_carried_in_its_built_form(self):
+        resolved = _resolved_tools(TestACallStillArrivingWhenTheStreamEnds.TOOLS)
+        assert isinstance(resolved, ParamTypes)
+        assert set(resolved) == {"get_weather"}
+
+    @pytest.mark.parametrize("tools", [None, [], [{"junk": 1}], ["not a dict"]])
+    def test_and_anything_that_yields_no_name_keeps_its_own_truthiness(self, tools):
+        assert bool(_resolved_tools(tools)) == bool(tools)
+
+    def test_resolving_twice_is_the_same_answer(self):
+        once = _resolved_tools(TestACallStillArrivingWhenTheStreamEnds.TOOLS)
+        assert _resolved_tools(once) is once

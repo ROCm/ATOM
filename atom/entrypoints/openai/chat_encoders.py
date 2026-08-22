@@ -70,14 +70,20 @@ def _load_encoder_from_dir(model_path: str) -> MessageEncoderAdapter | None:
         logger.warning(f"Failed to load encoder from {enc_path}: {e}")
         return None
 
+    logger.info(f"Loaded message encoder from {enc_path}")
     # also valid is "chat" (non-thinking short-form). May need to add as an option.
     # Revisit when a second model ships an encode_*.py — the default may need to be per-model.
-    def encode(messages, **kwargs):
-        kwargs.setdefault("thinking_mode", "thinking")
-        return raw(messages, **kwargs)
-
-    logger.info(f"Loaded message encoder from {enc_path}")
-    return build_message_encoder_adapter(module_name, encode, enc_path, raw)
+    #
+    # Handed to the adapter rather than applied in a wrapper here. A wrapper
+    # runs *after* the adapter has filtered kwargs against the encoder's
+    # signature, so the one kwarg it adds is the one the filter cannot remove:
+    # an encoder that does not take `thinking_mode` raised `TypeError` on
+    # every real request while the startup probe -- which now counts TypeError
+    # as a refusal -- reported only "tool calls will be delivered as plain
+    # text". Silent at startup, 500 on every chat.
+    return build_message_encoder_adapter(
+        module_name, raw, enc_path, defaults={"thinking_mode": "thinking"}
+    )
 
 
 def load_custom_message_encoder(model_path: str) -> MessageEncoderAdapter | None:

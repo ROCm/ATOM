@@ -481,3 +481,50 @@ class TestAStreamClosedBeforeItStartedIsStillStopped:
         service.forget_stream("r3")
         assert "r3" not in service._stream_seqs and "r3" not in service._abandoned
         service.close()
+
+    def test_closing_between_add_request_and_publication_aborts(self):
+        """The third window, and the one publication order decides.
+
+        Publishing the seqs into `_stream_seqs` *before* `add_request` left a
+        gap where a close popped the list and aborted sequences the engine had
+        not been told about -- the abort raised into a swallowed `except`, the
+        worker then added them, and they decoded to `max_tokens` into a queue
+        nobody would read, holding their KV blocks for the process lifetime.
+        """
+        import threading
+
+        from atom.entrypoints.atomesh.atom_standalone_service import (
+            EngineStreamRequest,
+        )
+
+        service = self._service()
+        added = threading.Event()
+        may_publish = threading.Event()
+        original = service.engine.add_request
+
+        def slow_add(seqs):
+            original(seqs)
+            added.set()
+            may_publish.wait(timeout=5)
+
+        service.engine.add_request = slow_add
+        request = EngineStreamRequest(
+            request_id="r5",
+            prompt="hi",
+            sampling_params=None,
+            effective_n=1,
+            stream_queue=queue.Queue(),
+        )
+        worker = threading.Thread(
+            target=service._submit_stream_request, args=(request,)
+        )
+        worker.start()
+        assert added.wait(timeout=5), "add_request never ran"
+        service.abort_stream("r5")  # lands after the engine has them
+        may_publish.set()
+        worker.join(timeout=5)
+        assert service.engine.aborted == [
+            s.id for s in service.engine.added
+        ], "sequences the engine was given were never aborted"
+        assert "r5" not in service._stream_seqs
+        service.close()

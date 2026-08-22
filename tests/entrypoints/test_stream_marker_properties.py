@@ -48,10 +48,10 @@ import pytest
 from atom.entrypoints.openai.reasoning import ReasoningFilter, separate_reasoning
 from atom.entrypoints.openai.reasoning_dialects import DIALECTS
 from atom.entrypoints.openai.serving_anthropic import completes_a_tool_call
+from atom.entrypoints.openai.tool_parser import RegionParse, ToolCall, parse_tool_calls
 from atom.entrypoints.openai.tool_parser.kimi_tool_parser import KimiParser
 from atom.entrypoints.openai.tool_parser.qwen3_tool_parser import QwenXmlParser
 from atom.entrypoints.openai.tool_parser.registry import _DETECT_ORDER
-from atom.entrypoints.openai.tool_parser import RegionParse, ToolCall, parse_tool_calls
 from atom.entrypoints.openai.tool_parser.stream import (
     _PEEK_WINDOW,
     ToolCallStreamParser,
@@ -1055,16 +1055,29 @@ def early_name(parser, region: str, tools) -> str | None:
     return calls[0].function["name"] if calls else None
 
 
-# A format that cannot see a call still arriving cannot name one before its
-# arguments: a Kimi entry is invisible until `<|tool_call_end|>` and a K3 call
-# until `<|close|>call`. Derived from the declaration the engine itself reads,
-# so the table and the behaviour cannot drift -- and pinned by
-# `test_the_declaration_matches_the_timing`, which measures rather than
-# re-derives.
+def sees_a_call_in_progress(parser) -> bool:
+    """Can this format's `parse_region` read a call whose arguments are still
+    arriving?
+
+    Measured, not declared. There used to be a class attribute saying this;
+    it outlived its only reader and the docs built on it went false without
+    anything failing. The property is directly observable, so observe it:
+    take the format's own call, make its argument long, and cut in the middle
+    of the value.
+    """
+    long_value = "x" * 4000
+    call = REAL_CALLS[parser.NAME].replace("Paris", long_value)
+    partial = call[: call.index(long_value) + 2000]
+    return bool(parser.parse_region(partial, DECLARED_TOOLS, at_end=False).calls)
+
+
+# The two token formats: a Kimi entry is invisible until `<|tool_call_end|>`
+# and a K3 call until `<|close|>call`, so neither can name a call whose
+# arguments are still arriving.
 NO_EARLY_NAME = {
     p.NAME: "a call of this format is invisible until its own end token"
     for p in ALL_PARSERS
-    if not p.RECOGNISES_A_CALL_IN_PROGRESS
+    if not sees_a_call_in_progress(p)
 }
 
 
@@ -1111,24 +1124,41 @@ class TestTheNameArrivesBeforeTheArguments:
         )
 
     @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
-    def test_the_declaration_matches_the_timing(self, parser):
-        """`RECOGNISES_A_CALL_IN_PROGRESS` is read by the engine for two
-        different decisions -- whether a name can go out early, and whether a
-        region that is producing nothing can be given up on. Declaring it
-        wrong the second way delivers a real call as prose, so it is measured
-        here rather than trusted: drive a call with an 800-byte payload and
-        see whether the name actually arrives before the arguments.
+    def test_reading_a_call_in_progress_is_what_moves_the_name(self, parser):
+        """Two independently observable things, asserted to agree.
+
+        One is whether `parse_region` can read a call whose argument is still
+        arriving; the other is whether, on a real stream of a call with an
+        800-byte payload, the name lands before the arguments. Neither is
+        derived from the other and neither is a declaration -- the attribute
+        that used to stand in for both outlived its reader, and the docs built
+        on it said Kimi-K3 names nothing early when it does so for any call
+        that fits inside the peek window.
+
+        800 bytes because that is the shape announcing early exists for. A
+        call short enough to fit in `Region.head` is named early by every
+        format, which is a different claim.
         """
         total, at, args_at, _ = self._drive(
             parser, self._big_call(parser), DECLARED_TOOLS
         )
         assert at is not None and args_at is not None
         early = at < args_at
-        assert early is parser.RECOGNISES_A_CALL_IN_PROGRESS, (
-            f"{parser.NAME} declares RECOGNISES_A_CALL_IN_PROGRESS="
-            f"{parser.RECOGNISES_A_CALL_IN_PROGRESS} but the name landed on "
-            f"chunk {at} of {total} and the arguments on {args_at}"
+        assert early is sees_a_call_in_progress(parser), (
+            f"{parser.NAME}: parse_region {'can' if not early else 'cannot'} read "
+            f"a call in progress, but the name landed on chunk {at} of {total} "
+            f"and the arguments on {args_at}"
         )
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_a_call_that_fits_the_window_is_named_early_by_every_format(self, parser):
+        """Including the two that cannot read one in progress -- for a short
+        call the whole thing is inside `Region.head`, so `parse_region` sees a
+        finished call there. The docs claimed otherwise for K3."""
+        text = "Sure. " + REAL_CALLS[parser.NAME]
+        assert len(REAL_CALLS[parser.NAME]) < _PEEK_WINDOW, "premise"
+        _, at, args_at, _ = self._drive(parser, text, DECLARED_TOOLS)
+        assert at is not None and args_at is not None and at <= args_at
 
     @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
     def test_a_declared_tool_is_named_early(self, parser):
@@ -1810,18 +1840,17 @@ class TestARegionIsAccountedForByteByByte:
             assert streamed == content, f"{parser.NAME} at chunk {size}: {streamed!r}"
 
 
-class TestTheDeclarationAboutACallInProgressIsMeasured:
-    """`RECOGNISES_A_CALL_IN_PROGRESS` says a format's `parse_region` can see a
-    call that has not finished arriving. The engine reads it to decide whether
-    a name may go out early.
+class TestNoSizeAtWhichACallStopsBeingOne:
+    """A "give up on a region producing nothing after N bytes" probe was added
+    here and reverted.
 
-    It was also read for a second decision -- whether a region producing
-    nothing could be given up on and released as prose -- and that is why the
-    rows below about long calls exist. The give-up is gone: it rests on
-    acceptance being monotone in how many bytes have arrived, and that is
-    false for three of the six formats, so real calls over the probe size were
-    delivered as raw markup with `finish_reason: stop` while `stream=false`
-    returned the call. These rows are what catches it coming back.
+    It rests on acceptance being monotone in how many bytes have arrived, and
+    that is false for three of the six formats -- MiniMax gates its
+    in-progress test on the first tag being in the declared schema, and DSML's
+    wrapper-less and direct-JSON branches match no prefix at all -- so real
+    calls over the probe size were delivered as raw markup with
+    `finish_reason: stop` while `stream=false` returned the call. It was also
+    quadratic. These rows are what catches it coming back.
     """
 
     @staticmethod
@@ -1836,15 +1865,6 @@ class TestTheDeclarationAboutACallInProgressIsMeasured:
         long_value = "x" * 4000
         call = REAL_CALLS[parser.NAME].replace("Paris", long_value)
         return call[: call.index(long_value) + 2000]
-
-    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
-    def test_the_declaration_matches_the_parse(self, parser):
-        partial = self._cut_inside_an_argument(parser)
-        seen = parser.parse_region(partial, DECLARED_TOOLS, at_end=False).calls
-        assert bool(seen) is parser.RECOGNISES_A_CALL_IN_PROGRESS, (
-            f"{parser.NAME} declares {parser.RECOGNISES_A_CALL_IN_PROGRESS} but a "
-            f"call cut off mid-argument parsed to {len(seen)} call(s)"
-        )
 
     @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
     def test_no_size_at_which_a_call_stops_being_one(self, parser):

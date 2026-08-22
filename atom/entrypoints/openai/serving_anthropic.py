@@ -175,9 +175,17 @@ def build_anthropic_response(
     input_tokens: int = 0,
     output_tokens: int = 0,
     cache_read_input_tokens: int = 0,
-    stop_reason: str = "end_turn",
+    *,
+    stop_reason: str,
 ) -> dict:
     """Build Anthropic Messages API response.
+
+    ``stop_reason`` has no default, and that is the point: this function used
+    to carry one and then overwrite it whenever `tool_calls` was non-empty, so
+    the answer `anthropic_stop_reason_with_calls` had already given the caller
+    was discarded and a response cut off at `max_tokens` mid-call came back as
+    an ordinary `tool_use`. Two places deciding one thing. Now there is one,
+    and a caller cannot forget to ask it.
 
     Args:
         tool_calls: List of ToolCall objects (from tool_parser.parse_tool_calls).
@@ -214,7 +222,12 @@ def build_anthropic_response(
         )
 
     if tool_calls:
-        stop_reason = "tool_use"
+        # `stop_reason` is the caller's, not this function's. It used to be
+        # overwritten here, which threw away the answer
+        # `anthropic_stop_reason_with_calls` had already given the call site --
+        # so a response cut off at `max_tokens` mid-call came back as an
+        # ordinary `tool_use` with silently truncated arguments, and disagreed
+        # with the streaming path for the same generation.
         for tc in tool_calls:
             # ToolCall has .id, .function["name"], .function["arguments"]
             func = tc.function if isinstance(tc.function, dict) else {}
@@ -509,6 +522,20 @@ def stream_message_delta(stop_reason: str = "end_turn", output_tokens: int = 0) 
             "delta": {"stop_reason": stop_reason, "stop_sequence": None},
             "usage": {"output_tokens": output_tokens},
         },
+    )
+
+
+def stream_error(message: str, error_type: str = "api_error") -> str:
+    """Anthropic's `error` event, for a stream that cannot finish.
+
+    Without one, an exception raised inside the SSE generator ended the
+    response mid-frame: an open content block with no `content_block_stop`, no
+    `message_delta`, no `message_stop` and nothing saying why. An Anthropic
+    SDK client blocks on the unterminated block until its own read timeout
+    rather than surfacing the failure.
+    """
+    return format_sse(
+        "error", {"type": "error", "error": {"type": error_type, "message": message}}
     )
 
 

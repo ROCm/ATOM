@@ -53,6 +53,10 @@ class MessageEncoderAdapter:
     # What this encoder's signature will accept, or ``None`` when it takes
     # `**kwargs` and so accepts anything. See `__call__`.
     accepts: frozenset[str] | None = field(default=None, compare=False)
+    # Values this model's loader wants set when the caller did not. Applied
+    # after the filter and subject to it, so a default the encoder cannot take
+    # is dropped like any other kwarg rather than raising.
+    defaults: dict[str, Any] = field(default_factory=dict, compare=False)
 
     def __call__(self, messages: list[dict], **kwargs: Any) -> str:
         """Render, passing on only the kwargs this encoder can take.
@@ -71,6 +75,8 @@ class MessageEncoderAdapter:
         cannot take is worth seeing when a template control appears not to
         work.
         """
+        for name, value in self.defaults.items():
+            kwargs.setdefault(name, value)
         if self.accepts is not None:
             unread = [name for name in kwargs if name not in self.accepts]
             for name in unread:
@@ -113,6 +119,7 @@ def build_message_encoder_adapter(
     encoder: MessageEncoder,
     source_path: str = "",
     accepts_from: MessageEncoder | None = None,
+    defaults: dict[str, Any] | None = None,
 ) -> MessageEncoderAdapter:
     """Build an adapter registered for ``module_name`` or an identity adapter.
 
@@ -131,4 +138,5 @@ def build_message_encoder_adapter(
         supports_tools=supports_tools,
         source_path=source_path,
         accepts=_accepted_kwargs(accepts_from or encoder),
+        defaults=dict(defaults or {}),
     )

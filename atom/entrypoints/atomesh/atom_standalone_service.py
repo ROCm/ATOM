@@ -24,6 +24,7 @@ from atom.entrypoints.openai.chat_encoders import (
     chat_template_source,
     load_custom_message_encoder,
     render_probe_prompt,
+    resolve_reasoning_toggle,
 )
 from atom.entrypoints.openai.protocol import (
     CHAT_COMPLETION_CHUNK_OBJECT,
@@ -44,10 +45,10 @@ from atom.entrypoints.openai.reasoning import (
 from atom.entrypoints.openai.reasoning_dialects import resolve_dialect
 from atom.entrypoints.openai.serving_chat import (
     _normalize_finish_reason,
-    finish_reason_with_calls,
     build_chat_response,
     build_chat_response_multi,
     create_chat_chunk,
+    finish_reason_with_calls,
 )
 from atom.entrypoints.openai.serving_completion import (
     build_completion_response,
@@ -252,8 +253,24 @@ class AtomEngineService:
             if request.request_id in self._abandoned:
                 self._abandoned.discard(request.request_id)
                 return
-            self._stream_seqs[request.request_id] = list(seqs)
         self.engine.core_mgr.add_request(seqs)
+        # Published *after* the engine has them, and the close re-checked
+        # once more. Publishing first left a window where `abort_stream`
+        # popped the list and aborted sequences the engine had not been told
+        # about -- the abort raised into a swallowed `except`, the worker then
+        # added them, and they decoded to `max_tokens` into a queue nobody
+        # would read. Which side of `add_request` the publish sits on decides
+        # whether a close in that window aborts or leaks; this way one of the
+        # two branches below always fires.
+        with self._stream_seqs_lock:
+            if request.request_id in self._abandoned:
+                self._abandoned.discard(request.request_id)
+                abandoned = seqs
+            else:
+                self._stream_seqs[request.request_id] = list(seqs)
+                abandoned = ()
+        for seq in abandoned:
+            self._abort_seq(seq)
 
     def _take_abandoned(self, request_id: str) -> bool:
         with self._stream_seqs_lock:
@@ -288,16 +305,19 @@ class AtomEngineService:
                 self._abandoned.add(request_id)
                 return
         for seq in seqs:
-            seq_id = getattr(seq, "id", None)
-            if seq_id is None:
-                continue
-            try:
-                self.engine.core_mgr.abort_request(seq_id)
-            except (AttributeError, KeyError, RuntimeError, ValueError) as exc:
-                logger.debug("abort_request(%s): %s", seq_id, exc)
-            requests = getattr(self.engine.io_processor, "requests", None)
-            if requests is not None:
-                requests.pop(seq_id, None)
+            self._abort_seq(seq)
+
+    def _abort_seq(self, seq: Any) -> None:
+        seq_id = getattr(seq, "id", None)
+        if seq_id is None:
+            return
+        try:
+            self.engine.core_mgr.abort_request(seq_id)
+        except (AttributeError, KeyError, RuntimeError, ValueError) as exc:
+            logger.debug("abort_request(%s): %s", seq_id, exc)
+        requests = getattr(self.engine.io_processor, "requests", None)
+        if requests is not None:
+            requests.pop(seq_id, None)
 
     def _preprocess_single_stream_request(self, request: EngineStreamRequest) -> Any:
         state = StreamRequestState(
@@ -1113,6 +1133,12 @@ class AtomStandaloneService:
         self.model_starts_in_reasoning = template_opens_reasoning_implicitly(
             _template_source
         )
+        # The kwarg that turns this model's reasoning off, so
+        # `_thinking_switched_off` can tell a switch the template reads from
+        # one it ignores.
+        self.reasoning_toggle = resolve_reasoning_toggle(
+            tokenizer, self.custom_message_encoder
+        )
         self.tool_parser_cls = resolve_tool_call_parser(
             tool_call_parser, tokenizer, self.custom_message_encoder, model=model_name
         )
@@ -1123,7 +1149,9 @@ class AtomStandaloneService:
         self._completion_streams: dict[str, CompletionStreamState] = {}
         self._streams_lock = threading.Lock()
 
-    def _reasoning_channel(self, prompt: str) -> ReasoningChannel:
+    def _reasoning_channel(
+        self, prompt: str, template_kwargs: dict[str, Any] | None = None
+    ) -> ReasoningChannel:
         """How to read this response's reasoning channel.
 
         One function, read by both delivery modes, so they cannot be given
@@ -1131,16 +1159,38 @@ class AtomStandaloneService:
         tried each registered dialect in turn and the streaming filter closed
         on the union of all their end markers.
 
-        This service threads neither `thinking` nor `reasoning_effort` into
-        the template, so there is no request-level opt-out to honour here yet.
-        When there is, it belongs in this function, as it does on the OpenAI
-        server.
+        `model_starts_in_reasoning` describes the template with reasoning
+        *on*, so it only holds while reasoning is on. This service takes no
+        `thinking` field, but it does merge `--default-chat-template-kwargs`
+        and the request's own `chat_template_kwargs` into the render -- so an
+        operator or a client can set the template's switch directly, and then
+        the rendered prompt does not open the channel. OR-ing the model-level
+        fact in regardless made a DeepSeek-R1-shaped model return its whole
+        answer as `reasoning_content` with `content` empty, on both delivery
+        modes. The OpenAI server gates this the same way; the docstring that
+        used to sit here said no request could reach it, and that was wrong.
         """
         return ReasoningChannel(
             dialect=self.reasoning_dialect,
             starts_open=prompt_starts_in_reasoning(prompt)
-            or self.model_starts_in_reasoning,
+            or (
+                self.model_starts_in_reasoning
+                and not self._thinking_switched_off(template_kwargs)
+            ),
         )
+
+    def _thinking_switched_off(self, template_kwargs: dict[str, Any] | None) -> bool:
+        """Did the render actually carry this template's off-switch?
+
+        Only the resolved toggle's own name and value count. A kwarg the
+        template does not read changes nothing about what the model does, and
+        believing it would stop the channel being separated while the model
+        went on producing it.
+        """
+        if not template_kwargs or self.reasoning_toggle is None:
+            return False
+        name, off_value, _on = self.reasoning_toggle
+        return name in template_kwargs and template_kwargs[name] == off_value
 
     def chat_completions(self, request_data: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -1188,7 +1238,7 @@ class AtomStandaloneService:
                     request_id,
                     self.model_name,
                     outputs,
-                    reasoning=self._reasoning_channel(prompt),
+                    reasoning=self._reasoning_channel(prompt, template_kwargs),
                     tools=request_data.get("tools"),
                     tool_choice=request_data.get("tool_choice"),
                     tool_parser_cls=self.tool_parser_cls,
@@ -1209,7 +1259,7 @@ class AtomStandaloneService:
                     self.model_name,
                     final_output["text"],
                     final_output,
-                    reasoning=self._reasoning_channel(prompt),
+                    reasoning=self._reasoning_channel(prompt, template_kwargs),
                     tools=request_data.get("tools"),
                     tool_choice=request_data.get("tool_choice"),
                     tool_parser_cls=self.tool_parser_cls,
@@ -1387,7 +1437,7 @@ class AtomStandaloneService:
                 stream_queue=stream_queue,
                 n=effective_n,
                 tool_parser_cls=self.tool_parser_cls,
-                reasoning=self._reasoning_channel(prompt),
+                reasoning=self._reasoning_channel(prompt, template_kwargs),
                 tools=request_data.get("tools"),
                 tool_choice=request_data.get("tool_choice"),
             )

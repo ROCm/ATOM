@@ -207,18 +207,6 @@ class ToolCallParser(ABC):
     CALL_OPENERS: ClassVar[tuple[str, ...]] = ()
     CALL_CLOSERS: ClassVar[tuple[str, ...]] = ()
     CALL_FILLERS: ClassVar[tuple[str, ...]] = ()
-    # Can ``parse_region`` recognise a call that has not finished arriving?
-    # The four XML-ish formats can -- that is what their truncated-call tests
-    # are for -- and the two token formats cannot: a Kimi entry is invisible
-    # until its `<|tool_call_end|>` and a K3 call until its `<|close|>call`.
-    #
-    # The engine reads this twice, and both readings need it exact. It is why
-    # a name can be announced from a region still arriving, and it is the
-    # licence to give up on a region that is producing nothing -- which is
-    # what stops an answer *about* tool calls from being withheld to end of
-    # stream. Declaring it True for a format that cannot would deliver a real
-    # call as prose; the property tests hold each format's own corpus to it.
-    RECOGNISES_A_CALL_IN_PROGRESS: ClassVar[bool] = False
 
     @classmethod
     def opens_region(cls, marker: str) -> bool:

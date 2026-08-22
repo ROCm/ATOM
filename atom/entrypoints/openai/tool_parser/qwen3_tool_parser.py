@@ -129,7 +129,6 @@ def _parse_function(
 
 class QwenXmlParser(ToolCallParser):
     NAME: ClassVar[str] = "qwen"
-    RECOGNISES_A_CALL_IN_PROGRESS: ClassVar[bool] = True
     START_MARKERS: ClassVar[tuple[str, ...]] = ("<tool_call>", QWEN_TOOL_PREFIX)
     # `</tool_call>` closes the wrapper the calls sit in, so it is markup too
     # -- and so is the newline between it and `</function>`. Not a

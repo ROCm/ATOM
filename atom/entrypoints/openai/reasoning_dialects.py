@@ -83,6 +83,13 @@ class ReasoningDialect:
     # a template states what it taught the model, while an output only
     # exhibits whatever it happens to contain.
     template_markers: tuple[str, ...] = ()
+    # Literals this format wraps every answer in, which are neither the
+    # channel's own delimiters nor any tool format's. Removed from both halves
+    # of the split and dropped by the streaming filter, so the two agree
+    # without either of them depending on which tool-call parser happened to
+    # be resolved -- the tool parser removes the same tokens, and a K3
+    # deployment whose template refused the tools probe has none.
+    content_framing: tuple[str, ...] = ()
     # Every marker that ends the reasoning channel, `think_end_marker`
     # included. A channel format can leave the think channel by *opening*
     # another one, and the streaming filter knew only the explicit close: a
@@ -95,6 +102,11 @@ class ReasoningDialect:
     @property
     def end_markers(self) -> tuple[str, ...]:
         return (self.think_end_marker, *self.extra_end_markers)
+
+    def strip_framing(self, text: str) -> str:
+        for marker in self.content_framing:
+            text = text.replace(marker, "")
+        return text
 
     def taught_by(self, template_source: str) -> bool:
         """Does this template teach the model this dialect?"""
@@ -228,17 +240,27 @@ def _split_think_tag(text: str, starts_thinking: bool = False) -> SplitResult | 
 # so a specific channel marker is tried before the generic <think> tag.
 # separate_reasoning() returns the first dialect whose split() matches. A dialect
 # is identified by its markers/split behavior, not a label.
+_CHANNEL_CONTENT_FRAMING = (
+    CHANNEL_RESPONSE_START,
+    CHANNEL_RESPONSE_END,
+    CHANNEL_MESSAGE_END,
+    CHANNEL_END_OF_MSG,
+)
+
+_CHANNEL_DIALECT = ReasoningDialect(
+    prompt_open_marker=CHANNEL_THINK_START,
+    output_open_marker=None,  # template-injected; not emitted in output
+    think_end_marker=CHANNEL_THINK_END,
+    extra_end_markers=(CHANNEL_RESPONSE_START,),
+    split=_split_channel,
+    template_efforts=frozenset({"low", "high", "max"}),  # Kimi-K3
+    template_markers=(CHANNEL_THINK_START, CHANNEL_THINK_END),
+    content_framing=_CHANNEL_CONTENT_FRAMING,
+)
+
 DIALECTS: tuple[ReasoningDialect, ...] = (
     # Structured channel format — Kimi-K3 token values (see CHANNEL_* above)
-    ReasoningDialect(
-        prompt_open_marker=CHANNEL_THINK_START,
-        output_open_marker=None,  # template-injected; not emitted in output
-        think_end_marker=CHANNEL_THINK_END,
-        extra_end_markers=(CHANNEL_RESPONSE_START,),
-        split=_split_channel,
-        template_efforts=frozenset({"low", "high", "max"}),  # Kimi-K3
-        template_markers=(CHANNEL_THINK_START, CHANNEL_THINK_END),
-    ),
+    _CHANNEL_DIALECT,
     # Generic <think>...</think> (K2/DeepSeek/Qwen3/MiniMax/...)
     ReasoningDialect(
         prompt_open_marker=THINK_OPEN_MARKER,

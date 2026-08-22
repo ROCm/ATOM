@@ -13,12 +13,11 @@ this module contains no per-model conditions. Add a model there, not here.
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
-# Called directly and not through a local wrapper: the tool-call path asks the
-# same question, and a rename in between is how the two sides drifted apart in
-# the first place. It also carries the first-character reject this path had
-# gone without, which it pays for once per token on every stream -- including
-# models whose reasoning markers never appear.
-from .marker_scanner import held_suffix_len
+# The same reader the tool-call side uses, not a second one: this module's
+# whole thesis is that asking "how much can be released without splitting a
+# marker" in more than one place is how the answers drift apart, and it used
+# to answer it itself, twice, with a different tie-break.
+from .marker_scanner import MarkerScanner
 from .reasoning_dialects import DIALECTS, FALLBACK_DIALECT, ReasoningDialect
 
 # Markers a rendered prompt ends with when the template already opened reasoning
@@ -98,16 +97,6 @@ def prompt_tokens_start_in_reasoning(
     return prompt_starts_in_reasoning(decode(token_ids[-tail:]))
 
 
-def _earliest_marker(buf: str, markers) -> tuple[int, str | None]:
-    """Return (index, marker) of the earliest-occurring marker in ``buf``."""
-    best_i, best_m = -1, None
-    for m in markers:
-        i = buf.find(m)
-        if i != -1 and (best_i == -1 or i < best_i):
-            best_i, best_m = i, m
-    return best_i, best_m
-
-
 def separate_reasoning(
     text: str,
     starts_thinking: bool = False,
@@ -136,9 +125,19 @@ def separate_reasoning(
         Tuple of (reasoning_content, content). reasoning_content is None if no
         thinking block was found.
     """
-    result = (dialect or FALLBACK_DIALECT).split(text, starts_thinking)
+    speaking = dialect or FALLBACK_DIALECT
+    result = speaking.split(text, starts_thinking)
     if result is not None:
-        return result
+        # Framing removed here and not inside the dialect's split, because the
+        # two fallbacks below are splits too and they were missing it -- so a
+        # channel-format answer with no closer, or one on a stream that never
+        # opened the channel, kept its tokens on this path while the streaming
+        # filter dropped them. One place, applied to whatever comes back.
+        reasoning, content = result
+        return (
+            speaking.strip_framing(reasoning or "") or None,
+            speaking.strip_framing(content),
+        )
     if starts_thinking:
         # The prompt opened the channel and the model never closed it, which
         # is what a reasoning model stopped at `max_tokens` looks like. It
@@ -150,146 +149,107 @@ def separate_reasoning(
         # put `reasoning_content: ""` in the non-streaming body and nothing in
         # the streamed one. Every other return in this function spells absence
         # as `None`.
-        return (text or None, "")
+        return (speaking.strip_framing(text) or None, "")
     # No reasoning markers — return content as-is (tool calls parsed separately).
-    return (None, text)
+    return (None, speaking.strip_framing(text))
 
 
-@dataclass
 class ReasoningFilter:
     """Stateful streaming filter that separates reasoning from content.
 
-    Processes tokens one chunk at a time and yields (field, text) tuples where
-    field is either "reasoning_content" or "content". Dialect-agnostic: reasoning
-    openers/terminators come from the registry-derived marker tables.
+    Chunks in, ``(field, text)`` tuples out, where field is
+    ``"reasoning_content"`` or ``"content"``. Three states: before the channel
+    opens, inside it, after it.
 
-    States:
-        0 = before reasoning opens (buffering to detect)
-        1 = inside reasoning (emitting as reasoning_content)
-        2 = after reasoning (emitting as content)
+    ``starts_thinking`` handles templates that inject the opening marker into
+    the prompt itself (Kimi-K3 ends the prompt with its think opener): the
+    output then begins *inside* the channel with no opening tag, so nothing in
+    the text says so and the filter must be told.
 
-    ``starts_thinking`` handles templates that inject the opening reasoning marker
-    into the prompt itself (e.g. Kimi-K3 ends the prompt with its think opener):
-    the output then begins *inside* the reasoning channel with no opening tag, so
-    the filter must start in state 1.
+    ``dialect`` is the one this model speaks, and the same object
+    :func:`separate_reasoning` is given. Go through :class:`ReasoningChannel`
+    rather than passing it by hand; that is what keeps the two paths on one
+    answer.
 
-    ``dialect`` is the one this model speaks, and it is the same object
-    :func:`separate_reasoning` is given. This used to hold no dialect at all --
-    it closed the channel on the *union* of every registered dialect's end
-    markers -- so a `<think>` model quoting a K3 channel token ended its chain
-    of thought there while the non-streaming split ended it at the real
-    `</think>`. Go through :class:`ReasoningChannel` rather than passing this
-    by hand; that is what keeps the two paths on one answer.
+    Every marker question goes to :class:`MarkerScanner`, the same reader the
+    tool-call side uses. It used to have its own: an `_earliest_marker` whose
+    tie-break was the opposite of the scanner's (first-declared rather than
+    longest, so `<think>` would be reported where `<thinking>` was meant), the
+    hold-and-cut arithmetic open-coded twice, and `self.buf += text` on an
+    attribute -- the quadratic append `Region` exists to avoid -- on the
+    reasoning half of every long chain of thought. All three in a module whose
+    first paragraph says asking this question in more than one place is the
+    bug being retired.
     """
 
-    state: int = 0
-    buf: str = ""
-    starts_thinking: bool = False
-    dialect: ReasoningDialect | None = None
-
-    def __post_init__(self):
-        if self.starts_thinking and self.state == 0:
-            self.state = 1
-        speaking = self.dialect or FALLBACK_DIALECT
-        self._end_markers = speaking.end_markers
-        self._open_markers = (
+    def __init__(
+        self,
+        starts_thinking: bool = False,
+        dialect: ReasoningDialect | None = None,
+    ) -> None:
+        self.starts_thinking = starts_thinking
+        self.dialect = dialect
+        speaking = dialect or FALLBACK_DIALECT
+        self._end_markers = frozenset(speaking.end_markers)
+        self._framing = frozenset(speaking.content_framing)
+        self._open_markers = frozenset(
             (speaking.output_open_marker,) if speaking.output_open_marker else ()
         )
+        self.state = 1 if starts_thinking else 0
+        self._scanner = self._scanner_for(self.state)
 
-    def _close_thinking(self, idx: int, marker: str) -> list:
-        """A think-end marker was found at ``idx``: emit everything before it as
-        reasoning, switch to content (state 2), and process anything after."""
-        results = []
-        reasoning = self.buf[:idx]
-        # Byte-for-byte, like the non-streaming split -- and this one could
-        # not have been made to agree anyway: it saw only what happened to be
-        # buffered when the marker arrived, so the same answer kept its
-        # newlines at one chunk size and lost them at another.
-        after = self.buf[idx + len(marker) :]
-        if reasoning:
-            results.append(("reasoning_content", reasoning))
-        self.state = 2
-        self.buf = ""
-        if after:
-            results.extend(self._process_content(after))
-        return results
+    def _scanner_for(self, state: int) -> MarkerScanner | None:
+        """What this state has to watch for. ``None`` when that is nothing,
+        which is the common case for the inline-`<think>` dialect after the
+        channel has closed."""
+        watched = self._framing | (
+            self._end_markers
+            if state == 1
+            else self._open_markers if state == 0 else frozenset()
+        )
+        return MarkerScanner(tuple(sorted(watched))) if watched else None
 
-    def _drain_thinking(self) -> list:
-        """State-1 helper: emit buffered reasoning up to a think-end marker; on
-        match switch to content. Otherwise emit what's safe, holding back a
-        partial trailing marker so it isn't split across chunks."""
-        idx, marker = _earliest_marker(self.buf, self._end_markers)
-        if idx != -1:
-            return self._close_thinking(idx, marker)
-        hold = held_suffix_len(self.buf, self._end_markers)
-        emit = self.buf[: len(self.buf) - hold] if hold else self.buf
-        self.buf = self.buf[len(self.buf) - hold :] if hold else ""
-        return [("reasoning_content", emit)] if emit else []
+    @property
+    def _field(self) -> str:
+        return "reasoning_content" if self.state == 1 else "content"
 
     def process(self, text: str) -> list:
-        """Process a chunk of text and return list of (field, text) tuples."""
-        results = []
-
-        if self.state == 0:
-            self.buf += text
-            # A reasoning opener emitted in the output (e.g. "<think>").
-            oidx, omark = _earliest_marker(self.buf, self._open_markers)
-            if oidx != -1:
-                before = self.buf[:oidx]
-                if before:
-                    results.append(("content", before))
-                self.state = 1
-                self.buf = self.buf[oidx + len(omark) :]
-                results.extend(self._drain_thinking())
-            else:
-                # No opener, so this is the answer: release it, holding back
-                # only a suffix that could still grow into one.
-                #
-                # State 0 no longer honours a `</think>` it never saw opened,
-                # and no longer buffers 100 characters hoping for one. Both
-                # were the same guess -- that the template had injected the
-                # opener -- made at run time about something the prompt
-                # answers: `starts_thinking` is that answer, and a filter in
-                # state 0 has been told the output does *not* begin inside the
-                # reasoning channel. The guess cost an unbounded first byte
-                # (its `"<" not in self.buf` gate could never be satisfied
-                # again once an ordinary answer contained a '<') and it let
-                # pre-`</think>` text reach the tool-call sniffer, which is
-                # how reasoning that merely mentions `<tool_call>` came to be
-                # emitted as a tool call. vLLM's streaming path resolves this
-                # from the token vocabulary and buffers nothing; this is the
-                # same position, reached from the prompt.
-                hold = held_suffix_len(self.buf, self._open_markers)
-                cut = len(self.buf) - hold
-                if cut:
-                    results.append(("content", self.buf[:cut]))
-                    self.buf = self.buf[cut:]
-
-        elif self.state == 1:
-            self.buf += text
-            results.extend(self._drain_thinking())
-
-        else:  # state == 2
-            results.extend(self._process_content(text))
-
-        return results
-
-    def _process_content(self, text: str) -> list:
-        """Process content after thinking. Tool calls are handled by ToolCallStreamParser."""
-        if text:
-            return [("content", text)]
-        return []
+        """Consume one chunk; return what it completed."""
+        out: list = []
+        while True:
+            if self._scanner is None:
+                if text:
+                    out.append((self._field, text))
+                return out
+            scan = self._scanner.feed(text)
+            text = ""
+            if scan.released:
+                out.append((self._field, scan.released))
+            if scan.hit is None:
+                return out
+            if scan.hit in self._framing and not (
+                self.state == 1 and scan.hit in self._end_markers
+            ):
+                # Framing this format wraps every answer in. Removed here and
+                # not only by the tool parser: doing it there alone made the
+                # answer depend on which tool-call format was resolved, so a
+                # K3 deployment whose template refused the tools probe handed
+                # its channel tokens to the client on both delivery paths.
+                text = scan.rest
+                continue
+            # A channel boundary: state 0 -> 1 on the opener, 1 -> 2 on any
+            # end marker. A dialect that opens the channel from the prompt has
+            # no opener to see, so it starts in state 1 and only ever takes
+            # the second of these.
+            self.state = 1 if self.state == 0 else 2
+            self._scanner = self._scanner_for(self.state)
+            text = scan.rest
 
     def flush(self) -> list:
-        """Flush any remaining buffered content."""
-        results = []
-        if self.buf:
-            if self.state == 0:
-                results.append(("content", self.buf))
-            elif self.state == 1:
-                results.append(("reasoning_content", self.buf))
-            self.buf = ""
-        return results
+        """End of stream: whatever is held never became a marker."""
+        rest = self._scanner.flush() if self._scanner is not None else ""
+        self._scanner = None
+        return [(self._field, rest)] if rest else []
 
 
 @dataclass(frozen=True)

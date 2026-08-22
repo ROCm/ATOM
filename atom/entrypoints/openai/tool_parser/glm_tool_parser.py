@@ -75,7 +75,6 @@ _ARG_RE = re.compile(
 
 class GlmParser(ToolCallParser):
     NAME: ClassVar[str] = "glm"
-    RECOGNISES_A_CALL_IN_PROGRESS: ClassVar[bool] = True
     START_MARKERS: ClassVar[tuple[str, ...]] = ("<tool_call>",)
     # No `CALL_CLOSERS`: this format's `</tool_call>` closes the call itself
     # rather than a wrapper around it, so `_TOOLCALL_RE` already spans it.

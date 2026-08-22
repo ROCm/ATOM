@@ -166,7 +166,6 @@ def _is_truncated_call(
 
 class DsmlParser(ToolCallParser):
     NAME: ClassVar[str] = "dsml"
-    RECOGNISES_A_CALL_IN_PROGRESS: ClassVar[bool] = True
     # Region-start markers, both marked and marker-less variants.
     START_MARKERS: ClassVar[tuple[str, ...]] = (
         "<" + _DSML + "tool_call",  # marked (covers tool_call / tool_calls)
@@ -248,9 +247,18 @@ class DsmlParser(ToolCallParser):
             if opener is not None:
                 name = opener.group(1).strip()
                 keep = _is_truncated_call(name, body, param_types, at_end=at_end)
+                # Where this call's markup starts, like the branch above. It
+                # was left at 0, so every byte between the region's opening
+                # marker and a cut-off `<invoke>` was counted as markup and
+                # deleted: 500 characters of an answer, on both delivery
+                # paths, and the only one of the four XML formats that did it.
+                begin = cls.markup_begin(region, opener.start())
             else:
                 name = _infer_name(set(raw), param_types) or "unknown"
                 keep = bool(raw)
+                # The wrapper-less malform has no opener to anchor to; the
+                # parameters run from wherever the region began.
+                begin = 0
             if keep:
                 types = param_types.get(name, {})
                 args = {k: _coerce(v, s, types.get(k)) for k, (v, s) in raw.items()}
