@@ -4,6 +4,7 @@
 import contextlib
 import copy
 import dataclasses
+import gc
 import importlib
 import ipaddress
 import json
@@ -291,6 +292,42 @@ def enable_orphan_reaping(sig: int = signal.SIGKILL) -> bool:
         logger.warning("Parent already exited while arming orphan reaping; exiting.")
         os._exit(1)
     return True
+
+
+def tune_gc() -> None:
+    """Stretch the interval between full (generation-2) collections.
+
+    Only gen-2 matters: it is stop-the-world and rescans every tracked
+    container, so its cost tracks live objects rather than recent garbage,
+    and at high concurrency it dominates while the gen-0/1 passes are noise.
+    Raising the thresholds is close to free because reference counting, not
+    the collector, reclaims everything acyclic -- peak RSS falls too, since a
+    larger gen-0 threshold lets more objects die before a collection can
+    promote them.
+
+    gc.freeze() was tried here and removed: once gen-2 stops running there is
+    nothing left for it to make cheaper, and alone it made collections more
+    frequent by emptying gen-2, which is the denominator CPython gates full
+    collections on (long_lived_pending > long_lived_total / 4).
+
+    Thresholds are per-interpreter, so every process has to call this itself:
+    subprocesses are spawned, and the API server's lifespan runs long after
+    they exist. Called from the API server, each EngineCore and each
+    ModelRunner worker; the EngineCore is the one that matters, since its
+    pauses stall the scheduler and the workers then have nothing to run.
+    """
+    from atom.utils import envs
+
+    thresholds = envs.ATOM_GC_THRESHOLD
+    if not thresholds:
+        return
+    try:
+        t = tuple(int(x) for x in thresholds.split(","))
+        old = gc.get_threshold()
+        gc.set_threshold(*t)
+        logger.info("[gc] thresholds %s -> %s", old, t)
+    except (ValueError, TypeError):
+        logger.warning("[gc] bad ATOM_GC_THRESHOLD=%r, ignored", thresholds)
 
 
 def kill_process_tree(pid: int):

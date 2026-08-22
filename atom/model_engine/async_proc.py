@@ -25,6 +25,7 @@ from threading import Thread
 import zmq
 import zmq.asyncio
 from aiter.dist.shm_broadcast import MessageQueue
+
 from atom.kv_transfer.disaggregation import KVOutputAggregator
 from atom.utils import (
     get_mp_context,
@@ -34,6 +35,7 @@ from atom.utils import (
     resolve_obj_by_qualname,
     set_process_title,
     shutdown_all_processes,
+    tune_gc,
 )
 from atom.utils.numa_utils import numa_bind_to_node
 
@@ -82,6 +84,12 @@ class AsyncIOProc:
         from atom.utils import enable_orphan_reaping
 
         enable_orphan_reaping()
+
+        # Second-order next to the EngineCore's call but not zero: without it
+        # a freeze still lands at the wave boundary, where the prefill burst
+        # churns enough objects to trigger gen-2 here. Runs before the model
+        # is built so the thresholds cover the startup heap.
+        tune_gc()
 
         # NUMA-local CPU/memory pinning (see atom.utils.numa_utils).
         # Auto-detects the GPU's local node by default; gated by
