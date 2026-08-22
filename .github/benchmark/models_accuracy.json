@@ -1,5 +1,31 @@
 [
   {
+    "model_name": "Qwen3.8-27B",
+    "model_path": "Qwen/Qwen3.8-27B",
+    "extraArgs": "--kv_cache_dtype fp8 -tp 1 --max-model-len 32768 --max-num-seqs 64 --no-enable_prefix_caching",
+    "client_command": "lm_eval --model local-chat-completions --model_args model=${MODEL_PATH},base_url=http://localhost:8000/v1/chat/completions,num_concurrent=64,max_retries=3,timeout=1200,max_gen_toks=8192,tokenized_requests=False,trust_remote_code=True --tasks gsm8k --num_fewshot 5 --batch_size 1 --output_path ${OUTPUT_PATH} --gen_kwargs 'do_sample=True,temperature=1.0,top_p=0.95,top_k=20,min_tokens=1,reasoning_effort=low' --apply_chat_template --fewshot_as_multiturn --log_samples",
+    "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
+    "runner": "linux-atom-mi35x-1",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.96,
+    "accuracy_baseline": 0.9727,
+    "accuracy_baseline_model": "Qwen/Qwen3.8-27B",
+    "_baseline_note": "Native ATOM TP1 BF16 weights with FP8 KV cache; 5-shot GSM8K flexible-extract using reasoning_effort=low."
+  },
+  {
+    "model_name": "Qwen3.8-2.4T-A95B-Quark-MXFP4",
+    "model_path": "amd/Qwen3.8-2.4T-A95B-Quark-MXFP4",
+    "extraArgs": "--kv_cache_dtype bf16 -tp 8 --max-model-len 32768 --max-num-seqs 64 --no-enable_prefix_caching",
+    "client_command": "lm_eval --model local-chat-completions --model_args model=${MODEL_PATH},base_url=http://localhost:8000/v1/chat/completions,num_concurrent=64,max_retries=3,timeout=1200,max_gen_toks=8192,tokenized_requests=False,trust_remote_code=True --tasks gsm8k --num_fewshot 5 --batch_size 1 --output_path ${OUTPUT_PATH} --gen_kwargs 'do_sample=True,temperature=1.0,top_p=0.95,top_k=20,min_tokens=1,reasoning_effort=low' --apply_chat_template --fewshot_as_multiturn --log_samples",
+    "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nATOM_USE_CUSTOM_ALL_GATHER=0\nATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0",
+    "runner": "linux-atom-do-mi350x-8",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.97,
+    "accuracy_baseline": 0.9833,
+    "accuracy_baseline_model": "amd/Qwen3.8-2.4T-A95B-Quark-MXFP4",
+    "_baseline_note": "Native ATOM TP8 Quark-MXFP4 with BF16 KV cache; 5-shot GSM8K flexible-extract using reasoning_effort=low."
+  },
+  {
     "model_name": "Meta-Llama-3-8B-Instruct",
     "model_path": "meta-llama/Meta-Llama-3-8B-Instruct",
     "extraArgs": "--kv_cache_dtype fp8 --gpu-memory-utilization 0.3",

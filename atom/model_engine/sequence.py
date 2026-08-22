@@ -143,9 +143,14 @@ class Sequence:
         self.top_k = sampling_params.top_k
         self.top_p = sampling_params.top_p
         self.max_tokens = sampling_params.max_tokens
+        self.min_tokens = sampling_params.min_tokens
         self.ignore_eos = sampling_params.ignore_eos
         self.stop_strings = sampling_params.stop_strings
         self.stop_token_sequences = stop_token_sequences or []
+        # Constant for the sequence; only read while it is below min_tokens.
+        self.single_token_stops = {
+            stop_seq[0] for stop_seq in self.stop_token_sequences if len(stop_seq) == 1
+        }
         self.is_first_decode = False
         # Set to True by Scheduler.postprocess after BlockManager.hash_blocks
         # has registered the prompt blocks for prefix caching. The trigger has

@@ -260,6 +260,64 @@ def test_gdn_metadata_adapter_compacts_full_graph_padding():
         """)
 
 
+def test_gdn_metadata_adapter_rejects_non_trailing_graph_padding():
+    _run_without_test_stubs("""
+        import pytest
+        import torch
+
+        from atom.plugin.vllm.gdn_backend import _get_trailing_decode_layout
+
+        query_start_loc_cpu = torch.tensor(
+            [0, 1, 1, 2, 2],
+            dtype=torch.int32,
+        )
+        with pytest.raises(RuntimeError, match="padding is no longer trailing"):
+            _get_trailing_decode_layout(query_start_loc_cpu, batch_size=4)
+        """)
+
+
+def test_gdn_metadata_adapter_rejects_incompatible_block_table_shape():
+    _run_without_test_stubs("""
+        from types import SimpleNamespace
+
+        import pytest
+        import torch
+
+        from atom.plugin.vllm.gdn_backend import AtomGDNAttentionMetadataBuilder
+
+        builder = SimpleNamespace(
+            use_full_cuda_graph=True,
+            decode_cudagraph_max_bs=4,
+            non_spec_state_indices_tensor=torch.zeros(4, dtype=torch.int32),
+            non_spec_query_start_loc=torch.zeros(5, dtype=torch.int32),
+            kv_cache_spec=SimpleNamespace(),
+            vllm_config=SimpleNamespace(
+                cache_config=SimpleNamespace(mamba_cache_mode="all")
+            ),
+        )
+        common = SimpleNamespace(
+            query_start_loc_cpu=torch.tensor([0, 1, 2, 2, 2], dtype=torch.int32),
+            query_start_loc=torch.tensor([0, 1, 2, 2, 2], dtype=torch.int32),
+            num_reqs=4,
+            block_table_tensor=torch.tensor([[5], [7]], dtype=torch.int32),
+            seq_lens=torch.ones(4, dtype=torch.int32),
+        )
+        metadata = SimpleNamespace(
+            num_prefills=0,
+            num_spec_decodes=0,
+            num_decodes=4,
+            num_decode_tokens=4,
+            non_spec_state_indices_tensor=None,
+            non_spec_query_start_loc=None,
+        )
+
+        with pytest.raises(RuntimeError, match="block-table layout changed"):
+            AtomGDNAttentionMetadataBuilder._compact_full_graph_decode_metadata(
+                builder, common, metadata
+            )
+        """)
+
+
 def test_aiter_tp_group_must_match_vllm_dcp_order():
     _run_without_test_stubs("""
         from types import SimpleNamespace

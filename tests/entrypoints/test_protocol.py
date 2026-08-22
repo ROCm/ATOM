@@ -176,6 +176,7 @@ class TestChatCompletionRequest:
         assert req.top_p == 1.0
         assert req.top_k == -1
         assert req.n == 1
+        assert req.min_tokens == 0
 
     def test_max_completion_tokens_sets_effective_limit(self):
         req = ChatCompletionRequest.model_validate(
@@ -206,6 +207,15 @@ class TestChatCompletionRequest:
             }
         )
         assert req.n == 4
+
+    def test_min_tokens_parameter_accepted(self):
+        req = ChatCompletionRequest.model_validate(
+            {
+                "messages": [{"role": "user", "content": "Hi"}],
+                "min_tokens": 3,
+            }
+        )
+        assert req.min_tokens == 3
 
     def test_kv_transfer_params_parsed(self):
         kv = {"transfer_id": "abc", "block_table": [1, 2, 3]}
@@ -253,6 +263,7 @@ class TestCompletionRequest:
         assert req.max_tokens == 8192
         assert req.get_max_tokens() == 8192
         assert req.n == 1
+        assert req.min_tokens == 0
 
     def test_max_completion_tokens_sets_effective_limit(self):
         req = CompletionRequest.model_validate(
@@ -274,6 +285,10 @@ class TestCompletionRequest:
     def test_n_parameter_accepted(self):
         req = CompletionRequest.model_validate({"prompt": "Hi", "n": 3})
         assert req.n == 3
+
+    def test_min_tokens_parameter_accepted(self):
+        req = CompletionRequest.model_validate({"prompt": "Hi", "min_tokens": 3})
+        assert req.min_tokens == 3
 
 
 # ============================================================================

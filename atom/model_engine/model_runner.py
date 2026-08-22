@@ -62,7 +62,7 @@ from atom.model_ops.eplb import (
     with_eplb_forward_monitor,
 )
 from atom.model_ops.rejection_sampler import RejectionSampler
-from atom.model_ops.sampler import SAMPLER_EPS, Sampler
+from atom.model_ops.sampler import SAMPLER_EPS, Sampler, apply_min_tokens_mask
 from atom.models.utils import get_pp_indices
 from atom.spec_decode.drafter import Drafter
 from atom.spec_decode.factory import build_drafter
@@ -3181,6 +3181,19 @@ class ModelRunner:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
         bs = batch.total_seqs_num
         if spec_decode_metadata is None:
+            # min_tokens is enforced only on the non-speculative path. Draft
+            # tokens are verified against the target distribution, so masking
+            # the target logits here would bias acceptance; the recipes that
+            # rely on min_tokens do not run speculative decoding.
+            if batch.min_tokens.any():
+                apply_min_tokens_mask(
+                    logits,
+                    batch.min_tokens,
+                    batch.num_completion_tokens,
+                    self.config.eos_token_id,
+                    tuple(self.config.stop_token_ids),
+                    batch.single_token_stops,
+                )
             sampled_tokens = self.sampler(
                 logits,
                 temperatures,
