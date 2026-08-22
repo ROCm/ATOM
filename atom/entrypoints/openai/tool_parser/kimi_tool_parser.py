@@ -43,7 +43,12 @@ def _parse_entries(section_text: str) -> list[ToolCall]:
     for match in _ENTRY_RE.finditer(section_text):
         name = match.group(1)
         index = match.group(2)
-        arguments = match.group(3).strip()
+        # `"{}"` and not `""` for a zero-argument call. This format passes
+        # the wire bytes through where the other five build a JSON object, so
+        # it was the one format whose no-argument call reached the client as
+        # an empty string -- `json.loads("")` raises, and on `/v1/messages` it
+        # becomes an `input_json_delta` the Anthropic SDK cannot accumulate.
+        arguments = match.group(3).strip() or "{}"
         tool_id = f"functions.{name}:{index}"
         tool_calls.append(
             ToolCall(

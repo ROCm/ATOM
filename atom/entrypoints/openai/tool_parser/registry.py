@@ -170,9 +170,11 @@ answer then leaks that framing: Kimi-K3's `Hello there.` arrived as
 `<|open|>response<|sep|>Hello there.<|close|>response<|sep|><|end_of_msg|>`
 the moment a request said `none`. The format still has to be read; what is
 suppressed is dispatch. `ToolCallStreamParser(suppress_calls=True)` and
-:func:`parse_tool_calls(..., suppress_calls=True)` are that, and both leave
-the region's bytes in the answer -- which is the correct reading, since the
-request said they could not be a call.
+:func:`parse_tool_calls(..., suppress_calls=True)` read the region exactly as
+a permitted one and drop only the calls, so the answer around a forbidden call
+survives and the call's own markup does not. Releasing those bytes instead was
+tried first and is what leaked the wire format: they are not prose, whatever
+the request said about dispatch.
 """
 
 

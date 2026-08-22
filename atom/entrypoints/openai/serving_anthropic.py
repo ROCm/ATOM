@@ -166,6 +166,50 @@ def anthropic_to_openai_tools(tools: list[dict] | None) -> list[dict] | None:
 # ── Response Construction ──────────────────────────────────────────────
 
 
+def _blocks_in_order(events: list) -> list[dict]:
+    """The engine's events as Anthropic content blocks, in arrival order.
+
+    The streaming path already does this, through `AnthropicBlocks` and
+    `tool_event_frames`. The non-streaming path was given `(content_text,
+    tool_calls)` instead -- the same events with the order thrown away -- and
+    rebuilt one text block ahead of every `tool_use`. So the same generation
+    came back as `['text', 'tool_use', 'tool_use']` unstreamed and
+    `['tool_use', 'text', 'tool_use']` streamed, and a client rendering blocks
+    in order showed the sentence introducing the second call before the first.
+
+    Consecutive content events are joined: they are one run of answer that the
+    engine happened to emit in pieces, and Anthropic has no way to say "two
+    adjacent text blocks" that means anything different.
+    """
+    blocks: list[dict] = []
+    pending: dict | None = None
+    for etype, data in events:
+        if etype == "content":
+            if not data:
+                continue
+            if blocks and blocks[-1]["type"] == "text":
+                blocks[-1]["text"] += data
+            else:
+                blocks.append({"type": "text", "text": data})
+        elif etype == "tool_call_start":
+            pending = {"id": data["id"], "name": data["function"]["name"]}
+        elif etype == "tool_call_args" and pending is not None:
+            try:
+                args = json.loads(data["function"]["arguments"] or "{}")
+            except (json.JSONDecodeError, TypeError):
+                args = {}
+            blocks.append(
+                {
+                    "type": "tool_use",
+                    "id": pending["id"],
+                    "name": pending["name"],
+                    "input": args if isinstance(args, dict) else {},
+                }
+            )
+            pending = None
+    return blocks
+
+
 def build_anthropic_response(
     request_id: str,
     model: str,
@@ -177,6 +221,7 @@ def build_anthropic_response(
     cache_read_input_tokens: int = 0,
     *,
     stop_reason: str,
+    events: list | None = None,
 ) -> dict:
     """Build Anthropic Messages API response.
 
@@ -207,21 +252,26 @@ def build_anthropic_response(
             }
         )
 
+    ordered = _blocks_in_order(events) if events is not None else None
+    if ordered is not None:
+        content.extend(ordered)
     # A text block whenever the reply is not a tool call, even an empty one.
     # The streaming path forces exactly this at the end of a response with no
     # call, so a reply that was nothing but reasoning came back as
     # `['thinking', 'text']` when streamed and `['thinking']` when not --
     # and a client that reads only text blocks got nothing at all from the
     # second.
-    if content_text or not tool_calls:
+    if ordered is None and (content_text or not tool_calls):
         content.append(
             {
                 "type": "text",
                 "text": content_text,
             }
         )
+    elif ordered is not None and not ordered:
+        content.append({"type": "text", "text": ""})
 
-    if tool_calls:
+    if tool_calls and ordered is None:
         # `stop_reason` is the caller's, not this function's. It used to be
         # overwritten here, which threw away the answer
         # `anthropic_stop_reason_with_calls` had already given the call site --

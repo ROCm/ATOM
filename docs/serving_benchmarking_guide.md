@@ -305,8 +305,11 @@ enforced where the events are *sent* — twelve places across two endpoints —
 while the parser went on consuming the region, so the model's own words were
 deleted and nothing took their place: 89 characters of a 95-character answer,
 no event, `finish_reason: stop`. The rule now lives at the one place the
-parser is *asked*, as `suppress_calls`, which is also the right reading — the
-request said this cannot be a call, so it is prose.
+parser is *asked*, as `suppress_calls`. What that suppresses is dispatch: the
+region is read exactly as a permitted call's would be and only the calls are
+dropped, so the answer around them survives and the model's raw wire markup
+does not reach the client. A reply that was nothing but a forbidden call
+therefore has empty `content` — the model produced no answer.
 
 Not by using no parser at all, which is where the first fix for that went.
 Dropping the parser drops everything else a parser does, and a format whose
@@ -1033,6 +1036,7 @@ server without modification.
 | `atom/entrypoints/openai/marker_scanner.py` | `MarkerScanner` — the one rule for how much of a stream is safe to release |
 | `atom/entrypoints/openai/reasoning.py` | Splits the reasoning channel from the answer; `ReasoningChannel` carries the model's dialect and whether the output begins inside the channel, and has one accessor per delivery mode |
 | `atom/entrypoints/openai/reasoning_dialects.py` | The dialects, and `resolve_dialect`, which picks one from the chat template at startup |
+| `atom/entrypoints/openai/kimi_k3_tokens.py` | Kimi-K3's channel tokens, split by owner: what the reasoning stage strips and what only the tool parser may |
 | `atom/entrypoints/openai/tool_parser/stream.py` | The one reader: the engine both delivery modes run through |
 | `atom/entrypoints/openai/chat_encoders.py` | Renders the chat template, and the two startup probes of it: `render_probe_prompt` (what the prompt tells the model) and `chat_template_source` (what the template does with a reply) |
 | `atom/entrypoints/openai/tool_parser/registry.py` | Which format a model emits, resolved once at startup from its chat template |

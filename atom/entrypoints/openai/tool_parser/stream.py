@@ -29,15 +29,9 @@ logger = logging.getLogger("atom")
 # peek from re-scanning a growing buffer once per token.
 _PEEK_WINDOW = 256
 
-# KNOWN LIMIT, and deliberately not fixed here: a region runs from its opening
-# marker to wherever it closes, and for the four XML-ish formats that is end of
-# stream. An answer that merely *mentions* `<tool_call>` therefore arrives in
-# one frame at the end -- measured on a GLM answer naming the tag at character
-# 29 and then explaining for 1234 more, 98% of it at EOS.
-#
-# A "give up on a region that has produced nothing after N bytes" probe was
-# tried and reverted. It rests on acceptance being monotone in how many bytes
-# have arrived, and that is false: MiniMax gates its in-progress test on the
+# Do not add a "give up on a region that has produced nothing after N bytes"
+# probe. It was tried and reverted: it rests on acceptance being monotone in
+# how many bytes have arrived, and that is false -- MiniMax gates its in-progress test on the
 # first tag being in the declared schema, and DSML's wrapper-less and
 # direct-JSON branches cannot match any prefix at all -- so real calls over
 # N bytes were delivered as text, differently from `stream=false`, on three of
@@ -114,28 +108,38 @@ def _peek_declared(tools: list | None) -> frozenset[str]:
 
 
 def _markup_spans(
-    spans: tuple[tuple[int, int], ...], length: int
+    spans: tuple[tuple[int, int], ...], body: str
 ) -> list[tuple[int, int]]:
     """A format's markup intervals, clamped and merged into a partition.
 
     The engine walks these in order and treats the gaps as answer, so they
     have to be ascending and non-overlapping whatever a format reports.
 
-    At least one byte is always consumed, which is what keeps the engine from
-    handing a region back, finding the same marker and parsing it forever:
-    every span kept here is non-empty, and a region with none at all gets the
-    one-byte span on the last line.
+    Two spans separated by nothing but whitespace are joined. That whitespace
+    is the template's, not the model's: `end_of_markup` moves only on a closer
+    and `begin_of_markup` only on an opener, which is right at the edge of a
+    region -- the newline before the model resumes prose belongs to the prose
+    -- and wrong between two calls, where every one of these chat templates
+    renders a separator. Left in the gap it became a `content: "\n"` delta
+    sitting between two `tool_calls` deltas, and on `/v1/messages` a whole
+    text block containing one newline.
+
+    Every span kept here is non-empty, so the engine always consumes at least
+    one byte and cannot hand a region back, find the same marker and parse it
+    forever. A format that reports only degenerate spans would break that, so
+    it is refused rather than papered over -- the caller falls back to
+    releasing the region unchanged.
     """
     merged: list[tuple[int, int]] = []
     for start, stop in sorted(spans):
-        start, stop = max(0, min(start, length)), max(0, min(stop, length))
+        start, stop = max(0, min(start, len(body))), max(0, min(stop, len(body)))
         if stop <= start:
             continue
-        if merged and start <= merged[-1][1]:
+        if merged and not body[merged[-1][1] : start].strip():
             merged[-1] = (merged[-1][0], max(merged[-1][1], stop))
         else:
             merged.append((start, stop))
-    return merged or ([(0, 1)] if length else [])
+    return merged
 
 
 def _resolved_tools(tools: list | None):
@@ -367,12 +371,27 @@ class ToolCallStreamParser:
             parsed = RegionParse((), parsed.spans)
         events: list = []
         rest = ""
-        if parsed.spans and (parsed.calls or self.suppress_calls):
-            # Everything outside the format's markup is answer, including
-            # whatever the model wrote *between* two calls. Reading only the
-            # outer pair deleted that -- "let me also check Rome" between two
-            # `<tool_call>` blocks, on five of the six formats, silently.
-            spans = _markup_spans(parsed.spans, len(body))
+        # Everything outside the format's markup is answer, including whatever
+        # the model wrote *between* two calls. Reading only the outer pair
+        # deleted that -- "let me also check Rome" between two `<tool_call>`
+        # blocks, on five of the six formats, silently.
+        #
+        # `spans` empty with calls present would mean a format reported
+        # nothing this engine can consume, and consuming nothing loops
+        # forever. No registered format can do it -- 1.2M fuzzed regions
+        # produced zero -- so this is the boundary check for the seventh, and
+        # it fails towards releasing the region rather than towards eating a
+        # byte of it.
+        spans = _markup_spans(parsed.spans, body)
+        if parsed.calls and not spans:
+            logger.warning(
+                "%s reported %d call(s) with no usable markup span in %d bytes; "
+                "releasing the region as text",
+                self.parser_cls.NAME,
+                len(parsed.calls),
+                len(body),
+            )
+        if spans and (parsed.calls or self.suppress_calls):
             pending = list(parsed.calls)
             at = 0
             for i, (start, stop) in enumerate(spans):
@@ -596,11 +615,37 @@ def read_whole(
     Nothing is trimmed. A trailing `.strip()` here cost a code-block answer its
     final newline, which streaming had no way to reproduce.
     """
+    return flatten_tool_events(
+        read_whole_events(parser_cls, text, tools, suppress_calls=suppress_calls)
+    )
+
+
+def read_whole_events(
+    parser_cls: type[ToolCallParser] | None,
+    text: str,
+    tools: list | None = None,
+    *,
+    suppress_calls: bool = False,
+) -> list:
+    """The same single chunk, as the engine's own ordered events.
+
+    `read_whole` flattens these into `(content, calls)`, which loses where the
+    content sat relative to the calls. A caller that renders blocks in order
+    -- the Anthropic non-streaming path -- needs that order, and building it
+    from a joined string put a response's whole answer in one block ahead of
+    every `tool_use`, so `stream=false` disagreed with `stream=true` about the
+    order of the blocks in the same generation.
+    """
     engine = ToolCallStreamParser(
         tools=tools, parser_cls=parser_cls, suppress_calls=suppress_calls
     )
     events = engine.process(text)
     events.extend(engine.flush())
+    return events
+
+
+def flatten_tool_events(events: list) -> tuple[str, list[ToolCall]]:
+    """Ordered events as `(joined content, calls)`."""
     content: list[str] = []
     calls: list[ToolCall] = []
     pending: dict | None = None

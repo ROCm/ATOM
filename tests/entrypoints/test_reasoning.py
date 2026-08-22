@@ -10,6 +10,7 @@ import pytest
 from atom.entrypoints.openai.reasoning import (
     ReasoningChannel,
     ReasoningFilter,
+    prompt_starts_in_reasoning,
     separate_reasoning,
 )
 from atom.entrypoints.openai.reasoning_dialects import resolve_dialect
@@ -470,6 +471,38 @@ class TestTheDialectsAsRegistered:
         dialect, _ = resolve_dialect("<|open|>think<|sep|>")
         framed = "<|open|>response<|sep|>Hi there.<|close|>response<|sep|>"
         assert ReasoningChannel(dialect=dialect).split(framed) == (None, "Hi there.")
+
+    def test_minimax_m3_resolves_to_its_own_tags(self):
+        """`<mm:think>`, not `<think>`.
+
+        MiniMax-M3's template sets `think_begin_token = '<mm:think>'`, and no
+        dialect declared either literal -- so it fell through to the inline
+        `<think>` entry, matched nothing, and delivered the whole chain of
+        thought as `content` with `reasoning_content: null` on both delivery
+        paths. On `/v1/messages`, where reasoning is dropped by default, that
+        put the trace inside the client's text block.
+        """
+        source = (
+            "{%- set think_begin_token = '<mm:think>' -%}"
+            "{%- set think_end_token = '</mm:think>' -%}"
+        )
+        dialect, stated = resolve_dialect(source)
+        assert (dialect.think_end_marker, stated) == ("</mm:think>", True)
+        channel = ReasoningChannel(dialect=dialect, starts_open=True)
+        assert channel.split("Reasoning.</mm:think>The answer.") == (
+            "Reasoning.",
+            "The answer.",
+        )
+        # And the prompt marker, which is what seeds `starts_open` in the
+        # first place: the template ends the generation prompt with the
+        # opener under `thinking_mode == "enabled"`.
+        assert prompt_starts_in_reasoning("]~b]ai\n<mm:think>")
+        assert dialect.output_open_marker == "<mm:think>"
+
+    def test_and_it_does_not_steal_the_generic_think_template(self):
+        """The two marker sets must not shadow each other."""
+        dialect, _ = resolve_dialect("<think></think>")
+        assert dialect.think_end_marker == "</think>"
 
     def test_and_the_inline_think_dialect_declares_none(self):
         dialect, _ = resolve_dialect("<think></think>")

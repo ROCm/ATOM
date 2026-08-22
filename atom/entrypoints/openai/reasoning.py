@@ -41,8 +41,8 @@ def template_opens_reasoning_implicitly(template_source: str) -> bool:
 
     The chat template says it. A template that mentions an end marker and not
     the matching opener is describing exactly that shape; one that mentions
-    both (Qwen3) describes a model that opens its own, and one that mentions
-    neither (MiniMax-M3, gpt-oss) has no reasoning channel to speak of.
+    both (Qwen3, MiniMax-M3) describes a model that opens its own, and one
+    that mentions neither (gpt-oss) has no reasoning channel to speak of.
 
     ``template_source`` is the template's own text, which is the only place
     this shows: an end marker is what the template does with a *reply*, so it

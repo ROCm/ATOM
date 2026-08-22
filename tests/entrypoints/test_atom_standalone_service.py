@@ -568,3 +568,160 @@ class TestAStreamClosedBeforeItStartedIsStillStopped:
         ], "sequences the engine was given were never aborted"
         assert "r5" not in service._stream_seqs
         service.close()
+
+
+class TestTheSubmitWindowClosesOnEveryPath:
+    """`_awaiting_submit` says "this id could still be submitted".
+
+    It is what lets `abort_stream` tell "not yet submitted" from "already
+    finished and forgotten", and if an id is never removed it is the same
+    permanent retention the set was added to prevent, one level down. The
+    first version of this bookkeeping discarded inside
+    `_submit_stream_request`, which has four ways out, and covered two: a
+    stream closed while it was preprocessing and a stream whose preprocess
+    raised each left an id behind.
+    """
+
+    class _Engine:
+        def __init__(self):
+            self.io_processor = self
+            self.core_mgr = self
+            self.requests = {}
+            self.gate = None
+            self.boom = False
+            self.added = []
+
+        def preprocess(self, *a, **kw):
+            if self.gate:
+                self.gate()
+            if self.boom:
+                raise RuntimeError("preprocess failed")
+            return type("Seq", (), {"id": 1})()
+
+        def add_request(self, seqs):
+            self.added.extend(seqs)
+
+        def abort_request(self, seq_id):
+            pass
+
+    def _service(self):
+        from atom.entrypoints.atomesh.atom_standalone_service import AtomEngineService
+
+        return AtomEngineService(self._Engine(), _StubTokenizer())
+
+    @staticmethod
+    def _request(rid):
+        from atom.entrypoints.atomesh.atom_standalone_service import (
+            EngineStreamRequest,
+        )
+
+        return EngineStreamRequest(
+            request_id=rid,
+            prompt="hi",
+            sampling_params=None,
+            effective_n=1,
+            stream_queue=queue.Queue(),
+        )
+
+    def test_a_stream_that_publishes_normally(self):
+        service = self._service()
+        for i in range(20):
+            rid = f"ok-{i}"
+            service._expect_stream(rid)
+            service._submit_stream_request(self._request(rid))
+            service._close_submit_window(rid)
+        assert service._awaiting_submit == set()
+        service.close()
+
+    def test_a_stream_closed_while_it_was_preprocessing(self):
+        """The window must stay open *during* preprocessing -- that abort has
+        no sequences to stop yet either -- and close after."""
+        service = self._service()
+        for i in range(20):
+            rid = f"mid-{i}"
+            service._expect_stream(rid)
+            service.engine.gate = lambda r=rid: service.abort_stream(r)
+            try:
+                service._submit_stream_request(self._request(rid))
+            finally:
+                service._close_submit_window(rid)
+        assert service.engine.core_mgr is service.engine
+        assert service._awaiting_submit == set(), (
+            f"{len(service._awaiting_submit)} ids retained for the life of the "
+            "process, one per stream closed during preprocessing"
+        )
+        service.close()
+
+    def test_a_stream_whose_preprocess_raised(self):
+        service = self._service()
+        service.engine.boom = True
+        for i in range(20):
+            rid = f"boom-{i}"
+            service._expect_stream(rid)
+            try:
+                service._submit_stream_request(self._request(rid))
+            except RuntimeError:
+                pass  # what `_worker_loop` does
+            finally:
+                service._close_submit_window(rid)
+        assert service._awaiting_submit == set()
+        service.close()
+
+    def test_and_the_worker_loop_is_the_one_calling_it(self):
+        """Through the real loop, not the helper -- otherwise this tests the
+        test's own `finally` rather than the service's."""
+        import time
+
+        service = self._service()
+        service.engine.boom = True
+        for i in range(20):
+            rid = f"loop-{i}"
+            service._expect_stream(rid)
+            service._queue.put(self._request(rid))
+        for _ in range(100):
+            if service._queue.empty():
+                break
+            time.sleep(0.02)
+        time.sleep(0.2)
+        assert service._awaiting_submit == set()
+        service.close()
+
+    def test_and_the_window_closes_after_the_submit_never_before(self):
+        """Ordering, driven through the real worker loop.
+
+        Closing the window first is the obvious way to write this and it
+        silently reopens the gap `_abandoned` exists for: an abort arriving
+        while the sequences are still being built then finds no sequence list
+        *and* no open window, reads that as "already finished", remembers
+        nothing -- and the worker adds the sequences to the engine a moment
+        later. They decode to `max_tokens` into a queue nobody will read.
+        """
+        import time
+
+        service = self._service()
+        rid = "ordering"
+        service._expect_stream(rid)
+        service.engine.gate = lambda: service.abort_stream(rid)
+        service._queue.put(self._request(rid))
+        for _ in range(100):
+            if service._queue.empty():
+                break
+            time.sleep(0.02)
+        time.sleep(0.2)
+        assert (
+            service.engine.added == []
+        ), "a stream closed while it was preprocessing still reached the engine"
+        assert service._awaiting_submit == set()
+        service.close()
+
+    def test_and_a_stream_the_shutdown_path_never_submits(self):
+        import time
+
+        service = self._service()
+        service._closed.set()
+        for i in range(20):
+            rid = f"shut-{i}"
+            service._expect_stream(rid)
+            service._queue.put(self._request(rid))
+        time.sleep(0.3)
+        assert service._awaiting_submit == set()

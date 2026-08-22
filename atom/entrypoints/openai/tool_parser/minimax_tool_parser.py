@@ -92,13 +92,18 @@ def _is_truncated_call(
     # A tag that has not finished arriving. At end of region that is all
     # there will ever be, so a prefix counts -- the rule `continues_a_call`
     # states and the other three formats have applied since it was written.
-    # The sweep that added it missed this one, because this format names a
-    # parameter by the tag itself and so had no keyword to hand it; the
-    # followers are the declared tags, built from the request.
-    openers = tuple(f"{MINIMAX_NS}<{t}>" for t in types) + tuple(
+    # The followers are the declared tags, built from the request, because
+    # this format names a parameter by the tag itself.
+    #
+    # An empty schema falls back to "any tag" here exactly as it does for a
+    # complete tag four lines up. Gating on `bool(openers)` instead made a
+    # zero-parameter tool the one tool whose truncated call could not be
+    # recovered -- the same tool declared with one property recovered it --
+    # and a truncation is precisely what this function exists to catch.
+    followers = tuple(f"{MINIMAX_NS}<{t}>" for t in types) + tuple(
         f"<{t}>" for t in types
-    )
-    return bool(openers) and continues_a_call(rest, openers, arrived=not at_end)
+    ) or (f"{MINIMAX_NS}<", "<")
+    return continues_a_call(rest, followers, arrived=not at_end)
 
 
 class MiniMaxParser(ToolCallParser):

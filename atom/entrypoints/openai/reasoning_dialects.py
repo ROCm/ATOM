@@ -176,14 +176,46 @@ def _split_channel(text: str, starts_thinking: bool = False) -> SplitResult | No
 # not a marker this dialect declares, so it survives -- see `SplitResult`.
 THINK_OPEN_MARKER = "<think>"
 THINK_END_MARKER = "</think>"
-_THINK_CLOSED_RE = re.compile(
-    re.escape(THINK_OPEN_MARKER) + r"(.*?)" + re.escape(THINK_END_MARKER) + r"(.*)",
-    flags=re.DOTALL,
-)
-_THINK_OPEN_RE = re.compile(re.escape(THINK_OPEN_MARKER) + r"(.*)", flags=re.DOTALL)
+
+# MiniMax-M3 spells the same shape with its own tags. Its template sets
+# `think_begin_token = '<mm:think>'` and ends the generation prompt with it
+# when `thinking_mode == "enabled"`, leaves no prefix under "adaptive" (so the
+# model writes the opener itself), and emits `</mm:think>` alone under
+# "disabled". Neither literal was declared anywhere, so the whole chain of
+# thought was delivered as `content` with `reasoning_content: null`, on both
+# delivery paths -- and on `/v1/messages`, inside the client's text block.
+MM_THINK_OPEN_MARKER = "<mm:think>"
+MM_THINK_END_MARKER = "</mm:think>"
 
 
-def _split_think_tag(text: str, starts_thinking: bool = False) -> SplitResult | None:
+def _inline_tag_split(open_marker: str, end_marker: str) -> Callable:
+    """A split for one `OPEN ... END` inline-tag dialect.
+
+    Built per dialect from that dialect's own markers rather than reading
+    module constants, because a second inline-tag format arrived and the
+    single hardcoded pair would have silently split its output with the wrong
+    tags -- the dialect declaring one thing and its split doing another is the
+    two-sources shape this module exists to retire.
+    """
+    closed_re = re.compile(
+        re.escape(open_marker) + r"(.*?)" + re.escape(end_marker) + r"(.*)",
+        flags=re.DOTALL,
+    )
+    open_re = re.compile(re.escape(open_marker) + r"(.*)", flags=re.DOTALL)
+
+    def split(text: str, starts_thinking: bool = False) -> SplitResult | None:
+        return _split_inline_tag(text, starts_thinking, end_marker, closed_re, open_re)
+
+    return split
+
+
+def _split_inline_tag(
+    text: str,
+    starts_thinking: bool,
+    end_marker: str,
+    closed_re,
+    open_re,
+) -> SplitResult | None:
     # Ordered as the streaming filter's state machine is, because that is what
     # this has to agree with. `starts_thinking` means the prompt already
     # opened the channel, so the output *begins* in it: the first `</think>`
@@ -197,8 +229,8 @@ def _split_think_tag(text: str, starts_thinking: bool = False) -> SplitResult | 
         # for without waiting for one, and waiting is the stall. vLLM's
         # non-streaming path still guesses here and its streaming path does
         # not; the two do not agree, and this is the half worth copying.
-        if THINK_END_MARKER in text:
-            reasoning, _, content = text.partition(THINK_END_MARKER)
+        if end_marker in text:
+            reasoning, _, content = text.partition(end_marker)
             return (reasoning or None, content)
         # Never closed: all reasoning, no answer. That is what a reasoning
         # model stopped at `max_tokens` looks like, and `separate_reasoning`'s
@@ -224,12 +256,12 @@ def _split_think_tag(text: str, starts_thinking: bool = False) -> SplitResult | 
     # with two -- swapping one divergence for another. Whether *both* should
     # reopen is a separate question, and answering it means changing the
     # filter, not this.
-    match = _THINK_CLOSED_RE.search(text)
+    match = closed_re.search(text)
     if match:
         return (match.group(1) or None, text[: match.start()] + match.group(2))
     # Unclosed block (truncated response). Searched, and split, for the same
     # reasons as the closed one above.
-    match = _THINK_OPEN_RE.search(text)
+    match = open_re.search(text)
     if match:
         return (match.group(1) or None, text[: match.start()])
     return None
@@ -275,12 +307,22 @@ _CHANNEL_DIALECT = ReasoningDialect(
 DIALECTS: tuple[ReasoningDialect, ...] = (
     # Structured channel format — Kimi-K3 token values (see CHANNEL_* above)
     _CHANNEL_DIALECT,
-    # Generic <think>...</think> (K2/DeepSeek/Qwen3/MiniMax/...)
+    # MiniMax-M3: the inline-tag shape in its own spelling. Before the generic
+    # entry, so its longer markers are matched first -- though the two sets do
+    # not overlap as substrings, which is checked below.
+    ReasoningDialect(
+        prompt_open_marker=MM_THINK_OPEN_MARKER,
+        output_open_marker=MM_THINK_OPEN_MARKER,
+        think_end_marker=MM_THINK_END_MARKER,
+        split=_inline_tag_split(MM_THINK_OPEN_MARKER, MM_THINK_END_MARKER),
+        template_markers=(MM_THINK_OPEN_MARKER, MM_THINK_END_MARKER),
+    ),
+    # Generic <think>...</think> (K2/DeepSeek/Qwen3/...)
     ReasoningDialect(
         prompt_open_marker=THINK_OPEN_MARKER,
         output_open_marker=THINK_OPEN_MARKER,
         think_end_marker=THINK_END_MARKER,
-        split=_split_think_tag,
+        split=_inline_tag_split(THINK_OPEN_MARKER, THINK_END_MARKER),
         template_markers=(THINK_OPEN_MARKER, THINK_END_MARKER),
     ),
 )

@@ -188,6 +188,7 @@ class AtomEngineService:
                         }
                     )
                     request.stream_queue.put({"done": True})
+                    self._close_submit_window(request.request_id)
                 else:
                     self._set_future_exception(
                         request.future,
@@ -197,7 +198,10 @@ class AtomEngineService:
 
             try:
                 if isinstance(request, EngineStreamRequest):
-                    self._submit_stream_request(request)
+                    try:
+                        self._submit_stream_request(request)
+                    finally:
+                        self._close_submit_window(request.request_id)
                 else:
                     self._submit_request(request)
             except Exception as error:
@@ -254,6 +258,24 @@ class AtomEngineService:
         with self._stream_seqs_lock:
             self._awaiting_submit.add(request_id)
 
+    def _close_submit_window(self, request_id: str) -> None:
+        """This id can no longer be submitted, however that came about.
+
+        The counterpart to `_expect_stream`, and called from the worker loop
+        rather than from inside `_submit_stream_request` because that function
+        has four ways out -- abandoned at the top, abandoned mid-preprocess,
+        published, or raising -- and bookkeeping spread over them discarded on
+        two. A stream closed while it was preprocessing, and one whose
+        preprocess raised, each left an id behind for the life of the process:
+        the same leak `_awaiting_submit` was added to remove, one level down.
+
+        It runs *after* the submit, never before, because the window has to
+        stay open for an abort arriving while the sequences are still being
+        built -- that abort has nothing to stop yet either.
+        """
+        with self._stream_seqs_lock:
+            self._awaiting_submit.discard(request_id)
+
     def _submit_stream_request(self, request: EngineStreamRequest) -> None:
         if self._take_abandoned(request.request_id):
             return
@@ -278,7 +300,6 @@ class AtomEngineService:
         # whether a close in that window aborts or leaks; this way one of the
         # two branches below always fires.
         with self._stream_seqs_lock:
-            self._awaiting_submit.discard(request.request_id)
             if request.request_id in self._abandoned:
                 self._abandoned.discard(request.request_id)
                 abandoned = seqs
@@ -297,7 +318,6 @@ class AtomEngineService:
                 # closing the window here let it through to the engine.
                 return False
             self._abandoned.discard(request_id)
-            self._awaiting_submit.discard(request_id)
             return True
 
     def forget_stream(self, request_id: str) -> None:

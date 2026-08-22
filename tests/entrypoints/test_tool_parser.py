@@ -5,6 +5,8 @@
 
 from typing import ClassVar
 
+import json
+
 import pytest
 
 from atom.entrypoints.openai.tool_parser.schema import ParamTypes
@@ -960,6 +962,30 @@ class TestACallStillArrivingWhenTheStreamEnds:
             "the model answered when it was calling a tool"
         )
 
+    @pytest.mark.parametrize("tail", ["<c", "<city>Par", ""])
+    def test_including_a_call_to_a_tool_that_declares_no_parameters(self, tail):
+        """The zero-parameter tool is the one this used to drop.
+
+        An empty schema falls back to "any tag" for a *complete* tag two lines
+        up in the same function; the partial-tag branch gated on there being
+        declared tags to compare against, so it had none and refused. The same
+        tool declared with one property recovered the call, which is the
+        asymmetry that gives it away.
+        """
+        zero = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "ping",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+        region = f'{self.NS}<invoke name="ping">\n{self.NS}{tail}'
+        assert MiniMaxParser.parse_region(
+            region, zero, at_end=True
+        ).calls, "a truncated call to a zero-parameter tool was read as prose"
+
     def test_but_not_while_more_bytes_may_still_arrive(self):
         region = f'{self.NS}<invoke name="get_weather">\n{self.NS}<ci'
         assert not MiniMaxParser.parse_region(
@@ -1015,3 +1041,102 @@ class TestTheRequestsToolsAreResolvedOnce:
     def test_resolving_twice_is_the_same_answer(self):
         once = _resolved_tools(TestACallStillArrivingWhenTheStreamEnds.TOOLS)
         assert _resolved_tools(once) is once
+
+
+class TestWhatSitsBetweenTwoCalls:
+    """Prose survives; the template's own separator does not.
+
+    Per-call markup spans made the gap between two calls answer, which is
+    right for a sentence and wrong for the newline every one of these chat
+    templates renders between consecutive calls. `end_of_markup` moves only on
+    a closer and `begin_of_markup` only on an opener -- correct at the edge of
+    a region, where the newline before the model resumes prose is the model's,
+    and wrong between two calls, where nobody wrote it.
+    """
+
+    TOOLS = TestACallStillArrivingWhenTheStreamEnds.TOOLS
+    CALLS = {
+        "qwen": "<tool_call>\n<function=get_weather>\n"
+        "<parameter=city>Paris</parameter>\n</function>\n</tool_call>",
+        "glm": "<tool_call>get_weather<arg_key>city</arg_key>"
+        "<arg_value>Paris</arg_value></tool_call>",
+        "dsml": '<｜DSML｜tool_calls><｜DSML｜invoke name="get_weather">'
+        '<｜DSML｜parameter name="city">Paris</｜DSML｜parameter>'
+        "</｜DSML｜invoke></｜DSML｜tool_calls>",
+        "minimax": ']<]minimax[>[<invoke name="get_weather">'
+        "]<]minimax[>[<city>Paris</city>]<]minimax[>[</invoke>",
+        "kimi_k3": '<|open|>call tool="get_weather"<|sep|>'
+        '<|open|>argument key="city"<|sep|>Paris<|close|>argument<|close|>call',
+    }
+    PARSERS = {
+        "qwen": QwenXmlParser,
+        "glm": GlmParser,
+        "dsml": DsmlParser,
+        "minimax": MiniMaxParser,
+        "kimi_k3": KimiK3Parser,
+    }
+
+    @pytest.mark.parametrize("name", sorted(CALLS))
+    @pytest.mark.parametrize("gap", ["\n", "  ", "\n\n  \t"])
+    def test_whitespace_alone_between_them_is_markup(self, name, gap):
+        call = self.CALLS[name]
+        content, calls = parse_tool_calls(
+            call + gap + call, self.TOOLS, self.PARSERS[name]
+        )
+        assert len(calls) == 2, "this shape proves nothing without two calls"
+        assert (
+            content == ""
+        ), f"the template's separator reached the client as content: {content!r}"
+
+    @pytest.mark.parametrize("name", sorted(CALLS))
+    def test_but_a_sentence_between_them_is_not(self, name):
+        call = self.CALLS[name]
+        content, calls = parse_tool_calls(
+            call + "\nNow Rome.\n" + call, self.TOOLS, self.PARSERS[name]
+        )
+        assert len(calls) == 2
+        assert "Now Rome." in content, f"the answer was deleted: {content!r}"
+
+
+class TestAZeroArgumentCallLooksTheSameInEveryFormat:
+    """`arguments` is JSON on the wire, and `""` is not JSON.
+
+    Kimi-K2 is the one format that passes the model's bytes through instead of
+    building the object, so its no-argument call reached the client as an
+    empty string where the other five sent `{}`. An OpenAI client calls
+    `json.loads` on the accumulated arguments and raises; the Anthropic SDK
+    accumulates an `input_json_delta` it cannot parse.
+    """
+
+    TOOLS = [
+        {
+            "type": "function",
+            "function": {
+                "name": "now",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+    ZERO_ARG = {
+        "kimi": "<|tool_calls_section_begin|><|tool_call_begin|>functions.now:0"
+        "<|tool_call_argument_begin|><|tool_call_end|><|tool_calls_section_end|>",
+        "qwen": "<tool_call>\n<function=now>\n</function>\n</tool_call>",
+        "glm": "<tool_call>now</tool_call>",
+        "dsml": '<｜DSML｜tool_calls><｜DSML｜invoke name="now">'
+        "</｜DSML｜invoke></｜DSML｜tool_calls>",
+        "kimi_k3": '<|open|>call tool="now"<|sep|><|close|>call',
+    }
+    PARSERS = {
+        "kimi": KimiParser,
+        "qwen": QwenXmlParser,
+        "glm": GlmParser,
+        "dsml": DsmlParser,
+        "kimi_k3": KimiK3Parser,
+    }
+
+    @pytest.mark.parametrize("name", sorted(ZERO_ARG))
+    def test_the_arguments_are_parseable_json(self, name):
+        _, calls = parse_tool_calls(self.ZERO_ARG[name], self.TOOLS, self.PARSERS[name])
+        assert len(calls) == 1, f"{name} did not read its own zero-argument call"
+        args = calls[0].function["arguments"]
+        assert json.loads(args) == {}, f"{name} sent {args!r}"

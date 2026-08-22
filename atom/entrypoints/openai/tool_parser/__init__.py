@@ -53,10 +53,17 @@ from .kimi_tool_parser import KimiParser
 from .minimax_tool_parser import MiniMaxParser
 from .qwen3_tool_parser import QwenXmlParser
 from .registry import parse_tool_calls
-from .stream import ToolCallStreamParser, read_whole
+from .stream import (
+    flatten_tool_events,
+    read_whole_events,
+    ToolCallStreamParser,
+    read_whole,
+)
 from .tool_parser import RegionParse, ToolCall, ToolCallParser
 
 __all__ = [
+    "flatten_tool_events",
+    "read_whole_events",
     "DsmlParser",
     "GlmParser",
     "KimiK3Parser",

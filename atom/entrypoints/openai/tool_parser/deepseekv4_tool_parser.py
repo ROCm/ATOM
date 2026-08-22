@@ -172,6 +172,16 @@ class DsmlParser(ToolCallParser):
         "<" + _DSML + "invoke",  # marked invoke
         "<invoke name=",  # marker-less invoke (common malform)
         "<tool_calls>",  # marker-less section open
+        # NOT the marker-less singular `<tool_call>`, though `CALL_OPENERS`
+        # claims it as markup. Adding it here leaves that wrapper in the
+        # answer when a model writes it -- the region opens at `<invoke name=`
+        # by which point it has gone out as content, and `markup_begin` only
+        # looks inside the region -- but this tuple is also what `detect`
+        # keys on, and `<tool_call>` is the Hermes and Qwen opener too. So
+        # declaring it makes DSML claim every one of their templates, which
+        # costs a whole model family its parser to save one stray tag.
+        # Fixing it properly means separating "must not be split" from
+        # "identifies this format", which no format needs yet.
     )
     # The section wrapper closing after the last invoke -- markup, not answer.
     # Both spellings, since the model drops the marker about as often as it

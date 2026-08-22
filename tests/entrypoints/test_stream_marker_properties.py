@@ -1089,6 +1089,49 @@ class TestAPrefixPairCannotChangeTheHandover:
             self.test_both_halves_agree_about_opening_a_region(Synthetic)
 
 
+class TestAFormatThatReportsNoUsableMarkup:
+    """The boundary six hand-written `parse_region` implementations feed.
+
+    A span the engine cannot consume means it consumes nothing, hands the
+    region back, finds the same marker and parses it forever. The earlier
+    guard against that quietly took a one-byte span instead: a byte of the
+    answer vanished with no event and no log, and the re-fed remainder could
+    reopen a region on the same marker and emit the *same* call a second time.
+
+    No registered format can produce this -- every span is a non-empty regex
+    match widened outward -- so this drives a synthetic one. That is the
+    point: it is the check for the seventh parser, and it has to fail towards
+    releasing the region rather than towards eating it.
+    """
+
+    class _Degenerate(QwenXmlParser):
+        NAME = "degenerate"
+        START_MARKERS = ("<X>",)
+
+        @classmethod
+        def parse_region(cls, region, tools, *, at_end):
+            call = ToolCall(
+                id="fixed",
+                type="function",
+                function={"name": "get_weather", "arguments": "{}"},
+            )
+            return RegionParse((call,), ((3, 3), (7, 2)))
+
+    BODY = "<X><X>DUP</X>"
+
+    def test_not_one_byte_of_the_answer_is_deleted(self):
+        content, _ = parse_tool_calls(self.BODY, DECLARED_TOOLS, self._Degenerate)
+        assert (
+            content == self.BODY
+        ), f"{len(self.BODY) - len(content)} byte(s) vanished: {content!r}"
+
+    def test_and_the_call_is_not_emitted_twice(self):
+        parser = ToolCallStreamParser(tools=DECLARED_TOOLS, parser_cls=self._Degenerate)
+        events = parser.process(self.BODY) + parser.flush()
+        starts = [k for k, _ in events if k == "tool_call_start"]
+        assert len(starts) <= 1, f"the same call went out {len(starts)} times"
+
+
 class TestAPlainAnswerDoesNotWaitForTheEnd:
     """A format's own framing is not a reason to stop streaming.
 

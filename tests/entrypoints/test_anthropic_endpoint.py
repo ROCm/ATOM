@@ -899,3 +899,121 @@ class TestAnEffortIsNotAnOptIn:
             and "_th_enabled is not None" in ast.unparse(n.test)
         ]
         assert guarded, "the toggle is written without asking whether it was stated"
+
+
+class TestTheBlocksArriveInTheSameOrderEitherWay:
+    """`/v1/messages` renders content blocks in order, so the order is answer.
+
+    The streaming path emits them as the engine produces them; the
+    non-streaming path was handed `(content_text, tool_calls)` -- the same
+    events with the order thrown away -- and rebuilt one text block ahead of
+    every `tool_use`. The same generation came back as
+    `['text','tool_use','tool_use']` unstreamed and
+    `['tool_use','text','tool_use']` streamed, so a client rendering in order
+    showed the sentence introducing the second call before the first call.
+
+    Not visible before this branch only because both paths were losing that
+    text; fixing the loss is what made the orders disagree.
+    """
+
+    TOOLS = [
+        {
+            "name": "get_weather",
+            "input_schema": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+            },
+        }
+    ]
+    CALL = (
+        "<tool_call>\n<function=get_weather>\n"
+        "<parameter=city>{}</parameter>\n</function>\n</tool_call>"
+    )
+
+    def _both(self, text):
+        from atom.entrypoints.openai.serving_anthropic import (
+            AnthropicBlocks,
+            build_anthropic_response,
+            tool_event_frames,
+        )
+        from atom.entrypoints.openai.tool_parser import (
+            QwenXmlParser,
+            ToolCallStreamParser,
+            flatten_tool_events,
+            read_whole_events,
+        )
+
+        tools = api_server.anthropic_to_openai_tools(self.TOOLS)
+        events = read_whole_events(QwenXmlParser, text, tools)
+        content_text, calls = flatten_tool_events(events)
+        body = build_anthropic_response(
+            "r",
+            "m",
+            content_text,
+            tool_calls=calls or None,
+            stop_reason="tool_use",
+            events=events,
+        )
+        unstreamed = [b["type"] for b in body["content"]]
+
+        parser = ToolCallStreamParser(tools=tools, parser_cls=QwenXmlParser)
+        blocks, streamed_events = AnthropicBlocks(), []
+        for i in range(0, len(text), 7):
+            streamed_events += parser.process(text[i : i + 7])
+        streamed_events += parser.flush()
+        frames = list(tool_event_frames(streamed_events, blocks)) + list(blocks.close())
+        streamed = [
+            json.loads(line[6:])["content_block"]["type"]
+            for frame in frames
+            for line in frame.splitlines()
+            if line.startswith("data: ") and '"content_block_start"' in line
+        ]
+        return streamed, unstreamed
+
+    @pytest.mark.parametrize(
+        "shape",
+        ["between", "after", "before", "only-call", "no-call"],
+        ids=lambda s: s,
+    )
+    def test_the_two_paths_agree(self, shape):
+        one, two = self.CALL.format("Paris"), self.CALL.format("Tokyo")
+        text = {
+            "between": one + "Let me also check Tokyo." + two,
+            "after": one + "Done.",
+            "before": "Checking now." + one,
+            "only-call": one,
+            "no-call": "Just an answer.",
+        }[shape]
+        streamed, unstreamed = self._both(text)
+        assert (
+            streamed == unstreamed
+        ), f"{shape}: stream={streamed} but stream=false={unstreamed}"
+
+    def test_and_the_endpoint_itself_asks_for_the_order(self):
+        """The parity above tests the builder; this tests the call site.
+
+        `build_anthropic_response` falls back to the old one-text-block shape
+        when it is given no events, so the endpoint dropping the argument
+        restores the divergence with every test of the builder still green.
+        """
+        source = pathlib.Path(api_server.__file__).read_text()
+        tree = ast.parse(source)
+        calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "build_anthropic_response"
+        ]
+        assert calls, "the endpoint no longer builds an Anthropic response"
+        for call in calls:
+            assert "events" in {kw.arg for kw in call.keywords}, (
+                f"build_anthropic_response at line {call.lineno} was not given "
+                "the engine's events, so its blocks come back in the wrong order"
+            )
+
+    def test_and_the_sentence_lands_between_the_calls(self):
+        """Not merely equal -- equal to the order the model wrote."""
+        one, two = self.CALL.format("Paris"), self.CALL.format("Tokyo")
+        streamed, _ = self._both(one + "Let me also check Tokyo." + two)
+        assert streamed == ["tool_use", "text", "tool_use"]

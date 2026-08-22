@@ -104,7 +104,11 @@ from .streaming_dispatch import (
     StreamBatchDispatcher,
     StreamOutputCollector,
 )
-from .tool_parser import ToolCallStreamParser, parse_tool_calls
+from .tool_parser import (
+    ToolCallStreamParser,
+    flatten_tool_events,
+    read_whole_events,
+)
 from .tool_parser.registry import (
     TOOL_CALL_PARSER_HELP,
     forbids_tool_calls,
@@ -2129,12 +2133,17 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         ).split(raw_text)
         if drop_reasoning:
             reasoning_content = None
-        content_text, tool_calls = parse_tool_calls(
+        # The engine's own events, not the flattened `(content, calls)`:
+        # this endpoint renders blocks in order, and the flattening is where
+        # the order was lost. `read_whole_events` is the same single chunk
+        # through the same engine the streaming branch above drives.
+        events = read_whole_events(
+            tool_call_parser_cls,
             content_with_tools,
             anthropic_to_openai_tools(request.tools),
-            parser_cls=tool_call_parser_cls,
             suppress_calls=forbids_tool_calls(request.tool_choice),
         )
+        content_text, tool_calls = flatten_tool_events(events)
         output_tokens = len(tokenizer.encode(raw_text))
         cache_read_input_tokens = final_output.get("num_cached_tokens", 0)
         return build_anthropic_response(
@@ -2154,6 +2163,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
             stop_reason=anthropic_stop_reason_with_calls(
                 final_output.get("finish_reason"), bool(tool_calls)
             ),
+            events=events,
         )
 
     except _ClientDisconnected:
