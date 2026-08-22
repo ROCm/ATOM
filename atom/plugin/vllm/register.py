@@ -266,6 +266,14 @@ def register_model() -> None:
 
     apply_vllm_v4_block_reuse_patch()
 
+    from atom.plugin.vllm.dbo_backend_patch import (
+        patch_vllm_dbo_backend,
+        patch_atom_dbo_bridge,
+    )
+
+    patch_vllm_dbo_backend()
+    patch_atom_dbo_bridge()
+
     from atom.plugin.vllm.gdn_backend import register_gdn_attention_backend
 
     register_gdn_attention_backend()
