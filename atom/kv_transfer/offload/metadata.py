@@ -156,11 +156,27 @@ class LMCacheOffloadMetadata(ConnectorMetadata):
     descriptors the worker consumes in ``start_load_kv``.
     """
 
+    #: `state_loads` is the one that is easy to miss: it carries no
+    #: `LMCacheReqMeta`, so a step whose only work is a state load looks empty
+    #: to anything that only counts requests -- and the requests parked on
+    #: those loads are woken by nothing but the report they would never be
+    #: asked to produce.
+    WORK_FIELDS = ConnectorMetadata.WORK_FIELDS + (
+        "requests",
+        "lookup_requests_in_step",
+        "state_loads",
+    )
+
     def __init__(self) -> None:
         super().__init__()
         self.requests: list[LMCacheReqMeta] = []
         # req_ids whose worker-side lookup pin can be released this step.
         self.lookup_requests_in_step: list[str] = []
+        # (req_id, state_hash, target_group) for the K3 state tier. A separate
+        # list because a state load shares no shape with a KV transfer -- no
+        # token ids, no block ids, no chunking -- only the park/report
+        # lifecycle, which is why it rides the metadata rather than the batch.
+        self.state_loads: list[tuple] = []
 
     def add_request(self, meta: LMCacheReqMeta) -> None:
         self.requests.append(meta)

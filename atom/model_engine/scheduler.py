@@ -146,6 +146,7 @@ class CacheStats:
         "_interval_compressed_tokens",
         "_interval_evicted_base",
         "_interval_full_tokens",
+        "_interval_offload_tokens",
         "_interval_requests",
         "_interval_wanted_tokens",
         "_log_interval",
@@ -153,6 +154,7 @@ class CacheStats:
         "total_cached_tokens",
         "total_compressed_tokens",
         "total_full_tokens",
+        "total_offload_tokens",
         "total_requests",
         "total_wanted_tokens",
     )
@@ -162,6 +164,10 @@ class CacheStats:
         self.total_requests: int = 0
         self.total_cached_tokens: int = 0
         self.total_full_tokens: int = 0
+        # Reuse served by the CPU tier, kept out of every series above: those
+        # describe the HBM prefix walk, and an LMCache load reaches past it by
+        # design, so folding them together makes `cached > wanted`.
+        self.total_offload_tokens: int = 0
         # Pre-gate compressed-prefix hit tokens. compressed - cached is reuse
         # the Pool.STATE gates declined; full - compressed is reuse lost to
         # compressed eviction or never there.
@@ -175,6 +181,7 @@ class CacheStats:
         self._interval_requests: int = 0
         self._interval_cached_tokens: int = 0
         self._interval_full_tokens: int = 0
+        self._interval_offload_tokens: int = 0
         self._interval_compressed_tokens: int = 0
         self._interval_wanted_tokens: int = 0
         # Set by Scheduler for pool occupancy logging.
@@ -187,13 +194,19 @@ class CacheStats:
         num_full_tokens: int,
         num_compressed_tokens: int,
         num_wanted_tokens: int,
+        num_offload_tokens: int = 0,
     ) -> None:
         """Record cache stats for one prefill sequence.
 
-        All four are required because the reported rates are differences
+        The first four are required because the reported rates are differences
         between them: `cached <= wanted <= compressed <= full`. A defaulted
         argument would silently report a negative rate rather than a missing
         one.
+
+        `num_offload_tokens` is the exception, and defaults because it is not
+        part of that chain: it is reuse the CPU tier served, which sits above
+        the HBM walk rather than inside it. Counting it in `cached` is what
+        would break the nesting -- see `_schedule_prefill_seq`.
         """
         self.total_requests += 1
         self.total_cached_tokens += num_cached_tokens
@@ -205,6 +218,8 @@ class CacheStats:
         self._interval_full_tokens += num_full_tokens
         self._interval_compressed_tokens += num_compressed_tokens
         self._interval_wanted_tokens += num_wanted_tokens
+        self.total_offload_tokens += num_offload_tokens
+        self._interval_offload_tokens += num_offload_tokens
 
         if self.total_requests % self._log_interval == 0:
             self._log()
@@ -229,6 +244,9 @@ class CacheStats:
             "compressed_tokens": self.total_compressed_tokens,
             "wanted_tokens": self.total_wanted_tokens,
             "full_tokens": self.total_full_tokens,
+            # Reuse from the CPU tier. Separate on purpose: it shares no
+            # denominator with the HBM series above.
+            "offload_tokens": self.total_offload_tokens,
         }
 
     def _reset_interval(self) -> None:
@@ -236,6 +254,7 @@ class CacheStats:
         self._interval_cached_tokens = 0
         self._interval_full_tokens = 0
         self._interval_compressed_tokens = 0
+        self._interval_offload_tokens = 0
         self._interval_wanted_tokens = 0
 
     @staticmethod
@@ -282,6 +301,12 @@ class CacheStats:
                 f"retained-cache {occ['retained']}, "
                 f"evicted this interval {evicted_iv} "
                 f"(total {occ['evicted_total']})"
+            )
+        if self.total_offload_tokens:
+            logger.info(
+                "[Cache Stats offload] CPU-tier tokens: "
+                f"interval={self._interval_offload_tokens} "
+                f"total={self.total_offload_tokens}"
             )
 
     @classmethod
@@ -1192,6 +1217,13 @@ class Scheduler:
             # output_queue). Must intercept here BEFORE the waiting->running
             # promotion below, which would overwrite ABORTED with RUNNING and
             # lose the abort intent.
+            #
+            # It does not follow that it holds nothing: a sequence parked for
+            # a transfer was allocated before it parked, and holds a full block
+            # table plus, for a hybrid, a state group. Leaking the group wedges
+            # every hybrid request once enough disconnects accumulate, since
+            # `can_allocate` refuses one outright with the pool empty.
+            # `deallocate` is a no-op for a seq that really held nothing.
             if seq.status == SequenceStatus.ABORTED:
                 self._reject_aborted_waiting(seq)
                 continue
@@ -1247,6 +1279,13 @@ class Scheduler:
                 self._assert_positive_prefill_chunk(
                     chunk, num_new_tokens, budget_remaining
                 )
+                # This branch `continue`s past both assignments below, so the
+                # refresh happens here too: `_mark_offload_load_ready` raised
+                # `num_cached_tokens` to the post-load hit, and the stale field
+                # is what reaches the API as `cached_tokens` -- the tier would
+                # look like it returned nothing. Unconditional, because a seq
+                # re-admitted after `preempt()` keeps the field.
+                seq.prefix_cache_hit_tokens = seq.num_cached_tokens
                 num_seqs_prefill, num_batched_tokens = self._schedule_prefill_seq(
                     seq,
                     chunk,
@@ -1312,12 +1351,16 @@ class Scheduler:
                 break
             self.block_manager.allocate(seq, num_cached_blocks)
 
+            # The hit the request kept, not the one `can_allocate` offered:
+            # `allocate` may disown the boundary, and `num_cached_blocks` is the
+            # pre-disown count. `seq.num_cached_tokens` also gets the unit right
+            # under DCP, and is what CacheStats uses, so the user-visible number
+            # and the internal hit rate cannot disagree.
+            #
             # Guard: PD decode consumer inherits hit from prefill node;
-            # don't clobber with local num_cached_blocks (always 0 on consumer).
+            # don't clobber with the local hit (always 0 on consumer).
             if not seq.prefix_cache_hit_tokens:
-                seq.prefix_cache_hit_tokens = (
-                    num_cached_blocks * self.block_manager.block_size
-                )
+                seq.prefix_cache_hit_tokens = seq.num_cached_tokens
 
             self._notify_connector_after_prefill_alloc(seq)
 
@@ -1326,12 +1369,53 @@ class Scheduler:
             )
 
             if needs_remote_load:
+                if seq.state_load_hash != -1 and not seq.state_joint_boundary_tokens:
+                    # Two transfers but one report: the first completion would
+                    # unpark the request while the other is still writing. Only
+                    # reachable when the legs were decided separately -- a joint
+                    # load arrives as one event via `_JointPark`.
+                    logger.warning(
+                        "seq %s has both a remote KV load and a state load "
+                        "pending, with no joint boundary; dropping the state "
+                        "load.",
+                        seq.id,
+                    )
+                    self.block_manager.cancel_state_load(seq)
                 self._park_for_remote_load(seq, skipped_waiting_requests)
                 continue
 
-            seq.prefix_cache_hit_tokens = (
-                num_cached_blocks * self.block_manager.block_size
-            )
+            if seq.state_joint_boundary_tokens:
+                # The KV leg was refused after the state leg was aimed at the
+                # joint boundary, so the state claims a prefix whose KV nobody
+                # will fetch. Disown it; `_decide_load_after_alloc` logs why.
+                logger.debug(
+                    "[JOINT-DISOWN] seq %s: KV leg refused at boundary %d; "
+                    "recomputing from %d",
+                    seq.id,
+                    seq.state_joint_boundary_tokens,
+                    seq.num_cached_tokens,
+                )
+                if seq.state_load_hash != -1:
+                    self.block_manager.cancel_state_load(seq)
+                seq.num_cached_tokens = 0
+                seq.state_joint_boundary_tokens = 0
+                seq.state_joint_boundary_hash = -1
+
+            if seq.state_load_hash != -1:
+                # The kept state boundary is in LMCache, not HBM. It parks
+                # exactly as a KV load does -- same queue, same backpressure,
+                # same wake-up -- because to the scheduler both are one event:
+                # a transfer into blocks this request already holds.
+                self._park_for_remote_load(seq, skipped_waiting_requests)
+                continue
+
+            # Refresh, not a duplicate of the set above: that one is guarded
+            # on the field being empty, so a seq re-admitted after `preempt()`
+            # would keep its previous admission's hit. Unconditional here, where
+            # the request is certain to prefill locally. The only path reaching
+            # this with an inherited PD hit is a *failed* remote recv, and there
+            # the local hit is the truthful number.
+            seq.prefix_cache_hit_tokens = seq.num_cached_tokens
 
             chunk = self._adjust_prefill_chunk_after_alloc(seq, chunk)
             chunk = self._finalize_prefill_chunk(seq, seq.num_cached_tokens, chunk)
@@ -1365,6 +1449,32 @@ class Scheduler:
                 self._kv_usage(),
             )
 
+        if self._schedule_tick % 100 == 0:
+            fates = self.block_manager.state_checkpoint_fates()
+            if any(fates.values()):
+                logger.info(
+                    "state checkpoints: %s",
+                    " ".join(f"{k}={v}" for k, v in sorted(fates.items())),
+                )
+            # Its own line rather than a key in the one above: those are what
+            # became of a checkpoint, this is whether a prefix in LMCache could
+            # be paired with one at all. Silent unless the joint load is on,
+            # since both counters stay 0 without it.
+            chosen = self.block_manager.joint_boundaries
+            skips = self.block_manager.joint_skips
+            if chosen or skips:
+                # The hbm/tier split is the actionable half: both are reuse,
+                # but only `tier` costs an entry-sized H2D and a park, so a
+                # ratio dominated by it says the state pool is too small for
+                # this concurrency even while the load counters look healthy.
+                logger.info(
+                    "joint kv: boundaries=%d (hbm=%d tier=%d) | %s",
+                    chosen,
+                    self.block_manager.joint_boundaries_hbm,
+                    self.block_manager.joint_boundaries_tier,
+                    " ".join(f"{k}={v}" for k, v in sorted(skips.items())),
+                )
+
         total_tokens_num_prefill = sum(num_scheduled_tokens)
 
         if num_seqs_prefill > 0:
@@ -1383,6 +1493,7 @@ class Scheduler:
 
             connector_meta_output = None
             if self.kv_connector is not None:
+                self._publish_state_loads()
                 connector_meta_output = self.kv_connector.build_connector_meta()
 
             # Freeze, per seq, whether this chunk finishes the prompt. Uses the
@@ -1529,6 +1640,7 @@ class Scheduler:
 
         connector_meta_output = None
         if self.kv_connector is not None:
+            self._publish_state_loads()
             connector_meta_output = self.kv_connector.build_connector_meta()
 
         decode_batch = ScheduledBatch(
@@ -1545,6 +1657,9 @@ class Scheduler:
             remote_kv_block_ids=sorted(remote_kv_blocks) if remote_kv_blocks else [],
             remote_kv_seq_blocks=remote_kv_seq_blocks,
             # An empty batch cannot execute queued maintenance.
+            # For spills that is not merely wasted work: a drained spill is
+            # released only once its copy reaches a forward, so draining into a
+            # batch that is never forwarded strands every slot it drained.
             state_maintenance_ops=(
                 self.block_manager.take_state_maintenance_ops()
                 if scheduled_seqs
@@ -1601,6 +1716,22 @@ class Scheduler:
         seq.status = SequenceStatus.WAITING
         if not self._connector_flag("is_offload"):
             self._uncount_inflight_load(seq)
+        if getattr(seq, "state_load_hash", -1) != -1 or getattr(
+            seq, "state_joint_boundary_tokens", 0
+        ):
+            # The state never arrived, so the boundary is not this request's
+            # history. Disown it exactly as `BlockManager.allocate` does at
+            # admission, otherwise the resume runs with `num_cached_tokens > 0`
+            # over a group nobody filled -- `has_initial_state` reads that as
+            # "the recurrence continues". Before `offload_loaded_tokens` is set
+            # below, so that field records the disowned figure.
+            seq.num_cached_tokens = 0
+            seq.state_load_hash = -1
+            # A joint boundary that failed on either leg is not this request's
+            # history any more than a state-only one is, and leaving it set
+            # would let the connector clamp a later lookup to it.
+            seq.state_joint_boundary_tokens = 0
+            seq.state_joint_boundary_hash = -1
         seq.offload_loaded = False
         seq.offload_loaded_tokens = seq.num_cached_tokens
         seq.offload_load_start_tokens = None
@@ -1676,6 +1807,14 @@ class Scheduler:
             seq.prefix_cache_hit_tokens = max(seq.prefix_cache_hit_tokens, loaded)
         seq.offload_load_start_tokens = None
         seq.offload_loaded = True
+        # A state load moves no KV, so the block above does nothing for it --
+        # `num_cached_tokens` is already the boundary the state covers, and all
+        # that is left is to stop calling the load pending. A joint load is the
+        # one case where both halves fire, and `_JointPark` held the wake until
+        # both legs reported.
+        seq.state_load_hash = -1
+        seq.state_joint_boundary_tokens = 0
+        seq.state_joint_boundary_hash = -1
 
     def _is_offload_prefill_resume(self, seq: Sequence) -> bool:
         """True when offload already owns blocks and should resume suffix prefill.
@@ -1697,8 +1836,16 @@ class Scheduler:
         """Ask the connector whether this prefill should park for remote KV."""
         if skip or self.kv_connector is None:
             return False
-        _ext_tokens, needs_remote_load = self.kv_connector.get_num_new_matched_tokens(
+        ext_tokens, needs_remote_load = self.kv_connector.get_num_new_matched_tokens(
             seq
+        )
+        # Keep the lookup's answer, not just the park flag: `can_allocate` runs
+        # next and a hybrid's two legs have to be aimed at one boundary, for
+        # which this is the KV leg's ceiling. In tokens, and absolute -- the
+        # connector reports what it found *beyond* what the seq already has.
+        seq.offload_kv_prefix_tokens = int(ext_tokens) + int(seq.num_cached_tokens)
+        seq.offload_kv_chunk_tokens = int(
+            getattr(self.kv_connector, "chunk_size", 0) or 0
         )
         return needs_remote_load
 
@@ -1860,11 +2007,20 @@ class Scheduler:
             # `block_size * dcp_world_size` tokens — so scaling by block_size
             # would under-report by the DCP factor.
             hbs = self.block_manager.hash_block_size
+            # `num_cached_tokens` sits above the HBM walk once a load landed
+            # -- that is the feature. Those tokens are not paged-pool reuse, so
+            # they go in their own series rather than inflating `cached` and
+            # making `wanted - cached` negative. `seq.num_cached_tokens` is
+            # deliberately NOT clamped: the forward must skip what was loaded.
+            wanted_tokens = seq.num_wanted_hit_blocks * hbs
+            hbm_cached_tokens = min(seq.num_cached_tokens, wanted_tokens)
+            offload_tokens = seq.num_cached_tokens - hbm_cached_tokens
             self.cache_stats.update(
-                seq.num_cached_tokens,
+                hbm_cached_tokens,
                 seq.num_tokens,
                 seq.num_compressed_hit_blocks * hbs,
-                seq.num_wanted_hit_blocks * hbs,
+                wanted_tokens,
+                num_offload_tokens=offload_tokens,
             )
         num_batched_tokens += chunk
         seq.status = SequenceStatus.RUNNING
@@ -1886,6 +2042,51 @@ class Scheduler:
         if hasattr(self.kv_connector, "should_park_for_load_after_alloc"):
             return self.kv_connector.should_park_for_load_after_alloc(seq)
         return True
+
+    def _settle_state_load(self, req_id, ok: bool) -> None:
+        """Release the state group a load reserved. No-op for an id the state
+        index never issued, and for a scheduler built without a block manager
+        (the connector test doubles)."""
+        settle = getattr(
+            getattr(self, "block_manager", None), "settle_state_load", None
+        )
+        if settle is not None:
+            settle(req_id, ok=ok)
+
+    def _publish_state_loads(self) -> None:
+        """Hand this pass's state-tier loads to the connector, before it builds
+        its metadata.
+
+        Drained here rather than at the park, because the connector publishes
+        once per pass and a load handed over twice would write the same entry
+        into a group the first transfer is already filling.
+        """
+        if self.kv_connector is None:
+            return
+        loads = self.block_manager.take_state_loads()
+        if not loads:
+            return
+        accepted = False
+        if hasattr(self.kv_connector, "enqueue_state_loads"):
+            accepted = bool(self.kv_connector.enqueue_state_loads(loads))
+        if accepted:
+            return
+        # Nothing will carry them and the requests are parked against a report
+        # that would never come, so wake them for recompute -- `failed_loading`
+        # means "recompute over the blocks already allocated".
+        #
+        # `abandon_state_load`, not `settle(ok=False)`: nothing was attempted,
+        # so this is not a miss to count against the index.
+        logger.warning(
+            "state offload: %s did not carry %d state load(s); waking those "
+            "requests to recompute. The tier's index should not have been "
+            "installed against this connector.",
+            type(self.kv_connector).__name__,
+            len(loads),
+        )
+        for req_id, _h, _group in loads:
+            self.block_manager.abandon_state_load(req_id)
+            self.failed_recving_kv_req_ids.append(req_id)
 
     def _park_for_remote_load(
         self, seq: Sequence, skipped_waiting_requests: deque[Sequence]
@@ -2668,9 +2869,16 @@ class Scheduler:
             )
             self.failed_recving_kv_req_ids.append(req_id)
 
+        # The two loading channels carry state-tier loads as well as KV ones,
+        # which buys the state leg the aggregator's per-request quorum for free.
+        # They cannot be confused: a KV load is refused for any sequence with a
+        # per-request cache, and a state load exists only for such a sequence.
         for req_id in kv_connector_output.finished_loading or ():
             assert is_offload, "Only offload connector should update loading KV status"
             logger.debug("Finished offload KV load for request %s", req_id)
+            # Ahead of the abort guard: an aborted request's state group has to
+            # be released too, and the guard takes the `continue`.
+            self._settle_state_load(req_id, ok=True)
             if self._finish_aborted_load_cleanup(req_id):
                 continue
             self.finished_recving_kv_req_ids.append(req_id)
@@ -2683,6 +2891,7 @@ class Scheduler:
                 "Offload KV load failed for request %s; falling back to prefill.",
                 req_id,
             )
+            self._settle_state_load(req_id, ok=False)
             if self._finish_aborted_load_cleanup(req_id):
                 continue
             self.failed_recving_kv_req_ids.append(req_id)
@@ -2703,6 +2912,24 @@ class Scheduler:
                 seq = self._deferred_sequence(req_id)
                 if seq is not None:
                     self._maybe_release_deferred(seq)
+
+        # The state-offload reports, not keyed by request: by the time a spill
+        # lands its owner is long gone and only the hash and slot remain. They
+        # ride the connector's completion channels, so they are drained from the
+        # connector with TP quorum already taken.
+        offload = getattr(
+            getattr(self, "block_manager", None), "state_offload", None
+        )
+        take = getattr(self.kv_connector, "take_state_reports", None)
+        if offload is not None and take is not None:
+            indexed, released, _failed = take()
+            # Index before releasing, always. The reverse order opens a window
+            # in which the slot is reusable but its hash is not yet findable,
+            # so a lookup misses a checkpoint that is in fact stored.
+            for h in indexed:
+                offload.confirm_spill(int(h))
+            for slot in released:
+                offload.release_staging(int(slot))
 
     def get_request_counts(self) -> tuple[int, int]:
         """Returns (num_running_reqs, num_waiting_reqs)."""

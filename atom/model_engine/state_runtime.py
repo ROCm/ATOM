@@ -163,11 +163,20 @@ class StateMaintenanceOps:
     """State movement drained once before a model batch."""
 
     relocations: tuple[tuple[int, int], ...] = ()
+    # (src_group, dst_entry, staging_slot, hash) for checkpoints the state pool
+    # evicted to the offload tier. Carried here rather than beside this struct
+    # so the one consumer -- `CommonAttentionBuilder.build` -- is also the one
+    # place the spill-before-copy order is enforced. Empty unless
+    # the offload tier is on.
+    spills: tuple[tuple[int, int, int, int], ...] = ()
     checkpoint_stores: tuple[CheckpointStoreOp, ...] = ()
     checkpoint_restores: tuple[CheckpointRestoreOp, ...] = ()
 
     @property
     def empty(self) -> bool:
         return not (
-            self.relocations or self.checkpoint_stores or self.checkpoint_restores
+            self.relocations
+            or self.spills
+            or self.checkpoint_stores
+            or self.checkpoint_restores
         )

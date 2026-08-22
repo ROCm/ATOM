@@ -546,6 +546,15 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         adjusted = min(int(chunk), limit)
         return max(1, adjusted)
 
+    def _may_emit_save(self) -> bool:
+        """Seam for a subclass to bound how many saves may be outstanding.
+
+        Unbounded here. It matters for a layout whose `should_defer_free` pins
+        a finished request's blocks until its save drains -- an unbounded queue
+        then lets a slow backend hold an unbounded slice of the pool.
+        """
+        return True
+
     def build_connector_meta(self) -> LMCacheOffloadMetadata:
         meta = LMCacheOffloadMetadata()
 
@@ -578,7 +587,7 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
                 self._clear_pending_load(sid)
                 continue
             # num_cached after load = max(HBM, offload); never drop below HBM.
-            seq.offload_loaded_tokens = max(hbm, lmc)
+            seq.offload_loaded_tokens = self._claim_after_load(seq, hbm, lmc)
             # req_id MUST be the raw seq.id (the type the scheduler compares
             # against in _update_waiting_for_remote_kv); str(seq.id) is only for
             # LMCache's lookup/pin API. A str here silently never wakes the seq.
@@ -617,6 +626,8 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         for sid, entry in self._save_tracker.items():
             if not self._do_save:
                 continue
+            if not self._may_emit_save():
+                break
             seq, saved = entry
             if sid in self._reqs_need_recv or sid in loading_sids:
                 continue  # loading this step; defer its save

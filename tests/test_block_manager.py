@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Tests for atom/model_engine/block_manager.py — public API only
 
+import logging
 
 from conftest import MockConfig
 
@@ -49,6 +50,72 @@ class TestCanAllocate:
     def test_can_allocate_multi_block(self, block_manager, seq_factory):
         seq = seq_factory([1, 2, 3, 4, 5])
         assert block_manager.can_allocate(seq) >= 0
+
+
+# ── the widened claim behind a joint boundary ──────────────────────────────
+
+
+class TestJointClaimReusesResidentBlocks:
+    """`can_allocate` returns one number, and the request needs two.
+
+    What it may call *cached* is gated on a resumable state behind it. What it
+    may point its block table at is every block the prefix walk matched -- the
+    state gate cut resumability, not residency. Without the second number the
+    KV leg pays LMCache to resend blocks the pool is already holding, and the
+    reply lands in *fresh* blocks, so HBM ends up with two copies of the same
+    prefix.
+    """
+
+    def _resident_prefix(self, seq_factory):
+        """A 4-block prefix published in the index, then released."""
+        cfg = MockConfig(
+            num_kvcache_blocks=32, kv_cache_block_size=4, enable_prefix_caching=True
+        )
+        bm = BlockManager(cfg)
+        tokens = list(range(20))
+        first = seq_factory(tokens)
+        bm.allocate(first, 0)
+        bm.hash_blocks(first, len(tokens))
+        resident = list(first.block_table[:4])
+        bm.deallocate(first)
+        return bm, tokens, resident
+
+    def test_without_a_joint_boundary_the_claim_stops_at_the_gated_hit(
+        self, seq_factory
+    ):
+        bm, tokens, resident = self._resident_prefix(seq_factory)
+        seq = seq_factory(tokens)
+        bm.allocate(seq, 2)
+        assert seq.block_table[:2] == resident[:2]
+        # Blocks 2 and 3 are resident and match, but nothing above the hit will
+        # ever be treated as computed, so claiming them would pin blocks the
+        # forward is about to overwrite.
+        assert seq.block_table[2] not in resident[2:]
+        assert seq.num_cached_tokens == 8
+
+    def test_a_joint_boundary_widens_the_claim_without_widening_the_hit(
+        self, seq_factory
+    ):
+        bm, tokens, resident = self._resident_prefix(seq_factory)
+        seq = seq_factory(tokens)
+        # The state gate cut the hit to 2 blocks; the walk had matched 4.
+        seq.state_joint_claim_tokens = 16
+        bm.allocate(seq, 2)
+
+        # All four resident blocks are reused -- that is the transfer the KV
+        # leg no longer has to make, and the second copy that no longer lands.
+        assert seq.block_table[:4] == resident
+        # ...and the request still only calls two of them cached, so a failed
+        # leg leaves the forward recomputing rather than skipping.
+        assert seq.num_cached_tokens == 8
+
+    def test_the_widened_claim_still_gives_every_position_a_block(self, seq_factory):
+        bm, tokens, _ = self._resident_prefix(seq_factory)
+        seq = seq_factory(tokens)
+        seq.state_joint_claim_tokens = 16
+        bm.allocate(seq, 2)
+        assert len(seq.block_table) == 5
+        assert len(set(seq.block_table)) == 5
 
 
 # ── allocate / deallocate ──────────────────────────────────────────────────
@@ -583,3 +650,88 @@ class TestRegisterReceivedPrefix:
         a = seq_factory(list(range(1, 11)))  # 10 tokens, bs=4 -> 2 full + partial
         bm.allocate(a)
         assert bm.register_received_prefix(a) == 2
+
+
+# ── state_offload disabled by default ─────────────────────────────────────
+
+
+def test_state_offload_is_none_when_tier_is_off(block_manager):
+    """No `lmcache_offload` connector means no tier, whatever the ring size:
+    the connector is the feature's only on/off switch."""
+    assert block_manager.state_offload is None
+
+
+# ── the ring is installed only where something can drain it ───────────────
+
+_OFFLOAD_KVC = {"kv_connector": "lmcache_offload", "kv_role": "offload"}
+
+
+def _bm_with_state_tier(monkeypatch, kv_transfer_config):
+    monkeypatch.setenv("OFFLOAD_STATE_STAGING_GROUPS", "2")
+    cfg = MockConfig(
+        enable_prefix_caching=True,
+        kv_transfer_config=kv_transfer_config,
+        pool_entries={"state": 4},
+        pool_entries_per_req={"state": 1},
+    )
+    return BlockManager(cfg)
+
+
+def test_no_ring_is_installed_without_a_connector_that_hosts_the_tier(
+    monkeypatch, caplog
+):
+    """The silent-permanent failure. Nothing submits a spill without a hosting
+    connector -- `_poll_kv_transfer_progress` returns early and the forward
+    finds no `_state_tier` -- so an installed ring would hand out every slot
+    and never get one back. Refuse to install it."""
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        bm = _bm_with_state_tier(monkeypatch, None)
+
+    assert bm.state_offload is None
+    assert all(cache.offload is None for cache in bm.state_caches)
+    # An installed-but-inert ring is the thing that misleads, so drive the
+    # eviction path that would reserve a slot and prove none is: with the ring
+    # installed this same call yields (group, dst, slot, hash) and that slot
+    # never comes back.
+    bm.state.group_hash[1] = 111
+    bm.state._spill(1)
+    assert bm.state.take_spill_copies() == []
+    assert bm.state_spills_for_batch() == []
+
+
+def test_a_connector_that_cannot_host_the_tier_gets_no_ring_either(monkeypatch, caplog):
+    """Same leak, one step subtler: moriio is a KV connector, so a plain
+    truthiness test on kv_transfer_config would install the ring, but only
+    lmcache_offload's worker half ever builds a `_state_tier`."""
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        bm = _bm_with_state_tier(monkeypatch, {"kv_connector": "moriio"})
+
+    assert bm.state_offload is None
+
+
+def test_the_ring_is_installed_for_the_offload_connector(monkeypatch):
+    bm = _bm_with_state_tier(monkeypatch, _OFFLOAD_KVC)
+    assert bm.state_offload is not None
+    assert bm.state_offload.staging_depth == 2
+    assert all(cache.offload is bm.state_offload for cache in bm.state_caches)
+
+
+def test_the_ring_is_installed_for_a_multi_that_lists_the_offload_backend(
+    monkeypatch,
+):
+    bm = _bm_with_state_tier(
+        monkeypatch,
+        {
+            "kv_connector": "multi",
+            "connectors": [{"kv_connector": "moriio"}, _OFFLOAD_KVC],
+        },
+    )
+    assert bm.state_offload is not None
+
+
+def test_a_multi_without_the_offload_backend_gets_no_ring(monkeypatch):
+    bm = _bm_with_state_tier(
+        monkeypatch,
+        {"kv_connector": "multi", "connectors": [{"kv_connector": "moriio"}]},
+    )
+    assert bm.state_offload is None
