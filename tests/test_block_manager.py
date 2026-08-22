@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Tests for atom/model_engine/block_manager.py — public API only
 
+
 from conftest import MockConfig
 
 from atom.model_engine.block_manager import BlockManager
@@ -148,7 +149,7 @@ class TestPublishLoadedPrefix:
         bm.allocate(loaded)
 
         assert bm.publish_loaded_prefix(loaded, start_token=0, end_token=8) == 8
-        loaded_block = bm.blocks[loaded.block_table[0]]
+        loaded_block = bm.kv.block(loaded.block_table[0])
         assert loaded_block.token_ids == list(range(8))
 
         probe = seq_factory(list(range(8)) + list(range(100, 108)))
@@ -156,6 +157,48 @@ class TestPublishLoadedPrefix:
         assert num_cached_blocks == 1
         bm.allocate(probe, num_cached_blocks)
         assert probe.num_cached_tokens == 8
+
+    def test_skips_when_predecessor_unhashed(self, seq_factory):
+        """A gap before the loaded range logs an error and skips."""
+        cfg = MockConfig(num_kvcache_blocks=16, enable_prefix_caching=True)
+        bm = BlockManager(cfg)
+        tokens = list(range(24))
+
+        loaded = seq_factory(tokens)
+        bm.allocate(loaded)
+        # Blocks 0-1 unhashed — publish_loaded_prefix should skip, not crash.
+        assert bm.publish_loaded_prefix(loaded, start_token=8, end_token=16) == 0
+
+
+class TestHashChainGapSkip:
+    def test_hash_blocks_skips_on_gap(self, block_manager_prefix, seq_factory):
+        """A gap in the hash chain must skip, not mint false-root hashes."""
+        bm = block_manager_prefix
+        tokens = list(range(16))
+
+        seq = seq_factory(tokens)
+        bm.allocate(seq)
+        seq.num_cached_tokens = 8
+        bm.hash_blocks(seq, 8)
+
+        # Blocks 0-1 never hashed → hash_blocks should skip → blocks stay -1.
+        for b in seq.block_table:
+            assert bm.kv.block(b).hash == -1
+
+    def test_no_skip_when_chain_intact(self, block_manager_prefix, seq_factory):
+        bm = block_manager_prefix
+        seq = seq_factory(list(range(16)))
+        bm.allocate(seq)
+        bm.hash_blocks(seq, 16)
+        for b in seq.block_table:
+            assert bm.kv.block(b).hash != -1
+
+    def test_hash_blocks_clamps_to_block_table(self, block_manager_prefix, seq_factory):
+        bm = block_manager_prefix
+        seq = seq_factory(list(range(16)))
+        bm.allocate(seq)
+        seq.block_table.pop()
+        bm.hash_blocks(seq, 16)  # must not IndexError
 
 
 # ── can_append / may_append ────────────────────────────────────────────────
@@ -215,7 +258,7 @@ class TestCanAllocateWithPrefixCaching:
     def test_can_allocate_accounts_for_cache_hits(self, seq_factory):
         """can_allocate must charge BOTH the cache-miss block AND the
         cache-hit-on-free-pool block to the free-block budget, because the
-        cached block still has to be claimed out of free_block_ids_set."""
+        cached block still has to be claimed off the free list."""
         cfg = MockConfig(
             num_kvcache_blocks=4, kv_cache_block_size=4, enable_prefix_caching=True
         )
@@ -255,7 +298,7 @@ class TestCanAllocateWithPrefixCaching:
 class TestHashTableCleanup:
     def test_stale_hash_entries_evicted_on_reuse(self, seq_factory):
         """When a cached block is reused for a different hash, the old
-        hash_to_block_id entry should be cleaned up."""
+        content-hash entry should be cleaned up."""
         cfg = MockConfig(
             num_kvcache_blocks=2, kv_cache_block_size=4, enable_prefix_caching=True
         )
@@ -263,7 +306,7 @@ class TestHashTableCleanup:
         s1 = seq_factory([1, 2, 3, 4, 5, 6, 7, 8])
         bm.allocate(s1)
         bm.hash_blocks(s1, s1.num_tokens - s1.num_cached_tokens)
-        h1 = bm.blocks[s1.block_table[0]].hash
+        h1 = bm.kv.block(s1.block_table[0]).hash
         bm.deallocate(s1)
 
         # Allocate with completely different tokens — should overwrite blocks
@@ -271,10 +314,10 @@ class TestHashTableCleanup:
         bm.allocate(s2)
         bm.hash_blocks(s2, s2.num_tokens - s2.num_cached_tokens)
         # Old hash should no longer point to a valid block
-        assert bm.hash_to_block_id.get(h1) != s2.block_table[0]
+        assert bm.kv.lookup(h1) != s2.block_table[0]
 
     def test_hash_table_bounded_growth(self, seq_factory):
-        """hash_to_block_id should not grow beyond num_kvcache_blocks."""
+        """The content index should not grow beyond num_kvcache_blocks."""
         cfg = MockConfig(
             num_kvcache_blocks=4, kv_cache_block_size=4, enable_prefix_caching=True
         )
@@ -286,7 +329,7 @@ class TestHashTableCleanup:
             if n >= 0:
                 bm.allocate(seq, n)
                 bm.deallocate(seq)
-        assert len(bm.hash_to_block_id) <= cfg.num_kvcache_blocks
+        assert bm.kv.num_indexed <= cfg.num_kvcache_blocks
 
 
 # ── can_append with multi-token decode (speculative decoding) ────────────
@@ -383,155 +426,160 @@ class TestPrefixCachingEdgeCases:
         bm.allocate(s2)
         assert s2.num_cached_tokens == 0
 
-    def test_free_block_ids_set_consistent(self, block_manager, seq_factory):
-        """free_block_ids_set stays consistent through allocate/deallocate."""
+    def test_free_count_consistent(self, block_manager, seq_factory):
+        """The free count stays consistent through allocate/deallocate."""
         s1 = seq_factory([1, 2, 3, 4])
         block_manager.allocate(s1)
-        initial_free = len(block_manager.free_block_ids_set)
+        initial_free = block_manager.kv.num_free
         block_manager.deallocate(s1)
-        assert len(block_manager.free_block_ids_set) == initial_free + 1
+        assert block_manager.kv.num_free == initial_free + 1
 
 
-# ── M2 paged-SWA dual pool ───────────────────────────────────────────────────
-
-_MC = MockConfig
+# ── decode-side block hashing ──────────────────────────────────────────────
 
 
-def _swa_bm(num_blocks=10, num_swa=10, bs=4, window=8, prefix=True):
-    return BlockManager(
-        _MC(
-            num_kvcache_blocks=num_blocks,
-            num_swa_blocks=num_swa,
-            kv_cache_block_size=bs,
-            swa_window_size=window,
-            enable_prefix_caching=prefix,
-        )
-    )
+class TestDecodeBlockHashing:
+    """Generated blocks must enter the prefix cache, not just prompt blocks.
 
+    The multi-turn case: turn 2's prompt is turn 1's prompt plus turn 1's
+    answer. Hashing only the prompt caps every follow-up hit at the original
+    prompt length, no matter how much of the conversation is still resident.
+    """
 
-class TestM2DualSwaPool:
-    def test_disabled_by_default(self, block_manager, seq_factory):
-        # No num_swa_blocks → swa disabled, swa_block_table stays empty.
-        assert block_manager.swa_enabled is False
-        seq = seq_factory([1, 2, 3, 4, 5, 6, 7, 8])
-        n = block_manager.can_allocate(seq)
-        block_manager.allocate(seq, n)
-        assert seq.block_table and seq.swa_block_table == []
+    BS = 4
 
-    def test_allocate_parallel(self, seq_factory):
-        bm = _swa_bm()
-        toks = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]  # 3 blocks (bs=4)
-        seq = seq_factory(toks)
-        n = bm.can_allocate(seq)
-        bm.allocate(seq, n)
-        # allocate() is lazy: swa_block_table starts as -1 placeholders (same
-        # length as block_table); the scheduler fills the chunk's window before
-        # forward via ensure_for_tokens (here: single-shot whole prompt).
-        assert len(seq.swa_block_table) == len(seq.block_table) == seq.num_blocks
-        assert all(s < 0 for s in seq.swa_block_table)
-        bm.swa.ensure_for_tokens(seq, 0, len(toks))
-        # After ensure, the touched logical blocks hold real disjoint phys ids.
-        assert all(s in bm.swa.used_block_ids for s in seq.swa_block_table)
+    def _bm(self, **overrides):
+        cfg = {
+            "num_kvcache_blocks": 100,
+            "kv_cache_block_size": self.BS,
+            "enable_prefix_caching": True,
+            "max_model_len": 256,
+        }
+        cfg.update(overrides)
+        return BlockManager(MockConfig(**cfg))
 
-    def test_windowonly_prefill_no_cross_request_swa_reuse(self, seq_factory):
-        # Window-only prefill writes/publishes SWA only for the trailing
-        # `window` tokens relative to the FULL prompt. Cross-request prefix
-        # reuse needs the trailing window *at the hit boundary* (mid-prompt)
-        # to be SWA-present — which window-only never writes — so bounded_hit
-        # finds no complete in-window run and gates the whole hit to 0. This
-        # trades away cross-request SWA prefix reuse for prefill scatter-write
-        # cost (see paged-SWA perf notes); correctness is preserved (a denied
-        # hit just recomputes, never reads stale SWA).
-        bm = _swa_bm()
-        toks = list(range(1, 13))  # 3 blocks
-        s1 = seq_factory(toks)
-        bm.allocate(s1, bm.can_allocate(s1))
-        bm.swa.ensure_for_tokens(
-            s1, 0, len(toks)
-        )  # fill SWA (scheduler does this pre-forward)
-        bm.hash_blocks(s1, len(toks))  # publish hashes (compressed + swa)
-        s2 = seq_factory(toks)
-        n2 = bm.can_allocate(s2)
-        assert n2 == 0  # window-only: no cross-request SWA prefix reuse
-        bm.allocate(s2, n2)
-        # reused cached blocks share the SAME swa phys ids as s1.
-        for i in range(n2):
-            assert s2.swa_block_table[i] == s1.swa_block_table[i]
-            assert bm.swa.blocks[s2.swa_block_table[i]].ref_count >= 2
-
-    def test_intersection_stops_hit_when_swa_evicted(self, seq_factory):
-        bm = _swa_bm()
-        toks = list(range(1, 13))
-        s1 = seq_factory(toks)
-        bm.allocate(s1, bm.can_allocate(s1))
-        bm.hash_blocks(s1, len(toks))
-        bm.deallocate(s1)
-        # Manually evict the SWA hash for block 0 (simulate window-free/evict)
-        # while leaving the compressed hash intact → hit must stop at block 0.
-        h0 = BlockManager.compute_hash(toks[0:4])
-        bm.swa.hash_to_block_id.pop(h0, None)
-        s2 = seq_factory(toks)
-        n2 = bm.can_allocate(s2)
-        assert n2 == 0  # compressed block 0 cached but SWA gone → no reuse
-
-    def test_deallocate_frees_both_pools(self, seq_factory):
-        bm = _swa_bm()
-        toks = list(range(1, 13))
-        seq = seq_factory(toks)
+    def _run_turn(self, bm, seq, generated):
+        """Prefill `seq`, then append `generated` and hash what filled up."""
         bm.allocate(seq, bm.can_allocate(seq))
-        bm.swa.ensure_for_tokens(seq, 0, len(toks))  # materialize real SWA blocks
-        used_swa = {s for s in seq.swa_block_table if s >= 0}
+        bm.hash_blocks(seq, seq.num_prompt_tokens - seq.num_cached_tokens)
+        for token in generated:
+            seq.append_token(token)
+            bm.may_append(seq)
+        bm.hash_decode_blocks(seq, seq.num_tokens)
+
+    def test_followup_turn_reuses_the_generated_blocks(self, seq_factory):
+        bm = self._bm()
+        prompt = list(range(8))  # 2 blocks
+        generated = list(range(100, 112))  # 3 more blocks
+        self._run_turn(bm, seq_factory(prompt), generated)
+
+        # Turn 2 replays the whole conversation as its prompt: 20 tokens, 5
+        # blocks. can_allocate never hands back the last block (the seq has to
+        # forward something), so a full hit is 4.
+        followup = seq_factory(prompt + generated)
+        assert bm.can_allocate(followup) == 4
+
+    def test_prompt_only_hashing_would_stop_at_the_prompt(self, seq_factory):
+        """Pins what the fix buys: without it the hit stops at 2 blocks."""
+        bm = self._bm()
+        prompt = list(range(8))
+        generated = list(range(100, 112))
+        seq = seq_factory(prompt)
+        bm.allocate(seq, bm.can_allocate(seq))
+        bm.hash_blocks(seq, seq.num_prompt_tokens)
+        for token in generated:
+            seq.append_token(token)
+            bm.may_append(seq)
+        # Deliberately skip hash_decode_blocks — the pre-fix behaviour.
+        followup = seq_factory(prompt + generated)
+        assert bm.can_allocate(followup) == 2
+
+    def test_uncommitted_tail_is_not_hashed(self, seq_factory):
+        """Only whole blocks below the committed watermark may be published.
+
+        The speculative-decoding hazard: tokens above the committed length can
+        still be rewritten next step, and their KV with them.
+        """
+        bm = self._bm()
+        prompt = list(range(8))
+        seq = seq_factory(prompt)
+        bm.allocate(seq, bm.can_allocate(seq))
+        bm.hash_blocks(seq, seq.num_prompt_tokens)
+        for token in range(100, 112):
+            seq.append_token(token)
+            bm.may_append(seq)
+        # Commit only the first generated block; the rest is still in flight.
+        bm.hash_decode_blocks(seq, 12)
+        assert seq.num_hashed_tokens == 12
+
+        followup = seq_factory(prompt + list(range(100, 112)))
+        assert bm.can_allocate(followup) == 3  # 2 prompt + 1 committed
+
+    def test_watermark_advances_past_the_prompt_boundary_block(self, seq_factory):
+        """The block straddling prompt-end is hashed once generation fills it."""
+        bm = self._bm()
+        prompt = list(range(10))  # 2 whole blocks + 2 tokens
+        seq = seq_factory(prompt)
+        bm.allocate(seq, bm.can_allocate(seq))
+        bm.hash_blocks(seq, seq.num_prompt_tokens)
+        assert seq.num_hashed_tokens == 8  # block 2 is half full
+
+        for token in range(100, 106):
+            seq.append_token(token)
+            bm.may_append(seq)
+        bm.hash_decode_blocks(seq, seq.num_tokens)
+        assert seq.num_hashed_tokens == 16
+
+    def test_deallocate_clears_the_watermark(self, seq_factory):
+        bm = self._bm()
+        seq = seq_factory(list(range(8)))
+        bm.allocate(seq, bm.can_allocate(seq))
+        bm.hash_blocks(seq, seq.num_prompt_tokens)
+        assert seq.num_hashed_tokens == 8
         bm.deallocate(seq)
-        assert seq.swa_block_table == []
-        assert used_swa and used_swa.issubset(bm.swa.free_block_ids_set)
+        # Preemption frees through here and re-prefills from scratch; a stale
+        # watermark would make hash_decode_blocks index a block table that no
+        # longer exists.
+        assert seq.num_hashed_tokens == 0
 
-    def test_swa_pool_exhaustion(self, seq_factory):
-        # SWA pool smaller than compressed → admission bounded by SWA pool.
-        bm = _swa_bm(num_blocks=10, num_swa=2, bs=4, prefix=False)
-        seq = seq_factory(list(range(1, 13)))  # needs 3 blocks > 2 swa
-        assert bm.can_allocate(seq) == -1
-
-
-class TestM2WindowFreeing:
-    def test_out_of_window_swa_freed_trailing_kept(self, seq_factory):
-        bs, window = 4, 8
-        bm = _swa_bm(num_blocks=40, num_swa=40, bs=bs, window=window, prefix=False)
-        seq = seq_factory(list(range(1, 9)))  # 2 full blocks (len 8)
+    def test_no_op_without_prefix_caching(self, seq_factory):
+        bm = self._bm(enable_prefix_caching=False)
+        seq = seq_factory(list(range(8)))
         bm.allocate(seq, bm.can_allocate(seq))
-        # Decode forward to len 24 (window=8 → blocks covering <16 fall out).
-        for t in range(8, 24):
-            seq.append_token(1000 + t)
+        for token in range(100, 108):
+            seq.append_token(token)
             bm.may_append(seq)
-        # blocks i with (i+1)*bs <= 24-8=16 → i in {0,1,2} freed (cover 0..11)
-        # wait: (i+1)*4<=16 → i+1<=4 → i<=3 → i in {0,1,2,3} (cover 0..15)
-        freed = [i for i, s in enumerate(seq.swa_block_table) if s < 0]
-        assert set(freed) == {0, 1, 2, 3}, f"freed={freed}"
-        # trailing blocks (in window) still held
-        kept = [s for s in seq.swa_block_table if s >= 0]
-        assert all(s in bm.swa.used_block_ids for s in kept)
-        # live SWA footprint bounded ~ window/bs (+ slack), not full seq length.
-        assert len(kept) <= window // bs + 2
+        bm.hash_decode_blocks(seq, seq.num_tokens)
+        assert seq.num_hashed_tokens == 0
+        assert not bm.kv.num_indexed
 
-    def test_freed_swa_slot_returned_to_pool(self, seq_factory):
-        bs, window = 4, 8
-        bm = _swa_bm(num_blocks=40, num_swa=40, bs=bs, window=window, prefix=False)
-        seq = seq_factory(list(range(1, 9)))
-        bm.allocate(seq, bm.can_allocate(seq))
-        free0 = len(bm.swa.free_block_ids_set)
-        for t in range(8, 30):
-            seq.append_token(1000 + t)
-            bm.may_append(seq)
-        # Many SWA blocks were allocated then window-freed → free pool recovered.
-        assert len(bm.swa.free_block_ids_set) > free0 - (window // bs + 3)
 
-    def test_compressed_untouched_by_window_freeing(self, seq_factory):
-        bs, window = 4, 8
-        bm = _swa_bm(num_blocks=40, num_swa=40, bs=bs, window=window, prefix=False)
-        seq = seq_factory(list(range(1, 9)))
-        bm.allocate(seq, bm.can_allocate(seq))
-        for t in range(8, 24):
-            seq.append_token(1000 + t)
-            bm.may_append(seq)
-        # Every compressed block stays held (no -1 sentinels, all in used set).
-        assert all(b >= 0 for b in seq.block_table)
-        assert all(b in bm.used_block_ids for b in seq.block_table)
+# ── register_received_prefix (PD consumer) ─────────────────────────────────
+
+
+class TestRegisterReceivedPrefix:
+    def test_registers_full_prompt_blocks_enabling_next_turn_hit(
+        self, block_manager_prefix, seq_factory
+    ):
+        bm = block_manager_prefix
+        # PD consumer: a remote-prefill request whose full prompt KV arrived via
+        # RDMA. It never ran a prefill forward, so its blocks are unhashed until
+        # register_received_prefix publishes them.
+        a = seq_factory(list(range(1, 13)))  # 12 tokens, bs=4 -> 3 full blocks
+        bm.allocate(a)
+        registered = bm.register_received_prefix(a)
+        assert registered == 3
+        # Next turn with the same prefix now hits locally (last block excluded).
+        b = seq_factory(list(range(1, 13)))
+        assert bm.can_allocate(b) == 2
+
+    def test_noop_without_prefix_caching(self, block_manager, seq_factory):
+        a = seq_factory(list(range(1, 13)))
+        block_manager.allocate(a)
+        assert block_manager.register_received_prefix(a) == 0
+
+    def test_excludes_trailing_partial_block(self, block_manager_prefix, seq_factory):
+        bm = block_manager_prefix
+        a = seq_factory(list(range(1, 11)))  # 10 tokens, bs=4 -> 2 full + partial
+        bm.allocate(a)
+        assert bm.register_received_prefix(a) == 2

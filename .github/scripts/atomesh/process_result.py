@@ -4,12 +4,22 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime
 import json
 import re
+import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
+
+from interactivity import (
+    METHOD_MEDIAN_TPOT,
+    METHOD_P90_E2E,
+    locate_records,
+    p90_e2e_normalized_interactivity,
+)
+
+AGENTIC_BENCHMARK_KIND = "aiperf_agentic"
 
 RESULT_RE = re.compile(
     r"^pd-(?P<backend>[^-]+)-(?P<model>.+)-(?P<topology>[^-]+(?:-[^-]+)*)-"
@@ -97,6 +107,13 @@ def round_or_none(*values: Any, digits: int = 4) -> float | None:
 
 
 def interactivity_value(payload: dict[str, Any]) -> float | None:
+    # An already-resolved value wins: apply_p90_e2e_interactivity() writes the
+    # p90 e2e normalized number here, and without this branch perf_point() would
+    # silently re-derive the legacy median-TPOT value and overwrite it.
+    explicit = number(payload.get("interactivity"))
+    if explicit and explicit > 0:
+        return explicit
+
     median_tpot = number(payload.get("median_tpot_ms"), payload.get("median_itl_ms"))
     if median_tpot and median_tpot > 0:
         return 1000.0 / median_tpot
@@ -106,6 +123,55 @@ def interactivity_value(payload: dict[str, Any]) -> float | None:
         return 1000.0 / tpot
 
     return None
+
+
+def apply_p90_e2e_interactivity(
+    path: Path, payload: dict[str, Any], fields: dict[str, Any]
+) -> None:
+    """Set interactivity from the per-request AIPerf records when they exist.
+
+    Agentic traces run a ~1M-token prefill per turn, so 1000/median_TPOT sees
+    only the decode phase and hides the prefill cost entirely. The InferenceX
+    definition amortizes TTFT over the turn's output tokens and takes p90 of the
+    result -- see interactivity.py. It needs profile_export.jsonl, which only
+    AIPerf writes, so standard ISL/OSL runs keep the legacy formula and are
+    tagged as such.
+    """
+    if string_value(payload.get("benchmark_kind")) != AGENTIC_BENCHMARK_KIND:
+        payload.setdefault("interactivity_method", METHOD_MEDIAN_TPOT)
+        return
+
+    records = locate_records(
+        path,
+        model=string_value(fields.get("model")) or None,
+        topology=string_value(fields.get("topology")) or None,
+        concurrency=int_value(fields.get("conc")),
+        artifact_dir=string_value(payload.get("aiperf_artifact_dir")) or None,
+    )
+    if records is None:
+        print(
+            f"WARNING: {path.name} is an agentic result but no per-request "
+            f"records were found next to it; falling back to "
+            f"{METHOD_MEDIAN_TPOT} interactivity",
+            file=sys.stderr,
+        )
+        payload["interactivity_method"] = METHOD_MEDIAN_TPOT
+        return
+
+    try:
+        result = p90_e2e_normalized_interactivity(records)
+    except (OSError, ValueError) as exc:
+        print(
+            f"WARNING: cannot compute {METHOD_P90_E2E} interactivity from "
+            f"{records}: {exc}; falling back to {METHOD_MEDIAN_TPOT}",
+            file=sys.stderr,
+        )
+        payload["interactivity_method"] = METHOD_MEDIAN_TPOT
+        return
+
+    payload["interactivity"] = result["value"]
+    payload["interactivity_method"] = METHOD_P90_E2E
+    payload["interactivity_n_requests"] = result["n_requests"]
 
 
 def parse_payload_date(payload: dict[str, Any]) -> tuple[str | None, int | None]:
@@ -298,6 +364,7 @@ def enrich_payload(
         "mean_tpot_ms",
         number(enriched.get("mean_tpot_ms"), enriched.get("mean_itl_ms")),
     )
+    apply_p90_e2e_interactivity(path, enriched, fields)
     enriched.setdefault("interactivity", interactivity_value(enriched))
     resources = topology_resources(enriched, fields)
     total_gpu = resources["total_gpu"]
@@ -430,6 +497,18 @@ def perf_point(
         "num_decode_gpu": resources["num_decode_gpu"],
         "total_gpu": total_gpu,
         "interactivity": round_or_none(interactivity),
+        # Which definition produced the value above -- agentic points computed
+        # from per-request records report p90_e2e_normalized, everything else
+        # reports median_tpot. The dashboard labels the two differently.
+        "interactivity_method": string_value(payload.get("interactivity_method"))
+        or METHOD_MEDIAN_TPOT,
+        "interactivity_n_requests": int_value(payload.get("interactivity_n_requests")),
+        # Prefill prefix-cache token hit rate as a 0-1 fraction. Absent unless the
+        # case enables prefix caching and the run was long enough for the engine
+        # to print a "[Cache Stats]" line.
+        "cache_hit_rate": round_or_none(payload.get("cache_hit_rate")),
+        "cache_hit_tokens": int_value(payload.get("cache_hit_tokens")),
+        "cache_total_tokens": int_value(payload.get("cache_total_tokens")),
         "tput_per_gpu": round_or_none(
             total_tput / total_gpu if total_tput and total_gpu else None
         ),
@@ -625,12 +704,12 @@ def write_summary(rows: list[dict[str, Any]], summary_path: Path) -> None:
     lines = [
         "### ATOMesh Model Performance Benchmark Summary",
         "",
-        "| Hardware | Model | Topology | ISL/OSL | Concurrency | Interactivity | Total tok/s | Input tok/s | Output tok/s | Total tok/s/GPU | Input tok/s/GPU | Output tok/s/GPU | TTFT ms | TPOT ms | E2E ms | Accuracy Task | Accuracy |",
-        "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: |",
+        "| Hardware | Model | Topology | ISL/OSL | Concurrency | Interactivity | Intvty def | Total tok/s | Input tok/s | Output tok/s | Total tok/s/GPU | Input tok/s/GPU | Output tok/s/GPU | TTFT ms | TPOT ms | E2E ms | Cache Hit | Accuracy Task | Accuracy |",
+        "| --- | --- | --- | --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: |",
     ]
     for row in rows:
         lines.append(
-            "| {hardware} | {model} | {topology} | {isl}/{osl} | {conc} | {interactivity} | {total} | {input_} | {output} | {total_per_gpu} | {input_per_gpu} | {output_per_gpu} | {ttft} | {tpot} | {e2e} | {accuracy_task} | {accuracy} |".format(
+            "| {hardware} | {model} | {topology} | {isl}/{osl} | {conc} | {interactivity} | {intvty_def} | {total} | {input_} | {output} | {total_per_gpu} | {input_per_gpu} | {output_per_gpu} | {ttft} | {tpot} | {e2e} | {cache_hit} | {accuracy_task} | {accuracy} |".format(
                 hardware=row.get("hardware", "--"),
                 model=row.get("benchmark_model_name", "--"),
                 topology=row.get("display_topology") or row.get("topology", "--"),
@@ -638,6 +717,11 @@ def write_summary(rows: list[dict[str, Any]], summary_path: Path) -> None:
                 osl=row.get("random_output_len", "--"),
                 conc=row.get("max_concurrency", "--"),
                 interactivity=fmt(row.get("interactivity")),
+                intvty_def=(
+                    "p90 e2e"
+                    if row.get("interactivity_method") == METHOD_P90_E2E
+                    else "median TPOT"
+                ),
                 total=fmt(row.get("total_token_throughput")),
                 input_=fmt(row.get("input_throughput")),
                 output=fmt(row.get("output_throughput")),
@@ -647,6 +731,7 @@ def write_summary(rows: list[dict[str, Any]], summary_path: Path) -> None:
                 ttft=fmt(row.get("mean_ttft_ms")),
                 tpot=fmt(row.get("mean_tpot_ms")),
                 e2e=fmt(row.get("mean_e2el_ms")),
+                cache_hit=fmt_pct(row.get("cache_hit_rate")),
                 accuracy_task=row.get("accuracy_task") or "--",
                 accuracy=fmt(row.get("accuracy_score"), digits=4),
             )
@@ -657,6 +742,12 @@ def write_summary(rows: list[dict[str, Any]], summary_path: Path) -> None:
 def fmt(value: Any, digits: int = 2) -> str:
     parsed = number(value)
     return "--" if parsed is None else f"{parsed:.{digits}f}"
+
+
+def fmt_pct(value: Any, digits: int = 2) -> str:
+    """Render a 0-1 fraction as a percentage; "--" when the metric is missing."""
+    parsed = number(value)
+    return "--" if parsed is None else f"{parsed * 100:.{digits}f}%"
 
 
 def main() -> None:

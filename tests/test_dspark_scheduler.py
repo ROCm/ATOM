@@ -14,9 +14,12 @@ from atom.spec_decode.dspark_scheduler import (
     build_sps_table,
     calibrate_confidence,
     expected_throughput,
+    flat_bucket_fits,
+    ragged_verify_len,
     schedule_prefix_lengths,
     survival_probabilities,
 )
+from atom.spec_decode.dspark_verify import VerifyScheduler
 
 # ----------------------------------------------------------------------------
 # survival_probabilities
@@ -280,11 +283,17 @@ def test_sps_table_feeds_scheduler_end_to_end():
 def _next_anchor(cu_end, mtp_k, ell, accepted):
     """Replicate the engine's anchor-advance math for one seq.
 
-    num_bonus = accepted (+1 if the whole verified prefix passed -> bonus token)
-    num_reject = mtp_k - num_bonus   (engine hardcodes mtp_k here)
+    num_bonus = accepted + 1        (the bonus slot always counts)
+    num_reject = mtp_k - num_bonus  (engine hardcodes mtp_k here)
     anchor_idx = cu_end - (1 + num_reject)
+
+    `ell` is unused: this used to read `accepted + 1 if accepted == ell else
+    accepted + 1`, both arms identical. Making it conditional on the prefix
+    fully passing (what the old docstring described) breaks
+    test_level_b_anchor_matches_phase1_prefix, so the unconditional +1 is the
+    behaviour under test and the condition was dead.
     """
-    num_bonus = accepted + 1 if accepted == ell else accepted + 1
+    num_bonus = accepted + 1
     num_reject = mtp_k - num_bonus
     return cu_end - (1 + num_reject)
 
@@ -468,6 +477,7 @@ def test_ragged_graph_bucket_plan_b():
     ForwardMode-recovery / pad-tail invariants for the 10-req example.
     """
     import numpy as np
+
     from atom.spec_decode.dspark_scheduler import quantize_to_bucket, resolve_q_buckets
 
     bs, full_q = 10, 6
@@ -488,3 +498,327 @@ def test_ragged_graph_bucket_plan_b():
     batch_id = np.full(cap, -1, dtype=np.int32)
     batch_id[:total_new] = np.repeat(np.arange(bs), new_len)
     assert (batch_id[total_new:] == -1).all()
+
+
+# ----------------------------------------------------------------------------
+# VerifyScheduler ell handoff (non-blocking)
+# ----------------------------------------------------------------------------
+
+
+class _FakeEvent:
+    """Stand-in for torch.cuda.Event exposing only query()."""
+
+    def __init__(self, done: bool):
+        self.done = done
+        self.synchronize_calls = 0
+
+    def query(self):
+        return self.done
+
+    def synchronize(self):
+        # Waiting on a LANDED copy is free and is how the fixed-generation read
+        # gets its guarantee. Waiting on one still in flight is the dspark ->
+        # decode bubble coming back.
+        self.synchronize_calls += 1
+        if not self.done:
+            raise AssertionError("ell handoff must never block on an in-flight copy")
+
+
+def _pending(done, ell, req_ids):
+    return (_FakeEvent(done), _torch.tensor(ell, dtype=_torch.int64), list(req_ids))
+
+
+def _fresh_scheduler():
+    """A VerifyScheduler with __init__'s state but no runner/CUDA."""
+    vs = VerifyScheduler.__new__(VerifyScheduler)
+    vs._ell_pending = []
+    vs._ell_map = {}
+    vs._ell_stage_ring = None
+    vs._ell_stage_idx = 0
+    vs._ell_slot_event = [None] * 4
+    vs._ell_last_slot = None
+    return vs
+
+
+def test_ell_never_waits_on_the_in_flight_copy():
+    # Only the previous step's copy exists and it is still in flight; the
+    # fixed-generation read must not reach for it. Regression guard for the
+    # dspark -> decode bubble (ell_by_req once synchronized on the newest copy).
+    vs = _fresh_scheduler()
+    vs._ell_pending = [_pending(False, [5, 5], ["A", "B"])]
+
+    assert vs.ell_by_req == {}  # too early -> full length
+    assert vs._ell_pending[0][0].synchronize_calls == 0
+    # Entries are never consumed; the ring cap in record_ell retires them.
+    assert len(vs._ell_pending) == 1
+
+
+def test_ell_adopts_fixed_generation_not_the_freshest_landed():
+    # [-2] wins even though a NEWER copy has also landed. Taking the freshest
+    # landed one is what made TP ranks disagree: which copies have landed is a
+    # per-rank property, the index is not.
+    vs = _fresh_scheduler()
+    vs._ell_pending = [
+        _pending(True, [1, 1], ["A", "B"]),
+        _pending(True, [4, 3], ["A", "B"]),  # <- generation N-2
+        _pending(True, [9, 9], ["A", "B"]),
+    ]
+
+    assert vs.ell_by_req == {"A": 4, "B": 3}
+    assert len(vs._ell_pending) == 3
+
+
+def test_ell_generation_is_identical_across_ranks():
+    # Same step count, different run-ahead: rank B has one more copy landed.
+    # Both must still size the step from the same generation, or their ragged
+    # token counts diverge and the TP group deadlocks in the all-reduce.
+    def rank(landed_flags):
+        vs = _fresh_scheduler()
+        vs._ell_pending = [
+            _pending(landed_flags[i], ell, ["A", "B"])
+            for i, ell in enumerate([[1, 1], [4, 3], [9, 9]])
+        ]
+        return vs.ell_by_req
+
+    assert rank([True, True, False]) == rank([True, True, True])
+
+
+def test_ell_map_is_remapped_by_req_id_not_position():
+    # ell was computed in step-N batch order; a reordered batch must still read
+    # each request's own value (continuous batching reorders between steps).
+    vs = _fresh_scheduler()
+    vs._ell_pending = [
+        _pending(True, [2, 5, 1], ["A", "B", "C"]),  # <- generation N-2
+        _pending(False, [0, 0, 0], ["A", "B", "C"]),
+    ]
+    by_req = vs.ell_by_req
+    assert [by_req[r] for r in ["C", "A", "B"]] == [1, 2, 5]
+
+
+def test_ell_setter_drops_inflight_copies():
+    vs = _fresh_scheduler()
+    vs._ell_pending = [_pending(True, [3], ["A"])]
+    vs.ell_by_req = {}
+    assert vs.ell_by_req == {}
+    assert vs._ell_pending == []
+
+
+def test_ell_stage_ring_allocates_on_cpu_under_a_gpu_default_device():
+    """The pinned ell ring must survive a non-CPU default device.
+
+    It is first allocated on the warmup forward, and ModelRunner.__init__ only
+    resets the default device to "cpu" AFTER _maybe_warmup() returns — so an
+    unqualified torch.zeros(..., pin_memory=True) allocates on the GPU and
+    raises "Only dense CPU tensors can be pinned", killing every rank at
+    startup. Reproduces that context exactly.
+    """
+    import pytest
+
+    if not (_torch.cuda.is_available() is True):
+        pytest.skip("needs a real CUDA/HIP device to set as the default")
+
+    class _StubRunnerCfg:
+        max_num_seqs = 8
+
+    class _StubRunner:
+        config = _StubRunnerCfg()
+
+    vs = _fresh_scheduler()
+    vs.runner = _StubRunner()
+
+    _torch.set_default_device("cuda")
+    try:
+        slot = vs._ell_stage(4)
+    finally:
+        _torch.set_default_device(None)
+
+    assert slot.device.type == "cpu"
+    assert slot.is_pinned()
+    assert slot.shape == (4,)
+    assert vs._ell_stage_ring.shape == (4, 8)
+    assert vs._ell_stage_idx == 1
+    assert vs._ell_last_slot == 0
+
+
+class _FakeSlotEvent:
+    """Stands in for torch.cuda.Event; `query()` is all `_ell_stage` uses.
+
+    Distinct from `_FakeEvent` above on purpose: same-named classes at module
+    scope silently shadow, so the ell-generation tests would have run against
+    this one and lost their synchronize() assertions.
+    """
+
+    def __init__(self, landed: bool):
+        self.landed = landed
+
+    def query(self):
+        return self.landed
+
+
+def test_ell_stage_never_reuses_a_slot_whose_copy_is_still_in_flight():
+    """Rotation alone does not free a slot.
+
+    The ring has _MAX_ELL_INFLIGHT slots and record_ell caps _ell_pending at the
+    same number, so once the host runs that many steps ahead the index wraps
+    onto a slot whose entry is being evicted -- and evicting the bookkeeping
+    tuple does NOT cancel its DMA. Handing the slot out anyway puts two copies
+    on one pinned buffer and the reader sees torn values: an ell that is neither
+    current nor merely stale, which ragged_verify_len then clamps into a legal
+    range and passes downstream. Only a device trap far away shows for it.
+
+    Guard: a busy slot is skipped for a one-off buffer, and the index parks so
+    the same slot is retried next step rather than being silently burned.
+    """
+    import pytest
+
+    if not (_torch.cuda.is_available() is True):
+        # _ell_stage allocates pinned memory, which needs a real device.
+        pytest.skip("needs a real CUDA/HIP device to pin the ell staging ring")
+
+    class _StubRunnerCfg:
+        max_num_seqs = 8
+
+    class _StubRunner:
+        config = _StubRunnerCfg()
+
+    vs = _fresh_scheduler()
+    vs.runner = _StubRunner()
+
+    # Prime the ring, then mark slot 0's copy as still in flight.
+    vs._ell_stage(4)
+    assert vs._ell_last_slot == 0
+    vs._ell_slot_event[0] = _FakeSlotEvent(landed=False)
+    vs._ell_stage_idx = 0
+
+    buf = vs._ell_stage(4)
+
+    assert vs._ell_last_slot is None, "must not claim a busy ring slot"
+    assert buf.data_ptr() != vs._ell_stage_ring[0].data_ptr()
+    assert vs._ell_stage_idx == 0, "index parks; the slot is retried, not burned"
+    assert buf.device.type == "cpu" and buf.is_pinned()
+
+    # Once it lands, the same slot is handed out again.
+    vs._ell_slot_event[0] = _FakeSlotEvent(landed=True)
+    slot = vs._ell_stage(4)
+    assert vs._ell_last_slot == 0
+    assert slot.data_ptr() == vs._ell_stage_ring[0].data_ptr()
+    assert vs._ell_stage_idx == 1
+
+
+# ---------------------------------------------------------------------------
+# Ragged verify length is bounded on BOTH sides. Violating either desyncs the
+# batch layout from what the scheduler reserved, and surfaces far downstream as
+# an out-of-range id in the draft's Markov lookup (a device-side ASSERT_TRAP
+# blamed on whatever kernel was in flight), never where the length is chosen.
+# The ell map is read without syncing, so in steady state it is two steps old
+# while the caller's guard only compares step N-1 with N: a request in both may
+# have had a longer segment at N-2, and its stale ell then exceeds what the
+# scheduler gave it now.
+# ---------------------------------------------------------------------------
+FULL_Q = 6
+
+FULL_Q = 6
+
+
+def test_stale_ell_cannot_grow_past_scheduled_len():
+    # This seq was already shrunk to 2 by an earlier step; a STALE ell of 5 would
+    # ask for 6 and spill into the next seq's segment.
+    assert ragged_verify_len(5, FULL_Q, 0, 2) == 2
+
+
+def test_fresh_ell_still_shrinks():
+    assert ragged_verify_len(2, FULL_Q, 0, FULL_Q) == 3
+    assert ragged_verify_len(0, FULL_Q, 0, FULL_Q) == 1
+
+
+def test_missing_ell_verifies_full_length():
+    # No ell yet (new request, or its copy still in flight) -> never under-verify.
+    assert ragged_verify_len(None, FULL_Q, 0, FULL_Q) == FULL_Q
+    # ...but still bounded by what was actually scheduled.
+    assert ragged_verify_len(None, FULL_Q, 0, 3) == 3
+
+
+def test_length_covers_bonus_tokens():
+    # Lower bound: must cover max_num_bonus even when ell is smaller, or the
+    # anchor falls outside the shrunk segment.
+    assert ragged_verify_len(0, FULL_Q, 3, FULL_Q) == 4
+
+
+def test_upper_bound_never_breaks_the_lower_bound():
+    """The trap a naive one-sided clamp falls into: capping at scheduled_len
+    must not push the length below max_num_bonus + 1. When the bounds cross
+    there is no representable length and the caller must stay rectangular."""
+    assert ragged_verify_len(1, FULL_Q, 3, 2) is None
+    # Exactly at the bound is fine.
+    assert ragged_verify_len(1, FULL_Q, 3, 4) == 4
+
+
+def test_clamped_to_full_q_and_min_one():
+    assert ragged_verify_len(99, FULL_Q, 0, FULL_Q) == FULL_Q
+    assert ragged_verify_len(-5, FULL_Q, 0, FULL_Q) == 1
+
+
+def test_nonpositive_scheduled_len_imposes_no_bound():
+    # 0 means "no scheduler bound to honor" -- do not collapse the length to 0.
+    assert ragged_verify_len(2, FULL_Q, 0, 0) == 3
+
+
+def test_both_bounds_hold_across_the_grid():
+    for ell in (None, -1, 0, 1, 3, 5, 50):
+        for max_nb in (0, 1, 4):
+            for sched in (1, 2, 3, FULL_Q):
+                li = ragged_verify_len(ell, FULL_Q, max_nb, sched)
+                if li is None:
+                    assert sched < max_nb + 1, (ell, max_nb, sched)
+                    continue
+                assert max_nb + 1 <= li <= FULL_Q, (ell, max_nb, sched, li)
+                assert li <= sched, (ell, max_nb, sched, li)
+
+
+# ---------------------------------------------------------------------------
+# The ragged shrink is only safe if the REPLAY can follow it down.
+
+
+def test_full_cudagraphs_cannot_represent_a_ragged_shrink():
+    """No captured flat bucket set -> no representable shrink.
+
+    This is the configuration that trapped: under FULL (non-PIECEWISE)
+    cudagraphs nothing flat is captured, `_dynamic_num_tokens_pad` returns None,
+    every caller falls back to `bs * max_seqlen_q`, and the replay runs over
+    more tokens than the rebuild populated. The tail holds the previous step's
+    ids, which the draft's Markov lookup then indexes out of range.
+    """
+    assert flat_bucket_fits(3, 6, []) is False
+    assert flat_bucket_fits(3, 6, None) is False
+
+
+def test_bucket_must_cover_the_total_and_divide_by_q():
+    buckets = [6, 12, 24]
+    # 3 real tokens at q=6 -> bucket 6 holds them and 6 % 6 == 0.
+    assert flat_bucket_fits(3, 6, buckets) is True
+    assert flat_bucket_fits(6, 6, buckets) is True
+    # Bigger than every captured bucket -> nothing can hold it.
+    assert flat_bucket_fits(25, 6, buckets) is False
+    # Covers the total but is not q-divisible -> the per-seq rows would not tile.
+    assert flat_bucket_fits(3, 6, [10]) is False
+    # Degenerate q never matches (guards the b % q modulo).
+    assert flat_bucket_fits(3, 0, buckets) is False
+
+
+def test_predicate_agrees_with_dynamic_num_tokens_pad():
+    """Must stay in step with the lookup it mirrors: yes exactly when that
+    lookup finds a bucket, no exactly when it returns the None that triggers the
+    unsafe `bs * max_seqlen_q` fallback."""
+    buckets = [6, 12, 24]
+
+    def pad_lookup(total, q):
+        for b in buckets:
+            if b >= total and q > 0 and b % q == 0:
+                return b
+        return None
+
+    for total in (0, 1, 3, 6, 7, 12, 25):
+        for q in (0, 1, 3, 6):
+            assert flat_bucket_fits(total, q, buckets) is (
+                pad_lookup(total, q) is not None
+            ), (total, q)

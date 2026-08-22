@@ -64,16 +64,30 @@ class CUDAGraphOptions:
     weak_ref_output: bool = True
 
 
-# Shared cudagraph pool across all piecewise pieces (default). Combined with the
-# weak_ref_tensor op it lets the pool OVERLAY piece outputs across shapes, so the
-# retained pool stays small (~10GB vs ~35GB unshared on DSV4 TP8). First
-# torch.cuda.graph makes the pool; the rest reuse it.
-_shared_graph_pool: Any | None = None
-
-# Per-num_tokens pools (ATOM_PER_BUCKET_POOL=1 fallback). Isolates each shape's
-# pool so shapes can't overlap — costs more memory but avoids any cross-shape
-# reuse. Kept as a safety escape hatch; default is the shared pool above.
+# One cudagraph pool per num_tokens bucket (default). A bucket's graphs only
+# ever reuse memory among themselves, so nothing one bucket's graph wrote can be
+# handed to another bucket's.
+#
+# Sharing one pool across buckets corrupts DeepSeek-V4 decode. Measured on
+# V4-Pro-DSpark tp8, GSM8K 3-shot 250q, --cudagraph-mode PIECEWISE:
+#
+#   pool shared, 11 buckets   0.664      pool shared, 2 buckets [32,64]  0.956
+#   pool shared, 1 bucket     0.976      per-bucket, 11 buckets          0.960
+#
+# Generations stay coherent for a few decode tokens and then collapse, prefill
+# is unaffected, and it is intermittent. Removing cross-bucket sharing by either
+# route (one bucket, or one pool each) fixes it; the corrupted memory is inside
+# the compiled pieces, not on the graph->eager boundary — pinning every boundary
+# tensor of the one V4 split op changes nothing (0.636).
 _graph_pools: dict = {}
+
+# ATOM_PER_BUCKET_POOL=0 restores the single shared pool. It buys little: on the
+# config above the two modes differ by 1.11GB reserved per rank (202.83 ->
+# 203.94GB) and the capture-time allocated delta is identical at 14.71GB, so the
+# overlay was not reducing live footprint at all. The wider claim it was added
+# for (~10GB vs ~35GB unshared on DSV4 TP8) does not reproduce there; a config
+# with far more or larger buckets, or DP, may still see a real gap.
+_shared_graph_pool: Any | None = None
 
 
 class CUDAGraphWrapper:
@@ -144,6 +158,10 @@ class CUDAGraphWrapper:
         return self.runnable
 
     def __call__(self, *args, **kwargs):
+        # Rebound on the first capture when the shared pool is opted into;
+        # `_graph_pools` is only mutated in place, so it needs no declaration.
+        global _shared_graph_pool
+
         forward_context = get_forward_context()
         batch_descriptor = forward_context.batch_descriptor
         cudagraph_runtime_mode = forward_context.cudagraph_runtime_mode
@@ -200,24 +218,21 @@ class CUDAGraphWrapper:
                     stack.enter_context(patch("gc.collect", lambda: None))
                     stack.enter_context(patch("torch.cuda.empty_cache", lambda: None))
 
-                import atom.utils.cuda_graph as _cg_mod
-
-                # Default: single shared pool (overlays piece outputs across
-                # shapes -> low memory; safe here because pieces replay serially
-                # and inter-piece tensors are pinned via persistent buffers).
-                # ATOM_PER_BUCKET_POOL=1 isolates a pool per num_tokens bucket
-                # (more memory) as a fallback.
-                _per_bucket = os.environ.get("ATOM_PER_BUCKET_POOL") == "1"
+                # Default: one pool per num_tokens bucket, so no bucket's graph
+                # can be handed memory another bucket's graph wrote. See the
+                # module header for the accuracy data behind this default and
+                # for what ATOM_PER_BUCKET_POOL=0 costs.
+                _per_bucket = os.environ.get("ATOM_PER_BUCKET_POOL", "1") == "1"
                 _bkey = batch_descriptor.num_tokens if batch_descriptor else 0
                 if _per_bucket:
-                    _pool = _cg_mod._graph_pools.get(_bkey)
+                    _pool = _graph_pools.get(_bkey)
                 else:
                     # Match vLLM (platforms/interface.py:get_global_graph_pool):
                     # use a DEDICATED shareable pool handle created ONCE up front
                     # for EVERY graph.
-                    if _cg_mod._shared_graph_pool is None:
-                        _cg_mod._shared_graph_pool = torch.cuda.graph_pool_handle()
-                    _pool = _cg_mod._shared_graph_pool
+                    if _shared_graph_pool is None:
+                        _shared_graph_pool = torch.cuda.graph_pool_handle()
+                    _pool = _shared_graph_pool
                 # thread_local, not the "global" default: global mode invalidates
                 # the capture when ANY thread makes an unsafe HIP call, and under
                 # DP attention the NCCL watchdog thread polls hipEventQuery on
@@ -250,8 +265,8 @@ class CUDAGraphWrapper:
             # to save memory
             # first graph of a per-bucket pool -> remember its pool. (shared pool
             # is created up front via graph_pool_handle() above, nothing to do.)
-            if _per_bucket and _bkey not in _cg_mod._graph_pools:
-                _cg_mod._graph_pools[_bkey] = cudagraph.pool()
+            if _per_bucket and _bkey not in _graph_pools:
+                _graph_pools[_bkey] = cudagraph.pool()
 
             entry.output = weak_ref_tensors(output)
             entry.cudagraph = cudagraph
@@ -276,3 +291,122 @@ class CUDAGraphWrapper:
 
         entry.cudagraph.replay()
         return entry.output
+
+
+class StableOutputs:
+    """Persistent output slots for a split op running inside PIECEWISE.
+
+    The dense graph piece downstream of the op was captured reading ONE fixed
+    address per key. Whatever produces the op's output -- a replayed cudagraph
+    or a plain eager call -- has to deliver it there, or the piece reads a
+    tensor the allocator has since recycled.
+
+    Deliberately not part of the capture runner: a slot is needed whenever the
+    op sits inside PIECEWISE, whether or not anything was ever captured.
+    """
+
+    def __init__(self):
+        self._slots: dict = {}
+
+    def slot(self, key, sample: torch.Tensor) -> torch.Tensor:
+        """This key's persistent buffer, shaped from `sample` on first use."""
+        buf = self._slots.get(key)
+        if buf is None:
+            buf = torch.empty_like(sample)
+            self._slots[key] = buf
+        return buf
+
+    def deliver(self, key, out: torch.Tensor) -> torch.Tensor:
+        """Copy an eagerly computed `out` into its slot and return the slot."""
+        buf = self.slot(key, out)
+        buf.copy_(out)
+        return buf
+
+
+class CudagraphCaptureRunner:
+    """A cache of cudagraphs, keyed by whatever the caller decides identifies one.
+
+    Give it a key, the inputs a graph should read, and the compute: it records
+    once and replays after that. It does not know who is calling or why --
+    deciding WHETHER a step should be captured, and where the output has to
+    land, belongs to the caller (see `piecewise_core` in
+    atom/utils/attn_ffn_piecewise.py, the attention-core user of this).
+
+    Holds its own graph pool, isolated from the dense-piece pool.
+    """
+
+    def __init__(self, capture_error_mode: str = "thread_local"):
+        self._graphs: dict = {}
+        self._pool = None
+        self._capture_error_mode = capture_error_mode
+
+    def has_graph(self, key) -> bool:
+        return key in self._graphs
+
+    def input_buffers(
+        self, named_args: dict, input_names: tuple, zero_copy: frozenset
+    ) -> tuple[dict, dict]:
+        """Where a graph captured now will read each input from, and which of
+        those this runner has to refresh at replay.
+
+        A zero-copy input is captured on the caller's OWN tensor: that address
+        goes into the graph and nothing refreshes it, so whoever produces it has
+        to keep handing back the same address every step. Everything else gets a
+        clone this runner owns and copies into at replay -- one copy per step,
+        bought in exchange for the producer being free to allocate as it likes.
+
+        Names rather than positions: an index set silently means something else
+        the moment an argument is added, and cannot be read without counting.
+        """
+        read_from: dict = {}
+        refresh: dict = {}
+        for n in input_names:
+            src = named_args[n]
+            if src is None or n in zero_copy:
+                read_from[n] = src
+                continue
+            clone = src.clone()
+            read_from[n] = clone
+            refresh[n] = clone
+        return read_from, refresh
+
+    def capture(
+        self,
+        key,
+        in_bufs: dict,
+        refresh: dict,
+        compute_fn: Callable,
+        out_buf: torch.Tensor,
+    ) -> None:
+        """Record `compute_fn(**in_bufs)` under `key`, landing in `out_buf`.
+
+        The output copy goes INSIDE the graph, so a later replay refreshes
+        `out_buf` with no Python at all.
+
+        Warm the compute up yourself first: workspace allocation, lazy init and
+        autotuning are one-time work that must not be recorded. That warmup is
+        also what gives you the sample `out_buf` is shaped from.
+        """
+        graph = torch.cuda.CUDAGraph()
+        if self._pool is None:
+            self._pool = torch.cuda.graph_pool_handle()
+        with torch.cuda.graph(
+            graph,
+            pool=self._pool,
+            stream=torch.cuda.current_stream(),
+            capture_error_mode=self._capture_error_mode,
+        ):
+            out_buf.copy_(compute_fn(**in_bufs))
+        self._graphs[key] = {"graph": graph, "in": refresh, "out": out_buf}
+
+    def replay(self, key, named_args: dict) -> torch.Tensor:
+        """Refresh the inputs this runner owns, replay, and return the output."""
+        entry = self._graphs[key]
+        # Only the inputs this runner cloned are here. A zero-copy one is not:
+        # the graph reads the producer's own tensor, so there is nothing to copy.
+        for n, buf in entry["in"].items():
+            src = named_args[n]
+            if src is not None:
+                buf.copy_(src)
+        entry["graph"].replay()
+        return entry["out"]  # the graph copied the result in for us

@@ -9,12 +9,11 @@ The validated configuration requires eight MI355 (gfx950) GPUs with TP8.
 
 ## Prerequisites
 
-Use the ATOM vLLM OOT image and install the KDA dependency used by the native
-Kimi-K3 implementation:
+Use the ATOM vLLM OOT image. The KDA recurrence runs on aiter, which the image
+already carries, so no extra package is needed:
 
 ```bash
 docker pull rocm/atom-dev:vllm-latest
-pip install "fla-core==0.5.1" "flash-linear-attention==0.5.1"
 ```
 
 Install the target ATOM checkout into the same environment:
@@ -96,9 +95,55 @@ Use a freshly started server for each reported accuracy run, matching the
 native Kimi-K3 validation protocol. Back-to-back evaluations on a warm server
 are not used as baselines for this model.
 
+## Speculative decoding with DSpark
+
+Kimi-K3 ships a DSpark draft, which proposes a block of `N` tokens in one
+non-causal pass and has the target verify all of them in the next step. Add
+`--speculative-config` to the launch above, and turn prefix caching on with
+`--mamba-cache-mode align` so the KDA and MLA pages agree on block boundaries:
+
+```bash
+DRAFT=/path/to/Kimi-K3-DSpark
+
+vllm serve "${MODEL}" \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --tensor-parallel-size 8 \
+    --trust-remote-code \
+    --enable-prefix-caching \
+    --mamba-cache-mode align \
+    --kv-cache-dtype fp8 \
+    --max-num-seqs 64 \
+    --max-num-batched-tokens 16384 \
+    --gpu-memory-utilization 0.85 \
+    --block-size 128 \
+    --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE"}' \
+    --speculative-config '{"method":"dspark","model":"'"${DRAFT}"'","num_speculative_tokens":2}' \
+    --additional-config '{"online_quant_config":{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*self_attn.[qkv]_conv1d*","*block_sparse_moe.experts*","*block_sparse_moe.routed_expert_*","*vision_tower*","*mm_projector*"]}}'
+```
+
+### Validated accuracy and acceptance
+
+Full 1,319-example GSM8K, 5-shot, 64 concurrent, TP8, `FULL_AND_PIECEWISE`,
+fresh server per run:
+
+```text
+                           flexible-extract   strict-match   wall clock
+DSpark, N=2                        0.9507         0.9500        177 s
+```
+
+Draft acceptance over those runs, reported by vLLM's SpecDecoding metrics:
+
+```text
+Mean acceptance length:      2.61 - 2.78  (of 3)
+Per-position acceptance:     0.89 - 0.95, 0.72 - 0.84
+Avg draft acceptance rate:   86.1%, 86.1%  (whole run, each of the two)
+```
+
 ## Current scope
 
 - Text generation only; the vision tower and multimodal projector are skipped.
 - TP8 on MI355/gfx950 is the validated deployment.
-- Prefix caching and asynchronous scheduling are disabled.
-- Speculative decoding is not enabled for this model.
+- Asynchronous scheduling is supported. Prefix caching is off by default and
+  needs `--mamba-cache-mode align` to be turned on, as the DSpark launch does.
+- DSpark speculative decoding is supported; see above.

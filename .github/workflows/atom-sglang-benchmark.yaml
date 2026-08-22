@@ -55,6 +55,7 @@ on:
           - GLM-5.2 FP8 TP4
           - GLM-5.2 FP8 TP4 PCP4
           - GLM-5.2 FP4 TP4
+          - Kimi-K3 TP8
           - GLM-5.2 FP4 TP4 MTP3
           - MiniMax-M3-MXFP4 TP4
           - MiniMax-M3-MXFP8 EAGLE3 TP4 MTP3
