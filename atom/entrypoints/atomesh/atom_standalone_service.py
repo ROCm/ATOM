@@ -51,7 +51,10 @@ from atom.entrypoints.openai.serving_completion import (
 )
 from atom.entrypoints.openai.sse import data_frame
 from atom.entrypoints.openai.tool_parser import ToolCallStreamParser
-from atom.entrypoints.openai.tool_parser.registry import resolve_tool_call_parser
+from atom.entrypoints.openai.tool_parser.registry import (
+    parser_for_tool_choice,
+    resolve_tool_call_parser,
+)
 from atom.model_engine.sequence import new_token_ids
 
 logger = logging.getLogger("atom")
@@ -552,7 +555,10 @@ class ChatCompletionStreamState:
         # differently depending on the entrypoint.
         self.tool_choice = tool_choice
         self.tool_parsers = [
-            ToolCallStreamParser(tools=tools, parser_cls=tool_parser_cls)
+            ToolCallStreamParser(
+                tools=tools,
+                parser_cls=parser_for_tool_choice(tool_parser_cls, tool_choice),
+            )
             for _ in range(n)
         ]
         self.has_tool_calls = [False] * n
@@ -662,7 +668,7 @@ class ChatCompletionStreamState:
                                 index=index,
                             )
                         )
-                    elif event_type == "tool_call_start" and self.tool_choice != "none":
+                    elif event_type == "tool_call_start":
                         chunks.append(
                             create_chat_chunk(
                                 self.request_id,
@@ -671,7 +677,7 @@ class ChatCompletionStreamState:
                                 index=index,
                             )
                         )
-                    elif event_type == "tool_call_args" and self.tool_choice != "none":
+                    elif event_type == "tool_call_args":
                         self.has_tool_calls[index] = True
                         chunks.append(
                             create_chat_chunk(
@@ -695,7 +701,7 @@ class ChatCompletionStreamState:
                             index=index,
                         )
                     )
-                elif event_type == "tool_call_start" and self.tool_choice != "none":
+                elif event_type == "tool_call_start":
                     chunks.append(
                         create_chat_chunk(
                             self.request_id,
@@ -704,7 +710,7 @@ class ChatCompletionStreamState:
                             index=index,
                         )
                     )
-                elif event_type == "tool_call_args" and self.tool_choice != "none":
+                elif event_type == "tool_call_args":
                     self.has_tool_calls[index] = True
                     chunks.append(
                         create_chat_chunk(

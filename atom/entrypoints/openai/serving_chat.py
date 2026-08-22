@@ -24,6 +24,7 @@ from .reasoning import (
 from .sse import data_frame
 from .streaming_dispatch import StreamOutputCollector
 from .tool_parser import ToolCallStreamParser, parse_tool_calls
+from .tool_parser.registry import parser_for_tool_choice
 
 logger = logging.getLogger("atom")
 
@@ -250,7 +251,9 @@ async def stream_chat_response(
     num_tokens_output = 0
     num_cached_tokens = 0
     reasoning_filter = ReasoningFilter(starts_thinking=starts_thinking)
-    tool_parser = ToolCallStreamParser(tools=tools, parser_cls=tool_parser_cls)
+    tool_parser = ToolCallStreamParser(
+        tools=tools, parser_cls=parser_for_tool_choice(tool_parser_cls, tool_choice)
+    )
     has_tool_calls = False
 
     kv_transfer_params_value = None
@@ -298,13 +301,13 @@ async def stream_chat_response(
                             yield create_chat_chunk(
                                 request_id, model, delta={"content": data}
                             )
-                        elif event_type == "tool_call_start" and tool_choice != "none":
+                        elif event_type == "tool_call_start":
                             yield create_chat_chunk(
                                 request_id,
                                 model,
                                 delta={"tool_calls": [data]},
                             )
-                        elif event_type == "tool_call_args" and tool_choice != "none":
+                        elif event_type == "tool_call_args":
                             has_tool_calls = True
                             yield create_chat_chunk(
                                 request_id,
@@ -319,11 +322,11 @@ async def stream_chat_response(
                         yield create_chat_chunk(
                             request_id, model, delta={"content": data}
                         )
-                    elif event_type == "tool_call_start" and tool_choice != "none":
+                    elif event_type == "tool_call_start":
                         yield create_chat_chunk(
                             request_id, model, delta={"tool_calls": [data]}
                         )
-                    elif event_type == "tool_call_args" and tool_choice != "none":
+                    elif event_type == "tool_call_args":
                         has_tool_calls = True
                         yield create_chat_chunk(
                             request_id, model, delta={"tool_calls": [data]}
@@ -382,13 +385,10 @@ def _build_chat_choice(
         raw_text, starts_thinking=starts_thinking
     )
     content, tool_calls = parse_tool_calls(
-        content_with_tools, tools, parser_cls=tool_parser_cls
+        content_with_tools,
+        tools,
+        parser_cls=parser_for_tool_choice(tool_parser_cls, tool_choice),
     )
-
-    # tool_choice="none" forbids tool calls: any the model emitted anyway are
-    # dropped so they never surface in the response.
-    if tool_choice == "none":
-        tool_calls = []
 
     message: dict[str, Any] = {"role": "assistant", "content": content}
     if reasoning_content is not None:
@@ -544,7 +544,10 @@ async def stream_chat_response_fanout(
         ReasoningFilter(starts_thinking=starts_thinking) for _ in range(n)
     ]
     tool_parsers = [
-        ToolCallStreamParser(tools=tools, parser_cls=tool_parser_cls) for _ in range(n)
+        ToolCallStreamParser(
+            tools=tools, parser_cls=parser_for_tool_choice(tool_parser_cls, tool_choice)
+        )
+        for _ in range(n)
     ]
     has_tool_calls = [False] * n
     finished = [False] * n
@@ -600,14 +603,14 @@ async def stream_chat_response_fanout(
                             yield create_chat_chunk(
                                 request_id, model, delta={"content": data}, index=idx
                             )
-                        elif event_type == "tool_call_start" and tool_choice != "none":
+                        elif event_type == "tool_call_start":
                             yield create_chat_chunk(
                                 request_id,
                                 model,
                                 delta={"tool_calls": [data]},
                                 index=idx,
                             )
-                        elif event_type == "tool_call_args" and tool_choice != "none":
+                        elif event_type == "tool_call_args":
                             has_tool_calls[idx] = True
                             yield create_chat_chunk(
                                 request_id,
@@ -622,14 +625,14 @@ async def stream_chat_response_fanout(
                         yield create_chat_chunk(
                             request_id, model, delta={"content": data}, index=idx
                         )
-                    elif event_type == "tool_call_start" and tool_choice != "none":
+                    elif event_type == "tool_call_start":
                         yield create_chat_chunk(
                             request_id,
                             model,
                             delta={"tool_calls": [data]},
                             index=idx,
                         )
-                    elif event_type == "tool_call_args" and tool_choice != "none":
+                    elif event_type == "tool_call_args":
                         has_tool_calls[idx] = True
                         yield create_chat_chunk(
                             request_id,

@@ -135,6 +135,42 @@ TOOL_CALL_PARSER_HELP = (
 )
 
 
+def forbids_tool_calls(tool_choice: Any) -> bool:
+    """Did this request say the model may not call a tool?
+
+    Both protocols' spellings, because both endpoints ask. OpenAI sends the
+    bare string ``"none"``; Anthropic sends ``{"type": "none"}``. Anything
+    else -- absent, ``auto``, ``required``, ``any``, a named tool -- is not a
+    prohibition, and in particular is not answered here.
+    """
+    if isinstance(tool_choice, str):
+        return tool_choice == "none"
+    if isinstance(tool_choice, dict):
+        return tool_choice.get("type") == "none"
+    return False
+
+
+def parser_for_tool_choice(
+    parser_cls: type[ToolCallParser] | None, tool_choice: Any
+) -> type[ToolCallParser] | None:
+    """The format to read this request's output as -- none, if it forbade calls.
+
+    `tool_choice: "none"` used to be enforced where the events were *sent*,
+    twelve places across two endpoints, while the parser went on consuming the
+    region. So the model's own words were deleted rather than its call
+    suppressed: a 95-character answer reached the client as its first six,
+    with no event and `finish_reason: stop`. Not parsing is both the correct
+    reading -- the output is prose, because the request said it could not be a
+    call -- and the cheaper one, since nothing is parsed to be thrown away.
+
+    Every construction site goes through here, so the two protocols cannot
+    drift: the Anthropic endpoint read `tool_choice` off the request and then
+    ignored it entirely, and the sweep that added the gates to the OpenAI path
+    never reached it.
+    """
+    return None if forbids_tool_calls(tool_choice) else parser_cls
+
+
 def validate_tool_call_parser(override: str | None) -> type[ToolCallParser] | None:
     """The format `override` names, or ``None`` for "read the template".
 

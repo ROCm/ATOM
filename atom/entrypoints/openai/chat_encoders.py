@@ -227,13 +227,19 @@ def render_probe_prompt(
     instead; see :func:`chat_template_source` for why one is not a cheaper
     version of the other.
 
-    ``None`` means the template refused the probe, which is a real answer and
-    the only one that is caught: a template may reject the synthetic tools
-    payload, and a model that does not do tool calls should still start.
-    `TemplateError` is that refusal by name and `TypeError` is a signature
-    that does not take ``tools``. Nothing else is caught -- an unexpected
-    failure here is a bug, and a bug that silently turns into "this model has
-    no tool-call format" is the class of silence this path exists to end.
+    ``None`` means the template refused the probe, which is a real answer: a
+    template may reject the synthetic tools payload, and a model that does not
+    do tool calls should still start. Refusal is `_PROBE_REFUSALS`, the same
+    list the reasoning probe uses -- these two ask the same template the same
+    kind of question and disagreeing about what counts as a refusal is how a
+    model with no chat template at all stopped booting. `transformers` raises
+    `ValueError` for that, this caught only `TemplateError` and `TypeError`,
+    and both probes run *before* the engine is created, so a base checkpoint
+    that used to serve `/v1/completions` perfectly well now died at startup.
+
+    Nothing outside that list is caught -- an unexpected failure here is a
+    bug, and a bug that silently turns into "this model has no tool-call
+    format" is the class of silence this path exists to end.
     """
     try:
         return apply_chat_template(
@@ -242,7 +248,7 @@ def render_probe_prompt(
             PROBE_MESSAGES,
             tools=PROBE_TOOLS if tools else None,
         )
-    except (TemplateError, TypeError) as e:
+    except _PROBE_REFUSALS as e:
         logger.warning("The model's chat template refused the probe: %s", e)
         return None
 

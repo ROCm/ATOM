@@ -11,6 +11,7 @@ marker, parse the whole block at flush — so that strategy lives once in
 emits tool calls incrementally and implements ``process``/``flush`` itself.
 """
 
+import logging
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -18,6 +19,8 @@ from typing import Any, ClassVar
 
 from ..marker_scanner import MarkerScanner
 from .schema import build_param_types
+
+logger = logging.getLogger("atom")
 
 # How far into a region a name may be before the peek gives up. Every
 # format on this box puts it in the first 30-70 characters; the margin is
@@ -32,6 +35,47 @@ def unique_tool_call_id() -> str:
     # across turns -> clients (e.g. qwen-code) dedupe by id and silently ignore
     # every repeat, causing an infinite tool-call retry loop. Use a random id.
     return f"call_{uuid.uuid4().hex}"
+
+
+class Region:
+    """The bytes buffered since a tool-call region opened.
+
+    A list and a join, not `self.buf += text`. Appending to a *string
+    attribute* is quadratic in CPython: the instance dict holds a reference,
+    so the in-place fast path never applies and every chunk copies the whole
+    buffer. Measured on a 128 KB tool call, streamed four characters at a
+    time: 23 ms of event-loop CPU in `process` alone, growing 17x for an 8x
+    payload while `flush` stayed linear. The same loop over a *local* string
+    is linear, which is why a microbenchmark of `s += x` finds nothing.
+
+    `head` is the first `_PEEK_WINDOW` bytes, kept separately so `announce`
+    never needs the region materialised -- it only ever looks that far in,
+    and handing it the whole buffer is how the quadratic scan it already
+    fixed once could come back.
+    """
+
+    __slots__ = ("_parts", "head")
+
+    def __init__(self) -> None:
+        self._parts: list[str] = []
+        self.head = ""
+
+    def append(self, text: str) -> None:
+        if not text:
+            return
+        self._parts.append(text)
+        if len(self.head) < _PEEK_WINDOW:
+            self.head = (self.head + text)[:_PEEK_WINDOW]
+
+    def take(self) -> str:
+        """Everything buffered, and start again."""
+        out = "".join(self._parts)
+        self._parts.clear()
+        self.head = ""
+        return out
+
+    def __bool__(self) -> bool:
+        return bool(self._parts)
 
 
 @dataclass
@@ -63,7 +107,7 @@ class ToolCallParser(ABC):
     START_MARKERS: ClassVar[tuple[str, ...]] = ()
 
     @classmethod
-    def peek_name(cls, region: str) -> str | None:
+    def peek_name(cls, region: str, tools: list | None = None) -> str | None:
         """The tool being called, from a region that has not closed yet.
 
         ``None`` while the name is not yet legible, and ``None`` by default:
@@ -76,6 +120,17 @@ class ToolCallParser(ABC):
         inside the first 30-70 characters. SGLang streams the whole call this
         way; only the name is taken here, because arguments arriving in
         fragments cannot be made coherent when the stream is cut short.
+
+        **It must not name a region ``parse`` would read as prose.** A name
+        cannot be retracted, so the two have to agree about what a call looks
+        like -- and four of the five that implement this had them disagree,
+        because each wrote the rule twice: once as a regex's follower set
+        here, once as a truncation test in `parse`. Each format now answers
+        the question in one place and both callers use it.
+
+        ``tools`` for the same reason `parse` takes it: MiniMax names its
+        parameters by the tag itself, so telling `<city>` from `<br>` needs
+        the request's schema and cannot be done from the bytes alone.
         """
         return None
 
@@ -101,6 +156,9 @@ class ToolCallParser(ABC):
         self.current_index = 0
         self.emitted_calls = 0
         self._scanner_cache: MarkerScanner | None = None
+        # Bytes buffered since a region opened. See `Region` for why this
+        # is not a string attribute the chunks are added to.
+        self.region = Region()
         # The name already sent for the call being buffered, if any; cleared
         # when that call's arguments go out. See `announce`.
         self._announced: str | None = None
@@ -160,7 +218,7 @@ class ToolCallParser(ABC):
     def flush(self) -> list:
         """Drain whatever is buffered at end of stream."""
 
-    def announce(self, region: str) -> list:
+    def announce(self, head: str) -> list:
         """Send the tool's name as soon as the region reveals it, once.
 
         Only for a name the request actually declared. That check is what
@@ -172,19 +230,22 @@ class ToolCallParser(ABC):
         SGLang's cursor parsers announce with no such check and will emit a
         call named after whatever follows the tag.
 
-        Asked of a bounded prefix and asked at most once more after that. The
-        first version ran the format's regex over the whole region on every
-        chunk, which is quadratic in the response and measured 3.0 -> 9.8 ->
-        36 -> 137 ms across 2k/4k/8k/16k tokens -- the shape `marker_scanner`
-        exists to retire, put back one layer up. A name that is not in the
-        first `_PEEK_WINDOW` bytes is not going to appear later either, so a
-        region that reaches that length without one stops being asked.
+        `head` is `Region.head`: the first `_PEEK_WINDOW` bytes and no more.
+        Asked of that, and asked at most once more after it fills. The first
+        version ran the format's regex over the whole region on every chunk,
+        which is quadratic in the response and measured 3.0 -> 9.8 -> 36 ->
+        137 ms across 2k/4k/8k/16k tokens -- the shape `marker_scanner` exists
+        to retire, put back one layer up. A name that is not in the first
+        `_PEEK_WINDOW` bytes is not going to appear later either, so a region
+        that reaches that length without one stops being asked. Taking the
+        head rather than slicing a whole region here is what keeps the caller
+        from having to materialise one.
         """
         if self._announced is not None or self._peek_exhausted or not self.tools:
             return []
-        name = self.peek_name(region[:_PEEK_WINDOW])
+        name = self.peek_name(head, self.tools)
         if name is None:
-            self._peek_exhausted = len(region) >= _PEEK_WINDOW
+            self._peek_exhausted = len(head) >= _PEEK_WINDOW
             return []
         if self._declared is None:
             self._declared = frozenset(build_param_types(self.tools))
@@ -213,38 +274,58 @@ class ToolCallParser(ABC):
         Two copies of "have we announced this already" is how the announcement
         was sent twice for one call.
 
-        A mismatch is raised, not smoothed over: `peek_name` and the parse
-        disagreeing about the same bytes is a bug in that format, and the name
-        is already on the wire where it cannot be corrected.
+        A mismatch means `peek_name` and `parse` read the same bytes and
+        disagreed, which is a bug in that format. This used to raise. It
+        cannot: the caller is `flush`, on a live SSE stream that has already
+        sent its 200, so the exception reached the client as a connection cut
+        mid-frame with no `[DONE]` and, on the `n>1` path, took the other
+        choices with it. Two registered parsers were then found to reach it on
+        ordinary output.
+
+        So it is logged and recovered from. The announced name is already on
+        the wire and cannot be retracted, but it can be left with no arguments
+        -- the shape every other unfulfilled announcement takes, and one that
+        `completes_a_tool_call` and `finish_reason` both read as "not a call".
+        The real call goes out at the next index, whole.
         """
-        if self._announced is None:
-            return [
-                (
-                    "tool_call_start",
-                    {
-                        "index": index,
-                        "id": call_id,
-                        "type": "function",
-                        "function": {"name": name, "arguments": ""},
-                    },
-                )
-            ]
-        if self._announced != name:
-            raise AssertionError(
-                f"{type(self).__name__} announced {self._announced!r} and then "
-                f"parsed {name!r} from the same region"
+        if self._announced is not None and self._announced != name:
+            logger.warning(
+                "%s announced %r and then parsed %r from the same region; "
+                "sending %r as a new call and leaving %r without arguments",
+                type(self).__name__,
+                self._announced,
+                name,
+                name,
+                self._announced,
             )
-        self._announced = None  # binds to the first call only
-        return []
+            self._announced = None
+            # Past the dangling announcement, so the real call does not land
+            # on an index the client has already bound to the wrong name.
+            # `_emit_call` reads `current_index` again for the arguments, so
+            # the two stay together.
+            self.current_index += 1
+            index = self.current_index
+        elif self._announced is not None:
+            self._announced = None  # binds to the first call only
+            return []
+        return [
+            (
+                "tool_call_start",
+                {
+                    "index": index,
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": ""},
+                },
+            )
+        ]
 
     def _emit_call(self, tc: ToolCall) -> list:
         """Render one parsed ToolCall as start+args stream events.
 
         The name is skipped when it has already gone out, and its id is
-        reused so the client sees one call rather than two. A mismatch means
-        `peek_name` and `parse` disagree about the same bytes, which is a bug
-        in that format and is raised rather than papered over -- the name is
-        already on the wire and cannot be corrected.
+        reused so the client sees one call rather than two. `_start_event`
+        also owns what to do when the announced name was the wrong one.
         """
         events = self._start_event(self.current_index, tc.id, tc.function["name"])
         events.append(
@@ -297,27 +378,27 @@ class BufferedMarkerParser(ToolCallParser):
                 results.append(("content", scan.released))
             if scan.hit is None:
                 return results
-            self.buf = scan.hit + scan.rest
+            self.region.append(scan.hit)
+            self.region.append(scan.rest)
             self.state = 1
             # Also here: a coarse chunk can carry the opener and the name
             # together, and waiting for the next one would give that back.
-            return results + self.announce(self.buf)
-        self.buf += text
+            return results + self.announce(self.region.head)
+        self.region.append(text)
         # The name is legible long before the region closes, and the
         # region is what the wait is for: on a 20 KB file write the
         # client learned the tool only after 5030 of 5040 tokens.
-        return results + self.announce(self.buf)
+        return results + self.announce(self.region.head)
 
     def flush(self) -> list:
         results: list = []
         if self.state == 0:
-            rest = self._scanner.flush() + self.buf
-            self.buf = ""
+            rest = self._scanner.flush()
             if rest:
                 results.append(("content", rest))
             return results
         # state 1: parse the complete (or trailing) tool-call block.
-        region, self.buf = self.buf, ""
+        region = self.region.take()
         _content, tool_calls = self.parse(region, self.tools)
         if not tool_calls:
             # A start marker is not a promise. An answer explaining that a

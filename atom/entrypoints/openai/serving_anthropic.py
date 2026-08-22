@@ -307,6 +307,18 @@ class AnthropicBlocks:
     def __init__(self) -> None:
         self.index = 0
         self.kind: str | None = None
+        # What it takes to reopen the tool call in flight: its id and name.
+        # Set when one starts, cleared when it ends, and deliberately NOT
+        # cleared by `close` -- text arriving between a call's name and its
+        # arguments closes the block but does not end the call, and the
+        # arguments still have to find their way back into one.
+        #
+        # Here and not in `tool_event_frames`, which runs once per parser
+        # batch: announcing a name early split those two events across two
+        # batches -- the name from `process`, the arguments from `flush` --
+        # so a local was reset between them and every streamed tool call on
+        # this endpoint reached the client with `input: {}`.
+        self.open_call: dict | None = None
 
     def close(self):
         """End the open block, if any. A thinking block signs off first."""
@@ -323,6 +335,8 @@ class AnthropicBlocks:
         yield from self.close()
         yield stream_content_block_start(self.index, kind, **start_kwargs)
         self.kind = kind
+        if kind == "tool_use":
+            self.open_call = dict(start_kwargs)
 
     def delta(self, kind: str, text: str, **start_kwargs):
         """Emit `text` as `kind`, switching blocks if that is not the open one."""
@@ -344,20 +358,22 @@ def tool_event_frames(events, blocks: AnthropicBlocks):
     one. Whether a call started is left to the caller to read off `events`;
     returning it from a generator would need the `yield from` that cannot be
     written there.
+
+    Which call is open lives on `blocks` and not here, because this runs once
+    per parser batch and one call spans two of them. See `AnthropicBlocks`.
     """
-    open_call: dict | None = None
     for etype, edata in events:
         if etype == "content":
             yield from blocks.delta("text", edata)
         elif etype == "tool_call_start":
             fn = edata.get("function", {})
-            open_call = {
-                "tool_use_id": edata.get("id", ""),
-                "tool_name": fn.get("name", ""),
-            }
-            yield from blocks.open("tool_use", **open_call)
+            yield from blocks.open(
+                "tool_use",
+                tool_use_id=edata.get("id", ""),
+                tool_name=fn.get("name", ""),
+            )
         elif etype == "tool_call_args":
-            if open_call is None:
+            if blocks.open_call is None:
                 # No name and no id to open a block with, so there is no block
                 # to open. `delta` would have started one with both fields
                 # empty -- syntactically a tool_use the client can neither
@@ -367,9 +383,11 @@ def tool_event_frames(events, blocks: AnthropicBlocks):
             fn = edata.get("function", {})
             # The id and name again: `delta` re-opens the block if anything
             # landed in between, and without them it would re-open it blank.
-            yield from blocks.delta("tool_use", fn.get("arguments", ""), **open_call)
+            yield from blocks.delta(
+                "tool_use", fn.get("arguments", ""), **blocks.open_call
+            )
         elif etype == "tool_call_end":
-            open_call = None
+            blocks.open_call = None
             yield from blocks.close()
 
 

@@ -177,7 +177,11 @@ class ReasoningFilter:
         reasoning, switch to content (state 2), and process anything after."""
         results = []
         reasoning = self.buf[:idx]
-        after = self.buf[idx + len(marker) :].lstrip("\n")
+        # Byte-for-byte, like the non-streaming split -- and this one could
+        # not have been made to agree anyway: it saw only what happened to be
+        # buffered when the marker arrived, so the same answer kept its
+        # newlines at one chunk size and lost them at another.
+        after = self.buf[idx + len(marker) :]
         if reasoning:
             results.append(("reasoning_content", reasoning))
         self.state = 2

@@ -77,10 +77,18 @@ class TestSeparateReasoning:
         assert reasoning == "thinking only"
         assert content == ""
 
-    def test_whitespace_after_thinking(self):
+    def test_whitespace_after_thinking_survives(self):
+        """It used to be trimmed here and delivered by the streaming path.
+
+        The newline a model writes before its answer is not a marker this
+        dialect declares, and only markers may be removed -- the same rule
+        `ToolCallParser.parse` states one stage later, after a trailing
+        `.strip()` there cost a code-block answer its final newline.
+        """
         text = "<think>thought</think>\n\nThe answer."
         reasoning, content = separate_reasoning(text)
-        assert content == "The answer."
+        assert content == "\n\nThe answer."
+        assert reasoning == "thought"
 
     def test_no_think_start_tag(self):
         """MiniMax M2.7 pattern: model doesn't generate <think>, only </think>.
@@ -93,13 +101,13 @@ class TestSeparateReasoning:
         """
         text = "The user wants hello world...\n</think>\n\nprint('Hello')"
         reasoning, content = separate_reasoning(text, starts_thinking=True)
-        assert reasoning == "The user wants hello world..."
-        assert content == "print('Hello')"
+        assert reasoning == "The user wants hello world...\n"
+        assert content == "\n\nprint('Hello')"
 
     def test_no_think_start_tag_empty_content(self):
         text = "Reasoning only\n</think>"
         reasoning, content = separate_reasoning(text, starts_thinking=True)
-        assert reasoning == "Reasoning only"
+        assert reasoning == "Reasoning only\n"
         assert content == ""
 
     def test_an_unopened_end_tag_is_text_when_the_prompt_did_not_open_one(self):

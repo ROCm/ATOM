@@ -59,9 +59,16 @@ class GlmParser(BufferedMarkerParser):
     START_MARKERS: ClassVar[tuple[str, ...]] = ("<tool_call>",)
 
     @classmethod
-    def peek_name(cls, region: str) -> str | None:
+    def peek_name(cls, region: str, tools: list | None = None) -> str | None:
         """`<tool_call>NAME<arg_key>` -- the name is what precedes the first
-        argument key, so it is legible only once that key arrives."""
+        argument key, so it is legible only once that key arrives.
+
+        The one format whose peek and `parse` already agreed. Both followers
+        it accepts are real: `<arg_key>` starts the arguments and
+        `</tool_call>` closes the very block the name opened -- unlike Qwen's,
+        where `</tool_call>` closes an *outer* wrapper and left the inner
+        block unterminated.
+        """
         m = _PEEK_NAME_RE.search(region)
         return m.group(1) if m else None
 
@@ -93,19 +100,33 @@ class GlmParser(BufferedMarkerParser):
             if not body:
                 continue
             ak = body.find("<arg_key>")
-            name = (body if ak == -1 else body[:ak]).strip()
+            if closed or ak != -1:
+                name, rest = body[:ak].strip() if ak != -1 else body.strip(), ""
+            else:
+                # Unclosed and no complete `<arg_key>` yet. The name runs to
+                # the first `<`, and whatever follows is the test below.
+                #
+                # Cut on the character and not on `len(name)`: the name is
+                # stripped, so a single newline after `<tool_call>` shifted
+                # that slice by one and left the name's own last character in
+                # `rest`. A `read_file` call truncated after a leading newline
+                # failed the test and was shipped to the user as raw markup.
+                lt = body.find("<")
+                name = (body if lt == -1 else body[:lt]).strip()
+                rest = "" if lt == -1 else body[lt:]
             if not _TOOL_NAME_RE.match(name):
                 continue
-            if not closed:
-                # See `QwenXmlParser._is_truncated_call`: an unclosed region
-                # is a cut-off call or prose quoting the tag, and prose has to
-                # fail both tests -- a declared name, and nothing after it but
-                # this format's own next token.
-                rest = body[len(name) :].lstrip() if ak == -1 else ""
-                if name not in param_types or not (
-                    not rest or _ARG_OPENER.startswith(rest[: len(_ARG_OPENER)])
-                ):
-                    continue
+            # See `QwenXmlParser._is_truncated_call`: an unclosed region is a
+            # cut-off call or prose quoting the tag, and prose has to fail
+            # both tests -- a declared name, and nothing after it but this
+            # format's own next token. `<tool_call>get_weather<br>` fails the
+            # second; a call cut off inside its own `<arg_key>` passes it, and
+            # used to be rejected along with the prose.
+            if not closed and not (
+                name in param_types
+                and (not rest or _ARG_OPENER.startswith(rest[: len(_ARG_OPENER)]))
+            ):
+                continue
             types = param_types.get(name, {})
             args: dict[str, Any] = {}
             for pm in _ARG_RE.finditer(body):

@@ -59,7 +59,11 @@ def _parse_entries(section_text: str) -> list[ToolCall]:
 
 
 class KimiParser(ToolCallParser):
-    """States: 0 = plain content, 1 = inside section, 2 = section closed."""
+    """States: 0 = plain content, 1 = inside a section. There is no third.
+
+    A section closing returns to 0 because the answer continues after it; the
+    terminal state this used to have swallowed everything that followed.
+    """
 
     NAME: ClassVar[str] = "kimi"
     # The section opener, and the only literal detection keys on. The entry
@@ -72,6 +76,14 @@ class KimiParser(ToolCallParser):
     # every announced call went out at index 0, so a client accumulating by
     # index overwrote the first call with the second. It also drains per
     # completed entry rather than at flush, so it has the least to gain.
+
+    def __init__(self, tools: list | None = None):
+        super().__init__(tools)
+        # Calls drained from the section currently open. `emitted_calls` is
+        # the running total for the whole stream and answers a different
+        # question; using it as this one made the not-a-promise branch dead
+        # code from the first real call onwards.
+        self._section_calls = 0
 
     @classmethod
     def detect(cls, text: str) -> bool:
@@ -107,36 +119,45 @@ class KimiParser(ToolCallParser):
             scan = self._scanner.feed(text)
             if scan.released:
                 results.append(("content", scan.released))
-            if scan.hit is not None:
-                self.state = 1
-                self.buf = scan.rest
-                results.extend(self._drain_entries())
+            if scan.hit is None:
+                return results
+            self.state = 1
+            self.buf = ""
+            self._section_calls = 0
+            # Falls through rather than returning: the whole section, and the
+            # answer after it, can arrive in the same chunk. Returning here
+            # left the section-end handling below unreached and `flush` then
+            # discarded the buffer, so the same text delivered in full at
+            # seven characters a chunk lost its last 18 in one -- and one big
+            # chunk is exactly what `merge_chunk` coalesces to under load.
+            text = scan.rest
 
-        elif self.state == 1:
-            self.buf += text
-            if KIMI_SECTION_END in self.buf:
-                section, _, after = self.buf.partition(KIMI_SECTION_END)
-                self.buf = section
-                results.extend(self._drain_entries())
-                if self.emitted_calls:
-                    results.append(("tool_call_end", None))
-                else:
-                    # A start marker is not a promise, for this format too.
-                    # The section body was dropped here and `state = 2` then
-                    # discarded the rest of the stream: an answer quoting both
-                    # section tokens delivered 26 of its 135 characters when
-                    # fed four at a time, and all 135 in one shot. `flush`'s
-                    # fallback could not see it -- the bytes were already gone.
-                    kept = KIMI_SECTION_BEGIN + section + KIMI_SECTION_END
-                    results.append(("content", kept))
-                # Back to plain content, not a terminal state: text after the
-                # section is still the answer.
-                self.state = 0
-                self.buf = ""
-                if after:
-                    results.extend(self.process(after))
-            else:
-                results.extend(self._drain_entries())
+        self.buf += text
+        if KIMI_SECTION_END not in self.buf:
+            return results + self._drain_entries()
+
+        section, _, after = self.buf.partition(KIMI_SECTION_END)
+        self.buf = section
+        results.extend(self._drain_entries())
+        # This section's own count, not the running total. `emitted_calls` is
+        # cumulative, so after one real call every later section read as
+        # fulfilled and the branch below stopped running for the rest of the
+        # stream: prose quoting both section tokens was deleted outright.
+        if self._section_calls:
+            results.append(("tool_call_end", None))
+        else:
+            # A start marker is not a promise, for this format too. The
+            # section body was dropped here and `state = 2` then discarded the
+            # rest of the stream: an answer quoting both section tokens
+            # delivered 26 of its 135 characters when fed four at a time.
+            kept = KIMI_SECTION_BEGIN + section + KIMI_SECTION_END
+            results.append(("content", kept))
+        # Back to plain content, not a terminal state: text after the section
+        # is still the answer.
+        self.state = 0
+        self.buf = ""
+        if after:
+            results.extend(self.process(after))
 
         return results
 
@@ -166,6 +187,7 @@ class KimiParser(ToolCallParser):
 
             self.buf = self.buf[match.end() :]
             self.emitted_calls += 1
+            self._section_calls += 1
 
         return results
 
@@ -183,7 +205,7 @@ class KimiParser(ToolCallParser):
                 results.append(("content", rest))
         elif self.state == 1:
             results.extend(self._drain_entries())
-            if self.emitted_calls > 0:
+            if self._section_calls > 0:
                 results.append(("tool_call_end", None))
             elif self.buf:
                 # The section opened and closed nothing. Same rule as every

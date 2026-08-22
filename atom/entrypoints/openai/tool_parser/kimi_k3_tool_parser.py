@@ -81,6 +81,19 @@ def _k3_coerce(val: str, ptype: str | None):
         return v
 
 
+def _is_truncated_call(text: str, after_opener: int) -> bool:
+    """Is the call opener at ``after_opener`` a cut-off call, or a quotation?
+
+    See :func:`QwenXmlParser._is_truncated_call`. Only the second of its two
+    tests applies here: K3 carries argument types on the wire, so this parser
+    is never given `tools` and has no declared names to check against. What
+    follows the opener is enough -- a call stops inside its own syntax and
+    prose continues in English.
+    """
+    rest = text[after_opener:].lstrip()
+    return not rest or any(tok.startswith(rest[: len(tok)]) for tok in _CALL_CONTINUES)
+
+
 def _strip_k3_framing(text: str) -> str:
     """Remove the channel tokens, and nothing else.
 
@@ -95,7 +108,13 @@ def _strip_k3_framing(text: str) -> str:
 
 # Name plus the separator that must follow; see QwenXmlParser for why.
 _CALL_OPENER_RE = re.compile(r'<\|open\|>call tool="[^"]*"[^<]*<\|sep\|>')
-_PEEK_NAME_RE = re.compile(r'<\|open\|>call tool="([^"]+)"[^<]*<\|sep\|>')
+_PEEK_NAME_RE = re.compile(
+    r'<\|open\|>call tool="([^"]+)"[^<]*<\|sep\|>(.*)', re.DOTALL
+)
+# What may follow that opener in a call: an argument, or the close of the
+# call itself. One tuple, read by `_is_truncated_call` and by `peek_name`.
+_ARG_OPENER = '<|open|>argument key="'
+_CALL_CONTINUES = (_ARG_OPENER, "<|close|>call")
 
 
 class KimiK3Parser(ToolCallParser):
@@ -147,10 +166,17 @@ class KimiK3Parser(ToolCallParser):
     )
 
     @classmethod
-    def peek_name(cls, region: str) -> str | None:
-        """`<|open|>call tool="NAME"` -- the name travels in the opener."""
+    def peek_name(cls, region: str, tools: list | None = None) -> str | None:
+        """`<|open|>call tool="NAME"` -- the name travels in the opener.
+
+        Judged by the same `_is_truncated_call` that decides whether `parse`
+        cuts the answer there. This used to announce on the opener alone, so
+        an answer *quoting* one named a tool the client never called.
+        """
         m = _PEEK_NAME_RE.search(region)
-        return m.group(1) if m else None
+        if m is None or not m.group(2).lstrip():
+            return None
+        return m.group(1) if _is_truncated_call(region, m.start(2)) else None
 
     @classmethod
     def opens_region(cls, marker: str) -> bool:
@@ -198,6 +224,14 @@ class KimiK3Parser(ToolCallParser):
         # answer that merely quoted it, which is the promise rule this format
         # has to keep like every other.
         m = _CALL_OPENER_RE.search(text)
+        if m is not None and not tool_calls and not _is_truncated_call(text, m.end()):
+            # A start marker is not a promise, and this format had no branch
+            # for it. Nothing parsed to a call and what follows the opener is
+            # English, so the opener is a quotation: cutting there deleted 62
+            # characters of the answer with no event and `finish_reason`
+            # still `stop`. `_CALL_OPENER_RE` cannot tell the two apart on
+            # its own -- it accepts openers `_K3_CALL_RE` rejects.
+            m = None
         if m is None:
             return _strip_k3_framing(text), tool_calls
         ts = text.find(KIMI_K3_TOOLS_START)
@@ -208,13 +242,17 @@ class KimiK3Parser(ToolCallParser):
         # Buffer everything; K3's interleaved framing is parsed once at flush.
         # The name is the exception: it travels in the call opener, so it can
         # go out now rather than after the arguments -- see `announce`.
-        self.buf += text
-        return self.announce(self.buf)
+        self.region.append(text)
+        return self.announce(self.region.head)
 
     def flush(self) -> list:
-        content, tool_calls = self.parse(self.buf, self.tools)
-        self.buf = ""
+        content, tool_calls = self.parse(self.region.take(), self.tools)
         results: list = []
+        if not tool_calls:
+            # Nothing to bind an announced name to, and `_emit_call` -- which
+            # is what normally consumes it -- never runs. Left set, it made
+            # the *next* call's name mismatch its own parse.
+            self._announced = None
         if content:
             results.append(("content", content))
         for tc in tool_calls:

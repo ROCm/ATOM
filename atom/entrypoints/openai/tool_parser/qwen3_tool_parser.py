@@ -35,6 +35,28 @@ _PARAM_RE = re.compile(
 )
 
 
+# What may follow the name inside a call: another parameter, or the close of
+# the very block the name opened. NOT `</tool_call>`, which closes the
+# *outer* wrapper -- `<function=get_weather></tool_call>` leaves the function
+# block unterminated, so `parse` reads it as prose. The peek used to accept
+# it and `parse` did not, which is the whole of the mismatch this shared
+# tuple exists to prevent: one spelling, both readers.
+_CALL_CONTINUES = (_PARAM_OPENER, "</function>")
+
+
+def _continues_a_call(rest: str) -> bool:
+    """Is `rest` the start of this format's own next token?"""
+    return any(tok.startswith(rest[: len(tok)]) for tok in _CALL_CONTINUES)
+
+
+def _name_and_rest(fn_text: str) -> tuple[str, str] | None:
+    """Split `NAME>whatever` at the tag close, or ``None`` if it has not come."""
+    gt = fn_text.find(">")
+    if gt == -1:
+        return None
+    return fn_text[:gt].strip(), fn_text[gt + 1 :].lstrip()
+
+
 def _is_truncated_call(fn_text: str, param_types: dict) -> bool:
     """Is this unclosed `<function=...` a cut-off call, or prose quoting a tag?
 
@@ -47,16 +69,15 @@ def _is_truncated_call(fn_text: str, param_types: dict) -> bool:
 
     Two things separate them, and prose has to fail both. The name is one the
     request declared -- prose can name a real tool, so this alone is not
-    enough. And what follows the name is a parameter or nothing: a cut-off
-    call stops inside its own syntax, while prose continues in English.
+    enough. And what follows the name is this format's own next token: a
+    cut-off call stops inside its own syntax, while prose continues in
+    English. `peek_name` applies the same two, from the same code.
     """
-    gt = fn_text.find(">")
-    if gt == -1:
+    split = _name_and_rest(fn_text)
+    if split is None:
         return False
-    if fn_text[:gt].strip() not in param_types:
-        return False
-    rest = fn_text[gt + 1 :].lstrip()
-    return not rest or _PARAM_OPENER.startswith(rest[: len(_PARAM_OPENER)])
+    name, rest = split
+    return name in param_types and (not rest or _continues_a_call(rest))
 
 
 def _parse_function(
@@ -90,14 +111,12 @@ def _parse_function(
     )
 
 
-# The name *and* the token that must follow it. A name alone matches prose
-# explaining how to call a tool, and an announcement cannot be retracted --
-# "the model writes <tool_call><function=get_weather> and then..." announced
-# `get_weather`. Waiting for the structure costs a few characters against
-# the thousands this saves.
-_PEEK_NAME_RE = re.compile(
-    r"<function=([^>\n]+)>\s*(?:<parameter=|</function>|</tool_call>)"
-)
+# The name, and enough of what follows to tell a call from prose. A name
+# alone matches an answer explaining how to call a tool, and an announcement
+# cannot be retracted -- "the model writes <tool_call><function=get_weather>
+# and then..." announced `get_weather`. Waiting for the structure costs a few
+# characters against the thousands this saves.
+_PEEK_NAME_RE = re.compile(r"<function=([^>\n]+)>(.*)", re.DOTALL)
 
 
 class QwenXmlParser(BufferedMarkerParser):
@@ -105,10 +124,20 @@ class QwenXmlParser(BufferedMarkerParser):
     START_MARKERS: ClassVar[tuple[str, ...]] = ("<tool_call>", QWEN_TOOL_PREFIX)
 
     @classmethod
-    def peek_name(cls, region: str) -> str | None:
-        """`<function=NAME>` -- legible once the tag closes."""
+    def peek_name(cls, region: str, tools: list | None = None) -> str | None:
+        """`<function=NAME>` -- legible once the tag closes and something
+        follows it that only a call would write.
+
+        The follower must have *arrived*, unlike in `_is_truncated_call`,
+        which accepts nothing-after because it runs at end of stream where
+        nothing more is coming. Here more is coming, so an empty tail is
+        "not yet" rather than "cut off".
+        """
         m = _PEEK_NAME_RE.search(region)
-        return m.group(1) if m else None
+        if m is None:
+            return None
+        rest = m.group(2).lstrip()
+        return m.group(1) if rest and _continues_a_call(rest) else None
 
     @classmethod
     def detect(cls, text: str) -> bool:

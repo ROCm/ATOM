@@ -8,6 +8,7 @@ requiring a running GPU server — uses unit tests on the conversion
 functions and response builders.
 """
 
+import ast
 import json
 import pathlib
 
@@ -669,3 +670,67 @@ class TestSeparationIsUnconditional:
         assert "anthropic_reasoning_split" not in src
         assert "anthropic_reasoning_filter" not in src
         assert "anthropic_tool_format" not in src
+
+
+class TestASwitchlessModelStillHonoursDisabled:
+    """The prompt is the better place to answer `thinking`, not the only one.
+
+    `anthropic_template_kwargs` sets the template's own switch wherever there
+    is one. For a model whose template has none -- gpt-oss-120b and
+    DeepSeek-R1 both measure that way -- it returns `{}`, and the two
+    downstream suppressions this branch removed are no longer there to catch
+    it. So `thinking: {"type": "disabled"}` was honoured at neither layer:
+    the client asked for no reasoning and got `thinking` blocks.
+
+    Withheld, not left unseparated. Separation stays unconditional because
+    the tool parser reads the same text -- see `TestSeparationIsUnconditional`.
+    """
+
+    TOGGLE = ("enable_thinking", False, True)
+
+    class Req:
+        def __init__(self, thinking):
+            self.thinking = thinking
+
+    @pytest.mark.parametrize(
+        "thinking, toggle, expected",
+        [
+            ({"type": "disabled"}, None, True),
+            # Answered in the prompt instead, which is strictly better.
+            ({"type": "disabled"}, TOGGLE, False),
+            # Absent is unstated at both layers or neither.
+            (None, None, False),
+            (None, TOGGLE, False),
+            ({"type": "enabled"}, None, False),
+        ],
+        ids=["switchless-off", "switched-off", "absent", "absent-switched", "on"],
+    )
+    def test_only_an_explicit_opt_out_with_nowhere_else_to_go(
+        self, thinking, toggle, expected
+    ):
+        assert (
+            api_server.anthropic_drop_reasoning(self.Req(thinking), toggle) is expected
+        )
+
+    def test_both_endpoint_paths_consult_it(self):
+        """Read off the syntax tree, not grepped for: a literal check passes
+        against code rewritten into a different shape with the same bug, and
+        this suite has been fooled that way twice.
+        """
+        tree = ast.parse(pathlib.Path(api_server.__file__).read_text())
+        fn = next(
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.AsyncFunctionDef) and n.name == "anthropic_messages"
+        )
+        reads = [
+            n
+            for n in ast.walk(fn)
+            if isinstance(n, ast.Name)
+            and n.id == "drop_reasoning"
+            and isinstance(n.ctx, ast.Load)
+        ]
+        assert len(reads) >= 2, (
+            "the streaming and non-streaming branches must both consult it; "
+            f"found {len(reads)} read(s)"
+        )

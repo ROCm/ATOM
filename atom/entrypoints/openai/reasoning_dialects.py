@@ -41,6 +41,19 @@ CHANNEL_TOOLS_START = "<|open|>tools<|sep|>"
 CHANNEL_CALL_PREFIX = '<|open|>call tool="'
 
 # Result of splitting a full response: (reasoning_content or None, content).
+#
+# **Both halves come back byte-for-byte.** What may be removed is a marker a
+# dialect declares; everything else, and whitespace in particular, survives.
+# This is the rule `ToolCallParser.parse` already states for the stage after
+# this one, and it exists for the same reason: the streaming filter releases
+# bytes as they arrive and owns nothing to tidy them with, so any trimming
+# done only here is a divergence a client sees.
+#
+# It was not applied here, and the symptom was the one that rule cites
+# verbatim -- a trailing `.strip()` cost a code-block answer its final
+# newline. Measured across 12544 (dialect, shape, chunking) comparisons,
+# stripping put `stream=false` and `stream=true` at 50% byte-agreement on
+# content; without it they agree exactly.
 SplitResult = tuple[str | None, str]
 
 
@@ -82,47 +95,85 @@ def _strip_channel_response_markers(text: str) -> str:
     for marker in (CHANNEL_RESPONSE_END, CHANNEL_MESSAGE_END, CHANNEL_END_OF_MSG):
         if marker in text:
             text = text.partition(marker)[0]
-    return text.strip()
+    return text
 
 
 def _split_channel(text: str, starts_thinking: bool = False) -> SplitResult | None:
     combined = CHANNEL_THINK_END + CHANNEL_RESPONSE_START
     if combined in text:
         reasoning, _, content = text.partition(combined)
-        return (reasoning.strip() or None, _strip_channel_response_markers(content))
+        return (reasoning or None, _strip_channel_response_markers(content))
     if CHANNEL_RESPONSE_START in text:
         _, _, content = text.partition(CHANNEL_RESPONSE_START)
         return (None, _strip_channel_response_markers(content))
     if CHANNEL_THINK_END in text and starts_thinking:
         reasoning, _, content = text.partition(CHANNEL_THINK_END)
-        return (reasoning.strip() or None, _strip_channel_response_markers(content))
+        return (reasoning or None, _strip_channel_response_markers(content))
     return None
 
 
 # --- Generic <think>...</think> dialect (K2/DeepSeek/Qwen3/MiniMax/...) ---
 
-_THINK_CLOSED_RE = re.compile(r"<think>(.*?)</think>\s*(.*)", flags=re.DOTALL)
-_THINK_OPEN_RE = re.compile(r"<think>(.*)", flags=re.DOTALL)
+# No `\s*` after `</think>`. The newline a model puts before its answer is
+# not a marker this dialect declares, so it survives -- see `SplitResult`.
+THINK_OPEN_MARKER = "<think>"
+THINK_END_MARKER = "</think>"
+_THINK_CLOSED_RE = re.compile(
+    re.escape(THINK_OPEN_MARKER) + r"(.*?)" + re.escape(THINK_END_MARKER) + r"(.*)",
+    flags=re.DOTALL,
+)
+_THINK_OPEN_RE = re.compile(re.escape(THINK_OPEN_MARKER) + r"(.*)", flags=re.DOTALL)
 
 
 def _split_think_tag(text: str, starts_thinking: bool = False) -> SplitResult | None:
-    # Closed block: <think>...</think> answer
-    match = _THINK_CLOSED_RE.match(text)
+    # Ordered as the streaming filter's state machine is, because that is what
+    # this has to agree with. `starts_thinking` means the prompt already
+    # opened the channel, so the output *begins* in it: the first `</think>`
+    # closes it and any `<think>` before that is literal text inside the
+    # reasoning, not an opener. Letting the searches below run first read one
+    # as an opener and dropped everything ahead of it.
+    if starts_thinking:
+        # `</think>` with no `<think>`. Reasoning only because the prompt says
+        # the channel is open -- ungated, this guessed, and disagreed with the
+        # streaming path, which cannot honour an end marker it has no opener
+        # for without waiting for one, and waiting is the stall. vLLM's
+        # non-streaming path still guesses here and its streaming path does
+        # not; the two do not agree, and this is the half worth copying.
+        if THINK_END_MARKER in text:
+            reasoning, _, content = text.partition(THINK_END_MARKER)
+            return (reasoning or None, content)
+        # Never closed: all reasoning, no answer. That is what a reasoning
+        # model stopped at `max_tokens` looks like, and `separate_reasoning`'s
+        # own fallback says it -- returning `None` defers to it rather than
+        # writing the same answer twice.
+        return None
+
+    # Closed block: <think>...</think> answer.
+    #
+    # Searched, not anchored at position 0: a block does not have to open the
+    # output. Anchoring meant a model that answers, opens a `<think>` block
+    # and answers again matched nothing, so the client was handed the literal
+    # tags with the chain of thought inside `content`.
+    #
+    # What precedes the block is content because it *is* content -- text
+    # outside the reasoning channel. Nothing about the split needs the
+    # streaming filter to justify it; this function has the whole output.
+    #
+    # The *first* block only, and that one IS a parity choice rather than a
+    # reading of the format: the streaming filter closes the channel on the
+    # first `</think>` and never reopens it, so splitting every block here
+    # would make `stream=false` disagree with `stream=true` on any output
+    # with two -- swapping one divergence for another. Whether *both* should
+    # reopen is a separate question, and answering it means changing the
+    # filter, not this.
+    match = _THINK_CLOSED_RE.search(text)
     if match:
-        return (match.group(1).strip() or None, match.group(2).strip())
-    # `</think>` with no `<think>`. Only reasoning if the prompt really did open
-    # the channel -- which `starts_thinking` now says, instead of this guessing.
-    # Ungated it disagreed with the streaming path, which cannot honour an end
-    # marker it has no opener for without waiting for one, and waiting is the
-    # stall. vLLM's non-streaming path still guesses here and its streaming path
-    # does not; the two do not agree, and this is the half worth copying.
-    if "</think>" in text and starts_thinking:
-        reasoning, _, content = text.partition("</think>")
-        return (reasoning.strip() or None, content.strip())
-    # Unclosed block (truncated response).
-    match = _THINK_OPEN_RE.match(text)
+        return (match.group(1) or None, text[: match.start()] + match.group(2))
+    # Unclosed block (truncated response). Searched, and split, for the same
+    # reasons as the closed one above.
+    match = _THINK_OPEN_RE.search(text)
     if match:
-        return (match.group(1).strip() or None, "")
+        return (match.group(1) or None, text[: match.start()])
     return None
 
 
@@ -149,9 +200,9 @@ DIALECTS: tuple[ReasoningDialect, ...] = (
     ),
     # Generic <think>...</think> (K2/DeepSeek/Qwen3/MiniMax/...)
     ReasoningDialect(
-        prompt_open_marker="<think>",
-        output_open_marker="<think>",
-        think_end_marker="</think>",
+        prompt_open_marker=THINK_OPEN_MARKER,
+        output_open_marker=THINK_OPEN_MARKER,
+        think_end_marker=THINK_END_MARKER,
         split=_split_think_tag,
     ),
 )

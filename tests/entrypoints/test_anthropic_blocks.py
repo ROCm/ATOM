@@ -17,6 +17,7 @@ out, whatever order the kinds arrive in.
 from __future__ import annotations
 
 import json
+from typing import ClassVar
 
 import pytest
 
@@ -25,6 +26,7 @@ from atom.entrypoints.openai.serving_anthropic import (
     completes_a_tool_call,
     tool_event_frames,
 )
+from atom.entrypoints.openai.tool_parser.glm_tool_parser import GlmParser
 
 KINDS = ("text", "thinking", "tool_use")
 
@@ -284,3 +286,91 @@ class TestNoBlockWithoutAnIdAndAName:
             for block in self._blocks(events):
                 if block["type"] == "tool_use":
                     assert block["id"] and block["name"], block
+
+
+class TestOneCallSpansTwoParserBatches:
+    """A name announced early and its arguments do not arrive together.
+
+    `tool_event_frames` runs once per parser batch, and announcing the name as
+    soon as the region reveals it puts the two events that describe one call
+    in different batches -- the name from `process`, the arguments from
+    `flush`. Which call is open therefore cannot be a local in that function,
+    and while it was, every streamed tool call on `/v1/messages` reached the
+    client as `input: {}` with `stop_reason: tool_use`. Claude Code ran the
+    tool with no arguments.
+
+    Driven through a real parser rather than a hand-built event list: the
+    tests above pass one batch each and so could not see this.
+    """
+
+    TOOLS: ClassVar[list] = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                },
+            },
+        }
+    ]
+    CALL = (
+        "<tool_call>get_weather<arg_key>city</arg_key>"
+        "<arg_value>Paris</arg_value></tool_call>"
+    )
+
+    def _frames(self, chunk_size):
+        parser = GlmParser(tools=self.TOOLS)
+        blocks = AnthropicBlocks()
+        out = []
+        for i in range(0, len(self.CALL), chunk_size):
+            batch = parser.process(self.CALL[i : i + chunk_size])
+            out += list(tool_event_frames(batch, blocks))
+        out += list(tool_event_frames(parser.flush(), blocks))
+        return [json.loads(f.split("data: ", 1)[1]) for f in out]
+
+    @pytest.mark.parametrize("chunk_size", [1, 7, len(CALL)])
+    def test_the_arguments_reach_the_client(self, chunk_size):
+        deltas = [
+            p["delta"]["partial_json"]
+            for p in self._frames(chunk_size)
+            if p["type"] == "content_block_delta"
+            and p["delta"]["type"] == "input_json_delta"
+        ]
+        assert "".join(deltas) == '{"city": "Paris"}'
+
+    @pytest.mark.parametrize("chunk_size", [1, 7, len(CALL)])
+    def test_they_land_in_the_block_that_carries_the_name(self, chunk_size):
+        frames = self._frames(chunk_size)
+        named = [
+            p["index"]
+            for p in frames
+            if p["type"] == "content_block_start"
+            and p["content_block"]["name"] == "get_weather"
+        ]
+        argued = [
+            p["index"]
+            for p in frames
+            if p["type"] == "content_block_delta"
+            and p["delta"]["type"] == "input_json_delta"
+        ]
+        assert named and set(argued) <= set(named), (named, argued)
+
+    def test_a_call_that_ended_does_not_adopt_the_next_arguments(self):
+        """The call outlives a block close, but not its own end.
+
+        Surviving `close` is what fixes the case above; surviving
+        `tool_call_end` would hand a later orphan batch of arguments to a
+        call the client has already been told is finished.
+        """
+        blocks = AnthropicBlocks()
+        start = (
+            "tool_call_start",
+            {"id": "call_1", "function": {"name": "get_weather", "arguments": ""}},
+        )
+        orphan = ("tool_call_args", {"function": {"arguments": '{"city": "Rome"}'}})
+        list(tool_event_frames([start, ("tool_call_end", None)], blocks))
+        assert blocks.open_call is None
+        frames = list(tool_event_frames([orphan], blocks))
+        assert frames == [], "arguments were adopted by a call that had ended"

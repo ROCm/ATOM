@@ -34,18 +34,23 @@ its content segments into the tool parser, both flushed on the last chunk.
 from __future__ import annotations
 
 import ast
+import itertools
+import json
 import pathlib
 import random
+import re
+import time
 
 import pytest
 
-from atom.entrypoints.openai.reasoning import ReasoningFilter
+from atom.entrypoints.openai.reasoning import ReasoningFilter, separate_reasoning
 from atom.entrypoints.openai.reasoning_dialects import DIALECTS
 from atom.entrypoints.openai.serving_anthropic import completes_a_tool_call
 from atom.entrypoints.openai.tool_parser.kimi_tool_parser import KimiParser
 from atom.entrypoints.openai.tool_parser.qwen3_tool_parser import QwenXmlParser
 from atom.entrypoints.openai.tool_parser.registry import _DETECT_ORDER
 from atom.entrypoints.openai.tool_parser.stream import ToolCallStreamParser
+from atom.entrypoints.openai.tool_parser.tool_parser import _PEEK_WINDOW
 
 # Kimi is the terminal fallback and so is not in the detect order, but it is a
 # registered format with markers of its own.
@@ -496,6 +501,131 @@ class TestNothingIsHeldPastTheEnd:
             )
 
 
+# Text built from a dialect's own markers, every way they can sit around
+# them. Generated rather than listed because hand-picked cases found three
+# divergences in a row here, each after the previous one was declared fixed:
+# a lost prefix, then a space, then a newline.
+_REASONING_GLUE = ["", " ", "\n", "\n\n", "x", " x ", "\nx\n"]
+
+
+def reasoning_shapes(dialect) -> list[str]:
+    open_m = dialect.output_open_marker or dialect.prompt_open_marker
+    end_m = dialect.think_end_marker
+    out = set()
+    for a, b, c in itertools.product(_REASONING_GLUE, repeat=3):
+        out.add(a + open_m + b + end_m + c)  # closed block
+        out.add(a + open_m + b)  # truncated mid-block
+        out.add(a + end_m + c)  # end marker with no opener
+        out.add(a + open_m + b + end_m + c + open_m + b + end_m + c)  # two blocks
+    return sorted(out)
+
+
+REASONING_DIALECTS = [
+    pytest.param(d, sth, id=f"d{i}-{'prompt-opened' if sth else 'self-opened'}")
+    for i, d in enumerate(DIALECTS)
+    for sth in (False, True)
+]
+
+
+def split_reasoning_streaming(text: str, chunk: int, starts_thinking: bool):
+    f = ReasoningFilter(starts_thinking=starts_thinking)
+    segs = []
+    for i in range(0, len(text), chunk):
+        segs += f.process(text[i : i + chunk])
+    segs += f.flush()
+    return (
+        "".join(t for k, t in segs if k == "reasoning_content"),
+        "".join(t for k, t in segs if k == "content"),
+    )
+
+
+class TestTheReasoningSplitAgreesWithItself:
+    """The same rule as the class below, one stage earlier.
+
+    That class holds the *tool parser* to stream/non-stream agreement. Nothing
+    held the *reasoning* split to it, and it diverged: a model that answers,
+    opens a `<think>` block and answers again had the block extracted when
+    streamed, and handed to the client as literal tags with the chain of
+    thought inside `content` when not.
+
+    One test per dialect rather than per shape. The corpus is a few thousand
+    strings and pytest ids for each would outnumber the rest of this suite ten
+    to one; the loop reports every divergence at once, which is also what you
+    want when a change breaks a whole class of them.
+
+    Judged byte-for-byte. It could not be, until the two things stopping it
+    were removed: this path stripped, and the filter's own `lstrip("\n")`
+    after the end marker saw only what happened to be buffered, so the same
+    answer kept its newlines at one chunk size and lost them at another.
+    Neither survived the question of what it was for -- the newline a model
+    writes before its answer is not a marker, and only markers may be
+    removed. Across this corpus that took content agreement from 50% to 100%.
+    """
+
+    CHUNKS = (1, 3, 11, 10_000)
+
+    def _divergences(self, dialect, starts_thinking, field: int):
+        out = []
+        for text in reasoning_shapes(dialect):
+            non = separate_reasoning(text, starts_thinking=starts_thinking)[field]
+            for chunk in self.CHUNKS:
+                got = split_reasoning_streaming(text, chunk, starts_thinking)[field]
+                if (non or "") != got:
+                    out.append((text, chunk, non, got))
+        return out
+
+    @pytest.mark.parametrize("dialect, starts_thinking", REASONING_DIALECTS)
+    def test_the_answer_is_the_same_however_it_is_delivered(
+        self, dialect, starts_thinking
+    ):
+        bad = self._divergences(dialect, starts_thinking, 1)
+        assert not bad, self._report("content", bad)
+
+    @pytest.mark.parametrize("dialect, starts_thinking", REASONING_DIALECTS)
+    def test_the_chain_of_thought_is_the_same_too(self, dialect, starts_thinking):
+        """Agreement on the answer is not enough: a split that put the
+        reasoning in the wrong field would still pass the test above if the
+        words happened to land in `content` either way."""
+        bad = self._divergences(dialect, starts_thinking, 0)
+        assert not bad, self._report("reasoning", bad)
+
+    @pytest.mark.parametrize(
+        "text, expected",
+        [
+            ("a<think>b</think>\nc", "a\nc"),
+            ("a<think>b</think>\n\nc", "a\n\nc"),
+            ("a<think>b</think>c", "ac"),
+            ("a<think>b</think> c", "a c"),
+            ("<think>b</think>\n\nThe answer.", "\n\nThe answer."),
+            ("<think>b</think>```\nx\n```\n", "```\nx\n```\n"),
+        ],
+        ids=["one-newline", "two-newlines", "none", "a-space", "an-answer", "a-block"],
+    )
+    def test_the_newline_a_model_puts_before_its_answer_survives(self, text, expected):
+        """Spelled out, because the sweep above says only that the two *agree*.
+
+        Two paths that both dropped it would satisfy that and still lose a
+        code block's final newline -- which is the symptom the byte-for-byte
+        rule was written for one stage later, and the one measured here
+        before the strips came out.
+        """
+        assert separate_reasoning(text, starts_thinking=False)[1] == expected
+        f = ReasoningFilter(starts_thinking=False)
+        segs = f.process(text) + f.flush()
+        assert "".join(t for k, t in segs if k == "content") == expected
+
+    @staticmethod
+    def _report(field, bad):
+        lines = [f"{len(bad)} shapes split {field} two ways:"]
+        for text, chunk, non, got in bad[:5]:
+            lines.append(
+                f"  chunk={chunk} text={text!r}\n"
+                f"    stream=false {non!r}\n"
+                f"    stream=true  {got!r}"
+            )
+        return "\n".join(lines)
+
+
 class TestNonStreamingAgreesWithStreaming:
     """An answer with no tool call comes back the same on both paths.
 
@@ -601,9 +731,13 @@ REAL_CALLS: dict[str, str] = {
         f'<{_D}parameter name="city" string="true">Paris</{_D}parameter>'
         f"</{_D}invoke></{_D}tool_calls>"
     ),
+    # Parameters named by the tag, which is what tells this format from DSML.
+    # This entry was written in DSML's `<parameter name="...">` spelling and
+    # so parsed to `get_weather({})` -- a call with no arguments, passing
+    # every test here while exercising none of the parameter path.
     "minimax": (
         f'{_NS}<tool_call>{_NS}<invoke name="get_weather">'
-        f'{_NS}<parameter name="city">Paris</{_NS}parameter>'
+        f"{_NS}<city>Paris{_NS}</city>"
         f"{_NS}</invoke>{_NS}</tool_call>"
     ),
 }
@@ -628,8 +762,19 @@ class TestARealCallSurvivesTheStream:
     @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
     def test_the_non_streaming_path_reads_the_call(self, parser):
         """The fixture is a real call in this format, and this says so."""
-        _, calls = parser.parse(REAL_CALLS[parser.NAME], None)
+        _, calls = parser.parse(REAL_CALLS[parser.NAME], DECLARED_TOOLS)
         assert [c.function["name"] for c in calls] == ["get_weather"]
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_the_call_carries_its_argument(self, parser):
+        """And the payload is in *this* format's spelling, not another's.
+
+        Only the name was asserted, so an entry written in the wrong format's
+        parameter syntax parsed to `get_weather({})` and passed everything
+        here -- minimax's was, for as long as the table existed.
+        """
+        _, calls = parser.parse(REAL_CALLS[parser.NAME], DECLARED_TOOLS)
+        assert json.loads(calls[0].function["arguments"]) == {"city": "Paris"}
 
     @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
     def test_the_call_arrives_however_it_is_chunked(self, parser):
@@ -667,6 +812,77 @@ FRAMING_NOT_A_REGION: dict[str, set[str]] = {
         "<|sep|>",
     },
 }
+
+
+def prefix_pairs(parser) -> list[tuple[str, str]]:
+    """Every (short, long) pair of this format's markers where short opens long."""
+    ms = parser.START_MARKERS
+    return [(a, b) for a in ms for b in ms if a != b and b.startswith(a)]
+
+
+class TestAPrefixPairCannotChangeTheHandover:
+    """Longest-first only settles a tie the buffer can already see.
+
+    `MarkerScanner` reports the longest marker at a position -- among the ones
+    already complete in its buffer. A chunk ending exactly at the shorter of a
+    prefix pair reports the shorter one, because the longer has not arrived to
+    be preferred. So which of the two fires is a function of where the
+    boundary landed.
+
+    Harmless while both halves agree about handing the stream over, and today
+    every pair does: K3's three are all channel framing that opens no region,
+    so either way the marker is dropped and the remainder is caught as its own
+    marker. Measured -- a K3 answer comes out identical at seven chunk sizes.
+
+    It stops being harmless the moment a pair disagrees. With a synthetic
+    `("<|end|>", "<|end|>call")` where only the long one opens a region, one
+    text produced two different answers across six chunk sizes: the marker was
+    deleted as framing at chunk 1, 2 and 9, and handed over as a region at 7,
+    8 and 999.
+
+    So this is the cheap half of the fix. The expensive half -- withholding a
+    complete match that could still grow -- is the rule `_plan` would need to
+    actually keep its promise, and is worth writing when a format needs it,
+    not before.
+    """
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_both_halves_agree_about_opening_a_region(self, parser):
+        disagreeing = [
+            (short, long)
+            for short, long in prefix_pairs(parser)
+            if parser.opens_region(short) != parser.opens_region(long)
+        ]
+        assert not disagreeing, (
+            f"{parser.NAME} declares a marker that is a prefix of another and "
+            f"they disagree about handing the stream over, so which happens "
+            f"depends on the chunk boundary: {disagreeing}"
+        )
+
+    def test_the_registry_still_has_pairs_to_check(self):
+        """Otherwise the test above is green because it examined nothing.
+
+        K3's `<|close|>response` / `<|close|>response<|sep|>` and its two
+        siblings are the only pairs there are; drop them and this suite would
+        keep passing while the rule went unenforced.
+        """
+        found = {p.NAME: prefix_pairs(p) for p in ALL_PARSERS}
+        total = sum(len(v) for v in found.values())
+        assert total >= 3, f"no prefix pairs left to check: {found}"
+
+    def test_a_disagreeing_pair_is_rejected(self):
+        """And that the check can fail at all -- built rather than waited for."""
+
+        class Synthetic(QwenXmlParser):
+            NAME = "synthetic"
+            START_MARKERS = ("<|end|>", "<|end|>call")
+
+            @classmethod
+            def opens_region(cls, marker):
+                return marker == "<|end|>call"
+
+        with pytest.raises(AssertionError, match="chunk boundary"):
+            self.test_both_halves_agree_about_opening_a_region(Synthetic)
 
 
 class TestAPlainAnswerDoesNotWaitForTheEnd:
@@ -792,7 +1008,7 @@ class TestTheNameArrivesBeforeTheArguments:
     @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
     def test_the_opt_outs_are_the_declared_ones(self, parser):
         """Whether a format announces at all, pinned rather than inferred."""
-        peeks = parser.peek_name(REAL_CALLS[parser.NAME]) is not None
+        peeks = parser.peek_name(REAL_CALLS[parser.NAME], DECLARED_TOOLS) is not None
         assert peeks is (parser.NAME not in NO_EARLY_NAME), (
             f"{parser.NAME}: peek_name says {peeks}, NO_EARLY_NAME says "
             f"{parser.NAME in NO_EARLY_NAME}"
@@ -870,6 +1086,185 @@ class TestTheNameArrivesBeforeTheArguments:
         assert "tool_call_start" not in events
 
 
+# Each format's call opener, up to and including the tool name -- written
+# out, like REAL_CALLS, because it is data about the format. Derived by
+# re-peeking instead, the corpus moved whenever `peek_name` did and the
+# property below went quietly vacuous.
+CALL_OPENERS: dict[str, str] = {
+    "glm": "<tool_call>get_weather",
+    "qwen": "<tool_call><function=get_weather>",
+    "kimi_k3": '<|open|>tools<|sep|><|open|>call tool="get_weather"<|sep|>',
+    "dsml": f'<{_D}tool_calls><{_D}invoke name="get_weather">',
+    "minimax": f'{_NS}<tool_call>{_NS}<invoke name="get_weather">',
+}
+
+# What legitimately comes next in each format -- the one tail that must make
+# the name go out. Without a positive row the property below is satisfied by
+# a peek that never announces anything.
+CALL_CONTINUATIONS: dict[str, str] = {
+    "glm": "<arg_key>city</arg_key>",
+    "qwen": "<parameter=city>Paris</parameter>",
+    "kimi_k3": '<|open|>argument key="city"<|sep|>Paris',
+    "dsml": f'<{_D}parameter name="city">Paris',
+    "minimax": f"{_NS}<city>Paris",
+}
+
+# A closer that is NOT this format's own. Per format, because one format's
+# foreign closer is another's legitimate one: `</tool_call>` leaves Qwen's
+# `<function=` block open and so is prose there, while for GLM it closes the
+# very block the name opened and `<tool_call>get_weather</tool_call>` is a
+# real zero-argument call.
+FOREIGN_CLOSERS: dict[str, str] = {
+    "glm": "</function>",
+    "qwen": "</tool_call>",
+    "kimi_k3": "<|close|>response<|sep|>",
+    "dsml": "</tool_call>",
+    "minimax": "</function>",
+}
+
+# And what prose looks like next. None of these may make the name go out.
+PROSE_TAILS = [
+    ("", "nothing yet"),
+    (" and then the parameters.", "English"),
+    ("<br>, like that.", "a tag, but not this format's"),
+]
+
+# A schema with a parameter in it. MiniMax names parameters by the tag, so
+# with an empty schema it can only fall back to accepting any tag and the
+# `<br>` row above passes for the wrong reason.
+PEEK_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+            },
+        },
+    }
+]
+
+
+class TestThePeekNeverNamesWhatTheParseCallsProse:
+    """`peek_name` and `parse` must agree about what a call looks like.
+
+    A name cannot be retracted. If the peek names a region and the parse then
+    reads that same region as prose, the client has been told about a call
+    that does not exist -- on `/v1/chat/completions` as a `tool_calls` delta
+    whose `arguments` is `""`, which every agent loop feeds to `json.loads`,
+    and on `/v1/messages` as a syntactically complete `tool_use` block with
+    `input: {}` that a client cannot tell from a real zero-argument call.
+
+    Four of the five formats that announce had the two disagree, because each
+    wrote the rule twice: a follower set in a peek regex, a truncation test in
+    `parse`. Qwen's peek accepted `</tool_call>` -- which closes the *outer*
+    wrapper and leaves the `<function=` block unterminated, so `parse` read it
+    as prose. Each format now answers the question once, from one constant,
+    and both callers ask it.
+
+    Which is also this property's limit, and worth being plain about: with one
+    constant per format the two *cannot* disagree, so no mutation of that
+    constant will fail this. What it guards is the next format, or the next
+    rewrite, that goes back to writing the rule twice --
+    `test_a_looser_peek_is_caught` is what shows it still can.
+    """
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_the_opener_matches_this_format(self, parser):
+        """Otherwise the regions below are not this format's syntax at all."""
+        if parser.NAME in NO_EARLY_NAME:
+            pytest.skip(NO_EARLY_NAME[parser.NAME])
+        opener = CALL_OPENERS[parser.NAME]
+        assert REAL_CALLS[parser.NAME].startswith(
+            opener
+        ), f"{parser.NAME}'s opener is not a prefix of its own real call"
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    @pytest.mark.parametrize("tail, why", PROSE_TAILS, ids=lambda x: x)
+    def test_prose_after_the_opener_names_nothing(self, parser, tail, why):
+        if parser.NAME in NO_EARLY_NAME:
+            pytest.skip(NO_EARLY_NAME[parser.NAME])
+        self._check(parser, CALL_OPENERS[parser.NAME] + tail, why, expected=None)
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_a_closer_that_is_not_this_format_s_names_nothing(self, parser):
+        """The shape Qwen got wrong: a closer that ends some *other* block."""
+        if parser.NAME in NO_EARLY_NAME:
+            pytest.skip(NO_EARLY_NAME[parser.NAME])
+        region = (
+            CALL_OPENERS[parser.NAME] + FOREIGN_CLOSERS[parser.NAME] + ", like that."
+        )
+        self._check(parser, region, "a closer from another block", None)
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_this_format_s_own_next_token_does_name_it(self, parser):
+        if parser.NAME in NO_EARLY_NAME:
+            pytest.skip(NO_EARLY_NAME[parser.NAME])
+        region = CALL_OPENERS[parser.NAME] + CALL_CONTINUATIONS[parser.NAME]
+        self._check(parser, region, "this format's own next token", "get_weather")
+
+    @staticmethod
+    def _check(parser, region, why, expected):
+        """Asked of `peek_name` directly, not of a consequence.
+
+        The obvious consequence -- "did `parse` hand the region back
+        unchanged" -- is unsound for Kimi-K3, whose `parse` rewrites the
+        content of *every* answer by stripping channel framing. A version
+        keyed on that passed while K3 announced a tool for a sentence merely
+        quoting a call opener.
+        """
+        got = parser.peek_name(region, PEEK_TOOLS)
+        assert got == expected, (
+            f"{parser.NAME} with {why} after its opener: peek said {got!r}, "
+            f"expected {expected!r} -- region {region!r}"
+        )
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_the_bare_opener_alone_names_nothing(self, parser):
+        """A follower has to have arrived, not merely be possible.
+
+        The opener on its own is the shape a quotation and a cut-off call
+        share; only what comes next tells them apart. Waiting for it costs a
+        few characters, and nothing at all when the call completes -- `parse`
+        still produces it at flush.
+
+        Stated for every format because it is the difference between the two
+        kinds of dangling name. K3 announced here, and its `parse` never
+        salvages a truncated call, so the client was left holding a name for
+        a call that produced no arguments and no event.
+        """
+        if parser.NAME in NO_EARLY_NAME:
+            pytest.skip(NO_EARLY_NAME[parser.NAME])
+        opener = CALL_OPENERS[parser.NAME]
+        assert (
+            parser.peek_name(opener, DECLARED_TOOLS) is None
+        ), f"{parser.NAME} named a tool off its opener alone: {opener!r}"
+
+    def test_a_looser_peek_is_caught(self):
+        """The check can fail -- built rather than waited for."""
+
+        class Loose(QwenXmlParser):
+            NAME = "loose"
+
+            @classmethod
+            def peek_name(cls, region, tools=None):
+                m = re.search(r"<function=([^>\n]+)>", region)
+                return m.group(1) if m else None
+
+        with pytest.raises(AssertionError, match="peek said"):
+            self._check(Loose, CALL_OPENERS["qwen"] + " and then...", "English", None)
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_a_real_call_is_still_named_early(self, parser):
+        """And the rule above is not satisfied by never announcing anything."""
+        if parser.NAME in NO_EARLY_NAME:
+            pytest.skip(NO_EARLY_NAME[parser.NAME])
+        assert (
+            parser.peek_name(REAL_CALLS[parser.NAME], DECLARED_TOOLS) == "get_weather"
+        )
+
+
 class TestAPromiseCannotBeTakenBack:
     """The cost of announcing early, stated rather than discovered.
 
@@ -922,14 +1317,15 @@ class TestAPromiseCannotBeTakenBack:
         delivered = "".join(d for k, d in events if k == "content")
         assert "Sure." in delivered, "the text before the call was dropped"
 
-    def test_peeking_a_different_name_than_the_parse_is_raised(self):
-        """`peek_name` and `parse` disagreeing about the same bytes is a bug
-        in that format, and the name is already on the wire. Loud, not
-        smoothed over -- there is nothing to smooth it into."""
+    @staticmethod
+    def _liar():
+        """A format whose `peek_name` and `parse` read the same bytes
+        differently -- a bug in that format, and one two registered parsers
+        were found to have."""
 
         class Liar(QwenXmlParser):
             @classmethod
-            def peek_name(cls, region):
+            def peek_name(cls, region, tools=None):
                 return "get_weather" if "<function=" in region else None
 
             @classmethod
@@ -939,8 +1335,144 @@ class TestAPromiseCannotBeTakenBack:
                     c.function["name"] = "something_else"
                 return content, calls
 
-        with pytest.raises(AssertionError, match="announced"):
-            self._drive(Liar, "Sure. " + REAL_CALLS["qwen"])
+        return Liar
+
+    def test_peeking_a_different_name_than_the_parse_does_not_kill_the_stream(self):
+        """This used to raise. The caller is `flush`, on a live SSE stream
+        that has already sent its 200, so the exception reached the client as
+        a cut connection with no `[DONE]` -- and on `n>1` took the other
+        choices with it."""
+        events = self._drive(self._liar(), "Sure. " + REAL_CALLS["qwen"])
+        assert [k for k, _ in events], "the stream produced nothing"
+
+    def test_the_call_that_parsed_goes_out_whole(self):
+        events = self._drive(self._liar(), "Sure. " + REAL_CALLS["qwen"])
+        args = [d for k, d in events if k == "tool_call_args"]
+        starts = {
+            d["function"]["name"]: d["index"]
+            for k, d in events
+            if k == "tool_call_start"
+        }
+        assert "something_else" in starts, f"the parsed call never went out: {starts}"
+        assert (
+            len(args) == 1 and args[0]["index"] == starts["something_else"]
+        ), "the arguments landed on an index the client bound to another name"
+
+    def test_the_announced_name_is_left_without_arguments(self):
+        """It cannot be retracted, but it can be left unusable -- which is
+        what `completes_a_tool_call` and `finish_reason` both read."""
+        events = self._drive(self._liar(), "Sure. " + REAL_CALLS["qwen"])
+        announced = [
+            d["index"]
+            for k, d in events
+            if k == "tool_call_start" and d["function"]["name"] == "get_weather"
+        ]
+        assert announced, "the announcement is the premise of this test"
+        assert not [
+            d for k, d in events if k == "tool_call_args" and d["index"] in announced
+        ], "the wrong name was given arguments to run with"
+
+
+def _big_call(payload_bytes: int) -> str:
+    """One Qwen tool call whose argument is `payload_bytes` long."""
+    return (
+        "<tool_call><function=get_weather>"
+        "<parameter=city>Paris</parameter>"
+        f"<parameter=note>{'x' * payload_bytes}</parameter>"
+        "</function></tool_call>"
+    )
+
+
+class TestTheRegionIsNotCopiedPerChunk:
+    """A buffered region costs what it is, not what it is squared.
+
+    `self.buf += text` on an *attribute* is quadratic in CPython: the
+    instance dict holds a reference, so the in-place fast path never applies
+    and every chunk copies the whole buffer. Measured on a 128 KB tool call
+    at four characters a chunk, 23 ms of event-loop CPU in `process` alone,
+    growing 17x for an 8x payload. The same loop over a *local* string is
+    linear, which is why a microbenchmark of `s += x` finds nothing and why
+    this is asserted on the parser rather than on the idiom.
+    """
+
+    SMALL_KB = 32
+    LARGE_KB = 128
+
+    @staticmethod
+    def _stream_ms(payload_bytes: int) -> float:
+        text = _big_call(payload_bytes)
+        best = None
+        for _ in range(3):
+            parser = ToolCallStreamParser(
+                tools=DECLARED_TOOLS, parser_cls=QwenXmlParser
+            )
+            start = time.perf_counter()
+            for i in range(0, len(text), 4):
+                parser.process(text[i : i + 4])
+            parser.flush()
+            elapsed = time.perf_counter() - start
+            best = elapsed if best is None else min(best, elapsed)
+        return best * 1000
+
+    @staticmethod
+    def _control_ms(payload_bytes: int) -> float:
+        """The same loop over a local string, which is linear by construction."""
+        best = None
+        for _ in range(3):
+            start = time.perf_counter()
+            buf = ""
+            for _i in range(payload_bytes // 4):
+                buf += "xxxx"
+            best = (
+                time.perf_counter() - start
+                if best is None
+                else min(best, time.perf_counter() - start)
+            )
+        return best * 1000
+
+    def test_announce_is_never_handed_the_whole_region(self):
+        """The deterministic half: materialising the buffer per chunk is the
+        cost, so nothing on that path may ask for it."""
+        seen: list[int] = []
+
+        class Watching(QwenXmlParser):
+            @classmethod
+            def peek_name(cls, region, tools=None):
+                seen.append(len(region))
+                return QwenXmlParser.peek_name(region, tools)
+
+        text = _big_call(8 * 1024)
+        parser = ToolCallStreamParser(tools=DECLARED_TOOLS, parser_cls=Watching)
+        for i in range(0, len(text), 4):
+            parser.process(text[i : i + 4])
+        parser.flush()
+        assert seen, "the peek never ran; this asserts nothing"
+        assert (
+            max(seen) <= _PEEK_WINDOW
+        ), f"a peek was handed {max(seen)} characters, window is {_PEEK_WINDOW}"
+
+    def test_the_cost_per_byte_does_not_grow(self):
+        """The timed half, with a control arm.
+
+        Two numbers being equal proves nothing on a shared machine unless
+        something in the same run is known to move -- so the control is the
+        linear loop, and its own per-byte cost has to come out flat before
+        this measurement is allowed to mean anything.
+        """
+        control = self._control_ms(self.LARGE_KB * 1024) / (
+            self._control_ms(self.SMALL_KB * 1024) * (self.LARGE_KB / self.SMALL_KB)
+        )
+        if not 0.6 < control < 1.6:
+            pytest.skip(f"machine too noisy to measure: control ratio {control:.2f}")
+
+        small = self._stream_ms(self.SMALL_KB * 1024) / self.SMALL_KB
+        large = self._stream_ms(self.LARGE_KB * 1024) / self.LARGE_KB
+        # Quadratic measured 1.75 across this pair; linear measures ~1.0.
+        assert large / small < 1.5, (
+            f"cost per KB grew {large / small:.2f}x from {self.SMALL_KB} KB to "
+            f"{self.LARGE_KB} KB ({small:.3f} -> {large:.3f} ms/KB); the region "
+            "is being copied per chunk again"
+        )
 
 
 class TestThePeekIsBounded:
@@ -958,9 +1490,9 @@ class TestThePeekIsBounded:
 
         class Counting(parser_cls):
             @classmethod
-            def peek_name(cls, region):
+            def peek_name(cls, region, tools=None):
                 calls.append(len(region))
-                return parser_cls.peek_name(region)
+                return parser_cls.peek_name(region, tools)
 
         stream = ToolCallStreamParser(parser_cls=Counting)
         stream.tools = tools
@@ -970,8 +1502,6 @@ class TestThePeekIsBounded:
         return calls
 
     def test_no_peek_ever_sees_more_than_the_window(self):
-        from atom.entrypoints.openai.tool_parser.tool_parser import _PEEK_WINDOW
-
         text = "The model writes <tool_call> to open one. " + "x" * 4000
         sizes = self._count_peeks(QwenXmlParser, text, DECLARED_TOOLS)
         assert sizes, "the peek never ran"

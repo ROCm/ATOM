@@ -14,12 +14,15 @@ from atom.entrypoints.openai.chat_encoder_adapters import (
     build_message_encoder_adapter,
 )
 from atom.entrypoints.openai.chat_encoders import (
+    _PROBE_REFUSALS,
     REASONING_TOGGLES,
     _load_encoder_from_dir,
     apply_chat_template,
     chat_template_source,
+    render_probe_prompt,
     resolve_reasoning_toggle,
 )
+from atom.entrypoints.openai.tool_parser.registry import resolve_tool_call_parser
 
 
 def test_loader_selects_dsv4_adapter_and_preserves_encoder_defaults(tmp_path):
@@ -343,3 +346,46 @@ class TestResolveReasoningToggle:
         ]
         assert not hardcoded, f"hardcoded reasoning kwarg name(s): {hardcoded}"
         assert "reasoning_toggle" in src, "it never consults the resolved name"
+
+
+class TestAModelWithNoChatTemplateStillBoots:
+    """Both startup probes run before the engine is created.
+
+    So a template that refuses one does not degrade a feature, it stops the
+    server. `transformers` raises `ValueError` for a checkpoint that ships no
+    chat template at all, `render_probe_prompt` caught only `TemplateError`
+    and `TypeError`, and a base model that used to serve `/v1/completions`
+    perfectly well died at startup instead.
+    """
+
+    class NoTemplate:
+        def apply_chat_template(self, *args, **kwargs):
+            raise ValueError(
+                "Cannot use chat template functions because "
+                "tokenizer.chat_template is not set"
+            )
+
+    def test_the_two_probes_agree_on_what_a_refusal_is(self):
+        """They ask the same template the same kind of question. Disagreeing
+        about which exceptions mean "no" is what let one of them through."""
+        source = pathlib.Path("atom/entrypoints/openai/chat_encoders.py").read_text()
+        assert (
+            "except _PROBE_REFUSALS" in source
+        ), "render_probe_prompt has its own refusal list again"
+
+    def test_valueerror_is_a_refusal(self):
+        assert ValueError in _PROBE_REFUSALS
+
+    def test_the_probe_returns_none_rather_than_raising(self):
+        assert render_probe_prompt(self.NoTemplate(), None, tools=True) is None
+
+    @pytest.mark.parametrize(
+        "probe",
+        [
+            lambda t: resolve_reasoning_toggle(t, None),
+            lambda t: resolve_tool_call_parser(None, t, None),
+        ],
+        ids=["reasoning", "tool-parser"],
+    )
+    def test_neither_startup_probe_raises(self, probe):
+        assert probe(self.NoTemplate()) is None

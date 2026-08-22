@@ -110,9 +110,24 @@ def _plan(markers: tuple[str, ...]) -> tuple[tuple[str, ...], tuple[str, ...], d
     Building it per scanner cost 8.7 us of request setup to save 4.5 us per
     chunk, which is the right trade only for streams longer than two chunks.
 
-    Returns the markers longest-first (so a marker that is a prefix of another
-    never wins a tie at the same position and truncates the longer one), their
-    distinct first characters, and every proper prefix grouped by length.
+    Returns the markers longest-first, their distinct first characters, and
+    every proper prefix grouped by length.
+
+    Longest-first settles a tie only between markers that are *both already
+    complete in the buffer*. A chunk ending exactly at the shorter of a
+    prefix pair reports the shorter one, because the longer one has not
+    arrived to be preferred -- so which of the two fires is a function of
+    where the chunk boundary landed, not of the text. `_earliest_complete`
+    says the same thing from the other side.
+
+    Nothing here withholds a complete match on the chance it could still
+    grow; that would be the stronger rule, and it would cost every marker
+    that is a prefix of another a wait of the length difference. It is not
+    needed while no format has a prefix pair whose halves disagree about
+    handing the stream over -- which is what
+    `TestAPrefixPairCannotChangeTheHandover` holds them to. The moment one
+    does, this becomes "the region opened, or did not, depending on
+    chunking", and the stronger rule has to be written.
     """
     ordered = tuple(sorted(set(markers), key=len, reverse=True))
     firsts = tuple(sorted({m[0] for m in ordered}))
@@ -205,7 +220,9 @@ class MarkerScanner:
 
         Earliest wins, and at the same position the longest does -- `<think>`
         must not be reported where `<thinking>` was meant when both are
-        registered.
+        registered. Only among those already complete in `buf`, though: see
+        `_plan` for why that is weaker than it sounds, and what holds the
+        registered formats inside the gap.
         """
         best_at, best = len(buf), None
         for m in self._markers:  # already longest-first

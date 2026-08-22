@@ -58,7 +58,7 @@ class TestWhatItBuys:
     def test_flagged_the_reasoning_is_recovered(self):
         reasoning, content = separate_reasoning(self.RAW, starts_thinking=True)
         assert reasoning == "Let me work it out."
-        assert content == "2 + 2 = 4."
+        assert content == "\n\n2 + 2 = 4."
 
     def test_streaming_and_non_streaming_agree_once_flagged(self):
         """The flag is one value read by both paths, so they cannot diverge."""
@@ -72,5 +72,9 @@ class TestWhatItBuys:
         streamed_r = "".join(s for f, s in segments if f == "reasoning_content")
         streamed_c = "".join(s for f, s in segments if f == "content")
 
-        assert (reasoning or "") == streamed_r.strip()
-        assert content == streamed_c.strip()
+        # Compared byte-for-byte. This used to `.strip()` the streamed side
+        # to make the two agree, which is what a divergence looks like when a
+        # test is written around it: `content` was `"2 + 2 = 4."` here and
+        # `"\n\n2 + 2 = 4."` on the wire.
+        assert (reasoning or "") == streamed_r
+        assert content == streamed_c

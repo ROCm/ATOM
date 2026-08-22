@@ -140,11 +140,17 @@ arrive late, and `atom:stream_longest_silence_seconds` now reports it while it
 is happening.
 
 "Opens a region" is asked of the format, not assumed of every marker it
-declares. Kimi-K3 declares five and only two of them mean a tool call; the
-other three are channel framing that wraps every answer it gives, including
+declares. Kimi-K3 declares thirteen and only two of them mean a tool call; the
+other eleven are channel framing that wraps every answer it gives, including
 `<|open|>response<|sep|>` at the very start. Treating those as a handover meant
 a K3 response streamed *nothing* — measured, 324 of 324 characters in one frame
 at EOS — which was the common path for that model rather than an edge case.
+
+A start marker is not a promise, and that applies to the handover markers too.
+An answer *quoting* one opens a region that then parses to no call, and every
+format releases that region verbatim rather than deleting it. K3 was the one
+without such a branch: it cut the answer at a quoted call opener and lost 62
+characters with no event and `finish_reason` still `stop`.
 
 **The tool's name does not wait for its arguments.** A region is buffered
 until it closes, so on a 20 KB file write the client learned *which* tool was
@@ -159,15 +165,49 @@ rather than English -- prose can name a real tool, so the first test alone let
 `get_weather`. SGLang's cursor parsers announce with neither check and will
 emit a call named after whatever follows the tag.
 
-The same pair gates the *unclosed-region* branch of `parse`, which exists for
-a call cut off at `max_tokens` and could not tell that from prose: it produced
-a complete zero-argument call, deleted the rest of the sentence and reported
-`finish_reason: tool_calls`, so an agentic client ran a tool nobody asked for.
+The same pair gates the *unclosed-region* branch of `parse` in all five XML-ish
+formats, which exists for a call cut off at `max_tokens` and could not tell
+that from prose: it produced a complete zero-argument call, deleted the rest of
+the sentence and reported `finish_reason: tool_calls`, so an agentic client ran
+a tool nobody asked for. K3 applies only the second test — it carries argument
+types on the wire, so it is never handed `tools` and has no declared names to
+check a name against.
+
+Where the model *wrote* the name, that name wins. DSML also infers a dropped
+tool name from the parameter signature, for a documented malform that omits the
+`<invoke>` wrapper entirely; reaching that inference for a merely *truncated*
+call scored a different declared tool than the one in the opener — which is
+also the opener `peek_name` reads, so the announcement and the parse then
+disagreed about the same bytes.
 
 The peek reads a bounded prefix and stops once that prefix has gone by without
 a name. Running the format's regex over the whole region on every chunk is
 quadratic in the response -- 3.0 → 9.8 → 36 → 137 ms across 2k/4k/8k/16k
 tokens, which is the shape `marker_scanner` exists to retire, one layer up.
+
+Peek and parse read *one* rule. Each format writes down the tokens that may
+follow the name inside a call -- another parameter, or the close of the very
+block the name opened -- and both callers test against that tuple. They used
+to encode it twice, a follower set in the peek regex and a truncation test in
+`parse`, and four of the five disagreed: Qwen's peek accepted `</tool_call>`,
+which closes the *outer* wrapper and leaves the `<function=` block open, so
+`parse` read the same bytes as prose and the name went out for a call that
+never came. The peek also takes the request's `tools` now, because MiniMax
+names a parameter by its own tag and telling `<city>` from `<br>` needs the
+schema.
+
+What remains is the honest case: a call the model really was making, cut off
+by `max_tokens`. The name is correct information, and `finish_reason` keys on
+the arguments so nothing downstream counts it as a call.
+
+Should a format's peek and its parse disagree anyway, the mismatch is logged
+and recovered from, not raised. The caller is `flush`, on a stream whose 200
+is already sent, so an exception there reaches the client as a connection cut
+mid-frame with no `[DONE]` — and on the `n>1` path takes the other choices
+with it. The announced name cannot be retracted, but it can be left with no
+arguments, which is the same shape every unfulfilled announcement takes and
+which nothing downstream counts as a call; the parsed call goes out whole at
+the next index.
 
 Kimi-K2 does not announce at all. Its call index and id travel on the wire
 (`functions.NAME:INDEX`) and an announcement has to carry both before the
@@ -204,12 +244,43 @@ streaming path removes too). Whitespace is not that — every format used to
 only. The property suite generates this check from the parser registry, so a
 format added later is held to it without a new case being written.
 
+The *reasoning* split is held to the same rule one stage earlier, and was not.
+Two ways: `</think>` was matched only at position 0, so a model that answers,
+opens a `<think>` block and answers again had it extracted when streamed and
+handed over as literal tags with the chain of thought inside `content` when
+not — and both halves were then `.strip()`ed, which is the trailing-newline
+bug above, in the stage before it. A model writes `</think>\n\nThe answer.`;
+`stream=true` delivers `"\n\nThe answer."` at every real chunk size and
+`stream=false` delivered `"The answer."`. Measured over 12544 (dialect, shape,
+chunking) comparisons, the two agreed byte-for-byte on 50% of them; they now
+agree on all of them, and the property that says so is byte-exact rather than
+word-level.
+
+The streaming filter also stopped eating the newline after its end marker. It
+only ever saw what happened to be buffered when the marker arrived, so the
+same answer kept those bytes at one chunk size and lost them at another —
+there was no chunk-invariant behaviour on that whitespace for the other path
+to match even if it had wanted to.
+
+**`tool_choice: "none"` suppresses the call, not the answer.** It used to be
+enforced where the events are *sent* — twelve places across two endpoints —
+while the parser went on consuming the region, so the model's own words were
+deleted and nothing took their place: 89 characters of a 95-character answer,
+no event, `finish_reason: stop`. The rule now lives at the one place the
+parser is chosen, which is also the right reading — the request said this
+cannot be a call, so it is prose — and it costs less, since nothing is parsed
+in order to be discarded. `/v1/messages` reads the field too, in Anthropic's
+`{"type": "none"}` spelling; it previously parsed it off the request and used
+it nowhere, so a client that forbade tool calls got `tool_use` blocks and
+`stop_reason: tool_use` anyway.
+
 **`thinking` is answered in the prompt, not in the response.** On
 `/v1/messages`, `thinking: {"type": "disabled"}` sets the chat template's own
 reasoning switch, so the model emits no chain of thought — there is then none
 to separate, none to discard, and none for the tool parser to misread.
-Everything downstream is unconditional: the reasoning channel is always
-separated and always reported, exactly as on `/v1/chat/completions`.
+*Separation* stays unconditional, exactly as on `/v1/chat/completions`: the
+tool parser is a second reader of the same text, so a chain of thought left in
+it is one the tool parser will try to parse.
 
 That ordering is the whole of it. Handling an unwanted chain of thought *after*
 generating it fails three different ways — discarding it returns an empty
@@ -225,12 +296,18 @@ Which kwarg carries the switch is resolved at startup by rendering the template
 twice and comparing, because a template silently ignores a kwarg it does not
 read. On this box: Qwen3/Qwen3.5 `enable_thinking`, Kimi-K3 `thinking`,
 MiniMax-M3 `thinking_mode="disabled"`, DeepSeek-V4 `thinking_mode="chat"`.
-A model whose template has no switch is named in the startup log; its reasoning
-cannot be turned off, and is separated and reported rather than dropped. Two
-details that bite: `{"type": "disabled"}` is a non-empty object, so testing the
-field for truthiness read the standard off-switch as on; and an *absent*
+A model whose template has no switch is named in the startup log. Its reasoning
+cannot be prevented, so `thinking: {"type": "disabled"}` is answered the only
+way left: the text is still separated, and the `thinking` blocks are withheld.
+That is the one downstream suppression there is, and it is reached only when
+the prompt could not carry the answer — without it an explicit opt-out was
+honoured at neither layer. A response that was *nothing but* reasoning then
+ends on an empty text block, which is the honest reply to "do not think".
+
+Two details that bite: `{"type": "disabled"}` is a non-empty object, so testing
+the field for truthiness read the standard off-switch as on; and an *absent*
 `thinking` leaves the model's own default alone rather than switching reasoning
-off, so an existing caller's answers do not change.
+off, at both layers or neither, so an existing caller's answers do not change.
 
 **A stalled response is visible while it is stalled.** Every SSE frame leaves
 through `_client_stream`, which times the gap before each one and registers it,

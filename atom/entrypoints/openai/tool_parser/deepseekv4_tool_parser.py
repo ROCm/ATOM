@@ -108,8 +108,45 @@ def _infer_name(arg_names: set, param_types: dict[str, dict[str, Any]]) -> str |
     return best
 
 
-# Name plus the token that must follow; see QwenXmlParser for why.
-_PEEK_NAME_RE = re.compile(r'invoke name="([^"]+)">\s*<[^>]*(?:parameter|/)')
+# Name plus whatever follows it; `_continues_a_call` judges that part, so the
+# rule lives in one place. See QwenXmlParser for why a follower is required.
+_PEEK_NAME_RE = re.compile(r'invoke\s+name="([^"]+)"\s*>(.*)', re.DOTALL)
+
+# The same opener with no closing tag: a call the model was cut off inside.
+_TRUNCATED_INVOKE_RE = re.compile(
+    r"<" + _OPT + r'invoke\s+name="([^"]*)"\s*>(.*)$', re.DOTALL
+)
+# What may follow that opener in a real call: another parameter, or the
+# close of the invoke the name opened. Either spelling of the marker, which
+# the model drops about as often as it writes. One tuple, read by both
+# `_is_truncated_call` and `peek_name` -- they used to encode this
+# separately and the peek's version accepted any tag with a slash in it,
+# `<br/>` included.
+_CALL_CONTINUES = (
+    "<" + _DSML + "parameter",
+    "<parameter",
+    "</" + _DSML + "invoke>",
+    "</invoke>",
+)
+
+
+def _continues_a_call(rest: str) -> bool:
+    """Is `rest` the start of this format's own next token?"""
+    return any(tok.startswith(rest[: len(tok)]) for tok in _CALL_CONTINUES)
+
+
+def _is_truncated_call(name: str, body: str, param_types: dict) -> bool:
+    """Is this unclosed `<invoke name=...>` a cut-off call, or prose?
+
+    See :func:`QwenXmlParser._is_truncated_call`, which this is the DSML
+    spelling of; the sweep that added it there and to GLM missed this format,
+    and the same sentence -- "you emit `<invoke name="get_weather">` and
+    inside it a `<parameter>` line" -- was still being dispatched as a call.
+    """
+    if name not in param_types:
+        return False
+    rest = body.lstrip()
+    return not rest or _continues_a_call(rest)
 
 
 class DsmlParser(BufferedMarkerParser):
@@ -123,11 +160,20 @@ class DsmlParser(BufferedMarkerParser):
     )
 
     @classmethod
-    def peek_name(cls, region: str) -> str | None:
+    def peek_name(cls, region: str, tools: list | None = None) -> str | None:
         """`<｜DSML｜invoke name="NAME">`, and the bare `<invoke ...>` the
-        model often emits instead -- both carry the name in the opener."""
+        model often emits instead -- both carry the name in the opener.
+
+        The self-closing `<invoke name="X"/>` shape has no `>` after the
+        quote and so is not matched: it is a complete zero-argument call that
+        `parse` reads on its own, and there is nothing to announce early
+        about a region that is already finished.
+        """
         m = _PEEK_NAME_RE.search(region)
-        return m.group(1) if m else None
+        if m is None:
+            return None
+        rest = m.group(2).lstrip()
+        return m.group(1) if rest and _continues_a_call(rest) else None
 
     # detect() is inherited: any start marker present means DSML.
 
@@ -169,13 +215,28 @@ class DsmlParser(BufferedMarkerParser):
                 args = _unwrap_wrapper_args(args, set(types))
                 calls.append((name, args))
         else:
-            # malformed: no complete invoke wrapper -> collect params, infer tool name
+            # No complete invoke wrapper. Two shapes reach here and they want
+            # opposite things: a call cut off mid-way, whose name is written
+            # in the opener, and the documented V4-Flash malform that drops
+            # the wrapper entirely, whose name has to be inferred from the
+            # parameters. Inferring in both cases scored `get_time` for a
+            # truncated `<invoke name="get_weather">` because it happened to
+            # share more parameters -- a different tool than the one the model
+            # named, and than the one the streaming path had already
+            # announced off the same opener.
+            opener = _TRUNCATED_INVOKE_RE.search(region)
+            body = opener.group(2) if opener else region
             raw = {
                 pm.group(1): (pm.group(3), pm.group(2))
-                for pm in _PARAM_RE.finditer(region)
+                for pm in _PARAM_RE.finditer(body)
             }
-            if raw:
+            if opener is not None:
+                name = opener.group(1).strip()
+                keep = _is_truncated_call(name, body, param_types)
+            else:
                 name = _infer_name(set(raw), param_types) or "unknown"
+                keep = bool(raw)
+            if keep:
                 types = param_types.get(name, {})
                 args = {k: _coerce(v, s, types.get(k)) for k, (v, s) in raw.items()}
                 args = _unwrap_wrapper_args(args, set(types))

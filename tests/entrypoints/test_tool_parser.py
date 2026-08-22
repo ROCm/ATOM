@@ -12,9 +12,11 @@ from atom.entrypoints.openai.tool_parser import (
     ToolCallStreamParser,
     parse_tool_calls,
 )
+from atom.entrypoints.openai.tool_parser.deepseekv4_tool_parser import DsmlParser
 from atom.entrypoints.openai.tool_parser.glm_tool_parser import GlmParser
 from atom.entrypoints.openai.tool_parser.kimi_k3_tool_parser import KimiK3Parser
 from atom.entrypoints.openai.tool_parser.kimi_tool_parser import KimiParser
+from atom.entrypoints.openai.tool_parser.minimax_tool_parser import MiniMaxParser
 from atom.entrypoints.openai.tool_parser.qwen3_tool_parser import QwenXmlParser
 
 # ============================================================================
@@ -408,8 +410,37 @@ class TestProseIsNotATruncatedCall:
                 GlmParser,
                 "To call it write <tool_call>get_weather and then the keys follow.",
             ),
+            # `</tool_call>` closes the *outer* wrapper, so the `<function=`
+            # block is still open and this is prose, not a zero-argument
+            # call. Qwen's peek used to accept it as a follower while its
+            # parse did not; unifying them onto one constant would have made
+            # both accept it, which is worse -- a phantom dispatch rather
+            # than a dangling name.
+            (
+                QwenXmlParser,
+                (
+                    "A zero-arg call is written <tool_call><function=get_weather>"
+                    "</tool_call>, like that."
+                ),
+            ),
+            (
+                DsmlParser,
+                (
+                    'You emit <invoke name="get_weather"> and inside it a '
+                    '<\uff5cDSML\uff5cparameter name="city">Paris'
+                    "</\uff5cDSML\uff5cparameter> line."
+                ),
+            ),
+            (
+                MiniMaxParser,
+                (
+                    "To call it you emit ]<]minimax[>[<invoke "
+                    'name="get_weather"> and then a '
+                    "]<]minimax[>[<city>Paris</city> line."
+                ),
+            ),
         ],
-        ids=["qwen", "glm"],
+        ids=["qwen", "glm", "qwen-outer-closer", "dsml", "minimax"],
     )
     def test_prose_naming_a_declared_tool_is_not_a_call(self, parser, text):
         content, calls = parser.parse(text, self.TOOLS)
@@ -428,8 +459,36 @@ class TestProseIsNotATruncatedCall:
                 GlmParser,
                 "Sure. <tool_call>get_weather<arg_key>city</arg_key><arg_value>Pa",
             ),
+            # No complete `<arg_key>` yet, so the name has to be cut at the
+            # `<` rather than run to the end of the region.
+            (GlmParser, "Sure. <tool_call>get_weather<arg_k"),
+            (GlmParser, "Sure. <tool_call>\nget_weather\n"),
+            (
+                DsmlParser,
+                (
+                    'Sure. <invoke name="get_weather">'
+                    '<\uff5cDSML\uff5cparameter name="city">Par'
+                ),
+            ),
+            (DsmlParser, 'Sure. <invoke name="get_weather">'),
+            (
+                MiniMaxParser,
+                (
+                    'Sure. ]<]minimax[>[<invoke name="get_weather">'
+                    "]<]minimax[>[<city>Par"
+                ),
+            ),
         ],
-        ids=["qwen-mid-param", "qwen-after-name", "glm-mid-arg"],
+        ids=[
+            "qwen-mid-param",
+            "qwen-after-name",
+            "glm-mid-arg",
+            "glm-mid-arg-key",
+            "glm-newline-before-name",
+            "dsml-mid-param",
+            "dsml-after-name",
+            "minimax-mid-param",
+        ],
     )
     def test_a_genuinely_truncated_call_still_parses(self, parser, text):
         _, calls = parser.parse(text, self.TOOLS)
@@ -477,13 +536,174 @@ class TestKimiKeepsWhatItDidNotParse:
         delivered, _ = self._stream(self.QUOTES_BOTH, 4)
         assert delivered == parse_tool_calls(self.QUOTES_BOTH, parser_cls=KimiParser)[0]
 
-    def test_text_after_a_real_section_still_arrives(self):
-        """`state = 2` discarded the rest of the stream unconditionally."""
-        text = (
-            "Sure. <|tool_calls_section_begin|><|tool_call_begin|>"
-            'functions.get_weather:0<|tool_call_argument_begin|>{"city":"Paris"}'
-            "<|tool_call_end|><|tool_calls_section_end|> Done."
-        )
-        delivered, calls = self._stream(text, 4)
+    REAL_SECTION = (
+        "<|tool_calls_section_begin|><|tool_call_begin|>"
+        'functions.get_weather:0<|tool_call_argument_begin|>{"city":"Paris"}'
+        "<|tool_call_end|><|tool_calls_section_end|>"
+    )
+
+    @pytest.mark.parametrize("size", [1, 4, 17, 999])
+    def test_text_after_a_real_section_still_arrives(self, size):
+        """`state = 2` discarded the rest of the stream unconditionally.
+
+        Parametrised over the chunk size because replacing that state fixed
+        only the split case: state 0 took the remainder after the marker and
+        returned without looking for the section end, so a section arriving
+        whole in one chunk still lost everything after it. Under load that is
+        the common case, not the rare one -- `merge_chunk` coalesces the
+        backlog into exactly these large chunks.
+        """
+        text = "Sure. " + self.REAL_SECTION + " Done."
+        delivered, calls = self._stream(text, size)
         assert "Sure." in delivered and "Done." in delivered
         assert "tool_call_start" in calls
+
+    @pytest.mark.parametrize("size", [1, 4, 999])
+    def test_a_quoted_section_after_a_real_call_is_still_not_a_call(self, size):
+        """The not-a-promise branch is per section, not per stream.
+
+        It was gated on `emitted_calls`, which is cumulative, so from the
+        first real call onwards every later section read as fulfilled and its
+        body was deleted -- the branch became dead code exactly when the
+        format started being used.
+        """
+        prose = (
+            " The tokens are <|tool_calls_section_begin|> and "
+            "<|tool_calls_section_end|>, in case you wondered."
+        )
+        delivered, calls = self._stream(self.REAL_SECTION + prose, size)
+        assert delivered == prose, "the second section was eaten"
+        assert calls.count("tool_call_end") == 1
+
+
+class TestTheNameTheModelWroteWins:
+    """DSML infers a dropped tool name from the parameters. Only when it has to.
+
+    The inference exists for the documented V4-Flash malform that drops the
+    `<invoke>` wrapper entirely. It was also reached by a call the model was
+    cut off inside -- whose name is written right there in the opener -- and
+    scored a *different* declared tool for it, because that one happened to
+    share more parameters. Two consequences: the client is handed the wrong
+    tool, and `peek_name` reads the same opener, so the streaming path had
+    already announced the name the parse then contradicted.
+    """
+
+    TOOLS: ClassVar[list] = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_time",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string"},
+                        "tz": {"type": "string"},
+                    },
+                },
+            },
+        },
+    ]
+    D = "｜DSML｜"
+
+    def test_a_truncated_call_keeps_the_name_in_its_opener(self):
+        text = (
+            f'<invoke name="get_weather">'
+            f'<{self.D}parameter name="city">Paris</{self.D}parameter>'
+            f'<{self.D}parameter name="tz">UTC</{self.D}parameter>'
+        )
+        _, calls = DsmlParser.parse(text, self.TOOLS)
+        assert [c.function["name"] for c in calls] == ["get_weather"]
+
+    def test_the_peek_and_the_parse_agree_on_it(self):
+        text = (
+            f'<invoke name="get_weather">'
+            f'<{self.D}parameter name="city">Paris</{self.D}parameter>'
+            f'<{self.D}parameter name="tz">UTC</{self.D}parameter>'
+        )
+        _, calls = DsmlParser.parse(text, self.TOOLS)
+        assert DsmlParser.peek_name(text) == calls[0].function["name"]
+
+    def test_the_wrapper_less_malform_still_infers(self):
+        """The shape the inference was written for, unchanged."""
+        text = (
+            f"<{self.D}tool_calls>"
+            f'<{self.D}parameter name="tz">UTC</{self.D}parameter>'
+            f'<{self.D}parameter name="city">Paris</{self.D}parameter>'
+        )
+        _, calls = DsmlParser.parse(text, self.TOOLS)
+        assert [c.function["name"] for c in calls] == ["get_time"]
+
+
+class TestKimiK3KeepsAQuotedOpener:
+    """A start marker is not a promise -- the one format that had no such branch.
+
+    `parse` cuts the answer at a call opener, and the regex it cuts on accepts
+    openers the call regex rejects. An answer quoting one therefore lost
+    everything from that point: 62 characters, no event, `finish_reason`
+    still `stop`.
+    """
+
+    QUOTED = (
+        "<|open|>response<|sep|>To call it the model writes "
+        '<|open|>call tool="get_weather" index="N"<|sep|> and then the '
+        "arguments. That is the whole trick.<|close|>response<|sep|>"
+    )
+    TRUNCATED = (
+        '<|open|>tools<|sep|><|open|>call tool="get_weather" index="0"<|sep|>'
+        '<|open|>argument key="city" type="string"<|sep|>Par'
+    )
+
+    @staticmethod
+    def _stream(text, size):
+        parser = ToolCallStreamParser(parser_cls=KimiK3Parser)
+        events = []
+        for i in range(0, len(text), size):
+            events += parser.process(text[i : i + size])
+        events += parser.flush()
+        return "".join(d for k, d in events if k == "content"), [
+            k for k, _ in events if k.startswith("tool_call")
+        ]
+
+    @pytest.mark.parametrize("size", [1, 5, 999])
+    def test_the_answer_survives_the_quotation(self, size):
+        delivered, _ = self._stream(self.QUOTED, size)
+        assert "That is the whole trick." in delivered
+
+    def test_both_paths_deliver_the_same_text(self):
+        delivered, _ = self._stream(self.QUOTED, 5)
+        assert delivered == parse_tool_calls(self.QUOTED, parser_cls=KimiK3Parser)[0]
+
+    def test_a_real_truncated_call_is_still_cut_there(self):
+        """The branch this shares with the quotation, and must keep."""
+        content, _ = KimiK3Parser.parse(self.TRUNCATED, None)
+        assert "Par" not in content and "argument" not in content
+
+    def test_no_dangling_name_is_left_behind(self):
+        """`flush` never cleared the announcement, so the next call's parse
+        was compared against a name from a region that produced none.
+
+        Driven with TRUNCATED and not QUOTED: this format never salvages a
+        cut-off call into a ToolCall, so that is the one shape where the peek
+        legitimately fires and the parse yields nothing -- which is exactly
+        the state `flush` has to clean up. Against QUOTED the peek no longer
+        fires at all, so the assertion held for the wrong reason.
+        """
+        parser = KimiK3Parser(
+            tools=[{"type": "function", "function": {"name": "get_weather"}}]
+        )
+        events = parser.process(self.TRUNCATED)
+        assert any(
+            k == "tool_call_start" for k, _ in events
+        ), "the announcement is the premise of this test"
+        parser.flush()
+        assert parser._announced is None

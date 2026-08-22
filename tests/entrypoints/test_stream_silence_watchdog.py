@@ -22,10 +22,12 @@ entry, and a timestamp needs no background task to own.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 
 import pytest
 
+from atom.entrypoints.openai import api_server
 from atom.entrypoints.openai import streaming_dispatch as sd
 from atom.entrypoints.openai.streaming_dispatch import (
     FrameWait,
@@ -252,8 +254,6 @@ class TestTheEndpointUsesIt:
         import pathlib
         import re
 
-        from atom.entrypoints.openai import api_server
-
         src = pathlib.Path(api_server.__file__).read_text()
         total = src.count("StreamingResponse(")
         wrapped = len(re.findall(r"StreamingResponse\(\s*_client_stream\(", src))
@@ -269,8 +269,6 @@ class TestTheEndpointUsesIt:
         the source check passes on a wrapper that only logs."""
         import inspect
 
-        from atom.entrypoints.openai import api_server
-
         src = inspect.getsource(api_server._client_stream)
         assert "with FrameWait(request_id" in src
         body = src.split("with FrameWait(request_id", 1)[1]
@@ -282,8 +280,6 @@ class TestTheEndpointUsesIt:
         """Its name was the bug: it wrapped what wanted logging, not what
         wanted watching, so the Anthropic endpoint went without either."""
         import pathlib
-
-        from atom.entrypoints.openai import api_server
 
         src = pathlib.Path(api_server.__file__).read_text()
         assert "_logged_stream(" not in src
@@ -367,8 +363,6 @@ class TestQueueingIsNotSilence:
         import inspect
         import textwrap
 
-        from atom.entrypoints.openai import api_server
-
         tree = ast.parse(textwrap.dedent(inspect.getsource(api_server._client_stream)))
         waits = [
             n
@@ -381,3 +375,95 @@ class TestQueueingIsNotSilence:
         assert not isinstance(
             armed[0].value, ast.Constant
         ), "`armed` is a constant, so the first wait is timed like the rest"
+
+
+class TestRequestLoggingCannotBreakTheStream:
+    """`--request-log` is a diagnostic. It was also a way to lose the answer.
+
+    `serving_chat` coalesces finish + usage + `[DONE]` into one send -- a
+    deliberate saving of two socket writes per request at a wave boundary --
+    and the logger ran `json.loads` over that whole send. `Extra data:` came
+    out of the generator, so with the flag on, the last frame of every OpenAI
+    stream never reached the client and no `[DONE]` was written. Off by
+    default, which is why nothing noticed.
+
+    The Anthropic half is quieter: its frames put `event: NAME` on the line
+    above the data, so a `startswith("data: ")` test matched none of them and
+    that endpoint logged nothing at all.
+    """
+
+    COALESCED = (
+        'data: {"id":"x","choices":[{"finish_reason":"stop"}]}\n\n'
+        'data: {"usage":{"total_tokens":7}}\n\n'
+        "data: [DONE]\n\n"
+    )
+    ANTHROPIC = 'event: content_block_delta\ndata: {"type":"content_block_delta"}\n\n'
+
+    @staticmethod
+    def _logged(chunk):
+        """What `_log_sse` writes, without touching the module's real logger."""
+        written = []
+
+        class Recorder:
+            @staticmethod
+            def info(line):
+                written.append(json.loads(line))
+
+        original = api_server._request_logger
+        api_server._request_logger = Recorder
+        try:
+            api_server._log_sse(chunk, "req-1")
+        finally:
+            api_server._request_logger = original
+        return written
+
+    def test_a_coalesced_send_does_not_raise(self):
+        """The whole bug: this used to come out of the generator."""
+        self._logged(self.COALESCED)
+
+    def test_every_frame_in_it_is_logged(self):
+        kinds = [e["type"] for e in self._logged(self.COALESCED)]
+        assert kinds == ["stream_chunk", "stream_chunk", "stream_done"], kinds
+
+    def test_an_anthropic_frame_is_logged(self):
+        events = self._logged(self.ANTHROPIC)
+        assert [e["type"] for e in events] == ["stream_chunk"]
+        assert events[0]["data"]["type"] == "content_block_delta"
+
+    def test_an_unparsable_payload_is_kept_rather_than_raised(self):
+        events = self._logged("data: {not json\n\n")
+        assert [e["type"] for e in events] == ["stream_chunk_unparsed"]
+        assert events[0]["data"] == "{not json"
+
+    def test_logging_off_writes_nothing_and_still_does_not_raise(self):
+        original = api_server._request_logger
+        api_server._request_logger = None
+        try:
+            api_server._log_sse(self.COALESCED, "req-1")
+        finally:
+            api_server._request_logger = original
+
+    def test_the_client_still_receives_every_frame(self):
+        """Logging is a side effect; `_client_stream` must yield regardless."""
+        written = []
+
+        class Recorder:
+            @staticmethod
+            def info(line):
+                written.append(line)
+
+        async def source():
+            yield "data: {}\n\n"
+            yield self.COALESCED
+
+        async def collect():
+            return [c async for c in api_server._client_stream(source(), "req-1")]
+
+        original = api_server._request_logger
+        api_server._request_logger = Recorder
+        try:
+            out = asyncio.run(collect())
+        finally:
+            api_server._request_logger = original
+        assert "".join(out).endswith("data: [DONE]\n\n")
+        assert len(written) == 4

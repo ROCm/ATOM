@@ -8,7 +8,11 @@ import asyncio
 import json
 import pathlib
 
-from atom.entrypoints.openai import serving_chat
+import pytest
+
+from atom.entrypoints.atomesh import atom_standalone_service
+from atom.entrypoints.openai import api_server, serving_chat
+from atom.entrypoints.openai.serving_anthropic import completes_a_tool_call
 from atom.entrypoints.openai.serving_chat import (
     build_chat_response,
     build_chat_response_multi,
@@ -18,7 +22,10 @@ from atom.entrypoints.openai.serving_chat import (
     stream_chat_response_fanout,
 )
 from atom.entrypoints.openai.streaming_dispatch import StreamOutputCollector
+from atom.entrypoints.openai.tool_parser import ToolCallStreamParser, parse_tool_calls
 from atom.entrypoints.openai.tool_parser.kimi_tool_parser import KimiParser
+from atom.entrypoints.openai.tool_parser.qwen3_tool_parser import QwenXmlParser
+from atom.entrypoints.openai.tool_parser.registry import parser_for_tool_choice
 
 # ============================================================================
 # normalize_chat_tools Tests
@@ -409,85 +416,120 @@ class TestFanoutCleanupSplit:
         assert request_calls == ["req-3"]
 
 
-def _forbids_none(node) -> bool:
-    """Is this the expression `tool_choice != "none"`?"""
-    return (
-        isinstance(node, ast.Compare)
-        and isinstance(node.left, ast.Name)
-        and node.left.id == "tool_choice"
-        and len(node.ops) == 1
-        and isinstance(node.ops[0], ast.NotEq)
-        and isinstance(node.comparators[0], ast.Constant)
-        and node.comparators[0].value == "none"
-    )
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+            },
+        },
+    }
+]
+A_CALL = (
+    "Sure. <tool_call><function=get_weather><parameter=city>Paris</parameter>"
+    "</function></tool_call>"
+)
 
 
-class TestToolChoiceIsHonouredEverywhereItIsEmitted:
-    """`tool_choice="none"` forbids tool calls on every path that can emit one.
+class TestForbiddingToolCallsDoesNotDeleteTheAnswer:
+    """`tool_choice="none"` suppresses the *call*, not the model's words.
 
-    The single-choice stream gated on it and the fan-out did not, so the same
-    request with `n=2, stream=true` returned `tool_calls` deltas and
-    `finish_reason="tool_calls"` that `n=1` suppressed. Checked by walking the
-    source rather than by listing the four call sites, because the gap was a
-    site nobody listed.
+    It used to be enforced at the twelve places an event is *sent*, across two
+    entrypoints, while the parser went on consuming the region -- so the text
+    was eaten and nothing took its place. Measured on the answer below: 89 of
+    95 characters gone, no event, `finish_reason: stop`.
+
+    The rule now lives at the one place the parser is chosen, which is also
+    the reading that makes sense: the request said this cannot be a call, so
+    it is prose. Stated behaviourally and not as a scan of the source -- the
+    scan this replaces was mutation-checked and accepted `or tool_choice !=
+    "none"`, and it hardcoded one module while the same gap sat in three
+    others.
     """
 
-    SOURCE = pathlib.Path(serving_chat.__file__)
-
-    def test_no_tool_event_is_emitted_without_checking_tool_choice(self):
-        tree = ast.parse(self.SOURCE.read_text())
-        unguarded = []
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Compare):
-                continue
-            left = node.left
-            if not (isinstance(left, ast.Name) and left.id == "event_type"):
-                continue
-            const = node.comparators[0]
-            if not (
-                isinstance(const, ast.Constant)
-                and isinstance(const.value, str)
-                and const.value.startswith("tool_call_")
-                and const.value != "tool_call_end"
-            ):
-                continue
-            # The comparison is the left half of `event_type == X and <gate>`;
-            # walk up is not available, so re-find the enclosing BoolOp. The
-            # gate must be `tool_choice != "none"` specifically -- an earlier
-            # version asked only whether the name appeared anywhere, and
-            # passed when every gate was inverted to `== "none"`.
-            guarded = any(
-                isinstance(b, ast.BoolOp)
-                and node in b.values
-                and any(_forbids_none(v) for v in b.values)
-                for b in ast.walk(tree)
-                if isinstance(b, ast.BoolOp)
-            )
-            if not guarded:
-                unguarded.append(f"line {node.lineno}: {const.value}")
-        assert not unguarded, "tool events emitted regardless of tool_choice:\n  " + (
-            "\n  ".join(unguarded)
+    @staticmethod
+    def _stream(tool_choice, chunk=7):
+        parser = ToolCallStreamParser(
+            tools=TOOLS,
+            parser_cls=parser_for_tool_choice(QwenXmlParser, tool_choice),
         )
+        events = []
+        for i in range(0, len(A_CALL), chunk):
+            events += parser.process(A_CALL[i : i + chunk])
+        events += parser.flush()
+        return events
 
-    def test_the_scan_matched_something(self):
-        """A matcher that finds no nodes passes forever.
+    @pytest.mark.parametrize(
+        "tool_choice",
+        ["none", {"type": "none"}],
+        ids=["openai-string", "anthropic-object"],
+    )
+    def test_the_whole_answer_is_delivered(self, tool_choice):
+        """Both protocols' spellings, because both endpoints ask."""
+        events = self._stream(tool_choice)
+        assert "".join(d for k, d in events if k == "content") == A_CALL
 
-        `event_type` is one rename away from `etype`, which api_server already
-        uses for the same variable -- and this scan would then be vacuously
-        green.
-        """
-        tree = ast.parse(self.SOURCE.read_text())
-        matched = [
-            n
-            for n in ast.walk(tree)
-            if isinstance(n, ast.Compare)
-            and isinstance(n.left, ast.Name)
-            and n.left.id == "event_type"
+    @pytest.mark.parametrize(
+        "tool_choice",
+        ["none", {"type": "none"}],
+        ids=["openai-string", "anthropic-object"],
+    )
+    def test_and_no_call_is_reported(self, tool_choice):
+        events = self._stream(tool_choice)
+        assert [k for k, _ in events if k.startswith("tool_call")] == []
+        assert not completes_a_tool_call(events)
+
+    @pytest.mark.parametrize(
+        "tool_choice", [None, "auto", "required", {"type": "auto"}]
+    )
+    def test_anything_else_still_calls_the_tool(self, tool_choice):
+        """The prohibition is `none` and nothing else -- reading `required`
+        or a named tool as one would silently stop every such request from
+        ever producing a call."""
+        events = self._stream(tool_choice)
+        assert completes_a_tool_call(events)
+
+    def test_the_two_paths_agree(self):
+        streamed = "".join(d for k, d in self._stream("none") if k == "content")
+        non_streaming, calls = parse_tool_calls(
+            A_CALL, TOOLS, parser_cls=parser_for_tool_choice(QwenXmlParser, "none")
+        )
+        assert calls == [] and non_streaming == streamed
+
+    def test_every_construction_site_goes_through_the_helper(self):
+        """The gap this had was a site nobody listed, so count them rather
+        than list them: a parser built straight from the resolved class again
+        is one endpoint that stopped honouring the field."""
+        roots = [
+            pathlib.Path(serving_chat.__file__),
+            pathlib.Path(api_server.__file__),
+            pathlib.Path(atom_standalone_service.__file__),
         ]
-        assert len(matched) >= 4, f"only {len(matched)} event_type comparisons found"
+        built = unguarded = 0
+        for path in roots:
+            for node in ast.walk(ast.parse(path.read_text())):
+                if not isinstance(node, ast.Call):
+                    continue
+                fn = node.func
+                name = getattr(fn, "id", None) or getattr(fn, "attr", None)
+                if name not in ("ToolCallStreamParser", "parse_tool_calls"):
+                    continue
+                built += 1
+                arg = next(
+                    (k.value for k in node.keywords if k.arg == "parser_cls"), None
+                )
+                via_helper = (
+                    isinstance(arg, ast.Call)
+                    and getattr(arg.func, "id", None) == "parser_for_tool_choice"
+                )
+                if not (via_helper or _is_none(arg)):
+                    unguarded += 1
+        assert built >= 4, f"only {built} construction sites found; matcher is stale"
+        assert unguarded == 0, f"{unguarded} of {built} sites bypass the helper"
 
-    def test_an_inverted_gate_is_not_accepted(self):
-        """`tool_choice == "none"` is the opposite rule and must not pass."""
-        assert _forbids_none(ast.parse('tool_choice != "none"', mode="eval").body)
-        assert not _forbids_none(ast.parse('tool_choice == "none"', mode="eval").body)
-        assert not _forbids_none(ast.parse("tool_choice is not None", mode="eval").body)
+
+def _is_none(node) -> bool:
+    return isinstance(node, ast.Constant) and node.value is None

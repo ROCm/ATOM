@@ -101,7 +101,13 @@ from .streaming_dispatch import (
     StreamBatchDispatcher,
     StreamOutputCollector,
 )
-from .tool_parser.registry import TOOL_CALL_PARSER_HELP, resolve_tool_call_parser
+from .tool_parser import ToolCallStreamParser, parse_tool_calls
+from .tool_parser.registry import (
+    TOOL_CALL_PARSER_HELP,
+    forbids_tool_calls,
+    parser_for_tool_choice,
+    resolve_tool_call_parser,
+)
 
 # Configure logging
 logger = logging.getLogger("atom")
@@ -182,10 +188,9 @@ def anthropic_template_kwargs(
     another name -- the whole Qwen family -- so an explicit opt-in was
     discarded silently against a server default of off.
 
-    ``toggle`` is ``None`` for a model whose template has no switch. The
-    request is then honoured as far as it can be -- the reasoning is separated
-    and reported as a `thinking` block, never discarded -- and startup has
-    already said so.
+    ``toggle`` is ``None`` for a model whose template has no switch. There is
+    then nothing to put in the prompt and `anthropic_drop_reasoning` takes
+    over.
     """
     if getattr(request, "thinking", None) is None:
         return {}
@@ -193,6 +198,32 @@ def anthropic_template_kwargs(
         return {}
     name, off_value, on_value = toggle
     return {name: on_value if anthropic_thinking_enabled(request) else off_value}
+
+
+def anthropic_drop_reasoning(request: Any, toggle: tuple[str, Any, Any] | None) -> bool:
+    """Must this response's reasoning be withheld after the fact?
+
+    Only when the request said `thinking: disabled` *and* the model's template
+    has no switch to say it in the prompt -- gpt-oss-120b and DeepSeek-R1 both
+    measure that way. Answering in the prompt is strictly better and
+    `anthropic_template_kwargs` does it wherever it can; this is the remainder,
+    and without it an explicit opt-out was honoured at neither layer.
+
+    Withheld, not left unseparated: the reasoning still goes through the
+    reasoning filter, so the tool parser never sees a model musing about
+    `<function=NAME>` and calls a tool named `NAME`. Only the `thinking`
+    blocks are dropped. A response that was *nothing but* reasoning then ends
+    on an empty text block, which is the honest answer to "do not think" --
+    the previous three attempts to fix this downstream all failed by trying to
+    salvage content out of it.
+
+    Keyed on the field being *present* and off, exactly as the prompt-level
+    answer is. An absent `thinking` is unstated, and unstated leaves the
+    model's own default alone at both layers or neither.
+    """
+    if getattr(request, "thinking", None) is None:
+        return False
+    return toggle is None and not anthropic_thinking_enabled(request)
 
 
 # The engine's `leave_reason` in Anthropic's vocabulary. The scheduler emits
@@ -246,6 +277,44 @@ def _log_request_event(event_type: str, request_id: str, data: Any) -> None:
     _request_logger.info(json.dumps(entry, default=str))
 
 
+def _log_sse(chunk: str, request_id: str) -> None:
+    """Log every SSE frame in `chunk`, and never fail the stream doing it.
+
+    One yield can carry several frames: `serving_chat` deliberately coalesces
+    finish + usage + `[DONE]` into one send, because at a wave boundary many
+    requests finalize at once and collapsing three socket writes per request
+    to one relieves the event loop. This used to `json.loads` the whole send
+    as a single payload, which raises `Extra data:` on exactly that frame --
+    out of the generator, so with `--request-log` on, the *last* frame of
+    every OpenAI stream never reached the client and no `[DONE]` was sent.
+
+    And frames are not all `data:`-first. Anthropic writes `event: NAME` on
+    the line above, so a `startswith("data: ")` test skipped every frame that
+    endpoint produces -- silently, which for a log is the worst failure it
+    can have.
+
+    A payload that will not parse is logged as text rather than dropped or
+    raised: this is the diagnostic path, and it must not be the reason a
+    response fails.
+    """
+    if _request_logger is None:
+        return
+    for frame in chunk.split("\n\n"):
+        payload = None
+        for line in frame.splitlines():
+            if line.startswith("data:"):
+                payload = line[5:].strip()
+        if payload is None:
+            continue
+        if payload == "[DONE]":
+            _log_request_event("stream_done", request_id, None)
+            continue
+        try:
+            _log_request_event("stream_chunk", request_id, json.loads(payload))
+        except ValueError:
+            _log_request_event("stream_chunk_unparsed", request_id, payload)
+
+
 async def _client_stream(
     gen: AsyncGenerator[str, None], request_id: str
 ) -> AsyncGenerator[str, None]:
@@ -274,12 +343,7 @@ async def _client_stream(
             except StopAsyncIteration:
                 return
         delivered = True
-        if _request_logger is not None and chunk.startswith("data: "):
-            payload = chunk[6:].strip()
-            if payload != "[DONE]":
-                _log_request_event("stream_chunk", request_id, json.loads(payload))
-            else:
-                _log_request_event("stream_done", request_id, None)
+        _log_sse(chunk, request_id)
         yield chunk
 
 
@@ -1725,6 +1789,16 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         # was never told not to think and the endpoint spent three attempts
         # dealing with a chain of thought it had asked for by omission.
         merged_kwargs.update(anthropic_template_kwargs(request, reasoning_toggle))
+        drop_reasoning = anthropic_drop_reasoning(request, reasoning_toggle)
+        # Same answer-it-in-the-prompt rule as `thinking` above, and the chat
+        # path already forwards its own spelling of this. `tool_choice` was
+        # read off the Anthropic request and then used nowhere at all -- a
+        # client that forbade tool calls got `tool_use` blocks and
+        # `stop_reason: tool_use`. Translated to the string a chat template
+        # expects; the object forms Anthropic has for *requiring* a call have
+        # no such spelling, and are not answered here or on the chat path.
+        if forbids_tool_calls(request.tool_choice):
+            merged_kwargs["tool_choice"] = "none"
         prompt = apply_chat_template(
             tokenizer,
             custom_message_encoder,
@@ -1794,8 +1868,6 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
             )
 
             async def generate_anthropic_stream():
-                from .tool_parser import ToolCallStreamParser
-
                 # Unconditional, like the chat path and like both upstreams:
                 # whatever reasoning arrives is separated and reported. The
                 # request's `thinking` was answered in the prompt, so there is
@@ -1812,7 +1884,11 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                     starts_thinking=prompt_starts_in_reasoning(prompt)
                     or model_starts_in_reasoning,
                 )
-                tool_parser = ToolCallStreamParser(parser_cls=tool_call_parser_cls)
+                tool_parser = ToolCallStreamParser(
+                    parser_cls=parser_for_tool_choice(
+                        tool_call_parser_cls, request.tool_choice
+                    )
+                )
                 tool_parser.tools = anthropic_to_openai_tools(request.tools)
                 blocks = AnthropicBlocks()
                 has_tool_calls = False
@@ -1862,6 +1938,8 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                                 continue
 
                             if field == "reasoning_content":
+                                if drop_reasoning:
+                                    continue
                                 for _frame in blocks.delta("thinking", text):
                                     yield _frame
                             else:
@@ -1909,8 +1987,6 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
             )
 
         # Non-streaming response
-        from .tool_parser import parse_tool_calls
-
         final_output = await _run_nonstream_with_disconnect(
             generate_async(prompt, sampling_params, request_id),
             raw_request,
@@ -1920,17 +1996,23 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
             raise RuntimeError("No output generated")
 
         raw_text = final_output["text"]
-        # Unconditional, and the same call the chat path makes. See the
-        # streaming branch above for why `thinking` has no say here.
+        # Separating is unconditional -- the same call the chat path makes,
+        # and what keeps a chain of thought out of the tool parser. Only
+        # whether the client is shown it is a question, and the same one the
+        # streaming branch above asks.
         reasoning_content, content_with_tools = separate_reasoning(
             raw_text,
             starts_thinking=prompt_starts_in_reasoning(prompt)
             or model_starts_in_reasoning,
         )
+        if drop_reasoning:
+            reasoning_content = None
         content_text, tool_calls = parse_tool_calls(
             content_with_tools,
             anthropic_to_openai_tools(request.tools),
-            parser_cls=tool_call_parser_cls,
+            parser_cls=parser_for_tool_choice(
+                tool_call_parser_cls, request.tool_choice
+            ),
         )
         output_tokens = len(tokenizer.encode(raw_text))
         cache_read_input_tokens = final_output.get("num_cached_tokens", 0)
