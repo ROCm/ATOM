@@ -490,9 +490,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 **i64_kwargs,
             )
             var[f"{p}block_tables"] = CpuGpuBuffer(
-                ub_max_bs,
-                self.max_num_blocks_per_seq // self.block_ratio,
-                **i32_kwargs,
+                ub_max_bs, self.block_table_cols, **i32_kwargs
             )
             var[f"{p}cu_seqlens_q"] = CpuGpuBuffer(ub_max_bs + 1, **i32_kwargs)
             var[f"{p}cu_seqlens_q"].cpu.copy_(

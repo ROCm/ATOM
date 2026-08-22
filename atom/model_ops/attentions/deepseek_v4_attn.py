@@ -251,9 +251,10 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     for FP8 ragged. Shared by MQA logits and top-k with `next_n=1`; unlike
     the output allocation length, this is NOT capped by `index_topk`."""
     block_tables_per_token: torch.Tensor | None = None
-    """int32 GPU `[decode_rows, max_blocks]` — compressed-cache block table
-    expanded from sequences to query rows. It lets the existing aiter MQA
-    kernels treat every query row as an independent batch with `next_n=1`."""
+    """int32 GPU `[decode_rows, block_table_cols]` — compressed-cache block
+    table expanded from sequences to query rows by a device-side gather. It
+    lets the existing aiter MQA kernels treat every query row as an
+    independent batch with `next_n=1`."""
     kv_indices_hca: torch.Tensor | None = None
     """[hca_indptr[T]] int32 GPU — packed paged offsets for HCA layers
     (HCA compress at slice head + SWA window prefix at tail; layer-invariant)."""
@@ -3581,27 +3582,33 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             in_seq = token_ids - cu[bids]
             rect_dst = bids * full_q + (full_q - ragged_lens_np[bids]) + in_seq
             n_committed_per_token_np[rect_dst] = csa_visible_end_per_token
-            mqa_row_to_batch_np = np.full(rect_bs * full_q, -1, dtype=np.int32)
-            mqa_row_to_batch_np[: scheduled_bs * full_q] = np.repeat(
-                np.arange(scheduled_bs, dtype=np.int32), full_q
-            )
+            # Rows are `full_q` slots per sequence, so row r serves seq
+            # r // full_q, and the rows past the batch are the tail.
+            mqa_valid_rows = scheduled_bs * full_q
+            mqa_row_to_batch_gpu = torch.arange(
+                mqa_valid_rows, dtype=torch.int32, device=self.device
+            ).div_(full_q, rounding_mode="floor")
         else:
-            mqa_row_to_batch_np = np.full(
-                n_committed_per_token_np.shape[0], -1, dtype=np.int32
-            )
-            mqa_row_to_batch_np[:T] = batch_id_per_token_np[:T]
+            # One row per query token, so the row -> seq map is the one
+            # already staged for this forward.
+            mqa_valid_rows = T
+            mqa_row_to_batch_gpu = batch_id_per_token_gpu[:T]
 
         # Expand block tables per query row so the unchanged aiter paged-MQA
-        # kernels can run once with shape `[decode_rows, 1, ...]`.
-        block_tables_np_full = var[f"{buf_prefix_ubatch}block_tables"].np[:scheduled_bs]
-        mqa_bt_buf = var[f"{buf_prefix_ubatch}v4_block_tables_per_token"]
+        # kernels can run once with shape `[decode_rows, 1, ...]`. Source and
+        # index are both on the device, so the gather runs there instead of the
+        # host shipping the expansion; the rows it skips are the tail.
+        mqa_bt = var[f"{buf_prefix_ubatch}v4_block_tables_per_token"]
         mqa_rows = n_committed_per_token_np.shape[0]
-        block_tables_per_token_np = mqa_bt_buf.np[:mqa_rows]
-        block_tables_per_token_np.fill(0)
-        valid_mqa_rows = mqa_row_to_batch_np >= 0
-        block_tables_per_token_np[valid_mqa_rows] = block_tables_np_full[
-            mqa_row_to_batch_np[valid_mqa_rows]
-        ]
+        block_tables_per_token_gpu = mqa_bt[:mqa_rows]
+        torch.index_select(
+            var[f"{buf_prefix_ubatch}block_tables"].gpu,
+            0,
+            mqa_row_to_batch_gpu,
+            out=block_tables_per_token_gpu[:mqa_valid_rows],
+        )
+        if mqa_valid_rows < mqa_rows:  # an empty `zero_` still costs a dispatch
+            block_tables_per_token_gpu[mqa_valid_rows:].zero_()
         # HCA: ragged, per-token len = actual_swa_count + n_committed_hca
         hca_per_tok = actual_swa_count_np + n_committed_hca_per_token
         hca_indptr_np = np.zeros(T_pad + 1, dtype=np.int32)
@@ -3619,7 +3626,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             f"{buf_prefix_ubatch}v4_n_committed_per_token",
             n_committed_per_token_np,
         )
-        block_tables_per_token_gpu = mqa_bt_buf.copy_to_gpu(mqa_rows)
         hca_indptr_gpu = self._stage(
             f"{buf_prefix_ubatch}v4_kv_indptr_hca", hca_indptr_np
         )
@@ -4426,8 +4432,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         bufs["v4_kv_indptr_csa"] = CpuGpuBuffer(T_dec + 1, **i32)
         bufs["v4_kv_indptr_hca"] = CpuGpuBuffer(T_dec + 1, **i32)
         bufs["v4_n_committed_per_token"] = CpuGpuBuffer(T_dec, **i32)
-        _bt_cols = self.model_runner.forward_vars["block_tables"].np.shape[1]
-        bufs["v4_block_tables_per_token"] = CpuGpuBuffer(T_dec, _bt_cols, **i32)
+        # Device-only, and as wide as the `block_tables` it gathers from: a host
+        # mirror would be `T_dec * cols * 4` of pinned memory nothing writes.
+        bufs["v4_block_tables_per_token"] = torch.zeros(
+            T_dec, self.block_table_cols, **i32
+        )
         # Where each decode token's own KV row goes, one buffer per compress
         # class. The fused SWA write reads these rather than deriving the row,
         # so the window layout stays inside this repo (see
@@ -4572,7 +4581,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         bs = self.max_bs
         win = self.window_size
         T_dec = self.max_decode_tokens
-        max_blocks = self.max_num_blocks_per_seq // self.block_ratio
 
         for ub_idx in range(self._NUM_TBO_UBATCHES):
             p = f"ub{ub_idx}_"
@@ -4580,7 +4588,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             # for the non-TBO path; cloned here so each ubatch slices its own).
             bufs[f"{p}positions"] = CpuGpuBuffer(T_dec, **i64)
             bufs[f"{p}context_lens"] = CpuGpuBuffer(bs, **i32)
-            bufs[f"{p}block_tables"] = CpuGpuBuffer(bs, max_blocks, **i32)
+            bufs[f"{p}block_tables"] = CpuGpuBuffer(bs, self.block_table_cols, **i32)
             bufs[f"{p}cu_seqlens_q"] = CpuGpuBuffer(bs + 1, **i32)
 
             # V4 decode metadata buffers.
@@ -4597,8 +4605,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             bufs[f"{p}v4_kv_indptr_csa"] = CpuGpuBuffer(T_dec + 1, **i32)
             bufs[f"{p}v4_kv_indptr_hca"] = CpuGpuBuffer(T_dec + 1, **i32)
             bufs[f"{p}v4_n_committed_per_token"] = CpuGpuBuffer(T_dec, **i32)
-            bufs[f"{p}v4_block_tables_per_token"] = CpuGpuBuffer(
-                T_dec, max_blocks, **i32
+            bufs[f"{p}v4_block_tables_per_token"] = torch.zeros(
+                T_dec, self.block_table_cols, **i32
             )
             for name in _DEST_ROW_BUFFERS.values():
                 bufs[f"{p}{name}"] = CpuGpuBuffer(T_dec, **i32)

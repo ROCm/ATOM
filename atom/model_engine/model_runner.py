@@ -1325,10 +1325,11 @@ class ModelRunner:
         )
 
         def _clone_slot(src: dict) -> dict:
-            # Only CpuGpuBuffers are per-forward host-pinned staging buffers that
-            # get overwritten each forward. Everything else (the eager `outputs`
-            # tensor, scalar `mtp_k`, ...) is either unused on the eager PP path
-            # or immutable, so share it by reference.
+            # CpuGpuBuffers are the per-forward staging buffers, and only their
+            # host half can be rewritten while an earlier microbatch's kernels
+            # are still reading. Everything else is immutable, unused on the
+            # eager PP path, or device-only, where the stream orders the writing
+            # kernel after those readers.
             return {
                 k: (v.clone() if isinstance(v, CpuGpuBuffer) else v)
                 for k, v in src.items()

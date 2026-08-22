@@ -265,6 +265,8 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         self.max_num_blocks_per_seq = (
             config.max_model_len + self.block_size - 1
         ) // self.block_size
+        # Width of every `block_tables` buffer, and of anything gathered from one.
+        self.block_table_cols = self.max_num_blocks_per_seq // self.block_ratio
         # Per-rank attention head count. eagle.propose's mid-step path reads
         # this to gate the `do_attn_metadata_update` branch. Subclasses that
         # need a kernel-minimum-padded count set `self.padded_num_attention_heads`
@@ -280,9 +282,7 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             "slot_mapping": CpuGpuBuffer(self.max_num_batched_tokens, **i64_kwargs),
             "context_lens": CpuGpuBuffer(self.max_bs, **i32_kwargs),
             "block_tables": CpuGpuBuffer(
-                self.max_bs,
-                self.max_num_blocks_per_seq // self.block_ratio,
-                **i32_kwargs,
+                self.max_bs, self.block_table_cols, **i32_kwargs
             ),
             "cu_seqlens_q": CpuGpuBuffer(self.max_bs + 1, **i32_kwargs),
             "cu_seqlens_k": CpuGpuBuffer(self.max_bs + 1, **i32_kwargs),
