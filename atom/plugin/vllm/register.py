@@ -19,6 +19,8 @@ ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER = "atom.plugin.vllm.model_wrapper:ATOMMoEForCau
 # when register new model to vllm, add here
 # Keys is from hf config arch name
 _VLLM_MODEL_REGISTRY_OVERRIDES: dict[str, str] = {
+    "CohereForCausalLM": ATOM_CAUSAL_LM_MODEL_WRAPPER,
+    "Cohere2ForCausalLM": ATOM_CAUSAL_LM_MODEL_WRAPPER,
     "LlamaForCausalLM": ATOM_CAUSAL_LM_MODEL_WRAPPER,
     "Qwen3ForCausalLM": ATOM_CAUSAL_LM_MODEL_WRAPPER,
     "Qwen3MoeForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,

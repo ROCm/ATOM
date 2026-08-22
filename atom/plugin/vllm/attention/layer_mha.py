@@ -143,6 +143,7 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
             else 1.0
         )
         self.kv_scale = torch.tensor(self.kv_scale_float, dtype=torch.float32)
+        self.per_tensor_scale = self.kv_scale  # set here; fp8 path overrides later
         self.per_token_quant = True
         self.sinks = sinks
         self.sliding_window = (
