@@ -31,7 +31,6 @@ use crate::{
     protocols::{
         chat::ChatCompletionRequest,
         common::GenerationRequest,
-        completion::CompletionRequest,
         generate::GenerateRequest,
         responses::{ResponsesGetParams, ResponsesRequest},
     },
@@ -42,6 +41,7 @@ use crate::{
             metrics_utils::{error_type_from_status, route_to_endpoint},
             placement_response::placement_err_to_response,
         },
+        completion_request::CompletionRequest,
         RouterTrait,
     },
 };
@@ -138,9 +138,22 @@ impl Router {
         route: &'static str,
         model_id: Option<&str>,
     ) -> Response {
-        let start = Instant::now();
         let is_stream = typed_req.is_stream();
         let text = typed_req.extract_text_for_routing();
+        self.route_serializable_request(headers, typed_req, route, model_id, is_stream, &text)
+            .await
+    }
+
+    pub async fn route_serializable_request<T: serde::Serialize + Clone>(
+        &self,
+        headers: Option<&HeaderMap>,
+        typed_req: &T,
+        route: &'static str,
+        model_id: Option<&str>,
+        is_stream: bool,
+        text: &str,
+    ) -> Response {
+        let start = Instant::now();
         let model = model_id.unwrap_or(UNKNOWN_MODEL_ID);
         let endpoint = route_to_endpoint(route);
 
@@ -159,7 +172,7 @@ impl Router {
             // operation per attempt
             |_: u32| async {
                 let res = self
-                    .route_typed_request_once(headers, typed_req, route, model_id, is_stream, &text)
+                    .route_typed_request_once(headers, typed_req, route, model_id, is_stream, text)
                     .await;
 
                 // Need to be outside `route_typed_request_once` because that function has multiple return paths
@@ -213,7 +226,7 @@ impl Router {
         response
     }
 
-    async fn route_typed_request_once<T: GenerationRequest + serde::Serialize + Clone>(
+    async fn route_typed_request_once<T: serde::Serialize + Clone>(
         &self,
         headers: Option<&HeaderMap>,
         typed_req: &T,
@@ -702,8 +715,18 @@ impl RouterTrait for Router {
         body: &CompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/completions", model_id)
-            .await
+        // Mesh-local type isn't `GenerationRequest`, so compute the signals here.
+        let is_stream = body.is_stream();
+        let text = body.routing_text();
+        self.route_serializable_request(
+            headers,
+            body,
+            "/v1/completions",
+            model_id,
+            is_stream,
+            &text,
+        )
+        .await
     }
 
     async fn route_responses(
