@@ -85,11 +85,14 @@ def build_args(config: dict[str, Any], variant: dict[str, Any]) -> str:
     utilization, ...) is passed verbatim via `extra_args`. Fixed order:
 
         --kv_cache_dtype <dtype> [-tp <n>] [--trust-remote-code]
+        (tp: variant.tp overrides config.tp)
         [<config.extra_args>] [<variant.extra_args>]
     """
     parts: list[str] = [f"--kv_cache_dtype {config.get('kv_cache_dtype', 'fp8')}"]
-    if config.get("tp") is not None:
-        parts.append(f"-tp {config['tp']}")
+    # A variant may pin its own TP, as it may already pin its own `path`.
+    tp = variant.get("tp", config.get("tp"))
+    if tp is not None:
+        parts.append(f"-tp {tp}")
     if config.get("trust_remote_code"):
         parts.append("--trust-remote-code")
     if config.get("extra_args"):

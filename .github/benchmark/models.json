@@ -27,6 +27,14 @@
       },
       "variants": [
         { "label": "", "suffix": "", "conc_max": 256 },
+        { "label": "TP4", "suffix": "-tp4", "tp": 4, "conc_max": 16 },
+        {
+          "label": "TP4 NoSS",
+          "suffix": "-tp4-noss",
+          "tp": 4,
+          "conc_max": 16,
+          "env_vars": "ATOM_USE_SIDE_STREAMS=0"
+        },
         {
           "label": "MTP3",
           "suffix": "-mtp3",

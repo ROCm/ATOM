@@ -71,6 +71,17 @@ def test_build_args_composition():
         == "--kv_cache_dtype fp8 -tp 8 --x"
     )
 
+    # variant.tp overrides config.tp, and emits -tp exactly once. A variant
+    # that pins a different topology than the model default must not leave the
+    # model's -tp in the string as well.
+    assert (
+        catalog.build_args({"kv_cache_dtype": "fp8", "tp": 8}, {"tp": 4})
+        == "--kv_cache_dtype fp8 -tp 4"
+    )
+
+    # A variant tp on a model that declares none still emits -tp.
+    assert catalog.build_args({}, {"tp": 4}) == "--kv_cache_dtype fp8 -tp 4"
+
 
 def test_build_args_smoke_over_real_catalog():
     """Every real (model, variant) pair produces a well-formed arg string.

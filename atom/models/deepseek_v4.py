@@ -3577,9 +3577,15 @@ class MoE(nn.Module):
     def single_stream_moe_forward(
         self, x: torch.Tensor  # [num_tokens, dim]
     ) -> torch.Tensor:  # [num_tokens, dim]
-        """Sequential: shared_experts → routed_experts → combine."""
-        shared = self.shared_experts(x) if self.shared_experts is not None else None
+        """Sequential: routed_experts → shared_experts → combine.
+
+        Mirrors dual_stream_moe_forward's call form and order -- going through
+        nn.Module.__call__ here cost a separate Inductor graph.
+        """
         routed = self.routed_expert_forward(x)
+        shared = (
+            self.shared_experts.forward(x) if self.shared_experts is not None else None
+        )
         return self.combine_outputs(
             routed, shared, prefix=f"{self.prefix}.combine_outputs"
         )
@@ -4149,11 +4155,12 @@ class DeepseekV4Model(nn.Module):
         # Main Compressor overlap. indexer_stream: Indexer Compressor overlap.
         # Both allocated once, shared across all blocks. Attention runs before
         # MoE in each block, so attn and MoE never contend for alt_stream.
+        _side_streams = torch.cuda.is_available() and envs.ATOM_USE_SIDE_STREAMS
         self.alt_stream: torch.cuda.Stream | None = (
-            torch.cuda.Stream() if torch.cuda.is_available() else None
+            torch.cuda.Stream() if _side_streams else None
         )
         self.indexer_stream: torch.cuda.Stream | None = (
-            torch.cuda.Stream() if torch.cuda.is_available() else None
+            torch.cuda.Stream() if _side_streams else None
         )
         self.layers = nn.ModuleList(
             [

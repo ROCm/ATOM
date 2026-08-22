@@ -87,7 +87,7 @@ utilization, …) is passed verbatim through `extra_args`:
 | field | where | emits |
 |-------|-------|-------|
 | `kv_cache_dtype` | config | `--kv_cache_dtype <v>` (default `fp8`) |
-| `tp` | config | `-tp <n>` (omitted if absent, e.g. gpt-oss) |
+| `tp` | config or variant | `-tp <n>` (omitted if absent, e.g. gpt-oss); variant overrides config |
 | `trust_remote_code` | config | `--trust-remote-code` |
 | `extra_args` | config and/or variant | appended verbatim (server flags) |
 | `env_vars` | model and/or variant | newline-joined container env vars |
