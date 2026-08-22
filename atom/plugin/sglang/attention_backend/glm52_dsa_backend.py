@@ -287,6 +287,75 @@ class ATOMGLM52DSABackendForSgl(AttentionBackend):
             self.forward_metadata = forward_batch
             self.atom_glm52_graph_metadata = None
             return
+
+        forward_mode = getattr(forward_batch, "forward_mode", None)
+        if self._is_target_verify(forward_mode):
+            spec_info = getattr(forward_batch, "spec_info", None)
+            draft_token_num = int(
+                getattr(spec_info, "draft_token_num", 0)
+                or getattr(spec_info, "num_tokens_per_req", 0)
+                or 0
+            )
+            if draft_token_num <= 0:
+                raise RuntimeError(
+                    "GLM target-verify graph metadata requires draft_token_num"
+                )
+
+            bs = int(forward_batch.batch_size)
+            if in_capture:
+                positions = torch.repeat_interleave(
+                    forward_batch.seq_lens[:bs].to(torch.int64) - draft_token_num,
+                    draft_token_num,
+                ) + torch.arange(
+                    draft_token_num, dtype=torch.int64, device=self.device
+                ).repeat(
+                    bs
+                )
+                metadata_batch = SimpleNamespace(
+                    forward_mode=forward_mode,
+                    actual_forward_mode=forward_mode,
+                    batch_size=bs,
+                    req_pool_indices=forward_batch.req_pool_indices[:bs],
+                    seq_lens=forward_batch.seq_lens[:bs],
+                    seq_lens_cpu=forward_batch.seq_lens_cpu[:bs],
+                    out_cache_loc=torch.zeros(
+                        bs * draft_token_num,
+                        dtype=torch.int64,
+                        device=self.device,
+                    ),
+                    positions=positions,
+                    spec_info=SimpleNamespace(draft_token_num=draft_token_num),
+                )
+                fixed = self._build_target_verify_graph_metadata(
+                    metadata_batch, positions
+                )
+                self._target_verify_graph_metadata[bs] = fixed
+                return self._publish_target_verify_graph_metadata(metadata_batch, fixed)
+
+            fixed = self._target_verify_graph_metadata.get(bs)
+            if fixed is None:
+                raise RuntimeError(
+                    f"Missing GLM target-verify graph metadata for batch size {bs}"
+                )
+            total_tokens = bs * draft_token_num
+            positions = forward_batch.positions[:total_tokens]
+            metadata_batch = SimpleNamespace(
+                forward_mode=forward_mode,
+                actual_forward_mode=getattr(
+                    forward_batch, "actual_forward_mode", forward_mode
+                ),
+                batch_size=bs,
+                req_pool_indices=forward_batch.req_pool_indices[:bs],
+                seq_lens=forward_batch.seq_lens[:bs],
+                seq_lens_cpu=forward_batch.seq_lens_cpu[:bs],
+                out_cache_loc=forward_batch.out_cache_loc[:total_tokens],
+                positions=positions,
+                spec_info=SimpleNamespace(draft_token_num=draft_token_num),
+            )
+            staged = self._build_target_verify_graph_metadata(metadata_batch, positions)
+            self._copy_metadata_in_place(staged, fixed)
+            return self._publish_target_verify_graph_metadata(metadata_batch, fixed)
+
         positions = getattr(forward_batch, "positions", None)
         if positions is None:
             graph_runner = getattr(self.model_runner, "graph_runner", None)
