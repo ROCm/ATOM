@@ -1457,6 +1457,15 @@ class TestAPromiseCannotBeTakenBack:
         ], "the wrong name was given arguments to run with"
 
 
+def _big_kimi_call(payload_bytes: int) -> str:
+    """The same, in Kimi's self-delimiting token format."""
+    return (
+        "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0"
+        f'<|tool_call_argument_begin|>{{"note": "{"x" * payload_bytes}"}}'
+        "<|tool_call_end|><|tool_calls_section_end|>"
+    )
+
+
 def _big_call(payload_bytes: int) -> str:
     """One Qwen tool call whose argument is `payload_bytes` long."""
     return (
@@ -1483,17 +1492,17 @@ class TestTheRegionIsNotCopiedPerChunk:
     LARGE_KB = 128
 
     @staticmethod
-    def _stream_ms(payload_bytes: int) -> float:
-        text = _big_call(payload_bytes)
+    def _stream_ms(payload_bytes: int, parser=None, build=None) -> float:
+        text = (build or _big_call)(payload_bytes)
         best = None
         for _ in range(3):
-            parser = ToolCallStreamParser(
-                tools=DECLARED_TOOLS, parser_cls=QwenXmlParser
+            stream = ToolCallStreamParser(
+                tools=DECLARED_TOOLS, parser_cls=parser or QwenXmlParser
             )
             start = time.perf_counter()
             for i in range(0, len(text), 4):
-                parser.process(text[i : i + 4])
-            parser.flush()
+                stream.process(text[i : i + 4])
+            stream.flush()
             elapsed = time.perf_counter() - start
             best = elapsed if best is None else min(best, elapsed)
         return best * 1000
@@ -1534,6 +1543,33 @@ class TestTheRegionIsNotCopiedPerChunk:
         assert (
             max(seen) <= _PEEK_WINDOW
         ), f"a peek was handed {max(seen)} characters, window is {_PEEK_WINDOW}"
+
+    @pytest.mark.parametrize(
+        "parser, build",
+        [
+            (QwenXmlParser, _big_call),
+            (KimiParser, _big_kimi_call),
+        ],
+        ids=["buffered-region", "kimi-incremental"],
+    )
+    def test_no_format_pays_more_per_byte_as_the_payload_grows(self, parser, build):
+        """Kimi is the format that is not a `BufferedMarkerParser`, so the
+        sweep that put the others on a list accumulator missed it -- and it
+        carried a second factor of its own, re-scanning the whole buffer for
+        an entry end on every chunk. 128 KB cost 428 ms of event-loop CPU
+        against Qwen's 10 for the same payload.
+        """
+        control = self._control_ms(self.LARGE_KB * 1024) / (
+            self._control_ms(self.SMALL_KB * 1024) * (self.LARGE_KB / self.SMALL_KB)
+        )
+        if not 0.6 < control < 1.6:
+            pytest.skip(f"machine too noisy to measure: control ratio {control:.2f}")
+        small = self._stream_ms(self.SMALL_KB * 1024, parser, build) / self.SMALL_KB
+        large = self._stream_ms(self.LARGE_KB * 1024, parser, build) / self.LARGE_KB
+        assert large / small < 1.5, (
+            f"{parser.NAME}: cost per KB grew {large / small:.2f}x from "
+            f"{self.SMALL_KB} to {self.LARGE_KB} KB ({small:.3f} -> {large:.3f})"
+        )
 
     def test_the_cost_per_byte_does_not_grow(self):
         """The timed half, with a control arm.

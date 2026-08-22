@@ -24,6 +24,12 @@ from .tool_parser import ToolCall, ToolCallParser
 
 KIMI_SECTION_BEGIN = "<|tool_calls_section_begin|>"
 KIMI_SECTION_END = "<|tool_calls_section_end|>"
+KIMI_ENTRY_END = "<|tool_call_end|>"
+# Nothing in a chunk can complete an entry or the section unless one of these
+# lands in it, so nothing before one arrives needs the buffer materialised.
+# See `KimiParser.process`.
+_DRAIN_TRIGGERS = (KIMI_ENTRY_END, KIMI_SECTION_END)
+_TRIGGER_TAIL = max(len(m) for m in _DRAIN_TRIGGERS) - 1
 
 _SECTION_RE = re.compile(
     re.escape(KIMI_SECTION_BEGIN) + r"(.*?)" + re.escape(KIMI_SECTION_END),
@@ -84,6 +90,8 @@ class KimiParser(ToolCallParser):
         # question; using it as this one made the not-a-promise branch dead
         # code from the first real call onwards.
         self._section_calls = 0
+        # The tail a drain trigger split across a chunk boundary would need.
+        self._trigger_tail = ""
 
     @classmethod
     def detect(cls, text: str) -> bool:
@@ -129,6 +137,7 @@ class KimiParser(ToolCallParser):
             self.state = 1
             self.buf = ""
             self._section_calls = 0
+            self._trigger_tail = ""
             # Falls through rather than returning: the whole section, and the
             # answer after it, can arrive in the same chunk. Returning here
             # left the section-end handling below unreached and `flush` then
@@ -137,9 +146,28 @@ class KimiParser(ToolCallParser):
             # chunk is exactly what `merge_chunk` coalesces to under load.
             text = scan.rest
 
-        self.buf += text
+        # Accumulated in a list and searched only when something could have
+        # completed. `self.buf += text` on an attribute is quadratic -- see
+        # `Region` -- and scanning the whole buffer per chunk is a second
+        # factor on top of it: a 50 KB argument cost 55 ms of event-loop CPU
+        # against Qwen's 4 for the same payload, and the gap widens with size.
+        # Only these two markers can end an entry or the section, so until one
+        # of them arrives there is nothing to look at. The tail carries the
+        # bytes a marker split across the boundary would need.
+        self.region.append(text)
+        probe = self._trigger_tail + text
+        self._trigger_tail = probe[-_TRIGGER_TAIL:]
+        if not any(m in probe for m in _DRAIN_TRIGGERS):
+            return results
+
+        self.buf += self.region.take()
         if KIMI_SECTION_END not in self.buf:
-            return results + self._drain_entries()
+            results.extend(self._drain_entries())
+            # Whatever is left is the entry still arriving; back it goes, so
+            # the next chunk appends rather than copies it again.
+            self.region.append(self.buf)
+            self.buf = ""
+            return results
 
         section, _, after = self.buf.partition(KIMI_SECTION_END)
         self.buf = section
@@ -161,6 +189,7 @@ class KimiParser(ToolCallParser):
         # is still the answer.
         self.state = 0
         self.buf = ""
+        self._trigger_tail = ""
         if after:
             results.extend(self.process(after))
 
@@ -209,6 +238,11 @@ class KimiParser(ToolCallParser):
             if rest:
                 results.append(("content", rest))
         elif self.state == 1:
+            # Whatever `process` left unexamined, because no drain trigger had
+            # arrived yet. At end of stream there is nothing more coming, so
+            # this is the one place it always has to be looked at.
+            self.buf += self.region.take()
+            self._trigger_tail = ""
             results.extend(self._drain_entries())
             if self._section_calls > 0:
                 results.append(("tool_call_end", None))
