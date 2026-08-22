@@ -101,7 +101,6 @@ from atom.model_ops.v4_kernels import (
     FP4_MQA_BLOCK_K,
     FP4_MQA_PARALLEL_UNIT_NUM,
     fp4_indexer_enabled,
-    hca_compress_paged_offsets,
     write_v4_paged_decode_indices,
     write_v4_paged_prefill_indices,
 )
@@ -2353,7 +2352,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # the other two are switched off. They used to be aliased onto this same
         # buffer because all three classes named the same row, which stopped
         # being true when the window started interleaving by class.
-        swa_indices_buf = var["v4_kv_indices_swa"].gpu
+        swa_indices_buf = var["v4_kv_indices_swa"]
         dest_rows = self._dest_row_buffers()
         write_v4_paged_decode_indices(
             state_slot_per_seq=attn_metadata.state_slot_out[:bs],
@@ -3632,40 +3631,20 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # batch_id_per_token + n_committed_csa_per_seq already staged in
         # `_attach_v4_per_fwd_meta`.
 
-        # ----- HCA compress paged offsets (CPU numpy, vectorized) -----
-        block_tables_np_full = var[f"{buf_prefix_ubatch}block_tables"].np[:scheduled_bs]
+        # `ctx/128` HCA entries per token: building this section in numpy and
+        # shipping it was the largest host cost here. The kernel below fills it
+        # from block tables already on the device, tiling each slice exactly
+        # with the SWA prefix, so nothing pre-fills the buffer.
+        hca_indices_buf = var[f"{buf_prefix_ubatch}v4_kv_indices_hca"]
         hca_total_indices = int(hca_indptr_np[T])
-        hca_indices_np = np.full(hca_total_indices, -1, dtype=np.int32)
-        # n_committed_hca_per_seq is int32; gather stays int32.
-        n_h_per_token = n_committed_hca_per_seq[batch_id_per_token_np[:T]]
-        total_hca_entries = int(n_h_per_token.sum())
-        if total_hca_entries > 0:
-            token_indices = np.repeat(np.arange(T, dtype=np.int32), n_h_per_token)
-            cu_n_h = np.zeros(T + 1, dtype=np.int32)
-            np.cumsum(n_h_per_token, out=cu_n_h[1:], dtype=np.int32)
-            entry_offsets = np.arange(total_hca_entries, dtype=np.int32) - np.repeat(
-                cu_n_h[:T], n_h_per_token
-            )
-            # HCA compress section occupies the slice HEAD (offset 0); the SWA
-            # prefix segment sits at the tail, written below by
-            # write_v4_paged_decode_indices.
-            write_pos = hca_indptr_np[token_indices] + entry_offsets
-            bid_expanded = batch_id_per_token_np[token_indices]
-            # Each physical block packs hca_rows_per_block rows (compressor
-            # cache view [num_blocks, hca_rows_per_block, head_dim]); shared
-            # with the prefill kernel + regression test via
-            # hca_compress_paged_offsets.
-            hca_indices_np[write_pos] = hca_compress_paged_offsets(
-                entry_offsets,
-                bid_expanded,
-                block_tables_np_full,
-                envelope_rows,
-                self.hca_rows_per_block,
-            )
-        # Stage to GPU (HCA compress section at head; SWA prefix scattered below).
-        hca_indices_gpu = self._stage(
-            f"{buf_prefix_ubatch}v4_kv_indices_hca", hca_indices_np
+        # `_stage` carried this bound; without it an over-long slice would be a
+        # silent out-of-bounds device write.
+        assert hca_total_indices <= hca_indices_buf.shape[0], (
+            f"V4 buffer 'v4_kv_indices_hca' too small: need {hca_total_indices}, "
+            f"have {hca_indices_buf.shape[0]}. Increase the bound in "
+            f"_alloc_v4_metadata_buffers."
         )
+        hca_indices_gpu = hca_indices_buf[:hca_total_indices]
 
         # ----- Write SWA / CSA / HCA window-prefix paged offsets (1 kernel) -----
         # Kernel computes `n = min(positions[t]+1, win)` and ring-index
@@ -3675,8 +3654,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # persistent forward_vars buffers — no allocator churn (the prior
         # `index_copy_` chain raced under MTP-3 long-prefill; this kernel
         # also fixes that, see skill `debug-agent-locate-kernel`).
-        swa_indices_gpu = var[f"{buf_prefix_ubatch}v4_kv_indices_swa"].gpu
-        csa_indices_gpu = var[f"{buf_prefix_ubatch}v4_kv_indices_csa"].gpu
+        swa_indices_gpu = var[f"{buf_prefix_ubatch}v4_kv_indices_swa"]
+        csa_indices_gpu = var[f"{buf_prefix_ubatch}v4_kv_indices_csa"]
         dest_rows = self._dest_row_buffers(buf_prefix_ubatch)
         write_v4_paged_decode_indices(
             # The slot array must come from the SAME buffer set as
@@ -3703,6 +3682,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             T=T,
             win=win,
             geometry=self.pool_geometry,
+            # Same buffer set as batch_id_per_token, for the reason above.
+            hca_block_tables=var[f"{buf_prefix_ubatch}block_tables"].gpu,
+            hca_rows_per_block=self.hca_rows_per_block,
         )
         attn_metadata.swa_dest_rows = dest_rows
 
@@ -4371,7 +4353,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         return buf.copy_to_gpu(n)
 
     def _alloc_v4_metadata_buffers(self) -> None:
-        """Pre-allocate every CpuGpuBuffer the V4 metadata builder writes into.
+        """Pre-allocate every buffer the V4 metadata builder writes into.
+
+        A `CpuGpuBuffer` where the host writes and the device reads, a bare
+        device tensor where both ends are kernels — the pinned host half is
+        the expensive part and only the staged buffers earn it.
 
         Bounds:
           - per-seq:        max_bs
@@ -4423,9 +4409,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # level data — downstream kernels do
         # `data[batch_id_per_token[t]]` instead of carrying a [T]-sized copy.
         T_dec = self.max_decode_tokens
-        bufs["v4_kv_indices_swa"] = CpuGpuBuffer(T_dec * win, **i32)
-        bufs["v4_kv_indices_csa"] = CpuGpuBuffer(T_dec * (win + self.index_topk), **i32)
-        bufs["v4_kv_indices_hca"] = CpuGpuBuffer(
+        # Device-only: written and read entirely by kernels, so a host mirror
+        # would be tens of MB of pinned memory nothing writes.
+        bufs["v4_kv_indices_swa"] = torch.zeros(T_dec * win, **i32)
+        bufs["v4_kv_indices_csa"] = torch.zeros(T_dec * (win + self.index_topk), **i32)
+        bufs["v4_kv_indices_hca"] = torch.zeros(
             T_dec * (win + self.max_committed_hca), **i32
         )
         bufs["v4_kv_indptr_swa"] = CpuGpuBuffer(T_dec + 1, **i32)
@@ -4594,11 +4582,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             # V4 decode metadata buffers.
             bufs[f"{p}v4_meta_state_slot_out"] = CpuGpuBuffer(bs, **i32)
             bufs[f"{p}v4_meta_state_slot_in"] = CpuGpuBuffer(bs, **i32)
-            bufs[f"{p}v4_kv_indices_swa"] = CpuGpuBuffer(T_dec * win, **i32)
-            bufs[f"{p}v4_kv_indices_csa"] = CpuGpuBuffer(
+            bufs[f"{p}v4_kv_indices_swa"] = torch.zeros(T_dec * win, **i32)
+            bufs[f"{p}v4_kv_indices_csa"] = torch.zeros(
                 T_dec * (win + self.index_topk), **i32
             )
-            bufs[f"{p}v4_kv_indices_hca"] = CpuGpuBuffer(
+            bufs[f"{p}v4_kv_indices_hca"] = torch.zeros(
                 T_dec * (win + self.max_committed_hca), **i32
             )
             bufs[f"{p}v4_kv_indptr_swa"] = CpuGpuBuffer(T_dec + 1, **i32)
