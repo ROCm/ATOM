@@ -421,7 +421,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         hf_config = config.hf_config
         text_config = getattr(hf_config, "text_config", hf_config)
         num_kv_heads = runner._get_num_kv_heads()
-        total_num_layers = runner._get_total_num_layers()
+        total_num_layers = runner._get_local_total_num_layers()
         kv_dtype_size = dtypes.d_dtypes[config.kv_cache_dtype].itemsize
 
         if runner.is_mimo_v2():
@@ -431,7 +431,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 1 for i in range(hf_config.num_hidden_layers) if pattern[i] == 1
             )
             num_full_layers = hf_config.num_hidden_layers - num_swa_layers
-            num_draft_layers = total_num_layers - hf_config.num_hidden_layers
+            num_draft_layers = total_num_layers - runner._get_local_num_target_layers()
             num_swa_layers += num_draft_layers
 
             _swa_raw = getattr(hf_config, "swa_num_key_value_heads", 0)
@@ -529,7 +529,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 "_kv_layer_cache_store": [],
             }
 
-        total_num_layers = runner._get_total_num_layers()
+        total_num_layers = runner._get_local_total_num_layers()
         tensors = {
             "kv_cache": torch.zeros(
                 2,
