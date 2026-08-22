@@ -54,6 +54,7 @@ class MockConfig:
             "kv_cache_block_size": 4,
             "num_kvcache_blocks": 10,
             "enable_prefix_caching": False,
+            "enable_log_stats": False,
             "enable_chunked_prefill": True,
             "max_num_seqs": 4,
             "max_num_batched_tokens": 64,

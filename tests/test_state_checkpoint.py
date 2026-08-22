@@ -24,7 +24,7 @@ from atom.model_engine.page_unit_checkpoint import (
     PagedStateCheckpointCoordinator,
     PagedStateCheckpointSpec,
 )
-from atom.model_engine.scheduler import CacheStats, ScheduledBatchOutput, Scheduler
+from atom.model_engine.scheduler import EngineStats, ScheduledBatchOutput, Scheduler
 from atom.model_engine.sequence import Sequence, SequenceType
 from atom.model_engine.state_cache import StateCache
 from atom.model_engine.state_pool import StateGroupPool
@@ -1803,8 +1803,8 @@ class TestCacheStatsAttribution:
     """
 
     def test_the_split_accounts_for_every_declined_token(self):
-        stats = CacheStats(log_interval=10**6)
-        stats.update(32, 44, 40, 36)
+        stats = EngineStats(enable_prefix_caching=True, cache_log_interval=10**6)
+        stats.update_cache(32, 44, 40, 36)
         lost_to_checkpoint = stats.total_wanted_tokens - stats.total_cached_tokens
         lost_hard = stats.total_compressed_tokens - stats.total_wanted_tokens
         assert lost_to_checkpoint == 4
@@ -1819,8 +1819,8 @@ class TestCacheStatsAttribution:
         seq.num_compressed_hit_blocks = 3
         seq.num_wanted_hit_blocks = 2
         sched._schedule_prefill_seq(seq, 44, {}, [], 0, 0)
-        assert sched.cache_stats.total_compressed_tokens == 3 * 2 * BLOCK
-        assert sched.cache_stats.total_wanted_tokens == 2 * 2 * BLOCK
+        assert sched.engine_stats.total_compressed_tokens == 3 * 2 * BLOCK
+        assert sched.engine_stats.total_wanted_tokens == 2 * 2 * BLOCK
 
 
 class TestGenerationIsHeldToSpacingNotTheGrid:
