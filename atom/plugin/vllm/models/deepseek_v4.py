@@ -12,18 +12,33 @@ It follows the same construction-swap pattern as ``qwen3_next``: the
 variant, then restores it.
 """
 
-from typing import Optional
-
 import torch
 
 from atom.models import deepseek_v4 as deepseek_v4_base
+
+# isort: off
 from atom.models.deepseek_v4 import (
     DeepseekV4Attention as DeepseekV4AttentionBase,
     DeepseekV4ForCausalLM as DeepseekV4ForCausalLMBase,
     DeepseekV4Model as DeepseekV4ModelBase,
     Indexer as IndexerBase,
 )
+
+# isort: on
+from atom.plugin.vllm.deepseek_v4_bridge import ATOM_DEEPSEEK_V4_BLOCK_SIZE
+from atom.utils.attn_ffn_piecewise import decode_bucket_key, piecewise_core
 from atom.utils.forward_context import AttnState, get_forward_context
+
+# Compressor.forward and CSA translation read this module global at runtime, so
+# it must remain aligned with the vLLM proxy page geometry after construction.
+deepseek_v4_base._V4_BLOCK_SIZE = ATOM_DEEPSEEK_V4_BLOCK_SIZE
+
+# The native attention core's UNDECORATED body. ``DeepseekV4Attention._attn_core``
+# is wrapped by ``@piecewise_core``, which owns the cudagraph/output-slot
+# bookkeeping; ``DeepseekV4AttentionVllm._attn_core`` re-applies that same
+# decorator and so must call through to the body, not to the wrapper (which would
+# run the bookkeeping twice). ``__wrapped__`` is set by ``functools.wraps``.
+_NATIVE_ATTN_CORE = DeepseekV4AttentionBase._attn_core.__wrapped__
 
 
 class IndexerVllm(IndexerBase):
@@ -58,8 +73,9 @@ class IndexerVllm(IndexerBase):
 
     def indexer_score_topk(
         self,
-        q_fp8: torch.Tensor,  # [total_tokens, n_heads, head_dim] fp8
+        q_quant: torch.Tensor,  # [total_tokens, n_heads, head_dim] — FP8 (this vLLM override handles the FP8 dispatch)
         weights: torch.Tensor,  # [total_tokens, n_heads] fp32
+        q_scale: torch.Tensor | None,  # FP4 e8m0 Q scale; None here (FP8-only override)
         topk: int,
     ) -> torch.Tensor:
         fc = get_forward_context()
@@ -70,7 +86,7 @@ class IndexerVllm(IndexerBase):
             # Pure-decode step (AttnState.DECODE): the CUDAGraph-captured
             # fixed-shape paged path. Byte-for-byte the native call.
             return self._score_topk_decode(
-                q_fp8, weights, block_tables, indexer_meta, topk
+                q_quant, weights, block_tables, indexer_meta, topk
             )  # [total_tokens, topk] int32
 
         # Prefill-classified step (may be MIXED under continuous batching).
@@ -78,14 +94,14 @@ class IndexerVllm(IndexerBase):
         if num_decode_tokens == 0:
             # Pure prefill: `total_committed` already spans only prefill seqs.
             return self._score_topk_prefill(
-                q_fp8, weights, block_tables, indexer_meta, topk
+                q_quant, weights, block_tables, indexer_meta, topk
             )  # [total_tokens, topk] int32
 
         num_decodes = int(indexer_meta["num_decodes"])
         n_committed_per_seq = indexer_meta["n_committed_per_seq_gpu"]
         # Decode rows: paged fixed-shape logits (bounded per-seq, no batch-sum).
         decode_topk = self._score_topk_decode(
-            q_fp8[:num_decode_tokens],
+            q_quant[:num_decode_tokens],
             weights[:num_decode_tokens],
             block_tables[:num_decodes],
             indexer_meta,
@@ -97,7 +113,7 @@ class IndexerVllm(IndexerBase):
         # committed K (the bridge builds the committed meta over the prefill
         # sub-batch), so `total_committed` no longer explodes.
         prefill_topk = self._score_topk_prefill(
-            q_fp8[num_decode_tokens:],
+            q_quant[num_decode_tokens:],
             weights[num_decode_tokens:],
             block_tables[num_decodes:],
             indexer_meta,
@@ -114,8 +130,8 @@ class IndexerVllm(IndexerBase):
         indexer_meta: dict,
         topk: int,
         *,
-        next_n: Optional[int] = None,
-        n_committed_per_seq: Optional[torch.Tensor] = None,
+        next_n: int | None = None,
+        n_committed_per_seq: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Paged decode top-k, extended for the DECODE slice of a mixed batch.
 
@@ -188,7 +204,7 @@ class IndexerVllm(IndexerBase):
             n_committed_per_seq_gpu,  # int32, sized [bs] (staged in builder)
             block_tables,
             logits_width,  # max_model_len arg == buffer width (store guard)
-            KVBlockSize=self.kv_cache.size(1),  # k1_csa = 32
+            KVBlockSize=self.kv_cache.size(1),  # csa_rows_per_block = 32
             Preshuffle=True,
         )
         topk_local = torch.empty(
@@ -263,16 +279,19 @@ class DeepseekV4AttentionVllm(DeepseekV4AttentionBase):
                     return torch.nn.functional.pad(out, (0, 0, 0, num_in - num_real))
         return super().forward_impl(x, positions)
 
+    @piecewise_core(key=decode_bucket_key, copy_per_step=("positions",))
     def _attn_core(
         self,
+        *,
         x: torch.Tensor,
         q: torch.Tensor,
         kv_pre: torch.Tensor,
         qr: torch.Tensor,
         qr_scale: torch.Tensor,
         positions: torch.Tensor,
-        idx_q_fp8: Optional[torch.Tensor] = None,
-        idx_weights: Optional[torch.Tensor] = None,
+        idx_q_quant: torch.Tensor | None = None,
+        idx_weights: torch.Tensor | None = None,
+        idx_q_scale: torch.Tensor | None = None,
         compressor_already_launched: bool = False,
     ) -> torch.Tensor:
         # NARROW PIECEWISE entry (see class docstring): the ``v4_core_attention``
@@ -284,6 +303,29 @@ class DeepseekV4AttentionVllm(DeepseekV4AttentionBase):
         # back to the bucket width — the native core reads only real-sized
         # metadata, and the padded-width output keeps the piecewise output buffer
         # and the downstream graphed ``_attn_post`` piece at the captured shape.
+        #
+        # This override re-applies ``@piecewise_core`` with the SAME key and
+        # ``copy_per_step`` as the base rather than wrapping the base's decorated
+        # method, because the decorator's bookkeeping must see the PADDED width:
+        # it keys the persistent output slot on ``x.shape[0]``, and that is the
+        # address the downstream dense piece was captured reading. Clipping
+        # outside the decorator would key the slot on the real count and hand
+        # back a short tensor, so the reconciliation has to happen INSIDE the
+        # body — which is why the calls below target the base's undecorated body
+        # (``__wrapped__``) instead of ``super()._attn_core``.
+        native_kwargs = {
+            "x": x,
+            "q": q,
+            "kv_pre": kv_pre,
+            "qr": qr,
+            "qr_scale": qr_scale,
+            "positions": positions,
+            "idx_q_quant": idx_q_quant,
+            "idx_weights": idx_weights,
+            "idx_q_scale": idx_q_scale,
+            "compressor_already_launched": compressor_already_launched,
+        }
+
         fc = get_forward_context()
         if not fc.context.is_dummy_run:
             attn_md = fc.attn_metadata
@@ -295,8 +337,8 @@ class DeepseekV4AttentionVllm(DeepseekV4AttentionBase):
 
                     def _clip(t):
                         # Clip only the leading (token) dim, and only when it is
-                        # the padded width — leaves per-seq / scalar tensors and
-                        # any Nones untouched.
+                        # the padded width — leaves per-seq / scalar tensors, the
+                        # pass-through config flag and any Nones untouched.
                         if (
                             isinstance(t, torch.Tensor)
                             and t.dim() >= 1
@@ -305,29 +347,11 @@ class DeepseekV4AttentionVllm(DeepseekV4AttentionBase):
                             return t[:num_real]
                         return t
 
-                    o = super()._attn_core(
-                        _clip(x),
-                        _clip(q),
-                        _clip(kv_pre),
-                        _clip(qr),
-                        _clip(qr_scale),
-                        _clip(positions),
-                        _clip(idx_q_fp8),
-                        _clip(idx_weights),
-                        compressor_already_launched=compressor_already_launched,
+                    o = _NATIVE_ATTN_CORE(
+                        self, **{k: _clip(v) for k, v in native_kwargs.items()}
                     )
                     return torch.nn.functional.pad(o, (0, 0, 0, num_in - num_real))
-        return super()._attn_core(
-            x,
-            q,
-            kv_pre,
-            qr,
-            qr_scale,
-            positions,
-            idx_q_fp8,
-            idx_weights,
-            compressor_already_launched=compressor_already_launched,
-        )
+        return _NATIVE_ATTN_CORE(self, **native_kwargs)
 
 
 class DeepseekV4ModelVllm(DeepseekV4ModelBase):

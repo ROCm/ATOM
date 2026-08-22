@@ -2,7 +2,11 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import contextlib
+import copy
+import dataclasses
+import importlib
 import ipaddress
+import json
 import logging
 import multiprocessing
 import os
@@ -11,6 +15,7 @@ import socket
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from functools import lru_cache
 from multiprocessing.context import ForkContext, SpawnContext
 from multiprocessing.process import BaseProcess
@@ -23,16 +28,11 @@ import psutil
 import torch
 import zmq
 import zmq.asyncio
-from atom.utils.custom_register import direct_register_custom_op
-from transformers import PretrainedConfig
-
-import copy
-import dataclasses
-import importlib
-from contextlib import contextmanager
-
 from packaging import version
 from packaging.version import Version
+from transformers import PretrainedConfig
+
+from atom.utils.custom_register import direct_register_custom_op
 
 if TYPE_CHECKING:
     from atom.config import Config
@@ -600,6 +600,22 @@ class CpuGpuBuffer:
             return self.cpu.copy_(self.gpu, non_blocking=True)
         return self.cpu[:n].copy_(self.gpu[:n], non_blocking=True)
 
+    def clone(self) -> "CpuGpuBuffer":
+        """Allocate an independent buffer with the same shape/dtype/device and
+        copy over the current cpu+gpu contents (preserves one-time inits like
+        arange/zeros). Used to build per-in-flight-slot metadata rings so
+        concurrent pipeline microbatches never share a staging buffer."""
+        new = CpuGpuBuffer(
+            *self.cpu.shape,
+            dtype=self.cpu.dtype,
+            device=self.gpu.device,
+            pin_memory=self.cpu.is_pinned(),
+            with_numpy=hasattr(self, "np"),
+        )
+        new.cpu.copy_(self.cpu)
+        new.gpu.copy_(self.gpu)
+        return new
+
 
 context_manager = None
 torch_compile_start_time: float = 0.0
@@ -794,10 +810,87 @@ def resolve_obj_by_qualname(qualname: str) -> Any:
     return getattr(module, obj_name)
 
 
+# Mirrored from Torch 2.11's private
+# _get_dynamo_config_for_logging().clean_for_json(). The cleanup function is
+# nested, so ATOM cannot reuse it while fixing the serializer below.
+_TORCH_DYNAMO_METRICS_CONFIG_BLOCKLIST = {
+    "TYPE_CHECKING",
+    "log_file_name",
+    "verbose",
+    "repro_after",
+    "repro_level",
+    "repro_forward_only",
+    "repro_tolerance",
+    "repro_ignore_non_fp",
+    "same_two_models_use_fp64",
+    "base_dir",
+    "debug_dir_root",
+    "_save_config_ignore",
+    "log_compilation_metrics",
+    "inject_BUILD_SET_unimplemented_TESTING_ONLY",
+    "_autograd_backward_strict_mode_banned_ops",
+    "reorderable_logging_functions",
+    "ignore_logger_methods",
+    "traceable_tensor_subclasses",
+    "nontraceable_tensor_subclasses",
+    "_custom_ops_profile",
+}
+
+# ATOM adds bound logger methods to this Torch 2.11 setting. Those callables are
+# the only extra value excluded from the metrics JSON.
+_DYNAMO_METRICS_CONFIG_BLOCKLIST = _TORCH_DYNAMO_METRICS_CONFIG_BLOCKLIST | {
+    "ignore_logging_functions"
+}
+
+
+def _patch_torch_dynamo_metrics_config_logging() -> None:
+    """Extend Torch's metrics cleanup for ATOM's callable logging ignores."""
+    config = torch._dynamo.config
+    if not hasattr(config, "ignore_logging_functions"):
+        return
+
+    try:
+        from torch._dynamo import utils as dynamo_utils
+    except ImportError:
+        return
+
+    original = getattr(dynamo_utils, "_get_dynamo_config_for_logging", None)
+    if original is None or getattr(
+        original, "_atom_ignore_logging_functions_patched", False
+    ):
+        return
+
+    try:
+        original()
+    except TypeError:
+        pass
+    else:
+        return
+
+    def wrapped_get_dynamo_config_for_logging():
+        config_dict = {
+            key: sorted(value) if isinstance(value, set) else value
+            for key, value in config.get_config_copy().items()
+            if key not in _DYNAMO_METRICS_CONFIG_BLOCKLIST
+        }
+        return json.dumps(config_dict, sort_keys=True)
+
+    # Verify the copied serializer before replacing Torch's private helper.
+    try:
+        wrapped_get_dynamo_config_for_logging()
+    except (TypeError, ValueError):
+        return
+
+    wrapped_get_dynamo_config_for_logging._atom_ignore_logging_functions_patched = True
+    dynamo_utils._get_dynamo_config_for_logging = wrapped_get_dynamo_config_for_logging
+
+
 def getLogger():
-    global logger
     if not logger.handlers:
-        logger.setLevel(logging.DEBUG)
+        # Must match the handler level below: a logger at DEBUG feeding a
+        # handler at INFO still builds a LogRecord per logger.debug() call
+        # and then discards it -- 10.4% of the API server's CPU at c=2048.
+        logger.setLevel(logging.INFO)
 
         console_handler = logging.StreamHandler()
         from atom.utils import envs as _envs
@@ -816,15 +909,22 @@ def getLogger():
         console_handler.setLevel(logging.INFO)
 
         logger.addHandler(console_handler)
-        if hasattr(torch._dynamo.config, "ignore_logger_methods"):
-            torch._dynamo.config.ignore_logger_methods = (
-                logging.Logger.info,
-                logging.Logger.warning,
-                logging.Logger.debug,
-                logger.warning,
-                logger.info,
-                logger.debug,
+        ignored_logger_methods = {
+            logging.Logger.info,
+            logging.Logger.warning,
+            logging.Logger.debug,
+            logger.warning,
+            logger.info,
+            logger.debug,
+        }
+        if hasattr(torch._dynamo.config, "ignore_logging_functions"):
+            torch._dynamo.config.ignore_logging_functions = set(
+                torch._dynamo.config.ignore_logging_functions
             )
+            torch._dynamo.config.ignore_logging_functions.update(ignored_logger_methods)
+            _patch_torch_dynamo_metrics_config_logging()
+        elif hasattr(torch._dynamo.config, "ignore_logger_methods"):
+            torch._dynamo.config.ignore_logger_methods = tuple(ignored_logger_methods)
 
     return logger
 

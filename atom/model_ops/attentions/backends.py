@@ -3,7 +3,8 @@
 
 import logging
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, Dict, Generic, Optional, Type, TypeVar
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Any, Generic, Optional, TypeVar
 
 if TYPE_CHECKING:
     from atom.kv_transfer.disaggregation.types import KVTransferTensors
@@ -11,17 +12,27 @@ if TYPE_CHECKING:
 import numpy as np
 import torch
 from aiter.dist.parallel_state import get_tp_group
+from torch import nn
+
+from atom.config import DCPConfig
+from atom.distributed.dcp_utils import get_dcp_rank, get_dcp_world_size
+from atom.model_engine.page_unit_checkpoint import (
+    CheckpointRestoreOp,
+    CheckpointStoreOp,
+)
 from atom.model_engine.scheduler import ScheduledBatch
+from atom.model_engine.state_runtime import StateTransfer
 from atom.model_ops.attention_mla import MLAModules
+from atom.model_ops.attentions.sub_pool_spec import SubPoolSpec
+from atom.model_ops.dcp_ops import dcp_local_index, dcp_owner_rank
 from atom.utils import CpuGpuBuffer
+from atom.utils.forward_context import AttentionMetaData, AttnState
 from atom.utils.tbo.ubatch_splitting import (
     UBatchSlice,
     attach_tbo_cpu_lens,
     split_attn_metadata,
 )
 from atom.utils.tbo.ubatching import tbo_enabled
-from atom.utils.forward_context import AttentionMetaData, AttnState
-from torch import nn
 
 logger = logging.getLogger("atom")
 T = TypeVar("T", bound="BroadcastableModelInput")
@@ -30,7 +41,7 @@ T = TypeVar("T", bound="BroadcastableModelInput")
 class BroadcastableModelInput(ABC):
 
     @abstractmethod
-    def as_broadcastable_tensor_dict(self) -> Dict[str, Any]:
+    def as_broadcastable_tensor_dict(self) -> dict[str, Any]:
         """
         Extract broadcastable fields. Override for fields that require some
         custom deserialization.
@@ -40,8 +51,8 @@ class BroadcastableModelInput(ABC):
     @classmethod
     @abstractmethod
     def from_broadcasted_tensor_dict(
-        cls: Type[T],
-        tensor_dict: Dict[str, Any],
+        cls: type[T],
+        tensor_dict: dict[str, Any],
         attn_backend: Optional["AttentionBackend"] = None,
     ) -> T:
         """
@@ -66,11 +77,11 @@ class AttentionBackend(ABC):
 
     @staticmethod
     @abstractmethod
-    def get_builder_cls() -> Type["AttentionMetadataBuilder"]:
+    def get_builder_cls() -> type["AttentionMetadataBuilder"]:
         raise NotImplementedError
 
     @staticmethod
-    def get_impl_cls() -> Type["AttentionImpl"]:
+    def get_impl_cls() -> type["AttentionImpl"]:
         return AttentionImpl
 
 
@@ -99,49 +110,83 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         raise NotImplementedError
 
     # ------------------------------------------------------------------ #
-    # Per-request cache (model-managed state outside the paged KV pool). #
+    # Cache sizing — one byte currency for every cache class.             #
     # ------------------------------------------------------------------ #
-    # Used by attention types that maintain per-request stateful buffers
-    # which do not fit the paged KV cache model — e.g. GDN recurrent state,
-    # DeepseekV4 ring buffer + compressor state. ModelRunner queries these
-    # methods at startup to size the per-request slot pool, deduct its
-    # bytes from the KV pool budget, and allocate the underlying tensors.
-    #
-    # Stateless attentions (standard MHA / MLA) leave the defaults:
-    # `compute_per_req_cache_bytes()` returns 0, `allocate_per_req_cache()`
-    # returns an empty dict, so no per-req pool is allocated.
 
-    def compute_per_req_cache_bytes(self) -> int:
-        """Total bytes (across all attention layers) for ONE request's
-        per-request cache.
+    def sub_pool_specs(self) -> list[SubPoolSpec]:
+        """Every cache class this attention type needs, expressed in bytes.
 
-        ModelRunner multiplies this by `max_num_seqs * slots_per_req()` to
-        size the per-req cache tensors and deduct that memory from the KV
-        pool budget.
+        One `SubPoolSpec` per class: paged token KV, a window-freed SWA pool,
+        a per-request recurrent/compressor state pool. ModelRunner feeds the
+        list to `plan_pools` to turn a byte budget into entry counts, so the
+        runner never needs to know which architecture it is sizing.
+
+        Specs sharing a `name` are one sub-pool — their `entry_bytes` sum and
+        they share an entry index space. That is how a heterogeneous Eagle3
+        draft KV pool rides the target model's block ids.
+
+        Default is empty: a builder that owns no cache (e.g. a draft builder
+        with no KV of its own) contributes nothing to the budget.
         """
-        return 0
+        return []
 
-    def slots_per_req(self) -> int:
-        """Number of contiguous slot indices one request occupies.
+    def allocate_per_req_cache(self, entries: dict[str, int]) -> dict[str, object]:
+        """Allocate this backend's per-request state.
 
-        Default = 1 (single committed state, no speculative lookahead).
-        GDN-style attentions override with `1 + model_runner.num_spec_tokens`
-        because their state-update kernel reserves one extra slot per
-        speculated token for rollback on rejection. Override only if the
-        attention has a different lookahead layout.
-        """
-        return 1
-
-    def allocate_per_req_cache(self, num_slots: int) -> dict[str, "torch.Tensor"]:
-        """Allocate per-request cache tensors.
-
-        Called by ModelRunner.allocate_kv_cache() once `num_slots` is known.
-        Builder returns a dict mapping attribute name → tensor; ModelRunner
-        does `setattr(self, name, tensor)` so model layers can access them
-        as `model_runner.<name>` (preserving existing names like
-        `mamba_k_cache` / `mamba_v_cache`).
+        Called by ModelRunner.allocate_kv_cache() with the entry count sizing
+        assigned to every cache class. The builder indexes the classes it
+        declared in `sub_pool_specs` — the runner does not know their names.
+        Returns a dict mapping attribute name → value; ModelRunner does
+        `setattr(self, name, value)` so model layers can reach them as
+        `model_runner.<name>` (preserving existing names like `mamba_k_cache`).
+        Values are usually tensors, but a backend may also publish the object
+        that owns them — DeepSeek-V4 publishes its `StateArena` alongside the
+        per-layer views so the PD path can address a whole entry.
         """
         return {}
+
+    def state_transfer(self) -> StateTransfer:
+        """Declare this backend's per-request state checkpoint capability."""
+        return StateTransfer.none()
+
+    def checkpoint_image_bytes(self) -> int | None:
+        """Bytes of an Active Slot a checkpoint image has to hold.
+
+        `None` means all of them: the safe answer, and the one a backend that
+        has not worked out which of its bytes a resumer skips should keep
+        giving. A backend returns less only when it can name bytes no resumer
+        reads — for a ring whose next reader starts exactly at the checkpoint
+        boundary, that is the whole ring.
+        """
+        return None
+
+    def relocate_state_slots(self, pairs: Sequence[tuple[int, int]]) -> None:
+        """Move live state between contiguous Active Slots."""
+        raise NotImplementedError(
+            f"{type(self).__name__} owns per-request state but does not "
+            "implement relocate_state_slots"
+        )
+
+    def execute_paged_state_copies(
+        self,
+        store_ops: Sequence[CheckpointStoreOp],
+        restore_ops: Sequence[CheckpointRestoreOp],
+    ) -> None:
+        """Copy checkpoints between Active Slots and arbitrary PAGEs."""
+        if store_ops or restore_ops:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not implement PAGE-backed state copy"
+            )
+
+    def warmup_per_req_cache(self) -> None:
+        """Pay whatever the first checkpoint copy would pay, before serving.
+
+        Called once by ModelRunner after `allocate_per_req_cache`'s pools are
+        installed, which is the earliest a backend can reach its own addresses.
+        Nothing else warms this path: `execute_paged_state_copies` runs only
+        from `build()`, so a backend that compiles a kernel or fills a cache
+        there does it inside a live request's batch. A no-op by default.
+        """
 
     def get_kv_transfer_tensors(self) -> "KVTransferTensors | None":
         """Return RDMA transfer regions for PD disaggregation.
@@ -155,44 +200,6 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         not been allocated yet.
         """
         return None
-
-    def compute_block_bytes(self) -> int:
-        """Per-block bytes contributed by this attention type's primary KV
-        tensors (kv_cache + kv_scale + any side caches like the V3.2
-        indexer cache).
-
-        Mirror of `allocate_kv_cache_tensors`: used by ModelRunner
-        get_num_blocks() to size the unified pool BEFORE any tensor is
-        allocated, so the budget math sees the same per-block cost the
-        builder will actually allocate. Per-request cache bytes are NOT
-        included here — they're accounted for via
-        `compute_per_req_cache_bytes()`.
-
-        Default returns 0 (no primary KV pool).
-        """
-        return 0
-
-    # ------------------------------------------------------------------ #
-    # Paged sliding-window (SWA) pool — a separate, window-freed KV pool  #
-    # some attention types carve out of the main KV budget.              #
-    # ------------------------------------------------------------------ #
-    # ModelRunner queries these at startup to decide, model-agnostically,
-    # whether to reserve a `num_swa_blocks`-sized SWA pool and deduct its
-    # bytes from the main (compressed) KV pool. A builder that returns >0
-    # from `swa_pool_block_bytes()` opts into the pool; the default 0 means
-    # no separate SWA pool (standard attentions keep all KV in one pool).
-    # This keeps the arch-specific decision inside the builder, not in the
-    # runner.
-
-    def swa_pool_block_bytes(self) -> int:
-        """Bytes of ONE physical SWA-pool block across all attention layers,
-        or 0 (default) if this attention type has no separate paged-SWA pool."""
-        return 0
-
-    def swa_pool_num_blocks(self, max_num_seqs: int, max_model_len: int) -> int:
-        """Number of blocks to reserve for the paged-SWA pool, or 0 (default).
-        Only consulted when `swa_pool_block_bytes()` > 0."""
-        return 0
 
     def allocate_kv_cache_tensors(
         self, num_kv_heads: int, num_draft_layers: int
@@ -234,9 +241,9 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         `base_linear_attention` and delegates `base_attention` MHA modules
         to its `AiterAttentionMetadataBuilder` parent).
 
-        Default returns None for unknown module types.
+        Default: unknown module types get no tensor.
         """
-        return None
+        return
 
 
 class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
@@ -247,13 +254,12 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         self.device = model_runner.device
         config = model_runner.config
         hf_config = config.hf_config
-        self.dcp_world_size = getattr(config, "decode_context_parallel_size", 1)
-        if self.dcp_world_size > 1:
-            from aiter.dist.parallel_state import get_dcp_group
-
-            self.dcp_rank = get_dcp_group().rank_in_group
-        else:
-            self.dcp_rank = 0
+        self.dcp_world_size = get_dcp_world_size()
+        self.dcp_rank = get_dcp_rank()
+        # DCP KV-cache interleave granularity S (1 = token-level round-robin).
+        self.cp_kv_cache_interleave_size = getattr(
+            config, "dcp_config", DCPConfig()
+        ).interleave_size
         self.max_num_batched_tokens = model_runner.max_num_batched_tokens
         self.max_bs = model_runner.max_bs
         self.max_num_blocks_per_seq = (
@@ -299,20 +305,6 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         for i, block_table in enumerate(batch.block_tables):
             block_tables[i] = 0
             block_tables[i, : len(block_table)] = block_table
-        # paged-SWA: fill the parallel SWA block table in lockstep (decode
-        # path). -1 sentinels (window-freed) are copied verbatim but never
-        # indexed by the SWA kernels.
-        swa_buf = var.get("swa_block_tables")
-        swa_tables = getattr(batch, "swa_block_tables", None)
-        if swa_buf is not None and swa_tables is not None:
-            swa_np = swa_buf.np
-            for i, swa_table in enumerate(swa_tables):
-                swa_np[i] = 0
-                if len(swa_table):
-                    # Clamp window-freed sentinels (-1) to 0: those blocks are
-                    # out of window and never indexed by the SWA kernels, but a
-                    # raw -1 phys would compute a negative paged offset → OOB.
-                    swa_np[i, : len(swa_table)] = [max(0, b) for b in swa_table]
 
     def _mrope_cpu_view(self, num_tokens: int) -> np.ndarray:
         return (
@@ -409,12 +401,17 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             block_table = batch.block_tables[i]
             block_size = self.model_runner.block_size
             if self.dcp_world_size > 1:
-                virtual_block_size = block_size * self.dcp_world_size
+                W = self.dcp_world_size
+                S = self.cp_kv_cache_interleave_size
+                virtual_block_size = block_size * W
                 for pos in range(cached_seqlen, seqlen):
-                    vb_offset = pos % virtual_block_size
-                    if vb_offset % self.dcp_world_size == self.dcp_rank:
+                    # Block-level interleave: token pos is owned by rank
+                    # (pos//S)%W at local index (pos//(S*W))*S + pos%S. S=1 is the
+                    # original round-robin. blk_idx = pos // (block_size*W) equals
+                    # local_index // block_size (needs block_size % S == 0).
+                    if dcp_owner_rank(pos, W, S) == self.dcp_rank:
                         blk_idx = pos // virtual_block_size
-                        local_offset = vb_offset // self.dcp_world_size
+                        local_offset = dcp_local_index(pos, W, S) % block_size
                         slot_mapping.append(
                             block_table[blk_idx] * block_size + local_offset
                         )
@@ -530,6 +527,14 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         )
 
     def build(self, batch: ScheduledBatch, bs: int):
+        # Run state maintenance on the compute stream before the forward.
+        state_ops = batch.state_maintenance_ops
+        if state_ops.relocations:
+            self.relocate_state_slots(state_ops.relocations)
+        if state_ops.checkpoint_stores or state_ops.checkpoint_restores:
+            self.execute_paged_state_copies(
+                state_ops.checkpoint_stores, state_ops.checkpoint_restores
+            )
         is_prefill = batch.total_tokens_num_prefill > 0
         if is_prefill:
             return self.prepare_prefill(batch)
@@ -544,7 +549,7 @@ class AttentionImpl(nn.Module):
         num_heads: int,
         head_size: int,
         scale: float,
-        num_kv_heads: Optional[int] = None,
+        num_kv_heads: int | None = None,
         kv_cache_dtype: str = "auto",
         layer_num: int = 0,
         mla_modules: MLAModules = None,

@@ -51,16 +51,14 @@ from `unified_kv` (Main) or the FP8 indexer pool, not from the kernel
 return).
 """
 
-from typing import Optional
-
 import torch
 import triton
 import triton.language as tl
 
-from atom.utils.decorators import mark_trace
-
 from atom.model_ops.v4_kernels.compress_plan import CompressPlan
+from atom.model_ops.v4_kernels.pool_index import row_offset
 from atom.utils import envs
+from atom.utils.decorators import mark_trace
 
 # Optional flydsl path (aiter ROCm kernels). Falls back to Triton when
 # unavailable. HCA = compress + norm_rope_scatter 2-kernel split for
@@ -192,8 +190,15 @@ def _fused_compress_attn_kernel(
 
         s_safe = tl.maximum(s, 0)
         ring = s_safe % STATE_SIZE
+        # 64 bits on the slot term: the compressor state sits at the front of
+        # a slot in the shared plane, so consecutive slots are a whole slot
+        # apart and the product runs the length of the pool — well past what a
+        # 32-bit multiply holds, and it wraps silently. `ring`, `col_off` and
+        # `d` stay inside one entry and need no widening.
         state_row_off = (
-            slot * kv_state_slot_stride + ring * kv_state_pos_stride + col_off
+            row_offset(slot, kv_state_slot_stride)
+            + ring * kv_state_pos_stride
+            + col_off
         )
         kv_b = tl.load(
             kv_state_ptr + state_row_off + d,
@@ -202,7 +207,7 @@ def _fused_compress_attn_kernel(
         )
         score_b = tl.load(
             score_state_ptr
-            + slot * score_state_slot_stride
+            + row_offset(slot, score_state_slot_stride)
             + ring * score_state_pos_stride
             + col_off
             + d,
@@ -389,10 +394,10 @@ def fused_compress_attn(
     cos_cache: torch.Tensor,  # [max_seq, ..., rope_head_dim/2] bf16/fp16
     sin_cache: torch.Tensor,  # same shape
     # KV cache scatter
-    kv_cache: Optional[
-        torch.Tensor
-    ],  # bf16: [NB, k_per_block, head_dim] / fp8: same shape, fp8
-    block_tables: Optional[torch.Tensor],  # [bs, max_blocks_per_seq] int32
+    kv_cache: (
+        torch.Tensor | None
+    ),  # bf16: [NB, k_per_block, head_dim] / fp8: same shape, fp8
+    block_tables: torch.Tensor | None,  # [bs, max_blocks_per_seq] int32
     k_per_block: int,
     # Geometry
     overlap: bool,
@@ -401,20 +406,19 @@ def fused_compress_attn(
     rope_head_dim: int,
     # FP8 quant fusion (Indexer-inner Compressor path)
     quant: bool = False,
-    cache_scale: Optional[
-        torch.Tensor
-    ] = None,  # fp32 [NB, k_per_block]; required when quant=True
+    cache_scale: (
+        torch.Tensor | None
+    ) = None,  # fp32 [NB, k_per_block] (FP8) / uint8 (FP4); required when quant
     use_ue8m0: bool = True,  # round scale to power-of-2 (UE8M0); only when quant=True
     preshuffle: bool = True,  # MFMA 16x16 preshuffled FP8 layout; only when quant=True
-    fp8_max: Optional[
-        float
-    ] = None,  # E4M3 max; required only on the quant (indexer_fp8) path
+    fp8_max: float | None = None,  # E4M3 max; required for FP8 quant
+    quant_mode: str | None = None,  # "none"|"fp8"|"fp4"; default from `quant`
     # V4-Main native fp8 2buff path (CSA/HCA Main under --kv_cache_dtype fp8).
     # Distinct from `quant` (Indexer-inner per-row preshuffle): writes per-64-tile
     # e8m0 nope-fp8 + inline dup-scale into `kv_cache` (fp8 [NB,k,512]) and bf16
     # rope into `kv_cache_rope` (bf16 [NB,k,64]) via the flydsl group_fp8 scatter.
     main_2buff_fp8: bool = False,
-    kv_cache_rope: Optional[torch.Tensor] = None,  # bf16 [NB,k_per_block,64]
+    kv_cache_rope: torch.Tensor | None = None,  # bf16 [NB,k_per_block,64]
     prefix: str = "",
 ) -> None:
     """Batched fused per-source-position pool + RMSNorm + RoPE + cache scatter,
@@ -444,6 +448,18 @@ def fused_compress_attn(
     num_compress = plan.num_compress
     if plan_capacity == 0:
         return  # nothing to do — no plan rows ever populated.
+
+    # Resolve quant mode (single source of truth). `quant_mode` is the unified
+    # selector; the legacy `quant` bool is only a fallback for callers that don't
+    # pass quant_mode ("fp8" if quant else "none").
+    _mode = quant_mode if quant_mode is not None else ("fp8" if quant else "none")
+    _fp4 = _mode == "fp4"
+    # `quant` = the Indexer-inner per-row fp8/fp4 scatter (needs cache_scale /
+    # fp8_max, takes the quant validation + Triton fallback path). Derive it from
+    # the mode so callers only pass quant_mode. CSA/HCA Main group_fp8 is NOT
+    # `quant` — its 2buff scatter is driven by `main_2buff_fp8` — and `none`/bf16
+    # is plain. (Back-compat: legacy quant=True → quant_mode None → _mode "fp8".)
+    quant = _mode in ("fp8", "per_row_fp8", "fp4")
 
     # ------------------------------------------------------------------
     # flydsl dispatch. Pure-GPU time on V4-Pro beats Triton 0.9x→2.9x
@@ -526,10 +542,20 @@ def fused_compress_attn(
             cache_scale=cache_scale,
             use_ue8m0=use_ue8m0,
             preshuffle=preshuffle and not main_2buff_fp8,
-            quant_mode="group_fp8" if main_2buff_fp8 else "per_row_fp8",
+            quant_mode="group_fp8" if main_2buff_fp8 else _mode,
             k_rope_cache=kv_cache_rope if main_2buff_fp8 else None,
         )
         return
+
+    if _fp4:
+        # FP4 indexer scatter only exists in the flydsl kernel — the Triton
+        # fallback below has no FP4 path. Reaching here means flydsl is
+        # unavailable or the shape is unsupported.
+        raise RuntimeError(
+            "quant_mode='fp4' requires the flydsl fused_compress_attn kernel "
+            f"(available={flydsl_fused_compress_attn is not None}, "
+            f"shape_ok={_flydsl_shape_ok}, mode={_flydsl_mode})."
+        )
 
     # Validate shapes
     dim_full = (2 if overlap else 1) * head_dim
@@ -566,7 +592,11 @@ def fused_compress_attn(
     # fused wkv_gate output). Inner column stride must be 1 — kernel uses
     # `+ d` for the BLOCK_D offset.
     assert kv_in.stride(-1) == 1 and score_in.stride(-1) == 1
-    assert kv_state.is_contiguous() and score_state.is_contiguous()
+    # State slot / ring strides are passed to the kernel, so the states may be
+    # strided views — they are slices of a per-request arena where the slot
+    # stride is the whole entry, not this field alone. Only the innermost dim
+    # has to be unit stride: the kernel addresses it as `col_off + d`.
+    assert kv_state.stride(-1) == 1 and score_state.stride(-1) == 1
     assert ape.is_contiguous() and rms_weight.is_contiguous()
     has_bt = block_tables is not None
     if has_bt:
@@ -672,15 +702,15 @@ def fused_compress_attn_reference(
     rms_eps: float,
     cos_cache: torch.Tensor,
     sin_cache: torch.Tensor,
-    kv_cache: Optional[torch.Tensor],
-    block_tables: Optional[torch.Tensor],
+    kv_cache: torch.Tensor | None,
+    block_tables: torch.Tensor | None,
     k_per_block: int,
     overlap: bool,
     ratio: int,
     head_dim: int,
     rope_head_dim: int,
     out_dtype: torch.dtype = torch.bfloat16,
-) -> Optional[torch.Tensor]:
+) -> torch.Tensor | None:
     """Pure-PyTorch reference equivalent of `fused_compress_attn` (plan path).
 
     Returns `[num_compress, head_dim]` BF16 in plan order. None if num_compress=0.

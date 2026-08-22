@@ -8,9 +8,9 @@ position confidence scores for a batch of draft blocks and an engine throughput
 profile ``SPS(B)``, choose a per-request verification length ``ell_r`` that
 maximizes system-wide token throughput ``Theta = tau * SPS(B)``.
 
-Pure, GPU-free, CPU-testable. The proposer (``atom/spec_decode/eagle.py``) calls
-``schedule_prefix_lengths`` after computing (and STS-calibrating) confidence, and
-truncates each draft block to ``ell_r`` before verification.
+Pure, GPU-free, CPU-testable. ``DSparkProposer`` (``dspark_proposer.py``) and
+ModelRunner call ``schedule_prefix_lengths`` after computing (and STS-calibrating)
+confidence, and truncate each draft block to ``ell_r`` before verification.
 
 Phase-2 scope:
   * ``calibrate_confidence`` — Sequential Temperature Scaling (STS) apply-side.
@@ -280,6 +280,27 @@ def schedule_prefix_lengths_tensor(
     return ell
 
 
+def ragged_verify_len(
+    ell: int | None, full_q: int, max_num_bonus: int, scheduled_len: int
+) -> int | None:
+    """Per-request RAGGED verify length (paper §5.2 avoid-padding), or None when
+    no length is representable and the caller must stay rectangular.
+    """
+    lo = max(max_num_bonus + 1, 1)
+    if 0 < scheduled_len < lo:
+        return None  # bounds cross -> no representable ragged length
+
+    ell_i = full_q - 1 if ell is None else int(ell)
+    li = max(ell_i, max_num_bonus) + 1
+    if li < lo:
+        li = lo
+    elif li > full_q:
+        li = full_q
+    if 0 < scheduled_len < li:
+        li = scheduled_len
+    return li
+
+
 def resolve_q_buckets(spec: str, max_q: int) -> list[int]:
     """Parse the DSpark CUDA-graph query-length buckets (plan Y, §17.1).
 
@@ -305,6 +326,32 @@ def resolve_q_buckets(spec: str, max_q: int) -> list[int]:
             out.add(v)
     out.add(max_q)  # always keep the full bucket as fallback
     return sorted(out)
+
+
+def flat_bucket_fits(total_tokens: int, q: int, buckets) -> bool:
+    """Can a captured flat num_tokens bucket hold ``total_tokens`` at per-seq
+    bound ``q``?
+
+    The predicate ``ModelRunner._dynamic_num_tokens_pad`` searches with, split
+    out so the ragged shrink can ask it BEFORE rewriting the batch. When no
+    bucket matches, that lookup returns None and every caller falls back to
+    ``bs * max_seqlen_q`` -- a replay over MORE tokens than the ragged rebuild
+    populated, whose tail still holds the previous step's ids. Those reach the
+    draft's Markov transition-table lookup as out-of-range indices: a
+    device-side trap attributed to whatever kernel was in flight, nowhere near
+    the shrink that caused it.
+
+    Args:
+        total_tokens: real flat token total the step would carry.
+        q: per-seq length bound (``num_spec_query_tokens``). Non-positive never
+            matches -- it would make the divisibility test meaningless.
+        buckets: captured flat num_tokens buckets. Empty/None means no flat
+            bucket set exists (FULL rather than PIECEWISE cudagraphs, or
+            pre-warmup), so no ragged shrink is representable.
+    """
+    if q <= 0 or not buckets:
+        return False
+    return any(b >= total_tokens and b % q == 0 for b in buckets)
 
 
 def quantize_to_bucket(q: int, buckets: list[int]) -> int:

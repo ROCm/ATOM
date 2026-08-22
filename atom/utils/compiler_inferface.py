@@ -12,11 +12,65 @@ from unittest.mock import patch
 
 import torch
 import torch._inductor.compile_fx
-import torch.fx as fx
+from torch import fx
+
 from atom.config import Config
 from atom.utils import compilation_counter, is_torch_equal_or_newer
 
 logger = logging.getLogger("atom")
+_non_saveable_artifact_warning_emitted = False
+
+
+def _log_non_saveable_artifact(key: str, reason: str) -> None:
+    """Warn once per process, then keep per-subgraph details at debug level."""
+    global _non_saveable_artifact_warning_emitted
+    log = logger.debug if _non_saveable_artifact_warning_emitted else logger.warning
+    log("Skipping standalone compiled graph save for %s: %s", key, reason)
+    _non_saveable_artifact_warning_emitted = True
+
+
+def _save_standalone_compiled_graph(
+    compiled_graph: Any, path: str, key: str
+) -> tuple[str, str] | None:
+    """Persist a Torch standalone artifact when the graph is serializable.
+
+    Torch 2.13 exposes ``CompiledArtifact.is_saveable()`` and raises a
+    ``RuntimeError`` (rather than the older ``AssertionError``) when an
+    Inductor graph has no AOT Autograd artifact. The compiled callable is still
+    valid in memory, so a cache miss must not abort model startup.
+    """
+    is_saveable = getattr(compiled_graph, "is_saveable", None)
+    if callable(is_saveable) and not is_saveable():
+        _log_non_saveable_artifact(key, "PyTorch did not emit a serializable artifact")
+        return None
+
+    try:
+        compiled_graph.save(path=path, format="unpacked")
+    except AssertionError:
+        _log_non_saveable_artifact(
+            key, "PyTorch did not emit a complete unpacked artifact"
+        )
+        return None
+    except RuntimeError as exc:
+        if "CompiledArtifact.save failed to save" not in str(exc):
+            raise
+        _log_non_saveable_artifact(key, str(exc))
+        return None
+
+    compilation_counter.num_compiled_artifacts_saved += 1
+    return key, path
+
+
+def _extend_metadata_with_cluster_dims(md):
+    """Return ``md`` with a no-op ``cluster_dims=(1, 1, 1)`` appended if it's a
+    namedtuple missing that field (AMD has no thread-block clusters); else ``md``
+    unchanged."""
+    if md is not None and hasattr(md, "_fields") and not hasattr(md, "cluster_dims"):
+        from collections import namedtuple
+
+        extended = namedtuple("KernelMetadata", list(md._fields) + ["cluster_dims"])
+        return extended(*md, (1, 1, 1))
+    return md
 
 
 def _patch_triton_cluster_dims_for_rocm() -> None:
@@ -31,32 +85,69 @@ def _patch_triton_cluster_dims_for_rocm() -> None:
     patching ``triton.autotune_at_compile_time=True`` -- crashes on AMD with
     ``AttributeError: 'KernelMetadata' object has no attribute 'cluster_dims'``.
 
-    Inject a no-op ``cluster_dims=(1, 1, 1)`` (single cluster == AMD's only mode)
-    when the field is absent, so the launcher's ``cta_args`` computation succeeds.
-    No-op on CUDA, where the field already exists. Idempotent.
+    Two entry paths create the metadata, and BOTH must be patched:
+
+    1. **Same-process compile** (``compile_threads==1``): the kernel is built by
+       ``CompiledKernel.__init__`` in this process -- patch ``__init__`` to inject
+       the field.
+    2. **Subprocess compile** (default ``compile_threads>1``): the kernel is
+       compiled in an ``async_compile`` worker (which never imports atom, so the
+       ``__init__`` patch is absent there), pickled back, and rebuilt in this
+       process by ``TritonCompileResult.__setstate__`` via
+       ``CompiledKernel.__new__`` (bypassing ``__init__`` entirely) +
+       ``_deserialize_metadata`` (which reconstructs the namedtuple from the
+       worker's field dict, still without ``cluster_dims``). Patch
+       ``__setstate__`` to inject the field into the rebuilt ``.metadata``.
+
+    Injecting a no-op ``cluster_dims=(1, 1, 1)`` (single cluster == AMD's only
+    mode) lets the launcher's ``cta_args`` computation succeed. No-op on CUDA,
+    where the field already exists. Idempotent.
     """
     if getattr(torch.version, "hip", None) is None:
         return
+
+    # Path 1: same-process CompiledKernel.__init__.
     try:
         import triton.compiler.compiler as _tcc
-    except Exception:
-        return
-    if getattr(_tcc.CompiledKernel, "_atom_cluster_dims_patched", False):
-        return
+    except ImportError:
+        _tcc = None
+    if _tcc is not None and not getattr(
+        _tcc.CompiledKernel, "_atom_cluster_dims_patched", False
+    ):
+        _orig_init = _tcc.CompiledKernel.__init__
 
-    _orig_init = _tcc.CompiledKernel.__init__
+        def _init(self, *args, **kwargs):
+            _orig_init(self, *args, **kwargs)
+            self.metadata = _extend_metadata_with_cluster_dims(
+                getattr(self, "metadata", None)
+            )
 
-    def _init(self, *args, **kwargs):
-        _orig_init(self, *args, **kwargs)
-        md = getattr(self, "metadata", None)
-        if md is not None and not hasattr(md, "cluster_dims"):
-            from collections import namedtuple
+        _tcc.CompiledKernel.__init__ = _init
+        _tcc.CompiledKernel._atom_cluster_dims_patched = True
 
-            extended = namedtuple("KernelMetadata", list(md._fields) + ["cluster_dims"])
-            self.metadata = extended(*md, (1, 1, 1))
+    # Path 2: subprocess-compiled kernels rebuilt via pickle (the default,
+    # compile_threads>1 path -- this is what --cudagraph-mode PIECEWISE without
+    # --level 0 hits during Inductor autotune).
+    try:
+        from torch._inductor.runtime.triton_heuristics import TritonCompileResult
+    except ImportError:
+        TritonCompileResult = None
+    if TritonCompileResult is not None and not getattr(
+        TritonCompileResult, "_atom_cluster_dims_patched", False
+    ):
+        _orig_setstate = TritonCompileResult.__setstate__
 
-    _tcc.CompiledKernel.__init__ = _init
-    _tcc.CompiledKernel._atom_cluster_dims_patched = True
+        def _setstate(self, state):
+            _orig_setstate(self, state)
+            # Only fix .metadata (read by make_launcher's cta_args); leave
+            # packed_metadata untouched -- triton's C launch expects its exact
+            # packed layout, so appending a field there would corrupt it.
+            self.kernel.metadata = _extend_metadata_with_cluster_dims(
+                getattr(self.kernel, "metadata", None)
+            )
+
+        TritonCompileResult.__setstate__ = _setstate
+        TritonCompileResult._atom_cluster_dims_patched = True
 
 
 _patch_triton_cluster_dims_for_rocm()
@@ -621,17 +712,7 @@ class InductorStandaloneAdaptor(CompilerInterface):
         # Save the compiled artifact to disk in the specified path
         assert key is not None
         path = os.path.join(self.cache_dir, key)
-        handle = None
-        try:
-            compiled_graph.save(path=path, format="unpacked")
-            compilation_counter.num_compiled_artifacts_saved += 1
-            handle = (key, path)
-        except AssertionError:
-            logger.warning(
-                "Skipping standalone compiled graph save for %s because "
-                "PyTorch did not emit a complete unpacked artifact.",
-                key,
-            )
+        handle = _save_standalone_compiled_graph(compiled_graph, path, key)
 
         # Post-process generated wrapper Python files: wrap regions between
         # <prefix>_start / <prefix>_end graph markers with record_function("<prefix>").

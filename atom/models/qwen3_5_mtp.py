@@ -5,8 +5,9 @@
 import re
 
 import torch
-import torch.nn as nn
 from aiter.dist.parallel_state import get_tp_group
+from torch import nn
+
 from atom.config import Config
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.linear import ColumnParallelLinear
@@ -17,6 +18,7 @@ from atom.models.qwen3_5 import (
     get_qwen3_5_text_config,
 )
 from atom.models.utils import IntermediateTensors
+
 from .utils import maybe_prefix
 
 
@@ -195,7 +197,21 @@ class Qwen3_5MTP(nn.Module):
     ) -> torch.Tensor | None:
         return self.lm_head(hidden_states)
 
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:  # noqa: D401
+    def compute_draft_ids(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        """Greedy draft token ids via distributed argmax — each rank reduces its
+        own vocab shard and only [N, 2] is all-gathered, instead of the full
+        [N, vocab] that compute_logits() would gather. Token-identical to
+        compute_logits(...).argmax(-1): the draft path never hits the LM head's
+        prefill last-token slice (is_draft is set for the whole propose loop),
+        so both see the same rows.
+        """
+        return self.lm_head.compute_argmax_token(hidden_states)
+
+    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
         return FusedMoE.make_expert_params_mapping(

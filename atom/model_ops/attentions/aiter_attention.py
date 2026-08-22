@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
-from typing import Type
 
 import aiter
 import numpy as np
@@ -10,17 +9,19 @@ import torch
 import triton
 import triton.language as tl
 from aiter.dist.parallel_state import get_tp_group
+
 from atom.model_engine.scheduler import ScheduledBatch
+from atom.model_ops.attention_mha import PagedAttentionImpl, use_pa_decode_bf16_asm
 from atom.utils import CpuGpuBuffer, envs
 from atom.utils.block_convert import (
     block_table_convert_triton,
     kv_indices_generate_triton,
 )
-from atom.model_ops.attention_mha import PagedAttentionImpl, use_pa_decode_bf16_asm
 from atom.utils.forward_context import AttentionMetaData, Context, get_forward_context
 from atom.utils.tbo import TokenSplitPrefillState
 
 from .backends import AttentionBackend, CommonAttentionBuilder
+from .sub_pool_spec import SubPoolSpec, page_pool
 
 logger = logging.getLogger("atom")
 
@@ -109,7 +110,7 @@ class AiterBackend(AttentionBackend):
         return "ATOM_ATTENTION"
 
     @staticmethod
-    def get_builder_cls() -> Type["AiterAttentionMetadataBuilder"]:
+    def get_builder_cls() -> type["AiterAttentionMetadataBuilder"]:
         return AiterAttentionMetadataBuilder
 
     @staticmethod
@@ -405,8 +406,8 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             "reduce_partial_map": reduce_partial_map,
         }
 
-    def compute_block_bytes(self) -> int:
-        """Standard split-K/V MHA per-block bytes.
+    def sub_pool_specs(self) -> list[SubPoolSpec]:
+        """One paged KV pool. Per-block bytes:
 
         - Standard models: `[2, num_hidden_layers, blocks, block_size,
           num_kv_heads, head_dim]` for kv_cache + matching kv_scale (fp32).
@@ -469,12 +470,12 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 * runner.physical_block_size
                 * 4  # float32 kv_scale
             )
-            return block_bytes
+            return [page_pool(block_bytes)]
 
         # Standard MHA path.
         block_bytes = (
             2
-            * hf_config.num_hidden_layers
+            * total_num_layers
             * runner.block_size
             * num_kv_heads
             * hf_config.head_dim
@@ -482,7 +483,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         )
         block_bytes += (
             2
-            * hf_config.num_hidden_layers
+            * total_num_layers
             * num_kv_heads
             * runner.physical_block_size
             * 4  # float32 kv_scale
@@ -500,7 +501,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 * index_dim
                 * torch.empty((), dtype=index_cache_dtype).element_size()
             )
-        return block_bytes
+        return [page_pool(block_bytes)]
 
     def allocate_kv_cache_tensors(
         self, num_kv_heads: int, num_draft_layers: int
@@ -528,10 +529,11 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 "_kv_layer_cache_store": [],
             }
 
+        total_num_layers = runner._get_total_num_layers()
         tensors = {
             "kv_cache": torch.zeros(
                 2,
-                hf_config.num_hidden_layers,
+                total_num_layers,
                 runner.num_physical_kvcache_blocks,
                 runner.physical_block_size,
                 num_kv_heads,
@@ -541,7 +543,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             ),
             "kv_scale": torch.zeros(
                 2,
-                hf_config.num_hidden_layers,
+                total_num_layers,
                 runner.num_physical_kvcache_blocks,
                 num_kv_heads,
                 runner.physical_block_size,
@@ -581,8 +583,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         an MHA attention this builder owns. Side effects: sets module
         `k_cache`, `v_cache`, `k_scale`, `v_scale`, `max_model_len`.
         """
-        from atom.config import KVCacheTensor
         from aiter import dtypes
+
+        from atom.config import KVCacheTensor
 
         if _is_indexed_sparse_attention(module):
             # MiniMax-M3 sparse attention. The KV cache uses the SAME allocation
@@ -853,6 +856,19 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
     def prepare_prefill(self, batch: ScheduledBatch):
         attn_metadata, positions = CommonAttentionBuilder.prepare_prefill(self, batch)
         if self._has_sparse_attention and not attn_metadata.has_cached:
+            bs = batch.total_seqs_num_prefill
+            self.prepare_block_tables(batch)
+            attn_metadata.block_tables = self.model_runner.forward_vars[
+                "block_tables"
+            ].copy_to_gpu(bs)
+        # `prefill_attention_triton` reads the paged KV cache, so it needs a
+        # block_table even with no cached tokens. The base builder only uploads
+        # one when `has_cached`.
+        if (
+            attn_metadata.block_tables is None
+            and envs.ATOM_USE_UNIFIED_ATTN
+            and batch.block_tables
+        ):
             bs = batch.total_seqs_num_prefill
             self.prepare_block_tables(batch)
             attn_metadata.block_tables = self.model_runner.forward_vars[

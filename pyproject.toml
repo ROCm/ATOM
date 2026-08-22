@@ -10,7 +10,7 @@ readme = "README.md"
 description = "a lightweight vLLM implementation built from scratch"
 requires-python = ">=3.10"
 dynamic = ["version"]
-dependencies = ["pybind11", "transformers==5.12.1", "zmq", "msgspec", "xxhash", "fastapi>=0.115,<0.137", "psutil", "protobuf", "uvicorn", "uvloop", "aiohttp", "datasets", "openpyxl", "tqdm", "setproctitle"]
+dependencies = ["pybind11", "transformers==5.12.1", "zmq", "msgspec", "xxhash", "fastapi>=0.115,<0.137", "psutil", "prometheus_client>=0.25,<0.26", "protobuf", "uvicorn", "uvloop", "aiohttp", "datasets", "openpyxl", "tqdm", "setproctitle"]
 
 [project.urls]
 Homepage = "https://github.com/ROCm/ATOM"
@@ -42,3 +42,6 @@ atom = "atom.plugin.vllm.register:register_platform"
 
 [project.entry-points."vllm.general_plugins"]
 atom_model_registry = "atom.plugin.vllm.register:register_model"
+
+[project.entry-points."sglang.srt.plugins"]
+atom_sglang = "atom.plugin.sglang.register:register_plugin"

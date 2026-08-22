@@ -3,13 +3,10 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
 from collections.abc import Iterable
-from typing import Any, Optional
+from typing import Any
 
 import torch
-from torch import nn
-
 from aiter.dist.parallel_state import get_pp_group as _aiter_pp_group
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig as SGLangQuantizationConfig,
@@ -20,8 +17,11 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.models.qwen3_5 import (
     Qwen3_5ForConditionalGeneration as _SglQwen35VL,
+)
+from sglang.srt.models.qwen3_5 import (
     Qwen3_5MoeForConditionalGeneration as _SglQwen35MoeVL,
 )
+from torch import nn
 
 from atom.model_loader.loader import WeightsMapper
 from atom.models.qwen3_5 import (
@@ -39,6 +39,8 @@ from atom.plugin.sglang.attention_backend.attention_gdn import (
 )
 from atom.plugin.sglang.runtime import (
     SGLangForwardBatchMetadata,
+    SGLangPluginRuntime,
+    plugin_runtime_scope,
 )
 
 _PACKED_MODULES_MAPPING = {
@@ -133,13 +135,17 @@ def apply_prepare_model_adaptations(atom_config: Any, model_arch: str) -> None:
 
 def _forward_qwen35_decoder_stack(
     decoder_stack: Qwen3_5Model,
-    input_ids: Optional[torch.Tensor],
+    input_ids: torch.Tensor | None,
     positions: torch.Tensor,
     intermediate_tensors: IntermediateTensors | None = None,
-    inputs_embeds: Optional[torch.Tensor] = None,
-    input_deepstack_embeds: Optional[torch.Tensor] = None,
-) -> torch.Tensor | IntermediateTensors:
-    if input_deepstack_embeds is None or input_deepstack_embeds.numel() == 0:
+    inputs_embeds: torch.Tensor | None = None,
+    input_deepstack_embeds: torch.Tensor | None = None,
+    dflash_capture_points: tuple[int, ...] = (),
+) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+    has_deepstack = (
+        input_deepstack_embeds is not None and input_deepstack_embeds.numel() > 0
+    )
+    if not has_deepstack and not dflash_capture_points:
         return decoder_stack(
             input_ids,
             positions,
@@ -159,16 +165,21 @@ def _forward_qwen35_decoder_stack(
         residual = intermediate_tensors["residual"]
 
     hs = decoder_stack.config.hidden_size
+    capture_points = set(dflash_capture_points)
+    aux_hidden_states: list[torch.Tensor] = []
     for local_i, layer in enumerate(
         decoder_stack.layers[decoder_stack.start_layer : decoder_stack.end_layer]
     ):
-        hidden_states, residual = layer(positions, hidden_states, residual)
         layer_num = decoder_stack.start_layer + local_i
-        if (
-            input_deepstack_embeds is not None
-            and input_deepstack_embeds.numel() > 0
-            and layer_num < 3
-        ):
+        if layer_num in capture_points:
+            # SGLang captures the previous layer's post-residual stream at the
+            # next layer entrance. Clone because ATOM fused norms may update the
+            # residual buffer in place during this layer.
+            captured = hidden_states if residual is None else hidden_states + residual
+            aux_hidden_states.append(captured.clone())
+
+        hidden_states, residual = layer(positions, hidden_states, residual)
+        if has_deepstack and layer_num < 3:
             sep = hs * layer_num
             hidden_states.add_(input_deepstack_embeds[:, sep : sep + hs])
 
@@ -177,6 +188,8 @@ def _forward_qwen35_decoder_stack(
             {"hidden_states": hidden_states, "residual": residual}
         )
     hidden_states, _ = decoder_stack.norm(hidden_states, residual)
+    if aux_hidden_states:
+        return hidden_states, aux_hidden_states
     return hidden_states
 
 
@@ -198,7 +211,7 @@ def _get_qwen35_language_model_stack_cls(
         def __init__(
             self,
             config: Any,
-            quant_config: Optional[SGLangQuantizationConfig] = None,
+            quant_config: SGLangQuantizationConfig | None = None,
             prefix: str = "",
         ) -> None:
             del prefix
@@ -220,6 +233,7 @@ def _get_qwen35_language_model_stack_cls(
             self.make_empty_intermediate_tensors = (
                 atom_lm.make_empty_intermediate_tensors
             )
+            self.dflash_capture_points: tuple[int, ...] = ()
             # Keep a strong reference to the full ATOM LM without registering it
             # as another submodule tree, so parameter names still flow through
             # the SGLang wrapper's expected `model.*` / `lm_head.*` prefixes.
@@ -254,7 +268,7 @@ def _get_qwen35_language_model_stack_cls(
             return self._atom_lm.lm_head
 
         def get_input_embeddings(
-            self, input_ids: Optional[torch.Tensor] = None
+            self, input_ids: torch.Tensor | None = None
         ) -> torch.Tensor | nn.Module:
             if input_ids is None:
                 return self.model.embed_tokens
@@ -263,50 +277,93 @@ def _get_qwen35_language_model_stack_cls(
         def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
             return self.model.embed_input_ids(input_ids)
 
+        def set_dflash_layers_to_capture(self, layers_to_capture: list[int]) -> None:
+            pp_group = _aiter_pp_group()
+            if getattr(pp_group, "world_size", 1) != 1:
+                raise ValueError("ATOM Qwen3.5 DFLASH currently requires PP1.")
+            if bool(getattr(self.atom_config, "enable_dp_attention", False)):
+                raise ValueError(
+                    "ATOM Qwen3.5 DFLASH currently does not support DP attention."
+                )
+
+            capture_points = tuple(int(layer) for layer in layers_to_capture)
+            if tuple(sorted(set(capture_points))) != capture_points:
+                raise ValueError(
+                    "DFLASH capture points must be sorted and unique, "
+                    f"got {capture_points}."
+                )
+            if any(
+                layer < self.start_layer or layer >= self.end_layer
+                for layer in capture_points
+            ):
+                raise ValueError(
+                    "DFLASH capture point is outside the local decoder stack: "
+                    f"points={capture_points}, range=[{self.start_layer}, {self.end_layer})."
+                )
+            self.dflash_capture_points = capture_points
+
         def forward(
             self,
-            input_ids: Optional[torch.Tensor],
+            input_ids: torch.Tensor | None,
             positions: torch.Tensor,
             intermediate_tensors: IntermediateTensors | None = None,
-            inputs_embeds: Optional[torch.Tensor] = None,
-            forward_batch: Optional[ForwardBatch] = None,
-            input_embeds: Optional[torch.Tensor] = None,
-            pp_proxy_tensors: Optional[PPProxyTensors] = None,
-            input_deepstack_embeds: Optional[torch.Tensor] = None,
+            inputs_embeds: torch.Tensor | None = None,
+            forward_batch: ForwardBatch | None = None,
+            input_embeds: torch.Tensor | None = None,
+            pp_proxy_tensors: PPProxyTensors | None = None,
+            input_deepstack_embeds: torch.Tensor | None = None,
             save_kv_cache: bool = True,
             **kwargs: Any,
         ):
             kwargs = dict(kwargs)
-            metadata = SGLangForwardBatchMetadata.build(
-                forward_batch,
-                pp_proxy_tensors=pp_proxy_tensors,
-                save_kv_cache=save_kv_cache,
-            )
             if inputs_embeds is None:
                 inputs_embeds = input_embeds
             if inputs_embeds is None:
                 inputs_embeds = kwargs.pop("inputs_embeds", None)
-            if intermediate_tensors is None:
-                intermediate_tensors = (
-                    SGLangForwardBatchMetadata.to_intermediate_tensors(
-                        pp_proxy_tensors,
-                        metadata,
-                    )
-                )
             del kwargs
-            with SGLangForwardBatchMetadata.bind(metadata):
-                with SGLangGDNForwardContext.bind(metadata):
+
+            with (
+                plugin_runtime_scope(framework="sglang", atom_config=self.atom_config),
+                SGLangPluginRuntime(
+                    atom_config=self.atom_config,
+                    forward_batch=forward_batch,
+                    positions=positions,
+                    input_ids=input_ids,
+                    input_embeds=inputs_embeds,
+                    set_forward_context=True,
+                ) as runtime,
+            ):
+                metadata = SGLangForwardBatchMetadata.build(
+                    runtime.forward_batch,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                    save_kv_cache=save_kv_cache,
+                )
+
+                if intermediate_tensors is None:
+                    intermediate_tensors = (
+                        SGLangForwardBatchMetadata.to_intermediate_tensors(
+                            pp_proxy_tensors,
+                            metadata,
+                        )
+                    )
+
+                with (
+                    SGLangForwardBatchMetadata.bind(metadata),
+                    SGLangGDNForwardContext.bind(metadata),
+                ):
                     out = _forward_qwen35_decoder_stack(
                         self.model,
-                        input_ids,
-                        positions,
+                        runtime.input_ids,
+                        runtime.positions,
                         intermediate_tensors=intermediate_tensors,
-                        inputs_embeds=inputs_embeds,
+                        inputs_embeds=runtime.input_embeds,
                         input_deepstack_embeds=input_deepstack_embeds,
+                        dflash_capture_points=self.dflash_capture_points,
                     )
-            if isinstance(out, IntermediateTensors):
-                return PPProxyTensors(dict(out.tensors))
-            return out
+                out = runtime.trim_output(out)
+                if isinstance(out, IntermediateTensors):
+                    return PPProxyTensors(dict(out.tensors))
+                return out
 
     _QWEN35_SGLANG_LANGUAGE_MODEL_STACKS[atom_model_cls] = (
         _AtomQwen35LanguageModelAdapter
@@ -325,7 +382,7 @@ class _Qwen3_5ConditionalGenerationSglangBase:
     def __init__(
         self,
         config: Any,
-        quant_config: Optional[SGLangQuantizationConfig] = None,
+        quant_config: SGLangQuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         self._prepare_sglang_root_config(config)
@@ -357,7 +414,7 @@ class _Qwen3_5ConditionalGenerationSglangBase:
     def _load_weights_in_plugin_mode(
         self,
         *,
-        weights_mapper: Optional[WeightsMapper] = None,
+        weights_mapper: WeightsMapper | None = None,
         load_fused_expert_weights_fn=None,
     ) -> set[str]:
         from atom.model_loader.loader import load_model_in_plugin_mode
@@ -370,26 +427,14 @@ class _Qwen3_5ConditionalGenerationSglangBase:
             load_fused_expert_weights_fn=load_fused_expert_weights_fn,
         )
 
-    @contextmanager
-    def _maybe_disable_shared_expert_fusion_for_load(self):
-        # Some Qwen3.5 FP8 checkpoints keep `shared_expert.*` as standalone
-        # modules. In that case, the generic loader must not rewrite those keys
-        # into `mlp.experts.<n_routed_experts>.*` during load.
-        has_standalone_shared_expert = any(
-            ".shared_expert." in name for name, _ in self.named_parameters()
-        )
-        if not has_standalone_shared_expert:
-            yield
-            return
-
-        import atom.model_loader.loader as atom_loader
-
-        original = atom_loader.is_rocm_aiter_fusion_shared_expert_enabled
-        atom_loader.is_rocm_aiter_fusion_shared_expert_enabled = lambda: False
-        try:
-            yield
-        finally:
-            atom_loader.is_rocm_aiter_fusion_shared_expert_enabled = original
+    @property
+    def disable_fused_shared_loading(self) -> bool:
+        """True when this checkpoint keeps `shared_expert.*` as standalone
+        modules, so the loader must not rewrite those keys into
+        `mlp.experts.<n_routed_experts>.*`. Read from the built model so it
+        always agrees with the structure the weights have to land in.
+        """
+        return any(".shared_expert." in name for name, _ in self.named_parameters())
 
 
 class Qwen3_5ForConditionalGeneration(
@@ -439,11 +484,10 @@ class Qwen3_5MoeForConditionalGeneration(
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         del weights
-        with self._maybe_disable_shared_expert_fusion_for_load():
-            return self._load_weights_in_plugin_mode(
-                weights_mapper=self.hf_to_sglang_mapper,
-                load_fused_expert_weights_fn=self.load_fused_expert_weights,
-            )
+        return self._load_weights_in_plugin_mode(
+            weights_mapper=self.hf_to_sglang_mapper,
+            load_fused_expert_weights_fn=self.load_fused_expert_weights,
+        )
 
 
 # SGLang discovers these multimodal wrappers from this module's `EntryClass`.

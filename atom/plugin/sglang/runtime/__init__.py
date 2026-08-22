@@ -16,6 +16,7 @@ from atom.plugin.sglang.runtime.model_arch import (
     SGLangModelAdapterSpec,
     get_model_arch_spec,
     is_glm52_dsa_config,
+    resolve_model_arch_spec,
 )
 
 apply_load_config_patch()
@@ -34,4 +35,5 @@ __all__ = [
     "is_draft_extend_mode",
     "is_glm52_dsa_config",
     "plugin_runtime_scope",
+    "resolve_model_arch_spec",
 ]

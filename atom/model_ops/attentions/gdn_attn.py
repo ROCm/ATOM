@@ -2,22 +2,26 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Type
 
 import numpy as np
 import torch
 from aiter.dist.parallel_state import get_tp_group
+
+from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.scheduler import ScheduledBatch
+from atom.model_engine.state_runtime import StateTransfer
 from atom.model_ops.attention_gdn import GatedDeltaNet
 from atom.utils import CpuGpuBuffer
 from atom.utils.forward_context import AttentionMetaData, Context
 
 from .aiter_attention import (
-    AiterBackend,
     AiterAttentionMetadataBuilder,
+    AiterBackend,
     kv_indices_generate_triton,
 )
+from .sub_pool_spec import SubPoolSpec, page_pool, state_pool
 
 
 class GDNAttentionBackend(AiterBackend):
@@ -26,11 +30,11 @@ class GDNAttentionBackend(AiterBackend):
         return "ROCM_GDN_ATTENTION"
 
     @staticmethod
-    def get_builder_cls() -> Type["GDNAttentionMetadataBuilder"]:
+    def get_builder_cls() -> type["GDNAttentionMetadataBuilder"]:
         return GDNAttentionMetadataBuilder
 
     @staticmethod
-    def get_impl_cls() -> Type["GatedDeltaNet"]:
+    def get_impl_cls() -> type["GatedDeltaNet"]:
         return GatedDeltaNet
 
 
@@ -55,6 +59,10 @@ class GDNAttentionMetadata:
     non_spec_state_indices_tensor: torch.Tensor | None = (
         None  # shape: [batch - num_spec_decodes,]
     )
+    # Slots the incoming state is READ from, when a state fork makes that differ
+    # from `non_spec_state_indices_tensor`. Same tensor otherwise; None on the
+    # spec path, which never carries a fork.
+    non_spec_state_indices_in_tensor: torch.Tensor | None = None
     spec_sequence_masks: torch.Tensor | None = None  # shape: [batch,]
     spec_token_indx: torch.Tensor | None = None
     non_spec_token_indx: torch.Tensor | None = None
@@ -67,30 +75,60 @@ class GDNAttentionMetadata:
     token_chunk_offset_ptr: torch.Tensor | None = None
 
 
-class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
+class GDNStateMixin:
+    def __init__(self, model_runner, **kwargs):
+        super().__init__(model_runner=model_runner, **kwargs)
+        self._init_gdn_state(model_runner)
 
-    reorder_batch_threshold: int = 1
-
-    def __init__(
+    def _init_gdn_state(
         self,
         model_runner,
     ):
-        super().__init__(model_runner=model_runner)
         # Hybrid model layer-counting state (formerly set as a side effect
-        # inside ModelRunner._compute_block_bytes' qwen_next branch).
+        # inside the qwen_next branch of the KV sizing path).
         # Promoted to runner attributes here so all consumers
         # (build_kv_cache_tensor, allocate_kv_cache_tensors, the per-req
         # cache hooks) can read them as `self.model_runner.<name>` without
-        # a hidden ordering dependency on _compute_block_bytes being
+        # a hidden ordering dependency on the KV sizing path being
         # called first.
         hf = model_runner.config.hf_config
-        model_runner.full_attention_interval = hf.full_attention_interval
-        model_runner.num_full_attn = (
-            hf.num_hidden_layers // model_runner.full_attention_interval
-        )
-        model_runner.num_gdn_attn_state = (
-            hf.num_hidden_layers - model_runner.num_full_attn
-        )
+        if getattr(hf, "model_type", None) == "kimi_linear":
+            lin = getattr(hf, "linear_attn_config", {}) or {}
+            model_runner.full_attention_layers = [
+                int(i) - 1 for i in lin.get("full_attn_layers", [])
+            ]
+            model_runner.kda_attention_layers = [
+                int(i) - 1 for i in lin.get("kda_layers", [])
+            ]
+            model_runner.num_full_attn = len(model_runner.full_attention_layers)
+            model_runner.num_gdn_attn_state = len(model_runner.kda_attention_layers)
+            hf.linear_num_key_heads = getattr(
+                hf, "linear_num_key_heads", lin.get("num_heads", hf.num_attention_heads)
+            )
+            hf.linear_num_value_heads = getattr(
+                hf,
+                "linear_num_value_heads",
+                lin.get("num_heads", hf.num_attention_heads),
+            )
+            hf.linear_key_head_dim = getattr(
+                hf, "linear_key_head_dim", lin.get("head_dim", hf.qk_nope_head_dim)
+            )
+            hf.linear_value_head_dim = getattr(
+                hf, "linear_value_head_dim", lin.get("head_dim", hf.v_head_dim)
+            )
+            hf.linear_conv_kernel_dim = getattr(
+                hf,
+                "linear_conv_kernel_dim",
+                lin.get("short_conv_kernel_size", 4),
+            )
+        else:
+            model_runner.full_attention_interval = hf.full_attention_interval
+            model_runner.num_full_attn = (
+                hf.num_hidden_layers // model_runner.full_attention_interval
+            )
+            model_runner.num_gdn_attn_state = (
+                hf.num_hidden_layers - model_runner.num_full_attn
+            )
 
         self.num_spec = 0
         if hasattr(model_runner, "drafter"):
@@ -103,6 +141,14 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
             device=self.device,
         )
         self.non_spec_state_indices_tensor = CpuGpuBuffer(
+            (self.max_bs,),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        # Read side of a state fork. Only the prefill path can carry one (a
+        # fork is always followed by at least `min_fork_tokens` prompt tokens),
+        # so the spec/decode index buffers have no counterpart.
+        self.non_spec_state_indices_in_tensor = CpuGpuBuffer(
             (self.max_bs,),
             dtype=torch.int32,
             device=self.device,
@@ -186,6 +232,14 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
         return conv_state_shape, temporal_state_shape
 
     def _state_dtypes(self) -> tuple[torch.dtype, torch.dtype]:
+        if (
+            getattr(self.model_runner.config.hf_config, "model_type", None)
+            == "kimi_linear"
+        ):
+            return (
+                self.model_runner.config.torch_dtype,
+                torch.float32,
+            )
         return (
             self.model_runner.config.torch_dtype,
             self.model_runner.config.torch_dtype,
@@ -203,25 +257,37 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
             self.model_runner.num_spec_tokens,
         )
 
-    def compute_per_req_cache_bytes(self) -> int:
-        """GDN: conv_state + temporal_state, summed over all GDN layers."""
+    def state_transfer(self) -> StateTransfer:
+        """Declare one-token fork checkpoint support for recurrent state."""
+        return StateTransfer.fork(1)
+
+    def state_spec(self) -> SubPoolSpec:
+        """The GDN state pool: conv_state + temporal_state over all GDN
+        layers, with one extra slot per speculative token for rollback.
+
+        Concrete builders splice this into their `sub_pool_specs()` alongside
+        whatever paged KV pool they own.
+        """
         shape_k, shape_v = self._state_shape_for_runner()
         dt_k, dt_v = self._state_dtypes()
         per_layer = (
             math.prod(shape_k) * dt_k.itemsize + math.prod(shape_v) * dt_v.itemsize
         )
-        return self.model_runner.num_gdn_attn_state * per_layer
+        return state_pool(
+            STATE_SLOT_CLASS,
+            self.model_runner.num_gdn_attn_state * per_layer,
+            entries_per_req=1 + self.num_spec,
+        )
 
-    def slots_per_req(self) -> int:
-        """GDN reserves one extra slot per speculative token for rollback."""
-        return 1 + self.num_spec
-
-    def allocate_per_req_cache(self, num_slots: int) -> dict[str, torch.Tensor]:
+    def allocate_per_req_cache(
+        self, entries: dict[str, int]
+    ) -> dict[str, torch.Tensor]:
         """Allocate mamba_k_cache / mamba_v_cache.
 
         Names preserved for backward compat with `attention_gdn.py` which
         accesses them as `model_runner.mamba_{k,v}_cache`.
         """
+        num_slots = entries.get(STATE_SLOT_CLASS, 0)
         shape_k, shape_v = self._state_shape_for_runner()
         dt_k, dt_v = self._state_dtypes()
         n = self.model_runner.num_gdn_attn_state
@@ -234,10 +300,306 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
             ),
         }
 
-    def compute_block_bytes(self) -> int:
-        """GDN hybrid: only full-attention layer slots contribute paged KV
-        bytes (linear-attention layers' state lives in the per-request
-        cache pool, accounted separately via compute_per_req_cache_bytes).
+    def relocate_state_slots(self, pairs: Sequence[tuple[int, int]]) -> None:
+        """Relocate a live GDN group between logical Active Slot spans.
+
+        A group is `1 + num_spec` consecutive slots — the extra ones hold the
+        per-draft states a rejected speculation rolls back to — so a group moves
+        as that whole span or the rollback slots go with the wrong owner.
+
+        GDN checkpoints by forking, not by copying, so this is not on the
+        checkpoint path: it exists because moving the pool's boundary has to be
+        able to relocate a group that is in the way.
+
+        Both caches are layer-major with the slot as the second axis, so a
+        group's rows are strided rather than contiguous and there is no single
+        range to copy. `_foreach_copy_` keeps it to one launch for the batch.
+        """
+        span = 1 + self.num_spec
+        caches = (self.model_runner.mamba_k_cache, self.model_runner.mamba_v_cache)
+        destinations, sources = [], []
+        for src_group, dst_group in pairs:
+            src_slot, dst_slot = src_group * span, dst_group * span
+            for cache in caches:
+                destinations.append(cache[:, dst_slot : dst_slot + span])
+                sources.append(cache[:, src_slot : src_slot + span])
+        if destinations:
+            torch._foreach_copy_(destinations, sources)
+
+    def prepare_state_indices(self, batch: ScheduledBatch, with_spec: bool = False):
+        non_spec_state_indices = self.non_spec_state_indices_tensor.np
+        non_spec_state_indices_in = self.non_spec_state_indices_in_tensor.np
+        spec_state_indices = self.spec_state_indices_tensor.np
+        slots_per_group = 1 + self.num_spec
+        fork_srcs = getattr(batch, "state_fork_srcs", None) or ()
+        assert not (with_spec and any(s >= 0 for s in fork_srcs)), (
+            "state fork on the spec-decode path: spec_state_indices_tensor has "
+            "no read-side counterpart (BlockManager only forks onto prefill)"
+        )
+        for idx, slot_group in enumerate(batch.per_req_cache_groups):
+            non_spec_state_indices[idx] = 0
+            non_spec_state_indices_in[idx] = 0
+            spec_state_indices[idx] = 0
+            base = slot_group * slots_per_group
+
+            if not with_spec:
+                non_spec_state_indices[idx] = base
+                # A forked seq reads the group it published (or resumed from)
+                # and writes the fresh one for this forward only.
+                src = fork_srcs[idx] if idx < len(fork_srcs) else -1
+                non_spec_state_indices_in[idx] = (
+                    src * slots_per_group if src >= 0 else base
+                )
+            else:
+                spec_state_indices[idx, : 1 + self.num_spec] = np.arange(
+                    base, base + 1 + self.num_spec
+                )
+
+    def prepare_num_accepted_tokens(self, batch: ScheduledBatch):
+        self.num_accepted_tokens.fill_(1)
+
+        if self.model_runner.tokenID_processor.num_bonus is None:
+            return
+        for idx, num_bonus in enumerate(self.model_runner.tokenID_processor.num_bonus):
+            self.num_accepted_tokens[idx] = num_bonus + 1
+
+    def prepare_gdn_metadata(
+        self,
+        batch: ScheduledBatch,
+        attn_metadata: AttentionMetaData,
+        is_prefill: bool = False,
+        *,
+        prepare_block_tables: bool = True,
+    ) -> GDNAttentionMetadata:
+
+        num_decodes = batch.total_seqs_num_decode
+        num_prefills = batch.total_seqs_num_prefill
+        num_decode_tokens = batch.total_tokens_num_decode
+        num_prefill_tokens = batch.total_tokens_num_prefill
+        num_reqs = batch.total_seqs_num
+        if prepare_block_tables:
+            self.prepare_block_tables(batch)
+
+        query_start_loc = attn_metadata.cu_seqlens_q
+        nums_dict, batch_ptr, token_chunk_offset_ptr = None, None, None
+        if not self.use_spec_decode or is_prefill:
+            self.prepare_state_indices(batch, with_spec=False)
+            spec_token_indx = None
+            non_spec_token_indx = None
+            spec_state_indices_tensor = None
+            non_spec_state_indices_tensor = (
+                self.non_spec_state_indices_tensor.copy_to_gpu(num_reqs)
+            )
+            # Always its own buffer, never aliased to the write tensor: this
+            # branch also serves non-spec decode, which runs from a captured
+            # CUDAGraph where the argument address is baked in at capture.
+            non_spec_state_indices_in_tensor = (
+                self.non_spec_state_indices_in_tensor.copy_to_gpu(num_reqs)
+            )
+            spec_query_start_loc = None
+            non_spec_query_start_loc = query_start_loc
+            num_accepted_tokens = None
+            spec_sequence_masks = None
+            num_spec_decodes = 0
+            num_spec_decode_tokens = 0
+        else:
+            self.prepare_state_indices(batch, with_spec=True)
+            self.prepare_num_accepted_tokens(batch)
+            spec_token_size = min(
+                num_decodes * (self.num_spec + 1), query_start_loc[-1].item()
+            )
+            spec_token_indx = torch.arange(
+                spec_token_size, dtype=torch.int32, device=self.device
+            )
+            non_spec_token_indx = torch.empty(
+                0, dtype=torch.int32, device=query_start_loc.device
+            )
+            spec_sequence_masks = torch.ones(
+                num_reqs, dtype=torch.bool, device=self.device
+            )
+            spec_state_indices_tensor = self.spec_state_indices_tensor.copy_to_gpu(
+                num_reqs
+            )
+            non_spec_state_indices_tensor = None
+            non_spec_state_indices_in_tensor = None
+            spec_query_start_loc = query_start_loc
+            non_spec_query_start_loc = None
+            num_accepted_tokens = self.num_accepted_tokens[:num_reqs]
+            num_spec_decodes = num_decodes
+            num_prefills = 0
+            num_decodes = 0
+            num_spec_decode_tokens = num_decode_tokens
+            num_decode_tokens = 0
+            num_prefill_tokens = 0
+
+        if num_prefills > 0:
+            # Tokens already folded into each request's state before this
+            # forward: earlier prefill chunks, or a resumed state checkpoint.
+            # It has to be the chunk's START offset — `attn_metadata`'s
+            # `context_lens` is the END (cached + scheduled) and would claim an
+            # incoming state on a cold first chunk, making the recurrence start
+            # from whatever the recycled state group still held. The backend
+            # leaves `num_cached_tokens` None when no row has any, which is the
+            # same all-False answer.
+            cached = attn_metadata.num_cached_tokens
+            has_initial_state = (
+                cached[:num_prefills] > 0
+                if cached is not None
+                else torch.zeros(num_prefills, dtype=torch.bool, device=self.device)
+            )
+            nums_dict, batch_ptr, token_chunk_offset_ptr = (
+                compute_causal_conv1d_metadata(non_spec_query_start_loc)
+            )
+        else:
+            has_initial_state = None
+
+        gdn_attn_metadata = GDNAttentionMetadata(
+            num_prefills=num_prefills,
+            num_prefill_tokens=num_prefill_tokens,
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
+            num_spec_decodes=num_spec_decodes,
+            num_spec_decode_tokens=num_spec_decode_tokens,
+            num_actual_tokens=batch.total_tokens_num,
+            has_initial_state=has_initial_state,
+            spec_query_start_loc=spec_query_start_loc,
+            non_spec_query_start_loc=non_spec_query_start_loc,
+            spec_state_indices_tensor=spec_state_indices_tensor,
+            non_spec_state_indices_tensor=non_spec_state_indices_tensor,
+            non_spec_state_indices_in_tensor=non_spec_state_indices_in_tensor,
+            spec_sequence_masks=spec_sequence_masks,
+            spec_token_indx=spec_token_indx,
+            non_spec_token_indx=non_spec_token_indx,
+            num_accepted_tokens=num_accepted_tokens,
+            nums_dict=nums_dict,
+            batch_ptr=batch_ptr,
+            token_chunk_offset_ptr=token_chunk_offset_ptr,
+        )
+        return gdn_attn_metadata
+
+    def _attach_gdn_decode_metadata(
+        self,
+        batch,
+        attn_metadata,
+        *,
+        prepare_block_tables: bool = True,
+    ) -> None:
+        num_decodes = batch.total_seqs_num_decode
+        gdn_metadata = self.prepare_gdn_metadata(
+            batch,
+            attn_metadata,
+            prepare_block_tables=prepare_block_tables,
+        )
+
+        # transfer data to ps buffer
+        if self.use_spec_decode:
+            self.spec_state_indices_tensor.gpu[num_decodes:, :].fill_(PAD_SLOT_ID)
+
+            self.spec_sequence_masks[:num_decodes].copy_(
+                gdn_metadata.spec_sequence_masks, non_blocking=True
+            )
+            self.spec_sequence_masks[num_decodes:].fill_(False)
+            gdn_metadata.spec_sequence_masks = self.spec_sequence_masks[:num_decodes]
+
+            self.spec_token_indx[: gdn_metadata.spec_token_indx.size(0)].copy_(
+                gdn_metadata.spec_token_indx, non_blocking=True
+            )
+            gdn_metadata.spec_token_indx = self.spec_token_indx[
+                : gdn_metadata.spec_token_indx.size(0)
+            ]
+
+            self.spec_query_start_loc[: num_decodes + 1].copy_(
+                gdn_metadata.spec_query_start_loc[: num_decodes + 1], non_blocking=True
+            )
+            spec_num_query_tokens = self.spec_query_start_loc[num_decodes]
+            self.spec_query_start_loc[num_decodes + 1 :].fill_(spec_num_query_tokens)
+            gdn_metadata.spec_query_start_loc = self.spec_query_start_loc[
+                : num_decodes + 1
+            ]
+
+            self.num_accepted_tokens[:num_decodes].copy_(
+                gdn_metadata.num_accepted_tokens[:num_decodes], non_blocking=True
+            )
+            self.num_accepted_tokens[num_decodes:].fill_(1)
+            gdn_metadata.num_accepted_tokens = self.num_accepted_tokens[:num_decodes]
+        else:
+            self.non_spec_state_indices_tensor.gpu[num_decodes:].fill_(PAD_SLOT_ID)
+            self.non_spec_state_indices_in_tensor.gpu[num_decodes:].fill_(PAD_SLOT_ID)
+
+            self.non_spec_query_start_loc[: num_decodes + 1].copy_(
+                gdn_metadata.non_spec_query_start_loc[: num_decodes + 1],
+                non_blocking=True,
+            )
+            self.non_spec_query_start_loc[num_decodes + 1 :].fill_(
+                gdn_metadata.non_spec_query_start_loc[num_decodes]
+            )
+            gdn_metadata.non_spec_query_start_loc = self.non_spec_query_start_loc[
+                : num_decodes + 1
+            ]
+
+        attn_metadata.gdn_metadata = gdn_metadata
+
+    def _build_gdn_capture_metadata(self, bs: int):
+        if self.use_spec_decode:
+            gdn_metadata = GDNAttentionMetadata(
+                num_prefills=0,
+                num_prefill_tokens=0,
+                num_decodes=0,
+                num_decode_tokens=0,
+                num_spec_decodes=bs,
+                num_spec_decode_tokens=bs * (self.num_spec + 1),
+                num_actual_tokens=bs * (self.num_spec + 1),
+                has_initial_state=None,
+                spec_query_start_loc=self.spec_query_start_loc[: bs + 1],
+                non_spec_query_start_loc=None,
+                spec_state_indices_tensor=self.spec_state_indices_tensor.gpu[:bs],
+                non_spec_state_indices_tensor=None,
+                spec_sequence_masks=self.spec_sequence_masks[:bs],
+                spec_token_indx=self.spec_token_indx[: bs * (self.num_spec + 1)],
+                non_spec_token_indx=self.non_spec_token_indx[:0],
+                num_accepted_tokens=self.num_accepted_tokens[:bs],
+                nums_dict=None,
+                batch_ptr=None,
+                token_chunk_offset_ptr=None,
+            )
+        else:
+            gdn_metadata = GDNAttentionMetadata(
+                num_prefills=0,
+                num_prefill_tokens=0,
+                num_decodes=bs,
+                num_decode_tokens=bs,
+                num_spec_decodes=0,
+                num_spec_decode_tokens=0,
+                num_actual_tokens=bs,
+                has_initial_state=None,
+                spec_query_start_loc=None,
+                non_spec_query_start_loc=self.non_spec_query_start_loc[: bs + 1],
+                spec_state_indices_tensor=None,
+                non_spec_state_indices_tensor=self.non_spec_state_indices_tensor.gpu[
+                    :bs
+                ],
+                non_spec_state_indices_in_tensor=(
+                    self.non_spec_state_indices_in_tensor.gpu[:bs]
+                ),
+                spec_sequence_masks=None,
+                spec_token_indx=None,
+                non_spec_token_indx=None,
+                num_accepted_tokens=None,
+                nums_dict=None,
+                batch_ptr=None,
+                token_chunk_offset_ptr=None,
+            )
+        return gdn_metadata
+
+
+class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
+
+    reorder_batch_threshold: int = 1
+
+    def sub_pool_specs(self) -> list[SubPoolSpec]:
+        """GDN hybrid: a paged KV pool holding ONLY the full-attention layer
+        slots, plus the per-request state pool for the linear-attention
+        layers (`GDNStateMixin.state_spec`).
         """
         from aiter import dtypes
 
@@ -261,7 +623,7 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
         )
         # kv_scale: [2, n_full, blocks, num_kv_heads, block_size] fp32
         block_bytes += 2 * n_full * num_kv_heads * runner.physical_block_size * 4
-        return block_bytes
+        return [page_pool(block_bytes), self.state_spec()]
 
     def allocate_kv_cache_tensors(
         self, num_kv_heads: int, num_draft_layers: int
@@ -308,9 +670,8 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
 
         - `base_linear_attention` (GDN linear attention) → wrap the slot
           slice of mamba_k_cache / mamba_v_cache
-        - everything else (full-attention MHA layers in the hybrid model,
-          plus modules of types this builder doesn't recognize) → defer
-          to AiterAttentionMetadataBuilder.build_kv_cache_tensor
+        - everything else → defer to
+          AiterAttentionMetadataBuilder.build_kv_cache_tensor
         """
         if hasattr(module, "base_linear_attention"):
             from atom.config import KVCacheTensor
@@ -326,122 +687,6 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
                 v_scale=None,
             )
         return super().build_kv_cache_tensor(layer_id, module)
-
-    def prepare_state_indices(self, batch: ScheduledBatch, with_spec: bool = False):
-        non_spec_state_indices = self.non_spec_state_indices_tensor.np
-        spec_state_indices = self.spec_state_indices_tensor.np
-        slots_per_group = 1 + self.num_spec
-        for idx, slot_group in enumerate(batch.per_req_cache_groups):
-            non_spec_state_indices[idx] = 0
-            spec_state_indices[idx] = 0
-            base = slot_group * slots_per_group
-
-            if not with_spec:
-                non_spec_state_indices[idx] = base
-            else:
-                spec_state_indices[idx, : 1 + self.num_spec] = np.arange(
-                    base, base + 1 + self.num_spec
-                )
-
-    def prepare_num_accepted_tokens(self, batch: ScheduledBatch):
-        self.num_accepted_tokens.fill_(1)
-
-        if self.model_runner.tokenID_processor.num_bonus is None:
-            return
-        for idx, num_bonus in enumerate(self.model_runner.tokenID_processor.num_bonus):
-            self.num_accepted_tokens[idx] = num_bonus + 1
-
-    def prepare_gdn_metadata(
-        self,
-        batch: ScheduledBatch,
-        attn_metadata: AttentionMetaData,
-        is_prefill: bool = False,
-    ) -> GDNAttentionMetadata:
-
-        num_decodes = batch.total_seqs_num_decode
-        num_prefills = batch.total_seqs_num_prefill
-        num_decode_tokens = batch.total_tokens_num_decode
-        num_prefill_tokens = batch.total_tokens_num_prefill
-        num_reqs = batch.total_seqs_num
-        self.prepare_block_tables(batch)
-
-        context_lens_tensor = attn_metadata.context_lens
-        query_start_loc = attn_metadata.cu_seqlens_q
-        context_lens_tensor = torch.zeros((batch.total_seqs_num_prefill)).cuda()
-        nums_dict, batch_ptr, token_chunk_offset_ptr = None, None, None
-        if not self.use_spec_decode or is_prefill:
-            self.prepare_state_indices(batch, with_spec=False)
-            spec_token_indx = None
-            non_spec_token_indx = None
-            spec_state_indices_tensor = None
-            non_spec_state_indices_tensor = (
-                self.non_spec_state_indices_tensor.copy_to_gpu(num_reqs)
-            )
-            spec_query_start_loc = None
-            non_spec_query_start_loc = query_start_loc
-            num_accepted_tokens = None
-            spec_sequence_masks = None
-            num_spec_decodes = 0
-            num_spec_decode_tokens = 0
-        else:
-            self.prepare_state_indices(batch, with_spec=True)
-            self.prepare_num_accepted_tokens(batch)
-            spec_token_size = min(
-                num_decodes * (self.num_spec + 1), query_start_loc[-1].item()
-            )
-            spec_token_indx = torch.arange(
-                spec_token_size, dtype=torch.int32, device=self.device
-            )
-            non_spec_token_indx = torch.empty(
-                0, dtype=torch.int32, device=query_start_loc.device
-            )
-            spec_sequence_masks = torch.ones(
-                num_reqs, dtype=torch.bool, device=self.device
-            )
-            spec_state_indices_tensor = self.spec_state_indices_tensor.copy_to_gpu(
-                num_reqs
-            )
-            non_spec_state_indices_tensor = None
-            spec_query_start_loc = query_start_loc
-            non_spec_query_start_loc = None
-            num_accepted_tokens = self.num_accepted_tokens[:num_reqs]
-            num_spec_decodes = num_decodes
-            num_prefills = 0
-            num_decodes = 0
-            num_spec_decode_tokens = num_decode_tokens
-            num_decode_tokens = 0
-            num_prefill_tokens = 0
-
-        if num_prefills > 0:
-            has_initial_state = context_lens_tensor > 0
-            nums_dict, batch_ptr, token_chunk_offset_ptr = (
-                compute_causal_conv1d_metadata(non_spec_query_start_loc)
-            )
-        else:
-            has_initial_state = None
-
-        gdn_attn_metadata = GDNAttentionMetadata(
-            num_prefills=num_prefills,
-            num_prefill_tokens=num_prefill_tokens,
-            num_decodes=num_decodes,
-            num_decode_tokens=num_decode_tokens,
-            num_spec_decodes=num_spec_decodes,
-            num_spec_decode_tokens=num_spec_decode_tokens,
-            num_actual_tokens=batch.total_tokens_num,
-            has_initial_state=has_initial_state,
-            spec_query_start_loc=spec_query_start_loc,
-            non_spec_query_start_loc=non_spec_query_start_loc,
-            spec_state_indices_tensor=spec_state_indices_tensor,
-            non_spec_state_indices_tensor=non_spec_state_indices_tensor,
-            spec_sequence_masks=spec_sequence_masks,
-            spec_token_indx=spec_token_indx,
-            non_spec_token_indx=non_spec_token_indx,
-            num_accepted_tokens=num_accepted_tokens,
-            nums_dict=nums_dict,
-            batch_ptr=batch_ptr,
-            token_chunk_offset_ptr=token_chunk_offset_ptr,
-        )
-        return gdn_attn_metadata
 
     def prepare_prefill(  # type: ignore[override]
         self,
@@ -461,7 +706,6 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
         batch: ScheduledBatch,
         bs: int,
     ) -> GDNAttentionMetadata:
-        num_decodes = batch.total_seqs_num_decode
         attn_metadata, positions = super().prepare_decode(batch, bs)
         self.model_runner.forward_vars["cu_seqlens_q"].cpu[
             bs:
@@ -471,54 +715,7 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
             "cu_seqlens_q"
         ].copy_to_gpu(bs + 1)
 
-        gdn_metadata = self.prepare_gdn_metadata(batch, attn_metadata)
-
-        # transfer data to ps buffer
-        if self.use_spec_decode:
-            self.spec_state_indices_tensor.gpu[num_decodes:, :].fill_(PAD_SLOT_ID)
-
-            self.spec_sequence_masks[:num_decodes].copy_(
-                gdn_metadata.spec_sequence_masks, non_blocking=True
-            )
-            self.spec_sequence_masks[num_decodes:].fill_(False)
-            gdn_metadata.spec_sequence_masks = self.spec_sequence_masks[:num_decodes]
-
-            self.spec_token_indx[: gdn_metadata.spec_token_indx.size(0)].copy_(
-                gdn_metadata.spec_token_indx, non_blocking=True
-            )
-            gdn_metadata.spec_token_indx = self.spec_token_indx[
-                : gdn_metadata.spec_token_indx.size(0)
-            ]
-
-            self.spec_query_start_loc[: num_decodes + 1].copy_(
-                gdn_metadata.spec_query_start_loc[: num_decodes + 1], non_blocking=True
-            )
-            spec_num_query_tokens = self.spec_query_start_loc[num_decodes]
-            self.spec_query_start_loc[num_decodes + 1 :].fill_(spec_num_query_tokens)
-            gdn_metadata.spec_query_start_loc = self.spec_query_start_loc[
-                : num_decodes + 1
-            ]
-
-            self.num_accepted_tokens[:num_decodes].copy_(
-                gdn_metadata.num_accepted_tokens[:num_decodes], non_blocking=True
-            )
-            self.num_accepted_tokens[num_decodes:].fill_(1)
-            gdn_metadata.num_accepted_tokens = self.num_accepted_tokens[:num_decodes]
-        else:
-            self.non_spec_state_indices_tensor.gpu[num_decodes:].fill_(PAD_SLOT_ID)
-
-            self.non_spec_query_start_loc[: num_decodes + 1].copy_(
-                gdn_metadata.non_spec_query_start_loc[: num_decodes + 1],
-                non_blocking=True,
-            )
-            self.non_spec_query_start_loc[num_decodes + 1 :].fill_(
-                gdn_metadata.non_spec_query_start_loc[num_decodes]
-            )
-            gdn_metadata.non_spec_query_start_loc = self.non_spec_query_start_loc[
-                : num_decodes + 1
-            ]
-
-        attn_metadata.gdn_metadata = gdn_metadata
+        self._attach_gdn_decode_metadata(batch, attn_metadata)
         return attn_metadata, positions
 
     def prepare_mtp_decode(
@@ -571,53 +768,7 @@ class GDNAttentionMetadataBuilder(AiterAttentionMetadataBuilder):
             **ctx_pa_ps,
         )
 
-        if self.use_spec_decode:
-            gdn_metadata = GDNAttentionMetadata(
-                num_prefills=0,
-                num_prefill_tokens=0,
-                num_decodes=0,
-                num_decode_tokens=0,
-                num_spec_decodes=bs,
-                num_spec_decode_tokens=bs * (self.num_spec + 1),
-                num_actual_tokens=bs * (self.num_spec + 1),
-                has_initial_state=None,
-                spec_query_start_loc=self.spec_query_start_loc[: bs + 1],
-                non_spec_query_start_loc=None,
-                spec_state_indices_tensor=self.spec_state_indices_tensor.gpu[:bs],
-                non_spec_state_indices_tensor=None,
-                spec_sequence_masks=self.spec_sequence_masks[:bs],
-                spec_token_indx=self.spec_token_indx[: bs * (self.num_spec + 1)],
-                non_spec_token_indx=self.non_spec_token_indx[:0],
-                num_accepted_tokens=self.num_accepted_tokens[:bs],
-                nums_dict=None,
-                batch_ptr=None,
-                token_chunk_offset_ptr=None,
-            )
-        else:
-            gdn_metadata = GDNAttentionMetadata(
-                num_prefills=0,
-                num_prefill_tokens=0,
-                num_decodes=bs,
-                num_decode_tokens=bs,
-                num_spec_decodes=0,
-                num_spec_decode_tokens=0,
-                num_actual_tokens=bs,
-                has_initial_state=None,
-                spec_query_start_loc=None,
-                non_spec_query_start_loc=self.non_spec_query_start_loc[: bs + 1],
-                spec_state_indices_tensor=None,
-                non_spec_state_indices_tensor=self.non_spec_state_indices_tensor.gpu[
-                    :bs
-                ],
-                spec_sequence_masks=None,
-                spec_token_indx=None,
-                non_spec_token_indx=None,
-                num_accepted_tokens=None,
-                nums_dict=None,
-                batch_ptr=None,
-                token_chunk_offset_ptr=None,
-            )
-        attn_metadata.gdn_metadata = gdn_metadata
+        attn_metadata.gdn_metadata = self._build_gdn_capture_metadata(bs)
 
         positions = var["positions"].copy_to_gpu(bs)
         context = Context(

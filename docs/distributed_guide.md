@@ -345,7 +345,7 @@ The block configuration adapts to the batch type: prefill uses `block_num=128, w
 | `ATOM_DP_MASTER_PORT` | int | `29500` | Port for DP Gloo rendezvous |
 | `ATOM_DP_LB_REQ_EQUIV` | int | `512` | Token-equivalent cost of one in-flight request for the `least_tokens` DP load-balance strategy |
 | ~~`ATOM_ENFORCE_EAGER`~~ | | | Removed. Use CLI flag `--enforce-eager` instead. |
-| `ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION` | bool | `False` | Fuse QK-norm + RoPE + cache quant (for Qwen3-MoE) |
+| `ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION` | bool | `False` | Fuse QK-norm + RoPE + cache quant for Qwen3 dense and MoE models |
 
 Environment variables in `atom/utils/envs.py` are evaluated lazily via `__getattr__`. If `ATOM_DP_SIZE`, `ATOM_DP_RANK`, or `ATOM_DP_RANK_LOCAL` are set in the environment, they override programmatic `ParallelConfig` defaults in `ParallelConfig.__post_init__()`.
 

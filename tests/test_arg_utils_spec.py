@@ -117,6 +117,21 @@ class TestKVCacheDtypeCliAlias:
         assert self._parse(["--tensor_parallel_size", "4"]).tensor_parallel_size == 4
 
 
+class TestMoEBackendCli:
+    def _parse(self, argv):
+        parser = argparse.ArgumentParser()
+        EngineArgs.add_cli_args(parser)
+        return EngineArgs.from_cli_args(parser.parse_args(argv))
+
+    def test_default_is_standard(self):
+        assert self._parse([]).moe_backend == "standard"
+
+    def test_mega_backend(self):
+        args = self._parse(["--moe-backend", "mega"])
+        assert args.moe_backend == "mega"
+        assert args._get_engine_kwargs()["moe_backend"] == "mega"
+
+
 class TestEngineArgsSpeculativeValidation:
     """Regression tests for speculative-config construction in _get_engine_kwargs."""
 
@@ -154,21 +169,23 @@ class TestEngineArgsSpeculativeValidation:
             method="mtp",
             model=args.model,
             num_speculative_tokens=3,
+            synthetic_acceptance_rate=None,
+            synthetic_acceptance_length=None,
         )
         assert kwargs["speculative_config"] is fake_spec_config
 
 
 class TestEngineArgsIndexCacheDtype:
-    """Regression tests for index-cache dtype CLI parity with KV cache dtype."""
+    """Regression tests for index-cache dtype CLI and deferred defaults."""
 
-    def test_index_cache_dtype_defaults_to_kv_cache_dtype(self):
+    def test_index_cache_dtype_default_is_deferred_until_model_is_known(self):
         parser = argparse.ArgumentParser()
         EngineArgs.add_cli_args(parser)
 
         args = EngineArgs.from_cli_args(parser.parse_args(["--kv_cache_dtype", "fp8"]))
 
         assert args.kv_cache_dtype == "fp8"
-        assert args.index_cache_dtype == "fp8"
+        assert args.index_cache_dtype is None
 
     def test_index_cache_dtype_accepts_dashed_spelling(self):
         parser = argparse.ArgumentParser()

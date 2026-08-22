@@ -1,11 +1,11 @@
 import logging
-from typing import Optional
 
 import torch
 from transformers import AutoConfig, PretrainedConfig
+
 from atom.plugin.prepare import _set_framework_backbone
-from atom.utils import envs
 from atom.plugin.vllm.spec_decode_patch import apply_vllm_spec_decode_patch
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -35,6 +35,11 @@ _VLLM_MODEL_REGISTRY_OVERRIDES: dict[str, str] = {
     "Qwen3_5ForConditionalGeneration": "atom.plugin.vllm.models.qwen3_5:Qwen3_5ForConditionalGeneration",
     "Qwen3_5MoeForConditionalGeneration": "atom.plugin.vllm.models.qwen3_5:Qwen3_5MoeForConditionalGeneration",
     "KimiK25ForConditionalGeneration": "atom.plugin.vllm.models.kimi_k25:KimiK25ForConditionalGeneration",
+    "KimiK3ForConditionalGeneration": (
+        "atom.plugin.vllm.models.kimi_k3:KimiK3ForCausalLMVllm"
+    ),
+    # vLLM registers this arch too, but only to its NVIDIA implementation.
+    "K3DSparkModel": "atom.plugin.vllm.models.kimi_k3_dspark:KimiK3DSparkVllm",
     "MiniMaxM2ForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "DeepseekV4ForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "MiniMaxM3SparseForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
@@ -135,13 +140,19 @@ def _register_mxfp8_quantization_config() -> None:
             return None
 
 
-def register_platform() -> Optional[str]:
+def register_platform() -> str | None:
 
     if disable_vllm_plugin:
         # return None instead of error because the flag can be used to
         # run pure vllm mode without ATOM plugin
         logger.info("Disable ATOM OOT plugin platforms")
         return None
+
+    from atom.plugin.vllm.rocm_dcp_full_graph_patch import (
+        apply_vllm_rocm_dcp_full_graph_patch,
+    )
+
+    apply_vllm_rocm_dcp_full_graph_patch()
 
     # Do not call _set_plugin_mode() here. SGLang (and other stacks) discover
     # vllm.platform_plugins and would set atom's backbone to "vllm" before
@@ -151,6 +162,14 @@ def register_platform() -> Optional[str]:
 
     _register_hf_configs()
     _register_mxfp8_quantization_config()
+    # DeepSeek-V4's packed proxy arena cannot immediately recycle block ids;
+    # install the targeted scheduler-side queue-order compatibility patch before
+    # any KVCacheManager is constructed.
+    from atom.plugin.vllm.deepseek_v4_prefix_patch import (
+        apply_vllm_v4_block_reuse_patch,
+    )
+
+    apply_vllm_v4_block_reuse_patch()
 
     # return the ATOM platform to vllm
     return "atom.plugin.vllm.platform.ATOMPlatform"
@@ -181,8 +200,56 @@ def _patch_vllm_attention_process_weights_after_loading(attention) -> None:
     def wrapped(self, act_dtype: "torch.dtype" = torch.bfloat16):
         return orig(self, act_dtype)
 
-    setattr(wrapped, "_atom_default_act_dtype_patched", True)
+    wrapped._atom_default_act_dtype_patched = True
     attention.process_weights_after_loading = wrapped
+
+
+def _patch_vllm_harmony_parser_manager() -> None:
+    """Restore vLLM's documented Harmony parser selection contract."""
+    try:
+        from vllm.parser import ParserManager
+        from vllm.parser.harmony import HarmonyParser
+    except ImportError:
+        return
+
+    original = ParserManager.get_parser.__func__
+    if getattr(original, "_atom_harmony_parser_patched", False):
+        return
+
+    # Do nothing after upstream fixes the early return for is_harmony=True.
+    try:
+        if original(ParserManager, is_harmony=True) is not None:
+            return
+    except TypeError:
+        return
+
+    def get_parser(
+        cls,
+        tool_parser_name=None,
+        reasoning_parser_name=None,
+        enable_auto_tools=False,
+        model_name=None,
+        is_harmony=False,
+    ):
+        parser_cls = original(
+            cls,
+            tool_parser_name=tool_parser_name,
+            reasoning_parser_name=reasoning_parser_name,
+            enable_auto_tools=enable_auto_tools,
+            model_name=model_name,
+            is_harmony=is_harmony,
+        )
+        if parser_cls is not None or not is_harmony:
+            return parser_cls
+
+        from vllm.reasoning.gptoss_reasoning_parser import GptOssReasoningParser
+
+        HarmonyParser.reasoning_parser_cls = GptOssReasoningParser
+        HarmonyParser.tool_parser_cls = None
+        return HarmonyParser
+
+    get_parser._atom_harmony_parser_patched = True
+    ParserManager.get_parser = classmethod(get_parser)
 
 
 def register_model() -> None:
@@ -191,10 +258,18 @@ def register_model() -> None:
         return
 
     _set_plugin_mode()
+    # The general-plugin hook runs in the EngineCore process that owns the
+    # scheduler/KVCacheManager; install this here as well as in the platform hook.
+    from atom.plugin.vllm.deepseek_v4_prefix_patch import (
+        apply_vllm_v4_block_reuse_patch,
+    )
+
+    apply_vllm_v4_block_reuse_patch()
 
     from atom.plugin.vllm.gdn_backend import register_gdn_attention_backend
 
     register_gdn_attention_backend()
+    _patch_vllm_harmony_parser_manager()
 
     import vllm.model_executor.models.registry as vllm_model_registry
 
@@ -232,6 +307,15 @@ def register_model() -> None:
     # classes. ATOM-vLLM uses its own metadata classes after attention
     # isolation, so extend that allow-list before MTP/Eagle proposal runs.
     apply_vllm_spec_decode_patch()
+
+    # vLLM 0.26 profiles CUDA graph memory on ROCm by temporarily capturing
+    # and destroying every graph. Skip that pass before it can leave stale
+    # AITER graph-owned state.
+    from atom.plugin.vllm.cudagraph_memory_profiler_patch import (
+        apply_vllm_cudagraph_memory_profiler_patch,
+    )
+
+    apply_vllm_cudagraph_memory_profiler_patch()
 
     # Patch vLLM graph_capture to also enter aiter's ca_comm.capture(),
     # avoiding hipMemcpyAsync in fused_allreduce_rmsnorm when model uses aiter collectives

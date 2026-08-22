@@ -1,7 +1,7 @@
 import json
 import logging
 import os
-from contextlib import contextmanager
+import sys
 from typing import Any
 
 import torch
@@ -19,14 +19,14 @@ logger = logging.getLogger("atom.plugin.rtpllm.models")
 
 
 class _NoopWeightManager:
-    def update(self, req):  # noqa: ANN001
+    def update(self, req):
         return None
 
 
 class _NoopModelWeightsLoader:
     _py_eplb = None
 
-    def load_lora_weights(self, adapter_name, lora_path, device):  # noqa: ANN001
+    def load_lora_weights(self, adapter_name, lora_path, device):
         logger.warning(
             "No-op model_weights_loader received load_lora_weights(%s, %s, %s); "
             "external plugin mode uses ATOM model weights path only.",
@@ -34,7 +34,6 @@ class _NoopModelWeightsLoader:
             lora_path,
             device,
         )
-        return None
 
 
 class _StubWeightInfo(ModelDeployWeightInfo):
@@ -247,11 +246,11 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
         attn_inputs = getattr(inputs, "attention_inputs", None)
         if attn_inputs is None:
             raise ValueError(
-                "RTP plugin requires inputs.attention_inputs to provide position_ids."
+                "RTP plugin requires inputs.attention_inputs to provide combo_position_ids."
             )
         # Keep plugin semantics aligned with RTP native path:
-        # first use attention_inputs.position_ids, then fallback to combo_position_ids.
-        positions = getattr(attn_inputs, "position_ids", None)
+        # first use attention_inputs.combo_position_ids, then fallback to bert_embedding_inputs.combo_position_ids.
+        positions = getattr(attn_inputs, "combo_position_ids", None)
         if positions is None or positions.numel() == 0:
             positions = self._extract_combo_positions(
                 inputs=inputs, model_device=model_device
@@ -264,14 +263,14 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
         if positions is None or positions.numel() == 0:
             raise ValueError(
                 "RTP plugin requires real position metadata from attention_inputs "
-                "(position_ids or input/prefix/sequence lengths); fallback positions are disabled."
+                "(combo_position_ids or input/prefix/sequence lengths); fallback positions are disabled."
             )
         positions = positions.to(
             device=model_device, dtype=torch.int32, non_blocking=True
         ).contiguous()
         # Eager-only: shape-based fallback rebuild. In cuda-graph capture mode
         # this Python-level branch on tensor shape is unsafe (and unnecessary
-        # because RTP guarantees position_ids has the same length as the
+        # because RTP guarantees combo_position_ids has the same length as the
         # capture-time max_num_token). See rtp+atom_graph.md §4.3.
         if not torch.cuda.is_current_stream_capturing():
             pos_tokens = (
@@ -301,8 +300,8 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
                     positions = positions[..., -token_num:].contiguous()
                 else:
                     raise ValueError(
-                        "RTP plugin position_ids/token_num mismatch "
-                        f"(position_ids_tokens={pos_tokens}, token_num={token_num})."
+                        "RTP plugin combo_position_ids/token_num mismatch "
+                        f"(combo_position_ids_tokens={pos_tokens}, token_num={token_num})."
                     )
         return positions
 
@@ -373,11 +372,17 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
         # block_table columns are indexed in kernel block granularity
         # (rtp_kernel_seq_size_per_block), not seq_size_per_block.
         # Qwen3.5 config example: max_seq_len=262144, kernel_block=16 -> 16384 columns.
-        kernel_seq_size_per_block = (
-            int(getattr(kv_cache, "kernel_seq_size_per_block", 0))
-            or int(getattr(kv_cache, "seq_size_per_block", 0))
-            or 1
-        )
+        _kv_tags = list(getattr(kv_cache, "group_tags", None) or []) if kv_cache else []
+        _kv_tag = _kv_tags[0] if _kv_tags else "full"
+        if kv_cache is not None and hasattr(kv_cache, "get_seq_size_per_block"):
+            _ks = int(kv_cache.get_kernel_seq_size_per_block(_kv_tag)) or int(
+                kv_cache.get_seq_size_per_block(_kv_tag)
+            )
+        else:
+            _ks = int(getattr(kv_cache, "kernel_seq_size_per_block", 0)) or int(
+                getattr(kv_cache, "seq_size_per_block", 0)
+            )
+        kernel_seq_size_per_block = _ks or 1
         max_blocks = (
             int(max_seq_len) + kernel_seq_size_per_block - 1
         ) // kernel_seq_size_per_block + 1
@@ -468,9 +473,28 @@ class ATOMQwen35Moe(BaseModel):
     """Qwen3.5-MoE model class that starts ATOM runtime in rtp-llm."""
 
     @staticmethod
+    def _get_external_packages_from_args() -> list[str]:
+        option_name = "--external_model_packages"
+        argv = sys.argv[1:]
+        raw_value = ""
+
+        for idx, token in enumerate(argv):
+            if token == option_name:
+                if idx + 1 < len(argv) and not argv[idx + 1].startswith("-"):
+                    raw_value = argv[idx + 1]
+                break
+            if token.startswith(f"{option_name}="):
+                raw_value = token.split("=", 1)[1]
+                break
+
+        if not raw_value:
+            return []
+        return [item.strip() for item in raw_value.split(",") if item.strip()]
+
+    @staticmethod
     def _is_external_plugin_mode() -> bool:
-        modules = os.getenv("RTP_LLM_EXTERNAL_MODEL_PACKAGES", "")
-        return "atom.plugin.rtpllm.models" in modules
+        target = "atom.plugin.rtpllm.models"
+        return target in ATOMQwen35Moe._get_external_packages_from_args()
 
     @staticmethod
     def get_weight_cls():
@@ -581,23 +605,16 @@ class ATOMQwen35Moe(BaseModel):
         )
 
     @staticmethod
-    @contextmanager
-    def _maybe_disable_shared_expert_fusion_for_load(atom_model: Any):
-        has_standalone_shared_expert = any(
-            ".shared_expert." in name for name, _ in atom_model.named_parameters()
-        )
-        if not has_standalone_shared_expert:
-            yield
-            return
+    def _mark_standalone_shared_experts(atom_model: Any) -> None:
+        """Tell the loader to leave `shared_expert.*` on its own module.
 
-        import atom.model_loader.loader as atom_loader
-
-        origin_fn = atom_loader.is_rocm_aiter_fusion_shared_expert_enabled
-        atom_loader.is_rocm_aiter_fusion_shared_expert_enabled = lambda: False
-        try:
-            yield
-        finally:
-            atom_loader.is_rocm_aiter_fusion_shared_expert_enabled = origin_fn
+        Some Qwen3.5 FP8 checkpoints keep the shared expert standalone rather
+        than fused into the routed MoE buffer, in which case rewriting those
+        keys into `mlp.experts.<n_routed_experts>.*` sends them to a parameter
+        that does not exist.
+        """
+        if any(".shared_expert." in name for name, _ in atom_model.named_parameters()):
+            atom_model.disable_fused_shared_loading = True
 
     def load(self, skip_python_model: bool = False):
         # External plugin mode: bypass rtp-llm native weight loading path and
@@ -641,7 +658,7 @@ class ATOMQwen35Moe(BaseModel):
         old_default_dtype = torch.get_default_dtype()
         try:
             old_default_device = torch.get_default_device()
-        except Exception:
+        except AttributeError:
             old_default_device = None
 
         # rtp-llm plugin mode bypasses ATOM ModelRunner, so we need to align
@@ -786,14 +803,14 @@ class ATOMQwen35Moe(BaseModel):
 
             # External plugin mode: load checkpoint once through ATOM loader.
             # Keep Qwen3.5 MoE weight semantics aligned with #532 plugin path.
-            with self._maybe_disable_shared_expert_fusion_for_load(atom_model):
-                load_model_in_plugin_mode(
-                    model=atom_model,
-                    config=atom_config,
-                    prefix="model.",
-                    weights_mapper=self._make_qwen35_hf_mapper(),
-                    load_fused_expert_weights_fn=_load_fused_expert_weights_for_qwen35,
-                )
+            self._mark_standalone_shared_experts(atom_model)
+            load_model_in_plugin_mode(
+                model=atom_model,
+                config=atom_config,
+                prefix="model.",
+                weights_mapper=self._make_qwen35_hf_mapper(),
+                load_fused_expert_weights_fn=_load_fused_expert_weights_for_qwen35,
+            )
             _assert_norm_weights_loaded(atom_model)
             _inject_rtp_projection_weights(atom_model)
         finally:

@@ -4,12 +4,22 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime
 import json
 import re
+import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
+
+from interactivity import (
+    METHOD_MEDIAN_TPOT,
+    METHOD_P90_E2E,
+    locate_records,
+    p90_e2e_normalized_interactivity,
+)
+
+AGENTIC_BENCHMARK_KIND = "aiperf_agentic"
 
 RESULT_RE = re.compile(
     r"^pd-(?P<backend>[^-]+)-(?P<model>.+)-(?P<topology>[^-]+(?:-[^-]+)*)-"
@@ -97,6 +107,13 @@ def round_or_none(*values: Any, digits: int = 4) -> float | None:
 
 
 def interactivity_value(payload: dict[str, Any]) -> float | None:
+    # An already-resolved value wins: apply_p90_e2e_interactivity() writes the
+    # p90 e2e normalized number here, and without this branch perf_point() would
+    # silently re-derive the legacy median-TPOT value and overwrite it.
+    explicit = number(payload.get("interactivity"))
+    if explicit and explicit > 0:
+        return explicit
+
     median_tpot = number(payload.get("median_tpot_ms"), payload.get("median_itl_ms"))
     if median_tpot and median_tpot > 0:
         return 1000.0 / median_tpot
@@ -106,6 +123,55 @@ def interactivity_value(payload: dict[str, Any]) -> float | None:
         return 1000.0 / tpot
 
     return None
+
+
+def apply_p90_e2e_interactivity(
+    path: Path, payload: dict[str, Any], fields: dict[str, Any]
+) -> None:
+    """Set interactivity from the per-request AIPerf records when they exist.
+
+    Agentic traces run a ~1M-token prefill per turn, so 1000/median_TPOT sees
+    only the decode phase and hides the prefill cost entirely. The InferenceX
+    definition amortizes TTFT over the turn's output tokens and takes p90 of the
+    result -- see interactivity.py. It needs profile_export.jsonl, which only
+    AIPerf writes, so standard ISL/OSL runs keep the legacy formula and are
+    tagged as such.
+    """
+    if string_value(payload.get("benchmark_kind")) != AGENTIC_BENCHMARK_KIND:
+        payload.setdefault("interactivity_method", METHOD_MEDIAN_TPOT)
+        return
+
+    records = locate_records(
+        path,
+        model=string_value(fields.get("model")) or None,
+        topology=string_value(fields.get("topology")) or None,
+        concurrency=int_value(fields.get("conc")),
+        artifact_dir=string_value(payload.get("aiperf_artifact_dir")) or None,
+    )
+    if records is None:
+        print(
+            f"WARNING: {path.name} is an agentic result but no per-request "
+            f"records were found next to it; falling back to "
+            f"{METHOD_MEDIAN_TPOT} interactivity",
+            file=sys.stderr,
+        )
+        payload["interactivity_method"] = METHOD_MEDIAN_TPOT
+        return
+
+    try:
+        result = p90_e2e_normalized_interactivity(records)
+    except (OSError, ValueError) as exc:
+        print(
+            f"WARNING: cannot compute {METHOD_P90_E2E} interactivity from "
+            f"{records}: {exc}; falling back to {METHOD_MEDIAN_TPOT}",
+            file=sys.stderr,
+        )
+        payload["interactivity_method"] = METHOD_MEDIAN_TPOT
+        return
+
+    payload["interactivity"] = result["value"]
+    payload["interactivity_method"] = METHOD_P90_E2E
+    payload["interactivity_n_requests"] = result["n_requests"]
 
 
 def parse_payload_date(payload: dict[str, Any]) -> tuple[str | None, int | None]:
@@ -217,6 +283,10 @@ def topology_key(value: Any) -> str:
     return match.group("topology").replace("-", "_") if match else text
 
 
+def model_key(value: Any) -> str:
+    return string_value(value).strip().rstrip("/").split("/")[-1].lower()
+
+
 def derive_fields(path: Path, payload: dict[str, Any]) -> dict[str, Any] | None:
     match = RESULT_RE.match(path.name)
     if match:
@@ -294,6 +364,7 @@ def enrich_payload(
         "mean_tpot_ms",
         number(enriched.get("mean_tpot_ms"), enriched.get("mean_itl_ms")),
     )
+    apply_p90_e2e_interactivity(path, enriched, fields)
     enriched.setdefault("interactivity", interactivity_value(enriched))
     resources = topology_resources(enriched, fields)
     total_gpu = resources["total_gpu"]
@@ -328,7 +399,7 @@ def perf_point(
     payload: dict[str, Any],
     fields: dict[str, Any],
     run_url: str | None,
-    gsm8k: float | None,
+    accuracy: dict[str, Any] | None,
 ) -> dict[str, Any]:
     resources = topology_resources(payload, fields)
     run_date, timestamp = parse_payload_date(payload)
@@ -374,6 +445,9 @@ def perf_point(
         "timestamp": timestamp,
         "source": "ATOMesh",
         "client_bench": "inferencemax bench",
+        "benchmark_kind": string_value(payload.get("benchmark_kind")) or None,
+        "scenario": string_value(payload.get("scenario")) or None,
+        "public_dataset": string_value(payload.get("public_dataset")) or None,
         "model": string_value(
             payload.get("benchmark_model_name"), fields.get("model"), default="unknown"
         ),
@@ -423,6 +497,18 @@ def perf_point(
         "num_decode_gpu": resources["num_decode_gpu"],
         "total_gpu": total_gpu,
         "interactivity": round_or_none(interactivity),
+        # Which definition produced the value above -- agentic points computed
+        # from per-request records report p90_e2e_normalized, everything else
+        # reports median_tpot. The dashboard labels the two differently.
+        "interactivity_method": string_value(payload.get("interactivity_method"))
+        or METHOD_MEDIAN_TPOT,
+        "interactivity_n_requests": int_value(payload.get("interactivity_n_requests")),
+        # Prefill prefix-cache token hit rate as a 0-1 fraction. Absent unless the
+        # case enables prefix caching and the run was long enough for the engine
+        # to print a "[Cache Stats]" line.
+        "cache_hit_rate": round_or_none(payload.get("cache_hit_rate")),
+        "cache_hit_tokens": int_value(payload.get("cache_hit_tokens")),
+        "cache_total_tokens": int_value(payload.get("cache_total_tokens")),
         "tput_per_gpu": round_or_none(
             total_tput / total_gpu if total_tput and total_gpu else None
         ),
@@ -442,8 +528,26 @@ def perf_point(
         "slurm_job": string_value(payload.get("slurm_job_id")),
         "chart_group": "atomesh-model-performance",
         "chart_label": f"{hardware.upper()} ({display_backend} {precision.upper()})",
-        "gsm8k": round_or_none(gsm8k, digits=4),
+        "accuracy_task": accuracy.get("task") if accuracy else None,
+        "accuracy_metric": accuracy.get("metric") if accuracy else None,
+        "accuracy_score": (
+            round_or_none(accuracy.get("value"), digits=4) if accuracy else None
+        ),
+        "accuracy_score_raw": accuracy.get("raw") if accuracy else None,
+        "accuracy_strict": (
+            round_or_none(accuracy.get("strict"), digits=4) if accuracy else None
+        ),
+        "accuracy_resolved": (
+            int_value(accuracy.get("resolved")) if accuracy else None
+        ),
+        "accuracy_total": int_value(accuracy.get("total")) if accuracy else None,
+        "accuracy_threshold": (
+            round_or_none(accuracy.get("threshold"), digits=4) if accuracy else None
+        ),
+        "accuracy_fewshot": (int_value(accuracy.get("fewshot")) if accuracy else None),
     }
+    if accuracy and accuracy.get("task") == "gsm8k":
+        point["gsm8k"] = round_or_none(accuracy.get("value"), digits=4)
     return {key: value for key, value in point.items() if value is not None}
 
 
@@ -466,7 +570,7 @@ def dashboard_point_entry(point: dict[str, Any], extra: str) -> dict[str, Any] |
 def collect_dashboard_entries(
     paths: list[Path],
     run_url: str | None,
-    gsm8k_scores: dict[tuple[str, int], dict[str, Any]],
+    accuracy_scores: dict[tuple[str, str, int], dict[str, Any]],
     hardware: str | None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     entries: list[dict[str, Any]] = []
@@ -482,15 +586,30 @@ def collect_dashboard_entries(
             continue
         payload = enrich_payload(path, payload, fields, hardware)
         conc = int(payload.get("max_concurrency", fields["conc"]))
-        gsm8k_score = gsm8k_scores.get((topology_key(fields["topology"]), conc))
-        if gsm8k_score is None:
-            gsm8k_score = gsm8k_scores.get(("", conc))
-        gsm8k = gsm8k_score.get("value") if gsm8k_score else None
-        if gsm8k_score is not None:
-            payload["gsm8k"] = gsm8k
-            payload["gsm8k_raw"] = gsm8k_score.get("raw")
+        model = model_key(payload.get("benchmark_model_name") or fields["model"])
+        topology = topology_key(fields["topology"])
+        accuracy = accuracy_scores.get((model, topology, conc))
+        if accuracy is None:
+            accuracy = accuracy_scores.get(("", topology, conc))
+        if accuracy is None:
+            accuracy = accuracy_scores.get((model, "", conc))
+        if accuracy is None:
+            accuracy = accuracy_scores.get(("", "", conc))
+        if accuracy is not None:
+            payload["accuracy_task"] = accuracy.get("task")
+            payload["accuracy_metric"] = accuracy.get("metric")
+            payload["accuracy_score"] = accuracy.get("value")
+            payload["accuracy_score_raw"] = accuracy.get("raw")
+            payload["accuracy_strict"] = accuracy.get("strict")
+            payload["accuracy_resolved"] = accuracy.get("resolved")
+            payload["accuracy_total"] = accuracy.get("total")
+            payload["accuracy_threshold"] = accuracy.get("threshold")
+            payload["accuracy_fewshot"] = accuracy.get("fewshot")
+            if accuracy.get("task") == "gsm8k":
+                payload["gsm8k"] = accuracy.get("value")
+                payload["gsm8k_raw"] = accuracy.get("raw")
         extra = extra_text(payload, run_url, payload.get("slurm_job_id"))
-        point = perf_point(path, payload, fields, run_url, gsm8k)
+        point = perf_point(path, payload, fields, run_url, accuracy)
         point_entry = dashboard_point_entry(point, extra)
         if point_entry:
             entries.append(point_entry)
@@ -514,7 +633,7 @@ def eval_topology(path: Path) -> str:
     return ""
 
 
-def find_eval_scores(root: Path) -> dict[tuple[str, int], dict[str, Any]]:
+def find_eval_scores(root: Path) -> dict[tuple[str, str, int], dict[str, Any]]:
     scores = {}
     for path in sorted(root.rglob("results*.json")):
         payload = read_json(path)
@@ -523,24 +642,60 @@ def find_eval_scores(root: Path) -> dict[tuple[str, int], dict[str, Any]]:
         conc = eval_concurrency(path)
         if conc is None:
             continue
-        result = payload.get("results", {}).get("gsm8k", {})
-        score_raw = next(
-            (
-                value
-                for value in (
-                    result.get("exact_match,flexible-extract"),
-                    result.get("exact_match,strict-match"),
-                    result.get("acc"),
-                )
-                if value not in (None, "")
-            ),
-            None,
-        )
+        results = payload.get("results", {})
+        task = ""
+        metric = ""
+        score_raw = None
+        strict = None
+        resolved = None
+        total = None
+
+        if "swebench_lite" in results:
+            task = "swebench_lite"
+            metric = "resolved"
+            result = results[task]
+            score_raw = result.get("exact_match,resolved")
+            details = payload.get("swebench", {})
+            resolved = details.get("resolved")
+            total = details.get("total")
+        elif "gsm8k" in results:
+            task = "gsm8k"
+            metric = "flexible-extract"
+            result = results[task]
+            score_raw = next(
+                (
+                    value
+                    for value in (
+                        result.get("exact_match,flexible-extract"),
+                        result.get("exact_match,strict-match"),
+                        result.get("acc"),
+                    )
+                    if value not in (None, "")
+                ),
+                None,
+            )
+            strict = number(result.get("exact_match,strict-match"))
+        else:
+            continue
+
         score = number(score_raw)
         if score is not None:
-            scores[(eval_topology(path), conc)] = {
+            env = slurm_job_env(path)
+            task_config = payload.get("configs", {}).get(task, {})
+            global_config = payload.get("config", {})
+            fewshot = task_config.get("num_fewshot")
+            if fewshot is None:
+                fewshot = global_config.get("num_fewshot")
+            scores[(model_key(env.get("MODEL_NAME")), eval_topology(path), conc)] = {
+                "task": task,
+                "metric": metric,
                 "value": round(score, 4),
                 "raw": f"{score:.4f}",
+                "strict": round(strict, 4) if strict is not None else None,
+                "resolved": int_value(resolved),
+                "total": int_value(total),
+                "threshold": number(env.get("EVAL_THRESHOLD")),
+                "fewshot": int_value(fewshot),
             }
     return scores
 
@@ -549,12 +704,12 @@ def write_summary(rows: list[dict[str, Any]], summary_path: Path) -> None:
     lines = [
         "### ATOMesh Model Performance Benchmark Summary",
         "",
-        "| Hardware | Model | Topology | ISL/OSL | Concurrency | Interactivity | Total tok/s | Input tok/s | Output tok/s | Total tok/s/GPU | Input tok/s/GPU | Output tok/s/GPU | TTFT ms | TPOT ms | E2E ms | GSM8K |",
-        "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| Hardware | Model | Topology | ISL/OSL | Concurrency | Interactivity | Intvty def | Total tok/s | Input tok/s | Output tok/s | Total tok/s/GPU | Input tok/s/GPU | Output tok/s/GPU | TTFT ms | TPOT ms | E2E ms | Cache Hit | Accuracy Task | Accuracy |",
+        "| --- | --- | --- | --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: |",
     ]
     for row in rows:
         lines.append(
-            "| {hardware} | {model} | {topology} | {isl}/{osl} | {conc} | {interactivity} | {total} | {input_} | {output} | {total_per_gpu} | {input_per_gpu} | {output_per_gpu} | {ttft} | {tpot} | {e2e} | {gsm8k} |".format(
+            "| {hardware} | {model} | {topology} | {isl}/{osl} | {conc} | {interactivity} | {intvty_def} | {total} | {input_} | {output} | {total_per_gpu} | {input_per_gpu} | {output_per_gpu} | {ttft} | {tpot} | {e2e} | {cache_hit} | {accuracy_task} | {accuracy} |".format(
                 hardware=row.get("hardware", "--"),
                 model=row.get("benchmark_model_name", "--"),
                 topology=row.get("display_topology") or row.get("topology", "--"),
@@ -562,6 +717,11 @@ def write_summary(rows: list[dict[str, Any]], summary_path: Path) -> None:
                 osl=row.get("random_output_len", "--"),
                 conc=row.get("max_concurrency", "--"),
                 interactivity=fmt(row.get("interactivity")),
+                intvty_def=(
+                    "p90 e2e"
+                    if row.get("interactivity_method") == METHOD_P90_E2E
+                    else "median TPOT"
+                ),
                 total=fmt(row.get("total_token_throughput")),
                 input_=fmt(row.get("input_throughput")),
                 output=fmt(row.get("output_throughput")),
@@ -571,7 +731,9 @@ def write_summary(rows: list[dict[str, Any]], summary_path: Path) -> None:
                 ttft=fmt(row.get("mean_ttft_ms")),
                 tpot=fmt(row.get("mean_tpot_ms")),
                 e2e=fmt(row.get("mean_e2el_ms")),
-                gsm8k=fmt(row.get("gsm8k"), digits=4),
+                cache_hit=fmt_pct(row.get("cache_hit_rate")),
+                accuracy_task=row.get("accuracy_task") or "--",
+                accuracy=fmt(row.get("accuracy_score"), digits=4),
             )
         )
     summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -580,6 +742,12 @@ def write_summary(rows: list[dict[str, Any]], summary_path: Path) -> None:
 def fmt(value: Any, digits: int = 2) -> str:
     parsed = number(value)
     return "--" if parsed is None else f"{parsed:.{digits}f}"
+
+
+def fmt_pct(value: Any, digits: int = 2) -> str:
+    """Render a 0-1 fraction as a percentage; "--" when the metric is missing."""
+    parsed = number(value)
+    return "--" if parsed is None else f"{parsed * 100:.{digits}f}%"
 
 
 def main() -> None:
@@ -595,15 +763,15 @@ def main() -> None:
 
     root = Path(args.result_dir)
     bench_paths = list(root.rglob("pd-*.json"))
-    gsm8k_scores = find_eval_scores(root)
+    accuracy_scores = find_eval_scores(root)
     entries, rows = collect_dashboard_entries(
-        bench_paths, args.run_url, gsm8k_scores, args.hardware
+        bench_paths, args.run_url, accuracy_scores, args.hardware
     )
     Path(args.output).write_text(json.dumps(entries, indent=2), encoding="utf-8")
     write_summary(rows, Path(args.summary))
     print(
         f"Generated {len(entries)} dashboard entries from {len(rows)} benchmark result(s) "
-        f"and {len(gsm8k_scores)} GSM8K score(s)"
+        f"and {len(accuracy_scores)} accuracy score(s)"
     )
 
 

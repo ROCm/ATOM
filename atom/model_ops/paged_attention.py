@@ -190,7 +190,7 @@ class PagedAttention(BaseAttention):
         **kwargs,
     ):
         if is_vllm():
-            from atom.plugin.attention import (
+            from atom.plugin.vllm.attention_bridge import (
                 unified_attention_with_output_base_for_plugin_mode,
             )
 
