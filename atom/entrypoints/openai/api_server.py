@@ -77,7 +77,8 @@ from .serving_anthropic import (
     anthropic_to_openai_tools,
     build_anthropic_response,
     completes_a_tool_call,
-    stream_error,
+    read_whole_blocks,
+    stream_failure_frames,
     stream_message_delta,
     stream_message_start,
     stream_message_stop,
@@ -107,7 +108,6 @@ from .streaming_dispatch import (
 from .tool_parser import (
     ToolCallStreamParser,
     flatten_tool_events,
-    read_whole_events,
 )
 from .tool_parser.registry import (
     TOOL_CALL_PARSER_HELP,
@@ -2096,11 +2096,19 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                     # the reasoning filter or a tool parser cut the response
                     # mid-frame with an open block and no terminator.
                     logger.exception("Error streaming anthropic response")
-                    for _frame in blocks.close():
+                    for _frame in stream_failure_frames(
+                        exc,
+                        blocks,
+                        output_tokens,
+                        opening=(
+                            None
+                            if message_started
+                            else stream_message_start(
+                                request_id, model_name, input_tokens, 0
+                            )
+                        ),
+                    ):
                         yield _frame
-                    yield stream_error(str(exc))
-                    yield stream_message_delta("end_turn", output_tokens)
-                    yield stream_message_stop()
                 finally:
                     cleanup_stream(seq_id, aborted=aborted)
                     cleanup_request(request_id)
@@ -2128,30 +2136,28 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         # and what keeps a chain of thought out of the tool parser. Only
         # whether the client is shown it is a question, and the same one the
         # streaming branch above asks.
-        reasoning_content, content_with_tools = reasoning_channel(
-            prompt_starts_in_reasoning(prompt), thinking_off=thinking_off
-        ).split(raw_text)
-        if drop_reasoning:
-            reasoning_content = None
-        # The engine's own events, not the flattened `(content, calls)`:
-        # this endpoint renders blocks in order, and the flattening is where
-        # the order was lost. `read_whole_events` is the same single chunk
-        # through the same engine the streaming branch above drives.
-        events = read_whole_events(
+        # Both stages over one chunk, in the order the branch above streams
+        # them: reasoning filter, then the tool parser on the content segments
+        # it yields. Calling `.split()` here instead flattened the two into
+        # `(reasoning, content)` and lost the interleaving at that line.
+        events = read_whole_blocks(
+            reasoning_channel(
+                prompt_starts_in_reasoning(prompt), thinking_off=thinking_off
+            ),
             tool_call_parser_cls,
-            content_with_tools,
+            raw_text,
             anthropic_to_openai_tools(request.tools),
             suppress_calls=forbids_tool_calls(request.tool_choice),
         )
-        content_text, tool_calls = flatten_tool_events(events)
+        if drop_reasoning:
+            events = [e for e in events if e[0] != "reasoning"]
+        _, tool_calls = flatten_tool_events(events)
         output_tokens = len(tokenizer.encode(raw_text))
         cache_read_input_tokens = final_output.get("num_cached_tokens", 0)
         return build_anthropic_response(
             request_id=request_id,
             model=model_name,
-            content_text=content_text,
-            reasoning_content=reasoning_content,
-            tool_calls=tool_calls if tool_calls else None,
+            events=events,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             cache_read_input_tokens=cache_read_input_tokens,
@@ -2163,7 +2169,6 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
             stop_reason=anthropic_stop_reason_with_calls(
                 final_output.get("finish_reason"), bool(tool_calls)
             ),
-            events=events,
         )
 
     except _ClientDisconnected:

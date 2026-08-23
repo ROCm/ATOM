@@ -8,13 +8,18 @@ converts responses back to Anthropic format. Enables Claude Code and other
 Anthropic-compatible tools to use ATOM as a backend.
 """
 
+import base64
+import hashlib
 import json
 import logging
+import os
 from typing import Any
 
 from pydantic import BaseModel
 
+from .reasoning import ReasoningChannel
 from .sse import event_frame
+from .tool_parser import ToolCallStreamParser
 
 logger = logging.getLogger("atom")
 
@@ -166,6 +171,65 @@ def anthropic_to_openai_tools(tools: list[dict] | None) -> list[dict] | None:
 # ── Response Construction ──────────────────────────────────────────────
 
 
+def stream_failure_frames(exc, blocks, output_tokens: int, *, opening: str | None):
+    """Everything a stream that raised still owes the client.
+
+    ``opening`` is the `message_start` frame when the stream never sent one,
+    else ``None``. A failure before the first chunk otherwise produced a
+    stream whose first frame is `message_delta`, and the Anthropic SDK builds
+    its accumulator from `message_start` and raises on anything before it --
+    so the client saw an SDK error rather than the `error` frame this delivers.
+    """
+    if opening is not None:
+        yield opening
+    # Every block this stream opened has to be closed before the terminator.
+    yield from blocks.close()
+    yield stream_error(str(exc))
+    yield stream_message_delta("end_turn", output_tokens)
+    yield stream_message_stop()
+
+
+def _sig() -> str:
+    """The opaque signature Anthropic puts on a thinking block."""
+    return base64.b64encode(hashlib.sha256(os.urandom(32)).digest()).decode()
+
+
+def read_whole_blocks(
+    channel: ReasoningChannel,
+    parser_cls,
+    text: str,
+    tools: list | None = None,
+    *,
+    suppress_calls: bool = False,
+) -> list:
+    """One complete output as ordered events, reasoning included.
+
+    The streaming branch's own loop over a single chunk: the reasoning filter
+    first, the tool parser on the content segments it yields. `split()`
+    returns `(reasoning, content)` and loses the interleaving at that line, so
+    blocks rebuilt from the pair put a whole answer in one block ahead of a
+    `thinking` that belonged in the middle of it -- two blocks where streaming
+    sent three, for the same generation.
+
+    Not Anthropic-specific except that Anthropic is the only endpoint whose
+    wire format has an order to lose; the chat path's fields are flat.
+    """
+    reader = channel.stream()
+    engine = ToolCallStreamParser(
+        tools=tools, parser_cls=parser_cls, suppress_calls=suppress_calls
+    )
+    out: list = []
+    for field, segment in reader.process(text) + reader.flush():
+        if not segment:
+            continue
+        if field == "reasoning_content":
+            out.append(("reasoning", segment))
+        else:
+            out.extend(engine.process(segment))
+    out.extend(engine.flush())
+    return out
+
+
 def _blocks_in_order(events: list) -> list[dict]:
     """The engine's events as Anthropic content blocks, in arrival order.
 
@@ -184,9 +248,11 @@ def _blocks_in_order(events: list) -> list[dict]:
     blocks: list[dict] = []
     pending: dict | None = None
     for etype, data in events:
-        if etype == "content":
-            if not data:
-                continue
+        if not data and etype in ("reasoning", "content"):
+            continue
+        if etype == "reasoning":
+            blocks.append({"type": "thinking", "thinking": data, "signature": _sig()})
+        elif etype == "content":
             if blocks and blocks[-1]["type"] == "text":
                 blocks[-1]["text"] += data
             else:
@@ -194,16 +260,29 @@ def _blocks_in_order(events: list) -> list[dict]:
         elif etype == "tool_call_start":
             pending = {"id": data["id"], "name": data["function"]["name"]}
         elif etype == "tool_call_args" and pending is not None:
+            raw = data["function"]["arguments"] or "{}"
             try:
-                args = json.loads(data["function"]["arguments"] or "{}")
+                args = json.loads(raw)
             except (json.JSONDecodeError, TypeError):
+                # A call cut off mid-arguments. Logged rather than silent, as
+                # SGLang does: the client sees a call with no arguments and
+                # nothing else says why.
+                logger.warning(
+                    "tool call %s: arguments are not JSON, sending {}: %r",
+                    pending["name"],
+                    raw[:120],
+                )
                 args = {}
+            # Whatever decoded, verbatim. Coercing a non-dict to `{}` dropped
+            # a Kimi-K2 call's arguments on `stream=false` alone -- that
+            # format passes the wire bytes through and the streaming path
+            # forwards them for the SDK to accumulate.
             blocks.append(
                 {
                     "type": "tool_use",
                     "id": pending["id"],
                     "name": pending["name"],
-                    "input": args if isinstance(args, dict) else {},
+                    "input": args,
                 }
             )
             pending = None
@@ -213,91 +292,30 @@ def _blocks_in_order(events: list) -> list[dict]:
 def build_anthropic_response(
     request_id: str,
     model: str,
-    content_text: str,
-    reasoning_content: str | None = None,
-    tool_calls: list | None = None,
+    events: list,
     input_tokens: int = 0,
     output_tokens: int = 0,
     cache_read_input_tokens: int = 0,
     *,
     stop_reason: str,
-    events: list | None = None,
 ) -> dict:
-    """Build Anthropic Messages API response.
+    """One response, built from the ordered events and nothing else.
 
-    ``stop_reason`` has no default, and that is the point: this function used
-    to carry one and then overwrite it whenever `tool_calls` was non-empty, so
-    the answer `anthropic_stop_reason_with_calls` had already given the caller
-    was discarded and a response cut off at `max_tokens` mid-call came back as
-    an ordinary `tool_use`. Two places deciding one thing. Now there is one,
-    and a caller cannot forget to ask it.
+    It also took `(content_text, reasoning_content, tool_calls)` and rebuilt
+    the blocks from them, so this file held two tool_use builders and two
+    orderings -- the two-readers shape the rest of this branch exists to
+    delete. It cost what that always costs: reasoning was prepended ahead of
+    everything, so a model that answers, thinks and answers again came back as
+    `[thinking, text]` with the two answers glued together where streaming
+    sent `[text, thinking, text]`.
 
-    Args:
-        tool_calls: List of ToolCall objects (from tool_parser.parse_tool_calls).
-            Each has .name, .arguments (dict), .call_id.
+    `stop_reason` has no default on purpose -- it used to be overwritten here
+    whenever `tool_calls` was non-empty, discarding what
+    `anthropic_stop_reason_with_calls` had already decided.
     """
-    content = []
-
-    if reasoning_content:
-        import base64
-        import hashlib
-        import os
-
-        sig = base64.b64encode(hashlib.sha256(os.urandom(32)).digest()).decode()
-        content.append(
-            {
-                "type": "thinking",
-                "thinking": reasoning_content,
-                "signature": sig,
-            }
-        )
-
-    ordered = _blocks_in_order(events) if events is not None else None
-    if ordered is not None:
-        content.extend(ordered)
-    # A text block whenever the reply is not a tool call, even an empty one.
-    # The streaming path forces exactly this at the end of a response with no
-    # call, so a reply that was nothing but reasoning came back as
-    # `['thinking', 'text']` when streamed and `['thinking']` when not --
-    # and a client that reads only text blocks got nothing at all from the
-    # second.
-    if ordered is None and (content_text or not tool_calls):
-        content.append(
-            {
-                "type": "text",
-                "text": content_text,
-            }
-        )
-    elif ordered is not None and not ordered:
-        content.append({"type": "text", "text": ""})
-
-    if tool_calls and ordered is None:
-        # `stop_reason` is the caller's, not this function's. It used to be
-        # overwritten here, which threw away the answer
-        # `anthropic_stop_reason_with_calls` had already given the call site --
-        # so a response cut off at `max_tokens` mid-call came back as an
-        # ordinary `tool_use` with silently truncated arguments, and disagreed
-        # with the streaming path for the same generation.
-        for tc in tool_calls:
-            # ToolCall has .id, .function["name"], .function["arguments"]
-            func = tc.function if isinstance(tc.function, dict) else {}
-            args_str = func.get("arguments", "{}")
-            try:
-                args = json.loads(args_str) if isinstance(args_str, str) else args_str
-            except (json.JSONDecodeError, TypeError):
-                args = {}
-            content.append(
-                {
-                    "type": "tool_use",
-                    "id": tc.id,
-                    "name": func.get("name", ""),
-                    "input": args,
-                }
-            )
-
-    # Ensure at least one content block
-    if not content:
-        content.append({"type": "text", "text": ""})
+    # A response is never empty: Anthropic has no representation for one, and
+    # the streaming path forces a final text block for the same reason.
+    content = _blocks_in_order(events) or [{"type": "text", "text": ""}]
 
     return {
         "id": f"msg_{request_id}",
@@ -539,11 +557,7 @@ def stream_content_block_delta(index: int, text: str, block_type: str = "text") 
 
 def stream_signature_delta(index: int) -> str:
     """Emit a signature_delta for thinking blocks (required by Claude Code)."""
-    import base64
-    import hashlib
-    import os
-
-    dummy_sig = base64.b64encode(hashlib.sha256(os.urandom(32)).digest()).decode()
+    dummy_sig = _sig()
     return format_sse(
         "content_block_delta",
         {

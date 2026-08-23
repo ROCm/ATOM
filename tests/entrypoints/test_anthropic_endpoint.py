@@ -233,12 +233,45 @@ class TestAnthropicToOpenAITools:
 # ============================================================================
 
 
+def say(text):
+    return ("content", text)
+
+
+def think(text):
+    return ("reasoning", text)
+
+
+def call(cid, name, arguments):
+    """The two events one call is made of, as the engine emits them."""
+    return [
+        (
+            "tool_call_start",
+            {
+                "index": 0,
+                "id": cid,
+                "type": "function",
+                "function": {"name": name, "arguments": ""},
+            },
+        ),
+        ("tool_call_args", {"index": 0, "function": {"arguments": arguments}}),
+    ]
+
+
 class TestBuildAnthropicResponse:
+    """The builder, driven the way the endpoint drives it.
+
+    These used to pass `(content_text, reasoning_content, tool_calls)` and
+    exercised a second block builder that lived beside `_blocks_in_order` --
+    two orderings of one wire format, which is how the reasoning block came to
+    be prepended ahead of everything. There is one builder now, so the inputs
+    here are the events the engine actually produces.
+    """
+
     def test_basic_response(self):
         resp = build_anthropic_response(
             request_id="test123",
             model="test-model",
-            content_text="Hello!",
+            events=[say("Hello!")],
             input_tokens=10,
             output_tokens=5,
             stop_reason="end_turn",
@@ -247,81 +280,68 @@ class TestBuildAnthropicResponse:
         assert resp["role"] == "assistant"
         assert resp["model"] == "test-model"
         assert resp["id"] == "msg_test123"
-        assert len(resp["content"]) == 1
-        assert resp["content"][0]["type"] == "text"
-        assert resp["content"][0]["text"] == "Hello!"
+        assert resp["content"] == [{"type": "text", "text": "Hello!"}]
         assert resp["usage"]["input_tokens"] == 10
         assert resp["usage"]["output_tokens"] == 5
         assert resp["stop_reason"] == "end_turn"
 
-    def test_response_with_reasoning(self):
+    def test_reasoning_lands_where_the_model_put_it(self):
+        """Not simply "first". The old builder prepended it unconditionally,
+        which is right only when the model thought before saying anything."""
         resp = build_anthropic_response(
             request_id="test456",
-            model="test-model",
-            content_text="The answer is 42.",
-            reasoning_content="Let me think about this...",
-            input_tokens=20,
-            output_tokens=15,
+            model="m",
+            events=[think("Let me think..."), say("The answer is 42.")],
             stop_reason="end_turn",
         )
-        assert len(resp["content"]) == 2
-        assert resp["content"][0]["type"] == "thinking"
-        assert resp["content"][0]["thinking"] == "Let me think about this..."
-        assert resp["content"][1]["type"] == "text"
-        assert resp["content"][1]["text"] == "The answer is 42."
+        kinds = [(b["type"], b.get("thinking", b.get("text"))) for b in resp["content"]]
+        assert kinds == [
+            ("thinking", "Let me think..."),
+            ("text", "The answer is 42."),
+        ]
+
+    def test_and_an_answer_on_both_sides_of_it_stays_on_both_sides(self):
+        resp = build_anthropic_response(
+            request_id="r",
+            model="m",
+            events=[say("Sure."), think("hmm"), say("Answer.")],
+            stop_reason="end_turn",
+        )
+        assert [b["type"] for b in resp["content"]] == ["text", "thinking", "text"]
 
     def test_response_no_reasoning(self):
         resp = build_anthropic_response(
             request_id="test789",
             model="m",
-            content_text="Direct answer.",
+            events=[say("Direct answer.")],
             stop_reason="end_turn",
         )
-        assert len(resp["content"]) == 1
-        assert resp["content"][0]["type"] == "text"
+        assert resp["content"] == [{"type": "text", "text": "Direct answer."}]
 
     def test_response_with_tool_calls(self):
-        from atom.entrypoints.openai.tool_parser import ToolCall
-
-        tc = ToolCall(
-            id="call_0",
-            type="function",
-            function={"name": "read_file", "arguments": '{"path": "/tmp/foo.py"}'},
-        )
         resp = build_anthropic_response(
             request_id="test_tc",
             model="m",
-            content_text="Let me read that file.",
-            tool_calls=[tc],
+            events=[say("Let me read that file.")]
+            + call("call_0", "read_file", '{"path": "/tmp/foo.py"}'),
             stop_reason="tool_use",
         )
         assert resp["stop_reason"] == "tool_use"
-        types = [b["type"] for b in resp["content"]]
-        assert "text" in types
-        assert "tool_use" in types
-        tool_block = [b for b in resp["content"] if b["type"] == "tool_use"][0]
+        assert [b["type"] for b in resp["content"]] == ["text", "tool_use"]
+        tool_block = resp["content"][1]
         assert tool_block["name"] == "read_file"
         assert tool_block["input"] == {"path": "/tmp/foo.py"}
         assert tool_block["id"] == "call_0"
 
     def test_response_with_reasoning_and_tool_calls(self):
-        from atom.entrypoints.openai.tool_parser import ToolCall
-
-        tc = ToolCall(
-            id="call_1",
-            type="function",
-            function={"name": "bash", "arguments": '{"command": "ls"}'},
-        )
         resp = build_anthropic_response(
             request_id="test_rtc",
             model="m",
-            content_text="I'll run a command.",
-            reasoning_content="The user wants to list files.",
-            tool_calls=[tc],
+            events=[think("The user wants to list files."), say("I'll run a command.")]
+            + call("call_1", "bash", '{"command": "ls"}'),
             stop_reason="tool_use",
         )
-        types = [b["type"] for b in resp["content"]]
-        assert types == ["thinking", "text", "tool_use"]
+        assert [b["type"] for b in resp["content"]] == ["thinking", "text", "tool_use"]
         assert resp["stop_reason"] == "tool_use"
 
     def test_the_caller_s_stop_reason_is_the_one_returned(self):
@@ -332,48 +352,31 @@ class TestBuildAnthropicResponse:
         for the same generation. Checked by value; the test this replaces
         grepped the source for the call and passed while the value was thrown
         away."""
-        from atom.entrypoints.openai.tool_parser import ToolCall
-
-        tc = ToolCall(
-            id="call_3",
-            type="function",
-            function={"name": "bash", "arguments": '{"command": "l'},
-        )
+        events = call("call_3", "bash", '{"command": "l')
         for asked in ("max_tokens", "tool_use", "end_turn", "stop_sequence"):
             resp = build_anthropic_response(
-                request_id="r",
-                model="m",
-                content_text="",
-                tool_calls=[tc],
-                stop_reason=asked,
+                request_id="r", model="m", events=events, stop_reason=asked
             )
             assert (
                 resp["stop_reason"] == asked
             ), f"asked for {asked!r}, got {resp['stop_reason']!r}"
 
-    def test_response_empty_content_with_tool_call(self):
-        from atom.entrypoints.openai.tool_parser import ToolCall
-
-        tc = ToolCall(
-            id="call_2",
-            type="function",
-            function={"name": "bash", "arguments": '{"command": "pwd"}'},
-        )
+    def test_a_call_with_no_answer_around_it_is_the_only_block(self):
         resp = build_anthropic_response(
             request_id="test_empty",
             model="m",
-            content_text="",
-            tool_calls=[tc],
+            events=call("call_2", "bash", '{"command": "pwd"}'),
             stop_reason="tool_use",
         )
-        types = [b["type"] for b in resp["content"]]
-        assert "tool_use" in types
-        assert resp["stop_reason"] == "tool_use"
+        assert [b["type"] for b in resp["content"]] == ["tool_use"]
 
-
-# ============================================================================
-# SSE Streaming Format Tests
-# ============================================================================
+    def test_a_response_with_no_events_is_still_a_response(self):
+        """Anthropic has no representation for an empty content list, and the
+        streaming path forces a final text block for the same reason."""
+        resp = build_anthropic_response(
+            request_id="r", model="m", events=[], stop_reason="end_turn"
+        )
+        assert resp["content"] == [{"type": "text", "text": ""}]
 
 
 class TestSSEFormatting:
@@ -901,93 +904,16 @@ class TestAnEffortIsNotAnOptIn:
         assert guarded, "the toggle is written without asking whether it was stated"
 
 
-class TestTheBlocksArriveInTheSameOrderEitherWay:
-    """`/v1/messages` renders content blocks in order, so the order is answer.
+class TestTheEndpointAsksForTheOrder:
+    """The call site, which no builder test can reach.
 
-    The streaming path emits them as the engine produces them; the
-    non-streaming path was handed `(content_text, tool_calls)` -- the same
-    events with the order thrown away -- and rebuilt one text block ahead of
-    every `tool_use`. The same generation came back as
-    `['text','tool_use','tool_use']` unstreamed and
-    `['tool_use','text','tool_use']` streamed, so a client rendering in order
-    showed the sentence introducing the second call before the first call.
-
-    Not visible before this branch only because both paths were losing that
-    text; fixing the loss is what made the orders disagree.
+    Block-order parity itself now lives in
+    `test_anthropic_blocks.TestBothDeliveryModesBuildTheSameBlocks`, which
+    supersedes the class that used to be here: that one fed the raw text
+    straight to the tool parser on both sides, so it had no reasoning stage
+    and structurally could not see the defect where the reasoning block was
+    prepended ahead of everything.
     """
-
-    TOOLS = [
-        {
-            "name": "get_weather",
-            "input_schema": {
-                "type": "object",
-                "properties": {"city": {"type": "string"}},
-            },
-        }
-    ]
-    CALL = (
-        "<tool_call>\n<function=get_weather>\n"
-        "<parameter=city>{}</parameter>\n</function>\n</tool_call>"
-    )
-
-    def _both(self, text):
-        from atom.entrypoints.openai.serving_anthropic import (
-            AnthropicBlocks,
-            build_anthropic_response,
-            tool_event_frames,
-        )
-        from atom.entrypoints.openai.tool_parser import (
-            QwenXmlParser,
-            ToolCallStreamParser,
-            flatten_tool_events,
-            read_whole_events,
-        )
-
-        tools = api_server.anthropic_to_openai_tools(self.TOOLS)
-        events = read_whole_events(QwenXmlParser, text, tools)
-        content_text, calls = flatten_tool_events(events)
-        body = build_anthropic_response(
-            "r",
-            "m",
-            content_text,
-            tool_calls=calls or None,
-            stop_reason="tool_use",
-            events=events,
-        )
-        unstreamed = [b["type"] for b in body["content"]]
-
-        parser = ToolCallStreamParser(tools=tools, parser_cls=QwenXmlParser)
-        blocks, streamed_events = AnthropicBlocks(), []
-        for i in range(0, len(text), 7):
-            streamed_events += parser.process(text[i : i + 7])
-        streamed_events += parser.flush()
-        frames = list(tool_event_frames(streamed_events, blocks)) + list(blocks.close())
-        streamed = [
-            json.loads(line[6:])["content_block"]["type"]
-            for frame in frames
-            for line in frame.splitlines()
-            if line.startswith("data: ") and '"content_block_start"' in line
-        ]
-        return streamed, unstreamed
-
-    @pytest.mark.parametrize(
-        "shape",
-        ["between", "after", "before", "only-call", "no-call"],
-        ids=lambda s: s,
-    )
-    def test_the_two_paths_agree(self, shape):
-        one, two = self.CALL.format("Paris"), self.CALL.format("Tokyo")
-        text = {
-            "between": one + "Let me also check Tokyo." + two,
-            "after": one + "Done.",
-            "before": "Checking now." + one,
-            "only-call": one,
-            "no-call": "Just an answer.",
-        }[shape]
-        streamed, unstreamed = self._both(text)
-        assert (
-            streamed == unstreamed
-        ), f"{shape}: stream={streamed} but stream=false={unstreamed}"
 
     def test_and_the_endpoint_itself_asks_for_the_order(self):
         """The parity above tests the builder; this tests the call site.
@@ -1011,9 +937,3 @@ class TestTheBlocksArriveInTheSameOrderEitherWay:
                 f"build_anthropic_response at line {call.lineno} was not given "
                 "the engine's events, so its blocks come back in the wrong order"
             )
-
-    def test_and_the_sentence_lands_between_the_calls(self):
-        """Not merely equal -- equal to the order the model wrote."""
-        one, two = self.CALL.format("Paris"), self.CALL.format("Tokyo")
-        streamed, _ = self._both(one + "Let me also check Tokyo." + two)
-        assert streamed == ["tool_use", "text", "tool_use"]

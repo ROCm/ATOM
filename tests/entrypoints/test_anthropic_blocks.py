@@ -21,13 +21,21 @@ from typing import ClassVar
 
 import pytest
 
+from atom.entrypoints.openai.reasoning import ReasoningChannel
+from atom.entrypoints.openai.reasoning_dialects import DIALECTS
 from atom.entrypoints.openai.serving_anthropic import (
     AnthropicBlocks,
+    _blocks_in_order,
+    build_anthropic_response,
     completes_a_tool_call,
+    read_whole_blocks,
+    stream_failure_frames,
+    stream_message_start,
     tool_event_frames,
 )
 from atom.entrypoints.openai.tool_parser import ToolCallStreamParser
 from atom.entrypoints.openai.tool_parser.glm_tool_parser import GlmParser
+from entrypoints.wire_corpus import REAL_CALLS, TYPED_TOOLS
 
 KINDS = ("text", "thinking", "tool_use")
 
@@ -430,3 +438,203 @@ class TestOneCallSpansTwoParserBatches:
         assert blocks.open_call_index is None
         frames = list(tool_event_frames([later], blocks))
         assert frames == [], "arguments were adopted by a call that never existed"
+
+
+# ── The two delivery modes must build the same blocks ──────────────────
+
+
+def blocks_from_frames(frames: list[str]) -> list[dict]:
+    """The blocks a client accumulates from the stream."""
+    out: list[dict] = []
+    for f in frames:
+        name = f.split("event: ", 1)[1].split("\n", 1)[0]
+        data = json.loads(f.split("data: ", 1)[1])
+        if name == "content_block_start":
+            out.append(dict(data["content_block"]))
+        elif name == "content_block_delta":
+            delta, blk = data["delta"], out[-1]
+            for key in ("text", "thinking"):
+                if key in delta:
+                    blk[key] = blk.get(key, "") + delta[key]
+            if "partial_json" in delta:
+                blk["_json"] = blk.get("_json", "") + delta["partial_json"]
+    for blk in out:
+        if "_json" in blk:
+            raw = blk.pop("_json")
+            try:
+                blk["input"] = json.loads(raw or "{}")
+            except json.JSONDecodeError:
+                blk["input"] = raw
+    return out
+
+
+def shape_of(blocks: list[dict]) -> list[tuple]:
+    """Type and payload only -- a thinking block's signature is random."""
+    return [
+        (b["type"], b.get("text", b.get("thinking", b.get("input")))) for b in blocks
+    ]
+
+
+def stream_side(raw: str, channel, parser_cls, tools=None) -> list[dict]:
+    """The server's streaming loop, over one chunk.
+
+    Copied in shape from `api_server`'s Anthropic branch on purpose: phase 1
+    is the reasoning filter, phase 2 is the tool parser *on the content
+    segments only*, and the interleaving of the two is what a client sees.
+    """
+    rf, tp = channel.stream(), ToolCallStreamParser(tools=tools, parser_cls=parser_cls)
+    blocks, frames = AnthropicBlocks(), []
+    for field, text in rf.process(raw) + rf.flush():
+        if not text:
+            continue
+        if field == "reasoning_content":
+            frames += list(blocks.delta("thinking", text))
+        else:
+            frames += list(tool_event_frames(tp.process(text), blocks))
+    frames += list(tool_event_frames(tp.flush(), blocks))
+    frames += list(blocks.close())
+    return blocks_from_frames(frames)
+
+
+def nonstream_side(raw: str, channel, parser_cls, tools=None) -> list[dict]:
+    """The same generation through `stream=false`, as `api_server` builds it."""
+    events = read_whole_blocks(channel, parser_cls, raw, tools)
+    return build_anthropic_response(
+        request_id="r", model="m", events=events, stop_reason="end_turn"
+    )["content"]
+
+
+class TestBothDeliveryModesBuildTheSameBlocks:
+    """`/v1/messages` renders blocks in order, so order is part of the answer.
+
+    The streaming branch interleaves as the model wrote: reasoning filter
+    first, tool parser on the content segments it yields. The non-streaming
+    branch calls `split()`, which returns `(reasoning, content)` -- position
+    gone at that line -- and then rebuilds blocks from the flat pair. So a
+    model that answers, thinks, and answers again came back as two blocks with
+    the two answers glued together where streaming sent three.
+
+    Parity is the right property here, unlike the reasoning split one stage
+    down where both readers were wrong together: streaming is correct and
+    non-streaming is not, so the canonical shape is asserted outright too.
+    """
+
+    SHAPES: ClassVar[dict[str, str]] = {
+        "answer only": "The answer is 42.",
+        "reasoning then answer": "<think>hmm</think>The answer is 42.",
+        "answer, reasoning, answer": "Sure.<think>hmm</think>Answer.",
+        "reasoning only": "<think>hmm</think>",
+        "answer then a call": "Checking.{call}",
+        "reasoning, answer, call": "<think>hmm</think>Checking.{call}",
+        "call then answer": "{call}All done.",
+        # The shape this branch has broken twice: a sentence the model wrote
+        # between two calls, which an extra span competing for a call hoists
+        # in front of both.
+        "call, sentence, call": "{call}Now Rome.{other}",
+        "reasoning between two calls": "{call}<think>and Rome</think>{other}",
+    }
+
+    @staticmethod
+    def _channel():
+        return ReasoningChannel(dialect=DIALECTS[2], starts_open=False)
+
+    @pytest.mark.parametrize("name", sorted(SHAPES))
+    def test_the_block_sequence_is_identical(self, name):
+        raw = self.SHAPES[name].format(
+            call=REAL_CALLS["glm"],
+            other=REAL_CALLS["glm"].replace("get_weather", "get_time"),
+        )
+        ch = self._channel()
+        streamed = shape_of(stream_side(raw, ch, GlmParser, TYPED_TOOLS))
+        whole = shape_of(nonstream_side(raw, ch, GlmParser, TYPED_TOOLS))
+        assert whole == streamed, (
+            f"{name}: stream=false built {whole}\n"
+            f"{' ' * len(name)}  stream=true  built {streamed}"
+        )
+
+    def test_and_the_order_is_the_one_the_model_wrote(self):
+        """The canonical shape, asserted rather than only compared.
+
+        Both paths agreeing on the wrong order would satisfy the property
+        above; this says which order is right.
+        """
+        ch = self._channel()
+        raw = "Sure.<think>hmm</think>Answer."
+        assert shape_of(stream_side(raw, ch, None)) == [
+            ("text", "Sure."),
+            ("thinking", "hmm"),
+            ("text", "Answer."),
+        ]
+
+    def test_and_a_call_whose_arguments_are_not_an_object_keeps_them(self):
+        """Kimi-K2 passes the wire bytes through, so `arguments` need not be a
+        JSON object. Streaming forwards them and the SDK accumulates the real
+        value; the non-streaming builder replaced anything but a dict with
+        `{}`, so the tool was invoked with no arguments on one path and the
+        right ones on the other -- silently, with no log."""
+        events = [
+            (
+                "tool_call_start",
+                {
+                    "index": 0,
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "t", "arguments": ""},
+                },
+            ),
+            ("tool_call_args", {"index": 0, "function": {"arguments": "[1, 2]"}}),
+        ]
+        streamed = shape_of(
+            blocks_from_frames(list(tool_event_frames(events, AnthropicBlocks())))
+        )
+        whole = shape_of(_blocks_in_order(events))
+        assert whole == streamed == [("tool_use", [1, 2])]
+
+
+class TestAStreamThatFailedStillOwesTheClientAWholeMessage:
+    """The error tail, which the endpoint used to write out inline.
+
+    It emitted `error` / `message_delta` / `message_stop` without checking
+    whether `message_start` had gone out. The flag is only set inside the
+    loop, after the first `await stream_collector.get()` returns -- so an
+    engine error, a detokenizer failure or an abort surfacing on that first
+    call produced a stream that never opened, and the SDK raises on a
+    `message_delta` arriving before `message_start`. The client got an
+    SDK-internal error instead of the `error` frame this exists to deliver.
+    """
+
+    @staticmethod
+    def _names(frames):
+        return [f.split("event: ", 1)[1].split("\n", 1)[0] for f in frames]
+
+    def test_it_opens_the_message_when_nothing_opened_it(self):
+        frames = list(
+            stream_failure_frames(
+                RuntimeError("boom"),
+                AnthropicBlocks(),
+                0,
+                opening=stream_message_start("r", "m", 0, 0),
+            )
+        )
+        names = self._names(frames)
+        assert names[0] == "message_start", names
+        assert names[-1] == "message_stop", names
+        assert "error" in names
+
+    def test_but_does_not_open_it_twice(self):
+        frames = list(
+            stream_failure_frames(
+                RuntimeError("boom"), AnthropicBlocks(), 0, opening=None
+            )
+        )
+        names = self._names(frames)
+        assert "message_start" not in names, names
+        assert names[-1] == "message_stop", names
+
+    def test_and_closes_a_block_that_was_left_open(self):
+        blocks = AnthropicBlocks()
+        list(blocks.delta("text", "half an ans"))
+        frames = list(
+            stream_failure_frames(RuntimeError("boom"), blocks, 0, opening=None)
+        )
+        assert self._names(frames)[0] == "content_block_stop", self._names(frames)
