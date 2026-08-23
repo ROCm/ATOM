@@ -563,3 +563,81 @@ class TestTheRenderedPromptIsNotCopiedToReadItsEnd:
             f"{self.LARGE_KB} KB allocated {large} bytes against {small} for "
             f"{self.SMALL_KB} KB; the prompt is being copied to read its end"
         )
+
+
+class TestNonReasoningOutputIsNotWithheld:
+    """A stream that never opens a reasoning channel must still reach the client.
+
+    The shapes are PR #1961's, kept verbatim. They came off an observed
+    production stall -- 1.5-2.4% of requests on a Claude-Code agent corpus
+    returned HTTP 200 and then zero body bytes until the client's 600s read
+    timeout, while the engine decoded to `max_tokens` -- and an observed shape
+    is worth more than one invented to fit the rule.
+
+    The rule itself is `TestBoundedWithhold` in
+    `test_stream_marker_properties.py`, which asks it of every registered
+    dialect crossed with every format, against a control with the trigger
+    characters neutralised. These are the point cases beside that axis, and
+    they pass here for a structural reason rather than a patched one: the
+    buffer-and-threshold state machine #1961 fixes (`len(self.buf) > 100 and
+    "<" not in self.buf`, which withheld everything for as long as the answer
+    contained a `<` anywhere -- and code is full of them) no longer exists.
+    `MarkerScanner` releases whatever cannot begin a declared marker, so there
+    is no threshold to tune and nowhere for the defect to live.
+
+    Measured against a scanner mutated to withhold anything containing a `<`:
+    the first two catch it, the last three are feature guards and correctly do
+    not, and `test_token_by_token_code_output_streams` does not either -- it
+    asserts only that *something* was emitted, and under partial withholding
+    something still is. Said out loud because a test that cannot fail reads
+    like one that can. `TestBoundedWithhold` is where the discrimination
+    lives: it compares the first content byte's offset against the same text
+    with its trigger characters neutralised.
+    """
+
+    @staticmethod
+    def _emit(chunks):
+        f = ReasoningFilter()
+        out = []
+        for c in chunks:
+            out.extend(f.process(c))
+        return out
+
+    def test_angle_bracket_in_plain_output_does_not_withhold_forever(self):
+        # A '<' that is not a reasoning marker: the classic case is code.
+        text = "Here is the fix:\n\nif (a < b) { return a; }\n" + "x" * 200
+        emitted = self._emit([text])
+        assert emitted, "nothing was emitted: the stream would stall"
+        assert "".join(t for f, t in emitted if f == "content").startswith(
+            "Here is the fix:"
+        )
+
+    def test_html_like_output_does_not_withhold_forever(self):
+        emitted = self._emit(["<div class='x'>hello</div>\n" + "y" * 200])
+        assert emitted, "nothing was emitted: the stream would stall"
+
+    def test_token_by_token_code_output_streams(self):
+        # The real shape: many small chunks, one of which contains '<'.
+        chunks = ["Sure. ", "Use ", "a < b ", "to compare. "] + [
+            "word " for _ in range(60)
+        ]
+        assert self._emit(chunks), "nothing was emitted: the stream would stall"
+
+    def test_a_real_think_block_still_separates(self):
+        # The fix must not cost the feature it guards.
+        out = self._emit(["<think>", "pondering", "</think>", "answer"])
+        assert ("reasoning_content", "pondering") in out
+        assert ("content", "answer") in out
+
+    def test_partial_end_marker_is_still_held_back(self):
+        # A marker split across chunks must not leak as content.
+        out = self._emit(["<think>", "abc", "</thi"])
+        assert not any("</thi" in t for _, t in out), "leaked a partial marker"
+
+    def test_template_injected_opener_still_reaches_end_marker(self):
+        f = ReasoningFilter(starts_thinking=True)
+        out = []
+        for c in ["reasoning here", "</think>", "final"]:
+            out.extend(f.process(c))
+        assert ("reasoning_content", "reasoning here") in out
+        assert ("content", "final") in out

@@ -5,6 +5,7 @@
 
 import ast
 import asyncio
+import inspect
 import json
 import pathlib
 
@@ -16,7 +17,7 @@ from atom.entrypoints.openai.protocol import (
     openai_stop_reason,
     openai_stop_reason_with_calls,
 )
-from atom.entrypoints.openai.reasoning import NO_REASONING
+from atom.entrypoints.openai.reasoning import NO_REASONING, ReasoningChannel
 from atom.entrypoints.openai.serving_anthropic import (
     anthropic_to_openai_tools,
     completes_a_tool_call,
@@ -796,3 +797,85 @@ class TestBothEndpointsAskOneQuestionAboutAToolName:
         assert accepted == usable_tool_name(
             name
         ), f"/v1/messages and /v1/chat/completions disagree about {name!r}"
+
+
+class TestFanoutSeedsImplicitReasoning:
+    """A template-injected opener must reach every fan-out sibling's filter.
+
+    PR #1961's class, translated: it passed `starts_thinking: bool` and this
+    branch passes a `ReasoningChannel`, because the dialect and the
+    starts-open flag were being handed to different readers and had to travel
+    together. The assertions are the same three.
+
+    Kept as behaviour beside `TestEverySeedingSiteIsSeeded`, which walks the
+    AST of `atom/entrypoints/` and refuses an unseeded construction site. That
+    scan is structural and would pass a site that is seeded with the wrong
+    thing; this one drives the generator and reads the deltas. #1961 makes the
+    point that decides it: a direct `ReasoningFilter(starts_thinking=True)`
+    unit test cannot catch this, because the defect is in the wiring.
+    """
+
+    # Long enough to pass any grace period a buffering filter might have, and
+    # carrying a '<' -- the two conditions that decided whether unseeded
+    # reasoning leaked.
+    REASONING = "Checking the bound: if (a < b) we return a. " + "Considering. " * 12
+
+    def _deltas(self, starts_open):
+        """Every delta the fan-out yields for a two-sibling reasoning stream."""
+
+        async def run():
+            collector = StreamOutputCollector("req-rs")
+            for index in (0, 1):
+                collector.put_nowait(
+                    (
+                        index,
+                        {"text": self.REASONING, "token_ids": [1], "finished": False},
+                    )
+                )
+            gen = stream_chat_response_fanout(
+                request_id="req-rs",
+                model="model",
+                shared_collector=collector,
+                seq_ids=[0, 1],
+                num_prompt_tokens=1,
+                cleanup_stream=lambda *a, **k: None,
+                cleanup_request=lambda *a, **k: None,
+                reasoning=ReasoningChannel(starts_open=starts_open),
+            )
+            out = []
+            for _ in range(6):
+                try:
+                    raw = await asyncio.wait_for(gen.__anext__(), timeout=2)
+                except (StopAsyncIteration, TimeoutError):
+                    break
+                if raw.startswith("data: ") and not raw.startswith("data: [DONE]"):
+                    out.append(json.loads(raw[6:])["choices"][0]["delta"])
+            await gen.aclose()
+            return out
+
+        return asyncio.run(run())
+
+    def test_pre_close_text_is_reasoning_not_content(self):
+        deltas = self._deltas(starts_open=True)
+
+        leaked = [d for d in deltas if d.get("content")]
+        assert not leaked, f"reasoning leaked to content: {leaked}"
+        assert any(
+            d.get("reasoning_content") for d in deltas
+        ), f"no reasoning_content was emitted at all: {deltas}"
+
+    def test_without_the_seed_the_same_text_is_not_reasoning(self):
+        # The contrast that shows the seed is what classified it, not the text.
+        # Asserting the text arrives as *content* here would not work: content
+        # segments pass through the tool-call parser, which holds them until
+        # the stream finishes, while reasoning_content is forwarded at once.
+        assert not any(
+            d.get("reasoning_content") for d in self._deltas(starts_open=False)
+        )
+
+    def test_both_streaming_entry_points_accept_the_seed(self):
+        # #1961's bug was a missing parameter, so pin the shape of both.
+        for fn in (stream_chat_response, stream_chat_response_fanout):
+            assert (
+                "reasoning" in inspect.signature(fn).parameters
+            ), f"{fn.__name__} cannot be told the prompt opened reasoning"
