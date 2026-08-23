@@ -12,9 +12,10 @@ Two properties have to hold, and neither shows up in a throughput number:
   `BlockManager` append into a `BufferError`, far from the code that took it.
 
 The marshals are exercised as unbound methods on a stub that supplies what
-they read, so the arithmetic under test is the shipped arithmetic. Both now
-delegate to `pack_rows`, whose own contract -- which rows it clears, and which
-destinations it refuses -- is pinned at the bottom of this file.
+they read, so the arithmetic under test is the shipped arithmetic. Every
+builder here lives in a module that imports AITER at load, so this file skips
+whole on a plain runner; the contract of the `pack_rows` helper they share is
+in `test_pack_rows.py`, which does not, and so runs in CI.
 """
 
 from __future__ import annotations
@@ -27,8 +28,12 @@ import numpy as np
 import pytest
 
 from atom.model_engine.sequence import new_block_table
-from atom.model_ops.attentions.backends import CommonAttentionBuilder
-from atom.utils import pack_rows
+
+CommonAttentionBuilder = pytest.importorskip(
+    "atom.model_ops.attentions.backends",
+    reason="the common builder's module imports aiter at load",
+    exc_type=ImportError,
+).CommonAttentionBuilder
 
 V4Builder = pytest.importorskip(
     "atom.model_ops.attentions.deepseek_v4_attn",
@@ -110,39 +115,6 @@ def test_v4_marshal_is_bit_exact_and_stays_in_its_rows(bs):
     assert (dst[bs:] == POISON).all(), "wrote past the scheduled rows"
 
 
-def test_a_non_contiguous_destination_raises_rather_than_dropping_writes():
-    """Flattening a non-contiguous buffer with `reshape(-1)` yields a copy, so
-    every row would be written into a temporary and lost with it. `.cast`
-    refuses instead, and unlike an assert it still refuses under `python -O`.
-    """
-    backing = np.full((MAX_BS, MAX_COLS * 2), POISON, dtype=np.int32)
-    dst = backing[:, :MAX_COLS]  # a view, so rows are not adjacent
-    assert not dst.flags.c_contiguous
-
-    with pytest.raises(TypeError, match="C-contiguous"):
-        CommonAttentionBuilder.prepare_block_tables(
-            _stub(dst), SimpleNamespace(block_tables=_rows(4))
-        )
-
-    # Positive control: the failure mode being guarded is real and silent.
-    assert not np.shares_memory(dst.reshape(-1), dst)
-
-
-def test_an_over_wide_row_raises_instead_of_reaching_the_next_one():
-    """`block_tables[i, :n] = row` raised when a row was too wide; a flat write
-    would land the overflow in the next request's row instead, leaving it a
-    block table that points at someone else's KV.
-    """
-    dst = np.full((MAX_BS, MAX_COLS), POISON, dtype=np.int32)
-    rows = _rows(3)
-    rows[1] = new_block_table(range(MAX_COLS + 1))
-
-    with pytest.raises(ValueError, match="exceeds"):
-        CommonAttentionBuilder.prepare_block_tables(
-            _stub(dst), SimpleNamespace(block_tables=rows)
-        )
-
-
 def test_empty_batch_writes_nothing():
     """A warmup batch carries no block tables and must leave the buffer alone."""
     dst = np.full((MAX_BS, MAX_COLS), POISON, dtype=np.int32)
@@ -213,45 +185,6 @@ def test_tbo_prefill_stash_does_not_pin_the_rows_it_keeps():
     for i, row in enumerate(kept):
         dst[i, : len(row)] = row
     assert (dst[0, : len(rows[0])] == np.asarray(rows[0][: len(rows[0])])).all()
-
-
-def test_pack_rows_clears_the_rows_it_fills_and_leaves_the_rest():
-    """Its callers hand it an uncleared destination -- `np.empty` at the TBO
-    site -- and rely on it to zero-fill each row's tail itself. What it must
-    not do is clear rows nobody scheduled."""
-    dst = np.full((6, MAX_COLS), POISON, dtype=np.int32)
-    rows = _rows(3)
-
-    pack_rows(dst, rows)
-
-    for i, row in enumerate(rows):
-        assert list(dst[i, : len(row)]) == list(row)
-        assert (dst[i, len(row) :] == 0).all(), "row tail not cleared"
-    assert (dst[len(rows) :] == POISON).all(), "cleared rows it was not given"
-
-
-def test_pack_rows_refuses_more_rows_than_the_destination_holds():
-    """The other edge a flat write does not have. Unchecked, this surfaces as
-    a memoryview structure error from whichever row ran off the end."""
-    dst = np.full((3, MAX_COLS), POISON, dtype=np.int32)
-
-    with pytest.raises(ValueError, match="rows exceed"):
-        pack_rows(dst, _rows(4))
-
-    pack_rows(dst, _rows(3))  # control: exactly full is fine
-
-
-def test_pack_rows_refuses_a_destination_whose_bits_it_would_reinterpret():
-    """`.cast("i")` reinterprets rather than converts, so a destination of any
-    other dtype would take the block ids as raw bits."""
-    dst = np.zeros((4, MAX_COLS), dtype=np.float32)
-
-    with pytest.raises(TypeError, match="int32"):
-        pack_rows(dst, _rows(2))
-
-    # Control: nothing about the cast itself would have complained.
-    dst[0, 0] = 1.0
-    assert memoryview(dst).cast("B").cast("i")[0] == 1065353216
 
 
 def test_int32_asarray_over_a_block_table_is_the_hazard_being_guarded():

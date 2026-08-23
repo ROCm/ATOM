@@ -134,7 +134,7 @@ def get_device_indices(
 def mark_spliting_op(
     is_custom: bool,
     gen_fake: Callable[..., Any] | None = None,
-    mutates_args: list[str] = [],
+    mutates_args: list[str] | None = None,
 ):
     def decorator(func):
         if not is_custom:
@@ -144,7 +144,7 @@ def mark_spliting_op(
         direct_register_custom_op(
             op_name=func.__name__,
             op_func=func,
-            mutates_args=mutates_args,
+            mutates_args=mutates_args if mutates_args is not None else [],
             fake_impl=gen_fake,
         )
         registered_op = getattr(torch.ops.aiter, func.__name__)
