@@ -133,6 +133,27 @@ def naming_another_tool(name: str) -> str:
     return REAL_CALLS[name].replace(TOOL, OTHER_TOOL)
 
 
+def naming_nothing(name: str) -> str:
+    """The same call with no name at all -- `<invoke name="">`.
+
+    Every format's name slot is `[^"]*` or the equivalent, so the wire admits
+    this and three formats used to hand it on as a call the client could not
+    dispatch.
+    """
+    return REAL_CALLS[name].replace(TOOL, "")
+
+
+def naming_only_spaces(name: str) -> str:
+    """The same call named with whitespace.
+
+    Kept apart from :func:`naming_nothing` because the two were not equivalent:
+    MiniMax rejected the empty name and shipped this one, having tested for
+    emptiness *before* stripping. A single shape would have found two of the
+    three formats and called the axis covered.
+    """
+    return REAL_CALLS[name].replace(TOOL, "   ")
+
+
 def truncated_naming_another_tool(name: str) -> str:
     """A cut-off call for the *other* tool.
 
@@ -176,6 +197,25 @@ def quoting_the_arguments(name: str) -> str | None:
         # no parameter markup and there is nothing here to misread.
         return None
     return f"You open one with {marker} and then write {after_the_name}"
+
+
+def quoting_a_call_it_will_not_make(name: str) -> str:
+    """Markup this format's call pattern *matches* and its gate then rejects.
+
+    Distinct from :func:`quoting_the_opener`, and the distinction is the whole
+    point. That one stops before the name, so for a format whose pattern wants
+    more than an opener -- Kimi's entry needs `functions.NAME:INDEX` -- the
+    pattern never matches and the parser has nothing to reject. A property
+    about *what happens to a rejected match* is then vacuous: it passed on
+    every format, before and after the fix it was written for.
+
+    So: a call cut off mid-argument, naming a tool the request never declared.
+    Unclosed, so the truncation gate runs; undeclared, so it refuses. Both
+    halves are format-generic -- every format gates an unclosed alternative on
+    a declared name, which `TestAFormatDeclaresEveryTokenItStrips` and the
+    truncation table already hold them to.
+    """
+    return cut_at_payload(REAL_CALLS[name].replace(TOOL, "undeclared_thing"))
 
 
 def quoting_the_opener(name: str) -> str:

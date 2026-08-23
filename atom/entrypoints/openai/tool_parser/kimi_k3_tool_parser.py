@@ -31,6 +31,7 @@ from .tool_parser import (
     continues_a_call,
     declared_tools_allow,
     unique_tool_call_id,
+    usable_tool_name,
 )
 
 # K3 channel tokens this parser matches on. Kept local so the parser is
@@ -236,6 +237,11 @@ class KimiK3Parser(ToolCallParser):
         tool_calls: list[ToolCall] = []
         spans: list[tuple[int, int]] = []
         for m in _K3_CALL_RE.finditer(region):
+            # Before the truncation gate, which only runs for an unclosed
+            # call: `tool="(?P<name>[^"]*)"` matches an empty and an all-space
+            # name, and a *closed* one had nothing to stop it.
+            if not usable_tool_name(m.group("name")):
+                continue
             if m.group("closed") is None and not _is_truncated_call(
                 m.group("name"), m.group("body"), param_types, at_end=at_end
             ):

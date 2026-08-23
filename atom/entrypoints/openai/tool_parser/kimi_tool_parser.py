@@ -79,9 +79,19 @@ def _is_truncated_call(
 
 def _parse_entries(
     section_text: str, param_types: dict, *, at_end: bool
-) -> list[ToolCall]:
-    """Parse individual tool call entries from the section content."""
+) -> tuple[list[ToolCall], int]:
+    """The entries this section really made, and where the first one starts.
+
+    The offset is returned rather than recomputed by the caller, because the
+    caller cannot: entries that fail the truncation gate are skipped here, and
+    asking `_ENTRY_RE.search` for the first *match* answers a different
+    question than "the first entry we accepted". They differ exactly when an
+    answer quotes the wire format before making a real call, which is the case
+    the section anchor exists for -- so the recomputation was wrong precisely
+    where it mattered.
+    """
     tool_calls = []
+    first_start = -1
     for match in _ENTRY_RE.finditer(section_text):
         name = match.group(1)
         index = match.group(2)
@@ -96,6 +106,8 @@ def _parse_entries(
         # becomes an `input_json_delta` the Anthropic SDK cannot accumulate.
         arguments = match.group(3).strip() or "{}"
         tool_id = f"functions.{name}:{index}"
+        if first_start < 0:
+            first_start = match.start()
         tool_calls.append(
             ToolCall(
                 id=tool_id,
@@ -103,7 +115,7 @@ def _parse_entries(
                 function={"name": name, "arguments": arguments},
             )
         )
-    return tool_calls
+    return tool_calls, first_start
 
 
 class KimiParser(ToolCallParser):
@@ -150,15 +162,23 @@ class KimiParser(ToolCallParser):
         output -- which is what `_SECTION_RE.search` did -- lost the second
         call entirely and delivered the raw wire tokens of both as content.
         """
-        entries = _parse_entries(region, build_param_types(tools), at_end=at_end)
+        entries, first_start = _parse_entries(
+            region, build_param_types(tools), at_end=at_end
+        )
         if not entries:
             return RegionParse()
         # The region opens at the *first* section marker in the text, which an
         # answer that quotes one before making a real call puts in the wrong
         # place. The section that matters is the last one opened before the
         # first entry; everything before it is the answer.
-        first = _ENTRY_RE.search(region)
-        opened = region.rfind(KIMI_SECTION_BEGIN, 0, first.start())
+        #
+        # The first entry *accepted*, not the first thing the entry pattern
+        # matched. `_ENTRY_RE.search` was the latter, so a quotation the
+        # truncation gate had already rejected still moved the anchor back to
+        # its section -- and the sentence the model wrote between the
+        # quotation and its real call was deleted as markup. The other five
+        # formats keep it; this was the only one that did not.
+        opened = region.rfind(KIMI_SECTION_BEGIN, 0, first_start)
         # One span for the whole section, not one per entry: `region_end`
         # already hands this exactly one section, and between two entries
         # there is only `<|tool_call_end|><|tool_call_begin|>` -- special

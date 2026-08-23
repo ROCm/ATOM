@@ -28,13 +28,14 @@ from .tool_parser import (
     continues_a_call,
     declared_tools_allow,
     unique_tool_call_id,
+    usable_tool_name,
 )
 
 TOOL_CALL_OPEN = "<tool_call>"
 # A call's body may not contain another `<tool_call>`. Without that the
 # non-greedy match ran from the *first* opener in the region to the first
 # close, so an answer that quotes the tag and then makes a real call produced
-# a "name" of the whole sentence -- rejected by `_TOOL_NAME_RE`, after which
+# a "name" of the whole sentence -- rejected by `usable_tool_name`, after which
 # `finditer` resumed past the real call and found nothing at all. The tag is
 # what this format opens a call with, so it cannot appear inside one.
 _NOT_NESTED = r"(?:(?!<tool_call>).)"
@@ -52,20 +53,14 @@ _TOOLCALL_RE = re.compile(
 # opener, so `finditer` skipped the first call entirely and returned the
 # second -- one call where the model made two, and a different one from the
 # one the early name had already announced.
-# A tool name is an identifier, which is what the model was given. Without
-# this the unterminated branch above turns any prose after a `<tool_call>`
-# into a call: an answer explaining that "the model writes <tool_call>
-# followed by the name" produced a call named " followed by the name. Hope
-# that helps!", and a Hermes-style `<tool_call>{"name": ...}` produced one
-# named after the whole JSON object. Both reached clients as `tool_calls`.
-#
-# `\w` and not `[A-Za-z_]`: OpenAI's own grammar is `^[a-zA-Z0-9_-]{1,64}$`,
-# so a leading digit is legal (`7z_extract`), and `\w` is Unicode-aware, so a
-# CJK name is too -- which matters rather a lot on a Chinese model family.
-# Rejecting one is silent, and prose is still rejected because a space cannot
-# appear in the tail. `\Z` and not `$`, which also matches before a trailing
-# newline and would admit a name with one.
-_TOOL_NAME_RE = re.compile(r"^\w[\w.\-]*\Z")
+# This format needs the name test more than the others do: without it the
+# unterminated branch above turns any prose after a `<tool_call>` into a call
+# -- an answer explaining that "the model writes <tool_call> followed by the
+# name" produced a call named " followed by the name. Hope that helps!", and a
+# Hermes-style `<tool_call>{"name": ...}` produced one named after the whole
+# JSON object. Both reached clients as `tool_calls`. It is `usable_tool_name`
+# now, shared: the same question was being answered six ways, and three
+# formats were not asking it at all.
 _ARG_OPENER = "<arg_key>"
 _ARG_RE = re.compile(
     r"<arg_key>(.*?)</arg_key>\s*<arg_value>"
@@ -134,7 +129,7 @@ class GlmParser(ToolCallParser):
                 lt = body.find("<")
                 name = (body if lt == -1 else body[:lt]).strip()
                 rest = "" if lt == -1 else body[lt:]
-            if not _TOOL_NAME_RE.match(name):
+            if not usable_tool_name(name):
                 continue
             # See `QwenXmlParser._is_truncated_call`: an unclosed region is a
             # cut-off call or prose quoting the tag, and prose has to fail

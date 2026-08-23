@@ -27,10 +27,22 @@ chunk, so the two modes cannot disagree: there is nothing left for them to
 disagree with.
 """
 
+import re
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, ClassVar
+
+# A tool name is an identifier, which is what the model was given.
+#
+# `\w` and not `[A-Za-z_]`: OpenAI's own grammar is `^[a-zA-Z0-9_-]{1,64}$`, so
+# a leading digit is legal (`7z_extract`), and `\w` is Unicode-aware, so a CJK
+# name is too -- which matters rather a lot on a Chinese model family.
+# Rejecting one is silent. `.` and `-` in the tail because MCP servers
+# namespace theirs `server.tool`; prose is still rejected because a space
+# cannot appear anywhere. `\Z` and not `$`, which also matches before a
+# trailing newline and would admit a name with one.
+_TOOL_NAME_RE = re.compile(r"^\w[\w.\-]*\Z")
 
 
 def continues_a_call(rest: str, tokens: tuple[str, ...], *, arrived: bool) -> bool:
@@ -72,6 +84,30 @@ def declared_tools_allow(name: str, param_types: dict) -> bool:
     that is the evidence which does not come from the request.
     """
     return not param_types or name in param_types
+
+
+def usable_tool_name(name: str | None) -> bool:
+    """Is this something a client could dispatch?
+
+    One predicate, because six formats answered it six ways and three of them
+    did not ask at all. `<invoke name="">` and `<invoke name="   ">` -- both of
+    which `name="([^"]*)"` matches -- reached the client as a call whose name
+    was the empty string: not dispatchable, and matching nothing the request
+    declared. On `/v1/messages` it becomes a `tool_use` block with an empty
+    `name`, which the Anthropic SDK surfaces as a tool the caller never
+    registered.
+
+    The three spelled their non-answers differently, which is the tell that
+    the axis and not any one format is the thing to fix: DSML and K3 asked
+    nothing, and MiniMax asked `if not name` *before* `name.strip()`, so a
+    name of pure whitespace passed the guard and then became empty.
+
+    Separate from `declared_tools_allow`, which asks whether the *request*
+    knows this name. This asks whether it is a name at all, and holds for a
+    request that declared no tools -- the case where that one deliberately
+    refutes nothing.
+    """
+    return bool(name) and _TOOL_NAME_RE.match(name) is not None
 
 
 def unique_tool_call_id() -> str:

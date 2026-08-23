@@ -65,6 +65,9 @@ from entrypoints.wire_corpus import (
     DECLARED_TOOLS,
     REAL_CALLS,
     naming_another_tool,
+    naming_nothing,
+    naming_only_spaces,
+    quoting_a_call_it_will_not_make,
     truncated,
     truncated_naming_another_tool,
 )
@@ -2647,4 +2650,93 @@ class TestTheEarlyNameCannotDisagreeWithTheParse:
         assert stream._index > announced[-1], (
             "the index of a name that produced no call was not stepped past; a "
             "later call would land on it"
+        )
+
+
+class TestNoFormatShipsACallItCannotName:
+    """A call the client cannot dispatch is not a call.
+
+    Every format's name slot admits an empty string -- `name="([^"]*)"`,
+    `tool="([^"]*)"` -- so this is a shape the wire allows and a model can
+    produce. Three of six handed it on: DSML and K3 asked nothing at all, and
+    MiniMax asked `if not name` *before* `name.strip()`, so a name of pure
+    whitespace passed the guard and reached the client as `""`.
+
+    Generated over the registry rather than written per format, because that
+    split -- three formats, three different ways of being wrong, one of them
+    only visible to the whitespace shape -- is what a per-format test set
+    reliably half-covers.
+    """
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    @pytest.mark.parametrize(
+        "derive", [naming_nothing, naming_only_spaces], ids=["empty", "whitespace"]
+    )
+    def test_it_is_not_reported_as_a_call(self, parser, derive):
+        text = derive(parser.NAME)
+        _content, calls = parse_tool_calls(text, DECLARED_TOOLS, parser)
+        assert not calls, (
+            f"{parser.NAME} reported a call named "
+            f"{calls[0].function['name']!r}, which matches nothing the request "
+            "declared and which a client cannot dispatch"
+        )
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_and_the_same_shape_with_a_name_still_is(self, parser):
+        """The positive control. Without it the property above passes on a
+        parser that stopped reading its own format."""
+        _content, calls = parse_tool_calls(
+            REAL_CALLS[parser.NAME], DECLARED_TOOLS, parser
+        )
+        assert calls, f"{parser.NAME} no longer reads its own complete call"
+
+
+class TestAQuotationDoesNotMoveARealCallsLeftEdge:
+    """A sentence between a quoted opener and a real call is the answer.
+
+    The region opens at the *first* marker in the text, so an answer that
+    shows the wire format and then calls for real puts the region's left edge
+    in the wrong place, and each format pulls it back to where its first
+    accepted call begins. Kimi pulled it back to the first thing its entry
+    pattern *matched* instead -- including a quotation its own truncation gate
+    had already rejected -- and deleted the sentence in between as markup.
+
+    Five formats kept it and one did not, which is what made the answer a
+    fact to look up rather than a decision to make.
+
+    The quotation has to be one the format's own pattern *matches* and its
+    gate then rejects -- `quoting_a_call_it_will_not_make`, not
+    `quoting_the_opener`. Built from the latter this class passed on HEAD, on
+    every format: Kimi's entry pattern needs `functions.NAME:INDEX`, an
+    opener alone does not match it, and with no rejected match there is no
+    anchor to move. Green, and asserting nothing about the defect it was
+    written for.
+    """
+
+    SENTINEL: ClassVar[str] = "SENTINEL_the_models_own_sentence"
+
+    def _text(self, parser) -> str:
+        return (
+            quoting_a_call_it_will_not_make(parser.NAME)
+            + self.SENTINEL
+            + REAL_CALLS[parser.NAME]
+        )
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_the_sentence_between_them_survives(self, parser):
+        content, calls = parse_tool_calls(self._text(parser), DECLARED_TOOLS, parser)
+        assert calls, f"{parser.NAME} lost the real call; this asserts nothing"
+        assert self.SENTINEL in content, (
+            f"{parser.NAME} deleted the sentence the model wrote between its "
+            "quotation and its call"
+        )
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_and_the_quotation_makes_no_second_call(self, parser):
+        """The other half: keeping the sentence must not cost the gate that
+        stops the quotation itself being read as a call."""
+        _content, calls = parse_tool_calls(self._text(parser), DECLARED_TOOLS, parser)
+        assert len(calls) == 1, (
+            f"{parser.NAME} made {len(calls)} calls where the model made one; "
+            "the quoted opener was read as a second"
         )

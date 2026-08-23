@@ -29,6 +29,7 @@ from .tool_parser import (
     continues_a_call,
     declared_tools_allow,
     unique_tool_call_id,
+    usable_tool_name,
 )
 
 MINIMAX_NS = "]<]minimax[>["
@@ -171,9 +172,12 @@ class MiniMaxParser(ToolCallParser):
             closed = m.group(1) is not None
             name = m.group(1) if closed else m.group(3)
             body = m.group(2) if closed else (m.group(4) or "")
-            if not name:
+            # Strip first, then judge. The other order -- `if not name` before
+            # `name.strip()` -- let `name="   "` through the guard and out as
+            # the empty string.
+            name = (name or "").strip()
+            if not usable_tool_name(name):
                 continue
-            name = name.strip()
             if not closed and not _is_truncated_call(
                 name, body, param_types, at_end=at_end
             ):

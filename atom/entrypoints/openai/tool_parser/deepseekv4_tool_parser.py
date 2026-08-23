@@ -29,6 +29,7 @@ from .tool_parser import (
     continues_a_call,
     declared_tools_allow,
     unique_tool_call_id,
+    usable_tool_name,
 )
 
 _DSML = "｜DSML｜"
@@ -253,6 +254,11 @@ class DsmlParser(ToolCallParser):
                 # `None` for a self-closing `<invoke .../>`, which is closed
                 # and carries no body.
                 body = (m.group(2) if closed else m.group(4)) or ""
+                # Before the truncation gate, which only runs for an unclosed
+                # invoke: `name="([^"]*)"` matches an empty and an all-space
+                # name, and a *closed* one had nothing to stop it.
+                if not usable_tool_name(name):
+                    continue
                 if not closed and not _is_truncated_call(
                     name, body, param_types, at_end=at_end
                 ):
