@@ -220,7 +220,11 @@ def _markup_spans(
         start, stop = max(0, min(start, len(body))), max(0, min(stop, len(body)))
         if stop <= start:
             continue
-        if merged and start <= merged[-1][1]:
+        # `<`, not `<=`: two spans that merely touch are two calls the model
+        # wrote with no separator between them, and joining those is the same
+        # reordering as joining whitespace-separated ones. The existing
+        # property used a newline and so never reached this.
+        if merged and start < merged[-1][1]:
             merged[-1] = (merged[-1][0], max(merged[-1][1], stop))
         else:
             merged.append((start, stop))
@@ -292,9 +296,18 @@ class ToolCallStreamParser:
         )
         self._region: Region | None = None
 
+        # Both closers, where the format declared no region end of its own.
+        # The wrapper's is a *trigger* only -- it arrives on the chunk that
+        # completes the region, and without it the call's own closer asks
+        # first, hears "not yet", and nothing asks again. `region_end` decides
+        # from the self closer; see there for why the wrapper's cannot.
+        self._end_markers: tuple[str, ...] = ()
+        if parser_cls is not None:
+            self._end_markers = parser_cls.REGION_END_MARKERS or (
+                parser_cls.CALL_SELF_CLOSERS + parser_cls.CALL_CLOSERS
+            )
         # The tail a region-closing literal split across a chunk boundary
         # would need, and nothing more.
-        self._end_markers = parser_cls.REGION_END_MARKERS if parser_cls else ()
         self._end_tail_len = max((len(m) for m in self._end_markers), default=1) - 1
         self._end_tail = ""
         # Stamped by the engine, so no format has to. Kimi took its index off

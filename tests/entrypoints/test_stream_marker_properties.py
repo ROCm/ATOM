@@ -57,6 +57,7 @@ from atom.entrypoints.openai.reasoning import (
 from atom.entrypoints.openai.reasoning_dialects import DIALECTS, resolve_dialect
 from atom.entrypoints.openai.serving_anthropic import completes_a_tool_call
 from atom.entrypoints.openai.tool_parser import RegionParse, ToolCall, parse_tool_calls
+from atom.entrypoints.openai.tool_parser.deepseekv4_tool_parser import DsmlParser
 from atom.entrypoints.openai.tool_parser.kimi_k3_tool_parser import KimiK3Parser
 from atom.entrypoints.openai.tool_parser.kimi_tool_parser import KimiParser
 from atom.entrypoints.openai.tool_parser.qwen3_tool_parser import QwenXmlParser
@@ -67,6 +68,7 @@ from atom.entrypoints.openai.tool_parser.stream import (
 )
 from entrypoints.wire_corpus import (
     DECLARED_TOOLS,
+    PAYLOAD,
     REAL_CALLS,
     naming_another_tool,
     naming_something_undispatchable,
@@ -995,6 +997,190 @@ class TestNonStreamingAgreesWithStreaming:
         )
 
 
+def streamed_and_last(parser, text: str, *, suppress: bool = False):
+    """What reached the client before the last frame, and in it.
+
+    `(streamed, last frame, calls)` at four characters a chunk. Not `drive`
+    above, which answers a different question -- it folds both into one
+    `Seen.content` and runs the reasoning stage these cases do not need. Three
+    copies of this lived in the classes below before it was one.
+    """
+    engine = ToolCallStreamParser(
+        tools=DECLARED_TOOLS, parser_cls=parser, suppress_calls=suppress
+    )
+    early, last, calls = [], [], 0
+    for i in range(0, len(text), 4):
+        for kind, data in engine.process(text[i : i + 4]):
+            if kind == "content":
+                early.append(data)
+            elif kind == "tool_call_args":
+                calls += 1
+    for kind, data in engine.flush():
+        if kind == "content":
+            last.append(data)
+        elif kind == "tool_call_args":
+            calls += 1
+    return "".join(early), "".join(last), calls
+
+
+class TestNothingKnownToBeOutsideACallIsBuffered:
+    """The goal, stated once: bytes the engine can tell are outside a
+    (start, end) pair reach the client while the model is still writing.
+
+    Three ways to be outside one, and the engine has to know all three:
+
+    * before any start marker -- `MarkerScanner`, bounded and asserted there;
+    * after the pair closed -- this class;
+    * a start marker that will never pair -- an answer quoting its own
+      opener, which `TestARequestThatForbadeCallsDoesNotWaitForOne` covers.
+
+    The middle one was missing for five of six formats, and it is the
+    ordinary agentic shape rather than an edge case: call a tool, explain the
+    result. Measured before the fix, 0 of 397 characters of that explanation
+    streamed -- the whole of it arrived in the last frame.
+
+    What made it hard to see is that `region_end` asked for "a literal that
+    cannot appear inside an argument value" and the only note about one said
+    the XML formats' `</tool_call>` is not such a literal. True, and about the
+    *wrapper*: every one of these grammars terminates a value on the call's
+    *own* closer, so that one can never sit inside a value. It is the safe
+    signal, and it was already declared.
+    """
+
+    TAIL: ClassVar[str] = "Here is what that returns, explained for the user. " * 6
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_every_format_says_what_ends_one_of_its_calls(self, parser):
+        """The declaration the rest of this rests on. A format that names no
+        closer can never be seen to close, so its answers wait for the stream
+        to end -- which is what four formats did while it went unnoticed."""
+        assert parser.CALL_SELF_CLOSERS, (
+            f"{parser.NAME} never says what ends one of its calls, so its "
+            "regions can only close at end of stream"
+        )
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_the_answer_after_a_call_does_not_wait_for_the_last_frame(self, parser):
+        text = REAL_CALLS[parser.NAME] + " " + self.TAIL
+        early, last, calls = streamed_and_last(parser, text)
+        assert calls == 1, f"{parser.NAME} lost the call; this asserts nothing"
+        assert self.TAIL.strip() in early + last, "the explanation was dropped"
+        assert len(last) < len(self.TAIL) // 2, (
+            f"{parser.NAME} held {len(last)} of {len(self.TAIL)} characters "
+            "written after the call until the stream ended"
+        )
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_and_no_markup_is_released_to_get_there(self, parser):
+        text = REAL_CALLS[parser.NAME] + " " + self.TAIL
+        early, last, _calls = streamed_and_last(parser, text)
+        leaked = [m for m in parser.START_MARKERS if m in early + last]
+        assert not leaked, f"{parser.NAME} released its own wire tokens: {leaked}"
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_and_a_value_holding_the_wrapper_closer_does_not_end_the_call(self, parser):
+        """Why the wrapper's closer is a trigger and never the answer. A model
+        writing `</tool_call>` inside a parameter must not have its call cut
+        there -- the region ends on the call's own closer, which the grammar
+        will not let a value hold."""
+        if not parser.CALL_CLOSERS:
+            pytest.skip(f"{parser.NAME}'s call is its own wrapper")
+        wrapper = parser.CALL_CLOSERS[0]
+        text = REAL_CALLS[parser.NAME].replace(PAYLOAD, PAYLOAD + wrapper + "TAIL")
+        early, last, calls = streamed_and_last(parser, text)
+        assert calls == 1, f"{parser.NAME} read {calls} calls where the model made 1"
+        leaked = [m for m in parser.START_MARKERS if m in early + last]
+        assert not leaked, f"{parser.NAME} released wire tokens: {leaked}"
+
+
+class TestAGiveUpProbeStaysReverted:
+    """A region that has produced nothing yet is still buffered, on purpose.
+
+    `stream.py`'s module comment says not to add a "give up after N bytes"
+    probe, because acceptance is not monotone in bytes arrived. One was added
+    anyway during this work -- bounded to `_PEEK_WINDOW`, gated to
+    `tool_choice: "none"`, and measured safe on all six formats -- and it
+    reintroduced the reverted failure on the one shape the corpus does not
+    carry: DSML's direct-JSON branch needs the whole object, so its real call
+    is invisible in the head and the region went out as text.
+
+    The corpus is generated from `render_call`, which renders one form per
+    format, so a format with several accepting branches is only covered on the
+    one it renders. This class carries the others by hand for that reason, and
+    says so.
+    """
+
+    #: DSML's two accepting branches that `render_call` does not render, in
+    #: the syntax the parser accepts -- read off `parse_region`, not off the
+    #: prose describing them. A payload past `_PEEK_WINDOW` is the point: the
+    #: direct-JSON branch needs the whole object, so the call is invisible to
+    #: any head-sized peek while being perfectly real.
+    BODY: ClassVar[str] = "x" * (4 * _PEEK_WINDOW)
+    UNRENDERED: ClassVar[dict[str, str]] = {
+        "wrapper-less": "<｜DSML｜tool_calls>"
+        f'<｜DSML｜parameter name="city">{BODY}</｜DSML｜parameter>'
+        "</｜DSML｜tool_calls>",
+        "direct-json": '<｜DSML｜tool_calls><｜DSML｜invoke name="get_weather">'
+        f'{{"city": "{BODY}"}}'
+        "</｜DSML｜invoke></｜DSML｜tool_calls>",
+    }
+
+    @pytest.mark.parametrize("branch", sorted(UNRENDERED), ids=str)
+    def test_the_shape_is_one_the_format_accepts(self, branch):
+        """The positive control, and it is not ceremony: the first version of
+        this class invented both shapes from the paragraph describing them,
+        and DSML accepted neither -- so "the markup leaked" was just
+        unparseable text being released, and the class asserted nothing."""
+        _content, calls = parse_tool_calls(
+            self.UNRENDERED[branch], DECLARED_TOOLS, DsmlParser
+        )
+        assert calls, f"dsml does not accept the {branch} shape; fix the shape"
+
+    @pytest.mark.parametrize("branch", sorted(UNRENDERED), ids=str)
+    @pytest.mark.parametrize("suppress", [False, True], ids=["dispatch", "none"])
+    def test_a_call_longer_than_the_peek_window_is_not_released_as_text(
+        self, branch, suppress
+    ):
+        early, last, _calls = streamed_and_last(
+            DsmlParser, self.UNRENDERED[branch], suppress=suppress
+        )
+        leaked = [m for m in DsmlParser.START_MARKERS if m in early + last]
+        assert not leaked, (
+            f"dsml's {branch} call went out as text: {leaked}. A probe that "
+            "gives up on a region is reading 'does not parse yet' as 'never "
+            "will'; see the module comment in stream.py."
+        )
+
+
+class TestForbiddingCallsStillStripsTheMarkup:
+    """`tool_choice: "none"` suppresses dispatch, not reading.
+
+    The format is still parsed so the markup can be located and dropped; a
+    response that was nothing but a call therefore has empty content rather
+    than the model's raw wire tokens.
+    """
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    @pytest.mark.parametrize(
+        "derive",
+        [
+            lambda n: REAL_CALLS[n],
+            truncated,
+            lambda n: "Sure. " + REAL_CALLS[n],
+        ],
+        ids=["complete", "truncated", "after-prose"],
+    )
+    def test_a_real_call_still_loses_its_markup(self, parser, derive):
+        """The peek must not mistake a call for prose. A truncated one counts:
+        it is what `max_tokens` leaves, and the gate exists to recover it."""
+        early, last, calls = streamed_and_last(
+            parser, derive(parser.NAME), suppress=True
+        )
+        assert calls == 0, "dispatch is what `tool_choice: none` suppresses"
+        leaked = [m for m in parser.START_MARKERS if m in early + last]
+        assert not leaked, f"{parser.NAME} put its own wire tokens in the answer"
+
+
 class TestBoundedWithhold:
     """Text must not be held back longer than a marker could justify."""
 
@@ -1151,10 +1337,11 @@ class TestARealCallSurvivesTheStream:
         ), f"the sentence introducing the second call arrived first: {order}"
 
     @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    @pytest.mark.parametrize("sep", ["\n", "", " "], ids=["newline", "none", "space"])
     def test_and_adjacent_calls_do_not_carry_a_later_sentence_in_front_of_them(
-        self, parser
+        self, parser, sep
     ):
-        """The same order, when two of the calls are only a newline apart.
+        """The same order, when two of the calls are only a separator apart.
 
         Every one of these chat templates puts a separator between parallel
         calls, so `_markup_spans` merges that pair into one span -- and the
@@ -1167,12 +1354,18 @@ class TestARealCallSurvivesTheStream:
         move when a later call does. This is the failure `_wrapper_edges` had
         -- an extra span competing for a call -- with real calls doing the
         merging instead of a spliced-in wrapper.
+
+        The separator is parametrised because the newline was hiding half of
+        it. `_markup_spans` joined on `start <= previous_stop`, so two calls
+        the model wrote with *nothing* between them still merged -- five of
+        six formats reordered, and no shape in the suite had a zero-length
+        gap to notice.
         """
         a = REAL_CALLS[parser.NAME]
         b = naming_another_tool(parser.NAME)
         middle = "Now let me also check Oslo."
         engine = ToolCallStreamParser(tools=DECLARED_TOOLS, parser_cls=parser)
-        text = f"{a}\n{b}\n{middle}\n{a}"
+        text = f"{a}{sep}{b}\n{middle}\n{a}"
         events = engine.process(text) + engine.flush()
         order: list[str] = []
         for kind, data in events:

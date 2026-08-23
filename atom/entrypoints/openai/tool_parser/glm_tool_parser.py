@@ -72,11 +72,11 @@ _ARG_RE = re.compile(
 class GlmParser(ToolCallParser):
     NAME: ClassVar[str] = "glm"
     START_MARKERS: ClassVar[tuple[str, ...]] = ("<tool_call>",)
-    # Both empty, and written out rather than inherited: this format's
-    # `</tool_call>` closes the call itself rather than a wrapper around it,
-    # so `_TOOLCALL_RE` already spans it and no inner block can still be open
-    # once it arrives.
-    CALL_SELF_CLOSERS: ClassVar[tuple[str, ...]] = ()
+    # The call's own closer, and there is no wrapper around it, so
+    # `CALL_CLOSERS` stays empty. Blank here because the two coincide answered
+    # "is there an inner block" with the tuple that says "what ends a call",
+    # and left this the one format whose region could never be seen to close.
+    CALL_SELF_CLOSERS: ClassVar[tuple[str, ...]] = ("</tool_call>",)
 
     @classmethod
     def render_call(cls, name: str, args: dict[str, str]) -> str:

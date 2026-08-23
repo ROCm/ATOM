@@ -218,9 +218,13 @@ def only_the_wrapper_closed(name: str) -> str | None:
     tuple is declared -- hand-written, this shape existed for one format.
 
     ``None`` where the format cannot express it, and both reasons are read off
-    the rendering rather than listed:
+    the declarations rather than listed:
 
-    * no inner block at all -- GLM's call *is* its wrapper;
+    * no wrapper distinct from the call -- GLM's `</tool_call>` is both, so
+      there is nothing that can close while the call stays open. Asked of
+      `CALL_CLOSERS`, which is the tuple that means "wrapper"; asking whether
+      the *self* closer was blank conflated the two and cost GLM its
+      region-end signal elsewhere.
     * something already written between the name and the call's own closer,
       even with no arguments. Kimi puts `{}` there and K3 an `index="N"`
       attribute, so deleting the closer leaves a call the format recovers as
@@ -232,6 +236,8 @@ def only_the_wrapper_closed(name: str) -> str | None:
     a guard nothing can justify.
     """
     parser = _registry()[name]
+    if not parser.CALL_CLOSERS:
+        return None
     call = parser.render_call(TOOL, {})
     closer = next((c for c in parser.CALL_SELF_CLOSERS if c in call), None)
     if closer is None:

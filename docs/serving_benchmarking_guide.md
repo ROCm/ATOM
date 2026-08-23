@@ -133,13 +133,57 @@ Two waits are longer than that. Text inside the reasoning channel is held until
 its end marker — not a stall: it is reasoning, and it is delivered as
 `reasoning_content` as it arrives. And once a marker that *opens a tool-call
 region* appears, everything from it onward belongs to the format until it can
-parse the region. For a real call that is its closing tag; for an answer that
-merely quotes a marker it is end of stream. That is a known cost, measured on
-a GLM answer naming the tag at character 29 and then explaining for 1234 more:
-98% of it arrives in one frame at EOS, and "how do I make you call a tool" is
-a common question. Nothing is lost — the region is released verbatim once it
-turns out not to be a call — and `atom:stream_longest_silence_seconds` reports
-the wait while it happens.
+parse the region.
+
+##### What is held, and for how long
+
+The rule is that a byte is buffered only while its **destination field** is
+undecided — `content` or `tool_calls` — because an SSE frame cannot be taken
+back. Four cases, and only two of them wait:
+
+| Where the byte is | Held? | Until |
+|---|---|---|
+| Before any start marker | no | — `MarkerScanner`, bounded by the longest marker and asserted there |
+| Inside a region, before the name is legible | **yes** | the format can name a declared tool, usually the first 30–70 characters |
+| Inside a region, after that — the argument values | **yes** | the region closes |
+| After the region closed | no | — released as it arrives |
+
+The name goes out as soon as it is legible and the request declared it
+(`tool_call_start`), so a client learns *which* tool is being called at chunk
+7–24 rather than after the whole payload.
+
+**Argument values wait, deliberately.** vLLM and SGLang stream them as JSON
+fragments for their JSON-shaped formats; a response cut off by `max_tokens`
+then leaves the client accumulating an object it cannot parse. Buffering them
+means five of the six formats here hand back *valid* JSON even for a truncated
+call — the half-written value becomes a string — which streaming fragments
+gives up. (Kimi-K2 is the exception: it passes the model's bytes through, so a
+truncated call already yields `{"city": "Par`. That is a separate defect.)
+Both of those engines buffer for their tag-shaped formats too, K3 included, so
+this is not a gap against them.
+
+**The region closes on the call's own closer**, not on the wrapper's. Every
+format's grammar lists the call closer among the terminators of an argument
+value — `</function>` for Qwen, `</invoke>` for DSML and MiniMax,
+`<|close|>call` for K3 — so a model writing one inside a parameter ends the
+parameter, and the literal can never hide in a value. The *wrapper* closer
+(`</tool_call>`) can, which is why it serves only as a trigger to look and
+never as the answer. Declared as `CALL_SELF_CLOSERS`; `REGION_END_MARKERS`
+overrides it where a region is larger than one call, which is Kimi-K2's
+section.
+
+Getting that wrong is expensive and was: while only Kimi declared a region
+end, everything a model wrote *after* its tool call waited for end of stream —
+0 of 397 characters streamed on five of six formats, and "call a tool, then
+explain the result" is the ordinary agentic shape.
+
+**A region that never closes is still held to end of stream.** An answer that
+merely quotes its own opener is the case: measured on a GLM answer naming the
+tag at character 29 and then explaining for 1234 more, 98% arrives in one
+frame at EOS. Nothing is lost — the region is released verbatim once it turns
+out not to be a call — and `atom:stream_longest_silence_seconds` reports the
+wait while it happens. vLLM and SGLang both do the same here, and SGLang's K3
+detector drops the text rather than releasing it.
 
 A probe that gave up on a region producing nothing after N bytes was written
 for this and reverted. It rests on acceptance being monotone in how many bytes
@@ -152,6 +196,18 @@ reopened a region with a fresh budget: 1.19 ms to 18.2 s on a 250 KB answer,
 in the request coroutine. Fixing the latency needs the *format* to say "this
 can no longer become a call", which is a different question from "does not
 parse yet" and one no format answers today.
+
+A second version was written and reverted for the same reason: bounded to the
+256-byte peek window, asked once, and restricted to `tool_choice: "none"`
+where nothing would be dispatched anyway. It measured clean on every shape the
+corpus carries — and the corpus carries one form per format, because it is
+generated from `render_call`. DSML's direct-JSON body needs the whole object,
+so a real call with a payload past the window is invisible to any head-sized
+peek and would have gone out as text.
+`TestAGiveUpProbeStaysReverted` now carries that shape, with a positive
+control asserting DSML actually accepts it: the first draft of that test
+invented both shapes from this paragraph rather than from the parser, DSML
+accepted neither, and it therefore proved nothing.
 
 "Opens a region" is asked of the format, not assumed of every marker it
 declares. Kimi-K3 declares 16 and only two of them mean a tool call; the

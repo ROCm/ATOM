@@ -281,12 +281,10 @@ class ToolCallParser(ABC):
     # tests enumerate them so a newly registered format is covered the moment
     # it exists rather than when someone writes a case.
     START_MARKERS: ClassVar[tuple[str, ...]] = ()
-    # Literals that can close a region mid-stream. Declared so the engine can
-    # tell, from the incoming chunk alone, whether it is worth materialising
-    # the buffer to ask `region_end` -- the check runs once per chunk on every
-    # stream, and materialising to answer it is the quadratic this class's
-    # `Region` exists to avoid. Empty means "this format's regions close only
-    # at end of stream", which is what four of the six do.
+    # Literals that can close a region mid-stream, so the engine knows from
+    # the chunk alone whether to ask `region_end`. Empty means "the closers
+    # below", which is right for every format but Kimi, whose region is a
+    # section of several entries and whose entry end is not a section end.
     REGION_END_MARKERS: ClassVar[tuple[str, ...]] = ()
     # The wrapper literals this format writes around its calls -- before the
     # first and after the last -- and any token it repeats between tags. All
@@ -363,18 +361,32 @@ class ToolCallParser(ABC):
     def region_end(cls, region: str) -> int:
         """How many bytes of ``region`` form a closed unit, or 0 for "not yet".
 
-        Asked only after one of ``REGION_END_MARKERS`` has arrived. A format
-        that answers lets the engine emit its calls and go back to reading the
-        answer without waiting for end of stream; one that does not is
-        buffered to EOS, which is correct but silent for as long as the region
-        runs.
+        Asked only once one of ``REGION_END_MARKERS`` has arrived, so the
+        per-chunk cost is a look at the chunk and not at the buffer. A region
+        that never answers waits for end of stream and takes everything the
+        model wrote after its call with it -- 0 of 397 characters streamed on
+        five of six formats, which is the ordinary agentic shape.
 
-        Answer only on a literal that cannot appear inside an argument value.
-        Kimi's section end is a special token and qualifies; the XML formats'
-        `</tool_call>` does not, because a model writing *about* tool calls
-        puts one inside a parameter.
+        The default answers for all of them, on the one literal that cannot
+        appear inside an argument value: the call's own closer, which every
+        grammar here lists among a value's terminators. The *wrapper* closer
+        can hide in a value, and reading the old note about that as "no safe
+        literal exists" is what left four formats buffering to EOS.
+
+        Once the call has closed no value is open, so `end_of_markup` can walk
+        the wrapper: the region ends where the markup after the last call
+        ends, and stays open while the wrapper does.
         """
-        return 0
+        at = max(
+            (i + len(c) for c in cls.CALL_SELF_CLOSERS if (i := region.rfind(c)) >= 0),
+            default=0,
+        )
+        if not at:
+            return 0
+        end = end_of_markup(region, at, cls.CALL_CLOSERS, cls.CALL_FILLERS)
+        # A format with a wrapper owes its closer; one whose call *is* its
+        # wrapper (GLM) is done at the call's own.
+        return 0 if cls.CALL_CLOSERS and end == at else end
 
     @classmethod
     def render_call(cls, name: str, args: dict[str, str]) -> str:
