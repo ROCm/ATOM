@@ -48,8 +48,11 @@ _FUNCTION_RE = re.compile(
 _PARAM_OPENER = "<parameter="
 _PARAM_RE = re.compile(
     # `\Z`, not `$`: `$` also matches before a trailing newline, so a value
-    # ending in one was cut a byte short.
-    r"<parameter=(.*?)(?:</parameter>|(?=<parameter=)|(?=</function>)|\Z)",
+    # ending in one was cut a byte short. `(?=<tool_call>)` is the fifth
+    # terminator `parse_region` names -- a value ends where the next call
+    # opens, or it swallows that call's wrapper as data.
+    r"<parameter=(.*?)"
+    r"(?:</parameter>|(?=<parameter=)|(?=</function>)|(?=<tool_call>)|\Z)",
     re.DOTALL,
 )
 

@@ -100,16 +100,23 @@ def complete(name: str) -> str:
     return REAL_CALLS[name]
 
 
-def truncated(name: str) -> str:
-    """The same call, cut off partway through its argument value.
+def cut_at_payload(call: str) -> str:
+    """`call` as it looked when generation stopped inside its argument value.
 
-    Cut at the payload rather than a fixed number of characters off the end:
-    measured, chopping twelve left a *fully closed* call for three of the six
-    formats, so a check meant to ask "can this read an unclosed call" was
-    asking whether a complete one parses.
+    The one place the cut rule lives, because where a call is cut decides what
+    the check is asking. Both other rules that have existed here asked
+    something else on half the registry: a fixed twelve characters left a
+    *fully closed* call for three of six formats, and the midpoint
+    (``call[:len(call)//2]``, which the announcement suite derived for itself)
+    leaves no recoverable call at all for three -- Kimi-K2's does not parse.
+    That second rule is why a real announce-vs-parse divergence stayed green.
     """
-    call = REAL_CALLS[name]
     return call[: call.index(PAYLOAD) + len(PAYLOAD) - 2]
+
+
+def truncated(name: str) -> str:
+    """The same call, cut off partway through its argument value."""
+    return cut_at_payload(REAL_CALLS[name])
 
 
 def truncated_after_complete(name: str) -> str:
@@ -124,6 +131,16 @@ def truncated_after_complete(name: str) -> str:
 def naming_another_tool(name: str) -> str:
     """The same call, for the *other* declared tool."""
     return REAL_CALLS[name].replace(TOOL, OTHER_TOOL)
+
+
+def truncated_naming_another_tool(name: str) -> str:
+    """A cut-off call for the *other* tool.
+
+    Needed because "the name announced from a prefix is not the name the
+    finished region parses to" cannot be stated with one tool name: comparing
+    `get_weather` to `get_weather` is true however badly the parse went.
+    """
+    return cut_at_payload(naming_another_tool(name))
 
 
 def quoting_the_opener(name: str) -> str:

@@ -51,19 +51,34 @@ _NOT_NESTED_ARG = r'(?:(?!<\|open\|>argument key=").)'
 # What may follow a call's opener in a real call: an argument, or the close of
 # the call the name opened. One tuple, read by `_is_truncated_call`.
 _CALL_CONTINUES = ('<|open|>argument key="', "<|close|>call")
-# Closed, or cut off at end of input. Without it a call truncated by
-# `max_tokens` parsed to nothing and its raw tokens went out as the answer.
+# Closed, cut off where the next call or section opens, or cut off at end of
+# input. Without end-of-input a call truncated by `max_tokens` parsed to
+# nothing and its raw tokens went out as the answer. The opener lookaheads are
+# the fifth terminator `parse_region` names, and this format needed them most:
+# the tempered dot already stops the body at a sibling, so with no terminator
+# accepting that position the whole entry matched nothing and was dropped --
+# after the announcement had named it.
 _K3_CALL_RE = re.compile(
     r'<\|open\|>call tool="(?P<name>[^"]*)"(?:\s+index="(?P<index>\d+)")?<\|sep\|>'
     r"(?P<body>" + _NOT_NESTED_CALL + r"*?)"
-    r"(?:(?P<closed><\|close\|>call)|(?=<\|close\|>tools)|\Z)",
+    r"(?:(?P<closed><\|close\|>call)"
+    r'|(?=<\|open\|>call tool=")'
+    r"|(?=<\|open\|>tools<\|sep\|>)"
+    r"|(?=<\|close\|>tools)"
+    r"|\Z)",
     re.DOTALL,
 )
 _K3_ARG_RE = re.compile(
     r'<\|open\|>argument key="(?P<key>[^"]*)"(?:\s+type="(?P<type>[^"]*)")?<\|sep\|>'
-    # Same alternation, so a value the model was cut off inside survives.
+    # Same alternation one level down: a value the model was cut off inside
+    # survives, and an argument missing its closer before a sibling is not
+    # deleted -- that dropped a parameter and dispatched the call without it.
     r"(?P<val>" + _NOT_NESTED_ARG + r"*?)"
-    r"(?:<\|close\|>argument|(?=<\|close\|>call)|\Z)",
+    r"(?:<\|close\|>argument"
+    r'|(?=<\|open\|>argument key=")'
+    r"|(?=<\|open\|>tools<\|sep\|>)"
+    r"|(?=<\|close\|>call)"
+    r"|\Z)",
     re.DOTALL,
 )
 # The channel framing this format wraps every answer in, tool call or not.

@@ -18,6 +18,7 @@ section, and the answer after the last one, be read at all: both used to be
 swallowed, differently, by the two readers this format used to have.
 """
 
+import json
 import re
 from typing import ClassVar
 
@@ -40,14 +41,17 @@ _ENTRY_RE = re.compile(
     # match, so the whole section -- special tokens included -- went out as
     # `content` with `finish_reason: stop`.
     r"functions\.([\w.\-]+):(\d+)" r"<\|tool_call_argument_begin\|>"
-    # Ends at `<|tool_call_end|>`, the next entry, the section close, or end of
-    # input. Without that last one a `max_tokens` truncation matched nothing
-    # and went out as raw special tokens -- and beside a complete entry, was
-    # dropped entirely.
+    # Ends at `<|tool_call_end|>`, the next entry, the section close, the next
+    # *section*, or end of input. Without end-of-input a `max_tokens`
+    # truncation matched nothing and went out as raw special tokens -- and
+    # beside a complete entry, was dropped entirely. The section opener is the
+    # fifth terminator `parse_region` names; here the next call opens a new
+    # section rather than a sibling entry.
     r"(.*?)"
     r"(?:(?P<closed><\|tool_call_end\|>)"
     r"|(?=<\|tool_call_begin\|>)"
     r"|(?=<\|tool_calls_section_end\|>)"
+    r"|(?=<\|tool_calls_section_begin\|>)"
     r"|\Z)",
     re.DOTALL,
 )
@@ -114,11 +118,13 @@ class KimiParser(ToolCallParser):
 
     @classmethod
     def render_call(cls, name: str, args: dict[str, str]) -> str:
-        import json as _json
-
+        # One call, so the entry index is 0. Do not read a multi-call shape
+        # off two of these concatenated: a real section increments the index
+        # across its entries, and taking the doubled `:0` for model output
+        # produced a duplicate-id "defect" that does not exist.
         return (
             f"{KIMI_SECTION_BEGIN}<|tool_call_begin|>functions.{name}:0"
-            f"<|tool_call_argument_begin|>{_json.dumps(args)}"
+            f"<|tool_call_argument_begin|>{json.dumps(args)}"
             f"{KIMI_ENTRY_END}{KIMI_SECTION_END}"
         )
 

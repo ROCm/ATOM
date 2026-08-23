@@ -334,6 +334,14 @@ class ToolCallParser(ABC):
         unchanged, so a start marker is not a promise -- a rule that used to
         be written out in each format, and was missing from two of them.
 
+        Where a call's own pattern *ends* is part of that meaning, and it has
+        five terminators, not four: its closing tag, the next parameter, the
+        end of the call, end of input, and **the next call's opener**. Four of
+        the six formats were missing the last, so a call cut off mid-value ran
+        on into the sibling behind it and the tool was invoked with markup as
+        data -- ``city="Par<tool_call>"``. The call count stayed right either
+        way, which is what hid it.
+
         ``at_end`` is whether more bytes can still arrive for this region, and
         it is the *only* difference between the two questions this used to be
         asked twice. With ``at_end`` a token cut off part-way through is all

@@ -51,7 +51,6 @@ from atom.entrypoints.openai.reasoning import (
     separate_reasoning,
 )
 from atom.entrypoints.openai.reasoning_dialects import DIALECTS, resolve_dialect
-from entrypoints.wire_corpus import DECLARED_TOOLS, REAL_CALLS
 from atom.entrypoints.openai.serving_anthropic import completes_a_tool_call
 from atom.entrypoints.openai.tool_parser import RegionParse, ToolCall, parse_tool_calls
 from atom.entrypoints.openai.tool_parser.kimi_k3_tool_parser import KimiK3Parser
@@ -61,6 +60,13 @@ from atom.entrypoints.openai.tool_parser.registry import _DETECT_ORDER
 from atom.entrypoints.openai.tool_parser.stream import (
     _PEEK_WINDOW,
     ToolCallStreamParser,
+)
+from entrypoints.wire_corpus import (
+    DECLARED_TOOLS,
+    REAL_CALLS,
+    naming_another_tool,
+    truncated,
+    truncated_naming_another_tool,
 )
 
 # Kimi is the terminal fallback and so is not in the detect order, but it is a
@@ -2373,29 +2379,39 @@ class TestTheEarlyNameCannotDisagreeWithTheParse:
         PROSE + "{call}",
         "{call}" + PROSE,
         "{call}{call}",
-        PROSE + "{half}" + PROSE + "{call}",
-        "{half}{call}",
+        PROSE + "{cut}" + PROSE + "{call}",
+        "{cut}{call}",
         # The shapes that need two *names* to say anything. A truncated call
         # followed by a complete one for a different tool is the ordinary
         # `max_tokens` malform, and it is what broke: the prefix announced the
         # truncated call's name and the finished region returned the other.
-        "{half}{other}",
-        "{other_half}{call}",
-        PROSE + "{half}" + PROSE + "{other}",
+        "{cut}{other}",
+        "{other_cut}{call}",
+        PROSE + "{cut}" + PROSE + "{other}",
         "{other}{call}",
     ]
 
     @staticmethod
     def _texts(parser):
-        call = REAL_CALLS[parser.NAME]
-        other = call.replace("get_weather", "get_time")
-        assert other != call, f"{parser.NAME}'s fixture has no name to vary"
+        """The shapes, filled from the corpus rather than re-derived here.
+
+        `{cut}` was `call[:len(call)//2]` and `{other}` was
+        `call.replace("get_weather", "get_time")` -- a second cut rule and a
+        second copy of the names, inside a suite whose premise is that a
+        format registered tomorrow needs nothing added. The cut rule cost
+        something: at the midpoint three formats have no recoverable call in
+        `{cut}`, so every shape using it was vacuous for them and hid a real
+        Kimi-K3 divergence. Cut where the corpus cuts and it shows up.
+        """
+        name = parser.NAME
+        other = naming_another_tool(name)
+        assert other != REAL_CALLS[name], f"{name}'s fixture has no name to vary"
         return [
             shape.format(
-                call=call,
-                half=call[: len(call) // 2],
+                call=REAL_CALLS[name],
+                cut=truncated(name),
                 other=other,
-                other_half=other[: len(other) // 2],
+                other_cut=truncated_naming_another_tool(name),
             )
             for shape in TestTheEarlyNameCannotDisagreeWithTheParse.SHAPES
         ]

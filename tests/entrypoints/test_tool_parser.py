@@ -3,32 +3,16 @@
 
 """Tests for tool call parsing."""
 
+import json
 from typing import ClassVar
 
-import json
-
 import pytest
-
-from atom.entrypoints.openai.tool_parser import read_whole_events
-from atom.entrypoints.openai.tool_parser.registry import PARSERS_BY_NAME
-from entrypoints.wire_corpus import (
-    PAYLOAD,
-    complete,
-    REAL_CALLS,
-    TYPED_TOOLS,
-    check_corpus,
-    quoting_the_opener,
-    truncated,
-    truncated_after_complete,
-)
-
-from atom.entrypoints.openai.tool_parser.schema import ParamTypes
-from atom.entrypoints.openai.tool_parser.stream import _resolved_tools
 
 from atom.entrypoints.openai.tool_parser import (
     ToolCall,
     ToolCallStreamParser,
     parse_tool_calls,
+    read_whole_events,
 )
 from atom.entrypoints.openai.tool_parser.deepseekv4_tool_parser import DsmlParser
 from atom.entrypoints.openai.tool_parser.glm_tool_parser import GlmParser
@@ -36,6 +20,37 @@ from atom.entrypoints.openai.tool_parser.kimi_k3_tool_parser import KimiK3Parser
 from atom.entrypoints.openai.tool_parser.kimi_tool_parser import KimiParser
 from atom.entrypoints.openai.tool_parser.minimax_tool_parser import MiniMaxParser
 from atom.entrypoints.openai.tool_parser.qwen3_tool_parser import QwenXmlParser
+from atom.entrypoints.openai.tool_parser.registry import PARSERS_BY_NAME
+from atom.entrypoints.openai.tool_parser.schema import ParamTypes
+from atom.entrypoints.openai.tool_parser.stream import _resolved_tools
+from entrypoints.wire_corpus import (
+    PAYLOAD,
+    REAL_CALLS,
+    TYPED_TOOLS,
+    check_corpus,
+    complete,
+    quoting_the_opener,
+    truncated,
+    truncated_after_complete,
+)
+
+
+def closer_reaching_the_tail_walk(parser) -> str | None:
+    """The first closer `_region_tail` can actually see, or None.
+
+    A closer the read-ahead strips as channel framing never gets there, and
+    `opens_region` documents that framing is dropped -- so requiring such a
+    literal to survive would be asserting against the format's own contract.
+    Derived from the declarations, never a list of format names.
+    """
+    return next(
+        (
+            c
+            for c in parser.CALL_CLOSERS
+            if c not in parser.START_MARKERS or parser.opens_region(c)
+        ),
+        None,
+    )
 
 
 def early_name(parser, region: str, tools=None) -> str | None:
@@ -1212,6 +1227,29 @@ class TestTheWrapperClosingTagIsNeverTheAnswer:
             content.count("</tool_call>") == 1
         ), f"the quoted tag was eaten: {content!r}"
 
+    @pytest.mark.parametrize("name", sorted(REAL_CALLS))
+    def test_and_an_answer_that_ends_by_naming_the_closing_tag_keeps_it(self, name):
+        """The same direction, with nothing after the tag to stop the walk.
+
+        The two tests around this one pin it as well, but both end in a `.`
+        after the quoted tag -- and a `.` is neither whitespace, a filler nor
+        a closer, so the walk stops on its first step whatever rule sits in
+        front of it. They are green by punctuation. An answer that ends
+        `... you write </tool_call>` has no period, and every format with an
+        outer wrapper deleted the literal.
+        """
+        parser = PARSERS_BY_NAME[name]
+        closer = closer_reaching_the_tail_walk(parser)
+        if closer is None:
+            pytest.skip(f"{name}: no closer of its own reaches the tail walk")
+        tail = f"\nTo close a call you write {closer}"
+        content, calls = parse_tool_calls(complete(name) + tail, TYPED_TOOLS, parser)
+        assert calls, f"{name} lost the call itself"
+        assert content == tail, (
+            f"{name} deleted its own closing literal out of the answer: "
+            f"{content!r} != {tail!r}"
+        )
+
     WRITE_TOOLS = [
         {
             "type": "function",
@@ -1398,6 +1436,46 @@ class TestWhatEveryFormatDoesWithACallCutOffMidWay:
         assert beside, (
             f"{name} drops a truncated call whenever a complete one exists in "
             "the same region"
+        )
+
+    @pytest.mark.parametrize("name", sorted(REAL_CALLS))
+    def test_and_the_other_order_does_not_bury_the_second_call_in_the_first(self, name):
+        """Cut off first, complete second -- and where the markup ended up.
+
+        Three suites have built `truncated + complete` since the corpus
+        landed, and all three stayed green while four formats mishandled it,
+        because each asked something else of it: chunk invariance (which holds
+        while every chunk size drops the same call), that `get_weather` is
+        among the names (both calls carry it here), and announced-matches-
+        parsed (both channels drop it, so they agree).
+
+        Not `len(calls) == 2`: that is not format-independent, and a format
+        whose second call lands inside the first's unterminated string literal
+        would be permanently red for being honest. What every format does owe
+        is that its markup reaches neither place it can leak to -- asserting
+        only one lets a fix move it to the other.
+        """
+        parser = PARSERS_BY_NAME[name]
+        content, calls = parse_tool_calls(
+            truncated(name) + complete(name), self.TOOLS, parser
+        )
+        assert calls, f"{name} drops both calls when the cut-off one comes first"
+        leaked = sorted(m for m in parser.START_MARKERS if m in content)
+        assert (
+            not leaked
+        ), f"{name} delivers its own markup to the user as the answer: {leaked}"
+        buried = sorted(
+            {
+                m
+                for m in parser.START_MARKERS
+                for c in calls
+                if m in c.function["arguments"]
+            }
+        )
+        assert not buried, (
+            f"{name} runs the first call's argument value past the second "
+            f"call's opener, so the tool is invoked with markup as data: "
+            f"{buried} in {[c.function['arguments'] for c in calls]}"
         )
 
     @pytest.mark.parametrize("name", sorted(REAL_CALLS))

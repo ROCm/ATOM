@@ -39,9 +39,13 @@ _OPT = r"(?:" + re.escape(_DSML) + r")?"  # optional ｜DSML｜ prefix
 # arrived before `max_tokens`; requiring `</parameter>` yielded `{}`.
 _PARAM_RE = re.compile(
     r"<" + _OPT + r'parameter\s+name="(.*?)"(?:\s+string="(true|false)")?\s*>'
+    # The tool_calls? lookahead is the fifth terminator `parse_region` names:
+    # a value ends where the next call opens, or it swallows that call's
+    # wrapper as data.
     r"(.*?)(?:</" + _OPT + r"parameter>"
     r"|(?=<" + _OPT + r"parameter\s)"
     r"|(?=</" + _OPT + r"invoke>)"
+    r"|(?=<" + _OPT + r"tool_calls?>)"
     r"|\Z)",
     re.DOTALL,
 )
