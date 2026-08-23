@@ -1,42 +1,45 @@
-from typing import ClassVar
-
 import numpy as np
 import torch
 from torch import nn
 
-from atom.config import Config, QuantizationConfig
+
+from atom.config import QuantizationConfig, Config
+
+from atom.model_ops.utils import atom_parameter
+from atom.utils.decorators import support_torch_compile
+
+from atom.model_ops.embed_head import VocabParallelEmbedding, ParallelLMHead
 from atom.model_config.qwen3_5 import (
     Qwen3_5Config,  # noqa: F401
     Qwen3_5TextConfig,
 )
+
 from atom.model_config.qwen3_5_moe import (
     Qwen3_5MoeConfig,  # noqa: F401
     Qwen3_5MoeTextConfig,
 )
-from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
-from atom.model_ops.layernorm import GemmaRMSNorm as Qwen3_5RMSNorm
+from atom.model_ops.moe import FusedMoE
 from atom.model_ops.linear import (
     MergedColumnParallelLinear,
 )
-from atom.model_ops.moe import FusedMoE
-from atom.model_ops.utils import atom_parameter
+from atom.model_ops.layernorm import GemmaRMSNorm as Qwen3_5RMSNorm
 from atom.models.qwen3_next import (
     Qwen3NextAttention,
-    Qwen3NextDecoderLayer,
     Qwen3NextGatedDeltaNet,
-    Qwen3NextMLP,
     Qwen3NextModel,
     Qwen3NextSparseMoeBlock,
+    Qwen3NextMLP,
+    Qwen3NextDecoderLayer,
 )
+
 from atom.models.utils import (
     IntermediateTensors,
     PPMissingLayer,
-    extract_layer_index,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
+    extract_layer_index,
 )
-from atom.utils.decorators import support_torch_compile
 
 
 def get_qwen3_5_text_config(atom_config: Config):
@@ -420,7 +423,7 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         "input_ids": 0,
         # positions is of shape (3, seq_len) if mrope is enabled for qwen2-vl,
         # otherwise (seq_len, ).
-        "positions": -1,
+        "positions": [0, -1],
         "intermediate_tensors": 0,
         "inputs_embeds": 0,
     }
@@ -457,19 +460,6 @@ class Qwen3_5Model(Qwen3NextModel):
         )
 
         self.norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
-
-@support_torch_compile(
-    dynamic_arg_dims={
-        "input_ids": 0,
-        # MRoPE VL path: positions shape (3, seq_len).
-        "positions": [0, -1],
-        "intermediate_tensors": 0,
-        "inputs_embeds": 0,
-    }
-)
-class Qwen3_5MRoPEModel(Qwen3_5Model):
-    """Language backbone for Qwen3.5-VL; separate compile mapping from text-only."""
 
 
 _QWEN3_5_PACKED_MODULES_MAPPING = {
@@ -509,7 +499,6 @@ def _apply_bf16_in_proj_mapping(mapping: dict, atom_config: Config) -> dict:
 
 class Qwen3_5ForCausalLMBase(nn.Module):
     packed_modules_mapping = _QWEN3_5_PACKED_MODULES_MAPPING
-    model_cls = Qwen3_5Model
 
     def __init__(self, atom_config: Config, prefix: str = ""):
         config: Qwen3_5MoeTextConfig = get_qwen3_5_text_config(atom_config)
@@ -522,7 +511,7 @@ class Qwen3_5ForCausalLMBase(nn.Module):
             dict(self.packed_modules_mapping), atom_config
         )
         self.config = config
-        self.model = self.model_cls(
+        self.model = Qwen3_5Model(
             atom_config=atom_config,
             prefix=maybe_prefix(prefix, "model"),
         )
@@ -566,10 +555,6 @@ class Qwen3_5ForCausalLMBase(nn.Module):
 
 class Qwen3_5ForCausalLM(Qwen3_5ForCausalLMBase):
     pass
-
-
-class Qwen3_5ForCausalLMMRoPE(Qwen3_5ForCausalLMBase):
-    model_cls = Qwen3_5MRoPEModel
 
 
 class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase):
@@ -618,10 +603,6 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase):
         )
 
 
-class Qwen3_5MoeForCausalLMMRoPE(Qwen3_5MoeForCausalLM):
-    model_cls = Qwen3_5MRoPEModel
-
-
 _TEXT_ONLY_WEIGHTS_MAPPING = {
     "model.language_model.": "language_model.model.",
     "lm_head.": "language_model.lm_head.",
@@ -666,9 +647,8 @@ class Qwen3_5ForConditionalGenerationTextOnly(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         **_: object,
     ):
-        # Text-only models must keep the input_ids path for block-FP8 + torch.compile.
-        # Multimodal models override forward in _Qwen3_5MultimodalBase to force
-        # inputs_embeds so vision tokens survive warmup.
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_input_ids(input_ids)
         return self.language_model(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
@@ -747,20 +727,20 @@ class _Qwen3_5MultimodalBase(nn.Module):
     )
 
     # Weight name mapping: checkpoint -> native ATOM module names.
-    hf_to_atom_mapper: ClassVar[dict[str, str]] = {
+    hf_to_atom_mapper = {
         "model.visual.": "visual.",
         "lm_head.": "language_model.lm_head.",
         "model.language_model.": "language_model.model.",
     }
 
     # Remap quant exclude layer names from checkpoint format to native names.
-    quant_exclude_name_mapping: ClassVar[dict[str, str]] = {
+    quant_exclude_name_mapping = {
         "model.visual.": "visual.",
         "lm_head.": "language_model.lm_head.",
         "model.language_model.": "language_model.model.",
     }
 
-    language_model_cls = Qwen3_5ForCausalLMMRoPE
+    language_model_cls = Qwen3_5ForCausalLM
 
     @staticmethod
     def get_mrope_input_positions(
@@ -848,7 +828,7 @@ class Qwen3_5MultimodalModel(_Qwen3_5MultimodalBase):
 
 
 class Qwen3_5MoeMultimodalModel(_Qwen3_5MultimodalBase):
-    language_model_cls = Qwen3_5MoeForCausalLMMRoPE
+    language_model_cls = Qwen3_5MoeForCausalLM
 
     def _prepare_text_config(self, atom_config: Config) -> None:
         text_config = atom_config.hf_config.text_config
