@@ -2820,7 +2820,10 @@ class DeepseekV4Attention(nn.Module):
                 sin.reshape(sin.shape[0], -1),
                 num_groups=G,
                 quant_group_size=128,
-                scale_shuffle=False,
+                # Row-major [S, G, Ks], which is how `x_scale` is allocated
+                # above and how the mxscale GEMM below reads it. The other
+                # layouts fill the same bytes in a shuffled order.
+                scale_layout="row",
                 x_fp8=x_fp8,
                 x_scale=x_scale,
             )
