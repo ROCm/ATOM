@@ -34,7 +34,7 @@ from atom.model_ops.attention_mla import (
     mla_dcp_decode_is_persistent,
     mla_dcp_kernel_num_heads,
 )
-from atom.utils import CpuGpuBuffer, envs
+from atom.utils import CpuGpuBuffer, envs, upload_numpy
 from atom.utils.block_convert import (
     kv_indices_generate_triton,
     mtp_prepare_decode_mla_kernel,
@@ -1282,14 +1282,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             total_tokens = int(cu[-1])
             # cu doubles as gather_kv_b_proj kv_indptr (block_size=1 → block
             # indptr == token indptr) and flash_attn cu_seqlens_k.
-            kv_indptr_list.append(
-                torch.from_numpy(cu).pin_memory().to(self.device, non_blocking=True)
-            )
-            kv_indices_list.append(
-                torch.from_numpy(chunk_indices)
-                .pin_memory()
-                .to(self.device, non_blocking=True)
-            )
+            kv_indptr_list.append(upload_numpy(cu, self.device))
+            kv_indices_list.append(upload_numpy(chunk_indices, self.device))
             cu_seqlens_k_list.append(kv_indptr_list[-1])  # same tensor
             total_tokens_list.append(total_tokens)
             max_seqlen_k_list.append(int(per_seq_chunk_lens.max(initial=0)))
@@ -1396,9 +1390,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
             cu = np.zeros(bs + 1, dtype=np.int32)
             np.cumsum(global_chunk_len, out=cu[1:])
-            cu_seqlens_k_list.append(
-                torch.from_numpy(cu).pin_memory().to(self.device, non_blocking=True)
-            )
+            cu_seqlens_k_list.append(upload_numpy(cu, self.device))
             total_tokens_list.append(int(cu[-1]))
             max_seqlen_k_list.append(int(global_chunk_len.max(initial=0)))
             padded_local_chunk_seq_lens_list.append(plc.astype(np.int32).tolist())
@@ -1419,11 +1411,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 if slot_segments
                 else np.empty(0, np.int32)
             )
-            local_slot_ids_list.append(
-                torch.from_numpy(slot_ids)
-                .pin_memory()
-                .to(self.device, non_blocking=True)
-            )
+            local_slot_ids_list.append(upload_numpy(slot_ids, self.device))
 
         return MLAChunkContextMetadata(
             kv_indptr=[],
@@ -2314,9 +2302,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             c_len = c_hi - c_lo
             cu = np.full(ub_num_reqs + 1, c_len, dtype=np.int32)
             cu[0] = 0
-            kv_indptr_list.append(
-                torch.from_numpy(cu).pin_memory().to(device, non_blocking=True)
-            )
+            kv_indptr_list.append(upload_numpy(cu, device))
             kv_indices_list.append(prefix_slots[c_lo:c_hi])
             total_tokens_list.append(c_len)
             max_seqlen_k_list.append(c_len)
