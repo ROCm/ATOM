@@ -135,6 +135,7 @@ class MiniMaxParser(ToolCallParser):
     CALL_OPENERS: ClassVar[tuple[str, ...]] = ("<tool_call>",)
     CALL_CLOSERS: ClassVar[tuple[str, ...]] = ("</tool_call>",)
     CALL_FILLERS: ClassVar[tuple[str, ...]] = (MINIMAX_NS,)
+    CALL_SELF_CLOSERS: ClassVar[tuple[str, ...]] = ("</invoke>",)
 
     # The ns_token opens a region like the other two, rather than being
     # framing the reader drops. It prefixes every tag including ones inside a

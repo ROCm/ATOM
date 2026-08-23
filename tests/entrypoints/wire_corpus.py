@@ -133,25 +133,16 @@ def naming_another_tool(name: str) -> str:
     return REAL_CALLS[name].replace(TOOL, OTHER_TOOL)
 
 
-def naming_nothing(name: str) -> str:
-    """The same call with no name at all -- `<invoke name="">`.
+def naming_something_undispatchable(name: str) -> str:
+    """The same call, named with something no client could dispatch.
 
-    Every format's name slot is `[^"]*` or the equivalent, so the wire admits
-    this and three formats used to hand it on as a call the client could not
-    dispatch.
+    The corpus's own name with its separator spaced out, rather than invented
+    junk: no grammar admits a space, and unlike a quote or an angle bracket it
+    perturbs no format's markup, so "no call" cannot come out true for the
+    wrong reason. Two hand-picked literals -- empty, and all-space -- read as
+    thorough and missed the shape a model actually writes.
     """
-    return REAL_CALLS[name].replace(TOOL, "")
-
-
-def naming_only_spaces(name: str) -> str:
-    """The same call named with whitespace.
-
-    Kept apart from :func:`naming_nothing` because the two were not equivalent:
-    MiniMax rejected the empty name and shipped this one, having tested for
-    emptiness *before* stripping. A single shape would have found two of the
-    three formats and called the axis covered.
-    """
-    return REAL_CALLS[name].replace(TOOL, "   ")
+    return REAL_CALLS[name].replace(TOOL, TOOL.replace("_", " "))
 
 
 def truncated_naming_another_tool(name: str) -> str:
@@ -216,6 +207,42 @@ def quoting_a_call_it_will_not_make(name: str) -> str:
     truncation table already hold them to.
     """
     return cut_at_payload(REAL_CALLS[name].replace(TOOL, "undeclared_thing"))
+
+
+def only_the_wrapper_closed(name: str) -> str | None:
+    """This format's call with the call's own closer never written.
+
+    `<tool_call><function=NAME></tool_call>`: the wrapper is closed and the
+    call is not, so the model was describing the syntax. Built by deleting
+    `CALL_SELF_CLOSERS` from a zero-argument rendering, which is why that
+    tuple is declared -- hand-written, this shape existed for one format.
+
+    ``None`` where the format cannot express it, and both reasons are read off
+    the rendering rather than listed:
+
+    * no inner block at all -- GLM's call *is* its wrapper;
+    * something already written between the name and the call's own closer,
+      even with no arguments. Kimi puts `{}` there and K3 an `index="N"`
+      attribute, so deleting the closer leaves a call the format recovers as
+      a truncation -- both do, measured -- rather than an unclosed block. The
+      question stops being the same one.
+
+    Nothing checks that the closer has a wrapper after it: no registered
+    format renders one last, and a guard for a shape none of them produce is
+    a guard nothing can justify.
+    """
+    parser = _registry()[name]
+    call = parser.render_call(TOOL, {})
+    closer = next((c for c in parser.CALL_SELF_CLOSERS if c in call), None)
+    if closer is None:
+        return None
+    at = call.rindex(closer)
+    body = call[call.index(TOOL) + len(TOOL) : at]
+    for filler in parser.CALL_FILLERS:
+        body = body.replace(filler, "")
+    if any(c.isalnum() for c in body):
+        return None
+    return call[:at] + call[at + len(closer) :]
 
 
 def quoting_the_opener(name: str) -> str:

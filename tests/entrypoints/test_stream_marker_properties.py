@@ -5,9 +5,12 @@
 
 Not a list of cases. The corpus is *generated* from the two production
 registries -- ``reasoning_dialects.DIALECTS`` and the tool-parser
-``_DETECT_ORDER`` -- crossed with a handful of text shapes built out of each
-entry's own declared markers. Registering a new model family or a new
-tool-call format therefore adds coverage by itself, and
+``registry.PARSERS_BY_NAME`` -- crossed with a handful of text shapes built
+out of each entry's own declared markers. The parser registry and not
+``_DETECT_ORDER``: the detect order omits the terminal fallback, so reading
+it here meant this file's own axis was a union assembled by hand.
+Registering a new model family or a new tool-call format therefore adds
+coverage by itself, and
 ``test_every_registered_parser_declares_its_markers`` is what stops a new
 entry from joining the registry without the declaration the generation needs.
 
@@ -34,6 +37,7 @@ its content segments into the tool parser, both flushed on the last chunk.
 from __future__ import annotations
 
 import ast
+import functools
 import itertools
 import json
 import pathlib
@@ -56,7 +60,7 @@ from atom.entrypoints.openai.tool_parser import RegionParse, ToolCall, parse_too
 from atom.entrypoints.openai.tool_parser.kimi_k3_tool_parser import KimiK3Parser
 from atom.entrypoints.openai.tool_parser.kimi_tool_parser import KimiParser
 from atom.entrypoints.openai.tool_parser.qwen3_tool_parser import QwenXmlParser
-from atom.entrypoints.openai.tool_parser.registry import _DETECT_ORDER
+from atom.entrypoints.openai.tool_parser.registry import PARSERS_BY_NAME
 from atom.entrypoints.openai.tool_parser.stream import (
     _PEEK_WINDOW,
     ToolCallStreamParser,
@@ -65,16 +69,19 @@ from entrypoints.wire_corpus import (
     DECLARED_TOOLS,
     REAL_CALLS,
     naming_another_tool,
-    naming_nothing,
-    naming_only_spaces,
+    naming_something_undispatchable,
     quoting_a_call_it_will_not_make,
     truncated,
     truncated_naming_another_tool,
 )
 
-# Kimi is the terminal fallback and so is not in the detect order, but it is a
-# registered format with markers of its own.
-ALL_PARSERS = (*_DETECT_ORDER, KimiParser)
+# The registry itself, not a union assembled here. It was
+# `(*_DETECT_ORDER, KimiParser)` -- correct today, and correct only because
+# Kimi is the one registered format outside the detect order. A second such
+# format joins `PARSERS_BY_NAME` and every property in this file silently
+# stops covering it, which is the failure this file exists to prevent one
+# layer down.
+ALL_PARSERS = tuple(PARSERS_BY_NAME.values())
 
 # Slack allowed on top of the neutralised control before a hold counts as a
 # stall. One marker's worth, since that is the most a correct rule can need.
@@ -368,6 +375,21 @@ class TestEveryFormatIsCovered:
         ]
         assert not undeclared, f"registered parsers with no START_MARKERS: {undeclared}"
 
+    def test_every_registered_parser_says_what_closes_a_call(self):
+        """`CALL_SELF_CLOSERS`, empty or not, has to be written down.
+
+        Inherited it reads as "this format's call is its own wrapper", which
+        is true of two formats and false of the rest -- and the difference
+        decides whether `<tool_call><function=NAME></tool_call>` is prose or a
+        dispatch. Asked of `vars` for the same reason the markers above are:
+        a subclass would otherwise answer with its parent's.
+        """
+        undeclared = [p.NAME for p in ALL_PARSERS if "CALL_SELF_CLOSERS" not in vars(p)]
+        assert not undeclared, (
+            "registered parsers that never say what closes one of their "
+            f"calls: {undeclared}"
+        )
+
     def test_every_dialect_declares_an_end_marker(self):
         missing = [d for d in DIALECTS if not d.think_end_marker]
         assert not missing, "a dialect with no end marker cannot be streamed"
@@ -378,6 +400,87 @@ class TestEveryFormatIsCovered:
             f"{len(PAIRS)} cases for {len(ALL_PARSERS)} parsers and "
             f"{len(DIALECTS)} dialects -- the generator lost a dimension"
         )
+
+
+_FORMAT_NAMES = frozenset(PARSERS_BY_NAME)
+
+
+@functools.lru_cache(maxsize=8)
+def _format_tables(root: pathlib.Path) -> tuple[tuple[str, int, frozenset], ...]:
+    """Every string collection under `root` naming 2+ registered formats.
+
+    Cached on the directory: parsing the suite is 42 ms and three tests ask.
+    """
+    found = []
+    for path in sorted(root.rglob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.Dict):
+                items = node.keys
+            elif isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+                items = node.elts
+            else:
+                continue
+            named = (
+                frozenset(
+                    e.value
+                    for e in items
+                    if isinstance(e, ast.Constant) and isinstance(e.value, str)
+                )
+                & _FORMAT_NAMES
+            )
+            if len(named) >= 2:
+                found.append((path.name, node.lineno, named))
+    return tuple(found)
+
+
+class TestNoSuiteKeepsAShortCopyOfTheRegistry:
+    """A per-format table in a test is a copy of the registry, and copies go
+    *short*.
+
+    Three did, and all three were green the whole time they existed: the prose
+    property ran under the ids `[qwen, glm, qwen-outer-closer, dsml, minimax]`
+    -- a full sweep at a glance, four of six once counted -- and the other two
+    each left out the one format with most to get wrong. Nothing counted them.
+
+    So: any collection naming two or more formats has to name all of them. A
+    table that genuinely cannot says so with a one-name exemption, which is
+    below the threshold and visible in the diff.
+    """
+
+    ROOT: ClassVar[pathlib.Path] = pathlib.Path(__file__).resolve().parent
+
+    def test_the_scan_sees_the_tables(self):
+        """Positive control: a rename of the formats would otherwise retire
+        this silently, still green."""
+        assert _format_tables(self.ROOT), (
+            "no per-format table found in the suite, so this guard reads "
+            f"nothing; it is looking for {sorted(_FORMAT_NAMES)}"
+        )
+
+    def test_none_of_them_is_short(self):
+        short = [
+            f"{f}:{ln} covers {len(names)}/{len(_FORMAT_NAMES)}, "
+            f"missing {sorted(_FORMAT_NAMES - names)}"
+            for f, ln, names in _format_tables(self.ROOT)
+            if names != _FORMAT_NAMES
+        ]
+        assert not short, "per-format tables that do not cover the registry:\n  " + (
+            "\n  ".join(short)
+        )
+
+    def test_the_scan_rejects_a_short_table_and_accepts_a_whole_one(self, tmp_path):
+        """Two-sided, so the scan cannot be 'fixed' by being weakened the next
+        time it fires."""
+        names = sorted(_FORMAT_NAMES)
+        for listed, want_short in ((names, False), (names[:-1], True)):
+            # A directory each, so the cache is keyed apart rather than
+            # cleared -- clearing would evict the real scan other tests share.
+            probe = tmp_path / ("short" if want_short else "whole")
+            probe.mkdir()
+            (probe / "probe.py").write_text(f"T = {listed!r}\n")
+            found = _format_tables(probe)
+            assert found, "the probe file produced no table at all"
+            assert any(n != _FORMAT_NAMES for _f, _l, n in found) is want_short
 
 
 class TestEverySeedingSiteIsSeeded:
@@ -1727,7 +1830,7 @@ CALL_OPENERS: dict[str, str] = {
     "kimi": ("<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0"),
     "glm": "<tool_call>get_weather",
     "qwen": "<tool_call><function=get_weather>",
-    "kimi_k3": '<|open|>tools<|sep|><|open|>call tool="get_weather"<|sep|>',
+    "kimi_k3": '<|open|>tools<|sep|><|open|>call tool="get_weather" index="0"<|sep|>',
     "dsml": f'<{_D}tool_calls><{_D}invoke name="get_weather">',
     "minimax": f'{_NS}<tool_call>{_NS}<invoke name="get_weather">',
 }
@@ -1740,7 +1843,8 @@ CALL_CONTINUATIONS: dict[str, str] = {
     "glm": "<arg_key>city</arg_key>",
     "qwen": "<parameter=city>Paris</parameter>",
     "kimi_k3": (
-        '<|open|>argument key="city"<|sep|>Paris<|close|>argument<|close|>call'
+        '<|open|>argument key="city" type="string"<|sep|>Paris'
+        "<|close|>argument<|sep|><|close|>call<|sep|>"
     ),
     "dsml": f'<{_D}parameter name="city">Paris',
     "minimax": f"{_NS}<city>Paris",
@@ -2453,7 +2557,7 @@ class TestAnUnclosedCallDoesNotSwallowTheNextOne:
         "dsml": f"</{_D}invoke></{_D}tool_calls>",
         "minimax": f"{_NS}</invoke>{_NS}</tool_call>",
         "kimi": "<|tool_calls_section_end|>",
-        "kimi_k3": "<|close|>call",
+        "kimi_k3": "<|close|>call<|sep|><|close|>tools<|sep|>",
     }
 
     def _unclosed_then_real(self, parser) -> str:
@@ -2653,42 +2757,68 @@ class TestTheEarlyNameCannotDisagreeWithTheParse:
         )
 
 
-class TestNoFormatShipsACallItCannotName:
-    """A call the client cannot dispatch is not a call.
+class TestEveryParserDefersToTheSharedNameTest:
+    """Whether a name is a name is answered in one place, for every format.
 
-    Every format's name slot admits an empty string -- `name="([^"]*)"`,
-    `tool="([^"]*)"` -- so this is a shape the wire allows and a model can
-    produce. Three of six handed it on: DSML and K3 asked nothing at all, and
-    MiniMax asked `if not name` *before* `name.strip()`, so a name of pure
-    whitespace passed the guard and reached the client as `""`.
+    Asked by *refusal* rather than by junk input: `usable_tool_name` is forced
+    to reject, and each format is then handed its own real call from the
+    corpus. A parser that routes its name through the predicate reports
+    nothing; one that does not reports the call anyway and names itself.
 
-    Generated over the registry rather than written per format, because that
-    split -- three formats, three different ways of being wrong, one of them
-    only visible to the whitespace shape -- is what a per-format test set
-    reliably half-covers.
+    The point of doing it this way is that it invents no names. A list of junk
+    strings only ever covers the failures whoever wrote the list thought of --
+    and the first version here, an empty name and an all-space one, passed on
+    two formats that were broken. Qwen tested `if not name`, which admits
+    `<function=YOUR FUNCTION NAME>`, the placeholder a model writes when it is
+    explaining the format. Kimi's `functions\\.([\\w.\\-]+):` was called safe by
+    construction and admits a leading dot, so `functions..hidden:0` shipped a
+    call named `.hidden`. Neither shape was in the list; both fall out of this
+    question without being anticipated.
+
+    Parametrised over the registry, so a seventh format is covered the moment
+    it is registered rather than when someone remembers it.
     """
 
+    @staticmethod
+    def _module_of(parser):
+        return sys.modules[parser.__module__]
+
     @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
-    @pytest.mark.parametrize(
-        "derive", [naming_nothing, naming_only_spaces], ids=["empty", "whitespace"]
-    )
-    def test_it_is_not_reported_as_a_call(self, parser, derive):
-        text = derive(parser.NAME)
-        _content, calls = parse_tool_calls(text, DECLARED_TOOLS, parser)
+    def test_a_refusal_is_honoured(self, parser, monkeypatch):
+        module = self._module_of(parser)
+        assert hasattr(module, "usable_tool_name"), (
+            f"{parser.NAME} does not import the shared name test, so it is "
+            "answering the question itself"
+        )
+        monkeypatch.setattr(module, "usable_tool_name", lambda _name: False)
+        _content, calls = parse_tool_calls(
+            REAL_CALLS[parser.NAME], DECLARED_TOOLS, parser
+        )
         assert not calls, (
-            f"{parser.NAME} reported a call named "
-            f"{calls[0].function['name']!r}, which matches nothing the request "
-            "declared and which a client cannot dispatch"
+            f"{parser.NAME} reported {calls[0].function['name']!r} after the "
+            "shared name test refused it, so it is not consulting it"
         )
 
     @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
-    def test_and_the_same_shape_with_a_name_still_is(self, parser):
-        """The positive control. Without it the property above passes on a
-        parser that stopped reading its own format."""
+    def test_and_without_the_refusal_the_call_is_read(self, parser):
+        """The positive control. Every case above passes on a parser that
+        stopped reading its own format at all."""
         _content, calls = parse_tool_calls(
             REAL_CALLS[parser.NAME], DECLARED_TOOLS, parser
         )
         assert calls, f"{parser.NAME} no longer reads its own complete call"
+
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_and_the_real_predicate_refuses_a_real_shape(self, parser):
+        """The link the refusal test cannot make: that the predicate as it
+        actually stands rejects something. Without this, a `usable_tool_name`
+        that returned True for everything would satisfy the class above."""
+        text = naming_something_undispatchable(parser.NAME)
+        _content, calls = parse_tool_calls(text, DECLARED_TOOLS, parser)
+        assert not calls, (
+            f"{parser.NAME} reported a call named "
+            f"{calls[0].function['name']!r}, which no client could dispatch"
+        )
 
 
 class TestAQuotationDoesNotMoveARealCallsLeftEdge:

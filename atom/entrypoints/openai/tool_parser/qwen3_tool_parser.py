@@ -28,6 +28,7 @@ from .tool_parser import (
     continues_a_call,
     declared_tools_allow,
     unique_tool_call_id,
+    usable_tool_name,
 )
 
 # Also read by GlmParser.detect: '<function=' is what tells Qwen's <tool_call>
@@ -110,7 +111,11 @@ def _parse_function(
     if gt == -1:
         return None
     name = fn_text[:gt].strip()
-    if not name:
+    # Not `if not name`, which rejects only the empty one:
+    # `<function=YOUR FUNCTION NAME>` -- the placeholder a model writes while
+    # explaining the format -- went out as a call. GLM refused the same
+    # sentence, so one `<tool_call>` family gave two answers.
+    if not usable_tool_name(name):
         return None
     body = fn_text[gt + 1 :]
     types = param_types.get(name, {})
@@ -143,6 +148,7 @@ class QwenXmlParser(ToolCallParser):
     # real call in half.
     CALL_OPENERS: ClassVar[tuple[str, ...]] = ("<tool_call>",)
     CALL_CLOSERS: ClassVar[tuple[str, ...]] = ("</tool_call>",)
+    CALL_SELF_CLOSERS: ClassVar[tuple[str, ...]] = ("</function>",)
 
     @classmethod
     def render_call(cls, name: str, args: dict[str, str]) -> str:

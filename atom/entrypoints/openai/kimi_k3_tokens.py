@@ -72,11 +72,26 @@ UNPAIRED_FRAMING: tuple[str, ...] = (
     BARE_SEPARATOR,
 )
 
+# The model's own `_close_tag` is `<|close|>` + tag + `<|sep|>`, so each of
+# these has two spellings on the wire: whole, and cut short by `max_tokens`
+# between the tag and the separator. Longest first -- the markup walkers take
+# the first that matches, so the bare form listed first would leave the
+# separator behind.
+TOOLS_END = "<|close|>tools"
+CALL_END = "<|close|>call"
+ARGUMENT_END = "<|close|>argument"
+
+
+def both_spellings(end: str) -> tuple[str, str]:
+    """`end` with its separator and without, in the order a walker wants."""
+    return (end + BARE_SEPARATOR, end)
+
+
 # Brackets around a tool call. The tool parser's, for the reason in the module
 # docstring.
 TOOL_REGION_FRAMING: tuple[str, ...] = (
     TOOLS_START,
-    "<|close|>tools",
-    "<|close|>call",
-    "<|close|>argument",
+    TOOLS_END,
+    CALL_END,
+    ARGUMENT_END,
 )

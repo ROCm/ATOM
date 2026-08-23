@@ -30,6 +30,7 @@ from entrypoints.wire_corpus import (
     TYPED_TOOLS,
     check_corpus,
     complete,
+    only_the_wrapper_closed,
     quoting_the_arguments,
     quoting_the_opener,
     truncated,
@@ -44,13 +45,15 @@ def closer_reaching_the_tail_walk(parser) -> str | None:
     `opens_region` documents that framing is dropped -- so requiring such a
     literal to survive would be asserting against the format's own contract.
     Derived from the declarations, never a list of format names.
+
+    A framing marker *prefixing* the closer counts, not only one equal to it.
+    Exact membership missed K3's `<|close|>tools<|sep|>`, whose separator the
+    read-ahead strips as a second framing token -- so the whole literal is
+    gone before the tail walk, while the test asked for it back.
     """
+    framing = tuple(m for m in parser.START_MARKERS if not parser.opens_region(m))
     return next(
-        (
-            c
-            for c in parser.CALL_CLOSERS
-            if c not in parser.START_MARKERS or parser.opens_region(c)
-        ),
+        (c for c in parser.CALL_CLOSERS if not c.startswith(framing)),
         None,
     )
 
@@ -457,56 +460,46 @@ class TestProseIsNotATruncatedCall:
 
     TOOLS: ClassVar[list] = [{"type": "function", "function": {"name": "get_weather"}}]
 
-    @pytest.mark.parametrize(
-        "parser, text",
-        [
-            (
-                QwenXmlParser,
-                (
-                    "To call it the model writes <tool_call>"
-                    "<function=get_weather> and then the parameters."
-                ),
-            ),
-            (
-                GlmParser,
-                "To call it write <tool_call>get_weather and then the keys follow.",
-            ),
-            # `</tool_call>` closes the *outer* wrapper, so the `<function=`
-            # block is still open and this is prose, not a zero-argument
-            # call. Qwen's peek used to accept it as a follower while its
-            # parse did not; unifying them onto one constant would have made
-            # both accept it, which is worse -- a phantom dispatch rather
-            # than a dangling name.
-            (
-                QwenXmlParser,
-                (
-                    "A zero-arg call is written <tool_call><function=get_weather>"
-                    "</tool_call>, like that."
-                ),
-            ),
-            (
-                DsmlParser,
-                (
-                    'You emit <invoke name="get_weather"> and inside it a '
-                    '<\uff5cDSML\uff5cparameter name="city">Paris'
-                    "</\uff5cDSML\uff5cparameter> line."
-                ),
-            ),
-            (
-                MiniMaxParser,
-                (
-                    "To call it you emit ]<]minimax[>[<invoke "
-                    'name="get_weather"> and then a '
-                    "]<]minimax[>[<city>Paris</city> line."
-                ),
-            ),
-        ],
-        ids=["qwen", "glm", "qwen-outer-closer", "dsml", "minimax"],
-    )
-    def test_prose_naming_a_declared_tool_is_not_a_call(self, parser, text):
-        content, calls = parse_tool_calls(text, self.TOOLS, parser)
+    @pytest.mark.parametrize("name", sorted(PARSERS_BY_NAME), ids=str)
+    def test_prose_naming_a_declared_tool_is_not_a_call(self, name):
+        """One sentence per format, generated. The hand-written list read
+        `[qwen, glm, qwen-outer-closer, dsml, minimax]` -- a full sweep at a
+        glance, four of six once counted."""
+        text = quoting_the_opener(name)
+        content, calls = parse_tool_calls(text, self.TOOLS, PARSERS_BY_NAME[name])
         assert calls == [], f"fabricated {[c.function['name'] for c in calls]}"
         assert content == text, "the answer was truncated at the quoted tag"
+
+    @pytest.mark.parametrize("name", sorted(PARSERS_BY_NAME), ids=str)
+    def test_the_wrapper_closing_does_not_finish_an_open_call(self, name):
+        """`<tool_call><function=NAME></tool_call>`: the wrapper is closed and
+        the call is not, so the model was describing the syntax.
+
+        Was written out for Qwen alone, justified as a fact no registry
+        states. `CALL_CLOSERS` did state which formats have a wrapper; what
+        was missing is what closes the *call*, now `CALL_SELF_CLOSERS`. Three
+        formats can express the shape and all three call it prose.
+        """
+        text = only_the_wrapper_closed(name)
+        if text is None:
+            pytest.skip(f"{name} cannot express it; see `only_the_wrapper_closed`")
+        sentence = f"A zero-arg call is written {text}, like that."
+        content, calls = parse_tool_calls(sentence, self.TOOLS, PARSERS_BY_NAME[name])
+        assert calls == [], f"fabricated {[c.function['name'] for c in calls]}"
+        assert content == sentence, f"the answer was truncated: {content!r}"
+
+    def test_and_the_shape_is_buildable_for_at_least_three_formats(self):
+        """A coverage floor, because a wrong `CALL_SELF_CLOSERS` degrades the
+        case above to a skip rather than a failure -- declaring the wrapper
+        closer by mistake leaves the format's own markup in the body, the
+        derivation returns None, and the format quietly stops being tested."""
+        buildable = sorted(
+            n for n in PARSERS_BY_NAME if only_the_wrapper_closed(n) is not None
+        )
+        assert len(buildable) >= 3, (
+            f"only {buildable} can express a wrapper-closed call; a format "
+            "stopped being covered rather than started failing"
+        )
 
     @pytest.mark.parametrize(
         "parser, text",
@@ -1080,6 +1073,25 @@ class TestTheRequestsToolsAreResolvedOnce:
         assert _resolved_tools(once) is once
 
 
+# Kimi's sections are separate regions, so the gap between two of them is
+# released as answer where the other five call it markup. Marked rather than
+# left out, and `strict`, so it goes red the day someone fixes it -- which
+# imperative `pytest.xfail()` cannot do: that aborts before the assertion and
+# reports xfailed either way.
+_SEPARATOR_CASES = [
+    pytest.param(
+        fmt,
+        id=fmt,
+        marks=(
+            [pytest.mark.xfail(strict=True, reason="sections are separate regions")]
+            if fmt == "kimi"
+            else []
+        ),
+    )
+    for fmt in sorted(PARSERS_BY_NAME)
+]
+
+
 class TestWhatSitsBetweenTwoCalls:
     """Prose survives; the template's own separator does not.
 
@@ -1092,44 +1104,29 @@ class TestWhatSitsBetweenTwoCalls:
     """
 
     TOOLS = TestACallStillArrivingWhenTheStreamEnds.TOOLS
-    CALLS = {
-        "qwen": "<tool_call>\n<function=get_weather>\n"
-        "<parameter=city>Paris</parameter>\n</function>\n</tool_call>",
-        "glm": "<tool_call>get_weather<arg_key>city</arg_key>"
-        "<arg_value>Paris</arg_value></tool_call>",
-        "dsml": '<｜DSML｜tool_calls><｜DSML｜invoke name="get_weather">'
-        '<｜DSML｜parameter name="city">Paris</｜DSML｜parameter>'
-        "</｜DSML｜invoke></｜DSML｜tool_calls>",
-        "minimax": ']<]minimax[>[<invoke name="get_weather">'
-        "]<]minimax[>[<city>Paris</city>]<]minimax[>[</invoke>",
-        "kimi_k3": '<|open|>call tool="get_weather"<|sep|>'
-        '<|open|>argument key="city"<|sep|>Paris<|close|>argument<|close|>call',
-    }
-    PARSERS = {
-        "qwen": QwenXmlParser,
-        "glm": GlmParser,
-        "dsml": DsmlParser,
-        "minimax": MiniMaxParser,
-        "kimi_k3": KimiK3Parser,
-    }
 
-    @pytest.mark.parametrize("name", sorted(CALLS))
+    # `REAL_CALLS`, not a table. The hand-written one held five formats and
+    # two different shapes: Qwen's, GLM's and DSML's carried their outer
+    # wrapper, so two of them are two *regions*, while MiniMax's and K3's did
+    # not. One question asked two ways -- and the format it left out is the
+    # one that answers differently.
+    @pytest.mark.parametrize("name", _SEPARATOR_CASES)
     @pytest.mark.parametrize("gap", ["\n", "  ", "\n\n  \t"])
     def test_whitespace_alone_between_them_is_markup(self, name, gap):
-        call = self.CALLS[name]
+        call = REAL_CALLS[name]
         content, calls = parse_tool_calls(
-            call + gap + call, self.TOOLS, self.PARSERS[name]
+            call + gap + call, self.TOOLS, PARSERS_BY_NAME[name]
         )
         assert len(calls) == 2, "this shape proves nothing without two calls"
         assert (
             content == ""
         ), f"the template's separator reached the client as content: {content!r}"
 
-    @pytest.mark.parametrize("name", sorted(CALLS))
+    @pytest.mark.parametrize("name", sorted(PARSERS_BY_NAME), ids=str)
     def test_but_a_sentence_between_them_is_not(self, name):
-        call = self.CALLS[name]
+        call = REAL_CALLS[name]
         content, calls = parse_tool_calls(
-            call + "\nNow Rome.\n" + call, self.TOOLS, self.PARSERS[name]
+            call + "\nNow Rome.\n" + call, self.TOOLS, PARSERS_BY_NAME[name]
         )
         assert len(calls) == 2
         assert "Now Rome." in content, f"the answer was deleted: {content!r}"
@@ -1154,31 +1151,14 @@ class TestAZeroArgumentCallLooksTheSameInEveryFormat:
             },
         }
     ]
-    ZERO_ARG = {
-        "kimi": "<|tool_calls_section_begin|><|tool_call_begin|>functions.now:0"
-        "<|tool_call_argument_begin|><|tool_call_end|><|tool_calls_section_end|>",
-        "qwen": "<tool_call>\n<function=now>\n</function>\n</tool_call>",
-        "glm": "<tool_call>now</tool_call>",
-        "dsml": '<｜DSML｜tool_calls><｜DSML｜invoke name="now">'
-        "</｜DSML｜invoke></｜DSML｜tool_calls>",
-        "kimi_k3": '<|open|>call tool="now"<|sep|><|close|>call',
-    }
-    PARSERS = {
-        "kimi": KimiParser,
-        "qwen": QwenXmlParser,
-        "glm": GlmParser,
-        "dsml": DsmlParser,
-        "kimi_k3": KimiK3Parser,
-    }
+    # No table: a zero-argument call is `render_call(name, {})`, which every
+    # format implements as the inverse of its parse. The hand-written one left
+    # out MiniMax -- the format that names parameters by the tag itself, and
+    # so has the most to get wrong when there are no tags.
 
-    @pytest.mark.parametrize("tool_name", ["get_weather", "get-weather", "server.tool"])
-    def test_and_every_format_accepts_the_names_openai_allows(self, tool_name):
-        """`^[a-zA-Z0-9_-]{1,64}$` is OpenAI's grammar, and MCP namespaces
-        with a dot. Kimi-K2 matched `functions\\.(\\w+)`, so a hyphenated or
-        namespaced name did not match at all -- the section was not a call and
-        the whole thing, special tokens included, went out as `content` with
-        `finish_reason: stop`."""
-        tools = [
+    @staticmethod
+    def _tools_for(tool_name: str) -> list[dict]:
+        return [
             {
                 "type": "function",
                 "function": {
@@ -1187,16 +1167,26 @@ class TestAZeroArgumentCallLooksTheSameInEveryFormat:
                 },
             }
         ]
-        for name, template in self.ZERO_ARG.items():
-            text = template.replace("now", tool_name)
-            _, calls = parse_tool_calls(text, tools, self.PARSERS[name])
-            assert [c.function["name"] for c in calls] == [
-                tool_name
-            ], f"{name} could not read a call to {tool_name!r}"
 
-    @pytest.mark.parametrize("name", sorted(ZERO_ARG))
+    @pytest.mark.parametrize("tool_name", ["get_weather", "get-weather", "server.tool"])
+    @pytest.mark.parametrize("name", sorted(PARSERS_BY_NAME), ids=str)
+    def test_and_every_format_accepts_the_names_openai_allows(self, name, tool_name):
+        """`^[a-zA-Z0-9_-]{1,64}$` is OpenAI's grammar, and MCP namespaces
+        with a dot. Kimi-K2 matched `functions\\.(\\w+)`, so a hyphenated or
+        namespaced name did not match at all -- the section was not a call and
+        the whole thing, special tokens included, went out as `content` with
+        `finish_reason: stop`."""
+        parser = PARSERS_BY_NAME[name]
+        text = parser.render_call(tool_name, {})
+        _, calls = parse_tool_calls(text, self._tools_for(tool_name), parser)
+        assert [c.function["name"] for c in calls] == [
+            tool_name
+        ], f"{name} could not read a call to {tool_name!r}"
+
+    @pytest.mark.parametrize("name", sorted(PARSERS_BY_NAME), ids=str)
     def test_the_arguments_are_parseable_json(self, name):
-        _, calls = parse_tool_calls(self.ZERO_ARG[name], self.TOOLS, self.PARSERS[name])
+        parser = PARSERS_BY_NAME[name]
+        _, calls = parse_tool_calls(parser.render_call("now", {}), self.TOOLS, parser)
         assert len(calls) == 1, f"{name} did not read its own zero-argument call"
         args = calls[0].function["arguments"]
         assert json.loads(args) == {}, f"{name} sent {args!r}"

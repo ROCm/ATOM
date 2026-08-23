@@ -222,6 +222,10 @@ class DsmlParser(ToolCallParser):
         "</tool_calls>",
         "</tool_call>",
     )
+    CALL_SELF_CLOSERS: ClassVar[tuple[str, ...]] = (
+        "</" + _DSML + "invoke>",
+        "</invoke>",
+    )
 
     # detect() is inherited: any start marker present means DSML.
 

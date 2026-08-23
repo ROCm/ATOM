@@ -29,6 +29,7 @@ from .tool_parser import (
     ToolCallParser,
     continues_a_call,
     declared_tools_allow,
+    usable_tool_name,
 )
 
 KIMI_SECTION_BEGIN = "<|tool_calls_section_begin|>"
@@ -95,6 +96,11 @@ def _parse_entries(
     for match in _ENTRY_RE.finditer(section_text):
         name = match.group(1)
         index = match.group(2)
+        # `[\w.\-]+` is not the same set: it admits a leading `.` or `-`, so
+        # `functions..hidden:0` shipped a call named `.hidden`. "Safe by
+        # construction" is why this parser was left out of the sweep.
+        if not usable_tool_name(name):
+            continue
         if match.group("closed") is None and not _is_truncated_call(
             name, match.group(3), param_types, at_end=at_end
         ):
@@ -123,6 +129,10 @@ class KimiParser(ToolCallParser):
     # The section opener, and the only literal detection keys on. The entry
     # markers inside it are `parse_region`'s business, never a reader's.
     START_MARKERS: ClassVar[tuple[str, ...]] = (KIMI_SECTION_BEGIN,)
+    # An entry's own end. `CALL_CLOSERS` stays empty: the section end is a
+    # `REGION_END_MARKER`, which is a stronger statement than "markup at a
+    # call's right edge" and is what `markup_end` must not walk over here.
+    CALL_SELF_CLOSERS: ClassVar[tuple[str, ...]] = (KIMI_ENTRY_END,)
     # A special token, so it cannot appear inside a JSON argument value. That
     # is the whole licence for closing a region on it: the XML formats' own
     # closers fail this test, because a model writing about tool calls puts

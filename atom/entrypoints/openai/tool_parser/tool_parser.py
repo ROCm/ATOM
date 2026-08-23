@@ -294,6 +294,13 @@ class ToolCallParser(ABC):
     CALL_OPENERS: ClassVar[tuple[str, ...]] = ()
     CALL_CLOSERS: ClassVar[tuple[str, ...]] = ()
     CALL_FILLERS: ClassVar[tuple[str, ...]] = ()
+    # What closes a *call*, where `CALL_CLOSERS` closes the wrapper around
+    # one. Telling them apart is the difference between prose and a dispatch:
+    # `<tool_call><function=NAME></tool_call>` has the wrapper closed and the
+    # call still open, so it is a model describing the syntax. Declared so
+    # the suite can build that shape for every format rather than for the one
+    # somebody wrote out. Empty where a call *is* its wrapper.
+    CALL_SELF_CLOSERS: ClassVar[tuple[str, ...]] = ()
     # The literals that *identify* this format, where that is narrower than
     # "what must not be split". Empty means the two coincide, as they do for
     # five of the six.

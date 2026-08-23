@@ -63,7 +63,10 @@ _CALL_CONTINUES = ('<|open|>argument key="', "<|close|>call")
 _K3_CALL_RE = re.compile(
     r'<\|open\|>call tool="(?P<name>[^"]*)"(?:\s+index="(?P<index>\d+)")?<\|sep\|>'
     r"(?P<body>" + _NOT_NESTED_CALL + r"*?)"
-    r"(?:(?P<closed><\|close\|>call)"
+    # The separator belongs to the closer, as it does in the model's encoder
+    # and in vLLM's and SGLang's readers. Optional: a truncation can stop
+    # between the two.
+    r"(?:(?P<closed><\|close\|>call(?:<\|sep\|>)?)"
     r'|(?=<\|open\|>call tool=")'
     r"|(?=<\|open\|>tools<\|sep\|>)"
     r"|(?=<\|close\|>tools)"
@@ -193,21 +196,35 @@ class KimiK3Parser(ToolCallParser):
     # anyway once it is handed back, but naming it here keeps the newline
     # between the two tokens out of the answer.
     CALL_OPENERS: ClassVar[tuple[str, ...]] = (k3.TOOLS_START,)
-    CALL_CLOSERS: ClassVar[tuple[str, ...]] = ("<|close|>tools",)
-    # NOT `CALL_FILLERS = (k3.BARE_SEPARATOR,)`, though a `<|sep|>` between
-    # `<|close|>call` and `<|close|>tools` does then reach the client. That
-    # tuple feeds the *call*-level walkers too, so declaring it there moved
-    # every K3 call's span and broke four properties at once. The separator
-    # would have to be a wrapper-only filler, and no format needs that yet.
+    # With the separator, because that is where the model puts it. Spelled
+    # without it, `markup_end` stopped on the separator and
+    # `<|sep|><|close|>tools<|sep|>` reached the client as the answer between
+    # two adjacent calls. Not `CALL_FILLERS = (k3.BARE_SEPARATOR,)`, which
+    # would fix the same leak: that tuple feeds the *call*-level walkers too
+    # and moves every K3 call's span.
+    CALL_CLOSERS: ClassVar[tuple[str, ...]] = k3.both_spellings(k3.TOOLS_END)
+    CALL_SELF_CLOSERS: ClassVar[tuple[str, ...]] = k3.both_spellings(k3.CALL_END)
 
     @classmethod
     def render_call(cls, name: str, args: dict[str, str]) -> str:
+        """Byte for byte what `/data/Kimi-K3/encoding_k3.py` emits.
+
+        It used to emit a reduction: no `index`, no `type`, no separator after
+        any closer, no `<|close|>tools` at all. This is the sole source of the
+        K3 corpus, so every K3 property was asked about a shape the model
+        never writes -- `_k3_coerce`'s `type=` branch was unreachable from it.
+
+        `type="string"` because the signature takes `dict[str, str]`; the
+        model chooses per value in `_xtml_type`.
+        """
+        sep = k3.BARE_SEPARATOR
         body = "".join(
-            f'<|open|>argument key="{k}"<|sep|>{v}<|close|>argument'
+            f'<|open|>argument key="{k}" type="string"{sep}{v}{k3.ARGUMENT_END}{sep}'
             for k, v in args.items()
         )
         return (
-            f'{k3.TOOLS_START}<|open|>call tool="{name}"<|sep|>' f"{body}<|close|>call"
+            f'{k3.TOOLS_START}<|open|>call tool="{name}" index="0"{sep}'
+            f"{body}{k3.CALL_END}{sep}{k3.TOOLS_END}{sep}"
         )
 
     @classmethod
