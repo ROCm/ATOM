@@ -196,17 +196,26 @@ class ReasoningFilter:
             (speaking.output_open_marker,) if speaking.output_open_marker else ()
         )
         self.state = 1 if starts_thinking else 0
+        # Nothing has been released yet, so an end marker arriving now sits at
+        # offset 0 -- which is the only place it means "I did not think this
+        # turn". See `_split_inline_tag`, whose answer this has to match.
+        self._at_offset_zero = not starts_thinking
         self._scanner = self._scanner_for(self.state)
 
     def _scanner_for(self, state: int) -> MarkerScanner | None:
         """What this state has to watch for. ``None`` when that is nothing,
         which is the common case for the inline-`<think>` dialect after the
         channel has closed."""
-        watched = self._framing | (
-            self._end_markers
-            if state == 1
-            else self._open_markers if state == 0 else frozenset()
-        )
+        watched = set(self._framing)
+        if state == 0:
+            # End markers too, though the channel is not open: at offset 0 one
+            # means the model declined to think, further in it is the model's
+            # own words, and watching is what tells them apart. Free --
+            # measured 1.00x on all four dialects, since `MarkerScanner` costs
+            # by chunk and not by marker count.
+            watched |= self._open_markers | self._end_markers
+        elif state == 1:
+            watched |= self._end_markers
         return MarkerScanner(tuple(sorted(watched))) if watched else None
 
     @property
@@ -225,6 +234,8 @@ class ReasoningFilter:
             text = ""
             if scan.released:
                 out.append((self._field, scan.released))
+                if self.state == 0:
+                    self._at_offset_zero = False
             if scan.hit is None:
                 return out
             if scan.hit in self._framing and not (
@@ -235,6 +246,17 @@ class ReasoningFilter:
                 # answer depend on which tool-call format was resolved, so a
                 # K3 deployment whose template refused the tools probe handed
                 # its channel tokens to the client on both delivery paths.
+                text = scan.rest
+                continue
+            if self.state == 0 and scan.hit in self._end_markers:
+                # Below the framing branch on purpose: K3 declares
+                # `<|open|>response<|sep|>` as both, and framing wins -- it
+                # says the same thing this rule would, at any offset.
+                if self._at_offset_zero:
+                    self.state = 2  # declined to think; the rest is the answer
+                    self._scanner = self._scanner_for(self.state)
+                else:
+                    out.append((self._field, scan.hit))  # the model's own words
                 text = scan.rest
                 continue
             # A channel boundary: state 0 -> 1 on the opener, 1 -> 2 on any

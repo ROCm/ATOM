@@ -636,8 +636,8 @@ REASONING_DIALECTS = [
 ]
 
 
-def split_reasoning_streaming(text: str, chunk: int, starts_thinking: bool):
-    f = ReasoningFilter(starts_thinking=starts_thinking)
+def split_reasoning_streaming(text: str, chunk: int, channel: ReasoningChannel):
+    f = channel.stream()
     segs = []
     for i in range(0, len(text), chunk):
         segs += f.process(text[i : i + chunk])
@@ -646,6 +646,91 @@ def split_reasoning_streaming(text: str, chunk: int, starts_thinking: bool):
         "".join(t for k, t in segs if k == "reasoning_content"),
         "".join(t for k, t in segs if k == "content"),
     )
+
+
+def every_way(dialect, text, chunks=(1, 3, 10_000)) -> list:
+    """One text read by `split` and by the stream at each chunk size.
+
+    Every entry has to hold, because these defects are the two readers
+    agreeing on the wrong answer -- comparing them to each other says nothing.
+    """
+    channel = ReasoningChannel(dialect=dialect, starts_open=False)
+    out = [channel.split(text)]
+    for chunk in chunks:
+        reasoning, content = split_reasoning_streaming(text, chunk, channel)
+        out.append((reasoning or None, content))
+    return out
+
+
+class TestWhatTheReaderDoesWithAChannelThePromptDidNotOpen:
+    """Agreement is not correctness, and these two are wrong *together*.
+
+    The class below holds the two delivery modes to the same answer, and can
+    see neither of these: both readers make the identical mistake, so parity
+    holds while the chain of thought goes out as the answer. Hence assertions
+    about what the split *is*, not that the two paths match.
+    """
+
+    @pytest.mark.parametrize(
+        "dialect", DIALECTS, ids=lambda d: d.think_end_marker.strip("<>|")
+    )
+    def test_a_leading_end_marker_is_the_model_declining_to_think(self, dialect):
+        """The shape MiniMax-M3 emits in about a quarter of multi-turn replies.
+
+        Its template renders every earlier no-thinking assistant turn as a bare
+        `</mm:think>` before the answer, so that is the trained form for "I did
+        not think this turn" -- measured on the live model, 0/10 single-turn
+        and 7/30 multi-turn. vLLM and SGLang both carry dedicated code for it
+        (`test_nonstreaming_drops_leading_end_tag`; `MiniMaxM3Detector`'s
+        docstring names the mechanism).
+
+        Not reasoning -- there is none -- but not the answer either: the marker
+        is this dialect's own literal and only the answer after it is the
+        model's words.
+        """
+        for got in every_way(dialect, f"{dialect.think_end_marker}The answer is 42."):
+            assert got == (None, "The answer is 42."), (
+                f"{dialect.think_end_marker} left in the answer, or the answer "
+                f"eaten: {got!r}"
+            )
+
+    @pytest.mark.parametrize(
+        "dialect", DIALECTS, ids=lambda d: d.think_end_marker.strip("<>|")
+    )
+    def test_but_one_further_in_is_the_model_writing_about_it(self, dialect):
+        """The mirror, and the reason the rule is positional.
+
+        Honouring an end marker wherever it appears is the guess `0858a50d4`
+        removed, and it removed it for cause: it made an ordinary answer wait
+        for a marker that was never coming, and it fed pre-marker text to the
+        tool-call sniffer. Neither applies at offset 0 -- there is no text
+        before it, and the decision is made within one marker's length, which
+        is already the scanner's bound. vLLM pins both halves the same way.
+        """
+        text = f"You close the block with {dialect.think_end_marker} normally."
+        for got in every_way(dialect, text):
+            assert got == (None, text), f"a quoted marker was consumed: {got!r}"
+
+    @pytest.mark.parametrize(
+        "dialect", DIALECTS, ids=lambda d: d.think_end_marker.strip("<>|")
+    )
+    def test_and_a_channel_the_model_opened_itself_is_still_read(self, dialect):
+        """One dialect did not do what the other two do.
+
+        A prompt that leaves thinking off does not stop the model opening a
+        channel of its own -- adaptive modes exist, and so does a model that
+        reopens one mid-answer. The two inline dialects read it; the channel
+        dialect returned `None` from its `starts_thinking` gate, and the tool
+        parser then stripped the framing and glued the chain of thought onto
+        the answer, on both paths, so nothing could see it.
+        """
+        open_m = dialect.output_open_marker or dialect.prompt_open_marker
+        text = f"{open_m}weighing it up{dialect.think_end_marker}The answer is 42."
+        for got in every_way(dialect, text):
+            assert got == ("weighing it up", "The answer is 42."), (
+                f"{dialect.think_end_marker}: a self-opened channel was not "
+                f"read: {got!r}"
+            )
 
 
 class TestTheReasoningSplitAgreesWithItself:
@@ -674,11 +759,28 @@ class TestTheReasoningSplitAgreesWithItself:
     CHUNKS = (1, 3, 11, 10_000)
 
     def _divergences(self, dialect, starts_thinking, field: int):
+        """Both readers through one `ReasoningChannel`, which is the point.
+
+        They used to be built here by hand -- `separate_reasoning(text,
+        starts_thinking=...)` and `ReasoningFilter(starts_thinking=...)`, both
+        without a dialect -- while the corpus was generated from the
+        *parametrised* dialect's markers. So for eight of the twelve cases
+        neither reader ever saw a marker, both returned the whole string as
+        one undifferentiated blob, and the two "agreed" about nothing.
+        Measured: a mutant that leaks an entire MiniMax chain of thought into
+        `content` passed the whole 3755-test suite.
+
+        `ReasoningChannel`'s own docstring names this failure -- "the
+        streaming filter got the second and never the first, and answered with
+        the union of every dialect's markers instead" -- so going through it
+        is not a workaround, it is the thing that was meant to be tested.
+        """
+        channel = ReasoningChannel(dialect=dialect, starts_open=starts_thinking)
         out = []
         for text in reasoning_shapes(dialect):
-            non = separate_reasoning(text, starts_thinking=starts_thinking)[field]
+            non = channel.split(text)[field]
             for chunk in self.CHUNKS:
-                got = split_reasoning_streaming(text, chunk, starts_thinking)[field]
+                got = split_reasoning_streaming(text, chunk, channel)[field]
                 if (non or "") != got:
                     out.append((text, chunk, non, got))
         return out

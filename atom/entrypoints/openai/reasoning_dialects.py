@@ -156,17 +156,37 @@ def _split_channel(text: str, starts_thinking: bool = False) -> SplitResult | No
     still reach this one, and the structural answer is to resolve the dialect
     at startup as the tool-call format now is.
     """
+    before = ""
     if not starts_thinking:
-        return None
+        # A prompt that left thinking off does not stop the model opening a
+        # channel of its own. The two inline dialects have always read that;
+        # returning `None` here let the tool parser strip the framing and glue
+        # the trace onto the answer, on both paths, so parity could not see it.
+        at = text.find(CHANNEL_THINK_START)
+        if at != -1:
+            # Searched, and what precedes it is content -- the two rulings
+            # `_split_inline_tag` makes. Anchoring at 0 instead put this out
+            # of step with the streaming filter on `\n\n<|open|>think<|sep|>`.
+            before, text = text[:at], text[at + len(CHANNEL_THINK_START) :]
+        elif text.startswith(CHANNEL_THINK_END):
+            # Declined to think; offset 0 only, see `_split_inline_tag`.
+            return (None, text[len(CHANNEL_THINK_END) :])
+        else:
+            return None
     best_at, best = len(text), None
     for marker in _CHANNEL_END_MARKERS:
         at = text.find(marker)
         if 0 <= at < best_at:
             best_at, best = at, marker
     if best is None:
-        return None
+        # Never closed. Seeded, that is a trace cut off at `max_tokens` and
+        # `separate_reasoning`'s fallback says so; self-opened, the channel's
+        # start is already known.
+        if starts_thinking:
+            return None
+        return (text or None, before)
     reasoning = text[:best_at]
-    content = text[best_at + len(best) :]
+    content = before + text[best_at + len(best) :]
     return (reasoning or None, content)
 
 
@@ -238,6 +258,20 @@ def _split_inline_tag(
         # writing the same answer twice.
         return None
 
+    # A closer with nothing before it: the model declined to think this turn.
+    # MiniMax-M3's template renders every earlier no-thinking assistant turn
+    # as a bare `</mm:think>`, so that is the trained form -- measured live,
+    # 0 of 10 single-turn replies and 7 of 30 multi-turn. vLLM and SGLang both
+    # carry code for it.
+    #
+    # Offset 0 only. Honouring the marker anywhere is the guess `0858a50d4`
+    # removed for cause: it made an ordinary answer wait for a marker that
+    # never came, and fed pre-marker text to the tool-call sniffer. Neither
+    # reaches here -- nothing precedes offset 0, and the decision is made
+    # within one marker's length, which the scanner already buffers.
+    if text.startswith(end_marker):
+        return (None, text[len(end_marker) :])
+
     # Closed block: <think>...</think> answer.
     #
     # Searched, not anchored at position 0: a block does not have to open the
@@ -288,7 +322,12 @@ _CHANNEL_CONTENT_FRAMING = k3.CHANNEL_FRAMING
 
 _CHANNEL_DIALECT = ReasoningDialect(
     prompt_open_marker=CHANNEL_THINK_START,
-    output_open_marker=None,  # template-injected; not emitted in output
+    # The same literal, not `None`. "The template injects it, so the model
+    # never writes one" is false when the prompt leaves thinking off and the
+    # model opens a channel anyway -- and `ReasoningFilter` builds
+    # `_open_markers` from this field, so state 0 had nothing to leave itself
+    # on and delivered the whole trace as the answer.
+    output_open_marker=CHANNEL_THINK_START,
     think_end_marker=CHANNEL_THINK_END,
     # `response` is what the trained format always opens next -- Kimi-K3's
     # encoder emits a complete response section before any tools section, so
