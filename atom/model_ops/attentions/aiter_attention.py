@@ -12,7 +12,7 @@ from aiter.dist.parallel_state import get_tp_group
 
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mha import PagedAttentionImpl, use_pa_decode_bf16_asm
-from atom.utils import CpuGpuBuffer, envs
+from atom.utils import CpuGpuBuffer, envs, pack_rows, upload_numpy
 from atom.utils.block_convert import (
     block_table_convert_triton,
     kv_indices_generate_triton,
@@ -1019,29 +1019,26 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         ctx_lens = cached_prefix_lens + new_lens
         total_kv = int(ctx_lens.sum())
 
-        max_blocks = max(
-            (len(block_tables_host[first_req + i]) for i in range(ub_num_reqs)),
-            default=1,
-        )
-        bt = np.zeros((ub_num_reqs, max_blocks), dtype=np.int32)
-        for i in range(ub_num_reqs):
-            row = block_tables_host[first_req + i]
-            bt[i, : len(row)] = row
+        # Indexed, not sliced: a short slice would leave `bt` rows unwritten.
+        rows = [block_tables_host[first_req + i] for i in range(ub_num_reqs)]
+        max_blocks = max((len(row) for row in rows), default=1)
+        bt = np.empty((ub_num_reqs, max_blocks), dtype=np.int32)  # pack_rows clears
+        pack_rows(bt, rows)
 
         cu_k = np.zeros(ub_num_reqs + 1, dtype=np.int32)
         np.cumsum(ctx_lens.astype(np.int32), out=cu_k[1:])
 
         ub_attn.has_cached = True
         ub_attn.total_kv = total_kv
-        ub_attn.context_lens = torch.from_numpy(ctx_lens.astype(np.int32)).to(
-            device, non_blocking=True
-        )
-        ub_attn.block_tables = torch.from_numpy(bt).to(device, non_blocking=True)
-        ub_attn.cu_seqlens_k = torch.from_numpy(cu_k).to(device, non_blocking=True)
+        ub_attn.context_lens = upload_numpy(ctx_lens.astype(np.int32), device)
+        # `bt` is [requests x blocks], so a long enough context puts it past the
+        # pageable limit and the copy would start synchronizing.
+        ub_attn.block_tables = upload_numpy(bt, device)
+        ub_attn.cu_seqlens_k = upload_numpy(cu_k, device)
         ub_attn.seq_starts = torch.zeros(ub_num_reqs, dtype=torch.int32, device=device)
-        ub_attn.num_cached_tokens = torch.from_numpy(
-            cached_prefix_lens.astype(np.int32)
-        ).to(device, non_blocking=True)
+        ub_attn.num_cached_tokens = upload_numpy(
+            cached_prefix_lens.astype(np.int32), device
+        )
         ub_attn.max_seqlen_k = int(ctx_lens.max())
 
     def prepare_decode(self, batch: ScheduledBatch, bs: int):

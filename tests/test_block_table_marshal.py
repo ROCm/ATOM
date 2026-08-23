@@ -12,7 +12,9 @@ Two properties have to hold, and neither shows up in a throughput number:
   `BlockManager` append into a `BufferError`, far from the code that took it.
 
 The marshals are exercised as unbound methods on a stub that supplies what
-they read, so the arithmetic under test is the shipped arithmetic.
+they read, so the arithmetic under test is the shipped arithmetic. Both now
+delegate to `pack_rows`, whose own contract -- which rows it clears, and which
+destinations it refuses -- is pinned at the bottom of this file.
 """
 
 from __future__ import annotations
@@ -26,6 +28,7 @@ import pytest
 
 from atom.model_engine.sequence import new_block_table
 from atom.model_ops.attentions.backends import CommonAttentionBuilder
+from atom.utils import pack_rows
 
 V4Builder = pytest.importorskip(
     "atom.model_ops.attentions.deepseek_v4_attn",
@@ -210,6 +213,34 @@ def test_tbo_prefill_stash_does_not_pin_the_rows_it_keeps():
     for i, row in enumerate(kept):
         dst[i, : len(row)] = row
     assert (dst[0, : len(rows[0])] == np.asarray(rows[0][: len(rows[0])])).all()
+
+
+def test_pack_rows_clears_the_rows_it_fills_and_leaves_the_rest():
+    """Its callers hand it an uncleared destination -- `np.empty` at the TBO
+    site -- and rely on it to zero-fill each row's tail itself. What it must
+    not do is clear rows nobody scheduled."""
+    dst = np.full((6, MAX_COLS), POISON, dtype=np.int32)
+    rows = _rows(3)
+
+    pack_rows(dst, rows)
+
+    for i, row in enumerate(rows):
+        assert list(dst[i, : len(row)]) == list(row)
+        assert (dst[i, len(row) :] == 0).all(), "row tail not cleared"
+    assert (dst[len(rows) :] == POISON).all(), "cleared rows it was not given"
+
+
+def test_pack_rows_refuses_a_destination_whose_bits_it_would_reinterpret():
+    """`.cast("i")` reinterprets rather than converts, so a destination of any
+    other dtype would take the block ids as raw bits."""
+    dst = np.zeros((4, MAX_COLS), dtype=np.float32)
+
+    with pytest.raises(TypeError, match="int32"):
+        pack_rows(dst, _rows(2))
+
+    # Control: nothing about the cast itself would have complained.
+    dst[0, 0] = 1.0
+    assert memoryview(dst).cast("B").cast("i")[0] == 1065353216
 
 
 def test_int32_asarray_over_a_block_table_is_the_hazard_being_guarded():

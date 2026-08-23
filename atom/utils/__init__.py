@@ -20,7 +20,7 @@ from contextlib import contextmanager
 from functools import lru_cache
 from multiprocessing.context import ForkContext, SpawnContext
 from multiprocessing.process import BaseProcess
-from typing import TYPE_CHECKING, Any, Optional, Union
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 from uuid import uuid4
 
@@ -614,6 +614,39 @@ def upload_numpy(arr: np.ndarray, device, *, non_blocking: bool = True) -> torch
         return torch.from_numpy(arr).to(device, non_blocking=non_blocking)
     _warn_oversize_upload(arr.nbytes)
     return torch.from_numpy(arr).pin_memory().to(device, non_blocking=non_blocking)
+
+
+def pack_rows(dst: np.ndarray, rows: Sequence) -> None:
+    """Left-align ragged `rows` into a 2-D int32 `dst`, zero-filling the rest.
+
+    A numpy row assign costs ~245ns on MI355X and does not vary with the row's
+    length until the bytes start to matter (~500 ints), so a marshal of short
+    rows is dispatch and nothing else -- 4.0 ms at 16k rows. Through one
+    `memoryview` of the destination the same write is ~46ns.
+
+    `.cast` is what makes the flattening safe: it refuses a non-contiguous
+    buffer, where `reshape(-1)` would hand back a copy and silently drop every
+    write. Rows must export a buffer of int32 -- an `array("i")` or an int32
+    ndarray -- since that is what makes each write a memcpy.
+    """
+    if dst.dtype != np.int32:
+        # `.cast("i")` would reinterpret the bits of any other dtype rather
+        # than convert them, so this must be checked and not assumed.
+        raise TypeError(f"pack_rows needs an int32 destination, got {dst.dtype}")
+    n_rows = len(rows)
+    # One memset over the rows in play, not one per row.
+    dst[:n_rows] = 0
+    flat = memoryview(dst).cast("B").cast("i")
+    cols = dst.shape[1]  # stride comes from what is written
+    base = 0
+    for row in rows:
+        n = len(row)
+        # A flat write has no row edge: where the numpy form raised, this one
+        # would land the overflow in the next row.
+        if n > cols:
+            raise ValueError(f"row of {n} exceeds the {cols}-column destination")
+        flat[base : base + n] = row
+        base += cols
 
 
 class CpuGpuBuffer:
