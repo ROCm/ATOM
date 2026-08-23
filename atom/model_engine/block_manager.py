@@ -187,14 +187,16 @@ class BlockManager:
         self.demands_declined_no_room: int = 0
 
     @classmethod
-    def compute_hash(cls, token_ids: list[int] | array.array, prefix: int = -1):
+    def compute_hash(cls, token_ids: array.array, prefix: int = -1):
         h = xxhash.xxh64()
         if prefix != -1:
             h.update(prefix.to_bytes(8, "little"))
-        # dtype pinned: `np.array` infers int64 from a list and int32 from an
-        # `array("i")`, so the digest used to depend on the caller's Python
-        # type. int64 is what lists gave, so pinning it leaves every existing
-        # hash where it was.
+        # dtype pinned even though every caller now passes an `array("i")`:
+        # `np.array` infers int64 from a list and int32 from an array, so the
+        # digest used to depend on the caller's Python type. int64 is what
+        # lists gave, which leaves every hash recorded before that where it
+        # was -- and keeps a caller who does pass a list from silently
+        # computing a different one.
         h.update(np.asarray(token_ids, dtype=np.int64).tobytes())
         return h.intdigest()
 
