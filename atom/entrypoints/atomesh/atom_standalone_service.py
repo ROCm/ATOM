@@ -35,6 +35,8 @@ from atom.entrypoints.openai.protocol import (
     STREAM_DONE_MESSAGE,
     TEXT_COMPLETION_OBJECT,
     CompletionRequest,
+    openai_stop_reason,
+    openai_stop_reason_with_calls,
 )
 from atom.entrypoints.openai.reasoning import (
     NO_REASONING,
@@ -45,11 +47,9 @@ from atom.entrypoints.openai.reasoning import (
 )
 from atom.entrypoints.openai.reasoning_dialects import resolve_dialect
 from atom.entrypoints.openai.serving_chat import (
-    _normalize_finish_reason,
     build_chat_response,
     build_chat_response_multi,
     create_chat_chunk,
-    finish_reason_with_calls,
 )
 from atom.entrypoints.openai.serving_completion import (
     build_completion_response,
@@ -875,7 +875,7 @@ class ChatCompletionStreamState:
         this, and only once nothing built is still queued."""
         chunks: list[str] = []
         for index, has_tool_calls in enumerate(self.has_tool_calls):
-            finish_reason = finish_reason_with_calls(
+            finish_reason = openai_stop_reason_with_calls(
                 self.engine_finish_reasons[index], has_tool_calls
             )
             chunks.append(
@@ -1045,12 +1045,11 @@ class CompletionStreamState:
                 self.request_id,
                 self.model_name,
                 event.get("text") or "",
-                # The reason goes on the final chunk, as it does on every
-                # other streaming path here and in the OpenAI server. It used
-                # to go on this one too, unnormalised -- so a client saw the
-                # engine's own `max_tokens` on a content chunk and `stop` on
-                # the terminal one, and `engine_finish_reasons`, which exists
-                # to carry it to the terminal one, was never written at all.
+                # The reason goes on the final chunk, as on every other
+                # streaming path here and in the OpenAI server. Put here too
+                # it was never translated, and `engine_finish_reasons` --
+                # which exists to carry it to the terminal chunk -- was never
+                # written at all.
                 finish_reason=None,
                 index=index,
                 **extra_fields,
@@ -1078,8 +1077,7 @@ class CompletionStreamState:
                     self.model_name,
                     "",
                     finish_reason=(
-                        _normalize_finish_reason(self.engine_finish_reasons[index])
-                        or "stop"
+                        openai_stop_reason(self.engine_finish_reasons[index]) or "stop"
                     ),
                     index=index,
                 )

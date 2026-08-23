@@ -15,6 +15,7 @@ from .protocol import (
     TOOL_NAME_RE,
     ChatCompletionRequest,
     ChatCompletionResponse,
+    openai_stop_reason_with_calls,
 )
 from .reasoning import (
     NO_REASONING,
@@ -180,43 +181,6 @@ def validate_chat_request(request: ChatCompletionRequest) -> None:
                 raise ValueError("response_format.json_schema.schema must be an object")
 
 
-def _normalize_finish_reason(finish_reason: str | None) -> str | None:
-    """Map engine finish reasons to the OpenAI-standard vocabulary.
-
-    The engine may report an EOS stop as ``"stop_<token_id>"`` (the raw id of
-    the stop token that fired, e.g. ``"stop_163586"``). OpenAI clients only
-    understand ``"stop"``/``"length"``/``"tool_calls"``, so anything that is
-    not a recognized value collapses to ``"stop"``.
-    """
-    if finish_reason is None:
-        return None
-    if finish_reason in ("stop", "length", "tool_calls"):
-        return finish_reason
-    if finish_reason in ("max_tokens", "max_new_tokens"):
-        return "length"
-    if finish_reason.startswith("stop"):
-        return "stop"
-    return "stop"
-
-
-def finish_reason_with_calls(engine_reason: str | None, has_calls: bool) -> str:
-    """The reason to report when a call was parsed and the engine had its own.
-
-    `length` outranks `tool_calls`, because they answer different questions
-    and only one of them is a warning: `tool_calls` says "act on this", and
-    `length` says "this is not all of it". A response cut off mid-call parses
-    to a call with a silently truncated argument value -- every format's
-    unclosed-region branch exists to salvage exactly that -- and reporting
-    `tool_calls` for it told the client to run a tool with half its arguments
-    and no indication anything was missing. OpenAI reports `length` for a
-    truncated response whatever else is in it.
-    """
-    normalized = _normalize_finish_reason(engine_reason)
-    if normalized == "length":
-        return "length"
-    return "tool_calls" if has_calls else (normalized or "stop")
-
-
 def create_chat_chunk(
     request_id: str,
     model: str,
@@ -372,7 +336,9 @@ async def stream_chat_response(
         aborted = False
 
         # Final chunks
-        finish_reason = finish_reason_with_calls(engine_finish_reason, has_tool_calls)
+        finish_reason = openai_stop_reason_with_calls(
+            engine_finish_reason, has_tool_calls
+        )
         usage = {
             "prompt_tokens": num_tokens_input,
             "completion_tokens": num_tokens_output,
@@ -436,7 +402,7 @@ def _build_chat_choice(
     # reason. A truthiness test reported `finish_reason: null` for it, which an
     # OpenAI client reads as "still in progress" and some SDKs raise on.
     effective_finish_reason = (
-        finish_reason_with_calls(finish_reason, bool(tool_calls))
+        openai_stop_reason_with_calls(finish_reason, bool(tool_calls))
         if (tool_calls or finish_reason is not None)
         else None
     )
@@ -712,7 +678,7 @@ async def stream_chat_response_fanout(
                 create_chat_chunk(
                     request_id,
                     model,
-                    finish_reason=finish_reason_with_calls(
+                    finish_reason=openai_stop_reason_with_calls(
                         engine_finish_reasons[i], has_tool_calls[i]
                     ),
                     index=i,

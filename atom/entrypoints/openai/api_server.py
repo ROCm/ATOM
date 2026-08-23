@@ -286,7 +286,7 @@ _ANTHROPIC_STOP_REASON = {
 def anthropic_stop_reason_with_calls(finish_reason: Any, has_calls: bool) -> str:
     """`max_tokens` outranks `tool_use`, for the reason `length` outranks
     `tool_calls` on the other endpoint (see
-    :func:`~.serving_chat.finish_reason_with_calls`): only one of the two is a
+    :func:`~.protocol.openai_stop_reason_with_calls`): only one of the two is a
     warning, and a response cut off mid-call parses to a call with a silently
     truncated argument value."""
     reason = anthropic_stop_reason(finish_reason)
@@ -298,7 +298,7 @@ def anthropic_stop_reason_with_calls(finish_reason: Any, has_calls: bool) -> str
 def anthropic_stop_reason(finish_reason: Any) -> str:
     """The engine's leave reason as Anthropic spells it.
 
-    Not routed through `_normalize_finish_reason`: that maps into OpenAI's
+    Not routed through `protocol.openai_stop_reason`: that maps into OpenAI's
     vocabulary (`stop` / `length`), which shares no member with the keys here,
     so chaining them would send every reason to the default.
 

@@ -12,15 +12,17 @@ import pytest
 
 from atom.entrypoints.atomesh import atom_standalone_service
 from atom.entrypoints.openai import api_server, serving_chat
+from atom.entrypoints.openai.protocol import (
+    openai_stop_reason,
+    openai_stop_reason_with_calls,
+)
 from atom.entrypoints.openai.reasoning import NO_REASONING
 from atom.entrypoints.openai.serving_anthropic import completes_a_tool_call
 from atom.entrypoints.openai.serving_chat import (
     _build_chat_choice,
-    _normalize_finish_reason,
     build_chat_response,
     build_chat_response_multi,
     create_chat_chunk,
-    finish_reason_with_calls,
     normalize_chat_tools,
     stream_chat_response,
     stream_chat_response_fanout,
@@ -639,12 +641,12 @@ class TestTheStreamReportsWhyItStopped:
     )
     def test_the_two_paths_agree_on_the_reason(self, engine_reason, expected):
         assert _build_chat_choice("hi", engine_reason)["finish_reason"] == expected
-        assert (_normalize_finish_reason(engine_reason) or "stop") == expected
+        assert (openai_stop_reason(engine_reason) or "stop") == expected
 
     def test_no_reason_at_all_still_ends_the_stream(self):
         """The engine always gives one for a finished generation; if it did
         not, a stream still has to close on something."""
-        assert (_normalize_finish_reason(None) or "stop") == "stop"
+        assert (openai_stop_reason(None) or "stop") == "stop"
 
     def test_no_streaming_path_hardcodes_stop(self):
         """Counted rather than listed: the gap was a site nobody listed."""
@@ -690,7 +692,7 @@ class TestBeingCutShortOutranksHavingMadeACall:
         ],
     )
     def test_the_rule(self, engine_reason, has_calls, expected):
-        assert finish_reason_with_calls(engine_reason, has_calls) == expected
+        assert openai_stop_reason_with_calls(engine_reason, has_calls) == expected
 
     def test_end_to_end_on_a_call_the_engine_cut_off(self):
         truncated = "<tool_call><function=get_weather><parameter=city>Par"
