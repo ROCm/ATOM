@@ -17,6 +17,12 @@ from pathlib import Path
 import sys
 from typing import Any
 
+from atom.utils.gc_utils import (
+    freeze_gc_heap,
+    maybe_attach_gc_debug_callback,
+    tune_gc,
+)
+
 logger = logging.getLogger("atom")
 
 engine: Any | None = None
@@ -185,6 +191,13 @@ def launch_atom_standalone(atomesh_runner: Any, raw_args: list[str]) -> None:
         standalone_args.engine_args,
         standalone_args.default_chat_template_kwargs,
     )
+
+    # This frontend is the api_server's counterpart -- same tokenizer, same
+    # per-request accumulators -- but it builds its engine itself and never
+    # runs that FastAPI lifespan, so it has to apply the GC policy here.
+    tune_gc()
+    maybe_attach_gc_debug_callback("atomesh")
+    freeze_gc_heap("atomesh")
 
     print("\033[32mATOM starting...\033[0m")
     print(f"\033[32mHost: {cli_args['host']}:{cli_args['port']}\033[0m")

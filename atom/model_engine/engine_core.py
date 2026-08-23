@@ -26,14 +26,20 @@ from atom.model_engine.sequence import (
 )
 from atom.model_engine.state_runtime import StateRuntime
 from atom.utils import (
+    engine_process_name,
     envs,
     init_exit_handler,
     make_zmq_socket,
     set_process_title,
-    tune_gc,
 )
 from atom.utils.distributed.utils import (
     stateless_destroy_torch_distributed_process_group,
+)
+from atom.utils.gc_utils import (
+    freeze_gc_heap,
+    maybe_attach_gc_debug_callback,
+    tune_gc,
+    unfreeze_gc_heap,
 )
 
 logger = logging.getLogger("atom")
@@ -55,6 +61,11 @@ KV_SHUTDOWN_DRAIN_TIMEOUT_S = 2.0
 
 
 class EngineCore:
+    # This process's name, for the title and every GC log line. A class
+    # attribute because it is per-process state and each engine is spawned into
+    # its own interpreter; `_setup_engine_process` is the only writer.
+    _process_name = "EngineCore"
+
     def __init__(self, config: Config, input_address: str, output_address: str):
         self.label = "Engine Core"
         self.input_queue = queue.Queue[Sequence]()
@@ -174,8 +185,41 @@ class EngineCore:
             scheduler=self.scheduler,
         )
 
+        # KV cache allocated, graphs captured, BlockPool built: everything this
+        # process holds for its lifetime exists, and the next thing is traffic.
+        self._freeze_after_startup()
+
         self._send_ready_signal()
         logger.info(f"{self.label}: EngineCore fully initialized and ready")
+
+    def _freeze_after_startup(self):
+        """Freeze this process and its ModelRunner workers.
+
+        The workers are driven from here because only the caller knows warmup
+        is over -- weights, compile and capture all land via RPCs it sends, and
+        `--enforce-eager` skips the capture step entirely.
+        """
+        freeze_gc_heap(self._process_name)
+        try:
+            self.runner_mgr.call_func("freeze_gc_heap", wait_out=True)
+        except Exception as e:  # noqa: BLE001 - never fail startup over this
+            logger.warning(f"{self._process_name}: worker heap freeze skipped: {e}")
+
+    @staticmethod
+    def _setup_engine_process(name: str):
+        """Identity, orphan reaping and GC policy, for every `run_engine`.
+
+        The disaggregated overrides do not call the base one, and each omission
+        is silent: an unreaped orphan pins VRAM, an untitled process is
+        `python` in `ps`, an unattached callback leaves ATOM_GC_DEBUG inert.
+        """
+        from atom.utils import enable_orphan_reaping
+
+        EngineCore._process_name = name
+        set_process_title(name)
+        enable_orphan_reaping()  # orphans pin VRAM + IPC handles; see its docs
+        tune_gc()
+        maybe_attach_gc_debug_callback(name)
 
     def _send_ready_signal(self):
         self.output_queue.put_nowait(("READY", None))
@@ -192,6 +236,9 @@ class EngineCore:
         if not self.still_running:
             return
         self.still_running = False
+        # Frozen weights and KV cache are unreachable *and* uncollectable, so
+        # an engine destroyed in-process would read as a GPU memory leak.
+        unfreeze_gc_heap()
         if not hasattr(self, "runner_mgr"):
             self._send_engine_dead()
             return
@@ -217,37 +264,17 @@ class EngineCore:
 
     @staticmethod
     def run_engine(config: Config, input_address: str, output_address: str):
-        # Bind this EngineCore's lifetime to its parent (the server /
-        # CoreManager): if the parent exits, have the kernel reap this process —
-        # and, transitively, the ModelRunner workers it spawns — instead of
-        # leaving them orphaned. Orphans keep pinning GPU VRAM + the custom
-        # all-reduce IPC handles / rendezvous TCPStore, which makes the next
-        # restart reuse a stale hipIpc handle and crash. See
-        # atom.utils.enable_orphan_reaping for the full rationale.
-        from atom.utils import enable_orphan_reaping
-
-        enable_orphan_reaping()
-
-        # The process whose GC pauses idle the GPUs: a gen-2 pass here stops
-        # the scheduler, and every ModelRunner worker then has nothing to run.
-        tune_gc()
+        EngineCore._setup_engine_process(engine_process_name(config))
 
         engine: EngineCore = None
         try:
             if config.pipeline_parallel_size > 1:
                 from atom.model_engine.pp_engine_core import PPEngineCoreProc
 
-                set_process_title(
-                    f"EngineCore_PP{config.parallel_config.pipeline_parallel_rank}"
-                )
                 engine = PPEngineCoreProc(config, input_address, output_address)
             elif config.parallel_config.data_parallel_size > 1:
-                set_process_title(
-                    f"EngineCore_DP{config.parallel_config.data_parallel_rank}"
-                )
                 engine = DPEngineCoreProc(config, input_address, output_address)
             else:
-                set_process_title("EngineCore")
                 engine = EngineCore(config, input_address, output_address)
             engine.busy_loop()
         except Exception as e:
@@ -968,6 +995,7 @@ class PrefillEngineCore(EngineCore):
 
     @staticmethod
     def run_engine(config: Config, input_address: str, output_address: str):
+        EngineCore._setup_engine_process("PrefillEngineCore")
         engine = None
         try:
             engine = PrefillEngineCore(config, input_address, output_address)
@@ -1062,6 +1090,12 @@ class DecodeEngineCore(EngineCore):
             disagg_cu_shm_name=config.disagg_cu_shm_name,
             state_runtime=self.state_runtime,
         )
+        # The block pool exists only now, so the freeze inside
+        # `super().__init__()` ran before there was one to take. Safe to repeat:
+        # `_ready_deferred` held READY back, so nothing has been admitted yet
+        # and `gc.freeze()` is additive.
+        self._freeze_after_startup()
+
         # EngineUtilityHandler was built in super().__init__() with scheduler=None
         # (decode defers scheduler creation); wire the real one in for MTP stats.
         self.utility_handler.scheduler = self.scheduler
@@ -1224,6 +1258,7 @@ class DecodeEngineCore(EngineCore):
 
     @staticmethod
     def run_engine(config: Config, input_address: str, output_address: str):
+        EngineCore._setup_engine_process("DecodeEngineCore")
         engine = None
         try:
             engine = DecodeEngineCore(config, input_address, output_address)

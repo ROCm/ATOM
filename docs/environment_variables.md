@@ -158,6 +158,21 @@ land. See `atom/model_ops/v4_backend_gate.py` for the selector.
 | **ATOM_ENABLE_DETAILED_ANNOTATION** | bool | 0 (false) | When profiling is active, appends detailed attention aggregates to the `prefill[]`/`decode[]` trace labels: `sqsq` (Σ N_Q²), `sqsk` (Σ N_Q·N_KV), and `sk` (Σ N_KV), where N_Q is the scheduled query tokens and N_KV the KV length per request. Used to estimate attention FLOPs for downstream roofline analysis. |
 | **ATOM_LOG_MORE** | bool | 0 (false) | If set to `1`, use verbose logging format (includes process name, PID, path, line number, function name). |
 
+## Garbage collection
+
+CPython's generation-2 pass is stop-the-world and walks every tracked
+container, so its cost tracks the live heap — which in a serving process is
+almost entirely startup state (model, compiled graph, tokenizer, KV block
+pool) that is never garbage. Measured on DeepSeek-V4-Flash-DSpark tp1: 242.8 ms
+in the EngineCore, up to 596 ms in a ModelRunner worker, while reclaiming zero
+objects once startup was done. See `atom/utils/gc_utils.py`.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_GC_FREEZE** | bool | 1 (true) | Move the startup heap into CPython's permanent generation once warmup is done, so collections stop scanning it. Applied in every process that outlives startup — the API server, the atomesh frontend, every EngineCore and every ModelRunner worker; undone on engine shutdown so an in-process teardown does not leak. Set `0` to keep the pre-freeze behaviour. |
+| **ATOM_GC_DEBUG** | bool | 0 (false) | Log every collection: generation, duration, objects reclaimed, objects tracked. Costly — counting the tracked set on every pass added ~90s of startup on a V4-Flash tp1 — but the only way to see these pauses, since a stall in the EngineCore idles the workers with no event in their torch trace. |
+| **ATOM_GC_THRESHOLD** | csv int | "" (= CPython default 700,10,10) | `t0,t1,t2` for `gc.set_threshold()`. Thresholds are per-interpreter, so each process reads it independently. A fallback for `ATOM_GC_FREEZE=0`: this spaces collections out, freezing removes what one costs. |
+
 ### Debug dump (`atom.utils.debug_helper`)
 
 Env-gated dump / compare / monkey-patch primitives for forward bisect &
