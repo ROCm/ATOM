@@ -202,18 +202,36 @@ def test_the_worker_rpc_returns_something():
     EngineCore freezes its workers through exactly such a call, and a server
     started with the first version of it never reached "ready".
 
-    Checked on the unbound function so this needs no GPU and no runner.
+    Read from source rather than imported: `model_runner` pulls in aiter, which
+    the non-GPU CI runner does not have, and a contract about what the code
+    says needs no runtime anyway.
     """
-    import inspect
+    import ast
+    import pathlib
 
-    from atom.model_engine.model_runner import ModelRunner
-
-    src = inspect.getsource(ModelRunner.freeze_gc_heap)
-    assert "return " in src, (
+    src = (
+        pathlib.Path(__file__).resolve().parent.parent
+        / "atom"
+        / "model_engine"
+        / "model_runner.py"
+    ).read_text()
+    fn = next(
+        (
+            node
+            for cls in ast.parse(src).body
+            if isinstance(cls, ast.ClassDef) and cls.name == "ModelRunner"
+            for node in cls.body
+            if isinstance(node, ast.FunctionDef) and node.name == "freeze_gc_heap"
+        ),
+        None,
+    )
+    assert fn is not None, "ModelRunner.freeze_gc_heap is gone; who freezes workers?"
+    assert any(
+        isinstance(n, ast.Return) and n.value is not None for n in ast.walk(fn)
+    ), (
         "ModelRunner.freeze_gc_heap returns None, which deadlocks the "
         "EngineCore's call_func(..., wait_out=True)"
     )
-    assert inspect.signature(ModelRunner.freeze_gc_heap).return_annotation is not None
 
 
 def test_the_env_gate_turns_it_off(monkeypatch):
