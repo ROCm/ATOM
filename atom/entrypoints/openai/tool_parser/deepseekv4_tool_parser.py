@@ -15,6 +15,10 @@ DeepSeek-V4-Flash occasionally malforms this (singular ``tool_call``, a missing
 ``invoke`` wrapper, or params without ``string=``); the parser recovers those
 best-effort: it infers a dropped tool name from the parameter signature vs the
 request's ``tools`` and infers a missing value type from the schema / JSON.
+
+Inferring a name has two conditions, both load-bearing: only at end of region,
+since an ``<invoke>`` still arriving names the tool outright, and only when
+some declared tool shares a parameter.
 """
 
 import json
@@ -137,13 +141,21 @@ def _coerce(value: str, string_attr: str | None, ptype: Any) -> Any:
 
 
 def _infer_name(arg_names: set, param_types: dict[str, dict[str, Any]]) -> str | None:
-    """Pick the request tool whose parameter set best matches ``arg_names``."""
-    best, best_score = None, -1e9
+    """The request tool whose parameters best match ``arg_names``, if one does.
+
+    At least one shared parameter. Every score is negative once the sets are
+    disjoint and the running best started below all of them, so the first
+    declared tool with any properties won on no evidence: a region of bare
+    ``<parameter name="zzz">`` dispatched ``get_weather``. This branch has no
+    name on the wire, so nothing shared means it was prose.
+    """
+    best, best_score = None, float("-inf")
     for name, props in param_types.items():
-        p = set(props)
-        if not p:
+        shared = len(arg_names.intersection(props))
+        if not shared:
             continue
-        score = len(p & arg_names) - 0.1 * len(p ^ arg_names)
+        # |p ^ a| == |p| + |a| - 2|p & a|, so it never has to be built.
+        score = shared - 0.1 * (len(props) + len(arg_names) - 2 * shared)
         if score > best_score:
             best_score, best = score, name
     return best
@@ -294,7 +306,16 @@ class DsmlParser(ToolCallParser):
                             pass
                 args = _unwrap_wrapper_args(args, set(types))
                 calls.append((name, args))
-        else:
+        elif at_end:
+            # `elif at_end`, not `else`: an `<invoke>` still on its way moves
+            # the region to the loop above and with it which bytes are markup,
+            # so this branch's acceptance is not monotone in arrived bytes --
+            # which the early announcement assumes. A name inferred half-way
+            # through went out ahead of prose the whole parse puts in front of
+            # it, so `stream=true` ordered the answer differently. A signature
+            # is only complete when the region is. Free: `invokes` is already
+            # computed, and the peek now skips this scan.
+            #
             # No `<invoke>` at all: the documented V4-Flash malform that drops
             # the wrapper and writes bare `<parameter>` lines. The name has to
             # be inferred from the parameter signature, which is why this is
@@ -311,18 +332,24 @@ class DsmlParser(ToolCallParser):
             # means the model was writing about the syntax -- and no shape
             # built from the front of a call can reach here to say so, which
             # is why it went two rounds unseen while deleting 152 characters
-            # of such an answer down to 18 and dispatching `unknown`.
+            # of such an answer down to 18 and dispatching a name it had
+            # invented.
             matches = list(_PARAM_RE.finditer(region))
             if matches and cls.markup_begin(region, matches[0].start()) == 0:
                 raw = {pm.group(1): (pm.group(3), pm.group(2)) for pm in matches}
-                name = _infer_name(set(raw), param_types) or "unknown"
-                # Nothing to anchor to, so the parameters run from wherever
-                # the region began to the end of what arrived.
-                spans.append((0, len(region)))
-                types = param_types.get(name, {})
-                args = {k: _coerce(v, s, types.get(k)) for k, (v, s) in raw.items()}
-                args = _unwrap_wrapper_args(args, set(types))
-                calls.append((name, args))
+                # No `or "unknown"`: a signature matching nothing declared is
+                # not a call the client could dispatch, and naming it shipped
+                # one anyway, with `finish_reason: tool_calls`, for an answer
+                # that had merely written the tags.
+                name = _infer_name(set(raw), param_types)
+                if name is not None:
+                    # Nothing to anchor to, so the parameters run from wherever
+                    # the region began to the end of what arrived.
+                    spans.append((0, len(region)))
+                    types = param_types.get(name, {})
+                    args = {k: _coerce(v, s, types.get(k)) for k, (v, s) in raw.items()}
+                    args = _unwrap_wrapper_args(args, set(types))
+                    calls.append((name, args))
 
         tool_calls = tuple(
             ToolCall(

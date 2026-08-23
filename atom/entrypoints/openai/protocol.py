@@ -4,7 +4,6 @@
 """Pydantic request/response models for the OpenAI-compatible API."""
 
 import json
-import re
 import time
 from typing import Any
 
@@ -67,9 +66,6 @@ def openai_stop_reason_with_calls(engine_reason: str | None, has_calls: bool) ->
     if normalized == "length":
         return "length"
     return "tool_calls" if has_calls else (normalized or "stop")
-
-
-TOOL_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
 
 
 # ============================================================================

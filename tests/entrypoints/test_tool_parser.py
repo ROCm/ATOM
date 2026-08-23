@@ -244,9 +244,11 @@ class TestToolCallStreamParser:
         tokens = [
             "I'll fetch that for you.",
             "<|tool_calls_section_begin|>",
-            "<|tool_call_begin|>functions.curl:0"
-            '<|tool_call_argument_begin|>{"url": "https://api.example.com/data", "method": "POST", "body": "{\\"key\\": \\"value\\"}"}'
-            "<|tool_call_end|>",
+            (
+                "<|tool_call_begin|>functions.curl:0"
+                '<|tool_call_argument_begin|>{"url": "https://api.example.com/data", "method": "POST", "body": "{\\"key\\": \\"value\\"}"}'
+                "<|tool_call_end|>"
+            ),
             "<|tool_calls_section_end|>",
         ]
         results = self._run_parser(tokens)
@@ -970,7 +972,7 @@ class TestACallStillArrivingWhenTheStreamEnds:
     parameter name was delivered as text.
     """
 
-    TOOLS = [
+    TOOLS: ClassVar[list[dict]] = [
         {
             "type": "function",
             "function": {
@@ -1142,7 +1144,7 @@ class TestAZeroArgumentCallLooksTheSameInEveryFormat:
     accumulates an `input_json_delta` it cannot parse.
     """
 
-    TOOLS = [
+    TOOLS: ClassVar[list[dict]] = [
         {
             "type": "function",
             "function": {
@@ -1249,7 +1251,7 @@ class TestTheWrapperClosingTagIsNeverTheAnswer:
             f"{content!r} != {tail!r}"
         )
 
-    WRITE_TOOLS = [
+    WRITE_TOOLS: ClassVar[list[dict]] = [
         {
             "type": "function",
             "function": {

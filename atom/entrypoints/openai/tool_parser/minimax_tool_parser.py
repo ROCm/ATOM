@@ -13,8 +13,12 @@ Every tag is prefixed by the ns_token ``]<]minimax[>[``::
     ]<]minimax[>[</tool_call>
 
 Unlike DSML, parameters are named by the TAG itself (``<city>Paris</city>``),
-not a ``name="..."`` attribute. Strip the ns_token first, then parse
-<invoke>/<tag> pairs. Values: schema type wins, else JSON, else raw string.
+not a ``name="..."`` attribute. Values: schema type wins, else JSON, else raw
+string.
+
+The ns_token is *not* stripped first, though this said so long after the code
+stopped doing it: parsing a copy with it deleted made every offset meaningless
+against the bytes that arrived.
 """
 
 import json
@@ -49,14 +53,18 @@ _NS = r"(?:" + re.escape(MINIMAX_NS) + r")?"
 # `finditer` then resumed past the real call, so the call the model actually
 # made never went out. GLM was given this guard first; this is the sweep.
 _NOT_NESTED = r"(?:(?!" + _NS + r"<invoke\s).)"
+# No leading ns_token: `CALL_FILLERS` declares it and `markup_begin` walks
+# back over it, so matching it here too is a second reader of one token -- and
+# the expensive kind. A pattern opening with an optional group has no fixed
+# first byte, so the scan tries every position rather than skipping to the
+# next `<`: on 18 KB, 524 us against 3.8, and 262 -> 3.8 for `_PARAM_RE`. The
+# other five formats open on a literal and never paid it.
 _INVOKE_RE = re.compile(
-    _NS
-    + r'<invoke\s+name="([^"]*)"\s*>('
+    r'<invoke\s+name="([^"]*)"\s*>('
     + _NOT_NESTED
     + r"*?)"
     + _NS
     + r"</invoke>|"
-    + _NS
     + r'<invoke\s+name="([^"]*)"\s*>('
     + _NOT_NESTED
     + r"*)",
@@ -67,7 +75,7 @@ _INVOKE_RE = re.compile(
 # model was cut off inside; without it a `max_tokens` truncation arrived as a
 # call with `{}` arguments while Qwen and GLM returned the partial value.
 _PARAM_RE = re.compile(
-    _NS + r"<([\w-]+)>(.*?)"
+    r"<([\w-]+)>(.*?)"
     r"(?:" + _NS + r"</\1>"
     r"|(?=" + _NS + r"<[\w-]+>)"
     r"|(?=" + _NS + r"</invoke>)"

@@ -405,8 +405,10 @@ class TestTheReasoningStageAgreesWithItselfWithoutHelp:
         "reason</think>answer",
         "reason<|close|>think<|sep|>answer",
         "reason<|close|>think<|sep|><|open|>response<|sep|>Paris.",
-        "reason<|close|>think<|sep|><|open|>response<|sep|>Paris."
-        "<|close|>response<|sep|><|end_of_msg|>",
+        (
+            "reason<|close|>think<|sep|><|open|>response<|sep|>Paris."
+            "<|close|>response<|sep|><|end_of_msg|>"
+        ),
         "reason</think>answer<|end_of_msg|>and more",
         "</think>",
         "<|close|>think<|sep|>",

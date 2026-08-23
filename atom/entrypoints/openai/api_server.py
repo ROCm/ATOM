@@ -93,6 +93,7 @@ from .serving_chat import (
     stream_chat_response,
     stream_chat_response_fanout,
     validate_chat_request,
+    validate_tool_list,
 )
 from .serving_completion import (
     build_completion_response,
@@ -1878,6 +1879,24 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
     Anthropic-compatible tools to use ATOM as a backend.
     """
     global engine, tokenizer, model_name
+
+    # One validator over the shape both endpoints share: this path already
+    # converts, so validating the conversion leaves a single rule rather than
+    # a second one in Anthropic's spelling. It checked nothing before, so a
+    # name `/v1/chat/completions` rejects was accepted here. Explicitly 400
+    # and before the try, because the handler below turns every exception into
+    # a 500 -- wrong for a malformed request, and once the response is
+    # streaming it arrives after the client was told the request succeeded.
+    try:
+        validate_tool_list(anthropic_to_openai_tools(request.tools))
+    except ValueError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "type": "error",
+                "error": {"type": "invalid_request_error", "message": str(exc)},
+            },
+        )
 
     try:
         # Convert Anthropic messages to OpenAI format

@@ -43,6 +43,7 @@ import json
 import pathlib
 import random
 import re
+import statistics
 import sys
 import time
 from typing import ClassVar
@@ -60,16 +61,21 @@ from atom.entrypoints.openai.tool_parser import RegionParse, ToolCall, parse_too
 from atom.entrypoints.openai.tool_parser.deepseekv4_tool_parser import DsmlParser
 from atom.entrypoints.openai.tool_parser.kimi_k3_tool_parser import KimiK3Parser
 from atom.entrypoints.openai.tool_parser.kimi_tool_parser import KimiParser
+from atom.entrypoints.openai.tool_parser.minimax_tool_parser import MINIMAX_NS
 from atom.entrypoints.openai.tool_parser.qwen3_tool_parser import QwenXmlParser
 from atom.entrypoints.openai.tool_parser.registry import PARSERS_BY_NAME
 from atom.entrypoints.openai.tool_parser.stream import (
     _PEEK_WINDOW,
     ToolCallStreamParser,
+    read_whole_events,
 )
 from entrypoints.wire_corpus import (
     DECLARED_TOOLS,
+    PARAM,
     PAYLOAD,
     REAL_CALLS,
+    TOOL,
+    TYPED_TOOLS,
     naming_another_tool,
     naming_something_undispatchable,
     quoting_a_call_it_will_not_make,
@@ -514,7 +520,7 @@ class TestEverySeedingSiteIsSeeded:
     # same question.
     SEEDED = ("ReasoningChannel", "ReasoningFilter", "separate_reasoning")
     # The keyword each of them spells the answer with.
-    SEED_KWARG = {
+    SEED_KWARG: ClassVar[dict[str, str]] = {
         "ReasoningChannel": "starts_open",
         "ReasoningFilter": "starts_thinking",
         "separate_reasoning": "starts_thinking",
@@ -945,6 +951,89 @@ class TestTheReasoningSplitAgreesWithItself:
         return "\n".join(lines)
 
 
+#: DSML's accepting branches that `render_call` does not render, read off the
+#: code rather than the prose describing them. Module level because it is a
+#: fact about the format: the corpus renders one form per format, so a format
+#: with several accepting branches is covered on one of them unless the others
+#: are carried by hand. The payload past `_PEEK_WINDOW` is deliberate -- the
+#: direct-JSON branch needs the whole object, so its call is invisible to any
+#: head-sized peek while being real.
+_DSML_BODY = "x" * (4 * _PEEK_WINDOW)
+DSML_UNRENDERED: dict[str, str] = {
+    "wrapper-less": "<｜DSML｜tool_calls>"
+    f'<｜DSML｜parameter name="{PARAM}">{_DSML_BODY}</｜DSML｜parameter>'
+    "</｜DSML｜tool_calls>",
+    "direct-json": f'<｜DSML｜tool_calls><｜DSML｜invoke name="{TOOL}">'
+    f'{{"{PARAM}": "{_DSML_BODY}"}}'
+    "</｜DSML｜invoke></｜DSML｜tool_calls>",
+}
+
+#: Both DSML branches in one region, wrapper-less first -- the shape that makes
+#: this format's acceptance non-monotone. Read as far as the `<invoke>` it is a
+#: wrapper-less call whose markup is the whole region; read past it the invoke
+#: loop claims the region and the bare parameters in front become answer.
+#: Neither branch alone shows it, which is why the order property below was
+#: green against the reverted fix until this was added. Not in
+#: `DSML_UNRENDERED`: releasing that prefix as text is correct here, and the
+#: give-up class asserts the opposite.
+DSML_BOTH_BRANCHES = (
+    "<｜DSML｜tool_calls>"
+    f'<｜DSML｜parameter name="{PARAM}">Paris</｜DSML｜parameter>'
+    f'<｜DSML｜invoke name="{TOOL}">'
+    f'<｜DSML｜parameter name="{PARAM}">Rome</｜DSML｜parameter>'
+    "</｜DSML｜invoke></｜DSML｜tool_calls>"
+)
+#: `TYPED_TOOLS`, not `DECLARED_TOOLS`: the wrapper-less branch has no name on
+#: the wire and infers one from the parameter signature, so tools declaring no
+#: properties give it nothing to match. Against `DECLARED_TOOLS` these shapes
+#: were accepted only because that branch fell back to a call named `unknown`
+#: -- never on their merits, so the positive control below was reporting the
+#: defect as the feature.
+DSML_UNRENDERED_TOOLS = TYPED_TOOLS
+
+
+def event_shape(events) -> list[tuple[str, str]]:
+    """An event list reduced to what both delivery modes must agree on.
+
+    Adjacent `content` is joined -- streaming releases the answer in whatever
+    pieces the chunking produced, which is not a difference a client can see,
+    and `_blocks_in_order` joins it for the same reason. Ids are dropped,
+    since comparing them compares the uuid generator. What is left is order,
+    names, indices and arguments.
+    """
+    out: list[list[str]] = []
+    for kind, data in events:
+        if kind == "content" and out and out[-1][0] == "content":
+            out[-1][1] += data
+        elif kind == "content":
+            out.append(["content", data])
+        elif kind in ("tool_call_start", "tool_call_args"):
+            fn = data["function"]
+            said = fn["name"] if kind == "tool_call_start" else fn["arguments"]
+            out.append([kind, f"{data['index']}:{said}"])
+        else:
+            out.append([kind, ""])
+    return [tuple(pair) for pair in out]
+
+
+#: One real call per registered format -- every format, so one added later is
+#: bound without anyone remembering to add a case -- plus DSML's three
+#: unrenderable branches.
+ORDER_CASES = [
+    *(
+        pytest.param(p, DECLARED_TOOLS, REAL_CALLS[p.NAME], id=p.NAME)
+        for p in ALL_PARSERS
+    ),
+    *(
+        pytest.param(DsmlParser, DSML_UNRENDERED_TOOLS, text, id=f"dsml-{branch}")
+        for branch, text in sorted(DSML_UNRENDERED.items())
+    ),
+    pytest.param(
+        DsmlParser, DSML_UNRENDERED_TOOLS, DSML_BOTH_BRANCHES, id="dsml-both-branches"
+    ),
+]
+
+
 class TestNonStreamingAgreesWithStreaming:
     """An answer with no tool call comes back the same on both paths.
 
@@ -996,8 +1085,34 @@ class TestNonStreamingAgreesWithStreaming:
             f"  out {rebuilt[-60:]!r}"
         )
 
+    @pytest.mark.parametrize("parser, tools, call", ORDER_CASES)
+    @pytest.mark.parametrize("lead", ["", "Let me check that. "], ids=["bare", "prose"])
+    def test_a_region_that_parses_agrees_on_order_too(self, parser, tools, call, lead):
+        """The two tests above bind the no-call case and skip this one.
 
-def streamed_and_last(parser, text: str, *, suppress: bool = False):
+        That skip is where an ordering difference lived: DSML announced a name
+        inferred from a signature, then an `<invoke>` arrived and moved which
+        bytes were markup, so `stream=true` put the call in front of prose
+        that `stream=false` puts behind it. Agreeing on the *text* is not
+        enough -- a client renders these in the order they arrive.
+        """
+        text = lead + call
+        engine = ToolCallStreamParser(tools=tools, parser_cls=parser)
+        events = []
+        for chunk in split_every_way(text)["fixed-3"]:
+            events.extend(engine.process(chunk))
+        events.extend(engine.flush())
+        streamed, whole = event_shape(events), event_shape(
+            read_whole_events(parser, text, tools)
+        )
+        assert streamed == whole, (
+            f"{parser.NAME} orders the same generation two ways\n"
+            f"  stream=true  {streamed}\n"
+            f"  stream=false {whole}"
+        )
+
+
+def streamed_and_last(parser, text: str, *, suppress: bool = False, tools=None):
     """What reached the client before the last frame, and in it.
 
     `(streamed, last frame, calls)` at four characters a chunk. Not `drive`
@@ -1006,7 +1121,9 @@ def streamed_and_last(parser, text: str, *, suppress: bool = False):
     copies of this lived in the classes below before it was one.
     """
     engine = ToolCallStreamParser(
-        tools=DECLARED_TOOLS, parser_cls=parser, suppress_calls=suppress
+        tools=DECLARED_TOOLS if tools is None else tools,
+        parser_cls=parser,
+        suppress_calls=suppress,
     )
     early, last, calls = [], [], 0
     for i in range(0, len(text), 4):
@@ -1093,6 +1210,33 @@ class TestNothingKnownToBeOutsideACallIsBuffered:
         assert not leaked, f"{parser.NAME} released wire tokens: {leaked}"
 
 
+class TestASignatureMatchingNothingIsNotACall:
+    """DSML's wrapper-less branch infers a name, so it must be able to say no.
+
+    Every score is negative once the parameter sets are disjoint and the
+    running best started below all of them, so the first declared tool with
+    any properties won on no evidence: `<parameter name="zzz">` dispatched
+    `get_weather`, and with no tools declared at all it dispatched a call
+    named `unknown`. There is no name on the wire in this branch, so nothing
+    matching means the region was prose.
+    """
+
+    REGION: ClassVar[str] = (
+        '<｜DSML｜tool_calls><｜DSML｜parameter name="zzz">1</｜DSML｜parameter>'
+    )
+
+    @pytest.mark.parametrize(
+        "tools", [DSML_UNRENDERED_TOOLS, None], ids=["declared", "none"]
+    )
+    def test_it_is_released_as_text(self, tools):
+        content, calls = parse_tool_calls(self.REGION, tools, DsmlParser)
+        assert not calls, (
+            f"dsml invented {[c.function['name'] for c in calls]} for a "
+            "signature no declared tool shares"
+        )
+        assert content == self.REGION, "the region was not released as written"
+
+
 class TestAGiveUpProbeStaysReverted:
     """A region that has produced nothing yet is still buffered, on purpose.
 
@@ -1106,43 +1250,30 @@ class TestAGiveUpProbeStaysReverted:
 
     The corpus is generated from `render_call`, which renders one form per
     format, so a format with several accepting branches is only covered on the
-    one it renders. This class carries the others by hand for that reason, and
-    says so.
+    one it renders. `DSML_UNRENDERED` carries the others for that reason.
     """
 
-    #: DSML's two accepting branches that `render_call` does not render, in
-    #: the syntax the parser accepts -- read off `parse_region`, not off the
-    #: prose describing them. A payload past `_PEEK_WINDOW` is the point: the
-    #: direct-JSON branch needs the whole object, so the call is invisible to
-    #: any head-sized peek while being perfectly real.
-    BODY: ClassVar[str] = "x" * (4 * _PEEK_WINDOW)
-    UNRENDERED: ClassVar[dict[str, str]] = {
-        "wrapper-less": "<｜DSML｜tool_calls>"
-        f'<｜DSML｜parameter name="city">{BODY}</｜DSML｜parameter>'
-        "</｜DSML｜tool_calls>",
-        "direct-json": '<｜DSML｜tool_calls><｜DSML｜invoke name="get_weather">'
-        f'{{"city": "{BODY}"}}'
-        "</｜DSML｜invoke></｜DSML｜tool_calls>",
-    }
-
-    @pytest.mark.parametrize("branch", sorted(UNRENDERED), ids=str)
+    @pytest.mark.parametrize("branch", sorted(DSML_UNRENDERED), ids=str)
     def test_the_shape_is_one_the_format_accepts(self, branch):
         """The positive control, and it is not ceremony: the first version of
         this class invented both shapes from the paragraph describing them,
         and DSML accepted neither -- so "the markup leaked" was just
         unparseable text being released, and the class asserted nothing."""
         _content, calls = parse_tool_calls(
-            self.UNRENDERED[branch], DECLARED_TOOLS, DsmlParser
+            DSML_UNRENDERED[branch], DSML_UNRENDERED_TOOLS, DsmlParser
         )
         assert calls, f"dsml does not accept the {branch} shape; fix the shape"
 
-    @pytest.mark.parametrize("branch", sorted(UNRENDERED), ids=str)
+    @pytest.mark.parametrize("branch", sorted(DSML_UNRENDERED), ids=str)
     @pytest.mark.parametrize("suppress", [False, True], ids=["dispatch", "none"])
     def test_a_call_longer_than_the_peek_window_is_not_released_as_text(
         self, branch, suppress
     ):
         early, last, _calls = streamed_and_last(
-            DsmlParser, self.UNRENDERED[branch], suppress=suppress
+            DsmlParser,
+            DSML_UNRENDERED[branch],
+            suppress=suppress,
+            tools=DSML_UNRENDERED_TOOLS,
         )
         leaked = [m for m in DsmlParser.START_MARKERS if m in early + last]
         assert not leaked, (
@@ -1209,7 +1340,9 @@ class TestBoundedWithhold:
 # generated: a call's payload is the one thing each format spells differently,
 # so the table is written out and `test_every_format_has_a_call` is what stops
 # a new format from joining the registry without one.
-_NS = "]<]minimax[>["
+# From the parser, not spelled again: a hand copy of a wire token is how two
+# readers of one literal come to disagree, which this suite has a test for.
+_NS = MINIMAX_NS
 _D = "｜DSML｜"
 
 
@@ -3062,4 +3195,84 @@ class TestAQuotationDoesNotMoveARealCallsLeftEdge:
         assert len(calls) == 1, (
             f"{parser.NAME} made {len(calls)} calls where the model made one; "
             "the quoted opener was read as a second"
+        )
+
+
+def _timed(call, *, loops: int = 20) -> float:
+    """Microseconds per call, averaged over `loops`.
+
+    Averaged inside and taken as a minimum outside: the inner loop lifts one
+    call above the clock's noise floor, the outer minimum drops the samples
+    the scheduler landed on.
+    """
+    start = time.perf_counter()
+    for _ in range(loops):
+        call()
+    return (time.perf_counter() - start) / loops * 1e6
+
+
+class TestNoFormatLosesItsLiteralPrefix:
+    """A format's patterns must be skippable over text that is not a call.
+
+    `re` scans for a pattern's fixed first byte and skips everything else; one
+    that opens with an *optional* group has no such byte and is tried at every
+    position. MiniMax matched its ns_token at the head of both `_INVOKE_RE`
+    and `_PARAM_RE`, so reading an 18 KB region cost 524 us against 3.8 for
+    the same work in DSML -- 138x, for a token `CALL_FILLERS` already walks
+    back, which is why the fix was to delete it rather than rewrite anything.
+
+    Against the other formats rather than a constant: the median is the
+    control arm, and it is what makes this readable on a machine whose
+    absolute numbers are nothing like this one's. The cost is that a
+    regression hitting every format at once would pass, so the second test
+    keeps the harness honest about what it can see.
+    """
+
+    #: Long enough that a per-position scan separates from a skipped one, short
+    #: enough to stay a unit test.
+    PROSE: ClassVar[str] = "The quick brown fox jumps over the lazy dog. " * 400
+    #: The spread across the six formats is 1.8x with no prefix lost, and the
+    #: defect was 138x. Far from both, being a shape check rather than a
+    #: number to tune.
+    BUDGET: ClassVar[float] = 20.0
+
+    @classmethod
+    def _cost(cls, call) -> float:
+        """Best of five: the mean measures the scheduler as much as the code."""
+        call()
+        return min(_timed(call) for _ in range(5))
+
+    def test_no_format_is_an_order_of_magnitude_off_the_others(self):
+        costs = {
+            p.NAME: self._cost(
+                functools.partial(p.parse_region, self.PROSE, TYPED_TOOLS, at_end=True)
+            )
+            for p in ALL_PARSERS
+        }
+        median = statistics.median(costs.values())
+        worst, cost = max(costs.items(), key=lambda kv: kv[1])
+        assert cost <= self.BUDGET * median, (
+            f"{worst} reads a non-call region {cost / median:.0f}x slower than "
+            f"the median format -- check whether one of its patterns now opens "
+            f"with an optional group.\n  "
+            + "\n  ".join(
+                f"{n}: {v:.1f} us"
+                for n, v in sorted(costs.items(), key=lambda kv: -kv[1])
+            )
+        )
+
+    def test_the_measurement_can_see_a_lost_prefix(self):
+        """The positive control. Without it "everything is within budget" is
+        also what a harness with no discrimination reports -- and this suite
+        has already shipped one class whose shapes no format accepted, so the
+        assertions held vacuously."""
+        ns = re.escape(MINIMAX_NS)
+        anchored = re.compile(r'<invoke\s+name="([^"]*)">')
+        adrift = re.compile(rf'(?:{ns})?<invoke\s+name="([^"]*)">')
+        fast = self._cost(lambda: anchored.findall(self.PROSE))
+        slow = self._cost(lambda: adrift.findall(self.PROSE))
+        assert slow > self.BUDGET * fast, (
+            f"the harness cannot tell a lost literal prefix from a kept one "
+            f"({slow:.1f} us against {fast:.1f} us); the test above proves "
+            f"nothing until it can"
         )

@@ -12,7 +12,6 @@ from .protocol import (
     CHAT_COMPLETION_CHUNK_OBJECT,
     STREAM_DONE_MESSAGE,
     TOOL_CHOICE_VALUES,
-    TOOL_NAME_RE,
     ChatCompletionRequest,
     ChatCompletionResponse,
     openai_stop_reason_with_calls,
@@ -26,6 +25,7 @@ from .sse import data_frame
 from .streaming_dispatch import StreamOutputCollector
 from .tool_parser import ToolCallStreamParser, parse_tool_calls
 from .tool_parser.registry import forbids_tool_calls
+from .tool_parser.tool_parser import usable_tool_name
 
 logger = logging.getLogger("atom")
 
@@ -112,13 +112,20 @@ def _validate_one_tool(tool: Any, index: int) -> None:
     if not isinstance(fn, dict):
         raise ValueError(f"tools[{index}].function must be an object")  # noqa: TRY004
     name = fn.get("name")
-    if not isinstance(name, str) or not TOOL_NAME_RE.match(name):
+    # The same predicate the parsers apply to a name the *model* writes. The
+    # second grammar that used to be here, `^[A-Za-z_][A-Za-z0-9_-]*$`, was
+    # the stricter: it rejected a leading digit that OpenAI's own
+    # `^[a-zA-Z0-9_-]{1,64}$` allows, every non-ASCII name, and MCP's
+    # `server.tool` -- a 400 before the model ever ran, while `/v1/messages`
+    # validated nothing and accepted all three.
+    if not isinstance(name, str) or not usable_tool_name(name):
         raise ValueError(
-            f"tools[{index}].function.name must match {TOOL_NAME_RE.pattern}"
+            f"tools[{index}].function.name must be a dispatchable name: "
+            "a word character followed by word characters, dots or dashes"
         )
 
 
-def _validate_tool_list(tools: Any) -> None:
+def validate_tool_list(tools: Any) -> None:
     if tools is None:
         return
     if not isinstance(tools, list):
@@ -138,7 +145,7 @@ def validate_chat_request(request: ChatCompletionRequest) -> None:
     Raises ``ValueError`` (surfaced as HTTP 400) on malformed input so the
     engine is never handed a request the chat template cannot render.
     """
-    _validate_tool_list(request.tools)
+    validate_tool_list(request.tools)
 
     tool_choice = request.tool_choice
     if tool_choice is not None:

@@ -17,7 +17,10 @@ from atom.entrypoints.openai.protocol import (
     openai_stop_reason_with_calls,
 )
 from atom.entrypoints.openai.reasoning import NO_REASONING
-from atom.entrypoints.openai.serving_anthropic import completes_a_tool_call
+from atom.entrypoints.openai.serving_anthropic import (
+    anthropic_to_openai_tools,
+    completes_a_tool_call,
+)
 from atom.entrypoints.openai.serving_chat import (
     _build_chat_choice,
     build_chat_response,
@@ -26,6 +29,7 @@ from atom.entrypoints.openai.serving_chat import (
     normalize_chat_tools,
     stream_chat_response,
     stream_chat_response_fanout,
+    validate_tool_list,
 )
 from atom.entrypoints.openai.streaming_dispatch import StreamOutputCollector
 from atom.entrypoints.openai.tool_parser import ToolCallStreamParser, parse_tool_calls
@@ -33,6 +37,7 @@ from atom.entrypoints.openai.tool_parser.kimi_k3_tool_parser import KimiK3Parser
 from atom.entrypoints.openai.tool_parser.kimi_tool_parser import KimiParser
 from atom.entrypoints.openai.tool_parser.qwen3_tool_parser import QwenXmlParser
 from atom.entrypoints.openai.tool_parser.registry import forbids_tool_calls
+from atom.entrypoints.openai.tool_parser.tool_parser import usable_tool_name
 
 # ============================================================================
 # normalize_chat_tools Tests
@@ -726,3 +731,68 @@ class TestTheReasonAResponseEnded:
 
     def test_and_a_genuinely_absent_one_is_still_null(self):
         assert self._choice(None)["finish_reason"] is None
+
+
+class TestBothEndpointsAskOneQuestionAboutAToolName:
+    """What a request may declare is what a parser can dispatch.
+
+    There were two grammars. `protocol.TOOL_NAME_RE`
+    (`^[A-Za-z_][A-Za-z0-9_-]*$`) guarded the chat entrance and was the
+    stricter: it rejected a leading digit that OpenAI's own
+    `^[a-zA-Z0-9_-]{1,64}$` allows, every non-ASCII name, and the
+    `server.tool` spelling MCP namespaces with -- so declaring an MCP tool was
+    a 400 before the model ever ran. `usable_tool_name` guarded the response
+    side and allowed all three. And `/v1/messages` asked neither: it converted
+    the tools and validated nothing, so the two endpoints disagreed about
+    which tools were legal at all.
+    """
+
+    #: Names a client may legitimately declare, and the shape of the mistake
+    #: each one used to be taken for.
+    LEGAL = ("get_weather", "server.tool", "7z_extract", "查天气", "a-b", "_x")
+    ILLEGAL = ("", "   ", "two words", ".hidden", "-lead", "a b.c")
+
+    @staticmethod
+    def _openai(name):
+        return [{"type": "function", "function": {"name": name, "parameters": {}}}]
+
+    @pytest.mark.parametrize("name", LEGAL)
+    def test_a_dispatchable_name_is_accepted_by_the_chat_entrance(self, name):
+        validate_tool_list(self._openai(name))
+
+    @pytest.mark.parametrize("name", ILLEGAL)
+    def test_an_undispatchable_name_is_refused_by_the_chat_entrance(self, name):
+        with pytest.raises(ValueError):
+            validate_tool_list(self._openai(name))
+
+    @pytest.mark.parametrize("name", LEGAL + ILLEGAL)
+    def test_the_entrance_and_the_parsers_agree(self, name):
+        """The property, of which the two tables above are the illustration.
+
+        Neither side may be the stricter: a name the entrance refuses is a
+        tool the client cannot declare, and a name the parsers refuse is a
+        call the model can never be seen to make.
+        """
+        try:
+            validate_tool_list(self._openai(name))
+            accepted = True
+        except ValueError:
+            accepted = False
+        assert accepted == usable_tool_name(name), (
+            f"the entrance and `usable_tool_name` disagree about {name!r}: "
+            f"entrance={accepted}, parsers={usable_tool_name(name)}"
+        )
+
+    @pytest.mark.parametrize("name", LEGAL + ILLEGAL)
+    def test_the_anthropic_entrance_asks_the_same_question(self, name):
+        """`/v1/messages` validates the conversion, so there is one rule and
+        not a second written in Anthropic's spelling."""
+        converted = anthropic_to_openai_tools([{"name": name, "input_schema": {}}])
+        try:
+            validate_tool_list(converted)
+            accepted = True
+        except ValueError:
+            accepted = False
+        assert accepted == usable_tool_name(
+            name
+        ), f"/v1/messages and /v1/chat/completions disagree about {name!r}"
