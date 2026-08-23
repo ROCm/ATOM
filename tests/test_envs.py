@@ -40,7 +40,7 @@ def _clean_atom_env(monkeypatch):
 
 def _get_envs():
     """Return the envs module; lazy __getattr__ re-evaluates on each access."""
-    import atom.utils.envs as envs
+    from atom.utils import envs
 
     return envs
 

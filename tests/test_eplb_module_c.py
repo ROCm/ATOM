@@ -2,6 +2,7 @@
 # Tests for atom/model_ops/eplb.py (Module-C rebalancing algorithms)
 
 import pytest
+from import_guard import skip_if_dependency_missing
 
 torch = pytest.importorskip("torch")
 
@@ -12,8 +13,8 @@ try:
         rebalance_experts,
         replicate_experts,
     )
-except Exception as _e:  # aiter/triton absent under bare non-GPU pytest
-    pytest.skip(f"requires full atom import env: {_e}", allow_module_level=True)
+except ImportError as _e:  # aiter/triton absent under bare non-GPU pytest
+    skip_if_dependency_missing(_e, "requires full atom import env")
 
 
 def test_balanced_packing_equal_cardinality():

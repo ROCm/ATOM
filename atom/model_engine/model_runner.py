@@ -43,7 +43,12 @@ from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
 from atom.model_engine.run_labels import build_run_label
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
-from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
+from atom.model_engine.sequence import (
+    Sequence,
+    SequenceStatus,
+    SequenceType,
+    new_block_table,
+)
 from atom.model_engine.state_runtime import StateRuntime
 from atom.model_loader.loader import load_model
 from atom.model_ops.attentions.sub_pool_spec import (
@@ -72,6 +77,7 @@ from atom.utils import (
     get_hf_text_config,
     init_exit_handler,
     resolve_obj_by_qualname,
+    worker_process_name,
 )
 from atom.utils.cuda_graph import BatchDescriptor
 from atom.utils.forward_context import (
@@ -84,6 +90,7 @@ from atom.utils.forward_context import (
     set_forward_context,
     set_kv_cache_data,
 )
+from atom.utils.gc_utils import freeze_gc_heap
 from atom.utils.selector import get_attn_backend
 from atom.utils.tbo import (
     UBatchSlice,
@@ -1146,7 +1153,7 @@ class ModelRunner:
         )
         seq.status = SequenceStatus.RUNNING
         seq.type = SequenceType.DECODE
-        seq.block_table = [0]
+        seq.block_table = new_block_table([0])
 
         spec_tokens = {seq.id: np.zeros(mtp_k, dtype=np.int32)} if mtp_k > 0 else None
         dummy_batch = ScheduledBatch(
@@ -1320,10 +1327,11 @@ class ModelRunner:
         )
 
         def _clone_slot(src: dict) -> dict:
-            # Only CpuGpuBuffers are per-forward host-pinned staging buffers that
-            # get overwritten each forward. Everything else (the eager `outputs`
-            # tensor, scalar `mtp_k`, ...) is either unused on the eager PP path
-            # or immutable, so share it by reference.
+            # CpuGpuBuffers are the per-forward staging buffers, and only their
+            # host half can be rewritten while an earlier microbatch's kernels
+            # are still reading. Everything else is immutable, unused on the
+            # eager PP path, or device-only, where the stream orders the writing
+            # kernel after those readers.
             return {
                 k: (v.clone() if isinstance(v, CpuGpuBuffer) else v)
                 for k, v in src.items()
@@ -1580,6 +1588,15 @@ class ModelRunner:
                 overhead / (1 << 30),
             )
         return int(overhead)
+
+    def freeze_gc_heap(self) -> int:
+        """RPC target: freeze this worker's startup heap. Pauses here reached
+        979 ms, the largest of any process.
+
+        The count is returned because `busy_loop` replies only `if out is not
+        None` -- an RPC target returning None hangs its `wait_out=True` caller.
+        """
+        return freeze_gc_heap(worker_process_name(self.config, self.rank))
 
     def get_num_blocks(self) -> dict[str, object]:
         torch.set_default_device(self.device)

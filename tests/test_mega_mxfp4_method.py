@@ -4,12 +4,13 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from import_guard import skip_if_dependency_missing
 
 try:
     # aiter/triton absent under bare non-GPU pytest
     import atom.model_ops.moe as moe_mod
-except Exception as exc:  # noqa: BLE001
-    pytest.skip(f"requires full atom import env: {exc}", allow_module_level=True)
+except ImportError as exc:
+    skip_if_dependency_missing(exc, "requires full atom import env")
 
 
 def test_mega_method_is_mxfp4_specialization():

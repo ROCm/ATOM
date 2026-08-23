@@ -208,8 +208,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # --- Profiling & Logging ---
     "ATOM_TORCH_PROFILER_DIR": lambda: os.getenv("ATOM_TORCH_PROFILER_DIR", None),
+    # Move the startup heap (model, compiled graph, tokenizer, KV block pool)
+    # into CPython's permanent generation once warmup is done, so collections
+    # stop scanning it.  On by default; set 0 to keep the old behaviour.
+    # See freeze_gc_heap in atom/utils/gc_utils.py.
+    "ATOM_GC_FREEZE": lambda: os.getenv("ATOM_GC_FREEZE", "1") == "1",
+    # Log every garbage collection: generation, duration, objects reclaimed.
+    "ATOM_GC_DEBUG": lambda: os.getenv("ATOM_GC_DEBUG", "0") == "1",
     # "t0,t1,t2" for gc.set_threshold(); empty keeps CPython's default.
-    # See _tune_gc in api_server.py.
+    # Read independently by the API server, each EngineCore and each
+    # ModelRunner worker -- thresholds are per-interpreter.  A fallback for
+    # ATOM_GC_FREEZE=0: freezing removes the cost of a pass, this only spaces
+    # the passes out.  See tune_gc in atom/utils/gc_utils.py.
     "ATOM_GC_THRESHOLD": lambda: os.getenv("ATOM_GC_THRESHOLD", "").strip(),
     "ATOM_PROFILER_MORE": lambda: os.getenv("ATOM_PROFILER_MORE", "0") == "1",
     # When profiling is active, append detailed attention aggregates (sqsq, sqsk, sk)
