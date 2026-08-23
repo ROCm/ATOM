@@ -13,7 +13,7 @@ try:
         rebalance_experts,
         replicate_experts,
     )
-except Exception as _e:  # aiter/triton absent under bare non-GPU pytest
+except ImportError as _e:  # aiter/triton absent under bare non-GPU pytest
     skip_if_dependency_missing(_e, "requires full atom import env")
 
 

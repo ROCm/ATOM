@@ -17,7 +17,7 @@ try:
     from aiter import dtypes
 
     import atom.model_ops.v4_kernels  # noqa: F401  (heavy import chain)
-except Exception as _e:  # noqa: BLE001
+except ImportError as _e:
     skip_if_dependency_missing(_e, "requires full atom import env")
 
 from atom.model_ops.attentions.v4_pool_geometry import (

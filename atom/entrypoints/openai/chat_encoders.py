@@ -66,8 +66,13 @@ def _load_encoder_from_dir(model_path: str) -> MessageEncoderAdapter | None:
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         raw = mod.encode_messages
-    except Exception as e:
-        logger.warning(f"Failed to load encoder from {enc_path}: {e}")
+    except Exception:
+        # Broad on purpose: this executes a file the operator supplied, so the
+        # failure can be anything that module raises, and a bad encoder must
+        # not stop the server. `exc_info` rather than `{e}` -- the message
+        # alone was never enough to debug someone else's encoder, and the
+        # traceback names the line inside it.
+        logger.warning(f"Failed to load encoder from {enc_path}", exc_info=True)
         return None
 
     logger.info(f"Loaded message encoder from {enc_path}")

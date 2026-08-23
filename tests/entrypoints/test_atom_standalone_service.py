@@ -15,7 +15,7 @@ try:
     from atom.entrypoints.atomesh.atom_standalone_service import (
         ChatCompletionStreamState,
     )
-except Exception as exc:  # noqa: BLE001 pragma: no cover
+except ImportError as exc:  # pragma: no cover
     skip_if_dependency_missing(exc, "atomesh service import unavailable")
     ChatCompletionStreamState = None  # type: ignore[assignment]
     _import_error = exc

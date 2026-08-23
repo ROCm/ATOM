@@ -206,6 +206,14 @@ class AtomEngineService:
                 else:
                     self._submit_request(request)
             except Exception as error:
+                # Broad on purpose: this is the worker thread's outer loop, and
+                # anything that escapes here kills it and hangs every request
+                # after this one. The client learns what happened either way;
+                # the server did not, so a failed request left no trace on the
+                # side that could act on it.
+                logger.exception(
+                    "standalone engine request %s failed", request.request_id
+                )
                 if isinstance(request, EngineStreamRequest):
                     request.stream_queue.put(
                         {

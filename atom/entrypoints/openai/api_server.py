@@ -25,13 +25,15 @@ import uuid
 from asyncio import AbstractEventLoop
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from PIL import Image
 from transformers import AutoProcessor, AutoTokenizer
+
+if TYPE_CHECKING:
+    from PIL import Image
 
 from atom import SamplingParams
 from atom.model_engine.arg_utils import EngineArgs
@@ -546,7 +548,17 @@ def _has_multimodal_content(messages: list[Any]) -> bool:
     return False
 
 
-def _load_image_from_url(url: str) -> Image.Image:
+def _load_image_from_url(url: str) -> "Image.Image":
+    # Imported here, not at module scope, and this is the one place in the
+    # file that needs it at runtime. Pillow is not a declared dependency, so a
+    # module-scope `from PIL import Image` made the whole server module
+    # unimportable wherever it is absent -- which is the non-GPU CI runner,
+    # where the only test that reached this module had to wrap its import in a
+    # try/except and degrade to `api_server = None`. Text-only serving does
+    # not need Pillow, so it should not be a condition of importing the
+    # server; a request that actually carries an image raises here, naming it.
+    from PIL import Image
+
     if url.startswith("data:"):
         try:
             _, encoded = url.split(",", 1)
@@ -574,7 +586,7 @@ def _get_multimodal_processor():
 
 def _collect_multimodal_parts(
     messages: list[Any],
-) -> tuple[list[dict[str, Any]], list[Image.Image]]:
+) -> tuple[list[dict[str, Any]], list["Image.Image"]]:
     """Normalize chat messages into processor form, loading every image.
 
     Content parts keep the order the client sent them in; the images are
@@ -1878,8 +1890,6 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
     and returns Anthropic-formatted responses. Enables Claude Code and other
     Anthropic-compatible tools to use ATOM as a backend.
     """
-    global engine, tokenizer, model_name
-
     # One validator over the shape both endpoints share: this path already
     # converts, so validating the conversion leaves a single rule rather than
     # a second one in Anthropic's spelling. It checked nothing before, so a

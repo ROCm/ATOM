@@ -89,7 +89,7 @@ try:
     import importlib
 
     api_server = importlib.import_module("atom.entrypoints.openai.api_server")
-except Exception as exc:  # pragma: no cover - environment-dependent skip
+except ImportError as exc:  # pragma: no cover - environment-dependent skip
     # Re-raises unless a third-party dependency is what is missing. It used to
     # skip on anything, so a syntax error in `api_server.py` silenced this
     # whole module and the suite still reported a clean run.

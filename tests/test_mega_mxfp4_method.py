@@ -9,7 +9,7 @@ from import_guard import skip_if_dependency_missing
 try:
     # aiter/triton absent under bare non-GPU pytest
     import atom.model_ops.moe as moe_mod
-except Exception as exc:  # noqa: BLE001
+except ImportError as exc:
     skip_if_dependency_missing(exc, "requires full atom import env")
 
 
