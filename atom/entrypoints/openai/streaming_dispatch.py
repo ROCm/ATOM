@@ -9,10 +9,13 @@ single callback per event loop. :class:`StreamOutputCollector` is the loop-side
 landing point each stream's SSE generator reads from.
 """
 
+import array
 import threading
 from asyncio import AbstractEventLoop, Event
 from dataclasses import dataclass, field
 from typing import Any, NamedTuple
+
+from atom.model_engine.sequence import new_token_ids
 
 # Fields a later chunk overrides on the one it merges into, when it has a value
 # of its own. The SSE consumers keep the newest non-empty value they see, so
@@ -25,7 +28,10 @@ class IncrementalStreamDetokenizer:
     """Decode token deltas without emitting incomplete UTF-8 characters."""
 
     tokenizer: Any
-    tokens: list[int] = field(default_factory=list)
+    # Grows for the whole life of a stream, one entry per token, and only ever
+    # sliced into `tokenizer.decode` -- which takes an array. Nothing here is
+    # serialized, so this one has no boundary to convert back at.
+    tokens: array.array = field(default_factory=new_token_ids)
     prefix_offset: int = 0
     read_offset: int = 0
 

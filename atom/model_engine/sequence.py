@@ -190,10 +190,16 @@ class Sequence:
         # would never fire for the prefill blocks; this flag does.
         self.prefix_hashes_published = False
         self.return_logprobs = bool(getattr(sampling_params, "logprobs", False))
-        self.logprobs: list[float] = []
+        # One entry per completion token, so the same reason `token_ids` is an
+        # array applies: a list would box a PyFloat per token and hand the
+        # collector a slot to walk for each one. `json.dumps` is the only
+        # consumer that needs a list, and it converts at its own boundary.
+        self.logprobs: array.array = array.array("d")
         # stream callback
         self.stream_callback = stream_callback
-        self.output_tokens = []  # cache for newly generate tokens
+        # The completion half of `token_ids`, kept in step with it by every
+        # writer, so it is the same array type for the same reasons.
+        self.output_tokens = new_token_ids()
         # Placeholders from previous postprocess; overwritten in place.
         self.num_placeholder_tokens: int = 0
 

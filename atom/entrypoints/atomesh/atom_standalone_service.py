@@ -46,6 +46,7 @@ from atom.entrypoints.openai.serving_completion import (
 )
 from atom.entrypoints.openai.sse import data_frame
 from atom.entrypoints.openai.tool_parser import ToolCallStreamParser
+from atom.model_engine.sequence import new_token_ids
 
 logger = logging.getLogger("atom")
 
@@ -331,7 +332,10 @@ class SingleRequestState:
         self.started_at = time.time()
         self.first_token_at: float | None = None
         self.last_token_at: float | None = None
-        self.token_ids: list[int] = []
+        # An array for the same reason the engine's `token_ids` is one. It
+        # stays one: this dict goes to `build_*_response`, which reads
+        # `text` and the counters and never `token_ids`.
+        self.token_ids = new_token_ids()
         self.finish_reason: str | None = None
         self.num_tokens_input = 0
         self.kv_transfer_output_meta_info: Any = None
@@ -400,7 +404,7 @@ class FanoutRequestState:
         self.future = future
         self.n = n
         self.started_at = time.time()
-        self.per_tokens: list[list[int]] = [[] for _ in range(n)]
+        self.per_tokens = [new_token_ids() for _ in range(n)]
         self.per_first_token_at: list[float | None] = [None] * n
         self.per_last_token_at: list[float | None] = [None] * n
         self.per_finish_reason: list[str | None] = [None] * n

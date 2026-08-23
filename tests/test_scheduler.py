@@ -562,7 +562,7 @@ class TestSchedule:
         )
 
         assert seq.num_cached_tokens == 10
-        assert seq.output_tokens == [999, sched.eos_token_id]
+        assert list(seq.output_tokens) == [999, sched.eos_token_id]
 
 
 # ── _waiting_new_token_count (PrefillDelayer queue signal) ─────────────────

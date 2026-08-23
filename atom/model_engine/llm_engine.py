@@ -754,7 +754,8 @@ class InputOutputProcessor:
                 # `list`, not the `array("i")` slice: this is what `generate()`
                 # hands a caller, and the storage type is ours to change.
                 "token_ids": list(req.completion_token_ids),
-                "logprobs": req.logprobs if req.return_logprobs else None,
+                # `list` for the same reason as `token_ids` above.
+                "logprobs": list(req.logprobs) if req.return_logprobs else None,
                 "latency": req.leave_time - req.arrive_time,
                 "finish_reason": req.leave_reason,
                 "num_tokens_input": req.num_prompt_tokens,

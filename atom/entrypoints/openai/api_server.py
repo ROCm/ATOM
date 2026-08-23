@@ -38,6 +38,7 @@ from atom.model_engine.arg_utils import EngineArgs
 from atom.model_engine.llm_engine import _load_tokenizer
 from atom.model_engine.multimodal import build_multimodal_inputs
 from atom.model_engine.request import RequestOutput
+from atom.model_engine.sequence import new_token_ids
 from atom.utils import tune_gc
 from atom.utils.arg_parser import FlexibleArgumentParser
 
@@ -475,7 +476,13 @@ async def generate_async(
     started_at = time.time()
     first_token_at: float | None = None
     last_token_at: float | None = None
-    all_token_ids: list[int] = []
+    # An array, not a list: this grows for the whole life of the request,
+    # and one boxed PyInt per token is what the collector then walks on
+    # every pass. It stays an array all the way out -- the dict below is
+    # an internal hand-off to `build_*_response`, which reads `text` and
+    # the counters and never `token_ids`, so nothing serializes it. A
+    # consumer that starts reading that key has to convert.
+    all_token_ids = new_token_ids()
     finish_reason: str | None = None
     seq = None
     kv_transfer_output_meta_info = None
@@ -594,7 +601,7 @@ async def generate_async_multimodal(
     started_at = time.time()
     first_token_at: float | None = None
     last_token_at: float | None = None
-    all_token_ids: list[int] = []
+    all_token_ids = new_token_ids()
     finish_reason: str | None = None
     seq = None
 
@@ -700,7 +707,7 @@ async def generate_async_fanout(
     loop = asyncio.get_running_loop()
 
     started_at = time.time()
-    per_tokens: list[list[int]] = [[] for _ in range(n)]
+    per_tokens = [new_token_ids() for _ in range(n)]
     per_first_token_at: list[float | None] = [None] * n
     per_last_token_at: list[float | None] = [None] * n
     per_finish_reason: list[str | None] = [None] * n

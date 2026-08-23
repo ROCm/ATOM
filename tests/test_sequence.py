@@ -79,7 +79,7 @@ class TestSequenceAppendToken:
         seq = seq_factory([1, 2])
         seq.append_token(3)
         seq.append_token(4)
-        assert seq.output_tokens == [3, 4]
+        assert list(seq.output_tokens) == [3, 4]
 
     def test_append_crosses_block_boundary(self, seq_factory):
         seq = seq_factory([1, 2, 3, 4], block_size=4)
