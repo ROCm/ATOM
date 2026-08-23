@@ -29,6 +29,7 @@ from entrypoints.wire_corpus import (
     TYPED_TOOLS,
     check_corpus,
     complete,
+    quoting_the_arguments,
     quoting_the_opener,
     truncated,
     truncated_after_complete,
@@ -352,9 +353,8 @@ class TestOnlyAnIdentifierIsAToolName:
 
 
 class TestATruncatedCallIsDeliveredRatherThanDeleted:
-    """A call cut off by `max_tokens` parses to nothing, and a region that
-    parses to nothing is released unchanged -- for this format as for every
-    other, which is the change.
+    """A call cut off by `max_tokens` reaches the client as a call, and what
+    is not a call reaches it as text. Either way the bytes are not deleted.
 
     K3 used to cut the answer at the tools marker instead, on a second opener
     regex that accepted shapes the call regex rejects, and the two ways of
@@ -362,10 +362,12 @@ class TestATruncatedCallIsDeliveredRatherThanDeleted:
     characters, and a truncated call kept its half-written payload with the
     dangling `<|close|>argument` still in it. Both are now the same rule.
 
-    Kimi already behaved this way (a section with no complete entry comes back
-    whole), so this is the two token formats agreeing rather than a new
-    policy. The four XML-ish formats do not reach it: they salvage a truncated
-    call into a real one, so there is no half-written markup to show.
+    This class used to assert the *other* outcome -- no call, region released
+    verbatim -- and was right about the code at the time, because it passes
+    `tools=None` and every format then refused every truncated call. That was
+    the defect: with the same request declaring its tools, K3 salvaged this
+    exact input. The salvage no longer turns on whether the client listed
+    them, so what is pinned here is the salvage.
     """
 
     TRUNCATED = (
@@ -376,8 +378,9 @@ class TestATruncatedCallIsDeliveredRatherThanDeleted:
 
     def test_the_partial_payload_is_delivered_not_dropped(self):
         content, calls = parse_tool_calls(self.TRUNCATED, None, KimiK3Parser)
-        assert calls == []
-        assert content == self.TRUNCATED, "bytes were deleted with no event"
+        assert [c.function["name"] for c in calls] == ["get_weather"]
+        assert calls[0].function["arguments"] == '{"city": "Paris"}'
+        assert content == "I will look it up.", "the answer around it was eaten"
 
     def test_an_answer_that_only_names_the_token_still_keeps_its_tail(self):
         """The case the gate was added for, which must keep working."""
@@ -741,13 +744,18 @@ class TestKimiK3KeepsAQuotedOpener:
         assert delivered == parse_tool_calls(self.QUOTED, parser_cls=KimiK3Parser)[0]
 
     def test_a_real_truncated_call_is_delivered_whole(self):
-        """The branch this shares with the quotation: no call parsed, so the
-        bytes are released rather than cut away. See
-        `TestATruncatedCallIsDeliveredRatherThanDeleted` for why that is now
-        the same answer for both shapes."""
+        """The shape the quotation has to be told apart from, same request.
+
+        `QUOTED` and this differ only in what follows the opener -- English in
+        one, this format's own next token in the other -- and that is the only
+        thing deciding between them here, because neither passes `tools`. It
+        used to be decided by the empty tool list instead, which refused both
+        and released `TRUNCATED`'s channel tokens as the answer.
+        """
         content, calls = parse_tool_calls(self.TRUNCATED, None, KimiK3Parser)
-        assert calls == []
-        assert content == self.TRUNCATED
+        assert [c.function["name"] for c in calls] == ["get_weather"]
+        assert calls[0].function["arguments"] == '{"city": "Par"}'
+        assert content == "", f"markup left in the answer: {content!r}"
 
     def test_a_region_that_produced_nothing_leaves_no_announcement_behind(self):
         """An announcement is per region. Carried past the region it was made
@@ -1508,14 +1516,71 @@ class TestWhatEveryFormatDoesWithACallCutOffMidWay:
         assert len(seen) == 1, f"{name} {order}: chunking changed the calls: {seen}"
 
     @pytest.mark.parametrize("name", sorted(REAL_CALLS))
-    def test_but_prose_that_quotes_the_opener_is_still_not_a_call(self, name):
+    @pytest.mark.parametrize("declares_tools", [True, False])
+    def test_but_prose_that_quotes_the_opener_is_still_not_a_call(
+        self, name, declares_tools
+    ):
         """The other half of the pair.
 
         An unclosed alternative without a `_is_truncated_call` gate turns
         every sentence *about* the wire format into a tool call. Kimi-K3 was
         given the alternation alone and did exactly that.
+
+        Both arms, because the gate has two halves and only one comes from the
+        request. `declared_tools_allow` stops refusing when the request lists
+        no tools, so with `tools=None` the follower test is the whole of what
+        separates a cut-off call from a sentence about one -- if that ever
+        stops carrying it, this is where it shows.
         """
         _, calls = parse_tool_calls(
-            quoting_the_opener(name), self.TOOLS, PARSERS_BY_NAME[name]
+            quoting_the_opener(name),
+            self.TOOLS if declares_tools else None,
+            PARSERS_BY_NAME[name],
         )
         assert calls == [], f"{name} read a sentence about calls as a call"
+
+    @pytest.mark.parametrize("name", sorted(REAL_CALLS))
+    @pytest.mark.parametrize("declares_tools", [True, False])
+    def test_and_neither_is_prose_that_quotes_the_arguments(self, name, declares_tools):
+        """The half no shape built from the front of a call can reach.
+
+        `quoting_the_opener` keeps everything *before* the tool name, so it
+        always carries the call opener and always lands in the branch that
+        reads one. A format that infers the name from the parameters instead
+        has a second branch, and DSML's had no gate at all: 152 characters of
+        an answer explaining the syntax collapse to 18 and a call is
+        dispatched. Undeclared tools make it worse rather than safer -- the
+        name cannot be inferred, so it is sent as `"unknown"`.
+        """
+        text = quoting_the_arguments(name)
+        if text is None:
+            pytest.skip(f"{name}: no self-contained region marker to quote")
+        tools = TYPED_TOOLS if declares_tools else None
+        content, calls = parse_tool_calls(text, tools, PARSERS_BY_NAME[name])
+        assert calls == [], (
+            f"{name} read a sentence about argument syntax as a call: "
+            f"{[(c.function['name'], c.function['arguments']) for c in calls]}"
+        )
+        assert content == text, f"{name} deleted the answer: {content!r}"
+
+    @pytest.mark.parametrize("name", sorted(REAL_CALLS))
+    def test_and_the_declared_tools_are_not_the_only_gate(self, name):
+        """A request that lists no tools still gets its truncated call.
+
+        `tools` sharpens the answer -- it is how a format tells a call cut off
+        by `max_tokens` from a sentence quoting an opener -- but it cannot be
+        the whole of it, because a *complete* call is read without it on all
+        six. Cut the same generation one byte earlier and it became raw
+        special tokens in `content`, decided by whether the client had
+        listed its tools rather than by anything the model wrote.
+        """
+        parser = PARSERS_BY_NAME[name]
+        _, whole = parse_tool_calls(complete(name), None, parser)
+        if not whole:
+            pytest.skip(f"{name} does not read a complete call without tools either")
+        _, cut = parse_tool_calls(truncated(name), None, parser)
+        assert cut, (
+            f"{name} reads a complete call with no tools declared and drops "
+            "the truncated one, so the same generation cut a byte earlier "
+            "ships raw markup as the answer"
+        )

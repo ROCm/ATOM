@@ -26,6 +26,7 @@ from .tool_parser import (
     ToolCall,
     ToolCallParser,
     continues_a_call,
+    declared_tools_allow,
     unique_tool_call_id,
 )
 
@@ -142,7 +143,7 @@ class GlmParser(ToolCallParser):
             # second; a call cut off inside its own `<arg_key>` passes it, and
             # used to be rejected along with the prose.
             if not closed and not (
-                name in param_types
+                declared_tools_allow(name, param_types)
                 and (
                     arg_key_arrived
                     or (not rest and at_end)

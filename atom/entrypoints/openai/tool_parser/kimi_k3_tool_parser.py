@@ -29,6 +29,7 @@ from .tool_parser import (
     ToolCall,
     ToolCallParser,
     continues_a_call,
+    declared_tools_allow,
     unique_tool_call_id,
 )
 
@@ -147,7 +148,7 @@ def _is_truncated_call(
     The gate travels with the unclosed alternative or a sentence that merely
     *quotes* the opener parses as a call.
     """
-    if name not in param_types:
+    if not declared_tools_allow(name, param_types):
         return False
     rest = body.lstrip()
     return (not rest and at_end) or continues_a_call(

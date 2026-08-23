@@ -942,6 +942,41 @@ class TestARealCallSurvivesTheStream:
             "get_weather"
         ), f"the sentence introducing the second call arrived first: {order}"
 
+    @pytest.mark.parametrize("parser", ALL_PARSERS, ids=lambda p: p.NAME)
+    def test_and_adjacent_calls_do_not_carry_a_later_sentence_in_front_of_them(
+        self, parser
+    ):
+        """The same order, when two of the calls are only a newline apart.
+
+        Every one of these chat templates puts a separator between parallel
+        calls, so `_markup_spans` merges that pair into one span -- and the
+        walk pairs one call per span, giving the last span whatever is left.
+        The merged span emits one call and the last emits two, so the second
+        call arrives behind a sentence the model wrote after it.
+
+        The test above cannot see it: with two calls the merge leaves nothing
+        over, and `order.index` reports the first occurrence, which does not
+        move when a later call does. This is the failure `_wrapper_edges` had
+        -- an extra span competing for a call -- with real calls doing the
+        merging instead of a spliced-in wrapper.
+        """
+        a = REAL_CALLS[parser.NAME]
+        b = naming_another_tool(parser.NAME)
+        middle = "Now let me also check Oslo."
+        engine = ToolCallStreamParser(tools=DECLARED_TOOLS, parser_cls=parser)
+        text = f"{a}\n{b}\n{middle}\n{a}"
+        events = engine.process(text) + engine.flush()
+        order: list[str] = []
+        for kind, data in events:
+            if kind == "tool_call_start":
+                order.append("call")
+            elif kind == "content" and data.strip() and order[-1:] != ["prose"]:
+                order.append("prose")
+        assert order == ["call", "call", "prose", "call"], (
+            f"{parser.NAME} moved a call across the sentence written after "
+            f"it: {order}"
+        )
+
 
 # Markers a format declares so the read-ahead will not split them, but which
 # do not hand the stream over: channel framing that wraps every answer. Only

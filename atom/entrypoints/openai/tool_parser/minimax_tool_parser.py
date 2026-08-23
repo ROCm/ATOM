@@ -27,6 +27,7 @@ from .tool_parser import (
     ToolCall,
     ToolCallParser,
     continues_a_call,
+    declared_tools_allow,
     unique_tool_call_id,
 )
 
@@ -91,9 +92,11 @@ def _is_truncated_call(
     the start of a call body -- but a tool declared without one still has to
     be callable, so an empty schema falls back to "any tag".
     """
-    types = param_types.get(name)
-    if types is None:
+    if not declared_tools_allow(name, param_types):
         return False
+    # An undeclared schema falls back to "any tag", the same way an
+    # empty one does below.
+    types = param_types.get(name) or {}
     rest = body.lstrip()
     if not rest:
         return at_end

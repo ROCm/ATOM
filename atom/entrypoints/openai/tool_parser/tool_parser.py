@@ -54,6 +54,26 @@ def continues_a_call(rest: str, tokens: tuple[str, ...], *, arrived: bool) -> bo
     return any(tok.startswith(rest[: len(tok)]) for tok in tokens)
 
 
+def declared_tools_allow(name: str, param_types: dict) -> bool:
+    """Can the request's declared tools rule this name out?
+
+    Only when it declared any. Every format's truncation gate asks whether the
+    name is one the request listed, because prose quoting an opener usually
+    invents one -- but a request with no ``tools`` field declares nothing, and
+    six formats read that as "no name is real". A call cut off by
+    `max_tokens` then went out as raw special tokens in ``content`` while the
+    *same* generation, one byte longer, was read as a call: the answer turned
+    on whether the client had listed its tools rather than on what the model
+    wrote. Agent harnesses that describe their tools in the system prompt hit
+    it on every truncation.
+
+    So: a declared list refutes a name it does not contain, and an absent list
+    refutes nothing. Whatever follower test the format applies still runs --
+    that is the evidence which does not come from the request.
+    """
+    return not param_types or name in param_types
+
+
 def unique_tool_call_id() -> str:
     # OpenAI tool_call ids must be unique across the whole conversation, not just
     # within one response. A per-response index (call_0, call_1, ...) collides

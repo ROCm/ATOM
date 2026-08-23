@@ -28,6 +28,7 @@ from .tool_parser import (
     ToolCall,
     ToolCallParser,
     continues_a_call,
+    declared_tools_allow,
 )
 
 KIMI_SECTION_BEGIN = "<|tool_calls_section_begin|>"
@@ -70,7 +71,7 @@ def _is_truncated_call(
     The follower is `{`: this format's arguments are JSON on the wire, so a
     real call continues with an object or, at end of region, with nothing.
     """
-    if name not in param_types:
+    if not declared_tools_allow(name, param_types):
         return False
     rest = args.lstrip()
     return (not rest and at_end) or continues_a_call(rest, ("{",), arrived=not at_end)

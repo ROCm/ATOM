@@ -26,6 +26,7 @@ from .tool_parser import (
     ToolCall,
     ToolCallParser,
     continues_a_call,
+    declared_tools_allow,
     unique_tool_call_id,
 )
 
@@ -95,7 +96,7 @@ def _is_truncated_call(fn_text: str, param_types: dict, *, at_end: bool) -> bool
     if split is None:
         return False
     name, rest = split
-    return name in param_types and (
+    return declared_tools_allow(name, param_types) and (
         (not rest and at_end)
         or continues_a_call(rest, _CALL_CONTINUES, arrived=not at_end)
     )

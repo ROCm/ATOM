@@ -143,6 +143,41 @@ def truncated_naming_another_tool(name: str) -> str:
     return cut_at_payload(naming_another_tool(name))
 
 
+def quoting_the_arguments(name: str) -> str | None:
+    """A sentence that shows this format's *argument* syntax and calls nothing.
+
+    The mirror of :func:`quoting_the_opener`, which keeps everything before
+    the tool name and so always carries the call opener with it. A format that
+    infers the name from the parameters instead has a second branch, and no
+    shape built from the front of a call can reach it -- DSML's ran for two
+    rounds unreachable from here while deleting the answers it fired on.
+
+    ``None`` where the format declares no self-contained region marker. A
+    marker ending in ``=`` or ``"`` is mid-attribute -- it *is* a call opener
+    waiting for a name -- so a string built from one would be a real call, and
+    a parser reading it as such would be right. Skipping is the honest answer;
+    inventing a shape that a correct parser must fail is not.
+    """
+    parser = _registry()[name]
+    marker = next(
+        (
+            m
+            for m in parser.START_MARKERS
+            if parser.opens_region(m) and not m.endswith(('"', "="))
+        ),
+        None,
+    )
+    if marker is None:
+        return None
+    call = REAL_CALLS[name]
+    after_the_name = call[call.index(TOOL) + len(TOOL) :]
+    if PARAM not in after_the_name:
+        # Arguments come before the name in this format, so the tail carries
+        # no parameter markup and there is nothing here to misread.
+        return None
+    return f"You open one with {marker} and then write {after_the_name}"
+
+
 def quoting_the_opener(name: str) -> str:
     """A sentence that mentions this format's opener and calls nothing.
 

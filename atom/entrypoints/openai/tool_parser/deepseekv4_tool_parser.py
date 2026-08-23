@@ -27,6 +27,7 @@ from .tool_parser import (
     ToolCall,
     ToolCallParser,
     continues_a_call,
+    declared_tools_allow,
     unique_tool_call_id,
 )
 
@@ -171,7 +172,7 @@ def _is_truncated_call(
     and the same sentence -- "you emit `<invoke name="get_weather">` and
     inside it a `<parameter>` line" -- was still being dispatched as a call.
     """
-    if name not in param_types:
+    if not declared_tools_allow(name, param_types):
         return False
     rest = body.lstrip()
     return (not rest and at_end) or continues_a_call(
@@ -292,11 +293,18 @@ class DsmlParser(ToolCallParser):
             # `get_time` for a cut-off `<invoke name="get_weather">` because
             # it happened to share more parameters, so the parse named a
             # different tool than the announcement had.
-            raw = {
-                pm.group(1): (pm.group(3), pm.group(2))
-                for pm in _PARAM_RE.finditer(region)
-            }
-            if raw:
+            #
+            # Only when the parameters *are* the region. Every other branch
+            # gates on an opener; this one has none to gate on, since the name
+            # is inferred from the signature rather than read, so where the
+            # markup starts is the whole of the evidence. Prose in front of it
+            # means the model was writing about the syntax -- and no shape
+            # built from the front of a call can reach here to say so, which
+            # is why it went two rounds unseen while deleting 152 characters
+            # of such an answer down to 18 and dispatching `unknown`.
+            matches = list(_PARAM_RE.finditer(region))
+            if matches and cls.markup_begin(region, matches[0].start()) == 0:
+                raw = {pm.group(1): (pm.group(3), pm.group(2)) for pm in matches}
                 name = _infer_name(set(raw), param_types) or "unknown"
                 # Nothing to anchor to, so the parameters run from wherever
                 # the region began to the end of what arrived.

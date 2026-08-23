@@ -199,14 +199,15 @@ def _markup_spans(
     The engine walks these in order and treats the gaps as answer, so they
     have to be ascending and non-overlapping whatever a format reports.
 
-    Two spans separated by nothing but whitespace are joined. That whitespace
-    is the template's, not the model's: `end_of_markup` moves only on a closer
-    and `begin_of_markup` only on an opener, which is right at the edge of a
-    region -- the newline before the model resumes prose belongs to the prose
-    -- and wrong between two calls, where every one of these chat templates
-    renders a separator. Left in the gap it became a `content: "\n"` delta
-    sitting between two `tool_calls` deltas, and on `/v1/messages` a whole
-    text block containing one newline.
+    Only genuinely overlapping spans are joined. Two spans separated by
+    whitespace used to be joined here as well, because that whitespace is the
+    template's separator and became a `content: "\n"` delta between two
+    `tool_calls` deltas -- but joining them broke the pairing downstream,
+    which is one call per span with the last span taking the remainder. Two
+    adjacent calls merged into one span, so that span took a single call and
+    the *last* one took two, putting a call behind a sentence the model wrote
+    after it. The separator is dropped where it is read instead, in
+    `_close_region`, which needs no span to disappear to do it.
 
     Every span kept here is non-empty, so the engine always consumes at least
     one byte and cannot hand a region back, find the same marker and parse it
@@ -219,7 +220,7 @@ def _markup_spans(
         start, stop = max(0, min(start, len(body))), max(0, min(stop, len(body)))
         if stop <= start:
             continue
-        if merged and not body[merged[-1][1] : start].strip():
+        if merged and start <= merged[-1][1]:
             merged[-1] = (merged[-1][0], max(merged[-1][1], stop))
         else:
             merged.append((start, stop))
@@ -479,8 +480,16 @@ class ToolCallStreamParser:
             pending = list(parsed.calls)
             at = 0
             for i, (start, stop) in enumerate(spans):
-                if start > at:
-                    events.append(("content", body[at:start]))
+                gap = body[at:start]
+                # Whitespace *between* two calls is the template's separator,
+                # not the answer: every one of these chat templates renders
+                # one, and `end_of_markup` stops at it because it moves only
+                # on a closer. Before the first call it is the model's, since
+                # that edge is where prose ended. Dropped here rather than by
+                # joining the two spans, which cost the one-call-per-span
+                # pairing and reordered the calls.
+                if gap and (i == 0 or gap.strip()):
+                    events.append(("content", gap))
                 at = stop
                 # In the order the model wrote them, so a client sees the
                 # sentence between two calls between them and not hoisted in
