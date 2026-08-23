@@ -177,8 +177,6 @@ class Sequence:
         self.stop_strings = sampling_params.stop_strings
         # Same type as `token_ids`, because the stop check compares a slice of
         # that against these and an `array("i")` never equals a list.
-        # Same type as `token_ids`, because the stop check compares a slice of
-        # that against these and an `array("i")` never equals a list.
         self.stop_token_sequences = [
             new_token_ids(s) for s in (stop_token_sequences or [])
         ]

@@ -230,6 +230,17 @@ def test_pack_rows_clears_the_rows_it_fills_and_leaves_the_rest():
     assert (dst[len(rows) :] == POISON).all(), "cleared rows it was not given"
 
 
+def test_pack_rows_refuses_more_rows_than_the_destination_holds():
+    """The other edge a flat write does not have. Unchecked, this surfaces as
+    a memoryview structure error from whichever row ran off the end."""
+    dst = np.full((3, MAX_COLS), POISON, dtype=np.int32)
+
+    with pytest.raises(ValueError, match="rows exceed"):
+        pack_rows(dst, _rows(4))
+
+    pack_rows(dst, _rows(3))  # control: exactly full is fine
+
+
 def test_pack_rows_refuses_a_destination_whose_bits_it_would_reinterpret():
     """`.cast("i")` reinterprets rather than converts, so a destination of any
     other dtype would take the block ids as raw bits."""

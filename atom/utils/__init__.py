@@ -633,20 +633,22 @@ def pack_rows(dst: np.ndarray, rows: Sequence) -> None:
         # `.cast("i")` would reinterpret the bits of any other dtype rather
         # than convert them, so this must be checked and not assumed.
         raise TypeError(f"pack_rows needs an int32 destination, got {dst.dtype}")
-    n_rows = len(rows)
-    # One memset over the rows in play, not one per row.
-    dst[:n_rows] = 0
+    # Both dimensions are checked here because a flat write has no edge in
+    # either: an over-wide row would land in the next row, and an over-long
+    # batch would run off the end with only a memoryview structure error to
+    # say so. The numpy form this replaces raised on both.
+    n_rows, (max_rows, cols) = len(rows), dst.shape
+    if n_rows > max_rows:
+        raise ValueError(f"{n_rows} rows exceed the {max_rows}-row destination")
+    dst[:n_rows] = 0  # one memset over the rows in play, not one per row
     flat = memoryview(dst).cast("B").cast("i")
-    cols = dst.shape[1]  # stride comes from what is written
     base = 0
     for row in rows:
         n = len(row)
-        # A flat write has no row edge: where the numpy form raised, this one
-        # would land the overflow in the next row.
         if n > cols:
             raise ValueError(f"row of {n} exceeds the {cols}-column destination")
         flat[base : base + n] = row
-        base += cols
+        base += cols  # the destination's stride, not the row's length
 
 
 class CpuGpuBuffer:
