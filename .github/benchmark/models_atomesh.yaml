@@ -46,7 +46,8 @@ backends:
 models:
   DeepSeek-V4-Pro:
     backend: atom
-    model_path: "/it-share/models/DeepSeek-V4-Pro/"
+    #model_path: "/it-share/models/DeepSeek-V4-Pro/" # crusoe旧版本
+    model_path: "/it-shared/models/DeepSeek-V4-Pro/" # crusoe v2版本
     precision: FP4
     env:
       common:
