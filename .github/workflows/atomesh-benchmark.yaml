@@ -439,7 +439,7 @@ jobs:
           scancel_cmd=(scancel)
           if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-crusoe-mi355" || "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi355-crusoe" ]]; then
             # controller="http://crs-m2m-cpu-spur-005.crusoe.amd.com:6817" #crusoe旧版本
-            controller="http://crs-m2m-cpu-spur-v2-009.crusoe.amd.com:6817" #crusoe新版本
+            controller="http://crs-m2m-cpu-spur-v2-001.crusoe.amd.com:6817" #crusoe v2 controller (v2-009 is node agent only)
             squeue_cmd+=(--controller "${controller}")
             scancel_cmd+=(--controller "${controller}")
           fi
@@ -549,7 +549,7 @@ jobs:
           SPUR_CONTROLLER_ADDR="${SPUR_CONTROLLER_ADDR:-}"
           if [[ -z "${SPUR_CONTROLLER_ADDR}" && ( "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-crusoe-mi355" || "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi355-crusoe" ) ]]; then
             # SPUR_CONTROLLER_ADDR="http://crs-m2m-cpu-spur-005.crusoe.amd.com:6817" #crusoe旧版本
-            SPUR_CONTROLLER_ADDR="http://crs-m2m-cpu-spur-v2-009.crusoe.amd.com:6817" #crusoe新版本
+            SPUR_CONTROLLER_ADDR="http://crs-m2m-cpu-spur-v2-001.crusoe.amd.com:6817" #crusoe v2 controller (v2-009 is node agent only)
           elif [[ -z "${SPUR_CONTROLLER_ADDR}" && "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
             SPUR_CONTROLLER_ADDR="http://134.199.196.72:6817"
           fi

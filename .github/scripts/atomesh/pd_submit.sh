@@ -100,7 +100,7 @@ crusoe_runner_labels = {
 if not spur_controller_addr:
     if slurm_submit_runner in crusoe_runner_labels:
         # spur_controller_addr = "http://crs-m2m-cpu-spur-005.crusoe.amd.com:6817" #crusoe旧版本
-        spur_controller_addr = "http://crs-m2m-cpu-spur-v2-009.crusoe.amd.com:6817" #crusoe新版本
+        spur_controller_addr = "http://crs-m2m-cpu-spur-v2-001.crusoe.amd.com:6817" #crusoe v2 controller (v2-009 is node agent only)
     else:
         spur_controller_addr = os.environ.get(
             "SPUR_CONTROLLER_ADDR", "http://134.199.196.72:6817"
