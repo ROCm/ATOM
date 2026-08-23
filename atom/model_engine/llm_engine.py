@@ -751,7 +751,8 @@ class InputOutputProcessor:
             )
             outputs[req.id] = {
                 "text": output_str,
-                "token_ids": req.completion_token_ids,
+                # `list`, not the `array("i")` slice: this dict is serialized.
+                "token_ids": list(req.completion_token_ids),
                 "logprobs": req.logprobs if req.return_logprobs else None,
                 "latency": req.leave_time - req.arrive_time,
                 "finish_reason": req.leave_reason,

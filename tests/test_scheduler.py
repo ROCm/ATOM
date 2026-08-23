@@ -897,7 +897,7 @@ class TestPrefixCaching:
             )
             batch, _ = sched.schedule()  # next decode step
 
-        assert seq1.token_ids == prompt + generated
+        assert list(seq1.token_ids) == prompt + generated
         # 20 tokens on the seq, but token 20 was sampled this step and no
         # forward has written its KV — the block it closes stays unhashed until
         # the next step consumes it.

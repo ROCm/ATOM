@@ -2,21 +2,22 @@
 # Tests for atom/model_engine/sequence.py — public API only
 
 import pytest
-from atom.sampling_params import SamplingParams
+
 from atom.model_engine.sequence import Sequence, SequenceStatus, get_exit_sequence
+from atom.sampling_params import SamplingParams
 
 
 class TestSequenceCreation:
     def test_token_ids_and_len(self, seq_factory):
         seq = seq_factory([1, 2, 3])
-        assert seq.token_ids == [1, 2, 3]
+        assert list(seq.token_ids) == [1, 2, 3]
         assert len(seq) == 3
 
     def test_token_ids_are_copied(self, seq_factory):
         original = [1, 2, 3]
         seq = seq_factory(original)
         original.append(4)
-        assert seq.token_ids == [1, 2, 3]
+        assert list(seq.token_ids) == [1, 2, 3]
 
     def test_auto_increment_ids(self, seq_factory):
         s1 = seq_factory([1])
@@ -53,12 +54,12 @@ class TestSequenceNumTokensAndBlocks:
 class TestSequenceBlock:
     def test_block_returns_tokens(self, seq_factory):
         seq = seq_factory([10, 20, 30, 40, 50, 60, 70, 80], block_size=4)
-        assert seq.block(0) == [10, 20, 30, 40]
-        assert seq.block(1) == [50, 60, 70, 80]
+        assert list(seq.block(0)) == [10, 20, 30, 40]
+        assert list(seq.block(1)) == [50, 60, 70, 80]
 
     def test_block_partial_last(self, seq_factory):
         seq = seq_factory([10, 20, 30, 40, 50], block_size=4)
-        assert seq.block(1) == [50]
+        assert list(seq.block(1)) == [50]
 
     def test_block_out_of_range(self, seq_factory):
         seq = seq_factory([1, 2], block_size=4)
@@ -70,7 +71,7 @@ class TestSequenceAppendToken:
     def test_append_extends_token_ids(self, seq_factory):
         seq = seq_factory([1, 2])
         seq.append_token(3)
-        assert seq.token_ids == [1, 2, 3]
+        assert list(seq.token_ids) == [1, 2, 3]
         assert len(seq) == 3
         assert seq.last_token == 3
 
@@ -98,8 +99,8 @@ class TestSequenceProperties:
         seq = seq_factory([10, 20, 30])
         seq.append_token(40)
         seq.append_token(50)
-        assert seq.prompt_token_ids == [10, 20, 30]
-        assert seq.completion_token_ids == [40, 50]
+        assert list(seq.prompt_token_ids) == [10, 20, 30]
+        assert list(seq.completion_token_ids) == [40, 50]
         assert seq.num_completion_tokens == 2
 
     def test_getitem(self, seq_factory):
@@ -111,7 +112,7 @@ class TestSequenceProperties:
 class TestGetExitSequence:
     def test_exit_sequence(self):
         seq = get_exit_sequence()
-        assert seq.token_ids == [-1]
+        assert list(seq.token_ids) == [-1]
         assert seq.status == SequenceStatus.EXIT_ENGINE
 
 

@@ -150,7 +150,7 @@ class TestPublishLoadedPrefix:
 
         assert bm.publish_loaded_prefix(loaded, start_token=0, end_token=8) == 8
         loaded_block = bm.kv.block(loaded.block_table[0])
-        assert loaded_block.token_ids == list(range(8))
+        assert list(loaded_block.token_ids) == list(range(8))
 
         probe = seq_factory(list(range(8)) + list(range(100, 108)))
         num_cached_blocks = bm.can_allocate(probe)
