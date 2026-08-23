@@ -240,6 +240,7 @@ EOF
   [[ -e /etc/libibverbs.d/ionic.driver ]] && docker_args+=(-v /etc/libibverbs.d/ionic.driver:/etc/libibverbs.d/ionic.driver:ro)
   [[ -d /it-share ]] && docker_args+=(-v /it-share:/it-share)
   [[ -d /shared_nfs ]] && docker_args+=(-v /shared_nfs:/shared_nfs)
+  [[ -d /home/junyyang/models ]] && docker_args+=(-v /home/junyyang/models:/home/junyyang/models:ro)
 
   docker_args+=(
     "${DOCKER_IMAGE}"
@@ -525,6 +526,7 @@ for execution_phase in "${EXECUTION_PHASES[@]}"; do
           fi
         fi
       fi
+      [[ -d /home/junyyang/models ]] && nested_docker_args+=(-v /home/junyyang/models:/home/junyyang/models:ro)
       docker run --rm --name "${container}" \
         --network host --ipc host --privileged \
         --device /dev/kfd --device /dev/dri --device /dev/infiniband \
