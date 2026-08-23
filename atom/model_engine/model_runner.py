@@ -89,6 +89,7 @@ from atom.utils.forward_context import (
     set_forward_context,
     set_kv_cache_data,
 )
+from atom.utils.gc_utils import freeze_gc_heap
 from atom.utils.selector import get_attn_backend
 from atom.utils.tbo import (
     UBatchSlice,
@@ -1586,6 +1587,15 @@ class ModelRunner:
                 overhead / (1 << 30),
             )
         return int(overhead)
+
+    def freeze_gc_heap(self) -> int:
+        """RPC target: freeze this worker's startup heap. Pauses here reached
+        979 ms, the largest of any process.
+
+        The count is returned because `busy_loop` replies only `if out is not
+        None` -- an RPC target returning None hangs its `wait_out=True` caller.
+        """
+        return freeze_gc_heap(f"TP{self.rank}")
 
     def get_num_blocks(self) -> dict[str, object]:
         torch.set_default_device(self.device)

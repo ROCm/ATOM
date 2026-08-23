@@ -35,8 +35,8 @@ from atom.utils import (
     resolve_obj_by_qualname,
     set_process_title,
     shutdown_all_processes,
-    tune_gc,
 )
+from atom.utils.gc_utils import maybe_attach_gc_debug_callback, tune_gc
 from atom.utils.numa_utils import numa_bind_to_node
 
 logger = logging.getLogger("atom")
@@ -88,8 +88,10 @@ class AsyncIOProc:
         # Second-order next to the EngineCore's call but not zero: without it
         # a freeze still lands at the wave boundary, where the prefill burst
         # churns enough objects to trigger gen-2 here. Runs before the model
-        # is built so the thresholds cover the startup heap.
+        # is built so the thresholds cover the startup heap. Freezing that heap
+        # happens later, via the EngineCore's `freeze_gc_heap` RPC.
         tune_gc()
+        maybe_attach_gc_debug_callback(f"TP{rank}")
 
         # NUMA-local CPU/memory pinning (see atom.utils.numa_utils).
         # Auto-detects the GPU's local node by default; gated by
