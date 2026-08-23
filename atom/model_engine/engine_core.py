@@ -26,6 +26,7 @@ from atom.model_engine.sequence import (
 )
 from atom.model_engine.state_runtime import StateRuntime
 from atom.utils import (
+    engine_process_name,
     envs,
     init_exit_handler,
     make_zmq_socket,
@@ -205,16 +206,6 @@ class EngineCore:
             logger.warning(f"{self._process_name}: worker heap freeze skipped: {e}")
 
     @staticmethod
-    def _process_name_for(config: Config) -> str:
-        """Title of the EngineCore process a `config` will run."""
-        pc = config.parallel_config
-        if config.pipeline_parallel_size > 1:
-            return f"EngineCore_PP{pc.pipeline_parallel_rank}"
-        if pc.data_parallel_size > 1:
-            return f"EngineCore_DP{pc.data_parallel_rank}"
-        return "EngineCore"
-
-    @staticmethod
     def _setup_engine_process(name: str):
         """Identity, orphan reaping and GC policy, for every `run_engine`.
 
@@ -273,7 +264,7 @@ class EngineCore:
 
     @staticmethod
     def run_engine(config: Config, input_address: str, output_address: str):
-        EngineCore._setup_engine_process(EngineCore._process_name_for(config))
+        EngineCore._setup_engine_process(engine_process_name(config))
 
         engine: EngineCore = None
         try:

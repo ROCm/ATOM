@@ -35,6 +35,7 @@ from atom.utils import (
     resolve_obj_by_qualname,
     set_process_title,
     shutdown_all_processes,
+    worker_process_name,
 )
 from atom.utils.gc_utils import maybe_attach_gc_debug_callback, tune_gc
 from atom.utils.numa_utils import numa_bind_to_node
@@ -85,13 +86,19 @@ class AsyncIOProc:
 
         enable_orphan_reaping()
 
+        # Named once, before anything logs: `ps`, the GC lines here and the
+        # freeze line the runner emits over RPC all have to be the same string,
+        # or a dp deployment's workers are indistinguishable from each other.
+        name = worker_process_name(args[0] if args else None, rank)
+        set_process_title(name)
+
         # Second-order next to the EngineCore's call but not zero: without it
         # a freeze still lands at the wave boundary, where the prefill burst
         # churns enough objects to trigger gen-2 here. Runs before the model
         # is built so the thresholds cover the startup heap. Freezing that heap
         # happens later, via the EngineCore's `freeze_gc_heap` RPC.
         tune_gc()
-        maybe_attach_gc_debug_callback(f"TP{rank}")
+        maybe_attach_gc_debug_callback(name)
 
         # NUMA-local CPU/memory pinning (see atom.utils.numa_utils).
         # Auto-detects the GPU's local node by default; gated by
@@ -108,16 +115,6 @@ class AsyncIOProc:
         except Exception as e:  # noqa: BLE001
             logger.warning(f"AsyncIOProc({label}): NUMA bind skipped: {e}")
         self.label = f"AsyncIOProc({label})"
-        # Set process title so this GPU worker is distinguishable by rank in
-        # ps/top/rocm-smi (otherwise all workers show as "python").
-        try:
-            cfg = args[0]
-            if cfg.parallel_config.data_parallel_size > 1:
-                set_process_title(f"DP{cfg.parallel_config.data_parallel_rank}TP{rank}")
-            else:
-                set_process_title(f"TP{rank}")
-        except Exception:
-            set_process_title(f"TP{rank}")
         self.io_addrs = io_addrs
         self.io_queues = queue.Queue(), queue.Queue()
         self.io_threads: list[threading.Thread] = []

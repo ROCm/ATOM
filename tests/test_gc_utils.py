@@ -128,6 +128,38 @@ def test_freezing_twice_is_additive_and_harmless():
     assert len(later) == 64  # and did not disturb what it froze
 
 
+def test_a_process_has_exactly_one_name():
+    """`ps`, the freeze line and the debug callback all take a name, and they
+    have to be the same string: under dp>1 a name that omits the dp rank makes
+    every rank's logs identical, which is the case worth telling apart."""
+    from types import SimpleNamespace as NS
+
+    from atom.utils import engine_process_name, worker_process_name
+
+    def cfg(pp=1, dp=1, pp_rank=0, dp_rank=0):
+        return NS(
+            pipeline_parallel_size=pp,
+            parallel_config=NS(
+                pipeline_parallel_rank=pp_rank,
+                data_parallel_size=dp,
+                data_parallel_rank=dp_rank,
+            ),
+        )
+
+    assert engine_process_name(cfg()) == "EngineCore"
+    assert engine_process_name(cfg(dp=4, dp_rank=2)) == "EngineCore_DP2"
+    assert engine_process_name(cfg(pp=2, pp_rank=1)) == "EngineCore_PP1"
+
+    assert worker_process_name(cfg(), 3) == "TP3"
+    assert worker_process_name(cfg(dp=4, dp_rank=2), 3) == "DP2TP3"
+    # A worker can be built without a config; naming must not be what fails.
+    assert worker_process_name(None, 3) == "TP3"
+
+    # Control: dp ranks must not collide, which is what a rank-blind name does.
+    names = {worker_process_name(cfg(dp=4, dp_rank=r), 0) for r in range(4)}
+    assert len(names) == 4, f"dp ranks share a name: {names}"
+
+
 def test_the_worker_rpc_returns_something():
     """`AsyncIOProc.busy_loop` replies only `if out is not None`, so an RPC
     target that returns None hangs its `wait_out=True` caller forever. The

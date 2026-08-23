@@ -194,6 +194,25 @@ def set_process_title(name: str, suffix: str = "", prefix: str | None = None) ->
     setproctitle.setproctitle(f"{prefix}::{name}")
 
 
+def engine_process_name(config: "Config") -> str:
+    """What an EngineCore process is called, in `ps` and in its own logs."""
+    pc = config.parallel_config
+    if config.pipeline_parallel_size > 1:
+        return f"EngineCore_PP{pc.pipeline_parallel_rank}"
+    if pc.data_parallel_size > 1:
+        return f"EngineCore_DP{pc.data_parallel_rank}"
+    return "EngineCore"
+
+
+def worker_process_name(config: "Config | None", rank: int) -> str:
+    """What a ModelRunner worker is called. `config` may be absent on paths
+    that build a worker without one."""
+    pc = getattr(config, "parallel_config", None)
+    if pc is not None and pc.data_parallel_size > 1:
+        return f"DP{pc.data_parallel_rank}TP{rank}"
+    return f"TP{rank}"
+
+
 def shutdown_all_processes(procs: list[BaseProcess], allowed_seconds: int = 2):
     # First join any already-exited processes (instant, no wait).
     for proc in procs:
