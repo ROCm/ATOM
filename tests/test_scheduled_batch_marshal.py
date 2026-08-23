@@ -17,6 +17,8 @@ its inputs rather than from the destination.
 
 from __future__ import annotations
 
+import gc
+
 import numpy as np
 import pytest
 
@@ -119,12 +121,26 @@ def test_empty_batch():
     assert batch.scheduled_tokens.size == 0
 
 
+def test_the_window_array_is_writable_and_outlives_its_staging_buffer():
+    """It wraps the staging buffer rather than copying out of it, so it holds
+    the only reference to that buffer and inherits its writability."""
+    seqs = [_decode_seq(range(i * 100, i * 100 + 40)) for i in range(4)]
+    tokens = _build(seqs, [2] * 4).scheduled_tokens
+
+    gc.collect()  # the staging local is gone; the buffer must not be
+    assert np.array_equal(tokens, _golden_tokens(seqs, [2] * 4))
+    assert tokens.flags.writeable, "a read-only view would surprise a future writer"
+    tokens[0] = -1
+    assert tokens[0] == -1
+
+
 def test_a_sequence_too_short_for_its_window_raises():
-    """The per-row form raised here, on the row that came up short. A staged
-    run has no row edge -- what refuses it is the destination assign being
-    whole-array, so the short run cannot be quietly written into a prefix."""
+    """The per-row form raised here, on the row that came up short. Staging
+    has no row edge, and the array that wraps the staging buffer takes its
+    length from it, so nothing downstream would notice -- the batch would just
+    be short. The explicit length check is what refuses it."""
     seqs = [_decode_seq(range(10)), _decode_seq(range(100, 104))]
-    with pytest.raises(ValueError, match="could not broadcast"):
+    with pytest.raises(ValueError, match="shorter than the window"):
         _build(seqs, [4, 99])
 
     # Control: the same batch with a window each sequence can fill is fine.

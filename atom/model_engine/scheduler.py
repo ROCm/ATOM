@@ -476,10 +476,17 @@ class ScheduledBatch:
             else:
                 offset = seq.num_tokens - num_rejected[i] - num
             staged.extend(seq.token_ids[offset : offset + num])
-        self.scheduled_tokens = np.empty(total_tokens_num, dtype=np.int32)
-        # Whole-array, not `[: len(staged)]`: a sequence too short to fill its
-        # window makes `staged` short, and only this form refuses it.
-        self.scheduled_tokens[:] = staged
+        # Checked here because nothing downstream will: the array below wraps
+        # whatever length was staged, and a sequence too short to fill its
+        # window would otherwise leave the batch quietly short.
+        if len(staged) != total_tokens_num:
+            raise ValueError(
+                f"staged {len(staged)} tokens for a batch of {total_tokens_num}: "
+                "a sequence is shorter than the window scheduled for it"
+            )
+        # Wrapped, not copied into a fresh array: consumers only ever read this
+        # or rebind it, so the staging buffer can be the buffer.
+        self.scheduled_tokens = np.frombuffer(staged, dtype=np.int32)
 
         if num_spec_step > 0 and scheduled_spec_decode_tokens is not None:
             # One row per sequence, in batch order. The caller's dict is keyed
