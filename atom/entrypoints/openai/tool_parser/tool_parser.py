@@ -99,20 +99,31 @@ def begin_of_markup(
     the sentence between a quotation and the call that follows it is inside
     the region -- and it stops here, because prose is not one of the literals
     this walks over.
+
+    Offsets, not slices. `region[:j].rstrip()` copies everything to the left
+    of the scan to read its last few bytes, once per step, so a region holding
+    several calls after a large argument paid O(calls x region) -- measured
+    7.3x on 128 KB with eight calls, and growing with the payload where this
+    is flat. `end_of_markup` walks the other direction with `startswith(s, j)`
+    and never copied; the same fix is already written out on
+    `_region_owes_a_closer`, one layer up, and was not carried into the
+    function that shape came from.
     """
     if not openers:
         return at
     begin = j = at
     while j > 0:
-        stripped = region[:j].rstrip()
-        if len(stripped) < j:
+        end = j
+        while end > 0 and region[end - 1].isspace():
+            end -= 1
+        if end < j:
             # Whitespace moves the scan but not the answer, exactly as in
             # `end_of_markup`: a newline between two markers is markup, a
             # newline between prose and a marker belongs to the prose.
-            j = len(stripped)
+            j = end
             continue
         token = next(
-            (t for t in (*fillers, *openers) if stripped.endswith(t)),
+            (t for t in (*fillers, *openers) if region.endswith(t, 0, j)),
             None,
         )
         if token is None:

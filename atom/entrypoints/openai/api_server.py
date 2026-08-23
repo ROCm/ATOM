@@ -354,6 +354,24 @@ def _log_request_event(event_type: str, request_id: str, data: Any) -> None:
     _request_logger.info(json.dumps(entry, default=str))
 
 
+def _log_request_model(event_type: str, request_id: str, model: Any) -> None:
+    """:func:`_log_request_event` for a pydantic model, dumped only if logged.
+
+    The guard in `_log_request_event` is in the callee, so
+    ``_log_request_event("request", rid, request.model_dump())`` builds the
+    dump before the call can decline it: every message and every tool schema
+    serialised on the event loop and thrown away, on every request, with
+    request logging off. Measured 20-26 us on an agent-shaped request against
+    0.07 us for the guard.
+
+    `_log_sse` directly below already asks the question in this order. Two
+    spellings of one rule in one module is what this removes.
+    """
+    if _request_logger is None:
+        return
+    _log_request_event(event_type, request_id, model.model_dump())
+
+
 def _log_sse(chunk: str, request_id: str) -> None:
     """Log every SSE frame in `chunk`, and never fail the stream doing it.
 
@@ -1164,7 +1182,9 @@ async def setup_streaming_request(
     # 9 of them were sitting on this line, up to 3.3 s each -- long enough that
     # the server accepts no new request at all and the GPUs run dry waiting for
     # work. Anything per-request logged from here has to stay off info.
-    logger.debug(f"API: Created request_id={request_id}, seq_id={seq_id}")
+    # %-style, not an f-string: the arguments are formatted only if the
+    # record is emitted, and this runs once per request with debug off.
+    logger.debug("API: Created request_id=%s, seq_id=%s", request_id, seq_id)
     engine.core_mgr.add_request([seq])
 
     return seq_id, stream_collector, seq.num_prompt_tokens
@@ -1528,7 +1548,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         request_id = f"chatcmpl-{uuid.uuid4().hex}"
         dp_rank = request.data_parallel_rank
 
-        _log_request_event("request", request_id, request.model_dump())
+        _log_request_model("request", request_id, request)
 
         is_multimodal = _has_multimodal_content(messages)
         if is_multimodal:
@@ -1719,7 +1739,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 reasoning=_reasoning,
                 tool_parser_cls=tool_call_parser_cls,
             )
-        _log_request_event("response", request_id, resp.model_dump())
+        _log_request_model("response", request_id, resp)
         return resp
 
     except _ClientDisconnected:
@@ -1755,7 +1775,7 @@ async def completions(request: CompletionRequest, raw_request: Request):
         request_id = f"cmpl-{uuid.uuid4().hex}"
         dp_rank = request.data_parallel_rank
 
-        _log_request_event("request", request_id, request.model_dump())
+        _log_request_model("request", request_id, request)
 
         # Streaming
         if request.stream:
@@ -1835,7 +1855,7 @@ async def completions(request: CompletionRequest, raw_request: Request):
                 raise RuntimeError("No output generated")
 
             resp = build_completion_response(request_id, model_name, final_output)
-        _log_request_event("response", request_id, resp.model_dump())
+        _log_request_model("response", request_id, resp)
         return resp
 
     except _ClientDisconnected:

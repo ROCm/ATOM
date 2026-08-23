@@ -4,6 +4,7 @@
 """Tests for tool call parsing."""
 
 import json
+import tracemalloc
 from typing import ClassVar
 
 import pytest
@@ -1583,4 +1584,81 @@ class TestWhatEveryFormatDoesWithACallCutOffMidWay:
             f"{name} reads a complete call with no tools declared and drops "
             "the truncated one, so the same generation cut a byte earlier "
             "ships raw markup as the answer"
+        )
+
+
+class TestTheRegionIsNotCopiedToReadACallsLeftEdge:
+    """`begin_of_markup` walks back over a call's wrapper a few bytes at a time.
+
+    It spelled each step `region[:j].rstrip()`, which copies everything to the
+    left of the scan -- so a region holding several calls after a large
+    argument paid O(calls x region). Measured 42.8 us against 5.8 for eight
+    calls behind a 128 KB payload, and growing with the payload where the
+    offset form is flat.
+
+    Its mirror `end_of_markup` walks the other way with `startswith(s, j)` and
+    never copied, and `_region_owes_a_closer` one layer up already carries
+    this fix in its docstring -- it was not carried into the function that
+    shape was taken from. `prompt_starts_in_reasoning` carries the twin of
+    this test.
+    """
+
+    CALL: ClassVar[str] = (
+        "<tool_call>\n<function=write_file>\n<parameter=content>\n"
+        "{payload}\n</parameter>\n</function>\n</tool_call>\n"
+    )
+
+    def _region(self, payload_kb: int, calls: int = 4) -> tuple[str, list[int]]:
+        """`calls` calls, the first carrying a `payload_kb` argument, and every
+        `<function=` offset -- which is what the formats hand `markup_begin`."""
+        region = "".join(
+            self.CALL.format(payload="x" * (payload_kb * 1024 if i == 0 else 8))
+            for i in range(calls)
+        )
+        ats, pos = [], 0
+        while (k := region.find("<function=", pos)) != -1:
+            ats.append(k)
+            pos = k + 1
+        return region, ats
+
+    @staticmethod
+    def _peak_bytes(region: str, ats: list[int]) -> int:
+        tracemalloc.start()
+        try:
+            tracemalloc.reset_peak()
+            for at in ats:
+                QwenXmlParser.markup_begin(region, at)
+            return tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+
+    def test_the_left_edge_is_unchanged(self):
+        """The walk still steps over the wrapper and the newline before it."""
+        region, ats = self._region(1)
+        assert ats, "nothing to walk; this asserts nothing"
+        # The first call's wrapper opens the region, so its markup begins at 0.
+        assert QwenXmlParser.markup_begin(region, ats[0]) == 0
+        # A later call's begins at its own `<tool_call>`, not at the prose or
+        # the payload before it.
+        for at in ats[1:]:
+            begin = QwenXmlParser.markup_begin(region, at)
+            assert region.startswith("<tool_call>", begin), (
+                f"walked back to {region[begin : begin + 20]!r}, which is not "
+                "this call's wrapper"
+            )
+
+    def test_prose_before_a_quoted_marker_stays_prose(self):
+        region = "I would call <tool_call>\n<function=f>\n</function>\n</tool_call>\n"
+        at = region.find("<function=")
+        assert QwenXmlParser.markup_begin(region, at) == region.find("<tool_call>")
+
+    def test_it_allocates_no_more_for_a_payload_128x_larger(self):
+        small, small_ats = self._region(1)
+        large, large_ats = self._region(128)
+        assert len(small_ats) == len(large_ats), "the two shapes must be comparable"
+        a = self._peak_bytes(small, small_ats)
+        b = self._peak_bytes(large, large_ats)
+        assert b < a + 4096, (
+            f"128 KB allocated {b} bytes against {a} for 1 KB; the region is "
+            "being copied on every step of the walk"
         )

@@ -3,6 +3,7 @@
 
 """Tests for reasoning/thinking content separation."""
 
+import tracemalloc
 from typing import ClassVar
 
 import pytest
@@ -509,4 +510,54 @@ class TestTheDialectsAsRegistered:
         assert dialect.content_framing == (), (
             "a dialect that wraps nothing must declare nothing, or it deletes "
             "literals out of ordinary answers"
+        )
+
+
+class TestTheRenderedPromptIsNotCopiedToReadItsEnd:
+    """`prompt_starts_in_reasoning` looks at the last twenty bytes of the
+    largest string the server handles.
+
+    It spelled that `prompt.rstrip()`, which copies the whole rendered prompt
+    -- system prompt, tool schemas and the entire history -- once per request,
+    on the event loop. Measured 4.8 us at 512 KB against 0.43 us for the
+    offset form.
+
+    Asserted in bytes allocated, not seconds: a copy is a fact about the
+    allocator, so this says the same thing on any machine and cannot go flaky.
+    `begin_of_markup` carries the twin of this test.
+    """
+
+    SMALL_KB = 16
+    LARGE_KB = 512
+
+    @staticmethod
+    def _peak_bytes(prompt: str) -> int:
+        tracemalloc.start()
+        try:
+            tracemalloc.reset_peak()
+            prompt_starts_in_reasoning(prompt)
+            return tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+
+    def _prompt(self, kb: int) -> str:
+        return ("You are a helpful assistant. " * (kb * 1024 // 29)) + "<think>\n"
+
+    def test_the_answer_is_unchanged(self):
+        assert prompt_starts_in_reasoning(self._prompt(64)) is True
+        assert prompt_starts_in_reasoning("just an ordinary prompt\n") is False
+        assert prompt_starts_in_reasoning("") is False
+        assert prompt_starts_in_reasoning("   \n\t ") is False
+
+    def test_trailing_whitespace_is_still_stepped_over(self):
+        assert prompt_starts_in_reasoning("<think>") is True
+        assert prompt_starts_in_reasoning("<think>  \n\t\n ") is True
+        assert prompt_starts_in_reasoning("<think> x ") is False
+
+    def test_it_allocates_no_more_for_a_prompt_32x_larger(self):
+        small = self._peak_bytes(self._prompt(self.SMALL_KB))
+        large = self._peak_bytes(self._prompt(self.LARGE_KB))
+        assert large < small + 4096, (
+            f"{self.LARGE_KB} KB allocated {large} bytes against {small} for "
+            f"{self.SMALL_KB} KB; the prompt is being copied to read its end"
         )
