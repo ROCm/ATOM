@@ -8,13 +8,13 @@ constructed Python objects and uses them in ``AtomStandaloneRouter``.
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
 import importlib
 import importlib.util
 import json
 import logging
-from pathlib import Path
 import sys
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from atom.utils.gc_utils import (
@@ -82,7 +82,7 @@ def print_version(verbose: bool = False) -> None:
             else atomesh_runner.version_string
         )
         print(version_fn())
-    except Exception:
+    except Exception:  # noqa: BLE001 - a version banner must not fail the CLI
         print("Atomesh Python interface")
 
 
@@ -107,7 +107,6 @@ def initialize_standalone_service(
 ) -> Any:
     from atom.entrypoints.atomesh.atom_standalone_service import AtomStandaloneService
 
-    global engine, tokenizer
     return AtomStandaloneService(
         engine=engine,
         tokenizer=tokenizer,
