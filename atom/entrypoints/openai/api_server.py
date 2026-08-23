@@ -68,6 +68,7 @@ from .reasoning import (
     prompt_starts_in_reasoning,
     prompt_tokens_start_in_reasoning,
     template_opens_reasoning_implicitly,
+    thinking_switched_off,
 )
 from .reasoning_dialects import resolve_dialect
 from .serving_anthropic import (
@@ -154,34 +155,32 @@ _request_logger: logging.Logger | None = None
 _stream_batch_dispatcher: StreamBatchDispatcher | None = None
 
 
-def reasoning_channel(prompt_opens: bool, *, thinking_off: bool) -> ReasoningChannel:
+def reasoning_channel(
+    prompt_opens: bool, *, template_kwargs: dict[str, Any] | None
+) -> ReasoningChannel:
     """How to read this request's reasoning channel.
 
     One place, because it is one answer and both endpoints and both delivery
     modes need the same one. The dialect is the model's, resolved at startup;
     what varies per request is whether the output begins inside the channel.
 
-    ``thinking_off`` is why that is not just the model-level fact. A request
-    that switches reasoning off renders a prompt that does not open the
-    channel, and `model_starts_in_reasoning` -- which describes the template
-    with reasoning *on* -- was OR-ed in regardless. On a model that begins
-    inside the channel implicitly, an ordinary answer to a request that had
-    asked for no thinking came back entirely as `reasoning_content`, with
-    `content` empty.
+    The render is why that is not just the model-level fact. A prompt that
+    switched reasoning off does not open the channel, and
+    `model_starts_in_reasoning` -- which describes the template with reasoning
+    *on* -- was OR-ed in regardless, so on a model that begins inside the
+    channel implicitly an ordinary answer came back entirely as
+    `reasoning_content` with `content` empty.
 
-    And it only counts when the template has a switch to honour it with. Ask
-    DeepSeek-R1 for no thinking and nothing goes into the prompt -- it has no
-    such kwarg (`resolve_reasoning_toggle` answers ``None`` for it) -- so the
-    model reasons exactly as always. Believing the request there stops the
-    channel being separated at all, and the client gets the chain of thought
-    and a literal `</think>` inside `content`. Reasoning that was asked not to
-    happen and happened anyway is still reasoning; `anthropic_drop_reasoning`
-    exists to withhold it, and it can only withhold what was separated.
+    ``template_kwargs``, not the request's own `thinking`: the server's
+    defaults and the client's `chat_template_kwargs` switch it too, and only
+    the merged dict has all three. Reasoning that was asked not to happen and
+    happened anyway is still reasoning -- `anthropic_drop_reasoning` exists to
+    withhold it, and it can only withhold what was separated.
     """
-    honoured = thinking_off and reasoning_toggle is not None
+    switched_off = thinking_switched_off(template_kwargs, reasoning_toggle)
     return ReasoningChannel(
         dialect=reasoning_dialect,
-        starts_open=prompt_opens or (model_starts_in_reasoning and not honoured),
+        starts_open=prompt_opens or (model_starts_in_reasoning and not switched_off),
     )
 
 
@@ -1564,7 +1563,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 if is_multimodal
                 else prompt_starts_in_reasoning(prompt)
             ),
-            thinking_off=_th_enabled is False,
+            template_kwargs=merged_kwargs,
         )
 
         # Streaming
@@ -1884,11 +1883,6 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         # no such spelling, and are not answered here or on the chat path.
         if forbids_tool_calls(request.tool_choice):
             merged_kwargs["tool_choice"] = "none"
-        # Thinking is "unstated" unless the field is present, exactly as
-        # `anthropic_template_kwargs` and `anthropic_drop_reasoning` read it.
-        thinking_off = request.thinking is not None and not anthropic_thinking_enabled(
-            request
-        )
         prompt = apply_chat_template(
             tokenizer,
             custom_message_encoder,
@@ -1973,7 +1967,8 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                 # it is the model's, resolved at startup -- the filter used to
                 # carry none and closed on any registered dialect's marker.
                 reasoning_filter = reasoning_channel(
-                    prompt_starts_in_reasoning(prompt), thinking_off=thinking_off
+                    prompt_starts_in_reasoning(prompt),
+                    template_kwargs=merged_kwargs,
                 ).stream()
                 tool_parser = ToolCallStreamParser(
                     parser_cls=tool_call_parser_cls,
@@ -2142,7 +2137,8 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         # `(reasoning, content)` and lost the interleaving at that line.
         events = read_whole_blocks(
             reasoning_channel(
-                prompt_starts_in_reasoning(prompt), thinking_off=thinking_off
+                prompt_starts_in_reasoning(prompt),
+                template_kwargs=merged_kwargs,
             ),
             tool_call_parser_cls,
             raw_text,

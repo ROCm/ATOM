@@ -12,6 +12,7 @@ this module contains no per-model conditions. Add a model there, not here.
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from typing import Any
 
 # The same reader the tool-call side uses, not a second one: this module's
 # whole thesis is that asking "how much can be released without splitting a
@@ -66,6 +67,28 @@ def template_opens_reasoning_implicitly(template_source: str) -> bool:
         ):
             return True
     return False
+
+
+def thinking_switched_off(
+    template_kwargs: dict | None, toggle: tuple[str, Any, Any] | None
+) -> bool:
+    """Did the render actually carry this template's off-switch?
+
+    The merged kwargs are the whole answer -- server defaults, the client's
+    `chat_template_kwargs`, and the request's `thinking` written in by the
+    toggle's name on top. Reading the request field alone missed the first
+    two, so an operator's `--default-chat-template-kwargs` never reached the
+    decision.
+
+    Only the resolved toggle's own name and value count: a kwarg the template
+    does not read changes nothing about what the model does, and believing it
+    would stop the channel being separated while the model went on producing
+    one.
+    """
+    if not template_kwargs or toggle is None:
+        return False
+    name, off_value, _on_value = toggle
+    return name in template_kwargs and template_kwargs[name] == off_value
 
 
 def prompt_starts_in_reasoning(prompt: str) -> bool:

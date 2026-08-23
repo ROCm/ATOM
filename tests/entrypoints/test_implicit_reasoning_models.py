@@ -96,8 +96,19 @@ class TestAskingForNoThinkingOnlyCountsWhereItCanBeHonoured:
 
     ANSWER = "The user wants the capital.</think>Paris."
 
+    SWITCH = ("enable_thinking", False, True)
+
     @staticmethod
-    def _channel(toggle, thinking_off):
+    def _channel(toggle, template_kwargs):
+        """The channel this request would get, on a model that begins inside
+        one implicitly.
+
+        `template_kwargs` is what actually went into the render -- the server
+        defaults merged with the client's own, with the request's `thinking`
+        field written in by name on top. Passing the request field instead
+        was the defect: an operator's `--default-chat-template-kwargs` never
+        reached this decision.
+        """
         import atom.entrypoints.openai.api_server as api
         from atom.entrypoints.openai.reasoning_dialects import resolve_dialect
 
@@ -110,7 +121,7 @@ class TestAskingForNoThinkingOnlyCountsWhereItCanBeHonoured:
             api.reasoning_dialect, _ = resolve_dialect("<think></think>")
             api.model_starts_in_reasoning = True
             api.reasoning_toggle = toggle
-            return api.reasoning_channel(False, thinking_off=thinking_off)
+            return api.reasoning_channel(False, template_kwargs=template_kwargs)
         finally:
             (
                 api.reasoning_dialect,
@@ -118,19 +129,44 @@ class TestAskingForNoThinkingOnlyCountsWhereItCanBeHonoured:
                 api.reasoning_toggle,
             ) = before
 
-    def test_a_model_with_no_switch_is_separated_anyway(self):
-        channel = self._channel(None, thinking_off=True)
-        assert channel.split(self.ANSWER) == ("The user wants the capital.", "Paris.")
+    SEPARATED = ("The user wants the capital.", "Paris.")
 
-    def test_a_model_with_a_switch_takes_the_request_at_its_word(self):
-        channel = self._channel(("enable_thinking", False, True), thinking_off=True)
+    def test_a_model_with_no_switch_is_separated_anyway(self):
+        """No toggle means nothing about thinking reached the prompt, so the
+        model reasons as always however the request was written. True by
+        construction now: with no toggle there is no kwarg name to look for."""
+        channel = self._channel(None, {"enable_thinking": False})
+        assert channel.split(self.ANSWER) == self.SEPARATED
+
+    def test_a_model_with_a_switch_takes_the_render_at_its_word(self):
+        channel = self._channel(self.SWITCH, {"enable_thinking": False})
         assert channel.split(self.ANSWER) == (None, self.ANSWER)
 
     @pytest.mark.parametrize(
-        "toggle", [None, ("enable_thinking", False, True)], ids=["no-switch", "switch"]
+        "kwargs",
+        [None, {}, {"enable_thinking": True}],
+        ids=["none", "empty", "switched-on"],
     )
-    def test_an_unstated_request_always_separates(self, toggle):
+    def test_anything_but_the_off_value_separates(self, kwargs):
         """Absent means unstated, and unstated leaves the model's own default
         alone -- at this layer as at the prompt layer."""
-        channel = self._channel(toggle, thinking_off=False)
-        assert channel.split(self.ANSWER) == ("The user wants the capital.", "Paris.")
+        channel = self._channel(self.SWITCH, kwargs)
+        assert channel.split(self.ANSWER) == self.SEPARATED
+
+    def test_a_kwarg_this_template_does_not_read_changes_nothing(self):
+        """The name has to be the resolved toggle's. A Qwen-spelled switch
+        sent to a Kimi-K3 template is a kwarg the render ignores, so the model
+        thinks anyway -- and believing it would stop the channel being
+        separated while the chain of thought went on being produced."""
+        channel = self._channel(self.SWITCH, {"thinking": False})
+        assert channel.split(self.ANSWER) == self.SEPARATED
+
+    def test_an_operator_default_reaches_the_decision(self):
+        """The defect. `--default-chat-template-kwargs '{"enable_thinking":
+        false}'` renders a prompt that does not open the channel, but
+        `thinking_off` was read from the request's own `thinking` field, which
+        is absent -- so the model-level fact was OR-ed back in and the whole
+        answer came back as `reasoning_content` with `content` empty."""
+        merged = {"enable_thinking": False}  # a server default, no request field
+        channel = self._channel(self.SWITCH, merged)
+        assert channel.split(self.ANSWER) == (None, self.ANSWER)

@@ -12,6 +12,7 @@ import pytest
 
 from atom.entrypoints.atomesh import atom_standalone_service
 from atom.entrypoints.openai import api_server, serving_chat
+from atom.entrypoints.openai.reasoning import NO_REASONING
 from atom.entrypoints.openai.serving_anthropic import completes_a_tool_call
 from atom.entrypoints.openai.serving_chat import (
     _build_chat_choice,
@@ -24,7 +25,6 @@ from atom.entrypoints.openai.serving_chat import (
     stream_chat_response,
     stream_chat_response_fanout,
 )
-from atom.entrypoints.openai.reasoning import NO_REASONING
 from atom.entrypoints.openai.streaming_dispatch import StreamOutputCollector
 from atom.entrypoints.openai.tool_parser import ToolCallStreamParser, parse_tool_calls
 from atom.entrypoints.openai.tool_parser.kimi_k3_tool_parser import KimiK3Parser

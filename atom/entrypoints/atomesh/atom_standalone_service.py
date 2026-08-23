@@ -41,6 +41,7 @@ from atom.entrypoints.openai.reasoning import (
     ReasoningChannel,
     prompt_starts_in_reasoning,
     template_opens_reasoning_implicitly,
+    thinking_switched_off,
 )
 from atom.entrypoints.openai.reasoning_dialects import resolve_dialect
 from atom.entrypoints.openai.serving_chat import (
@@ -1183,7 +1184,7 @@ class AtomStandaloneService:
             _template_source
         )
         # The kwarg that turns this model's reasoning off, so
-        # `_thinking_switched_off` can tell a switch the template reads from
+        # `thinking_switched_off` can tell a switch the template reads from
         # one it ignores.
         self.reasoning_toggle = resolve_reasoning_toggle(
             tokenizer, self.custom_message_encoder
@@ -1217,33 +1218,15 @@ class AtomStandaloneService:
         fact in regardless made a DeepSeek-R1-shaped model return its whole
         answer as `reasoning_content` with `content` empty, on both delivery
         modes.
-
-        The OpenAI server does *not* gate it the same way: there `thinking_off`
-        comes only from the request's own `thinking` / `reasoning_effort`
-        fields, never from the merged template kwargs. That is a latent bug
-        there, not a form to copy back into here.
         """
         return ReasoningChannel(
             dialect=self.reasoning_dialect,
             starts_open=prompt_starts_in_reasoning(prompt)
             or (
                 self.model_starts_in_reasoning
-                and not self._thinking_switched_off(template_kwargs)
+                and not thinking_switched_off(template_kwargs, self.reasoning_toggle)
             ),
         )
-
-    def _thinking_switched_off(self, template_kwargs: dict[str, Any] | None) -> bool:
-        """Did the render actually carry this template's off-switch?
-
-        Only the resolved toggle's own name and value count. A kwarg the
-        template does not read changes nothing about what the model does, and
-        believing it would stop the channel being separated while the model
-        went on producing it.
-        """
-        if not template_kwargs or self.reasoning_toggle is None:
-            return False
-        name, off_value, _on = self.reasoning_toggle
-        return name in template_kwargs and template_kwargs[name] == off_value
 
     def chat_completions(self, request_data: dict[str, Any]) -> dict[str, Any]:
         try:
