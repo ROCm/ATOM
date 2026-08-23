@@ -104,7 +104,7 @@ from atom.model_ops.v4_kernels import (
     write_v4_paged_decode_indices,
     write_v4_paged_prefill_indices,
 )
-from atom.utils import CpuGpuBuffer
+from atom.utils import CpuGpuBuffer, upload_numpy
 from atom.utils.forward_context import (
     AttentionMetaData,
     AttnState,
@@ -3688,14 +3688,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         )
         attn_metadata.swa_dest_rows = dest_rows
 
-        # `skip_prefix_len_csa` is no longer materialized on the decode path —
+        # `skip_prefix_len_csa` is not materialized on the decode path —
         # `csa_translate_pack` is invoked with `window_size = self.window_size`
         # so the kernel derives `skip = min(positions[t]+1, win)` inline,
-        # which is identical to the value we used to write here
-        # (`actual_swa_count_np`). Saves a CPU write + H2D per fwd. The
-        # `v4_skip_prefix_len_csa` forward_var is retained for the (unrelated)
-        # prefill path where skip depends on `chunk_start` and cannot be
-        # derived from positions alone.
+        # which is identical to the value this used to write
+        # (`actual_swa_count_np`). Saves a CPU write + H2D per fwd. Prefill
+        # cannot derive it from positions (skip depends on `chunk_start`) and
+        # uploads its own tensor in `_build_paged_prefill_meta`.
 
         # ----- Stash on attn_metadata for V4Attention.forward consumption -----
         # batch_id_per_token + n_committed_csa_per_seq already set in
@@ -3866,19 +3865,20 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         hca_total = int(hca_indptr_np[T])
 
         # ----- H2D: 4 indptrs + 2 per-seq scalars -----
-        # All non-blocking; sources are per-call temp np arrays, so not a
-        # cross-ubatch race source (the shared-pinned-buffer race is handled by
-        # the stream sync before build_ubatch_prefill_metadata's finally).
-        chunk_start_per_seq_gpu = torch.from_numpy(chunk_start_per_seq_np).to(
-            device, non_blocking=True
+        # Sources are per-call temp np arrays, so not a cross-ubatch race source
+        # (the shared-pinned-buffer race is handled by the stream sync before
+        # build_ubatch_prefill_metadata's finally). Via `upload_numpy` because
+        # the indptrs are `T + 1` long: 64 KB at mnbt 16384, over the pageable
+        # cliff at mnbt 131072.
+        chunk_start_per_seq_gpu = upload_numpy(chunk_start_per_seq_np, device)
+        n_committed_hca_per_seq_gpu = upload_numpy(
+            np.asarray(n_committed_hca_per_seq_np[:scheduled_bs], dtype=np.int32),
+            device,
         )
-        n_committed_hca_per_seq_gpu = torch.from_numpy(
-            np.asarray(n_committed_hca_per_seq_np[:scheduled_bs], dtype=np.int32)
-        ).to(device, non_blocking=True)
-        ext_indptr = torch.from_numpy(ext_indptr_np).to(device, non_blocking=True)
-        swa_indptr = torch.from_numpy(swa_indptr_np).to(device, non_blocking=True)
-        csa_indptr = torch.from_numpy(csa_indptr_np).to(device, non_blocking=True)
-        hca_indptr = torch.from_numpy(hca_indptr_np).to(device, non_blocking=True)
+        ext_indptr = upload_numpy(ext_indptr_np, device)
+        swa_indptr = upload_numpy(swa_indptr_np, device)
+        csa_indptr = upload_numpy(csa_indptr_np, device)
+        hca_indptr = upload_numpy(hca_indptr_np, device)
 
         # Reuse already-on-GPU tensors (populated upstream).
         # Cast positions to int32: production var["positions"] is int64 but
@@ -3947,9 +3947,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # `kv_indices_prefix_csa[indptr[t]:indptr[t+1]]`; the SWA prefix
         # (length `skip`) occupies the slice TAIL, written by the builder.
         # Matches the per-token prefix_swa_count vector we just computed on CPU.
-        skip_csa_gpu = torch.from_numpy(prefix_swa_count_np).to(
-            device, non_blocking=True
-        )
+        skip_csa_gpu = upload_numpy(prefix_swa_count_np, device)
 
         # ----- Publish on attn_metadata -----
         attn_metadata.kv_indices_extend = ext_indices[:ext_total]
@@ -4506,11 +4504,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # Under CUDAGraph capture they land in the graph's private pool
         # and replay reuses the same address; eager keeps the standard
         # caching-allocator fast path.
-        # Per-token write offset consumed by `csa_translate_pack` (decode path
-        # fills with `window_size`; prefill path will fill with per-token
-        # prior_swa_count once the new dual-source kernel lands). Allocated
-        # `mnbt` (worst-case prefill) so prefill writes don't overflow.
-        bufs["v4_skip_prefix_len_csa"] = CpuGpuBuffer(mnbt, **i32)
 
         # Compress plan buffers (per-ratio) — pre-allocated for CUDAGraph
         # plan-tensor address stability. `make_compress_plans(..., plan_buffers=)`
