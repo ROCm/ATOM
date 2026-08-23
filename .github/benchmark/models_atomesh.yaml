@@ -46,8 +46,7 @@ backends:
 models:
   DeepSeek-V4-Pro:
     backend: atom
-    #model_path: "/it-share/models/DeepSeek-V4-Pro/" # crusoe旧版本
-    model_path: "/it-shared/models/DeepSeek-V4-Pro/" # crusoe v2版本
+    model_path: "/it-share/models/DeepSeek-V4-Pro/"
     precision: FP4
     env:
       common:
@@ -381,7 +380,8 @@ models:
 
   Kimi-K2.5-MXFP4:
     backend: atom
-    model_path: "${ATOMESH_MODEL_ROOT}/Kimi-K2.5-MXFP4/"
+    #model_path: "${ATOMESH_MODEL_ROOT}/Kimi-K2.5-MXFP4/" #crusoe旧版本
+    model_path: "/home/junyyang/models/amd/Kimi-K2.5-MXFP4/" #crusoe新版本
     precision: MXFP4
     env:
       common:
