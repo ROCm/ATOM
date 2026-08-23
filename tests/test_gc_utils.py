@@ -117,8 +117,9 @@ def test_unfreezing_makes_the_startup_heap_reclaimable_again():
 
 
 def test_freezing_twice_is_additive_and_harmless():
-    """The disaggregated decode path freezes a second time, once its scheduler
-    exists -- its block pool is built after `EngineCore.__init__` returns."""
+    """The disaggregated decode path freezes a second time, once its block pool
+    exists -- it is built later in `DecodeEngineCore.__init__`, after the base
+    freeze has already run."""
     freeze_gc_heap("first")
     first = gc.get_freeze_count()
     later = [object() for _ in range(64)]

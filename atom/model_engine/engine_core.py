@@ -1090,9 +1090,11 @@ class DecodeEngineCore(EngineCore):
             disagg_cu_shm_name=config.disagg_cu_shm_name,
             state_runtime=self.state_runtime,
         )
-        # Deliberately not frozen here, though the block pool only exists now:
-        # READY went out in `super().__init__()`, so the input thread may
-        # already hold requests that freezing would make permanent.
+        # The block pool exists only now, so the freeze inside
+        # `super().__init__()` ran before there was one to take. Safe to repeat:
+        # `_ready_deferred` held READY back, so nothing has been admitted yet
+        # and `gc.freeze()` is additive.
+        self._freeze_after_startup()
 
         # EngineUtilityHandler was built in super().__init__() with scheduler=None
         # (decode defers scheduler creation); wire the real one in for MTP stats.
