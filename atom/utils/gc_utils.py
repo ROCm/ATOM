@@ -24,8 +24,10 @@ logger = logging.getLogger("atom")
 def tune_gc() -> None:
     """Raise the collection thresholds from ``ATOM_GC_THRESHOLD``.
 
-    Per-interpreter, so every process calls it for itself. This spaces passes
-    out; `freeze_gc_heap` removes what one costs and is on by default, so with
+    Per-interpreter, so every process that serves calls it for itself -- an
+    enumeration here has gone stale twice, so the rule is the documentation and
+    `tests/test_gc_utils.py` is what checks it. This spaces passes out;
+    `freeze_gc_heap` removes what one costs and is on by default, so with
     `ATOM_GC_FREEZE=1` there is little left for this to do.
     """
     from atom.utils import envs

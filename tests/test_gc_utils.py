@@ -128,6 +128,41 @@ def test_freezing_twice_is_additive_and_harmless():
     assert len(later) == 64  # and did not disturb what it froze
 
 
+def test_every_serving_frontend_applies_the_gc_policy():
+    """The axis, not one instance of it.
+
+    This coverage has gone stale twice already: #1980 reached the API server
+    but not the disaggregated EngineCores, whose `run_engine` does not call the
+    base one; and the first version of this change reached those but not
+    atomesh, which builds its own engine and never runs the FastAPI lifespan.
+    Both misses are silent -- the process simply keeps its 200ms pauses.
+
+    So the rule is checked rather than the instances: a process that builds an
+    engine and then serves has to apply the policy.
+    """
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent / "atom"
+    frontends = sorted(
+        p
+        for p in root.rglob("*.py")
+        # `examples/` are batch scripts: they exit, they do not serve.
+        if ".create_engine(" in p.read_text() and "examples/" not in p.as_posix()
+    )
+    assert frontends, "no engine frontend found; this test has stopped checking"
+    missing = [
+        p.relative_to(root).as_posix()
+        for p in frontends
+        # The call, not the import: an unused import passes for the name.
+        if "freeze_gc_heap(" not in p.read_text()
+    ]
+    assert not missing, (
+        f"these build an engine and serve, but never apply the GC policy: "
+        f"{missing}. Add tune_gc/maybe_attach_gc_debug_callback/freeze_gc_heap "
+        f"once startup is done, as atom/entrypoints/openai/api_server.py does."
+    )
+
+
 def test_a_process_has_exactly_one_name():
     """`ps`, the freeze line and the debug callback all take a name, and they
     have to be the same string: under dp>1 a name that omits the dp rank makes
