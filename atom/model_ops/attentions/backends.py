@@ -159,6 +159,7 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         boundary, that is the whole ring.
         """
         return None
+
     def state_entry_views(self, group: int) -> list["torch.Tensor"]:
         """Contiguous views covering the whole of `group`'s per-request state.
 

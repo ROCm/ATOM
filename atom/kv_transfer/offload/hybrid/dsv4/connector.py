@@ -92,8 +92,6 @@ logger = logging.getLogger("atom")
 DSV4_CHECKPOINT_SAVE_CHANNEL = "atom.dsv4.checkpoint.save"
 
 
-
-
 def _wait_for_publication(
     probe,
     *,

@@ -243,7 +243,6 @@ def kv_connector_hosts_state_tier(kv_transfer_config) -> bool:
     return name in _STATE_TIER_BACKENDS
 
 
-
 def state_offload_staging_groups() -> int:
     """K: staging *groups* to reserve for the tier.
 

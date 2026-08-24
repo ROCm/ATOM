@@ -2986,9 +2986,7 @@ class Scheduler:
         # lands its owner is long gone and only the hash and slot remain. They
         # ride the connector's completion channels, so they are drained from the
         # connector with TP quorum already taken.
-        offload = getattr(
-            getattr(self, "block_manager", None), "state_offload", None
-        )
+        offload = getattr(getattr(self, "block_manager", None), "state_offload", None)
         take = getattr(self.kv_connector, "take_state_reports", None)
         if offload is not None and take is not None:
             indexed, released, _failed = take()

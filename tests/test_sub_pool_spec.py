@@ -455,7 +455,10 @@ def test_staging_groups_are_sized_by_multiplicity(monkeypatch):
     span, k = 3, 2  # GDN: span = 1 + num_spec
     monkeypatch.setenv("OFFLOAD_STATE_STAGING_GROUPS", str(k))
     plan = plan_pools(
-        [page_pool(1000), state_pool(ENTRY_STATE, 500, entries_per_req=span, offload_hosted=True)],
+        [
+            page_pool(1000),
+            state_pool(ENTRY_STATE, 500, entries_per_req=span, offload_hosted=True),
+        ],
         available_bytes=1_000_000,
         max_num_seqs=8,
     )

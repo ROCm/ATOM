@@ -1989,6 +1989,7 @@ class TestTheCacheCannotStarveLiveKv:
 
         assert scheduled, "the pass allocated before releasing the previous pin"
 
+
 def test_fates_report_every_counter():
     """checkpoint_fates() must expose all four fate counters.
 

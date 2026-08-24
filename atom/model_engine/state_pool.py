@@ -15,7 +15,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger("atom")
 
 
-
 @dataclass(frozen=True)
 class GroupRetirement:
     """What `retire_top` did, and what the caller still owes.
@@ -391,11 +390,7 @@ class StateGroupPool:
         # `_spill` returns on `not enabled` first, so `hashes` stays empty and
         # the membership test is false anyway. Anything that adds to `hashes`
         # outside the confirm-after-spill path must re-check `enabled` here.
-        return (
-            self.offload is not None
-            and h in self.offload.hashes
-            and tokens > 0
-        )
+        return self.offload is not None and h in self.offload.hashes and tokens > 0
 
     def _spill(self, group: int) -> None:
         """Stage `group`'s bytes for the tier, if there is room. Never blocks.

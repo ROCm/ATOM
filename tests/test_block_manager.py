@@ -86,7 +86,7 @@ class TestJointClaimReusesResidentBlocks:
         bm, tokens, resident = self._resident_prefix(seq_factory)
         seq = seq_factory(tokens)
         bm.allocate(seq, 2)
-        assert seq.block_table[:2] == resident[:2]
+        assert list(seq.block_table[:2]) == resident[:2]
         # Blocks 2 and 3 are resident and match, but nothing above the hit will
         # ever be treated as computed, so claiming them would pin blocks the
         # forward is about to overwrite.
@@ -104,7 +104,7 @@ class TestJointClaimReusesResidentBlocks:
 
         # All four resident blocks are reused -- that is the transfer the KV
         # leg no longer has to make, and the second copy that no longer lands.
-        assert seq.block_table[:4] == resident
+        assert list(seq.block_table[:4]) == resident
         # ...and the request still only calls two of them cached, so a failed
         # leg leaves the forward recomputing rather than skipping.
         assert seq.num_cached_tokens == 8

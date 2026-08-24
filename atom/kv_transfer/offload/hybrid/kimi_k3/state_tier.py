@@ -167,8 +167,6 @@ class StateOffloadTier:
                 self._failed.add(req_id)
 
 
-
-
 class _JointPark:
     """One park for the KV load and the state load of the same request.
 
