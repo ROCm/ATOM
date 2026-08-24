@@ -30,6 +30,8 @@ module-level skip would take the config tests down with it on the CPU CI
 runner, and those are the only ones that gate actually runs.
 """
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
@@ -39,10 +41,14 @@ import torch
 from atom.config import DCPConfig, qrep_unsupported_reason
 
 try:
+    import triton
     from aiter import dtypes
 
     from atom.config import QuantizationConfig
     from atom.model_ops.dcp_ops import (
+        _dcp_a2a_pack_kernel,
+        _dcp_a2a_unpack_combine_kernel,
+        _lse_pack_slots,
         correct_attn_out,
         dcp_global_pos,
         dcp_local_index,
@@ -600,6 +606,182 @@ def test_projection_does_not_defeat_the_empty_rank_scrub():
     torch.testing.assert_close(got[0, 0], projected[1, 0, 0], rtol=1e-5, atol=1e-5)
 
 
+# ──────────────────────────────────────────────────────── A2A merge backend ──
+
+
+def _a2a_roundtrip(o_per_rank, lse_per_rank, n_ranks):
+    """pack -> all-to-all -> combine, with the collective done as a local permute.
+
+    ``all_to_all_single`` needs a real process group, which a single-process test
+    does not have. But the collective is a pure permutation -- rank r's chunk n
+    becomes rank n's chunk r -- so stacking the send buffers reproduces exactly
+    what every rank would receive. That leaves the two Triton kernels and the LSE
+    bit-packing as the only things under test, which is where the bugs would be.
+
+    Returns ``[B, H_total, D]``: each rank owns heads ``[j*H_local, ...)``, so
+    concatenating the per-rank outputs in rank order rebuilds the original head
+    layout.
+    """
+    b, h_total, d = o_per_rank[0].shape
+    h_local = h_total // n_ranks
+    dtype = o_per_rank[0].dtype
+    pack = _lse_pack_slots(dtype)
+
+    sends = []
+    for r in range(n_ranks):
+        send = torch.empty((n_ranks, b, h_local, d + pack), dtype=dtype, device=DEV)
+        o_r = o_per_rank[r].contiguous()
+        l_r = lse_per_rank[r].contiguous().to(torch.float32)
+        _dcp_a2a_pack_kernel[(b, h_total)](
+            o_r,
+            l_r,
+            send,
+            o_r.stride(0),
+            o_r.stride(1),
+            l_r.stride(0),
+            l_r.stride(1),
+            send.stride(0),
+            send.stride(1),
+            send.stride(2),
+            H_LOCAL=h_local,
+            HEAD_DIM=d,
+            LSE_PACK=pack,
+        )
+        sends.append(send)
+
+    outs = []
+    for j in range(n_ranks):
+        recv = torch.stack([sends[r][j] for r in range(n_ranks)]).contiguous()
+        out = torch.empty((b, h_local, d), dtype=dtype, device=DEV)
+        out_lse = torch.empty((b, h_local), dtype=torch.float32, device=DEV)
+        _dcp_a2a_unpack_combine_kernel[(b, h_local)](
+            recv,
+            out,
+            out_lse,
+            recv.stride(0),
+            recv.stride(1),
+            recv.stride(2),
+            out.stride(0),
+            out.stride(1),
+            out_lse.stride(0),
+            out_lse.stride(1),
+            n_ranks,
+            HEAD_DIM=d,
+            LSE_PACK=pack,
+            N_ROUNDED=triton.next_power_of_2(n_ranks),
+            WRITE_LSE=True,
+        )
+        outs.append(out)
+    return torch.cat(outs, dim=1)
+
+
+@needs_gpu
+@pytest.mark.parametrize("n_ranks", [2, 8])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_a2a_reproduces_the_ag_rs_merge(n_ranks, dtype):
+    """The two backends must agree: same weighted sum, same head ownership.
+
+    They arrive there differently -- ag_rs pre-multiplies each rank's partial and
+    lets ReduceScatter sum, a2a moves everything to the owning rank and does both
+    locally -- so this is a comparison, not a bit-for-bit check.
+
+    bf16 is the case that matters most: it is what decode actually runs, and it
+    is the only one where the fp32 LSE has to survive being split across two
+    16-bit slots of the transfer buffer.
+    """
+    b, h, d = 3, 8, 32
+    g = torch.Generator(device=DEV).manual_seed(n_ranks)
+    o = [
+        torch.randn(b, h, d, generator=g, device=DEV).to(dtype) for _ in range(n_ranks)
+    ]
+    lse = [torch.randn(b, h, generator=g, device=DEV) for _ in range(n_ranks)]
+
+    got = _a2a_roundtrip(o, lse, n_ranks)
+    ref = _merge_partials(torch.stack(o), torch.stack(lse))
+
+    tol = 1e-5 if dtype == torch.float32 else 3e-2
+    torch.testing.assert_close(got.float(), ref.float(), rtol=tol, atol=tol)
+
+
+@needs_gpu
+def test_a2a_lse_survives_the_16_bit_split():
+    """A bf16 buffer stores the fp32 LSE as two raw 16-bit halves.
+
+    Nothing does arithmetic on those slots -- the collective copies bits -- so the
+    value must come back EXACTLY, not approximately. If it did not, every rank's
+    softmax weights would be subtly wrong in a way the tolerance above could hide.
+
+    Checked by giving each rank a distinct LSE and one-hot outputs, so the merged
+    result is a pure function of the weights.
+    """
+    b, h, d, n_ranks = 2, 4, 32, 4
+    g = torch.Generator(device=DEV).manual_seed(11)
+    lse = [torch.randn(b, h, generator=g, device=DEV) * 5.0 for _ in range(n_ranks)]
+    # Rank r contributes the constant r, so out == sum_r weight_r * r exactly.
+    o = [
+        torch.full((b, h, d), float(r), device=DEV, dtype=torch.bfloat16)
+        for r in range(n_ranks)
+    ]
+
+    got = _a2a_roundtrip(o, lse, n_ranks).float()
+
+    stacked = torch.stack(lse)  # [N, B, H]
+    w = torch.softmax(stacked, dim=0)  # exp(lse_r - global_lse)
+    want = sum(w[r].unsqueeze(-1) * float(r) for r in range(n_ranks))
+    torch.testing.assert_close(
+        got, want.expand_as(got).contiguous(), rtol=8e-3, atol=8e-3
+    )
+
+
+@needs_gpu
+def test_a2a_scrubs_the_empty_rank():
+    """Same hazard as the ag_rs path: a rank owning no KV returns o=NaN, lse=-inf.
+
+    The combine kernel must force that contribution to a hard zero. Without it
+    NaN*0 = NaN survives the accumulation and poisons the row for every rank --
+    silently, since nothing raises.
+    """
+    b, h, d, n_ranks = 2, 4, 32, 2
+    g = torch.Generator(device=DEV).manual_seed(5)
+    o = [
+        torch.randn(b, h, d, generator=g, device=DEV).bfloat16() for _ in range(n_ranks)
+    ]
+    lse = [torch.randn(b, h, generator=g, device=DEV) for _ in range(n_ranks)]
+    o[0][0, 0] = float("nan")
+    lse[0][0, 0] = NEG_INF
+
+    got = _a2a_roundtrip(o, lse, n_ranks)
+    assert torch.isfinite(got).all(), "empty-rank NaN reached the a2a output"
+    # Rank 0 contributed nothing, so the row is rank 1 alone (weight 1).
+    torch.testing.assert_close(
+        got[0, 0].float(), o[1][0, 0].float(), rtol=8e-3, atol=8e-3
+    )
+
+
+@needs_dcp_ops
+def test_lse_pack_slots_covers_the_transfer_dtypes():
+    """fp32 needs one slot, 16-bit dtypes need two; anything else must raise
+    rather than silently truncate the LSE."""
+    assert _lse_pack_slots(torch.float32) == 1
+    assert _lse_pack_slots(torch.bfloat16) == 2
+    assert _lse_pack_slots(torch.float16) == 2
+    with pytest.raises(NotImplementedError, match="a2a merge buffer dtype"):
+        _lse_pack_slots(torch.float8_e4m3fn)
+
+
+@needs_dcp_ops
+def test_cp_lse_a2a_is_a_no_op_without_a_dcp_group():
+    """dcp==1 has nothing to merge; the input must come back untouched."""
+    from atom.model_ops.dcp_ops import cp_lse_a2a
+
+    o = torch.randn(2, 4, 8)
+    lse = torch.randn(2, 4)
+    group = SimpleNamespace(world_size=1)
+    assert cp_lse_a2a(o, lse, group) is o
+    out, out_lse = cp_lse_a2a(o, lse, group, return_lse=True)
+    assert out is o and out_lse is lse
+
+
 # ─────────────────────────────────────────────────────────── DCPConfig parsing ──
 
 
@@ -764,11 +946,11 @@ def tp_group():
     """
     import os
 
+    import torch.distributed as dist
     from aiter.dist.parallel_state import (
         init_distributed_environment,
         initialize_model_parallel,
     )
-    import torch.distributed as dist
 
     if not dist.is_initialized():
         os.environ.setdefault("MASTER_ADDR", "127.0.0.1")

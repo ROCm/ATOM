@@ -397,12 +397,17 @@ def _dcp_a2a_unpack_combine_kernel(
         tl.store(out_lse_ptr + b * lse_stride_b + h * lse_stride_h, global_lse)
 
     factor = tl.exp(lse - global_lse)
-    # NaN * 0 = NaN, so an empty rank's NaN output would survive a plain weighted
-    # sum and poison this row. Force its weight to a hard zero instead.
+    # An empty rank already lands on factor == 0 by itself: its lse is -inf, so
+    # exp(-inf - finite) is exactly 0. This line is belt-and-braces for the case
+    # where global_lse is itself -inf (every rank empty) and the subtraction
+    # yields NaN; the load-bearing NaN guard is the vals mask below.
     factor = tl.where((factor != factor) | (~valid), 0.0, factor)  # noqa: PLR0124
 
     d = tl.arange(0, HEAD_DIM)
     vals = tl.load(base[:, None] + d[None, :]).to(tl.float32)
+    # THIS is what stops an empty rank from poisoning the row. aiter returns
+    # o=NaN alongside lse=-inf, and NaN * 0 = NaN, so the NaN has to be replaced
+    # BEFORE the multiply -- zeroing the weight is not enough.
     vals = tl.where(factor[:, None] == 0.0, 0.0, vals)
     acc = tl.sum(vals * factor[:, None], axis=0)
 
