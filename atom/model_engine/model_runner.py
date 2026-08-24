@@ -3248,7 +3248,7 @@ class ModelRunner:
                     batch.num_completion_tokens,
                     self.config.eos_token_id,
                     tuple(self.config.stop_token_ids),
-                    batch.single_token_stops,
+                    batch.request_stop_token_ids,
                 )
             sampled_tokens = self.sampler(
                 logits,
@@ -3277,7 +3277,7 @@ class ModelRunner:
                     num_draft_tokens,
                     self.config.eos_token_id,
                     tuple(self.config.stop_token_ids),
-                    batch.single_token_stops,
+                    batch.request_stop_token_ids,
                 )
                 # `rejection_sample` keeps the bonus token only when every
                 # draft was accepted and writes the -1 sentinel otherwise, so
@@ -3290,7 +3290,7 @@ class ModelRunner:
                     batch.num_completion_tokens[:spec_bs] + num_draft_tokens,
                     self.config.eos_token_id,
                     tuple(self.config.stop_token_ids),
-                    batch.single_token_stops,
+                    batch.request_stop_token_ids,
                 )
             bonus_token_ids = self.sampler(
                 logits=bonus_logits,

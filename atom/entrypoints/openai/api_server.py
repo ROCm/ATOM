@@ -713,6 +713,8 @@ def _build_stream_chunk(request_output: RequestOutput, request_id: str) -> dict:
         "finished_at": time.time(),
         "started_at": started_at,
         "num_cached_tokens": getattr(request_output, "num_cached_tokens", 0),
+        "stop_reason": request_output.stop_reason,
+        "stop_truncate_to": request_output.stop_truncate_to,
     }
     if getattr(request_output, "kv_transfer_params_output", None):
         chunk_data["kv_transfer_params"] = request_output.kv_transfer_params_output
@@ -792,6 +794,8 @@ async def generate_async(
     # consumer that starts reading that key has to convert.
     all_token_ids = new_token_ids()
     finish_reason: str | None = None
+    stop_reason: str | None = None
+    stop_truncate_to: int = -1
     seq = None
     kv_transfer_output_meta_info = None
     num_cached_tokens_seen = 0
@@ -811,6 +815,8 @@ async def generate_async(
                 "token_ids": request_output.output_tokens,
                 "finished": request_output.finished,
                 "finish_reason": request_output.finish_reason,
+                "stop_reason": request_output.stop_reason,
+                "stop_truncate_to": request_output.stop_truncate_to,
                 "ts": now,
             },
         )
@@ -844,6 +850,8 @@ async def generate_async(
                 all_token_ids.extend(token_ids)
             if item.get("finished", False):
                 finish_reason = item.get("finish_reason")
+                stop_reason = item.get("stop_reason")
+                stop_truncate_to = item.get("stop_truncate_to", -1)
                 _finished_ok = True
                 break
     finally:
@@ -864,6 +872,11 @@ async def generate_async(
             engine.io_processor.requests.pop(seq.id, None)
 
     text = tokenizer.decode(all_token_ids, skip_special_tokens=True)
+    # A stop string is defined over the text, so the cut is applied to the
+    # text -- the token that carried the match may hold characters on both
+    # sides of it, which no token-level trim could separate.
+    if stop_truncate_to >= 0:
+        text = text[:stop_truncate_to]
     num_tokens_input = (
         seq.num_prompt_tokens if seq is not None else len(tokenizer.encode(prompt))
     )
@@ -911,6 +924,8 @@ async def generate_async_multimodal(
     last_token_at: float | None = None
     all_token_ids = new_token_ids()
     finish_reason: str | None = None
+    stop_reason: str | None = None
+    stop_truncate_to: int = -1
     seq = None
 
     def completion_callback(request_output: RequestOutput):
@@ -921,6 +936,8 @@ async def generate_async_multimodal(
                 "token_ids": request_output.output_tokens,
                 "finished": request_output.finished,
                 "finish_reason": request_output.finish_reason,
+                "stop_reason": request_output.stop_reason,
+                "stop_truncate_to": request_output.stop_truncate_to,
                 "ts": now,
             },
         )
@@ -954,6 +971,8 @@ async def generate_async_multimodal(
                 all_token_ids.extend(token_ids_out)
             if item.get("finished", False):
                 finish_reason = item.get("finish_reason")
+                stop_reason = item.get("stop_reason")
+                stop_truncate_to = item.get("stop_truncate_to", -1)
                 _finished_ok = True
                 break
     finally:
@@ -967,6 +986,11 @@ async def generate_async_multimodal(
             engine.io_processor.requests.pop(seq.id, None)
 
     text = tokenizer.decode(all_token_ids, skip_special_tokens=True)
+    # A stop string is defined over the text, so the cut is applied to the
+    # text -- the token that carried the match may hold characters on both
+    # sides of it, which no token-level trim could separate.
+    if stop_truncate_to >= 0:
+        text = text[:stop_truncate_to]
     num_tokens_output = len(all_token_ids)
     finished_at = time.time()
     ttft = (first_token_at - started_at) if first_token_at is not None else 0.0

@@ -24,8 +24,7 @@ def new_token_ids(token_ids=()) -> array.array:
 
     Behaves as a list for append/pop/index/len/iterate/slice-delete, and holds
     negative ids (the exit sentinel is -1). It does NOT compare equal to a
-    list, which is why `stop_token_sequences` below is converted too, and why
-    `BlockManager.compute_hash` pins its dtype.
+    list, which is why `BlockManager.compute_hash` pins its dtype.
     """
     return array.array("i", token_ids)
 
@@ -75,7 +74,6 @@ class Sequence:
         token_ids: list[int],
         block_size: int,
         sampling_params: SamplingParams | None = None,
-        stop_token_sequences: list[list[int]] | None = None,
         stream_callback: Callable[[Any], None] | None = None,
         id=None,
         kv_transfer_params: dict | None = None,
@@ -175,16 +173,22 @@ class Sequence:
         self.max_tokens = sampling_params.max_tokens
         self.min_tokens = sampling_params.min_tokens
         self.ignore_eos = sampling_params.ignore_eos
+        # Stop *strings* never reach the engine core -- they are matched on
+        # detokenized text by whoever holds the tokenizer, which then aborts
+        # the request. Carried here only so that owner can read them back.
         self.stop_strings = sampling_params.stop_strings
-        # Same type as `token_ids`, because the stop check compares a slice of
-        # that against these and an `array("i")` never equals a list.
-        self.stop_token_sequences = [
-            new_token_ids(s) for s in (stop_token_sequences or [])
-        ]
-        # Constant for the sequence; only read while it is below min_tokens.
-        self.single_token_stops = {
-            stop_seq[0] for stop_seq in self.stop_token_sequences if len(stop_seq) == 1
-        }
+        self.include_stop_str_in_output = sampling_params.include_stop_str_in_output
+        # Which stop string fired, and how far to cut the text, both written
+        # by that same owner. `-1` means the text stands as generated.
+        self.stop_reason: str | None = None
+        self.stop_truncate_to: int = -1
+        # This request's own terminal token ids, on top of the server-wide
+        # `config.stop_token_ids` the scheduler holds. A set because both
+        # readers -- the stop check and the `min_tokens` mask -- ask only for
+        # membership, and it is constant for the sequence.
+        self.request_stop_token_ids: frozenset[int] = frozenset(
+            sampling_params.stop_token_ids or ()
+        )
         self.is_first_decode = False
         # Set to True by Scheduler.postprocess after BlockManager.hash_blocks
         # has registered the prompt blocks for prefix caching. The trigger has

@@ -15,3 +15,10 @@ class RequestOutput:
     finish_reason: Optional[str] = None
     kv_transfer_params_output: Optional[Dict[str, Any]] = None
     num_cached_tokens: int = 0
+    # Which stop string ended the request, for the client to read back. Only
+    # ever set by the frontend stop-string check -- the engine core decides
+    # token-level stops and reports those through `finish_reason` alone.
+    stop_reason: Optional[str] = None
+    # How far the accumulated text should be cut, or -1 to leave it. Set with
+    # `stop_reason`, and honoured by every consumer that builds text.
+    stop_truncate_to: int = -1

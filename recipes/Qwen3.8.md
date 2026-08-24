@@ -101,6 +101,24 @@ Further semantics:
 - Speculative decoding is supported. [`apply_min_tokens_mask_with_spec_decode`](../atom/model_ops/sampler.py) masks only the leading draft rows a request can still reach below its floor — a draft position reachable only after the tokens ahead of it in the same forward is no longer below it. The bonus row is scored at `num_draft_tokens` past the current length, which is exactly where it lands on the only path that keeps it (all drafts accepted). ATOM's rejection sampler is argmax-based, so a masked terminal token simply stops being `target_argmax`: a draft that proposed EOS too early is rejected and the sequence continues from the target's own token.
 - Batches where every request has `min_tokens=0` skip the mask, the per-step stop-set construction and the scheduler guard entirely, so the default path costs nothing.
 
+## Stopping
+
+`min_tokens` is one end of a stop story that follows vLLM's split, so it is worth naming the whole of it. Two kinds of stop condition, decided in two places, because only one of them can be decided without a tokenizer:
+
+| Condition | Decided by | Notes |
+|---|---|---|
+| EOS | scheduler | silenced by `ignore_eos` |
+| `config.stop_token_ids` | scheduler | the model's other end-of-turn ids; `ignore_eos` silences these too, since they are EOS by another name |
+| `stop_token_ids` (per request) | scheduler | the client named them, so they fire even under `ignore_eos` |
+| `max_tokens` | scheduler | always wins |
+| `stop` / `stop_strings` | **frontend** | matched on detokenized text, then the request is aborted |
+
+Stop strings are matched on text rather than on pre-encoded token ids because a client's spelling of one need not tokenize the way the model emits it — `"five,"` is `[52670, 11]` standing alone but `[4236, 11]` mid-sentence — and a token-level match simply never fires, with nothing reporting it.
+
+- `include_stop_str_in_output` (default `False`) decides whether the matched stop string stays in the returned text. `False` matches OpenAI, vLLM and TGI.
+- The matched string comes back as `stop_reason`, alongside `finish_reason: stop_sequence`.
+- The abort is asynchronous, so a few tokens may be generated after the match; they are dropped rather than returned.
+
 ## Accuracy
 
 Install `lm-eval` first:

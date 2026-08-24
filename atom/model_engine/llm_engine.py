@@ -14,6 +14,10 @@ from atom.config import Config
 from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
 from atom.model_engine.multimodal import get_mrope_input_positions
 from atom.model_engine.sequence import Sequence
+from atom.model_engine.stop_strings import (
+    IncrementalDetokenizer,
+    check_stop_strings,
+)
 from atom.sampling_params import SamplingParams
 from atom.utils import envs
 
@@ -141,6 +145,9 @@ class LLMEngine:
             self.core_mgr = DisaggCoreManager(config)
         else:
             self.core_mgr = CoreManager(config)
+        # A stop string is decided in the frontend, so the frontend is what
+        # has to tell the engine core to stop working on that request.
+        self.io_processor.abort_request = self.core_mgr.abort_request
         self._step_lock = None
         self._pending_results = {}
         import json
@@ -253,7 +260,16 @@ class LLMEngine:
         # fresh batch gets deterministic DP assignment and no leaked counts.
         self.core_mgr.reset_dp_router()
 
-        self.add_request(prompts, sampling_params, request_ids=request_ids)
+        # A no-op callback, purely so `_wrap_for_stop_strings` has something
+        # to wrap: without one the offline path would see no per-step output
+        # and a stop string could only be applied after the request had
+        # already run to EOS or `max_tokens`.
+        self.add_request(
+            prompts,
+            sampling_params,
+            stream_callback=lambda _request_output: None,
+            request_ids=request_ids,
+        )
         outputs = {}
         while not self.is_finished() and (
             self.core_mgr.is_alive() or self.core_mgr.is_rest()
@@ -548,6 +564,14 @@ class InputOutputProcessor:
         self.tokenizer = tokenizer
         self.block_size = block_size
         self.requests = {}
+        # req_id -> (stop_string, truncate_to) for requests a stop string
+        # ended. Written by the wrapped stream callback, read once by
+        # `postprocess`, which removes the entry with the request.
+        self._stop_string_hits: dict[int, tuple[str, int]] = {}
+        # Set by LLMEngine once its CoreManager exists. A stop string is
+        # decided here, in the frontend, so ending the request means telling
+        # the engine core to stop working on it.
+        self.abort_request = None
         # `has_per_req_cache` flags model architectures that need a
         # per-request stateful buffer outside the paged KV pool. Sequences
         # constructed for these models trigger BlockManager to reserve a
@@ -586,6 +610,76 @@ class InputOutputProcessor:
                 "deepseek_v4",
             }
         )
+
+    def _wrap_for_stop_strings(self, sampling_params, callback):
+        """Wrap a stream callback so a stop string ends the request.
+
+        This is the frontend half of the split described in
+        `atom.model_engine.stop_strings`: the engine core cannot see text, so
+        the one stop condition defined over text is decided here, against the
+        detokenized output the client will actually receive, and the request
+        is then aborted.
+
+        Requests without stop strings are handed back their own callback
+        unchanged -- no detokenizer, no wrapper, no per-step work. That is the
+        overwhelming majority of them.
+        """
+        stops = sampling_params.stop_strings
+        if not stops:
+            return callback
+
+        detokenizer = IncrementalDetokenizer(self.tokenizer)
+        include = sampling_params.include_stop_str_in_output
+        # The abort is fire-and-forget and the engine keeps producing until it
+        # lands, so more output can arrive for a request already stopped.
+        # Everything after the first hit is dropped rather than re-checked.
+        state = {"stopped": False}
+
+        def on_output(request_output):
+            if not state["stopped"]:
+                delta = detokenizer.update(
+                    request_output.output_tokens or (), request_output.finished
+                )
+                hit = check_stop_strings(detokenizer.text, len(delta), stops, include)
+                if hit is not None:
+                    stop_string, truncate_to = hit
+                    if truncate_to < 0:
+                        # `check_stop_strings` says -1 when the match already
+                        # ends the text, so there is nothing to cut *yet*. The
+                        # abort is asynchronous, though, and whatever the
+                        # engine emits before it lands still reaches
+                        # `completion_token_ids`. Pinning the length here is
+                        # what keeps that tail out of the final text.
+                        truncate_to = len(detokenizer.text)
+                    state["stopped"] = True
+                    request_output.finished = True
+                    request_output.finish_reason = "stop_sequence"
+                    request_output.stop_reason = stop_string
+                    request_output.stop_truncate_to = truncate_to
+                    self._stop_string_hits[request_output.request_id] = (
+                        stop_string,
+                        truncate_to,
+                    )
+                    if self.abort_request is not None:
+                        try:
+                            self.abort_request(request_output.request_id)
+                        except Exception:
+                            # The request ends for the client either way; a
+                            # failed abort only costs the tokens it would have
+                            # saved, and raising here would lose the output.
+                            logger.warning(
+                                "Abort after stop string failed for request %s",
+                                request_output.request_id,
+                                exc_info=True,
+                            )
+            elif not request_output.finished:
+                # Trailing output from before the abort landed.
+                return
+
+            if callback is not None:
+                callback(request_output)
+
+        return on_output
 
     def preprocess(
         self,
@@ -664,18 +758,6 @@ class InputOutputProcessor:
                 multimodal_data,
             )
 
-        stop_token_sequences = []
-        if sampling_params.stop_strings:
-            stops = (
-                [sampling_params.stop_strings]
-                if isinstance(sampling_params.stop_strings, str)
-                else sampling_params.stop_strings
-            )
-            for stop_str in stops:
-                stop_tokens = self.tokenizer.encode(stop_str, add_special_tokens=False)
-                if stop_tokens:
-                    stop_token_sequences.append(stop_tokens)
-
         if stream_callbacks is not None and len(stream_callbacks) != n:
             raise ValueError(
                 f"stream_callbacks length {len(stream_callbacks)} does not match n={n}"
@@ -690,8 +772,7 @@ class InputOutputProcessor:
                 tokens,
                 self.block_size,
                 sampling_params,
-                stop_token_sequences,
-                stream_callback=cb,
+                stream_callback=self._wrap_for_stop_strings(sampling_params, cb),
                 num_draft_tokens=self.num_speculative_tokens,
                 has_per_req_cache=self.has_per_req_cache,
                 kv_transfer_params=kv_transfer_params,
@@ -736,6 +817,18 @@ class InputOutputProcessor:
             if external_request_id is not None:
                 self._external_to_internal.pop(external_request_id, None)
             output_str = self.tokenizer.decode(req.completion_token_ids)
+            # A stop string ends the request from here, so this is also where
+            # its two effects land: the text is cut where the client asked,
+            # and the reason reads `stop_sequence` rather than whatever the
+            # engine core happened to report for the tokens that arrived
+            # before the abort took hold.
+            stop_hit = self._stop_string_hits.pop(req.id, None)
+            stop_reason = None
+            if stop_hit is not None:
+                stop_reason, truncate_to = stop_hit
+                if truncate_to >= 0:
+                    output_str = output_str[:truncate_to]
+                req.leave_reason = "stop_sequence"
             req.leave_time = time.time()
 
             # Calculate TTFT (Time To First Token) and TPOT (Time Per Output Token)
@@ -764,12 +857,22 @@ class InputOutputProcessor:
                 "logprobs": list(req.logprobs) if req.return_logprobs else None,
                 "latency": req.leave_time - req.arrive_time,
                 "finish_reason": req.leave_reason,
+                "stop_reason": stop_reason,
                 "num_tokens_input": req.num_prompt_tokens,
                 "num_tokens_output": req.num_completion_tokens,
                 "ttft": ttft,  # Time to first token in seconds
                 "tpot": tpot,  # Time per output token in seconds
             }
         return outputs
+
+    def discard_stop_state(self, req_id) -> None:
+        """Forget a request's stop-string hit without producing an output.
+
+        `postprocess` is the ordinary consumer, but a request can leave
+        without reaching it -- a disconnected client, an abort -- and the
+        entry would then outlive the request.
+        """
+        self._stop_string_hits.pop(req_id, None)
 
     def has_pending_requests(self):
         return len(self.requests) > 0

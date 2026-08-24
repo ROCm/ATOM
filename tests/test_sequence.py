@@ -41,9 +41,13 @@ class TestSequenceCreation:
         assert seq.min_tokens == 3
         assert seq.ignore_eos is True
 
-    def test_single_token_stops_precomputed(self):
-        seq = Sequence([1], 4, stop_token_sequences=[[7], [8, 9]])
-        assert seq.single_token_stops == {7}
+    def test_request_stop_token_ids_precomputed(self):
+        sp = SamplingParams(stop_token_ids=[7, 8])
+        seq = Sequence([1], 4, sampling_params=sp)
+        assert seq.request_stop_token_ids == frozenset({7, 8})
+
+    def test_request_stop_token_ids_default_empty(self):
+        assert Sequence([1], 4).request_stop_token_ids == frozenset()
 
 
 class TestSequenceNumTokensAndBlocks:

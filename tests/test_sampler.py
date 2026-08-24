@@ -68,7 +68,7 @@ def test_min_tokens_masks_first_token_terminal_logits():
         num_completion_tokens=[0],
         eos_token_id=1,
         stop_token_ids=[2],
-        single_token_stops=[{3}],
+        request_stop_token_ids=[{3}],
     )
 
     assert torch.isneginf(result[0, 1])
@@ -87,7 +87,7 @@ def test_min_tokens_does_not_mask_at_threshold():
         num_completion_tokens=[1],
         eos_token_id=1,
         stop_token_ids=[2],
-        single_token_stops=[{3}],
+        request_stop_token_ids=[{3}],
     )
 
     torch.testing.assert_close(result, original)
@@ -108,7 +108,7 @@ def test_spec_decode_masks_only_the_draft_rows_below_the_floor():
         num_draft_tokens=[3],
         eos_token_id=1,
         stop_token_ids=[2],
-        single_token_stops=[{3}],
+        request_stop_token_ids=[{3}],
     )
 
     assert torch.isneginf(result[0, [1, 2, 3]]).all()
@@ -132,7 +132,7 @@ def test_spec_decode_ragged_batch_maps_each_row_to_its_own_request():
         num_draft_tokens=[2, 1, 3],
         eos_token_id=1,
         stop_token_ids=(),
-        single_token_stops=[{4}, {5}, {6}],
+        request_stop_token_ids=[{4}, {5}, {6}],
     )
 
     # req0's two rows: EOS plus req0's stop, and not req1's or req2's.

@@ -9,15 +9,13 @@ single callback per event loop. :class:`StreamOutputCollector` is the loop-side
 landing point each stream's SSE generator reads from.
 """
 
-import array
 import logging
 import threading
 import time
 from asyncio import AbstractEventLoop, Event
-from dataclasses import dataclass, field
 from typing import Any, NamedTuple
 
-from atom.model_engine.sequence import new_token_ids
+from atom.model_engine.stop_strings import IncrementalDetokenizer
 
 logger = logging.getLogger("atom")
 
@@ -34,40 +32,12 @@ _WAITING_SINCE: dict[int, float] = {}
 # Fields a later chunk overrides on the one it merges into, when it has a value
 # of its own. The SSE consumers keep the newest non-empty value they see, so
 # merging this way hands them what reading each chunk separately would have.
-_LATEST_WINS = ("finish_reason", "kv_transfer_params", "num_cached_tokens")
-
-
-@dataclass
-class IncrementalStreamDetokenizer:
-    """Decode token deltas without emitting incomplete UTF-8 characters."""
-
-    tokenizer: Any
-    # Grows for the whole life of a stream, one entry per token, and only ever
-    # sliced into `tokenizer.decode` -- which takes an array. Nothing here is
-    # serialized, so this one has no boundary to convert back at.
-    tokens: array.array = field(default_factory=new_token_ids)
-    prefix_offset: int = 0
-    read_offset: int = 0
-
-    def update(self, token_ids: list[int], finished: bool) -> str:
-        self.tokens.extend(token_ids)
-        prefix_text = self.tokenizer.decode(
-            self.tokens[self.prefix_offset : self.read_offset],
-            skip_special_tokens=True,
-        )
-        new_text = self.tokenizer.decode(
-            self.tokens[self.prefix_offset :],
-            skip_special_tokens=True,
-        )
-
-        if len(new_text) > len(prefix_text) and not new_text.endswith("\ufffd"):
-            delta = new_text[len(prefix_text) :]
-            self.prefix_offset = self.read_offset
-            self.read_offset = len(self.tokens)
-            return delta
-        if finished:
-            return new_text[len(prefix_text) :]
-        return ""
+_LATEST_WINS = (
+    "finish_reason",
+    "kv_transfer_params",
+    "num_cached_tokens",
+    "stop_reason",
+)
 
 
 def merge_chunk(into: dict, new: dict) -> None:
@@ -209,7 +179,7 @@ class _BufferedChunk(NamedTuple):
 
     loop: AbstractEventLoop
     collector: Any
-    state: IncrementalStreamDetokenizer
+    state: IncrementalDetokenizer
     chunk: dict
     tag: int | None
 
@@ -234,16 +204,16 @@ class StreamBatchDispatcher:
         self.tokenizer = tokenizer
         self._thread_local = threading.local()
 
-    def new_state(self) -> IncrementalStreamDetokenizer:
+    def new_state(self) -> IncrementalDetokenizer:
         """Make the detokenizer for one stream, for its callback to hold."""
-        return IncrementalStreamDetokenizer(self.tokenizer)
+        return IncrementalDetokenizer(self.tokenizer)
 
     def enqueue(
         self,
         *,
         loop: AbstractEventLoop,
         collector: Any,
-        state: IncrementalStreamDetokenizer,
+        state: IncrementalDetokenizer,
         chunk: dict,
         tag: int | None = None,
     ) -> None:
@@ -263,10 +233,20 @@ class StreamBatchDispatcher:
 
         by_loop: dict[AbstractEventLoop, list[tuple[Any, Any]]] = {}
         for item in buf:
-            item.chunk["text"] = item.state.update(
+            delta = item.state.update(
                 item.chunk.get("token_ids") or [],
                 bool(item.chunk.get("finished")),
             )
+            # `stop_truncate_to` counts characters of the whole completion,
+            # because that is the only frame a stop string is defined in. A
+            # stream sends deltas, so it becomes "how much of this delta is
+            # still inside the cut" -- and the detokenizer's accumulated
+            # `text` is what converts between the two.
+            truncate_to = item.chunk.get("stop_truncate_to", -1)
+            if truncate_to >= 0:
+                emitted_before = len(item.state.text) - len(delta)
+                delta = delta[: max(0, truncate_to - emitted_before)]
+            item.chunk["text"] = delta
             payload = item.chunk if item.tag is None else (item.tag, item.chunk)
             by_loop.setdefault(item.loop, []).append((item.collector, payload))
 

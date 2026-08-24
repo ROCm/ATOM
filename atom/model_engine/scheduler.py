@@ -436,10 +436,12 @@ class ScheduledBatch:
                 ],
                 dtype=np.int32,
             )
-            self.single_token_stops = [seq.single_token_stops for seq in seqs.values()]
+            self.request_stop_token_ids = [
+                seq.request_stop_token_ids for seq in seqs.values()
+            ]
         else:
             self.num_completion_tokens = None
-            self.single_token_stops = None
+            self.request_stop_token_ids = None
         # True if any seq in the batch is a fan-out child (SamplingParams.n>1)
         # and therefore requires fresh per-row random noise at the sampler
         # rather than the cached shared exponential tensor.
@@ -698,7 +700,9 @@ class Scheduler:
         self.max_model_len = config.max_model_len
         self.bos_token_id = config.bos_token_id
         self.eos_token_id = config.eos_token_id
-        self.stop_token_ids = config.stop_token_ids
+        # A set: every read is a membership test, and it is unioned with a
+        # request's own stop ids in `postprocess`.
+        self.stop_token_ids = frozenset(config.stop_token_ids)
         self.block_manager = BlockManager(
             config,
             state_runtime=state_runtime,
@@ -2347,53 +2351,47 @@ class Scheduler:
             # spurious tail below.
             stop_at_idx: int | None = None
             # A sequence below its `min_tokens` floor cannot stop naturally.
-            # The sampler has already kept EOS, the server's stop tokens and
-            # the single-token stops out of the logits it sampled from, so what
-            # this holds off is the one stop condition the sampler cannot see:
-            # a multi-token stop sequence, recognizable only here, once its
-            # whole suffix has landed. `max_tokens` is deliberately left
-            # outside the guard -- the ceiling always wins, and
-            # `SamplingParams` has already rejected `min_tokens > max_tokens`.
+            # The sampler's mask already keeps these same ids out of the
+            # logits it sampled from, so on the ordinary path this agrees with
+            # a decision already made. It is load-bearing where the mask does
+            # not reach: a token that arrived before the floor was raised, and
+            # any path that hands the scheduler ids it did not sample.
+            # `max_tokens` is deliberately left outside the guard -- the
+            # ceiling always wins, and `SamplingParams` has already rejected
+            # `min_tokens > max_tokens`.
             # `seq.min_tokens` is 0 for every request that does not ask for a
             # floor, so the common path stops at the first term.
             below_min_tokens = (
                 seq.min_tokens > 0
                 and (num_tokens - seq.num_prompt_tokens) < seq.min_tokens
             )
-            # Check if sequence ends with any stop sequence
-            for stop_seq in () if below_min_tokens else seq.stop_token_sequences:
-                stop_len = len(stop_seq)
-                if num_tokens >= stop_len:
-                    is_stop = False
-                    for i in range(num_new_token):
-                        offset = num_tokens - i
-                        if seq.token_ids[offset - stop_len : offset] == stop_seq:
-                            is_stop = True
-                            # `i` counts back from the last sampled token
-                            # (i=0 = last). Truncate to include this stop
-                            # sequence (drop everything after it).
-                            stop_at_idx = num_new_token - 1 - i
-                            break
-                    if is_stop:
-                        leave_reason = "stop_sequence"
-                        break
-            else:
+            # Every stop this block can decide is a *token* comparison, which
+            # needs no tokenizer and so belongs here. Stop strings are the
+            # exception and are matched on detokenized text by the frontend --
+            # see `atom.model_engine.stop_strings`.
+            if not below_min_tokens:
+                # `config.stop_token_ids` is `generation_config.eos_token_id`
+                # minus the primary one -- the model's other end-of-turn
+                # tokens, EOS by another name -- so `ignore_eos` silences
+                # those along with EOS itself. A request's own stop ids are
+                # not EOS: the client named them, and they fire either way.
+                # vLLM draws the same line, by folding the model's extra ids
+                # into `stop_token_ids` only when `not ignore_eos` and then
+                # testing that set unconditionally.
+                stop_ids = seq.request_stop_token_ids
+                if not seq.ignore_eos:
+                    stop_ids = (
+                        self.stop_token_ids | stop_ids
+                        if stop_ids
+                        else self.stop_token_ids
+                    )
                 # Check the last token in the list for EOS
-                if (
-                    not below_min_tokens
-                    and token_ids
-                    and not seq.ignore_eos
-                    and self.eos_token_id in token_ids
-                ):
+                if token_ids and not seq.ignore_eos and self.eos_token_id in token_ids:
                     leave_reason = "eos"
                     stop_at_idx = token_ids.index(self.eos_token_id)
-                elif (
-                    not below_min_tokens
-                    and not seq.ignore_eos
-                    and any(t in self.stop_token_ids for t in token_ids)
-                ):
+                elif stop_ids and any(t in stop_ids for t in token_ids):
                     stop_at_idx = next(
-                        i for i, t in enumerate(token_ids) if t in self.stop_token_ids
+                        i for i, t in enumerate(token_ids) if t in stop_ids
                     )
                     leave_reason = f"stop_{token_ids[stop_at_idx]}"
 

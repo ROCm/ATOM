@@ -56,7 +56,7 @@ def _mask_terminal_tokens(
     reqs: np.ndarray,
     eos_token_id: int,
     stop_token_ids: list[int] | tuple[int, ...],
-    single_token_stops: list[set[int]] | None,
+    request_stop_token_ids: list[frozenset[int]] | None,
 ) -> torch.Tensor:
     """Set every terminal token to ``-inf`` on the given ``logits`` rows.
 
@@ -76,11 +76,11 @@ def _mask_terminal_tokens(
         token_ids = _stop_token_id_tensor(tuple(sorted(global_stop_ids)), logits.device)
         logits[row_index[:, None], token_ids[None, :]] = -torch.inf
 
-    if single_token_stops is not None:
+    if request_stop_token_ids is not None:
         for row, req in zip(rows.tolist(), reqs.tolist()):
             row_stop_ids = [
                 int(token_id)
-                for token_id in single_token_stops[req]
+                for token_id in request_stop_token_ids[req]
                 if 0 <= int(token_id) < vocab_size
                 and int(token_id) not in global_stop_ids
             ]
@@ -96,7 +96,7 @@ def apply_min_tokens_mask(
     num_completion_tokens,
     eos_token_id: int,
     stop_token_ids: list[int] | tuple[int, ...] = (),
-    single_token_stops: list[set[int]] | None = None,
+    request_stop_token_ids: list[frozenset[int]] | None = None,
 ) -> torch.Tensor:
     """Mask terminal tokens while a request is below ``min_tokens``.
 
@@ -106,9 +106,13 @@ def apply_min_tokens_mask(
 
     The mask is applied to logits rather than ignoring EOS after sampling:
     feeding a sampled EOS back into the model would start a new message and
-    change the requested distribution. Only single-token stop strings can be
-    masked before sampling; multi-token stops are held off by the scheduler,
-    which refuses to stop a sequence that is still below its floor.
+    change the requested distribution.
+
+    Terminal here means the model's EOS, the server's `stop_token_ids` and the
+    request's own -- everything that ends a request by *token* id. Stop
+    strings are not maskable and are not tried: they end a request from the
+    frontend, on detokenized text, and a floor that is still in force simply
+    keeps that check from running.
     """
     blocked_rows = np.flatnonzero(
         np.asarray(num_completion_tokens) < np.asarray(min_tokens)
@@ -123,7 +127,7 @@ def apply_min_tokens_mask(
         blocked_rows,
         eos_token_id,
         stop_token_ids,
-        single_token_stops,
+        request_stop_token_ids,
     )
 
 
@@ -134,7 +138,7 @@ def apply_min_tokens_mask_with_spec_decode(
     num_draft_tokens,
     eos_token_id: int,
     stop_token_ids: list[int] | tuple[int, ...] = (),
-    single_token_stops: list[set[int]] | None = None,
+    request_stop_token_ids: list[frozenset[int]] | None = None,
 ) -> torch.Tensor:
     """``apply_min_tokens_mask`` for the flattened draft logits.
 
@@ -180,7 +184,7 @@ def apply_min_tokens_mask_with_spec_decode(
         reqs,
         eos_token_id,
         stop_token_ids,
-        single_token_stops,
+        request_stop_token_ids,
     )
 
 
