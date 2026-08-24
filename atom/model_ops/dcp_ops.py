@@ -128,7 +128,8 @@ def _correct_attn_cp_out_kernel(
     )
 
     lse = tl.load(lses_ptr + lse_offsets)
-    lse = tl.where((lse != lse) | (lse == float("inf")), -float("inf"), lse)
+    lse_is_nan = lse != lse  # noqa: PLR0124  # Triton has no isnan predicate
+    lse = tl.where(lse_is_nan | (lse == float("inf")), -float("inf"), lse)
 
     lse_max = tl.max(lse, axis=0)
     lse_max = tl.where(lse_max == -float("inf"), 0, lse_max)
@@ -145,8 +146,11 @@ def _correct_attn_cp_out_kernel(
     )
     local_lse = tl.load(lses_ptr + local_lse_offset)
     lse_diff = local_lse - global_lse
+    lse_diff_is_nan = (
+        lse_diff != lse_diff  # noqa: PLR0124  # Triton has no isnan predicate
+    )
     lse_diff = tl.where(
-        (lse_diff != lse_diff) | (lse_diff == float("inf")),
+        lse_diff_is_nan | (lse_diff == float("inf")),
         -float("inf"),
         lse_diff,
     )
@@ -204,7 +208,8 @@ def _correct_attn_cp_out_rs_layout_kernel(
         + head_idx * lses_stride_H
     )
     lse = tl.load(lses_ptr + lse_offsets)
-    lse = tl.where((lse != lse) | (lse == float("inf")), -float("inf"), lse)
+    lse_is_nan = lse != lse  # noqa: PLR0124  # Triton has no isnan predicate
+    lse = tl.where(lse_is_nan | (lse == float("inf")), -float("inf"), lse)
 
     lse_max = tl.max(lse, axis=0)
     lse_max = tl.where(lse_max == -float("inf"), 0, lse_max)
@@ -216,8 +221,11 @@ def _correct_attn_cp_out_rs_layout_kernel(
     )
     local_lse = tl.load(lses_ptr + local_lse_offset)
     lse_diff = local_lse - global_lse
+    lse_diff_is_nan = (
+        lse_diff != lse_diff  # noqa: PLR0124  # Triton has no isnan predicate
+    )
     lse_diff = tl.where(
-        (lse_diff != lse_diff) | (lse_diff == float("inf")),
+        lse_diff_is_nan | (lse_diff == float("inf")),
         -float("inf"),
         lse_diff,
     )

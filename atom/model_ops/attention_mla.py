@@ -1695,9 +1695,7 @@ class MLAAttention(nn.Module):
             # (max_seqlen_qo=2).
             is_sparse_mtp = self.is_sparse_mla and attn_metadata.max_seqlen_q > 1
 
-            if self._should_rebuild_sparse_dcp_persistent_metadata(
-                use_persistent_mode
-            ):
+            if self._should_rebuild_sparse_dcp_persistent_metadata(use_persistent_mode):
                 self._rebuild_sparse_dcp_persistent_metadata(
                     attn_metadata,
                     q,

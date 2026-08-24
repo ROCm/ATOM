@@ -378,7 +378,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             assert (
                 not self.is_producer
             ), "Only the decode (consumer) side handles do_remote_prefill"
-            self._reqs_need_recv[seq.id] = (seq, seq.block_table, slot_index)
+            self._reqs_need_recv[seq.id] = (seq, list(seq.block_table), slot_index)
             params["do_remote_prefill"] = False
             params["local_slot_index"] = slot_index
             # PD incremental: skip leading blocks already in the decode node's
@@ -404,7 +404,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         # Producer side: queue block_ids for the write listener to look up
         if params.get("do_remote_decode"):
             assert self.is_producer, "Only the producer side handles do_remote_decode"
-            self._reqs_need_save[seq.id] = (seq, seq.block_table, slot_index)
+            self._reqs_need_save[seq.id] = (seq, list(seq.block_table), slot_index)
             logger.debug(
                 "Queued req %s for KV save (%d blocks, slot=%d)",
                 seq.id,
@@ -421,7 +421,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         seq.kv_transfer_params_output = {
             "do_remote_prefill": True,
             "do_remote_decode": False,
-            "remote_block_ids": seq.block_table.copy(),
+            "remote_block_ids": list(seq.block_table),
             # The consumer's SWA ring slot; the producer keys the SWA region
             # transfer by it. Empty for backends with no SWA state.
             "remote_swa_block_ids": _swa_ring_ids(seq),
@@ -592,6 +592,7 @@ class MooncakeConnector(KVConnectorBase):
         self._has_slot_regions: bool = False
         # (base_addr, bytes_per_block) per region
         self._block_regions: list[tuple[int, int]] = []
+        self._block_region_consumer_indices: list[int] | None = None
         # Sliding-window regions, keyed by the request's state slot (not by the
         # compressed block_table above). Kept whole rather than as
         # `(base, unit)` because a window region may be reverse-indexed, and
@@ -739,6 +740,17 @@ class MooncakeConnector(KVConnectorBase):
 
         # Populate block/slot region lists for transfer offset computation
         self._block_regions = [(r.base_addr, r.unit_bytes) for r in tt.block_regions]
+        self._block_region_consumer_indices = getattr(
+            tt, "block_region_consumer_indices", None
+        )
+        if self._block_region_consumer_indices is not None and len(
+            self._block_region_consumer_indices
+        ) != len(self._block_regions):
+            raise ValueError(
+                "block_region_consumer_indices must match block_regions: "
+                f"{len(self._block_region_consumer_indices)} != "
+                f"{len(self._block_regions)}"
+            )
         # Window regions, transferred one whole entry per state slot.
         self._swa_block_regions = list(tt.swa_block_regions)
         self._slot_regions = [(r.base_addr, r.unit_bytes) for r in tt.slot_regions]
@@ -1335,6 +1347,7 @@ class MooncakeConnector(KVConnectorBase):
         num_local_regions: int,
         num_consumer_regions: int,
         consumer_num_layers: int | None = None,
+        explicit_indices: list[int] | None = None,
     ) -> list[int]:
         """Map this stage's local RDMA regions onto the consumer's region list.
 
@@ -1342,6 +1355,13 @@ class MooncakeConnector(KVConnectorBase):
         ``(i // L) * stride + start_layer + (i % L)``.
         Identity for pp_size == 1. Raises on layout mismatch.
         """
+        if explicit_indices is not None:
+            if len(explicit_indices) != num_local_regions:
+                raise ValueError(
+                    "Explicit consumer region map length does not match local "
+                    f"regions: {len(explicit_indices)} != {num_local_regions}"
+                )
+            return explicit_indices
         if (
             consumer_num_layers is not None
             and self.pp_size > 1
@@ -1396,6 +1416,7 @@ class MooncakeConnector(KVConnectorBase):
             num_regions,
             len(consumer_base_addrs),
             request_data.get("consumer_num_layers"),
+            self._block_region_consumer_indices,
         )
         for region_idx in range(num_regions):
             src_base = self.kv_caches_base_addr[region_idx]
@@ -1455,6 +1476,7 @@ class MooncakeConnector(KVConnectorBase):
             len(self._block_regions),
             len(consumer_block_addrs),
             request_data.get("consumer_num_layers"),
+            self._block_region_consumer_indices,
         )
         for region_idx, (src_base, bpb) in enumerate(self._block_regions):
             cidx = block_cmap[region_idx]

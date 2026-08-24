@@ -484,3 +484,117 @@ This means each GPU runs an independent attention computation (no TP AllReduce f
 | `atom/model_ops/linear.py` | `ColumnParallelLinear`, `RowParallelLinear`, `QKVParallelLinear`, `MergedColumnParallelLinear` |
 | `atom/model_ops/moe.py` | `FusedMoE`, `FusedMoEParallelConfig` (EP configuration and expert distribution) |
 | `atom/model_ops/fused_moe/mori_prepare_finalize.py` | `MoriPrepareAndFinalize` (MORI dispatch/combine for EP) |
+
+---
+
+## 8. Multi-node data parallelism
+
+Global DP ranks may span nodes. The node holding global DP rank 0 is the
+**coordinator**: it runs the API server and routes requests to every rank in
+the group, so the load balancer stays a single global scheduler rather than one
+independent balancer per node. Every other node hosts only its own engines and
+connects back.
+
+Multi-node is inferred from the topology — `data_parallel_size_local <
+data_parallel_size`, or `data_parallel_rank > 0` (`ParallelConfig.is_multinode_dp`).
+There is no enable flag.
+
+### Flags
+
+| Flag | Meaning |
+|---|---|
+| `--data-parallel-size` / `-dp` | Global DP ranks across all nodes |
+| `--data-parallel-size-local` | DP ranks on **this** node (default: the global size) |
+| `--data-parallel-rank` | First global rank this node owns |
+| `--data-parallel-master-ip` | Coordinator IP |
+| `--data-parallel-master-port` | DP rendezvous port |
+| `--data-parallel-base-port` | Model-runner rendezvous port |
+
+Each has an `ATOM_DP_*` environment equivalent (`ATOM_DP_SIZE_LOCAL`,
+`ATOM_DP_RANK`, …) for launch scripts; explicit flags win.
+
+### Example — 2 nodes, 4 DP ranks each, TP2
+
+```bash
+# Node 0 (coordinator, 10.0.0.1) — serves the API
+python -m atom.entrypoints.openai_server --model <model> -tp 2 \
+  --data-parallel-size 8 --data-parallel-size-local 4 --data-parallel-rank 0 \
+  --data-parallel-master-ip 10.0.0.1 --data-parallel-master-port 29500
+
+# Node 1 — engines only, no API server
+python -m atom.entrypoints.openai_server --model <model> -tp 2 \
+  --data-parallel-size 8 --data-parallel-size-local 4 --data-parallel-rank 4 \
+  --data-parallel-master-ip 10.0.0.1 --data-parallel-master-port 29500
+```
+
+Node 0 owns global DP ranks 0-3, node 1 owns 4-7. Each node's *local* ranks
+start at 0 and index its own GPUs; the global rank identifies the engine within
+the whole group. Conflating the two is the classic multi-node bug — global ranks
+drive process groups and expert sharding, local ranks drive GPU index, NUMA
+binding, and MoRI's `gpu_per_node`.
+
+### Ports
+
+Engine sockets are derived from the DP master port; both ends compute them
+independently and must agree. With `base = master_port + 100`, DP rank `r` uses:
+
+| Port | Purpose |
+|---|---|
+| `base + 3r` | requests (ROUTER/DEALER) |
+| `base + 3r + 1` | outputs (PULL/PUSH) |
+| `base + 3r + 2` | control — utility commands, abort, shutdown |
+
+All must be reachable from every node, plus the master and base rendezvous
+ports. The coordinator binds `0.0.0.0` **without authentication** — run it only
+on a trusted cluster fabric.
+
+Mismatched `--data-parallel-master-port` between nodes yields disjoint port
+plans and a startup that hangs rather than errors: the coordinator waits
+indefinitely for an identity handshake that never arrives.
+
+### Restrictions
+
+- **Multi-node DP + pipeline parallel is rejected** with a `ValueError`. The
+  engine-index space folds PP stages into DP ranks and the two mappings are not
+  reconciled across nodes.
+- PP + DP is separately unsupported (single-node assertion, pre-existing).
+
+## 9. Wide expert parallelism (multi-node EP)
+
+EP spans `dp_size * tp_size` ranks globally, so a multi-node DP run produces a
+multi-node EP group automatically. Requirements:
+
+- **Set `--data-parallel-size-local` correctly.** It reaches MoRI as
+  `gpu_per_node` via `FusedMoEParallelConfig.local_ep_size`. A wrong value
+  describes the wrong node topology to the all-to-all kernels.
+- **Use the mori all2all backend.** The FlyDSL backend raises on internode.
+- Kernel selection follows aiter's shared-memory topology probe
+  (`all2all_manager.internode`): `IntraNode` within a node, `InterNodeV1` with
+  RDMA across nodes. Both the synchronous prefill handle and the TBO decode path
+  read the *same* probe — previously the TBO path inferred it from
+  `world_size <= 8`, which reads 2 nodes × 4 GPUs as intra-node and would run
+  IntraNode kernels across a boundary with no P2P mapping.
+
+### Status and validation
+
+> **Multi-node DP and wide EP are implemented but have NOT been validated on
+> real multi-node hardware.** The `InterNodeV1` MoRI path and RDMA behavior are
+> unverified. Validate in your cluster before production use.
+
+What *is* verified: single-node behavior is unchanged (global == local, IPC
+sockets, coordinator path), and the rank arithmetic, port planning, routing, and
+shutdown paths are covered by CPU tests.
+
+`atom/benchmarks/internode_dp_ep_smoke.py` checks that a cross-node DP/EP
+process group forms and all-reduces. It does **not** exercise MoRI kernels:
+
+```bash
+# On each node, with matching global parameters
+python atom/benchmarks/internode_dp_ep_smoke.py \
+  --data-parallel-size 2 --data-parallel-size-local 1 \
+  --data-parallel-rank <0 or 1> --tensor-parallel-size 1 \
+  --data-parallel-master-ip <coordinator-ip>
+```
+
+Expect both nodes to report an EP group spanning all global ranks and an
+`ep_all_reduce_sum` equal to the sum of those ranks.
