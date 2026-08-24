@@ -796,8 +796,11 @@ class ParallelConfig:
     data_parallel_size: int = 1
     """Number of data parallel groups. MoE layers will be sharded according to
     the product of the tensor parallel size and data parallel size."""
-    data_parallel_size_local: int = 1
-    """Number of local data parallel groups."""
+    data_parallel_size_local: int | None = None
+    """DP ranks this node runs. Defaults to data_parallel_size, i.e. the
+    single-node case where every global rank is local. Set it below the global
+    size to give a node one slice of a multi-node run; it also reaches MoRI as
+    `gpu_per_node` (see model_ops/moe.py), so it must describe real hardware."""
     data_parallel_rank: int = 0
     """Rank of the data parallel group."""
     data_parallel_rank_local: int | None = None
@@ -823,8 +826,6 @@ class ParallelConfig:
     pp_kv_status_addr: str = ""
     """ZMQ endpoint where the head receives KV offload status from downstream
     PP stages. All downstream stages PUSH; the head PULLs."""
-    world_size: int = field(init=False)
-    """Vestigial: never assigned or read; engine_core derives worker count directly."""
     data_parallel_master_port: int = 29500
     """Port of the data parallel master."""
 
@@ -833,10 +834,20 @@ class ParallelConfig:
     data_parallel_master_ip: str = "127.0.0.1"
 
     @property
-    def world_size_across_dp(self) -> int:
-        """world_size_across_dp is TPxPPxDP, it is the size of the world
-        including data parallelism."""
-        return self.world_size * self.data_parallel_size
+    def is_multinode_dp(self) -> bool:
+        """Whether this node owns only part of the global DP group.
+
+        Inferred from the topology rather than a separate flag: either this
+        node runs fewer ranks than exist globally, or its slice starts at a
+        non-zero global rank.
+        """
+        # data_parallel_size_local is int | None in the declaration, but
+        # __post_init__ always resolves it before any caller can reach here.
+        assert self.data_parallel_size_local is not None
+        return (
+            self.data_parallel_size_local < self.data_parallel_size
+            or self.data_parallel_rank > 0
+        )
 
     def get_next_dp_init_port(self) -> int:
         """
@@ -890,6 +901,7 @@ class ParallelConfig:
         """
         factors: list[Any] = []
         factors.append(self.data_parallel_size)
+        factors.append(self.data_parallel_size_local)
         factors.append(self.data_parallel_rank)
         factors.append(self.data_parallel_rank_local)
         factors.append(self.data_parallel_master_ip)
@@ -911,6 +923,33 @@ class ParallelConfig:
             self.data_parallel_master_port = envs.ATOM_DP_MASTER_PORT
         if envs.is_set("ATOM_DP_BASE_PORT"):
             self.data_parallel_base_port = envs.ATOM_DP_BASE_PORT
+
+        if self.data_parallel_size < 1:
+            raise ValueError("data_parallel_size must be at least 1")
+
+        if envs.is_set("ATOM_DP_SIZE_LOCAL"):
+            self.data_parallel_size_local = envs.ATOM_DP_SIZE_LOCAL
+
+        # Default the local slice to the whole group: on one node every global
+        # rank is local, and that is the overwhelmingly common case.
+        if self.data_parallel_size_local is None:
+            self.data_parallel_size_local = self.data_parallel_size
+
+        if self.data_parallel_size_local < 1:
+            raise ValueError("data_parallel_size_local must be at least 1")
+        if self.data_parallel_rank < 0:
+            raise ValueError("data_parallel_rank must be non-negative")
+        if (
+            self.data_parallel_rank + self.data_parallel_size_local
+            > self.data_parallel_size
+        ):
+            raise ValueError(
+                f"data_parallel_rank ({self.data_parallel_rank}) + "
+                f"data_parallel_size_local ({self.data_parallel_size_local}) "
+                f"must not exceed data_parallel_size "
+                f"({self.data_parallel_size}): this node's slice would run off "
+                f"the end of the global DP group"
+            )
 
 
 _DSPARK_DEFAULT_MAX_BLOCK = 16
@@ -1465,6 +1504,12 @@ class Config:
     mark_trace: bool = False
     load_dummy: str | None = None
     enable_expert_parallel: bool = False
+    fake_eplb: bool = False
+    # Width the MoE shards experts for when DP-attention simulates a deployment
+    # wider than the box (set by CoreManager); 0 = not simulating.
+    # `parallel_config.data_parallel_size` stays the real rank count, since it
+    # sizes the process group and the token collectives.
+    dp_logical_size: int = 0
     master_addr: str = "127.0.0.1"
     graph_bs: list[int] | None = None
     enable_dp_attention: bool = False
@@ -1532,6 +1577,28 @@ class Config:
     # coordination between prefill and decode. When False (default),
     # use plain separate streams with no CU masking.
     disagg_constrained: bool = False
+
+    @property
+    def tp_world_size(self) -> int:
+        """Number of TP worker processes actually launched.
+
+        `tensor_parallel_size` is the *logical* width -- how many shards every
+        weight is cut into. Under `--fake-eplb` on a box with fewer visible
+        devices than `-tp`, only the first `tp_world_size` of those shards get
+        a process, reproducing the first N devices of the larger deployment.
+        See `atom/distributed/simulated_tp.py`.
+
+        Gated on `fake_eplb` because such a run's output is garbage anyway;
+        without it, an oversized `-tp` keeps raising in ModelRunner instead of
+        silently running smaller. A property, not a field: `enable_dp_attention`
+        rewrites `tensor_parallel_size` after Config is built.
+        """
+        tp = self.tensor_parallel_size
+        if not self.fake_eplb:
+            return tp
+        # Does not create a CUDA context, so it is safe in the parent process.
+        visible = torch.cuda.device_count()
+        return visible if 0 < visible < tp else tp
 
     def _set_cudagraph_sizes(self):
         if self.compilation_config.cudagraph_capture_sizes:

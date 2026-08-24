@@ -18,7 +18,6 @@ Float8_e4m3fnuz`). This test locks in that fix for both dialects.
 """
 
 import sys
-import types
 import unittest
 
 import pytest
@@ -72,11 +71,48 @@ def _make_wo_a(dtype, out_features=256, in_features=128, block=128):
     return FakeWoA()
 
 
+class _FakeAttention:
+    """The ``self`` that ``process_weights_after_loading`` runs against.
+
+    Refuses an attribute it does not model, by name. A plain
+    ``SimpleNamespace`` let a missing one surface as ``'types.SimpleNamespace'
+    object has no attribute 'n_local_groups'``, raised from inside the method
+    with nothing to say about where to fix it -- which is how all three tests
+    below sat red after production grew reads of ``n_local_groups`` and
+    ``o_lora_rank``, on every machine that can run them. That is only a
+    machine with aiter, because this module ``importorskip``s it and CI has
+    none, so nothing reported it.
+
+    Runtime, not a scan of the method's source. A source scan sees only the
+    literal ``self.X`` in that one body -- not a read through a helper, not
+    one through a base class -- and it re-breaks on a refactor that changed
+    nothing. This fails at the read, wherever the read is.
+
+    Values coherent with ``_make_wo_a``'s 256 x 128 weight: the gfx950
+    batched-GEMM path wants ``out_dim == n_local_groups * o_lora_rank``, so
+    2 x 128. ``_is_gfx950`` is False because this is the gfx942 dtype gate --
+    the BF16 fallback is the path under test, and that flag selects it.
+    """
+
+    def __init__(self, wo_a):
+        self.wo_a = wo_a
+        self.n_local_groups = 2
+        self.o_lora_rank = 128
+        self._is_gfx950 = False
+
+    def __getattr__(self, name):
+        raise AttributeError(
+            f"process_weights_after_loading read self.{name}, which this "
+            f"double does not model -- add it to _FakeAttention with a value "
+            f"coherent with _make_wo_a's weight"
+        )
+
+
 class TestWoADequantFnFnuzGate(unittest.TestCase):
     def _run(self, dtype):
         from atom.models.deepseek_v4 import DeepseekV4Attention
 
-        fake_self = types.SimpleNamespace(wo_a=_make_wo_a(dtype))
+        fake_self = _FakeAttention(_make_wo_a(dtype))
         DeepseekV4Attention.process_weights_after_loading(fake_self)
         return fake_self.wo_a
 
@@ -104,7 +140,7 @@ class TestWoADequantFnFnuzGate(unittest.TestCase):
         weight_before = wo_a.weight
         from atom.models.deepseek_v4 import DeepseekV4Attention
 
-        fake_self = types.SimpleNamespace(wo_a=wo_a)
+        fake_self = _FakeAttention(wo_a)
         DeepseekV4Attention.process_weights_after_loading(fake_self)
         self.assertIs(wo_a.weight, weight_before)
 

@@ -25,7 +25,7 @@ from atom.model_engine.state_runtime import StateTransfer
 from atom.model_ops.attention_mla import MLAModules
 from atom.model_ops.attentions.sub_pool_spec import SubPoolSpec
 from atom.model_ops.dcp_ops import dcp_local_index, dcp_owner_rank
-from atom.utils import CpuGpuBuffer
+from atom.utils import CpuGpuBuffer, pack_rows
 from atom.utils.forward_context import AttentionMetaData, AttnState
 from atom.utils.tbo.ubatch_splitting import (
     UBatchSlice,
@@ -265,6 +265,8 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         self.max_num_blocks_per_seq = (
             config.max_model_len + self.block_size - 1
         ) // self.block_size
+        # Width of every `block_tables` buffer, and of anything gathered from one.
+        self.block_table_cols = self.max_num_blocks_per_seq // self.block_ratio
         # Per-rank attention head count. eagle.propose's mid-step path reads
         # this to gate the `do_attn_metadata_update` branch. Subclasses that
         # need a kernel-minimum-padded count set `self.padded_num_attention_heads`
@@ -280,9 +282,7 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             "slot_mapping": CpuGpuBuffer(self.max_num_batched_tokens, **i64_kwargs),
             "context_lens": CpuGpuBuffer(self.max_bs, **i32_kwargs),
             "block_tables": CpuGpuBuffer(
-                self.max_bs,
-                self.max_num_blocks_per_seq // self.block_ratio,
-                **i32_kwargs,
+                self.max_bs, self.block_table_cols, **i32_kwargs
             ),
             "cu_seqlens_q": CpuGpuBuffer(self.max_bs + 1, **i32_kwargs),
             "cu_seqlens_k": CpuGpuBuffer(self.max_bs + 1, **i32_kwargs),
@@ -299,12 +299,15 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         self.model_runner.forward_vars.update(attn_metadata)
         self.has_sliding_window = hasattr(hf_config, "sliding_window")
 
-    def prepare_block_tables(self, batch: ScheduledBatch):
+    def prepare_block_tables(self, batch: ScheduledBatch, limit: int | None = None):
+        """Marshal the batch's block tables into `forward_vars["block_tables"]`.
+
+        `limit` caps how many rows are taken, for callers scheduling fewer
+        sequences than the batch carries.
+        """
         var = self.model_runner.forward_vars
-        block_tables = var["block_tables"].np
-        for i, block_table in enumerate(batch.block_tables):
-            block_tables[i] = 0
-            block_tables[i, : len(block_table)] = block_table
+        rows = batch.block_tables if limit is None else batch.block_tables[:limit]
+        pack_rows(var["block_tables"].np, rows)
 
     def _mrope_cpu_view(self, num_tokens: int) -> np.ndarray:
         return (

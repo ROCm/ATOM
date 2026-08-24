@@ -31,9 +31,10 @@ from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mla import (
     _MLA_MIN_HEADS,
     MLAAttention,
+    mla_dcp_decode_is_persistent,
     mla_dcp_kernel_num_heads,
 )
-from atom.utils import CpuGpuBuffer, envs
+from atom.utils import CpuGpuBuffer, envs, upload_numpy
 from atom.utils.block_convert import (
     kv_indices_generate_triton,
     mtp_prepare_decode_mla_kernel,
@@ -54,6 +55,11 @@ try:
     )
 except (TypeError, ValueError):
     _MLA_META_SUPPORTS_MAX_SPLIT = False
+
+# Cap on the KV-split budget: aiter cuts the KV walk into
+# `min(num_clusters, cap * batch_size)` parts, and a negative cap means uncapped
+# -- as many parts as the machine has clusters (v1_2_device.cuh:894).
+_MLA_SPLIT_BUDGET_AUTO = -1
 
 
 def _mla_seg_meta_kwargs() -> dict:
@@ -173,13 +179,21 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         # DCP decode all-gathers Q on the head dim, so the head count reaching
         # mla_decode_fwd (and thus the persistent decode metadata) is the padded
-        # gathered width, not the per-rank one.
+        # gathered width, not the per-rank one. Pad it the same way the module
+        # does (mla_dcp_decode_is_persistent picks the width set), so these
+        # descriptors always describe the kernel that will actually run.
         # Only gfx950 runs DCP in persistent mode (gfx942 lacks the lse persistent
         # kernel and stays non-persistent, where this metadata is unused); scale
         # by dcp only there so gfx942 keeps the original per-rank head sizing.
-        if self.dcp_world_size > 1 and dcp_persistent_supported():
+        dcp_persistent = dcp_persistent_supported()
+        if self.dcp_world_size > 1 and dcp_persistent:
             self.persistent_num_heads = mla_dcp_kernel_num_heads(
-                self.num_attention_heads, self.dcp_world_size
+                self.num_attention_heads,
+                self.dcp_world_size,
+                kv_cache_dtype=config.kv_cache_dtype,
+                persistent=mla_dcp_decode_is_persistent(
+                    self.is_sparse, self.dcp_world_size, dcp_persistent
+                ),
             )
         else:
             self.persistent_num_heads = self.padded_num_attention_heads
@@ -481,9 +495,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 **i64_kwargs,
             )
             var[f"{p}block_tables"] = CpuGpuBuffer(
-                ub_max_bs,
-                self.max_num_blocks_per_seq // self.block_ratio,
-                **i32_kwargs,
+                ub_max_bs, self.block_table_cols, **i32_kwargs
             )
             var[f"{p}cu_seqlens_q"] = CpuGpuBuffer(ub_max_bs + 1, **i32_kwargs)
             var[f"{p}cu_seqlens_q"].cpu.copy_(
@@ -558,7 +570,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             "max_seqlen_qo": 1,
             "uni_seqlen_qo": 1,
             "fast_mode": 1,
-            "max_split_per_batch": 16,
+            "max_split_per_batch": _MLA_SPLIT_BUDGET_AUTO,
         }
         work_meta_data = var["sparse_mtp_work_meta_data"]
         work_info_set = var["sparse_mtp_work_info_set"]
@@ -607,7 +619,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             "max_seqlen_qo": max_q_len,
             "uni_seqlen_qo": max_q_len,
             "fast_mode": 1,
-            "max_split_per_batch": 16,
+            "max_split_per_batch": _MLA_SPLIT_BUDGET_AUTO,
         }
         # round-robin CP only lands on the full-build path: decode_update_mla_
         # metadata_v1 has no is_cp_round_robin arg and collapses qlen>1 to 1.
@@ -1123,7 +1135,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 max_seqlen_qo=1,
                 uni_seqlen_qo=1,
                 fast_mode=1,
-                max_split_per_batch=16,
+                max_split_per_batch=_MLA_SPLIT_BUDGET_AUTO,
             )
             attn_metadata.sparse_prefill_work_meta_data = var[
                 "sparse_prefill_work_meta_data"
@@ -1275,14 +1287,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             total_tokens = int(cu[-1])
             # cu doubles as gather_kv_b_proj kv_indptr (block_size=1 → block
             # indptr == token indptr) and flash_attn cu_seqlens_k.
-            kv_indptr_list.append(
-                torch.from_numpy(cu).pin_memory().to(self.device, non_blocking=True)
-            )
-            kv_indices_list.append(
-                torch.from_numpy(chunk_indices)
-                .pin_memory()
-                .to(self.device, non_blocking=True)
-            )
+            kv_indptr_list.append(upload_numpy(cu, self.device))
+            kv_indices_list.append(upload_numpy(chunk_indices, self.device))
             cu_seqlens_k_list.append(kv_indptr_list[-1])  # same tensor
             total_tokens_list.append(total_tokens)
             max_seqlen_k_list.append(int(per_seq_chunk_lens.max(initial=0)))
@@ -1389,9 +1395,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
             cu = np.zeros(bs + 1, dtype=np.int32)
             np.cumsum(global_chunk_len, out=cu[1:])
-            cu_seqlens_k_list.append(
-                torch.from_numpy(cu).pin_memory().to(self.device, non_blocking=True)
-            )
+            cu_seqlens_k_list.append(upload_numpy(cu, self.device))
             total_tokens_list.append(int(cu[-1]))
             max_seqlen_k_list.append(int(global_chunk_len.max(initial=0)))
             padded_local_chunk_seq_lens_list.append(plc.astype(np.int32).tolist())
@@ -1412,11 +1416,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 if slot_segments
                 else np.empty(0, np.int32)
             )
-            local_slot_ids_list.append(
-                torch.from_numpy(slot_ids)
-                .pin_memory()
-                .to(self.device, non_blocking=True)
-            )
+            local_slot_ids_list.append(upload_numpy(slot_ids, self.device))
 
         return MLAChunkContextMetadata(
             kv_indptr=[],
@@ -1511,7 +1511,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             max_seqlen_qo=1,
             uni_seqlen_qo=1,
             fast_mode=1,
-            max_split_per_batch=16,
+            max_split_per_batch=_MLA_SPLIT_BUDGET_AUTO,
         )
         attn_metadata.sparse_prefill_work_meta_data = var[
             "sparse_prefill_work_meta_data"
@@ -2021,7 +2021,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             max_seqlen_qo=max_q_len,
             uni_seqlen_qo=max_q_len,
             fast_mode=1,
-            max_split_per_batch=16,
+            max_split_per_batch=_MLA_SPLIT_BUDGET_AUTO,
         )
 
     def build_for_cudagraph_capture(self, bs: int) -> AttentionMetaData:
@@ -2307,9 +2307,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             c_len = c_hi - c_lo
             cu = np.full(ub_num_reqs + 1, c_len, dtype=np.int32)
             cu[0] = 0
-            kv_indptr_list.append(
-                torch.from_numpy(cu).pin_memory().to(device, non_blocking=True)
-            )
+            kv_indptr_list.append(upload_numpy(cu, device))
             kv_indices_list.append(prefix_slots[c_lo:c_hi])
             total_tokens_list.append(c_len)
             max_seqlen_k_list.append(c_len)

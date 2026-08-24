@@ -102,11 +102,10 @@ from atom.model_ops.v4_kernels import (
     FP4_MQA_PARALLEL_UNIT_NUM,
     fp4_indexer_enabled,
     fp4_mqa_prefill_config,
-    hca_compress_paged_offsets,
     write_v4_paged_decode_indices,
     write_v4_paged_prefill_indices,
 )
-from atom.utils import CpuGpuBuffer
+from atom.utils import CpuGpuBuffer, upload_numpy
 from atom.utils.forward_context import (
     AttentionMetaData,
     AttnState,
@@ -252,9 +251,10 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     for FP8 ragged. Shared by MQA logits and top-k with `next_n=1`; unlike
     the output allocation length, this is NOT capped by `index_topk`."""
     block_tables_per_token: torch.Tensor | None = None
-    """int32 GPU `[decode_rows, max_blocks]` — compressed-cache block table
-    expanded from sequences to query rows. It lets the existing aiter MQA
-    kernels treat every query row as an independent batch with `next_n=1`."""
+    """int32 GPU `[decode_rows, block_table_cols]` — compressed-cache block
+    table expanded from sequences to query rows by a device-side gather. It
+    lets the existing aiter MQA kernels treat every query row as an
+    independent batch with `next_n=1`."""
     kv_indices_hca: torch.Tensor | None = None
     """[hca_indptr[T]] int32 GPU — packed paged offsets for HCA layers
     (HCA compress at slice head + SWA window prefix at tail; layer-invariant)."""
@@ -2394,7 +2394,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # the other two are switched off. They used to be aliased onto this same
         # buffer because all three classes named the same row, which stopped
         # being true when the window started interleaving by class.
-        swa_indices_buf = var["v4_kv_indices_swa"].gpu
+        swa_indices_buf = var["v4_kv_indices_swa"]
         dest_rows = self._dest_row_buffers()
         write_v4_paged_decode_indices(
             state_slot_per_seq=attn_metadata.state_slot_out[:bs],
@@ -2590,8 +2590,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             and _drafter.uses_confidence_schedule
         )
         if ragged_lens is not None or _dspark_ragged_graph:
+            # Pinned staging, not `torch.as_tensor(np, device=cuda)`: that is a
+            # pageable H2D and syncs here, which was the ragged decode bubble.
             attn_metadata.dspark_ragged_lens_gpu = self._stage_dspark_ragged_lens(
-                "v4_dspark_ragged_lens", extend_lens_np, positions.device, pad_to=bs
+                extend_lens_np, self._dspark_ragged_lens_pad_to(bs)
             )
             attn_metadata.dspark_full_q = int(full_q)
 
@@ -2780,11 +2782,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             if dspark_ragged:
                 ragged_lens_buf = np.zeros(padded_bs, dtype=np.int32)
                 ragged_lens_buf[:ub_real_reqs] = ub_extend_lens_np
-                attn_metadata.dspark_ragged_lens_gpu = self._stage_dspark_ragged_lens(
-                    f"{p}v4_dspark_ragged_lens",
-                    ragged_lens_buf,
-                    positions_gpu.device,
-                    pad_to=padded_bs,
+                attn_metadata.dspark_ragged_lens_gpu = torch.as_tensor(
+                    ragged_lens_buf, device=positions_gpu.device
                 )
                 attn_metadata.dspark_full_q = full_q
 
@@ -3624,27 +3623,33 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             in_seq = token_ids - cu[bids]
             rect_dst = bids * full_q + (full_q - ragged_lens_np[bids]) + in_seq
             n_committed_per_token_np[rect_dst] = csa_visible_end_per_token
-            mqa_row_to_batch_np = np.full(rect_bs * full_q, -1, dtype=np.int32)
-            mqa_row_to_batch_np[: scheduled_bs * full_q] = np.repeat(
-                np.arange(scheduled_bs, dtype=np.int32), full_q
-            )
+            # Rows are `full_q` slots per sequence, so row r serves seq
+            # r // full_q, and the rows past the batch are the tail.
+            mqa_valid_rows = scheduled_bs * full_q
+            mqa_row_to_batch_gpu = torch.arange(
+                mqa_valid_rows, dtype=torch.int32, device=self.device
+            ).div_(full_q, rounding_mode="floor")
         else:
-            mqa_row_to_batch_np = np.full(
-                n_committed_per_token_np.shape[0], -1, dtype=np.int32
-            )
-            mqa_row_to_batch_np[:T] = batch_id_per_token_np[:T]
+            # One row per query token, so the row -> seq map is the one
+            # already staged for this forward.
+            mqa_valid_rows = T
+            mqa_row_to_batch_gpu = batch_id_per_token_gpu[:T]
 
         # Expand block tables per query row so the unchanged aiter paged-MQA
-        # kernels can run once with shape `[decode_rows, 1, ...]`.
-        block_tables_np_full = var[f"{buf_prefix_ubatch}block_tables"].np[:scheduled_bs]
-        mqa_bt_buf = var[f"{buf_prefix_ubatch}v4_block_tables_per_token"]
+        # kernels can run once with shape `[decode_rows, 1, ...]`. Source and
+        # index are both on the device, so the gather runs there instead of the
+        # host shipping the expansion; the rows it skips are the tail.
+        mqa_bt = var[f"{buf_prefix_ubatch}v4_block_tables_per_token"]
         mqa_rows = n_committed_per_token_np.shape[0]
-        block_tables_per_token_np = mqa_bt_buf.np[:mqa_rows]
-        block_tables_per_token_np.fill(0)
-        valid_mqa_rows = mqa_row_to_batch_np >= 0
-        block_tables_per_token_np[valid_mqa_rows] = block_tables_np_full[
-            mqa_row_to_batch_np[valid_mqa_rows]
-        ]
+        block_tables_per_token_gpu = mqa_bt[:mqa_rows]
+        torch.index_select(
+            var[f"{buf_prefix_ubatch}block_tables"].gpu,
+            0,
+            mqa_row_to_batch_gpu,
+            out=block_tables_per_token_gpu[:mqa_valid_rows],
+        )
+        if mqa_valid_rows < mqa_rows:  # an empty `zero_` still costs a dispatch
+            block_tables_per_token_gpu[mqa_valid_rows:].zero_()
         # HCA: ragged, per-token len = actual_swa_count + n_committed_hca
         hca_per_tok = actual_swa_count_np + n_committed_hca_per_token
         hca_indptr_np = np.zeros(T_pad + 1, dtype=np.int32)
@@ -3662,47 +3667,26 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             f"{buf_prefix_ubatch}v4_n_committed_per_token",
             n_committed_per_token_np,
         )
-        block_tables_per_token_gpu = mqa_bt_buf.copy_to_gpu(mqa_rows)
         hca_indptr_gpu = self._stage(
             f"{buf_prefix_ubatch}v4_kv_indptr_hca", hca_indptr_np
         )
         # batch_id_per_token + n_committed_csa_per_seq already staged in
         # `_attach_v4_per_fwd_meta`.
 
-        # ----- HCA compress paged offsets (CPU numpy, vectorized) -----
-        block_tables_np_full = var[f"{buf_prefix_ubatch}block_tables"].np[:scheduled_bs]
+        # `ctx/128` HCA entries per token: building this section in numpy and
+        # shipping it was the largest host cost here. The kernel below fills it
+        # from block tables already on the device, tiling each slice exactly
+        # with the SWA prefix, so nothing pre-fills the buffer.
+        hca_indices_buf = var[f"{buf_prefix_ubatch}v4_kv_indices_hca"]
         hca_total_indices = int(hca_indptr_np[T])
-        hca_indices_np = np.full(hca_total_indices, -1, dtype=np.int32)
-        # n_committed_hca_per_seq is int32; gather stays int32.
-        n_h_per_token = n_committed_hca_per_seq[batch_id_per_token_np[:T]]
-        total_hca_entries = int(n_h_per_token.sum())
-        if total_hca_entries > 0:
-            token_indices = np.repeat(np.arange(T, dtype=np.int32), n_h_per_token)
-            cu_n_h = np.zeros(T + 1, dtype=np.int32)
-            np.cumsum(n_h_per_token, out=cu_n_h[1:], dtype=np.int32)
-            entry_offsets = np.arange(total_hca_entries, dtype=np.int32) - np.repeat(
-                cu_n_h[:T], n_h_per_token
-            )
-            # HCA compress section occupies the slice HEAD (offset 0); the SWA
-            # prefix segment sits at the tail, written below by
-            # write_v4_paged_decode_indices.
-            write_pos = hca_indptr_np[token_indices] + entry_offsets
-            bid_expanded = batch_id_per_token_np[token_indices]
-            # Each physical block packs hca_rows_per_block rows (compressor
-            # cache view [num_blocks, hca_rows_per_block, head_dim]); shared
-            # with the prefill kernel + regression test via
-            # hca_compress_paged_offsets.
-            hca_indices_np[write_pos] = hca_compress_paged_offsets(
-                entry_offsets,
-                bid_expanded,
-                block_tables_np_full,
-                envelope_rows,
-                self.hca_rows_per_block,
-            )
-        # Stage to GPU (HCA compress section at head; SWA prefix scattered below).
-        hca_indices_gpu = self._stage(
-            f"{buf_prefix_ubatch}v4_kv_indices_hca", hca_indices_np
+        # `_stage` carried this bound; without it an over-long slice would be a
+        # silent out-of-bounds device write.
+        assert hca_total_indices <= hca_indices_buf.shape[0], (
+            f"V4 buffer 'v4_kv_indices_hca' too small: need {hca_total_indices}, "
+            f"have {hca_indices_buf.shape[0]}. Increase the bound in "
+            f"_alloc_v4_metadata_buffers."
         )
+        hca_indices_gpu = hca_indices_buf[:hca_total_indices]
 
         # ----- Write SWA / CSA / HCA window-prefix paged offsets (1 kernel) -----
         # Kernel computes `n = min(positions[t]+1, win)` and ring-index
@@ -3712,8 +3696,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # persistent forward_vars buffers — no allocator churn (the prior
         # `index_copy_` chain raced under MTP-3 long-prefill; this kernel
         # also fixes that, see skill `debug-agent-locate-kernel`).
-        swa_indices_gpu = var[f"{buf_prefix_ubatch}v4_kv_indices_swa"].gpu
-        csa_indices_gpu = var[f"{buf_prefix_ubatch}v4_kv_indices_csa"].gpu
+        swa_indices_gpu = var[f"{buf_prefix_ubatch}v4_kv_indices_swa"]
+        csa_indices_gpu = var[f"{buf_prefix_ubatch}v4_kv_indices_csa"]
         dest_rows = self._dest_row_buffers(buf_prefix_ubatch)
         write_v4_paged_decode_indices(
             # The slot array must come from the SAME buffer set as
@@ -3740,17 +3724,19 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             T=T,
             win=win,
             geometry=self.pool_geometry,
+            # Same buffer set as batch_id_per_token, for the reason above.
+            hca_block_tables=var[f"{buf_prefix_ubatch}block_tables"].gpu,
+            hca_rows_per_block=self.hca_rows_per_block,
         )
         attn_metadata.swa_dest_rows = dest_rows
 
-        # `skip_prefix_len_csa` is no longer materialized on the decode path —
+        # `skip_prefix_len_csa` is not materialized on the decode path —
         # `csa_translate_pack` is invoked with `window_size = self.window_size`
         # so the kernel derives `skip = min(positions[t]+1, win)` inline,
-        # which is identical to the value we used to write here
-        # (`actual_swa_count_np`). Saves a CPU write + H2D per fwd. The
-        # `v4_skip_prefix_len_csa` forward_var is retained for the (unrelated)
-        # prefill path where skip depends on `chunk_start` and cannot be
-        # derived from positions alone.
+        # which is identical to the value this used to write
+        # (`actual_swa_count_np`). Saves a CPU write + H2D per fwd. Prefill
+        # cannot derive it from positions (skip depends on `chunk_start`) and
+        # uploads its own tensor in `_build_paged_prefill_meta`.
 
         # ----- Stash on attn_metadata for V4Attention.forward consumption -----
         # batch_id_per_token + n_committed_csa_per_seq already set in
@@ -3921,19 +3907,20 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         hca_total = int(hca_indptr_np[T])
 
         # ----- H2D: 4 indptrs + 2 per-seq scalars -----
-        # All non-blocking; sources are per-call temp np arrays, so not a
-        # cross-ubatch race source (the shared-pinned-buffer race is handled by
-        # the stream sync before build_ubatch_prefill_metadata's finally).
-        chunk_start_per_seq_gpu = torch.from_numpy(chunk_start_per_seq_np).to(
-            device, non_blocking=True
+        # Sources are per-call temp np arrays, so not a cross-ubatch race source
+        # (the shared-pinned-buffer race is handled by the stream sync before
+        # build_ubatch_prefill_metadata's finally). Via `upload_numpy` because
+        # the indptrs are `T + 1` long: 64 KB at mnbt 16384, over the pageable
+        # cliff at mnbt 131072.
+        chunk_start_per_seq_gpu = upload_numpy(chunk_start_per_seq_np, device)
+        n_committed_hca_per_seq_gpu = upload_numpy(
+            np.asarray(n_committed_hca_per_seq_np[:scheduled_bs], dtype=np.int32),
+            device,
         )
-        n_committed_hca_per_seq_gpu = torch.from_numpy(
-            np.asarray(n_committed_hca_per_seq_np[:scheduled_bs], dtype=np.int32)
-        ).to(device, non_blocking=True)
-        ext_indptr = torch.from_numpy(ext_indptr_np).to(device, non_blocking=True)
-        swa_indptr = torch.from_numpy(swa_indptr_np).to(device, non_blocking=True)
-        csa_indptr = torch.from_numpy(csa_indptr_np).to(device, non_blocking=True)
-        hca_indptr = torch.from_numpy(hca_indptr_np).to(device, non_blocking=True)
+        ext_indptr = upload_numpy(ext_indptr_np, device)
+        swa_indptr = upload_numpy(swa_indptr_np, device)
+        csa_indptr = upload_numpy(csa_indptr_np, device)
+        hca_indptr = upload_numpy(hca_indptr_np, device)
 
         # Reuse already-on-GPU tensors (populated upstream).
         # Cast positions to int32: production var["positions"] is int64 but
@@ -4002,9 +3989,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # `kv_indices_prefix_csa[indptr[t]:indptr[t+1]]`; the SWA prefix
         # (length `skip`) occupies the slice TAIL, written by the builder.
         # Matches the per-token prefix_swa_count vector we just computed on CPU.
-        skip_csa_gpu = torch.from_numpy(prefix_swa_count_np).to(
-            device, non_blocking=True
-        )
+        skip_csa_gpu = upload_numpy(prefix_swa_count_np, device)
 
         # ----- Publish on attn_metadata -----
         attn_metadata.kv_indices_extend = ext_indices[:ext_total]
@@ -4083,15 +4068,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         """Populate `forward_vars["block_tables"]` from the batch and return
         the GPU view sliced to `scheduled_bs` rows.
 
-        Mirrors `CommonAttentionBuilder.prepare_block_tables` but is invoked
-        unconditionally (parent only calls it when has_cached).
+        Defers the marshal to `CommonAttentionBuilder.prepare_block_tables`,
+        but is invoked unconditionally (parent only calls it when has_cached).
         """
-        var = self.model_runner.forward_vars
-        block_tables_np = var["block_tables"].np
-        for i, block_table in enumerate(batch.block_tables[:scheduled_bs]):
-            block_tables_np[i] = 0
-            block_tables_np[i, : len(block_table)] = block_table
-        return var["block_tables"].copy_to_gpu(scheduled_bs)
+        self.prepare_block_tables(batch, limit=scheduled_bs)
+        return self.model_runner.forward_vars["block_tables"].copy_to_gpu(scheduled_bs)
 
     def _populate_state_slot_mappings(
         self, batch: ScheduledBatch, scheduled_bs: int, return_cpu: bool = False
@@ -4297,8 +4278,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # DSpark TRUE-FLAT graph: capture must take the same ragged indexer branch
         # and rect shape [bs, full_q] as replay, else the graph mismatches. The
         # synthetic batch's per-seq lengths (`extend_lens_np`, ragged under
-        # zero-copy-q else uniform max_q_len) drive the indexer ragged topk — same
-        # construction (`torch.as_tensor`) as replay's prepare_decode branch.
+        # zero-copy-q else uniform max_q_len) drive the indexer ragged topk.
         drafter = getattr(self.model_runner, "drafter", None)
         if (
             self.model_runner.config.dspark.ragged
@@ -4306,9 +4286,23 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             and drafter.uses_confidence_schedule
         ):
             full_q_real = drafter.mtp_k + 1
-            attn_metadata.dspark_ragged_lens_gpu = self._stage_dspark_ragged_lens(
-                "v4_dspark_ragged_lens", extend_lens_np, positions.device, pad_to=bs
-            )
+            pad_to = self._dspark_ragged_lens_pad_to(bs)
+            if pad_to is not None:
+                # AF + DP: the core captured here bakes this tensor's address, so
+                # capture has to write the SAME buffer replay does — otherwise
+                # every replay reads this capture's throwaway allocation.
+                attn_metadata.dspark_ragged_lens_gpu = self._stage_dspark_ragged_lens(
+                    extend_lens_np, pad_to
+                )
+            else:
+                # Nothing captures the core here and this is a capture-time
+                # allocation, so a pageable H2D costs nothing: main's
+                # `torch.full((bs,), max_q_len)`, widened to the ragged lengths
+                # (identical when the synthetic batch is the uniform rectangle).
+                attn_metadata.dspark_ragged_lens_gpu = torch.as_tensor(
+                    extend_lens_np.astype(np.int32, copy=False),
+                    device=positions.device,
+                )
             attn_metadata.dspark_full_q = int(full_q_real)
 
         # Build compress_plans + per-fwd meta + indexer meta via the same
@@ -4363,36 +4357,47 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
     # Helpers.                                                           #
     # ------------------------------------------------------------------ #
 
-    def _dspark_ragged_lens_needs_staging(self) -> bool:
-        """Fixed-address staging for the dspark ragged verify-lengths: AF+DP needs
-        the baked pointer, everywhere else it costs acceptance (tp8 49.9% vs 60%).
+    def _dspark_ragged_lens_pad_to(self, bs: int) -> int | None:
+        """Row count the dspark ragged verify-lengths must be padded to, or None
+        to keep the real per-seq count.
+
+        AF + DP replays a captured attention core that baked BOTH this tensor's
+        address and its row count, so every step has to present `bs` rows with
+        the tail zeroed or the core reads whatever the shorter copy left behind.
+        Nothing else captures the core, and padding costs acceptance there, so
+        every other configuration keeps the real count.
         """
         cfg = self.model_runner.config
         mode = getattr(cfg.compilation_config, "cudagraph_mode", None)
         if mode is None or not mode.is_attn_ffn_piecewise():
-            return False
-        return getattr(cfg.parallel_config, "data_parallel_size", 1) > 1
+            return None
+        if getattr(cfg.parallel_config, "data_parallel_size", 1) <= 1:
+            return None
+        return int(bs)
 
-    def _stage_dspark_ragged_lens(
-        self, name: str, arr, device, pad_to: int | None = None
-    ) -> torch.Tensor:
-        """Materialize the dspark ragged verify-lengths GPU tensor.
+    def _stage_dspark_ragged_lens(self, extend_lens_np, pad_to: int | None):
+        """Pinned async H2D of the per-seq verify lengths, returning the GPU view.
 
-        Fixed-address staging only where correctness needs it (AF + DP); every
-        other path keeps the fresh per-step tensor, which is what the acceptance
-        rate wants. See `_dspark_ragged_lens_needs_staging`.
+        Pinned staging, never `torch.as_tensor(np, device=cuda)`: that is a
+        pageable H2D and synchronizes, which was the ragged decode bubble #1861
+        removed. `forward_vars["ragged_extend"]` is one buffer at one address for
+        both capture and replay, which is also what the AF captured core needs --
+        so the fixed address costs nothing extra and only `pad_to` varies.
         """
-        arr = arr.astype(np.int32, copy=False)
-        if not self._dspark_ragged_lens_needs_staging():
-            return torch.as_tensor(arr, device=device)
-        if pad_to is not None and pad_to > arr.shape[0]:
-            padded = np.zeros(pad_to, dtype=np.int32)
-            padded[: arr.shape[0]] = arr
-            arr = padded
-        return self._stage(name, arr)
+        buf = self.model_runner.forward_vars["ragged_extend"]
+        n = int(extend_lens_np.size)
+        buf.np[:n] = extend_lens_np
+        if pad_to is not None and pad_to > n:
+            buf.np[n:pad_to] = 0
+            n = int(pad_to)
+        return buf.copy_to_gpu(n)
 
     def _alloc_v4_metadata_buffers(self) -> None:
-        """Pre-allocate every CpuGpuBuffer the V4 metadata builder writes into.
+        """Pre-allocate every buffer the V4 metadata builder writes into.
+
+        A `CpuGpuBuffer` where the host writes and the device reads, a bare
+        device tensor where both ends are kernels — the pinned host half is
+        the expensive part and only the staged buffers earn it.
 
         Bounds:
           - per-seq:        max_bs
@@ -4431,11 +4436,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # buffer on every path, forked or not, so the captured decode graph sees
         # a stable address.
         bufs["v4_meta_state_slot_in"] = CpuGpuBuffer(bs, **i32)
-        # DSpark ragged verify lengths are read inside the captured AF attention
-        # core via attn_metadata. Stage them into a fixed-address buffer so graph
-        # replay sees refreshed per-step contents instead of the capture-time
-        # torch.as_tensor allocation.
-        bufs["v4_dspark_ragged_lens"] = CpuGpuBuffer(bs, **i32)
 
         # Phase B: paged-decode index buffers (consumed by Phase C/E).
         # Sized to worst-case decode shape `T = max_bs * (1 + max_spec_steps)`
@@ -4449,17 +4449,22 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # level data — downstream kernels do
         # `data[batch_id_per_token[t]]` instead of carrying a [T]-sized copy.
         T_dec = self.max_decode_tokens
-        bufs["v4_kv_indices_swa"] = CpuGpuBuffer(T_dec * win, **i32)
-        bufs["v4_kv_indices_csa"] = CpuGpuBuffer(T_dec * (win + self.index_topk), **i32)
-        bufs["v4_kv_indices_hca"] = CpuGpuBuffer(
+        # Device-only: written and read entirely by kernels, so a host mirror
+        # would be tens of MB of pinned memory nothing writes.
+        bufs["v4_kv_indices_swa"] = torch.zeros(T_dec * win, **i32)
+        bufs["v4_kv_indices_csa"] = torch.zeros(T_dec * (win + self.index_topk), **i32)
+        bufs["v4_kv_indices_hca"] = torch.zeros(
             T_dec * (win + self.max_committed_hca), **i32
         )
         bufs["v4_kv_indptr_swa"] = CpuGpuBuffer(T_dec + 1, **i32)
         bufs["v4_kv_indptr_csa"] = CpuGpuBuffer(T_dec + 1, **i32)
         bufs["v4_kv_indptr_hca"] = CpuGpuBuffer(T_dec + 1, **i32)
         bufs["v4_n_committed_per_token"] = CpuGpuBuffer(T_dec, **i32)
-        _bt_cols = self.model_runner.forward_vars["block_tables"].np.shape[1]
-        bufs["v4_block_tables_per_token"] = CpuGpuBuffer(T_dec, _bt_cols, **i32)
+        # Device-only, and as wide as the `block_tables` it gathers from: a host
+        # mirror would be `T_dec * cols * 4` of pinned memory nothing writes.
+        bufs["v4_block_tables_per_token"] = torch.zeros(
+            T_dec, self.block_table_cols, **i32
+        )
         # Where each decode token's own KV row goes, one buffer per compress
         # class. The fused SWA write reads these rather than deriving the row,
         # so the window layout stays inside this repo (see
@@ -4541,11 +4546,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # Under CUDAGraph capture they land in the graph's private pool
         # and replay reuses the same address; eager keeps the standard
         # caching-allocator fast path.
-        # Per-token write offset consumed by `csa_translate_pack` (decode path
-        # fills with `window_size`; prefill path will fill with per-token
-        # prior_swa_count once the new dual-source kernel lands). Allocated
-        # `mnbt` (worst-case prefill) so prefill writes don't overflow.
-        bufs["v4_skip_prefix_len_csa"] = CpuGpuBuffer(mnbt, **i32)
 
         # Compress plan buffers (per-ratio) — pre-allocated for CUDAGraph
         # plan-tensor address stability. `make_compress_plans(..., plan_buffers=)`
@@ -4604,7 +4604,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         bs = self.max_bs
         win = self.window_size
         T_dec = self.max_decode_tokens
-        max_blocks = self.max_num_blocks_per_seq // self.block_ratio
 
         for ub_idx in range(self._NUM_TBO_UBATCHES):
             p = f"ub{ub_idx}_"
@@ -4612,26 +4611,25 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             # for the non-TBO path; cloned here so each ubatch slices its own).
             bufs[f"{p}positions"] = CpuGpuBuffer(T_dec, **i64)
             bufs[f"{p}context_lens"] = CpuGpuBuffer(bs, **i32)
-            bufs[f"{p}block_tables"] = CpuGpuBuffer(bs, max_blocks, **i32)
+            bufs[f"{p}block_tables"] = CpuGpuBuffer(bs, self.block_table_cols, **i32)
             bufs[f"{p}cu_seqlens_q"] = CpuGpuBuffer(bs + 1, **i32)
 
             # V4 decode metadata buffers.
             bufs[f"{p}v4_meta_state_slot_out"] = CpuGpuBuffer(bs, **i32)
             bufs[f"{p}v4_meta_state_slot_in"] = CpuGpuBuffer(bs, **i32)
-            bufs[f"{p}v4_dspark_ragged_lens"] = CpuGpuBuffer(bs, **i32)
-            bufs[f"{p}v4_kv_indices_swa"] = CpuGpuBuffer(T_dec * win, **i32)
-            bufs[f"{p}v4_kv_indices_csa"] = CpuGpuBuffer(
+            bufs[f"{p}v4_kv_indices_swa"] = torch.zeros(T_dec * win, **i32)
+            bufs[f"{p}v4_kv_indices_csa"] = torch.zeros(
                 T_dec * (win + self.index_topk), **i32
             )
-            bufs[f"{p}v4_kv_indices_hca"] = CpuGpuBuffer(
+            bufs[f"{p}v4_kv_indices_hca"] = torch.zeros(
                 T_dec * (win + self.max_committed_hca), **i32
             )
             bufs[f"{p}v4_kv_indptr_swa"] = CpuGpuBuffer(T_dec + 1, **i32)
             bufs[f"{p}v4_kv_indptr_csa"] = CpuGpuBuffer(T_dec + 1, **i32)
             bufs[f"{p}v4_kv_indptr_hca"] = CpuGpuBuffer(T_dec + 1, **i32)
             bufs[f"{p}v4_n_committed_per_token"] = CpuGpuBuffer(T_dec, **i32)
-            bufs[f"{p}v4_block_tables_per_token"] = CpuGpuBuffer(
-                T_dec, max_blocks, **i32
+            bufs[f"{p}v4_block_tables_per_token"] = torch.zeros(
+                T_dec, self.block_table_cols, **i32
             )
             for name in _DEST_ROW_BUFFERS.values():
                 bufs[f"{p}{name}"] = CpuGpuBuffer(T_dec, **i32)

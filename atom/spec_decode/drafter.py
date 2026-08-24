@@ -225,6 +225,16 @@ class Drafter(abc.ABC):
         drafter uses fixed-length verification."""
         return None
 
+    @property
+    def precompute_duplicates_propose(self) -> bool:
+        """Is `precompute_context_kv` the pass propose's first draft step redoes?
+
+        True (EAGLE) means the two must never both run: the second is a
+        collective the peers on `dummy_execution` do not mirror. False (DSpark)
+        means it writes storage propose only reads, so it always runs.
+        """
+        return False
+
     # ---- aux-hidden-state ownership (drafter-owned, hook-based) ----
     def arm_aux_capture(self, target_model: nn.Module) -> None:
         """Install drafter-owned forward hooks on the target's decoder layers per

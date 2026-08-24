@@ -13,6 +13,7 @@ from atom.config import (
     DCPConfig,
     DSparkConfig,
     EPLBConfig,
+    ParallelConfig,
     SpeculativeConfig,
 )
 from atom.model_engine.engine_core_mgr import DP_LB_DEFAULT, DP_LB_STRATEGIES
@@ -41,6 +42,11 @@ class EngineArgs:
     pipeline_parallel_size: int = 1
     prefill_context_parallel_size: int = 1
     data_parallel_size: int = 1
+    data_parallel_size_local: int | None = None
+    data_parallel_rank: int = 0
+    data_parallel_master_ip: str = "127.0.0.1"
+    data_parallel_master_port: int = 29500
+    data_parallel_base_port: int | None = None
     enforce_eager: bool = False
     enable_prefix_caching: bool = True
     port: int = 8006
@@ -61,6 +67,7 @@ class EngineArgs:
     cudagraph_mode: str = "FULL"
     load_dummy: str | None = None
     enable_expert_parallel: bool = False
+    fake_eplb: bool = False
     torch_profiler_dir: str | None = None
     enable_dp_attention: bool = False
     dp_load_balance: str = DP_LB_DEFAULT
@@ -133,6 +140,49 @@ class EngineArgs:
             type=int,
             default=1,
             help="Data parallel size.",
+        )
+        parser.add_argument(
+            "--data-parallel-size-local",
+            type=int,
+            default=None,
+            help=(
+                "Number of data-parallel ranks to run on THIS node. Defaults "
+                "to --data-parallel-size (single-node). Set it lower to give "
+                "this node one slice of a multi-node run."
+            ),
+        )
+        parser.add_argument(
+            "--data-parallel-rank",
+            type=int,
+            default=0,
+            help=(
+                "First GLOBAL data-parallel rank owned by this node. Node 0 "
+                "uses 0; the second node of a 2x4 run uses 4."
+            ),
+        )
+        parser.add_argument(
+            "--data-parallel-master-ip",
+            type=str,
+            default="127.0.0.1",
+            help="IP of the coordinator node (global DP rank 0).",
+        )
+        parser.add_argument(
+            "--data-parallel-master-port",
+            type=int,
+            default=29500,
+            help=(
+                "Rendezvous port for the DP process group. Engine sockets are "
+                "derived from it (base = port + 100, 3 ports per DP rank)."
+            ),
+        )
+        parser.add_argument(
+            "--data-parallel-base-port",
+            type=int,
+            default=None,
+            help=(
+                "Rendezvous port for model-runner distributed init. Set "
+                "explicitly for multi-node launches."
+            ),
         )
         parser.add_argument(
             "--decode-context-parallel-size",
@@ -221,6 +271,13 @@ class EngineArgs:
             "--enable-expert-parallel",
             action="store_true",
             help="Enable expert parallel(EP MoE).",
+        )
+        parser.add_argument(
+            "--fake-eplb",
+            action="store_true",
+            help="Replace MoE router logits with a synthetic uniform "
+            "distribution so every expert is selected equally. For "
+            "benchmarking the balanced-load upper bound only.",
         )
         parser.add_argument(
             "--torch-profiler-dir",
@@ -608,6 +665,20 @@ class EngineArgs:
         # --dcp-config (JSON dict) → DCPConfig object, passed through as
         # Config.dcp_config.
         kwargs["dcp_config"] = DCPConfig.from_dict(kwargs.pop("dcp_config"))
+
+        # DP topology -> ParallelConfig. `data_parallel_size` stays in kwargs
+        # too: LLMEngine still reads the loose kwarg on the legacy path.
+        parallel_config_kwargs = {
+            "data_parallel_size": kwargs["data_parallel_size"],
+            "data_parallel_size_local": kwargs.pop("data_parallel_size_local"),
+            "data_parallel_rank": kwargs.pop("data_parallel_rank"),
+            "data_parallel_master_ip": kwargs.pop("data_parallel_master_ip"),
+            "data_parallel_master_port": kwargs.pop("data_parallel_master_port"),
+        }
+        base_port = kwargs.pop("data_parallel_base_port")
+        if base_port is not None:
+            parallel_config_kwargs["data_parallel_base_port"] = base_port
+        kwargs["parallel_config"] = ParallelConfig(**parallel_config_kwargs)
 
         logger.info(f"Engine kwargs: {kwargs}")
 

@@ -168,22 +168,63 @@ def mla_kernel_num_heads(num_heads: int) -> int:
 # mapping the round-robin causal mask runs on. DCP decode must avoid them.
 _MLA_DCP_KERNEL_WIDTHS = (16, 32, 64, 128)
 
+# gqa=64 is the one width above that aiter serves only from the PERSISTENT
+# decode kernel when Q and the KV cache are both fp8 -- asm_mla.cu aborts the
+# process otherwise ("fp8/fp8 with gqa_ratio=64 only supports persistent mode"),
+# the same constraint supports_dpa_persistent_mode is built around. A DCP decode
+# that cannot be persistent has to skip it and gather straight to 128.
+_MLA_DCP_KERNEL_WIDTHS_FP8_NON_PERSISTENT = (16, 32, 128)
+
 _dcp_kernel_width_warned = False
 
 
+def mla_dcp_decode_is_persistent(
+    is_sparse: bool, dcp_world_size: int, dcp_persistent_supported: bool
+) -> bool:
+    """Whether a DCP decode will reach ``mla_decode_fwd`` in persistent mode.
+
+    The live decision is made per step in ``_forward_decode``; this mirrors the
+    parts of it that are already settled at construction time, because the
+    gathered head width has to be fixed there (it sizes the persistent work
+    descriptors as well as the kernel's nhead). Sparse MLA under DCP is forced
+    non-persistent (its sparse region length varies per layer, which metadata
+    built once per step cannot describe), only gfx950 ships the lse-emitting
+    persistent kernel DCP needs, and persistent mode wants page_size 1. The one
+    remaining runtime gate, ``dpa_persistent_supported``, is unconditionally
+    true, so nothing here can claim persistent mode that the step then refuses.
+
+    ``dcp_persistent_supported`` is taken as an argument rather than queried
+    here, the way ``should_use_persistent_mode`` takes it: callers already cache
+    it to keep ``get_gfx()`` off the per-forward path.
+    """
+    if dcp_world_size <= 1 or is_sparse:
+        return False
+    return dcp_persistent_supported and envs.ATOM_MLA_PAGE_SIZE <= 1
+
+
 def mla_dcp_kernel_num_heads(
-    num_heads: int, dcp_world_size: int, min_kernel_heads: int = _MLA_MIN_HEADS
+    num_heads: int,
+    dcp_world_size: int,
+    min_kernel_heads: int = _MLA_MIN_HEADS,
+    *,
+    kv_cache_dtype: str,
+    persistent: bool,
 ) -> int:
     """Width to pad the GATHERED query heads to for a DCP decode.
 
     DCP decode all-gathers Q on the head dim before calling the kernel, so what
     gets dispatched on is ``num_heads * dcp_world_size``; a single rank's head
     count is never seen and is the wrong thing to pad. Round that gathered width
-    up to one aiter serves natively -- the folded widths are no use here because
-    the fold breaks the round-robin causal mask (see above).
+    up to one aiter serves natively for the mode this decode actually runs in --
+    the folded widths are no use here because the fold breaks the round-robin
+    causal mask (see above), and gqa=64 is off the table on a non-persistent fp8
+    decode (see _MLA_DCP_KERNEL_WIDTHS_FP8_NON_PERSISTENT).
     """
     gathered = max(num_heads * dcp_world_size, min_kernel_heads)
-    for width in _MLA_DCP_KERNEL_WIDTHS:
+    widths = _MLA_DCP_KERNEL_WIDTHS
+    if not persistent and kv_cache_dtype.startswith("fp8"):
+        widths = _MLA_DCP_KERNEL_WIDTHS_FP8_NON_PERSISTENT
+    for width in widths:
         if width >= gathered:
             return width
     global _dcp_kernel_width_warned
@@ -191,7 +232,7 @@ def mla_dcp_kernel_num_heads(
         _dcp_kernel_width_warned = True
         logger.warning(
             f"DCP decode gathers {gathered} query heads, past the widest natively "
-            f"dispatched MLA kernel ({_MLA_DCP_KERNEL_WIDTHS[-1]}); falling back to "
+            f"dispatched MLA kernel ({widths[-1]}); falling back to "
             "the folded kernel, which is incorrect for MTP (round-robin causal "
             "mask). Lower decode_context_parallel_size or raise tp."
         )
@@ -519,7 +560,15 @@ class MLAAttention(nn.Module):
         self.dcp_head_pad = 0
         if dcp_world_size > 1:
             self.dcp_kernel_num_heads = mla_dcp_kernel_num_heads(
-                self.num_heads, dcp_world_size, self.min_query_heads
+                self.num_heads,
+                dcp_world_size,
+                self.min_query_heads,
+                kv_cache_dtype=self.kv_cache_dtype,
+                persistent=mla_dcp_decode_is_persistent(
+                    self.is_sparse_mla,
+                    dcp_world_size,
+                    self.dcp_persistent_supported,
+                ),
             )
             self.dcp_head_pad = (
                 self.dcp_kernel_num_heads - self.num_heads * dcp_world_size

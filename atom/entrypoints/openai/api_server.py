@@ -15,7 +15,6 @@ Usage:
 import asyncio
 import base64
 import binascii
-import gc
 import io
 import json
 import logging
@@ -26,23 +25,36 @@ import uuid
 from asyncio import AbstractEventLoop
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from PIL import Image
 from transformers import AutoProcessor, AutoTokenizer
+
+if TYPE_CHECKING:
+    from PIL import Image
 
 from atom import SamplingParams
 from atom.model_engine.arg_utils import EngineArgs
 from atom.model_engine.llm_engine import _load_tokenizer
 from atom.model_engine.multimodal import build_multimodal_inputs
 from atom.model_engine.request import RequestOutput
-from atom.utils import envs
+from atom.model_engine.sequence import new_token_ids
 from atom.utils.arg_parser import FlexibleArgumentParser
+from atom.utils.gc_utils import (
+    freeze_gc_heap,
+    maybe_attach_gc_debug_callback,
+    tune_gc,
+)
 
-from .chat_encoders import apply_chat_template, load_custom_message_encoder
+from .chat_encoders import (
+    apply_chat_template,
+    chat_template_source,
+    load_custom_message_encoder,
+    render_probe_prompt,
+    resolve_reasoning_toggle,
+)
 from .metrics import AtomMetricsExporter
 from .protocol import (
     DEFAULT_TEMPERATURE,
@@ -54,21 +66,26 @@ from .protocol import (
     ModelList,
 )
 from .reasoning import (
+    ReasoningChannel,
     prompt_starts_in_reasoning,
     prompt_tokens_start_in_reasoning,
+    template_opens_reasoning_implicitly,
+    thinking_switched_off,
 )
+from .reasoning_dialects import resolve_dialect
 from .serving_anthropic import (
+    AnthropicBlocks,
     AnthropicMessagesRequest,
     anthropic_to_openai_messages,
     anthropic_to_openai_tools,
     build_anthropic_response,
-    stream_content_block_delta,
-    stream_content_block_start,
-    stream_content_block_stop,
+    completes_a_tool_call,
+    read_whole_blocks,
+    stream_failure_frames,
     stream_message_delta,
     stream_message_start,
     stream_message_stop,
-    stream_signature_delta,
+    tool_event_frames,
 )
 from .serving_chat import (
     build_chat_response,
@@ -78,6 +95,7 @@ from .serving_chat import (
     stream_chat_response,
     stream_chat_response_fanout,
     validate_chat_request,
+    validate_tool_list,
 )
 from .serving_completion import (
     build_completion_response,
@@ -86,7 +104,20 @@ from .serving_completion import (
     stream_completion_response_fanout,
 )
 from .sse import event_frame
-from .streaming_dispatch import StreamBatchDispatcher, StreamOutputCollector
+from .streaming_dispatch import (
+    FrameWait,
+    StreamBatchDispatcher,
+    StreamOutputCollector,
+)
+from .tool_parser import (
+    ToolCallStreamParser,
+    flatten_tool_events,
+)
+from .tool_parser.registry import (
+    TOOL_CALL_PARSER_HELP,
+    forbids_tool_calls,
+    resolve_tool_call_parser,
+)
 
 # Configure logging
 logger = logging.getLogger("atom")
@@ -102,6 +133,20 @@ DEFAULT_PORT = 8000
 
 engine = None
 tokenizer: AutoTokenizer | None = None
+# The tool-call format this model emits, resolved once at startup from its
+# chat template. `None` means none was recognised and tool calls, if any, are
+# delivered as plain text -- said out loud at startup, never discovered here.
+tool_call_parser_cls: type | None = None
+# Whether this model's output begins inside the reasoning channel even when
+# nothing in the prompt or the output says so -- DeepSeek-R1 closes a block it
+# never opens. Read from the chat template at startup, because a single
+# response cannot tell you: its first token is already reasoning and reads
+# like an answer.
+model_starts_in_reasoning: bool = False
+reasoning_dialect: Any = None
+# (kwarg, off-value) the chat template reads to switch reasoning off, resolved
+# at startup by asking it; None when the template offers no such switch.
+reasoning_toggle: tuple[str, Any, Any] | None = None
 processor: Any | None = None
 model_name: str = ""
 default_chat_template_kwargs: dict[str, Any] = {}
@@ -111,7 +156,184 @@ _stream_loops: dict[str, AbstractEventLoop] = {}
 _request_start_times: dict[str, float] = {}
 _request_logger: logging.Logger | None = None
 _stream_batch_dispatcher: StreamBatchDispatcher | None = None
+
+
+def reasoning_channel(
+    prompt_opens: bool, *, template_kwargs: dict[str, Any] | None
+) -> ReasoningChannel:
+    """How to read this request's reasoning channel.
+
+    One place, because it is one answer and both endpoints and both delivery
+    modes need the same one. The dialect is the model's, resolved at startup;
+    what varies per request is whether the output begins inside the channel.
+
+    The render is why that is not just the model-level fact. A prompt that
+    switched reasoning off does not open the channel, and
+    `model_starts_in_reasoning` -- which describes the template with reasoning
+    *on* -- was OR-ed in regardless, so on a model that begins inside the
+    channel implicitly an ordinary answer came back entirely as
+    `reasoning_content` with `content` empty.
+
+    ``template_kwargs``, not the request's own `thinking`: the server's
+    defaults and the client's `chat_template_kwargs` switch it too, and only
+    the merged dict has all three. Reasoning that was asked not to happen and
+    happened anyway is still reasoning -- `anthropic_drop_reasoning` exists to
+    withhold it, and it can only withhold what was separated.
+    """
+    switched_off = thinking_switched_off(template_kwargs, reasoning_toggle)
+    return ReasoningChannel(
+        dialect=reasoning_dialect,
+        starts_open=prompt_opens or (model_starts_in_reasoning and not switched_off),
+    )
+
+
+def anthropic_thinking_enabled(request: Any) -> bool:
+    """Did this request ask for a reasoning channel?
+
+    `thinking` is absent on most requests and `{"type": "disabled"}` is the
+    spelling for switching it off, which is a non-empty dict and therefore
+    truthy -- so `bool(request.thinking)` read the standard off-switch as on.
+    """
+    thinking = getattr(request, "thinking", None) or {}
+    return bool(thinking) and thinking.get("type") != "disabled"
+
+
+def anthropic_template_kwargs(
+    request: Any, toggle: tuple[str, Any, Any] | None
+) -> dict:
+    """How `thinking` reaches the model: by not asking it to think.
+
+    `thinking: disabled` is answered where the answer costs nothing -- in the
+    prompt. The chat template's own switch is set, so the model emits no
+    reasoning, so there is none to separate, none to discard, and none for the
+    tool parser to misread. This is what SGLang does with the same field and
+    what vLLM gets structurally by having no such field at all.
+
+    Everything downstream is then unconditional, which is the point. Three
+    attempts to handle an unwanted chain of thought *after* generating it each
+    broke something else: discarding it returned an empty message, relabelling
+    it as `text` handed the client the thing it declined, and declining to
+    separate it fed a chain of thought to the tool parser, which read one
+    model's musing about `<function=NAME>` as a call to a tool named `NAME`.
+    The reasoning that is never produced needs none of that.
+
+    Only when the field is actually present, which is also what SGLang keys
+    on. Anthropic's default is thinking-off, but reading an absent field as
+    "switch this model's reasoning off" would silently change what every
+    existing caller gets back from a reasoning model. Absent means unstated,
+    and unstated leaves the model's own default alone.
+
+    Both directions go through the resolved toggle. Writing a hardcoded
+    `thinking=True` for the on direction is a no-op on any template that reads
+    another name -- the whole Qwen family -- so an explicit opt-in was
+    discarded silently against a server default of off.
+
+    ``toggle`` is ``None`` for a model whose template has no switch. There is
+    then nothing to put in the prompt and `anthropic_drop_reasoning` takes
+    over.
+    """
+    if getattr(request, "thinking", None) is None:
+        return {}
+    if toggle is None:
+        return {}
+    name, off_value, on_value = toggle
+    return {name: on_value if anthropic_thinking_enabled(request) else off_value}
+
+
+def anthropic_drop_reasoning(request: Any) -> bool:
+    """Must this response's reasoning be withheld from the client?
+
+    Whenever the request did not ask for it. Answering in the prompt is
+    strictly better and `anthropic_template_kwargs` does it wherever it can,
+    but that only reaches models whose template has a switch -- and it only
+    reaches the ones that *asked*, since an absent field leaves the model's
+    default alone. This is everything else.
+
+    Withheld, not left unseparated: the reasoning still goes through the
+    reasoning filter, so the tool parser never sees a model musing about
+    `<function=NAME>` and calls a tool named `NAME`. Only the `thinking`
+    blocks are dropped. A response that was *nothing but* reasoning then ends
+    on an empty text block, which is the honest answer to "do not think" --
+    the previous three attempts to fix this downstream all failed by trying to
+    salvage content out of it.
+
+    Absent counts as off *here*, and that is deliberately not what the
+    prompt-level answer does. The two are different questions. What to put in
+    the prompt is about the model's own default, and overriding a default
+    nobody asked about would change what every existing caller gets from a
+    reasoning model. What to put in the *response* is about this protocol's
+    default, and Anthropic's is thinking-off: a client that never sends the
+    field has no reason to expect `thinking` blocks, and one that validates
+    block types or verifies the signature rejects them. Reading absent as
+    "show it" sent a random-signature `thinking` block to every Claude Code
+    and Anthropic-SDK caller talking to a Qwen3 or DeepSeek deployment.
+
+    Separated either way -- only whether the client is *shown* it is decided
+    here. That is what keeps a chain of thought out of the tool parser, which
+    is a second reader of the same text.
+    """
+    return not anthropic_thinking_enabled(request)
+
+
+# The engine's `leave_reason` in Anthropic's vocabulary. The scheduler emits
+# exactly seven shapes; the three here line up by name, `stop_<token_id>` is
+# handled below, and `aborted` / `unschedulable: ...` / "" have no counterpart
+# in Anthropic's vocabulary and keep the default.
+_ANTHROPIC_STOP_REASON = {
+    "eos": "end_turn",
+    "max_tokens": "max_tokens",
+    "stop_sequence": "stop_sequence",
+}
+
+
+def anthropic_stop_reason_with_calls(finish_reason: Any, has_calls: bool) -> str:
+    """`max_tokens` outranks `tool_use`, for the reason `length` outranks
+    `tool_calls` on the other endpoint (see
+    :func:`~.protocol.openai_stop_reason_with_calls`): only one of the two is a
+    warning, and a response cut off mid-call parses to a call with a silently
+    truncated argument value."""
+    reason = anthropic_stop_reason(finish_reason)
+    if reason == "max_tokens":
+        return reason
+    return "tool_use" if has_calls else reason
+
+
+def anthropic_stop_reason(finish_reason: Any) -> str:
+    """The engine's leave reason as Anthropic spells it.
+
+    Not routed through `protocol.openai_stop_reason`: that maps into OpenAI's
+    vocabulary (`stop` / `length`), which shares no member with the keys here,
+    so chaining them would send every reason to the default.
+
+    `stop_<token_id>` is *not* `stop_sequence`, though it was mapped to it.
+    The two come from different branches of the scheduler and mean opposite
+    things: `stop_sequence` is one of the client's own `stop_sequences`
+    matching, and Anthropic pairs it with the matched string in the response;
+    `stop_<id>` is a model end-of-turn token from `stop_token_ids` firing,
+    which is an ordinary `end_turn`.
+
+    `stop_token_ids` is `generation_config.eos_token_id` minus the single
+    `tokenizer.eos_token_id`, so any model declaring more than one EOS reaches
+    this branch in normal operation -- Qwen3, Qwen3.5, gpt-oss.
+    """
+    reason = finish_reason or ""
+    if reason.startswith("stop_") and reason != "stop_sequence":
+        return "end_turn"
+    return _ANTHROPIC_STOP_REASON.get(reason, "end_turn")
+
+
+# Anthropic's own keepalive. Sent in place of a reasoning segment the request
+# asked not to see: the bytes are being generated either way, and with nothing
+# going out the socket is silent for the whole chain of thought -- on an
+# R1-shaped 5019-character trace the first client-visible frame arrived after
+# 5016 of them. Long enough to trip proxy and SDK idle-read timeouts, and the
+# stall watchdog can only report it, not prevent it.
 _ANTHROPIC_PING_FRAME = event_frame("ping", {"type": "ping"})
+# Paced by the clock, not by the model: one ping per dropped reasoning
+# *segment* is one per engine chunk, i.e. O(reasoning tokens) socket writes of
+# 35 discarded bytes. The keepalive only has to beat proxy and SDK idle-read
+# timeouts, which are tens of seconds.
+_ANTHROPIC_PING_INTERVAL_SECONDS = 5.0
 _metrics_exporter = AtomMetricsExporter()
 _metrics_refresh_task: asyncio.Task | None = None
 _METRICS_REFRESH_INTERVAL_SECONDS = 5.0
@@ -135,17 +357,91 @@ def _log_request_event(event_type: str, request_id: str, data: Any) -> None:
     _request_logger.info(json.dumps(entry, default=str))
 
 
-async def _logged_stream(
+def _log_request_model(event_type: str, request_id: str, model: Any) -> None:
+    """:func:`_log_request_event` for a pydantic model, dumped only if logged.
+
+    The guard in `_log_request_event` is in the callee, so
+    ``_log_request_event("request", rid, request.model_dump())`` builds the
+    dump before the call can decline it: every message and every tool schema
+    serialised on the event loop and thrown away, on every request, with
+    request logging off. Measured 20-26 us on an agent-shaped request against
+    0.07 us for the guard.
+
+    `_log_sse` directly below already asks the question in this order. Two
+    spellings of one rule in one module is what this removes.
+    """
+    if _request_logger is None:
+        return
+    _log_request_event(event_type, request_id, model.model_dump())
+
+
+def _log_sse(chunk: str, request_id: str) -> None:
+    """Log every SSE frame in `chunk`, and never fail the stream doing it.
+
+    One yield can carry several frames: `serving_chat` deliberately coalesces
+    finish + usage + `[DONE]` into one send, because at a wave boundary many
+    requests finalize at once and collapsing three socket writes per request
+    to one relieves the event loop. This used to `json.loads` the whole send
+    as a single payload, which raises `Extra data:` on exactly that frame --
+    out of the generator, so with `--request-log` on, the *last* frame of
+    every OpenAI stream never reached the client and no `[DONE]` was sent.
+
+    And frames are not all `data:`-first. Anthropic writes `event: NAME` on
+    the line above, so a `startswith("data: ")` test skipped every frame that
+    endpoint produces -- silently, which for a log is the worst failure it
+    can have.
+
+    A payload that will not parse is logged as text rather than dropped or
+    raised: this is the diagnostic path, and it must not be the reason a
+    response fails.
+    """
+    if _request_logger is None:
+        return
+    for frame in chunk.split("\n\n"):
+        payload = None
+        for line in frame.splitlines():
+            if line.startswith("data:"):
+                payload = line[5:].strip()
+        if payload is None:
+            continue
+        if payload == "[DONE]":
+            _log_request_event("stream_done", request_id, None)
+            continue
+        try:
+            _log_request_event("stream_chunk", request_id, json.loads(payload))
+        except ValueError:
+            _log_request_event("stream_chunk_unparsed", request_id, payload)
+
+
+async def _client_stream(
     gen: AsyncGenerator[str, None], request_id: str
 ) -> AsyncGenerator[str, None]:
-    """Wrap a streaming generator to log each SSE chunk."""
-    async for chunk in gen:
-        if _request_logger is not None and chunk.startswith("data: "):
-            payload = chunk[6:].strip()
-            if payload != "[DONE]":
-                _log_request_event("stream_chunk", request_id, json.loads(payload))
-            else:
-                _log_request_event("stream_done", request_id, None)
+    """Every SSE frame on its way to the client: logged, and timed.
+
+    The last point a frame passes through before uvicorn writes it, which is
+    why the silence watchdog lives here rather than at the collector it
+    started at. Between the collector and this line sit the reasoning
+    channel's read-ahead and the tool-call format's, and while either
+    withholds, the collector keeps waking on schedule -- so the gauge read
+    zero for exactly the stall it exists to report.
+
+    Wrapping every streaming response and not two of the three: this was
+    `_logged_stream`, and the Anthropic endpoint never used it. A watchdog
+    with an endpoint-shaped hole in it is worse than none, because the zero it
+    reports looks like an answer.
+    """
+    it = gen.__aiter__()
+    delivered = False
+    while True:
+        # The first wait is the queue, not silence: every generator awaits the
+        # collector before its opening frame.
+        with FrameWait(request_id, armed=delivered):
+            try:
+                chunk = await it.__anext__()
+            except StopAsyncIteration:
+                return
+        delivered = True
+        _log_sse(chunk, request_id)
         yield chunk
 
 
@@ -252,7 +548,17 @@ def _has_multimodal_content(messages: list[Any]) -> bool:
     return False
 
 
-def _load_image_from_url(url: str) -> Image.Image:
+def _load_image_from_url(url: str) -> "Image.Image":
+    # Imported here, not at module scope, and this is the one place in the
+    # file that needs it at runtime. Pillow is not a declared dependency, so a
+    # module-scope `from PIL import Image` made the whole server module
+    # unimportable wherever it is absent -- which is the non-GPU CI runner,
+    # where the only test that reached this module had to wrap its import in a
+    # try/except and degrade to `api_server = None`. Text-only serving does
+    # not need Pillow, so it should not be a condition of importing the
+    # server; a request that actually carries an image raises here, naming it.
+    from PIL import Image
+
     if url.startswith("data:"):
         try:
             _, encoded = url.split(",", 1)
@@ -280,7 +586,7 @@ def _get_multimodal_processor():
 
 def _collect_multimodal_parts(
     messages: list[Any],
-) -> tuple[list[dict[str, Any]], list[Image.Image]]:
+) -> tuple[list[dict[str, Any]], list["Image.Image"]]:
     """Normalize chat messages into processor form, loading every image.
 
     Content parts keep the order the client sent them in; the images are
@@ -476,7 +782,13 @@ async def generate_async(
     started_at = time.time()
     first_token_at: float | None = None
     last_token_at: float | None = None
-    all_token_ids: list[int] = []
+    # An array, not a list: this grows for the whole life of the request,
+    # and one boxed PyInt per token is what the collector then walks on
+    # every pass. It stays an array all the way out -- the dict below is
+    # an internal hand-off to `build_*_response`, which reads `text` and
+    # the counters and never `token_ids`, so nothing serializes it. A
+    # consumer that starts reading that key has to convert.
+    all_token_ids = new_token_ids()
     finish_reason: str | None = None
     seq = None
     kv_transfer_output_meta_info = None
@@ -595,7 +907,7 @@ async def generate_async_multimodal(
     started_at = time.time()
     first_token_at: float | None = None
     last_token_at: float | None = None
-    all_token_ids: list[int] = []
+    all_token_ids = new_token_ids()
     finish_reason: str | None = None
     seq = None
 
@@ -701,7 +1013,7 @@ async def generate_async_fanout(
     loop = asyncio.get_running_loop()
 
     started_at = time.time()
-    per_tokens: list[list[int]] = [[] for _ in range(n)]
+    per_tokens = [new_token_ids() for _ in range(n)]
     per_first_token_at: list[float | None] = [None] * n
     per_last_token_at: list[float | None] = [None] * n
     per_finish_reason: list[str | None] = [None] * n
@@ -883,7 +1195,9 @@ async def setup_streaming_request(
     # 9 of them were sitting on this line, up to 3.3 s each -- long enough that
     # the server accepts no new request at all and the GPUs run dry waiting for
     # work. Anything per-request logged from here has to stay off info.
-    logger.debug(f"API: Created request_id={request_id}, seq_id={seq_id}")
+    # %-style, not an f-string: the arguments are formatted only if the
+    # record is emitted, and this runs once per request with debug off.
+    logger.debug("API: Created request_id=%s, seq_id=%s", request_id, seq_id)
     engine.core_mgr.add_request([seq])
 
     return seq_id, stream_collector, seq.num_prompt_tokens
@@ -1106,34 +1420,6 @@ async def setup_streaming_request_fanout(
 # ============================================================================
 
 
-def _tune_gc() -> None:
-    """Stretch the interval between full (generation-2) collections.
-
-    Only gen-2 matters: it is stop-the-world and rescans every tracked
-    container, so its cost tracks live objects rather than recent garbage.
-    At c=2048 it was 47% of wall clock while the 23k gen-0/1 passes over the
-    same window cost 0.1s. Raising the thresholds is close to free because
-    reference counting, not the collector, reclaims everything acyclic --
-    peak RSS actually fell, since a larger gen-0 threshold lets more objects
-    die before a collection can promote them.
-
-    gc.freeze() was tried here and removed: once gen-2 stops running there is
-    nothing left for it to make cheaper, and alone it made collections more
-    frequent by emptying gen-2, which is the denominator CPython gates full
-    collections on (long_lived_pending > long_lived_total / 4).
-    """
-    thresholds = envs.ATOM_GC_THRESHOLD
-    if not thresholds:
-        return
-    try:
-        t = tuple(int(x) for x in thresholds.split(","))
-        old = gc.get_threshold()
-        gc.set_threshold(*t)
-        logger.info("[gc] thresholds %s -> %s", old, t)
-    except (ValueError, TypeError):
-        logger.warning("[gc] bad ATOM_GC_THRESHOLD=%r, ignored", thresholds)
-
-
 async def _refresh_metrics_once() -> None:
     if engine is None:
         return
@@ -1161,9 +1447,13 @@ async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown."""
     global _metrics_refresh_task
     logger.info("Server started successfully and ready to accept requests")
-    _tune_gc()
+    tune_gc()
+    maybe_attach_gc_debug_callback("api_server")
     await _refresh_metrics_once()
     _metrics_refresh_task = asyncio.create_task(_metrics_refresh_loop())
+    # The engine was built in `main()`, so this is the last point before the
+    # first request at which everything reachable is still startup state.
+    freeze_gc_heap("api_server")
     try:
         yield
     finally:
@@ -1239,9 +1529,21 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             merged_kwargs["response_format"] = request.response_format
         if isinstance(request.tool_choice, str):
             merged_kwargs["tool_choice"] = request.tool_choice
+        _th_enabled, _th_effort = resolve_thinking(request)
         if request.thinking is not None or request.reasoning_effort is not None:
-            _th_enabled, _th_effort = resolve_thinking(request)
-            merged_kwargs["thinking"] = _th_enabled
+            # By the name this template actually reads. `thinking` was
+            # hardcoded, which is right for Kimi-K3 and a silent no-op for the
+            # whole Qwen family, whose templates read `enable_thinking` --
+            # measured, `thinking=False` left the `<think>` prefill in place.
+            # A template ignores a kwarg it does not know, so the failure was
+            # invisible: the model reasoned anyway.
+            # Only when the request said something about it. An effort is
+            # not an opt-in, and this is merged after the server defaults and
+            # after the client's own `chat_template_kwargs` -- so writing it
+            # unconditionally overrode both.
+            if reasoning_toggle is not None and _th_enabled is not None:
+                name, off_value, on_value = reasoning_toggle
+                merged_kwargs[name] = on_value if _th_enabled else off_value
             if _th_effort is not None:
                 merged_kwargs["thinking_effort"] = _th_effort
 
@@ -1259,7 +1561,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         request_id = f"chatcmpl-{uuid.uuid4().hex}"
         dp_rank = request.data_parallel_rank
 
-        _log_request_event("request", request_id, request.model_dump())
+        _log_request_model("request", request_id, request)
 
         is_multimodal = _has_multimodal_content(messages)
         if is_multimodal:
@@ -1288,10 +1590,13 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         # The K3 template may inject the opening reasoning marker into the prompt
         # itself; if so the stream begins mid-thought and the ReasoningFilter must
         # start in the thinking state. Multimodal inputs arrive pre-tokenized.
-        _starts_thinking = (
-            prompt_tokens_start_in_reasoning(token_ids, tokenizer.decode)
-            if is_multimodal
-            else prompt_starts_in_reasoning(prompt)
+        _reasoning = reasoning_channel(
+            (
+                prompt_tokens_start_in_reasoning(token_ids, tokenizer.decode)
+                if is_multimodal
+                else prompt_starts_in_reasoning(prompt)
+            ),
+            template_kwargs=merged_kwargs,
         )
 
         # Streaming
@@ -1318,6 +1623,9 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     cleanup_stream,
                     cleanup_request,
                     tools=request.tools,
+                    tool_choice=request.tool_choice,
+                    reasoning=_reasoning,
+                    tool_parser_cls=tool_call_parser_cls,
                 )
             else:
                 seq_id, stream_collector, num_prompt_tokens = (
@@ -1340,10 +1648,11 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     cleanup_request,
                     tools=request.tools,
                     tool_choice=request.tool_choice,
-                    starts_thinking=_starts_thinking,
+                    reasoning=_reasoning,
+                    tool_parser_cls=tool_call_parser_cls,
                 )
             return StreamingResponse(
-                _logged_stream(gen, request_id),
+                _client_stream(gen, request_id),
                 media_type="text/event-stream",
             )
 
@@ -1369,6 +1678,8 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 outputs,
                 tools=request.tools,
                 tool_choice=request.tool_choice,
+                reasoning=_reasoning,
+                tool_parser_cls=tool_call_parser_cls,
             )
         elif is_multimodal:
             final_output = await _run_nonstream_with_disconnect(
@@ -1391,6 +1702,8 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 final_output,
                 tools=request.tools,
                 tool_choice=request.tool_choice,
+                reasoning=_reasoning,
+                tool_parser_cls=tool_call_parser_cls,
             )
         elif effective_n > 1:
             outputs = await _race_disconnect(
@@ -1412,6 +1725,8 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 outputs,
                 tools=request.tools,
                 tool_choice=request.tool_choice,
+                reasoning=_reasoning,
+                tool_parser_cls=tool_call_parser_cls,
             )
         else:
             final_output = await _run_nonstream_with_disconnect(
@@ -1434,8 +1749,10 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 final_output,
                 tools=request.tools,
                 tool_choice=request.tool_choice,
+                reasoning=_reasoning,
+                tool_parser_cls=tool_call_parser_cls,
             )
-        _log_request_event("response", request_id, resp.model_dump())
+        _log_request_model("response", request_id, resp)
         return resp
 
     except _ClientDisconnected:
@@ -1471,7 +1788,7 @@ async def completions(request: CompletionRequest, raw_request: Request):
         request_id = f"cmpl-{uuid.uuid4().hex}"
         dp_rank = request.data_parallel_rank
 
-        _log_request_event("request", request_id, request.model_dump())
+        _log_request_model("request", request_id, request)
 
         # Streaming
         if request.stream:
@@ -1514,7 +1831,7 @@ async def completions(request: CompletionRequest, raw_request: Request):
                     cleanup_request,
                 )
             return StreamingResponse(
-                _logged_stream(gen, request_id),
+                _client_stream(gen, request_id),
                 media_type="text/event-stream",
             )
 
@@ -1551,7 +1868,7 @@ async def completions(request: CompletionRequest, raw_request: Request):
                 raise RuntimeError("No output generated")
 
             resp = build_completion_response(request_id, model_name, final_output)
-        _log_request_event("response", request_id, resp.model_dump())
+        _log_request_model("response", request_id, resp)
         return resp
 
     except _ClientDisconnected:
@@ -1573,7 +1890,23 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
     and returns Anthropic-formatted responses. Enables Claude Code and other
     Anthropic-compatible tools to use ATOM as a backend.
     """
-    global engine, tokenizer, model_name
+    # One validator over the shape both endpoints share: this path already
+    # converts, so validating the conversion leaves a single rule rather than
+    # a second one in Anthropic's spelling. It checked nothing before, so a
+    # name `/v1/chat/completions` rejects was accepted here. Explicitly 400
+    # and before the try, because the handler below turns every exception into
+    # a 500 -- wrong for a malformed request, and once the response is
+    # streaming it arrives after the client was told the request succeeded.
+    try:
+        validate_tool_list(anthropic_to_openai_tools(request.tools))
+    except ValueError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "type": "error",
+                "error": {"type": "invalid_request_error", "message": str(exc)},
+            },
+        )
 
     try:
         # Convert Anthropic messages to OpenAI format
@@ -1585,6 +1918,20 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         messages = [ChatMessage(**m) for m in openai_messages]
 
         merged_kwargs = dict(default_chat_template_kwargs)
+        # The request's `thinking` was dropped on the floor here, so the model
+        # was never told not to think and the endpoint spent three attempts
+        # dealing with a chain of thought it had asked for by omission.
+        merged_kwargs.update(anthropic_template_kwargs(request, reasoning_toggle))
+        drop_reasoning = anthropic_drop_reasoning(request)
+        # Same answer-it-in-the-prompt rule as `thinking` above, and the chat
+        # path already forwards its own spelling of this. `tool_choice` was
+        # read off the Anthropic request and then used nowhere at all -- a
+        # client that forbade tool calls got `tool_use` blocks and
+        # `stop_reason: tool_use`. Translated to the string a chat template
+        # expects; the object forms Anthropic has for *requiring* a call have
+        # no such spelling, and are not answered here or on the chat path.
+        if forbids_tool_calls(request.tool_choice):
+            merged_kwargs["tool_choice"] = "none"
         prompt = apply_chat_template(
             tokenizer,
             custom_message_encoder,
@@ -1654,23 +2001,51 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
             )
 
             async def generate_anthropic_stream():
-                from .reasoning import ReasoningFilter
-                from .tool_parser import ToolCallStreamParser
-
-                reasoning_filter = ReasoningFilter()
-                if prompt.rstrip().endswith("<think>"):
-                    reasoning_filter.state = 1
-                tool_parser = ToolCallStreamParser()
+                # Unconditional, like the chat path and like both upstreams:
+                # whatever reasoning arrives is separated and reported. The
+                # request's `thinking` was answered in the prompt, so there is
+                # nothing left here for it to decide -- and separating always
+                # is what keeps the reasoning out of the tool parser, which is
+                # a second reader of this same text.
+                #
+                # Asked of every dialect, not of one literal: the K3 template
+                # opens with `<|open|>think<|sep|>`, which `.endswith("<think>")`
+                # does not see, and the assignment it guarded skipped
+                # `__post_init__` so the instance was in the thinking state
+                # while claiming it did not start there. Which dialect closes
+                # it is the model's, resolved at startup -- the filter used to
+                # carry none and closed on any registered dialect's marker.
+                reasoning_filter = reasoning_channel(
+                    prompt_starts_in_reasoning(prompt),
+                    template_kwargs=merged_kwargs,
+                ).stream()
+                tool_parser = ToolCallStreamParser(
+                    parser_cls=tool_call_parser_cls,
+                    suppress_calls=forbids_tool_calls(request.tool_choice),
+                )
                 tool_parser.tools = anthropic_to_openai_tools(request.tools)
-                block_index = 0
-                started_text = False
-                started_thinking = False
+                blocks = AnthropicBlocks()
                 has_tool_calls = False
                 output_tokens = 0
-                stop_reason = "end_turn"
+                # Overwritten by a tool call, and otherwise by whatever the
+                # engine says. It used to be the constant `end_turn`, so a
+                # response cut off at `max_tokens` claimed a normal ending --
+                # and a reasoning model asked for no thinking, which produces
+                # only reasoning and has all of it dropped, delivered an empty
+                # message that also said nothing was wrong. The vocabularies
+                # already line up; they were simply never connected.
+                # Computed once, at the end, from the two facts that decide
+                # it -- exactly as `serving_chat` does. Recomputing it at each
+                # send point meant whichever fact arrived last won: a call
+                # completing mid-stream froze it at `tool_use`, and the
+                # `max_tokens` that arrived three chunks later could never be
+                # folded in. Kimi-K2 is the one registered format whose region
+                # closes mid-stream, so it is the one that reaches this.
+                engine_reason: Any = None
 
                 message_started = False
-                _thinking_enabled = bool(getattr(request, "thinking", None))
+                # See `_ANTHROPIC_PING_INTERVAL_SECONDS`.
+                last_ping = 0.0
                 # Assume abort until we reach the normal end of the stream. If
                 # the client disconnects, GeneratorExit unwinds through the
                 # yields and the finally runs with this still True -> abort.
@@ -1686,10 +2061,16 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                             )
                             message_started = True
                         new_text = chunk_data["text"]
+                        if chunk_data.get("finish_reason"):
+                            engine_reason = chunk_data["finish_reason"]
                         output_tokens += len(chunk_data.get("token_ids", []))
                         finished = chunk_data.get("finished", False)
 
-                        # Phase 1: Reasoning filter
+                        # Phase 1: Reasoning filter. Never None --
+                        # `reasoning_channel(...).stream()` always returns a
+                        # `ReasoningFilter`. Do not add a skip path back: it
+                        # would feed an unseparated chain of thought straight
+                        # into the tool parser.
                         segments = reasoning_filter.process(new_text)
                         if finished:
                             segments.extend(reasoning_filter.flush())
@@ -1699,126 +2080,85 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                                 continue
 
                             if field == "reasoning_content":
-                                if not _thinking_enabled:
-                                    yield _ANTHROPIC_PING_FRAME
+                                if drop_reasoning:
+                                    now = time.monotonic()
+                                    if now - last_ping >= (
+                                        _ANTHROPIC_PING_INTERVAL_SECONDS
+                                    ):
+                                        last_ping = now
+                                        yield _ANTHROPIC_PING_FRAME
                                     continue
-                                if not started_thinking and not started_text:
-                                    yield stream_content_block_start(
-                                        block_index, "thinking"
-                                    )
-                                    started_thinking = True
-                                if started_thinking:
-                                    yield stream_content_block_delta(
-                                        block_index, text, "thinking"
-                                    )
+                                for _frame in blocks.delta("thinking", text):
+                                    yield _frame
                             else:
                                 # Phase 2: Tool call detection on content
                                 events = tool_parser.process(text)
-                                for etype, edata in events:
-                                    if etype == "content":
-                                        if started_thinking and not started_text:
-                                            yield stream_signature_delta(block_index)
-                                            yield stream_content_block_stop(block_index)
-                                            block_index += 1
-                                        if not started_text:
-                                            yield stream_content_block_start(
-                                                block_index, "text"
-                                            )
-                                            started_text = True
-                                        yield stream_content_block_delta(
-                                            block_index, edata, "text"
-                                        )
-                                    elif etype == "tool_call_start":
-                                        has_tool_calls = True
-                                        stop_reason = "tool_use"
-                                        if started_text:
-                                            yield stream_content_block_stop(block_index)
-                                            block_index += 1
-                                            started_text = False
-                                        elif started_thinking:
-                                            yield stream_signature_delta(block_index)
-                                            yield stream_content_block_stop(block_index)
-                                            block_index += 1
-                                            started_thinking = False
-                                        fn = edata.get("function", {})
-                                        yield stream_content_block_start(
-                                            block_index,
-                                            "tool_use",
-                                            tool_use_id=edata.get("id", ""),
-                                            tool_name=fn.get("name", ""),
-                                        )
-                                    elif etype == "tool_call_args":
-                                        fn = edata.get("function", {})
-                                        yield stream_content_block_delta(
-                                            block_index,
-                                            fn.get("arguments", ""),
-                                            "tool_use",
-                                        )
-                                    elif etype == "tool_call_end":
-                                        yield stream_content_block_stop(block_index)
-                                        block_index += 1
+                                has_tool_calls = has_tool_calls or (
+                                    completes_a_tool_call(events)
+                                )
+                                for _frame in tool_event_frames(events, blocks):
+                                    yield _frame
 
                         if finished:
                             # Flush remaining tool call events
-                            for etype, edata in tool_parser.flush():
-                                if etype == "content":
-                                    if not started_text:
-                                        if started_thinking:
-                                            yield stream_signature_delta(block_index)
-                                            yield stream_content_block_stop(block_index)
-                                            block_index += 1
-                                            started_thinking = False
-                                        yield stream_content_block_start(
-                                            block_index, "text"
-                                        )
-                                        started_text = True
-                                    yield stream_content_block_delta(
-                                        block_index, edata, "text"
-                                    )
-                                elif etype == "tool_call_start":
-                                    has_tool_calls = True
-                                    stop_reason = "tool_use"
-                                    if started_text:
-                                        yield stream_content_block_stop(block_index)
-                                        block_index += 1
-                                        started_text = False
-                                    fn = edata.get("function", {})
-                                    yield stream_content_block_start(
-                                        block_index,
-                                        "tool_use",
-                                        tool_use_id=edata.get("id", ""),
-                                        tool_name=fn.get("name", ""),
-                                    )
-                                elif etype == "tool_call_args":
-                                    fn = edata.get("function", {})
-                                    yield stream_content_block_delta(
-                                        block_index,
-                                        fn.get("arguments", ""),
-                                        "tool_use",
-                                    )
-                                elif etype == "tool_call_end":
-                                    yield stream_content_block_stop(block_index)
-                                    block_index += 1
+                            events = tool_parser.flush()
+                            has_tool_calls = has_tool_calls or (
+                                completes_a_tool_call(events)
+                            )
+                            for _frame in tool_event_frames(events, blocks):
+                                yield _frame
 
-                            if not started_text and not has_tool_calls:
-                                if started_thinking:
-                                    yield stream_signature_delta(block_index)
-                                    yield stream_content_block_stop(block_index)
-                                    block_index += 1
-                                yield stream_content_block_start(block_index, "text")
-                                started_text = True
-                            if started_text:
-                                yield stream_content_block_stop(block_index)
+                            # A response with no tool call must end on a text
+                            # block even when it produced none, because a reply
+                            # of pure reasoning still has to carry a `text`
+                            # block for clients that read only that.
+                            if not has_tool_calls and blocks.kind != "text":
+                                for _frame in blocks.open("text"):
+                                    yield _frame
+                            # Before the last frames, not after. The flag means
+                            # "the engine sequence may still be running", and
+                            # the engine is done the moment its finished chunk
+                            # arrived -- a client hanging up between the two
+                            # yields below fired a broadcast abort for a
+                            # sequence that had already ended, which is the
+                            # control-path flood the flag exists to prevent.
+                            # `serving_chat` already sets it here.
+                            aborted = False
+                            for _frame in blocks.close():
+                                yield _frame
+                            stop_reason = anthropic_stop_reason_with_calls(
+                                engine_reason, has_tool_calls
+                            )
                             yield stream_message_delta(stop_reason, output_tokens)
                             yield stream_message_stop()
-                            aborted = False
                             break
+                except Exception as exc:
+                    # Every block this stream opened has to be closed, and the
+                    # client has to be told why. There was no `except` at all:
+                    # the endpoint's own handler has already returned by the
+                    # time the generator runs, so a raise from the collector,
+                    # the reasoning filter or a tool parser cut the response
+                    # mid-frame with an open block and no terminator.
+                    logger.exception("Error streaming anthropic response")
+                    for _frame in stream_failure_frames(
+                        exc,
+                        blocks,
+                        output_tokens,
+                        opening=(
+                            None
+                            if message_started
+                            else stream_message_start(
+                                request_id, model_name, input_tokens, 0
+                            )
+                        ),
+                    ):
+                        yield _frame
                 finally:
                     cleanup_stream(seq_id, aborted=aborted)
                     cleanup_request(request_id)
 
             return StreamingResponse(
-                generate_anthropic_stream(),
+                _client_stream(generate_anthropic_stream(), request_id),
                 media_type="text/event-stream",
                 headers={
                     "anthropic-version": "2023-06-01",
@@ -1827,9 +2167,6 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
             )
 
         # Non-streaming response
-        from .reasoning import separate_reasoning
-        from .tool_parser import parse_tool_calls
-
         final_output = await _run_nonstream_with_disconnect(
             generate_async(prompt, sampling_params, request_id),
             raw_request,
@@ -1839,24 +2176,44 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
             raise RuntimeError("No output generated")
 
         raw_text = final_output["text"]
-        reasoning_content, content_with_tools = separate_reasoning(raw_text)
-        content_text, tool_calls = parse_tool_calls(
-            content_with_tools, anthropic_to_openai_tools(request.tools)
+        # Separating is unconditional -- the same call the chat path makes,
+        # and what keeps a chain of thought out of the tool parser. Only
+        # whether the client is shown it is a question, and the same one the
+        # streaming branch above asks.
+        # Both stages over one chunk, in the order the branch above streams
+        # them: reasoning filter, then the tool parser on the content segments
+        # it yields. Calling `.split()` here instead flattened the two into
+        # `(reasoning, content)` and lost the interleaving at that line.
+        events = read_whole_blocks(
+            reasoning_channel(
+                prompt_starts_in_reasoning(prompt),
+                template_kwargs=merged_kwargs,
+            ),
+            tool_call_parser_cls,
+            raw_text,
+            anthropic_to_openai_tools(request.tools),
+            suppress_calls=forbids_tool_calls(request.tool_choice),
         )
+        if drop_reasoning:
+            events = [e for e in events if e[0] != "reasoning"]
+        _, tool_calls = flatten_tool_events(events)
         output_tokens = len(tokenizer.encode(raw_text))
         cache_read_input_tokens = final_output.get("num_cached_tokens", 0)
-        if not getattr(request, "thinking", None):
-            reasoning_content = None
-
         return build_anthropic_response(
             request_id=request_id,
             model=model_name,
-            content_text=content_text,
-            reasoning_content=reasoning_content,
-            tool_calls=tool_calls if tool_calls else None,
+            events=events,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             cache_read_input_tokens=cache_read_input_tokens,
+            # A tool call is its own ending; otherwise whatever the engine
+            # said. Omitting this left the parameter's `end_turn` default in
+            # place, so the same response cut off at `max_tokens` reported a
+            # normal ending with `stream=false` and `max_tokens` with
+            # `stream=true`.
+            stop_reason=anthropic_stop_reason_with_calls(
+                final_output.get("finish_reason"), bool(tool_calls)
+            ),
         )
 
     except _ClientDisconnected:
@@ -2009,11 +2366,19 @@ async def stop_profile():
 def main():
     """Main entry point for the server."""
     global engine, tokenizer, model_name, default_chat_template_kwargs, _request_logger
+    global tool_call_parser_cls, model_starts_in_reasoning, reasoning_toggle
+    global reasoning_dialect
     global custom_message_encoder, _stream_batch_dispatcher
 
     parser = FlexibleArgumentParser(description="ATOM OpenAI API Server")
     EngineArgs.add_cli_args(parser)
     parser.add_argument("--host", type=str, default=DEFAULT_HOST, help="Server host")
+    parser.add_argument(
+        "--tool-call-parser",
+        type=str,
+        default="auto",
+        help=TOOL_CALL_PARSER_HELP,
+    )
     parser.add_argument(
         "--server-port",
         type=int,
@@ -2099,6 +2464,41 @@ def main():
 
     logger.info(f"Initializing engine with model {args.model}...")
     engine_args = EngineArgs.from_cli_args(args)
+    _template_source = chat_template_source(tokenizer, custom_message_encoder)
+    reasoning_dialect, _dialect_stated = resolve_dialect(
+        _template_source,
+        render_probe_prompt(tokenizer, custom_message_encoder, tools=False) or "",
+    )
+    logger.info(
+        "Reasoning channel: %s%s",
+        reasoning_dialect.think_end_marker,
+        "" if _dialect_stated else " (no dialect named in the chat template)",
+    )
+    model_starts_in_reasoning = template_opens_reasoning_implicitly(_template_source)
+    if model_starts_in_reasoning:
+        logger.info(
+            "Chat template closes a reasoning block it never opens; treating "
+            "output as reasoning until the end marker."
+        )
+
+    reasoning_toggle = resolve_reasoning_toggle(tokenizer, custom_message_encoder)
+    if reasoning_toggle is not None:
+        _name, _off, _on = reasoning_toggle
+        logger.info(f"Reasoning switches on {_name}: {_on!r} on, {_off!r} off.")
+    else:
+        logger.info(
+            "This chat template has no switch for reasoning, so a request "
+            "asking for none cannot stop the model producing it. Any that "
+            "arrives is still separated and reported, never discarded."
+        )
+
+    tool_call_parser_cls = resolve_tool_call_parser(
+        args.tool_call_parser,
+        tokenizer,
+        custom_message_encoder,
+        model=args.model,
+    )
+
     engine = engine_args.create_engine(tokenizer=tokenizer)
     _stream_batch_dispatcher = StreamBatchDispatcher(tokenizer)
 

@@ -56,7 +56,7 @@ def _install_forward_context_stubs():
 
 _install_forward_context_stubs()
 
-from atom.plugin.rtpllm.utils.forward_context import (  # noqa: E402
+from atom.plugin.rtpllm.utils.forward_context import (
     RTPForwardContext,
     RTPForwardMLAContext,
     RTPForwardQwen35HybridContext,
