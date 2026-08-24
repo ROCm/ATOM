@@ -1981,6 +1981,11 @@ class Indexer(nn.Module):
         # budget-chunking (below) rarely fires. Must match the width the
         # precomputed schedule (full_cta_info) was built with.
         max_seq_len = indexer_meta["fp4_prefill_max_seq_len"]
+        prefill_block_k = indexer_meta["fp4_prefill_block_k"]
+        prefill_num_warps = indexer_meta["fp4_prefill_num_warps"]
+        prefill_wave_tasks_per_row = indexer_meta[
+            "fp4_prefill_wave_tasks_per_row"
+        ]
         kv_block_size = self.kv_cache.size(3)  # csa_rows_per_block = 64
         # The packed-dword scale readers in pa_mqa_logits_fp4* require N_PHYS==1
         # (NTPW=4 N-tiles share one physical block), i.e. kv_block_size == 64
@@ -2011,11 +2016,13 @@ class Indexer(nn.Module):
                     row_to_batch[chunk_start:chunk_end],
                     rs,
                     re,
-                    FP4_MQA_BLOCK_K,
+                    prefill_block_k,
                     fp4_mqa_prefill_parallel_unit_num(
                         chunk_rows,
                         max_seq_len,
-                        block_k=FP4_MQA_BLOCK_K,
+                        block_k=prefill_block_k,
+                        num_warps=prefill_num_warps,
+                        wave_tasks_per_row=prefill_wave_tasks_per_row,
                     ),
                     max_seq_len,
                 )
@@ -2038,8 +2045,9 @@ class Indexer(nn.Module):
                 re,
                 max_seq_len,
                 weight_scale=self._weights_scale,
-                block_k=FP4_MQA_BLOCK_K,
+                block_k=prefill_block_k,
                 kv_block_size=kv_block_size,
+                num_warps=prefill_num_warps,
                 out=logits,
                 cta_info=cta_info,
                 n_ctas=n_ctas,

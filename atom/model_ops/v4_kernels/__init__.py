@@ -25,7 +25,10 @@ from atom.model_ops.v4_kernels.csa_translate_pack import (
 from atom.model_ops.v4_kernels.fp4_mqa_schedule import (
     FP4_MQA_BLOCK_K,
     FP4_MQA_PARALLEL_UNIT_NUM,
+    FP4MQAPrefillConfig,
+    fp4_mqa_prefill_config,
     fp4_mqa_prefill_parallel_unit_num,
+    fp4_mqa_prefill_wave_tasks_per_row,
 )
 from atom.model_ops.v4_kernels.fused_compress import (
     fused_compress_attn,
@@ -67,12 +70,15 @@ from atom.model_ops.v4_kernels.state_writes import (
 __all__ = [
     "FP4_MQA_BLOCK_K",
     "FP4_MQA_PARALLEL_UNIT_NUM",
+    "FP4MQAPrefillConfig",
     "CompressPlan",
     "QKNormRopeOut",
     "csa_translate_pack",
     "csa_translate_pack_reference",
     "fp4_indexer_enabled",
+    "fp4_mqa_prefill_config",
     "fp4_mqa_prefill_parallel_unit_num",
+    "fp4_mqa_prefill_wave_tasks_per_row",
     "fused_compress_attn",
     "fused_compress_attn_reference",
     "hca_compress_paged_offsets",

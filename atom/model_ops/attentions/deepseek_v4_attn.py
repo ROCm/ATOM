@@ -101,7 +101,7 @@ from atom.model_ops.v4_kernels import (
     FP4_MQA_BLOCK_K,
     FP4_MQA_PARALLEL_UNIT_NUM,
     fp4_indexer_enabled,
-    fp4_mqa_prefill_parallel_unit_num,
+    fp4_mqa_prefill_config,
     hca_compress_paged_offsets,
     write_v4_paged_decode_indices,
     write_v4_paged_prefill_indices,
@@ -2274,29 +2274,42 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             fp4_prefill_max_seq_len = max(int(n_committed_per_seq.max()), 1)
 
             local_starts = torch.zeros_like(visible_end_gpu)
-            # Prefill uses an eager, shape-specific grid. Small Q needs more K
-            # splits to fill gfx950, while a full 16K-row prefill generally does
-            # not; the selector also caps P by the useful row/chunk pair count
-            # because the FlyDSL kernel launches exactly P CTAs. Decode keeps
-            # its fixed 512-CTA CUDAGraph schedule unchanged.
+            # Prefill is eager, so select both workgroup granularity and grid
+            # from this forward's query composition. The kernel assigns the
+            # same 64 K rows to each wave in its 256x4 and 64x1 forms; the
+            # selector preserves the wave-task budget while allowing ragged,
+            # multi-sequence prefill to schedule waves independently. Decode
+            # keeps its fixed 256x4 CUDAGraph schedule unchanged.
             prefill_rows = int(visible_end_gpu.shape[0])
-            prefill_parallel_unit_num = fp4_mqa_prefill_parallel_unit_num(
+            max_query_len = max(
+                1,
+                min(
+                    prefill_rows,
+                    int(getattr(attn_metadata, "max_seqlen_q", prefill_rows)),
+                ),
+            )
+            prefill_config = fp4_mqa_prefill_config(
                 prefill_rows,
                 fp4_prefill_max_seq_len,
-                block_k=self._fp4_block_k,
+                max_query_len,
             )
             _, prefill_cta_info, prefill_n_ctas = compute_prefill_schedule(
                 batch_id_per_token_gpu.to(torch.int32),
                 local_starts,
                 visible_end_gpu,
-                self._fp4_block_k,
-                prefill_parallel_unit_num,
+                prefill_config.block_k,
+                prefill_config.parallel_unit_num,
                 fp4_prefill_max_seq_len,
             )
             meta["fp4_prefill_cta_info"] = prefill_cta_info
             meta["fp4_prefill_n_ctas"] = prefill_n_ctas
             meta["fp4_prefill_local_starts"] = local_starts
             meta["fp4_prefill_max_seq_len"] = fp4_prefill_max_seq_len
+            meta["fp4_prefill_block_k"] = prefill_config.block_k
+            meta["fp4_prefill_num_warps"] = prefill_config.num_warps
+            meta["fp4_prefill_wave_tasks_per_row"] = (
+                prefill_config.wave_tasks_per_row
+            )
 
         return meta
 
