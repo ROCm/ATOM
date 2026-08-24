@@ -2825,7 +2825,24 @@ class FusedMoE(torch.nn.Module):
             return need_gather_w2
 
         need_gather_w2 = check_need_allgather()
-        tp_group = get_tp_group() if need_gather_w2 else None
+        w2_gather_groups = []
+        if need_gather_w2:
+            # ``self.tp_size`` includes DP ranks when DPA flattens DP x TP for
+            # MoE, while get_tp_group() only spans physical TP. Gather in the
+            # same order as flat rank = dp_rank * physical_tp_size + tp_rank.
+            tp_group = get_tp_group()
+            if tp_group.world_size > 1:
+                w2_gather_groups.append(tp_group)
+            if self.dp_size > 1 and get_current_atom_config().enable_dp_attention:
+                w2_gather_groups.append(get_dp_group())
+
+            gathered_world_size = 1
+            for group in w2_gather_groups:
+                gathered_world_size *= group.world_size
+            assert gathered_world_size == self.tp_size, (
+                "w2 online-quant gather groups do not cover effective TP: "
+                f"gathered={gathered_world_size}, effective_tp={self.tp_size}"
+            )
         load_full_w2 = not need_gather_w2
 
         # Save references to old weights before create_weights overwrites them.
@@ -2910,7 +2927,9 @@ class FusedMoE(torch.nn.Module):
                     old_w2_scale[expert_id],
                 )
             if need_gather_w2:
-                w2_full = tp_group.all_gather(w2_local, dim=1)
+                w2_full = w2_local
+                for group in w2_gather_groups:
+                    w2_full = group.all_gather(w2_full, dim=1)
                 w2_q, w2_s = _quant_weight(w2_full)
                 del w2_full
             else:

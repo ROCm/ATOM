@@ -189,7 +189,6 @@ class EagleProposer(Drafter):
         carrying `dspark_block_size` to `DSparkProposer`, and every model on
         hand takes that branch.
         """
-        del produces_output
         if not next_token_ids:
             return
         forward_context = get_forward_context()
@@ -217,14 +216,27 @@ class EagleProposer(Drafter):
         input_ids = self.runner.tokenID_processor.input_ids.gpu[1 : num_tokens + 1]
         input_ids.scatter_(0, last_token_indices, anchor_ids)
 
+        # A batch that produces no output returns before `postprocess`, so
+        # `propose()` never runs on this rank -- but peers that DO sample run it
+        # and issue `mtp_k` DPMetadata all_reduces plus `mtp_k` draft-model MoE
+        # collectives. Match that ledger here or the peers deadlock. The repeats
+        # feed identical inputs, so the extra passes rewrite the same draft KV
+        # with the same values.
+        num_draft_passes = 1
+        if not produces_output and self.config.parallel_config.data_parallel_size > 1:
+            num_draft_passes = self.mtp_k
+
         was_draft = context.is_draft
         context.is_draft = True
         try:
-            self.model(
-                input_ids=input_ids,
-                positions=positions[:num_tokens] + 1,
-                hidden_states=draft_hidden,
-            )
+            for _ in range(num_draft_passes):
+                if num_draft_passes > 1:
+                    self._refresh_dp_metadata(forward_context, num_tokens)
+                self.model(
+                    input_ids=input_ids,
+                    positions=positions[:num_tokens] + 1,
+                    hidden_states=draft_hidden,
+                )
         finally:
             context.is_draft = was_draft
 

@@ -366,11 +366,12 @@ class DSparkProposer(Drafter):
         rows are harmless -- they land on future positions, unread until the
         step that accepts them rewrites them.
 
-        `next_token_ids` is unused: DSpark drafts from aux hidden states.
-        `produces_output` is unused: the window has to cover every scheduled
-        row, so a forward that also reaches `propose()` is not skippable here.
+        `next_token_ids` is only read to re-run the block pass for DP
+        collective alignment (see below); the KV write itself drafts from aux
+        hidden states.
+        `produces_output` is not skippable for the window write -- it has to
+        cover every scheduled row -- but it does select the DP sync below.
         """
-        del next_token_ids, produces_output
         aux_hidden_states = self.aux_for(hidden_states)
         if aux_hidden_states is None:
             return
@@ -379,6 +380,34 @@ class DSparkProposer(Drafter):
         main_hidden_all = torch.cat(aux_hidden_states, dim=-1)
         with record_function(f"dspark_ctx_kv[bs={bs} tok={main_hidden_all.shape[0]}]"):
             self.model.write_context_kv(main_hidden_all, positions)
+
+        if produces_output or self.config.parallel_config.data_parallel_size <= 1:
+            return
+        if not next_token_ids:
+            return
+        anchors = next_token_ids[:bs]
+        if any(t < 0 for t in anchors):
+            return
+        # A batch that produces no output returns before `postprocess`, so
+        # `propose()` never runs on this rank -- but peers that DO sample run it
+        # and issue one DPMetadata all_reduce plus one block pass (which carries
+        # the backbone's DP-attention MoE collectives). Replay the same pass and
+        # drop its tokens, or those peers deadlock in the all_reduce. The
+        # verify scheduler is detached so this replay leaves no ell behind.
+        last_token_indices = self.prepare_inputs(bs, 1)
+        anchor_ids = self.anchors_to_gpu(anchors)
+        verify_scheduler, self.verify_scheduler = self.verify_scheduler, None
+        try:
+            self.propose(
+                target_token_ids=None,
+                target_positions=positions,
+                target_hidden_states=hidden_states,
+                num_reject_tokens=None,
+                next_token_ids=anchor_ids,
+                last_token_indices=last_token_indices,
+            )
+        finally:
+            self.verify_scheduler = verify_scheduler
 
     def propose(
         self,
