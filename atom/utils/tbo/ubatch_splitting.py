@@ -280,6 +280,15 @@ def split_mixed_token_midpoint(
     if total_tokens < num_ubatches:
         return None
 
+    # Mirror `_precompute_mixed_token_split`'s structural gate: every cut but
+    # the last must land strictly inside the prefill region, so that only the
+    # final ubatch straddles the prefill/decode boundary and every earlier one
+    # is pure prefill. A cut at or past `num_prefill_tokens` would leave a pure
+    # DECODE ubatch under a parent context that says is_prefill=True, which TBO
+    # cannot express today.
+    if (total_tokens * (num_ubatches - 1)) // num_ubatches >= num_prefill_tokens:
+        return None
+
     # cu[i] = index of request i's first token.
     cu = np.zeros(num_reqs + 1, dtype=np.int64)
     np.cumsum(toks, out=cu[1:])
