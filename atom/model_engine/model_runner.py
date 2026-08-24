@@ -67,7 +67,12 @@ from atom.model_ops.eplb import (
     with_eplb_forward_monitor,
 )
 from atom.model_ops.rejection_sampler import RejectionSampler
-from atom.model_ops.sampler import SAMPLER_EPS, Sampler, apply_min_tokens_mask
+from atom.model_ops.sampler import (
+    SAMPLER_EPS,
+    Sampler,
+    apply_min_tokens_mask,
+    apply_min_tokens_mask_with_spec_decode,
+)
 from atom.models.utils import get_pp_indices
 from atom.spec_decode.drafter import Drafter
 from atom.spec_decode.factory import build_drafter
@@ -3235,10 +3240,7 @@ class ModelRunner:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
         bs = batch.total_seqs_num
         if spec_decode_metadata is None:
-            # min_tokens is enforced only on the non-speculative path. Draft
-            # tokens are verified against the target distribution, so masking
-            # the target logits here would bias acceptance; the recipes that
-            # rely on min_tokens do not run speculative decoding.
+            # One logits row per sequence here, so row index == request index.
             if batch.min_tokens.any():
                 apply_min_tokens_mask(
                     logits,
@@ -3265,6 +3267,31 @@ class ModelRunner:
 
             bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
             target_logits = torch.index_select(logits, 0, target_logits_indices)
+            if batch.min_tokens.any():
+                num_draft_tokens = spec_decode_metadata.num_draft_tokens_np
+                spec_bs = len(num_draft_tokens)
+                apply_min_tokens_mask_with_spec_decode(
+                    target_logits,
+                    batch.min_tokens,
+                    batch.num_completion_tokens,
+                    num_draft_tokens,
+                    self.config.eos_token_id,
+                    tuple(self.config.stop_token_ids),
+                    batch.single_token_stops,
+                )
+                # `rejection_sample` keeps the bonus token only when every
+                # draft was accepted and writes the -1 sentinel otherwise, so
+                # whenever it survives it sits exactly `num_draft_tokens` past
+                # the current length. Scoring it at that position is exact,
+                # not conservative.
+                apply_min_tokens_mask(
+                    bonus_logits,
+                    batch.min_tokens[:spec_bs],
+                    batch.num_completion_tokens[:spec_bs] + num_draft_tokens,
+                    self.config.eos_token_id,
+                    tuple(self.config.stop_token_ids),
+                    batch.single_token_stops,
+                )
             bonus_token_ids = self.sampler(
                 logits=bonus_logits,
                 temperatures=temperatures,

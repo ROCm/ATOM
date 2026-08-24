@@ -201,6 +201,36 @@ class TestSchedule:
         np.testing.assert_array_equal(batch.num_completion_tokens, [0])
         assert batch.single_token_stops == [{7}]
 
+    def test_min_tokens_metadata_discounts_placeholder_tokens(
+        self, scheduler, seq_factory
+    ):
+        """Deferred output appends a placeholder that holds no sampled token.
+
+        Counting it would move a request across its floor one real token
+        early -- the same over-count `postprocess` already corrects for before
+        it compares against `max_tokens`.
+        """
+        seq = seq_factory([1, 2, 3, 4], sampling_params=SamplingParams(min_tokens=4))
+        scheduler.add(seq)
+        scheduler.schedule()
+        scheduler.postprocess(
+            list(scheduler.running),
+            ScheduledBatchOutput(
+                req_ids=[seq.id],
+                token_ids=[(10,)],
+                num_rejected=np.zeros(1, dtype=np.int32),
+                num_bonus=np.zeros(1, dtype=np.int32),
+                draft_token_ids=None,
+                is_deferred_out=True,
+            ),
+        )
+        assert seq.num_placeholder_tokens == 1
+
+        batch, _seqs = scheduler.schedule()
+
+        # One real sampled token, whatever the placeholder width happens to be.
+        np.testing.assert_array_equal(batch.num_completion_tokens, [1])
+
     def test_prefill_respects_max_num_seqs(self, seq_factory):
         sched = Scheduler(
             MockConfig(
@@ -1184,6 +1214,104 @@ class TestPostprocess:
         )
         assert len(finished) == 1
         assert finished[0].leave_reason == "stop_sequence"
+
+    def test_min_tokens_holds_off_a_multi_token_stop(self, scheduler, seq_factory):
+        """The one stop condition the sampler's mask cannot reach.
+
+        A two-token suffix is only recognizable here, after both tokens have
+        landed, so the floor has to be enforced at this end too.
+        """
+        seq = self._prefill(
+            scheduler,
+            seq_factory(
+                [1, 2, 3, 4],
+                sampling_params=SamplingParams(min_tokens=3, ignore_eos=True),
+                stop_token_sequences=[[10, 11]],
+            ),
+        )
+        scheduler.postprocess(list(scheduler.running), self._output(seq.id, [10]))
+        finished = scheduler.postprocess(
+            list(scheduler.running), self._output(seq.id, [11])
+        )
+        assert finished == []
+
+        scheduler.postprocess(list(scheduler.running), self._output(seq.id, [10]))
+        finished = scheduler.postprocess(
+            list(scheduler.running), self._output(seq.id, [11])
+        )
+        assert len(finished) == 1
+        assert finished[0].leave_reason == "stop_sequence"
+
+    def test_min_tokens_holds_off_eos(self, scheduler, seq_factory):
+        """Backstop for the sampler's mask, and the whole story under MTP,
+        where the rejection sampler can hand back a token the mask did shape
+        but a later consumer still has to agree about."""
+        seq = self._prefill(
+            scheduler,
+            seq_factory([1, 2, 3, 4], sampling_params=SamplingParams(min_tokens=2)),
+        )
+        finished = scheduler.postprocess(
+            list(scheduler.running), self._output(seq.id, [2])
+        )
+        assert finished == []
+
+        finished = scheduler.postprocess(
+            list(scheduler.running), self._output(seq.id, [2])
+        )
+        assert len(finished) == 1
+        assert finished[0].leave_reason == "eos"
+
+    def test_min_tokens_does_not_outlive_max_tokens(self, scheduler, seq_factory):
+        """A floor that reaches the ceiling must still terminate there.
+
+        `max_tokens` is outside the guard on purpose; this is the test that
+        fails if it ever moves inside and a request stops being able to end.
+        """
+        seq = self._prefill(
+            scheduler,
+            seq_factory(
+                [1, 2, 3, 4],
+                sampling_params=SamplingParams(
+                    min_tokens=2, max_tokens=2, ignore_eos=True
+                ),
+            ),
+        )
+        scheduler.postprocess(list(scheduler.running), self._output(seq.id, [10]))
+        finished = scheduler.postprocess(
+            list(scheduler.running), self._output(seq.id, [11])
+        )
+        assert len(finished) == 1
+        assert finished[0].leave_reason == "max_tokens"
+
+    def test_stop_token_ids_held_off_below_min_tokens(self, seq_factory):
+        sched = Scheduler(MockConfig(stop_token_ids=[99]))
+        seq = seq_factory([1, 2, 3, 4], sampling_params=SamplingParams(min_tokens=2))
+        sched.add(seq)
+        sched.schedule()
+        finished = sched.postprocess(
+            list(sched.running),
+            ScheduledBatchOutput(
+                req_ids=[seq.id],
+                token_ids=[(99,)],
+                num_rejected=None,
+                num_bonus=None,
+                draft_token_ids=None,
+            ),
+        )
+        assert finished == []
+
+        finished = sched.postprocess(
+            list(sched.running),
+            ScheduledBatchOutput(
+                req_ids=[seq.id],
+                token_ids=[(99,)],
+                num_rejected=None,
+                num_bonus=None,
+                draft_token_ids=None,
+            ),
+        )
+        assert len(finished) == 1
+        assert "stop_99" in finished[0].leave_reason
 
     def test_finished_removed_from_running(self, scheduler, seq_factory):
         seq = self._prefill(scheduler, seq_factory([1, 2, 3, 4]))

@@ -422,8 +422,19 @@ class ScheduledBatch:
         # Both payloads below are read only while a sequence sits under its
         # floor, so the min_tokens=0 batch — the common case — skips them.
         if self.min_tokens.any():
+            # `num_completion_tokens` counts the trailing placeholders the last
+            # postprocess appended -- `mtp_k` of them when verifying drafts,
+            # plus one in deferred-output mode -- and those slots hold no
+            # sampled token yet. Counting them would let a request cross its
+            # floor early, by exactly the placeholder width, which is the
+            # correction `postprocess` makes for the same reason before it
+            # compares against `max_tokens`.
             self.num_completion_tokens = np.asarray(
-                [seq.num_completion_tokens for seq in seqs.values()], dtype=np.int32
+                [
+                    seq.num_completion_tokens - seq.num_placeholder_tokens
+                    for seq in seqs.values()
+                ],
+                dtype=np.int32,
             )
             self.single_token_stops = [seq.single_token_stops for seq in seqs.values()]
         else:
@@ -2335,8 +2346,22 @@ class Scheduler:
             # Track the earliest stop position so `num_tokens` can drop the
             # spurious tail below.
             stop_at_idx: int | None = None
+            # A sequence below its `min_tokens` floor cannot stop naturally.
+            # The sampler has already kept EOS, the server's stop tokens and
+            # the single-token stops out of the logits it sampled from, so what
+            # this holds off is the one stop condition the sampler cannot see:
+            # a multi-token stop sequence, recognizable only here, once its
+            # whole suffix has landed. `max_tokens` is deliberately left
+            # outside the guard -- the ceiling always wins, and
+            # `SamplingParams` has already rejected `min_tokens > max_tokens`.
+            # `seq.min_tokens` is 0 for every request that does not ask for a
+            # floor, so the common path stops at the first term.
+            below_min_tokens = (
+                seq.min_tokens > 0
+                and (num_tokens - seq.num_prompt_tokens) < seq.min_tokens
+            )
             # Check if sequence ends with any stop sequence
-            for stop_seq in seq.stop_token_sequences:
+            for stop_seq in () if below_min_tokens else seq.stop_token_sequences:
                 stop_len = len(stop_seq)
                 if num_tokens >= stop_len:
                     is_stop = False
@@ -2354,11 +2379,18 @@ class Scheduler:
                         break
             else:
                 # Check the last token in the list for EOS
-                if token_ids and not seq.ignore_eos and self.eos_token_id in token_ids:
+                if (
+                    not below_min_tokens
+                    and token_ids
+                    and not seq.ignore_eos
+                    and self.eos_token_id in token_ids
+                ):
                     leave_reason = "eos"
                     stop_at_idx = token_ids.index(self.eos_token_id)
-                elif not seq.ignore_eos and any(
-                    t in self.stop_token_ids for t in token_ids
+                elif (
+                    not below_min_tokens
+                    and not seq.ignore_eos
+                    and any(t in self.stop_token_ids for t in token_ids)
                 ):
                     stop_at_idx = next(
                         i for i, t in enumerate(token_ids) if t in self.stop_token_ids

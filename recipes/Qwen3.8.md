@@ -90,13 +90,16 @@ curl http://localhost:8000/v1/chat/completions -H 'Content-Type: application/jso
 }'
 ```
 
-Semantics, as implemented in [`apply_min_tokens_mask`](../atom/model_ops/sampler.py):
+The floor is enforced in two places, because no single one of them sees every way a request can end:
 
-- While a request has generated fewer than `min_tokens` tokens, the EOS id, the server's configured `stop_token_ids`, and any **single-token** stop strings are masked to `-inf` before sampling. Masking logits (rather than dropping a sampled EOS) keeps the sampled distribution intact — feeding a sampled EOS back into the model would start a new message.
-- Multi-token stop sequences are unaffected; the scheduler still terminates on them once the full suffix is observed.
+- **At the sampler**, [`apply_min_tokens_mask`](../atom/model_ops/sampler.py) masks the EOS id, the server's configured `stop_token_ids` and any **single-token** stop strings to `-inf` before sampling, for every request still below its floor. Masking logits (rather than dropping a sampled EOS) keeps the sampled distribution intact — feeding a sampled EOS back into the model would start a new message.
+- **At the scheduler**, `Scheduler.postprocess` refuses to finish a sequence below its floor. This is what holds off the one stop condition the sampler cannot see: a **multi-token** stop sequence, recognizable only after its whole suffix has landed. `max_tokens` stays outside that guard — the ceiling always wins, and `min_tokens > max_tokens` is rejected up front.
+
+Further semantics:
+
 - `0 <= min_tokens <= max_tokens` is validated in `SamplingParams`.
-- The mask is applied on the non-speculative path only. Draft tokens are verified against the target distribution, so masking target logits would bias acceptance — do not combine `min_tokens` with MTP/speculative decoding.
-- Batches where every request has `min_tokens=0` skip the mask and the per-step stop-set construction entirely, so the default path costs nothing.
+- Speculative decoding is supported. [`apply_min_tokens_mask_with_spec_decode`](../atom/model_ops/sampler.py) masks only the leading draft rows a request can still reach below its floor — a draft position reachable only after the tokens ahead of it in the same forward is no longer below it. The bonus row is scored at `num_draft_tokens` past the current length, which is exactly where it lands on the only path that keeps it (all drafts accepted). ATOM's rejection sampler is argmax-based, so a masked terminal token simply stops being `target_argmax`: a draft that proposed EOS too early is rejected and the sequence continues from the target's own token.
+- Batches where every request has `min_tokens=0` skip the mask, the per-step stop-set construction and the scheduler guard entirely, so the default path costs nothing.
 
 ## Accuracy
 
