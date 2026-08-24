@@ -713,7 +713,6 @@ def _build_stream_chunk(request_output: RequestOutput, request_id: str) -> dict:
         "finished_at": time.time(),
         "started_at": started_at,
         "num_cached_tokens": getattr(request_output, "num_cached_tokens", 0),
-        "stop_reason": request_output.stop_reason,
         "stop_truncate_to": request_output.stop_truncate_to,
     }
     if getattr(request_output, "kv_transfer_params_output", None):
@@ -794,7 +793,6 @@ async def generate_async(
     # consumer that starts reading that key has to convert.
     all_token_ids = new_token_ids()
     finish_reason: str | None = None
-    stop_reason: str | None = None
     stop_truncate_to: int = -1
     seq = None
     kv_transfer_output_meta_info = None
@@ -815,7 +813,6 @@ async def generate_async(
                 "token_ids": request_output.output_tokens,
                 "finished": request_output.finished,
                 "finish_reason": request_output.finish_reason,
-                "stop_reason": request_output.stop_reason,
                 "stop_truncate_to": request_output.stop_truncate_to,
                 "ts": now,
             },
@@ -850,7 +847,6 @@ async def generate_async(
                 all_token_ids.extend(token_ids)
             if item.get("finished", False):
                 finish_reason = item.get("finish_reason")
-                stop_reason = item.get("stop_reason")
                 stop_truncate_to = item.get("stop_truncate_to", -1)
                 _finished_ok = True
                 break
@@ -896,10 +892,6 @@ async def generate_async(
         "text": text,
         "token_ids": all_token_ids,
         "finish_reason": finish_reason,
-        # Which stop string ended it, when one did. `finish_reason` says only
-        # that a stop sequence fired, and Anthropic's schema pairs the reason
-        # with the matched string.
-        "stop_reason": stop_reason,
         "num_tokens_input": num_tokens_input,
         "num_tokens_output": num_tokens_output,
         "ttft": ttft,
@@ -928,7 +920,6 @@ async def generate_async_multimodal(
     last_token_at: float | None = None
     all_token_ids = new_token_ids()
     finish_reason: str | None = None
-    stop_reason: str | None = None
     stop_truncate_to: int = -1
     seq = None
 
@@ -940,7 +931,6 @@ async def generate_async_multimodal(
                 "token_ids": request_output.output_tokens,
                 "finished": request_output.finished,
                 "finish_reason": request_output.finish_reason,
-                "stop_reason": request_output.stop_reason,
                 "stop_truncate_to": request_output.stop_truncate_to,
                 "ts": now,
             },
@@ -975,7 +965,6 @@ async def generate_async_multimodal(
                 all_token_ids.extend(token_ids_out)
             if item.get("finished", False):
                 finish_reason = item.get("finish_reason")
-                stop_reason = item.get("stop_reason")
                 stop_truncate_to = item.get("stop_truncate_to", -1)
                 _finished_ok = True
                 break
@@ -1010,10 +999,6 @@ async def generate_async_multimodal(
         "text": text,
         "token_ids": all_token_ids,
         "finish_reason": finish_reason,
-        # Which stop string ended it, when one did. `finish_reason` says only
-        # that a stop sequence fired, and Anthropic's schema pairs the reason
-        # with the matched string.
-        "stop_reason": stop_reason,
         "num_tokens_input": (
             seq.num_prompt_tokens if seq is not None else len(token_ids)
         ),

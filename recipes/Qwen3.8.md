@@ -116,7 +116,7 @@ Further semantics:
 Stop strings are matched on text rather than on pre-encoded token ids because a client's spelling of one need not tokenize the way the model emits it — `"five,"` is `[52670, 11]` standing alone but `[4236, 11]` mid-sentence — and a token-level match simply never fires, with nothing reporting it.
 
 - `include_stop_str_in_output` (default `False`) decides whether the matched stop string stays in the returned text. `False` matches OpenAI, vLLM and TGI.
-- The matched string comes back as `stop_reason`, alongside `finish_reason: stop_sequence`.
+- `finish_reason` reads `stop_sequence`. Which stop string matched is not reported: OpenAI's schema has no field for it, and vLLM likewise keeps it off its OpenAI endpoint.
 - The abort is asynchronous, so a few tokens may be generated after the match; they are dropped rather than returned.
 
 ## Accuracy

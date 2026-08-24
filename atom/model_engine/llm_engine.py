@@ -564,10 +564,10 @@ class InputOutputProcessor:
         self.tokenizer = tokenizer
         self.block_size = block_size
         self.requests = {}
-        # req_id -> (stop_string, truncate_to) for requests a stop string
-        # ended. Written by the wrapped stream callback, read once by
-        # `postprocess`, which removes the entry with the request.
-        self._stop_string_hits: dict[int, tuple[str, int]] = {}
+        # req_id -> truncate_to, for requests a stop string ended. Written by
+        # the wrapped stream callback, read once by `postprocess`, which
+        # removes the entry with the request.
+        self._stop_string_hits: dict[int, int] = {}
         # Set by LLMEngine once its CoreManager exists. A stop string is
         # decided here, in the frontend, so ending the request means telling
         # the engine core to stop working on it.
@@ -642,7 +642,10 @@ class InputOutputProcessor:
                 )
                 hit = check_stop_strings(detokenizer.text, len(delta), stops, include)
                 if hit is not None:
-                    stop_string, truncate_to = hit
+                    # Only the cut is kept. Which stop string matched is not
+                    # reported: `finish_reason` already says one did, and
+                    # OpenAI's schema has no field for the identity.
+                    _stop_string, truncate_to = hit
                     if truncate_to < 0:
                         # `check_stop_strings` says -1 when the match already
                         # ends the text, so there is nothing to cut *yet*. The
@@ -654,12 +657,8 @@ class InputOutputProcessor:
                     state["stopped"] = True
                     request_output.finished = True
                     request_output.finish_reason = "stop_sequence"
-                    request_output.stop_reason = stop_string
                     request_output.stop_truncate_to = truncate_to
-                    self._stop_string_hits[request_output.request_id] = (
-                        stop_string,
-                        truncate_to,
-                    )
+                    self._stop_string_hits[request_output.request_id] = truncate_to
                     if self.abort_request is not None:
                         try:
                             self.abort_request(request_output.request_id)
@@ -822,10 +821,8 @@ class InputOutputProcessor:
             # and the reason reads `stop_sequence` rather than whatever the
             # engine core happened to report for the tokens that arrived
             # before the abort took hold.
-            stop_hit = self._stop_string_hits.pop(req.id, None)
-            stop_reason = None
-            if stop_hit is not None:
-                stop_reason, truncate_to = stop_hit
+            truncate_to = self._stop_string_hits.pop(req.id, None)
+            if truncate_to is not None:
                 if truncate_to >= 0:
                     output_str = output_str[:truncate_to]
                 req.leave_reason = "stop_sequence"
@@ -857,7 +854,6 @@ class InputOutputProcessor:
                 "logprobs": list(req.logprobs) if req.return_logprobs else None,
                 "latency": req.leave_time - req.arrive_time,
                 "finish_reason": req.leave_reason,
-                "stop_reason": stop_reason,
                 "num_tokens_input": req.num_prompt_tokens,
                 "num_tokens_output": req.num_completion_tokens,
                 "ttft": ttft,  # Time to first token in seconds

@@ -498,9 +498,8 @@ class SingleRequestState:
         # `text` and the counters and never `token_ids`.
         self.token_ids = new_token_ids()
         self.finish_reason: str | None = None
-        # Set with `finish_reason` when a stop string ended the request: which
-        # one, and where the text has to be cut. -1 leaves the text alone.
-        self.stop_reason: str | None = None
+        # Where the text has to be cut when a stop string ended the request.
+        # -1 leaves it alone.
         self.stop_truncate_to: int = -1
         self.num_tokens_input = 0
         self.kv_transfer_output_meta_info: Any = None
@@ -525,7 +524,6 @@ class SingleRequestState:
                 self.token_ids.extend(output_tokens)
             if request_output.finished:
                 self.finish_reason = request_output.finish_reason
-                self.stop_reason = request_output.stop_reason
                 self.stop_truncate_to = request_output.stop_truncate_to
                 self.future.set_result([self._build_output(time.time())])
 

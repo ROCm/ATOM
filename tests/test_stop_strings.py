@@ -155,10 +155,12 @@ def test_a_stop_string_finishes_and_aborts_the_request():
     cb(_output([2]))
     assert seen[-1].finished is True
     assert seen[-1].finish_reason == "stop_sequence"
-    assert seen[-1].stop_reason == "STOP"
     assert seen[-1].stop_truncate_to == 2  # cut back to "ab"
+    # Which stop string matched is deliberately not reported -- `finish_reason`
+    # already says one did, and OpenAI's schema has no field for the identity.
+    assert not hasattr(seen[-1], "stop_reason")
     assert proc.aborted == [7], "the engine core has to be told to stop"
-    assert proc.impl._stop_string_hits[7] == ("STOP", 2)
+    assert proc.impl._stop_string_hits[7] == 2
 
 
 def test_output_arriving_before_the_abort_lands_is_dropped():
@@ -195,7 +197,7 @@ def test_include_stop_str_in_output_keeps_it():
 
     cb(_output([1]))
     cb(_output([2]))
-    assert seen[-1].stop_reason == "STOP"
+    assert seen[-1].finish_reason == "stop_sequence"
     # The match ends the text, so `check_stop_strings` alone would say -1.
     # The wrapper pins the length anyway: the abort is asynchronous, and
     # tokens emitted before it lands would otherwise be appended past the
@@ -215,6 +217,6 @@ def test_a_tail_arriving_after_the_match_is_still_cut_off():
     )
 
     cb(_output([1]))
-    truncate_to = proc.impl._stop_string_hits[7][1]
+    truncate_to = proc.impl._stop_string_hits[7]
     # Whatever arrives next, the recorded cut still ends at the stop string.
     assert "abSTOP tail"[:truncate_to] == "abSTOP"

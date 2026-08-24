@@ -32,12 +32,7 @@ _WAITING_SINCE: dict[int, float] = {}
 # Fields a later chunk overrides on the one it merges into, when it has a value
 # of its own. The SSE consumers keep the newest non-empty value they see, so
 # merging this way hands them what reading each chunk separately would have.
-_LATEST_WINS = (
-    "finish_reason",
-    "kv_transfer_params",
-    "num_cached_tokens",
-    "stop_reason",
-)
+_LATEST_WINS = ("finish_reason", "kv_transfer_params", "num_cached_tokens")
 
 
 def merge_chunk(into: dict, new: dict) -> None:

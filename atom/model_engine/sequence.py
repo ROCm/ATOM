@@ -178,9 +178,8 @@ class Sequence:
         # the request. Carried here only so that owner can read them back.
         self.stop_strings = sampling_params.stop_strings
         self.include_stop_str_in_output = sampling_params.include_stop_str_in_output
-        # Which stop string fired, and how far to cut the text, both written
-        # by that same owner. `-1` means the text stands as generated.
-        self.stop_reason: str | None = None
+        # How far to cut the text, written by that same owner. `-1` means the
+        # text stands as generated.
         self.stop_truncate_to: int = -1
         # This request's own terminal token ids, on top of the server-wide
         # `config.stop_token_ids` the scheduler holds. A set because both
