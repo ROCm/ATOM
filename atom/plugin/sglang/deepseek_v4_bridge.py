@@ -791,25 +791,35 @@ def bind_deepseek_v4_proxy_cache_views(model, proxy_pool: Any) -> bool:
     if getattr(model, "_atom_sglang_v4_proxy_cache_ptr", None) == ptr:
         return True
 
+    geometry = _proxy_pool_geometry(proxy_pool)
     csa_i = 0
     hca_i = 0
     for local_layer_id, block in enumerate(_iter_deepseek_v4_cache_blocks(model)):
         attn = block.attn
         ratio = int(attn.compress_ratio)
         attn.unified_kv = proxy_pool.views["unified"][local_layer_id]
-        attn.unified_kv_rope = proxy_pool.views["unified_rope"][local_layer_id]
         attn.kv_fp8 = bool(proxy_pool.use_fp8_kv)
+        if attn.kv_fp8:
+            attn.unified_kv_rope = proxy_pool.views["unified_rope"][local_layer_id]
+        else:
+            attn.unified_kv_rope = None
+        # V4Attention.forward reads swa_plane / swa_plane_rope / swa_window for
+        # decode fused writes and fp8 prefill swa_write; keep them aligned with
+        # the vLLM bridge contract (#1600).
+        attn.swa_plane = attn.unified_kv
+        attn.swa_window = geometry.window_params(ratio)
         # The shared kernels address SWA as a per-request ring,
         # `slot*cache_size + pos%cache_size`, which is the layout this pool
         # already had; it is exposed flat because the kernels index rows.
         swa_view = proxy_pool.views["swa"][local_layer_id]
         attn.swa_kv = swa_view.reshape(-1, swa_view.shape[-1])
-        swa_rope_view = proxy_pool.views["swa_rope"][local_layer_id]
-        attn.swa_kv_rope = (
-            swa_rope_view.reshape(-1, swa_rope_view.shape[-1])
-            if swa_rope_view is not None
-            else None
-        )
+        if attn.kv_fp8 and attn.unified_kv_rope is not None:
+            swa_rope_view = proxy_pool.views["swa_rope"][local_layer_id]
+            attn.swa_kv_rope = swa_rope_view.reshape(-1, swa_rope_view.shape[-1])
+            attn.swa_plane_rope = attn.unified_kv_rope
+        else:
+            attn.swa_kv_rope = None
+            attn.swa_plane_rope = None
         attn.swa_cache_size = proxy_pool.swa_cache_size
         if ratio == 4:
             indexer_topk = int(attn.indexer.index_topk)
@@ -846,7 +856,6 @@ def bind_deepseek_v4_proxy_cache_views(model, proxy_pool: Any) -> bool:
             hca_i += 1
 
     model._atom_sglang_v4_proxy_cache_ptr = ptr
-    geometry = _proxy_pool_geometry(proxy_pool)
     proxy_pool._atom_v4_geometry = geometry
     model._atom_v4_meta_params = SimpleNamespace(
         num_slots=proxy_pool.num_slots,
