@@ -46,8 +46,9 @@ sees ``finished_sending`` (``scheduler.py``: producer path), and it can *also*
 free on ``finished_saving`` when the connector does not defer. If offload is
 still reading those blocks for its save when the moriio send completes (or vice
 versa), the free would corrupt the in-flight transfer. So when a request needs
-**both** a send and a save, ``MultiConnector`` withholds *both* completion
-signals until the pair is done, then emits them together. The scheduler's
+**both** a send and one or more saves, ``MultiConnector`` withholds *both*
+completion signals until every known save is done, then emits them together.
+The scheduler's
 ``finished_sending`` handler frees first; the ``finished_saving`` handler then
 finds nothing to free and no-ops. This is the analogue of vLLM's
 ``_extra_async_saves`` refcount.
@@ -66,6 +67,7 @@ from atom.kv_transfer.disaggregation.base import (
 from atom.kv_transfer.disaggregation.types import (
     ConnectorMetadata,
     KVConnectorOutput,
+    SaveCompletionId,
     completion_req_key,
 )
 
@@ -216,9 +218,12 @@ class MultiConnector(KVConnectorBase):
         # Send/save pairing state (see module docstring).
         # _pending_save: str(req_id) for requests offload will save this lifetime.
         self._pending_save: set[str] = set()
-        # _sent / _saved: completed-but-unpaired transfers, str(req_id) -> raw id.
+        # _pending_save_ops: exact save operations not reported complete yet,
+        # grouped by request key. Legacy metadata uses the request key itself.
+        self._pending_save_ops: dict[str, set[SaveCompletionId]] = {}
+        # _sent / _saved: completed-but-unpaired transfers, str(req_id) -> raw ids.
         self._sent: dict[str, Any] = {}
-        self._saved: dict[str, Any] = {}
+        self._saved: dict[str, set[SaveCompletionId]] = {}
 
     def register_kv_caches(
         self,
@@ -245,8 +250,18 @@ class MultiConnector(KVConnectorBase):
             reqs = getattr(m, "requests", None)
             if reqs:
                 for req in reqs:
-                    if getattr(req, "save_spec", None) is not None:
-                        self._pending_save.add(str(req.req_id))
+                    has_save = (
+                        getattr(req, "save_spec", None) is not None
+                        or getattr(req, "slot_save_spec", None) is not None
+                    )
+                    if not has_save:
+                        continue
+                    req_key = completion_req_key(req.req_id)
+                    self._pending_save.add(req_key)
+                    operation = getattr(req, "save_operation", None)
+                    self._pending_save_ops.setdefault(req_key, set()).add(
+                        operation if operation is not None else req_key
+                    )
             c.start_load_kv(m)
 
     def get_finished(self) -> KVConnectorOutput:
@@ -285,19 +300,31 @@ class MultiConnector(KVConnectorBase):
         for r in send_now:
             self._sent[str(r)] = r
         for r in save_now:
-            self._saved[completion_req_key(r)] = r
+            key = completion_req_key(r)
+            self._saved.setdefault(key, set()).add(r)
+            pending_ops = self._pending_save_ops.get(key)
+            if pending_ops is not None:
+                if r in pending_ops:
+                    pending_ops.discard(r)
+                else:
+                    # Metadata from a legacy connector has no exact operation
+                    # ID and is represented by the request key.
+                    pending_ops.discard(key)
+                if not pending_ops:
+                    self._pending_save_ops.pop(key, None)
 
         rel_send: set = set()
         rel_save: set = set()
         for key, raw in list(self._sent.items()):
             needs_save = key in self._pending_save
-            if needs_save and key not in self._saved:
+            pending_ops = self._pending_save_ops.get(key)
+            if needs_save and pending_ops:
                 continue  # hold: save still in flight for this request
             rel_send.add(raw)
             del self._sent[key]
             self._pending_save.discard(key)
-            if key in self._saved:
-                rel_save.add(self._saved.pop(key))
+            self._pending_save_ops.pop(key, None)
+            rel_save.update(self._saved.pop(key, set()))
 
         out.finished_sending = rel_send
         out.finished_saving = rel_save

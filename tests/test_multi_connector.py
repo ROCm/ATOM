@@ -160,6 +160,7 @@ def _worker(connectors, pp_is_head=True):
     obj.is_producer = any(getattr(c, "is_producer", False) for c in connectors)
     obj._pp_is_head = pp_is_head
     obj._pending_save = set()
+    obj._pending_save_ops = {}
     obj._sent = {}
     obj._saved = {}
     return obj
@@ -170,6 +171,21 @@ def _save_meta(*req_ids):
     meta = ConnectorMetadata()
     meta.requests = [
         SimpleNamespace(req_id=r, save_spec=object(), load_spec=None) for r in req_ids
+    ]
+    return meta
+
+
+def _save_operation_meta(*operations):
+    """Offload metadata carrying exact save operation identities."""
+    meta = ConnectorMetadata()
+    meta.requests = [
+        SimpleNamespace(
+            req_id=operation.req_id,
+            save_spec=object(),
+            load_spec=None,
+            save_operation=operation,
+        )
+        for operation in operations
     ]
     return meta
 
@@ -418,6 +434,38 @@ def test_pairing_matches_save_operation_id():
     assert out.finished_sending == {9}
     assert out.finished_saving == {op}
     assert w._pending_save == set()
+    assert w._sent == {}
+    assert w._saved == {}
+
+
+def test_pairing_waits_for_all_save_operation_ids():
+    # Hybrid offload can have multiple save generations for one request in
+    # flight. A request-level single-value _saved entry would overwrite the
+    # first completion and release the send after only one save.
+    moriio = FakeWorkerSub(is_producer=True)
+    off = FakeWorkerSub()
+    w = _worker([moriio, off])
+    op0 = SaveOperationId(9, 2)
+    op1 = SaveOperationId(9, 3)
+    w.start_load_kv(
+        MultiConnectorMetadata(
+            [ConnectorMetadata(), _save_operation_meta(op0, op1)]
+        )
+    )
+
+    moriio._finished = ({9}, set())
+    off._finished = KVConnectorOutput(finished_saving={op0})
+    out1 = w.get_finished()
+    assert out1.finished_sending == set()
+    assert out1.finished_saving == set()
+
+    moriio._finished = (set(), set())
+    off._finished = KVConnectorOutput(finished_saving={op1})
+    out2 = w.get_finished()
+    assert out2.finished_sending == {9}
+    assert out2.finished_saving == {op0, op1}
+    assert w._pending_save == set()
+    assert w._pending_save_ops == {}
     assert w._sent == {}
     assert w._saved == {}
 
