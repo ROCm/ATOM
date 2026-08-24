@@ -693,6 +693,67 @@ def dcp_global_pos(local_index, dcp_rank, dcp_size, cp_kv_cache_interleave_size=
     ) * cp_kv_cache_interleave_size + (local_index % cp_kv_cache_interleave_size)
 
 
+@triton.jit
+def _dcp_pack_topk_kernel(
+    logits_ptr,  # [rows, l_max] fp32 -- this rank's local score plane
+    idx_ptr,  # [rows, k]     int32 -- local top-k column ids
+    lens_ptr,  # [rows]        int32 -- this rank's local KV length
+    out_ptr,  # [2, rows, k]  fp32  -- plane 0 score, plane 1 int32 gid bits
+    logits_stride_r,
+    logits_stride_c,
+    idx_stride_r,
+    idx_stride_c,
+    lens_stride,
+    out_stride_p,
+    out_stride_r,
+    out_stride_c,
+    K,
+    DCP_RANK: tl.constexpr,
+    DCP_WORLD: tl.constexpr,
+    INTERLEAVE: tl.constexpr,  # cp_kv_cache_interleave_size S (1 = round-robin)
+    BLOCK_K: tl.constexpr,
+):
+    """Fused (bound-check, score gather, global-id) pack. One program per
+    (row, BLOCK_K columns).
+
+    Replaces 19 eager kernels; the intermediates they materialised (`valid`,
+    `safe`, `sc`, the six `dcp_global_pos` steps) never leave registers, which
+    is where nearly all of this segment's HBM traffic came from.
+    """
+    r = tl.program_id(0).to(tl.int64)
+    col = tl.program_id(1) * BLOCK_K + tl.arange(0, BLOCK_K)
+    mask = col < K
+
+    idx = tl.load(idx_ptr + r * idx_stride_r + col * idx_stride_c, mask=mask, other=-1)
+    ln = tl.load(lens_ptr + r * lens_stride)
+    # Bound-check rather than assume a padding convention from the aiter kernel.
+    valid = mask & (idx >= 0) & (idx < ln)
+
+    safe = tl.where(valid, idx, 0).to(tl.int64)
+    sc = tl.load(
+        logits_ptr + r * logits_stride_r + safe * logits_stride_c,
+        mask=valid,
+        other=0.0,
+    )
+    sc = tl.where(valid, sc, float("-inf"))
+
+    # Under interleave-S sharding a local index j on rank r is global position
+    # ((j//S)*W + r)*S + j%S; S=1 collapses to the round-robin j*W + r.
+    if INTERLEAVE == 1:
+        gid = idx * DCP_WORLD + DCP_RANK
+    else:
+        gid = ((idx // INTERLEAVE) * DCP_WORLD + DCP_RANK) * INTERLEAVE + (
+            idx % INTERLEAVE
+        )
+    gid = tl.where(valid, gid, -1)
+
+    base = out_ptr + r * out_stride_r + col * out_stride_c
+    tl.store(base, sc, mask=mask)
+    # Plane 1 carries the int32 bit pattern in an fp32 slot: the collective only
+    # copies bits and the consumer reads it back through an int32 view.
+    tl.store(base + out_stride_p, gid.to(tl.float32, bitcast=True), mask=mask)
+
+
 def dcp_pack_topk_candidates(
     local_logits,
     local_idx,
@@ -713,20 +774,107 @@ def dcp_pack_topk_candidates(
     ``((j//S)*W + r)*S + j%S`` (S=1 -> the round-robin j*W + r), so the id is
     globally unique -- which is what makes the tie-break a total order.
     """
-    rows, _k = local_idx.shape
-    # Bound-check rather than assume a padding convention from the aiter kernel.
-    valid = (local_idx >= 0) & (local_idx < local_lens.view(rows, 1))
-    safe = torch.where(valid, local_idx, torch.zeros_like(local_idx))
-    sc = torch.gather(local_logits, 1, safe.to(torch.int64))
-    out_pair[0].copy_(torch.where(valid, sc, torch.full_like(sc, -float("inf"))))
-    gid = torch.where(
-        valid,
-        dcp_global_pos(
-            local_idx, dcp_rank, dcp_world_size, cp_kv_cache_interleave_size
-        ),
-        torch.full_like(local_idx, -1),
+    rows, k = local_idx.shape
+    BLOCK_K = 256
+    _dcp_pack_topk_kernel[(rows, triton.cdiv(k, BLOCK_K))](
+        local_logits,
+        local_idx,
+        local_lens,
+        out_pair,
+        local_logits.stride(0),
+        local_logits.stride(1),
+        local_idx.stride(0),
+        local_idx.stride(1),
+        local_lens.stride(0),
+        out_pair.stride(0),
+        out_pair.stride(1),
+        out_pair.stride(2),
+        k,
+        DCP_RANK=dcp_rank,
+        DCP_WORLD=dcp_world_size,
+        INTERLEAVE=cp_kv_cache_interleave_size,
+        BLOCK_K=BLOCK_K,
+        num_warps=4,
     )
-    out_pair.view(torch.int32)[1].copy_(gid)
+
+
+@triton.jit
+def _dcp_gather_candidate_gids_kernel(
+    recv_ptr,  # [W, 2, rows, k] int32 view of the all-gathered pairs
+    cand_ptr,  # [rows, topk]    int32 -- merge output, index into [0, W*k)
+    out_ptr,  # [rows, topk]    int32 -- global ids
+    recv_stride_w,
+    recv_stride_p,
+    recv_stride_r,
+    recv_stride_c,
+    cand_stride_r,
+    cand_stride_c,
+    out_stride_r,
+    out_stride_c,
+    TOPK,
+    K_LOC: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Map merged candidate indices back to global ids, straight off the
+    all-gather buffer.
+
+    The eager version had to `reshape` the permuted ``[rows, W, k]`` gid plane
+    into ``[rows, W*k]`` first, which materialises a full rows x W x k copy just
+    so `torch.gather` sees a 2-D tensor. Decomposing the candidate index as
+    ``(w, j) = divmod(c, K_LOC)`` here reads the same elements in place, so the
+    copy, the int64 index cast and the final `copy_` all disappear.
+    """
+    r = tl.program_id(0).to(tl.int64)
+    col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = col < TOPK
+
+    c = tl.load(
+        cand_ptr + r * cand_stride_r + col * cand_stride_c, mask=mask, other=0
+    ).to(tl.int64)
+    w = c // K_LOC
+    j = c % K_LOC
+    gid = tl.load(
+        recv_ptr
+        + w * recv_stride_w
+        + recv_stride_p  # plane 1 = gid
+        + r * recv_stride_r
+        + j * recv_stride_c,
+        mask=mask,
+        other=-1,
+    )
+    tl.store(out_ptr + r * out_stride_r + col * out_stride_c, gid, mask=mask)
+
+
+def dcp_gather_candidate_gids(recv_i32, cand_idx, out):
+    """``out[r, i] = recv_i32[c // k, 1, r, c % k]`` with ``c = cand_idx[r, i]``.
+
+    ``recv_i32`` is the ``[W, 2, rows, k]`` int32 view of the all-gathered
+    (score, gid) pairs; ``cand_idx`` is the merge's row-local candidate index.
+    """
+    # The eager version was a `copy_` of a gather, so the shapes had to match
+    # exactly; keep that contract explicit now that the kernel writes `out`
+    # directly and a mismatch would run off the end of it instead of raising.
+    assert out.shape == cand_idx.shape, (out.shape, cand_idx.shape)
+    rows, topk = cand_idx.shape
+    k_loc = recv_i32.shape[3]
+    BLOCK = 256
+    _dcp_gather_candidate_gids_kernel[(rows, triton.cdiv(topk, BLOCK))](
+        recv_i32,
+        cand_idx,
+        out,
+        recv_i32.stride(0),
+        recv_i32.stride(1),
+        recv_i32.stride(2),
+        recv_i32.stride(3),
+        cand_idx.stride(0),
+        cand_idx.stride(1),
+        out.stride(0),
+        out.stride(1),
+        topk,
+        K_LOC=k_loc,
+        BLOCK=BLOCK,
+        num_warps=4,
+    )
 
 
 # ---------------------------------------------------------------------------

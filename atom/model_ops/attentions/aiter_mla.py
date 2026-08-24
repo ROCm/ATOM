@@ -323,6 +323,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # mla_decode_fwd(g_kv_indptr=...) to apply the global-position causal
             # mask for MTP (max_q_len > 1).
             "g_kv_indptr": CpuGpuBuffer(self.max_bs + 1, **i32_kwargs),
+            # Per-request LOCAL (this rank's shard) KV length under DCP. Same
+            # quantity `get_dcp_local_seq_lens` already produces here on the host;
+            # published so the sparse indexer does not recompute it on device once
+            # per full-index layer (21 layers on GLM-5.2). Layer-invariant: it
+            # depends only on context_lens / S / W / dcp_rank.
+            "dcp_local_context_lens": CpuGpuBuffer(self.max_bs, **i32_kwargs),
             "kv_indices": CpuGpuBuffer(
                 self.max_bs * self.max_num_blocks_per_seq,
                 **i32_kwargs,
@@ -1774,6 +1780,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 self.dcp_rank,
                 self.cp_kv_cache_interleave_size,
             )
+            # Publish it: the sparse indexer used to re-derive this on device with
+            # 8 elementwise kernels per full-index layer.
+            var["dcp_local_context_lens"].np[:scheduled_bs] = local_context_lens
+            var["dcp_local_context_lens"].np[scheduled_bs:bs] = 0
             num_blocks_per_seq = cdiv(local_context_lens, self.block_size)
         elif any(batch.is_first_decode_without_local_prefill):
             num_blocks_per_seq = [
@@ -1952,6 +1962,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # _forward_decode -> mla_decode_fwd for the MTP (max_q_len>1) cprr mask.
         attn_metadata.g_kv_indptr = (
             var["g_kv_indptr"].copy_to_gpu(bs + 1) if self.dcp_world_size > 1 else None
+        )
+        # Layer-invariant local KV lengths for the DCP sparse indexer (see the
+        # buffer's declaration). None off DCP so the consumer falls back.
+        attn_metadata.dcp_local_context_lens = (
+            var["dcp_local_context_lens"].copy_to_gpu(bs)
+            if self.dcp_world_size > 1
+            else None
         )
 
         if ctx_mla_ps_sparse is not None:

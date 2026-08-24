@@ -89,6 +89,7 @@ from atom.model_ops.attention_mla import (
 )
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.dcp_ops import (
+    dcp_gather_candidate_gids,
     dcp_pack_topk_candidates,
     triton_filter_and_convert_dcp_index,
     triton_filter_and_convert_dcp_index_prefill,
@@ -1437,17 +1438,25 @@ def _dcp_decode_candidate_exchange(
         "DCP + DeepSeek-V3.2 sparse indexer (DSA) currently supports "
         "qlen=1 decode only (MTP verify not yet supported)."
     )
-    g_ctx = attn_metadata.context_lens
     # Interleave-S local length (matches get_dcp_local_seq_lens / prepare_decode's
     # slot split): each full S*W super-block gives every rank S tokens, and the
     # tail remainder is handed out S at a time by rank. S=1 -> the round-robin
     # base + (this rank owns the +1 tail?) split.
-    S = cp_kv_cache_interleave_size
-    W = dcp_world_size
-    full_chunks = g_ctx // (S * W)
-    base = full_chunks * S
-    remainder = (g_ctx - base * W - dcp_rank * S).clamp(0, S)
-    local_ctx = (base + remainder).to(torch.int32)
+    #
+    # It depends only on context_lens / S / W / dcp_rank, so it is the same for
+    # every layer and prepare_decode already computes it on the host. Prefer that
+    # published buffer -- deriving it here costs 8 elementwise kernels on every
+    # full-index layer (21 of them on GLM-5.2). The fallback keeps metadata
+    # builders that do not publish it working.
+    local_ctx = getattr(attn_metadata, "dcp_local_context_lens", None)
+    if local_ctx is None or local_ctx.shape[0] != num_rows:
+        g_ctx = attn_metadata.context_lens
+        S = cp_kv_cache_interleave_size
+        W = dcp_world_size
+        full_chunks = g_ctx // (S * W)
+        base = full_chunks * S
+        remainder = (g_ctx - base * W - dcp_rank * S).clamp(0, S)
+        local_ctx = (base + remainder).to(torch.int32)
     l_max = (max_model_len + dcp_world_size - 1) // dcp_world_size
     local_logits = torch.empty([num_rows, l_max], dtype=torch.float32, device="cuda")
     deepgemm_fp8_paged_mqa_logits(
@@ -1505,9 +1514,12 @@ def _dcp_decode_candidate_exchange(
     # Rank is the outer dim after all-gather but the merge wants it on the
     # candidate dim. Selection is provably order-independent, so any consistent
     # permutation works — but scores and gids must use the SAME one.
+    #
+    # Only the SCORE plane needs materialising: aiter's top-k takes a 2-D
+    # (stride0, stride1) pair, and after an all-gather the per-row candidates sit
+    # in W chunks separated by 2*rows*k_loc, which no 2-D stride can express. The
+    # gid plane is read in place by dcp_gather_candidate_gids below.
     gathered_sc = recv[:, 0].permute(1, 0, 2).reshape(num_rows, n_cand).contiguous()
-    # gid plane: [rows, W, k_loc] AllGather view, innermost dim contiguous.
-    gathered_gid = recv[:, 1].permute(1, 0, 2)
     topk_indices_decode = topk_indices[:num_decode_tokens, :topk_tokens]
     cand_idx = torch.empty(
         num_rows, topk_tokens, dtype=torch.int32, device=gathered_sc.device
@@ -1526,11 +1538,9 @@ def _dcp_decode_candidate_exchange(
         topk_tokens,
         stable=True,
     )
-    # Map row-local candidate index -> global id. gathered_gid is the 3D
-    # [rows, W, k_loc] view; reshape materializes a contiguous copy (a few us,
-    # << the second-pass topk this eliminated). gather requires an int64 index.
-    gathered_gid_flat = gathered_gid.reshape(num_rows, n_cand)
-    topk_indices_decode.copy_(torch.gather(gathered_gid_flat, 1, cand_idx.long()))
+    # Map row-local candidate index -> global id, reading recv's gid plane in
+    # place and writing straight into topk_indices.
+    dcp_gather_candidate_gids(recv, cand_idx, topk_indices_decode)
 
 
 def sparse_attn_indexer(

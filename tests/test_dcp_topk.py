@@ -34,7 +34,11 @@ import torch
 try:
     from aiter.ops.topk import top_k_per_row_decode
 
-    from atom.model_ops.dcp_ops import dcp_pack_topk_candidates
+    from atom.model_ops.dcp_ops import (
+        dcp_gather_candidate_gids,
+        dcp_global_pos,
+        dcp_pack_topk_candidates,
+    )
 except ImportError as _e:  # triton/aiter absent on a CPU-only runner
     pytest.skip(f"requires full atom import env: {_e}", allow_module_level=True)
 
@@ -48,6 +52,56 @@ TOPK = 2048
 MAX_MODEL_LEN = 1 << 20
 
 
+# ───────────────────────────────────────────── pack kernel == reference ──
+#
+# `dcp_pack_topk_candidates` became a single Triton kernel on 2026-08-24 (it was
+# 19 eager ops; see DCP_Further_Optimization.md ch.6). The end-to-end tests below
+# only ever run it at S == 1, so pin it against the eager formulation directly,
+# across interleave sizes and including the padding / out-of-range slots.
+
+
+def _pack_reference(local_logits, local_idx, local_lens, rank, world, s_itl):
+    """The pre-2026-08-24 eager implementation, verbatim."""
+    rows, _k = local_idx.shape
+    valid = (local_idx >= 0) & (local_idx < local_lens.view(rows, 1))
+    safe = torch.where(valid, local_idx, torch.zeros_like(local_idx))
+    sc = torch.gather(local_logits, 1, safe.to(torch.int64))
+    gid = torch.where(
+        valid,
+        dcp_global_pos(local_idx, rank, world, s_itl),
+        torch.full_like(local_idx, -1),
+    )
+    return (
+        torch.where(valid, sc, torch.full_like(sc, -float("inf"))),
+        gid,
+    )
+
+
+@pytest.mark.parametrize("s_itl", [1, 4, 16])
+@pytest.mark.parametrize("rank, world", [(0, 8), (3, 8), (7, 8), (1, 2)])
+@pytest.mark.parametrize("rows, k, l_max", [(8, TOPK, 4096), (1, 37, 64)])
+def test_pack_matches_eager_reference(s_itl, rank, world, rows, k, l_max):
+    g = torch.Generator(device=DEV).manual_seed(1000 + rank * 17 + s_itl)
+    logits = torch.randn(rows, l_max, generator=g, device=DEV, dtype=torch.float32)
+    # Mix in-range ids with the two padding conventions the bound check exists
+    # for: negative slots and ids past the live local length.
+    idx = torch.randint(
+        -3, l_max, (rows, k), generator=g, device=DEV, dtype=torch.int32
+    )
+    lens = torch.randint(
+        0, l_max, (rows,), generator=g, device=DEV, dtype=torch.int32
+    )
+
+    out = torch.empty(2, rows, k, dtype=torch.float32, device=DEV)
+    dcp_pack_topk_candidates(logits, idx, lens, rank, world, out, s_itl)
+    ref_sc, ref_gid = _pack_reference(logits, idx, lens, rank, world, s_itl)
+
+    assert torch.equal(out[0], ref_sc), "score plane differs from the eager reference"
+    assert torch.equal(
+        out.view(torch.int32)[1], ref_gid
+    ), "gid plane differs from the eager reference"
+
+
 # ───────────────────────────────────────── pack + merge == global top-k ──
 
 
@@ -57,11 +111,14 @@ def _build_gathered(global_logits, ctx, world, k=TOPK):
     Single process: the all-gather is a concat, and each rank's local shard is
     carved out of the global plane by the round-robin rule (position p lives on
     rank p % W, at local index p // W).
+
+    Returns the buffer in the layout production hands the merge: the int32 view
+    of ``[W, 2, rows, k]`` (rank outermost, plane 0 score / plane 1 gid).
     """
     rows = global_logits.shape[0]
     dev = global_logits.device
     l_max = (MAX_MODEL_LEN + world - 1) // world
-    sc_planes, gid_planes = [], []
+    sends = []
 
     for r in range(world):
         local_ctx = (ctx - r + world - 1) // world  # #positions p<ctx, p%W==r
@@ -78,28 +135,27 @@ def _build_gathered(global_logits, ctx, world, k=TOPK):
         )
         send = torch.empty(2, rows, k, dtype=torch.float32, device=dev)
         dcp_pack_topk_candidates(local, idx, lens, r, world, send)
-        # all_gather puts rank on dim 0; the merge wants it on the candidate dim
-        sc_planes.append(send[0].clone())
-        gid_planes.append(send.view(torch.int32)[1].clone())
+        sends.append(send.clone())
 
-    return (
-        torch.cat(sc_planes, dim=1).contiguous(),
-        torch.cat(gid_planes, dim=1).contiguous(),
-    )
+    return torch.stack(sends, dim=0).view(torch.int32)
 
 
-def _merge(sc_all, gid_all, k=TOPK):
+def _merge(recv, k=TOPK):
     """The production merge, mirrored exactly.
 
     Kept structurally identical to `_dcp_decode_candidate_exchange` in
-    `deepseek_v2.py`: aiter's stable one-block top-k over the gathered candidate
-    scores gives row-local indices, which the gid plane maps back to global ids.
-    (Before 2026-08-13 this was the hand-written `dcp_stable_topk`; it was
-    removed once aiter's `stable=True` proved both faster and sufficient.)
+    `deepseek_v2.py`: only the score plane is materialised on the candidate dim,
+    aiter's stable one-block top-k picks row-local candidate indices, and
+    `dcp_gather_candidate_gids` maps those back to global ids straight off the
+    gathered buffer. (Before 2026-08-13 the top-k was a hand-written
+    `dcp_stable_topk`; before 2026-08-24 the gid map was a reshape + gather.)
     """
-    rows, n_cand = sc_all.shape
-    cand_idx = torch.empty(rows, k, dtype=torch.int32, device=sc_all.device)
-    cand_lens = torch.full((rows,), n_cand, dtype=torch.int32, device=sc_all.device)
+    world, _, rows, k_loc = recv.shape
+    n_cand = world * k_loc
+    dev = recv.device
+    sc_all = recv[:, 0].permute(1, 0, 2).reshape(rows, n_cand).contiguous()
+    cand_idx = torch.empty(rows, k, dtype=torch.int32, device=dev)
+    cand_lens = torch.full((rows,), n_cand, dtype=torch.int32, device=dev)
     top_k_per_row_decode(
         sc_all.view(torch.float32),
         1,
@@ -111,13 +167,13 @@ def _merge(sc_all, gid_all, k=TOPK):
         k,
         stable=True,
     )
-    out = torch.gather(gid_all.reshape(rows, n_cand), 1, cand_idx.long())
-    return out.to(torch.int32)
+    out = torch.empty(rows, k, dtype=torch.int32, device=dev)
+    dcp_gather_candidate_gids(recv, cand_idx, out)
+    return out
 
 
 def _simulate(global_logits, ctx, world, k=TOPK):
-    sc_all, gid_all = _build_gathered(global_logits, ctx, world, k)
-    return _merge(sc_all, gid_all, k), None
+    return _merge(_build_gathered(global_logits, ctx, world, k), k), None
 
 
 def _global_reference(global_logits, ctx, k=TOPK):
@@ -202,11 +258,11 @@ def test_merge_agrees_across_ranks_on_a_fixed_buffer():
     answer, which is what all-gather actually hands them.
     """
     gl = _make_logits(16, 65536, seed=9, tie_frac=0.99)
-    sc, gid = _build_gathered(gl, 65536, 8)
-    first = _merge(sc, gid).clone()
+    recv = _build_gathered(gl, 65536, 8)
+    first = _merge(recv).clone()
     for i in range(20):
         assert torch.equal(
-            _merge(sc, gid), first
+            _merge(recv), first
         ), f"merge {i} disagrees -- ranks would build overlapping candidate sets"
 
 
