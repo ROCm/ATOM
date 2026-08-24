@@ -45,6 +45,7 @@ sys.modules["aiter.ops.communication"] = _comm_stub
 from atom.distributed import pp_comm
 from atom.distributed.pp_transport import PPStageTransport
 from atom.model_engine.arg_utils import EngineArgs
+from atom.model_engine.dynamic_chunking import ChunkSizePredictor
 from atom.model_engine.scheduler import (
     ScheduledBatch,
     ScheduledBatchOutput,
@@ -455,20 +456,12 @@ def test_cli_parses_dynamic_chunking_options():
             "--enable-dynamic-chunking",
             "--dynamic-chunking-smooth-factor",
             "0.65",
-            "--dynamic-chunking-calibration",
-            "3.25e-7,6.03e-3,12.0,5.39e-4",
-            "--dynamic-chunking-calibration-logging",
-            "--dynamic-chunking-base-size",
-            "24576",
             "--dynamic-chunking-min-chunk-size",
             "8192",
         ]
     )
     assert args.enable_dynamic_chunking is True
     assert args.dynamic_chunking_smooth_factor == pytest.approx(0.65)
-    assert args.dynamic_chunking_calibration == "3.25e-7,6.03e-3,12.0,5.39e-4"
-    assert args.dynamic_chunking_calibration_logging is True
-    assert args.dynamic_chunking_base_size == 24576
     assert args.dynamic_chunking_min_chunk_size == 8192
 
 
@@ -476,13 +469,11 @@ def test_dynamic_chunking_passthrough_to_engine_kwargs():
     kwargs = EngineArgs(
         enable_dynamic_chunking=True,
         dynamic_chunking_smooth_factor=0.8,
-        dynamic_chunking_calibration="3.25e-7,6.03e-3,12.0,5.39e-4",
-        dynamic_chunking_base_size=24576,
+        dynamic_chunking_min_chunk_size=8192,
     )._get_engine_kwargs()
     assert kwargs["enable_dynamic_chunking"] is True
     assert kwargs["dynamic_chunking_smooth_factor"] == pytest.approx(0.8)
-    assert kwargs["dynamic_chunking_calibration"] == "3.25e-7,6.03e-3,12.0,5.39e-4"
-    assert kwargs["dynamic_chunking_base_size"] == 24576
+    assert kwargs["dynamic_chunking_min_chunk_size"] == 8192
 
 
 def test_from_cli_args_roundtrip():
@@ -513,6 +504,26 @@ def _pp_config(**overrides):
 
 def _make_seq(prompt_len, block_size=16):
     return Sequence(token_ids=list(range(prompt_len)), block_size=block_size)
+
+
+def _dynamic_sched(coefficients=(1.0, 0.0, 0.0), **overrides):
+    """Scheduler with a calibrated latency model already installed.
+
+    Serving installs one only once the workers have fitted the attention terms
+    from real prefills, which is what these tests stand in for.
+    """
+    sched = Scheduler(
+        _pp_config(
+            enable_dynamic_chunking=True,
+            dynamic_chunking_smooth_factor=1.0,
+            dynamic_chunking_min_chunk_size=64,
+            **overrides,
+        )
+    )
+    assert sched.install_chunk_latency_model(
+        ChunkSizePredictor.from_coefficients(coefficients)
+    )
+    return sched
 
 
 def test_advance_on_schedule_enabled_for_pp_gt1():
@@ -621,31 +632,79 @@ def test_prefill_chunk_page_alignment(num_new, budget, block_size, expected):
 
 
 def test_dynamic_prefill_chunk_uses_prefix_length():
-    sched = Scheduler(
+    sched = _dynamic_sched(max_num_batched_tokens=1024)
+    assert sched._prefill_chunk_for_budget(10000, 1024, 0, history_len=1024) == 384
+
+
+def _calibrating_sched(**kwargs):
+    """A scheduler before any model has been calibrated, so the sweep is running."""
+    return Scheduler(
         _pp_config(
-            max_num_batched_tokens=1024,
             enable_dynamic_chunking=True,
-            dynamic_chunking_smooth_factor=1.0,
             dynamic_chunking_min_chunk_size=64,
-            dynamic_chunking_coefficients=(1.0, 0.0, 0.0),
+            **kwargs,
         )
     )
-    assert sched._prefill_chunk_for_budget(10000, 1024, 0, history_len=1024) == 384
+
+
+def test_the_calibration_sweep_alternates_between_two_fixed_chunk_sizes():
+    # Startup profiling cannot supply a model - dummy forwards bypass attention -
+    # and traffic cannot condition one either, because a single chunk size leaves
+    # the terms unidentifiable. So requests alternate between the budget and a
+    # quarter of it until a fit lands, each carried across a whole prompt.
+    sched = _calibrating_sched(max_num_batched_tokens=1024)
+
+    assert sched.dynamic_chunk_predictor is None
+    assert sched._prefill_chunk_for_budget(10000, 1024, 0, history_len=0) == 256
+    # Later chunks of the same request keep the base its first chunk used.
+    assert (
+        sched._chunked_prefill_size(
+            10000, 1024, 0, history_len=256, already_prefilling=True
+        )
+        == 256
+    )
+    assert sched._prefill_chunk_for_budget(10000, 1024, 0, history_len=0) == 1024
+
+
+def test_the_calibration_sweep_ends_with_a_rejected_model():
+    # The workers stop timing prefills once they have answered with a fit, so a
+    # model that is not worth acting on still ends the sweep - otherwise chunk
+    # sizes would keep alternating for a fit that is never coming.
+    sched = _calibrating_sched(max_num_batched_tokens=32768)
+
+    sched.install_chunk_latency_model(
+        ChunkSizePredictor(1.331e-10, 6.452e-03, 12.19, 2.345e-05)
+    )
+
+    assert sched.dynamic_chunk_predictor is None
+    assert sched._dynamic_chunk_limit(32768) is None
+    assert sched._prefill_chunk_for_budget(10000, 32768, 0, history_len=32768) == 10000
+
+
+def test_a_prefix_flat_calibration_is_not_installed():
+    # What startup profiling used to produce: a model whose chunk cost barely
+    # grows with the prefix. Acting on it only splits requests into more chunks.
+    sched = Scheduler(
+        _pp_config(
+            max_num_batched_tokens=32768,
+            enable_dynamic_chunking=True,
+            dynamic_chunking_min_chunk_size=64,
+        )
+    )
+
+    installed = sched.install_chunk_latency_model(
+        ChunkSizePredictor(1.331e-10, 6.452e-03, 12.19, 2.345e-05)
+    )
+
+    assert installed is False
+    assert sched.dynamic_chunk_predictor is None
 
 
 def test_dynamic_prefill_chunk_yields_to_a_second_prefill():
     # One other request with prefill left to do is enough: it feeds the stages
     # its own chunks, so the budget refills whatever this request is given and
     # shrinking here only splits this request into more chunks.
-    sched = Scheduler(
-        _pp_config(
-            max_num_batched_tokens=1024,
-            enable_dynamic_chunking=True,
-            dynamic_chunking_smooth_factor=1.0,
-            dynamic_chunking_min_chunk_size=64,
-            dynamic_chunking_coefficients=(1.0, 0.0, 0.0),
-        )
-    )
+    sched = _dynamic_sched(max_num_batched_tokens=1024)
     sched.waiting.append(_make_seq(64))
 
     assert sched._prefill_chunk_for_budget(10000, 1024, 0, history_len=1024) == 1024
@@ -655,15 +714,7 @@ def test_dynamic_prefill_chunk_counts_a_resumed_request_once():
     # A partial prefill resumed out of `running` is already in
     # `_partial_prefill_count`, so counting it again would close the gate on the
     # one case the solver exists for.
-    sched = Scheduler(
-        _pp_config(
-            max_num_batched_tokens=1024,
-            enable_dynamic_chunking=True,
-            dynamic_chunking_smooth_factor=1.0,
-            dynamic_chunking_min_chunk_size=64,
-            dynamic_chunking_coefficients=(1.0, 0.0, 0.0),
-        )
-    )
+    sched = _dynamic_sched(max_num_batched_tokens=1024)
     sched._partial_prefill_count = 1
 
     assert sched._dynamic_chunk_limit(1024, already_prefilling=True) == 384
@@ -673,39 +724,21 @@ def test_dynamic_prefill_chunk_counts_a_resumed_request_once():
 def test_dynamic_prefill_chunk_yields_after_a_recent_burst():
     # The queue has just drained, but chunks sized now run alongside whatever is
     # still prefilling behind them, so the lull alone does not reopen the solver.
-    sched = Scheduler(
-        _pp_config(
-            max_num_batched_tokens=1024,
-            enable_dynamic_chunking=True,
-            dynamic_chunking_smooth_factor=1.0,
-            dynamic_chunking_min_chunk_size=64,
-            dynamic_chunking_coefficients=(1.0, 0.0, 0.0),
-        )
-    )
+    sched = _dynamic_sched(max_num_batched_tokens=1024)
     sched._recent_prefill_supply.append(4)
 
     assert sched._prefill_chunk_for_budget(10000, 1024, 0, history_len=1024) == 1024
 
 
-def test_dynamic_prefill_chunk_base_size_decouples_from_the_budget():
-    # The chunk the solver equalizes against is what sets how many chunks a
-    # prompt is split into, so it is configurable independently of the batch
-    # budget instead of inheriting it.
-    def limit(base_size):
-        return Scheduler(
-            _pp_config(
-                max_num_batched_tokens=4096,
-                enable_dynamic_chunking=True,
-                dynamic_chunking_smooth_factor=1.0,
-                dynamic_chunking_base_size=base_size,
-                dynamic_chunking_min_chunk_size=64,
-                dynamic_chunking_coefficients=(1.0, 0.0, 0.0),
-            )
-        )._dynamic_chunk_limit(1024)
+def test_dynamic_prefill_chunk_equalizes_against_the_batch_budget():
+    # The chunk the solver equalizes against is --max-num-batched-tokens, as in
+    # SGLang and vLLM-Ascend: raising the budget is how the operator gives the
+    # solver room to shrink into.
+    def limit(budget):
+        return _dynamic_sched(max_num_batched_tokens=budget)._dynamic_chunk_limit(1024)
 
     assert limit(2048) == 1216
-    # 0 keeps the old behaviour of equalizing against max_num_batched_tokens.
-    assert limit(0) == 3136
+    assert limit(4096) == 3136
 
 
 def test_prefill_chunk_not_aligned_when_chunked_prefill_disabled():
@@ -898,19 +931,15 @@ def test_parked_seq_prefix_is_discoverable_after_load():
     )
     assert promoted == loaded - boundary
 
+
 def test_dynamic_pp_prefill_registers_prefix_hashes():
     bs = 16
-    cfg = _pp_config(
+    sched = _dynamic_sched(
         enable_prefix_caching=True,
         max_num_batched_tokens=256,
         kv_cache_block_size=bs,
         num_kvcache_blocks=4096,
-        enable_dynamic_chunking=True,
-        dynamic_chunking_smooth_factor=1.0,
-        dynamic_chunking_min_chunk_size=64,
-        dynamic_chunking_coefficients=(1.0, 0.0, 0.0),
     )
-    sched = Scheduler(cfg)
     prompt = 4096
     seq = _drive_pp_prefill(sched, prompt, block_size=bs)
     assert seq.num_cached_tokens == prompt

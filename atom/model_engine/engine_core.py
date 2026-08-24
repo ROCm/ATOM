@@ -15,6 +15,7 @@ from atom.config import Config, ParallelConfig
 from atom.kv_transfer.disaggregation import KVOutputAggregator
 from atom.kv_transfer.disaggregation.types import connector_metadata_has_work
 from atom.model_engine.async_proc import AsyncIOProcManager
+from atom.model_engine.dynamic_chunking import ChunkSizePredictor
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import EngineUtilityHandler
 from atom.model_engine.scheduler import DecodeScheduler, PrefillScheduler, Scheduler
@@ -43,6 +44,11 @@ from atom.utils.gc_utils import (
 )
 
 logger = logging.getLogger("atom")
+
+# Engine steps between checks for a newly calibrated chunk latency model. The
+# workers do the timing and the fitting; this only paces the RPC that collects
+# the result, which is why it can be this frequent without costing anything.
+DYNAMIC_CHUNKING_POLL_STEPS = 32
 
 # How often each EngineCore publishes its metrics snapshot. Kept at the API
 # server's scrape interval: the exporter reads a cache, so this bounds how
@@ -146,33 +152,21 @@ class EngineCore:
 
             config.num_kvcache_blocks = num_blocks
             if config.enable_dynamic_chunking and config.pipeline_parallel_size > 1:
-                if config.dynamic_chunking_calibration:
-                    # Already parsed and validated into coefficients by Config.
-                    logger.info(
-                        "%s: dynamic chunking using supplied calibration %s",
+                # Startup profiling only measures the chunk cost that carries no
+                # attention; the attention terms are calibrated from real
+                # prefills while serving, so no chunk is rebalanced until then.
+                profile = self.runner_mgr.call_func(
+                    "profile_dynamic_chunking", wait_out=True
+                )
+                if not profile or "linear_coeff" not in profile:
+                    config.enable_dynamic_chunking = False
+                    reason = (profile or {}).get("error", "")
+                    logger.warning(
+                        "%s: disabling dynamic chunking because startup profiling "
+                        "did not produce a chunk overhead baseline%s",
                         self.label,
-                        config.dynamic_chunking_coefficients,
+                        f": {reason}" if reason else "",
                     )
-                else:
-                    profile = self.runner_mgr.call_func(
-                        "profile_dynamic_chunking", wait_out=True
-                    )
-                    if profile and "coefficients" in profile:
-                        config.dynamic_chunking_coefficients = tuple(
-                            profile["coefficients"]
-                        )
-                    else:
-                        config.enable_dynamic_chunking = False
-                        logger.warning(
-                            "%s: disabling dynamic chunking because startup "
-                            "profiling did not produce a valid latency model%s",
-                            self.label,
-                            (
-                                f": {profile['error']}"
-                                if profile and profile.get("error")
-                                else ""
-                            ),
-                        )
                 if (
                     config.enable_dynamic_chunking
                     and config.parallel_config.pipeline_parallel_rank != 0
@@ -206,6 +200,9 @@ class EngineCore:
                 config,
                 state_runtime=self.state_runtime,
             )
+
+        self._dynamic_chunking_enabled = config.enable_dynamic_chunking
+        self._dynamic_chunking_poll_countdown = DYNAMIC_CHUNKING_POLL_STEPS
 
         self.kv_transfer_enabled = bool(config.kv_transfer_config)
         self._next_idle_kv_drain = 0.0
@@ -501,6 +498,36 @@ class EngineCore:
             return
         kvoutput = self.runner_mgr.call_func_with_aggregation("async_proc_aggregation")
         self.scheduler._update_from_kv_xfer_finished(kvoutput)
+
+    def _poll_dynamic_chunking_calibration(self) -> None:
+        """Install a freshly calibrated chunk latency model, if one is ready.
+
+        The workers time their own prefills, so this is one RPC round trip every
+        `DYNAMIC_CHUNKING_POLL_STEPS` steps and nothing on the forward path.
+
+        Called from the PP head's step loop rather than from here: dynamic
+        chunking needs more than one stage, and every such deployment runs
+        `PPEngineCoreProc`, whose head loop replaces `_process_engine_step`.
+        Every other stage had the feature turned off during startup because it
+        makes no chunking decisions.
+        """
+        if not self._dynamic_chunking_enabled:
+            return
+        self._dynamic_chunking_poll_countdown -= 1
+        if self._dynamic_chunking_poll_countdown > 0:
+            return
+        self._dynamic_chunking_poll_countdown = DYNAMIC_CHUNKING_POLL_STEPS
+        fit = self.runner_mgr.call_func("take_dynamic_chunking_fit", wait_out=True)
+        coefficients = fit.get("coefficients") if fit else None
+        if coefficients is None:
+            return
+        # The workers stop timing prefills once they have answered with a fit, so
+        # there is never a second one to collect - whether the scheduler takes
+        # this model or rejects it as not worth acting on.
+        self._dynamic_chunking_enabled = False
+        self.scheduler.install_chunk_latency_model(
+            ChunkSizePredictor.from_coefficients(coefficients)
+        )
 
     def _dispatch_idle_offload_work(self) -> None:
         if not self.kv_transfer_enabled:

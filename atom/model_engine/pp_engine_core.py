@@ -124,6 +124,9 @@ class PPEngineCoreProc(EngineCore):
             self.runner_mgr.call_func("flush_pp_send", wait_out=True)
 
         self._poll_kv_transfer_progress()
+        # The head is the only stage that sizes chunks, so it is also the one
+        # that adopts a model calibrated from the prefills it launched.
+        self._poll_dynamic_chunking_calibration()
 
         poll_ms = 0 if launched else _PP_HEAD_IDLE_POLL_MS
         while self._in_flight:

@@ -30,7 +30,7 @@ from atom.config import Config
 from atom.kv_transfer.disaggregation import KVConnectorOutput
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.dynamic_chunking import (
-    GATE_SUPPLY_WINDOW,
+    CALIBRATION_SWEEP_RATIO,
     ChunkSizePredictor,
     has_sole_prefill,
 )
@@ -49,6 +49,8 @@ from atom.model_engine.state_runtime import (
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
+
+_DYNAMIC_CHUNKING_SUPPLY_WINDOW = 16
 
 
 class SpecStats:
@@ -748,42 +750,21 @@ class Scheduler:
         self.dynamic_chunking_smooth_factor = getattr(
             config, "dynamic_chunking_smooth_factor", 0.75
         )
-        self.dynamic_chunking_base_size = (
-            getattr(config, "dynamic_chunking_base_size", 0)
-            or self.max_num_batched_tokens
-        )
         self.dynamic_chunking_min_chunk_size = getattr(
             config, "dynamic_chunking_min_chunk_size", 4096
         )
-        dynamic_coefficients = getattr(config, "dynamic_chunking_coefficients", None)
-        self.dynamic_chunk_predictor = (
-            ChunkSizePredictor.from_coefficients(dynamic_coefficients)
-            if getattr(config, "enable_dynamic_chunking", False)
-            and dynamic_coefficients is not None
-            else None
+        self.enable_dynamic_chunking = getattr(config, "enable_dynamic_chunking", False)
+        # Installed after runtime calibration; None keeps fixed/sweep chunking.
+        self.dynamic_chunk_predictor: ChunkSizePredictor | None = None
+        self._calibrating = self.enable_dynamic_chunking
+        # Alternate calibration base size per request.
+        self._calibration_sweep_alternate = False
+        # Suppress dynamic sizing after recent multi-prefill supply.
+        self._recent_prefill_supply: deque[int] = deque(
+            maxlen=_DYNAMIC_CHUNKING_SUPPLY_WINDOW
         )
-        # Peak prefill supply over the last `GATE_SUPPLY_WINDOW` schedules, so a
-        # momentary lull does not commit a request to a long chunk sequence.
-        self._recent_prefill_supply: deque[int] = deque(maxlen=GATE_SUPPLY_WINDOW)
-        if (
-            getattr(config, "enable_dynamic_chunking", False)
-            and self.dynamic_chunk_predictor is None
-        ):
-            logger.warning(
-                "Dynamic chunking was requested but no startup latency model "
-                "is available; using fixed-size chunked prefill"
-            )
-        # V4 SWA correctness on a prefix-cache hit is now handled entirely in
-        # BlockManager: `_swa_bounded_hit` bounds the hit so the boundary's
-        # trailing window is SWA-present, and `allocate` marks out-of-window
-        # blocks -1. The old `_v4_swa_warmup_blocks` (re-forward the tail to
-        # repopulate the per-request ring) was a pre-paged-ring workaround and is
-        # removed — the paged content-addressed SWA pool reuses the tail window
-        # directly. See PLAN_swa_prefix_cache_tail_gate.md.
-        # Number of running seqs currently mid-prefill (per-seq state lives in
-        # `Sequence.is_partial_prefill`). Maintained as a counter so Phase 1
-        # of `schedule()` can skip the running-queue scan entirely on
-        # pure-decode steps (the common case).
+        # Prefix-cache SWA correctness is enforced by BlockManager.
+        # Count partial prefills to skip queue scans on decode-only steps.
         self._partial_prefill_count: int = 0
         self._schedule_tick: int = 0
 
@@ -1177,7 +1158,7 @@ class Scheduler:
         decoding already-running sequences.
         """
         self._schedule_tick += 1
-        if self.dynamic_chunk_predictor is not None:
+        if self.enable_dynamic_chunking:
             # Sampled before the queues move, so `_dynamic_chunk_limit` sees how
             # much prefill work the pipeline has had, not just what is left now.
             self._recent_prefill_supply.append(
@@ -1418,6 +1399,10 @@ class Scheduler:
             if needs_remote_load:
                 self._park_for_remote_load(seq, skipped_waiting_requests)
                 continue
+
+            seq.prefix_cache_hit_tokens = (
+                num_cached_blocks * self.block_manager.block_size
+            )
 
             chunk = self._adjust_prefill_chunk_after_alloc(seq, chunk)
             chunk = self._finalize_prefill_chunk(seq, seq.num_cached_tokens, chunk)
@@ -1816,31 +1801,50 @@ class Scheduler:
         )
         self.running.append(seq)
 
+    def install_chunk_latency_model(self, predictor: ChunkSizePredictor) -> bool:
+        """Install a useful calibrated model and end the calibration sweep.
+
+        A model that cannot shrink after one base-size prefix is rejected, leaving
+        fixed chunking enabled.
+        """
+        self._calibrating = False
+        if not predictor.predicts_useful_shrink(
+            base_chunk_size=self.max_num_batched_tokens,
+            history_len=self.max_num_batched_tokens,
+        ):
+            logger.warning(
+                "Ignoring dynamic chunking calibration a=%.3e b=%.3e gamma=%.3e: "
+                "it predicts no useful shrink after a %d-token prefix, so "
+                "chunking stays fixed",
+                predictor.quadratic_coeff,
+                predictor.linear_coeff,
+                predictor.prefix_coeff,
+                self.max_num_batched_tokens,
+            )
+            return False
+        first = self.dynamic_chunk_predictor is None
+        self.dynamic_chunk_predictor = predictor
+        logger.log(
+            logging.INFO if first else logging.DEBUG,
+            "Dynamic chunking latency model %s: a=%.3e b=%.3e c=%.3e gamma=%.3e",
+            "installed" if first else "refreshed",
+            predictor.quadratic_coeff,
+            predictor.linear_coeff,
+            predictor.constant_coeff,
+            predictor.prefix_coeff,
+        )
+        return True
+
     def _dynamic_chunk_limit(
         self, history_len: int, *, already_prefilling: bool = False
     ) -> int | None:
-        """Chunk ceiling from the latency model, or None to keep the chunk fixed.
+        """Return the dynamic chunk ceiling, or None for fixed chunking.
 
-        Equal-latency chunking rebalances the microbatches *of one request*. With
-        a fixed chunk size that request's chunks grow more expensive along the
-        prompt, so the stages end up waiting on its last and costliest chunk;
-        evening them out shortens that drain.
-
-        It only buys anything while that request is the pipeline's only prefill.
-        A second prefilling request feeds the stages its own chunks, the token
-        budget refills from it whatever this one is given, and the forward count
-        does not move — so shrinking here just splits this request into more
-        chunks, each re-paying the per-chunk cached-prefix rebuild (`gamma * L`
-        for MLA) and another per-forward overhead. That is why the condition is
-        `has_sole_prefill` over a trailing window rather than a headroom test:
-        the chunk sizes committed now are executed alongside whatever arrives
-        behind them.
-
-        `already_prefilling` says whether this request is itself in
-        `_partial_prefill_count`, which it is when resuming a partial prefill out
-        of `running` but not when being admitted straight off `waiting`.
+        Dynamic sizing requires sole-prefill supply. Before calibration completes,
+        it returns the sweep size; ``already_prefilling`` avoids double-counting
+        the current request.
         """
-        if self.dynamic_chunk_predictor is None:
+        if not self.enable_dynamic_chunking:
             return None
         prefill_sources = (
             self._partial_prefill_count
@@ -1849,13 +1853,32 @@ class Scheduler:
         )
         if not has_sole_prefill(prefill_sources, self._recent_prefill_supply):
             return None
+        if self.dynamic_chunk_predictor is None:
+            if not self._calibrating:
+                return None
+            return self._calibration_sweep_chunk(already_prefilling)
         return self.dynamic_chunk_predictor.predict(
             history_len=history_len,
-            base_chunk_size=self.dynamic_chunking_base_size,
+            base_chunk_size=self.max_num_batched_tokens,
             smooth_factor=self.dynamic_chunking_smooth_factor,
             alignment=max(self.block_manager.block_size, 64),
             max_chunk_size=self.max_num_batched_tokens,
             min_chunk_size=self.dynamic_chunking_min_chunk_size,
+        )
+
+    def _calibration_sweep_chunk(self, already_prefilling: bool) -> int | None:
+        """Select one of two per-request chunk sizes for an identifiable fit.
+
+        Requests alternate between the full budget (None) and its
+        ``CALIBRATION_SWEEP_RATIO`` fraction.
+        """
+        if not already_prefilling:
+            self._calibration_sweep_alternate = not self._calibration_sweep_alternate
+        if not self._calibration_sweep_alternate:
+            return None
+        return max(
+            self.max_num_batched_tokens // CALIBRATION_SWEEP_RATIO,
+            self.dynamic_chunking_min_chunk_size,
         )
 
     def _chunked_prefill_size(
