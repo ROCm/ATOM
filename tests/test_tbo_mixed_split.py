@@ -153,3 +153,49 @@ def test_min_token_bar_keys_off_prefill_only():
     meets_min, can_split, _, _ = _precompute_mixed_token_split(toks, n_reqs, n_pt, 8192)
     assert can_split is True
     assert meets_min is False
+
+
+def test_maybe_create_ubatch_slices_dispatches_to_mixed():
+    """The factory must route a mixed batch to the mixed splitter.
+
+    Regression: the mixed splitter existed and was unit-tested while nothing
+    called it -- `maybe_create_ubatch_slices` still took the prefill path,
+    which counts only `num_scheduled_tokens[:num_prefill_seqs]` and would have
+    produced slices that do not cover the decode rows.
+    """
+    from atom.utils.tbo.ubatch_splitting import maybe_create_ubatch_slices
+
+    # The shape the first end-to-end attempt actually produced.
+    toks = np.asarray([605] * 27 + [1], dtype=np.int64)
+    total = int(toks.sum())
+    slices = maybe_create_ubatch_slices(
+        num_reqs=28,
+        num_tokens=total,
+        is_prefill=True,
+        num_scheduled_tokens=toks,
+        force=True,
+        num_prefill_seqs=27,
+        num_prefill_tokens=27 * 605,
+    )
+    assert slices is not None and len(slices) == 2
+    # Mixed splitter ran: only it fills these in.
+    assert all(s.num_prefill_tokens is not None for s in slices)
+    # And the slices span the whole batch, decode rows included.
+    assert slices[0].token_slice.start == 0
+    assert slices[-1].token_slice.stop == total
+
+
+def test_maybe_create_ubatch_slices_leaves_prefill_path_alone():
+    """Without the mixed args the factory must behave exactly as before."""
+    from atom.utils.tbo.ubatch_splitting import maybe_create_ubatch_slices
+
+    toks = np.asarray([4096] * 4, dtype=np.int64)
+    slices = maybe_create_ubatch_slices(
+        num_reqs=4,
+        num_tokens=int(toks.sum()),
+        is_prefill=True,
+        num_scheduled_tokens=toks,
+        force=True,
+    )
+    assert slices is not None
+    assert all(s.num_prefill_tokens is None for s in slices)

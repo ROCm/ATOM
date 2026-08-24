@@ -2213,22 +2213,29 @@ class ModelRunner:
 
         With the packed-reduce path the eligibility (local + cross-DP AND)
         is decided in ``ForwardMode.decide``; here we just realise the split.
+
+        Deliberately has NO local veto of its own -- not even a defensive one.
+        `tbo_collective_active` is the cross-DP decision, and a rank that
+        second-guesses it here runs 1 ubatch while its peers run 2, which
+        deadlocks the per-ubatch collectives. Every reason to decline belongs in
+        `local_tbo_precompute`, where it reaches the AND-reduce and turns TBO
+        off for the whole group. A mixed batch used to be vetoed here; that
+        veto is now expressed as can_split=False, and re-adding one would
+        reintroduce the hang (observed: one rank scheduled a mixed batch, and
+        no rank scheduled another forward after it).
         """
-        if getattr(batch, "is_mixed", False):
-            # TBO ubatch splitting on a [prefill | decode] layout is not yet
-            # supported (P2-M5 follow-up). Run mixed batches without TBO.
-            #
-            # Belt-and-braces only: `local_tbo_precompute` already reports
-            # can_split=False for a mixed batch, so `tbo_collective_active` is
-            # False by the time we get here and the next line would return
-            # anyway. Refusing here ALONE would deadlock -- can_split is
-            # AND-reduced across DP, so a rank that hides its refusal from that
-            # reduce runs 1 ubatch while its peers run 2.
-            return None
         if not tbo_collective_active:
             return None
 
-        tbo_num_reqs = batch.total_seqs_num_prefill if is_prefill else scheduled_bs
+        # A mixed batch spans BOTH segments, so the split has to see every row.
+        # `total_seqs_num_prefill` would hide the decode rows from the cut and
+        # from `num_scheduled_tokens`, leaving slices that do not cover the
+        # tokens actually forwarded.
+        is_mixed = getattr(batch, "is_mixed", False)
+        if is_mixed:
+            tbo_num_reqs = batch.total_seqs_num
+        else:
+            tbo_num_reqs = batch.total_seqs_num_prefill if is_prefill else scheduled_bs
         # tbo_collective_active is the OR-reduced cross-DP decision: this rank
         # is committed to splitting even if it's below ATOM_TBO_PREFILL_MIN_TOKENS
         # (a peer cleared the bar). force=True bypasses the local min-token gate
@@ -2239,6 +2246,8 @@ class ModelRunner:
             is_prefill=is_prefill,
             num_scheduled_tokens=num_scheduled_tokens if is_prefill else None,
             force=True,
+            num_prefill_seqs=batch.total_seqs_num_prefill if is_mixed else None,
+            num_prefill_tokens=batch.total_tokens_num_prefill if is_mixed else None,
         )
         if ubatch_slices is not None:
             logger.debug(
