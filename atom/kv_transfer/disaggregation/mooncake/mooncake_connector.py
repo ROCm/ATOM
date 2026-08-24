@@ -225,11 +225,11 @@ def plan_sharded(
     src_ids = np.asarray(src_block_ids, dtype=np.int64)
     dst_ids = np.asarray(dst_block_ids, dtype=np.int64)
 
-    dst_block = np.repeat(np.arange(dst_ids.size, dtype=np.int64), block_size // S)
-    dst_token = np.tile(np.arange(0, block_size, S, dtype=np.int64), dst_ids.size)
-    # Every run starts at an S-group boundary, so dcp_global_pos reduces to the
-    # group form and the whole run lands inside one source block.
-    local = dst_block * block_size + dst_token
+    # One run per S-group of this rank's local slots. Starting each run on an
+    # S-group boundary is what lets dcp_global_pos reduce to the group form
+    # below, and keeps the whole run inside one source block.
+    local = np.arange(0, dst_ids.size * block_size, S, dtype=np.int64)
+    dst_block, dst_token = np.divmod(local, block_size)
     g = ((local // S) * dcp_size + dcp_rank) * S
     src_block, src_token = np.divmod(g, block_size)
 
