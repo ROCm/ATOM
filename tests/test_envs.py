@@ -25,6 +25,7 @@ _ATOM_ENV_VARS = [
     "ATOM_PROFILER_TIMEOUT",
     "ATOM_LOG_MORE",
     "ATOM_DISABLE_MMAP",
+    "ATOM_ONLINE_QUANT_STREAMING",
     "ATOM_DISABLE_VLLM_PLUGIN",
     "ATOM_USE_CUSTOM_ALL_GATHER",
     "ATOM_ENABLE_RELAXED_MTP",
@@ -87,6 +88,9 @@ class TestEnvsDefaults:
     def test_disable_mmap_default(self):
         assert _get_envs().ATOM_DISABLE_MMAP is False
 
+    def test_online_quant_streaming_default_disabled(self):
+        assert _get_envs().ATOM_ONLINE_QUANT_STREAMING is False
+
     def test_disable_vllm_plugin_default(self):
         assert _get_envs().ATOM_DISABLE_VLLM_PLUGIN is False
 
@@ -145,6 +149,10 @@ class TestEnvsOverrides:
     def test_disable_mmap_case_insensitive(self, monkeypatch):
         monkeypatch.setenv("ATOM_DISABLE_MMAP", "True")
         assert _get_envs().ATOM_DISABLE_MMAP is True
+
+    def test_online_quant_streaming_enabled(self, monkeypatch):
+        monkeypatch.setenv("ATOM_ONLINE_QUANT_STREAMING", "1")
+        assert _get_envs().ATOM_ONLINE_QUANT_STREAMING is True
 
     def test_disable_vllm_plugin_enabled(self, monkeypatch):
         monkeypatch.setenv("ATOM_DISABLE_VLLM_PLUGIN", "1")

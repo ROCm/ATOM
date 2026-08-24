@@ -88,6 +88,7 @@ class DSparkProposer(Drafter):
             return self._blk_ps_bufs
         from atom.model_ops.attentions.aiter_mla import (
             _MLA_META_SUPPORTS_MAX_SPLIT,
+            _MLA_SPLIT_BUDGET_AUTO,
             get_mla_metadata_info_v1,
         )
 
@@ -107,8 +108,14 @@ class DSparkProposer(Drafter):
         # max_split_per_batch only exists in newer aiter builds; feature-detect
         # it (as aiter_mla does) so old builds don't hit a TypeError. Cache the
         # kwargs so the sizing (info) and fill (get_mla_metadata_v1) calls agree.
+        # The block pass is a bs=1, non-causal (msk0) decode over the FULL target
+        # context, so a hardcoded 16 pins it to 16 of the machine's clusters and
+        # starves it at long ctx (~392us at 256k). Take the budget from the
+        # machine like the rest of the decode path (_MLA_SPLIT_BUDGET_AUTO=-1).
         self._blk_split_kwargs = (
-            {"max_split_per_batch": 16} if _MLA_META_SUPPORTS_MAX_SPLIT else {}
+            {"max_split_per_batch": _MLA_SPLIT_BUDGET_AUTO}
+            if _MLA_META_SUPPORTS_MAX_SPLIT
+            else {}
         )
         (
             (wmd_sz, wmd_ty),
