@@ -42,7 +42,6 @@ from aiter import (
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import (
     get_pp_group,
-    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
 from aiter.jit.utils.torch_guard import torch_compile_guard
@@ -83,6 +82,7 @@ from atom.model_ops.activation import SiluAndMul
 from atom.model_ops.attention_mla import (
     MLAModules,
     is_rocm_aiter_fp4bmm_enabled,
+    qrep_tp_override,
     triton_convert_req_index_to_global_index,
     triton_convert_req_index_to_global_index_dsa_prefill,
     triton_gather_kv_indices_sparse,
@@ -2434,23 +2434,8 @@ class DeepseekV2MLAAttention(nn.Module):
         assert num_heads % tp_size == 0
         self.num_local_heads = num_heads // tp_size
 
-        # DCP Query Replication (QREP): shard the query projection on a coarser
-        # effective-TP grid (tp/dcp) so each rank materializes its whole DCP
-        # group's query head set, letting decode skip the per-step AllGather Q.
-        # Gated in Config.__post_init__ (only True with dcp>1, dense/sparse, fp8,
-        # no spec). W_K is separately DCP-gathered at load in
-        # MLAAttention.process_weights_after_loading.
-        self.qrep_enabled = (
-            get_current_atom_config().dcp_config.enable_query_replication
-        )
-        q_qrep_override: dict = {}
-        if self.qrep_enabled:
-            dcp_size = get_dcp_world_size()
-            assert tp_size % dcp_size == 0
-            q_qrep_override = {
-                "override_tp_size": tp_size // dcp_size,
-                "override_tp_rank": get_tensor_model_parallel_rank() // dcp_size,
-            }
+        # DCP Query Replication: {} unless QREP is on -- see qrep_tp_override.
+        q_qrep_override = qrep_tp_override(tp_size)
 
         self.scaling = self.qk_head_dim**-0.5
         self.max_position_embeddings = max_position_embeddings
