@@ -33,6 +33,7 @@ import triton
 import triton.language as tl
 
 from atom.model_ops.attentions.v4_pool_geometry import WindowParams
+from atom.model_ops.v4_kernels.pool_index import window_constexprs, window_row
 
 
 def _ring_rows(
@@ -206,12 +207,12 @@ def _dspark_index_kernel(
     draft_rows_ptr,  # [B*T] int32 out
     out_ptr,  # [capacity] int32 out
     B,
+    ring_start,
     T: tl.constexpr,
     W: tl.constexpr,
     RING_SLOTS: tl.constexpr,
-    RING_STRIDE: tl.constexpr,
-    RING_START: tl.constexpr,
     SLOT_ROWS: tl.constexpr,
+    RING_STRIDE: tl.constexpr,
     RUN_ROWS: tl.constexpr,
     BLOCK_B: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -252,26 +253,24 @@ def _dspark_index_kernel(
         tl.store(kv_indptr_ptr + B * T, tl.sum(per_req).to(tl.int32))
 
     # This row's own draft KV lands at absolute position anchor+1+t.
-    draft_ring = (anchor + 1 + t) % RING_SLOTS
     tl.store(
         draft_rows_ptr + i,
-        (
-            slot * SLOT_ROWS
-            + RING_START
-            + (draft_ring // RING_STRIDE) * RUN_ROWS
-            + (draft_ring % RING_STRIDE)
+        window_row(
+            slot,
+            anchor + 1 + t,
+            ring_start,
+            RING_SLOTS,
+            SLOT_ROWS,
+            RING_STRIDE,
+            RUN_ROWS,
         ).to(tl.int32),
     )
 
     j = tl.arange(0, BLOCK_K)
     in_window = j < n_valid
     pos = tl.where(in_window, anchor - n_valid + 1 + j, anchor + 1 + (j - n_valid))
-    ring = pos % RING_SLOTS
-    row = (
-        slot * SLOT_ROWS
-        + RING_START
-        + (ring // RING_STRIDE) * RUN_ROWS
-        + (ring % RING_STRIDE)
+    row = window_row(
+        slot, pos, ring_start, RING_SLOTS, SLOT_ROWS, RING_STRIDE, RUN_ROWS
     )
     tl.store(out_ptr + start + j, row.to(tl.int32), mask=j < length)
 
@@ -376,13 +375,6 @@ def dspark_build_indices(
     anchors_i64 = anchors.to(torch.int64)
     slots_i64 = slots.to(torch.int64)
 
-    ring = dict(
-        RING_SLOTS=window.ring_slots,
-        RING_STRIDE=window.ring_stride,
-        RING_START=window.ring_start,
-        SLOT_ROWS=window.slot_rows,
-        RUN_ROWS=window.run_rows,
-    )
     _dspark_index_kernel[(B * T,)](
         anchors_i64,
         slots_i64,
@@ -390,9 +382,10 @@ def dspark_build_indices(
         draft_rows,
         out_indices,
         B,
+        window.ring_start,
         T=T,
         W=W,
-        **ring,
+        **window_constexprs(window),
         BLOCK_B=triton.next_power_of_2(B),
         BLOCK_K=triton.next_power_of_2(W + T),
     )
