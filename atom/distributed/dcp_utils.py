@@ -18,6 +18,7 @@ only the distributed-access layer.
 """
 
 from atom.config import get_current_atom_config
+from atom.utils import envs
 
 
 def get_dcp_world_size() -> int:
@@ -34,6 +35,19 @@ def get_dcp_world_size() -> int:
 def dcp_is_enabled() -> bool:
     """True when Decode Context Parallel is active (world size > 1)."""
     return get_dcp_world_size() > 1
+
+
+def dcp_replicated_index_cache_enabled(atom_config=None) -> bool:
+    """Whether native GLM-5.2 uses a full replicated index cache under DCP."""
+    if not envs.ATOM_DCP_REPLICATE_INDEX_CACHE:
+        return False
+    config = atom_config or get_current_atom_config()
+    hf_config = config.hf_config
+    return (
+        config.decode_context_parallel_size > 1
+        and getattr(hf_config, "model_type", None) == "glm_moe_dsa"
+        and config.speculative_config is None
+    )
 
 
 def get_dcp_group():
