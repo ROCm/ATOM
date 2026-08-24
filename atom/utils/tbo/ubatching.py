@@ -150,6 +150,21 @@ def local_tbo_precompute(
     if not config.enable_tbo:
         return False, False, 0, 0
 
+    # A mixed prefill+decode batch cannot be ubatch-split yet: the split maths
+    # below only sees `num_scheduled_tokens[:num_pref_reqs]`, and
+    # `split_attn_metadata` has no branch for the nested per-segment metadata a
+    # mixed batch carries. `_maybe_create_tbo_slices` already refuses to build
+    # slices for one.
+    #
+    # The refusal has to happen HERE, not there. `can_split` is AND-reduced
+    # across DP precisely so that one rank's inability to split turns TBO off
+    # for everyone; a rank that instead stays silent here and bails out later
+    # runs 1 ubatch while its peers run 2, and the per-ubatch collectives
+    # deadlock. Reporting it as a structural can_split=False keeps the whole
+    # group in step.
+    if getattr(batch, "is_mixed", False):
+        return False, False, 0, 0
+
     if is_prefill:
         from atom.utils import envs
 

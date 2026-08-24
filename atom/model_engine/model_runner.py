@@ -2217,6 +2217,13 @@ class ModelRunner:
         if getattr(batch, "is_mixed", False):
             # TBO ubatch splitting on a [prefill | decode] layout is not yet
             # supported (P2-M5 follow-up). Run mixed batches without TBO.
+            #
+            # Belt-and-braces only: `local_tbo_precompute` already reports
+            # can_split=False for a mixed batch, so `tbo_collective_active` is
+            # False by the time we get here and the next line would return
+            # anyway. Refusing here ALONE would deadlock -- can_split is
+            # AND-reduced across DP, so a rank that hides its refusal from that
+            # reduce runs 1 ubatch while its peers run 2.
             return None
         if not tbo_collective_active:
             return None
