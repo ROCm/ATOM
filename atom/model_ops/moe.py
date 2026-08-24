@@ -602,6 +602,17 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         # TODO: could allow this now
         # assert not moe.use_flashinfer_cutlass_kernels, "Must be created in modelopt.py"
         if moe.use_mori_kernels:
+            from atom.utils import envs as _atom_envs
+
+            # gfx1250: use mori dispatch_combine_v2 (cco/FlyDSL) instead of the
+            # gfx942/950-only v1 kernels. Gated by ATOM_MORI_V2.
+            if _atom_envs.ATOM_MORI_V2:
+                from atom.model_ops.fused_moe.mori_v2_prepare_finalize import (
+                    make_mori_v2_prepare_finalize,
+                )
+
+                return make_mori_v2_prepare_finalize(moe, all2all_manager)
+
             assert quant_config is not None
 
             from atom.model_ops.fused_moe.mori_prepare_finalize import (
@@ -674,6 +685,13 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 "num_local_experts": moe.num_local_experts,
                 "num_experts_per_token": moe.experts_per_token,
                 "gpu_per_node": moe.moe_parallel_config.local_ep_size,
+                # The same probe the sync handle uses (aiter sets it from
+                # in_the_same_node_as). Sharing one source keeps prefill and
+                # decode on the same kernel type -- inferring it from
+                # `world_size <= 8` instead let them disagree on a 2-node x
+                # 4-GPU group, running IntraNode kernels across a boundary
+                # that has no P2P mapping.
+                "internode": all2all_manager.internode,
                 "data_type_itemsize": moe.in_dtype.itemsize,
                 "max_token_type_size": moe.in_dtype.itemsize,
                 "scale_type_size": scale_type_size,
@@ -681,7 +699,9 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             }
 
             tbo_mori_ops = None
-            sync_handle = handle  # IntraNode handle for prefill (sync path)
+            # Prefill (sync path). aiter picks its kernel from the same
+            # internode probe, so this is not necessarily IntraNode.
+            sync_handle = handle
             if is_async:
                 from atom.model_ops.fused_moe.mori_prepare_finalize import (
                     _NUM_TBO_UBATCHES,
@@ -741,12 +761,30 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             ), f"Attempt to override experts for {id(self)}!"
             self.topk_indices_dtype = prepare_finalize.topk_indices_dtype()
             # experts = self.select_gemm_impl(prepare_finalize, layer)
-            self.fused_experts = FusedMoEModularKernel(
+            from atom.model_ops.fused_moe.mori_v2_prepare_finalize import (
+                MoriV2ModularKernel,
+                MoriV2PrepareAndFinalize,
+            )
+
+            modular_cls = (
+                MoriV2ModularKernel
+                if isinstance(prepare_finalize, MoriV2PrepareAndFinalize)
+                else FusedMoEModularKernel
+            )
+            self.fused_experts = modular_cls(
                 prepare_finalize,
                 # experts,
                 # layer.shared_experts,
                 quant_config=self.moe_quant_config,
             )
+
+            # The v2 fused transport (MegaMoE) runs the whole layer, so it must be
+            # told the expert-GEMM recipe that only the layer + this quant method
+            # know. Here is also the last point before any cudagraph capture, and
+            # it allocates a cco arena and JIT-compiles its kernels.
+            bind_mega = getattr(prepare_finalize, "bind_mega_transport", None)
+            if bind_mega is not None:
+                bind_mega(layer, self)
 
     @property
     def using_modular_kernel(self) -> bool:

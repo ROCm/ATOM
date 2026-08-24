@@ -51,11 +51,17 @@ class LLMEngine:
         # separate eos_token_id from stop_token_ids
         stop_token_ids.discard(config.eos_token_id)
         config.stop_token_ids = list(stop_token_ids)
-        # Set data parallel size in config
-        config.parallel_config.data_parallel_size = data_parallel_size
-        if data_parallel_master_port is not None:
-            config.parallel_config.data_parallel_master_port = data_parallel_master_port
-        self.data_parallel_size = data_parallel_size
+        # Legacy path only: callers that pass DP topology as loose kwargs
+        # instead of a ParallelConfig. When a parallel_config was supplied it
+        # is already authoritative, and overwriting it here would reset a
+        # multi-node topology back to a single local rank.
+        if "parallel_config" not in config_kwargs:
+            config.parallel_config.data_parallel_size = data_parallel_size
+            if data_parallel_master_port is not None:
+                config.parallel_config.data_parallel_master_port = (
+                    data_parallel_master_port
+                )
+        self.data_parallel_size = config.parallel_config.data_parallel_size
         # PCP and DP-attention are not yet compatible: PCP stripe-splits
         # input_ids to 1/pcp_size in ForCausalLM.forward, but DP-attention's
         # `_gather_ids_for_dp` all-gathers using dp_metadata sizes computed on
@@ -751,8 +757,11 @@ class InputOutputProcessor:
             )
             outputs[req.id] = {
                 "text": output_str,
-                "token_ids": req.completion_token_ids,
-                "logprobs": req.logprobs if req.return_logprobs else None,
+                # `list`, not the `array("i")` slice: this is what `generate()`
+                # hands a caller, and the storage type is ours to change.
+                "token_ids": list(req.completion_token_ids),
+                # `list` for the same reason as `token_ids` above.
+                "logprobs": list(req.logprobs) if req.return_logprobs else None,
                 "latency": req.leave_time - req.arrive_time,
                 "finish_reason": req.leave_reason,
                 "num_tokens_input": req.num_prompt_tokens,
