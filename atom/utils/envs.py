@@ -494,6 +494,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_TBO_PREFILL_MIN_TOKENS": lambda: int(
         os.getenv("ATOM_TBO_PREFILL_MIN_TOKENS", "8192")
     ),
+    # Allow TBO to split a mixed prefill+decode batch. Off by default: the
+    # split arithmetic and the slices exist (see `_split_mixed_token_midpoint`)
+    # but the V4 attention builder cannot yet rebuild its nested per-segment
+    # metadata for a ubatch, so turning this on raises NotImplementedError at
+    # the first mixed TBO step. Flipping it to "1" is how the metadata work
+    # gets exercised once it lands; until then a mixed batch keeps vetoing TBO
+    # through `can_split`.
+    "ATOM_TBO_MIXED": lambda: os.getenv("ATOM_TBO_MIXED", "0") == "1",
     # --- PCP MoE comm mode ---
     # Fold the PCP (prefill-context-parallel) dim into the MoE tp/ep sharding.
     # Only meaningful when prefill_context_parallel_size > 1;

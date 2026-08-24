@@ -97,6 +97,39 @@ def _precompute_prefill_req_split(
     return meets_min_tokens, True, ub0, ub1
 
 
+def _precompute_mixed_token_split(
+    num_scheduled_tokens: np.ndarray,
+    num_reqs: int,
+    num_pref_tokens: int,
+    min_pref: int,
+) -> tuple[bool, bool, int, int]:
+    """Mixed ``[prefill | decode]``, token-midpoint split over the WHOLE batch.
+
+    Differs from `_precompute_prefill_token_split` in what it counts: that one
+    sums only ``num_scheduled_tokens[:num_pref_reqs]``, which for a mixed batch
+    silently drops every decode row and produces ub0/ub1 that do not add up to
+    the tokens actually forwarded.
+
+    ``meets_min_tokens`` still keys off the PREFILL tokens alone: the bar exists
+    to skip TBO when there is not enough prefill compute to hide communication
+    behind, and a few hundred decode rows do not change that.
+
+    MUST mirror `split_mixed_token_midpoint` in ubatch_splitting.py -- the
+    cross-DP MAX-reduce of ub0/ub1 sizes the per-ubatch buffers, so the two
+    disagreeing is an all_gather size mismatch, i.e. a hang.
+    """
+    total_tokens = int(
+        np.asarray(num_scheduled_tokens[:num_reqs], dtype=np.int64).sum()
+    )
+    # can_split: need >= 2 tokens to cut into two non-empty halves.
+    if total_tokens < 2:
+        return False, False, 0, 0
+    meets_min_tokens = not (min_pref > 0 and num_pref_tokens < min_pref)
+    ub0 = total_tokens // 2
+    ub1 = total_tokens - ub0
+    return meets_min_tokens, True, ub0, ub1
+
+
 def _precompute_decode(batch) -> tuple[bool, bool, int, int]:
     """Decode, split by request count (uniform tokens per request).
 
@@ -150,20 +183,26 @@ def local_tbo_precompute(
     if not config.enable_tbo:
         return False, False, 0, 0
 
-    # A mixed prefill+decode batch cannot be ubatch-split yet: the split maths
-    # below only sees `num_scheduled_tokens[:num_pref_reqs]`, and
-    # `split_attn_metadata` has no branch for the nested per-segment metadata a
-    # mixed batch carries. `_maybe_create_tbo_slices` already refuses to build
-    # slices for one.
-    #
-    # The refusal has to happen HERE, not there. `can_split` is AND-reduced
-    # across DP precisely so that one rank's inability to split turns TBO off
-    # for everyone; a rank that instead stays silent here and bails out later
-    # runs 1 ubatch while its peers run 2, and the per-ubatch collectives
-    # deadlock. Reporting it as a structural can_split=False keeps the whole
-    # group in step.
     if getattr(batch, "is_mixed", False):
-        return False, False, 0, 0
+        from atom.utils import envs
+
+        # Off by default. The split arithmetic below is complete, but the V4
+        # attention builder cannot yet rebuild its nested per-segment metadata
+        # for a ubatch, so an enabled mixed split fails at that point rather
+        # than here. See ATOM_TBO_MIXED.
+        if not envs.ATOM_TBO_MIXED:
+            # Report the refusal HERE, not in `_maybe_create_tbo_slices`.
+            # `can_split` is AND-reduced across DP precisely so that one rank's
+            # inability to split turns TBO off for everyone; a rank that stays
+            # silent here and bails out later runs 1 ubatch while its peers run
+            # 2, and the per-ubatch collectives deadlock.
+            return False, False, 0, 0
+        return _precompute_mixed_token_split(
+            num_scheduled_tokens,
+            batch.total_seqs_num,
+            batch.total_tokens_num_prefill,
+            envs.ATOM_TBO_PREFILL_MIN_TOKENS,
+        )
 
     if is_prefill:
         from atom.utils import envs
