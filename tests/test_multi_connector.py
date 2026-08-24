@@ -21,7 +21,11 @@ from atom.kv_transfer.disaggregation.multi.multi_connector import (
     MultiConnectorMetadata,
     MultiConnectorScheduler,
 )
-from atom.kv_transfer.disaggregation.types import ConnectorMetadata, KVConnectorOutput
+from atom.kv_transfer.disaggregation.types import (
+    ConnectorMetadata,
+    KVConnectorOutput,
+    SaveOperationId,
+)
 
 # ---------------------------------------------------------------------------
 # Mock sub-connectors
@@ -88,6 +92,16 @@ class FakeSchedSub:
     def load_failed(self, req_id):
         self.load_failed_ids.append(req_id)
 
+    def process_completions(self, output):
+        # Mirrors OffloadSchedulerMixin: apply the completions, then hand the
+        # scheduler bare request ids.
+        for value in output.finished_saving:
+            self.save_finished(value)
+        output.finished_saving = {
+            getattr(value, "req_id", value) for value in output.finished_saving
+        }
+        return output
+
     def has_pending_work(self):
         return self.pending
 
@@ -101,6 +115,7 @@ class FakeSchedSub:
             "should_defer_free",
             "save_finished",
             "load_failed",
+            "process_completions",
             "has_pending_work",
         }
         if name in offload_api and not object.__getattribute__(self, "_offload"):
@@ -229,6 +244,22 @@ def test_offload_methods_forwarded_to_owning_sub():
     sched.load_failed("r2")
     assert off.saved == ["r1"]
     assert off.load_failed_ids == ["r2"]
+
+
+def test_process_completions_reaches_the_offload_sub():
+    # The scheduler calls process_completions and nothing else — it is the only
+    # caller of the offload sub's save_finished. Without the fan-out the sub's
+    # inflight saves never clear (has_pending_work stays true forever) and the
+    # exact SaveOperationId reaches a scheduler that looks requests up by id.
+    moriio = FakeSchedSub(is_producer=True)
+    off = FakeSchedSub(offload_methods=True)
+    sched = _sched([moriio, off])
+
+    op = SaveOperationId(9, 1)
+    out = sched.process_completions(KVConnectorOutput(finished_saving={op}))
+
+    assert off.saved == [op]
+    assert out.finished_saving == {9}
 
 
 def test_offload_methods_default_when_no_sub_implements():
@@ -368,6 +399,27 @@ def test_save_then_send_also_pairs():
     out2 = w.get_finished()
     assert out2.finished_sending == {9}
     assert out2.finished_saving == {9}
+
+
+def test_pairing_matches_save_operation_id():
+    # The offload connector reports a SaveOperationId(req_id, generation), not
+    # a bare request id, whenever it tracks save generations. Pairing keys the
+    # send side by request, so the completion has to collapse onto req_id or
+    # every send is withheld forever and the producer never frees its blocks.
+    moriio = FakeWorkerSub(is_producer=True)
+    off = FakeWorkerSub()
+    w = _worker([moriio, off])
+    w.start_load_kv(MultiConnectorMetadata([ConnectorMetadata(), _save_meta(9)]))
+
+    op = SaveOperationId(9, 3)
+    moriio._finished = ({9}, set())
+    off._finished = KVConnectorOutput(finished_saving={op})
+    out = w.get_finished()
+    assert out.finished_sending == {9}
+    assert out.finished_saving == {op}
+    assert w._pending_save == set()
+    assert w._sent == {}
+    assert w._saved == {}
 
 
 def test_non_head_pp_stage_does_not_pair():

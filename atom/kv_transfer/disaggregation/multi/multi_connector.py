@@ -63,7 +63,11 @@ from atom.kv_transfer.disaggregation.base import (
     KVConnectorBase,
     KVConnectorSchedulerBase,
 )
-from atom.kv_transfer.disaggregation.types import ConnectorMetadata, KVConnectorOutput
+from atom.kv_transfer.disaggregation.types import (
+    ConnectorMetadata,
+    KVConnectorOutput,
+    completion_req_key,
+)
 
 logger = logging.getLogger("atom")
 
@@ -281,7 +285,7 @@ class MultiConnector(KVConnectorBase):
         for r in send_now:
             self._sent[str(r)] = r
         for r in save_now:
-            self._saved[str(r)] = r
+            self._saved[completion_req_key(r)] = r
 
         rel_send: set = set()
         rel_save: set = set()
@@ -383,6 +387,20 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             for c in self._connectors
             if hasattr(c, "has_pending_work")
         )
+
+    def process_completions(self, output: KVConnectorOutput) -> KVConnectorOutput:
+        """Let every sub apply its own completions and normalize the output.
+
+        Only the offload sub defines this. Without the fan-out its
+        ``save_finished`` / ``load_finished`` bookkeeping never clears, and the
+        exact ``SaveOperationId`` / ``LoadOperationId`` identities reach the
+        scheduler, which looks requests up by bare id.
+        """
+        for c in self._connectors:
+            handler = getattr(c, "process_completions", None)
+            if callable(handler):
+                output = handler(output)
+        return output
 
     def save_finished(self, req_id: Any) -> None:
         for c in self._connectors:
