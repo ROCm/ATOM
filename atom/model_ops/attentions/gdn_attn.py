@@ -607,8 +607,8 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         config = runner.config
         hf_config = config.hf_config
         num_kv_heads = runner._get_num_kv_heads()
-        total = runner._get_local_total_num_layers()
-        num_draft = total - runner._get_local_num_target_layers()
+        total = runner._get_total_num_layers()
+        num_draft = total - hf_config.num_hidden_layers
         n_full = runner.num_full_attn + num_draft
         kv_dtype_size = dtypes.d_dtypes[config.kv_cache_dtype].itemsize
 

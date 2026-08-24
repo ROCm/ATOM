@@ -48,7 +48,7 @@ class _KimiMLAGDNCommon(GDNStateMixin):
         """Rows in the MLA pool: the target's full-attention layers plus any
         draft layers that share this pool.
 
-        Derived from `_get_local_total_num_layers()` rather than from the
+        Derived from `_get_total_num_layers()` rather than from the
         `num_draft_layers` argument ModelRunner passes to
         `allocate_kv_cache_tensors`, so the row count the pool is SIZED for
         (`sub_pool_specs`) and the row count it is ALLOCATED with can never
@@ -57,9 +57,8 @@ class _KimiMLAGDNCommon(GDNStateMixin):
         method in both places.
         """
         runner = self.model_runner
-        num_draft = (
-            runner._get_local_total_num_layers() - runner._get_local_num_target_layers()
-        )
+        hf = runner.config.hf_config
+        num_draft = runner._get_total_num_layers() - hf.num_hidden_layers
         return runner.num_full_attn + num_draft
 
     def sub_pool_specs(self) -> list[SubPoolSpec]:
