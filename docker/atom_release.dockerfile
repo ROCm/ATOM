@@ -159,6 +159,9 @@ RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
 # [MC 3/4] CMake build with HIP + HIP dma-buf MR (ibv_reg_dmabuf_mr)
 # USE_HIP_DMABUF must compile into rdma_transport (rdma_context.cpp). Without
 # hsa-runtime64, CMake silently disables dma-buf and GPU MRs stay on ibv_reg_mr.
+# ATOM only consumes the TransferEngine (`mooncake.engine`), so Mooncake Store
+# and its Rust bindings stay off: they add build surface (cachelib, cargo) that
+# nothing here loads. WITH_STORE_RUST=ON is a hard error without WITH_STORE.
 RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
         echo "========== [MC 3/4] Build and install Mooncake (USE_HIP=ON USE_HIP_DMABUF=${USE_HIP_DMABUF}) =========="; \
         HSA_PREFIXS="/opt/rocm"; \
@@ -168,6 +171,7 @@ RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
         done; \
         mkdir -p /app/mooncake/build && cd /app/mooncake/build \
         && cmake .. -DUSE_HIP=ON -DUSE_HIP_DMABUF=${USE_HIP_DMABUF} -DUSE_ETCD=ON \
+             -DWITH_TE=ON -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF \
              -DCMAKE_PREFIX_PATH="${HSA_PREFIXS}${CMAKE_PREFIX_PATH:+:${CMAKE_PREFIX_PATH}}" \
              > /tmp/mooncake-cmake.log 2>&1 \
         || { cat /tmp/mooncake-cmake.log; exit 1; } \
@@ -178,7 +182,14 @@ RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
                     grep -E "HIP dmabuf|hsa-runtime64" /tmp/mooncake-cmake.log || true; \
                     exit 1; }; \
            fi \
-        && make -j$(nproc) && make install \
+        && { make -j$(nproc) > /tmp/mooncake-make.log 2>&1 \
+             || { echo "ERROR: Mooncake build failed. Compiler diagnostics:"; \
+                  grep -nE "error:|fatal error|undefined reference|Error [0-9]" \
+                       /tmp/mooncake-make.log | head -n 80; \
+                  echo "--- tail of build log ---"; \
+                  tail -n 120 /tmp/mooncake-make.log; \
+                  exit 1; }; } \
+        && make install \
         && ldconfig \
         && ( grep -a -R -l "ibv_reg_dmabuf_mr" /usr/local/lib /opt/venv 2>/dev/null | head -n 1 \
              || { echo "ERROR: installed Mooncake libs have no ibv_reg_dmabuf_mr"; exit 1; } ) \
