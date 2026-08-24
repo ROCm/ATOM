@@ -2354,9 +2354,19 @@ class Scheduler:
                         i for i, t in enumerate(token_ids) if t in self.stop_token_ids
                     )
                     leave_reason = f"stop_{token_ids[stop_at_idx]}"
-                elif (num_tokens - seq.num_prompt_tokens) >= seq.max_tokens:
-                    # Use local num_tokens (pre-placeholder), not the property
-                    # which over-counts by mtp_k + num_rejected.
+
+            # ``num_tokens`` is the real post-verification length. One MTP
+            # forward can accept multiple tokens, so the final batch can cross
+            # max_tokens even though the request was below the cap when it was
+            # scheduled. Select the earlier boundary between a natural stop
+            # above and the output cap, then reuse the common truncation path
+            # for both internal and client-visible tokens.
+            completion_tokens = num_tokens - seq.num_prompt_tokens
+            if completion_tokens >= seq.max_tokens:
+                overflow = completion_tokens - seq.max_tokens
+                max_stop_at_idx = max(-1, num_new_token - 1 - overflow)
+                if stop_at_idx is None or max_stop_at_idx < stop_at_idx:
+                    stop_at_idx = max_stop_at_idx
                     leave_reason = "max_tokens"
 
             # Drop accepted-draft tokens past the stop position (MTP only —
@@ -2377,6 +2387,11 @@ class Scheduler:
                 # in stop_at_idx / num_new_token, so offset the cut by it.
                 keep = stop_at_idx + 1 + (1 if injected_t0 is not None else 0)
                 new_tokens = new_tokens[:keep]
+                if seq.return_logprobs:
+                    # LLMEngine.postprocess returns the complete logprobs
+                    # array rather than slicing it through num_tokens, so keep
+                    # it aligned explicitly with the cropped completion.
+                    del seq.logprobs[num_tokens - seq.num_prompt_tokens :]
 
             # Hash generated blocks. Deferred output: all tokens forwarded;
             # undeferred: last token not yet forwarded, so exclude it.
