@@ -248,7 +248,7 @@ models:
             isl: [1048576]
             osl: 1024
             server:
-              common_args:
+              common_args: &glm52_agentic_common_args
                 kv_cache_dtype: fp8
                 block_size: 16
                 gpu_memory_utilization: 0.9
@@ -271,7 +271,7 @@ models:
                 MAX_JOBS: "16"
             benchmark:
               kind: aiperf_agentic
-              aiperf_commit: b7b16cf851885567988a643282266bce74e34437
+              aiperf_commit: 49634d1c6c2e6dcc18979d704a65e7c7064efc49
               scenario: inferencex-agentx-mvp
               public_dataset: semianalysis_cc_traces_weka_062126
               max_context_length: 1048576
@@ -325,6 +325,70 @@ models:
           name: glm-52-mxfp4-1p1d-tp4-agentic-1m-c48
           concurrency: [48]
 
+        # TP4+DCP4 uses the validated sharded-index DCP layout. Keep every
+        # concurrency in a separate job so both the HBM prefix cache and
+        # LMCache CPU tier start cold for each measurement.
+        - &glm52_agentic_lmcache_tp4_dcp4
+          <<: *glm52_agentic_tp4_tp4
+          name: glm-52-mxfp4-1p1d-tp4-dcp4-agentic-lmcache-1m-c1
+          topology: 1p1d_dcp4
+          pd_worker_layout: single_node
+          concurrency: [1]
+          server:
+            common_args:
+              <<: *glm52_agentic_common_args
+              gpu_memory_utilization: 0.85
+              extra_args: "--decode-context-parallel-size 4 --level 3"
+          prefill:
+            workers: 1
+            tp: 4
+            cudagraph: none
+            extra_args: "--enforce-eager --max-num-batched-tokens 8192"
+          decode:
+            workers: 1
+            tp: 4
+            cudagraph: >-
+              [1,2,4,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256]
+            extra_args: "--cudagraph-mode FULL"
+          env:
+            common:
+              ATOM_DCP_REPLICATE_INDEX_CACHE: "0"
+              ATOM_MLA_PAGE_SIZE: "1"
+              ATOM_ONLINE_QUANT_STREAMING: "0"
+              ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB: "1024"
+              ATOM_USE_TRITON_MLA: "0"
+              MAX_JOBS: "16"
+              PYTHONHASHSEED: "0"
+            prefill:
+              HIP_VISIBLE_DEVICES: "0,1,2,3"
+              LMCACHE_LOCAL_CPU: "True"
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "256"
+              LMCACHE_CHUNK_SIZE: "256"
+              OFFLOAD_PROFILE: "1"
+              OFFLOAD_MIN_LOAD_TOKENS: "0"
+              PREFILL_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
+            decode:
+              HIP_VISIBLE_DEVICES: "4,5,6,7"
+              DECODE_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
+
+        - <<: *glm52_agentic_lmcache_tp4_dcp4
+          name: glm-52-mxfp4-1p1d-tp4-dcp4-agentic-lmcache-1m-c2
+          concurrency: [2]
+
+        - <<: *glm52_agentic_lmcache_tp4_dcp4
+          name: glm-52-mxfp4-1p1d-tp4-dcp4-agentic-lmcache-1m-c4
+          concurrency: [4]
+
+        - <<: *glm52_agentic_lmcache_tp4_dcp4
+          name: glm-52-mxfp4-1p1d-tp4-dcp4-agentic-lmcache-1m-c8
+          concurrency: [8]
+
+        - <<: *glm52_agentic_lmcache_tp4_dcp4
+          name: glm-52-mxfp4-1p1d-tp4-dcp4-agentic-lmcache-1m-c16
+          concurrency: [16]
+
         - &glm52_agentic_lmcache_tp4_dpa
           <<: *glm52_agentic_tp4_tp4
           name: glm-52-mxfp4-1p1d-tp4-dpa-agentic-lmcache-1m-c24
@@ -351,7 +415,7 @@ models:
               LMCACHE_MAX_LOCAL_CPU_SIZE: "256"
               LMCACHE_CHUNK_SIZE: "256"
               PREFILL_KV_TRANSFER_CONFIG: >-
-                {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":6301},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
+                {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT}},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
               HIP_VISIBLE_DEVICES: "0,1,2,3"
             decode:
               MAX_JOBS: "16"
