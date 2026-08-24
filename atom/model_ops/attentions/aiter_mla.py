@@ -330,10 +330,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 if indexer_type == "full"
             )
             if not self.full_index_layer_ids:
-                raise ValueError("Replicated GLM index cache found no full IndexShare layers")
+                raise ValueError(
+                    "Replicated GLM index cache found no full IndexShare layers"
+                )
             self.index_layer_to_cache_row = {
-                layer_id: row
-                for row, layer_id in enumerate(self.full_index_layer_ids)
+                layer_id: row for row, layer_id in enumerate(self.full_index_layer_ids)
             }
             logger.info(
                 "Replicating GLM index cache for %d full IndexShare layers "
@@ -1060,11 +1061,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 if self.replicate_index_cache
                 else len(index_cache_layer_ids)
             )
+            replicate_index_cache = getattr(self, "replicate_index_cache", False)
             index_page_factor = (
-                self.dcp_world_size if self.replicate_index_cache else 1
+                getattr(self, "dcp_world_size", 1) if replicate_index_cache else 1
             )
             block_bytes += (
-                index_layers
+                len(index_cache_layer_ids)
                 * runner.block_size
                 * index_page_factor
                 * aligned_index_dim
@@ -1110,8 +1112,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 if self.replicate_index_cache
                 else len(index_cache_layer_ids)
             )
+            replicate_index_cache = getattr(self, "replicate_index_cache", False)
             index_page_factor = (
-                self.dcp_world_size if self.replicate_index_cache else 1
+                getattr(self, "dcp_world_size", 1) if replicate_index_cache else 1
             )
             out["aligned_index_dim"] = aligned
             out["index_cache_layer_ids"] = index_cache_layer_ids
@@ -1122,14 +1125,14 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 )
             }
             out["index_cache"] = torch.zeros(
-                index_layers,
+                len(index_cache_layer_ids),
                 runner.num_physical_kvcache_blocks,
                 runner.physical_block_size * index_page_factor,
                 aligned,
                 dtype=dtypes.fp8,
                 device="cuda",
             )
-            if self.replicate_index_cache:
+            if replicate_index_cache:
                 out["index_layer_to_cache_row"] = self.index_layer_to_cache_row
                 out["full_index_layer_ids"] = self.full_index_layer_ids
         return out
@@ -1171,9 +1174,22 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 )
             index_cache_layer_id = runner.index_cache_layer_map[global_layer_id]
             index_cache = runner.index_cache[index_cache_layer_id]
+            replicate_index_cache = getattr(self, "replicate_index_cache", False)
             index_page_factor = (
-                self.dcp_world_size if self.replicate_index_cache else 1
+                getattr(self, "dcp_world_size", 1) if replicate_index_cache else 1
             )
+            # `layer_id` is a PP-local cache-row counter, while the compact map
+            # is keyed by global model layer IDs. On a non-first PP stage they
+            # differ (for example local 0 may be global 39), so use layer_num
+            # to avoid binding this indexer to another stage's compact row.
+            global_layer_id = getattr(module, "layer_num", None)
+            if global_layer_id not in runner.index_cache_layer_map:
+                raise RuntimeError(
+                    "Sparse MLA indexer layer is missing from the compact index "
+                    f"cache layout: layer_num={global_layer_id}"
+                )
+            index_cache_layer_id = runner.index_cache_layer_map[global_layer_id]
+            index_cache = runner.index_cache[index_cache_layer_id]
             # Use aligned dimension to avoid memory copy in torch inductor
             module.indexer.k_cache.kv_cache[0] = index_cache.view(
                 runner.num_physical_kvcache_blocks
@@ -1182,17 +1198,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 1,
                 runner.aligned_index_dim,
             )
-            module.indexer.replicate_index_cache = self.replicate_index_cache
+            module.indexer.replicate_index_cache = replicate_index_cache
         module.kv_cache = kv_cache
-        if runner.is_deepseek_v32 and self.replicate_index_cache:
-            index_row = self.index_layer_to_cache_row.get(layer_id)
-            transfer_index_cache = (
-                runner.index_cache[index_row] if index_row is not None else None
-            )
-        else:
-            transfer_index_cache = (
-                runner.index_cache[layer_id] if runner.is_deepseek_v32 else None
-            )
         return KVCacheTensor(
             layer_num=layer_id,
             k_cache=kv_cache,
@@ -1379,9 +1386,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                         f"count: {len(index_slots)} != {sum_scheduled_tokens}"
                     )
                 var["index_slot_mapping"].np[:sum_scheduled_tokens] = index_slots
-            attn_metadata.index_slot_mapping = var[
-                "index_slot_mapping"
-            ].copy_to_gpu(sum_scheduled_tokens)
+            attn_metadata.index_slot_mapping = var["index_slot_mapping"].copy_to_gpu(
+                sum_scheduled_tokens
+            )
         if self.is_sparse and attn_metadata.max_seqlen_k > self.index_topk:
             if attn_metadata.block_tables is None:
                 self.prepare_block_tables(batch)
@@ -2250,9 +2257,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 var[f"{p}index_slot_mapping"].np[:ub_real_tokens] = var[
                     "index_slot_mapping"
                 ].np[tok_start : tok_start + ub_real_tokens]
-                var[f"{p}index_slot_mapping"].np[
-                    ub_real_tokens:padded_tok_count
-                ] = 0
+                var[f"{p}index_slot_mapping"].np[ub_real_tokens:padded_tok_count] = 0
 
             var[f"{p}block_tables"].np[:ub_real_reqs] = var["block_tables"].np[
                 req_start : req_start + ub_real_reqs

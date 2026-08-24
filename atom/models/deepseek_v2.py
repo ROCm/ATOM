@@ -1398,9 +1398,7 @@ def _dcp_gather_indexer_k_prefill(
     return k_fp8, k_scale
 
 
-def _dcp_index_comm_required(
-    dcp_world_size: int, replicated_index_cache: bool
-) -> bool:
+def _dcp_index_comm_required(dcp_world_size: int, replicated_index_cache: bool) -> bool:
     """Whether index top-k still needs a cross-rank gather/merge."""
     return dcp_world_size > 1 and not replicated_index_cache
 
@@ -1676,9 +1674,7 @@ def sparse_attn_indexer(
                 dtype=torch.long,
                 device=prefill_metadata.block_tables.device,
             )
-        if _dcp_index_comm_required(
-            get_dcp_world_size(), replicated_index_cache
-        ):
+        if _dcp_index_comm_required(get_dcp_world_size(), replicated_index_cache):
             k_fp8, k_scale = _dcp_gather_indexer_k_prefill(
                 kv_cache, prefill_metadata, head_dim, k.device
             )
