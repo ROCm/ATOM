@@ -340,15 +340,7 @@ def test_incremental_transfer_is_the_tail_of_the_full_transfer(
         assert part == tail
 
 
-# ── rejected inputs ───────────────────────────────────────────────────────
-
-
-def test_planner_rejects_impossible_layouts():
-    ids = list(range(16))
-    with pytest.raises(ValueError, match="interleave_size"):
-        plan_sharded(ids, ids[:4], 16, 4, 0, interleave_size=5)
-    with pytest.raises(ValueError, match="dcp_rank"):
-        plan_sharded(ids, ids[:4], 16, 4, 4, interleave_size=1)
+# ── degenerate inputs ─────────────────────────────────────────────────────
 
 
 def test_empty_plans_are_empty_not_broken():

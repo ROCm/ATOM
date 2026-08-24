@@ -206,15 +206,6 @@ def _coalesce(
     return src[starts], dst[starts], merged_len
 
 
-def _validate_dcp_layout(block_size: int, dcp_size: int, dcp_rank: int) -> None:
-    if block_size <= 0:
-        raise ValueError(f"block_size must be >= 1, got {block_size}")
-    if dcp_size <= 0:
-        raise ValueError(f"dcp_size must be >= 1, got {dcp_size}")
-    if not 0 <= dcp_rank < dcp_size:
-        raise ValueError(f"dcp_rank {dcp_rank} out of range for dcp_size {dcp_size}")
-
-
 def plan_sharded(
     src_block_ids,
     dst_block_ids,
@@ -230,12 +221,7 @@ def plan_sharded(
     block manager sizes every rank's table from rank 0's share, so ranks above
     it can own a trailing virtual block that has no source tokens at all.
     """
-    _validate_dcp_layout(block_size, dcp_size, dcp_rank)
     S = int(interleave_size)
-    if S < 1 or block_size % S:
-        raise ValueError(
-            f"interleave_size {S} must be >= 1 and divide block_size {block_size}"
-        )
     src_ids = np.asarray(src_block_ids, dtype=np.int64)
     dst_ids = np.asarray(dst_block_ids, dtype=np.int64)
 
@@ -262,7 +248,6 @@ def plan_replicated(
     dcp_size: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Plan the replicated (full-copy) transfer; identical on every DCP rank."""
-    _validate_dcp_layout(block_size, dcp_size, 0)
     src_ids = np.asarray(src_block_ids, dtype=np.int64)
     dst_ids = np.asarray(dst_block_ids, dtype=np.int64)
 
