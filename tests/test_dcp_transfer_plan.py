@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 """CPP prefill -> DCP decode KV relayout: the block/token transfer plan.
 
-``atom/kv_transfer/disaggregation/dcp_plan.py`` decides which producer bytes
-land in which consumer slot when a non-DCP prefill node pushes KV to a DCP
+The mooncake connector's DCP planner decides which producer bytes land in
+which consumer slot when a non-DCP prefill node pushes KV to a DCP
 decode node. A wrong mapping does not crash and does not produce NaN -- decode
 simply attends to the wrong tokens, which only shows up as garbage on long
 contexts. So the checks here go past "it runs":
@@ -22,12 +22,14 @@ a different id instead of on plausible-looking data.
 
 import numpy as np
 import pytest
+from aiter_stub import stubbed_aiter
 
-from atom.kv_transfer.disaggregation.dcp_plan import (
-    build_token_runs,
-    plan_replicated,
-    plan_sharded,
-)
+with stubbed_aiter():
+    from atom.kv_transfer.disaggregation.mooncake.mooncake_connector import (
+        build_token_runs,
+        plan_replicated,
+        plan_sharded,
+    )
 
 # (block_size, dcp_size, interleave_size)
 LAYOUTS = [
