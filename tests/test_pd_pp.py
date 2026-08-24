@@ -897,12 +897,14 @@ def _fake_head(batch):
         scheduler=MagicMock(),
         _poll_kv_transfer_progress=MagicMock(),
         _dispatch_idle_offload_work=MagicMock(),
+        _poll_dynamic_chunking_calibration=MagicMock(),
         # Real throttle, mocked dispatch: `_pp_head_step` runs on a loop that
         # never sleeps, so it must go through `_advance_idle_kv_transfer`.
         _next_idle_kv_drain=0.0,
     )
     head.scheduler.schedule.side_effect = [(batch, {}), None]
     head.scheduler.take_rejected.return_value = None
+    head.pp_transport.recv_completion.return_value = None
     head._advance_idle_kv_transfer = PPEngineCoreProc._advance_idle_kv_transfer.__get__(
         head
     )
