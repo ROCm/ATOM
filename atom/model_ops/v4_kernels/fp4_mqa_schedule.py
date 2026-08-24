@@ -65,9 +65,7 @@ def fp4_mqa_prefill_wave_tasks_per_row(
     k_tasks_per_row = max(
         1, (max_seq_len + FP4_MQA_FINE_BLOCK_K - 1) // FP4_MQA_FINE_BLOCK_K
     )
-    waves_for_device = (
-        FP4_MQA_TARGET_DEVICE_WAVE_TASKS + num_rows - 1
-    ) // num_rows
+    waves_for_device = (FP4_MQA_TARGET_DEVICE_WAVE_TASKS + num_rows - 1) // num_rows
     waves_for_pipeline = (
         k_tasks_per_row + FP4_MQA_TARGET_SERIAL_K_TASKS - 1
     ) // FP4_MQA_TARGET_SERIAL_K_TASKS
@@ -166,16 +164,12 @@ def fp4_mqa_prefill_config(
         1, (max_seq_len + FP4_MQA_BLOCK_K - 1) // FP4_MQA_BLOCK_K
     )
     long_reuse = (
-        num_rows >= 8192
-        and max_query_len >= 6144
-        and coarse_chunks_per_row <= 64
+        num_rows >= 8192 and max_query_len >= 6144 and coarse_chunks_per_row <= 64
     )
     if long_reuse:
         wave_tasks_per_row = 4
     else:
-        wave_tasks_per_row = fp4_mqa_prefill_wave_tasks_per_row(
-            num_rows, max_seq_len
-        )
+        wave_tasks_per_row = fp4_mqa_prefill_wave_tasks_per_row(num_rows, max_seq_len)
 
     # For Q<=1536 the high wave budget is latency/occupancy driven and the
     # independently scheduled wave is beneficial once launch overhead is
@@ -183,12 +177,9 @@ def fp4_mqa_prefill_config(
     # cap each sequence's run length: this is the source-derived proxy for the
     # loss of single-KV cache reuse. It intentionally keeps ambiguous two-seq
     # and very long-query shapes on the conservative 4-wave kernel.
-    sequence_equivalents = max(
-        1, (num_rows + max_query_len - 1) // max_query_len
-    )
+    sequence_equivalents = max(1, (num_rows + max_query_len - 1) // max_query_len)
     use_fine_workgroups = num_rows >= 512 and (
-        num_rows <= 1536
-        or (sequence_equivalents >= 3 and max_query_len <= 3072)
+        num_rows <= 1536 or (sequence_equivalents >= 3 and max_query_len <= 3072)
     )
     if use_fine_workgroups:
         block_k = FP4_MQA_FINE_BLOCK_K

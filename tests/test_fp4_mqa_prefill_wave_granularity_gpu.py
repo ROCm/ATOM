@@ -105,9 +105,13 @@ def test_one_wave_matches_four_waves_for_random_ragged_pages():
     max_seq_len = 257
     pages_per_sequence = math.ceil(max_seq_len / KV_BLOCK_SIZE)
     num_physical_pages = 3 * pages_per_sequence + 3
-    block_tables = torch.randperm(
-        num_physical_pages, generator=generator, device=device
-    )[: 3 * pages_per_sequence].reshape(3, pages_per_sequence).to(torch.int32)
+    block_tables = (
+        torch.randperm(num_physical_pages, generator=generator, device=device)[
+            : 3 * pages_per_sequence
+        ]
+        .reshape(3, pages_per_sequence)
+        .to(torch.int32)
+    )
 
     q_fp4 = torch.randint(
         0,
@@ -148,19 +152,19 @@ def test_one_wave_matches_four_waves_for_random_ragged_pages():
         device=device,
         generator=generator,
     )
-    args = dict(
-        q_fp4=q_fp4,
-        q_scale=q_scale,
-        kv_cache=kv_cache,
-        kv_scale=kv_scale,
-        block_tables=block_tables,
-        weights=weights,
-        row_to_batch=row_to_batch,
-        local_starts=local_starts,
-        local_ends=local_ends,
-        max_seq_len=max_seq_len,
-        wave_tasks_per_row=8,
-    )
+    args = {
+        "q_fp4": q_fp4,
+        "q_scale": q_scale,
+        "kv_cache": kv_cache,
+        "kv_scale": kv_scale,
+        "block_tables": block_tables,
+        "weights": weights,
+        "row_to_batch": row_to_batch,
+        "local_starts": local_starts,
+        "local_ends": local_ends,
+        "max_seq_len": max_seq_len,
+        "wave_tasks_per_row": 8,
+    }
 
     coarse = _launch(block_k=256, num_warps=4, **args)
     fine = _launch(block_k=64, num_warps=1, **args)

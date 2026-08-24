@@ -2307,9 +2307,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             meta["fp4_prefill_max_seq_len"] = fp4_prefill_max_seq_len
             meta["fp4_prefill_block_k"] = prefill_config.block_k
             meta["fp4_prefill_num_warps"] = prefill_config.num_warps
-            meta["fp4_prefill_wave_tasks_per_row"] = (
-                prefill_config.wave_tasks_per_row
-            )
+            meta["fp4_prefill_wave_tasks_per_row"] = prefill_config.wave_tasks_per_row
 
         return meta
 

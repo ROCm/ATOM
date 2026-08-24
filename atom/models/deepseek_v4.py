@@ -2037,9 +2037,7 @@ class Indexer(nn.Module):
         max_seq_len = indexer_meta["fp4_prefill_max_seq_len"]
         prefill_block_k = indexer_meta["fp4_prefill_block_k"]
         prefill_num_warps = indexer_meta["fp4_prefill_num_warps"]
-        prefill_wave_tasks_per_row = indexer_meta[
-            "fp4_prefill_wave_tasks_per_row"
-        ]
+        prefill_wave_tasks_per_row = indexer_meta["fp4_prefill_wave_tasks_per_row"]
         kv_block_size = self.kv_cache.size(3)  # csa_rows_per_block = 64
         # The packed-dword scale readers in pa_mqa_logits_fp4* require N_PHYS==1
         # (NTPW=4 N-tiles share one physical block), i.e. kv_block_size == 64

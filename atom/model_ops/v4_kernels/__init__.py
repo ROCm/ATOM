@@ -70,8 +70,8 @@ from atom.model_ops.v4_kernels.state_writes import (
 __all__ = [
     "FP4_MQA_BLOCK_K",
     "FP4_MQA_PARALLEL_UNIT_NUM",
-    "FP4MQAPrefillConfig",
     "CompressPlan",
+    "FP4MQAPrefillConfig",
     "QKNormRopeOut",
     "csa_translate_pack",
     "csa_translate_pack_reference",
