@@ -237,6 +237,8 @@ class ForwardMode:
         tbo_on: bool,
         local_tbo: tuple[bool, bool, int, int],
         max_seqlen_q: int,
+        dp_sync_device: torch.device | str = "cpu",
+        dp_sync_buffer: torch.Tensor | None = None,
     ) -> "ForwardMode":
         """Run the step's DP collective and settle its shape from the result.
 
@@ -258,6 +260,8 @@ class ForwardMode:
             sync = sync_dp_metadata(
                 dp_group=dp_group,
                 dp_size=dp_size,
+                device=dp_sync_device,
+                gathered_buffer=dp_sync_buffer,
                 scheduled_tokens=scheduled_tokens,
                 scheduled_bs=scheduled_bs,
                 is_prefill=is_prefill,

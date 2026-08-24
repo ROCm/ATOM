@@ -99,6 +99,7 @@ from atom.utils.tbo import (
     local_tbo_precompute,
     maybe_create_ubatch_slices,
 )
+from atom.utils.tbo.ubatching import DP_METADATA_MAX_FIELDS
 
 logger = logging.getLogger("atom")
 
@@ -683,6 +684,20 @@ class ModelRunner:
             os.makedirs(self.profiler_dir, exist_ok=True)
 
         self._setup_device_and_distributed(rank, config)
+
+        dp_size = config.parallel_config.data_parallel_size
+        self._dp_metadata_device_sync = (
+            dp_size > 1 and envs.ATOM_DP_METADATA_DEVICE_SYNC
+        )
+        self._dp_metadata_gathered_buffer = (
+            torch.empty(
+                dp_size * DP_METADATA_MAX_FIELDS,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            if self._dp_metadata_device_sync
+            else None
+        )
 
         self.capture_sizes = [0]  # for eager fallback
         # The same ladder as an ASCENDING int32 array, which is what
@@ -2573,10 +2588,21 @@ class ModelRunner:
         # prepare_input_ids sizes the buffer, and because one call site is the
         # only way the step is guaranteed a single cross-DP collective.
         dp_size = self.config.parallel_config.data_parallel_size
+        dp_group = get_dp_group() if dp_size > 1 else None
         forward_mode = ForwardMode.decide(
             batch=batch,
             dp_size=dp_size,
-            dp_group=get_dp_group().cpu_group if dp_size > 1 else None,
+            dp_group=(
+                (
+                    dp_group.device_group
+                    if self._dp_metadata_device_sync
+                    else dp_group.cpu_group
+                )
+                if dp_group is not None
+                else None
+            ),
+            dp_sync_device=(self.device if self._dp_metadata_device_sync else "cpu"),
+            dp_sync_buffer=self._dp_metadata_gathered_buffer,
             enforce_eager=self.enforce_eager,
             capture_sizes=self.capture_sizes_np,
             captured_tokens=(
