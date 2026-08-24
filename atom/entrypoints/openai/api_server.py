@@ -896,6 +896,10 @@ async def generate_async(
         "text": text,
         "token_ids": all_token_ids,
         "finish_reason": finish_reason,
+        # Which stop string ended it, when one did. `finish_reason` says only
+        # that a stop sequence fired, and Anthropic's schema pairs the reason
+        # with the matched string.
+        "stop_reason": stop_reason,
         "num_tokens_input": num_tokens_input,
         "num_tokens_output": num_tokens_output,
         "ttft": ttft,
@@ -1006,6 +1010,10 @@ async def generate_async_multimodal(
         "text": text,
         "token_ids": all_token_ids,
         "finish_reason": finish_reason,
+        # Which stop string ended it, when one did. `finish_reason` says only
+        # that a stop sequence fired, and Anthropic's schema pairs the reason
+        # with the matched string.
+        "stop_reason": stop_reason,
         "num_tokens_input": (
             seq.num_prompt_tokens if seq is not None else len(token_ids)
         ),
