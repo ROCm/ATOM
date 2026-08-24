@@ -73,12 +73,16 @@ def maybe_create_ubatch_slices(
     num_scheduled_tokens: Optional[np.ndarray] = None,
     max_tokens_per_ubatch: Optional[int] = None,
     force: bool = False,
+    num_prefill_seqs: Optional[int] = None,
+    num_prefill_tokens: Optional[int] = None,
 ) -> Optional[list[UBatchSlice]]:
     """Split a batch into N micro-batch slices.
 
     For decode: split by request count (uniform tokens per request).
     For prefill: token-balanced split so each ubatch has roughly equal
                  token count, respecting request boundaries.
+    For mixed (`num_prefill_*` given): token midpoint over the whole batch,
+                 with each slice recording its own prefill boundary.
 
     Returns None if the batch is too small to split or if the split
     would produce a ubatch exceeding max_tokens_per_ubatch.
@@ -90,6 +94,21 @@ def maybe_create_ubatch_slices(
     """
     if num_ubatches <= 1:
         return None
+
+    # Mixed batches have their own splitter: the cut spans both segments and
+    # each slice has to record where its own prefill ends. Dispatch before the
+    # prefill/decode paths below, which would only see the prefill rows.
+    if num_prefill_tokens is not None:
+        assert (
+            num_scheduled_tokens is not None
+        ), "mixed split needs per-row token counts for the whole batch"
+        return split_mixed_token_midpoint(
+            num_reqs,
+            num_prefill_seqs,
+            num_prefill_tokens,
+            num_scheduled_tokens,
+            num_ubatches,
+        )
 
     # Token-midpoint prefill split can cut *inside* a request, so it works
     # even with a single request (bs=1) — only require that there are at
