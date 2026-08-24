@@ -97,6 +97,54 @@ def _precompute_prefill_req_split(
     return meets_min_tokens, True, ub0, ub1
 
 
+_MIXED_SPLIT_TALLY: dict[str, int] = {}
+
+
+def _probe_mixed_split(outcome: str) -> None:
+    """Tally mixed-split outcomes under ATOM_PROBE_TBO_MIXED=1.
+
+    Exists because a green accuracy run is not by itself evidence that the
+    mixed+TBO path ran: if every batch was prefill-only, or every split was
+    refused, the run exercised the ordinary prefill path and says nothing about
+    this one. The tally is what turns "it passed" into "it passed *and* it ran
+    N times".
+
+    The `gate:*` keys are this rank's vote; `build:*` is the one that settles
+    it. `can_split` is AND-reduced across DP, so a rank can vote to split every
+    step and still never split -- only a `build:` count proves the new V4
+    metadata builders actually ran.
+
+    Logged on each outcome's FIRST occurrence, then every 200 events. Each line
+    carries the whole tally, so the last one printed gives the counts.
+
+    The first-occurrence rule is what makes the probe answer its own question:
+    an earlier version logged only at 1 and at multiples of 200, and a gsm8k run
+    that never reached 200 mixed batches printed one line -- `{'gate:split': 1}`
+    -- and nothing after, so whether `build:mixed_ubatch` ever fired was exactly
+    as unknown as before the probe existed.
+
+    There is deliberately no atexit summary: an earlier version registered one
+    and it never fired in 12 runs, because teardown SIGKILLs the spawn workers.
+    """
+    from atom.utils import envs
+
+    if not envs.ATOM_PROBE_TBO_MIXED:
+        return
+    first_of_kind = outcome not in _MIXED_SPLIT_TALLY
+    _MIXED_SPLIT_TALLY[outcome] = _MIXED_SPLIT_TALLY.get(outcome, 0) + 1
+    total = sum(_MIXED_SPLIT_TALLY.values())
+    if first_of_kind or total % 200 == 0:
+        import logging
+
+        # logging.getLogger("atom"), not aiter's logger: AITER_LOG_LEVEL=WARNING
+        # silently swallows anything logged through the latter.
+        logging.getLogger("atom").warning(
+            "[probe] tbo mixed-split after %d mixed batches: %s",
+            total,
+            dict(sorted(_MIXED_SPLIT_TALLY.items())),
+        )
+
+
 def _precompute_mixed_token_split(
     num_scheduled_tokens: np.ndarray,
     num_reqs: int,
@@ -123,6 +171,7 @@ def _precompute_mixed_token_split(
     )
     # can_split: need >= 2 tokens to cut into two non-empty halves.
     if total_tokens < 2:
+        _probe_mixed_split("gate:refused:tiny")
         return False, False, 0, 0
     ub0 = total_tokens // 2
 
@@ -145,9 +194,11 @@ def _precompute_mixed_token_split(
     # 379 decode tokens), so the midpoint lands inside the prefill region and
     # this rejects almost nothing.
     if ub0 >= num_pref_tokens:
+        _probe_mixed_split("gate:refused:decode_heavy")
         return False, False, 0, 0
 
     meets_min_tokens = not (min_pref > 0 and num_pref_tokens < min_pref)
+    _probe_mixed_split("gate:split" if meets_min_tokens else "gate:refused:below_min")
     return meets_min_tokens, True, ub0, total_tokens - ub0
 
 
@@ -207,10 +258,10 @@ def local_tbo_precompute(
     if getattr(batch, "is_mixed", False):
         from atom.utils import envs
 
-        # Off by default. The split arithmetic below is complete, but the V4
-        # attention builder cannot yet rebuild its nested per-segment metadata
-        # for a ubatch, so an enabled mixed split fails at that point rather
-        # than here. See ATOM_TBO_MIXED.
+        # Off by default. The path is complete, accuracy-verified and measured
+        # +4.5% to +14.5% output throughput, but every existing baseline was
+        # taken with a mixed batch vetoing TBO here, so flipping the default
+        # silently moves them. See ATOM_TBO_MIXED.
         if not envs.ATOM_TBO_MIXED:
             # Report the refusal HERE, not in `_maybe_create_tbo_slices`.
             # `can_split` is AND-reduced across DP precisely so that one rank's
