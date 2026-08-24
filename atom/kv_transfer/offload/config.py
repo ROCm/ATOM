@@ -23,10 +23,12 @@ from typing import Any
 
 import torch
 
-# Version 2 adds explicit DSV4 KV/index dimensions and DCP virtual-block byte
-# mapping to the PAGE identity. Keeping it separate prevents version-1 objects
-# from being reused after the layout correction.
-PAGE_LAYOUT_VERSION = 2
+from atom.utils import envs
+
+# Version 3 adds the GLM replicated-index layout and IndexShare schedule to the
+# PAGE identity. Its compact layer axis and DCP-expanded index pages are byte-
+# incompatible with the sharded-index v2 layout.
+PAGE_LAYOUT_VERSION = 3
 _PAGE_FINGERPRINT_BYTES = 16
 _OFFLOAD_LAYOUT_ALIASES = {
     "hybrid": "hybrid",
@@ -49,10 +51,12 @@ _HF_PAGE_FIELDS = (
     "qk_rope_head_dim",
     "compress_ratios",
     "indexer_dtype",
+    "indexer_types",
 )
 _HF_INTEGER_GEOMETRY_FIELDS = frozenset(_HF_PAGE_FIELDS) - {
     "compress_ratios",
     "indexer_dtype",
+    "indexer_types",
 }
 
 logger = logging.getLogger("atom")
@@ -198,6 +202,12 @@ def build_page_namespace(
                 else getattr(config, "decode_context_parallel_size", 1)
             ),
             minimum=1,
+        ),
+        "replicated_index_cache": bool(
+            envs.ATOM_DCP_REPLICATE_INDEX_CACHE
+            and getattr(hf, "model_type", None) == "glm_moe_dsa"
+            and (getattr(config, "decode_context_parallel_size", 1) or 1) > 1
+            and getattr(config, "speculative_config", None) is None
         ),
         "hf_geometry": _stable_hf_geometry(hf),
         "speculative_config": _stable_config_value(

@@ -29,6 +29,7 @@ import torch
 try:
     from atom.model_ops.dcp_ops import (
         correct_attn_out,
+        correct_attn_out_rs_layout,
         dcp_global_pos,
         dcp_local_index,
         dcp_owner_rank,
@@ -97,6 +98,46 @@ def test_merge_reproduces_dense_attention(dtype, N):
 
     tol = 1e-5 if dtype == torch.float32 else 3e-2
     torch.testing.assert_close(merged, dense_o, rtol=tol, atol=tol)
+
+
+@needs_gpu
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("N", [2, 4, 8])
+def test_rs_layout_merge_reproduces_dense_attention(dtype, N):
+    """Rank-major correction plus RS chunking reproduces the dense result."""
+    B, H, L, D = 5, 8, 128, 64
+    dense_o, _, outs, lses = _dense_and_shards(B, H, L, D, N, dtype, seed=11)
+    local_heads = H // N
+    packed_per_source = []
+
+    for source_rank in range(N):
+        packed = correct_attn_out_rs_layout(
+            outs[source_rank].clone(), lses, source_rank
+        )
+        assert packed.shape == (N * B, local_heads, D)
+
+        # The optimized kernel must be exactly the general correction arranged
+        # as N contiguous reduce-scatter destination chunks.
+        corrected, _ = correct_attn_out(outs[source_rank].clone(), lses, source_rank)
+        reference_layout = (
+            corrected.view(B, N, local_heads, D)
+            .permute(1, 0, 2, 3)
+            .reshape(N * B, local_heads, D)
+        )
+        tol = 1e-6 if dtype == torch.float32 else 2e-2
+        torch.testing.assert_close(packed, reference_layout, rtol=tol, atol=tol)
+        packed_per_source.append(packed.float())
+
+    # Simulate ReduceScatter(sum): sum every source rank's packed contribution,
+    # then give destination rank r its contiguous B-row chunk.
+    reduced = torch.stack(packed_per_source).sum(0)
+    tol = 1e-5 if dtype == torch.float32 else 3e-2
+    for destination_rank in range(N):
+        got = reduced[destination_rank * B : (destination_rank + 1) * B]
+        expected = dense_o[
+            :, destination_rank * local_heads : (destination_rank + 1) * local_heads
+        ]
+        torch.testing.assert_close(got, expected, rtol=tol, atol=tol)
 
 
 @needs_gpu
