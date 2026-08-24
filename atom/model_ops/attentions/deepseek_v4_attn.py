@@ -3360,6 +3360,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         )
         ub_dec = src.decode_attn_metadata
 
+        # Reaching here is the only proof the mixed+TBO path really ran: the
+        # gate's vote is AND-reduced across DP, so voting to split every step
+        # is compatible with never splitting once.
+        from atom.utils.tbo.ubatching import _probe_mixed_split
+
+        _probe_mixed_split("build:mixed_ubatch")
+
         merged = AttentionMetaData_DSV4(
             cu_seqlens_q=ub_pref.cu_seqlens_q,
             cu_seqlens_k=None,
@@ -3399,11 +3406,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         """
         from atom.utils.tbo.ubatch_splitting import split_attn_metadata
 
-        # The one ubatch that straddles the prefill/decode boundary needs the
-        # nested two-segment shape a mixed batch carries, not the flat prefill
-        # metadata this method otherwise builds. Only reachable with
-        # ATOM_TBO_MIXED=1; the split refuses mixed batches in
-        # `local_tbo_precompute` otherwise.
         # Both ubatches of a split MIXED batch have to be rebuilt from the
         # parent's prefill SEGMENT metadata, never from the parent itself. The
         # parent of a mixed batch is a thin carrier -- `prepare_mixed` gives it

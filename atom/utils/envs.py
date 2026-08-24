@@ -494,14 +494,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_TBO_PREFILL_MIN_TOKENS": lambda: int(
         os.getenv("ATOM_TBO_PREFILL_MIN_TOKENS", "8192")
     ),
-    # Allow TBO to split a mixed prefill+decode batch. Off by default: the
-    # split arithmetic and the slices exist (see `_split_mixed_token_midpoint`)
-    # but the V4 attention builder cannot yet rebuild its nested per-segment
-    # metadata for a ubatch, so turning this on raises NotImplementedError at
-    # the first mixed TBO step. Flipping it to "1" is how the metadata work
-    # gets exercised once it lands; until then a mixed batch keeps vetoing TBO
-    # through `can_split`.
+    # Allow TBO to split a mixed prefill+decode batch. The cut is required to
+    # land inside the prefill region, giving ubatch 0 = pure prefill and
+    # ubatch 1 = [prefill tail | every decode row]; V4 rebuilds both from the
+    # parent's prefill SEGMENT metadata.
+    #
+    # Measured on V4-Pro dp8+DPA+TBO (no EP, no prefix caching), n=2 per arm,
+    # output throughput: +4.5% at ISL 2048/conc 512, +12.0% at ISL 8192/conc
+    # 512, +14.5% at ISL 8192/conc 2048; mean TTFT -14% to -17% throughout.
+    # The gain tracks how much prefill there is to hide the TP all-reduce
+    # behind, so it shrinks as a rank's prefill approaches
+    # ATOM_TBO_PREFILL_MIN_TOKENS and the split starts getting refused.
+    #
+    # Still off by default: with it off a mixed batch vetoes TBO through
+    # `can_split`, and that is the behaviour every existing baseline was
+    # measured under.
     "ATOM_TBO_MIXED": lambda: os.getenv("ATOM_TBO_MIXED", "0") == "1",
+    # Log how many mixed batches TBO split vs refused, and why. Diagnostic
+    # only: an accuracy run can pass while the mixed split never fires (the
+    # batches were all prefill-only, or all refused), in which case it has
+    # validated nothing about this path. Costs one dict update per step.
+    "ATOM_PROBE_TBO_MIXED": lambda: os.getenv("ATOM_PROBE_TBO_MIXED", "0") == "1",
     # --- PCP MoE comm mode ---
     # Fold the PCP (prefill-context-parallel) dim into the MoE tp/ep sharding.
     # Only meaningful when prefill_context_parallel_size > 1;
