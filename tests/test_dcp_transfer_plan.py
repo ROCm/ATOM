@@ -24,12 +24,9 @@ import numpy as np
 import pytest
 
 from atom.kv_transfer.disaggregation.dcp_plan import (
-    DCPShardKind,
     build_token_runs,
-    expected_dst_blocks,
     plan_replicated,
     plan_sharded,
-    resolve_shard_kind,
 )
 
 # (block_size, dcp_size, interleave_size)
@@ -224,7 +221,6 @@ def test_replicated_plan_lands_on_the_index_rows(
     wide = block_size * dcp_size
 
     plan = plan_replicated(n_dst, n_src, block_size, dcp_size)
-    assert plan.kind is DCPShardKind.REPLICATED
     assert plan.dst_block_tokens == wide
 
     dst_flat = np.full((max(dst_ids) + 1) * wide, -1, dtype=np.int64)
@@ -338,24 +334,7 @@ def _ordered_pairs(plan, src_ids, dst_ids):
     return [(int(s), int(d)) for s, d in zip(src, dst)]
 
 
-# ── sizing and classification ─────────────────────────────────────────────
-
-
-@pytest.mark.parametrize("dcp_size", [1, 2, 4, 8])
-@pytest.mark.parametrize("num_tokens", LENGTHS)
-def test_expected_dst_blocks_matches_the_token_math(dcp_size, num_tokens):
-    block_size = 16
-    n_src = _cdiv(num_tokens, block_size)
-    n_dst = _cdiv(num_tokens, block_size * dcp_size)
-    assert expected_dst_blocks(n_src, dcp_size) == n_dst
-
-
-def test_resolve_shard_kind():
-    assert resolve_shard_kind(9216, 9216, 4) is DCPShardKind.SHARDED
-    assert resolve_shard_kind(2304, 9216, 4) is DCPShardKind.REPLICATED
-    assert resolve_shard_kind(2304, 2304, 1) is DCPShardKind.SHARDED
-    with pytest.raises(ValueError, match="cannot classify"):
-        resolve_shard_kind(2304, 4608, 4)
+# ── rejected inputs ───────────────────────────────────────────────────────
 
 
 def test_planner_rejects_impossible_layouts():

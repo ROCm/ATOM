@@ -309,7 +309,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         # Under DCP one block-table entry is a virtual block covering
         # block_size * dcp_size global tokens, so the prefix-cache offset has to
         # be counted in those, not in single blocks.
-        self.dcp_size = max(1, getattr(config, "decode_context_parallel_size", 1) or 1)
+        self.dcp_size = config.decode_context_parallel_size
         self.host_ip = get_ip()
 
         # Pending requests: req_id -> (Sequence, block_table)

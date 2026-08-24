@@ -10,7 +10,7 @@ side runs DCP, so one block-table entry is a *virtual block* covering
 own share of them. Pushing KV across therefore needs a relayout, and the shape
 of that relayout differs per cache region:
 
-``SHARDED`` (kv_cache)
+Sharded regions (kv_cache)
     Tokens are interleave-sharded across ranks in groups of ``interleave_size``
     (S): global token ``g`` lives on rank ``(g // S) % W`` at local index
     ``(g // (S*W)) * S + g % S``. Rank ``r``'s virtual block ``b``, offset ``j``
@@ -18,7 +18,7 @@ of that relayout differs per cache region:
     S == block_size collapses to "dst block b <- src block b*W + r", one whole
     block per descriptor; S == 1 gives one descriptor per token.
 
-``REPLICATED`` (index_cache, once the indexer stops being DCP-split)
+Replicated regions (index_cache, once the indexer stops being DCP-split)
     Every rank holds the full ``block_size * dcp_size`` tokens of a virtual
     block, laid out in plain sequential order, so virtual block ``v`` is the
     concatenation of source blocks ``[v*W, (v+1)*W)``. Independent of both the
@@ -43,17 +43,9 @@ Pure numpy, no torch/GPU dependency, so the mapping is unit-testable on CPU.
 
 from __future__ import annotations
 
-import enum
 from dataclasses import dataclass
 
 import numpy as np
-
-
-class DCPShardKind(enum.Enum):
-    """How a cache region is distributed over the DCP ranks."""
-
-    SHARDED = "sharded"
-    REPLICATED = "replicated"
 
 
 @dataclass(frozen=True)
@@ -65,7 +57,6 @@ class DCPBlockPlan:
     offsets inside those blocks. Entry ``i`` copies ``num_tokens[i]`` tokens.
     """
 
-    kind: DCPShardKind
     block_size: int
     dst_block_tokens: int
     src_block: np.ndarray
@@ -76,39 +67,6 @@ class DCPBlockPlan:
 
     def __len__(self) -> int:
         return int(self.src_block.shape[0])
-
-
-def expected_dst_blocks(num_src_blocks: int, dcp_size: int) -> int:
-    """Virtual blocks a DCP consumer needs for ``num_src_blocks`` source blocks.
-
-    The consumer allocates ``ceil(num_tokens / (block_size * W))`` entries and
-    the producer holds ``ceil(num_tokens / block_size)``, so the two counts are
-    related by a plain ``ceil`` division regardless of where the sequence ends.
-    """
-    if dcp_size <= 0:
-        raise ValueError(f"dcp_size must be >= 1, got {dcp_size}")
-    return -(-int(num_src_blocks) // int(dcp_size))
-
-
-def resolve_shard_kind(
-    producer_unit_bytes: int, consumer_unit_bytes: int, dcp_size: int
-) -> DCPShardKind:
-    """Classify a region from the two sides' per-block byte counts.
-
-    Equal widths mean the consumer stores one block's worth of tokens per entry
-    (sharded); a ``dcp_size``-times wider consumer entry means it stores the
-    whole virtual block (replicated). Anything else is a layout the planner
-    cannot express, and silently guessing would corrupt the cache, so it raises.
-    """
-    if consumer_unit_bytes == producer_unit_bytes:
-        return DCPShardKind.SHARDED
-    if consumer_unit_bytes == producer_unit_bytes * dcp_size:
-        return DCPShardKind.REPLICATED
-    raise ValueError(
-        "cannot classify DCP region: producer unit_bytes="
-        f"{producer_unit_bytes}, consumer unit_bytes={consumer_unit_bytes}, "
-        f"dcp_size={dcp_size} (expected equal or {dcp_size}x)"
-    )
 
 
 def _validate(block_size: int, dcp_size: int, dcp_rank: int) -> None:
@@ -154,7 +112,6 @@ def plan_sharded(
 
     keep = src_block < int(num_src_blocks)
     return DCPBlockPlan(
-        kind=DCPShardKind.SHARDED,
         block_size=block_size,
         dst_block_tokens=block_size,
         src_block=src_block[keep],
@@ -181,7 +138,6 @@ def plan_replicated(
 
     keep = src_block < int(num_src_blocks)
     return DCPBlockPlan(
-        kind=DCPShardKind.REPLICATED,
         block_size=block_size,
         dst_block_tokens=block_size * dcp_size,
         src_block=src_block[keep],
