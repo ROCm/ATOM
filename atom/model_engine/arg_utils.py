@@ -551,8 +551,8 @@ class EngineArgs:
                 '  "enable_project_before_merge" (bool, TRUE): project V '
                 "before the output merge, shrinking it by "
                 "kv_lora_rank/v_head_dim.\n"
-                '  "comm_backend" (str, a2a): \'a2a\' = one all-to-all; '
-                "\'ag_rs\' = AllGather LSE + ReduceScatter output.\n"
+                "  \"comm_backend\" (str, a2a): 'a2a' = one all-to-all; "
+                "'ag_rs' = AllGather LSE + ReduceScatter output.\n"
                 "The last three default to the NEW behaviour (and the middle "
                 "two auto-disable where unsupported), so a control run must "
                 "pass the old values explicitly -- passing nothing re-runs the "

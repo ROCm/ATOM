@@ -790,9 +790,7 @@ class MLAAttention(nn.Module):
 
         if not use_qrep:
             q_out = dcp_all_gather_query_heads(self.dcp_group, q_out)
-        o, lse = self._forward_decode(
-            q_out, kv_cache, attn_metadata, return_lse=True
-        )
+        o, lse = self._forward_decode(q_out, kv_cache, attn_metadata, return_lse=True)
         return self._dcp_project_merge_out(o, lse, ctx=self._cp_triton_ctx)
 
     def _v_up_proj(self, x, W_V=None, W_V_scale=None, num_heads=None):
