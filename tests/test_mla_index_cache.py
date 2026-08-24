@@ -62,6 +62,7 @@ def test_local_total_layers_adds_mtp_only_on_drafter_stage():
 def _require_aiter_mla():
     try:
         import aiter  # noqa: F401
+
         from atom.model_ops.attentions import aiter_mla
         from atom.model_ops.attentions.aiter_mla import AiterMLAMetadataBuilder
     except (ImportError, RuntimeError) as exc:
