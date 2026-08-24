@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import array
 from collections.abc import Callable
-from copy import copy
 from enum import Enum, auto
 from itertools import count
 from typing import Any
@@ -10,6 +10,36 @@ from typing import Any
 import numpy as np
 
 from atom.sampling_params import SamplingParams
+
+
+def new_token_ids(token_ids=()) -> array.array:
+    """A sequence's token ids.
+
+    An `array("i")` rather than a list for two reasons that both scale with
+    context. The scheduler copies a slice of this into the flat
+    `scheduled_tokens` buffer every step -- a whole chunk of it on a prefill --
+    and from a list that is one CPython int unboxing per token, 0.28 ms for a
+    16k chunk against 0.001 ms from an array. And a list of 100k ids costs
+    3.4 MiB of boxed ints where the array costs 0.38.
+
+    Behaves as a list for append/pop/index/len/iterate/slice-delete, and holds
+    negative ids (the exit sentinel is -1). It does NOT compare equal to a
+    list, which is why `stop_token_sequences` below is converted too, and why
+    `BlockManager.compute_hash` pins its dtype.
+    """
+    return array.array("i", token_ids)
+
+
+def new_block_table(block_ids=()) -> array.array:
+    """A sequence's physical block ids.
+
+    An `array("i")` rather than a list because every forward marshals these
+    into the int32 `block_tables` buffer, where a list costs one CPython int
+    unboxing per block (~17k per step at 50 seqs x 100k ctx) and an array is a
+    memcpy. It behaves as a list for append/pop/index/len/iterate; it has no
+    `.clear()` (use `del bt[:]`) and no `.copy()` (use `list(bt)`).
+    """
+    return array.array("i", block_ids)
 
 
 class SequenceStatus(Enum):
@@ -69,7 +99,7 @@ class Sequence:
         self.external_request_id = request_id
         self.status = SequenceStatus.WAITING
         self.type = SequenceType.DUMMY
-        self.token_ids = copy(token_ids)
+        self.token_ids = new_token_ids(token_ids)
         self.last_token = token_ids[-1]
         self.num_draft_tokens = num_draft_tokens
         # `has_per_req_cache=True` means this seq's attention type maintains
@@ -105,6 +135,15 @@ class Sequence:
         # `BlockManager._record_checkpoint_demand` at admission; this one is
         # read by `checkpoint_cut` and `checkpointers_at`, which must agree.
         self.checkpoint_demand_pos = 0
+        # Which of the two demand counters this seq has already been put
+        # against. `can_allocate` re-runs for a sequence the queue keeps
+        # deferring, and the position above cannot serve as the marker for
+        # either one: a declined demand writes 0 back, so it does not remember
+        # the decline, and a decline retracts a demand the recorded counter had
+        # already taken. Both are cleared by `deallocate`, so a re-admitted
+        # request counts again, which it should.
+        self.checkpoint_demand_counted = False
+        self.checkpoint_demand_declined = False
         # Where this seq last kept a checkpoint. Prefill lands on the grid so
         # this tracks it, but a speculative decode step lands wherever
         # `1 + accepted` puts it, and there the grid is unreachable — see
@@ -118,7 +157,7 @@ class Sequence:
         # garbage sampled tokens from intermediate chunks and to skip the
         # scheduler's Phase 1 scan when no partials exist.
         self.is_partial_prefill = False
-        self.block_table = []
+        self.block_table = new_block_table()
         # Per-request cache slot index (filled by BlockManager.allocate()).
         # -1 = unallocated. The slot indexes into the per-req cache tensors
         # owned by ModelRunner (e.g. mamba_k_cache for GDN).
@@ -136,7 +175,11 @@ class Sequence:
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
         self.stop_strings = sampling_params.stop_strings
-        self.stop_token_sequences = stop_token_sequences or []
+        # Same type as `token_ids`, because the stop check compares a slice of
+        # that against these and an `array("i")` never equals a list.
+        self.stop_token_sequences = [
+            new_token_ids(s) for s in (stop_token_sequences or [])
+        ]
         self.is_first_decode = False
         # Set to True by Scheduler.postprocess after BlockManager.hash_blocks
         # has registered the prompt blocks for prefix caching. The trigger has
@@ -147,10 +190,18 @@ class Sequence:
         # would never fire for the prefill blocks; this flag does.
         self.prefix_hashes_published = False
         self.return_logprobs = bool(getattr(sampling_params, "logprobs", False))
-        self.logprobs: list[float] = []
+        # One entry per completion token, so the same reason `token_ids` is an
+        # array applies: a list would box a PyFloat per token and hand the
+        # collector a slot to walk for each one. `json.dumps` is the only
+        # consumer that needs a list, and it converts at its own boundary.
+        self.logprobs: array.array = array.array("d")
         # stream callback
         self.stream_callback = stream_callback
-        self.output_tokens = []  # cache for newly generate tokens
+        # The completion half of `token_ids`, kept in step with it by every
+        # writer, so it is the same array type for the same reasons.
+        self.output_tokens = new_token_ids()
+        # Placeholders from previous postprocess; overwritten in place.
+        self.num_placeholder_tokens: int = 0
 
         # save speculative tokens if is_deferred_output = False or prefill is inter
         self.spec_token_ids: np.ndarray = np.array([], dtype=np.int32)

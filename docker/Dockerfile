@@ -171,18 +171,11 @@ FROM ${SGLANG_BASE_IMAGE} AS atom_sglang
 ARG GPU_ARCH
 ARG VENV_PYTHON="/opt/venv/bin/python"
 ARG SGLANG_REPO="https://github.com/sgl-project/sglang.git"
-ARG SGLANG_REF="v0.5.15.post1"
+ARG SGLANG_REF="v0.5.17"
 LABEL com.rocm.atom.sglang_ref="${SGLANG_REF}"
 
 ENV PATH="/opt/venv/bin:${PATH}"
 ENV PYTHONPATH="/app/sglang/python:/app/ATOM:${PYTHONPATH}"
-
-# Temporary backport: SGLang v0.5.15.post1, the latest release at the time of
-# this change, does not include the upstream Cohere2MoeConfig dataclass fix.
-# Remove this patch once SGLANG_REF includes:
-# https://github.com/sgl-project/sglang/commit/6a4ffcc34aae336e712792b1bbcbd142ba7114eb
-# Tracking issue: https://github.com/sgl-project/sglang/issues/28233
-COPY docker/patches/sglang/cohere2-moe-drop-invalid-hf-strict.patch /tmp/sglang-patches/cohere2-moe-drop-invalid-hf-strict.patch
 
 RUN echo "========== [SGLANG-ATOM 0/6] Check Aiter/FlyDSL/Triton versions before SGLang build ==========" && \
     "${VENV_PYTHON}" -m pip show atom amd-mori-nightly amd-aiter flydsl triton || true && \
@@ -203,7 +196,6 @@ RUN echo "========== [SGLANG-ATOM 1/6] Clone SGLang ==========" && \
     git clone "${SGLANG_REPO}" /app/sglang && \
     cd /app/sglang && \
     git checkout "${SGLANG_REF}" && \
-    git apply /tmp/sglang-patches/cohere2-moe-drop-invalid-hf-strict.patch && \
     git submodule update --init --recursive && \
     echo "sglang ref:" && \
     git rev-parse HEAD
@@ -220,7 +212,7 @@ RUN echo "========== [SGLANG-ATOM 2/6] Build sglang kernel ==========" && \
       test -n "${FINAL_AMDGPU_TARGET}"; \
       echo "GPU not detectable during build; fallback AMDGPU_TARGET=${FINAL_AMDGPU_TARGET} from GPU_ARCH=${GPU_ARCH}"; \
     fi && \
-    cd /app/sglang/sgl-kernel && \
+    cd /app/sglang/python/sglang/kernels/aot && \
     AMDGPU_TARGET="${FINAL_AMDGPU_TARGET}" "${VENV_PYTHON}" setup_rocm.py install && \
     "${VENV_PYTHON}" -m pip show sglang-kernel || true
 
@@ -246,13 +238,13 @@ RUN echo "========== [SGLANG-ATOM 3/6] Install SGLang dependencies ==========" &
       referencing \
       safetensors && \
     "${VENV_PYTHON}" -m pip install --no-cache-dir --no-deps \
-      compressed-tensors==0.13.0 \
+      compressed-tensors==0.15.0 \
       outlines==0.1.11 \
       petit_kernel==0.0.2 \
       timm==1.0.16 \
       torchao==0.9.0 \
       wave-lang==3.8.2 \
-      xgrammar==0.1.27 && \
+      xgrammar==0.2.1 && \
     "${VENV_PYTHON}" -m pip install --no-cache-dir \
       "cython>=0.29.36,<3.0" \
       "apache-tvm-ffi @ git+https://github.com/apache/tvm-ffi.git@37d0485b2058885bf4e7a486f7d7b2174a8ac1ce" \

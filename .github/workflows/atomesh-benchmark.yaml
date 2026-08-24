@@ -31,6 +31,11 @@ on:
         options:
           - smoke
           - nightly
+      rdma_smoke_nodes:
+        description: 'Comma-separated Slurm nodes for the Mooncake RDMA smoke test; defaults to atomesh_1p1d_nodes'
+        required: false
+        default: ''
+        type: string
       run_all_models:
         description: 'Run all models from models_atomesh.yaml'
         required: false
@@ -155,7 +160,7 @@ env:
   ATOMESH_PD_RANK_MAPPING_POLICY: ${{ (github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && 'idx2idx' || 'none' }}
   ATOMESH_LOG_ROOT: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_log_root != '' && inputs.atomesh_log_root || ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && '/data/${USER}/logs/ATOMESH_LOG/' || (github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi355-crusoe' && '/home/junyyang/ATOMesh_ACTION_RUNNER/ATOMesh_LOG/' || (github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-crusoe-mi355' && '/shared_nfs/ATOMESH_CI/LOG/' || '/it-share/ATOMESH_LOG/') }}
   ATOMESH_MODEL_ROOT: ${{ (github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && '/data/models2' || (((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-crusoe-mi355' || (github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi355-crusoe') && '/shared_nfs/huggingface_models/amd' || '/mnt/models') }}
-  ATOMESH_1P1D_NODES: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_1p1d_nodes != 'auto' && inputs.atomesh_1p1d_nodes || ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && 'ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-5,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-6,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-7,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-8,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16' || (((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-crusoe-mi355' || (github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi355-crusoe') && '' || 'mia1-p02-g42,mia1-p02-g44')) }}
+  ATOMESH_1P1D_NODES: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_1p1d_nodes != 'auto' && inputs.atomesh_1p1d_nodes || ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && 'ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-5,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-6,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-7,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-8,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16' || (!((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-crusoe-mi355' || (github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi355-crusoe') && 'mia1-p02-g42,mia1-p02-g44' || '')) }}
   ATOMESH_2P1D_NODES: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_2p1d_nodes != 'auto' && inputs.atomesh_2p1d_nodes || ((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi350' && 'ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-5,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-6,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-7,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-8,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16' || (((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-crusoe-mi355' || (github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi355-crusoe') && '' || 'mia1-p02-g42,mia1-p02-g44,mia1-p02-g47')) }}
 
 concurrency:
@@ -175,6 +180,7 @@ jobs:
     outputs:
       matrix_json: ${{ steps.matrix.outputs.matrix_json }}
       has_matrix: ${{ steps.matrix.outputs.has_matrix }}
+      image: ${{ steps.image.outputs.image }}
     steps:
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
@@ -388,6 +394,665 @@ jobs:
         with:
           name: atomesh-benchmark-matrix
           path: atomesh-matrix.json
+
+  rdma-smoke-test:
+    name: Mooncake RDMA smoke test
+    needs: [load-config]
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.suite == 'smoke' }}
+    runs-on: ${{ inputs.atomesh_slurm_submit_runner }}
+    timeout-minutes: 45
+    env:
+      RDMA_SMOKE_IMAGE: ${{ needs.load-config.outputs.image }}
+      RDMA_SMOKE_NODES: ${{ inputs.rdma_smoke_nodes }}
+      SLURM_SUBMIT_RUNNER: ${{ inputs.atomesh_slurm_submit_runner }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Run Mooncake RDMA transfer test on selected nodes
+        run: |
+          set -euo pipefail
+          export PATH="/usr/local/slurm-24.05.5.1/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+
+          if [[ -z "${RDMA_SMOKE_IMAGE}" ]]; then
+            echo "::error::No ATOM image was resolved for the RDMA smoke test."
+            exit 1
+          fi
+
+          nodes="${RDMA_SMOKE_NODES:-${ATOMESH_1P1D_NODES:-}}"
+          nodes="${nodes// /}"
+          if [[ -n "${nodes}" ]]; then
+            IFS=',' read -r -a node_list <<< "${nodes}"
+            node_count="${#node_list[@]}"
+          else
+            # Allocate two nodes by default so both local and cross-node GDR are validated.
+            node_count=2
+          fi
+          if [[ "${node_count}" -lt 1 ]]; then
+            echo "::error::GPUDirect RDMA smoke testing requires at least one Slurm node."
+            exit 1
+          fi
+
+          current_user="$(id -un 2>/dev/null || id -u)"
+          log_root="${ATOMESH_LOG_ROOT//\$\{USER\}/${current_user}}"
+          log_root="${log_root//\$USER/${current_user}}"
+          run_dir="${log_root%/}/rdma-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -p "${run_dir}"
+          export RDMA_SMOKE_RUN_DIR="${run_dir}"
+          export RDMA_SMOKE_NODE_COUNT="${node_count}"
+          CURRENT_USER="${current_user}"
+          ATOMESH_CELL_ID="rdma-smoke"
+          RESULT_DIR="${run_dir}"
+          SLURM_JOB_NAME="rdma-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          SLURM_OUTPUT="${run_dir}/slurm-%j.out"
+          SLURM_ERROR="${run_dir}/slurm-%j.err"
+          SLURM_CANCEL_HELPER="${run_dir}/slurm-cancel.sh"
+          SLURM_LOG_POLL_INTERVAL="${SLURM_LOG_POLL_INTERVAL:-15}"
+          USES_SPUR_CONTROLLER=0
+          SPUR_CONTROLLER_ADDR=""
+          SPUR_ACCOUNTING_ADDR=""
+          if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
+            USES_SPUR_CONTROLLER=1
+            SPUR_CONTROLLER_ADDR="http://134.199.196.72:6817"
+            SPUR_ACCOUNTING_ADDR="http://134.199.196.72:6819"
+          elif [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi355-crusoe" ]]; then
+            USES_SPUR_CONTROLLER=1
+            SPUR_CONTROLLER_ADDR="http://crs-m2m-cpu-spur-005.crusoe.amd.com:6817"
+            SPUR_ACCOUNTING_ADDR="http://crs-m2m-cpu-spur-005.crusoe.amd.com:6819"
+          fi
+          source "${GITHUB_WORKSPACE}/.github/scripts/atomesh/slurm_submit_helpers.sh"
+          install_slurm_cancel_traps
+
+          rank_script="${run_dir}/run-rdma-smoke-rank.sh"
+          cat > "${rank_script}" <<'RANK_SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          rank="${SLURM_PROCID:-${SPUR_TASK_OFFSET:-0}}"
+          job_id="${SLURM_JOB_ID:-${SPUR_JOB_ID:-local}}"
+          container="atomesh-rdma-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${job_id}-${rank}-$$"
+          rank_host="$(hostname)"
+          cleanup() {
+            if docker container inspect "${container}" >/dev/null 2>&1; then
+              docker rm -f "${container}" || {
+                echo "WARNING: failed to remove RDMA smoke container ${container}" >&2
+              }
+            fi
+          }
+          on_error() {
+            local rc="$1"
+            local line="$2"
+            local command="$3"
+            echo "ERROR: RDMA smoke rank ${rank} failed on ${rank_host}: rc=${rc} line=${line} command=${command}" >&2
+          }
+          on_signal() {
+            local signal="$1"
+            local rc="$2"
+            echo "ERROR: RDMA smoke rank ${rank} received ${signal} on ${rank_host}" >&2
+            exit "${rc}"
+          }
+          on_exit() {
+            local rc=$?
+            trap - EXIT
+            echo "=== RDMA smoke rank exit: rank=${rank} host=${rank_host} pid=$$ job=${job_id} container=${container} rc=${rc} ==="
+            cleanup
+            exit "${rc}"
+          }
+          trap 'on_error "$?" "${LINENO}" "${BASH_COMMAND}"' ERR
+          trap on_exit EXIT
+          trap 'on_signal HUP 129' HUP
+          trap 'on_signal INT 130' INT
+          trap 'on_signal TERM 143' TERM
+          cleanup
+
+          echo "=== RDMA smoke rank start: rank=${rank} host=${rank_host} pid=$$ job=${job_id} container=${container} ==="
+          echo "=== Pulling RDMA smoke image on rank ${rank}: ${RDMA_SMOKE_IMAGE} ==="
+          docker pull "${RDMA_SMOKE_IMAGE}"
+          echo "=== RDMA smoke image pull complete on rank ${rank} ==="
+          docker_args=(
+            run --rm -i --name "${container}"
+            --network host --ipc host
+            --privileged
+            --device=/dev/kfd
+            --device=/dev/dri
+            --device=/dev/infiniband
+            --group-add=video
+            --cap-add=IPC_LOCK
+            --ulimit memlock=-1:-1
+            -e MC_GID_INDEX=1
+            -e MC_ENABLE_DEST_DEVICE_AFFINITY=1
+            -e SMOKE_RANK="${rank}"
+            -e SMOKE_NODE_COUNT="${RDMA_SMOKE_NODE_COUNT}"
+            -e SMOKE_RUN_DIR=/rdma-smoke-shared
+            -v "${RDMA_SMOKE_RUN_DIR}:/rdma-smoke-shared"
+          )
+          host_ionic="$(readlink -f /usr/lib/x86_64-linux-gnu/libionic.so.1 2>/dev/null || true)"
+          [[ -z "${host_ionic}" ]] || docker_args+=(
+            -v "${host_ionic}:/usr/lib/x86_64-linux-gnu/libionic.so.1:ro"
+          )
+          [[ ! -e /usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so ]] || docker_args+=(
+            -v /usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so:/usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so:ro
+          )
+          [[ ! -e /etc/libibverbs.d/ionic.driver ]] || docker_args+=(
+            -v /etc/libibverbs.d/ionic.driver:/etc/libibverbs.d/ionic.driver:ro
+          )
+          docker_args+=(
+            "${RDMA_SMOKE_IMAGE}"
+            bash -s
+          )
+          printf '=== RDMA smoke docker command on rank %s ===' "${rank}"
+          printf ' %q' docker "${docker_args[@]}"
+          echo
+          echo "=== Starting RDMA smoke container on rank ${rank} ==="
+          set +e
+          docker "${docker_args[@]}" <<'CONTAINER_SCRIPT'
+          set -euo pipefail
+
+          mapfile -t rdma_devices < <(
+            for device_path in /sys/class/infiniband/*; do
+              [[ -e "${device_path}" ]] && basename "${device_path}"
+            done
+          )
+          if [[ "${#rdma_devices[@]}" -eq 0 ]]; then
+            echo "ERROR: no RDMA devices found under /sys/class/infiniband" >&2
+            exit 1
+          fi
+          echo "RDMA devices: ${rdma_devices[*]}"
+          ibv_devinfo
+          rocm-smi --showproductname || true
+
+          gpu_count="$(python3 - <<'PY'
+          import torch
+          print(torch.cuda.device_count())
+          PY
+          )"
+          if ! [[ "${gpu_count}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "ERROR: no ROCm GPUs are visible for GPUDirect RDMA testing" >&2
+            exit 1
+          fi
+          echo "Visible ROCm GPUs: ${gpu_count}"
+
+          rdma_context="/app/mooncake/mooncake-transfer-engine/src/transport/rdma_transport/rdma_context.cpp"
+          python3 - "${rdma_context}" <<'PY'
+          import pathlib
+          import sys
+
+          path = pathlib.Path(sys.argv[1])
+          source = path.read_text()
+
+          old = "            uint32_t init = 16;"
+          new = "            uint32_t init = max_dest_rd_atomic_;"
+
+          if source.count(old) != 1:
+              raise RuntimeError(
+                  f"Expected exactly one Mooncake RDMA atomic setting, "
+                  f"found {source.count(old)} in {path}"
+              )
+
+          path.write_text(source.replace(old, new))
+          print(f"Patched Mooncake RDMA atomic limits in {path}")
+          PY
+
+          build_dir="/tmp/mooncake-rdma-smoke-build"
+          rm -rf "${build_dir}"
+          cmake -S /app/mooncake -B "${build_dir}" \
+            -DUSE_HIP=ON \
+            -DUSE_ETCD=OFF \
+            -DBUILD_UNIT_TESTS=ON
+          cmake --build "${build_dir}" \
+            --target transfer_engine_validator \
+            --parallel "$(nproc)"
+          validator_bin="${build_dir}/mooncake-transfer-engine/example/transfer_engine_validator"
+          if [[ ! -x "${validator_bin}" ]]; then
+            echo "ERROR: transfer_engine_validator was not built at ${validator_bin}" >&2
+            exit 1
+          fi
+
+          rdma_device_csv="$(IFS=,; echo "${rdma_devices[*]}")"
+          export RDMA_DEVICE_CSV="${rdma_device_csv}"
+          export GPU_COUNT="${gpu_count}"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          devices = os.environ["RDMA_DEVICE_CSV"].split(",")
+          gpu_count = int(os.environ["GPU_COUNT"])
+          matrix = {}
+          for gpu_id in range(gpu_count):
+              matrix[f"cuda:{gpu_id}"] = [devices, []]
+          Path("/tmp/rdma-smoke-nic-priority.json").write_text(
+              json.dumps(matrix),
+              encoding="utf-8",
+          )
+          PY
+          echo "NIC priority matrix:"
+          cat /tmp/rdma-smoke-nic-priority.json
+
+          target_pid=""
+          cleanup_processes() {
+            [[ -z "${target_pid}" ]] || kill "${target_pid}" 2>/dev/null || true
+            [[ -z "${target_pid}" ]] || wait "${target_pid}" 2>/dev/null || true
+          }
+          trap cleanup_processes EXIT HUP INT TERM
+
+          wait_for_p2p_address() {
+            local target_log="$1"
+            local target_pid="$2"
+            local timeout_seconds="$3"
+            local deadline=$((SECONDS + timeout_seconds))
+            local address=""
+            while true; do
+              address="$(awk '
+                /Transfer Engine RPC using P2P handshake, listening on / {
+                  print $NF
+                  exit
+                }
+              ' "${target_log}" 2>/dev/null || true)"
+              if [[ -n "${address}" ]] && kill -0 "${target_pid}" 2>/dev/null; then
+                printf '%s\n' "${address}"
+                return 0
+              fi
+              if ! kill -0 "${target_pid}" 2>/dev/null; then
+                echo "ERROR: P2P target exited before publishing its listening address" >&2
+                cat "${target_log}" >&2 || true
+                wait "${target_pid}" 2>/dev/null || true
+                return 1
+              fi
+              if [[ "${SECONDS}" -ge "${deadline}" ]]; then
+                echo "ERROR: timed out waiting for P2P target listening address" >&2
+                cat "${target_log}" >&2 || true
+                return 1
+              fi
+              sleep 1
+            done
+          }
+
+          if [[ "${gpu_count}" -ne 8 ]]; then
+            echo "ERROR: node-local prefill/decode RDMA testing requires exactly 8 GPUs, found ${gpu_count}" >&2
+            exit 1
+          fi
+          if [[ "${#rdma_devices[@]}" -lt 8 ]]; then
+            echo "ERROR: node-local prefill/decode RDMA testing requires at least 8 RDMA devices, found ${#rdma_devices[@]}" >&2
+            exit 1
+          fi
+
+          # The initiator writes prefill VRAM into the decode target. Register
+          # each decode buffer on its local HCA and the prefill GPU's alternate
+          # HCA, then verify destination affinity selects the matching HCA.
+          for ((prefill_gpu_id = 0; prefill_gpu_id < 4; prefill_gpu_id++)); do
+            decode_gpu_id=$((prefill_gpu_id + 4))
+            prefill_rdma_device="${rdma_devices[prefill_gpu_id]}"
+            decode_rdma_device="${rdma_devices[decode_gpu_id]}"
+            decode_device_csv="${decode_rdma_device},${prefill_rdma_device}"
+            prefill_matrix="/tmp/gdr-smoke-prefill-gpu-${prefill_gpu_id}-nic-priority.json"
+            decode_matrix="/tmp/gdr-smoke-decode-gpu-${decode_gpu_id}-nic-priority.json"
+            printf '{"cuda:0":[["%s"],[]]}\n' "${prefill_rdma_device}" > "${prefill_matrix}"
+            printf '{"cuda:0":[["%s","%s"],[]]}\n' \
+              "${decode_rdma_device}" "${prefill_rdma_device}" > "${decode_matrix}"
+
+            target_log="/tmp/gdr-smoke-decode-gpu-${decode_gpu_id}-target.log"
+            initiator_log="/tmp/gdr-smoke-prefill-gpu-${prefill_gpu_id}-initiator.log"
+
+            echo "=== GPUDirect RDMA prefill GPU ${prefill_gpu_id} (${prefill_rdma_device}) -> decode GPU ${decode_gpu_id} (${decode_rdma_device}, alternate ${prefill_rdma_device}) ==="
+            HIP_VISIBLE_DEVICES="${decode_gpu_id}" \
+            "${validator_bin}" \
+              --mode=target \
+              --protocol=rdma \
+              --metadata_server=P2PHANDSHAKE \
+              --local_server_name=127.0.0.2:0 \
+              --device_name="${decode_device_csv}" \
+              --nic_priority_matrix="${decode_matrix}" \
+              --use_vram=true \
+              --gpu_id=0 \
+              --buffer_size=100663296 \
+              >"${target_log}" 2>&1 &
+            target_pid=$!
+            target_name="$(wait_for_p2p_address "${target_log}" "${target_pid}" 30)"
+            echo "P2P target listening at ${target_name}"
+
+            set +e
+            MC_LOG_RDMA_SLICE_AFFINITY=1 \
+            GLOG_v=1 \
+            HIP_VISIBLE_DEVICES="${prefill_gpu_id}" \
+            timeout 120 "${validator_bin}" \
+              --mode=initiator \
+              --protocol=rdma \
+              --metadata_server=P2PHANDSHAKE \
+              --local_server_name=127.0.0.3:0 \
+              --segment_id="${target_name}" \
+              --device_name="${prefill_rdma_device}" \
+              --nic_priority_matrix="${prefill_matrix}" \
+              --use_vram=true \
+              --gpu_id=0 \
+              --buffer_size=100663296 \
+              --batch_size=1 \
+              --block_size=67108864 \
+              --threads=1 \
+              --duration=1 \
+              2>&1 | tee "${initiator_log}"
+            transfer_rc="${PIPESTATUS[0]}"
+            set -e
+
+            if [[ "${transfer_rc}" -ne 0 ]] ||
+               ! grep -q "Data validation passed" "${initiator_log}"; then
+              cat "${initiator_log}" >&2
+              cat "${target_log}" >&2
+              echo "ERROR: GPUDirect RDMA data validation failed from prefill GPU ${prefill_gpu_id} (${prefill_rdma_device}) to decode GPU ${decode_gpu_id} (${decode_rdma_device}, alternate ${prefill_rdma_device})" >&2
+              exit 1
+            fi
+            expected_affinity="local_device_name=${prefill_rdma_device}, peer_device_name=${prefill_rdma_device}"
+            if grep -Fq "RDMA slice affinity:" "${initiator_log}"; then
+              if ! grep -Fq "${expected_affinity}" "${initiator_log}"; then
+                grep -F "RDMA slice affinity:" "${initiator_log}" >&2 || true
+                echo "ERROR: GPUDirect RDMA selected the wrong HCA for prefill GPU ${prefill_gpu_id}" >&2
+                exit 1
+              fi
+            else
+              echo "WARNING: RDMA data validation passed, but HCA affinity logging was unavailable for prefill GPU ${prefill_gpu_id}" >&2
+            fi
+            kill "${target_pid}" 2>/dev/null || true
+            wait "${target_pid}" 2>/dev/null || true
+            target_pid=""
+            echo "GPUDirect RDMA passed from prefill GPU ${prefill_gpu_id} to decode GPU ${decode_gpu_id} via alternate HCA ${prefill_rdma_device}"
+          done
+          echo "Node-local GPUDirect RDMA passed for all four prefill/decode GPU pairs"
+
+          if [[ "${SMOKE_NODE_COUNT}" -lt 2 ]]; then
+            echo "Single-node GPUDirect RDMA smoke test passed"
+            exit 0
+          fi
+
+          touch "${SMOKE_RUN_DIR}/local-gdr-done-${SMOKE_RANK}"
+          if [[ "${SMOKE_RANK}" -le 1 ]]; then
+            deadline=$((SECONDS + 300))
+            while true; do
+              completed_nodes=0
+              for marker in "${SMOKE_RUN_DIR}"/local-gdr-done-*; do
+                [[ -e "${marker}" ]] && completed_nodes=$((completed_nodes + 1))
+              done
+              [[ "${completed_nodes}" -ge "${SMOKE_NODE_COUNT}" ]] && break
+              if [[ "${SECONDS}" -ge "${deadline}" ]]; then
+                echo "ERROR: timed out waiting for node-local GDR tests" >&2
+                exit 1
+              fi
+              sleep 2
+            done
+          fi
+
+          wait_for_file() {
+            local path="$1"
+            local timeout_seconds="$2"
+            local description="$3"
+            local deadline=$((SECONDS + timeout_seconds))
+            while [[ ! -s "${path}" ]]; do
+              if [[ "${SECONDS}" -ge "${deadline}" ]]; then
+                echo "ERROR: timed out waiting for ${description}: ${path}" >&2
+                exit 1
+              fi
+              sleep 1
+            done
+          }
+
+          local_ip="$(ip route get 1.1.1.1 2>/dev/null | awk '
+            {
+              for (i = 1; i <= NF; i++) {
+                if ($i == "src" && i < NF) {
+                  print $(i + 1)
+                  exit
+                }
+              }
+            }
+          ')"
+          local_ip="${local_ip:-$(hostname -I | awk '{print $1}')}"
+          if [[ -z "${local_ip}" ]]; then
+            echo "ERROR: unable to determine node IP for cross-node GDR testing" >&2
+            exit 1
+          fi
+
+          peer_info="${SMOKE_RUN_DIR}/cross-node-prefill-info"
+          if [[ "${SMOKE_RANK}" -eq 0 ]]; then
+            {
+              echo "${local_ip}"
+              echo "${gpu_count}"
+            } > "${peer_info}.tmp"
+            mv "${peer_info}.tmp" "${peer_info}"
+          elif [[ "${SMOKE_RANK}" -eq 1 ]]; then
+            wait_for_file "${peer_info}" 60 "prefill node information"
+            mapfile -t peer_data < "${peer_info}"
+            prefill_node_ip="${peer_data[0]:-}"
+            prefill_gpu_count="${peer_data[1]:-0}"
+            if [[ -z "${prefill_node_ip}" || "${prefill_gpu_count}" -ne "${gpu_count}" ]]; then
+              echo "ERROR: cross-node GPU topology mismatch: prefill=${prefill_gpu_count}, decode=${gpu_count}" >&2
+              exit 1
+            fi
+          fi
+
+          if [[ "${SMOKE_RANK}" -eq 0 || "${SMOKE_RANK}" -eq 1 ]]; then
+            cross_prefill_gpu_ids=(0 1 2 3 4 5 6 7 0 1 2 3)
+            cross_decode_gpu_ids=(0 1 2 3 4 5 6 7 4 5 6 7)
+            for ((pair_index = 0; pair_index < ${#cross_prefill_gpu_ids[@]}; pair_index++)); do
+              prefill_gpu_id="${cross_prefill_gpu_ids[pair_index]}"
+              decode_gpu_id="${cross_decode_gpu_ids[pair_index]}"
+              prefill_rdma_device="${rdma_devices[prefill_gpu_id]}"
+              decode_rdma_device="${rdma_devices[decode_gpu_id]}"
+              decode_device_csv="${decode_rdma_device}"
+              expected_peer_device="${decode_rdma_device}"
+              is_cross_rail=0
+              if [[ "${prefill_gpu_id}" -ne "${decode_gpu_id}" ]]; then
+                decode_device_csv="${decode_rdma_device},${prefill_rdma_device}"
+                expected_peer_device="${prefill_rdma_device}"
+                is_cross_rail=1
+              fi
+              echo "=== Cross-node RDMA pair: prefill GPU ${prefill_gpu_id} (${prefill_rdma_device}) -> decode GPU ${decode_gpu_id} (${decode_device_csv}); expected peer HCA ${expected_peer_device} ==="
+              prefill_matrix="/tmp/cross-node-prefill-gpu-${prefill_gpu_id}-nic-priority.json"
+              decode_matrix="/tmp/cross-node-decode-gpu-${decode_gpu_id}-nic-priority.json"
+              printf '{"cuda:0":[["%s"],[]]}\n' "${prefill_rdma_device}" > "${prefill_matrix}"
+              if [[ "${is_cross_rail}" -eq 1 ]]; then
+                printf '{"cuda:0":[["%s","%s"],[]]}\n' \
+                  "${decode_rdma_device}" "${prefill_rdma_device}" > "${decode_matrix}"
+              else
+                printf '{"cuda:0":[["%s"],[]]}\n' "${decode_rdma_device}" > "${decode_matrix}"
+              fi
+              ready_file="${SMOKE_RUN_DIR}/cross-node-ready-prefill-${prefill_gpu_id}-decode-${decode_gpu_id}"
+              result_file="${SMOKE_RUN_DIR}/cross-node-result-prefill-${prefill_gpu_id}-decode-${decode_gpu_id}"
+              target_log="${SMOKE_RUN_DIR}/cross-node-prefill-${prefill_gpu_id}-decode-${decode_gpu_id}-target.log"
+
+              if [[ "${SMOKE_RANK}" -eq 1 ]]; then
+                echo "=== Cross-node decode target: ${local_ip}, GPU ${decode_gpu_id} (${decode_rdma_device}) ==="
+                HIP_VISIBLE_DEVICES="${decode_gpu_id}" \
+                "${validator_bin}" \
+                  --mode=target \
+                  --protocol=rdma \
+                  --metadata_server=P2PHANDSHAKE \
+                  --local_server_name="${local_ip}:0" \
+                  --device_name="${decode_device_csv}" \
+                  --nic_priority_matrix="${decode_matrix}" \
+                  --use_vram=true \
+                  --gpu_id=0 \
+                  --buffer_size=100663296 \
+                  >"${target_log}" 2>&1 &
+                target_pid=$!
+                target_name="$(wait_for_p2p_address "${target_log}" "${target_pid}" 30)"
+                echo "Cross-node P2P target listening at ${target_name}"
+                echo "${target_name}" > "${ready_file}.tmp"
+                mv "${ready_file}.tmp" "${ready_file}"
+
+                wait_for_file "${result_file}" 150 "prefill GPU ${prefill_gpu_id} to decode GPU ${decode_gpu_id} result"
+                result="$(<"${result_file}")"
+                kill "${target_pid}" 2>/dev/null || true
+                wait "${target_pid}" 2>/dev/null || true
+                target_pid=""
+                if [[ "${result}" != "0" ]]; then
+                  cat "${target_log}" >&2
+                  echo "ERROR: cross-node GPUDirect RDMA failed from prefill GPU ${prefill_gpu_id} to decode GPU ${decode_gpu_id}" >&2
+                  exit 1
+                fi
+                echo "Cross-node GPUDirect RDMA passed on decode GPU ${decode_gpu_id}"
+              else
+                wait_for_file "${ready_file}" 60 "decode GPU ${decode_gpu_id} target"
+                target_name="$(<"${ready_file}")"
+                initiator_log="/tmp/cross-node-prefill-${prefill_gpu_id}-decode-${decode_gpu_id}-initiator.log"
+                echo "=== Cross-node prefill initiator: ${local_ip} GPU ${prefill_gpu_id} (${prefill_rdma_device}) -> ${target_name} decode GPU ${decode_gpu_id} ==="
+                transfer_batch_size=4
+                transfer_block_size=1048576
+                transfer_duration=2
+                affinity_env=()
+                if [[ "${is_cross_rail}" -eq 1 ]]; then
+                  transfer_batch_size=1
+                  transfer_block_size=67108864
+                  transfer_duration=1
+                  affinity_env=(MC_LOG_RDMA_SLICE_AFFINITY=1 GLOG_v=1)
+                fi
+                set +e
+                env "${affinity_env[@]}" HIP_VISIBLE_DEVICES="${prefill_gpu_id}" \
+                timeout 120 "${validator_bin}" \
+                  --mode=initiator \
+                  --protocol=rdma \
+                  --metadata_server=P2PHANDSHAKE \
+                  --local_server_name="${local_ip}:0" \
+                  --segment_id="${target_name}" \
+                  --device_name="${prefill_rdma_device}" \
+                  --nic_priority_matrix="${prefill_matrix}" \
+                  --use_vram=true \
+                  --gpu_id=0 \
+                  --buffer_size=100663296 \
+                  --batch_size="${transfer_batch_size}" \
+                  --block_size="${transfer_block_size}" \
+                  --threads=1 \
+                  --duration="${transfer_duration}" \
+                  2>&1 | tee "${initiator_log}"
+                transfer_rc="${PIPESTATUS[0]}"
+                set -e
+                if [[ "${transfer_rc}" -eq 0 ]] &&
+                   grep -q "Data validation passed" "${initiator_log}"; then
+                  result=0
+                else
+                  result=1
+                fi
+                if [[ "${result}" -eq 0 && "${is_cross_rail}" -eq 1 ]]; then
+                  expected_affinity="local_device_name=${prefill_rdma_device}, peer_device_name=${expected_peer_device}"
+                  if grep -Fq "RDMA slice affinity:" "${initiator_log}"; then
+                    if ! grep -Fq "${expected_affinity}" "${initiator_log}"; then
+                      grep -F "RDMA slice affinity:" "${initiator_log}" >&2 || true
+                      echo "ERROR: cross-node GPUDirect RDMA selected the wrong HCA from prefill GPU ${prefill_gpu_id} to decode GPU ${decode_gpu_id}" >&2
+                      result=1
+                    fi
+                  else
+                    echo "WARNING: cross-node RDMA data validation passed, but HCA affinity logging was unavailable from prefill GPU ${prefill_gpu_id} to decode GPU ${decode_gpu_id}" >&2
+                  fi
+                fi
+                echo "${result}" > "${result_file}.tmp"
+                mv "${result_file}.tmp" "${result_file}"
+                if [[ "${result}" -ne 0 ]]; then
+                  cat "${target_log}" >&2 || true
+                  echo "ERROR: cross-node GPUDirect RDMA data validation failed from prefill GPU ${prefill_gpu_id} to decode GPU ${decode_gpu_id}" >&2
+                  exit 1
+                fi
+                echo "Cross-node GPUDirect RDMA passed from prefill GPU ${prefill_gpu_id}"
+              fi
+            done
+          fi
+
+          if [[ "${SMOKE_RANK}" -eq 0 ]]; then
+            echo "Mooncake cross-node GPUDirect RDMA passed for same-index GPU pairs 0-7 and prefill GPUs 0-3 to decode GPUs 4-7"
+          fi
+          CONTAINER_SCRIPT
+          docker_rc=$?
+          set -e
+          echo "=== RDMA smoke container finished on rank ${rank}: rc=${docker_rc} ==="
+          exit "${docker_rc}"
+          RANK_SCRIPT
+          chmod +x "${rank_script}"
+
+          slurm_status_file="${run_dir}/slurm-job.rc"
+          rm -f "${slurm_status_file}" "${slurm_status_file}.tmp"
+          batch_script="${run_dir}/rdma-smoke.sbatch.sh"
+          cat > "${batch_script}" <<EOF
+          #!/usr/bin/env bash
+          set -euo pipefail
+          set +e
+          srun --nodes=${node_count} --ntasks=${node_count} --ntasks-per-node=1 \
+            "${rank_script}"
+          srun_rc=\$?
+          set -e
+          printf '%s\n' "\${srun_rc}" > "${slurm_status_file}.tmp"
+          mv "${slurm_status_file}.tmp" "${slurm_status_file}"
+          exit "\${srun_rc}"
+          EOF
+          chmod +x "${batch_script}"
+
+          sbatch_cmd=(
+            sbatch
+            --parsable
+            --exclusive
+            --export=ALL
+            --job-name "${SLURM_JOB_NAME}"
+            --nodes "${node_count}"
+            --ntasks "${node_count}"
+            --ntasks-per-node 1
+            --time 00:30:00
+            --output "${SLURM_OUTPUT}"
+            --error "${SLURM_ERROR}"
+          )
+          if [[ -n "${nodes}" ]]; then
+            sbatch_cmd+=(--nodelist "${nodes}")
+          fi
+          if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
+            sbatch_cmd+=(--controller "${SPUR_CONTROLLER_ADDR}")
+          else
+            [[ -z "${ATOMESH_SLURM_ACCOUNT}" ]] || sbatch_cmd+=(--account "${ATOMESH_SLURM_ACCOUNT}")
+            [[ -z "${ATOMESH_SLURM_PARTITION}" ]] || sbatch_cmd+=(--partition "${ATOMESH_SLURM_PARTITION}")
+            sbatch_cmd+=(--gres gpu:8)
+            if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi355-crusoe" ]]; then
+              sbatch_cmd+=(
+                --controller "${SPUR_CONTROLLER_ADDR}"
+                -q amd-burst-qos
+              )
+            fi
+          fi
+          sbatch_cmd+=("${batch_script}")
+
+          printf ' %q' "${sbatch_cmd[@]}"
+          echo
+          write_slurm_cancel_helper ""
+          set +e
+          sbatch_output="$("${sbatch_cmd[@]}")"
+          sbatch_rc=$?
+          set -e
+          echo "${sbatch_output}"
+          if [[ "${sbatch_rc}" -ne 0 ]]; then
+            echo "sbatch submit exit code: ${sbatch_rc}"
+            exit "${sbatch_rc}"
+          fi
+
+          JOB_ID="$(parse_sbatch_job_id "${sbatch_output}")"
+          SLURM_JOB_ACTIVE=1
+          echo "${JOB_ID}" | tee "${run_dir}/slurm-job-id"
+          write_slurm_cancel_helper "${JOB_ID}"
+          set_slurm_job_log_paths "${JOB_ID}"
+          monitor_slurm_job "${JOB_ID}"
+          read_slurm_exit_code "${JOB_ID}"
+          if [[ "${SLURM_STATE}" == "unknown" && -s "${slurm_status_file}" ]]; then
+            batch_rc="$(tr -d '[:space:]' < "${slurm_status_file}")"
+            if [[ "${batch_rc}" =~ ^[0-9]+$ ]]; then
+              SLURM_JOB_RC="${batch_rc}"
+              SLURM_EXIT_CODE="${batch_rc}:0"
+              if [[ "${batch_rc}" -eq 0 ]]; then
+                SLURM_STATE="COMPLETED"
+              else
+                SLURM_STATE="FAILED"
+              fi
+              echo "Using batch script exit status because Slurm accounting is unavailable."
+            else
+              echo "WARNING: invalid batch script exit status: ${batch_rc}" >&2
+            fi
+          fi
+          SLURM_JOB_ACTIVE=0
+          echo "slurm_state=${SLURM_STATE}"
+          echo "slurm_exit_code=${SLURM_EXIT_CODE}"
+          echo "slurm job exit code: ${SLURM_JOB_RC}"
+          exit "${SLURM_JOB_RC}"
 
   run-model-benchmark:
     name: ${{ matrix.id }}

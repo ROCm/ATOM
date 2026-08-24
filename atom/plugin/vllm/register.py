@@ -1,5 +1,4 @@
 import logging
-from typing import Optional
 
 import torch
 from transformers import AutoConfig, PretrainedConfig
@@ -39,6 +38,8 @@ _VLLM_MODEL_REGISTRY_OVERRIDES: dict[str, str] = {
     "KimiK3ForConditionalGeneration": (
         "atom.plugin.vllm.models.kimi_k3:KimiK3ForCausalLMVllm"
     ),
+    # vLLM registers this arch too, but only to its NVIDIA implementation.
+    "K3DSparkModel": "atom.plugin.vllm.models.kimi_k3_dspark:KimiK3DSparkVllm",
     "MiniMaxM2ForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "DeepseekV4ForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "MiniMaxM3SparseForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
@@ -139,13 +140,19 @@ def _register_mxfp8_quantization_config() -> None:
             return None
 
 
-def register_platform() -> Optional[str]:
+def register_platform() -> str | None:
 
     if disable_vllm_plugin:
         # return None instead of error because the flag can be used to
         # run pure vllm mode without ATOM plugin
         logger.info("Disable ATOM OOT plugin platforms")
         return None
+
+    from atom.plugin.vllm.rocm_dcp_full_graph_patch import (
+        apply_vllm_rocm_dcp_full_graph_patch,
+    )
+
+    apply_vllm_rocm_dcp_full_graph_patch()
 
     # Do not call _set_plugin_mode() here. SGLang (and other stacks) discover
     # vllm.platform_plugins and would set atom's backbone to "vllm" before

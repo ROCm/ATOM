@@ -1,0 +1,176 @@
+# SPDX-License-Identifier: MIT
+# PP-stage offload KV status aggregation (GPU-free).
+
+import pytest
+from aiter_stub import stubbed_aiter
+
+with stubbed_aiter():
+    from atom.kv_transfer.disaggregation.pp_kv_aggregator import PPKVAggregator
+    from atom.kv_transfer.disaggregation.types import KVConnectorOutput
+    from atom.model_engine.pp_engine_core import PPEngineCoreProc
+
+
+class FakeScheduler:
+    def __init__(self):
+        self.outputs = []
+
+    def _update_from_kv_xfer_finished(self, out):
+        self.outputs.append(out)
+
+    def released_sending(self):
+        rel = set()
+        for out in self.outputs:
+            rel |= set(out.finished_sending or ())
+        return rel
+
+    def released_saving(self):
+        rel = set()
+        for out in self.outputs:
+            rel |= set(out.finished_saving or ())
+        return rel
+
+
+class FakeRunnerMgr:
+    """Returns one queued worker-side KVConnectorOutput per poll."""
+
+    def __init__(self, outputs):
+        self._outputs = list(outputs)
+
+    def call_func_with_aggregation(self, name):
+        assert name == "async_proc_aggregation"
+        return self._outputs.pop(0) if self._outputs else KVConnectorOutput()
+
+
+class FakePPTransport:
+    """Returns one queued list of (pp_rank, output) per poll."""
+
+    def __init__(self, messages):
+        self._messages = list(messages)
+
+    def recv_kv_status(self, timeout_ms=0):
+        return self._messages.pop(0) if self._messages else []
+
+
+def _head(pp_size, local_outputs, downstream_messages=()):
+    proc = PPEngineCoreProc.__new__(PPEngineCoreProc)
+    proc.kv_transfer_enabled = True
+    proc.pp_size = pp_size
+    proc._pp_kv_aggregator = None
+    proc._held_sending = {}
+    proc.scheduler = FakeScheduler()
+    proc.runner_mgr = FakeRunnerMgr(local_outputs)
+    proc.pp_transport = FakePPTransport(downstream_messages)
+    return proc
+
+
+def test_send_waits_for_every_pp_stage_save():
+    proc = _head(
+        pp_size=3,
+        local_outputs=[
+            KVConnectorOutput(finished_sending={"a"}, finished_saving={"a"}),
+            KVConnectorOutput(),
+        ],
+        downstream_messages=[
+            [(1, KVConnectorOutput(finished_saving={"a"}))],
+            [(2, KVConnectorOutput(finished_saving={"a"}))],
+        ],
+    )
+
+    proc._poll_kv_transfer_progress()
+    assert proc.scheduler.released_sending() == set()  # stage 2 still saving
+    assert proc._held_sending == {"a": "a"}
+
+    proc._poll_kv_transfer_progress()
+    assert proc.scheduler.released_sending() == {"a"}
+    assert proc.scheduler.released_saving() == {"a"}
+    assert proc._held_sending == {}
+
+
+def test_send_without_a_save_is_not_held():
+    # Once the aggregator exists, a later send-only request (prompt shorter
+    # than the offload chunk, or already persisted) must still pass straight
+    # through — no finished_saving is ever coming for it.
+    proc = _head(
+        pp_size=2,
+        local_outputs=[
+            KVConnectorOutput(finished_sending={"a"}, finished_saving={"a"}),
+            KVConnectorOutput(finished_sending={"b"}),
+        ],
+        downstream_messages=[[(1, KVConnectorOutput(finished_saving={"a"}))], []],
+    )
+
+    proc._poll_kv_transfer_progress()
+    assert proc.scheduler.released_sending() == {"a"}
+
+    proc._poll_kv_transfer_progress()
+    assert proc.scheduler.released_sending() == {"a", "b"}
+    assert proc._held_sending == {}
+
+
+def test_send_passes_through_before_any_offload_activity():
+    proc = _head(pp_size=2, local_outputs=[KVConnectorOutput(finished_sending={"a"})])
+    proc._poll_kv_transfer_progress()
+    assert proc.scheduler.released_sending() == {"a"}
+    assert proc._pp_kv_aggregator is None
+
+
+def test_recv_bypasses_the_aggregator():
+    proc = _head(
+        pp_size=2,
+        local_outputs=[KVConnectorOutput(finished_recving={"a"}, failed_recving={"b"})],
+    )
+    proc._poll_kv_transfer_progress()
+    assert proc.scheduler.outputs[0].finished_recving == {"a"}
+    assert proc.scheduler.outputs[0].failed_recving == {"b"}
+
+
+def test_aggregator_requires_all_stages():
+    agg = PPKVAggregator(3)
+    assert agg.ingest(0, KVConnectorOutput(finished_saving={"a"})).is_empty()
+    assert agg.ingest(1, KVConnectorOutput(finished_saving={"a"})).is_empty()
+    assert agg.ingest(2, KVConnectorOutput(finished_saving={"a"})).finished_saving == {
+        "a"
+    }
+
+
+def test_load_failure_waits_for_every_stage():
+    # Reporting at the first failing stage wakes the request for recompute
+    # into blocks the other stages are still loading into.
+    agg = PPKVAggregator(3)
+    assert agg.ingest(0, KVConnectorOutput(failed_loading={"a"})).is_empty()
+    assert agg.has_pending() is True
+
+    assert agg.ingest(1, KVConnectorOutput(finished_loading={"a"})).is_empty()
+    assert agg.has_pending() is True
+
+    out = agg.ingest(2, KVConnectorOutput(finished_loading={"a"}))
+    assert out.failed_loading == {"a"}
+    assert out.finished_loading == set()
+
+
+def test_terminal_load_failure_leaves_no_residue():
+    # The tally is dropped only once no stage can still report, so the verdict
+    # is emitted exactly once and nothing is left to spin the engine's idle
+    # KV drain forever.
+    agg = PPKVAggregator(2)
+    assert agg.ingest(0, KVConnectorOutput(failed_loading={"a"})).is_empty()
+
+    out = agg.ingest(1, KVConnectorOutput(failed_loading={"a"}))
+    assert out.failed_loading == {"a"}
+    assert agg.has_pending() is False
+
+    assert agg.ingest(0, KVConnectorOutput()).is_empty()
+
+
+def test_load_failure_does_not_block_another_request():
+    agg = PPKVAggregator(2)
+    agg.ingest(0, KVConnectorOutput(failed_loading={"a"}, finished_loading={"b"}))
+    out = agg.ingest(1, KVConnectorOutput(finished_loading={"a", "b"}))
+    assert out.finished_loading == {"b"}
+    assert out.failed_loading == {"a"}
+    assert agg.has_pending() is False
+
+
+def test_aggregator_rejects_bad_pp_size():
+    with pytest.raises(ValueError):
+        PPKVAggregator(0)

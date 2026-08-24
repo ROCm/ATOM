@@ -97,8 +97,8 @@ jobs:
       RCCL_BRANCH: "29e1567b95e28823b0beb1a988adc587bfab5b4f"
       GPU_ARCH: "gfx942;gfx950"
       SGLANG_REPO: "https://github.com/sgl-project/sglang.git"
-      SGLANG_REF: "v0.5.15.post1"
-      SGLANG_VERSION: "0.5.15.post1"
+      SGLANG_REF: "v0.5.17"
+      SGLANG_VERSION: "0.5.17"
 
     steps:
       - name: Set HF_TOKEN

@@ -37,6 +37,10 @@ def merge_attn_states(
         prefill_tokens_with_context = num_tokens
 
     # TODO(woosuk): Use CUDA kernel instead of Triton to minimize CPU overhead.
+    # num_warps=1: one program owns a single [HEAD_SIZE] row, so the default
+    # num_warps=4 spreads 128 elements over 256 lanes -- half idle, 2 B each.
+    # aiter hit the same shape in its stage-2 MLA merge and measured 1.7-1.9x
+    # from num_warps=1 on gfx950 (op_tests/test_mla_stage2_merge.py header).
     merge_attn_states_kernel[(num_tokens, num_query_heads)](
         output,
         output_lse,
@@ -52,6 +56,7 @@ def merge_attn_states(
         output_lse is not None,
         prefill_tokens_with_context,
         output_scale is not None,
+        num_warps=1,
     )
 
 

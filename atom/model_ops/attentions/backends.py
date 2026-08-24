@@ -14,6 +14,7 @@ import torch
 from aiter.dist.parallel_state import get_tp_group
 from torch import nn
 
+from atom.config import DCPConfig
 from atom.distributed.dcp_utils import get_dcp_rank, get_dcp_world_size
 from atom.model_engine.page_unit_checkpoint import (
     CheckpointRestoreOp,
@@ -23,7 +24,8 @@ from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.state_runtime import StateTransfer
 from atom.model_ops.attention_mla import MLAModules
 from atom.model_ops.attentions.sub_pool_spec import SubPoolSpec
-from atom.utils import CpuGpuBuffer
+from atom.model_ops.dcp_ops import dcp_local_index, dcp_owner_rank
+from atom.utils import CpuGpuBuffer, pack_rows
 from atom.utils.forward_context import AttentionMetaData, AttnState
 from atom.utils.tbo.ubatch_splitting import (
     UBatchSlice,
@@ -147,6 +149,17 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         """Declare this backend's per-request state checkpoint capability."""
         return StateTransfer.none()
 
+    def checkpoint_image_bytes(self) -> int | None:
+        """Bytes of an Active Slot a checkpoint image has to hold.
+
+        `None` means all of them: the safe answer, and the one a backend that
+        has not worked out which of its bytes a resumer skips should keep
+        giving. A backend returns less only when it can name bytes no resumer
+        reads — for a ring whose next reader starts exactly at the checkpoint
+        boundary, that is the whole ring.
+        """
+        return None
+
     def relocate_state_slots(self, pairs: Sequence[tuple[int, int]]) -> None:
         """Move live state between contiguous Active Slots."""
         raise NotImplementedError(
@@ -164,6 +177,16 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
             raise NotImplementedError(
                 f"{type(self).__name__} does not implement PAGE-backed state copy"
             )
+
+    def warmup_per_req_cache(self) -> None:
+        """Pay whatever the first checkpoint copy would pay, before serving.
+
+        Called once by ModelRunner after `allocate_per_req_cache`'s pools are
+        installed, which is the earliest a backend can reach its own addresses.
+        Nothing else warms this path: `execute_paged_state_copies` runs only
+        from `build()`, so a backend that compiles a kernel or fills a cache
+        there does it inside a live request's batch. A no-op by default.
+        """
 
     def get_kv_transfer_tensors(self) -> "KVTransferTensors | None":
         """Return RDMA transfer regions for PD disaggregation.
@@ -233,11 +256,17 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         hf_config = config.hf_config
         self.dcp_world_size = get_dcp_world_size()
         self.dcp_rank = get_dcp_rank()
+        # DCP KV-cache interleave granularity S (1 = token-level round-robin).
+        self.cp_kv_cache_interleave_size = getattr(
+            config, "dcp_config", DCPConfig()
+        ).interleave_size
         self.max_num_batched_tokens = model_runner.max_num_batched_tokens
         self.max_bs = model_runner.max_bs
         self.max_num_blocks_per_seq = (
             config.max_model_len + self.block_size - 1
         ) // self.block_size
+        # Width of every `block_tables` buffer, and of anything gathered from one.
+        self.block_table_cols = self.max_num_blocks_per_seq // self.block_ratio
         # Per-rank attention head count. eagle.propose's mid-step path reads
         # this to gate the `do_attn_metadata_update` branch. Subclasses that
         # need a kernel-minimum-padded count set `self.padded_num_attention_heads`
@@ -253,9 +282,7 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             "slot_mapping": CpuGpuBuffer(self.max_num_batched_tokens, **i64_kwargs),
             "context_lens": CpuGpuBuffer(self.max_bs, **i32_kwargs),
             "block_tables": CpuGpuBuffer(
-                self.max_bs,
-                self.max_num_blocks_per_seq // self.block_ratio,
-                **i32_kwargs,
+                self.max_bs, self.block_table_cols, **i32_kwargs
             ),
             "cu_seqlens_q": CpuGpuBuffer(self.max_bs + 1, **i32_kwargs),
             "cu_seqlens_k": CpuGpuBuffer(self.max_bs + 1, **i32_kwargs),
@@ -272,12 +299,15 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         self.model_runner.forward_vars.update(attn_metadata)
         self.has_sliding_window = hasattr(hf_config, "sliding_window")
 
-    def prepare_block_tables(self, batch: ScheduledBatch):
+    def prepare_block_tables(self, batch: ScheduledBatch, limit: int | None = None):
+        """Marshal the batch's block tables into `forward_vars["block_tables"]`.
+
+        `limit` caps how many rows are taken, for callers scheduling fewer
+        sequences than the batch carries.
+        """
         var = self.model_runner.forward_vars
-        block_tables = var["block_tables"].np
-        for i, block_table in enumerate(batch.block_tables):
-            block_tables[i] = 0
-            block_tables[i, : len(block_table)] = block_table
+        rows = batch.block_tables if limit is None else batch.block_tables[:limit]
+        pack_rows(var["block_tables"].np, rows)
 
     def _mrope_cpu_view(self, num_tokens: int) -> np.ndarray:
         return (
@@ -374,12 +404,17 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             block_table = batch.block_tables[i]
             block_size = self.model_runner.block_size
             if self.dcp_world_size > 1:
-                virtual_block_size = block_size * self.dcp_world_size
+                W = self.dcp_world_size
+                S = self.cp_kv_cache_interleave_size
+                virtual_block_size = block_size * W
                 for pos in range(cached_seqlen, seqlen):
-                    vb_offset = pos % virtual_block_size
-                    if vb_offset % self.dcp_world_size == self.dcp_rank:
+                    # Block-level interleave: token pos is owned by rank
+                    # (pos//S)%W at local index (pos//(S*W))*S + pos%S. S=1 is the
+                    # original round-robin. blk_idx = pos // (block_size*W) equals
+                    # local_index // block_size (needs block_size % S == 0).
+                    if dcp_owner_rank(pos, W, S) == self.dcp_rank:
                         blk_idx = pos // virtual_block_size
-                        local_offset = vb_offset // self.dcp_world_size
+                        local_offset = dcp_local_index(pos, W, S) % block_size
                         slot_mapping.append(
                             block_table[blk_idx] * block_size + local_offset
                         )

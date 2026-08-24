@@ -48,11 +48,14 @@ def _flash_state_layout(kv_fp8: bool, *, ring_extra: int = 1):
             torch.float32,
             float("-inf"),
         ),
+        # Mirrors the bridge, `in_checkpoint` included: this list is that
+        # list's oracle, so a difference here is a difference nobody catches.
         StateField(
             "hca_main_kv",
             n_hca,
             (128 + ring_extra, head_dim),
             torch.float32,
+            in_checkpoint=False,
         ),
         StateField(
             "hca_main_score",
@@ -60,6 +63,7 @@ def _flash_state_layout(kv_fp8: bool, *, ring_extra: int = 1):
             (128 + ring_extra, head_dim),
             torch.float32,
             float("-inf"),
+            in_checkpoint=False,
         ),
     ]
     row_widths = [head_dim * (1 if kv_fp8 else 2)]

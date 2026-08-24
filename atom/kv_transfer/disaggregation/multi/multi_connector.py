@@ -170,6 +170,21 @@ class MultiConnectorMetadata(ConnectorMetadata):
                 agg.extend(sub)
         return agg
 
+    @property
+    def lookup_requests_in_step(self):
+        """Aggregate of sub-metas' pending lookup-pin releases.
+
+        Same reason as ``requests``: the idle dispatch gates on this, and a
+        metadata dropped for looking empty takes the sub-meta's only unpin
+        with it.
+        """
+        agg: list = []
+        for m in self.metas:
+            sub = getattr(m, "lookup_requests_in_step", None)
+            if sub:
+                agg.extend(sub)
+        return agg
+
 
 # ---------------------------------------------------------------------------
 # Worker side
@@ -186,6 +201,13 @@ class MultiConnector(KVConnectorBase):
         self.is_producer = any(
             getattr(c, "is_producer", False) for c in self._connectors
         )
+
+        pp_rank = getattr(
+            getattr(config, "parallel_config", None),
+            "pipeline_parallel_rank",
+            0,
+        )
+        self._pp_is_head = pp_rank == 0
 
         # Send/save pairing state (see module docstring).
         # _pending_save: str(req_id) for requests offload will save this lifetime.
@@ -220,7 +242,7 @@ class MultiConnector(KVConnectorBase):
             if reqs:
                 for req in reqs:
                     if getattr(req, "save_spec", None) is not None:
-                        self._pending_save.add(str(getattr(req, "req_id")))
+                        self._pending_save.add(str(req.req_id))
             c.start_load_kv(m)
 
     def get_finished(self) -> KVConnectorOutput:
@@ -246,10 +268,10 @@ class MultiConnector(KVConnectorBase):
             failed_loading=load_failed,
         )
 
-        if not self.is_producer:
-            # No moriio send to pair with: offload save / recv pass straight
-            # through (the scheduler frees consumer/offload requests on
-            # finished_saving via should_defer_free).
+        if not self.is_producer or not self._pp_is_head:
+            # Non-producer: no moriio send to pair with.
+            # Non-head PP stage: mooncake only reports done_sending on stage 0
+            # (via _record_release), so downstream stages would wait forever.
             out.finished_sending = set(send_now)
             out.finished_saving = set(save_now)
             return out
@@ -350,6 +372,16 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         return any(
             hasattr(c, "should_defer_free") and c.should_defer_free(seq)
             for c in self._connectors
+        )
+
+    def has_pending_work(self) -> bool:
+        # Scheduler-side only: the send/save pairing state lives on the worker
+        # instance, and a pending send is already visible to the engine through
+        # the scheduler's deferred_free_blocks.
+        return any(
+            c.has_pending_work()
+            for c in self._connectors
+            if hasattr(c, "has_pending_work")
         )
 
     def save_finished(self, req_id: Any) -> None:
