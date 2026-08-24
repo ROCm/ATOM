@@ -3258,6 +3258,78 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         self._ubatch_compress_plan_buffers[ubatch_idx] = pool
         return pool
 
+    def _rebuild_prefill_segment(
+        self,
+        prefill_meta: AttentionMetaData,
+        pref_slice,
+        padded_bs: int,
+        ubatch_idx: int,
+    ) -> AttentionMetaData_DSV4:
+        """Slice a mixed batch's prefill SEGMENT metadata for one ubatch.
+
+        Runs the ordinary token-split rebuild, but against the mixed prefill
+        bank: `prepare_mixed` staged the prefill half's positions, cu_seqlens_q
+        and block_tables there, while `forward_vars` holds the decode half's.
+        Reading the live bank would rebuild this ubatch's prefill rows out of
+        the decode half's staging.
+
+        Swapping is safe -- the bank mirrors every CpuGpuBuffer in
+        `forward_vars`, `ub{idx}_` sets included, because it is built lazily on
+        the first mixed step, after `_alloc_v4_metadata_buffers` has run its
+        `forward_vars.update(bufs)`.
+        """
+        main_var = self.model_runner.forward_vars
+        self.model_runner.forward_vars = self._get_mixed_prefill_bank()
+        try:
+            return self.build_ubatch_prefill_metadata(
+                prefill_meta, pref_slice, padded_bs, ubatch_idx=ubatch_idx
+            )
+        finally:
+            self.model_runner.forward_vars = main_var
+
+    def _build_ubatch_prefill_of_mixed(
+        self,
+        attn_metadata: AttentionMetaData,
+        ub_slice,
+        ubatch_idx: int,
+    ) -> AttentionMetaData_DSV4:
+        """Rebuild the PURE-PREFILL ubatch of a split mixed batch.
+
+        The cut is gated to land inside the prefill region, so ubatch 0 holds
+        prefill rows only and wants a plain prefill metadata -- but sliced out
+        of the parent's prefill SEGMENT, not out of the parent. A mixed parent
+        is a thin carrier: `prepare_mixed` populates the two segment metadatas
+        and the markers, leaving `state_slot_out` and the rest of the
+        per-request fields None on the carrier itself. Feeding it to the
+        ordinary rebuild is what produced
+
+            _build_paged_prefill_meta: attn_metadata.state_slot_out[:bs]
+            TypeError: 'NoneType' object is not subscriptable
+
+        The slice needs no adjustment: prefill rows lead in both the merged and
+        the prefill-only axis, and this ubatch ends before the boundary, so its
+        ranges mean the same thing in each.
+        """
+        src = cast(AttentionMetaData_DSV4, attn_metadata)
+        assert src.prefill_attn_metadata is not None, (
+            "pure-prefill ubatch of a mixed batch needs the parent's prefill "
+            "segment metadata"
+        )
+        from atom.utils.tbo.ubatch_splitting import UBatchSlice
+
+        rs = ub_slice.request_slice
+        # Strip the mixed markers before recursing. `build_ubatch_prefill_
+        # metadata` dispatches on their presence, so passing `ub_slice` through
+        # unchanged would land right back here -- unbounded recursion. The
+        # ranges are all the rebuild needs.
+        plain_slice = UBatchSlice(
+            request_slice=ub_slice.request_slice,
+            token_slice=ub_slice.token_slice,
+        )
+        return self._rebuild_prefill_segment(
+            src.prefill_attn_metadata, plain_slice, rs.stop - rs.start, ubatch_idx
+        )
+
     def _build_ubatch_mixed_metadata(
         self,
         attn_metadata: AttentionMetaData,
@@ -3331,18 +3403,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             request_slice=slice(rs.start, src.num_prefill_seqs),
             token_slice=slice(ts.start, src.num_prefill_tokens),
         )
-        main_var = self.model_runner.forward_vars
-        self.model_runner.forward_vars = self._get_mixed_prefill_bank()
-        try:
-            ub_pref = self.build_ubatch_prefill_metadata(
-                src.prefill_attn_metadata,
-                pref_slice,
-                ub_pref_seqs,
-                ubatch_idx=ubatch_idx,
-            )
-        finally:
-            self.model_runner.forward_vars = main_var
-
+        ub_pref = self._rebuild_prefill_segment(
+            src.prefill_attn_metadata, pref_slice, ub_pref_seqs, ubatch_idx
+        )
         ub_dec = src.decode_attn_metadata
 
         merged = AttentionMetaData_DSV4(
@@ -3389,6 +3452,20 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # metadata this method otherwise builds. Only reachable with
         # ATOM_TBO_MIXED=1; the split refuses mixed batches in
         # `local_tbo_precompute` otherwise.
+        # Both ubatches of a split MIXED batch have to be rebuilt from the
+        # parent's prefill SEGMENT metadata, never from the parent itself. The
+        # parent of a mixed batch is a thin carrier -- `prepare_mixed` gives it
+        # the two segment metadatas, the markers and little else, so the
+        # per-request fields the rebuild below reads (`state_slot_out` first
+        # among them) are None on it and it dies with
+        # `'NoneType' object is not subscriptable`.
+        #
+        # The straddling ubatch additionally needs the nested two-segment
+        # shape put back together; the pure-prefill one is an ordinary prefill
+        # rebuild once it is pointed at the right source.
+        #
+        # Only reachable with ATOM_TBO_MIXED=1; `local_tbo_precompute` refuses
+        # mixed batches otherwise.
         _ub_pref_tok = getattr(ub_slice, "num_prefill_tokens", None)
         if _ub_pref_tok is not None:
             _ub_tok = ub_slice.token_slice.stop - ub_slice.token_slice.start
@@ -3396,6 +3473,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 return self._build_ubatch_mixed_metadata(
                     attn_metadata, ub_slice, ubatch_idx
                 )
+            # Pure-prefill ubatch of a mixed parent: same redirect to the
+            # prefill segment (and its staging bank), minus the reassembly.
+            return self._build_ubatch_prefill_of_mixed(
+                attn_metadata, ub_slice, ubatch_idx
+            )
 
         # PCP+TBO request-boundary split: each ubatch = one request group processed as an
         # independent non-TBO PCP mini-batch. Slice the FULL (un-reindexed)
