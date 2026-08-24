@@ -438,7 +438,7 @@ class EngineArgs:
                 "pipeline fill/drain. Requires --pipeline-parallel-size > 1. Helps "
                 "single-stream long prefill and costs throughput once several "
                 "requests prefill at once, so it is meant for latency-bound "
-                "deployments; see docs/dynamic_chunked_pipeline_parallelism.md."
+                "deployments; see docs/dynamic_chunking_guide.md."
             ),
         )
         parser.add_argument(
