@@ -162,6 +162,9 @@ RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
 # ATOM only consumes the TransferEngine (`mooncake.engine`), so Mooncake Store
 # and its Rust bindings stay off: they add build surface (cachelib, cargo) that
 # nothing here loads. WITH_STORE_RUST=ON is a hard error without WITH_STORE.
+# HIP hipify copies tests/*.cpp into the build tree but not headers such as
+# rdma_test_peers.h, so BUILD_UNIT_TESTS=ON fails. Upstream ROCm CI also sets
+# BUILD_UNIT_TESTS=OFF; examples are unused in this image.
 RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
         echo "========== [MC 3/4] Build and install Mooncake (USE_HIP=ON USE_HIP_DMABUF=${USE_HIP_DMABUF}) =========="; \
         HSA_PREFIXS="/opt/rocm"; \
@@ -172,6 +175,7 @@ RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
         mkdir -p /app/mooncake/build && cd /app/mooncake/build \
         && cmake .. -DUSE_HIP=ON -DUSE_HIP_DMABUF=${USE_HIP_DMABUF} -DUSE_ETCD=ON \
              -DWITH_TE=ON -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF \
+             -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF \
              -DCMAKE_PREFIX_PATH="${HSA_PREFIXS}${CMAKE_PREFIX_PATH:+:${CMAKE_PREFIX_PATH}}" \
              > /tmp/mooncake-cmake.log 2>&1 \
         || { cat /tmp/mooncake-cmake.log; exit 1; } \
