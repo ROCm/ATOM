@@ -2447,10 +2447,10 @@ class DeepseekV2MLAAttention(nn.Module):
         if self.qrep_enabled:
             dcp_size = get_dcp_world_size()
             assert tp_size % dcp_size == 0
-            q_qrep_override = dict(
-                override_tp_size=tp_size // dcp_size,
-                override_tp_rank=get_tensor_model_parallel_rank() // dcp_size,
-            )
+            q_qrep_override = {
+                "override_tp_size": tp_size // dcp_size,
+                "override_tp_rank": get_tensor_model_parallel_rank() // dcp_size,
+            }
 
         self.scaling = self.qk_head_dim**-0.5
         self.max_position_embeddings = max_position_embeddings

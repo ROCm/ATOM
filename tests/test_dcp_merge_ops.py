@@ -988,9 +988,7 @@ def _build_layer(quant_type=None, n_wide=N_WIDE):
     w = torch.randn(n_wide, K, generator=g, device=DEV, dtype=torch.bfloat16) * 0.05
     layer.weight.data = w.to(layer.weight.dtype)
     if quant_type == QuantType.per_1x128:
-        s = torch.rand(
-            (n_wide + 127) // 128, (K + 127) // 128, generator=g, device=DEV
-        )
+        s = torch.rand((n_wide + 127) // 128, (K + 127) // 128, generator=g, device=DEV)
         layer.weight_scale.data = (s * 0.01 + 0.01).to(layer.weight_scale.dtype)
     layer.process_weights_after_loading()
     return layer

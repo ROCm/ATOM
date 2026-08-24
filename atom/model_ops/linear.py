@@ -431,7 +431,7 @@ class LinearBase(nn.Module):
         output_size: int | list[int],
         tp_dim: int | None = None,
         bias: bool = False,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         reduce_results: bool = False,
         source_quant_dtype: torch.dtype | None = None,
         prefix: str = "",
@@ -464,9 +464,9 @@ class LinearBase(nn.Module):
         # valid TP size and eff_rank a valid rank within it, all downstream param
         # sizing / weight_loader narrowing is inherited unchanged.
         if override_tp_size is not None or override_tp_rank is not None:
-            assert override_tp_size is not None and override_tp_rank is not None, (
-                "override_tp_size and override_tp_rank must be set together"
-            )
+            assert (
+                override_tp_size is not None and override_tp_rank is not None
+            ), "override_tp_size and override_tp_rank must be set together"
             assert 0 <= override_tp_rank < override_tp_size
             self.tp_size = override_tp_size
             self.tp_rank = override_tp_rank
@@ -1082,7 +1082,7 @@ class ReplicatedLinear(LinearBase):
         input_size: int,
         output_size: int,
         bias: bool = False,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         source_quant_dtype: torch.dtype = None,
         prefix: str = "",
         **kwargs,
@@ -1108,7 +1108,7 @@ class ColumnParallelLinear(LinearBase):
         input_size: int,
         output_size: int,
         bias: bool = False,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         source_quant_dtype: torch.dtype = None,
         prefix: str = "",
         override_tp_size: int | None = None,
@@ -1201,9 +1201,9 @@ class ColumnParallelLinear(LinearBase):
         # caller is expected to slice below the padding (only per_Token fp8 pads
         # at all, and it appends at the end).
         if getattr(self, "is_output_padded", False):
-            assert start + length <= self._output_size_before_padding, (
-                "row view must stay within the unpadded rows"
-            )
+            assert (
+                start + length <= self._output_size_before_padding
+            ), "row view must stay within the unpadded rows"
             view.is_output_padded = False
         view.prefix = f"{getattr(self, 'prefix', '')}[rows {start}:{start + length}]"
         return view

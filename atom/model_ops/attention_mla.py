@@ -828,9 +828,7 @@ class MLAAttention(nn.Module):
         else:
             n_heads_out = self.qrep_num_heads if self.qrep_enabled else self.num_heads
             q = self.q_proj(x, x_scale).view(-1, n_heads_out, self.qk_head_dim)
-        q_nope, q_pe = q.split(
-            [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
-        )
+        q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
         # Convert from (B, N, P) to (N, B, P)
         q_nope = q_nope.transpose(0, 1)
@@ -2034,9 +2032,7 @@ class MLAAttention(nn.Module):
             # and the AG path runs as before); use_qrep only toggles the optimization.
             # Excludes prefill and the seg path (seg alloc is per-rank sized).
             use_qrep = (
-                self.qrep_enabled
-                and not context.is_prefill
-                and not self.use_seg_mla
+                self.qrep_enabled and not context.is_prefill and not self.use_seg_mla
             )
             q_nope, q_rope = self._q_proj_and_k_up_proj(
                 q, x_scale=q_scale, group=use_qrep
