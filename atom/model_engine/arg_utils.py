@@ -483,34 +483,24 @@ class EngineArgs:
             type=json.loads,
             default=None,
             help=(
-                "DCP (Decode Context Parallel) config as a JSON dict, parsed "
-                "straight into a DCPConfig object (no per-field flags). "
-                "Supported keys:\n"
-                '  - "interleave_size": int, KV-cache interleave granularity S: '
-                "token i is stored on DCP rank (i // S) %% W. Default 1 = "
-                "token-level round-robin.\n"
-                '  - "enable_query_replication": bool, replicate the MLA query '
-                "projection across the DCP group at load time so each rank "
-                "locally produces the full group head set, removing the "
-                "per-step decode AllGather Q (QREP). First cut: dense+sparse "
-                "qlen=1 decode, fp8 weights; auto-disabled for speculative "
-                "decode / fp4 / dcp<=1. Default TRUE -- pass false explicitly "
-                "for a non-QREP control run.\n"
-                '  - "enable_project_before_merge": bool, run the V '
-                "up-projection before the DCP output merge so the merge "
-                "exchanges v_head_dim per head instead of kv_lora_rank "
-                "(kv_lora/v_head x less: 4x on DeepSeek, 2x on GLM-5.2). "
-                "Costs a DCP-group copy of W_V. Covers decode and sparse "
-                "prefill; auto-disabled for fp4 / dcp<=1. Default TRUE -- "
-                "pass false explicitly for a control run.\n"
-                '  - "comm_backend": str, which collective pattern merges the '
-                "per-rank partial attention. 'a2a' (DEFAULT) = one all-to-all "
-                "with the LSE packed alongside the output, combine done "
-                "locally, 1 call. 'ag_rs' = AllGather LSE + local correct + "
-                "ReduceScatter output, 2 calls. Equivalent math, not bitwise "
-                "identical. Pass 'ag_rs' explicitly for a control run. \n"
-                "Example:\n"
-                """  '{"interleave_size": 16, "enable_query_replication": true}'"""
+                "DCP (Decode Context Parallel) knobs as one JSON dict, parsed "
+                "straight into DCPConfig (no per-field flags); unknown keys "
+                "raise. Details and constraints: "
+                "docs/context_parallel_guide.md.\n"
+                '  "interleave_size" (int, 1): KV interleave granularity S -- '
+                "token i lives on rank (i // S) %% W; 1 = round-robin.\n"
+                '  "enable_query_replication" (bool, TRUE): drop the per-step '
+                "decode AllGather Q by replicating q_proj at load time.\n"
+                '  "enable_project_before_merge" (bool, TRUE): project V '
+                "before the output merge, shrinking it by "
+                "kv_lora_rank/v_head_dim.\n"
+                '  "comm_backend" (str, a2a): \'a2a\' = one all-to-all; '
+                "\'ag_rs\' = AllGather LSE + ReduceScatter output.\n"
+                "The last three default to the NEW behaviour (and the middle "
+                "two auto-disable where unsupported), so a control run must "
+                "pass the old values explicitly -- passing nothing re-runs the "
+                "new path.\n"
+                'Example: \'{"interleave_size": 16, "enable_query_replication": true}\''
             ),
         )
         eplb_group = parser.add_argument_group("EPLB options")

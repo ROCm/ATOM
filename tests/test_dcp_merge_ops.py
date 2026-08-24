@@ -947,10 +947,17 @@ def tp_group():
     import os
 
     import torch.distributed as dist
-    from aiter.dist.parallel_state import (
-        init_distributed_environment,
-        initialize_model_parallel,
-    )
+
+    try:
+        from aiter.dist.parallel_state import (
+            init_distributed_environment,
+            initialize_model_parallel,
+        )
+    except ImportError as e:
+        # A fixture that raises reports as a setup ERROR, not a skip -- which is
+        # exactly how a missing @needs_gpu on a consumer surfaced on a CPU-only
+        # runner. Skipping here keeps that mistake from turning CI red.
+        pytest.skip(f"requires aiter: {e}", allow_module_level=False)
 
     if not dist.is_initialized():
         os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
@@ -994,6 +1001,7 @@ def _build_layer(quant_type=None, n_wide=N_WIDE):
     return layer
 
 
+@needs_gpu
 def test_row_view_matches_output_slicing_bitwise(tp_group):
     """Every rank's view must equal that rank's slice of the wide projection."""
     layer = _build_layer()
@@ -1012,6 +1020,7 @@ def test_row_view_matches_output_slicing_bitwise(tp_group):
         )
 
 
+@needs_gpu
 def test_row_view_is_zero_copy(tp_group):
     """The point is to avoid a second weight, so it must share storage."""
     layer = _build_layer()
@@ -1024,6 +1033,7 @@ def test_row_view_is_zero_copy(tp_group):
     assert view.output_size == ROWS
 
 
+@needs_gpu
 def test_row_view_slices_the_blockscale(tp_group):
     """per_1x128 scale is [N/128, K/128] and unshuffled: it slices by 128."""
     layer = _build_layer()
@@ -1036,6 +1046,7 @@ def test_row_view_slices_the_blockscale(tp_group):
     )
 
 
+@needs_gpu
 def test_row_view_does_not_disturb_the_parent(tp_group):
     """Taking a view must leave the full projection usable and unchanged."""
     layer = _build_layer()
@@ -1048,6 +1059,7 @@ def test_row_view_does_not_disturb_the_parent(tp_group):
     assert layer.output_size == N_WIDE
 
 
+@needs_gpu
 @pytest.mark.parametrize("start, length", [(8, ROWS), (0, 24), (ROWS + 16, ROWS)])
 def test_row_view_rejects_misaligned_slices(tp_group, start, length):
     """A shuffled weight may only be cut on 16-row blocks; per_1x128 wants 128.
@@ -1060,12 +1072,14 @@ def test_row_view_rejects_misaligned_slices(tp_group, start, length):
         layer.make_row_view(start, length)
 
 
+@needs_gpu
 def test_row_view_rejects_out_of_range(tp_group):
     layer = _build_layer()
     with pytest.raises(AssertionError, match="out of range"):
         layer.make_row_view(N_WIDE - ROWS + 128, ROWS)
 
 
+@needs_gpu
 def test_row_view_refuses_unhandled_scale_layout(tp_group):
     """Only the scale layouts that were verified are allowed through.
 

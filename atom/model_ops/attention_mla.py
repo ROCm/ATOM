@@ -535,13 +535,9 @@ class MLAAttention(nn.Module):
             self.dcp_rank = 0
             self._cp_triton_ctx = None
 
-        # DCP Query Replication (QREP): when enabled (resolved in Config), the
-        # query projection is sharded on effective TP = tp/dcp so each rank
-        # produces the whole DCP-group head set (`qrep_num_heads`); decode then
-        # skips the per-step AllGather Q and feeds those heads straight to the
-        # local kernel. W_K is gathered across the DCP group at load
-        # (process_weights_after_loading); W_V stays per-rank (the decode output
-        # is reduce-scattered back to local heads before W_V).
+        # DCP Query Replication (QREP): q_proj is sharded on effective TP =
+        # tp/dcp, so each rank produces the whole DCP-group head set and decode
+        # can skip the per-step AllGather Q. W_K is gathered to match, at load.
         self.qrep_enabled = (
             self.dcp_world_size > 1
             and get_current_atom_config().dcp_config.enable_query_replication
@@ -552,13 +548,11 @@ class MLAAttention(nn.Module):
                 "DCP query replication requires the DCP-group head set "
                 f"(num_heads*dcp={self.qrep_num_heads}) >= {_MLA_MIN_HEADS}."
             )
-        # Project-before-merge (PBM): apply W_V to the head-gathered output
-        # BEFORE cp_lse_ag_out_rs, so the merge exchanges v_head_dim per head
-        # instead of kv_lora_rank. Legal because the merge is a per-(token,head)
-        # scalar weighting followed by a cross-rank sum, and W_V is per-head
-        # linear -- the two commute. Covers both cp_lse_ag_out_rs call sites
-        # (decode and sparse prefill). fp4 is excluded: its W_V scale is block
-        # structured, so the gather-then-requantize recipe does not carry over.
+        # Project-before-merge (PBM): apply W_V before the merge, so it
+        # exchanges v_head_dim per head instead of kv_lora_rank. Legal because
+        # the merge is a per-(token, head) scalar weighting plus a cross-rank
+        # sum and W_V is per-head linear -- they commute. fp4 is excluded: its
+        # W_V scale is block structured, so gather-then-requantize breaks.
         self.pbm_enabled = (
             self.dcp_world_size > 1
             and get_current_atom_config().dcp_config.enable_project_before_merge
@@ -707,21 +701,16 @@ class MLAAttention(nn.Module):
                 W_V, dtype=dtypes.fp8
             )
             if self.qrep_enabled:
-                # QREP: gather the bf16 W_K across the DCP group so each rank
-                # holds the full group head set [group_H, 512, 128], then quantize
-                # the gathered tensor. Gathering bf16 (not fp8) sidesteps the
-                # per-rank scalar-scale stitching problem. Head order matches the
-                # effective-TP q_proj shard (both are global heads
-                # [g*group_H:(g+1)*group_H] in DCP rank_in_group order). Keep the
-                # per-rank self.W_K/scale above for the prefill path.
+                # Gather bf16 and quantize once: gathering fp8 would need the
+                # per-rank scalar scales stitched together. Head order already
+                # matches the effective-TP q_proj shard. self.W_K stays for prefill.
                 W_K_qrep = self.dcp_group.all_gather(W_K.contiguous(), dim=0)
                 self.W_K_qrep, self.W_K_qrep_scale = dynamic_per_batched_tensor_quant(
                     W_K_qrep, dtype=dtypes.fp8
                 )
             if self.pbm_enabled:
-                # Project-before-merge needs W_V for the whole DCP group, because
-                # the projection now runs on the head-gathered output (before the
-                # ReduceScatter that would have cut it back to this rank's heads).
+                # PBM projects the head-gathered output, i.e. before the merge
+                # would have cut it back to this rank's heads -- so W_V must too.
                 W_V_dcp = self.dcp_group.all_gather(W_V.contiguous(), dim=0)
                 self.W_V_dcp, self.W_V_dcp_scale = dynamic_per_batched_tensor_quant(
                     W_V_dcp, dtype=dtypes.fp8
@@ -730,13 +719,10 @@ class MLAAttention(nn.Module):
     def _local_q_proj(self):
         """This rank's rows of the QREP-widened q_proj, built on first use.
 
-        Prefill needs only its own heads. Projecting the whole DCP group and
-        slicing the result still pays for the group, so prefill projects through a zero-copy row
-        VIEW of the weight instead -- same GEMM cost as without QREP, no extra
-        memory. Decode keeps using the full q_proj, which is what lets it skip
-        the AllGather Q. See `ColumnParallelLinear.make_row_view` for why
-        slicing an already-shuffled weight is legal on these boundaries.
-
+        Prefill needs only its own heads, and slicing the OUTPUT still pays for
+        the whole group's GEMM -- so it projects through a zero-copy row view of
+        the weight. Decode keeps the full q_proj; that is what lets it skip the
+        AllGather Q. See ``ColumnParallelLinear.make_row_view``.
         """
         w = self.q_proj.weight.data
         if self._qrep_local_src is not w:
@@ -764,11 +750,9 @@ class MLAAttention(nn.Module):
     def _v_up_proj(self, x, W_V=None, W_V_scale=None, num_heads=None):
         """V up-projection only: ``[B, N, kv_lora_rank] -> [B, N, v_head_dim]``.
 
-        Split out of ``_v_up_proj_and_o_proj`` so DCP decode can run it BEFORE
-        the cross-rank merge (project-before-merge). The weight/head count are
-        arguments because that path projects the whole DCP group's heads with
-        the gathered ``W_V_dcp``, while every other caller uses this rank's
-        ``self.W_V`` and ``self.num_heads``.
+        Split out so DCP decode can run it BEFORE the merge (project-before-
+        merge). Weight and head count are arguments because that path projects
+        the whole group with ``W_V_dcp``; every other caller uses ``self.W_V``.
         """
         W_V = self.W_V if W_V is None else W_V
         W_V_scale = self.W_V_scale if W_V_scale is None else W_V_scale
@@ -813,11 +797,9 @@ class MLAAttention(nn.Module):
 
     @mark_trace(prefix="q_proj_and_k_up_proj", torch_compile=False)
     def _q_proj_and_k_up_proj(self, x, x_scale=None, group=False):
-        # DCP Query Replication (QREP): when qrep_enabled, q_proj emits the full
-        # DCP-group head set. `group=True` (decode) keeps all group heads and uses
-        # the DCP-gathered W_K_qrep, so the caller can skip the AllGather Q.
-        # `group=False` (prefill / non-QREP) slices this rank's own heads out of
-        # the group projection and uses the per-rank W_K.
+        # QREP: q_proj emits the full DCP-group head set. group=True (decode)
+        # keeps them all and uses W_K_qrep, so the caller skips the AllGather Q;
+        # group=False (prefill / non-QREP) takes only this rank's heads.
         if self.qrep_enabled and not group:
             # Row-view weight: computes only this rank's heads, so the redundant
             # group-wide GEMM never happens (the old code projected all group
