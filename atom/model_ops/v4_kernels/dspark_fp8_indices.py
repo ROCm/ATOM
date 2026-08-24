@@ -9,17 +9,20 @@ kernel addresses KV as one pool of rows plus a CSR index list per query row, so
 the `[window ++ draft-block]` KV DSpark attends to has to be expressed as pool
 row ids rather than a materialised `[B, W+T, 512]` tensor.
 
-Two things are built here:
+`dspark_build_indices` emits all three in one launch:
 
-- `dspark_draft_dest_rows` — the ring rows the draft block's own KV is scattered
-  into, fused into the `qk_norm_rope_maybe_quant` launch that produces it.
-- `dspark_build_kv_indices` — the ragged CSR (`kv_indices`, `kv_indptr`) plus
-  `qo_indptr`, laid out one query row per draft position, `N = B*T` rows.
+- `kv_indices` / `kv_indptr` — the ragged CSR, one query row per draft position,
+  `N = B*T` rows.
+- `draft_rows` — the ring rows the draft block's own KV is scattered into, fused
+  into the `qk_norm_rope_maybe_quant` launch that produces it.
 
-Both are pure tensor ops with statically-known shapes: no `.item()`, no
-data-dependent allocation, so a captured CUDA graph replays them. Invalid grid
-cells are funnelled into a trailing dump slot rather than compacted, which is
-what keeps the shapes static.
+`qo_indptr` comes from `dspark_qo_indptr`. Shapes are statically known: no
+`.item()`, no data-dependent allocation, so a captured CUDA graph replays it.
+The buffers are shape-keyed and persistent, and the capacity is the worst case
+rather than a tight fit, so trailing slack is simply never read.
+
+The pool row formula is not restated here -- the kernel calls
+`pool_index.window_row`, which is what that module exists for.
 
 The `[B,T,W+T]` gather indices the bf16 path uses (`_dspark_block_topk_idxs`)
 are a broadcast along T — every draft position attends to the identical set — so
@@ -36,126 +39,9 @@ from atom.model_ops.attentions.v4_pool_geometry import WindowParams
 from atom.model_ops.v4_kernels.pool_index import window_constexprs, window_row
 
 
-def _ring_rows(
-    window: WindowParams, slots: torch.Tensor, pos: torch.Tensor
-) -> torch.Tensor:
-    """Vectorised `WindowParams.index`: pool row for each (slot, position).
-
-    ``slots`` broadcasts against ``pos``. Mirrors the scalar form in
-    `v4_pool_geometry.py` and the Triton twin in `pool_index.py`; positions must
-    be >= 0, since Python and Triton disagree on the sign of a negative modulo
-    and the callers below mask before they get here.
-    """
-    ring = pos % window.ring_slots
-    chunk = ring // window.ring_stride
-    within = ring % window.ring_stride
-    return (
-        slots * window.slot_rows + window.ring_start + chunk * window.run_rows + within
-    )
-
-
-def dspark_draft_dest_rows_reference(
-    window: WindowParams,
-    slots: torch.Tensor,  # [B] int, per-request ring slot
-    draft_pos: torch.Tensor,  # [B, T] int, absolute draft positions
-) -> torch.Tensor:  # [B*T] int32
-    """Ring rows for the draft block's own KV, in `draft_pos` order.
-
-    Handed to `qk_norm_rope_maybe_quant(..., swa_dest_rows=)` so the fp8 quant
-    launch scatters the draft KV into the ring in the same pass that computes
-    it. Writing these speculative rows is safe for the same reason
-    `write_context_kv` may write rejected rows (`dspark_proposer.py:372-376`):
-    they land strictly above the anchor, and nothing ever gathers a position
-    above the anchor.
-    """
-    return (
-        _ring_rows(window, slots.view(-1, 1).to(draft_pos.dtype), draft_pos)
-        .to(torch.int32)
-        .view(-1)
-    )
-
-
 def dspark_kv_index_capacity(batch: int, draft: int, window: int) -> int:
     """Elements to reserve for `kv_indices`, plus the trailing dump slot."""
     return batch * draft * (window + draft) + 1
-
-
-def dspark_build_kv_indices_reference(
-    window: WindowParams,
-    slots: torch.Tensor,  # [B] int, per-request ring slot
-    anchors: torch.Tensor,  # [B] int, per-request anchor position
-    draft_rows: torch.Tensor,  # [B*T] int32, from dspark_draft_dest_rows
-    draft_width: int,  # T
-    draft_window: int,  # W
-    out_indices: torch.Tensor,  # [>= capacity] int32, preallocated
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build the CSR KV lists for `N = B*T` query rows.
-
-    Row ``b*T + t`` gets request ``b``'s list — the valid rolling-window rows
-    followed by all ``T`` draft rows — so the list repeats ``T`` times per
-    request. That is legal: CSR only requires ``kv_indptr`` to be monotone, and
-    the values inside a slice may repeat across slices.
-
-    A request holds ``n = min(anchor+1, W)`` valid window slots (slot ``s`` maps
-    to absolute position ``anchor-(W-1)+s``, and `_build_block_plan` marks
-    ``s >= (W-1)-anchor`` valid, i.e. exactly the non-negative positions), so
-    per-row length is ``n + T`` and the lists are ragged.
-
-    ``out_indices`` is a fixed-capacity buffer, not a tight one: the kernel only
-    reads ``[kv_indptr[i], kv_indptr[i+1])``, so trailing slack is never touched
-    and the shapes stay static for graph capture.
-
-    Returns ``(kv_indices, kv_indptr)``; build `qo_indptr` with
-    :func:`dspark_qo_indptr`.
-    """
-    B = anchors.shape[0]
-    T, W = draft_width, draft_window
-    device = anchors.device
-    K = W + T
-
-    capacity = dspark_kv_index_capacity(B, T, W)
-    if out_indices.numel() < capacity:
-        raise ValueError(
-            f"DSpark kv_indices buffer holds {out_indices.numel()} < {capacity} "
-            f"needed for B={B} T={T} W={W}."
-        )
-    dump = capacity - 1
-
-    idx = anchors.to(torch.int64)
-    n_valid = torch.clamp(idx + 1, max=W)  # [B]
-
-    # One row per draft position; every row of a request shares its list.
-    n_valid_r = n_valid.view(B, 1).expand(B, T).reshape(B * T, 1)
-    anchors_r = idx.view(B, 1).expand(B, T).reshape(B * T, 1)
-    slots_r = slots.to(torch.int64).view(B, 1).expand(B, T).reshape(B * T, 1)
-
-    lengths = (n_valid_r + T).view(-1)  # [B*T]
-    kv_indptr = torch.zeros(B * T + 1, dtype=torch.int32, device=device)
-    kv_indptr[1:] = torch.cumsum(lengths, dim=0).to(torch.int32)
-
-    j = torch.arange(K, device=device, dtype=torch.int64).view(1, K)
-    in_window = j < n_valid_r
-    in_row = j < (n_valid_r + T)
-
-    # Window half: the valid suffix, oldest first. Draft half: the block's own
-    # rows, already resolved to ring rows by `dspark_draft_dest_rows`.
-    win_pos = anchors_r - n_valid_r + 1 + j
-    win_rows = _ring_rows(window, slots_r, torch.clamp(win_pos, min=0))
-    draft_col = torch.clamp(j - n_valid_r, min=0, max=T - 1)
-    draft_rows_r = draft_rows.view(B, T).to(torch.int64)
-    draft_pick = torch.gather(
-        draft_rows_r.view(B, 1, T).expand(B, T, T).reshape(B * T, T), 1, draft_col
-    )
-
-    rows = torch.where(in_window, win_rows, draft_pick).to(torch.int32)
-
-    # Scatter into the ragged buffer. Cells past a row's length go to the dump
-    # slot instead of being compacted, so every shape here is static.
-    dst = kv_indptr[:-1].to(torch.int64).view(-1, 1) + j
-    dst = torch.where(in_row, dst, torch.full_like(dst, dump))
-    out_indices[:capacity].scatter_(0, dst.reshape(-1), rows.reshape(-1))
-
-    return out_indices[:capacity], kv_indptr
 
 
 def dspark_qo_indptr(batch: int, draft: int, device) -> torch.Tensor:
@@ -182,12 +68,12 @@ def dspark_qo_indptr(batch: int, draft: int, device) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 # Fused build.
 #
-# The torch spellings above are ~50 elementwise launches (~286us at B=128 T=4
+# Spelled as torch ops this is ~50 elementwise launches (~286us at B=128 T=4
 # W=128 on MI355X) over tensors of at most a few thousand int32 -- launch-bound,
-# and paid once per DSpark stage per step, in front of an attention kernel that
-# reads only W+T rows. `write_v4_paged_decode_indices` is the target's answer to
-# the same problem: derive every index on device in one kernel. This is that,
-# for the draft's `[window ++ draft-block]` list.
+# in front of an attention kernel that reads only W+T rows.
+# `write_v4_paged_decode_indices` is the target's answer to the same problem:
+# derive every index on device in one kernel. This is that, for the draft's
+# `[window ++ draft-block]` list.
 #
 # ONE launch, matching the target's shape. The CSR offsets are a prefix sum over
 # requests and the index fill needs them before it can address its slice -- but
@@ -356,10 +242,8 @@ def dspark_build_indices(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Everything the asm path needs, in one launch.
 
-    Returns ``(kv_indices, kv_indptr, draft_rows)``. Equivalent to
-    :func:`dspark_draft_dest_rows_reference` followed by
-    :func:`dspark_build_kv_indices_reference`; `tests/test_dspark_fp8_indices.py`
-    holds them to that. Build `qo_indptr` with :func:`dspark_qo_indptr`.
+    Returns ``(kv_indices, kv_indptr, draft_rows)``; build ``qo_indptr`` with
+    :func:`dspark_qo_indptr`.
     """
     B = anchors.shape[0]
     T, W = draft_width, draft_window
