@@ -109,6 +109,12 @@ def test_fp4_prefill_coarse_and_fine_grids_preserve_wave_work():
         # At least three shorter sequence-equivalents select one-wave CTAs.
         (3584, 16896, 1536, 64, 1, 8, 28672),
         (8192, 16896, 2048, 64, 1, 8, 65536),
+        # Cache pressure alone is insufficient: at least three independent KV
+        # streams are needed to repay the fine launch's extra descriptors.
+        (3584, 32768, 1792, 256, 4, 16, 14336),
+        (3584, 32768, 896, 64, 1, 16, 57344),
+        # Conversely, eight short working sets still fit usable L2.
+        (3584, 4096, 448, 256, 4, 4, 3584),
         # Long single-sequence Q has enough row parallelism and strong KV reuse.
         (8192, 16384, 8192, 256, 4, 4, 8192),
         (16384, 16384, 16384, 256, 4, 4, 16384),

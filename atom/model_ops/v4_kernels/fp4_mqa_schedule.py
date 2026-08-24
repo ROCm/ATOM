@@ -18,18 +18,48 @@ FP4_MQA_NUM_WARPS = 4
 FP4_MQA_FINE_BLOCK_K = 64
 FP4_MQA_FINE_NUM_WARPS = 1
 
+# gfx950 exposes 256 CUs and at most 32 resident waves per CU.  Ragged causal
+# rows do not all retire together, so one resident set plus half a refill is a
+# better coverage target than exactly one set.  Expressing this in waves keeps
+# the model invariant across the 256x4 and 64x1 launch shapes.
+FP4_MQA_GFX950_COMPUTE_UNITS = 256
+FP4_MQA_GFX950_MAX_WAVES_PER_CU = 32
+FP4_MQA_RESIDENT_WAVE_SLOTS = (
+    FP4_MQA_GFX950_COMPUTE_UNITS * FP4_MQA_GFX950_MAX_WAVES_PER_CU
+)
+FP4_MQA_TARGET_DEVICE_WAVE_TASKS = 3 * FP4_MQA_RESIDENT_WAVE_SLOTS // 2
+
+# Each logical K token contributes 64 packed FP4 bytes plus four e8m0 scale
+# bytes.  rocminfo reports a 4 MiB L2 slice on gfx950.  Leave one quarter for Q,
+# weights, descriptors, and unrelated traffic when deciding whether concurrent
+# sequence working sets have displaced the cache-local launch's advantage.
+FP4_MQA_KV_BYTES_PER_TOKEN = 64 + 4
+FP4_MQA_GFX950_L2_BYTES = 4 * 1024 * 1024
+FP4_MQA_L2_USABLE_NUMERATOR = 3
+FP4_MQA_L2_USABLE_DENOMINATOR = 4
+FP4_MQA_MIN_FINE_SEQUENCE_EQUIVALENTS = 3
+
 # The inner loop is pipelined across 64-row wave tasks. Keep enough independent
-# tasks to cover the whole gfx950 while retaining useful serial work in each
-# task. The target is expressed in waves (the invariant shared by both launch
-# shapes), then quantized to a four-wave coarse CTA:
+# tasks to cover the device while retaining useful serial work in each task:
 #
-# * 12,288 waves is the measured saturation knee for this 88-92 VGPR kernel;
+# * 12,288 tasks are 1.5 full resident-wave sets on gfx950;
 # * about 33 serial K tasks keeps the prologue/epilogue amortized;
 # * fewer than 12 serial K tasks loses to dispatch and descriptor overhead.
-FP4_MQA_TARGET_DEVICE_WAVE_TASKS = 12_288
 FP4_MQA_TARGET_SERIAL_K_TASKS = 33
 FP4_MQA_MIN_SERIAL_K_TASKS = 12
 FP4_MQA_WAVE_TASK_QUANTUM = FP4_MQA_NUM_WARPS
+
+# These boundaries are consequences of the device model above rather than
+# independently tuned query-size cutoffs.
+FP4_MQA_FINE_MIN_ROWS = 2 * FP4_MQA_GFX950_COMPUTE_UNITS
+FP4_MQA_FINE_LATENCY_MAX_ROWS = FP4_MQA_TARGET_DEVICE_WAVE_TASKS // (
+    2 * FP4_MQA_NUM_WARPS
+)
+FP4_MQA_MAX_CACHE_LOCAL_QUERY_ROWS = (
+    FP4_MQA_TARGET_DEVICE_WAVE_TASKS // FP4_MQA_NUM_WARPS
+)
+FP4_MQA_LONG_QUERY_MIN_ROWS = FP4_MQA_TARGET_DEVICE_WAVE_TASKS // 2
+FP4_MQA_LONG_MAX_COARSE_CHUNKS = 64
 
 
 class FP4MQAPrefillConfig(NamedTuple):
@@ -164,22 +194,40 @@ def fp4_mqa_prefill_config(
         1, (max_seq_len + FP4_MQA_BLOCK_K - 1) // FP4_MQA_BLOCK_K
     )
     long_reuse = (
-        num_rows >= 8192 and max_query_len >= 6144 and coarse_chunks_per_row <= 64
+        num_rows >= FP4_MQA_RESIDENT_WAVE_SLOTS
+        and max_query_len >= FP4_MQA_LONG_QUERY_MIN_ROWS
+        and coarse_chunks_per_row <= FP4_MQA_LONG_MAX_COARSE_CHUNKS
     )
     if long_reuse:
         wave_tasks_per_row = 4
     else:
         wave_tasks_per_row = fp4_mqa_prefill_wave_tasks_per_row(num_rows, max_seq_len)
 
-    # For Q<=1536 the high wave budget is latency/occupancy driven and the
-    # independently scheduled wave is beneficial once launch overhead is
-    # amortized. At larger Q, require at least three sequence-equivalents and
-    # cap each sequence's run length: this is the source-derived proxy for the
-    # loss of single-KV cache reuse. It intentionally keeps ambiguous two-seq
-    # and very long-query shapes on the conservative 4-wave kernel.
+    # A 1-wave CTA is useful once there are at least two rows per CU to amortize
+    # dispatch. In the latency regime, two coarse CTAs per row still fit within
+    # the device wave target, so independently scheduling their eight waves
+    # improves tail balance. Beyond that regime, use the fine launch only when
+    # the concurrent KV working sets exceed the usable gfx950 L2 capacity and
+    # no individual sequence already supplies a device-filling coarse grid.
     sequence_equivalents = max(1, (num_rows + max_query_len - 1) // max_query_len)
-    use_fine_workgroups = num_rows >= 512 and (
-        num_rows <= 1536 or (sequence_equivalents >= 3 and max_query_len <= 3072)
+    kv_working_set_bytes = max(1, max_seq_len * FP4_MQA_KV_BYTES_PER_TOKEN)
+    usable_l2_bytes = (
+        FP4_MQA_GFX950_L2_BYTES
+        * FP4_MQA_L2_USABLE_NUMERATOR
+        // FP4_MQA_L2_USABLE_DENOMINATOR
+    )
+    sequences_to_fill_l2 = (
+        usable_l2_bytes + kv_working_set_bytes - 1
+    ) // kv_working_set_bytes
+    min_fine_sequences = max(
+        FP4_MQA_MIN_FINE_SEQUENCE_EQUIVALENTS, sequences_to_fill_l2
+    )
+    use_fine_workgroups = num_rows >= FP4_MQA_FINE_MIN_ROWS and (
+        num_rows <= FP4_MQA_FINE_LATENCY_MAX_ROWS
+        or (
+            sequence_equivalents >= min_fine_sequences
+            and max_query_len <= FP4_MQA_MAX_CACHE_LOCAL_QUERY_ROWS
+        )
     )
     if use_fine_workgroups:
         block_k = FP4_MQA_FINE_BLOCK_K
