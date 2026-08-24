@@ -69,19 +69,20 @@ python3 -m atom.entrypoints.openai_server \
   --pipeline-parallel-size 4 \
   --max-num-batched-tokens 32768 \
   --enable-dynamic-chunking \
-  --dynamic-chunking-smooth-factor 1.0 \
-  --dynamic-chunking-calibration 3.25e-07,6.03e-03,26.1,5.39e-04
+  --dynamic-chunking-smooth-factor 1.0
 ```
 
 | Flag | Meaning |
 | --- | --- |
 | `--enable-dynamic-chunking` | Turn the feature on. Requires `pipeline_parallel_size > 1`. |
-| `--dynamic-chunking-calibration` | `a,b,c,gamma` fitted from real requests, replacing startup profiling. Effectively required: see [Calibrating the latency model](#calibrating-the-latency-model). |
-| `--dynamic-chunking-base-size` | The chunk the solver equalizes against. `0` (default) uses `--max-num-batched-tokens`. |
 | `--dynamic-chunking-min-chunk-size` | Floor on the solved chunk size. Default `4096`. |
-| `--dynamic-chunking-smooth-factor` | Blend between base size (`0.0`) and the solver's answer (`1.0`). |
-| `--dynamic-chunking-calibration-logging` | Emit the per-forward samples used to fit the coefficients. Calibration runs only. |
-| `--max-num-batched-tokens` | Ceiling: a dynamic chunk is never larger, whatever the base size is. |
+| `--dynamic-chunking-smooth-factor` | Blend between the base chunk (`0.0`) and the solver's answer (`1.0`). |
+| `--max-num-batched-tokens` | The chunk the solver equalizes against, and the ceiling it is clamped to. |
+
+Nothing has to be calibrated by hand. The latency model is measured by the server
+itself, partly at startup and partly from the first real prefills, and chunking
+stays fixed until it is ready — see
+[Calibrating the latency model](#calibrating-the-latency-model).
 
 ## How the chunk size is chosen
 
@@ -118,14 +119,13 @@ answer is then clamped to
 `[--dynamic-chunking-min-chunk-size, --max-num-batched-tokens]` and aligned to
 the KV block size.
 
-The chunk the equality is taken against is `--dynamic-chunking-base-size`, which
-by default is `--max-num-batched-tokens`. That default couples two unrelated
-things: the batch budget is a memory and scheduling limit, while the base size
-decides how many chunks a prompt is split into. Because the solver only ever
-returns something at or below the base, inheriting the budget means the chunk
-count can only grow relative to fixed chunking of the same budget — and every
-added chunk re-pays `gamma*L`. Setting the base to 2-3x the best fixed chunk
-size keeps the count roughly neutral while still evening the chunks out.
+The chunk the equality is taken against is `--max-num-batched-tokens`, the same
+knob SGLang (`--chunked-prefill-size`) and vLLM-Ascend use for this. Because the
+solver only ever returns something at or below it, running dynamic chunking at
+the budget that is best for fixed chunking can only grow the chunk count — and
+every added chunk re-pays `gamma*L`. Set the budget to 2-3x the best fixed chunk
+size, as both references recommend, so the count stays roughly neutral while the
+chunks even out.
 
 The relevant code is `ChunkSizePredictor` in
 `atom/model_engine/dynamic_chunking.py` and `Scheduler._dynamic_chunk_limit` in
@@ -135,68 +135,122 @@ The relevant code is `ChunkSizePredictor` in
 
 The four coefficients are **configuration-specific**. They change with the
 model, the PP layer split, `kv_cache_dtype`, `attn_prefill_chunk_size`,
-`max_model_len` and the attention backend. They must be measured, and measuring
-them on the wrong workload is the single most common way to make this feature
-useless.
+`max_model_len` and the attention backend, so they are measured on the running
+server. No single measurement can identify all four, so it happens in two parts.
 
-By default ATOM profiles at startup using dummy batches. That is cheap but
-biased: dummy runs use `batch_size=1` with no real prefix, never trigger MoE
-routing at scale, and sweep a grid that skips the realistic
-(large prefix, moderate chunk) corner. On Kimi-K2.5-MXFP4 the two are not close:
+**Startup: `b` and `c`, from a dummy chunk sweep.** ATOM's dummy forwards return
+early from attention — see the `is_dummy_run` guards in `attention_mla.py`,
+`deepseek_v4.py` and `attention_mha.py` — so a dummy chunk sweep measures exactly
+the MLP, MoE and projection cost and nothing else. That is a clean fit for the
+two terms that carry no attention, and worthless for the other two. On
+Kimi-K2.5-MXFP4 it is also the whole explanation for why early Dynamic CPP
+measurements came out flat to slightly negative, back when the same sweep was
+used to fit all four:
 
-| Coefficient | Dummy profile | Real requests | Ratio |
+| Coefficient | Dummy sweep | Real prefills | Ratio |
 | --- | --- | --- | --- |
-| `a` (attention area) | 8.2e-11 | 3.25e-07 | ~4000x low |
-| `b` (linear in chunk) | 6.44e-03 | 6.03e-03 | ~1x |
-| `gamma` (prefix rebuild) | 2.27e-05 | 5.39e-04 | ~24x low |
+| `a` (attention area) | 1.3e-10 | 3.25e-07 | ~2400x low |
+| `b` (linear in chunk) | 6.45e-03 | 6.03e-03 | ~1x |
+| `c` (per chunk) | 12.2 | 26.1 | ~2x low |
+| `gamma` (prefix rebuild) | 2.3e-05 | 5.39e-04 | ~24x low |
 
-The pattern is the tell: the dummy profile recovers the chunk-linear term
-correctly and collapses **both** prefix-dependent terms, because dummy batches
-have no prefix to pay for. The resulting model claims a chunk costs almost the
-same whether it follows 0 or 98304 cached tokens.
+Both attention terms collapse and the chunk-linear term is right, which is what
+"attention did not run" looks like. Fed that model the solver has nothing to
+solve: at a 98304-token prefix it asked for ~34000 tokens, above the 32768
+ceiling, so the chunk was clamped back to the base size and the chunk **count**
+never changed. It was never an algorithmic problem with equal-latency chunking.
 
-Fed that model, the solver has nothing to solve. At a 98304-token prefix it
-asks for ~34000 tokens, above the 32768 ceiling, so the chunk is clamped back to
-the base size — which is exactly the observed behaviour: 32768 became 32704, a
-0.2% change that leaves the chunk **count** identical, so no bubble is removed.
-The startup guard then (correctly, given its inputs) reports that shrinking is
-pointless and falls back to fixed chunks.
+**Serving: `a`, `gamma` and `c`, from a sweep over real prefills.** With `b`
+known, the residual of a measured prefill is linear in the three remaining
+unknowns:
 
-This is the whole reason early Dynamic CPP measurements on Kimi came out flat to
-slightly negative. It was never an algorithmic problem with equal-latency
-chunking; it was a calibration problem.
+```
+  measured - b*x = a * (2*L*x + x^2) + gamma * L + c
+```
 
-To calibrate on real traffic instead:
+`c` is refitted here rather than taken from startup because a dummy forward
+reaches `b` without ever setting attention up, so its constant is not the one a
+real chunk pays. Pinned, that error lands on `gamma` — the term the whole feature
+turns on.
 
-1. Run the serving configuration you actually care about with fixed chunks and
-   `--dynamic-chunking-calibration-logging`. Each PP stage then logs one
-   `DYNAMIC_CHUNKING_SAMPLE` line per prefill forward with the chunk size, the
-   cached prefix, the attention area and the measured GPU time. The timer is
-   placed after the PP receive and before the PP send, so it captures the
-   forward only, not P2P waiting.
-2. Do this at **two different fixed chunk sizes** (e.g. 32768 and 8192). A
-   single chunk size yields only `ISL/chunk` distinct shapes — 4 shapes for a
-   128K prompt at 32768, which cannot support a 4-coefficient fit.
-3. Fit with `scripts/dynamic_ck/fit_real_chunk_samples.py`. It groups repeated
-   shapes and fits the median, which keeps rare MoE/OS jitter out of the
-   coefficients.
-4. Feed the bottleneck stage's coefficients back via
-   `--dynamic-chunking-calibration` and drop the logging flag: it synchronizes
-   on every prefill forward, which perturbs pipeline overlap enough to change
-   the result it is being used to measure.
+Telling the three apart needs chunk sizes that vary **independently of the cached
+prefix**, and serving traffic never supplies that on its own:
 
-On Kimi-K2.5-MXFP4 (prefill PP4 x TP1, `fp8` KV, 128K prompts) this produced,
-for the slowest stage:
+- At one fixed chunk size, `2*L*x + x^2` is itself affine in `L`, so the three
+  terms are not merely ill-conditioned but unidentifiable. Fitting anyway
+  recovered a `gamma` around 60% high on Kimi-K2.5-MXFP4, which cost the feature
+  its entire margin over a tuned fixed chunk.
+- Samples taken off a solved ladder are worse, not better: there the chunk is a
+  decreasing function of the prefix by construction. Freeing `c` against ladder
+  samples sent it to 95ms against a true 20ms.
+
+So until a model exists, `Scheduler._calibration_sweep_chunk` alternates requests
+between `--max-num-batched-tokens` and a quarter of it
+(`CALIBRATION_SWEEP_RATIO`), each base carried across a whole prompt. Two bases
+that far apart put the solved ladder within about 5% of the one the true
+coefficients give and keep it there under sampling noise; at 2x apart the same
+sweep leaves a tail of fits five times worse. Four requests are enough, which
+usually means the model is installed before a benchmark's warmup ends.
+
+`ChunkLatencyCalibrator` in `atom/model_engine/dynamic_chunking.py` owns the fit;
+the mechanics are:
+
+- **Sampling** is on whenever the feature is. Each worker times its own forwards
+  between the PP receive and the PP send, so a sample measures the chunk rather
+  than how well the stage overlapped with its neighbours. The events are read
+  only once `query()` reports them complete, one or two forwards later, so
+  nothing on the serving path ever synchronizes.
+- **Only single-sequence prefills** are sampled. A batch carrying more than one
+  sequence spreads its time over shapes the model cannot separate. This costs
+  nothing, because the solver only acts on a request that is the pipeline's sole
+  prefill anyway.
+- **The process's first request is discarded** (`DISCARD_FIRST_CHUNK_REQUESTS`).
+  Its forwards pay kernel autotuning and lazy allocator growth, running up to 60x
+  slower than the same shape does later, and by a different factor per chunk size
+  — so keeping them hands the sweep an offset between its two bases that the
+  fitted constant absorbs and `gamma` pays for. Counting in requests rather than
+  forwards is the point: a fixed number of forwards covers most of a large-chunk
+  request and a fraction of a small-chunk one.
+- **Timings are grouped by `(chunk, prefix)` shape and reduced by median**, so a
+  straggler forward moves the fit far less than it moves one sample.
+- **The fit runs once**, when the samples reach `MIN_CALIBRATION_SHAPES` shapes
+  spanning `MIN_CALIBRATION_PREFIXES` prefixes and `MIN_CALIBRATION_CHUNK_SIZES`
+  chunk sizes. The sweep that conditioned it ends with it, so sampling stops
+  there too — every later sample would come off the ladder, where the terms
+  cannot be separated. A fit that raises is retried once there is a shape the
+  last attempt did not see.
+- **The PP head's EngineCore collects the result** every
+  `DYNAMIC_CHUNKING_POLL_STEPS` steps and installs it in the scheduler. A fit is
+  rejected if its residual exceeds `MAX_CALIBRATION_RESIDUAL_FRACTION` of the
+  mean sampled time, if it measured no attention growth, or if it predicts no
+  useful shrink one full chunk into a prompt. A rejected model still ends the
+  sweep, and chunking stays fixed at the configured budget.
+
+The model is fitted on the PP head, because that is the stage whose EngineCore
+schedules. Measured across a PP4 x TP1 prefill worker the per-stage fits sit
+within 4% of each other (equal-latency budget 550ms on stage 0 against 572ms on
+the slowest stage), so this costs a few percent of accuracy and no collectives.
+
+On Kimi-K2.5-MXFP4 (prefill PP4 x TP1, `fp8` KV, 128K prompts) the coefficients
+this converges to are
 
 ```
   a = 3.25e-07   b = 6.03e-03   c = 26.1   gamma = 5.39e-04
-  20 shapes, RMS error 16ms on a 695ms mean (2.3%), condition number 25
 ```
 
-All four stages fit to within a few percent of each other, and an independent
-calibration of a standalone (non-disaggregated) PP4 server landed on
-`a = 3.21e-07, b = 6.25e-03, gamma = 6.18e-04` — close enough to treat these as
-a property of the model and hardware rather than an artifact of the fit.
+and an offline fit of the same model on a standalone (non-disaggregated) PP4
+server landed on `a = 3.21e-07, b = 6.25e-03, gamma = 6.18e-04` — close enough to
+treat these as a property of the model and hardware rather than an artifact of
+the fit. Feeding the sweep a deliberately biased `b` (7% high) moves the solved
+chunk sizes by under 1%, because an error that is constant in the prefix lands in
+the area term rather than in `gamma`. `b` is the only term the fit still inherits,
+which is why that is the only bias it has to tolerate.
+
+Startup profiling reads a different `c` on every stage (35.5ms on stage 0 against
+13.7ms on stage 3 for this configuration), and the head is the stage with the
+largest one. Refitting `c` is what makes that stop mattering: with it pinned, the
+per-stage fits disagree on `gamma` by a factor of 1.7, and with it free they land
+within 15% of each other.
 
 ## Measured results
 
@@ -283,10 +337,11 @@ Two things about this are still open. First, the loss does not scale with how
 often the solver actually fires: cutting solved decisions by roughly 90% at
 `concurrency=16` left the regression essentially unchanged, which looks like a
 threshold effect rather than a per-chunk cost — MoE kernel bucketing by token
-count is the leading suspect and has not been confirmed. Second, none of these
-runs used `--dynamic-chunking-base-size`, so the "keep the chunk count neutral"
-argument above is reasoned from the cost model and from the reference
-implementations, not measured here.
+count is the leading suspect and has not been confirmed. Second, every run
+compared fixed and dynamic at the *same* `--max-num-batched-tokens`, so the
+"raise the budget to 2-3x and keep the chunk count neutral" argument above is
+reasoned from the cost model and from the reference implementations, not measured
+here.
 
 Practically: **enable Dynamic CPP only where prefill concurrency is reliably 1.**
 The trailing-window guard narrows the exposure and encodes the right intent, but
@@ -329,30 +384,29 @@ momentary lull still executes alongside whatever arrives behind it. The intent i
 right, but the measurements above show the regression is not what a threshold
 fixes. Leave the feature off where prefill concurrency is above 1.
 
-**Coefficients do not transfer between configurations.** The prefill server in
-a disaggregated deployment runs with a different `attn_prefill_chunk_size`,
-`max_model_len` and `max_num_seqs` than a standalone server, and those change
-the fit. Re-calibrate per serving configuration.
-
 **A model fitted without a separate `gamma` produces wrong chunk sizes.** Least
 squares folds the prefix growth into `a` and inflates it several-fold. The
 solver charges `gamma*L` against the equal-latency budget, so a fit that hides
 it in the area term both over-shrinks and mis-shapes the sequence.
 
-**Startup profiling should be treated as a fallback, not a calibration.** It is
-good enough to detect "this configuration has no prefix growth worth acting on"
-and to keep the feature from doing harm. It is not accurate enough to size
-chunks well. If you want the measured gains above, calibrate on real requests.
+**The first requests of a run are the calibration sweep.** They get fixed chunks,
+alternating between the budget and a quarter of it, so their TTFT is whatever
+fixed chunking at those sizes gives — not the dynamic result. Four requests
+usually suffice, which fits inside a benchmark's warmup, but a short measured run
+with no warmup will average the sweep into its result.
 
-**Check that the feature actually engaged.** The prefill log states which model
-is in use — `dynamic chunking using supplied calibration` for
-`--dynamic-chunking-calibration`, `dynamic chunking selected PP stage N fit` for
-profiled ones, or `disabling dynamic chunking because ...` when it fell back. A
-run that silently fell back looks like "the feature does nothing".
+**Check that the feature actually engaged.** The prefill log states where the
+model is in its lifecycle — `dynamic chunking chunk overhead b=... c=...` at
+startup, `dynamic chunking still calibrating: ... N chunk sizes` while the sweep
+runs, `dynamic chunking calibrated from N real prefill shapes over M chunk sizes`
+once it fits, `Dynamic chunking latency model installed` when the scheduler adopts
+it, and either `disabling dynamic chunking because ...` or `Ignoring dynamic
+chunking calibration ...` when it declined to.
 
-**`--dynamic-chunking-min-chunk-size` must be below the base size.** A floor at
-or above the base leaves the solver nothing to return, so chunking stays fixed.
-The default `4096` assumes a base in the tens of thousands of tokens.
+**`--dynamic-chunking-min-chunk-size` must be below `--max-num-batched-tokens`.**
+A floor at or above the budget leaves the solver nothing to return, so chunking
+stays fixed. The default `4096` assumes a budget in the tens of thousands of
+tokens.
 
 ## Reproducing
 
@@ -361,8 +415,10 @@ The harness lives outside the repo, under `scripts/dynamic_ck/`:
 | Script | Purpose |
 | --- | --- |
 | `run_kimi_pd_config.sh` | One disaggregated PD configuration (prefill PP4 x TP1 + mooncake + decode TP4), fixed or dynamic. |
-| `run_kimi_pd_calibrated_ab.sh` | Two fixed-chunk runs, fit the model from their real samples, then run dynamic with the result. |
 | `run_kimi_pd_fixed_sweep.sh` | Add more fixed chunk sizes to an existing run root, to locate the best fixed baseline. |
 | `run_kimi_pd_conc_sweep.sh` | Same A/B at higher concurrency, and across guard thresholds including a never-solve control. |
-| `fit_real_chunk_samples.py` | Fit `a,b,c,gamma` per PP stage from `DYNAMIC_CHUNKING_SAMPLE` logs. |
 | `summarize_pd_ab.py` | Compare runs and recover each run's actual chunk sequence from the scheduler log. |
+
+`fit_real_chunk_samples.py` and `run_kimi_pd_calibrated_ab.sh` fitted the model
+offline from per-forward log lines, which the server now does itself. They are
+kept as the reference the runtime fit was validated against.
