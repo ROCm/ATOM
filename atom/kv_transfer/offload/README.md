@@ -897,10 +897,11 @@ python -m atom.entrypoints.openai_server \
   --kv-transfer-config '{"kv_connector":"lmcache_offload","kv_role":"offload"}'
 ```
 
-For DSV4 version 1, use BF16 or FP8 KV/indexer layouts. FP4 indexer scale
-regions are not mapped and startup rejects that layout. Pipeline parallelism
-greater than one is also rejected; TP stores one PAGE shard and one AOS1
-sidecar per rank.
+Standalone DSV4 LMCache offload supports both FP8 and FP4 indexer layouts.
+FP4 PAGE objects include the packed data and separate e8m0 scale regions for
+every CSA layer. FP4 remains unsupported with PD connectors such as Mooncake
+or Moriio. Pipeline parallelism greater than one is also rejected; TP stores
+one PAGE shard and one AOS1 sidecar per rank.
 
 ### NVMe-only standalone example
 
@@ -1045,8 +1046,8 @@ a durable backend flush. PAGE transfer timing remains opt-in with
 Common diagnostics:
 
 - **No PAGE+SLOT registration line:** the model did not expose DSV4
-  `block_regions`, or startup rejected incomplete SLOT geometry, FP4 indexer
-  scale layout, PP, or an invalid staging count. Treat startup exceptions as
+  `block_regions`, or startup rejected incomplete PAGE/SLOT geometry, PP, or
+  an invalid staging count. Treat startup exceptions as
   configuration errors; do not force PAGE-only stateful operation.
 - **`SLOT sidecar load missing`:** PAGE may exist, but the boundary is not
   restorable. Expected causes include a failed earlier sidecar save and
@@ -1125,8 +1126,8 @@ ATOM baseline and the two vLLM columns are from separate runs and serve as
 reference (see caveat below):
 
 These measurements predate the DSV4 PAGE+AOS1 path and validate the dense
-raw-byte connector only. `MXFP4` here describes model weights; it is not evidence
-for the unsupported DSV4 FP4 indexer layout.
+raw-byte connector only. `MXFP4` here describes model weights; it is not
+performance evidence for the DSV4 FP4 indexer offload path.
 
 | metric | vLLM none | ATOM baseline | vLLM LMCache | ATOM offload (chunk2) |
 |--------|----------:|--------------:|-------------:|----------------------:|
@@ -1244,10 +1245,10 @@ python3 multi-round-qa.py \
 - **Stateful load with a nonzero HBM floor is skipped.** Version 1 does not merge
   a partial native HBM checkpoint with a later AOS1 snapshot. It recomputes for
   correctness even when LMCache has additional PAGE chunks.
-- **DSV4 FP4 indexer is unsupported.** Its scale region is not represented in
-  PAGE geometry, so registration fails before engine start. BF16 and FP8 are
-  supported. This restriction is about the DSV4 indexer layout, not merely model
-  weight quantization.
+- **DSV4 FP4 indexer is standalone-offload only.** LMCache PAGE geometry
+  includes both packed data and e8m0 scale regions. PD transfer through
+  Mooncake/Moriio still fails at startup until its producer/consumer mapping is
+  extended for the separate scale pool.
 - **Pipeline parallelism is unsupported for DSV4 PAGE+SLOT.** TP is supported
   with one rank-local PAGE shard and AOS1 object per rank.
 - **Sidecar discovery is session-local.** A scheduler restart does not rebuild
