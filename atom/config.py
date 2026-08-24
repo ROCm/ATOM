@@ -1442,13 +1442,6 @@ def qrep_unsupported_reason(
     Kept a module-level pure function so it is unit-testable: the alternative,
     exercising it through ``Config.__post_init__``, needs a real model directory
     and an HF config. ``Config.__post_init__`` is its only production caller.
-
-    ⚠️ Gating keys off the DCP size ONLY -- never off the KV-cache interleave
-    granularity. This check once lived inside ``if dcp_config.interleave_size >
-    1``, which silently disabled QREP for the default ``interleave_size=1``,
-    i.e. in every ordinary configuration, while logging that dcp was <= 1. Now
-    that QREP defaults to on, that failure mode would be invisible; the truth
-    table in ``tests/test_dcp_config.py`` pins it.
     """
     if dcp_size <= 1:
         # No DCP group means there is no AllGather Q to remove.

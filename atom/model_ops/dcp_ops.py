@@ -495,6 +495,23 @@ def cp_lse_a2a(cp_attn_out, cp_attn_lse, cp_group, return_lse: bool = False):
     return (out, out_lse) if return_lse else out
 
 
+def dcp_lse_merge(cp_attn_out, cp_attn_lse, cp_group, backend="a2a", ctx=None):
+    """Reconstruct the global softmax from the per-rank partials.
+
+    Dispatches to one of the two backends above. Both compute the same weighted
+    sum over KV shards and leave this rank owning the same head slice; they
+    differ only in how many collectives it takes (see the A2A section above for
+    why one all-to-all can replace AllGather-LSE + ReduceScatter). Equivalent
+    math, not bitwise identical.
+
+    ``ctx`` is the Triton context the AG+RS backend caches its launches in; the
+    a2a backend does not use one.
+    """
+    if backend == "a2a":
+        return cp_lse_a2a(cp_attn_out, cp_attn_lse, cp_group)
+    return cp_lse_ag_out_rs(cp_attn_out, cp_attn_lse, cp_group, ctx=ctx)
+
+
 def dcp_gather_compressed_kv(
     kv_cache: torch.Tensor, slot_ids: torch.Tensor
 ) -> torch.Tensor:
