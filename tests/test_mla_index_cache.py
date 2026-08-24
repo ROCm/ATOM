@@ -1,27 +1,72 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-"""AITER-backed builder tests for compact MLA index-cache allocation.
+"""Compact MLA index-cache tests.
 
-Skipped on the non-GPU Pre Checkin gate (no AITER). Pure layout helpers are
-covered by ``test_mla_index_cache_layout.py``.
+CPU layout helpers live in ``mla_cache_layout`` so Pre Checkin can exercise
+IndexShare compaction without AITER. Builder / ModelRunner cases skip when
+the AITER MLA backend is unavailable.
 """
 
 from types import SimpleNamespace
 
 import pytest
 
-pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
-
-try:
-    from atom.model_ops.attentions import aiter_mla
-    from atom.model_ops.attentions.aiter_mla import AiterMLAMetadataBuilder
-except (ImportError, RuntimeError) as exc:
-    pytest.skip(f"aiter MLA backend unavailable: {exc}", allow_module_level=True)
-
 from atom.model_ops.attentions.mla_cache_layout import (
     _aligned_index_cache_dim,
+    _global_index_cache_layer_ids,
     _mla_kv_cache_dim,
 )
+from atom.models.utils import get_pp_indices
+
+
+def test_global_index_cache_layout_excludes_shared_and_keeps_mtp():
+    assert _global_index_cache_layer_ids(
+        ("full", "shared", "shared", "full"), 4, 2
+    ) == (0, 3, 4, 5)
+
+
+def test_global_index_cache_layout_without_schedule_is_unchanged():
+    assert _global_index_cache_layer_ids(None, 4, 1) == (0, 1, 2, 3, 4)
+
+
+def test_global_index_cache_layout_includes_real_stack_draft_layers():
+    """Standalone DSpark MLA drafts share the target pool as N extra rows."""
+    assert _global_index_cache_layer_ids(None, 61, 5) == tuple(range(61 + 5))
+
+
+def test_cache_dimensions_are_derived_and_index_rows_are_aligned():
+    hf_config = SimpleNamespace(kv_lora_rank=480, qk_rope_head_dim=32)
+
+    assert _mla_kv_cache_dim(hf_config) == 512
+    assert _aligned_index_cache_dim(111) == 128
+    assert _aligned_index_cache_dim(124) == 128
+    assert _aligned_index_cache_dim(125) == 144
+
+
+def test_local_total_layers_adds_mtp_only_on_drafter_stage():
+    """Mirror ModelRunner._get_local_total_num_layers without importing it.
+
+    ModelRunner pulls AITER at import time; the PP/MTP accounting itself is
+    just get_pp_indices + optional draft depth on the last stage.
+    """
+    num_hidden = 6
+    num_draft = 2
+
+    start, end = get_pp_indices(num_hidden, 0, 2)
+    assert end - start == 3
+
+    start, end = get_pp_indices(num_hidden, 1, 2)
+    assert (end - start) + num_draft == 5
+
+
+def _require_aiter_mla():
+    try:
+        import aiter  # noqa: F401
+        from atom.model_ops.attentions import aiter_mla
+        from atom.model_ops.attentions.aiter_mla import AiterMLAMetadataBuilder
+    except (ImportError, RuntimeError) as exc:
+        pytest.skip(f"aiter MLA backend unavailable: {exc}")
+    return aiter_mla, AiterMLAMetadataBuilder
 
 
 def _mock_pp(monkeypatch, rank: int, world_size: int) -> None:
@@ -35,6 +80,7 @@ def _mock_pp(monkeypatch, rank: int, world_size: int) -> None:
 
 
 def _builder(
+    AiterMLAMetadataBuilder,
     indexer_types,
     total_local_layers: int,
     *,
@@ -73,7 +119,10 @@ def _builder(
     return builder, runner
 
 
-def test_local_total_layers_adds_mtp_only_on_drafter_stage(monkeypatch):
+def test_model_runner_local_total_layers_adds_mtp_only_on_drafter_stage(
+    monkeypatch,
+):
+    _require_aiter_mla()
     from atom.model_engine import model_runner
     from atom.model_engine.model_runner import ModelRunner
 
@@ -103,6 +152,7 @@ def test_local_total_layers_adds_mtp_only_on_drafter_stage(monkeypatch):
 
 
 def test_num_draft_kv_layers_counts_integrated_dspark_stages():
+    _require_aiter_mla()
     from atom.model_engine.model_runner import ModelRunner
 
     runner = object.__new__(ModelRunner)
@@ -123,7 +173,9 @@ def test_num_draft_kv_layers_counts_integrated_dspark_stages():
 
 
 def test_pp_index_cache_layout_uses_global_layer_ids(monkeypatch):
+    _, AiterMLAMetadataBuilder = _require_aiter_mla()
     non_draft_builder, _ = _builder(
+        AiterMLAMetadataBuilder,
         ("full", "shared", "shared", "full", "shared", "full"),
         total_local_layers=3,
     )
@@ -134,6 +186,7 @@ def test_pp_index_cache_layout_uses_global_layer_ids(monkeypatch):
     assert local_layer_ids == (0,)
 
     draft_builder, _ = _builder(
+        AiterMLAMetadataBuilder,
         ("full", "shared", "shared", "full", "shared", "full"),
         total_local_layers=4,
     )
@@ -145,7 +198,9 @@ def test_pp_index_cache_layout_uses_global_layer_ids(monkeypatch):
 
 
 def test_sub_pool_entry_bytes_uses_compact_index_layer_count(monkeypatch):
+    aiter_mla, AiterMLAMetadataBuilder = _require_aiter_mla()
     builder, _ = _builder(
+        AiterMLAMetadataBuilder,
         ("full", "shared", "shared", "full", "shared", "full"),
         total_local_layers=4,
     )
@@ -166,7 +221,9 @@ def test_sub_pool_entry_bytes_uses_compact_index_layer_count(monkeypatch):
 
 
 def test_sub_pool_entry_bytes_support_nonstandard_dimensions(monkeypatch):
+    aiter_mla, AiterMLAMetadataBuilder = _require_aiter_mla()
     builder, _ = _builder(
+        AiterMLAMetadataBuilder,
         ("full", "shared", "shared", "full", "shared", "full"),
         total_local_layers=4,
         kv_lora_rank=480,
@@ -185,11 +242,13 @@ def test_sub_pool_entry_bytes_support_nonstandard_dimensions(monkeypatch):
 
 
 def test_compact_layout_uses_fewer_bytes_than_full_layout(monkeypatch):
+    aiter_mla, AiterMLAMetadataBuilder = _require_aiter_mla()
     compact, _ = _builder(
+        AiterMLAMetadataBuilder,
         ("full", "shared", "shared", "full", "shared", "full"),
         total_local_layers=4,
     )
-    full, _ = _builder(None, total_local_layers=4)
+    full, _ = _builder(AiterMLAMetadataBuilder, None, total_local_layers=4)
     _mock_pp(monkeypatch, rank=1, world_size=2)
     fake_fp8 = SimpleNamespace(itemsize=1)
     monkeypatch.setattr(
@@ -204,7 +263,9 @@ def test_compact_layout_uses_fewer_bytes_than_full_layout(monkeypatch):
 
 
 def test_allocate_index_cache_uses_compact_shape_and_map(monkeypatch):
+    aiter_mla, AiterMLAMetadataBuilder = _require_aiter_mla()
     builder, runner = _builder(
+        AiterMLAMetadataBuilder,
         ("full", "shared", "shared", "full", "shared", "full"),
         total_local_layers=4,
     )
@@ -281,6 +342,7 @@ class _FakeTransferStack:
 
 
 def test_build_kv_cache_tensor_binds_compact_index_slice():
+    _, AiterMLAMetadataBuilder = _require_aiter_mla()
     builder = object.__new__(AiterMLAMetadataBuilder)
     runner = SimpleNamespace(
         kv_cache=_FakeCache("kv"),
@@ -314,6 +376,7 @@ def test_build_kv_cache_tensor_binds_compact_index_slice():
 
 
 def test_build_shared_layer_keeps_main_kv_without_index_slice():
+    _, AiterMLAMetadataBuilder = _require_aiter_mla()
     builder = object.__new__(AiterMLAMetadataBuilder)
     runner = SimpleNamespace(
         kv_cache=_FakeCache("kv"),
@@ -343,7 +406,9 @@ def test_build_shared_layer_keeps_main_kv_without_index_slice():
 
 
 def test_transfer_regions_use_explicit_compact_consumer_map(monkeypatch):
+    _, AiterMLAMetadataBuilder = _require_aiter_mla()
     builder, runner = _builder(
+        AiterMLAMetadataBuilder,
         ("full", "shared", "shared", "full", "shared", "full"),
         total_local_layers=4,
     )
