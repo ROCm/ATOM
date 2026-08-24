@@ -96,6 +96,7 @@ combine knob as a quality/throughput tradeoff.
 | **ATOM_ENABLE_DS_QKNORM_FUSION** | bool | 1 (true) | If set to `1`, use the fused Q/K RMSNorm path (`fused_qk_rmsnorm`) in the DeepSeek MLA attention module when Q-LoRA is enabled and QK norm+quant fusion is not used. If set to `0`, apply separate RMSNorm for the Q and KV branches instead. |
 | **ATOM_ENABLE_DS_QKNORM_QUANT_FUSION** | bool | 1 (true) | If set to `1`, fuse QK norm with quantization in MLA attention module. |
 | **ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD** | int | 1024 | Upper bound on MoE token count (`num_tokens` in the MoE forward) for using the dual-stream path: shared experts on a secondary CUDA stream while routed experts run on the default stream. If `num_tokens` exceeds this value, that forward uses single-stream MoE instead. Set to `0` to disable dual-stream setup entirely (no alt stream, no `maybe_dual_stream_forward` registration). |
+| **ATOM_DUAL_STREAM_PIECEWISE** | bool | 0 | Opt-in: allow a PIECEWISE-captured graph piece to hold the MoE dual-stream fork/join (shared experts on `alt_stream` overlapping routed experts). Capture is not the obstacle — `set_forward_context` runs inside `graph_capture()`, so the main stream the fork waits on is the stream capture runs on — and vLLM and SGLang both keep this overlap on inside piecewise graphs (SGLang runs dual-stream *only* inside a graph). Measured on V4-Pro-DSpark under `AF_PIECEWISE`: the fork survives capture, hides 77.5% of shared-expert time, and leaves GSM8K and MTP acceptance unmoved. Off by default only because no throughput win has been demonstrated, and because each replayed piece then carries its own driver-allocated stream (368 vs 2 distinct streams on a tp8 rank trace). The dispatcher is shared, so this moves V2/V3.2/K3 as well. Eager (`NONE`) and whole-model `FULL` are unaffected. |
 
 ### DSpark block sampling
 
@@ -156,6 +157,21 @@ land. See `atom/model_ops/v4_backend_gate.py` for the selector.
 | **ATOM_PROFILER_MORE** | bool | 0 (false) | When `ATOM_TORCH_PROFILER_DIR` is set and this is `1`, enables detailed profiling: `record_shapes`, `with_stack`, and `profile_memory`. Applies to both the run-phase profiler and the CUDA-graph capture profiler. |
 | **ATOM_ENABLE_DETAILED_ANNOTATION** | bool | 0 (false) | When profiling is active, appends detailed attention aggregates to the `prefill[]`/`decode[]` trace labels: `sqsq` (Σ N_Q²), `sqsk` (Σ N_Q·N_KV), and `sk` (Σ N_KV), where N_Q is the scheduled query tokens and N_KV the KV length per request. Used to estimate attention FLOPs for downstream roofline analysis. |
 | **ATOM_LOG_MORE** | bool | 0 (false) | If set to `1`, use verbose logging format (includes process name, PID, path, line number, function name). |
+
+## Garbage collection
+
+CPython's generation-2 pass is stop-the-world and walks every tracked
+container, so its cost tracks the live heap — which in a serving process is
+almost entirely startup state (model, compiled graph, tokenizer, KV block
+pool) that is never garbage. Measured on DeepSeek-V4-Flash-DSpark tp1: 242.8 ms
+in the EngineCore, up to 596 ms in a ModelRunner worker, while reclaiming zero
+objects once startup was done. See `atom/utils/gc_utils.py`.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_GC_FREEZE** | bool | 1 (true) | Move the startup heap into CPython's permanent generation once warmup is done, so collections stop scanning it. Applied in every process that outlives startup — the API server, the atomesh frontend, every EngineCore and every ModelRunner worker; undone on engine shutdown so an in-process teardown does not leak. Set `0` to keep the pre-freeze behaviour. |
+| **ATOM_GC_DEBUG** | bool | 0 (false) | Log every collection: generation, duration, objects reclaimed, objects tracked. Costly — counting the tracked set on every pass added ~90s of startup on a V4-Flash tp1 — but the only way to see these pauses, since a stall in the EngineCore idles the workers with no event in their torch trace. |
+| **ATOM_GC_THRESHOLD** | csv int | "" (= CPython default 700,10,10) | `t0,t1,t2` for `gc.set_threshold()`. Thresholds are per-interpreter, so each process reads it independently. A fallback for `ATOM_GC_FREEZE=0`: this spaces collections out, freezing removes what one costs. |
 
 ### Debug dump (`atom.utils.debug_helper`)
 
