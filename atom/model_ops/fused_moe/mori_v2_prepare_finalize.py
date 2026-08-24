@@ -193,6 +193,11 @@ def _cco_per_rank_vmm(
 # are config-wide, so the first layer's are the model's.
 _MEGA_TRANSPORTS: dict = {}
 
+# bf16 | fp8 | fp4, and it must MATCH the expert GEMM's A operand -- on gfx1250
+# that is fp4 unless AITER_FORCE_A8W4=1. A mismatch is a row-width error, not a
+# slow path. Read once: init_mega_transport runs per MoE layer (61x for V4-Pro).
+_MEGA_WIRE = os.environ.get("MEGA_WIRE", "bf16")
+
 
 def init_mega_transport(
     *,
@@ -235,6 +240,8 @@ def init_mega_transport(
         hidden_pad,
         intermediate_pad,
         swiglu_limit,
+        # Keyed on: the wire sets the payload width and whether out_scales exists.
+        _MEGA_WIRE,
     )
     cached = _MEGA_TRANSPORTS.get(key)
     if cached is not None:
@@ -266,13 +273,16 @@ def init_mega_transport(
         swiglu_limit=swiglu_limit,
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
+        # Passed, not left to aiter's own read of $MEGA_WIRE, so the key and the
+        # transport cannot drift.
+        dispatch_wire=_MEGA_WIRE,
     )
     comm.barrier()
     _MEGA_TRANSPORTS[key] = mega
     logger.info(
         "[MORI-V2] Created MegaMoE: ep_rank=%d ep_size=%d hidden=%d inter=%d "
         "experts=%d topk=%d M=%d act=%s gate=%s quant=%s pad=(%d,%d) "
-        "swiglu_limit=%s dispatch=%s",
+        "swiglu_limit=%s dispatch=%s wire=%s force_a8w4=%s",
         ep_rank,
         ep_size,
         hidden_dim,
@@ -287,6 +297,9 @@ def init_mega_transport(
         intermediate_pad,
         swiglu_limit,
         mega._config.dispatch_backend,
+        mega._config.dispatch_wire,
+        # The other half of the pair: logged together so a mismatch is readable.
+        os.environ.get("AITER_FORCE_A8W4", "0"),
     )
     return mega
 
