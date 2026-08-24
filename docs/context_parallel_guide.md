@@ -551,6 +551,35 @@ GSM8K 5-shot set. Both topologies score **flexible-extract 0.9689 /
 strict-match 0.9666**. The TP8/DCP8 run also completes a 32-concurrent graph
 smoke with no traceback, HIP error, or engine failure.
 
+### Experimental GLM-5.2 replicated index cache
+
+Set `ATOM_DCP_REPLICATE_INDEX_CACHE=1` to keep the GLM-5.2 DSA index cache
+complete on every DCP rank. The main MLA KV cache remains round-robin sharded.
+Only the 21 `"full"` IndexShare layers allocate index rows; `"shared"` layers
+reuse the preceding full layer's top-k and persistent work plan.
+
+Each scheduler block's index page expands from `block_size` rank-local tokens
+to `block_size × dcp` global tokens. Every rank writes each new index K to that
+expanded page. Prefill then gathers the full K locally, and decode scores the
+global context and runs a single stable global top-k locally. Both the prefill
+index-K AllGather and decode candidate pack/AllGather/second-top-k are skipped.
+The existing ownership filter still partitions that global top-k into compact
+rank-local indices for the DCP-sharded MLA KV cache.
+
+The switch is off by default and the initial implementation is deliberately
+native-only: `glm_moe_dsa`, DCP > 1, q_len=1 decode, MLA page size 1, and no
+PCP or PP. MTP/speculative decode, LMCache/KV transfer/PD, and RapidServe
+disaggregation fail fast at startup. GPU prefix caching and CUDA graph replay
+use the same expanded-page lifetime and are supported.
+
+Replication trades index communication for cache capacity. For GLM-5.2 with
+78 MLA layers, 21 full index layers, block size 16, fp8 index width 144, and
+DCP8, index bytes per scheduler block increase from
+`78 × 16 × 144 = 179,712` to `21 × 16 × 8 × 144 = 387,072`.
+Including the unchanged MLA KV, total bytes per block rise from 898,560 to
+1,105,920 (+23.1%), so a fixed KV memory budget holds about 18.8% fewer blocks.
+At 2,048 global tokens this is about 3.16 MiB additional index storage per rank.
+
 **Kimi-K3 validated** (ATOM server, 8×MI355 gfx950, `-tp 8 -dcp 8`, fp8 KV, full 1319
 GSM8K 5-shot at 64 concurrency): **flexible-extract 0.9553 / strict-match
 0.9553**, inside the [Kimi-K3 recipe](../recipes/Kimi-K3.md)'s
