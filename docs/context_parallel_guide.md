@@ -551,6 +551,21 @@ GSM8K 5-shot set. Both topologies score **flexible-extract 0.9689 /
 strict-match 0.9666**. The TP8/DCP8 run also completes a 32-concurrent graph
 smoke with no traceback, HIP error, or engine failure.
 
+### DCP output-merge layout
+
+The LSE-corrected partial output is written directly in rank-major
+`[dcp × batch, local_heads, value_dim]` order. A dim-0 ReduceScatter therefore
+returns contiguous `[batch, local_heads, value_dim]` output without the two
+full-tensor `movedim(...).contiguous()` copies previously placed before and
+after the collective. This production path also skips materializing global LSE,
+which no caller consumed.
+
+On one MI355, the correction/layout stage at GLM-5.2's `H=64, D=512, DCP8`
+measured 13.0 us versus 15.5 us for the previous correction plus pre-RS copy at
+batch 1, 13.2 us versus 164.4 us at batch 16, and 417.2 us versus 866.1 us at
+8,192 rows. The numerical merge, empty-rank NaN scrub, CUDA graph path, and
+ReduceScatter result layout are unchanged.
+
 ### Experimental GLM-5.2 replicated index cache
 
 Set `ATOM_DCP_REPLICATE_INDEX_CACHE=1` to keep the GLM-5.2 DSA index cache
@@ -579,6 +594,48 @@ DCP8, index bytes per scheduler block increase from
 Including the unchanged MLA KV, total bytes per block rise from 898,560 to
 1,105,920 (+23.1%), so a fixed KV memory budget holds about 18.8% fewer blocks.
 At 2,048 global tokens this is about 3.16 MiB additional index storage per rank.
+
+**Validation** (TP8+DCP8, GLM-5.2-MXFP4, fp8 KV, no MTP): CUDA graph capture,
+short decode, an 8,192-input/128-output run at concurrency 16, and the full
+1,319-sample GSM8K 5-shot set all complete. Using the same lm-eval chat adapter,
+replicated index scores **0.9651 / 0.9621** (flexible/strict) versus the sharded
+index run's **0.9697 / 0.9697**; the 0.46/0.76-point difference is about
+0.7/1.1 combined standard errors and is not statistically significant. On the
+8K/128 benchmark,
+output throughput improves from 172.34 to 179.77 token/s (+4.3%), mean TPOT
+drops from 53.14 to 49.30 ms (-7.2%), and median ITL drops from 23.15 to
+19.43 ms (-16.1%). The fixed KV budget holds about 18.8% fewer blocks as
+described above.
+
+### LMCache compatibility
+
+The default sharded-index DCP layout is compatible with ATOM's
+`lmcache_offload` byte codec. LMCache stores each rank's local MLA/index shard;
+the connector uses `block_size × dcp` as the scheduler-visible virtual block,
+requires chunks to contain whole virtual blocks, includes DCP size in the PAGE
+namespace, and transfers the DSA index cache alongside MLA KV. Persistent sparse
+metadata is rebuilt after load and is not part of the stored byte payload.
+
+The replicated-index layout is compatible with the standalone
+`lmcache_offload` connector. Its opaque block payload contains all 78 local MLA
+KV shards plus the 21 compact, DCP-expanded full-index rows. PAGE namespace
+version 3 includes both the replicated-layout flag and the exact
+`indexer_types` schedule, so these objects cannot collide with old sharded
+objects or a different IndexShare mapping. Full-prompt hits are floored to a
+complete LMCache chunk after reserving the final token for recomputation;
+otherwise an 8,192-token hit becomes an invalid 8,191-token load and falls back
+to a full prefill.
+
+Only standalone `{"kv_connector":"lmcache_offload"}` is enabled in this
+experimental mode. PD connectors and a `multi` topology containing LMCache plus
+PD still fail fast because their transfer protocols have not been adapted to
+the expanded index pages.
+
+**Validated** (TP8+DCP8, 8,192-token prompt, fp8 KV): all eight ranks stored
+67.5 MiB each and subsequently restored 65.4 MiB/7,936 tokens with
+`status=ok`; TTFT fell from 5.87 s cold to 0.46 s with the remaining 256-token
+prefill. A repeated 20-sample GSM8K smoke completed 160/160 worker loads without
+fallback, traceback, or HIP error and kept flexible-extract accuracy at 0.95.
 
 **Kimi-K3 validated** (ATOM server, 8×MI355 gfx950, `-tp 8 -dcp 8`, fp8 KV, full 1319
 GSM8K 5-shot at 64 concurrency): **flexible-extract 0.9553 / strict-match

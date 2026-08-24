@@ -157,6 +157,53 @@ def cdiv(a, b):
     return (a + b - 1) // b
 
 
+def _uses_standalone_lmcache_offload(config) -> bool:
+    """Whether the configured transfer path is the raw-byte LMCache connector."""
+    transfer_config = getattr(config, "kv_transfer_config", None)
+    if not isinstance(transfer_config, dict):
+        return False
+    connector = transfer_config.get("kv_connector")
+    if not isinstance(connector, str):
+        return False
+    normalized = connector.strip().lower()
+    return normalized in {
+        "lmcache_offload",
+        "lmcacheoffloadconnector",
+        "lmcacheconnectorv1",
+    }
+
+
+def _replicated_index_cache_unsupported_reasons(
+    config,
+    hf_config,
+    *,
+    dcp_world_size: int,
+    mla_page_size: int,
+    pcp_world_size: int,
+) -> list[str]:
+    """Return startup blockers for the experimental replicated index layout."""
+    unsupported = []
+    if getattr(hf_config, "model_type", None) != "glm_moe_dsa":
+        unsupported.append("model_type must be glm_moe_dsa")
+    if dcp_world_size <= 1:
+        unsupported.append("decode context parallel size must be > 1")
+    if config.speculative_config is not None:
+        unsupported.append("MTP/speculative decoding is not supported")
+    if mla_page_size != 1:
+        unsupported.append("MLA page size must be 1")
+    if pcp_world_size > 1:
+        unsupported.append("PCP is not supported")
+    if getattr(config, "pipeline_parallel_size", 1) > 1:
+        unsupported.append("pipeline parallelism is not supported")
+    if getattr(config, "kv_transfer_config", None) and not (
+        _uses_standalone_lmcache_offload(config)
+    ):
+        unsupported.append("PD and non-LMCache KV transfer are not supported")
+    if getattr(config, "enable_rapidserve", False):
+        unsupported.append("RapidServe disaggregation is not supported")
+    return unsupported
+
+
 class AiterMLABackend(AttentionBackend):
     @staticmethod
     def get_name() -> str:
@@ -255,23 +302,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         self.dcp_rank = get_dcp_rank()
         self.replicate_index_cache = dcp_replicated_index_cache_enabled(config)
         if envs.ATOM_DCP_REPLICATE_INDEX_CACHE:
-            unsupported = []
-            if getattr(hf_config, "model_type", None) != "glm_moe_dsa":
-                unsupported.append("model_type must be glm_moe_dsa")
-            if self.dcp_world_size <= 1:
-                unsupported.append("decode context parallel size must be > 1")
-            if config.speculative_config is not None:
-                unsupported.append("MTP/speculative decoding is not supported")
-            if self.block_size != 1:
-                unsupported.append("MLA page size must be 1")
-            if get_pcp_world_size() > 1:
-                unsupported.append("PCP is not supported")
-            if getattr(config, "pipeline_parallel_size", 1) > 1:
-                unsupported.append("pipeline parallelism is not supported")
-            if getattr(config, "kv_transfer_config", None):
-                unsupported.append("KV transfer/LMCache/PD is not supported")
-            if getattr(config, "enable_rapidserve", False):
-                unsupported.append("RapidServe disaggregation is not supported")
+            unsupported = _replicated_index_cache_unsupported_reasons(
+                config,
+                hf_config,
+                dcp_world_size=self.dcp_world_size,
+                mla_page_size=self.block_size,
+                pcp_world_size=get_pcp_world_size(),
+            )
             if unsupported:
                 raise ValueError(
                     "ATOM_DCP_REPLICATE_INDEX_CACHE=1 is unsupported: "
