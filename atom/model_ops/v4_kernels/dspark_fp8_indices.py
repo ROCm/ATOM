@@ -9,12 +9,14 @@ kernel addresses KV as one pool of rows plus a CSR index list per query row, so
 the `[window ++ draft-block]` KV DSpark attends to has to be expressed as pool
 row ids rather than a materialised `[B, W+T, 512]` tensor.
 
-`dspark_build_indices` emits all three in one launch:
+`dspark_build_indices` fills, in one launch:
 
 - `kv_indices` / `kv_indptr` — the ragged CSR, one query row per draft position,
   `N = B*T` rows.
 - `draft_rows` — the ring rows the draft block's own KV is scattered into, fused
   into the `qk_norm_rope_maybe_quant` launch that produces it.
+
+and `dspark_index_views` reads them back.
 
 `qo_indptr` and the scatter's `batch_ids` are constants that ride in the same
 `DSparkIndexBuffers` bundle. Everything is allocated once at `max_num_seqs` and
@@ -124,14 +126,14 @@ class DSparkIndexBuffers:
     Sized at the maximum batch and only ever sliced -- the idiom
     `write_v4_paged_decode_indices` states as "All inputs are persistent
     forward_vars buffers, no allocator churn", and that the drafter's own
-    `_init_draft_block_buffers` already follows. Nothing here is keyed by
-    shape, because every one of these is prefix-stable in the batch: the first
-    `B*T` entries of the max-batch buffer ARE the batch-`B` answer.
+    `_init_draft_block_buffers` already follows. Nothing is keyed by shape,
+    because every one of these is prefix-stable in the batch: the first `B*T`
+    entries of the max-batch buffer ARE the batch-`B` answer.
 
-    `qo_indptr` and `batch_ids` are constants, filled at allocation and never
-    written again. The other three are refilled by `dspark_build_indices` at
-    the top of each block; `built_for` records the batch they hold, so a stage
-    reading them back cannot be handed a stale or uninitialised slice.
+    `draft_width` / `draft_window` are the shape the buffers were cut for, kept
+    here so no caller can hand a slice a different one; `qo_indptr` and
+    `batch_ids` are constants filled at allocation and never written again.
+    `built_for` is the batch the other three currently hold.
     """
 
     kv_indices: torch.Tensor  # [max_b*T*(W+T)] int32
@@ -139,6 +141,9 @@ class DSparkIndexBuffers:
     draft_rows: torch.Tensor  # [max_b*T] int32
     qo_indptr: torch.Tensor  # [max_b*T+1] int32, constant ramp
     batch_ids: torch.Tensor  # [max_b*T] int32, constant [0]*T ++ [1]*T ++ ...
+    max_batch: int
+    draft_width: int  # T
+    draft_window: int  # W
     built_for: int = -1
 
 
@@ -148,17 +153,17 @@ def dspark_index_buffers(
     """Allocate :class:`DSparkIndexBuffers` for a process's largest batch.
 
     `qo_indptr` is `arange(N+1)`: the asm wrapper runs `max_seqlen_q = 1`, one
-    "sequence" per query row, the same convention the V4 target's decode
-    metadata uses (`deepseek_v4_attn.py:3727`).
+    "sequence" per query row -- the same per-token convention the V4 target uses
+    for its own decode AND verify forwards (`deepseek_v4_attn.py:3727`).
 
     `batch_ids` is the token -> request map the fused SWA scatter gates on
-    (`bid >= 0`). It carries no CG-pad sentinels, and does not need any: the
-    draft runs at `context.batch_size`, which is `scheduled_bs`, the REAL decode
-    batch (`model_runner.py:2609`) -- not the padded `effective_bs` the target's
+    (`bid >= 0`). It carries no CG-pad sentinels, and needs none: the draft runs
+    at `context.batch_size`, which is `scheduled_bs`, the REAL decode batch
+    (`model_runner.py:2609`) -- not the padded `effective_bs` the target's
     metadata is built at. The target can alias `cu_seqlens_q[:bs]` for its own
     (`deepseek_v4_attn.py:2348`) because at one token per sequence that slice is
     already `arange(bs)`; DSpark runs T tokens per request and needs each id
-    repeated T times, so there is no existing buffer to slice.
+    repeated T times, so there is nothing to alias.
     """
     n = max_batch * draft
     i32 = {"dtype": torch.int32, "device": device}
@@ -172,61 +177,64 @@ def dspark_index_buffers(
         .expand(max_batch, draft)
         .reshape(-1)
         .contiguous(),
+        max_batch=max_batch,
+        draft_width=draft,
+        draft_window=window,
+    )
+
+
+def _slices(bufs: DSparkIndexBuffers, batch: int):
+    n = batch * bufs.draft_width
+    return (
+        bufs.kv_indices[: n * (bufs.draft_window + bufs.draft_width)],
+        bufs.kv_indptr[: n + 1],
+        bufs.draft_rows[:n],
     )
 
 
 def dspark_index_views(
-    bufs: DSparkIndexBuffers, batch: int, draft: int, window: int
+    bufs: DSparkIndexBuffers, batch: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """The `(kv_indices, kv_indptr, draft_rows)` slices for a batch.
+    """The `(kv_indices, kv_indptr, draft_rows)` a built bundle holds.
 
-    DSpark runs one block through every stage and the values are
-    stage-invariant (all DSpark layers share compress ratio 0, hence one
-    `WindowParams`, and each layer's plane view is base-row-relative), so stage
-    0 builds and the rest read this back -- no launch, no allocation.
+    The one accessor: :func:`dspark_build_indices` only fills, and every stage
+    -- including the one that filled -- reads through here. DSpark runs one
+    block through every stage and the values are stage-invariant (all DSpark
+    layers share compress ratio 0, hence one `WindowParams`, and each layer's
+    plane view is base-row-relative), so stage 0 builds and the rest just slice.
     """
     if bufs.built_for != batch:
         raise RuntimeError(
             f"DSpark kv indices hold batch {bufs.built_for}, not {batch}; "
             "stage 0 must build them before any stage reads them back."
         )
-    n = batch * draft
-    return (
-        bufs.kv_indices[: n * (window + draft)],
-        bufs.kv_indptr[: n + 1],
-        bufs.draft_rows[:n],
-    )
+    return _slices(bufs, batch)
 
 
 def dspark_build_indices(
     window: WindowParams,
     slots: torch.Tensor,  # [B] per-request ring slot
     anchors: torch.Tensor,  # [B] per-request anchor position
-    draft_width: int,  # T
-    draft_window: int,  # W
     bufs: DSparkIndexBuffers,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Everything the asm path needs, in one launch.
+) -> None:
+    """Fill `bufs` for this block, in one launch. Read it with
+    :func:`dspark_index_views`.
 
-    Fills ``bufs`` in place and returns its ``(kv_indices, kv_indptr,
-    draft_rows)`` slices; ``qo_indptr`` and ``batch_ids`` are constants already
-    sitting in the same bundle.
+    `T` and `W` come from the bundle, so a slice can never be cut to a shape the
+    buffers were not allocated for.
     """
     B = anchors.shape[0]
-    T, W = draft_width, draft_window
-    if bufs.batch_ids.numel() < B * T:
+    T, W = bufs.draft_width, bufs.draft_window
+    if B > bufs.max_batch:
         raise ValueError(
-            f"DSpark index buffers hold {bufs.batch_ids.numel() // T} requests "
-            f"< B={B}; they are sized at max_num_seqs."
+            f"DSpark index buffers hold {bufs.max_batch} requests < B={B}; "
+            "they are sized at max_num_seqs."
         )
-    bufs.built_for = B
-    kv_indices, kv_indptr, draft_rows = dspark_index_views(bufs, B, T, W)
-    anchors_i64 = anchors.to(torch.int64)
-    slots_i64 = slots.to(torch.int64)
+    kv_indices, kv_indptr, draft_rows = _slices(bufs, B)
 
     _dspark_index_kernel[(B * T,)](
-        anchors_i64,
-        slots_i64,
+        anchors.to(torch.int64),
+        slots.to(torch.int64),
         kv_indptr,
         draft_rows,
         kv_indices,
@@ -238,4 +246,5 @@ def dspark_build_indices(
         BLOCK_B=triton.next_power_of_2(B),
         BLOCK_K=triton.next_power_of_2(W + T),
     )
-    return kv_indices, kv_indptr, draft_rows
+    # Last: a launch that raised must not leave the bundle claiming a batch.
+    bufs.built_for = B

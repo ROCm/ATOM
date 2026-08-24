@@ -831,11 +831,8 @@ class DSparkLayer(Block):  # type: ignore[misc]
             # `dspark_indices_view` raises if it somehow did not.
             bufs = self.dspark_index_buffers(T, W, x.device)
             if self.stage_id == 0:
-                kv_indices, kv_indptr, draft_rows = dspark_build_indices(
-                    a.swa_window, slots, positions, T, W, bufs
-                )
-            else:
-                kv_indices, kv_indptr, draft_rows = dspark_index_views(bufs, B, T, W)
+                dspark_build_indices(a.swa_window, slots, positions, bufs)
+            kv_indices, kv_indptr, draft_rows = dspark_index_views(bufs, B)
             batch_ids = bufs.batch_ids[: B * T]
 
         # Per-head weightless Q RMSNorm + weighted KV RMSNorm + GPT-J RoPE in ONE
