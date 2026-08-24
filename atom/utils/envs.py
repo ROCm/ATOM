@@ -61,6 +61,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_TRITON_MLA_SHUFFLE_KV": lambda: (
         os.getenv("ATOM_USE_TRITON_MLA_SHUFFLE_KV", "0") == "1"
     ),
+    # Run the sparse (top-k gathered) MLA attention on aiter's Gluon
+    # sparse_mla_fwd instead of the asm mla_decode_fwd. It takes num_heads < 16
+    # natively, so it also drops the query-head padding. gfx950 only; anything
+    # it does not cover falls back to the asm decode.
+    "ATOM_USE_TRITON_SPARSE_MLA": lambda: (
+        os.getenv("ATOM_USE_TRITON_SPARSE_MLA", "0") == "1"
+    ),
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
     "ATOM_USE_TRITON_MOE_DECODE": lambda: os.getenv("ATOM_USE_TRITON_MOE_DECODE", "0")
     == "1",
