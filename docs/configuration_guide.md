@@ -255,8 +255,8 @@ Defined in `atom/config.py`. Controls data parallelism. Environment variables
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `data_parallel_size` | `int` | `1` | Number of data-parallel groups; overridden by `ATOM_DP_SIZE` env var |
-| `data_parallel_size_local` | `int` | `1` | Number of local data-parallel groups |
-| `data_parallel_rank` | `int` | `0` | Rank within the data-parallel group; overridden by `ATOM_DP_RANK` |
+| `data_parallel_size_local` | `int \| None` | `None` → `data_parallel_size` | DP ranks on **this** node. Defaults to the global size, i.e. single-node. Set it lower to give a node one slice of a multi-node run; also reaches MoRI as `gpu_per_node`. Overridden by `ATOM_DP_SIZE_LOCAL` |
+| `data_parallel_rank` | `int` | `0` | First **global** DP rank owned by this node; overridden by `ATOM_DP_RANK` |
 | `data_parallel_rank_local` | `Optional[int]` | `None` | Local rank within the data-parallel group (SPMD mode); overridden by `ATOM_DP_RANK_LOCAL` |
 | `data_parallel_master_port` | `int` | `29500` | Port used by the data-parallel master for process group initialization |
 | `data_parallel_base_port` | `int` | `get_open_port()` | Base port for data-parallel communication (dynamically assigned) |

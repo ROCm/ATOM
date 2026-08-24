@@ -1,0 +1,329 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+"""One call per wire format, asked of the formats themselves.
+
+Nothing here is written by hand: `REAL_CALLS` is built by asking every
+registered parser to `render_call`, and every shape the suites need is derived
+from it. A format registered tomorrow is covered by every property the moment
+it exists, with nothing added here.
+
+Hand-written samples were the alternative and one of them was wrong in the way
+that matters: MiniMax's was written in DSML's spelling and parsed to
+`get_weather({})`, exercising none of the parameter path.
+
+Generating does not by itself fix that -- a renderer and a parser written from
+the same misunderstanding round-trip perfectly. :func:`check_corpus`'s last
+check does: a format's call must be *identified* by its own parser and no
+other.
+"""
+
+from __future__ import annotations
+
+#: The value every call carries. Derivations cut here, so it must appear
+#: exactly once in each rendered call.
+PAYLOAD = "Paris"
+
+#: The tool every call names, and the parameter it passes.
+TOOL = "get_weather"
+PARAM = "city"
+
+#: The second declared tool. Never called; it exists so that "the early name
+#: disagreed with the parse" is expressible at all -- with one declared tool a
+#: property comparing names compares `get_weather` to `get_weather`.
+OTHER_TOOL = "get_time"
+
+DECLARED_TOOLS: list[dict] = [
+    {"type": "function", "function": {"name": TOOL, "parameters": {}}},
+    {"type": "function", "function": {"name": OTHER_TOOL, "parameters": {}}},
+]
+
+#: Typed variant, for the parsers that coerce argument values.
+TYPED_TOOLS: list[dict] = [
+    {
+        "type": "function",
+        "function": {
+            "name": name,
+            "parameters": {
+                "type": "object",
+                "properties": {PARAM: {"type": "string"}},
+            },
+        },
+    }
+    for name in (TOOL, OTHER_TOOL)
+]
+
+
+def _render(parser_cls) -> str:
+    return parser_cls.render_call(TOOL, {PARAM: PAYLOAD})
+
+
+class _Corpus(dict):
+    """The rendered calls, with a format that cannot render explained."""
+
+    def __missing__(self, name):
+        raise AssertionError(
+            f"the registered format {name!r} cannot render its own syntax. "
+            "Implement `render_call(name, args)` on its parser -- the inverse "
+            "of `parse_region` for one call, wrapper included. The whole test "
+            "corpus is generated from it, so every property covers the format "
+            "as soon as it exists, and nothing needs adding to the tests."
+        )
+
+
+def build(parsers: dict) -> dict[str, str]:
+    """One rendered call per format that can render one."""
+    out = _Corpus()
+    for name, cls in parsers.items():
+        try:
+            out[name] = _render(cls)
+        except NotImplementedError:
+            continue
+    return out
+
+
+def _registry() -> dict:
+    from atom.entrypoints.openai.tool_parser.registry import PARSERS_BY_NAME
+
+    return PARSERS_BY_NAME
+
+
+#: Built at import, from the registry. THE corpus; nobody writes an entry.
+REAL_CALLS: dict[str, str] = build(_registry())
+
+
+# --- derived shapes ---------------------------------------------------------
+
+
+def complete(name: str) -> str:
+    """This format's call, whole."""
+    return REAL_CALLS[name]
+
+
+def cut_at_payload(call: str) -> str:
+    """`call` as it looked when generation stopped inside its argument value.
+
+    The one place the cut rule lives, because where a call is cut decides what
+    the check is asking. Both other rules that have existed here asked
+    something else on half the registry: a fixed twelve characters left a
+    *fully closed* call for three of six formats, and the midpoint
+    (``call[:len(call)//2]``, which the announcement suite derived for itself)
+    leaves no recoverable call at all for three -- Kimi-K2's does not parse.
+    That second rule is why a real announce-vs-parse divergence stayed green.
+    """
+    return call[: call.index(PAYLOAD) + len(PAYLOAD) - 2]
+
+
+def truncated(name: str) -> str:
+    """The same call, cut off partway through its argument value."""
+    return cut_at_payload(REAL_CALLS[name])
+
+
+def truncated_after_complete(name: str) -> str:
+    """A cut-off call after a finished one, in one region.
+
+    The ordinary `max_tokens` shape, and the one where a format that recovers
+    truncation only in an `else:` branch drops the second call.
+    """
+    return REAL_CALLS[name] + truncated(name)
+
+
+def naming_another_tool(name: str) -> str:
+    """The same call, for the *other* declared tool."""
+    return REAL_CALLS[name].replace(TOOL, OTHER_TOOL)
+
+
+def naming_something_undispatchable(name: str) -> str:
+    """The same call, named with something no client could dispatch.
+
+    The corpus's own name with its separator spaced out, rather than invented
+    junk: no grammar admits a space, and unlike a quote or an angle bracket it
+    perturbs no format's markup, so "no call" cannot come out true for the
+    wrong reason. Two hand-picked literals -- empty, and all-space -- read as
+    thorough and missed the shape a model actually writes.
+    """
+    return REAL_CALLS[name].replace(TOOL, TOOL.replace("_", " "))
+
+
+def truncated_naming_another_tool(name: str) -> str:
+    """A cut-off call for the *other* tool.
+
+    Needed because "the name announced from a prefix is not the name the
+    finished region parses to" cannot be stated with one tool name: comparing
+    `get_weather` to `get_weather` is true however badly the parse went.
+    """
+    return cut_at_payload(naming_another_tool(name))
+
+
+def quoting_the_arguments(name: str) -> str | None:
+    """A sentence that shows this format's *argument* syntax and calls nothing.
+
+    The mirror of :func:`quoting_the_opener`, which keeps everything before
+    the tool name and so always carries the call opener with it. A format that
+    infers the name from the parameters instead has a second branch, and no
+    shape built from the front of a call can reach it -- DSML's ran for two
+    rounds unreachable from here while deleting the answers it fired on.
+
+    ``None`` where the format declares no self-contained region marker. A
+    marker ending in ``=`` or ``"`` is mid-attribute -- it *is* a call opener
+    waiting for a name -- so a string built from one would be a real call, and
+    a parser reading it as such would be right. Skipping is the honest answer;
+    inventing a shape that a correct parser must fail is not.
+    """
+    parser = _registry()[name]
+    marker = next(
+        (
+            m
+            for m in parser.START_MARKERS
+            if parser.opens_region(m) and not m.endswith(('"', "="))
+        ),
+        None,
+    )
+    if marker is None:
+        return None
+    call = REAL_CALLS[name]
+    after_the_name = call[call.index(TOOL) + len(TOOL) :]
+    if PARAM not in after_the_name:
+        # Arguments come before the name in this format, so the tail carries
+        # no parameter markup and there is nothing here to misread.
+        return None
+    return f"You open one with {marker} and then write {after_the_name}"
+
+
+def quoting_a_call_it_will_not_make(name: str) -> str:
+    """Markup this format's call pattern *matches* and its gate then rejects.
+
+    Distinct from :func:`quoting_the_opener`, and the distinction is the whole
+    point. That one stops before the name, so for a format whose pattern wants
+    more than an opener -- Kimi's entry needs `functions.NAME:INDEX` -- the
+    pattern never matches and the parser has nothing to reject. A property
+    about *what happens to a rejected match* is then vacuous: it passed on
+    every format, before and after the fix it was written for.
+
+    So: a call cut off mid-argument, naming a tool the request never declared.
+    Unclosed, so the truncation gate runs; undeclared, so it refuses. Both
+    halves are format-generic -- every format gates an unclosed alternative on
+    a declared name, which `TestAFormatDeclaresEveryTokenItStrips` and the
+    truncation table already hold them to.
+    """
+    return cut_at_payload(REAL_CALLS[name].replace(TOOL, "undeclared_thing"))
+
+
+def only_the_wrapper_closed(name: str) -> str | None:
+    """This format's call with the call's own closer never written.
+
+    `<tool_call><function=NAME></tool_call>`: the wrapper is closed and the
+    call is not, so the model was describing the syntax. Built by deleting
+    `CALL_SELF_CLOSERS` from a zero-argument rendering, which is why that
+    tuple is declared -- hand-written, this shape existed for one format.
+
+    ``None`` where the format cannot express it, and both reasons are read off
+    the declarations rather than listed:
+
+    * no wrapper distinct from the call -- GLM's `</tool_call>` is both, so
+      there is nothing that can close while the call stays open. Asked of
+      `CALL_CLOSERS`, which is the tuple that means "wrapper"; asking whether
+      the *self* closer was blank conflated the two and cost GLM its
+      region-end signal elsewhere.
+    * something already written between the name and the call's own closer,
+      even with no arguments. Kimi puts `{}` there and K3 an `index="N"`
+      attribute, so deleting the closer leaves a call the format recovers as
+      a truncation -- both do, measured -- rather than an unclosed block. The
+      question stops being the same one.
+
+    Nothing checks that the closer has a wrapper after it: no registered
+    format renders one last, and a guard for a shape none of them produce is
+    a guard nothing can justify.
+    """
+    parser = _registry()[name]
+    if not parser.CALL_CLOSERS:
+        return None
+    call = parser.render_call(TOOL, {})
+    closer = next((c for c in parser.CALL_SELF_CLOSERS if c in call), None)
+    if closer is None:
+        return None
+    at = call.rindex(closer)
+    body = call[call.index(TOOL) + len(TOOL) : at]
+    for filler in parser.CALL_FILLERS:
+        body = body.replace(filler, "")
+    if any(c.isalnum() for c in body):
+        return None
+    return call[:at] + call[at + len(closer) :]
+
+
+def quoting_the_opener(name: str) -> str:
+    """A sentence that mentions this format's opener and calls nothing.
+
+    An unclosed alternative without a truncation gate turns every sentence
+    *about* the wire format into a tool call; Kimi-K3 did exactly that when it
+    was given the alternation alone.
+    """
+    call = REAL_CALLS[name]
+    return (
+        f"You write {call[: call.index(TOOL)]}undeclared_thing "
+        "and then the parameters."
+    )
+
+
+# --- the corpus has to be real ----------------------------------------------
+
+
+def check_corpus(parsers: dict, parse) -> list[str]:
+    """Complaints about the corpus itself, empty when it is sound.
+
+    ``parsers`` is the registry and ``parse`` is `parse_tool_calls`; injected
+    so this module imports nothing from the package under test at definition
+    time.
+    """
+    import json
+
+    problems = []
+
+    cannot = sorted(set(parsers) - set(REAL_CALLS))
+    if cannot:
+        problems.append(
+            f"registered but cannot render their own syntax: {cannot} -- "
+            "implement `render_call` and every property covers them"
+        )
+
+    for name in sorted(set(REAL_CALLS) & set(parsers)):
+        call = REAL_CALLS[name]
+        if call.count(PAYLOAD) != 1:
+            problems.append(
+                f"{name}: {PAYLOAD!r} appears {call.count(PAYLOAD)} times; the "
+                "derivations cut there and need exactly one"
+            )
+        # Round trip: what this format writes, it must read back.
+        content, calls = parse(call, TYPED_TOOLS, parsers[name])
+        got = [c.function["name"] for c in calls]
+        if got != [TOOL]:
+            problems.append(f"{name}: renders a call its own parser reads as {got}")
+            continue
+        try:
+            decoded = json.loads(calls[0].function["arguments"])
+        except ValueError:
+            problems.append(f"{name}: arguments are not JSON")
+            continue
+        if decoded != {PARAM: PAYLOAD}:
+            problems.append(f"{name}: round-trips to {decoded!r}")
+        if content:
+            problems.append(f"{name}: left {content!r} outside the call")
+
+        # The ground truth a round trip cannot give: a renderer and a parser
+        # written from the same misunderstanding agree with each other, but a
+        # sample in another format's spelling is claimed by that format.
+        #
+        # `detect`, not `parse`. Two formats may both be able to *read* a
+        # string -- DSML matches its marker optionally, so it reads MiniMax's
+        # calls -- but only one may *claim* it. No exception list on purpose:
+        # one was written for the MiniMax/DSML pair, and that was the smell
+        # that led to splitting identification off `START_MARKERS`.
+        claimers = sorted(n for n in parsers if parsers[n].detect(call))
+        if claimers != [name]:
+            problems.append(
+                f"{name}'s own call is identified as {claimers} -- either the "
+                "renderer is written in another format's spelling, or two "
+                "formats are confusable by construction and one needs a "
+                "narrower `DETECT_MARKERS`"
+            )
+    return problems

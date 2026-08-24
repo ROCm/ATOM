@@ -37,12 +37,18 @@ from atom.distributed.pp_comm import (
     commit_pp_send_work,
     recv_intermediate_tensors,
 )
+from atom.distributed.simulated_tp import apply_simulated_tp, reject_simulated_tp
 from atom.kv_transfer.disaggregation import KVConnectorOutput
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
 from atom.model_engine.run_labels import build_run_label
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
-from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
+from atom.model_engine.sequence import (
+    Sequence,
+    SequenceStatus,
+    SequenceType,
+    new_block_table,
+)
 from atom.model_engine.state_runtime import StateRuntime
 from atom.model_loader.loader import load_model
 from atom.model_ops.attentions.sub_pool_spec import (
@@ -71,6 +77,7 @@ from atom.utils import (
     get_hf_text_config,
     init_exit_handler,
     resolve_obj_by_qualname,
+    worker_process_name,
 )
 from atom.utils.cuda_graph import BatchDescriptor
 from atom.utils.forward_context import (
@@ -83,6 +90,7 @@ from atom.utils.forward_context import (
     set_forward_context,
     set_kv_cache_data,
 )
+from atom.utils.gc_utils import freeze_gc_heap
 from atom.utils.selector import get_attn_backend
 from atom.utils.tbo import (
     UBatchSlice,
@@ -612,9 +620,14 @@ class ModelRunner:
         self.block_size = config.kv_cache_block_size
         self.kv_cache_dtype = config.kv_cache_dtype
         self.enforce_eager = config.enforce_eager
+        # world_size: the logical TP width, i.e. how many shards each weight is
+        # cut into -- what the KV-head math below divides by.
+        # tp_world_size: how many of those shards have a process.
+        # They differ only under simulated TP.
         self.world_size = config.tensor_parallel_size
+        self.tp_world_size = config.tp_world_size
         self.rank = rank
-        self.label = f"Model Runner{rank}/{self.world_size}"
+        self.label = f"Model Runner{rank}/{self.tp_world_size}"
         self.hf_text_config = get_hf_text_config(hf_config)
         if self.hf_text_config.model_type in ["llama"] and self.config.torch_dtype in [
             torch.bfloat16,
@@ -899,7 +912,8 @@ class ModelRunner:
         dp_rank_local = config.parallel_config.data_parallel_rank_local or 0
         pp_rank = config.parallel_config.pipeline_parallel_rank
         pp_size = config.pipeline_parallel_size
-        stage_span = config.tensor_parallel_size * config.prefill_context_parallel_size
+        # tp_world_size: how many GPUs this stage actually occupies.
+        stage_span = config.tp_world_size * config.prefill_context_parallel_size
         engine_index = dp_rank_local * pp_size + pp_rank
         local_device_rank = engine_index * stage_span + rank
         num_gpus = torch.cuda.device_count()
@@ -922,13 +936,21 @@ class ModelRunner:
             config.parallel_config.data_parallel_master_ip,
             config.parallel_config.data_parallel_base_port,
         )
+        # Both branches handle simulated TP: the PP path only to reject it,
+        # since it would otherwise deadlock on a group sized for absent ranks.
         if config.pipeline_parallel_size > 1:
             from atom.distributed.pp_comm import init_pp_aware_dist_env
 
+            reject_simulated_tp(config, "pipeline parallel")
             dp_size = config.parallel_config.data_parallel_size
             world_size = dp_size * pp_size * stage_span
             dp_rank = config.parallel_config.data_parallel_rank
             global_rank = (dp_rank * pp_size + pp_rank) * stage_span + rank
+            # No local_rank here, unlike the non-PP branch below. Safe only
+            # because PP is single-node today: CoreManager rejects multi-node
+            # DP when pp_size > 1, and asserts PP+DP out entirely, so
+            # global_rank is already the physical device index. Revisit if
+            # either restriction is lifted.
             init_pp_aware_dist_env(
                 tensor_model_parallel_size=config.tensor_parallel_size,
                 pipeline_model_parallel_size=pp_size,
@@ -940,11 +962,17 @@ class ModelRunner:
                 prefill_context_model_parallel_size=config.prefill_context_parallel_size,
             )
         else:
+            # The group spans the devices that exist; apply_simulated_tp then
+            # makes it *report* the logical width so layers shard that many ways.
             init_dist_env(
-                config.tensor_parallel_size,
+                config.tp_world_size,
                 rankID=rank,
                 backend="nccl",
                 distributed_init_method=distributed_init_method,
+                # This node's physical device index. Without it aiter derives a
+                # local rank from the DP-scaled global rank, which overruns the
+                # device list on every node after the first.
+                local_rank=local_device_rank,
                 data_parallel_size=config.parallel_config.data_parallel_size,
                 data_parallel_rank=config.parallel_config.data_parallel_rank,
                 prefill_context_model_parallel_size=config.prefill_context_parallel_size,
@@ -952,6 +980,7 @@ class ModelRunner:
                     config, "decode_context_parallel_size", 1
                 ),
             )
+            apply_simulated_tp(config)
 
     def _make_buffer(
         self, *size: int | torch.SymInt, dtype: torch.dtype, numpy: bool = True
@@ -1119,35 +1148,6 @@ class ModelRunner:
         if self.rank == 0:
             logger.info(*args)
 
-    def _run_dummy_drafter(self, hidden_states, draft_bs=None):
-        """Run drafter forward for DP synchronization (no real proposal)."""
-        if not hasattr(self, "drafter"):
-            return
-        forward_context = get_forward_context()
-        forward_context.context.is_draft = True
-        if draft_bs is None:
-            draft_bs = forward_context.context.graph_bs
-        for i in range(self.drafter.mtp_k):
-            self.drafter._refresh_dp_metadata(forward_context, hidden_states.shape[0])
-            hidden_states = self.drafter.model(
-                input_ids=torch.zeros(
-                    hidden_states.shape[0],
-                    dtype=torch.int32,
-                    device=self.device,
-                ),
-                positions=torch.zeros(
-                    hidden_states.shape[0],
-                    dtype=torch.int64,
-                    device=self.device,
-                ),
-                hidden_states=hidden_states,
-            )
-            if i == 0:
-                hidden_states = hidden_states[:draft_bs]
-                # pad_for_all_gather uses graph_bs * 1, consistent with
-                # ranks running propose
-                forward_context.attn_metadata.max_seqlen_q = 1
-
     def dummy_execution(self):
         """Execute dummy decode batch for DP synchronization."""
         has_drafter = hasattr(self, "drafter")
@@ -1162,7 +1162,7 @@ class ModelRunner:
         )
         seq.status = SequenceStatus.RUNNING
         seq.type = SequenceType.DECODE
-        seq.block_table = [0]
+        seq.block_table = new_block_table([0])
 
         spec_tokens = {seq.id: np.zeros(mtp_k, dtype=np.int32)} if mtp_k > 0 else None
         dummy_batch = ScheduledBatch(
@@ -1336,10 +1336,11 @@ class ModelRunner:
         )
 
         def _clone_slot(src: dict) -> dict:
-            # Only CpuGpuBuffers are per-forward host-pinned staging buffers that
-            # get overwritten each forward. Everything else (the eager `outputs`
-            # tensor, scalar `mtp_k`, ...) is either unused on the eager PP path
-            # or immutable, so share it by reference.
+            # CpuGpuBuffers are the per-forward staging buffers, and only their
+            # host half can be rewritten while an earlier microbatch's kernels
+            # are still reading. Everything else is immutable, unused on the
+            # eager PP path, or device-only, where the stream orders the writing
+            # kernel after those readers.
             return {
                 k: (v.clone() if isinstance(v, CpuGpuBuffer) else v)
                 for k, v in src.items()
@@ -1596,6 +1597,15 @@ class ModelRunner:
                 overhead / (1 << 30),
             )
         return int(overhead)
+
+    def freeze_gc_heap(self) -> int:
+        """RPC target: freeze this worker's startup heap. Pauses here reached
+        979 ms, the largest of any process.
+
+        The count is returned because `busy_loop` replies only `if out is not
+        None` -- an RPC target returning None hangs its `wait_out=True` caller.
+        """
+        return freeze_gc_heap(worker_process_name(self.config, self.rank))
 
     def get_num_blocks(self) -> dict[str, object]:
         torch.set_default_device(self.device)
@@ -3361,16 +3371,47 @@ class ModelRunner:
 
         pp_group = get_pp_group()
         pp_non_last = pp_group.world_size > 1 and not pp_group.is_last_rank
-        # Before the batch is classified as producing a token or not: `propose()`
-        # is reached only from `postprocess`, so a drafter context maintained
-        # there would cover a chunked prefill's final chunk alone.
-        if hasattr(self, "drafter") and not pp_non_last and not batch.is_dummy_run:
-            self.drafter.precompute_context_kv(
+
+        drafter = getattr(self, "drafter", None)
+        # An output-less batch still runs propose() for its DP collectives.
+        will_align_draft = (
+            self._dp_draft_lockstep_active()
+            and self._is_pure_middle_chunk(batch)
+            and not batch.is_dummy_run
+        )
+        # Runs after EVERY target forward -- `postprocess` (hence propose) is
+        # skipped for a middle chunk. Not on the aligning step: that pass is one
+        # the peers never mirror.
+        run_context_pass = (
+            drafter is not None
+            and not pp_non_last
+            and not batch.is_dummy_run
+            and not (will_align_draft and drafter.precompute_duplicates_propose)
+        )
+        if run_context_pass:
+            drafter.precompute_context_kv(
                 get_forward_context().context.positions,
                 hidden_states,
                 batch.next_token_ids,
             )
         if pp_non_last or self._is_pure_middle_chunk(batch):
+            # This return skips `postprocess`, hence propose() and the DP
+            # collectives it carries. Run it for those and drop the ids.
+            if will_align_draft:
+                self.propose_draft_token_ids(
+                    batch,
+                    self.tokenID_processor.input_ids.gpu[
+                        1 : batch.total_tokens_num + 1
+                    ],
+                    hidden_states,
+                    torch.zeros(
+                        batch.total_seqs_num, dtype=torch.int32, device=self.device
+                    ),
+                    torch.zeros(
+                        batch.total_seqs_num, dtype=torch.int32, device=self.device
+                    ),
+                    align_only=True,
+                )
             reset_forward_context()
             # Mark this slot's GPU work (attention consumed its metadata) done.
             if not batch.is_dummy_run:
@@ -3402,6 +3443,19 @@ class ModelRunner:
     @staticmethod
     def _is_pure_middle_chunk(batch) -> bool:
         return batch is not None and not batch.produces_output()
+
+    def _dp_draft_lockstep_active(self) -> bool:
+        """Are this rank's draft passes bound to what the DP peers run?
+
+        Only under DP attention -- `_refresh_dp_metadata` returns early at
+        `data_parallel_size <= 1`, where an output-less batch legitimately
+        drafts nothing. PP is excluded via `is_deferred_out`.
+        """
+        return (
+            hasattr(self, "drafter")
+            and self.config.parallel_config.data_parallel_size > 1
+            and self.tokenID_processor.is_deferred_out
+        )
 
     @torch.inference_mode()
     def process_kvconnector_output(self, connector_meta_output):
@@ -3442,7 +3496,15 @@ class ModelRunner:
         hidden_states: torch.Tensor,
         next_token_ids: torch.Tensor,
         num_reject_tokens: torch.Tensor,
+        align_only: bool = False,
     ):
+        """`align_only` runs the draft purely for its DP collectives.
+
+        Its caller is the all-middle-chunk batch, where every seq is mid-prompt:
+        the `batch.next_token_ids` override below replaces `next_token_ids`
+        wholesale, so the zeros it passes are never read. The ids are dropped --
+        the scheduler is not expecting a draft for a seq that produced no token.
+        """
         forward_context = get_forward_context()
 
         # A sequence still mid-prompt samples nothing usable, so its anchor is
@@ -3509,6 +3571,8 @@ class ModelRunner:
             next_token_ids=next_token_ids,
             last_token_indices=last_token_indices,
         )
+        if align_only:
+            return None
         # DSpark Phase 2: stash this step's scheduler-chosen ell keyed by req_id,
         # so next step's calc_spec_decode_metadata can re-map it onto the (possibly
         # reordered) batch. Keying by req_id (not batch position) is required:
@@ -4522,7 +4586,7 @@ class RapidServeModelRunner(ModelRunner):
 
         if self.rank != 0:
             return None
-        paths = [self._disagg_rank_file_path(tag, r) for r in range(self.world_size)]
+        paths = [self._disagg_rank_file_path(tag, r) for r in range(self.tp_world_size)]
         deadline = time.monotonic() + 120  # 2 min timeout
         while time.monotonic() < deadline:
             if all(os.path.exists(p) for p in paths):
@@ -4548,7 +4612,9 @@ class RapidServeModelRunner(ModelRunner):
         self._disagg_write_rank_file("weights", handles)
         paths = self._disagg_collect_rank_files("weights")
         if paths is not None:
-            logger.info(f"ModelRunner rank 0: all {self.world_size} weight files ready")
+            logger.info(
+                f"ModelRunner rank 0: all {self.tp_world_size} weight files ready"
+            )
         return paths  # non-None only for rank 0
 
     def import_model_weight_ipc_handles(self, paths: list[str]) -> bool:
@@ -4601,7 +4667,7 @@ class RapidServeModelRunner(ModelRunner):
         paths = self._disagg_collect_rank_files("kvcache")
         if paths is not None:
             logger.info(
-                f"ModelRunner rank 0: all {self.world_size} kvcache files ready"
+                f"ModelRunner rank 0: all {self.tp_world_size} kvcache files ready"
             )
         return paths  # non-None only for rank 0
 

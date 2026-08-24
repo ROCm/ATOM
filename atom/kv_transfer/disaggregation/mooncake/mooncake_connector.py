@@ -378,7 +378,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             assert (
                 not self.is_producer
             ), "Only the decode (consumer) side handles do_remote_prefill"
-            self._reqs_need_recv[seq.id] = (seq, seq.block_table, slot_index)
+            self._reqs_need_recv[seq.id] = (seq, list(seq.block_table), slot_index)
             params["do_remote_prefill"] = False
             params["local_slot_index"] = slot_index
             # PD incremental: skip leading blocks already in the decode node's
@@ -404,7 +404,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         # Producer side: queue block_ids for the write listener to look up
         if params.get("do_remote_decode"):
             assert self.is_producer, "Only the producer side handles do_remote_decode"
-            self._reqs_need_save[seq.id] = (seq, seq.block_table, slot_index)
+            self._reqs_need_save[seq.id] = (seq, list(seq.block_table), slot_index)
             logger.debug(
                 "Queued req %s for KV save (%d blocks, slot=%d)",
                 seq.id,
@@ -421,7 +421,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         seq.kv_transfer_params_output = {
             "do_remote_prefill": True,
             "do_remote_decode": False,
-            "remote_block_ids": seq.block_table.copy(),
+            "remote_block_ids": list(seq.block_table),
             # The consumer's SWA ring slot; the producer keys the SWA region
             # transfer by it. Empty for backends with no SWA state.
             "remote_swa_block_ids": _swa_ring_ids(seq),

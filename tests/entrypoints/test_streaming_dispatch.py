@@ -10,7 +10,10 @@ from atom.entrypoints.openai.streaming_dispatch import (
 
 class _Utf8ByteTokenizer:
     def decode(self, token_ids, skip_special_tokens=True):
-        return bytes(token_ids).decode("utf-8", errors="replace")
+        # `bytes(x)` of an `array("i")` copies its buffer -- four bytes per id
+        # -- where from a list it takes the values. A real tokenizer reads ids,
+        # so this double has to as well; keep the `list`.
+        return bytes(list(token_ids)).decode("utf-8", errors="replace")
 
 
 class _ImmediateLoop:
@@ -378,4 +381,4 @@ def test_each_stream_gets_its_own_detokenizer():
     first, second = dispatcher.new_state(), dispatcher.new_state()
 
     assert first is not second
-    assert first.tokens == [] and second.tokens == []
+    assert not first.tokens and not second.tokens
