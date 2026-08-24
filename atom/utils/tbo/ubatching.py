@@ -124,10 +124,31 @@ def _precompute_mixed_token_split(
     # can_split: need >= 2 tokens to cut into two non-empty halves.
     if total_tokens < 2:
         return False, False, 0, 0
-    meets_min_tokens = not (min_pref > 0 and num_pref_tokens < min_pref)
     ub0 = total_tokens // 2
-    ub1 = total_tokens - ub0
-    return meets_min_tokens, True, ub0, ub1
+
+    # One contiguous cut of a `[prefill | decode]` layout can never leave BOTH
+    # halves mixed: whichever side the cut falls on, the other side is pure.
+    # Require it to land strictly inside the prefill region, which gives
+    #     ubatch 0 = pure prefill      (the ordinary prefill path, unchanged)
+    #     ubatch 1 = [prefill tail | every decode row]   (mixed)
+    # so both ubatches keep is_prefill=True and only ubatch 1 needs mixed
+    # metadata.
+    #
+    # The other landing -- cut at or past the prefill tokens -- would make
+    # ubatch 1 pure DECODE while its parent context says is_prefill=True, and
+    # TBO builds per-ubatch contexts off the parent's mode
+    # (`_make_ubatch_context` branches on `ctx.context.is_prefill`, one branch
+    # for all ubatches). Supporting that needs per-ubatch mode switching, which
+    # is a separate piece of work; refuse the split instead.
+    #
+    # Real mixed batches are overwhelmingly prefill (measured: 15831 prefill vs
+    # 379 decode tokens), so the midpoint lands inside the prefill region and
+    # this rejects almost nothing.
+    if ub0 >= num_pref_tokens:
+        return False, False, 0, 0
+
+    meets_min_tokens = not (min_pref > 0 and num_pref_tokens < min_pref)
+    return meets_min_tokens, True, ub0, total_tokens - ub0
 
 
 def _precompute_decode(batch) -> tuple[bool, bool, int, int]:

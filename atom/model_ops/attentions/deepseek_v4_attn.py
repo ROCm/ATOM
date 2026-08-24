@@ -3229,6 +3229,29 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         """
         from atom.utils.tbo.ubatch_splitting import split_attn_metadata
 
+        # A ubatch that straddles the prefill/decode boundary needs its own
+        # nested per-segment metadata rebuilt, which is not implemented: the
+        # rebuild below produces one flat prefill metadata, and the pieces a
+        # mixed segment additionally needs -- `compress_plans` (built per
+        # sequence from extend/context lens), `swa_dest_rows` (row numbers the
+        # pool geometry derives from a per-layer stride, not a sliceable range)
+        # and the three `kv_indices_{swa,csa,hca}` sets -- have no per-ubatch
+        # construction.
+        #
+        # Only reachable with ATOM_TBO_MIXED=1; the split otherwise refuses
+        # mixed batches back in `local_tbo_precompute`. Fail loudly rather than
+        # hand the forward metadata describing the wrong rows.
+        _ub_pref_tok = getattr(ub_slice, "num_prefill_tokens", None)
+        if _ub_pref_tok is not None:
+            _ub_tok = ub_slice.token_slice.stop - ub_slice.token_slice.start
+            if 0 < _ub_pref_tok < _ub_tok:
+                raise NotImplementedError(
+                    "V4 TBO: ubatch straddles the prefill/decode boundary "
+                    f"({_ub_pref_tok} prefill of {_ub_tok} tokens) and its "
+                    "per-segment metadata cannot be rebuilt yet. Unset "
+                    "ATOM_TBO_MIXED."
+                )
+
         # PCP+TBO request-boundary split: each ubatch = one request group processed as an
         # independent non-TBO PCP mini-batch. Slice the FULL (un-reindexed)
         # metadata to the group + call _apply_pcp_reindex on it (reuse the proven
