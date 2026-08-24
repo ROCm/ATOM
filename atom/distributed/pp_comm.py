@@ -71,17 +71,16 @@ def init_pp_aware_dist_env(
         prefill_context_model_parallel_size=prefill_context_model_parallel_size,
     )
 
-    if tensor_model_parallel_size > 1:
-        tp_grp = get_tp_group()
-        ca_comm = tp_grp.device_communicator.ca_comm
-        signal = torch.zeros(
-            tensor_model_parallel_size * 64,
-            dtype=torch.int64,
-            device=torch.cuda.current_device(),
-        )
-        ca_comm.signal = signal
-        ca_comm.register_input_buffer(signal)
-        ca_comm.buffer = ca_comm._pool["input"].tensor
+    # No per-rank signal/input-buffer registration here (this used to copy
+    # aiter init_dist_env's signal/buffer block). All of it was vestigial --
+    # ca_comm.signal / ca_comm.buffer are never read, and the registration
+    # entry is keyed by the signal tensor's own address, which no allreduce
+    # ever uses as input -- and it made raw IPC input pools unusable
+    # (ROCm/aiter#4921): under PYTORCH_HIP_ALLOC_CONF=expandable_segments:True
+    # the torch.zeros signal is VMM-backed so hipIpcGetMemHandle rejects it,
+    # and the raw_cached input pool has no backing tensor so the
+    # `_pool["input"].tensor` mirror raised. CustomAllreduce.__init__ builds
+    # its own pools and copy-in path; nothing further is needed.
 
     logger.debug(
         "init_pp_aware_dist_env: global_rank=%d tp=%d pp=%d pcp=%d dp=%d world=%d",

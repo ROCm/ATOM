@@ -28,8 +28,13 @@ from atom.distributed.pcp_utils import (
     pcp_round_robin_query_indices,
 )
 from atom.model_engine.scheduler import ScheduledBatch
-from atom.model_ops.attention_mla import _MLA_MIN_HEADS, MLAAttention
-from atom.utils import CpuGpuBuffer, envs
+from atom.model_ops.attention_mla import (
+    _MLA_MIN_HEADS,
+    MLAAttention,
+    mla_dcp_decode_is_persistent,
+    mla_dcp_kernel_num_heads,
+)
+from atom.utils import CpuGpuBuffer, envs, upload_numpy
 from atom.utils.block_convert import (
     kv_indices_generate_triton,
     mtp_prepare_decode_mla_kernel,
@@ -167,17 +172,26 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         self.dcp_world_size = get_dcp_world_size()
         self.dcp_rank = get_dcp_rank()
 
-        # DCP decode all-gathers Q on the head dim across the DCP group, so the
-        # head count that reaches mla_decode_fwd (and thus the persistent decode
-        # metadata) is padded_num_attention_heads * dcp_world_size. The module's
-        # head-repeat compensates the _MLA_MIN_HEADS padding, so this product
-        # matches the kernel's actual nhead in every case. dcp=1 -> unchanged.
+        # DCP decode all-gathers Q on the head dim, so the head count reaching
+        # mla_decode_fwd (and thus the persistent decode metadata) is the padded
+        # gathered width, not the per-rank one. Pad it the same way the module
+        # does (mla_dcp_decode_is_persistent picks the width set), so these
+        # descriptors always describe the kernel that will actually run.
         # Only gfx950 runs DCP in persistent mode (gfx942 lacks the lse persistent
         # kernel and stays non-persistent, where this metadata is unused); scale
         # by dcp only there so gfx942 keeps the original per-rank head sizing.
-        self.persistent_num_heads = self.padded_num_attention_heads * (
-            self.dcp_world_size if dcp_persistent_supported() else 1
-        )
+        dcp_persistent = dcp_persistent_supported()
+        if self.dcp_world_size > 1 and dcp_persistent:
+            self.persistent_num_heads = mla_dcp_kernel_num_heads(
+                self.num_attention_heads,
+                self.dcp_world_size,
+                kv_cache_dtype=config.kv_cache_dtype,
+                persistent=mla_dcp_decode_is_persistent(
+                    self.is_sparse, self.dcp_world_size, dcp_persistent
+                ),
+            )
+        else:
+            self.persistent_num_heads = self.padded_num_attention_heads
 
         max_seqlen_qo = getattr(model_runner, "num_spec_tokens", 0) + 1
         (
@@ -476,9 +490,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 **i64_kwargs,
             )
             var[f"{p}block_tables"] = CpuGpuBuffer(
-                ub_max_bs,
-                self.max_num_blocks_per_seq // self.block_ratio,
-                **i32_kwargs,
+                ub_max_bs, self.block_table_cols, **i32_kwargs
             )
             var[f"{p}cu_seqlens_q"] = CpuGpuBuffer(ub_max_bs + 1, **i32_kwargs)
             var[f"{p}cu_seqlens_q"].cpu.copy_(
@@ -1270,14 +1282,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             total_tokens = int(cu[-1])
             # cu doubles as gather_kv_b_proj kv_indptr (block_size=1 → block
             # indptr == token indptr) and flash_attn cu_seqlens_k.
-            kv_indptr_list.append(
-                torch.from_numpy(cu).pin_memory().to(self.device, non_blocking=True)
-            )
-            kv_indices_list.append(
-                torch.from_numpy(chunk_indices)
-                .pin_memory()
-                .to(self.device, non_blocking=True)
-            )
+            kv_indptr_list.append(upload_numpy(cu, self.device))
+            kv_indices_list.append(upload_numpy(chunk_indices, self.device))
             cu_seqlens_k_list.append(kv_indptr_list[-1])  # same tensor
             total_tokens_list.append(total_tokens)
             max_seqlen_k_list.append(int(per_seq_chunk_lens.max(initial=0)))
@@ -1384,9 +1390,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
             cu = np.zeros(bs + 1, dtype=np.int32)
             np.cumsum(global_chunk_len, out=cu[1:])
-            cu_seqlens_k_list.append(
-                torch.from_numpy(cu).pin_memory().to(self.device, non_blocking=True)
-            )
+            cu_seqlens_k_list.append(upload_numpy(cu, self.device))
             total_tokens_list.append(int(cu[-1]))
             max_seqlen_k_list.append(int(global_chunk_len.max(initial=0)))
             padded_local_chunk_seq_lens_list.append(plc.astype(np.int32).tolist())
@@ -1407,11 +1411,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 if slot_segments
                 else np.empty(0, np.int32)
             )
-            local_slot_ids_list.append(
-                torch.from_numpy(slot_ids)
-                .pin_memory()
-                .to(self.device, non_blocking=True)
-            )
+            local_slot_ids_list.append(upload_numpy(slot_ids, self.device))
 
         return MLAChunkContextMetadata(
             kv_indptr=[],
@@ -2044,14 +2044,22 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # DCP + MTP (max_q_len>1) capture: the cprr kernel masks on GLOBAL
         # positions, so capture needs a self-consistent (local, global) KV layout
         # or the graph shape won't match replay. Give every seq 1 local token per
-        # rank -> global length = dcp_world_size (page_size=1 only; round-robin
-        # requires it). Replay overwrites these buffers with real values.
+        # rank -> global length = dcp_world_size. Replay overwrites these buffers
+        # with real values.
         cp_round_robin = self.dcp_world_size > 1 and max_q_len > 1
-        if cp_round_robin and self.block_size == 1:
-            var["kv_indptr"].np[: bs + 1] = np.arange(bs + 1, dtype=np.int32)
-            var["kv_indptr"].copy_to_gpu(bs + 1)
-            var["kv_indices"].gpu[:bs].zero_()
-            var["kv_last_page_lens"].gpu[:bs].fill_(1)
+        if cp_round_robin:
+            if self.block_size == 1:
+                var["kv_indptr"].np[: bs + 1] = np.arange(bs + 1, dtype=np.int32)
+                var["kv_indptr"].copy_to_gpu(bs + 1)
+                var["kv_indices"].gpu[:bs].zero_()
+                var["kv_last_page_lens"].gpu[:bs].fill_(1)
+            # g_kv_indptr is the only thing telling the cprr kernel how long each
+            # sequence is GLOBALLY, and nothing else initializes it -- capturing
+            # with it left at its allocation value walks the kernel off the KV
+            # list (illegal access). The round-robin is token-level whatever the
+            # block size, so the one-local-token-per-rank layout set up here (or
+            # by the block_size > 1 branch above) is a global length of
+            # dcp_world_size in both cases.
             var["g_kv_indptr"].np[: bs + 1] = (
                 np.arange(bs + 1, dtype=np.int32) * self.dcp_world_size
             )
@@ -2294,9 +2302,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             c_len = c_hi - c_lo
             cu = np.full(ub_num_reqs + 1, c_len, dtype=np.int32)
             cu[0] = 0
-            kv_indptr_list.append(
-                torch.from_numpy(cu).pin_memory().to(device, non_blocking=True)
-            )
+            kv_indptr_list.append(upload_numpy(cu, device))
             kv_indices_list.append(prefix_slots[c_lo:c_hi])
             total_tokens_list.append(c_len)
             max_seqlen_k_list.append(c_len)

@@ -225,6 +225,16 @@ class Drafter(abc.ABC):
         drafter uses fixed-length verification."""
         return None
 
+    @property
+    def precompute_duplicates_propose(self) -> bool:
+        """Is `precompute_context_kv` the pass propose's first draft step redoes?
+
+        True (EAGLE) means the two must never both run: the second is a
+        collective the peers on `dummy_execution` do not mirror. False (DSpark)
+        means it writes storage propose only reads, so it always runs.
+        """
+        return False
+
     # ---- aux-hidden-state ownership (drafter-owned, hook-based) ----
     def arm_aux_capture(self, target_model: nn.Module) -> None:
         """Install drafter-owned forward hooks on the target's decoder layers per
@@ -323,7 +333,6 @@ class Drafter(abc.ABC):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         next_token_ids: list[int] | None,
-        produces_output: bool,
     ) -> None:
         """Absorb one target forward into whatever context this drafter keeps.
 
@@ -333,9 +342,6 @@ class Drafter(abc.ABC):
 
         `next_token_ids` is the token one position past this forward, per seq:
         -1 where sampling supplies it, None on unlabelled batches.
-
-        `produces_output`: True when ``propose()`` will follow; drafters that
-        forward during absorb may skip redundant work.
         """
         return
 

@@ -32,6 +32,13 @@ from atom.plugin.vllm.model_wrapper import ATOMMoEForCausalLM
 from atom.utils.forward_context import get_forward_context as get_atom_forward_context
 
 
+def _adapt_kda_metadata_for_atom(kda_metadata: KimiK3KDAMetadata) -> None:
+    """Provide the state-read index field expected by native ATOM KDA."""
+    kda_metadata.non_spec_state_indices_in_tensor = (  # type: ignore[attr-defined]
+        kda_metadata.non_spec_state_indices_tensor
+    )
+
+
 def _get_k3_state_shape(
     vllm_config: VllmConfig,
 ) -> tuple[tuple[int, ...], tuple[int, ...]]:
@@ -243,6 +250,7 @@ class KimiKDAAttentionVllm(KimiKDAAttention, MambaBase):
                 f"Expected KimiK3KDAMetadata for {self.layer_name}, "
                 f"got {type(kda_metadata).__name__}"
             )
+        _adapt_kda_metadata_for_atom(kda_metadata)
 
         vllm_layer = vllm_context.no_compile_layers[self.layer_name]
         conv_state, ssm_state = vllm_layer.kv_cache
