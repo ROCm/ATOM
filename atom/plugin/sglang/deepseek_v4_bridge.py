@@ -1449,12 +1449,14 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
     md.swa_cs = proxy_pool.swa_cache_size
     md.index_topk = index_topk
     md.swa_pages = proxy_pool.num_slots * proxy_pool.swa_cache_size
-    md.pool_geometry = getattr(
-        getattr(model, "_atom_v4_meta_params", None),
-        "geometry",
-        None,
-    ) or getattr(proxy_pool, "_atom_v4_geometry", None) or _proxy_pool_geometry(
-        proxy_pool
+    md.pool_geometry = (
+        getattr(
+            getattr(model, "_atom_v4_meta_params", None),
+            "geometry",
+            None,
+        )
+        or getattr(proxy_pool, "_atom_v4_geometry", None)
+        or _proxy_pool_geometry(proxy_pool)
     )
 
     if total:
@@ -1540,9 +1542,9 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
 
     visible_np = np.zeros(t_pad, dtype=np.int32)
     if total:
-        visible_np[:total] = np.minimum(
-            (pos_np + 1) // 4, n_csa[batch_np]
-        ).astype(np.int32)
+        visible_np[:total] = np.minimum((pos_np + 1) // 4, n_csa[batch_np]).astype(
+            np.int32
+        )
     md.n_committed_per_token = bufs.stage(bufs.n_committed_per_token, visible_np, t_pad)
     block_cols = int(block_tables.shape[1])
     block_rows = bufs.block_tables_per_token.gpu[:t_pad, :block_cols]
@@ -1709,12 +1711,14 @@ def build_atom_v4_verify_graph_metadata_from_sglang(
     md.swa_cs = proxy_pool.swa_cache_size
     md.index_topk = index_topk
     md.swa_pages = proxy_pool.num_slots * proxy_pool.swa_cache_size
-    md.pool_geometry = getattr(
-        getattr(model, "_atom_v4_meta_params", None),
-        "geometry",
-        None,
-    ) or getattr(proxy_pool, "_atom_v4_geometry", None) or _proxy_pool_geometry(
-        proxy_pool
+    md.pool_geometry = (
+        getattr(
+            getattr(model, "_atom_v4_meta_params", None),
+            "geometry",
+            None,
+        )
+        or getattr(proxy_pool, "_atom_v4_geometry", None)
+        or _proxy_pool_geometry(proxy_pool)
     )
     # Target verify is extend-shaped for attention/compressor state, but the
     # indexer needs the fixed-shape decode scorer to be graph-safe.
@@ -1982,12 +1986,9 @@ def build_atom_v4_attention_metadata_from_sglang(
     md.swa_cs = proxy_pool.swa_cache_size
     md.index_topk = index_topk
     md.swa_pages = proxy_pool.num_slots * proxy_pool.swa_cache_size
-    md.pool_geometry = getattr(
-        getattr(model, "_atom_v4_meta_params", None),
-        "geometry",
-        None,
-    ) or getattr(proxy_pool, "_atom_v4_geometry", None) or _proxy_pool_geometry(
-        proxy_pool
+    md.pool_geometry = (
+        getattr(proxy_pool, "_atom_v4_geometry", None)
+        or _proxy_pool_geometry(proxy_pool)
     )
 
     if is_draft_extend:
