@@ -22,9 +22,7 @@ from atom.model_ops.fused_moe.config import moe_kernel_token_capacity
 def test_moe_kernel_token_capacity(
     mbt, enable_dpa, dp_size, use_all2all, dp_logical_ratio, expected
 ):
-    cfg = SimpleNamespace(
-        max_num_batched_tokens=mbt, enable_dp_attention=enable_dpa
-    )
+    cfg = SimpleNamespace(max_num_batched_tokens=mbt, enable_dp_attention=enable_dpa)
     assert (
         moe_kernel_token_capacity(
             cfg,
