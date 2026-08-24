@@ -274,16 +274,13 @@ def _fake_fp8_e4m3_inplace(x: torch.Tensor, block_size: int = 64) -> None:
     through FP8 E4M3 at inference to match training numerics. Keeps the rolling
     KV cache in its native dtype (only the values pass through the round-trip).
 
-    Deliberately still the eager chain, not a kernel. It is reachable only from
-    the bf16 path -- the fp8 path quantizes the very same lanes for real, so
-    both call sites skip it (`write_context_kv` passes `fake_quant=not to_2buff`,
-    and `dspark_attention` calls it only in its bf16 branch). A Triton rewrite
-    was measured at ~11us against ~65us here, but it optimizes the path this
-    work is moving off, and it costs a second numerics surface: the kernel
-    carries fp32 while this computes the scale in the input dtype, so the two
-    disagree on values sitting on a power-of-two boundary. Fold it into
-    `qk_norm_rope_maybe_quant` instead if the bf16 path ever needs the speed --
-    that launch already produces `kv` one line earlier.
+    Eager on purpose. Only the bf16 path reaches it -- the fp8 path quantizes
+    the same lanes for real, so both call sites skip it. A Triton rewrite
+    measured ~11us against ~65us, but it speeds up the path this work is moving
+    off and adds a second numerics surface (fp32 scale there, input-dtype scale
+    here, disagreeing on power-of-two boundaries). If the bf16 path ever needs
+    it, fold the round trip into `qk_norm_rope_maybe_quant`, which already
+    produces `kv` one line earlier, rather than add a kernel beside it.
     """
     if x.numel() == 0:
         return
@@ -629,28 +626,20 @@ class DSparkLayer(Block):  # type: ignore[misc]
         # priced in bytes, because a bf16 window is not a width the packed
         # planes hold.
         #
-        # The fp8 block attention does not want that. Its window IS the planes'
-        # own 2buff layout, so it stays silent here and takes the ordinary
-        # branch of `build_kv_cache_tensor`, which binds `swa_plane` +
-        # `swa_plane_rope` + `kv_fp8` — the two planes the asm kernel reads with
-        # one index buffer. Staying silent also restores the
-        # `prepare_mtp_decode` fast path, which a field-window MTP layer
-        # disables outright (`deepseek_v4_attn.py:592`).
+        # The fp8 path wants the opposite: its window IS the planes' 2buff
+        # layout, so staying silent takes `build_kv_cache_tensor`'s ordinary
+        # branch, which binds `swa_plane` + `swa_plane_rope` + `kv_fp8`. It also
+        # restores the `prepare_mtp_decode` fast path a field window disables
+        # (`deepseek_v4_attn.py:592`).
         #
-        # Keyed off the pool's dtype, and off nothing else. There is no opt-in
-        # flag: the rope plane the asm path addresses exists exactly when the
-        # server runs `--kv_cache_dtype fp8`, and that is already the condition
-        # under which the TARGET routes through the same asm kernel --
-        # `sparse_attn_v4_paged_decode` dispatches on `unified_kv_rope is not
-        # None` with no arch guard of its own (`paged_decode.py:1081`; the
-        # `get_gfx()` check below it guards only the bf16 fallback). So a draft
-        # that follows the pool's dtype is exposed to exactly what the target
-        # already is, and under bf16 KV it stays on the bf16 path.
+        # No opt-in flag; the pool's dtype decides. The rope plane exists
+        # exactly under `--kv_cache_dtype fp8`, which is already when the TARGET
+        # takes the same asm kernel (`paged_decode.py:1081` dispatches on
+        # `unified_kv_rope is not None`, with no arch guard of its own), so the
+        # draft is exposed to what the target already is and nothing more.
         #
-        # Config, fixed before the model is built, so this is the one fp8 signal
-        # the TRACED region may read: unlike `attn.kv_fp8`, which
-        # `build_kv_cache_tensor` binds only after warmup has already traced,
-        # baking this into a compiled graph cannot be wrong.
+        # Config, so the TRACED region may read it -- unlike `attn.kv_fp8`,
+        # which binds only after warmup has traced.
         self.dspark_fp8_planned = get_current_atom_config().kv_cache_dtype == "fp8"
         if not self.dspark_fp8_planned:
             self.attn.window_kv_dtype = torch.bfloat16
@@ -907,11 +896,11 @@ class DSparkLayer(Block):  # type: ignore[misc]
         if use_fp8:
             # The draft KV is in the ring now, so the whole
             # [window ++ draft-block] KV is addressable as pool rows and never
-            # has to be materialised. One CSR list per query row, N = B*T rows
-            # at max_seqlen_q=1 — the target's own decode convention
-            # (`deepseek_v4_attn.py:3727`). The bf16 path's `topk_idxs` is a
-            # broadcast along T, so all T positions of a request share one list,
-            # which is exactly what a per-row CSR slice expresses.
+            # materialised. One CSR list per query row, N = B*T at
+            # max_seqlen_q=1 -- the target's decode convention
+            # (`deepseek_v4_attn.py:3727`). `topk_idxs` broadcasts along T, so
+            # a request's T positions share one list, which is what a CSR slice
+            # already is.
             out = sparse_attn_v4_paged_decode(
                 None,  # bf16 q: dead on the asm path, which reads q_packed_in
                 a.unified_kv,
@@ -935,14 +924,11 @@ class DSparkLayer(Block):  # type: ignore[misc]
             kv = kv.view(B, T, a.head_dim)
 
             if topk_idxs.numel() == 0:
-                # The plan omits the gather block whenever the fp8 path is
-                # PLANNED, but planning it is not taking it: the warmup dummy
-                # run cannot (`swa_plane` is unbound before `allocate_kv_cache`)
-                # and neither can a layer `build_kv_cache_tensor` left without
-                # planes. Both land here and still need the block, so rebuild
-                # it. Here and not in `_build_block_plan` because this body is
-                # opaque to Dynamo and runs eagerly every step, so the branch
-                # cannot bake -- which is exactly what that function may not do.
+                # The plan omits the block when fp8 is PLANNED, but planning
+                # is not taking: warmup (`swa_plane` unbound) and any layer left
+                # without planes land here and still need it. Rebuilt here, not
+                # in `_build_block_plan`, because this body is opaque to Dynamo
+                # -- the branch cannot bake, which there it would.
                 topk_idxs = _dspark_block_topk_idxs(B, T, W, valid_target, x.device)
 
             # Assemble the [window ++ draft block] KV. The window-validity mask

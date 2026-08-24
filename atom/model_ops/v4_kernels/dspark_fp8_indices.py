@@ -69,19 +69,16 @@ def dspark_qo_indptr(batch: int, draft: int, device) -> torch.Tensor:
 # Fused build.
 #
 # Spelled as torch ops this is ~50 elementwise launches (~286us at B=128 T=4
-# W=128 on MI355X) over tensors of at most a few thousand int32 -- launch-bound,
-# in front of an attention kernel that reads only W+T rows.
-# `write_v4_paged_decode_indices` is the target's answer to the same problem:
-# derive every index on device in one kernel. This is that, for the draft's
+# W=128 on MI355X) over a few thousand int32 -- launch-bound, in front of an
+# attention kernel that reads only W+T rows. `write_v4_paged_decode_indices` is
+# the target's answer to the same problem, and this is that for the draft's
 # `[window ++ draft-block]` list.
 #
-# ONE launch, matching the target's shape. The CSR offsets are a prefix sum over
-# requests and the index fill needs them before it can address its slice -- but
-# the summand is only `min(anchor+1, W) + T`, so a program can rebuild the whole
-# prefix from the `B` anchors itself rather than wait for a separate pass to
-# hand it over. B is the CUDA-graph-padded batch (hundreds of int64), so every
-# program redundantly reducing one BLOCK_B vector is far cheaper than the extra
-# launch and the serialization between the two that it forces.
+# ONE launch. The fill needs the CSR offsets before it can address its slice,
+# but the summand is only `min(anchor+1, W) + T`, so a program rebuilds the
+# whole prefix from the B anchors itself instead of waiting on a second kernel.
+# B is the CG-padded batch, so that redundant BLOCK_B reduction is far cheaper
+# than the extra launch and the serialization it forces.
 # ---------------------------------------------------------------------------
 
 
