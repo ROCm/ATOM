@@ -48,10 +48,9 @@ still reading those blocks for its save when the moriio send completes (or vice
 versa), the free would corrupt the in-flight transfer. So when a request needs
 **both** a send and one or more saves, ``MultiConnector`` withholds *both*
 completion signals until every known save is done, then emits them together.
-The scheduler's
-``finished_sending`` handler frees first; the ``finished_saving`` handler then
-finds nothing to free and no-ops. This is the analogue of vLLM's
-``_extra_async_saves`` refcount.
+The scheduler's ``finished_sending`` handler frees first; the
+``finished_saving`` handler then finds nothing to free and no-ops. This is the
+analogue of vLLM's ``_extra_async_saves`` refcount.
 """
 
 from __future__ import annotations
@@ -215,15 +214,22 @@ class MultiConnector(KVConnectorBase):
         )
         self._pp_is_head = pp_rank == 0
 
-        # Send/save pairing state (see module docstring).
-        # _pending_save: str(req_id) for requests offload will save this lifetime.
+        # Send/save pairing state, all keyed by str(req_id). See module
+        # docstring. Legacy metadata without an operation id uses the key.
         self._pending_save: set[str] = set()
-        # _pending_save_ops: exact save operations not reported complete yet,
-        # grouped by request key. Legacy metadata uses the request key itself.
         self._pending_save_ops: dict[str, set[SaveCompletionId]] = {}
-        # _sent / _saved: completed-but-unpaired transfers, str(req_id) -> raw ids.
         self._sent: dict[str, Any] = {}
         self._saved: dict[str, set[SaveCompletionId]] = {}
+
+    @property
+    def _pairs_send_and_save(self) -> bool:
+        """Whether this rank has a send to pair its saves against.
+
+        Only a producer's PP stage 0 does: mooncake reports done_sending on
+        stage 0 alone (via ``_record_release``). Every other rank passes both
+        completions straight through and must keep no pairing state.
+        """
+        return self.is_producer and self._pp_is_head
 
     def register_kv_caches(
         self,
@@ -245,23 +251,24 @@ class MultiConnector(KVConnectorBase):
         for c, m in zip(self._connectors, metas):
             if m is None:
                 continue
-            # Remember which requests offload is about to save, so get_finished
-            # can hold their send completion until the save also finishes.
-            reqs = getattr(m, "requests", None)
-            if reqs:
-                for req in reqs:
-                    has_save = (
-                        getattr(req, "save_spec", None) is not None
-                        or getattr(req, "slot_save_spec", None) is not None
-                    )
-                    if not has_save:
-                        continue
-                    req_key = completion_req_key(req.req_id)
-                    self._pending_save.add(req_key)
-                    operation = getattr(req, "save_operation", None)
-                    self._pending_save_ops.setdefault(req_key, set()).add(
-                        operation if operation is not None else req_key
-                    )
+            # Remember what offload is about to save, so get_finished can hold
+            # the send until it finishes.
+            if self._pairs_send_and_save:
+                reqs = getattr(m, "requests", None)
+                if reqs:
+                    for req in reqs:
+                        has_save = (
+                            getattr(req, "save_spec", None) is not None
+                            or getattr(req, "slot_save_spec", None) is not None
+                        )
+                        if not has_save:
+                            continue
+                        req_key = completion_req_key(req.req_id)
+                        self._pending_save.add(req_key)
+                        operation = getattr(req, "save_operation", None)
+                        self._pending_save_ops.setdefault(req_key, set()).add(
+                            operation if operation is not None else req_key
+                        )
             c.start_load_kv(m)
 
     def get_finished(self) -> KVConnectorOutput:
@@ -287,16 +294,12 @@ class MultiConnector(KVConnectorBase):
             failed_loading=load_failed,
         )
 
-        if not self.is_producer or not self._pp_is_head:
-            # Non-producer: no moriio send to pair with.
-            # Non-head PP stage: mooncake only reports done_sending on stage 0
-            # (via _record_release), so downstream stages would wait forever.
+        if not self._pairs_send_and_save:
             out.finished_sending = set(send_now)
             out.finished_saving = set(save_now)
             return out
 
-        # Producer + offload: pair each request's send and save before
-        # releasing either (see module docstring).
+        # Pair each request's send and save before releasing either.
         for r in send_now:
             self._sent[str(r)] = r
         for r in save_now:
@@ -307,9 +310,7 @@ class MultiConnector(KVConnectorBase):
                 if r in pending_ops:
                     pending_ops.discard(r)
                 else:
-                    # Metadata from a legacy connector has no exact operation
-                    # ID and is represented by the request key.
-                    pending_ops.discard(key)
+                    pending_ops.discard(key)  # legacy: keyed by request
                 if not pending_ops:
                     self._pending_save_ops.pop(key, None)
 
@@ -418,10 +419,9 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
     def process_completions(self, output: KVConnectorOutput) -> KVConnectorOutput:
         """Let every sub apply its own completions and normalize the output.
 
-        Only the offload sub defines this. Without the fan-out its
-        ``save_finished`` / ``load_finished`` bookkeeping never clears, and the
-        exact ``SaveOperationId`` / ``LoadOperationId`` identities reach the
-        scheduler, which looks requests up by bare id.
+        Only offload defines this. Without the fan-out its save/load
+        bookkeeping never clears and raw operation ids reach the scheduler,
+        which looks requests up by bare id.
         """
         for c in self._connectors:
             handler = getattr(c, "process_completions", None)

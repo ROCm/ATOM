@@ -448,9 +448,7 @@ def test_pairing_waits_for_all_save_operation_ids():
     op0 = SaveOperationId(9, 2)
     op1 = SaveOperationId(9, 3)
     w.start_load_kv(
-        MultiConnectorMetadata(
-            [ConnectorMetadata(), _save_operation_meta(op0, op1)]
-        )
+        MultiConnectorMetadata([ConnectorMetadata(), _save_operation_meta(op0, op1)])
     )
 
     moriio._finished = ({9}, set())
@@ -472,7 +470,8 @@ def test_pairing_waits_for_all_save_operation_ids():
 
 def test_non_head_pp_stage_does_not_pair():
     # Downstream stages never see mooncake's done_sending (it is recorded on
-    # stage 0 only), so pairing there would strand every save.
+    # stage 0 only), so pairing there would strand every save. get_finished
+    # returns before the release loop, so registering state there leaks it.
     moriio = FakeWorkerSub(is_producer=True)
     off = FakeWorkerSub(finished=KVConnectorOutput(finished_saving={9}))
     w = _worker([moriio, off], pp_is_head=False)
@@ -481,6 +480,8 @@ def test_non_head_pp_stage_does_not_pair():
     out = w.get_finished()
     assert out.finished_saving == {9}
     assert out.finished_sending == set()
+    assert w._pending_save == set()
+    assert w._pending_save_ops == {}
 
 
 @pytest.mark.parametrize("pp_rank, holds_send", [(0, True), (1, False)])

@@ -332,11 +332,9 @@ class ConnectorMetadata:
 def completion_req_key(completion: ConnectorCompletionId) -> str:
     """Request identity shared by every shape a completion can take.
 
-    An offload connector reports ``SaveOperationId(req_id, generation)`` (or
-    ``LoadOperationId``) once it tracks generations and a bare request id
-    otherwise, while the send side and the scheduler only ever know requests.
-    Anything that pairs a completion with per-request state has to collapse
-    both shapes onto the request id first, or the lookup silently never hits.
+    Offload reports ``SaveOperationId``/``LoadOperationId`` or a bare request
+    id; the send side and the scheduler only know requests. Pairing the two
+    means collapsing onto the request id first, or the lookup never hits.
     """
     return str(getattr(completion, "req_id", completion))
 
