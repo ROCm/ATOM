@@ -115,6 +115,24 @@ def test_page_namespace_changes_for_meaningful_geometry(mutate):
     assert offcfg.build_page_namespace(config, cfg, 4) != original
 
 
+def test_page_namespace_separates_replicated_index_layout(monkeypatch):
+    config = _config()
+    config.speculative_config = None
+    config.hf_config.model_type = "glm_moe_dsa"
+    config.hf_config.indexer_types = ["full", "shared", "shared"]
+    cfg = _lmcache_config()
+
+    monkeypatch.delenv("ATOM_DCP_REPLICATE_INDEX_CACHE", raising=False)
+    sharded = offcfg.build_page_namespace(config, cfg, 4)
+    monkeypatch.setenv("ATOM_DCP_REPLICATE_INDEX_CACHE", "1")
+    replicated = offcfg.build_page_namespace(config, cfg, 4)
+    assert replicated != sharded
+
+    config.hf_config.indexer_types = ["full", "full", "shared"]
+    changed_schedule = offcfg.build_page_namespace(config, cfg, 4)
+    assert changed_schedule != replicated
+
+
 def test_page_namespace_changes_when_code_layout_version_changes():
     current = offcfg.build_page_namespace(_config(), _lmcache_config(), 4)
     future = offcfg.build_page_namespace(
