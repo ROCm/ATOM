@@ -17,6 +17,7 @@ from aiter import (
 
 from atom.distributed.dcp_utils import (
     dcp_persistent_supported,
+    dcp_replicated_index_cache_enabled,
     get_dcp_rank,
     get_dcp_world_size,
 )
@@ -171,6 +172,57 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         self.dcp_world_size = get_dcp_world_size()
         self.dcp_rank = get_dcp_rank()
+        self.replicate_index_cache = dcp_replicated_index_cache_enabled(config)
+        if envs.ATOM_DCP_REPLICATE_INDEX_CACHE:
+            unsupported = []
+            if getattr(hf_config, "model_type", None) != "glm_moe_dsa":
+                unsupported.append("model_type must be glm_moe_dsa")
+            if self.dcp_world_size <= 1:
+                unsupported.append("decode context parallel size must be > 1")
+            if config.speculative_config is not None:
+                unsupported.append("MTP/speculative decoding is not supported")
+            if self.block_size != 1:
+                unsupported.append("MLA page size must be 1")
+            if get_pcp_world_size() > 1:
+                unsupported.append("PCP is not supported")
+            if getattr(config, "pipeline_parallel_size", 1) > 1:
+                unsupported.append("pipeline parallelism is not supported")
+            if getattr(config, "kv_transfer_config", None):
+                unsupported.append("KV transfer/LMCache/PD is not supported")
+            if getattr(config, "enable_rapidserve", False):
+                unsupported.append("RapidServe disaggregation is not supported")
+            if unsupported:
+                raise ValueError(
+                    "ATOM_DCP_REPLICATE_INDEX_CACHE=1 is unsupported: "
+                    + "; ".join(unsupported)
+                )
+
+        self.full_index_layer_ids: tuple[int, ...] = ()
+        self.index_layer_to_cache_row: dict[int, int] = {}
+        if self.replicate_index_cache:
+            indexer_types = getattr(hf_config, "indexer_types", None)
+            if not indexer_types or len(indexer_types) != hf_config.num_hidden_layers:
+                raise ValueError(
+                    "Replicated GLM index cache requires one indexer_types entry "
+                    "per target layer"
+                )
+            self.full_index_layer_ids = tuple(
+                layer_id
+                for layer_id, indexer_type in enumerate(indexer_types)
+                if indexer_type == "full"
+            )
+            if not self.full_index_layer_ids:
+                raise ValueError("Replicated GLM index cache found no full IndexShare layers")
+            self.index_layer_to_cache_row = {
+                layer_id: row
+                for row, layer_id in enumerate(self.full_index_layer_ids)
+            }
+            logger.info(
+                "Replicating GLM index cache for %d full IndexShare layers "
+                "across %d DCP ranks",
+                len(self.full_index_layer_ids),
+                self.dcp_world_size,
+            )
 
         # DCP decode all-gathers Q on the head dim, so the head count reaching
         # mla_decode_fwd (and thus the persistent decode metadata) is the padded
@@ -222,6 +274,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             **_mla_seg_meta_kwargs(),
         )
         i32_kwargs = {"dtype": torch.int32, "device": self.device}
+        i64_kwargs = {"dtype": torch.int64, "device": self.device}
 
         mla_metadata = {
             # AITER MLA specific persistent buffers
@@ -261,6 +314,14 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         mla_metadata["kv_last_page_lens"].cpu.fill_(1)
         mla_metadata["kv_last_page_lens"].copy_to_gpu()
         if self.is_sparse:
+            if self.replicate_index_cache:
+                mla_metadata["index_slot_mapping"] = CpuGpuBuffer(
+                    self.max_num_batched_tokens, **i64_kwargs
+                )
+                # CUDAGraph capture may execute cache writes before the first
+                # scheduled batch. Point those dummy writes at a valid slot.
+                mla_metadata["index_slot_mapping"].np.fill(0)
+                mla_metadata["index_slot_mapping"].copy_to_gpu()
             mla_metadata["cu_seqlen_ke"] = CpuGpuBuffer(
                 self.max_num_batched_tokens, **i32_kwargs
             )
@@ -504,6 +565,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 ub_max_bs * max_seqlen_qo,
                 **i64_kwargs,
             )
+            if self.replicate_index_cache:
+                var[f"{p}index_slot_mapping"] = CpuGpuBuffer(
+                    ub_max_bs * max_seqlen_qo,
+                    **i64_kwargs,
+                )
+                var[f"{p}index_slot_mapping"].np.fill(0)
+                var[f"{p}index_slot_mapping"].copy_to_gpu()
             var[f"{p}block_tables"] = CpuGpuBuffer(
                 ub_max_bs,
                 self.max_num_blocks_per_seq // self.block_ratio,
@@ -866,9 +934,18 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         if runner.is_deepseek_v32:
             index_dim = hf_config.index_head_dim + 4
             aligned_index_dim = ((index_dim + 15) // 16) * 16
+            index_layers = (
+                len(self.full_index_layer_ids)
+                if self.replicate_index_cache
+                else total_num_layers
+            )
+            index_page_factor = (
+                self.dcp_world_size if self.replicate_index_cache else 1
+            )
             block_bytes += (
-                total_num_layers
+                index_layers
                 * runner.block_size
+                * index_page_factor
                 * aligned_index_dim
                 * dtypes.fp8.itemsize
             )
@@ -903,15 +980,26 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # to avoid unaligned memory access in torch inductor.
             index_dim = hf_config.index_head_dim + 4
             aligned = ((index_dim + 15) // 16) * 16
+            index_layers = (
+                len(self.full_index_layer_ids)
+                if self.replicate_index_cache
+                else total_num_layers
+            )
+            index_page_factor = (
+                self.dcp_world_size if self.replicate_index_cache else 1
+            )
             out["aligned_index_dim"] = aligned
             out["index_cache"] = torch.zeros(
-                total_num_layers,
+                index_layers,
                 runner.num_physical_kvcache_blocks,
-                runner.physical_block_size,
+                runner.physical_block_size * index_page_factor,
                 aligned,
                 dtype=dtypes.fp8,
                 device="cuda",
             )
+            if self.replicate_index_cache:
+                out["index_layer_to_cache_row"] = self.index_layer_to_cache_row
+                out["full_index_layer_ids"] = self.full_index_layer_ids
         return out
 
     def build_kv_cache_tensor(self, layer_id: int, module):
@@ -938,22 +1026,40 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         kv_cache = runner.kv_cache[layer_id].view(num_slots, 1, 576)
         module.max_model_len = runner.config.max_model_len
         if runner.is_deepseek_v32 and module.indexer is not None:
+            index_row = (
+                self.index_layer_to_cache_row[layer_id]
+                if self.replicate_index_cache
+                else layer_id
+            )
+            index_page_factor = (
+                self.dcp_world_size if self.replicate_index_cache else 1
+            )
             # Use aligned dimension to avoid memory copy in torch inductor
-            module.indexer.k_cache.kv_cache[0] = runner.index_cache[layer_id].view(
-                runner.num_physical_kvcache_blocks * runner.physical_block_size,
+            module.indexer.k_cache.kv_cache[0] = runner.index_cache[index_row].view(
+                runner.num_physical_kvcache_blocks
+                * runner.physical_block_size
+                * index_page_factor,
                 1,
                 runner.aligned_index_dim,
             )
+            module.indexer.replicate_index_cache = self.replicate_index_cache
         module.kv_cache = kv_cache
+        if runner.is_deepseek_v32 and self.replicate_index_cache:
+            index_row = self.index_layer_to_cache_row.get(layer_id)
+            transfer_index_cache = (
+                runner.index_cache[index_row] if index_row is not None else None
+            )
+        else:
+            transfer_index_cache = (
+                runner.index_cache[layer_id] if runner.is_deepseek_v32 else None
+            )
         return KVCacheTensor(
             layer_num=layer_id,
             k_cache=kv_cache,
             v_cache=None,
             k_scale=None,
             v_scale=None,
-            index_cache=(
-                runner.index_cache[layer_id] if runner.is_deepseek_v32 else None
-            ),
+            index_cache=transfer_index_cache,
         )
 
     def get_kv_transfer_tensors(self):
@@ -1063,6 +1169,28 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         bs = batch.total_seqs_num_prefill
         sum_scheduled_tokens = batch.total_tokens_num_prefill
         var = self.model_runner.forward_vars
+        if self.replicate_index_cache:
+            if batch.is_dummy_run:
+                var["index_slot_mapping"].np[:sum_scheduled_tokens] = 0
+            else:
+                index_slots = [
+                    self._replicated_index_slot(block_table, pos)
+                    for block_table, cached_len, seq_len in zip(
+                        batch.block_tables,
+                        batch.num_cached_tokens,
+                        batch.context_lens,
+                    )
+                    for pos in range(cached_len, seq_len)
+                ]
+                if len(index_slots) != sum_scheduled_tokens:
+                    raise RuntimeError(
+                        "Replicated index slot count does not match prefill token "
+                        f"count: {len(index_slots)} != {sum_scheduled_tokens}"
+                    )
+                var["index_slot_mapping"].np[:sum_scheduled_tokens] = index_slots
+            attn_metadata.index_slot_mapping = var[
+                "index_slot_mapping"
+            ].copy_to_gpu(sum_scheduled_tokens)
         if self.is_sparse and attn_metadata.max_seqlen_k > self.index_topk:
             if attn_metadata.block_tables is None:
                 self.prepare_block_tables(batch)
@@ -1125,7 +1253,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             attn_metadata.sparse_kv_indptr = var["sparse_kv_indptr"].copy_to_gpu(
                 sum_scheduled_tokens + 1
             )
-            if self.dcp_world_size > 1:
+            if self.dcp_world_size > 1 and not self.replicate_index_cache:
                 self._build_dcp_indexer_prefill_meta(attn_metadata, bs, counts, var)
             get_mla_metadata_v1(
                 attn_metadata.sparse_cu_seqlens_q,
@@ -1578,6 +1706,19 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             + dcp_local_index(pos, W, S) % block_size
         )
 
+    def _replicated_index_slot(self, block_table, pos: int) -> int:
+        """Physical slot for a global token in an expanded replicated page.
+
+        Scheduler block IDs and lifetimes stay unchanged. Each scheduler block's
+        index-cache page is widened from ``block_size`` local tokens to
+        ``block_size * dcp_world_size`` global tokens.
+        """
+        expanded_page_size = self.model_runner.block_size * self.dcp_world_size
+        return (
+            block_table[pos // expanded_page_size] * expanded_page_size
+            + pos % expanded_page_size
+        )
+
     def prepare_decode(self, batch: ScheduledBatch, bs: int):
         scheduled_bs = batch.total_seqs_num_decode
         dropout_p = 0.0
@@ -1640,6 +1781,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         var["positions"].np[:sum_scheduled_tokens] = positions
         var["context_lens"].np[:scheduled_bs] = context_lens
         var["context_lens"].np[scheduled_bs:bs] = 0
+        if self.replicate_index_cache:
+            var["index_slot_mapping"].np[:bs] = 0
+            if not batch.is_dummy_run:
+                var["index_slot_mapping"].np[:scheduled_bs] = [
+                    self._replicated_index_slot(block_table, int(seq_len) - 1)
+                    for block_table, seq_len in zip(block_tables, context_lens)
+                ]
 
         if self.dcp_world_size > 1:
             from atom.model_ops.dcp_ops import get_dcp_local_seq_lens
@@ -1787,6 +1935,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         is_sparse_mtp = self.is_sparse and max_seqlen_q > 1
         # metadata copies on main stream
         positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
+        index_slot_mapping = (
+            var["index_slot_mapping"].copy_to_gpu(bs)
+            if self.replicate_index_cache
+            else None
+        )
         ctx.update({el: var[el].copy_to_gpu(num) for el, num in vars_for_metadata})
 
         if is_sparse_mtp:
@@ -1822,6 +1975,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             **ctx,
         )
         attn_metadata.dtype_q = self.dtype_q
+        if self.replicate_index_cache:
+            attn_metadata.index_slot_mapping = index_slot_mapping
 
         # Round-robin CP global kv_indptr (only under DCP; None otherwise so the
         # non-DCP / qlen=1 paths keep the plain kernel). Consumed by
@@ -1912,6 +2067,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 tok_start : tok_start + ub_real_tokens
             ]
             var[f"{p}slot_mapping"].np[ub_real_tokens:padded_tok_count] = -1
+            if self.replicate_index_cache:
+                var[f"{p}index_slot_mapping"].np[:ub_real_tokens] = var[
+                    "index_slot_mapping"
+                ].np[tok_start : tok_start + ub_real_tokens]
+                var[f"{p}index_slot_mapping"].np[
+                    ub_real_tokens:padded_tok_count
+                ] = 0
 
             var[f"{p}block_tables"].np[:ub_real_reqs] = var["block_tables"].np[
                 req_start : req_start + ub_real_reqs
@@ -1983,6 +2145,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 vars_used.append((f"{p}g_kv_indptr", padded_bs + 1))
             if self.is_sparse:
                 vars_used.append((f"{p}sparse_kv_indptr", padded_bs + 1))
+            if self.replicate_index_cache:
+                vars_used.append((f"{p}index_slot_mapping", padded_tok_count))
 
             for el, num in vars_used:
                 var[el].copy_to_gpu(num)
@@ -2117,6 +2281,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             **ctx_mla_ps,
         )
         attn_matadata.dtype_q = self.dtype_q
+        if self.replicate_index_cache:
+            attn_matadata.index_slot_mapping = var["index_slot_mapping"].gpu[:bs]
         # Attach the round-robin CP global kv_indptr for the captured graph so
         # replay (which overwrites the buffer with real values) matches. Only
         # consumed by _forward_decode when dcp>1 and max_q_len>1.
@@ -2197,6 +2363,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             reduce_partial_map=var[f"{p}reduce_partial_map"],
         )
         attn.dtype_q = self.dtype_q
+        if self.replicate_index_cache:
+            attn.index_slot_mapping = var[f"{p}index_slot_mapping"].gpu[
+                : padded_bs * max_q_len
+            ]
         # Per-ubatch round-robin CP global kv_indptr (None when non-DCP). Consumed
         # by _forward_decode when dcp>1 and max_q_len>1 (MTP).
         attn.g_kv_indptr = (

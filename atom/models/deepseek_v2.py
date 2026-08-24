@@ -1394,6 +1394,13 @@ def _dcp_gather_indexer_k_prefill(
     return k_fp8, k_scale
 
 
+def _dcp_index_comm_required(
+    dcp_world_size: int, replicated_index_cache: bool
+) -> bool:
+    """Whether index top-k still needs a cross-rank gather/merge."""
+    return dcp_world_size > 1 and not replicated_index_cache
+
+
 def _dcp_decode_candidate_exchange(
     attn_metadata,
     padded_q_fp8_decode_tokens: torch.Tensor,
@@ -1566,7 +1573,14 @@ def sparse_attn_indexer(
     forward_context = get_forward_context()
     attn_metadata = forward_context.attn_metadata
     context = forward_context.context
-    slot_mapping = attn_metadata.slot_mapping
+    replicated_index_cache = (
+        getattr(attn_metadata, "index_slot_mapping", None) is not None
+    )
+    slot_mapping = (
+        attn_metadata.index_slot_mapping
+        if replicated_index_cache
+        else attn_metadata.slot_mapping
+    )
     # Skip for dummy runs to avoid corrupting KV cache
     if forward_context.context.is_dummy_run:
         # dummy runner
@@ -1577,7 +1591,10 @@ def sparse_attn_indexer(
     )
     runner_block_size = get_current_atom_config().kv_cache_block_size
     cp_kv_cache_interleave_size = get_current_atom_config().dcp_config.interleave_size
-    kv_cache = kv_cache.view(-1, runner_block_size, kv_cache.shape[-1])
+    index_block_size = runner_block_size * (
+        get_dcp_world_size() if replicated_index_cache else 1
+    )
+    kv_cache = kv_cache.view(-1, index_block_size, kv_cache.shape[-1])
     # PCP prefill: `k` (and `positions`) arrive as the full PADDED key set
     # [S_pad] produced by an all-gather of the round-robin shards. The KV-cache
     # write (driven by slot_mapping) and the gathered-KV sizing (total_kv =
@@ -1655,7 +1672,9 @@ def sparse_attn_indexer(
                 dtype=torch.long,
                 device=prefill_metadata.block_tables.device,
             )
-        if get_dcp_world_size() > 1:
+        if _dcp_index_comm_required(
+            get_dcp_world_size(), replicated_index_cache
+        ):
             k_fp8, k_scale = _dcp_gather_indexer_k_prefill(
                 kv_cache, prefill_metadata, head_dim, k.device
             )
@@ -1792,8 +1811,8 @@ def sparse_attn_indexer(
         num_rows = batch_size * next_n
         dcp_world_size = get_dcp_world_size()
         logits = None
-        if dcp_world_size > 1:
-            dcp_rank = get_dcp_rank()
+        dcp_rank = get_dcp_rank() if dcp_world_size > 1 else 0
+        if _dcp_index_comm_required(dcp_world_size, replicated_index_cache):
             _dcp_decode_candidate_exchange(
                 attn_metadata,
                 padded_q_fp8_decode_tokens,
@@ -1820,7 +1839,7 @@ def sparse_attn_indexer(
                 decode_metadata.context_lens,
                 attn_metadata.block_tables,
                 max_model_len,
-                KVBlockSize=runner_block_size,
+                KVBlockSize=index_block_size,
                 Preshuffle=True,
             )
         assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
