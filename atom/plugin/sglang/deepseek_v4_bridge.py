@@ -1545,9 +1545,7 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
         visible_np = np.minimum((pos_np + 1) // 4, n_csa[batch_np]).astype(np.int32)
     else:
         visible_np = np.zeros(0, dtype=np.int32)
-    md.n_committed_per_token = bufs.stage(
-        bufs.n_committed_per_token, visible_np, t_pad
-    )
+    md.n_committed_per_token = bufs.stage(bufs.n_committed_per_token, visible_np, t_pad)
     block_cols = int(block_tables.shape[1])
     block_rows = bufs.block_tables_per_token.gpu[:t_pad, :block_cols]
     safe_batch_ids = md.batch_id_per_token[:t_pad].clamp_min(0).long()
