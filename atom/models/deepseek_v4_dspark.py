@@ -301,30 +301,6 @@ def _apply_dspark_kv_qat_(kv: torch.Tensor, rope_dim: int) -> None:
     _fake_fp8_e4m3_inplace(non_rope, block_size=64)
 
 
-_BATCH_IDS_CACHE: dict = {}
-
-
-def _dspark_batch_ids(batch: int, draft: int, device) -> torch.Tensor:
-    """`[B*T]` request id per query row, for the fused SWA scatter.
-
-    Depends only on the shape, so it is cached rather than rebuilt: an
-    `arange().expand().reshape()` is three launches in front of a kernel that
-    reads a few hundred rows.
-    """
-    key = (batch, draft, str(device))
-    hit = _BATCH_IDS_CACHE.get(key)
-    if hit is None:
-        hit = (
-            torch.arange(batch, device=device, dtype=torch.int32)
-            .view(batch, 1)
-            .expand(batch, draft)
-            .reshape(-1)
-            .contiguous()
-        )
-        _BATCH_IDS_CACHE[key] = hit
-    return hit
-
-
 def _dspark_block_topk_idxs(
     B: int, T: int, W: int, valid_target: torch.Tensor, device
 ) -> torch.Tensor:
@@ -518,9 +494,8 @@ try:
     from atom.model_ops.linear import ReplicatedLinear
     from atom.model_ops.v4_kernels.dspark_fp8_indices import (
         dspark_build_indices,
-        dspark_indices_view,
-        dspark_kv_index_scratch,
-        dspark_qo_indptr,
+        dspark_index_buffers,
+        dspark_index_views,
     )
     from atom.model_ops.v4_kernels.paged_decode import sparse_attn_v4_paged_decode
     from atom.model_ops.v4_kernels.qk_norm_rope_maybe_quant import (
@@ -854,16 +829,14 @@ class DSparkLayer(Block):  # type: ignore[misc]
             # all of them. Stage 0 always runs first and always refills them --
             # `_DSparkInner.forward` walks `self.mtp` in order -- and
             # `dspark_indices_view` raises if it somehow did not.
-            kv_buf = dspark_kv_index_scratch(B, T, W, x.device)
+            bufs = self.dspark_index_buffers(T, W, x.device)
             if self.stage_id == 0:
                 kv_indices, kv_indptr, draft_rows = dspark_build_indices(
-                    a.swa_window, slots, positions, T, W, kv_buf
+                    a.swa_window, slots, positions, T, W, bufs
                 )
             else:
-                kv_indices, kv_indptr, draft_rows = dspark_indices_view(
-                    B, T, W, x.device, kv_buf
-                )
-            batch_ids = _dspark_batch_ids(B, T, x.device)
+                kv_indices, kv_indptr, draft_rows = dspark_index_views(bufs, B, T, W)
+            batch_ids = bufs.batch_ids[: B * T]
 
         # Per-head weightless Q RMSNorm + weighted KV RMSNorm + GPT-J RoPE in ONE
         # fused kernel — the same `qk_norm_rope_maybe_quant` the V4 target runs
@@ -913,7 +886,7 @@ class DSparkLayer(Block):  # type: ignore[misc]
                 unified_kv_rope=a.unified_kv_rope,
                 q_packed_in=qkn.q_packed,
                 q_rope_in=qkn.q_rope,
-                qo_indptr=dspark_qo_indptr(B, T, x.device),
+                qo_indptr=bufs.qo_indptr[: B * T + 1],
                 prefix=f"{a.layer_name}.dspark_attn_fp8",
             )  # [B*T, n_heads, head_dim]
             out = out.view(B, T, a.n_local_heads, a.head_dim)
@@ -1208,6 +1181,29 @@ class DeepseekV4DSpark(DSparkDraftModel):
         return self.model.head_and_sample(normed, hc_hidden, input_ids)
 
 
+class _DSparkIndexBufferOwner:
+    """Lazily allocates the one `DSparkIndexBuffers` the whole backbone shares.
+
+    Sized at `max_num_seqs` and only ever sliced, so there is nothing keyed by
+    shape and nothing reallocated per step. Lazy because the draft width is a
+    forward argument: fixed for the process (`DeepseekV4DSpark.forward_spec`
+    raises if it changes) but not known when the model is built.
+
+    Every stage holds the same owner. That is what lets stage 0 fill the CSR
+    and the rest read it back, and it is why this is one object on the model
+    rather than a buffer per layer.
+    """
+
+    def __init__(self, max_batch: int) -> None:
+        self.max_batch = max_batch
+        self._bufs = None
+
+    def __call__(self, draft: int, window: int, device):
+        if self._bufs is None:
+            self._bufs = dspark_index_buffers(self.max_batch, draft, window, device)
+        return self._bufs
+
+
 @support_torch_compile
 class _DSparkInner(nn.Module):
     """Inner module owning the DSpark backbone layers; embed/head set externally.
@@ -1257,6 +1253,11 @@ class _DSparkInner(nn.Module):
             ]
         )
         self.layers = self.mtp  # alias for reset_kv_cache iteration
+        # One index-buffer owner for the whole backbone: the fp8 path's CSR is
+        # stage-invariant, so stage 0 fills these and the rest read them back.
+        owner = _DSparkIndexBufferOwner(int(atom_config.max_num_seqs))
+        for layer in self.mtp:
+            layer.dspark_index_buffers = owner
         self.embed = None  # set by share_with_target
         self.head = None
 
