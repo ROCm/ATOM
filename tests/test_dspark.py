@@ -624,28 +624,6 @@ def test_traced_region_reads_no_per_step_globals():
         assert not leaked, f"{fn.__qualname__} reads {sorted(leaked)}"
 
 
-def test_warmup_is_the_first_traced_call_and_is_padded_off_0_1():
-    # mark_dynamic (decorator, FIRST call only) specializes size-0/1 dims rather
-    # than symbolizing them, so a graph first traced at B==1 holds no SymInt and
-    # PiecewiseBackend raises IndexError on sym_shape_indices[0].
-    #
-    # Warmup is made the first traced call and padded to B==2. Padding is sound
-    # ONLY there: the opaque attention op synthesizes a zero window on a dummy
-    # run and never reads attn_metadata. On a real step attn_metadata has
-    # exactly B rows, so swa_block_tables[:B] would return the real count and
-    # the [window ++ draft] concat would mismatch.
-    import inspect
-
-    from atom.models.deepseek_v4_dspark import DeepseekV4DSpark
-
-    src = inspect.getsource(DeepseekV4DSpark.forward_spec)
-    # Both paths go through __call__ now -- no `.forward` bypass.
-    assert "self.model.forward(" not in src
-    assert "self.model(" in src
-    # ...and the pad is gated on the dummy run.
-    assert "is_dummy and" in src
-
-
 def test_num_draft_change_raises():
     # num_draft is a python int, so it is baked into the compiled graph. It is
     # constant in practice (min(mtp_k, window_size)); fail loudly rather than
@@ -814,7 +792,7 @@ def test_lm_head_and_markov_sampler_are_outside_the_compiled_region():
     import inspect
     import textwrap
 
-    from atom.models.deepseek_v4_dspark import DeepseekV4DSpark, _DSparkInner
+    from atom.models.deepseek_v4_dspark import _DSparkInner
 
     tree = ast.parse(textwrap.dedent(inspect.getsource(_DSparkInner.forward)))
     attrs = set()
@@ -824,31 +802,38 @@ def test_lm_head_and_markov_sampler_are_outside_the_compiled_region():
     assert "get_logits" not in attrs, "LM head must not be traced"
     assert "forward_head" not in attrs, "Markov sampler must not be traced"
 
-    # ...and the wrapper must actually run them, or the draft returns hidden
-    # states instead of tokens.
-    src = inspect.getsource(DeepseekV4DSpark.forward_spec)
-    assert "head_and_sample" in src
+    # That the wrapper actually runs them is asserted where it can be
+    # observed -- `test_forward_spec_passes_the_batch_through_unpadded` records
+    # `head_and_sample`'s arguments, which only happens if it was called.
 
     # head_and_sample is a plain method: the decorator replaces only __call__.
     assert callable(_DSparkInner.head_and_sample)
 
 
-@pytest.mark.parametrize(
-    "is_dummy, B, expect_B",
-    [
-        # Warmup is the first traced call; padding B==1 to 2 keeps the batch dim
-        # symbolic (mark_dynamic specializes size-1). Sound only on a dummy run:
-        # the opaque attention op synthesizes a zero window and never reads
-        # attn_metadata. On a real step attn_metadata has exactly B rows, so
-        # swa_block_tables[:B] would return the real count and the
-        # [window ++ draft] concat would die on mismatched batch dims.
-        (True, 1, 2),
-        (False, 1, 1),
-        (True, 4, 4),
-        (False, 4, 4),
-    ],
-)
-def test_batch_dim_padded_only_for_a_dummy_run_at_b1(is_dummy, B, expect_B):
+@pytest.mark.parametrize("is_dummy", [True, False], ids=["dummy", "real"])
+@pytest.mark.parametrize("B", [1, 4])
+def test_forward_spec_passes_the_batch_through_unpadded(is_dummy, B):
+    """No pad, on any batch, dummy or not.
+
+    `forward_spec` used to repeat a B==1 dummy run to B==2: warmup was the
+    first traced call and `mark_dynamic` cannot make a size-1 dim dynamic.
+    Under `--enable-dp-attention` that pad ran 2*T MoE rows against a
+    `dp_metadata` sized for B==1 and tripped reduce_scatterv, so #1915 fixed
+    it upstream instead -- `warmup_model` gives a block drafter >= 2 sequences,
+    so the first trace is already B>=2 -- and dropped the pad entirely.
+
+    The two tests that covered the pad were left behind asserting a `repeat(2)`
+    that no longer happens and an `"is_dummy and" in src` that is no longer in
+    the source. Both were red from the day #1915 landed and nobody was told,
+    because this module `importorskip`s aiter and CI has none. This is the
+    contract that replaced them, and it is read off the call rather than off
+    the source: the pad would show up here as a batch the inner model did not
+    ask for.
+
+    `is_dummy` is still varied because "dummy runs are not special either" is
+    half of what changed.
+    """
+    expect_B = B
     from atom.models.deepseek_v4_dspark import DeepseekV4DSpark
 
     T = 5

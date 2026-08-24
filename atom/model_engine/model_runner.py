@@ -43,7 +43,12 @@ from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
 from atom.model_engine.run_labels import build_run_label
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
-from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
+from atom.model_engine.sequence import (
+    Sequence,
+    SequenceStatus,
+    SequenceType,
+    new_block_table,
+)
 from atom.model_engine.state_runtime import StateRuntime
 from atom.model_loader.loader import load_model
 from atom.model_ops.attentions.sub_pool_spec import (
@@ -72,6 +77,7 @@ from atom.utils import (
     get_hf_text_config,
     init_exit_handler,
     resolve_obj_by_qualname,
+    worker_process_name,
 )
 from atom.utils.cuda_graph import BatchDescriptor
 from atom.utils.forward_context import (
@@ -84,6 +90,7 @@ from atom.utils.forward_context import (
     set_forward_context,
     set_kv_cache_data,
 )
+from atom.utils.gc_utils import freeze_gc_heap
 from atom.utils.selector import get_attn_backend
 from atom.utils.tbo import (
     UBatchSlice,
@@ -939,6 +946,11 @@ class ModelRunner:
             world_size = dp_size * pp_size * stage_span
             dp_rank = config.parallel_config.data_parallel_rank
             global_rank = (dp_rank * pp_size + pp_rank) * stage_span + rank
+            # No local_rank here, unlike the non-PP branch below. Safe only
+            # because PP is single-node today: CoreManager rejects multi-node
+            # DP when pp_size > 1, and asserts PP+DP out entirely, so
+            # global_rank is already the physical device index. Revisit if
+            # either restriction is lifted.
             init_pp_aware_dist_env(
                 tensor_model_parallel_size=config.tensor_parallel_size,
                 pipeline_model_parallel_size=pp_size,
@@ -957,6 +969,10 @@ class ModelRunner:
                 rankID=rank,
                 backend="nccl",
                 distributed_init_method=distributed_init_method,
+                # This node's physical device index. Without it aiter derives a
+                # local rank from the DP-scaled global rank, which overruns the
+                # device list on every node after the first.
+                local_rank=local_device_rank,
                 data_parallel_size=config.parallel_config.data_parallel_size,
                 data_parallel_rank=config.parallel_config.data_parallel_rank,
                 prefill_context_model_parallel_size=config.prefill_context_parallel_size,
@@ -1146,7 +1162,7 @@ class ModelRunner:
         )
         seq.status = SequenceStatus.RUNNING
         seq.type = SequenceType.DECODE
-        seq.block_table = [0]
+        seq.block_table = new_block_table([0])
 
         spec_tokens = {seq.id: np.zeros(mtp_k, dtype=np.int32)} if mtp_k > 0 else None
         dummy_batch = ScheduledBatch(
@@ -1296,7 +1312,8 @@ class ModelRunner:
         still reading. Each in-flight slot gets its own buffer set; reuse of a
         slot is gated by a per-slot CUDA event (see ``_advance_forward_vars`` /
         ``_record_forward_vars_event``), bounding the CPU's GPU lead to the ring
-        size even when the head pops middle-chunk batches without a GPU sync.
+        size even when the head runs middle-chunk or DP-sync dummy batches
+        without a GPU sync.
 
         When ``pp_size == 1`` the ring is the single original dict and advance is
         a no-op, so behavior is unchanged.
@@ -1320,10 +1337,11 @@ class ModelRunner:
         )
 
         def _clone_slot(src: dict) -> dict:
-            # Only CpuGpuBuffers are per-forward host-pinned staging buffers that
-            # get overwritten each forward. Everything else (the eager `outputs`
-            # tensor, scalar `mtp_k`, ...) is either unused on the eager PP path
-            # or immutable, so share it by reference.
+            # CpuGpuBuffers are the per-forward staging buffers, and only their
+            # host half can be rewritten while an earlier microbatch's kernels
+            # are still reading. Everything else is immutable, unused on the
+            # eager PP path, or device-only, where the stream orders the writing
+            # kernel after those readers.
             return {
                 k: (v.clone() if isinstance(v, CpuGpuBuffer) else v)
                 for k, v in src.items()
@@ -1339,8 +1357,11 @@ class ModelRunner:
         logger.info(f"forward_vars ring: {pp_size} slots (pipeline parallel)")
 
     def _advance_forward_vars(self):
-        """Rotate to the next in-flight slot. Called once per real forward,
-        before any buffer is written. No-op when the ring has a single slot."""
+        """Rotate to the next in-flight slot before any buffer is written.
+
+        Dummy forwards use the same staging buffers as real forwards, so they
+        participate in the ring too. No-op when the ring has a single slot.
+        """
         if len(self._fv_ring) == 1:
             return
         self._fv_idx = (self._fv_idx + 1) % len(self._fv_ring)
@@ -1373,6 +1394,10 @@ class ModelRunner:
         buying nothing. A never-recorded event passes, so the first forward is
         not held.
 
+        DP-sync dummy forwards use these same buffers and can also return while
+        their copies are in flight. They must therefore enter this gate and
+        record the event just like real forwards.
+
         The pipeline ring solves the same problem by rotating buffers, which
         bounds the lead to its depth; `_stage_h2d_done` is None there and this
         does nothing.
@@ -1395,7 +1420,8 @@ class ModelRunner:
     def _record_forward_vars_event(self):
         """Mark the current slot's forward as done on the GPU stream. Paired
         with the synchronize() in ``_advance_forward_vars``. Called at the end of
-        every real forward. No-op when the ring has a single slot."""
+        every forward, including DP-sync dummies. No-op when the ring has a
+        single slot."""
         if len(self._fv_ring) == 1:
             return
         self._fv_slot_events[self._fv_idx].record()
@@ -1580,6 +1606,15 @@ class ModelRunner:
                 overhead / (1 << 30),
             )
         return int(overhead)
+
+    def freeze_gc_heap(self) -> int:
+        """RPC target: freeze this worker's startup heap. Pauses here reached
+        979 ms, the largest of any process.
+
+        The count is returned because `busy_loop` replies only `if out is not
+        None` -- an RPC target returning None hangs its `wait_out=True` caller.
+        """
+        return freeze_gc_heap(worker_process_name(self.config, self.rank))
 
     def get_num_blocks(self) -> dict[str, object]:
         torch.set_default_device(self.device)
@@ -2729,6 +2764,25 @@ class ModelRunner:
         )
         input_ids = self.tokenID_processor.prepare_input_ids(batch)
         self.prepare_inputs(batch, input_ids, preprocessed=preprocessed)
+
+        # Stage the speculative inputs while this forward's normal staging
+        # window is still open.  Both buffers are pinned and reused, so copying
+        # them later from postprocess would fall outside the event recorded by
+        # forward() immediately after prepare_model().
+        if hasattr(self, "drafter"):
+            forward_context = get_forward_context()
+            if batch.next_token_ids is not None:
+                forward_context.context.draft_anchor_overrides = (
+                    self.drafter.anchors_to_gpu(batch.next_token_ids)
+                )
+            ragged_lens = getattr(batch, "dynamic_spec_query_tokens_per_req", None)
+            if ragged_lens is not None and batch.total_tokens_num_prefill == 0:
+                scheduled_bs = batch.total_seqs_num_decode
+                lens_buf = self.forward_vars["ragged_lens"]
+                lens_buf.np[:scheduled_bs] = np.asarray(ragged_lens)[:scheduled_bs]
+                forward_context.context.draft_ragged_lens = lens_buf.copy_to_gpu(
+                    scheduled_bs
+                )
         return (
             input_ids,
             temperatures,
@@ -3328,9 +3382,12 @@ class ModelRunner:
         # Make this forward's staging buffers safe to overwrite before
         # prepare_inputs writes them: rotate to a free slot if there is a ring,
         # otherwise wait out the previous forward's copies.
-        if not batch.is_dummy_run:
-            self._advance_forward_vars()
-            self._gate_staging_reuse()
+        # Dummy forwards use and asynchronously upload the same staging
+        # buffers. Excluding them here leaves no event between a dummy and the
+        # following real forward, allowing that real forward's CPU writes to
+        # race the dummy's still-pending H2D copies.
+        self._advance_forward_vars()
+        self._gate_staging_reuse()
         (
             input_ids,
             temperatures,
@@ -3339,8 +3396,7 @@ class ModelRunner:
             all_greedy,
             needs_independent_noise,
         ) = self.prepare_model(batch)
-        if not batch.is_dummy_run:
-            self._mark_staging_h2d_enqueued()
+        self._mark_staging_h2d_enqueued()
         logits, hidden_states = self.run_model(input_ids, batch)
 
         pp_group = get_pp_group()
@@ -3388,8 +3444,7 @@ class ModelRunner:
                 )
             reset_forward_context()
             # Mark this slot's GPU work (attention consumed its metadata) done.
-            if not batch.is_dummy_run:
-                self._record_forward_vars_event()
+            self._record_forward_vars_event()
             return ScheduledBatchOutput(
                 req_ids=list(batch.req_ids),
                 token_ids=[],
@@ -3410,8 +3465,7 @@ class ModelRunner:
         )
 
         reset_forward_context()
-        if not batch.is_dummy_run:
-            self._record_forward_vars_event()
+        self._record_forward_vars_event()
         return fwd_output
 
     @staticmethod
@@ -3491,7 +3545,8 @@ class ModelRunner:
                 "sampled -- they are matched positionally"
             )
             # -1 marks "sampling supplies it", so keep the sampled value there.
-            override = self.drafter.anchors_to_gpu(nxt)
+            override = forward_context.context.draft_anchor_overrides
+            assert override is not None
             next_token_ids = torch.where(
                 override >= 0, override.to(next_token_ids.dtype), next_token_ids
             )
@@ -3510,15 +3565,11 @@ class ModelRunner:
             # RAGGED: each seg has its own len_i; anchor offset = len_i - num_bonus_i
             # (num_bonus_i = mtp_k - num_reject_i), applied to cu_seqlens_q ends.
             sbs = batch.total_seqs_num_decode
-            # Pinned staging + non_blocking: a pageable H2D here would sit
-            # between the target forward and the block draft and synchronize the
-            # stream, forcing the host to wait out the whole target forward.
-            # int32 matches num_reject_tokens (rejection_sampler emits int32 and
-            # default_num_rejected_tokens is int32), so the arithmetic below
-            # keeps the dtype it had before.
-            lens_buf = self.forward_vars["ragged_lens"]
-            lens_buf.np[:sbs] = np.asarray(ragged_lens)[:sbs]
-            lens_t = lens_buf.copy_to_gpu(sbs)
+            # This pinned H2D was staged in prepare_model(), before the
+            # forward's staging event was recorded. int32 matches
+            # num_reject_tokens, so the arithmetic keeps its original dtype.
+            lens_t = forward_context.context.draft_ragged_lens
+            assert lens_t is not None and lens_t.shape[0] == sbs
             num_bonus = self.drafter.mtp_k - num_reject_tokens[:sbs]
             last_token_offset = lens_t - num_bonus
         elif (

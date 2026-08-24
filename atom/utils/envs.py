@@ -27,6 +27,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_RANK": lambda: int(os.getenv("ATOM_DP_RANK", "0")),
     "ATOM_DP_RANK_LOCAL": lambda: int(os.getenv("ATOM_DP_RANK_LOCAL", "0")),
     "ATOM_DP_SIZE": lambda: int(os.getenv("ATOM_DP_SIZE", "1")),
+    "ATOM_DP_SIZE_LOCAL": lambda: int(os.getenv("ATOM_DP_SIZE_LOCAL", "1")),
     "ATOM_DP_MASTER_IP": lambda: os.getenv("ATOM_DP_MASTER_IP", "127.0.0.1"),
     "ATOM_DP_MASTER_PORT": lambda: int(os.getenv("ATOM_DP_MASTER_PORT", "29500")),
     # Rendezvous base port; set per role when prefill/decode share a node.
@@ -208,8 +209,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # --- Profiling & Logging ---
     "ATOM_TORCH_PROFILER_DIR": lambda: os.getenv("ATOM_TORCH_PROFILER_DIR", None),
+    # Move the startup heap (model, compiled graph, tokenizer, KV block pool)
+    # into CPython's permanent generation once warmup is done, so collections
+    # stop scanning it.  On by default; set 0 to keep the old behaviour.
+    # See freeze_gc_heap in atom/utils/gc_utils.py.
+    "ATOM_GC_FREEZE": lambda: os.getenv("ATOM_GC_FREEZE", "1") == "1",
+    # Log every garbage collection: generation, duration, objects reclaimed.
+    "ATOM_GC_DEBUG": lambda: os.getenv("ATOM_GC_DEBUG", "0") == "1",
     # "t0,t1,t2" for gc.set_threshold(); empty keeps CPython's default.
-    # See _tune_gc in api_server.py.
+    # Read independently by the API server, each EngineCore and each
+    # ModelRunner worker -- thresholds are per-interpreter.  A fallback for
+    # ATOM_GC_FREEZE=0: freezing removes the cost of a pass, this only spaces
+    # the passes out.  See tune_gc in atom/utils/gc_utils.py.
     "ATOM_GC_THRESHOLD": lambda: os.getenv("ATOM_GC_THRESHOLD", "").strip(),
     "ATOM_PROFILER_MORE": lambda: os.getenv("ATOM_PROFILER_MORE", "0") == "1",
     # When profiling is active, append detailed attention aggregates (sqsq, sqsk, sk)
@@ -274,7 +285,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Quantize eligible modules as they load to reduce peak memory. Streaming
     # quantizes local TP shards, so results may differ slightly from offline.
     "ATOM_ONLINE_QUANT_STREAMING": lambda: (
-        os.getenv("ATOM_ONLINE_QUANT_STREAMING", "1").lower() in ("1", "true")
+        os.getenv("ATOM_ONLINE_QUANT_STREAMING", "0").lower() in ("1", "true")
     ),
     # Tail workers for H2D, quantization, and source release. More workers
     # increase overlap and in-flight memory; 0 runs inline.

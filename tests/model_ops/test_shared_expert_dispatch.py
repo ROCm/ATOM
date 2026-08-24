@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from conftest import atom_config_double
 
 pytest.importorskip("aiter", reason="full dispatch tests require aiter")
 
@@ -179,11 +180,24 @@ def test_ep_alone_does_not_imply_all2all(
 
 
 def _atom_config(*, eplb: bool) -> SimpleNamespace:
-    return SimpleNamespace(
+    """The four fields this gate reads, over the real Config's defaults.
+
+    Hand-built, this went red the day `is_rocm_aiter_fusion_shared_expert_
+    enabled_for_quant_config` grew a read of `enable_dp_attention` -- a field
+    that exists on Config with a default of False, so the double should have
+    had it. `atom_config_double` takes every field from
+    `dataclasses.fields(Config)`, so the next one arrives on its own.
+    """
+    return atom_config_double(
         quant_config=SimpleNamespace(exclude_layers=[], quant_dtype=None),
         parallel_config=SimpleNamespace(data_parallel_size=8),
         moe_ep_flatten_tp_across_dp=False,
         eplb_enable=eplb,
+        # The branch under test is the MoRI + DP-attention one -- "only MoRI
+        # needs the switch", says the code -- so the scenario has to say so.
+        # Left at Config's default of False, the early return is unreachable
+        # and the (no eplb, no switch) row stops meaning anything.
+        enable_dp_attention=True,
     )
 
 
@@ -198,6 +212,9 @@ def _atom_config(*, eplb: bool) -> SimpleNamespace:
 )
 def test_eplb_overrides_the_local_replica_switch(monkeypatch, eplb, switch, expected):
     monkeypatch.setattr(topK_module.envs, "ATOM_FUSE_SHARED_EXPERT", switch)
+    # Stated, not inherited: the gate asks whether MoRI is importable, so
+    # without this the truth table below holds only on a box that has it.
+    monkeypatch.setattr(topK_module, "_has_module", lambda name: True)
     monkeypatch.setattr(
         topK_module,
         "get_current_atom_config",

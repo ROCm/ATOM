@@ -10,15 +10,26 @@ what it costs to take the highest block id away, which is what a moving
 compress/state boundary does.
 """
 
+import array
+
 import pytest
 
 from atom.model_engine.block_pool import BlockPool
 
 
+def toks(*ids: int) -> array.array:
+    """What the block manager publishes: a slice of `Sequence.token_ids`.
+
+    A list here is what `Block.update` refuses, so the tests have to hold the
+    production type or they stop covering the comparison the pool relies on.
+    """
+    return array.array("i", ids)
+
+
 def published(pool: BlockPool, block_id: int, h: int) -> int:
     """Allocate, publish under `h`, and release — a cached, free block."""
     pool.allocate(block_id)
-    pool.publish(block_id, h, [h])
+    pool.publish(block_id, h, toks(h))
     pool.free(block_id)
     return block_id
 
@@ -81,7 +92,7 @@ class TestRetiringTheTopBlock:
     def test_a_held_top_moves_and_keeps_its_identity(self):
         pool = BlockPool(num_blocks=3)
         pool.allocate(2)
-        pool.publish(2, 100, [7, 8])
+        pool.publish(2, 100, toks(7, 8))
         pool.claim(2)  # a second holder, so the ref count has to travel too
 
         retirement = pool.retire_top()
@@ -89,7 +100,7 @@ class TestRetiringTheTopBlock:
         assert 0 <= retirement.moved_to < 2
 
         moved = pool.block(retirement.moved_to)
-        assert (moved.hash, moved.token_ids, moved.ref_count) == (100, [7, 8], 2)
+        assert (moved.hash, moved.token_ids, moved.ref_count) == (100, toks(7, 8), 2)
         assert pool.lookup(100) == retirement.moved_to
         assert pool.is_used(retirement.moved_to)
         assert not pool.is_used(2)
@@ -101,7 +112,7 @@ class TestRetiringTheTopBlock:
         published(pool, 0, h=100)
         published(pool, 1, h=200)
         pool.allocate(2)
-        pool.publish(2, 300, [3])
+        pool.publish(2, 300, toks(3))
 
         retirement = pool.retire_top()
         # The destination is a cached block, so its content is the price.

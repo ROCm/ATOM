@@ -34,7 +34,7 @@ from atom.model_ops.attention_mla import (
     mla_dcp_decode_is_persistent,
     mla_dcp_kernel_num_heads,
 )
-from atom.utils import CpuGpuBuffer, envs
+from atom.utils import CpuGpuBuffer, envs, upload_numpy
 from atom.utils.block_convert import (
     kv_indices_generate_triton,
     mtp_prepare_decode_mla_kernel,
@@ -56,6 +56,11 @@ try:
 except (TypeError, ValueError):
     _MLA_META_SUPPORTS_MAX_SPLIT = False
 
+# Cap on the KV-split budget: aiter cuts the KV walk into
+# `min(num_clusters, cap * batch_size)` parts, and a negative cap means uncapped
+# -- as many parts as the machine has clusters (v1_2_device.cuh:894).
+_MLA_SPLIT_BUDGET_AUTO = -1
+
 
 def _mla_seg_meta_kwargs() -> dict:
     """Extra kwargs for ``get_mla_metadata_info_v1`` on the seg (page_size>1)
@@ -63,6 +68,33 @@ def _mla_seg_meta_kwargs() -> dict:
     if envs.ATOM_MLA_PAGE_SIZE > 1 and _MLA_META_SUPPORTS_MAX_SPLIT:
         return {"max_split_per_batch": 16}
     return {}
+
+
+def _global_index_cache_layer_ids(
+    indexer_types,
+    num_hidden_layers: int,
+    num_draft_layers: int,
+) -> tuple[int, ...]:
+    """Return global layers that own an index-key cache slice.
+
+    GLM-5.2 ``shared`` layers reuse a preceding full layer's temporary top-k
+    positions and do not construct an indexer, so their index-key cache slices
+    are dead. Other sparse MLA models have no ``indexer_types`` schedule and
+    retain the existing one-slice-per-layer layout.
+    """
+    target_layer_ids = range(num_hidden_layers)
+    if indexer_types is not None:
+        target_layer_ids = (
+            layer_id
+            for layer_id in target_layer_ids
+            # MTP layers are not included in indexer_types. Only the GLM
+            # "shared" value means no indexer module/cache owner; DeepSeek's
+            # index_topk_pattern "S" has different semantics and keeps a cache.
+            if layer_id >= len(indexer_types) or indexer_types[layer_id] != "shared"
+        )
+    return tuple(target_layer_ids) + tuple(
+        range(num_hidden_layers, num_hidden_layers + num_draft_layers)
+    )
 
 
 @dataclass
@@ -143,6 +175,55 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
     # prepare_mtp_decode's fused kernel when this is set (matches the MHA
     # backend). The fused kernel handles both sparse and dense MLA.
     fuse_mtp_decode_position_update = True
+
+    def _global_num_draft_layers(self) -> int:
+        """Return draft layers in the target MLA pool across all PP stages."""
+        runner = self.model_runner
+        spec_config = getattr(runner.config, "speculative_config", None)
+        # Eagle3 draft layers are owned by eagle3_draft_builder and use a
+        # separate KV pool. Only MTP-style draft layers share the target MLA
+        # pool and therefore belong in this pool's global KV/index-cache layout.
+        if spec_config is None or hasattr(runner, "eagle3_draft_builder"):
+            return 0
+        draft_hf_config = spec_config.draft_model_hf_config
+        # Mirror ModelRunner._get_total_num_layers(), which is authoritative for
+        # the rows actually allocated in this target MLA pool.
+        return getattr(draft_hf_config, "num_nextn_predict_layers", 1)
+
+    def _index_cache_layout(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        """Return (local, global) global-layer IDs owning index cache slices."""
+        from aiter.dist.parallel_state import get_pp_group
+
+        from atom.models.utils import get_pp_indices
+
+        runner = self.model_runner
+        hf_config = runner.config.hf_config
+        num_hidden_layers = hf_config.num_hidden_layers
+        pp_group = get_pp_group()
+        start_layer, end_layer = get_pp_indices(
+            num_hidden_layers, pp_group.rank_in_group, pp_group.world_size
+        )
+        num_local_target_layers = end_layer - start_layer
+        num_local_draft_layers = (
+            runner._get_total_num_layers() - num_local_target_layers
+        )
+        global_layer_ids = _global_index_cache_layer_ids(
+            getattr(hf_config, "indexer_types", None),
+            num_hidden_layers,
+            self._global_num_draft_layers(),
+        )
+        local_layer_ids = tuple(
+            layer_id
+            for layer_id in global_layer_ids
+            if start_layer <= layer_id < end_layer
+            # start_layer and end_layer DONOT contain draft layers
+            or (
+                num_hidden_layers
+                <= layer_id
+                < num_hidden_layers + num_local_draft_layers
+            )
+        )
+        return local_layer_ids, global_layer_ids
 
     def __init__(self, model_runner):
         if envs.ATOM_MLA_PAGE_SIZE > 1:
@@ -490,9 +571,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 **i64_kwargs,
             )
             var[f"{p}block_tables"] = CpuGpuBuffer(
-                ub_max_bs,
-                self.max_num_blocks_per_seq // self.block_ratio,
-                **i32_kwargs,
+                ub_max_bs, self.block_table_cols, **i32_kwargs
             )
             var[f"{p}cu_seqlens_q"] = CpuGpuBuffer(ub_max_bs + 1, **i32_kwargs)
             var[f"{p}cu_seqlens_q"].cpu.copy_(
@@ -567,7 +646,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             "max_seqlen_qo": 1,
             "uni_seqlen_qo": 1,
             "fast_mode": 1,
-            "max_split_per_batch": 16,
+            "max_split_per_batch": _MLA_SPLIT_BUDGET_AUTO,
         }
         work_meta_data = var["sparse_mtp_work_meta_data"]
         work_info_set = var["sparse_mtp_work_info_set"]
@@ -616,7 +695,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             "max_seqlen_qo": max_q_len,
             "uni_seqlen_qo": max_q_len,
             "fast_mode": 1,
-            "max_split_per_batch": 16,
+            "max_split_per_batch": _MLA_SPLIT_BUDGET_AUTO,
         }
         # round-robin CP only lands on the full-build path: decode_update_mla_
         # metadata_v1 has no is_cp_round_robin arg and collapses qlen>1 to 1.
@@ -838,8 +917,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         tensor per layer (k_c + k_pe; V is absorbed into latent compression —
         no separate V cache or kv_scale).
 
-        DeepSeek-V3.2 sparse variant adds an indexer cache contribution
-        for every bound layer, including draft/MTP layers.
+        DeepSeek-V3.2 sparse variants add an indexer cache contribution
+        for every indexer-owning layer, including draft/MTP layers. GLM-5.2
+        shared layers do not own an indexer and are excluded.
         """
         runner = self.model_runner
         config = runner.config
@@ -851,8 +931,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         if runner.is_deepseek_v32:
             index_dim = hf_config.index_head_dim + 4
             aligned_index_dim = ((index_dim + 15) // 16) * 16
+            index_cache_layer_ids, _ = self._index_cache_layout()
             block_bytes += (
-                total_num_layers
+                len(index_cache_layer_ids)
                 * runner.block_size
                 * aligned_index_dim
                 * dtypes.fp8.itemsize
@@ -865,9 +946,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         """MLA: single 576-dim paged tensor per layer (k_c + k_pe packed,
         no separate V cache — MLA absorbs V into the latent compression).
 
-        DeepSeek-V3.2 sparse variant additionally allocates an `index_cache`
-        for the indexer module; the aligned dimension is also returned so
-        build_kv_cache_tensor can reslice without recomputing it.
+        DeepSeek-V3.2 sparse variants additionally allocate an `index_cache`
+        for indexer-owning layers; the aligned dimension and compact layer map
+        are returned so build_kv_cache_tensor can bind the correct slice.
         """
         runner = self.model_runner
         config = runner.config
@@ -888,9 +969,17 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # to avoid unaligned memory access in torch inductor.
             index_dim = hf_config.index_head_dim + 4
             aligned = ((index_dim + 15) // 16) * 16
+            index_cache_layer_ids, _ = self._index_cache_layout()
             out["aligned_index_dim"] = aligned
+            out["index_cache_layer_ids"] = index_cache_layer_ids
+            out["index_cache_layer_map"] = {
+                global_layer_id: compact_layer_id
+                for compact_layer_id, global_layer_id in enumerate(
+                    index_cache_layer_ids
+                )
+            }
             out["index_cache"] = torch.zeros(
-                total_num_layers,
+                len(index_cache_layer_ids),
                 runner.num_physical_kvcache_blocks,
                 runner.physical_block_size,
                 aligned,
@@ -922,9 +1011,22 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         num_slots = runner.num_physical_kvcache_blocks * runner.physical_block_size
         kv_cache = runner.kv_cache[layer_id].view(num_slots, 1, 576)
         module.max_model_len = runner.config.max_model_len
+        index_cache = None
         if runner.is_deepseek_v32 and module.indexer is not None:
+            # `layer_id` is a PP-local cache-row counter, while the compact map
+            # is keyed by global model layer IDs. On a non-first PP stage they
+            # differ (for example local 0 may be global 39), so use layer_num
+            # to avoid binding this indexer to another stage's compact row.
+            global_layer_id = getattr(module, "layer_num", None)
+            if global_layer_id not in runner.index_cache_layer_map:
+                raise RuntimeError(
+                    "Sparse MLA indexer layer is missing from the compact index "
+                    f"cache layout: layer_num={global_layer_id}"
+                )
+            index_cache_layer_id = runner.index_cache_layer_map[global_layer_id]
+            index_cache = runner.index_cache[index_cache_layer_id]
             # Use aligned dimension to avoid memory copy in torch inductor
-            module.indexer.k_cache.kv_cache[0] = runner.index_cache[layer_id].view(
+            module.indexer.k_cache.kv_cache[0] = index_cache.view(
                 runner.num_physical_kvcache_blocks * runner.physical_block_size,
                 1,
                 runner.aligned_index_dim,
@@ -936,9 +1038,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             v_cache=None,
             k_scale=None,
             v_scale=None,
-            index_cache=(
-                runner.index_cache[layer_id] if runner.is_deepseek_v32 else None
-            ),
+            index_cache=index_cache if runner.is_deepseek_v32 else None,
         )
 
     def get_kv_transfer_tensors(self):
@@ -976,10 +1076,61 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     )
                 )
 
+        block_region_consumer_indices = None
+        index_cache_layer_ids = getattr(runner, "index_cache_layer_ids", ())
+        if index_cache_layer_ids:
+            local_index_layer_ids, global_index_layer_ids = self._index_cache_layout()
+            if tuple(index_cache_layer_ids) != local_index_layer_ids:
+                raise RuntimeError(
+                    "Allocated and transfer-time index cache layouts disagree"
+                )
+            num_hidden_layers = runner.config.hf_config.num_hidden_layers
+            num_global_draft_layers = sum(
+                layer_id >= num_hidden_layers for layer_id in global_index_layer_ids
+            )
+            num_global_kv_layers = num_hidden_layers + num_global_draft_layers
+            # Unlike index_cache_layer_map (PP-local allocated rows), this map
+            # numbers compact index-cache rows in the consumer's global region
+            # list. It is used only to translate local P/D regions.
+            global_compact_index_slot_by_layer = {
+                global_layer_id: compact_layer_id
+                for compact_layer_id, global_layer_id in enumerate(
+                    global_index_layer_ids
+                )
+            }
+            from aiter.dist.parallel_state import get_pp_group
+
+            from atom.models.utils import get_pp_indices
+
+            pp_group = get_pp_group()
+            start_layer, end_layer = get_pp_indices(
+                num_hidden_layers, pp_group.rank_in_group, pp_group.world_size
+            )
+            num_local_target_layers = end_layer - start_layer
+            num_local_draft_layers = num_layers - num_local_target_layers
+            local_kv_layer_ids = tuple(range(start_layer, end_layer)) + tuple(
+                range(
+                    num_hidden_layers,
+                    num_hidden_layers + num_local_draft_layers,
+                )
+            )
+            if len(local_kv_layer_ids) != num_layers:
+                raise RuntimeError(
+                    "MLA KV cache layer count does not match the PP-local layout: "
+                    f"cache={num_layers}, layout={len(local_kv_layer_ids)}, "
+                    f"target={num_local_target_layers}, "
+                    f"draft={num_local_draft_layers}"
+                )
+            block_region_consumer_indices = list(local_kv_layer_ids) + [
+                num_global_kv_layers + global_compact_index_slot_by_layer[layer_id]
+                for layer_id in local_index_layer_ids
+            ]
+
         return KVTransferTensors(
             block_regions=block_regions,
             slot_regions=[],
             num_blocks=runner.config.num_kvcache_blocks,
+            block_region_consumer_indices=block_region_consumer_indices,
         )
 
     def _build_dcp_indexer_prefill_meta(self, attn_metadata, bs: int, counts, var):
@@ -1132,7 +1283,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 max_seqlen_qo=1,
                 uni_seqlen_qo=1,
                 fast_mode=1,
-                max_split_per_batch=16,
+                max_split_per_batch=_MLA_SPLIT_BUDGET_AUTO,
             )
             attn_metadata.sparse_prefill_work_meta_data = var[
                 "sparse_prefill_work_meta_data"
@@ -1284,14 +1435,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             total_tokens = int(cu[-1])
             # cu doubles as gather_kv_b_proj kv_indptr (block_size=1 → block
             # indptr == token indptr) and flash_attn cu_seqlens_k.
-            kv_indptr_list.append(
-                torch.from_numpy(cu).pin_memory().to(self.device, non_blocking=True)
-            )
-            kv_indices_list.append(
-                torch.from_numpy(chunk_indices)
-                .pin_memory()
-                .to(self.device, non_blocking=True)
-            )
+            kv_indptr_list.append(upload_numpy(cu, self.device))
+            kv_indices_list.append(upload_numpy(chunk_indices, self.device))
             cu_seqlens_k_list.append(kv_indptr_list[-1])  # same tensor
             total_tokens_list.append(total_tokens)
             max_seqlen_k_list.append(int(per_seq_chunk_lens.max(initial=0)))
@@ -1398,9 +1543,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
             cu = np.zeros(bs + 1, dtype=np.int32)
             np.cumsum(global_chunk_len, out=cu[1:])
-            cu_seqlens_k_list.append(
-                torch.from_numpy(cu).pin_memory().to(self.device, non_blocking=True)
-            )
+            cu_seqlens_k_list.append(upload_numpy(cu, self.device))
             total_tokens_list.append(int(cu[-1]))
             max_seqlen_k_list.append(int(global_chunk_len.max(initial=0)))
             padded_local_chunk_seq_lens_list.append(plc.astype(np.int32).tolist())
@@ -1421,11 +1564,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 if slot_segments
                 else np.empty(0, np.int32)
             )
-            local_slot_ids_list.append(
-                torch.from_numpy(slot_ids)
-                .pin_memory()
-                .to(self.device, non_blocking=True)
-            )
+            local_slot_ids_list.append(upload_numpy(slot_ids, self.device))
 
         return MLAChunkContextMetadata(
             kv_indptr=[],
@@ -1520,7 +1659,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             max_seqlen_qo=1,
             uni_seqlen_qo=1,
             fast_mode=1,
-            max_split_per_batch=16,
+            max_split_per_batch=_MLA_SPLIT_BUDGET_AUTO,
         )
         attn_metadata.sparse_prefill_work_meta_data = var[
             "sparse_prefill_work_meta_data"
@@ -2030,7 +2169,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             max_seqlen_qo=max_q_len,
             uni_seqlen_qo=max_q_len,
             fast_mode=1,
-            max_split_per_batch=16,
+            max_split_per_batch=_MLA_SPLIT_BUDGET_AUTO,
         )
 
     def build_for_cudagraph_capture(self, bs: int) -> AttentionMetaData:
@@ -2316,9 +2455,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             c_len = c_hi - c_lo
             cu = np.full(ub_num_reqs + 1, c_len, dtype=np.int32)
             cu[0] = 0
-            kv_indptr_list.append(
-                torch.from_numpy(cu).pin_memory().to(device, non_blocking=True)
-            )
+            kv_indptr_list.append(upload_numpy(cu, device))
             kv_indices_list.append(prefix_slots[c_lo:c_hi])
             total_tokens_list.append(c_len)
             max_seqlen_k_list.append(c_len)

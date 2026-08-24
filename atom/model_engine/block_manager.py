@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import array
 import logging
 from math import inf, isinf
 
@@ -40,6 +41,13 @@ def _make_block_stored(
     medium: str = MEDIUM_GPU,
 ) -> BlockStored:
     """Construct a BlockStored event from a coalesced run of new blocks."""
+    # A list, not the `array("i")` the publish paths carry: the event is
+    # msgpack-encoded and msgspec has no encoding for an array. The publisher
+    # counts encode failures rather than raising, so an array here takes the
+    # event stream down without stopping anything.
+    assert isinstance(
+        tokens, list
+    ), f"BlockStored.token_ids must be a list, got {type(tokens).__name__}"
     return BlockStored(
         block_hashes=hashes,
         parent_block_hash=parent,
@@ -179,11 +187,17 @@ class BlockManager:
         self.demands_declined_no_room: int = 0
 
     @classmethod
-    def compute_hash(cls, token_ids: list[int], prefix: int = -1):
+    def compute_hash(cls, token_ids: array.array, prefix: int = -1):
         h = xxhash.xxh64()
         if prefix != -1:
             h.update(prefix.to_bytes(8, "little"))
-        h.update(np.array(token_ids).tobytes())
+        # dtype pinned even though every caller now passes an `array("i")`:
+        # `np.array` infers int64 from a list and int32 from an array, so the
+        # digest used to depend on the caller's Python type. int64 is what
+        # lists gave, which leaves every hash recorded before that where it
+        # was -- and keeps a caller who does pass a list from silently
+        # computing a different one.
+        h.update(np.asarray(token_ids, dtype=np.int64).tobytes())
         return h.intdigest()
 
     def complete_previous_state_batch(self) -> None:
@@ -304,7 +318,7 @@ class BlockManager:
         hbs = self.hash_block_size
         return (len(seq) + hbs - 1) // hbs
 
-    def _hash_block_tokens(self, seq: Sequence, i: int) -> list[int]:
+    def _hash_block_tokens(self, seq: Sequence, i: int) -> array.array:
         hbs = self.hash_block_size
         return seq.token_ids[i * hbs : (i + 1) * hbs]
 
@@ -1039,7 +1053,10 @@ class BlockManager:
                     self._event_log.append(
                         _make_block_stored(
                             [block_hash],
-                            token_ids,
+                            # The only BlockStored site fed straight from
+                            # `_hash_block_tokens`; the other two accumulate
+                            # into a list already. See `_make_block_stored`.
+                            list(token_ids),
                             parent_hash if parent_hash != -1 else None,
                             self.block_size,
                         )
@@ -1098,7 +1115,7 @@ class BlockManager:
         # go back on the free list, so the intent dies with it.
         if self.paged_state_checkpoints is not None:
             self.paged_state_checkpoints.forget_pending(seq)
-        seq.block_table.clear()
+        del seq.block_table[:]  # `array("i")` has no `.clear()`
         if seq.has_per_req_cache and seq.per_req_cache_group >= 0:
             # No next forward will read a pending fork source after deallocation.
             self.state.release(seq.per_req_cache_group)

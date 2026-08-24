@@ -50,6 +50,9 @@ no wall-clock skew). See `atom/model_engine/prefill_delayer.py`. Active only whe
 | **ATOM_LOADER_PREFETCH_THREADS** | int | 4 | Concurrent sequential readers used by the prefetcher. The device saturates at ~2 streams, so raising this mostly adds contention with the loader; `0` is clamped to `1` (use `ATOM_LOADER_PREFETCH=false` to switch prefetching off). |
 | **ATOM_LOADER_PREFETCH_BLOCK_MB** | int | 16 | Read block size for the prefetcher, in MiB. |
 | **ATOM_LOADER_FADVISE** | bool | `false` | Issue `posix_fadvise(SEQUENTIAL\|WILLNEED)` per shard before reading it. Off by default and ignored while `ATOM_LOADER_PREFETCH` is on: `WILLNEED` is a hint the kernel drops for most of a 350 GiB checkpoint, and running both makes the kernel read ahead over random-ish ranges while the prefetcher streams the same files, so the two compete for the device. Only useful with prefetching disabled. |
+| **ATOM_ONLINE_QUANT_STREAMING** | bool | `false` | Opt in to quantizing eligible online-quant modules as soon as their checkpoint weights are complete, then release source storage to reduce load-time peak memory. Only active with a valid online quantization config. See the [streaming online quantization guide](./online_quantization_streaming_guide.md). |
+| **ATOM_ONLINE_QUANT_STREAMING_HOST_STAGING** | bool | `true` | Assemble streamed module weights in CPU storage before one H2D transfer. Keeps the checkpoint walk parallel; disabling it buffers loader calls and forces the checkpoint walk to one thread. |
+| **ATOM_ONLINE_QUANT_STREAMING_THREADS** | int | `4` | Tail workers for H2D, per-module quantization, and source release. More workers increase overlap and in-flight memory; `0` runs finalization inline. |
 
 ## Plugin mode
 
@@ -157,6 +160,21 @@ land. See `atom/model_ops/v4_backend_gate.py` for the selector.
 | **ATOM_PROFILER_MORE** | bool | 0 (false) | When `ATOM_TORCH_PROFILER_DIR` is set and this is `1`, enables detailed profiling: `record_shapes`, `with_stack`, and `profile_memory`. Applies to both the run-phase profiler and the CUDA-graph capture profiler. |
 | **ATOM_ENABLE_DETAILED_ANNOTATION** | bool | 0 (false) | When profiling is active, appends detailed attention aggregates to the `prefill[]`/`decode[]` trace labels: `sqsq` (Σ N_Q²), `sqsk` (Σ N_Q·N_KV), and `sk` (Σ N_KV), where N_Q is the scheduled query tokens and N_KV the KV length per request. Used to estimate attention FLOPs for downstream roofline analysis. |
 | **ATOM_LOG_MORE** | bool | 0 (false) | If set to `1`, use verbose logging format (includes process name, PID, path, line number, function name). |
+
+## Garbage collection
+
+CPython's generation-2 pass is stop-the-world and walks every tracked
+container, so its cost tracks the live heap — which in a serving process is
+almost entirely startup state (model, compiled graph, tokenizer, KV block
+pool) that is never garbage. Measured on DeepSeek-V4-Flash-DSpark tp1: 242.8 ms
+in the EngineCore, up to 596 ms in a ModelRunner worker, while reclaiming zero
+objects once startup was done. See `atom/utils/gc_utils.py`.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_GC_FREEZE** | bool | 1 (true) | Move the startup heap into CPython's permanent generation once warmup is done, so collections stop scanning it. Applied in every process that outlives startup — the API server, the atomesh frontend, every EngineCore and every ModelRunner worker; undone on engine shutdown so an in-process teardown does not leak. Set `0` to keep the pre-freeze behaviour. |
+| **ATOM_GC_DEBUG** | bool | 0 (false) | Log every collection: generation, duration, objects reclaimed, objects tracked. Costly — counting the tracked set on every pass added ~90s of startup on a V4-Flash tp1 — but the only way to see these pauses, since a stall in the EngineCore idles the workers with no event in their torch trace. |
+| **ATOM_GC_THRESHOLD** | csv int | "" (= CPython default 700,10,10) | `t0,t1,t2` for `gc.set_threshold()`. Thresholds are per-interpreter, so each process reads it independently. A fallback for `ATOM_GC_FREEZE=0`: this spaces collections out, freezing removes what one costs. |
 
 ### Debug dump (`atom.utils.debug_helper`)
 
