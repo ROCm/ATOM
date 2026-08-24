@@ -2433,9 +2433,11 @@ class DeepseekV4Attention(nn.Module):
         self._use_async_compress = (
             self.alt_stream is not None
             and self.compressor is not None
-            # ATOM_V4_ASYNC_COMPRESS=0 forces the Compressors inline on the main
-            # stream (see maybe_compressors_async).
-            and envs.ATOM_V4_ASYNC_COMPRESS
+            # Intra-GPU disagg (--enable-rapidserve) confines decode to a
+            # CU-masked stream; side-stream Compressors would escape that
+            # partition, so run them inline on the main stream instead (see
+            # maybe_compressors_async).
+            and not get_current_atom_config().enable_rapidserve
         )
 
         self.layer_name = prefix

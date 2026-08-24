@@ -47,9 +47,8 @@ def maybe_dual_stream_forward(
     hidden_states: torch.Tensor,
     layer_name: str,
 ) -> torch.Tensor:
-    self = get_current_atom_config().compilation_config.static_forward_context[
-        layer_name
-    ]
+    atom_config = get_current_atom_config()
+    self = atom_config.compilation_config.static_forward_context[layer_name]
     threshold = envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD
     num_tokens = hidden_states.shape[0]
     # Under TBO the two micro-batches already overlap on separate threads
@@ -63,11 +62,17 @@ def maybe_dual_stream_forward(
         get_current_cudagraph_runtime_mode() == CUDAGraphMode.PIECEWISE
     )
 
+    # Intra-GPU disagg (--enable-rapidserve) partitions CUs between the prefill
+    # and decode processes by masking their streams. `alt_stream` carries no
+    # mask, so a dual-stream fork would escape the partition and contend with
+    # the other process. Overrides the threshold rather than replacing it — the
+    # env var stays the tuning knob for every non-rapidserve run.
     if (
         self._use_dual_stream
         and 0 < num_tokens <= threshold
         and not tbo_active()
         and not is_piecewise_cudagraph
+        and not atom_config.enable_rapidserve
     ):
         return self.dual_stream_moe_forward(hidden_states)
     return self.single_stream_moe_forward(hidden_states)

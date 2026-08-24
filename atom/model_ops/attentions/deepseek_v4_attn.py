@@ -69,7 +69,7 @@ from atom.model_ops.v4_kernels import (
     write_v4_paged_decode_indices,
     write_v4_paged_prefill_indices,
 )
-from atom.utils import CpuGpuBuffer, envs
+from atom.utils import CpuGpuBuffer
 from atom.utils.forward_context import (
     AttentionMetaData,
     AttnState,
@@ -1714,9 +1714,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # ---- fire H2D on prep_stream ----
         # NB: this runs inside attn_metadata_builder.build(), BEFORE
         # set_forward_context() — can't read main_stream from the context yet.
-        # ATOM_ATTN_PREP_STREAM=0 issues the copies on the current stream
-        # instead, fully serializing them against the CPU plan build below.
-        overlap_prep = envs.ATOM_ATTN_PREP_STREAM
+        # Intra-GPU disagg (--enable-rapidserve) runs decode on a CU-masked
+        # stream, and prep_stream's wait_stream barriers serialize against it —
+        # so there the copies go on the current stream, fully serialized against
+        # the CPU plan build below. Mirrors AiterMLAMetadataBuilder.
+        overlap_prep = not self.model_runner.config.enable_rapidserve
         current_stream = torch.cuda.current_stream()
         prep_stream = self.prep_stream if overlap_prep else current_stream
         if overlap_prep:

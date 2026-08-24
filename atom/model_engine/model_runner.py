@@ -4581,7 +4581,8 @@ class RapidServeModelRunner(ModelRunner):
             # Sample the first generated token from each sequence's last logit
             sampled = self.sampler(logits, temperatures, top_ks, top_ps, all_greedy)
             sampled_cpu = sampled.view(-1).tolist()
-            drafts_cpu = self._prefill_propose_drafts(batch, sampled, hidden_states)
+            #drafts_cpu = self._prefill_propose_drafts(batch, sampled, hidden_states)
+            drafts_cpu=[]
         # Synchronize so decode's default stream sees all KV writes.
         stream.synchronize()
         reset_forward_context()
