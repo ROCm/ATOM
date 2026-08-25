@@ -251,9 +251,9 @@ def test_decode_filter_block_interleave(interleave, g_ctxs, seed):
 
 # ────────────────────────────────────────────────────────────── prefill side ──
 
-PRE_W = 8
+PRE_W = 8  # overridden per-test below
 PRE_PAGE = 16
-PRE_TOPK = 256  # multiple of BLOCK_N=128; production runs index_topk=2048
+PRE_TOPK = 256  # multiple of BLOCK_N=128; production runs index_topk=2048 (see the prod case)
 
 
 def _build_prefill_case(seq_lens):
@@ -348,11 +348,14 @@ def _run_prefill(case, interleave=1):
     return per_rank
 
 
+@pytest.mark.parametrize("world", [8, 4, 2])  # production ships dcp8; 4/2 untested
 @pytest.mark.parametrize("interleave", [1, 4])  # 4 divides PRE_PAGE=16
 @pytest.mark.parametrize(
     "seq_lens", [[400], [300, 240], [17, 5, 1]], ids=["single", "two-seq", "tiny"]
 )
-def test_prefill_filter(seq_lens, interleave):
+def test_prefill_filter(seq_lens, interleave, world):
+    global PRE_W
+    PRE_W = world
     case = _build_prefill_case(np.asarray(seq_lens, dtype=np.int32))
     per_rank = _run_prefill(case, interleave)
 
