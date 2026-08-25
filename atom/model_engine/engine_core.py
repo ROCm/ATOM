@@ -138,6 +138,10 @@ class EngineCore:
             # adding an architecture never touches this line.
             config.pool_entries = block_info.get("pool_entries", {})
             config.pool_entries_per_req = block_info.get("pool_entries_per_req", {})
+            config.blocks_per_superblock = int(
+                block_info.get("blocks_per_superblock", 0) or 0
+            )
+            config.max_state_slots = int(block_info.get("max_state_slots", 0) or 0)
             self.state_runtime = StateRuntime.from_wire(block_info["state_runtime"])
             ret = self.runner_mgr.call_func(
                 "allocate_kv_cache", num_blocks, wait_out=True

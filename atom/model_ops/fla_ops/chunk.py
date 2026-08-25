@@ -6,7 +6,6 @@
 # The original source code was licensed under the MIT license and included
 # the following copyright notice:
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
-# ruff: noqa: E501
 import warnings
 
 import torch
@@ -24,6 +23,12 @@ from .l2norm import l2norm_fwd
 from .solve_tril import solve_tril, solve_tril_16x16_kernel
 from .utils import SUPPRESS_LEVEL, input_guard, is_amd
 from .wy_fast import recompute_w_u_fwd
+
+#: Token grid the chunked recurrence lands its per-chunk states on. Hardcoded
+#: throughout this file rather than a parameter, so a consumer of `h` — the SSM
+#: state cache is the only one — reads it from here instead of restating 64.
+#: A checkpoint is takeable at multiples of this and nowhere else.
+CHUNK_SIZE = 64
 
 
 def chunk_gated_delta_rule_fwd(
@@ -100,13 +105,35 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens=cu_seqlens,
         o=o,
     )
-    if SUPPRESS_LEVEL < 3:
-        return g, o, A, final_state, None, None, None
-    elif SUPPRESS_LEVEL >= 3:
-        return g, o, A, final_state, w, h, v_new
+    # `h` is the recurrent state at EVERY chunk boundary — [B, NT, H, K, V],
+    # where h[:, j] is the state after j*chunk_size tokens. Returned whatever
+    # `SUPPRESS_LEVEL` says, because the SSM state cache reads checkpoints
+    # straight out of it: that is what lets a checkpoint be taken at an
+    # interior position without splitting the prefill into two forwards. The
+    # kernel computes it either way, so returning it costs nothing — only `w`
+    # is genuinely suppressed.
+    return g, o, A, final_state, (w if SUPPRESS_LEVEL >= 3 else None), h, v_new
 
 
 class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
+    # Per-chunk recurrent states from the most recent forward, for the SSM
+    # state cache (see `pop_last_intermediate_states`). Overwritten every
+    # call; the consumer reads it immediately after its own forward.
+    #
+    # Captured only when `keep_intermediate_states` asks for it, i.e. when the
+    # caller is ATOM's state-cache path and will actually pop it. `h` is large
+    # (33 MB at T=8192, H=8, K=V=128) and callers that never pop — the vLLM,
+    # SGLang and rtpllm plugins among them — would otherwise pin one
+    # indefinitely after their last forward.
+    #
+    # An explicit flag rather than something inferred from the call. Upstream
+    # keys this off `dst_indices is not None`, which reads as "the paged path,
+    # so the popper", but ATOM routes src->dst by gather/scatter around the
+    # kernel and never passes `dst_indices` at all — inferring it here would
+    # leave `last_h` permanently None, `pop` returning None, and the whole
+    # checkpoint write silently skipped with nothing to show for it.
+    last_h = None
+
     @staticmethod
     @input_guard
     @torch.amp.custom_fwd(device_type="cuda")
@@ -123,6 +150,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         cu_seqlens: torch.LongTensor | None = None,
         use_qk_l2norm_in_kernel: bool = False,
         o: torch.Tensor | None = None,
+        keep_intermediate_states: bool = False,
     ):
         if use_qk_l2norm_in_kernel:
             q = l2norm_fwd(q)
@@ -145,6 +173,12 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         )
         ctx.scale = scale
         ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
+        # Per-chunk states, for the SSM state cache. Parked on the class so the
+        # (fixed) 2-tuple return contract stays intact for every existing
+        # caller, including the vLLM and rtpllm plugins. Cleared rather than
+        # left alone when not asked for: a stale `h` from an earlier step is
+        # the wrong shape *and* the wrong tokens, and `pop` has no way to tell.
+        ChunkGatedDeltaRuleFunction.last_h = h if keep_intermediate_states else None
         # Skip the dtype cast when it's a no-op so the caller's buffer is
         # the literal returned tensor (preserves the inplace contract).
         if o.dtype != q.dtype:
@@ -166,6 +200,7 @@ def chunk_gated_delta_rule(
     head_first: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
     o: torch.Tensor | None = None,
+    keep_intermediate_states: bool = False,
 ):
     r"""
     Args:
@@ -194,6 +229,11 @@ def chunk_gated_delta_rule(
         head_first (Optional[bool]):
             Whether the inputs are in the head-first format, which is not supported for variable-length inputs.
             Default: `False`.
+        keep_intermediate_states (Optional[bool]):
+            Retain the per-chunk recurrent states of this call for
+            `pop_last_intermediate_states` to collect. Default: `False`, which
+            drops them as soon as the forward returns — they are ~33 MB at
+            T=8192, H=8, K=V=128, so a caller that never pops must not ask.
 
     Returns:
         o (torch.Tensor):
@@ -308,7 +348,35 @@ def chunk_gated_delta_rule(
         cu_seqlens,
         use_qk_l2norm_in_kernel,
         o,
+        keep_intermediate_states,
     )
     if head_first:
         o = rearrange(o, "b t h ... -> b h t ...")
     return o, final_state
+
+
+def pop_last_intermediate_states():
+    """Per-chunk recurrent states from the most recent chunked GDN forward.
+
+    ``h[:, j]`` is the state after ``j * chunk_size`` tokens, so the SSM state
+    cache can take a checkpoint at any chunk-aligned interior position without
+    splitting the prefill into two forward passes.
+
+    Bit-exact against the alternative, despite appearances. ``h`` is stored in
+    the input dtype (bf16) while the recurrence carries fp32 internally, so a
+    state read out of it *is* pre-rounded — but the GDN state pool is bf16 too
+    (``GDNStateMixin._state_dtypes``), so ending the forward at that position
+    instead would round the same fp32 value on the way in. Measured on MI355
+    over 56 (seed, length, boundary) combinations: the checkpoint equals a
+    shortened re-run's stored state exactly, every time, and resuming from it
+    reproduces the remaining tokens' outputs bit for bit. See
+    ``tests/test_gdn_state_checkpoint_gpu.py``. A pool at higher precision than
+    ``h`` would break that, which is why kimi_linear — the one model whose v
+    side is fp32 — does not take this path.
+
+    Consumes the reference so a later caller cannot read a stale tensor, and
+    returns None when the last forward was not asked to keep its states.
+    """
+    h = ChunkGatedDeltaRuleFunction.last_h
+    ChunkGatedDeltaRuleFunction.last_h = None
+    return h
