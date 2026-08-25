@@ -2,6 +2,8 @@
 # Tests for atom/model_engine/block_manager.py — public API only
 
 
+import logging
+
 from conftest import MockConfig
 
 from atom.model_engine.block_manager import BlockManager
@@ -583,3 +585,66 @@ class TestRegisterReceivedPrefix:
         a = seq_factory(list(range(1, 11)))  # 10 tokens, bs=4 -> 2 full + partial
         bm.allocate(a)
         assert bm.register_received_prefix(a) == 2
+
+
+class TestPrefixMissLog:
+    """That the diagnostic separates the three ways a scan returns nothing.
+
+    A hit rate cannot: "never cached", "was cached and the block went", and
+    "too short to have a reusable block" read identically in it and want
+    opposite fixes. Off unless `ATOM_LOG_PREFIX_MISS`, because it fires once
+    per zero-hit request and that is ~10% of agentic traffic.
+    """
+
+    @staticmethod
+    def _kinds(caplog):
+        return [
+            r.getMessage().split("kind=")[1].split()[0]
+            for r in caplog.records
+            if r.getMessage().startswith("[PrefixMiss]")
+        ]
+
+    def test_a_cold_prompt_reports_unindexed(
+        self, block_manager_prefix, seq_factory, caplog, monkeypatch
+    ):
+        monkeypatch.setenv("ATOM_LOG_PREFIX_MISS", "1")
+        seq = seq_factory([1, 2, 3, 4, 5, 6, 7, 8])
+        with caplog.at_level(logging.INFO, logger="atom"):
+            assert block_manager_prefix.can_allocate(seq) == 0
+        assert self._kinds(caplog) == ["unindexed"]
+
+    def test_a_prompt_too_short_to_reuse_says_so(
+        self, block_manager_prefix, seq_factory, caplog, monkeypatch
+    ):
+        """One block of prompt has no reusable block at all: the last is always
+        forwarded for logits, so the loop never runs. `unindexed` would be a
+        lie -- there was nothing to look up."""
+        monkeypatch.setenv("ATOM_LOG_PREFIX_MISS", "1")
+        seq = seq_factory([1, 2, 3])
+        with caplog.at_level(logging.INFO, logger="atom"):
+            block_manager_prefix.can_allocate(seq)
+        assert self._kinds(caplog) == ["no-blocks"]
+
+    def test_a_hit_logs_nothing(
+        self, block_manager_prefix, seq_factory, caplog, monkeypatch
+    ):
+        monkeypatch.setenv("ATOM_LOG_PREFIX_MISS", "1")
+        first = seq_factory([1, 2, 3, 4, 5, 6, 7, 8])
+        block_manager_prefix.allocate(first)
+        block_manager_prefix.hash_blocks(
+            first, first.num_tokens - first.num_cached_tokens
+        )
+        block_manager_prefix.deallocate(first)
+        second = seq_factory([1, 2, 3, 4, 9, 10, 11, 12])
+        with caplog.at_level(logging.INFO, logger="atom"):
+            assert block_manager_prefix.can_allocate(second) > 0
+        assert self._kinds(caplog) == []
+
+    def test_the_flag_is_off_by_default(
+        self, block_manager_prefix, seq_factory, caplog, monkeypatch
+    ):
+        monkeypatch.setenv("ATOM_LOG_PREFIX_MISS", "0")
+        seq = seq_factory([1, 2, 3, 4, 5, 6, 7, 8])
+        with caplog.at_level(logging.INFO, logger="atom"):
+            block_manager_prefix.can_allocate(seq)
+        assert self._kinds(caplog) == []

@@ -551,14 +551,46 @@ class BlockManager:
         h = -1
         compressed_hit = 0
         block_hashes: list[int] = []
+        miss_kind = ""
         for i in range(self._n_hash_blocks(seq) - 1):
             token_ids = self._hash_block_tokens(seq, i)
             h = self.compute_hash(token_ids, h)
             block_id = self.kv.lookup(h)
-            if block_id == -1 or self.kv.block(block_id).token_ids != token_ids:
+            if block_id == -1:
+                # The hash is not in the index at all: either this prefix was
+                # never seen, or the block that held it was allocated away.
+                miss_kind = "unindexed"
+                break
+            if self.kv.block(block_id).token_ids != token_ids:
+                # Indexed, but the block holds different tokens -- a hash
+                # collision, or a stale entry. Distinct from `unindexed`
+                # because the fixes are opposite ones.
+                miss_kind = "token-mismatch"
                 break
             block_hashes.append(h)
             compressed_hit += 1
+        if envs.ATOM_LOG_PREFIX_MISS and compressed_hit == 0:
+            # Why a request got nothing, at the one place that knows. Three
+            # outcomes look identical in a hit rate and want opposite fixes: a
+            # prompt whose first block was never cached (new session, or a
+            # client that re-cut its history so block 0 differs), one whose
+            # block was evicted, and one too short to have a reusable block at
+            # all. `-1` for `first_hash` means the loop never ran.
+            logger.info(
+                "[PrefixMiss] seq=%s tokens=%d hash_blocks=%d kind=%s "
+                "first_hash=%d first_tokens=%s indexed=%d",
+                getattr(seq, "external_request_id", None) or seq.id,
+                seq.num_tokens,
+                self._n_hash_blocks(seq),
+                miss_kind or "no-blocks",
+                h,
+                (
+                    list(self._hash_block_tokens(seq, 0)[:8])
+                    if self._n_hash_blocks(seq) > 1
+                    else []
+                ),
+                self.kv.num_indexed,
+            )
         # Step 2: SWA only needs the trailing window before the boundary to be
         # present (SWA is local). Scan right-to-left within the compressed prefix
         # for the largest boundary whose window is SWA-cached (vLLM
@@ -793,13 +825,31 @@ class BlockManager:
         store_run_parent: int | None = h if h != -1 else None
         store_run_hashes: list[int] = []
         store_run_tokens: list[int] = []
+        first_published = -1
         for i in range(start, end):
             token_ids = self._hash_block_tokens(seq, i)
             h = self.compute_hash(token_ids, h)
+            if i == 0:
+                first_published = h
             self.kv.publish(seq.block_table[i], h, token_ids)
             if record:
                 store_run_hashes.append(h)
                 store_run_tokens.extend(token_ids)
+        if envs.ATOM_LOG_PREFIX_MISS and first_published != -1:
+            # The write side of `[PrefixMiss]`. A miss reports the hash it
+            # looked for; without the hash that was stored there is no way to
+            # tell a prompt that diverged at block 0 from one whose block 0 was
+            # evicted -- the two produce the same "unindexed" line. Only block
+            # 0 is logged: if the chains agree there they agree until the
+            # prompts differ, and one line per request is the point.
+            logger.info(
+                "[PrefixStore] seq=%s block0_hash=%d first_tokens=%s " "blocks=%d..%d",
+                getattr(seq, "external_request_id", None) or seq.id,
+                first_published,
+                list(self._hash_block_tokens(seq, 0)[:8]),
+                start,
+                end,
+            )
         if record and store_run_hashes:
             self._event_log.append(
                 _make_block_stored(
