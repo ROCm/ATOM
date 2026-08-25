@@ -37,6 +37,7 @@ class TestMTPMaxTokens:
         # its three drafts are followed by four newly scheduled provisional
         # positions. The scheduler replaces the verified window, then removes
         # the three unused speculative placeholders from the real length.
+        seq.num_placeholder_tokens = sched.mtp_k
         for token in (87, 88, 89, 90, 91, 92, 93):
             seq.append_token(token)
             if seq.return_logprobs:
