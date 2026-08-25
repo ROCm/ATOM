@@ -133,7 +133,8 @@ def _correct_attn_cp_out_kernel(
     )
 
     lse = tl.load(lses_ptr + lse_offsets)
-    lse = tl.where((lse != lse) | (lse == float("inf")), -float("inf"), lse)
+    lse_is_nan = lse != lse  # noqa: PLR0124  # Triton has no isnan predicate
+    lse = tl.where(lse_is_nan | (lse == float("inf")), -float("inf"), lse)
 
     lse_max = tl.max(lse, axis=0)
     lse_max = tl.where(lse_max == -float("inf"), 0, lse_max)
@@ -150,8 +151,11 @@ def _correct_attn_cp_out_kernel(
     )
     local_lse = tl.load(lses_ptr + local_lse_offset)
     lse_diff = local_lse - global_lse
+    lse_diff_is_nan = (
+        lse_diff != lse_diff  # noqa: PLR0124  # Triton has no isnan predicate
+    )
     lse_diff = tl.where(
-        (lse_diff != lse_diff) | (lse_diff == float("inf")),
+        lse_diff_is_nan | (lse_diff == float("inf")),
         -float("inf"),
         lse_diff,
     )
@@ -171,6 +175,83 @@ def _correct_attn_cp_out_kernel(
     # need no separate NaN scrub.
     output = tl.where(factor == 0.0, 0.0, output)
     tl.store(new_output_ptr + output_offsets, output)
+
+
+@triton.jit
+def _correct_attn_cp_out_rs_layout_kernel(
+    outputs_ptr,
+    rs_output_ptr,
+    lses_ptr,
+    outputs_stride_B,
+    outputs_stride_H,
+    outputs_stride_D,
+    lses_stride_N,
+    lses_stride_B,
+    lses_stride_H,
+    lse_idx,
+    batch_size: tl.int64,
+    HEAD_DIM: tl.constexpr,
+    LOCAL_HEADS: tl.constexpr,
+    N_ROUNDED: tl.constexpr,
+):
+    """Correct partial attention directly into rank-major RS input layout.
+
+    ``outputs`` is ``[B, H_full, D]`` with rank-major head groups. The output is
+    physically ``[N * B, H_local, D]`` so reduce-scatter on dim 0 returns the
+    final contiguous ``[B, H_local, D]`` tensor directly. Unlike the general
+    correction kernel, this production-only path does not materialize global
+    LSE because ``cp_lse_ag_out_rs`` never consumes it.
+    """
+    batch_idx = tl.program_id(axis=0).to(tl.int64)
+    head_idx = tl.program_id(axis=1).to(tl.int64)
+    d_offsets = tl.arange(0, HEAD_DIM)
+    num_n_offsets = tl.arange(0, N_ROUNDED)
+
+    lse_offsets = (
+        num_n_offsets * lses_stride_N
+        + batch_idx * lses_stride_B
+        + head_idx * lses_stride_H
+    )
+    lse = tl.load(lses_ptr + lse_offsets)
+    lse_is_nan = lse != lse  # noqa: PLR0124  # Triton has no isnan predicate
+    lse = tl.where(lse_is_nan | (lse == float("inf")), -float("inf"), lse)
+
+    lse_max = tl.max(lse, axis=0)
+    lse_max = tl.where(lse_max == -float("inf"), 0, lse_max)
+    lse -= lse_max
+    global_lse = tl.log(tl.sum(tl.exp(lse), axis=0)) + lse_max
+
+    local_lse_offset = (
+        lse_idx * lses_stride_N + batch_idx * lses_stride_B + head_idx * lses_stride_H
+    )
+    local_lse = tl.load(lses_ptr + local_lse_offset)
+    lse_diff = local_lse - global_lse
+    lse_diff_is_nan = (
+        lse_diff != lse_diff  # noqa: PLR0124  # Triton has no isnan predicate
+    )
+    lse_diff = tl.where(
+        lse_diff_is_nan | (lse_diff == float("inf")),
+        -float("inf"),
+        lse_diff,
+    )
+    factor = tl.exp(lse_diff)
+
+    input_offsets = (
+        batch_idx * outputs_stride_B
+        + head_idx * outputs_stride_H
+        + d_offsets * outputs_stride_D
+    )
+    output = tl.load(outputs_ptr + input_offsets) * factor
+    output = tl.where(factor == 0.0, 0.0, output)
+
+    head_group = head_idx // LOCAL_HEADS
+    local_head = head_idx % LOCAL_HEADS
+    rs_offsets = (
+        (head_group * batch_size + batch_idx) * LOCAL_HEADS * HEAD_DIM
+        + local_head * HEAD_DIM
+        + d_offsets
+    )
+    tl.store(rs_output_ptr + rs_offsets, output)
 
 
 def correct_attn_out(out, lses, cp_rank, ctx=None):
@@ -217,6 +298,59 @@ def correct_attn_out(out, lses, cp_rank, ctx=None):
     return out, lse
 
 
+def correct_attn_out_rs_layout(out, lses, cp_rank, ctx=None):
+    """Correct local output directly into reduce-scatter's rank-major layout.
+
+    Returns ``[N * B, H_local, D]``. A dim-0 reduce-scatter over ``N`` ranks
+    therefore returns contiguous ``[B, H_local, D]`` without either of the
+    full-tensor ``movedim(...).contiguous()`` copies used by the old path.
+    """
+    B, H, D = out.shape
+    N = lses.shape[0]
+    assert (N & (N - 1)) == 0, f"cp world size must be a power of two, got {N}"
+    assert H % N == 0, f"full head count {H} must be divisible by cp size {N}"
+    assert 0 <= cp_rank < N, f"cp rank {cp_rank} outside [0, {N})"
+    local_heads = H // N
+    rs_output = torch.empty(
+        (N * B, local_heads, D),
+        dtype=out.dtype,
+        device=out.device,
+    )
+
+    grid = (B, H, 1)
+    regular_args = (
+        out,
+        rs_output,
+        lses,
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        lses.stride(0),
+        lses.stride(1),
+        lses.stride(2),
+        cp_rank,
+        B,
+    )
+    const_args = {
+        "HEAD_DIM": D,
+        "LOCAL_HEADS": local_heads,
+        "N_ROUNDED": N,
+    }
+    if ctx is not None:
+        ctx.call_kernel(
+            _correct_attn_cp_out_rs_layout_kernel,
+            grid,
+            *regular_args,
+            **const_args,
+        )
+    else:
+        _correct_attn_cp_out_rs_layout_kernel[grid](
+            *regular_args,
+            **const_args,
+        )
+    return rs_output
+
+
 def cp_lse_ag_out_rs(cp_attn_out, cp_attn_lse, cp_group, ctx=None):
     """AG+RS backend: AllGather LSE -> Triton correct -> ReduceScatter output.
 
@@ -236,12 +370,10 @@ def cp_lse_ag_out_rs(cp_attn_out, cp_attn_lse, cp_group, ctx=None):
     lses = dcp_all_gather(cp_group, cp_attn_lse, 0)
     lses = lses.reshape((cp_group.world_size,) + cp_attn_lse.shape)
 
-    out, _ = correct_attn_out(cp_attn_out, lses, cp_group.rank_in_group, ctx=ctx)
-
-    out = out.movedim(1, 0).contiguous()  # [B, H_full, D] -> [H_full, B, D]
-    out = cp_group.reduce_scatter(out, dim=0)
-    out = out.movedim(0, 1).contiguous()  # [H_local, B, D] -> [B, H_local, D]
-    return out
+    rs_input = correct_attn_out_rs_layout(
+        cp_attn_out, lses, cp_group.rank_in_group, ctx=ctx
+    )
+    return cp_group.reduce_scatter(rs_input, dim=0)
 
 
 # ─────────────────────────────────────────────── A2A merge backend ──

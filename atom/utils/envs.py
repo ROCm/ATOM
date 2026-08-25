@@ -62,6 +62,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_TRITON_MLA_SHUFFLE_KV": lambda: (
         os.getenv("ATOM_USE_TRITON_MLA_SHUFFLE_KV", "0") == "1"
     ),
+    # Experimental native GLM-5.2 DCP mode: keep MLA KV sharded but replicate
+    # full IndexShare-layer index caches on every DCP rank. This removes the
+    # indexer candidate all-gather/global-merge path. Disabled by default.
+    "ATOM_DCP_REPLICATE_INDEX_CACHE": lambda: (
+        os.getenv("ATOM_DCP_REPLICATE_INDEX_CACHE", "0") == "1"
+    ),
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
     "ATOM_USE_TRITON_MOE_DECODE": lambda: os.getenv("ATOM_USE_TRITON_MOE_DECODE", "0")
     == "1",

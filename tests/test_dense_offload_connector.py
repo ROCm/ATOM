@@ -155,6 +155,28 @@ def test_dense_worker_resolves_virtual_dcp_block_size():
         worker._load_executor.shutdown(wait=True)
 
 
+def test_dense_full_prompt_hit_loads_only_complete_chunks(monkeypatch):
+    scheduler = _scheduler(monkeypatch)
+
+    class Lookup:
+        def lookup(self, token_ids, lookup_id):
+            del lookup_id
+            return len(token_ids)
+
+        def clear_lookup_status(self, lookup_id):
+            del lookup_id
+
+    scheduler._lookup_client = Lookup()
+    seq = _load_seq(8, num_prompt_tokens=16)
+
+    need, should_park = scheduler.get_num_new_matched_tokens(seq)
+
+    # Full hit 16 reserves the final token for logits, then floors 15 to the
+    # 8-token LMCache chunk. Requesting 15 would retrieve only 8 and fail closed.
+    assert (need, should_park) == (8, True)
+    assert scheduler._load_specs["8"].lmcache_cached_tokens == 8
+
+
 def test_dense_producer_role_tracks_only_saves(monkeypatch):
     scheduler = _scheduler(monkeypatch, "kv_producer")
     seq = SimpleNamespace(
