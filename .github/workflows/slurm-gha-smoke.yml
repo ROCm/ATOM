@@ -28,5 +28,8 @@ jobs:
           echo "RUNNER_OS=${RUNNER_OS:-}"
           echo "HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-}"
           echo "ROCR_VISIBLE_DEVICES=${ROCR_VISIBLE_DEVICES:-}"
-          env | sort | grep -E '^(GITHUB_|RUNNER_|SLURM_)' || true
+          echo "GITHUB_REPOSITORY=${GITHUB_REPOSITORY:-}"
+          echo "GITHUB_RUN_ID=${GITHUB_RUN_ID:-}"
+          echo "GITHUB_WORKFLOW=${GITHUB_WORKFLOW:-}"
+          env | sort | grep -E '^(RUNNER_|SLURM_)' || true
           rocm-smi || true
