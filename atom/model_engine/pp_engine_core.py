@@ -291,11 +291,11 @@ class PPEngineCoreProc(EngineCore):
         # finished_saving is ever coming. Only the paired sends wait for the
         # PP-wide save quorum.
         #
-        # A chunked prefill pairs one send with every save generation flushed
-        # alongside it, and the quorum is per generation, so the hold keeps the
-        # whole set and releases only once the last one clears. The set is
-        # final: the send arrives after the request's last chunk, so no further
-        # generation can appear for it.
+        # The quorum is per save generation, and a chunked prefill flushes
+        # several of them alongside the one send, so the hold keeps that whole
+        # set and releases only when its last member clears. Nothing joins the
+        # set later: mooncake reports the send after the request's final chunk,
+        # so every generation it will ever have is already in this poll.
         local_saving = {
             completion_req_key(rid) for rid in kvoutput.finished_saving or ()
         }
