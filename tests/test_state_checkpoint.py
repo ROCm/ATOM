@@ -3328,3 +3328,103 @@ class TestReadSideCounters:
         third.state_slot = pool.pop()
         pool.checkpoint(third, 3, 333)
         assert pool.checkpoint_fates()["superseded_events"] == 1
+
+
+class TestTrimSuperseded:
+    """What the soft cap may and may not spend.
+
+    The cap exists because 84.5% of resident checkpoints on the measured trace
+    had been superseded while the pools reported `binding: paged` -- roughly
+    5.8 GiB held by state the workload had already moved past. What makes it
+    safe is the restriction, not the cap: 16.5% of resumes on that trace land
+    on an anchor a deeper one had already superseded, so the candidate set is
+    the ceiling on what may go, never a target to reach.
+    """
+
+    @staticmethod
+    def _pool(n=8, cap=2):
+        pool = StateSlotPool(n, StateTransfer.fork(1), hash_block_size=1, soft_cap=cap)
+        return pool
+
+    @staticmethod
+    def _checkpointed(pool, *hashes):
+        """File each hash on its own slot and hand the slot back."""
+        out = []
+        for h in hashes:
+            slot = pool.pop()
+            pool._index(h, slot)
+            pool.release(slot)
+            out.append(slot)
+        return out
+
+    def test_only_superseded_slots_are_spent(self):
+        pool = self._pool(cap=1)
+        a, b, c = self._checkpointed(pool, 10, 20, 30)
+        pool._superseded.add(a)
+        assert pool.trim_superseded(soft_cap=1) == 1
+        assert pool.lookup(10) == -1, "the superseded one went"
+        assert pool.lookup(20) == b and pool.lookup(30) == c, "the others stayed"
+
+    def test_running_out_of_candidates_leaves_the_pool_over_cap(self):
+        """Over the cap beats spending a checkpoint nothing has replaced."""
+        pool = self._pool(cap=1)
+        self._checkpointed(pool, 10, 20, 30)
+        assert pool.trim_superseded(soft_cap=1) == 0
+        assert len(pool._checkpointed) == 3
+        assert pool.checkpoint_fates()["checkpoints_trimmed"] == 0
+
+    def test_it_stops_at_the_cap_rather_than_draining_candidates(self):
+        pool = self._pool(cap=2)
+        slots = self._checkpointed(pool, 10, 20, 30, 40)
+        pool._superseded.update(slots)
+        assert pool.trim_superseded(soft_cap=2) == 2
+        assert len(pool._checkpointed) == 2
+
+    def test_the_coldest_candidate_goes_first(self):
+        """`_checkpointed` is LRU, so a trim takes them in the order a
+        shortage would have -- only earlier, and only from the candidates.
+
+        Cap 2 against 3 resident, so exactly one goes and which one is the
+        assertion. At cap 1 both candidates would have to go and the ordering
+        would not be observable."""
+        pool = self._pool(cap=2)
+        a, b, c = self._checkpointed(pool, 10, 20, 30)
+        pool._superseded.update((b, c))  # a is NOT a candidate
+        assert pool.trim_superseded(soft_cap=2) == 1
+        assert pool.lookup(10) == a, "not a candidate, untouched"
+        assert pool.lookup(20) == -1, "colder candidate went first"
+        assert pool.lookup(30) == c, "the warmer one survived"
+
+    def test_a_trimmed_slot_becomes_vacant_not_merely_unindexed(self):
+        """The point is the bytes. A slot that keeps its superblock has been
+        spent for nothing -- see `release`/`_unback`."""
+        pool = self._pool(cap=1)
+        a, _b = self._checkpointed(pool, 10, 20)
+        pool._superseded.add(a)
+        pool.trim_superseded(soft_cap=1)
+        assert a in pool._free and pool.slot_hash[a] == -1
+        assert pool.occupancy()["slots_vacant"] >= 1
+
+    def test_soft_cap_of_zero_never_trims(self):
+        pool = self._pool(cap=0)
+        slots = self._checkpointed(pool, 10, 20, 30)
+        pool._superseded.update(slots)
+        assert pool.trim_superseded(soft_cap=0) == 0
+        assert len(pool._checkpointed) == 3
+
+    def test_pop_trims_before_it_mints(self):
+        """The trigger. With nothing vacant and the pool over its cap, a `pop`
+        must find its slot in this pool's own dead weight rather than claim a
+        superblock off the paged cache."""
+        pool = StateSlotPool(3, StateTransfer.fork(1), hash_block_size=1, soft_cap=1)
+        slots = self._checkpointed(pool, 10, 20, 30)
+        pool._superseded.update(slots)
+        assert not pool._vacant or all(
+            pool.slot_hash[s] != -1 for s in pool._vacant
+        ), "nothing genuinely vacant"
+        got = pool.pop()
+        assert got >= 0
+        assert pool.checkpoint_fates()["checkpoints_trimmed"] >= 1
+        assert (
+            pool.checkpoint_fates()["checkpoints_evicted"] == 0
+        ), "a trim, not an eviction"

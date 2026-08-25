@@ -71,6 +71,7 @@ class StateSlotPool:
         enabled: bool = True,
         superblock_source: "SuperblockSource | None" = None,
         max_slots: int = 0,
+        soft_cap: int = 0,
     ):
         self.enabled: bool = enabled and num_slots > 0
         self.num_slots: int = num_slots
@@ -89,6 +90,11 @@ class StateSlotPool:
         # allocation. 0 means "no growth" and is the default, which is what
         # every pool without a superblock source wants.
         self.max_slots: int = max_slots or num_slots
+        # Resident checkpoints above which `_pop_free` trims before it
+        # mints. 0 = never trim, which is what every pool without a
+        # superblock source wants: with a statically carved region there
+        # is no paged pool on the other side to hand the bytes to.
+        self.soft_cap: int = soft_cap
         # Pool slot index -> the superblock backing it. Only populated when a
         # source is in play; `pop` fills it and `release` drains it.
         self._slot_super: dict[int, int] = {}
@@ -189,6 +195,12 @@ class StateSlotPool:
         # soft cap needs to know how large the candidate set gets first.
         self.checkpoints_superseded: int = 0
         self._superseded: set[int] = set()
+        # Spent by `trim_superseded` to get back under the soft cap.
+        # Apart from `evicted`, which means the pool had nothing free and
+        # took the LRU checkpoint whatever it was: this one is chosen, and
+        # only from checkpoints a deeper anchor already replaced. Reading
+        # them as one number would hide a trim working as a pool failing.
+        self.checkpoints_trimmed: int = 0
 
     # ------------------------------ free list ------------------------------ #
     def has_free(self, count: int = 1) -> bool:
@@ -275,6 +287,21 @@ class StateSlotPool:
         One slot. A caller needing a request's whole set asks `pop_many`.
         """
         slot = self._pop_vacant()
+        # Nothing vacant and the pool is over its cap: give the superseded
+        # checkpoints back before minting, so a new slot comes out of this
+        # pool's own dead weight rather than off the paged cache.
+        #
+        # Here rather than in `claim_superblock`: trimming releases superblocks
+        # INTO the pool a claim takes from, so doing it inside the claim would
+        # have it reach back into its own caller. This runs strictly before, and
+        # the vacant slot it frees is then found without a claim at all.
+        if (
+            slot < 0
+            and self.soft_cap > 0
+            and len(self._checkpointed) > self.soft_cap
+            and self.trim_superseded(self.soft_cap)
+        ):
+            slot = self._pop_vacant()
         if slot < 0 and self._can_mint():
             # Second in the preference order, not last. A vacant slot costs
             # nothing, so it still goes first; but minting costs one superblock
@@ -468,6 +495,54 @@ class StateSlotPool:
         for slot in slots or ():
             if slot >= 0:
                 self.release(slot)
+
+    def trim_superseded(self, soft_cap: int, limit: int = 0) -> int:
+        """Hand superseded checkpoints back until the pool is under `soft_cap`.
+
+        Returns how many were spent. Soft in two ways, both deliberate:
+
+        Only checkpoints a DEEPER anchor of the same chain has superseded are
+        eligible. A later turn resumes off the deepest anchor at or before its
+        hit, so once a deeper one exists the older only serves a hit landing
+        between the two -- 16.5% of resumes on the measured trace, which is why
+        this is the candidate set and not the discard set. Everything else is
+        untouchable here however far over the cap the pool is, and running out
+        of candidates ends the trim rather than reaching past them: over the cap
+        is a worse outcome than a resume that had to re-prefill, but not by as
+        much as spending a checkpoint nothing has replaced.
+
+        Order is `_checkpointed`, which is LRU, so within the candidates the
+        coldest goes first -- the same order a shortage would have taken them
+        in, only earlier and restricted.
+
+        `limit` of 0 trims to the cap; a positive value stops after that many,
+        for a caller that needs a specific number of superblocks back and has
+        no reason to spend more.
+
+        Nothing here decides WHEN to run: `BlockManager` calls this off the
+        paged pool having to destroy cached content, so a pool with room to
+        spare never pays for the checkpoints it is holding.
+        """
+        if not self.enabled or soft_cap <= 0 or not self._superseded:
+            return 0
+        spent = 0
+        # A list, not the deque itself: `release` mutates `_checkpointed`.
+        for slot in list(self._checkpointed):
+            if len(self._checkpointed) <= soft_cap:
+                break
+            if limit and spent >= limit:
+                break
+            if slot not in self._superseded:
+                continue
+            # `invalidate` drops the hash and both marks, which moves the slot
+            # to the vacant half on the `release` inside `_set_hash` -- and that
+            # is what hands the superblock back to the paged pool. Going through
+            # the existing path rather than unbacking here keeps one place that
+            # knows how a slot changes halves.
+            self.invalidate(slot)
+            self.checkpoints_trimmed += 1
+            spent += 1
+        return spent
 
     def _set_hash(self, slot: int, h: int) -> None:
         """Change what an existing slot backs, re-filing it if it is free.
@@ -803,6 +878,7 @@ class StateSlotPool:
             # anything to do.
             "checkpoints_superseded": len(self._superseded),
             "superseded_events": self.checkpoints_superseded,
+            "checkpoints_trimmed": self.checkpoints_trimmed,
         }
 
     def occupancy(self) -> dict[str, int]:

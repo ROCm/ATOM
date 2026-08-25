@@ -59,6 +59,7 @@ class EngineArgs:
     attn_prefill_chunk_size: int = 16384
     state_checkpoint_interval_tokens: int = 8192
     state_checkpoint_slots: int = 0
+    state_checkpoint_soft_cap: int = -1
     state_checkpoint_demand: bool = True
     enable_chunked_prefill: bool = True
     scheduler_delay_factor: float = 0.0
@@ -445,6 +446,26 @@ class EngineArgs:
                 "committed state and has no speculation to roll back. Costs the "
                 "model's per-slot state bytes, taken out of the paged KV pool. "
                 "--state-checkpoint-groups is the old spelling, still accepted."
+            ),
+        )
+        parser.add_argument(
+            "--state-checkpoint-soft-cap",
+            type=int,
+            default=-1,
+            help=(
+                "Resident checkpoints above which the pool hands bytes back to "
+                "the paged cache. Soft in two ways: it only ever spends a "
+                "checkpoint a DEEPER anchor of the same chain has already "
+                "superseded, and with none of those left it stays over the cap "
+                "rather than evict something still worth resuming from. Nothing "
+                "runs until the paged pool has to destroy cached content to "
+                "claim a superblock, so where there is room to spare this costs "
+                "nothing. -1 (default) sizes it at "
+                "max_num_seqs * slots_per_req * 2 -- a floor under what the "
+                "in-flight requests alone need, not a tuned number; 0 disables "
+                "trimming. Measured on Kimi-K3 agentic traffic: 84.5% of "
+                "resident checkpoints were superseded (~5.8 GiB) while the "
+                "pools reported `binding: paged` throughout."
             ),
         )
         parser.add_argument(

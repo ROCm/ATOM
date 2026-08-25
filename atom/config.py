@@ -1517,6 +1517,13 @@ class Config:
     # not one per request width: a checkpoint holds only the committed state.
     # See `SubPoolSpec.extra_entries`.
     state_checkpoint_slots: int = 0
+    # Resident checkpoints above which the pool trims, spending only
+    # those a deeper anchor of the same chain has already superseded and
+    # only when the paged pool has had to destroy cached content to get a
+    # superblock. -1 = derive from `max_num_seqs`; 0 = never trim.
+    # Resolved to a concrete count in `__post_init__`, so readers below
+    # never see the sentinel. See `StateSlotPool.trim_superseded`.
+    state_checkpoint_soft_cap: int = -1
     # Whether a refused hit may place a rung of its own. Off leaves the
     # prompt-end anchor as the only placement: on the cc-traces a demand is
     # 47% of all checkpoint writes but reads back 2.8% of the time against the

@@ -584,7 +584,12 @@ class CacheStats:
             f"resumed: {p.get('checkpoints_resumed', 0)}, "
             f"read-twice: {p.get('checkpoints_read_twice', 0)}, "
             f"superseded-now: {p.get('checkpoints_superseded', 0)}, "
-            f"supersede-events: {p.get('superseded_events', 0)}"
+            f"supersede-events: {p.get('superseded_events', 0)}, "
+            # Apart from `evicted` above: a trim CHOOSES, from checkpoints a
+            # deeper anchor already replaced, and hands the bytes to the paged
+            # pool. An eviction is the pool having nothing free and spending
+            # whatever the LRU head happened to be.
+            f"trimmed: {p.get('checkpoints_trimmed', 0)}"
         )
         if "supers_total" not in p:
             return

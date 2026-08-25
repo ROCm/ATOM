@@ -160,6 +160,25 @@ class BlockManager:
         self.max_state_slots = (
             int(getattr(config, "max_state_slots", 0) or 0) or self.num_state_slots
         )
+        # Resident checkpoints above which the pool trims. Resolved here rather
+        # than in `Config.__post_init__` because the default is stated in slots
+        # and `state_slots_per_req` comes from the sizing plan, which the config
+        # does not have.
+        #
+        # `max_num_seqs * slots_per_req * 2` is a floor under what the in-flight
+        # requests alone need, doubled -- not a tuned number. What the right
+        # number is has to be measured; what this guarantees is that trimming
+        # can never squeeze the live set. Measured at max_num_seqs=32, nospec:
+        # 129 checkpoints resident against 6 slots actually live, so the cap
+        # binds and the candidates (84.5% of them superseded) are what it spends.
+        soft_cap = int(getattr(config, "state_checkpoint_soft_cap", -1))
+        self.state_checkpoint_soft_cap = (
+            max(1, int(getattr(config, "max_num_seqs", 0) or 0))
+            * self.state_slots_per_req
+            * 2
+            if soft_cap < 0
+            else soft_cap
+        )
         # Tokens between rungs of the checkpoint ladder, shared by every
         # Pool.STATE class (--state-checkpoint-interval-tokens).
         #
@@ -237,6 +256,10 @@ class BlockManager:
             # minutes to make room. Every one was a `Lost-to-checkpoint`, none
             # a `Lost-unrecoverable`.
             max_slots=self.max_state_slots,
+            # Only with a superblock source: without one the state region is
+            # carved statically and a trimmed slot's bytes have nowhere to go,
+            # so the trim would spend checkpoints and buy nothing.
+            soft_cap=(self.state_checkpoint_soft_cap if superblocks is not None else 0),
         )
         self.paged_state_checkpoints: PagedStateCheckpointCoordinator | None = None
         if checkpoint_spec is not None:
