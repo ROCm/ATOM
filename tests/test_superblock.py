@@ -351,6 +351,36 @@ class TestClaimOrder:
         assert pool.claim_superblock() == 0
         assert pool.superblocks_evicted_cached == 1, "one claim"
         assert pool.superblock_blocks_evicted == 1, "but one block of four"
+        assert pool.superblock_blocks_evicted <= pool.blocks_evicted
+
+    def test_a_stale_hash_is_not_counted_as_destroyed(self):
+        """A block still carrying a hash the index has re-pointed elsewhere
+        destroys nothing when taken.
+
+        `hash != -1` is the weaker test; `_unindex` also requires the index to
+        still name this block, and that is what `blocks_evicted` counts.
+        Counting the weaker one made the superblock share exceed the total it
+        is a subset of -- 2032 of 2021 in a live run.
+        """
+        pool, sb = pooled(num_blocks=8, per=4)
+        fill(pool, 0, h=900)
+        pool.free(0)
+        # Re-point 900 at a block outside superblock 0, leaving block 0's own
+        # `hash` field stale. Publishing is the ordinary route to that state:
+        # the same content gets cached again somewhere else.
+        fill(pool, 4, h=900)
+        pool.free(4)
+        for b in (1, 2, 3):
+            pool.allocate(b)
+            pool.free(b)
+
+        assert pool.blocks[0].hash == 900, "stale, and still set"
+        assert pool.lookup(900) == 4, "but the index names block 4"
+        before = pool.blocks_evicted
+        assert pool.claim_superblock() == 0
+        assert pool.blocks_evicted == before, "nothing reusable was destroyed"
+        assert pool.superblock_blocks_evicted == 0
+        assert pool.lookup(900) == 4, "the live copy survived"
 
     def test_a_kv_floor_is_held_back_from_bulk_claims(self):
         """Spending the pool to nothing for slots leaves nothing to prefill with.

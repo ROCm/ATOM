@@ -473,8 +473,16 @@ class BlockPool:
                 # the two differ by however much of the superblock was empty.
                 # Without this the state pool's share of `blocks_evicted` can
                 # only be bounded (claims x blocks_per_super), never measured.
-                self.superblock_blocks_evicted += 1
+                #
+                # Read off `blocks_evicted` rather than counted here against
+                # `hash != -1`: that test is weaker than the one `_unindex`
+                # applies, which also requires the index to still name this
+                # block. A block whose hash was re-pointed elsewhere destroys
+                # nothing, and counting it made this exceed the total it is a
+                # subset of -- 2032 of 2021 in a live run.
+                before = self.blocks_evicted
                 self.allocate(block_id)
+                self.superblock_blocks_evicted += self.blocks_evicted - before
                 self.free(block_id)
             # After `free`, not instead of it: `free` returns the block to the
             # free list, and leaving it there would let `pop` hand out an id
