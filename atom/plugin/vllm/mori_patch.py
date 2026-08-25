@@ -59,30 +59,6 @@ def _try_get_exact_valid_rows(dispatch_recv_token_num: torch.Tensor) -> int | No
     return int(dispatch_recv_token_num.reshape(-1)[0].item())
 
 
-def _is_qwen35_vllm_plugin_model() -> bool:
-    try:
-        from atom.config import get_current_atom_config
-
-        atom_config = get_current_atom_config()
-        if atom_config is None or not getattr(
-            atom_config.plugin_config, "is_vllm", False
-        ):
-            return False
-        archs = getattr(atom_config.hf_config, "architectures", None) or []
-        qwen35_archs = {
-            "Qwen3_5MoeForConditionalGeneration",
-            "Qwen3_5ForConditionalGeneration",
-        }
-        if any(a in qwen35_archs for a in archs):
-            return True
-        model_type = getattr(atom_config.hf_config, "model_type", "") or ""
-        text_config = getattr(atom_config.hf_config, "text_config", None)
-        text_model_type = getattr(text_config, "model_type", "") if text_config else ""
-        return model_type.startswith("qwen3_5") or text_model_type.startswith("qwen3_5")
-    except Exception:  # noqa: BLE001
-        return False
-
-
 def _trim_qwen35_uniform_full_graph(
     dispatch_a1: torch.Tensor,
     dispatch_scale: torch.Tensor | None,
@@ -120,7 +96,9 @@ def trim_vllm_mori_dispatch_tensors(
     ep_world_size: int,
     dispatch_recv_token_num: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]:
-    if _is_qwen35_vllm_plugin_model() and _is_uniform_full_graph_batch():
+    from atom.plugin.vllm.qwen35_plugin_scope import is_qwen35_35b_a3b_vllm_plugin_model
+
+    if is_qwen35_35b_a3b_vllm_plugin_model() and _is_uniform_full_graph_batch():
         return _trim_qwen35_uniform_full_graph(
             dispatch_a1,
             dispatch_scale,

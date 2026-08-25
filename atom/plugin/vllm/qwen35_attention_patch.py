@@ -1,8 +1,9 @@
-"""Qwen3.5-only vLLM MHA path for FULL-cudagraph correctness on vLLM 0.27+.
+"""Qwen3.5-35B-A3B vLLM MHA path for FULL-cudagraph correctness on vLLM 0.27+.
 
-Routes Qwen3.5 hybrid models through a legacy PagedAttention-style wrapper around
-vLLM native Attention (via attention_bridge) instead of the isolated
-AttentionForVllmMHA metadata path. Applied via plugin registration only.
+Routes Qwen3.5-35B-A3B hybrid models through a legacy PagedAttention-style wrapper
+around vLLM native Attention (via attention_bridge) instead of the isolated
+AttentionForVllmMHA metadata path. Larger Qwen3.5 variants are unaffected.
+Applied via plugin registration only.
 """
 
 from __future__ import annotations
@@ -16,30 +17,9 @@ from atom.model_ops.base_attention import BaseAttention
 from atom.plugin.vllm.attention_bridge import (
     unified_attention_with_output_base_for_plugin_mode,
 )
+from atom.plugin.vllm.qwen35_plugin_scope import is_qwen35_35b_a3b_vllm_plugin_model
 
 _QWEN35_ATTENTION_PATCH_APPLIED = False
-
-
-def _is_qwen35_vllm_plugin_model() -> bool:
-    try:
-        atom_config = get_current_atom_config()
-        if atom_config is None or not getattr(
-            atom_config.plugin_config, "is_vllm", False
-        ):
-            return False
-        archs = getattr(atom_config.hf_config, "architectures", None) or []
-        qwen35_archs = {
-            "Qwen3_5MoeForConditionalGeneration",
-            "Qwen3_5ForConditionalGeneration",
-        }
-        if any(a in qwen35_archs for a in archs):
-            return True
-        model_type = getattr(atom_config.hf_config, "model_type", "") or ""
-        text_config = getattr(atom_config.hf_config, "text_config", None)
-        text_model_type = getattr(text_config, "model_type", "") if text_config else ""
-        return model_type.startswith("qwen3_5") or text_model_type.startswith("qwen3_5")
-    except Exception:  # noqa: BLE001
-        return False
 
 
 class Qwen35VllmPagedAttention(BaseAttention):
@@ -193,7 +173,7 @@ def apply_qwen35_vllm_attention_patch() -> None:
     def qwen35_attention_new(cls, *args, **kwargs):
         from atom.plugin.prepare import is_vllm
 
-        if is_vllm() and _is_qwen35_vllm_plugin_model():
+        if is_vllm() and is_qwen35_35b_a3b_vllm_plugin_model():
             return Qwen35VllmPagedAttention(*args, **kwargs)
         return original_new(cls, *args, **kwargs)
 
