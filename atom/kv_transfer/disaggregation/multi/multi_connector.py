@@ -278,6 +278,7 @@ class MultiConnector(KVConnectorBase):
         load_failed: set = set()
         send_now: list = []
         save_now: list = []
+        completions: set = set()
         for c in self._connectors:
             o = _normalize_finished(c.get_finished())
             recv |= o.finished_recving
@@ -286,12 +287,14 @@ class MultiConnector(KVConnectorBase):
             load_failed |= o.failed_loading
             send_now.extend(o.finished_sending)
             save_now.extend(o.finished_saving)
+            completions |= o.connector_completions
 
         out = KVConnectorOutput(
             finished_recving=recv,
             failed_recving=failed,
             finished_loading=loaded,
             failed_loading=load_failed,
+            connector_completions=completions,
         )
 
         if not self._pairs_send_and_save:

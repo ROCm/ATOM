@@ -22,6 +22,7 @@ from atom.kv_transfer.disaggregation.multi.multi_connector import (
     MultiConnectorScheduler,
 )
 from atom.kv_transfer.disaggregation.types import (
+    ConnectorCompletion,
     ConnectorMetadata,
     KVConnectorOutput,
     SaveOperationId,
@@ -335,6 +336,27 @@ def test_get_finished_unions_and_normalizes_tuple():
     out = w.get_finished()
     assert out.finished_recving == {"d1", "d2"}
     assert out.failed_recving == {"f1"}
+
+
+def test_get_finished_carries_connector_completions():
+    # DSV4 reports its SLOT sidecar outcome only on a connector-owned channel.
+    # Dropping it here leaves the scheduler's _sidecar_save_inflight uncleared
+    # and has_pending_work() true forever.
+    done = ConnectorCompletion("dsv4.checkpoint.save", SaveOperationId(7, 1), True)
+    moriio = FakeWorkerSub(finished=(set(), set()))
+    off = FakeWorkerSub(finished=KVConnectorOutput(connector_completions={done}))
+    w = _worker([moriio, off])  # not producer: pass-through path
+    assert w.get_finished().connector_completions == {done}
+
+
+def test_paired_get_finished_carries_connector_completions():
+    # The pairing path builds its own output, so it needs the same union.
+    done = ConnectorCompletion("dsv4.checkpoint.save", SaveOperationId(7, 1), True)
+    off = FakeWorkerSub(
+        is_producer=True, finished=KVConnectorOutput(connector_completions={done})
+    )
+    w = _worker([off], pp_is_head=True)
+    assert w.get_finished().connector_completions == {done}
 
 
 def test_producer_offload_load_completion_uses_loading_state():
