@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
+import pytest
 
 from atom.model_engine.scheduler import Scheduler, ScheduledBatchOutput
 from atom.sampling_params import SamplingParams
@@ -72,6 +73,27 @@ class TestMTPMaxTokens:
         assert len(finished[0].logprobs) == finished[0].num_completion_tokens
         emitted = stream_queue.put_nowait.call_args.args[0][0][1]
         assert emitted.output_tokens == [10, 11]
+        assert emitted.finish_reason == "max_tokens"
+
+    @pytest.mark.parametrize("max_tokens", [0, -1])
+    def test_nonpositive_cap_emits_empty_terminal_output(self, seq_factory, max_tokens):
+        sched = self._scheduler()
+        seq = self._prefill(
+            sched,
+            seq_factory(
+                [1, 2, 3, 4],
+                sampling_params=SamplingParams(max_tokens=max_tokens, ignore_eos=True),
+            ),
+        )
+        stream_queue = mock.Mock()
+        finished = self._accept_all(sched, seq, [10, 11, 12, 13], stream_queue)
+
+        assert len(finished) == 1
+        assert finished[0].leave_reason == "max_tokens"
+        assert finished[0].num_completion_tokens == 0
+        emitted = stream_queue.put_nowait.call_args.args[0][0][1]
+        assert emitted.output_tokens == []
+        assert emitted.finished is True
         assert emitted.finish_reason == "max_tokens"
 
     def test_earlier_eos_wins_over_later_cap(self, seq_factory):

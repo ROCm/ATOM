@@ -2404,7 +2404,12 @@ class Scheduler:
             )
 
             # Prepare stream output
-            if stream_output_queue is not None and new_tokens:
+            # A terminal event is required even when truncation leaves no
+            # tokens (for example max_tokens <= 0). Async consumers wait for
+            # this finished RequestOutput and would otherwise block forever.
+            if stream_output_queue is not None and (
+                new_tokens or leave_reason is not None
+            ):
                 if self.kv_connector is not None and leave_reason is not None:
                     self.kv_connector.request_finished(seq)
                 output_tokens_list = (
