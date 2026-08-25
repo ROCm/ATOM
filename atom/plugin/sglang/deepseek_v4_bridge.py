@@ -166,6 +166,7 @@ def _resolve_v4_pool_geometry(md, proxy_pool, model=None):
         geometry = _proxy_pool_geometry(proxy_pool)
         proxy_pool._atom_v4_geometry = geometry
     md.pool_geometry = geometry
+    md.envelope_rows = int(geometry.envelope_rows)
     return geometry
 
 
@@ -2047,6 +2048,7 @@ def build_atom_v4_attention_metadata_from_sglang(
 
 def _populate_decode_indices(md, block_tables, pos_np, device) -> None:
     from atom.model_ops.v4_kernels import write_v4_paged_decode_indices
+    from atom.plugin.vllm.deepseek_v4_ops import write_v4_decode_hca_compress_tail
 
     win = int(md.swa_window)
     batch_np = md.batch_id_per_token_cpu
@@ -2104,19 +2106,17 @@ def _populate_decode_indices(md, block_tables, pos_np, device) -> None:
         win=win,
         geometry=md.pool_geometry,
     )
-    # Fill HCA compressed section on CPU for the first-cut eager bridge.
-    # `write_v4_paged_decode_indices` writes the SWA prefix at the TAIL of each
-    # per-token slice, so HCA compressed entries must occupy the HEAD starting
-    # at hca_indptr[t].  This mirrors native ATOM's _attach_v4_paged_decode_meta.
-    hca_cpu = hca_indices.detach().cpu().numpy()
-    for t, bid in enumerate(batch_np):
-        n_hca = int(hca_counts[t])
-        base = int(hca_indptr_np[t])
-        if n_hca:
-            hca_cpu[base : base + n_hca] = int(md.swa_pages) + block_tables[
-                int(bid), :n_hca
-            ].detach().cpu().numpy().astype(np.int32)
-    hca_indices.copy_(torch.from_numpy(hca_cpu).to(device=device))
+    write_v4_decode_hca_compress_tail(
+        batch_id_per_token=md.batch_id_per_token,
+        positions=positions_gpu,
+        hca_indptr=hca_indptr,
+        n_committed_hca_per_seq=md.n_committed_hca_per_seq,
+        block_tables=block_tables,
+        hca_indices=hca_indices,
+        T=T,
+        win=win,
+        envelope_rows=md.pool_geometry.envelope_rows,
+    )
     md.swa_dest_rows = dest_rows
     md.kv_indices_swa = swa_indices[: int(swa_indptr_np[-1])]
     md.kv_indices_csa = csa_indices[: int(csa_indptr_np[-1])]
