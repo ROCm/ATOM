@@ -89,8 +89,8 @@ from atom.model_ops.attention_mla import (
 )
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.dcp_ops import (
+    dcp_decode_candidate_exchange,
     dcp_gather_candidate_gids,
-    dcp_pack_topk_candidates,
     triton_filter_and_convert_dcp_index,
     triton_filter_and_convert_dcp_index_prefill,
 )
@@ -1399,149 +1399,6 @@ def _dcp_gather_indexer_k_prefill(
     return k_fp8, k_scale
 
 
-def _dcp_decode_candidate_exchange(
-    attn_metadata,
-    padded_q_fp8_decode_tokens: torch.Tensor,
-    kv_cache: torch.Tensor,
-    weights: torch.Tensor,
-    topk_indices: torch.Tensor,
-    dcp_rank: int,
-    num_decode_tokens: int,
-    topk_tokens: int,
-    max_model_len: int,
-    runner_block_size: int,
-    stable_topk: bool,
-    cp_kv_cache_interleave_size: int = 1,
-) -> None:
-    """DCP decode candidate exchange -> deterministic merge into global top-k.
-
-    Each rank holds only 1/W of the KV (index_cache is sharded, same slot_mapping
-    as the main KV). Score the LOCAL shard — block_tables already point at it, so
-    only context_lens must be localized — take a LOCAL top-k, and all-gather just
-    the W*topk (score, global_id) candidates. Because fewer tokens outrank a given
-    token locally than globally, a token in the global top-K is in its own rank's
-    local top-K, so the merge reconstructs the global top-K. Caveat: the local
-    top-k is a score-only radix-select whose tie handling differs from the global
-    gid-ordered tie-break, so when the local boundary (2048th) sits on a score tie
-    a tied token may be dropped before the exchange -- the merged set can then
-    differ from dcp=1 at that boundary. Exact fp32 score ties are rare, so this is
-    a negligible boundary effect, not a systematic loss.
-
-    Writes the merged global top-k in place into
-    topk_indices[:num_decode_tokens, :topk_tokens].
-    """
-    dcp_world_size = get_dcp_world_size()
-    batch_size, next_n = padded_q_fp8_decode_tokens.shape[:2]
-    num_rows = batch_size * next_n
-    num_padded_tokens = num_rows
-    assert attn_metadata.max_seqlen_q == 1, (
-        "DCP + DeepSeek-V3.2 sparse indexer (DSA) currently supports "
-        "qlen=1 decode only (MTP verify not yet supported)."
-    )
-    # Interleave-S local length (matches get_dcp_local_seq_lens / prepare_decode's
-    # slot split): each full S*W super-block gives every rank S tokens, and the
-    # tail remainder is handed out S at a time by rank. S=1 -> the round-robin
-    # base + (this rank owns the +1 tail?) split.
-    #
-    # It depends only on context_lens / S / W / dcp_rank, so it is the same for
-    # every layer and prepare_decode already computes it on the host. Prefer that
-    # published buffer -- deriving it here costs 8 elementwise kernels on every
-    # full-index layer (21 of them on GLM-5.2). The fallback keeps metadata
-    # builders that do not publish it working.
-    local_ctx = getattr(attn_metadata, "dcp_local_context_lens", None)
-    if local_ctx is None or local_ctx.shape[0] != num_rows:
-        g_ctx = attn_metadata.context_lens
-        S = cp_kv_cache_interleave_size
-        W = dcp_world_size
-        full_chunks = g_ctx // (S * W)
-        base = full_chunks * S
-        remainder = (g_ctx - base * W - dcp_rank * S).clamp(0, S)
-        local_ctx = (base + remainder).to(torch.int32)
-    l_max = (max_model_len + dcp_world_size - 1) // dcp_world_size
-    local_logits = torch.empty([num_rows, l_max], dtype=torch.float32, device="cuda")
-    deepgemm_fp8_paged_mqa_logits(
-        padded_q_fp8_decode_tokens,
-        kv_cache,
-        weights[:num_padded_tokens],
-        local_logits,
-        local_ctx,
-        attn_metadata.block_tables,
-        l_max,
-        KVBlockSize=runner_block_size,
-        Preshuffle=True,
-    )
-    # ---- local top-k -> exchange candidates -> deterministic merge ----
-    # k_loc is the constant `topk_tokens`, never the live local length: the
-    # exchanged size must be static for CUDAGraph. Short contexts therefore ship
-    # (-inf, -1) padding, which the merge drops.
-    k_loc = topk_tokens
-    local_idx = torch.empty(
-        num_rows, k_loc, dtype=torch.int32, device=local_logits.device
-    )
-    top_k_per_row_decode(
-        local_logits,
-        next_n,
-        local_ctx,
-        local_idx,
-        num_rows,
-        local_logits.stride(0),
-        local_logits.stride(1),
-        k_loc,
-        stable=stable_topk,
-    )
-    # [2, rows, k_loc]: plane 0 = score, plane 1 = int32 gid bits.
-    send = torch.empty(
-        2, num_rows, k_loc, dtype=torch.float32, device=local_logits.device
-    )
-    dcp_pack_topk_candidates(
-        local_logits,
-        local_idx,
-        local_ctx,
-        dcp_rank,
-        dcp_world_size,
-        send,
-        cp_kv_cache_interleave_size,
-    )
-    # Exchange as int32 so the gid bit patterns cannot be touched by any float
-    # canonicalization along the way; the score plane is bitcast back at the end
-    # (free, no copy).
-    recv = (
-        get_dcp_group()
-        .all_gather(send.view(torch.int32), dim=0)
-        .view(dcp_world_size, 2, num_rows, k_loc)
-    )
-    n_cand = dcp_world_size * k_loc
-    # Rank is the outer dim after all-gather but the merge wants it on the
-    # candidate dim. Selection is provably order-independent, so any consistent
-    # permutation works — but scores and gids must use the SAME one.
-    #
-    # Only the SCORE plane needs materialising: aiter's top-k takes a 2-D
-    # (stride0, stride1) pair, and after an all-gather the per-row candidates sit
-    # in W chunks separated by 2*rows*k_loc, which no 2-D stride can express. The
-    # gid plane is read in place by dcp_gather_candidate_gids below.
-    gathered_sc = recv[:, 0].permute(1, 0, 2).reshape(num_rows, n_cand).contiguous()
-    topk_indices_decode = topk_indices[:num_decode_tokens, :topk_tokens]
-    cand_idx = torch.empty(
-        num_rows, topk_tokens, dtype=torch.int32, device=gathered_sc.device
-    )
-    cand_lens = torch.full(
-        (num_rows,), n_cand, dtype=torch.int32, device=gathered_sc.device
-    )
-    top_k_per_row_decode(
-        gathered_sc.view(torch.float32),
-        1,
-        cand_lens,
-        cand_idx,
-        num_rows,
-        gathered_sc.stride(0),
-        gathered_sc.stride(1),
-        topk_tokens,
-        stable=True,
-    )
-    # Map row-local candidate index -> global id, reading recv's gid plane in
-    # place and writing straight into topk_indices.
-    dcp_gather_candidate_gids(recv, cand_idx, topk_indices_decode)
-
 
 def sparse_attn_indexer(
     hidden_states: torch.Tensor,
@@ -1808,7 +1665,7 @@ def sparse_attn_indexer(
         logits = None
         if dcp_world_size > 1:
             dcp_rank = get_dcp_rank()
-            _dcp_decode_candidate_exchange(
+            dcp_decode_candidate_exchange(
                 attn_metadata,
                 padded_q_fp8_decode_tokens,
                 kv_cache,
