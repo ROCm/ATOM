@@ -1,4 +1,4 @@
-name: Slurm ATOM Accuracy Smoke
+name: Slurm ATOM Accuracy
 
 on:
   pull_request:
@@ -16,30 +16,39 @@ permissions:
 
 env:
   ATOM_BASE_IMAGE: rocm/atom-dev:latest
+  ATOM_PYTHON_TAG: "cp312"
   CONTAINER_NAME: atom_slurm_gpt_oss_120b
   MODEL_NAME: gpt-oss-120b
   MODEL_PATH: openai/gpt-oss-120b
-  MODEL_EXTRA_ARGS: --kv_cache_dtype fp8 --gpu-memory-utilization 0.3
+  MODEL_EXTRA_ARGS: --kv_cache_dtype fp8 --gpu-memory-utilization 0.5
+  ACCURACY_THRESHOLD: "0.87"
   CLIENT_COMMAND: >-
     lm_eval --model local-chat-completions --apply_chat_template
-    --model_args model=${MODEL_PATH},base_url=http://localhost:8000/v1/chat/completions,num_concurrent=8,max_retries=3,max_gen_toks=512,tokenized_requests=False,trust_remote_code=True
-    --tasks gsm8k --num_fewshot 3 --limit 10 --output_path ${OUTPUT_PATH}
+    --model_args model=${MODEL_PATH},base_url=http://localhost:8000/v1/chat/completions,num_concurrent=65,max_retries=3,max_gen_toks=2048,tokenized_requests=False,trust_remote_code=True
+    --tasks gsm8k --num_fewshot 3 --output_path ${OUTPUT_PATH}
 
 jobs:
-  gpt-oss-120b-limited-gsm8k:
-    name: Accuracy gpt-oss-120b limited GSM8K
-    runs-on: [self-hosted, slurm-runner-mi355x-1gpu]
-    timeout-minutes: 30
+  gpt-oss-120b-gsm8k:
+    name: Accuracy gpt-oss-120b GSM8K
+    runs-on: [self-hosted, slurm-runner-mi355x-8gpu]
+    timeout-minutes: 45
     steps:
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
+
+      - name: Download aiter wheel
+        timeout-minutes: 30
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          AITER_WHEEL_OUTPUT_DIR: /tmp/aiter-whl
+        run: bash .github/scripts/download_aiter_wheel.sh
 
       - name: Start CI container
         uses: ./.github/actions/setup-gpu-container
         with:
           container-name: ${{ env.CONTAINER_NAME }}
           base-image: ${{ env.ATOM_BASE_IMAGE }}
-          runner: slurm-runner-mi355x-1gpu
+          runner: slurm-runner-mi355x-8gpu
           hf-token: ${{ secrets.AMD_HF_TOKEN }}
           network-host: "true"
 
@@ -51,6 +60,18 @@ jobs:
           echo "HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-}"
           rocm-smi || true
           docker exec "$CONTAINER_NAME" bash -lc 'env | sort | grep -E "^(ROCR_VISIBLE_DEVICES|HIP_VISIBLE_DEVICES|CUDA_VISIBLE_DEVICES)=" || true'
+
+      - name: Collect GPU info
+        id: gpu-info
+        env:
+          COLLECT_VERBOSE_GPU_INFO: "1"
+        run: bash .github/scripts/collect_gpu_info.sh "$CONTAINER_NAME" docker "slurm-runner-mi355x-8gpu"
+
+      - name: Install aiter from wheel
+        env:
+          CONTAINER_NAME: ${{ env.CONTAINER_NAME }}
+          AITER_WHL_DIR: /tmp/aiter-whl
+        run: bash .github/scripts/install_aiter_wheel.sh
 
       - name: Install ATOM and dependencies
         run: |
@@ -67,7 +88,7 @@ jobs:
           "
 
       - name: Download model
-        timeout-minutes: 10
+        timeout-minutes: 150
         env:
           HF_TOKEN: ${{ secrets.AMD_HF_TOKEN }}
         run: |
@@ -76,8 +97,8 @@ jobs:
             -e HF_TOKEN="${HF_TOKEN:-}" \
             -e MODEL_ID="${MODEL_PATH}" \
             -e TARGET_DIR="/models/${MODEL_PATH}" \
-            -e MODEL_DOWNLOAD_TIMEOUT="10m" \
-            -e MODEL_LOCK_WAIT_SECONDS="600" \
+            -e MODEL_DOWNLOAD_TIMEOUT="30m" \
+            -e MODEL_LOCK_WAIT_SECONDS="1800" \
             -e MODEL_LOCK_POLL_INTERVAL="30" \
             -e MODEL_PROGRESS_INTERVAL="60" \
             "$CONTAINER_NAME" \
@@ -91,8 +112,8 @@ jobs:
               fi
             '
 
-      - name: Run limited GSM8K accuracy
-        timeout-minutes: 20
+      - name: Run GSM8K accuracy
+        timeout-minutes: 30
         env:
           MODEL_EXTRA_ARGS: ${{ env.MODEL_EXTRA_ARGS }}
           CLIENT_COMMAND: ${{ env.CLIENT_COMMAND }}
@@ -107,11 +128,14 @@ jobs:
 
           echo "Launching ${MODEL_NAME} from ${model_path}"
           echo ".github/scripts/atom_test.sh launch $model_path $MODEL_EXTRA_ARGS" | \
-            docker exec -i "$CONTAINER_NAME" bash -l
+            docker exec -e ATOM_DEBUG_DEVICE_MAPPING="1" -i "$CONTAINER_NAME" bash -l
 
-          echo "Running limited GSM8K accuracy"
+          echo "Running GSM8K accuracy"
           docker exec \
             -e CLIENT_COMMAND="${CLIENT_COMMAND}" \
+            -e GPU_NAME="${{ steps.gpu-info.outputs.gpu_name }}" \
+            -e GPU_VRAM_GB="${{ steps.gpu-info.outputs.gpu_vram_gb }}" \
+            -e ROCM_VERSION="${{ steps.gpu-info.outputs.rocm_version }}" \
             "$CONTAINER_NAME" bash -lc "
               cd /workspace
               .github/scripts/atom_test.sh accuracy $model_path
@@ -119,6 +143,8 @@ jobs:
 
       - name: Check result file
         if: success()
+        env:
+          ACCURACY_THRESHOLD: ${{ env.ACCURACY_THRESHOLD }}
         run: |
           set -euo pipefail
           result_file=$(ls -1t accuracy_test_results/*.json 2>/dev/null | head -n 1)
@@ -127,7 +153,7 @@ jobs:
             exit 2
           fi
           echo "RESULT_FILE=$result_file"
-          python3 - "$result_file" <<'PY'
+          score=$(python3 - "$result_file" <<'PY'
           import json
           import sys
 
@@ -135,6 +161,13 @@ jobs:
               data = json.load(f)
           print(data["results"]["gsm8k"].get("exact_match,flexible-extract"))
           PY
+          )
+          echo "Flexible extract value: $score"
+          awk -v val="$score" -v threshold="$ACCURACY_THRESHOLD" 'BEGIN {exit (val < threshold) ? 1 : 0}' || {
+            echo "Accuracy test failed: $score < $ACCURACY_THRESHOLD"
+            exit 1
+          }
+          echo "Accuracy test passed: $score >= $ACCURACY_THRESHOLD"
 
       - name: Dump server log
         if: always()
@@ -148,7 +181,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: slurm-gpt-oss-120b-limited-gsm8k-output
+          name: slurm-gpt-oss-120b-gsm8k-output
           path: |
             atom_accuracy_output.txt
             accuracy_test_results/*.json
