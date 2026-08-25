@@ -587,33 +587,41 @@ class TestRegisterReceivedPrefix:
         assert bm.register_received_prefix(a) == 2
 
 
-class TestPrefixMissLog:
-    """That the diagnostic separates the three ways a scan returns nothing.
+class TestPrefixWalkLog:
+    """That the diagnostic records where the prefix walk stopped, not just
+    whether it returned nothing.
 
-    A hit rate cannot: "never cached", "was cached and the block went", and
-    "too short to have a reusable block" read identically in it and want
-    opposite fixes. Off unless `ATOM_LOG_PREFIX_MISS`, because it fires once
-    per zero-hit request and that is ~10% of agentic traffic.
+    Reuse is lost in two independent places -- the paged index (never cached,
+    or evicted) and the state/SWA gates -- and a request that matched most of
+    its prefix before stopping short is invisible to a zero-hit counter. The
+    line carries both boundaries so the two are subtractable. Off unless
+    `ATOM_LOG_PREFIX_MISS`: it fires once per admitted request.
     """
 
     @staticmethod
-    def _kinds(caplog):
-        return [
-            r.getMessage().split("kind=")[1].split()[0]
-            for r in caplog.records
-            if r.getMessage().startswith("[PrefixMiss]")
-        ]
+    def _walks(caplog):
+        out = []
+        for r in caplog.records:
+            m = r.getMessage()
+            if not m.startswith("[PrefixWalk]"):
+                continue
+            f = dict(p.split("=", 1) for p in m.split() if "=" in p)
+            out.append(f)
+        return out
 
-    def test_a_cold_prompt_reports_unindexed(
+    def test_a_cold_prompt_reports_unindexed_and_zero(
         self, block_manager_prefix, seq_factory, caplog, monkeypatch
     ):
         monkeypatch.setenv("ATOM_LOG_PREFIX_MISS", "1")
         seq = seq_factory([1, 2, 3, 4, 5, 6, 7, 8])
         with caplog.at_level(logging.INFO, logger="atom"):
-            assert block_manager_prefix.can_allocate(seq) == 0
-        assert self._kinds(caplog) == ["unindexed"]
+            hit = block_manager_prefix.can_allocate(seq)
+            block_manager_prefix.allocate(seq, hit)
+        (w,) = self._walks(caplog)
+        assert w["kind"] == "unindexed"
+        assert w["compressed"] == "0" and w["cached"] == "0"
 
-    def test_a_prompt_too_short_to_reuse_says_so(
+    def test_a_prompt_too_short_to_reuse_says_full(
         self, block_manager_prefix, seq_factory, caplog, monkeypatch
     ):
         """One block of prompt has no reusable block at all: the last is always
@@ -622,23 +630,34 @@ class TestPrefixMissLog:
         monkeypatch.setenv("ATOM_LOG_PREFIX_MISS", "1")
         seq = seq_factory([1, 2, 3])
         with caplog.at_level(logging.INFO, logger="atom"):
-            block_manager_prefix.can_allocate(seq)
-        assert self._kinds(caplog) == ["no-blocks"]
+            hit = block_manager_prefix.can_allocate(seq)
+            block_manager_prefix.allocate(seq, hit)
+        (w,) = self._walks(caplog)
+        assert w["kind"] == "full" and w["compressed"] == "0"
 
-    def test_a_hit_logs_nothing(
+    def test_a_partial_hit_records_where_it_stopped(
         self, block_manager_prefix, seq_factory, caplog, monkeypatch
     ):
+        """The case a zero-hit counter cannot see: the walk matched a block and
+        then stopped, so `compressed` is neither 0 nor the full block count."""
         monkeypatch.setenv("ATOM_LOG_PREFIX_MISS", "1")
-        first = seq_factory([1, 2, 3, 4, 5, 6, 7, 8])
+        # 4 blocks of 4 tokens. The second seq shares block 0, diverges at
+        # block 1, so the walk stops with 1 of a possible 3 matched.
+        first = seq_factory(list(range(1, 17)))
         block_manager_prefix.allocate(first)
         block_manager_prefix.hash_blocks(
             first, first.num_tokens - first.num_cached_tokens
         )
         block_manager_prefix.deallocate(first)
-        second = seq_factory([1, 2, 3, 4, 9, 10, 11, 12])
+        second = seq_factory([1, 2, 3, 4] + list(range(90, 102)))
         with caplog.at_level(logging.INFO, logger="atom"):
-            assert block_manager_prefix.can_allocate(second) > 0
-        assert self._kinds(caplog) == []
+            hit = block_manager_prefix.can_allocate(second)
+            assert hit > 0
+            block_manager_prefix.allocate(second, hit)
+        w = self._walks(caplog)[-1]
+        assert w["blocks"] == "4"
+        assert w["compressed"] == "1"  # neither 0 nor the full 3
+        assert w["kind"] == "unindexed"  # stopped early: block 1 diverges
 
     def test_the_flag_is_off_by_default(
         self, block_manager_prefix, seq_factory, caplog, monkeypatch
@@ -646,5 +665,5 @@ class TestPrefixMissLog:
         monkeypatch.setenv("ATOM_LOG_PREFIX_MISS", "0")
         seq = seq_factory([1, 2, 3, 4, 5, 6, 7, 8])
         with caplog.at_level(logging.INFO, logger="atom"):
-            block_manager_prefix.can_allocate(seq)
-        assert self._kinds(caplog) == []
+            block_manager_prefix.allocate(seq, block_manager_prefix.can_allocate(seq))
+        assert self._walks(caplog) == []

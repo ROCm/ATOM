@@ -569,28 +569,12 @@ class BlockManager:
                 break
             block_hashes.append(h)
             compressed_hit += 1
-        if envs.ATOM_LOG_PREFIX_MISS and compressed_hit == 0:
-            # Why a request got nothing, at the one place that knows. Three
-            # outcomes look identical in a hit rate and want opposite fixes: a
-            # prompt whose first block was never cached (new session, or a
-            # client that re-cut its history so block 0 differs), one whose
-            # block was evicted, and one too short to have a reusable block at
-            # all. `-1` for `first_hash` means the loop never ran.
-            logger.info(
-                "[PrefixMiss] seq=%s tokens=%d hash_blocks=%d kind=%s "
-                "first_hash=%d first_tokens=%s indexed=%d",
-                getattr(seq, "external_request_id", None) or seq.id,
-                seq.num_tokens,
-                self._n_hash_blocks(seq),
-                miss_kind or "no-blocks",
-                h,
-                (
-                    list(self._hash_block_tokens(seq, 0)[:8])
-                    if self._n_hash_blocks(seq) > 1
-                    else []
-                ),
-                self.kv.num_indexed,
-            )
+        # Where the walk stopped, and on which hash. Stashed rather than logged
+        # here: `can_allocate` also runs as a pure admission probe that may
+        # reject and retry, so logging here would emit many lines per request
+        # and count the rejected probes. `allocate` runs once per admission.
+        seq.prefix_miss_kind = miss_kind or "full"
+        seq.prefix_miss_hash = h
         # Step 2: SWA only needs the trailing window before the boundary to be
         # present (SWA is local). Scan right-to-left within the compressed prefix
         # for the largest boundary whose window is SWA-cached (vLLM
@@ -672,6 +656,31 @@ class BlockManager:
             self._attach_state_slots(seq, h if num_cached_blocks > 0 else -1)
         if seq.has_per_req_cache:
             seq._state_initialized_after_alloc = False
+        if envs.ATOM_LOG_PREFIX_MISS:
+            # The whole walk, not just the total misses: reuse is lost in two
+            # places and a request that stops short of the end looks identical
+            # to one that hit nothing when only the total is recorded.
+            #   blocks - 1 - compressed  = lost in the paged index (never
+            #                              cached, or evicted)
+            #   compressed - cached      = declined by the state/SWA gates
+            # `first_hash` is the hash the walk stopped on, so a miss can be
+            # matched against the [PrefixStore] line that published it.
+            compressed = getattr(seq, "num_compressed_hit_blocks", 0)
+            logger.info(
+                "[PrefixWalk] seq=%s tokens=%d blocks=%d compressed=%d "
+                "cached=%d kind=%s stop_hash=%d indexed=%d",
+                getattr(seq, "external_request_id", None) or seq.id,
+                seq.num_tokens,
+                self._n_hash_blocks(seq),
+                compressed,
+                num_cached_blocks,
+                # "no-probe": `allocate` called without `can_allocate` first,
+                # so no walk happened. The scheduler always probes; tests and
+                # the no-prefix-caching path do not.
+                getattr(seq, "prefix_miss_kind", "no-probe"),
+                getattr(seq, "prefix_miss_hash", -1),
+                self.kv.num_indexed,
+            )
 
     def _attach_state_slots(self, seq: Sequence, hit_hash: int) -> None:
         """Give `seq` its state slots, resuming from a checkpoint when one exists.
