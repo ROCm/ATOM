@@ -565,13 +565,7 @@ class MLAAttention(nn.Module):
         self.dcp_persistent_supported = dcp_persistent_supported()
         self.dcp_prefill_merge_bf16_ok = dcp_prefill_merge_bf16_ok()
 
-        # Run the sparse decode on the Gluon kernel instead of the asm one. It
-        # takes num_heads < 16 natively, gfx950 only. Anything it does not cover
-        # keeps the asm path, so the flag only changes which kernel runs:
-        #   - DCP: its cross-rank merge needs an LSE this kernel cannot return
-        #   - an f16 KV cache: not covered by the kernel's format inference
-        # Page size does not enter it: sparse indices are physical token ids, so
-        # the cache reads flat whatever ATOM_MLA_PAGE_SIZE is.
+        # Run the sparse decode on the Gluon kernel instead, if available.
         self.use_gluon_sparse_mla = (
             envs.ATOM_USE_TRITON_SPARSE_MLA
             and self.is_sparse_mla
