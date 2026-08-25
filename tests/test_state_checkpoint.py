@@ -3267,11 +3267,17 @@ class TestReadSideCounters:
         assert fates["checkpoints_superseded"] == 0
         assert fates["superseded_events"] == 1
 
-    def test_supersede_survives_the_scheduler_clearing_fork_src(self):
-        """The bug this replaced: `state_fork_src` is a one-forward flag the
-        scheduler clears after every batch, and `checkpoint` runs in
-        postprocess — so reading it there finds -1 every time and no anchor is
-        ever marked. Measured 0 supersessions against 98 checkpoints kept."""
+    def test_supersede_is_the_resume_link_not_a_seq_local_one(self):
+        """Two things this must not key off, both measured 0 in a live run.
+
+        `state_fork_src` is cleared by the scheduler after every batch, so
+        `checkpoint` (postprocess) always reads -1. And a request's own
+        previous checkpoint never fires either: a conversation's turns are
+        separate Sequences and with the interval ladder off each writes exactly
+        one checkpoint. The link that crosses requests is the resume, so
+        `attach_state` writes `last_checkpoint_slot` and `checkpoint` only
+        reads it.
+        """
 
         class Seq:
             def __init__(self):
@@ -3294,14 +3300,31 @@ class TestReadSideCounters:
 
         pool = StateSlotPool(8, StateTransfer.fork(1), hash_block_size=1)
         pool.applies = lambda seq: True
-        seq = Seq()
-        seq.state_slot = pool.pop()
-        for turn, h in enumerate((111, 222, 333), start=1):
-            pool.checkpoint(seq, turn, h)
-            seq.state_fork_src = -1  # what Scheduler does after every forward
-            pool.release_pins()
-            pool.release_pins()
+
+        # Turn 1: a fresh conversation. Nothing to supersede.
+        first = Seq()
+        first.state_slot = pool.pop()
+        pool.checkpoint(first, 1, 111)
+        pool.release_pins()
+        pool.release_pins()
+        anchor1 = pool.lookup(111)
+        assert anchor1 >= 0
+        assert pool.checkpoint_fates()["superseded_events"] == 0
+
+        # Turn 2: a NEW Sequence resuming off turn 1's anchor. What
+        # `attach_state` does on the resume path:
+        second = Seq()
+        second.last_checkpoint_slot = anchor1
+        second.state_slot = pool.pop()
+        pool.checkpoint(second, 2, 222)
+        pool.release_pins()
+        pool.release_pins()
         fates = pool.checkpoint_fates()
-        assert fates["checkpoints_kept"] == 3
-        # Turn 1 has no predecessor; turns 2 and 3 each supersede one.
-        assert fates["superseded_events"] == 2
+        assert fates["superseded_events"] == 1
+        assert fates["checkpoints_superseded"] == 1
+
+        # A turn that resumes nothing supersedes nothing.
+        third = Seq()
+        third.state_slot = pool.pop()
+        pool.checkpoint(third, 3, 333)
+        assert pool.checkpoint_fates()["superseded_events"] == 1

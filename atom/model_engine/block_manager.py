@@ -675,6 +675,14 @@ class BlockManager:
         # `StateSlotPool.mark_speculative`. Here rather than in `claim`, which
         # `_set_hash` also calls to re-file a slot that nobody read.
         self.state.promote(src)
+        # The chain this request continues, recorded where it survives: a
+        # conversation's turns are separate Sequences, so the anchor a later
+        # turn supersedes was written by an object that no longer exists.
+        # `checkpoint` setting this from its own previous `old` only ever links
+        # two checkpoints of the SAME request — and with the interval ladder off
+        # each request writes exactly one, which is why `supersede-events` read
+        # 0 against 98 kept. Resume is the link that crosses requests.
+        seq.last_checkpoint_slot = src
         shared = self.state.is_pinned(src)
         if not shared:
             self.state.claim(src)

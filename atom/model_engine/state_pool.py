@@ -728,17 +728,20 @@ class StateSlotPool:
         anchor = getattr(seq, "checkpoint_end_pos", 0)
         guess = bool(anchor) and boundary_blocks * self.hash_block_size != anchor
         # The anchor about to be filed sits deeper on the same chain than the
-        # one this request filed before it, so a right-to-left `resumable_hit`
-        # scan reaches the new one first and the older only serves a hit that
-        # lands between the two.
+        # one named here, so a right-to-left `resumable_hit` scan reaches the
+        # new one first and the older only serves a hit that lands between the
+        # two.
         #
-        # `last_checkpoint_slot`, NOT `state_fork_src`: the scheduler clears
-        # the latter once a batch has carried it, and `checkpoint` runs in
-        # postprocess, so it is always -1 here. Reading it measured 0
-        # supersessions against 98 checkpoints kept.
+        # `last_checkpoint_slot` is written at RESUME, in
+        # `BlockManager.attach_state`, not by the line below. Two things it must
+        # not be: `state_fork_src`, which the scheduler clears once a batch has
+        # carried it and so reads -1 by the time this runs in postprocess; and
+        # this request's own previous checkpoint, because a conversation's turns
+        # are separate Sequences and with the interval ladder off each writes
+        # exactly one checkpoint — that version measured 0 supersessions against
+        # 98 kept. The resume is the only link that crosses requests.
         #
-        # No chain walk and no session id — the predecessor is on the sequence.
-        # Marking only; see `_superseded`.
+        # No chain walk and no session id. Marking only; see `_superseded`.
         prev_anchor = getattr(seq, "last_checkpoint_slot", -1)
         if (
             prev_anchor >= 0
@@ -747,7 +750,10 @@ class StateSlotPool:
         ):
             self._superseded.add(prev_anchor)
             self.checkpoints_superseded += 1
-        seq.last_checkpoint_slot = old
+        # Deliberately NOT re-pointed at `old` here. `old` is this request's
+        # own checkpoint, and the next thing to supersede it is a LATER
+        # request's, which will name it through its own resume. Writing it back
+        # would only ever match if one request checkpointed twice.
         seq.state_slot = self.pop()
         seq.state_fork_src = old
         # Not released: `state_fork_src` names `old` as what this request's
