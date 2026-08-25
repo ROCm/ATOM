@@ -160,7 +160,6 @@ def _worker(connectors, pp_is_head=True):
     obj._connectors = connectors
     obj.is_producer = any(getattr(c, "is_producer", False) for c in connectors)
     obj._pp_is_head = pp_is_head
-    obj._pending_save = set()
     obj._pending_save_ops = {}
     obj._sent = {}
     obj._saved = {}
@@ -323,7 +322,7 @@ def test_start_load_kv_routes_by_index_and_records_saves():
     w.start_load_kv(MultiConnectorMetadata([m0, m1]))
     assert a.loaded_meta is m0
     assert b.loaded_meta is m1
-    assert w._pending_save == {"101", "102"}
+    assert w._pending_save_ops == {"101": {101}, "102": {102}}
 
 
 def test_get_finished_unions_and_normalizes_tuple():
@@ -401,7 +400,7 @@ def test_send_is_withheld_until_save_completes():
 
     # offload will save r9
     w.start_load_kv(MultiConnectorMetadata([ConnectorMetadata(), _save_meta(9)]))
-    assert w._pending_save == {"9"}
+    assert w._pending_save_ops == {"9": {9}}
 
     # Step 1: moriio reports send done, offload's save still in flight.
     moriio._finished = ({9}, set())
@@ -416,7 +415,7 @@ def test_send_is_withheld_until_save_completes():
     out2 = w.get_finished()
     assert out2.finished_sending == {9}
     assert out2.finished_saving == {9}
-    assert w._pending_save == set()  # cleared after release
+    assert w._pending_save_ops == {}  # cleared after release
 
 
 def test_save_then_send_also_pairs():
@@ -447,15 +446,18 @@ def test_pairing_matches_save_operation_id():
     moriio = FakeWorkerSub(is_producer=True)
     off = FakeWorkerSub()
     w = _worker([moriio, off])
-    w.start_load_kv(MultiConnectorMetadata([ConnectorMetadata(), _save_meta(9)]))
-
     op = SaveOperationId(9, 3)
+    w.start_load_kv(
+        MultiConnectorMetadata([ConnectorMetadata(), _save_operation_meta(op)])
+    )
+    assert w._pending_save_ops == {"9": {op}}
+
     moriio._finished = ({9}, set())
     off._finished = KVConnectorOutput(finished_saving={op})
     out = w.get_finished()
     assert out.finished_sending == {9}
     assert out.finished_saving == {op}
-    assert w._pending_save == set()
+    assert w._pending_save_ops == {}
     assert w._sent == {}
     assert w._saved == {}
 
@@ -484,7 +486,6 @@ def test_pairing_waits_for_all_save_operation_ids():
     out2 = w.get_finished()
     assert out2.finished_sending == {9}
     assert out2.finished_saving == {op0, op1}
-    assert w._pending_save == set()
     assert w._pending_save_ops == {}
     assert w._sent == {}
     assert w._saved == {}
@@ -502,7 +503,6 @@ def test_non_head_pp_stage_does_not_pair():
     out = w.get_finished()
     assert out.finished_saving == {9}
     assert out.finished_sending == set()
-    assert w._pending_save == set()
     assert w._pending_save_ops == {}
 
 

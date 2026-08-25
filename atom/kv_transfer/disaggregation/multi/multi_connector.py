@@ -215,8 +215,8 @@ class MultiConnector(KVConnectorBase):
         self._pp_is_head = pp_rank == 0
 
         # Send/save pairing state, all keyed by str(req_id). See module
-        # docstring. Legacy metadata without an operation id uses the key.
-        self._pending_save: set[str] = set()
+        # docstring. Legacy metadata without an operation id is identified by
+        # its bare request id, the same fallback the worker reports with.
         self._pending_save_ops: dict[str, set[SaveCompletionId]] = {}
         self._sent: dict[str, Any] = {}
         self._saved: dict[str, set[SaveCompletionId]] = {}
@@ -263,12 +263,10 @@ class MultiConnector(KVConnectorBase):
                         )
                         if not has_save:
                             continue
-                        req_key = completion_req_key(req.req_id)
-                        self._pending_save.add(req_key)
                         operation = getattr(req, "save_operation", None)
-                        self._pending_save_ops.setdefault(req_key, set()).add(
-                            operation if operation is not None else req_key
-                        )
+                        self._pending_save_ops.setdefault(
+                            completion_req_key(req.req_id), set()
+                        ).add(operation if operation is not None else req.req_id)
             c.start_load_kv(m)
 
     def get_finished(self) -> KVConnectorOutput:
@@ -310,24 +308,17 @@ class MultiConnector(KVConnectorBase):
             self._saved.setdefault(key, set()).add(r)
             pending_ops = self._pending_save_ops.get(key)
             if pending_ops is not None:
-                if r in pending_ops:
-                    pending_ops.discard(r)
-                else:
-                    pending_ops.discard(key)  # legacy: keyed by request
+                pending_ops.discard(r)
                 if not pending_ops:
                     self._pending_save_ops.pop(key, None)
 
         rel_send: set = set()
         rel_save: set = set()
         for key, raw in list(self._sent.items()):
-            needs_save = key in self._pending_save
-            pending_ops = self._pending_save_ops.get(key)
-            if needs_save and pending_ops:
+            if self._pending_save_ops.get(key):
                 continue  # hold: save still in flight for this request
             rel_send.add(raw)
             del self._sent[key]
-            self._pending_save.discard(key)
-            self._pending_save_ops.pop(key, None)
             rel_save.update(self._saved.pop(key, set()))
 
         out.finished_sending = rel_send
