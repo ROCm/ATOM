@@ -1,16 +1,21 @@
-from typing import Optional
-
 import functools
 import logging
 
 import aiter
 import torch
+import triton
+import triton.language as tl
 from aiter import dtypes, fused_qk_rope_concat_and_cache_mla
 from aiter.mla import mla_decode_fwd
 from aiter.ops.triton import (
-    batched_gemm_a16wfp4 as _fp4_bmm_module,
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant as _fp8_bmm_module,
 )
+from aiter.ops.triton import (
+    batched_gemm_a16wfp4 as _fp4_bmm_module,
+)
+from torch import nn
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+
 from atom.config import get_current_atom_config
 from atom.model_ops.attention_mla import MLAAttention, MLAModules
 from atom.model_ops.linear import use_triton_gemm
@@ -23,13 +28,25 @@ from atom.plugin.vllm.attention.layer_common import (
     _register_vllm_static_forward_context,
 )
 from atom.utils import envs
-from torch import nn
-from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
-
-import triton
-import triton.language as tl
 
 logger = logging.getLogger("atom")
+
+
+def _validate_aiter_tp_matches_vllm_dcp(aiter_tp_group, vllm_dcp_group) -> None:
+    aiter_ranks = tuple(aiter_tp_group.ranks)
+    vllm_ranks = tuple(vllm_dcp_group.ranks)
+    groups_match = (
+        aiter_tp_group.world_size == vllm_dcp_group.world_size
+        and aiter_ranks == vllm_ranks
+        and aiter_tp_group.rank_in_group == vllm_dcp_group.rank_in_group
+    )
+    if not groups_match:
+        raise RuntimeError(
+            "Kimi-K3 DCP FULL graph requires identical aiter TP and vLLM "
+            "DCP rank membership/order; got "
+            f"aiter={aiter_ranks}, vllm={vllm_ranks}."
+        )
+
 
 functools_partial = functools.partial
 _aiter_triton_fp8_bmm = (
@@ -154,16 +171,16 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         head_dim,
         scale,
         num_kv_heads,
-        alibi_slopes: list[float] = None,
+        alibi_slopes: list[float] | None = None,
         kv_cache_dtype="bf16",
         layer_num=0,
-        mla_modules: Optional[MLAModules] = None,
-        sinks: Optional[nn.Parameter] = None,
-        prefix: Optional[str] = None,
+        mla_modules: MLAModules | None = None,
+        sinks: nn.Parameter | None = None,
+        prefix: str | None = None,
         **kwargs,
     ):
-        from vllm.v1.attention.backend import AttentionType
         from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+        from vllm.v1.attention.backend import AttentionType
 
         if mla_modules is None:
             raise ValueError("mla_modules is required for vLLM MLA attention")
@@ -222,24 +239,33 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         from vllm.config import get_current_vllm_config
         from vllm.forward_context import (
             get_forward_context as get_vllm_forward_context,
+        )
+        from vllm.forward_context import (
             is_forward_context_available,
         )
         from vllm.model_executor.layers.attention.mla_attention import (
             MLACommonMetadataBuilder,
         )
 
+        vllm_config = get_current_vllm_config()
         self.supports_quant_query_input = False
+        dcp_size = vllm_config.parallel_config.decode_context_parallel_size
+        self._configure_dcp_decode_head_padding(dcp_size)
+        if dcp_size > 1:
+            from atom.model_ops.dcp_ops import CPTritonContext
+
+            self._cp_triton_ctx = CPTritonContext()
         self.dcp_world_size = -1
         self.chunked_prefill_workspace_size = (
             MLACommonMetadataBuilder.determine_chunked_prefill_workspace_size(
-                get_current_vllm_config()
+                vllm_config
             )
         )
         self.cp_kv_cache_interleave_size = (
-            get_current_vllm_config().parallel_config.cp_kv_cache_interleave_size
+            vllm_config.parallel_config.cp_kv_cache_interleave_size
         )
         self.need_to_return_lse_for_decode = (
-            get_current_vllm_config().parallel_config.decode_context_parallel_size > 1
+            vllm_config.parallel_config.decode_context_parallel_size > 1
         )
         self.is_aiter_triton_fp4_bmm_enabled = (
             envs.ATOM_USE_TRITON_MXFP4_BMM
@@ -251,9 +277,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         self.q_pad_num_heads = kwargs.get("q_pad_num_heads", None)
         self._pad_v = True
         self.flash_attn_varlen_func = aiter.flash_attn_varlen_func
-        self.prefill_backend = build_vllm_mla_prefill_backend(
-            self, get_current_vllm_config()
-        )
+        self.prefill_backend = build_vllm_mla_prefill_backend(self, vllm_config)
         if self.rotary_emb is not None:
             rotary_emb_cos_sin_cache = torch.cat(
                 [
@@ -777,7 +801,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         assert isinstance(q, torch.Tensor)
         original_num_heads = q.shape[1]
-        q = self._pad_query_heads(q)
+        q = self._pad_decode_query_heads(q)
         B = q.shape[0]
         num_heads_q = q.shape[1]
         o = torch.empty(
@@ -860,12 +884,9 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         )
         if do_fold:
             o = o.view(ori_total_s, ori_nhead, -1)
-        o = self._restore_query_heads(o, original_num_heads)
+        o = self._restore_decode_query_heads(o, original_num_heads)
         if lse is not None:
-            if self.head_repeat_factor > 1:
-                lse = lse[:, :: self.head_repeat_factor]
-            elif self.head_pad > 0:
-                lse = lse[:, :original_num_heads]
+            lse = self._restore_decode_query_heads(lse, original_num_heads)
         return o, lse
 
     def forward_impl(
@@ -891,19 +912,28 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
             )
 
         if not hasattr(self, "_cached_ops"):
-            from vllm.distributed.parallel_state import get_dcp_group
+            from aiter.dist.parallel_state import get_tp_group as get_aiter_tp_group
             from vllm import _custom_ops as ops
+            from vllm.distributed.parallel_state import get_dcp_group
             from vllm.platforms import current_platform
-            from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
+
+            from atom.model_ops.dcp_ops import (
+                cp_lse_ag_out_rs,
+                dcp_all_gather_query_heads,
+            )
 
             self._cached_ops = ops
             self._cached_current_platform = current_platform
             self._cached_get_dcp_group = get_dcp_group
+            self._cached_get_aiter_tp_group = get_aiter_tp_group
             self._cached_cp_lse_ag_out_rs = cp_lse_ag_out_rs
+            self._cached_dcp_all_gather_query_heads = dcp_all_gather_query_heads
         ops = self._cached_ops
         current_platform = self._cached_current_platform
         get_dcp_group = self._cached_get_dcp_group
+        get_aiter_tp_group = self._cached_get_aiter_tp_group
         cp_lse_ag_out_rs = self._cached_cp_lse_ag_out_rs
+        dcp_all_gather_query_heads = self._cached_dcp_all_gather_query_heads
 
         # create the output here, it use query shape
         if attn_metadata is None:
@@ -926,7 +956,13 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
             return output.fill_(0)
 
         if self.dcp_world_size == -1:
-            self.dcp_world_size = get_dcp_group().world_size
+            vllm_dcp_group = get_dcp_group()
+            self.dcp_world_size = vllm_dcp_group.world_size
+            if self.dcp_world_size > 1:
+                aiter_tp_group = get_aiter_tp_group()
+                _validate_aiter_tp_matches_vllm_dcp(aiter_tp_group, vllm_dcp_group)
+                self.dcp_group = aiter_tp_group
+                self.dcp_rank = aiter_tp_group.rank_in_group
 
         fp8_attention = self.kv_cache_dtype.startswith("fp8")
 
@@ -1131,7 +1167,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                 # decode_q is fp8 when fp8_attention (produced by the fused
                 # kernel); the head-dim all-gather is copy-only, so an fp8
                 # payload is safe (unlike an fp8 all-reduce).
-                decode_q = get_dcp_group().all_gather(decode_q, dim=1)
+                decode_q = dcp_all_gather_query_heads(self.dcp_group, decode_q)
 
             # call decode attn
             attn_out, lse = self._forward_decode(decode_q, kv_cache, attn_metadata)
@@ -1141,8 +1177,8 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                 attn_out = cp_lse_ag_out_rs(
                     attn_out,
                     lse,
-                    get_dcp_group(),
-                    is_lse_base_on_e=not getattr(self, "_use_fi_prefill", False),
+                    self.dcp_group,
+                    ctx=self._cp_triton_ctx,
                 )
 
             # v_up projection
@@ -1369,7 +1405,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         key: torch.Tensor,
         value: torch.Tensor,
         positions: torch.Tensor = None,
-        q_scale: Optional[torch.Tensor] = None,
+        q_scale: torch.Tensor | None = None,
         qkv: torch.Tensor = None,
         **kwargs,
     ):

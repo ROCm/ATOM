@@ -166,12 +166,16 @@ class EagleProposer(Drafter):
             buf[: aux.shape[0]].copy_(aux)
         return hidden
 
+    @property
+    def precompute_duplicates_propose(self) -> bool:
+        # The pass below is propose's i==0 step: same rows, same anchors.
+        return True
+
     def precompute_context_kv(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         next_token_ids: list[int] | None,
-        produces_output: bool,
     ) -> None:
         """Run the draft model over this forward so its KV covers it.
 
@@ -185,11 +189,14 @@ class EagleProposer(Drafter):
         early return: repeating it would be duplicate work. The test is on the
         data -- nothing here asks what kind of chunk this is.
 
+        The all-middle batch (no -1) is the remaining case; under DP it runs
+        `propose(align_only=True)` for its collectives -- the same redo -- so
+        `precompute_duplicates_propose` has the runner skip this call there.
+
         NOTE: unverified against real weights. `build_drafter` routes anything
         carrying `dspark_block_size` to `DSparkProposer`, and every model on
         hand takes that branch.
         """
-        del produces_output
         if not next_token_ids:
             return
         forward_context = get_forward_context()
@@ -202,7 +209,9 @@ class EagleProposer(Drafter):
         # Anchor row per sequence = `cu_seqlens_q[1:] - 1`, the rule
         # `propose_draft_token_ids` uses on a pure prefill step.
         last_token_indices = self.prepare_inputs(bs, 1)
-        anchor_ids = self.anchors_to_gpu(anchors)
+        anchor_ids = forward_context.context.draft_anchor_overrides
+        assert anchor_ids is not None
+        anchor_ids = anchor_ids[:bs]
 
         # `positions` is the padded forward buffer; the target's own output row
         # count is this batch's real token count, and all three inputs below

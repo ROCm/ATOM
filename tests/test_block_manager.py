@@ -69,7 +69,7 @@ class TestAllocateDeallocate:
         seq = seq_factory([1, 2, 3, 4, 5, 6, 7, 8])
         block_manager.allocate(seq)
         block_manager.deallocate(seq)
-        assert seq.block_table == []
+        assert len(seq.block_table) == 0
         assert seq.num_cached_tokens == 0
 
     def test_deallocate_restores_capacity(self, block_manager, seq_factory):
@@ -150,7 +150,7 @@ class TestPublishLoadedPrefix:
 
         assert bm.publish_loaded_prefix(loaded, start_token=0, end_token=8) == 8
         loaded_block = bm.kv.block(loaded.block_table[0])
-        assert loaded_block.token_ids == list(range(8))
+        assert list(loaded_block.token_ids) == list(range(8))
 
         probe = seq_factory(list(range(8)) + list(range(100, 108)))
         num_cached_blocks = bm.can_allocate(probe)
@@ -384,7 +384,7 @@ class TestPrefixCachingPreemption:
         # Simulate preemption
         bm.deallocate(s1)
         assert s1.num_cached_tokens == 0
-        assert s1.block_table == []
+        assert len(s1.block_table) == 0
 
         # Re-allocate — first block is a cache hit; the last full block is
         # force-recomputed so prefill has at least one token to forward.
