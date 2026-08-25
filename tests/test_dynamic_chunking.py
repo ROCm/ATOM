@@ -4,6 +4,7 @@ import pytest
 
 from atom.model_engine.dynamic_chunking import (
     CALIBRATION_SWEEP_RATIO,
+    MAX_CALIBRATION_FIT_FAILURES,
     MAX_PREFIX_OVERHEAD_FRACTION,
     ChunkLatencyCalibrator,
     ChunkSizePredictor,
@@ -186,6 +187,25 @@ def test_calibration_retries_on_fresh_samples_but_not_on_every_poll():
     with pytest.raises(ValueError, match="not described by the chunk latency model"):
         calibrator.maybe_fit()
     assert calibrator.maybe_fit() is None
+
+
+def test_calibration_gives_up_after_repeated_rejections():
+    # Noise a workload never shakes off would otherwise retry for the life of the
+    # process, keeping every other request at the sweep size. Fresh samples buy
+    # retries, but only a bounded number of them.
+    calibrator = ChunkLatencyCalibrator(B, C)
+
+    def unusable(prefix, chunk):
+        return TRUTH.predicted_latency(prefix, chunk) * (3.0 if prefix % 4096 else 0.4)
+
+    for _ in range(MAX_CALIBRATION_FIT_FAILURES):
+        assert not calibrator.gave_up
+        _sweep(calibrator, latency=unusable)
+        with pytest.raises(ValueError):
+            calibrator.maybe_fit()
+
+    assert calibrator.gave_up
+    assert calibrator.num_failed_fits == MAX_CALIBRATION_FIT_FAILURES
 
 
 def test_calibration_rejects_a_cost_that_falls_with_attention_area():
