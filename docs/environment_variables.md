@@ -11,6 +11,8 @@ This document describes the environment variables used in the ATOM project.
 | **ATOM_DP_SIZE** | int | 1 | Total number of data parallel ranks. |
 | **ATOM_DP_MASTER_IP** | str | 127.0.0.1 | Master IP address for DP ranks coordination. |
 | **ATOM_DP_MASTER_PORT** | int | 29500 | Master port for DP ranks coordination. |
+| **ATOM_DP_LB_REQ_EQUIV** | int | 512 | Token-equivalent decode pressure assigned to each in-flight request by `least_tokens` routing. |
+| **ATOM_DP_SESSION_AFFINITY** | bool | false | Load-place each new session, then keep later turns on the same prefix-cache owner. Reads `X-Dynamo-Session-ID`, falling back to `X-Correlation-ID`. |
 
 ## Prefill delayer (DP attention)
 

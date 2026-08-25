@@ -212,6 +212,22 @@ def test_affinity_new_session_accounts_for_decode_pressure():
     assert rank == 1
 
 
+def test_affinity_routes_across_global_ranks_on_multinode_coordinator():
+    mgr = _make_mgr(2, session_affinity=True)
+    # A coordinator owns two local engines but routes across all four global
+    # ranks. Routing state must use the global width so a remote rank can win.
+    mgr.global_engine_count = 4
+    mgr._rank_reqs = [0, 0, 0, 0]
+    mgr._rank_tokens = [1000, 1000, 1000, 0]
+    mgr._rank_routed_total = [0, 0, 0, 0]
+
+    rank = _route(mgr, [_FakeSeq("new", 100, dp_session_id="global-session")])[0]
+
+    assert rank == 3
+    assert mgr._dp_session_owners["global-session"] == 3
+    assert len(mgr.get_dp_router_statistics()["requests_per_rank"]) == 4
+
+
 def test_affinity_child_is_independent_of_parent_cache_owner():
     mgr = _make_mgr(4, session_affinity=True)
     parent_owner = 0

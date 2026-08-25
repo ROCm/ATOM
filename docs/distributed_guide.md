@@ -232,6 +232,12 @@ not inherit the parent's rank. For an established session, load accounting
 charges only positive prompt-length growth rather than repeatedly charging the
 complete cached conversation.
 
+The OpenAI server reads the session ID from `X-Dynamo-Session-ID`, falling back
+to `X-Correlation-ID`; `X-Dynamo-Parent-Session-ID` is retained for routing
+observability. For AIPerf agentic workloads, the normal correlation header is
+therefore sufficient. `AIPERF_HTTP_X_DYNAMO_SESSION_ID_FROM_CORRELATION_ID=1`
+can also be used when parent-session telemetry is desired.
+
 Bookkeeping is maintained entirely inside `CoreManager` (no engine-core protocol
 change): for the load-aware strategies, load is charged on dispatch and released
 when a sequence finishes (STREAM `finished` / offline `ADD` output) or is aborted
@@ -239,11 +245,12 @@ when a sequence finishes (STREAM `finished` / offline `ADD` output) or is aborte
 release on the per-rank output threads. Explicit `data_parallel_rank` hints are
 validated up front (a bad hint rejects the whole batch before any charge, so no
 partial load leaks) and, when valid, take priority but are still charged so they
-participate in balancing. `round_robin` skips this bookkeeping entirely. An
-invalid `dp_load_balance` value fails fast at `CoreManager` construction rather
-than silently defaulting. `reset_dp_router()` (called at the start of an offline
-`generate()` batch) assumes the previous batch has drained and warns if it is
-invoked while requests are still charged.
+participate in balancing. `round_robin` skips this bookkeeping unless session
+affinity is enabled, because new-session placement still needs the token-load
+counters. An invalid `dp_load_balance` value fails fast at `CoreManager`
+construction rather than silently defaulting. `reset_dp_router()` (called at
+the start of an offline `generate()` batch) assumes the previous batch has
+drained and warns if it is invoked while requests are still charged.
 
 ### Configuration
 
