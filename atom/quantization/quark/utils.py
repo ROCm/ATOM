@@ -3,10 +3,11 @@
 
 from collections.abc import Iterable
 from typing import Any
+
 import regex as re
+import torch
 import triton
 import triton.language as tl
-import torch
 from aiter import QuantType
 
 _FP8_SOURCE_DTYPES = frozenset(
@@ -199,6 +200,23 @@ def dequant_per_tensor_fp8(
     return w.to(out_dtype)
 
 
+def can_dequant_weight_online(
+    source_quant_type: QuantType,
+    source_quant_dtype: torch.dtype | None = None,
+) -> bool:
+    """Return whether the online path can dequantize this source."""
+    if source_quant_type == QuantType.No:
+        return True
+    if source_quant_dtype is not None and source_quant_dtype not in _FP8_SOURCE_DTYPES:
+        return False
+    return source_quant_type in (
+        QuantType.per_Tensor,
+        QuantType.per_Token,
+        QuantType.per_1x128,
+        QuantType.per_1x32,
+    )
+
+
 def dequant_weight_online(
     weight: torch.Tensor,
     weight_scale: torch.Tensor | None,
@@ -214,11 +232,9 @@ def dequant_weight_online(
     different target format.
 
     A source is identified by BOTH its ``quant_type`` (the block layout) and its
-    element ``quant_dtype``. The layout alone is not enough: e.g. ``per_1x32``
-    can carry either MXFP8 (8-bit) or MXFP4 (4-bit) elements. We only support
-    dequantizing 8-bit FP8 sources; any 4-bit (e.g. MXFP4) source is rejected,
-    since MXFP4 is only ever an online-quant target, never a weight we
-    dequantize. Supported sources:
+    element ``quant_dtype``. The layout alone is not enough: ``per_1x32`` is the
+    MX layout, which the format allows to carry 4-bit elements as well, and only
+    the 8-bit (MXFP8) form is accepted here. Supported sources:
 
     - ``No``: unquantized, returned unchanged.
     - ``per_Tensor``: per-tensor FP8, one scalar scale per output partition.
@@ -245,8 +261,7 @@ def dequant_weight_online(
     if source_quant_dtype is not None and source_quant_dtype not in _FP8_SOURCE_DTYPES:
         raise ValueError(
             f"Unsupported online dequant source dtype={source_quant_dtype} "
-            f"(quant_type={source_quant_type}); only 8-bit FP8 sources are "
-            f"supported (MXFP4 and other 4-bit formats are target-only)."
+            f"(quant_type={source_quant_type}); supported sources are 8-bit FP8."
         )
 
     if source_quant_type == QuantType.per_Tensor:
@@ -262,6 +277,46 @@ def dequant_weight_online(
     raise ValueError(
         f"Unsupported source quant_type for online dequant: {source_quant_type}. "
         f"Supported sources: No, per_Tensor, per_Token, per_1x128, per_1x32."
+    )
+
+
+def dequant_moe_weight_online(
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor | None,
+    source_quant_type: QuantType,
+    source_quant_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Dequantize ``[E, N, K]`` by flattening row-local expert groups."""
+    assert (
+        weight.dim() == 3
+    ), f"expected batched MoE weight [E, N, K], got shape={tuple(weight.shape)}"
+    experts, rows, cols = weight.shape
+    flat_weight = weight.reshape(experts * rows, cols)
+    if source_quant_type == QuantType.No:
+        return flat_weight
+
+    assert (
+        weight_scale is not None
+    ), f"source quant_type={source_quant_type} requires a weight scale"
+    if source_quant_type == QuantType.per_Token:
+        flat_scale = weight_scale.reshape(experts * rows, -1)
+    elif source_quant_type == QuantType.per_1x128:
+        assert (
+            rows % 128 == 0
+        ), f"per_1x128 expert rows must be 128-aligned, got N={rows}"
+        flat_scale = weight_scale.reshape(experts * (rows // 128), -1)
+    elif source_quant_type == QuantType.per_1x32:
+        flat_scale = weight_scale.reshape(experts * rows, -1)
+    else:
+        raise ValueError(
+            "Batched MoE online dequant does not support "
+            f"source quant_type={source_quant_type}."
+        )
+    return dequant_weight_online(
+        flat_weight.contiguous(),
+        flat_scale.contiguous(),
+        source_quant_type,
+        source_quant_dtype,
     )
 
 

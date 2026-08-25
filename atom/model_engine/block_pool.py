@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import array
 from collections import OrderedDict
 from collections.abc import Callable, Hashable, Iterable
 from dataclasses import dataclass
@@ -115,7 +116,7 @@ class BlockPool:
         """Block id indexed under content hash `h`, or -1."""
         return self._hash_to_block_id.get(h, -1)
 
-    def publish(self, block_id: int, h: int, token_ids: list[int]) -> None:
+    def publish(self, block_id: int, h: int, token_ids: array.array) -> None:
         """Index `block_id` under the content hash of the tokens it now holds."""
         block = self.blocks[block_id]
         block.update(h, token_ids)
@@ -131,7 +132,7 @@ class BlockPool:
         for block in self.blocks:
             if block.ref_count == 0:
                 block.hash = -1
-                block.token_ids = []
+                block.token_ids = array.array("i")
         # Every free block is vacant now, and which container an id is in is
         # only ever decided from its hash — so the split has to be redrawn
         # here rather than left to drift.
@@ -147,7 +148,7 @@ class BlockPool:
             if self._on_evict is not None:
                 self._on_evict(block.hash)
         block.hash = -1
-        block.token_ids = []
+        block.token_ids = array.array("i")
 
     # ---------------------------- allocation ------------------------------- #
     def _take_free(self) -> int:
@@ -331,4 +332,4 @@ class BlockPool:
             self._hash_to_block_id[src.hash] = destination
         self._used.discard(source)
         self._used.add(destination)
-        src.ref_count, src.hash, src.token_ids = 0, -1, []
+        src.ref_count, src.hash, src.token_ids = 0, -1, array.array("i")

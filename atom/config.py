@@ -796,8 +796,11 @@ class ParallelConfig:
     data_parallel_size: int = 1
     """Number of data parallel groups. MoE layers will be sharded according to
     the product of the tensor parallel size and data parallel size."""
-    data_parallel_size_local: int = 1
-    """Number of local data parallel groups."""
+    data_parallel_size_local: int | None = None
+    """DP ranks this node runs. Defaults to data_parallel_size, i.e. the
+    single-node case where every global rank is local. Set it below the global
+    size to give a node one slice of a multi-node run; it also reaches MoRI as
+    `gpu_per_node` (see model_ops/moe.py), so it must describe real hardware."""
     data_parallel_rank: int = 0
     """Rank of the data parallel group."""
     data_parallel_rank_local: int | None = None
@@ -823,8 +826,6 @@ class ParallelConfig:
     pp_kv_status_addr: str = ""
     """ZMQ endpoint where the head receives KV offload status from downstream
     PP stages. All downstream stages PUSH; the head PULLs."""
-    world_size: int = field(init=False)
-    """Vestigial: never assigned or read; engine_core derives worker count directly."""
     data_parallel_master_port: int = 29500
     """Port of the data parallel master."""
 
@@ -833,10 +834,20 @@ class ParallelConfig:
     data_parallel_master_ip: str = "127.0.0.1"
 
     @property
-    def world_size_across_dp(self) -> int:
-        """world_size_across_dp is TPxPPxDP, it is the size of the world
-        including data parallelism."""
-        return self.world_size * self.data_parallel_size
+    def is_multinode_dp(self) -> bool:
+        """Whether this node owns only part of the global DP group.
+
+        Inferred from the topology rather than a separate flag: either this
+        node runs fewer ranks than exist globally, or its slice starts at a
+        non-zero global rank.
+        """
+        # data_parallel_size_local is int | None in the declaration, but
+        # __post_init__ always resolves it before any caller can reach here.
+        assert self.data_parallel_size_local is not None
+        return (
+            self.data_parallel_size_local < self.data_parallel_size
+            or self.data_parallel_rank > 0
+        )
 
     def get_next_dp_init_port(self) -> int:
         """
@@ -890,6 +901,7 @@ class ParallelConfig:
         """
         factors: list[Any] = []
         factors.append(self.data_parallel_size)
+        factors.append(self.data_parallel_size_local)
         factors.append(self.data_parallel_rank)
         factors.append(self.data_parallel_rank_local)
         factors.append(self.data_parallel_master_ip)
@@ -911,6 +923,33 @@ class ParallelConfig:
             self.data_parallel_master_port = envs.ATOM_DP_MASTER_PORT
         if envs.is_set("ATOM_DP_BASE_PORT"):
             self.data_parallel_base_port = envs.ATOM_DP_BASE_PORT
+
+        if self.data_parallel_size < 1:
+            raise ValueError("data_parallel_size must be at least 1")
+
+        if envs.is_set("ATOM_DP_SIZE_LOCAL"):
+            self.data_parallel_size_local = envs.ATOM_DP_SIZE_LOCAL
+
+        # Default the local slice to the whole group: on one node every global
+        # rank is local, and that is the overwhelmingly common case.
+        if self.data_parallel_size_local is None:
+            self.data_parallel_size_local = self.data_parallel_size
+
+        if self.data_parallel_size_local < 1:
+            raise ValueError("data_parallel_size_local must be at least 1")
+        if self.data_parallel_rank < 0:
+            raise ValueError("data_parallel_rank must be non-negative")
+        if (
+            self.data_parallel_rank + self.data_parallel_size_local
+            > self.data_parallel_size
+        ):
+            raise ValueError(
+                f"data_parallel_rank ({self.data_parallel_rank}) + "
+                f"data_parallel_size_local ({self.data_parallel_size_local}) "
+                f"must not exceed data_parallel_size "
+                f"({self.data_parallel_size}): this node's slice would run off "
+                f"the end of the global DP group"
+            )
 
 
 _DSPARK_DEFAULT_MAX_BLOCK = 16
@@ -1392,17 +1431,30 @@ class EPLBConfig:
         return cls(**cfg)
 
 
+DCP_COMM_BACKENDS = ("ag_rs", "a2a")
+
+
 @dataclass
 class DCPConfig:
-    """DCP (Decode Context Parallel) sub-config. Today only interleave
-    granularity; room for future knobs (all-to-all backend, query
-    replication, ...) without growing the top-level CLI surface."""
+    """DCP (Decode Context Parallel) sub-config: interleave granularity, query
+    replication, output-merge placement and the merge collective backend --
+    knobs that would otherwise each grow the top-level CLI surface."""
 
     interleave_size: int = 1
+    enable_query_replication: bool = True
+    enable_project_before_merge: bool = True
+    comm_backend: str = "a2a"
 
     def __post_init__(self):
         self.interleave_size = int(self.interleave_size)
         assert self.interleave_size >= 1, "dcp.interleave_size must be >= 1"
+        self.enable_query_replication = bool(self.enable_query_replication)
+        self.enable_project_before_merge = bool(self.enable_project_before_merge)
+        self.comm_backend = str(self.comm_backend)
+        assert self.comm_backend in DCP_COMM_BACKENDS, (
+            f"dcp.comm_backend must be one of {list(DCP_COMM_BACKENDS)}; "
+            f"got {self.comm_backend!r}"
+        )
 
     @classmethod
     def from_dict(cls, cfg: dict | None) -> "DCPConfig":
@@ -1419,6 +1471,27 @@ class DCPConfig:
                 f"Supported keys: {sorted(allowed)}"
             )
         return cls(**cfg)
+
+
+def qrep_unsupported_reason(
+    dcp_size: int, speculative_config, mxfp4_bmm: bool
+) -> str | None:
+    """Why DCP query replication cannot run here, or None if it can.
+
+    Kept a module-level pure function so it is unit-testable: the alternative,
+    exercising it through ``Config.__post_init__``, needs a real model directory
+    and an HF config. ``Config.__post_init__`` is its only production caller.
+    """
+    if dcp_size <= 1:
+        # No DCP group means there is no AllGather Q to remove.
+        return "decode_context_parallel_size <= 1 (no DCP group)"
+    if speculative_config is not None:
+        # MTP / eagle3 / dspark run a qlen>1 verify on the cprr kernel.
+        return "speculative decode (qlen>1 cprr path)"
+    if mxfp4_bmm:
+        # fp4 (mxfp4) absorbed BMM has a different scale structure.
+        return "fp4 (mxfp4) BMM weights"
+    return None
 
 
 @dataclass
@@ -1466,6 +1539,12 @@ class Config:
     mark_trace: bool = False
     load_dummy: str | None = None
     enable_expert_parallel: bool = False
+    fake_eplb: bool = False
+    # Width the MoE shards experts for when DP-attention simulates a deployment
+    # wider than the box (set by CoreManager); 0 = not simulating.
+    # `parallel_config.data_parallel_size` stays the real rank count, since it
+    # sizes the process group and the token collectives.
+    dp_logical_size: int = 0
     master_addr: str = "127.0.0.1"
     graph_bs: list[int] | None = None
     enable_dp_attention: bool = False
@@ -1534,6 +1613,28 @@ class Config:
     # use plain separate streams with no CU masking.
     disagg_constrained: bool = False
 
+    @property
+    def tp_world_size(self) -> int:
+        """Number of TP worker processes actually launched.
+
+        `tensor_parallel_size` is the *logical* width -- how many shards every
+        weight is cut into. Under `--fake-eplb` on a box with fewer visible
+        devices than `-tp`, only the first `tp_world_size` of those shards get
+        a process, reproducing the first N devices of the larger deployment.
+        See `atom/distributed/simulated_tp.py`.
+
+        Gated on `fake_eplb` because such a run's output is garbage anyway;
+        without it, an oversized `-tp` keeps raising in ModelRunner instead of
+        silently running smaller. A property, not a field: `enable_dp_attention`
+        rewrites `tensor_parallel_size` after Config is built.
+        """
+        tp = self.tensor_parallel_size
+        if not self.fake_eplb:
+            return tp
+        # Does not create a CUDA context, so it is safe in the parent process.
+        visible = torch.cuda.device_count()
+        return visible if 0 < visible < tp else tp
+
     def _set_cudagraph_sizes(self):
         if self.compilation_config.cudagraph_capture_sizes:
             self.graph_bs = self.compilation_config.cudagraph_capture_sizes
@@ -1547,9 +1648,6 @@ class Config:
                 self.graph_bs = cuda_graph_sizes
 
     def __post_init__(self):
-        if self.index_cache_dtype is None:
-            self.index_cache_dtype = self.kv_cache_dtype
-
         self.moe_backend = self.moe_backend.strip().lower()
         if self.moe_backend not in ("standard", "mega"):
             raise ValueError(
@@ -1662,6 +1760,23 @@ class Config:
                 "dcp_config.interleave_size=1 with speculative decode, or disable "
                 "speculative decode for block-level interleave."
             )
+
+        # DCP Query Replication (QREP) first-cut gating: turn the flag OFF
+        # (warn, not error) for combinations not yet wired, so it can default to
+        # on without breaking mixed runs.
+        if self.dcp_config.enable_query_replication:
+            qrep_off = qrep_unsupported_reason(
+                self.decode_context_parallel_size,
+                self.speculative_config,
+                envs.ATOM_USE_TRITON_MXFP4_BMM,
+            )
+            if qrep_off is not None:
+                logger.warning(
+                    "dcp_config.enable_query_replication disabled: %s not "
+                    "supported in the first cut.",
+                    qrep_off,
+                )
+                self.dcp_config.enable_query_replication = False
         assert 1 <= self.pipeline_parallel_size
         self.hf_config = get_hf_config(
             self.model, trust_remote_code=self.trust_remote_code
@@ -1840,10 +1955,28 @@ class Config:
         # Use the preserved `architectures` field (re-injected by get_hf_config,
         # line 567) which keeps the original "DeepseekV4ForCausalLM[NextN]" name.
         arches = getattr(self.hf_config, "architectures", None) or []
-        if any("DeepseekV4" in str(a) for a in arches):
+        is_deepseek_v4 = any("DeepseekV4" in str(a) for a in arches)
+        if is_deepseek_v4:
             v4_block_size = 256
             if self.kv_cache_block_size != v4_block_size:
                 self.kv_cache_block_size = v4_block_size
+
+        # Keep ``None`` intact until the model architecture is known so an
+        # omitted index-cache option remains distinguishable from an explicit
+        # fp8/bf16 override. Native single-node V4 defaults to the FP4 indexer
+        # except on gfx942. Plugin proxy pools and KV-transfer region maps do
+        # not yet describe the separate FP4 scale pool, so those integrations
+        # retain FP8 until their layouts support it. Every other model keeps
+        # the historical KV-cache-dtype default.
+        if self.index_cache_dtype is None and is_deepseek_v4:
+            if self.plugin_config is None and not self.kv_transfer_config:
+                from aiter.jit.utils.chip_info import get_gfx
+
+                self.index_cache_dtype = "fp8" if get_gfx() == "gfx942" else "fp4"
+            else:
+                self.index_cache_dtype = "fp8"
+        elif self.index_cache_dtype is None:
+            self.index_cache_dtype = self.kv_cache_dtype
 
     def compute_hash(self) -> str:
         """

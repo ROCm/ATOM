@@ -149,7 +149,7 @@ class ScheduledBatch:
         total_seqs_num_decode: int = 0,
         is_dummy_run: bool = False,
         num_spec_step: int = 0,
-        scheduled_spec_decode_tokens: dict[int, list[int]] = {},
+        scheduled_spec_decode_tokens: dict[int, np.ndarray] | None = None,
     ):
 ```
 
@@ -158,10 +158,10 @@ class ScheduledBatch:
 | Field | Type | Description |
 |---|---|---|
 | `req_ids` | `list[int]` | Sequence IDs in batch order (`list(seqs.keys())`) |
-| `scheduled_tokens` | `list[list[int]]` | Last `num_tokens` token IDs per sequence (the tokens to process) |
+| `scheduled_tokens` | `np.ndarray[int32]` | The tokens to process, flattened in batch order and sliced by `num_scheduled_tokens` |
 | `temperatures` | `list[float]` | Sampling temperature per sequence |
 | `context_lens` | `list[int]` | Total token count per sequence (`seq.num_tokens`) |
-| `block_tables` | `list[list[int]]` | Block ID tables for sequences that have block tables |
+| `block_tables` | `list[array("i")]` | Block ID tables for sequences that have block tables, held as `Sequence.block_table` gives them |
 | `last_block_num_tokens` | `list[int]` | Number of valid tokens in each sequence's last block |
 | `num_cached_tokens` | `list[int]` | Number of tokens served from prefix cache per sequence |
 | `num_scheduled_tokens` | `list[int]` | Number of new tokens scheduled per sequence |
@@ -173,7 +173,7 @@ class ScheduledBatch:
 | `total_seqs_num_decode` | `int` | Number of decode sequences |
 | `is_dummy_run` | `bool` | Whether this is a dummy/warmup run |
 | `num_spec_step` | `int` | Number of speculative decode steps (`mtp_k`) |
-| `scheduled_spec_decode_tokens` | `dict[int, list[int]]` | Draft token IDs per sequence ID from prior speculative step |
+| `scheduled_spec_decode_tokens` | `np.ndarray[int32]` | Draft tokens from the prior speculative step, densified to `[bs, num_spec_step]` in batch order (the constructor takes them keyed by request ID) |
 
 ### ScheduledBatchOutput
 

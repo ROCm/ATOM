@@ -1,5 +1,4 @@
 import logging
-from typing import Optional
 
 import torch
 from transformers import AutoConfig, PretrainedConfig
@@ -141,13 +140,19 @@ def _register_mxfp8_quantization_config() -> None:
             return None
 
 
-def register_platform() -> Optional[str]:
+def register_platform() -> str | None:
 
     if disable_vllm_plugin:
         # return None instead of error because the flag can be used to
         # run pure vllm mode without ATOM plugin
         logger.info("Disable ATOM OOT plugin platforms")
         return None
+
+    from atom.plugin.vllm.rocm_dcp_full_graph_patch import (
+        apply_vllm_rocm_dcp_full_graph_patch,
+    )
+
+    apply_vllm_rocm_dcp_full_graph_patch()
 
     # Do not call _set_plugin_mode() here. SGLang (and other stacks) discover
     # vllm.platform_plugins and would set atom's backbone to "vllm" before

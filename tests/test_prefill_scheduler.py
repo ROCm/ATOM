@@ -22,8 +22,8 @@ def prefill_scheduler():
 
 @pytest.fixture
 def seq_factory():
-    from atom.sampling_params import SamplingParams
     from atom.model_engine.sequence import Sequence
+    from atom.sampling_params import SamplingParams
 
     def make(token_ids, block_size=4):
         return Sequence(token_ids, block_size, sampling_params=SamplingParams())
@@ -58,7 +58,7 @@ def test_has_requests_true_after_add(prefill_scheduler, seq_factory):
 def test_schedule_returns_none_when_no_block_table(prefill_scheduler, seq_factory):
     """Sequences without a block_table (not yet assigned by decode) are not scheduled."""
     seq = seq_factory([1, 2, 3, 4])
-    assert seq.block_table == []
+    assert len(seq.block_table) == 0
     prefill_scheduler.add(seq)
 
     result = prefill_scheduler.schedule()

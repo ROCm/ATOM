@@ -4,7 +4,6 @@
 """Pydantic request/response models for the OpenAI-compatible API."""
 
 import json
-import re
 import time
 from typing import Any
 
@@ -23,10 +22,50 @@ CHAT_COMPLETION_CHUNK_OBJECT = "chat.completion.chunk"
 TEXT_COMPLETION_OBJECT = "text_completion"
 STREAM_DONE_MESSAGE = "data: [DONE]\n\n"
 
+
 # Valid OpenAI ``tool_choice`` string values and the function-name constraint.
 # Spec-level (not model-specific): the same for every model served.
 TOOL_CHOICE_VALUES = frozenset({"auto", "none", "required"})
-TOOL_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
+
+
+def openai_stop_reason(finish_reason: str | None) -> str | None:
+    """The engine's leave reason as OpenAI spells it.
+
+    The engine says `eos` / `max_tokens` / `stop_sequence` / `stop_<token_id>`
+    / `aborted` / `unschedulable: ...`; OpenAI clients understand only `stop` /
+    `length` / `tool_calls`. `stop_<token_id>` is an ordinary end of turn --
+    any model declaring more than one EOS reaches it in normal operation.
+
+    Named for the vocabulary it maps *into*, and paired with
+    `api_server.anthropic_stop_reason`. Two functions rather than one with a
+    mode: the two vocabularies share no member, so chaining them would send
+    every reason to the other's default.
+    """
+    if finish_reason is None:
+        return None
+    if finish_reason in ("stop", "length", "tool_calls"):
+        return finish_reason
+    if finish_reason in ("max_tokens", "max_new_tokens"):
+        return "length"
+    return "stop"
+
+
+def openai_stop_reason_with_calls(engine_reason: str | None, has_calls: bool) -> str:
+    """The reason to report when a call was parsed and the engine had its own.
+
+    `length` outranks `tool_calls`, because they answer different questions
+    and only one of them is a warning: `tool_calls` says "act on this", and
+    `length` says "this is not all of it". A response cut off mid-call parses
+    to a call with a silently truncated argument value -- every format's
+    unclosed-region branch exists to salvage exactly that -- and reporting
+    `tool_calls` for it told the client to run a tool with half its arguments
+    and no indication anything was missing. OpenAI reports `length` for a
+    truncated response whatever else is in it.
+    """
+    normalized = openai_stop_reason(engine_reason)
+    if normalized == "length":
+        return "length"
+    return "tool_calls" if has_calls else (normalized or "stop")
 
 
 # ============================================================================
