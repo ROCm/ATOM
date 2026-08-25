@@ -26,6 +26,7 @@ from aiter.dist.utils import get_distributed_init_method
 from torch.profiler import record_function
 
 from atom.config import Config, CUDAGraphMode, set_current_atom_config
+from atom.distributed.group_reuse import reuse_identical_rank_groups
 from atom.distributed.pcp_utils import (
     PcpBalGroup,
     pcp_allgather_rerange,
@@ -920,36 +921,39 @@ class ModelRunner:
             config.parallel_config.data_parallel_master_ip,
             config.parallel_config.data_parallel_base_port,
         )
-        if config.pipeline_parallel_size > 1:
-            from atom.distributed.pp_comm import init_pp_aware_dist_env
+        # Groups spanning the same ranks each build their own RCCL communicators,
+        # and the KV cache gets whatever the memory budget has left after them.
+        with reuse_identical_rank_groups():
+            if config.pipeline_parallel_size > 1:
+                from atom.distributed.pp_comm import init_pp_aware_dist_env
 
-            dp_size = config.parallel_config.data_parallel_size
-            world_size = dp_size * pp_size * stage_span
-            dp_rank = config.parallel_config.data_parallel_rank
-            global_rank = (dp_rank * pp_size + pp_rank) * stage_span + rank
-            init_pp_aware_dist_env(
-                tensor_model_parallel_size=config.tensor_parallel_size,
-                pipeline_model_parallel_size=pp_size,
-                global_rank=global_rank,
-                world_size=world_size,
-                distributed_init_method=distributed_init_method,
-                backend="nccl",
-                data_parallel_size=dp_size,
-                prefill_context_model_parallel_size=config.prefill_context_parallel_size,
-            )
-        else:
-            init_dist_env(
-                config.tensor_parallel_size,
-                rankID=rank,
-                backend="nccl",
-                distributed_init_method=distributed_init_method,
-                data_parallel_size=config.parallel_config.data_parallel_size,
-                data_parallel_rank=config.parallel_config.data_parallel_rank,
-                prefill_context_model_parallel_size=config.prefill_context_parallel_size,
-                decode_context_parallel_size=getattr(
-                    config, "decode_context_parallel_size", 1
-                ),
-            )
+                dp_size = config.parallel_config.data_parallel_size
+                world_size = dp_size * pp_size * stage_span
+                dp_rank = config.parallel_config.data_parallel_rank
+                global_rank = (dp_rank * pp_size + pp_rank) * stage_span + rank
+                init_pp_aware_dist_env(
+                    tensor_model_parallel_size=config.tensor_parallel_size,
+                    pipeline_model_parallel_size=pp_size,
+                    global_rank=global_rank,
+                    world_size=world_size,
+                    distributed_init_method=distributed_init_method,
+                    backend="nccl",
+                    data_parallel_size=dp_size,
+                    prefill_context_model_parallel_size=config.prefill_context_parallel_size,
+                )
+            else:
+                init_dist_env(
+                    config.tensor_parallel_size,
+                    rankID=rank,
+                    backend="nccl",
+                    distributed_init_method=distributed_init_method,
+                    data_parallel_size=config.parallel_config.data_parallel_size,
+                    data_parallel_rank=config.parallel_config.data_parallel_rank,
+                    prefill_context_model_parallel_size=config.prefill_context_parallel_size,
+                    decode_context_parallel_size=getattr(
+                        config, "decode_context_parallel_size", 1
+                    ),
+                )
 
     def _make_buffer(
         self, *size: int | torch.SymInt, dtype: torch.dtype, numpy: bool = True

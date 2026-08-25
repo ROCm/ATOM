@@ -505,6 +505,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # sends only its 1/tp_size slice and the receiver all-gathers, cutting PP
     # link traffic by tp_size. Default on; set "0" for full-tensor sends.
     "ATOM_PP_SEND_ALLGATHER": lambda: os.getenv("ATOM_PP_SEND_ALLGATHER", "1") == "1",
+    # Let parallel groups spanning identical ranks (TP/DCP/EP at tp==dcp==world
+    # size, and the degenerate single-rank PCP/PP/DP) share one set of RCCL
+    # communicators instead of building one each. Worth 7.75GB per GPU of KV cache
+    # on 8xMI355X at -tp 8 -dcp 8; costs serialization between those groups'
+    # collectives. Off until measured on a given topology.
+    "ATOM_REUSE_COMM_GROUPS": lambda: os.getenv("ATOM_REUSE_COMM_GROUPS", "0") == "1",
 }
 
 
