@@ -221,6 +221,17 @@ decode-slot pressure. It helps most with heterogeneous prompt lengths under
 moderate load; with uniform-length requests it degenerates to `least_requests`.
 All strategies break ties with a round-robin cursor.
 
+When `ATOM_DP_SESSION_AFFINITY=1`, session routing adds a cache-locality layer
+above the configured fallback strategy. A new correlation/session ID is placed
+on the rank minimizing
+`estimated_uncached_prefill_tokens + ATOM_DP_LB_REQ_EQUIV * in_flight_requests`;
+rendezvous hashing only breaks exact ties. That owner is then immutable for the
+life of the process, so a busy owner never causes a later turn to lose its
+prefix-cache locality. Child correlation IDs are independent sessions and do
+not inherit the parent's rank. For an established session, load accounting
+charges only positive prompt-length growth rather than repeatedly charging the
+complete cached conversation.
+
 Bookkeeping is maintained entirely inside `CoreManager` (no engine-core protocol
 change): for the load-aware strategies, load is charged on dispatch and released
 when a sequence finishes (STREAM `finished` / offline `ADD` output) or is aborted
@@ -242,6 +253,8 @@ invoked while requests are still charged.
 - `Config.dp_load_balance` (str, default `"least_requests"`): DP routing strategy.
 - CLI: `--data-parallel-size N` or `-dp N`; `--dp-load-balance {round_robin,least_requests,least_tokens}`
 - Env: `ATOM_DP_LB_REQ_EQUIV` (int, default `512`): token-equivalent cost of one in-flight request for `least_tokens`.
+- Env: `ATOM_DP_SESSION_AFFINITY` (bool, default `0`): load-place each new
+  session once, then keep all later turns on its cache owner without spill.
 
 ## Expert Parallelism (EP)
 
@@ -344,6 +357,7 @@ The block configuration adapts to the batch type: prefill uses `block_num=128, w
 | `ATOM_DP_MASTER_IP` | str | `127.0.0.1` | IP address for DP Gloo rendezvous |
 | `ATOM_DP_MASTER_PORT` | int | `29500` | Port for DP Gloo rendezvous |
 | `ATOM_DP_LB_REQ_EQUIV` | int | `512` | Token-equivalent cost of one in-flight request for the `least_tokens` DP load-balance strategy |
+| `ATOM_DP_SESSION_AFFINITY` | bool | `0` | Load-place a new session, then keep later turns on its immutable prefix-cache owner |
 | ~~`ATOM_ENFORCE_EAGER`~~ | | | Removed. Use CLI flag `--enforce-eager` instead. |
 | `ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION` | bool | `False` | Fuse QK-norm + RoPE + cache quant for Qwen3 dense and MoE models |
 
