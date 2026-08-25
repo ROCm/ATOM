@@ -17,6 +17,7 @@ self-hosted-runner:
     - linux-atom-mi355-1
     - linux-atom-mi355-4
     - linux-atom-mi355-8
+    - slurm-runner-mi355x-1gpu
     - slurm-runner-small
 
 # Configuration variables in array of strings defined in your repository or

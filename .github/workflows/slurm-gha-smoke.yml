@@ -16,8 +16,8 @@ permissions:
 
 jobs:
   smoke:
-    name: Slurm runner smoke
-    runs-on: [self-hosted, slurm-runner-small]
+    name: Slurm GPU runner smoke
+    runs-on: [self-hosted, slurm-runner-mi355x-1gpu]
     timeout-minutes: 10
     steps:
       - name: Show runtime context
@@ -26,4 +26,7 @@ jobs:
           date -u
           echo "RUNNER_NAME=${RUNNER_NAME:-}"
           echo "RUNNER_OS=${RUNNER_OS:-}"
+          echo "HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-}"
+          echo "ROCR_VISIBLE_DEVICES=${ROCR_VISIBLE_DEVICES:-}"
           env | sort | grep -E '^(GITHUB_|RUNNER_|SLURM_)' || true
+          rocm-smi || true
