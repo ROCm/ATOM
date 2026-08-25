@@ -112,6 +112,10 @@ class TestMTPMaxTokens:
         assert len(finished) == 1
         assert finished[0].leave_reason == "max_tokens"
         assert finished[0].num_completion_tokens == expected_count
+        if expected_count == 0:
+            assert finished[0].first_token_time == 0.0
+        else:
+            assert finished[0].first_token_time > 0.0
         emitted = stream_queue.put_nowait.call_args.args[0][0][1]
         assert emitted.output_tokens == expected_output
         assert emitted.finished is True

@@ -2304,9 +2304,6 @@ class Scheduler:
                     seq.num_tokens,
                     len(seq.block_table),
                 )
-            if seq.num_completion_tokens >= 1 and seq.first_token_time == 0.0:
-                seq.first_token_time = time.time()
-
             num_tokens = seq.num_tokens - num_placeholder_width - num_rejected
             leave_reason = None
             # Client disconnected -> finish now via the normal stop path (frees
@@ -2397,6 +2394,12 @@ class Scheduler:
                     # array rather than slicing it through num_tokens, so keep
                     # it aligned explicitly with the cropped completion.
                     del seq.logprobs[num_tokens - seq.num_prompt_tokens :]
+
+            # Record TTFT from the finalized retained length, after rejected
+            # speculative tokens and cap/stop overflow have been removed. A
+            # terminal response with no completion tokens must keep TTFT zero.
+            if num_tokens - seq.num_prompt_tokens >= 1 and seq.first_token_time == 0.0:
+                seq.first_token_time = time.time()
 
             # Hash generated blocks. Deferred output: all tokens forwarded;
             # undeferred: last token not yet forwarded, so exclude it.
