@@ -495,6 +495,14 @@ class EngineCore:
             return
         kvoutput = self.runner_mgr.call_func_with_aggregation("async_proc_aggregation")
         self.scheduler._update_from_kv_xfer_finished(kvoutput)
+        # Reclaim any offload save whose completion report never came (LMCache
+        # force-unpinned it upstream). Self-throttled, so calling it on every
+        # poll is cheap; without it a stalled save hangs the engine forever.
+        reconcile = getattr(
+            self.scheduler, "_reconcile_stalled_deferred_saves", None
+        )
+        if callable(reconcile):
+            reconcile()
 
     def _dispatch_idle_offload_work(self) -> None:
         if not self.kv_transfer_enabled:
