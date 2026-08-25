@@ -283,19 +283,11 @@ class PPEngineCoreProc(EngineCore):
         if self._pp_kv_aggregator is None:
             self._pp_kv_aggregator = PPKVAggregator(self.pp_size)
 
-        # MultiConnector releases a request's send and its stage-local save in
-        # the same poll (see its "Send/save pairing" docstring), so a send that
-        # arrives with no save alongside it belongs to a request no stage is
-        # saving — a prompt shorter than the offload chunk, or one whose chunks
-        # were already persisted. Holding those would strand them forever: no
-        # finished_saving is ever coming. Only the paired sends wait for the
-        # PP-wide save quorum.
-        #
-        # The quorum is per save generation, and a chunked prefill flushes
-        # several of them alongside the one send, so the hold keeps that whole
-        # set and releases only when its last member clears. Nothing joins the
-        # set later: mooncake reports the send after the request's final chunk,
-        # so every generation it will ever have is already in this poll.
+        # MultiConnector emits a send together with its stage-local saves, so
+        # a send arriving alone belongs to a request no stage is saving —
+        # holding it would strand it forever. A paired send waits for the
+        # PP-wide quorum, which is per save generation, hence the whole set.
+        # It is complete: mooncake sends only after the request's last chunk.
         local_saving = {
             completion_req_key(rid) for rid in kvoutput.finished_saving or ()
         }
