@@ -84,6 +84,7 @@ RUN echo "========== [Parallel] Building Aiter ==========" && \
 FROM base AS atom_image
 ARG ATOM_REPO="https://github.com/ROCm/ATOM.git"
 ARG ATOM_COMMIT="HEAD"
+ARG CARGO_BUILD_JOBS=32
 
 # pip packages (lm-eval is lightweight, install directly)
 RUN pip install lm-eval[api]
@@ -166,7 +167,7 @@ RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
 ARG RUST_VERSION="1.94.0"
 
 RUN echo "========== Install Rust toolchain ==========" \
-    && apt-get update && apt-get install -y --no-install-recommends curl build-essential pkg-config libssl-dev \
+    && apt-get update && apt-get install -y --no-install-recommends curl build-essential pkg-config libssl-dev protobuf-compiler libprotobuf-dev \
     && rm -rf /var/lib/apt/lists/* \
     && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
         | sh -s -- -y --default-toolchain "${RUST_VERSION}" --profile minimal \
@@ -202,7 +203,7 @@ ARG CACHEBUST=1
 RUN git clone $ATOM_REPO /app/ATOM && \
     cd /app/ATOM && \
     git checkout $ATOM_COMMIT && \
-    ATOM_MESH_BUILD=1 python -m pip install -e .
+    CARGO_BUILD_JOBS=$CARGO_BUILD_JOBS ATOM_MESH_BUILD=1 python -m pip install -e .
 RUN pip show atom || true
 
 RUN pip install --no-cache-dir msgpack msgspec quart
