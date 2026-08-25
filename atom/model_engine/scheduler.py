@@ -2364,7 +2364,12 @@ class Scheduler:
             completion_tokens = num_tokens - seq.num_prompt_tokens
             if completion_tokens >= seq.max_tokens:
                 overflow = completion_tokens - seq.max_tokens
-                max_stop_at_idx = max(-1, num_new_token - 1 - overflow)
+                # ``stop_at_idx`` indexes this step's model output, excluding
+                # an injected P/D T0.  -1 therefore keeps T0 but no model
+                # output; when the cap retains no tokens, -2 is the boundary
+                # before T0.
+                min_stop_at_idx = -1 - (1 if injected_t0 is not None else 0)
+                max_stop_at_idx = max(min_stop_at_idx, num_new_token - 1 - overflow)
                 if stop_at_idx is None or max_stop_at_idx < stop_at_idx:
                     stop_at_idx = max_stop_at_idx
                     leave_reason = "max_tokens"
