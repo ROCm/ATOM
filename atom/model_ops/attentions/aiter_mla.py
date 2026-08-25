@@ -315,8 +315,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     + "; ".join(unsupported)
                 )
 
-        self.full_index_layer_ids: tuple[int, ...] = ()
-        self.index_layer_to_cache_row: dict[int, int] = {}
         if self.replicate_index_cache:
             indexer_types = getattr(hf_config, "indexer_types", None)
             if not indexer_types or len(indexer_types) != hf_config.num_hidden_layers:
@@ -324,22 +322,15 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     "Replicated GLM index cache requires one indexer_types entry "
                     "per target layer"
                 )
-            self.full_index_layer_ids = tuple(
-                layer_id
-                for layer_id, indexer_type in enumerate(indexer_types)
-                if indexer_type == "full"
-            )
-            if not self.full_index_layer_ids:
+            index_cache_layer_ids, _ = self._index_cache_layout()
+            if not index_cache_layer_ids:
                 raise ValueError(
                     "Replicated GLM index cache found no full IndexShare layers"
                 )
-            self.index_layer_to_cache_row = {
-                layer_id: row for row, layer_id in enumerate(self.full_index_layer_ids)
-            }
             logger.info(
                 "Replicating GLM index cache for %d full IndexShare layers "
                 "across %d DCP ranks",
-                len(self.full_index_layer_ids),
+                len(index_cache_layer_ids),
                 self.dcp_world_size,
             )
 
@@ -1053,18 +1044,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             index_dim = hf_config.index_head_dim + 4
             aligned_index_dim = ((index_dim + 15) // 16) * 16
             index_cache_layer_ids, _ = self._index_cache_layout()
-            # TODO(mengqing): seems the relicate index cache is the same as
-            # the index cache layer ids, so we can use the index cache layer
-            # ids to calculate the index cache size
-            index_layers = (
-                len(self.full_index_layer_ids)
-                if self.replicate_index_cache
-                else len(index_cache_layer_ids)
-            )
-            replicate_index_cache = getattr(self, "replicate_index_cache", False)
-            index_page_factor = (
-                getattr(self, "dcp_world_size", 1) if replicate_index_cache else 1
-            )
+            index_page_factor = self.dcp_world_size if self.replicate_index_cache else 1
             block_bytes += (
                 len(index_cache_layer_ids)
                 * runner.block_size
@@ -1103,19 +1083,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # to avoid unaligned memory access in torch inductor.
             index_dim = hf_config.index_head_dim + 4
             aligned = ((index_dim + 15) // 16) * 16
-            # TODO(mengqing): seems the relicate index cache is the same as 
-            # the index cache layer ids, so we can use the index cache layer
-            # ids to calculate the index cache size
             index_cache_layer_ids, _ = self._index_cache_layout()
-            index_layers = (
-                len(self.full_index_layer_ids)
-                if self.replicate_index_cache
-                else len(index_cache_layer_ids)
-            )
-            replicate_index_cache = getattr(self, "replicate_index_cache", False)
-            index_page_factor = (
-                getattr(self, "dcp_world_size", 1) if replicate_index_cache else 1
-            )
+            index_page_factor = self.dcp_world_size if self.replicate_index_cache else 1
             out["aligned_index_dim"] = aligned
             out["index_cache_layer_ids"] = index_cache_layer_ids
             out["index_cache_layer_map"] = {
@@ -1132,9 +1101,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 dtype=dtypes.fp8,
                 device="cuda",
             )
-            if replicate_index_cache:
-                out["index_layer_to_cache_row"] = self.index_layer_to_cache_row
-                out["full_index_layer_ids"] = self.full_index_layer_ids
         return out
 
     def build_kv_cache_tensor(self, layer_id: int, module):
@@ -1174,22 +1140,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 )
             index_cache_layer_id = runner.index_cache_layer_map[global_layer_id]
             index_cache = runner.index_cache[index_cache_layer_id]
-            replicate_index_cache = getattr(self, "replicate_index_cache", False)
-            index_page_factor = (
-                getattr(self, "dcp_world_size", 1) if replicate_index_cache else 1
-            )
-            # `layer_id` is a PP-local cache-row counter, while the compact map
-            # is keyed by global model layer IDs. On a non-first PP stage they
-            # differ (for example local 0 may be global 39), so use layer_num
-            # to avoid binding this indexer to another stage's compact row.
-            global_layer_id = getattr(module, "layer_num", None)
-            if global_layer_id not in runner.index_cache_layer_map:
-                raise RuntimeError(
-                    "Sparse MLA indexer layer is missing from the compact index "
-                    f"cache layout: layer_num={global_layer_id}"
-                )
-            index_cache_layer_id = runner.index_cache_layer_map[global_layer_id]
-            index_cache = runner.index_cache[index_cache_layer_id]
+            index_page_factor = self.dcp_world_size if self.replicate_index_cache else 1
             # Use aligned dimension to avoid memory copy in torch inductor
             module.indexer.k_cache.kv_cache[0] = index_cache.view(
                 runner.num_physical_kvcache_blocks
@@ -1198,7 +1149,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 1,
                 runner.aligned_index_dim,
             )
-            module.indexer.replicate_index_cache = replicate_index_cache
+            module.indexer.replicate_index_cache = self.replicate_index_cache
         module.kv_cache = kv_cache
         return KVCacheTensor(
             layer_num=layer_id,
