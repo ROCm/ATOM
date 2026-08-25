@@ -1,12 +1,12 @@
 #!/bin/bash
 # GLM-5.2 PP4×TP1 Prefill (CPP) + DCP Decode (PD disaggregation via mooncake)
 #
-# Container: atom_pp4pd_test
+# Container: atom_pp4pd_dcp
 # GPUs:      0-3 = prefill (PP4×TP1), 4-7 = decode (TP4 × DCP4)
 # Ports:     8010 = prefill API, 8020 = decode API, 30000 = mesh proxy
 #
 # Usage:
-#   docker exec -it atom_pp4pd_test bash /it-share/yajizhan/code/ATOM/scripts/start_glm52_pp4pd_dcp.sh
+#   docker exec -it atom_pp4pd_dcp bash /it-share/yajizhan/code/ATOM/scripts/start_glm52_pp4pd_dcp.sh
 #
 # Derived from start_glm52_pp4pd_dpa.sh. The decode node swaps
 # `--enable-dp-attention` (dp4 × tp1, one request wholly on one rank) for
@@ -33,24 +33,39 @@ DECODE_PORT=8020
 MESH_PORT=30000
 HANDSHAKE_PORT=6301
 
+# Everything but the MoE experts, the router gate and the embeddings is
+# quantized to per-token-per-channel fp8 while the checkpoint loads. Both nodes
+# take it: the KV they exchange is fp8 either way, but the two model instances
+# have to agree on weights or the decode continuation drifts from the prefill.
+ONLINE_QUANT_CONFIG='{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","*expert*"]}'
+
 # DCP KV interleave granularity S: global token i lives on decode rank
 # (i // S) % dcp. S=1 is token-level round-robin; S=block_size makes each decode
 # rank own contiguous 16-token runs, which collapses the producer's RDMA
 # descriptors from one-per-token-run to one-per-block.
 #
 # S > 1 forbids speculative decode (config.py: the q>1 verify cprr MLA kernel
-# assumes token-level interleave), and MTP cannot be dropped on the decode node
-# alone: the drafter adds a KV layer on prefill's last PP stage, so the two nodes
-# would register different region groups and _consumer_region_map would reject
-# every transfer. So S decides MTP for BOTH nodes.
+# assumes token-level interleave), so ENABLE_MTP only has an effect at S=1.
+# MTP is all-or-nothing across the pair, never per node: the drafter adds a KV
+# layer on prefill's last PP stage, so a node running it registers a different
+# number of region groups and _consumer_region_map rejects every transfer.
 DCP_SIZE="${DCP_SIZE:-4}"
 DCP_INTERLEAVE="${DCP_INTERLEAVE:-1}"
 
+# Off by default: DCP relayout is the thing under test, and MTP adds a draft KV
+# layer plus q>1 verify on top of it.
+ENABLE_MTP="${ENABLE_MTP:-0}"
+if [ "$ENABLE_MTP" -eq 1 ] && [ "$DCP_INTERLEAVE" -ne 1 ]; then
+  echo "ENABLE_MTP=1 needs DCP_INTERLEAVE=1 (speculative decode requires token-level interleave)" >&2
+  exit 1
+fi
+
 # Decode is one scheduler for the whole node now, not four. The DPA baseline ran
 # --max-num-seqs 128 per DP rank = 512 in flight node-wide; keep that number so
-# throughput comparisons are apples-to-apples, and capture graphs up to it.
+# throughput comparisons are apples-to-apples. Graphs are captured up to 256 --
+# the same ladder the CI case uses -- and batches above that run eager.
 DECODE_MAX_SEQS="${DECODE_MAX_SEQS:-512}"
-DECODE_CAPTURE_SIZES="${DECODE_CAPTURE_SIZES:-[1,2,4,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,160,192,224,256,320,384,448,512]}"
+DECODE_CAPTURE_SIZES="${DECODE_CAPTURE_SIZES:-[1,2,4,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256]}"
 
 # Nominal per-stage CPU offload budget. The connector redistributes the total
 # (pp_size * this) across stages by layer count so every stage caches the same
@@ -71,7 +86,7 @@ SPEC_ACCEPT_RATE="${SPEC_ACCEPT_RATE:-0.6633}"
 # draft token on its own. Accuracy runs need this: the synthetic rate accepts
 # drafts the target never agreed with, so generated text is not the model's.
 SPEC_ARGS=()
-if [ "$DCP_INTERLEAVE" -eq 1 ]; then
+if [ "$ENABLE_MTP" -eq 1 ]; then
   SPEC_ARGS=(--method mtp --num-speculative-tokens 3)
   if [ -n "$SPEC_ACCEPT_RATE" ] && [ "$SPEC_ACCEPT_RATE" != "off" ]; then
     SPEC_ARGS+=(--spec-decode-acceptance-rate "$SPEC_ACCEPT_RATE")
@@ -113,6 +128,7 @@ nohup python -m atom.entrypoints.openai_server \
   --max-num-batched-tokens 8192 \
   --kv_cache_dtype fp8 --block-size 16 --gpu-memory-utilization 0.85 \
   --enable_prefix_caching \
+  --online_quant_config "$ONLINE_QUANT_CONFIG" \
   --kv-transfer-config "{\"kv_connector\":\"multi\",\"connectors\":[{\"kv_connector\":\"mooncake\",\"kv_role\":\"kv_producer\",\"handshake_port\":$HANDSHAKE_PORT,\"proxy_ip\":\"127.0.0.1\"},{\"kv_connector\":\"lmcache_offload\",\"kv_role\":\"offload\"}]}" \
   > /tmp/prefill.log 2>&1 &
 
@@ -146,6 +162,7 @@ nohup python -m atom.entrypoints.openai_server \
   --max-num-seqs "$DECODE_MAX_SEQS" \
   --kv_cache_dtype fp8 --block-size 16 --gpu-memory-utilization 0.85 \
   --enable_prefix_caching \
+  --online_quant_config "$ONLINE_QUANT_CONFIG" \
   --kv-transfer-config "{\"kv_role\":\"kv_consumer\",\"kv_connector\":\"mooncake\",\"handshake_port\":$HANDSHAKE_PORT,\"proxy_ip\":\"127.0.0.1\"}" \
   > /tmp/decode.log 2>&1 &
 
@@ -190,9 +207,9 @@ echo "  mesh    log: /tmp/mesh_dcp.log"
 echo "  mesh API:    http://127.0.0.1:$MESH_PORT/v1/chat/completions"
 echo "  DCP:         tp4 x dcp${DCP_SIZE}, interleave_size=${DCP_INTERLEAVE}, max-num-seqs=${DECODE_MAX_SEQS} (node-wide)"
 echo "  LMCache:     CPU=${LMCACHE_CPU_SIZE}GB  chunk=${LMCACHE_CHUNK}"
-if [ "$DCP_INTERLEAVE" -eq 1 ]; then
+if [ "$ENABLE_MTP" -eq 1 ]; then
   echo "  MTP accept:  ${SPEC_ACCEPT_RATE}"
 else
-  echo "  MTP:         off (interleave_size > 1 forbids speculative decode)"
+  echo "  MTP:         off"
 fi
 echo "  Verify:      grep -i 'lmcache\|offload' /tmp/prefill.log"
