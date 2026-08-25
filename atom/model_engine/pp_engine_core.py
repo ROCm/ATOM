@@ -49,7 +49,7 @@ class PPEngineCoreProc(EngineCore):
         # per-request ring now and publishes nothing, so the exception is gone.
         self._defer_prefix_hash: bool = bm.enable_prefix_caching
         self._pp_kv_aggregator: PPKVAggregator | None = None
-        self._held_sending: dict = {}
+        self._held_sending: dict[str, tuple] = {}
         logger.info(
             f"{self.label}: PP stage {self.pp_rank}/{self.pp_size} "
             f"(head={self.is_head}, last={self.is_last}) ready"
@@ -290,6 +290,12 @@ class PPEngineCoreProc(EngineCore):
         # were already persisted. Holding those would strand them forever: no
         # finished_saving is ever coming. Only the paired sends wait for the
         # PP-wide save quorum.
+        #
+        # A chunked prefill pairs one send with every save generation flushed
+        # alongside it, and the quorum is per generation, so the hold keeps the
+        # whole set and releases only once the last one clears. The set is
+        # final: the send arrives after the request's last chunk, so no further
+        # generation can appear for it.
         local_saving = {
             completion_req_key(rid) for rid in kvoutput.finished_saving or ()
         }
@@ -297,7 +303,14 @@ class PPEngineCoreProc(EngineCore):
         for rid in kvoutput.finished_sending or ():
             key = completion_req_key(rid)
             if key in local_saving:
-                self._held_sending[key] = rid
+                self._held_sending[key] = (
+                    rid,
+                    {
+                        op
+                        for op in kvoutput.finished_saving
+                        if completion_req_key(op) == key
+                    },
+                )
             else:
                 unpaired_sending.add(rid)
         if unpaired_sending:
@@ -325,9 +338,15 @@ class PPEngineCoreProc(EngineCore):
         # Release held finished_sending whose global save is now complete.
         rel = set()
         for rid in result.finished_saving or ():
-            held = self._held_sending.pop(completion_req_key(rid), None)
-            if held is not None:
-                rel.add(held)
+            key = completion_req_key(rid)
+            held = self._held_sending.get(key)
+            if held is None:
+                continue
+            raw, pending = held
+            pending.discard(rid)
+            if not pending:
+                del self._held_sending[key]
+                rel.add(raw)
         if rel:
             result.finished_sending = rel
         self.scheduler._update_from_kv_xfer_finished(result)

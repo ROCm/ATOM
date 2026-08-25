@@ -81,7 +81,7 @@ def test_send_waits_for_every_pp_stage_save():
 
     proc._poll_kv_transfer_progress()
     assert proc.scheduler.released_sending() == set()  # stage 2 still saving
-    assert proc._held_sending == {"a": "a"}
+    assert proc._held_sending == {"a": ("a", {"a"})}
 
     proc._poll_kv_transfer_progress()
     assert proc.scheduler.released_sending() == {"a"}
@@ -110,11 +110,47 @@ def test_send_pairs_with_a_save_operation_id():
 
     proc._poll_kv_transfer_progress()
     assert proc.scheduler.released_sending() == set()  # stage 1 still saving
-    assert proc._held_sending == {"9": 9}
+    assert proc._held_sending == {"9": (9, {op})}
 
     proc._poll_kv_transfer_progress()
     assert proc.scheduler.released_sending() == {9}
     assert proc.scheduler.released_saving() == {op}
+    assert proc._held_sending == {}
+
+
+def test_send_waits_for_every_save_generation():
+    # A chunked prefill saves once per chunk, so the pairing rank flushes the
+    # send together with every generation it accumulated. The head must hold
+    # the send until each of those generations has reached PP quorum, not just
+    # the first one — the stages lag each other, and a stage still short of
+    # quorum is still reading the blocks the send would free.
+    g2, g3 = SaveOperationId(9, 2), SaveOperationId(9, 3)
+    proc = _head(
+        pp_size=2,
+        local_outputs=[
+            KVConnectorOutput(finished_sending={9}, finished_saving={g2, g3}),
+            KVConnectorOutput(),
+            KVConnectorOutput(),
+        ],
+        downstream_messages=[
+            [],
+            [(1, KVConnectorOutput(finished_saving={g2}))],
+            [(1, KVConnectorOutput(finished_saving={g3}))],
+        ],
+    )
+
+    proc._poll_kv_transfer_progress()
+    assert proc.scheduler.released_sending() == set()
+    assert proc._held_sending == {"9": (9, {g2, g3})}
+
+    proc._poll_kv_transfer_progress()
+    assert proc.scheduler.released_sending() == set()  # generation 3 pending
+    assert proc.scheduler.released_saving() == {g2}
+    assert proc._held_sending == {"9": (9, {g3})}
+
+    proc._poll_kv_transfer_progress()
+    assert proc.scheduler.released_sending() == {9}
+    assert proc.scheduler.released_saving() == {g2, g3}
     assert proc._held_sending == {}
 
 
