@@ -24,6 +24,26 @@ STREAM_DONE_MESSAGE = "data: [DONE]\n\n"
 
 
 # ============================================================================
+# Finish reasons
+# ============================================================================
+
+
+def openai_finish_reason(engine_reason: Optional[str]) -> Optional[str]:
+    """Map ATOM's engine termination reason onto OpenAI's ``finish_reason``.
+
+    The scheduler reports its own vocabulary — ``eos``, ``max_tokens``,
+    ``stop_sequence``, ``stop_<token_id>``, ``aborted``,
+    ``unschedulable: ...`` — but OpenAI clients switch on exactly
+    ``{stop, length, tool_calls, content_filter}``, and an unknown string sends
+    them down their error path. Only a length cap maps to ``length``; every other
+    way a sequence can end is a stop from the client's point of view.
+    """
+    if engine_reason is None:
+        return None
+    return "length" if engine_reason == "max_tokens" else "stop"
+
+
+# ============================================================================
 # Request Models
 # ============================================================================
 
@@ -141,7 +161,7 @@ class ChatCompletionRequest(BaseModel):
     top_p: Optional[float] = DEFAULT_TOP_P
     max_tokens: Optional[int] = DEFAULT_MAX_TOKENS
     max_completion_tokens: Optional[int] = None
-    stop: Optional[List[str]] = None
+    stop: Optional[Union[str, List[str]]] = None
     ignore_eos: Optional[bool] = False
     stream: Optional[bool] = False
     seed: Optional[int] = None
@@ -151,6 +171,9 @@ class ChatCompletionRequest(BaseModel):
     tool_choice: Optional[Any] = (
         None  # "auto", "none", "required", or {function: {name}}
     )
+    # MiniMax-M2/M3 reasoning toggle: {"type": "enabled"} / {"type": "disabled"}.
+    # Resolved by chat_request.resolve_thinking(); a plain bool is also accepted.
+    thinking: Optional[Any] = None
     # Accepted for compatibility, not actively used:
     presence_penalty: Optional[float] = 0.0
     frequency_penalty: Optional[float] = 0.0
@@ -166,14 +189,27 @@ class ChatCompletionRequest(BaseModel):
             return self.max_tokens
         return DEFAULT_MAX_TOKENS
 
+    def get_stop(self) -> Optional[List[str]]:
+        """Normalize ``stop`` to a list (OpenAI accepts a bare string too)."""
+        if isinstance(self.stop, str):
+            return [self.stop]
+        return self.stop
+
     def get_messages(self) -> List[ChatMessage]:
-        """Get messages from either 'messages' or 'prompt' field."""
-        if self.messages is not None:
-            return self.messages
-        elif self.prompt is not None:
-            return self.prompt
-        else:
+        """Get messages from either 'messages' or 'prompt' field.
+
+        Raises:
+            ValueError: when neither field is present, or the conversation is
+                empty. An empty conversation still renders a valid generation
+                prompt, so without this check the model would answer a request
+                that carries no instruction at all (HTTP 200 instead of 400).
+        """
+        messages = self.messages or self.prompt
+        if messages:
+            return messages
+        if self.messages is None and self.prompt is None:
             raise ValueError("Either 'messages' or 'prompt' field is required")
+        raise ValueError("'messages' must contain at least one message")
 
 
 class CompletionRequest(BaseModel):
@@ -188,7 +224,7 @@ class CompletionRequest(BaseModel):
     top_p: Optional[float] = DEFAULT_TOP_P
     max_tokens: Optional[int] = DEFAULT_MAX_TOKENS
     max_completion_tokens: Optional[int] = None
-    stop: Optional[List[str]] = None
+    stop: Optional[Union[str, List[str]]] = None
     ignore_eos: Optional[bool] = False
     stream: Optional[bool] = False
     # Optional KV-transfer metadata for P/D disaggregation.
@@ -204,6 +240,12 @@ class CompletionRequest(BaseModel):
         if self.max_tokens is not None:
             return self.max_tokens
         return DEFAULT_MAX_TOKENS
+
+    def get_stop(self) -> Optional[List[str]]:
+        """Normalize ``stop`` to a list (OpenAI accepts a bare string too)."""
+        if isinstance(self.stop, str):
+            return [self.stop]
+        return self.stop
 
 
 # ============================================================================

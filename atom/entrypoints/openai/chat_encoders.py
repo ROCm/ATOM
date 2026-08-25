@@ -17,6 +17,7 @@ import os
 from typing import Any, Callable, List, Optional
 
 from huggingface_hub import snapshot_download
+from jinja2.exceptions import TemplateError
 
 logger = logging.getLogger("atom")
 
@@ -115,4 +116,13 @@ def apply_chat_template(
     kwargs["add_generation_prompt"] = True
     if tools:
         kwargs["tools"] = tools
-    return tokenizer.apply_chat_template(messages, **kwargs)
+    try:
+        return tokenizer.apply_chat_template(messages, **kwargs)
+    except TemplateError as exc:
+        # Chat templates reject malformed conversations with
+        # {{ raise_exception(...) }} — e.g. MiniMax-M3 on a tool message with no
+        # preceding tool call. That is a client error (400), not a server fault
+        # (500), so surface it as a ValueError like the other input checks.
+        raise ValueError(
+            f"This model's chat template rejected the conversation: {exc}"
+        ) from exc

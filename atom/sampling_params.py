@@ -4,6 +4,11 @@
 from dataclasses import dataclass
 from typing import Optional, Union
 
+#: Upper bound on ``temperature`` the OpenAI-compatible API accepts. Enforced by
+#: the API layer (``entrypoints/openai/chat_request.py``), not here: the engine
+#: stays permissive so offline callers keep working.
+MAX_TEMPERATURE = 2.0
+
 
 @dataclass
 class SamplingParams:

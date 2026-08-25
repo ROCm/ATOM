@@ -16,6 +16,7 @@ from atom.entrypoints.openai.protocol import (
     ErrorResponse,
     ModelCard,
     ModelList,
+    openai_finish_reason,
 )
 
 # ============================================================================
@@ -356,3 +357,26 @@ class TestResponseModels:
             error={"message": "Not found", "type": "invalid_request_error", "code": 404}
         )
         assert err.error["message"] == "Not found"
+
+
+# ============================================================================
+# finish_reason vocabulary
+# ============================================================================
+
+
+class TestOpenAIFinishReason:
+    """The engine has its own vocabulary; the API must speak OpenAI's."""
+
+    @pytest.mark.parametrize(
+        "engine_reason",
+        ["eos", "stop_sequence", "stop_200020", "aborted", "unschedulable: kv"],
+    )
+    def test_non_length_terminations_map_to_stop(self, engine_reason):
+        assert openai_finish_reason(engine_reason) == "stop"
+
+    def test_max_tokens_maps_to_length(self):
+        # Clients use "length" to decide whether to ask for a continuation.
+        assert openai_finish_reason("max_tokens") == "length"
+
+    def test_unfinished_stays_none(self):
+        assert openai_finish_reason(None) is None

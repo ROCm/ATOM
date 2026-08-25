@@ -30,19 +30,29 @@ from atom import SamplingParams
 from atom.model_engine.arg_utils import EngineArgs
 from atom.model_engine.llm_engine import _load_tokenizer
 from atom.model_engine.request import RequestOutput
+from atom.utils import envs
 from atom.utils.arg_parser import FlexibleArgumentParser
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from PIL import Image
+from starlette.datastructures import Headers, MutableHeaders
 from transformers import AutoProcessor, AutoTokenizer
 
 from .chat_encoders import apply_chat_template, load_custom_message_encoder
+from .chat_request import (
+    disable_primed_thinking,
+    prepare_chat_request,
+    template_supported_roles,
+)
 from .protocol import (
     ChatCompletionRequest,
     CompletionRequest,
     ModelCard,
     ModelList,
 )
+from .reasoning import prompt_primes_thinking
+from .tool_parser import tool_call_prefill
 from .serving_chat import (
     build_chat_response,
     build_chat_response_multi,
@@ -87,6 +97,13 @@ processor: Optional[Any] = None
 model_name: str = ""
 default_chat_template_kwargs: Dict[str, Any] = {}
 custom_message_encoder: Optional[Any] = None
+# Extension roles ("root", "developer") the loaded chat template handles itself;
+# the rest are rewritten by chat_request.normalize_chat_messages. Probed once at
+# startup because it depends only on the template source.
+template_extension_roles: frozenset = frozenset()
+# Accepted API keys. Empty (the default) disables authentication entirely, so
+# no-auth deployments are unaffected.
+api_keys: set = set()
 _stream_queues: Dict[str, asyncio.Queue] = {}
 _seq_id_to_request_id: Dict[int, str] = {}
 _stream_loops: Dict[str, AbstractEventLoop] = {}
@@ -256,6 +273,7 @@ def _get_multimodal_processor():
 def _prepare_multimodal_inputs(
     messages: List[Any],
     chat_template_kwargs: Dict[str, Any],
+    thinking_enabled: Optional[bool] = None,
 ) -> Tuple[List[int], Dict[str, Any]]:
     mm_processor = _get_multimodal_processor()
     processor_messages: List[Dict[str, Any]] = []
@@ -314,6 +332,8 @@ def _prepare_multimodal_inputs(
         add_generation_prompt=True,
         **template_kwargs,
     )
+    if thinking_enabled is False:
+        text = disable_primed_thinking(text)
     if images and "<|image_pad|>" not in text:
         raise ValueError("Multimodal chat template did not emit image placeholders")
     inputs = mm_processor(text=[text], images=images, return_tensors="pt")
@@ -1026,36 +1046,156 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="ATOM OpenAI API Server", lifespan=lifespan)
 
 
+# ---- Authentication ----
+
+# Endpoints that stay reachable without a key even when one is configured:
+# liveness/readiness probes (CI polls /health before the engine is usable) and
+# the OpenAPI schema.
+_AUTH_EXEMPT_PATHS = frozenset({"/health", "/docs", "/redoc", "/openapi.json"})
+
+
+def _extract_api_key(headers: Headers) -> str:
+    """Read the presented key from ``Authorization: Bearer`` or ``x-api-key``."""
+    authorization = headers.get("authorization") or ""
+    if authorization.lower().startswith("bearer "):
+        return authorization[len("bearer ") :].strip()
+    return (headers.get("x-api-key") or "").strip()
+
+
+class APIKeyAuthMiddleware:
+    """Enforce API-key auth when the server was started with ``--api-key``.
+
+    Off by default: with no key configured every request passes straight through,
+    so existing no-auth deployments are unaffected. When keys are configured, a
+    missing or wrong key gets OpenAI's 401 instead of a served completion.
+
+    Written as raw ASGI rather than ``@app.middleware("http")`` on purpose:
+    Starlette's ``BaseHTTPMiddleware`` pumps every response through an extra task
+    group and memory stream, which lands on this server's SSE hot path where the
+    streaming code already counts socket writes.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if (
+            scope["type"] != "http"
+            or not api_keys
+            or scope.get("path") in _AUTH_EXEMPT_PATHS
+            or _extract_api_key(Headers(scope=scope)) in api_keys
+        ):
+            return await self.app(scope, receive, send)
+        response = JSONResponse(
+            status_code=401,
+            content={
+                "error": {
+                    "message": (
+                        "Incorrect API key provided. You can pass it as an "
+                        "'Authorization: Bearer <key>' header."
+                    ),
+                    "type": "invalid_request_error",
+                    "code": "invalid_api_key",
+                }
+            },
+        )
+        await response(scope, receive, send)
+
+
+app.add_middleware(APIKeyAuthMiddleware)
+
+
+# ---- Request id ----
+
+
+class RequestIDMiddleware:
+    """Stamp every response with an ``x-request-id`` header.
+
+    OpenAI returns a per-request id on every response, success or failure, and
+    clients quote it when reporting a problem; ATOM's error envelope carried no
+    identifier of any kind.
+
+    Registered last so it ends up outermost, which is what puts the header on
+    the 401 :class:`APIKeyAuthMiddleware` answers with. Raw ASGI for the reason
+    given there.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        request_id = f"req_{uuid.uuid4().hex}"
+
+        async def send_with_request_id(message):
+            if message["type"] == "http.response.start":
+                MutableHeaders(scope=message)["x-request-id"] = request_id
+            await send(message)
+
+        await self.app(scope, receive, send_with_request_id)
+
+
+app.add_middleware(RequestIDMiddleware)
+
+
 # ---- Error handlers ----
+
+
+def _error_response(status_code: int, message: str, error_type: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "error": {
+                "message": message,
+                "type": error_type,
+                "code": status_code,
+            }
+        },
+    )
 
 
 @app.exception_handler(ValueError)
 async def value_error_handler(request: Request, exc: ValueError):
-    return JSONResponse(
-        status_code=400,
-        content={
-            "error": {
-                "message": str(exc),
-                "type": "invalid_request_error",
-                "code": 400,
-            }
-        },
+    return _error_response(400, str(exc), "invalid_request_error")
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_error_handler(
+    request: Request, exc: RequestValidationError
+):
+    """Answer schema violations with 400 instead of FastAPI's default 422.
+
+    The OpenAI API returns ``400 invalid_request_error`` for a malformed body
+    (e.g. ``content`` sent as an object instead of a string), and clients written
+    against it treat 422 as an unexpected server-side failure.
+    """
+    errors = exc.errors()
+    if errors:
+        first = errors[0]
+        location = ".".join(
+            str(part) for part in first.get("loc", ()) if part != "body"
+        )
+        message = first.get("msg", "invalid request")
+        message = f"{location}: {message}" if location else message
+    else:  # pragma: no cover - pydantic always reports at least one error
+        message = "invalid request"
+    return _error_response(400, message, "invalid_request_error")
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Render HTTPExceptions in OpenAI's ``{"error": {...}}`` envelope."""
+    error_type = (
+        "invalid_request_error" if exc.status_code < 500 else "internal_server_error"
     )
+    return _error_response(exc.status_code, str(exc.detail), error_type)
 
 
 @app.exception_handler(Exception)
 async def general_error_handler(request: Request, exc: Exception):
     logger.error(f"Unhandled error: {exc}", exc_info=True)
-    return JSONResponse(
-        status_code=500,
-        content={
-            "error": {
-                "message": str(exc),
-                "type": "internal_server_error",
-                "code": 500,
-            }
-        },
-    )
+    return _error_response(500, str(exc), "internal_server_error")
 
 
 # ---- Endpoints ----
@@ -1069,17 +1209,21 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
     validate_model(request.model)
 
     try:
-        messages = request.get_messages()
-
-        merged_kwargs = dict(default_chat_template_kwargs)
-        if request.chat_template_kwargs:
-            merged_kwargs.update(request.chat_template_kwargs)
+        # Validation + role / tool_choice / thinking policy. Raises ValueError on
+        # malformed input, which the handler above turns into a 400.
+        prepared = prepare_chat_request(
+            request,
+            default_template_kwargs=default_chat_template_kwargs,
+            supported_roles=template_extension_roles,
+        )
+        messages = prepared.messages
+        merged_kwargs = prepared.template_kwargs
 
         effective_n = _coerce_n(request.n, request.temperature)
         sampling_params = _build_sampling_params(
             temperature=request.temperature,
             max_tokens=request.get_max_tokens(),
-            stop_strings=request.stop,
+            stop_strings=request.get_stop(),
             ignore_eos=request.ignore_eos,
             top_k=request.top_k,
             top_p=request.top_p,
@@ -1099,16 +1243,54 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             _get_multimodal_processor()
             loop = asyncio.get_running_loop()
             token_ids, multimodal_data = await loop.run_in_executor(
-                None, _prepare_multimodal_inputs, messages, merged_kwargs
+                None,
+                _prepare_multimodal_inputs,
+                messages,
+                merged_kwargs,
+                prepared.thinking_enabled,
             )
         else:
             prompt = apply_chat_template(
                 tokenizer,
                 custom_message_encoder,
                 [msg.to_template_dict() for msg in messages],
-                tools=request.tools,
+                tools=prepared.tool_choice.template_tools,
                 **merged_kwargs,
             )
+            if prepared.thinking_enabled is False:
+                prompt = disable_primed_thinking(prompt)
+
+        # tool_choice: "required" / a named function must produce a call, but
+        # ATOM has no constrained decoding. Start the call for the model instead:
+        # extend the assistant turn with the opening tokens of its tool-call
+        # dialect so the only continuation left is the call itself. Thinking is
+        # closed first — the client asked for a tool call, not a monologue.
+        tool_call_prefix = ""
+        if not is_multimodal and prepared.tool_choice.mode in ("required", "function"):
+            forced_prompt = disable_primed_thinking(prompt)
+            prefill = tool_call_prefill(
+                forced_prompt, prepared.tool_choice.function_name
+            )
+            if prefill:
+                prompt = forced_prompt + prefill
+                tool_call_prefix = prefill
+
+        # How the model's output is decoded back into an OpenAI message:
+        # tool_choice decides what the template advertised and whether the output
+        # is scanned for tool calls at all, and MiniMax-M3's template ends the
+        # prompt with an open <think>, so the first generated token is already
+        # reasoning (without that flag it would be misfiled as content).
+        output_policy = {
+            "tools": prepared.tool_choice.template_tools,
+            "enable_tool_calls": prepared.parse_tool_calls,
+            "enable_reasoning": prepared.parse_reasoning,
+            # The multimodal path renders straight to token ids, so there is no
+            # prompt string left to inspect.
+            "reasoning_primed": (
+                False if is_multimodal else prompt_primes_thinking(prompt)
+            ),
+            "tool_call_prefix": tool_call_prefix,
+        }
 
         # Streaming
         if request.stream:
@@ -1131,7 +1313,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     seq_ids,
                     num_prompt_tokens,
                     cleanup_streaming_request,
-                    tools=request.tools,
+                    **output_policy,
                 )
             else:
                 seq_id, stream_queue, num_prompt_tokens = await setup_streaming_request(
@@ -1148,7 +1330,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     seq_id,
                     num_prompt_tokens,
                     cleanup_streaming_request,
-                    tools=request.tools,
+                    **output_policy,
                 )
             return StreamingResponse(
                 _logged_stream(gen, request_id),
@@ -1171,7 +1353,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             if not outputs:
                 raise RuntimeError("No output generated")
             resp = build_chat_response_multi(
-                request_id, model_name, outputs, tools=request.tools
+                request_id, model_name, outputs, **output_policy
             )
         elif is_multimodal:
             final_output = await _run_nonstream_with_disconnect(
@@ -1191,7 +1373,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 model_name,
                 final_output["text"],
                 final_output,
-                tools=request.tools,
+                **output_policy,
             )
         elif effective_n > 1:
             outputs = await _race_disconnect(
@@ -1207,7 +1389,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             if not outputs:
                 raise RuntimeError("No output generated")
             resp = build_chat_response_multi(
-                request_id, model_name, outputs, tools=request.tools
+                request_id, model_name, outputs, **output_policy
             )
         else:
             final_output = await _run_nonstream_with_disconnect(
@@ -1227,7 +1409,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 model_name,
                 final_output["text"],
                 final_output,
-                tools=request.tools,
+                **output_policy,
             )
         _log_request_event("response", request_id, resp.model_dump())
         return resp
@@ -1255,7 +1437,7 @@ async def completions(request: CompletionRequest, raw_request: Request):
         sampling_params = _build_sampling_params(
             temperature=request.temperature,
             max_tokens=request.get_max_tokens(),
-            stop_strings=request.stop,
+            stop_strings=request.get_stop(),
             ignore_eos=request.ignore_eos,
             top_k=request.top_k,
             top_p=request.top_p,
@@ -1372,11 +1554,12 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         messages = [ChatMessage(**m) for m in openai_messages]
 
         merged_kwargs = dict(default_chat_template_kwargs)
+        openai_tools = anthropic_to_openai_tools(request.tools)
         prompt = apply_chat_template(
             tokenizer,
             custom_message_encoder,
             [msg.to_template_dict() for msg in messages],
-            tools=anthropic_to_openai_tools(request.tools),
+            tools=openai_tools,
             **merged_kwargs,
         )
 
@@ -1429,10 +1612,13 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                 from .reasoning import ReasoningFilter
                 from .tool_parser import ToolCallStreamParser
 
-                reasoning_filter = ReasoningFilter()
-                if prompt.rstrip().endswith("<think>"):
-                    reasoning_filter.state = 1
-                tool_parser = ToolCallStreamParser()
+                reasoning_filter = ReasoningFilter.for_stream(
+                    primed=prompt_primes_thinking(prompt)
+                )
+                # Without the request's tool schemas the XML dialects (Qwen3,
+                # MiniMax) cannot type-coerce parameter values and every
+                # argument would reach the client as a string.
+                tool_parser = ToolCallStreamParser(tools=openai_tools)
                 block_index = 0
                 started_text = False
                 started_thinking = False
@@ -1610,7 +1796,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
 
         raw_text = final_output["text"]
         reasoning_content, content_with_tools = separate_reasoning(raw_text)
-        content_text, tool_calls = parse_tool_calls(content_with_tools)
+        content_text, tool_calls = parse_tool_calls(content_with_tools, openai_tools)
         output_tokens = len(tokenizer.encode(raw_text))
         cache_read_input_tokens = final_output.get("num_cached_tokens", 0)
         if not getattr(request, "thinking", None):
@@ -1743,7 +1929,7 @@ async def stop_profile():
 def main():
     """Main entry point for the server."""
     global engine, tokenizer, model_name, default_chat_template_kwargs, _request_logger
-    global custom_message_encoder
+    global custom_message_encoder, template_extension_roles, api_keys
 
     parser = FlexibleArgumentParser(description="ATOM OpenAI API Server")
     EngineArgs.add_cli_args(parser)
@@ -1770,7 +1956,25 @@ def main():
         default=None,
         help="Path to JSONL file for logging all API requests and responses (debug)",
     )
+    parser.add_argument(
+        "--api-key",
+        type=str,
+        action="append",
+        default=None,
+        help=(
+            "Require this API key on every request "
+            "('Authorization: Bearer <key>' or 'x-api-key'). Repeat to accept "
+            "several keys. Defaults to the ATOM_API_KEY env var; when neither "
+            "is set the server stays unauthenticated."
+        ),
+    )
     args = parser.parse_args()
+
+    api_keys = {key for key in (args.api_key or []) if key}
+    if not api_keys and envs.ATOM_API_KEY:
+        api_keys = {envs.ATOM_API_KEY}
+    if api_keys:
+        logger.info(f"API-key authentication enabled ({len(api_keys)} key(s))")
 
     if args.request_log:
         _request_logger = logging.getLogger("atom.request_log")
@@ -1789,6 +1993,14 @@ def main():
     tokenizer = _load_tokenizer(args.model, args.trust_remote_code)
     model_name = args.served_model_name if args.served_model_name else args.model
     custom_message_encoder = load_custom_message_encoder(args.model)
+    template_extension_roles = template_supported_roles(
+        getattr(tokenizer, "chat_template", None)
+    )
+    logger.info(
+        "Chat template handles extension roles: %s (others are folded into "
+        "'system' so their instructions are not dropped)",
+        sorted(template_extension_roles) or "none",
+    )
 
     logger.info(f"Initializing engine with model {args.model}...")
     engine_args = EngineArgs.from_cli_args(args)

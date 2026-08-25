@@ -13,6 +13,7 @@ from .protocol import (
     STREAM_DONE_MESSAGE,
     TEXT_COMPLETION_OBJECT,
     CompletionResponse,
+    openai_finish_reason,
 )
 
 logger = logging.getLogger("atom")
@@ -88,7 +89,7 @@ async def stream_completion_response(
                 request_id,
                 model,
                 new_text,
-                finish_reason=chunk_data.get("finish_reason"),
+                finish_reason=openai_finish_reason(chunk_data.get("finish_reason")),
                 **extra_fields,
             )
 
@@ -137,7 +138,7 @@ def build_completion_response(
             {
                 "index": 0,
                 "text": final_output["text"],
-                "finish_reason": final_output["finish_reason"],
+                "finish_reason": openai_finish_reason(final_output["finish_reason"]),
             }
         ],
         usage={
@@ -170,7 +171,7 @@ def build_completion_response_multi(
         {
             "index": i,
             "text": out["text"],
-            "finish_reason": out["finish_reason"],
+            "finish_reason": openai_finish_reason(out["finish_reason"]),
         }
         for i, out in enumerate(final_outputs)
     ]
@@ -242,7 +243,7 @@ async def stream_completion_response_fanout(
                 request_id,
                 model,
                 new_text,
-                finish_reason=chunk_data.get("finish_reason"),
+                finish_reason=openai_finish_reason(chunk_data.get("finish_reason")),
                 index=idx,
                 **extra_fields,
             )

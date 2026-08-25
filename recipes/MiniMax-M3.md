@@ -268,3 +268,52 @@ Reference MXFP4 EAGLE3 results from our run on 4xMI355 GPUs:
 
 For PD-disaggregated serving (1P+1D, 2P+1D DPA, with/without EAGLE3), see
 [recipes/mesh/MiniMax-M3.md](mesh/MiniMax-M3.md).
+
+## Full-capability serving
+
+This profile serves MiniMax-M3 with the features it ships: tool calling, the
+per-request thinking toggle, `role=root`, its full context window, and
+prefix-cache reporting. Add `--api-key` when the deployment should require
+authentication; omit it and the server stays open.
+
+```bash
+export model_path=amd/MiniMax-M3-MXFP4
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export ATOM_FORCE_ATTN_TRITON=1
+
+python -m atom.entrypoints.openai_server \
+  --model "$model_path" \
+  --tensor-parallel-size 4 \
+  --server-port 8000 \
+  --trust-remote-code \
+  --gpu-memory-utilization 0.9 \
+  --block-size 128 \
+  --max-model-len 1048576 \
+  --max-num-seqs 64 \
+  --max-num-batched-tokens 32768 \
+  --kv_cache_dtype fp8 \
+  --index-cache-dtype fp8 \
+  --online_quant_config '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "vision_tower", "multi_modal_projector", "patch_merge_mlp", "*block_sparse_moe"]}' \
+  --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4}' \
+  --api-key "$ATOM_API_KEY"
+```
+
+- `--max-model-len 1048576` is the 1M window M3 advertises, and it fits at
+  `-tp 4` with `--gpu-memory-utilization 0.9`. The cost is concurrency, which is
+  why `--max-num-seqs` is 64 here. Lower the window (`524288`, `262144`, …) to
+  buy concurrency back.
+- Prefix caching is on by default and is what populates
+  `usage.prompt_tokens_details.cached_tokens`.
+
+### Capabilities
+
+| Capability | How to use it |
+|:---|:---|
+| Tool calling | standard OpenAI `tools`; streamed and non-streamed `tool_calls`, parallel calls, `finish_reason: "tool_calls"` |
+| `tool_choice` | `auto` / `none` / `required` / `{"type":"function","function":{"name":…}}` |
+| Thinking toggle | `"thinking": {"type": "enabled"}`, `{"type": "disabled"}` or `{"type": "adaptive"}` (model decides) per request |
+| Reasoning split | `message.reasoning_content` (non-stream) and `delta.reasoning_content` (stream) |
+| `role=root` | highest-priority instruction, overrides `system` |
+| Prefix-cache reporting | `usage.prompt_tokens_details.cached_tokens` |
+| API-key auth | `--api-key` / `ATOM_API_KEY`; `Authorization: Bearer <key>` or `x-api-key` |
+| Request correlation | `x-request-id` on every response, including errors |

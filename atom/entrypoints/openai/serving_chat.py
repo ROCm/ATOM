@@ -13,6 +13,7 @@ from .protocol import (
     CHAT_COMPLETION_CHUNK_OBJECT,
     STREAM_DONE_MESSAGE,
     ChatCompletionResponse,
+    openai_finish_reason,
 )
 from .reasoning import ReasoningFilter, separate_reasoning
 from .tool_parser import ToolCallStreamParser, parse_tool_calls
@@ -60,6 +61,10 @@ async def stream_chat_response(
     num_prompt_tokens: int,
     cleanup_fn,
     tools=None,
+    enable_tool_calls: bool = True,
+    enable_reasoning: bool = True,
+    reasoning_primed: bool = False,
+    tool_call_prefix: str = "",
 ) -> AsyncGenerator[str, None]:
     """Generate streaming chat completion response with reasoning and tool calls.
 
@@ -71,13 +76,27 @@ async def stream_chat_response(
     ``num_prompt_tokens`` is the engine-computed prompt length (``Sequence.
     num_prompt_tokens``); reusing it avoids re-tokenizing the prompt on the
     event loop at stream start.
+
+    ``enable_tool_calls=False`` serves ``tool_choice: "none"``;
+    ``enable_reasoning=False`` serves ``thinking: {"type": "disabled"}`` — both
+    stream the model output as plain content. ``reasoning_primed`` says the chat
+    template left a ``<think>`` block open at the end of the prompt, so the
+    model's first token is already reasoning.
     """
     num_tokens_input = num_prompt_tokens
     num_tokens_output = 0
     num_cached_tokens = 0
-    reasoning_filter = ReasoningFilter()
-    tool_parser = ToolCallStreamParser(tools=tools)
+    reasoning_filter = ReasoningFilter.for_stream(
+        enabled=enable_reasoning, primed=reasoning_primed
+    )
+    tool_parser = ToolCallStreamParser(tools=tools, enabled=enable_tool_calls)
+    if tool_call_prefix:
+        # tool_choice forced the call by ending the prompt with its opening
+        # tokens; seed the parser with them so the model's continuation parses.
+        # A bare opener yields no events by construction.
+        tool_parser.process(tool_call_prefix)
     has_tool_calls = False
+    engine_finish_reason = None
 
     kv_transfer_params_value = None
 
@@ -98,6 +117,8 @@ async def stream_chat_response(
             _ct = chunk_data.get("num_cached_tokens", 0)
             if _ct:
                 num_cached_tokens = _ct
+            if chunk_data.get("finish_reason"):
+                engine_finish_reason = chunk_data["finish_reason"]
 
             if "kv_transfer_params" in chunk_data:
                 kv_transfer_params_value = chunk_data["kv_transfer_params"]
@@ -157,7 +178,13 @@ async def stream_chat_response(
         aborted = False
 
         # Final chunks
-        finish_reason = "tool_calls" if has_tool_calls else "stop"
+        # A truncated stream must report "length", not "stop" — clients use it
+        # to decide whether to ask for a continuation.
+        finish_reason = (
+            "tool_calls"
+            if has_tool_calls
+            else (openai_finish_reason(engine_finish_reason) or "stop")
+        )
         usage = {
             "prompt_tokens": num_tokens_input,
             "completion_tokens": num_tokens_output,
@@ -191,23 +218,48 @@ def _build_chat_choice(
     finish_reason: Optional[str],
     index: int = 0,
     tools=None,
+    enable_tool_calls: bool = True,
+    enable_reasoning: bool = True,
+    reasoning_primed: bool = False,
+    tool_call_prefix: str = "",
 ) -> Dict[str, Any]:
     """Build one entry of ``choices[...]`` from a raw output string.
 
     Factored out of :func:`build_chat_response` so multi-sample responses
     (SamplingParams.n>1) can reuse the reasoning + tool-call separation
     without duplicating the logic.
+
+    ``enable_tool_calls=False`` serves ``tool_choice: "none"``;
+    ``enable_reasoning=False`` serves ``thinking: {"type": "disabled"}``.
     """
-    reasoning_content, content_with_tools = separate_reasoning(raw_text)
-    content, tool_calls = parse_tool_calls(content_with_tools, tools)
+    if enable_reasoning:
+        reasoning_content, content_with_tools = separate_reasoning(
+            raw_text, primed=reasoning_primed
+        )
+    else:
+        reasoning_content, content_with_tools = None, raw_text
+    if enable_tool_calls:
+        # tool_call_prefix is the forced opener the prompt ended with: it is part
+        # of the assistant turn but not of the model's output, so restore it
+        # before parsing.
+        content, tool_calls = parse_tool_calls(
+            tool_call_prefix + content_with_tools, tools
+        )
+    else:
+        content, tool_calls = content_with_tools, []
 
     message: Dict[str, Any] = {"role": "assistant", "content": content}
-    if reasoning_content is not None:
-        message["reasoning_content"] = reasoning_content
     if tool_calls:
         message["tool_calls"] = [tc.to_dict() for tc in tool_calls]
+        # OpenAI reports a tool-call-only turn as content=null, not "".
+        if not content:
+            message["content"] = None
+    if reasoning_content is not None:
+        message["reasoning_content"] = reasoning_content
 
-    effective_finish_reason = "tool_calls" if tool_calls else finish_reason
+    effective_finish_reason = (
+        "tool_calls" if tool_calls else openai_finish_reason(finish_reason)
+    )
     return {
         "index": index,
         "message": message,
@@ -221,6 +273,10 @@ def build_chat_response(
     raw_text: str,
     final_output: Dict[str, Any],
     tools=None,
+    enable_tool_calls: bool = True,
+    enable_reasoning: bool = True,
+    reasoning_primed: bool = False,
+    tool_call_prefix: str = "",
 ) -> ChatCompletionResponse:
     """Build a non-streaming chat completion response (single choice)."""
     response = ChatCompletionResponse(
@@ -229,7 +285,14 @@ def build_chat_response(
         model=model,
         choices=[
             _build_chat_choice(
-                raw_text, final_output["finish_reason"], index=0, tools=tools
+                raw_text,
+                final_output["finish_reason"],
+                index=0,
+                tools=tools,
+                enable_tool_calls=enable_tool_calls,
+                enable_reasoning=enable_reasoning,
+                reasoning_primed=reasoning_primed,
+                tool_call_prefix=tool_call_prefix,
             )
         ],
         usage={
@@ -259,6 +322,10 @@ def build_chat_response_multi(
     model: str,
     final_outputs: List[Dict[str, Any]],
     tools=None,
+    enable_tool_calls: bool = True,
+    enable_reasoning: bool = True,
+    reasoning_primed: bool = False,
+    tool_call_prefix: str = "",
 ) -> ChatCompletionResponse:
     """Build a non-streaming response with one choice per fan-out sibling.
 
@@ -270,7 +337,16 @@ def build_chat_response_multi(
     """
     assert final_outputs, "build_chat_response_multi requires at least one output"
     choices = [
-        _build_chat_choice(out["text"], out["finish_reason"], index=i, tools=tools)
+        _build_chat_choice(
+            out["text"],
+            out["finish_reason"],
+            index=i,
+            tools=tools,
+            enable_tool_calls=enable_tool_calls,
+            enable_reasoning=enable_reasoning,
+            reasoning_primed=reasoning_primed,
+            tool_call_prefix=tool_call_prefix,
+        )
         for i, out in enumerate(final_outputs)
     ]
     prompt_tokens = final_outputs[0]["num_tokens_input"]
@@ -309,6 +385,10 @@ async def stream_chat_response_fanout(
     num_prompt_tokens: int,
     cleanup_fn,
     tools=None,
+    enable_tool_calls: bool = True,
+    enable_reasoning: bool = True,
+    reasoning_primed: bool = False,
+    tool_call_prefix: str = "",
 ) -> AsyncGenerator[str, None]:
     """Streaming variant that multiplexes ``len(seq_ids)`` fan-out siblings
     into a single SSE stream, tagging every chunk with ``choices[0].index``.
@@ -324,8 +404,17 @@ async def stream_chat_response_fanout(
     n = len(seq_ids)
     num_tokens_input = num_prompt_tokens
     num_tokens_output = [0] * n
-    reasoning_filters = [ReasoningFilter() for _ in range(n)]
-    tool_parsers = [ToolCallStreamParser(tools=tools) for _ in range(n)]
+    engine_finish_reasons: List[Optional[str]] = [None] * n
+    reasoning_filters = [
+        ReasoningFilter.for_stream(enabled=enable_reasoning, primed=reasoning_primed)
+        for _ in range(n)
+    ]
+    tool_parsers = [
+        ToolCallStreamParser(tools=tools, enabled=enable_tool_calls) for _ in range(n)
+    ]
+    if tool_call_prefix:
+        for parser in tool_parsers:
+            parser.process(tool_call_prefix)
     has_tool_calls = [False] * n
     finished = [False] * n
     kv_transfer_params_value = None
@@ -354,6 +443,8 @@ async def stream_chat_response_fanout(
             _ct = chunk_data.get("num_cached_tokens", 0)
             if _ct:
                 num_cached_tokens = _ct
+            if chunk_data.get("finish_reason"):
+                engine_finish_reasons[idx] = chunk_data["finish_reason"]
 
             if "kv_transfer_params" in chunk_data:
                 kv_transfer_params_value = chunk_data["kv_transfer_params"]
@@ -441,7 +532,11 @@ async def stream_chat_response_fanout(
                 create_chat_chunk(
                     request_id,
                     model,
-                    finish_reason="tool_calls" if has_tool_calls[i] else "stop",
+                    finish_reason=(
+                        "tool_calls"
+                        if has_tool_calls[i]
+                        else (openai_finish_reason(engine_finish_reasons[i]) or "stop")
+                    ),
                     index=i,
                 )
                 for i in range(n)
