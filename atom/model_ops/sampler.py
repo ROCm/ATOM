@@ -45,6 +45,8 @@ class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
         self.eps = SAMPLER_EPS
+        # Re-seeded before every draw, so it carries no state across rows.
+        self._generator = None
 
     def forward(
         self,
@@ -54,6 +56,7 @@ class Sampler(nn.Module):
         top_ps: torch.Tensor | None = None,  # (num_tokens,) float32, 1.0 means disabled
         all_greedy: bool = False,  # True if all temperatures are 0 (checked on CPU)
         needs_independent_noise: bool = False,
+        seeds: tuple[list[int], list[int]] | None = None,
     ) -> torch.Tensor:  # (num_tokens,)
         """
         Sample tokens from logits using temperature or top-k top-p filtering.
@@ -69,25 +72,111 @@ class Sampler(nn.Module):
                 exponential noise so sibling sequences with identical logits
                 do not produce identical tokens. Adds an O(bs * vocab_size)
                 allocation, so only enabled when actually needed.
+            seeds: ``(rows, derived_seeds)`` for sequences sampling
+                reproducibly, or None. Those rows are re-drawn and overwrite the
+                batch result; all other rows are left as the batch produced them.
 
         Returns:
             Sampled token IDs (num_tokens,)
         """
-        # No Top-K Top-P parameters, perform temperature-based sampling
         if not self._needs_filtering(top_ks, top_ps):
-            return self._temperature_sample(
+            sampled = self._temperature_sample(
                 logits, temperatures, needs_independent_noise=needs_independent_noise
             )
+        else:
+            sampled = self._topk_topp_sample(
+                logits,
+                temperatures,
+                top_ks,
+                top_ps,
+                all_greedy,
+                needs_independent_noise=needs_independent_noise,
+            )
 
-        # Apply top-k/top-p filtering
-        return self._topk_topp_sample(
-            logits,
-            temperatures,
-            top_ks,
-            top_ps,
-            all_greedy,
-            needs_independent_noise=needs_independent_noise,
-        )
+        if seeds is not None:
+            self._overwrite_seeded_rows(
+                sampled, logits, temperatures, top_ks, top_ps, seeds
+            )
+        return sampled
+
+    # ---- Seeded (reproducible) sampling ------------------------------------
+
+    def _row_value(self, values: torch.Tensor | None, row: int, default):
+        """Read one row out of a per-row buffer.
+
+        A single-element buffer carries one value shared by every row; see
+        ``model_runner.prepare_sample``.
+        """
+        if values is None:
+            return default
+        if values.numel() == 1:
+            return values[0].item()
+        return values[row].item()
+
+    def _overwrite_seeded_rows(
+        self,
+        sampled: torch.Tensor,
+        logits: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_ks: torch.Tensor | None,
+        top_ps: torch.Tensor | None,
+        seeds: tuple[list[int], list[int]],
+    ) -> None:
+        """Re-draw the seeded rows in place, each from its own generator.
+
+        ``argmax(p / Exp(1))`` is the Gumbel-max trick: it samples the
+        categorical distribution ``p``. Drawing the exponential noise here rather
+        than calling ``torch.multinomial`` or aiter's sampling ops is what makes
+        the result depend only on the row's seed -- those draw from a global
+        stream shared with the rest of the batch.
+        """
+        rows, derived = seeds
+        if not rows:
+            return
+        num_rows, vocab_size = logits.shape
+        if self._generator is None:
+            self._generator = torch.Generator(device=logits.device)
+        generator = self._generator
+
+        for row, seed in zip(rows, derived, strict=True):
+            if row >= num_rows:
+                continue
+            temperature = self._row_value(temperatures, row, 1.0)
+            if temperature <= self.eps:
+                continue  # greedy: argmax already reproducible
+
+            probs = (logits[row].float() / temperature).softmax(dim=-1)
+
+            top_k = int(self._row_value(top_ks, row, -1))
+            top_p = float(self._row_value(top_ps, row, 1.0))
+            if top_k != -1 or top_p < 1.0:
+                probs = self._filter_probs(probs, top_k, top_p)
+
+            generator.manual_seed(int(seed))
+            noise = torch.empty(
+                vocab_size, dtype=torch.float, device=logits.device
+            ).exponential_(1, generator=generator)
+            sampled[row] = torch.argmax(probs / (noise + self.eps)).to(sampled.dtype)
+
+    def _filter_probs(
+        self, probs: torch.Tensor, top_k: int, top_p: float
+    ) -> torch.Tensor:
+        """Zero out everything top-k/top-p excludes from one row, then renormalize.
+
+        Applies the same masking as :meth:`_native_sample`, so a seeded row is
+        filtered identically to the rest of the batch.
+        """
+        sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+        keep = torch.ones_like(sorted_probs, dtype=torch.bool)
+        if top_p < 1.0:
+            cumsum = torch.cumsum(sorted_probs, dim=-1)
+            keep &= (cumsum - sorted_probs) <= top_p
+        if top_k != -1:
+            keep &= torch.arange(probs.numel(), device=probs.device) < top_k
+        keep[0] = True  # never filter away the whole distribution
+        filtered = torch.zeros_like(probs)
+        filtered.scatter_(0, sorted_indices, sorted_probs * keep)
+        return filtered / filtered.sum().clamp(min=self.eps)
 
     def _needs_filtering(
         self,

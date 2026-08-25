@@ -66,7 +66,9 @@ clients (curl, OpenAI SDK, lm-eval) work without modification.
 | `stop` | `Optional[str \| List[str]]` | `None` | Stop string(s) |
 | `ignore_eos` | `Optional[bool]` | `False` | Ignore end-of-sequence token |
 | `stream` | `Optional[bool]` | `False` | Enable server-sent events streaming |
-| `seed` | `Optional[int]` | `None` | Random seed |
+| `seed` | `Optional[int]` | `None` | Makes sampling reproducible: the draw at each position is derived from `(seed, position)`. Best-effort — see [Reproducible sampling](#reproducible-sampling) |
+| `presence_penalty` | `Optional[float]` | `0.0` | Accepted and range-checked (`[-2, 2]`) for client compatibility; **not applied** to sampling |
+| `frequency_penalty` | `Optional[float]` | `0.0` | Accepted and range-checked (`[-2, 2]`) for client compatibility; **not applied** to sampling |
 | `tools` | `Optional[List[Dict]]` | `None` | OpenAI tool definitions, forwarded to the chat template |
 | `tool_choice` | `Optional[str \| Dict]` | `"auto"` | `auto`, `none`, `required`, or `{"type":"function","function":{"name":…}}` |
 | `thinking` | `Optional[Dict \| bool]` | `None` | Reasoning toggle: `{"type": "enabled"}` / `{"type": "disabled"}` |
@@ -86,6 +88,7 @@ clients (curl, OpenAI SDK, lm-eval) work without modification.
 | `stop` | `Optional[str \| List[str]]` | `None` | Stop string(s) |
 | `ignore_eos` | `Optional[bool]` | `False` | Ignore end-of-sequence token |
 | `stream` | `Optional[bool]` | `False` | Enable SSE streaming |
+| `seed` | `Optional[int]` | `None` | Same meaning as for chat |
 
 ### Response models
 

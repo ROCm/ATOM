@@ -707,6 +707,76 @@ class TestToolChoice:
 
 
 # ============================================================================
+# Sampling parameters that reach the engine
+# ============================================================================
+
+
+class TestSamplingParameters:
+    """A field the API documents as affecting sampling must reach SamplingParams.
+
+    Parsing a field and never forwarding it produces a server that accepts the
+    request and ignores it, which no response can reveal.
+    """
+
+    def test_seed_reaches_the_engine(self, server):
+        server.answers("ok")
+        server.chat(seed=1234)
+        assert server.engine.last_sampling_params.seed == 1234
+
+    def test_seed_zero_is_forwarded(self, server):
+        server.answers("ok")
+        server.chat(seed=0)
+        assert server.engine.last_sampling_params.seed == 0
+
+    def test_absent_seed_stays_none(self, server):
+        server.answers("ok")
+        server.chat()
+        assert server.engine.last_sampling_params.seed is None
+
+    def test_penalties_are_accepted_but_not_forwarded(self, server):
+        """The two penalties are compatibility-only: accepted, never applied.
+
+        They are range-checked at the API layer but must not reach the sampler.
+        """
+        server.answers("ok")
+        response = server.chat(presence_penalty=0.5, frequency_penalty=-1.25)
+        assert response.status_code == 200
+        params = server.engine.last_sampling_params
+        assert not hasattr(params, "presence_penalty")
+        assert not hasattr(params, "frequency_penalty")
+
+    @pytest.mark.parametrize("field", ["presence_penalty", "frequency_penalty"])
+    @pytest.mark.parametrize("value", [2.5, -2.5])
+    def test_out_of_range_penalty_is_400(self, server, field, value):
+        assert server.chat(**{field: value}).status_code == 400
+
+    def test_oversized_seed_is_400(self, server):
+        assert server.chat(seed=2**63).status_code == 400
+
+    def test_top_k_and_top_p_reach_the_engine(self, server):
+        server.answers("ok")
+        server.chat(top_k=5, top_p=0.3)
+        params = server.engine.last_sampling_params
+        assert params.top_k == 5
+        assert params.top_p == 0.3
+
+    def test_max_completion_tokens_wins_over_max_tokens(self, server):
+        server.answers("ok")
+        server.chat(max_tokens=99, max_completion_tokens=7)
+        assert server.engine.last_sampling_params.max_tokens == 7
+
+    def test_text_completions_forwards_the_seed_too(self, server):
+        """/v1/completions shares the sampler, so it must share the seed."""
+        server.says("ok")
+        response = server.client.post(
+            "/v1/completions",
+            json={"model": MODEL, "prompt": "hello", "seed": 99},
+        )
+        assert response.status_code == 200
+        assert server.engine.last_sampling_params.seed == 99
+
+
+# ============================================================================
 # role=root
 # ============================================================================
 
@@ -1069,10 +1139,9 @@ class TestAuthentication:
 class TestFinishReasonVocabulary:
     """The engine's vocabulary must never reach the client.
 
-    ``protocol.openai_finish_reason`` is unit-tested elsewhere; these drive it
-    through all four serving paths, because a correct mapping that is not wired
-    into a path is exactly the defect the live server showed ("eos" on the
-    wire).
+    ``protocol.openai_finish_reason`` is unit-tested elsewhere. These drive it
+    through all four serving paths instead, since a correct mapping still
+    reaches the client as ``"eos"`` on any path that forgets to call it.
     """
 
     def test_eos_becomes_stop_non_stream(self, server):

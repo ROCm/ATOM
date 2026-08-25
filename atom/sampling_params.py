@@ -25,6 +25,10 @@ class SamplingParams:
     # outputs diverge when temperature > 0.
     n: int = 1
     logprobs: Optional[Union[bool, int]] = None
+    # Derives each position's random draw from (seed, position) instead of the
+    # engine's shared noise. Determinism is best-effort: identical logits are
+    # also required, and batched decode is not bitwise reproducible.
+    seed: Optional[int] = None
 
     def __post_init__(self):
         if self.top_k != -1 and self.top_k < 1:
@@ -33,3 +37,10 @@ class SamplingParams:
             raise ValueError("top_p must be in range (0.0, 1.0]")
         if self.n < 1:
             raise ValueError("n must be >= 1")
+        if self.seed is not None:
+            # bool is an int subclass and would silently seed with 0 or 1.
+            if not isinstance(self.seed, int) or isinstance(self.seed, bool):
+                raise ValueError("seed must be an integer or None")
+            # torch.Generator.manual_seed takes a signed 64-bit value.
+            if not -(2**63) <= self.seed < 2**63:
+                raise ValueError("seed must fit in a signed 64-bit integer")

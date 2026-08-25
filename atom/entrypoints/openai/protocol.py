@@ -227,6 +227,7 @@ class CompletionRequest(BaseModel):
     stop: Optional[Union[str, List[str]]] = None
     ignore_eos: Optional[bool] = False
     stream: Optional[bool] = False
+    seed: Optional[int] = None
     # Optional KV-transfer metadata for P/D disaggregation.
     kv_transfer_params: Optional[Dict[str, Any]] = None
     # Optional DPA routing hint inserted by atomesh for DP-aware workers.

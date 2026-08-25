@@ -355,8 +355,7 @@ def resolve_thinking(thinking: Any) -> Optional[bool]:
         if normalized in _THINKING_AUTO:
             return None
     raise ValueError(
-        "'thinking.type' must be 'enabled', 'disabled' or 'adaptive', got "
-        f"{value!r}"
+        "'thinking.type' must be 'enabled', 'disabled' or 'adaptive', got " f"{value!r}"
     )
 
 
@@ -439,6 +438,10 @@ def _validate_sampling(request: ChatCompletionRequest) -> None:
         value = getattr(request, name, None)
         if value is not None and value < 1:
             raise ValueError(f"{name} must be >= 1, got {value}")
+    # torch.Generator.manual_seed takes a signed 64-bit value.
+    seed = getattr(request, "seed", None)
+    if seed is not None and not -(2**63) <= seed < 2**63:
+        raise ValueError("seed must fit in a signed 64-bit integer")
 
 
 def _validate_tools(tools: Optional[List[Dict[str, Any]]]) -> None:

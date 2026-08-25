@@ -32,6 +32,7 @@ from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 import struct
 from atom.utils import envs
+from atom.model_engine.sampling_control import build_seed_rows
 
 logger = logging.getLogger("atom")
 
@@ -321,6 +322,7 @@ class ScheduledBatch:
             [getattr(seq, "needs_independent_noise", False) for seq in seqs.values()],
             dtype=bool,
         )
+        self.sampling_seeds = build_seed_rows(seqs.values())
 
         self.is_first_decode_without_local_prefill = [
             seq.is_first_decode for seq in seqs.values()
