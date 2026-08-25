@@ -613,8 +613,8 @@ class TestRegisterReceivedPrefix:
         assert bm.register_received_prefix(seq) == 2
         assert seq.num_hashed_tokens == 16
         assert seq.prefix_hashes_published is True
-        assert bm.kv.block(seq.block_table[0]).token_ids == list(range(8))
-        assert bm.kv.block(seq.block_table[1]).token_ids == list(range(8, 16))
+        assert list(bm.kv.block(seq.block_table[0]).token_ids) == list(range(8))
+        assert list(bm.kv.block(seq.block_table[1]).token_ids) == list(range(8, 16))
         assert bm.kv.block(seq.block_table[2]).hash == -1
 
     def test_dcp_registers_only_suffix_after_local_cache_hit(
