@@ -14,9 +14,15 @@ server lifetime.
 
 import logging
 import os
+import time
 from collections import deque
 
 logger = logging.getLogger("atom")
+
+# How often `reclaim_stale_slots` actually scans, regardless of how often it is
+# called. The scan is O(staging_depth) and self-throttled so wiring it into a
+# per-step drain loop costs nothing when nothing is stuck.
+_RECLAIM_SCAN_INTERVAL_S = 5.0
 
 # Consecutive dropped spills, with no slot coming back, before the ring is
 # called starved rather than busy. A slot returns only once the worker's D2H
@@ -74,6 +80,17 @@ class StateOffloadIndex:
         # means the consumer stopped draining.
         self._consecutive_drops = 0
         self._warned_starved = False
+        # slot -> time.monotonic() when it was reserved by `request_spill`.
+        # A slot's only way home is `release_staging`, driven by the worker's
+        # spill report. If that report never comes (the worker abandoned the
+        # transfer, or its completion was lost the same way a KV save's can be),
+        # the slot is pinned forever and the ring silently starves. This stamp
+        # lets `reclaim_stale_slots` return a slot the report has clearly
+        # abandoned. Reclaimed slots (`_slots_reclaimed`) are counted so the
+        # symptom is visible rather than a silent throughput cliff.
+        self._slot_reserved_at: dict[int, float] = {}
+        self._next_reclaim_at: float = 0.0
+        self._slots_reclaimed = 0
 
     @property
     def enabled(self) -> bool:
@@ -98,6 +115,7 @@ class StateOffloadIndex:
             return -1
         slot = self._free_slots.popleft()
         self._pending.append((h, slot))
+        self._slot_reserved_at[slot] = time.monotonic()
         self.spills_requested += 1
         return slot
 
@@ -131,8 +149,71 @@ class StateOffloadIndex:
     def release_staging(self, slot: int) -> None:
         if 0 <= slot < self.staging_depth and slot not in self._free_slots:
             self._free_slots.append(slot)
+            self._slot_reserved_at.pop(slot, None)
             # The ring is moving again, so any drops so far were a burst.
             self._consecutive_drops = 0
+
+    def reclaim_stale_slots(self, timeout_s: float, now: float | None = None) -> int:
+        """Return slots whose spill report never came back to the free ring.
+
+        `release_staging` is the only way a slot comes home, and it fires only
+        on the worker's spill report. A lost report (the transfer was abandoned,
+        or its completion vanished the way a stalled KV save's does) would pin
+        that slot forever; enough of them and `request_spill` drops every spill
+        (`spills_dropped` climbs, `_note_drop` warns) with no way to recover
+        short of a restart. This is the ring-side twin of the engine's
+        `_reconcile_stalled_deferred_saves`.
+
+        Safety mirrors that reconciliation: `timeout_s` must be larger than the
+        upstream (LMCache pin-monitor) abandon window, so the worker's staging
+        buffer for this slot is no longer being read before the slot -- and thus
+        the buffer -- is handed to a new spill. Caller passes the same abandon
+        timeout used engine-side. Self-throttled to one real scan per
+        `_RECLAIM_SCAN_INTERVAL_S`, so it is safe to call every step.
+
+        A reclaimed slot's `_pending` entry (if it was never drained) is dropped
+        too: its hash was never confirmed, so nothing indexed it and no load can
+        ask for it. Returns the number of slots reclaimed this call.
+        """
+        if timeout_s <= 0 or not self._slot_reserved_at:
+            return 0
+        now = time.monotonic() if now is None else now
+        if now < self._next_reclaim_at:
+            return 0
+        self._next_reclaim_at = now + _RECLAIM_SCAN_INTERVAL_S
+        stale = [
+            slot
+            for slot, at in self._slot_reserved_at.items()
+            if now - at >= timeout_s
+        ]
+        if not stale:
+            return 0
+        stale_set = set(stale)
+        # Drop any still-queued pending entries for the stale slots; whatever is
+        # left is a live spill still waiting to be drained this step.
+        kept = [(h, slot) for (h, slot) in self._pending if slot not in stale_set]
+        self._pending.clear()
+        self._pending.extend(kept)
+        for slot in stale:
+            self._slot_reserved_at.pop(slot, None)
+            if 0 <= slot < self.staging_depth and slot not in self._free_slots:
+                self._free_slots.append(slot)
+        self._slots_reclaimed += len(stale)
+        # A reclaim means the ring was stuck, not bursting; reset the burst
+        # counter so a fresh starvation warning can arm if it stalls again.
+        self._consecutive_drops = 0
+        self._warned_starved = False
+        logger.warning(
+            "State offload staging ring reclaimed %d slot(s) whose spill report "
+            "never returned after %.0fs (staging_depth=%d, total reclaimed=%d). "
+            "The worker very likely abandoned or lost the transfer's completion; "
+            "the slot is returned to the ring so spills can resume.",
+            len(stale),
+            timeout_s,
+            self.staging_depth,
+            self._slots_reclaimed,
+        )
+        return len(stale)
 
     def forget(self, h: int) -> None:
         """Drop a hash whose load failed, so the next request does not retry."""
