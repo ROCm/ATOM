@@ -215,8 +215,9 @@ class MultiConnector(KVConnectorBase):
         self._pp_is_head = pp_rank == 0
 
         # Send/save pairing state, all keyed by str(req_id). See module
-        # docstring. Legacy metadata without an operation id is identified by
-        # its bare request id, the same fallback the worker reports with.
+        # docstring. The values below are completion identities, not keys: a
+        # pending save is named by its SaveOperationId, or by the bare req_id
+        # when the metadata carries none -- whichever the worker will report.
         self._pending_save_ops: dict[str, set[SaveCompletionId]] = {}
         self._sent: dict[str, Any] = {}
         self._saved: dict[str, set[SaveCompletionId]] = {}
