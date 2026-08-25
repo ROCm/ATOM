@@ -142,19 +142,25 @@ if _HAS_TRITON:
             # single-pass property is non-negotiable: nothing here re-reads.
             pp = tl.multiple_of(ps_ptr + t * stride_ps_t + o_d, (16,))
             if CG2:
-                ps = tl.load(pp, mask=m_d, other=0.0, cache_modifier=".cg").to(tl.float32)
+                ps = tl.load(pp, mask=m_d, other=0.0, cache_modifier=".cg").to(
+                    tl.float32
+                )
             else:
                 ps = tl.load(pp, mask=m_d, other=0.0).to(tl.float32)
             if DO_ADD:
                 hp = tl.multiple_of(hs_ptr + t * stride_hs_t + o_d, (16,))
                 if CG2:
-                    ps += tl.load(hp, mask=m_d, other=0.0, cache_modifier=".cg").to(tl.float32)
+                    ps += tl.load(hp, mask=m_d, other=0.0, cache_modifier=".cg").to(
+                        tl.float32
+                    )
                 else:
                     ps += tl.load(hp, mask=m_d, other=0.0).to(tl.float32)
             if DO_ADD2:
                 h2p = tl.multiple_of(hs2_ptr + t * stride_hs2_t + o_d, (16,))
                 if CG2:
-                    ps += tl.load(h2p, mask=m_d, other=0.0, cache_modifier=".cg").to(tl.float32)
+                    ps += tl.load(h2p, mask=m_d, other=0.0, cache_modifier=".cg").to(
+                        tl.float32
+                    )
                 else:
                     ps += tl.load(h2p, mask=m_d, other=0.0).to(tl.float32)
             if WRITE_PREF:
@@ -175,10 +181,14 @@ if _HAS_TRITON:
                         br_ptr + t * stride_br_t + i_l * stride_br_b + o_d, (16,)
                     )
                     if CG:
-                        v = tl.load(bp, mask=m_d, other=0.0, cache_modifier=".cg").to(tl.float32)
+                        v = tl.load(bp, mask=m_d, other=0.0, cache_modifier=".cg").to(
+                            tl.float32
+                        )
                     else:
                         v = tl.load(bp, mask=m_d, other=0.0).to(tl.float32)
-                    s = tl.sum(v * sw, axis=0) * tl.rsqrt(tl.sum(v * v, axis=0) / H + eps)
+                    s = tl.sum(v * sw, axis=0) * tl.rsqrt(
+                        tl.sum(v * v, axis=0) / H + eps
+                    )
                     b_mp = b_m
                     b_m = tl.maximum(b_m, s)
                     r = tl.exp(b_mp - b_m)
@@ -198,11 +208,15 @@ if _HAS_TRITON:
                     )
                     msk = m_l[:, None] & m_d[None, :]
                     if CG:
-                        v = tl.load(bp, mask=msk, other=0.0, cache_modifier=".cg").to(tl.float32)
+                        v = tl.load(bp, mask=msk, other=0.0, cache_modifier=".cg").to(
+                            tl.float32
+                        )
                     else:
                         v = tl.load(bp, mask=msk, other=0.0).to(tl.float32)
                     rstd = tl.rsqrt(tl.sum(v * v, axis=1) / H + eps)
-                    s = tl.where(m_l, tl.sum(v * sw[None, :], axis=1) * rstd, float("-inf"))
+                    s = tl.where(
+                        m_l, tl.sum(v * sw[None, :], axis=1) * rstd, float("-inf")
+                    )
                     b_m, b_mp = tl.maximum(b_m, tl.max(s, axis=0)), b_m
                     r = tl.exp(b_mp - b_m)
                     p = tl.exp(s - b_m)
@@ -211,7 +225,9 @@ if _HAS_TRITON:
         else:
             # prefix (the last candidate) is loaded once and reused across tiles;
             # re-reading it per tile would undo the single-pass property.
-            ps = tl.load(ps_ptr + t * stride_ps_t + o_d, mask=m_d, other=0.0).to(tl.float32)
+            ps = tl.load(ps_ptr + t * stride_ps_t + o_d, mask=m_d, other=0.0).to(
+                tl.float32
+            )
             if DO_ADD:
                 ps += tl.load(hs_ptr + t * stride_hs_t + o_d, mask=m_d, other=0.0).to(
                     tl.float32
@@ -236,7 +252,10 @@ if _HAS_TRITON:
                 m_l = o_l < Bp
                 is_last = o_l == B
                 v = tl.load(
-                    br_ptr + t * stride_br_t + o_l[:, None] * stride_br_b + o_d[None, :],
+                    br_ptr
+                    + t * stride_br_t
+                    + o_l[:, None] * stride_br_b
+                    + o_d[None, :],
                     mask=(o_l < B)[:, None] & m_d[None, :],
                     other=0.0,
                 ).to(tl.float32)
@@ -378,7 +397,9 @@ if _HAS_TRITON:
                 g_cc = tl.sum(tl.where(o_l == 0, s1, 0.0), axis=0)
                 g_pp = tl.sum(tl.where(o_l == B, s1, 0.0), axis=0)
                 g_cp = tl.sum(tl.where(o_l == 0, s3, 0.0), axis=0)
-                qn = (e0 * e0 * g_cc + 2.0 * e0 * e1 * g_cp + e1 * e1 * g_pp) / (zz * zz)
+                qn = (e0 * e0 * g_cc + 2.0 * e0 * e1 * g_cp + e1 * e1 * g_pp) / (
+                    zz * zz
+                )
             else:
                 qn = tl.sum(tl.where(m_d, b_o * b_o, 0.0), axis=0)
             rs = tl.rsqrt(qn / H + out_eps)
@@ -535,7 +556,6 @@ if _HAS_TRITON:
             rs = tl.rsqrt(tl.sum(tl.where(m_d, b_o * b_o, 0.0), axis=0) / H + out_eps)
             b_o = b_o * rs * tl.load(ow_ptr + o_d, mask=m_d, other=0.0).to(tl.float32)
         tl.store(y_ptr + t * stride_yt + o_d, b_o.to(y_ptr.dtype.element_ty), mask=m_d)
-
 
     # ----------------------------------------------- decode, split-H variant
     # GRID FIX.  Every decode kernel above launches exactly T programs, so at
@@ -701,12 +721,21 @@ if _HAS_TRITON:
         # NS slots in the same fixed order, so the combine is bit-deterministic
         # -- no fp32 atomic_add ordering can perturb it run to run.
         R1 = tl.sum(
-            tl.load(rb[:, None] + o_l[None, :], mask=m_ss[:, None], other=0.0,
-                    cache_modifier=".cv"), axis=0
+            tl.load(
+                rb[:, None] + o_l[None, :],
+                mask=m_ss[:, None],
+                other=0.0,
+                cache_modifier=".cv",
+            ),
+            axis=0,
         )
         R2 = tl.sum(
-            tl.load(rb[:, None] + NCP + o_l[None, :], mask=m_ss[:, None], other=0.0,
-                    cache_modifier=".cv"),
+            tl.load(
+                rb[:, None] + NCP + o_l[None, :],
+                mask=m_ss[:, None],
+                other=0.0,
+                cache_modifier=".cv",
+            ),
             axis=0,
         )
 
@@ -716,10 +745,13 @@ if _HAS_TRITON:
             e = tl.exp(sc - b_m)
             b_o = tl.sum(e[:, None] * v, axis=0) / tl.sum(e, axis=0)
         else:
-            q1 = tl.sum(tl.load(rb + B, mask=m_ss, other=0.0,
-                                cache_modifier=".cv"), axis=0)
-            q2 = tl.sum(tl.load(rb + NCP + B, mask=m_ss, other=0.0,
-                                cache_modifier=".cv"), axis=0)
+            q1 = tl.sum(
+                tl.load(rb + B, mask=m_ss, other=0.0, cache_modifier=".cv"), axis=0
+            )
+            q2 = tl.sum(
+                tl.load(rb + NCP + B, mask=m_ss, other=0.0, cache_modifier=".cv"),
+                axis=0,
+            )
             sp = q2 * tl.rsqrt(q1 / H + eps)
             sc = tl.where(o_l < B, R2 * tl.rsqrt(R1 / H + eps), float("-inf"))
             b_m = tl.maximum(tl.max(sc, axis=0), sp)
@@ -744,8 +776,10 @@ if _HAS_TRITON:
                     tl.load(ck2 + o_n, mask=m_n, other=0, cache_modifier=".cv"), axis=0
                 )
             tl.debug_barrier()
-            tot = tl.sum(tl.load(s2p + t * NS + o_s, mask=m_ss, other=0.0,
-                                 cache_modifier=".cv"), axis=0)
+            tot = tl.sum(
+                tl.load(s2p + t * NS + o_s, mask=m_ss, other=0.0, cache_modifier=".cv"),
+                axis=0,
+            )
             rs = tl.rsqrt(tot / H + out_eps)
             b_o = b_o * rs * tl.load(ow_ptr + o_d, mask=m_d, other=0.0).to(tl.float32)
 
@@ -879,9 +913,9 @@ def _decode_plan(B: int):
 # two that divides H exactly (H = 7168 = 2^10 * 7, so every power of two up to
 # 1024 divides it) -- next_pow2(7168) = 8192 would waste 12.5% of every lane.
 _CU_COUNT = 256
-_SPLIT_MIN_CL = 224   # do not split H finer than this many elements per CTA
+_SPLIT_MIN_CL = 224  # do not split H finer than this many elements per CTA
 _SPLIT_MAX_NS = 16
-_SPLIT_MAX_B = 31     # scratch row pitch is 2*next_pow2(B+1) <= 64 floats
+_SPLIT_MAX_B = 31  # scratch row pitch is 2*next_pow2(B+1) <= 64 floats
 # WHERE THIS PAYS, and why the window is narrow.  An isolated probe of the
 # barrier alone (store + release ticket + `.cv` spin + `.cv` read-back, no real
 # work) costs 4.0 us per round at 256 CTAs and 1.6 us at 32, i.e. ~3-8 us for
@@ -911,8 +945,9 @@ def _split_scratch(device):
     key = (device.type, device.index)
     e = _SPLIT_SCRATCH.get(key)
     if e is None:
-        scr = torch.empty(_SPLIT_SCR_FLOATS + _CU_COUNT, dtype=torch.float32,
-                          device=device)
+        scr = torch.empty(
+            _SPLIT_SCR_FLOATS + _CU_COUNT, dtype=torch.float32, device=device
+        )
         cnt = torch.zeros(2 * _SPLIT_CNT_STRIDE, dtype=torch.int32, device=device)
         e = (scr, cnt)
         _SPLIT_SCRATCH[key] = e
@@ -930,8 +965,12 @@ def _split_plan(T: int, B: int, H: int):
     if plan is None:
         ns = 1
         if _SPLIT_MIN_B <= B <= _SPLIT_MAX_B and T <= _SPLIT_MAX_T:
-            while (ns * 2 * T <= _SPLIT_MAX_CTAS and ns * 2 <= _SPLIT_MAX_NS
-                   and H % (ns * 2) == 0 and H // (ns * 2) >= _SPLIT_MIN_CL):
+            while (
+                ns * 2 * T <= _SPLIT_MAX_CTAS
+                and ns * 2 <= _SPLIT_MAX_NS
+                and H % (ns * 2) == 0
+                and H // (ns * 2) >= _SPLIT_MIN_CL
+            ):
                 ns *= 2
         if ns == 1:
             plan = False
@@ -943,8 +982,16 @@ def _split_plan(T: int, B: int, H: int):
             if B == 1:
                 nr, pit = 2, True
             ncp = triton.next_power_of_2(B + 1)
-            plan = (ns, cl, bdc, nr, ncp, triton.next_power_of_2(ns), pit,
-                    _SPLIT_WARPS.get(bdc, 4))
+            plan = (
+                ns,
+                cl,
+                bdc,
+                nr,
+                ncp,
+                triton.next_power_of_2(ns),
+                pit,
+                _SPLIT_WARPS.get(bdc, 4),
+            )
         _SPLIT_PLAN_CACHE[key] = plan
     return plan
 
