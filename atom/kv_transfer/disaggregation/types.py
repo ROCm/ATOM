@@ -97,6 +97,14 @@ class ConnectorCompletion:
         return self.channel, self.operation_id
 
 
+# Region roles the DCP relayout dispatches on. An MLA latent region is
+# interleave-sharded across the decode ranks; a DSA indexer region is either
+# sharded the same way or replicated whole on every rank, which needs a
+# different source->destination plan (see the mooncake connector).
+MLA_KV_ROLE = "mla.kv"
+INDEX_CACHE_ROLE = "dsa.index_cache"
+
+
 @dataclass
 class KVTransferRegion:
     """One RDMA-registerable tensor region."""

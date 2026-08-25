@@ -2,11 +2,14 @@
 """Producer-side RDMA descriptors for a DCP decode node.
 
 ``_execute_block_transfer`` normally emits one whole-block descriptor per
-region per block. A DCP consumer rank owns only the round-robin shard of each
-block, so the producer has to relayout: descriptors become token runs planned
-by ``plan_sharded``, scaled by the region's per-token bytes. Getting the scale
-or the rank wrong writes real KV to the wrong slots, which decode reads back as
-plausible-looking garbage rather than a fault, so the addresses are pinned here.
+region per block. A DCP consumer rank owns only part of each block, so the
+producer has to relayout: descriptors become token runs, scaled by the region's
+per-token bytes. Which relayout depends on the region -- the MLA latent is
+interleave-sharded (``plan_sharded``), while a replicated indexer cache is held
+whole by every rank (``plan_replicated``). Getting the scale, the rank, or the
+per-region choice wrong writes real KV to the wrong slots, which decode reads
+back as plausible-looking garbage rather than a fault, so the addresses are
+pinned here.
 """
 
 import threading
@@ -18,9 +21,14 @@ from aiter_stub import stubbed_aiter
 with stubbed_aiter():
     from atom.kv_transfer.disaggregation.mooncake.mooncake_connector import (
         MooncakeConnector,
+        plan_replicated,
         plan_sharded,
     )
-    from atom.kv_transfer.disaggregation.types import ConnectorMetadata
+    from atom.kv_transfer.disaggregation.types import (
+        INDEX_CACHE_ROLE,
+        MLA_KV_ROLE,
+        ConnectorMetadata,
+    )
 
 BLOCK_SIZE = 16
 # Two regions with different per-token widths: MLA's 576-wide latent KV and the
@@ -41,6 +49,7 @@ def _connector():
     conn._block_region_consumer_indices = None
     conn.kv_caches_base_addr = list(REGION_BASES)
     conn._per_block_bytes_list = [t * BLOCK_SIZE for t in TOKEN_BYTES]
+    conn._block_region_roles = [MLA_KV_ROLE, INDEX_CACHE_ROLE]
     conn.written = []
     conn._rdma_write_with_retry = (
         lambda target, src, dst, sizes, req_id, kind: conn.written.append(
@@ -51,8 +60,9 @@ def _connector():
     return conn
 
 
-def _request(dcp_size, dcp_rank, interleave):
+def _request(dcp_size, dcp_rank, interleave, replicate_index=False):
     return {
+        "consumer_replicates_index_cache": replicate_index,
         "consumer_base_addrs": list(CONSUMER_BASES),
         "consumer_num_layers": len(CONSUMER_BASES),
         # Deliberately different from dcp_size: reading the wrong field here is
@@ -91,6 +101,7 @@ def test_a_small_layout_by_hand():
     conn._block_region_consumer_indices = None
     conn.kv_caches_base_addr = [1000]
     conn._per_block_bytes_list = [4]
+    conn._block_region_roles = [MLA_KV_ROLE]
     conn.written = []
     conn._rdma_write_with_retry = (
         lambda target, src, dst, sizes, req_id, kind: conn.written.append(
@@ -202,7 +213,7 @@ def test_without_dcp_the_descriptors_stay_whole_blocks():
         ]
 
 
-def _consumer(dcp_size, dcp_rank, interleave):
+def _consumer(dcp_size, dcp_rank, interleave, replicate_index=False):
     """A consumer with only the state the write_request path reads."""
     conn = object.__new__(MooncakeConnector)
     conn.is_producer = False
@@ -211,6 +222,7 @@ def _consumer(dcp_size, dcp_rank, interleave):
     conn.dcp_size = dcp_size
     conn.dcp_rank = dcp_rank
     conn.dcp_interleave_size = interleave
+    conn.replicate_index_cache = replicate_index
     conn.local_ip = "10.0.0.1"
     conn.rpc_port = 7000
     conn._notification_port = 7001
@@ -319,3 +331,92 @@ def test_the_producer_serves_the_request_the_consumer_actually_sent(dcp_size, dc
             )
             for s, d, n in zip(src_off, dst_off, run_len)
         ]
+
+
+@pytest.mark.parametrize("dcp_size", [2, 4])
+@pytest.mark.parametrize("interleave", [1, 4, BLOCK_SIZE])
+def test_a_replicated_index_region_goes_whole_to_every_rank(dcp_size, interleave):
+    """With a replicated index cache the two regions take different plans.
+
+    The MLA latent stays interleave-sharded, so a rank still receives only its
+    own 1/W of it. The indexer page is held whole by every rank, so it is the
+    concatenation of all W source blocks, laid out in the destination's wider
+    token space -- identical on every rank, and independent of the interleave.
+    """
+    src_block_ids = [40, 3, 17, 62, 9, 51, 28, 6, 33]
+    n_dst = -(-len(src_block_ids) // dcp_size)
+    dst_block_ids = [11, 4, 27][:n_dst]
+
+    index_per_rank = []
+    for dcp_rank in range(dcp_size):
+        conn = _connector()
+        assert conn._execute_block_transfer(
+            _request(dcp_size, dcp_rank, interleave, replicate_index=True),
+            "host:1",
+            src_block_ids,
+            dst_block_ids,
+            "req-0",
+        )
+        (batch,) = conn.written
+        # The two regions no longer contribute the same number of descriptors,
+        # so split on the sharded plan's length rather than in half.
+        tok = TOKEN_BYTES[0]
+        expected_mla = [
+            (
+                REGION_BASES[0] + int(so) * tok,
+                CONSUMER_BASES[0] + int(do) * tok,
+                int(n) * tok,
+            )
+            for so, do, n in zip(
+                *plan_sharded(
+                    src_block_ids,
+                    dst_block_ids,
+                    BLOCK_SIZE,
+                    dcp_size,
+                    dcp_rank,
+                    interleave,
+                )
+            )
+        ]
+        mla, index = batch[: len(expected_mla)], batch[len(expected_mla) :]
+        assert mla == expected_mla
+
+        tok = TOKEN_BYTES[1]
+        assert index == [
+            (
+                REGION_BASES[1] + int(so) * tok,
+                CONSUMER_BASES[1] + int(do) * tok,
+                int(n) * tok,
+            )
+            for so, do, n in zip(
+                *plan_replicated(src_block_ids, dst_block_ids, BLOCK_SIZE, dcp_size)
+            )
+        ]
+        index_per_rank.append(index)
+
+    assert all(r == index_per_rank[0] for r in index_per_rank)
+    # Every source block the destination table can hold reaches the rank
+    # exactly once -- W times the bytes a sharded index region would carry.
+    # A dst list too short to cover every source block clips the tail, which
+    # is what plan_replicated's `keep` mask is for.
+    covered = min(len(src_block_ids), len(dst_block_ids) * dcp_size)
+    assert sum(n for _, _, n in index_per_rank[0]) == (
+        covered * BLOCK_SIZE * TOKEN_BYTES[1]
+    )
+
+
+def test_a_sharded_index_region_is_unchanged_when_the_consumer_does_not_replicate():
+    """The flag is per-consumer: without it the indexer takes the sharded plan."""
+    src_block_ids = [40, 3, 17, 62]
+    dst_block_ids = [11]
+
+    conn = _connector()
+    plain = _descriptors(conn, _request(4, 2, 1), src_block_ids, dst_block_ids)
+    conn = _connector()
+    explicit_off = _descriptors(
+        conn,
+        _request(4, 2, 1, replicate_index=False),
+        src_block_ids,
+        dst_block_ids,
+    )
+    assert plain == explicit_off

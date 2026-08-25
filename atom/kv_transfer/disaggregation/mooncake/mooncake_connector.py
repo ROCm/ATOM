@@ -28,7 +28,10 @@ import zmq
 from aiter.dist.parallel_state import get_dp_group, get_tp_group
 
 from atom.config import Config
-from atom.distributed.dcp_utils import get_dcp_group
+from atom.distributed.dcp_utils import (
+    dcp_replicated_index_cache_enabled,
+    get_dcp_group,
+)
 from atom.kv_transfer.disaggregation.base import (
     KVConnectorBase,
     KVConnectorSchedulerBase,
@@ -40,6 +43,7 @@ from atom.kv_transfer.disaggregation.port_offset import (
     side_channel_port_offset as _port_offset,
 )
 from atom.kv_transfer.disaggregation.types import (
+    INDEX_CACHE_ROLE,
     ConnectorMetadata,
     KVTransferRegion,
     ReqId,
@@ -163,7 +167,7 @@ def _configure_mooncake_transport(protocol: str) -> None:
 #     S == block_size collapses to "dst block b <- src block b*W + r", one whole
 #     block per descriptor; S == 1 gives one descriptor per token.
 #
-# Replicated regions (index_cache, once the indexer stops being DCP-split)
+# Replicated regions (index_cache under ATOM_DCP_REPLICATE_INDEX_CACHE=1)
 #     Every rank holds the full ``block_size * dcp_size`` tokens of a virtual
 #     block in plain sequential order, so virtual block ``v`` is the
 #     concatenation of source blocks ``[v*W, (v+1)*W)``. Independent of both the
@@ -601,6 +605,11 @@ class MooncakeConnector(KVConnectorBase):
         self.dcp_size = config.decode_context_parallel_size
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_size > 1 else 0
         self.dcp_interleave_size = config.dcp_config.interleave_size
+        # With a replicated index cache every DCP rank holds all
+        # block_size * dcp_size tokens of a virtual block's indexer page
+        # instead of its own shard, so those regions need the replicated plan
+        # while the MLA latent regions stay sharded.
+        self.replicate_index_cache = dcp_replicated_index_cache_enabled(config)
         # Global index of this stage's first layer; consumer regions are ordered
         # over all layers, so a producer stage writes at this layer offset.
         self._start_layer = 0
@@ -718,6 +727,7 @@ class MooncakeConnector(KVConnectorBase):
         self.kv_caches: dict[str, Any] | None = None
         self.kv_caches_base_addr: list[int] = []
         self._per_block_bytes_list: list[int] = []
+        self._block_region_roles: list[str | None] = []
         self.kv_cache_shape: tuple[int, ...] | None = None
         self.block_len: int = config.kv_cache_block_size
         self.num_blocks: int = 0
@@ -892,6 +902,7 @@ class MooncakeConnector(KVConnectorBase):
 
         self.kv_caches_base_addr = [r.base_addr for r in tt.block_regions]
         self._per_block_bytes_list = [r.unit_bytes for r in tt.block_regions]
+        self._block_region_roles = [r.semantic_role for r in tt.block_regions]
 
         # Under pipeline parallelism this stage holds only layers
         # [start_layer, end_layer); its local regions map onto the consumer's
@@ -1116,6 +1127,7 @@ class MooncakeConnector(KVConnectorBase):
                 "consumer_dcp_size": self.dcp_size,
                 "consumer_dcp_rank": self.dcp_rank,
                 "consumer_dcp_interleave": self.dcp_interleave_size,
+                "consumer_replicates_index_cache": self.replicate_index_cache,
             }
 
             consumer_staging_pool_idx = -1
@@ -1566,15 +1578,18 @@ class MooncakeConnector(KVConnectorBase):
             request_data.get("consumer_num_layers"),
             self._block_region_consumer_indices,
         )
-        # Under DCP the consumer rank owns an interleaved shard of each block
-        # rather than the whole block, so whole-block descriptors no longer
-        # line up. Every block region shares the KV cache's slot mapping (the
-        # indexer cache included), so one token-unit plan covers them all, and
-        # DCP only runs on MLA, whose layout stores a token contiguously.
+        # Under DCP the consumer rank owns only part of each block, so
+        # whole-block descriptors no longer line up and the push becomes a
+        # token-unit relayout. DCP only runs on MLA, whose layout stores a
+        # token contiguously. Which relayout depends on the region: the MLA
+        # latent is interleave-sharded, while the indexer cache is either
+        # sharded the same way or -- with a replicated index cache -- held
+        # whole by every rank in a page dcp_size times as wide.
         dcp_size = max(1, request_data.get("consumer_dcp_size", 1))
-        plan = None
+        sharded_plan = None
+        replicated_plan = None
         if dcp_size > 1:
-            plan = plan_sharded(
+            sharded_plan = plan_sharded(
                 src_block_ids,
                 dst_block_ids,
                 self.block_size,
@@ -1582,17 +1597,34 @@ class MooncakeConnector(KVConnectorBase):
                 request_data["consumer_dcp_rank"],
                 request_data["consumer_dcp_interleave"],
             )
+            if request_data.get("consumer_replicates_index_cache", False):
+                replicated_plan = plan_replicated(
+                    src_block_ids,
+                    dst_block_ids,
+                    self.block_size,
+                    dcp_size,
+                )
 
         for region_idx in range(num_regions):
             src_base = self.kv_caches_base_addr[region_idx]
             dst_base = consumer_base_addrs[cmap[region_idx]]
             bpb = self._per_block_bytes_list[region_idx]
+            plan = sharded_plan
+            if (
+                replicated_plan is not None
+                and self._block_region_roles[region_idx] == INDEX_CACHE_ROLE
+            ):
+                plan = replicated_plan
             if plan is None:
                 for sb, db in zip(src_block_ids, dst_block_ids):
                     src_addrs.append(src_base + sb * bpb)
                     dst_addrs.append(dst_base + db * bpb)
                     sizes.append(bpb)
                 continue
+            # The destination page may be wider than the source's, but only in
+            # whole tokens, and the plan's offsets already count in the
+            # destination's own token space -- so both ends scale by the
+            # source's per-token width.
             token_bytes = bpb // self.block_size
             for src_off, dst_off, run_len in zip(*plan):
                 src_addrs.append(src_base + int(src_off) * token_bytes)

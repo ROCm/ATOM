@@ -52,6 +52,17 @@ ONLINE_QUANT_CONFIG='{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head
 DCP_SIZE="${DCP_SIZE:-4}"
 DCP_INTERLEAVE="${DCP_INTERLEAVE:-1}"
 
+# Keep the MLA KV sharded but give every decode rank the whole indexer page of
+# each virtual block, which lets decode skip the indexer candidate all-gather
+# and the global merge that follows it. Costs HBM: the index cache goes from
+# 1/dcp to full on every rank, so the KV+index footprint per token rises about
+# a fifth and the block pool shrinks to match.
+#
+# DECODE ONLY. The startup check reads the bare environment variable rather
+# than the dcp>1-gated helper, so a prefill rank that saw this would abort with
+# "decode context parallel size must be > 1". Never export it for both nodes.
+REPLICATE_INDEX_CACHE="${REPLICATE_INDEX_CACHE:-1}"
+
 # Off by default: DCP relayout is the thing under test, and MTP adds a draft KV
 # layer plus q>1 verify on top of it.
 ENABLE_MTP="${ENABLE_MTP:-0}"
@@ -152,6 +163,7 @@ ATOM_LOG_PREFIX_CACHE_PER_REQ=1 \
 ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB="$SPARSE_INDEXER_LOGITS_BUDGET_MB" \
 AITER_QUICK_REDUCE_QUANTIZATION=INT4 \
 AITER_USE_FLYDSL_MOE_SORTING=1 \
+ATOM_DCP_REPLICATE_INDEX_CACHE="$REPLICATE_INDEX_CACHE" \
 HIP_VISIBLE_DEVICES=4,5,6,7 \
 nohup python -m atom.entrypoints.openai_server \
   --model "$MODEL" --server-port "$DECODE_PORT" --trust-remote-code \
@@ -207,6 +219,7 @@ echo "  mesh    log: /tmp/mesh_dcp.log"
 echo "  mesh API:    http://127.0.0.1:$MESH_PORT/v1/chat/completions"
 echo "  DCP:         tp4 x dcp${DCP_SIZE}, interleave_size=${DCP_INTERLEAVE}, max-num-seqs=${DECODE_MAX_SEQS} (node-wide)"
 echo "  LMCache:     CPU=${LMCACHE_CPU_SIZE}GB  chunk=${LMCACHE_CHUNK}"
+echo "  Index cache: $([ "$REPLICATE_INDEX_CACHE" = "1" ] && echo "replicated on every DCP rank" || echo "sharded across DCP ranks")"
 if [ "$ENABLE_MTP" -eq 1 ]; then
   echo "  MTP accept:  ${SPEC_ACCEPT_RATE}"
 else
