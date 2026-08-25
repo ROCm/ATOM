@@ -13,6 +13,7 @@ from atom.config import (
     DCPConfig,
     DSparkConfig,
     EPLBConfig,
+    ParallelConfig,
     SpeculativeConfig,
 )
 from atom.model_engine.engine_core_mgr import DP_LB_DEFAULT, DP_LB_STRATEGIES
@@ -41,6 +42,11 @@ class EngineArgs:
     pipeline_parallel_size: int = 1
     prefill_context_parallel_size: int = 1
     data_parallel_size: int = 1
+    data_parallel_size_local: int | None = None
+    data_parallel_rank: int = 0
+    data_parallel_master_ip: str = "127.0.0.1"
+    data_parallel_master_port: int = 29500
+    data_parallel_base_port: int | None = None
     enforce_eager: bool = False
     enable_prefix_caching: bool = True
     port: int = 8006
@@ -134,6 +140,49 @@ class EngineArgs:
             type=int,
             default=1,
             help="Data parallel size.",
+        )
+        parser.add_argument(
+            "--data-parallel-size-local",
+            type=int,
+            default=None,
+            help=(
+                "Number of data-parallel ranks to run on THIS node. Defaults "
+                "to --data-parallel-size (single-node). Set it lower to give "
+                "this node one slice of a multi-node run."
+            ),
+        )
+        parser.add_argument(
+            "--data-parallel-rank",
+            type=int,
+            default=0,
+            help=(
+                "First GLOBAL data-parallel rank owned by this node. Node 0 "
+                "uses 0; the second node of a 2x4 run uses 4."
+            ),
+        )
+        parser.add_argument(
+            "--data-parallel-master-ip",
+            type=str,
+            default="127.0.0.1",
+            help="IP of the coordinator node (global DP rank 0).",
+        )
+        parser.add_argument(
+            "--data-parallel-master-port",
+            type=int,
+            default=29500,
+            help=(
+                "Rendezvous port for the DP process group. Engine sockets are "
+                "derived from it (base = port + 100, 3 ports per DP rank)."
+            ),
+        )
+        parser.add_argument(
+            "--data-parallel-base-port",
+            type=int,
+            default=None,
+            help=(
+                "Rendezvous port for model-runner distributed init. Set "
+                "explicitly for multi-node launches."
+            ),
         )
         parser.add_argument(
             "--decode-context-parallel-size",
@@ -491,14 +540,24 @@ class EngineArgs:
             type=json.loads,
             default=None,
             help=(
-                "DCP (Decode Context Parallel) config as a JSON dict, parsed "
-                "straight into a DCPConfig object (no per-field flags). "
-                "Supported keys:\n"
-                '  - "interleave_size": int, KV-cache interleave granularity S: '
-                "token i is stored on DCP rank (i // S) %% W. Default 1 = "
-                "token-level round-robin.\n"
-                "Example:\n"
-                """  '{"interleave_size": 16}'"""
+                "DCP (Decode Context Parallel) knobs as one JSON dict, parsed "
+                "straight into DCPConfig (no per-field flags); unknown keys "
+                "raise. Details and constraints: "
+                "docs/context_parallel_guide.md.\n"
+                '  "interleave_size" (int, 1): KV interleave granularity S -- '
+                "token i lives on rank (i // S) %% W; 1 = round-robin.\n"
+                '  "enable_query_replication" (bool, TRUE): drop the per-step '
+                "decode AllGather Q by replicating q_proj at load time.\n"
+                '  "enable_project_before_merge" (bool, TRUE): project V '
+                "before the output merge, shrinking it by "
+                "kv_lora_rank/v_head_dim.\n"
+                "  \"comm_backend\" (str, a2a): 'a2a' = one all-to-all; "
+                "'ag_rs' = AllGather LSE + ReduceScatter output.\n"
+                "The last three default to the NEW behaviour (and the middle "
+                "two auto-disable where unsupported), so a control run must "
+                "pass the old values explicitly -- passing nothing re-runs the "
+                "new path.\n"
+                'Example: \'{"interleave_size": 16, "enable_query_replication": true}\''
             ),
         )
         eplb_group = parser.add_argument_group("EPLB options")
@@ -616,6 +675,20 @@ class EngineArgs:
         # --dcp-config (JSON dict) → DCPConfig object, passed through as
         # Config.dcp_config.
         kwargs["dcp_config"] = DCPConfig.from_dict(kwargs.pop("dcp_config"))
+
+        # DP topology -> ParallelConfig. `data_parallel_size` stays in kwargs
+        # too: LLMEngine still reads the loose kwarg on the legacy path.
+        parallel_config_kwargs = {
+            "data_parallel_size": kwargs["data_parallel_size"],
+            "data_parallel_size_local": kwargs.pop("data_parallel_size_local"),
+            "data_parallel_rank": kwargs.pop("data_parallel_rank"),
+            "data_parallel_master_ip": kwargs.pop("data_parallel_master_ip"),
+            "data_parallel_master_port": kwargs.pop("data_parallel_master_port"),
+        }
+        base_port = kwargs.pop("data_parallel_base_port")
+        if base_port is not None:
+            parallel_config_kwargs["data_parallel_base_port"] = base_port
+        kwargs["parallel_config"] = ParallelConfig(**parallel_config_kwargs)
 
         logger.info(f"Engine kwargs: {kwargs}")
 

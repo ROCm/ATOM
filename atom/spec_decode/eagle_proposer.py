@@ -209,7 +209,9 @@ class EagleProposer(Drafter):
         # Anchor row per sequence = `cu_seqlens_q[1:] - 1`, the rule
         # `propose_draft_token_ids` uses on a pure prefill step.
         last_token_indices = self.prepare_inputs(bs, 1)
-        anchor_ids = self.anchors_to_gpu(anchors)
+        anchor_ids = forward_context.context.draft_anchor_overrides
+        assert anchor_ids is not None
+        anchor_ids = anchor_ids[:bs]
 
         # `positions` is the padded forward buffer; the target's own output row
         # count is this batch's real token count, and all three inputs below
