@@ -75,8 +75,13 @@ class TestMTPMaxTokens:
         assert emitted.output_tokens == [10, 11]
         assert emitted.finish_reason == "max_tokens"
 
-    @pytest.mark.parametrize("max_tokens", [0, -1])
-    def test_nonpositive_cap_emits_empty_terminal_output(self, seq_factory, max_tokens):
+    @pytest.mark.parametrize(
+        ("max_tokens", "injected_t0", "expected_output"),
+        [(0, None, []), (-1, None, []), (0, 99, [99])],
+    )
+    def test_nonpositive_cap_emits_terminal_output(
+        self, seq_factory, max_tokens, injected_t0, expected_output
+    ):
         sched = self._scheduler()
         seq = self._prefill(
             sched,
@@ -85,6 +90,7 @@ class TestMTPMaxTokens:
                 sampling_params=SamplingParams(max_tokens=max_tokens, ignore_eos=True),
             ),
         )
+        seq._injected_t0 = injected_t0
         stream_queue = mock.Mock()
         finished = self._accept_all(sched, seq, [10, 11, 12, 13], stream_queue)
 
@@ -92,7 +98,7 @@ class TestMTPMaxTokens:
         assert finished[0].leave_reason == "max_tokens"
         assert finished[0].num_completion_tokens == 0
         emitted = stream_queue.put_nowait.call_args.args[0][0][1]
-        assert emitted.output_tokens == []
+        assert emitted.output_tokens == expected_output
         assert emitted.finished is True
         assert emitted.finish_reason == "max_tokens"
 
