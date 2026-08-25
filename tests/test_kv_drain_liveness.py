@@ -141,7 +141,7 @@ def test_connector_without_the_hook_is_not_pending():
 
 def test_held_send_keeps_the_head_alive():
     proc = _head(2)
-    proc._held_sending = {"a": "a"}
+    proc._held_sending = {"a": ("a", {"a"})}
     assert proc.has_pending_kv_work() is True
 
 
@@ -170,7 +170,7 @@ def test_idle_drain_releases_the_last_held_send():
     proc = _head(2, messages=[[(1, KVConnectorOutput(finished_saving={"a"}))]])
     proc._pp_kv_aggregator = PPKVAggregator(2)
     proc._pp_kv_aggregator.ingest(0, KVConnectorOutput(finished_saving={"a"}))
-    proc._held_sending = {"a": "a"}
+    proc._held_sending = {"a": ("a", {"a"})}
 
     assert proc.has_pending_kv_work() is True
     proc._advance_idle_kv_transfer()
