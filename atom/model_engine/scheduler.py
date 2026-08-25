@@ -1835,6 +1835,14 @@ class Scheduler:
         )
         return True
 
+    def abandon_chunk_latency_calibration(self) -> None:
+        """End the calibration sweep without a model, leaving chunking fixed."""
+        self._calibrating = False
+        logger.warning(
+            "Dynamic chunking calibration gave up; chunking stays fixed at %d tokens",
+            self.max_num_batched_tokens,
+        )
+
     def _dynamic_chunk_limit(
         self, history_len: int, *, already_prefilling: bool = False
     ) -> int | None:

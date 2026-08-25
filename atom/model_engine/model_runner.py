@@ -41,6 +41,9 @@ from atom.distributed.pp_comm import (
 from atom.distributed.simulated_tp import apply_simulated_tp, reject_simulated_tp
 from atom.kv_transfer.disaggregation import KVConnectorOutput
 from atom.model_engine.dynamic_chunking import (
+    MAX_CALIBRATION_FIT_FAILURES,
+    MIN_PROFILE_SAMPLES,
+    PROFILE_SWEEP_RATIO,
     ChunkLatencyCalibrator,
     fit_chunk_overhead,
 )
@@ -1273,12 +1276,12 @@ class ModelRunner:
     def _dynamic_chunking_profile_chunks(
         self, alignment: int, max_chunk: int
     ) -> list[int]:
-        """Return aligned startup profiling sizes from max_chunk to max_chunk/8."""
+        """Return aligned startup profiling sizes spanning the sweep ratio."""
 
         def align(value: int) -> int:
             return max(alignment, int(value) // alignment * alignment)
 
-        chunk_floor = max(alignment, max_chunk // 8)
+        chunk_floor = max(alignment, max_chunk // PROFILE_SWEEP_RATIO)
         return list(
             dict.fromkeys(
                 align(chunk)
@@ -1305,13 +1308,17 @@ class ModelRunner:
             self.config.num_kvcache_blocks * self.block_size,
         )
         max_chunk -= max_chunk % alignment
-        if max_chunk < 8 * alignment:
-            raise ValueError(
-                "Dynamic chunking needs room for at least 8 aligned profiling "
-                f"lengths, got max_chunk={max_chunk}, alignment={alignment}"
-            )
-
         chunk_grid = self._dynamic_chunking_profile_chunks(alignment, max_chunk)
+        if len(chunk_grid) < MIN_PROFILE_SAMPLES:
+            # Report it like a failed fit rather than raising: too little room to
+            # profile is a reason to serve with fixed chunking, not to fail startup.
+            reason = (
+                f"Dynamic chunking needs at least {MIN_PROFILE_SAMPLES} aligned "
+                f"profiling lengths, got {len(chunk_grid)} from "
+                f"max_chunk={max_chunk}, alignment={alignment}"
+            )
+            logger.warning("%s: %s", self.label, reason)
+            return {"error": reason} if self.rank == 0 else None
 
         # Random tokens avoid an unrealistic single-expert MoE profile.
         rng = np.random.default_rng(0)
@@ -1409,7 +1416,18 @@ class ModelRunner:
             predictor = calibrator.maybe_fit()
         except ValueError as exc:
             logger.warning("%s: dynamic chunking calibration: %s", self.label, exc)
-            return {"coefficients": None}
+            if not calibrator.gave_up:
+                return {"coefficients": None}
+            logger.warning(
+                "%s: giving up on dynamic chunking calibration after %d rejected "
+                "fits over %d shapes; chunking stays fixed",
+                self.label,
+                MAX_CALIBRATION_FIT_FAILURES,
+                calibrator.num_shapes,
+            )
+            # Stop timing prefills: more of the same samples cannot pass the gates.
+            self._chunk_calibrator = None
+            return {"coefficients": None, "gave_up": True}
         if predictor is None:
             logger.info(
                 "%s: dynamic chunking still calibrating: %d timed prefills, "

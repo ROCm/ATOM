@@ -520,6 +520,11 @@ class EngineCore:
         fit = self.runner_mgr.call_func("take_dynamic_chunking_fit", wait_out=True)
         coefficients = fit.get("coefficients") if fit else None
         if coefficients is None:
+            if fit and fit.get("gave_up"):
+                # The workers have stopped timing, so end the sweep too rather
+                # than size every other request for a model that never lands.
+                self._dynamic_chunking_enabled = False
+                self.scheduler.abandon_chunk_latency_calibration()
             return
         # The workers stop timing prefills once they have answered with a fit, so
         # there is never a second one to collect - whether the scheduler takes

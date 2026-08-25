@@ -681,6 +681,18 @@ def test_the_calibration_sweep_ends_with_a_rejected_model():
     assert sched._prefill_chunk_for_budget(10000, 32768, 0, history_len=32768) == 10000
 
 
+def test_the_calibration_sweep_ends_when_calibration_gives_up():
+    # Calibration that never clears its quality gates must not sweep forever, or
+    # every other request stays at the sweep size for the life of the process.
+    sched = _calibrating_sched(max_num_batched_tokens=32768)
+
+    sched.abandon_chunk_latency_calibration()
+
+    assert sched.dynamic_chunk_predictor is None
+    assert sched._dynamic_chunk_limit(32768) is None
+    assert sched._prefill_chunk_for_budget(10000, 32768, 0, history_len=0) == 10000
+
+
 def test_a_prefix_flat_calibration_is_not_installed():
     # What startup profiling used to produce: a model whose chunk cost barely
     # grows with the prefix. Acting on it only splits requests into more chunks.

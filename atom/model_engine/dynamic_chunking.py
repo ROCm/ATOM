@@ -25,6 +25,10 @@ MAX_PREFIX_OVERHEAD_FRACTION = 0.2
 
 MIN_PROFILE_SAMPLES = 8
 
+# Span of the startup profiling sweep: it runs from the token budget down to
+# this fraction of it.
+PROFILE_SWEEP_RATIO = 8
+
 # Minimum sample diversity required for an identifiable runtime fit.
 MIN_CALIBRATION_PREFIXES = 3
 MIN_CALIBRATION_CHUNK_SIZES = 2
@@ -40,6 +44,12 @@ MAX_CALIBRATION_TIMINGS_PER_SHAPE = 4
 MAX_CALIBRATION_RESIDUAL_FRACTION = 0.25
 MAX_CALIBRATION_DESIGN_CONDITION = 100.0
 MAX_CALIBRATION_PREDICTION_STDERR_FRACTION = 0.05
+
+# Rejected fits tolerated before calibration gives up. Timing noise on a busy
+# server can keep every fit outside the gates, and retrying for the life of the
+# process would leave the scheduler's sweep sizing chunks for a model that is
+# never going to arrive.
+MAX_CALIBRATION_FIT_FAILURES = 8
 
 # Ignore models that shrink the reference chunk by less than this fraction.
 MIN_USEFUL_SHRINK_FRACTION = 0.05
@@ -136,6 +146,7 @@ class ChunkLatencyCalibrator:
     constant_coeff: float
     _timings: dict[tuple[int, int], deque[float]] = field(default_factory=dict)
     _since_fit: int = 0
+    _failed_fits: int = 0
 
     def add(self, prefix_len: int, chunk_size: int, elapsed_ms: float) -> None:
         """Record one real prefill forward."""
@@ -167,6 +178,15 @@ class ChunkLatencyCalibrator:
     def num_chunk_sizes(self) -> int:
         return len({chunk for chunk, _ in self._timings})
 
+    @property
+    def num_failed_fits(self) -> int:
+        return self._failed_fits
+
+    @property
+    def gave_up(self) -> bool:
+        """Whether this workload has rejected enough fits to stop trying."""
+        return self._failed_fits >= MAX_CALIBRATION_FIT_FAILURES
+
     def _is_due(self) -> bool:
         if len(self._timings) < MIN_CALIBRATION_SHAPES:
             return False
@@ -182,12 +202,18 @@ class ChunkLatencyCalibrator:
         """Fit if the samples can support one, else ``None``.
 
         Raises ``ValueError`` when the samples are present but unusable, so the
-        caller can log why calibration is not converging.
+        caller can log why calibration is not converging. Rejections are counted
+        against ``MAX_CALIBRATION_FIT_FAILURES``, after which ``gave_up`` tells
+        the caller to stop sampling and leave chunking fixed.
         """
         if not self._is_due():
             return None
         self._since_fit = 0
-        return self.fit()
+        try:
+            return self.fit()
+        except ValueError:
+            self._failed_fits += 1
+            raise
 
     def _fit_terms(
         self, chunks: np.ndarray, prefixes: np.ndarray, latencies: np.ndarray
