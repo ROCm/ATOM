@@ -254,6 +254,14 @@ class tokenIDProcessor:
             cpu_tensor = gpu_tensor.to("cpu", non_blocking=True)
             event = torch.cuda.Event()
             event.record(self.async_copy_stream)
+        # No reverse wait here. `gpu_tensor` is a draft pass's captured output,
+        # so its address is fixed and the NEXT replay rewrites it -- but that
+        # replay sits behind a whole target forward on the default stream, while
+        # this copy is a few KB. Ordering the default stream against it would
+        # stall it for the copy every step, which is the overlap the side stream
+        # exists to buy. If a future change ever puts a replay closer than one
+        # forward away, the wait belongs immediately before THAT replay, not
+        # here.
         self.draft_token_ids_cpu.append((cpu_tensor, event))
 
     def recv_async_output_draft(self) -> np.ndarray:
@@ -3412,14 +3420,14 @@ class ModelRunner:
         # Runs after EVERY target forward -- `postprocess` (hence propose) is
         # skipped for a middle chunk. Not on the aligning step: that pass is one
         # the peers never mirror.
-        run_context_pass = (
+        run_compute_draft_kv = (
             drafter is not None
             and not pp_non_last
             and not batch.is_dummy_run
-            and not (will_align_draft and drafter.precompute_duplicates_propose)
+            and not (will_align_draft and drafter.draft_kv_duplicates_propose)
         )
-        if run_context_pass:
-            drafter.precompute_context_kv(
+        if run_compute_draft_kv:
+            drafter.compute_draft_kv(
                 get_forward_context().context.positions,
                 hidden_states,
                 batch.next_token_ids,
@@ -4296,6 +4304,9 @@ class ModelRunner:
                     if prof is not None:
                         prof.step()
                         self._capture_trace_tag = None
+            # Inside the `with`: graph_capture() arms the custom all-reduce for
+            # capture and pause_gc() keeps the collector from aborting one.
+            self._warmup_draft_graphs(full_q_len, capture_ctx.stream)
         self.graph_bs.sort(reverse=False)
 
         # PIECEWISE: sorted 1D num_tokens buckets for run_model's round_up_1d(Σ)
@@ -4348,6 +4359,56 @@ class ModelRunner:
             )
 
         return time.time() - start_time, self.graph_bs, _pool_bytes
+
+    @torch.inference_mode()
+    def _warmup_draft_graphs(self, max_q_len: int, stream) -> None:
+        """Run every declared draft pass once per `graph_bs`, paying its JIT here.
+
+        aiter's flydsl hgemm builds a kernel per tile config, in-process, so a
+        batch first seen mid-serve stalls that step and every restart pays
+        again: `hipModuleLoadData` per rank went 6 -> 0 on the 16k/20/50c
+        reproducer, with this and the drafter's rounding.
+
+        Warming `self.graph_bs` is the point -- the drafter rounds up to that
+        same list, so warmed and reachable are one set by construction rather
+        than two that drift.
+
+        Call INSIDE ``graph_capture()`` (it arms the custom all-reduce for the
+        optional capture) and after ``allocate_kv_cache``, so the builder's
+        context has real ring slots and ``is_dummy_run=False``.
+        """
+        drafter = getattr(self, "drafter", None)  # unset when spec decode is off
+        if drafter is None or not drafter.draft_graphs:
+            return
+        build_capture = self.attn_metadata_builder.build_for_cudagraph_capture
+        # Only DeepSeek-V4's builder takes `max_q_len`; the rest raise TypeError
+        # on the keyword. Probed the same way the main capture loop does.
+        supports_dynamic_q_len = (
+            "max_q_len" in inspect.signature(build_capture).parameters
+        )
+        start = time.time()
+        for pass_ in drafter.draft_graphs:
+            for bs in self.graph_bs:
+                attn_metadata, context = (
+                    build_capture(bs=bs, max_q_len=max_q_len)
+                    if supports_dynamic_q_len
+                    else build_capture(bs=bs)
+                )
+                set_forward_context(
+                    attn_metadata=attn_metadata,
+                    atom_config=self.config,
+                    context=context,
+                    num_tokens=bs * max_q_len,
+                )
+                self.graph_pool = pass_.warmup(bs, pool=self.graph_pool, stream=stream)
+        torch.cuda.synchronize()
+        if self.rank == 0:
+            logger.info(
+                "Draft passes warmed at %s in %.2fs: %s",
+                list(self.graph_bs),
+                time.time() - start,
+                [g.name for g in drafter.draft_graphs],
+            )
 
     @torch.inference_mode()
     def _maybe_calibrate_dspark_sps(self, max_q_len: int, n_iters: int = 20) -> None:

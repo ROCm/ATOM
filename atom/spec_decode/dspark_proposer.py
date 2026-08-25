@@ -5,6 +5,7 @@ from torch import nn
 from torch.profiler import record_function
 
 from atom.distributed.dcp_utils import get_dcp_rank, get_dcp_world_size
+from atom.spec_decode.draft_graph import DraftGraph, StagedInput
 from atom.spec_decode.drafter import AuxCaptureSpec, Drafter
 from atom.spec_decode.dspark_verify import VerifyScheduler
 from atom.utils import envs
@@ -44,6 +45,140 @@ class DSparkProposer(Drafter):
         self.dcp_rank = get_dcp_rank()
         if self._with_draft:
             self._init_draft_block_buffers()
+
+    def _declare_draft_graphs(self):
+        """The block pass.
+
+        ``block`` is the only pure pass either drafter has: it gathers the
+        rolling window and writes nothing back. The KV write is a separate call
+        (``compute_draft_kv``), which is exactly why the block can be padded
+        at all -- purity is a property of what a pass does, not of DSpark.
+
+        That KV write is per-token, not per-sequence, and is NOT declared:
+        warming it needs a prefill-shaped synthetic forward context, which the
+        capture builder cannot produce. Declaring it with a stub forward would
+        create a pass that claims to be warmable and is not.
+
+        The separate-draft flavor declares nothing for the same reason: it drafts
+        through ``_propose_with_draft``, and the warmup/forward/epilogue below
+        reach for ``model.window_size`` and ``model.model.head_and_sample``,
+        which its checkpoint does not carry. Declining to pad is not enough --
+        warmup runs before that gate.
+
+        No ``mtp_k`` floor, unlike eagle's: the block drafts its whole width in
+        ONE pass, so there is no step 1+ to be absent at ``mtp_k == 1``.
+        """
+        self.block = None
+        if self._with_draft:
+            return ()
+        self.block = DraftGraph(
+            forward=self._block_backbone,
+            epilogue=self._block_head,
+            capture_epilogue=True,
+            inputs={
+                "anchor_ids": StagedInput(dtype=torch.int32),
+                "anchor_positions": StagedInput(dtype=torch.int64),
+            },
+            pads=self._block_may_pad,
+            warmup_inputs=self._block_warmup_inputs,
+        )
+        return (self.block,)
+
+    def _block_warmup_inputs(self, pad_bs, *, anchor_positions, **_):
+        """A plausible warmup batch: anchors past the window, real ring slots.
+
+        Anchors at position ``window`` leave every window slot valid, which is
+        what a steady-state decode draws. Warming at position 0 would mask all
+        but the last slot and compile a shape serving never asks for.
+        """
+        fc = get_forward_context()
+        assert not fc.context.is_dummy_run, (
+            "warmup needs a real forward context; a dummy one bakes the "
+            "all-zero rolling window and only shows up as lost acceptance"
+        )
+        anchor_positions.fill_(int(self.model.window_size))
+
+    @property
+    def _block_may_pad(self) -> bool:
+        """Whether the block may take fabricated rows.
+
+        Off under EPLB: pad rows carry fabricated tokens through the draft's full
+        MoE, and ``select_experts_with_record`` counts every row it routes into
+        the expert-load histogram that drives online expert migration.
+        """
+        return not self.config.eplb_enable
+
+    def _block_head(self, out, pad_bs, *, anchor_ids, **_):
+        """The block's epilogue: LM head, then the sequential Markov sampler.
+
+        Nothing here resists capture -- the sampler is a fixed-trip loop over
+        the draft width, and the LM head's one data-dependent step (its
+        prefill last-token slice) is already suppressed for a draft. Under TP
+        it does all_gather the vocab shard; ``capture_epilogue`` says whether
+        that one collective is captured with the rest.
+
+        It must be WARMED regardless: the head has its own per-shape flydsl
+        builder, and leaving it out of the warm is exactly how
+        `hipModuleLoadData` went 0 -> 4 on the reproducer once.
+        """
+        normed, hc_hidden = out
+        return self.model.model.head_and_sample(normed, hc_hidden, anchor_ids)
+
+    def _block_backbone(self, pad_bs, *, anchor_ids, anchor_positions):
+        """The block's forward: the parallel backbone over the whole draft width.
+
+        Nothing of the target's metadata is installed. The ring slots the model
+        reads off the forward context are already this length: `prepare_decode`
+        publishes them at the padded batch, which is the batch this runs at.
+        """
+        num_draft = min(self.mtp_k, int(self.model.window_size))
+        return self.model.model(anchor_ids, anchor_positions, num_draft)
+
+    def _block_graph_bs(self, bs: int, context) -> int:
+        """The batch the block runs at, or ``bs`` when nothing pins a wider one.
+
+        On the target's cudagraph path it must come from
+        ``context.graph_bs``, which the target set to the DP-unified
+        ``moe_pad_bs`` precisely because MoE's ``pad_for_all_gather`` pads
+        hidden_states to it before a cross-DP all_gather (model_runner.py:2611).
+        ``runner.graph_bs`` is the unnegotiated list, and is ``[0]`` until
+        capture runs. Off that path, see ``_self_chosen_graph_bs``.
+        """
+        mode = context.forward_mode
+        if context.is_dummy_run:
+            return bs  # no bound ring slots to pad against
+        if mode is None or not mode.use_cudagraph:
+            return self._self_chosen_graph_bs(bs)
+        graph_bs = int(context.graph_bs)
+        if graph_bs <= bs:
+            return bs
+        # A SEQUENCE count only on the rectangular decode path: under PIECEWISE
+        # + ragged, `_dspark_ragged_moe_graph_bs` swaps in a token-derived count
+        # (flat_bucket // q) that need not be a captured size. Round through the
+        # base so the answer is a warmed batch or nothing -- padding to an
+        # unwarmed shape is the stall this exists to fix.
+        return graph_bs if self.block.graph_bs_for(bs) == graph_bs else bs
+
+    def _self_chosen_graph_bs(self, bs: int) -> int:
+        """A batch the drafter picks itself, when the target negotiated none.
+
+        A prefill step's ``graph_bs`` is a token count, so there is nothing to
+        pad a SEQUENCE batch to -- and that used to end the matter, leaving the
+        first draft after every prefill eager. It need not: the block's own
+        capture at ``graph_bs_for(bs)`` is self-evidencing, since a graph exists
+        at that batch only if the startup sweep both warmed and captured it.
+        With no capture this returns ``bs`` and nothing changes.
+
+        DP needs no special case. ``_refresh_dp_metadata`` forces
+        ``dp_uniform_decode = False`` for every draft, which routes MoE to the
+        variable-length ``all_gatherv`` (moe.py ``dp_eager_mode``), so ranks
+        already run different widths here; padding changes the numbers, not the
+        structure. There was a ``dp > 1`` bail-out, and it was removed: nothing
+        was ever measured to need it, and it silently kept the whole prefill-side
+        win off the configuration that most wants it.
+        """
+        pad_bs = self.block.graph_bs_for(bs)
+        return pad_bs if self.block.is_captured(pad_bs) else bs
 
     def _init_draft_block_buffers(self) -> None:
         """Preallocate the block-pass metadata the separate-draft path rebinds."""
@@ -358,7 +493,7 @@ class DSparkProposer(Drafter):
         # Plain residual stream (no special bookkeeping).
         return output
 
-    def precompute_context_kv(
+    def compute_draft_kv(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
@@ -391,7 +526,7 @@ class DSparkProposer(Drafter):
         forward_context = get_forward_context()
         bs = forward_context.context.batch_size
         main_hidden_all = torch.cat(aux_hidden_states, dim=-1)
-        with record_function(f"dspark_ctx_kv[bs={bs} tok={main_hidden_all.shape[0]}]"):
+        with record_function(f"draft_kv[bs={bs} tok={main_hidden_all.shape[0]}]"):
             self.model.write_context_kv(main_hidden_all, positions)
 
     def propose(
@@ -434,7 +569,7 @@ class DSparkProposer(Drafter):
                 "dspark_target_layer_ids; none were captured."
             )
         # aux is validated here (drafting requires it) but the target context is
-        # already in the draft's KV: `precompute_context_kv` absorbed it right
+        # already in the draft's KV: `compute_draft_kv` absorbed it right
         # after the target forward, uniformly for every flavor. propose() only
         # needs the anchor to seed the block.
 
@@ -453,7 +588,7 @@ class DSparkProposer(Drafter):
                 anchor_positions,
             )
 
-        # The rolling target-KV window is filled by `precompute_context_kv`,
+        # The rolling target-KV window is filled by `compute_draft_kv`,
         # which the runner calls after every target forward.
         #
         # Draft width = the verify horizon mtp_k (num_speculative_tokens). This
@@ -467,14 +602,30 @@ class DSparkProposer(Drafter):
         # confidence calibration are not comparable across K.
         window = int(self.model.window_size)
         num_draft = min(self.mtp_k, window)
-        self._refresh_dp_metadata(forward_context, bs * num_draft)
-        with record_function(f"dspark[bs={bs} T={num_draft}]"):
-            draft_token_ids, confidence = self.model.forward_spec(
-                anchor_ids,
-                anchor_positions,
-                num_draft=num_draft,
-            )
-        draft_token_ids = draft_token_ids[:, : self.mtp_k]
+        # forward_spec sizes the block off anchor_ids. context.batch_size counts
+        # only one half of a mixed prefill+decode step, so it is not that B.
+        real_bs = anchor_ids.shape[0]
+        pad_bs = self._block_graph_bs(real_bs, context)
+        # The target already replayed a padded graph, but none of that padding
+        # reaches here: its pad rows end at the graph boundary. `anchor_ids`
+        # comes from the sampler, which runs after the graph and only over real
+        # rows. So the block pads its own inputs. The target's `state_slot_out`
+        # needs no help: `prepare_decode` publishes it at the padded batch.
+        staged = self.block.stage(
+            pad_bs,
+            {"anchor_ids": anchor_ids, "anchor_positions": anchor_positions},
+        )
+        self._refresh_dp_metadata(forward_context, pad_bs * num_draft)
+        replayed = " graph" if self.block.is_captured(pad_bs) else ""
+        with record_function(
+            f"propose_dspark[bs={real_bs}/{pad_bs} T={num_draft}{replayed}]"
+        ):
+            draft_token_ids, confidence = self.block.run(pad_bs, **staged)
+        draft_token_ids = draft_token_ids[:real_bs, : self.mtp_k]
+        if confidence is not None:
+            # compute_ell takes its batch size from confidence.shape and zips the
+            # resulting ell against batch.req_ids by position.
+            confidence = confidence[:real_bs]
         # Confidence-scheduled verification. The hardware-aware prefix scheduler
         # consumes the confidence head to pick a per-request verify length
         # ell_r. We compute ell here and stash it; the actual variable-length
@@ -482,7 +633,7 @@ class DSparkProposer(Drafter):
         # request's scheduled spec tokens to ell_r, which frees batch capacity
         # instead of the no-op in-block masking of Level A.
         if self.verify_scheduler is not None and confidence is not None:
-            with record_function(f"dspark_sched[bs={bs}]"):
+            with record_function(f"dspark_sched[bs={real_bs}]"):
                 self.verify_scheduler.set_last_ell(
                     self.verify_scheduler.compute_ell(confidence[:, : self.mtp_k])
                 )
@@ -503,7 +654,7 @@ class DSparkProposer(Drafter):
         """Kimi-K3 DSpark: one non-causal block pass over the paged latent cache.
 
         The target context is already in the draft's latent cache (absorbed by
-        `precompute_context_kv`); this only builds the draft block's own metadata
+        `compute_draft_kv`); this only builds the draft block's own metadata
         (addressed by slot mapping) and runs the block. Same shape as the V4
         block pass -- T queries per request against a paged KV cache.
         """
@@ -674,7 +825,7 @@ class DSparkProposer(Drafter):
         forward_context.attn_metadata.dtype_q = dtype_q
 
         # ---- 3. Block pass + Markov sampling ---------------------------------
-        with record_function(f"dspark[bs={bs} T={T}]"):
+        with record_function(f"propose_dspark[bs={bs} T={T}]"):
             draft_token_ids, confidence = self.model.forward_spec(
                 anchor_ids,
                 block_positions.view(-1),

@@ -11,6 +11,7 @@ from torch import nn
 
 from atom.config import Config
 from atom.model_loader.loader import load_model
+from atom.spec_decode.draft_graph import DraftGraph
 from atom.utils import CpuGpuBuffer, resolve_obj_by_qualname
 from atom.utils.forward_context import (
     DPMetadata,
@@ -171,6 +172,24 @@ class Drafter(abc.ABC):
         self.target_logits_indices = CpuGpuBuffer(max_bs * self.mtp_k, **i64_kwargs)
         self.bonus_logits_indices = CpuGpuBuffer(max_bs, **i64_kwargs)
 
+        self._build_draft_graphs()
+
+    # ---- draft passes ----
+    def _declare_draft_graphs(self) -> tuple[DraftGraph, ...]:
+        """Declare this drafter's warmable forwards. Opt-in.
+
+        A flavor whose model cannot answer the warmup/forward/epilogue must
+        declare nothing rather than merely decline to pad: warmup runs before
+        the pad and capture gates.
+        """
+        return ()
+
+    def _build_draft_graphs(self) -> None:
+        self.draft_graphs: tuple[DraftGraph, ...] = tuple(
+            pass_.bind(self.config, self.device, self.runner)
+            for pass_ in self._declare_draft_graphs()
+        )
+
     # ---- flavor hooks ----
     @abc.abstractmethod
     def _resolve_mtp_k(self) -> int:
@@ -226,8 +245,8 @@ class Drafter(abc.ABC):
         return None
 
     @property
-    def precompute_duplicates_propose(self) -> bool:
-        """Is `precompute_context_kv` the pass propose's first draft step redoes?
+    def draft_kv_duplicates_propose(self) -> bool:
+        """Is `compute_draft_kv` the pass propose's first draft step redoes?
 
         True (EAGLE) means the two must never both run: the second is a
         collective the peers on `dummy_execution` do not mirror. False (DSpark)
@@ -328,7 +347,7 @@ class Drafter(abc.ABC):
         buf.np[:n] = anchors
         return buf.copy_to_gpu(n)
 
-    def precompute_context_kv(
+    def compute_draft_kv(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
