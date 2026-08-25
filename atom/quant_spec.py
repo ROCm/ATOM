@@ -14,14 +14,48 @@ This module introduces:
 
 from __future__ import annotations
 
+import functools
+import importlib
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
-from aiter import QuantType
-from aiter.utility.dtypes import d_dtypes
+
+
+class _LazyAiterAttr:
+    """One AITER attribute, resolved on first use rather than at import.
+
+    `atom.config` imports this module, and Python imports a package before its
+    submodule, so a plain `from aiter import QuantType` here makes *reading a
+    dataclass* require the AITER build. That is why the unit-test suite used to
+    replace `atom.config` with a hand-written stand-in, which then drifted from
+    the real thing and silently disabled test modules.
+
+    Only the name is deferred. Every attribute read returns the genuine AITER
+    object, so `quant_type` values compare and behave exactly as before -- this
+    is not a stand-in and never answers when AITER is missing.
+    """
+
+    __slots__ = ("_attr", "_module", "_value")
+
+    def __init__(self, module: str, attr: str):
+        self._module = module
+        self._attr = attr
+        self._value = None
+
+    def _resolve(self) -> Any:
+        if self._value is None:
+            self._value = getattr(importlib.import_module(self._module), self._attr)
+        return self._value
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._resolve(), name)
+
+
+QuantType = _LazyAiterAttr("aiter", "QuantType")
+d_dtypes = _LazyAiterAttr("aiter.utility.dtypes", "d_dtypes")
 
 # ──────────────────────────────────────────────────────────────────────
 # Typed layer-level spec
@@ -32,7 +66,10 @@ from aiter.utility.dtypes import d_dtypes
 class LayerQuantConfig:
     """Immutable description of how a single layer (or default) is quantized."""
 
-    quant_type: QuantType = QuantType.No
+    # `default_factory`, not `default`: a plain default is evaluated when the
+    # class is created, which would resolve the lazy AITER name at import time
+    # and undo the deferral above. The factory runs per instantiation instead.
+    quant_type: QuantType = field(default_factory=lambda: QuantType.No)
     quant_dtype: Any = torch.bfloat16  # torch.dtype (use Any for forward compat)
     is_dynamic: bool = True
     quant_method: str | None = None
@@ -57,6 +94,32 @@ def should_skip_online_quant(cur_type, cur_dtype, online_cfg) -> bool:
     """
     return online_cfg.quant_type == QuantType.No or (
         cur_type == online_cfg.quant_type and cur_dtype == online_cfg.quant_dtype
+    )
+
+
+def should_stream_online_quant(
+    quant_config,
+    prefix: str,
+    source_quant_type,
+    source_quant_dtype,
+) -> bool:
+    """Return whether this source can be streamed to a distinct online target."""
+    # Attention stays in the post-load pass because MLA post-processing reads
+    # an already-loaded and processed kv_b_proj.
+    # Imported lazily to avoid a module-load cycle (envs/quark pull in config
+    # which can pull in quant_spec).
+    from atom.quantization.quark.utils import can_dequant_weight_online
+    from atom.utils import envs
+
+    if not envs.ATOM_ONLINE_QUANT_STREAMING:
+        return False
+    if quant_config is None or not getattr(quant_config, "online_quant", False):
+        return False
+    if not can_dequant_weight_online(source_quant_type, source_quant_dtype):
+        return False
+    online_cfg = quant_config.get_layer_quant_config(prefix, use_online_quant=True)
+    return not should_skip_online_quant(
+        source_quant_type, source_quant_dtype, online_cfg
     )
 
 
@@ -124,18 +187,27 @@ def get_quant_parser(method_name: str) -> QuantConfigParser:
 
 # -- helpers ----------------------------------------------------------------
 
-_QSCHEME_TO_QUANT_TYPE: dict[str, QuantType] = {
-    "per_channel": QuantType.per_Token,
-    "per_tensor": QuantType.per_Tensor,
-    "per_group": QuantType.per_1x32,
-    "per_block": QuantType.per_1x128,
-}
+
+@functools.cache
+def _qscheme_to_quant_type() -> dict[str, QuantType]:
+    """qscheme string -> AITER quant type, built on first use.
+
+    A module-level dict literal would read the lazy AITER names at import time,
+    which is exactly what the deferral above exists to avoid. Cached, so the
+    lookup stays a dict access after the first call.
+    """
+    return {
+        "per_channel": QuantType.per_Token,
+        "per_tensor": QuantType.per_Tensor,
+        "per_group": QuantType.per_1x32,
+        "per_block": QuantType.per_1x128,
+    }
 
 
 def _parse_quant_type(qscheme: str | None) -> QuantType:
     if qscheme is None:
         return QuantType.No
-    return _QSCHEME_TO_QUANT_TYPE.get(qscheme, QuantType.No)
+    return _qscheme_to_quant_type().get(qscheme, QuantType.No)
 
 
 def _parse_quant_dtype(dtype_str: str | None) -> Any:
@@ -293,19 +365,28 @@ class GenericParser(QuantConfigParser):
     """Fallback parser that uses heuristics for compressed-tensors, etc."""
 
     # Regex patterns for identifying quantization types from config keys/values
-    _DTYPE_PATTERNS = {
+    _DTYPE_PATTERNS: ClassVar[dict[str, str]] = {
         r"fp8|float8": "fp8",
         r"fp4|float4|mxfp4": "fp4x2",
         r"int8|w8a8": "int8",
         r"int4|w4a16|gptq|awq": "int4x2",
     }
 
-    _QTYPE_PATTERNS = {
-        r"block|per_block|blockwise|1x128": QuantType.per_1x128,
-        r"per_channel|channel|per_token|token": QuantType.per_Token,
-        r"per_tensor|tensor": QuantType.per_Tensor,
-        r"per_group|group": QuantType.per_1x32,
-    }
+    @staticmethod
+    @functools.cache
+    def _qtype_patterns() -> dict[str, QuantType]:
+        """Regex -> AITER quant type, built on first use.
+
+        A class-level dict literal runs when the class is created, i.e. at
+        import time, which would resolve the lazy AITER names and defeat the
+        deferral. Same reason as `_qscheme_to_quant_type`.
+        """
+        return {
+            r"block|per_block|blockwise|1x128": QuantType.per_1x128,
+            r"per_channel|channel|per_token|token": QuantType.per_Token,
+            r"per_tensor|tensor": QuantType.per_Tensor,
+            r"per_group|group": QuantType.per_1x32,
+        }
 
     def parse(self, hf_quant_config: dict) -> ParsedQuantConfig:
         quant_method = hf_quant_config.get("quant_method", "")
@@ -416,7 +497,7 @@ class GenericParser(QuantConfigParser):
         for key in ("quant_type", "quantization_type", "scheme"):
             val = cfg.get(key)
             if val and isinstance(val, str):
-                for pattern, qtype in self._QTYPE_PATTERNS.items():
+                for pattern, qtype in self._qtype_patterns().items():
                     if re.search(pattern, val.lower()):
                         return qtype
         # Check compressed-tensors config_groups for weight strategy
@@ -428,13 +509,13 @@ class GenericParser(QuantConfigParser):
                 weights = group.get("weights") or {}
                 strategy = weights.get("strategy", "")
                 if strategy:
-                    mapped = _QSCHEME_TO_QUANT_TYPE.get(strategy)
+                    mapped = _qscheme_to_quant_type().get(strategy)
                     if mapped is None:
-                        mapped = _QSCHEME_TO_QUANT_TYPE.get(f"per_{strategy}")
+                        mapped = _qscheme_to_quant_type().get(f"per_{strategy}")
                     if mapped is not None:
                         return mapped
         # Fall back to regex heuristics on full config string
-        for pattern, qtype in self._QTYPE_PATTERNS.items():
+        for pattern, qtype in self._qtype_patterns().items():
             if re.search(pattern, config_str):
                 return qtype
         # Bare compressed-tensors / vLLM fp8 (no weight_block_size, no config_groups,

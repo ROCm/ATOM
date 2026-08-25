@@ -9,6 +9,7 @@
 # here works on the CPU-only / mocked CI runner without any sys.modules stub;
 # conftest.py supplies the atom.* / zmq stubs the import chain needs.
 
+import pickle
 from threading import Lock
 
 import pytest
@@ -178,6 +179,31 @@ def test_explicit_hint_takes_priority_and_is_charged():
     # Hinted rank's load is counted so it participates in future balancing.
     assert mgr._rank_reqs[2] >= 1
     assert mgr._rank_tokens[2] >= 30
+
+
+def test_dispatch_sends_explicit_hint_to_exact_engine_rank():
+    class _RecordingSocket:
+        def __init__(self):
+            self.messages = []
+
+        def send_multipart(self, parts, copy=False):
+            self.messages.append(parts)
+
+    mgr = _make_mgr(4, strategy="least_requests")
+    mgr.engine_core_identities = [b"e0", b"e1", b"e2", b"e3"]
+    mgr.input_sockets = [_RecordingSocket() for _ in range(4)]
+    # Make rank 3 the least attractive load-balanced destination. An explicit
+    # mesh hint must still route there exactly.
+    mgr._rank_reqs = [0, 0, 0, 10]
+    mgr._rank_tokens = [0, 0, 0, 10_000]
+
+    seq = _FakeSeq("sticky", num_prompt_tokens=100, data_parallel_rank=3)
+    mgr._dispatch_to_dp_ranks([seq])
+
+    assert [len(sock.messages) for sock in mgr.input_sockets] == [0, 0, 0, 1]
+    request_type, dispatched = pickle.loads(mgr.input_sockets[3].messages[0][1])
+    assert request_type.name == "ADD"
+    assert [item.id for item in dispatched] == [seq.id]
 
 
 def test_invalid_hint_still_supported_via_add_request_validation():

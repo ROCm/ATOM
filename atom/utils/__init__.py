@@ -15,11 +15,12 @@ import socket
 import sys
 import tempfile
 import time
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from functools import lru_cache
 from multiprocessing.context import ForkContext, SpawnContext
 from multiprocessing.process import BaseProcess
-from typing import TYPE_CHECKING, Any, Callable, Iterator, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 from uuid import uuid4
 
@@ -92,15 +93,36 @@ def set_ulimit(target_soft_limit: int = 65535) -> None:
 
 @contextlib.contextmanager
 def set_device_control_env_var(config: "Config", local_dp_rank: int):
-    """
-    Temporarily set CUDA_VISIBLE_DEVICES or equivalent
-    for engine subprocess.
+    """Publish this engine's GPU slice under the RLHF device-map variable.
+
+    Inert for the DP path that calls it, and must stay that way. It sets a
+    variable named by the literal placeholder string; the only reader is
+    ``RLHFModelRunner.DP_DEVICE_MAP_ENV`` (atom/rollout/model_runner_ext.py),
+    which consults it solely when ``data_parallel_size <= 1``. ``CoreManager``
+    only wraps a spawn in this when ``data_parallel_size > 1``, so the two
+    never meet. Do not delete the placeholder string as dead -- it is a live
+    protocol constant for the rollout adapter.
+
+    Making it set a real ``HIP_VISIBLE_DEVICES`` was tried and reverted. The
+    mask renumbers devices in the child (``cuda:0`` becomes the first *visible*
+    GPU), but ``ModelRunner._setup_device_and_distributed`` independently
+    computes an ABSOLUTE index -- ``local_dp_rank * tp_size + rank`` -- and
+    selects ``cuda:{that}``. The two offsets compound: with ``-dp 4 -tp 2``,
+    DP rank 1 would get a mask of "2,3" (two visible devices) and then ask for
+    ``cuda:2``, which no longer exists. Startup dies on the
+    ``local_device_rank >= torch.cuda.device_count()`` check -- every
+    multi-GPU DP run, including ones that ship today.
+
+    Either the mask or the absolute index can own device placement, not both.
+    ATOM uses the absolute index, so this stays inert.
     """
     world_size = config.tensor_parallel_size
     evar = "VLLM_DEVICE_CONTROL_ENV_VAR_PLACEHOLDER"
 
     value = get_device_indices(evar, local_dp_rank, world_size)
-    print(f"Setting DP rank {local_dp_rank} to {value}")
+    logger.debug(
+        "%s=%s for local DP rank %d (inert placeholder)", evar, value, local_dp_rank
+    )
     with patch.dict(os.environ, values=((evar, value),)):
         yield
 
@@ -120,7 +142,7 @@ def get_device_indices(
             for i in range(local_dp_rank * world_size, (local_dp_rank + 1) * world_size)
         )
     except IndexError as e:
-        raise Exception(
+        raise ValueError(
             f"Error setting {device_control_env_var}: "
             f"local range: [{local_dp_rank * world_size}, "
             f"{(local_dp_rank + 1) * world_size}) "
@@ -132,8 +154,8 @@ def get_device_indices(
 
 def mark_spliting_op(
     is_custom: bool,
-    gen_fake: Optional[Callable[..., Any]] = None,
-    mutates_args: list[str] = [],
+    gen_fake: Callable[..., Any] | None = None,
+    mutates_args: list[str] | None = None,
 ):
     def decorator(func):
         if not is_custom:
@@ -143,7 +165,7 @@ def mark_spliting_op(
         direct_register_custom_op(
             op_name=func.__name__,
             op_func=func,
-            mutates_args=mutates_args,
+            mutates_args=mutates_args if mutates_args is not None else [],
             fake_impl=gen_fake,
         )
         registered_op = getattr(torch.ops.aiter, func.__name__)
@@ -167,14 +189,12 @@ def get_hf_text_config(config: PretrainedConfig):
         return config
 
 
-def get_mp_context() -> Union[ForkContext, SpawnContext]:
+def get_mp_context() -> ForkContext | SpawnContext:
     """Get a multiprocessing context with 'spawn' start method."""
     return multiprocessing.get_context("spawn")
 
 
-def set_process_title(
-    name: str, suffix: str = "", prefix: Optional[str] = None
-) -> None:
+def set_process_title(name: str, suffix: str = "", prefix: str | None = None) -> None:
     """Set the current process title (comm/cmdline) for ps/top/rocm-smi.
 
     rocm-smi --showpids reads the process ``comm`` field, which defaults to the
@@ -193,6 +213,25 @@ def set_process_title(
     if suffix:
         name = f"{name}_{suffix}"
     setproctitle.setproctitle(f"{prefix}::{name}")
+
+
+def engine_process_name(config: "Config") -> str:
+    """What an EngineCore process is called, in `ps` and in its own logs."""
+    pc = config.parallel_config
+    if config.pipeline_parallel_size > 1:
+        return f"EngineCore_PP{pc.pipeline_parallel_rank}"
+    if pc.data_parallel_size > 1:
+        return f"EngineCore_DP{pc.data_parallel_rank}"
+    return "EngineCore"
+
+
+def worker_process_name(config: "Config | None", rank: int) -> str:
+    """What a ModelRunner worker is called. `config` may be absent on paths
+    that build a worker without one."""
+    pc = getattr(config, "parallel_config", None)
+    if pc is not None and pc.data_parallel_size > 1:
+        return f"DP{pc.data_parallel_rank}TP{rank}"
+    return f"TP{rank}"
 
 
 def shutdown_all_processes(procs: list[BaseProcess], allowed_seconds: int = 2):
@@ -276,7 +315,10 @@ def enable_orphan_reaping(sig: int = signal.SIGKILL) -> bool:
             err = ctypes.get_errno()
             logger.warning("prctl(PR_SET_PDEATHSIG) failed: errno=%d", err)
             return False
-    except Exception as e:  # pragma: no cover - defensive
+    except Exception as e:  # noqa: BLE001 - best-effort; platform-dependent
+        # ctypes/prctl is Linux-specific and can fail on a restricted or
+        # non-glibc image. Orphan reaping is a safety net, so losing it must
+        # not stop the process that was trying to arm it.
         logger.warning("Could not arm orphan reaping: %s", e)
         return False
 
@@ -393,7 +435,7 @@ def _get_open_port() -> int:
             return s.getsockname()[1]
 
 
-@lru_cache()
+@lru_cache
 def get_zmq_base_path() -> str:
     return tempfile.gettempdir()
 
@@ -419,7 +461,7 @@ def get_engine_client_zmq_addr(local_only: bool, host: str, port: int = 0) -> st
     )
 
 
-def close_sockets(sockets: Sequence[Union[zmq.Socket, zmq.asyncio.Socket]]):
+def close_sockets(sockets: Sequence[zmq.Socket | zmq.asyncio.Socket]):
     for sock in sockets:
         if sock is not None:
             sock.close(linger=0)
@@ -446,7 +488,7 @@ def split_zmq_path(path: str) -> tuple[str, str, str]:
     return scheme, host, port
 
 
-def make_zmq_path(scheme: str, host: str, port: Optional[int] = None) -> str:
+def make_zmq_path(scheme: str, host: str, port: int | None = None) -> str:
     """Make a ZMQ path from its parts.
 
     Args:
@@ -464,15 +506,15 @@ def make_zmq_path(scheme: str, host: str, port: Optional[int] = None) -> str:
     return f"{scheme}://{host}:{port}"
 
 
-# Adapted from: https://github.com/sgl-project/sglang/blob/v0.4.1/python/sglang/srt/utils.py#L783 # noqa: E501
+# Adapted from: https://github.com/sgl-project/sglang/blob/v0.4.1/python/sglang/srt/utils.py#L783
 def make_zmq_socket(
-    ctx: Union[zmq.asyncio.Context, zmq.Context],  # type: ignore[name-defined]
+    ctx: zmq.asyncio.Context | zmq.Context,  # type: ignore[name-defined]
     path: str,
     socket_type: Any,
-    bind: Optional[bool] = None,
-    identity: Optional[bytes] = None,
-    linger: Optional[int] = None,
-) -> Union[zmq.Socket, zmq.asyncio.Socket]:  # type: ignore[name-defined]
+    bind: bool | None = None,
+    identity: bytes | None = None,
+    linger: int | None = None,
+) -> zmq.Socket | zmq.asyncio.Socket:  # type: ignore[name-defined]
     """Make a ZMQ socket with the proper bind/connect semantics."""
 
     mem = psutil.virtual_memory()
@@ -547,9 +589,9 @@ def init_exit_handler(self: Any):
 def zmq_socket_ctx(
     path: str,
     socket_type: Any,
-    bind: Optional[bool] = None,
+    bind: bool | None = None,
     linger: int = 0,
-    identity: Optional[bytes] = None,
+    identity: bytes | None = None,
 ) -> Iterator[zmq.Socket]:
     """Context manager for a ZMQ socket"""
 
@@ -563,12 +605,101 @@ def zmq_socket_ctx(
         ctx.destroy(linger=linger)
 
 
+# A pageable host-to-device copy larger than the driver's staging buffer cannot
+# be handed off and returned from: the host waits for it, and because it goes
+# out on the current stream it waits behind everything already queued there.
+# Under it, the driver stages the bytes and returns immediately.
+#
+# Measured on MI355X with 4 ms of work in flight, host time charged to the copy:
+#
+#     bytes    pageable   pin_memory()   persistent pinned
+#     64 KB    0.018 ms      0.021 ms         0.022 ms
+#    400 KB    0.037 ms      0.167 ms         0.014 ms
+#    512 KB    0.032 ms          --           0.014 ms
+#    560 KB    3.047 ms          --           0.015 ms   <-- cliff
+#    800 KB    3.058 ms      0.168 ms         0.031 ms
+#
+# Three things follow. Below the cliff every route costs about the same, so the
+# one that allocates nothing wins. Above it pageable is ~100x worse and the
+# choice is forced. And neither route here is as good as a persistent pinned
+# buffer: charged against queue depth at 1.5 MB, pageable grows +84 us per
+# queued matmul and a `CpuGpuBuffer` is flat, while a per-call `pin_memory()`
+# lands anywhere from +3 to +36 depending on how fragmented the caching host
+# allocator already is -- better than pageable, and not something to rely on.
+# That is why `CpuGpuBuffer` exists and why a per-forward buffer should be one.
+_PAGEABLE_H2D_LIMIT = 512 * 1024
+
+
+@lru_cache(maxsize=8)
+def _warn_oversize_upload(nbytes: int) -> None:
+    logger.warning(
+        "upload_numpy: %d B is past the %d B pageable limit, so it is staged "
+        "through a fresh pinned block every call. A per-forward upload this "
+        "size should own a CpuGpuBuffer instead.",
+        nbytes,
+        _PAGEABLE_H2D_LIMIT,
+    )
+
+
+def upload_numpy(arr: np.ndarray, device, *, non_blocking: bool = True) -> torch.Tensor:
+    """Copy a numpy array to `device` by whichever route its size calls for.
+
+    For one-off and size-varying uploads, where the size can cross the cliff as
+    a config knob moves and nobody notices until a step takes milliseconds
+    longer. A buffer uploaded every forward should be a `CpuGpuBuffer`.
+
+    A shared reusable staging block is not a third option, and was tried: its
+    copy goes out on the current stream, so the event that makes reuse safe
+    sits behind whatever is queued, and waiting on it costs what pageable
+    costs. Only a block nobody else touches escapes that.
+    """
+    if arr.nbytes <= _PAGEABLE_H2D_LIMIT:
+        return torch.from_numpy(arr).to(device, non_blocking=non_blocking)
+    _warn_oversize_upload(arr.nbytes)
+    return torch.from_numpy(arr).pin_memory().to(device, non_blocking=non_blocking)
+
+
+def pack_rows(dst: np.ndarray, rows: Sequence) -> None:
+    """Left-align ragged `rows` into a 2-D int32 `dst`, zero-filling the rest.
+
+    A numpy row assign costs ~245ns on MI355X and does not vary with the row's
+    length until the bytes start to matter (~500 ints), so a marshal of short
+    rows is dispatch and nothing else -- 4.0 ms at 16k rows. Through one
+    `memoryview` of the destination the same write is ~46ns.
+
+    `.cast` is what makes the flattening safe: it refuses a non-contiguous
+    buffer, where `reshape(-1)` would hand back a copy and silently drop every
+    write. Rows must export a buffer of int32 -- an `array("i")` or an int32
+    ndarray -- since that is what makes each write a memcpy.
+    """
+    if dst.dtype != np.int32:
+        # `.cast("i")` would reinterpret the bits of any other dtype rather
+        # than convert them, so this must be checked and not assumed.
+        raise TypeError(f"pack_rows needs an int32 destination, got {dst.dtype}")
+    # Both dimensions are checked here because a flat write has no edge in
+    # either: an over-wide row would land in the next row, and an over-long
+    # batch would run off the end with only a memoryview structure error to
+    # say so. The numpy form this replaces raised on both.
+    n_rows, (max_rows, cols) = len(rows), dst.shape
+    if n_rows > max_rows:
+        raise ValueError(f"{n_rows} rows exceed the {max_rows}-row destination")
+    dst[:n_rows] = 0  # one memset over the rows in play, not one per row
+    flat = memoryview(dst).cast("B").cast("i")
+    base = 0
+    for row in rows:
+        n = len(row)
+        if n > cols:
+            raise ValueError(f"row of {n} exceeds the {cols}-column destination")
+        flat[base : base + n] = row
+        base += cols  # the destination's stride, not the row's length
+
+
 class CpuGpuBuffer:
     """Buffer to easily copy tensors between CPU and GPU."""
 
     def __init__(
         self,
-        *size: Union[int, torch.SymInt],
+        *size: int | torch.SymInt,
         dtype: torch.dtype,
         device: torch.device,
         pin_memory: bool = True,
@@ -588,17 +719,33 @@ class CpuGpuBuffer:
                 )
             self.np = self.cpu.numpy()
 
-    def copy_to_gpu(self, n: Optional[int] = None) -> torch.Tensor:
+    def copy_to_gpu(self, n: int | None = None) -> torch.Tensor:
         if n is None:
             return self.gpu.copy_(self.cpu, non_blocking=True)
         return self.gpu[:n].copy_(self.cpu[:n], non_blocking=True)
 
-    def copy_to_cpu(self, n: Optional[int] = None) -> torch.Tensor:
+    def copy_to_cpu(self, n: int | None = None) -> torch.Tensor:
         """NOTE: Because this method is non-blocking, explicit synchronization
         is needed to ensure the data is copied to CPU."""
         if n is None:
             return self.cpu.copy_(self.gpu, non_blocking=True)
         return self.cpu[:n].copy_(self.gpu[:n], non_blocking=True)
+
+    def clone(self) -> "CpuGpuBuffer":
+        """Allocate an independent buffer with the same shape/dtype/device and
+        copy over the current cpu+gpu contents (preserves one-time inits like
+        arange/zeros). Used to build per-in-flight-slot metadata rings so
+        concurrent pipeline microbatches never share a staging buffer."""
+        new = CpuGpuBuffer(
+            *self.cpu.shape,
+            dtype=self.cpu.dtype,
+            device=self.gpu.device,
+            pin_memory=self.cpu.is_pinned(),
+            with_numpy=hasattr(self, "np"),
+        )
+        new.cpu.copy_(self.cpu)
+        new.gpu.copy_(self.gpu)
+        return new
 
 
 context_manager = None
@@ -616,7 +763,7 @@ def is_torch_equal_or_newer(target: str) -> bool:
     """
     try:
         return _is_torch_equal_or_newer(str(torch.__version__), target)
-    except Exception:
+    except Exception:  # noqa: BLE001 - any parse failure falls back to PKG-INFO
         # Fallback to PKG-INFO to load the package info, needed by the doc gen.
         return Version(importlib.metadata.version("torch")) >= Version(target)
 
@@ -701,7 +848,10 @@ at::Tensor atom_weak_ref_tensor(at::Tensor input) {
                 "ATOM_DISABLE_JIT_WEAKREF=1 to silence.",
                 _e,
             )
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001, S110 - the logger itself is what failed
+            # Deliberately silent: this handler wraps the *warning* above, so
+            # the only thing left to report with is the thing that just broke.
+            # The caller still gets the correct (unoptimized) fallback below.
             pass
         _ATOM_WEAKREF_OP = False
         return None
@@ -728,8 +878,8 @@ def weak_ref_tensor(tensor: Any) -> Any:
 
 
 def weak_ref_tensors(
-    tensors: Union[torch.Tensor, list[torch.Tensor], tuple[torch.Tensor]],
-) -> Union[torch.Tensor, list[Any], tuple[Any], Any]:
+    tensors: torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor],
+) -> torch.Tensor | list[Any] | tuple[Any] | Any:
     """
     Convenience function to create weak references to tensors,
     for single tensor, list of tensors or tuple of tensors.
@@ -871,7 +1021,10 @@ def _patch_torch_dynamo_metrics_config_logging() -> None:
 
 def getLogger():
     if not logger.handlers:
-        logger.setLevel(logging.DEBUG)
+        # Must match the handler level below: a logger at DEBUG feeding a
+        # handler at INFO still builds a LogRecord per logger.debug() call
+        # and then discards it -- 10.4% of the API server's CPU at c=2048.
+        logger.setLevel(logging.INFO)
 
         console_handler = logging.StreamHandler()
         from atom.utils import envs as _envs

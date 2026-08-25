@@ -20,6 +20,7 @@ import time
 
 import msgspec
 import pytest
+from conftest import MockConfig
 
 from atom.distributed.kv_events import (
     MEDIUM_GPU,
@@ -34,7 +35,6 @@ from atom.distributed.kv_events import (
     make_publisher,
 )
 from atom.model_engine.block_manager import BlockManager
-from conftest import MockConfig
 
 # ── helpers ───────────────────────────────────────────────────────────────
 
@@ -221,9 +221,9 @@ class TestBlockManagerHooks:
         s1 = seq_factory([1, 2, 3, 4])
         _admit(bm, s1)
         bm.deallocate(s1)
-        assert bm.hash_to_block_id, "preconditions: hash should be cached"
+        assert bm.kv.num_indexed, "preconditions: hash should be cached"
         bm.clear_cache()
-        assert bm.hash_to_block_id == {}
+        assert bm.kv.num_indexed == 0
 
     def test_record_remote_store(self, seq_factory):
         bm = _bm_with_events()

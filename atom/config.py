@@ -9,22 +9,26 @@ import os
 import re
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
-from typing import Any, ClassVar, Optional, Union
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import torch
-from aiter import QuantType
-from atom.quant_spec import (
-    LayerQuantConfig,
-    get_quant_parser,
-)
-from atom.utils import envs, get_open_port
-from atom.utils.distributed.utils import stateless_init_torch_distributed_process_group
 from torch.distributed import ProcessGroup, ReduceOp
 from transformers import AutoConfig, GenerationConfig, PretrainedConfig
 
 # plugin-related utilities
 from atom.plugin import is_plugin_mode, is_vllm
 from atom.plugin.config import PluginConfig
+from atom.quant_spec import (
+    LayerQuantConfig,
+    get_quant_parser,
+)
+from atom.utils import envs, get_open_port
+from atom.utils.distributed.utils import stateless_init_torch_distributed_process_group
+
+if TYPE_CHECKING:
+    # Annotation only. Importing AITER here would put a GPU kernel build behind
+    # `import atom.config`, which is what `atom.quant_spec` defers on purpose.
+    from aiter import QuantType
 
 logger = logging.getLogger("atom")
 
@@ -36,10 +40,13 @@ class KVCacheTensor:
     """
 
     layer_num: int
-    k_cache: torch.Tensor = torch.tensor([])
-    v_cache: torch.Tensor = torch.tensor([])
+    k_cache: torch.Tensor = field(default_factory=lambda: torch.tensor([]))
+    v_cache: torch.Tensor = field(default_factory=lambda: torch.tensor([]))
     k_scale: torch.Tensor = None
     v_scale: torch.Tensor = None
+    # DSA sparse layers (GLM-5.2 / DeepSeek-V3.2): indexer key cache, block-major
+    # ``(num_blocks, block_size, aligned_index_dim)``. Omitted for non-DSA layers.
+    index_cache: torch.Tensor | None = None
 
 
 @dataclass
@@ -62,12 +69,21 @@ class CUDAGraphMode(enum.Enum):
     FULL = 2
     FULL_DECODE_ONLY = (FULL, NONE)
     FULL_AND_PIECEWISE = (FULL, PIECEWISE)
+    # AF_PIECEWISE ("attention/FFN-wise"): PIECEWISE + attention core in its own
+    # cudagraph (DSpark). Tuple so decode/mixed_mode resolve to PIECEWISE (existing
+    # == PIECEWISE checks treat it as such); extra capture gated by is_attn_ffn_piecewise().
+    AF_PIECEWISE = (PIECEWISE, PIECEWISE)
 
     def decode_mode(self) -> "CUDAGraphMode":
         return CUDAGraphMode(self.value[0]) if self.separate_routine() else self
 
     def mixed_mode(self) -> "CUDAGraphMode":
         return CUDAGraphMode(self.value[1]) if self.separate_routine() else self
+
+    def is_attn_ffn_piecewise(self) -> bool:
+        """True only for AF_PIECEWISE — gates the extra attention-core cudagraph
+        (attention/FFN-wise capture) on top of the standard piecewise pieces."""
+        return self is CUDAGraphMode.AF_PIECEWISE
 
     def requires_piecewise_compilation(self) -> bool:
         return (
@@ -108,7 +124,7 @@ class CompilationConfig:
 
     local_cache_dir: str = field(default=None, init=False)  # type: ignore
     # cudagraph_capture_sizes: Optional[list[int]] = [1,2,4,8]
-    cudagraph_capture_sizes: Optional[list[int]] = None
+    cudagraph_capture_sizes: list[int] | None = None
 
     cuda_graph_sizes: list[int] = field(default_factory=list)
     """Cuda graph capture sizes
@@ -128,7 +144,7 @@ class CompilationConfig:
     use_inductor: bool = True
 
     # CudaGraph compilation
-    cudagraph_mode: Optional[CUDAGraphMode] = None
+    cudagraph_mode: CUDAGraphMode | None = None
     """
     The mode of the cudagraph:
 
@@ -137,6 +153,13 @@ class CompilationConfig:
     - FULL.
     - FULL_DECODE_ONLY.
     - FULL_AND_PIECEWISE.
+    - AF_PIECEWISE.
+
+    AF_PIECEWISE ("attention/FFN-wise") mode: PIECEWISE where the attention
+    core is ALSO captured into its own cudagraph with zero-copy public buffers
+    (DeepSeek-V4 DSpark), so small-batch decode is all-replay with no eager
+    attention gap between the dense pieces. Falls back to plain PIECEWISE
+    behavior for models that don't implement the attention-core capture.
 
     PIECEWISE mode build piecewise cudagraph only, keeping the cudagraph
     incompatiable ops (i.e. some attention ops) outside the cudagraph
@@ -168,7 +191,7 @@ class CompilationConfig:
 
     compilation_time: float = field(default=0.0, init=False)
 
-    splitting_ops: Optional[list[str]] = None
+    splitting_ops: list[str] | None = None
     """A list of ops to split the full graph into subgraphs, used in piecewise
     compilation."""
 
@@ -187,7 +210,7 @@ class CompilationConfig:
     """Additional configurations for inductor.
     - None: use default configurations."""
 
-    compile_sizes: Optional[list[Union[int, str]]] = None
+    compile_sizes: list[int | str] | None = None
     """Sizes to compile for inductor. In addition
     to integers, it also supports "cudagraph_capture_sizes" to
     specify the sizes for cudagraph capture."""
@@ -269,7 +292,7 @@ class QuantizationConfig:
     def __init__(
         self,
         config: PretrainedConfig = None,
-        online_quant_config: Optional[dict] = None,
+        online_quant_config: dict | None = None,
     ):
         if config is None:
             self.torch_dtype = torch.bfloat16
@@ -290,9 +313,7 @@ class QuantizationConfig:
         self.hf_quant_config = getattr(config, "quantization_config", None)
 
         if self.hf_quant_config is None:
-            self.global_spec = LayerQuantConfig(
-                quant_type=QuantType.No, quant_dtype=self.torch_dtype
-            )
+            self.global_spec = LayerQuantConfig.no_quant(self.torch_dtype)
             self.layer_pattern_specs = []
             self.exclude_layers = []
             self.quant_method = ""
@@ -312,8 +333,15 @@ class QuantizationConfig:
             "mxfp4",
             "mxfp8",
             "quark",
+            "compressed-tensors",
         ]:
             self.online_quant = True
+            if self.quant_method == "compressed-tensors":
+                logger.warning(
+                    "Online quant with compressed-tensors is not fully supported. "
+                    "Be careful about the online quant config setting when launching "
+                    "the server."
+                )
             online_parser = get_quant_parser("online_quant")
             online_parsed_quant_config = online_parser.parse(online_quant_config)
             self.online_global_spec = online_parsed_quant_config.global_spec
@@ -379,7 +407,7 @@ class QuantizationConfig:
     # -- convenience properties (delegate to global_spec) ---------------------
 
     @property
-    def quant_type(self) -> QuantType:
+    def quant_type(self) -> "QuantType":
         return self.global_spec.quant_type
 
     @property
@@ -424,7 +452,7 @@ class QuantizationConfig:
     def _is_excluded(
         self,
         layer_name: str,
-        exclude_layers: Optional[list[str]] = None,
+        exclude_layers: list[str] | None = None,
         *,
         check_children: bool = False,
     ) -> bool:
@@ -583,6 +611,11 @@ _CONFIG_REGISTRY: dict[str, str] = {
 }
 
 
+# model_types that exist only as speculative-draft checkpoints. transformers
+# has no config class for them, so AutoConfig.from_pretrained raises; load them
+# as a bare PretrainedConfig instead (see get_hf_config).
+_PLAIN_CONFIG_MODEL_TYPES: frozenset[str] = frozenset({"k3_dspark"})
+
 _MULTIMODAL_MODEL_TYPES: dict[str, str] = {
     # Maps multimodal model_type -> key in config_dict for the text sub-config
     "kimi_k3": "text_config",
@@ -664,6 +697,14 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
         except Exception:
             hf_config._multimodal_config = None
         return hf_config
+
+    if model_type in _PLAIN_CONFIG_MODEL_TYPES:
+        # Speculative-draft checkpoints ship their own model_type that
+        # transformers has never heard of (and never will -- they are not
+        # standalone LMs). There is no schema to map onto, and nothing here
+        # needs one: the draft model reads plain attributes off the config.
+        # Keep every field verbatim as a bare PretrainedConfig.
+        return PretrainedConfig.from_dict(config_dict)
 
     if model_type in _CONFIG_REGISTRY:
         config_class = AutoConfig.for_model(_CONFIG_REGISTRY[model_type])
@@ -755,18 +796,36 @@ class ParallelConfig:
     data_parallel_size: int = 1
     """Number of data parallel groups. MoE layers will be sharded according to
     the product of the tensor parallel size and data parallel size."""
-    data_parallel_size_local: int = 1
-    """Number of local data parallel groups."""
+    data_parallel_size_local: int | None = None
+    """DP ranks this node runs. Defaults to data_parallel_size, i.e. the
+    single-node case where every global rank is local. Set it below the global
+    size to give a node one slice of a multi-node run; it also reaches MoRI as
+    `gpu_per_node` (see model_ops/moe.py), so it must describe real hardware."""
     data_parallel_rank: int = 0
     """Rank of the data parallel group."""
-    data_parallel_rank_local: Optional[int] = None
+    data_parallel_rank_local: int | None = None
     """Local rank of the data parallel group,
     set only in SPMD mode."""
     decode_context_parallel_size: int = 1
     """DCP group size. tp_size must be divisible by dcp_size.
     DCP does not increase world_size; it reuses TP GPUs."""
-    world_size: int = field(init=False)
-    """world_size is TPxPP, it affects the number of workers we create."""
+    pipeline_parallel_rank: int = 0
+    """Pipeline stage index of this EngineCore (0 = first stage). Each PP stage
+    runs as an independent EngineCore process; this identifies which stage."""
+    pp_meta_addrs: list = field(default_factory=list)
+    """ZMQ endpoints (len == pp_size) where each downstream stage receives the
+    scheduled batch from the head. Populated by CoreManager for pp_size > 1."""
+    pp_token_addr: str = ""
+    """ZMQ endpoint where the head receives sampled tokens back from the last
+    stage. Populated by CoreManager for pp_size > 1."""
+    control_address: str = ""
+    """ZMQ endpoint carrying control traffic (utility commands, abort, shutdown)
+    for this EngineCore, separate from the request endpoint. Keeping the two
+    apart leaves the request socket with a single writer thread, so admitting a
+    request needs no synchronization. Populated by launch_engine_core."""
+    pp_kv_status_addr: str = ""
+    """ZMQ endpoint where the head receives KV offload status from downstream
+    PP stages. All downstream stages PUSH; the head PULLs."""
     data_parallel_master_port: int = 29500
     """Port of the data parallel master."""
 
@@ -775,10 +834,20 @@ class ParallelConfig:
     data_parallel_master_ip: str = "127.0.0.1"
 
     @property
-    def world_size_across_dp(self) -> int:
-        """world_size_across_dp is TPxPPxDP, it is the size of the world
-        including data parallelism."""
-        return self.world_size * self.data_parallel_size
+    def is_multinode_dp(self) -> bool:
+        """Whether this node owns only part of the global DP group.
+
+        Inferred from the topology rather than a separate flag: either this
+        node runs fewer ranks than exist globally, or its slice starts at a
+        non-zero global rank.
+        """
+        # data_parallel_size_local is int | None in the declaration, but
+        # __post_init__ always resolves it before any caller can reach here.
+        assert self.data_parallel_size_local is not None
+        return (
+            self.data_parallel_size_local < self.data_parallel_size
+            or self.data_parallel_rank > 0
+        )
 
     def get_next_dp_init_port(self) -> int:
         """
@@ -832,6 +901,7 @@ class ParallelConfig:
         """
         factors: list[Any] = []
         factors.append(self.data_parallel_size)
+        factors.append(self.data_parallel_size_local)
         factors.append(self.data_parallel_rank)
         factors.append(self.data_parallel_rank_local)
         factors.append(self.data_parallel_master_ip)
@@ -847,11 +917,100 @@ class ParallelConfig:
             self.data_parallel_rank = envs.ATOM_DP_RANK
         if envs.is_set("ATOM_DP_RANK_LOCAL"):
             self.data_parallel_rank_local = envs.ATOM_DP_RANK_LOCAL
+        if envs.is_set("ATOM_DP_MASTER_IP"):
+            self.data_parallel_master_ip = envs.ATOM_DP_MASTER_IP
+        if envs.is_set("ATOM_DP_MASTER_PORT"):
+            self.data_parallel_master_port = envs.ATOM_DP_MASTER_PORT
+        if envs.is_set("ATOM_DP_BASE_PORT"):
+            self.data_parallel_base_port = envs.ATOM_DP_BASE_PORT
+
+        if self.data_parallel_size < 1:
+            raise ValueError("data_parallel_size must be at least 1")
+
+        if envs.is_set("ATOM_DP_SIZE_LOCAL"):
+            self.data_parallel_size_local = envs.ATOM_DP_SIZE_LOCAL
+
+        # Default the local slice to the whole group: on one node every global
+        # rank is local, and that is the overwhelmingly common case.
+        if self.data_parallel_size_local is None:
+            self.data_parallel_size_local = self.data_parallel_size
+
+        if self.data_parallel_size_local < 1:
+            raise ValueError("data_parallel_size_local must be at least 1")
+        if self.data_parallel_rank < 0:
+            raise ValueError("data_parallel_rank must be non-negative")
+        if (
+            self.data_parallel_rank + self.data_parallel_size_local
+            > self.data_parallel_size
+        ):
+            raise ValueError(
+                f"data_parallel_rank ({self.data_parallel_rank}) + "
+                f"data_parallel_size_local ({self.data_parallel_size_local}) "
+                f"must not exceed data_parallel_size "
+                f"({self.data_parallel_size}): this node's slice would run off "
+                f"the end of the global DP group"
+            )
+
+
+_DSPARK_DEFAULT_MAX_BLOCK = 16
+_DSPARK_DEFAULT_ROLLING_WINDOW = 128
+
+
+def _normalize_draft_dspark_config(hf_config: PretrainedConfig) -> None:
+    """Map a standalone DSpark draft config onto ATOM's canonical names.
+
+    DSpark checkpoints come in two shapes and name the same quantities
+    differently:
+
+    - INLINE (e.g. V4-Pro-DSpark) ships inside the target checkpoint and already
+      uses the ``dspark_*`` names the rest of ATOM reads. It never comes here.
+    - STANDALONE drafts are their OWN checkpoint (``architectures:
+      ["*DSparkModel"]``, e.g. Kimi-K3-DSpark's ``K3DSparkModel``) and carry
+      their DSpark fields at the config top level: ``target_layer_ids``,
+      ``mask_token_id``, ``markov_rank``, and optionally a training block width.
+    """
+    target_layer_ids = getattr(hf_config, "target_layer_ids", None)
+    if not target_layer_ids:
+        raise ValueError(
+            "K3DSparkModel config is missing `target_layer_ids` (the target "
+            "decoder layers whose hidden states the draft consumes). Without "
+            "it the draft has no context input."
+        )
+    # 0-based target decoder-layer indices, matching ATOM's `layers[i]` aux-tap
+    # convention: the reference indexes `hidden_states[layer_id + 1]`, i.e. the
+    # OUTPUT of layer `layer_id`, which is the layer this convention taps.
+    hf_config.dspark_target_layer_ids = [int(i) for i in target_layer_ids]
+
+    mask_token_id = getattr(hf_config, "mask_token_id", None)
+    if mask_token_id is None:
+        raise ValueError(
+            "K3DSparkModel config is missing `mask_token_id` (the noise token "
+            "the draft block is seeded with)."
+        )
+    hf_config.dspark_noise_token_id = int(mask_token_id)
+
+    hf_config.dspark_markov_rank = int(getattr(hf_config, "markov_rank", 0) or 0)
+    # Synthesized marker, not a checkpoint field: the flavor discriminator the
+    # rest of the stack branches on (SpeculativeConfig.use_dspark_with_draft).
+    hf_config.dspark_with_draft = True
+
+    # NOTE: no `dspark_block_size` here. Unlike V4-Pro-DSpark and the SpecForge
+    # SpecForge DFlash checkpoints, this config carries no block width: the draft is
+    # width-agnostic in its weights and the block is sized by
+    # --num-speculative-tokens (7 in the checkpoint's own serving recipe).
+    # DSparkProposer._resolve_mtp_k falls back to that.
+
+    logger.info(
+        "Detected MLA DSpark drafter with a separate draft model "
+        f"(markov_rank={hf_config.dspark_markov_rank}, "
+        f"target_layers={hf_config.dspark_target_layer_ids}, "
+        f"mask_token_id={hf_config.dspark_noise_token_id})"
+    )
 
 
 def _normalize_moe_config_fields(
     hf_config: PretrainedConfig,
-    model_path: Optional[str] = None,
+    model_path: str | None = None,
 ) -> None:
     """Normalize common MoE config field names across model families."""
     moe_config = getattr(hf_config, "text_config", hf_config)
@@ -885,12 +1044,30 @@ def _normalize_moe_config_fields(
 
 @dataclass
 class SpeculativeConfig:
-    method: Optional[str] = ""
-    model: Optional[str] = None
-    num_speculative_tokens: Optional[int] = None
-    draft_model_hf_config: Optional[PretrainedConfig] = None
+    method: str | None = ""
+    model: str | None = None
+    num_speculative_tokens: int | None = None
+    draft_model_hf_config: PretrainedConfig | None = None
     use_aux_hidden_state: bool = False
     eagle3_aux_layer_ids: list[int] = field(default_factory=list)
+    # Debug/benchmark knobs: force a speculative acceptance curve independent of
+    # the real draft/target agreement, so a run can replay a published
+    # acceptance-length figure (an InferenceX golden AL, say) while the draft head
+    # is still training. Set at most one; both resolve into
+    # `synthetic_acceptance_rates`. See ROCm/ATOM#555.
+    #
+    # Mean acceptance length in [1, num_speculative_tokens + 1], counting the
+    # target's own guaranteed token -- the same unit as vLLM's
+    # synthetic_acceptance_length and SGLang's SGLANG_SIMULATE_ACC_LEN, so a
+    # published AL can be pasted in without conversion.
+    synthetic_acceptance_length: float | None = None
+    # The same target expressed as a mean acceptance RATE in [0, 1]
+    # (accepted_draft / total_draft), i.e. (length - 1) / num_speculative_tokens.
+    synthetic_acceptance_rate: float | None = None
+    # Resolved per-position *unconditional* acceptance rates (entry i = marginal
+    # probability that the first i+1 draft tokens are all accepted), filled in by
+    # __post_init__. None => real draft/target rejection sampling.
+    synthetic_acceptance_rates: list[float] | None = None
 
     # model_type → mtp_model_type mapping
     _MTP_TYPE_MAP: ClassVar[dict[str, str]] = {
@@ -916,19 +1093,99 @@ class SpeculativeConfig:
     }
 
     def use_dspark(self) -> bool:
-        """DeepSeek-V4 DSpark semi-autoregressive block drafter.
+        """DSpark semi-autoregressive block drafter (either flavor).
 
-        DSpark ships inside the V4 checkpoint under the same `mtp.*` namespace as
-        serial MTP, but it is a parallel block drafter (parallel backbone +
-        Markov sequential head + confidence head), NOT serial MTP. We detect it
-        by the DSpark-only `dspark_block_size` config field and route it to its
-        own draft model class. We intentionally never silently fall back to MTP:
-        a wrong fallback loads cleanly but measures the wrong algorithm.
+        DSpark is a parallel block drafter (parallel backbone + Markov
+        sequential head + confidence head), NOT serial MTP. Two checkpoint
+        flavors reach here, and both normalize to `dspark_block_size` in
+        `hf_config_override`:
+
+        - V4-Pro-DSpark: ships INSIDE the V4 target checkpoint under the same
+          `mtp.*` namespace serial MTP uses, so only the DSpark-only
+          `dspark_block_size` field distinguishes the two.
+        - Kimi-K3-DSpark: a standalone MLA-backbone checkpoint with its own
+          `architectures: ["K3DSparkModel"]`.
+
+        We intentionally never silently fall back to MTP: a wrong fallback
+        loads cleanly but measures the wrong algorithm.
         """
         cfg = self.draft_model_hf_config
-        return self.method == "dspark" or bool(getattr(cfg, "dspark_block_size", None))
+        return (
+            self.method == "dspark"
+            or bool(getattr(cfg, "dspark_block_size", None))
+            or bool(getattr(cfg, "dspark_with_draft", False))
+        )
+
+    def use_dspark_with_draft(self) -> bool:
+        """True when DSpark was given a separate draft model (--draft-model).
+
+        ``dspark_with_draft`` is NOT a checkpoint field -- do not go looking for
+        it in config.json. It is synthesized by
+        :func:`_normalize_draft_dspark_config`, which runs from
+        :meth:`hf_config_override` when the draft's ``architectures`` is
+        ``["K3DSparkModel"]``, so it is set for exactly the configs that went
+        through that normalization.
+        """
+        cfg = self.draft_model_hf_config
+        return bool(getattr(cfg, "dspark_with_draft", False))
+
+    def _resolve_synthetic_acceptance(self) -> None:
+        """Validate the forced-acceptance knobs and resolve to per-position rates.
+
+        Both knobs describe the same curve, so exactly one may be set; the rate
+        form is converted to a length and everything downstream reads only
+        ``synthetic_acceptance_rates``.
+        """
+        # Local import: the schedule lives next to the kernel that consumes it,
+        # and that module pulls in triton, which has no business loading just
+        # because someone imported a config.
+        from atom.model_ops.rejection_sampler import acceptance_length_to_rates
+
+        if (
+            self.synthetic_acceptance_length is not None
+            and self.synthetic_acceptance_rate is not None
+        ):
+            raise ValueError(
+                "--spec-decode-acceptance-length and --spec-decode-acceptance-rate "
+                "describe the same curve; set at most one."
+            )
+        length = self.synthetic_acceptance_length
+        if self.synthetic_acceptance_rate is None and length is None:
+            return
+
+        n = self.num_speculative_tokens
+        if not n:
+            raise ValueError(
+                "Forced speculative acceptance needs --num-speculative-tokens, "
+                f"but it is {n!r}."
+            )
+        if self.synthetic_acceptance_rate is not None:
+            rate = self.synthetic_acceptance_rate
+            if not 0.0 <= rate <= 1.0:
+                raise ValueError(
+                    "synthetic_acceptance_rate (--spec-decode-acceptance-rate) "
+                    f"must be in [0, 1], but got {rate}."
+                )
+            length = 1.0 + n * rate
+        if not 1.0 <= length <= float(n + 1):
+            raise ValueError(
+                "synthetic_acceptance_length (--spec-decode-acceptance-length) "
+                f"must be in [1, {n + 1}] for num_speculative_tokens={n}, but got "
+                f"{length}."
+            )
+        self.synthetic_acceptance_length = length
+        self.synthetic_acceptance_rates = acceptance_length_to_rates(length, n)
+        logger.info(
+            "Forced speculative acceptance ON: mean acceptance length %.4f over "
+            "%d draft positions (per-position rates %s). Throughput numbers from "
+            "this run are synthetic; output text and accuracy are meaningless.",
+            length,
+            n,
+            [round(r, 4) for r in self.synthetic_acceptance_rates],
+        )
 
     def __post_init__(self):
+        self._resolve_synthetic_acceptance()
         if self.draft_model_hf_config is None:
             self.draft_model_hf_config = get_hf_config(
                 self.model, trust_remote_code=True
@@ -959,10 +1216,13 @@ class SpeculativeConfig:
 
     @staticmethod
     def hf_config_override(
-        hf_config: PretrainedConfig, model_path: Optional[str] = None
+        hf_config: PretrainedConfig, model_path: str | None = None
     ) -> None:
         # Eagle3 architecture mapping (architecture-level, not model_type)
         arch = (getattr(hf_config, "architectures", None) or [""])[0]
+        if arch.endswith("DSparkModel"):
+            _normalize_draft_dspark_config(hf_config)
+            return
         if arch == "LlamaForCausalLMEagle3":
             hf_config.architectures = ["Eagle3LlamaModel"]
         elif arch == "Eagle3DeepseekV2ForCausalLM":
@@ -1089,7 +1349,7 @@ class DSparkConfig:
     disable_sps_calib: bool = False
 
     @classmethod
-    def from_dict(cls, cfg: Optional[dict]) -> "DSparkConfig":
+    def from_dict(cls, cfg: dict | None) -> "DSparkConfig":
         """Build from the ``--dspark-config`` JSON dict.
 
         ``cfg`` maps directly onto this dataclass' fields; unknown keys raise so
@@ -1155,7 +1415,7 @@ class EPLBConfig:
         }, "eplb.placement_policy must be one of {'naive','biased'}"
 
     @classmethod
-    def from_dict(cls, cfg: Optional[dict]) -> "EPLBConfig":
+    def from_dict(cls, cfg: dict | None) -> "EPLBConfig":
         """Build from the ``--eplb-config`` JSON dict.
 
         ``cfg`` maps directly onto this dataclass' fields; unknown keys raise so
@@ -1171,6 +1431,69 @@ class EPLBConfig:
         return cls(**cfg)
 
 
+DCP_COMM_BACKENDS = ("ag_rs", "a2a")
+
+
+@dataclass
+class DCPConfig:
+    """DCP (Decode Context Parallel) sub-config: interleave granularity, query
+    replication, output-merge placement and the merge collective backend --
+    knobs that would otherwise each grow the top-level CLI surface."""
+
+    interleave_size: int = 1
+    enable_query_replication: bool = True
+    enable_project_before_merge: bool = True
+    comm_backend: str = "a2a"
+
+    def __post_init__(self):
+        self.interleave_size = int(self.interleave_size)
+        assert self.interleave_size >= 1, "dcp.interleave_size must be >= 1"
+        self.enable_query_replication = bool(self.enable_query_replication)
+        self.enable_project_before_merge = bool(self.enable_project_before_merge)
+        self.comm_backend = str(self.comm_backend)
+        assert self.comm_backend in DCP_COMM_BACKENDS, (
+            f"dcp.comm_backend must be one of {list(DCP_COMM_BACKENDS)}; "
+            f"got {self.comm_backend!r}"
+        )
+
+    @classmethod
+    def from_dict(cls, cfg: dict | None) -> "DCPConfig":
+        """Build from the ``--dcp-config`` JSON dict.
+
+        ``cfg`` maps directly onto this dataclass' fields; unknown keys raise so
+        typos fail fast."""
+        cfg = cfg or {}
+        allowed = {f.name for f in fields(cls)}
+        unknown = set(cfg) - allowed
+        if unknown:
+            raise ValueError(
+                f"Unknown --dcp-config key(s): {sorted(unknown)}. "
+                f"Supported keys: {sorted(allowed)}"
+            )
+        return cls(**cfg)
+
+
+def qrep_unsupported_reason(
+    dcp_size: int, speculative_config, mxfp4_bmm: bool
+) -> str | None:
+    """Why DCP query replication cannot run here, or None if it can.
+
+    Kept a module-level pure function so it is unit-testable: the alternative,
+    exercising it through ``Config.__post_init__``, needs a real model directory
+    and an HF config. ``Config.__post_init__`` is its only production caller.
+    """
+    if dcp_size <= 1:
+        # No DCP group means there is no AllGather Q to remove.
+        return "decode_context_parallel_size <= 1 (no DCP group)"
+    if speculative_config is not None:
+        # MTP / eagle3 / dspark run a qlen>1 verify on the cprr kernel.
+        return "speculative decode (qlen>1 cprr path)"
+    if mxfp4_bmm:
+        # fp4 (mxfp4) absorbed BMM has a different scale structure.
+        return "fp4 (mxfp4) BMM weights"
+    return None
+
+
 @dataclass
 class Config:
     model: str
@@ -1178,12 +1501,19 @@ class Config:
     max_num_batched_tokens: int = 16384
     long_prefill_token_threshold: int = 0
     attn_prefill_chunk_size: int = 16384
+    # Tokens between rungs of the state-checkpoint ladder, shared by every
+    # Pool.STATE class; 0 = no ladder. Must be a multiple of the prefix-cache
+    # hash block size (asserted in BlockManager). See
+    # BlockManager.checkpointers_at.
+    state_checkpoint_interval_tokens: int = 8192
     scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
     max_model_len: int | None = None
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
     decode_context_parallel_size: int = 1
+    dcp_config: DCPConfig = field(default_factory=DCPConfig)
+    pipeline_parallel_size: int = 1
     prefill_context_parallel_size: int = 1
     enforce_eager: bool = False
     hf_config: PretrainedConfig = field(init=False)
@@ -1206,10 +1536,16 @@ class Config:
     quant_config: QuantizationConfig = field(init=False)
     asyncio_mode: bool = False
     mark_trace: bool = False
-    load_dummy: Optional[str] = None
+    load_dummy: str | None = None
     enable_expert_parallel: bool = False
+    fake_eplb: bool = False
+    # Width the MoE shards experts for when DP-attention simulates a deployment
+    # wider than the box (set by CoreManager); 0 = not simulating.
+    # `parallel_config.data_parallel_size` stays the real rank count, since it
+    # sizes the process group and the token collectives.
+    dp_logical_size: int = 0
     master_addr: str = "127.0.0.1"
-    graph_bs: Optional[list[int]] = None
+    graph_bs: list[int] | None = None
     enable_dp_attention: bool = False
     # DP request-routing strategy used by CoreManager to pick an engine rank:
     # "round_robin" | "least_requests" (default) | "least_tokens". Only has an
@@ -1226,7 +1562,7 @@ class Config:
     # atom/plugin/config.py, not queried via is_vllm() at the call site.
     moe_ep_flatten_tp_across_dp: bool = False
     torch_dtype: torch.dtype = field(init=False)
-    speculative_config: Optional[SpeculativeConfig] = None
+    speculative_config: SpeculativeConfig | None = None
     kv_transfer_config: dict = field(default_factory=dict)
     kv_events_config: KVEventsConfig = field(default_factory=KVEventsConfig.from_env)
     # DSpark runtime knobs. Built once in the parent from --dspark-config (see
@@ -1237,16 +1573,19 @@ class Config:
     enable_tbo: bool = False
     enable_tbo_decode: bool = False
     enable_low_latency: bool = False
+    # Post-routing routed-MoE implementation. This is deliberately separate
+    # from all2all backend/mode: Mega owns dispatch, both GEMMs, and combine.
+    moe_backend: str = "standard"
     runner_qualname: str = "atom.model_engine.model_runner.ModelRunner"
     # EPLB master switch + sub-config
     eplb_enable: bool = False
     eplb_config: EPLBConfig = field(default_factory=EPLBConfig)
 
     # only use for plugin mode
-    plugin_config: Optional[PluginConfig] = None
+    plugin_config: PluginConfig | None = None
     # only for quark_online_quantization
-    online_quant_config: Optional[dict] = None
-    hf_overrides: Optional[dict[str, Any]] = None
+    online_quant_config: dict | None = None
+    hf_overrides: dict[str, Any] | None = None
 
     # Intra-GPU prefill/decode disaggregation
     enable_rapidserve: bool = False
@@ -1267,11 +1606,33 @@ class Config:
     disagg_cu_shm_name: str = ""
     # Override max_num_seqs for the prefill process in disagg mode.
     # When None, prefill inherits the base max_num_seqs.
-    disagg_prefill_max_num_seqs: Optional[int] = None
+    disagg_prefill_max_num_seqs: int | None = None
     # When True (and enable_rapidserve=True), use CU-masked streams + shm
     # coordination between prefill and decode. When False (default),
     # use plain separate streams with no CU masking.
     disagg_constrained: bool = False
+
+    @property
+    def tp_world_size(self) -> int:
+        """Number of TP worker processes actually launched.
+
+        `tensor_parallel_size` is the *logical* width -- how many shards every
+        weight is cut into. Under `--fake-eplb` on a box with fewer visible
+        devices than `-tp`, only the first `tp_world_size` of those shards get
+        a process, reproducing the first N devices of the larger deployment.
+        See `atom/distributed/simulated_tp.py`.
+
+        Gated on `fake_eplb` because such a run's output is garbage anyway;
+        without it, an oversized `-tp` keeps raising in ModelRunner instead of
+        silently running smaller. A property, not a field: `enable_dp_attention`
+        rewrites `tensor_parallel_size` after Config is built.
+        """
+        tp = self.tensor_parallel_size
+        if not self.fake_eplb:
+            return tp
+        # Does not create a CUDA context, so it is safe in the parent process.
+        visible = torch.cuda.device_count()
+        return visible if 0 < visible < tp else tp
 
     def _set_cudagraph_sizes(self):
         if self.compilation_config.cudagraph_capture_sizes:
@@ -1286,8 +1647,17 @@ class Config:
                 self.graph_bs = cuda_graph_sizes
 
     def __post_init__(self):
-        if self.index_cache_dtype is None:
-            self.index_cache_dtype = self.kv_cache_dtype
+        self.moe_backend = self.moe_backend.strip().lower()
+        if self.moe_backend not in ("standard", "mega"):
+            raise ValueError(
+                "moe_backend must be one of {'standard', 'mega'}, "
+                f"got {self.moe_backend!r}"
+            )
+        if self.moe_backend == "mega" and not self.enable_expert_parallel:
+            raise ValueError(
+                "moe_backend='mega' requires expert parallelism; "
+                "pass --enable-expert-parallel."
+            )
 
         if isinstance(self.compilation_config, dict):
             self.compilation_config = CompilationConfig(**self.compilation_config)
@@ -1298,7 +1668,40 @@ class Config:
             self.eplb_config = EPLBConfig(**self.eplb_config.__dict__)
         else:
             raise TypeError("eplb_config must be EPLBConfig or dict")
+        if isinstance(self.dcp_config, dict):
+            self.dcp_config = DCPConfig(**self.dcp_config)
+        elif isinstance(self.dcp_config, DCPConfig):
+            # Normalize/validate even when constructed programmatically.
+            self.dcp_config = DCPConfig(**self.dcp_config.__dict__)
+        else:
+            raise TypeError("dcp_config must be DCPConfig or dict")
         # assert os.path.isdir(self.model)
+
+        # The forced-acceptance schedule spends its whole budget on the first
+        # ceil(length - 1) positions, and the sampler can only accept what was
+        # actually drafted. The DSpark confidence scheduler hands each request
+        # its own verify length ell_r, so whenever ell_r falls below that many
+        # positions the run quietly lands under the acceptance length it was
+        # asked to reproduce (measured at length 3.78 over 7 positions: exact
+        # while ell_r >= 3, 3.39 at ell_r = 2, 2.89 at ell_r = 1). ell_r is
+        # chosen at runtime from the confidence head, so there is no upfront
+        # check that would catch it -- and a benchmark reporting a number it
+        # never hit is worse than one that refuses to start.
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.synthetic_acceptance_rates is not None
+            and self.dspark.confidence_schedule
+        ):
+            raise ValueError(
+                "Forced speculative acceptance (--spec-decode-acceptance-length "
+                "/ --spec-decode-acceptance-rate) cannot be combined with the "
+                "DSpark confidence scheduler (--dspark-config "
+                "'{\"confidence_schedule\": true}'): it sizes each request's "
+                "verify length at runtime, and a short one caps acceptance below "
+                "the requested length with no way to detect it upfront. Drop "
+                "confidence_schedule (and ragged, which needs it) for "
+                "forced-acceptance runs."
+            )
 
         # RapidServe (intra-GPU prefill/decode disagg) needs a specialized
         # runner in both the prefill and decode processes. Select it unless the
@@ -1317,21 +1720,72 @@ class Config:
                 f"tp_size ({self.tensor_parallel_size}) must be divisible by "
                 f"dcp_size ({self.decode_context_parallel_size})"
             )
-            if self.enable_prefix_caching:
-                logger.warning(
-                    "DCP does not support prefix caching yet; "
-                    "disabling enable_prefix_caching."
+            # Spec-decode + DCP arch gating. Any speculative method (mtp /
+            # eagle3 / dspark) runs a q>1 verify pass, and DCP decode with q>1
+            # uses the round-robin CP (cprr) MLA kernel, which is persistent-only
+            # and ships only on gfx950; on gfx942 the non-persistent fallback
+            # ignores the cprr masking and silently produces WRONG output.
+            if self.speculative_config is not None:
+                from aiter.jit.utils.chip_info import get_gfx
+
+                gfx = get_gfx()
+                assert gfx == "gfx950", (
+                    f"Speculative decode + DCP is only supported on gfx950 (needs "
+                    f"the persistent cprr MLA kernel); got {gfx}. Disable DCP or "
+                    f"speculative decode on this GPU."
                 )
-                self.enable_prefix_caching = False
-            if self.enable_chunked_prefill:
+        # DCP KV-cache interleave granularity S. S=1 (default) = token-level
+        # round-robin (unchanged). S>1 = block-level interleave; must divide the
+        # KV block so each physical block holds an integer number of S-groups
+        # (the (i//(S*W))*S + i%S local-index math relies on block_size % S == 0),
+        # and only makes sense under DCP.
+        assert 1 <= self.dcp_config.interleave_size <= self.kv_cache_block_size, (
+            f"dcp_config.interleave_size ({self.dcp_config.interleave_size}) must "
+            f"be in [1, kv_cache_block_size={self.kv_cache_block_size}]"
+        )
+        if self.dcp_config.interleave_size > 1:
+            assert self.kv_cache_block_size % self.dcp_config.interleave_size == 0, (
+                f"kv_cache_block_size ({self.kv_cache_block_size}) must be divisible "
+                f"by dcp_config.interleave_size ({self.dcp_config.interleave_size})"
+            )
+            assert self.decode_context_parallel_size > 1, (
+                "dcp_config.interleave_size > 1 only applies under DCP "
+                f"(decode_context_parallel_size={self.decode_context_parallel_size})"
+            )
+            assert self.speculative_config is None, (
+                "dcp_config.interleave_size > 1 (block-level DCP interleave) is "
+                "incompatible with speculative decode (MTP/eagle/dspark): the q>1 "
+                "verify cprr MLA kernel assumes token-level interleave. Use "
+                "dcp_config.interleave_size=1 with speculative decode, or disable "
+                "speculative decode for block-level interleave."
+            )
+
+        # DCP Query Replication (QREP) first-cut gating: turn the flag OFF
+        # (warn, not error) for combinations not yet wired, so it can default to
+        # on without breaking mixed runs.
+        if self.dcp_config.enable_query_replication:
+            qrep_off = qrep_unsupported_reason(
+                self.decode_context_parallel_size,
+                self.speculative_config,
+                envs.ATOM_USE_TRITON_MXFP4_BMM,
+            )
+            if qrep_off is not None:
                 logger.warning(
-                    "DCP does not support chunked prefill yet; "
-                    "disabling enable_chunked_prefill."
+                    "dcp_config.enable_query_replication disabled: %s not "
+                    "supported in the first cut.",
+                    qrep_off,
                 )
-                self.enable_chunked_prefill = False
+                self.dcp_config.enable_query_replication = False
+        assert 1 <= self.pipeline_parallel_size
         self.hf_config = get_hf_config(
             self.model, trust_remote_code=self.trust_remote_code
         )
+        num_hidden_layers = getattr(self.hf_config, "num_hidden_layers", None)
+        if num_hidden_layers is not None:
+            assert num_hidden_layers >= self.pipeline_parallel_size, (
+                f"num_hidden_layers ({num_hidden_layers}) must be >= "
+                f"pipeline_parallel_size ({self.pipeline_parallel_size})"
+            )
         if self.hf_overrides:
             self.hf_config.update(self.hf_overrides)
             logger.info("Applied HF config overrides: %s", self.hf_overrides)
@@ -1444,19 +1898,42 @@ class Config:
 
         if self.speculative_config is not None:
             num_spec = self.speculative_config.num_speculative_tokens
-            # DSpark is a parallel block drafter: the whole block is produced in
-            # one backbone pass. dspark_block_size (5 for V4-Pro-DSpark) is only
-            # the TRAINING default draft width, NOT a hard ceiling: the DSpark
-            # weights are draft-width-agnostic (no parameter shape depends on it),
-            # so a wider verify horizon is drafted in the same single pass, with
-            # positions past block_size RoPE-extrapolated. The real ceiling is the
-            # rolling target-KV window (sliding_window=128), beyond which the
-            # [window ++ draft] block attention no longer fits its context.
             is_dspark = getattr(self.speculative_config, "use_dspark", lambda: False)()
             draft_cfg = self.speculative_config.draft_model_hf_config
-            max_spec = (
-                int(getattr(draft_cfg, "sliding_window", 128)) if is_dspark else 4
-            )
+            if not is_dspark:
+                # Sequential drafters (MTP / Eagle): one drafted token per
+                # backbone pass, so the horizon is a small fixed depth.
+                max_spec = 4
+            else:
+                # DSpark is a PARALLEL block drafter: all flavors
+                # (inline V4, standalone K3 / Qwen3 / ...) share this path with
+                # no per-model constants.
+                train_block = getattr(draft_cfg, "dspark_block_size", None)
+                if getattr(draft_cfg, "dspark_with_draft", False):
+                    # Standalone draft: attends a paged sibling KV holding the
+                    # full context, so the hard ceiling is a block cap the
+                    # checkpoint may set, else a generous default.
+                    max_spec = int(
+                        getattr(draft_cfg, "dspark_max_block", None)
+                        or _DSPARK_DEFAULT_MAX_BLOCK
+                    )
+                else:
+                    # Inline draft (V4): attends a ROLLING target-KV window, so
+                    # the hard ceiling is that window -- beyond it the
+                    # [window ++ draft] block attention no longer fits its
+                    # context. `sliding_window` may be present-but-None.
+                    max_spec = int(
+                        getattr(draft_cfg, "sliding_window", None)
+                        or _DSPARK_DEFAULT_ROLLING_WINDOW
+                    )
+                if train_block and num_spec is not None and num_spec > train_block:
+                    logger.warning(
+                        "num_speculative_tokens=%d exceeds the DSpark draft's "
+                        "training block size (%d): accepted, but expect a lower "
+                        "accepted length.",
+                        num_spec,
+                        train_block,
+                    )
             if num_spec is None or num_spec < 1 or num_spec > max_spec:
                 raise ValueError(
                     f"num_speculative_tokens must be between 1 and {max_spec}, "
@@ -1477,10 +1954,28 @@ class Config:
         # Use the preserved `architectures` field (re-injected by get_hf_config,
         # line 567) which keeps the original "DeepseekV4ForCausalLM[NextN]" name.
         arches = getattr(self.hf_config, "architectures", None) or []
-        if any("DeepseekV4" in str(a) for a in arches):
+        is_deepseek_v4 = any("DeepseekV4" in str(a) for a in arches)
+        if is_deepseek_v4:
             v4_block_size = 256
             if self.kv_cache_block_size != v4_block_size:
                 self.kv_cache_block_size = v4_block_size
+
+        # Keep ``None`` intact until the model architecture is known so an
+        # omitted index-cache option remains distinguishable from an explicit
+        # fp8/bf16 override. Native single-node V4 defaults to the FP4 indexer
+        # except on gfx942. Plugin proxy pools and KV-transfer region maps do
+        # not yet describe the separate FP4 scale pool, so those integrations
+        # retain FP8 until their layouts support it. Every other model keeps
+        # the historical KV-cache-dtype default.
+        if self.index_cache_dtype is None and is_deepseek_v4:
+            if self.plugin_config is None and not self.kv_transfer_config:
+                from aiter.jit.utils.chip_info import get_gfx
+
+                self.index_cache_dtype = "fp8" if get_gfx() == "gfx942" else "fp4"
+            else:
+                self.index_cache_dtype = "fp8"
+        elif self.index_cache_dtype is None:
+            self.index_cache_dtype = self.kv_cache_dtype
 
     def compute_hash(self) -> str:
         """
@@ -1559,7 +2054,7 @@ class Config:
         return hash_str
 
 
-_current_atom_config: Optional[Config] = None
+_current_atom_config: Config | None = None
 
 
 def set_current_atom_config(atom_config: Config):
@@ -1567,22 +2062,24 @@ def set_current_atom_config(atom_config: Config):
     _current_atom_config = atom_config
 
 
-def _get_current_atom_config_from_vllm_forward_context() -> Optional[Config]:
+def _get_current_atom_config_from_vllm_forward_context() -> Config | None:
     # In vLLM plugin mode (especially speculative decode), main/draft models
     # can coexist in one process. Resolve per-forward config first to avoid
     # reading a stale global singleton.
     try:
         from vllm.forward_context import (
             get_forward_context as get_vllm_forward_context,
+        )
+        from vllm.forward_context import (
             is_forward_context_available,
         )
-    except Exception:
+    except (ImportError, AttributeError):
         return None
     if not is_forward_context_available():
         return None
     try:
         return get_vllm_forward_context().additional_kwargs.get("atom_config")
-    except Exception:
+    except (ImportError, AttributeError):
         return None
 
 

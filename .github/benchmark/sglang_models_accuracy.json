@@ -23,6 +23,7 @@
     "lm_eval_num_fewshot": 5,
     "lm_eval_num_concurrent": 8,
     "accuracy_threshold": 0.94,
+    "mtp_accept_threshold": 0.8,
     "accuracy_baseline": null,
     "accuracy_baseline_model": "deepseek-ai/DeepSeek-V4-Pro",
     "_baseline_note": "DeepSeek V4-Pro MTP1 follows the V4-Pro TP8 GSM8K 5-shot threshold while enabling EAGLE speculative decoding."
@@ -37,6 +38,7 @@
     "lm_eval_num_fewshot": 5,
     "lm_eval_num_concurrent": 8,
     "accuracy_threshold": 0.94,
+    "mtp_accept_threshold": 0.55,
     "accuracy_baseline": 0.9507,
     "accuracy_baseline_model": "deepseek-ai/DeepSeek-V4-Pro",
     "_baseline_note": "DeepSeek V4-Pro MTP3 full GSM8K validation measured flexible-extract = 0.9507 ± 0.0060 with EAGLE speculative decoding."
@@ -65,7 +67,7 @@
     "accuracy_threshold": 0.91,
     "accuracy_baseline": null,
     "accuracy_baseline_model": "deepseek-ai/DeepSeek-R1-0528",
-    "_baseline_note": "Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k."
+    "_baseline_note": "TP4 uses AITER attention with FP8 Q/KV decode; threshold aligned with the SGLANG gsm8k target."
   },
   {
     "model_name": "DeepSeek-R1-FP8 TP4 Online Quant",
@@ -77,7 +79,7 @@
     "accuracy_threshold": 0.91,
     "accuracy_baseline": null,
     "accuracy_baseline_model": "deepseek-ai/DeepSeek-R1-0528",
-    "_baseline_note": "Online quant coverage based on the DeepSeek-R1-FP8 TP4 SGLang accuracy validation target for gsm8k."
+    "_baseline_note": "Online quant TP4 uses AITER attention with FP8 Q/KV decode; threshold follows the DeepSeek-R1-FP8 TP4 gsm8k target."
   },
   {
     "model_name": "Kimi-K2.6-MXFP4 TP4",
@@ -104,6 +106,20 @@
     "_baseline_note": "TP8 coverage for the Kimi-K2.6-MXFP4 SGLang accuracy validation target for gsm8k."
   },
   {
+    "model_name": "Kimi-K3 TP8",
+    "model_path": "moonshotai/Kimi-K3",
+    "extraArgs": "--trust-remote-code --tensor-parallel-size 8 --attention-backend aiter --kv-cache-dtype fp8_e4m3 --page-size 128 --context-length 16384 --mem-fraction-static 0.93 --disable-radix-cache",
+    "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_PLUGINS=atom_sglang\nSGLANG_USE_AITER=1\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nSGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=atom.plugin.sglang.models\nATOM_LOADER_NUM_THREADS=16\nATOM_SYNC_AFTER_LOAD=1\nATOM_DIST_TIMEOUT_SECONDS=3600\nATOM_USE_TRITON_GEMM=1\nAITER_USE_GROUPED_GEMM=0\nATOM_USE_TRITON_MOE=0\nAITER_FLYDSL_FORCE=1\nAITER_FORCE_GFX1250=0\nATOM_MLA_PAGE_SIZE=1\nATOM_USE_UNIFIED_ATTN=1\nATOM_FORCE_ATTN_TRITON=1",
+    "runner": "atom-plugin-acc-validation-runner-sgl",
+    "test_level": "nightly",
+    "lm_eval_num_fewshot": 5,
+    "lm_eval_num_concurrent": 64,
+    "accuracy_threshold": 0.94,
+    "accuracy_baseline": 0.9553,
+    "accuracy_baseline_model": "moonshotai/Kimi-K3",
+    "_baseline_note": "Kimi-K3 TP8 with FP8 KV cache and CUDA Graph. The 0.9553 GSM8K 5-shot flexible-extract reference comes from the validated ATOM vLLM Kimi-K3 recipe; refresh with the first SGLang nightly measurement."
+  },
+  {
     "model_name": "MiniMax-M3-MXFP4 TP4",
     "model_path": "amd/MiniMax-M3-MXFP4",
     "extraArgs": "--trust-remote-code --tensor-parallel-size 4 --attention-backend aiter --page-size 128 --mem-fraction-static 0.8 --max-running-requests 128 --disable-radix-cache",
@@ -118,6 +134,23 @@
     "accuracy_baseline": null,
     "accuracy_baseline_model": "amd/MiniMax-M3-MXFP4",
     "_baseline_note": "SGLang-ATOM MiniMax-M3-MXFP4 TP4 measured on GSM8K benchmark."
+  },
+  {
+    "model_name": "MiniMax-M3-MXFP8 EAGLE3 TP4 MTP3",
+    "model_path": "MiniMaxAI/MiniMax-M3-MXFP8",
+    "extraArgs": "--trust-remote-code --random-seed 0 --tensor-parallel-size 4 --attention-backend aiter --mem-fraction-static 0.75 --page-size 128 --context-length 32768 --max-running-requests 128 --model-loader-extra-config '{\"online_quant_config\":{\"global_quant_config\":\"ptpc_fp8\",\"exclude_layer\":[\"lm_head\",\"model.embed_tokens\",\"vision_tower\",\"multi_modal_projector\",\"patch_merge_mlp\",\"*block_sparse_moe\"]}}' --json-model-override-args '{\"use_index_cache\":true,\"index_topk_freq\":4}' --speculative-algorithm EAGLE3 --speculative-draft-model-path Inferact/MiniMax-M3-EAGLE3 --speculative-num-steps 3 --speculative-eagle-topk 1 --kv-cache-dtype fp8_e4m3 --disable-radix-cache --decode-log-interval 1",
+    "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nSGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=atom.plugin.sglang.models\nAITER_QUICK_REDUCE_QUANTIZATION=INT4\nSGLANG_USE_AITER=1\nSGLANG_AITER_FP8_PREFILL_ATTN=0\nATOM_FORCE_ATTN_TRITON=1\nSGLANG_ENABLE_TORCH_COMPILE=1\nTORCHINDUCTOR_COMPILE_THREADS=128\nATOM_SGLANG_EAGLE3_TP_VERIFY_BROADCAST=1",
+    "runner": "atom-plugin-acc-validation-runner-sgl",
+    "test_level": "nightly",
+    "lm_eval_num_fewshot": 5,
+    "lm_eval_num_concurrent": 32,
+    "lm_eval_use_chat_completions": "1",
+    "lm_eval_extra_model_args": "max_gen_toks=16384",
+    "accuracy_threshold": 0.93,
+    "mtp_accept_threshold": 0.35,
+    "accuracy_baseline": null,
+    "accuracy_baseline_model": "MiniMaxAI/MiniMax-M3-MXFP8 + Inferact/MiniMax-M3-EAGLE3",
+    "_baseline_note": "SGLang-ATOM MiniMax-M3-MXFP8 TP4 with EAGLE3 speculative decoding; threshold follows the existing MiniMax-M3 GSM8K validation target."
   },
   {
     "model_name": "Qwen3.5-35B-A3B-FP8 TP2",
@@ -219,13 +252,13 @@
     "model_name": "DeepSeek-R1-FP4 TP4",
     "model_path": "amd/DeepSeek-R1-0528-MXFP4-v2",
     "extraArgs": "--trust-remote-code --tensor-parallel-size 4 --attention-backend aiter --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.85 --page-size 1 --disable-radix-cache",
-    "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_AITER_FP8_PREFILL_ATTN=0\nSGLANG_USE_AITER=1\nATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nSGLANG_ENABLE_TORCH_COMPILE=1\nTORCHINDUCTOR_COMPILE_THREADS=128",
+    "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_AITER_FP8_PREFILL_ATTN=0\nSGLANG_USE_AITER=1\nATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nSGLANG_ENABLE_TORCH_COMPILE=1\nTORCHINDUCTOR_COMPILE_THREADS=128\nATOM_LOADER_NUM_THREADS=1",
     "runner": "atom-plugin-acc-validation-runner-sgl",
     "test_level": "nightly",
     "accuracy_threshold": 0.91,
     "accuracy_baseline": null,
     "accuracy_baseline_model": "amd/DeepSeek-R1-0528-MXFP4-v2",
-    "_baseline_note": "Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k."
+    "_baseline_note": "TP4 uses AITER attention with FP8 Q/KV decode; serial loading avoids under-filled batched MoE expert groups."
   },
   {
     "model_name": "DeepSeek-R1-FP4 TP4 DP4 EP4",
@@ -271,6 +304,7 @@
     "runner": "atom-plugin-acc-validation-runner-sgl",
     "test_level": "nightly",
     "accuracy_threshold": 0.93,
+    "mtp_accept_threshold": 0.5,
     "accuracy_baseline": null,
     "accuracy_baseline_model": "amd/DeepSeek-R1-0528-MXFP4-v2",
     "_baseline_note": "Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k."
@@ -283,6 +317,7 @@
     "runner": "atom-plugin-acc-validation-runner-sgl",
     "test_level": "nightly",
     "accuracy_threshold": 0.93,
+    "mtp_accept_threshold": 0.75,
     "accuracy_baseline": null,
     "accuracy_baseline_model": "amd/DeepSeek-R1-0528-MXFP4-v2",
     "_baseline_note": "Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k."
@@ -327,10 +362,10 @@
     "_baseline_note": "5-shot GSM8K local-completions coverage for GLM-5.2-FP8 IndexShare using the SGLang-ATOM recipe server command."
   },
   {
-    "model_name": "GLM-5.2-FP8 TP4 PCP2",
+    "model_name": "GLM-5.2-FP8 TP4 PCP4",
     "model_path": "zai-org/GLM-5.2-FP8",
-    "extraArgs": "--trust-remote-code --tp-size 4 --enable-nsa-prefill-context-parallel --attn-cp-size 2 --nsa-prefill-cp-mode round-robin-split --max-prefill-tokens 30720 --chunked-prefill-size 30720 --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.85 --disable-radix-cache --model-loader-extra-config '{\"online_quant_config\":{\"global_quant_config\":\"ptpc_fp8\",\"layer_quant_config\":{\"model.layers.*.mlp.experts\":\"per_block_fp8\"},\"exclude_layer\":[\"lm_head\",\"model.embed_tokens\",\"*.mlp.gate\"]}}'",
-    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1\nSGLANG_USE_AITER=1\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nATOM_SGLANG_PCP_SIZE=2\nATOM_PCP_MOE_MERGE=1\nTORCHINDUCTOR_COMPILE_THREADS=128",
+    "extraArgs": "--trust-remote-code --tp-size 4 --enable-nsa-prefill-context-parallel --attn-cp-size 4 --nsa-prefill-cp-mode round-robin-split --max-prefill-tokens 30720 --chunked-prefill-size 30720 --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.85 --disable-radix-cache --model-loader-extra-config '{\"online_quant_config\":{\"global_quant_config\":\"ptpc_fp8\",\"layer_quant_config\":{\"model.layers.*.mlp.experts\":\"per_block_fp8\"},\"exclude_layer\":[\"lm_head\",\"model.embed_tokens\",\"*.mlp.gate\"]}}'",
+    "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1\nSGLANG_USE_AITER=1\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nATOM_SGLANG_PCP_SIZE=4\nATOM_PCP_MOE_MERGE=1\nTORCHINDUCTOR_COMPILE_THREADS=128",
     "runner": "atom-plugin-acc-validation-runner-sgl",
     "test_level": "nightly",
     "lm_eval_num_fewshot": 5,
@@ -338,7 +373,7 @@
     "accuracy_threshold": 0.92,
     "accuracy_baseline": null,
     "accuracy_baseline_model": "zai-org/GLM-5.2-FP8",
-    "_baseline_note": "GLM-5.2-FP8 SGLang world-size 4 with ATOM effective TP2 x PCP2; threshold follows the TP4 5-shot GSM8K baseline until PCP measurements are collected."
+    "_baseline_note": "GLM-5.2-FP8 SGLang world-size 4 with ATOM effective TP1 x PCP4; threshold follows the TP4 5-shot GSM8K baseline until PCP measurements are collected."
   },
   {
     "model_name": "GLM-5.2-MXFP4 TP4",

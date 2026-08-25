@@ -119,6 +119,7 @@ support_draft_model_arch_dict = {
     "Qwen3_5MTPModel": "atom.models.qwen3_5_mtp.Qwen3_5MTP",
     "Eagle3LlamaModel": "atom.models.eagle3_llama.Eagle3LlamaModel",
     "Eagle3DeepseekMLAModel": "atom.models.eagle3_deepseek_mla.Eagle3DeepseekMLAModel",
+    "K3DSparkModel": "atom.models.kimi_k3_dspark.KimiK3DSpark",
 }
 
 
@@ -157,7 +158,6 @@ class Drafter(abc.ABC):
             support_draft_model_arch_dict[draft_hf.architectures[0]]
         )
         self.model = self._build_draft_model(model_class)
-        self._draft_argmax_fused = hasattr(self.model, "compute_draft_token")
 
         # Drafter-owned aux capture state (armed by arm_aux_capture).
         self._captures_aux = False
@@ -224,6 +224,16 @@ class Drafter(abc.ABC):
         """Confidence-schedule verify planner (DSpark Level B), or None when the
         drafter uses fixed-length verification."""
         return None
+
+    @property
+    def precompute_duplicates_propose(self) -> bool:
+        """Is `precompute_context_kv` the pass propose's first draft step redoes?
+
+        True (EAGLE) means the two must never both run: the second is a
+        collective the peers on `dummy_execution` do not mirror. False (DSpark)
+        means it writes storage propose only reads, so it always runs.
+        """
+        return False
 
     # ---- aux-hidden-state ownership (drafter-owned, hook-based) ----
     def arm_aux_capture(self, target_model: nn.Module) -> None:
@@ -307,6 +317,34 @@ class Drafter(abc.ABC):
         n = target_hidden_states.shape[0]
         return [buf[:n] for buf in self._aux_buffers]
 
+    def anchors_to_gpu(self, anchors: list[int]) -> torch.Tensor:
+        """Scheduler-supplied anchors as an int32 GPU tensor, without blocking.
+
+        `-1` entries survive as-is; callers read them as "sampling supplies it".
+        Uses ``forward_vars`` so the PP ring clones it per in-flight slot.
+        """
+        n = len(anchors)
+        buf = self.runner.forward_vars["draft_next_tokens"]
+        buf.np[:n] = anchors
+        return buf.copy_to_gpu(n)
+
+    def precompute_context_kv(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        next_token_ids: list[int] | None,
+    ) -> None:
+        """Absorb one target forward into whatever context this drafter keeps.
+
+        Called after EVERY target forward, including the ones that sample
+        nothing. `propose()` is reached only from a forward that samples, so a
+        context maintained there covers a chunked prefill's final chunk alone.
+
+        `next_token_ids` is the token one position past this forward, per seq:
+        -1 where sampling supplies it, None on unlabelled batches.
+        """
+        return
+
     # ---- shared machinery ----
     @staticmethod
     def _share_if_not_loaded(
@@ -327,28 +365,28 @@ class Drafter(abc.ABC):
             setattr(owner, attr, source)
 
     def load_model(self, target_model: nn.Module) -> None:
-        if self.speculative_config.method == "eagle3":
-            load_model(
-                self.model,
-                self.speculative_config.model,
-                self.speculative_config.draft_model_hf_config,
-                self.config.load_dummy,
-                False,
-            )
-            logger.info(
-                "Eagle3 draft model loaded from %s (independent embed/lm_head)",
-                self.speculative_config.model,
-            )
-            return
-
-        # MTP: load from the target model checkpoint and share embeddings/lm_head.
+        # Three drafter flavors cover three of the four combinations:
+        #   eagle3          standalone ckpt, independent embed + lm_head
+        #   K3 DSpark       standalone ckpt, SHARED embed + lm_head (Kimi-K3:
+        #                   the checkpoint ships neither)
+        #   MTP / V4 DSpark weights inside the target ckpt, shared embed/lm_head
+        # so they are decided separately below rather than by one method probe.
+        spec = self.speculative_config
+        standalone_ckpt = spec.method == "eagle3" or spec.use_dspark_with_draft()
         loaded = load_model(
             self.model,
-            self.config.model,
-            self.speculative_config.draft_model_hf_config,
+            spec.model if standalone_ckpt else self.config.model,
+            spec.draft_model_hf_config,
             self.config.load_dummy,
-            True,
+            not standalone_ckpt,
         )
+
+        if spec.method == "eagle3":
+            logger.info(
+                "Eagle3 draft model loaded from %s (independent embed/lm_head)",
+                spec.model,
+            )
+            return
 
         # Resolve the base model (unwrap multimodal wrapper if present)
         target_base = getattr(target_model, "language_model", target_model)

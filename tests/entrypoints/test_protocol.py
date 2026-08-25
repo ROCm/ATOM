@@ -16,7 +16,7 @@ from atom.entrypoints.openai.protocol import (
     ErrorResponse,
     ModelCard,
     ModelList,
-    openai_finish_reason,
+    openai_stop_reason,
 )
 
 # ============================================================================
@@ -364,7 +364,7 @@ class TestResponseModels:
 # ============================================================================
 
 
-class TestOpenAIFinishReason:
+class TestOpenAIStopReason:
     """The engine has its own vocabulary; the API must speak OpenAI's."""
 
     @pytest.mark.parametrize(
@@ -372,11 +372,11 @@ class TestOpenAIFinishReason:
         ["eos", "stop_sequence", "stop_200020", "aborted", "unschedulable: kv"],
     )
     def test_non_length_terminations_map_to_stop(self, engine_reason):
-        assert openai_finish_reason(engine_reason) == "stop"
+        assert openai_stop_reason(engine_reason) == "stop"
 
     def test_max_tokens_maps_to_length(self):
         # Clients use "length" to decide whether to ask for a continuation.
-        assert openai_finish_reason("max_tokens") == "length"
+        assert openai_stop_reason("max_tokens") == "length"
 
     def test_unfinished_stays_none(self):
-        assert openai_finish_reason(None) is None
+        assert openai_stop_reason(None) is None

@@ -1,11 +1,11 @@
 """Lifecycle tests for the GLM5 rtp-llm wrapper."""
 
 import ast
-from contextlib import nullcontext
 import importlib
 import os
-from pathlib import Path
 import sys
+from contextlib import nullcontext
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 

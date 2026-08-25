@@ -11,7 +11,7 @@ from typing import Any, Union
 import numpy as np
 import torch
 
-from atom.config import Config, KVCacheTensor, ParallelConfig
+from atom.config import Config, CUDAGraphMode, KVCacheTensor, ParallelConfig
 
 
 class AttnState(Enum):
@@ -333,6 +333,12 @@ class Context:
     # land on each other's rows. Read per-thread (the context is thread-local).
     ubatch_token_offset: int = 0
 
+    # Optional speculative-decoding inputs staged alongside the target
+    # forward's other host-to-device copies. Keeping these on the per-forward
+    # context avoids launching pinned-buffer H2Ds later from postprocess.
+    draft_anchor_overrides: torch.Tensor | None = None
+    draft_ragged_lens: torch.Tensor | None = None
+
     def __init__(
         self,
         positions: torch.Tensor,
@@ -345,6 +351,8 @@ class Context:
         forward_mode: ForwardMode | None = None,
         input_ids: torch.Tensor | None = None,
         ubatch_token_offset: int = 0,
+        draft_anchor_overrides: torch.Tensor | None = None,
+        draft_ragged_lens: torch.Tensor | None = None,
     ):
         self.positions = positions
         self.is_prefill = is_prefill
@@ -356,6 +364,8 @@ class Context:
         self.forward_mode = forward_mode
         self.input_ids = input_ids
         self.ubatch_token_offset = ubatch_token_offset
+        self.draft_anchor_overrides = draft_anchor_overrides
+        self.draft_ragged_lens = draft_ragged_lens
 
 
 @dataclass
@@ -371,6 +381,9 @@ class AttentionMetaData:
     context_lens: torch.Tensor | None = None
     block_tables: torch.Tensor | None = None
     dropout_p: float = 0.0
+    # True for standard causal attention; False only for DSpark's bidirectional
+    # draft block. The MLA asm decode kernel selects a different .co by this flag.
+    causal: bool = True
 
     state: AttnState = AttnState.PREFILL_NATIVE
     """One of `DECODE / PREFILL_NATIVE / PREFILL_PREFIX` — controls which
@@ -415,6 +428,7 @@ class AttentionMetaData:
         context_lens: torch.Tensor | None = None,
         block_tables: torch.Tensor | None = None,
         dropout_p: float = 0.0,
+        causal: bool = True,
         state: AttnState = AttnState.PREFILL_NATIVE,
         kv_indptr: torch.Tensor | None = None,
         kv_indices: torch.Tensor | None = None,
@@ -449,6 +463,7 @@ class AttentionMetaData:
         self.context_lens = context_lens
         self.block_tables = block_tables
         self.dropout_p = dropout_p
+        self.causal = causal
         self.state = state
         self.kv_indptr = kv_indptr
         self.kv_indices = kv_indices
@@ -600,6 +615,57 @@ def get_forward_context() -> ForwardContext:
     return _forward_context
 
 
+def _normalize_cudagraph_runtime_mode(mode: Any) -> CUDAGraphMode | None:
+    """Normalize a frontend runtime mode to ATOM's concrete enum.
+
+    Frontends own their graph dispatch and therefore use distinct enum
+    classes.  Match by name rather than value so their enum layouts can evolve
+    independently.  Composite configuration modes are deliberately rejected:
+    a forward context must describe the concrete NONE/PIECEWISE/FULL decision
+    for the current batch.
+    """
+    name = mode if isinstance(mode, str) else getattr(mode, "name", None)
+    if name not in {"NONE", "PIECEWISE", "FULL"}:
+        return None
+    return CUDAGraphMode[name]
+
+
+def get_current_cudagraph_runtime_mode() -> CUDAGraphMode:
+    """Return the concrete graph mode for the active model forward.
+
+    In vLLM plugin mode graph capture/replay is owned by vLLM, so its forward
+    context is authoritative.  Native ATOM records the same decision on its
+    own ForwardContext.  An unavailable/unknown context is treated as NONE:
+    eager dual-stream execution is valid, and some vLLM runners expose NONE
+    while a whole-model FULL graph is being captured.  Replay does not execute
+    this Python dispatcher.
+    """
+    from atom.plugin import is_vllm
+
+    if is_vllm():
+        try:
+            from vllm.forward_context import (
+                get_forward_context as get_vllm_forward_context,
+            )
+            from vllm.forward_context import (
+                is_forward_context_available,
+            )
+
+            if is_forward_context_available():
+                mode = _normalize_cudagraph_runtime_mode(
+                    get_vllm_forward_context().cudagraph_runtime_mode
+                )
+                if mode is not None:
+                    return mode
+        except (ImportError, AttributeError, AssertionError):
+            pass
+
+    mode = _normalize_cudagraph_runtime_mode(
+        getattr(get_forward_context(), "cudagraph_runtime_mode", None)
+    )
+    return mode if mode is not None else CUDAGraphMode.NONE
+
+
 def set_forward_context(
     attn_metadata: AttentionMetaData,
     atom_config: Config,
@@ -716,12 +782,11 @@ def set_kv_cache_data(
 ) -> None:
     """Register KV cache data globally and with the KV connector if enabled.
 
-    ``num_blocks`` is the physical KV block count; the offload connector needs
-    it to byte-slice MLA's token-major latent cache (where tensor.shape[0] is
-    the token count, not the block count).
+    ``num_blocks`` is the scheduler-visible KV block count (the ID space used
+    by request block tables). The offload connector needs it to byte-slice
+    MLA's token-major latent cache, where tensor.shape[0] is the page-size-1
+    physical row count rather than the scheduler block count.
     """
-    global _forward_kv_cache_context
-
     if hasattr(config, "kv_transfer_config") and config.kv_transfer_config:
         connector = get_kvconnector(config=config)
         if connector is not None:

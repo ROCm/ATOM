@@ -5,6 +5,10 @@ Covers the self-contained, GPU-free pieces: Markov head + Confidence head
 numerics, and SpeculativeConfig DSpark detection/routing.
 """
 
+import pytest
+
+pytest.importorskip("aiter", reason="the compiled draft imports aiter at module load")
+
 import torch
 
 from atom.models.deepseek_v4_dspark import (
@@ -324,3 +328,558 @@ def test_scheduler_multi_request_global_topk():
     sps = torch.linspace(1.0, 0.3, steps=32)
     ell = schedule_prefix_lengths(conf, sps, early_stop=True)
     assert ell[0] >= ell[1]
+
+
+# ---------------------------------------------------------------------------
+# AF_PIECEWISE generic contract (atom/utils/attn_ffn_piecewise.py)
+# ---------------------------------------------------------------------------
+
+
+def _core_probe(*, piecewise, capturing, graph_ready, dummy=False, capture=True):
+    """Drive a decorated core once against fake collaborators and report which
+    of capture / replay / deliver / bare-core it chose.
+
+    `capture` is the mode gate (AF_PIECEWISE on). Off, the core never records a
+    graph of its own -- plain PIECEWISE, eager core plus a stabilised output."""
+    import types
+
+    from atom.utils.attn_ffn_piecewise import piecewise_core
+
+    log = []
+
+    class FakeRunner:
+        def has_graph(self, key):
+            return graph_ready
+
+        def input_buffers(self, inputs, input_names, upstream):
+            # (what the graph reads, what replay has to refresh)
+            return dict(inputs), {}
+
+        def capture(self, key, read_from, refresh, core, out_buf):
+            log.append("capture")
+
+        def replay(self, key, inputs):
+            log.append("replay")
+            return "replayed"
+
+    class FakeOutputs:
+        def slot(self, key, sample):
+            return sample
+
+        def deliver(self, key, out):
+            log.append("deliver")
+            return out
+
+    @piecewise_core()
+    def core(layer, *, x):
+        log.append("core")
+        return x
+
+    fc = types.SimpleNamespace(
+        context=types.SimpleNamespace(is_dummy_run=dummy),
+        attn_metadata=object(),
+        in_hipgraph=capturing,
+    )
+    core(
+        types.SimpleNamespace(layer_name="l0"),
+        runner=FakeRunner(),
+        outputs=FakeOutputs(),
+        piecewise=piecewise,
+        capture=capture,
+        forward_context=fc,
+        x=torch.ones(4),
+    )
+    return log
+
+
+def test_decorated_core_picks_capture_replay_or_eager():
+    # The decision table, pinned. Every row that is not a replay must end in a
+    # deliver: whatever computed the output still owes it to the fixed address
+    # the downstream dense piece reads.
+    P = _core_probe
+
+    # Not piecewise: no graph cache, and no slot to deliver to either.
+    assert P(piecewise=False, capturing=False, graph_ready=False) == ["core"]
+    assert P(piecewise=False, capturing=True, graph_ready=True) == ["core"]
+
+    # Capture pass, first time this key appears: warm up, record, then compute
+    # the real answer (the recording fed on clones).
+    assert P(piecewise=True, capturing=True, graph_ready=False) == [
+        "core",
+        "capture",
+        "core",
+        "deliver",
+    ]
+    # Real step with a graph ready: replay only.
+    assert P(piecewise=True, capturing=False, graph_ready=True) == ["replay"]
+    # Capture pass revisiting a key, and a real step never captured: eager.
+    assert P(piecewise=True, capturing=True, graph_ready=True) == ["core", "deliver"]
+    assert P(piecewise=True, capturing=False, graph_ready=False) == ["core", "deliver"]
+
+    # A dummy run never touches the cache, but still owes the slot.
+    assert P(piecewise=True, capturing=True, graph_ready=False, dummy=True) == [
+        "core",
+        "deliver",
+    ]
+
+    # Plain PIECEWISE (capture gate off): the core never records or replays a
+    # graph of its own, whatever the capture pass / cache says -- it runs eager
+    # and only stabilises its output. This is the path the three-way branch in
+    # v4_core_attention used to hand-code outside the decorator.
+    assert P(piecewise=True, capturing=True, graph_ready=True, capture=False) == [
+        "core",
+        "deliver",
+    ]
+    assert P(piecewise=True, capturing=False, graph_ready=True, capture=False) == [
+        "core",
+        "deliver",
+    ]
+
+
+def test_non_tensor_params_are_passthrough_not_graph_inputs():
+    # A bool/int/enum config arg on a core is forwarded to the body untouched
+    # (and baked at capture), NOT treated as a graph input to clone or capture
+    # on. This is what lets a model keep its own config flags in its signature --
+    # e.g. V4's `compressor_already_launched` -- without the decorator choking on
+    # a non-tensor. The split comes off the annotations.
+    import torch as _t
+
+    from atom.utils.attn_ffn_piecewise import piecewise_core
+
+    seen = {}
+
+    @piecewise_core()
+    def core(layer, *, x: _t.Tensor, flag: bool = False, n: int = 0):
+        seen["flag"] = flag
+        seen["n"] = n
+        return x
+
+    # Only the tensor is a graph input; the annotated non-tensors are config.
+    assert core.input_names == ("x",)
+    assert core.passthrough_names == ("flag", "n")
+    # piecewise=False just runs the body, and the config args reach it as passed.
+    out = core(object(), piecewise=False, x=_t.ones(3), flag=True, n=7)
+    assert out.shape == (3,)
+    assert seen == {"flag": True, "n": 7}
+
+
+def test_runner_copies_only_what_is_not_zero_copy():
+    import torch as _t
+
+    from atom.utils.cuda_graph import CudagraphCaptureRunner
+
+    r = CudagraphCaptureRunner()
+    inputs = {"x": _t.ones(4, 8), "positions": _t.arange(4)}
+    read_from, refresh = r.input_buffers(inputs, ("x", "positions"), frozenset({"x"}))
+    # A zero-copy input is captured on the caller's own tensor and never
+    # refreshed -- that is what makes its producer responsible for the address.
+    assert read_from["x"] is inputs["x"]
+    assert "x" not in refresh
+    # Everything else is cloned, and the clone is what replay copies into.
+    assert read_from["positions"] is not inputs["positions"]
+    assert refresh["positions"] is read_from["positions"]
+
+
+def test_v4_core_captures_on_everything_but_positions():
+    # Pins the one input the graph must not bake a pointer to. Capturing on it
+    # costs ~2pts of accuracy; the root cause was never found, so this is the
+    # workaround and it has to stay stated somewhere a change would trip over.
+    import pytest
+
+    try:
+        from atom.models.deepseek_v4 import DeepseekV4Attention
+
+        core = DeepseekV4Attention._attn_core
+    except ImportError as e:
+        if "aiter" not in str(e):
+            raise
+        pytest.skip(f"requires aiter to import deepseek_v4: {e}")
+
+    assert set(core.zero_copy_names) == set(core.input_names) - {"positions"}
+
+
+def test_v4_core_inputs_come_from_the_signature():
+    # There is no second declaration to drift from: the inputs and their order
+    # ARE the core's parameter list, minus the leading layer. The runner clones
+    # and refreshes them by it.
+    import pytest
+
+    try:
+        from atom.models.deepseek_v4 import DeepseekV4Attention
+
+        core = DeepseekV4Attention._attn_core
+    except ImportError as e:
+        if "aiter" not in str(e):
+            raise
+        pytest.skip(f"requires aiter to import deepseek_v4: {e}")
+
+    assert core.input_names == (
+        "x",
+        "q",
+        "kv_pre",
+        "qr",
+        "qr_scale",
+        "positions",
+        "idx_q_quant",
+        "idx_weights",
+        "idx_q_scale",
+    )
+
+
+def test_core_with_var_kwargs_is_rejected():
+    # **kwargs carries no order, and the runner expands by order. Better to fail
+    # at decoration than to mis-assign inputs at replay.
+    from atom.utils.attn_ffn_piecewise import piecewise_core
+
+    try:
+
+        @piecewise_core()
+        def _bad(layer, **named):
+            return None
+
+        assert False, "expected TypeError for a **kwargs core"
+    except TypeError as e:
+        assert "explicitly" in str(e)
+
+
+# ----------------------------------------------------------------------------
+# torch.compile boundary
+#
+# These guard the two SILENT failure modes of compiling the draft: a baked
+# `is_dummy_run` (draft reads a zero KV window forever -> acceptance collapses,
+# output stays correct) and a decorator that quietly does nothing at all.
+# ----------------------------------------------------------------------------
+
+
+def test_support_torch_compile_is_actually_applied():
+    # Adding the decorator is a NO-OP unless dispatch reaches it: it replaces
+    # __call__ -> forward, so the class must define `forward` (not the old
+    # `forward_spec`) and the ctor must take `atom_config`.
+    import inspect
+
+    from atom.models.deepseek_v4_dspark import _DSparkInner
+    from atom.utils.decorators import TorchCompileWrapperWithCustomDispatcher
+
+    assert TorchCompileWrapperWithCustomDispatcher in _DSparkInner.__bases__
+    assert hasattr(_DSparkInner, "forward")
+    assert not hasattr(_DSparkInner, "forward_spec")
+
+    # dynamic_arg_dims inference marks dim 0 of every param annotated exactly
+    # torch.Tensor, and raises at import time if it finds none.
+    params = inspect.signature(_DSparkInner.forward).parameters
+    tensor_args = [n for n, p in params.items() if p.annotation is torch.Tensor]
+    assert tensor_args == ["input_ids", "positions"]
+
+    # The decorator's replacement __init__ is (self, atom_config, **kwargs), so
+    # anything passed positionally after atom_config would fail to construct.
+    init = inspect.signature(_DSparkInner.__init__).parameters
+    assert list(init) == ["self", "atom_config", "kwargs"]
+
+
+def test_block_plan_takes_no_is_dummy_run():
+    # _build_block_plan is traced. Its old is_dummy_run branch guarded nothing
+    # (the live branch is pure tensor arithmetic over `positions`), but it WOULD
+    # bake from the warmup trace and zero the window permanently. Keep it gone.
+    import inspect
+
+    from atom.models.deepseek_v4_dspark import _build_block_plan
+
+    assert "is_dummy_run" not in inspect.signature(_build_block_plan).parameters
+
+
+def test_traced_region_reads_no_per_step_globals():
+    # Under CompilationLevel >= DYNAMO_ONCE the custom dispatcher evaluates no
+    # guards, so any per-step mutable global read in the traced region is frozen
+    # at whatever the first call saw. Turn the invariant into a build failure
+    # instead of a code-review hope.
+    #
+    # Scanned via AST, not text: identifiers only, so prose in docstrings and
+    # comments (which necessarily discuss is_dummy_run) doesn't trip it.
+    #
+    # DSparkLayer.dspark_attention is deliberately absent: it sits behind the
+    # opaque torch.ops.aiter.dspark_block_attention op, runs eagerly every step,
+    # and its forward-context reads therefore cannot bake.
+    import ast
+    import inspect
+    import textwrap
+
+    from atom.models import deepseek_v4_dspark as m
+
+    traced = [
+        m._DSparkInner.forward,
+        m._build_block_plan,
+        m._dspark_block_topk_idxs,
+        m.DSparkLayer.forward_block,
+    ]
+    banned = {"is_dummy_run", "get_forward_context", "environ"}
+    for fn in traced:
+        tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+        used = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name):
+                used.add(node.id)
+            elif isinstance(node, ast.Attribute):
+                used.add(node.attr)
+        leaked = used & banned
+        assert not leaked, f"{fn.__qualname__} reads {sorted(leaked)}"
+
+
+def test_num_draft_change_raises():
+    # num_draft is a python int, so it is baked into the compiled graph. It is
+    # constant in practice (min(mtp_k, window_size)); fail loudly rather than
+    # replay a graph built for another width.
+    from atom.models.deepseek_v4_dspark import DeepseekV4DSpark
+
+    class _StubInner:
+        def __init__(self):
+            self.calls = []
+
+        def forward(self, input_ids, positions, num_draft):
+            # Mirrors the real contract: the compiled region returns hidden
+            # state, not tokens.
+            self.calls.append(num_draft)
+            return "normed", "hc_hidden"
+
+        __call__ = forward
+
+        @staticmethod
+        def head_and_sample(normed, hc_hidden, anchor_ids):
+            return "draft", "conf"
+
+    class _StubCtx:
+        is_dummy_run = False
+
+    stub = DeepseekV4DSpark.__new__(DeepseekV4DSpark)
+    stub.model = _StubInner()
+    stub.block_size = 5
+    stub._compiled_num_draft = None
+
+    import atom.utils.forward_context as fc
+
+    ids = torch.zeros(2, dtype=torch.int32)
+    pos = torch.zeros(2, dtype=torch.int64)
+    saved = fc.get_forward_context
+    fc.get_forward_context = lambda: type("_FC", (), {"context": _StubCtx()})()
+    try:
+        assert stub.forward_spec(ids, pos, num_draft=5) == ("draft", "conf")
+        try:
+            stub.forward_spec(ids, pos, num_draft=6)
+            assert False, "expected ValueError on draft-width change"
+        except ValueError as e:
+            assert "5 -> 6" in str(e)
+    finally:
+        fc.get_forward_context = saved
+
+
+def test_write_context_kv_stays_eager_and_still_writes():
+    # write_context_kv is deliberately NOT compiled -- the decorator replaces
+    # only __call__, so every other method is untouched. That is what keeps its
+    # is_dummy_run early-return, its wildly dynamic num_tokens, and swa_write's
+    # variable Triton grid out of the traced region.
+    #
+    # It lives on DSparkDraftModel (the wrapper's base) rather than on the inner
+    # module: the inner is the compiled one, and nothing about absorbing the
+    # target's context belongs inside the traced block forward. Assert it is
+    # reachable as a plain method, is not the compiled entry point, and still
+    # fans out to one write per stage.
+    from atom.models.deepseek_v4_dspark import DeepseekV4DSpark, _DSparkInner
+    from atom.models.dspark_draft import DSparkDraftModel
+
+    assert callable(DeepseekV4DSpark.write_context_kv)
+    assert DeepseekV4DSpark.write_context_kv is DSparkDraftModel.write_context_kv
+    # The traced entry point is the inner's forward, and this is not it.
+    assert DeepseekV4DSpark.write_context_kv is not _DSparkInner.forward
+
+    calls = []
+
+    class _StageStub:
+        def write_context_kv(self, ctx_hidden, positions):
+            calls.append(ctx_hidden.shape[0])
+
+    class _StubCtx:
+        is_dummy_run = False
+
+    stages = [_StageStub(), _StageStub(), _StageStub()]
+
+    class _Wrapper(DSparkDraftModel):
+        # project_context is stage 0's main_proj/main_norm; stub it so the test
+        # covers the fan-out, not the projection.
+        def project_context(self, aux_concat):
+            return aux_concat
+
+        @property
+        def context_layers(self):
+            return stages
+
+    import atom.utils.forward_context as fc
+
+    saved = fc.get_forward_context
+    fc.get_forward_context = lambda: type("_FC", (), {"context": _StubCtx()})()
+    try:
+        DSparkDraftModel.write_context_kv(_Wrapper(), torch.zeros(4, 2), None)
+    finally:
+        fc.get_forward_context = saved
+    assert calls == [4, 4, 4], "one rolling-KV write per stage"
+
+
+def test_attention_is_reached_only_through_the_opaque_op():
+    # The fused qk_norm_rope_maybe_quant lazily JIT-builds a flydsl kernel, and
+    # Dynamo cannot trace the builder (it hits function.__new__). Tracing into
+    # dspark_attention graph-breaks, and the break splits the forward into two
+    # Dynamo graphs -- the second trips "VllmBackend can only be called once".
+    #
+    # The V4 target calls the identical kernel safely because its call site is
+    # behind torch.ops.aiter.v4_core_attention. Mirror that, and keep it mirrored.
+    import ast
+    import inspect
+    import textwrap
+
+    import torch as _t
+
+    from atom.models import deepseek_v4_dspark as m
+
+    op = _t.ops.aiter.dspark_block_attention
+    assert op is not None
+    # Registered as a split point: backends._split_judge_func tests the
+    # attribute, not compilation_config.splitting_ops.
+    assert getattr(op, "spliting_op", False) is True
+
+    # forward_block (traced) must go through the op, never call the method.
+    tree = ast.parse(textwrap.dedent(inspect.getsource(m.DSparkLayer.forward_block)))
+    calls = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            fn = node.func
+            if isinstance(fn, ast.Attribute):
+                calls.add(fn.attr)
+    assert "dspark_block_attention" in calls
+    assert "dspark_attention" not in calls, (
+        "forward_block must reach attention through the opaque op; calling the "
+        "method directly puts the flydsl JIT builder back inside the trace"
+    )
+
+
+def test_opaque_attention_fake_impl_matches_real_output_shape():
+    # A wrong fake impl mis-sizes every downstream op in the compiled graph.
+    # dspark_attention returns [B, T, dim] -- same shape as its input x.
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    from atom.models.deepseek_v4_dspark import _dspark_block_attention_fake
+
+    B, T, W, dim = 2, 5, 128, 64
+    with FakeTensorMode():
+        x = torch.empty(B, T, dim, dtype=torch.bfloat16)
+        out = _dspark_block_attention_fake(
+            x,
+            torch.empty(B, dtype=torch.int64),
+            torch.empty(B, T, dtype=torch.int64),
+            torch.empty(B, W, dtype=torch.bool),
+            torch.empty(B, T, W + T, dtype=torch.int32),
+            "layer",
+        )
+    assert out.shape == (B, T, dim)
+    assert out.dtype == torch.bfloat16
+
+
+def test_lm_head_and_markov_sampler_are_outside_the_compiled_region():
+    # Under TP, ParallelLMHead's aiter all_gather lazily JIT-loads an aiter
+    # module on first call, and tracing that loader reaches
+    # shutil.which() -> posix.stat, which Dynamo cannot trace. Same
+    # graph-break-then-"VllmBackend can only be called once" failure as the
+    # attention path. The V4 target draws the line in the same place: its LM
+    # head lives in compute_logits, outside the decorated model's forward.
+    import ast
+    import inspect
+    import textwrap
+
+    from atom.models.deepseek_v4_dspark import _DSparkInner
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(_DSparkInner.forward)))
+    attrs = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute):
+            attrs.add(node.attr)
+    assert "get_logits" not in attrs, "LM head must not be traced"
+    assert "forward_head" not in attrs, "Markov sampler must not be traced"
+
+    # That the wrapper actually runs them is asserted where it can be
+    # observed -- `test_forward_spec_passes_the_batch_through_unpadded` records
+    # `head_and_sample`'s arguments, which only happens if it was called.
+
+    # head_and_sample is a plain method: the decorator replaces only __call__.
+    assert callable(_DSparkInner.head_and_sample)
+
+
+@pytest.mark.parametrize("is_dummy", [True, False], ids=["dummy", "real"])
+@pytest.mark.parametrize("B", [1, 4])
+def test_forward_spec_passes_the_batch_through_unpadded(is_dummy, B):
+    """No pad, on any batch, dummy or not.
+
+    `forward_spec` used to repeat a B==1 dummy run to B==2: warmup was the
+    first traced call and `mark_dynamic` cannot make a size-1 dim dynamic.
+    Under `--enable-dp-attention` that pad ran 2*T MoE rows against a
+    `dp_metadata` sized for B==1 and tripped reduce_scatterv, so #1915 fixed
+    it upstream instead -- `warmup_model` gives a block drafter >= 2 sequences,
+    so the first trace is already B>=2 -- and dropped the pad entirely.
+
+    The two tests that covered the pad were left behind asserting a `repeat(2)`
+    that no longer happens and an `"is_dummy and" in src` that is no longer in
+    the source. Both were red from the day #1915 landed and nobody was told,
+    because this module `importorskip`s aiter and CI has none. This is the
+    contract that replaced them, and it is read off the call rather than off
+    the source: the pad would show up here as a batch the inner model did not
+    ask for.
+
+    `is_dummy` is still varied because "dummy runs are not special either" is
+    half of what changed.
+    """
+    expect_B = B
+    from atom.models.deepseek_v4_dspark import DeepseekV4DSpark
+
+    T = 5
+    seen = {}
+
+    class _StubInner:
+        def __call__(self, input_ids, positions, num_draft):
+            seen["B"] = input_ids.shape[0]
+            seen["positions"] = positions.tolist()
+            return torch.zeros(input_ids.shape[0] * num_draft, 4), torch.zeros(
+                input_ids.shape[0], num_draft, 4
+            )
+
+        forward = __call__
+
+        @staticmethod
+        def head_and_sample(normed, hc_hidden, anchor_ids):
+            seen["normed_rows"] = normed.shape[0]
+            seen["hc_B"] = hc_hidden.shape[0]
+            seen["anchor_B"] = anchor_ids.shape[0]
+            return "draft", "conf"
+
+    stub = DeepseekV4DSpark.__new__(DeepseekV4DSpark)
+    stub.model = _StubInner()
+    stub.block_size = T
+    stub._compiled_num_draft = None
+
+    import atom.utils.forward_context as fc
+
+    saved = fc.get_forward_context
+    fc.get_forward_context = lambda: type(
+        "_FC", (), {"context": type("_C", (), {"is_dummy_run": is_dummy})()}
+    )()
+    try:
+        stub.forward_spec(
+            torch.full((B,), 7, dtype=torch.int32),
+            torch.full((B,), 11, dtype=torch.int64),
+            num_draft=T,
+        )
+    finally:
+        fc.get_forward_context = saved
+
+    assert seen["B"] == expect_B
+    if expect_B != B:
+        # The pad row copies the real request: a zero position would gather an
+        # uninitialised block-table entry and can fault the GPU.
+        assert seen["positions"] == [11] * expect_B
+    # Outputs always come back sliced to the real batch.
+    assert (seen["normed_rows"], seen["hc_B"], seen["anchor_B"]) == (B * T, B, B)

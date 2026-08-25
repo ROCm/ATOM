@@ -202,6 +202,20 @@ class Qwen3NextMTP(nn.Module):
     ) -> torch.Tensor | None:
         return self.lm_head(hidden_states)
 
+    def compute_draft_ids(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        """Greedy draft token ids via distributed argmax — each rank reduces its
+        own vocab shard and only [N, 2] is all-gathered, instead of the full
+        [N, vocab] that compute_logits() would gather. Token-identical to
+        compute_logits(...).argmax(-1): the draft path never hits the LM head's
+        prefill last-token slice (is_draft is set for the whole propose loop),
+        so both see the same rows.
+        """
+        return self.lm_head.compute_argmax_token(hidden_states)
+
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)

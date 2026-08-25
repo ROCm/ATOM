@@ -157,14 +157,13 @@ exec podman run --rm --name "atom_agentic_${RUN_LABEL}" \
   -e MODEL_PATH=/data/amd_int/models/DeepSeek-V4-Pro -e TP=8 -e EP_SIZE=1 \
   -e CONC="$CONC" -e DURATION="$DURATION" -e PORT=18080 \
   -e MAX_NUM_SEQS=96 -e GPU_MEMORY_UTILIZATION=0.9 -e KV_CACHE_DTYPE=fp8 \
-  -e ATOM_SWA_FULL_RETAIN=1 -e ATOM_SWA_RETENTION_INTERVAL=32768 \
-  -e ATOM_SWA_CHECKPOINT_FRAC=0.5 -e ATOM_DEBUG_PREFIX_HITS=1 \
+  -e ATOM_DEBUG_PREFIX_HITS=1 \
   -e RESULT_DIR="/workspace/results/$RUN_LABEL" -e RESULT_FILENAME="$RUN_LABEL" \
   -e AGENTIC_OUTPUT_DIR="/workspace/results/$RUN_LABEL" \
   -e INFMAX_CONTAINER_WORKSPACE=/inferencex \
   -e AGENTIC_DIR=/inferencex/utils/agentic-benchmark -e AIPERF_DIR=/inferencex/utils/aiperf \
   -e AIPERF_RUNTIME_DIR="/workspace/runtime/$RUN_LABEL" \
-  -e AIPERF_AGENTIC_CACHE_WARMUP_DURATION=600 -e AIPERF_WARMUP_GRACE_PERIOD=1800 \
+  -e AIPERF_WARMUP_REQUESTS_PER_LANE=10 -e AIPERF_TRACE_IDLE_GAP_CAP_SECONDS=300 -e AIPERF_WARMUP_GRACE_PERIOD=1800 \
   -e HF_HOME=/workspace/hf_home -e PYTHONDONTWRITEBYTECODE=1 \
   "$IMAGE" bash /workspace/atom_agentic_dsv4.sh
 ```
@@ -201,18 +200,23 @@ The replay `build_replay_cmd` expands to:
 aiperf profile --scenario inferencex-agentx-mvp \
   --url http://localhost:18080 --endpoint /v1/chat/completions --endpoint-type chat --streaming \
   --model /data/amd_int/models/DeepSeek-V4-Pro \
-  --concurrency 48 --benchmark-duration 3600 --random-seed 42 \
-  --agentic-cache-warmup-duration 600 --warmup-grace-period 1800 \
+  --concurrency 48 --benchmark-duration 3600 --stats-interval 30 --random-seed 42 \
+  --warmup-requests-per-lane 10 --trace-idle-gap-cap-seconds 300 --warmup-grace-period 1800 \
   --public-dataset semianalysis_cc_traces_weka_062126 --num-dataset-entries 393 \
   --output-artifact-dir "$RESULT_DIR/aiperf_artifacts"
 ```
 
-### Step 3 — one-line invocation (exactly what produced the PR1640 row)
+### Step 3 — one-line invocation
+
+The PR1640 row was produced with `ATOM_SWA_FULL_RETAIN=1
+ATOM_SWA_RETENTION_INTERVAL=32768 ATOM_SWA_CHECKPOINT_FRAC=0.5` on top of the
+below. That SWA full-retain mode has since been removed, so this recipe now
+runs the default window-only path and will not reproduce that row exactly.
+
 ```bash
 ATOM_IMAGE=docker.io/rocm/atom-dev:latest \
 ATOM_SOURCE_OVERRIDE=$PWD/ATOM \
 GPU_MEMORY_UTILIZATION=0.9 KV_CACHE_DTYPE=fp8 \
-ATOM_SWA_FULL_RETAIN=1 ATOM_SWA_RETENTION_INTERVAL=32768 ATOM_SWA_CHECKPOINT_FRAC=0.5 \
 ATOM_DEBUG_PREFIX_HITS=1 \
 RUN_LABEL=atom_pr1640_agentic_fp8_tp8_c48_mem90_int32k_$(date +%Y%m%d) \
 bash ./run_atom_agentic.sh full

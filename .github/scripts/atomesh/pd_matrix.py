@@ -256,10 +256,17 @@ def build_cell(
     )
     required_nodes = required_node_count(pd_worker_layout, prefill_cfg, decode_cfg)
     slurm_submit_runner = str(runner_cfg.get("slurm_submit_runner", ""))
-    allow_auto_nodes = slurm_submit_runner == "atomesh-cicd-mi350"
+    allow_auto_nodes = slurm_submit_runner in {
+        "atomesh-cicd-mi350",
+        "atomesh-cicd-crusoe-mi355",
+        "atomesh-cicd-mi355-crusoe",
+    }
+    requires_explicit_candidate_nodes = slurm_submit_runner == "atomesh-cicd-mi350"
 
     nodes = resolve_nodes(suite_cfg.get("nodes"))
-    if allow_auto_nodes:
+    if allow_auto_nodes and not requires_explicit_candidate_nodes:
+        nodes = []
+    if allow_auto_nodes and requires_explicit_candidate_nodes:
         if not nodes:
             raise ValueError(
                 f"{suite_cfg.get('name', model_name)} needs a non-empty "
@@ -357,7 +364,7 @@ def build_cell(
         "random_range_ratio": str(benchmark_cfg.get("random_range_ratio", 0.8)),
         "request_rate": str(benchmark_cfg.get("request_rate", "inf")),
         "num_prompts_multiplier": int(benchmark_cfg.get("num_prompts_multiplier", 10)),
-        "wait_server_timeout": int(benchmark_cfg.get("wait_server_timeout", 2500)),
+        "wait_server_timeout": int(benchmark_cfg.get("wait_server_timeout", 5000)),
         "wait_router_timeout": int(benchmark_cfg.get("wait_router_timeout", 300)),
         "benchmark": benchmark_cfg,
         "runner": runner_cfg,
@@ -387,6 +394,14 @@ def build_cell(
             "fewshot_as_multiturn": bool(
                 accuracy_cfg.get("fewshot_as_multiturn", False)
             ),
+            "threshold": accuracy_cfg.get("threshold"),
+            "agent_workers": accuracy_cfg.get("agent_workers"),
+            "agent_step_limit": accuracy_cfg.get("agent_step_limit"),
+            "case_timeout": accuracy_cfg.get("case_timeout"),
+            "agent_timeout": accuracy_cfg.get("agent_timeout"),
+            "score_timeout": accuracy_cfg.get("score_timeout"),
+            "max_workers": accuracy_cfg.get("max_workers"),
+            "instance_timeout": accuracy_cfg.get("instance_timeout"),
         },
     }
 

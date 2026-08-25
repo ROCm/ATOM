@@ -10,6 +10,7 @@ _ATOM_ENV_VARS = [
     "ATOM_DP_SIZE",
     "ATOM_DP_MASTER_IP",
     "ATOM_DP_MASTER_PORT",
+    "ATOM_DP_BASE_PORT",
     "ATOM_USE_TRITON_GEMM",
     "ATOM_USE_TRITON_MXFP4_BMM",
     "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION",
@@ -24,6 +25,7 @@ _ATOM_ENV_VARS = [
     "ATOM_PROFILER_TIMEOUT",
     "ATOM_LOG_MORE",
     "ATOM_DISABLE_MMAP",
+    "ATOM_ONLINE_QUANT_STREAMING",
     "ATOM_DISABLE_VLLM_PLUGIN",
     "ATOM_USE_CUSTOM_ALL_GATHER",
     "ATOM_ENABLE_RELAXED_MTP",
@@ -39,7 +41,7 @@ def _clean_atom_env(monkeypatch):
 
 def _get_envs():
     """Return the envs module; lazy __getattr__ re-evaluates on each access."""
-    import atom.utils.envs as envs
+    from atom.utils import envs
 
     return envs
 
@@ -62,6 +64,9 @@ class TestEnvsDefaults:
     def test_dp_master_port_default(self):
         assert _get_envs().ATOM_DP_MASTER_PORT == 29500
 
+    def test_dp_base_port_default(self):
+        assert _get_envs().ATOM_DP_BASE_PORT == 0
+
     def test_use_triton_gemm_default(self):
         assert _get_envs().ATOM_USE_TRITON_GEMM is False
 
@@ -82,6 +87,9 @@ class TestEnvsDefaults:
 
     def test_disable_mmap_default(self):
         assert _get_envs().ATOM_DISABLE_MMAP is False
+
+    def test_online_quant_streaming_default_disabled(self):
+        assert _get_envs().ATOM_ONLINE_QUANT_STREAMING is False
 
     def test_disable_vllm_plugin_default(self):
         assert _get_envs().ATOM_DISABLE_VLLM_PLUGIN is False
@@ -107,6 +115,12 @@ class TestEnvsOverrides:
     def test_dp_size_override(self, monkeypatch):
         monkeypatch.setenv("ATOM_DP_SIZE", "8")
         assert _get_envs().ATOM_DP_SIZE == 8
+
+    def test_dp_port_overrides(self, monkeypatch):
+        monkeypatch.setenv("ATOM_DP_MASTER_PORT", "29700")
+        monkeypatch.setenv("ATOM_DP_BASE_PORT", "29800")
+        assert _get_envs().ATOM_DP_MASTER_PORT == 29700
+        assert _get_envs().ATOM_DP_BASE_PORT == 29800
 
     def test_torch_profiler_dir_override(self, monkeypatch):
         monkeypatch.setenv("ATOM_TORCH_PROFILER_DIR", "/tmp/prof")
@@ -136,6 +150,10 @@ class TestEnvsOverrides:
         monkeypatch.setenv("ATOM_DISABLE_MMAP", "True")
         assert _get_envs().ATOM_DISABLE_MMAP is True
 
+    def test_online_quant_streaming_enabled(self, monkeypatch):
+        monkeypatch.setenv("ATOM_ONLINE_QUANT_STREAMING", "1")
+        assert _get_envs().ATOM_ONLINE_QUANT_STREAMING is True
+
     def test_disable_vllm_plugin_enabled(self, monkeypatch):
         monkeypatch.setenv("ATOM_DISABLE_VLLM_PLUGIN", "1")
         assert _get_envs().ATOM_DISABLE_VLLM_PLUGIN is True
@@ -162,3 +180,16 @@ class TestIsSet:
     def test_is_set_returns_false_for_empty_string(self, monkeypatch):
         monkeypatch.setenv("ATOM_DP_SIZE", "")
         assert _get_envs().is_set("ATOM_DP_SIZE") is False
+
+
+def test_parallel_config_applies_explicit_dp_endpoint_env(monkeypatch):
+    monkeypatch.setenv("ATOM_DP_MASTER_IP", "127.0.0.2")
+    monkeypatch.setenv("ATOM_DP_MASTER_PORT", "29700")
+    monkeypatch.setenv("ATOM_DP_BASE_PORT", "29800")
+
+    from atom.config import ParallelConfig
+
+    config = ParallelConfig()
+    assert config.data_parallel_master_ip == "127.0.0.2"
+    assert config.data_parallel_master_port == 29700
+    assert config.data_parallel_base_port == 29800

@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
-from typing import Type
 
 import aiter
 import numpy as np
@@ -10,17 +9,19 @@ import torch
 import triton
 import triton.language as tl
 from aiter.dist.parallel_state import get_tp_group
+
 from atom.model_engine.scheduler import ScheduledBatch
-from atom.utils import CpuGpuBuffer, envs
+from atom.model_ops.attention_mha import PagedAttentionImpl, use_pa_decode_bf16_asm
+from atom.utils import CpuGpuBuffer, envs, pack_rows, upload_numpy
 from atom.utils.block_convert import (
     block_table_convert_triton,
     kv_indices_generate_triton,
 )
-from atom.model_ops.attention_mha import PagedAttentionImpl, use_pa_decode_bf16_asm
 from atom.utils.forward_context import AttentionMetaData, Context, get_forward_context
 from atom.utils.tbo import TokenSplitPrefillState
 
 from .backends import AttentionBackend, CommonAttentionBuilder
+from .sub_pool_spec import SubPoolSpec, page_pool
 
 logger = logging.getLogger("atom")
 
@@ -109,7 +110,7 @@ class AiterBackend(AttentionBackend):
         return "ATOM_ATTENTION"
 
     @staticmethod
-    def get_builder_cls() -> Type["AiterAttentionMetadataBuilder"]:
+    def get_builder_cls() -> type["AiterAttentionMetadataBuilder"]:
         return AiterAttentionMetadataBuilder
 
     @staticmethod
@@ -305,9 +306,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 **i64_kwargs,
             )
             var[f"{p}block_tables"] = CpuGpuBuffer(
-                ub_max_bs,
-                self.max_num_blocks_per_seq // self.block_ratio,
-                **i32_kwargs,
+                ub_max_bs, self.block_table_cols, **i32_kwargs
             )
             var[f"{p}cu_seqlens_q"] = CpuGpuBuffer(ub_max_bs + 1, **i32_kwargs)
             var[f"{p}cu_seqlens_q"].cpu.copy_(
@@ -405,8 +404,8 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             "reduce_partial_map": reduce_partial_map,
         }
 
-    def compute_block_bytes(self) -> int:
-        """Standard split-K/V MHA per-block bytes.
+    def sub_pool_specs(self) -> list[SubPoolSpec]:
+        """One paged KV pool. Per-block bytes:
 
         - Standard models: `[2, num_hidden_layers, blocks, block_size,
           num_kv_heads, head_dim]` for kv_cache + matching kv_scale (fp32).
@@ -469,12 +468,12 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 * runner.physical_block_size
                 * 4  # float32 kv_scale
             )
-            return block_bytes
+            return [page_pool(block_bytes)]
 
         # Standard MHA path.
         block_bytes = (
             2
-            * hf_config.num_hidden_layers
+            * total_num_layers
             * runner.block_size
             * num_kv_heads
             * hf_config.head_dim
@@ -482,7 +481,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         )
         block_bytes += (
             2
-            * hf_config.num_hidden_layers
+            * total_num_layers
             * num_kv_heads
             * runner.physical_block_size
             * 4  # float32 kv_scale
@@ -500,7 +499,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 * index_dim
                 * torch.empty((), dtype=index_cache_dtype).element_size()
             )
-        return block_bytes
+        return [page_pool(block_bytes)]
 
     def allocate_kv_cache_tensors(
         self, num_kv_heads: int, num_draft_layers: int
@@ -528,10 +527,11 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 "_kv_layer_cache_store": [],
             }
 
+        total_num_layers = runner._get_total_num_layers()
         tensors = {
             "kv_cache": torch.zeros(
                 2,
-                hf_config.num_hidden_layers,
+                total_num_layers,
                 runner.num_physical_kvcache_blocks,
                 runner.physical_block_size,
                 num_kv_heads,
@@ -541,7 +541,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             ),
             "kv_scale": torch.zeros(
                 2,
-                hf_config.num_hidden_layers,
+                total_num_layers,
                 runner.num_physical_kvcache_blocks,
                 num_kv_heads,
                 runner.physical_block_size,
@@ -581,8 +581,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         an MHA attention this builder owns. Side effects: sets module
         `k_cache`, `v_cache`, `k_scale`, `v_scale`, `max_model_len`.
         """
-        from atom.config import KVCacheTensor
         from aiter import dtypes
+
+        from atom.config import KVCacheTensor
 
         if _is_indexed_sparse_attention(module):
             # MiniMax-M3 sparse attention. The KV cache uses the SAME allocation
@@ -858,6 +859,19 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             attn_metadata.block_tables = self.model_runner.forward_vars[
                 "block_tables"
             ].copy_to_gpu(bs)
+        # `prefill_attention_triton` reads the paged KV cache, so it needs a
+        # block_table even with no cached tokens. The base builder only uploads
+        # one when `has_cached`.
+        if (
+            attn_metadata.block_tables is None
+            and envs.ATOM_USE_UNIFIED_ATTN
+            and batch.block_tables
+        ):
+            bs = batch.total_seqs_num_prefill
+            self.prepare_block_tables(batch)
+            attn_metadata.block_tables = self.model_runner.forward_vars[
+                "block_tables"
+            ].copy_to_gpu(bs)
         if self._has_sparse_attention:
             from atom.model_ops.minimax_m3.sparse_attn import (
                 make_sparse_prefill_metadata,
@@ -901,9 +915,11 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         # from previous steps). A straddled/ubatch request's FULL visible K is
         # num_cached + (its tokens in this ubatch), so the gather must include it.
         self._tbo_prefill_state = TokenSplitPrefillState(
-            block_tables=[
-                np.asarray(bt, dtype=np.int32) for bt in batch.block_tables[:bs]
-            ],
+            # Handed over as-is: the reader wants `len(row)` and a slice
+            # assignment, which the rows serve directly. Referencing is safe
+            # because BlockManager only appends between steps, and stash and
+            # read are both inside this one forward.
+            block_tables=batch.block_tables[:bs],
             cu_tokens=np.asarray(
                 self.model_runner.forward_vars["cu_seqlens_q"].np[: bs + 1],
                 dtype=np.int64,
@@ -1003,29 +1019,26 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         ctx_lens = cached_prefix_lens + new_lens
         total_kv = int(ctx_lens.sum())
 
-        max_blocks = max(
-            (len(block_tables_host[first_req + i]) for i in range(ub_num_reqs)),
-            default=1,
-        )
-        bt = np.zeros((ub_num_reqs, max_blocks), dtype=np.int32)
-        for i in range(ub_num_reqs):
-            row = block_tables_host[first_req + i]
-            bt[i, : len(row)] = row
+        # Indexed, not sliced: a short slice would leave `bt` rows unwritten.
+        rows = [block_tables_host[first_req + i] for i in range(ub_num_reqs)]
+        max_blocks = max((len(row) for row in rows), default=1)
+        bt = np.empty((ub_num_reqs, max_blocks), dtype=np.int32)  # pack_rows clears
+        pack_rows(bt, rows)
 
         cu_k = np.zeros(ub_num_reqs + 1, dtype=np.int32)
         np.cumsum(ctx_lens.astype(np.int32), out=cu_k[1:])
 
         ub_attn.has_cached = True
         ub_attn.total_kv = total_kv
-        ub_attn.context_lens = torch.from_numpy(ctx_lens.astype(np.int32)).to(
-            device, non_blocking=True
-        )
-        ub_attn.block_tables = torch.from_numpy(bt).to(device, non_blocking=True)
-        ub_attn.cu_seqlens_k = torch.from_numpy(cu_k).to(device, non_blocking=True)
+        ub_attn.context_lens = upload_numpy(ctx_lens.astype(np.int32), device)
+        # `bt` is [requests x blocks], so a long enough context puts it past the
+        # pageable limit and the copy would start synchronizing.
+        ub_attn.block_tables = upload_numpy(bt, device)
+        ub_attn.cu_seqlens_k = upload_numpy(cu_k, device)
         ub_attn.seq_starts = torch.zeros(ub_num_reqs, dtype=torch.int32, device=device)
-        ub_attn.num_cached_tokens = torch.from_numpy(
-            cached_prefix_lens.astype(np.int32)
-        ).to(device, non_blocking=True)
+        ub_attn.num_cached_tokens = upload_numpy(
+            cached_prefix_lens.astype(np.int32), device
+        )
         ub_attn.max_seqlen_k = int(ctx_lens.max())
 
     def prepare_decode(self, batch: ScheduledBatch, bs: int):

@@ -1,4 +1,5 @@
 import torch
+from vllm.v1.attention.backend import MultipleOf
 from vllm.v1.attention.backends.mla.prefill.base import MLAPrefillBackend
 
 from atom.model_ops.minimax_m3.sparse_attn import SPARSE_BLOCK_SIZE
@@ -34,6 +35,10 @@ class AiterMhaBackendForVllm:
 
     @staticmethod
     def get_supported_kernel_block_sizes():
+        # Keep the physical kernel page at 16 even when vLLM's hybrid KV manager
+        # uses a larger logical page. Advertising arbitrary multiples makes
+        # fp8 hybrid models execute cache kernels against the unsplit logical
+        # page and corrupts TP output.
         return [16]
 
     @classmethod
@@ -86,6 +91,14 @@ class AiterMhaBackendForVllm:
     def is_ssm(cls) -> bool:
         return False
 
+    @classmethod
+    def supports_sliding_window(cls) -> bool:
+        return True
+
+    @classmethod
+    def supports_pcp(cls) -> bool:
+        return False
+
     @staticmethod
     def get_required_kv_cache_layout():
         return None
@@ -117,6 +130,14 @@ class AiterMhaBackendForVllm:
     @classmethod
     def full_cls_name(cls) -> tuple[str, str]:
         return (cls.__module__, cls.__qualname__)
+
+
+class AiterMhaFlexibleBlockBackendForVllm(AiterMhaBackendForVllm):
+    """Draft-only backend whose Triton path accepts the logical KV page size."""
+
+    @staticmethod
+    def get_supported_kernel_block_sizes():
+        return [MultipleOf(16)]
 
 
 class AiterMlaBackendForVllm:
@@ -172,6 +193,14 @@ class AiterMlaBackendForVllm:
 
     @classmethod
     def is_ssm(cls) -> bool:
+        return False
+
+    @classmethod
+    def supports_sliding_window(cls) -> bool:
+        return False
+
+    @classmethod
+    def supports_pcp(cls) -> bool:
         return False
 
     @staticmethod
@@ -435,6 +464,14 @@ class MiniMaxM3SparseAttentionBackend:
 
     @classmethod
     def is_ssm(cls) -> bool:
+        return False
+
+    @classmethod
+    def supports_sliding_window(cls) -> bool:
+        return False
+
+    @classmethod
+    def supports_pcp(cls) -> bool:
         return False
 
     @staticmethod

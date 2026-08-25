@@ -7,16 +7,22 @@ from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
+import pytest
+from conftest import MockConfig
 
+from atom.kv_transfer.disaggregation.types import (
+    KVConnectorOutput,
+    SaveOperationId,
+)
+from atom.kv_transfer.offload._offload_common import OffloadSchedulerMixin
 from atom.model_engine.scheduler import (
     ScheduledBatch,
-    Scheduler,
     ScheduledBatchOutput,
+    Scheduler,
     SpecStats,
 )
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 from atom.sampling_params import SamplingParams
-from conftest import MockConfig
 
 # ── SpecStats ──────────────────────────────────────────────────────────────
 
@@ -50,6 +56,11 @@ class TestSchedulerAddQuery:
         scheduler.add(seq_factory([1, 2, 3]))
         assert not scheduler.is_finished()
 
+    def test_deferred_offload_work_keeps_scheduler_alive(self, scheduler):
+        scheduler.deferred_free_blocks[17] = SimpleNamespace(id=17)
+
+        assert not scheduler.is_finished()
+
     def test_extend(self, scheduler, seq_factory):
         scheduler.extend([seq_factory([1]), seq_factory([2])])
         assert scheduler.get_num_unfinished_requests() == 2
@@ -70,13 +81,107 @@ class TestSchedulerAddQuery:
 
 
 class TestSchedule:
+    def test_non_offload_abort_keeps_existing_receive_cleanup(self):
+        seq = SimpleNamespace(
+            id=96,
+            status=SequenceStatus.ABORTED,
+            _counted_as_inflight_load=True,
+        )
+        sched = Scheduler.__new__(Scheduler)
+        sched._rejected = []
+        sched.deferred_free_blocks = {}
+        sched.finished_recving_kv_req_ids = []
+        sched.failed_recving_kv_req_ids = []
+        sched._num_parked_remote_kv = 1
+        sched.kv_connector = SimpleNamespace(is_offload=False)
+
+        sched._reject_aborted_waiting(seq)
+
+        assert sched.deferred_free_blocks == {}
+        assert sched._num_parked_remote_kv == 0
+        assert sched._rejected == [seq]
+
+    @pytest.mark.parametrize("first_terminal", ["load", "save"])
+    def test_aborted_load_and_save_both_finish_before_release(
+        self,
+        first_terminal,
+    ):
+        load = 97
+        save = 97
+        seq = SimpleNamespace(
+            id=97,
+            status=SequenceStatus.ABORTED,
+            block_table=[1],
+            has_per_req_cache=False,
+            _counted_as_inflight_load=True,
+        )
+        events = []
+
+        class _Connector(OffloadSchedulerMixin):
+            is_offload = True
+            is_producer = False
+
+            def __init__(self):
+                self.pending_save = True
+
+            def load_finished(self, operation):
+                events.append(("load_finished", operation))
+                return operation == load
+
+            def save_finished(self, operation):
+                events.append(("save_finished", operation))
+                if operation == save:
+                    self.pending_save = False
+
+            def should_defer_free(self, value):
+                assert value is seq
+                return self.pending_save
+
+            def request_finished(self, value):
+                events.append(("request_finished", value.id))
+
+        sched = Scheduler.__new__(Scheduler)
+        sched.waiting = deque()
+        sched.running = deque()
+        sched._rejected = []
+        sched.deferred_free_blocks = {}
+        sched.finished_recving_kv_req_ids = []
+        sched.failed_recving_kv_req_ids = []
+        sched._num_parked_remote_kv = 1
+        sched.kv_connector = _Connector()
+        sched.block_manager = SimpleNamespace(
+            deallocate=lambda value: events.append(("deallocate", value.id))
+        )
+        sched._reject_aborted_waiting(seq)
+
+        assert sched.deferred_free_blocks == {seq.id: seq}
+        assert seq._awaiting_aborted_load_cleanup is True
+
+        outputs = {
+            "load": KVConnectorOutput(finished_loading={load}),
+            "save": KVConnectorOutput(finished_saving={save}),
+        }
+        second_terminal = "save" if first_terminal == "load" else "load"
+
+        sched._update_from_kv_xfer_finished(outputs[first_terminal])
+
+        assert sched.deferred_free_blocks == {seq.id: seq}
+        assert not any(event[0] == "deallocate" for event in events)
+
+        sched._update_from_kv_xfer_finished(outputs[second_terminal])
+
+        assert sched.deferred_free_blocks == {}
+        assert sched._num_parked_remote_kv == 0
+        assert events.count(("request_finished", seq.id)) == 1
+        assert events.count(("deallocate", seq.id)) == 1
+
     def test_empty_returns_none(self, scheduler):
         assert scheduler.schedule() is None
 
     def test_prefill(self, scheduler, seq_factory):
         seq = seq_factory([1, 2, 3, 4])
         scheduler.add(seq)
-        batch, seqs = scheduler.schedule()
+        batch, _seqs = scheduler.schedule()
         assert batch.total_seqs_num_prefill == 1
         assert batch.total_tokens_num_prefill == 4
         assert seq.status == SequenceStatus.RUNNING
@@ -129,20 +234,48 @@ class TestSchedule:
         assert len(sched.running) <= sched.max_num_seqs
 
     def test_prefill_respects_max_batched_tokens(self, seq_factory):
+        # Budgets here are multiples of the 64-token chunk alignment: a leftover
+        # under one aligned unit is deliberately not scheduled at all (see
+        # Scheduler._align_truncated_chunk), so a 6-token budget would pack one
+        # seq, not two, and prove nothing about the budget being respected.
         sched = Scheduler(
             MockConfig(
-                max_num_batched_tokens=6,
+                max_num_batched_tokens=192,
+                max_model_len=1024,
                 num_kvcache_blocks=100,
                 enable_chunked_prefill=True,
             )
         )
-        sched.add(seq_factory([1, 2, 3, 4]))  # 4 tokens
-        sched.add(seq_factory([5, 6, 7, 8]))  # 4 tokens total, but only 2 fit in budget
+        sched.add(seq_factory(list(range(128))))
+        sched.add(seq_factory(list(range(200, 328))))  # only 64 fit in budget
         batch, _ = sched.schedule()
-        # Chunked prefill: seq2 gets a 2-token chunk (budget 6-4=2)
         assert batch.total_seqs_num_prefill == 2
-        assert batch.total_tokens_num_prefill == 6
-        assert list(batch.num_scheduled_tokens) == [4, 2]
+        assert batch.total_tokens_num_prefill == 192
+        assert list(batch.num_scheduled_tokens) == [128, 64]
+
+    def test_budget_sliver_is_left_for_the_next_step(self, seq_factory):
+        """Chunk alignment must not manufacture its own tail.
+
+        Flooring seq 2's chunk to the block grid frees the remainder, and
+        handing that remainder to seq 3 splits seq 3's prefill for nothing — it
+        lands in the same later step either way, one forward worse off and off
+        the block grid. Production saw a 16384-token budget go out as
+        `..., 640, 10`.
+        """
+        sched = Scheduler(
+            MockConfig(
+                max_num_batched_tokens=200,
+                max_model_len=1024,
+                num_kvcache_blocks=400,
+                enable_chunked_prefill=True,
+            )
+        )
+        for start in (0, 200, 400):
+            sched.add(seq_factory(list(range(start, start + 128))))
+        batch, _ = sched.schedule()
+        # 200 - 128 = 72 for seq 2, floored to 64; the freed 8 stays unspent.
+        assert list(batch.num_scheduled_tokens) == [128, 64]
+        assert batch.total_tokens_num_prefill == 192
 
     def test_chunked_prefill_splits_prompt_across_steps(self, seq_factory):
         sched = Scheduler(
@@ -212,6 +345,99 @@ class TestSchedule:
         assert SequenceStatus.RUNNING in statuses
         assert SequenceStatus.WAITING in statuses
 
+    def test_decode_preemption_skips_save_pinned_victim(self, seq_factory):
+        sched = Scheduler(MockConfig(num_kvcache_blocks=2, kv_cache_block_size=4))
+        current = seq_factory([1, 2, 3, 4])
+        pinned_victim = seq_factory([5, 6, 7, 8])
+        sched.add(current)
+        sched.add(pinned_victim)
+        sched.schedule()
+        current.num_cached_tokens = current.num_prompt_tokens
+        pinned_victim.num_cached_tokens = pinned_victim.num_prompt_tokens
+        current.append_token(9)
+        pinned_victim.append_token(10)
+        operation = SaveOperationId(pinned_victim.id, 50)
+
+        class _Connector(OffloadSchedulerMixin):
+            is_producer = False
+            is_offload = True
+            _do_load = False
+
+            def __init__(self):
+                self.pending = {operation}
+
+            def should_defer_free(self, seq):
+                return seq is pinned_victim and operation in self.pending
+
+            def save_finished(self, value):
+                self.pending.discard(value)
+
+            def build_connector_meta(self):
+                return None
+
+        sched.kv_connector = _Connector()
+        pinned_blocks = list(pinned_victim.block_table)
+
+        batch, _ = sched.schedule()
+
+        assert current.status == SequenceStatus.WAITING
+        assert pinned_victim.status == SequenceStatus.RUNNING
+        assert list(pinned_victim.block_table[:1]) == pinned_blocks
+        assert list(batch.req_ids) == [pinned_victim.id]
+
+    def test_decode_preemption_stalls_pinned_current_until_save_terminal(
+        self, seq_factory
+    ):
+        sched = Scheduler(MockConfig(num_kvcache_blocks=1, kv_cache_block_size=4))
+        pinned = seq_factory([1, 2, 3, 4])
+        sched.add(pinned)
+        sched.schedule()
+        pinned.num_cached_tokens = pinned.num_prompt_tokens
+        pinned.append_token(9)
+        operation = SaveOperationId(pinned.id, 51)
+
+        class _Connector(OffloadSchedulerMixin):
+            is_producer = False
+            is_offload = True
+            _do_load = False
+
+            def __init__(self):
+                self.pending = {operation}
+
+            def should_defer_free(self, seq):
+                return seq is pinned and operation in self.pending
+
+            def save_finished(self, value):
+                self.pending.discard(value)
+
+            def build_connector_meta(self):
+                return None
+
+        sched.kv_connector = _Connector()
+        pinned_blocks = list(pinned.block_table)
+
+        blocked, _ = sched.schedule()
+
+        assert list(blocked.req_ids) == []
+        assert pinned.status == SequenceStatus.RUNNING
+        assert list(pinned.block_table) == pinned_blocks
+        assert sched.preempt(pinned) is False
+        assert list(pinned.block_table) == pinned_blocks
+
+        sched._update_from_kv_xfer_finished(
+            KVConnectorOutput(finished_saving={operation})
+        )
+        sched.schedule()
+
+        assert pinned.status == SequenceStatus.WAITING
+        assert len(pinned.block_table) == 0
+        assert sched.waiting.popleft() is pinned
+        sched.kv_connector = None
+        replacement = seq_factory([10, 11, 12, 13])
+        sched.add(replacement)
+        resumed, _ = sched.schedule()
+        assert list(resumed.req_ids) == [replacement.id]
+
     def test_ready_remote_kv_waiter_is_promoted_ahead_of_fresh_head(self):
         sched = Scheduler.__new__(Scheduler)
         fresh = SimpleNamespace(id=1, status=SequenceStatus.WAITING)
@@ -225,6 +451,52 @@ class TestSchedule:
 
         assert [seq.id for seq in sched.waiting] == [2, 1, 3]
 
+    def test_offload_parked_count_released_only_after_resume(self, seq_factory):
+        sched = Scheduler(
+            MockConfig(
+                max_num_seqs=2,
+                max_num_batched_tokens=64,
+                num_kvcache_blocks=100,
+            )
+        )
+        sched.kv_connector = SimpleNamespace(
+            is_offload=True,
+            build_connector_meta=lambda: None,
+        )
+
+        seq = seq_factory(list(range(8)))
+        seq.num_cached_tokens = 4
+        seq.block_table = [0]
+        seq.offload_loaded_tokens = 4
+        sched._park_for_remote_load(seq, deque())
+        sched._count_inflight_load(seq)
+        sched.finished_recving_kv_req_ids.append(seq.id)
+
+        assert sched._resolve_waiting_remote_kv(seq, deque()) is False
+        assert sched._num_parked_remote_kv == 1
+        sched.waiting.append(seq)
+
+        batch, _ = sched.schedule()
+
+        assert batch.total_seqs_num_prefill == 1
+        assert seq in sched.running
+        assert sched._num_parked_remote_kv == 0
+        assert seq._counted_as_inflight_load is False
+
+        sched.running.clear()
+        failed = seq_factory(list(range(8)))
+        failed.num_cached_tokens = 4
+        failed.block_table = [0]
+        sched._park_for_remote_load(failed, deque())
+        sched.failed_recving_kv_req_ids.append(failed.id)
+        sched.waiting.append(failed)
+
+        sched.schedule()
+
+        assert failed.offload_load_failed is True
+        assert failed in sched.running
+        assert sched._num_parked_remote_kv == 0
+
     def test_partial_prefill_ready_for_offload_load_moves_to_waiting(self):
         class _Connector:
             def should_park_partial_prefill_for_load(self, seq):
@@ -234,6 +506,7 @@ class TestSchedule:
         sched.kv_connector = _Connector()
         sched.waiting = deque()
         sched._partial_prefill_count = 1
+        sched._num_parked_remote_kv = 0
         keep = SimpleNamespace(
             id=1,
             status=SequenceStatus.RUNNING,
@@ -252,10 +525,12 @@ class TestSchedule:
         assert [seq.id for seq in sched.waiting] == [2]
         assert ready.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
         assert ready.is_partial_prefill is False
-        assert ready._discard_next_deferred_output is True
+        assert not hasattr(ready, "_discard_next_deferred_output")
         assert sched._partial_prefill_count == 0
+        assert sched._num_parked_remote_kv == 1
+        assert ready._counted_as_inflight_load is True
 
-    def test_offload_partial_handoff_discards_stale_deferred_output(self, seq_factory):
+    def test_offload_partial_handoff_keeps_resumed_deferred_output(self, seq_factory):
         sched = Scheduler(
             MockConfig(
                 max_num_batched_tokens=64,
@@ -268,7 +543,9 @@ class TestSchedule:
         seq.status = SequenceStatus.RUNNING
         seq.type = SequenceType.PREFILL
         seq.num_cached_tokens = 8
-        seq._discard_next_deferred_output = True
+        # The pre-handoff partial-prefill postprocess already appended the
+        # deferred-output placeholder before the request was parked.
+        seq.append_token(sched.eos_token_id)
         sched.running = deque([seq])
 
         sched.postprocess(
@@ -285,9 +562,7 @@ class TestSchedule:
         )
 
         assert seq.num_cached_tokens == 10
-        assert seq._discard_next_deferred_output is False
-        assert 999 not in seq.output_tokens
-        assert seq.output_tokens == [sched.eos_token_id]
+        assert list(seq.output_tokens) == [999, sched.eos_token_id]
 
 
 # ── _waiting_new_token_count (PrefillDelayer queue signal) ─────────────────
@@ -511,17 +786,18 @@ class TestLongPrefillTokenThreshold:
         """budget < threshold → chunk is bounded by budget, not threshold."""
         sched = Scheduler(
             MockConfig(
-                num_kvcache_blocks=100,
+                num_kvcache_blocks=400,
                 kv_cache_block_size=4,
-                max_num_batched_tokens=10,
-                long_prefill_token_threshold=8,
+                max_model_len=1024,
+                max_num_batched_tokens=192,
+                long_prefill_token_threshold=128,
                 enable_chunked_prefill=True,
             )
         )
-        sched.add(seq_factory(list(range(20))))  # capped at 8
-        sched.add(seq_factory(list(range(20, 40))))  # budget left = 2
+        sched.add(seq_factory(list(range(320))))  # capped at the threshold, 128
+        sched.add(seq_factory(list(range(400, 720))))  # budget left = 64
         batch, _ = sched.schedule()
-        assert list(batch.num_scheduled_tokens) == [8, 2]
+        assert list(batch.num_scheduled_tokens) == [128, 64]
 
     def test_ignored_when_chunked_prefill_disabled(self, seq_factory):
         """No chunked prefill → threshold is a no-op (full prompt or reject)."""
@@ -583,6 +859,119 @@ class TestPrefixCaching:
                 max_num_batched_tokens=256,
             )
         )
+
+    def test_generated_blocks_feed_the_next_turn(self, seq_factory):
+        """Multi-turn reuse: turn 2's prompt is turn 1's prompt plus its answer.
+
+        Exercises the postprocess call site, where the committed KV length is
+        the only thing separating a finalized block from one the next step may
+        still rewrite.
+        """
+        sched = Scheduler(
+            MockConfig(
+                enable_prefix_caching=True,
+                kv_cache_block_size=4,
+                num_kvcache_blocks=40,
+                max_num_seqs=4,
+                max_num_batched_tokens=256,
+                max_model_len=64,
+            )
+        )
+        prompt = [1, 3, 4, 5, 6, 7, 8, 9]  # 2 whole blocks
+        seq1 = seq_factory(prompt, sampling_params=SamplingParams(max_tokens=64))
+        sched.add(seq1)
+        batch, _ = sched.schedule()  # prefill
+
+        generated = list(range(100, 112))  # 3 more blocks
+        for token in generated:
+            sched.postprocess(
+                list(sched.running),
+                ScheduledBatchOutput(
+                    req_ids=[seq1.id],
+                    token_ids=[(token,)],
+                    num_rejected=None,
+                    num_bonus=None,
+                    draft_token_ids=None,
+                ),
+                batch=batch,
+            )
+            batch, _ = sched.schedule()  # next decode step
+
+        assert list(seq1.token_ids) == prompt + generated
+        # 20 tokens on the seq, but token 20 was sampled this step and no
+        # forward has written its KV — the block it closes stays unhashed until
+        # the next step consumes it.
+        assert seq1.num_hashed_tokens == 16
+
+        sched.postprocess(
+            list(sched.running),
+            ScheduledBatchOutput(
+                req_ids=[seq1.id],
+                token_ids=[(112,)],
+                num_rejected=None,
+                num_bonus=None,
+                draft_token_ids=None,
+            ),
+            batch=batch,
+        )
+        assert seq1.num_hashed_tokens == 20
+
+        followup = seq_factory(prompt + generated)
+        sched.add(followup)
+        batch2, _ = sched.schedule()
+        # 20 tokens, 5 blocks; the last is never reused so 16 tokens are cached
+        # and only the final block's 4 tokens get forwarded.
+        assert batch2.total_tokens_num_prefill == 4
+
+    def test_deferred_output_hashes_up_to_the_committed_length(self, seq_factory):
+        """The same KV line, reached from the other side of the output lag.
+
+        Deferred output patches sampled ids one step late and appends its
+        placeholder after hashing, so the committed length it hands over
+        already excludes the token still in flight. Subtracting one there —
+        correct for undeferred output, see the test above — would leave every
+        generated block a step behind for the whole run.
+        """
+        sched = Scheduler(
+            MockConfig(
+                enable_prefix_caching=True,
+                kv_cache_block_size=4,
+                num_kvcache_blocks=40,
+                max_num_seqs=4,
+                max_num_batched_tokens=256,
+                max_model_len=64,
+            )
+        )
+        prompt = [1, 3, 4, 5, 6, 7, 8, 9]  # 2 whole blocks
+        seq1 = seq_factory(prompt, sampling_params=SamplingParams(max_tokens=64))
+        sched.add(seq1)
+        batch, _ = sched.schedule()  # prefill
+
+        def step(token_ids):
+            nonlocal batch
+            sched.postprocess(
+                list(sched.running),
+                ScheduledBatchOutput(
+                    req_ids=[seq1.id] if token_ids else [],
+                    token_ids=[token_ids] if token_ids else [],
+                    num_rejected=np.zeros(1, dtype=np.int32),
+                    num_bonus=np.zeros(1, dtype=np.int32),
+                    draft_token_ids=None,
+                    is_deferred_out=True,
+                ),
+                batch=batch,
+            )
+            batch, _ = sched.schedule()
+
+        # The prefill step returns nothing; its sampled token surfaces next.
+        step(())
+        for token in range(100, 108):
+            step((token,))
+
+        # Every id that surfaced was sampled by a forward that has since run
+        # again, so all eight are backed by KV: 16 tokens, 4 whole blocks. A
+        # blanket subtract-one would stop at 12 and stay a block behind.
+        assert seq1.num_hashed_tokens == 16
 
     def test_prefix_cache_reduces_token_count(self, seq_factory):
         """After a first request populates the cache, a second request sharing
@@ -697,7 +1086,7 @@ class TestPreempt:
         scheduler.schedule()
         scheduler.preempt(seq)
         assert seq.status == SequenceStatus.WAITING
-        assert seq.block_table == []
+        assert len(seq.block_table) == 0
 
 
 # ── postprocess ────────────────────────────────────────────────────────────
