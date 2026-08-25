@@ -491,6 +491,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
         if os.getenv("ATOM_PREFILL_DELAYER_MAX_QUEUE_MS", "") == ""
         else float(os.getenv("ATOM_PREFILL_DELAYER_MAX_QUEUE_MS"))
     ),
+    # After a prefill forward, protect this many scheduler passes for decode
+    # before allowing another prefill. Mirrors SGLang's
+    # --prefill-decode-interval; 0 disables the hard interval.
+    "ATOM_PREFILL_DECODE_INTERVAL": lambda: int(
+        os.getenv("ATOM_PREFILL_DECODE_INTERVAL", "0")
+    ),
     # --- TBO prefill ubatch splitting ---
     # Split prefill ubatches at the exact token midpoint (vLLM-DBO style),
     # cutting through a request if needed for perfectly balanced 50/50 ubatches.

@@ -373,6 +373,14 @@ class EngineCore:
             fwd_out = self.runner_mgr.call_func(
                 "forward", scheduled_batch, wait_out=True
             )
+            if (
+                self.scheduler.prefill_delayer is not None
+                and scheduled_batch.total_seqs_num_prefill > 0
+            ):
+                # Arm post-prefill decode protection only after the prefill
+                # forward really completed. A delayer FIRE merely grants
+                # admission and can still result in a decode/empty batch.
+                self.scheduler.prefill_delayer.notify_prefill_executed()
 
         # Aggregate KV transfer status from all workers (only when PD disaggregation is active)
         self._poll_kv_transfer_progress()
@@ -636,6 +644,7 @@ class DPEngineCoreProc(EngineCore):
                     kv_high_watermark=envs.ATOM_PREFILL_DELAYER_KV_HIGH_WATERMARK,
                     token_usage_low_watermark=envs.ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK,
                     max_queue_ms=envs.ATOM_PREFILL_DELAYER_MAX_QUEUE_MS,
+                    prefill_decode_interval=envs.ATOM_PREFILL_DECODE_INTERVAL,
                 )
             )
 
