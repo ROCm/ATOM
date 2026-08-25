@@ -93,6 +93,14 @@ class BlockManager:
         self.hash_block_size = self.block_size * self.dcp_world_size
         self.enable_prefix_caching = config.enable_prefix_caching
         self.total_evicted_blocks: int = 0
+        # Every hash ever published, so a walk that stops can say whether the
+        # content was once cached (evicted) or never was (divergence). Unbounded
+        # by design -- forgetting is exactly what it exists to detect -- so it
+        # only fills while the diagnostic flag is on. Read at each publish
+        # rather than latched here: the flag is an env var, and latching it at
+        # construction makes the set silently empty for anything that builds a
+        # manager before setting it.
+        self._published_hashes: set[int] = set()
 
         kv_events = getattr(config, "kv_events_config", None)
         self._events_enabled: bool = bool(kv_events and kv_events.enable)
@@ -663,12 +671,18 @@ class BlockManager:
             #   blocks - 1 - compressed  = lost in the paged index (never
             #                              cached, or evicted)
             #   compressed - cached      = declined by the state/SWA gates
-            # `first_hash` is the hash the walk stopped on, so a miss can be
-            # matched against the [PrefixStore] line that published it.
             compressed = getattr(seq, "num_compressed_hit_blocks", 0)
+            stop_hash = getattr(seq, "prefix_miss_hash", -1)
+            # The whole question for the paged channel: `evicted` means this
+            # exact hash was published earlier and is no longer in the index,
+            # so the prefix was cached and the block went. Otherwise the walk
+            # stopped on content nobody ever stored -- a divergence, not a
+            # capacity loss.
+            was_stored = stop_hash in self._published_hashes
             logger.info(
                 "[PrefixWalk] seq=%s tokens=%d blocks=%d compressed=%d "
-                "cached=%d kind=%s stop_hash=%d indexed=%d",
+                "cached=%d kind=%s stop_hash=%d stored=%d evicted_total=%d "
+                "indexed=%d",
                 getattr(seq, "external_request_id", None) or seq.id,
                 seq.num_tokens,
                 self._n_hash_blocks(seq),
@@ -678,7 +692,9 @@ class BlockManager:
                 # so no walk happened. The scheduler always probes; tests and
                 # the no-prefix-caching path do not.
                 getattr(seq, "prefix_miss_kind", "no-probe"),
-                getattr(seq, "prefix_miss_hash", -1),
+                stop_hash,
+                int(was_stored),
+                self.kv.blocks_evicted,
                 self.kv.num_indexed,
             )
 
@@ -841,16 +857,21 @@ class BlockManager:
             if i == 0:
                 first_published = h
             self.kv.publish(seq.block_table[i], h, token_ids)
+            if envs.ATOM_LOG_PREFIX_MISS:
+                # Every hash this run publishes, not just block 0's. A walk
+                # almost always stops deep in the prefix, so a block-0-only
+                # record can never answer "was the hash it stopped on ever
+                # here?" -- it says "never seen" for every stop and reads as a
+                # measured zero. Grows without bound; diagnostic builds only.
+                self._published_hashes.add(h)
             if record:
                 store_run_hashes.append(h)
                 store_run_tokens.extend(token_ids)
         if envs.ATOM_LOG_PREFIX_MISS and first_published != -1:
-            # The write side of `[PrefixMiss]`. A miss reports the hash it
-            # looked for; without the hash that was stored there is no way to
-            # tell a prompt that diverged at block 0 from one whose block 0 was
-            # evicted -- the two produce the same "unindexed" line. Only block
-            # 0 is logged: if the chains agree there they agree until the
-            # prompts differ, and one line per request is the point.
+            # The write side of `[PrefixWalk]`. A stop reports the hash it
+            # looked for; without knowing whether that hash was ever stored
+            # there is no way to tell a prompt that diverged from one whose
+            # block was evicted -- the two produce the same "unindexed" line.
             logger.info(
                 "[PrefixStore] seq=%s block0_hash=%d first_tokens=%s " "blocks=%d..%d",
                 getattr(seq, "external_request_id", None) or seq.id,

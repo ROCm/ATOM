@@ -315,6 +315,11 @@ class EngineUtilityHandler:
             # `CacheStats` counts the reuse a request wanted and did not
             # get; the funnel is where it was lost.
             result |= self.scheduler.block_manager.checkpoint_funnel()
+            # The paged pool's own eviction counts, which the funnel does not
+            # carry: `checkpoints_evicted` speaks for the state pool alone, so
+            # without these a falling `paged_hit` cannot be told apart from
+            # prompts that never shared a prefix -- opposite fixes.
+            result |= self.scheduler.block_manager.pool_pressure()
         self.output_queue.put_nowait(
             ("UTILITY_RESPONSE", {"cmd": "get_cache_statistics", "result": result})
         )

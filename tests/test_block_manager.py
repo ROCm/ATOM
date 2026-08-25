@@ -609,6 +609,49 @@ class TestPrefixWalkLog:
             out.append(f)
         return out
 
+    def test_a_deep_stop_can_still_be_called_evicted(
+        self, block_manager_prefix, seq_factory, caplog, monkeypatch
+    ):
+        """The distinction the whole diagnostic exists for, at the depth it
+        actually happens.
+
+        Walks almost never stop at block 0 -- the shared system prompt matches
+        first -- so a record of only block-0 hashes reports "never stored" for
+        every stop and reads as a measured zero. `stored=1` on a hash the walk
+        stopped at deep in the prefix is the eviction signal.
+        """
+        monkeypatch.setenv("ATOM_LOG_PREFIX_MISS", "1")
+        # Publish 3 blocks, then drop the pool's index. The same prompt now
+        # stops on a hash that was certainly stored: an eviction, not a
+        # divergence.
+        first = seq_factory(list(range(1, 17)))
+        block_manager_prefix.allocate(first)
+        block_manager_prefix.hash_blocks(
+            first, first.num_tokens - first.num_cached_tokens
+        )
+        block_manager_prefix.deallocate(first)
+        bm = block_manager_prefix
+        bm.kv._hash_to_block_id.clear()
+        for b in bm.kv.blocks:
+            b.hash = -1
+        again = seq_factory(list(range(1, 17)))
+        with caplog.at_level(logging.INFO, logger="atom"):
+            bm.allocate(again, bm.can_allocate(again))
+        w = self._walks(caplog)[-1]
+        assert w["compressed"] == "0"
+        assert w["stored"] == "1"  # was cached and went -- capacity, not drift
+
+    def test_a_genuinely_new_prefix_is_not_called_evicted(
+        self, block_manager_prefix, seq_factory, caplog, monkeypatch
+    ):
+        """The other side: content nobody ever stored must not read as an
+        eviction, or every cold start inflates the capacity column."""
+        monkeypatch.setenv("ATOM_LOG_PREFIX_MISS", "1")
+        seq = seq_factory(list(range(500, 516)))
+        with caplog.at_level(logging.INFO, logger="atom"):
+            block_manager_prefix.allocate(seq, block_manager_prefix.can_allocate(seq))
+        assert self._walks(caplog)[-1]["stored"] == "0"
+
     def test_a_cold_prompt_reports_unindexed_and_zero(
         self, block_manager_prefix, seq_factory, caplog, monkeypatch
     ):

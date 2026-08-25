@@ -417,6 +417,11 @@ class LLMEngine:
                 "demands_recorded",
                 "demands_declined_no_room",
                 "chunks_cut_for_demand",
+                # The paged pool, so a falling `paged_hit` can be attributed.
+                # Cumulative like the token counts above, hence summed; the
+                # occupancy keys beside them in `pool_pressure` are gauges.
+                "blocks_evicted",
+                "blocks_retired",
             )
         }
         # `reusable`, not `full`: a request's trailing block is never a reuse
