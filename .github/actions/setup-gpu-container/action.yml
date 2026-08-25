@@ -129,6 +129,11 @@ runs:
         MMAP_FLAG=""
         [ "${DISABLE_MMAP}" = "true" ] && MMAP_FLAG="-e ATOM_DISABLE_MMAP=true"
 
+        VISIBLE_DEVICE_FLAGS=""
+        [ -n "${ROCR_VISIBLE_DEVICES:-}" ] && VISIBLE_DEVICE_FLAGS="${VISIBLE_DEVICE_FLAGS} -e ROCR_VISIBLE_DEVICES=${ROCR_VISIBLE_DEVICES}"
+        [ -n "${HIP_VISIBLE_DEVICES:-}" ] && VISIBLE_DEVICE_FLAGS="${VISIBLE_DEVICE_FLAGS} -e HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES}"
+        [ -n "${CUDA_VISIBLE_DEVICES:-}" ] && VISIBLE_DEVICE_FLAGS="${VISIBLE_DEVICE_FLAGS} -e CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+
         docker run -dt $PULL_FLAG $NETWORK_FLAG --device=/dev/kfd $DEVICE_FLAG \
         -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
         $MODEL_MOUNT \
@@ -139,6 +144,7 @@ runs:
         --cap-add=SYS_PTRACE \
         -e HF_TOKEN="${HF_TOKEN:-}" \
         -e ATOM_DOCKER_IMAGE="${ATOM_DASHBOARD_DOCKER_IMAGE:-}" \
+        $VISIBLE_DEVICE_FLAGS \
         $EXTRA_RUN_FLAGS \
         --env-file "$ENV_FILE" \
         --security-opt seccomp=unconfined \
