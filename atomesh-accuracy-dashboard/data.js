@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1787589990789,
+  "lastUpdate": 1787676183518,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -1985,6 +1985,57 @@ window.BENCHMARK_DATA = {
             "value": 0.8939,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/32749651947 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202608241610 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.3821 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "PerryZhang01",
+            "username": "PerryZhang01",
+            "email": "Perry.Zhang@amd.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "4e0848dcdf94f3d4be0c1e3ce51db99bc93f8b8c",
+          "message": "[fix](dspark): keep Kimi-K3 KDA out of the piecewise cudagraph (#2004)\n\nServing Kimi-K3 with a DSpark drafter died during capture with \"HIP error:\noperation not permitted when stream is capturing\".\n\nDSpark makes a capture batch carry 1 + num_spec tokens per request, which\ndecode_threshold=1 reads as prefill, so capture takes the chunked KDA path.\nThat path builds chunk_indices from the batch's own cu_seqlens via a host\nreadback -- illegal mid-capture, and frozen into every replay if the read is\ndodged. Plain K3 has one token per request, is classified as decode, and\nnever reaches it.\n\nMark the mixer with @eager_break_during_capture so it runs eagerly and is\nre-executed per replay against live metadata, matching vLLM's own Kimi GDN\nlinear attention. The decorator rejects ops returning a fresh tensor -- its\naddress moves each replay and breaks downstream segments -- so the plugin\nregisters its own write-into-output op rather than widening the shared one,\nleaving the native ATOM and SGLang paths untouched.\n\nFull decode graphs are unaffected: they reach the builder through\nbuild_for_cudagraph_capture, which synthesises the draft counts and lands on\nthe fused spec path, so KDA stays inside those graphs.\n\nAlso drops DCP from the Kimi-K3 CI entry -- vLLM rejects it outright for this\nmodel in config/speculative.py, so the entry could never start -- and moves\nextra_args after the harness defaults so an entry can override them.\n\ngsm8k 5-shot, TP8, N=7: 0.9522 flexible / 0.9515 strict, against 0.9553 /\n0.9560 for plain K3; draft acceptance 48.5%.\n\nCo-authored-by: perzhang <perzhang@amd.com>\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-08-25T09:19:20Z",
+          "url": "https://github.com/ROCm/ATOM/commit/4e0848dcdf94f3d4be0c1e3ce51db99bc93f8b8c"
+        },
+        "date": 1787676150239,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.9477,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/32870878654 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202608251555 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9469 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP accuracy (GSM8K)",
+            "value": 0.9507,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/32870878654 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202608251555 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9507 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP MTP acceptance (%)",
+            "value": 66.18,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/32870878654 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202608251555 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9507 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP avg toks/fwd (tok/fwd)",
+            "value": 2.99,
+            "unit": "tok/fwd"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.8764,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/32870878654 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202608251555 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.3662 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
