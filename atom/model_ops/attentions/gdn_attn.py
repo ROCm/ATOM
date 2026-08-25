@@ -727,6 +727,7 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         only_update: bool = False,
         num_reject_tokens=None,
     ):
+        pad_bs = int(positions.shape[-1])  # rows; see the base contract
         var = self.model_runner.forward_vars
 
         # GDN hybrid models use paged KV cache for full-attention layers.
@@ -736,9 +737,9 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         # paged attention does not use persistent worker buffers that need
         # incremental updates (unlike MLA). The full kv_indices regeneration
         # is always correct regardless of the update mode.
-        kv_indptr = var["kv_indptr"].gpu[: bs + 1]
+        kv_indptr = var["kv_indptr"].gpu[: pad_bs + 1]
         kv_indices_generate_triton(
-            var["block_tables"].gpu[:bs],
+            var["block_tables"].gpu[:pad_bs],
             var["kv_indices"].gpu,
             kv_indptr,
             self.block_ratio,
@@ -747,7 +748,7 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
 
         result = {}
         if self.block_size == 1024:
-            result = self.set_aiter_persistent_worker_buffers(bs)
+            result = self.set_aiter_persistent_worker_buffers(pad_bs)
         return result
 
     def build_for_cudagraph_capture(self, bs: int):

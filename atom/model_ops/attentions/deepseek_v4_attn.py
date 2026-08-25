@@ -2353,6 +2353,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         )
 
         var = self.model_runner.forward_vars
+        pad_bs = int(positions.shape[-1])  # rows; see the base contract
         attn_metadata = cast(
             AttentionMetaData_DSV4, get_forward_context().attn_metadata
         )
@@ -2370,17 +2371,32 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # `prepare_decode`.
         actual_swa = torch.clamp(positions + 1, max=win)
 
-        swa_indptr = var["v4_kv_indptr_swa"].gpu[: bs + 1]
+        swa_indptr = var["v4_kv_indptr_swa"].gpu[: pad_bs + 1]
         # positions/actual_swa are int64 (eagle's positions buffer); cast to
         # int32 inside cumsum to match swa_indptr's int32 storage.
         torch.cumsum(actual_swa, dim=0, dtype=torch.int32, out=swa_indptr[1:])
 
-        # batch_id_per_token: 1-tok-per-seq → arange(bs). Eagle already
-        # populated cu_seqlens_q as arange(bs+1) (eagle.py:430), so its
-        # [:bs] slice IS [0,1,...,bs-1] — exactly the per-token batch id.
-        # No extra alloc / arange kernel.
-        assert attn_metadata.cu_seqlens_q is not None
-        batch_id_per_token = attn_metadata.cu_seqlens_q[:bs]
+        # batch_id_per_token: 1-tok-per-seq → arange(bs), with `-1` over the
+        # drafter's pad tail. That sentinel is the SAME one the verify fwd uses
+        # (`_attach_v4_per_fwd_meta` fills the padded tail with -1): the index
+        # writer and `csa_translate_pack` both skip those rows, so a padded
+        # draft costs nothing for the rows it invented instead of repeating a
+        # real one's gather. At bs=65 padded to 128 that is half the batch.
+        #
+        # THE buffer the verify fwd publishes on this field, not a private
+        # one: a captured draft graph baked that address, so a mid-step that
+        # republished a different tensor would leave the replay reading the
+        # verify map -- and the `-1` tail below is the only thing masking the
+        # pad rows out of the fused SWA write. Restaged by the verify fwd every
+        # step, so writing it here clobbers nothing.
+        #
+        # Not a slice of `cu_seqlens_q` either: that one is also the q indptr,
+        # and a sentinel in it would corrupt the other reader. `_v4_row_ids` is
+        # the resident arange the real prefix is restored from.
+        batch_id_per_token = var["v4_batch_id_per_token"].gpu[:pad_bs]
+        batch_id_per_token[:bs].copy_(self._v4_row_ids[:bs])
+        if pad_bs > bs:
+            batch_id_per_token[bs:] = -1
 
         # ----- Kernel: write SWA prefix paged offsets -----
         # MTP layers are dense, so only the dense class's buffer is asked for;
@@ -2390,7 +2406,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         swa_indices_buf = var["v4_kv_indices_swa"]
         dest_rows = self._dest_row_buffers()
         write_v4_paged_decode_indices(
-            state_slot_per_seq=attn_metadata.state_slot_out[:bs],
+            state_slot_per_seq=attn_metadata.state_slot_out[:pad_bs],
             batch_id_per_token=batch_id_per_token,
             positions=positions,
             swa_indptr=swa_indptr,
@@ -2400,7 +2416,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             csa_indices=None,
             hca_indices=None,
             dest_rows=dest_rows,
-            T=bs,
+            T=pad_bs,
             win=win,
             geometry=self.pool_geometry,
         )
@@ -2422,7 +2438,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # to that length via the same builder-staged path as the verify fwd.
         if self._kv_fp8:
             attn_metadata.qo_indptr = self._stage(
-                "v4_qo_indptr", self._v4_qo_indptr_np[: bs + 1]
+                "v4_qo_indptr", self._v4_qo_indptr_np[: pad_bs + 1]
             )
 
         # NOT rebuilt (unused by SWA-only MTP layer; would block a future
@@ -2523,6 +2539,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         si_buf.np[:scheduled_bs] = self._state_slot_in_np(
             batch, scheduled_bs, state_slot_np
         )
+        # Published at the PADDED `bs`, like the ubatch path below already does,
+        # so a consumer that runs the padded batch -- a speculative drafter -- can
+        # slice to it. Every reader either masks the pad tail out
+        # (`batch_id_per_token = -1`) or discards those rows, so 0 is as good a
+        # filler here as it is there.
+        ss_buf.np[scheduled_bs:bs] = 0
+        si_buf.np[scheduled_bs:bs] = 0
 
         # ---- fire H2D on prep_stream ----
         # NB: this runs inside attn_metadata_builder.build(), BEFORE
@@ -2535,8 +2558,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             cu_seqlens_q_gpu = var["cu_seqlens_q"].copy_to_gpu(bs + 1)
             context_lens_gpu = var["context_lens"].copy_to_gpu(scheduled_bs)
             block_tables_gpu = var["block_tables"].copy_to_gpu(scheduled_bs)
-            state_slot_gpu = ss_buf.copy_to_gpu(scheduled_bs)
-            state_slot_in_gpu = si_buf.copy_to_gpu(scheduled_bs)
+            state_slot_gpu = ss_buf.copy_to_gpu(bs)
+            state_slot_in_gpu = si_buf.copy_to_gpu(bs)
 
         # ---- CPU numpy work, overlapped with prep_stream H2D ----
         # RAGGED: per-seq extend lengths (else uniform max_seqlen_q). compress
@@ -4474,6 +4497,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # (re-copied into the captured buffer before graph.replay). The constant
         # numpy sources are precomputed once so the per-fwd cost is a slice + H2D.
         bufs["v4_qo_indptr"] = CpuGpuBuffer(T_dec + 1, **i32)
+        # The constant arange a mid-step restores the real prefix of
+        # `v4_batch_id_per_token` from, resident so no step rebuilds it.
+        self._v4_row_ids = torch.arange(bs, device=self.device, dtype=torch.int32)
         self._v4_qo_indptr_np = np.arange(T_dec + 1, dtype=np.int32)
         # Per-seq `ctx_len // 4` (raw, no clamp). Consumed by csa_translate_pack
         # (kernel masks `(k < n_committed) & (k < index_topk)`) AND by the

@@ -820,8 +820,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         unused here: there are no persistent worker buffers to roll over for
         ``block_size != 1024``.
         """
+        pad_bs = int(positions.shape[-1])  # rows; see the base contract
         var = self.model_runner.forward_vars
-        slot_mapping = var["slot_mapping"].gpu[:bs]
+        slot_mapping = var["slot_mapping"].gpu[:pad_bs]
         block_tables = var["block_tables"].gpu
         context_lens = var["context_lens"].gpu
         update_positions = positions_out is not None
@@ -832,15 +833,15 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             last_token_indices = slot_mapping
         # Dummy runs skip the draft attention, so keep this launch as a no-op:
         # their synthetic context_lens can point past block_tables.
-        _mtp_prepare_decode_metadata_kernel[(max(1, triton.cdiv(bs, 128)),)](
+        _mtp_prepare_decode_metadata_kernel[(max(1, triton.cdiv(pad_bs, 128)),)](
             context_lens,
             block_tables,
             slot_mapping,
             positions,
             positions_out,
             last_token_indices,
-            bs,
-            bs == 0 or get_forward_context().context.is_dummy_run,
+            pad_bs,
+            pad_bs == 0 or get_forward_context().context.is_dummy_run,
             update_context_lens,
             update_positions,
             select_positions,

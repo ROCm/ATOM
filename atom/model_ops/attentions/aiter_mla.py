@@ -818,18 +818,19 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         parity with the MHA backend but unused (MLA's ``positions`` is already
         one entry per sequence at this point).
         """
+        pad_bs = int(positions.shape[-1])  # rows; see the base contract
         del last_token_indices  # MLA positions are already per-seq (1 per token)
         var = self.model_runner.forward_vars
-        kv_indptr = var["kv_indptr"].gpu[: bs + 1]
-        cu_seqlens_q = var["cu_seqlens_q"].gpu[: bs + 1]
+        kv_indptr = var["kv_indptr"].gpu[: pad_bs + 1]
+        cu_seqlens_q = var["cu_seqlens_q"].gpu[: pad_bs + 1]
         if self.is_sparse:
-            sparse_kv_indptr = var["sparse_kv_indptr"].gpu[: bs + 1]
+            sparse_kv_indptr = var["sparse_kv_indptr"].gpu[: pad_bs + 1]
         else:
             assert self.block_size == 1
             sparse_kv_indptr = None
 
         update_positions = positions_out is not None
-        context_lens = var["context_lens"].gpu[:bs] if update_context_lens else None
+        context_lens = var["context_lens"].gpu[:pad_bs] if update_context_lens else None
 
         mtp_prepare_decode_mla_kernel[(1,)](
             kv_indptr,
@@ -837,7 +838,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             sparse_kv_indptr if self.is_sparse else kv_indptr,
             positions_out if update_positions else kv_indptr,
             context_lens if update_context_lens else kv_indptr,
-            bs,
+            pad_bs,
             self.index_topk if self.is_sparse else 0,
             positions_out.stride(0) if update_positions else 1,
             IS_SPARSE=self.is_sparse,
@@ -857,13 +858,15 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             assert self.block_size == 1
             W = self.dcp_world_size
             r = self.dcp_rank
-            ctx_g = var["context_lens"].gpu[:bs].to(torch.int64)
+            ctx_g = var["context_lens"].gpu[:pad_bs].to(torch.int64)
             base = ctx_g // W
             remainder = (ctx_g - base * W - r).clamp_(0, 1)
             local_ctx = (base + remainder).to(torch.int32)  # local KV tokens/blocks
             kv_indptr[0] = 0
-            kv_indptr[1 : bs + 1] = torch.cumsum(local_ctx, dim=0, dtype=torch.int32)
-            var["kv_last_page_lens"].gpu[:bs] = (local_ctx > 0).to(
+            kv_indptr[1 : pad_bs + 1] = torch.cumsum(
+                local_ctx, dim=0, dtype=torch.int32
+            )
+            var["kv_last_page_lens"].gpu[:pad_bs] = (local_ctx > 0).to(
                 var["kv_last_page_lens"].gpu.dtype
             )
             # Host upper bound for the index generator's loop (safe overestimate,
@@ -871,7 +874,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             local_max_k = max_seqlen_k // W + 1
 
         kv_indices_generate_triton(
-            var["block_tables"].gpu[:bs],
+            var["block_tables"].gpu[:pad_bs],
             var["kv_indices"].gpu,
             kv_indptr,
             self.block_ratio,
@@ -881,7 +884,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # qlen==1 local decode: full build (not cprr; is_cp_round_robin=False),
             # over the just-rebuilt LOCAL kv_indptr / kv_last_page_lens.
             return self.set_mla_persistent_worker_buffers(
-                bs, 1, only_update=False, num_reject_tokens=None
+                pad_bs, 1, only_update=False, num_reject_tokens=None
             )
         if self.is_sparse:
             # The MTP draft's single sparse block reads sparse_kv_indptr, but it
@@ -899,7 +902,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # reflects the reject-adjusted KV lengths, so num_reject_tokens is
             # not needed here.
             result = self.set_mla_persistent_worker_buffers(
-                bs,
+                pad_bs,
                 1,
                 only_update=False,
                 num_reject_tokens=None,
@@ -908,7 +911,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             result["sparse_kv_indptr"] = sparse_kv_indptr
         else:
             result = self.set_mla_persistent_worker_buffers(
-                bs, max_seqlen_q, only_update, num_reject_tokens
+                pad_bs, max_seqlen_q, only_update, num_reject_tokens
             )
         return result
 

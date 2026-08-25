@@ -105,6 +105,35 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
     def build(self, batch: ScheduledBatch, bs: int):
         raise NotImplementedError
 
+    def prepare_mtp_decode(
+        self,
+        bs: int,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        positions: torch.Tensor,
+        only_update: bool = False,
+        num_reject_tokens: torch.Tensor | None = None,
+    ):
+        """Rebuild this backend's metadata for one serial-draft mid-step.
+
+        The draft runs one row per sequence, and `positions` is that row buffer
+        -- so `positions.shape[-1]` is the ROW COUNT and is what every shape here
+        follows. It is not `bs`: a drafter may run a wider batch to land on a
+        captured shape, and `bs` stays the count of rows that carry a real
+        sequence. They are equal whenever nothing is padded.
+
+        The LAST axis, not the first: MRoPE positions are `[3, N]` (the token
+        axis is last), and every other layout is `[N]`, where the two agree.
+
+        Backends that distinguish the two mark the padded tail so downstream
+        kernels skip it; those that do not simply never read `bs`, the same way
+        most ignore `only_update` / `num_reject_tokens`.
+
+        Returns per-forward metadata the caller installs on `attn_metadata`;
+        `{}` when the backend mutates it in place.
+        """
+        raise NotImplementedError
+
     @abstractmethod
     def build_for_cudagraph_capture(self, bs: int) -> AttentionMetaData:
         raise NotImplementedError
