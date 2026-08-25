@@ -58,6 +58,11 @@ on:
             glm-52-mxfp4-1p1d-tp4-agentic-1m-c1,glm-52-mxfp4-1p1d-tp4-agentic-1m-c2,
             glm-52-mxfp4-1p1d-tp4-agentic-1m-c4,glm-52-mxfp4-1p1d-tp4-agentic-1m-c8,
             glm-52-mxfp4-1p1d-tp4-agentic-1m-c48,
+            glm-52-mxfp4-1p1d-tp4-dcp4-agentic-lmcache-1m-c1,
+            glm-52-mxfp4-1p1d-tp4-dcp4-agentic-lmcache-1m-c2,
+            glm-52-mxfp4-1p1d-tp4-dcp4-agentic-lmcache-1m-c4,
+            glm-52-mxfp4-1p1d-tp4-dcp4-agentic-lmcache-1m-c8,
+            glm-52-mxfp4-1p1d-tp4-dcp4-agentic-lmcache-1m-c16,
             glm-52-mxfp4-1p1d-tp4-dpa-agentic-lmcache-1m-c24,
             glm-52-mxfp4-1p1d-tp4-dpa-agentic-lmcache-1m-c32,
             glm-52-mxfp4-1p1d-tp4-dpa-agentic-lmcache-1m-c48

@@ -428,8 +428,9 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         self.block_size = config.kv_cache_block_size
         # Under DCP one block-table entry is a virtual block covering
         # block_size * dcp_size global tokens, so the prefix-cache offset has to
-        # be counted in those, not in single blocks.
-        self.dcp_size = config.decode_context_parallel_size
+        # be counted in those, not in single blocks. Same quantity as
+        # BlockManager.hash_block_size.
+        self.hash_block_size = self.block_size * config.decode_context_parallel_size
         self.host_ip = get_ip()
 
         # Pending requests: req_id -> (Sequence, block_table)
@@ -509,10 +510,8 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             # prefix cache. Per-request state (including the SWA ring slot) is
             # not covered by a block-only delta, so it takes a full transfer.
             num_computed_blocks = 0
-            if not seq.has_per_req_cache and self.block_size > 0:
-                num_computed_blocks = seq.num_cached_tokens // (
-                    self.block_size * self.dcp_size
-                )
+            if not seq.has_per_req_cache and self.hash_block_size > 0:
+                num_computed_blocks = seq.num_cached_tokens // self.hash_block_size
             params["num_computed_blocks"] = num_computed_blocks
             logger.info(
                 "[SCHEDULER-CONSUMER] Queued req %s for remote KV recv "

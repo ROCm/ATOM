@@ -23,10 +23,16 @@ from typing import Any
 
 import torch
 
-# Version 3 adds the effective index-cache dtype to the PAGE identity. FP4 and
-# FP8 DSV4 indexers have different region counts and byte layouts, so they must
-# never reuse one another's objects even when the HF model config is identical.
-PAGE_LAYOUT_VERSION = 3
+from atom.utils import envs
+
+# Version 4 merges two independent PAGE-identity changes that each shipped as
+# "version 3". One added the effective index-cache dtype: FP4 and FP8 DSV4
+# indexers differ in region count and byte layout, so they must never reuse one
+# another's objects even under an identical HF config. The other added the GLM
+# replicated-index layout and IndexShare schedule, whose compact layer axis and
+# DCP-expanded index pages are incompatible with the sharded-index layout.
+# Objects from either version-3 generation are unreadable here.
+PAGE_LAYOUT_VERSION = 4
 _PAGE_FINGERPRINT_BYTES = 16
 _OFFLOAD_LAYOUT_ALIASES = {
     "hybrid": "hybrid",
@@ -49,10 +55,12 @@ _HF_PAGE_FIELDS = (
     "qk_rope_head_dim",
     "compress_ratios",
     "indexer_dtype",
+    "indexer_types",
 )
 _HF_INTEGER_GEOMETRY_FIELDS = frozenset(_HF_PAGE_FIELDS) - {
     "compress_ratios",
     "indexer_dtype",
+    "indexer_types",
 }
 
 logger = logging.getLogger("atom")
@@ -199,6 +207,12 @@ def build_page_namespace(
                 else getattr(config, "decode_context_parallel_size", 1)
             ),
             minimum=1,
+        ),
+        "replicated_index_cache": bool(
+            envs.ATOM_DCP_REPLICATE_INDEX_CACHE
+            and getattr(hf, "model_type", None) == "glm_moe_dsa"
+            and (getattr(config, "decode_context_parallel_size", 1) or 1) > 1
+            and getattr(config, "speculative_config", None) is None
         ),
         "hf_geometry": _stable_hf_geometry(hf),
         "speculative_config": _stable_config_value(
