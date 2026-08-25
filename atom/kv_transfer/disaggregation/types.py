@@ -333,6 +333,16 @@ class ConnectorMetadata:
         )
 
 
+def completion_req_key(completion: ConnectorCompletionId) -> str:
+    """Request identity shared by every shape a completion can take.
+
+    Offload reports ``SaveOperationId``/``LoadOperationId`` or a bare request
+    id; the send side and the scheduler only know requests. Pairing the two
+    means collapsing onto the request id first, or the lookup never hits.
+    """
+    return str(getattr(completion, "req_id", completion))
+
+
 def connector_metadata_has_work(metadata: object | None) -> bool:
     """Return whether connector metadata contains dispatchable work."""
     if metadata is None:
