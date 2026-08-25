@@ -615,7 +615,7 @@ class BlockManager:
                     store_run_hashes,
                     store_run_tokens,
                     store_run_parent,
-                    self.block_size,
+                    self.hash_block_size,
                 )
             )
         pos = base + num_new_tokens
@@ -1041,7 +1041,7 @@ class BlockManager:
                             [block_hash],
                             token_ids,
                             parent_hash if parent_hash != -1 else None,
-                            self.block_size,
+                            self.hash_block_size,
                         )
                     )
 
@@ -1196,7 +1196,7 @@ class BlockManager:
                 block_hashes,
                 token_ids,
                 parent_block_hash,
-                self.block_size,
+                self.hash_block_size,
                 medium=MEDIUM_REMOTE,
             )
         )

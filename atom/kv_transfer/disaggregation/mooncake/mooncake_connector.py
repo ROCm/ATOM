@@ -386,7 +386,17 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             # prefix cache. Per-request state (including the SWA ring slot) is
             # not covered by a block-only delta, so it takes a full transfer.
             num_computed_blocks = 0
-            if not seq.has_per_req_cache and self.hash_block_size > 0:
+            remote_hash_block_size = params.get("hash_block_size")
+            if remote_hash_block_size != self.hash_block_size:
+                logger.warning(
+                    "PD incremental transfer disabled for req %s: producer "
+                    "hash_block_size=%r, consumer hash_block_size=%d; "
+                    "falling back to full transfer",
+                    seq.id,
+                    remote_hash_block_size,
+                    self.hash_block_size,
+                )
+            elif not seq.has_per_req_cache and self.hash_block_size > 0:
                 num_computed_blocks = seq.num_cached_tokens // self.hash_block_size
             params["num_computed_blocks"] = num_computed_blocks
             logger.info(
@@ -433,6 +443,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             "tp_size": self.tp_size,
             "dp_rank": self.dp_rank,
             "remote_pp_size": self.pp_size,
+            "hash_block_size": self.hash_block_size,
             "transfer_id": seq.id,
             "first_token_id": first_token_id,
             "draft_token_ids": draft_token_ids,
