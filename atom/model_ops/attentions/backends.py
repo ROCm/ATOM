@@ -290,6 +290,36 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         self.model_runner.forward_vars.update(attn_metadata)
         self.has_sliding_window = hasattr(hf_config, "sliding_window")
 
+    @property
+    def disagg_kv_write_masked(self) -> bool:
+        """True when this prefill TP rank must mask some of its KV writes.
+
+        Asymmetric rapidserve runs prefill wide (TP=N) so a single request's
+        prefill uses every GPU, but MLA's KV latent is TP-replicated — all N
+        ranks end up holding an identical copy and only the rank co-located with
+        a request's target decode rank may commit it. The rest redirect those
+        writes to the reserved dump index (block_manager.DUMP_INDEX).
+
+        Masking runs through the index tensors rather than through control flow
+        so all TP ranks execute the same sequence of kernels and stay in lockstep
+        on their shared communicator.
+        """
+        cfg = self.model_runner.config
+        return (
+            getattr(cfg, "disagg_prefill_tp_size", 0) > 1 and not cfg.disagg_is_decode
+        )
+
+    def disagg_owned_rows(self, batch: ScheduledBatch) -> np.ndarray | None:
+        """Boolean mask of the batch rows this prefill rank owns, or None.
+
+        A prefill batch may mix requests bound for different decode ranks, so
+        ownership is per row: rank r commits the rows whose target_rank is r.
+        """
+        targets = getattr(batch, "target_ranks", None)
+        if not targets:
+            return None
+        return np.asarray(targets) == self.model_runner.rank
+
     def prepare_block_tables(self, batch: ScheduledBatch):
         var = self.model_runner.forward_vars
         block_tables = var["block_tables"].np
@@ -310,6 +340,18 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
                     # out of window and never indexed by the SWA kernels, but a
                     # raw -1 phys would compute a negative paged offset → OOB.
                     swa_np[i, : len(swa_table)] = [max(0, b) for b in swa_table]
+
+        if self.disagg_kv_write_masked:
+            from atom.model_engine.block_manager import DUMP_INDEX
+
+            owned = self.disagg_owned_rows(batch)
+            n = len(batch.block_tables)
+            # No target info (warmup / dummy batches) => own nothing, so the
+            # writes cannot land in a live pool.
+            masked = slice(0, n) if owned is None else ~owned[:n]
+            block_tables[:n][masked] = DUMP_INDEX
+            if swa_buf is not None and swa_tables is not None:
+                swa_buf.np[: len(swa_tables)][masked] = DUMP_INDEX
 
     def _mrope_cpu_view(self, num_tokens: int) -> np.ndarray:
         return (

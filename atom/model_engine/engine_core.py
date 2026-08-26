@@ -656,13 +656,23 @@ class PrefillEngineCore(EngineCore):
         config.enforce_eager = True
 
         self._disagg_d2p_addr = config.disagg_d2p_addr  # PULL: receive BlockAssignment
-        self._disagg_p2d_addr = config.disagg_p2d_addr  # PUSH: send PrefillDone
-        self._disagg_weight_ipc_addr = config.disagg_weight_ipc_addr
-        self._disagg_weight_ack_addr = config.disagg_weight_ack_addr
-        self._disagg_kvcache_ipc_addr = config.disagg_kvcache_ipc_addr
+        # One channel per decode rank: decode rank k pairs with the prefill TP
+        # rank on the same GPU, and a PrefillDone must reach the ONE rank that
+        # owns the sequence. Symmetric rapidserve has a single decode rank, so
+        # these are all length-1 lists there.
+        self._disagg_p2d_addrs = config.disagg_p2d_addrs  # PUSH: send PrefillDone
+        self._disagg_weight_ipc_addrs = config.disagg_weight_ipc_addrs
+        self._disagg_weight_ack_addrs = config.disagg_weight_ack_addrs
+        self._disagg_kvcache_ipc_addrs = config.disagg_kvcache_ipc_addrs
+        self._num_decode_ranks = config.disagg_num_decode_ranks
 
         # Maps seq_id → BlockAssignment, populated by the receiver thread.
         self._pending_assignments: dict = {}
+        # seq_id → owning decode rank, learned from each BlockAssignment. The
+        # matching PrefillDone must go back to that rank and nowhere else: block
+        # IDs are per-rank, so delivering it elsewhere would apply them to a
+        # different rank's KV pool.
+        self._seq_target_rank: dict = {}
 
         # ZMQ context for disagg sockets (separate from the main engine sockets).
         self._disagg_ctx = zmq.Context()
@@ -696,14 +706,29 @@ class PrefillEngineCore(EngineCore):
         logger.info(
             f"PrefillEngineCore: sending weight handles ({len(weight_payload)} bytes)..."
         )
-        with self._disagg_ctx.socket(zmq.PUSH) as w_sock:
-            w_sock.bind(self._disagg_weight_ipc_addr)
-            w_sock.send(weight_payload)
-        logger.info("PrefillEngineCore: weight handles sent, waiting for ACK...")
-        with self._disagg_ctx.socket(zmq.PULL) as ack_sock:
-            ack_sock.connect(self._disagg_weight_ack_addr)
-            ack_sock.recv()
-        logger.info("PrefillEngineCore: weight ACK received — decode weights freed")
+        # Every decode rank gets the SAME payload — it holds one handle-file path
+        # per prefill TP rank, and decode rank k picks out paths[k] itself.
+        socks = []
+        for addr in self._disagg_weight_ipc_addrs:
+            s = self._disagg_ctx.socket(zmq.PUSH)
+            s.bind(addr)
+            s.send(weight_payload)
+            socks.append(s)
+        logger.info(
+            f"PrefillEngineCore: weight handles sent to {len(socks)} decode "
+            f"rank(s), waiting for ACKs..."
+        )
+        # Wait for ALL of them before returning: the ACK means that rank has
+        # freed its own weight copy, and KV sizing below measures free VRAM.
+        for addr in self._disagg_weight_ack_addrs:
+            with self._disagg_ctx.socket(zmq.PULL) as ack_sock:
+                ack_sock.connect(addr)
+                ack_sock.recv()
+        for s in socks:
+            s.close()
+        logger.info(
+            "PrefillEngineCore: all weight ACKs received — decode weights freed"
+        )
 
     def _send_ready_signal(self):
         """Round 2 bootstrap: export kvcache handle → send to decode → emit READY."""
@@ -730,11 +755,17 @@ class PrefillEngineCore(EngineCore):
         logger.info(
             f"PrefillEngineCore: sending kvcache bundle ({len(kvcache_bundle)} bytes)..."
         )
-        # Keep socket alive on self until exit() so linger doesn't block shutdown.
-        self._bootstrap_push_sock = self._disagg_ctx.socket(zmq.PUSH)
-        self._bootstrap_push_sock.bind(self._disagg_kvcache_ipc_addr)
-        self._bootstrap_push_sock.send(kvcache_bundle)
-        logger.info("PrefillEngineCore: kvcache bundle sent")
+        # Keep sockets alive on self until exit() so linger doesn't block shutdown.
+        self._bootstrap_push_socks = []
+        for addr in self._disagg_kvcache_ipc_addrs:
+            s = self._disagg_ctx.socket(zmq.PUSH)
+            s.bind(addr)
+            s.send(kvcache_bundle)
+            self._bootstrap_push_socks.append(s)
+        logger.info(
+            f"PrefillEngineCore: kvcache bundle sent to "
+            f"{len(self._bootstrap_push_socks)} decode rank(s)"
+        )
         super()._send_ready_signal()
 
     def _init_disagg(self):
@@ -749,11 +780,16 @@ class PrefillEngineCore(EngineCore):
         self.runner_mgr.call_func("create_prefill_stream_pool", wait_out=True)
         logger.info("PrefillEngineCore: prefill stream pool created")
 
-        # --- Open the PUSH socket to send PrefillDone messages ---
+        # --- Open one PUSH socket per decode rank for PrefillDone ---
         # Prefill connects (not binds) so decode's PULL bind is ready first,
         # preventing messages from being dropped before decode connects.
-        self._p2d_sock = self._disagg_ctx.socket(zmq.PUSH)
-        self._p2d_sock.connect(self._disagg_p2d_addr)
+        # Indexed by decode rank: a PrefillDone must reach the rank that owns
+        # the sequence's KV, never fan out or round-robin.
+        self._p2d_socks = []
+        for addr in self._disagg_p2d_addrs:
+            s = self._disagg_ctx.socket(zmq.PUSH)
+            s.connect(addr)
+            self._p2d_socks.append(s)
 
         # --- Start thread to receive BlockAssignment from decode ---
         # Prefill binds so decode's PUSH connect finds a ready socket.
@@ -781,6 +817,7 @@ class PrefillEngineCore(EngineCore):
                 assignment: BlockAssignment = payload
                 with self.scheduler._pending_lock:
                     self._pending_assignments[assignment.seq_id] = assignment
+                    self._seq_target_rank[assignment.seq_id] = assignment.target_rank
             elif msg_type == DisaggMsgType.ABORT:
                 seq_id = payload
                 with self.scheduler._pending_lock:
@@ -807,6 +844,11 @@ class PrefillEngineCore(EngineCore):
                     # decode. Must stay positionally aligned with block_table —
                     # the V4 index kernels use absolute logical indexing.
                     seq.swa_block_table = list(assignment.swa_block_table)
+                    # Which decode rank's KV pool these block IDs refer to. The
+                    # prefill TP rank sharing that GPU is the only one allowed to
+                    # commit this sequence's KV; every other rank masks its
+                    # writes to the dump block (see ScheduledBatch.target_ranks).
+                    seq.disagg_target_rank = assignment.target_rank
 
     def _process_engine_step(self):
         from atom.model_engine.disagg_types import DisaggMsgType, PrefillDone
@@ -853,7 +895,11 @@ class PrefillEngineCore(EngineCore):
                     else []
                 ),
             )
-            self._p2d_sock.send(pickle.dumps((DisaggMsgType.PREFILL_DONE, done)))
+            # Route to the rank that allocated the blocks, not round-robin.
+            target = self._seq_target_rank.pop(seq_id, 0)
+            self._p2d_socks[target].send(
+                pickle.dumps((DisaggMsgType.PREFILL_DONE, done))
+            )
 
         # Remove completed sequences — prefill produces no output tokens.
         for seq in list(seqs.values()):
@@ -881,8 +927,8 @@ class PrefillEngineCore(EngineCore):
     def exit(self):
         super().exit()
         try:
-            if hasattr(self, "_bootstrap_push_sock"):
-                self._bootstrap_push_sock.close(linger=0)
+            for s in getattr(self, "_bootstrap_push_socks", []):
+                s.close(linger=0)
         except Exception:
             pass
         try:
@@ -907,10 +953,15 @@ class DecodeEngineCore(EngineCore):
 
     def __init__(self, config: Config, input_address: str, output_address: str):
         self._disagg_d2p_addr = config.disagg_d2p_addr  # PUSH: send BlockAssignment
-        self._disagg_p2d_addr = config.disagg_p2d_addr  # PULL: receive PrefillDone
-        self._disagg_weight_ipc_addr = config.disagg_weight_ipc_addr
-        self._disagg_weight_ack_addr = config.disagg_weight_ack_addr
-        self._disagg_kvcache_ipc_addr = config.disagg_kvcache_ipc_addr
+        # This rank's own slice of the per-decode-rank channels. Under DP decode
+        # rank k lives on GPU k and bootstraps against the prefill TP rank on the
+        # same GPU — the IPC handles are only valid there.
+        self._decode_rank = config.disagg_decode_rank
+        k = self._decode_rank
+        self._disagg_p2d_addr = config.disagg_p2d_addrs[k]  # PULL: PrefillDone
+        self._disagg_weight_ipc_addr = config.disagg_weight_ipc_addrs[k]
+        self._disagg_weight_ack_addr = config.disagg_weight_ack_addrs[k]
+        self._disagg_kvcache_ipc_addr = config.disagg_kvcache_ipc_addrs[k]
 
         self._disagg_ctx = zmq.Context()
 
@@ -1072,6 +1123,7 @@ class DecodeEngineCore(EngineCore):
             num_cached_tokens=seq.num_cached_tokens,
             context_len=seq.num_tokens,
             swa_block_table=list(seq.swa_block_table),
+            target_rank=self._decode_rank,
         )
         self._d2p_sock.send(pickle.dumps((DisaggMsgType.BLOCK_ASSIGNMENT, assignment)))
         logger.info(

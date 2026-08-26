@@ -165,6 +165,34 @@ def _module_meta_attrs(mod: nn.Module) -> dict:
     }
 
 
+def _expert_placement(model: nn.Module) -> dict:
+    """Per-MoE-module (ep_size, ep_rank, local_num_experts), for cross-checking.
+
+    Under asymmetric rapidserve the two processes reach the same expert sharding
+    by different routes — prefill via plain TP (`tp_size=8, tp_rank`), decode via
+    the DP-attention flatten (`flatten_tp_across_dp`, moe.py:133-139, giving
+    `tp_size = dp*tp, tp_rank = dp_rank`). Both land on ep_size=8 and
+    ep_rank=<this GPU>, and `determine_expert_map` is a pure function of those,
+    so rank k holds the same experts in both.
+
+    That agreement is load-bearing and NOT implied by tensor shape: every rank
+    holds `global_num_experts // ep_size` experts, so a divergent mapping (a
+    different flatten, a different DP-rank-to-GPU binding, EPLB rearranging one
+    process's placement but not the other's) produces identically-shaped tensors
+    holding the WRONG experts. Aliasing those is silent numerical corruption, so
+    the consumer verifies rather than assumes.
+    """
+    out: dict[str, tuple] = {}
+    for name, mod in model.named_modules():
+        if hasattr(mod, "ep_size") and hasattr(mod, "ep_rank"):
+            out[name] = (
+                int(mod.ep_size),
+                int(mod.ep_rank),
+                int(getattr(mod, "local_num_experts", -1)),
+            )
+    return out
+
+
 def export_model_weight_handles(model: nn.Module) -> dict:
     """Export all model parameter tensors as CUDA IPC handles.
 
@@ -223,7 +251,11 @@ def export_model_weight_handles(model: nn.Module) -> dict:
         if mattrs:
             module_attrs[mod_name] = mattrs
 
-    handles[_META_KEY] = {"tensor_attrs": tensor_attrs, "module_attrs": module_attrs}
+    handles[_META_KEY] = {
+        "tensor_attrs": tensor_attrs,
+        "module_attrs": module_attrs,
+        "expert_placement": _expert_placement(model),
+    }
     logger.info(
         f"[WT-EXPORT] {len(handles) - 1} tensors, "
         f"{len(tensor_attrs)} with attrs, {len(module_attrs)} modules with attrs"
@@ -231,7 +263,46 @@ def export_model_weight_handles(model: nn.Module) -> dict:
     return handles
 
 
-def import_model_weights(model: nn.Module, handles: dict) -> None:
+class ExpertPlacementMismatch(RuntimeError):
+    """Producer and consumer disagree about which experts each rank owns."""
+
+
+def _assert_expert_placement_matches(model: nn.Module, producer: dict) -> None:
+    """Fail loudly if the two processes shard experts differently.
+
+    Silent-wrong-answer guard, not a shape check: mismatched placements are
+    shape-compatible, so aliasing them would run the right kernels over the
+    wrong experts and simply degrade output quality.
+    """
+    if not producer:
+        return  # producer has no MoE modules, or predates the sidecar field
+    bad = []
+    for name, mod in model.named_modules():
+        if not (hasattr(mod, "ep_size") and hasattr(mod, "ep_rank")):
+            continue
+        theirs = producer.get(name)
+        if theirs is None:
+            continue
+        mine = (
+            int(mod.ep_size),
+            int(mod.ep_rank),
+            int(getattr(mod, "local_num_experts", -1)),
+        )
+        if tuple(theirs) != mine:
+            bad.append(f"{name}: producer={tuple(theirs)} consumer={mine}")
+    if bad:
+        raise ExpertPlacementMismatch(
+            f"{len(bad)} MoE module(s) shard experts differently between the "
+            f"prefill and decode processes, so their weights cannot be aliased "
+            f"(the tensors are the same SHAPE but hold different experts). "
+            f"Expected (ep_size, ep_rank, local_num_experts) to agree:\n  "
+            + "\n  ".join(bad[:10])
+        )
+
+
+def import_model_weights(
+    model: nn.Module, handles: dict, shape_aware: bool = False
+) -> None:
     """Replace model parameters with views into another process's GPU allocation.
 
     Also restores MLA absorbed tensors exported by export_model_weight_handles.
@@ -241,7 +312,22 @@ def import_model_weights(model: nn.Module, handles: dict) -> None:
     model's parameters point into prefill's GPU memory — zero additional bytes
     are allocated.  The decode process's original weight tensors are freed when
     their reference counts drop to zero.
+
+    `shape_aware` is for asymmetric rapidserve (prefill TP=N, decode TP=1).
+    There the two processes disagree about attention weights — prefill holds
+    Column/RowParallel shards, decode needs full matrices — so those tensors
+    cannot be aliased at all and decode loads them itself. Aliasing is then
+    applied only where the producer's shape MATCHES the consumer's own, which
+    is exactly the replicated tensors and the EP-aligned expert weights (where
+    essentially all of the model's bytes live). Mismatched entries are skipped
+    and the consumer keeps the copy it loaded.
     """
+    _import_model_weights_impl(model, handles, shape_aware=shape_aware)
+
+
+def _import_model_weights_impl(
+    model: nn.Module, handles: dict, shape_aware: bool
+) -> None:
     modules = dict(model.named_modules())
     # remove_duplicate=False to match the export and to materialize every
     # registration of a shared Parameter (see export note).
@@ -252,15 +338,59 @@ def import_model_weights(model: nn.Module, handles: dict) -> None:
     tensor_attrs = sidecar.get("tensor_attrs", {})
     module_attrs = sidecar.get("module_attrs", {})
 
+    if shape_aware:
+        # MoE aliasing rests on both processes deriving the SAME expert
+        # placement (see _expert_placement). Shape equality cannot detect a
+        # divergence — every rank holds global//ep_size experts either way — so
+        # check it explicitly before trusting a single alias.
+        _assert_expert_placement_matches(model, sidecar.get("expert_placement", {}))
+
     def _restore_attrs(obj, key):
         """Re-stamp the producer's non-tensor attributes onto the rebuilt object."""
         for k, v in tensor_attrs.get(key, {}).items():
             setattr(obj, k, v)
 
+    n_aliased = 0
+    kept_local: list[str] = []
+
+    def _consumer_shape(key: str):
+        """The consumer's own shape for `key`, or None if it has no counterpart.
+
+        Under `shape_aware` a missing counterpart means the producer created the
+        tensor and the consumer did not (post-load-hook outputs), so there is
+        nothing to compare against and aliasing proceeds as normal.
+        """
+        for prefix in ("__param__", "__buf__"):
+            if key.startswith(prefix):
+                name = key[len(prefix) :]
+                # Explicit None checks: `a or b` on a multi-element tensor calls
+                # __bool__ and raises.
+                t = params.get(name)
+                if t is None:
+                    t = buffers.get(name)
+                return None if t is None else tuple(t.shape)
+        return None
+
+    def _materialize(key: str, meta: dict) -> torch.Tensor | None:
+        """The imported view for `key`, or None to keep the consumer's own copy."""
+        nonlocal n_aliased
+        if shape_aware:
+            want = _consumer_shape(key)
+            if want is not None and want != tuple(meta["shape"]):
+                # Asymmetric topology: this is a TP-sharded attention weight.
+                # Prefill's shard and decode's full matrix are different tensors,
+                # not different views of one — decode keeps what it loaded.
+                kept_local.append(key)
+                return None
+        n_aliased += 1
+        return _import_tensor(meta)
+
     for key, meta in handles.items():
         if key == _META_KEY:
             continue
-        t = _import_tensor(meta)
+        t = _materialize(key, meta)
+        if t is None:
+            continue
         if key.startswith("__param__"):
             # Rebuild the Parameter around the imported CUDA view (set_data fails
             # for meta->cuda). Create the slot if the consumer's meta model lacks
@@ -290,6 +420,19 @@ def import_model_weights(model: nn.Module, handles: dict) -> None:
             parent, _, attr = name.rpartition(".")
             mod = modules.get(parent, model)
             if mod is not None:
+                # The producer's post-load hook may have turned a registered
+                # Parameter into a plain attribute — moe.py:1103-1108 does
+                # exactly that for w13/w2_weight_scale. The consumer built on
+                # meta and never ran that hook, so it still holds a meta
+                # Parameter under this name. Drop that stale slot: leaving it
+                # makes named_parameters() report the tensor as un-materialized,
+                # so the consumer re-loads it from the checkpoint, which drags
+                # its whole module into post-load processing — and that
+                # re-shuffles the module's ALIASED weights, allocating a second
+                # copy and writing through the alias into the producer's memory.
+                # Measured cost of getting this wrong on V4-Pro: +90GB and
+                # corrupted prefill weights.
+                mod._parameters.pop(attr, None)
                 _restore_attrs(t, key)
                 setattr(mod, attr, t)
 
@@ -309,6 +452,12 @@ def import_model_weights(model: nn.Module, handles: dict) -> None:
         f"[WT-IMPORT] restored {sum(len(a) for a in tensor_attrs.values())} tensor "
         f"attrs and {restored_mod_attrs} module attrs from the producer"
     )
+    if shape_aware:
+        logger.info(
+            f"[WT-IMPORT] asymmetric: {n_aliased} tensors aliased into the "
+            f"producer's allocation, {len(kept_local)} kept local (TP-sharded on "
+            f"the producer, full-size here): {sorted(kept_local)[:8]}"
+        )
 
     leftover = [n for n, p in model.named_parameters() if p.is_meta] + [
         n for n, b in model.named_buffers() if isinstance(b, torch.Tensor) and b.is_meta

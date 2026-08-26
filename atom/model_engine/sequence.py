@@ -93,6 +93,11 @@ class Sequence:
         # out-of-window SWA blocks can be freed while compressed blocks persist).
         # Empty / unused for non-SWA models.
         self.swa_block_table = []
+        # Asymmetric rapidserve: the decode rank owning this sequence's KV pool.
+        # Set from BlockAssignment.target_rank in the prefill process; the block
+        # tables above are indices into THAT rank's pool, so only the prefill TP
+        # rank on the same GPU may write them. 0 everywhere else.
+        self.disagg_target_rank = 0
         # Per-request cache slot index (filled by BlockManager.allocate()).
         # -1 = unallocated. The slot indexes into the per-req cache tensors
         # owned by ModelRunner (e.g. mamba_k_cache for GDN).

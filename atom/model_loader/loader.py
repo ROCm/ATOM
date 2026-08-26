@@ -230,8 +230,17 @@ def load_model(
     is_plugin_mode: bool = False,
     weights_mapper: WeightsMapper | None = None,
     load_fused_expert_weights_fn=None,
+    only_params: set[str] | None = None,
 ):
     """Load a checkpoint into `model` and run post-load weight processing.
+
+    `only_params` restricts the load to a set of parameter names AND restricts
+    post-load processing to the modules that own them. Used by asymmetric
+    rapidserve decode, where most parameters are already CUDA IPC aliases into
+    the prefill process: re-running process_weights_after_loading on those would
+    re-shuffle/re-quantize in place and write the result through the alias into
+    PREFILL's weights, corrupting both processes with no crash. None (default)
+    loads and post-processes everything, unchanged.
 
     The checkpoint -> parameter logic lives in `loading_core`, which is kept
     free of AITER so it can be unit-tested without a GPU build; this wrapper
@@ -281,6 +290,7 @@ def load_model(
         prefix=prefix,
         weights_mapper=weights_mapper,
         load_fused_expert_weights_fn=load_fused_expert_weights_fn,
+        only_params=only_params,
         default_weight_loader=default_weight_loader,
         fuse_shared_expert=_fuse_shared_expert,
         is_rank0=_is_rank0,
@@ -304,7 +314,36 @@ def load_model(
         logger.info("Weight post-processing started (includes online quantization)")
     pp_start = time.perf_counter()
 
+    # Partial load: only the modules whose parameters were ALL loaded here may
+    # be post-processed (see `only_params` in the docstring). Owning one loaded
+    # param is not enough — a module can mix loaded and aliased tensors, and
+    # `process_weights_after_loading` shuffles/quantizes every weight it owns
+    # in place. A FusedMoE whose scales were loaded but whose w13/w2 weights are
+    # aliases would therefore re-shuffle ~90GB of the producer's memory through
+    # the alias: a silent corruption of BOTH processes, plus a second copy.
+    post_process_modules: set[str] | None = None
+    if only_params is not None:
+        loaded = set(only_params)
+        post_process_modules = set()
+        for module_name, module in model.named_modules():
+            owned = [
+                f"{module_name}.{n}" if module_name else n
+                for n, _ in module.named_parameters(recurse=False)
+            ]
+            if owned and all(n in loaded for n in owned):
+                post_process_modules.add(module_name)
+        skipped = {n.rpartition(".")[0] for n in loaded} - post_process_modules
+        if skipped:
+            logger.info(
+                "Partial load: skipping post-processing for %d module(s) that "
+                "mix loaded and aliased parameters: %s",
+                len(skipped),
+                sorted(skipped)[:5],
+            )
+
     for module_name, module in model.named_modules():
+        if post_process_modules is not None and module_name not in post_process_modules:
+            continue
         if hasattr(module, "process_weights_after_loading"):
             module.process_weights_after_loading()
         quant_method = getattr(module, "quant_method", None)

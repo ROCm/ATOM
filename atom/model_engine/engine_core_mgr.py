@@ -620,8 +620,12 @@ class CoreManager:
         else:
             logger.info("%s: add %s", self.label, ", ".join(added))
 
-    def _select_dp_rank_locked(self) -> int:
+    def _select_dp_rank_locked(self, lo: int = 0, hi: int | None = None) -> int:
         """Pick a DP engine rank for a new request. Caller must hold _lb_lock.
+
+        `lo`/`hi` bound the candidate range (default: all engines). Disagg uses
+        them to select among the decode ranks only — its engine list starts with
+        the prefill process at index 0, which must never be chosen as a target.
 
         - "round_robin": load-agnostic rotation.
         - "least_requests" (default): fewest in-flight requests, ties broken by
@@ -634,9 +638,10 @@ class CoreManager:
         Fully-tied ranks are resolved by a rotating cursor so selection does not
         always fall on rank 0. See docs/distributed_guide.md for the rationale.
         """
-        n = self.local_engine_count
+        hi = self.local_engine_count if hi is None else hi
+        n = hi - lo
         if self._dp_lb_strategy == "round_robin":
-            dp_rank = self._rank_rotation_cursor % n
+            dp_rank = lo + (self._rank_rotation_cursor % n)
             self._rank_rotation_cursor += 1
             return dp_rank
 
@@ -644,11 +649,11 @@ class CoreManager:
         # of fully-equal ranks spreads evenly. Scores are computed inline (no
         # intermediate list) — the loop reads the counters directly.
         least_requests = self._dp_lb_strategy == "least_requests"
-        best_rank = 0
+        best_rank = lo
         best_score = None
         offset = self._rank_rotation_cursor % n
         for i in range(n):
-            r = (offset + i) % n
+            r = lo + ((offset + i) % n)
             if least_requests:
                 # Lexicographic (request count, prompt-token load): tuples compare
                 # element-wise, so tokens only decide among request-count ties.
@@ -904,14 +909,43 @@ class DisaggCoreManager(CoreManager):
         if torch.multiprocessing.get_start_method(allow_none=True) is None:
             torch.multiprocessing.set_start_method("spawn", force=False)
 
-        # Generate the inter-process ZMQ addresses before spawning.
+        # Asymmetric topology: --enable-dp-attention under rapidserve means
+        # "prefill wide (TP), decode per-GPU (DP)" rather than the whole-engine
+        # flattening CoreManager.__init__ does — that flattening never runs here
+        # because this class does not call super().__init__().
+        asymmetric = config.enable_dp_attention and config.tensor_parallel_size > 1
+        prefill_tp = config.tensor_parallel_size if asymmetric else 0
+
+        # Decode rank count. Symmetric rapidserve runs ONE decode process at the
+        # same TP as prefill — tensor parallelism drives all its workers from a
+        # single scheduler. Data parallelism cannot: each DP rank owns its own
+        # scheduler, BlockManager and KV pool, so it needs its own EngineCore
+        # process, exactly as CoreManager.__init__ does for non-disagg DPA.
+        n_decode = config.tensor_parallel_size if asymmetric else 1
+        if asymmetric:
+            logger.info(
+                "Asymmetric rapidserve: prefill TP=%d (1 process, %d workers), "
+                "decode DP=%d (%d processes, TP=1 each). MLA's KV latent is "
+                "TP-replicated, so the prefill rank sharing a GPU with a "
+                "sequence's target decode rank writes its KV locally and the "
+                "other ranks mask to the dump block.",
+                config.tensor_parallel_size,
+                config.tensor_parallel_size,
+                n_decode,
+                n_decode,
+            )
+
+        # decode → prefill stays single: many PUSHers to one PULLer is native
+        # ZMQ and prefill does not care which rank sent an assignment.
         d2p_addr = get_open_zmq_ipc_path()  # decode → prefill (BlockAssignment)
-        p2d_addr = get_open_zmq_ipc_path()  # prefill → decode (PrefillDone)
+        # Everything prefill sends is per-rank: a PrefillDone must reach the one
+        # owner, and each bootstrap pairs decode rank k with prefill rank k.
+        p2d_addrs = [get_open_zmq_ipc_path() for _ in range(n_decode)]
         # Bootstrap round 1: weight IPC handles (prefill → decode) + ACK (decode → prefill)
-        weight_ipc_addr = get_open_zmq_ipc_path()
-        weight_ack_addr = get_open_zmq_ipc_path()
+        weight_ipc_addrs = [get_open_zmq_ipc_path() for _ in range(n_decode)]
+        weight_ack_addrs = [get_open_zmq_ipc_path() for _ in range(n_decode)]
         # Bootstrap round 2: kvcache handle + num_blocks (prefill → decode)
-        kvcache_ipc_addr = get_open_zmq_ipc_path()
+        kvcache_ipc_addrs = [get_open_zmq_ipc_path() for _ in range(n_decode)]
 
         # Shared memory for dynamic CU partitioning: 4 bytes (float32).
         # DecodeScheduler writes the chosen CU fraction; PrefillScheduler reads it.
@@ -935,43 +969,84 @@ class DisaggCoreManager(CoreManager):
         if config.disagg_prefill_max_num_seqs is not None:
             prefill_config.max_num_seqs = config.disagg_prefill_max_num_seqs
         prefill_config.enforce_eager = True
+        prefill_config.disagg_prefill_tp_size = prefill_tp
+        # Prefill owns the wide TP topology; DP attention must stay off there or
+        # the model takes the DP gather path instead of the TP all_reduce path.
+        prefill_config.enable_dp_attention = False
         prefill_config.disagg_d2p_addr = d2p_addr
-        prefill_config.disagg_p2d_addr = p2d_addr
-        prefill_config.disagg_weight_ipc_addr = weight_ipc_addr
-        prefill_config.disagg_weight_ack_addr = weight_ack_addr
-        prefill_config.disagg_kvcache_ipc_addr = kvcache_ipc_addr
+        prefill_config.disagg_p2d_addrs = p2d_addrs
+        prefill_config.disagg_weight_ipc_addrs = weight_ipc_addrs
+        prefill_config.disagg_weight_ack_addrs = weight_ack_addrs
+        prefill_config.disagg_kvcache_ipc_addrs = kvcache_ipc_addrs
+        prefill_config.disagg_num_decode_ranks = n_decode
         prefill_config.disagg_cu_shm_name = cu_shm_name
         # Give prefill a distinct distributed rendezvous port so it doesn't
         # collide with decode's data_parallel_base_port (both deep-copy the
         # same port from config).
         prefill_config.parallel_config.data_parallel_base_port = _get_open_port()
 
-        decode_config = copy.deepcopy(config)
-        decode_config.disagg_d2p_addr = d2p_addr
-        decode_config.disagg_p2d_addr = p2d_addr
-        decode_config.disagg_weight_ipc_addr = weight_ipc_addr
-        decode_config.disagg_weight_ack_addr = weight_ack_addr
-        decode_config.disagg_kvcache_ipc_addr = kvcache_ipc_addr
-        decode_config.disagg_cu_shm_name = cu_shm_name
-        # Decode allocates no GPU memory — kvcache and weights are imported from
-        # prefill via CUDA IPC after prefill's READY signal.
-        decode_config.disagg_is_decode = True
+        # One rendezvous port shared by every decode rank — that is how the DP
+        # group finds itself. Distinct from prefill's (set above) so the two
+        # groups do not collide. Mirrors CoreManager.__init__, which likewise
+        # varies only data_parallel_rank across its per-rank configs.
+        decode_base_port = _get_open_port()
+
+        decode_configs = []
+        for k in range(n_decode):
+            dc = copy.deepcopy(config)
+            dc.disagg_d2p_addr = d2p_addr
+            dc.disagg_p2d_addrs = p2d_addrs
+            dc.disagg_weight_ipc_addrs = weight_ipc_addrs
+            dc.disagg_weight_ack_addrs = weight_ack_addrs
+            dc.disagg_kvcache_ipc_addrs = kvcache_ipc_addrs
+            dc.disagg_cu_shm_name = cu_shm_name
+            # Decode allocates no GPU memory — kvcache and weights are imported
+            # from prefill via CUDA IPC after prefill's READY signal.
+            dc.disagg_is_decode = True
+            dc.disagg_prefill_tp_size = prefill_tp
+            dc.disagg_decode_rank = k
+            dc.disagg_num_decode_ranks = n_decode
+            if asymmetric:
+                # One attention rank per GPU, N of them: the DP-attention shape.
+                # tp_size=1 with dp_size=N keeps `dp*tp > 1`, so expert
+                # parallelism stays ON (moe.py:151) and decode's ep_size matches
+                # prefill's — which is what lets the MoE weights, where nearly
+                # all the bytes live, stay IPC-aliased. Only the TP=1 attention
+                # weights differ in shape and are loaded locally.
+                dc.tensor_parallel_size = 1
+                dc.parallel_config.data_parallel_size = n_decode
+                dc.parallel_config.data_parallel_rank = k
+                # ModelRunner derives its GPU as
+                #   (data_parallel_rank_local * pp + pp_rank) * (tp * pcp) + rank
+                # (model_runner.py:970-983). At tp=1 the ONLY term that varies is
+                # data_parallel_rank_local, so without this every decode process
+                # computes device 0 and they all pile onto GPU 0 — and each then
+                # tries to open an IPC handle from a prefill rank on a different
+                # physical GPU. Setting it puts decode rank k on cuda:k, which is
+                # where prefill TP rank k already lives, so the pairing holds.
+                # launch_engine_core does the same for the non-disagg DP path.
+                dc.parallel_config.data_parallel_rank_local = k
+                dc.enable_dp_attention = True
+                dc.parallel_config.data_parallel_base_port = decode_base_port
+            decode_configs.append(dc)
 
         if config.torch_profiler_dir:
             prefill_config.torch_profiler_dir = os.path.join(
                 config.torch_profiler_dir, "prefill"
             )
-            decode_config.torch_profiler_dir = os.path.join(
-                config.torch_profiler_dir, "decode"
-            )
             os.makedirs(prefill_config.torch_profiler_dir, exist_ok=True)
-            os.makedirs(decode_config.torch_profiler_dir, exist_ok=True)
+            for k, dc in enumerate(decode_configs):
+                dc.torch_profiler_dir = os.path.join(
+                    config.torch_profiler_dir,
+                    f"decode{k}" if n_decode > 1 else "decode",
+                )
+                os.makedirs(dc.torch_profiler_dir, exist_ok=True)
 
         # Addresses for the standard CoreManager input/output sockets.
         prefill_input_addr = get_open_zmq_ipc_path()
         prefill_output_addr = get_open_zmq_ipc_path()
-        decode_input_addr = get_open_zmq_ipc_path()
-        decode_output_addr = get_open_zmq_ipc_path()
+        decode_input_addrs = [get_open_zmq_ipc_path() for _ in range(n_decode)]
+        decode_output_addrs = [get_open_zmq_ipc_path() for _ in range(n_decode)]
 
         from atom.model_engine.engine_core import DecodeEngineCore, PrefillEngineCore
 
@@ -984,24 +1059,33 @@ class DisaggCoreManager(CoreManager):
                 "output_address": prefill_output_addr,
             },
         )
-        decode_proc = multiprocessing.Process(
-            target=DecodeEngineCore.run_engine,
-            name="DecodeEngineCore",
-            kwargs={
-                "config": decode_config,
-                "input_address": decode_input_addr,
-                "output_address": decode_output_addr,
-            },
-        )
+        decode_procs = [
+            multiprocessing.Process(
+                target=DecodeEngineCore.run_engine,
+                name=f"DecodeEngineCore{k}" if n_decode > 1 else "DecodeEngineCore",
+                kwargs={
+                    "config": decode_configs[k],
+                    "input_address": decode_input_addrs[k],
+                    "output_address": decode_output_addrs[k],
+                },
+            )
+            for k in range(n_decode)
+        ]
+
+        # Process-index layout, used by every socket list below: index 0 is
+        # prefill, indices 1..n_decode are decode ranks 0..n_decode-1.
+        self._n_decode = n_decode
+        self._decode_idx0 = 1
 
         # Set up the inherited state without running CoreManager.__init__,
         # which would spawn its own engines the base way. This manager fans out
-        # through its own add_request() and never charges DP load, but the
-        # inherited output thread still releases it on every finished sequence.
+        # through its own add_request(), but the inherited output thread still
+        # releases DP load on every finished sequence, and with N decode ranks
+        # the inherited _select_dp_rank_locked is what picks a request's target.
         self._init_shared_state(
             config,
             label="DisaggCoreManager",
-            local_engine_count=2,  # prefill + decode
+            local_engine_count=1 + n_decode,
         )
 
         import weakref
@@ -1019,20 +1103,24 @@ class DisaggCoreManager(CoreManager):
             logger.info(f"{self.label}: {name} process started and connected")
 
         try:
-            # Start both processes simultaneously.  Prefill binds the bootstrap
-            # PUSH socket and blocks on send() until decode connects and calls
-            # recv() — they rendezvous naturally without any sequential ordering.
+            # Start every process before waiting on any READY. Prefill binds the
+            # bootstrap PUSH sockets and blocks on send() until each decode rank
+            # connects and calls recv() — they rendezvous naturally, but only if
+            # all of them are alive, so no READY may be awaited until then.
             _connect_proc(
                 prefill_proc, prefill_input_addr, prefill_output_addr, "prefill"
             )
-            _connect_proc(decode_proc, decode_input_addr, decode_output_addr, "decode")
-            self._wait_for_single_ready(idx=0)
-            self._wait_for_single_ready(idx=1)
-            logger.info(f"{self.label}: both EngineCores ready")
+            for k, proc in enumerate(decode_procs):
+                _connect_proc(
+                    proc, decode_input_addrs[k], decode_output_addrs[k], f"decode{k}"
+                )
+            for idx in range(1 + n_decode):
+                self._wait_for_single_ready(idx=idx)
+            logger.info(f"{self.label}: all {1 + n_decode} EngineCores ready")
 
-            # Start output thread for decode only (index 1).
-            # Prefill has a separate output thread just for READY/error monitoring.
-            for idx, name in [(0, "prefill"), (1, "decode")]:
+            # Prefill's output thread only monitors READY/errors; the decode
+            # ranks are the ones that produce finished sequences.
+            for idx in range(1 + n_decode):
                 t = self._create_output_thread(
                     idx, self.output_sockets[idx], self.shutdown_paths[idx]
                 )
@@ -1065,7 +1153,14 @@ class DisaggCoreManager(CoreManager):
                 )
 
     def add_request(self, seqs: list[Sequence]):
-        """Fan-out: send every new sequence to BOTH prefill and decode."""
+        """Fan-out: every sequence goes to prefill AND to one decode rank.
+
+        Prefill sees all of them because it computes every prefill forward
+        cooperatively across its TP ranks. A sequence's KV, though, lives on
+        exactly one decode rank — that rank allocates the blocks and runs the
+        decode steps — so it must be sent to that rank alone. Sending it to
+        several would have each of them allocate blocks for the same sequence.
+        """
         logger.debug(f"{self.label}: fan-out {len(seqs)} seqs to prefill and decode")
         # Register stream callbacks before sending (decode will produce output).
         for seq in seqs:
@@ -1073,12 +1168,29 @@ class DisaggCoreManager(CoreManager):
                 self._seq_id_to_callback[seq.id] = seq.stream_callback
                 seq.stream_callback = None
 
-        # Send decode payload as-is.
-        decode_payload = pickle.dumps((EngineCoreRequestType.ADD, seqs))
-        self.input_sockets[1].send_multipart(
-            [self.engine_core_identities[1], decode_payload],
-            copy=False,
-        )
+        # Group by target decode rank so each rank gets one message. With a
+        # single decode rank this reduces to today's behaviour.
+        by_idx: dict[int, list[Sequence]] = {}
+        for seq in seqs:
+            if self._n_decode == 1:
+                idx = self._decode_idx0
+            else:
+                # Select and charge atomically so a burst spreads instead of all
+                # landing on the current minimum. The inherited output thread
+                # calls _release_seq_load() when the sequence finishes.
+                with self._lb_lock:
+                    idx = self._select_dp_rank_locked(
+                        lo=self._decode_idx0, hi=self.local_engine_count
+                    )
+                    self._charge_seq_load_locked(seq, idx)
+            by_idx.setdefault(idx, []).append(seq)
+
+        for idx, rank_seqs in by_idx.items():
+            payload = pickle.dumps((EngineCoreRequestType.ADD, rank_seqs))
+            self.input_sockets[idx].send_multipart(
+                [self.engine_core_identities[idx], payload],
+                copy=False,
+            )
 
         # For prefill: limit each sequence to 1 output token.  Prefill discards
         # all sampled tokens (postprocess is a no-op), but setting max_tokens=1

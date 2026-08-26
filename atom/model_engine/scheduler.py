@@ -383,6 +383,14 @@ class ScheduledBatch:
         self.swa_block_tables = [
             seq.swa_block_table for seq in seqs.values() if seq.block_table
         ]
+        # Asymmetric rapidserve: per-row owning decode rank, positionally aligned
+        # with block_tables. A prefill TP rank commits only the rows it owns and
+        # masks the rest — see CommonAttentionBuilder.prepare_block_tables.
+        self.target_ranks = [
+            getattr(seq, "disagg_target_rank", 0)
+            for seq in seqs.values()
+            if seq.block_table
+        ]
         self.last_block_num_tokens = [
             _seq.last_block_num_tokens for _seq in seqs.values()
         ]

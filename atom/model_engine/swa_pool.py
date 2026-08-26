@@ -39,6 +39,7 @@ class SlidingWindowPool:
         full_retain: bool = False,
         retention_interval: int = 0,
         checkpoint_frac: float = 0.5,
+        reserve_dump_block: bool = False,
     ):
         self.enabled: bool = num_blocks > 0
         self.window: int = window
@@ -82,8 +83,11 @@ class SlidingWindowPool:
         )
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
         self.hash_to_block_id: dict[int, int] = dict()
-        self.free_block_ids: deque[int] = deque(range(num_blocks))
-        self.free_block_ids_set: set[int] = set(range(num_blocks))
+        # Asymmetric rapidserve keeps SWA block 0 permanently unallocated as the
+        # write sink for masked prefill TP ranks — see block_manager.DUMP_INDEX.
+        first_free = 1 if (reserve_dump_block and num_blocks > 0) else 0
+        self.free_block_ids: deque[int] = deque(range(first_free, num_blocks))
+        self.free_block_ids_set: set[int] = set(range(first_free, num_blocks))
         self.used_block_ids: set[int] = set()
 
     # ----------------------------- primitives ------------------------------ #

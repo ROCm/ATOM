@@ -1368,16 +1368,27 @@ class Config:
 
     # Intra-GPU prefill/decode disaggregation
     enable_rapidserve: bool = False
-    # ZMQ IPC address: decode PUSH → prefill PULL (BlockAssignment messages)
+    # ZMQ IPC address: decode PUSH → prefill PULL (BlockAssignment messages).
+    # Stays a single address with N decode ranks: many PUSHers to one PULLer is
+    # native ZMQ, and prefill does not care which rank sent an assignment.
     disagg_d2p_addr: str = ""
+    # The reverse direction is per-rank — prefill must deliver a PrefillDone to
+    # the ONE decode rank that owns the sequence — as is each bootstrap channel,
+    # since decode rank k pairs with prefill rank k on GPU k. Index = decode rank.
     # ZMQ IPC address: prefill PUSH → decode PULL (PrefillDone messages)
-    disagg_p2d_addr: str = ""
+    disagg_p2d_addrs: list[str] = field(default_factory=list)
     # Bootstrap round 1: prefill PUSH → decode PULL (weight IPC handles)
-    disagg_weight_ipc_addr: str = ""
+    disagg_weight_ipc_addrs: list[str] = field(default_factory=list)
     # Bootstrap round 1 ACK: decode PUSH → prefill PULL (signals weights freed)
-    disagg_weight_ack_addr: str = ""
+    disagg_weight_ack_addrs: list[str] = field(default_factory=list)
     # Bootstrap round 2: prefill PUSH → decode PULL (kvcache_args + num_blocks)
-    disagg_kvcache_ipc_addr: str = ""
+    disagg_kvcache_ipc_addrs: list[str] = field(default_factory=list)
+    # Which decode rank this process is (0-based), and how many there are.
+    # Under DP decode each rank owns its own scheduler, BlockManager and KV pool,
+    # and pairs with the prefill TP rank on the same GPU — so it must read
+    # `paths[disagg_decode_rank]` from the IPC handle rendezvous, not paths[0].
+    disagg_decode_rank: int = 0
+    disagg_num_decode_ranks: int = 1
     # True for the decode process in disagg mode: skip GPU weight/kvcache allocation.
     disagg_is_decode: bool = False
     # Name of the shared-memory region used for dynamic CU partitioning.
@@ -1390,6 +1401,14 @@ class Config:
     # coordination between prefill and decode. When False (default),
     # use plain separate streams with no CU masking.
     disagg_constrained: bool = False
+    # Asymmetric rapidserve: prefill runs at this TP size while decode runs at
+    # tensor_parallel_size=1 (one attention rank per GPU), so a single request's
+    # prefill uses every GPU cooperatively (TTFT) while decode stays per-GPU.
+    # 0 = symmetric (both processes share tensor_parallel_size), the default.
+    # Set by DisaggCoreManager on BOTH configs: prefill reads it to know it owns
+    # the wide topology, decode reads it to know how many prefill TP shards a
+    # weight was split across when reconstructing full attention matrices.
+    disagg_prefill_tp_size: int = 0
 
     def _set_cudagraph_sizes(self):
         if self.compilation_config.cudagraph_capture_sizes:

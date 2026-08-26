@@ -93,6 +93,7 @@ def load_weights_into_model(
     prefix: str = "",
     weights_mapper: WeightsMapper | None = None,
     load_fused_expert_weights_fn=None,
+    only_params: set[str] | None = None,
     *,
     default_weight_loader: Callable,
     fuse_shared_expert: Callable[[str, str], bool],
@@ -153,6 +154,10 @@ def load_weights_into_model(
             model, "disable_fused_shared_loading", False
         ),
     )
+    # NOTE: left unfiltered even under a partial load. `named_parameters()`
+    # dedups a Parameter registered under several names, so filtering here would
+    # also drop the duplicate registrations a full load needs. The restriction is
+    # applied explicitly by the dispatcher via `only_params` instead.
     params_dict = dict(model.named_parameters())
     # Pre-index expert_mapping by weight_name_part for O(1) lookup.
     # Original code does O(N) scan of expert_mapping (768 entries) per tensor,
@@ -210,6 +215,7 @@ def load_weights_into_model(
         packed_modules_mapping=packed_modules_mapping,
         expert_index=expert_index,
         expert_weight_prefixes=expert_weight_prefixes,
+        only_params=only_params,
         has_expert_mapping=has_expert_mapping,
         detect_fused_expert_fn=getattr(model, "detect_fused_expert_format", None),
         get_fused_expert_mapping_fn=getattr(model, "get_fused_expert_mapping", None),

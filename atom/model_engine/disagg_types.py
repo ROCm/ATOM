@@ -37,6 +37,12 @@ class BlockAssignment:
     block_table: list  # list[int] — physical block IDs owned by decode
     num_cached_tokens: int  # prefix-cache hits; prefill skips these blocks
     context_len: int  # total token count (prompt length)
+    # Which decode rank owns this sequence's KV. Under DP decode each rank has
+    # its own BlockManager and KV pool, so the block IDs above are meaningful
+    # only on THIS rank — prefill must route the matching PrefillDone back to it
+    # and must write the KV from the prefill TP rank sharing its GPU. Always 0
+    # for symmetric rapidserve (single decode rank).
+    target_rank: int = 0
     # Paged-SWA (DeepSeek-V4) parallel block table, positionally aligned with
     # block_table. The PREFILL forward is what writes the sliding-window KV, but
     # only decode owns the SlidingWindowPool — so decode materializes the

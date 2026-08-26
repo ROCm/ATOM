@@ -1708,6 +1708,18 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         )
         if len(state_slot_np) < scheduled_bs:
             state_slot_np = np.zeros(scheduled_bs, dtype=np.int32)
+        if self.disagg_kv_write_masked:
+            # Third pool needing a sink on non-owned rows (block_tables and
+            # swa_block_tables are handled in prepare_block_tables): the
+            # compressor's per-request kv_state / score_state tails.
+            from atom.model_engine.block_manager import DUMP_INDEX
+
+            owned = self.disagg_owned_rows(batch)
+            state_slot_np = state_slot_np.copy()
+            if owned is None:
+                state_slot_np[:] = DUMP_INDEX
+            else:
+                state_slot_np[~owned[:scheduled_bs]] = DUMP_INDEX
         ss_buf = var["v4_meta_state_slot_groups"]
         ss_buf.np[:scheduled_bs] = state_slot_np
 

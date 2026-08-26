@@ -49,11 +49,28 @@ def _make_all_cleared() -> AllBlocksCleared:
     return AllBlocksCleared()
 
 
+# Physical index reserved as the KV write sink under asymmetric rapidserve.
+# MLA's KV latent is TP-replicated, so after a wide prefill EVERY rank holds an
+# identical copy — but only the rank co-located with a request's target GPU may
+# write it. The other ranks point their block table / SWA block table /
+# per-request cache slot at this index, so their redundant writes land in
+# scratch instead of corrupting the live pool. Masking indices (not control
+# flow) keeps the TP ranks in lockstep on their shared communicator.
+#
+# Reserved ONLY when asymmetric rapidserve is active; every other configuration
+# keeps its full block budget.
+DUMP_INDEX = 0
+
+
 class BlockManager:
     def __init__(self, config: Config):
         block_size = config.kv_cache_block_size
         num_blocks = config.num_kvcache_blocks
         assert num_blocks > 0
+        # See DUMP_INDEX. Index 0 stays permanently unallocated in all three
+        # pools so masked prefill ranks always have a safe sink.
+        reserve_dump = getattr(config, "disagg_prefill_tp_size", 0) > 1
+        first_free = DUMP_INDEX + 1 if reserve_dump else 0
         self.block_size = block_size
         self.dcp_world_size = config.decode_context_parallel_size
         # dcp_rank is always 0 here: BlockManager runs only on the scheduler
@@ -66,8 +83,8 @@ class BlockManager:
         self.hash_block_size = self.block_size * self.dcp_world_size
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
         self.hash_to_block_id: dict[int, int] = {}
-        self.free_block_ids: deque[int] = deque(range(num_blocks))
-        self.free_block_ids_set: set[int] = set(range(num_blocks))
+        self.free_block_ids: deque[int] = deque(range(first_free, num_blocks))
+        self.free_block_ids_set: set[int] = set(range(first_free, num_blocks))
         self.used_block_ids: set[int] = set()
         self.enable_prefix_caching = config.enable_prefix_caching
 
@@ -85,7 +102,7 @@ class BlockManager:
         # (1 for stateless / + num_spec for spec-decoding-aware variants).
         num_per_req_cache_groups: int = getattr(config, "num_per_req_cache_groups", 0)
         self.free_per_req_cache_groups: list[int] = list(
-            range(num_per_req_cache_groups)
+            range(min(first_free, num_per_req_cache_groups), num_per_req_cache_groups)
         )
 
         # Sliding-window KV pool (DeepSeek-V4). A separate content-addressed pool
@@ -105,6 +122,7 @@ class BlockManager:
             full_retain=envs.ATOM_SWA_FULL_RETAIN,
             retention_interval=envs.ATOM_SWA_RETENTION_INTERVAL,
             checkpoint_frac=envs.ATOM_SWA_CHECKPOINT_FRAC,
+            reserve_dump_block=reserve_dump,
         )
 
     @property
