@@ -1773,3 +1773,59 @@ def test_paged_post_refuses_a_missing_q():
             )
     finally:
         v4.get_forward_context = saved
+
+
+def test_qk_norm_rope_shapes_match_what_the_paged_kernel_asserts():
+    # `_qk_norm_rope_out` feeds both the op's fake impl and the dummy_run
+    # stand-in, so comparing those two to each other proves nothing -- they were
+    # BOTH 448 wide while the real kernel produced 512, and it surfaced as
+    # `assert_size_stride` inside a compiled graph on an fp8-KV run (the bf16
+    # runs never touched that branch).
+    #
+    # So check against the CONSUMER's contract instead: the asm path of
+    # `sparse_attn_v4_paged_decode` asserts its Q on these exact constants. The
+    # 2buff packed width is NOT `head_dim - rope_head_dim` -- that is
+    # `V4_DIM_NOPE`; the packed row adds the inline e8m0 scale and padding.
+    import types
+
+    import pytest
+
+    try:
+        import atom.models.deepseek_v4 as v4
+        from atom.model_ops.v4_kernels.v4_quant import (
+            V4_DIM_NOPE,
+            V4_DIM_QK_PACKED,
+            V4_DIM_ROPE,
+        )
+    except ImportError as e:
+        if "aiter" not in str(e) and "forward_context" not in str(e):
+            raise
+        pytest.skip(f"deepseek_v4 not importable here: {e}")
+
+    assert V4_DIM_QK_PACKED != V4_DIM_NOPE, (
+        "the trap this pins is gone -- packed and nope now coincide, so "
+        "deriving one from head_dim would no longer be wrong"
+    )
+
+    T, H, D, RD = 4, 2, 512, V4_DIM_ROPE
+    q = torch.zeros(T, H * D)
+
+    def layer(kv_fp8):
+        return types.SimpleNamespace(
+            n_local_heads=H, head_dim=D, rope_head_dim=RD, kv_fp8=kv_fp8
+        )
+
+    fp8 = v4._qk_norm_rope_out(layer(True), q, T, zeros=True)
+    assert fp8.q_packed.shape == (T, H, V4_DIM_QK_PACKED)
+    assert fp8.q_rope.shape == (T, H, V4_DIM_ROPE)
+    assert fp8.k_packed.shape == (T, 1, V4_DIM_QK_PACKED)
+    assert fp8.k_rope.shape == (T, 1, V4_DIM_ROPE)
+    assert fp8.q_sa is None and fp8.kv is None
+
+    bf16 = v4._qk_norm_rope_out(layer(False), q, T, zeros=True)
+    assert bf16.q_sa.shape == (T, H, D) and bf16.kv.shape == (T, D)
+    assert bf16.q_packed is None and bf16.q_rope is None
+
+    # And the op's return list has to carry the active layout's four / two.
+    assert len(v4._qk_norm_rope_list(fp8, True)) == 4
+    assert len(v4._qk_norm_rope_list(bf16, False)) == 2

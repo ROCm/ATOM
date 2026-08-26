@@ -353,15 +353,23 @@ def _qk_norm_rope_out(layer, q: torch.Tensor, num_tokens: int, *, zeros: bool):
     WHICH fields are populated is the kv-cache layout, and `kv_fp8` is frozen at
     `__init__`, so this is a fixed shape per layer.
     """
+    from atom.model_ops.v4_kernels.v4_quant import V4_DIM_QK_PACKED, V4_DIM_ROPE
+
     alloc = q.new_zeros if zeros else q.new_empty
-    h, d, rd = layer.n_local_heads, layer.head_dim, layer.rope_head_dim
+    h, d = layer.n_local_heads, layer.head_dim
     if layer.kv_fp8:
-        nope = d - rd  # 2buff: NoPE fp8 [.,512] + RoPE bf16 [.,64]
+        # The 2buff packed width is NOT `head_dim - rope_head_dim`: that is
+        # `V4_DIM_NOPE` (448), and the packed row is the NoPE fp8 plus its inline
+        # e8m0 scale plus padding, `V4_DIM_QK_PACKED` (512). Deriving it instead
+        # of naming it produced a fake 448 wide against a body 512 wide, which
+        # surfaced as `assert_size_stride` inside the compiled graph on an
+        # fp8-KV run. These are the same constants `sparse_attn_v4_paged_decode`
+        # asserts its Q against, so take them from there.
         return QKNormRopeOut(
-            q_packed=alloc((num_tokens, h, nope), dtype=dtypes.fp8),
-            q_rope=alloc((num_tokens, h, rd)),
-            k_packed=alloc((num_tokens, 1, nope), dtype=dtypes.fp8),
-            k_rope=alloc((num_tokens, 1, rd)),
+            q_packed=alloc((num_tokens, h, V4_DIM_QK_PACKED), dtype=dtypes.fp8),
+            q_rope=alloc((num_tokens, h, V4_DIM_ROPE)),
+            k_packed=alloc((num_tokens, 1, V4_DIM_QK_PACKED), dtype=dtypes.fp8),
+            k_rope=alloc((num_tokens, 1, V4_DIM_ROPE)),
         )
     return QKNormRopeOut(q_sa=alloc((num_tokens, h, d)), kv=alloc((num_tokens, d)))
 
