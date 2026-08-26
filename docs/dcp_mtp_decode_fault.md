@@ -10,6 +10,8 @@ replicated index cache forbade speculative decode outright. This lifts that.
 
 Result: **GSM8K 1319 = 0.9303 +/- 0.007**, zero GPU faults, against 0.9295
 (replicate=0, no MTP) and 0.9356 (replicate=1, no MTP) on the same harness.
+Those three were all taken before the index-page relayout fix; see the
+re-measured section below for the current numbers and the acceptance rate.
 
 ## Root cause: MTP silently changed which attention kernel runs
 
@@ -90,11 +92,66 @@ Buffer capacity was never it either: `_sparse_kv_indices_gpu` is
 `max_num_batched_tokens * index_topk` = 16384 x 2048 int32 = 134 MB, against at
 most `max_num_seqs * 4` = 2048 rows.
 
+## Re-measured after the index-page relayout fix (2026-08-26)
+
+The 0.9303 above was taken while the PD producer still moved DSA index pages
+with the MLA latent's token addressing (`docs/dcp_index_cache_page_relayout.md`).
+With that fixed, and the eval switched to the form `recipes/GLM-5.md` publishes
+its reference against (`local-chat-completions`, `--apply_chat_template`,
+`max_tokens=16384`), GSM8K 1319 5-shot on the same box:
+
+| config | flexible | strict | eval wall time |
+|---|---|---|---|
+| DCP PD, no MTP | 0.9583 +/- 0.0055 | 0.9591 +/- 0.0055 | 12:41 |
+| DCP PD, MTP=3 | 0.9613 +/- 0.0053 | 0.9629 +/- 0.0052 | 08:07 |
+| TP4 single node, no MTP | 0.9644 +/- 0.0051 | 0.9651 +/- 0.0051 | 10:28 |
+
+MTP costs nothing: +0.30pp flexible, +0.38pp strict against no-MTP, both inside
+one standard error of the difference. It finishes the same 1319 requests 1.56x
+faster.
+
+## Acceptance rate, MTP=3
+
+`SPEC_ACCEPT_RATE=off`, so every draft token is the MTP head's and every
+acceptance is the target model agreeing. Read it from
+`GET :8020/debug/mtp_stats`, or from the `[MTP Stats]` lines the decode node
+logs every 1000 steps.
+
+Over the whole GSM8K run: **0.6030 acceptance, 2.81 tokens per target forward**,
+with the accepted-length distribution 12.0% / 26.6% / 29.8% / 31.5% for 0/1/2/3.
+
+That single number is an average over two regimes. Per-1000-step intervals:
+
+| phase | mean acceptance |
+|---|---|
+| first 90% of intervals (batch full) | 62.5% (range 55.4-68.9) |
+| last 10% (a handful of stragglers) | 40.6% (range 16.4-56.6) |
+| final 10 intervals | 24.8% |
+
+Acceptance is content-dependent, not context- or batch-dependent. Single-request
+probes, each measured as a delta across one call:
+
+| probe | prompt tokens | output tokens | acceptance | tokens/forward |
+|---|---|---|---|---|
+| short question | 222 | 301 | 0.657 | 2.97 |
+| doc summarization | 11283 | 300 | 0.616 | 2.85 |
+| doc summarization | 39964 | 302 | 0.622 | 2.87 |
+| open-ended 4000-token essay | 50 | 4001 | 0.499 | 2.50 |
+
+40k prompt tokens is well past `dcp_size * index_topk` = 8192, where the DSA
+top-k stops short-circuiting and the sparse path actually selects, and batch=1 is
+as small as the verify shape gets. Neither moves the rate. What moves it is what
+is being generated: short arithmetic reasoning drafts at ~0.65, free-running
+prose at ~0.50, and the GSM8K stragglers -- the samples that run to the 16384
+token cap -- at under 0.20. So the eval-wide 0.60 understates the rate that
+matters for a loaded server; 0.62-0.65 is the steady state.
+
 ## Not yet done
 
-- **Throughput unmeasured.** The whole point is tokens-per-step; accuracy was
-  only the gate. 431 tok/s (no MTP) vs the DPA baseline's 797 is the number to
-  move.
+- **Throughput unmeasured under the replay corpus.** The GSM8K wall times above
+  give 1.56x, but that harness is 1319 short requests, not the agentic traffic
+  the 431 tok/s (no MTP) and 797 tok/s (DPA baseline) numbers came from. Rerun
+  the replay with MTP on before quoting a throughput figure.
 - The `recipes/mesh/GLM-5.2.md` eval (`local-chat-completions`,
   `--apply_chat_template --fewshot_as_multiturn`, threshold >= 0.93) aborted with
   `ServerDisconnectedError` -- `max_gen_toks=16384` outruns the client/proxy idle
