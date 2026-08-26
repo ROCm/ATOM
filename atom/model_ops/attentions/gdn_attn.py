@@ -21,6 +21,11 @@ from .aiter_attention import (
     AiterBackend,
     kv_indices_generate_triton,
 )
+from .paged_state_copy import (
+    SegmentedCopyPlan,
+    launch_copy_descriptor,
+    plan_segmented_copy,
+)
 from .sub_pool_spec import SubPoolSpec, page_pool, state_pool
 
 
@@ -360,7 +365,7 @@ class GDNStateMixin:
         shape_k, shape_v = self._state_shape_for_runner()
         dt_k, dt_v = self._state_dtypes()
         n = self.model_runner.num_gdn_attn_state
-        return {
+        tensors = {
             "mamba_k_cache": torch.zeros(
                 (n, num_slots) + shape_k, dtype=dt_k, device="cuda"
             ),
@@ -368,6 +373,323 @@ class GDNStateMixin:
                 (n, num_slots) + shape_v, dtype=dt_v, device="cuda"
             ),
         }
+        self._assert_checkpoint_geometry_still_holds()
+        return tensors
+
+    def _assert_checkpoint_geometry_still_holds(self) -> None:
+        """The spec was built during sizing; check the pool agrees with it.
+
+        `checkpoint_image_bytes` is asked once before these tensors exist and
+        the answer travels to the scheduler as `PagedStateCheckpointSpec`. If
+        the shapes moved in between, the scheduler would reserve PAGE units for
+        one image while the worker scattered a different one — raw pointers, so
+        the first sign would be corrupt state rather than an error.
+
+        A no-op unless this run copies; a fork keeps no spec.
+        """
+        runtime = getattr(self.model_runner, "state_runtime", None)
+        spec = None if runtime is None else runtime.checkpoint_spec
+        if spec is None:
+            return
+        image = self.checkpoint_image_bytes()
+        if image != spec.image_bytes:
+            raise RuntimeError(
+                f"the state pool holds a {image} B checkpoint image but the "
+                f"scheduler reserved units for {spec.image_bytes} B"
+            )
+        if runtime.transfer.paged_layout_id != spec.layout_id:
+            raise RuntimeError(
+                f"state layout {runtime.transfer.paged_layout_id!r} does not "
+                f"match the spec's {spec.layout_id!r}"
+            )
+
+    # ------------------------ PAGE-copy checkpoints ------------------------ #
+    #
+    # A checkpoint image is a byte copy of one Active Slot into
+    # `ceil(image_bytes / page_unit_bytes)` ordinary KV blocks, run by
+    # `PagedStateCheckpointCoordinator`. Everything below is the source side of
+    # that copy: this class owns `mamba_{k,v}_cache`, so it can say where a
+    # slot's bytes are, but not where a PAGE unit is -- that belongs to
+    # whichever builder owns the paged pool (`_page_unit_regions`).
+    #
+    # Dormant under `StateTransfer.fork`: nothing produces a store op unless a
+    # subclass declares `copy()`. Only `_KimiMLAGDNCommon` does today.
+
+    def _checkpoint_layer_ranges(self) -> list[list[tuple[int, int]]]:
+        """Per plane, one `(offset, nbytes)` per layer for slot 0.
+
+        Both caches are `(num_layers, num_slots, *state)` and contiguous, so
+        layer L of slot S is the single range at `(L * num_slots + S) *
+        per_layer_bytes`. This returns the S=0 column; a real slot adds
+        `S * per_layer_bytes` to every offset, which `_checkpoint_slot_bases`
+        does in one vectorised step.
+
+        Plane order is conv (`mamba_k_cache`) then ssm (`mamba_v_cache`), all
+        layers of one before any of the other -- stated in the layout id as
+        `order=conv-all-layers,ssm-all-layers`, because shapes alone cannot say
+        it and a reader assembling the image interleaved would get every layer
+        but the first wrong.
+
+        The whole slot is carried: unlike V4's compressor ring, no part of a
+        KDA state is provably dead at a boundary.
+
+        Sole owner of the segment order. `_checkpoint_segment_sizes` and
+        `_checkpoint_slot_bases` both read it rather than each walking the
+        planes themselves, which is how a plan's segment index and an address
+        row stay talking about the same segment.
+        """
+        num_slots = self._checkpoint_num_slots()
+        return [
+            [(layer * num_slots * nbytes, nbytes) for layer in range(n_layers)]
+            for nbytes, n_layers in self._checkpoint_plane_shapes()
+        ]
+
+    def _checkpoint_plane_shapes(self) -> list[tuple[int, int]]:
+        """`(per_layer_bytes, num_layers)` per plane, conv first then ssm.
+
+        Pure geometry from the state shapes, so it answers before the tensors
+        exist -- which `checkpoint_image_bytes` needs, being called during
+        sizing.
+        """
+        shape_k, shape_v = self._state_shape_for_runner()
+        dt_k, dt_v = self._state_dtypes()
+        n = self.model_runner.num_gdn_attn_state
+        return [
+            (math.prod(shape_k) * dt_k.itemsize, n),
+            (math.prod(shape_v) * dt_v.itemsize, n),
+        ]
+
+    def _checkpoint_num_slots(self) -> int:
+        """The slot axis of the state tensors, or 1 before they exist.
+
+        Only the *offsets* scale with it; the image's size does not. So a
+        pre-allocation caller (sizing) gets a consistent answer from the same
+        code the post-allocation callers use.
+        """
+        cache = getattr(self.model_runner, "mamba_k_cache", None)
+        return 1 if cache is None else int(cache.shape[1])
+
+    def _checkpoint_segment_sizes(self) -> list[int]:
+        """The image as the copy planner reads it: one size per source segment.
+
+        The one place the per-plane ranges are flattened. Sizing wants their
+        total and the planner wants the list, and the two answering from
+        different comprehensions is how an image gets priced at one shape and
+        cut at another.
+        """
+        return [
+            nbytes for ranges in self._checkpoint_layer_ranges() for _, nbytes in ranges
+        ]
+
+    def checkpoint_image_bytes(self) -> int:
+        """Bytes one checkpoint image holds. Priced before the pool exists.
+
+        Independent of `num_slots`: a checkpoint is one slot, and the slot
+        count only moves where slots sit, not how big one is.
+        """
+        return sum(nbytes * n for nbytes, n in self._checkpoint_plane_shapes())
+
+    def _checkpoint_slot_bases(self) -> np.ndarray:
+        """`[slot, segment]` start address of every source segment of a copy.
+
+        Segments in the order `_checkpoint_layer_ranges` walks the planes,
+        which is the order `_checkpoint_copy_plan` builds the source stream
+        in -- so a plan's segment index addresses a row of this directly.
+
+        Built as one vectorised expression rather than V4's per-slot tensor
+        views: a K3 slot's offsets are affine in `(layer, slot)`, so `2 * S`
+        materialised views would buy addresses that are one multiplication
+        each.
+
+        Keyed on the addresses and the slot count it was built from rather
+        than cleared by a hook, so a pool that moves underneath invalidates
+        this by disagreeing with its own key.
+        """
+        runner = self.model_runner
+        k_cache, v_cache = runner.mamba_k_cache, runner.mamba_v_cache
+        num_slots = int(k_cache.shape[1])
+        key = (k_cache.data_ptr(), v_cache.data_ptr(), num_slots)
+        cached = getattr(self, "_checkpoint_slot_base_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+
+        slots = np.arange(num_slots, dtype=np.int64)[:, None]
+        columns = []
+        for cache, (nbytes, n_layers) in zip(
+            (k_cache, v_cache), self._checkpoint_plane_shapes(), strict=True
+        ):
+            if not cache.is_contiguous():
+                raise RuntimeError(
+                    "a PAGE-copy state plane must be contiguous; "
+                    f"{tuple(cache.shape)} stride {cache.stride()} is not"
+                )
+            layers = np.arange(n_layers, dtype=np.int64)[None, :]
+            columns.append(cache.data_ptr() + (layers * num_slots + slots) * nbytes)
+        bases = np.hstack(columns)
+        self._checkpoint_slot_base_cache = (key, bases)
+        return bases
+
+    def _page_unit_regions(self) -> tuple[np.ndarray, np.ndarray]:
+        """Base address and per-unit stride of every region a PAGE id owns.
+
+        The destination side of the copy, which lives in whatever paged pool
+        the concrete builder owns -- this class only knows about the state
+        planes. `_KimiMLAGDNCommon` answers it for K3's MLA pool.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} declares PAGE-copy checkpoints but does "
+            "not say where a PAGE unit is"
+        )
+
+    def _checkpoint_copy_plan(self) -> SegmentedCopyPlan:
+        """Where a slot's segments meet a whole image's PAGE regions.
+
+        Both streams are geometry. The state ranges come from the layout, and
+        every image is `units_per_checkpoint` units of identical region sizes --
+        `_validate_paged_state_op` refuses anything else. So the cut points are
+        the same for every store and every restore this worker will ever do,
+        and the walk that finds them runs once instead of once an op.
+        """
+        if getattr(self, "_checkpoint_plan_cache", None) is None:
+            spec = self.model_runner.state_runtime.checkpoint_spec
+            self._checkpoint_plan_cache = plan_segmented_copy(
+                self._checkpoint_segment_sizes(),
+                # Sizes from the same array `_page_unit_bases` takes addresses
+                # from, tiled the way it ravels. Spelling the destination
+                # stream out a second time here would let the two orders
+                # diverge, and a plan cut against one order and addressed
+                # through the other lands whole regions in the wrong unit.
+                self._page_unit_stream_sizes(spec.units_per_checkpoint),
+                spec.image_bytes,
+            )
+        return self._checkpoint_plan_cache
+
+    def _checkpoint_descriptor_buffer(self) -> CpuGpuBuffer:
+        """Pinned staging for a step's whole descriptor, sized for the worst step.
+
+        Pinned because the alternative synchronizes: a pageable H2D from
+        `build()` makes the host wait out the forward already enqueued. Reused
+        because allocating pinned memory is itself a synchronizing call.
+
+        A step can carry at most one store and one restore per sequence, so two
+        per sequence bounds it. The caller checks that bound rather than growing
+        on demand: a descriptor that did not fit would otherwise be silently
+        truncated into a copy of the wrong shape.
+        """
+        if getattr(self, "_checkpoint_descriptor", None) is None:
+            plan = self._checkpoint_copy_plan()
+            max_ops = 2 * int(self.model_runner.config.max_num_seqs)
+            self._checkpoint_descriptor = CpuGpuBuffer(
+                max_ops * plan.num_spans,
+                3,
+                dtype=torch.int64,
+                device=self.model_runner.mamba_k_cache.device,
+            )
+        return self._checkpoint_descriptor
+
+    def _validate_paged_state_op(self, op) -> None:
+        """Refuse an op this worker cannot honour, before it addresses memory.
+
+        `layout_id` is the cross-worker check: the scheduler priced the image
+        against one geometry and this worker reassembles it against its own, so
+        a mismatch would put every byte at the wrong offset rather than fail.
+
+        Unit ids are checked against the **logical** block count, which is what
+        `BlockPool` hands out and what `sub_pool_specs` priced. The tensor is
+        shaped in physical blocks and K3's `block_ratio` is 128, so a check
+        against the physical count would admit ids 128x out of range.
+        """
+        spec = self.model_runner.state_runtime.checkpoint_spec
+        if spec is None:
+            raise RuntimeError("a paged state copy arrived with no checkpoint spec")
+        if op.layout_id != spec.layout_id:
+            raise RuntimeError(
+                f"state checkpoint layout mismatch: op {op.layout_id!r} "
+                f"against this worker's {spec.layout_id!r}"
+            )
+        if op.total_bytes != spec.image_bytes:
+            raise RuntimeError(
+                f"a checkpoint image is {spec.image_bytes} B but the op names "
+                f"{op.total_bytes}"
+            )
+        if len(op.unit_ids) != spec.units_per_checkpoint:
+            raise RuntimeError(
+                f"a checkpoint takes {spec.units_per_checkpoint} PAGE units but "
+                f"the op names {len(op.unit_ids)}"
+            )
+        num_blocks = int(self.model_runner.config.num_kvcache_blocks)
+        if any(unit < 0 or unit >= num_blocks for unit in op.unit_ids):
+            raise RuntimeError("state checkpoint PAGE unit is out of range")
+
+    def execute_paged_state_copies(self, store_ops, restore_ops) -> None:
+        """Copy raw checkpoint bytes between slots and non-contiguous PAGEs.
+
+        Every op of either direction goes into one descriptor and one launch.
+        A store and a restore are the same intersection read opposite ways, so
+        they share the plan too -- and each direction is described in a single
+        vectorised pass, which is why they are batched apart rather than
+        interleaved.
+        """
+        if not store_ops and not restore_ops:
+            return
+        for op in (*store_ops, *restore_ops):
+            self._validate_paged_state_op(op)
+
+        plan = self._checkpoint_copy_plan()
+        slot_bases = self._checkpoint_slot_bases()
+        per_op = plan.num_spans
+        total = (len(store_ops) + len(restore_ops)) * per_op
+        staging = self._checkpoint_descriptor_buffer()
+        if total > staging.np.shape[0]:
+            raise RuntimeError(
+                f"a step asked to copy {total // per_op} checkpoints, more "
+                f"than the {staging.np.shape[0] // per_op} its descriptor was "
+                "sized for"
+            )
+        descriptor = staging.np[:total]
+        at = 0
+        for ops, storing in ((store_ops, True), (restore_ops, False)):
+            if not ops:
+                continue
+            end = at + len(ops) * per_op
+            slots = [op.src_slot if storing else op.dst_slot for op in ops]
+            plan.write_descriptor(
+                descriptor[at:end],
+                slot_bases[slots],
+                self._page_unit_bases([op.unit_ids for op in ops]),
+                forward=storing,
+            )
+            at = end
+        launch_copy_descriptor(staging.copy_to_gpu(total), plan)
+
+    def warmup_per_req_cache(self) -> None:
+        """Run one checkpoint copy now, so the first real one is only a copy.
+
+        `execute_paged_state_copies` is reachable only from `build()`, so
+        everything it builds lazily -- the copy plan, the slot base table, the
+        tiling's upload, the pinned descriptor, and the Triton JIT of
+        `_copy_tiles_kernel` -- otherwise lands inside the batch of whichever
+        request first crosses a rung.
+
+        Slot 0 into the pool's first units. Both are real addresses, which is
+        the point: a warmup on scratch would compile a kernel and fill nothing.
+        The bytes it writes are read by nobody -- a KV block is written before
+        it is read, and this runs before any block has been handed out.
+        """
+        runtime = getattr(self.model_runner, "state_runtime", None)
+        spec = None if runtime is None else runtime.checkpoint_spec
+        if spec is None:
+            return
+        plan = self._checkpoint_copy_plan()
+        if not plan.num_spans:
+            return
+        staging = self._checkpoint_descriptor_buffer()
+        plan.write_descriptor(
+            staging.np[: plan.num_spans],
+            self._checkpoint_slot_bases()[:1],
+            self._page_unit_bases([list(range(spec.units_per_checkpoint))]),
+        )
+        launch_copy_descriptor(staging.copy_to_gpu(plan.num_spans), plan)
 
     def relocate_state_slots(self, pairs: Sequence[tuple[int, int]]) -> None:
         """Relocate a live GDN state slot between Active Slot positions.
