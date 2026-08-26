@@ -163,6 +163,7 @@ class WeightUpdaterMixin:
                 if wlp is not None:
                     buf.weight_loader_process = wlp
                 else:
+
                     def _weight_loader_process(param_data, loaded_weight):
                         if param_data.dtype != loaded_weight.dtype:
                             loaded_weight = loaded_weight.to(param_data.dtype)
