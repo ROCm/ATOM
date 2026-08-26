@@ -127,8 +127,8 @@ class AtomPersistentDecoder:
 
     def __init__(self, runner) -> None:
         from aiter.MK1 import (
-            AtomCacheBinding,
             BackendLaunchError,
+            KVCacheBinding,
             MK1Config,
             PersistentDecoder as AiterPersistentDecoder,
             PrelaunchError,
@@ -189,8 +189,8 @@ class AtomPersistentDecoder:
         ):
             raise RuntimeError("ATOM cache layer has incompatible plane byte length")
 
-        self.native.bind_atom_cache(
-            AtomCacheBinding(
+        self.native.bind_cache(
+            KVCacheBinding(
                 key_planes=key_bytes,
                 value_planes=value_bytes,
                 block_counts=(int(runner.num_physical_kvcache_blocks),) * 36,

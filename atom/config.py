@@ -1687,8 +1687,6 @@ class Config:
                 raise ValueError(
                     "persistent_decoder_checkpoint is required when persistent decode is enabled"
                 )
-            if self.kv_cache_block_size != 32:
-                raise ValueError("persistent decode requires --block-size 32")
             if self.kv_cache_dtype != "bf16":
                 raise ValueError("persistent decode currently requires BF16 KV cache")
             if self.tensor_parallel_size != 1 or self.pipeline_parallel_size != 1:
