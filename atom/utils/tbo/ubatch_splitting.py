@@ -274,7 +274,7 @@ def split_mixed_token_midpoint(
     num_prefill_tokens: int,
     num_scheduled_tokens,
     num_ubatches: int = 2,
-) -> Optional[list[UBatchSlice]]:
+) -> list[UBatchSlice] | None:
     """Split a mixed ``[prefill | decode]`` batch at the token midpoint.
 
     Same cut as :func:`_split_prefill_token_midpoint` -- exact token fractions

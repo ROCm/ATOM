@@ -1161,6 +1161,8 @@ class TestLongPrefillTokenThreshold:
         # Step 2: partial-prefill resume, also capped at 8 (not 12 remaining).
         batch2, _ = sched.schedule()
         assert list(batch2.num_scheduled_tokens) == [8]
+
+
 # ── mixed prefill+decode (decode-first budget reservation) ──────────────────
 
 
@@ -1171,14 +1173,14 @@ class TestMixedDecodeFirst:
     mixed batch forms. Mirrors vLLM V1's running-before-waiting ordering."""
 
     def _mixed_sched(self, **kw):
-        cfg = dict(
-            enable_mixed_prefill_decode=True,
-            enable_chunked_prefill=True,
-            max_num_batched_tokens=8,
-            num_kvcache_blocks=100,
-            kv_cache_block_size=4,
-            max_num_seqs=8,
-        )
+        cfg = {
+            "enable_mixed_prefill_decode": True,
+            "enable_chunked_prefill": True,
+            "max_num_batched_tokens": 8,
+            "num_kvcache_blocks": 100,
+            "kv_cache_block_size": 4,
+            "max_num_seqs": 8,
+        }
         cfg.update(kw)
         return Scheduler(MockConfig(**cfg))
 
@@ -1798,6 +1800,8 @@ class TestComputeDetailedAggregates:
         assert batch.detailed_sqsq == 9  # 3^2
         assert batch.detailed_sqsk == 300  # 3 * 100
         assert batch.detailed_sk == 100
+
+
 # ── mixed prefill+decode batch (Phase 2) ───────────────────────────────────
 
 

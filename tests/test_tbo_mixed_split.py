@@ -24,6 +24,8 @@ Three properties, none of them obvious from either function alone:
 Everything here is pure arithmetic -- no GPU, no model.
 """
 
+import itertools
+
 import numpy as np
 import pytest
 
@@ -99,7 +101,7 @@ def test_slices_tile_the_batch(n_pref_seqs, pref_len, n_dec_seqs):
 
     assert slices[0].token_slice.start == 0
     assert slices[-1].token_slice.stop == total
-    for a, b in zip(slices, slices[1:]):
+    for a, b in itertools.pairwise(slices):
         assert a.token_slice.stop == b.token_slice.start
     for s in slices:
         assert s.token_slice.stop > s.token_slice.start, "empty ubatch"
