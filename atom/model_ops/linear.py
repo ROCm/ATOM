@@ -2,8 +2,9 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+from collections.abc import Callable
 from functools import partial as functools_partial
-from typing import Callable, Optional
+from typing import Optional
 
 import torch
 from aiter import (
