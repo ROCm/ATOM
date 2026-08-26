@@ -1755,7 +1755,7 @@ def test_paged_post_refuses_a_missing_q():
 
 
 def test_qk_norm_rope_shapes_match_what_the_paged_kernel_asserts():
-    # `_qkn_blank` feeds both the op's fake impl and the dummy_run
+    # `_qkn_placeholder` feeds both the op's fake impl and the dummy_run
     # stand-in, so comparing those two to each other proves nothing -- they were
     # BOTH 448 wide while the real kernel produced 512, and it surfaced as
     # `assert_size_stride` inside a compiled graph on an fp8-KV run (the bf16
@@ -1794,14 +1794,14 @@ def test_qk_norm_rope_shapes_match_what_the_paged_kernel_asserts():
             n_local_heads=H, head_dim=D, rope_head_dim=RD, kv_fp8=kv_fp8
         )
 
-    fp8 = v4._qkn_blank(layer(True), q, T, zeros=True)
+    fp8 = v4._qkn_placeholder(layer(True), q, T, zeros=True)
     assert fp8.q_packed.shape == (T, H, V4_DIM_QK_PACKED)
     assert fp8.q_rope.shape == (T, H, V4_DIM_ROPE)
     assert fp8.k_packed.shape == (T, 1, V4_DIM_QK_PACKED)
     assert fp8.k_rope.shape == (T, 1, V4_DIM_ROPE)
     assert fp8.q_sa is None and fp8.kv is None
 
-    bf16 = v4._qkn_blank(layer(False), q, T, zeros=True)
+    bf16 = v4._qkn_placeholder(layer(False), q, T, zeros=True)
     assert bf16.q_sa.shape == (T, H, D) and bf16.kv.shape == (T, D)
     assert bf16.q_packed is None and bf16.q_rope is None
 

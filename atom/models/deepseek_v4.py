@@ -313,16 +313,17 @@ direct_register_custom_op(
 )
 
 
-def _qkn_blank(layer, q: torch.Tensor, num_tokens: int, *, zeros: bool):
-    """A `QKNormRopeOut` of the right shapes with no content.
+def _qkn_placeholder(layer, q: torch.Tensor, num_tokens: int, *, zeros: bool):
+    """A stand-in `QKNormRopeOut`: right shapes, no content.
 
-    One source for the two places that need the shapes without the work: the
-    op's fake impl (tracing) and the dummy_run short-circuit (warmup, before the
-    KV planes are bound). `zeros` for the latter -- warmup's output is consumed
-    downstream, so it has to be finite rather than `empty`'s garbage.
+    One source for the two places that need the shapes without doing the work --
+    the op's fake impl (tracing) and the dummy_run short-circuit (warmup, before
+    the KV planes are bound). They MUST agree, or the compiled graph fails on
+    `assert_size_stride`. `zeros` for warmup, whose output is consumed
+    downstream and so has to be finite rather than `empty`'s garbage.
 
-    WHICH fields are populated is the kv-cache layout, and `kv_fp8` is frozen at
-    `__init__`, so this is a fixed shape per layer.
+    Which fields are populated is the kv-cache layout; `kv_fp8` is frozen at
+    `__init__`, so the shape is fixed per layer.
     """
     from atom.model_ops.v4_kernels.v4_quant import V4_DIM_QK_PACKED, V4_DIM_ROPE
 
@@ -363,7 +364,7 @@ def _v4_qk_norm_rope_fake(
 ) -> list[torch.Tensor]:
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
-    return _qkn_to_list(_qkn_blank(self, q, q.shape[0], zeros=False), self.kv_fp8)
+    return _qkn_to_list(_qkn_placeholder(self, q, q.shape[0], zeros=False), self.kv_fp8)
 
 
 def v4_qk_norm_rope(
@@ -3201,7 +3202,7 @@ class DeepseekV4Attention(nn.Module):
         # so the SWA plane this writes into is not bound yet. Called from
         # `_attn_pre` this sits UPSTREAM of that guard and needs its own.
         if fc.context.is_dummy_run or os.environ.get("ATOM_V4_BYPASS_ATTN") == "1":
-            return _qkn_blank(self, q, q.shape[0], zeros=True)
+            return _qkn_placeholder(self, q, q.shape[0], zeros=True)
         attn_md = cast("AttentionMetaData_DSV4", fc.attn_metadata)
         rd = self.rope_head_dim
         ratio = self.compress_ratio
