@@ -157,20 +157,34 @@ def cdiv(a, b):
     return (a + b - 1) // b
 
 
-def _uses_standalone_lmcache_offload(config) -> bool:
-    """Whether the configured transfer path is the raw-byte LMCache connector."""
+# Connectors that carry the widened replicated index page correctly. LMCache
+# derives every block's stride from the tensor itself, so it is layout-agnostic.
+# Mooncake plans the index regions with plan_replicated once the consumer says
+# it replicates, which is why this layout may run behind a PD decode node.
+_REPLICATION_SAFE_CONNECTORS = frozenset(
+    {
+        "lmcache_offload",
+        "lmcacheoffloadconnector",
+        "lmcacheconnectorv1",
+        "mooncake",
+    }
+)
+
+
+def _uses_replication_safe_kv_transfer(config) -> bool:
+    """Whether the configured transfer path handles a replicated index page.
+
+    Only a single top-level connector qualifies. The ``multi`` fan-out is the
+    prefill node's shape, and a prefill node runs with dcp_world_size == 1,
+    where this layout is rejected anyway.
+    """
     transfer_config = getattr(config, "kv_transfer_config", None)
     if not isinstance(transfer_config, dict):
         return False
     connector = transfer_config.get("kv_connector")
     if not isinstance(connector, str):
         return False
-    normalized = connector.strip().lower()
-    return normalized in {
-        "lmcache_offload",
-        "lmcacheoffloadconnector",
-        "lmcacheconnectorv1",
-    }
+    return connector.strip().lower() in _REPLICATION_SAFE_CONNECTORS
 
 
 def _replicated_index_cache_unsupported_reasons(
@@ -196,9 +210,11 @@ def _replicated_index_cache_unsupported_reasons(
     if getattr(config, "pipeline_parallel_size", 1) > 1:
         unsupported.append("pipeline parallelism is not supported")
     if getattr(config, "kv_transfer_config", None) and not (
-        _uses_standalone_lmcache_offload(config)
+        _uses_replication_safe_kv_transfer(config)
     ):
-        unsupported.append("PD and non-LMCache KV transfer are not supported")
+        unsupported.append(
+            "KV transfer connector does not support the replicated index page"
+        )
     if getattr(config, "enable_rapidserve", False):
         unsupported.append("RapidServe disaggregation is not supported")
     return unsupported
@@ -1183,6 +1199,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
     def get_kv_transfer_tensors(self):
         from atom.kv_transfer.disaggregation.types import (
+            INDEX_CACHE_ROLE,
+            MLA_KV_ROLE,
             KVTransferRegion,
             KVTransferTensors,
         )
@@ -1201,6 +1219,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     base_addr=t.data_ptr(),
                     total_bytes=t.numel() * t.element_size(),
                     unit_bytes=bpb,
+                    semantic_role=MLA_KV_ROLE,
                 )
             )
 
@@ -1213,6 +1232,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                         base_addr=t.data_ptr(),
                         total_bytes=t.numel() * t.element_size(),
                         unit_bytes=bpb,
+                        semantic_role=INDEX_CACHE_ROLE,
                     )
                 )
 

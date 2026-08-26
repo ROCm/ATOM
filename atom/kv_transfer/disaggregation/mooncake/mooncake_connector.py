@@ -22,11 +22,16 @@ from typing import Any
 
 import msgpack
 import msgspec
+import numpy as np
 import torch
 import zmq
 from aiter.dist.parallel_state import get_dp_group, get_tp_group
 
 from atom.config import Config
+from atom.distributed.dcp_utils import (
+    dcp_replicated_index_cache_enabled,
+    get_dcp_group,
+)
 from atom.kv_transfer.disaggregation.base import (
     KVConnectorBase,
     KVConnectorSchedulerBase,
@@ -38,6 +43,7 @@ from atom.kv_transfer.disaggregation.port_offset import (
     side_channel_port_offset as _port_offset,
 )
 from atom.kv_transfer.disaggregation.types import (
+    INDEX_CACHE_ROLE,
     ConnectorMetadata,
     KVTransferRegion,
     ReqId,
@@ -141,6 +147,125 @@ def _configure_mooncake_transport(protocol: str) -> None:
     """
     if protocol.strip().lower() == "tcp":
         os.environ["MC_FORCE_TCP"] = "true"
+
+
+# ---------------------------------------------------------------------------
+# DCP relayout: block/token mapping for a non-DCP producer -> DCP consumer push
+# ---------------------------------------------------------------------------
+#
+# The producer stores KV contiguously: global token ``g`` lives in block
+# ``g // block_size`` at offset ``g % block_size``. A DCP consumer's block-table
+# entry is a *virtual block* covering ``block_size * dcp_size`` global tokens,
+# of which each rank physically holds only its own share, so the push is a
+# relayout rather than a block copy. Its shape differs per cache region:
+#
+# Sharded regions (kv_cache)
+#     Tokens are interleave-sharded across ranks in groups of ``interleave_size``
+#     (S): global token ``g`` lives on rank ``(g // S) % W`` at local index
+#     ``(g // (S*W)) * S + g % S``. Rank ``r``'s virtual block ``b``, offset
+#     ``j`` therefore pulls global position ``dcp_global_pos(b*block_size+j, r)``.
+#     S == block_size collapses to "dst block b <- src block b*W + r", one whole
+#     block per descriptor; S == 1 gives one descriptor per token.
+#
+# Replicated regions (index_cache under ATOM_DCP_REPLICATE_INDEX_CACHE=1)
+#     Every rank holds the full ``block_size * dcp_size`` tokens of a virtual
+#     block in plain sequential order, so virtual block ``v`` is the
+#     concatenation of source blocks ``[v*W, (v+1)*W)``. Independent of both the
+#     rank and the interleave size, and the destination ``unit_bytes`` is ``W``
+#     times the source's.
+#
+# Both kinds return the same thing: coalesced ``(src_offset, dst_offset,
+# length)`` runs in token units, flat within the region (block id *
+# tokens-per-block + offset), which the caller turns into addresses with
+#
+#     src_addr = src_base + src_offset * token_bytes
+#     dst_addr = dst_base + dst_offset * token_bytes
+#     size     = length * token_bytes
+#
+# where ``token_bytes = src_unit_bytes // block_size``. Addressing a single
+# token is only possible when the region stores a token's bytes contiguously,
+# which holds for the MLA ``[num_slots, 1, 576]`` layout but not for the MHA
+# ``[blocks, heads, head_dim/x, block_size, x]`` one; callers must gate
+# ``interleave_size < block_size`` on the former.
+
+
+def _coalesce(
+    src: np.ndarray, dst: np.ndarray, length: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Merge runs that are contiguous on both sides into single descriptors.
+
+    A virtual block's ``dcp_size`` replicated sources, and consecutively
+    allocated blocks in general, collapse into one descriptor whenever the
+    allocator handed out consecutive ids, which is the common case and keeps
+    the RDMA batch small.
+    """
+    if src.size == 0:
+        empty = np.empty(0, dtype=np.int64)
+        return empty, empty.copy(), empty.copy()
+    contiguous = (src[1:] == src[:-1] + length[:-1]) & (
+        dst[1:] == dst[:-1] + length[:-1]
+    )
+    starts = np.concatenate(([True], ~contiguous))
+    group = np.cumsum(starts) - 1
+    merged_len = np.bincount(group, weights=length).astype(np.int64)
+    return src[starts], dst[starts], merged_len
+
+
+def plan_sharded(
+    src_block_ids,
+    dst_block_ids,
+    block_size: int,
+    dcp_size: int,
+    dcp_rank: int,
+    interleave_size: int = 1,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Plan the KV (interleave-sharded) transfer for one DCP rank.
+
+    Walks ``block_size // interleave_size`` runs per destination block. Runs
+    whose source block is past the end of the producer's list are dropped: the
+    block manager sizes every rank's table from rank 0's share, so ranks above
+    it can own a trailing virtual block that has no source tokens at all.
+    """
+    S = int(interleave_size)
+    src_ids = np.asarray(src_block_ids, dtype=np.int64)
+    dst_ids = np.asarray(dst_block_ids, dtype=np.int64)
+
+    # One run per S-group of this rank's local slots. Starting each run on an
+    # S-group boundary is what lets dcp_global_pos reduce to the group form
+    # below, and keeps the whole run inside one source block.
+    local = np.arange(0, dst_ids.size * block_size, S, dtype=np.int64)
+    dst_block, dst_token = np.divmod(local, block_size)
+    g = ((local // S) * dcp_size + dcp_rank) * S
+    src_block, src_token = np.divmod(g, block_size)
+
+    keep = src_block < src_ids.size
+    return _coalesce(
+        src_ids[src_block[keep]] * block_size + src_token[keep],
+        dst_ids[dst_block[keep]] * block_size + dst_token[keep],
+        np.full(int(keep.sum()), S, dtype=np.int64),
+    )
+
+
+def plan_replicated(
+    src_block_ids,
+    dst_block_ids,
+    block_size: int,
+    dcp_size: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Plan the replicated (full-copy) transfer; identical on every DCP rank."""
+    src_ids = np.asarray(src_block_ids, dtype=np.int64)
+    dst_ids = np.asarray(dst_block_ids, dtype=np.int64)
+
+    dst_block = np.repeat(np.arange(dst_ids.size, dtype=np.int64), dcp_size)
+    sub = np.tile(np.arange(dcp_size, dtype=np.int64), dst_ids.size)
+    src_block = dst_block * dcp_size + sub
+
+    keep = src_block < src_ids.size
+    return _coalesce(
+        src_ids[src_block[keep]] * block_size,
+        dst_ids[dst_block[keep]] * block_size * dcp_size + sub[keep] * block_size,
+        np.full(int(keep.sum()), block_size, dtype=np.int64),
+    )
 
 
 # ZMQ side-channel message types
@@ -471,6 +596,20 @@ class MooncakeConnector(KVConnectorBase):
         self.pp_rank = config.parallel_config.pipeline_parallel_rank
         self.pp_size = config.pipeline_parallel_size
         self.num_hidden_layers = config.hf_config.num_hidden_layers
+        self.block_size = config.kv_cache_block_size
+        # Decode Context Parallel splits a request's tokens round-robin across
+        # the decode ranks, so a consumer rank holds only its own shard while
+        # the producer holds whole blocks. The consumer ships this topology in
+        # its write_request; the producer relayouts on the way out and keeps
+        # dcp_size == 1 of its own.
+        self.dcp_size = config.decode_context_parallel_size
+        self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_size > 1 else 0
+        self.dcp_interleave_size = config.dcp_config.interleave_size
+        # With a replicated index cache every DCP rank holds all
+        # block_size * dcp_size tokens of a virtual block's indexer page
+        # instead of its own shard, so those regions need the replicated plan
+        # while the MLA latent regions stay sharded.
+        self.replicate_index_cache = dcp_replicated_index_cache_enabled(config)
         # Global index of this stage's first layer; consumer regions are ordered
         # over all layers, so a producer stage writes at this layer offset.
         self._start_layer = 0
@@ -588,6 +727,7 @@ class MooncakeConnector(KVConnectorBase):
         self.kv_caches: dict[str, Any] | None = None
         self.kv_caches_base_addr: list[int] = []
         self._per_block_bytes_list: list[int] = []
+        self._block_region_roles: list[str | None] = []
         self.kv_cache_shape: tuple[int, ...] | None = None
         self.block_len: int = config.kv_cache_block_size
         self.num_blocks: int = 0
@@ -762,6 +902,7 @@ class MooncakeConnector(KVConnectorBase):
 
         self.kv_caches_base_addr = [r.base_addr for r in tt.block_regions]
         self._per_block_bytes_list = [r.unit_bytes for r in tt.block_regions]
+        self._block_region_roles = [r.semantic_role for r in tt.block_regions]
 
         # Under pipeline parallelism this stage holds only layers
         # [start_layer, end_layer); its local regions map onto the consumer's
@@ -949,17 +1090,19 @@ class MooncakeConnector(KVConnectorBase):
                 self._pending_recv_nonce[req_id] = write_nonce
 
             # PD incremental: slice off locally cached prefix blocks; invalid
-            # offset falls back to full transfer.
+            # offset falls back to full transfer. Under DCP one local block is
+            # a *virtual* block spanning dcp_size producer blocks, so the same
+            # prefix costs dcp_size times as many source blocks.
             remote_block_ids = meta.remote_block_ids or []
             off = meta.num_computed_blocks
             if (
                 off < 0
                 or off >= len(meta.local_block_ids)
-                or off >= len(remote_block_ids)
+                or off * self.dcp_size >= len(remote_block_ids)
             ):
                 off = 0
             dst_block_ids = meta.local_block_ids[off:]
-            src_block_ids = remote_block_ids[off:]
+            src_block_ids = remote_block_ids[off * self.dcp_size :]
 
             # Build the (stage-independent) write_request payload once.
             request_body = {
@@ -969,6 +1112,9 @@ class MooncakeConnector(KVConnectorBase):
                 "consumer_rpc_port": self.rpc_port,
                 # Consumer's layer count per group for producer stride validation.
                 "consumer_num_layers": self._num_local_layers,
+                # Role of each of this side's block regions, so the producer can
+                # check its per-region plan lands on the same kind of region.
+                "consumer_region_roles": self._block_region_roles,
                 "dst_block_ids": dst_block_ids,
                 # Source block_ids so downstream stages (no scheduler, no
                 # _completed_prefills) can transfer without a local lookup.
@@ -980,6 +1126,11 @@ class MooncakeConnector(KVConnectorBase):
                 "notify_port": self._notification_port,
                 "consumer_tp_size": self.tp_size,
                 "write_nonce": write_nonce,
+                # DCP relayout: which shard of each block this rank owns.
+                "consumer_dcp_size": self.dcp_size,
+                "consumer_dcp_rank": self.dcp_rank,
+                "consumer_dcp_interleave": self.dcp_interleave_size,
+                "consumer_replicates_index_cache": self.replicate_index_cache,
             }
 
             consumer_staging_pool_idx = -1
@@ -1195,6 +1346,7 @@ class MooncakeConnector(KVConnectorBase):
             notify_port = request_data["notify_port"]
             consumer_tp_size = request_data.get("consumer_tp_size", self.tp_size)
             consumers_per_rank = max(1, consumer_tp_size // self.tp_size)
+            consumer_dcp_size = max(1, request_data.get("consumer_dcp_size", 1))
             write_nonce = request_data.get("write_nonce", 0)
             has_slot_data = request_data.get("has_slot_regions", False)
 
@@ -1253,16 +1405,22 @@ class MooncakeConnector(KVConnectorBase):
             # PD incremental (TP-TP only): consumer already sliced dst; slice
             # producer's src by the same offset. PP src arrives pre-sliced.
             if self.pp_size == 1:
-                off = request_data.get("num_computed_blocks", 0)
+                # The consumer's offset counts destination blocks; under DCP
+                # each of those spans consumer_dcp_size source blocks.
+                off = request_data.get("num_computed_blocks", 0) * consumer_dcp_size
                 if 0 < off < len(src_block_ids):
                     src_block_ids = src_block_ids[off:]
-            if len(src_block_ids) != len(dst_block_ids):
+            expected_dst_blocks = -(-len(src_block_ids) // consumer_dcp_size)
+            if len(dst_block_ids) != expected_dst_blocks:
                 logger.error(
                     "[PRODUCER] src/dst block count mismatch for req %s "
-                    "(src=%d, dst=%d); aborting transfer to avoid misaligned KV.",
+                    "(src=%d, dst=%d, expected dst=%d at dcp_size=%d); aborting "
+                    "transfer to avoid misaligned KV.",
                     req_id,
                     len(src_block_ids),
                     len(dst_block_ids),
+                    expected_dst_blocks,
+                    consumer_dcp_size,
                 )
                 return
             target = f"{consumer_host}:{consumer_rpc_port}"
@@ -1423,14 +1581,81 @@ class MooncakeConnector(KVConnectorBase):
             request_data.get("consumer_num_layers"),
             self._block_region_consumer_indices,
         )
+        # The plan is picked per region from this stage's own role list, but the
+        # bytes land in the consumer's region at cmap[region_idx], and matching
+        # region counts do not make the two orders the same. Writing an index
+        # region with the latent's plan corrupts it into plausible text instead
+        # of faulting, so compare the roles the mapping pairs up.
+        consumer_roles = request_data.get("consumer_region_roles")
+        if consumer_roles is not None:
+            for region_idx in range(num_regions):
+                remote_role = consumer_roles[cmap[region_idx]]
+                if self._block_region_roles[region_idx] != remote_role:
+                    raise RuntimeError(
+                        f"Region role mismatch for req {req_id}: local region "
+                        f"{region_idx} is "
+                        f"{self._block_region_roles[region_idx]!r}, but consumer "
+                        f"region {cmap[region_idx]} is {remote_role!r}"
+                    )
+        # Under DCP the consumer rank owns only part of each block, so
+        # whole-block descriptors no longer line up and the push becomes a
+        # token-unit relayout. DCP only runs on MLA, whose layout stores a
+        # token contiguously. Which relayout depends on the region: the MLA
+        # latent is interleave-sharded, while the indexer cache is either
+        # sharded the same way or -- with a replicated index cache -- held
+        # whole by every rank in a page dcp_size times as wide.
+        dcp_size = max(1, request_data.get("consumer_dcp_size", 1))
+        sharded_plan = None
+        replicated_plan = None
+        if dcp_size > 1:
+            sharded_plan = plan_sharded(
+                src_block_ids,
+                dst_block_ids,
+                self.block_size,
+                dcp_size,
+                request_data["consumer_dcp_rank"],
+                request_data["consumer_dcp_interleave"],
+            )
+            if request_data.get("consumer_replicates_index_cache", False):
+                replicated_plan = plan_replicated(
+                    src_block_ids,
+                    dst_block_ids,
+                    self.block_size,
+                    dcp_size,
+                )
+
         for region_idx in range(num_regions):
             src_base = self.kv_caches_base_addr[region_idx]
             dst_base = consumer_base_addrs[cmap[region_idx]]
             bpb = self._per_block_bytes_list[region_idx]
-            for sb, db in zip(src_block_ids, dst_block_ids):
-                src_addrs.append(src_base + sb * bpb)
-                dst_addrs.append(dst_base + db * bpb)
-                sizes.append(bpb)
+            plan = sharded_plan
+            if (
+                replicated_plan is not None
+                and self._block_region_roles[region_idx] == INDEX_CACHE_ROLE
+            ):
+                plan = replicated_plan
+            if plan is None:
+                for sb, db in zip(src_block_ids, dst_block_ids):
+                    src_addrs.append(src_base + sb * bpb)
+                    dst_addrs.append(dst_base + db * bpb)
+                    sizes.append(bpb)
+                continue
+            # The destination page may be wider than the source's, but only in
+            # whole tokens, and the plan's offsets already count in the
+            # destination's own token space -- so both ends scale by the
+            # source's per-token width.
+            if bpb % self.block_size:
+                raise RuntimeError(
+                    f"Region {region_idx} stores {bpb} bytes per block, which "
+                    f"block_size {self.block_size} does not divide. Addressing a "
+                    "single token needs its bytes contiguous, which holds for the "
+                    "MLA layout the token-unit relayout is built on."
+                )
+            token_bytes = bpb // self.block_size
+            for src_off, dst_off, run_len in zip(*plan):
+                src_addrs.append(src_base + int(src_off) * token_bytes)
+                dst_addrs.append(dst_base + int(dst_off) * token_bytes)
+                sizes.append(int(run_len) * token_bytes)
 
         logger.info(
             "[PRODUCER] block RDMA write: req=%s, %d regions × %d blocks, "
