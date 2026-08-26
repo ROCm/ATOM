@@ -1178,11 +1178,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         failure it removes is a scatter into whatever the allocator handed
         that address range to next.
         """
-        runner = self.model_runner
         planes = self._kv_planes()
-        pools = [runner.v4_csa_idx_kv]
-        if self._indexer_fp4:
-            pools.append(runner.v4_csa_idx_kv_scale)
+        pools = [pool for pool, _ in self._indexer_page_pools()]
         owners = tuple(t.data_ptr() for t in (*planes, *pools))
         # The whole test: there is always at least one plane, so the owners of
         # a built cache are never the empty tuple this starts as, and an
@@ -1340,6 +1337,26 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         ]
         assert len(planes) == len(self._plane_row_widths())
         return planes
+
+    def _indexer_page_pools(self) -> list[tuple[torch.Tensor, str]]:
+        """Indexer pools and semantic-role prefixes in PAGE stream order.
+
+        FP8 keeps data and its row scales in one tensor. FP4 stores packed
+        data and e8m0 scales in separate block-indexed tensors, and both are
+        required to restore indexer logits bit-for-bit. This is the single
+        enumeration used by the internal PAGE checkpoint copier and external
+        transfer/offload registration so neither path can omit a pool.
+        """
+        runner = self.model_runner
+        if self._indexer_fp4:
+            return [
+                (runner.v4_csa_idx_kv, "dsv4.csa_indexer.fp4_data"),
+                (
+                    runner.v4_csa_idx_kv_scale,
+                    "dsv4.csa_indexer.fp4_scale",
+                ),
+            ]
+        return [(runner.v4_csa_idx_kv, "dsv4.csa_indexer")]
 
     def allocate_kv_cache_tensors(
         self, num_kv_heads: int, num_draft_layers: int
@@ -1797,16 +1814,18 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             return None
 
         # `get_kv_transfer_tensors` is called unconditionally on every
-        # `allocate_kv_cache`; returning None means "no transfer region." Only
-        # fail when transfer or offload is active. The FP4 indexer's separate
-        # uint8 e8m0 scale pool is not yet described by the region map below,
-        # so registering it would expose a half-described cache.
-        transfer_active = bool(getattr(runner.config, "kv_transfer_config", None))
-        if self._indexer_fp4 and transfer_active:
+        # `allocate_kv_cache`; returning None means "no transfer region."
+        # Standalone LMCache offload can carry both FP4 indexer pools, but PD
+        # connectors have a separate producer/consumer region contract which
+        # has not been extended to the FP4 scale pool yet.
+        transfer_config = getattr(runner.config, "kv_transfer_config", None)
+        transfer_active = bool(transfer_config)
+        if self._indexer_fp4 and transfer_active and _uses_pd_staging(transfer_config):
             raise NotImplementedError(
-                "DeepSeek-V4 KV transfer/offload with --index_cache_dtype fp4 "
-                "is unsupported because the unmapped FP4 indexer scale pool "
-                "would be omitted; use the FP8 indexer or disable transfer/offload."
+                "DeepSeek-V4 PD transfer with --index_cache_dtype fp4 is "
+                "unsupported; standalone LMCache offload supports FP4, but "
+                "Mooncake/Moriio producer-consumer staging does not yet map "
+                "the separate FP4 indexer scale pool."
             )
         if transfer_active and getattr(runner.config, "pipeline_parallel_size", 1) > 1:
             raise NotImplementedError(
@@ -1815,10 +1834,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 "because each PAGE/SLOT plane region covers every layer; use "
                 "PP=1 or disable DeepSeek-V4 transfer/offload."
             )
-        if self._indexer_fp4:
-            # Single-node FP4 indexer: the FP8 region map below references the
-            # absent fp8 idx pool (`v4_csa_idx_kv` is uint8 here, no scale
-            # region). No transfer is active, so skip building regions.
+        if self._indexer_fp4 and not transfer_active:
+            # No connector will consume the regions in a single-node run.
             return None
 
         num_slots = self.num_state_slots
@@ -1866,17 +1883,35 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 )
             )
 
-        # Compressed PAGE regions: CSA Indexer KV (FP8).
-        for pos, layer_id in enumerate(self.csa_layers):
-            t = runner.v4_csa_idx_kv[pos]
-            bpb = self.csa_rows_per_block * self._index_row_bytes
-            block_regions.append(
-                KVTransferRegion(
-                    t.data_ptr(),
-                    t.numel() * t.element_size(),
-                    bpb,
-                    semantic_role=f"dsv4.csa_indexer.layer_{layer_id}",
+        # Compressed PAGE regions: one per CSA layer in each indexer pool.
+        # The pool order is data then scale for FP4, matching the internal
+        # checkpoint stream. Derive the block width from the actual view so
+        # this remains correct for both the FP8 row layout and FP4 tiles.
+        for pool, role_prefix in self._indexer_page_pools():
+            for pos, layer_id in enumerate(self.csa_layers):
+                view = pool[pos]
+                if not view.is_contiguous():
+                    raise RuntimeError(
+                        "a CSA indexer layer must be contiguous to be transferred"
+                    )
+                block_regions.append(
+                    KVTransferRegion(
+                        view.data_ptr(),
+                        view.numel() * view.element_size(),
+                        view.stride(0) * view.element_size(),
+                        semantic_role=f"{role_prefix}.layer_{layer_id}",
+                    )
                 )
+
+        checkpoint_spec = runner.state_runtime.checkpoint_spec
+        if checkpoint_spec is None:
+            raise RuntimeError("DSV4 PAGE/state checkpoint sizing spec is missing")
+        transfer_page_bytes = sum(region.unit_bytes for region in block_regions)
+        if transfer_page_bytes != checkpoint_spec.page_unit_bytes:
+            raise RuntimeError(
+                "DSV4 PAGE transfer regions do not cover the sized PAGE unit: "
+                f"regions={transfer_page_bytes}, "
+                f"checkpoint={checkpoint_spec.page_unit_bytes}"
             )
 
         # Full per-request SLOT (legacy field name: `swa_block_regions`) is one

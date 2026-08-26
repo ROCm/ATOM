@@ -36,6 +36,7 @@ from atom.model_ops.fused_moe.config import (
     FusedMoEConfig,
     FusedMoEQuantConfig,
     fp8_w8a8_moe_quant_config,
+    moe_kernel_token_capacity,
     mxfp4_w4a8_moe_quant_config,
     mxfp4_w4a16_moe_quant_config,
 )
@@ -685,6 +686,13 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 "num_local_experts": moe.num_local_experts,
                 "num_experts_per_token": moe.experts_per_token,
                 "gpu_per_node": moe.moe_parallel_config.local_ep_size,
+                # The same probe the sync handle uses (aiter sets it from
+                # in_the_same_node_as). Sharing one source keeps prefill and
+                # decode on the same kernel type -- inferring it from
+                # `world_size <= 8` instead let them disagree on a 2-node x
+                # 4-GPU group, running IntraNode kernels across a boundary
+                # that has no P2P mapping.
+                "internode": all2all_manager.internode,
                 "data_type_itemsize": moe.in_dtype.itemsize,
                 "max_token_type_size": moe.in_dtype.itemsize,
                 "scale_type_size": scale_type_size,
@@ -692,7 +700,9 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             }
 
             tbo_mori_ops = None
-            sync_handle = handle  # IntraNode handle for prefill (sync path)
+            # Prefill (sync path). aiter picks its kernel from the same
+            # internode probe, so this is not necessarily IntraNode.
+            sync_handle = handle
             if is_async:
                 from atom.model_ops.fused_moe.mori_prepare_finalize import (
                     _NUM_TBO_UBATCHES,
@@ -2814,6 +2824,12 @@ class FusedMoE(torch.nn.Module):
                 self.expert_mask[start : start + self.local_num_experts] = 1
             else:
                 self.expert_mask = (self.expert_map > -1).to(torch.int32)
+        moe_token_capacity = moe_kernel_token_capacity(
+            atom_config,
+            dp_size=self.moe_parallel_config.dp_size,
+            use_all2all=self.moe_parallel_config.use_all2all_kernels,
+            dp_logical_ratio=self.moe_parallel_config.dp_logical_ratio,
+        )
         if self.expert_layout.mode is SharedExpertMode.LEGACY_AITER:
             init_aiter_topK_meta_data(
                 n_routed_experts=num_experts,
@@ -2826,7 +2842,7 @@ class FusedMoE(torch.nn.Module):
                     if is_rocm_aiter_fuse_routed_scaling_factor()
                     else 1 / self.routed_scaling_factor
                 ),
-                max_num_tokens=atom_config.max_num_batched_tokens,
+                max_num_tokens=moe_token_capacity,
                 is_EP=self.use_ep,
             )
         assert intermediate_size % self.tp_size == 0
@@ -2873,7 +2889,7 @@ class FusedMoE(torch.nn.Module):
             expert_layout=self.expert_layout,
             in_dtype=atom_config.torch_dtype,
             a_quant_dtype=a_quant_dtype,
-            max_num_tokens=atom_config.max_num_batched_tokens,
+            max_num_tokens=moe_token_capacity,
             has_bias=self.has_bias,
             # is_act_and_mul=True,
             is_lora_enabled=False,
