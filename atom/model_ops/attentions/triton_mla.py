@@ -69,27 +69,62 @@ class TritonMLAMetadataBuilder(AiterMLAMetadataBuilder):
         # Triton MLA does not use aiter persistent worker buffers
         return {}
 
+    def _cut_decode_buffers(
+        self,
+        rows: int,
+        max_seqlen_k: int,
+        kv_indices: torch.Tensor,
+        kv_indptr: torch.Tensor,
+    ) -> dict:
+        """The three buffers `attention_mla`'s Triton branch reads, cut to `rows`.
+
+        One implementation for both entry points, because the defect was that
+        only `prepare_decode` cut them: a mid-step then ran its own wider batch
+        against the verify forward's cut. Costs a zero plus a densify per
+        mid-step, which that path did not pay before.
+        """
+        var = self.model_runner.forward_vars
+        block_table = var["triton_block_table"][:rows, :max_seqlen_k]
+        block_table.zero_()
+        csr_to_dense_block_table(kv_indices, kv_indptr, block_table, max_seqlen_k, rows)
+        return {
+            "triton_block_table": block_table,
+            "triton_attn_logits": var["triton_attn_logits"][:rows],
+            "triton_lse": var["triton_lse"][:rows],
+        }
+
     def prepare_decode(self, batch: ScheduledBatch, bs: int):
         attn_metadata, positions = super().prepare_decode(batch, bs)
-
-        scheduled_bs = batch.total_seqs_num_decode
-        max_seqlen_k = attn_metadata.max_seqlen_k
-        var = self.model_runner.forward_vars
-
-        triton_bt = var["triton_block_table"][:scheduled_bs, :max_seqlen_k]
-        triton_bt.zero_()
-        csr_to_dense_block_table(
+        for name, buf in self._cut_decode_buffers(
+            batch.total_seqs_num_decode,
+            attn_metadata.max_seqlen_k,
             attn_metadata.kv_indices,
             attn_metadata.kv_indptr,
-            triton_bt,
-            max_seqlen_k,
-            scheduled_bs,
-        )
-        attn_metadata.triton_block_table = triton_bt
-        attn_metadata.triton_attn_logits = var["triton_attn_logits"][:scheduled_bs]
-        attn_metadata.triton_lse = var["triton_lse"][:scheduled_bs]
-
+        ).items():
+            setattr(attn_metadata, name, buf)
         return attn_metadata, positions
+
+    def prepare_mtp_decode(
+        self,
+        bs: int,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        positions: torch.Tensor,
+        only_update: bool = False,
+        num_reject_tokens: torch.Tensor | None = None,
+    ):
+        """Re-cut the Triton decode buffers off the `kv_indptr` the base rebuilt."""
+        result = super().prepare_mtp_decode(
+            bs, max_seqlen_q, max_seqlen_k, positions, only_update, num_reject_tokens
+        )
+        pad_bs = int(positions.shape[-1])  # rows; see the base contract
+        var = self.model_runner.forward_vars
+        return result | self._cut_decode_buffers(
+            pad_bs,
+            max_seqlen_k,
+            var["kv_indices"].gpu,
+            var["kv_indptr"].gpu[: pad_bs + 1],
+        )
 
     def prepare_prefill(self, batch: ScheduledBatch):
         attn_metadata, positions = super().prepare_prefill(batch)

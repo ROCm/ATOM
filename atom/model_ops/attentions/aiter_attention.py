@@ -850,7 +850,28 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             positions_out.stride(0) if update_positions else 1,
             BLOCK=128,
         )
-        return {"slot_mapping": slot_mapping}
+        workinfos = {"slot_mapping": slot_mapping}
+        if self._has_sparse_attention:
+            # `attention_mha` picks this up off the shared metadata with a plain
+            # `getattr`, and `prepare_decode` cut it at `scheduled_bs` -- so a
+            # mid-step would read seq_lens for fewer rows than it runs.
+            from atom.model_ops.minimax_m3.sparse_attn import (
+                make_sparse_decode_metadata,
+            )
+
+            workinfos["sparse_attention_metadata"] = make_sparse_decode_metadata(
+                seq_lens=context_lens[:pad_bs],
+                block_table=self._get_sparse_attention_block_tables(
+                    block_tables[:pad_bs], context_lens[:pad_bs], pad_bs
+                ),
+                slot_mapping=slot_mapping,  # this step's, not the verify fwd's
+                max_seq_len=max_seqlen_k,
+                # A mid-step is one row per sequence. Not the `max_seqlen_q`
+                # argument: on the `only_update` path that carries the verify
+                # forward's width.
+                max_query_len=1,
+            )
+        return workinfos
 
     def prepare_prefill(self, batch: ScheduledBatch):
         attn_metadata, positions = CommonAttentionBuilder.prepare_prefill(self, batch)
