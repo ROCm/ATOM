@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import logging
 from collections import deque
 from dataclasses import dataclass
 from heapq import heapify, heappop, heappush
 from typing import Protocol
 
 from atom.model_engine.state_runtime import StateTransfer
+from atom.utils import envs
+
+logger = logging.getLogger("atom")
 
 
 class SuperblockSource(Protocol):
@@ -681,12 +685,32 @@ class StateSlotPool:
         if not self.applies(seq):
             return hit
         hbs = self.hash_block_size
+        n_ckpt = 0
+        blocked_by_fork = 0
         for i in range(hit - 1, -1, -1):
             checkpointed = block_hashes[i] in self.hash_to_slot
             if not assume_checkpointed and not checkpointed:
                 continue
+            n_ckpt += 1
             if seq.num_tokens - (i + 1) * hbs >= self.min_fork_tokens:
                 return i + 1
+            blocked_by_fork += 1
+        if envs.ATOM_LOG_PREFIX_MISS and hit > 0 and not assume_checkpointed:
+            # Which of the two conditions refused the whole prefix. They want
+            # opposite fixes -- checkpoint placement vs `min_fork_tokens` -- and
+            # a hit rate shows neither, since a request resuming from zero after
+            # a 99% paged match reads the same as one that never matched.
+            logger.info(
+                "[SlotGateReject] seq=%s hit=%d tokens=%d ckpts_on_prefix=%d "
+                "blocked_by_fork=%d slots_indexed=%d min_fork=%d",
+                getattr(seq, "external_request_id", None) or seq.id,
+                hit,
+                seq.num_tokens,
+                n_ckpt,
+                blocked_by_fork,
+                len(self.hash_to_slot),
+                self.min_fork_tokens,
+            )
         return 0
 
     def lookup(self, h: int) -> int:
