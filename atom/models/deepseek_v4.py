@@ -3021,13 +3021,19 @@ class DeepseekV4Attention(nn.Module):
             tag = "mixed_seg[prefill]" if is_prefill else "mixed_seg[decode]"
             slot = attn_out[lo:hi]
             with torch.profiler.record_function(f"{tag} n={hi - lo}"):
+                # Keyword-only, and `piecewise` is required: `_attn_core` is
+                # wrapped by `@piecewise_core`, whose wrapper takes
+                # `(layer, *, piecewise, ...)`. False because a segment always
+                # runs eager -- the graphs are keyed on a whole-batch row count
+                # that no segment has.
                 res = self._attn_core(
-                    x[lo:hi],
-                    q[lo:hi],
-                    kv_pre[lo:hi],
-                    qr[lo:hi],
-                    qr_scale[lo:hi],
-                    positions[lo:hi],
+                    piecewise=False,
+                    x=x[lo:hi],
+                    q=q[lo:hi],
+                    kv_pre=kv_pre[lo:hi],
+                    qr=qr[lo:hi],
+                    qr_scale=qr_scale[lo:hi],
+                    positions=positions[lo:hi],
                     idx_q_quant=None if idx_q_quant is None else idx_q_quant[lo:hi],
                     idx_weights=None if idx_weights is None else idx_weights[lo:hi],
                     idx_q_scale=None if idx_q_scale is None else idx_q_scale[lo:hi],
