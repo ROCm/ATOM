@@ -297,6 +297,7 @@ class WeightUpdaterMixin:
             return
 
         from aiter import QuantType as _QT
+
         from atom.model_ops.utils import shuffle_weights
 
         needs_shuffle = False
