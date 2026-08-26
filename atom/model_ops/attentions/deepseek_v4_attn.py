@@ -2528,7 +2528,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         pf_bank = self._get_mixed_prefill_bank()
         self.model_runner.forward_vars = pf_bank
         try:
-            prefill_meta, prefill_positions = self.prepare_prefill(batch)
+            prefill_meta, _prefill_positions = self.prepare_prefill(batch)
         finally:
             # Restore even on error so a failed mixed build can't leave the
             # runner pointed at the mirror bank.

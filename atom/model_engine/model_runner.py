@@ -2642,7 +2642,7 @@ class ModelRunner:
         is_mixed = getattr(batch, "is_mixed", False)
         bs = batch.total_seqs_num
         num_scheduled_tokens = np.asarray(batch.num_scheduled_tokens)
-        cu_seqlens_q, arange = self._get_cumsum_and_arange(num_scheduled_tokens)
+        cu_seqlens_q, _arange = self._get_cumsum_and_arange(num_scheduled_tokens)
         if preprocessed is None:
             preprocessed = self._preprocess(
                 batch,
