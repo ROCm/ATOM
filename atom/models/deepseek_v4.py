@@ -208,47 +208,29 @@ def _v4_attn_compress_fake(x: torch.Tensor, layer_name: str) -> torch.Tensor:
 
 @mark_spliting_op(is_custom=True, gen_fake=_v4_attn_compress_fake, mutates_args=[])
 def v4_attn_compress(x: torch.Tensor, layer_name: str) -> torch.Tensor:
-    """The split point, and the ONE batch-shaped kernel, alone.
+    """The split point, and the ONE batch-shaped kernel: the compressor.
 
-    One tensor in, an ordering token out. The compressor is the only thing left
-    whose LAUNCH is sized by the batch -- its grid is
-    `plan_gpu.shape[0] = graph_bs * per_seq_bound` -- which is why this graph
-    keys on `(layer, num_tokens, bucket_bs, q_eff)` while a dense piece keys on
-    num_tokens alone.
+    Its grid is `plan_gpu.shape[0] = graph_bs * per_seq_bound`, which is why
+    this graph keys on `(layer, num_tokens, bucket_bs, q_eff)` while a dense
+    piece keys on num_tokens alone. The indexer top-k would belong here on the
+    FP8 path (`_score_topk_decode_ragged` pads to a `bs * full_q` rectangle),
+    but FP4 is the default and its varqlen path is token-shaped, so it sits in
+    `_attn_paged_core` with the rest of that granularity.
 
-    The indexer top-k used to be here too, and on the FP8 path it would have to
-    be (`_score_topk_decode_ragged` pads into a `bs * full_q` rectangle). The
-    FP4 indexer is the default (`index_cache_dtype` resolves to fp4 off gfx942)
-    and its varqlen path is token-shaped throughout -- `padded_tokens =
-    q_fp4.size(0)`, a constant `n_ctas` grid, windows read from fixed-address
-    buffers the builder refreshes every decode -- so it belongs in a dense piece
-    and now lives in `_attn_paged_core`.
+    The `[1]` is an ORDERING TOKEN, not data: the compressor writes this
+    forward's compressed KV, `score_topk_from` reads it, and they are now in
+    different graphs. The downstream piece consuming this return is the edge
+    that orders them. Returning nothing is NOT an option -- measured under
+    inductor, an op that declares no mutation and returns nothing is DCE'd and
+    the compressor stops running. The only other way to declare an effect is a
+    mutated argument, and every buffer the compressor writes is None or a
+    placeholder at trace time (the builder setattr-replaces them in
+    `build_kv_cache_tensor`, after warmup traces). One element is the cheapest
+    declaration available, and on the captured path it costs nothing.
 
-    It has to stay AHEAD of that top-k: the compressor writes this forward's
-    compressed KV and `score_topk_from` reads it, and they are now in different
-    graphs. The `[1]` this returns is an ORDERING TOKEN, not data -- the piece
-    downstream consumes it, and that data edge is what enforces the order and
-    what stops inductor dropping an op whose result looks unused.
-
-    Returning NOTHING is not an option, and not for a stylistic reason -- all
-    three alternatives were measured under `torch.compile(backend="inductor")`:
-
-      * `-> None` with `mutates_args=[]`: the op is DCE'd. Not mis-ordered --
-        it does not run at all, so the compressor silently stops compressing.
-      * `-> None` with `mutates_args=["x"]`: survives. Rejected on contract,
-        not on cost -- `x` is NOT mutated here, and declaring it invites
-        functionalization to treat it as such. A microbenchmark did not show a
-        clone, so do not repeat the claim that it costs one; the objection is
-        that the declaration is false, and `module_dispatch_ops.py` keeps the
-        buffers this op really writes outside the signature on purpose.
-      * returning `x`: survives, and parks a `[num_tokens, dim]` tensor in the
-        persistent output slot for every (layer, num_tokens) -- ~44MB a layer at
-        the largest bucket, for a value nobody reads.
-
-    The oddness is real, and it is a signpost: this split point no longer has a
-    natural data boundary. Give the compressor a fixed-capacity plan
-    (`make_compress_plans`' `decode_capacity_per_ratio`) and it becomes
-    token-shaped, at which point the split op -- and this token -- go away.
+    It is still a signpost: this split has no natural data boundary any more.
+    Give the compressor a fixed-capacity plan (`decode_capacity_per_ratio`) and
+    it goes token-shaped, taking the split op and this token with it.
     """
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
@@ -403,21 +385,15 @@ def v4_qk_norm_rope(
 ) -> list[torch.Tensor]:
     """`_qk_norm_rope` as a Dynamo-OPAQUE op, so it can live in a dense piece.
 
-    Registered as a REGULAR custom op, NOT a splitting op, for the reason
-    `deepseek_v2.py`'s indexer wrapper spells out: opacity, not a graph *split*,
-    is what defeats the bake. Dynamo treats a custom op as a leaf and never
-    traces the body, so the `attn_metadata` it reads (`swa_dest_rows`,
-    `batch_id_per_token`, the decode/prefill state) is fetched LIVE on every
-    forward instead of freezing to the warmup trace's values -- and warmup
-    traces at ~16k tokens, so a frozen read would be wrong at every decode
-    shape. An identity-marker wrapper, which IS traced through, is what faulted
-    the last time work was moved into a dense piece this way.
+    A REGULAR custom op, not a splitting one: opacity, not a graph *split*, is
+    what defeats the bake. Dynamo never traces a custom op's body, so the
+    `attn_metadata` this reads stays live per forward instead of freezing to the
+    warmup trace (~16k tokens). Identity marker ops ARE traced through, which is
+    what faulted the last attempt to move work into a dense piece this way.
 
-    AF_PIECEWISE only; `_attn_pre` gates the call. Nothing is declared mutated:
-    the SWA plane this writes is read by `sparse_attn_v4_paged_*` on the far
-    side of the `v4_attn_compress` split, not by anything in this piece, and
-    the returned Q is consumed by that split op -- the data edge that both
-    orders this op and protects it from DCE.
+    Nothing is declared mutated: the SWA plane it writes is read across the
+    `v4_attn_compress` split, not in this piece, and the returned Q is consumed
+    downstream -- the edge that orders it and blocks DCE.
     """
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
@@ -3181,40 +3157,19 @@ class DeepseekV4Attention(nn.Module):
         x: torch.Tensor | None = None,  # [num_tokens, dim] hidden state
         compressor_already_launched: bool = False,
     ) -> torch.Tensor:  # [1] -- an ordering token, see `v4_attn_compress`
-        """The BATCH-shaped half of the attention: compressor + indexer top-k.
+        """The BATCH-shaped half: compressor launch + side-stream join.
 
-        Not the attention itself -- it used to hold that, and the name said so long
-        after it stopped being true. What it holds now is exactly the two
-        kernels whose LAUNCH is sized by the batch: the compressor's grid is
-        `plan_gpu.shape[0] = graph_bs * per_seq_bound`, and the DSpark ragged
-        indexer scatters into a `bs * full_q` rectangle. That is why this graph
-        keys on `(layer, num_tokens, bucket_bs, q_eff)` while a dense piece keys
-        on num_tokens alone -- one graph per granularity.
+        The only kernel left whose launch is sized by the batch, which is why this
+        graph keys on `(layer, num_tokens, bucket_bs, q_eff)` while a dense piece
+        keys on num_tokens alone -- one graph per granularity. Everything
+        token-shaped is in the pieces around it (`_qk_norm_rope` before,
+        `_attn_paged_core` after), including the paged attention itself, which only
+        ever sat here because torch.compile could not trace it.
 
-        Everything token-shaped is in the dense pieces around it, as opaque
-        custom ops: `_qk_norm_rope` before, `_attn_paged_core` (CSA pack + the
-        paged attention itself + prefill's SWA write) after. The paged attention
-        is token-shaped too (`N = qo_indptr.numel()-1`) and only ever sat here
-        because torch.compile could not trace it, which opacity solves.
-
-        Order inside is load-bearing: the compressor writes this forward's
-        compressed KV, the join makes it visible, `score_topk_from` reads it.
-
-        Returns the raw seq-local top-k `[total_tokens, index_topk]`, which
-        `_attn_paged_core` translate-packs. Token-shaped, so the piece
-        downstream can be captured on it.
-
-        `@piecewise_core` captures it, and `capture` is the ONLY thing that
-        differs between PIECEWISE and AF_PIECEWISE -- with it off this runs
-        eager and delivers into the persistent slot the downstream piece was
-        captured reading. `forward_impl` calls with `piecewise=False`, so the
-        decorator just runs the body.
-
-        The two callers differ only in `compressor_already_launched` (FULL
-        launches it before the projections to overlap them) and `idx_q_quant`:
-        if provided (narrow) the indexer runs only its paged score/top-k; if
-        None (FULL) `forward_batched` projects inline, which is the only reason
-        `qr`/`qr_scale`/`positions` are in this signature at all.
+        `capture` is the ONLY difference between PIECEWISE and AF_PIECEWISE: off,
+        this runs eager and delivers into the persistent slot the downstream piece
+        was captured reading. `compressor_already_launched` is True from
+        `forward_impl`, which launches it before the projections to overlap them.
         """
         fc = get_forward_context()
         # warmup_model runs BEFORE allocate_kv_cache, so the Compressor's and
@@ -3263,23 +3218,14 @@ class DeepseekV4Attention(nn.Module):
     ) -> "QKNormRopeOut":
         """The fused QK-norm/RoPE (+ decode SWA write). Single source.
 
-        Split out of the attention body so it can run one graph piece earlier,
-        inside the compiled dense piece, via the opaque `v4_qk_norm_rope` op.
-        It is the only part of the core that can move there: a dense piece is
-        keyed on num_tokens alone, and this kernel is the one whose launch
-        needs nothing else -- grid is `q.shape[0]`, `batch_id_per_token` is
-        `[T]` and only gates the store, `swa_dest_rows` is a whole buffer, and
-        the SWA plane it writes is persistent. Its neighbours in the core are
-        not: the compressor's grid is `graph_bs * per_seq_bound` and the DSpark
-        ragged indexer's is `bs * full_q`, and one num_tokens is reached from
-        several (bs, q_eff).
+        Split out of the attention body so it can run one graph piece earlier, in
+        the compiled dense piece, via the opaque `v4_qk_norm_rope` op -- its grid is
+        `q.shape[0]`, `batch_id_per_token` is `[T]` and only gates the store, and
+        `swa_dest_rows` is a whole buffer, so a num_tokens-keyed piece holds it.
 
-        Ordering: moving this AHEAD of the compressor launch is safe because
-        nothing here reads what the compressor writes (it takes `x`; this takes
-        the projections) and the decode SWA write has no ordering hazard
-        against the attention that reads the window. It does give up the
-        launch-before-projections overlap -- which AF_PIECEWISE has already
-        given up, since it forces `_use_async_compress = False`.
+        Running AHEAD of the compressor is safe: nothing here reads what the
+        compressor writes, and the decode SWA write has no ordering hazard against
+        the attention that reads the window.
         """
         fc = get_forward_context()
         # Same reason the other halves guard: warmup runs before allocate_kv_cache,
@@ -3367,24 +3313,14 @@ class DeepseekV4Attention(nn.Module):
         qr: torch.Tensor | None = None,  # FULL only, same
         qr_scale: torch.Tensor | None = None,  # FULL only, same
     ) -> torch.Tensor:
-        """The TOKEN-shaped tail of the attention: CSA translate-pack, the paged
-        attention itself, and prefill's SWA write. Single source.
+        """The TOKEN-shaped tail: indexer top-k, CSA pack, the paged attention, and
+        prefill's SWA write.
 
-        Every launch in here is sized by the token count --
-        `csa_translate_pack`'s grid is `(T, ...)` and the paged kernels take
-        `N = qo_indptr.numel()-1 = total_tokens` -- and everything it reads is
-        either token-shaped or a whole persistent buffer. So it belongs in a
-        dense piece, whose cudagraph key is num_tokens, and NOT in the core.
-
-        The core keeps only what is sized by the BATCH: the compressor's grid is
-        `graph_bs * per_seq_bound` and the DSpark ragged indexer's rectangle is
-        `bs * full_q`. That is the whole split -- one graph per granularity --
-        and it is why the core's key is `(layer, num_tokens, bs, q_eff)` while a
-        dense piece's is num_tokens alone.
-
-        `topk_local` is the core's output, crossing that boundary. It is
-        `[total_tokens, index_topk]`, i.e. token-shaped, which is what lets the
-        piece downstream be captured on it.
+        Every launch here is sized by the token count -- `csa_translate_pack`'s grid
+        is `(T, ...)`, the paged kernels take `N = qo_indptr.numel()-1`, the FP4
+        varqlen scorer takes `padded_tokens = q_fp4.size(0)` on a constant grid --
+        and everything it reads is token-shaped or a whole persistent buffer. So it
+        belongs in a dense piece, keyed on num_tokens, not in the core.
         """
         fc = get_forward_context()
         num_tokens = positions.shape[0]

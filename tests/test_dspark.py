@@ -1815,3 +1815,149 @@ def test_qk_norm_rope_shapes_match_what_the_paged_kernel_asserts():
     # And the op's return list has to carry the active layout's four / two.
     assert len(v4._qk_norm_rope_list(fp8, True)) == 4
     assert len(v4._qk_norm_rope_list(bf16, False)) == 2
+
+
+# ---------------------------------------------------------------------------
+# `kv_indices_{swa,csa,hca}` carry no information in their own length
+#
+# `_attach_v4_paged_decode_meta` publishes them whole, not sliced to
+# `indptr_np[T]`. That length is a cumsum of per-token KV spans, so it varies
+# step to step at a FIXED num_tokens and no graph key pins it -- and a cudagraph
+# bakes it. Neither consumer reads it: the paged kernel walks
+# `kv_indices[indptr[t]:indptr[t+1]]`, `csa_translate_pack`'s grid comes from
+# `topk_local.shape`. Both are exercised below against an exact and an oversized
+# buffer and required to agree.
+# ---------------------------------------------------------------------------
+
+ENVELOPE_ROWS = 8
+CSA_BLOCK_CAPACITY = 64
+WINDOW_SIZE = 128
+SLACK = 97  # deliberately not a round number, and not a multiple of index_topk
+
+
+def _decode_batch(bs: int, tokens_per_seq: int, index_topk: int):
+    """A ragged decode batch: per-token spans differ, and a CG pad tail follows.
+
+    `positions` drives `skip = min(pos + 1, WINDOW_SIZE)` inline, so varying
+    them across tokens is what makes `valid_k` -- and therefore the exact
+    destination length -- data-dependent in the first place.
+    """
+    g = torch.Generator().manual_seed(bs * 1000 + tokens_per_seq)
+    t_real = bs * tokens_per_seq
+    t_pad = t_real + 3  # CG padding: batch_id -1, contributes nothing
+
+    batch_id = torch.full((t_pad,), -1, dtype=torch.int32)
+    batch_id[:t_real] = torch.repeat_interleave(
+        torch.arange(bs, dtype=torch.int32), tokens_per_seq
+    )
+    positions = torch.zeros(t_pad, dtype=torch.int32)
+    positions[:t_real] = torch.randint(
+        WINDOW_SIZE, WINDOW_SIZE * 6, (t_real,), generator=g, dtype=torch.int32
+    )
+
+    # Slice length per token = skip + valid_k, with valid_k ragged across tokens.
+    skip = torch.minimum(
+        positions[:t_real].to(torch.int64) + 1, torch.tensor(WINDOW_SIZE)
+    )
+    valid_k = torch.randint(1, index_topk + 1, (t_real,), generator=g)
+    spans = torch.zeros(t_pad, dtype=torch.int64)
+    spans[:t_real] = skip + valid_k
+
+    indptr = torch.zeros(t_pad + 1, dtype=torch.int32)
+    indptr[1:] = torch.cumsum(spans, 0).to(torch.int32)
+
+    topk_local = torch.randint(
+        0, CSA_BLOCK_CAPACITY * 4, (t_pad, index_topk), generator=g, dtype=torch.int32
+    )
+    block_tables = torch.randint(
+        1, 5000, (max(bs, 1), 16), generator=g, dtype=torch.int32
+    )
+    return topk_local, block_tables, positions, indptr, batch_id, int(indptr[t_pad])
+
+
+def _run_writer(dest_len: int, batch) -> torch.Tensor:
+    from atom.model_ops.v4_kernels.csa_translate_pack import (
+        csa_translate_pack_reference,
+    )
+
+    topk_local, block_tables, positions, indptr, batch_id, _ = batch
+    dest = torch.full((dest_len,), -7, dtype=torch.int32)
+    csa_translate_pack_reference(
+        topk_local,
+        block_tables,
+        positions,
+        indptr,
+        batch_id,
+        None,
+        dest,
+        envelope_rows=ENVELOPE_ROWS,
+        csa_block_capacity=CSA_BLOCK_CAPACITY,
+        window_size=WINDOW_SIZE,
+    )
+    return dest
+
+
+def test_writer_ignores_the_destination_length():
+    batch = _decode_batch(bs=5, tokens_per_seq=6, index_topk=32)
+    exact = batch[-1]
+
+    tight = _run_writer(exact, batch)
+    loose = _run_writer(exact + SLACK, batch)
+
+    torch.testing.assert_close(loose[:exact], tight)
+    assert torch.all(loose[exact:] == -7), (
+        "an oversized destination must leave its tail untouched -- a writer that "
+        "sized anything off `kv_indices.numel()` would have scribbled into it"
+    )
+
+
+def test_writer_is_length_invariant_across_shapes():
+    """The same, over batch shapes whose exact lengths differ widely."""
+    for bs, tokens_per_seq, index_topk in [
+        (1, 1, 16),
+        (3, 4, 32),
+        (8, 6, 64),
+        (17, 2, 128),
+    ]:
+        batch = _decode_batch(bs, tokens_per_seq, index_topk)
+        exact = batch[-1]
+        tight = _run_writer(exact, batch)
+        loose = _run_writer(exact + SLACK, batch)
+        torch.testing.assert_close(
+            loose[:exact],
+            tight,
+            msg=f"bs={bs} tokens_per_seq={tokens_per_seq} topk={index_topk}",
+        )
+
+
+def test_reader_ignores_the_indices_length():
+    """Attention output is identical over an exact vs an oversized `kv_indices`.
+
+    The oversized tail is filled with in-range but WRONG slot ids, so a reader
+    that walked past `indptr[T]` would change its answer rather than fault.
+    """
+    torch.manual_seed(0)
+    t, heads, dim, pages = 6, 4, 32, 512
+
+    spans = torch.tensor([3, 1, 7, 0, 4, 2])
+    indptr = torch.zeros(t + 1, dtype=torch.int32)
+    indptr[1:] = torch.cumsum(spans, 0).to(torch.int32)
+    exact = int(indptr[t])
+
+    q = torch.randn(t, heads, dim)
+    unified_kv = torch.randn(pages, dim)
+    attn_sink = torch.randn(heads)
+    tight = torch.randint(0, pages, (exact,), dtype=torch.int32)
+    loose = torch.cat([tight, torch.randint(0, pages, (SLACK,), dtype=torch.int32)])
+
+    from atom.model_ops.v4_kernels.paged_decode import (
+        sparse_attn_v4_paged_decode_reference,
+    )
+
+    out_tight = sparse_attn_v4_paged_decode_reference(
+        q, unified_kv, tight, indptr, attn_sink, dim**-0.5
+    )
+    out_loose = sparse_attn_v4_paged_decode_reference(
+        q, unified_kv, loose, indptr, attn_sink, dim**-0.5
+    )
+    torch.testing.assert_close(out_tight, out_loose)
