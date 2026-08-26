@@ -346,9 +346,9 @@ def _qk_norm_rope_out(layer, q: torch.Tensor, num_tokens: int, *, zeros: bool):
 
 
 def _qk_norm_rope_list(qkn: "QKNormRopeOut", kv_fp8: bool) -> list[torch.Tensor]:
-    """`QKNormRopeOut` -> the op's return list. Only the active layout's fields;
-    a custom op's list cannot carry the other path's Nones. `_attn_pre` re-splits
-    on the same frozen flag."""
+    """`QKNormRopeOut` -> the op's return list: the active layout's fields only,
+    since a schema cannot carry the other path's Nones. Shared with the fake, so
+    the two cannot disagree on length."""
     if kv_fp8:
         return [qkn.q_packed, qkn.q_rope, qkn.k_packed, qkn.k_rope]
     return [qkn.q_sa, qkn.kv]
@@ -376,14 +376,9 @@ def v4_qk_norm_rope(
     """`_qk_norm_rope` as a Dynamo-OPAQUE op, so it can live in a dense piece.
 
     A REGULAR custom op, not a splitting one: opacity, not a graph *split*, is
-    what defeats the bake. Dynamo never traces a custom op's body, so the
-    `attn_metadata` this reads stays live per forward instead of freezing to the
-    warmup trace (~16k tokens). Identity marker ops ARE traced through, which is
-    what faulted the last attempt to move work into a dense piece this way.
-
-    Nothing is declared mutated: the SWA plane it writes is read across the
-    `v4_attn_compress` split, not in this piece, and the returned Q is consumed
-    downstream -- the edge that orders it and blocks DCE.
+    what keeps the `attn_metadata` it reads live per forward instead of frozen
+    to the warmup trace (~16k tokens). Identity marker ops ARE traced through,
+    which is what faulted an earlier attempt to move work this way.
     """
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
