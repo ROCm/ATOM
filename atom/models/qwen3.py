@@ -25,7 +25,8 @@
 # limitations under the License.
 
 import os
-from typing import Any, Iterable, Union
+from collections.abc import Iterable
+from typing import Any, Union
 
 import torch
 
