@@ -71,6 +71,7 @@ from atom.model_ops.sampler import SAMPLER_EPS, Sampler
 from atom.models.utils import get_pp_indices
 from atom.spec_decode.drafter import Drafter
 from atom.spec_decode.factory import build_drafter
+from atom.utils import dsa_logits_dump
 from atom.utils import (
     CpuGpuBuffer,
     envs,
@@ -3204,6 +3205,7 @@ class ModelRunner:
 
                 graph_key = (graph_bs, max_q_len)
                 self.graphs[graph_key].replay()
+                dsa_logits_dump.flush(graph_bs, max_q_len)
                 hidden_states = self.forward_vars["outputs"][:num_tokens]
                 # Drafter aux buffers (if any) refresh on replay: their in-place
                 # copy ops were captured into the graph.

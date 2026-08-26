@@ -68,6 +68,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DCP_REPLICATE_INDEX_CACHE": lambda: (
         os.getenv("ATOM_DCP_REPLICATE_INDEX_CACHE", "0") == "1"
     ),
+    # --- DSA indexer logits mirror (debug) ---
+    # Directory to write decode logits-plane snapshots to; empty disables the
+    # mirror entirely. See atom/utils/dsa_logits_dump.py.
+    "ATOM_DSA_LOGITS_DUMP": lambda: os.getenv("ATOM_DSA_LOGITS_DUMP", ""),
+    "ATOM_DSA_LOGITS_DUMP_ROWS": lambda: int(
+        os.getenv("ATOM_DSA_LOGITS_DUMP_ROWS", "8")
+    ),
+    "ATOM_DSA_LOGITS_DUMP_EVERY": lambda: int(
+        os.getenv("ATOM_DSA_LOGITS_DUMP_EVERY", "400")
+    ),
+    "ATOM_DSA_LOGITS_DUMP_MAX": lambda: int(
+        os.getenv("ATOM_DSA_LOGITS_DUMP_MAX", "24")
+    ),
+    # Comma-separated layer indices to mirror; empty means the first layer that
+    # calls in.
+    "ATOM_DSA_LOGITS_DUMP_LAYERS": lambda: os.getenv("ATOM_DSA_LOGITS_DUMP_LAYERS", ""),
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
     "ATOM_USE_TRITON_MOE_DECODE": lambda: os.getenv("ATOM_USE_TRITON_MOE_DECODE", "0")
     == "1",
