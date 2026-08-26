@@ -566,10 +566,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #
     # Measured on V4-Pro dp8+DPA+TBO (no EP, no prefix caching), n=2 per arm,
     # output throughput: +4.5% at ISL 2048/conc 512, +12.0% at ISL 8192/conc
-    # 512, +14.5% at ISL 8192/conc 2048; mean TTFT -14% to -17% throughout.
+    # 512, +18.1% at ISL 8192/conc 2048; mean TTFT -14% to -19% throughout.
     # The gain tracks how much prefill there is to hide the TP all-reduce
     # behind, so it shrinks as a rank's prefill approaches
     # ATOM_TBO_PREFILL_MIN_TOKENS and the split starts getting refused.
+    #
+    # The conc-2048 figure was re-measured after rebasing onto main (it read
+    # +14.5% before) with an aiter bump in the same step, so the 3.6pp is not
+    # attributable to either alone. Both arms of every A/B ran the same code
+    # and the same aiter, which is what makes each delta valid.
     #
     # Still off by default: with it off a mixed batch vetoes TBO through
     # `can_split`, and that is the behaviour every existing baseline was
