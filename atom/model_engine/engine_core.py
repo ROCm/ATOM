@@ -498,9 +498,7 @@ class EngineCore:
         # Reclaim any offload save whose completion report never came (LMCache
         # force-unpinned it upstream). Self-throttled, so calling it on every
         # poll is cheap; without it a stalled save hangs the engine forever.
-        reconcile = getattr(
-            self.scheduler, "_reconcile_stalled_deferred_saves", None
-        )
+        reconcile = getattr(self.scheduler, "_reconcile_stalled_deferred_saves", None)
         if callable(reconcile):
             reconcile()
 

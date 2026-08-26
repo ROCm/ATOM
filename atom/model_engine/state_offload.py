@@ -157,23 +157,30 @@ class StateOffloadIndex:
         """Return slots whose spill report never came back to the free ring.
 
         `release_staging` is the only way a slot comes home, and it fires only
-        on the worker's spill report. A lost report (the transfer was abandoned,
-        or its completion vanished the way a stalled KV save's does) would pin
-        that slot forever; enough of them and `request_spill` drops every spill
-        (`spills_dropped` climbs, `_note_drop` warns) with no way to recover
-        short of a restart. This is the ring-side twin of the engine's
-        `_reconcile_stalled_deferred_saves`.
+        on the worker's spill report. A lost report would pin that slot forever;
+        enough of them and `request_spill` drops every spill (`spills_dropped`
+        climbs, `_note_drop` warns) with no way to recover short of a restart.
+        The ring-side twin of the engine's `_reconcile_stalled_deferred_saves`,
+        and it takes that reconciler's window so the two cannot drift.
 
-        Safety mirrors that reconciliation: `timeout_s` must be larger than the
-        upstream (LMCache pin-monitor) abandon window, so the worker's staging
-        buffer for this slot is no longer being read before the slot -- and thus
-        the buffer -- is handed to a new spill. Caller passes the same abandon
-        timeout used engine-side. Self-throttled to one real scan per
-        `_RECLAIM_SCAN_INTERVAL_S`, so it is safe to call every step.
+        **Only slots the spill queue has let go are eligible.** A slot still in
+        `_pending` has not been drained by `BlockManager.state_spills_for_batch`
+        yet, and that method drains `take_pending()` and the pool's
+        `take_spill_copies()` in one call -- so a slot in `_pending` still has a
+        `(group, slot)` copy queued on `StateGroupPool`. Returning it would let
+        a new spill reserve the same slot, and the two copies would then race
+        for the single `{slot: hash}` entry the drain builds: the loser is
+        reported as "a copy with no pending hash" and releases the slot out from
+        under the winner. Skipping those costs nothing -- an undrained spill
+        means the engine has not run a batch, which is what
+        `_reconcile_stalled_deferred_saves` is busy fixing; the slot becomes
+        eligible on the next scan once the batch drains it.
 
-        A reclaimed slot's `_pending` entry (if it was never drained) is dropped
-        too: its hash was never confirmed, so nothing indexed it and no load can
-        ask for it. Returns the number of slots reclaimed this call.
+        Safety otherwise mirrors the engine-side reconciliation: `timeout_s` is
+        past the upstream force-unpin window, so the worker's staging buffer is
+        no longer being read before the slot is handed to a new spill.
+        Self-throttled to one real scan per `_RECLAIM_SCAN_INTERVAL_S`, so it is
+        safe to call every step. Returns the number of slots reclaimed.
         """
         if timeout_s <= 0 or not self._slot_reserved_at:
             return 0
@@ -181,19 +188,14 @@ class StateOffloadIndex:
         if now < self._next_reclaim_at:
             return 0
         self._next_reclaim_at = now + _RECLAIM_SCAN_INTERVAL_S
+        queued = {slot for _h, slot in self._pending}
         stale = [
             slot
             for slot, at in self._slot_reserved_at.items()
-            if now - at >= timeout_s
+            if now - at >= timeout_s and slot not in queued
         ]
         if not stale:
             return 0
-        stale_set = set(stale)
-        # Drop any still-queued pending entries for the stale slots; whatever is
-        # left is a live spill still waiting to be drained this step.
-        kept = [(h, slot) for (h, slot) in self._pending if slot not in stale_set]
-        self._pending.clear()
-        self._pending.extend(kept)
         for slot in stale:
             self._slot_reserved_at.pop(slot, None)
             if 0 <= slot < self.staging_depth and slot not in self._free_slots:
@@ -291,6 +293,10 @@ class StateOffloadIndex:
             "loads_completed": self.loads_completed,
             "loads_failed": self.loads_failed,
             "indexed": len(self.hashes),
+            # Slots `reclaim_stale_slots` had to take back. Non-zero means spill
+            # reports are being lost, which the warning says once and this keeps
+            # saying; without it the only symptom is a throughput cliff.
+            "slots_reclaimed": self._slots_reclaimed,
         }
 
 

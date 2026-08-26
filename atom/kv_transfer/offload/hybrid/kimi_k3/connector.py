@@ -377,6 +377,12 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler):
         would let the next request write into them mid-transfer and index the
         result under this prefix's hash. One never handed out has no reader,
         and holding it is what turns a stopped backend into a stopped engine.
+
+        That leaves the handed-out save with no way out, which is what
+        `Scheduler._reconcile_stalled_deferred_saves` covers, on a longer clock
+        tied to LMCache's own force-unpin window. Neither mechanism subsumes the
+        other: this one asks whether the backend ever took the save, that one
+        whether it ever answered.
         """
         sid = str(seq.id)
         if self._save_stalled and sid not in self._save_inflight:
