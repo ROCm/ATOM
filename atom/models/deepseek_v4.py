@@ -2922,17 +2922,9 @@ class DeepseekV4Attention(nn.Module):
                 x, qr, positions, qr_scale
             )
 
-        # Both narrow modes, not just AF: pull the fused QK-norm/RoPE into THIS
-        # piece through an op Dynamo will not trace into. It is token-shaped
-        # (`T_tok = q.shape[0]`), so a num_tokens-keyed dense piece holds it
-        # correctly whether or not the split op is also captured -- and
-        # under plain PIECEWISE that moves it out of the eager gap for free.
-        #
-        # AF is NOT a different structure. The split is by granularity and is
-        # the same either way; the only difference is whether the batch-shaped
-        # core gets its own graph, which is `capture=self.attn_ffn_piecewise`
-        # inside `piecewise_core` and nothing here. Gating this on AF left plain
-        # PIECEWISE with no QK-norm at all and a None Q in the paged attention.
+        # Both narrow modes: QK-norm/RoPE is token-shaped, so a num_tokens-keyed
+        # piece holds it either way. AF differs only in `capture`, inside
+        # `piecewise_core`; gating this on it left PIECEWISE with a None Q.
         # (q_sa, kv, q_packed, q_rope, k_packed, k_rope)
         paged: tuple[torch.Tensor | None, ...] = (None,) * 6
         if run_indexer_proj:
@@ -2946,14 +2938,9 @@ class DeepseekV4Attention(nn.Module):
             # Consumed. Dropping them is what keeps the captured core from
             # holding an input it no longer reads.
             q = kv_pre = None
-            # `qr`/`qr_scale` are DEAD on this path, and were before this change:
-            # the core's only use of them is the `self.indexer.topk(...)` call,
-            # and `topk` short-circuits to `score_topk_from` whenever
-            # `pre_q_quant` is given. On the narrow split `idx_q_quant` is
-            # non-None under exactly the condition that gates that call
-            # (`indexer is not None and not skip_topk`), so either the call does
-            # not happen or it does not reach them. Passing None takes two more
-            # tensors out of the captured core's zero-copy set for free.
+            # `qr`/`qr_scale` are dead downstream: `indexer.topk` short-circuits
+            # past them whenever `idx_q_quant` is given, and where it is not
+            # there is no indexer to call.
             qr = qr_scale = None
         return (
             q,
