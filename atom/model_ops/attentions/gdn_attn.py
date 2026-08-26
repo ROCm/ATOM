@@ -5,6 +5,7 @@ import logging
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -33,7 +34,31 @@ from .paged_state_copy import (
 )
 from .sub_pool_spec import SubPoolSpec, page_pool, state_pool
 
+if TYPE_CHECKING:
+    from atom.kv_transfer.disaggregation.types import KVTransferRegion
+
 logger = logging.getLogger("atom")
+
+
+def slot_indexed_caches(runner, replayssm: bool) -> list[torch.Tensor]:
+    """The `(layer, slot, ...)` caches that together hold one slot's state.
+
+    `relocate_state_slots` moves exactly these, and `state_slot_regions`
+    describes exactly these; anything added to the pool belongs here so that
+    neither can be extended without the other.
+
+    Takes the runner rather than the builder so that both callers reach it the
+    same way whether or not they are bound: the state tests drive those two
+    methods unbound, against a stub that has the caches but no methods.
+    """
+    caches = [runner.mamba_k_cache, runner.mamba_v_cache]
+    if replayssm:
+        caches += [
+            runner.replayssm_buf_k,
+            runner.replayssm_buf_u,
+            runner.replayssm_buf_g,
+        ]
+    return caches
 
 
 class GDNAttentionBackend(AiterBackend):
@@ -906,6 +931,64 @@ class GDNStateMixin:
                 views.append(cache[layer, slot : slot + 1])
         return views
 
+    def state_slot_regions(self) -> tuple[list["KVTransferRegion"], int]:
+        """RDMA regions for the state pool, addressed by state slot.
+
+        The third view of the bytes `relocate_state_slots` moves and
+        `state_entry_views` names, for the one consumer that needs neither a
+        copy nor a view but an address: a peer's NIC.
+
+        One region per (cache, layer), not per cache. A region resolves an
+        index as `base + slot * unit`, so a slot's bytes must be contiguous
+        and evenly strided -- true within a layer, false across them, since
+        every cache is `(layer, slot) + state_shape` and a slot's rows are a
+        layer-stride apart.
+
+        Returns the regions and the pool's slot count. The count is the
+        allocated width, not the live request count: it is what makes a
+        region's extent, and both ends compute addresses from it.
+        """
+        from atom.kv_transfer.disaggregation.types import KVTransferRegion
+
+        caches = slot_indexed_caches(self.model_runner, self.replayssm)
+        num_slots = caches[0].shape[1]
+        regions: list[KVTransferRegion] = []
+        for cache in caches:
+            assert cache.is_contiguous(), (
+                "slot-indexed state cache must be contiguous: a transfer "
+                "region addresses a slot as base + slot * unit_bytes"
+            )
+            assert cache.shape[1] == num_slots, (
+                f"state caches disagree on slot count: {cache.shape[1]} != "
+                f"{num_slots}; one slot index has to address all of them"
+            )
+            slot_bytes = cache[0, 0].numel() * cache.element_size()
+            layer_bytes = num_slots * slot_bytes
+            for layer in range(cache.shape[0]):
+                regions.append(
+                    KVTransferRegion(
+                        base_addr=cache.data_ptr() + layer * layer_bytes,
+                        total_bytes=layer_bytes,
+                        unit_bytes=slot_bytes,
+                    )
+                )
+
+        if self.replayssm:
+            # The cursor has no layer axis -- one int32 per slot, shared by
+            # every layer -- so the whole tensor is a single region whose unit
+            # is one element. Without it the records above are unreadable: the
+            # reader cannot tell which of them the sequence has committed.
+            pos = self.model_runner.replayssm_write_pos
+            regions.append(
+                KVTransferRegion(
+                    base_addr=pos.data_ptr(),
+                    total_bytes=pos.numel() * pos.element_size(),
+                    unit_bytes=pos.element_size(),
+                )
+            )
+
+        return regions, num_slots
+
     def relocate_state_slots(self, pairs: Sequence[tuple[int, int]]) -> None:
         """Relocate a live GDN state slot between Active Slot positions.
 
@@ -931,17 +1014,13 @@ class GDNStateMixin:
         range to copy. `_foreach_copy_` keeps it to one launch for the batch.
         The cursor is the exception — one entry per slot, no layer axis.
         """
-        caches = [self.model_runner.mamba_k_cache, self.model_runner.mamba_v_cache]
+        runner = self.model_runner
+        caches = slot_indexed_caches(runner, self.replayssm)
         cursor = None
         if self.replayssm:
-            caches += [
-                self.model_runner.replayssm_buf_k,
-                self.model_runner.replayssm_buf_u,
-                self.model_runner.replayssm_buf_g,
-            ]
             # One entry per slot, no layer axis -- moved alongside, not with
             # the layer-major caches above.
-            cursor = self.model_runner.replayssm_write_pos
+            cursor = runner.replayssm_write_pos
         destinations, sources = [], []
         for src, dst in pairs:
             for cache in caches:

@@ -456,6 +456,69 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
 
         return None
 
+    def get_kv_transfer_tensors(self):
+        """The MLA base's block regions, plus the KDA state pool it omits.
+
+        This backend's cache is in two halves and the base class describes one:
+        the full-attention layers sit in the paged pool it walks, the KDA
+        layers in the slot-indexed recurrent-state pool `build_kv_cache_tensor`
+        tags `per_request_state=True`. A request's KDA state is not derivable
+        from its MLA blocks, so shipping only the base's answer would leave
+        decode running most of the model on a zeroed state -- fluently, and
+        with nothing downstream able to tell. The connector transfers whatever
+        regions it is handed and reports success either way, which is why the
+        two halves have to be joined here rather than checked later.
+
+        Joined in this class rather than in `GDNStateMixin` because only a
+        hybrid has a base answer to extend; the pure-GDN backends own no block
+        regions. The slot half itself comes from the mixin, next to the other
+        two methods that name the same bytes.
+        """
+        from atom.kv_transfer.disaggregation.factory import resolve_pd_backend
+
+        tensors = super().get_kv_transfer_tensors()
+        if tensors is None:
+            return None
+
+        # A non-empty `kv_transfer_config` alone does not mean disaggregation:
+        # the aggregated LMCache offload tier configures one too, and it reads
+        # the state pool through `state_backend` instead of through regions.
+        connector = resolve_pd_backend(self.model_runner.config.kv_transfer_config)
+        if connector is None:
+            return tensors
+
+        config = self.model_runner.config
+        model_type = config.hf_config.model_type
+
+        if connector != "mooncake":
+            raise NotImplementedError(
+                f"{model_type} disaggregated serving requires the mooncake "
+                f"connector, but kv_connector={connector!r} is configured. Only "
+                "mooncake transfers the slot-indexed regions the KDA recurrent "
+                f"state lives in; every other connector would move the "
+                f"{len(self.mla_idx_by_layer)} full-attention layers and "
+                f"silently drop the state of the other "
+                f"{len(self.kda_idx_by_layer)}. Set "
+                'kv_transfer_config["kv_connector"] = "mooncake".'
+            )
+
+        if getattr(config, "pipeline_parallel_size", 1) > 1:
+            # `_consumer_region_map` shifts a stage's regions onto the peer's
+            # list group-major over `num_hidden_layers`. The slot regions below
+            # are group-major over the KDA layers only, a shorter axis, so the
+            # shift would land them on the wrong peer regions -- writing one
+            # layer's state over another's rather than failing.
+            raise NotImplementedError(
+                f"{model_type} disaggregated serving does not support pipeline "
+                f"parallelism (pipeline_parallel_size="
+                f"{config.pipeline_parallel_size}): the KDA state regions are "
+                "keyed by KDA layer index, which `_consumer_region_map` cannot "
+                "align across stages. Run the P and D instances with PP=1."
+            )
+
+        tensors.slot_regions, tensors.num_slots = self.state_slot_regions()
+        return tensors
+
     def prepare_prefill(self, batch: ScheduledBatch, running_bs: int):
         attn_metadata, positions = super().prepare_prefill(batch, running_bs)
         if batch.block_tables == []:
