@@ -936,6 +936,83 @@ class ModelRunner:
             config.parallel_config.data_parallel_master_ip,
             config.parallel_config.data_parallel_base_port,
         )
+        # Before init_dist_env, not after: MoRI reads its heap settings when the
+        # heap is created, inside the first collective.
+        from atom.model_engine.topology import (
+            WideEPTopology,
+            format_startup_summary,
+            node_count,
+        )
+        from atom.model_ops.fused_moe.mori_env import apply_mori_env
+
+        nnodes = node_count(config)
+        mori_env = apply_mori_env(nnodes=nnodes)
+
+        # weight_iterator splits the prefetch by node, because page cache is
+        # per node. It reads these, and without them falls back to (0, 1) --
+        # every rank prefetching the whole checkpoint -- as soon as the world
+        # is wider than the visible devices, which is every multi-node run.
+        # An external launcher that already set them knows better than we do.
+        if nnodes > 1:
+            topo = WideEPTopology.from_config(config)
+            os.environ.setdefault("LOCAL_RANK", str(local_device_rank))
+            os.environ.setdefault("LOCAL_WORLD_SIZE", str(topo.gpu_per_node))
+        if nnodes > 1:
+            logger.info(
+                format_startup_summary(
+                    WideEPTopology.from_config(config),
+                    dp_rank=config.parallel_config.data_parallel_rank,
+                    dp_rank_local=dp_rank_local,
+                    device_rank=local_device_rank,
+                    visible_devices=os.environ.get("HIP_VISIBLE_DEVICES")
+                    or os.environ.get("CUDA_VISIBLE_DEVICES"),
+                    mori_env=mori_env,
+                )
+            )
+
+        # aiter's init_dist_env calls init_process_group with no timeout, so the
+        # NCCL world is the one barrier we cannot bound from the call site.
+        # init_distributed_environment skips creation when a world already
+        # exists (aiter dist/parallel_state.py), so build it here instead, with
+        # the same rank arithmetic it would have used.
+        #
+        # Opt-in: multi-node AND an explicit --dp-sync-timeout. Nothing about
+        # the single-node path changes, and a multi-node run that did not ask
+        # for a bound keeps today's behaviour rather than silently taking a new
+        # init path that no single-node test covers.
+        if (
+            nnodes > 1
+            and config.parallel_config.dp_sync_timeout is not None
+            and pp_size == 1
+            and not torch.distributed.is_initialized()
+        ):
+            global_world = config.parallel_config.data_parallel_size * stage_span
+            global_rank = (
+                config.parallel_config.data_parallel_rank * stage_span + rank
+            )
+            if "HIP_VISIBLE_DEVICES" not in os.environ:
+                # aiter would have set it to range(world_size) here, which is
+                # wrong past one node -- a 16-rank world does not mean 16 local
+                # devices. Creating the world ourselves skips that, so say so.
+                logger.warning(
+                    "HIP_VISIBLE_DEVICES is unset on a %d-node run; the "
+                    "launcher should pin this node's devices explicitly.",
+                    nnodes,
+                )
+            logger.info(
+                "[wideep] pre-creating the torch world: rank=%d/%d timeout=%s",
+                global_rank,
+                global_world,
+                config.parallel_config.dp_sync_timeout,
+            )
+            torch.distributed.init_process_group(
+                backend="nccl",
+                init_method=distributed_init_method,
+                world_size=global_world,
+                rank=global_rank,
+                timeout=config.parallel_config.dp_sync_timeout,
+            )
+
         # Both branches handle simulated TP: the PP path only to reject it,
         # since it would otherwise deadlock on a group sized for absent ranks.
         if config.pipeline_parallel_size > 1:
@@ -1701,14 +1778,41 @@ class ModelRunner:
         # result back into the plan before publishing anything: the plan is the
         # single source for every entry count, so it must never disagree with
         # the number the pool is actually built at.
+        #
+        # Multi-node needs the same reduction for a different reason. Under
+        # DP-attention each rank owns its own BlockManager, so unequal counts do
+        # not corrupt anything -- the tighter rank simply preempts and recomputes
+        # sooner while the rest idle waiting for it. Nodes rarely have byte-equal
+        # free memory, and ATOM logs no preemption, so the only trace of this is
+        # a throughput number that is lower than it should be for no visible
+        # reason. Levelling costs the difference in blocks; not levelling costs
+        # a diagnosis.
+        from atom.model_engine.topology import node_count
+
         num_kvcache_blocks = plan.paged_entries
-        if config.pipeline_parallel_size > 1 and torch.distributed.is_initialized():
+        level_blocks = config.pipeline_parallel_size > 1 or node_count(config) > 1
+        if level_blocks and torch.distributed.is_initialized():
             t = torch.tensor(
                 [num_kvcache_blocks], dtype=torch.int64, device=self.device
             )
+            local_blocks = num_kvcache_blocks
             torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN)
             num_kvcache_blocks = int(t.item())
             plan = plan.with_paged_entries(num_kvcache_blocks)
+            if local_blocks != num_kvcache_blocks:
+                logger.warning(
+                    "[wideep] KV pool levelled down: this rank sized %d blocks, "
+                    "the group's minimum is %d. Every rank now runs at the "
+                    "tightest one; %d blocks of this GPU go unused.",
+                    local_blocks,
+                    num_kvcache_blocks,
+                    local_blocks - num_kvcache_blocks,
+                )
+            else:
+                logger.info(
+                    "[wideep] KV pool blocks=%d, equal to the group minimum",
+                    num_kvcache_blocks,
+                )
 
         block_bytes = plan.entry_bytes[plan.paged_class]
         # The whole plan travels to the engine process; BlockManager, the

@@ -888,6 +888,114 @@ def _select_source_rank_for_receiver(
     return _assign_sender_for_receiver(ranks_to_send, ranks_to_recv, recv_rank)
 
 
+@dataclass(frozen=True)
+class MigrationCost:
+    """What a planned rearrange will move, split at the node boundary."""
+
+    transfers: int
+    cross_node_transfers: int
+    bytes_per_expert: int
+
+    @property
+    def cross_node_bytes(self) -> int:
+        return self.cross_node_transfers * self.bytes_per_expert
+
+    @property
+    def total_bytes(self) -> int:
+        return self.transfers * self.bytes_per_expert
+
+    def cross_node_stall_ms(self, bandwidth_gbps: float) -> float:
+        """Time to move the cross-node bytes at an assumed link bandwidth.
+
+        Intra-node transfers are excluded: over XGMI they are roughly an order
+        of magnitude cheaper and are not what the guard is protecting against.
+        """
+        if bandwidth_gbps <= 0:
+            return float("inf")
+        return self.cross_node_bytes / (bandwidth_gbps * 1e9) * 1e3
+
+
+def count_migration_transfers(
+    *,
+    old_p2l: torch.Tensor,
+    new_p2l: torch.Tensor,
+    num_local_physical_experts: int,
+    num_gpu_per_node: int,
+) -> tuple[int, int]:
+    """``(transfers, cross_node_transfers)`` for a whole rearrange.
+
+    Exact rather than estimated: it applies the same recv rule as
+    ``_plan_single_layer_migration`` (one P2P per rank/logical the rank gains
+    and did not already hold) and the same source selection, but derives them
+    once from the global maps instead of replaying per-rank planning
+    ``world_size`` times. ``test_migration_cost_matches_planner`` pins the two
+    together so the shortcut cannot drift.
+
+    Every rank computes the same answer -- the maps are identical across ranks
+    -- so a decision taken on this needs no collective to stay consistent.
+    """
+    assert old_p2l.shape == new_p2l.shape
+    num_layers, num_physical = old_p2l.shape
+    assert num_local_physical_experts > 0
+    assert num_physical % num_local_physical_experts == 0
+    world_size = num_physical // num_local_physical_experts
+    assert num_gpu_per_node > 0 and world_size % num_gpu_per_node == 0
+
+    old_rows = old_p2l.cpu().tolist()
+    new_rows = new_p2l.cpu().tolist()
+    transfers = 0
+    cross_node = 0
+
+    for layer in range(num_layers):
+        old_l = old_rows[layer]
+        new_l = new_rows[layer]
+
+        # Ascending rank order, matching the planner: _assign_sender_for_receiver
+        # indexes into these lists, so their order is part of the contract.
+        holders: dict[int, list[int]] = {}
+        seen: dict[int, set[int]] = {}
+        for gslot in range(num_physical):
+            logical = old_l[gslot]
+            if logical < 0:
+                continue
+            r = gslot // num_local_physical_experts
+            if logical not in holders:
+                holders[logical] = []
+                seen[logical] = set()
+            if r not in seen[logical]:
+                holders[logical].append(r)
+                seen[logical].add(r)
+
+        recv_by_logical: dict[int, list[int]] = {}
+        for r in range(world_size):
+            rbase = r * num_local_physical_experts
+            old_r = old_l[rbase : rbase + num_local_physical_experts]
+            new_r = new_l[rbase : rbase + num_local_physical_experts]
+            old_set = {x for x in old_r if x >= 0}
+            for logical in sorted({x for x in new_r if x >= 0} - old_set):
+                recv_by_logical.setdefault(logical, []).append(r)
+
+        for logical, recv_ranks in recv_by_logical.items():
+            send_ranks = holders.get(logical)
+            if not send_ranks:
+                # The planner asserts here; counting must not be the thing that
+                # raises, or the guard turns a bad plan into a crash.
+                continue
+            recv_node = [r // num_gpu_per_node for r in recv_ranks]
+            for r, node in zip(recv_ranks, recv_node):
+                src = _select_source_rank_for_receiver(
+                    ranks_to_send=send_ranks,
+                    ranks_to_recv=recv_ranks,
+                    recv_rank=r,
+                    num_gpu_per_node=num_gpu_per_node,
+                )
+                transfers += 1
+                if src // num_gpu_per_node != node:
+                    cross_node += 1
+
+    return transfers, cross_node
+
+
 def _effective_p2p_chunk_size(*, requested: int, num_logical_experts: int) -> int:
     if num_logical_experts <= 1:
         return 1
@@ -1661,6 +1769,12 @@ class EPLBManager:
         self._nnodes: int = 1
         self._rebalance_layers_per_chunk: int = 64
         self._p2p_batch_chunk_size: int = 32
+        self._max_migration_stall_ms: float = 0.0
+        self._migration_bandwidth_gbps: float = 50.0
+        # Cumulative, so a guard that is quietly suppressing every rebalance is
+        # visible in the log rather than looking like EPLB having nothing to do.
+        self._skipped_rebalances: int = 0
+        self._skipped_cross_node_bytes: int = 0
         # True iff the DP group == the migration (EP) group. When True the DP
         # sync's `any_rank_has_prefill` already spans exactly the migration
         # collective, so the prefill gate reuses it for free (no extra collective).
@@ -1799,26 +1913,52 @@ class EPLBManager:
                 "manager-owned runtime metadata cannot safely rebalance"
             ) from exc
 
-        try:
-            from atom.config import get_current_atom_config
+        # Node count for hierarchical placement. Deliberately outside the
+        # best-effort block below: a wrong value silently spreads expert groups
+        # across nodes and makes every rebalance pay avoidable inter-node
+        # traffic, so it fails loud instead of defaulting to 1.
+        from atom.config import get_current_atom_config
+        from atom.model_engine.topology import WideEPTopology, node_count
 
-            cfg = get_current_atom_config().eplb_config
+        atom_config = get_current_atom_config()
+        self._nnodes = node_count(atom_config)
+        if not atom_config.dp_logical_size:
+            # Skipped while simulating, where the two legitimately disagree.
+            topo = WideEPTopology.from_config(atom_config)
+            if topo.ep_size != ep_size:
+                raise RuntimeError(
+                    f"EPLB ep_size ({ep_size}) disagrees with the topology "
+                    f"({topo.ep_size}); hierarchical placement would partition "
+                    f"the wrong rank set. {topo.describe()}"
+                )
+
+        try:
+            cfg = atom_config.eplb_config
             self._rebalance_layers_per_chunk = int(
                 getattr(cfg, "rebalance_layers_per_chunk", 64)
             )
             self._p2p_batch_chunk_size = int(getattr(cfg, "p2p_batch_chunk_size", 32))
+            self._max_migration_stall_ms = float(
+                getattr(cfg, "max_migration_stall_ms", 0.0)
+            )
+            self._migration_bandwidth_gbps = float(
+                getattr(cfg, "migration_bandwidth_gbps", 50.0)
+            )
         except Exception:  # noqa: BLE001 - optional eplb_config, fall back to defaults
             self._rebalance_layers_per_chunk = 64
             self._p2p_batch_chunk_size = 32
+            self._max_migration_stall_ms = 0.0
+            self._migration_bandwidth_gbps = 50.0
 
         logger.info(
             "EPLB runtime initialized: layers=%d num_logical=%d "
-            "num_physical=%d ep_size=%d ep_rank=%d",
+            "num_physical=%d ep_size=%d ep_rank=%d nnodes=%d",
             len(layers),
             num_logical,
             num_physical,
             ep_size,
             ep_rank,
+            self._nnodes,
         )
         self.monitor.initialize_for_metadata(self.live_metadata)
         # Initialize redundant physical slots the checkpoint loader left empty.
@@ -2176,6 +2316,11 @@ class EPLBManager:
             max_num_replicas=self.live_metadata.max_num_replicas,
         )
 
+        cost = self._migration_cost(new_p2l=p2l)
+        stall_ms = cost.cross_node_stall_ms(self._migration_bandwidth_gbps)
+        if self._skip_for_migration_cost(rc=_rc, cost=cost, stall_ms=stall_ms):
+            return
+
         chunk_size = max(1, int(self._rebalance_layers_per_chunk))
         layer_ids = sorted(self._moe_layers)
         num_chunks = (len(layer_ids) + chunk_size - 1) // chunk_size
@@ -2228,6 +2373,83 @@ class EPLBManager:
                 chunk,
                 _chunk_ms,
             )
+
+    def _migration_cost(self, *, new_p2l: torch.Tensor) -> MigrationCost:
+        """What moving to ``new_p2l`` would transfer, from the global maps."""
+        assert self.live_metadata is not None
+        num_local = int(self.live_metadata.num_local_physical_experts)
+        ep_size = int(self.live_metadata.ep_size)
+        first = min(self._expert_weights_of_layer)
+        bytes_per_expert = sum(
+            w.numel() // w.shape[0] * w.element_size()
+            for w in self._expert_weights_of_layer[first]
+        )
+        transfers, cross_node = count_migration_transfers(
+            old_p2l=self.live_metadata.physical_to_logical_map,
+            new_p2l=new_p2l,
+            num_local_physical_experts=num_local,
+            num_gpu_per_node=ep_size // self._nnodes,
+        )
+        return MigrationCost(
+            transfers=transfers,
+            cross_node_transfers=cross_node,
+            bytes_per_expert=bytes_per_expert,
+        )
+
+    def _skip_for_migration_cost(
+        self, *, rc: int, cost: MigrationCost, stall_ms: float
+    ) -> bool:
+        """Whether the cross-node cost of this rearrange is worth paying.
+
+        Every rank derives the same maps, so every rank reaches the same verdict
+        without a collective -- which matters, since half the ranks migrating
+        while the other half skip would leave the placement inconsistent.
+        """
+        _mib = 1024.0 * 1024.0
+        if self._max_migration_stall_ms <= 0:
+            logger.info(
+                "EPLB rebalance #%d migration: %d transfers (%d cross-node), "
+                "%.0f MiB (%.0f MiB cross-node, ~%.0fms at %.0f GB/s); no cap set",
+                rc,
+                cost.transfers,
+                cost.cross_node_transfers,
+                cost.total_bytes / _mib,
+                cost.cross_node_bytes / _mib,
+                stall_ms,
+                self._migration_bandwidth_gbps,
+            )
+            return False
+
+        if stall_ms <= self._max_migration_stall_ms:
+            logger.info(
+                "EPLB rebalance #%d migration: %d transfers (%d cross-node), "
+                "%.0f MiB (%.0f MiB cross-node, ~%.0fms) within %.0fms cap",
+                rc,
+                cost.transfers,
+                cost.cross_node_transfers,
+                cost.total_bytes / _mib,
+                cost.cross_node_bytes / _mib,
+                stall_ms,
+                self._max_migration_stall_ms,
+            )
+            return False
+
+        self._skipped_rebalances += 1
+        self._skipped_cross_node_bytes += cost.cross_node_bytes
+        logger.warning(
+            "EPLB rebalance #%d SKIPPED: %d cross-node transfers would move "
+            "%.0f MiB (~%.0fms at %.0f GB/s) over the %.0fms cap. Placement is "
+            "unchanged. Cumulative: %d rebalance(s) skipped, %.0f MiB not moved",
+            rc,
+            cost.cross_node_transfers,
+            cost.cross_node_bytes / _mib,
+            stall_ms,
+            self._migration_bandwidth_gbps,
+            self._max_migration_stall_ms,
+            self._skipped_rebalances,
+            self._skipped_cross_node_bytes / _mib,
+        )
+        return True
 
     def _log_rebalance_metrics(
         self, *, rc: int, logical_load: torch.Tensor, logcnt: torch.Tensor

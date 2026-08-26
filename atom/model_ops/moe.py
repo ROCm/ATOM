@@ -298,6 +298,8 @@ class FusedMoEParallelConfig:
         # parallel update tp_size, tp_rank, ep_size and ep_rank to reflect that.
         ep_size = tp_size
         ep_rank = tp_rank
+        local_ep_size = atom_config.parallel_config.data_parallel_size_local * tp_size_
+        _assert_gpu_per_node(atom_config, ep_size=ep_size, gpu_per_node=local_ep_size)
         return FusedMoEParallelConfig(
             tp_size=1,
             tp_rank=0,
@@ -310,8 +312,35 @@ class FusedMoEParallelConfig:
             dp_logical_ratio=(
                 dp_logical // dp_size if flatten_tp_across_dp_for_moe else 1
             ),
-            local_ep_size=atom_config.parallel_config.data_parallel_size_local
-            * tp_size_,
+            local_ep_size=local_ep_size,
+        )
+
+
+def _assert_gpu_per_node(atom_config, *, ep_size: int, gpu_per_node: int) -> None:
+    """Check the value that reaches MoRI as ``gpu_per_node``.
+
+    InterNodeV1 derives its RDMA and XGMI peer targets from it, so a wrong
+    value does not raise -- it addresses the wrong ranks. Before #1603 it was 1
+    on every run and nothing noticed, because the intra-node kernel does not
+    consult it. That is the argument for checking rather than trusting.
+
+    Only meaningful under DP-attention: that is the case where every rank joins
+    one EP group, so the group has to partition evenly into nodes. Without it
+    EP spans a TP group and there are dp_size independent groups, and the
+    identity does not hold.
+    """
+    if not atom_config.enable_dp_attention:
+        return
+    from atom.model_engine.topology import node_count
+
+    nnodes = node_count(atom_config)
+    if ep_size % gpu_per_node or ep_size // gpu_per_node != nnodes:
+        raise ValueError(
+            f"gpu_per_node={gpu_per_node} does not partition ep_size={ep_size} "
+            f"into {nnodes} node(s). MoRI takes this as the node width and "
+            f"computes peer targets from it, so a wrong value reaches the "
+            f"wrong ranks instead of failing. Check "
+            f"data_parallel_size_local against the GPUs this node actually has."
         )
 
 

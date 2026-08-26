@@ -74,7 +74,12 @@ def init_gloo_process_group(
 
 
 def stateless_init_torch_distributed_process_group(
-    host: str, port: int, rank: int, world_size: int, backend: str
+    host: str,
+    port: int,
+    rank: int,
+    world_size: int,
+    backend: str,
+    timeout: timedelta | None = None,
 ) -> ProcessGroup:
     """
     A replacement for `torch.distributed.init_process_group` that does not
@@ -106,10 +111,16 @@ def stateless_init_torch_distributed_process_group(
     are the same as process 1 and 5, the main communication channel is
     always formed with process 1, 2, ..., 8, and the additional communication
     channel is formed with process 9 and 10.
+
+    ``timeout`` bounds the rendezvous, the store, and the group handshake.
+    ``None`` keeps the backend default, so single-node behaviour is unchanged;
+    a shorter value is what turns "the other node never started" from an
+    indefinite hang into an error naming the group that did not form.
     """
     init_method = get_tcp_uri(host, port)
     backend = Backend(backend)  # it is basically string
-    timeout = _get_default_timeout(backend)
+    if timeout is None:
+        timeout = _get_default_timeout(backend)
 
     store, rank, world_size = next(
         rendezvous(init_method, rank, world_size, timeout=timeout)

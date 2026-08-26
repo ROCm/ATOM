@@ -47,6 +47,7 @@ class EngineArgs:
     data_parallel_master_ip: str = "127.0.0.1"
     data_parallel_master_port: int = 29500
     data_parallel_base_port: int | None = None
+    dp_sync_timeout_s: float | None = None
     enforce_eager: bool = False
     enable_prefix_caching: bool = True
     port: int = 8006
@@ -182,6 +183,18 @@ class EngineArgs:
             help=(
                 "Rendezvous port for model-runner distributed init. Set "
                 "explicitly for multi-node launches."
+            ),
+        )
+        parser.add_argument(
+            "--dp-sync-timeout",
+            type=float,
+            default=None,
+            dest="dp_sync_timeout_s",
+            help=(
+                "Seconds to wait on DP rendezvous and collectives before "
+                "failing. Default is the backend's (~30 min for gloo). Set it "
+                "for multi-node: a peer that never starts otherwise blocks "
+                "every barrier indefinitely with nothing logged."
             ),
         )
         parser.add_argument(
@@ -688,6 +701,7 @@ class EngineArgs:
         base_port = kwargs.pop("data_parallel_base_port")
         if base_port is not None:
             parallel_config_kwargs["data_parallel_base_port"] = base_port
+        parallel_config_kwargs["dp_sync_timeout_s"] = kwargs.pop("dp_sync_timeout_s")
         kwargs["parallel_config"] = ParallelConfig(**parallel_config_kwargs)
 
         logger.info(f"Engine kwargs: {kwargs}")

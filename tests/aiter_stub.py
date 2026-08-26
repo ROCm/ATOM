@@ -17,7 +17,12 @@ def stubbed_aiter():
     afterwards, so it is removed as soon as the engine classes are bound.
     """
     installed = []
-    for name in ("aiter", "aiter.dist", "aiter.dist.shm_broadcast"):
+    for name in (
+        "aiter",
+        "aiter.dist",
+        "aiter.dist.shm_broadcast",
+        "aiter.dist.parallel_state",
+    ):
         if name in sys.modules:
             continue
         module = types.ModuleType(name)

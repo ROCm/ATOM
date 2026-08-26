@@ -8,6 +8,7 @@ import multiprocessing.shared_memory
 import os
 import pickle
 import queue
+import time
 import weakref
 from dataclasses import dataclass
 from threading import Lock, Thread
@@ -436,7 +437,12 @@ class CoreManager:
                     self.output_sockets.append(output_socket)
                     self.shutdown_paths.append(get_open_zmq_inproc_path())
 
-                self._wait_for_all_ready_signals()
+                self._wait_for_all_ready_signals(
+                    timeout_s=(
+                        pc.dp_sync_timeout_s if multinode else None
+                    ),
+                    engines_per_node=local_engine_count,
+                )
                 logger.info(
                     f"{self.label}: All EngineCores are fully initialized and ready"
                 )
@@ -477,8 +483,17 @@ class CoreManager:
         self._output_handler_task = None
         self._asyncio_mode = config.asyncio_mode
 
-    def _wait_for_all_ready_signals(self):
-        """Wait for READY signals from all DP ranks in parallel (no timeout)."""
+    def _wait_for_all_ready_signals(
+        self, *, timeout_s: float | None = None, engines_per_node: int | None = None
+    ):
+        """Wait for READY from every engine.
+
+        Unbounded is right on one node: the engines are this process's children
+        and their death shows up other ways. Across nodes the usual failure is
+        that the other node was never started, or was pointed at a different
+        master, and it presents here as a wait that never ends and never logs a
+        thing -- the hardest shape of failure to attribute.
+        """
         poller = zmq.Poller()
         for dp_rank, output_socket in enumerate(self.output_sockets):
             poller.register(output_socket, zmq.POLLIN)
@@ -486,9 +501,20 @@ class CoreManager:
         engine_count = len(self.output_sockets)
         ready_received = [False] * engine_count
         remaining = engine_count
+        deadline = None if timeout_s is None else time.monotonic() + timeout_s
 
         while remaining > 0:
-            socks = poller.poll()  # Wait indefinitely
+            if deadline is None:
+                socks = poller.poll()  # Wait indefinitely
+            else:
+                left_ms = int((deadline - time.monotonic()) * 1000)
+                socks = poller.poll(timeout=max(0, left_ms))
+                if not socks:
+                    raise TimeoutError(
+                        self._ready_timeout_message(
+                            ready_received, timeout_s, engines_per_node
+                        )
+                    )
             if not socks:
                 continue
 
@@ -515,6 +541,38 @@ class CoreManager:
                     raise RuntimeError(
                         f"{self.label}: Expected READY signal from DP rank {dp_rank}, but got {request_type}"
                     )
+
+    def _ready_timeout_message(
+        self,
+        ready_received: list[bool],
+        timeout_s: float,
+        engines_per_node: int | None,
+    ) -> str:
+        """Name the engines that never reported, grouped by the node they sit on.
+
+        Which node is missing is the whole diagnosis here, and the coordinator
+        is the only process that can see it -- the engines that did come up are
+        blocked on the same barrier and have nothing to say.
+        """
+        missing = [i for i, ok in enumerate(ready_received) if not ok]
+        if engines_per_node:
+            by_node: dict[int, list[int]] = {}
+            for rank in missing:
+                by_node.setdefault(rank // engines_per_node, []).append(rank)
+            where = "; ".join(
+                f"node {node}: dp ranks {ranks}" for node, ranks in sorted(by_node.items())
+            )
+        else:
+            where = f"dp ranks {missing}"
+        return (
+            f"{self.label}: {len(missing)} of {len(ready_received)} engines did "
+            f"not report READY within {timeout_s:g}s ({where}).\n"
+            f"  Why: every engine has to join before the group forms, so one "
+            f"absent node blocks all of them.\n"
+            f"  Fix: check that node's launcher started, that it was given the "
+            f"same --data-parallel-master-ip/--data-parallel-base-port as this "
+            f"one, and that its log does not end in a weight-loading stall."
+        )
 
     def _create_output_thread(
         self, dp_rank: int, output_socket: zmq.Socket, shutdown_path: str
