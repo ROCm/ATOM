@@ -1028,8 +1028,7 @@ class Scheduler:
         )
 
     def heartbeat_throughput(self, now: float) -> None:
-        """Close the throughput window on time while the engine sits idle.
-        """
+        """Close the throughput window on time while the engine sits idle."""
         if self.engine_stats.window_expired(now):
             self._record_throughput()
 
