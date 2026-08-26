@@ -3,9 +3,14 @@
 
 """DCP (Decode Context Parallel) communication ops for ATOM.
 
-Implements the AG+RS backend for combining partial attention outputs
-across DCP ranks using LSE (Log-Sum-Exp) correction.
-Uses vllm-style algorithm: AllGather LSE -> correct local output -> ReduceScatter.
+Two backends combine the per-rank partial attention outputs into the global
+softmax, selected by ``DCPConfig.comm_backend``:
+
+  * ``ag_rs`` -- AllGather LSE -> correct local output -> ReduceScatter (2 calls)
+  * ``a2a``   -- one all-to-all carrying output+LSE, combine locally (1 call)
+
+They are mathematically equivalent but not bitwise identical; see the A2A
+section below for why one collective can replace two.
 """
 
 import numpy as np
@@ -369,6 +374,274 @@ def cp_lse_ag_out_rs(cp_attn_out, cp_attn_lse, cp_group, ctx=None):
         cp_attn_out, lses, cp_group.rank_in_group, ctx=ctx
     )
     return cp_group.reduce_scatter(rs_input, dim=0)
+
+
+# ─────────────────────────────────────────────── A2A merge backend ──
+#
+# All-to-All backend for the DCP output merge.
+#
+# The AG+RS backend (``cp_lse_ag_out_rs``) needs two collectives, and the reason is
+# ``ReduceScatter``'s reduce op: it can only be a predefined ``sum``/``max``, never
+# an LSE-weighted combine. To use ``sum`` the weights must already be applied, and
+# computing them needs ``global_lse``, which needs every rank's LSE -- hence the
+# AllGather LSE that comes first.
+#
+# A2A sidesteps that by not asking the network to reduce at all. The all-to-all is
+# a pure permutation: it relocates data so that every partial for a given head
+# lands on the one rank that owns that head. The weighting and the sum then happen
+# in a local kernel, where arbitrary math is allowed. One collective instead of two.
+#
+# Both backends compute the same thing::
+#
+#     global_lse[b,h] = log sum_r exp(lse_r[b,h])
+#     out[b,h]        = sum_r exp(lse_r[b,h] - global_lse[b,h]) * o_r[b,h]
+#
+# They differ only in where the multiply and the sum happen, so results agree to
+# floating-point noise but are NOT bitwise identical (different summation order).
+#
+# Bytes are roughly the same as AG+RS: ReduceScatter and All-to-All both carry
+# scatter semantics, so each moves ~(N-1)/N of the full tensor. What A2A saves is
+# one collective's launch and synchronization -- which is worth measuring rather
+# than assuming, because the profiling in the DCP notes shows a large part of the
+# current ReduceScatter cost scales with row count rather than with bytes.
+
+
+def _lse_pack_slots(dtype: torch.dtype) -> int:
+    """How many buffer slots one fp32 LSE needs at this element width."""
+    if dtype == torch.float32:
+        return 1
+    if dtype in (torch.bfloat16, torch.float16):
+        return 2
+    raise NotImplementedError(f"a2a merge buffer dtype {dtype} not supported")
+
+
+@triton.jit
+def _dcp_a2a_pack_kernel(
+    out_ptr,  # [B, H, D]      this rank's partial attention output
+    lse_ptr,  # [B, H]         fp32
+    send_ptr,  # [N, B, H_LOCAL, D + LSE_PACK]
+    out_stride_b,
+    out_stride_h,
+    lse_stride_b,
+    lse_stride_h,
+    send_stride_n,
+    send_stride_b,
+    send_stride_h,
+    H_LOCAL: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    LSE_PACK: tl.constexpr,
+):
+    """Scatter (output, lse) into the per-destination send buffer.
+
+    One program per (token, GLOBAL head). Head ``h`` belongs to destination rank
+    ``h // H_LOCAL`` -- the same contiguous split the ReduceScatter path uses, so
+    a rank ends up owning exactly the heads it owned before.
+    """
+    b = tl.program_id(axis=0).to(tl.int64)
+    h = tl.program_id(axis=1).to(tl.int64)
+
+    dst = h // H_LOCAL
+    h_local = h % H_LOCAL
+
+    d = tl.arange(0, HEAD_DIM)
+    src = tl.load(out_ptr + b * out_stride_b + h * out_stride_h + d)
+
+    dst_base = (
+        send_ptr + dst * send_stride_n + b * send_stride_b + h_local * send_stride_h
+    )
+    tl.store(dst_base + d, src)
+
+    lse = tl.load(lse_ptr + b * lse_stride_b + h * lse_stride_h)
+    if LSE_PACK == 1:
+        tl.store(dst_base + HEAD_DIM, lse)
+    else:
+        # Split the fp32 into two raw 16-bit halves. Nothing does arithmetic on
+        # these slots -- the collective copies bits and the combine kernel puts
+        # them back together -- so a bf16 slot is just 16 bits of storage here.
+        bits = lse.to(tl.uint32, bitcast=True)
+        hi = (bits >> 16).to(tl.uint16).to(dst_base.dtype.element_ty, bitcast=True)
+        lo = (bits & 0xFFFF).to(tl.uint16).to(dst_base.dtype.element_ty, bitcast=True)
+        tl.store(dst_base + HEAD_DIM, hi)
+        tl.store(dst_base + HEAD_DIM + 1, lo)
+
+
+@triton.jit
+def _dcp_a2a_unpack_combine_kernel(
+    recv_ptr,  # [N, B, H_LOCAL, D + LSE_PACK]  N = source rank (KV shard)
+    out_ptr,  # [B, H_LOCAL, D]
+    out_lse_ptr,  # [B, H_LOCAL] fp32, or unused
+    recv_stride_n,
+    recv_stride_b,
+    recv_stride_h,
+    out_stride_b,
+    out_stride_h,
+    lse_stride_b,
+    lse_stride_h,
+    N_RANKS,
+    HEAD_DIM: tl.constexpr,
+    LSE_PACK: tl.constexpr,
+    N_ROUNDED: tl.constexpr,
+    WRITE_LSE: tl.constexpr,
+):
+    """LSE-weighted combine along the KV-shard axis. One program per (token, head).
+
+    The reduce axis is N (the KV shards), never the head axis -- heads are only
+    ever relocated, never summed across. That is what makes the head split above
+    free to be any partition.
+    """
+    b = tl.program_id(axis=0).to(tl.int64)
+    h = tl.program_id(axis=1).to(tl.int64)
+
+    n = tl.arange(0, N_ROUNDED)
+    valid = n < N_RANKS
+    base = (
+        recv_ptr
+        + n.to(tl.int64) * recv_stride_n
+        + b * recv_stride_b
+        + h * recv_stride_h
+    )
+
+    if LSE_PACK == 1:
+        lse = tl.load(base + HEAD_DIM, mask=valid, other=float("-inf"))
+        lse = lse.to(tl.float32)
+    else:
+        hi = tl.load(base + HEAD_DIM, mask=valid, other=0).to(tl.uint16, bitcast=True)
+        lo = tl.load(base + HEAD_DIM + 1, mask=valid, other=0).to(
+            tl.uint16, bitcast=True
+        )
+        bits = (hi.to(tl.uint32) << 16) | lo.to(tl.uint32)
+        lse = bits.to(tl.float32, bitcast=True)
+        lse = tl.where(valid, lse, float("-inf"))
+
+    # A rank that owns no KV for this row reports lse=-inf (and o=NaN). Treat any
+    # non-finite lse as "contributed nothing" so it cannot reach the accumulator.
+    # `x != x` is the NaN test: this Triton has no tl.math.isnan, and it is the
+    # same idiom dcp_ops.py already uses.
+    lse_is_nan = lse != lse  # noqa: PLR0124
+    lse = tl.where(lse_is_nan | (lse == float("inf")), float("-inf"), lse)
+
+    lse_max = tl.max(lse, axis=0)
+    # Every rank empty -> max is -inf; subtracting it would make 0/0 = NaN.
+    lse_max = tl.where(lse_max == float("-inf"), 0.0, lse_max)
+    global_lse = tl.log(tl.sum(tl.exp(lse - lse_max), axis=0)) + lse_max
+
+    if WRITE_LSE:
+        tl.store(out_lse_ptr + b * lse_stride_b + h * lse_stride_h, global_lse)
+
+    factor = tl.exp(lse - global_lse)
+    # An empty rank already lands on factor == 0 by itself: its lse is -inf, so
+    # exp(-inf - finite) is exactly 0. This line is belt-and-braces for the case
+    # where global_lse is itself -inf (every rank empty) and the subtraction
+    # yields NaN; the load-bearing NaN guard is the vals mask below.
+    factor = tl.where((factor != factor) | (~valid), 0.0, factor)  # noqa: PLR0124
+
+    d = tl.arange(0, HEAD_DIM)
+    vals = tl.load(base[:, None] + d[None, :]).to(tl.float32)
+    # THIS is what stops an empty rank from poisoning the row. aiter returns
+    # o=NaN alongside lse=-inf, and NaN * 0 = NaN, so the NaN has to be replaced
+    # BEFORE the multiply -- zeroing the weight is not enough.
+    vals = tl.where(factor[:, None] == 0.0, 0.0, vals)
+    acc = tl.sum(vals * factor[:, None], axis=0)
+
+    tl.store(
+        out_ptr + b * out_stride_b + h * out_stride_h + d,
+        acc.to(out_ptr.dtype.element_ty),
+    )
+
+
+def cp_lse_a2a(cp_attn_out, cp_attn_lse, cp_group, return_lse: bool = False):
+    """A2A backend: pack -> one all-to-all -> local LSE combine.
+
+    Drop-in for ``cp_lse_ag_out_rs``: same inputs, same ``[B, H_local, D]``
+    output, same head ownership.
+
+    Args:
+        cp_attn_out: ``[B, H, D]`` this rank's partial output over its KV shard.
+        cp_attn_lse: ``[B, H]`` matching log-sum-exp, fp32.
+        cp_group: DCP GroupCoordinator.
+        return_lse: also return the merged ``[B, H_local]`` global LSE.
+    """
+    n_ranks = cp_group.world_size
+    if n_ranks == 1:
+        return (cp_attn_out, cp_attn_lse) if return_lse else cp_attn_out
+
+    b, h_total, head_dim = cp_attn_out.shape
+    assert h_total % n_ranks == 0, (
+        f"a2a merge needs the head count divisible by the DCP size; "
+        f"got H={h_total}, N={n_ranks}"
+    )
+    h_local = h_total // n_ranks
+
+    dtype = cp_attn_out.dtype
+    pack = _lse_pack_slots(dtype)
+    dev = cp_attn_out.device
+
+    cp_attn_out = cp_attn_out.contiguous()
+    cp_attn_lse = cp_attn_lse.contiguous().to(torch.float32)
+
+    send = torch.empty((n_ranks, b, h_local, head_dim + pack), dtype=dtype, device=dev)
+    _dcp_a2a_pack_kernel[(b, h_total)](
+        cp_attn_out,
+        cp_attn_lse,
+        send,
+        cp_attn_out.stride(0),
+        cp_attn_out.stride(1),
+        cp_attn_lse.stride(0),
+        cp_attn_lse.stride(1),
+        send.stride(0),
+        send.stride(1),
+        send.stride(2),
+        H_LOCAL=h_local,
+        HEAD_DIM=head_dim,
+        LSE_PACK=pack,
+    )
+
+    # The N axis flips meaning here: it is "destination rank" on the way in and
+    # "source rank / KV shard" on the way out.
+    recv = torch.empty_like(send)
+    torch.distributed.all_to_all_single(recv, send, group=cp_group.device_group)
+
+    out = torch.empty((b, h_local, head_dim), dtype=dtype, device=dev)
+    out_lse = (
+        torch.empty((b, h_local), dtype=torch.float32, device=dev)
+        if return_lse
+        else send
+    )
+    _dcp_a2a_unpack_combine_kernel[(b, h_local)](
+        recv,
+        out,
+        out_lse,
+        recv.stride(0),
+        recv.stride(1),
+        recv.stride(2),
+        out.stride(0),
+        out.stride(1),
+        out_lse.stride(0) if return_lse else 0,
+        out_lse.stride(1) if return_lse else 0,
+        n_ranks,
+        HEAD_DIM=head_dim,
+        LSE_PACK=pack,
+        N_ROUNDED=triton.next_power_of_2(n_ranks),
+        WRITE_LSE=return_lse,
+    )
+    return (out, out_lse) if return_lse else out
+
+
+def dcp_lse_merge(cp_attn_out, cp_attn_lse, cp_group, backend="a2a", ctx=None):
+    """Reconstruct the global softmax from the per-rank partials.
+
+    Dispatches to one of the two backends above. Both compute the same weighted
+    sum over KV shards and leave this rank owning the same head slice; they
+    differ only in how many collectives it takes (see the A2A section above for
+    why one all-to-all can replace AllGather-LSE + ReduceScatter). Equivalent
+    math, not bitwise identical.
+
+    ``ctx`` is the Triton context the AG+RS backend caches its launches in; the
+    a2a backend does not use one.
+    """
+    if backend == "a2a":
+        return cp_lse_a2a(cp_attn_out, cp_attn_lse, cp_group)
+    return cp_lse_ag_out_rs(cp_attn_out, cp_attn_lse, cp_group, ctx=ctx)
 
 
 def dcp_gather_compressed_kv(

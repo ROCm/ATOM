@@ -25,9 +25,9 @@ import torch
 
 from atom.utils import envs
 
-# Version 3 adds the GLM replicated-index layout and IndexShare schedule to the
-# PAGE identity. Its compact layer axis and DCP-expanded index pages are byte-
-# incompatible with the sharded-index v2 layout.
+# Version 3 adds the effective index-cache dtype to the PAGE identity. FP4 and
+# FP8 DSV4 indexers have different region counts and byte layouts, so they must
+# never reuse one another's objects even when the HF model config is identical.
 PAGE_LAYOUT_VERSION = 3
 _PAGE_FINGERPRINT_BYTES = 16
 _OFFLOAD_LAYOUT_ALIASES = {
@@ -183,6 +183,7 @@ def build_page_namespace(
             else "dense-opaque-block"
         ),
         "kv_cache_dtype": str(getattr(config, "kv_cache_dtype", "auto")),
+        "index_cache_dtype": str(getattr(config, "index_cache_dtype", "auto")),
         "block_size": _strict_integer(
             "PAGE block size",
             config.kv_cache_block_size,
@@ -223,7 +224,7 @@ def build_page_namespace(
     digest = hashlib.blake2b(
         canonical,
         digest_size=_PAGE_FINGERPRINT_BYTES,
-        person=b"ATOM-PAGE-CFG-v2",
+        person=b"ATOM-PAGE-CFG-v3",
     ).hexdigest()
     return f"{base_model_name}::atom-page-v{layout_version}-{digest}"
 

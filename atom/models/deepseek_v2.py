@@ -40,7 +40,10 @@ from aiter import (
     top_k_per_row_prefill,
 )
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
-from aiter.dist.parallel_state import get_pp_group, get_tensor_model_parallel_world_size
+from aiter.dist.parallel_state import (
+    get_pp_group,
+    get_tensor_model_parallel_world_size,
+)
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.fused_fp8_quant import fused_reduce_rms_fp8_group_quant
@@ -79,6 +82,7 @@ from atom.model_ops.activation import SiluAndMul
 from atom.model_ops.attention_mla import (
     MLAModules,
     is_rocm_aiter_fp4bmm_enabled,
+    qrep_tp_override,
     triton_convert_req_index_to_global_index,
     triton_convert_req_index_to_global_index_dsa_prefill,
     triton_gather_kv_indices_sparse,
@@ -2445,6 +2449,9 @@ class DeepseekV2MLAAttention(nn.Module):
         assert num_heads % tp_size == 0
         self.num_local_heads = num_heads // tp_size
 
+        # DCP Query Replication: {} unless QREP is on -- see qrep_tp_override.
+        q_qrep_override = qrep_tp_override(tp_size)
+
         self.scaling = self.qk_head_dim**-0.5
         self.max_position_embeddings = max_position_embeddings
         self.layer_num = layer_num
@@ -2516,6 +2523,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.q_b_proj",
                 source_quant_dtype=source_quant_dtype,
+                **q_qrep_override,
             )
         else:
             self.q_proj = ColumnParallelLinear(
@@ -2525,6 +2533,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.q_proj",
                 source_quant_dtype=source_quant_dtype,
+                **q_qrep_override,
             )
 
             self.kv_a_proj_with_mqa = ReplicatedLinear(

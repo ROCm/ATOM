@@ -1431,17 +1431,30 @@ class EPLBConfig:
         return cls(**cfg)
 
 
+DCP_COMM_BACKENDS = ("ag_rs", "a2a")
+
+
 @dataclass
 class DCPConfig:
-    """DCP (Decode Context Parallel) sub-config. Today only interleave
-    granularity; room for future knobs (all-to-all backend, query
-    replication, ...) without growing the top-level CLI surface."""
+    """DCP (Decode Context Parallel) sub-config: interleave granularity, query
+    replication, output-merge placement and the merge collective backend --
+    knobs that would otherwise each grow the top-level CLI surface."""
 
     interleave_size: int = 1
+    enable_query_replication: bool = True
+    enable_project_before_merge: bool = True
+    comm_backend: str = "a2a"
 
     def __post_init__(self):
         self.interleave_size = int(self.interleave_size)
         assert self.interleave_size >= 1, "dcp.interleave_size must be >= 1"
+        self.enable_query_replication = bool(self.enable_query_replication)
+        self.enable_project_before_merge = bool(self.enable_project_before_merge)
+        self.comm_backend = str(self.comm_backend)
+        assert self.comm_backend in DCP_COMM_BACKENDS, (
+            f"dcp.comm_backend must be one of {list(DCP_COMM_BACKENDS)}; "
+            f"got {self.comm_backend!r}"
+        )
 
     @classmethod
     def from_dict(cls, cfg: dict | None) -> "DCPConfig":
@@ -1458,6 +1471,27 @@ class DCPConfig:
                 f"Supported keys: {sorted(allowed)}"
             )
         return cls(**cfg)
+
+
+def qrep_unsupported_reason(
+    dcp_size: int, speculative_config, mxfp4_bmm: bool
+) -> str | None:
+    """Why DCP query replication cannot run here, or None if it can.
+
+    Kept a module-level pure function so it is unit-testable: the alternative,
+    exercising it through ``Config.__post_init__``, needs a real model directory
+    and an HF config. ``Config.__post_init__`` is its only production caller.
+    """
+    if dcp_size <= 1:
+        # No DCP group means there is no AllGather Q to remove.
+        return "decode_context_parallel_size <= 1 (no DCP group)"
+    if speculative_config is not None:
+        # MTP / eagle3 / dspark run a qlen>1 verify on the cprr kernel.
+        return "speculative decode (qlen>1 cprr path)"
+    if mxfp4_bmm:
+        # fp4 (mxfp4) absorbed BMM has a different scale structure.
+        return "fp4 (mxfp4) BMM weights"
+    return None
 
 
 @dataclass
@@ -1725,6 +1759,23 @@ class Config:
                 "dcp_config.interleave_size=1 with speculative decode, or disable "
                 "speculative decode for block-level interleave."
             )
+
+        # DCP Query Replication (QREP) first-cut gating: turn the flag OFF
+        # (warn, not error) for combinations not yet wired, so it can default to
+        # on without breaking mixed runs.
+        if self.dcp_config.enable_query_replication:
+            qrep_off = qrep_unsupported_reason(
+                self.decode_context_parallel_size,
+                self.speculative_config,
+                envs.ATOM_USE_TRITON_MXFP4_BMM,
+            )
+            if qrep_off is not None:
+                logger.warning(
+                    "dcp_config.enable_query_replication disabled: %s not "
+                    "supported in the first cut.",
+                    qrep_off,
+                )
+                self.dcp_config.enable_query_replication = False
         assert 1 <= self.pipeline_parallel_size
         self.hf_config = get_hf_config(
             self.model, trust_remote_code=self.trust_remote_code

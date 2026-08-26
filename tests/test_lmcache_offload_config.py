@@ -19,6 +19,7 @@ def _config():
         model="org/model",
         model_tag="org/model",
         kv_cache_dtype="fp8",
+        index_cache_dtype="fp8",
         kv_cache_block_size=256,
         tensor_parallel_size=4,
         decode_context_parallel_size=2,
@@ -76,6 +77,7 @@ def test_page_namespace_supports_torch_dtype_in_speculative_config():
     "mutate",
     [
         lambda config, cfg: setattr(config, "kv_cache_dtype", "bf16"),
+        lambda config, cfg: setattr(config, "index_cache_dtype", "fp4"),
         lambda config, cfg: setattr(config.hf_config, "indexer_dtype", "bf16"),
         lambda config, cfg: setattr(config.hf_config, "kv_head_dim", 576),
         lambda config, cfg: setattr(config.hf_config, "index_head_dim", 160),
@@ -95,6 +97,7 @@ def test_page_namespace_supports_torch_dtype_in_speculative_config():
     ],
     ids=[
         "kv-dtype",
+        "effective-index-dtype",
         "index-dtype",
         "kv-head-dim",
         "index-head-dim",

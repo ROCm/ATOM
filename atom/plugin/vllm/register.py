@@ -328,6 +328,12 @@ def register_model() -> None:
     from atom.plugin.vllm.mori_patch import apply_vllm_mori_patch
 
     apply_vllm_mori_patch()
+
+    from atom.plugin.vllm.qwen35_attention_patch import (
+        apply_qwen35_vllm_attention_patch,
+    )
+
+    apply_qwen35_vllm_attention_patch()
     # Expose batch-ordered req_ids to ATOM metadata builders so the DeepSeek-V4
     # proxy can key state-slot allocation on the request id (host-resident)
     # instead of a D2H copy of the first block id.
