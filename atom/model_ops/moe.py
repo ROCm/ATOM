@@ -1063,6 +1063,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
         self.use_triton = use_triton_moe and not ep_moe
         self.use_triton_ep = use_triton_moe and ep_moe
+        # Phase split: keep the weights in the FlyDSL layout and run the Triton
+        # /gluon kernel on decode only, over a zero-copy view rebuilt in apply().
+        # Narrows ATOM_USE_TRITON_MOE, so it is inert unless that path is on.
+        self.use_triton_decode = self.use_triton and envs.ATOM_USE_TRITON_MOE_DECODE
 
         if getattr(get_current_atom_config(), "eplb_enable", False):
             self.use_triton_ep = False
@@ -1216,12 +1220,33 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self._process_weight_layout_after_loading(layer)
 
     def _process_weight_layout_after_loading(self, layer) -> None:
-        use_triton_gfx1250_silu = (
-            self.use_triton
-            and self.is_gfx1250
-            and getattr(layer, "activation", ActivationType.Silu)
-            == ActivationType.Silu
+        is_silu = (
+            getattr(layer, "activation", ActivationType.Silu) == ActivationType.Silu
         )
+        use_triton_gfx1250_silu = self.use_triton and self.is_gfx1250 and is_silu
+
+        # Decode-only Triton leaves the layout to the FlyDSL prep (branch C) and
+        # rebuilds the Triton view per decode call in apply(). That single copy
+        # can serve both kernels only where the two preps write the same bytes:
+        # gfx1250, GUGU rows, SiLU. Off that config they are different layouts.
+        if self.use_triton_decode:
+            assert self.is_gfx1250 and self.is_guinterleave and is_silu, (
+                "ATOM_USE_TRITON_MOE_DECODE=1 shares one weight copy between the "
+                "FlyDSL and Triton kernels, which only matches on gfx1250 + "
+                "ATOM_MOE_GU_ITLV=1 + SiLU (got gfx1250="
+                f"{self.is_gfx1250}, gu_itlv={self.is_guinterleave}, silu={is_silu})."
+            )
+            # FlyDSL trims the create_weights padding via hidden_pad /
+            # intermediate_pad; the Triton kernels take no such argument and read
+            # the padded N/K straight off the weight. Equal only at zero pad --
+            # otherwise prefill and decode would silently disagree.
+            assert self.hidden_pad == 0 and self.intermediate_pad == 0, (
+                "ATOM_USE_TRITON_MOE_DECODE needs an unpadded expert shape: "
+                "FlyDSL trims the padding on prefill but the Triton decode "
+                f"kernel cannot (hidden_pad={self.hidden_pad}, "
+                f"intermediate_pad={self.intermediate_pad}). Lower pad_align."
+            )
+            use_triton_gfx1250_silu = False
 
         # ── A. Triton/gluon GUGU experts: TP (gfx1250 + SiLU) or EP ───────────
         if use_triton_gfx1250_silu or self.use_triton_ep:
@@ -1307,7 +1332,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             return
 
         # ── B. General Triton MXFP4 MoE ───────────────────────────────────────
-        if self.use_triton:
+        if self.use_triton and not self.use_triton_decode:
             from atom.model_ops.fused_moe_triton import _swizzle_mxfp4
 
             atom_config = get_current_atom_config()
@@ -1418,6 +1443,42 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         layer.w13_weight_scale = atom_parameter(shuffled_w13_scale)
         layer.w2_weight_scale = atom_parameter(shuffled_w2_scale)
 
+    def _triton_views_of_flydsl_weights(self, layer) -> tuple:
+        """Zero-copy Triton/gluon views of the FlyDSL-shuffled MXFP4 weights.
+
+        On gfx1250 under GUGU the FlyDSL prep (branch C of
+        ``_process_weight_layout_after_loading``) and the Triton prep (branch A)
+        write byte-identical buffers and differ only in the view laid over them:
+
+        * weight ``(E, N, K/2)`` fp4  ->  ``(E, K/2*16, N/16)`` uint8
+          (``moe_weight_decode_view``, a reshape + stride swap)
+        * scale  ``(E, N/32, K/32*32)``  ->  ``(E, K/32*32, N/32)``
+          (``shuffle_scale_moe``'s trailing transpose; the n32k4 permute
+          underneath is the same one ``_shuffle_scale_tile_gfx1250`` applies)
+
+        ``ATOM_USE_TRITON_MOE_DECODE`` keeps the FlyDSL view on the layer so
+        prefill runs FlyDSL, and calls this to hand decode the Triton view of
+        the same storage -- no second copy, no extra memory.
+
+        Cached on the layer: the views alias the weight storage, so they survive
+        an in-place EPLB weight swap, and rebuilding six view ops per MoE layer
+        per decode step is pure overhead on a latency-critical path.
+        """
+        views = getattr(layer, "_triton_decode_views", None)
+        if views is None:
+            from aiter.ops.triton.utils.shuffle import moe_weight_decode_view
+
+            views = (
+                moe_weight_decode_view(layer.w13_weight.data),
+                moe_weight_decode_view(layer.w2_weight.data),
+                layer.w13_weight_scale.data.transpose(-1, -2),
+                layer.w2_weight_scale.data.transpose(-1, -2),
+                "GFX1250_SCALE",
+                "GFX1250_SCALE",
+            )
+            layer._triton_decode_views = views
+        return views
+
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
     ) -> FusedMoEQuantConfig | None:
@@ -1462,16 +1523,38 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         activation: ActivationType = ActivationType.Silu,
         prefix: str = "",
     ) -> torch.Tensor:
-        if self.use_triton:
+        # ATOM_USE_TRITON_MOE_DECODE splits the two kernels by phase: the weights
+        # sit in the FlyDSL layout, so prefill falls through to the FlyDSL tail
+        # below and only decode takes the Triton block (over a view of the very
+        # same storage, see _triton_views_of_flydsl_weights).
+        use_triton_now = self.use_triton
+        if self.use_triton_decode:
+            use_triton_now = not get_forward_context().context.is_prefill
+
+        if use_triton_now:
             from atom.model_ops.fused_moe_triton import (
                 triton_kernel_fused_experts,
                 triton_kernel_moe_forward,
             )
-            use_triton_gfx1250_silu = (
-                self.use_triton
-                and self.is_gfx1250
-                and activation == ActivationType.Silu
+            use_triton_gfx1250_silu = self.is_gfx1250 and (
+                activation == ActivationType.Silu
             )
+            if self.use_triton_decode:
+                (
+                    w13_weight,
+                    w2_weight,
+                    w13_weight_scale,
+                    w2_weight_scale,
+                    w13_swizzle_layout,
+                    w2_swizzle_layout,
+                ) = self._triton_views_of_flydsl_weights(layer)
+            else:
+                w13_weight = layer.w13_weight
+                w2_weight = layer.w2_weight
+                w13_weight_scale = layer.w13_weight_scale
+                w2_weight_scale = layer.w2_weight_scale
+                w13_swizzle_layout = layer.w13_swizzle_layout
+                w2_swizzle_layout = layer.w2_swizzle_layout
             needs_custom_routing = (
                 use_grouped_topk
                 or scoring_func != "softmax"
@@ -1517,17 +1600,17 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 _moe_result = triton_kernel_fused_experts(
                     output,
                     x,
-                    layer.w13_weight,
-                    layer.w2_weight,
+                    w13_weight,
+                    w2_weight,
                     routing_data,
                     gather_idx,
                     scatter_idx,
                     topk=n_expts_act,
                     activation=activation,
-                    w13_scale=layer.w13_weight_scale,
-                    w2_scale=layer.w2_weight_scale,
-                    w13_swizzle_layout=layer.w13_swizzle_layout,
-                    w2_swizzle_layout=layer.w2_swizzle_layout,
+                    w13_scale=w13_weight_scale,
+                    w2_scale=w2_weight_scale,
+                    w13_swizzle_layout=w13_swizzle_layout,
+                    w2_swizzle_layout=w2_swizzle_layout,
                     a13_scale=layer.w13_input_scale,
                     a2_scale=layer.w2_input_scale,
                     w1_bias=layer.w13_bias,
@@ -1565,16 +1648,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # Takes directly from model dtype in config.json
             return triton_kernel_moe_forward(
                 x,
-                layer.w13_weight,
-                layer.w2_weight,
+                w13_weight,
+                w2_weight,
                 router_logits,
                 topk=top_k,
                 renormalize=renormalize,
                 activation=activation,
-                w13_scale=layer.w13_weight_scale,
-                w2_scale=layer.w2_weight_scale,
-                w13_swizzle_layout=layer.w13_swizzle_layout,
-                w2_swizzle_layout=layer.w2_swizzle_layout,
+                w13_scale=w13_weight_scale,
+                w2_scale=w2_weight_scale,
+                w13_swizzle_layout=w13_swizzle_layout,
+                w2_swizzle_layout=w2_swizzle_layout,
                 a13_scale=layer.w13_input_scale,
                 a2_scale=layer.w2_input_scale,
                 w1_bias=layer.w13_bias,

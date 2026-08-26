@@ -70,6 +70,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # moe_gemm_a16w4 / a4w4 / a8w4 path. Defaults to on for gfx94x, and for
     # gfx95x when ATOM_USE_TRITON_GEMM is set.
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
+    # Split the routed experts by phase: FlyDSL fused_moe on prefill, the Triton
+    # /gluon GUGU kernel on decode. Needs ATOM_USE_TRITON_MOE=1 (it narrows that
+    # flag, it cannot enable Triton on its own) plus gfx1250 + ATOM_MOE_GU_ITLV=1
+    # + SiLU, because it keeps a single copy of the weights in the FlyDSL layout
+    # and hands Triton a zero-copy view of it -- which is only valid where the
+    # two preshuffles agree byte-for-byte. TP only; inert under EP.
+    "ATOM_USE_TRITON_MOE_DECODE": lambda: (
+        os.getenv("ATOM_USE_TRITON_MOE_DECODE", "0") == "1"
+    ),
     # Select the a4w4 Triton wrapper instead of the a8w4 default, on both the TP
     # and EP paths. Only chooses *which* wrapper runs -- it cannot enable the
     # Triton path on its own, and asserts if set without ATOM_USE_TRITON_MOE.
