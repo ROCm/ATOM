@@ -529,12 +529,44 @@ def _get_engine_max_model_len() -> int | None:
     return getattr(_get_engine_config(), "max_model_len", None)
 
 
+def _get_engine_max_pool_tokens() -> int | None:
+    """Longest prompt the KV pool can hold, as each engine rank reported it.
+
+    None before the engine is up, or on a manager that never learned it, in
+    which case the scheduler remains the only enforcer.
+    """
+    return getattr(getattr(engine, "core_mgr", None), "max_pool_tokens", None)
+
+
+def _validate_pool_capacity(
+    num_prompt_tokens: int, max_pool_tokens: int | None
+) -> None:
+    """Refuse a prompt whose KV cannot fit even a completely empty pool.
+
+    `max_model_len` is a declared limit; this is a physical one, since the pool
+    is sized from whatever device memory is free once the weights are loaded, so
+    on a tight pool it binds first. The scheduler checks it too, but only once
+    the request reaches the engine — by then the client holds a response it will
+    never be answered on, so the request has to be turned away here instead.
+    """
+    if max_pool_tokens is None or int(num_prompt_tokens) <= int(max_pool_tokens):
+        return
+
+    raise ValueError(
+        f"This server's KV cache holds at most {max_pool_tokens} tokens for a "
+        f"single request, and your prompt contains at least {num_prompt_tokens} "
+        f"input tokens. Please shorten the prompt, or restart the server with a "
+        f"higher --gpu-memory-utilization to enlarge the cache."
+    )
+
+
 def _validate_sequence_context_length(seq) -> None:
     _validate_context_length(
         seq.num_prompt_tokens,
         seq.max_tokens,
         _get_engine_max_model_len(),
     )
+    _validate_pool_capacity(seq.num_prompt_tokens, _get_engine_max_pool_tokens())
 
 
 def _has_multimodal_content(messages: list[Any]) -> bool:

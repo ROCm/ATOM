@@ -317,6 +317,38 @@ class BlockManager:
         )[0]
         return int((local_len + self.block_size - 1) // self.block_size)
 
+    @property
+    def max_pool_tokens(self) -> int:
+        """Longest prompt, in global tokens, whose KV fits an entirely empty pool.
+
+        Bisects `num_pool_blocks`, which is monotone in `seq_len`, rather than
+        inverting it in closed form: under block-level interleaving
+        (`cp_kv_cache_interleave_size > 1`) a rank's share is not a plain
+        `seq_len / dcp_world_size`, and an inverse derived by hand would drift
+        from the allocator as soon as that arithmetic moved. Runs once, at
+        startup.
+
+        Mirrors the ceiling `Scheduler._unschedulable_reason` enforces, so the
+        frontend can predict that verdict and refuse an oversized prompt with an
+        error while it is still answering the client, instead of leaving the
+        scheduler to discover it once the client is already waiting. The API
+        server needs it published because `num_kvcache_blocks` is measured in
+        the engine subprocess and its own Config never learns the value.
+        """
+        capacity = self.kv.num_blocks
+        # A prompt this long needs more than `capacity` blocks on some rank, so
+        # it bounds the search from above: each rank holds at least
+        # `1 / dcp_world_size` of it, i.e. over `capacity` blocks' worth.
+        hi = (capacity + 1) * self.block_size * max(1, self.dcp_world_size)
+        lo = 0
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if self.num_pool_blocks(mid) <= capacity:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
     def _effective_block_size(self):
         return self.block_size * self.dcp_world_size
 
