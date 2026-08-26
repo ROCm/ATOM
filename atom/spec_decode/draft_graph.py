@@ -128,11 +128,13 @@ class DraftGraph:
         padded -- which is the only safe answer, since nobody sized the target's
         metadata past the real batch there.
 
-        Declining the padding rather than the pass is deliberate: under DP every
-        rank still has to reach the draft's collectives.
+        An empty batch is never widened: a pad row is a copy of the last real
+        one, and there is no last real one to copy. Declining the padding rather
+        than the pass is deliberate -- under DP every rank still has to reach the
+        draft's collectives.
         """
         mode = context.forward_mode
-        if not self.pads or context.is_dummy_run:
+        if not bs or not self.pads or context.is_dummy_run:
             return bs
         if mode is None or not mode.use_cudagraph:
             return bs
@@ -241,7 +243,12 @@ class DraftGraph:
             return pool
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, pool, stream=stream):
+        # thread_local, not the "global" default: global invalidates a capture
+        # when ANY thread makes an unsafe HIP call, and the NCCL watchdog polls
+        # `hipEventQuery` every ~100ms. Same reasoning as `cuda_graph.py`'s.
+        with torch.cuda.graph(
+            graph, pool, stream=stream, capture_error_mode="thread_local"
+        ):
             out = self._to_capture(pad_bs, **staged)
         self._cuda_graphs[pad_bs] = (graph, out)
         return pool or graph.pool()

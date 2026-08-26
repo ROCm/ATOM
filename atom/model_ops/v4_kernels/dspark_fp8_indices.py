@@ -18,8 +18,9 @@ row ids rather than a materialised `[B, W+T, 512]` tensor.
 
 and `DSparkIndexBuffers.views` reads them back.
 
-`qo_indptr` and the scatter's `batch_ids` are constants that ride in the same
-`DSparkIndexBuffers` bundle. Everything is allocated once at `max_num_seqs` and
+`qo_indptr` is a constant riding in the same `DSparkIndexBuffers` bundle; the
+scatter's `batch_ids` is filled there too but follows how much of the batch is
+real, via `mask_pad_tail`. Everything is allocated once at `max_num_seqs` and
 only ever sliced, and shapes are statically known -- no `.item()`, no
 data-dependent allocation -- so a captured CUDA graph replays it.
 
@@ -158,12 +159,13 @@ class DSparkIndexBuffers:
         for its own decode AND verify forwards (`deepseek_v4_attn.py:3727`).
 
         `batch_ids` is the token -> request map the fused SWA scatter gates on
-        (`bid >= 0`), and carries `-1` over a padded batch's fabricated rows; it
-        is `mask_pad_tail` that writes both halves, so this leaves it empty. The
-        target can alias `cu_seqlens_q[:bs]` for its own
-        (`deepseek_v4_attn.py:2348`) because at one token per sequence that slice is
-        already `arange(bs)`; DSpark runs T tokens per request and needs each id
-        repeated T times, so there is nothing to alias.
+        (`bid >= 0`); `mask_pad_tail` rewrites it when a batch is padded. Filled
+        here rather than left ``empty`` because the startup sweep runs the block
+        first, and a buffer whose contract gives `-1` a meaning should not start
+        out undefined. The target can alias `cu_seqlens_q[:bs]` for its own
+        (`deepseek_v4_attn.py:2348`) because at one token per sequence that slice
+        is already `arange(bs)`; DSpark runs T tokens per request and needs each
+        id repeated T times, so there is nothing to alias.
         """
         n = max_batch * draft
         i32 = {"dtype": torch.int32, "device": device}
@@ -172,7 +174,7 @@ class DSparkIndexBuffers:
             kv_indptr=torch.empty(n + 1, **i32),
             draft_rows=torch.empty(n, **i32),
             qo_indptr=torch.arange(n + 1, **i32),
-            batch_ids=torch.empty(n, **i32),
+            batch_ids=torch.arange(n, **i32) // draft,
             max_batch=max_batch,
             draft_width=draft,
             draft_window=window,

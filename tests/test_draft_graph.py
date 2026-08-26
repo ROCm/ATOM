@@ -44,6 +44,18 @@ def test_the_pad_batch_is_the_one_the_target_ran(bs, ran_at, want):
     assert _graph().target_pad_bs(bs, _ctx(effective_bs=ran_at)) == want
 
 
+def test_an_empty_batch_is_never_widened():
+    """A pad row is a copy of the last real row, and there is none.
+
+    `stage` would reach `src[-1]` on a zero-row source and raise IndexError,
+    which is a much worse way to learn that a rank was kept alive purely to
+    reach the draft's collectives.
+    """
+    g = _graph()
+    assert g.target_pad_bs(0, _ctx(effective_bs=48)) == 0
+    assert g.stage(0, {"row": torch.zeros(0, dtype=torch.int32)})["row"].shape[0] == 0
+
+
 def test_a_token_derived_graph_bs_cannot_be_mistaken_for_a_sequence_count():
     """Under PIECEWISE + ragged, `_dspark_ragged_moe_graph_bs` overwrites
     `context.graph_bs` with a TOKEN count (flat_bucket // q) that is neither a

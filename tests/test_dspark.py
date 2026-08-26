@@ -1050,6 +1050,15 @@ def test_propose_leaves_the_batch_alone_when_nothing_pins_a_wider_one(
     assert out.shape[0] == 44
 
 
+def test_the_token_map_is_usable_before_any_step_has_padded():
+    """The startup sweep runs the block before `propose` ever calls
+    `mask_pad_tail`, so `allocate` may not leave this undefined: the scatter
+    reads it as a liveness gate and would drop a random subset of the warm.
+    """
+    bufs = DSparkIndexBuffers.allocate(8, 2, 4, torch.device("cpu"))
+    assert bufs.batch_ids.tolist() == [i // 2 for i in range(16)]
+
+
 def test_the_pad_sentinel_lifts_off_a_row_that_becomes_real_again():
     """The half a single step cannot show: the batch shrinks, then grows.
 

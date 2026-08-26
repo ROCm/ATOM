@@ -2383,12 +2383,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # draft costs nothing for the rows it invented instead of repeating a
         # real one's gather. At bs=65 padded to 128 that is half the batch.
         #
-        # THE buffer the verify fwd publishes on this field, not a private
-        # one: a captured draft graph baked that address, so a mid-step that
-        # republished a different tensor would leave the replay reading the
-        # verify map -- and the `-1` tail below is the only thing masking the
-        # pad rows out of the fused SWA write. Restaged by the verify fwd every
-        # step, so writing it here clobbers nothing.
+        # By its fixed name because a captured draft graph bakes this address:
+        # the tensor a mid-step installs has to be the same object every step,
+        # and under TBO `attn_metadata` alternates between ubatch-prefixed
+        # buffers. The draft is not ubatched, so the unprefixed one and a global
+        # arange are its map. `_attach_v4_per_fwd_meta` reassigns this field on
+        # every verify fwd, so writing it clobbers nothing.
         #
         # Not a slice of `cu_seqlens_q` either: that one is also the q indptr,
         # and a sentinel in it would corrupt the other reader. `row_ids` is
