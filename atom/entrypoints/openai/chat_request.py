@@ -23,7 +23,8 @@ only), so it is unit-testable without a GPU, an engine or FastAPI.
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 from atom.sampling_params import MAX_TEMPERATURE
 
@@ -93,16 +94,6 @@ def template_supported_roles(chat_template: Any) -> frozenset:
 # ---------------------------------------------------------------------------
 
 
-def _append_text(message: ChatMessage, extra: str) -> ChatMessage:
-    """Return a copy of ``message`` with ``extra`` appended to its text content."""
-    if isinstance(message.content, list):
-        content: Any = list(message.content) + [{"type": "text", "text": extra}]
-    else:
-        base = message.content or ""
-        content = f"{base}\n\n{extra}" if base else extra
-    return message.model_copy(update={"content": content})
-
-
 def _merge_messages(messages: Sequence[ChatMessage]) -> ChatMessage:
     """Collapse several same-role messages into one, joining their text."""
     if len(messages) == 1:
@@ -115,7 +106,7 @@ def normalize_chat_messages(
     messages: Sequence[ChatMessage],
     *,
     supported_roles: frozenset = frozenset(),
-) -> List[ChatMessage]:
+) -> list[ChatMessage]:
     """Map extension roles onto roles the chat template understands.
 
     ``root`` (MiniMax) and ``developer`` (OpenAI) are dropped silently by
@@ -132,8 +123,8 @@ def normalize_chat_messages(
     ``supported_roles`` comes from :func:`template_supported_roles`.
     """
     template_handles_root = "root" in supported_roles
-    kept: List[ChatMessage] = []
-    roots: List[ChatMessage] = []
+    kept: list[ChatMessage] = []
+    roots: list[ChatMessage] = []
     competing_system = any(
         (m.role or "").strip() in ("system", "developer") for m in messages
     )
@@ -193,12 +184,6 @@ def _validate_sampling(request: ChatCompletionRequest) -> None:
         raise ValueError(
             f"temperature must be in [0, {MAX_TEMPERATURE:g}], got {temperature}"
         )
-    top_p = request.top_p
-    if top_p is not None and not 0.0 < top_p <= 1.0:
-        raise ValueError(f"top_p must be in (0, 1], got {top_p}")
-    top_k = request.top_k
-    if top_k is not None and top_k != -1 and top_k < 1:
-        raise ValueError(f"top_k must be -1 (disabled) or >= 1, got {top_k}")
     for name in ("max_tokens", "max_completion_tokens"):
         value = getattr(request, name, None)
         if value is not None and value < 1:
@@ -209,20 +194,25 @@ def _validate_sampling(request: ChatCompletionRequest) -> None:
         raise ValueError("seed must fit in a signed 64-bit integer")
 
 
-def _validate_assistant_tool_calls(tool_calls: Any) -> List[str]:
+def _validate_assistant_tool_calls(tool_calls: Any) -> list[str]:
     """Validate one assistant message's ``tool_calls``; return their ids."""
     if not isinstance(tool_calls, list) or not tool_calls:
         raise ValueError("'tool_calls' must be a non-empty array")
-    ids: List[str] = []
+    ids: list[str] = []
     for entry in tool_calls:
         if not isinstance(entry, dict):
-            raise ValueError("each entry of 'tool_calls' must be an object")
+            # ValueError, not TypeError: the endpoint maps it to HTTP 400.
+            raise ValueError(  # noqa: TRY004
+                "each entry of 'tool_calls' must be an object"
+            )
         call_type = entry.get("type", "function")
         if call_type != "function":
             raise ValueError(f"unsupported tool_call type '{call_type}'")
         fn = entry.get("function")
         if not isinstance(fn, dict):
-            raise ValueError("each tool_call requires a 'function' object")
+            raise ValueError(  # noqa: TRY004
+                "each tool_call requires a 'function' object"
+            )
         name = fn.get("name")
         if not isinstance(name, str) or not name.strip():
             raise ValueError("each tool_call requires a non-empty 'function.name'")
@@ -234,7 +224,7 @@ def _validate_assistant_tool_calls(tool_calls: Any) -> List[str]:
                     "expected a JSON object string"
                 )
         elif not isinstance(arguments, dict):
-            raise ValueError(
+            raise ValueError(  # noqa: TRY004
                 f"tool_call '{name}': 'function.arguments' must be a JSON object "
                 "string"
             )
@@ -249,7 +239,7 @@ def _validate_message_sequence(messages: Sequence[ChatMessage]) -> None:
     """Validate roles and the assistant-tool_calls / tool-response pairing."""
     announced_ids: set = set()
     # tool_call_id -> index of the assistant message that requested it
-    unanswered: Dict[str, int] = {}
+    unanswered: dict[str, int] = {}
     last_index = len(messages) - 1
 
     for index, message in enumerate(messages):
@@ -304,7 +294,7 @@ def _validate_message_sequence(messages: Sequence[ChatMessage]) -> None:
 
 def validate_request_messages(
     request: ChatCompletionRequest,
-) -> List[ChatMessage]:
+) -> list[ChatMessage]:
     """Validate the parts of a chat request ``serving_chat`` does not, and
     return its messages.
 

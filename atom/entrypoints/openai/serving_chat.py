@@ -69,12 +69,20 @@ def normalize_chat_tools(tools: Any) -> Any:
     return normalized
 
 
+#: ``thinking.type`` values that leave the choice to the model, so they resolve
+#: to "no preference" rather than to ``True``. MiniMax-M3's template treats this
+#: as a third mode, distinct from ``enabled``, and leaving its switch unset is
+#: what renders that mode.
+THINKING_MODEL_DECIDES = frozenset({"adaptive", "auto"})
+
+
 def resolve_thinking(request: ChatCompletionRequest) -> tuple[bool | None, str | None]:
     """Resolve (enabled, effort) from the request's thinking / reasoning_effort.
 
     ``thinking`` (extra_body) takes precedence over ``reasoning_effort``.
     Thinking is disabled when ``thinking.type == "disabled"`` or
-    ``reasoning_effort == "none"``. Effort is only returned when it is one of
+    ``reasoning_effort == "none"``, and left to the model for the values in
+    :data:`THINKING_MODEL_DECIDES`. Effort is only returned when it is one of
     the values the template understands.
 
     ``enabled`` is ``None`` when the request stated no preference -- setting
@@ -87,8 +95,10 @@ def resolve_thinking(request: ChatCompletionRequest) -> tuple[bool | None, str |
     """
     thinking = request.thinking or {}
     enabled: bool | None = None
-    if isinstance(thinking, dict) and thinking.get("type") is not None:
-        enabled = thinking.get("type") != "disabled"
+    if isinstance(thinking, dict):
+        kind = thinking.get("type")
+        if kind is not None and kind not in THINKING_MODEL_DECIDES:
+            enabled = kind != "disabled"
     if request.reasoning_effort == "none":
         enabled = False
 
@@ -232,6 +242,7 @@ async def stream_chat_response(
     tool_choice=None,
     reasoning: ReasoningChannel = NO_REASONING,
     tool_parser_cls=None,
+    tool_call_prefix: str = "",
 ) -> AsyncGenerator[str, None]:
     """Generate streaming chat completion response with reasoning and tool calls.
 
@@ -260,6 +271,9 @@ async def stream_chat_response(
         suppress_calls=forbids_tool_calls(tool_choice),
     )
     has_tool_calls = False
+    # Prepended to the first chunk so it enters the reasoning filter and the tool
+    # reader in the same order the model's own text would.
+    pending_prefix = tool_call_prefix
 
     kv_transfer_params_value = None
 
@@ -278,6 +292,9 @@ async def stream_chat_response(
                 )
                 role_sent = True
             new_text = chunk_data["text"]
+            if pending_prefix:
+                new_text = pending_prefix + new_text
+                pending_prefix = ""
             if chunk_data.get("finish_reason"):
                 engine_finish_reason = chunk_data["finish_reason"]
             num_tokens_output += len(chunk_data.get("token_ids", []))
@@ -383,6 +400,7 @@ def _build_chat_choice(
     tool_choice=None,
     reasoning: ReasoningChannel = NO_REASONING,
     tool_parser_cls=None,
+    tool_call_prefix: str = "",
 ) -> dict[str, Any]:
     """Build one entry of ``choices[...]`` from a raw output string.
 
@@ -390,7 +408,7 @@ def _build_chat_choice(
     (SamplingParams.n>1) can reuse the reasoning + tool-call separation
     without duplicating the logic.
     """
-    reasoning_content, content_with_tools = reasoning.split(raw_text)
+    reasoning_content, content_with_tools = reasoning.split(tool_call_prefix + raw_text)
     content, tool_calls = parse_tool_calls(
         content_with_tools,
         tools,
@@ -432,6 +450,7 @@ def build_chat_response(
     tool_choice=None,
     reasoning: ReasoningChannel = NO_REASONING,
     tool_parser_cls=None,
+    tool_call_prefix: str = "",
 ) -> ChatCompletionResponse:
     """Build a non-streaming chat completion response (single choice)."""
     response = ChatCompletionResponse(
@@ -447,6 +466,7 @@ def build_chat_response(
                 tool_choice=tool_choice,
                 reasoning=reasoning,
                 tool_parser_cls=tool_parser_cls,
+                tool_call_prefix=tool_call_prefix,
             )
         ],
         usage={
@@ -479,6 +499,7 @@ def build_chat_response_multi(
     tool_choice=None,
     reasoning: ReasoningChannel = NO_REASONING,
     tool_parser_cls=None,
+    tool_call_prefix: str = "",
 ) -> ChatCompletionResponse:
     """Build a non-streaming response with one choice per fan-out sibling.
 
@@ -498,6 +519,7 @@ def build_chat_response_multi(
             tool_choice=tool_choice,
             reasoning=reasoning,
             tool_parser_cls=tool_parser_cls,
+            tool_call_prefix=tool_call_prefix,
         )
         for i, out in enumerate(final_outputs)
     ]
@@ -541,6 +563,7 @@ async def stream_chat_response_fanout(
     tool_choice=None,
     reasoning: ReasoningChannel = NO_REASONING,
     tool_parser_cls=None,
+    tool_call_prefix: str = "",
 ) -> AsyncGenerator[str, None]:
     """Streaming variant that multiplexes ``len(seq_ids)`` fan-out siblings
     into a single SSE stream, tagging every chunk with ``choices[0].index``.
@@ -567,6 +590,9 @@ async def stream_chat_response_fanout(
         for _ in range(n)
     ]
     has_tool_calls = [False] * n
+    # Per sibling: they answer the same prompt, so each output misses the same
+    # opener.
+    pending_prefix = [tool_call_prefix] * n
     # See the single-choice path: the engine's reason, per sibling.
     engine_finish_reasons: list[str | None] = [None] * n
     finished = [False] * n
@@ -595,6 +621,9 @@ async def stream_chat_response_fanout(
                 # Defensive: should not happen, engine emits finished once per seq.
                 continue
             new_text = chunk_data["text"]
+            if pending_prefix[idx]:
+                new_text = pending_prefix[idx] + new_text
+                pending_prefix[idx] = ""
             if chunk_data.get("finish_reason"):
                 engine_finish_reasons[idx] = chunk_data["finish_reason"]
             num_tokens_output[idx] += len(chunk_data.get("token_ids", []))

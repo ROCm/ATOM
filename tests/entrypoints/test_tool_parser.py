@@ -1654,3 +1654,190 @@ class TestTheRegionIsNotCopiedToReadACallsLeftEdge:
             f"128 KB allocated {b} bytes against {a} for 1 KB; the region is "
             "being copied on every step of the walk"
         )
+
+
+# ============================================================================
+# MiniMax: a value whose schema says it nests
+# ============================================================================
+
+
+NS = "]<]minimax[>["
+
+NESTING_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "book",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "guests": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "age": {"type": "integer"},
+                            },
+                        },
+                    },
+                    "tags": {"type": "array", "items": {"type": "string"}},
+                    "opts": {
+                        "type": "object",
+                        "properties": {
+                            "seat": {"type": "string"},
+                            "meal": {
+                                "type": "object",
+                                "properties": {"kind": {"type": "string"}},
+                            },
+                        },
+                    },
+                    "note": {"type": "string"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "plan",
+            # Schema-less object items: the shape that made undeclared keys
+            # appear on every element.
+            "parameters": {
+                "type": "object",
+                "properties": {"todo": {"type": "array", "items": {"type": "object"}}},
+            },
+        },
+    },
+    {
+        "type": "function",
+        # Properties declared inside a composition rather than at the top level.
+        "function": {
+            "name": "composed",
+            "parameters": {
+                "type": "object",
+                "oneOf": [
+                    {"properties": {"count": {"type": "integer"}}},
+                    {"properties": {"items": {"type": "array"}}},
+                ],
+            },
+        },
+    },
+]
+
+
+def minimax_call(name: str, body: str) -> str:
+    return (
+        f'{NS}<tool_call>\n{NS}<invoke name="{name}">{body}'
+        f"{NS}</invoke>\n{NS}</tool_call>"
+    )
+
+
+def minimax_args(name: str, body: str, tools=NESTING_TOOLS) -> dict:
+    _, calls = parse_tool_calls(minimax_call(name, body), tools, MiniMaxParser)
+    assert calls, "no call parsed"
+    return json.loads(calls[0].function["arguments"])
+
+
+class TestMiniMaxReadsANestedValueAsItsSchemaDeclaresIt:
+    """An object or array argument is written as child elements. Read flat,
+    `<tags><item>a</item></tags>` is an empty `tags` plus a stray `item`."""
+
+    def test_array_of_strings(self):
+        args = minimax_args(
+            "book",
+            f"{NS}<tags>{NS}<item>a{NS}</item>{NS}<item>b{NS}</item>{NS}</tags>",
+        )
+        assert args == {"tags": ["a", "b"]}
+
+    def test_array_of_objects_types_every_field(self):
+        args = minimax_args(
+            "book",
+            f"{NS}<guests>"
+            f"{NS}<item>{NS}<name>Ada{NS}</name>{NS}<age>36{NS}</age>{NS}</item>"
+            f"{NS}<item>{NS}<name>Bob{NS}</name>{NS}<age>41{NS}</age>{NS}</item>"
+            f"{NS}</guests>",
+        )
+        assert args == {
+            "guests": [{"name": "Ada", "age": 36}, {"name": "Bob", "age": 41}]
+        }
+
+    def test_nested_object_four_levels_deep(self):
+        args = minimax_args(
+            "book",
+            f"{NS}<opts>{NS}<seat>12A{NS}</seat>"
+            f"{NS}<meal>{NS}<kind>vegan{NS}</kind>{NS}</meal>{NS}</opts>",
+        )
+        assert args == {"opts": {"seat": "12A", "meal": {"kind": "vegan"}}}
+
+    def test_schema_less_object_items_gain_no_extra_keys(self):
+        args = minimax_args(
+            "plan",
+            f"{NS}<todo>"
+            f"{NS}<item>{NS}<title>Buy milk{NS}</title>{NS}<done>false{NS}</done>"
+            f"{NS}</item>{NS}</todo>",
+        )
+        assert args == {"todo": [{"title": "Buy milk", "done": False}]}
+
+    def test_properties_declared_inside_a_composition_are_still_typed(self):
+        args = minimax_args("composed", f"{NS}<count>42{NS}</count>")
+        assert args == {"count": 42}
+
+    def test_an_empty_array_element_is_an_empty_list(self):
+        assert minimax_args("book", f"{NS}<tags>{NS}</tags>") == {"tags": []}
+
+    def test_a_lone_scalar_where_an_array_was_declared_is_wrapped(self):
+        assert minimax_args("book", f"{NS}<tags>solo{NS}</tags>") == {"tags": ["solo"]}
+
+
+class TestMiniMaxTakesADeclaredStringVerbatim:
+    """A declared ``string`` is text, whatever it contains."""
+
+    def test_markup_inside_a_string_is_not_read_as_more_arguments(self):
+        args = minimax_args("book", f"{NS}<note><h1>Hi</h1> a < b{NS}</note>")
+        assert args == {"note": "<h1>Hi</h1> a < b"}
+
+    def test_a_trailing_newline_belongs_to_the_value(self):
+        args = minimax_args("book", f"{NS}<note>hello\nworld\n{NS}</note>")
+        assert args == {"note": "hello\nworld\n"}
+
+    def test_a_leading_newline_belongs_to_the_value_too(self):
+        args = minimax_args("book", f"{NS}<note>\nindented{NS}</note>")
+        assert args == {"note": "\nindented"}
+
+
+class TestMiniMaxRecoversAnOpeningTagTheTokenizerErased:
+    """Several of M3's added tokens are tag-shaped and marked special, so
+    ``decode(skip_special_tokens=True)`` erases the opener but not the closer."""
+
+    def test_an_orphaned_closing_tag_directly_inside_invoke_is_recovered(self):
+        args = minimax_args("book", f"Ada{NS}</note>")
+        assert args == {"note": "Ada"}
+
+    def test_an_orphaned_tag_nested_in_an_object_needs_the_schema_to_name_it(self):
+        args = minimax_args("book", f"{NS}<opts>12A{NS}</seat>{NS}</opts>")
+        assert args == {"opts": {"seat": "12A"}}
+
+
+class TestMiniMaxStartsAForcedCall:
+    def test_the_opener_is_this_formats_own(self):
+        assert MiniMaxParser.call_prefill() == f"{NS}<tool_call>\n"
+
+    def test_a_named_choice_opens_that_invocation(self):
+        assert MiniMaxParser.call_prefill("book").endswith(f'{NS}<invoke name="book">')
+
+    def test_a_name_carrying_markup_is_declined_rather_than_emitted(self):
+        assert MiniMaxParser.call_prefill('book"><evil') == ""
+
+    def test_the_opener_plus_what_the_model_writes_next_parses(self):
+        rest = f'{NS}<invoke name="book">{NS}<note>hi{NS}</note>{NS}</invoke>'
+        _, calls = parse_tool_calls(
+            MiniMaxParser.call_prefill() + rest, NESTING_TOOLS, MiniMaxParser
+        )
+        assert [c.function["name"] for c in calls] == ["book"]
+
+    def test_a_format_that_declares_no_opener_forces_nothing(self):
+        """An opener has to be checked against the model that emits it before
+        the server can put it in a prompt."""
+        assert QwenXmlParser.call_prefill() == ""
+        assert KimiParser.call_prefill("x") == ""

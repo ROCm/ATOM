@@ -61,14 +61,6 @@ class TestSamplingValidation:
     def test_temperature_in_range_is_accepted(self, temperature):
         validate_request_messages(_request(temperature=temperature))
 
-    def test_top_p_out_of_range_is_rejected(self):
-        with pytest.raises(ValueError, match=r"top_p must be in \(0, 1\]"):
-            validate_request_messages(_request(top_p=1.5))
-
-    def test_top_k_zero_is_rejected(self):
-        with pytest.raises(ValueError, match="top_k"):
-            validate_request_messages(_request(top_k=0))
-
     def test_negative_max_tokens_is_rejected(self):
         with pytest.raises(ValueError, match="max_tokens must be >= 1"):
             validate_request_messages(_request(max_tokens=-1))

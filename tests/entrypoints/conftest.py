@@ -46,7 +46,7 @@ def _stub_unimportable(mod_name: str, attr_name: str, stub_cls) -> bool:
         return False
     try:
         importlib.import_module(mod_name)
-    except Exception:
+    except Exception:  # noqa: BLE001 - any import failure means "stub it"
         stub = types.ModuleType(mod_name)
         setattr(stub, attr_name, stub_cls)
         sys.modules[mod_name] = stub
@@ -96,7 +96,7 @@ _injected = [
 ]
 try:
     importlib.import_module("atom.entrypoints.openai.api_server")
-except Exception:
+except Exception:  # noqa: BLE001, S110 - see below
     # Left to each test module to skip on; the endpoint tests are optional
     # coverage on environments missing PIL/transformers/uvicorn.
     pass

@@ -271,10 +271,10 @@ For PD-disaggregated serving (1P+1D, 2P+1D DPA, with/without EAGLE3), see
 
 ## Full-capability serving
 
-This profile serves MiniMax-M3 with the features it ships: tool calling, the
-per-request thinking toggle, `role=root`, its full context window, and
-prefix-cache reporting. Add `--api-key` when the deployment should require
-authentication; omit it and the server stays open.
+This profile serves MiniMax-M3 with the features it ships: `tool_choice`, the
+per-request thinking toggle, `role=root`, and its full context window. Add
+`--api-key` when the deployment should require authentication; omit it and the
+server stays open.
 
 ```bash
 export model_path=amd/MiniMax-M3-MXFP4
@@ -302,18 +302,13 @@ python -m atom.entrypoints.openai_server \
   `-tp 4` with `--gpu-memory-utilization 0.9`. The cost is concurrency, which is
   why `--max-num-seqs` is 64 here. Lower the window (`524288`, `262144`, …) to
   buy concurrency back.
-- Prefix caching is on by default and is what populates
-  `usage.prompt_tokens_details.cached_tokens`.
 
 ### Capabilities
 
 | Capability | How to use it |
 |:---|:---|
-| Tool calling | standard OpenAI `tools`; streamed and non-streamed `tool_calls`, parallel calls, `finish_reason: "tool_calls"` |
 | `tool_choice` | `auto` / `none` / `required` / `{"type":"function","function":{"name":…}}` |
 | Thinking toggle | `"thinking": {"type": "enabled"}`, `{"type": "disabled"}` or `{"type": "adaptive"}` (model decides) per request |
-| Reasoning split | `message.reasoning_content` (non-stream) and `delta.reasoning_content` (stream) |
 | `role=root` | highest-priority instruction, overrides `system` |
-| Prefix-cache reporting | `usage.prompt_tokens_details.cached_tokens` |
 | API-key auth | `--api-key` / `ATOM_API_KEY`; `Authorization: Bearer <key>` or `x-api-key` |
 | Request correlation | `x-request-id` on every response, including errors |

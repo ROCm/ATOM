@@ -42,7 +42,6 @@ clients (curl, OpenAI SDK, lm-eval) work without modification.
 |--------|------|-------------|
 | `POST` | `/v1/chat/completions` | Chat completion (ChatCompletionRequest -> ChatCompletionResponse) |
 | `POST` | `/v1/completions` | Text completion (CompletionRequest -> CompletionResponse) |
-| `POST` | `/v1/messages` | Anthropic Messages API (for Claude Code and other Anthropic-format clients) |
 | `GET`  | `/v1/models` | List available models |
 | `GET`  | `/health` | Health check (returns `{"status": "ok"}`) |
 | `POST` | `/start_profile` | Start torch profiler on the engine |
@@ -55,24 +54,16 @@ clients (curl, OpenAI SDK, lm-eval) work without modification.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `model` | `Optional[str]` | `None` | Model name (validated against the loaded model) |
-| `messages` | `Optional[List[ChatMessage]]` | `None` | Chat messages (`role`, `content`, plus `tool_calls` / `tool_call_id` / `name`) |
+| `messages` | `Optional[List[ChatMessage]]` | `None` | List of chat messages (`role`, `content`) |
 | `prompt` | `Optional[List[ChatMessage]]` | `None` | Alias for `messages` |
-| `temperature` | `Optional[float]` | `1.0` | Sampling temperature, `0`–`2` |
-| `top_p` | `Optional[float]` | `1.0` | Nucleus sampling threshold, `(0, 1]` |
-| `top_k` | `Optional[int]` | `-1` | Top-k cutoff; `-1` disables |
-| `max_tokens` | `Optional[int]` | `8192` | Maximum tokens to generate (`>= 1`) |
-| `max_completion_tokens` | `Optional[int]` | `None` | OpenAI's newer name for `max_tokens`; takes precedence |
-| `n` | `Optional[int]` | `1` | Number of samples (collapses to 1 under greedy sampling) |
+| `temperature` | `Optional[float]` | `1.0` | Sampling temperature |
+| `top_p` | `Optional[float]` | `1.0` | Nucleus sampling threshold |
+| `max_tokens` | `Optional[int]` | `256` | Maximum tokens to generate |
 | `stop` | `Optional[str \| List[str]]` | `None` | Stop string(s) |
 | `ignore_eos` | `Optional[bool]` | `False` | Ignore end-of-sequence token |
 | `stream` | `Optional[bool]` | `False` | Enable server-sent events streaming |
-| `seed` | `Optional[int]` | `None` | Makes sampling reproducible: the draw at each position is derived from `(seed, position)`. Best-effort — see [Reproducible sampling](#reproducible-sampling) |
-| `presence_penalty` | `Optional[float]` | `0.0` | Accepted and range-checked (`[-2, 2]`) for client compatibility; **not applied** to sampling |
-| `frequency_penalty` | `Optional[float]` | `0.0` | Accepted and range-checked (`[-2, 2]`) for client compatibility; **not applied** to sampling |
-| `tools` | `Optional[List[Dict]]` | `None` | OpenAI tool definitions, forwarded to the chat template |
-| `tool_choice` | `Optional[str \| Dict]` | `"auto"` | `auto`, `none`, `required`, or `{"type":"function","function":{"name":…}}` |
-| `thinking` | `Optional[Dict \| bool]` | `None` | Reasoning toggle: `{"type": "enabled"}` / `{"type": "disabled"}` |
-| `chat_template_kwargs` | `Optional[Dict]` | `None` | Extra kwargs for template rendering; wins over server defaults |
+| `seed` | `Optional[int]` | `None` | Random seed |
+| `thinking` | `Optional[Dict]` | `None` | Reasoning toggle: `{"type": "enabled"}`, `{"type": "disabled"}` or `{"type": "adaptive"}` (let the model decide) |
 
 **CompletionRequest** fields:
 
@@ -82,13 +73,11 @@ clients (curl, OpenAI SDK, lm-eval) work without modification.
 | `prompt` | `str` | (required) | Text prompt |
 | `temperature` | `Optional[float]` | `1.0` | Sampling temperature |
 | `top_p` | `Optional[float]` | `1.0` | Nucleus sampling threshold |
-| `top_k` | `Optional[int]` | `-1` | Top-k cutoff; `-1` disables |
-| `max_tokens` | `Optional[int]` | `8192` | Maximum tokens to generate |
-| `n` | `Optional[int]` | `1` | Number of samples |
+| `max_tokens` | `Optional[int]` | `256` | Maximum tokens to generate |
 | `stop` | `Optional[str \| List[str]]` | `None` | Stop string(s) |
 | `ignore_eos` | `Optional[bool]` | `False` | Ignore end-of-sequence token |
 | `stream` | `Optional[bool]` | `False` | Enable SSE streaming |
-| `seed` | `Optional[int]` | `None` | Same meaning as for chat |
+| `seed` | `Optional[int]` | `None` | Random seed |
 
 ### Response models
 
@@ -99,51 +88,36 @@ Both `ChatCompletionResponse` and `CompletionResponse` include:
 - `created` — Unix timestamp
 - `model` — model name
 - `choices` — list of generated completions
-- `usage` — token counts (`prompt_tokens`, `completion_tokens`, `total_tokens`),
-  `prompt_tokens_details.cached_tokens` (prefix-cache hits), plus `ttft_s`,
-  `tpot_s`, and `latency_s` timing fields
+- `usage` — token counts (`prompt_tokens`, `completion_tokens`, `total_tokens`)
+  plus `ttft_s`, `tpot_s`, and `latency_s` timing fields
 
-Chat `choices[].message` additionally carries, when applicable:
-
-- `reasoning_content` — the model's thinking, split out of `content`
-- `tool_calls` — parsed tool calls in OpenAI format; `content` is `null` and
-  `finish_reason` is `"tool_calls"` for a tool-only turn
-
-Streaming responses use the SSE (Server-Sent Events) protocol. Every chunk
-carries `id`, `object` and `choices`; deltas use `content`, `reasoning_content`
-and `tool_calls`. The last chunk before `data: [DONE]\n\n` carries `usage` with
-`choices: []`.
+Streaming responses use the SSE (Server-Sent Events) protocol with
+`data: [DONE]\n\n` as the termination signal.
 
 ### Tool calling
 
-Tool calls are emitted by models in one of three on-the-wire formats, all
-auto-detected and normalized into OpenAI `tool_calls` by
-`atom/entrypoints/openai/tool_parser.py`:
+`tool_choice` controls whether the model may call a tool:
 
-| Model family | Format |
-|--------------|--------|
-| Kimi-K2 | `<\|tool_calls_section_begin\|>` special tokens |
-| Qwen3 (qwen3_coder / qwen3_xml) | `<tool_call><function=NAME><parameter=P>…` |
-| MiniMax-M2 / MiniMax-M3 | `<minimax:tool_call><invoke name="NAME"><parameter name="P">…` |
+| Value | What happens |
+|---|---|
+| `auto` (default) | the model decides |
+| `none` | the model will not call a tool |
+| `required` | the server pushes the model into making a call |
+| `{"type":"function","function":{"name":"X"}}` | only `X` is offered, and the server pushes the model into calling that one |
 
-Neither XML dialect carries value types, so parameters are coerced to the types
-declared in the request's `tools` JSON Schema. Because ATOM has no constrained
-decoding, `tool_choice: "required"` and named choices are steered with a
-system-level instruction rather than guaranteed by a grammar; `tool_choice:
-"none"` is exact — the tools are not advertised and the output is not scanned.
+`required` and named choices are best-effort. ATOM has no constrained decoding,
+so the server starts the call for the model rather than guaranteeing one, and it
+can only do that for formats it knows how to start — MiniMax today.
+
+When the reply is only a tool call, `content` is `null` and `finish_reason` is
+`"tool_calls"`.
 
 ### Errors
 
-Invalid input is rejected before it reaches the chat template or the engine, with
-the status codes the OpenAI API uses and an
-`{"error": {"message", "type", "code"}}` body:
-
-| Status | When |
-|--------|------|
-| `400` | malformed request: unknown role, empty `messages`, out-of-range sampling params, `max_tokens < 1`, bad tool schema / `tool_choice`, unparseable `function.arguments`, tool replies that do not match the announced `tool_call_id`s, prompt + `max_tokens` over `--max-model-len` |
-| `401` | missing or wrong API key (only when the server was started with `--api-key` / `ATOM_API_KEY`) |
-| `499` | client disconnected mid-generation |
-| `500` | internal error |
+A bad request now comes back as `400` with an
+`{"error": {"message", "type", "code"}}` body instead of reaching the model. If
+the server was started with `--api-key` (or `ATOM_API_KEY`), a request without
+the right key gets `401`.
 
 #### Delivery under load
 
@@ -541,8 +515,6 @@ Server-specific CLI arguments:
 | `--host` | `0.0.0.0` | Bind address |
 | `--server-port` | `8000` | HTTP port (note: `--port` is for internal engine communication) |
 | `--api-key` | — | Require this key on every request (`Authorization: Bearer <key>` or `x-api-key`); repeatable. Falls back to `ATOM_API_KEY`. Unset = no authentication |
-| `--default-chat-template-kwargs` | — | JSON of default chat-template kwargs, e.g. `'{"enable_thinking": false}'`; per-request `chat_template_kwargs` wins |
-| `--request-log` | — | JSONL file capturing every request/response (debug) |
 | `--timeout-keep-alive` | `5` | Seconds an idle keep-alive connection is held. Pooling clients hold their end longer (aiohttp defaults to 15s), so a caller that pauses for longer than this reuses a socket the server already closed and has to re-send. Raise it past the caller's idle window to avoid that |
 | `--disable-uvicorn-access-log` | off | Stop uvicorn logging a line per HTTP request. It copies a `LogRecord` and writes to the same stdout as the engine, on the event loop |
 | `--tool-call-parser` | `auto` | Tool-call wire format. `auto` reads it from the model's chat template at startup (Jinja, or a model-side `encoding/encoding_*.py`); a name — `dsml`, `glm`, `kimi`, `kimi_k3`, `minimax`, `qwen` — overrides. When neither resolves, tool calls are delivered as plain text and the startup log says so; the format is never guessed from output. On the OpenAI server an unknown name is refused at startup, before the weights load, rather than silently disabling tool parsing. The atomesh entrypoint deliberately does not refuse: it shares the flag with the mesh router, which declares its own vocabulary for it, so a name ATOM does not recognise is logged at INFO, forwarded to the router, and ATOM falls back to reading the chat template. Check the log for `is not one of ATOM's formats` if a format you specified is not taking effect |

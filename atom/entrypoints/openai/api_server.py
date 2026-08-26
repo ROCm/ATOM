@@ -475,6 +475,21 @@ def _named_tool_choice(tool_choice: Any) -> str | None:
     return None
 
 
+def _forces_tool_call(tool_choice: Any) -> bool:
+    return (
+        tool_choice in ("required", "any")
+        or _named_tool_choice(tool_choice) is not None
+    )
+
+
+def _close_open_reasoning(prompt: str) -> str:
+    # A forced call is appended to the assistant turn, and appending it inside an
+    # open reasoning block would make the call part of the model's thinking.
+    if reasoning_dialect is None or not prompt_starts_in_reasoning(prompt):
+        return prompt
+    return prompt + reasoning_dialect.think_end_marker
+
+
 def _build_sampling_params(
     temperature: float,
     max_tokens: int,
@@ -1689,10 +1704,9 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             merged_kwargs["tool_choice"] = request.tool_choice
         named_tool = _named_tool_choice(request.tool_choice)
         if named_tool is not None:
-            # A named choice is otherwise validated and then never communicated:
-            # the template is only told about string choices. Offering that one
-            # tool is the part of "call exactly this" the server can enforce --
-            # a model cannot call a tool it was not given.
+            # A model cannot call a tool it was never given. That it calls one at
+            # all is the prefill further down: a template may ignore the kwarg
+            # below, and M3's does.
             merged_kwargs["tool_choice"] = "required"
             request.tools = [
                 t
@@ -1760,6 +1774,20 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 **merged_kwargs,
             )
 
+        # Start the call rather than ask for it: ATOM has no constrained
+        # decoding, and the kwarg above is a no-op on a template that does not
+        # read it. A format with no opener leaves the prompt untouched.
+        tool_call_prefix = ""
+        if (
+            not is_multimodal
+            and tool_call_parser_cls is not None
+            and _forces_tool_call(request.tool_choice)
+        ):
+            prefill = tool_call_parser_cls.call_prefill(named_tool)
+            if prefill:
+                prompt = _close_open_reasoning(prompt) + prefill
+                tool_call_prefix = prefill
+
         # The K3 template may inject the opening reasoning marker into the prompt
         # itself; if so the stream begins mid-thought and the ReasoningFilter must
         # start in the thinking state. Multimodal inputs arrive pre-tokenized.
@@ -1799,6 +1827,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     tool_choice=request.tool_choice,
                     reasoning=_reasoning,
                     tool_parser_cls=tool_call_parser_cls,
+                    tool_call_prefix=tool_call_prefix,
                 )
             else:
                 seq_id, stream_collector, num_prompt_tokens = (
@@ -1823,6 +1852,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     tool_choice=request.tool_choice,
                     reasoning=_reasoning,
                     tool_parser_cls=tool_call_parser_cls,
+                    tool_call_prefix=tool_call_prefix,
                 )
             return StreamingResponse(
                 _client_stream(gen, request_id),
@@ -1853,6 +1883,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 tool_choice=request.tool_choice,
                 reasoning=_reasoning,
                 tool_parser_cls=tool_call_parser_cls,
+                tool_call_prefix=tool_call_prefix,
             )
         elif is_multimodal:
             final_output = await _run_nonstream_with_disconnect(
@@ -1877,6 +1908,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 tool_choice=request.tool_choice,
                 reasoning=_reasoning,
                 tool_parser_cls=tool_call_parser_cls,
+                tool_call_prefix=tool_call_prefix,
             )
         elif effective_n > 1:
             outputs = await _race_disconnect(
@@ -1900,6 +1932,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 tool_choice=request.tool_choice,
                 reasoning=_reasoning,
                 tool_parser_cls=tool_call_parser_cls,
+                tool_call_prefix=tool_call_prefix,
             )
         else:
             final_output = await _run_nonstream_with_disconnect(
@@ -1924,6 +1957,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 tool_choice=request.tool_choice,
                 reasoning=_reasoning,
                 tool_parser_cls=tool_call_parser_cls,
+                tool_call_prefix=tool_call_prefix,
             )
         _log_request_model("response", request_id, resp)
         return resp

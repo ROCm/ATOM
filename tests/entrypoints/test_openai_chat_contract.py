@@ -22,7 +22,7 @@ from __future__ import annotations
 import itertools
 import json
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import pytest
 
@@ -35,9 +35,9 @@ try:
     from atom.entrypoints.openai.tool_parser.minimax_tool_parser import MiniMaxParser
 
     MINIMAX_DIALECT, _ = resolve_dialect("<mm:think>", "")
-except Exception as exc:  # pragma: no cover - environment-dependent skip
+except Exception as exc:  # noqa: BLE001 # pragma: no cover - env-dependent skip
     api_server = None  # type: ignore[assignment]
-    _import_error: Optional[Exception] = exc
+    _import_error: Exception | None = exc
 else:
     _import_error = None
 
@@ -103,10 +103,10 @@ class FakeTokenizer:
     def __init__(self, primes_thinking: bool = True, chat_template: str = "") -> None:
         self.primes_thinking = primes_thinking
         self.chat_template = chat_template
-        self.pieces: List[str] = []
-        self.last_template_call: Optional[Dict[str, Any]] = None
+        self.pieces: list[str] = []
+        self.last_template_call: dict[str, Any] | None = None
 
-    def register(self, pieces: List[str]) -> List[int]:
+    def register(self, pieces: list[str]) -> list[int]:
         start = len(self.pieces)
         self.pieces.extend(pieces)
         return list(range(start, len(self.pieces)))
@@ -134,7 +134,7 @@ class FakeTokenizer:
             rendered += "<mm:think>"
         return rendered
 
-    def encode(self, text, **_kwargs) -> List[int]:
+    def encode(self, text, **_kwargs) -> list[int]:
         return list(range(max(1, len(text) // 4)))
 
     def decode(self, token_ids, skip_special_tokens: bool = True) -> str:
@@ -149,20 +149,20 @@ class FakeEngine:
         self.config = SimpleNamespace(max_model_len=max_model_len)
         self.io_processor = self
         self.core_mgr = self
-        self.requests: Dict[int, Any] = {}
-        self.output_pieces: List[str] = ["Hello!"]
+        self.requests: dict[int, Any] = {}
+        self.output_pieces: list[str] = ["Hello!"]
         # The scheduler's own vocabulary, not OpenAI's -- see
         # protocol.openai_finish_reason. Using a realistic value here is
         # what makes every finish_reason assertion in this file able to
         # catch the mapping being unwired.
         self.finish_reason = "eos"
         self.num_cached_tokens = 0
-        self.prompt_tokens_override: Optional[int] = None
+        self.prompt_tokens_override: int | None = None
         self.last_prompt: Any = None
         self.last_sampling_params: Any = None
-        self.aborted: List[int] = []
+        self.aborted: list[int] = []
         self._seq_ids = itertools.count(1)
-        self._pending: List[Any] = []
+        self._pending: list[Any] = []
 
     # -- io_processor surface ------------------------------------------------
     def preprocess(
@@ -271,7 +271,7 @@ class Harness:
         payload.update(body)
         return self.client.post("/v1/chat/completions", json=payload)
 
-    def stream(self, **body) -> List[Dict[str, Any]]:
+    def stream(self, **body) -> list[dict[str, Any]]:
         """POST a streaming request and return the parsed SSE chunks."""
         response = self.chat(stream=True, **body)
         assert response.status_code == 200, response.text
@@ -284,7 +284,7 @@ class Harness:
         return chunks
 
     @property
-    def rendered(self) -> Dict[str, Any]:
+    def rendered(self) -> dict[str, Any]:
         assert self.tokenizer.last_template_call is not None
         return self.tokenizer.last_template_call
 
@@ -493,6 +493,18 @@ class TestThinking:
         assert message["reasoning_content"] == "reasoning"
         assert message["content"] == "answer"
 
+    @pytest.mark.parametrize("mode", ["adaptive", "auto"])
+    def test_thinking_adaptive_leaves_the_switch_alone(self, server, mode):
+        """Verifier cases 15_01 / 14_09 send ``{"type": "adaptive"}``.
+
+        It is a third mode, not a spelling of ``enabled``: the template leaves
+        the generation prompt without the opening marker so the model decides
+        per turn, and not writing the kwarg is what reproduces that.
+        """
+        server.answers("answer")
+        server.chat(thinking={"type": mode})
+        assert "enable_thinking" not in server.rendered["kwargs"]
+
     def test_reasoning_split_by_default(self, server):
         """Verifier case 18_01."""
         server.says("let me think</mm:think>final answer")
@@ -665,32 +677,95 @@ class TestToolCalls:
 
 
 class TestToolChoice:
-    def test_none_hides_tools_and_never_returns_tool_calls(self, server):
-        """Verifier case 13_08."""
+    def test_none_never_returns_tool_calls(self, server):
+        """Verifier case 13_08.
+
+        The tools stay in the prompt, as on the OpenAI API. What changes is that
+        the output is not scanned, so a model that writes the syntax anyway
+        cannot get a tool call into a response that asked for none.
+        """
         server.answers(MINIMAX_WEATHER_CALL)
         body = server.chat(tools=[WEATHER_TOOL], tool_choice="none").json()
         assert server.rendered["kwargs"]["tool_choice"] == "none"
+        assert server.rendered["tools"] == [WEATHER_TOOL]
         message = body["choices"][0]["message"]
         assert "tool_calls" not in message
         assert body["choices"][0]["finish_reason"] == "stop"
 
-    def test_required_instructs_the_model_to_call_a_tool(self, server):
-        """Verifier case 13_08."""
+    def test_required_starts_the_call_in_the_prompt(self, server):
+        """Verifier case 13_08.
+
+        Asserting on the prompt, not on the template kwarg: M3's template has no
+        ``tool_choice`` variable, so the kwarg alone proves nothing.
+        """
         server.answers(MINIMAX_WEATHER_CALL)
         body = server.chat(tools=[WEATHER_TOOL], tool_choice="required").json()
-        assert server.rendered["kwargs"]["tool_choice"] == "required"
+        assert server.prompt.endswith(MiniMaxParser.call_prefill())
         assert body["choices"][0]["finish_reason"] == "tool_calls"
 
-    def test_named_choice_advertises_only_that_tool(self, server):
+    def test_required_closes_a_primed_thinking_block_first(self, server):
+        """This template opens the reasoning channel at the end of the prompt,
+        and a call appended inside it would be part of the model's thinking."""
+        server.answers(MINIMAX_WEATHER_CALL)
+        server.chat(tools=[WEATHER_TOOL], tool_choice="required")
+        assert "</mm:think>" in server.prompt
+        assert server.prompt.index("</mm:think>") < server.prompt.index(
+            f"{NS}<tool_call>"
+        )
+
+    def test_the_started_call_is_handed_back_to_the_parser(self, server):
+        """The opener is prompt, not output, so the model never re-emits it.
+
+        Without it the parser sees a call body with no opening tag and reports
+        prose, losing the call the model did make.
+        """
+        # What the model writes once the prompt has already opened the call.
+        server.says(
+            f'{NS}<invoke name="get_weather">'
+            f"{NS}<location>Beijing{NS}</location>"
+            f"{NS}</invoke>\n{NS}</tool_call>"
+        )
+        body = server.chat(tools=[WEATHER_TOOL], tool_choice="required").json()
+        calls = body["choices"][0]["message"]["tool_calls"]
+        assert [c["function"]["name"] for c in calls] == ["get_weather"]
+        assert json.loads(calls[0]["function"]["arguments"]) == {"location": "Beijing"}
+
+    def test_the_started_call_survives_streaming(self, server):
+        server.says(
+            f'{NS}<invoke name="get_weather">'
+            f"{NS}<location>Beijing{NS}</location>"
+            f"{NS}</invoke>\n{NS}</tool_call>"
+        )
+        chunks = server.stream(tools=[WEATHER_TOOL], tool_choice="required")
+        names = [
+            tc["function"]["name"]
+            for c in chunks
+            if c != "[DONE]"
+            for choice in c.get("choices", [])
+            for tc in (choice.get("delta") or {}).get("tool_calls") or []
+            if (tc.get("function") or {}).get("name")
+        ]
+        assert names == ["get_weather"]
+
+    def test_named_choice_advertises_and_opens_only_that_tool(self, server):
         """Verifier case 13_08."""
         server.answers(MINIMAX_WEATHER_CALL)
         server.chat(
             tools=[WEATHER_TOOL, SEARCH_TOOL],
             tool_choice={"type": "function", "function": {"name": "get_weather"}},
         )
-        # The model cannot call a tool it was never offered.
+        # The model cannot call a tool it was never offered...
         assert server.rendered["tools"] == [WEATHER_TOOL]
         assert server.rendered["kwargs"]["tool_choice"] == "required"
+        # ...and the invocation it is left to finish names that one.
+        assert server.prompt.endswith(MiniMaxParser.call_prefill("get_weather"))
+
+    def test_auto_never_starts_a_call(self, server):
+        server.answers("no tool needed")
+        server.chat(tools=[WEATHER_TOOL], tool_choice="auto")
+        assert f"{NS}<tool_call>" not in server.prompt
+        server.chat(tools=[WEATHER_TOOL])
+        assert f"{NS}<tool_call>" not in server.prompt
 
     def test_auto_is_the_default(self, server):
         """Verifier case 13_08."""
@@ -734,10 +809,7 @@ class TestSamplingParameters:
         assert server.engine.last_sampling_params.seed is None
 
     def test_penalties_are_accepted_but_not_forwarded(self, server):
-        """The two penalties are compatibility-only: accepted, never applied.
-
-        They are range-checked at the API layer but must not reach the sampler.
-        """
+        """The two penalties are compatibility-only: accepted, never applied."""
         server.answers("ok")
         response = server.chat(presence_penalty=0.5, frequency_penalty=-1.25)
         assert response.status_code == 200
@@ -849,7 +921,7 @@ class TestUsage:
         """Verifier case 10_04."""
         server.engine.num_cached_tokens = 64
         server.answers("a", "b")
-        usage_chunk = [c for c in server.stream()[:-1] if "usage" in c][0]
+        usage_chunk = next(c for c in server.stream()[:-1] if "usage" in c)
         assert usage_chunk["usage"]["prompt_tokens_details"]["cached_tokens"] == 64
 
     def test_cached_tokens_never_exceed_prompt_tokens(self, server):
