@@ -1362,29 +1362,6 @@ class BlockManager:
             }
         )
 
-    def pool_pressure(self) -> dict[str, int]:
-        """Both pools' eviction counts and occupancy, side by side.
-
-        The pair is the point. A hit rate says reuse was lost but not which
-        pool lost it, and the two are sized against each other out of one
-        budget (`plan_pools`) — so the actionable reading is always a
-        comparison: paged evicting while state sits mostly vacant means the
-        split is wrong, both evicting means the budget is.
-        """
-        return (
-            self.kv.eviction_stats()
-            | self.state.occupancy()
-            | self.state.checkpoint_fates()
-            # Held checkpoints the block index can no longer reach. The one
-            # question neither pool can answer alone, so it is assembled here
-            # like the rest of this dict.
-            | {
-                "checkpoints_unreachable": self.state.count_unreachable(
-                    lambda h: self.kv.lookup(h) >= 0
-                )
-            }
-        )
-
     def checkpointers_at(
         self,
         seq: Sequence,

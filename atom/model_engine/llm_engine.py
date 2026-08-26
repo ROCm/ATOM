@@ -388,18 +388,6 @@ class LLMEngine:
             "checkpoints_read_twice",
             "checkpoints_superseded",
             "slots_held",
-            # Pool occupancy. Listed here or they are dropped entirely: only
-            # keys named in `totals` survive the merge, which is how a first
-            # pass at exposing `pool_pressure` shipped the eviction counts
-            # without the occupancy needed to interpret them.
-            "blocks_total",
-            "blocks_used",
-            "blocks_free",
-            "blocks_free_reusable",
-            "blocks_indexed",
-            "slots_total",
-            "slots_used",
-            "slots_vacant",
         )
         totals = {
             key: (
@@ -429,27 +417,6 @@ class LLMEngine:
                 "demands_recorded",
                 "demands_declined_no_room",
                 "chunks_cut_for_demand",
-                # The paged pool, so a falling `paged_hit` can be attributed.
-                # Cumulative like the token counts above, hence summed; the
-                # occupancy keys beside them are gauges and listed there.
-                "blocks_evicted",
-                "blocks_retired",
-                # Of `blocks_evicted`, the share state slots took. The two
-                # want opposite fixes -- a smaller state pool vs a bigger
-                # paged one -- and are indistinguishable in the total.
-                "superblock_blocks_evicted",
-                "superblocks_evicted_cached",
-                "superblock_claims_refused",
-                # Occupancy, to read the counts above against. Taken across
-                # ranks rather than summed -- see `gauges`.
-                "blocks_total",
-                "blocks_used",
-                "blocks_free",
-                "blocks_free_reusable",
-                "blocks_indexed",
-                "slots_total",
-                "slots_used",
-                "slots_vacant",
             )
         }
         # `reusable`, not `full`: a request's trailing block is never a reuse

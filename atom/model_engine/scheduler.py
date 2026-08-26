@@ -22,7 +22,7 @@ import struct
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 
 import numpy as np
 
@@ -155,7 +155,6 @@ class CacheStats:
         "_interval_reusable_tokens",
         "_interval_wanted_tokens",
         "_log_interval",
-        "_pool_pressure",
         "block_manager",
         "reqs_full_reuse",
         "reqs_no_paged",
@@ -172,13 +171,8 @@ class CacheStats:
     def __init__(
         self,
         log_interval: int = 100,
-        pool_pressure: Callable[[], dict[str, int]] | None = None,
     ):
         self._log_interval = log_interval
-        # Read at log time rather than passed per update: the free-list scan
-        # behind it is O(free blocks), which is ~10k here and would be paid
-        # once per request for a line printed once per `log_interval`.
-        self._pool_pressure = pool_pressure
         self.total_requests: int = 0
         self.total_cached_tokens: int = 0
         self.total_full_tokens: int = 0
@@ -324,60 +318,8 @@ class CacheStats:
         Not against `total_full_tokens`: that denominator includes each
         request's trailing block, which no cache is ever allowed to serve, so
         it reports a ceiling nothing can reach and drifts with the prompt
-        length mix. `paged_hit_rate * state_hit_rate == hit_rate` exactly.
         """
         return self._rate(self.total_cached_tokens, self.total_reusable_tokens)
-
-    @property
-    def paged_hit_rate(self) -> float:
-        """The paged KV pool's own hit rate, with the state cache factored out.
-
-        Denominator is what the paged pool was asked for (`reusable`);
-        numerator is what it had (`compressed`). The state gates run strictly
-        after this and cannot change either term, so this number is unaffected
-        by checkpoint policy -- change `--state-checkpoint-*` and this should
-        not move. It answers "is the prefix still in KV?" and nothing else.
-
-        What it charges the pool for: eviction, capacity, and genuinely novel
-        prefixes. That last one is a workload property, not a defect, so this
-        rate has a ceiling below 100% set by how much of the traffic is new
-        text -- compare it against the dataset's theoretical prefix hit, not
-        against 100%.
-        """
-        return self._rate(self.total_compressed_tokens, self.total_reusable_tokens)
-
-    @property
-    def state_hit_rate(self) -> float:
-        """The state cache's own hit rate, with the paged pool factored out.
-
-        Denominator is what the paged pool actually offered (`compressed`),
-        NOT `reusable` -- the state gates never see a prefix the paged pool
-        already lost, and charging them for it would mean a KV eviction shows
-        up as a state-cache failure and sends tuning at the wrong pool. This
-        is the conditional probability: given the prefix was there, did a
-        checkpoint let us resume from it?
-
-        Unlike `paged_hit_rate`, 100% is genuinely reachable here: it means
-        every boundary the paged pool offered had a resumable checkpoint. The
-        gap decomposes into `state_recoverable_loss_rate` (a checkpoint would
-        have fixed it) and the remainder (nothing would have).
-        """
-        return self._rate(self.total_cached_tokens, self.total_compressed_tokens)
-
-    @property
-    def state_recoverable_loss_rate(self) -> float:
-        """The part of the state cache's miss that checkpoint placement owns.
-
-        Same denominator as `state_hit_rate`, so the two compose:
-        `state_hit_rate + state_recoverable_loss_rate` is the rate the state
-        cache would reach with a dense ladder. The distance from that to 1.0
-        is the part no checkpoint can buy, and the honest cap on what any
-        amount of `--state-checkpoint-slots` is worth.
-        """
-        return self._rate(
-            self.total_wanted_tokens - self.total_cached_tokens,
-            self.total_compressed_tokens,
-        )
 
     def get_statistics(self) -> dict:
         """Counters, not rates — the caller derives those.
@@ -445,183 +387,6 @@ class CacheStats:
             self.total_wanted_tokens,
             self.total_reusable_tokens,
             self.total_full_tokens,
-        )
-        # main's `[Cache Pool]` occupancy line is subsumed by `_log_pressure`
-        # below, which reports both pools rather than the block pool alone.
-        # `block_manager` and `_interval_evicted_base` are kept: `_log_pressure`
-        # is gated on a `_pool_pressure` callback only the K3 path installs.
-        self._log_pools()
-        self._log_frequency()
-        if self._pool_pressure is not None:
-            self._log_pressure(self._pool_pressure())
-
-    def _log_pools(self) -> None:
-        """Each pool's hit rate against its own denominator.
-
-        The `[Cache Stats]` line reports one end-to-end rate, which cannot say
-        which pool to fix: the same 85% is a KV pool that lost the prefix or a
-        state cache that refused to resume from it, and those want opposite
-        changes. Splitting needs two denominators, because the pools are in
-        series and the second only ever sees what the first passed on:
-
-            paged = compressed / reusable      "was the prefix still in KV?"
-            state = cached     / compressed    "given it was, could we resume?"
-            paged * state = cached / reusable = the end-to-end rate
-
-        So the product is exact, and the smaller factor is the bottleneck --
-        that comparison is the whole point of the line. Reading `state`
-        against `reusable` instead would fold KV evictions into the state
-        cache's score and point tuning at the wrong pool.
-
-        `+ckpt` is where `state` would land if every ladder were dense. It is
-        the ceiling on what checkpoint placement or more slots can buy; if it
-        sits near `state`, the state cache is already doing all it can and the
-        remaining loss is the paged pool's.
-        """
-        paged = self.paged_hit_rate
-        state = self.state_hit_rate
-        # Which factor is further from 1.0 loses more reuse, since the rates
-        # multiply. Named here rather than left to the reader because the
-        # comparison is against each other, not against 100%.
-        worse = "paged" if paged <= state else "state"
-        logger.info(
-            "[Cache Pools] "
-            f"paged-hit: {paged:.2%} "
-            f"({self.total_compressed_tokens}/{self.total_reusable_tokens}), "
-            f"state-hit: {state:.2%} "
-            f"({self.total_cached_tokens}/{self.total_compressed_tokens}), "
-            f"state-hit+ckpt: {state + self.state_recoverable_loss_rate:.2%}, "
-            f"combined: {self.hit_rate:.2%}, "
-            f"binding: {worse}"
-        )
-
-    def _log_frequency(self) -> None:
-        """How OFTEN each pool cost a request reuse, against how much.
-
-        The `[Cache Stats]` line above is token-weighted, so a handful of
-        275k-token conversations decide it. This one is request-weighted, and
-        the two disagreeing is itself the finding: a low hit rate with a low
-        `state-miss` count is a few enormous requests missing, not a broad
-        failure, and wants a different fix.
-
-        `paged-match+state-miss` is the decisive one for sizing the state
-        pool. It counts requests where the paged pool still had the prefix and
-        only the missing checkpoint stood between the request and reuse --
-        state-cache capacity is the binding constraint exactly to the extent
-        this is large. When `no-paged` dominates instead, no amount of
-        checkpoint tuning helps, because the prefix itself is gone.
-
-        All four are measured against `reusable`, not `full`. That is not a
-        detail: against `full`, `full-reuse` and `paged-miss` are tautologies
-        that read 0% and 100% on every possible workload, which is what this
-        line did when first shipped.
-        """
-        n = self.total_requests
-        logger.info(
-            "[Cache Freq] "
-            f"Reqs: {n}, "
-            f"full-reuse: {self.reqs_full_reuse} "
-            f"({self._rate(self.reqs_full_reuse, n):.1%}), "
-            f"paged-match+state-miss: {self.reqs_state_miss} "
-            f"({self._rate(self.reqs_state_miss, n):.1%}), "
-            f"  of which a checkpoint would fix: "
-            f"{self.reqs_state_miss_recoverable} "
-            f"({self._rate(self.reqs_state_miss_recoverable, n):.1%}), "
-            f"paged-miss: {self.reqs_no_paged} "
-            f"({self._rate(self.reqs_no_paged, n):.1%})"
-        )
-
-    @staticmethod
-    def _log_pressure(p: dict[str, int]) -> None:
-        """The two pools' own account of what they destroyed.
-
-        `full - compressed` in the line above is reuse the paged pool did not
-        have, but it cannot say why — a prompt with no shared prefix and a
-        prefix evicted an hour ago read identically. These counters separate
-        them, and are the only evidence that eviction happened at all:
-        `blocks_evicted == 0` at the end of a run means every miss above was
-        absence of reuse, not loss of it.
-
-        Vacant is called out because it is the leading indicator. Evictions
-        can only begin once it reaches 0, so a run that ends with vacant
-        blocks to spare never had paged pressure whatever its hit rate.
-        """
-        logger.info(
-            "[Pool Pressure] "
-            f"paged: {p['blocks_used']}/{p['blocks_total']} used, "
-            f"{p['blocks_free_reusable']} reusable-free, "
-            f"{p['blocks_free'] - p['blocks_free_reusable']} vacant, "
-            f"{p['blocks_indexed']} indexed | "
-            f"evicted: {p['blocks_evicted']}, retired: {p['blocks_retired']} | "
-            f"state: {p['slots_used']}/{p['slots_total']} used, "
-            f"{p['slots_held']} checkpointed, {p['slots_vacant']} vacant"
-        )
-        # The state pool's own losses, which `blocks_evicted` cannot express:
-        # a checkpoint can die without any block dying (`evicted`, the pool ran
-        # out of slots) or *because* a block died (`orphaned`, the prefix it
-        # was filed under left the KV index first). The pair says which pool to
-        # grow — see `StateSlotPool.__init__` for why they are kept apart.
-        logger.info(
-            "[Checkpoint Fates] "
-            f"kept: {p['checkpoints_kept']}, "
-            f"dropped: {p['checkpoints_dropped']}, "
-            f"evicted: {p['checkpoints_evicted']}, "
-            f"orphaned: {p['checkpoints_orphaned']}, "
-            # Instantaneous where the three before it are cumulative: held
-            # checkpoints the block index can no longer reach. `orphaned`
-            # counts the ones caught as their own block went; these are the
-            # rest, still holding a slot and — under superblocks — a whole
-            # superblock that paged eviction is exempted from taking.
-            f"unreachable-now: {p.get('checkpoints_unreachable', 0)}"
-        )
-        # The read side, which no counter above covers: `kept` says a slot was
-        # spent, not that anything came back for it. `resumed/kept` is the
-        # first direct reading of whether checkpointing pays, `read-twice`
-        # tests the one-shot-reuse claim a spend-on-first-read policy rests on,
-        # and `superseded` sizes the candidate set such a policy would spend.
-        logger.info(
-            "[Checkpoint Reads] "
-            f"resumed: {p.get('checkpoints_resumed', 0)}, "
-            f"read-twice: {p.get('checkpoints_read_twice', 0)}, "
-            f"superseded-now: {p.get('checkpoints_superseded', 0)}, "
-            f"supersede-events: {p.get('superseded_events', 0)}, "
-            # Apart from `evicted` above: a trim CHOOSES, from checkpoints a
-            # deeper anchor already replaced, and hands the bytes to the paged
-            # pool. An eviction is the pool having nothing free and spending
-            # whatever the LRU head happened to be.
-            f"trimmed: {p.get('checkpoints_trimmed', 0)}"
-        )
-        if "supers_total" not in p:
-            return
-        # Superblocks, when state slots and KV blocks come from one supply.
-        # Three losses the lines above cannot express, because both kinds now
-        # draw on the same free list and `blocks_evicted` cannot say which
-        # kind destroyed the content:
-        #
-        #   refused   a state slot that could not be created at all -- nothing
-        #             whole was left. Says the pool is too small, or that live
-        #             KV is spread across too many superblocks for any to come
-        #             back whole.
-        #   ev-cache  a slot that WAS created, by spending a superblock whose
-        #             blocks still held reusable content. Reuse destroyed to
-        #             make room for state, which wants the opposite fix to
-        #             `refused` -- hence counted apart.
-        #   pinned    superblocks holding one live block, unavailable as a slot
-        #             however much of them is free. The accumulation curve: a
-        #             rising standing count says the packing preference has
-        #             stopped clustering, and it is what to watch rather than
-        #             any per-event rate.
-        #
-        # `state: N/M` above now moves during a run -- with one supply `M` is a
-        # ceiling the pool grows into, not a reservation fixed at startup.
-        logger.info(
-            "[Superblocks] "
-            f"{p['supers_state']} state, "
-            f"{p['supers_reclaimable']} reclaimable, "
-            f"{p['supers_partially_pinned']} pinned "
-            f"of {p['supers_total']} | "
-            f"refused: {p['superblock_claims_refused']}, "
-            f"ev-cache: {p['superblocks_evicted_cached']}"
         )
 
     @classmethod
@@ -1090,9 +855,7 @@ class Scheduler:
             SpecStats(mtp_k=self.mtp_k) if self.use_spec else None
         )
         self.cache_stats: CacheStats | None = (
-            CacheStats(pool_pressure=self.block_manager.pool_pressure)
-            if config.enable_prefix_caching
-            else None
+            CacheStats() if config.enable_prefix_caching else None
         )
         if self.cache_stats is not None:
             self.cache_stats.block_manager = self.block_manager

@@ -110,10 +110,6 @@ class BlockPool:
         # read identically in a hit rate, so they are counted apart.
         self.superblock_claims_refused: int = 0
         self.superblocks_evicted_cached: int = 0
-        # Reusable blocks destroyed by superblock claims specifically, so the
-        # state pool's share of `blocks_evicted` is measured rather than
-        # bounded by claims x blocks_per_super.
-        self.superblock_blocks_evicted: int = 0
         # Physical grouping, when a hybrid backend needs contiguous ranges for
         # its per-request state. `None` is the whole story for every model that
         # does not: no mapping, no packing preference, and every path below
@@ -167,7 +163,6 @@ class BlockPool:
             stats = dict(self.superblocks.occupancy())
             stats["superblock_claims_refused"] = self.superblock_claims_refused
             stats["superblocks_evicted_cached"] = self.superblocks_evicted_cached
-            stats["superblock_blocks_evicted"] = self.superblock_blocks_evicted
         return stats | {
             "blocks_evicted": self.blocks_evicted,
             "blocks_retired": self.blocks_retired,
@@ -468,21 +463,7 @@ class BlockPool:
                 # ordinary path, so a checkpoint filed under this hash learns
                 # its prefix is gone by the route it always did.
                 #
-                # Counted per block, not per claim: a claim takes the whole
-                # superblock but only the hashed blocks in it cost reuse, and
-                # the two differ by however much of the superblock was empty.
-                # Without this the state pool's share of `blocks_evicted` can
-                # only be bounded (claims x blocks_per_super), never measured.
-                #
-                # Read off `blocks_evicted` rather than counted here against
-                # `hash != -1`: that test is weaker than the one `_unindex`
-                # applies, which also requires the index to still name this
-                # block. A block whose hash was re-pointed elsewhere destroys
-                # nothing, and counting it made this exceed the total it is a
-                # subset of -- 2032 of 2021 in a live run.
-                before = self.blocks_evicted
                 self.allocate(block_id)
-                self.superblock_blocks_evicted += self.blocks_evicted - before
                 self.free(block_id)
             # After `free`, not instead of it: `free` returns the block to the
             # free list, and leaving it there would let `pop` hand out an id

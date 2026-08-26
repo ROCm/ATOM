@@ -327,60 +327,6 @@ class TestClaimOrder:
 
         assert pool.claim_superblock() == 0, "only now spend the cache"
         assert pool.superblocks_evicted_cached == 1
-        assert pool.superblock_blocks_evicted == 4, "all four held content"
-
-    def test_a_claim_counts_blocks_destroyed_not_blocks_taken(self):
-        """A claim takes the whole superblock; only its hashed blocks cost reuse.
-
-        `superblocks_evicted_cached` counts claims, so scaling it by
-        `blocks_per_super` bounds the state pool's share of `blocks_evicted`
-        without measuring it -- the two differ by however much of the
-        superblock held nothing. Here that is 4x.
-        """
-        pool, _sb = pooled(num_blocks=8, per=4)
-        fill(pool, 0, h=900)  # superblock 0: one hashed block of four
-        pool.free(0)
-        for b in (1, 2, 3):
-            pool.allocate(b)
-            pool.free(b)
-        # Superblock 1 costs nothing, so it is rightly taken first. Spend it
-        # to leave the cached one as the only candidate.
-        assert pool.claim_superblock() == 1
-        assert pool.superblock_blocks_evicted == 0, "nothing destroyed yet"
-
-        assert pool.claim_superblock() == 0
-        assert pool.superblocks_evicted_cached == 1, "one claim"
-        assert pool.superblock_blocks_evicted == 1, "but one block of four"
-        assert pool.superblock_blocks_evicted <= pool.blocks_evicted
-
-    def test_a_stale_hash_is_not_counted_as_destroyed(self):
-        """A block still carrying a hash the index has re-pointed elsewhere
-        destroys nothing when taken.
-
-        `hash != -1` is the weaker test; `_unindex` also requires the index to
-        still name this block, and that is what `blocks_evicted` counts.
-        Counting the weaker one made the superblock share exceed the total it
-        is a subset of -- 2032 of 2021 in a live run.
-        """
-        pool, sb = pooled(num_blocks=8, per=4)
-        fill(pool, 0, h=900)
-        pool.free(0)
-        # Re-point 900 at a block outside superblock 0, leaving block 0's own
-        # `hash` field stale. Publishing is the ordinary route to that state:
-        # the same content gets cached again somewhere else.
-        fill(pool, 4, h=900)
-        pool.free(4)
-        for b in (1, 2, 3):
-            pool.allocate(b)
-            pool.free(b)
-
-        assert pool.blocks[0].hash == 900, "stale, and still set"
-        assert pool.lookup(900) == 4, "but the index names block 4"
-        before = pool.blocks_evicted
-        assert pool.claim_superblock() == 0
-        assert pool.blocks_evicted == before, "nothing reusable was destroyed"
-        assert pool.superblock_blocks_evicted == 0
-        assert pool.lookup(900) == 4, "the live copy survived"
 
     def test_a_kv_floor_is_held_back_from_bulk_claims(self):
         """Spending the pool to nothing for slots leaves nothing to prefill with.
