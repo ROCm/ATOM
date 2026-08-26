@@ -26,7 +26,7 @@ from aiter_stub import stubbed_aiter
 
 with stubbed_aiter():
     from atom.kv_transfer.disaggregation.mooncake.mooncake_connector import (
-        plan_replicated,
+        plan_replicated_index,
         plan_sharded,
     )
 
@@ -214,36 +214,148 @@ def test_tail_virtual_block_without_a_source_is_dropped():
 
 
 # ── index (replicated) ────────────────────────────────────────────────────
+#
+# The index plan moves bytes, not tokens, because an index page written by
+# `indexer_k_quant_and_cache(preshuffle=True)` has no byte range that is a
+# token: its fp8 keys are MFMA-16x16 tiled and its fp32 scales all sit after
+# them. So the expected bytes come from a transcription of that kernel's two
+# destination offsets, run once at the producer's page width and once at the
+# consumer's, and the plan has to turn one into the other.
+
+INDEX_TILE = 16
+INDEX_HEAD_DIM = 32  # a multiple of 16, as the write kernel requires
+INDEX_SCALE_BYTES = 4  # one fp32 per token: `index_dim = index_head_dim + 4`
+INDEX_PAD_BYTES = 12  # aligned_index_dim 48 - 32 - 4
 
 
-@pytest.mark.parametrize("block_size,dcp_size,interleave", LAYOUTS)
+def _writer_index_page_tags(page_tokens, first_token):
+    """One page of an index cache as the write kernel lays it out, each byte
+    tagged with what wrote it. Transcribed from `indexer_k_quant_and_cache`'s
+    preshuffled `dst_offset` and its `dst_scale_idx`."""
+    page = np.full(
+        page_tokens * (INDEX_HEAD_DIM + INDEX_SCALE_BYTES + INDEX_PAD_BYTES),
+        -1,
+        dtype=np.int64,
+    )
+    keys = page_tokens * INDEX_HEAD_DIM
+    for offset in range(page_tokens):
+        token = first_token + offset
+        for col in range(INDEX_HEAD_DIM):
+            page[
+                (offset // INDEX_TILE) * (INDEX_TILE * INDEX_HEAD_DIM)
+                + (col // INDEX_TILE) * (INDEX_TILE * INDEX_TILE)
+                + (offset % INDEX_TILE) * INDEX_TILE
+                + col % INDEX_TILE
+            ] = (token * 100 + col)
+        for byte in range(INDEX_SCALE_BYTES):
+            page[keys + offset * INDEX_SCALE_BYTES + byte] = -(token * 100 + byte) - 1
+    return page, keys
+
+
+def _index_region(block_ids, page_tokens, num_pages, tagged=True):
+    """Flat byte region holding `num_pages` written pages at their block ids."""
+    page_bytes = page_tokens * (INDEX_HEAD_DIM + INDEX_SCALE_BYTES + INDEX_PAD_BYTES)
+    flat = np.full((max(block_ids) + 1) * page_bytes, -1, dtype=np.int64)
+    if tagged:
+        for ordinal in range(num_pages):
+            page, _ = _writer_index_page_tags(page_tokens, ordinal * page_tokens)
+            base = block_ids[ordinal] * page_bytes
+            flat[base : base + page_bytes] = page
+    return flat, page_bytes
+
+
+@pytest.mark.parametrize("dcp_size", [2, 4, 8])
 @pytest.mark.parametrize("num_tokens", LENGTHS)
-def test_replicated_plan_lands_on_the_index_rows(
-    block_size, dcp_size, interleave, num_tokens
-):
-    """An unsharded index cache: same content on every rank, plain order."""
+def test_replicated_index_plan_reproduces_the_writer_page(dcp_size, num_tokens):
+    """Every rank ends up with the page the write kernel would have produced had
+    it written the whole virtual block itself."""
+    block_size = INDEX_TILE
     n_src, _, src_ids, dst_ids = _setup(num_tokens, block_size, dcp_size)
-    src_flat = _fill_source(src_ids, block_size, n_src)
+    src_flat, src_page_bytes = _index_region(src_ids, block_size, n_src)
+
     wide = block_size * dcp_size
+    dst_flat, dst_page_bytes = _index_region(dst_ids, wide, 0, tagged=False)
+    _apply(
+        plan_replicated_index(
+            src_ids,
+            dst_ids,
+            dcp_size,
+            src_page_bytes,
+            block_size * INDEX_HEAD_DIM,
+            block_size * INDEX_SCALE_BYTES,
+        ),
+        src_flat,
+        dst_flat,
+    )
 
-    dst_flat = np.full((max(dst_ids) + 1) * wide, -1, dtype=np.int64)
-    _apply(plan_replicated(src_ids, dst_ids, block_size, dcp_size), src_flat, dst_flat)
-    for pos in range(num_tokens):
-        row = _writer_row_index(dst_ids, pos, block_size, dcp_size)
-        assert dst_flat[row] == pos
+    for ordinal in range(n_src):
+        virtual, sub = divmod(ordinal, dcp_size)
+        if virtual >= len(dst_ids):
+            break
+        want, keys = _writer_index_page_tags(wide, virtual * wide)
+        got = dst_flat[
+            dst_ids[virtual] * dst_page_bytes : (dst_ids[virtual] + 1) * dst_page_bytes
+        ]
+        lo, hi = sub * block_size * INDEX_HEAD_DIM, (sub + 1) * block_size * (
+            INDEX_HEAD_DIM
+        )
+        assert list(got[lo:hi]) == list(want[lo:hi]), "key plane"
+        lo = keys + sub * block_size * INDEX_SCALE_BYTES
+        hi = lo + block_size * INDEX_SCALE_BYTES
+        assert list(got[lo:hi]) == list(want[lo:hi]), "scale plane"
 
 
-def test_replicated_plan_is_rank_and_interleave_independent():
+def test_replicated_index_plan_never_writes_a_scale_byte_with_a_key_byte():
+    """The failure this replaced: moving a source page to one sub-page offset of
+    the destination lands its scales inside the next sub-page's keys and leaves
+    the scale plane holding key bytes, which dequantises every token by a float
+    read out of fp8 data."""
+    block_size, dcp_size, n_dst = INDEX_TILE, 4, 3
+    n_src = n_dst * dcp_size
+    src_ids, dst_ids = _block_ids(n_src, 5), _block_ids(n_dst, 13)
+    src_flat, src_page_bytes = _index_region(src_ids, block_size, n_src)
+    dst_flat, dst_page_bytes = _index_region(dst_ids, block_size * dcp_size, 0, False)
+
+    _apply(
+        plan_replicated_index(
+            src_ids,
+            dst_ids,
+            dcp_size,
+            src_page_bytes,
+            block_size * INDEX_HEAD_DIM,
+            block_size * INDEX_SCALE_BYTES,
+        ),
+        src_flat,
+        dst_flat,
+    )
+
+    keys = block_size * dcp_size * INDEX_HEAD_DIM
+    for virtual in range(n_dst):
+        page = dst_flat[
+            dst_ids[virtual] * dst_page_bytes : (dst_ids[virtual] + 1) * dst_page_bytes
+        ]
+        assert (page[:keys] >= 0).all(), "a key byte is missing or is a scale"
+        scales = page[keys : keys + block_size * dcp_size * INDEX_SCALE_BYTES]
+        assert (scales < 0).all(), "a scale byte is missing or is a key"
+        # The page's tail is padding the writer never touches, so nothing may
+        # land there either.
+        assert (page[keys + scales.size :] == -1).all()
+
+
+def test_replicated_index_plan_is_rank_and_interleave_independent():
     """It takes neither, by construction -- pinned so a future 'optimisation'
     that shards it has to fail a test rather than silently halve the index."""
-    block_size, dcp_size, n_dst = 16, 4, 8
+    block_size, dcp_size, n_dst = INDEX_TILE, 4, 8
     n_src = n_dst * dcp_size
     src_ids, dst_ids = _block_ids(n_src, 3), _block_ids(n_dst, 11)
-    src, _, length = plan_replicated(src_ids, dst_ids, block_size, dcp_size)
-    # One run per source block, and every source block carried in full: a plan
+    keys, scales = block_size * INDEX_HEAD_DIM, block_size * INDEX_SCALE_BYTES
+    src, _, length = plan_replicated_index(
+        src_ids, dst_ids, dcp_size, block_size * 48, keys, scales
+    )
+    # Two runs per source block, and every source block carried in full: a plan
     # that sharded the index would move 1/W of this.
-    assert len(src) == n_src
-    assert length.sum() == n_src * block_size
+    assert len(src) == 2 * n_src
+    assert length.sum() == n_src * (keys + scales)
 
 
 # ── run coalescing ────────────────────────────────────────────────────────
@@ -261,8 +373,8 @@ def test_descriptor_count_under_a_consecutive_allocator(
     destination side is dense, and a merge needs both. The sharded cost is
     therefore the closed form ``n_dst * (block_size / S)`` -- dropping S from
     block_size to 1 really does multiply the batch by block_size. The
-    replicated region is where merging pays: its W sources per virtual block
-    are consecutive, so the whole request collapses to one descriptor.
+    replicated index region cannot merge either, for its own reason: a page's
+    key run stops one scale plane and one padding run short of the next page.
     """
     num_tokens = 4096
     n_src = _cdiv(num_tokens, block_size)
@@ -276,30 +388,35 @@ def test_descriptor_count_under_a_consecutive_allocator(
         assert len(runs[2]) == expect
         assert runs[2].sum() == n_dst * block_size
 
-    assert len(plan_replicated(src_ids, dst_ids, block_size, dcp_size)[2]) == 1
+    keys, scales = block_size * 128, block_size * 4
+    covered = min(n_src, n_dst * dcp_size)
+    assert (
+        len(
+            plan_replicated_index(
+                src_ids, dst_ids, dcp_size, block_size * 144, keys, scales
+            )[2]
+        )
+        == 2 * covered
+    )
 
 
-def test_coalescing_collapses_consecutively_allocated_blocks():
-    """The payoff case: a virtual block's W replicated sources become one
-    descriptor whenever the allocator handed out consecutive ids."""
+def test_the_index_plan_pays_two_descriptors_per_page_even_when_ids_are_dense():
+    """Consecutive block ids buy the index region nothing: the padding between a
+    page's scale plane and the next page's keys breaks source contiguity for
+    both planes, so the batch is 2 per source page whatever the allocator did."""
     block_size, dcp_size, n_dst = 16, 4, 8
     n_src = n_dst * dcp_size
-    src_ids = list(range(100, 100 + n_src))
-    dst_ids = list(range(7, 7 + n_dst))
+    keys, scales = block_size * 128, block_size * 4
 
-    src_off, _, length = plan_replicated(src_ids, dst_ids, block_size, dcp_size)
-    # Consecutive on both sides throughout -> a single descriptor.
-    assert len(src_off) == 1
-    assert length[0] == n_src * block_size
-
-
-def test_coalescing_does_not_merge_across_a_block_id_gap():
-    block_size, dcp_size = 16, 4
-    src_ids = [0, 1, 2, 3, 50, 51, 52, 53]
-    dst_ids = [0, 9]
-    src_off, _, length = plan_replicated(src_ids, dst_ids, block_size, dcp_size)
-    assert len(src_off) == 2
-    assert list(length) == [4 * block_size, 4 * block_size]
+    for src_ids, dst_ids in (
+        (list(range(100, 100 + n_src)), list(range(7, 7 + n_dst))),
+        (_block_ids(n_src, 21), _block_ids(n_dst, 22)),
+    ):
+        _, _, length = plan_replicated_index(
+            src_ids, dst_ids, dcp_size, block_size * 144, keys, scales
+        )
+        assert len(length) == 2 * n_src
+        assert length.sum() == n_src * (keys + scales)
 
 
 # ── PD incremental slicing ────────────────────────────────────────────────

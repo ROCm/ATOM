@@ -1,4 +1,11 @@
-# GLM-5.2 DCP decode: the DSA top-k dominates, and replicating the index cache makes it worse
+# GLM-5.2 DCP decode: where the step time goes, before and after the index-page relayout fix
+
+**Re-measured 2026-08-26.** The 1.60 ms below was measured while the mooncake
+DCP relayout was corrupting the DSA index cache, so the top-k ran on a plane
+that was 5-7 % NaN -- a single radix bucket the kernel cannot split. On the
+fixed relayout (`docs/dcp_index_cache_page_relayout.md`) the same kernel costs
+**0.40 ms**. The numbers in this document are kept as the before side of that
+A/B; the after side is the section at the end.
 
 Measured 2026-08-25 on MI355X, GLM-5.2-MXFP4, PP4xTP1 prefill -> TP4xDCP4 decode
 over mooncake PD, replaying the SemiAnalysis `cc-traces-weka-062126` agentic
@@ -79,3 +86,42 @@ carries 2x the decode concurrency at 1.15x the step time.
 MTP under DCP is blocked separately, by
 `assert attn_metadata.max_seqlen_q == 1` in `_dcp_decode_candidate_exchange`
 (`deepseek_v2.py:1441`).
+
+## After the page-aware relayout fix (2026-08-26)
+
+Same script, same corpus, same concurrency 32, same 3-minute kernel-only capture
+20 minutes into the profiling phase. Artifacts:
+`results/dcp_index_relayout_fix_20260826/traces_postfix/` (rank 0 analysis and
+the re-run of the same analyzer over the 2026-08-25 trace, side by side).
+
+The two windows do the same amount of work -- 48 875 vs 48 890 top-k calls,
+174 545 vs 174 600 MoE calls -- so the times compare directly.
+
+| | broken relayout | page-aware relayout |
+|---|---|---|
+| `radix_topk_one_block_kernel` per call | 1.601 ms | **0.400 ms** |
+| that kernel's share of GPU time | 50.2 % | **19.7 %** |
+| GPU time in the 3-min window | 156.0 s | **99.3 s** |
+| decode step p90 | 68.87 ms | **45.08 ms** |
+| decode step avg | 32.66 ms | **16.49 ms** |
+| decode steps in the window | 5 024 | **6 691** |
+
+| bucket | before | after |
+|---|---|---|
+| DSA top-k select | 79.26 s (50.8 %) | 20.55 s (20.7 %) |
+| DSA indexer (fp8 paged mqa logits) | 19.02 s (12.2 %) | 16.85 s (17.0 %) |
+| MoE | 17.73 s (11.4 %) | 20.65 s (20.8 %) |
+| GEMM / linear | 14.03 s (9.0 %) | 16.18 s (16.3 %) |
+| Collective (RCCL) | 9.53 s (6.1 %) | 8.79 s (8.9 %) |
+| MLA attention | 5.75 s (3.7 %) | 5.72 s (5.8 %) |
+| norm / elementwise | 3.87 s (2.5 %) | 3.80 s (3.8 %) |
+
+Every other bucket holds its absolute time to within noise; only the top-k
+moves. That is the signature of a data-dependent kernel, not of a slower
+machine: the radix select was spending its time on a NaN bucket that the
+transfer had manufactured.
+
+**This retires the sharded-vs-replicated recommendation above.** The 3x logits
+plane that replication costs is real, but it is now 3x of a 20 % component,
+not of a 50 % one, and the decode step is MoE-and-GEMM-bound again. The
+sharded A/B is worth running for its own sake, not as a fix for this.

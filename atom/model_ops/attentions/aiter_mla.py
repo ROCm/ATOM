@@ -159,8 +159,8 @@ def cdiv(a, b):
 
 # Connectors that carry the widened replicated index page correctly. LMCache
 # derives every block's stride from the tensor itself, so it is layout-agnostic.
-# Mooncake plans the index regions with plan_replicated once the consumer says
-# it replicates, which is why this layout may run behind a PD decode node.
+# Mooncake plans the index regions with plan_replicated_index once the consumer
+# says it replicates, which is why this layout may run behind a PD decode node.
 _REPLICATION_SAFE_CONNECTORS = frozenset(
     {
         "lmcache_offload",
@@ -1221,15 +1221,22 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             )
 
         if hasattr(runner, "index_cache"):
+            index_head_dim = runner.config.hf_config.index_head_dim
             for layer_id in range(runner.index_cache.shape[0]):
                 t = runner.index_cache[layer_id]
                 bpb = t.stride(0) * t.element_size() * self.block_ratio
+                # `index_dim = index_head_dim + 4` above is one fp32 scale per
+                # token, so a page's two planes are that many keys and that
+                # many scales; the rest of `aligned_index_dim` is padding.
+                tokens_per_page = bpb // runner.aligned_index_dim
                 block_regions.append(
                     KVTransferRegion(
                         base_addr=t.data_ptr(),
                         total_bytes=t.numel() * t.element_size(),
                         unit_bytes=bpb,
                         semantic_role=INDEX_CACHE_ROLE,
+                        key_plane_bytes=tokens_per_page * index_head_dim,
+                        scale_plane_bytes=tokens_per_page * 4,
                     )
                 )
 

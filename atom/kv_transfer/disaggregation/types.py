@@ -121,6 +121,13 @@ class KVTransferRegion:
     # and list positions are process-local implementation details; a named role
     # makes equal-sized planes distinguishable across code versions.
     semantic_role: str | None = None
+    # A preshuffled DSA index page is not token-addressable: its fp8 keys are
+    # MFMA-16x16 tiled and every page keeps its fp32 scales in one plane after
+    # all of its keys, with the page's remaining bytes unused. A relayout that
+    # moves less than a whole page therefore has to move each plane on its own,
+    # and these two give it the split. None for token-contiguous pages.
+    key_plane_bytes: int | None = None
+    scale_plane_bytes: int | None = None
 
     def unit_addr(self, index: int) -> int:
         if self.reverse_indexed:

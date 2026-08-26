@@ -169,14 +169,17 @@ def _configure_mooncake_transport(protocol: str) -> None:
 #
 # Replicated regions (index_cache under ATOM_DCP_REPLICATE_INDEX_CACHE=1)
 #     Every rank holds the full ``block_size * dcp_size`` tokens of a virtual
-#     block in plain sequential order, so virtual block ``v`` is the
-#     concatenation of source blocks ``[v*W, (v+1)*W)``. Independent of both the
-#     rank and the interleave size, and the destination ``unit_bytes`` is ``W``
-#     times the source's.
+#     block, so virtual block ``v`` is the concatenation of source blocks
+#     ``[v*W, (v+1)*W)``. Independent of both the rank and the interleave size,
+#     and the destination ``unit_bytes`` is ``W`` times the source's. This one
+#     plans in bytes, not tokens: an index page is written preshuffled, so its
+#     tokens are neither contiguous nor even in order within the page, and a
+#     source page landing at a sub-page offset moves as one key run plus one
+#     scale run (see ``plan_replicated_index``).
 #
-# Both kinds return the same thing: coalesced ``(src_offset, dst_offset,
-# length)`` runs in token units, flat within the region (block id *
-# tokens-per-block + offset), which the caller turns into addresses with
+# Sharded regions return coalesced ``(src_offset, dst_offset, length)`` runs in
+# token units, flat within the region (block id * tokens-per-block + offset),
+# which the caller turns into addresses with
 #
 #     src_addr = src_base + src_offset * token_bytes
 #     dst_addr = dst_base + dst_offset * token_bytes
@@ -246,13 +249,25 @@ def plan_sharded(
     )
 
 
-def plan_replicated(
+def plan_replicated_index(
     src_block_ids,
     dst_block_ids,
-    block_size: int,
     dcp_size: int,
+    src_page_bytes: int,
+    key_plane_bytes: int,
+    scale_plane_bytes: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Plan the replicated (full-copy) transfer; identical on every DCP rank."""
+    """Plan the replicated index-cache transfer in bytes; same on every rank.
+
+    ``indexer_k_quant_and_cache(preshuffle=True)`` stores a page as an
+    MFMA-16x16-tiled fp8 key plane followed by an fp32 scale plane, so a page is
+    only copyable whole -- addressing one of its tokens is not a byte range at
+    all. Source pages stay whole here, but the destination page is ``dcp_size``
+    of them wide and interleaves the two planes differently: its keys run
+    ``dcp_size * key_plane_bytes`` before its scales start. So each source page
+    splits into a key run and a scale run, landing at sub-page ``s`` of each
+    plane rather than at one sub-page offset of the page.
+    """
     src_ids = np.asarray(src_block_ids, dtype=np.int64)
     dst_ids = np.asarray(dst_block_ids, dtype=np.int64)
 
@@ -261,10 +276,28 @@ def plan_replicated(
     src_block = dst_block * dcp_size + sub
 
     keep = src_block < src_ids.size
-    return _coalesce(
-        src_ids[src_block[keep]] * block_size,
-        dst_ids[dst_block[keep]] * block_size * dcp_size + sub[keep] * block_size,
-        np.full(int(keep.sum()), block_size, dtype=np.int64),
+    src_page = src_ids[src_block[keep]] * src_page_bytes
+    dst_page = dst_ids[dst_block[keep]] * src_page_bytes * dcp_size
+    sub = sub[keep]
+    n = sub.size
+
+    # Two descriptors per source page, with no _coalesce pass: a page's key run
+    # stops short of the next page by that page's scale plane and padding, so
+    # consecutive block ids never make the source side contiguous.
+    return (
+        np.concatenate([src_page, src_page + key_plane_bytes]),
+        np.concatenate(
+            [
+                dst_page + sub * key_plane_bytes,
+                dst_page + dcp_size * key_plane_bytes + sub * scale_plane_bytes,
+            ]
+        ),
+        np.concatenate(
+            [
+                np.full(n, key_plane_bytes, dtype=np.int64),
+                np.full(n, scale_plane_bytes, dtype=np.int64),
+            ]
+        ),
     )
 
 
@@ -728,6 +761,7 @@ class MooncakeConnector(KVConnectorBase):
         self.kv_caches_base_addr: list[int] = []
         self._per_block_bytes_list: list[int] = []
         self._block_region_roles: list[str | None] = []
+        self._block_region_planes: list[tuple[int, int] | None] = []
         self.kv_cache_shape: tuple[int, ...] | None = None
         self.block_len: int = config.kv_cache_block_size
         self.num_blocks: int = 0
@@ -903,6 +937,14 @@ class MooncakeConnector(KVConnectorBase):
         self.kv_caches_base_addr = [r.base_addr for r in tt.block_regions]
         self._per_block_bytes_list = [r.unit_bytes for r in tt.block_regions]
         self._block_region_roles = [r.semantic_role for r in tt.block_regions]
+        self._block_region_planes = [
+            (
+                (r.key_plane_bytes, r.scale_plane_bytes)
+                if r.key_plane_bytes is not None
+                else None
+            )
+            for r in tt.block_regions
+        ]
 
         # Under pipeline parallelism this stage holds only layers
         # [start_layer, end_layer); its local regions map onto the consumer's
@@ -1605,8 +1647,9 @@ class MooncakeConnector(KVConnectorBase):
         # sharded the same way or -- with a replicated index cache -- held
         # whole by every rank in a page dcp_size times as wide.
         dcp_size = max(1, request_data.get("consumer_dcp_size", 1))
+        interleave = request_data.get("consumer_dcp_interleave", 1)
+        replicates_index = request_data.get("consumer_replicates_index_cache", False)
         sharded_plan = None
-        replicated_plan = None
         if dcp_size > 1:
             sharded_plan = plan_sharded(
                 src_block_ids,
@@ -1614,14 +1657,23 @@ class MooncakeConnector(KVConnectorBase):
                 self.block_size,
                 dcp_size,
                 request_data["consumer_dcp_rank"],
-                request_data["consumer_dcp_interleave"],
+                interleave,
             )
-            if request_data.get("consumer_replicates_index_cache", False):
-                replicated_plan = plan_replicated(
-                    src_block_ids,
-                    dst_block_ids,
-                    self.block_size,
-                    dcp_size,
+            # Sub-page runs cannot carry a preshuffled index page: its tokens
+            # are MFMA-tiled and share one trailing scale plane, so a token-unit
+            # source offset addresses no token's bytes. Only a whole-page
+            # interleave keeps the sharded plan page-aligned.
+            if (
+                not replicates_index
+                and interleave < self.block_size
+                and INDEX_CACHE_ROLE in self._block_region_roles
+            ):
+                raise RuntimeError(
+                    f"A DCP interleave of {interleave} shards the DSA index "
+                    "cache below a page, which its preshuffled layout does not "
+                    "allow. Run the decode node with "
+                    "ATOM_DCP_REPLICATE_INDEX_CACHE=1, or with an interleave of "
+                    f"{self.block_size}."
                 )
 
         for region_idx in range(num_regions):
@@ -1629,33 +1681,46 @@ class MooncakeConnector(KVConnectorBase):
             dst_base = consumer_base_addrs[cmap[region_idx]]
             bpb = self._per_block_bytes_list[region_idx]
             plan = sharded_plan
+            unit = 0
             if (
-                replicated_plan is not None
+                dcp_size > 1
+                and replicates_index
                 and self._block_region_roles[region_idx] == INDEX_CACHE_ROLE
             ):
-                plan = replicated_plan
+                key_bytes, scale_bytes = self._block_region_planes[region_idx]
+                plan = plan_replicated_index(
+                    src_block_ids,
+                    dst_block_ids,
+                    dcp_size,
+                    bpb,
+                    key_bytes,
+                    scale_bytes,
+                )
+                unit = 1  # already in bytes
             if plan is None:
                 for sb, db in zip(src_block_ids, dst_block_ids):
                     src_addrs.append(src_base + sb * bpb)
                     dst_addrs.append(dst_base + db * bpb)
                     sizes.append(bpb)
                 continue
-            # The destination page may be wider than the source's, but only in
-            # whole tokens, and the plan's offsets already count in the
-            # destination's own token space -- so both ends scale by the
-            # source's per-token width.
-            if bpb % self.block_size:
-                raise RuntimeError(
-                    f"Region {region_idx} stores {bpb} bytes per block, which "
-                    f"block_size {self.block_size} does not divide. Addressing a "
-                    "single token needs its bytes contiguous, which holds for the "
-                    "MLA layout the token-unit relayout is built on."
-                )
-            token_bytes = bpb // self.block_size
+            if not unit:
+                # The destination page may be wider than the source's, but only
+                # in whole tokens, and the plan's offsets already count in the
+                # destination's own token space -- so both ends scale by the
+                # source's per-token width.
+                if bpb % self.block_size:
+                    raise RuntimeError(
+                        f"Region {region_idx} stores {bpb} bytes per block, "
+                        f"which block_size {self.block_size} does not divide. "
+                        "Addressing a single token needs its bytes contiguous, "
+                        "which holds for the MLA layout the token-unit relayout "
+                        "is built on."
+                    )
+                unit = bpb // self.block_size
             for src_off, dst_off, run_len in zip(*plan):
-                src_addrs.append(src_base + int(src_off) * token_bytes)
-                dst_addrs.append(dst_base + int(dst_off) * token_bytes)
-                sizes.append(int(run_len) * token_bytes)
+                src_addrs.append(src_base + int(src_off) * unit)
+                dst_addrs.append(dst_base + int(dst_off) * unit)
+                sizes.append(int(run_len) * unit)
 
         logger.info(
             "[PRODUCER] block RDMA write: req=%s, %d regions × %d blocks, "
