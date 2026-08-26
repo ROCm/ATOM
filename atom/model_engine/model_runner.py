@@ -9,6 +9,7 @@ import math
 import os
 import time
 from contextlib import contextmanager, nullcontext
+from functools import partial
 from typing import Any, NamedTuple
 
 import numpy as np
@@ -4305,8 +4306,20 @@ class ModelRunner:
                         prof.step()
                         self._capture_trace_tag = None
             # Inside the `with`: graph_capture() arms the custom all-reduce for
-            # capture and pause_gc() keeps the collector from aborting one.
-            self._warmup_draft_graphs(full_q_len, capture_ctx.stream)
+            # capture and pause_gc() keeps the collector from aborting one. The
+            # drafter gets the capture builder already bound to this backend's
+            # signature -- which of them takes a `max_q_len` is the runner's to
+            # know, and it is the same probe the loop above ran.
+            if hasattr(self, "drafter"):
+                self.drafter.warmup_draft_graphs(
+                    (
+                        partial(build_capture, max_q_len=full_q_len)
+                        if supports_dynamic_q_len
+                        else build_capture
+                    ),
+                    full_q_len,
+                    capture_ctx.stream,
+                )
         self.graph_bs.sort(reverse=False)
 
         # PIECEWISE: sorted 1D num_tokens buckets for run_model's round_up_1d(Σ)
@@ -4359,56 +4372,6 @@ class ModelRunner:
             )
 
         return time.time() - start_time, self.graph_bs, _pool_bytes
-
-    @torch.inference_mode()
-    def _warmup_draft_graphs(self, max_q_len: int, stream) -> None:
-        """Run every declared draft pass once per `graph_bs`, paying its JIT here.
-
-        aiter's flydsl hgemm builds a kernel per tile config, in-process, so a
-        batch first seen mid-serve stalls that step and every restart pays
-        again: `hipModuleLoadData` per rank went 6 -> 0 on the 16k/20/50c
-        reproducer, with this and the drafter's rounding.
-
-        Warming `self.graph_bs` is the point -- the drafter rounds up to that
-        same list, so warmed and reachable are one set by construction rather
-        than two that drift.
-
-        Call INSIDE ``graph_capture()`` (it arms the custom all-reduce for the
-        optional capture) and after ``allocate_kv_cache``, so the builder's
-        context has real ring slots and ``is_dummy_run=False``.
-        """
-        drafter = getattr(self, "drafter", None)  # unset when spec decode is off
-        if drafter is None or not drafter.draft_graphs:
-            return
-        build_capture = self.attn_metadata_builder.build_for_cudagraph_capture
-        # Only DeepSeek-V4's builder takes `max_q_len`; the rest raise TypeError
-        # on the keyword. Probed the same way the main capture loop does.
-        supports_dynamic_q_len = (
-            "max_q_len" in inspect.signature(build_capture).parameters
-        )
-        start = time.time()
-        for pass_ in drafter.draft_graphs:
-            for bs in self.graph_bs:
-                attn_metadata, context = (
-                    build_capture(bs=bs, max_q_len=max_q_len)
-                    if supports_dynamic_q_len
-                    else build_capture(bs=bs)
-                )
-                set_forward_context(
-                    attn_metadata=attn_metadata,
-                    atom_config=self.config,
-                    context=context,
-                    num_tokens=bs * max_q_len,
-                )
-                self.graph_pool = pass_.warmup(bs, pool=self.graph_pool, stream=stream)
-        torch.cuda.synchronize()
-        if self.rank == 0:
-            logger.info(
-                "Draft passes warmed at %s in %.2fs: %s",
-                list(self.graph_bs),
-                time.time() - start,
-                [g.name for g in drafter.draft_graphs],
-            )
 
     @torch.inference_mode()
     def _maybe_calibrate_dspark_sps(self, max_q_len: int, n_iters: int = 20) -> None:

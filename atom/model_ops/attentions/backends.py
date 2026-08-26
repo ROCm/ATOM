@@ -118,8 +118,8 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
 
         The draft runs one row per sequence, and `positions` is that row buffer
         -- so `positions.shape[-1]` is the ROW COUNT and is what every shape here
-        follows. It is not `bs`: a drafter may run a wider batch to land on a
-        captured shape, and `bs` stays the count of rows that carry a real
+        follows. It is not `bs`: a drafter may run the wider batch the target
+        itself just ran, and `bs` stays the count of rows that carry a real
         sequence. They are equal whenever nothing is padded.
 
         The LAST axis, not the first: MRoPE positions are `[3, N]` (the token
@@ -291,6 +291,13 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         ).interleave_size
         self.max_num_batched_tokens = model_runner.max_num_batched_tokens
         self.max_bs = model_runner.max_bs
+        # Every row's own index, resident so no step rebuilds it. One buffer for
+        # three readers that each want the same numbers: a cu_seqlens ramp at one
+        # token per sequence (hence `+ 1`), the real prefix a padded
+        # `batch_id_per_token` is restored from, and DSpark's token -> request map.
+        self.row_ids = torch.arange(
+            self.max_bs + 1, device=self.device, dtype=torch.int32
+        )
         self.max_num_blocks_per_seq = (
             config.max_model_len + self.block_size - 1
         ) // self.block_size

@@ -13,6 +13,7 @@ pytest.importorskip("aiter", reason="the compiled draft imports aiter at module 
 
 import torch
 
+from atom.model_ops.v4_kernels.dspark_fp8_indices import DSparkIndexBuffers
 from atom.models.deepseek_v4_dspark import (
     DSparkConfidenceHead,
     DSparkMarkovHead,
@@ -894,19 +895,23 @@ def test_forward_spec_passes_the_batch_through_unpadded(is_dummy, B):
 _GRAPH_BS = [1, 2, 4, 8, 16, 32, 48, 64, 128, 256]
 
 
-def _stub_forward_context(*, batch_size, graph_bs, scheduled_bs, use_cudagraph=True):
+def _stub_forward_context(*, batch_size, target_bs, scheduled_bs, use_cudagraph=True):
     context = types.SimpleNamespace(
         batch_size=batch_size,
-        graph_bs=graph_bs,
+        # A token count, as DSpark's ragged path leaves it. The drafter must
+        # read `effective_bs`, so a stub that agreed here would prove nothing.
+        graph_bs=target_bs * 337,
         is_dummy_run=False,
         is_draft=False,
         positions=None,
-        forward_mode=types.SimpleNamespace(use_cudagraph=use_cudagraph),
+        forward_mode=types.SimpleNamespace(
+            use_cudagraph=use_cudagraph, effective_bs=target_bs
+        ),
     )
     # `prepare_decode` publishes the ring slots at the PADDED batch, so the stub
     # does too -- the block slices to that length and nothing stages it.
     attn_metadata = types.SimpleNamespace(
-        state_slot_out=torch.arange(max(graph_bs, scheduled_bs), dtype=torch.int32)
+        state_slot_out=torch.arange(max(target_bs, scheduled_bs), dtype=torch.int32)
         + 100
     )
     return types.SimpleNamespace(context=context, attn_metadata=attn_metadata)
@@ -930,7 +935,12 @@ def _proposer_with_graph_bs(monkeypatch, *, eplb=False, mtp_k=5, window=128):
     p.device = torch.device("cpu")
     p.mtp_k = mtp_k
     p.model = types.SimpleNamespace(vocab_size=1024, window_size=window)
-    p.runner = types.SimpleNamespace(graph_bs=list(_GRAPH_BS))
+    p.runner = types.SimpleNamespace(
+        graph_bs=list(_GRAPH_BS),
+        attn_metadata_builder=types.SimpleNamespace(
+            row_ids=torch.arange(p.config.max_num_seqs + 1, dtype=torch.int32)
+        ),
+    )
     p._build_draft_graphs()
     return p
 
@@ -948,8 +958,20 @@ def _run_propose(p, fc, real_bs, monkeypatch, seen):
         # A real class, not SimpleNamespace: __call__ is looked up on the type.
         __call__ = staticmethod(_backbone)
 
+        # The real bundle, not a stub: `mask_pad_tail` is what keeps a padded
+        # block from scattering draft KV, and `seen["batch_ids"]` is the only
+        # place these tests can watch it.
+        bufs = DSparkIndexBuffers.allocate(
+            p.config.max_num_seqs, p.mtp_k, int(p.model.window_size), p.device
+        )
+
+        @classmethod
+        def index_buffers(cls, draft, window, device):
+            return cls.bufs
+
         @staticmethod
         def head_and_sample(normed, hc_hidden, anchor_ids):
+            seen["batch_ids"] = _Inner.bufs.batch_ids.clone()
             return (
                 torch.zeros(hc_hidden, p.mtp_k, dtype=torch.int32),
                 torch.zeros(hc_hidden, p.mtp_k),
@@ -980,7 +1002,7 @@ def test_propose_drafts_at_the_captured_graph_bs(monkeypatch, real_bs, expect_B)
     seen = {}
     p = _proposer_with_graph_bs(monkeypatch)
     fc = _stub_forward_context(
-        batch_size=real_bs, graph_bs=expect_B, scheduled_bs=real_bs
+        batch_size=real_bs, target_bs=expect_B, scheduled_bs=real_bs
     )
     out = _run_propose(p, fc, real_bs, monkeypatch, seen)
 
@@ -991,6 +1013,14 @@ def test_propose_drafts_at_the_captured_graph_bs(monkeypatch, real_bs, expect_B)
     assert seen["slots"].shape[0] >= expect_B
     assert seen["slots"][:real_bs].tolist() == list(range(100, 100 + real_bs))
     assert out.shape[0] == real_bs
+
+    # ...but the rows it fabricated must scatter no draft KV. Their ring slot is
+    # the 0 `prepare_decode` fills that tail with, and 0 is a real position, so
+    # an unmasked pad row writes into another request's window.
+    t = p.mtp_k
+    ids = seen["batch_ids"]
+    assert ids[: real_bs * t].tolist() == [i // t for i in range(real_bs * t)]
+    assert ids[real_bs * t : expect_B * t].tolist() == [-1] * (expect_B - real_bs) * t
 
 
 @pytest.mark.parametrize(
@@ -1012,7 +1042,7 @@ def test_propose_leaves_the_batch_alone_when_nothing_pins_a_wider_one(
     seen = {}
     p = _proposer_with_graph_bs(monkeypatch, eplb=eplb)
     fc = _stub_forward_context(
-        batch_size=44, graph_bs=48, scheduled_bs=44, use_cudagraph=cudagraph
+        batch_size=44, target_bs=48, scheduled_bs=44, use_cudagraph=cudagraph
     )
     fc.context.is_dummy_run = dummy
     out = _run_propose(p, fc, 44, monkeypatch, seen)
@@ -1020,40 +1050,22 @@ def test_propose_leaves_the_batch_alone_when_nothing_pins_a_wider_one(
     assert out.shape[0] == 44
 
 
-def test_a_token_derived_graph_bs_is_not_mistaken_for_a_sequence_count(monkeypatch):
-    """Under PIECEWISE + ragged, `_dspark_ragged_moe_graph_bs` overwrites
-    `context.graph_bs` with a TOKEN count (flat_bucket // q), which need not be a
-    captured size. Padding to it would run the block at a shape the startup
-    sweep never warmed -- the exact stall this is supposed to remove."""
-    p = _proposer_with_graph_bs(monkeypatch)
-    ctx = types.SimpleNamespace(
-        graph_bs=100,  # not in _GRAPH_BS
-        is_dummy_run=False,
-        forward_mode=types.SimpleNamespace(use_cudagraph=True),
-    )
-    assert p._block_graph_bs(44, ctx) == 44
-    ctx.graph_bs = 48
-    assert p._block_graph_bs(44, ctx) == 48
+def test_the_pad_sentinel_lifts_off_a_row_that_becomes_real_again():
+    """The half a single step cannot show: the batch shrinks, then grows.
 
-
-def test_a_capture_is_its_own_licence_to_pad_off_the_target_graph_path(monkeypatch):
-    """A prefill step negotiates no sequence count, so the draft picks its own.
-
-    It may only do that where a capture already exists at that batch: a graph is
-    there only if the startup sweep both warmed and captured that shape, so the
-    choice needs no agreement from the target.
+    `batch_ids` outlives the step, so marking without restoring would leave the
+    -1 on rows the next, larger batch fills with real requests -- and a -1 there
+    drops that request's draft KV silently, which reads as lost acceptance
+    rather than as a bug.
     """
-    eager = types.SimpleNamespace(
-        graph_bs=16336,  # a prefill step's graph_bs is a TOKEN count
-        is_dummy_run=False,
-        forward_mode=types.SimpleNamespace(use_cudagraph=False),
-    )
-    p = _proposer_with_graph_bs(monkeypatch)
-    assert p._block_graph_bs(18, eager) == 18, "no capture yet: nothing to pad to"
+    bufs = DSparkIndexBuffers.allocate(8, 2, 4, torch.device("cpu"))
+    row_ids = torch.arange(9, dtype=torch.int32)
 
-    p.block._cuda_graphs[32] = ("graph", "out")
-    assert p._block_graph_bs(18, eager) == 32
-    assert p._block_graph_bs(40, eager) == 40, "capture is at 32, not 48"
+    bufs.mask_pad_tail(row_ids, 2, 6)
+    assert bufs.batch_ids[:12].tolist() == [0, 0, 1, 1] + [-1] * 8
+
+    bufs.mask_pad_tail(row_ids, 5, 6)
+    assert bufs.batch_ids[:12].tolist() == [0, 0, 1, 1, 2, 2, 3, 3, 4, 4, -1, -1]
 
 
 def test_confidence_is_sliced_back_before_the_verify_scheduler(monkeypatch):
@@ -1069,7 +1081,7 @@ def test_confidence_is_sliced_back_before_the_verify_scheduler(monkeypatch):
         set_last_ell=lambda ell: None,
     )
     monkeypatch.setattr(DSparkProposer, "verify_scheduler", sched, raising=False)
-    fc = _stub_forward_context(batch_size=44, graph_bs=48, scheduled_bs=44)
+    fc = _stub_forward_context(batch_size=44, target_bs=48, scheduled_bs=44)
     _run_propose(p, fc, 44, monkeypatch, seen)
     assert seen["B"] == 48
     assert seen["ell_bs"] == 44
@@ -1097,7 +1109,7 @@ def test_the_block_wires_both_its_backbone_and_its_head_into_the_pass(monkeypatc
             return None, None
 
     p.model.model = _Inner()
-    fc = _stub_forward_context(batch_size=8, graph_bs=8, scheduled_bs=8)
+    fc = _stub_forward_context(batch_size=8, target_bs=8, scheduled_bs=8)
     import atom.spec_decode.dspark_proposer as mod
 
     monkeypatch.setattr(mod, "get_forward_context", lambda: fc)
@@ -1113,6 +1125,84 @@ def test_the_block_wires_both_its_backbone_and_its_head_into_the_pass(monkeypatc
         anchor_positions=torch.zeros(8, dtype=torch.int64),
     )
     assert ran == ["backbone"]
+
+
+@pytest.mark.parametrize("window", [128, 64, 7])
+def test_the_block_warms_where_the_whole_rolling_window_is_valid(monkeypatch, window):
+    """The seed decides which shape the warm compiles, not merely that it runs.
+
+    An anchor at position 0 masks every window slot but the last, so the warm
+    builds a near-empty-window variant and steady-state decode still meets its
+    own shape fresh -- the same defect class as leaving the LM head out of the
+    warm, and just as invisible: the pass runs, the graph captures, only the
+    flydsl build moves back into serving.
+
+    Asserted against the model's own ``window_size`` at three widths, so a seed
+    that happened to write the literal 128 would not pass.
+    """
+    seen = {}
+    p = _proposer_with_graph_bs(monkeypatch, window=window)
+    monkeypatch.setenv("ATOM_DRAFT_CUDAGRAPH", "0")  # capture needs a GPU
+
+    class _Inner:
+        @staticmethod
+        def __call__(ids, pos, num_draft):
+            seen["pos"] = pos.clone()
+            return ("normed", ids.shape[0])
+
+        @staticmethod
+        def head_and_sample(normed, hc_hidden, anchor_ids):
+            return None, None
+
+    p.model.model = _Inner()
+    fc = _stub_forward_context(batch_size=8, target_bs=8, scheduled_bs=8)
+    import atom.spec_decode.dspark_proposer as mod
+
+    monkeypatch.setattr(mod, "get_forward_context", lambda: fc)
+    p.block.warmup(8)
+
+    assert seen["pos"].shape[0] == 8
+    assert (seen["pos"] >= window).all(), seen["pos"].tolist()
+
+
+def test_warming_the_block_on_a_dummy_context_is_refused(monkeypatch):
+    """A dummy context carries an all-zero rolling window, and the seed cannot
+    tell: it writes positions and reads the ring slots off whatever context it
+    is handed. Warming there compiles against zeros and shows up only as lost
+    acceptance downstream, so the pass refuses instead.
+
+    The armed half is the second call: the same warm on a real context reaches
+    the backbone, so the raise below is the guard firing and not the stub
+    failing to be reachable.
+    """
+    reached = []
+    p = _proposer_with_graph_bs(monkeypatch)
+    monkeypatch.setenv("ATOM_DRAFT_CUDAGRAPH", "0")
+
+    class _Inner:
+        @staticmethod
+        def __call__(ids, pos, num_draft):
+            reached.append("backbone")
+            return ("normed", ids.shape[0])
+
+        @staticmethod
+        def head_and_sample(normed, hc_hidden, anchor_ids):
+            return None, None
+
+    p.model.model = _Inner()
+    fc = _stub_forward_context(batch_size=8, target_bs=8, scheduled_bs=8)
+    import atom.spec_decode.dspark_proposer as mod
+
+    monkeypatch.setattr(mod, "get_forward_context", lambda: fc)
+
+    fc.context.is_dummy_run = True
+    with pytest.raises(AssertionError, match="dummy"):
+        p.block.warmup(8)
+    assert reached == []
+
+    fc.context.is_dummy_run = False
+    p.block.warmup(8)
+    assert reached == ["backbone"]
 
 
 def test_the_separate_draft_model_path_declares_no_draft_graph(monkeypatch):

@@ -134,52 +134,6 @@ class DSparkProposer(Drafter):
         num_draft = min(self.mtp_k, int(self.model.window_size))
         return self.model.model(anchor_ids, anchor_positions, num_draft)
 
-    def _block_graph_bs(self, bs: int, context) -> int:
-        """The batch the block runs at, or ``bs`` when nothing pins a wider one.
-
-        On the target's cudagraph path it must come from
-        ``context.graph_bs``, which the target set to the DP-unified
-        ``moe_pad_bs`` precisely because MoE's ``pad_for_all_gather`` pads
-        hidden_states to it before a cross-DP all_gather (model_runner.py:2611).
-        ``runner.graph_bs`` is the unnegotiated list, and is ``[0]`` until
-        capture runs. Off that path, see ``_self_chosen_graph_bs``.
-        """
-        mode = context.forward_mode
-        if context.is_dummy_run:
-            return bs  # no bound ring slots to pad against
-        if mode is None or not mode.use_cudagraph:
-            return self._self_chosen_graph_bs(bs)
-        graph_bs = int(context.graph_bs)
-        if graph_bs <= bs:
-            return bs
-        # A SEQUENCE count only on the rectangular decode path: under PIECEWISE
-        # + ragged, `_dspark_ragged_moe_graph_bs` swaps in a token-derived count
-        # (flat_bucket // q) that need not be a captured size. Round through the
-        # base so the answer is a warmed batch or nothing -- padding to an
-        # unwarmed shape is the stall this exists to fix.
-        return graph_bs if self.block.graph_bs_for(bs) == graph_bs else bs
-
-    def _self_chosen_graph_bs(self, bs: int) -> int:
-        """A batch the drafter picks itself, when the target negotiated none.
-
-        A prefill step's ``graph_bs`` is a token count, so there is nothing to
-        pad a SEQUENCE batch to -- and that used to end the matter, leaving the
-        first draft after every prefill eager. It need not: the block's own
-        capture at ``graph_bs_for(bs)`` is self-evidencing, since a graph exists
-        at that batch only if the startup sweep both warmed and captured it.
-        With no capture this returns ``bs`` and nothing changes.
-
-        DP needs no special case. ``_refresh_dp_metadata`` forces
-        ``dp_uniform_decode = False`` for every draft, which routes MoE to the
-        variable-length ``all_gatherv`` (moe.py ``dp_eager_mode``), so ranks
-        already run different widths here; padding changes the numbers, not the
-        structure. There was a ``dp > 1`` bail-out, and it was removed: nothing
-        was ever measured to need it, and it silently kept the whole prefill-side
-        win off the configuration that most wants it.
-        """
-        pad_bs = self.block.graph_bs_for(bs)
-        return pad_bs if self.block.is_captured(pad_bs) else bs
-
     def _init_draft_block_buffers(self) -> None:
         """Preallocate the block-pass metadata the separate-draft path rebinds."""
         max_bs = self.config.max_num_seqs
@@ -605,21 +559,30 @@ class DSparkProposer(Drafter):
         # forward_spec sizes the block off anchor_ids. context.batch_size counts
         # only one half of a mixed prefill+decode step, so it is not that B.
         real_bs = anchor_ids.shape[0]
-        pad_bs = self._block_graph_bs(real_bs, context)
+        pad_bs = self.block.target_pad_bs(real_bs, context)
         # The target already replayed a padded graph, but none of that padding
         # reaches here: its pad rows end at the graph boundary. `anchor_ids`
         # comes from the sampler, which runs after the graph and only over real
         # rows. So the block pads its own inputs. The target's `state_slot_out`
-        # needs no help: `prepare_decode` publishes it at the padded batch.
+        # needs no help, and by an identity rather than an agreement:
+        # `prepare_decode` publishes it at the `bs` it was built with, which is
+        # `forward_mode.effective_bs` -- the same number `target_pad_bs` just
+        # returned.
         staged = self.block.stage(
             pad_bs,
             {"anchor_ids": anchor_ids, "anchor_positions": anchor_positions},
         )
+        # ...and the fabricated rows must not scatter their draft KV. Their ring
+        # slot is the 0 `prepare_decode` fills that tail with, which is a real
+        # position, so the write would land in another request's window. Here
+        # and not inside the block: `run` may REPLAY, and then nothing in the
+        # block's Python runs at all.
+        self.model.model.index_buffers(num_draft, window, self.device).mask_pad_tail(
+            self.runner.attn_metadata_builder.row_ids, real_bs, pad_bs
+        )
         self._refresh_dp_metadata(forward_context, pad_bs * num_draft)
-        replayed = " graph" if self.block.is_captured(pad_bs) else ""
-        with record_function(
-            f"propose_dspark[bs={real_bs}/{pad_bs} T={num_draft}{replayed}]"
-        ):
+        label = self.block.label(real_bs, pad_bs)
+        with record_function(f"propose_dspark[{label} T={num_draft}]"):
             draft_token_ids, confidence = self.block.run(pad_bs, **staged)
         draft_token_ids = draft_token_ids[:real_bs, : self.mtp_k]
         if confidence is not None:

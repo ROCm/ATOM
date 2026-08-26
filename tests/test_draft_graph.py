@@ -8,48 +8,75 @@ lived only there, nothing would check them at all.
 """
 
 import dataclasses
+import types
 
 import pytest
 import torch
 
 from atom.spec_decode.draft_graph import DraftGraph, StagedInput
 
-_GRAPH_BS = [1, 2, 4, 8, 16, 32, 48, 64, 128, 256]
-
 
 def _graph(**kw):
-    """A pass over one int32 input, bound to a stub runner and config."""
+    """A pass over one int32 input, bound to a stub config."""
     kw.setdefault("inputs", {"row": StagedInput(dtype=torch.int32)})
     kw.setdefault("pads", True)
     g = DraftGraph(forward=kw.pop("forward", lambda pad_bs, **rows: pad_bs), **kw)
-    runner = dataclasses.make_dataclass("R", [("graph_bs", list)])(list(_GRAPH_BS))
     config = dataclasses.make_dataclass("C", [("max_num_seqs", int)])(256)
-    return g.bind(config, torch.device("cpu"), runner)
+    return g.bind(config, torch.device("cpu"))
 
 
-@pytest.mark.parametrize("n", [1, 2, 3, 17, 33, 49, 64, 200, 256])
-def test_graph_bs_for_is_monotone_and_idempotent(n):
-    """The two invariants the whole scheme rests on. Monotone means padding can
-    never truncate; idempotent means "warmed at startup" and "reachable at
-    runtime" are one set rather than two lists that can drift."""
+def _ctx(*, effective_bs, use_cudagraph=True, dummy=False, graph_bs=None):
+    """A forward context carrying only what `target_pad_bs` reads."""
+    return types.SimpleNamespace(
+        is_dummy_run=dummy,
+        graph_bs=effective_bs if graph_bs is None else graph_bs,
+        forward_mode=types.SimpleNamespace(
+            use_cudagraph=use_cudagraph, effective_bs=effective_bs
+        ),
+    )
+
+
+@pytest.mark.parametrize("bs,ran_at,want", [(44, 48, 48), (50, 64, 64), (64, 64, 64)])
+def test_the_pad_batch_is_the_one_the_target_ran(bs, ran_at, want):
+    """Never a batch the drafter picks. The target sized its per-sequence
+    metadata with `effective_bs`, so that is exactly how far a pad row may
+    reach; anything wider reads a row nobody wrote this step."""
+    assert _graph().target_pad_bs(bs, _ctx(effective_bs=ran_at)) == want
+
+
+def test_a_token_derived_graph_bs_cannot_be_mistaken_for_a_sequence_count():
+    """Under PIECEWISE + ragged, `_dspark_ragged_moe_graph_bs` overwrites
+    `context.graph_bs` with a TOKEN count (flat_bucket // q) that is neither a
+    captured size nor the batch the metadata was built at. Reading
+    `effective_bs` is what makes that unreachable rather than guarded against.
+    """
+    ctx = _ctx(effective_bs=48, graph_bs=16336)
+    assert _graph().target_pad_bs(44, ctx) == 48
+
+
+@pytest.mark.parametrize(
+    "ctx_kw,why",
+    [
+        ({"use_cudagraph": False}, "eager: nobody sized the metadata past bs"),
+        ({"dummy": True}, "a dummy run has no bound ring slots to pad against"),
+    ],
+)
+def test_nothing_is_padded_where_the_target_pinned_no_batch(ctx_kw, why):
     g = _graph()
-    q = g.graph_bs_for(n)
-    assert q >= n
-    assert g.graph_bs_for(q) == q
-    assert q in _GRAPH_BS
+    # Planted first: owning a graph at 48 is NOT a licence to pad to it. Only a
+    # replayed target sizes its per-sequence metadata past the real batch, and
+    # a pad row that reaches further takes its ring slot -- which DSpark's block
+    # SCATTERS draft KV through -- from a row nobody wrote this step.
+    g._cuda_graphs[48] = ("graph", "out")
+    assert g.target_pad_bs(44, _ctx(effective_bs=256, **ctx_kw)) == 44, why
 
 
-def test_graph_bs_for_falls_through_when_nothing_covers_the_batch():
-    g = _graph()
-    assert g.graph_bs_for(999) == 999
-    # ...nor is an empty batch rounded up to the smallest graph_bs, which would
-    # ask `stage` to replicate a last real row that does not exist.
-    assert g.graph_bs_for(0) == 0
-
-
-def test_a_pass_that_cannot_pad_never_rounds_up():
+def test_a_pass_that_cannot_pad_stays_at_the_real_batch():
+    """`pads` gates the padding, not just the capture -- EPLB turns it off
+    because pad rows would route through the draft's MoE and land in the
+    expert-load histogram."""
     g = _graph(pads=False)
-    assert g.graph_bs_for(44) == 44
+    assert g.target_pad_bs(44, _ctx(effective_bs=48)) == 44
     assert not g.will_capture
 
 

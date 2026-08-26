@@ -133,9 +133,9 @@ A drafter declares its forward passes as `DraftGraph`s (`atom/spec_decode/drafte
 At the end of CUDAGraph capture the runner runs each one once per captured batch
 size, so the per-shape JIT — aiter's flydsl builds an hgemm per tile config,
 in-process — is paid at startup instead of stalling a serving step. At serve
-time the drafter rounds its batch up to one of those same `graph_bs`, which is
-what makes a warmed shape and a reachable shape one set rather than two lists
-that drift. The switch below decides whether that warm also *records*.
+time a pass runs at the batch the target just ran, which `ForwardMode.decide`
+picks out of those same `graph_bs` — that is what makes a warmed shape and a
+reachable shape one set rather than two lists that drift. The switch below decides whether that warm also *records*.
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|

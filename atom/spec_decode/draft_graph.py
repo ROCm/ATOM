@@ -2,7 +2,7 @@
 """One draft forward, warmed and optionally captured per ``graph_bs``.
 
 Kept out of ``drafter.py`` so it stays importable without a GPU AITER build:
-the invariants below -- rounding to a captured batch, staging with a padded
+the invariants below -- which batch a pass may run at, staging with a padded
 tail, the pad contract -- are pure torch, and CI has no aiter. A flavor's own
 passes still live with the flavor; only the machine is here.
 """
@@ -39,9 +39,10 @@ class DraftGraph:
 
     * **warmup** -- run it once per ``graph_bs`` at startup, paying its
       per-shape JIT there rather than mid-serve. Needs nothing.
-    * **pad** -- round the runtime batch up to a ``graph_bs``, so serving only
-      ever asks for a warmed one. Needs ``inputs`` (fixed addresses to pad into)
-      and ``pads`` (an assertion that the fabricated rows reach nothing).
+    * **pad** -- run at the batch the target just ran, which the startup sweep
+      warmed, rather than at whatever this step's batch happens to be. Needs
+      ``inputs`` (fixed addresses to pad into) and ``pads`` (an assertion that
+      the fabricated rows reach nothing).
     * **capture** -- record it. Needs pad.
 
     The pass is ``epilogue ∘ forward``. Warmup always runs both, so nothing
@@ -65,7 +66,6 @@ class DraftGraph:
     pads: bool = False
     warmup_inputs: Callable[..., None] | None = None
 
-    _runner: Any = field(init=False, default=None)
     _buffers: dict[str, torch.Tensor] = field(init=False, default_factory=dict)
     _cuda_graphs: dict[int, tuple] = field(init=False, default_factory=dict)
 
@@ -80,7 +80,7 @@ class DraftGraph:
         """
         return self.forward.__qualname__
 
-    def bind(self, config: "Config", device, runner) -> "DraftGraph":
+    def bind(self, config: "Config", device) -> "DraftGraph":
         """Give the declared pass its storage. Once, at drafter init.
 
         Buffers are allocated now rather than on first use: a capture bakes
@@ -91,7 +91,6 @@ class DraftGraph:
             f"{self.name} says it may pad but stages nothing, so there is no "
             f"buffer for the fabricated rows to land in"
         )
-        self._runner = runner
         self._buffers = {
             role: torch.zeros(
                 (config.max_num_seqs, *staged.shape),
@@ -108,20 +107,45 @@ class DraftGraph:
         graph is made by the shared ``warmup``."""
         return self.pads and envs.ATOM_DRAFT_CUDAGRAPH
 
-    def graph_bs_for(self, bs: int) -> int:
-        """Round ``bs`` up to a warmed ``graph_bs``, or leave it alone.
+    def target_pad_bs(self, bs: int, context) -> int:
+        """The batch the target just ran at, or ``bs`` when it pinned none.
 
-        Monotone and idempotent by construction, so padding can never truncate,
-        and "warmed at startup" and "reachable at serve time" stay one set
-        rather than two lists that drift.
+        Never a batch the drafter picks. ``forward_mode.effective_bs`` IS what
+        the target ran: ``model_runner`` builds the attention metadata with it,
+        so every per-sequence buffer already reaches that far -- ``slot_mapping``
+        -1, ``context_lens`` 0, ring slots published -- and a pad row fabricates
+        nothing the backend has not already accounted for, on any backend and
+        without the drafter knowing each one's convention. It is a warmed shape
+        by construction too: on the cudagraph path ``ForwardMode.decide`` picks
+        it out of ``graph_bs``, which is the list the startup sweep warms.
 
-        An empty batch is never rounded up -- a pad row is a copy of a real one.
+        Not ``context.graph_bs``, which agrees except where DSpark's ragged path
+        overwrites it with a token-derived count (``_dspark_ragged_moe_graph_bs``)
+        that is neither captured nor the batch the metadata was built at.
+
+        Off the cudagraph path every eager branch of ``decide`` returns
+        ``effective_bs == scheduled_bs``, so this answers ``bs`` and nothing is
+        padded -- which is the only safe answer, since nobody sized the target's
+        metadata past the real batch there.
+
         Declining the padding rather than the pass is deliberate: under DP every
-        rank has to reach the draft's collectives.
+        rank still has to reach the draft's collectives.
         """
-        if not bs or not self.pads:
+        mode = context.forward_mode
+        if not self.pads or context.is_dummy_run:
             return bs
-        return min((g for g in self._runner.graph_bs if g >= bs), default=bs)
+        if mode is None or not mode.use_cudagraph:
+            return bs
+        return max(bs, int(mode.effective_bs))
+
+    def label(self, real_bs: int, pad_bs: int) -> str:
+        """``bs=<real>/<pad>`` plus a trailing ``graph`` on a replay.
+
+        One convention, one implementation: "did the draft get into a graph" is
+        then a single grep across every flavor, rather than each flavor writing
+        the same string and the answer holding by coincidence.
+        """
+        return f"bs={real_bs}/{pad_bs}" + (" graph" if self.is_captured(pad_bs) else "")
 
     def stage(
         self, pad_bs: int, srcs: "Mapping[str, torch.Tensor]"
@@ -136,10 +160,7 @@ class DraftGraph:
         How many rows are real comes from the sources, not from the caller: a
         count that cannot disagree with the tensor it describes.
         """
-        staged = {
-            role: self._stage_one(role, pad_bs, src) for role, src in srcs.items()
-        }
-        counts = {t.shape[0] for t in srcs.values() if t is not None}
+        counts = {t.shape[0] for t in srcs.values()}
         assert len(counts) <= 1, (
             f"{self.name} was handed batches of {sorted(counts)}; they "
             f"describe one step, so one of them is not this step's"
@@ -149,7 +170,7 @@ class DraftGraph:
             f"{self.name} was asked for {pad_bs} rows against {bs} real ones, "
             f"but never said its fabricated rows are inert"
         )
-        return staged
+        return {role: self._stage_one(role, pad_bs, src) for role, src in srcs.items()}
 
     def _stage_one(self, role: str, pad_bs: int, src: torch.Tensor | None):
         """Copy ``src`` into this input's fixed buffer, tail-repeating its last row.
@@ -157,7 +178,7 @@ class DraftGraph:
         Every input repeats the same last index, so a pad row is a coherent copy
         of the last real one and only redoes work that row already does. Zeros
         instead faulted 8/8 ranks at the first padded decode step, and repeating
-        one input alone -- an incoherent pair -- faulted too.
+        one input alone -- an incoherent mix -- faulted too.
 
         ``src=None`` hands back the view unwritten: warmup wants a well-formed
         batch, not a particular one.

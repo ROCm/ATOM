@@ -2391,10 +2391,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # step, so writing it here clobbers nothing.
         #
         # Not a slice of `cu_seqlens_q` either: that one is also the q indptr,
-        # and a sentinel in it would corrupt the other reader. `_v4_row_ids` is
+        # and a sentinel in it would corrupt the other reader. `row_ids` is
         # the resident arange the real prefix is restored from.
         batch_id_per_token = var["v4_batch_id_per_token"].gpu[:pad_bs]
-        batch_id_per_token[:bs].copy_(self._v4_row_ids[:bs])
+        batch_id_per_token[:bs].copy_(self.row_ids[:bs])
         if pad_bs > bs:
             batch_id_per_token[bs:] = -1
 
@@ -4497,9 +4497,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # (re-copied into the captured buffer before graph.replay). The constant
         # numpy sources are precomputed once so the per-fwd cost is a slice + H2D.
         bufs["v4_qo_indptr"] = CpuGpuBuffer(T_dec + 1, **i32)
-        # The constant arange a mid-step restores the real prefix of
-        # `v4_batch_id_per_token` from, resident so no step rebuilds it.
-        self._v4_row_ids = torch.arange(bs, device=self.device, dtype=torch.int32)
         self._v4_qo_indptr_np = np.arange(T_dec + 1, dtype=np.int32)
         # Per-seq `ctx_len // 4` (raw, no clamp). Consumed by csa_translate_pack
         # (kernel masks `(k < n_committed) & (k < index_topk)`) AND by the
