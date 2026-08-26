@@ -144,12 +144,31 @@ GSM8K, full 1319 samples, 5-shot, on the fixed relayout:
 | the `recipes/GLM-5.md` form (chat template, `max_tokens=16384`) | 0.9583 | 0.9591 |
 
 The first row is the one comparable to this branch's earlier DCP PD records
-(0.9295, 0.9356) and shows no regression. The second is the form the recipe
-publishes its TP4 reference against (0.9742 / 0.9727); GSM8K prompts are a few
-hundred tokens, far below the `W * index_topk` = 8192 threshold at which the
-DCP top-k stops short-circuiting, so neither row can see this bug class -- they
-are here to show the fix costs nothing, not to prove it works. The needle rows
-above are what prove it.
+(0.9295, 0.9356) and shows no regression.
+
+The second row is the form `recipes/GLM-5.md` publishes its TP4 MXFP4 reference
+against -- 0.9742 / 0.9727 -- which the DCP PD path appears to trail by 1.6 pp.
+It does not. That reference was not produced on this machine, so the same eval
+was run against a single-node TP4 server started from the recipe's own command
+(`-tp 4`, fp8 KV, no prefix caching, no DPA/MTP) on the same box, same image,
+same model copy:
+
+| configuration | flexible-extract | strict-match |
+|---|---|---|
+| TP4 single node, this box | 0.9644 +- 0.0051 | 0.9651 +- 0.0051 |
+| PP4 prefill -> TP4xDCP4 decode over PD | 0.9583 +- 0.0055 | 0.9591 +- 0.0055 |
+| `recipes/GLM-5.md` TP4 reference | 0.9742 +- 0.0044 | 0.9727 +- 0.0045 |
+
+PD+DCP against the local TP4 control is -0.61 pp flexible and -0.60 pp strict,
+0.8 sigma either way -- no measurable accuracy cost to the disaggregated DCP
+path. What is left is the local TP4 control sitting 0.98 pp under the published
+reference (1.5 sigma), which is a property of this machine's model copy or
+image, not of anything on this branch.
+
+None of these rows can see the bug this document is about: GSM8K prompts are a
+few hundred tokens, far below the `W * index_topk` = 8192 threshold at which
+the DCP top-k stops short-circuiting. They are here to show the fix costs
+nothing. The needle rows above are what prove it works.
 
 Artifacts: `results/dcp_index_relayout_fix_20260826/`.
 
