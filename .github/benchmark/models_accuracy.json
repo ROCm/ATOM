@@ -470,5 +470,18 @@
     "accuracy_baseline": 0.95,
     "accuracy_baseline_model": "deepseek-ai/DeepSeek-V4-Pro",
     "_baseline_note": "TBO + dp-attention at conc=1000. Local 1319-sample GSM8K 3-shot, 4 runs = 0.9439/0.9484/0.9538/0.9530 (mean ~0.950, 2026-06-14, after TBO ids-gather + pad_for_all_gather fixes). Baseline 0.95; threshold 0.93 (~1.4pp below lowest 0.9439, conc=1000 variance)."
+  },
+  {
+    "model_name": "DeepSeek-V4-Pro TBO+DPA+mixed conc1000",
+    "model_path": "deepseek-ai/DeepSeek-V4-Pro",
+    "extraArgs": "--kv_cache_dtype fp8 -tp 8 --enable-dp-attention --enable-tbo --enable-mixed-prefill-decode --max-num-batched-tokens 16384 --trust-remote-code --gpu-memory-utilization 0.85 --no-enable_prefix_caching --max-model-len 9472",
+    "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1\nATOM_TBO_MIXED=1\nATOM_PROBE_TBO_MIXED=1",
+    "client_command": "lm_eval --model local-completions --model_args model=${MODEL_PATH},base_url=http://localhost:8000/v1/completions,num_concurrent=1000,max_retries=3,tokenized_requests=False,trust_remote_code=True --tasks gsm8k --num_fewshot 3 --output_path ${OUTPUT_PATH}",
+    "runner": "linux-atom-do-mi350x-8",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.93,
+    "accuracy_baseline": 0.95,
+    "accuracy_baseline_model": "deepseek-ai/DeepSeek-V4-Pro",
+    "_baseline_note": "Same as 'TBO+DPA conc1000' plus --enable-mixed-prefill-decode and ATOM_TBO_MIXED=1, so a delta against that sibling isolates TBO splitting a mixed batch. Local 1319-sample GSM8K 3-shot, 3 runs = 0.9560/0.9507/0.9560 (2026-08-24, branch fpz/mixed_mla_dispatch_v4). Baseline/threshold deliberately identical to the sibling: the two cases must move together, and this one drifting alone is the signal. WEAK GUARD -- gsm8k produced only 5-6 build:mixed_ubatch per rank, so this case would still pass if the mixed split stopped firing entirely; ATOM_PROBE_TBO_MIXED=1 puts the tally in the server log so a human can check. Coverage is 10-30x higher under long-input load (57/rank at ISL 8192 conc 512), which is where a perf case would belong."
   }
 ]
