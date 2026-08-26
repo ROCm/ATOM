@@ -18,7 +18,7 @@ the method that IS its core -- no separate wrapper, the decorated function is th
 core itself::
 
     @piecewise_core(key=decode_bucket_key)
-    def _attn_compress_index(self, *, x, idx_q_quant, ...):
+    def _attn_compress(self, *, x):
         ...the body that needs its own graph...
 
 and writes nothing else -- no staging buffers, no per-input policy, no dummy
@@ -63,6 +63,18 @@ def decode_bucket_key(forward_context) -> tuple:
     else:
         bucket_bs = int(getattr(context, "scheduled_bs", 0) or 0)
     return (bucket_bs, q_eff)
+
+
+def _is_decode(forward_context) -> bool:
+    """Whether this step is a decode.
+
+    Checked by NAME, like ``_annotation_names_tensor`` above and for the same
+    reason: this module stays free of a torch import, and ``AttnState`` lives
+    behind one. Any ``PREFILL_*`` reads as not-decode, which is the only
+    distinction that matters here.
+    """
+    state = getattr(getattr(forward_context, "attn_metadata", None), "state", None)
+    return getattr(state, "name", "") == "DECODE"
 
 
 def _annotation_names_tensor(annotation: Any) -> bool:
@@ -137,15 +149,18 @@ def _resolve_zero_copy(names: tuple[str, ...], copied: frozenset) -> frozenset:
 def piecewise_core(
     *,
     key: Callable[[Any], tuple] = lambda _fc: (),
-    max_tokens: int = 512,
+    max_tokens: int | None = None,
     copy_per_step: tuple[str, ...] = (),
 ):
     """Give the decorated function its own cudagraph, keyed per layer and shape.
 
     ``key`` adds whatever else changes the graph's shape beyond the layer and the
     token count -- for a decode core that is the bucket, `decode_bucket_key`.
-    ``max_tokens`` bounds the rows a captured graph covers; a longer step (a
-    prefill) runs eager.
+    Only DECODE steps are captured; a prefill runs eager, delivering into the
+    persistent output slot. ``max_tokens`` is an OPTIONAL extra cap on the rows
+    a captured graph covers -- a memory lever, off by default. It used to be 512
+    and to be the only gate, which silently excluded every decode bucket above
+    ~85 sequences at DSpark q=6.
 
     Every TENSOR input is captured on directly -- the graph reads the producer's
     own tensor and nothing copies it -- EXCEPT the names in ``copy_per_step``,
@@ -242,11 +257,22 @@ def piecewise_core(
             # `capture` off (plain PIECEWISE) short-circuits to the deliver tail
             # below: the core runs eager and only its result is stabilised, with
             # no graph of its own ever recorded.
+            # DECODE, not a row count. Prefill is what must not be captured --
+            # its shapes are one-off, and the compressor's prefill plan is
+            # sliced to an actual count rather than a graph-fixed capacity -- and
+            # asking that question directly beats bounding tokens and hoping the
+            # two coincide. They did not: at DSpark q=6 a 512-row bound also cut
+            # every decode above bs~85, so AF was silently OFF for the three
+            # largest buckets. `max_tokens` survives as an optional cap for the
+            # reason the bound was introduced (capture memory), now off by
+            # default -- the pool measured 8.37GB before the granularity split
+            # and 1.62GB after.
             eligible = (
                 capture
                 and not getattr(context, "is_dummy_run", False)
                 and getattr(forward_context, "attn_metadata", None) is not None
-                and num_tokens <= max_tokens
+                and _is_decode(forward_context)
+                and (max_tokens is None or num_tokens <= max_tokens)
             )
             # num_tokens is a KEY DIM, not an incidental one: the graph is
             # captured at exactly this flat row count.

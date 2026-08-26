@@ -88,8 +88,8 @@ def dspark_block_attention(
     only be called once``.
 
     The V4 target calls the very same kernel and is fine precisely because its
-    call site (``DeepseekV4Attention._attn_compress_index``) is reachable only through
-    ``torch.ops.aiter.v4_attn_compress_index``, a splitting op. This mirrors that,
+    call site (``DeepseekV4Attention._attn_compress``) is reachable only through
+    ``torch.ops.aiter.v4_attn_compress``, a splitting op. This mirrors that,
     at the WIDE granularity (``v4_attention_with_output``): the whole attention
     sub-layer stays eager.
 

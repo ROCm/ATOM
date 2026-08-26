@@ -338,12 +338,16 @@ def test_scheduler_multi_request_global_topk():
 # ---------------------------------------------------------------------------
 
 
-def _core_probe(*, piecewise, capturing, graph_ready, dummy=False, capture=True):
+def _core_probe(
+    *, piecewise, capturing, graph_ready, dummy=False, capture=True, decode=True
+):
     """Drive a decorated core once against fake collaborators and report which
     of capture / replay / deliver / bare-core it chose.
 
     `capture` is the mode gate (AF_PIECEWISE on). Off, the core never records a
-    graph of its own -- plain PIECEWISE, eager core plus a stabilised output."""
+    graph of its own -- plain PIECEWISE, eager core plus a stabilised output.
+    `decode` is the eligibility gate: prefill is never captured, whatever the
+    mode, because its shapes are one-off."""
     import types
 
     from atom.utils.attn_ffn_piecewise import piecewise_core
@@ -380,7 +384,12 @@ def _core_probe(*, piecewise, capturing, graph_ready, dummy=False, capture=True)
 
     fc = types.SimpleNamespace(
         context=types.SimpleNamespace(is_dummy_run=dummy),
-        attn_metadata=object(),
+        # `_is_decode` reads `attn_metadata.state` by NAME, so a stub enum-alike
+        # is enough and this file needs no AttnState import.
+        attn_metadata=types.SimpleNamespace(
+            state=types.SimpleNamespace(name="DECODE" if decode else "PREFILL_NATIVE"),
+            max_seqlen_q=1,
+        ),
         in_hipgraph=capturing,
     )
     core(
@@ -405,6 +414,22 @@ def test_decorated_core_picks_capture_replay_or_eager():
     assert P(piecewise=False, capturing=False, graph_ready=False) == ["core"]
     assert P(piecewise=False, capturing=True, graph_ready=True) == ["core"]
 
+    # PREFILL is never captured, whatever the mode: its shapes are one-off and
+    # the compressor's prefill plan is sliced to an actual count, not a
+    # graph-fixed capacity. It still owes the downstream piece a deliver.
+    #
+    # This replaced a `num_tokens <= 512` bound, which was trying to say the
+    # same thing in the wrong units -- at DSpark q=6 it also cut every decode
+    # above bs~85, silently disabling AF for the three largest buckets.
+    assert P(piecewise=True, capturing=False, graph_ready=True, decode=False) == [
+        "core",
+        "deliver",
+    ]
+    assert P(piecewise=True, capturing=True, graph_ready=False, decode=False) == [
+        "core",
+        "deliver",
+    ]
+
     # Capture pass, first time this key appears: warm up, record, then compute
     # the real answer (the recording fed on clones).
     assert P(piecewise=True, capturing=True, graph_ready=False) == [
@@ -428,7 +453,7 @@ def test_decorated_core_picks_capture_replay_or_eager():
     # Plain PIECEWISE (capture gate off): the core never records or replays a
     # graph of its own, whatever the capture pass / cache says -- it runs eager
     # and only stabilises its output. This is the path the three-way branch in
-    # v4_attn_compress_index used to hand-code outside the decorator.
+    # v4_attn_compress used to hand-code outside the decorator.
     assert P(piecewise=True, capturing=True, graph_ready=True, capture=False) == [
         "core",
         "deliver",
@@ -496,7 +521,7 @@ def test_v4_core_copies_nothing_per_step():
     try:
         from atom.models.deepseek_v4 import DeepseekV4Attention
 
-        core = DeepseekV4Attention._attn_compress_index
+        core = DeepseekV4Attention._attn_compress
     except ImportError as e:
         if "aiter" not in str(e):
             raise
@@ -566,35 +591,17 @@ def test_v4_core_inputs_come_from_the_signature():
     try:
         from atom.models.deepseek_v4 import DeepseekV4Attention
 
-        core = DeepseekV4Attention._attn_compress_index
+        core = DeepseekV4Attention._attn_compress
     except ImportError as e:
         if "aiter" not in str(e):
             raise
         pytest.skip(f"requires aiter to import deepseek_v4: {e}")
 
-    # The last six are the AF_PIECEWISE shape: `_attn_pre` ran the fused
-    # QK-norm/RoPE a graph piece earlier and hands its outputs in, so `q` and
-    # `kv_pre` arrive None. Exactly one of the two groups is live per call,
-    # which is why both have to be declared and both optional.
-    # The core is the BATCH-shaped half alone: `x` for the compressor and the
-    # indexer's projections for its top-k. `qr`/`qr_scale`/`positions` are there
-    # only for FULL, where the indexer projects inline. Everything token-shaped
-    # -- the paged Q, `positions` for the CSA pack -- stayed in the dense pieces
-    # with the work that reads it, which is what shrank this from nine.
-    # The core is the BATCH-shaped half alone: `x` for the compressor and the
-    # indexer's projections for its top-k. `qr`/`qr_scale`/`positions` are there
-    # only for FULL, where the indexer projects inline. Everything token-shaped
-    # -- the paged Q, `positions` for the CSA pack -- stayed in the dense pieces
-    # with the work that reads it, which is what shrank this from nine.
-    assert core.input_names == (
-        "x",
-        "idx_q_quant",
-        "idx_weights",
-        "idx_q_scale",
-        "qr",
-        "qr_scale",
-        "positions",
-    )
+    # The core is the ONE batch-shaped kernel now: the compressor, whose grid is
+    # `graph_bs * per_seq_bound`. `x` is all it needs. The indexer top-k left
+    # with the FP4 default -- its varqlen path is token-shaped -- and everything
+    # else token-shaped was already in the dense pieces. Nine inputs to one.
+    assert core.input_names == ("x",)
 
 
 def test_core_with_var_kwargs_is_rejected():
@@ -800,7 +807,7 @@ def test_attention_is_reached_only_through_the_opaque_op():
     # Dynamo graphs -- the second trips "VllmBackend can only be called once".
     #
     # The V4 target calls the identical kernel safely because its call site is
-    # behind torch.ops.aiter.v4_attn_compress_index. Mirror that, and keep it mirrored.
+    # behind torch.ops.aiter.v4_attn_compress. Mirror that, and keep it mirrored.
     import ast
     import inspect
     import textwrap
@@ -1407,7 +1414,7 @@ def test_qk_norm_rope_short_circuits_dummy_run():
 
 def test_core_still_binds_the_inputs_that_arrive_none():
     # A core whose signature spans more than one call shape gets None for the
-    # inputs of the shape it is not in -- under the narrow split `_attn_compress_index` is
+    # inputs of the shape it is not in -- under the narrow split `_attn_compress` is
     # handed the paged Q and not `q`/`kv_pre`. Those parameters still have to be
     # BOUND: dropping them from the call instead was a missing-argument
     # TypeError that only showed up at cudagraph capture on real hardware.
@@ -1527,16 +1534,9 @@ def test_every_half_of_the_core_short_circuits_dummy_run():
         x = torch.zeros(T, D)
         # `piecewise=False` is the decorator's eager route -- it just runs the
         # body, which is what has the guard.
-        topk = DeepseekV4Attention._attn_compress_index(
-            layer,
-            piecewise=False,
-            x=x,
-            idx_q_quant=object(),
-            idx_weights=object(),
-            positions=positions,
-        )
-        assert topk.shape == (T, 1) and topk.dtype == torch.int32
-        o = DeepseekV4Attention._attn_paged_core(layer, qkn, topk, positions)
+        token = DeepseekV4Attention._attn_compress(layer, piecewise=False, x=x)
+        assert token.shape == (1,)
+        o = DeepseekV4Attention._attn_paged_core(layer, qkn, positions)
         assert o.shape == (T, H * D) and torch.all(o == 0)
     finally:
         v4.get_forward_context = saved
@@ -1678,18 +1678,9 @@ def test_every_op_fake_agrees_with_its_body():
                 ],
             ),
             (
-                "v4_attn_compress_index",
-                [v4._v4_attn_compress_index_fake(x, None, None, None, "L").shape],
-                [
-                    A._attn_compress_index(
-                        layer,
-                        piecewise=False,
-                        x=x,
-                        idx_q_quant=object(),
-                        idx_weights=object(),
-                        positions=positions,
-                    ).shape
-                ],
+                "v4_attn_compress",
+                [v4._v4_attn_compress_fake(x, "L").shape],
+                [A._attn_compress(layer, piecewise=False, x=x).shape],
             ),
             (
                 "v4_attn_paged_core",
@@ -1701,19 +1692,15 @@ def test_every_op_fake_agrees_with_its_body():
                         None,
                         None,
                         None,
-                        torch.zeros(T, TOPK, dtype=torch.int32),
+                        torch.zeros(1),
                         positions,
+                        None,
+                        None,
+                        None,
                         "L",
                     ).shape
                 ],
-                [
-                    A._attn_paged_core(
-                        layer,
-                        v4.QKNormRopeOut(),
-                        torch.zeros(T, TOPK, dtype=torch.int32),
-                        positions,
-                    ).shape
-                ],
+                [A._attn_paged_core(layer, v4.QKNormRopeOut(), positions).shape],
             ),
         ]
     finally:
@@ -1768,7 +1755,6 @@ def test_paged_post_refuses_a_missing_q():
             DeepseekV4Attention._attn_paged_core(
                 layer,
                 QKNormRopeOut(),  # every field None -- the broken-gate shape
-                torch.zeros(T, 8, dtype=torch.int32),
                 torch.zeros(T, dtype=torch.int32),
             )
     finally:
