@@ -31,6 +31,8 @@ subtrees:
         title: Online quantization best practices
       - file: eagle3_speculative_decoding
         title: EAGLE 3 / 3.1 speculative decoding
+      - file: forced_acceptance_length
+        title: Forced acceptance length
       - file: scheduling_kv_cache_guide
         title: Scheduling and KV cache
       - file: distributed_guide

@@ -32,6 +32,13 @@ from atom.plugin.vllm.model_wrapper import ATOMMoEForCausalLM
 from atom.utils.forward_context import get_forward_context as get_atom_forward_context
 
 
+def _adapt_kda_metadata_for_atom(kda_metadata: KimiK3KDAMetadata) -> None:
+    """Provide the state-read index field expected by native ATOM KDA."""
+    kda_metadata.non_spec_state_indices_in_tensor = (  # type: ignore[attr-defined]
+        kda_metadata.non_spec_state_indices_tensor
+    )
+
+
 def _get_k3_state_shape(
     vllm_config: VllmConfig,
 ) -> tuple[tuple[int, ...], tuple[int, ...]]:
@@ -58,6 +65,45 @@ def _get_k3_state_dtype(vllm_config: VllmConfig) -> tuple[torch.dtype, torch.dty
         vllm_config.model_config.dtype,
         vllm_config.cache_config.mamba_cache_dtype,
     )
+
+
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+
+from atom.config import get_current_atom_config
+from atom.utils import mark_spliting_op
+
+
+def _kda_attention_vllm_fake(
+    hidden_states: torch.Tensor,
+    hidden_states_scale: torch.Tensor | None,
+    layer_name: str,
+    output: torch.Tensor,
+) -> None:
+    return None
+
+
+@mark_spliting_op(
+    is_custom=True,
+    gen_fake=_kda_attention_vllm_fake,
+    mutates_args=["output"],
+)
+def kda_attention_vllm(
+    hidden_states: torch.Tensor,
+    hidden_states_scale: torch.Tensor | None,
+    layer_name: str,
+    output: torch.Tensor,
+) -> None:
+    """Opaque splitting-op boundary for the KDA mixer, vLLM plugin flavour.
+
+    Mirrors ``aiter.kda_attention_with_output`` but takes an ``output`` buffer
+    instead of returning one, which ``@eager_break_during_capture`` requires.
+    Registering it here rather than widening the shared op keeps the native
+    ATOM and SGLang paths on the original signature.
+    """
+    self = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    self._kda_run(hidden_states, hidden_states_scale, output)
 
 
 class KimiKDAAttentionVllm(KimiKDAAttention, MambaBase):
@@ -119,6 +165,41 @@ class KimiKDAAttentionVllm(KimiKDAAttention, MambaBase):
         # KDA shares vLLM's GDN cache specification, but uses its own metadata
         # backend via get_attn_backend().
         return MambaAttentionBackendEnum.GDN_ATTN
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states_scale = None
+        if isinstance(hidden_states, tuple):
+            hidden_states, hidden_states_scale = hidden_states
+        output = torch.empty(
+            hidden_states.shape, dtype=torch.bfloat16, device=hidden_states.device
+        )
+        torch.ops.aiter.kda_attention_vllm(
+            hidden_states, hidden_states_scale, self.layer_name, output
+        )
+        return output
+
+    @eager_break_during_capture
+    def _kda_run(
+        self,
+        hidden_states: torch.Tensor,
+        hidden_states_scale: torch.Tensor | None,
+        output: torch.Tensor,
+    ) -> None:
+        """Run the mixer outside the piecewise cudagraph, writing into ``output``.
+
+        A capture batch under DSpark carries ``1 + num_spec`` tokens per request,
+        which ``decode_threshold=1`` reads as prefill, so capture takes the
+        chunked KDA path. That path builds ``chunk_indices`` from this batch's
+        ``cu_seqlens`` via a host readback -- illegal mid-capture, and frozen
+        into every replay if the readback is dodged. Breaking out re-runs the
+        mixer per replay against live metadata instead, which is what vLLM's own
+        Kimi GDN linear attention does.
+
+        Full decode graphs are untouched: they reach the builder through
+        ``build_for_cudagraph_capture``, which synthesises the draft counts and
+        lands on the fused spec path.
+        """
+        output.copy_(self._forward_impl(hidden_states, hidden_states_scale))
 
     def _forward_segments(
         self,
@@ -243,6 +324,7 @@ class KimiKDAAttentionVllm(KimiKDAAttention, MambaBase):
                 f"Expected KimiK3KDAMetadata for {self.layer_name}, "
                 f"got {type(kda_metadata).__name__}"
             )
+        _adapt_kda_metadata_for_atom(kda_metadata)
 
         vllm_layer = vllm_context.no_compile_layers[self.layer_name]
         conv_state, ssm_state = vllm_layer.kv_cache

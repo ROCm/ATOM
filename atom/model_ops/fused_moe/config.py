@@ -1,9 +1,11 @@
 import logging
-from typing import Union, NamedTuple, ClassVar, TYPE_CHECKING
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, ClassVar, NamedTuple, Union
+
 import torch
 
 if TYPE_CHECKING:
+    from atom.model_ops.fused_moe.expert_layout import MoEExpertLayout
     from atom.model_ops.moe import FusedMoEParallelConfig
 
 logger = logging.getLogger("atom")
@@ -304,6 +306,7 @@ class FusedMoEConfig:
 
     num_local_experts: int
     moe_parallel_config: "FusedMoEParallelConfig"
+    expert_layout: "MoEExpertLayout"
 
     # The activation type.
     in_dtype: torch.dtype | str | None = None
@@ -357,3 +360,24 @@ class FusedMoEConfig:
     @property
     def use_mori_kernels(self):
         return self.moe_parallel_config.use_mori_kernels
+
+
+def moe_kernel_token_capacity(
+    atom_config,
+    *,
+    dp_size: int,
+    use_all2all: bool,
+    dp_logical_ratio: int = 1,
+) -> int:
+    """Token rows MoE kernels must reserve for this rank.
+
+    DP-attention + TP MoE all-gathers hidden states across DP ranks before
+    routing. AITER fused-shared-expert topK metadata is a single preallocated
+    ``[T, topk+shared]`` buffer, so ``T`` must cover the gathered width:
+    ``max_num_batched_tokens * dp_size`` (times the simulated-DP repeat).
+    All2all/EP keeps tokens local, so the per-rank scheduler budget is enough.
+    """
+    tokens = atom_config.max_num_batched_tokens
+    if atom_config.enable_dp_attention and dp_size > 1 and not use_all2all:
+        tokens *= dp_size * max(int(dp_logical_ratio), 1)
+    return tokens

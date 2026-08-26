@@ -12,6 +12,8 @@ from prometheus_client import CollectorRegistry, generate_latest
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
 from prometheus_client.exposition import CONTENT_TYPE_LATEST
 
+from .streaming_dispatch import longest_silence_seconds
+
 
 class _AtomMetricsCollector:
     def __init__(self, exporter: AtomMetricsExporter):
@@ -40,6 +42,19 @@ class _AtomMetricsCollector:
             "Unix timestamp of the last successful runtime metrics refresh.",
         )
         metric.add_metric([], last_refresh)
+        yield metric
+
+        # Read live rather than from the snapshot: the snapshot is refreshed by
+        # the engine, and a stream starved by the engine is exactly the case
+        # where that refresh may also be late. This one is answered by the
+        # event loop that is serving the stalled request.
+        metric = GaugeMetricFamily(
+            "atom:stream_longest_silence_seconds",
+            "Seconds the most starved in-flight SSE stream has gone without a "
+            "chunk. Zero when none is waiting. Non-zero and growing is a "
+            "response that has stopped delivering while the client waits.",
+        )
+        metric.add_metric([], longest_silence_seconds())
         yield metric
 
         gauges = (

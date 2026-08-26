@@ -32,7 +32,11 @@ from atom.model_ops.utils import (
     requantize_with_max_scale,
     shuffle_weights,
 )
-from atom.quant_spec import LayerQuantConfig, should_skip_online_quant
+from atom.quant_spec import (
+    LayerQuantConfig,
+    should_skip_online_quant,
+    should_stream_online_quant,
+)
 from atom.quantization.quark.utils import (
     dequant_weight_online,
     quant_weight_online,
@@ -431,10 +435,12 @@ class LinearBase(nn.Module):
         output_size: int | list[int],
         tp_dim: int | None = None,
         bias: bool = False,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         reduce_results: bool = False,
         source_quant_dtype: torch.dtype | None = None,
         prefix: str = "",
+        override_tp_size: int | None = None,
+        override_tp_rank: int | None = None,
     ):
         self.prefix = prefix
         layer_quant_config = (
@@ -456,6 +462,18 @@ class LinearBase(nn.Module):
         self.tp_dim = tp_dim
         self.tp_rank = get_tp_group().rank_in_group
         self.tp_size = get_tp_group().world_size
+        # Optional effective-TP override: shard on a coarser grid than the global
+        # TP group (e.g. DCP query replication uses effective TP = tp/dcp so each
+        # rank materializes its whole DCP group's output shard). Since eff_tp is a
+        # valid TP size and eff_rank a valid rank within it, all downstream param
+        # sizing / weight_loader narrowing is inherited unchanged.
+        if override_tp_size is not None or override_tp_rank is not None:
+            assert (
+                override_tp_size is not None and override_tp_rank is not None
+            ), "override_tp_size and override_tp_rank must be set together"
+            assert 0 <= override_tp_rank < override_tp_size
+            self.tp_size = override_tp_size
+            self.tp_rank = override_tp_rank
         self.output_partition_sizes = (
             output_size if isinstance(output_size, list) else [output_size]
         )
@@ -467,10 +485,20 @@ class LinearBase(nn.Module):
                 divide(s, self.tp_size) for s in self.output_partition_sizes
             ]
 
+        # Stream eligible source weights through meta storage.
+        self._stream_online_quant = self.source_quant_dtype is None and (
+            should_stream_online_quant(quant_config, prefix, quant_type, params_dtype)
+        )
+        # The default device may be reset before loading starts.
+        self._load_device = torch.empty(0).device if self._stream_online_quant else None
+        param_device = "meta" if self._stream_online_quant else None
+
         if self.source_quant_dtype is not None:
             weight_size = (self.output_size, self.input_size)
             self.weight = atom_parameter(
-                torch.empty(weight_size, dtype=self.source_quant_dtype)
+                torch.empty(
+                    weight_size, dtype=self.source_quant_dtype, device=param_device
+                )
             )
         else:
             weight_size = (
@@ -478,10 +506,14 @@ class LinearBase(nn.Module):
                 if params_dtype not in [dtypes.fp4x2, dtypes.i4x2]
                 else (self.output_size, self.input_size // 2)
             )
-            self.weight = atom_parameter(torch.empty(weight_size, dtype=params_dtype))
+            self.weight = atom_parameter(
+                torch.empty(weight_size, dtype=params_dtype, device=param_device)
+            )
         if bias:
             output_type = get_current_atom_config().torch_dtype
-            self.bias = atom_parameter(torch.empty(self.output_size, dtype=output_type))
+            self.bias = atom_parameter(
+                torch.empty(self.output_size, dtype=output_type, device=param_device)
+            )
             self.bias.weight_loader_process = self.weight_loader_process
         else:
             self.register_parameter("bias", None)
@@ -491,19 +523,29 @@ class LinearBase(nn.Module):
         if quant_type != QuantType.No and self.source_quant_dtype is None:
             if quant_type == QuantType.per_Tensor:
                 self.weight_scale = atom_parameter(
-                    torch.empty(len(self.output_partition_sizes), 1, dtype=dtypes.fp32)
+                    torch.empty(
+                        len(self.output_partition_sizes),
+                        1,
+                        dtype=dtypes.fp32,
+                        device=param_device,
+                    )
                 )
                 if not layer_quant_config.is_dynamic:
                     self.input_scale = atom_parameter(
                         torch.empty(
-                            len(self.output_partition_sizes), 1, dtype=dtypes.fp32
+                            len(self.output_partition_sizes),
+                            1,
+                            dtype=dtypes.fp32,
+                            device=param_device,
                         )
                     )
                     self.input_scale.weight_loader_process = self.weight_loader_process
                     self.input_scale.weight_loader = self.weight_loader
             elif quant_type == QuantType.per_Token:
                 self.weight_scale = atom_parameter(
-                    torch.empty(self.output_size, 1, dtype=dtypes.fp32)
+                    torch.empty(
+                        self.output_size, 1, dtype=dtypes.fp32, device=param_device
+                    )
                 )
             elif quant_type == QuantType.per_1x128:
                 scale_dtype = (
@@ -516,6 +558,7 @@ class LinearBase(nn.Module):
                         (self.output_size + 127) // 128,
                         (self.input_size + 127) // 128,
                         dtype=scale_dtype,
+                        device=param_device,
                     )
                 )
             elif quant_type == QuantType.per_1x32:
@@ -524,6 +567,7 @@ class LinearBase(nn.Module):
                         self.output_size,
                         (self.input_size + 31) // 32,
                         dtype=dtypes.fp8_e8m0,
+                        device=param_device,
                     )
                 )
             self.weight.weight_loader_process = self.weight_loader_process
@@ -659,14 +703,24 @@ class LinearBase(nn.Module):
         )
         weight = self.weight.data
         weight_scale = getattr(self, "weight_scale", None)
+        if (
+            self.tp_size > 1
+            and self.tp_dim is not None
+            and isinstance(self, ReplicatedLinear)
+        ):
+            # W and S of kv_a_proj_with_mqa don't match,
+            # but it doesn't need to be split.
+            return
         # Gather is required whenever local quantization would differ from
         # quantizing the full unpartitioned weight (bit-exact with offline).
+        # Streaming tails are collective-free because modules complete in
+        # different orders across ranks; they quantize the local shard instead.
         need_gather = False
-        if self.tp_size > 1 and self.tp_dim is not None:
-            if isinstance(self, ReplicatedLinear):
-                # W and S of kv_a_proj_with_mqa don't match,
-                # but it doesn't need to be split.
-                return
+        if (
+            not self._stream_online_quant
+            and self.tp_size > 1
+            and self.tp_dim is not None
+        ):
             # col qkv w13, tp_dim=0, [m, n] -> [m // tp, n] -> [m // tp, 1], don't need gather
             # row o, w2, tp_dim=1, [m, n] -> [m, n //tp] -> [m, 1], need gather
             if online_quant_type == QuantType.per_Token:
@@ -1068,7 +1122,7 @@ class ReplicatedLinear(LinearBase):
         input_size: int,
         output_size: int,
         bias: bool = False,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         source_quant_dtype: torch.dtype = None,
         prefix: str = "",
         **kwargs,
@@ -1094,9 +1148,11 @@ class ColumnParallelLinear(LinearBase):
         input_size: int,
         output_size: int,
         bias: bool = False,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         source_quant_dtype: torch.dtype = None,
         prefix: str = "",
+        override_tp_size: int | None = None,
+        override_tp_rank: int | None = None,
         **kwargs,
     ):
         self.tp_dim = 0
@@ -1108,6 +1164,8 @@ class ColumnParallelLinear(LinearBase):
             quant_config=quant_config,
             source_quant_dtype=source_quant_dtype,
             prefix=prefix,
+            override_tp_size=override_tp_size,
+            override_tp_rank=override_tp_rank,
         )
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
@@ -1116,6 +1174,79 @@ class ColumnParallelLinear(LinearBase):
         start_idx = self.tp_rank * shard_size
         loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
         param.weight_loader_process(param_data, loaded_weight)
+
+    def make_row_view(self, start: int, length: int) -> "ColumnParallelLinear":
+        """A layer that computes only output rows [start, start+length).
+
+        Motivation: DCP query replication makes q_proj emit the whole DCP group's
+        heads so decode can skip its AllGather Q. Prefill needs only this rank's
+        heads, and slicing the *output* means the GEMM still did 8x the work
+        (measured: +14.8 ms/step of prefill on GLM-5.2 tp8/dcp8). Slicing the
+        WEIGHT instead makes prefill cost what it costs without replication.
+        """
+        import copy
+
+        assert 0 <= start and length > 0 and start + length <= self.weight.shape[0], (
+            f"row view [{start}, {start + length}) out of range for "
+            f"weight rows {self.weight.shape[0]}"
+        )
+        if getattr(self.weight, "is_shuffled", False):
+            assert start % 16 == 0 and length % 16 == 0, (
+                "a shuffled weight may only be row-sliced on 16-row boundaries "
+                f"(shuffle block size); got start={start} length={length}"
+            )
+
+        view = copy.copy(self)
+        # nn.Module bookkeeping is shared by the shallow copy; give the view its
+        # own parameter dict so rebinding weight/scale cannot disturb `self`.
+        view._parameters = dict(self._parameters)
+        view.weight = nn.Parameter(
+            self.weight.data.narrow(0, start, length), requires_grad=False
+        )
+        view.weight.is_shuffled = getattr(self.weight, "is_shuffled", False)
+
+        ws = getattr(self, "weight_scale", None)
+        if ws is not None and ws.data.dim() == 2 and ws.data.shape[0] > 1:
+            if self.quant_type == QuantType.per_1x128:
+                # Scale is [(N+127)//128, (K+127)//128] and is NOT shuffled, so it
+                # slices on the same boundary scaled by 128 -- the same arithmetic
+                # the TP weight_loader already uses for this quant type.
+                assert start % 128 == 0 and length % 128 == 0, (
+                    "per_1x128 row view must be 128-aligned; got "
+                    f"start={start} length={length}"
+                )
+                view.weight_scale = nn.Parameter(
+                    ws.data.narrow(0, start // 128, length // 128),
+                    requires_grad=False,
+                )
+            elif self.quant_type == QuantType.per_Token:
+                view.weight_scale = nn.Parameter(
+                    ws.data.narrow(0, start, length), requires_grad=False
+                )
+            else:
+                raise NotImplementedError(
+                    f"make_row_view does not handle a per-output-channel scale "
+                    f"for quant_type={self.quant_type}"
+                )
+        # per_Tensor / unquantized scales are shared as-is by the shallow copy.
+
+        if self.bias is not None:
+            view.bias = nn.Parameter(
+                self.bias.data.narrow(0, start, length), requires_grad=False
+            )
+
+        view.output_size = length
+        # `forward` trims padded rows via `_output_size_before_padding`. A row
+        # view lives entirely inside the real rows, so it must not re-trim; the
+        # caller is expected to slice below the padding (only per_Token fp8 pads
+        # at all, and it appends at the end).
+        if getattr(self, "is_output_padded", False):
+            assert (
+                start + length <= self._output_size_before_padding
+            ), "row view must stay within the unpadded rows"
+            view.is_output_padded = False
+        view.prefix = f"{getattr(self, 'prefix', '')}[rows {start}:{start + length}]"
+        return view
 
 
 class MergedColumnParallelLinear(LinearBase):

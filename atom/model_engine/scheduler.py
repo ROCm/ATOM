@@ -30,7 +30,12 @@ from atom.config import Config
 from atom.kv_transfer.disaggregation import KVConnectorOutput
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.request import RequestOutput
-from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
+from atom.model_engine.sequence import (
+    Sequence,
+    SequenceStatus,
+    SequenceType,
+    new_token_ids,
+)
 from atom.model_engine.state_runtime import (
     DEFAULT_STATE_RUNTIME,
     StateMaintenanceOps,
@@ -381,9 +386,11 @@ class ScheduledBatch:
         # `context_lens` is set further down, once `num_cached_tokens` is known:
         # a chunked prefill's context ends at this chunk, not at the whole
         # prompt, so `seq.num_tokens` is only right for decode.
-        self.num_rejected = np.asarray(
-            [seq.num_rejected for seq in seqs.values()], dtype=np.int32
-        )
+        # Kept as a list too: the offset loop below reads it per sequence, and
+        # `arr[i]` builds a numpy scalar where a list index does not. The list
+        # is what `np.asarray` consumes anyway, so holding onto it is free.
+        num_rejected = [seq.num_rejected for seq in seqs.values()]
+        self.num_rejected = np.asarray(num_rejected, dtype=np.int32)
         self.num_bonus = np.asarray(
             [seq.num_bonus_tokens for seq in seqs.values()], dtype=np.int32
         )
@@ -458,38 +465,62 @@ class ScheduledBatch:
             dtype=np.int32,
         )
 
-        # Compute token offsets: prefill uses num_cached_tokens, decode uses existing formula
-        self.scheduled_tokens = np.empty(total_tokens_num, dtype=np.int32)
-        pos = 0
+        # Each sequence's window, staged into one array rather than assigned
+        # per sequence: a numpy slice-assign costs ~245ns of dispatch whatever
+        # its length, and at decode a window is a single token. `extend`
+        # between two `array("i")` is a memcpy. 4x at bs=256.
+        staged = new_token_ids()
         for i, (seq, num) in enumerate(zip(seqs.values(), num_scheduled_tokens)):
             if seq.type == SequenceType.PREFILL:
                 offset = self.num_cached_tokens[i]
             else:
-                offset = seq.num_tokens - self.num_rejected[i] - num
-            self.scheduled_tokens[pos : pos + num] = seq.token_ids[
-                offset : offset + num
-            ]
-            pos += num
+                offset = seq.num_tokens - num_rejected[i] - num
+            staged.extend(seq.token_ids[offset : offset + num])
+        # Checked here because nothing downstream will: the array below wraps
+        # whatever length was staged, and a sequence too short to fill its
+        # window would otherwise leave the batch quietly short.
+        if len(staged) != total_tokens_num:
+            raise ValueError(
+                f"staged {len(staged)} tokens for a batch of {total_tokens_num}: "
+                "a sequence is shorter than the window scheduled for it"
+            )
+        # Wrapped, not copied into a fresh array: consumers only ever read this
+        # or rebind it, so the staging buffer can be the buffer.
+        self.scheduled_tokens = np.frombuffer(staged, dtype=np.int32)
 
         if num_spec_step > 0 and scheduled_spec_decode_tokens is not None:
-            # One row per sequence, in batch order, zero-filled where a sequence
-            # has no drafts yet — which is every sequence entering decode
-            # straight off its own prefill. The caller's dict is keyed by
-            # request id and only holds sequences that DO have drafts, so
-            # densifying it with `list(...values())` drops those rows and shifts
-            # every later one onto the wrong sequence. Consumers index this by
-            # batch position (`prepare_input_ids`), not by request id, so that
-            # shift silently feeds one sequence another's draft tokens, and
-            # raises IndexError once the array is short enough.
-            self.scheduled_spec_decode_tokens = np.zeros(
-                (len(seqs), num_spec_step), dtype=np.int32
-            )
-            for i, req_id in enumerate(self.req_ids):
+            # One row per sequence, in batch order. The caller's dict is keyed
+            # by request id and holds only sequences that DO have drafts, so
+            # densifying it with `list(...values())` drops the others and
+            # shifts every later row onto the wrong sequence — consumers index
+            # this by batch position (`prepare_input_ids`), which turns that
+            # shift into one sequence silently reading another's drafts.
+            #
+            # Rows are collected and written in one assign: a per-row write
+            # costs ~245ns of dispatch against a row this short, so the marshal
+            # was mostly dispatch (3.7x at bs=256). Rows that are not
+            # full width are padded rather than dropping the batch back to the
+            # per-row form, because at a large batch a sequence joins decode
+            # nearly every step and would take every other sequence with it.
+            no_drafts = np.zeros(num_spec_step, dtype=np.int32)
+            rows = []
+            for req_id in self.req_ids:
                 drafts = scheduled_spec_decode_tokens.get(req_id)
-                if drafts is None or drafts.size == 0:
-                    continue
-                width = min(drafts.size, num_spec_step)
-                self.scheduled_spec_decode_tokens[i, :width] = drafts[:width]
+                if drafts is not None and drafts.size == num_spec_step:
+                    rows.append(drafts)
+                elif drafts is None or drafts.size == 0:
+                    rows.append(no_drafts)
+                else:  # short or long: onto a row of its own, never the shared one
+                    padded = no_drafts.copy()
+                    padded[: min(drafts.size, num_spec_step)] = drafts[:num_spec_step]
+                    rows.append(padded)
+            # `concatenate` rejects an empty list, which a warmup batch is.
+            flat = (
+                np.concatenate(rows, dtype=np.int32)
+                if rows
+                else np.empty(0, dtype=np.int32)
+            )
+            self.scheduled_spec_decode_tokens = flat.reshape(len(seqs), num_spec_step)
         self.block_tables = [
             seq.block_table for seq in seqs.values() if seq.block_table
         ]
