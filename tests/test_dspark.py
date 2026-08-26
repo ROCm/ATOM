@@ -1534,8 +1534,7 @@ def test_every_half_of_the_core_short_circuits_dummy_run():
         x = torch.zeros(T, D)
         # `piecewise=False` is the decorator's eager route -- it just runs the
         # body, which is what has the guard.
-        token = DeepseekV4Attention._attn_compress(layer, piecewise=False, x=x)
-        assert token.shape == (1,)
+        assert DeepseekV4Attention._attn_compress(layer, piecewise=False, x=x) is None
         o = DeepseekV4Attention._attn_paged_core(layer, qkn, positions)
         assert o.shape == (T, H * D) and torch.all(o == 0)
     finally:
@@ -1679,8 +1678,8 @@ def test_every_op_fake_agrees_with_its_body():
             ),
             (
                 "v4_attn_compress",
-                [v4._v4_attn_compress_fake(x, "L").shape],
-                [A._attn_compress(layer, piecewise=False, x=x).shape],
+                [v4._v4_attn_compress_fake(x, "L")],
+                [A._attn_compress(layer, piecewise=False, x=x)],
             ),
             (
                 "v4_attn_paged_core",
@@ -1692,7 +1691,6 @@ def test_every_op_fake_agrees_with_its_body():
                         None,
                         None,
                         None,
-                        torch.zeros(1),
                         positions,
                         None,
                         None,
@@ -1961,3 +1959,61 @@ def test_reader_ignores_the_indices_length():
         q, unified_kv, loose, indptr, attn_sink, dim**-0.5
     )
     torch.testing.assert_close(out_tight, out_loose)
+
+
+def test_a_void_op_survives_only_because_split_ops_are_not_compiled():
+    # `v4_attn_compress` returns nothing. That is only safe because a split op's
+    # submodule is the one piece the backend leaves uncompiled --
+    # `submod_names_to_compile` excludes `is_splitting_graph` -- so it never
+    # reaches AOT autograd, which is the layer that drops an effect-free call.
+    #
+    # Both halves of that are pinned here: the DCE layer, and the exclusion. Get
+    # either wrong and the compressor silently stops running, with no error.
+    import torch
+
+    from atom.utils.custom_register import direct_register_custom_op
+
+    calls = []
+
+    def _op(x: torch.Tensor) -> None:
+        calls.append(1)
+
+    def _fake(x: torch.Tensor) -> None:
+        return None
+
+    direct_register_custom_op(
+        op_name="_void_probe", op_func=_op, mutates_args=[], fake_impl=_fake
+    )
+
+    def f(x):
+        torch.ops.aiter._void_probe(x)
+        return x * 2
+
+    if not torch.cuda.is_available():
+        import pytest
+
+        pytest.skip("the op registers a CUDA kernel")
+    x = torch.randn(8, device="cuda")
+    seen = {}
+    for backend in ("eager", "aot_eager"):
+        g = torch.compile(f, backend=backend, dynamic=False)
+        g(x)
+        calls.clear()
+        g(x)
+        seen[backend] = len(calls)
+        torch._dynamo.reset()
+    assert seen["eager"] == 1, "Dynamo alone keeps it; if not, the premise moved"
+    assert seen["aot_eager"] == 0, (
+        "AOT no longer drops an effect-free op -- then a void op would be safe "
+        "anywhere and `v4_attn_compress` need not stay a split op"
+    )
+
+    import inspect
+
+    from atom.utils import backends
+
+    src = inspect.getsource(backends)
+    assert "if not item.is_splitting_graph" in src, (
+        "the backend no longer excludes split-op submodules from compilation, "
+        "so `v4_attn_compress` would go through AOT and be DCE'd"
+    )

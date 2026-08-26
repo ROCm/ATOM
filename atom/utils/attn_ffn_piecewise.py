@@ -293,7 +293,10 @@ def piecewise_core(
                     read_from, refresh = runner.input_buffers(
                         tensor_inputs, input_names, zero_copy
                     )
-                    out_slot = outputs.slot(out_key, core(**read_from))
+                    # A void core -- one whose whole effect is on paged state --
+                    # has no result to stabilise and no slot to size.
+                    warm = core(**read_from)
+                    out_slot = None if warm is None else outputs.slot(out_key, warm)
                     runner.capture(graph_key, read_from, refresh, core, out_slot)
                 elif runner.has_graph(graph_key) and not capturing:
                     return runner.replay(graph_key, tensor_inputs)
@@ -302,7 +305,8 @@ def piecewise_core(
             # or a step whose key was never captured. Also the tail of the
             # capture branch above -- it fed on clones, so its result is not this
             # forward's answer.
-            return outputs.deliver(out_key, core(**tensor_inputs))
+            result = core(**tensor_inputs)
+            return None if result is None else outputs.deliver(out_key, result)
 
         wrapper.input_names = input_names
         wrapper.passthrough_names = passthrough_names

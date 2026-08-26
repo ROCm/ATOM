@@ -116,7 +116,7 @@ from atom.model_ops.v4_kernels import (
 )
 from atom.utils import envs, mark_spliting_op
 from atom.utils.attn_ffn_piecewise import decode_bucket_key, piecewise_core
-from atom.utils.cuda_graph import CudagraphCaptureRunner, StableOutputs
+from atom.utils.cuda_graph import CudagraphCaptureRunner
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import AttnState, get_forward_context
@@ -195,19 +195,14 @@ def v4_attention_with_output(
 
 
 v4_attn_runner = CudagraphCaptureRunner()
-# The fixed addresses the dense piece downstream of the attn core reads. Needed
-# under PIECEWISE whether or not the core itself is captured, so it is separate
-# from the graph cache above. `DeepseekV4Attention._attn_compress` carries
-# `@piecewise_core` decorator itself and is handed these two per call.
-v4_attn_outputs = StableOutputs()
 
 
-def _v4_attn_compress_fake(x: torch.Tensor, layer_name: str) -> torch.Tensor:
-    return x.new_empty((1,))
+def _v4_attn_compress_fake(x: torch.Tensor, layer_name: str) -> None:
+    return None
 
 
 @mark_spliting_op(is_custom=True, gen_fake=_v4_attn_compress_fake, mutates_args=[])
-def v4_attn_compress(x: torch.Tensor, layer_name: str) -> torch.Tensor:
+def v4_attn_compress(x: torch.Tensor, layer_name: str) -> None:
     """The split point, and the ONE batch-shaped kernel: the compressor.
 
     Its grid is `plan_gpu.shape[0] = graph_bs * per_seq_bound`, which is why
@@ -217,20 +212,17 @@ def v4_attn_compress(x: torch.Tensor, layer_name: str) -> torch.Tensor:
     but FP4 is the default and its varqlen path is token-shaped, so it sits in
     `_attn_paged_core` with the rest of that granularity.
 
-    The `[1]` is an ORDERING TOKEN, not data: the compressor writes this
-    forward's compressed KV, `score_topk_from` reads it, and they are now in
-    different graphs. The downstream piece consuming this return is the edge
-    that orders them. Returning nothing is NOT an option -- measured under
-    inductor, an op that declares no mutation and returns nothing is DCE'd and
-    the compressor stops running. The only other way to declare an effect is a
-    mutated argument, and every buffer the compressor writes is None or a
-    placeholder at trace time (the builder setattr-replaces them in
-    `build_kv_cache_tensor`, after warmup traces). One element is the cheapest
-    declaration available, and on the captured path it costs nothing.
+    It returns NOTHING, and does not need to: a split op's submodule is the one
+    piece the backend leaves uncompiled (`backends.py`, `submod_names_to_compile`
+    excludes `is_splitting_graph`), so it never reaches AOT autograd, which is
+    the layer that DCEs an effect-free call -- measured: survives under
+    `backend="eager"`, dropped under `aot_eager` and `inductor`. Ordering comes
+    from `split_graph`'s `keep_original_order=True` and the sequential submodule
+    calls it generates, not from a data edge. A regular custom op in a compiled
+    piece would need one; this is not that.
 
-    It is still a signpost: this split has no natural data boundary any more.
     Give the compressor a fixed-capacity plan (`decode_capacity_per_ratio`) and
-    it goes token-shaped, taking the split op and this token with it.
+    it goes token-shaped, at which point the split op is not needed at all.
     """
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
@@ -242,9 +234,9 @@ def v4_attn_compress(x: torch.Tensor, layer_name: str) -> torch.Tensor:
     is_piecewise = (
         getattr(fc, "cudagraph_runtime_mode", None) == CUDAGraphMode.PIECEWISE
     )
-    return self._attn_compress(
+    self._attn_compress(
         runner=v4_attn_runner,
-        outputs=v4_attn_outputs,
+        outputs=None,
         piecewise=is_piecewise,
         capture=self.attn_ffn_piecewise,
         forward_context=fc,
@@ -259,7 +251,6 @@ def _v4_attn_paged_core_fake(
     q_rope: torch.Tensor | None,
     k_packed: torch.Tensor | None,
     k_rope: torch.Tensor | None,
-    compressed: torch.Tensor,
     positions: torch.Tensor,
     idx_q_quant: torch.Tensor | None,
     idx_weights: torch.Tensor | None,
@@ -281,7 +272,6 @@ def v4_attn_paged_core(
     q_rope: torch.Tensor | None,
     k_packed: torch.Tensor | None,
     k_rope: torch.Tensor | None,
-    compressed: torch.Tensor,  # ordering token from `v4_attn_compress`, unread
     positions: torch.Tensor,
     idx_q_quant: torch.Tensor | None,
     idx_weights: torch.Tensor | None,
@@ -2872,7 +2862,7 @@ class DeepseekV4Attention(nn.Module):
             # token-shaped work (projections, `qk_norm_rope` above; CSA pack and
             # the paged attention below); the split op holds the batch-shaped
             # pair, and is keyed with the batch shape accordingly.
-            compressed = torch.ops.aiter.v4_attn_compress(x, self.layer_name)
+            torch.ops.aiter.v4_attn_compress(x, self.layer_name)
             o = torch.ops.aiter.v4_attn_paged_core(
                 q_sa,
                 kv,
@@ -2880,7 +2870,6 @@ class DeepseekV4Attention(nn.Module):
                 q_rope,
                 k_packed,
                 k_rope,
-                compressed,
                 positions,
                 idx_q_quant,
                 idx_weights,
@@ -3156,7 +3145,7 @@ class DeepseekV4Attention(nn.Module):
         *,
         x: torch.Tensor | None = None,  # [num_tokens, dim] hidden state
         compressor_already_launched: bool = False,
-    ) -> torch.Tensor:  # [1] -- an ordering token, see `v4_attn_compress`
+    ) -> None:
         """The BATCH-shaped half: compressor launch + side-stream join.
 
         The only kernel left whose launch is sized by the batch, which is why this
@@ -3178,7 +3167,7 @@ class DeepseekV4Attention(nn.Module):
         # sit above all of this; both halves now also run from `_attn_pre`, a
         # graph piece earlier, so both need their own. See `_qk_norm_rope`.
         if fc.context.is_dummy_run or os.environ.get("ATOM_V4_BYPASS_ATTN") == "1":
-            return x.new_zeros((1,))
+            return
         attn_md = cast("AttentionMetaData_DSV4", fc.attn_metadata)
         ratio = self.compress_ratio
         plan_for_layer = attn_md.compress_plans[ratio] if ratio else None
@@ -3208,7 +3197,6 @@ class DeepseekV4Attention(nn.Module):
                 current_stream.wait_stream(self.alt_stream)
             if self.indexer is not None:
                 current_stream.wait_stream(self.indexer_stream)
-        return x.new_zeros((1,))  # ordering token, see `v4_attn_compress`
 
     def _qk_norm_rope(
         self,
