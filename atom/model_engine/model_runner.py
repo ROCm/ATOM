@@ -181,29 +181,6 @@ class tokenIDProcessor:
         num_spec_tokens: int = 0,
     ):
         """Asynchronously copy the sampled_token_ids tensor to the host."""
-        # Deferred output is disabled when running in P/D disaggregation mode
-        # (kv_transfer_config is set), enabled otherwise.
-        # TODO: In P/D disaggregation mode, if have issue, we can disable it
-        #
-        # Deferred output used to be force-disabled whenever
-        # --enable-mixed-prefill-decode was set, to dodge an accuracy bug where a
-        # decode seq that idled across several prefill-chunk steps read a
-        # placeholder token (R1 GSM8K 0.87 vs 0.9469). That gate is removed: the
-        # bug's precondition no longer exists. Decode-first budget reservation
-        # (58de4490) seats every in-flight decode in every mixed step (measured
-        # 503-510 of 512 per step, on all 260 mixed steps of a run), so a decode
-        # seq no longer idles across prefill chunks; and an idle seq's placeholder
-        # is filled by the next postprocess (it is still in `self.running`, so
-        # `fwd_output.get_idx` finds it) while no new placeholder is appended (the
-        # placeholder loop iterates the *scheduled* seqs), leaving the real token
-        # in `seq.token_ids[-1]`.
-        #
-        # Re-measured on DeepSeek-V4-Pro tp4, mixed on, full GSM8K (1319, 5-shot),
-        # ~940 mixed batches per run: deferred off 0.9530 ±0.0058 vs deferred on
-        # 0.9492 ±0.0060 — a 0.0038 gap inside the error bars, against the
-        # historical −0.077. The gate was costing ~7% throughput (it disabled
-        # deferred for *pure-decode* steps too, which is where the cost landed).
-        # The pipeline-parallel gate below is main's and is kept as-is.
         self.is_deferred_out = getattr(runner.config, "pipeline_parallel_size", 1) == 1
 
         self.runner = runner
