@@ -12,7 +12,10 @@ pytest.importorskip(
     exc_type=ImportError,
 )
 
-from atom.model_engine.model_runner import tokenIDProcessor
+from atom.model_engine.model_runner import (
+    _kv_config_has_producer,
+    tokenIDProcessor,
+)
 from atom.model_engine.scheduler import ScheduledBatch
 
 
@@ -110,6 +113,63 @@ def _processor() -> tokenIDProcessor:
     processor.prev_rejected_num = np.array([7], dtype=np.int32)
     processor.prev_bonus_num = np.array([8], dtype=np.int32)
     return processor
+
+
+@pytest.mark.parametrize(
+    ("kv_config", "expected"),
+    [
+        ({}, False),
+        ({"kv_connector": "mooncake", "kv_role": "kv_consumer"}, False),
+        ({"kv_connector": "mooncake", "kv_role": "kv_producer"}, True),
+        (
+            {
+                "kv_connector": "multi",
+                "connectors": [
+                    {"kv_connector": "lmcache_offload", "kv_role": "offload"},
+                    {"kv_connector": "mooncake", "kv_role": "kv_producer"},
+                ],
+            },
+            True,
+        ),
+    ],
+)
+def test_detects_remote_prefill_producer(kv_config, expected):
+    assert _kv_config_has_producer(kv_config) is expected
+
+
+@pytest.mark.parametrize(
+    ("kv_config", "expected"),
+    [
+        ({"kv_role": "kv_consumer"}, True),
+        ({"kv_role": "kv_producer"}, False),
+        (
+            {
+                "kv_connector": "multi",
+                "connectors": [
+                    {"kv_role": "offload"},
+                    {"kv_role": "kv_producer"},
+                ],
+            },
+            False,
+        ),
+    ],
+)
+def test_remote_prefill_producer_disables_deferred_output(kv_config, expected):
+    runner = SimpleNamespace(
+        config=SimpleNamespace(
+            pipeline_parallel_size=1,
+            kv_transfer_config=kv_config,
+        ),
+        device="cuda",
+    )
+    with (
+        mock.patch("atom.model_engine.model_runner.CpuGpuBuffer"),
+        mock.patch("atom.model_engine.model_runner.torch.cuda.Stream"),
+        mock.patch("atom.model_engine.model_runner.torch.zeros"),
+    ):
+        processor = tokenIDProcessor(runner, max_num_batched_tokens=8)
+
+    assert processor.is_deferred_out is expected
 
 
 def test_middle_prefills_preserve_status_until_mixed_final_batch():

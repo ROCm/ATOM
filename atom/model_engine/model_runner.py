@@ -158,6 +158,18 @@ def max_schedulable_decode_bs(
     return min(max_num_seqs, max_num_batched_tokens // full_q_len)
 
 
+def _kv_config_has_producer(kv_config: object) -> bool:
+    """Whether a KV config contains a P/D producer, including ``multi``."""
+    if not isinstance(kv_config, dict):
+        return False
+    if kv_config.get("kv_role") == "kv_producer":
+        return True
+    return any(
+        _kv_config_has_producer(sub)
+        for sub in kv_config.get("connectors", [])
+    )
+
+
 class TokenLocations(NamedTuple):
     """How each request in this decode batch gets its anchor token.
 
@@ -186,7 +198,15 @@ class tokenIDProcessor:
         num_spec_tokens: int = 0,
     ):
         """Asynchronously copy the sampled_token_ids tensor to the host."""
-        self.is_deferred_out = getattr(runner.config, "pipeline_parallel_size", 1) == 1
+        kv_cfg = getattr(runner.config, "kv_transfer_config", {}) or {}
+        is_remote_prefill_producer = _kv_config_has_producer(kv_cfg)
+        # P/D hands off prompt-end state plus the first sampled token.
+        # Disable deferred output on the producer so the consumer processes that
+        # token only once, avoiding duplicate state updates (e.g. Kimi-K3 KDA).
+        self.is_deferred_out = (
+            getattr(runner.config, "pipeline_parallel_size", 1) == 1
+            and not is_remote_prefill_producer
+        )
 
         self.runner = runner
         device = runner.device
