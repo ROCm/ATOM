@@ -87,6 +87,7 @@ class EngineStats:
         "cache_enabled",
         "distribution",
         "engine_index",
+        "label",
         "mtp_k",
         "num_generation_tokens",
         "num_prompt_tokens",
@@ -105,6 +106,7 @@ class EngineStats:
         self,
         *,
         engine_index: int = 0,
+        label: str = "",
         use_spec: bool = False,
         mtp_k: int = 0,
         enable_prefix_caching: bool = False,
@@ -158,6 +160,9 @@ class EngineStats:
             throughput_log_interval_s > 0
         ), f"throughput_log_interval_s must be > 0, got {throughput_log_interval_s}"
         self.engine_index = engine_index
+        # Distinguishes the P/D processes, which both run as engine index 0 and
+        # usually log to the same place. "" for the aggregated engine.
+        self.label = label
         self.throughput_log_interval_s = throughput_log_interval_s
         self._throughput_last_log_time = time.monotonic()
         self.num_prompt_tokens = 0
@@ -377,11 +382,24 @@ class EngineStats:
         self.num_prompt_tokens += num_prompt_tokens
         self.num_generation_tokens += num_generation_tokens
 
+    def window_expired(self, now: float) -> bool:
+        """Whether the throughput window is due to close.
+
+        Split out so the busy loop's idle heartbeat can skip the rest of
+        `_record_throughput` on the overwhelming majority of its spins — it
+        calls this once per pass, and the answer is no all but once per
+        interval.
+        """
+        return (
+            self.throughput_enabled
+            and now - self._throughput_last_log_time >= self.throughput_log_interval_s
+        )
+
     def maybe_log_throughput(
         self,
         num_running_reqs: int,
         num_waiting_reqs: int,
-        kv_usage: float,
+        kv_usage: float | None,
     ) -> None:
         if not self.throughput_enabled:
             return
@@ -389,26 +407,36 @@ class EngineStats:
         elapsed = now - self._throughput_last_log_time
         if elapsed < self.throughput_log_interval_s:
             return
+        if (
+            self.num_prompt_tokens == 0
+            and self.num_generation_tokens == 0
+            and num_running_reqs == 0
+            and num_waiting_reqs == 0
+        ):
+            self._throughput_last_log_time = now
+            return
         prompt_throughput = self.num_prompt_tokens / elapsed
         generation_throughput = self.num_generation_tokens / elapsed
         # The prefix-cache hit rate is owned by this same object now; pull it
         # from the cache section rather than have the caller thread it in.
         prefix_cache_hit_rate = self.cache_hit_rate if self.cache_enabled else None
-        hit_rate_pct = (
-            0.0 if prefix_cache_hit_rate is None else prefix_cache_hit_rate * 100
-        )
         logger.info(
-            "Engine %03d: Avg prompt throughput: %.1f tokens/s, "
+            "%sEngine %03d: Avg prompt throughput: %.1f tokens/s, "
             "Avg generation throughput: %.1f tokens/s, Running: %d reqs, "
-            "Waiting: %d reqs, GPU KV cache usage: %.1f%%, "
-            "Prefix cache hit rate: %.1f%%",
+            "Waiting: %d reqs, GPU KV cache usage: %s, "
+            "Prefix cache hit rate: %s",
+            self.label,
             self.engine_index,
             prompt_throughput,
             generation_throughput,
             num_running_reqs,
             num_waiting_reqs,
-            kv_usage * 100,
-            hit_rate_pct,
+            "n/a" if kv_usage is None else f"{kv_usage * 100:.1f}%",
+            (
+                "n/a"
+                if prefix_cache_hit_rate is None
+                else f"{prefix_cache_hit_rate * 100:.1f}%"
+            ),
         )
         self._throughput_last_log_time = now
         self.num_prompt_tokens = 0
@@ -768,6 +796,8 @@ class Scheduler:
     :meth:`_update_from_kv_xfer_finished` (both sides).
     """
 
+    _ENGINE_LABEL = ""
+
     def __init__(
         self,
         config: Config,
@@ -878,6 +908,7 @@ class Scheduler:
         )
         self.engine_stats = EngineStats(
             engine_index=dp_rank or 0,
+            label=self._ENGINE_LABEL,
             use_spec=self.use_spec,
             mtp_k=self.mtp_k,
             enable_prefix_caching=config.enable_prefix_caching,
@@ -968,6 +999,15 @@ class Scheduler:
             return 0.0
         return bm.kv.num_used / total
 
+    def _status_counts(self) -> tuple[int, int]:
+        """(running, waiting) as the engine-status line should report them.
+
+        Overridable: a scheduler that parks admitted requests in queues of its
+        own has to fold them in here, or the line reports an idle engine while
+        it is at full load.
+        """
+        return len(self.running), len(self.waiting)
+
     def _record_throughput(
         self, num_prompt_tokens: int = 0, num_generation_tokens: int = 0
     ) -> None:
@@ -980,11 +1020,18 @@ class Scheduler:
         if not stats.throughput_enabled:
             return
         stats.update_throughput(num_prompt_tokens, num_generation_tokens)
+        num_running_reqs, num_waiting_reqs = self._status_counts()
         stats.maybe_log_throughput(
-            num_running_reqs=len(self.running),
-            num_waiting_reqs=len(self.waiting),
+            num_running_reqs=num_running_reqs,
+            num_waiting_reqs=num_waiting_reqs,
             kv_usage=self._kv_usage(),
         )
+
+    def heartbeat_throughput(self, now: float) -> None:
+        """Close the throughput window on time while the engine sits idle.
+        """
+        if self.engine_stats.window_expired(now):
+            self._record_throughput()
 
     def _waiting_new_token_count(self) -> int:
         """Sum of new (uncached) tokens across the ADMITTABLE waiting queue,
@@ -2979,6 +3026,7 @@ class PrefillScheduler:
         )
         self.engine_stats = EngineStats(
             engine_index=dp_rank or 0,
+            label="Prefill ",
             enable_log_stats=config.enable_log_stats,
         )
         self.total_prompt_tokens = 0
@@ -3054,17 +3102,13 @@ class PrefillScheduler:
                 num_batched_tokens += num_new_tokens
                 num_seqs += 1
 
-        # Prefill produces no generation tokens, and KV lives on the
-        # decode side (no local BlockManager), so generation and KV
-        # usage are reported as 0.
+        # Prefill produces no generation tokens, and KV lives on the decode
+        # side (no local BlockManager), so generation is 0 and KV usage is
+        # None — reported as `n/a`, not as an empty pool.
         self.engine_stats.update_throughput(
             num_prompt_tokens=num_batched_tokens, num_generation_tokens=0
         )
-        self.engine_stats.maybe_log_throughput(
-            num_running_reqs=len(self.running),
-            num_waiting_reqs=len(self.waiting),
-            kv_usage=0.0,
-        )
+        self._log_throughput()
 
         if not scheduled_seqs:
             return None, {}
@@ -3089,6 +3133,20 @@ class PrefillScheduler:
             ),
             scheduled_seqs,
         )
+
+    def _log_throughput(self) -> None:
+        """Close the throughput window if it is due. No BlockManager here —
+        the decode process owns the KV blocks — so usage is reported `n/a`."""
+        self.engine_stats.maybe_log_throughput(
+            num_running_reqs=len(self.running),
+            num_waiting_reqs=len(self.waiting),
+            kv_usage=None,
+        )
+
+    def heartbeat_throughput(self, now: float) -> None:
+        """Idle-pass counterpart of `Scheduler.heartbeat_throughput`."""
+        if self.engine_stats.window_expired(now):
+            self._log_throughput()
 
     def postprocess(self, seqs, fwd_output, stream_output_queue=None) -> list:
         """No-op: prefill produces no sampled tokens."""
@@ -3119,6 +3177,22 @@ class DecodeScheduler(Scheduler):
     on_prefill_done() promotes sequences directly from prefill_waiting to
     running.  schedule() only schedules the running queue as decode batches.
     """
+
+    _ENGINE_LABEL = "Decode "
+
+    def _status_counts(self) -> tuple[int, int]:
+        """Fold in the two queues this scheduler adds.
+
+        `allocate_waiting()` drains `waiting` almost immediately, so a request
+        spends most of its life in `prefill_waiting` (blocks assigned, awaiting
+        PrefillDone) and lands in `prefill_done` before `schedule()` promotes
+        it. Counting only the base pair reports `Running: 0, Waiting: 0` on an
+        engine holding a full load of in-flight requests.
+        """
+        return (
+            len(self.running) + len(self.prefill_done),
+            len(self.waiting) + len(self.prefill_waiting),
+        )
 
     def __init__(
         self,

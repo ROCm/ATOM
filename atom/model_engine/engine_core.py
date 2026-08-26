@@ -312,8 +312,10 @@ class EngineCore:
                     continue
                 if not self.scheduler.is_finished():
                     self._process_engine_step()
-                elif self.has_pending_kv_work():
-                    self._advance_idle_kv_transfer()
+                else:
+                    self.scheduler.heartbeat_throughput(now)
+                    if self.has_pending_kv_work():
+                        self._advance_idle_kv_transfer()
         finally:
             # Teardown runs even on exceptions so the sender thread/socket
             # don't leak. Isolate the final publish so a publisher hiccup
@@ -701,6 +703,7 @@ class DPEngineCoreProc(EngineCore):
 
                 if not global_has_unfinished and not self.engines_running:
                     self.engines_running = False
+                    self.scheduler.heartbeat_throughput(now)
                     if self.has_pending_kv_work():
                         # Local RPCs only. Anything that reaches schedule()
                         # would run the delayer's cross-DP all_reduce off

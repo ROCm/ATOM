@@ -2,6 +2,8 @@
 # Tests for atom/model_engine/scheduler.py — public API only
 
 
+import logging
+import time
 from collections import deque
 from types import SimpleNamespace
 from unittest import mock
@@ -101,6 +103,82 @@ class TestThroughputStats:
         stats.update_throughput(num_prompt_tokens=10, num_generation_tokens=5)
         assert stats.num_prompt_tokens == 0
         assert stats.num_generation_tokens == 0
+
+    def test_an_all_quiet_window_closes_without_logging(self, caplog):
+        """A quiet engine must not fill the log with 0.0 lines — but the
+        window still has to close, because a stale start is what made the
+        first line after a lull divide its tokens by the whole lull."""
+        stats = EngineStats(enable_log_stats=True)
+        stats._throughput_last_log_time -= 43.0
+        with caplog.at_level(logging.INFO, logger="atom"):
+            stats.maybe_log_throughput(
+                num_running_reqs=0, num_waiting_reqs=0, kv_usage=0.0
+            )
+        assert "Engine" not in caplog.text, "all-quiet window must stay silent"
+        # Closed anyway: the start is fresh, so the next window measures its
+        # own interval rather than the 43s that preceded it.
+        assert time.monotonic() - stats._throughput_last_log_time < 1.0
+
+    def test_running_requests_keep_the_zero_line(self, caplog):
+        """Zero tokens with requests in flight means the engine is stuck —
+        exactly when the 0.0 line is worth printing. Only a window with
+        nothing running *and* nothing queued is suppressed."""
+        stats = EngineStats(enable_log_stats=True)
+        stats._throughput_last_log_time -= 43.0
+        with caplog.at_level(logging.INFO, logger="atom"):
+            stats.maybe_log_throughput(
+                num_running_reqs=8, num_waiting_reqs=0, kv_usage=0.5
+            )
+        assert "Avg prompt throughput: 0.0 tokens/s" in caplog.text
+        assert "Running: 8 reqs" in caplog.text
+
+    def test_idle_does_not_leave_the_window_start_stale(self, caplog):
+        """The regression this fixes: after a lull, the next active window
+        must measure its own interval, not lull-plus-interval."""
+        stats = EngineStats(enable_log_stats=True, throughput_log_interval_s=0.05)
+        # 43s of idleness, closed silently by the heartbeat.
+        stats._throughput_last_log_time -= 43.0
+        stats.maybe_log_throughput(num_running_reqs=0, num_waiting_reqs=0, kv_usage=0.0)
+        # Now work arrives and one interval passes.
+        stats.update_throughput(num_prompt_tokens=7700)
+        time.sleep(0.06)
+        with caplog.at_level(logging.INFO, logger="atom"):
+            stats.maybe_log_throughput(
+                num_running_reqs=1, num_waiting_reqs=0, kv_usage=0.1
+            )
+        # 7700 tokens over ~0.06s, not over ~43s (which would read ~179/s).
+        assert "Engine 000" in caplog.text
+        rate = float(caplog.text.split("Avg prompt throughput: ")[1].split(" ")[0])
+        assert rate > 10_000, f"window still spans the idle stretch: {rate} tok/s"
+
+    def test_window_expired_gates_the_idle_heartbeat(self):
+        stats = EngineStats(enable_log_stats=True, throughput_log_interval_s=10.0)
+        assert stats.window_expired(time.monotonic()) is False
+        assert stats.window_expired(time.monotonic() + 11.0) is True
+
+    def test_window_expired_is_false_when_log_stats_disabled(self):
+        stats = EngineStats(enable_log_stats=False)
+        assert stats.window_expired(time.monotonic() + 1e6) is False
+
+    def test_label_defaults_to_empty_so_the_line_is_unchanged(self):
+        assert EngineStats(enable_log_stats=True).label == ""
+
+    def test_absent_kv_pool_logs_na_not_zero(self, caplog):
+        """`kv_usage=None` means "this scheduler owns no KV pool" (P/D prefill),
+        which must not read as a real, empty pool."""
+        stats = EngineStats(
+            enable_log_stats=True, label="Prefill ", throughput_log_interval_s=1e-6
+        )
+        with caplog.at_level(logging.INFO, logger="atom"):
+            stats.update_throughput(num_prompt_tokens=100)
+            stats.maybe_log_throughput(
+                num_running_reqs=2, num_waiting_reqs=1, kv_usage=None
+            )
+        line = caplog.text
+        assert "Prefill Engine 000" in line
+        assert "GPU KV cache usage: n/a" in line
+        # Prefix caching is off here too, so that one is n/a as well.
+        assert "Prefix cache hit rate: n/a" in line
 
 
 # ── add / extend / query ───────────────────────────────────────────────────
