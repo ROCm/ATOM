@@ -2151,8 +2151,12 @@ def _populate_decode_indices(md, block_tables, pos_np, device) -> None:
         else torch.empty(0, dtype=torch.int32, device=device)
     )
     md.kv_indptr_swa = swa_indptr
-    md.kv_indptr_csa = csa_indptr if has_csa else torch.zeros(1, dtype=torch.int32, device=device)
-    md.kv_indptr_hca = hca_indptr if has_hca else torch.zeros(1, dtype=torch.int32, device=device)
+    md.kv_indptr_csa = (
+        csa_indptr if has_csa else torch.zeros(1, dtype=torch.int32, device=device)
+    )
+    md.kv_indptr_hca = (
+        hca_indptr if has_hca else torch.zeros(1, dtype=torch.int32, device=device)
+    )
 
 
 def _populate_prefill_indices(md, block_tables, batch_np, pos_np, q_np, device) -> None:
