@@ -93,14 +93,6 @@ class BlockManager:
         self.hash_block_size = self.block_size * self.dcp_world_size
         self.enable_prefix_caching = config.enable_prefix_caching
         self.total_evicted_blocks: int = 0
-        # Every hash ever published, so a walk that stops can say whether the
-        # content was once cached (evicted) or never was (divergence). Unbounded
-        # by design -- forgetting is exactly what it exists to detect -- so it
-        # only fills while the diagnostic flag is on. Read at each publish
-        # rather than latched here: the flag is an env var, and latching it at
-        # construction makes the set silently empty for anything that builds a
-        # manager before setting it.
-        self._published_hashes: set[int] = set()
 
         kv_events = getattr(config, "kv_events_config", None)
         self._events_enabled: bool = bool(kv_events and kv_events.enable)
@@ -559,30 +551,16 @@ class BlockManager:
         h = -1
         compressed_hit = 0
         block_hashes: list[int] = []
-        miss_kind = ""
         for i in range(self._n_hash_blocks(seq) - 1):
             token_ids = self._hash_block_tokens(seq, i)
             h = self.compute_hash(token_ids, h)
             block_id = self.kv.lookup(h)
             if block_id == -1:
-                # The hash is not in the index at all: either this prefix was
-                # never seen, or the block that held it was allocated away.
-                miss_kind = "unindexed"
                 break
             if self.kv.block(block_id).token_ids != token_ids:
-                # Indexed, but the block holds different tokens -- a hash
-                # collision, or a stale entry. Distinct from `unindexed`
-                # because the fixes are opposite ones.
-                miss_kind = "token-mismatch"
                 break
             block_hashes.append(h)
             compressed_hit += 1
-        # Where the walk stopped, and on which hash. Stashed rather than logged
-        # here: `can_allocate` also runs as a pure admission probe that may
-        # reject and retry, so logging here would emit many lines per request
-        # and count the rejected probes. `allocate` runs once per admission.
-        seq.prefix_miss_kind = miss_kind or "full"
-        seq.prefix_miss_hash = h
         # Step 2: SWA only needs the trailing window before the boundary to be
         # present (SWA is local). Scan right-to-left within the compressed prefix
         # for the largest boundary whose window is SWA-cached (vLLM
@@ -664,39 +642,6 @@ class BlockManager:
             self._attach_state_slots(seq, h if num_cached_blocks > 0 else -1)
         if seq.has_per_req_cache:
             seq._state_initialized_after_alloc = False
-        if envs.ATOM_LOG_PREFIX_MISS:
-            # The whole walk, not just the total misses: reuse is lost in two
-            # places and a request that stops short of the end looks identical
-            # to one that hit nothing when only the total is recorded.
-            #   blocks - 1 - compressed  = lost in the paged index (never
-            #                              cached, or evicted)
-            #   compressed - cached      = declined by the state/SWA gates
-            compressed = getattr(seq, "num_compressed_hit_blocks", 0)
-            stop_hash = getattr(seq, "prefix_miss_hash", -1)
-            # The whole question for the paged channel: `evicted` means this
-            # exact hash was published earlier and is no longer in the index,
-            # so the prefix was cached and the block went. Otherwise the walk
-            # stopped on content nobody ever stored -- a divergence, not a
-            # capacity loss.
-            was_stored = stop_hash in self._published_hashes
-            logger.info(
-                "[PrefixWalk] seq=%s tokens=%d blocks=%d compressed=%d "
-                "cached=%d kind=%s stop_hash=%d stored=%d evicted_total=%d "
-                "indexed=%d",
-                getattr(seq, "external_request_id", None) or seq.id,
-                seq.num_tokens,
-                self._n_hash_blocks(seq),
-                compressed,
-                num_cached_blocks,
-                # "no-probe": `allocate` called without `can_allocate` first,
-                # so no walk happened. The scheduler always probes; tests and
-                # the no-prefix-caching path do not.
-                getattr(seq, "prefix_miss_kind", "no-probe"),
-                stop_hash,
-                int(was_stored),
-                self.kv.blocks_evicted,
-                self.kv.num_indexed,
-            )
 
     def _attach_state_slots(self, seq: Sequence, hit_hash: int) -> None:
         """Give `seq` its state slots, resuming from a checkpoint when one exists.
@@ -850,36 +795,13 @@ class BlockManager:
         store_run_parent: int | None = h if h != -1 else None
         store_run_hashes: list[int] = []
         store_run_tokens: list[int] = []
-        first_published = -1
         for i in range(start, end):
             token_ids = self._hash_block_tokens(seq, i)
             h = self.compute_hash(token_ids, h)
-            if i == 0:
-                first_published = h
             self.kv.publish(seq.block_table[i], h, token_ids)
-            if envs.ATOM_LOG_PREFIX_MISS:
-                # Every hash this run publishes, not just block 0's. A walk
-                # almost always stops deep in the prefix, so a block-0-only
-                # record can never answer "was the hash it stopped on ever
-                # here?" -- it says "never seen" for every stop and reads as a
-                # measured zero. Grows without bound; diagnostic builds only.
-                self._published_hashes.add(h)
             if record:
                 store_run_hashes.append(h)
                 store_run_tokens.extend(token_ids)
-        if envs.ATOM_LOG_PREFIX_MISS and first_published != -1:
-            # The write side of `[PrefixWalk]`. A stop reports the hash it
-            # looked for; without knowing whether that hash was ever stored
-            # there is no way to tell a prompt that diverged from one whose
-            # block was evicted -- the two produce the same "unindexed" line.
-            logger.info(
-                "[PrefixStore] seq=%s block0_hash=%d first_tokens=%s " "blocks=%d..%d",
-                getattr(seq, "external_request_id", None) or seq.id,
-                first_published,
-                list(self._hash_block_tokens(seq, 0)[:8]),
-                start,
-                end,
-            )
         if record and store_run_hashes:
             self._event_log.append(
                 _make_block_stored(

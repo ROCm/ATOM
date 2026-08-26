@@ -122,7 +122,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # A hit rate cannot separate "never cached" from "was cached and went"
     # from "too short to have a reusable block", and those want opposite
     # fixes -- see `BlockManager.can_allocate`.
-    "ATOM_LOG_PREFIX_MISS": lambda: (os.getenv("ATOM_LOG_PREFIX_MISS", "0") == "1"),
     # DSA sparse-indexer prefill: KV-dimension chunk size (in tokens) for
     # `fp8_mqa_logits`. The dense logits buffer is [prefill_tokens, total_kv];
     # total_kv = sum of all co-scheduled prefill contexts and is NOT bounded by

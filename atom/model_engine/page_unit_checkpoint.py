@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import logging
 from collections import OrderedDict
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
@@ -13,9 +12,6 @@ from typing import Protocol
 
 from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.sequence import Sequence
-from atom.utils import envs
-
-logger = logging.getLogger("atom")
 
 COPYING = "COPYING"
 READY = "READY"
@@ -481,24 +477,6 @@ class PagedStateCheckpointCoordinator:
         for i in range(hit - 1, -1, -1):
             if assume_checkpointed or self.store.contains(block_hashes[i]):
                 return i + 1
-        # Nothing on the whole prefix carries state, so every block the paged
-        # index found is refused. That is the expensive outcome and the one a
-        # rate cannot show: a request whose prefix was 99% cached and resumes
-        # from zero reads the same as one that never matched.
-        if envs.ATOM_LOG_PREFIX_MISS and hit > 0 and not assume_checkpointed:
-            near = [
-                h
-                for h in block_hashes[max(0, hit - 4) : hit]
-                if self.store.contains_or_pending(h)
-            ]
-            logger.info(
-                "[GateReject] seq=%s hit=%d ckpts=%d pending=%d near_pending=%d",
-                getattr(seq, "external_request_id", None) or seq.id,
-                hit,
-                len(self.store.hash_to_checkpoint),
-                len(self.store._pending_by_hash),
-                len(near),
-            )
         return 0
 
     def checkpoint(self, seq: Sequence, boundary_blocks: int, h: int) -> None:
