@@ -1534,6 +1534,17 @@ class MooncakeConnector(KVConnectorBase):
             return False
 
         # ---- Phase 2: Slot transfer ----
+        # Registered slot regions but no slot means no per-request state moves
+        # and the resuming side decodes from a zeroed recurrent state -- 69 of
+        # 93 layers on Kimi-K3, still fluent, so the skip below would report
+        # success. Same shape as the SWA guard above.
+        if self._slot_regions and (src_slot < 0 or dst_slot < 0):
+            raise RuntimeError(
+                f"backend registered {len(self._slot_regions)} state slot "
+                f"regions but the transfer carries no state slot "
+                f"(src={src_slot}, dst={dst_slot}); the resuming request would "
+                "decode from a zeroed recurrent state"
+            )
         if src_slot < 0 or dst_slot < 0:
             logger.debug(
                 "[PRODUCER] slot transfer skipped (src_slot=%d, dst_slot=%d)",
@@ -1546,7 +1557,7 @@ class MooncakeConnector(KVConnectorBase):
         slot_dst: list[int] = []
         slot_sizes: list[int] = []
 
-        # Phase 2a: SWA slot regions (direct, no staging)
+        # Phase 2a: slot-indexed state, written direct (no staging)
         slot_cmap = self._consumer_region_map(
             len(self._slot_regions), len(consumer_slot_addrs)
         )
