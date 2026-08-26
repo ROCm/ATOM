@@ -313,8 +313,8 @@ direct_register_custom_op(
 )
 
 
-def _qk_norm_rope_out(layer, q: torch.Tensor, num_tokens: int, *, zeros: bool):
-    """A `QKNormRopeOut` with `_qk_norm_rope`'s shapes and no content.
+def _qkn_blank(layer, q: torch.Tensor, num_tokens: int, *, zeros: bool):
+    """A `QKNormRopeOut` of the right shapes with no content.
 
     One source for the two places that need the shapes without the work: the
     op's fake impl (tracing) and the dummy_run short-circuit (warmup, before the
@@ -345,10 +345,11 @@ def _qk_norm_rope_out(layer, q: torch.Tensor, num_tokens: int, *, zeros: bool):
     return QKNormRopeOut(q_sa=alloc((num_tokens, h, d)), kv=alloc((num_tokens, d)))
 
 
-def _qk_norm_rope_list(qkn: "QKNormRopeOut", kv_fp8: bool) -> list[torch.Tensor]:
-    """`QKNormRopeOut` -> the op's return list: the active layout's fields only,
-    since a schema cannot carry the other path's Nones. Shared with the fake, so
-    the two cannot disagree on length."""
+def _qkn_to_list(qkn: "QKNormRopeOut", kv_fp8: bool) -> list[torch.Tensor]:
+    """Flatten for the op boundary: a custom op schema carries no dataclass, and
+    no Optionals in a tuple return, so this is the active layout's fields as a
+    list. Shared with the fake impl, which is what keeps the two from
+    disagreeing on length."""
     if kv_fp8:
         return [qkn.q_packed, qkn.q_rope, qkn.k_packed, qkn.k_rope]
     return [qkn.q_sa, qkn.kv]
@@ -362,9 +363,7 @@ def _v4_qk_norm_rope_fake(
 ) -> list[torch.Tensor]:
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
-    return _qk_norm_rope_list(
-        _qk_norm_rope_out(self, q, q.shape[0], zeros=False), self.kv_fp8
-    )
+    return _qkn_to_list(_qkn_blank(self, q, q.shape[0], zeros=False), self.kv_fp8)
 
 
 def v4_qk_norm_rope(
@@ -382,7 +381,7 @@ def v4_qk_norm_rope(
     """
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
-    return _qk_norm_rope_list(self._qk_norm_rope(q, kv_pre, positions), self.kv_fp8)
+    return _qkn_to_list(self._qk_norm_rope(q, kv_pre, positions), self.kv_fp8)
 
 
 direct_register_custom_op(
@@ -3202,7 +3201,7 @@ class DeepseekV4Attention(nn.Module):
         # so the SWA plane this writes into is not bound yet. Called from
         # `_attn_pre` this sits UPSTREAM of that guard and needs its own.
         if fc.context.is_dummy_run or os.environ.get("ATOM_V4_BYPASS_ATTN") == "1":
-            return _qk_norm_rope_out(self, q, q.shape[0], zeros=True)
+            return _qkn_blank(self, q, q.shape[0], zeros=True)
         attn_md = cast("AttentionMetaData_DSV4", fc.attn_metadata)
         rd = self.rope_head_dim
         ratio = self.compress_ratio
