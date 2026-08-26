@@ -225,8 +225,30 @@ def v4_attn_compress(x: torch.Tensor, layer_name: str) -> torch.Tensor:
     and now lives in `_attn_paged_core`.
 
     It has to stay AHEAD of that top-k: the compressor writes this forward's
-    compressed KV and `score_topk_from` reads it. The returned token is the data
-    edge that enforces it.
+    compressed KV and `score_topk_from` reads it, and they are now in different
+    graphs. The `[1]` this returns is an ORDERING TOKEN, not data -- the piece
+    downstream consumes it, and that data edge is what enforces the order and
+    what stops inductor dropping an op whose result looks unused.
+
+    Returning NOTHING is not an option, and not for a stylistic reason -- all
+    three alternatives were measured under `torch.compile(backend="inductor")`:
+
+      * `-> None` with `mutates_args=[]`: the op is DCE'd. Not mis-ordered --
+        it does not run at all, so the compressor silently stops compressing.
+      * `-> None` with `mutates_args=["x"]`: survives. Rejected on contract,
+        not on cost -- `x` is NOT mutated here, and declaring it invites
+        functionalization to treat it as such. A microbenchmark did not show a
+        clone, so do not repeat the claim that it costs one; the objection is
+        that the declaration is false, and `module_dispatch_ops.py` keeps the
+        buffers this op really writes outside the signature on purpose.
+      * returning `x`: survives, and parks a `[num_tokens, dim]` tensor in the
+        persistent output slot for every (layer, num_tokens) -- ~44MB a layer at
+        the largest bucket, for a value nobody reads.
+
+    The oddness is real, and it is a signpost: this split point no longer has a
+    natural data boundary. Give the compressor a fixed-capacity plan
+    (`make_compress_plans`' `decode_capacity_per_ratio`) and it becomes
+    token-shaped, at which point the split op -- and this token -- go away.
     """
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
@@ -317,23 +339,6 @@ direct_register_custom_op(
     mutates_args=[],
     fake_impl=_v4_attn_paged_core_fake,
 )
-
-
-def _compress_done(x: torch.Tensor) -> torch.Tensor:
-    """The split op's output: an ordering token, not data.
-
-    The compressor produces no tensor anyone downstream reads -- it writes
-    caches. But the split op still has to return something: the piece after it
-    consumes the return value, and that data edge is what keeps the compressor
-    ordered ahead of the indexer top-k that reads what it wrote, and what stops
-    inductor dropping an op whose result looks unused.
-
-    One element, so the persistent output slot the downstream piece is captured
-    reading costs nothing. Returning `x` instead would put a
-    `[num_tokens, dim]` tensor in that slot for every (layer, num_tokens) --
-    ~44MB a layer at the largest bucket.
-    """
-    return x.new_zeros((1,))
 
 
 def _qk_norm_rope_out(layer, q: torch.Tensor, num_tokens: int, *, zeros: bool):
@@ -3175,7 +3180,7 @@ class DeepseekV4Attention(nn.Module):
         *,
         x: torch.Tensor | None = None,  # [num_tokens, dim] hidden state
         compressor_already_launched: bool = False,
-    ) -> torch.Tensor:  # [1] -- an ordering token, see `_compress_done`
+    ) -> torch.Tensor:  # [1] -- an ordering token, see `v4_attn_compress`
         """The BATCH-shaped half of the attention: compressor + indexer top-k.
 
         Not the attention itself -- it used to hold that, and the name said so long
@@ -3218,7 +3223,7 @@ class DeepseekV4Attention(nn.Module):
         # sit above all of this; both halves now also run from `_attn_pre`, a
         # graph piece earlier, so both need their own. See `_qk_norm_rope`.
         if fc.context.is_dummy_run or os.environ.get("ATOM_V4_BYPASS_ATTN") == "1":
-            return _compress_done(x)
+            return x.new_zeros((1,))
         attn_md = cast("AttentionMetaData_DSV4", fc.attn_metadata)
         ratio = self.compress_ratio
         plan_for_layer = attn_md.compress_plans[ratio] if ratio else None
@@ -3248,7 +3253,7 @@ class DeepseekV4Attention(nn.Module):
                 current_stream.wait_stream(self.alt_stream)
             if self.indexer is not None:
                 current_stream.wait_stream(self.indexer_stream)
-        return _compress_done(x)
+        return x.new_zeros((1,))  # ordering token, see `v4_attn_compress`
 
     def _qk_norm_rope(
         self,
