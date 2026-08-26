@@ -257,7 +257,7 @@ class TestEvictionAccounting:
         pool.allocate(0)  # vacant destination
         pool.free(0)
         pool.allocate(1)
-        pool.publish(1, 300, [300])  # live, holds a hash
+        pool.publish(1, 300, toks(300))  # live, holds a hash
         out = pool.retire_top()
         assert out is not None and out.moved_to == 0
         assert pool.lookup(300) == 0  # content survived the move
