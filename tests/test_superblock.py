@@ -471,3 +471,78 @@ class TestDiagnostics:
         occ = sb.occupancy()
         assert occ["supers_partially_pinned"] == 1
         assert occ["supers_total"] == 2
+
+
+class TestAdmissionAgreesWithAllocation:
+    """`has_free(n)` must promise exactly what `pop()` n times can deliver.
+
+    An overcount is not a refused admission -- it is an `AssertionError` from
+    `_ensure_backed` partway through, after earlier slots have already been
+    handed out.
+    """
+
+    @staticmethod
+    def _pool(num_blocks=40, per=4, slots=3, spend=9):
+        from atom.model_engine.state_pool import StateSlotPool
+
+        sb = SuperblockMap(num_blocks, per)
+        pool = BlockPool(num_blocks, superblocks=sb)
+        state = StateSlotPool(
+            num_slots=slots, superblock_source=pool, max_slots=slots * 3
+        )
+        for _ in range(spend):  # leave exactly one claimable superblock
+            assert pool.claim_superblock() >= 0
+        return state
+
+    def test_a_multi_slot_answer_counts_every_superblock_it_needs(self):
+        """One claimable superblock does not make three slots available.
+
+        `can_claim_superblock` answers for a single claim, so asking it on
+        behalf of a shortfall of three said yes on the strength of one -- the
+        first `pop` took it and the second asserted.
+        """
+        state = self._pool()
+        assert not any(s in state._slot_super for s in state._free), "none backed"
+        assert state.has_free(3) is False
+
+    def test_a_single_slot_answer_is_not_held_to_the_kv_floor(self):
+        """The plural check reserves a KV floor; `claim_superblock` does not.
+
+        So a shortfall of one has to keep asking the singular question, or
+        admission refuses slots the pool would in fact have handed over.
+        """
+        state = self._pool()
+        assert state.has_free(1) is True
+        assert state.pop() >= 0, "and the claim it promised actually succeeds"
+
+
+class TestRetireTopBacking:
+    def test_a_rehomed_checkpoint_takes_its_superblock_with_it(self):
+        """Otherwise `_unback` finds nothing and the bytes never come back.
+
+        `_slot_super` is keyed by slot index, so leaving the entry under the
+        retired index strands it: that index no longer exists, and the slot
+        now holding the checkpoint has no backing to release.
+        """
+        from atom.model_engine.state_pool import StateSlotPool
+
+        sb = SuperblockMap(32, 4)
+        pool = BlockPool(32, superblocks=sb)
+        state = StateSlotPool(num_slots=2, superblock_source=pool, max_slots=4)
+
+        # Drain the pool so the checkpoint lands in the TOP slot, which is the
+        # one `retire_top` takes -- only `pop` attaches backing, so the slot
+        # has to be reached that way.
+        held = [state.pop() for _ in range(state.num_slots)]
+        top = state.num_slots - 1
+        for slot in held:
+            if slot != top:
+                state.release(slot)
+        state._index(900, top)
+        state.release(top)
+        assert top in state._slot_super, "the checkpoint's slot is backed"
+
+        moved = state.retire_top()
+        assert moved is not None and moved.relocated_to >= 0
+        assert moved.retired not in state._slot_super, "no entry left behind"
+        assert moved.relocated_to in state._slot_super, "backing followed"

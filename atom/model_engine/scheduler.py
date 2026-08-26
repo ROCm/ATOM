@@ -212,41 +212,23 @@ class CacheStats:
         self.block_manager = None
         self._interval_evicted_base: int = 0
         self._interval_reusable_tokens: int = 0
-        # Per-request frequencies, cumulative. The token totals above answer
-        # "how much reuse was lost"; these answer "how often, and to which
-        # pool" -- a question a token ratio cannot, because one 275k-token
-        # conversation can outweigh fifty short ones and make a rare failure
-        # look like the common case.
+        # Per-request frequencies, cumulative: how OFTEN reuse was lost and to
+        # which pool, which a token ratio cannot say -- one 275k-token
+        # conversation can outweigh fifty short ones. Not mutually exclusive
+        # (a request can lose tokens at both pools), so they do not sum to
+        # `total_requests`.
         #
-        # NOT mutually exclusive, and deliberately so: one request can lose
-        # tokens at both pools (the paged prefix ran out early AND a
-        # checkpoint was missing below where it ended), so forcing it into a
-        # single bucket would have to pick a winner and would undercount
-        # whichever lost. They do not sum to `total_requests`.
+        # Every threshold is `reusable`, never `full`: against `full`,
+        # `no_paged` and `full_reuse` are tautologies, because the trailing
+        # block is never a reuse candidate.
         #
-        # Every threshold is `reusable`, never `full`. Against `full`, two of
-        # these are not measurements but tautologies: `compressed < full` holds
-        # for every request that has ever existed, because the trailing block
-        # is never a reuse candidate. So `no_paged` reads 100% and
-        # `full_reuse` reads 0% on any workload, including a perfect one. This
-        # class shipped that way; the fix is the denominator, not the counter.
-        #
-        #   full_reuse    cached == reusable. Everything reusable was reused --
-        #                 or there was nothing to reuse, since a cold first
-        #                 turn also lands here. Read it with the token totals.
+        #   full_reuse    cached == reusable, including a cold first turn
         #   state_miss_recoverable
-        #                 cached < wanted: a checkpoint at that boundary would
-        #                 have unlocked reuse the paged pool was still
-        #                 holding. The state cache's own miss, and the only
-        #                 counter that argues for spending bytes on slots.
-        #   state_miss    cached < compressed: the paged pool had more prefix
-        #                 than the state gates would admit, for any reason.
-        #                 Superset of the above; the difference is the part no
-        #                 checkpoint could have fixed.
-        #   no_paged      compressed < reusable: the paged pool did not have
-        #                 the prefix. State-cache tuning is powerless here --
-        #                 this is KV capacity, eviction, or a genuinely new
-        #                 prefix.
+        #                 cached < wanted: a checkpoint there would have
+        #                 unlocked reuse the paged pool still held
+        #   state_miss    cached < compressed, for any reason. Superset
+        #   no_paged      compressed < reusable: KV capacity, eviction, or a
+        #                 genuinely new prefix
         self.reqs_full_reuse: int = 0
         self.reqs_state_miss_recoverable: int = 0
         self.reqs_state_miss: int = 0
@@ -2344,13 +2326,11 @@ class Scheduler:
             # after the request resumes is fresh and must be kept.
             if seq.id in prev_partial_ids:
                 continue
-            # Register prefix-cache hashes for blocks the prefill step just
-            # finalized. Deferred from BlockManager.allocate() so a hash is
-            # only published after the block's KV has actually been computed
-            # by the forward — keeps the block manager correct under chunked
-            # prefill where one block may span multiple steps. Must run before
-            # any seq state update so num_cached_tokens and block_table still
-            # reflect the pre-step view.
+            # Publish prefix-cache hashes for blocks this prefill finalized.
+            # Deferred from `BlockManager.allocate` so a hash appears only
+            # once its KV exists; must run before any seq update, while
+            # `num_cached_tokens` and `block_table` still hold the pre-step
+            # view.
             #
             # Gate is `not prefix_hashes_published`, not `seq.type ==
             # PREFILL`: ModelRunner runs in deferred-output mode by default

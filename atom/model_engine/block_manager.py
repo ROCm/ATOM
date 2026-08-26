@@ -141,11 +141,10 @@ class BlockManager:
         # excluded from `num_kvcache_blocks` at sizing time, so admission only
         # needs free slot indices from this list.
         #
-        # Slots are counted raw, not divided into per-request groups. What one
-        # request occupies is a property of the request — `1 + num_spec` while
-        # it speculates, 1 otherwise — and a checkpoint occupies exactly one
-        # whatever the model does, so there is no single width to divide by.
-        # `state_slots_per_req` is what a live request asks for.
+        # Slots are counted raw, not in per-request groups: what one request
+        # occupies is a property of the request (`1 + num_spec` while it
+        # speculates, 1 otherwise) and a checkpoint always occupies exactly
+        # one, so there is no single width to divide by.
         pool_entries: dict = getattr(config, "pool_entries", None) or {}
         pool_per_req: dict = getattr(config, "pool_entries_per_req", None) or {}
         # Total capacity, kept so callers can tell "all slots busy" (transient)
@@ -165,12 +164,10 @@ class BlockManager:
         # and `state_slots_per_req` comes from the sizing plan, which the config
         # does not have.
         #
-        # `max_num_seqs * slots_per_req * 2` is a floor under what the in-flight
-        # requests alone need, doubled -- not a tuned number. What the right
-        # number is has to be measured; what this guarantees is that trimming
-        # can never squeeze the live set. Measured at max_num_seqs=32, nospec:
-        # 129 checkpoints resident against 6 slots actually live, so the cap
-        # binds and the candidates (84.5% of them superseded) are what it spends.
+        # `max_num_seqs * slots_per_req * 2` is the in-flight requirement
+        # doubled -- a guarantee that trimming can never squeeze the live set,
+        # not a tuned number. At max_num_seqs=32 nospec, 129 checkpoints sat
+        # resident against 6 slots live, so the cap binds.
         soft_cap = int(getattr(config, "state_checkpoint_soft_cap", -1))
         self.state_checkpoint_soft_cap = (
             max(1, int(getattr(config, "max_num_seqs", 0) or 0))
@@ -238,23 +235,15 @@ class BlockManager:
             # at admission rather than from a statically carved region.
             superblock_source=self.kv if superblocks is not None else None,
             # But the *number* of slots is capped by the state tensor's own
-            # slot dimension, because an index past it is an out-of-bounds GPU
-            # read rather than a refused allocation -- it surfaced as
-            # `hipErrorLaunchFailure` inside a KDA kernel eleven minutes into
-            # a run, with nothing pointing back at the allocator.
+            # slot dimension: an index past it is an out-of-bounds GPU read,
+            # not a refused allocation -- it surfaced as
+            # `hipErrorLaunchFailure` inside a KDA kernel, pointing nowhere
+            # near the allocator. `max_state_slots` carries that number from
+            # the runner, since it depends on how the state was allocated.
             #
-            # Which number that is depends on how the state was allocated, so
-            # `max_state_slots` carries it from the runner. A separate
-            # per-request tensor has `pool_entries` slots and no more; a
-            # unified pool has one per superblock, and then the superblock
-            # supply is the only ceiling -- the same count `superblock_source`
-            # already governs the bytes with.
-            #
-            # Erring low is not free. At 32 slots a K3 conc-8 run saturated
-            # the state pool (9 live, 23 checkpointed, 0 vacant) while 261
-            # superblocks sat reclaimable, and evicted 97 checkpoints in ten
-            # minutes to make room. Every one was a `Lost-to-checkpoint`, none
-            # a `Lost-unrecoverable`.
+            # Erring low is not free: at 32 slots a K3 conc-8 run saturated
+            # the pool (0 vacant) while 261 superblocks sat reclaimable, and
+            # evicted 97 checkpoints in ten minutes to make room.
             max_slots=self.max_state_slots,
             # Only with a superblock source: without one the state region is
             # carved statically and a trimmed slot's bytes have nowhere to go,

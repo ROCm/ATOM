@@ -231,9 +231,23 @@ class StateSlotPool:
         if short > 0 and not self._can_mint(short):
             return False
         # Indices are obtainable. Now the bytes: a free slot already carrying a
-        # superblock needs none, so only the rest have to be claimable.
+        # superblock needs none, so only the rest have to be claimable -- and
+        # all of the rest, not merely one. `can_claim_superblock` answers for a
+        # single claim, so asking it for a shortfall of 3 said yes on the
+        # strength of one superblock and `pop` then asserted on the second.
+        #
+        # The two questions are not the same question scaled: the singular one
+        # exactly predicts `claim_superblock`, which holds back no KV floor,
+        # while the plural one does hold one back. So a shortfall of exactly
+        # one keeps asking the singular question, or admission would start
+        # refusing single slots the pool would in fact have handed over.
         backed = sum(1 for s in self._free if s in self._slot_super)
-        return count <= backed or self._supers.can_claim_superblock()
+        short_bytes = count - backed
+        if short_bytes <= 0:
+            return True
+        if short_bytes == 1:
+            return self._supers.can_claim_superblock()
+        return self._supers.can_claim_superblocks(short_bytes)
 
     def _can_mint(self, count: int = 1) -> bool:
         """Whether `count` more slot indices exist to be handed out.
@@ -640,6 +654,12 @@ class StateSlotPool:
         self.slot_hash[src] = -1
         self.slot_hash[dst] = h
         self.hash_to_slot[h] = dst
+        # The backing follows the checkpoint. Left behind, `_slot_super[src]`
+        # names a slot index that no longer exists and `dst` has no entry, so
+        # the eventual `_unback(dst)` finds nothing and the superblock is never
+        # returned to the paged pool.
+        if src in self._slot_super:
+            self._slot_super[dst] = self._slot_super.pop(src)
 
     # ---------------------------- applicability ---------------------------- #
     def applies(self, seq) -> bool:
