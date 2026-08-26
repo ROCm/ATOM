@@ -63,9 +63,10 @@ DCP_INTERLEAVE="${DCP_INTERLEAVE:-1}"
 # "decode context parallel size must be > 1". Never export it for both nodes.
 REPLICATE_INDEX_CACHE="${REPLICATE_INDEX_CACHE:-1}"
 
-# Off by default: DCP relayout is the thing under test, and MTP adds a draft KV
-# layer plus q>1 verify on top of it.
-ENABLE_MTP="${ENABLE_MTP:-0}"
+# On by default: this script serves the throughput runs, and MTP is part of the
+# configuration being measured. Set ENABLE_MTP=0 to isolate a DCP change from
+# the draft KV layer and the q>1 verify path.
+ENABLE_MTP="${ENABLE_MTP:-1}"
 if [ "$ENABLE_MTP" -eq 1 ] && [ "$DCP_INTERLEAVE" -ne 1 ]; then
   echo "ENABLE_MTP=1 needs DCP_INTERLEAVE=1 (speculative decode requires token-level interleave)" >&2
   exit 1
