@@ -402,11 +402,22 @@ class PagedStateCheckpointCoordinator:
     # readable midstep — present because `BlockManager` calls them across every
     # member of `state_caches` without asking which kind it holds.
     readable_midstep = False
-    # Only the last boundary a seq reached survives to be stored: `checkpoint`
-    # files one pending entry per seq and discards `boundary_blocks`. So the
-    # prompt-end anchor is not worth the prefill chunk it costs here — see
-    # `BlockManager._record_checkpoint_end`, which reads this.
-    keeps_interior_boundaries = False
+    # Every boundary a seq reaches is kept, not just its last: `checkpoint`
+    # files one pending entry *per hash*, so an anchor and the prompt-end
+    # checkpoint that follows it a chunk later both survive to be stored.
+    #
+    # This was False, and with one entry per seq it had to be — the anchor was
+    # overwritten before it was stored, so it bought a shortened prefill chunk
+    # on every prompt and moved the hit rate by zero. What makes it affordable
+    # to keep both is the image's price: 127 blocks, 0.112% of the paged pool,
+    # against a whole 53.6 MiB Active Slot under `fork`.
+    #
+    # And the anchor is the placement that matters. Measured on the cc-traces,
+    # of 4,808 resumes with a nonzero KV hit, 93.5% land on a previous prompt
+    # end and 0.0% on the 8192 ladder — so the grid's chunk cuts were pure
+    # cost. Run with `--state-checkpoint-interval-tokens -1` to drop the grid
+    # and leave the anchor and the demand as the only two placements.
+    keeps_interior_boundaries = True
 
     def reserve_midstep(self, seq, positions: list[tuple[int, int]]) -> list[tuple]:
         del seq, positions
@@ -426,7 +437,12 @@ class PagedStateCheckpointCoordinator:
     ) -> None:
         self.enabled = enabled
         self.store = PageUnitCheckpointStore(pool, spec)
-        self._pending: dict[int, tuple[Sequence, int]] = {}
+        # Keyed by `(seq id, prefix hash)` rather than by seq: two boundaries of
+        # one prompt are two checkpoints, and keying by seq alone let the later
+        # one overwrite the earlier before either was stored. Re-reaching the
+        # *same* hash still collapses, which is what the hash in the key is
+        # for -- that is one boundary reached twice, not two boundaries.
+        self._pending: dict[tuple[int, int], tuple[Sequence, int]] = {}
         self._store_ops: list[CheckpointStoreOp] = []
         self.checkpoints_kept = 0
         self.checkpoints_dropped = 0
@@ -452,10 +468,17 @@ class PagedStateCheckpointCoordinator:
     def checkpoint(self, seq: Sequence, boundary_blocks: int, h: int) -> None:
         del boundary_blocks
         if self.applies(seq) and seq.state_slot >= 0:
-            self._pending[id(seq)] = (seq, h)
+            self._pending[(id(seq), h)] = (seq, h)
 
     def forget_pending(self, seq: Sequence) -> None:
-        self._pending.pop(id(seq), None)
+        """Drop every boundary this seq had pending, not just its last.
+
+        A seq can now hold several. All of them describe state in the slot
+        that is about to go back on the free list, so all of them die with it.
+        """
+        seq_id = id(seq)
+        for key in [k for k in self._pending if k[0] == seq_id]:
+            del self._pending[key]
         self.store.cancel_queued_restore(seq.state_slot)
 
     def begin_restore(self, h: int, dst_slot: int) -> bool:
@@ -490,13 +513,14 @@ class PagedStateCheckpointCoordinator:
         return self.store.ensure_free_units(count)
 
     def unindex(self, h: int) -> None:
-        pending_ids = [
-            seq_id for seq_id, (_, pending_h) in self._pending.items() if pending_h == h
-        ]
-        for seq_id in pending_ids:
-            del self._pending[seq_id]
+        # `_pending` is keyed by `(seq, hash)`, so one hash can be pending for
+        # several sequences at once -- two turns of a conversation reaching the
+        # same boundary. All of them lose it together.
+        stale = [key for key, (_, pending_h) in self._pending.items() if pending_h == h]
+        for key in stale:
+            del self._pending[key]
         removed = self.store.unindex(h)
-        if pending_ids or removed:
+        if stale or removed:
             self.checkpoints_orphaned += 1
 
     def clear_index(self) -> None:

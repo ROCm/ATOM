@@ -1195,7 +1195,14 @@ class TestPagedCopyCheckpoint:
         assert not hasattr(scheduler.block_manager, "state_copies_for_batch")
         assert not hasattr(scheduler.block_manager, "state_transfers_for_batch")
 
-    def test_latest_pending_checkpoint_replaces_the_previous_intent(self):
+    def test_two_boundaries_of_one_seq_are_both_stored(self):
+        """They used to collide: `_pending` was keyed by seq, so the second
+        overwrote the first before either was stored, and the prompt-end anchor
+        was never worth its prefill chunk. Keyed by `(seq, hash)` both survive.
+
+        Affordable because an image is `units_per_checkpoint` blocks out of the
+        paged pool rather than a whole Active Slot.
+        """
         bm = make_block_manager(
             paged_copy_config(),
             state_runtime=PAGED_COPY_RUNTIME,
@@ -1207,11 +1214,27 @@ class TestPagedCopyCheckpoint:
         checkpoints.checkpoint(seq, boundary_blocks=2, h=202)
         ops = bm.take_state_maintenance_ops()
 
-        assert len(ops.checkpoint_stores) == 1
+        assert len(ops.checkpoint_stores) == 2
         assert not hasattr(seq, "pending_checkpoint")
         bm.complete_previous_state_batch()
-        assert not checkpoints.store.contains(101)
+        assert checkpoints.store.contains(101)
         assert checkpoints.store.contains(202)
+
+    def test_reaching_the_same_boundary_twice_is_still_one_checkpoint(self):
+        """The hash in the key is what tells "two boundaries" from "one
+        boundary, reached again"."""
+        bm = make_block_manager(
+            paged_copy_config(),
+            state_runtime=PAGED_COPY_RUNTIME,
+        )
+        seq = self._admitted(bm)
+        checkpoints = bm.paged_state_checkpoints
+
+        checkpoints.checkpoint(seq, boundary_blocks=1, h=303)
+        checkpoints.checkpoint(seq, boundary_blocks=1, h=303)
+        ops = bm.take_state_maintenance_ops()
+
+        assert len(ops.checkpoint_stores) == 1
 
     def test_prefix_eviction_drops_an_uncommitted_checkpoint(self):
         bm = make_block_manager(
@@ -1879,11 +1902,14 @@ class TestDemandDrivenCheckpoints:
         assert funnel["demands_declined_no_room"] == 1
         assert funnel["demands_recorded"] == 0
         assert funnel["chunks_cut_for_demand"] == 0
-        # The grid rung and nothing else. No demand cut, which is the one the
-        # refused store must not have bought -- and no anchor either: a PAGE
-        # class keeps only its last boundary, so `_record_checkpoint_end`
-        # declines to reserve one for it.
-        assert forward_on_the_ladder(bm, second) == [48], "a demand cut slipped in"
+        # The grid rung and the prompt-end anchor. The anchor is not the thing
+        # under test here -- it is reserved from `num_prompt_tokens` alone and
+        # is unaffected by the pool being tight -- but it is a cut, so it
+        # appears. What must be absent is a *demand* cut: that is the one the
+        # refused store would have bought for nothing.
+        cuts = forward_on_the_ladder(bm, second)
+        assert 48 in cuts, "the grid rung went missing"
+        assert second.checkpoint_demand_pos not in cuts, "a demand cut slipped in"
 
     def _tighten_past_an_image(self, bm):
         """Leave room for a resumer's blocks but not for a checkpoint image."""
@@ -1956,8 +1982,16 @@ class TestDemandDrivenCheckpoints:
         run_prompt_on_the_ladder(bm, first)
         bm.take_state_maintenance_ops()
         bm.complete_previous_state_batch()
-        image = bm.paged_state_checkpoints.store.units_per_checkpoint
-        assert len(bm.paged_state_checkpoints.store.records) == 1, "one image only"
+        store = bm.paged_state_checkpoints.store
+        image = store.units_per_checkpoint
+        # A prompt now stores its grid rung *and* its prompt-end anchor, and
+        # this test needs the pool resting on exactly one image. Spend all but
+        # the deepest, which is the one a continuation resumes from -- and the
+        # one `_next_victim` would keep longest, so this is also the state the
+        # gate would find on its own.
+        for cid in list(store._lru)[:-1]:
+            store._evict(cid)
+        assert len(store.records) == 1, "rested on one image"
 
         second = stateful_seq(CONTINUATION)
         # Leave the request's own blocks plus half an image: reachable only by
@@ -2377,34 +2411,55 @@ class TestLadderOffButCheckpointingOn:
         assert seq.checkpoint_end_pos == 0
         assert run_prompt_on_the_ladder(bm, stateful_seq(PROMPT)) == []
 
-    def test_a_last_boundary_only_class_is_not_anchored_for(self):
+    def test_both_classes_are_anchored_for(self):
         """The anchor costs a prefill chunk, so it has to buy something.
 
-        A PAGE class files one pending checkpoint per seq and discards the
-        boundary, so the prompt-end checkpoint a chunk later overwrites the
-        anchor before either is stored -- the chunk is bought and thrown away.
-        Under `fork` the two are separate slots in the index and both survive,
-        which is what makes the anchor worth its chunk there.
+        It does on both paths now. `PagedStateCheckpointCoordinator` keys its
+        pending checkpoints by `(seq, hash)`, so the anchor and the prompt-end
+        checkpoint a chunk later are two entries and both survive to be stored.
 
-        Pinned because the failure is silent and asymmetric: DSV4 would pay one
-        extra forward per prompt for exactly zero hit rate, and nothing in the
-        funnel counters would say so.
+        This test previously pinned the opposite, and was right to: with one
+        pending entry per seq the later write overwrote the anchor before
+        either was stored, so the chunk was bought and thrown away. What
+        changed is the key, and what makes keeping both affordable is the
+        image's price -- 127 blocks against a whole Active Slot under `fork`.
+
+        The anchor is also the placement that pays: of 4,808 cc-trace resumes
+        with a nonzero KV hit, 93.5% land on a previous prompt end and 0.0% on
+        the 8192 ladder.
         """
         fork = make_block_manager(ckpt_config())
         copy = make_block_manager(ckpt_config(), state_runtime=PAGED_COPY_RUNTIME)
         assert fork.state.keeps_interior_boundaries is True
-        assert copy.paged_state_checkpoints.keeps_interior_boundaries is False
+        assert copy.paged_state_checkpoints.keeps_interior_boundaries is True
 
         forked, copied = stateful_seq(PROMPT), stateful_seq(PROMPT)
         fork.can_allocate(forked)
         copy.can_allocate(copied)
-        assert forked.checkpoint_end_pos > 0, "fork should still anchor"
-        assert copied.checkpoint_end_pos == 0, "copy paid for an anchor it drops"
+        assert forked.checkpoint_end_pos > 0, "fork should anchor"
+        assert copied.checkpoint_end_pos > 0, "copy should anchor too now"
 
-        # And the cost is exactly the chunk: the copy path forwards its prompt
-        # in one cut, the fork path in two.
-        assert run_prompt_on_the_ladder(copy, stateful_seq(PROMPT)) == [len(PROMPT)]
-        assert len(run_prompt_on_the_ladder(fork, stateful_seq(PROMPT))) == 1
+    def test_two_boundaries_of_one_prompt_both_stay_pending(self):
+        """The property the anchor rests on, asked of the coordinator directly.
+
+        Two different hashes from one sequence are two checkpoints. Reaching
+        the *same* hash twice is one boundary reached twice and still collapses
+        -- that is what the hash in the key is for.
+        """
+        copy = make_block_manager(ckpt_config(), state_runtime=PAGED_COPY_RUNTIME)
+        coord = copy.paged_state_checkpoints
+        seq = stateful_seq(PROMPT)
+        seq.state_slots = [0]
+
+        coord.checkpoint(seq, 4, 111)
+        coord.checkpoint(seq, 8, 222)
+        assert len(coord._pending) == 2, "an anchor and a prompt end coexist"
+
+        coord.checkpoint(seq, 8, 222)
+        assert len(coord._pending) == 2, "the same boundary twice is still one"
+
+        coord.forget_pending(seq)
+        assert not coord._pending, "a released slot takes all of them with it"
 
 
 class TestCacheStatsAttribution:
