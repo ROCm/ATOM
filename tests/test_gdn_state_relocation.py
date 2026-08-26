@@ -19,6 +19,9 @@ import torch
 
 pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
 
+from atom.kv_transfer.disaggregation.mooncake.mooncake_connector import (
+    MooncakeConnector,
+)
 from atom.kv_transfer.disaggregation.types import KVTransferRegion, KVTransferTensors
 from atom.model_ops.attentions.gdn_attn import GDNStateMixin, slot_indexed_caches
 
@@ -433,3 +436,81 @@ def test_pipeline_parallelism_is_refused():
 
     with pytest.raises(NotImplementedError, match="pipeline parallelism"):
         builder.get_kv_transfer_tensors()
+
+
+# ---- the producer's guard on a transfer that carries no slot ----------------
+# Registering the regions is only half of it: the transfer also has to be
+# handed a slot index. These two cases pin the boundary between "nothing
+# slot-indexed to move", which is a legitimate skip, and "state to move and
+# nowhere to move it from", which on K3 is 69 of 93 layers silently reading a
+# zeroed state.
+
+
+def transfer_stub(slot_regions):
+    """The narrowest stand-in that reaches the Phase 2 guard.
+
+    No block regions, so Phase 1 builds an empty descriptor list and the RDMA
+    stub is handed nothing; that keeps the case about the slot bookkeeping.
+    """
+    return SimpleNamespace(
+        _block_regions=[],
+        _swa_block_regions=[],
+        _slot_regions=slot_regions,
+        # Identity, ignoring the consumer-side counts the real one cross-checks:
+        # every phase asks for a map here and none of them is what these cases
+        # are about.
+        _consumer_region_map=lambda n, *_: list(range(n)),
+        _block_region_consumer_indices=None,
+        _rdma_write_with_retry=lambda *a, **k: True,
+        _gather_slot=None,
+        _staging_base_addr=0,
+        _staging_slot_bytes=0,
+    )
+
+
+def transfer_args(src_slot, dst_slot):
+    return {
+        "request_data": {
+            "consumer_block_base_addrs": [],
+            "consumer_block_bpb": [],
+            "consumer_slot_base_addrs": [0x2000],
+            "consumer_slot_bps": [64],
+            "dst_slot_index": dst_slot,
+        },
+        "target": "peer",
+        "src_block_ids": [],
+        "dst_block_ids": [],
+        "prefill_data": {"slot_index": src_slot},
+        "req_id": "r0",
+    }
+
+
+@pytest.mark.parametrize(
+    "src_slot, dst_slot",
+    [(-1, 0), (0, -1), (-1, -1)],
+)
+def test_registered_slot_regions_with_no_slot_is_an_error(src_slot, dst_slot):
+    """Either end missing is enough: the transfer has state to move and no
+    slot to move it from or to. Skipping it returns success and leaves decode
+    on a zeroed recurrent state, which reads as fluent output.
+    """
+    connector = transfer_stub([(0x1000, 64)])
+
+    with pytest.raises(RuntimeError, match="zeroed recurrent state"):
+        MooncakeConnector._execute_block_slot_transfer(
+            connector, **transfer_args(src_slot, dst_slot)
+        )
+
+
+def test_no_slot_regions_still_skips():
+    """The skip is right for a backend with nothing slot-indexed registered --
+    turning it into an error would break every such transfer.
+    """
+    connector = transfer_stub([])
+
+    assert (
+        MooncakeConnector._execute_block_slot_transfer(
+            connector, **transfer_args(-1, -1)
+        )
+        is True
+    )
