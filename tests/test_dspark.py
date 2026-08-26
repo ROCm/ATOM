@@ -428,7 +428,7 @@ def test_decorated_core_picks_capture_replay_or_eager():
     # Plain PIECEWISE (capture gate off): the core never records or replays a
     # graph of its own, whatever the capture pass / cache says -- it runs eager
     # and only stabilises its output. This is the path the three-way branch in
-    # v4_core_attention used to hand-code outside the decorator.
+    # v4_attn_compress_index used to hand-code outside the decorator.
     assert P(piecewise=True, capturing=True, graph_ready=True, capture=False) == [
         "core",
         "deliver",
@@ -483,22 +483,78 @@ def test_runner_copies_only_what_is_not_zero_copy():
     assert refresh["positions"] is read_from["positions"]
 
 
-def test_v4_core_captures_on_everything_but_positions():
-    # Pins the one input the graph must not bake a pointer to. Capturing on it
-    # costs ~2pts of accuracy; the root cause was never found, so this is the
-    # workaround and it has to stay stated somewhere a change would trip over.
+def test_v4_core_copies_nothing_per_step():
+    # Nothing is copied, and structurally so: the core is the batch-shaped half
+    # alone, and its inputs all come from the dense piece immediately upstream,
+    # whose graph writes them to the same address every replay. `positions` cost
+    # ~5pts when captured on (8f86bbaf) and is not an input here at all any
+    # more -- both its readers (`_qk_norm_rope`, `_fill_csa_paged_compress`) are
+    # token-shaped and stayed in the dense pieces. If a future change moves a
+    # token-shaped reader back INTO the core, this is what should stop it.
     import pytest
 
     try:
         from atom.models.deepseek_v4 import DeepseekV4Attention
 
-        core = DeepseekV4Attention._attn_core
+        core = DeepseekV4Attention._attn_compress_index
     except ImportError as e:
         if "aiter" not in str(e):
             raise
         pytest.skip(f"requires aiter to import deepseek_v4: {e}")
 
-    assert set(core.zero_copy_names) == set(core.input_names) - {"positions"}
+    assert set(core.zero_copy_names) == set(core.input_names)
+
+
+def test_copy_per_step_rejects_a_bare_string():
+    # `("positions")` is a string, not a 1-tuple; `frozenset` of it is a set of
+    # characters, which subtracts nothing from the input names -- so the entry
+    # silently means "copy nothing" while reading as its opposite. That shipped.
+    import pytest
+
+    from atom.utils.attn_ffn_piecewise import piecewise_core
+
+    with pytest.raises(TypeError, match="trailing comma"):
+
+        @piecewise_core(copy_per_step="positions")
+        def core(layer, *, x):
+            return x
+
+
+def test_topk_cannot_reach_qr_when_the_projection_was_handed_in():
+    # `_attn_pre` passes None for `qr`/`qr_scale` on the AF path, which is only
+    # safe because the core's single use of them -- `Indexer.topk` -- never
+    # reaches them once `pre_q_quant` is given. That short-circuit is the whole
+    # justification, so assert it directly rather than trusting the read.
+    import types
+
+    import pytest
+
+    try:
+        from atom.models.deepseek_v4 import Indexer
+    except ImportError as e:
+        if "aiter" not in str(e) and "forward_context" not in str(e):
+            raise
+        pytest.skip(f"deepseek_v4 not importable here: {e}")
+
+    def _explode(*a, **k):
+        raise AssertionError("forward_batched ran -- qr would have been read")
+
+    sentinel = object()
+    stub = types.SimpleNamespace(
+        score_topk_from=lambda q, w, s: (q, w, s),
+        forward_batched=_explode,
+    )
+    out = Indexer.topk(
+        stub,
+        None,  # x_full
+        _explode,  # qr_full: reading it at all is a failure
+        None,  # positions
+        _explode,  # qr_full_scale
+        pre_q_quant=sentinel,
+        pre_weights="w",
+        pre_q_scale="s",
+    )
+    assert out == (sentinel, "w", "s")
 
 
 def test_v4_core_inputs_come_from_the_signature():
@@ -510,22 +566,34 @@ def test_v4_core_inputs_come_from_the_signature():
     try:
         from atom.models.deepseek_v4 import DeepseekV4Attention
 
-        core = DeepseekV4Attention._attn_core
+        core = DeepseekV4Attention._attn_compress_index
     except ImportError as e:
         if "aiter" not in str(e):
             raise
         pytest.skip(f"requires aiter to import deepseek_v4: {e}")
 
+    # The last six are the AF_PIECEWISE shape: `_attn_pre` ran the fused
+    # QK-norm/RoPE a graph piece earlier and hands its outputs in, so `q` and
+    # `kv_pre` arrive None. Exactly one of the two groups is live per call,
+    # which is why both have to be declared and both optional.
+    # The core is the BATCH-shaped half alone: `x` for the compressor and the
+    # indexer's projections for its top-k. `qr`/`qr_scale`/`positions` are there
+    # only for FULL, where the indexer projects inline. Everything token-shaped
+    # -- the paged Q, `positions` for the CSA pack -- stayed in the dense pieces
+    # with the work that reads it, which is what shrank this from nine.
+    # The core is the BATCH-shaped half alone: `x` for the compressor and the
+    # indexer's projections for its top-k. `qr`/`qr_scale`/`positions` are there
+    # only for FULL, where the indexer projects inline. Everything token-shaped
+    # -- the paged Q, `positions` for the CSA pack -- stayed in the dense pieces
+    # with the work that reads it, which is what shrank this from nine.
     assert core.input_names == (
         "x",
-        "q",
-        "kv_pre",
-        "qr",
-        "qr_scale",
-        "positions",
         "idx_q_quant",
         "idx_weights",
         "idx_q_scale",
+        "qr",
+        "qr_scale",
+        "positions",
     )
 
 
@@ -732,7 +800,7 @@ def test_attention_is_reached_only_through_the_opaque_op():
     # Dynamo graphs -- the second trips "VllmBackend can only be called once".
     #
     # The V4 target calls the identical kernel safely because its call site is
-    # behind torch.ops.aiter.v4_core_attention. Mirror that, and keep it mirrored.
+    # behind torch.ops.aiter.v4_attn_compress_index. Mirror that, and keep it mirrored.
     import ast
     import inspect
     import textwrap
@@ -1286,3 +1354,422 @@ def test_the_separate_draft_model_path_declares_no_draft_graph(monkeypatch):
     # None, not absent and not the pass a previous build left behind: rebuilding
     # is what the flavor probes in these tests do, and `propose` reads this.
     assert p.block is None
+
+
+def test_qk_norm_rope_short_circuits_dummy_run():
+    # warmup_model runs BEFORE allocate_kv_cache, so the SWA plane this kernel
+    # writes into is not bound yet. the attention has always guarded dummy_run;
+    # called from `_attn_pre` this sits UPSTREAM of that guard and needs its
+    # own. Getting that wrong died in `flydsl_hca_compress_attn` on a None
+    # kv_cache, so the guard is asserted where it now has to live.
+    import types
+
+    import pytest
+
+    try:
+        from atom.models.deepseek_v4 import DeepseekV4Attention
+    except ImportError as e:
+        # `forward_context`: conftest stubs `atom.config` for the rest of the
+        # suite and `module_dispatch_ops` then cannot resolve
+        # `get_current_cudagraph_runtime_mode`, which is why the sibling V4
+        # tests here only pass when this file runs alone. Anything else is a
+        # real import break and must not be skipped past.
+        if "aiter" not in str(e) and "forward_context" not in str(e):
+            raise
+        pytest.skip(f"deepseek_v4 not importable here: {e}")
+
+    import atom.models.deepseek_v4 as v4
+
+    T, H, D, RD = 4, 2, 64, 16
+    layer = types.SimpleNamespace(
+        n_local_heads=H, head_dim=D, rope_head_dim=RD, kv_fp8=False
+    )
+    fc = types.SimpleNamespace(context=types.SimpleNamespace(is_dummy_run=True))
+    saved = v4.get_forward_context
+    v4.get_forward_context = lambda: fc
+    try:
+        # No attn_metadata, no kv_norm, no rotary_emb, no swa_plane on the stub:
+        # reaching past the guard is an AttributeError, which is the assertion.
+        qkn = DeepseekV4Attention._qk_norm_rope(
+            layer,
+            torch.zeros(T, H * D),
+            torch.zeros(T, D),
+            torch.zeros(T, dtype=torch.int32),
+        )
+    finally:
+        v4.get_forward_context = saved
+
+    # Shapes still have to be right -- warmup's output is consumed downstream,
+    # and the op's fake impl promises exactly these.
+    assert qkn.q_sa.shape == (T, H, D) and qkn.kv.shape == (T, D)
+    assert torch.all(qkn.q_sa == 0) and torch.all(qkn.kv == 0)
+
+
+def test_core_still_binds_the_inputs_that_arrive_none():
+    # A core whose signature spans more than one call shape gets None for the
+    # inputs of the shape it is not in -- under the narrow split `_attn_compress_index` is
+    # handed the paged Q and not `q`/`kv_pre`. Those parameters still have to be
+    # BOUND: dropping them from the call instead was a missing-argument
+    # TypeError that only showed up at cudagraph capture on real hardware.
+    import types
+
+    from atom.utils.attn_ffn_piecewise import piecewise_core
+
+    seen = {}
+
+    @piecewise_core()
+    def core(layer, *, x: torch.Tensor | None, y: torch.Tensor | None):
+        seen["x"], seen["y"] = x, y
+        return y if x is None else x
+
+    class _Outputs:
+        def deliver(self, key, out):
+            return out
+
+    fc = types.SimpleNamespace(
+        context=types.SimpleNamespace(is_dummy_run=False),
+        attn_metadata=object(),
+        in_hipgraph=False,
+    )
+    y = torch.ones(4)
+    out = core(
+        types.SimpleNamespace(layer_name="l0"),
+        runner=None,
+        outputs=_Outputs(),
+        piecewise=True,
+        capture=False,
+        forward_context=fc,
+        x=None,
+        y=y,
+    )
+    assert seen == {"x": None, "y": y}
+    assert out is y
+
+
+def test_core_rejects_an_all_none_call():
+    # The row count comes off an input, so there has to be one. Saying so beats
+    # an AttributeError on None deep in the runner.
+    import types
+
+    import pytest
+
+    from atom.utils.attn_ffn_piecewise import piecewise_core
+
+    @piecewise_core()
+    def core(layer, *, x: torch.Tensor | None):
+        return x
+
+    fc = types.SimpleNamespace(
+        context=types.SimpleNamespace(is_dummy_run=False),
+        attn_metadata=object(),
+        in_hipgraph=False,
+    )
+    with pytest.raises(ValueError, match="every tensor input None"):
+        core(
+            types.SimpleNamespace(layer_name="l0"),
+            runner=None,
+            outputs=None,
+            piecewise=True,
+            capture=False,
+            forward_context=fc,
+            x=None,
+        )
+
+
+def test_every_half_of_the_core_short_circuits_dummy_run():
+    # warmup_model runs BEFORE allocate_kv_cache: the SWA plane and the
+    # Compressor/Indexer caches are all unbound. The attention has always guarded
+    # dummy_run, but BOTH halves of it now also run from `_attn_pre`, a graph
+    # piece earlier -- outside that guard. Each needs its own, and guarding one
+    # and not the other is exactly the bug that shipped twice: both times it
+    # died in `flydsl_hca_compress_attn` on a None kv_cache.
+    #
+    # So this asserts the property over EVERY entry point `_attn_pre` can reach
+    # under AF, rather than over whichever one was most recently added.
+    import types
+
+    import pytest
+
+    try:
+        from atom.models.deepseek_v4 import DeepseekV4Attention
+    except ImportError as e:
+        if "aiter" not in str(e) and "forward_context" not in str(e):
+            raise
+        pytest.skip(f"deepseek_v4 not importable here: {e}")
+
+    import atom.models.deepseek_v4 as v4
+
+    T, H, D, RD = 4, 2, 64, 16
+    q, kv_pre = torch.zeros(T, H * D), torch.zeros(T, D)
+    positions = torch.zeros(T, dtype=torch.int32)
+
+    def _explode(*a, **k):
+        raise AssertionError("a paged kernel ran: the KV caches are not bound yet")
+
+    # Deliberately bare: anything that reaches past the guard touches an
+    # attribute this stub does not have, or an exploding collaborator.
+    layer = types.SimpleNamespace(
+        n_local_heads=H,
+        head_dim=D,
+        rope_head_dim=RD,
+        kv_fp8=False,
+        compress_ratio=4,
+        skip_topk=False,
+        indexer=types.SimpleNamespace(topk=_explode),
+        maybe_compressors_async=_explode,
+        _fill_csa_paged_compress=_explode,
+    )
+    fc = types.SimpleNamespace(context=types.SimpleNamespace(is_dummy_run=True))
+    saved = v4.get_forward_context
+    v4.get_forward_context = lambda: fc
+    try:
+        qkn = DeepseekV4Attention._qk_norm_rope(layer, q, kv_pre, positions)
+        x = torch.zeros(T, D)
+        # `piecewise=False` is the decorator's eager route -- it just runs the
+        # body, which is what has the guard.
+        topk = DeepseekV4Attention._attn_compress_index(
+            layer,
+            piecewise=False,
+            x=x,
+            idx_q_quant=object(),
+            idx_weights=object(),
+            positions=positions,
+        )
+        assert topk.shape == (T, 1) and topk.dtype == torch.int32
+        o = DeepseekV4Attention._attn_paged_core(layer, qkn, topk, positions)
+        assert o.shape == (T, H * D) and torch.all(o == 0)
+    finally:
+        v4.get_forward_context = saved
+
+    # Shapes still have to be right: warmup's output is consumed downstream and
+    # the op's fake impl promises exactly these.
+    assert qkn.q_sa.shape == (T, H, D) and qkn.kv.shape == (T, D)
+    assert torch.all(qkn.q_sa == 0) and torch.all(qkn.kv == 0)
+
+
+def test_custom_op_bodies_only_call_methods_that_exist():
+    # The custom ops resolve their layer out of `static_forward_context` and
+    # then call methods on it, so a method the model no longer has is not a
+    # NameError at import -- it is an AttributeError inside a compiled graph, on
+    # the GPU, at capture time. That shipped: a op left behind by a reverted
+    # design kept calling `self._paged_pre_ran_upstream()` after the method was
+    # deleted, and every test here passed because none of them reach `_attn_pre`.
+    #
+    # So this reads the ops' own bodies and checks each `self.<name>` against
+    # the class. Cheap, and it fails at the moment the method disappears.
+    import ast
+    import inspect
+
+    import pytest
+
+    try:
+        import atom.models.deepseek_v4 as v4
+    except ImportError as e:
+        if "aiter" not in str(e) and "forward_context" not in str(e):
+            raise
+        pytest.skip(f"deepseek_v4 not importable here: {e}")
+
+    tree = ast.parse(inspect.getsource(v4))
+    # Module-level functions registered as custom ops -- the ones that look up a
+    # layer and drive it. Nested defs and class methods are not these.
+    op_names = {
+        n.func.id if isinstance(n.func, ast.Name) else None: n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+    }
+    registered = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        fn = node.func
+        name = getattr(fn, "id", None) or getattr(fn, "attr", None)
+        if name not in ("direct_register_custom_op", "mark_spliting_op"):
+            continue
+        for kw in node.keywords:
+            if kw.arg in ("op_func", "gen_fake") and isinstance(kw.value, ast.Name):
+                registered.add(kw.value.id)
+    # `mark_spliting_op` is a decorator, so its op is the function it decorates.
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and any(
+            getattr(getattr(d, "func", d), "id", None) == "mark_spliting_op"
+            for d in node.decorator_list
+        ):
+            registered.add(node.name)
+
+    assert registered, "found no custom ops to check -- the scan is broken"
+
+    missing = []
+    for node in tree.body:
+        if not isinstance(node, ast.FunctionDef) or node.name not in registered:
+            continue
+        for sub in ast.walk(node):
+            # CALLS only. Instance attributes (`self.kv_fp8`, set in __init__)
+            # are not on the class and would all read as missing; methods are,
+            # and a missing method is what this is for.
+            if not isinstance(sub, ast.Call):
+                continue
+            fn = sub.func
+            if (
+                isinstance(fn, ast.Attribute)
+                and isinstance(fn.value, ast.Name)
+                and fn.value.id == "self"
+                and not callable(getattr(v4.DeepseekV4Attention, fn.attr, None))
+            ):
+                missing.append(f"{node.name} -> self.{fn.attr}()")
+
+    assert not missing, (
+        "custom op bodies call methods DeepseekV4Attention does not have; these "
+        "raise inside a compiled graph on the GPU, not at import:\n  "
+        + "\n  ".join(sorted(set(missing)))
+    )
+
+
+def test_every_op_fake_agrees_with_its_body():
+    # A fake impl that promises a different shape than the body returns does not
+    # fail at the op -- it fails as `assert_size_stride` deep inside the compiled
+    # graph, on the GPU, with a message about strides. That shipped: the core's
+    # no-top-k stand-in returned [T, 1] while its fake promised [T, index_topk].
+    #
+    # Both are reachable here: the fakes are plain functions, and every body has
+    # a dummy_run short-circuit that returns the same shape the real path does
+    # (it has to -- warmup output feeds the layers downstream). So compare them.
+    import types
+
+    import pytest
+
+    try:
+        import atom.models.deepseek_v4 as v4
+    except ImportError as e:
+        if "aiter" not in str(e) and "forward_context" not in str(e):
+            raise
+        pytest.skip(f"deepseek_v4 not importable here: {e}")
+
+    T, H, D, RD, TOPK = 4, 2, 64, 16, 32
+    layer = types.SimpleNamespace(
+        n_local_heads=H,
+        head_dim=D,
+        rope_head_dim=RD,
+        kv_fp8=False,
+        compress_ratio=4,
+        skip_topk=False,
+        indexer=types.SimpleNamespace(index_topk=TOPK),
+    )
+    q, kv_pre = torch.zeros(T, H * D), torch.zeros(T, D)
+    x, positions = torch.zeros(T, D), torch.zeros(T, dtype=torch.int32)
+
+    cfg = types.SimpleNamespace(
+        compilation_config=types.SimpleNamespace(static_forward_context={"L": layer})
+    )
+    fc = types.SimpleNamespace(context=types.SimpleNamespace(is_dummy_run=True))
+    saved_cfg, saved_fc = v4.get_current_atom_config, v4.get_forward_context
+    v4.get_current_atom_config = lambda: cfg
+    v4.get_forward_context = lambda: fc
+    try:
+        A = v4.DeepseekV4Attention
+        cases = [
+            (
+                "v4_qk_norm_rope",
+                [t.shape for t in v4._v4_qk_norm_rope_fake(q, kv_pre, positions, "L")],
+                [
+                    t.shape
+                    for t in v4._qk_norm_rope_list(
+                        A._qk_norm_rope(layer, q, kv_pre, positions), layer.kv_fp8
+                    )
+                ],
+            ),
+            (
+                "v4_attn_compress_index",
+                [v4._v4_attn_compress_index_fake(x, None, None, None, "L").shape],
+                [
+                    A._attn_compress_index(
+                        layer,
+                        piecewise=False,
+                        x=x,
+                        idx_q_quant=object(),
+                        idx_weights=object(),
+                        positions=positions,
+                    ).shape
+                ],
+            ),
+            (
+                "v4_attn_paged_core",
+                [
+                    v4._v4_attn_paged_core_fake(
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        torch.zeros(T, TOPK, dtype=torch.int32),
+                        positions,
+                        "L",
+                    ).shape
+                ],
+                [
+                    A._attn_paged_core(
+                        layer,
+                        v4.QKNormRopeOut(),
+                        torch.zeros(T, TOPK, dtype=torch.int32),
+                        positions,
+                    ).shape
+                ],
+            ),
+        ]
+    finally:
+        v4.get_current_atom_config, v4.get_forward_context = saved_cfg, saved_fc
+
+    for name, fake_shapes, real_shapes in cases:
+        assert fake_shapes == real_shapes, (
+            f"{name}: fake promises {fake_shapes}, body returns {real_shapes}. "
+            "These must match or the compiled graph fails on assert_size_stride."
+        )
+
+
+def test_paged_post_refuses_a_missing_q():
+    # `forward()`'s narrow branch always calls `v4_attn_paged_core`, so whatever
+    # fills its Q must run on EVERY narrow path. Gating `v4_qk_norm_rope` on
+    # AF_PIECEWISE alone left plain PIECEWISE with no QK-norm at all and a None
+    # Q going into an aiter kernel -- a GPU-side failure, and invisible to every
+    # test here because none of them reach `_attn_pre`.
+    #
+    # So the shape of that mistake is asserted on the CPU side instead.
+    import types
+
+    import pytest
+
+    try:
+        from atom.models.deepseek_v4 import DeepseekV4Attention, QKNormRopeOut
+    except ImportError as e:
+        if "aiter" not in str(e) and "forward_context" not in str(e):
+            raise
+        pytest.skip(f"deepseek_v4 not importable here: {e}")
+
+    import atom.models.deepseek_v4 as v4
+
+    T, H, D = 4, 2, 64
+    layer = types.SimpleNamespace(
+        n_local_heads=H,
+        head_dim=D,
+        rope_head_dim=16,
+        kv_fp8=False,
+        compress_ratio=4,
+        skip_topk=False,
+        indexer=types.SimpleNamespace(index_topk=8),
+    )
+    # is_dummy_run False, or the short-circuit fires before the assertion.
+    fc = types.SimpleNamespace(
+        context=types.SimpleNamespace(is_dummy_run=False), attn_metadata=object()
+    )
+    saved = v4.get_forward_context
+    v4.get_forward_context = lambda: fc
+    try:
+        with pytest.raises(AssertionError, match="did not run upstream"):
+            DeepseekV4Attention._attn_paged_core(
+                layer,
+                QKNormRopeOut(),  # every field None -- the broken-gate shape
+                torch.zeros(T, 8, dtype=torch.int32),
+                torch.zeros(T, dtype=torch.int32),
+            )
+    finally:
+        v4.get_forward_context = saved

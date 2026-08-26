@@ -17,9 +17,9 @@ Both are the runner's business, not the model's. A model opts in by decorating
 the method that IS its core -- no separate wrapper, the decorated function is the
 core itself::
 
-    @piecewise_core(key=decode_bucket_key, copy_per_step=("positions",))
-    def _attn_core(self, *, x, q, kv_pre, ..., positions):
-        ...the paged attention body...
+    @piecewise_core(key=decode_bucket_key)
+    def _attn_compress_index(self, *, x, idx_q_quant, ...):
+        ...the body that needs its own graph...
 
 and writes nothing else -- no staging buffers, no per-input policy, no dummy
 forward to measure shapes. The inputs and their order come off the function's
@@ -29,8 +29,9 @@ eager path just passes ``piecewise=False`` and the body runs directly.
 What this deliberately does NOT do is let the producer write the graph's input
 buffer directly. That saves the clone's copy, but only by making every producer
 in the chain aware of the capture -- which is what the previous design did, and
-is what made this feature reach into the model layer. Two small copies per layer
-(`q` and `kv_pre`; the other inputs were already copied) buy that back.
+is what made this feature reach into the model layer. ``copy_per_step`` buys
+that back for whichever inputs cannot be captured on -- name one and the runner
+clones and refreshes it. V4 currently names none.
 """
 
 import functools
@@ -174,6 +175,16 @@ def piecewise_core(
     caller has no branch of its own to keep.
     """
 
+    if isinstance(copy_per_step, str):
+        # `("positions")` is a string, not a 1-tuple, and `frozenset` of it is a
+        # set of CHARACTERS -- which subtracts nothing from the input names, so
+        # the entry silently means "copy nothing" while reading as its opposite.
+        # That shipped once. A one-name tuple needs its trailing comma.
+        raise TypeError(
+            f"copy_per_step must be a tuple of names, got the string "
+            f"{copy_per_step!r}. A single name needs a trailing comma: "
+            f'("{copy_per_step}",). Without it this silently copies nothing.'
+        )
     copied = frozenset(copy_per_step)
 
     def decorate(fn: Callable) -> Callable:
@@ -197,13 +208,32 @@ def piecewise_core(
                 return fn(layer, **inputs)
 
             layer_name = getattr(layer, "layer_name", id(layer))
-            num_tokens = int(inputs[input_names[0]].shape[0])
+            # Row count off the first input the caller actually passed. A core
+            # whose signature covers several call shapes leaves the inputs of the
+            # shapes it is not in as None -- declaration order still decides
+            # which one anchors, but a None one is skipped rather than crashing.
+            # Every tensor input is [num_tokens, ...], so any of them will do.
+            anchor = next(
+                (inputs[n] for n in input_names if inputs.get(n) is not None), None
+            )
+            if anchor is None:
+                raise ValueError(
+                    f"{fn.__name__} was called with every tensor input None; "
+                    "the runner has no way to size the graph. Inputs are "
+                    f"{list(input_names)}."
+                )
+            num_tokens = int(anchor.shape[0])
             # One output slot per (layer, flat row count): the address the dense
             # piece downstream was captured reading.
             out_key = (layer_name, num_tokens)
             # Config args are not graph inputs: bind them into the compute so they
             # are baked at capture, and hand the runner only the tensor inputs.
-            tensor_inputs = {n: inputs[n] for n in input_names if n in inputs}
+            # EVERY declared input, None included. A core whose signature spans
+            # several call shapes leaves the inputs of the shapes it is not in as
+            # None, and those parameters still have to be bound or the call is a
+            # missing-argument TypeError. The runner already leaves a None alone
+            # (`input_buffers` / `replay` both check), so it takes the same dict.
+            tensor_inputs = {n: inputs.get(n) for n in input_names}
             core = functools.partial(
                 fn, layer, **{n: inputs[n] for n in passthrough_names if n in inputs}
             )

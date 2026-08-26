@@ -3767,11 +3767,34 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # is_pure_decode was set by the caller at AttentionMetaData_DSV4
         # construction time; we only flip it (True→False) above when the
         # warmup carve-out fires (incomplete state_slot_out_cpu).
-        attn_metadata.kv_indices_swa = swa_indices_gpu[: int(swa_indptr_np[T])]
-        attn_metadata.kv_indices_csa = csa_indices_gpu[: int(csa_indptr_np[T])]
+        # Published WHOLE, not sliced to `indptr_np[T]`. These are read by
+        # `sparse_attn_v4_paged_decode` and written by `csa_translate_pack`,
+        # and NEITHER derives a bound from the tensor's own length: the reader
+        # walks `kv_indices[kv_indptr[t] : kv_indptr[t+1]]` (the asm kernel takes
+        # num_seqs from `qo_indptr.numel()-1`, see `paged_decode.py:104`) and the
+        # writer's grid comes from `topk_local.shape`. So the length carries no
+        # information — but a data-dependent one gets BAKED into whichever
+        # cudagraph holds the reader. The length is the cumsum of per-token KV
+        # spans, so it varies step to step at a FIXED num_tokens, and no graph
+        # key here pins it. It only ever stayed correct because the buffer below
+        # is sized for the worst case, so overshooting the slice stayed inside
+        # the allocation. A whole-buffer view is the same tensor with a length
+        # that cannot go stale.
+        #
+        # Both consumers now live in a dense piece (`_attn_paged_core`), keyed
+        # on num_tokens alone, so this matters under plain PIECEWISE too — not
+        # just AF_PIECEWISE, where they used to sit in the captured core.
+        # `prepare_mtp_decode` (`kv_indices_swa = swa_indices_buf`, ~:2381) and
+        # the sglang bridge decode path already publish these whole.
+        # SWA/CSA are the very tensors `write_v4_paged_decode_indices` was just
+        # handed, so this only stops narrowing them afterwards. HCA keeps its
+        # `[:hca_total_indices]` slice as the write-side bound above, where the
+        # capacity assert can catch an overrun.
+        attn_metadata.kv_indices_swa = swa_indices_gpu
+        attn_metadata.kv_indices_csa = csa_indices_gpu
         attn_metadata.n_committed_per_token = n_committed_per_token_gpu
         attn_metadata.block_tables_per_token = block_tables_per_token_gpu
-        attn_metadata.kv_indices_hca = hca_indices_gpu  # already exact len
+        attn_metadata.kv_indices_hca = hca_indices_buf
         attn_metadata.kv_indptr_swa = swa_indptr_gpu
         attn_metadata.kv_indptr_csa = csa_indptr_gpu
         attn_metadata.kv_indptr_hca = hca_indptr_gpu

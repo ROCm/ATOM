@@ -33,6 +33,19 @@ from atom.utils.forward_context import AttnState, get_forward_context
 # it must remain aligned with the vLLM proxy page geometry after construction.
 deepseek_v4_base._V4_BLOCK_SIZE = ATOM_DEEPSEEK_V4_BLOCK_SIZE
 
+# BROKEN by the granularity split of the native attention (2026-08-26), and
+# deliberately left to fail LOUDLY here at import rather than compute garbage.
+#
+# ``DeepseekV4Attention._attn_core`` no longer exists. The native attention is
+# now three pieces -- ``_qk_norm_rope`` (token) / ``_attn_compress_index``
+# (batch, the only captured core) / ``_attn_paged_core`` (token) -- so this
+# override's whole job, clipping every per-token input from the padded bucket
+# width down to the real token count and padding the output back, no longer has
+# a single body to wrap. The clip has to move to whichever pieces read the
+# real-sized metadata (``_attn_compress_index`` for the indexer,
+# ``_attn_paged_core`` for the paged prefill kernel), and the pad-back to
+# whichever produces the output the next captured piece reads.
+#
 # The native attention core's UNDECORATED body. ``DeepseekV4Attention._attn_core``
 # is wrapped by ``@piecewise_core``, which owns the cudagraph/output-slot
 # bookkeeping; ``DeepseekV4AttentionVllm._attn_core`` re-applies that same
@@ -242,7 +255,7 @@ class DeepseekV4AttentionVllm(DeepseekV4AttentionBase):
       the ``forward_impl`` override below.
     * NARROW split (PIECEWISE — the FULL_AND_PIECEWISE prefill/mixed path): the
       Q/KV/indexer projections run as a *captured* dense piece (``_attn_pre``)
-      at the padded width, then the eager op (``v4_core_attention``) calls
+      at the padded width, then the eager op (``v4_attn_compress_index``) calls
       ``_attn_core`` DIRECTLY, never ``forward_impl`` — reconciled in the
       ``_attn_core`` override below. (This is the path exercised by the launch
       config; without the ``_attn_core`` slice the padded ``q`` reaches
@@ -294,7 +307,7 @@ class DeepseekV4AttentionVllm(DeepseekV4AttentionBase):
         idx_q_scale: torch.Tensor | None = None,
         compressor_already_launched: bool = False,
     ) -> torch.Tensor:
-        # NARROW PIECEWISE entry (see class docstring): the ``v4_core_attention``
+        # NARROW PIECEWISE entry (see class docstring): the ``v4_attn_compress_index``
         # split op calls this DIRECTLY, so ``forward_impl``'s slice never runs.
         # ``_attn_pre`` projected every per-token tensor at the padded bucket
         # width, but the sparse-attention metadata (``batch_id_per_token`` /
