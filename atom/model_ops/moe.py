@@ -17,11 +17,15 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.flydsl.moe_common import GateMode
 from aiter.ops.shuffle import (
     interleave_gate_up_rows,
-    moe_shuffle_scale,
     moe_shuffle_weight,
 )
 from torch import nn
 from transformers import PretrainedConfig
+
+try:
+    from aiter.ops.shuffle import moe_shuffle_scale
+except ImportError:
+    from aiter.ops.shuffle import shuffle_scale as moe_shuffle_scale
 
 from atom.config import (
     Config,

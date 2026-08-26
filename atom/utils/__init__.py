@@ -1040,7 +1040,9 @@ def getLogger():
                 datefmt="%H:%M:%S",
             )
         console_handler.setFormatter(formatter)
-        console_handler.setLevel(logging.INFO)
+        console_handler.setLevel(
+            getattr(logging, _envs.ATOM_LOG_LEVEL, logging.WARNING)
+        )
 
         logger.addHandler(console_handler)
         ignored_logger_methods = {

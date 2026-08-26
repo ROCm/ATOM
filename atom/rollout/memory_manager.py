@@ -86,6 +86,17 @@ class MemoryManagerMixin:
     def _release_weights(self) -> None:
         if not hasattr(self, "model") or self.model is None:
             return
+        # No-eager sleep policy: keep weights AND CUDA graphs resident so their
+        # GPU addresses stay stable across sleep/wake. Online weight updates are
+        # applied in-place (param.data.copy_ + in-place shuffle), so the graphs
+        # remain valid and never need recapture — this avoids the GPU
+        # memory-access fault that occurs when recapturing graphs on wake under
+        # PYTORCH_CUDA_ALLOC_CONF=expandable_segments.
+        if not self.enforce_eager:
+            logger.info(
+                f"{self.label}: no-eager sleep keeps weights + CUDA graphs resident"
+            )
+            return
         # Release CUDA graphs first — they hold references to weight memory
         # and prevent freeing GPU memory.
         if not self.enforce_eager and hasattr(self, "graphs") and self.graphs:
@@ -129,6 +140,13 @@ class MemoryManagerMixin:
 
     def _release_kv_cache(self) -> None:
         if not hasattr(self, "kv_cache") or self.kv_cache is None:
+            return
+        # No-eager: keep the KV cache resident so its GPU address stays stable —
+        # decode CUDA graphs capture the KV cache base pointer, so freeing and
+        # re-allocating it would invalidate the graphs and force a (fault-prone)
+        # recapture on wake. Contents are still zeroed via clear_kv_cache().
+        if not self.enforce_eager:
+            logger.info(f"{self.label}: no-eager sleep keeps KV cache resident")
             return
         self._kv_cache_num_blocks = self.config.num_kvcache_blocks
 
@@ -214,10 +232,6 @@ class MemoryManagerMixin:
                 f"{self.label}: CUDA graph recapture failed: {e}",
                 exc_info=True,
             )
-            # Fall back to eager mode rather than crashing
-            self.enforce_eager = True
-            self.graphs = {}
-            self.graph_pool = None
             if hasattr(self, "_graphs_backup_keys"):
                 del self._graphs_backup_keys
-            logger.warning(f"{self.label}: Falling back to enforce_eager=True")
+            raise
