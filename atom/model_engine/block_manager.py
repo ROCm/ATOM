@@ -295,7 +295,16 @@ class BlockManager:
             return self.kv.has_free(count)
         return self.paged_state_checkpoints.ensure_free_units(count)
 
-    def _dcp_num_blocks(self, seq_len: int) -> int:
+    def num_pool_blocks(self, seq_len: int) -> int:
+        """KV pool blocks a `seq_len`-token sequence occupies on this rank.
+
+        Under DCP a rank stores only its interleaved shard, so this is a factor
+        of `dcp_world_size` below the global `ceil(seq_len / block_size)`. The
+        pool is sized in these same per-rank units, so this is the only count
+        that may be compared against `kv.num_blocks` — whether to draw from the
+        pool (`can_allocate`/`allocate`) or to reject a prompt as too large for
+        it (`Scheduler._unschedulable_reason`).
+        """
         if self.dcp_world_size <= 1:
             return (seq_len + self.block_size - 1) // self.block_size
         from atom.model_ops.dcp_ops import get_dcp_local_seq_lens
@@ -399,7 +408,7 @@ class BlockManager:
         if seq.has_per_req_cache and not self.state.has_free():
             return -1
         if not self.enable_prefix_caching:
-            if not self._has_page_units(self._dcp_num_blocks(len(seq))):
+            if not self._has_page_units(self.num_pool_blocks(len(seq))):
                 return -1
             return 0
         # Step 1: compressed prefix (CSA/HCA/indexer share the block hash and
@@ -479,7 +488,7 @@ class BlockManager:
         # Pin the restore before fresh blocks can evict its checkpoint.
         if seq.has_per_req_cache and self.paged_state_checkpoints is not None:
             self._attach_state_group(seq, h if num_cached_blocks > 0 else -1)
-        for _ in range(num_cached_blocks, self._dcp_num_blocks(len(seq))):
+        for _ in range(num_cached_blocks, self.num_pool_blocks(len(seq))):
             seq.block_table.append(self._fresh_block())
         seq.num_cached_tokens = num_cached_blocks * self._hash_block_size()
 

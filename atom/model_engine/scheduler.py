@@ -1038,8 +1038,11 @@ class Scheduler:
           - prompt longer than `max_num_batched_tokens` AND chunked prefill
             disabled → no single prefill forward can ever fit it (with chunked
             prefill enabled, the prompt is split across steps and this is fine)
-          - prompt's KV blocks (+ per-req cache reservation) exceed the total
-            pool size → never fits even on a fully empty pool
+          - prompt's KV blocks exceed the total pool size → never fits even on
+            a fully empty pool. Counted per-rank (dcp-local, via
+            `BlockManager.num_pool_blocks`) to match how the pool is sized and
+            drawn, so a dcp>1 deployment admits prompts `dcp_world_size` times
+            longer than the global block count alone would suggest.
 
         Called at submit time (`_warn_if_unschedulable`, which logs the
         reason and adds extra dynamic warnings) and at schedule time
@@ -1071,11 +1074,18 @@ class Scheduler:
             )
         bm = self.block_manager
         total_blocks = bm.kv.num_blocks
-        if seq.num_blocks > total_blocks:
+        # `num_pool_blocks`, not `seq.num_blocks`: the latter counts global
+        # blocks, while the pool is sized and drawn per-rank. Under dcp>1 the
+        # two differ by `dcp_world_size`.
+        pool_blocks = bm.num_pool_blocks(num_tokens)
+        if pool_blocks > total_blocks:
+            scope = (
+                f" (per-rank, dcp={bm.dcp_world_size})" if bm.dcp_world_size > 1 else ""
+            )
             return (
-                f"needs {seq.num_blocks} KV blocks for {num_tokens} input tokens "
-                f"> total pool blocks={total_blocks}. Reduce prompt length or "
-                f"raise --gpu-memory-utilization. (Per-req state cache lives in "
+                f"needs {pool_blocks} KV blocks{scope} for {num_tokens} input "
+                f"tokens > total pool blocks={total_blocks}. Reduce prompt length "
+                f"or raise --gpu-memory-utilization. (Per-req state cache lives in "
                 f"its own pre-allocated tensor and does not consume pool blocks.)"
             )
         return None
