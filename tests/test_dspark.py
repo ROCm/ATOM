@@ -1569,13 +1569,8 @@ def test_custom_op_bodies_only_call_methods_that_exist():
         pytest.skip(f"deepseek_v4 not importable here: {e}")
 
     tree = ast.parse(inspect.getsource(v4))
-    # Module-level functions registered as custom ops -- the ones that look up a
-    # layer and drive it. Nested defs and class methods are not these.
-    op_names = {
-        n.func.id if isinstance(n.func, ast.Name) else None: n
-        for n in ast.walk(tree)
-        if isinstance(n, ast.Call)
-    }
+    # The module-level functions registered as custom ops: named in a
+    # `direct_register_custom_op` call, or decorated with `mark_spliting_op`.
     registered = set()
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
