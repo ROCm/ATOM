@@ -201,8 +201,6 @@ def _replicated_index_cache_unsupported_reasons(
         unsupported.append("model_type must be glm_moe_dsa")
     if dcp_world_size <= 1:
         unsupported.append("decode context parallel size must be > 1")
-    if config.speculative_config is not None:
-        unsupported.append("MTP/speculative decoding is not supported")
     if mla_page_size != 1:
         unsupported.append("MLA page size must be 1")
     if pcp_world_size > 1:
@@ -373,7 +371,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             and self.dcp_world_size > 1
             and dcp_persistent
             and self.block_size == 1
-            and config.speculative_config is None
         )
         if self.dcp_world_size > 1 and dcp_persistent:
             self.persistent_num_heads = mla_dcp_kernel_num_heads(
@@ -484,8 +481,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 device=self.device,
             )
             # DCP sparse decode compacts each rank's owned top-k slots to the
-            # front (no -1 holes), so the per-request region length becomes data-
-            # AND layer-dependent.
+            # front (no -1 holes), so the per-query-token region length becomes
+            # data- AND layer-dependent.
             self._dcp_sparse_kv_indptr_gpu = torch.zeros(
                 self.max_num_batched_tokens + 1,
                 dtype=torch.int32,
@@ -1960,11 +1957,17 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         var["context_lens"].np[:scheduled_bs] = context_lens
         var["context_lens"].np[scheduled_bs:bs] = 0
         if self.replicate_index_cache:
-            var["index_slot_mapping"].np[:bs] = 0
+            # One slot per query token: MTP verify forwards max_seqlen_q draft
+            # positions per request, at global positions
+            # [seq_len - max_seqlen_q, seq_len), the same range the main KV
+            # slot_mapping above walks. Collapses to the single seq_len-1 slot
+            # when max_seqlen_q == 1.
+            var["index_slot_mapping"].np[: bs * max_seqlen_q] = 0
             if not batch.is_dummy_run:
-                var["index_slot_mapping"].np[:scheduled_bs] = [
-                    self._replicated_index_slot(block_table, int(seq_len) - 1)
+                var["index_slot_mapping"].np[: scheduled_bs * max_seqlen_q] = [
+                    self._replicated_index_slot(block_table, pos)
                     for block_table, seq_len in zip(block_tables, context_lens)
+                    for pos in range(int(seq_len) - max_seqlen_q, int(seq_len))
                 ]
 
         if self.dcp_world_size > 1:
@@ -2114,7 +2117,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # metadata copies on main stream
         positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
         index_slot_mapping = (
-            var["index_slot_mapping"].copy_to_gpu(bs)
+            var["index_slot_mapping"].copy_to_gpu(bs * max_seqlen_q)
             if self.replicate_index_cache
             else None
         )
@@ -2189,6 +2192,15 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             attn_metadata.sparse_kv_last_page_lens = var[
                 "sparse_kv_last_page_lens"
             ].gpu[:bs]
+            if self.dcp_world_size > 1:
+                # The DCP top-k filter keys its block-table lookup off the query
+                # token's owning request. One token per request here, so the map
+                # is the identity -- but it has to exist, because the filter is
+                # shared with the MTP path where it is not.
+                self._token_to_seq_idxs_gpu[:bs] = torch.arange(
+                    bs, dtype=torch.int32, device=self.device
+                )
+                attn_metadata.token_to_seq_idxs = self._token_to_seq_idxs_gpu[:bs]
 
         # Use bs (graph_bs) >= 2 instead of scheduled_bs >= 2 to avoid accuracy issue:
         if self.model_runner.config.enable_tbo_decode and bs >= 2:
@@ -2458,7 +2470,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         )
         attn_matadata.dtype_q = self.dtype_q
         if self.replicate_index_cache:
-            attn_matadata.index_slot_mapping = var["index_slot_mapping"].gpu[:bs]
+            attn_matadata.index_slot_mapping = var["index_slot_mapping"].gpu[
+                :sum_tokens
+            ]
         # Attach the round-robin CP global kv_indptr for the captured graph so
         # replay (which overwrites the buffer with real values) matches. Only
         # consumed by _forward_decode when dcp>1 and max_q_len>1.
@@ -2488,6 +2502,15 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             attn_matadata.sparse_kv_last_page_lens = var[
                 "sparse_kv_last_page_lens"
             ].gpu[:bs]
+            if self.dcp_world_size > 1:
+                # Same identity map prepare_decode builds: the DCP top-k filter
+                # keys its block-table lookup off the query token's owning
+                # request, and one token per request makes that the identity.
+                # It still has to exist, or the captured graph has no buffer.
+                self._token_to_seq_idxs_gpu[:bs] = torch.arange(
+                    bs, dtype=torch.int32, device=self.device
+                )
+                attn_matadata.token_to_seq_idxs = self._token_to_seq_idxs_gpu[:bs]
         positions = var["positions"].copy_to_gpu(sum_tokens)
         context = Context(
             positions=positions, is_prefill=False, batch_size=bs, graph_bs=bs

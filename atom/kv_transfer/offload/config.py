@@ -23,7 +23,7 @@ from typing import Any
 
 import torch
 
-from atom.utils import envs
+from atom.distributed.dcp_utils import dcp_replicated_index_cache_enabled
 
 # Version 4 merges two independent PAGE-identity changes that each shipped as
 # "version 3". One added the effective index-cache dtype: FP4 and FP8 DSV4
@@ -208,12 +208,7 @@ def build_page_namespace(
             ),
             minimum=1,
         ),
-        "replicated_index_cache": bool(
-            envs.ATOM_DCP_REPLICATE_INDEX_CACHE
-            and getattr(hf, "model_type", None) == "glm_moe_dsa"
-            and (getattr(config, "decode_context_parallel_size", 1) or 1) > 1
-            and getattr(config, "speculative_config", None) is None
-        ),
+        "replicated_index_cache": bool(dcp_replicated_index_cache_enabled(config)),
         "hf_geometry": _stable_hf_geometry(hf),
         "speculative_config": _stable_config_value(
             getattr(config, "speculative_config", None)

@@ -1857,26 +1857,18 @@ def sparse_attn_indexer(
                 logits.stride(1),
                 stable=stable_topk,
             )
-        if attn_metadata.max_seqlen_q > 1:
-            triton_gather_kv_indices_sparse(
-                attn_metadata.sparse_kv_indptr,
-                attn_metadata.token_to_seq_idxs,
-                topk_indices,
-                attn_metadata.kv_indices,
-                attn_metadata.kv_indptr,
-                NUM_TOPK_TOKENS=topk_tokens,
-                out=sparse_kv_indices_buffer,
-            )
-        elif dcp_world_size > 1:
+        if dcp_world_size > 1:
             # topk_indices now hold GLOBAL positions. Keep only this rank's owned
             # tokens ((p//S)%W == r), de-interleave to the local index, map to the
             # local main-KV slot, and COMPACT them to the front -- non-owned
             # positions are dropped, not marked with -1, because holes break
             # aiter's lse output. The compacted per-request lengths are written
-            # into dcp_sparse_kv_indptr_buffer for this layer's attention.
+            # into dcp_sparse_kv_indptr_buffer for this layer's attention. The
+            # row unit is the query token, so MTP's draft positions each get
+            # their own compacted region.
             triton_filter_and_convert_dcp_index(
-                attn_metadata.cu_seqlens_q,
-                attn_metadata.g_kv_indptr,
+                attn_metadata.token_to_seq_idxs,
+                num_decode_tokens,
                 attn_metadata.block_tables,
                 topk_indices,
                 dcp_rank,
@@ -1887,6 +1879,16 @@ def sparse_attn_indexer(
                 NUM_TOPK_TOKENS=topk_tokens,
                 out=sparse_kv_indices_buffer,
                 cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+            )
+        elif attn_metadata.max_seqlen_q > 1:
+            triton_gather_kv_indices_sparse(
+                attn_metadata.sparse_kv_indptr,
+                attn_metadata.token_to_seq_idxs,
+                topk_indices,
+                attn_metadata.kv_indices,
+                attn_metadata.kv_indptr,
+                NUM_TOPK_TOKENS=topk_tokens,
+                out=sparse_kv_indices_buffer,
             )
         else:
             triton_convert_req_index_to_global_index(

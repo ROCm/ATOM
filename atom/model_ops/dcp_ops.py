@@ -870,10 +870,8 @@ def dcp_pack_topk_candidates(
 
 @triton.jit
 def _count_owned_dcp_kernel(
-    qo_indptr,  # int32 [num_requests + 1]
-    global_kv_indptr,  # int32 [num_requests + 1] -- GLOBAL context (column range)
     token_indices_ptr,  # int32 [num_tokens, NUM_TOPK_TOKENS] -- GLOBAL top-k positions
-    out_counts,  # int32 [num_requests] -- owned top-k count per request
+    out_counts,  # int32 [num_tokens] -- owned top-k count per query token
     DCP_RANK: tl.constexpr,
     DCP_WORLD: tl.constexpr,
     INTERLEAVE: tl.constexpr,  # cp_kv_cache_interleave_size S (1 = round-robin)
@@ -883,15 +881,15 @@ def _count_owned_dcp_kernel(
     ti_stride1,
 ):
     """Pass 1 of the compacting DCP filter: how many of the global top-k
-    positions does this rank own, per request? Its exclusive cumsum gives the
-    compacted output offsets used by ``_compact_filter_dcp_kernel``.
+    positions does this rank own, per QUERY TOKEN? Its exclusive cumsum gives
+    the compacted output offsets used by ``_compact_filter_dcp_kernel``.
 
-    qlen==1 only (DCP + sparse + MTP is rejected upstream), so each request has
-    exactly one query token. Owner of global position g is rank (g//S)%W
-    (S=INTERLEAVE; S=1 -> g%W).
+    The row unit is a query token, not a request: MTP verify forwards
+    max_seqlen_q draft positions per request and each one carries its own
+    top-k. At qlen==1 the two coincide. Owner of global position g is rank
+    (g//S)%W (S=INTERLEAVE; S=1 -> g%W).
     """
-    batch_id = tl.program_id(0)
-    token_id = tl.load(qo_indptr + batch_id)
+    token_id = tl.program_id(0)
 
     count = 0
     for tile_start in range(0, NUM_TOPK_TOKENS, BLOCK_N):
@@ -902,14 +900,13 @@ def _count_owned_dcp_kernel(
         owned = col_valid & (tok >= 0) & (((tok // INTERLEAVE) % DCP_WORLD) == DCP_RANK)
         count += tl.sum(owned.to(tl.int32))
 
-    tl.store(out_counts + batch_id, count)
+    tl.store(out_counts + token_id, count)
 
 
 @triton.jit
 def _compact_filter_dcp_kernel(
-    qo_indptr,  # int32 [num_requests + 1]
-    global_kv_indptr,  # int32 [num_requests + 1] -- GLOBAL context (column range)
-    out_kv_indptr,  # int32 [num_requests + 1] -- COMPACTED offsets (cumsum of pass 1)
+    token_to_seq_idxs,  # int32 [num_tokens] -- owning request of each query token
+    out_kv_indptr,  # int32 [num_tokens + 1] -- COMPACTED offsets (cumsum of pass 1)
     block_table,  # int32 [num_req, max_num_blocks_per_req] -- logical(global) blocks
     token_indices_ptr,  # int32 [num_tokens, NUM_TOPK_TOKENS] -- GLOBAL top-k positions
     out_kv_indices,  # int32 [>= out_kv_indptr[-1]]
@@ -946,10 +943,11 @@ def _compact_filter_dcp_kernel(
     # than gathered from a precomputed kv_indices -- the DCP round-robin
     # per-token slot array does not exist on the sparse path (dense reads go
     # through block_tables in-kernel).
-    batch_id = tl.program_id(0)
+    token_id = tl.program_id(0)
 
-    out_kv_start = tl.load(out_kv_indptr + batch_id)
-    token_id = tl.load(qo_indptr + batch_id)
+    out_kv_start = tl.load(out_kv_indptr + token_id)
+    # The block table is per request, so a draft position looks up its owner.
+    req_id = tl.load(token_to_seq_idxs + token_id)
 
     vbs = PAGE_SIZE * DCP_WORLD
     written = 0
@@ -974,7 +972,7 @@ def _compact_filter_dcp_kernel(
             vb % INTERLEAVE
         )
         physical_block = tl.load(
-            block_table + batch_id * bt_stride0 + block_id * bt_stride1,
+            block_table + req_id * bt_stride0 + block_id * bt_stride1,
             mask=idx_valid,
             other=0,
         )
@@ -988,15 +986,15 @@ def _compact_filter_dcp_kernel(
 
 
 def triton_filter_and_convert_dcp_index(
-    qo_indptr: torch.Tensor,  # int32 [num_requests + 1]
-    global_kv_indptr: torch.Tensor,  # int32 [num_requests + 1]
+    token_to_seq_idxs: torch.Tensor,  # int32 [num_tokens] owning request per token
+    num_tokens: int,
     block_table: torch.Tensor,  # int32 [num_req, max_num_blocks_per_req] logical
     token_indices: torch.Tensor,  # int32 [num_tokens, NUM_TOPK_TOKENS] GLOBAL pos
     dcp_rank: int,
     dcp_world_size: int,
     block_size: int,  # runner (physical) block size == PAGE_SIZE
-    out_kv_indptr: torch.Tensor,  # int32 [num_requests + 1] COMPACTED, written here
-    owned_counts: torch.Tensor,  # int32 [>= num_requests] scratch for pass 1
+    out_kv_indptr: torch.Tensor,  # int32 [num_tokens + 1] COMPACTED, written here
+    owned_counts: torch.Tensor,  # int32 [>= num_tokens] scratch for pass 1
     NUM_TOPK_TOKENS: int = 2048,
     BLOCK_N: int = 128,
     out: torch.Tensor | None = None,
@@ -1034,22 +1032,17 @@ def triton_filter_and_convert_dcp_index(
     assert 0 <= dcp_rank < dcp_world_size
     assert out is not None, "sparse_kv_indices_buffer (out) is required"
 
-    num_batch = global_kv_indptr.shape[0] - 1
-
-    qo_indptr_c = qo_indptr.contiguous()
-    global_kv_indptr_c = global_kv_indptr.contiguous()
+    token_to_seq_idxs_c = token_to_seq_idxs.contiguous()
     block_table_c = block_table.contiguous()
     token_indices_c = token_indices.contiguous()
 
     ti_stride0, ti_stride1 = token_indices_c.stride()
     bt_stride0, bt_stride1 = block_table_c.stride()
-    grid = (num_batch,)
+    grid = (num_tokens,)
 
-    # Pass 1: per-request count of owned top-k positions.
-    counts = owned_counts[:num_batch]
+    # Pass 1: per-query-token count of owned top-k positions.
+    counts = owned_counts[:num_tokens]
     _count_owned_dcp_kernel[grid](
-        qo_indptr_c,
-        global_kv_indptr_c,
         token_indices_c,
         counts,
         dcp_rank,
@@ -1069,12 +1062,13 @@ def triton_filter_and_convert_dcp_index(
     # through a host->device copy, which HIP rejects while a graph is capturing
     # (hipErrorStreamCaptureUnsupported). Everything here must stay device-side.
     out_kv_indptr[:1].zero_()
-    torch.cumsum(counts, dim=0, dtype=torch.int32, out=out_kv_indptr[1 : num_batch + 1])
+    torch.cumsum(
+        counts, dim=0, dtype=torch.int32, out=out_kv_indptr[1 : num_tokens + 1]
+    )
 
     # Pass 2: write the owned slots packed to the front of each region.
     _compact_filter_dcp_kernel[grid](
-        qo_indptr_c,
-        global_kv_indptr_c,
+        token_to_seq_idxs_c,
         out_kv_indptr,
         block_table_c,
         token_indices_c,

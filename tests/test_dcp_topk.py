@@ -252,15 +252,16 @@ def _filter_owned(token_indices, ctx, rank, world, block_size=16):
     block_table = torch.arange(rows * n_blocks, dtype=torch.int32, device=dev).reshape(
         rows, n_blocks
     )
-    qo_indptr = torch.arange(rows + 1, dtype=torch.int32, device=dev)
-    g_kv_indptr = torch.arange(rows + 1, dtype=torch.int32, device=dev) * ctx
+    # One query token per request here, so the token -> request map is the
+    # identity; MTP is what makes it non-trivial.
+    token_to_seq_idxs = torch.arange(rows, dtype=torch.int32, device=dev)
     out_kv_indptr = torch.zeros(rows + 1, dtype=torch.int32, device=dev)
     owned_counts = torch.zeros(rows, dtype=torch.int32, device=dev)
     out = torch.zeros(rows * TOPK, dtype=torch.int32, device=dev)
 
     triton_filter_and_convert_dcp_index(
-        qo_indptr,
-        g_kv_indptr,
+        token_to_seq_idxs,
+        rows,
         block_table,
         token_indices,
         rank,

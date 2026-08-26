@@ -78,9 +78,8 @@ def _build_decode_case(g_ctxs, max_blocks, seed):
     gen = torch.Generator().manual_seed(seed)
     bs = len(g_ctxs)
 
-    qo_indptr = torch.arange(bs + 1, dtype=torch.int32)
-    global_kv_indptr = torch.zeros(bs + 1, dtype=torch.int32)
-    global_kv_indptr[1:] = torch.cumsum(torch.tensor(g_ctxs), 0).to(torch.int32)
+    # One query token per request, so the token -> request map is the identity.
+    token_to_seq_idxs = torch.arange(bs, dtype=torch.int32)
 
     # Physical blocks are deliberately shuffled so a wrong slot formula cannot
     # accidentally match a "logical == physical" identity mapping.
@@ -96,7 +95,7 @@ def _build_decode_case(g_ctxs, max_blocks, seed):
         # distinct global positions in [0, g), in the indexer's (arbitrary) order
         picks = torch.randperm(g, generator=gen)[:n]
         token_indices[b, :n] = picks.to(torch.int32)
-    return qo_indptr, global_kv_indptr, block_table, token_indices
+    return token_to_seq_idxs, block_table, token_indices
 
 
 def _decode_reference(g_ctxs, block_table, token_indices, rank, interleave=1):
@@ -131,12 +130,11 @@ def _decode_reference(g_ctxs, block_table, token_indices, rank, interleave=1):
 def test_decode_filter(name, g_ctxs, seed):
     bs = len(g_ctxs)
     max_blocks = max(1, (max(g_ctxs) + DEC_PAGE * DEC_W - 1) // (DEC_PAGE * DEC_W)) + 1
-    qo_indptr, global_kv_indptr, block_table, token_indices = _build_decode_case(
+    token_to_seq_idxs, block_table, token_indices = _build_decode_case(
         g_ctxs, max_blocks, seed
     )
 
-    qo_g = qo_indptr.to(DEV)
-    gkv_g = global_kv_indptr.to(DEV)
+    t2s_g = token_to_seq_idxs.to(DEV)
     bt_g = block_table.to(DEV)
     ti_g = token_indices.to(DEV)
 
@@ -147,8 +145,8 @@ def test_decode_filter(name, g_ctxs, seed):
         counts = torch.zeros(bs, dtype=torch.int32, device=DEV)
 
         triton_filter_and_convert_dcp_index(
-            qo_g,
-            gkv_g,
+            t2s_g,
+            bs,
             bt_g,
             ti_g,
             rank,
@@ -205,11 +203,10 @@ def test_decode_filter_block_interleave(interleave, g_ctxs, seed):
     filter kernel's owner/offset math is pinned to the write side at S>1."""
     bs = len(g_ctxs)
     max_blocks = max(1, (max(g_ctxs) + DEC_PAGE * DEC_W - 1) // (DEC_PAGE * DEC_W)) + 1
-    qo_indptr, global_kv_indptr, block_table, token_indices = _build_decode_case(
+    token_to_seq_idxs, block_table, token_indices = _build_decode_case(
         g_ctxs, max_blocks, seed
     )
-    qo_g = qo_indptr.to(DEV)
-    gkv_g = global_kv_indptr.to(DEV)
+    t2s_g = token_to_seq_idxs.to(DEV)
     bt_g = block_table.to(DEV)
     ti_g = token_indices.to(DEV)
 
@@ -220,8 +217,8 @@ def test_decode_filter_block_interleave(interleave, g_ctxs, seed):
         counts = torch.zeros(bs, dtype=torch.int32, device=DEV)
 
         triton_filter_and_convert_dcp_index(
-            qo_g,
-            gkv_g,
+            t2s_g,
+            bs,
             bt_g,
             ti_g,
             rank,

@@ -46,7 +46,6 @@ def dcp_replicated_index_cache_enabled(atom_config=None) -> bool:
     return (
         config.decode_context_parallel_size > 1
         and getattr(hf_config, "model_type", None) == "glm_moe_dsa"
-        and config.speculative_config is None
     )
 
 

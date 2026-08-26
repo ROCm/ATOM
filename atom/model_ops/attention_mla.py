@@ -603,13 +603,13 @@ class MLAAttention(nn.Module):
 
         self.dcp_persistent_supported = dcp_persistent_supported()
         self.dcp_prefill_merge_bf16_ok = dcp_prefill_merge_bf16_ok()
-        # Scope sparse persistent DCP to native non-speculative attention.
-        # Decode is q_len=1; sparse prefill is represented as per-token virtual
-        # q_len=1 rows. Plugin DCP reconfigures its group after construction.
+        # Scope sparse persistent DCP to native attention. Every sparse row is a
+        # virtual q_len=1 row -- decode has one per sequence, sparse prefill one
+        # per token, and MTP verify one per draft position -- so the work plan is
+        # built the same way in all three. Plugin DCP reconfigures its group
+        # after construction.
         self.sparse_dcp_metadata_rebuild = (
-            self.is_sparse_mla
-            and self.dcp_world_size > 1
-            and getattr(atom_config, "speculative_config", None) is None
+            self.is_sparse_mla and self.dcp_world_size > 1
         )
 
         # Compacted per-layer sparse offsets for DCP decode; rebound by the
@@ -1845,8 +1845,13 @@ class MLAAttention(nn.Module):
                     paged_kv_indptr = attn_metadata.sparse_kv_indptr[: B + 1]
                     paged_kv_indices = self.sparse_kv_indices_buffer
                     paged_kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens[:B]
-                    if self.dcp_world_size > 1:
-                        paged_kv_indptr = self.dcp_sparse_kv_indptr_buffer[: B + 1]
+                if self.dcp_world_size > 1:
+                    # The DCP filter compacts each query token's owned top-k to
+                    # the front, so the region lengths are its per-token cumsum,
+                    # not the uniform top-k stride sparse_kv_indptr describes.
+                    # B is a token count on both paths -- MTP verify runs the
+                    # sparse layers at max_q_len=1, one row per draft position.
+                    paged_kv_indptr = self.dcp_sparse_kv_indptr_buffer[: B + 1]
 
             dp_size = get_dp_group().world_size
             use_persistent_mode = should_use_persistent_mode(
@@ -1856,10 +1861,11 @@ class MLAAttention(nn.Module):
                 dcp_world_size=self.dcp_world_size,
                 dcp_persistent_supported=self.dcp_persistent_supported,
             )
-            # Sparse DCP persistent decode is enabled only for ordinary q_len=1
-            # native serving. Its full IndexShare layers rebuild the work plan
-            # below from the layer-local compact indptr; plugin/speculative paths
-            # retain the established non-persistent fallback.
+            # Sparse DCP decode stays persistent: its full IndexShare layers
+            # rebuild the work plan below from the layer-local compact indptr,
+            # which the non-persistent split-KV reduce cannot describe (it hands
+            # every row the same split count regardless of how many top-k slots
+            # this rank actually owns).
             if self.is_sparse_mla and self.dcp_world_size > 1:
                 use_persistent_mode = (
                     use_persistent_mode and self.sparse_dcp_metadata_rebuild
@@ -1878,6 +1884,7 @@ class MLAAttention(nn.Module):
                     paged_cu_seqlens_q,
                     paged_kv_indptr,
                     paged_kv_last_page_lens,
+                    work_prefix="sparse_mtp_" if is_sparse_mtp else "",
                 )
 
             if not use_persistent_mode:
