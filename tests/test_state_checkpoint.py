@@ -3,7 +3,7 @@
 #
 # Neither the GDN recurrent state nor the V4 compressor ring can be rebuilt
 # from cached KV blocks, so a prefix hit is only resumable at a boundary where
-# some earlier request published its state. `StateGroupPool` indexes those
+# some earlier request published its state. `StateSlotPool` indexes those
 # boundaries and `BlockManager` shrinks the hit to the rightmost one — without
 # it, a hit hands the resumed forward a group straight off the free list and it
 # reads the previous occupant's state.
@@ -24,10 +24,10 @@ from atom.model_engine.page_unit_checkpoint import (
     PagedStateCheckpointCoordinator,
     PagedStateCheckpointSpec,
 )
-from atom.model_engine.scheduler import CacheStats, ScheduledBatchOutput, Scheduler
+from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
 from atom.model_engine.sequence import Sequence, SequenceType
 from atom.model_engine.state_cache import StateCache
-from atom.model_engine.state_pool import StateGroupPool
+from atom.model_engine.state_pool import StateSlotPool
 from atom.model_engine.state_runtime import (
     StateRuntime,
     StateTransfer,
@@ -41,6 +41,13 @@ PAGED_COPY_TRANSFER = StateTransfer.copy(PAGED_COPY_SPEC.layout_id)
 DEFAULT_STATE_RUNTIME = StateRuntime(transfer=DEFAULT_STATE_TRANSFER)
 PAGED_COPY_RUNTIME = StateRuntime(
     transfer=PAGED_COPY_TRANSFER,
+    checkpoint_spec=PAGED_COPY_SPEC,
+)
+# A PAGE-backed backend whose kernel *can* hand over an interior state. The two
+# runtimes differ on that axis alone, so a test that names this one is testing
+# the capability rather than the storage.
+PAGED_MIDSTEP_RUNTIME = StateRuntime(
+    transfer=StateTransfer.copy(PAGED_COPY_SPEC.layout_id, readable_midstep=True),
     checkpoint_spec=PAGED_COPY_SPEC,
 )
 
@@ -158,7 +165,7 @@ def boundary_hash(bm: BlockManager, seq: Sequence) -> int:
     return bm.kv.block(seq.block_table[last]).hash
 
 
-# ── StateGroupPool in isolation ────────────────────────────────────────────
+# ── StateSlotPool in isolation ────────────────────────────────────────────
 
 
 def idx_seq(num_tokens: int = 1000):
@@ -169,23 +176,23 @@ def idx_seq(num_tokens: int = 1000):
 class TestPoolIndex:
 
     def test_disabled_is_identity(self):
-        pool = StateGroupPool(0)
+        pool = StateSlotPool(0)
         assert pool.resumable_hit(idx_seq(), 5, [1, 2, 3, 4, 5]) == 5
-        assert pool.lookup_group(1) == -1
+        assert pool.lookup(1) == -1
 
     def test_resumable_hit_picks_rightmost_checkpoint(self):
-        pool = StateGroupPool(4, StateTransfer.fork(1), hash_block_size=1)
+        pool = StateSlotPool(4, StateTransfer.fork(1), hash_block_size=1)
         pool._index(10, 0)
         pool._index(30, 1)
         # hashes for blocks 0..4; checkpoints exist after block 0 and block 2
         assert pool.resumable_hit(idx_seq(), 5, [10, 20, 30, 40, 50]) == 3
 
     def test_resumable_hit_zero_when_nothing_published(self):
-        pool = StateGroupPool(4, StateTransfer.fork(1), hash_block_size=1)
+        pool = StateSlotPool(4, StateTransfer.fork(1), hash_block_size=1)
         assert pool.resumable_hit(idx_seq(), 5, [10, 20, 30, 40, 50]) == 0
 
     def test_resumable_hit_walks_back_when_the_fork_has_no_room(self):
-        pool = StateGroupPool(4, StateTransfer.fork(4), hash_block_size=1)
+        pool = StateSlotPool(4, StateTransfer.fork(4), hash_block_size=1)
         pool._index(10, 0)
         pool._index(30, 1)
         # One token per block, five in the seq: the rightmost checkpoint
@@ -194,26 +201,26 @@ class TestPoolIndex:
         assert pool.resumable_hit(idx_seq(5), 5, [10, 20, 30, 40, 50]) == 1
 
     def test_invalidate_drops_both_directions(self):
-        pool = StateGroupPool(4)
+        pool = StateSlotPool(4)
         pool._index(10, 2)
         pool.invalidate(2)
-        assert pool.lookup_group(10) == -1
+        assert pool.lookup(10) == -1
         # A later invalidate of the same group must not delete a new tenant.
         pool._index(10, 3)
         pool.invalidate(2)
-        assert pool.lookup_group(10) == 3
+        assert pool.lookup(10) == 3
 
     def test_republishing_a_hash_orphans_the_old_group(self):
-        pool = StateGroupPool(4)
+        pool = StateSlotPool(4)
         pool._index(10, 1)
         pool._index(10, 2)
-        assert pool.lookup_group(10) == 2
+        assert pool.lookup(10) == 2
         # Group 1 no longer backs hash 10; invalidating it leaves 2 indexed.
         pool.invalidate(1)
-        assert pool.lookup_group(10) == 2
+        assert pool.lookup(10) == 2
 
     def test_pins_drain_once(self):
-        pool = StateGroupPool(4)
+        pool = StateSlotPool(4)
         while pool.has_free():  # every group out with a request
             pool.pop()
         pool.pin(1)
@@ -248,24 +255,24 @@ class TestFreeListHalves:
         after it carrying nothing. In release order 0 comes out first and the
         checkpoint dies while a group with nothing to lose waits behind it.
         """
-        pool = StateGroupPool(4)
+        pool = StateSlotPool(4)
         drain(pool)
         pool.release(0)
         pool._index(10, 0)
         pool.release(1)
 
         assert pool.pop() == 1
-        assert pool.lookup_group(10) == 0
+        assert pool.lookup(10) == 0
 
     def test_admission_packs_towards_index_zero(self):
-        pool = StateGroupPool(4)
+        pool = StateSlotPool(4)
         drain(pool)
         for group in (3, 1, 2):
             pool.release(group)
         assert [pool.pop() for _ in range(3)] == [1, 2, 3]
 
     def test_checkpoints_are_spent_least_recently_used_first(self):
-        pool = StateGroupPool(4)
+        pool = StateSlotPool(4)
         drain(pool)
         for group, h in ((0, 10), (1, 11), (2, 12)):
             pool.release(group)
@@ -280,7 +287,7 @@ class TestFreeListHalves:
         `claim` deliberately leaves the hash in place, so the group comes back
         through `release` still checkpointed — and lands at the LRU tail.
         """
-        pool = StateGroupPool(4)
+        pool = StateSlotPool(4)
         drain(pool)
         for group, h in ((0, 10), (1, 11)):
             pool.release(group)
@@ -291,10 +298,75 @@ class TestFreeListHalves:
         pool.release_pins()
 
         assert pool.pop() == 1  # 11 is now the older of the two
-        assert pool.lookup_group(10) == 0
+        assert pool.lookup(10) == 0
+
+    def test_a_speculative_checkpoint_is_spent_before_any_anchor(self):
+        """A guess must never evict knowledge, however old the knowledge is.
+
+        Group 0 holds an anchor released first, so plain LRU would spend it.
+        Group 1 is marked speculative and lands at the head instead, which is
+        what makes the demand rung cost the anchors nothing.
+
+        Indexed before it is released, which is the order the fork path takes:
+        the group is still its owner's when the hash is filed.
+        """
+        pool = StateSlotPool(4)
+        drain(pool)
+        pool.release(0)
+        pool._index(10, 0)
+        pool._index(11, 1)
+        pool.mark_speculative(1)
+        pool.release(1)
+
+        assert pool.pop() == 1
+        assert pool.lookup(10) == 0
+
+    def test_speculative_checkpoints_keep_lru_among_themselves(self):
+        pool = StateSlotPool(4)
+        drain(pool)
+        for group, h in ((0, 10), (1, 11)):
+            pool._index(h, group)
+            pool.mark_speculative(group)
+            pool.release(group)
+
+        # Filed at the head, so the *later* one is spent first: neither has
+        # been read, and the older has had longer to prove it never will be.
+        assert pool.pop() == 1
+        assert pool.pop() == 0
+
+    def test_a_read_speculative_checkpoint_is_promoted(self):
+        """Being resumed from is the evidence the guess was right.
+
+        `BlockManager._attach_state_slots` promotes the source it is about to
+        fork off, so a demand rung that pays off stops being spent first.
+        """
+        pool = StateSlotPool(4)
+        drain(pool)
+        pool._index(10, 0)
+        pool.mark_speculative(0)
+        pool.release(0)
+        pool.release(1)
+        pool._index(11, 1)
+
+        pool.promote(0)  # a resumer reads the speculative checkpoint
+
+        assert pool.pop() == 1  # 10 is no longer the first thing spent
+        assert pool.lookup(10) == 0
+
+    def test_promoting_a_group_nobody_marked_leaves_the_order_alone(self):
+        """`_attach_state_slots` promotes every source, most of them anchors."""
+        pool = StateSlotPool(4)
+        drain(pool)
+        for group, h in ((0, 10), (1, 11)):
+            pool.release(group)
+            pool._index(h, group)
+
+        pool.promote(1)
+
+        assert pool.pop() == 0  # still the older of the two
 
     def test_republishing_a_hash_returns_the_orphan_to_the_vacant_half(self):
-        pool = StateGroupPool(4)
+        pool = StateSlotPool(4)
         drain(pool)
         pool.release(0)
         pool._index(10, 0)
@@ -302,25 +374,25 @@ class TestFreeListHalves:
         pool._index(10, 1)  # group 0 no longer backs anything
 
         assert pool.pop() == 0  # vacant again, so it goes before the checkpoint
-        assert pool.lookup_group(10) == 1
+        assert pool.lookup(10) == 1
 
 
 class TestShrinking:
     def test_a_vacant_top_costs_nothing(self):
-        pool = StateGroupPool(4)
+        pool = StateSlotPool(4)
         out = pool.retire_top()
         assert (out.retired, out.relocated_to) == (3, -1)
-        assert pool.num_groups == 3
+        assert pool.num_slots == 3
         assert not pool.is_free(3)
 
     def test_a_live_top_moves_into_the_lowest_vacant_group(self):
-        pool = StateGroupPool(4)
+        pool = StateSlotPool(4)
         drain(pool)
         pool.release(2)  # only group 2 is free; 3 is held by a request
 
         out = pool.retire_top()
         assert (out.retired, out.relocated_to, out.held_checkpoint) == (3, 2, False)
-        assert pool.num_groups == 3
+        assert pool.num_slots == 3
 
     def test_shrinking_spends_the_oldest_checkpoint_not_the_top_one(self):
         """The whole reason `retire_top` relocates instead of just dropping.
@@ -330,7 +402,7 @@ class TestShrinking:
         sit at the top. Retiring by index alone would spend it and leave one
         nothing has touched in minutes.
         """
-        pool = StateGroupPool(4)
+        pool = StateSlotPool(4)
         drain(pool)
         for group, h in ((0, 10), (3, 13)):
             pool.release(group)
@@ -343,39 +415,39 @@ class TestShrinking:
 
         assert out.retired == 3 and out.held_checkpoint
         assert out.relocated_to == 0
-        assert pool.lookup_group(13) == 0  # the hot one survived, at a new address
-        assert pool.lookup_group(10) == -1  # the cold one is what we spent
-        assert pool.num_groups == 3
+        assert pool.lookup(13) == 0  # the hot one survived, at a new address
+        assert pool.lookup(10) == -1  # the cold one is what we spent
+        assert pool.num_slots == 3
 
     def test_the_top_is_spent_when_it_is_itself_the_oldest(self):
-        pool = StateGroupPool(2)
+        pool = StateSlotPool(2)
         drain(pool)
         pool.release(1)
         pool._index(13, 1)
 
         out = pool.retire_top()
         assert (out.retired, out.relocated_to, out.held_checkpoint) == (1, -1, True)
-        assert pool.lookup_group(13) == -1
+        assert pool.lookup(13) == -1
 
     def test_a_pinned_top_is_refused_rather_than_moved(self):
         """It is being read by the in-flight step; the pin drains next pass."""
-        pool = StateGroupPool(4)
+        pool = StateSlotPool(4)
         drain(pool)
         pool.pin(3)
         assert pool.retire_top() is None
-        assert pool.num_groups == 4
+        assert pool.num_slots == 4
 
     def test_a_live_top_with_nowhere_to_go_is_refused(self):
-        pool = StateGroupPool(4)
+        pool = StateSlotPool(4)
         drain(pool)
         assert pool.retire_top() is None
-        assert pool.num_groups == 4
+        assert pool.num_slots == 4
 
     def test_growing_adds_groups_at_the_top(self):
-        pool = StateGroupPool(2)
+        pool = StateSlotPool(2)
         drain(pool)
         pool.extend(2)
-        assert pool.num_groups == 4
+        assert pool.num_slots == 4
         assert [pool.pop() for _ in range(2)] == [2, 3]
 
     def test_the_vacant_heap_does_not_grow_without_bound(self):
@@ -385,28 +457,28 @@ class TestShrinking:
         directly: on a long-lived server the stale entries otherwise outnumber
         the live ones by the number of checkpoints ever taken.
         """
-        pool = StateGroupPool(4)
+        pool = StateSlotPool(4)
         for round_ in range(200):
             group = pool.pop()
             pool.release(group)
             pool._index(round_, group)  # promotes it, stranding a heap entry
             pool.claim(group)
-            pool.group_hash[group] = -1
+            pool.slot_hash[group] = -1
             pool.release(group)
-        assert len(pool._vacant) <= 2 * pool.num_groups + 2
+        assert len(pool._vacant) <= 2 * pool.num_slots + 2
 
     def test_regrowing_a_retired_index_reuses_its_hash_slot(self):
         """Not appending a second one, which would shift every index above it."""
-        pool = StateGroupPool(3)
+        pool = StateSlotPool(3)
         assert pool.retire_top().retired == 2
         pool.extend(1)
 
-        assert pool.num_groups == 3
-        assert len(pool.group_hash) == 3
+        assert pool.num_slots == 3
+        assert len(pool.slot_hash) == 3
         drain(pool)
         pool.release(2)
         pool._index(12, 2)
-        assert pool.lookup_group(12) == 2
+        assert pool.lookup(12) == 2
 
 
 # ── BlockManager: the hit is shrunk to a resumable boundary ────────────────
@@ -449,15 +521,15 @@ class TestHitShrink:
         bm = make_block_manager(ckpt_config())
         first = stateful_seq(list(range(40)))
         h = publish_at_boundary(bm, first)
-        src = bm.state.lookup_group(h)
+        src = bm.state.lookup(h)
         assert src >= 0
 
         second = stateful_seq(list(range(40)))
         bm.allocate(second, bm.can_allocate(second))
         assert second.state_fork_src == src
-        assert second.per_req_cache_group != src
+        assert second.state_slot != src
         # The checkpoint survives the resume, so a third request still finds it.
-        assert bm.state.lookup_group(h) == src
+        assert bm.state.lookup(h) == src
 
 
 # ── Capacity: checkpoints live on the free list, never hold it back ────────
@@ -474,7 +546,7 @@ class TestCapacity:
             bm.deallocate(seq)
         # Some checkpoints survive, older ones were recycled by the FIFO — the
         # point is that neither outcome costs a group.
-        assert bm.state.hash_to_group
+        assert bm.state.hash_to_slot
         # Every group is back, so the pool admits its full concurrency.
         assert bm.state.num_free() == 4
         for i in range(4):
@@ -487,15 +559,15 @@ class TestCapacity:
         bm = make_block_manager(ckpt_config())
         first = stateful_seq(list(range(40)))
         h = publish_at_boundary(bm, first)
-        group = bm.state.lookup_group(h)
+        group = bm.state.lookup(h)
         bm.deallocate(first)
         # Drain the queue until the checkpoint's group comes back around.
         while bm.state.has_free():
             seq = stateful_seq(list(range(900, 920)))
             bm.allocate(seq, 0)
-            if seq.per_req_cache_group == group:
+            if seq.state_slot == group:
                 break
-        assert bm.state.lookup_group(h) == -1
+        assert bm.state.lookup(h) == -1
 
     def test_resume_without_a_spare_group_adopts_the_checkpoint(self):
         # Two groups: the publisher keeps one, so the only free group when the
@@ -504,16 +576,155 @@ class TestCapacity:
         first = stateful_seq(list(range(40)))
         h = publish_at_boundary(bm, first)
         publisher_has_read_its_source(bm)
-        group = bm.state.lookup_group(h)
+        group = bm.state.lookup(h)
         assert bm.state.num_free() == 1
 
         second = stateful_seq(list(range(40)))
         bm.allocate(second, bm.can_allocate(second))
         # No second group to fork into, so the resume spends the checkpoint —
         # still exactly the state it wanted, just no longer shareable.
-        assert second.per_req_cache_group == group
+        assert second.state_slot == group
         assert second.state_fork_src == -1
-        assert bm.state.lookup_group(h) == -1
+        assert bm.state.lookup(h) == -1
+
+
+# ── A request is wide, a checkpoint is one slot ────────────────────────────
+#
+# The asymmetry this whole pool exists to express. Every other test in this
+# file runs at `state_slots_per_req == 1`, where a request and a checkpoint
+# happen to be the same size and nothing can tell the two apart. These run at
+# 3 — `--num-speculative-tokens 2` — which is the config the change was made
+# for: there, a checkpoint that took a request's width would waste two thirds
+# of its bytes, and those bytes come out of the same budget as the KV cache.
+
+
+def spec_config(slots, **overrides):
+    """`slots` raw slots, three of which one live request takes."""
+    return ckpt_config(
+        pool_entries={"state": slots},
+        pool_entries_per_req={"state": 3},
+        **overrides,
+    )
+
+
+class TestPerNeedWidth:
+
+    def test_a_live_request_takes_its_whole_width(self):
+        bm = make_block_manager(spec_config(9))
+        seq = stateful_seq(list(range(40)))
+        bm.allocate(seq, bm.can_allocate(seq))
+        assert len(seq.state_slots) == 3
+        assert len(set(seq.state_slots)) == 3  # no slot handed out twice
+        assert bm.state.num_free() == 6
+
+    def test_a_checkpoint_takes_one(self):
+        """The point of the change: 3 slots per request, 1 per checkpoint.
+
+        The publisher hands its committed slot to the index and takes a fresh
+        one, so it still holds 3 afterwards — and the checkpoint beside it is
+        one slot, not another 3. At `spr == 3` the old sizing spent 9 slots to
+        end up here; this spends 4.
+        """
+        bm = make_block_manager(spec_config(9))
+        seq = stateful_seq(list(range(40)))
+        h = publish_at_boundary(bm, seq)
+        assert bm.state.lookup(h) >= 0
+        assert len(seq.state_slots) == 3
+        # 9 - 3 held by the seq - 1 pinned checkpoint.
+        assert bm.state.num_free() == 5
+
+    def test_admission_gates_on_the_full_width(self):
+        """Not on one slot: a request admitted on 1 would find no scratch."""
+        bm = make_block_manager(spec_config(4))
+        first = stateful_seq(list(range(40)))
+        assert bm.can_allocate(first) >= 0
+        bm.allocate(first, 0)
+        assert bm.state.num_free() == 1  # non-zero, but short of a width
+
+        second = stateful_seq(list(range(900, 940)))
+        assert bm.can_allocate(second) == -1
+
+    def test_a_resume_settles_at_what_a_cold_start_costs(self):
+        """Three slots in steady state, four while the fork is in flight.
+
+        The fourth is the checkpoint itself: the resumer's first forward reads
+        it, so it is pinned off the free list until that forward is out, and
+        then it goes back — still indexed, so the next resumer hits it too.
+        That transient is the whole difference between resuming and starting
+        cold, and it lasts two passes rather than the request's lifetime.
+        """
+        bm = make_block_manager(spec_config(12))
+        first = stateful_seq(list(range(40)))
+        h = publish_at_boundary(bm, first)
+        publisher_has_read_its_source(bm)
+        bm.deallocate(first)
+        free_before = bm.state.num_free()
+
+        second = stateful_seq(list(range(40)))
+        bm.allocate(second, bm.can_allocate(second))
+        assert second.state_fork_src == bm.state.lookup(h)
+        assert len(second.state_slots) == 3
+        assert free_before - bm.state.num_free() == 4  # its own 3, plus the source
+
+        publisher_has_read_its_source(bm)
+        assert free_before - bm.state.num_free() == 3
+        assert bm.state.lookup(h) == second.state_fork_src  # survives to be hit again
+
+    def test_adopting_a_checkpoint_still_yields_a_full_width(self):
+        """The narrow path: too few slots to fork into, so the checkpoint is
+        taken over as the committed slot and the scratch comes from the rest.
+
+        The seq must still end up 3 wide. Adopting changes where its committed
+        state lives, not how much speculation room it has.
+        """
+        # 6 slots: the publisher holds 3 and its checkpoint is 1, leaving 2 —
+        # one short of a width, which is exactly the adopt case.
+        bm = make_block_manager(spec_config(6))
+        first = stateful_seq(list(range(40)))
+        h = publish_at_boundary(bm, first)
+        publisher_has_read_its_source(bm)
+        checkpoint = bm.state.lookup(h)
+        assert bm.state.num_free() == 3  # 2 vacant + the checkpoint
+
+        second = stateful_seq(list(range(40)))
+        bm.allocate(second, bm.can_allocate(second))
+        assert second.state_slot == checkpoint
+        assert second.state_fork_src == -1
+        assert len(second.state_slots) == 3
+        assert len(set(second.state_slots)) == 3
+        assert bm.state.lookup(h) == -1
+
+    def test_deallocate_returns_every_slot(self):
+        """Including the scratch. Releasing only the committed one would leak
+        `num_spec` slots per request and starve the pool within a few hundred.
+        """
+        bm = make_block_manager(spec_config(9))
+        seq = stateful_seq(list(range(40)))
+        bm.allocate(seq, bm.can_allocate(seq))
+        bm.deallocate(seq)
+        assert bm.state.num_free() == 9
+        assert seq.state_slots == []
+
+    def test_a_fork_moves_only_the_committed_slot(self):
+        """The scratch persists across forwards — step N's accepted slot is
+        step N+1's initial state — so it belongs to the request, not to
+        whichever slot it currently commits into.
+        """
+        bm = make_block_manager(spec_config(9))
+        seq = stateful_seq(list(range(40)))
+        bm.allocate(seq, bm.can_allocate(seq))
+        scratch = list(seq.state_slots[1:])
+        committed = seq.state_slot
+
+        # Forward exactly to the boundary: publishing is what forks.
+        bm.hash_blocks(seq, bm.checkpoint_limit(seq) - seq.num_cached_tokens)
+
+        assert bm.state.lookup(boundary_hash(bm, seq)) == committed
+        assert seq.state_fork_src == committed
+        assert seq.state_slot != committed  # took a fresh one
+        assert seq.state_slots[1:] == scratch  # left its scratch alone
+        assert len(seq.state_slots) == 3
+        assert len(set(seq.state_slots)) == 3
 
 
 # ── Fork lifecycle ─────────────────────────────────────────────────────────
@@ -526,21 +737,21 @@ class TestForkLifecycle:
         seq = stateful_seq(list(range(40)))
         hit = bm.can_allocate(seq)
         bm.allocate(seq, hit)
-        before = seq.per_req_cache_group
+        before = seq.state_slot
         boundary = bm.checkpoint_limit(seq)
         bm.hash_blocks(seq, boundary - seq.num_cached_tokens)
-        assert seq.per_req_cache_group != before
+        assert seq.state_slot != before
         assert seq.state_fork_src == before
-        assert bm.state.lookup_group(boundary_hash(bm, seq)) == before
+        assert bm.state.lookup(boundary_hash(bm, seq)) == before
 
     def test_no_publish_when_the_forward_misses_the_boundary(self):
         bm = make_block_manager(ckpt_config())
         seq = stateful_seq(list(range(40)))
         bm.allocate(seq, bm.can_allocate(seq))
-        group = seq.per_req_cache_group
+        group = seq.state_slot
         bm.hash_blocks(seq, bm.checkpoint_limit(seq) + BLOCK)
-        assert seq.per_req_cache_group == group
-        assert not bm.state.hash_to_group
+        assert seq.state_slot == group
+        assert not bm.state.hash_to_slot
 
     def test_boundary_leaves_room_for_the_fork_forward(self):
         bm = make_block_manager(ckpt_config())
@@ -574,8 +785,8 @@ class TestForkLifecycle:
             seq.num_cached_tokens += 2 * BLOCK
         # Four publishes into four groups: the oldest was recycled to serve the
         # last one, the rest stand as distinct resume points.
-        assert len(bm.state.hash_to_group) == 3
-        assert bm.state.lookup_group(boundary_hash(bm, seq)) >= 0
+        assert len(bm.state.hash_to_slot) == 3
+        assert bm.state.lookup(boundary_hash(bm, seq)) >= 0  # the rightmost one
 
     def test_interval_thins_the_ladder(self):
         bm = make_block_manager(ckpt_config(state_checkpoint_interval_tokens=3 * BLOCK))
@@ -608,7 +819,7 @@ class TestForkLifecycle:
         seq = stateful_seq(list(range(30)))  # 30 < 8 * BLOCK
         assert bm.checkpoint_limit(seq) == 0
         run_prompt(bm, seq)
-        assert not bm.state.hash_to_group
+        assert not bm.state.hash_to_slot
         assert seq.state_fork_src == -1
 
     def test_interval_snaps_onto_the_hash_block_grid(self):
@@ -640,7 +851,7 @@ class TestForkLifecycle:
         seq = stateful_seq(list(range(40)))
         published = [2, 5]  # checkpoint boundaries, in blocks
 
-        bm.state.hash_to_group = {}
+        bm.state.hash_to_slot = {}
         hashes = [1000 + i for i in range(9)]
         for group, boundary in enumerate(published):
             bm.state._index(hashes[boundary - 1], group)
@@ -667,7 +878,7 @@ class TestForkLifecycle:
         bm = make_block_manager(ckpt_config())
         seq = stateful_seq(list(range(40)))
         bm.allocate(seq, bm.can_allocate(seq))
-        source = seq.per_req_cache_group
+        source = seq.state_slot
         free_before_publish = bm.state.num_free()
         bm.hash_blocks(seq, bm.checkpoint_limit(seq) - seq.num_cached_tokens)
         # Publishing costs a group until the forward that reads the source has
@@ -675,9 +886,9 @@ class TestForkLifecycle:
         assert bm.state.num_free() == free_before_publish - 1
 
         bm.cancel_state_fork(seq)
-        assert seq.per_req_cache_group == source
+        assert seq.state_slot == source
         assert seq.state_fork_src == -1
-        assert not bm.state.hash_to_group
+        assert not bm.state.hash_to_slot
         # Cancelling gives back exactly what publishing took.
         assert bm.state.num_free() == free_before_publish
 
@@ -687,7 +898,7 @@ class TestForkLifecycle:
         # group the first one already took off the free list.
         bm = make_block_manager(ckpt_config(pool_entries={"state": 8}))
         first = stateful_seq(list(range(40)))
-        src = bm.state.lookup_group(publish_at_boundary(bm, first))
+        src = bm.state.lookup(publish_at_boundary(bm, first))
         publisher_has_read_its_source(bm)
 
         resumers = [stateful_seq(list(range(40))) for _ in range(3)]
@@ -697,7 +908,7 @@ class TestForkLifecycle:
         assert bm.state.pin_count(src) == len(resumers)
         assert all(s.state_fork_src == src for s in resumers)
         # Distinct write groups, none of them the shared source.
-        groups = {s.per_req_cache_group for s in resumers}
+        groups = {s.state_slot for s in resumers}
         assert len(groups) == len(resumers)
         assert src not in groups
         # However many read it, the group goes back exactly once.
@@ -708,7 +919,7 @@ class TestForkLifecycle:
     def test_cancel_refuses_to_adopt_a_shared_source(self):
         bm = make_block_manager(ckpt_config())
         first = stateful_seq(list(range(40)))
-        src = bm.state.lookup_group(publish_at_boundary(bm, first))
+        src = bm.state.lookup(publish_at_boundary(bm, first))
         publisher_has_read_its_source(bm)
 
         sharers = [stateful_seq(list(range(40))) for _ in range(2)]
@@ -722,19 +933,19 @@ class TestForkLifecycle:
         # Once only one reader is left, adopting is legal again.
         bm.state.unpin(src)
         assert bm.cancel_state_fork(sharers[1]) is True
-        assert sharers[1].per_req_cache_group == src
+        assert sharers[1].state_slot == src
 
     def test_cancel_of_a_resume_releases_the_pin(self):
         bm = make_block_manager(ckpt_config())
         first = stateful_seq(list(range(40)))
-        src = bm.state.lookup_group(publish_at_boundary(bm, first))
+        src = bm.state.lookup(publish_at_boundary(bm, first))
         publisher_has_read_its_source(bm)
 
         second = stateful_seq(list(range(40)))
         bm.allocate(second, bm.can_allocate(second))
         assert bm.state.is_pinned(src)
         bm.cancel_state_fork(second)
-        assert second.per_req_cache_group == src
+        assert second.state_slot == src
         assert not bm.state.is_pinned(src)
         # The pin must not also hand the group back — it has an owner now.
         bm.complete_previous_state_batch()
@@ -743,7 +954,7 @@ class TestForkLifecycle:
     def test_pinned_source_returns_to_the_free_list_next_step(self):
         bm = make_block_manager(ckpt_config())
         first = stateful_seq(list(range(40)))
-        src = bm.state.lookup_group(publish_at_boundary(bm, first))
+        src = bm.state.lookup(publish_at_boundary(bm, first))
         publisher_has_read_its_source(bm)
         second = stateful_seq(list(range(40)))
         bm.allocate(second, bm.can_allocate(second))
@@ -762,7 +973,7 @@ class TestForkLifecycle:
         """
         bm = make_block_manager(ckpt_config())
         first = stateful_seq(list(range(40)))
-        src = bm.state.lookup_group(publish_at_boundary(bm, first))
+        src = bm.state.lookup(publish_at_boundary(bm, first))
         assert first.state_fork_src == src
 
         assert not bm.state.is_free(src)  # the pass that admits cannot get it
@@ -772,7 +983,7 @@ class TestForkLifecycle:
         assert bm.state.is_free(src)
         # And it comes back as a checkpoint, at the LRU tail — publishing is
         # not what spends it.
-        assert bm.state.lookup_group(bm.state.group_hash[src]) == src
+        assert bm.state.lookup(bm.state.slot_hash[src]) == src
 
     def test_a_finished_publisher_gives_its_source_back_at_once(self):
         """Nobody is left to read it, so the clock should not hold it.
@@ -784,7 +995,7 @@ class TestForkLifecycle:
         first = stateful_seq(list(range(40)))
         whole = bm.state.num_free()  # nothing handed out yet
         h = publish_at_boundary(bm, first)
-        src = bm.state.lookup_group(h)
+        src = bm.state.lookup(h)
         assert not bm.state.is_free(src)
 
         bm.deallocate(first)
@@ -792,7 +1003,7 @@ class TestForkLifecycle:
         # Source and write group both back: the pool is whole again, without
         # waiting out the two passes the clock would have taken.
         assert bm.state.num_free() == whole
-        assert bm.state.lookup_group(h) == src
+        assert bm.state.lookup(h) == src
 
 
 class TestCheckpointsDieWithTheirPrefix:
@@ -810,17 +1021,17 @@ class TestCheckpointsDieWithTheirPrefix:
         first = stateful_seq(list(range(40)))
         h = publish_at_boundary(bm, first)
         publisher_has_read_its_source(bm)
-        src = bm.state.lookup_group(h)
+        src = bm.state.lookup(h)
         assert bm.state.holds_checkpoint(src)
 
         bm._record_evicted(h)
-        assert bm.state.lookup_group(h) == -1
+        assert bm.state.lookup(h) == -1
         assert bm.state.is_free(src)
         assert not bm.state.holds_checkpoint(src)  # vacant, spent before live ones
         assert bm.state.checkpoint_fates()["checkpoints_orphaned"] == 1
 
     def test_an_orphan_is_spent_before_a_live_checkpoint(self):
-        pool = StateGroupPool(4)
+        pool = StateSlotPool(4)
         while pool.has_free():
             pool.pop()
         for group, h in ((0, 10), (1, 11)):
@@ -829,14 +1040,41 @@ class TestCheckpointsDieWithTheirPrefix:
 
         pool.unindex(10)  # group 0's prefix is gone
         assert pool.pop() == 0
-        assert pool.lookup_group(11) == 1
+        assert pool.lookup(11) == 1
 
     def test_unindex_of_an_unknown_hash_is_a_no_op(self):
-        pool = StateGroupPool(4)
+        pool = StateSlotPool(4)
         pool._index(10, 0)
         pool.unindex(999)
-        assert pool.lookup_group(10) == 0
+        assert pool.lookup(10) == 0
         assert pool.checkpoint_fates()["checkpoints_orphaned"] == 0
+
+    def test_a_thrashing_pool_reports_no_drops_at_all(self):
+        """`checkpoints_dropped` is not the capacity signal it looks like.
+
+        Take four times as many checkpoints as the pool can hold, each one
+        returned to the free list the way a finished request returns its
+        group. `pop` never refuses — it spends the LRU checkpoint — so this
+        pool overwrites rather than turning anything away, and `dropped`
+        stays 0 through the whole thrash.
+
+        Read `checkpoints_evicted` against `kept - num_slots` instead. On
+        hardware that identity held exactly (kept 198, evicted 166, 32 groups)
+        at the moment the state hit rate fell 6 points, while the 0 in
+        `dropped` was read as proof the pool had room to spare.
+        """
+        pool = StateSlotPool(4)
+        for h in range(16):
+            group = pool.pop()
+            pool.release(group)
+            pool._index(h, group)
+
+        fates = pool.checkpoint_fates()
+        assert fates["checkpoints_dropped"] == 0
+        assert pool.num_free() == 4  # never once out of groups to hand out
+        # 16 taken, 4 resident: every other one was destroyed for space.
+        assert fates["checkpoints_evicted"] == 16 - 4
+        assert sum(1 for h in range(16) if pool.lookup(h) != -1) == 4
 
 
 # ── The scheduler side: what a checkpoint costs the publisher ──────────────
@@ -946,7 +1184,7 @@ class TestPagedCopyCheckpoint:
         checkpoints.store.complete_inflight()
         assert checkpoints.begin_restore(33, dst_slot=2)
         publisher = stateful_seq(list(range(BLOCK)))
-        publisher.per_req_cache_group = 1
+        publisher.state_slot = 1
         checkpoints.checkpoint(publisher, boundary_blocks=1, h=13)
         scheduler.block_manager.state.record_relocation(3, 4)
         scheduler.add(stateful_seq(list(range(BLOCK))))
@@ -1038,7 +1276,7 @@ class TestPagedCopyCheckpoint:
         assert len(transfers.checkpoint_restores) == 1
         restore = transfers.checkpoint_restores[0]
         assert restore.unit_ids == store.unit_ids
-        assert restore.dst_slot == second.per_req_cache_group
+        assert restore.dst_slot == second.state_slot
         assert second.state_fork_src == -1
         # The checkpoint stays canonical and shareable. Its fragments were not
         # adopted as the request's kernel-visible slot.
@@ -1057,7 +1295,7 @@ class TestPagedCopyCheckpoint:
 
         second = stateful_seq(list(range(48)))
         bm.allocate(second, bm.can_allocate(second))
-        dst = second.per_req_cache_group
+        dst = second.state_slot
         checkpoint_id = bm.paged_state_checkpoints.store.lookup(h)
         assert bm.paged_state_checkpoints.store.records[checkpoint_id].pin_count == 1
 
@@ -1069,7 +1307,7 @@ class TestPagedCopyCheckpoint:
 
         third = stateful_seq(list(range(100, 140)))
         bm.allocate(third, bm.can_allocate(third))
-        assert third.per_req_cache_group == dst
+        assert third.state_slot == dst
         assert bm.take_state_maintenance_ops().checkpoint_restores == ()
 
     def test_missing_gated_checkpoint_releases_the_new_slot_and_raises(self):
@@ -1087,10 +1325,105 @@ class TestPagedCopyCheckpoint:
 
         second = stateful_seq(list(range(48)))
         with pytest.raises(RuntimeError, match="disappeared"):
-            bm._attach_state_group(second, h)
+            bm._attach_state_slots(second, h)
 
-        assert second.per_req_cache_group == -1
+        assert second.state_slot == -1
         assert bm.state.num_free() == free_slots
+
+    def test_a_midstep_coordinator_keeps_every_boundary_of_one_prompt(self):
+        """Two positions in one forward become two independently findable records.
+
+        The case that was structurally impossible before: the coordinator filed
+        one pending entry per *sequence*, so a prompt reaching a grid rung and
+        its prompt-end anchor in the same forward kept only whichever arrived
+        last. That is what made `keeps_interior_boundaries` False, which in turn
+        disqualified the anchor — the highest-value placement in the system.
+        """
+        bm = make_block_manager(
+            paged_copy_config(),
+            state_runtime=PAGED_MIDSTEP_RUNTIME,
+        )
+        seq = self._admitted(bm)
+        checkpoints = bm.paged_state_checkpoints
+
+        reservations = checkpoints.reserve_midstep(seq, [(16, 101), (32, 202)])
+        assert len(reservations) == 2
+        # Distinct staging slots: each holds its own position's bytes, which is
+        # exactly why both can survive where two live-slot entries cannot.
+        assert reservations[0][0] != reservations[1][0]
+        assert reservations[0][0] != seq.state_slot
+
+        checkpoints.publish_midstep(reservations, seq)
+        ops = bm.take_state_maintenance_ops()
+
+        assert len(ops.checkpoint_stores) == 2
+        bm.complete_previous_state_batch()
+        assert checkpoints.store.contains(101)
+        assert checkpoints.store.contains(202)
+
+    def test_a_midstep_coordinator_answers_both_capabilities(self):
+        bm = make_block_manager(
+            paged_copy_config(),
+            state_runtime=PAGED_MIDSTEP_RUNTIME,
+        )
+        checkpoints = bm.paged_state_checkpoints
+        assert checkpoints.readable_midstep is True
+        # The anchor gate reads this one, and it is what the multi-boundary
+        # `_pending` earns: see `BlockManager._record_checkpoint_end`.
+        assert checkpoints.keeps_interior_boundaries is True
+        # A copy still binds no successor, whichever way it is read.
+        assert checkpoints.successor_room == 0.0
+
+    def test_a_non_midstep_coordinator_still_declines_both(self):
+        bm = make_block_manager(
+            paged_copy_config(),
+            state_runtime=PAGED_COPY_RUNTIME,
+        )
+        checkpoints = bm.paged_state_checkpoints
+        assert checkpoints.readable_midstep is False
+        assert checkpoints.keeps_interior_boundaries is False
+        assert checkpoints.reserve_midstep(self._admitted(bm), [(16, 101)]) == []
+
+    def test_staging_slots_outlive_the_drain_that_queued_their_scatter(self):
+        """A staging slot is not free until the scatter reading it has ridden a batch.
+
+        Handing it back at drain time would put it on the free list during the
+        pass that admits the requests which could pop it, so one kernel would
+        read and write it at once — the same two-pass hazard the fork pool
+        documents when it holds a checkpoint slot across a fork.
+        """
+        bm = make_block_manager(
+            paged_copy_config(),
+            state_runtime=PAGED_MIDSTEP_RUNTIME,
+        )
+        seq = self._admitted(bm)
+        checkpoints = bm.paged_state_checkpoints
+
+        reservations = checkpoints.reserve_midstep(seq, [(16, 101)])
+        staged_slot = reservations[0][0]
+        checkpoints.publish_midstep(reservations, seq)
+        bm.take_state_maintenance_ops()
+
+        assert not bm.state.is_free(staged_slot)
+        bm.complete_previous_state_batch()
+        assert bm.state.is_free(staged_slot)
+
+    def test_cancelled_midstep_returns_its_slots_unindexed(self):
+        bm = make_block_manager(
+            paged_copy_config(),
+            state_runtime=PAGED_MIDSTEP_RUNTIME,
+        )
+        seq = self._admitted(bm)
+        checkpoints = bm.paged_state_checkpoints
+        free_before = bm.state.num_free()
+
+        reservations = checkpoints.reserve_midstep(seq, [(16, 101), (32, 202)])
+        checkpoints.cancel_midstep(reservations)
+
+        assert bm.state.num_free() == free_before
+        # The bytes were never written, so nothing may be findable.
+        assert not checkpoints.store.contains(101)
+        assert not checkpoints.store.contains(202)
 
     def test_copy_transfer_can_checkpoint_a_speculative_decode_boundary(self):
         spec = SimpleNamespace(num_speculative_tokens=3, use_dspark=lambda: False)
@@ -1136,7 +1469,7 @@ class TestDecodePointPublishing:
         """A prompt that ends between rungs, so prefill publishes nothing."""
         seq = stateful_seq(list(range(10)))
         run_prompt(bm, seq)
-        assert not bm.state.hash_to_group
+        assert not bm.state.hash_to_slot
         return seq
 
     def test_a_rung_past_the_prompt_publishes(self):
@@ -1145,12 +1478,12 @@ class TestDecodePointPublishing:
             state_runtime=StateRuntime(transfer=StateTransfer.fork(1)),
         )
         seq = self._prompt_of_10(bm)
-        group = seq.per_req_cache_group
+        group = seq.state_slot
 
         self._generate_to(bm, seq, 3 * BLOCK)
-        assert seq.per_req_cache_group != group
+        assert seq.state_slot != group
         assert seq.state_fork_src == group
-        assert bm.state.lookup_group(bm.kv.block(seq.block_table[2]).hash) == group
+        assert bm.state.lookup(bm.kv.block(seq.block_table[2]).hash) == group
 
     def test_a_backend_needing_a_long_fork_never_publishes_mid_generation(self):
         """Self-gating: no `min_fork` special case, the number decides.
@@ -1160,11 +1493,11 @@ class TestDecodePointPublishing:
         """
         bm = make_block_manager(ckpt_config())  # DEFAULT_STATE_TRANSFER needs MIN_FORK.
         seq = self._prompt_of_10(bm)
-        group = seq.per_req_cache_group
+        group = seq.state_slot
 
         self._generate_to(bm, seq, 4 * BLOCK)
-        assert seq.per_req_cache_group == group
-        assert not bm.state.hash_to_group
+        assert seq.state_slot == group
+        assert not bm.state.hash_to_slot
 
     def test_no_publish_on_the_step_that_finishes_the_request(self):
         """Nothing will fork from it, and the fresh group would go straight back."""
@@ -1173,11 +1506,11 @@ class TestDecodePointPublishing:
             state_runtime=StateRuntime(transfer=StateTransfer.fork(1)),
         )
         seq = self._prompt_of_10(bm)
-        group = seq.per_req_cache_group
+        group = seq.state_slot
 
         self._generate_to(bm, seq, 3 * BLOCK, room=0)
-        assert seq.per_req_cache_group == group
-        assert not bm.state.hash_to_group
+        assert seq.state_slot == group
+        assert not bm.state.hash_to_slot
 
     def test_blocks_are_still_hashed_where_no_checkpoint_is_taken(self):
         """Prefix caching and state checkpoints are separate gates."""
@@ -1201,7 +1534,7 @@ class TestDecodePointPublishing:
         # left a checkpoint.
         assert bm.can_allocate(followup) == 3
         bm.allocate(followup, 3)
-        assert followup.state_fork_src == bm.state.lookup_group(
+        assert followup.state_fork_src == bm.state.lookup(
             bm.kv.block(seq.block_table[2]).hash
         )
 
@@ -1277,11 +1610,11 @@ class TestDecodePublishGate:
             batch, _ = sched.schedule()
             forks.extend(s for s in batch.state_fork_srcs if s >= 0)
 
-        published = bm.state.lookup_group(bm.kv.block(seq.block_table[1]).hash)
+        published = bm.state.lookup(bm.kv.block(seq.block_table[1]).hash)
         assert published >= 0
         # The seq moved off the group it gave away, and the forward right after
         # the publish was told to read it.
-        assert seq.per_req_cache_group != published
+        assert seq.state_slot != published
         assert forks == [published]
 
 
@@ -1304,9 +1637,12 @@ class TestDecodePublishGate:
 class StubStateCache:
     """Minimal `StateCache`: a fixed room and a hit it can be told to cap."""
 
-    def __init__(self, successor_room=inf, cap=None, enabled=True):
+    def __init__(
+        self, successor_room=inf, cap=None, enabled=True, readable_midstep=False
+    ):
         self.successor_room = successor_room
         self.enabled = enabled
+        self.readable_midstep = readable_midstep
         self._cap = cap
 
     def applies(self, seq):
@@ -1318,12 +1654,21 @@ class StubStateCache:
     def checkpoint(self, seq, boundary_blocks, h):
         pass
 
+    def reserve_midstep(self, seq, positions):
+        return []
+
+    def publish_midstep(self, reservations, seq=None):
+        pass
+
+    def cancel_midstep(self, reservations):
+        pass
+
 
 def second_class(**overrides):
     """A second state class for the protocol tests.
 
     A stub rather than a real one: multi-class behaviour is a property of the
-    ladder, not of whichever class happens to exist beside `StateGroupPool`,
+    ladder, not of whichever class happens to exist beside `StateSlotPool`,
     and testing it through a real one made these tests hostage to that class's
     lifetime — which is how they broke when the sliding window stopped being a
     pool of its own.
@@ -1335,11 +1680,11 @@ class TestStateCacheProtocol:
 
     def test_copy_transfer_has_no_slot_backed_fallback(self):
         with pytest.raises(ValueError, match="do not belong"):
-            StateGroupPool(4, StateTransfer.copy("test-layout"))
+            StateSlotPool(4, StateTransfer.copy("test-layout"))
 
     def test_both_classes_satisfy_the_protocol(self):
         assert isinstance(second_class(), StateCache)
-        assert isinstance(StateGroupPool(4), StateCache)
+        assert isinstance(StateSlotPool(4), StateCache)
 
     def test_a_class_that_keeps_nothing_reports_inf(self):
         """`inf` is what stops the ladder cutting chunks for a class in vain.
@@ -1350,7 +1695,7 @@ class TestStateCacheProtocol:
         nothing there — cost with no reuse.
         """
         assert isinf(second_class().successor_room)
-        assert isinf(StateGroupPool(4, StateTransfer.none()).successor_room)
+        assert isinf(StateSlotPool(4, StateTransfer.none()).successor_room)
 
     def test_the_limit_follows_the_class_that_reaches_furthest(self):
         """The smallest room reaches furthest right; a larger one must not cap it."""
@@ -1367,13 +1712,13 @@ class TestStateCacheProtocol:
         could not separate "no state at all" from "no successor needed" — which
         are opposite ends of the room scale.
         """
-        assert isinf(StateGroupPool(4, StateTransfer.none()).successor_room)
+        assert isinf(StateSlotPool(4, StateTransfer.none()).successor_room)
         assert StateTransfer.copy("test-layout").successor_room == 0
-        assert StateGroupPool(4, StateTransfer.fork(7)).successor_room == 7
+        assert StateSlotPool(4, StateTransfer.fork(7)).successor_room == 7
 
     def test_a_copy_never_asks_the_resumer_for_room(self):
         """`resumable_hit`'s fork test is vacuous under `copy`, not skipped."""
-        forking = StateGroupPool(4, StateTransfer.fork(4), hash_block_size=1)
+        forking = StateSlotPool(4, StateTransfer.fork(4), hash_block_size=1)
         copying = PagedStateCheckpointCoordinator(
             BlockPool(4),
             PagedStateCheckpointSpec(1, 1, "test-layout", image_bytes=1),
@@ -1449,6 +1794,21 @@ class TestGatedHitFixpoint:
 
 INTERVAL = 4 * BLOCK
 PROMPT = list(range(44))  # 11 blocks; last never reused, so 10 are hittable
+# A prompt that diverges from `PROMPT` at token 28, mid-interval and nowhere
+# near either prompt's end. This is the traffic the demand is for now that the
+# prompt-end anchor exists: on a conversation that just grows, the position the
+# next turn resumes at *is* the previous turn's end, and the anchor reserves it
+# up front rather than one disappointed request late. What the anchor cannot
+# reserve is a branch point, because no prompt ever ended there.
+BRANCH = list(range(28)) + list(range(900, 916))
+# `PROMPT` resent with a further turn appended. This is the shape a demand
+# needs now that the anchor exists: the anchor reserves the previous prompt's
+# end, so a continuation resumes there (10 blocks) and still wants the block
+# past it — the "resumed from a checkpoint AND wants a further one" state the
+# two gates have to be observed meeting in. An identical re-send no longer
+# produces it: the anchor covers every hittable block, so the hit is complete
+# and there is no gap left for a demand to name.
+CONTINUATION = PROMPT + list(range(900, 916))
 
 # An image that costs more units than a request's blocks do. That is the shape
 # where the ladder's question and admission's question can disagree: the pool
@@ -1495,36 +1855,93 @@ class TestDemandDrivenCheckpoints:
     answers is reuse being declined only for want of a checkpoint. The request
     that finds the gap is the one that pays for it — it collects none of that
     reuse and has to compute the prefix anyway.
+
+    Scoped to branch points since the prompt-end anchor landed. A conversation
+    that only grows resumes at the previous turn's end, and the anchor reserves
+    that proactively — see `TestPromptEndAnchor`, which inherited the cases
+    these tests used to make. What no anchor can reserve is a position no prompt
+    ever ended at, and that is what these now use.
     """
 
     def test_the_gap_becomes_a_rung_off_the_grid(self):
         bm = make_block_manager(demand_config())
         run_prompt_on_the_ladder(bm, stateful_seq(PROMPT))
 
-        second = stateful_seq(PROMPT)
-        assert bm.can_allocate(second) == 8  # the grid's last rung, 32 tokens
-        assert second.num_wanted_hit_blocks == 9  # what a checkpoint would give
-        assert second.checkpoint_demand_pos == 36
-        # Off the grid, and to the right of the last rung the grid offers: the
-        # demand carries its own fork room, so `limit` does not cap it.
-        assert 36 % INTERVAL
+        second = stateful_seq(BRANCH)
+        assert bm.can_allocate(second) == 0  # nothing resumable at the branch
+        assert second.num_wanted_hit_blocks == 7  # what a checkpoint would give
+        assert second.checkpoint_demand_pos == 28
+        # Off the grid: the demand carries its own fork room, so it sits where
+        # the request asked rather than where the interval would have put it.
+        assert 28 % INTERVAL
         assert bm.checkpoint_limit(second) == 32
+
+    def test_the_rung_can_be_switched_off_without_the_grid(self):
+        """`--no-state-checkpoint-demand` drops the rung, nothing else.
+
+        The refusal is still measured — `num_wanted_hit_blocks` is what
+        `CacheStats` splits declined reuse by, and turning the placement off
+        must not blind that. What goes is only the placement, leaving the grid
+        and this prompt's own anchor to carry the checkpoints.
+        """
+        bm = make_block_manager(demand_config(state_checkpoint_demand=False))
+        run_prompt_on_the_ladder(bm, stateful_seq(PROMPT))
+
+        second = stateful_seq(BRANCH)
+        bm.allocate(second, bm.can_allocate(second))
+        assert second.num_cached_tokens == 0
+        assert second.num_wanted_hit_blocks == 7  # still measured...
+        assert second.checkpoint_demand_pos == 0  # ...but no longer placed
+        assert bm.demands_recorded == 0
+        # 28 is the demand's rung and it is gone; the grid and anchor remain.
+        assert forward_on_the_ladder(bm, second) == [32, 36]
+
+    def test_the_env_var_overrides_the_flag_in_both_directions(self, monkeypatch):
+        """`ATOM_STATE_CHECKPOINT_DEMAND` beats the config field.
+
+        Both directions are pinned because the override is asymmetric in
+        practice: =0 turns the rung off for one run without editing a launch
+        script, and =1 has to be able to turn it back on over a script that
+        already passes --no-state-checkpoint-demand. An unset variable must
+        change nothing, or merely having it exported on the box would pin the
+        policy for every server running there.
+        """
+        # =0 beats a config that asks for the rung.
+        monkeypatch.setenv("ATOM_STATE_CHECKPOINT_DEMAND", "0")
+        bm = make_block_manager(demand_config(state_checkpoint_demand=True))
+        assert bm.state_checkpoint_demand is False
+
+        # =1 beats a config that refuses it.
+        monkeypatch.setenv("ATOM_STATE_CHECKPOINT_DEMAND", "1")
+        bm = make_block_manager(demand_config(state_checkpoint_demand=False))
+        assert bm.state_checkpoint_demand is True
+
+        # Exported-but-empty is not "set" — the flag still decides.
+        monkeypatch.setenv("ATOM_STATE_CHECKPOINT_DEMAND", "")
+        bm = make_block_manager(demand_config(state_checkpoint_demand=False))
+        assert bm.state_checkpoint_demand is False
+
+        monkeypatch.delenv("ATOM_STATE_CHECKPOINT_DEMAND")
+        bm = make_block_manager(demand_config(state_checkpoint_demand=True))
+        assert bm.state_checkpoint_demand is True
 
     def test_the_third_request_finds_what_the_second_was_missing(self):
         """Self-limiting: nothing to want, want it once, want nothing again."""
         bm = make_block_manager(demand_config())
 
         first = stateful_seq(PROMPT)
-        assert run_prompt_on_the_ladder(bm, first) == [32]  # the grid alone
+        # 32 is the grid's last rung; 36 is `first`'s own end, anchored.
+        assert run_prompt_on_the_ladder(bm, first) == [32, 36]
         assert first.checkpoint_demand_pos == 0  # nothing was cached to fall short
 
-        second = stateful_seq(PROMPT)
+        second = stateful_seq(BRANCH)
         bm.allocate(second, bm.can_allocate(second))
-        assert second.num_cached_tokens == 32  # the grid got it this far...
-        assert second.checkpoint_demand_pos == 36  # ...one block short of the rest
-        assert forward_on_the_ladder(bm, second) == [36]  # one cut, for the gap
+        assert second.num_cached_tokens == 0  # the branch point is unreachable...
+        assert second.checkpoint_demand_pos == 28  # ...and this is where it is
+        # The demand at 28, then the grid rung and this prompt's own anchor.
+        assert forward_on_the_ladder(bm, second) == [28, 32, 36]
 
-        third = stateful_seq(PROMPT)
+        third = stateful_seq(BRANCH)
         bm.allocate(third, bm.can_allocate(third))
         assert third.num_cached_tokens == 36
         assert third.checkpoint_demand_pos == 0  # nothing left to want
@@ -1547,12 +1964,12 @@ class TestDemandDrivenCheckpoints:
         # Live KV takes the pool down to where an image no longer fits but the
         # resumer's own blocks still do -- the state under real pressure, where
         # admission goes through and only the store cannot.
-        spare = -(-len(PROMPT) // BLOCK) + 1
+        spare = -(-len(CONTINUATION) // BLOCK) + 1
         assert spare < checkpoints.store.units_per_checkpoint
         bm.kv.reserve_units(bm.kv.num_free - spare, ("live-kv", 0))
         assert not an_image_fits_on_its_own(checkpoints)
 
-        second = stateful_seq(PROMPT)
+        second = stateful_seq(CONTINUATION)
         hit = bm.can_allocate(second)
         bm.allocate(second, hit)
 
@@ -1564,7 +1981,11 @@ class TestDemandDrivenCheckpoints:
         assert funnel["demands_declined_no_room"] == 1
         assert funnel["demands_recorded"] == 0
         assert funnel["chunks_cut_for_demand"] == 0
-        assert forward_on_the_ladder(bm, second) == [32], "the grid rung, no demand cut"
+        # The grid rung and nothing else. No demand cut, which is the one the
+        # refused store must not have bought -- and no anchor either: a PAGE
+        # class keeps only its last boundary, so `_record_checkpoint_end`
+        # declines to reserve one for it.
+        assert forward_on_the_ladder(bm, second) == [48], "a demand cut slipped in"
 
     def _tighten_past_an_image(self, bm):
         """Leave room for a resumer's blocks but not for a checkpoint image."""
@@ -1640,10 +2061,10 @@ class TestDemandDrivenCheckpoints:
         image = bm.paged_state_checkpoints.store.units_per_checkpoint
         assert len(bm.paged_state_checkpoints.store.records) == 1, "one image only"
 
-        second = stateful_seq(PROMPT)
+        second = stateful_seq(CONTINUATION)
         # Leave the request's own blocks plus half an image: reachable only by
         # spending the very checkpoint `second` is about to resume from.
-        spare = -(-len(PROMPT) // BLOCK) + image // 2
+        spare = -(-len(CONTINUATION) // BLOCK) + image // 2
         bm.kv.reserve_units(bm.kv.num_free - spare, ("live-kv", 0))
 
         hit = bm.can_allocate(second)
@@ -1740,15 +2161,21 @@ class TestDemandDrivenCheckpoints:
         """
         bm = make_block_manager(demand_config())
         short = list(range(16))
-        run_prompt_on_the_ladder(bm, stateful_seq(short))
+        short_branch = list(range(4)) + list(range(900, 912))
+        first = stateful_seq(short)
+        run_prompt_on_the_ladder(bm, first)
+        assert bm.checkpoint_limit(first) == 0  # the grid places no rung here
 
-        second = stateful_seq(short)
+        second = stateful_seq(short_branch)
         assert bm.can_allocate(second) == 0
-        assert bm.checkpoint_limit(second) == 0  # the grid places no rung here
-        assert second.checkpoint_demand_pos == 8  # the demand is its own rung
-        assert run_prompt_on_the_ladder(bm, second) == [8]
+        assert bm.checkpoint_limit(second) == 0
+        assert second.checkpoint_demand_pos == 4  # the demand is its own rung
+        # 4 is the demand, 8 is this prompt's own end anchored — and the anchor
+        # is reachable here only because it is the demand's neighbour, not its
+        # substitute: no prompt has ever ended at 4.
+        assert run_prompt_on_the_ladder(bm, second) == [4, 8]
 
-        third = stateful_seq(short)
+        third = stateful_seq(short_branch)
         assert bm.can_allocate(third) == 2  # ...and the next one collects it
         assert third.checkpoint_demand_pos == 0  # nothing left to want
         assert run_prompt_on_the_ladder(bm, third) == []
@@ -1757,14 +2184,19 @@ class TestDemandDrivenCheckpoints:
         """The cut and the keep read the same call, so they cannot drift."""
         bm = make_block_manager(demand_config())
         run_prompt_on_the_ladder(bm, stateful_seq(PROMPT))
-        seq = stateful_seq(PROMPT)
+        seq = stateful_seq(BRANCH)
         bm.allocate(seq, bm.can_allocate(seq))
-        assert seq.checkpoint_demand_pos == 36
+        assert seq.checkpoint_demand_pos == 28
+        assert seq.checkpoint_end_pos == 36
 
-        n = len(PROMPT)
+        n = len(BRANCH)
         cuts = {bm.checkpoint_cut(seq, pos - 1, pos) for pos in range(1, n + 1)}
         rungs = {pos for pos in range(1, n + 1) if bm.checkpointers_at(seq, pos)}
-        assert cuts - {0} == rungs == {16, 32, 36}
+        # 16 and 32 from the grid, 28 the demand, 36 the anchor. Swept one
+        # token at a time, so every position is offered to both sides — which
+        # is what would catch `checkpoint_cut` picking a target `checkpointers_at`
+        # then refuses, the failure the two-candidate ladder made possible.
+        assert cuts - {0} == rungs == {16, 28, 32, 36}
 
     def test_a_recorded_demand_is_always_a_position_something_keeps(self):
         """Otherwise the cut is an extra forward that stores nothing.
@@ -1794,33 +2226,287 @@ class TestDemandDrivenCheckpoints:
         assert warm.checkpoint_demand_pos == 0
 
 
-class TestCacheStatsAttribution:
-    """Splitting declined reuse into the part a checkpoint reaches and the rest.
+class TestPromptEndAnchor:
+    """A rung reserved at this prompt's own end, before anyone asks for it.
 
-    One number for both makes "does demand-driven checkpointing apply to this
-    workload" unfalsifiable, which is the whole reason the counterfactual is
-    computed outside the tests.
+    The demand is reactive: it exists only once a hit has already been refused
+    for want of a checkpoint, which is one request too late for the position
+    that serves the next turn of a conversation. On agentic traffic that
+    position is where nearly all the reuse is — over the SemiAnalysis cc-traces
+    93.5% of resumes land on a previous prompt's end and 0.0% on the interval
+    ladder — so it is reserved up front instead of waited for.
+
+    These cases are the ones `TestDemandDrivenCheckpoints` used to make, before
+    the anchor started serving the growing-conversation traffic they replayed.
     """
 
-    def test_the_split_accounts_for_every_declined_token(self):
-        stats = CacheStats(log_interval=10**6)
-        stats.update(32, 44, 40, 36)
-        lost_to_checkpoint = stats.total_wanted_tokens - stats.total_cached_tokens
-        lost_hard = stats.total_compressed_tokens - stats.total_wanted_tokens
-        assert lost_to_checkpoint == 4
-        assert lost_hard == 4
-        assert lost_to_checkpoint + lost_hard == 40 - 32
+    def test_the_second_request_resumes_where_the_first_ended(self):
+        """No disappointed request in between — this is the whole point."""
+        bm = make_block_manager(demand_config())
+        first = stateful_seq(PROMPT)
+        run_prompt_on_the_ladder(bm, first)
+        assert first.checkpoint_end_pos == 36
 
-    def test_hit_tokens_are_counted_in_hash_blocks(self):
-        """Under DCP one block_table entry spans `dcp` blocks of tokens."""
-        sched = make_scheduler(demand_config(decode_context_parallel_size=2))
-        assert sched.block_manager.hash_block_size == 2 * BLOCK
+        second = stateful_seq(PROMPT)
+        # 9 blocks = 36 tokens, the anchor. The grid alone would have given 8,
+        # and the demand would have taken until the third request to find it.
+        assert bm.can_allocate(second) == 9
+        assert second.num_wanted_hit_blocks == 9  # nothing left on the table
+        assert second.checkpoint_demand_pos == 0  # so nothing to demand
+
+    def test_the_anchor_steps_back_to_a_position_that_is_keepable(self):
+        """The exact end is never keepable, so insisting on it anchors nothing.
+
+        A checkpoint at P binds the forward after it to carry `successor_room`
+        tokens, and a grid-floored prompt end leaves at most `hash_block_size`
+        minus one. Wherever the room reaches a block or more — MIN_FORK 8
+        against BLOCK 4 here, V4's 131 against 256 in production — the floored
+        end fails that test for *every* prompt: `checkpoint_cut` would shorten
+        a chunk and `checkpointers_at` would then refuse to keep anything, with
+        no error to show for it. Stepping back to the rightmost keepable grid
+        position costs at most one block of the next turn's reuse.
+        """
+        bm = make_block_manager(demand_config())
+        for n in (12, 40, 44, 45, 50):
+            seq = stateful_seq(list(range(1000 * n, 1000 * n + n)))
+            bm.can_allocate(seq)
+            anchor = seq.checkpoint_end_pos
+            assert anchor % BLOCK == 0, n  # on the hash grid
+            assert n - anchor >= MIN_FORK, n  # and it leaves the fork its room
+            assert bm.checkpointers_at(seq, anchor), n  # so it is really kept
+
+    def test_a_prompt_with_no_room_for_an_anchor_gets_none(self):
+        bm = make_block_manager(demand_config())
+        seq = stateful_seq(list(range(MIN_FORK)))
+        bm.can_allocate(seq)
+        assert seq.checkpoint_end_pos == 0
+
+    def test_the_cut_and_the_keep_agree_at_every_anchor(self):
+        """Swept, because a cut nothing keeps is a forward spent on nothing."""
+        for n in range(BLOCK, 80):
+            bm = make_block_manager(demand_config())
+            tokens = list(range(1000 * n, 1000 * n + n))
+            for _ in range(3):
+                seq = stateful_seq(tokens)
+                bm.allocate(seq, bm.can_allocate(seq))
+                cuts = set(forward_on_the_ladder(bm, seq))
+                keeps = {p for p in range(1, n + 1) if bm.checkpointers_at(seq, p)}
+                assert not cuts - keeps, (n, sorted(cuts), sorted(keeps))
+
+    def test_the_anchor_does_not_displace_the_grid_rung(self):
+        """Both are cut for, because they serve different classes.
+
+        `checkpoint_cut` takes the *earliest* candidate for exactly this: with
+        the anchor at 36 and a rung at 32, returning the later one means the
+        forward never ends at 32 and the rung is not deferred but lost. A class
+        the anchor is out of reach for would then lose the rung it had been
+        resuming from, on every request, permanently.
+        """
+        bm = make_block_manager(demand_config())
+        first = stateful_seq(PROMPT)
+        assert run_prompt_on_the_ladder(bm, first) == [32, 36]
+
+        bm.state_caches = (*bm.state_caches, StubStateCache(cap=8))
+        second = stateful_seq(PROMPT)
+        assert bm.can_allocate(second) == 8  # the rung, still there
+        assert second.num_wanted_hit_blocks == 8  # and no gap to demand
+        assert second.checkpoint_demand_pos == 0
+
+    def test_a_stateless_model_records_no_anchor(self):
+        bm = make_block_manager(
+            demand_config(pool_entries={}),
+            state_runtime=StateRuntime(),
+        )
+        cold = Sequence(PROMPT, BLOCK, has_per_req_cache=False)
+        bm.can_allocate(cold)
+        assert cold.checkpoint_end_pos == 0
+
+    def test_deallocate_clears_the_anchor(self):
+        """Sequences are recycled; a stale anchor would cut the next prompt."""
+        bm = make_block_manager(demand_config())
         seq = stateful_seq(PROMPT)
-        seq.num_compressed_hit_blocks = 3
-        seq.num_wanted_hit_blocks = 2
-        sched._schedule_prefill_seq(seq, 44, {}, [], 0, 0)
-        assert sched.cache_stats.total_compressed_tokens == 3 * 2 * BLOCK
-        assert sched.cache_stats.total_wanted_tokens == 2 * 2 * BLOCK
+        run_prompt_on_the_ladder(bm, seq)
+        assert seq.checkpoint_end_pos == 36
+        bm.deallocate(seq)
+        assert seq.checkpoint_end_pos == 0
+
+    def test_anchor_cuts_are_counted_apart_from_demand_cuts(self):
+        """The demand counter is a convergence signal and must stay readable.
+
+        The anchor fires on nearly every prompt while the demand is supposed to
+        fall silent once the gap it found is filled. Folding the two together
+        would leave `chunks_cut_for_demand` growing forever on healthy traffic,
+        which is precisely the shape it exists to expose.
+        """
+        bm = make_block_manager(demand_config())
+        run_prompt_on_the_ladder(bm, stateful_seq(PROMPT))
+        assert bm.checkpoint_funnel()["chunks_cut_for_demand"] == 0
+        assert bm.checkpoint_funnel()["chunks_cut_for_end"] == 1
+
+        second = stateful_seq(BRANCH)
+        bm.allocate(second, bm.can_allocate(second))
+        forward_on_the_ladder(bm, second)
+        assert bm.checkpoint_funnel()["chunks_cut_for_demand"] == 1
+        assert bm.checkpoint_funnel()["chunks_cut_for_end"] == 2
+
+
+class TestLadderOffButCheckpointingOn:
+    """`-1`: no interval rungs, demand and anchor still place checkpoints.
+
+    Every rung costs the prompt that keeps it an extra prefill chunk, and the
+    interval is a guess about where reuse will resume. The other two placements
+    are not guesses — one is a position a request was refused at, the other is
+    where the next turn of a conversation demonstrably starts. On the
+    SemiAnalysis cc-traces the ladder placed ~30x the writes of the two of them
+    together and caught reuse they already reach: 0.0% of resumes landed on an
+    8192 rung.
+
+    Spelled `-1` rather than folded into `0` because `0` is the documented off
+    switch *and* reachable by accident — `test_interval_snaps_onto_the_hash_-
+    block_grid` shows an off-grid interval snapping down to it. Giving `0` a
+    second meaning would turn a `--block-size` typo from failing safe into
+    silently enabling a policy.
+    """
+
+    def test_minus_one_survives_the_grid_snap(self):
+        bm = make_block_manager(ckpt_config(state_checkpoint_interval_tokens=-1))
+        assert bm.state_checkpoint_interval_tokens == -1
+
+    def test_the_grid_places_no_rung(self):
+        bm = make_block_manager(demand_config(state_checkpoint_interval_tokens=-1))
+        seq = stateful_seq(PROMPT)
+        bm.can_allocate(seq)
+        assert bm.checkpoint_limit(seq) == 0
+        # 32 is a rung under the default interval, and nothing under -1. The
+        # anchor at 36 is the only aimed position left.
+        assert not bm.checkpointers_at(seq, 32)
+        assert bm.checkpointers_at(seq, 36)
+
+    def test_the_anchor_still_reaches_the_same_hit(self):
+        """The point of the mode: the ladder's reuse for one cut, not two."""
+        bm = make_block_manager(demand_config(state_checkpoint_interval_tokens=-1))
+        first = stateful_seq(PROMPT)
+        assert run_prompt_on_the_ladder(bm, first) == [36]  # the ladder cut 32 too
+
+        second = stateful_seq(PROMPT)
+        assert bm.can_allocate(second) == 9  # what the full ladder also gave
+        assert second.checkpoint_demand_pos == 0
+
+    def test_the_demand_still_fires(self):
+        """This is what -1 buys over 0, and why it is not spelled 0."""
+        bm = make_block_manager(demand_config(state_checkpoint_interval_tokens=-1))
+        run_prompt_on_the_ladder(bm, stateful_seq(PROMPT))
+
+        second = stateful_seq(BRANCH)
+        assert bm.can_allocate(second) == 0
+        assert second.checkpoint_demand_pos == 28
+        bm.allocate(second, 0)
+        assert forward_on_the_ladder(bm, second) == [28, 36]  # no rung at 32
+
+        third = stateful_seq(BRANCH)
+        # 9, not the demand's 7: by now `second` has left its own anchor at 36,
+        # which is further along than the branch point. The demand's rung is
+        # what got `second` past 28 to reach the end and place that anchor —
+        # under interval=0 the pair would still be stuck at 0.
+        assert bm.can_allocate(third) == 9
+
+    def test_zero_would_have_left_that_reuse_on_the_floor(self):
+        """The same three requests under 0, as the contrast -1 exists for."""
+        bm = make_block_manager(demand_config(state_checkpoint_interval_tokens=0))
+        run_prompt_on_the_ladder(bm, stateful_seq(PROMPT))
+        for _ in range(3):
+            seq = stateful_seq(BRANCH)
+            assert bm.can_allocate(seq) == 0
+            bm.allocate(seq, 0)
+            assert forward_on_the_ladder(bm, seq) == []
+
+    def test_generation_keeps_no_checkpoints(self):
+        """Decode spacing is measured in intervals, and there is no interval.
+
+        Both aimed placements are prompt positions, so an unaimed position past
+        the prompt has nothing to match. Stated as a test because the arithmetic
+        that would otherwise run — `pos - last < -1` — is true for every pos,
+        which would checkpoint on every decode step.
+        """
+        bm = make_block_manager(demand_config(state_checkpoint_interval_tokens=-1))
+        seq = stateful_seq(PROMPT)
+        bm.allocate(seq, bm.can_allocate(seq))
+        assert not any(
+            bm.checkpointers_at(seq, pos, aimed=False)
+            for pos in range(BLOCK, 200, BLOCK)
+        )
+
+    def test_it_costs_fewer_cuts_than_the_ladder(self):
+        """The whole justification, swept rather than asserted at one length."""
+        totals = {}
+        for interval in (INTERVAL, -1):
+            cuts = 0
+            for n in range(BLOCK, 80):
+                bm = make_block_manager(
+                    demand_config(state_checkpoint_interval_tokens=interval)
+                )
+                tokens = list(range(1000 * n, 1000 * n + n))
+                for _ in range(3):
+                    seq = stateful_seq(tokens)
+                    bm.allocate(seq, bm.can_allocate(seq))
+                    cuts += len(forward_on_the_ladder(bm, seq))
+            totals[interval] = cuts
+        assert totals[-1] < totals[INTERVAL]
+
+    def test_every_cut_is_still_kept(self):
+        for n in range(BLOCK, 80):
+            bm = make_block_manager(demand_config(state_checkpoint_interval_tokens=-1))
+            tokens = list(range(1000 * n, 1000 * n + n))
+            for _ in range(3):
+                seq = stateful_seq(tokens)
+                bm.allocate(seq, bm.can_allocate(seq))
+                cuts = set(forward_on_the_ladder(bm, seq))
+                keeps = {p for p in range(1, n + 1) if bm.checkpointers_at(seq, p)}
+                assert not cuts - keeps, (n, sorted(cuts), sorted(keeps))
+
+    def test_interval_zero_anchors_nothing(self):
+        """0 is off for *all three* placements, not just the grid.
+
+        The anchor is recorded outside the grid, so it does not inherit the
+        grid's off switch — it has to check the interval itself. Without that
+        check `checkpoint_cut` shortens a chunk on every prompt and
+        `checkpointers_at` then refuses to keep anything, which is a per-request
+        cost with nothing stored and no error raised.
+        """
+        bm = make_block_manager(demand_config(state_checkpoint_interval_tokens=0))
+        seq = stateful_seq(PROMPT)
+        bm.can_allocate(seq)
+        assert seq.checkpoint_end_pos == 0
+        assert run_prompt_on_the_ladder(bm, stateful_seq(PROMPT)) == []
+
+    def test_a_last_boundary_only_class_is_not_anchored_for(self):
+        """The anchor costs a prefill chunk, so it has to buy something.
+
+        A PAGE class files one pending checkpoint per seq and discards the
+        boundary, so the prompt-end checkpoint a chunk later overwrites the
+        anchor before either is stored -- the chunk is bought and thrown away.
+        Under `fork` the two are separate slots in the index and both survive,
+        which is what makes the anchor worth its chunk there.
+
+        Pinned because the failure is silent and asymmetric: DSV4 would pay one
+        extra forward per prompt for exactly zero hit rate, and nothing in the
+        funnel counters would say so.
+        """
+        fork = make_block_manager(ckpt_config())
+        copy = make_block_manager(ckpt_config(), state_runtime=PAGED_COPY_RUNTIME)
+        assert fork.state.keeps_interior_boundaries is True
+        assert copy.paged_state_checkpoints.keeps_interior_boundaries is False
+
+        forked, copied = stateful_seq(PROMPT), stateful_seq(PROMPT)
+        fork.can_allocate(forked)
+        copy.can_allocate(copied)
+        assert forked.checkpoint_end_pos > 0, "fork should still anchor"
+        assert copied.checkpoint_end_pos == 0, "copy paid for an anchor it drops"
+
+        # And the cost is exactly the chunk: the copy path forwards its prompt
+        # in one cut, the fork path in two.
+        assert run_prompt_on_the_ladder(copy, stateful_seq(PROMPT)) == [len(PROMPT)]
+        assert len(run_prompt_on_the_ladder(fork, stateful_seq(PROMPT))) == 1
 
 
 class TestGenerationIsHeldToSpacingNotTheGrid:
@@ -1988,3 +2674,579 @@ class TestTheCacheCannotStarveLiveKv:
         _, scheduled = scheduler.schedule()
 
         assert scheduled, "the pass allocated before releasing the previous pin"
+
+
+# ── midstep checkpoints ────────────────────────────────────────────────────
+
+
+#: A backend that reads its recurrent state at interior chunk boundaries.
+MIDSTEP_STATE_RUNTIME = StateRuntime(
+    transfer=StateTransfer.fork(MIN_FORK, readable_midstep=True)
+)
+
+
+def make_midstep_bm(**overrides):
+    """A `BlockManager` on `demand_config` for a midstep-readable backend.
+
+    Readability is a property of the backend, not of the config, so it arrives
+    through `state_runtime` rather than a config field — the same route
+    `ModelRunner` hands `GDNStateMixin.state_transfer` down.
+    """
+    return make_block_manager(
+        demand_config(**overrides), state_runtime=MIDSTEP_STATE_RUNTIME
+    )
+
+
+def forward_midstep(bm: BlockManager, seq: Sequence) -> list[int]:
+    """Run an admitted seq's prompt the way a readable backend does.
+
+    The scheduler's loop with the cut still consulted — it should never fire —
+    and `plan_midstep` where `Scheduler.schedule` puts it, once the chunk is
+    settled. Returns the positions checkpointed, which under this backend is
+    what the ladder yields *without* the forwards it used to cost.
+    """
+    kept = []
+    while seq.num_cached_tokens < seq.num_prompt_tokens:
+        start = seq.num_cached_tokens
+        chunk = seq.num_prompt_tokens - start
+        assert not bm.checkpoint_cut(seq, start, start + chunk)
+        bm.plan_midstep(seq, start, start + chunk)
+        kept.extend(p for _g, p, _h in seq.midstep_reservations)
+        bm.hash_blocks(seq, chunk, start_tokens=start)
+        seq.num_cached_tokens = start + chunk
+    return kept
+
+
+class TestMidstepCheckpoints:
+    """Every rung of the ladder, kept inside one full-length forward.
+
+    A checkpoint is state as of position P, and the only reason the scheduler
+    shortens a prefill chunk onto P is that most backends can hand back state
+    only as of the forward's last token. A chunk kernel does not have that
+    limitation: it materializes the recurrent state at every interior chunk
+    boundary on its way through, so P is a copy rather than a forward.
+
+    So the ladder's cost model changes and its reach does not. `checkpoint_cut`
+    returns 0 for every seq and `checkpointers_at` defers to the midstep path;
+    the two gates are one change, because suppressing the cut alone leaves
+    `checkpointers_at` refusing off-grid positions it is then handed and keeping
+    nothing at all, silently.
+    """
+
+    def test_the_ladder_costs_no_forwards(self):
+        bm = make_midstep_bm()
+        seq = stateful_seq(PROMPT)
+        bm.allocate(seq, bm.can_allocate(seq))
+        # The unreadable backend cuts at 32 and again at 36 for this prompt.
+        assert forward_midstep(bm, seq) == [32, 36]
+        assert bm.checkpoint_funnel()["chunks_cut_for_end"] == 0
+        assert bm.checkpoint_funnel()["chunks_cut_for_demand"] == 0
+
+    def test_the_reuse_is_the_same_reuse(self):
+        """The point: same hit as the cutting ladder, without the cuts."""
+        for readable in (False, True):
+            bm = make_block_manager(
+                demand_config(),
+                state_runtime=(
+                    MIDSTEP_STATE_RUNTIME if readable else DEFAULT_STATE_RUNTIME
+                ),
+            )
+            first = stateful_seq(PROMPT)
+            bm.allocate(first, bm.can_allocate(first))
+            (forward_midstep if readable else forward_on_the_ladder)(bm, first)
+
+            second = stateful_seq(PROMPT)
+            assert bm.can_allocate(second) == 9, readable
+
+    def test_both_positions_are_separately_resumable(self):
+        """Not one checkpoint at the rightmost — one per position, each keyed.
+
+        A single group filed under the last position would look identical on a
+        prompt that reuses the whole prefix, and fail the moment a request
+        branches before it.
+        """
+        bm = make_midstep_bm()
+        first = stateful_seq(PROMPT)
+        bm.allocate(first, bm.can_allocate(first))
+        forward_midstep(bm, first)
+
+        assert len(set(bm.state.hash_to_slot.values())) == 2
+
+        # A request sharing 32 tokens and then diverging cannot use the anchor
+        # at 36, so its hit of 8 blocks is 32's checkpoint and could have come
+        # from nowhere else. Filing both positions under one group would leave
+        # this at 0.
+        branch_at_32 = stateful_seq(list(range(32)) + list(range(900, 916)))
+        assert bm.can_allocate(branch_at_32) == 8
+        # And the whole-prefix case still reaches the further one.
+        assert bm.can_allocate(stateful_seq(PROMPT)) == 9
+
+    def test_the_boundary_is_not_kept_twice(self):
+        """`checkpointers_at` has to defer, or both paths keep the same rung.
+
+        The midstep path already filed 32, and a forward that also ends there
+        is exactly what the ladder used to produce — so without the gate the
+        rung is kept a second time. Two groups on one hash, the loser sitting
+        free and unindexed; and under `fork` the seq gives its live group away
+        and takes a fresh one, binding the next forward to refill a replacement
+        it had no reason to need.
+        """
+        bm = make_midstep_bm()
+        seq = stateful_seq(PROMPT)
+        bm.allocate(seq, bm.can_allocate(seq))
+        group = seq.state_slot
+        bm.plan_midstep(seq, 0, 32)
+        bm.hash_blocks(seq, 32, start_tokens=0)
+
+        assert bm.checkpoint_funnel()["checkpoints_kept"] == 1
+        assert seq.state_slot == group  # not forked out from under it
+        assert seq.state_fork_src == -1
+
+    def test_a_position_the_hash_chain_cannot_name_is_skipped(self):
+        """No hash, no way back — so reserving one would spend a group on air."""
+        bm = make_midstep_bm()
+        seq = stateful_seq(PROMPT)
+        bm.can_allocate(seq)
+        seq.block_hashes = seq.block_hashes[:2]  # 8 tokens' worth
+        assert bm.midstep_positions(seq, 0, 44) == []
+
+    def test_the_chain_covers_the_whole_prompt_past_the_miss(self):
+        """`block_hashes` stops at the first miss; the anchor is past it."""
+        bm = make_midstep_bm()
+        seq = stateful_seq(PROMPT)
+        bm.can_allocate(seq)
+        assert len(seq.block_hashes) == len(PROMPT) // BLOCK
+        # And it is the same chain `hash_blocks` publishes, or a resumer would
+        # look the checkpoint up under a hash nothing files it under.
+        bm.allocate(seq, 0)
+        bm.hash_blocks(seq, seq.num_prompt_tokens)
+        published = [bm.kv.block(b).hash for b in seq.block_table]
+        assert published == seq.block_hashes
+
+    def test_an_unreadable_backend_keeps_its_chain_empty(self):
+        """A hash pass over every prompt, for a field nothing would read."""
+        bm = make_block_manager(demand_config())
+        seq = stateful_seq(PROMPT)
+        bm.can_allocate(seq)
+        assert seq.block_hashes == []
+
+    def test_nothing_is_findable_until_the_forward_has_run(self):
+        """Publishing at reservation time indexes bytes nobody wrote."""
+        bm = make_midstep_bm()
+        seq = stateful_seq(PROMPT)
+        bm.allocate(seq, bm.can_allocate(seq))
+        bm.plan_midstep(seq, 0, 44)
+        assert seq.midstep_reservations
+        assert bm.state.hash_to_slot == {}
+
+        bm.hash_blocks(seq, 44)
+        assert len(bm.state.hash_to_slot) == 2
+        assert seq.midstep_reservations == []  # drained, not left to re-publish
+
+    def test_a_cancelled_reservation_is_returned_vacant(self):
+        bm = make_midstep_bm()
+        seq = stateful_seq(PROMPT)
+        bm.allocate(seq, bm.can_allocate(seq))
+        free_before = bm.state.num_free()
+        bm.plan_midstep(seq, 0, 44)
+        assert bm.state.num_free() == free_before - 2
+
+        bm.cancel_midstep(seq)
+        assert bm.state.num_free() == free_before
+        assert bm.state.hash_to_slot == {}  # holding nothing findable
+
+    def test_replanning_returns_the_previous_forward_s_groups(self):
+        """A plan is good for one forward; a second means the first never ran."""
+        bm = make_midstep_bm()
+        seq = stateful_seq(PROMPT)
+        bm.allocate(seq, bm.can_allocate(seq))
+        bm.plan_midstep(seq, 0, 44)
+        free_with_one_plan = bm.state.num_free()
+        bm.plan_midstep(seq, 0, 44)
+        assert bm.state.num_free() == free_with_one_plan
+
+    def test_deallocate_returns_them_too(self):
+        """Preemption frees through here, and the forward is not going to run."""
+        bm = make_midstep_bm()
+        seq = stateful_seq(PROMPT)
+        bm.allocate(seq, bm.can_allocate(seq))
+        free_before = bm.state.num_free()
+        bm.plan_midstep(seq, 0, 44)
+        bm.deallocate(seq)
+        # `free_before` counted the seq's own group as taken; deallocate hands
+        # that back as well, so the reservations are the difference.
+        assert bm.state.num_free() == free_before + 1
+        assert seq.midstep_reservations == []
+
+    def test_a_shortage_keeps_the_earliest_position(self):
+        """Best-effort, in the order a later forward would reach them.
+
+        The earliest is the one an earlier chunk arrives at, and the one a
+        branching request is most likely to still be able to use.
+        """
+        bm = make_midstep_bm(pool_entries={"state": 2})
+        seq = stateful_seq(PROMPT)
+        bm.allocate(seq, bm.can_allocate(seq))
+        bm.plan_midstep(seq, 0, 44)
+        assert [p for _g, p, _h in seq.midstep_reservations] == [32]
+        assert bm.checkpoint_funnel()["checkpoints_dropped"] == 1
+
+    def test_reservations_never_starve_an_admission(self):
+        """`has_free` is the gate, so the worst case is a deferred admission."""
+        bm = make_midstep_bm(pool_entries={"state": 3})
+        first = stateful_seq(PROMPT)
+        bm.allocate(first, bm.can_allocate(first))
+        bm.plan_midstep(first, 0, 44)
+        # Two groups reserved, one held by `first` — the pool is empty, and a
+        # second request is refused rather than handed a reserved group.
+        second = stateful_seq(PROMPT)
+        assert bm.can_allocate(second) == -1
+        assert bm.state.num_free() == 0
+
+    def test_generation_still_checkpoints_the_ordinary_way(self):
+        """Midstep is a prefill affair; a decode step ends where acceptance says.
+
+        `checkpointers_at` defers only on the aimed path, so an unaimed caller
+        gets the same answer a fork backend has always given.
+        """
+        bm = make_midstep_bm()
+        seq = stateful_seq(PROMPT)
+        bm.allocate(seq, bm.can_allocate(seq))
+        assert bm.checkpointers_at(seq, INTERVAL + BLOCK, MIN_FORK, aimed=False)
+
+    def test_the_prompt_s_checkpoints_space_the_decode_ones(self):
+        """`last_checkpoint_pos` is the decode spacing rule's only input.
+
+        A prompt that filed a midstep checkpoint at its end and left the
+        watermark at 0 would let the first decode boundary keep another one
+        immediately, which is what the interval exists to prevent.
+        """
+        bm = make_midstep_bm()
+        seq = stateful_seq(PROMPT)
+        bm.allocate(seq, bm.can_allocate(seq))
+        forward_midstep(bm, seq)
+        assert seq.last_checkpoint_pos == 36
+
+    def test_one_unreadable_class_keeps_the_cut(self):
+        """The gate is `all`, not `any`: that class still needs the forward.
+
+        A readable class loses nothing by being handed a position it would have
+        taken anyway, and an unreadable one loses everything by being handed a
+        forward that does not end there.
+        """
+        bm = make_midstep_bm()
+        bm.state_caches = (*bm.state_caches, StubStateCache(successor_room=0))
+        seq = stateful_seq(PROMPT)
+        bm.allocate(seq, bm.can_allocate(seq))
+        assert bm.checkpoint_cut(seq, 0, 44) == 32
+        assert bm.checkpointers_at(seq, 32)
+
+    def test_interval_zero_reserves_nothing(self):
+        """0 is off for the midstep path too, as it is for the other three."""
+        bm = make_midstep_bm(state_checkpoint_interval_tokens=0)
+        seq = stateful_seq(PROMPT)
+        bm.allocate(seq, bm.can_allocate(seq))
+        assert bm.midstep_positions(seq, 0, 44) == []
+
+    def test_minus_one_reserves_the_anchor_alone(self):
+        """The two changes compose: no grid, no cuts, and the reuse still there."""
+        bm = make_midstep_bm(state_checkpoint_interval_tokens=-1)
+        first = stateful_seq(PROMPT)
+        bm.allocate(first, bm.can_allocate(first))
+        assert forward_midstep(bm, first) == [36]
+
+        second = stateful_seq(PROMPT)
+        assert bm.can_allocate(second) == 9
+
+    def test_a_stateless_model_reserves_nothing(self):
+        bm = make_block_manager(
+            demand_config(pool_entries={}),
+            state_runtime=StateRuntime(),
+        )
+        cold = Sequence(PROMPT, BLOCK, has_per_req_cache=False)
+        bm.can_allocate(cold)
+        assert cold.block_hashes == []
+        assert bm.midstep_positions(cold, 0, 44) == []
+
+
+class TestCountUnreachable:
+    """The gap `checkpoints_orphaned` leaves, and that the probe measures.
+
+    `unindex` fires for the hash of the block that was evicted. A checkpoint
+    filed further along the same chain keeps its hash, its slot, and — under
+    superblocks — a superblock that `is_reclaimable` exempts from paged
+    eviction. Nothing counts it, which is what these pin down.
+    """
+
+    @staticmethod
+    def _pool_with(*hashes):
+        pool = StateSlotPool(8, StateTransfer.fork(1), hash_block_size=1)
+        for slot, h in enumerate(hashes):
+            pool._index(h, slot)
+        return pool
+
+    def test_all_reachable_counts_zero(self):
+        pool = self._pool_with(10, 20, 30)
+        assert pool.count_unreachable(lambda h: True) == 0
+
+    def test_counts_a_checkpoint_whose_block_is_gone(self):
+        pool = self._pool_with(10, 20, 30)
+        assert pool.count_unreachable(lambda h: h != 20) == 1
+
+    def test_counts_every_one_when_the_index_is_empty(self):
+        pool = self._pool_with(10, 20, 30)
+        assert pool.count_unreachable(lambda h: False) == 3
+
+    def test_ignores_vacant_slots(self):
+        """A slot with no hash holds nothing to be unreachable about."""
+        pool = self._pool_with(10, 20)
+        assert pool.count_unreachable(lambda h: False) == 2
+        pool.invalidate(0)
+        assert pool.count_unreachable(lambda h: False) == 1
+
+    def test_ignores_slots_a_live_request_holds(self):
+        """Only free slots carry checkpoints; a claimed one is being written."""
+        pool = self._pool_with(10, 20)
+        pool.claim(0)
+        assert pool.count_unreachable(lambda h: False) == 1
+
+    def test_orphaned_undercounts_what_this_finds(self):
+        """The whole reason the probe exists, stated as an assertion.
+
+        Evicting block 10 orphans the checkpoint filed under it. The one under
+        30 is just as dead — its prefix runs through 10 — but `unindex` was
+        never called for 30, so the counter never saw it.
+        """
+        pool = self._pool_with(10, 20, 30)
+        pool.unindex(10)  # the evicted block's own hash
+        assert pool.checkpoint_fates()["checkpoints_orphaned"] == 1
+        # 10 is gone from the index, and 30's prefix ran through it.
+        assert pool.count_unreachable(lambda h: h == 20) == 1
+
+
+class TestReadSideCounters:
+    """That `resumed`, `read_twice` and `superseded` count the thing named.
+
+    Every other checkpoint counter records a WRITE. These record reads and
+    supersession, and a soft cap would be sized from them, so a counter that
+    silently reads zero would size it to nothing. Two of these pin down exactly
+    the placements that would do that.
+    """
+
+    @staticmethod
+    def _pool_with(*hashes):
+        pool = StateSlotPool(8, StateTransfer.fork(1), hash_block_size=1)
+        for slot, h in enumerate(hashes):
+            pool._index(h, slot)
+        return pool
+
+    def test_promote_counts_a_non_speculative_checkpoint(self):
+        """The placement bug this is guarding: `promote` returns early for a
+        slot that was never `mark_speculative`d, and with the demand rung off
+        every checkpoint is a plain prompt-end anchor. A counter behind that
+        gate reads zero for the whole measured configuration."""
+        pool = self._pool_with(10, 20)
+        assert 0 not in pool._speculative
+        pool.promote(0)
+        assert pool.checkpoint_fates()["checkpoints_resumed"] == 1
+
+    def test_read_twice_needs_two_reads(self):
+        pool = self._pool_with(10, 20)
+        pool.promote(0)
+        assert pool.checkpoint_fates()["checkpoints_read_twice"] == 0
+        pool.promote(0)
+        assert pool.checkpoint_fates()["checkpoints_read_twice"] == 1
+        # A second slot read once must not join it.
+        pool.promote(1)
+        assert pool.checkpoint_fates()["checkpoints_read_twice"] == 1
+        assert pool.checkpoint_fates()["checkpoints_resumed"] == 3
+
+    def test_marks_do_not_survive_the_slot_being_reused(self):
+        """Both marks describe a checkpoint; the slot index outlives it. Were
+        they kept, the next occupant of slot 0 would report itself as already
+        read and already superseded on the strength of its predecessor."""
+        pool = self._pool_with(10, 20)
+        pool.promote(0)
+        pool._superseded.add(0)
+        pool.invalidate(0)
+        assert pool.checkpoint_fates()["checkpoints_read_twice"] == 0
+        assert pool.checkpoint_fates()["checkpoints_superseded"] == 0
+        pool._index(30, 0)
+        assert pool.checkpoint_fates()["checkpoints_read_twice"] == 0
+
+    def test_superseded_is_a_gauge_and_events_are_cumulative(self):
+        """`checkpoints_superseded` sizes the candidate set a soft cap spends,
+        so it has to fall when one leaves. `superseded_events` is the tally and
+        must not."""
+        pool = self._pool_with(10, 20)
+        pool._superseded.add(0)
+        pool.checkpoints_superseded += 1
+        fates = pool.checkpoint_fates()
+        assert fates["checkpoints_superseded"] == 1
+        assert fates["superseded_events"] == 1
+        pool.invalidate(0)
+        fates = pool.checkpoint_fates()
+        assert fates["checkpoints_superseded"] == 0
+        assert fates["superseded_events"] == 1
+
+    def test_supersede_is_the_resume_link_not_a_seq_local_one(self):
+        """Two things this must not key off, both measured 0 in a live run.
+
+        `state_fork_src` is cleared by the scheduler after every batch, so
+        `checkpoint` (postprocess) always reads -1. And a request's own
+        previous checkpoint never fires either: a conversation's turns are
+        separate Sequences and with the interval ladder off each writes exactly
+        one checkpoint. The link that crosses requests is the resume, so
+        `attach_state` writes `last_checkpoint_slot` and `checkpoint` only
+        reads it.
+        """
+
+        class Seq:
+            def __init__(self):
+                self.state_slots = []
+                self.state_fork_src = -1
+                self.last_checkpoint_slot = -1
+                self.checkpoint_end_pos = 0
+                self.num_tokens = 100
+
+            @property
+            def state_slot(self):
+                return self.state_slots[0] if self.state_slots else -1
+
+            @state_slot.setter
+            def state_slot(self, value):
+                if self.state_slots:
+                    self.state_slots[0] = value
+                else:
+                    self.state_slots = [value]
+
+        pool = StateSlotPool(8, StateTransfer.fork(1), hash_block_size=1)
+        pool.applies = lambda seq: True
+
+        # Turn 1: a fresh conversation. Nothing to supersede.
+        first = Seq()
+        first.state_slot = pool.pop()
+        pool.checkpoint(first, 1, 111)
+        pool.release_pins()
+        pool.release_pins()
+        anchor1 = pool.lookup(111)
+        assert anchor1 >= 0
+        assert pool.checkpoint_fates()["superseded_events"] == 0
+
+        # Turn 2: a NEW Sequence resuming off turn 1's anchor. What
+        # `attach_state` does on the resume path:
+        second = Seq()
+        second.last_checkpoint_slot = anchor1
+        second.state_slot = pool.pop()
+        pool.checkpoint(second, 2, 222)
+        pool.release_pins()
+        pool.release_pins()
+        fates = pool.checkpoint_fates()
+        assert fates["superseded_events"] == 1
+        assert fates["checkpoints_superseded"] == 1
+
+        # A turn that resumes nothing supersedes nothing.
+        third = Seq()
+        third.state_slot = pool.pop()
+        pool.checkpoint(third, 3, 333)
+        assert pool.checkpoint_fates()["superseded_events"] == 1
+
+
+class TestTrimSuperseded:
+    """What the soft cap may and may not spend.
+
+    The cap exists because 84.5% of resident checkpoints on the measured trace
+    had been superseded while the pools reported `binding: paged` -- roughly
+    5.8 GiB held by state the workload had already moved past. What makes it
+    safe is the restriction, not the cap: 16.5% of resumes on that trace land
+    on an anchor a deeper one had already superseded, so the candidate set is
+    the ceiling on what may go, never a target to reach.
+    """
+
+    @staticmethod
+    def _pool(n=8, cap=2):
+        pool = StateSlotPool(n, StateTransfer.fork(1), hash_block_size=1, soft_cap=cap)
+        return pool
+
+    @staticmethod
+    def _checkpointed(pool, *hashes):
+        """File each hash on its own slot and hand the slot back."""
+        out = []
+        for h in hashes:
+            slot = pool.pop()
+            pool._index(h, slot)
+            pool.release(slot)
+            out.append(slot)
+        return out
+
+    def test_only_superseded_slots_are_spent(self):
+        pool = self._pool(cap=1)
+        a, b, c = self._checkpointed(pool, 10, 20, 30)
+        pool._superseded.add(a)
+        assert pool.trim_superseded(soft_cap=1) == 1
+        assert pool.lookup(10) == -1, "the superseded one went"
+        assert pool.lookup(20) == b and pool.lookup(30) == c, "the others stayed"
+
+    def test_running_out_of_candidates_leaves_the_pool_over_cap(self):
+        """Over the cap beats spending a checkpoint nothing has replaced."""
+        pool = self._pool(cap=1)
+        self._checkpointed(pool, 10, 20, 30)
+        assert pool.trim_superseded(soft_cap=1) == 0
+        assert len(pool._checkpointed) == 3
+        assert pool.checkpoint_fates()["checkpoints_trimmed"] == 0
+
+    def test_it_stops_at_the_cap_rather_than_draining_candidates(self):
+        pool = self._pool(cap=2)
+        slots = self._checkpointed(pool, 10, 20, 30, 40)
+        pool._superseded.update(slots)
+        assert pool.trim_superseded(soft_cap=2) == 2
+        assert len(pool._checkpointed) == 2
+
+    def test_the_coldest_candidate_goes_first(self):
+        """`_checkpointed` is LRU, so a trim takes them in the order a
+        shortage would have -- only earlier, and only from the candidates.
+
+        Cap 2 against 3 resident, so exactly one goes and which one is the
+        assertion. At cap 1 both candidates would have to go and the ordering
+        would not be observable."""
+        pool = self._pool(cap=2)
+        a, b, c = self._checkpointed(pool, 10, 20, 30)
+        pool._superseded.update((b, c))  # a is NOT a candidate
+        assert pool.trim_superseded(soft_cap=2) == 1
+        assert pool.lookup(10) == a, "not a candidate, untouched"
+        assert pool.lookup(20) == -1, "colder candidate went first"
+        assert pool.lookup(30) == c, "the warmer one survived"
+
+    def test_a_trimmed_slot_becomes_vacant_not_merely_unindexed(self):
+        """The point is the bytes. A slot that keeps its superblock has been
+        spent for nothing -- see `release`/`_unback`."""
+        pool = self._pool(cap=1)
+        a, _b = self._checkpointed(pool, 10, 20)
+        pool._superseded.add(a)
+        pool.trim_superseded(soft_cap=1)
+        assert a in pool._free and pool.slot_hash[a] == -1
+        assert pool.occupancy()["slots_vacant"] >= 1
+
+    def test_soft_cap_of_zero_never_trims(self):
+        pool = self._pool(cap=0)
+        slots = self._checkpointed(pool, 10, 20, 30)
+        pool._superseded.update(slots)
+        assert pool.trim_superseded(soft_cap=0) == 0
+        assert len(pool._checkpointed) == 3
+
+    def test_pop_trims_before_it_mints(self):
+        """The trigger. With nothing vacant and the pool over its cap, a `pop`
+        must find its slot in this pool's own dead weight rather than claim a
+        superblock off the paged cache."""
+        pool = StateSlotPool(3, StateTransfer.fork(1), hash_block_size=1, soft_cap=1)
+        slots = self._checkpointed(pool, 10, 20, 30)
+        pool._superseded.update(slots)
+        assert not pool._vacant or all(
+            pool.slot_hash[s] != -1 for s in pool._vacant
+        ), "nothing genuinely vacant"
+        got = pool.pop()
+        assert got >= 0
+        assert pool.checkpoint_fates()["checkpoints_trimmed"] >= 1
+        assert (
+            pool.checkpoint_fates()["checkpoints_evicted"] == 0
+        ), "a trim, not an eviction"

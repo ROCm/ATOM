@@ -352,18 +352,24 @@ class LLMEngine:
     def get_cache_statistics(self, timeout: float = 30.0) -> dict[str, Any]:
         """Return aggregated prefix-cache statistics across DP ranks.
 
-        The four rates are the ones `[Cache Stats]` logs, recomputed from
-        summed counters rather than averaged: ranks admit different numbers of
-        tokens, so the mean of their rates is not the rate of their union.
+        The rates are the ones `[Cache Stats]` and `[Cache Pools]` log,
+        recomputed from summed counters rather than averaged: ranks admit
+        different numbers of tokens, so the mean of their rates is not the rate
+        of their union.
 
-        `cached <= wanted <= compressed <= full` by construction, which is what
-        makes the differences below meaningful:
+        `cached <= wanted <= compressed <= reusable <= full` by construction,
+        which is what makes the differences below meaningful:
           hit                 reuse actually admitted
           compressed_hit      reuse the prefix index held, before the
                               per-request state classes had their say
           lost_to_checkpoint  declined only because no checkpoint existed at
                               that boundary — what a denser ladder recovers
           lost_unrecoverable  declined for a reason no checkpoint touches
+
+        `paged_hit` and `state_hit` split that into one number per pool, so a
+        caller can tell which to fix; `hit` alone cannot, since the same value
+        arises from a KV pool that lost the prefix and from a state cache that
+        refused to resume from it. They multiply back to `hit` exactly.
         """
         responses = self.core_mgr.broadcast_utility_command_sync(
             "get_cache_statistics", timeout=timeout
@@ -373,37 +379,74 @@ class LLMEngine:
             for resp in responses
             if resp.get("result", resp).get("enabled", False)
         ]
+        # Instantaneous readings rather than cumulative counts, so they are
+        # taken across ranks rather than summed: every DP rank runs the same
+        # schedule against its own shard, so the ranks agree and a sum would
+        # report one pool's occupancy multiplied by `world_size`.
+        gauges = (
+            "checkpoints_unreachable",
+            "checkpoints_read_twice",
+            "checkpoints_superseded",
+            "slots_held",
+        )
         totals = {
-            key: sum(int(stats.get(key, 0)) for stats in rank_stats)
+            key: (
+                max((int(stats.get(key, 0)) for stats in rank_stats), default=0)
+                if key in gauges
+                else sum(int(stats.get(key, 0)) for stats in rank_stats)
+            )
             for key in (
                 "requests",
                 "cached_tokens",
                 "compressed_tokens",
                 "wanted_tokens",
+                "reusable_tokens",
                 "full_tokens",
                 "checkpoints_kept",
                 "checkpoints_dropped",
                 "checkpoints_evicted",
+                "checkpoints_orphaned",
+                "checkpoints_unreachable",
+                "checkpoints_resumed",
+                "checkpoints_read_twice",
+                "checkpoints_superseded",
+                "superseded_events",
+                "checkpoints_trimmed",
+                "checkpoints_trimmed",
+                "slots_held",
                 "demands_recorded",
                 "demands_declined_no_room",
                 "chunks_cut_for_demand",
             )
         }
-        full = totals["full_tokens"]
+        # `reusable`, not `full`: a request's trailing block is never a reuse
+        # candidate (prefill must forward one block for logits), so `full`
+        # charges both pools for tokens neither was offered and caps every
+        # rate below 100%. See `CacheStats.total_reusable_tokens`.
+        reusable = totals["reusable_tokens"]
 
-        def rate(num: int) -> float:
-            return num / full if full else 0.0
+        def rate(num: int, den: int = reusable) -> float:
+            return num / den if den else 0.0
 
+        compressed = totals["compressed_tokens"]
         return {
             "enabled": bool(rank_stats),
             **totals,
             "hit": rate(totals["cached_tokens"]),
-            "compressed_hit": rate(totals["compressed_tokens"]),
+            "compressed_hit": rate(compressed),
             "lost_to_checkpoint": rate(
                 totals["wanted_tokens"] - totals["cached_tokens"]
             ),
-            "lost_unrecoverable": rate(
-                totals["compressed_tokens"] - totals["wanted_tokens"]
+            "lost_unrecoverable": rate(compressed - totals["wanted_tokens"]),
+            # Per-pool rates, each against its own denominator so they isolate
+            # one pool and multiply back to `hit`. The state cache is scored
+            # against what the paged pool actually handed it, never against
+            # `reusable` -- otherwise a KV eviction reads as a state-cache
+            # miss. See `CacheStats.paged_hit_rate` / `state_hit_rate`.
+            "paged_hit": rate(compressed),
+            "state_hit": rate(totals["cached_tokens"], compressed),
+            "state_recoverable_loss": rate(
+                totals["wanted_tokens"] - totals["cached_tokens"], compressed
             ),
         }
 
@@ -462,12 +505,28 @@ class LLMEngine:
             "checkpoints_dropped",
             "checkpoints_evicted",
             "checkpoints_orphaned",
+            "checkpoints_unreachable",
+            "slots_held",
             "demands_recorded",
             "demands_declined_no_room",
             "chunks_cut_for_demand",
         )
+        # Instantaneous readings, as opposed to the cumulative counts above.
+        # Every DP rank runs the same schedule against its own shard, so these
+        # agree across ranks; summing them would multiply one pool's occupancy
+        # by the rank count and read as a pool `world_size` times its real size.
+        cache_gauges = (
+            "checkpoints_unreachable",
+            "checkpoints_read_twice",
+            "checkpoints_superseded",
+            "slots_held",
+        )
         cache_totals = {
-            key: sum(int(stats.get(key, 0)) for stats in cache_rank_stats)
+            key: (
+                max((int(stats.get(key, 0)) for stats in cache_rank_stats), default=0)
+                if key in cache_gauges
+                else sum(int(stats.get(key, 0)) for stats in cache_rank_stats)
+            )
             for key in cache_keys
         }
         cache_full = cache_totals["full_tokens"]

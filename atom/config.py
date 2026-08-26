@@ -1502,10 +1502,51 @@ class Config:
     long_prefill_token_threshold: int = 0
     attn_prefill_chunk_size: int = 16384
     # Tokens between rungs of the state-checkpoint ladder, shared by every
-    # Pool.STATE class; 0 = no ladder. Must be a multiple of the prefix-cache
-    # hash block size (asserted in BlockManager). See
-    # BlockManager.checkpointers_at.
+    # Pool.STATE class. Must be a multiple of the prefix-cache hash block size
+    # (snapped, with a warning, in BlockManager).
+    #   >0  a rung every N tokens
+    #    0  state checkpointing off entirely
+    #   -1  no interval rungs, but the demand rung and the prompt-end anchor
+    #       still place checkpoints
+    # See BlockManager.checkpointers_at.
     state_checkpoint_interval_tokens: int = 8192
+    # Extra state slots to size the STATE pool with on top of what the
+    # in-flight requests take. Checkpoints live in the same pool as running
+    # requests, so at 0 the room to keep one is whatever concurrency leaves
+    # over — declaring it here decouples the two. Counted one per checkpoint,
+    # not one per request width: a checkpoint holds only the committed state.
+    # See `SubPoolSpec.extra_entries`.
+    state_checkpoint_slots: int = 0
+    # Resident checkpoints above which the pool trims, spending only
+    # those a deeper anchor of the same chain has already superseded and
+    # only when the paged pool has had to destroy cached content to get a
+    # superblock. -1 = derive from `max_num_seqs`; 0 = never trim.
+    # Resolved to a concrete count in `__post_init__`, so readers below
+    # never see the sentinel. See `StateSlotPool.trim_superseded`.
+    state_checkpoint_soft_cap: int = -1
+    # Whether a refused hit may place a rung of its own. Off leaves the
+    # prompt-end anchor as the only placement: on the cc-traces a demand is
+    # 47% of all checkpoint writes but reads back 2.8% of the time against the
+    # anchor's 85.2%, so the rung's worth is an open question that only differs
+    # from demoting it (see `StateSlotPool.mark_speculative`) on hardware.
+    # See `BlockManager._record_checkpoint_demand`.
+    state_checkpoint_demand: bool = True
+    # Paged blocks per superblock — how many blocks one contiguous per-request
+    # state slot spans. Set by the runner from the sizing plan
+    # (`ceil(slot_bytes / block_bytes)`), never by a flag: it is a property of
+    # the model's geometry, and a value disagreeing with the pool would hand a
+    # backend a range of the wrong length.
+    #
+    # 0 means no superblocks — every model whose per-request state is not one
+    # contiguous range, and the path `BlockPool` has always taken.
+    blocks_per_superblock: int = 0
+    # How far the state slot pool may grow, as opposed to how many slots it is
+    # created with. 0 means "no further than the count it was given" — the
+    # right answer whenever the state lives in its own tensor, since a slot
+    # index past that tensor's slot dimension is an out-of-bounds GPU read.
+    # A backend that carves state from the superblocks themselves reports the
+    # superblock supply here instead; see `AttentionBackend.uses_unified_pool`.
+    max_state_slots: int = 0
     scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
     max_model_len: int | None = None

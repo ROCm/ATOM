@@ -69,6 +69,15 @@ class GDNAttentionMetadata:
 
     num_accepted_tokens: torch.Tensor | None = None  # shape: [batch,]
 
+    # Recurrent-state checkpoints this step must write, as the device index
+    # tensors `_checkpoint_targets` builds, or None when it reaches none. Built
+    # once per step and read by every layer.
+    ssm_checkpoints: dict | None = None
+    # First chunk index of each sequence within this step's `h`, the same
+    # mapping the chunk kernel builds internally. Only computed when there are
+    # checkpoints to place against it.
+    ssm_chunk_offsets: torch.Tensor | None = None
+
     # The following attributes are for triton implementation of causal_conv1d
     nums_dict: dict | None = None
     batch_ptr: torch.Tensor | None = None
@@ -258,8 +267,51 @@ class GDNStateMixin:
         )
 
     def state_transfer(self) -> StateTransfer:
-        """Declare one-token fork checkpoint support for recurrent state."""
-        return StateTransfer.fork(1)
+        """A fork whose successor forward need only carry one token.
+
+        Both halves of the GDN state come out of a forward self-contained at any
+        length. The recurrent state is rewritten whole, and every write path in
+        `causal_conv1d` stores the full `state_len` window to the output slot —
+        the short-chunk paths get there by loading the previous window from the
+        *input* slot, shifting left and appending x — so the new group stops
+        depending on the old one the moment the forward returns.
+
+        Reading the state layout alone suggests `conv_kernel_dim - 1` instead,
+        on the theory that a shorter forward leaves the new group holding a
+        window the old group still owns part of. The kernel closes that gap.
+
+        A fork rather than a copy because the state is two per-family tensors
+        rather than one contiguous entry, so there is no single range to
+        duplicate — and at one token the fork binds almost nothing anyway.
+
+        Midstep-readable, which is a separate claim and rests on separate
+        machinery: the chunk kernel materializes the recurrent state at every
+        64-token boundary and `write_state_checkpoints` copies those out, so a
+        checkpoint inside a prompt is a copy rather than a shortened forward.
+        The engine stops cutting prefill chunks onto the checkpoint ladder for
+        this backend — see `BlockManager.checkpoint_cut`. True here only
+        because `_checkpoint_targets` and the copy-out kernel exist; a backend
+        that declares it without them keeps zero checkpoints and says nothing.
+
+        Costs no accuracy, which is worth stating because the obvious reading
+        says it must: `h` is bf16 while the recurrence carries fp32, so a state
+        sliced out of it is pre-rounded. The shortened forward it replaces
+        rounds the same fp32 value on the way into the pool, though, because
+        the two dtypes are the same one — `h` is allocated as `k.new_empty`
+        and `_state_dtypes` returns `config.torch_dtype` — so the rounding is
+        common to both paths and the difference is nil. Measured on MI355: the
+        checkpoint matches a cut prefill's stored state exactly across 56
+        (seed, length, boundary) combinations, and resuming from one reproduces
+        the remaining tokens' outputs bit for bit. See
+        `tests/test_gdn_state_checkpoint_gpu.py`.
+
+        That argument is about the two dtypes agreeing, not about the copy, so
+        it does not survive a pool allocated at higher precision than `h`.
+        `_state_dtypes` builds exactly one such pool — kimi_linear's fp32 v
+        side — and that model is already off this path for a different reason
+        (`_KimiMLAGDNCommon.state_transfer`).
+        """
+        return StateTransfer.fork(1, readable_midstep=True)
 
     def state_spec(self) -> SubPoolSpec:
         """The GDN state pool: conv_state + temporal_state over all GDN
@@ -267,16 +319,33 @@ class GDNStateMixin:
 
         Concrete builders splice this into their `sub_pool_specs()` alongside
         whatever paged KV pool they own.
+
+        `--state-checkpoint-slots` buys entries beyond the in-flight floor.
+        Without it a retained checkpoint can only sit in a slot `max_num_seqs`
+        left spare, so the room to keep one is set by concurrency rather than
+        by how much reuse the traffic has — the reason a *lower* max_num_seqs
+        measures a *worse* hit rate on prefix-reusing traffic.
+
+        The extra entries are counted one per checkpoint, NOT `spr` each: a
+        checkpoint only ever holds a committed state, and the `num_spec`
+        rollback slots beside it are scratch a resumed prefix has no use for.
+        At `--num-speculative-tokens 2` that is the difference between a
+        checkpoint costing three slots and costing one, and the slots it does
+        not take stay available to the KV cache, which is sized out of what is
+        left after this.
         """
         shape_k, shape_v = self._state_shape_for_runner()
         dt_k, dt_v = self._state_dtypes()
         per_layer = (
             math.prod(shape_k) * dt_k.itemsize + math.prod(shape_v) * dt_v.itemsize
         )
+        spr = 1 + self.num_spec
+        extra = max(0, getattr(self.model_runner.config, "state_checkpoint_slots", 0))
         return state_pool(
             STATE_SLOT_CLASS,
             self.model_runner.num_gdn_attn_state * per_layer,
-            entries_per_req=1 + self.num_spec,
+            entries_per_req=spr,
+            extra_entries=extra,
         )
 
     def allocate_per_req_cache(
@@ -301,59 +370,152 @@ class GDNStateMixin:
         }
 
     def relocate_state_slots(self, pairs: Sequence[tuple[int, int]]) -> None:
-        """Relocate a live GDN group between logical Active Slot spans.
+        """Relocate a live GDN state slot between Active Slot positions.
 
-        A group is `1 + num_spec` consecutive slots — the extra ones hold the
-        per-draft states a rejected speculation rolls back to — so a group moves
-        as that whole span or the rollback slots go with the wrong owner.
+        A slot is one complete recurrent state and moves on its own. A request
+        holding several — a committed state plus `num_spec` rollback slots —
+        is several such moves, and the caller names each one, because nothing
+        about the set is contiguous.
 
         GDN checkpoints by forking, not by copying, so this is not on the
         checkpoint path: it exists because moving the pool's boundary has to be
-        able to relocate a group that is in the way.
+        able to relocate a slot that is in the way, and relocation is a byte
+        move whatever mechanism the class uses to checkpoint. A backend
+        declaring `StateTransfer.fork` therefore still owes this method.
 
-        Both caches are layer-major with the slot as the second axis, so a
-        group's rows are strided rather than contiguous and there is no single
+        Both caches are layer-major with the slot as the second axis, so one
+        slot's rows are strided rather than contiguous and there is no single
         range to copy. `_foreach_copy_` keeps it to one launch for the batch.
         """
-        span = 1 + self.num_spec
         caches = (self.model_runner.mamba_k_cache, self.model_runner.mamba_v_cache)
         destinations, sources = [], []
-        for src_group, dst_group in pairs:
-            src_slot, dst_slot = src_group * span, dst_group * span
+        for src, dst in pairs:
             for cache in caches:
-                destinations.append(cache[:, dst_slot : dst_slot + span])
-                sources.append(cache[:, src_slot : src_slot + span])
+                destinations.append(cache[:, dst])
+                sources.append(cache[:, src])
         if destinations:
             torch._foreach_copy_(destinations, sources)
 
+    def _checkpoint_targets(self, batch: ScheduledBatch) -> dict | None:
+        """Checkpoints this step reaches, as device index tensors.
+
+        Every reserved position this step covers, `cached < p <= cached +
+        scheduled`, is a target — INCLUDING one at the step's end. That end
+        case needs its own copy like any other: the chunk kernel leaves the
+        final state in the sequence's RUNTIME slot, and a checkpoint slot is
+        never the runtime slot. Assuming otherwise leaves the checkpoint
+        unwritten while `commit_midstep` publishes it anyway, so a later
+        request resumes from whatever the slot's previous tenant left behind.
+
+        `is_end` marks those targets, because their source differs: the state
+        at the end of a sequence's tokens is not in `h`, which holds chunk
+        boundaries strictly before the end — `chunk_offsets[row] + T // 64` is
+        already the NEXT sequence's first chunk. It exists only in the runtime
+        slot, so the kernel reads `runtime_slots[i]` instead.
+
+        Built once per step, not per layer: every GDN layer copies the same
+        targets, so the H2D transfer is hoisted here and each layer just
+        launches one kernel over it.
+
+        Offsets are relative to the start of the sequence's slice OF THIS
+        STEP. `h` and the conv input only ever hold this step's tokens, and
+        `cu_seqlens` / `chunk_offsets` locate each sequence within them — so
+        the kernel reconstructs an absolute index as `cu_seqlens[row] + off`
+        (conv) or `chunk_offsets[row] + off // 64` (SSM). Both bases are
+        per-sequence: omitting them is what made an earlier Python-loop
+        version silently capture one sequence's state into another's
+        checkpoint whenever a batch held two prefills.
+
+        A target is dropped when this step holds too few tokens before it to
+        fill the conv window. Both halves of a checkpoint must land together —
+        an SSM state at P paired with a conv window from elsewhere is silently
+        wrong, and worse than no checkpoint at all, because it is findable.
+
+        Slots, not a separate checkpoint region: a checkpoint here IS an
+        ordinary pool slot, indexed exactly as every other slot on this path
+        is. (The upstream branch appends checkpoints after the runtime slots
+        and offsets them by a `state_cache_base`; that region does not exist
+        in this pool.) One slot is the whole checkpoint — a resumed prefix has
+        no speculation to roll back, so it needs no scratch beside it.
+        """
+        all_saves = getattr(batch, "state_save_all", None)
+        if not all_saves:
+            return None
+        # Tokens of conv history a checkpoint needs behind it: the conv state
+        # width. From the config, so it tracks the model rather than assuming.
+        state_len = self.model_runner.config.hf_config.linear_conv_kernel_dim - 1
+        cached = batch.num_cached_tokens
+        sched = batch.num_scheduled_tokens
+        runtime_slots = batch.state_slots_committed
+        limit = self.model_runner.mamba_k_cache.shape[1]
+
+        found = []
+        # A seq may hold several reservations (a grid rung, a demand, the
+        # prompt-end anchor); take every one this step reaches.
+        for i, reservations in enumerate(all_saves):
+            if i >= len(runtime_slots):
+                continue
+            start = int(cached[i])
+            end = start + int(sched[i])
+            for dst_slot, p in reservations:
+                dst = int(dst_slot)
+                p = int(p)
+                # `dst >= limit` would mean the scheduler's pool outgrew this
+                # rank's tensor; skipping degrades to "no checkpoint", which
+                # is always safe, where writing would corrupt another slot.
+                if not 0 <= dst < limit:
+                    continue
+                if not (start + state_len <= p <= end):
+                    continue
+                found.append((i, dst, p - start, int(p == end), runtime_slots[i]))
+        if not found:
+            return None
+
+        def mk(col):
+            return torch.tensor(col, dtype=torch.int32, device=self.device)
+
+        rows, slots, offs, is_end, runtime = zip(*found)
+        return {
+            "rows": mk(rows),
+            "slots": mk(slots),
+            "offs": mk(offs),
+            "is_end": mk(is_end),
+            "runtime": mk(runtime),
+        }
+
     def prepare_state_indices(self, batch: ScheduledBatch, with_spec: bool = False):
+        """Fill the index tensors the GDN kernels gather their state through.
+
+        The seq's own slot list is written straight in — no base, no stride.
+        The pool hands out slots one at a time and a request's set is not
+        adjacent; the kernels never assumed it was (the ssm kernel loads each
+        index out of this tensor, and the conv path is handed column 0 alone),
+        so this is where a contiguity assumption would have been *invented*
+        rather than a place one has to be honoured.
+        """
         non_spec_state_indices = self.non_spec_state_indices_tensor.np
         non_spec_state_indices_in = self.non_spec_state_indices_in_tensor.np
         spec_state_indices = self.spec_state_indices_tensor.np
-        slots_per_group = 1 + self.num_spec
         fork_srcs = getattr(batch, "state_fork_srcs", None) or ()
         assert not (with_spec and any(s >= 0 for s in fork_srcs)), (
             "state fork on the spec-decode path: spec_state_indices_tensor has "
             "no read-side counterpart (BlockManager only forks onto prefill)"
         )
-        for idx, slot_group in enumerate(batch.per_req_cache_groups):
+        for idx, slots in enumerate(batch.state_slots):
             non_spec_state_indices[idx] = 0
             non_spec_state_indices_in[idx] = 0
             spec_state_indices[idx] = 0
-            base = slot_group * slots_per_group
+            committed = slots[0]
 
             if not with_spec:
-                non_spec_state_indices[idx] = base
-                # A forked seq reads the group it published (or resumed from)
-                # and writes the fresh one for this forward only.
+                non_spec_state_indices[idx] = committed
+                # A forked seq reads the slot it published (or resumed from)
+                # and writes the fresh one for this forward only. The source is
+                # a checkpoint, which is one slot, so it needs no translation.
                 src = fork_srcs[idx] if idx < len(fork_srcs) else -1
-                non_spec_state_indices_in[idx] = (
-                    src * slots_per_group if src >= 0 else base
-                )
+                non_spec_state_indices_in[idx] = src if src >= 0 else committed
             else:
-                spec_state_indices[idx, : 1 + self.num_spec] = np.arange(
-                    base, base + 1 + self.num_spec
-                )
+                spec_state_indices[idx, : len(slots)] = slots
 
     def prepare_num_accepted_tokens(self, batch: ScheduledBatch):
         self.num_accepted_tokens.fill_(1)
@@ -697,6 +859,21 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             attn_metadata.gdn_metadata = None
             return attn_metadata, positions
         gdn_metadata = self.prepare_gdn_metadata(batch, attn_metadata, is_prefill=True)
+
+        # Interior checkpoints: the impl slices them out of the chunk kernel's
+        # per-chunk states, so a checkpoint mid-prompt costs no extra forward.
+        # Positions at the step's end are sourced from the runtime slot; both
+        # kinds are tagged and written by one kernel.
+        gdn_metadata.ssm_checkpoints = self._checkpoint_targets(batch)
+        if gdn_metadata.ssm_checkpoints is not None:
+            # Same mapping the chunk kernel builds internally, computed once
+            # per step rather than per layer.
+            from atom.model_ops.fla_ops.chunk import CHUNK_SIZE
+            from atom.model_ops.fla_ops.index import prepare_chunk_offsets
+
+            gdn_metadata.ssm_chunk_offsets = prepare_chunk_offsets(
+                gdn_metadata.non_spec_query_start_loc, CHUNK_SIZE
+            )
 
         attn_metadata.gdn_metadata = gdn_metadata
         return attn_metadata, positions

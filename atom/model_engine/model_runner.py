@@ -1720,6 +1720,39 @@ class ModelRunner:
         # Keep runtime state metadata out of Config.
         transfer = self.attn_metadata_builder.state_transfer()
         uses_paged_state = transfer.copies
+        # How many paged blocks one contiguous state slot spans, so the block
+        # pool can hand a backend that whole range instead of the split being
+        # carved once at startup. Derived from the plan the pool is actually
+        # built at — a value from anywhere else could disagree with it, and a
+        # backend handed a range of the wrong length has no way to notice.
+        #
+        # Only for a class whose per-request state IS one contiguous range: a
+        # PAGE-copy backend keeps its checkpoints as page images and needs no
+        # superblock, and a model with no per-request state has nothing to
+        # size. Both leave the field 0, which is the pre-superblock path.
+        slot_bytes = int(plan.entry_bytes.get(STATE_SLOT_CLASS, 0))
+        config.blocks_per_superblock = (
+            -(-slot_bytes // block_bytes) if slot_bytes and not uses_paged_state else 0
+        )
+        # How far the slot pool may grow. A backend that carves its state out
+        # of the same superblocks the blocks come from has one slot per
+        # superblock, so the superblock supply -- which already governs the
+        # bytes -- is the only ceiling. A backend with its own per-request
+        # tensor is sized for `plan.entries` and cannot exceed it; 0 says so.
+        #
+        # Derived here beside `blocks_per_superblock`, from the same plan, so
+        # the two cannot disagree about how many superblocks there are.
+        config.max_state_slots = (
+            (
+                int(plan.reserved_bytes.get(plan.paged_class or "", 0))
+                + int(plan.reserved_bytes.get(STATE_SLOT_CLASS, 0))
+            )
+            // (config.blocks_per_superblock * block_bytes)
+            if config.blocks_per_superblock
+            and getattr(self.attn_metadata_builder, "uses_unified_pool", False)
+            else 0
+        )
+
         if uses_paged_state and config.pipeline_parallel_size > 1:
             raise RuntimeError(
                 "PAGE-backed state checkpoints do not yet support pipeline "
@@ -1836,6 +1869,20 @@ class ModelRunner:
             "pool_entries": dict(plan.entries),
             "pool_entries_per_req": dict(plan.entries_per_req),
             "state_runtime": state_runtime.to_wire(),
+            # Sized here, because only here is the plan the pool is actually
+            # built at known — but read in the engine process, so it has to
+            # travel. Left on this process's `config` it arrived as 0 over
+            # there and switched superblocks off for the model they were built
+            # for, silently, which a whole benchmark run then measured.
+            "blocks_per_superblock": int(
+                getattr(config, "blocks_per_superblock", 0) or 0
+            ),
+            # How far the slot pool may grow, which is not the same as how many
+            # slots it starts with. Same journey and same reason as the line
+            # above: only this process knows how the state tensor was
+            # allocated, and the allocator bound by its slot dimension lives in
+            # the other one. 0 means "no more than you were given".
+            "max_state_slots": int(getattr(config, "max_state_slots", 0) or 0),
         }
 
     def allocate_kv_cache(self, num_kvcache_blocks):

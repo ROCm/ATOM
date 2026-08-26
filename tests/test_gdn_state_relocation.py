@@ -1,11 +1,16 @@
 # SPDX-License-Identifier: MIT
-# Tests for relocating a GDN state group's bytes.
+# Tests for relocating a GDN state slot's bytes.
 #
 # GDN checkpoints by forking, so this path is not about checkpoints: moving the
-# state pool's boundary has to be able to shift a group out of the way, and that
-# is a byte move whatever mechanism the class uses to checkpoint. The unit that
-# moves is the whole group -- `1 + num_spec` consecutive slots, because the
-# extra ones hold the per-draft states a rejected speculation rolls back to.
+# state pool's boundary has to be able to shift a slot out of the way, and that
+# is a byte move whatever mechanism the class uses to checkpoint.
+#
+# The unit that moves is one slot -- one complete recurrent state, across every
+# layer. A request under speculative decoding holds `1 + num_spec` of them, but
+# they are allocated one at a time and need not be adjacent, so relocating such
+# a request is several pairs rather than one wider pair. That is the whole point
+# of the per-slot allocation: a checkpoint holds a committed state and has no
+# speculation to roll back, so it costs one slot rather than a full group.
 
 from types import SimpleNamespace
 
@@ -17,88 +22,95 @@ pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
 from atom.model_ops.attentions.gdn_attn import GDNStateMixin
 
 LAYERS = 3
-GROUPS = 4
+SLOTS = 12
 SHAPE_K = (2, 5)
 SHAPE_V = (2, 3, 4)
 
 
 def build(num_spec: int):
     """Caches whose every (layer, slot) plane carries a distinct value."""
-    span = 1 + num_spec
-    slots = GROUPS * span
-    k = torch.zeros((LAYERS, slots) + SHAPE_K)
-    v = torch.zeros((LAYERS, slots) + SHAPE_V)
+    k = torch.zeros((LAYERS, SLOTS) + SHAPE_K)
+    v = torch.zeros((LAYERS, SLOTS) + SHAPE_V)
     for layer in range(LAYERS):
-        for slot in range(slots):
+        for slot in range(SLOTS):
             k[layer, slot] = layer * 100 + slot
             v[layer, slot] = -(layer * 100 + slot)
     stub = SimpleNamespace(
         num_spec=num_spec,
         model_runner=SimpleNamespace(mamba_k_cache=k, mamba_v_cache=v),
     )
-    return stub, k, v, span
+    return stub, k, v
 
 
 @pytest.mark.parametrize("num_spec", [0, 2])
-def test_relocation_moves_every_layer_and_every_slot_of_the_group(num_spec):
-    stub, k, v, span = build(num_spec)
+def test_relocation_moves_every_layer_of_the_slot(num_spec):
+    """And moves exactly one slot, whatever `num_spec` says.
+
+    Parametrized over `num_spec` precisely because the answer must not depend
+    on it: the slot is the unit, so a wider request is more pairs, not a wider
+    pair. Under the old group-width relocation this moved `1 + num_spec` slots
+    and the two parametrizations disagreed.
+    """
+    stub, k, v = build(num_spec)
     before_k, before_v = k.clone(), v.clone()
 
     GDNStateMixin.relocate_state_slots(stub, [(1, 3)])
 
-    src, dst = 1 * span, 3 * span
-    assert torch.equal(k[:, dst : dst + span], before_k[:, src : src + span])
-    assert torch.equal(v[:, dst : dst + span], before_v[:, src : src + span])
+    assert torch.equal(k[:, 3], before_k[:, 1])
+    assert torch.equal(v[:, 3], before_v[:, 1])
     # The source is untouched: relocation duplicates, the caller retires the
     # old index afterwards.
-    assert torch.equal(k[:, src : src + span], before_k[:, src : src + span])
+    assert torch.equal(k[:, 1], before_k[:, 1])
 
 
-def test_relocation_leaves_neighbouring_groups_alone():
-    stub, k, v, span = build(num_spec=2)
+def test_relocation_leaves_every_other_slot_alone():
+    stub, k, v = build(num_spec=2)
     before_k, before_v = k.clone(), v.clone()
 
     GDNStateMixin.relocate_state_slots(stub, [(1, 3)])
 
-    for group in (0, 2):
-        lo = group * span
-        assert torch.equal(k[:, lo : lo + span], before_k[:, lo : lo + span])
-        assert torch.equal(v[:, lo : lo + span], before_v[:, lo : lo + span])
+    for slot in range(SLOTS):
+        if slot == 3:
+            continue
+        assert torch.equal(k[:, slot], before_k[:, slot])
+        assert torch.equal(v[:, slot], before_v[:, slot])
 
 
 def test_several_pairs_in_one_call():
-    stub, k, _, span = build(num_spec=1)
+    stub, k, _ = build(num_spec=1)
     before_k = k.clone()
 
     GDNStateMixin.relocate_state_slots(stub, [(0, 2), (1, 3)])
 
     for src, dst in ((0, 2), (1, 3)):
-        lo_s, lo_d = src * span, dst * span
-        assert torch.equal(k[:, lo_d : lo_d + span], before_k[:, lo_s : lo_s + span])
+        assert torch.equal(k[:, dst], before_k[:, src])
+
+
+def test_a_whole_request_is_relocated_one_slot_at_a_time():
+    """A speculating request's slots are not a span and need not be adjacent.
+
+    Written as its own case because the old contract was the opposite one, and
+    getting it wrong is silent: a caller that still passes a base index and
+    expects `1 + num_spec` slots to follow would move two slots it does not own
+    and leave the request's real ones behind.
+    """
+    stub, k, _ = build(num_spec=2)
+    before_k = k.clone()
+    # Scattered on purpose -- this is what `pop_many` may return.
+    request_slots = [7, 2, 9]
+    targets = [1, 4, 6]
+
+    GDNStateMixin.relocate_state_slots(stub, list(zip(request_slots, targets)))
+
+    for src, dst in zip(request_slots, targets):
+        assert torch.equal(k[:, dst], before_k[:, src])
 
 
 def test_no_pairs_is_a_no_op():
-    stub, k, v, _ = build(num_spec=2)
+    stub, k, v = build(num_spec=2)
     before_k, before_v = k.clone(), v.clone()
 
     GDNStateMixin.relocate_state_slots(stub, [])
 
     assert torch.equal(k, before_k)
     assert torch.equal(v, before_v)
-
-
-def test_a_group_is_not_one_slot_when_speculating():
-    """The span is what distinguishes this from copying a single slot.
-
-    Written as its own case because getting it wrong is silent: with `num_spec`
-    slots left behind, a relocated request keeps drafting against another
-    group's rollback states.
-    """
-    stub, k, _, span = build(num_spec=2)
-    assert span == 3
-    before_k = k.clone()
-
-    GDNStateMixin.relocate_state_slots(stub, [(0, 2)])
-
-    for offset in range(span):
-        assert torch.equal(k[:, 2 * span + offset], before_k[:, offset])
