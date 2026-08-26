@@ -24,7 +24,8 @@ from atom.model_engine.page_unit_checkpoint import (
     PagedStateCheckpointCoordinator,
     PagedStateCheckpointSpec,
 )
-from atom.model_engine.scheduler import EngineStats, ScheduledBatchOutput, Scheduler
+from atom.model_engine.engine_stats import EngineStats
+from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
 from atom.model_engine.sequence import Sequence, SequenceType
 from atom.model_engine.state_cache import StateCache
 from atom.model_engine.state_pool import StateGroupPool

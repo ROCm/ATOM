@@ -17,8 +17,8 @@ from atom.kv_transfer.disaggregation.types import (
     SaveOperationId,
 )
 from atom.kv_transfer.offload._offload_common import OffloadSchedulerMixin
+from atom.model_engine.engine_stats import EngineStats
 from atom.model_engine.scheduler import (
-    EngineStats,
     ScheduledBatch,
     ScheduledBatchOutput,
     Scheduler,
@@ -118,6 +118,20 @@ class TestThroughputStats:
         # Closed anyway: the start is fresh, so the next window measures its
         # own interval rather than the 43s that preceded it.
         assert time.monotonic() - stats._throughput_last_log_time < 1.0
+
+    def test_a_burst_then_idle_is_still_reported(self, caplog):
+        """Silence is gated on zero tokens *as well as* an empty engine, so a
+        window still holding a finished burst's tokens prints even though
+        nothing is running by the time it closes."""
+        stats = EngineStats(enable_log_stats=True)
+        stats.update_throughput(num_prompt_tokens=30000)
+        stats._throughput_last_log_time -= 43.0
+        with caplog.at_level(logging.INFO, logger="atom"):
+            stats.maybe_log_throughput(
+                num_running_reqs=0, num_waiting_reqs=0, kv_usage=0.0
+            )
+        assert "Engine 000" in caplog.text, "a burst must not be swallowed"
+        assert stats.num_prompt_tokens == 0, "reported tokens must be cleared"
 
     def test_running_requests_keep_the_zero_line(self, caplog):
         """Zero tokens with requests in flight means the engine is stuck —
