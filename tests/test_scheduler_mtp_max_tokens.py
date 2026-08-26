@@ -5,10 +5,10 @@ from unittest import mock
 
 import numpy as np
 import pytest
-
-from atom.model_engine.scheduler import Scheduler, ScheduledBatchOutput
-from atom.sampling_params import SamplingParams
 from conftest import MockConfig
+
+from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
+from atom.sampling_params import SamplingParams
 
 
 class TestMTPMaxTokens:
