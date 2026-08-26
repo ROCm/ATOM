@@ -163,6 +163,7 @@ class WeightUpdaterMixin:
                 if wlp is not None:
                     buf.weight_loader_process = wlp
                 else:
+
                     def _weight_loader_process(param_data, loaded_weight):
                         if param_data.dtype != loaded_weight.dtype:
                             loaded_weight = loaded_weight.to(param_data.dtype)
@@ -346,8 +347,9 @@ class WeightUpdaterMixin:
             return
 
         from aiter import QuantType as _QT
-        from atom.utils import envs
+
         from atom.model_ops.utils import shuffle_weights
+        from atom.utils import envs
 
         needs_shuffle = False
         if quant_type.value == _QT.per_1x128.value:

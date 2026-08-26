@@ -764,6 +764,7 @@ class LinearBase(nn.Module):
             from atom.quantization.quark.utils import (
                 quantize_weight_to_fp8_128x128_blockscale,
             )
+
             # The blockscale GEMM path consumes true 128x128 scales shaped
             # (N//128, K//128). Keep online load/reload aligned with the
             # RLHF weight-sync requantization path.
