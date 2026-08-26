@@ -177,8 +177,7 @@ WAIT_ROUTER_TIMEOUT="${WAIT_ROUTER_TIMEOUT:-300}"
 BENCHMARK_KIND="${BENCHMARK_KIND:-random}"
 AIPERF_DIR="${AIPERF_DIR:-/tmp/atomesh-aiperf}"
 AIPERF_VENV="${AIPERF_VENV:-/tmp/atomesh-aiperf-venv}"
-# agentx-v1.0.4
-AIPERF_COMMIT="${AIPERF_COMMIT:-49634d1c6c2e6dcc18979d704a65e7c7064efc49}"
+AIPERF_COMMIT="${AIPERF_COMMIT:-b7b16cf851885567988a643282266bce74e34437}"
 AIPERF_SCENARIO="${AIPERF_SCENARIO:-inferencex-agentx-mvp}"
 AIPERF_PUBLIC_DATASET="${AIPERF_PUBLIC_DATASET:-semianalysis_cc_traces_weka_062126_256k}"
 AIPERF_MAX_CONTEXT_LENGTH="${AIPERF_MAX_CONTEXT_LENGTH:-262144}"
@@ -243,12 +242,10 @@ dump_launch_info() {
 apply_prefixed_env() {
   local prefix="$1"
   local role_ip="$2"
-  local handshake_port="${3:-${HANDSHAKE_PORT}}"
   local name raw value
   while IFS='=' read -r name raw; do
     [[ "${name}" == "${prefix}"* ]] || continue
     value="${raw//\$\{ROLE_IP\}/${role_ip}}"
-    value="${value//\$\{HANDSHAKE_PORT\}/${handshake_port}}"
     export "${name#${prefix}}=${value}"
   done < <(env)
 }
@@ -546,7 +543,7 @@ start_prefill() {
   local handshake_port="${3:-${HANDSHAKE_PORT}}"
   local dp_master_port="${4:-${PREFILL_DP_MASTER_PORT}}"
   local dp_base_port="${5:-${PREFILL_DP_BASE_PORT}}"
-  apply_prefixed_env "ATOMESH_PREFILL_ENV_" "${host_ip}" "${handshake_port}"
+  apply_prefixed_env "ATOMESH_PREFILL_ENV_" "${host_ip}"
   local -a prefill_cache_env=()
   build_server_cache_env "prefill" "${server_port}" prefill_cache_env
   local -a prefill_dp_env=()
@@ -583,7 +580,7 @@ start_decode() {
   local handshake_port="${3:-${HANDSHAKE_PORT}}"
   local dp_master_port="${4:-${DECODE_DP_MASTER_PORT}}"
   local dp_base_port="${5:-${DECODE_DP_BASE_PORT}}"
-  apply_prefixed_env "ATOMESH_DECODE_ENV_" "${host_ip}" "${handshake_port}"
+  apply_prefixed_env "ATOMESH_DECODE_ENV_" "${host_ip}"
   local max_conc
   max_conc="$(echo "${BENCH_MAX_CONCURRENCY}" | tr 'x,' '\n' | sort -n | tail -1)"
   local decode_max_num_seqs="${MAX_NUM_SEQS}"
