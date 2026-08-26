@@ -176,6 +176,10 @@ def _bind_v4_state_slots(md) -> None:
     md.state_slot_out = slots
 
 
+def _geometry_serves_ratio(geometry, ratio: int) -> bool:
+    return ratio in geometry.classes
+
+
 try:
     from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 except Exception:  # noqa: BLE001  # pragma: no cover - SGLang import-time fallback
@@ -1563,33 +1567,41 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
     md.block_tables_per_token = block_rows
 
     positions_gpu = positions[:t_pad]
-    dest_rows = {ratio: buf.gpu for ratio, buf in bufs.swa_dest_rows.items()}
+    geometry = md.pool_geometry
+    has_csa = _geometry_serves_ratio(geometry, 4)
+    has_hca = _geometry_serves_ratio(geometry, 128)
+    dest_rows = {
+        ratio: buf.gpu
+        for ratio, buf in bufs.swa_dest_rows.items()
+        if _geometry_serves_ratio(geometry, ratio)
+    }
     write_v4_paged_decode_indices(
         state_slot_per_seq=md.state_slot_mapping,
         batch_id_per_token=md.batch_id_per_token,
         positions=positions_gpu,
         swa_indptr=swa_indptr,
-        csa_indptr=csa_indptr,
-        hca_indptr=hca_indptr,
+        csa_indptr=csa_indptr if has_csa else None,
+        hca_indptr=hca_indptr if has_hca else None,
         swa_indices=bufs.idx_swa.gpu,
-        csa_indices=bufs.idx_csa.gpu,
-        hca_indices=bufs.idx_hca.gpu,
+        csa_indices=bufs.idx_csa.gpu if has_csa else None,
+        hca_indices=bufs.idx_hca.gpu if has_hca else None,
         dest_rows=dest_rows,
         T=t_pad,
         win=win,
-        geometry=md.pool_geometry,
+        geometry=geometry,
     )
-    write_v4_decode_hca_compress_tail(
-        batch_id_per_token=md.batch_id_per_token,
-        positions=positions_gpu,
-        hca_indptr=hca_indptr,
-        n_committed_hca_per_seq=md.n_committed_hca_per_seq,
-        block_tables=md.block_tables,
-        hca_indices=bufs.idx_hca.gpu,
-        T=t_pad,
-        win=win,
-        envelope_rows=md.pool_geometry.envelope_rows,
-    )
+    if has_hca:
+        write_v4_decode_hca_compress_tail(
+            batch_id_per_token=md.batch_id_per_token,
+            positions=positions_gpu,
+            hca_indptr=hca_indptr,
+            n_committed_hca_per_seq=md.n_committed_hca_per_seq,
+            block_tables=md.block_tables,
+            hca_indices=bufs.idx_hca.gpu,
+            T=t_pad,
+            win=win,
+            envelope_rows=geometry.envelope_rows,
+        )
     md.swa_dest_rows = dest_rows
     md.kv_indices_swa = bufs.idx_swa.gpu
     md.kv_indices_csa = bufs.idx_csa.gpu
@@ -2080,50 +2092,67 @@ def _populate_decode_indices(md, block_tables, pos_np, device) -> None:
     swa_indices = torch.empty(
         max(1, int(swa_indptr_np[-1])), dtype=torch.int32, device=device
     )
-    csa_indices = torch.empty(
-        max(1, int(csa_indptr_np[-1])), dtype=torch.int32, device=device
-    )
-    hca_indices = torch.empty(
-        max(1, int(hca_indptr_np[-1])), dtype=torch.int32, device=device
-    )
     T = len(batch_np)
+    geometry = md.pool_geometry
+    has_csa = _geometry_serves_ratio(geometry, 4)
+    has_hca = _geometry_serves_ratio(geometry, 128)
+    csa_indices = (
+        torch.empty(max(1, int(csa_indptr_np[-1])), dtype=torch.int32, device=device)
+        if has_csa
+        else None
+    )
+    hca_indices = (
+        torch.empty(max(1, int(hca_indptr_np[-1])), dtype=torch.int32, device=device)
+        if has_hca
+        else None
+    )
     dest_rows = {
         ratio: torch.empty(max(T, 1), dtype=torch.int32, device=device)
         for ratio in _V4_SWA_DEST_RATIOS
+        if _geometry_serves_ratio(geometry, ratio)
     }
     write_v4_paged_decode_indices(
         state_slot_per_seq=md.state_slot_mapping,
         batch_id_per_token=md.batch_id_per_token,
         positions=positions_gpu,
         swa_indptr=swa_indptr,
-        csa_indptr=csa_indptr,
-        hca_indptr=hca_indptr,
+        csa_indptr=csa_indptr if has_csa else None,
+        hca_indptr=hca_indptr if has_hca else None,
         swa_indices=swa_indices,
         csa_indices=csa_indices,
         hca_indices=hca_indices,
         dest_rows=dest_rows,
         T=T,
         win=win,
-        geometry=md.pool_geometry,
+        geometry=geometry,
     )
-    write_v4_decode_hca_compress_tail(
-        batch_id_per_token=md.batch_id_per_token,
-        positions=positions_gpu,
-        hca_indptr=hca_indptr,
-        n_committed_hca_per_seq=md.n_committed_hca_per_seq,
-        block_tables=block_tables,
-        hca_indices=hca_indices,
-        T=T,
-        win=win,
-        envelope_rows=md.pool_geometry.envelope_rows,
-    )
+    if has_hca:
+        write_v4_decode_hca_compress_tail(
+            batch_id_per_token=md.batch_id_per_token,
+            positions=positions_gpu,
+            hca_indptr=hca_indptr,
+            n_committed_hca_per_seq=md.n_committed_hca_per_seq,
+            block_tables=block_tables,
+            hca_indices=hca_indices,
+            T=T,
+            win=win,
+            envelope_rows=geometry.envelope_rows,
+        )
     md.swa_dest_rows = dest_rows
     md.kv_indices_swa = swa_indices[: int(swa_indptr_np[-1])]
-    md.kv_indices_csa = csa_indices[: int(csa_indptr_np[-1])]
-    md.kv_indices_hca = hca_indices[: int(hca_indptr_np[-1])]
+    md.kv_indices_csa = (
+        csa_indices[: int(csa_indptr_np[-1])]
+        if has_csa
+        else torch.empty(0, dtype=torch.int32, device=device)
+    )
+    md.kv_indices_hca = (
+        hca_indices[: int(hca_indptr_np[-1])]
+        if has_hca
+        else torch.empty(0, dtype=torch.int32, device=device)
+    )
     md.kv_indptr_swa = swa_indptr
-    md.kv_indptr_csa = csa_indptr
-    md.kv_indptr_hca = hca_indptr
+    md.kv_indptr_csa = csa_indptr if has_csa else torch.zeros(1, dtype=torch.int32, device=device)
+    md.kv_indptr_hca = hca_indptr if has_hca else torch.zeros(1, dtype=torch.int32, device=device)
 
 
 def _populate_prefill_indices(md, block_tables, batch_np, pos_np, q_np, device) -> None:
