@@ -155,32 +155,3 @@ class TestPagedCheckpointsAreRefusedWhereSizingWouldRaise:
         interior state to slice a checkpoint out of."""
         with tp_world(TP):
             assert not Builder.state_transfer(builder()).readable_midstep
-
-
-class TestTheSpareSlotsGoBackToTheKvPool:
-    """`--state-checkpoint-slots` buys Active Slots for checkpoints to sit in.
-    Under PAGE the image lives in KV blocks, so those slots would hold nothing
-    — 1.7 GiB of them at K3's geometry."""
-
-    def spec_of(self, monkeypatch, **kwargs):
-        """`state_spec` calls `super()`, which needs a real class rather than
-        the namespace the other tests here get away with."""
-        from atom.model_ops.attentions.sub_pool_spec import state_pool
-
-        monkeypatch.setattr(
-            K3.GDNStateMixin,
-            "state_spec",
-            lambda self: state_pool("state", 1024, entries_per_req=1, extra_entries=32),
-        )
-
-        class _Stub(Builder):
-            def __init__(self, source):
-                self.__dict__.update(source.__dict__)
-
-        return _Stub(builder(**kwargs)).state_spec()
-
-    def test_paged_runs_ask_for_no_spare_slots(self, monkeypatch):
-        assert self.spec_of(monkeypatch).extra_entries == 0
-
-    def test_fork_runs_keep_them(self, monkeypatch):
-        assert self.spec_of(monkeypatch, pp=2).extra_entries == 32

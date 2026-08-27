@@ -340,8 +340,8 @@ class CacheStats:
         Same denominator as `state_hit_rate`, so the two compose:
         `state_hit_rate + state_recoverable_loss_rate` is the rate the state
         cache would reach with a dense ladder. The distance from that to 1.0
-        is the part no checkpoint can buy, and the honest cap on what any
-        amount of `--state-checkpoint-slots` is worth.
+        is the part no checkpoint can buy, and so the honest cap on what any
+        amount of checkpoint capacity is worth.
         """
         return self._rate(
             self.total_wanted_tokens - self.total_cached_tokens,

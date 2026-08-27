@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 from collections.abc import Sequence
-from dataclasses import replace
 
 import numpy as np
 import torch
@@ -127,20 +126,6 @@ class _KimiMLAGDNCommon(GDNStateMixin):
             ":carry=all"
         )
         return StateTransfer.copy(layout_id)
-
-    def state_spec(self) -> SubPoolSpec:
-        """The mixin's spec, minus the spare checkpoint slots under PAGE.
-
-        `--state-checkpoint-slots` buys Active Slots for checkpoints to sit in,
-        which is what a fork needs and a copy does not: the image lives in KV
-        blocks, so those slots would hold nothing. At K3's 53.6 MiB a slot that
-        is 1.7 GiB reserved for nothing — and it is the same memory the paged
-        pool wants in order to absorb the 127-block images.
-        """
-        spec = super().state_spec()
-        if not self._uses_paged_checkpoints():
-            return spec
-        return replace(spec, extra_entries=0)
 
     def sub_pool_specs(self) -> list[SubPoolSpec]:
         """MLA paged KV for the full-attention layers, plus the KDA/GDN

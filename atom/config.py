@@ -1510,13 +1510,6 @@ class Config:
     #       still place checkpoints
     # See BlockManager.checkpointers_at.
     state_checkpoint_interval_tokens: int = 8192
-    # Extra state slots to size the STATE pool with on top of what the
-    # in-flight requests take. Checkpoints live in the same pool as running
-    # requests, so at 0 the room to keep one is whatever concurrency leaves
-    # over — declaring it here decouples the two. Counted one per checkpoint,
-    # not one per request width: a checkpoint holds only the committed state.
-    # See `SubPoolSpec.extra_entries`.
-    state_checkpoint_slots: int = 0
     # Whether a refused hit may place a rung of its own. Off leaves the
     # prompt-end anchor as the only placement; the rung reads back far less
     # often than the anchor, so its worth is an open question — see

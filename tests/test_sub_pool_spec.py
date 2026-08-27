@@ -124,18 +124,19 @@ class TestPlanPools:
         assert plan.reserved_bytes[ENTRY_STATE] == (8 + 3) * 10
         assert plan.entries[ENTRY_KV] == 8
 
-    def test_checkpoint_headroom_is_counted_one_slot_per_checkpoint(self):
-        """What `--state-checkpoint-slots` buys, at the GDN width.
+    def test_extra_entries_are_a_flat_cushion_not_a_per_request_one(self):
+        """`extra_entries` is passed through, NOT multiplied by the width.
 
-        `extra_entries` is passed through, NOT multiplied by the per-request
-        width: a live request takes `1 + num_spec` slots because it speculates,
-        a checkpoint takes one because it holds a committed state and has
-        nothing to roll back. `BlockManager` counts slots raw — there is no
-        `entries // entries_per_req` rounding to align to any more.
+        The distinction matters for anything a cushion holds that is not a
+        live request: a checkpoint takes one slot because it holds a committed
+        state and has nothing to roll back, where a live request takes
+        `1 + num_spec` because it speculates. `BlockManager` counts slots raw,
+        with no `entries // entries_per_req` rounding to align to.
 
-        The saving is the difference asserted below: at `spr == 3`, 32
-        checkpoints cost 32 slots rather than 96, and the 64 not spent stay in
-        the paged pool, which is sized out of what is left after this.
+        No backend passes a nonzero `extra_entries` today. This pins the
+        arithmetic so the next one to want a cushion gets a flat one rather
+        than `width x` what it asked for -- at `spr == 3` below, that is 32
+        slots against 96, with the difference staying in the paged pool.
         """
         spr = 3  # 1 + num_spec, the GDN width
         specs = [

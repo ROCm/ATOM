@@ -320,32 +320,24 @@ class GDNStateMixin:
         Concrete builders splice this into their `sub_pool_specs()` alongside
         whatever paged KV pool they own.
 
-        `--state-checkpoint-slots` buys entries beyond the in-flight floor.
-        Without it a retained checkpoint can only sit in a slot `max_num_seqs`
-        left spare, so the room to keep one is set by concurrency rather than
-        by how much reuse the traffic has — the reason a *lower* max_num_seqs
-        measures a *worse* hit rate on prefix-reusing traffic.
-
-        The extra entries are counted one per checkpoint, NOT `spr` each: a
-        checkpoint only ever holds a committed state, and the `num_spec`
-        rollback slots beside it are scratch a resumed prefix has no use for.
-        At `--num-speculative-tokens 2` that is the difference between a
-        checkpoint costing three slots and costing one, and the slots it does
-        not take stay available to the KV cache, which is sized out of what is
-        left after this.
+        Sized for in-flight requests and nothing more. A retained checkpoint
+        sits in a slot `max_num_seqs` left spare, so how many can be kept is
+        set by concurrency rather than by how much reuse the traffic has —
+        which is why a *lower* max_num_seqs measures a *worse* hit rate on
+        prefix-reusing traffic. Decoupling the two is what the PAGE path does,
+        by keeping the image in KV blocks instead of a slot; a flat cushion
+        here would buy the same thing for `fork` at the cost of a knob nobody
+        can size without measuring, so it is not offered.
         """
         shape_k, shape_v = self._state_shape_for_runner()
         dt_k, dt_v = self._state_dtypes()
         per_layer = (
             math.prod(shape_k) * dt_k.itemsize + math.prod(shape_v) * dt_v.itemsize
         )
-        spr = 1 + self.num_spec
-        extra = max(0, getattr(self.model_runner.config, "state_checkpoint_slots", 0))
         return state_pool(
             STATE_SLOT_CLASS,
             self.model_runner.num_gdn_attn_state * per_layer,
-            entries_per_req=spr,
-            extra_entries=extra,
+            entries_per_req=1 + self.num_spec,
         )
 
     def allocate_per_req_cache(
