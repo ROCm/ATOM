@@ -138,6 +138,17 @@ for key, value in exports.items():
 PY
 )"
 
+SLURM_QOS="${SLURM_QOS:-amd-burst-qos}"
+case "${RUNNER_NAME:-}" in
+  plugin_runner_crusoe_v2_01|plugin_runner_crusoe_v2_02)
+    export SPUR_CONTROLLER_ADDR="http://crs-m2m-cpu-spur-v2-001.crusoe.amd.com:6817"
+    export SPUR_ACCOUNTING_ADDR="${SPUR_V2_ACCOUNTING_ADDR:-http://crs-m2m-cpu-spur-v2-001.crusoe.amd.com:6819}"
+    export SLURM_ACCOUNT="amd-aifw-dev"
+    export SLURM_PARTITION=""
+    SLURM_QOS="amd-aifw-dev-qos"
+    ;;
+esac
+
 export RESULT_DIR
 CURRENT_USER="$(id -un 2>/dev/null || id -u)"
 SLURM_LOG_ROOT="${SLURM_LOG_ROOT//\$\{USER\}/${CURRENT_USER}}"
@@ -154,7 +165,12 @@ USES_SPUR_CONTROLLER=1
 echo "=== plugin CI cell ==="
 echo "cell=${PLUGIN_CI_CELL_ID}"
 echo "plugin=${PLUGIN_CI_PLUGIN}"
+echo "runner_name=${RUNNER_NAME:-unknown}"
 echo "nodes=${NODE_LIST:-auto}"
+echo "slurm_account=${SLURM_ACCOUNT}"
+echo "slurm_partition=${SLURM_PARTITION:-default}"
+echo "slurm_qos=${SLURM_QOS}"
+echo "spur_controller=${SPUR_CONTROLLER_ADDR}"
 echo "slurm_job_name=${SLURM_JOB_NAME}"
 echo "log_root=${LOG_ROOT}"
 echo "submit_lock_file=${SUBMIT_LOCK_FILE}"
@@ -194,9 +210,11 @@ SBATCH_CMD=(
   --exclusive
   --export=ALL
   --account "${SLURM_ACCOUNT}"
-  --partition "${SLURM_PARTITION}"
-  -q amd-burst-qos
+  --qos "${SLURM_QOS}"
 )
+if [[ -n "${SLURM_PARTITION}" ]]; then
+  SBATCH_CMD+=(--partition "${SLURM_PARTITION}")
+fi
 if [[ -n "${NODE_LIST}" ]]; then
   SBATCH_CMD+=(--nodelist "${NODE_LIST}")
 fi
