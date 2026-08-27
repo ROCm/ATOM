@@ -2555,7 +2555,7 @@ class ModelRunner:
         bs = batch.total_seqs_num
         scheduled_tokens = batch.total_tokens_num
         num_scheduled_tokens = np.asarray(batch.num_scheduled_tokens)
-        cu_seqlens_q, arange = self._get_cumsum_and_arange(num_scheduled_tokens)
+        cu_seqlens_q, _arange = self._get_cumsum_and_arange(num_scheduled_tokens)
         if preprocessed is None:
             preprocessed = self._preprocess(
                 batch,
@@ -2567,7 +2567,7 @@ class ModelRunner:
             running_tokens,
             num_tokens_across_dp,
             dp_uniform_decode,
-            max_tokens,
+            _max_tokens,
             tbo_collective_active,
             ub_max_tokens_across_dp,
             _dspark_shape_max,

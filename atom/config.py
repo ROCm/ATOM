@@ -1869,17 +1869,17 @@ class Config:
         # only for server mode or plugin mode(vllm)
         # for torch compile policy, plugin mode(vllm) uses the ATOM compile policy
         # for cuda graph capture, plugin mode(vllm) uses the vLLM's cuda graph capture policy
-        if not is_plugin_mode() or (
-            self.plugin_config is not None and self.plugin_config.is_vllm
-        ):
-            if self.compilation_config.level == CompilationLevel.PIECEWISE:
-                self.compilation_config.set_splitting_ops_for_v1()
-                # Keep an explicit cudagraph_mode (e.g. FULL); default to
-                # PIECEWISE only when unset. splitting_ops/sizes are set either
-                # way so the model is still piece-split-compiled at level 3.
-                if self.compilation_config.cudagraph_mode is None:
-                    self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
-                self.compilation_config.init_with_cudagraph_sizes()
+        if (
+            not is_plugin_mode()
+            or (self.plugin_config is not None and self.plugin_config.is_vllm)
+        ) and self.compilation_config.level == CompilationLevel.PIECEWISE:
+            self.compilation_config.set_splitting_ops_for_v1()
+            # Keep an explicit cudagraph_mode (e.g. FULL); default to
+            # PIECEWISE only when unset. splitting_ops/sizes are set either
+            # way so the model is still piece-split-compiled at level 3.
+            if self.compilation_config.cudagraph_mode is None:
+                self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+            self.compilation_config.init_with_cudagraph_sizes()
 
         self.torch_dtype = (
             self.hf_config.dtype

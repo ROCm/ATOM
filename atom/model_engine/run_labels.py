@@ -29,7 +29,7 @@ fall outside those, so dummies never pollute the prefill/decode statistics.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from atom.model_engine.scheduler import ScheduledBatch
@@ -42,7 +42,7 @@ def build_run_label(
     is_dummy: bool,
     tbo_on: bool,
     scheduled_bs: int,
-    batch: Optional["ScheduledBatch"],
+    batch: ScheduledBatch | None,
     running_bs: int,
     detailed_suffix: str = "",
 ) -> str:
