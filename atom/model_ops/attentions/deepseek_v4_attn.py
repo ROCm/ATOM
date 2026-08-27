@@ -2622,6 +2622,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             sum_scheduled_tokens,
             running_bs=running_bs,
             max_q_len=max_seqlen_q,
+            running_tokens=sum_scheduled_tokens_padded,
         )
         self._attach_v4_indexer_meta(
             attn_metadata,
@@ -3376,10 +3377,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         token_num_per_seq,
         state_slot_out_cpu,
         scheduled_bs: int,
-        total_tokens: int,
+        scheduled_tokens: int,
         *,
         running_bs: int | None = None,
         max_q_len: int | None = None,
+        running_tokens: int | None = None,
         buf_prefix_ubatch: str = "",
     ) -> None:
         """Hoist per-fwd, layer-invariant metadata used by every V4 layer.
@@ -3400,7 +3402,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             per-seq state cache slot (already set by prepare_*; passed
             through unchanged here).
 
-        Caller contract: `scheduled_bs >= 1` and `total_tokens >= 1`.
+        Caller contract: `scheduled_bs >= 1` and `scheduled_tokens >= 1`.
         warmup_model + dummy_run paths both enforce these via min-1 fallbacks
         (model_runner.warmup_model:1003-1011, _populate_state_slot_mappings
         zeros-fill); CG capture uses running_bs >= 1 too.
@@ -3415,7 +3417,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # bucket `running_bs * (1+max_spec_steps)` so the per-token
         # `batch_id_per_token` buffer has a stable shape across captures.
         # Prefill states (PREFILL_NATIVE / PREFILL_PREFIX) are eager and
-        # use `total_tokens` exactly — no wasted padding (a long prefill
+        # use `scheduled_tokens` exactly — no wasted padding (a long prefill
         # chunk doesn't need to be padded up to a bucket that doesn't
         # exist for it).
         if is_pure_decode:
@@ -3423,9 +3425,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 "DECODE state requires running_bs + max_q_len from caller "
                 "(CG bucket size — fixed at capture)"
             )
-            padded_total_tokens = int(running_bs) * int(max_q_len)
+            padded_total_tokens = (
+                int(running_tokens)
+                if running_tokens is not None
+                else int(running_bs) * int(max_q_len)
+            )
         else:
-            padded_total_tokens = total_tokens
+            padded_total_tokens = scheduled_tokens
 
         var = self.model_runner.forward_vars
 
@@ -3439,7 +3445,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             np.arange(scheduled_bs, dtype=np.int32), token_num_per_seq
         )
         batch_id_per_token_np = np.full(padded_total_tokens, -1, dtype=np.int32)
-        batch_id_per_token_np[:total_tokens] = batch_id_unpadded_np
+        batch_id_per_token_np[:scheduled_tokens] = batch_id_unpadded_np
         attn_metadata.batch_id_per_token_cpu = batch_id_unpadded_np
 
         # context_lens is int32 on the buffer; keep dtype through divide so
@@ -3487,7 +3493,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             token_num_per_seq=token_num_per_seq,
             state_slot_out_cpu=state_slot_out_cpu,
             scheduled_bs=scheduled_bs,
-            total_tokens=total_tokens,
+            total_tokens=scheduled_tokens,
             padded_total_tokens=padded_total_tokens,
             buf_prefix_ubatch=buf_prefix_ubatch,
         )
