@@ -123,6 +123,20 @@ triton_fused_qk_rope_cat_and_cache_mla = mark_trace(
     torch_compile=False,
 )
 
+# Gluon sparse (top-k gathered) MLA, gated by ATOM_USE_TRITON_SPARSE_MLA.
+# Optional: older aiter builds have no sparse_mla_fwd.
+try:
+    from aiter.ops.triton.attention.sparse_mla import (
+        sparse_mla_fwd as _gluon_sparse_mla_fwd,
+    )
+
+    gluon_sparse_mla_fwd = mark_trace(
+        _gluon_sparse_mla_fwd, prefix="mla_decode_sparse_gluon", torch_compile=False
+    )
+except Exception:  # noqa: BLE001
+    gluon_sparse_mla_fwd = None
+
+
 # torch.set_printoptions(threshold=10_000)
 
 logger = logging.getLogger("atom")
@@ -148,6 +162,19 @@ def mla_min_query_heads(kv_cache_dtype: str, block_width: int) -> int:
     if block_width == 2 and kv_cache_dtype.startswith("fp8"):
         return 32
     return _MLA_MIN_HEADS
+
+
+def gluon_sparse_mla_supported() -> bool:
+    """Whether the Gluon sparse-MLA kernel can run on this GPU (gfx950 only).
+
+    Like ``dcp_persistent_supported``: cache it once per ``__init__`` to keep
+    ``get_gfx()`` off the per-forward path (graph-break).
+    """
+    if gluon_sparse_mla_fwd is None:
+        return False
+    from aiter.jit.utils.chip_info import get_gfx
+
+    return get_gfx() == "gfx950"
 
 
 def mla_kernel_num_heads(num_heads: int) -> int:
@@ -593,6 +620,26 @@ class MLAAttention(nn.Module):
 
         self.dcp_persistent_supported = dcp_persistent_supported()
         self.dcp_prefill_merge_bf16_ok = dcp_prefill_merge_bf16_ok()
+
+        # Run the sparse decode on the Gluon kernel instead, if available.
+        self.use_gluon_sparse_mla = (
+            envs.ATOM_USE_TRITON_SPARSE_MLA
+            and self.is_sparse_mla
+            and self.dcp_world_size == 1
+            and self.kv_cache_dtype in ("auto", "fp8")
+            and self.dtype in (torch.bfloat16, torch.float8_e4m3fn)
+            and gluon_sparse_mla_supported()
+        )
+        # Layer 0 only: this runs per layer and the answer is model-wide.
+        if (
+            envs.ATOM_USE_TRITON_SPARSE_MLA
+            and not self.use_gluon_sparse_mla
+            and self.layer_num == 0
+        ):
+            logger.warning(
+                "ATOM_USE_TRITON_SPARSE_MLA=1 but this configuration is not "
+                "covered by the Gluon sparse-MLA kernel; using the asm decode."
+            )
 
         # Compacted per-layer sparse offsets for DCP decode; rebound by the
         # metadata builder to the shared buffer (see aiter_mla.py).
@@ -1616,6 +1663,52 @@ class MLAAttention(nn.Module):
         # [num_token_slots, 1, d] -> [num_blocks, block_size, d] -> [.., 1, ..]
         return kv_cache.view(num_blocks, block_size, d).unsqueeze(1)
 
+    def _forward_decode_gluon_sparse(
+        self,
+        q: torch.Tensor,  # [num_tokens, num_heads, d_qk], NOT head-padded
+        kv_c_and_k_pe_cache: torch.Tensor,
+        attn_metadata: AttentionMetaData,
+    ) -> torch.Tensor:
+        """The same sparse decode as the asm path, on aiter's Gluon kernel.
+
+        Sparse KV is packed per token at page_size 1, so ``sparse_kv_indptr``
+        and the indexer's flat slot ids are already the kernel's ``kv_indptr`` /
+        ``kv_indices`` -- MTP verify included, its layout is per-token too. Two
+        things the asm path needs and this one does not:
+
+        - query-head padding: the kernel runs num_heads < 16 natively.
+        - the persistent work-stealing metadata: never read, since the split-K
+          count comes from the shapes.
+        """
+        num_tokens = q.shape[0]
+        d_qk = self.kv_lora_rank + self.qk_rope_head_dim
+        o = torch.empty(
+            num_tokens,
+            q.shape[1],
+            self.kv_lora_rank,
+            dtype=self.dtype,
+            device=q.device,
+        )
+        # fp8 q carries the layer's static scale and the cache is fp8 in the same
+        # case, so both dots run on the fp8 matrix core with no dequant.
+        q_is_fp8 = q.dtype == torch.float8_e4m3fn
+        gluon_sparse_mla_fwd(
+            q,
+            # The same flattening the asm call applies, so both paths stay
+            # indifferent to the cache buffer's shape.
+            kv_c_and_k_pe_cache.view(-1, 1, 1, d_qk),
+            attn_metadata.sparse_kv_indptr[: num_tokens + 1],
+            self.sparse_kv_indices_buffer,
+            self.scale,
+            kv_scale=self._k_scale if self.kv_cache_dtype == "fp8" else None,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            dot_precision="fp8" if q_is_fp8 else "bf16",
+            q_scale=self._q_scale if q_is_fp8 else None,
+            out=o,
+        )
+        return o
+
     def _forward_decode(
         self,
         q: torch.Tensor,
@@ -1631,6 +1724,13 @@ class MLAAttention(nn.Module):
         assert attn_metadata is not None
         B = q.shape[0]
         num_heads_q = q.shape[1]
+
+        # Before _pad_decode_query_heads: running num_heads natively is the point.
+        # return_lse is the one runtime gate; only DCP asks for it.
+        if self.use_gluon_sparse_mla and not return_lse:
+            return self._forward_decode_gluon_sparse(
+                q, kv_c_and_k_pe_cache, attn_metadata
+            )
 
         q = self._pad_decode_query_heads(q)
 
