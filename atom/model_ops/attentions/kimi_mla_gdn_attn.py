@@ -90,10 +90,14 @@ class _KimiMLAGDNCommon(GDNStateMixin):
         127 ordinary KV blocks — 0.112% of the paged pool — drawn from the same
         free list as everything else, and evicted by the same LRU.
 
-        Not midstep-readable: KDA calls `chunk_kimi_delta_attn`, which returns
-        only the final state and never exposes the per-chunk states an interior
-        checkpoint would be sliced out of. `PagedStateCheckpointCoordinator`
-        says `False` for its own reasons, so the two agree.
+        Not midstep-readable, for want of plumbing rather than of state: KDA
+        goes through aiter's `chunk_kimi_delta_attn`, whose returned tuple
+        carries only the final state. The per-chunk `h` an interior checkpoint
+        would be sliced out of *is* computed — by the same
+        `chunk_gated_delta_rule_fwd_h` the GDN path uses — and then dropped
+        before the return. Exposing it is what this backend would need to
+        answer `True`. `PagedStateCheckpointCoordinator` says `False` for its
+        own reasons, so the two agree meanwhile.
 
         Dtype-safe by construction, which a checkpoint cut from `h` would not
         be here — `_state_dtypes` gives kimi_linear an fp32 v side. An image is
