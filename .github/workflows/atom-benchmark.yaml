@@ -59,7 +59,7 @@ on:
         type: boolean
         default: true
       agentic:
-        description: "ALSO run the agentic AgentX trace replay (DeepSeek-V4-Pro, 9 cells x ~1h GPU). Off by default; the nightly never runs it."
+        description: "Run ONLY the agentic AgentX trace replay (DeepSeek-V4-Pro, 9 cells x ~1h GPU). Overrides the model checkboxes and the workload grid above. The nightly never runs it."
         type: boolean
         default: false
       agentic_duration:

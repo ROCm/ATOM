@@ -92,10 +92,19 @@ def main() -> int:
     env_filter = os.environ.get("BENCH_KIND_FILTER", "")
     if env_filter:
         bench_kinds = {k for k in env_filter.split(",") if k}
+    elif event != "schedule" and inputs.get("agentic"):
+        # EXCLUSIVE, and it overrides the model checkboxes rather than adding to
+        # them. Agentic runs are read as a set -- the concurrency curve at a
+        # fixed config -- so mixing a few random cells from whatever else
+        # happened to be ticked into the same run only makes the results harder
+        # to read. Only DeepSeek-V4-Pro has agentic variants today, so dropping
+        # the model filter costs nothing and stops "agentic + nothing ticked"
+        # from silently producing an empty matrix.
+        bench_kinds = {"aiperf_agentic"}
+        model_filter = None
+        param_lists = None
     else:
         bench_kinds = {"random"}
-        if event != "schedule" and inputs.get("agentic"):
-            bench_kinds.add("aiperf_agentic")
     configs = build_cell_configs(
         CATALOG,
         param_lists=param_lists,

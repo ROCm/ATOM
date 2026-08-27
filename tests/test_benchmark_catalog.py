@@ -324,3 +324,29 @@ def test_param_lists_does_not_overwrite_an_agentic_workload():
     rnd = catalog.build_cells(CATALOG, param_lists=grid, bench_kind_filter={"random"})
     assert {c["isl"] for c in rnd} == {1024}
     assert {c["conc"] for c in rnd} == {128}
+
+
+def test_dp_agentic_variant_carries_the_session_routing_env():
+    """DP-attention needs session affinity, and only the DPA variant.
+
+    Without `ATOM_DP_SESSION_AFFINITY` a conversation's turns land on different
+    DP ranks, so the prefix KV from the previous turn is resident on a rank the
+    next turn does not reach -- an agentic trace is nothing but multi-turn
+    sessions, so the whole workload degrades to cold prefill. The TP variant has
+    no ranks to scatter across and must not carry these.
+    """
+    dp_only = {
+        "ATOM_DP_SESSION_AFFINITY=1",
+        "ATOM_DP_LB_REQ_EQUIV=512",
+        "ATOM_ENABLE_PREFILL_DELAYER=1",
+        "ATOM_PREFILL_DECODE_INTERVAL=10",
+    }
+    agentic = catalog.build_cells(CATALOG, bench_kind_filter={"aiperf_agentic"})
+    for cell in agentic:
+        env = set(cell["env_vars"].splitlines())
+        is_dpa = "--enable-dp-attention" in cell["server_args"]
+        assert dp_only <= env if is_dpa else not (dp_only & env), cell[
+            "result_filename"
+        ]
+        # Pinned so throughput is not read through a fluctuating accept rate.
+        assert "--spec-decode-acceptance-rate 0.4966666667" in cell["server_args"]
