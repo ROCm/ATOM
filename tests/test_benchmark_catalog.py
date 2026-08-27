@@ -135,14 +135,23 @@ def test_build_cells_matches_legacy_effective_matrix():
 
 
 def test_cells_respect_conc_bands():
-    # DP-attention variants run the high-concurrency band; everything else is
-    # capped at 256. Keyed on the resolved server args so it stays correct as
-    # new DP/non-DP variants are added.
+    """Every cell falls inside its OWN variant's declared band.
+
+    Read from the catalog rather than hard-coded: "DP means conc >= 64" held
+    only while DP-attention was a high-concurrency-only story, and the agentic
+    variants deliberately break it -- their DPA band reaches down to 48 to
+    overlap the TP band, which is the only concurrency where the two can be
+    compared at all.
+    """
+    bands = {
+        (v["prefix"], v["suffix"]): (v["conc_min"], v["conc_max"])
+        for v in catalog.load_variants(CATALOG)
+    }
     for c in catalog.build_cells(CATALOG):
-        if "--enable-dp-attention" in c["server_args"]:
-            assert c["conc"] >= 64
-        else:
-            assert c["conc"] <= 256
+        lo, hi = bands[(c["prefix"], c["suffix"])]
+        assert (
+            lo <= c["conc"] <= hi
+        ), f"{c['result_filename']} at conc={c['conc']} is outside [{lo}, {hi}]"
 
 
 def test_result_filename_contract():
@@ -294,11 +303,16 @@ def test_agentic_variants_carry_what_the_recipe_requires():
         for flag in ("--cudagraph-mode FULL", "--method mtp", "-tp 8"):
             assert flag in args, f"{flag} missing from {cell['result_filename']}"
 
-    dpa = [c for c in agentic if "--enable-dp-attention" in c["server_args"]]
-    plain = [c for c in agentic if "--enable-dp-attention" not in c["server_args"]]
+    dpa = {c["conc"] for c in agentic if "--enable-dp-attention" in c["server_args"]}
+    plain = {
+        c["conc"] for c in agentic if "--enable-dp-attention" not in c["server_args"]
+    }
     assert dpa and plain, "expected both a TP band and a DPA band"
-    # Small concurrency on TP, large on DPA -- the bands must not overlap.
-    assert max(c["conc"] for c in plain) < min(c["conc"] for c in dpa)
+    # Small concurrency on TP, large on DPA, and they must OVERLAP by at least
+    # one point: without a concurrency both run, the two curves are measured on
+    # disjoint workloads and no DP-vs-TP comparison is possible anywhere.
+    assert plain & dpa, f"bands are disjoint: TP {sorted(plain)}, DPA {sorted(dpa)}"
+    assert min(plain) < min(dpa) and max(plain) < max(dpa)
 
 
 def test_param_lists_does_not_overwrite_an_agentic_workload():
