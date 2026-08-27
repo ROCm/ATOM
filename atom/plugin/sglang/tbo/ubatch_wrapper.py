@@ -28,24 +28,33 @@ class SGLangPluginUBatchWrapper(UBatchWrapper):
         ub_slice,
         positions: torch.Tensor,
         input_ids: torch.Tensor,
-        padded_bs: int,
+        running_bs: int,
         *,
-        ub_graph_bs: int | None,
+        ub_running_tokens: int | None,
         dp_metadata,
     ) -> ForwardContext:
         ub_num_reqs = ub_slice.request_slice.stop - ub_slice.request_slice.start
         ub_num_tokens = ub_slice.token_slice.stop - ub_slice.token_slice.start
-        graph_bs = (
-            ub_graph_bs
-            if ub_graph_bs is not None
-            else ub_num_tokens if ctx.context.is_prefill else padded_bs
+        # The adapter hands rows on prefill and None on decode, where the
+        # per-ubatch request count still needs its max_seqlen_q multiplier.
+        running_tokens = (
+            ub_running_tokens
+            if ub_running_tokens is not None
+            else (
+                ub_num_tokens
+                if ctx.context.is_prefill
+                else running_bs * int(ctx.attn_metadata.max_seqlen_q)
+            )
         )
         ub_context = Context(
             positions=positions,
             is_prefill=ctx.context.is_prefill,
             is_dummy_run=ctx.context.is_dummy_run,
-            batch_size=ub_num_reqs,
-            graph_bs=graph_bs,
+            scheduled_bs=ub_num_reqs,
+            scheduled_tokens=ub_num_tokens,
+            # `running_bs` already IS `ub_num_reqs` on prefill (see the adapter).
+            running_bs=running_bs,
+            running_tokens=running_tokens,
             is_draft=ctx.context.is_draft,
             dp_uniform_decode=ctx.context.dp_uniform_decode,
             forward_mode=ctx.context.forward_mode,
@@ -130,7 +139,7 @@ class SGLangPluginUBatchWrapper(UBatchWrapper):
                 ub_slice,
                 child_forward_batches[idx],
                 is_prefill=ctx.context.is_prefill,
-                full_graph_bs=ctx.context.graph_bs,
+                full_running_bs=ctx.context.running_bs,
                 ubatch_idx=idx,
                 num_ubatches=num_ubatches,
                 ub_max_tokens_across_dp=ctx.ub_max_tokens_across_dp,
@@ -140,8 +149,8 @@ class SGLangPluginUBatchWrapper(UBatchWrapper):
                 ub_slice,
                 adapted.positions,
                 adapted.input_ids,
-                adapted.padded_bs,
-                ub_graph_bs=adapted.graph_bs,
+                adapted.running_bs,
+                ub_running_tokens=adapted.running_tokens,
                 dp_metadata=(
                     ub_dp_metadata[idx] if ub_dp_metadata is not None else None
                 ),

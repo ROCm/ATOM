@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""One draft forward, warmed and optionally captured per ``graph_bs``.
+"""One draft forward, warmed and optionally captured per captured size.
 
 Kept out of ``drafter.py`` so it stays importable without a GPU AITER build:
 the invariants below -- which batch a pass may run at, staging with a padded
@@ -37,7 +37,7 @@ class DraftGraph:
 
     Three capabilities, each needing strictly more than the last:
 
-    * **warmup** -- run it once per ``graph_bs`` at startup, paying its
+    * **warmup** -- run it once per ``capture_sizes`` entry at startup, paying its
       per-shape JIT there rather than mid-serve. Needs nothing.
     * **pad** -- run at the batch the target just ran, which the startup sweep
       warmed, rather than at whatever this step's batch happens to be. Needs
@@ -54,13 +54,13 @@ class DraftGraph:
     ``warmup_inputs`` makes that startup batch plausible, since warming on zeros
     compiles a shape no real batch draws.
 
-    Everything here counts SEQUENCES, in the same three words the target uses:
-    ``bs`` is real, ``pad_bs`` is what actually runs, ``graph_bs`` is the
-    captured set.
+    Everything here counts SEQUENCES, in the target's own words: ``bs`` is the
+    scheduled batch, ``running_bs`` is what it actually runs at, and
+    ``capture_sizes`` is the ladder the startup sweep warms.
     """
 
-    forward: Callable[..., Any]  # (pad_bs, **staged) -> Any
-    epilogue: Callable[..., Any] | None = None  # (fwd_out, pad_bs, **staged)
+    forward: Callable[..., Any]  # (running_bs, **staged) -> Any
+    epilogue: Callable[..., Any] | None = None  # (fwd_out, running_bs, **staged)
     capture_epilogue: bool = False
     inputs: "Mapping[str, StagedInput]" = field(default_factory=dict)
     pads: bool = False
@@ -107,52 +107,57 @@ class DraftGraph:
         graph is made by the shared ``warmup``."""
         return self.pads and envs.ATOM_DRAFT_CUDAGRAPH
 
-    def target_pad_bs(self, bs: int, context) -> int:
+    def target_running_bs(self, bs: int, context) -> int:
         """The batch the target just ran at, or ``bs`` when it pinned none.
 
-        Never a batch the drafter picks. ``forward_mode.effective_bs`` IS what
-        the target ran: ``model_runner`` builds the attention metadata with it,
-        so every per-sequence buffer already reaches that far -- ``slot_mapping``
+        Never a batch the drafter picks. ``context.running_bs`` IS what the
+        target ran: ``model_runner`` builds the attention metadata with it, so
+        every per-sequence buffer already reaches that far -- ``slot_mapping``
         -1, ``context_lens`` 0, ring slots published -- and a pad row fabricates
         nothing the backend has not already accounted for, on any backend and
         without the drafter knowing each one's convention. It is a warmed shape
         by construction too: on the cudagraph path ``ForwardMode.decide`` picks
-        it out of ``graph_bs``, which is the list the startup sweep warms.
+        it out of ``capture_sizes``, the list the startup sweep warms. And it is
+        DP-unified, which is what lets the draft's own collectives line up.
 
-        Not ``context.graph_bs``, which agrees except where DSpark's ragged path
-        overwrites it with a token-derived count (``_dspark_ragged_moe_graph_bs``)
-        that is neither captured nor the batch the metadata was built at.
-
-        Off the cudagraph path every eager branch of ``decide`` returns
-        ``effective_bs == scheduled_bs``, so this answers ``bs`` and nothing is
-        padded -- which is the only safe answer, since nobody sized the target's
-        metadata past the real batch there.
+        Off the cudagraph path nothing is padded -- ``running_bs`` is then the
+        scheduled batch, and that is the only safe answer anyway, since nobody
+        sized the target's metadata past the real batch there.
 
         An empty batch is never widened: a pad row is a copy of the last real
         one, and there is no last real one to copy. Declining the padding rather
         than the pass is deliberate -- under DP every rank still has to reach the
         draft's collectives.
+
+        ``is_dummy_run`` is deliberately NOT read, for the reason spelled out in
+        :meth:`_replays`: it is per-rank, so any term keyed on it splits the DP
+        group into two shapes.
+
         """
         mode = context.forward_mode
-        if not bs or not self.pads or context.is_dummy_run:
+        if not bs or not self.pads:
             return bs
         if mode is None or not mode.use_cudagraph:
             return bs
-        return max(bs, int(mode.effective_bs))
+        return max(bs, int(context.running_bs))
 
-    def label(self, real_bs: int, pad_bs: int) -> str:
-        """``bs=<real>/<pad>`` plus a trailing ``graph`` on a replay.
+    def label(self, real_bs: int, running_bs: int, context) -> str:
+        """``bs=<real>/<pad>`` plus a trailing ``graph`` when this step replays.
 
         One convention, one implementation: "did the draft get into a graph" is
         then a single grep across every flavor, rather than each flavor writing
-        the same string and the answer holding by coincidence.
+        the same string and the answer holding by coincidence. Reads the same
+        predicate `run` does, so the mark cannot claim a replay that did not
+        happen.
         """
-        return f"bs={real_bs}/{pad_bs}" + (" graph" if self.is_captured(pad_bs) else "")
+        return f"bs={real_bs}/{running_bs}" + (
+            " graph" if self._replays(running_bs, context) else ""
+        )
 
     def stage(
-        self, pad_bs: int, srcs: "Mapping[str, torch.Tensor]"
+        self, running_bs: int, srcs: "Mapping[str, torch.Tensor]"
     ) -> dict[str, torch.Tensor]:
-        """Copy every input into its fixed buffer, widening the batch to ``pad_bs``.
+        """Copy every input into its fixed buffer, widening the batch to ``running_bs``.
 
         The only way in, because ``pads`` is the part of the contract nothing
         else can check: a pass that lies about it still runs and still returns
@@ -167,14 +172,16 @@ class DraftGraph:
             f"{self.name} was handed batches of {sorted(counts)}; they "
             f"describe one step, so one of them is not this step's"
         )
-        bs = counts.pop() if counts else pad_bs
-        assert pad_bs == bs or self.pads, (
-            f"{self.name} was asked for {pad_bs} rows against {bs} real ones, "
+        bs = counts.pop() if counts else running_bs
+        assert running_bs == bs or self.pads, (
+            f"{self.name} was asked for {running_bs} rows against {bs} real ones, "
             f"but never said its fabricated rows are inert"
         )
-        return {role: self._stage_one(role, pad_bs, src) for role, src in srcs.items()}
+        return {
+            role: self._stage_one(role, running_bs, src) for role, src in srcs.items()
+        }
 
-    def _stage_one(self, role: str, pad_bs: int, src: torch.Tensor | None):
+    def _stage_one(self, role: str, running_bs: int, src: torch.Tensor | None):
         """Copy ``src`` into this input's fixed buffer, tail-repeating its last row.
 
         Every input repeats the same last index, so a pad row is a coherent copy
@@ -186,7 +193,7 @@ class DraftGraph:
         batch, not a particular one.
         """
         buf = self._buffers[role]
-        out = buf[:pad_bs]
+        out = buf[:running_bs]
         if src is None:
             return out
         assert src.dtype == buf.dtype, (
@@ -201,44 +208,76 @@ class DraftGraph:
         )
         bs = src.shape[0]
         out[:bs].copy_(src)
-        if pad_bs > bs:
+        if running_bs > bs:
             out[bs:].copy_(src[-1])  # copy_ broadcasts; no expand needed
         return out
 
-    def is_captured(self, pad_bs: int) -> bool:
-        return pad_bs in self._cuda_graphs
+    def is_captured(self, running_bs: int) -> bool:
+        """Whether a recording exists at this shape. Not whether it may be used."""
+        return running_bs in self._cuda_graphs
+
+    def _replays(self, running_bs: int, context) -> bool:
+        """Whether THIS step stands in for a recording.
+
+        A recording holds the collective at the width it was made for, so every
+        term here must be one the whole DP group agrees on -- which is why
+        `is_dummy_run` may not enter. A DP-sync dummy is per-rank, so gating on
+        it makes the rank with work replay while the rest issue eagerly, and
+        all of them wait forever (measured: V4-Flash-DSpark tp8 + DPA hung 8/8
+        on the first real decode). Replaying is safe on a dummy anyway --
+        `warmup` asserts the recording was made on a REAL context.
+        """
+        mode = context.forward_mode
+        return mode is not None and mode.use_cudagraph and self.is_captured(running_bs)
 
     @property
     def _to_capture(self) -> Callable[..., Any]:
         """What a graph holds -- and so what a replay stands in for."""
         return self._forward_and_epilogue if self.capture_epilogue else self.forward
 
-    def run(self, pad_bs: int, **staged) -> Any:
-        """Replay this batch size's graph, then whatever it did not cover."""
-        captured = self._cuda_graphs.get(pad_bs)
+    def run(self, running_bs: int, context, **staged) -> Any:
+        """Replay this batch size's graph, then whatever it did not cover.
+
+        Takes the step, not just its shape: a recording stands in for the branch
+        the flavor took while it was made, and a dummy took a different one --
+        ``warmup`` asserts it ran on a real context precisely so the recording
+        holds the real branch. Refusing the padding is not enough, because a
+        dummy's own batch can be a captured size on its own.
+        """
+        captured = (
+            self._cuda_graphs.get(running_bs)
+            if self._replays(running_bs, context)
+            else None
+        )
         if captured is None:
-            out = self._to_capture(pad_bs, **staged)
+            out = self._to_capture(running_bs, **staged)
         else:
             graph, out = captured
             graph.replay()
         return (
-            out if self.capture_epilogue else self._run_epilogue(out, pad_bs, **staged)
+            out
+            if self.capture_epilogue
+            else self._run_epilogue(out, running_bs, **staged)
         )
 
-    def _forward_and_epilogue(self, pad_bs: int, **staged) -> Any:
-        return self._run_epilogue(self.forward(pad_bs, **staged), pad_bs, **staged)
+    def _forward_and_epilogue(self, running_bs: int, **staged) -> Any:
+        return self._run_epilogue(
+            self.forward(running_bs, **staged), running_bs, **staged
+        )
 
-    def _run_epilogue(self, out: Any, pad_bs: int, **staged) -> Any:
-        return out if self.epilogue is None else self.epilogue(out, pad_bs, **staged)
+    def _run_epilogue(self, out: Any, running_bs: int, **staged) -> Any:
+        return (
+            out if self.epilogue is None else self.epilogue(out, running_bs, **staged)
+        )
 
     @torch.inference_mode()
-    def warmup(self, pad_bs: int, *, pool=None, stream=None):
-        """Run the pass once at one ``graph_bs``, paying its per-shape JIT here."""
-        staged = {role: self._stage_one(role, pad_bs, None) for role in self.inputs}
+    def warmup(self, running_bs: int, *, pool=None, stream=None):
+        """Run the pass once at one captured size, paying its per-shape JIT here."""
+        staged = {role: self._stage_one(role, running_bs, None) for role in self.inputs}
         if self.warmup_inputs is not None:
-            self.warmup_inputs(pad_bs, **staged)
+            self.warmup_inputs(running_bs, **staged)
         # forward AND epilogue, so nothing serving runs is left cold.
-        self._forward_and_epilogue(pad_bs, **staged)
+        self._forward_and_epilogue(running_bs, **staged)
         if not self.will_capture:
             return pool
         torch.cuda.synchronize()
@@ -249,6 +288,6 @@ class DraftGraph:
         with torch.cuda.graph(
             graph, pool, stream=stream, capture_error_mode="thread_local"
         ):
-            out = self._to_capture(pad_bs, **staged)
-        self._cuda_graphs[pad_bs] = (graph, out)
+            out = self._to_capture(running_bs, **staged)
+        self._cuda_graphs[running_bs] = (graph, out)
         return pool or graph.pool()

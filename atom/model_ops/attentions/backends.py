@@ -117,10 +117,11 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         """Rebuild this backend's metadata for one serial-draft mid-step.
 
         The draft runs one row per sequence, and `positions` is that row buffer
-        -- so `positions.shape[-1]` is the ROW COUNT and is what every shape here
-        follows. It is not `bs`: a drafter may run the wider batch the target
-        itself just ran, and `bs` stays the count of rows that carry a real
-        sequence. They are equal whenever nothing is padded.
+        -- so `positions.shape[-1]` is this step's `running_bs`, and it is what
+        every shape here follows. The `bs` argument is the `scheduled_bs`: the
+        count of those rows that carry a real sequence. They are equal whenever
+        nothing is padded, and an override must read the buffer rather than the
+        argument, because a drafter may run the wider batch the target just ran.
 
         The LAST axis, not the first: MRoPE positions are `[3, N]` (the token
         axis is last), and every other layout is `[N]`, where the two agree.
@@ -539,11 +540,11 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         self,
         attn_metadata: AttentionMetaData,
         ub_slice: UBatchSlice,
-        padded_bs: int,
+        running_bs: int,
         ubatch_idx: int = 0,
     ) -> AttentionMetaData:
         del ubatch_idx  # only used by builders with per-ubatch plan buffers
-        return split_attn_metadata(attn_metadata, ub_slice, padded_bs)
+        return split_attn_metadata(attn_metadata, ub_slice, running_bs)
 
     def _attach_tbo_prefill_cpu_lens(
         self, attn_metadata: AttentionMetaData, bs: int

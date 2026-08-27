@@ -317,7 +317,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_USE_CUSTOM_ALL_GATHER", "1").lower() == "1"
     ),
     "ATOM_USE_FLYDSL_GDR": lambda: os.getenv("ATOM_USE_FLYDSL_GDR", "0").lower() == "1",
-    # Capture each declared draft pass into a per-graph_bs CUDAGraph as it is
+    # Capture each declared draft pass into a per-captured-size CUDAGraph as it is
     # warmed, so the draft replays instead of relaunching every kernel. 0 drafts
     # eagerly. On by default: DSpark tp1 acceptance is 65.25% captured vs 65.21%
     # eager. Named for the draft, not a flavor -- see `DraftGraph.will_capture`.

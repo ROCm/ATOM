@@ -1715,10 +1715,10 @@ def _run_rtp_sparse_attn_indexer_topk_only(
         return weights
 
     max_seqlen_q = int(getattr(attn_metadata, "max_seqlen_q", 1) or 1)
-    num_decode_tokens = int(context.batch_size) * max_seqlen_q
+    num_decode_tokens = int(context.scheduled_bs) * max_seqlen_q
     kv_cache_for_logits = kv_cache.unsqueeze(-2)
     padded_q_fp8_decode_tokens = q_fp8[:num_decode_tokens].reshape(
-        int(context.batch_size), -1, *q_fp8.shape[1:]
+        int(context.scheduled_bs), -1, *q_fp8.shape[1:]
     )
     batch_size, next_n, _heads, _dim = padded_q_fp8_decode_tokens.shape
     logits = torch.empty(

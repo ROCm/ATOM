@@ -10,7 +10,7 @@ overridable methods and injected here, so native files stay clean:
   token-count threshold instead.
 * ``FusedMoEModularKernel._maybe_trim_dispatch_output`` (dispatch-buffer trim)
   -- vLLM DP+EP mixed batches need an exact received-token trim; the native
-  graph_bs bound under-counts recv on a decoding rank and reads past the
+  running_tokens bound under-counts recv on a decoding rank and reads past
   buffer -> illegal memory access.
 """
 

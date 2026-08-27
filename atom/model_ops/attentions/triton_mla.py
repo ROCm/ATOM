@@ -2,10 +2,10 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
-from typing import List, Type
 
 import torch
 from aiter.ops.triton.attention.mla_decode import csr_to_dense_block_table
+
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mla import MLAAttention
 from atom.utils import envs
@@ -23,11 +23,11 @@ class TritonMLABackend(AttentionBackend):
         return "ROCM_TRITON_MLA"
 
     @staticmethod
-    def get_builder_cls() -> Type["TritonMLAMetadataBuilder"]:
+    def get_builder_cls() -> type["TritonMLAMetadataBuilder"]:
         return TritonMLAMetadataBuilder
 
     @staticmethod
-    def get_impl_cls() -> Type["MLAAttention"]:
+    def get_impl_cls() -> type["MLAAttention"]:
         return MLAAttention
 
 
@@ -112,18 +112,31 @@ class TritonMLAMetadataBuilder(AiterMLAMetadataBuilder):
         positions: torch.Tensor,
         only_update: bool = False,
         num_reject_tokens: torch.Tensor | None = None,
+        **fused,
     ):
-        """Re-cut the Triton decode buffers off the `kv_indptr` the base rebuilt."""
+        """Re-cut the Triton decode buffers off the `kv_indptr` the base rebuilt.
+
+        `**fused` rather than the base's three keyword-only arguments spelled
+        out again: this class inherits `fuse_mtp_decode_position_update`, so
+        `EagleProposer` passes them, and an override that restated them could
+        fall behind the base without anything noticing until the call raised.
+        """
         result = super().prepare_mtp_decode(
-            bs, max_seqlen_q, max_seqlen_k, positions, only_update, num_reject_tokens
+            bs,
+            max_seqlen_q,
+            max_seqlen_k,
+            positions,
+            only_update,
+            num_reject_tokens,
+            **fused,
         )
-        pad_bs = int(positions.shape[-1])  # rows; see the base contract
+        running_bs = int(positions.shape[-1])  # rows; see the base contract
         var = self.model_runner.forward_vars
         return result | self._cut_decode_buffers(
-            pad_bs,
+            running_bs,
             max_seqlen_k,
             var["kv_indices"].gpu,
-            var["kv_indptr"].gpu[: pad_bs + 1],
+            var["kv_indptr"].gpu[: running_bs + 1],
         )
 
     def prepare_prefill(self, batch: ScheduledBatch):
@@ -203,11 +216,11 @@ class TritonMLAMetadataBuilder(AiterMLAMetadataBuilder):
         blk_offsets = torch.zeros(bs + 1, dtype=torch.int64, device=device)
         blk_offsets[1:] = torch.cumsum(per_seq_blocks, dim=0)
 
-        blk_indptr_list: List[torch.Tensor] = []
-        blk_indices_list: List[torch.Tensor] = []
-        cu_seqlens_k_list: List[torch.Tensor] = []
-        chunk_total_tokens: List[torch.Tensor] = []
-        chunk_max_seqlen_k: List[torch.Tensor] = []
+        blk_indptr_list: list[torch.Tensor] = []
+        blk_indices_list: list[torch.Tensor] = []
+        cu_seqlens_k_list: list[torch.Tensor] = []
+        chunk_total_tokens: list[torch.Tensor] = []
+        chunk_max_seqlen_k: list[torch.Tensor] = []
 
         for c in range(num_chunks):
             gb_start = c * chunk_blocks
