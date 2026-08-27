@@ -1389,6 +1389,90 @@ class TestPagedCopyCheckpoint:
         assert third.state_slot == dst
         assert bm.take_state_maintenance_ops().checkpoint_restores == ()
 
+    # ── the CPU tier's leg of a PAGE resume ────────────────────────────
+
+    class _TierIndex:
+        """The engine-side index, reduced to what `_attach_state_slots` reads."""
+
+        def __init__(self, *hashes):
+            self.hashes = set(hashes)
+            self.pending_loads = {}
+            self.requested = []
+
+        def request_load(self, req_id, h):
+            if h not in self.hashes:
+                return False
+            self.pending_loads[req_id] = h
+            self.requested.append((req_id, h))
+            return True
+
+    def _with_tier(self, bm, *hashes):
+        index = self._TierIndex(*hashes)
+        bm.state_offload = index
+        bm.paged_state_checkpoints.attach_offload(index)
+        return index
+
+    def test_a_boundary_only_the_tier_has_becomes_a_load(self):
+        """The path the whole tier exists for. HBM misses, the tier votes, and
+        the request parks on a load instead of disowning the boundary."""
+        bm = make_block_manager(paged_copy_config(), state_runtime=PAGED_COPY_RUNTIME)
+        first = self._admitted(bm)
+        bm.hash_blocks(first, bm.checkpoint_limit(first) - first.num_cached_tokens)
+        h = boundary_hash(bm, first)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        # The image left HBM but the tier still advertises it.
+        bm.paged_state_checkpoints.unindex(h)
+        index = self._with_tier(bm, h)
+
+        second = stateful_seq(list(range(48)))
+        assert bm._attach_state_slots(second, h) is True
+
+        assert second.state_load_hash == h
+        assert second.state_slot >= 0, "the H2D writes this slot directly"
+        assert index.requested == [(second.id, h)]
+        # No restore queued: there is nothing in HBM to gather from, and the
+        # bytes land in the slot rather than in PAGE units.
+        assert bm.take_state_maintenance_ops().checkpoint_restores == ()
+        assert bm.take_state_loads() == [(second.id, h, second.state_slot)]
+
+    def test_hbm_is_preferred_over_the_tier(self):
+        """Both tiers are keyed by the same hash, so the gate does not say which
+        one answered -- `_attach_state_slots` tries HBM first and only falls to
+        a load on a miss. A resident image must not pay a park."""
+        bm = make_block_manager(paged_copy_config(), state_runtime=PAGED_COPY_RUNTIME)
+        first = self._admitted(bm)
+        bm.hash_blocks(first, bm.checkpoint_limit(first) - first.num_cached_tokens)
+        h = boundary_hash(bm, first)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        index = self._with_tier(bm, h)  # advertised in BOTH
+
+        second = stateful_seq(list(range(48)))
+        assert bm._attach_state_slots(second, h) is True
+
+        assert second.state_load_hash == -1
+        assert index.requested == [], "a resident image must not pay a park"
+        assert len(bm.take_state_maintenance_ops().checkpoint_restores) == 1
+
+    def test_a_tier_that_declines_disowns_rather_than_parking(self):
+        """`request_load` refuses a hash it never stored, because a load is
+        resolved only by a report -- offering one would park the request
+        against bytes no `get` can produce."""
+        bm = make_block_manager(paged_copy_config(), state_runtime=PAGED_COPY_RUNTIME)
+        first = self._admitted(bm)
+        bm.hash_blocks(first, bm.checkpoint_limit(first) - first.num_cached_tokens)
+        h = boundary_hash(bm, first)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        bm.paged_state_checkpoints.unindex(h)
+        self._with_tier(bm)  # votes for nothing
+
+        second = stateful_seq(list(range(48)))
+        assert bm._attach_state_slots(second, h) is False
+        assert second.state_load_hash == -1
+        assert bm.checkpoint_funnel()["state_gate_lost_boundary"] == 1
+
     def test_a_gated_boundary_neither_tier_has_is_disowned_not_raised(self):
         """This used to raise, and could not stay that way.
 

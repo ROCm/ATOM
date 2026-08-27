@@ -108,6 +108,23 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
             )
             return
 
+        # The store reads the checkpoint's PAGE units and the load writes an
+        # Active Slot, so the blob has to be the same length both ways. They are
+        # equal for K3 (a checkpoint covers the whole slot), and a model where
+        # they differ would silently truncate the store or over-read the load --
+        # so it is asserted here rather than assumed, at the one point both
+        # numbers are in scope.
+        image_bytes = int(getattr(spec, "image_bytes", 0) or 0)
+        if image_bytes and image_bytes != entry_bytes:
+            logger.warning(
+                "kimi_k3 offload: a checkpoint image is %d B but an Active Slot "
+                "is %d B; the store reads units and the load writes a slot, so "
+                "they must match. State tier off.",
+                image_bytes,
+                entry_bytes,
+            )
+            return
+
         tp = get_tp_group()
         rank, world = pp_aware_rank_and_world(self._config, tp)
         cfg = offcfg.build_lmcache_config(

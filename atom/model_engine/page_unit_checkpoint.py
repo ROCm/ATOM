@@ -552,10 +552,18 @@ class PagedStateCheckpointCoordinator:
         pool: BlockPool,
         spec: PagedStateCheckpointSpec,
         enabled: bool,
-        offload_sink: bool = False,
+        offload=None,
     ) -> None:
         self.enabled = enabled
-        self.store = PageUnitCheckpointStore(pool, spec, offload_sink=offload_sink)
+        # The CPU tier beneath this one, or None. Not a member of
+        # `BlockManager.state_caches`: every one of those is a veto over where a
+        # prefix may resume, and this does the opposite -- it makes MORE
+        # boundaries reachable. It is consulted in exactly two places,
+        # `resumable_hit` (the vote) and `take_offload_stores` (the sink).
+        self.offload = offload
+        self.store = PageUnitCheckpointStore(
+            pool, spec, offload_sink=offload is not None
+        )
         # Keyed by `(seq id, prefix hash)` rather than by seq: two boundaries of
         # one prompt are two checkpoints, and keying by seq alone let the later
         # one overwrite the earlier before either was stored. Re-reaching the
@@ -580,9 +588,31 @@ class PagedStateCheckpointCoordinator:
         if not self.applies(seq):
             return hit
         for i in range(hit - 1, -1, -1):
-            if assume_checkpointed or self.store.contains(block_hashes[i]):
+            if assume_checkpointed or self._reachable(block_hashes[i]):
                 return i + 1
         return 0
+
+    def _reachable(self, h: int) -> bool:
+        """Whether `h`'s image can be *produced*, in HBM or from the CPU tier.
+
+        Produced, not merely indexed. This scan runs right to left and stops at
+        the first boundary it accepts, so accepting one whose bytes nothing can
+        deliver does not cost a wasted lookup -- it costs the whole walk-back,
+        hiding every shorter checkpoint still resident in HBM.
+
+        HBM needs no preference rule: both tiers are keyed by the same content
+        hash, so the scan takes the rightmost boundary wherever it lives, and
+        `_attach_state_slots` tries HBM first regardless.
+
+        The tier's half is deliberately optimistic -- `hashes` means "was stored
+        once", never "is still there", since LMCache's own LRU can drop bytes at
+        any time. A false positive costs one park plus a recompute and retracts
+        itself (`fail_load` -> `forget`); refusing to vote until certain would
+        cost a synchronous cross-process lookup on the admission path.
+        """
+        if self.store.contains(h):
+            return True
+        return self.offload is not None and h in self.offload.hashes
 
     def checkpoint(self, seq: Sequence, boundary_blocks: int, h: int) -> None:
         """File a boundary to be stored, keyed by hash rather than by seq.
@@ -677,6 +707,20 @@ class PagedStateCheckpointCoordinator:
 
     def ensure_free_units(self, count: int) -> bool:
         return self.store.ensure_free_units(count)
+
+    def attach_offload(self, index) -> None:
+        """Wire the CPU tier in, after both objects exist.
+
+        Not a constructor argument because the two are built in the wrong
+        order: this class needs `checkpoint_spec`, which comes off
+        `state_runtime`, while the index needs the connector config. One call
+        sets both halves -- the vote (`_reachable`) and the sink (whether a
+        READY checkpoint is nominated at all) -- so they cannot be turned on
+        separately, which would either vote for hashes nothing stores or pin
+        units nothing releases.
+        """
+        self.offload = index
+        self.store._offload_sink = index is not None
 
     def take_offload_stores(
         self, max_inflight: int

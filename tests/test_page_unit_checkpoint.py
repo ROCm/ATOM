@@ -511,3 +511,71 @@ class TestOffloadPinRelease:
         # And recovery is total: the record is spendable again, unbroken.
         assert store._is_evictable(cid)
         assert store.lookup(11) == cid
+
+
+class TestTheTierVotes:
+    """`resumable_hit` accepts a boundary the CPU tier holds, not just HBM.
+
+    This is what makes the whole tier reachable: without it a hash whose image
+    went to LMCache is invisible to `can_allocate`, and the bytes are written
+    and never read.
+    """
+
+    class _Index:
+        def __init__(self, *hashes):
+            self.hashes = set(hashes)
+
+    @staticmethod
+    def coordinator(num_units=40, offload=None):
+        from atom.model_engine.page_unit_checkpoint import (
+            PagedStateCheckpointCoordinator,
+            PagedStateCheckpointSpec,
+        )
+
+        c = PagedStateCheckpointCoordinator(
+            BlockPool(num_units),
+            PagedStateCheckpointSpec(10, 25, "layout-v1", image_bytes=25),
+            enabled=True,
+        )
+        if offload is not None:
+            c.attach_offload(offload)
+        return c
+
+    @staticmethod
+    def seq():
+        from types import SimpleNamespace
+
+        return SimpleNamespace(has_per_req_cache=True)
+
+    def test_a_hash_only_the_tier_holds_is_accepted(self):
+        c = self.coordinator(offload=self._Index(77))
+        assert c.resumable_hit(self.seq(), 3, [11, 77, 99]) == 2
+
+    def test_without_a_tier_it_is_not(self):
+        c = self.coordinator()
+        assert c.resumable_hit(self.seq(), 3, [11, 77, 99]) == 0
+
+    def test_the_scan_still_takes_the_rightmost_boundary(self):
+        """Both tiers are keyed by the same content hash, so no preference rule
+        is needed -- and `_attach_state_slots` tries HBM first regardless."""
+        c = self.coordinator(offload=self._Index(11, 99))
+        assert c.resumable_hit(self.seq(), 3, [11, 77, 99]) == 3
+
+    def test_attaching_turns_on_the_vote_and_the_sink_together(self):
+        """Half-attached is worse than off: a vote with no sink accepts hashes
+        nothing ever stores; a sink with no vote pins units nothing reads."""
+        c = self.coordinator()
+        assert c.offload is None and c.store._offload_sink is False
+        c.attach_offload(self._Index())
+        assert c.offload is not None and c.store._offload_sink is True
+
+    def test_the_tier_half_is_optimistic_on_purpose(self):
+        """`hashes` means "was stored once", never "is still there" -- LMCache's
+        own LRU can drop bytes under it. A false positive costs one park plus a
+        recompute and retracts itself; being certain would cost a synchronous
+        cross-process lookup on the admission path."""
+        index = self._Index(77)
+        c = self.coordinator(offload=index)
+        assert c.resumable_hit(self.seq(), 3, [11, 77, 99]) == 2
+        index.hashes.discard(77)  # what `fail_load` -> `forget` does
+        assert c.resumable_hit(self.seq(), 3, [11, 77, 99]) == 0

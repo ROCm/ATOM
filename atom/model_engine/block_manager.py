@@ -173,7 +173,6 @@ class BlockManager:
                 self.kv,
                 checkpoint_spec,
                 enabled=enabled,
-                offload_sink=kv_offload_enabled,
             )
         # The rolling state class: per-request slots plus a content index over
         # the free ones. A checkpoint IS a free slot whose content is still
@@ -282,6 +281,12 @@ class BlockManager:
         # away -- which is what the staging ring existed to rescue.
         if kv_offload_enabled:
             self.state_offload = StateOffloadIndex()
+            # Attached rather than passed at construction: the coordinator is
+            # built before the switch is read (it needs `checkpoint_spec`,
+            # which comes off `state_runtime`). One object, two uses -- the
+            # coordinator votes off `hashes` and drains stores into it.
+            if self.paged_state_checkpoints is not None:
+                self.paged_state_checkpoints.attach_offload(self.state_offload)
         # The demand funnel: recorded at admission, cut for when a prefill
         # chunk is shortened to land on it, kept when the state pool files it.
         # Counted at all three because a gap between any two is a different
