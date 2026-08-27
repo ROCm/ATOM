@@ -238,6 +238,12 @@ class BlockManager:
         self.joint_boundaries = 0
         self.joint_boundaries_hbm = 0
         self.joint_boundaries_tier = 0
+        # Admissions whose gated boundary neither tier could produce by the time
+        # `allocate` ran. Non-zero is expected under pressure (the CPU index is
+        # optimistic, and an HBM checkpoint can be unindexed inside the same
+        # pass); a large fraction of `joint_boundaries` means the gate is
+        # accepting boundaries that do not survive to attach.
+        self.state_gate_lost_boundary = 0
         # Why the rest got none, keyed by the gate that stopped them.
         self.joint_skips: dict[str, int] = {}
         # The LMCache chunk size in tokens, read where the config is rather than
@@ -892,19 +898,32 @@ class BlockManager:
         width = self.state_slots_per_req
         if self.paged_state_checkpoints is not None:
             seq.state_slots = self.state.pop_many(width)
-            if hit_hash != -1 and not self.paged_state_checkpoints.begin_restore(
-                hit_hash, seq.state_slot
-            ):
-                self.state.release_many(seq.state_slots)
-                seq.state_slots = []
-                raise RuntimeError(
-                    "gated PAGE checkpoint disappeared before state attach"
-                )
             seq.state_fork_src = -1
-            # `begin_restore` either gathered the boundary's state into the
-            # committed slot or there was no boundary to gather, so what the
-            # caller holds is what it asked for.
-            return True
+            if hit_hash == -1:
+                return True  # cold start: nothing claimed, nothing to restore
+            if self.paged_state_checkpoints.begin_restore(hit_hash, seq.state_slot):
+                # Queued for the next batch, which gathers the image out of its
+                # PAGE units into the committed slot. What the caller holds is
+                # what it asked for.
+                return True
+            # HBM does not have it. That used to be an invariant violation and
+            # this used to raise -- `can_allocate` had shrunk the hit to a
+            # boundary the HBM index carried, so a miss here meant the gate and
+            # the store disagreed.
+            #
+            # It is a normal path now, and it has to be: the gate consults the
+            # CPU tier too, so a hash it accepted may live only there. Leaving
+            # the raise in would take the engine down on the first request that
+            # actually used the tier.
+            if self._request_state_load(seq, hit_hash):
+                return True
+            # Neither tier can produce it. Reachable rather than defensive:
+            # the tier's index is optimistic (`hashes` means "was stored once"),
+            # and an HBM checkpoint can be unindexed between `can_allocate` and
+            # here by another seq's `_fresh_block` in the same pass. Disown the
+            # boundary -- blocks stay claimed and the forward recomputes.
+            self.state_gate_lost_boundary += 1
+            return False
 
         src = self.state.lookup(hit_hash) if hit_hash != -1 else -1
         if src < 0:
@@ -1674,6 +1693,7 @@ class BlockManager:
             "joint_boundaries": self.joint_boundaries,
             "joint_boundaries_hbm": self.joint_boundaries_hbm,
             "joint_boundaries_tier": self.joint_boundaries_tier,
+            "state_gate_lost_boundary": self.state_gate_lost_boundary,
         } | self.state_checkpoint_fates()
 
     def pool_pressure(self) -> dict[str, int]:

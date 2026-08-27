@@ -1389,7 +1389,20 @@ class TestPagedCopyCheckpoint:
         assert third.state_slot == dst
         assert bm.take_state_maintenance_ops().checkpoint_restores == ()
 
-    def test_missing_gated_checkpoint_releases_the_new_slot_and_raises(self):
+    def test_a_gated_boundary_neither_tier_has_is_disowned_not_raised(self):
+        """This used to raise, and could not stay that way.
+
+        The raise asserted that the gate and the HBM store agree, which held
+        while `can_allocate` only ever accepted boundaries the HBM index
+        carried. The gate now consults the CPU tier as well, so a hash it
+        accepted may live only there -- and with no tier able to produce it,
+        the answer is to disown the boundary, not to take the engine down.
+
+        The slots are KEPT, unlike the old abort: the request is about to
+        recompute its whole prefix and it writes that state into these very
+        slots. Releasing them here would hand the next request a buffer this
+        one is still filling.
+        """
         bm = make_block_manager(
             paged_copy_config(),
             state_runtime=PAGED_COPY_RUNTIME,
@@ -1403,11 +1416,11 @@ class TestPagedCopyCheckpoint:
         bm.paged_state_checkpoints.unindex(h)
 
         second = stateful_seq(list(range(48)))
-        with pytest.raises(RuntimeError, match="disappeared"):
-            bm._attach_state_slots(second, h)
+        assert bm._attach_state_slots(second, h) is False
 
-        assert second.state_slot == -1
-        assert bm.state.num_free() == free_slots
+        assert second.state_slot >= 0, "the seq keeps slots to recompute into"
+        assert bm.state.num_free() == free_slots - bm.state_slots_per_req
+        assert bm.checkpoint_funnel()["state_gate_lost_boundary"] == 1
 
     def test_copy_transfer_can_checkpoint_a_speculative_decode_boundary(self):
         spec = SimpleNamespace(num_speculative_tokens=3, use_dspark=lambda: False)
