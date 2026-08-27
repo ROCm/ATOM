@@ -110,7 +110,7 @@ exports = {
     "SLURM_GPUS_PER_NODE": runner.get("gpus_per_node", 8),
     "SLURM_TIME_LIMIT": runner.get("time_limit", "03:00:00"),
     "SLURM_LOG_ROOT": runner.get(
-        "log_root", "/shared_nfs/ATOM_PLUGIN_CI/ATOM_SGLang_LOG/"
+        "log_root", "/home/junyyang/ATOM_PLUGIN_RUNNER/LOG/"
     ),
     "NODE_LIST": node_list,
     "NUM_NODES": cell.get("num_nodes", 1),
@@ -147,7 +147,7 @@ export SLURM_JOB_NAME="${PLUGIN_CI_CELL_ID}-${GITHUB_RUN_ID:-local}-${GITHUB_RUN
 export SLURM_OUTPUT="${LOG_ROOT}/slurm-%j.out"
 export SLURM_ERROR="${LOG_ROOT}/slurm-%j.err"
 export SLURM_CANCEL_HELPER="${RESULT_DIR}/${PLUGIN_CI_CELL_ID}.slurm-cancel.sh"
-SUBMIT_LOCK_FILE="${SLURM_SUBMIT_LOCK_FILE:-/shared_nfs/ATOM_PLUGIN_CI/.sbatch-submit.lock}"
+SUBMIT_LOCK_FILE="${SLURM_SUBMIT_LOCK_FILE:-/home/junyyang/ATOM_PLUGIN_RUNNER/LOG/.sbatch-submit.lock}"
 MAX_SUBMITTED_JOBS="${SLURM_MAX_SUBMITTED_JOBS:-3}"
 SLURM_LOG_POLL_INTERVAL="${SLURM_LOG_POLL_INTERVAL:-30}"
 USES_SPUR_CONTROLLER=1
