@@ -3,14 +3,14 @@
 
 One executor of its own, separate from the KV connector's `_load_executor` and
 `_save_executor` so that state transfers and KV transfers cannot block each
-other -- but a single one, shared by this tier's own spills and loads. See
+other -- but a single one, shared by this tier's own stores and loads. See
 `submit_load` for why the KV connector's load/save split is not copied here.
 
 This class **reports, and the engine applies**. It runs in a spawned runner
 process while `StateOffloadIndex` lives in the engine process, so this side
-cannot free a staging slot or index a hash directly. `take_spill_reports` and
+cannot index a hash directly. `take_store_reports` and
 `get_finished` hand their sets to the connector, which emits the first as
-`ConnectorCompletion`s on its own channels and merges the second into
+`ConnectorCompletion`s on its own channel and merges the second into
 `finished_loading`/`failed_loading`. The failed-hash set exists to resolve the
 aggregator's quorum: without it a partial store would pin the hash forever.
 """
@@ -39,10 +39,9 @@ class StateOffloadTier:
         self._done: set[str] = set()
         self._failed: set[str] = set()
         self._inflight: set = set()
-        # The spill path's three reports, drained by `take_spill_reports`.
+        # The store path's two reports, drained by `take_store_reports`.
         self._indexed: set[int] = set()
         self._index_failed: set[int] = set()
-        self._released: set[int] = set()
 
     def _register(self, fut) -> None:
         """Add *fut* to the inflight set and attach a callback that removes it
@@ -59,33 +58,35 @@ class StateOffloadTier:
 
         fut.add_done_callback(_discard)
 
-    def submit_spill(
-        self, h: int, entry_index: int, staging_slot: int, ready_event=None
-    ) -> None:
-        """`entry_index` is what the codec packs, `staging_slot` what the ring
-        releases. Two index spaces: the staging entries sit past the pool's
-        range in the arena (`num_groups + slot`), while the ring counts from 0.
+    def submit_store(self, h: int, slot: int) -> None:
+        """Pack `slot`'s state under `h` and hand it to LMCache.
 
-        `ready_event` fences the D2D staging copy that `AttentionBackend.build`
-        issued on the forward's compute stream. This worker packs on its own
-        stream, so without the wait it reads the entry's previous occupant.
+        No `ready_event`. The staging ring is gone (#2045 makes the source hold
+        still on its own), so nothing on the compute stream is producing these
+        bytes for us to fence against -- `StagedTransfer.pack` gathers straight
+        from the source on its own stream.
+
+        NOTE: nothing calls this yet. Phase 2 removed the ring that used to
+        drive it and Phase 3 gives it its new caller, whose source is the
+        checkpoint's PAGE units rather than a slot. Kept rather than deleted so
+        the two halves of the change stay reviewable apart.
         """
-        fut = self._executor.submit(
-            self._do_spill, h, entry_index, staging_slot, ready_event
-        )
-        self._register(fut)
+        self._register(self._executor.submit(self._do_store, h, slot))
 
-    def submit_load(self, req_id: str, h: int, group: int) -> None:
-        """Fetch `h` into pool group `group` for the parked request `req_id`.
+    def submit_load(self, req_id: str, h: int, slot: int) -> None:
+        """Fetch `h` into pool slot `slot` for the parked request `req_id`.
 
-        Shares one serial executor with the spills, unlike the KV connector's
+        Shares one serial executor with the stores, unlike the KV connector's
         split pair: `StagedTransfer` keeps its staging buffer in
         `threading.local`, so a second thread costs a second resident buffer
-        per rank out of the HBM the state pool is already short of. The queue
-        it would shorten is at most `OFFLOAD_STATE_STAGING_GROUPS` deep.
+        per rank out of HBM the state pool is already short of.
+
+        A load is on the TTFT critical path and a store is not, so once stores
+        become frequent (Phase 3 fires one per checkpoint rather than one per
+        eviction) this queue wants a priority, or a load can wait behind
+        several stores. Measure `state_load_queue_wait_ms` before adding one.
         """
-        fut = self._executor.submit(self._do_load, req_id, h, group)
-        self._register(fut)
+        self._register(self._executor.submit(self._do_load, req_id, h, slot))
 
     def drain(self) -> None:
         """Block until every submitted transfer has settled. Tests and shutdown
@@ -105,16 +106,12 @@ class StateOffloadTier:
     def shutdown(self) -> None:
         self._executor.shutdown(wait=True)
 
-    def _do_spill(
-        self, h: int, entry_index: int, staging_slot: int, ready_event=None
-    ) -> None:
+    def _do_store(self, h: int, slot: int) -> None:
         stored = False
         try:
-            if ready_event is not None:
-                ready_event.synchronize()
-            stored = bool(self.codec.put(h, entry_index))
-        except Exception:  # a spill is best effort by design
-            logger.warning("state offload: spill of hash %d failed", h, exc_info=True)
+            stored = bool(self.codec.put(h, slot))
+        except Exception:  # a store is best effort by design
+            logger.warning("state offload: store of hash %d failed", h, exc_info=True)
         with self._lock:
             # Report, never apply: `StateOffloadIndex` lives in the engine
             # process and this runs in a spawned runner. The engine applies
@@ -126,30 +123,24 @@ class StateOffloadTier:
                 # `indexed | index_failed` instead of waiting for a second
                 # report that will never come from this rank.
                 self._index_failed.add(int(h))
-            # Always, stored or not: a leaked slot shrinks the ring
-            # permanently and the feature quietly stops spilling.
-            self._released.add(int(staging_slot))
 
-    def take_spill_reports(self) -> tuple[set[int], set[int], set[int]]:
-        """`(hashes stored, staging slots free, hashes failed)` since the last call.
+    def take_store_reports(self) -> tuple[set[int], set[int]]:
+        """`(hashes stored, hashes failed)` since the last call.
 
-        A hash appears in exactly one of the first or third set per spill.
-        The aggregator's quorum over the two is failure-dominant, so a partial
-        store resolves in the same step rather than pinning the key.
+        A hash appears in exactly one of the two per store. The aggregator's
+        quorum over them is failure-dominant, so a partial store resolves in
+        the same step rather than pinning the key.
         """
         with self._lock:
             indexed = set(self._indexed)
             index_failed = set(self._index_failed)
-            released = set(self._released)
             self._indexed.clear()
             self._index_failed.clear()
-            self._released.clear()
-        return indexed, released, index_failed
+        return indexed, index_failed
 
-    def _do_load(self, req_id: str, h: int, group: int) -> None:
-        # A load target is a real pool group, not a staging entry: the bytes
-        # land where the resuming request will read them. Only the spill
-        # direction needs the staging indirection.
+    def _do_load(self, req_id: str, h: int, slot: int) -> None:
+        # The bytes land in the committed slot, where the resuming request
+        # reads them.
         #
         # A miss is a normal path, not an error: LMCache's LRU can drop bytes
         # under a hash the engine's index still advertises. Retracting that
@@ -157,7 +148,7 @@ class StateOffloadTier:
         # the report below.
         ok = False
         try:
-            ok = bool(self.codec.get(h, group))
+            ok = bool(self.codec.get(h, slot))
         except Exception:  # a failed load is a normal path
             logger.warning("state offload: load of hash %d failed", h, exc_info=True)
         with self._lock:

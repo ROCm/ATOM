@@ -223,10 +223,8 @@ class BlockManager:
         from atom.model_engine.state_offload import (
             StateOffloadIndex,
             kv_connector_hosts_state_tier,
-            state_offload_staging_groups,
         )
 
-        staging = state_offload_staging_groups()
         # Joint boundaries, split by what the state leg cost: `hbm` forked a
         # resident checkpoint, `tier` paid an entry-sized H2D and a park. Almost
         # all `tier` means the state pool is too small for the concurrency.
@@ -258,26 +256,22 @@ class BlockManager:
         self.state_offload: StateOffloadIndex | None = None
         # (req_id, hash, target_group) admitted this pass and not yet handed to
         # the connector. Kept here rather than in the index because the slot
-        # is this object's fact, the same reason `state_spills_for_batch` joins
-        # the spill's two halves engine-side.
+        # is this object's fact.
         self._state_loads: list[tuple] = []
         # req_id -> slot, for loads whose request was deallocated before the
         # bytes landed. The slot is off the free list until the report comes
         # back; see `deallocate`.
         self._orphan_load_slots: dict = {}
-        # `kv_offload_enabled` is the whole switch. Without a connector to
-        # drain a spill the ring would hand out slots that never come back, and
-        # a hash whose KV left HBM could not be resumed from anyway.
-        if kv_offload_enabled and staging > 0:
-            index = StateOffloadIndex(staging_depth=staging)
-            # Only the slot pool: `_spill` / `_resumable_from` live on
-            # `StateSlotPool`, while a
-            # PAGE checkpoint already lives in the KV blocks the KV connector
-            # offloads on its own.
-            for cache in self.state_caches:
-                if isinstance(cache, StateSlotPool):
-                    cache.offload = index
-            self.state_offload = index
+        # `kv_offload_enabled` is the whole switch: without a connector to
+        # carry a transfer there is nothing beneath the pool, and a hash whose
+        # KV left HBM could not be resumed from anyway.
+        #
+        # The index no longer reaches into `StateSlotPool`. A K3 checkpoint is
+        # a PAGE image in the KV pool (#2045), so the spill source is a set of
+        # units the coordinator owns, not a slot the pool is about to hand
+        # away -- which is what the staging ring existed to rescue.
+        if kv_offload_enabled:
+            self.state_offload = StateOffloadIndex()
         # The demand funnel: recorded at admission, cut for when a prefill
         # chunk is shortened to land on it, kept when the state pool files it.
         # Counted at all three because a gap between any two is a different
@@ -316,50 +310,11 @@ class BlockManager:
         stores = restores = ()
         if self.paged_state_checkpoints is not None:
             stores, restores = self.paged_state_checkpoints.take_checkpoint_ops()
-        # Drained here rather than beside the relocations so that the one
-        # consumer -- `CommonAttentionBuilder.build` -- is also the one place
-        # the spill-before-relocate order is enforced.
         return StateMaintenanceOps(
             relocations=relocations,
-            spills=tuple(self.state_spills_for_batch()),
             checkpoint_stores=stores,
             checkpoint_restores=restores,
         )
-
-    def state_spills_for_batch(self) -> list[tuple[int, int, int, int]]:
-        """`(src_group, dst_entry, staging_slot, hash)` the batch being built
-        must copy out before its forward.
-
-        The pool knows `(group, slot)` and the ring knows `(hash, slot)`; the
-        slot is the only thing relating them. Joined engine-side because
-        `num_groups` is authoritative here. Both lists are appended by the same
-        `_spill()` and drained together, so a slot in one and not the other is a
-        bug -- dropped rather than guessed at.
-        """
-        out: list[tuple[int, int, int, int]] = []
-        for cache in self.state_caches:
-            offload = getattr(cache, "offload", None)
-            if offload is None:
-                continue
-            hash_of_slot = {slot: h for h, slot in offload.take_pending()}
-            for group, slot in cache.take_spill_copies():
-                h = hash_of_slot.pop(slot, None)
-                if h is None:
-                    logger.warning(
-                        "state offload: staging slot %d has a copy but no "
-                        "pending hash; dropping the spill",
-                        slot,
-                    )
-                    offload.release_staging(slot)
-                    continue
-                out.append((group, cache.num_groups + slot, slot, h))
-            # Whatever is left is a pending hash with no copy to feed it. The
-            # keys are the slots; the values are the hashes, which the ring
-            # does not take back.
-            for slot in hash_of_slot:
-                # Never observed in correct operation; release rather than leak.
-                offload.release_staging(slot)
-        return out
 
     def state_checkpoint_fates(self) -> dict[str, int]:
         """Summed fates across every state class, for the periodic stats line.
@@ -949,16 +904,8 @@ class BlockManager:
 
         src = self.state.lookup(hit_hash) if hit_hash != -1 else -1
         if src < 0:
-            # Decided before the pop, not after: an eviction that makes room
-            # for a load must not spill, because the spill's copy out of that
-            # slot is issued by a later forward while the load writes it from
-            # the tier's thread first. See `StateSlotPool.pop`.
             wants_load = self._tier_can_serve(hit_hash)
-            # Only the committed slot can be the load's destination, so only it
-            # has to forgo the spill; the rollback scratch is this request's own.
-            seq.state_slots = [self.state.pop(spill=not wants_load)] + (
-                self.state.pop_many(width - 1)
-            )
+            seq.state_slots = self.state.pop_many(width)
             seq.state_fork_src = -1
             if wants_load and self._request_state_load(seq, hit_hash):
                 return True
@@ -993,42 +940,23 @@ class BlockManager:
 
     def _tier_can_serve(self, hit_hash: int) -> bool:
         """Whether the tier believes it holds `hit_hash`.
-        Asked twice per admission -- before `pop`, to decide whether that
-        eviction may spill, and inside `_request_state_load`. One predicate so
-        the two cannot drift: a pop that forwent its spill for a load then
-        refused would lose a checkpoint for nothing.
+
+        Asked twice per admission -- once by `_attach_state_slots` to decide
+        whether to try a load at all, and again inside `_request_state_load`.
+        One predicate so the two cannot drift.
         """
         return (
             hit_hash != -1
             and self.state_offload is not None
             and hit_hash in self.state_offload.hashes
         )
-        """Whether `hit_hash`'s state can be produced at all, from either tier.
-
-        Distinct from `_tier_can_serve`, which asks "will a load be issued" and
-        decides whether an eviction may spill. This asks "does this boundary
-        have a state behind it" -- an HBM checkpoint answers yes here, no there.
-
-        The HBM branch is reachable, not redundant: `unindex` drops a checkpoint
-        when *its own* block leaves the index, but `can_allocate`'s walk stops at
-        the first miss anywhere in the chain, so an earlier block going puts a
-        live HBM checkpoint above `hbm_boundary`. That is the cheapest joint load
-        there is -- no state transfer, just the fork.
-
-        Nothing downstream needs to know which branch answered:
-        `_attach_state_slots` looks HBM up first and falls to a load on a miss.
-        """
-        return self._tier_can_serve(hit_hash) or (
-            hit_hash != -1 and self.state.lookup(hit_hash) >= 0
-        )
 
     def _request_state_load(self, seq: Sequence, hit_hash: int) -> bool:
         """Ask the tier to fetch `hit_hash` into the slot `seq` just took.
 
         Only reached when the HBM index missed -- the case the tier exists for.
-        The destination is a real pool slot, never a staging entry: the bytes
-        land where the resuming forward reads them, and only the spill direction
-        needs the indirection.
+        The bytes land in the committed slot, where the resuming forward reads
+        them.
 
         `state_fork_src` stays -1. The loaded slot *is* the incoming state, and
         naming a source would send the forward to a different slot than the one
@@ -1040,17 +968,6 @@ class BlockManager:
         then disowns the boundary -- the pre-tier answer.
         """
         if not self._tier_can_serve(hit_hash):
-            return False
-        if self.state.has_pending_spill(seq.state_slot):
-            # A spill queued in an earlier pass still has to read this slot
-            # and the load would overwrite it first. Decline; the caller
-            # disowns the boundary, which is the pre-tier answer.
-            logger.warning(
-                "state offload: slot %d still owes a spill copy; declining "
-                "the load for seq %s and recomputing instead.",
-                seq.state_slot,
-                seq.id,
-            )
             return False
         if not self.state_offload.request_load(seq.id, hit_hash):
             return False

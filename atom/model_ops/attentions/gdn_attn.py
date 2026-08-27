@@ -823,24 +823,26 @@ class GDNStateMixin:
         )
         launch_copy_descriptor(staging.copy_to_gpu(plan.num_spans), plan)
 
-    def state_entry_views(self, group: int) -> list[torch.Tensor]:
-        """One contiguous slice per (cache, layer) — the group's whole state.
+    def state_entry_views(self, slot: int) -> list[torch.Tensor]:
+        """One contiguous slice per (cache, layer) — the slot's whole state.
 
-        Both caches are layer-major with the slot on axis 1, so a group's rows
+        Both caches are layer-major with the slot on axis 1, so one slot's rows
         are strided and there is no single range covering them. Slicing per
         layer makes each piece contiguous, which is what the staging packer
         requires; `relocate_state_slots` keeps its own strided views because
         `_foreach_copy_` has no such constraint and one launch beats `LAYERS`.
+
+        One slot, not a request's whole set: a checkpoint is exactly the
+        committed state (#2045), and the speculation scratch beside it is this
+        request's own and resumable by nobody.
         """
-        span = 1 + self.num_spec
-        lo = group * span
         views = []
         for cache in (
             self.model_runner.mamba_k_cache,
             self.model_runner.mamba_v_cache,
         ):
             for layer in range(cache.shape[0]):
-                views.append(cache[layer, lo : lo + span])
+                views.append(cache[layer, slot : slot + 1])
         return views
 
     def relocate_state_slots(self, pairs: Sequence[tuple[int, int]]) -> None:

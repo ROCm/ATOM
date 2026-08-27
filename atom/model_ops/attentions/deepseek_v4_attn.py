@@ -840,23 +840,14 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         )
         return StateTransfer.copy(layout_id)
 
-    def state_entry_views(self, group: int) -> list[torch.Tensor]:
-        """One contiguous slice per plane — a V4 group is one slot per plane.
+    def state_entry_views(self, slot: int) -> list[torch.Tensor]:
+        """One contiguous slice per plane — a V4 slot is one row per plane.
 
         A slot holds the compressor state and then every layer's windows
         contiguously (see `relocate_state_slots`), so a plane's whole
         contribution is one range and no per-layer split is needed.
-
-        `group` may address a staging-ring group past the last one the
-        BlockManager leases, and that resolves: `num_state_slots` (:863-866)
-        and the carve that sizes the planes (:1023, feeding `with_capacity` at
-        :1038) both read
-        `entries[STATE_SLOT_CLASS]`, the *allocation* count, which already
-        includes the K extra staging groups — admission is capped by a separate
-        count. So `_slot_views()`'s span and `physical_slot`'s bound both cover
-        the staging groups; `tests/test_state_entry_views.py` pins this.
         """
-        return self._slot_views()[group]
+        return self._slot_views()[slot]
 
     def relocate_state_slots(self, pairs: Sequence[tuple[int, int]]) -> None:
         """Duplicate a request's whole per-request state: compressor + windows.
@@ -1357,8 +1348,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         tier's staging ring are both added by `state_pool` itself, which is the
         only reader of the two env vars that size them.
         """
-        from atom.model_engine.state_offload import kv_connector_hosts_state_tier
-
         geo = self.pool_geometry
         row_bytes = self.plane_row_bytes()
         return [
@@ -1367,9 +1356,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 STATE_SLOT_CLASS,
                 geo.slot_bytes(row_bytes),
                 entries_per_req=1,
-                offload_hosted=kv_connector_hosts_state_tier(
-                    getattr(self.model_runner.config, "kv_transfer_config", None)
-                ),
             ),
         ]
 

@@ -1726,10 +1726,7 @@ class ModelRunner:
         # sliding-window pool and the attention builder each index it by the
         # class name they declared. Nothing here needs to know those names.
         self.pool_plan = plan
-        # BlockManager divides this into request groups; the offload staging
-        # cushion is allocated but not leasable, so admission must not see it.
-        # Backends keep sizing their tensors from `pool_plan.entries`.
-        config.pool_entries = dict(plan.admission_entries)
+        config.pool_entries = dict(plan.entries)
         config.pool_entries_per_req = dict(plan.entries_per_req)
         # Keep runtime state metadata out of Config.
         transfer = self.attn_metadata_builder.state_transfer()
@@ -1777,15 +1774,9 @@ class ModelRunner:
         )
         self.state_runtime = state_runtime
         for name in sorted(plan.entries):
-            extra = plan.entries[name] - plan.admission_entries[name]
             logger.info(
-                f"sub-pool {name}: entries={plan.entries[name]}"
-                + (
-                    f" ({plan.admission_entries[name]} admissible + {extra} staging)"
-                    if extra
-                    else ""
-                )
-                + f", entry_bytes={plan.entry_bytes[name]}, "
+                f"sub-pool {name}: entries={plan.entries[name]}, "
+                f"entry_bytes={plan.entry_bytes[name]}, "
                 f"reserved={plan.reserved_bytes[name] / (1 << 30):.2f}GB"
             )
 
@@ -1853,10 +1844,7 @@ class ModelRunner:
         # the class they declared.
         return {
             "num_kvcache_blocks": num_kvcache_blocks,
-            # BlockManager divides this into request groups; the offload staging
-            # cushion is allocated but not leasable, so admission must not see it.
-            # Backends keep sizing their tensors from `pool_plan.entries`.
-            "pool_entries": dict(plan.admission_entries),
+            "pool_entries": dict(plan.entries),
             "pool_entries_per_req": dict(plan.entries_per_req),
             "state_runtime": state_runtime.to_wire(),
         }

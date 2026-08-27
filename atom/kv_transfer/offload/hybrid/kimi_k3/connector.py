@@ -38,7 +38,6 @@ logger = logging.getLogger("atom")
 #: them opaquely and takes a failure-dominant TP quorum, which is what makes a
 #: partial store resolve instead of pinning a key forever.
 STATE_INDEX_CHANNEL = "k3_state_index"
-STATE_STAGING_CHANNEL = "k3_state_staging"
 
 #: A save outstanding longer than this is a backend that stopped, not one that
 #: is busy: a 4096-token store costs ~65ms.
@@ -66,15 +65,9 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
     def _build_state_tier(self, transfer_tensors) -> None:
         from aiter.dist.parallel_state import get_tp_group
 
-        from atom.model_engine.state_offload import state_offload_staging_groups
-
-        if state_offload_staging_groups() <= 0:
-            return
-
-        # PP breaks the tier twice over: the CacheEngineKey has no PP component,
-        # so two stages at the same TP rank would overwrite each other; and only
-        # the head stage drains staging releases, so the ring starves. Refused
-        # rather than half-supported. Paged KV is unaffected.
+        # PP breaks the tier: the CacheEngineKey has no PP component, so two
+        # stages at the same TP rank would overwrite each other. Refused rather
+        # than half-supported. Paged KV is unaffected.
         pp_size = int(getattr(self._config, "pipeline_parallel_size", 1) or 1)
         if pp_size > 1:
             logger.warning(
@@ -242,14 +235,15 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
         out = super().get_finished()
         if self._state_tier is None:
             return out
-        indexed, released, index_failed = self._state_tier.take_spill_reports()
+        indexed, index_failed = self._state_tier.take_store_reports()
         state_done, state_failed = self._state_tier.get_finished()
         out.finished_loading, out.failed_loading = self._settle_joint(
             out.finished_loading, out.failed_loading, state_done, state_failed
         )
-        # Spill and staging reports have no request identity, so they ride the
-        # connector-owned channels; the aggregator's quorum is failure-dominant,
-        # which is what resolves a partial store instead of pinning the key.
+        # Store reports have no request identity -- by the time one lands its
+        # owner is long gone -- so they ride the connector-owned channel; the
+        # aggregator's quorum is failure-dominant, which is what resolves a
+        # partial store instead of pinning the key.
         for h in indexed:
             out.connector_completions.add(
                 ConnectorCompletion(STATE_INDEX_CHANNEL, int(h), True)
@@ -257,10 +251,6 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
         for h in index_failed:
             out.connector_completions.add(
                 ConnectorCompletion(STATE_INDEX_CHANNEL, int(h), False)
-            )
-        for group in released:
-            out.connector_completions.add(
-                ConnectorCompletion(STATE_STAGING_CHANNEL, int(group), True)
             )
         return out
 
@@ -314,7 +304,6 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler):
         # Channel reports drained by the engine each step.
         self._state_indexed: set[int] = set()
         self._state_index_failed: set[int] = set()
-        self._state_staging_released: set[int] = set()
 
     # -- state load queue --------------------------------------------------
     def enqueue_state_loads(self, loads) -> bool:
@@ -468,17 +457,12 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler):
             )
             target.add(int(completion.operation_id))
             return True
-        if completion.channel == STATE_STAGING_CHANNEL:
-            self._state_staging_released.add(int(completion.operation_id))
-            return True
         return super().connector_completion(completion)
 
-    def take_state_reports(self) -> tuple[set[int], set[int], set[int]]:
-        """Drain this step's tier reports for the engine-side index."""
+    def take_state_reports(self) -> tuple[set[int], set[int]]:
+        """Drain this step's tier store reports for the engine-side index."""
         indexed = self._state_indexed
         failed = self._state_index_failed
-        released = self._state_staging_released
         self._state_indexed = set()
         self._state_index_failed = set()
-        self._state_staging_released = set()
-        return indexed, released, failed
+        return indexed, failed

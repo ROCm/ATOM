@@ -225,39 +225,18 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         """
         return None
 
-    def state_entry_views(self, group: int) -> list["torch.Tensor"]:
-        """Contiguous views covering the whole of `group`'s per-request state.
+    def state_entry_views(self, slot: int) -> list["torch.Tensor"]:
+        """Contiguous views covering the whole of `slot`'s per-request state.
 
         The byte-level counterpart of `relocate_state_slots`, so the offload
         tier can read or write the same bytes. Every view must be contiguous --
-        the Triton packer refuses a strided one -- so a class whose group is
+        the Triton packer refuses a strided one -- so a class whose slot is
         strided (GDN, slot on axis 1) returns one view per layer.
         """
         raise NotImplementedError(
             f"{type(self).__name__} owns per-request state but does not "
             "implement state_entry_views"
         )
-
-    def _submit_state_spills(self, pairs) -> None:
-        """Hand the staged bytes to the offload tier's own executor.
-
-        The connector is reached function-locally so these modules stay
-        importable without the offload extra.
-        """
-        from atom.utils.forward_context import get_kvconnector
-
-        connector = get_kvconnector()
-        tier = getattr(connector, "_state_tier", None)
-        if tier is None:
-            return
-        import torch
-
-        # One event for the whole batch: every copy above was issued on this
-        # stream, so an event recorded now is after all of them.
-        ready = torch.cuda.Event()
-        ready.record(torch.cuda.current_stream())
-        for _src, dst, slot, h in pairs:
-            tier.submit_spill(h, entry_index=dst, staging_slot=slot, ready_event=ready)
 
     def relocate_state_slots(self, pairs: Sequence[tuple[int, int]]) -> None:
         """Move live state between contiguous Active Slots."""
@@ -638,19 +617,6 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
     def build(self, batch: ScheduledBatch, bs: int):
         # Run state maintenance on the compute stream before the forward.
         state_ops = batch.state_maintenance_ops
-        # Spills FIRST, and the order is load-bearing. A spill is filed under
-        # the group's *old* hash, and the same `pop()` then hands that group out
-        # as a checkpoint destination -- so one group is routinely both a spill
-        # SOURCE and a checkpoint DESTINATION in one batch. Issue the other
-        # copies first and the tier stores the new occupant's state under the
-        # evicted checkpoint's hash: valid-looking, someone else's, undetectable
-        # on any later load. The reverse cannot happen -- a spill's destination
-        # is past the pool's range and is never a copy source.
-        if state_ops.spills:
-            self.relocate_state_slots(
-                [(src, dst) for src, dst, _slot, _h in state_ops.spills]
-            )
-            self._submit_state_spills(state_ops.spills)
         if state_ops.relocations:
             self.relocate_state_slots(state_ops.relocations)
         if state_ops.checkpoint_stores or state_ops.checkpoint_restores:

@@ -231,7 +231,6 @@ the tier off means turning the connector off.
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| **OFFLOAD_STATE_STAGING_GROUPS** | int | 1 | Spill staging ring depth in **groups** -- `state_pool()` multiplies by the class's `entries_per_req` to get rows. Allocated inside the state arena and never leased to a request. Raise it if `state_offload_spills_dropped` is a material fraction of `spills_requested`; set 0 on a deployment that will never offload, to reclaim the rows. |
 | **OFFLOAD_STATE_CPU_SIZE** | float (GiB) | 16 | A CPU pool for state entries, separate from the paged-KV pool. Sharing loses both ways: the KV write stream is several times the state volume so it evicts the checkpoints, and a stopped KV backend takes the tier down with it. 0 shares the paged-KV pool. |
 
 ## Profiling & debugging

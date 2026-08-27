@@ -731,13 +731,12 @@ def test_state_offload_is_none_when_tier_is_off(block_manager):
     assert block_manager.state_offload is None
 
 
-# ── the ring is installed only where something can drain it ───────────────
+# ── the index is built only where something can report to it ─────────────
 
 _OFFLOAD_KVC = {"kv_connector": "lmcache_offload", "kv_role": "offload"}
 
 
 def _bm_with_state_tier(monkeypatch, kv_transfer_config):
-    monkeypatch.setenv("OFFLOAD_STATE_STAGING_GROUPS", "2")
     cfg = MockConfig(
         enable_prefix_caching=True,
         kv_transfer_config=kv_transfer_config,
@@ -750,28 +749,21 @@ def _bm_with_state_tier(monkeypatch, kv_transfer_config):
 def test_no_ring_is_installed_without_a_connector_that_hosts_the_tier(
     monkeypatch, caplog
 ):
-    """The silent-permanent failure. Nothing submits a spill without a hosting
-    connector -- `_poll_kv_transfer_progress` returns early and the forward
-    finds no `_state_tier` -- so an installed ring would hand out every slot
-    and never get one back. Refuse to install it."""
+    """The silent-permanent failure. A load is resolved only by a worker
+    report, and without a hosting connector no report ever comes -- so an index
+    built here would offer loads that park their request forever. Refuse to
+    build it."""
     with caplog.at_level(logging.WARNING, logger="atom"):
         bm = _bm_with_state_tier(monkeypatch, None)
 
     assert bm.state_offload is None
-    assert all(cache.offload is None for cache in bm.state_caches)
-    # An installed-but-inert ring is the thing that misleads, so drive the
-    # eviction path that would reserve a slot and prove none is: with the ring
-    # installed this same call yields (src, dst, staging, hash) and that
-    # staging slot never comes back.
-    bm.state.slot_hash[1] = 111
-    bm.state._spill(1)
-    assert bm.state.take_spill_copies() == []
-    assert bm.state_spills_for_batch() == []
 
 
-def test_a_connector_that_cannot_host_the_tier_gets_no_ring_either(monkeypatch, caplog):
-    """Same leak, one step subtler: moriio is a KV connector, so a plain
-    truthiness test on kv_transfer_config would install the ring, but only
+def test_a_connector_that_cannot_host_the_tier_gets_no_index_either(
+    monkeypatch, caplog
+):
+    """Same failure, one step subtler: moriio is a KV connector, so a plain
+    truthiness test on kv_transfer_config would build the index, but only
     lmcache_offload's worker half ever builds a `_state_tier`."""
     with caplog.at_level(logging.WARNING, logger="atom"):
         bm = _bm_with_state_tier(monkeypatch, {"kv_connector": "moriio"})
@@ -779,14 +771,15 @@ def test_a_connector_that_cannot_host_the_tier_gets_no_ring_either(monkeypatch, 
     assert bm.state_offload is None
 
 
-def test_the_ring_is_installed_for_the_offload_connector(monkeypatch):
+def test_the_index_is_built_for_the_offload_connector(monkeypatch):
     bm = _bm_with_state_tier(monkeypatch, _OFFLOAD_KVC)
     assert bm.state_offload is not None
-    assert bm.state_offload.staging_depth == 2
-    assert all(cache.offload is bm.state_offload for cache in bm.state_caches)
+    # #2045 moved the checkpoint into the KV pool, so the tier no longer
+    # reaches into the slot pool at all -- that coupling was the staging ring.
+    assert not any(hasattr(cache, "offload") for cache in bm.state_caches)
 
 
-def test_the_ring_is_installed_for_a_multi_that_lists_the_offload_backend(
+def test_the_index_is_built_for_a_multi_that_lists_the_offload_backend(
     monkeypatch,
 ):
     bm = _bm_with_state_tier(
@@ -799,7 +792,7 @@ def test_the_ring_is_installed_for_a_multi_that_lists_the_offload_backend(
     assert bm.state_offload is not None
 
 
-def test_a_multi_without_the_offload_backend_gets_no_ring(monkeypatch):
+def test_a_multi_without_the_offload_backend_gets_no_index(monkeypatch):
     bm = _bm_with_state_tier(
         monkeypatch,
         {"kv_connector": "multi", "connectors": [{"kv_connector": "moriio"}]},

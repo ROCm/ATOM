@@ -3396,30 +3396,20 @@ class Scheduler:
                 if seq is not None:
                     self._maybe_release_deferred(seq)
 
-        # The state-offload reports, not keyed by request: by the time a spill
-        # lands its owner is long gone and only the hash and slot remain. They
+        # The state-offload store reports, not keyed by request: by the time a
+        # store lands its owner is long gone and only the hash remains. They
         # ride the connector's completion channels, so they are drained from the
         # connector with TP quorum already taken.
+        #
+        # Indexed only on the report, never at submission: a hash advertised
+        # before its bytes exist parks the next request over that prefix
+        # against a `get` that must miss.
         offload = getattr(getattr(self, "block_manager", None), "state_offload", None)
         take = getattr(self.kv_connector, "take_state_reports", None)
         if offload is not None and take is not None:
-            indexed, released, _failed = take()
-            # Index before releasing, always. The reverse order opens a window
-            # in which the slot is reusable but its hash is not yet findable,
-            # so a lookup misses a checkpoint that is in fact stored.
+            indexed, _failed = take()
             for h in indexed:
-                offload.confirm_spill(int(h))
-            for slot in released:
-                offload.release_staging(int(slot))
-            # Ring-side twin of `_reconcile_stalled_deferred_saves`: a slot whose
-            # spill report never returns (worker abandoned/lost the transfer)
-            # would pin the ring until every spill drops. Reclaim it once the
-            # same abandon window the engine uses has elapsed -- larger than the
-            # upstream force-unpin timeout, so the staging buffer is no longer in
-            # flight before the slot is reused. Self-throttled inside.
-            reclaim = getattr(offload, "reclaim_stale_slots", None)
-            if callable(reclaim):
-                reclaim(_offload_save_abandon_timeout_s())
+                offload.note_stored(int(h))
 
     def get_request_counts(self) -> tuple[int, int]:
         """Returns (num_running_reqs, num_waiting_reqs)."""

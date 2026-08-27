@@ -57,7 +57,6 @@ from atom.kv_transfer.offload.hybrid.dsv4.policy import (
 from atom.kv_transfer.offload.hybrid.kimi_k3.connector import (
     SAVE_STALL_SECONDS,
     STATE_INDEX_CHANNEL,
-    STATE_STAGING_CHANNEL,
     KimiK3OffloadScheduler,
 )
 from atom.kv_transfer.offload.metadata import (
@@ -4650,7 +4649,6 @@ def _k3_scheduler() -> KimiK3OffloadScheduler:
     s._warned_save_stalled = False
     s._state_indexed = set()
     s._state_index_failed = set()
-    s._state_staging_released = set()
     s._active_load_operations = {}
     s._do_save = True
     s._max_pending_saves = 4
@@ -4822,20 +4820,22 @@ def test_state_loads_are_drained_into_the_metadata_exactly_once(monkeypatch):
 
 def test_the_two_state_channels_are_routed_and_drained():
     """The tier reports over the generic completion channel rather than extra
-    `KVConnectorOutput` fields, so TP quorum is the aggregator's job."""
+    `KVConnectorOutput` fields, so TP quorum is the aggregator's job. Failure
+    is its own channel value, not a missing report: quorum over
+    `indexed | failed` is failure-dominant, so a partial store resolves in the
+    same step instead of pinning the key forever."""
     s = _k3_scheduler()
     for channel, op, ok in (
         (STATE_INDEX_CHANNEL, 111, True),
         (STATE_INDEX_CHANNEL, 222, False),
-        (STATE_STAGING_CHANNEL, 3, True),
     ):
         assert s.connector_completion(
             SimpleNamespace(channel=channel, operation_id=op, succeeded=ok)
         )
 
-    indexed, released, failed = s.take_state_reports()
-    assert (indexed, released, failed) == ({111}, {3}, {222})
-    assert s.take_state_reports() == (set(), set(), set())
+    indexed, failed = s.take_state_reports()
+    assert (indexed, failed) == ({111}, {222})
+    assert s.take_state_reports() == (set(), set())
 
 
 def test_no_more_saves_go_out_than_the_pool_can_afford_to_pin():

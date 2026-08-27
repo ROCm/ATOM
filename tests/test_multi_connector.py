@@ -405,7 +405,7 @@ def test_no_sub_to_carry_a_state_load_is_reported_not_swallowed():
 
 
 def test_the_composite_exposes_the_sub_connectors_state_tier():
-    """`AttentionBackend._submit_state_spills` reads `_state_tier` off whatever
+    """The K3 store/load path reads `_state_tier` off whatever
     connector the forward context holds. Under `multi` that is this object, so
     without the re-export nothing is ever submitted and every slot leaks."""
     tier = object()

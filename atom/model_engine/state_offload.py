@@ -1,221 +1,58 @@
 # SPDX-License-Identifier: MIT
 """Scheduler-side bookkeeping for the state-cache offload tier.
 
-Two things live here and neither touches a device: the set of hashes believed
-to be in LMCache, and the bounded queue of groups waiting to be read out of
-HBM. The bytes and the transfers are the worker's business
-(`kv_transfer/offload/state_tier.py`).
+One thing lives here and it touches no device: the set of hashes believed to be
+in LMCache, plus the loads offered against them. The bytes and the transfers are
+the worker's business (`kv_transfer/offload/hybrid/kimi_k3/state_tier.py`).
+
+There used to be a second thing -- a bounded ring of staging entries a spill
+copied an evicted checkpoint into. It existed for one reason: a checkpoint lived
+in a state slot, and `StateSlotPool.pop` handed that slot to the next request
+the instant it was evicted, so the bytes had to be rescued somewhere before they
+were overwritten. Under #2045 a K3 checkpoint is a PAGE image in the KV pool
+whose units are reserved and structurally un-takeable, so the source holds still
+on its own and the ring has nothing left to rescue. See `REBASE_PLAN_v2.md`.
 
 The set is in memory and never persisted: `LocalDiskBackend.__init__` starts
 from an empty dict and never scans its directory, so an index recovered from
-disk would be a pure false-positive generator. Index and bytes share one
-server lifetime.
+disk would be a pure false-positive generator. Index and bytes share one server
+lifetime.
 """
 
 import logging
-import os
-import time
-from collections import deque
 
 logger = logging.getLogger("atom")
 
-# How often `reclaim_stale_slots` actually scans, regardless of how often it is
-# called. The scan is O(staging_depth) and self-throttled so wiring it into a
-# per-step drain loop costs nothing when nothing is stuck.
-_RECLAIM_SCAN_INTERVAL_S = 5.0
-
-# Consecutive dropped spills, with no slot coming back, before the ring is
-# called starved rather than busy. A slot returns only once the worker's D2H
-# lands, so a burst of evictions can legitimately drop for a step or two; an
-# order of magnitude above that, so crossing it means the slots are gone.
-_STARVATION_DROP_THRESHOLD = 256
-
 
 class StateOffloadIndex:
-    """What has been spilled, what is queued to be, and what is coming back.
+    """What is believed to be in LMCache, and what is being fetched back.
 
-    `hashes` answers the membership half of `StateSlotPool._resumable_from`.
-    It is deliberately optimistic: LMCache's own LRU can drop bytes at any
-    time, so a hash here means "was spilled once", never "is still there". The
-    false positive costs one lookup and a park/unpark, and is handled by the
-    `failed_loading` path (`fail_load` -> `forget`).
+    `hashes` answers the membership half of the tier's vote. It is deliberately
+    optimistic: LMCache's own LRU can drop bytes at any time, so a hash here
+    means "was stored once", never "is still there". The false positive costs
+    one lookup and a park/unpark, and is handled by the `failed_loading` path
+    (`fail_load` -> `forget`).
     """
 
-    def __init__(self, staging_depth: int) -> None:
-        self.staging_depth = max(0, int(staging_depth))
-        # Orphaned checkpoints (`unindex`) are worth spilling only when the KV
-        # prefix can also come back: `resumable_hit` scans `block_hashes`, which
-        # `can_allocate` builds from HBM `kv.lookup` hits only. With KV offload
-        # off, a hash whose KV left HBM never reappears and the bytes are wasted.
-        #
-        # In production today this is always True: `BlockManager.__init__`
-        # refuses to construct the index at all when the connector does not
-        # host the tier, so the only path here has already established it. The
-        # flag is kept, and the `unindex` gate with it, because the two
-        # conditions are independent in principle -- a future connector could
-        # host the tier's transport without offloading KV -- and because the
-        # failure it prevents (spending LMCache capacity on hashes no load can
-        # ever reach) is silent. Its False arm is covered by tests only.
+    def __init__(self) -> None:
         self.hashes: set[int] = set()
-        self._free_slots: deque[int] = deque(range(self.staging_depth))
-        self._pending: deque[tuple[int, int]] = deque()
         # req_id -> hash, for loads offered and not yet settled. Keyed by
         # request because that is what comes back, on the same
-        # `finished_loading`/`failed_loading` channel a KV load uses. (Spill
-        # reports are keyed by hash and slot -- their owner is long gone.)
+        # `finished_loading`/`failed_loading` channel a KV load uses.
         self.pending_loads: dict = {}
-        # Read once, here, rather than per call: `_resumable_from` consults it
-        # inside a per-block scan.
-        self.spills_requested = 0
-        self.spills_dropped = 0
-        # Evictions that deliberately did not spill because the group was
-        # going to a load. Apart from `spills_dropped`: a deeper ring does not
-        # fix this one, it is the price of the load.
-        self.spills_forgone = 0
         self.loads_attempted = 0
         self.loads_completed = 0
         self.loads_failed = 0
-        # Drops since the last `release_staging`. A full ring is normal
-        # backpressure only while slots come back; none in this many attempts
-        # means the consumer stopped draining.
-        self._consecutive_drops = 0
-        self._warned_starved = False
-        # slot -> time.monotonic() when it was reserved by `request_spill`.
-        # A slot's only way home is `release_staging`, driven by the worker's
-        # spill report. If that report never comes (the worker abandoned the
-        # transfer, or its completion was lost the same way a KV save's can be),
-        # the slot is pinned forever and the ring silently starves. This stamp
-        # lets `reclaim_stale_slots` return a slot the report has clearly
-        # abandoned. Reclaimed slots (`_slots_reclaimed`) are counted so the
-        # symptom is visible rather than a silent throughput cliff.
-        self._slot_reserved_at: dict[int, float] = {}
-        self._next_reclaim_at: float = 0.0
-        self._slots_reclaimed = 0
 
-    @property
-    def enabled(self) -> bool:
-        return self.staging_depth > 0
+    # ------------------------------- stores -------------------------------- #
+    def note_stored(self, h: int) -> None:
+        """A store landed in LMCache and the hash is now worth voting for.
 
-    def request_spill(self, h: int, group: int) -> int:
-        """Reserve a staging slot for `group`, or -1 if the ring is full.
-
-        On `pop()`'s critical path, so no work beyond a deque pop. The caller
-        copies `group` into the slot on the compute stream and `pop()` hands the
-        original out immediately -- spilling by copy rather than by pin, because
-        `pop()` runs precisely when there is no free group to withhold.
+        Called from the report the worker sends back, never at submission: a
+        hash advertised before its bytes exist parks the next request over that
+        prefix against a `get` that must miss.
         """
-        # A negative hash is a caller bug, not a dropped spill -- `_spill`
-        # already refuses a group with no checkpoint. Guarded, but not counted,
-        # so `spills_dropped` stays a clean backpressure signal.
-        if h < 0:
-            return -1
-        if not self._free_slots:
-            self.spills_dropped += 1
-            self._note_drop()
-            return -1
-        slot = self._free_slots.popleft()
-        self._pending.append((h, slot))
-        self._slot_reserved_at[slot] = time.monotonic()
-        self.spills_requested += 1
-        return slot
-
-    def _note_drop(self) -> None:
-        """Warn once when drops stop looking like a burst and start looking
-        like a consumer that has gone away."""
-        self._consecutive_drops += 1
-        if self._warned_starved or self._consecutive_drops < _STARVATION_DROP_THRESHOLD:
-            return
-        self._warned_starved = True
-        logger.warning(
-            "State offload staging ring is starved: %d spills dropped in a row "
-            "with no slot released (staging_depth=%d). The consumer is very "
-            "likely not calling StateSlotPool.take_spill_copies() every step, "
-            "or not calling StateOffloadIndex.release_staging(slot) once the "
-            "bytes are safe. Every further spill will be dropped until it does.",
-            self._consecutive_drops,
-            self.staging_depth,
-        )
-
-    def take_pending(self) -> list[tuple[int, int]]:
-        """Drain the queue as `(hash, staging_slot)` pairs."""
-        out = list(self._pending)
-        self._pending.clear()
-        return out
-
-    def confirm_spill(self, h: int) -> None:
-        """Index `h` once its bytes reached LMCache."""
-        self.hashes.add(h)
-
-    def release_staging(self, slot: int) -> None:
-        if 0 <= slot < self.staging_depth and slot not in self._free_slots:
-            self._free_slots.append(slot)
-            self._slot_reserved_at.pop(slot, None)
-            # The ring is moving again, so any drops so far were a burst.
-            self._consecutive_drops = 0
-
-    def reclaim_stale_slots(self, timeout_s: float, now: float | None = None) -> int:
-        """Return slots whose spill report never came back to the free ring.
-
-        `release_staging` is the only way a slot comes home, and it fires only
-        on the worker's spill report. A lost report would pin that slot forever;
-        enough of them and `request_spill` drops every spill (`spills_dropped`
-        climbs, `_note_drop` warns) with no way to recover short of a restart.
-        The ring-side twin of the engine's `_reconcile_stalled_deferred_saves`,
-        and it takes that reconciler's window so the two cannot drift.
-
-        **Only slots the spill queue has let go are eligible.** A slot still in
-        `_pending` has not been drained by `BlockManager.state_spills_for_batch`
-        yet, and that method drains `take_pending()` and the pool's
-        `take_spill_copies()` in one call -- so a slot in `_pending` still has a
-        `(slot, staging)` copy queued on `StateSlotPool`. Returning it would let
-        a new spill reserve the same slot, and the two copies would then race
-        for the single `{slot: hash}` entry the drain builds: the loser is
-        reported as "a copy with no pending hash" and releases the slot out from
-        under the winner. Skipping those costs nothing -- an undrained spill
-        means the engine has not run a batch, which is what
-        `_reconcile_stalled_deferred_saves` is busy fixing; the slot becomes
-        eligible on the next scan once the batch drains it.
-
-        Safety otherwise mirrors the engine-side reconciliation: `timeout_s` is
-        past the upstream force-unpin window, so the worker's staging buffer is
-        no longer being read before the slot is handed to a new spill.
-        Self-throttled to one real scan per `_RECLAIM_SCAN_INTERVAL_S`, so it is
-        safe to call every step. Returns the number of slots reclaimed.
-        """
-        if timeout_s <= 0 or not self._slot_reserved_at:
-            return 0
-        now = time.monotonic() if now is None else now
-        if now < self._next_reclaim_at:
-            return 0
-        self._next_reclaim_at = now + _RECLAIM_SCAN_INTERVAL_S
-        queued = {slot for _h, slot in self._pending}
-        stale = [
-            slot
-            for slot, at in self._slot_reserved_at.items()
-            if now - at >= timeout_s and slot not in queued
-        ]
-        if not stale:
-            return 0
-        for slot in stale:
-            self._slot_reserved_at.pop(slot, None)
-            if 0 <= slot < self.staging_depth and slot not in self._free_slots:
-                self._free_slots.append(slot)
-        self._slots_reclaimed += len(stale)
-        # A reclaim means the ring was stuck, not bursting; reset the burst
-        # counter so a fresh starvation warning can arm if it stalls again.
-        self._consecutive_drops = 0
-        self._warned_starved = False
-        logger.warning(
-            "State offload staging ring reclaimed %d slot(s) whose spill report "
-            "never returned after %.0fs (staging_depth=%d, total reclaimed=%d). "
-            "The worker very likely abandoned or lost the transfer's completion; "
-            "the slot is returned to the ring so spills can resume.",
-            len(stale),
-            timeout_s,
-            self.staging_depth,
-            self._slots_reclaimed,
-        )
-        return len(stale)
+        self.hashes.add(int(h))
 
     def forget(self, h: int) -> None:
         """Drop a hash whose load failed, so the next request does not retry."""
@@ -247,7 +84,7 @@ class StateOffloadIndex:
         return True
 
     def complete_load(self, req_id) -> None:
-        """The bytes landed in the request's group.
+        """The bytes landed in the request's slot.
 
         The hash stays indexed: a load reads LMCache, it does not consume it,
         and the next request over the same prefix must still find it.
@@ -279,24 +116,15 @@ class StateOffloadIndex:
     def stats(self) -> dict[str, int]:
         """Counters for the periodic `state checkpoints:` line.
 
-        Reached via `StateSlotPool.checkpoint_fates`, which prefixes every
-        key with `state_offload_`. Read the three load counters together:
-        `failed / attempted` is this index's false-positive rate, and
-        `attempted - completed - failed` is what is in flight or was abandoned
-        by an aborted request.
+        Read the three load counters together: `failed / attempted` is this
+        index's false-positive rate, and `attempted - completed - failed` is
+        what is in flight or was abandoned by an aborted request.
         """
         return {
-            "spills_requested": self.spills_requested,
-            "spills_dropped": self.spills_dropped,
-            "spills_forgone": self.spills_forgone,
             "loads_attempted": self.loads_attempted,
             "loads_completed": self.loads_completed,
             "loads_failed": self.loads_failed,
             "indexed": len(self.hashes),
-            # Slots `reclaim_stale_slots` had to take back. Non-zero means spill
-            # reports are being lost, which the warning says once and this keeps
-            # saying; without it the only symptom is a throughput cliff.
-            "slots_reclaimed": self._slots_reclaimed,
         }
 
 
@@ -310,9 +138,9 @@ def kv_connector_hosts_state_tier(kv_transfer_config) -> bool:
 
     The tier is not standalone: its bytes ride the KV connector's worker half
     and its completions ride that connector's `get_finished`. Against any other
-    backend the staging ring would hand out slots and never get one back, so
-    this gates whether the ring is installed at all -- and a false negative
-    (tier off) is much cheaper than a false positive (every slot leaks).
+    backend a load would be offered and never reported, parking the request
+    that took it -- so this gates whether the index is built at all, and a
+    false negative (tier off) is much cheaper than a false positive.
 
     A name check rather than a capability probe: this runs in the engine
     process at `BlockManager.__init__`, before any worker connector exists.
@@ -328,42 +156,3 @@ def kv_connector_hosts_state_tier(kv_transfer_config) -> bool:
             for s in subs
         )
     return name in _STATE_TIER_BACKENDS
-
-
-def state_offload_staging_groups() -> int:
-    """K: staging *groups* to reserve for the tier.
-
-    Groups, not entries: a sizing site multiplies by its `entries_per_req`,
-    because `state_entry_views` is indexed by group. One function rather than
-    two `os.environ` reads, because the arena and the pool both size themselves
-    from it and would otherwise disagree.
-
-    This only sizes the ring; whether the tier runs follows the connector. Bad
-    depths warn rather than raise (model load): non-integer falls back to 1,
-    negative floors to 0.
-    """
-    raw = os.environ.get("OFFLOAD_STATE_STAGING_GROUPS")
-    if raw is None:
-        return 1
-    try:
-        depth = int(raw)
-    except ValueError:
-        # Warn rather than raise -- this runs during model load. Not silent
-        # either: a mistyped depth buys one group instead of twenty, with a
-        # starved ring 256 dropped spills later as the only other symptom.
-        logger.warning(
-            "state offload: invalid OFFLOAD_STATE_STAGING_GROUPS=%r; using 1",
-            raw,
-        )
-        return 1
-    if depth < 0:
-        # Same reasoning as the typo above, and a worse outcome: a negative
-        # depth turns the whole tier off, so the operator gets a
-        # healthy-looking server that never spills.
-        logger.warning(
-            "state offload: negative OFFLOAD_STATE_STAGING_GROUPS=%r disables "
-            "the tier entirely; using 0",
-            raw,
-        )
-        return 0
-    return depth
