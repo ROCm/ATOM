@@ -27,7 +27,7 @@ from collections.abc import Callable
 import numpy as np
 
 from atom.config import Config
-from atom.kv_transfer.disaggregation import KVConnectorOutput
+from atom.kv_transfer.disaggregation import KVConnectorOutput, kv_config_has_producer
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
@@ -1012,8 +1012,21 @@ class Scheduler:
         self.last_prompt_latency = 0.0
         self.delay_factor = config.scheduler_delay_factor
 
-        # Speculative decoding
-        self.use_spec = config.speculative_config is not None
+        # Speculative decoding. A P/D producer is excluded for the same reason
+        # `PrefillScheduler` is: it prefills, samples T0 and hands the request
+        # off, so it never proposes. ModelRunner disables deferred output on a
+        # producer (the consumer must consume T0 exactly once, or KDA state
+        # advances twice), and `propose()` only runs on the deferred path.
+        # Leaving speculation on here would still pad every sequence with
+        # `mtp_k` placeholders and size its decode window to `mtp_k + 1`, and
+        # the padding holds `num_tokens` `mtp_k` short of `max_tokens` so the
+        # handoff never fires -- the producer keeps decoding a request whose
+        # drafts do not exist. The drafter itself stays loaded: the producer
+        # still writes the draft's context KV into the shared pool at prefill.
+        is_pd_producer = kv_config_has_producer(
+            getattr(config, "kv_transfer_config", {}) or {}
+        )
+        self.use_spec = config.speculative_config is not None and not is_pd_producer
         self.mtp_k: int = (
             config.speculative_config.num_speculative_tokens if self.use_spec else 0
         )  # type: ignore
@@ -2176,6 +2189,17 @@ class Scheduler:
                 )[: self.mtp_k]
                 for d in drafts:
                     seq.append_token(int(d))
+                # Pad to the full verify window regardless of what the producer
+                # sent -- normally nothing, since a producer does not
+                # speculate. The first decode slices the trailing `mtp_k + 1`
+                # tokens, so a short seq makes that slice reach back into the
+                # prompt: T0 lands at the end of the window instead of at its
+                # head and the consumer verifies prompt tokens as drafts.
+                # Placeholders are what postprocess leaves on every other
+                # running seq, and the target rejects any the drafter's absence
+                # left it disagreeing with.
+                for _ in range(self.mtp_k - len(drafts)):
+                    seq.append_token(self.eos_token_id)
                 seq.spec_token_ids = np.asarray(drafts, dtype=np.int32)
         logger.info(
             "[PD-TRANSITION] seq %s: num_tokens=%d, "
@@ -2738,7 +2762,13 @@ class Scheduler:
                 new_tokens = [injected_t0] + list(new_tokens)
                 seq._injected_t0 = None
 
-            if self.mtp_k > 0:
+            # `draft_token_ids` is None whenever the runner skipped propose(),
+            # which a P/D producer does on every step: it disables deferred
+            # output so the consumer consumes T0 exactly once (KDA state would
+            # otherwise advance twice). The seq is handed off rather than
+            # decoded here, so it keeps its empty spec_token_ids and the
+            # consumer proposes for itself.
+            if self.mtp_k > 0 and draft_token_ids is not None:
                 # idx already resolved above via get_idx
                 seq.spec_token_ids = draft_token_ids[idx]
 
