@@ -1250,9 +1250,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             for layer_id in range(runner.index_cache.shape[0]):
                 t = runner.index_cache[layer_id]
                 bpb = t.stride(0) * t.element_size() * self.block_ratio
-                # `index_dim = index_head_dim + 4` above is one fp32 scale per
-                # token, so a page's two planes are that many keys and that
-                # many scales; the rest of `aligned_index_dim` is padding.
                 tokens_per_page = bpb // runner.aligned_index_dim
                 block_regions.append(
                     KVTransferRegion(
