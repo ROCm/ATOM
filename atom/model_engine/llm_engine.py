@@ -401,6 +401,13 @@ class LLMEngine:
                 # placement that converges from one that pays per request, and
                 # one of them missing makes the other unreadable.
                 "chunks_cut_for_end",
+                # Whether the joint state+KV load found a boundary to work
+                # with, and what the state leg cost when it did. Summed like
+                # the rest: a boundary is per admission and every rank admits
+                # the same request.
+                "joint_boundaries",
+                "joint_boundaries_hbm",
+                "joint_boundaries_tier",
             )
         }
         # `reusable`, not `full`: a request's trailing block is never a reuse

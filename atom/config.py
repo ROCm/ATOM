@@ -58,7 +58,8 @@ class KVCacheTensor:
     # recurrent state, the V4 compressor ring) rather than paged KV. They belong
     # in ``kv_cache_data`` -- the linear-attention forward reads them from there
     # -- but are addressed by request slot, so no block-addressed mover may
-    # touch them. The dense offload codec skips them for that reason.
+    # touch them. The dense codec skips them; the state tier reaches the same
+    # bytes through ``state_entry_views``.
     per_request_state: bool = False
 
 

@@ -61,6 +61,7 @@ class FakeSchedSub:
             self.saved = []
             self.load_failed_ids = []
             self.pending = False
+            self.state_loads = []
 
     def get_num_new_matched_tokens(self, seq):
         return self._match
@@ -106,6 +107,10 @@ class FakeSchedSub:
     def has_pending_work(self):
         return self.pending
 
+    def enqueue_state_loads(self, loads):
+        self.state_loads.extend(loads)
+        return True
+
     def __getattribute__(self, name):
         # Hide offload-specific methods unless this mock opts in, so
         # MultiConnector's hasattr() guards are exercised realistically.
@@ -118,6 +123,7 @@ class FakeSchedSub:
             "load_failed",
             "process_completions",
             "has_pending_work",
+            "enqueue_state_loads",
         }
         if name in offload_api and not object.__getattribute__(self, "_offload"):
             raise AttributeError(name)
@@ -163,6 +169,7 @@ def _worker(connectors, pp_is_head=True):
     obj._pending_save_ops = {}
     obj._sent = {}
     obj._saved = {}
+    obj._state_tier = None
     return obj
 
 
@@ -373,6 +380,103 @@ def test_producer_offload_load_completion_uses_loading_state():
     assert out.failed_loading == {"f1"}
 
 
+def test_state_loads_go_to_the_sub_that_can_carry_them():
+    """The scheduler calls `enqueue_state_loads` on whatever connector it
+    holds. Under `multi` that is this object, and a load it swallowed would
+    leave its request parked against a transfer nobody was asked to make.
+    """
+    plain = FakeSchedSub()
+    off = FakeSchedSub(is_offload=True, offload_methods=True)
+    loads = [(1, 111, 0), (2, 222, 3)]
+
+    assert _sched([plain, off]).enqueue_state_loads(loads) is True
+
+    assert off.state_loads == loads
+    assert not hasattr(plain, "enqueue_state_loads")
+
+
+def test_no_sub_to_carry_a_state_load_is_reported_not_swallowed():
+    """Every one of these belongs to a parked request that only a report can
+    wake, and the scheduler's `hasattr` guard cannot catch this case because
+    this method always exists on the composite. So it has to say no."""
+    plain = FakeSchedSub()
+    accepted = _sched([plain, FakeSchedSub()]).enqueue_state_loads([(1, 111, 0)])
+    assert accepted is False
+
+
+def test_the_composite_exposes_the_sub_connectors_state_tier():
+    """`AttentionBackend._submit_state_spills` reads `_state_tier` off whatever
+    connector the forward context holds. Under `multi` that is this object, so
+    without the re-export nothing is ever submitted and every slot leaks."""
+    tier = object()
+    off = FakeWorkerSub()
+    off._state_tier = tier
+    w = _worker([FakeWorkerSub(), off])
+
+    w.register_kv_caches({}, transfer_tensors=None, num_blocks=1)
+
+    assert w._state_tier is tier
+
+
+def test_no_sub_with_a_tier_leaves_the_composite_tier_none():
+    w = _worker([FakeWorkerSub(), FakeWorkerSub()])
+    w.register_kv_caches({}, transfer_tensors=None, num_blocks=1)
+    assert w._state_tier is None
+
+
+def test_a_state_only_step_under_multi_is_not_dropped():
+    """A step whose only work is a state load must reach the worker.
+
+    `state_loads` carries no `LMCacheReqMeta`, so a wrapper that answers from
+    its own (always empty) fields reports no work, the engine drops the
+    snapshot, and the request parked on that load is woken by nothing.
+    """
+    from atom.kv_transfer.disaggregation.types import connector_metadata_has_work
+    from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata
+
+    sub = LMCacheOffloadMetadata()
+    sub.state_loads = [("req-1", 12345, 7)]
+
+    assert connector_metadata_has_work(sub)
+    assert connector_metadata_has_work(MultiConnectorMetadata(metas=[sub]))
+
+
+def test_a_multi_wrapper_over_idle_subs_still_reports_no_work():
+    from types import SimpleNamespace
+
+    from atom.kv_transfer.disaggregation.types import connector_metadata_has_work
+    from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata
+
+    assert not connector_metadata_has_work(
+        MultiConnectorMetadata(metas=[LMCacheOffloadMetadata(), SimpleNamespace()])
+    )
+
+
+def test_every_metadata_field_a_subclass_adds_is_declared_work_or_not():
+    """`WORK_FIELDS` must name real attributes, or a typo silences a field.
+
+    A misspelled entry is invisible: `getattr` returns None, the field never
+    counts, and the only symptom is a parked request much later.
+    """
+    from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata
+
+    meta = LMCacheOffloadMetadata()
+    for name in LMCacheOffloadMetadata.WORK_FIELDS:
+        assert hasattr(meta, name), f"WORK_FIELDS names a missing attribute: {name}"
+
+
+def test_two_sub_connectors_with_a_tier_is_refused():
+    """First-one-wins would be wrong, not merely arbitrary: the spill goes to
+    one tier and the load may ask the other, so a hash could be reported
+    indexed by a tier that never stored it."""
+    a, b = FakeWorkerSub(), FakeWorkerSub()
+    a._state_tier, b._state_tier = object(), object()
+    w = _worker([a, b])
+
+    with pytest.raises(ValueError, match="exactly one may"):
+        w.register_kv_caches({}, transfer_tensors=None, num_blocks=1)
+
+
 def test_recv_blocks_concat():
     w = _worker([FakeWorkerSub(recv_blocks=[1, 2]), FakeWorkerSub(recv_blocks=[3])])
     assert w.get_finished_recv_blocks() == [1, 2, 3]
@@ -527,44 +631,3 @@ def test_real_constructor_populates_the_pairing_state(monkeypatch, pp_rank, hold
     w.start_load_kv(MultiConnectorMetadata([ConnectorMetadata(), _save_meta(9)]))
     out = w.get_finished()
     assert out.finished_sending == (set() if holds_send else {9})
-
-
-def test_a_state_only_step_under_multi_is_not_dropped():
-    """A step whose only work is a state load must reach the worker.
-
-    `state_loads` carries no `LMCacheReqMeta`, so a wrapper that answers from
-    its own (always empty) fields reports no work, the engine drops the
-    snapshot, and the request parked on that load is woken by nothing.
-    """
-    from atom.kv_transfer.disaggregation.types import connector_metadata_has_work
-    from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata
-
-    sub = LMCacheOffloadMetadata()
-    sub.state_loads = [("req-1", 12345, 7)]
-
-    assert connector_metadata_has_work(sub)
-    assert connector_metadata_has_work(MultiConnectorMetadata([sub]))
-
-
-def test_a_multi_wrapper_over_idle_subs_still_reports_no_work():
-    from types import SimpleNamespace
-
-    from atom.kv_transfer.disaggregation.types import connector_metadata_has_work
-    from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata
-
-    assert not connector_metadata_has_work(
-        MultiConnectorMetadata([LMCacheOffloadMetadata(), SimpleNamespace()])
-    )
-
-
-def test_every_metadata_field_a_subclass_adds_is_declared_work_or_not():
-    """`WORK_FIELDS` must name real attributes, or a typo silences a field.
-
-    A misspelled entry is invisible: `getattr` returns None, the field never
-    counts, and the only symptom is a parked request much later.
-    """
-    from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata
-
-    meta = LMCacheOffloadMetadata()
-    for name in LMCacheOffloadMetadata.WORK_FIELDS:
-        assert hasattr(meta, name), f"WORK_FIELDS names a missing attribute: {name}"

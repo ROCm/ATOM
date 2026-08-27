@@ -3156,3 +3156,164 @@ class TestMidstepCheckpoints:
         bm.can_allocate(cold)
         assert cold.block_hashes == []
         assert bm.midstep_positions(cold, 0, 44) == []
+
+
+def test_fates_report_every_counter():
+    """checkpoint_fates() must expose all four fate counters.
+
+    NOTE: the actual dict keys carry the ``checkpoints_`` prefix
+    (``checkpoints_kept``, ``checkpoints_evicted``, ``checkpoints_orphaned``,
+    ``checkpoints_dropped``).  The task-0 brief assumed short keys
+    (``kept`` / ``evicted`` / …); those differ — see the report for the
+    discrepancy note and the rationale for leaving the public API unchanged.
+    """
+    pool = StateSlotPool(num_slots=2, transfer=StateTransfer.fork(1), hash_block_size=4)
+    fates = pool.checkpoint_fates()
+    assert set(fates) == {
+        "checkpoints_kept",
+        "checkpoints_evicted",
+        "checkpoints_orphaned",
+        "checkpoints_dropped",
+    }
+
+
+def test_state_checkpoint_fates_warns_on_missing_method(caplog):
+    """A state cache that lacks checkpoint_fates() emits a warning.
+
+    The aggregator must not silently under-count: when a class registered in
+    ``state_caches`` does not implement ``checkpoint_fates()``, a WARNING is
+    logged naming the skipped class so an operator knows the total is partial.
+    """
+    import logging
+
+    bm = BlockManager(ckpt_config())
+    # StubStateCache (defined above) satisfies StateCache but has no
+    # checkpoint_fates — exactly the class of future lightweight implementations
+    # the warning is meant to catch.
+    bm.state_caches = (bm.state_caches[0], StubStateCache())
+
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        bm.state_checkpoint_fates()
+
+    assert any(
+        "StubStateCache" in r.message and "checkpoint_fates" in r.message
+        for r in caplog.records
+    ), "expected a WARNING naming StubStateCache; got: " + str(
+        [r.message for r in caplog.records]
+    )
+
+
+def test_state_checkpoint_fates_warns_once_per_class(caplog):
+    """The caller is the scheduler's every-100-ticks stats line and
+    `state_caches` never changes during a run, so an unlatched warning is the
+    same line forever -- drowning the log it is trying to draw attention to.
+    What it reports is a static property of the build: true on tick 1, no
+    truer on tick 10000.
+    """
+    import logging
+
+    bm = BlockManager(ckpt_config())
+    bm.state_caches = (bm.state_caches[0], StubStateCache())
+
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        for _ in range(5):
+            bm.state_checkpoint_fates()
+
+    hits = [r for r in caplog.records if "StubStateCache" in r.message]
+    assert len(hits) == 1, [r.message for r in hits]
+
+
+def test_state_checkpoint_fates_log_order_is_stable(caplog):
+    """The periodic log line emitted by `Scheduler.schedule()` sorts its keys.
+
+    Read by an operator diffing one stats line against the next, so the field
+    order has to be a property of the line rather than of whichever order the
+    counters happen to be declared in — `StateSlotPool.checkpoint_fates()`
+    returns them kept/dropped/evicted/orphaned, which is not alphabetical, and
+    a new counter appended to that dict would otherwise land in the middle of
+    the line for every deployment at once.
+
+    Asserted against the emitted message, not against a `sorted()` this test
+    applies itself: dropping the `sorted()` from the scheduler's join has to be
+    what fails here, and the non-alphabetical insertion order above is what
+    makes the two distinguishable.
+    """
+    import logging
+
+    sched = Scheduler(ckpt_config())
+    sched.add(stateful_seq(list(range(40))))
+    pool = sched.block_manager.state
+    pool.checkpoints_kept += 3
+    pool.checkpoints_dropped += 1
+    # The premise: if the counters were declared alphabetically the emitted
+    # line would be sorted whether or not the scheduler sorted it.
+    assert list(pool.checkpoint_fates()) != sorted(pool.checkpoint_fates())
+
+    # The line is periodic — one pass in a hundred — so the batch has to be
+    # driven to the tick that emits it.
+    with caplog.at_level(logging.INFO, logger="atom"):
+        for _ in range(100):
+            sched.schedule()
+
+    lines = [
+        r.getMessage()
+        for r in caplog.records
+        if r.getMessage().startswith("state checkpoints: ")
+    ]
+    assert lines, "the periodic state-checkpoint line was never emitted"
+
+    fields = lines[-1].removeprefix("state checkpoints: ").split()
+    keys = [f.split("=")[0] for f in fields]
+    assert keys == [
+        "checkpoints_dropped",
+        "checkpoints_evicted",
+        "checkpoints_kept",
+        "checkpoints_orphaned",
+    ], f"fields are not in alphabetical order: {lines[-1]}"
+    # The values ride along with their keys rather than being sorted apart.
+    assert "checkpoints_kept=3" in fields and "checkpoints_dropped=1" in fields
+
+
+def test_checkpoint_funnel_includes_second_state_class():
+    """checkpoint_funnel() must aggregate fates across ALL state classes.
+
+    Prior to the fix, ``checkpoint_funnel()`` called ``self.state.checkpoint_fates()``
+    directly, which would miss any second state class added to ``state_caches``.
+    After routing through ``state_checkpoint_fates()``, a second class that
+    implements ``checkpoint_fates()`` is included in the funnel output.
+    """
+
+    class SecondPoolStub:
+        """Minimal StateCache with checkpoint_fates — mimics a second real class."""
+
+        successor_room = 0
+
+        def applies(self, seq):
+            return False
+
+        def resumable_hit(self, seq, P, block_hashes, assume_checkpointed=False):
+            return 0
+
+        def checkpoint(self, seq, boundary_blocks, h):
+            pass
+
+        def checkpoint_fates(self) -> dict:
+            return {"checkpoints_kept": 7, "checkpoints_dropped": 2}
+
+    bm = BlockManager(ckpt_config())
+    bm.state_caches = (bm.state_caches[0], SecondPoolStub())
+
+    funnel = bm.checkpoint_funnel()
+
+    # The two ladder-level counters must still be present.
+    assert "demands_recorded" in funnel
+    assert "chunks_cut_for_demand" in funnel
+
+    # The second class's counters must appear in the funnel — they would have
+    # been absent before the fix.
+    assert (
+        funnel.get("checkpoints_kept", 0) >= 7
+    ), "checkpoints_kept from SecondPoolStub missing from checkpoint_funnel()"
+    assert (
+        funnel.get("checkpoints_dropped", 0) >= 2
+    ), "checkpoints_dropped from SecondPoolStub missing from checkpoint_funnel()"

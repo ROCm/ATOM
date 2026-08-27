@@ -529,6 +529,12 @@ class EngineCore:
         connector = getattr(self.scheduler, "kv_connector", None)
         if connector is None or not getattr(connector, "is_offload", False):
             return
+        # getattr for the same reason as `kv_connector` above: this path is
+        # reached with scheduler doubles that implement only the connector
+        # surface.
+        publish = getattr(self.scheduler, "_publish_state_loads", None)
+        if publish is not None:
+            publish()
         meta = connector.build_connector_meta()
         if not connector_metadata_has_work(meta):
             return

@@ -182,6 +182,57 @@ flag below. Details in the state-checkpoint section of the
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | **ATOM_STATE_CHECKPOINT_DEMAND** | bool | 1 (true) | Set to `0` to stop a prefix hit that was refused for want of a checkpoint from placing a rung of its own, leaving the prompt-end anchor as the only placement. Overrides `--state-checkpoint-demand`, so the policy can be A/B'd without editing a launch script. The rung is most of the checkpoint write traffic and little of the read-back, and every write evicts something — `StateSlotPool.mark_speculative` carries the measurement. |
+## KV / state offload (`lmcache_offload` connector)
+
+The `lmcache_offload` connector spills computed KV to a CPU tier and fetches it
+back on a later prefix hit. It has no env switch of its own: it runs when
+`--kv-transfer-config` names it, e.g.
+`'{"kv_connector":"lmcache_offload","kv_role":"offload"}'`.
+
+Which layout runs is decided from the model config alone
+(`select_offload_layout`) -- `dense` for ordinary token-indexed KV, `hybrid` for
+DeepSeek-V4's compressed PAGE/SLOT chunks, `kimi_k3` for dense MLA KV plus the
+KDA per-request state tier. Background and the counters to read before tuning
+any of this: [`atom/kv_transfer/offload/README.md`](../atom/kv_transfer/offload/README.md).
+
+### Transport and staging (all layouts)
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **OFFLOAD_COPY_WORKERS** | int | 1 | Threads draining the save queue. |
+| **OFFLOAD_MAX_PENDING_SAVES** | int | `max(2, 2 x copy_workers)` | The back-pressure bound, read from both ends: `hybrid` caps the worker queue with it, `kimi_k3` caps how many requests may have a save outstanding. It matters because a request whose save is queued keeps its blocks pinned, so this is also how much of the pool a slow backend can hold. Ignored by `dense`, which does not pin. |
+| **OFFLOAD_MIN_LOAD_TOKENS** | int | 8192 | Prefix below which a KV hit is not worth a load -- a KV load moves bytes proportional to the hit, so a short one spends a round trip moving very little. **No effect under `kimi_k3`**: every sequence there carries per-request state, and a joint boundary is chosen for both legs together, so refusing one leg on size would leave the other claiming a prefix whose KV never came. |
+| **OFFLOAD_GPU_STAGING_CHUNKS** | int | 2 | GPU staging buffer, in LMCache chunks. |
+| **OFFLOAD_GPU_STAGING_MAX_BYTES** | int | unset | Hard cap on the staging buffer; must cover at least one chunk. |
+| **OFFLOAD_RELEASE_GPU_STAGING_AFTER_TRANSFER** | bool | 0 | Free the staging buffer after each transfer instead of holding it. Trades HBM for per-transfer allocation. |
+| **OFFLOAD_PROFILE** | bool | 0 | Per-transfer timing on the periodic stats line. |
+| **LMCACHE_LOCAL_CPU**, **LMCACHE_MAX_LOCAL_CPU_SIZE**, **LMCACHE_CHUNK_SIZE**, **LMCACHE_LOCAL_DISK** | - | LMCache | Read by LMCache itself, not by ATOM. `MAX_LOCAL_CPU_SIZE` is GiB for the paged-KV pool. |
+
+### DeepSeek-V4 (`hybrid`)
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **OFFLOAD_SLOT_STAGING_SLOTS** | int | 1 | Staging slots for complete SLOT sidecars. |
+| **OFFLOAD_COMMITTED_SIDECAR_CAPACITY** | int | 65536 | Committed-sidecar index capacity. |
+| **OFFLOAD_PUBLICATION_TIMEOUT_S** | float | 5.0 | How long a worker waits for a chunk's publication. |
+| **OFFLOAD_PUBLICATION_POLL_INTERVAL_S** | float | 0.01 | Poll interval for the above. |
+
+### Per-request state and its tier
+
+Hybrid models (GDN/KDA: Qwen3-Next, Qwen3.5, Kimi-K3) and DeepSeek-V4 keep one
+per-request **state** entry alongside their paged KV, in a fixed pool of groups.
+A prefix hit is resumable only up to a boundary where that state was
+checkpointed, so the pool size and whether an evicted checkpoint can be fetched
+back decide the hit rate.
+
+Under `kimi_k3` the state tier is **not separately switchable**: a resumable
+prefix needs both legs, so state is offloaded exactly when KV is, and turning
+the tier off means turning the connector off.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **OFFLOAD_STATE_STAGING_GROUPS** | int | 1 | Spill staging ring depth in **groups** -- `state_pool()` multiplies by the class's `entries_per_req` to get rows. Allocated inside the state arena and never leased to a request. Raise it if `state_offload_spills_dropped` is a material fraction of `spills_requested`; set 0 on a deployment that will never offload, to reclaim the rows. |
+| **OFFLOAD_STATE_CPU_SIZE** | float (GiB) | 16 | A CPU pool for state entries, separate from the paged-KV pool. Sharing loses both ways: the KV write stream is several times the state volume so it evicts the checkpoints, and a stopped KV backend takes the tier down with it. 0 shares the paged-KV pool. |
 
 ## Profiling & debugging
 

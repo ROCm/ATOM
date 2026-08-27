@@ -1726,7 +1726,10 @@ class ModelRunner:
         # sliding-window pool and the attention builder each index it by the
         # class name they declared. Nothing here needs to know those names.
         self.pool_plan = plan
-        config.pool_entries = dict(plan.entries)
+        # BlockManager divides this into request groups; the offload staging
+        # cushion is allocated but not leasable, so admission must not see it.
+        # Backends keep sizing their tensors from `pool_plan.entries`.
+        config.pool_entries = dict(plan.admission_entries)
         config.pool_entries_per_req = dict(plan.entries_per_req)
         # Keep runtime state metadata out of Config.
         transfer = self.attn_metadata_builder.state_transfer()
@@ -1774,9 +1777,15 @@ class ModelRunner:
         )
         self.state_runtime = state_runtime
         for name in sorted(plan.entries):
+            extra = plan.entries[name] - plan.admission_entries[name]
             logger.info(
-                f"sub-pool {name}: entries={plan.entries[name]}, "
-                f"entry_bytes={plan.entry_bytes[name]}, "
+                f"sub-pool {name}: entries={plan.entries[name]}"
+                + (
+                    f" ({plan.admission_entries[name]} admissible + {extra} staging)"
+                    if extra
+                    else ""
+                )
+                + f", entry_bytes={plan.entry_bytes[name]}, "
                 f"reserved={plan.reserved_bytes[name] / (1 << 30):.2f}GB"
             )
 
@@ -1844,7 +1853,10 @@ class ModelRunner:
         # the class they declared.
         return {
             "num_kvcache_blocks": num_kvcache_blocks,
-            "pool_entries": dict(plan.entries),
+            # BlockManager divides this into request groups; the offload staging
+            # cushion is allocated but not leasable, so admission must not see it.
+            # Backends keep sizing their tensors from `pool_plan.entries`.
+            "pool_entries": dict(plan.admission_entries),
             "pool_entries_per_req": dict(plan.entries_per_req),
             "state_runtime": state_runtime.to_wire(),
         }
@@ -1999,6 +2011,11 @@ class ModelRunner:
             for key, kv_cache_tensor in zip(kv_cache_keys, kv_cache_tensors)
         }
         transfer_tensors = self.attn_metadata_builder.get_kv_transfer_tensors()
+        if transfer_tensors is not None:
+            # The tier is built inside `register_kv_caches` and needs
+            # `state_entry_views` to name the bytes it packs. This is the only
+            # place the builder and the connector are both in scope.
+            transfer_tensors.state_backend = self.attn_metadata_builder
         if hasattr(self, "eagle3_draft_builder") and transfer_tensors is not None:
             draft_regions = self.eagle3_draft_builder.get_kv_transfer_tensors()
             if draft_regions:
