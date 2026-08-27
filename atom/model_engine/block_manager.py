@@ -1072,7 +1072,9 @@ class BlockManager:
         """
         if self.paged_state_checkpoints is None or self.state_offload is None:
             return []
-        return self.paged_state_checkpoints.take_offload_stores(max_inflight)
+        out = self.paged_state_checkpoints.take_offload_stores(max_inflight)
+        self.state_offload.stores_attempted += len(out)
+        return out
 
     def settle_state_store(self, prefix_hash: int, ok: bool) -> None:
         """One store reported. Release the units, and index the hash if it landed.
@@ -1084,8 +1086,13 @@ class BlockManager:
         """
         if self.paged_state_checkpoints is not None:
             self.paged_state_checkpoints.settle_offload_store(int(prefix_hash))
-        if ok and self.state_offload is not None:
+        if self.state_offload is None:
+            return
+        if ok:
+            self.state_offload.stores_completed += 1
             self.state_offload.note_stored(int(prefix_hash))
+        else:
+            self.state_offload.stores_failed += 1
 
     def reclaim_stale_state_store_pins(self, timeout_s: float) -> int:
         """Release store pins whose report never came. See the store."""
@@ -1731,6 +1738,12 @@ class BlockManager:
         concludes checkpointing never fires. Occupancy stays on `self.state`:
         that is the slot pool either way, and the coordinator has none.
         """
+        # `_state_checkpoint_cache`, not `self.state`: under #2045 a K3
+        # checkpoint is a PAGE image the coordinator owns, and the slot pool
+        # holds none -- so reading the pool here printed `kept: 0` beside a
+        # `state checkpoints:` line saying 112, two counters for one fact
+        # disagreeing in the same log. `occupancy()` stays on the pool, which
+        # is the thing that has slots.
         return (
             self.kv.eviction_stats()
             | self.state.occupancy()

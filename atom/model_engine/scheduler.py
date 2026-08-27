@@ -2560,6 +2560,9 @@ class Scheduler:
             accepted = bool(enqueue(stores))
         if accepted:
             return
+        offload = getattr(getattr(self, "block_manager", None), "state_offload", None)
+        if offload is not None:
+            offload.stores_refused += len(stores)
         logger.warning(
             "state offload: %s did not carry %d state store(s); releasing "
             "their units now. Either this connector has no state tier (the "

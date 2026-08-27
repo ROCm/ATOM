@@ -43,6 +43,18 @@ class StateOffloadIndex:
         self.loads_attempted = 0
         self.loads_completed = 0
         self.loads_failed = 0
+        # Store-side counters. Until this commit the only store-side signal was
+        # `indexed` growing, which is why a shell that refused every store
+        # (`enqueue_state_stores` never forwarded) looked identical to a tier
+        # with nothing to do -- 94 refusals produced one warning line and no
+        # number anywhere. `stores_refused` is the probe that would have said
+        # so on the first pass, and it is deliberately apart from
+        # `stores_failed`: refused means nobody tried, failed means the worker
+        # tried and could not.
+        self.stores_attempted = 0
+        self.stores_completed = 0
+        self.stores_failed = 0
+        self.stores_refused = 0
 
     # ------------------------------- stores -------------------------------- #
     def note_stored(self, h: int) -> None:
@@ -116,11 +128,21 @@ class StateOffloadIndex:
     def stats(self) -> dict[str, int]:
         """Counters for the periodic `state checkpoints:` line.
 
-        Read the three load counters together: `failed / attempted` is this
-        index's false-positive rate, and `attempted - completed - failed` is
-        what is in flight or was abandoned by an aborted request.
+        Read the load counters together: `failed / attempted` is this index's
+        false-positive rate, and `attempted - completed - failed` is what is in
+        flight or was abandoned by an aborted request. Read the store counters
+        the same way, and read `stores_completed` against `checkpoints_kept`:
+        the gap is how much of what HBM keeps the CPU tier never received.
         """
         return {
+            # Store leg. `attempted - completed - failed` is in flight;
+            # `refused` is a wiring fault, not backpressure -- any non-zero
+            # value means the connector never took the store at all.
+            "stores_attempted": self.stores_attempted,
+            "stores_completed": self.stores_completed,
+            "stores_failed": self.stores_failed,
+            "stores_refused": self.stores_refused,
+            # Load leg.
             "loads_attempted": self.loads_attempted,
             "loads_completed": self.loads_completed,
             "loads_failed": self.loads_failed,

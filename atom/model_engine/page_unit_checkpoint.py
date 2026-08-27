@@ -378,6 +378,11 @@ class PageUnitCheckpointStore:
             return
         self._offload_ready.append(checkpoint_id)
 
+    @property
+    def store_backlog(self) -> deque:
+        """Nominations waiting for an in-flight slot. A gauge for the log."""
+        return self._offload_ready
+
     def take_offload_stores(
         self, max_inflight: int
     ) -> list[tuple[int, tuple[int, ...]]]:
@@ -771,7 +776,20 @@ class PagedStateCheckpointCoordinator:
         self.store.clear()
 
     def checkpoint_fates(self) -> dict[str, int]:
-        return {
+        """What became of this class's checkpoints, plus the CPU tier's own.
+
+        The tier's counters are folded in here rather than reported separately
+        because the two only mean anything against each other: `stores_completed`
+        is worth reading only as a fraction of `checkpoints_kept`, and a tier
+        that stored nothing is indistinguishable from a tier that was never
+        asked unless both numbers sit on one line. `StateGroupPool` did this
+        before #2045 moved K3's checkpoints here; restoring it makes the load
+        and store legs visible again under PAGE.
+
+        Keys are prefixed `state_offload_` because the aggregation upstream is
+        by key across every state class.
+        """
+        fates = {
             "checkpoints_kept": self.checkpoints_kept,
             "checkpoints_dropped": self.checkpoints_dropped,
             "checkpoints_evicted": self.store.evictions,
@@ -780,3 +798,16 @@ class PagedStateCheckpointCoordinator:
             "offload_pins_reclaimed": self.store.offload_pins_reclaimed,
             "checkpoints_orphaned": self.checkpoints_orphaned,
         }
+        # `getattr`, not a direct call: `attach_offload` accepts anything that
+        # answers `hashes`, and the tests attach a double that does not carry
+        # counters. A missing `stats` means "no numbers to fold", not an error.
+        stats = getattr(self.offload, "stats", None) if self.offload else None
+        if callable(stats):
+            fates.update((f"state_offload_{k}", v) for k, v in stats().items())
+            # A gauge, not a counter: how many nominations are waiting for a
+            # slot under `OFFLOAD_MAX_PENDING_SAVES`. The queue is unbounded and
+            # drained oldest-first, so a value that climbs and stays high means
+            # checkpoints are reaching READY faster than the tier drains them
+            # and fresh nominations are queueing behind stale ones.
+            fates["state_offload_store_backlog"] = len(self.store.store_backlog)
+        return fates
