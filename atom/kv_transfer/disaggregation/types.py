@@ -24,6 +24,20 @@ ReqId = str | int
 TransferId = int
 
 
+def kv_config_has_producer(kv_config: object) -> bool:
+    """Whether a KV config contains a P/D producer, including ``multi``.
+
+    Both the scheduler and the model runner branch on this: a producer
+    prefills and hands the request off after one token, so it neither defers
+    output nor speculates.
+    """
+    if not isinstance(kv_config, dict):
+        return False
+    if kv_config.get("kv_role") == "kv_producer":
+        return True
+    return any(kv_config_has_producer(sub) for sub in kv_config.get("connectors", []))
+
+
 @dataclass(frozen=True)
 class SaveOperationId:
     """Exact identity of one scheduler-issued PAGE/SLOT save generation.
