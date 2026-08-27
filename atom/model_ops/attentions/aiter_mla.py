@@ -158,15 +158,7 @@ def cdiv(a, b):
 
 
 def _replicated_index_cache_transfer_supported(config) -> bool:
-    """Whether the configured transfer path carries a replicated index page.
-
-    LMCache derives every block's stride from the tensor itself, so it is
-    layout-agnostic. Mooncake plans the index regions with
-    ``plan_replicated_index`` once the consumer says it replicates, which is
-    why this layout may run behind a PD decode node. The ``multi`` fan-out
-    qualifies only in the prefill node's shape -- a Mooncake producer paired
-    with an LMCache offload -- where both members are individually safe.
-    """
+    """Whether the target replicated-index transfer topology is configured."""
 
     transfer_config = getattr(config, "kv_transfer_config", None)
     if not isinstance(transfer_config, dict) or not transfer_config:
