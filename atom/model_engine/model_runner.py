@@ -71,9 +71,9 @@ from atom.model_ops.sampler import SAMPLER_EPS, Sampler
 from atom.models.utils import get_pp_indices
 from atom.spec_decode.drafter import Drafter
 from atom.spec_decode.factory import build_drafter
-from atom.utils import dsa_logits_dump
 from atom.utils import (
     CpuGpuBuffer,
+    dsa_logits_dump,
     envs,
     get_hf_text_config,
     init_exit_handler,

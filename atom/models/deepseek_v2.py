@@ -123,8 +123,7 @@ from atom.plugin.vllm.attention.layer_sparse_mla import (
     IndexerDecoratorForPluginMode,
 )
 from atom.quant_spec import should_skip_online_quant
-from atom.utils import envs
-from atom.utils import dsa_logits_dump
+from atom.utils import dsa_logits_dump, envs
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import get_forward_context
