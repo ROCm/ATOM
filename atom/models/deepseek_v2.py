@@ -90,7 +90,6 @@ from atom.model_ops.attention_mla import (
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.dcp_ops import (
     dcp_decode_candidate_exchange,
-    dcp_gather_candidate_gids,
     triton_filter_and_convert_dcp_index,
     triton_filter_and_convert_dcp_index_prefill,
 )
@@ -1397,7 +1396,6 @@ def _dcp_gather_indexer_k_prefill(
     k_fp8 = gathered_k.index_select(0, gather_index)
     k_scale = gathered_scale.index_select(0, gather_index)
     return k_fp8, k_scale
-
 
 
 def sparse_attn_indexer(

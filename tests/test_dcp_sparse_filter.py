@@ -253,7 +253,9 @@ def test_decode_filter_block_interleave(interleave, g_ctxs, seed):
 
 PRE_W = 8  # overridden per-test below
 PRE_PAGE = 16
-PRE_TOPK = 256  # multiple of BLOCK_N=128; production runs index_topk=2048 (see the prod case)
+PRE_TOPK = (
+    256  # multiple of BLOCK_N=128; production runs index_topk=2048 (see the prod case)
+)
 
 
 def _build_prefill_case(seq_lens):

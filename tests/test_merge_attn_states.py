@@ -76,7 +76,9 @@ def _ref_merge(p_out, p_lse, s_out, s_lse, tokens_with_ctx, scale=None):
         safe = torch.where(empty, torch.zeros_like(mx), mx)
         pe, se = torch.exp(pl - safe), torch.exp(sl - safe)
         tot = pe + se
-        lse[:, t] = torch.where(empty, torch.full_like(mx, NEG_INF), torch.log(tot) + safe)
+        lse[:, t] = torch.where(
+            empty, torch.full_like(mx, NEG_INF), torch.log(tot) + safe
+        )
         denom = torch.where(empty, torch.ones_like(tot), tot)
         out[t] = (
             p_out[t].float() * (pe / denom)[:, None]
@@ -119,10 +121,10 @@ def _assert_matches(got_t, ref, p_out, s_out, fp8):
 
 def _inputs(num_tokens, num_heads, head_size, seed=0):
     torch.manual_seed(seed)
-    mk = lambda: torch.randn(  # noqa: E731
+    mk = lambda: torch.randn(
         num_tokens, num_heads, head_size, device=DEV, dtype=torch.bfloat16
     )
-    lse = lambda: torch.randn(num_heads, num_tokens, device=DEV, dtype=torch.float32)  # noqa: E731
+    lse = lambda: torch.randn(num_heads, num_tokens, device=DEV, dtype=torch.float32)
     return mk(), lse(), mk(), lse()
 
 
@@ -130,7 +132,10 @@ def _run(p_out, p_lse, s_out, s_lse, tokens_with_ctx=None, want_lse=False, scale
     num_tokens, num_heads, head_size = p_out.shape
     tokens_with_ctx = num_tokens if tokens_with_ctx is None else tokens_with_ctx
     out = torch.empty(
-        num_tokens, num_heads, head_size, device=DEV,
+        num_tokens,
+        num_heads,
+        head_size,
+        device=DEV,
         dtype=FP8 if scale is not None else torch.bfloat16,
     )
     out_lse = (
@@ -138,9 +143,7 @@ def _run(p_out, p_lse, s_out, s_lse, tokens_with_ctx=None, want_lse=False, scale
         if want_lse
         else None
     )
-    merge_attn_states(
-        out, p_out, p_lse, s_out, s_lse, out_lse, tokens_with_ctx, scale
-    )
+    merge_attn_states(out, p_out, p_lse, s_out, s_lse, out_lse, tokens_with_ctx, scale)
     return out, out_lse
 
 

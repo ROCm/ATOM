@@ -88,9 +88,7 @@ def test_pack_matches_eager_reference(s_itl, rank, world, rows, k, l_max):
     idx = torch.randint(
         -3, l_max, (rows, k), generator=g, device=DEV, dtype=torch.int32
     )
-    lens = torch.randint(
-        0, l_max, (rows,), generator=g, device=DEV, dtype=torch.int32
-    )
+    lens = torch.randint(0, l_max, (rows,), generator=g, device=DEV, dtype=torch.int32)
 
     out = torch.empty(2, rows, k, dtype=torch.float32, device=DEV)
     dcp_pack_topk_candidates(logits, idx, lens, rank, world, out, s_itl)
