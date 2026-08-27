@@ -181,6 +181,11 @@ class MemoryManagerMixin:
         return models
 
     def _resume_kv_cache(self) -> None:
+        # No-eager sleep keeps the existing KV cache resident so CUDA graph
+        # addresses remain stable. There is nothing to restore in this case.
+        if not self.enforce_eager and getattr(self, "kv_cache", None) is not None:
+            return
+
         if (
             not hasattr(self, "_kv_cache_num_blocks")
             or self._kv_cache_num_blocks is None
