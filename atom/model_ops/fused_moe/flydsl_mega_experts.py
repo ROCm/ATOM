@@ -311,7 +311,7 @@ class MegaFusedExperts:
             experts=global_num_experts,
             # Infer top-k from the routing tensors, same as the standard kernels.
             topk=int(topk_ids.shape[1]),
-            # todo decode use graph_bs for perf
+            # todo decode use running_bs for perf
             mtpr=self._mtpr,
             swiglu_limit=getattr(self._layer, "swiglu_limit", 0.0),
             quant=self._quant,

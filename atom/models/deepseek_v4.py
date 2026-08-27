@@ -2150,7 +2150,7 @@ class Indexer(nn.Module):
         exercised eagerly under PIECEWISE (the paged core is an eager splitting op).
 
         `--cudagraph-mode FULL` works too: `graph_key` is only
-        `(graph_bs, max_q_len)`, so a rectangular step (DP-sync dummy, boundary,
+        `(running_bs, max_q_len)`, so a rectangular step (DP-sync dummy, boundary,
         no-shrink) can replay a ragged-captured graph. The attn builder therefore
         refreshes these windows on EVERY decode fwd — rectangular ones included —
         so a replay never reads the previous step's stale windows (which faulted

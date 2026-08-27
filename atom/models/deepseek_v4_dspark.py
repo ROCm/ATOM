@@ -704,7 +704,7 @@ class DSparkLayer(Block):  # type: ignore[misc]
 
         fc = get_forward_context()
         attn_md = fc.attn_metadata
-        B = fc.context.batch_size
+        B = fc.context.scheduled_bs
         cu_seqlens_q = attn_md.cu_seqlens_q[: B + 1]
         a = self.attn
         # An fp8 window is the planes' own 2buff layout, so the verified target

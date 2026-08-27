@@ -49,18 +49,18 @@ def decode_bucket_key(forward_context) -> tuple:
     """``(bucket_bs, q_eff)`` for a core captured per decode bucket.
 
     Nothing here is model-specific -- both come off the forward context -- so
-    every decode core keys the same way. ``bucket_bs`` is the ceil-to-captured
-    graph_bs (``forward_mode.effective_bs`` at replay; a capture Context has no
-    forward_mode, so batch_size == graph_bs == bucket).
+    every decode core keys the same way. ``bucket_bs`` is the step's
+    ``running_bs`` (a capture Context has no forward_mode, so batch_size is
+    already the bucket).
     """
     attn_metadata = getattr(forward_context, "attn_metadata", None)
     context = getattr(forward_context, "context", None)
     q_eff = int(getattr(attn_metadata, "max_seqlen_q", 1) or 1)
     forward_mode = getattr(context, "forward_mode", None)
-    if forward_mode is not None and getattr(forward_mode, "effective_bs", 0):
-        bucket_bs = int(forward_mode.effective_bs)
+    if forward_mode is not None and getattr(forward_mode, "running_bs", 0):
+        bucket_bs = int(forward_mode.running_bs)
     else:
-        bucket_bs = int(getattr(context, "batch_size", 0) or 0)
+        bucket_bs = int(getattr(context, "scheduled_bs", 0) or 0)
     return (bucket_bs, q_eff)
 
 

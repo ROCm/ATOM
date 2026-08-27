@@ -95,6 +95,9 @@ jobs:
           pip3 install torch --index-url https://download.pytorch.org/whl/cpu
           pip3 install -e .
           pip3 install pytest msgpack quart
+          # atom/diffusion test deps. Without them 38 diffusion tests self-skip
+          # via importorskip and the subsystem gets no CI coverage at all.
+          pip3 install av pillow httpx
       - name: Run unit tests
         env:
           UNIT_TEST_REPORT: unit-report.xml

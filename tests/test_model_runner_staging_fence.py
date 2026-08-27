@@ -105,8 +105,8 @@ def test_late_draft_uploads_are_staged_by_prepare_model():
     """Draft setup must not start a new pinned H2D after the staging event."""
     prepare_model = _method("prepare_model")
     propose = _method("propose_draft_token_ids")
-    precompute = _method(
-        "precompute_context_kv",
+    compute_draft_kv = _method(
+        "compute_draft_kv",
         path=EAGLE_PROPOSER,
         class_name="EagleProposer",
     )
@@ -115,4 +115,4 @@ def test_late_draft_uploads_are_staged_by_prepare_model():
     assert len(_attribute_calls(prepare_model, "copy_to_gpu")) == 1
     assert not _attribute_calls(propose, "anchors_to_gpu")
     assert not _attribute_calls(propose, "copy_to_gpu")
-    assert not _attribute_calls(precompute, "anchors_to_gpu")
+    assert not _attribute_calls(compute_draft_kv, "anchors_to_gpu")

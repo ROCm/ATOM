@@ -780,23 +780,31 @@ def _set_atom_forward_context(
         else positions.shape[0]
     )
 
+    max_q = int(getattr(attn_metadata, "max_seqlen_q", 1) or 1)
     enable_dp_attention = bool(atom_config.enable_dp_attention)
     if enable_dp_attention:
         num_tokens_across_dp = _resolve_num_tokens_across_dp(
             atom_config, forward_batch, num_tokens
         )
-        graph_bs = int(torch.max(num_tokens_across_dp).item())
+        # Already TOKENS, and already the group max -- what MoE pads to.
+        running_tokens = int(torch.max(num_tokens_across_dp).item())
     else:
         num_tokens_across_dp = None
-        graph_bs = num_tokens if is_prefill else batch_size
+        running_tokens = num_tokens if is_prefill else batch_size * max_q
+    # Sequences, per the field's contract -- the TBO split divides this into
+    # per-ubatch request counts, so handing it a token count would make each
+    # ubatch `max_seqlen_q` times too wide. Prefill's value is unread there.
+    running_bs = batch_size if is_prefill else max(1, running_tokens // max_q)
 
     dp_uniform_decode = _resolve_dp_uniform_decode(atom_config, forward_batch)
     context = Context(
         positions=positions,
         is_prefill=is_prefill,
         is_dummy_run=is_dummy_run,
-        batch_size=batch_size,
-        graph_bs=graph_bs,
+        scheduled_bs=batch_size,
+        scheduled_tokens=num_tokens,
+        running_bs=running_bs,
+        running_tokens=running_tokens,
         dp_uniform_decode=dp_uniform_decode,
     )
     set_forward_context(

@@ -1038,8 +1038,11 @@ class Scheduler:
           - prompt longer than `max_num_batched_tokens` AND chunked prefill
             disabled → no single prefill forward can ever fit it (with chunked
             prefill enabled, the prompt is split across steps and this is fine)
-          - prompt's KV blocks (+ per-req cache reservation) exceed the total
-            pool size → never fits even on a fully empty pool
+          - prompt's KV blocks exceed the total pool size → never fits even on
+            a fully empty pool. Counted per-rank (dcp-local, via
+            `BlockManager.num_pool_blocks`) to match how the pool is sized and
+            drawn, so a dcp>1 deployment admits prompts `dcp_world_size` times
+            longer than the global block count alone would suggest.
 
         Called at submit time (`_warn_if_unschedulable`, which logs the
         reason and adds extra dynamic warnings) and at schedule time
@@ -1071,11 +1074,18 @@ class Scheduler:
             )
         bm = self.block_manager
         total_blocks = bm.kv.num_blocks
-        if seq.num_blocks > total_blocks:
+        # `num_pool_blocks`, not `seq.num_blocks`: the latter counts global
+        # blocks, while the pool is sized and drawn per-rank. Under dcp>1 the
+        # two differ by `dcp_world_size`.
+        pool_blocks = bm.num_pool_blocks(num_tokens)
+        if pool_blocks > total_blocks:
+            scope = (
+                f" (per-rank, dcp={bm.dcp_world_size})" if bm.dcp_world_size > 1 else ""
+            )
             return (
-                f"needs {seq.num_blocks} KV blocks for {num_tokens} input tokens "
-                f"> total pool blocks={total_blocks}. Reduce prompt length or "
-                f"raise --gpu-memory-utilization. (Per-req state cache lives in "
+                f"needs {pool_blocks} KV blocks{scope} for {num_tokens} input "
+                f"tokens > total pool blocks={total_blocks}. Reduce prompt length "
+                f"or raise --gpu-memory-utilization. (Per-req state cache lives in "
                 f"its own pre-allocated tensor and does not consume pool blocks.)"
             )
         return None
@@ -2304,9 +2314,6 @@ class Scheduler:
                     seq.num_tokens,
                     len(seq.block_table),
                 )
-            if seq.num_completion_tokens >= 1 and seq.first_token_time == 0.0:
-                seq.first_token_time = time.time()
-
             num_tokens = seq.num_tokens - num_placeholder_width - num_rejected
             leave_reason = None
             # Client disconnected -> finish now via the normal stop path (frees
@@ -2354,9 +2361,24 @@ class Scheduler:
                         i for i, t in enumerate(token_ids) if t in self.stop_token_ids
                     )
                     leave_reason = f"stop_{token_ids[stop_at_idx]}"
-                elif (num_tokens - seq.num_prompt_tokens) >= seq.max_tokens:
-                    # Use local num_tokens (pre-placeholder), not the property
-                    # which over-counts by mtp_k + num_rejected.
+
+            # ``num_tokens`` is the real post-verification length. One MTP
+            # forward can accept multiple tokens, so the final batch can cross
+            # max_tokens even though the request was below the cap when it was
+            # scheduled. Select the earlier boundary between a natural stop
+            # above and the output cap, then reuse the common truncation path
+            # for both internal and client-visible tokens.
+            completion_tokens = num_tokens - seq.num_prompt_tokens
+            if completion_tokens >= seq.max_tokens:
+                overflow = completion_tokens - seq.max_tokens
+                # ``stop_at_idx`` indexes this step's model output, excluding
+                # an injected P/D T0.  -1 therefore keeps T0 but no model
+                # output; when the cap retains no tokens, -2 is the boundary
+                # before T0.
+                min_stop_at_idx = -1 - (1 if injected_t0 is not None else 0)
+                max_stop_at_idx = max(min_stop_at_idx, num_new_token - 1 - overflow)
+                if stop_at_idx is None or max_stop_at_idx < stop_at_idx:
+                    stop_at_idx = max_stop_at_idx
                     leave_reason = "max_tokens"
 
             # Drop accepted-draft tokens past the stop position (MTP only —
@@ -2377,6 +2399,17 @@ class Scheduler:
                 # in stop_at_idx / num_new_token, so offset the cut by it.
                 keep = stop_at_idx + 1 + (1 if injected_t0 is not None else 0)
                 new_tokens = new_tokens[:keep]
+                if seq.return_logprobs:
+                    # LLMEngine.postprocess returns the complete logprobs
+                    # array rather than slicing it through num_tokens, so keep
+                    # it aligned explicitly with the cropped completion.
+                    del seq.logprobs[num_tokens - seq.num_prompt_tokens :]
+
+            # Record TTFT from the finalized retained length, after rejected
+            # speculative tokens and cap/stop overflow have been removed. A
+            # terminal response with no completion tokens must keep TTFT zero.
+            if num_tokens - seq.num_prompt_tokens >= 1 and seq.first_token_time == 0.0:
+                seq.first_token_time = time.time()
 
             # Hash generated blocks. Deferred output: all tokens forwarded;
             # undeferred: last token not yet forwarded, so exclude it.
@@ -2389,7 +2422,12 @@ class Scheduler:
             )
 
             # Prepare stream output
-            if stream_output_queue is not None and new_tokens:
+            # A terminal event is required even when truncation leaves no
+            # tokens (for example max_tokens <= 0). Async consumers wait for
+            # this finished RequestOutput and would otherwise block forever.
+            if stream_output_queue is not None and (
+                new_tokens or leave_reason is not None
+            ):
                 if self.kv_connector is not None and leave_reason is not None:
                     self.kv_connector.request_finished(seq)
                 output_tokens_list = (

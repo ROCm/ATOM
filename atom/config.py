@@ -1545,7 +1545,6 @@ class Config:
     # sizes the process group and the token collectives.
     dp_logical_size: int = 0
     master_addr: str = "127.0.0.1"
-    graph_bs: list[int] | None = None
     enable_dp_attention: bool = False
     # DP request-routing strategy used by CoreManager to pick an engine rank:
     # "round_robin" | "least_requests" (default) | "least_tokens". Only has an
@@ -1634,17 +1633,22 @@ class Config:
         visible = torch.cuda.device_count()
         return visible if 0 < visible < tp else tp
 
-    def _set_cudagraph_sizes(self):
-        if self.compilation_config.cudagraph_capture_sizes:
-            self.graph_bs = self.compilation_config.cudagraph_capture_sizes
-        else:
-            cuda_graph_sizes = self.compilation_config.cuda_graph_sizes
-            if len(cuda_graph_sizes) == 1:
-                self.graph_bs = [1, 2, 4, 8] + [
-                    i for i in range(16, cuda_graph_sizes[0] + 1, 16)
-                ]
-            elif len(cuda_graph_sizes) > 1:
-                self.graph_bs = cuda_graph_sizes
+    @property
+    def capture_sizes(self) -> list[int]:
+        """The declared CUDAGraph capture ladder, in batch sizes.
+
+        Declared, not schedulable -- `ModelRunner` drops what its own token
+        budget can never produce, a bound needing the drafter's resolved
+        `mtp_k` that config cannot see. Returns a copy: the runner sorts and
+        filters in place.
+        """
+        declared = self.compilation_config.cudagraph_capture_sizes
+        if declared:
+            return list(declared)
+        sizes = self.compilation_config.cuda_graph_sizes
+        if len(sizes) == 1:
+            return [1, 2, 4, 8] + list(range(16, sizes[0] + 1, 16))
+        return list(sizes)
 
     def __post_init__(self):
         self.moe_backend = self.moe_backend.strip().lower()
@@ -1865,18 +1869,17 @@ class Config:
         # only for server mode or plugin mode(vllm)
         # for torch compile policy, plugin mode(vllm) uses the ATOM compile policy
         # for cuda graph capture, plugin mode(vllm) uses the vLLM's cuda graph capture policy
-        if not is_plugin_mode() or (
-            self.plugin_config is not None and self.plugin_config.is_vllm
-        ):
-            if self.compilation_config.level == CompilationLevel.PIECEWISE:
-                self.compilation_config.set_splitting_ops_for_v1()
-                self._set_cudagraph_sizes()
-                # Keep an explicit cudagraph_mode (e.g. FULL); default to
-                # PIECEWISE only when unset. splitting_ops/sizes are set either
-                # way so the model is still piece-split-compiled at level 3.
-                if self.compilation_config.cudagraph_mode is None:
-                    self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
-                self.compilation_config.init_with_cudagraph_sizes()
+        if (
+            not is_plugin_mode()
+            or (self.plugin_config is not None and self.plugin_config.is_vllm)
+        ) and self.compilation_config.level == CompilationLevel.PIECEWISE:
+            self.compilation_config.set_splitting_ops_for_v1()
+            # Keep an explicit cudagraph_mode (e.g. FULL); default to
+            # PIECEWISE only when unset. splitting_ops/sizes are set either
+            # way so the model is still piece-split-compiled at level 3.
+            if self.compilation_config.cudagraph_mode is None:
+                self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+            self.compilation_config.init_with_cudagraph_sizes()
 
         self.torch_dtype = (
             self.hf_config.dtype
