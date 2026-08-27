@@ -82,6 +82,20 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
                 "kimi_k3 offload: no attention backend published; state tier off."
             )
             return
+        # The geometry the bytes are written under, folded into every key so a
+        # build that changed any of it cannot read another's images. Read from
+        # the runtime rather than recomputed, so there is one owner of the
+        # string and the HBM and CPU sides cannot disagree about it.
+        spec = getattr(getattr(backend, "model_runner", None), "state_runtime", None)
+        spec = getattr(spec, "checkpoint_spec", None)
+        layout_id = getattr(spec, "layout_id", None)
+        if not layout_id:
+            logger.warning(
+                "kimi_k3 offload: no checkpoint layout id published; state tier "
+                "off. Without it a build that changed the state geometry could "
+                "read another's images back as valid."
+            )
+            return
         try:
             views = backend.state_entry_views(0)
             entry_bytes = sum(int(v.numel()) * v.element_size() for v in views)
@@ -117,6 +131,7 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
             model_name=meta.model_name,
             world_size=world,
             worker_id=rank,
+            layout_id=layout_id,
         )
         # ONE pool, shared with paged KV. A separate `atom-state-{rank}` engine
         # used to be built here, on the argument that the KV write stream would
@@ -149,9 +164,10 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
         self._state_tier = StateOffloadTier(codec)
         logger.info(
             "kimi_k3 offload: state tier up, entry=%.2f MiB rank=%d, "
-            "sharing the paged-KV CPU pool",
+            "sharing the paged-KV CPU pool, layout=%s",
             entry_bytes / (1 << 20),
             rank,
+            layout_id,
         )
 
     # -- per-step ----------------------------------------------------------

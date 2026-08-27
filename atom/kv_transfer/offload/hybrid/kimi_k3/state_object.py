@@ -41,15 +41,20 @@ class StateByteCodec:
         model_name: str,
         world_size: int,
         worker_id: int,
+        layout_id: str,
     ) -> None:
         self._backend = backend
         self._staged = staged
         self.entry_bytes = int(entry_bytes)
         if self.entry_bytes <= 0:
             raise ValueError("state entry bytes must be > 0")
+        if not isinstance(layout_id, str) or not layout_id:
+            raise ValueError("a state entry key needs a non-empty layout id")
         self._model_name = model_name
         self._world_size = int(world_size)
         self._worker_id = int(worker_id)
+        self._layout_id = layout_id
+        self._misfit_reads = 0
         self._storage = None
         # Never hard-code a size: V4 keeps six compressor fields across
         # n_csa/n_hca layers plus an optional window; GDN keeps
@@ -65,19 +70,44 @@ class StateByteCodec:
         self._storage = storage_manager
 
     def key(self, h: int):
-        """The key carries ATOM's hash unmodified.
+        """ATOM's hash, bound to the geometry the bytes were written under.
 
-        `StateSlotPool._resumable_from` looks up the same integer in HBM and
-        in this tier, so hashing or stringifying it here would make the two
-        branches ask different questions. `dtype` is part of the key's identity.
+        **Two jobs, and the second one is why this is not the bare hash.**
+
+        *Build safety.* The same prefix hash maps to a completely different
+        image under a different `num_spec`, TP size, or conv/ssm dtype. A size
+        mismatch would be caught by `entry_bytes`; the same size with a
+        different order or meaning reads back silently wrong state, and a
+        request resumed onto wrong state produces wrong output with nothing
+        raised anywhere. #2045 already encodes all of it in `layout_id`
+        (layers / conv shape+dtype / ssm shape+dtype / order / tp / spec /
+        carry) and enforces it HBM-side in `_validate_paged_state_op`; this is
+        the CPU side of the same check.
+
+        *Namespace separation.* `CacheEngineKey` has no field saying what an
+        entry IS -- KV chunk keys come from `ChunkedTokenDatabase`'s chunk hash
+        and state keys from ATOM's chained block hash, both plain integers in
+        one space. Since Phase 3a they also share one pool. They were separated
+        only accidentally, by this side hard-coding `torch.uint8` while KV
+        carries the KV dtype. Folding `layout_id` in makes them disjoint by
+        construction: no KV key can ever carry a K3 layout id.
+
+        Not a plain `hash((h, layout_id))`: Python's `hash` of a str is salted
+        per process (`PYTHONHASHSEED`), so a restart would silently orphan every
+        entry written by the previous run. `xxh64` is what the block hashes
+        themselves use.
         """
+        import xxhash
         from lmcache.utils import CacheEngineKey
 
+        digest = xxhash.xxh64()
+        digest.update(int(h).to_bytes(8, "little", signed=True))
+        digest.update(self._layout_id.encode())
         return CacheEngineKey(
             self._model_name,
             self._world_size,
             self._worker_id,
-            int(h),
+            digest.intdigest(),
             torch.uint8,
         )
 
@@ -112,11 +142,53 @@ class StateByteCodec:
         obj = self._storage.get(self.key(h))
         if obj is None:
             return False
+        size = self._object_bytes(obj)
+        if size is not None and size != self.entry_bytes:
+            # Unreachable while `layout_id` is in the key, which is the point:
+            # a hit of the wrong size means two things collided in the shared
+            # pool, and unpacking it would write another entry's bytes over a
+            # request's live state. Degrade to a miss -- the caller disowns the
+            # boundary and recomputes -- and count it, because a nonzero count
+            # means the key is no longer doing its job.
+            self._misfit_reads += 1
+            logger.warning(
+                "state offload: hash %d came back %d bytes, expected %d; "
+                "treating as a miss (misfit_reads=%d)",
+                h,
+                size,
+                self.entry_bytes,
+                self._misfit_reads,
+            )
+            obj.ref_count_down()
+            return False
         try:
             self._staged.unpack(obj, self._backend.state_entry_views(entry_index))
         finally:
             obj.ref_count_down()
         return True
+
+    @staticmethod
+    def _object_bytes(obj) -> int | None:
+        """Bytes in a `MemoryObj`, or None when it will not say.
+
+        `get_size()` is the documented accessor; the tensor is the fallback for
+        the buffer-backed objects that have no size of their own. None means
+        "cannot check", never "size 0" -- refusing a load we cannot measure
+        would turn an unknown into a guaranteed miss.
+        """
+        get_size = getattr(obj, "get_size", None)
+        if callable(get_size):
+            try:
+                return int(get_size())
+            except Exception:
+                pass
+        tensor = getattr(obj, "tensor", None)
+        if tensor is not None:
+            try:
+                return int(tensor.numel()) * tensor.element_size()
+            except Exception:
+                pass
+        return None
 
     def contains(self, h: int) -> bool:
         """Ask storage, never a local set -- a set goes stale the moment

@@ -4853,3 +4853,131 @@ def test_no_more_saves_go_out_than_the_pool_can_afford_to_pin():
     assert s._may_emit_save() is True
     s._save_stalled = True
     assert s._may_emit_save() is False
+
+
+# ── the state key: build safety and namespace separation ──────────────────
+
+
+class _FakeStorage:
+    """The two `storage_manager` calls the codec makes, over a plain dict."""
+
+    def __init__(self) -> None:
+        self.objects: dict = {}
+
+    def batched_put(self, keys, objs) -> None:
+        for k, o in zip(keys, objs, strict=True):
+            self.objects[k] = o
+
+    def get(self, key):
+        return self.objects.get(key)
+
+    def contains(self, key):
+        return key in self.objects
+
+
+@pytest.fixture
+def lmcache_key(monkeypatch):
+    """`CacheEngineKey` alone -- the whole `lmcache` stub is more than these need.
+
+    A dataclass rather than a stub with identity semantics: the tests below are
+    about two keys being equal or not, which is exactly what the real class
+    answers by value.
+    """
+    import dataclasses
+
+    @dataclasses.dataclass(frozen=True)
+    class CacheEngineKey:
+        model_name: str
+        world_size: int
+        worker_id: int
+        chunk_hash: int
+        dtype: object
+
+    utils_module = types.ModuleType("lmcache.utils")
+    utils_module.CacheEngineKey = CacheEngineKey
+    lmcache_module = types.ModuleType("lmcache")
+    lmcache_module.__path__ = []
+    lmcache_module.utils = utils_module
+    monkeypatch.setitem(sys.modules, "lmcache", lmcache_module)
+    monkeypatch.setitem(sys.modules, "lmcache.utils", utils_module)
+    return CacheEngineKey
+
+
+def _codec(layout_id: str, storage=None):
+    from atom.kv_transfer.offload.hybrid.kimi_k3.state_object import StateByteCodec
+
+    codec = StateByteCodec(
+        backend=None,
+        staged=None,
+        entry_bytes=1024,
+        model_name="k3",
+        world_size=8,
+        worker_id=0,
+        layout_id=layout_id,
+    )
+    codec.bind_storage_manager(storage if storage is not None else _FakeStorage())
+    return codec
+
+
+def test_the_same_hash_under_a_different_layout_is_a_different_key(lmcache_key):
+    """A build that changed the state geometry must not read another's images.
+
+    The failure this prevents is silent: same size, different order or meaning,
+    unpacked over a request's live state with nothing raised anywhere.
+    """
+    a = _codec("layers=69;spec=1;tp=8")
+    b = _codec("layers=69;spec=2;tp=8")  # one speculated token more
+    assert a.key(12345) != b.key(12345)
+    # And the layout alone does not collapse distinct hashes.
+    assert a.key(12345) != a.key(12346)
+
+
+def test_the_key_survives_a_process_restart(lmcache_key):
+    """`hash()` of a str is salted per process, so using it would orphan every
+    entry the previous run wrote -- a cache that silently starts cold."""
+    assert _codec("L").key(7) == _codec("L").key(7)
+
+
+def test_a_state_key_cannot_collide_with_a_kv_chunk_key(lmcache_key):
+    """Since one pool holds both (Phase 3a), the key is the only separation.
+
+    `CacheEngineKey` has no field saying what an entry is: KV keys carry
+    `ChunkedTokenDatabase`'s chunk hash and state keys ATOM's block hash, both
+    plain integers. Folding the layout in is what makes them disjoint -- no KV
+    key can carry a K3 layout id -- rather than merely unlikely to coincide.
+    """
+    codec = _codec("kimi_k3;layers=69")
+    # A KV chunk key is the raw hash; the state key for the same hash is not.
+    assert codec.key(999).chunk_hash != 999
+
+
+def test_a_hit_of_the_wrong_size_is_a_miss_not_garbage(lmcache_key, caplog):
+    """Unreachable while the layout is in the key, which is the point.
+
+    A hit of the wrong size means two things collided in the shared pool, and
+    unpacking it would write another entry's bytes over a request's live state.
+    """
+    import logging
+
+    storage = _FakeStorage()
+    codec = _codec("L", storage)
+    released = []
+    storage.objects[codec.key(5)] = SimpleNamespace(
+        get_size=lambda: 64,  # not the 1024 entry_bytes
+        ref_count_down=lambda: released.append(True),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        assert codec.get(5, 0) is False
+    assert released == [True], "the misfit object's reference must be discharged"
+    assert codec._misfit_reads == 1
+    assert any("expected 1024" in r.getMessage() for r in caplog.records)
+
+
+def test_an_object_that_will_not_report_its_size_is_still_loaded():
+    """None means "cannot check", never "size 0". Refusing what we cannot
+    measure would turn an unknown into a guaranteed miss."""
+    from atom.kv_transfer.offload.hybrid.kimi_k3.state_object import StateByteCodec
+
+    assert StateByteCodec._object_bytes(SimpleNamespace()) is None
+    assert StateByteCodec._object_bytes(SimpleNamespace(get_size=lambda: 32)) == 32
