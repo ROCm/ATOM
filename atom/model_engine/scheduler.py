@@ -2562,8 +2562,11 @@ class Scheduler:
             return
         logger.warning(
             "state offload: %s did not carry %d state store(s); releasing "
-            "their units now. The tier's index should not have been installed "
-            "against this connector.",
+            "their units now. Either this connector has no state tier (the "
+            "index should not have been installed against it), or the "
+            "delegating shell is missing an `enqueue_state_stores` forwarder "
+            "to the implementation that does -- check both before assuming "
+            "the configuration is wrong.",
             type(self.kv_connector).__name__,
             len(stores),
         )
@@ -2596,8 +2599,10 @@ class Scheduler:
         # so this is not a miss to count against the index.
         logger.warning(
             "state offload: %s did not carry %d state load(s); waking those "
-            "requests to recompute. The tier's index should not have been "
-            "installed against this connector.",
+            "requests to recompute. Either this connector has no state tier, "
+            "or the delegating shell is missing an `enqueue_state_loads` "
+            "forwarder -- the class named here is the shell, not the "
+            "implementation behind it.",
             type(self.kv_connector).__name__,
             len(loads),
         )

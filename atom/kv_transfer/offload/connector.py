@@ -160,6 +160,10 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         callback = getattr(self._impl, "enqueue_state_loads", None)
         return bool(callback(loads)) if callback is not None else False
 
+    def enqueue_state_stores(self, stores) -> bool:
+        callback = getattr(self._impl, "enqueue_state_stores", None)
+        return bool(callback(stores)) if callback is not None else False
+
     def take_state_reports(self):
         callback = getattr(self._impl, "take_state_reports", None)
         return callback() if callback is not None else (set(), set(), set())
