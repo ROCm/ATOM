@@ -564,17 +564,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ubatch 1 = [prefill tail | every decode row]; V4 rebuilds both from the
     # parent's prefill SEGMENT metadata.
     #
-    # Measured on V4-Pro dp8+DPA+TBO (no EP, no prefix caching), n=2 per arm,
-    # output throughput: +4.5% at ISL 2048/conc 512, +12.0% at ISL 8192/conc
-    # 512, +18.1% at ISL 8192/conc 2048; mean TTFT -14% to -19% throughout.
-    # The gain tracks how much prefill there is to hide the TP all-reduce
-    # behind, so it shrinks as a rank's prefill approaches
-    # ATOM_TBO_PREFILL_MIN_TOKENS and the split starts getting refused.
+    # This is a TAIL-LATENCY feature. Throughput is flat. Measured on V4-Pro
+    # dp8+DPA+TBO at ISL 8192 / OSL 1024 / conc 1024, both arms configured from
+    # the CI catalog cell so they differ only by this flag:
     #
-    # The conc-2048 figure was re-measured after rebasing onto main (it read
-    # +14.5% before) with an aiter bump in the same step, so the 3.6pp is not
-    # attributable to either alone. Both arms of every A/B ran the same code
-    # and the same aiter, which is what makes each delta valid.
+    #   Total tok/s   52736 -> 52844   (+0.2%)
+    #   Mean TTFT     11280 -> 11685   (+3.6%)
+    #   Mean ITL      171.8 -> 172.7   (+0.6%)
+    #   P99 ITL        3470 ->  1838   (-47%)
+    #   max ITL      103967 ->  5029   (-95%)
+    #
+    # Judge it on the tail and nowhere else: mean and median ITL do not move,
+    # because the win is deleting a rare catastrophic decode stall (a single
+    # 103-second gap), not speeding up the common case. At P99 alone the win
+    # reads half its true size, and the 103 s is invisible entirely.
+    #
+    # An earlier revision of this comment claimed +4.5%/+12.0%/+18.1% output
+    # throughput. Those came from a local A/B whose control arm was missing
+    # --index_cache_dtype fp4, GPU_MAX_HW_QUEUES=5 and ATOM_NUMA_BIND=1, which
+    # cost it ~15% on its own. Do not reintroduce a throughput claim without a
+    # control arm built from the catalog.
     #
     # Still off by default: with it off a mixed batch vetoes TBO through
     # `can_split`, and that is the behaviour every existing baseline was

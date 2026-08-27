@@ -258,10 +258,12 @@ def local_tbo_precompute(
     if getattr(batch, "is_mixed", False):
         from atom.utils import envs
 
-        # Off by default. The path is complete, accuracy-verified and measured
-        # +4.5% to +14.5% output throughput, but every existing baseline was
-        # taken with a mixed batch vetoing TBO here, so flipping the default
-        # silently moves them. See ATOM_TBO_MIXED.
+        # Off by default. The path is complete and accuracy-verified; it buys
+        # tail latency (max ITL 104 s -> 5 s) at flat throughput, not the
+        # +4.5–14.5% this comment used to claim -- that came from a control arm
+        # missing three CI flags. Every existing baseline was taken with a mixed
+        # batch vetoing TBO here, so flipping the default moves them.
+        # See ATOM_TBO_MIXED.
         if not envs.ATOM_TBO_MIXED:
             # Report the refusal HERE, not in `_maybe_create_tbo_slices`.
             # `can_split` is AND-reduced across DP precisely so that one rank's
