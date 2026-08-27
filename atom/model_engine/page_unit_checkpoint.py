@@ -708,6 +708,15 @@ class PagedStateCheckpointCoordinator:
     def ensure_free_units(self, count: int) -> bool:
         return self.store.ensure_free_units(count)
 
+    def contains(self, h: int) -> bool:
+        """Whether HBM holds a READY image for `h` right now.
+
+        Distinct from `_reachable`, which also counts the CPU tier: this one
+        answers "would a resume be free", and is what the `state_hbm` /
+        `state_tier` split reports.
+        """
+        return self.store.contains(h)
+
     def attach_offload(self, index) -> None:
         """Wire the CPU tier in, after both objects exist.
 

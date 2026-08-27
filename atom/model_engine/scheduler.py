@@ -1914,14 +1914,16 @@ class Scheduler:
             skips = self.block_manager.joint_skips
             if chosen or skips:
                 # The hbm/tier split is the actionable half: both are reuse,
-                # but only `tier` costs an entry-sized H2D and a park, so a
-                # ratio dominated by it says the state pool is too small for
-                # this concurrency even while the load counters look healthy.
+                # but only `tier` costs an image-sized H2D and a park. Under
+                # #2045 a ratio dominated by `tier` says the PAGED pool is too
+                # small for this concurrency -- checkpoints are being squeezed
+                # out by the KV write stream they now share a pool with -- and
+                # that is a diagnosis the fork-era split could not make.
                 logger.info(
-                    "joint kv: boundaries=%d (hbm=%d tier=%d) | %s",
+                    "joint kv: boundaries=%d (state_hbm=%d state_tier=%d) | %s",
                     chosen,
-                    self.block_manager.joint_boundaries_hbm,
-                    self.block_manager.joint_boundaries_tier,
+                    self.block_manager.state_hbm,
+                    self.block_manager.state_tier,
                     " ".join(f"{k}={v}" for k, v in sorted(skips.items())),
                 )
 

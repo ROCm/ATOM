@@ -1473,6 +1473,136 @@ class TestPagedCopyCheckpoint:
         assert second.state_load_hash == -1
         assert bm.checkpoint_funnel()["state_gate_lost_boundary"] == 1
 
+    # ── the joint boundary, which #2045 makes the only source of value ──
+
+    def _joint_bm(self, chunk=BLOCK, **overrides):
+        bm = make_block_manager(
+            paged_copy_config(**overrides), state_runtime=PAGED_COPY_RUNTIME
+        )
+        # Normally read off the LMCache config at construction; that import is
+        # unavailable here, and the value is the KV leg's transfer grid.
+        bm._joint_chunk_tokens = chunk
+        return bm
+
+    def _prompt_with_a_rung_at(self, bm, blocks: int):
+        """Run PROMPT once and leave one READY checkpoint `blocks` blocks in.
+
+        Placed explicitly rather than by the ladder because the position
+        matters: `can_allocate` matches over `range(n_hash_blocks - 1)`, so a
+        checkpoint filed under the LAST block is one no scan can ever look up.
+        An interior rung is what a resume actually lands on.
+        """
+        seq = self._admitted(bm, PROMPT)
+        # Publish the prefix, which is what makes its blocks lookup-able and so
+        # what a second request's walk can match against.
+        bm.hash_blocks(seq, seq.num_prompt_tokens)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        # Whatever the ladder placed is not the subject here; keep exactly one
+        # rung, at a position chosen for being interior.
+        bm.paged_state_checkpoints.clear_index()
+
+        h = bm._chain_to(seq, [], blocks)[blocks - 1]
+        bm.paged_state_checkpoints.checkpoint(seq, blocks, h)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        assert bm.paged_state_checkpoints.contains(h), "precondition: it is READY"
+        assert bm.kv.lookup(h) >= 0, "precondition: its KV block is published"
+        return seq, h
+
+    @staticmethod
+    def _break_the_kv_chain_at(bm, block_id: int) -> None:
+        """Evict one published KV block so the prefix walk stops before the rung.
+
+        Without this there is nothing for a joint boundary to do: a fully
+        resident prefix already gates to its rung, `_attach_state_slots` issues
+        the state load on its own, and the KV leg has nothing to fetch. The
+        joint path exists for exactly the case this creates -- HBM lost the KV,
+        LMCache still has it.
+
+        Call after `deallocate`: `allocate` is the eviction event and it asserts
+        the block is unheld.
+        """
+        assert bm.kv.block(block_id).hash != -1, "precondition: it was published"
+        bm.kv.allocate(block_id)  # takes it for fresh content, dropping the hash
+
+    def _reset_joint_counters(self, bm):
+        bm.joint_boundaries = bm.state_hbm = bm.state_tier = 0
+        bm.joint_skips.clear()
+
+    def test_a_page_class_now_gets_a_joint_boundary(self):
+        """The inversion, and the single most important assertion in Phase 5.
+
+        This gate used to refuse every PAGE seq (`not_hybrid`), which was right
+        while a K3 checkpoint was an Active Slot the tier spilled out of the
+        slot pool. #2045 moved the image into the KV pool, and HBM's
+        `state ⊆ KV` means a checkpoint can no longer outlive its KV there --
+        so when LMCache hands the KV back, nothing hands the state back unless
+        the two are fetched together. Refusing here makes the whole tier dead
+        weight, and no other counter in the system would say so.
+        """
+        bm = self._joint_bm()
+        first, h = self._prompt_with_a_rung_at(bm, 8)  # 32 tokens in
+
+        victim = first.block_table[1]
+        bm.deallocate(first)
+        self._break_the_kv_chain_at(bm, victim)
+        bm.paged_state_checkpoints.unindex(h)  # the image left HBM with it
+        self._with_tier(bm, h)  # ...but LMCache still has it
+        self._reset_joint_counters(bm)
+
+        second = stateful_seq(PROMPT)
+        second.offload_kv_prefix_tokens = len(PROMPT)
+        hbm_hit = bm.can_allocate(second)
+
+        assert bm.joint_boundaries == 1, bm.joint_skips
+        assert second.state_joint_boundary_hash == h
+        assert second.state_joint_boundary_tokens == 8 * BLOCK
+        # The KV leg has real work: the walk stopped well below the boundary.
+        assert hbm_hit * BLOCK < second.state_joint_kv_tokens
+
+    def test_the_split_says_which_tier_the_state_leg_came_from(self):
+        """`state_tier` is the only counter here that cannot be non-zero with
+        the CPU tier switched off, which makes it the honest test of "did this
+        feature run" -- no passing unit test can produce it in production."""
+        bm = self._joint_bm()
+        first, h = self._prompt_with_a_rung_at(bm, 8)
+        victim = first.block_table[1]
+        bm.deallocate(first)
+        self._break_the_kv_chain_at(bm, victim)
+        self._with_tier(bm, h)
+        self._reset_joint_counters(bm)
+
+        # The checkpoint outlived the block that broke the chain, so the state
+        # leg is free -- a gather out of resident units, no transfer.
+        resident = stateful_seq(PROMPT)
+        resident.offload_kv_prefix_tokens = len(PROMPT)
+        bm.can_allocate(resident)
+        assert (bm.state_hbm, bm.state_tier) == (1, 0)
+
+        # Drop it from HBM too: now the state leg costs an image-sized H2D.
+        bm.paged_state_checkpoints.unindex(h)
+        from_cpu = stateful_seq(PROMPT)
+        from_cpu.offload_kv_prefix_tokens = len(PROMPT)
+        bm.can_allocate(from_cpu)
+        assert (bm.state_hbm, bm.state_tier) == (1, 1)
+
+    def test_no_tier_means_no_joint_boundary(self):
+        """`state_offload is None` short-circuits before anything else: a
+        boundary both legs must reach is meaningless with one leg missing."""
+        bm = self._joint_bm()
+        first, h = self._prompt_with_a_rung_at(bm, 8)
+        victim = first.block_table[1]
+        bm.deallocate(first)
+        self._break_the_kv_chain_at(bm, victim)
+        self._reset_joint_counters(bm)
+
+        seq = stateful_seq(PROMPT)
+        seq.offload_kv_prefix_tokens = len(PROMPT)
+        bm.can_allocate(seq)
+        assert bm.joint_boundaries == 0
+        assert bm.joint_skips.get("off") == 1
+
     def test_a_gated_boundary_neither_tier_has_is_disowned_not_raised(self):
         """This used to raise, and could not stay that way.
 

@@ -235,8 +235,11 @@ class BlockManager:
         # resident checkpoint, `tier` paid an entry-sized H2D and a park. Almost
         # all `tier` means the state pool is too small for the concurrency.
         self.joint_boundaries = 0
-        self.joint_boundaries_hbm = 0
-        self.joint_boundaries_tier = 0
+        self.state_hbm = 0
+        # The number that says the tier is doing anything at all. Every other
+        # counter here can be non-zero with the CPU tier switched off; this one
+        # cannot, which makes it the only honest test of "did this feature run".
+        self.state_tier = 0
         # Admissions whose gated boundary neither tier could produce by the time
         # `allocate` ran. Non-zero is expected under pressure (the CPU index is
         # optimistic, and an HBM checkpoint can be unindexed inside the same
@@ -588,10 +591,16 @@ class BlockManager:
         seq.state_joint_claim_tokens = 0
         if self.state_offload is None:
             return self._no_joint("off")
-        # PAGE checkpoints live in the KV pool, so their state leg has no tier
-        # to be served from and no separate boundary to agree on.
-        if not seq.has_per_req_cache or self.paged_state_checkpoints is not None:
-            return self._no_joint("not_hybrid")
+        # PAGE is now the served class, not the excluded one. This used to
+        # read `is not None` and refuse -- correct while a K3 checkpoint was an
+        # Active Slot the tier spilled out of `StateSlotPool`. #2045 moved the
+        # image into the KV pool, and with it the whole reason the joint path
+        # exists: HBM's `state ⊆ KV` (`_record_evicted` unindexes a checkpoint
+        # the instant its boundary block is spent) means a checkpoint can no
+        # longer outlive its KV in HBM -- so when LMCache hands the KV back,
+        # nothing hands the state back unless the two are fetched together.
+        if not seq.has_per_req_cache or self.paged_state_checkpoints is None:
+            return self._no_joint("no_paged_checkpoints")
         hbs = self._hash_block_size()
         # From the connector's config, not the connector object: the scheduler
         # holds whatever `get_kvconnector` returned, and one without
@@ -649,10 +658,13 @@ class BlockManager:
         claim_tokens = ((claim_blocks * hbs) // chunk) * chunk
         seq.state_joint_claim_tokens = max(claim_tokens, hbm_boundary * hbs)
         self.joint_boundaries += 1
-        if self.state.lookup(h) >= 0:
-            self.joint_boundaries_hbm += 1
+        # Which tier the STATE leg came from. The KV leg's own tier is decided
+        # separately by `_decide_load_after_alloc`, which is why these are not
+        # named for the boundary as a whole.
+        if self.paged_state_checkpoints.contains(h):
+            self.state_hbm += 1
         else:
-            self.joint_boundaries_tier += 1
+            self.state_tier += 1
         return candidate
 
     def _no_joint(self, reason: str) -> int:
@@ -1696,8 +1708,8 @@ class BlockManager:
             "chunks_cut_for_demand": self.chunks_cut_for_demand,
             "chunks_cut_for_end": self.chunks_cut_for_end,
             "joint_boundaries": self.joint_boundaries,
-            "joint_boundaries_hbm": self.joint_boundaries_hbm,
-            "joint_boundaries_tier": self.joint_boundaries_tier,
+            "state_hbm": self.state_hbm,
+            "state_tier": self.state_tier,
             "state_gate_lost_boundary": self.state_gate_lost_boundary,
         } | self.state_checkpoint_fates()
 

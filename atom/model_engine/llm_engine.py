@@ -406,8 +406,8 @@ class LLMEngine:
                 # the rest: a boundary is per admission and every rank admits
                 # the same request.
                 "joint_boundaries",
-                "joint_boundaries_hbm",
-                "joint_boundaries_tier",
+                "state_hbm",
+                "state_tier",
             )
         }
         # `reusable`, not `full`: a request's trailing block is never a reuse
