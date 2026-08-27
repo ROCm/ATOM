@@ -1864,8 +1864,8 @@ def sparse_attn_indexer(
             # positions are dropped, not marked with -1, because holes break
             # aiter's lse output. The compacted per-request lengths are written
             # into dcp_sparse_kv_indptr_buffer for this layer's attention. The
-            # row unit is the query token, so MTP's draft positions each get
-            # their own compacted region.
+            # row unit is the query token, so each MTP draft position gets its
+            # own compacted region.
             triton_filter_and_convert_dcp_index(
                 attn_metadata.token_to_seq_idxs,
                 num_decode_tokens,

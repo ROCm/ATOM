@@ -604,10 +604,9 @@ class MLAAttention(nn.Module):
         self.dcp_persistent_supported = dcp_persistent_supported()
         self.dcp_prefill_merge_bf16_ok = dcp_prefill_merge_bf16_ok()
         # Scope sparse persistent DCP to native attention. Every sparse row is a
-        # virtual q_len=1 row -- decode has one per sequence, sparse prefill one
-        # per token, and MTP verify one per draft position -- so the work plan is
-        # built the same way in all three. Plugin DCP reconfigures its group
-        # after construction.
+        # virtual q_len=1 row -- one per sequence at decode, per token at sparse
+        # prefill, per draft position under MTP -- so all three build the work
+        # plan the same way. Plugin DCP reconfigures its group after construction.
         self.sparse_dcp_metadata_rebuild = (
             self.is_sparse_mla and self.dcp_world_size > 1
         )
@@ -1847,10 +1846,9 @@ class MLAAttention(nn.Module):
                     paged_kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens[:B]
                 if self.dcp_world_size > 1:
                     # The DCP filter compacts each query token's owned top-k to
-                    # the front, so the region lengths are its per-token cumsum,
-                    # not the uniform top-k stride sparse_kv_indptr describes.
-                    # B is a token count on both paths -- MTP verify runs the
-                    # sparse layers at max_q_len=1, one row per draft position.
+                    # the front, so region lengths are its per-token cumsum, not
+                    # the uniform stride sparse_kv_indptr describes. B is a token
+                    # count on both paths.
                     paged_kv_indptr = self.dcp_sparse_kv_indptr_buffer[: B + 1]
 
             dp_size = get_dp_group().world_size
@@ -1863,9 +1861,8 @@ class MLAAttention(nn.Module):
             )
             # Sparse DCP decode stays persistent: its full IndexShare layers
             # rebuild the work plan below from the layer-local compact indptr,
-            # which the non-persistent split-KV reduce cannot describe (it hands
-            # every row the same split count regardless of how many top-k slots
-            # this rank actually owns).
+            # which the non-persistent split-KV reduce cannot describe -- it
+            # gives every row the same split count regardless of owned slots.
             if self.is_sparse_mla and self.dcp_world_size > 1:
                 use_persistent_mode = (
                     use_persistent_mode and self.sparse_dcp_metadata_rebuild

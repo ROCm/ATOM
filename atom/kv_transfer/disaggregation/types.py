@@ -97,10 +97,9 @@ class ConnectorCompletion:
         return self.channel, self.operation_id
 
 
-# Region roles the DCP relayout dispatches on. An MLA latent region is
-# interleave-sharded across the decode ranks; a DSA indexer region is either
-# sharded the same way or replicated whole on every rank, which needs a
-# different source->destination plan (see the mooncake connector).
+# Region roles the DCP relayout dispatches on: an MLA latent region is always
+# interleave-sharded, a DSA indexer region may instead be replicated whole on
+# every rank, which needs a different plan (see the mooncake connector).
 MLA_KV_ROLE = "mla.kv"
 INDEX_CACHE_ROLE = "dsa.index_cache"
 
@@ -122,10 +121,9 @@ class KVTransferRegion:
     # makes equal-sized planes distinguishable across code versions.
     semantic_role: str | None = None
     # A preshuffled DSA index page is not token-addressable: its fp8 keys are
-    # MFMA-16x16 tiled and every page keeps its fp32 scales in one plane after
-    # all of its keys, with the page's remaining bytes unused. A relayout that
-    # moves less than a whole page therefore has to move each plane on its own,
-    # and these two give it the split. None for token-contiguous pages.
+    # MFMA-16x16 tiled and its fp32 scales sit in one plane after them, with the
+    # rest of the page unused. A sub-page relayout therefore moves each plane on
+    # its own, and these give it the split. None for token-contiguous pages.
     key_plane_bytes: int | None = None
     scale_plane_bytes: int | None = None
 

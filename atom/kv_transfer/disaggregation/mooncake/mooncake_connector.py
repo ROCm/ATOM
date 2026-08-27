@@ -157,39 +157,24 @@ def _configure_mooncake_transport(protocol: str) -> None:
 # ``g // block_size`` at offset ``g % block_size``. A DCP consumer's block-table
 # entry is a *virtual block* covering ``block_size * dcp_size`` global tokens,
 # of which each rank physically holds only its own share, so the push is a
-# relayout rather than a block copy. Its shape differs per cache region:
+# relayout rather than a block copy, with a shape that differs per region.
 #
-# Sharded regions (kv_cache)
-#     Tokens are interleave-sharded across ranks in groups of ``interleave_size``
-#     (S): global token ``g`` lives on rank ``(g // S) % W`` at local index
-#     ``(g // (S*W)) * S + g % S``. Rank ``r``'s virtual block ``b``, offset
-#     ``j`` therefore pulls global position ``dcp_global_pos(b*block_size+j, r)``.
-#     S == block_size collapses to "dst block b <- src block b*W + r", one whole
-#     block per descriptor; S == 1 gives one descriptor per token.
+# Sharded regions (kv_cache): tokens are interleave-sharded in groups of
+# ``interleave_size`` (S), so global ``g`` lives on rank ``(g // S) % W`` at
+# local index ``(g // (S*W)) * S + g % S``. Planned in token units, returned as
+# coalesced ``(src_offset, dst_offset, length)`` runs flat within the region
+# (block id * tokens-per-block + offset) for the caller to scale by
+# ``token_bytes = src_unit_bytes // block_size``. Addressing one token that way
+# needs its bytes contiguous, which holds for the MLA ``[num_slots, 1, 576]``
+# layout but not for MHA ``[blocks, heads, head_dim/x, block_size, x]``, so
+# callers must gate ``interleave_size < block_size`` on the former.
 #
-# Replicated regions (index_cache under ATOM_DCP_REPLICATE_INDEX_CACHE=1)
-#     Every rank holds the full ``block_size * dcp_size`` tokens of a virtual
-#     block, so virtual block ``v`` is the concatenation of source blocks
-#     ``[v*W, (v+1)*W)``. Independent of both the rank and the interleave size,
-#     and the destination ``unit_bytes`` is ``W`` times the source's. This one
-#     plans in bytes, not tokens: an index page is written preshuffled, so its
-#     tokens are neither contiguous nor even in order within the page, and a
-#     source page landing at a sub-page offset moves as one key run plus one
-#     scale run (see ``plan_replicated_index``).
-#
-# Sharded regions return coalesced ``(src_offset, dst_offset, length)`` runs in
-# token units, flat within the region (block id * tokens-per-block + offset),
-# which the caller turns into addresses with
-#
-#     src_addr = src_base + src_offset * token_bytes
-#     dst_addr = dst_base + dst_offset * token_bytes
-#     size     = length * token_bytes
-#
-# where ``token_bytes = src_unit_bytes // block_size``. Addressing a single
-# token is only possible when the region stores a token's bytes contiguously,
-# which holds for the MLA ``[num_slots, 1, 576]`` layout but not for the MHA
-# ``[blocks, heads, head_dim/x, block_size, x]`` one; callers must gate
-# ``interleave_size < block_size`` on the former.
+# Replicated regions (index_cache under ATOM_DCP_REPLICATE_INDEX_CACHE=1): every
+# rank holds a virtual block whole, so it is the concatenation of source blocks
+# ``[v*W, (v+1)*W)`` -- independent of rank and of S, with a destination
+# ``unit_bytes`` W times the source's. Planned in bytes, not tokens: an index
+# page is written preshuffled, so a source page landing at a sub-page offset
+# moves as one key run plus one scale run (see ``plan_replicated_index``).
 
 
 def _coalesce(
@@ -464,10 +449,8 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         self.dp_rank = config.parallel_config.data_parallel_rank
         self.pp_size = config.pipeline_parallel_size
         self.block_size = config.kv_cache_block_size
-        # Under DCP one block-table entry is a virtual block covering
-        # block_size * dcp_size global tokens, so the prefix-cache offset has to
-        # be counted in those, not in single blocks. Same quantity as
-        # BlockManager.hash_block_size.
+        # The prefix-cache offset counts virtual blocks, not single blocks.
+        # Same quantity as BlockManager.hash_block_size.
         self.hash_block_size = self.block_size * config.decode_context_parallel_size
         self.host_ip = get_ip()
 
@@ -630,18 +613,13 @@ class MooncakeConnector(KVConnectorBase):
         self.pp_size = config.pipeline_parallel_size
         self.num_hidden_layers = config.hf_config.num_hidden_layers
         self.block_size = config.kv_cache_block_size
-        # Decode Context Parallel splits a request's tokens round-robin across
-        # the decode ranks, so a consumer rank holds only its own shard while
-        # the producer holds whole blocks. The consumer ships this topology in
-        # its write_request; the producer relayouts on the way out and keeps
-        # dcp_size == 1 of its own.
+        # The consumer ships its DCP topology in the write_request; the
+        # producer relayouts on the way out and keeps dcp_size == 1 of its own.
         self.dcp_size = config.decode_context_parallel_size
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_size > 1 else 0
         self.dcp_interleave_size = config.dcp_config.interleave_size
-        # With a replicated index cache every DCP rank holds all
-        # block_size * dcp_size tokens of a virtual block's indexer page
-        # instead of its own shard, so those regions need the replicated plan
-        # while the MLA latent regions stay sharded.
+        # Indexer regions then take the replicated plan while the MLA latent
+        # regions stay sharded.
         self.replicate_index_cache = dcp_replicated_index_cache_enabled(config)
         # Global index of this stage's first layer; consumer regions are ordered
         # over all layers, so a producer stage writes at this layer offset.
@@ -1132,9 +1110,8 @@ class MooncakeConnector(KVConnectorBase):
                 self._pending_recv_nonce[req_id] = write_nonce
 
             # PD incremental: slice off locally cached prefix blocks; invalid
-            # offset falls back to full transfer. Under DCP one local block is
-            # a *virtual* block spanning dcp_size producer blocks, so the same
-            # prefix costs dcp_size times as many source blocks.
+            # offset falls back to full transfer. Under DCP the same prefix
+            # costs dcp_size times as many source blocks.
             remote_block_ids = meta.remote_block_ids or []
             off = meta.num_computed_blocks
             if (
@@ -1623,11 +1600,10 @@ class MooncakeConnector(KVConnectorBase):
             request_data.get("consumer_num_layers"),
             self._block_region_consumer_indices,
         )
-        # The plan is picked per region from this stage's own role list, but the
-        # bytes land in the consumer's region at cmap[region_idx], and matching
-        # region counts do not make the two orders the same. Writing an index
-        # region with the latent's plan corrupts it into plausible text instead
-        # of faulting, so compare the roles the mapping pairs up.
+        # The plan comes from this stage's role list but the bytes land at
+        # cmap[region_idx], and equal region counts do not make the two orders
+        # match. Writing an index region with the latent's plan corrupts it into
+        # plausible text instead of faulting, so check the pairing.
         consumer_roles = request_data.get("consumer_region_roles")
         if consumer_roles is not None:
             for region_idx in range(num_regions):
@@ -1640,12 +1616,9 @@ class MooncakeConnector(KVConnectorBase):
                         f"region {cmap[region_idx]} is {remote_role!r}"
                     )
         # Under DCP the consumer rank owns only part of each block, so
-        # whole-block descriptors no longer line up and the push becomes a
-        # token-unit relayout. DCP only runs on MLA, whose layout stores a
-        # token contiguously. Which relayout depends on the region: the MLA
-        # latent is interleave-sharded, while the indexer cache is either
-        # sharded the same way or -- with a replicated index cache -- held
-        # whole by every rank in a page dcp_size times as wide.
+        # whole-block descriptors no longer line up and the push becomes the
+        # per-region relayout described at the top of this file. Safe in token
+        # units because DCP only runs on MLA, which stores a token contiguously.
         dcp_size = max(1, request_data.get("consumer_dcp_size", 1))
         interleave = request_data.get("consumer_dcp_interleave", 1)
         replicates_index = request_data.get("consumer_replicates_index_cache", False)
@@ -1659,10 +1632,8 @@ class MooncakeConnector(KVConnectorBase):
                 request_data["consumer_dcp_rank"],
                 interleave,
             )
-            # Sub-page runs cannot carry a preshuffled index page: its tokens
-            # are MFMA-tiled and share one trailing scale plane, so a token-unit
-            # source offset addresses no token's bytes. Only a whole-page
-            # interleave keeps the sharded plan page-aligned.
+            # A preshuffled index page has no token-addressable bytes, so only
+            # a whole-page interleave keeps the sharded plan page-aligned.
             if (
                 not replicates_index
                 and interleave < self.block_size
@@ -1704,10 +1675,9 @@ class MooncakeConnector(KVConnectorBase):
                     sizes.append(bpb)
                 continue
             if not unit:
-                # The destination page may be wider than the source's, but only
-                # in whole tokens, and the plan's offsets already count in the
-                # destination's own token space -- so both ends scale by the
-                # source's per-token width.
+                # The destination page is wider only in whole tokens and the
+                # plan already counts in its token space, so both ends scale by
+                # the source's per-token width.
                 if bpb % self.block_size:
                     raise RuntimeError(
                         f"Region {region_idx} stores {bpb} bytes per block, "
