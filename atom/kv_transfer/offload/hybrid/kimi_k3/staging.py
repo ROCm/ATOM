@@ -214,7 +214,9 @@ class StagedTransfer:
         the one that produces the observable result, so it is the one waited
         on before the segments are handed back to their owner.
         """
-        from atom.kv_transfer.offload.triton_kv_staging import fused_unpack_chunk_major
+        from atom.kv_transfer.offload.dense.triton_kv_staging import (
+            fused_unpack_chunk_major,
+        )
 
         segments = list(segments)
         seg_bytes = self._segment_block_bytes(segments)

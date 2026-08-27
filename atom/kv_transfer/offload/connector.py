@@ -101,13 +101,35 @@ class LMCacheOffloadConnector(KVConnectorBase):
 
 
 class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
-    """Scheduler-side shell delegating to the selected implementation."""
+    """Scheduler-side shell delegating to the selected implementation.
+
+    **Every member `Scheduler` reads off `self.kv_connector` has to appear here**,
+    because `self.kv_connector` IS this object -- the implementation behind
+    `_impl` is invisible from outside. A member the scheduler probes with
+    `getattr(..., default)` and this class does not define does not raise; it
+    silently takes the default forever, which is how `enqueue_state_stores`
+    refused every state store from the day it was written. `tests/
+    test_lmcache_offload_connector.py` sweeps for the gap rather than trusting
+    this comment.
+    """
 
     is_producer = False
     is_offload = True
 
     def __init__(self, config) -> None:
         self._impl = _build_scheduler(config)
+
+    @property
+    def chunk_size(self) -> int | None:
+        """The KV leg's transfer grid, in tokens.
+
+        Read by `Scheduler._resolve_waiting_remote_kv` to stamp
+        `seq.offload_kv_chunk_tokens`, which is `_joint_kv_boundary`'s fallback
+        when `BlockManager` could not read the LMCache config at startup.
+        Without this forwarder that fallback was dead -- `getattr` returned its
+        0 default and the joint path refused with `no_chunk_size`.
+        """
+        return getattr(self._impl, "chunk_size", None)
 
     def get_num_new_matched_tokens(self, seq):
         return self._impl.get_num_new_matched_tokens(seq)

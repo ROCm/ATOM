@@ -5010,3 +5010,44 @@ def test_a_step_whose_only_work_is_a_state_store_reaches_the_worker():
     meta = LMCacheOffloadMetadata()
     meta.state_stores = [(111, (1, 2))]
     assert connector_metadata_has_work(meta)
+
+
+# ── the delegating shell must expose everything the scheduler reads ────────
+
+
+def test_every_member_the_scheduler_reads_is_reachable_through_the_shell():
+    """The shell forwards by hand, so a new method is a silent no-op until
+    someone remembers to add it here too.
+
+    `Scheduler` holds the SHELL in `self.kv_connector`, never the
+    implementation. Most of those reads are `getattr(..., default)`, which does
+    not raise on a missing member -- it takes the default, forever. That is how
+    `enqueue_state_stores` refused every state store from the day it was
+    written: the method existed on `KimiK3OffloadScheduler`, the probe ran
+    against the shell, and the store path took its "nothing will carry these"
+    branch on every pass with one warning line to show for it.
+
+    So sweep for it. This reads the scheduler's source rather than a
+    hand-kept list, because a hand-kept list is the same failure one level up.
+    """
+    import inspect
+    import re
+
+    import atom.model_engine.scheduler as sched_mod
+    from atom.kv_transfer.offload.connector import LMCacheOffloadConnectorScheduler
+
+    src = inspect.getsource(sched_mod)
+    probed = set(re.findall(r'getattr\(\s*self\.kv_connector,\s*"([a-z_]+)"', src))
+    probed |= set(re.findall(r"self\.kv_connector\.([a-z_]+)\(", src))
+    probed |= set(re.findall(r"self\.kv_connector\.([a-z_]+)\b", src))
+    # `_connector_flag(name)` is the same read one indirection along.
+    probed |= set(re.findall(r'_connector_flag\(\s*"([a-z_]+)"', src))
+    probed.discard("_impl")
+    assert probed, "the scan found nothing -- it has stopped matching the source"
+
+    shell = LMCacheOffloadConnectorScheduler
+    missing = sorted(n for n in probed if not hasattr(shell, n))
+    assert not missing, (
+        "Scheduler reads these off `kv_connector`, but the delegating shell "
+        f"does not expose them, so each silently takes its default: {missing}"
+    )
