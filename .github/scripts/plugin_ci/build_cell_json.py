@@ -1,11 +1,9 @@
-#!/usr/bin/env python3
 """Build a plugin CI Slurm cell JSON from workflow matrix inputs."""
 
 import argparse
 import json
 import os
 import re
-import sys
 
 
 def slug(value):
@@ -47,13 +45,18 @@ def main():
         ],
         "runner": {
             "slurm_submit_runner": os.environ.get(
-                "PLUGIN_CI_SLURM_SUBMIT_RUNNER", "atomesh-cicd"
+                "PLUGIN_CI_SLURM_SUBMIT_RUNNER",
+                "atom-mi355-8gpu-vllm-sgl-ci",
             ),
-            "slurm_account": os.environ.get("PLUGIN_CI_SLURM_ACCOUNT", "amd-frameworks"),
+            "slurm_account": os.environ.get(
+                "PLUGIN_CI_SLURM_ACCOUNT", "amd-frameworks"
+            ),
             "slurm_partition": os.environ.get(
                 "PLUGIN_CI_SLURM_PARTITION", "amd-frameworks"
             ),
-            "log_root": os.environ.get("PLUGIN_CI_LOG_ROOT", "/it-share/PLUGIN_CI_LOG/"),
+            "log_root": os.environ.get(
+                "PLUGIN_CI_LOG_ROOT", "/it-share/PLUGIN_CI_LOG/"
+            ),
             "gpus_per_node": int(os.environ.get("PLUGIN_CI_GPUS_PER_NODE", "8")),
             "cpus_per_task": int(os.environ.get("PLUGIN_CI_CPUS_PER_TASK", "114")),
             "time_limit": os.environ.get("PLUGIN_CI_TIME_LIMIT", "03:00:00"),
