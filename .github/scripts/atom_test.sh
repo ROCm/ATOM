@@ -461,11 +461,15 @@ if [ "$TYPE" == "benchmark" ]; then
     fi
     AGENTIC_OUT_DIR="${AGENTIC_OUT_DIR:-./aiperf-artifacts-c${CONC}}"
     ensure_aiperf
-    # The replay is only part of the wall clock: AIPerf configures the dataset
-    # and drains a warmup grace period on either side of it, each with its own
-    # multi-minute timeout. Budget those rather than let the drain supervisor
-    # cut a healthy run.
-    BENCH_MAX_MIN=$(( AIPERF_BENCHMARK_DURATION / 60 + 60 ))
+    # The replay is only part of the wall clock, and the rest is not small: on a
+    # c=48 cell, dataset configuration plus the warmup that primes every lane's
+    # prefix cache took 23.5 min BEFORE profiling started, and warmup scales with
+    # the lane count. Both bracketing phases carry their own 1800s timeouts, so
+    # budget 90 min around the replay rather than let this supervisor cut a
+    # healthy run. Must stay BELOW the workflow step's `timeout-minutes`, so that
+    # an overrun is killed here -- with a reason in the log -- rather than by the
+    # runner, which takes the whole step down silently.
+    BENCH_MAX_MIN=$(( AIPERF_BENCHMARK_DURATION / 60 + 90 ))
     echo "Agentic replay: ${AIPERF_BENCHMARK_DURATION}s at concurrency ${CONC}"
     echo "  scenario=${AIPERF_SCENARIO} dataset=${AIPERF_PUBLIC_DATASET}"
     echo "  artifacts=${AGENTIC_OUT_DIR} drain budget=${BENCH_MAX_MIN}min"
