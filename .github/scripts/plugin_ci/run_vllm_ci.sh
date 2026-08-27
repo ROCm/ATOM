@@ -174,6 +174,8 @@ elif [[ -d "/it-share/models" ]]; then
   MODEL_CACHE_MOUNT="-v /it-share/models:/models"
 elif [[ -d "/mnt/dcgpuval/models" ]]; then
   MODEL_CACHE_MOUNT="-v /mnt/dcgpuval/models:/models"
+elif [[ -d "/shared_nfs/huggingface_models/amd" ]]; then
+  MODEL_CACHE_MOUNT="-v /shared_nfs/huggingface_models/amd:/models"
 elif [[ -d "/shareddata/models" ]]; then
   MODEL_CACHE_MOUNT="-v /shareddata/models:/models"
 elif [[ -d "/data/models" ]]; then

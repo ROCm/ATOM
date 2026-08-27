@@ -6,7 +6,7 @@
 set -euo pipefail
 
 REPO_ROOT="${GITHUB_WORKSPACE:-$(pwd)}"
-JOB_ID="${SLURM_JOB_ID:-local}"
+JOB_ID="${SLURM_JOB_ID:-${SPUR_JOB_ID:-local}}"
 RUN_DIR="${LOG_ROOT}/slurm_job-${JOB_ID}"
 mkdir -p "${RUN_DIR}"
 

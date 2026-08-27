@@ -87,19 +87,12 @@ def shell_value(value):
 def q(value):
     return shlex.quote(str(shell_value(value)))
 
-slurm_submit_runner = runner.get("slurm_submit_runner", "atomesh-cicd")
-crusoe_runner_labels = {
-    "atomesh-cicd-crusoe-mi355",
-    "atomesh-cicd-mi355-crusoe",
-}
-if slurm_submit_runner in crusoe_runner_labels:
-    default_spur_accounting_addr = "http://crs-m2m-cpu-spur-005.crusoe.amd.com:6819"
-    spur_controller_addr = "http://crs-m2m-cpu-spur-005.crusoe.amd.com:6817"
-else:
-    default_spur_accounting_addr = "http://134.199.196.72:6819"
-    spur_controller_addr = os.environ.get(
-        "SPUR_CONTROLLER_ADDR", "http://134.199.196.72:6817"
-    )
+slurm_submit_runner = runner.get(
+    "slurm_submit_runner", "atom-mi355-8gpu-vllm-sgl-ci"
+)
+
+default_spur_accounting_addr = "http://crs-m2m-cpu-spur-005.crusoe.amd.com:6819"
+spur_controller_addr = "http://crs-m2m-cpu-spur-005.crusoe.amd.com:6817"
 
 nodes = cell.get("nodes") or []
 if isinstance(nodes, str):
@@ -111,12 +104,14 @@ exports = {
     "PLUGIN_CI_CELL_ID": cell["id"],
     "PLUGIN_CI_PLUGIN": os.environ["PLUGIN"],
     "SLURM_SUBMIT_RUNNER": slurm_submit_runner,
-    "SLURM_ACCOUNT": runner.get("slurm_account", "amd-frameworks"),
-    "SLURM_PARTITION": runner.get("slurm_partition", "amd-frameworks"),
+    "SLURM_ACCOUNT": runner.get("slurm_account", "amd-aifw-dev"),
+    "SLURM_PARTITION": runner.get("slurm_partition", "amd-spur"),
     "SLURM_CPUS_PER_TASK": runner.get("cpus_per_task", 114),
     "SLURM_GPUS_PER_NODE": runner.get("gpus_per_node", 8),
     "SLURM_TIME_LIMIT": runner.get("time_limit", "03:00:00"),
-    "SLURM_LOG_ROOT": runner.get("log_root", "/it-share/PLUGIN_CI_LOG/"),
+    "SLURM_LOG_ROOT": runner.get(
+        "log_root", "/shared_nfs/ATOM_PLUGIN_CI/ATOM_SGLang_LOG/"
+    ),
     "NODE_LIST": node_list,
     "NUM_NODES": cell.get("num_nodes", 1),
     "SPUR_CONTROLLER_ADDR": spur_controller_addr,
@@ -153,10 +148,7 @@ export SLURM_OUTPUT="${LOG_ROOT}/slurm-%j.out"
 export SLURM_ERROR="${LOG_ROOT}/slurm-%j.err"
 export SLURM_CANCEL_HELPER="${RESULT_DIR}/${PLUGIN_CI_CELL_ID}.slurm-cancel.sh"
 SLURM_LOG_POLL_INTERVAL="${SLURM_LOG_POLL_INTERVAL:-30}"
-USES_SPUR_CONTROLLER=0
-if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" || "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-crusoe-mi355" || "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi355-crusoe" ]]; then
-  USES_SPUR_CONTROLLER=1
-fi
+USES_SPUR_CONTROLLER=1
 
 echo "=== plugin CI cell ==="
 echo "cell=${PLUGIN_CI_CELL_ID}"
@@ -191,7 +183,7 @@ if ! command -v sbatch >/dev/null 2>&1; then
   exit 127
 fi
 
-source "${REPO_ROOT}/.github/scripts/atomesh/slurm_submit_helpers.sh"
+source "${REPO_ROOT}/.github/scripts/slurm_submit_helpers.sh"
 install_slurm_cancel_traps
 
 SBATCH_CMD=(
@@ -199,32 +191,22 @@ SBATCH_CMD=(
   --parsable
   --exclusive
   --export=ALL
-  --job-name "${SLURM_JOB_NAME}"
+  --account "${SLURM_ACCOUNT}"
+  --partition "${SLURM_PARTITION}"
+  -q amd-burst-qos
 )
-if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
-  SBATCH_CMD+=(--controller "${SPUR_CONTROLLER_ADDR}")
-fi
-if [[ -n "${SLURM_ACCOUNT}" ]]; then
-  SBATCH_CMD+=(--account "${SLURM_ACCOUNT}")
-fi
-if [[ -n "${SLURM_PARTITION}" ]]; then
-  SBATCH_CMD+=(--partition "${SLURM_PARTITION}")
-fi
-if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-crusoe-mi355" || "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi355-crusoe" ]]; then
-  SBATCH_CMD+=(-q amd-burst-qos --reservation=atomesh-ci)
+if [[ -n "${NODE_LIST}" ]]; then
+  SBATCH_CMD+=(--nodelist "${NODE_LIST}")
 fi
 SBATCH_CMD+=(
+  --job-name "${SLURM_JOB_NAME}"
+  --controller "${SPUR_CONTROLLER_ADDR}"
   --nodes "${NUM_NODES}"
   --ntasks "${NUM_NODES}"
   --ntasks-per-node 1
   --cpus-per-task "${SLURM_CPUS_PER_TASK}"
   --gres "gpu:${SLURM_GPUS_PER_NODE}"
   --time "${SLURM_TIME_LIMIT}"
-)
-if [[ -n "${NODE_LIST}" ]]; then
-  SBATCH_CMD+=(--nodelist "${NODE_LIST}")
-fi
-SBATCH_CMD+=(
   --output "${SLURM_OUTPUT}"
   --error "${SLURM_ERROR}"
   "${JOB_SCRIPT}"

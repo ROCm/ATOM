@@ -29,9 +29,9 @@ env:
   GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/ATOM.git' }}
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id || github.sha }}
   NIGHTLY_PLUGIN_IMAGE_TAG: rocm/atom-dev:vllm-latest
-  PLUGIN_CI_SLURM_ACCOUNT: amd-frameworks
-  PLUGIN_CI_SLURM_PARTITION: amd-frameworks
-  PLUGIN_CI_LOG_ROOT: /it-share/PLUGIN_CI_LOG/
+  PLUGIN_CI_SLURM_ACCOUNT: amd-aifw-dev
+  PLUGIN_CI_SLURM_PARTITION: amd-spur
+  PLUGIN_CI_LOG_ROOT: /shared_nfs/ATOM_PLUGIN_CI/ATOM_SGLang_LOG/
 
 jobs:
   ci-gate:

@@ -49,13 +49,14 @@ def main():
                 "atom-mi355-8gpu-vllm-sgl-ci",
             ),
             "slurm_account": os.environ.get(
-                "PLUGIN_CI_SLURM_ACCOUNT", "amd-frameworks"
+                "PLUGIN_CI_SLURM_ACCOUNT", "amd-aifw-dev"
             ),
             "slurm_partition": os.environ.get(
-                "PLUGIN_CI_SLURM_PARTITION", "amd-frameworks"
+                "PLUGIN_CI_SLURM_PARTITION", "amd-spur"
             ),
             "log_root": os.environ.get(
-                "PLUGIN_CI_LOG_ROOT", "/it-share/PLUGIN_CI_LOG/"
+                "PLUGIN_CI_LOG_ROOT",
+                "/shared_nfs/ATOM_PLUGIN_CI/ATOM_SGLang_LOG/",
             ),
             "gpus_per_node": int(os.environ.get("PLUGIN_CI_GPUS_PER_NODE", "8")),
             "cpus_per_task": int(os.environ.get("PLUGIN_CI_CPUS_PER_TASK", "114")),
