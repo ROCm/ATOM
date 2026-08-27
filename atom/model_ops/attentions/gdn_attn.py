@@ -92,13 +92,18 @@ class GDNStateMixin:
         # a hidden ordering dependency on the KV sizing path being
         # called first.
         hf = model_runner.config.hf_config
-        if getattr(hf, "model_type", None) == "kimi_linear":
+        model_type = getattr(hf, "model_type", None)
+        if model_type in ("kimi_linear", "glm5_next_text"):
             lin = getattr(hf, "linear_attn_config", {}) or {}
+            # Kimi-Linear numbers these 1-based; GLM-5.3-Flash numbers them
+            # 0-based (its layer_types[3] is the first full-attention layer, and
+            # full_attn_layers correspondingly starts at 3).
+            offset = 0 if model_type == "glm5_next_text" else 1
             model_runner.full_attention_layers = [
-                int(i) - 1 for i in lin.get("full_attn_layers", [])
+                int(i) - offset for i in lin.get("full_attn_layers", [])
             ]
             model_runner.kda_attention_layers = [
-                int(i) - 1 for i in lin.get("kda_layers", [])
+                int(i) - offset for i in lin.get("kda_layers", [])
             ]
             model_runner.num_full_attn = len(model_runner.full_attention_layers)
             model_runner.num_gdn_attn_state = len(model_runner.kda_attention_layers)
@@ -232,9 +237,12 @@ class GDNStateMixin:
         return conv_state_shape, temporal_state_shape
 
     def _state_dtypes(self) -> tuple[torch.dtype, torch.dtype]:
-        if (
-            getattr(self.model_runner.config.hf_config, "model_type", None)
-            == "kimi_linear"
+        # KDA recurrence accumulates in fp32 and aiter's chunk_kimi_delta_attn
+        # reads the state back verbatim, so the temporal state must be fp32 for
+        # every KDA model (Kimi-Linear and GLM-5.3-Flash).
+        if getattr(self.model_runner.config.hf_config, "model_type", None) in (
+            "kimi_linear",
+            "glm5_next_text",
         ):
             return (
                 self.model_runner.config.torch_dtype,

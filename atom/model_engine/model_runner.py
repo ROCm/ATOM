@@ -129,6 +129,9 @@ support_model_arch_dict = {
     "MistralForCausalLM": "atom.models.mistral3.Mistral3ForCausalLM",
     "MiniMaxM3SparseForCausalLM": "atom.models.minimax_m3.MiniMaxM3SparseForCausalLM",
     "MiniMaxM3SparseForConditionalGeneration": "atom.models.minimax_m3.MiniMaxM3SparseForConditionalGeneration",
+    "Glm5NextForConditionalGeneration": (
+        "atom.models.glm5_next.Glm5NextForConditionalGeneration"
+    ),
 }
 # seed = 34567
 # np.random.seed(seed)
@@ -888,7 +891,17 @@ class ModelRunner:
         return False
 
     def is_kimi_linear(self) -> bool:
-        return getattr(self.hf_text_config, "model_type", None) == "kimi_linear"
+        """Hybrid MLA + KDA-linear-attention models (KimiMLAGDNBackend).
+
+        Selects the backend that allocates a paged MLA KV pool for the full
+        attention layers *and* a recurrent state pool for the linear ones.
+        GLM-5.3-Flash (``glm5_next_text``) has the same shape as Kimi-Linear:
+        11 MLA layers interleaved with 34 KDA layers.
+        """
+        return getattr(self.hf_text_config, "model_type", None) in (
+            "kimi_linear",
+            "glm5_next_text",
+        )
 
     def is_deepseek_v4(self) -> bool:
         # NOTE: `hf_text_config.model_type` reads "deepseek_v3" for V4 because

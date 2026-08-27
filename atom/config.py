@@ -623,7 +623,15 @@ _MULTIMODAL_MODEL_TYPES: dict[str, str] = {
     "qwen3_5": "text_config",
     "qwen3_5_moe": "text_config",
     "mistral3": "text_config",
+    "glm5_next": "text_config",  # GLM-5.3-Flash: hybrid KDA/DSA text + vision tower
 }
+
+# Text sub-config model_types that this image's transformers has no class for.
+# Loaded as a bare PretrainedConfig; the ATOM model normalizes the aliases it
+# needs at construction time.
+_PLAIN_TEXT_CONFIG_MODEL_TYPES: frozenset[str] = frozenset(
+    {"kimi_linear", "glm5_next_text"}
+)
 
 # multimodal models fully supported by plugin mode
 _PLUGIN_SUPPORTED_MULTIMODAL_MODELS: set[str] = {
@@ -668,10 +676,11 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
         ):
             text_config_dict["quantization_config"] = config_dict["quantization_config"]
         text_model_type = text_config_dict.get("model_type", "deepseek_v3")
-        if text_model_type == "kimi_linear":
-            # Transformers does not ship KimiLinearConfig yet in this image.
-            # Keep the remote-code fields as plain PretrainedConfig attrs; the
-            # ATOM model normalizes the aliases it needs at construction time.
+        if text_model_type in _PLAIN_TEXT_CONFIG_MODEL_TYPES:
+            # Transformers does not ship a config class for these in this image
+            # (KimiLinearConfig, Glm5NextTextConfig). Keep the fields as plain
+            # PretrainedConfig attrs; the ATOM model normalizes the aliases it
+            # needs at construction time.
             hf_config = PretrainedConfig.from_dict(text_config_dict)
         else:
             mapped_type = _CONFIG_REGISTRY.get(text_model_type, text_model_type)
