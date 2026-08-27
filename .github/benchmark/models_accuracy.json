@@ -170,7 +170,7 @@
     "runner": "linux-atom-do-mi350x-8",
     "test_level": "pr",
     "accuracy_threshold": 0.87,
-    "accuracy_baseline": 0.90,
+    "accuracy_baseline": 0.9,
     "accuracy_baseline_model": "openai/gpt-oss-120b",
     "_baseline_note": "No public GSM8K baseline available"
   },
@@ -182,7 +182,7 @@
     "runner": "linux-atom-do-mi350x-8",
     "test_level": "main",
     "accuracy_threshold": 0.88,
-    "accuracy_baseline": 0.90,
+    "accuracy_baseline": 0.9,
     "accuracy_baseline_model": "meta-llama/Llama-3.3-70B-Instruct",
     "_baseline_note": "HF page inaccessible; needs CI measurement of baseline"
   },
@@ -244,7 +244,7 @@
     "runner": "linux-atom-do-mi350x-8",
     "test_level": "main",
     "accuracy_threshold": 0.87,
-    "accuracy_baseline": 0.90,
+    "accuracy_baseline": 0.9,
     "accuracy_baseline_model": "openai/gpt-oss-120b",
     "_baseline_note": "No public GSM8K baseline available"
   },
@@ -332,6 +332,19 @@
     "accuracy_baseline": 0.9447,
     "accuracy_baseline_model": "zai-org/GLM-5.2-FP8",
     "_baseline_note": "ATOM native FP8 gsm8k 3-shot flexible-extract=0.9447 (5-shot=0.9416); --gpu-memory-utilization 0.8 needed since the DSA index cache OOMs at default 0.9. Threshold 0.92 leaves ~2.5pp headroom."
+  },
+  {
+    "model_name": "GLM-5.3-Flash",
+    "model_path": "zai-org/GLM-5.3-Flash",
+    "extraArgs": "--kv_cache_dtype fp8 -tp 8 --max-model-len 2048 --max-num-batched-tokens 2048 --max-num-seqs 32 --gpu-memory-utilization 0.85 --no-enable_prefix_caching",
+    "client_command": "lm_eval --model local-completions --model_args model=${MODEL_PATH},base_url=http://localhost:8000/v1/completions,num_concurrent=32,max_retries=3,tokenized_requests=False,max_length=2048 --tasks gsm8k --num_fewshot 3 --batch_size 1 --output_path ${OUTPUT_PATH} --log_samples",
+    "env_vars": "",
+    "runner": "linux-atom-do-mi350x-8",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.9,
+    "accuracy_baseline": 0.9257,
+    "accuracy_baseline_model": "zai-org/GLM-5.3-Flash",
+    "_baseline_note": "ATOM native FP8 gsm8k 3-shot over all 1319 questions: flexible-extract=0.9257 with the default CUDAGraph path (eager measured 0.9204, i.e. equal within stderr +/-0.0072). Prefix caching is off because the KDA recurrent state is per-request. Threshold 0.90 leaves ~2.5pp headroom."
   },
   {
     "model_name": "GLM-5.2-MXFP4",

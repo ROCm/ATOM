@@ -608,6 +608,9 @@ class InputOutputProcessor:
                 "qwen3_5_moe_text",
                 "kimi_linear",
                 "deepseek_v4",
+                # GLM-5.3-Flash: KDA linear-attention layers keep a per-request
+                # recurrent state, same as kimi_linear.
+                "glm5_next_text",
             }
         )
 

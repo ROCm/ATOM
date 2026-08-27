@@ -92,7 +92,48 @@ class GDNStateMixin:
         # a hidden ordering dependency on the KV sizing path being
         # called first.
         hf = model_runner.config.hf_config
-        if getattr(hf, "model_type", None) == "kimi_linear":
+        if getattr(hf, "model_type", None) == "glm5_next_text":
+            # GLM-5.3-Flash declares its layout in `layer_types`, one entry per
+            # layer. Derive from that rather than `linear_attn_config`: GLM
+            # ships those lists 0-BASED while Kimi ships them 1-based (hence the
+            # `- 1` in the branch below), and `layer_types` is unambiguous.
+            layer_types = list(getattr(hf, "layer_types", []) or [])
+            model_runner.full_attention_layers = [
+                i for i, t in enumerate(layer_types) if t != "linear_attention"
+            ]
+            model_runner.kda_attention_layers = [
+                i for i, t in enumerate(layer_types) if t == "linear_attention"
+            ]
+            model_runner.num_full_attn = len(model_runner.full_attention_layers)
+            model_runner.num_gdn_attn_state = len(model_runner.kda_attention_layers)
+            lin = getattr(hf, "linear_attn_config", {}) or {}
+            hf.linear_num_key_heads = getattr(
+                hf, "linear_num_key_heads", lin.get("num_heads", hf.num_attention_heads)
+            )
+            hf.linear_num_value_heads = getattr(
+                hf,
+                "linear_num_value_heads",
+                lin.get("num_heads", hf.num_attention_heads),
+            )
+            hf.linear_key_head_dim = getattr(
+                hf, "linear_key_head_dim", lin.get("head_dim", 128)
+            )
+            hf.linear_value_head_dim = getattr(
+                hf, "linear_value_head_dim", lin.get("head_dim", 128)
+            )
+            hf.linear_conv_kernel_dim = getattr(
+                hf,
+                "linear_conv_kernel_dim",
+                lin.get("short_conv_kernel_size", 4),
+            )
+            if not getattr(hf, "mla_kv_entry_dim", None):
+                # NoPE MLA pads its rope block to 64 and holds it at zero, so
+                # the KV rows are 576 wide. Declared here as well as in the
+                # model so cache SIZING cannot run before the model set it.
+                from atom.models.glm5_next import _ROPE_PAD
+
+                hf.mla_kv_entry_dim = hf.kv_lora_rank + _ROPE_PAD
+        elif getattr(hf, "model_type", None) == "kimi_linear":
             lin = getattr(hf, "linear_attn_config", {}) or {}
             model_runner.full_attention_layers = [
                 int(i) - 1 for i in lin.get("full_attn_layers", [])
@@ -232,9 +273,13 @@ class GDNStateMixin:
         return conv_state_shape, temporal_state_shape
 
     def _state_dtypes(self) -> tuple[torch.dtype, torch.dtype]:
-        if (
-            getattr(self.model_runner.config.hf_config, "model_type", None)
-            == "kimi_linear"
+        # KDA (Kimi Delta Attention) accumulates its recurrence in fp32 and
+        # reads the state back verbatim, so the SSM state must be fp32 -- the
+        # conv state stays in the model dtype. GLM-5.3-Flash uses the same KDA
+        # kernels as Kimi Linear and so has the same requirement.
+        if getattr(self.model_runner.config.hf_config, "model_type", None) in (
+            "kimi_linear",
+            "glm5_next_text",
         ):
             return (
                 self.model_runner.config.torch_dtype,

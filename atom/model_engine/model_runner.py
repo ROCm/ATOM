@@ -133,6 +133,9 @@ support_model_arch_dict = {
     "MistralForCausalLM": "atom.models.mistral3.Mistral3ForCausalLM",
     "MiniMaxM3SparseForCausalLM": "atom.models.minimax_m3.MiniMaxM3SparseForCausalLM",
     "MiniMaxM3SparseForConditionalGeneration": "atom.models.minimax_m3.MiniMaxM3SparseForConditionalGeneration",
+    "Glm5NextForConditionalGeneration": (
+        "atom.models.glm5_next.Glm5NextForConditionalGeneration"
+    ),
 }
 # seed = 34567
 # np.random.seed(seed)
@@ -646,8 +649,13 @@ class ModelRunner:
 
         rope_parameters = getattr(self.hf_text_config, "rope_parameters", None) or {}
         self.use_mrope = "mrope_section" in rope_parameters
+        # A sparse indexer is orthogonal to whether the model is pure MLA or a
+        # linear/MLA hybrid: GLM-5.3-Flash is both hybrid and sparse, so gating
+        # this on `use_mla` alone would silently leave its index cache unbound.
         self.is_deepseek_v32 = (
-            hasattr(hf_config, "index_topk") if self.use_mla else False
+            hasattr(hf_config, "index_topk")
+            if (self.use_mla or self.use_kimi_mla)
+            else False
         )
         # Initialize profiler for this rank (before _setup_device_and_distributed
         # so that dp config fields are still at their original values)
@@ -882,7 +890,19 @@ class ModelRunner:
         return False
 
     def is_kimi_linear(self) -> bool:
-        return getattr(self.hf_text_config, "model_type", None) == "kimi_linear"
+        """Models served by the Kimi MLA+GDN hybrid backend.
+
+        GLM-5.3-Flash (`glm5_next_text`) is not a Kimi checkpoint, but it has
+        exactly the layout this backend exists for -- linear-attention (KDA)
+        layers interleaved with full MLA layers -- so it selects the same
+        backend. GLM additionally carries a sparse indexer, which
+        `KimiAiterMLAGDNMetadataBuilder` already inherits from
+        `AiterMLAMetadataBuilder`.
+        """
+        return getattr(self.hf_text_config, "model_type", None) in (
+            "kimi_linear",
+            "glm5_next_text",
+        )
 
     def is_deepseek_v4(self) -> bool:
         # NOTE: `hf_text_config.model_type` reads "deepseek_v3" for V4 because
