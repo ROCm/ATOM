@@ -1986,11 +1986,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         var["context_lens"].np[:scheduled_bs] = context_lens
         var["context_lens"].np[scheduled_bs:bs] = 0
         if self.replicate_index_cache:
-            # One slot per query token: MTP verify forwards max_seqlen_q draft
-            # positions per request, at global positions
-            # [seq_len - max_seqlen_q, seq_len), the same range the main KV
-            # slot_mapping above walks. Collapses to the single seq_len-1 slot
-            # when max_seqlen_q == 1.
             var["index_slot_mapping"].np[: bs * max_seqlen_q] = 0
             if not batch.is_dummy_run:
                 var["index_slot_mapping"].np[: scheduled_bs * max_seqlen_q] = [
