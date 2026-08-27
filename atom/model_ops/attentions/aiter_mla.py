@@ -157,34 +157,58 @@ def cdiv(a, b):
     return (a + b - 1) // b
 
 
-# Connectors that carry the widened replicated index page correctly. LMCache
-# derives every block's stride from the tensor itself, so it is layout-agnostic.
-# Mooncake plans the index regions with plan_replicated_index once the consumer
-# says it replicates, which is why this layout may run behind a PD decode node.
-_REPLICATION_SAFE_CONNECTORS = frozenset(
-    {
-        "lmcache_offload",
-        "lmcacheoffloadconnector",
-        "lmcacheconnectorv1",
-        "mooncake",
-    }
-)
+def _replicated_index_cache_transfer_supported(config) -> bool:
+    """Whether the configured transfer path carries a replicated index page.
 
-
-def _uses_replication_safe_kv_transfer(config) -> bool:
-    """Whether the configured transfer path handles a replicated index page.
-
-    Only a single top-level connector qualifies. The ``multi`` fan-out is the
-    prefill node's shape, and a prefill node runs with dcp_world_size == 1,
-    where this layout is rejected anyway.
+    LMCache derives every block's stride from the tensor itself, so it is
+    layout-agnostic. Mooncake plans the index regions with
+    ``plan_replicated_index`` once the consumer says it replicates, which is
+    why this layout may run behind a PD decode node. The ``multi`` fan-out
+    qualifies only in the prefill node's shape -- a Mooncake producer paired
+    with an LMCache offload -- where both members are individually safe.
     """
+
     transfer_config = getattr(config, "kv_transfer_config", None)
-    if not isinstance(transfer_config, dict):
+    if not isinstance(transfer_config, dict) or not transfer_config:
         return False
-    connector = transfer_config.get("kv_connector")
-    if not isinstance(connector, str):
+
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+    def canonical(sub_config, path):
+        if not isinstance(sub_config, dict):
+            return None
+        try:
+            return KVConnectorFactory.canonical_name(
+                sub_config.get("kv_connector"), path=path
+            )
+        except (TypeError, ValueError):
+            return None
+
+    connector = canonical(transfer_config, "kv_transfer_config")
+    if connector == "lmcache_offload":
+        return True
+    if connector == "mooncake":
+        return transfer_config.get("kv_role", "kv_producer") in {
+            "kv_producer",
+            "kv_consumer",
+        }
+    if connector != "multi":
         return False
-    return connector.strip().lower() in _REPLICATION_SAFE_CONNECTORS
+
+    sub_configs = transfer_config.get("connectors")
+    if not isinstance(sub_configs, list) or len(sub_configs) != 2:
+        return False
+    topology = {
+        (
+            canonical(sub_config, f"kv_transfer_config.connectors[{index}]"),
+            sub_config.get("kv_role") if isinstance(sub_config, dict) else None,
+        )
+        for index, sub_config in enumerate(sub_configs)
+    }
+    return topology == {
+        ("mooncake", "kv_producer"),
+        ("lmcache_offload", "offload"),
+    }
 
 
 def _replicated_index_cache_unsupported_reasons(
@@ -208,10 +232,11 @@ def _replicated_index_cache_unsupported_reasons(
     if getattr(config, "pipeline_parallel_size", 1) > 1:
         unsupported.append("pipeline parallelism is not supported")
     if getattr(config, "kv_transfer_config", None) and not (
-        _uses_replication_safe_kv_transfer(config)
+        _replicated_index_cache_transfer_supported(config)
     ):
         unsupported.append(
-            "KV transfer connector does not support the replicated index page"
+            "KV transfer must be standalone LMCache, standalone Mooncake, or "
+            "multi[Mooncake producer + LMCache offload]"
         )
     if getattr(config, "enable_rapidserve", False):
         unsupported.append("RapidServe disaggregation is not supported")
@@ -1222,6 +1247,14 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         if hasattr(runner, "index_cache"):
             index_head_dim = runner.config.hf_config.index_head_dim
+            if getattr(self, "replicate_index_cache", False):
+                expected_page_width = runner.physical_block_size * self.dcp_world_size
+                index_shape = tuple(runner.index_cache.shape)
+                if len(index_shape) < 3 or index_shape[2] != expected_page_width:
+                    raise RuntimeError(
+                        "Replicated MLA index page width mismatch: "
+                        f"expected {expected_page_width}, got shape={index_shape}"
+                    )
             for layer_id in range(runner.index_cache.shape[0]):
                 t = runner.index_cache[layer_id]
                 bpb = t.stride(0) * t.element_size() * self.block_ratio

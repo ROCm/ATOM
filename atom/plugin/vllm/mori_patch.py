@@ -17,14 +17,13 @@ overridable methods and injected here, so native files stay clean:
 from __future__ import annotations
 
 import functools
-from typing import Optional
 
 import torch
+from aiter.jit.utils.chip_info import get_cu_num
 
 import atom.model_ops.fused_moe.modular_kernel as mk
 from atom.model_ops.fused_moe.mori_prepare_finalize import MoriPrepareAndFinalize
 from atom.plugin.config import VLLM_MORI_LAUNCH_CONFIG_TOKEN_THRESHOLD
-from aiter.jit.utils.chip_info import get_cu_num
 
 _MORI_PATCH_APPLIED = False
 
@@ -32,7 +31,7 @@ _MORI_PATCH_APPLIED = False
 def _is_stream_capturing() -> bool:
     try:
         return torch.cuda.is_current_stream_capturing()
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -54,10 +53,38 @@ def _is_uniform_full_graph_batch() -> bool:
     )
 
 
-def _try_get_exact_valid_rows(dispatch_recv_token_num: torch.Tensor) -> Optional[int]:
+def _try_get_exact_valid_rows(dispatch_recv_token_num: torch.Tensor) -> int | None:
     if dispatch_recv_token_num.numel() == 0 or _is_stream_capturing():
         return None
     return int(dispatch_recv_token_num.reshape(-1)[0].item())
+
+
+def _trim_qwen35_uniform_full_graph(
+    dispatch_a1: torch.Tensor,
+    dispatch_scale: torch.Tensor | None,
+    dispatch_ids: torch.Tensor,
+    dispatch_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]:
+    from vllm.distributed.parallel_state import get_dp_group
+    from vllm.forward_context import get_forward_context
+
+    forward_context = get_forward_context()
+    context = forward_context.context if forward_context is not None else None
+    if context is None:
+        return dispatch_a1, dispatch_scale, dispatch_ids, dispatch_weights
+
+    dp_size = get_dp_group().world_size
+    topk = topk_ids.shape[1]
+    total_valid_tokens = context.graph_bs * topk * dp_size
+    all_ranks_decode = getattr(context, "dp_uniform_decode", not context.is_prefill)
+    if total_valid_tokens < dispatch_a1.shape[0] and all_ranks_decode:
+        dispatch_a1 = dispatch_a1[:total_valid_tokens]
+        dispatch_ids = dispatch_ids[:total_valid_tokens]
+        dispatch_weights = dispatch_weights[:total_valid_tokens]
+        if dispatch_scale is not None:
+            dispatch_scale = dispatch_scale[:total_valid_tokens]
+    return dispatch_a1, dispatch_scale, dispatch_ids, dispatch_weights
 
 
 def trim_vllm_mori_dispatch_tensors(
@@ -69,6 +96,17 @@ def trim_vllm_mori_dispatch_tensors(
     ep_world_size: int,
     dispatch_recv_token_num: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]:
+    from atom.plugin.vllm.qwen35_plugin_scope import is_qwen35_35b_a3b_vllm_plugin_model
+
+    if is_qwen35_35b_a3b_vllm_plugin_model() and _is_uniform_full_graph_batch():
+        return _trim_qwen35_uniform_full_graph(
+            dispatch_a1,
+            dispatch_scale,
+            dispatch_ids,
+            dispatch_weights,
+            topk_ids,
+        )
+
     # Only trim in full-cudagraph uniform-decode settings.
     # All DP/TP ranks are padded to a common token count only under full-graph
     # settings. In piecewise or eager batches, token counts per rank can differ
@@ -118,7 +156,7 @@ def apply_vllm_mori_patch() -> None:
             return min(128, mp), 16
         return min(64, mp), 4
 
-    setattr(vllm_get_dispatch_config, "_atom_vllm_mori_patched", True)
+    vllm_get_dispatch_config._atom_vllm_mori_patched = True
     MoriPrepareAndFinalize._get_dispatch_config = vllm_get_dispatch_config
 
     original_trim = mk.FusedMoEModularKernel._maybe_trim_dispatch_output
@@ -147,7 +185,7 @@ def apply_vllm_mori_patch() -> None:
             expert_tokens_meta.expert_num_tokens,
         )
 
-    setattr(vllm_maybe_trim_dispatch_output, "_atom_vllm_mori_patched", True)
+    vllm_maybe_trim_dispatch_output._atom_vllm_mori_patched = True
     mk.FusedMoEModularKernel._maybe_trim_dispatch_output = (
         vllm_maybe_trim_dispatch_output
     )
