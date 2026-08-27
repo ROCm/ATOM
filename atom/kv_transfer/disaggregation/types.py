@@ -163,6 +163,10 @@ class ReqMeta:
     remote_tp_size: int = 0
     transfer_id: int = 0
     local_slot_index: int = -1
+    # Producer's final committed state slot. This is distinct from
+    # `local_slot_index`, which is the consumer destination slot. Prefix
+    # checkpointing may move the producer request after admission.
+    remote_slot_index: int = -1
     # The request's SWA ring slot, as a one-element list so it zips with the
     # region loop like block ids do. Empty for backends with no SWA state.
     local_swa_block_ids: list[int] = field(default_factory=list)
@@ -233,6 +237,7 @@ class ConnectorMetadata:
             ),
             transfer_id=kv_transfer_params.get("transfer_id", 0),
             local_slot_index=kv_transfer_params.get("local_slot_index", -1),
+            remote_slot_index=kv_transfer_params.get("remote_slot_index", -1),
         )
 
     def add_new_req_to_save(
