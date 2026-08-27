@@ -259,8 +259,11 @@ def _v4_sparse_attention_fake(
 ) -> torch.Tensor:
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
-    return positions.new_empty(
-        (positions.shape[0], self.n_local_heads * self.head_dim),
+    # Off the Q, matching the body. Sizing this by `positions` disagrees with it
+    # whenever the two token counts differ -- see `_sparse_attention`.
+    q_rows = q_sa if q_sa is not None else q_packed
+    return q_rows.new_empty(
+        (q_rows.shape[0], self.n_local_heads * self.head_dim),
         dtype=torch.bfloat16,
     )
 
@@ -3276,20 +3279,29 @@ class DeepseekV4Attention(nn.Module):
         belongs in a dense piece, keyed on num_tokens, not in the core.
         """
         fc = get_forward_context()
-        num_tokens = positions.shape[0]
-        if fc.context.is_dummy_run or os.environ.get("ATOM_V4_BYPASS_ATTN") == "1":
-            # warmup runs before allocate_kv_cache: `unified_kv` is unbound and
-            # the paged kernels would read OOB. Same guard the core has always
-            # carried; this half now runs outside it. See `_qk_norm_rope`.
-            return positions.new_zeros(
-                (num_tokens, self.n_local_heads * self.head_dim),
-                dtype=torch.bfloat16,
-            )
-        assert qkn.q_sa is not None or qkn.q_packed is not None, (
+        # Row count off the Q, NOT off `positions`. The Q descends from the
+        # hidden state through `wqkv_a`/`wq_b`, so it carries the same token
+        # count the residual stream does. `positions` does not have to: under
+        # `--enable-dp-attention`, a step where any rank is prefilling takes the
+        # variable-length path (`model_runner.py`, `dp_uniform_decode`) and the
+        # two can differ. Sizing the attention output by `positions` then hands
+        # the mHC residual a mismatched `m` -- an aiter shape assert deep inside
+        # a compiled piece, far from here.
+        q_rows = qkn.q_sa if qkn.q_sa is not None else qkn.q_packed
+        assert q_rows is not None, (
             "_sparse_attention got no Q: `_qk_norm_rope` did not run upstream. "
             "Every narrow path must run it -- gating it on AF_PIECEWISE alone "
             "left plain PIECEWISE feeding None into the paged attention."
         )
+        num_tokens = q_rows.shape[0]
+        if fc.context.is_dummy_run or os.environ.get("ATOM_V4_BYPASS_ATTN") == "1":
+            # warmup runs before allocate_kv_cache: `unified_kv` is unbound and
+            # the paged kernels would read OOB. Same guard the core has always
+            # carried; this half now runs outside it. See `_qk_norm_rope`.
+            return q_rows.new_zeros(
+                (num_tokens, self.n_local_heads * self.head_dim),
+                dtype=torch.bfloat16,
+            )
         attn_md = cast("AttentionMetaData_DSV4", fc.attn_metadata)
         ratio = self.compress_ratio
         is_decode = attn_md.state is AttnState.DECODE

@@ -1680,7 +1680,8 @@ def test_every_op_fake_agrees_with_its_body():
                 "v4_sparse_attention",
                 [
                     v4._v4_sparse_attention_fake(
-                        None,
+                        # a real Q: the fake sizes on it, not on `positions`
+                        torch.zeros(T, H, D),
                         None,
                         None,
                         None,
@@ -1693,7 +1694,14 @@ def test_every_op_fake_agrees_with_its_body():
                         "L",
                     ).shape
                 ],
-                [A._sparse_attention(layer, v4.QKNormRopeOut(), positions).shape],
+                [
+                    A._sparse_attention(
+                        layer,
+                        # a real Q: the body sizes on it and asserts it is there
+                        v4.QKNormRopeOut(q_sa=torch.zeros(T, H, D)),
+                        positions,
+                    ).shape
+                ],
             ),
         ]
     finally:
@@ -2012,3 +2020,48 @@ def test_a_void_op_survives_only_because_split_ops_are_not_compiled():
         "the backend no longer excludes split-op submodules from compilation, "
         "so `v4_attn_compress` would go through AOT and be DCE'd"
     )
+
+
+def test_sparse_attention_sizes_on_the_q_not_positions():
+    # The attention output feeds the mHC residual stream, which is sized by the
+    # hidden state. The Q descends from the hidden state, `positions` does not
+    # have to: under `--enable-dp-attention` a step where any rank is prefilling
+    # takes the variable-length path and the two counts can differ. Sizing on
+    # `positions` then surfaced as an aiter `residual_in shape mismatch` deep
+    # inside a compiled piece -- expected 6, got 5 -- with nothing near the
+    # cause. Both the body and the fake are pinned, since disagreeing is its own
+    # class of failure.
+    import types
+
+    import pytest
+
+    try:
+        import atom.models.deepseek_v4 as v4
+    except ImportError as e:
+        if "aiter" not in str(e) and "forward_context" not in str(e):
+            raise
+        pytest.skip(f"deepseek_v4 not importable here: {e}")
+
+    T_Q, T_POS, H, D = 5, 6, 2, 64  # deliberately different
+    layer = types.SimpleNamespace(
+        n_local_heads=H, head_dim=D, rope_head_dim=16, kv_fp8=False
+    )
+    qkn = v4.QKNormRopeOut(q_sa=torch.zeros(T_Q, H, D), kv=torch.zeros(T_Q, D))
+    positions = torch.zeros(T_POS, dtype=torch.int32)
+
+    cfg = types.SimpleNamespace(
+        compilation_config=types.SimpleNamespace(static_forward_context={"L": layer})
+    )
+    fc = types.SimpleNamespace(context=types.SimpleNamespace(is_dummy_run=True))
+    saved_cfg, saved_fc = v4.get_current_atom_config, v4.get_forward_context
+    v4.get_current_atom_config, v4.get_forward_context = (lambda: cfg), (lambda: fc)
+    try:
+        body = v4.DeepseekV4Attention._sparse_attention(layer, qkn, positions)
+        fake = v4._v4_sparse_attention_fake(
+            qkn.q_sa, qkn.kv, None, None, None, None, positions, None, None, None, "L"
+        )
+    finally:
+        v4.get_current_atom_config, v4.get_forward_context = saved_cfg, saved_fc
+
+    assert body.shape == (T_Q, H * D), f"body followed positions: {body.shape}"
+    assert fake.shape == (T_Q, H * D), f"fake followed positions: {fake.shape}"
