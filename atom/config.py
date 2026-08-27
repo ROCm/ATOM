@@ -623,6 +623,7 @@ _MULTIMODAL_MODEL_TYPES: dict[str, str] = {
     "qwen3_5": "text_config",
     "qwen3_5_moe": "text_config",
     "mistral3": "text_config",
+    "qwen4_exp": "text_config",
 }
 
 # multimodal models fully supported by plugin mode

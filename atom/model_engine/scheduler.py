@@ -465,6 +465,12 @@ class ScheduledBatch:
             dtype=np.int32,
         )
 
+        # Qwen3.8-Flash-Next's PLE hashes n-grams that reach back across a chunk
+        # boundary, so it needs the tokens immediately BEFORE each scheduled
+        # chunk -- which `scheduled_tokens` by definition does not carry. A
+        # list of references, so this costs nothing for models that ignore it.
+        self.seq_token_ids = [seq.token_ids for seq in seqs.values()]
+
         # Each sequence's window, staged into one array rather than assigned
         # per sequence: a numpy slice-assign costs ~245ns of dispatch whatever
         # its length, and at decode a window is a single token. `extend`
@@ -1831,6 +1837,15 @@ class Scheduler:
         than one checkpoint interval.
         """
         bm = self.block_manager
+        # A multimodal prefill must stay whole: the vision encoder runs over
+        # every image in the request and the model scatters its output onto
+        # ALL the placeholder positions in the forward, so a chunk that ends
+        # mid-image leaves embeddings with nowhere to go. Checkpoint alignment
+        # is only a prefix-cache optimization, so give it up here rather than
+        # split the prompt. (`_unschedulable_reason` already guarantees a
+        # multimodal prompt fits the batch budget in one go.)
+        if getattr(seq, "multimodal_data", None) is not None:
+            return chunk
         target = bm.checkpoint_cut(seq, start, start + chunk)
         if target:
             chunk = target - start

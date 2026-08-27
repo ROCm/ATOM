@@ -14,6 +14,7 @@ def get_attn_backend(
     use_gdn: bool = False,
     use_v4: bool = False,
     use_kimi_mla: bool = False,
+    use_qwen3_8_flash_next: bool = False,
 ) -> type[AttentionBackend]:
     """Selects which attention backend to use and lazily imports it."""
     return _cached_get_attn_backend(
@@ -24,6 +25,7 @@ def get_attn_backend(
         use_sglang=is_sglang(),
         use_vllm=is_vllm(),
         use_kimi_mla=use_kimi_mla,
+        use_qwen3_8_flash_next=use_qwen3_8_flash_next,
     )
 
 
@@ -36,6 +38,7 @@ def _cached_get_attn_backend(
     use_sglang: bool = False,
     use_vllm: bool = False,
     use_kimi_mla: bool = False,
+    use_qwen3_8_flash_next: bool = False,
 ) -> type[AttentionBackend]:
 
     # get device-specific attn_backend
@@ -47,6 +50,7 @@ def _cached_get_attn_backend(
         use_sglang=use_sglang,
         use_vllm=use_vllm,
         use_kimi_mla=use_kimi_mla,
+        use_qwen3_8_flash_next=use_qwen3_8_flash_next,
     )
     if not attention_cls:
         raise ValueError(f"Invalid attention backend for {attention_cls}")
@@ -61,7 +65,10 @@ def get_attn_backend_cls(
     use_sglang,
     use_vllm,
     use_kimi_mla=False,
+    use_qwen3_8_flash_next=False,
 ) -> str:
+    if use_qwen3_8_flash_next:
+        return "atom.model_ops.attentions.qwen3_8_flash_next_attn.Qwen3_8FlashNextBackend"
     if use_v4:
         return "atom.model_ops.attentions.deepseek_v4_attn.DeepseekV4Backend"
     if use_kimi_mla:
