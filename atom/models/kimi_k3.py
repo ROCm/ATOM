@@ -8,6 +8,7 @@ weights live under ``language_model.*`` in the checkpoint, so this module keeps
 the same object hierarchy and skips the vision tower/projector tensors.
 """
 
+import os
 from typing import ClassVar
 
 import torch
@@ -120,14 +121,23 @@ def _normalize_kimi_config(config) -> None:
 
 def _kda_packed_modules_mapping(
     kda_layer_indices: list[int],
+    lowrank_out_gate: bool = False,
 ) -> dict[str, tuple[str, int]]:
+    """Map the checkpoint's separate KDA projections onto the fused ``in_proj``.
+
+    ``lowrank_out_gate`` follows ``KimiKDAAttention.lowrank_out_gate``: a
+    low-rank gate keeps ``g_a_proj``/``g_b_proj`` as their own modules, so only
+    q/k/v are packed and ``g_proj`` must not be mapped.
+    """
     mapping = {
         ".gate_proj": (".gate_up_proj", 0),
         ".up_proj": (".gate_up_proj", 1),
         ".q_a_proj": (".fused_qkv_a_proj", 0),
         ".kv_a_proj_with_mqa": (".fused_qkv_a_proj", 1),
     }
-    projection_names = ("q_proj", "k_proj", "v_proj", "g_proj")
+    projection_names = ("q_proj", "k_proj", "v_proj")
+    if not lowrank_out_gate:
+        projection_names += ("g_proj",)
     for layer_idx in kda_layer_indices:
         prefix = f".layers.{layer_idx}.self_attn."
         for shard_id, projection_name in enumerate(projection_names):
@@ -799,6 +809,91 @@ def kda_attention_with_output(
     return self._forward_impl(hidden_states, hidden_states_scale)
 
 
+_KDA_DBG = os.environ.get("ATOM_KDA_DEBUG_GATE", "0") == "1"
+_KDA_DBG_SEEN: set = set()
+
+
+def _kda_dbg_capturing() -> bool:
+    try:
+        return torch.cuda.is_current_stream_capturing()
+    except (RuntimeError, AttributeError):
+        return False
+
+
+def _kda_layer_num(layer) -> str:
+    return f"{getattr(layer, 'layer_num', -1):02d}"
+
+
+def _kda_dbg_absmax(x) -> float:
+    if x is None or x.numel() == 0:
+        return -1.0
+    t = x.detach()
+    if t.numel() > (1 << 22):
+        t = t.reshape(-1)[: 1 << 22]
+    if t.element_size() == 1:
+        return float(t.view(torch.uint8).max())
+    return float(t.abs().max())
+
+
+def _kda_dbg_gate(layer, core_out, forget_gate, out_gate, phase="?") -> None:
+    """One line per KDA layer: is the OUTPUT gate collapsing the result?
+
+    GLM-5.3-Flash drives `o_norm` from a low-rank gate (g_a -> g_b) rather than
+    Kimi's full-rank `g_proj`. A mis-sliced low-rank gate still produces
+    finite, plausible numbers -- it just scales the layer's contribution
+    toward zero -- so the gate has to be inspected directly.
+    `o_norm` applies sigmoid, hence the reported sigmoid mean.
+    """
+    # Key by (layer, phase): KDA runs a DIFFERENT kernel in each phase
+    # (chunk_kimi_delta_attn for prefill, fused_sigmoid_gating_delta_rule_update
+    # for decode), so a per-layer-only key would only ever show prefill and hide
+    # a decode-side fault entirely.
+    # Restrict to a couple of layers rather than capping the total: with 34 KDA
+    # layers the prefill pass alone exhausts any global cap, and decode -- the
+    # phase actually under suspicion -- never gets logged at all.
+    if layer.layer_num not in (0, 4):
+        return
+    key = (layer.layer_num, phase)
+    if key in _KDA_DBG_SEEN:
+        return
+    _KDA_DBG_SEEN.add(key)
+    g = out_gate.detach().float()
+    # The decay the kernel will apply, transcribed from
+    # fla_ops/fused_sigmoid_gating.py: with a lower_bound the log-decay is
+    #   lower_bound * sigmoid(exp(A_log) * (g + dt_bias))
+    # A saturated sigmoid means exp(-5) ~= 0.0067 retention per step, i.e. the
+    # recurrent state is wiped every token -- which would explain a tiny
+    # core_out all by itself.
+    decay_txt = "n/a"
+    lb = layer._kda_gate_lower_bound
+    if lb is not None:
+        a = forget_gate.detach().float().reshape(-1, layer.head_dim)
+        pre = (
+            torch.exp(layer.A_log.detach().float())
+            .repeat_interleave(layer.head_dim)[: a.shape[-1] * 1]
+            .reshape(1, -1)
+        )
+        x = a + layer.dt_bias.detach().float().reshape(1, -1)[:, : a.shape[-1]]
+        sig = torch.sigmoid(pre[:, : a.shape[-1]] * x)
+        log_decay = lb * sig
+        retain = torch.exp(log_decay)
+        decay_txt = (
+            f"sigmoid.mean={float(sig.mean()):.4f}"
+            f" retain.mean={float(retain.mean()):.5f}"
+            f" retain.min={float(retain.min()):.5f}"
+            f" retain.max={float(retain.max()):.5f}"
+        )
+    print(
+        f"[kda-gate] layer={layer.layer_num:02d} phase={phase}"
+        f" core_out={_kda_dbg_absmax(core_out):8.4f}"
+        f" forget_gate={_kda_dbg_absmax(forget_gate):8.4f}"
+        f" out_gate_absmax={_kda_dbg_absmax(out_gate):8.4f}"
+        f" sigmoid(out_gate).mean={float(torch.sigmoid(g).mean()):.4f}"
+        f" | decay: {decay_txt}",
+        flush=True,
+    )
+
+
 class KimiKDAAttention(nn.Module):
     @property
     def mamba_type(self) -> str:
@@ -809,10 +904,28 @@ class KimiKDAAttention(nn.Module):
         atom_config: Config,
         quant_config: QuantizationConfig | None,
         prefix: str = "",
+        lowrank_out_gate: bool | None = None,
     ):
         super().__init__()
         config = _text_config(atom_config.hf_config)
         self.config = config
+        # Two output-gate layouts share this class:
+        #   full-rank  -- one `g_proj` fused into in_proj  (Kimi-K3)
+        #   low-rank   -- `g_a_proj` (hidden -> head_dim) then `g_b_proj`
+        #                 (head_dim -> proj_size)          (GLM-5.3-Flash)
+        # The low-rank form exactly mirrors the f_a/f_b pair that always was
+        # low-rank, so the layouts differ only in where the gate comes from.
+        #
+        # A caller that knows its checkpoint passes `lowrank_out_gate`
+        # explicitly. Inferring it from a MISSING `use_full_rank_gate` key is
+        # not safe -- GLM-5.3 omits the key yet is low-rank, while a Kimi config
+        # that omits it is full-rank -- so absence falls back to Kimi's meaning
+        # and GLM states its layout outright.
+        if lowrank_out_gate is None:
+            lowrank_out_gate = not (
+                getattr(config, "linear_attn_config", {}) or {}
+            ).get("use_full_rank_gate", True)
+        self.lowrank_out_gate = bool(lowrank_out_gate)
         self.hidden_size = config.hidden_size
         self.num_heads = config.linear_num_key_heads
         self.head_dim = config.linear_key_head_dim
@@ -840,14 +953,11 @@ class KimiKDAAttention(nn.Module):
         # The top-level model maps four separate checkpoint projections
         # directly into this fused [q | k | v | g] parameter. Mapping keys
         # include the KDA layer index so KimiFullAttention.g_proj is untouched.
+        # [q | k | v] always; `g` joins only when the gate is full-rank.
+        in_proj_shards = [self.proj_size] * (3 if self.lowrank_out_gate else 4)
         self.in_proj = MergedColumnParallelLinear(
             self.hidden_size,
-            [
-                self.proj_size,
-                self.proj_size,
-                self.proj_size,
-                self.proj_size,
-            ],
+            in_proj_shards,
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.in_proj",
@@ -911,6 +1021,23 @@ class KimiKDAAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.f_b_proj",
         )
+        if self.lowrank_out_gate:
+            # g_a rides the fused in_proj (it consumes hidden_states); g_b is a
+            # second GEMM on g_a's output, exactly like f_b on f_a's.
+            self.g_a_proj = ReplicatedLinear(
+                self.hidden_size,
+                self.head_dim,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.g_a_proj",
+            )
+            self.g_b_proj = ColumnParallelLinear(
+                self.head_dim,
+                self.proj_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.g_b_proj",
+            )
         o_type, o_dtype = _effective_layer_quant(quant_config, f"{prefix}.o_proj")
         self.o_norm = KimiRMSNormGated(
             self.head_dim,
@@ -936,6 +1063,8 @@ class KimiKDAAttention(nn.Module):
 
     def get_streaming_deferred_modules(self) -> tuple[nn.Module, ...]:
         """Children that must remain unquantized until KDA fuses their weights."""
+        if self.lowrank_out_gate:
+            return self.in_proj, self.f_a_proj, self.g_a_proj
         return self.in_proj, self.f_a_proj
 
     def process_weights_after_loading(self) -> None:
@@ -954,11 +1083,13 @@ class KimiKDAAttention(nn.Module):
         ``hidden_states``, so it is a data-dependent second GEMM and cannot ride
         the same launch.
 
-        Fused output width is ``4*local_proj + num_local_heads + head_dim``. The
-        two small tails (``b`` = num_local_heads, ``f_a`` = head_dim) make N a
-        non-multiple of the GEMM tile, so the fused shape may fall back to an
-        untuned tgemm config until one is tuned for it; the saved launches
-        dominate on the launch-bound decode path.
+        Fused output width is ``4*local_proj + num_local_heads + head_dim``
+        with a full-rank gate, and ``3*local_proj + num_local_heads +
+        2*head_dim`` with a low-rank one (``g_a`` becomes a third tail while
+        ``g`` leaves the q|k|v block). The small tails make N a non-multiple of
+        the GEMM tile, so the fused shape may fall back to an untuned tgemm
+        config until one is tuned for it; the saved launches dominate on the
+        launch-bound decode path.
 
         Assumes bf16 (unquantized) attention weights, which the Kimi-K3
         checkpoint guarantees (``re:.*self_attn.*`` is in the quant ignore
@@ -968,9 +1099,14 @@ class KimiKDAAttention(nn.Module):
         if getattr(self, "_in_proj_fused", False):
             return
         # Order defines the forward-time slice boundaries below; keep in sync.
-        # in_proj already holds the fused [q | k | v | g] (4 * local_proj_size);
-        # b_proj and f_a_proj are appended as the two tails.
-        tails = (self.b_proj, self.f_a_proj)
+        # in_proj already holds [q | k | v | g] (full-rank gate) or [q | k | v]
+        # (low-rank gate); every other hidden_states consumer is appended as a
+        # tail -- g_a exists only in the low-rank layout.
+        tails = (
+            (self.b_proj, self.f_a_proj, self.g_a_proj)
+            if self.lowrank_out_gate
+            else (self.b_proj, self.f_a_proj)
+        )
         assert all(m.quant_type == QuantType.No for m in (self.in_proj, *tails)), (
             "KDA in-proj fusion assumes unquantized (bf16) attention weights; "
             "this checkpoint quantizes self_attn projections."
@@ -1091,20 +1227,33 @@ class KimiKDAAttention(nn.Module):
         nlh = self.num_local_heads
         hd = self.head_dim
         fused_in = self.in_proj(hidden_states, x_scale=hidden_states_scale)
+        # Slice boundaries follow the tail order fixed in
+        # process_weights_after_loading:
+        #   full-rank gate: [q|k|v|g] b f_a
+        #   low-rank gate:  [q|k|v]   b f_a g_a
+        # `qkv_end` is where the q|k|v block stops and the tails begin.
+        qkv_end = 3 * lp if self.lowrank_out_gate else 4 * lp
         # No .contiguous() needed: mixed_qkv is a column slice (feature stride 1,
         # row stride N_fused). Both causal-conv consumers read the token stride
         # from the tensor itself — causal_conv1d_fn uses x.stride(1) after
         # transpose (channel-last: stride(0)==1), and causal_conv1d_update only
         # requires x.stride(1)==1 (feature-contiguous, which the slice preserves).
         mixed_qkv = fused_in[..., : 3 * lp]
-        out_gate = fused_in[..., 3 * lp : 4 * lp]
         # beta is widened to fp32 inside _run_kda (see the note there): the KDA
         # delta-rule write strength must stay fp32 for accuracy.
-        beta = fused_in[..., 4 * lp : 4 * lp + nlh].unsqueeze(0)
+        beta = fused_in[..., qkv_end : qkv_end + nlh].unsqueeze(0)
         # f_a feeds a second GEMM (f_b_proj); make it contiguous so tgemm sees a
         # unit row stride rather than the fused output's N_fused stride.
-        f_a = fused_in[..., 4 * lp + nlh : 4 * lp + nlh + hd].contiguous()
+        f_a = fused_in[..., qkv_end + nlh : qkv_end + nlh + hd].contiguous()
         gate = self.f_b_proj(f_a)
+        if self.lowrank_out_gate:
+            # Low-rank output gate: the second half of the same pattern as f_a
+            # -> f_b_proj. g_a is the last tail of the fused GEMM.
+            g_a_start = qkv_end + nlh + hd
+            g_a = fused_in[..., g_a_start : g_a_start + hd].contiguous()
+            out_gate = self.g_b_proj(g_a)
+        else:
+            out_gate = fused_in[..., 3 * lp : 4 * lp]
         gate = rearrange(gate, "t (h d) -> 1 t h d", d=self.head_dim)
         # Allocate from fused_in (bf16), not hidden_states, which may be fp8.
         out = fused_in.new_empty(
@@ -1153,6 +1302,20 @@ class KimiKDAAttention(nn.Module):
             initial = gather_kda_initial_state(
                 ssm_state, state_indices_in, kda_metadata.has_initial_state
             )
+            if _KDA_DBG and not _kda_dbg_capturing():
+                # A brand-new sequence MUST start from an all-zero recurrent
+                # state. If this reads non-zero, the layer is resuming from
+                # whatever the profile run or a previous request left in the
+                # slot, which makes identical requests produce different text.
+                self._kda_dbg_initial = (
+                    float(initial.abs().max()),
+                    (
+                        [int(b) for b in kda_metadata.has_initial_state[:4].tolist()]
+                        if kda_metadata.has_initial_state is not None
+                        else None
+                    ),
+                    [int(i) for i in state_indices_in[:4].tolist()],
+                )
             kda_out, last_state = self._run_kda(
                 q,
                 k,
@@ -1261,6 +1424,24 @@ class KimiKDAAttention(nn.Module):
         else:
             out.zero_()
 
+        if _KDA_DBG and not _kda_dbg_capturing():
+            if kda_metadata.num_prefills > 0:
+                _phase = "prefill"
+            elif kda_metadata.num_decodes > 0:
+                _phase = "decode"
+            elif kda_metadata.num_spec_decodes > 0:
+                _phase = "spec"
+            else:
+                _phase = "none"
+            _kda_dbg_gate(self, out, gate, out_gate, _phase)
+            _init = getattr(self, "_kda_dbg_initial", None)
+            if _init is not None and _phase == "prefill":
+                print(
+                    f"[kda-init] layer={_kda_layer_num(self)} initial_absmax={_init[0]:.6f}"
+                    f" has_initial_state={_init[1]} slots={_init[2]}",
+                    flush=True,
+                )
+                self._kda_dbg_initial = None
         normed = self.o_norm(
             out, rearrange(out_gate, "t (h d) -> t h d", d=self.head_dim)
         )

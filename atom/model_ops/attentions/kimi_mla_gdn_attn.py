@@ -9,7 +9,7 @@ from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mla import MLAAttention
 from atom.utils import envs
 
-from .aiter_mla import AiterMLAMetadataBuilder
+from .aiter_mla import AiterMLAMetadataBuilder, mla_kv_entry_dim
 from .backends import AttentionBackend
 from .gdn_attn import GDNStateMixin
 from .sub_pool_spec import SubPoolSpec, page_pool
@@ -67,10 +67,24 @@ class _KimiMLAGDNCommon(GDNStateMixin):
         runner = self.model_runner
         config = runner.config
         hf = config.hf_config
-        entry = hf.kv_lora_rank + hf.qk_rope_head_dim
+        entry = mla_kv_entry_dim(hf)
         kv_dtype_size = dtypes.d_dtypes[config.kv_cache_dtype].itemsize
         block_bytes = self._num_cache_rows() * runner.block_size * entry * kv_dtype_size
+        if runner.is_deepseek_v32:
+            # Sparse-indexer key cache rides the same paged pool (GLM-5.3-Flash).
+            index_cache_layer_ids, _ = self._index_cache_layout()
+            block_bytes += (
+                len(index_cache_layer_ids)
+                * runner.block_size
+                * self._aligned_index_dim()
+                * dtypes.fp8.itemsize
+            )
         return [page_pool(block_bytes), self.state_spec()]
+
+    def _aligned_index_dim(self) -> int:
+        """Indexer entry width, padded to 16B so inductor sees aligned rows."""
+        hf = self.model_runner.config.hf_config
+        return ((hf.index_head_dim + 4 + 15) // 16) * 16
 
     def allocate_kv_cache_tensors(
         self, num_kv_heads: int, num_draft_layers: int
@@ -80,8 +94,8 @@ class _KimiMLAGDNCommon(GDNStateMixin):
         config = runner.config
         hf = config.hf_config
         num_layers = self._num_cache_rows()
-        entry = hf.kv_lora_rank + hf.qk_rope_head_dim
-        return {
+        entry = mla_kv_entry_dim(hf)
+        out: dict = {
             "kv_cache": torch.zeros(
                 num_layers,
                 runner.num_physical_kvcache_blocks,
@@ -91,6 +105,29 @@ class _KimiMLAGDNCommon(GDNStateMixin):
                 device="cuda",
             )
         }
+        if runner.is_deepseek_v32:
+            # Sparse indexer key cache, one compact row per indexer-owning
+            # layer. Mirrors AiterMLAMetadataBuilder.allocate_kv_cache_tensors,
+            # which this mixin shadows.
+            aligned = self._aligned_index_dim()
+            index_cache_layer_ids, _ = self._index_cache_layout()
+            out["aligned_index_dim"] = aligned
+            out["index_cache_layer_ids"] = index_cache_layer_ids
+            out["index_cache_layer_map"] = {
+                global_layer_id: compact_layer_id
+                for compact_layer_id, global_layer_id in enumerate(
+                    index_cache_layer_ids
+                )
+            }
+            out["index_cache"] = torch.zeros(
+                len(index_cache_layer_ids),
+                runner.num_physical_kvcache_blocks,
+                runner.physical_block_size,
+                aligned,
+                dtype=dtypes.fp8,
+                device="cuda",
+            )
+        return out
 
     def build_kv_cache_tensor(self, layer_id: int, module):
         from atom.config import KVCacheTensor
@@ -120,9 +157,23 @@ class _KimiMLAGDNCommon(GDNStateMixin):
                 f"MLA cache row {row} for model layer {layer_id} "
                 f"exceeds {allocated_rows} allocated rows"
             )
-            entry = hf.kv_lora_rank + hf.qk_rope_head_dim
+            entry = mla_kv_entry_dim(hf)
             kv_cache = runner.kv_cache[row].view(-1, 1, entry)
             module.max_model_len = runner.config.max_model_len
+            if runner.is_deepseek_v32 and getattr(module, "indexer", None) is not None:
+                if layer_id not in runner.index_cache_layer_map:
+                    raise RuntimeError(
+                        "Sparse MLA indexer layer is missing from the compact "
+                        f"index cache layout: layer_num={layer_id}"
+                    )
+                index_cache = runner.index_cache[
+                    runner.index_cache_layer_map[layer_id]
+                ]
+                module.indexer.k_cache.kv_cache[0] = index_cache.view(
+                    runner.num_physical_kvcache_blocks * runner.physical_block_size,
+                    1,
+                    runner.aligned_index_dim,
+                )
             module.kv_cache = kv_cache
             return KVCacheTensor(
                 layer_num=layer_id,

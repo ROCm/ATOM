@@ -623,6 +623,7 @@ _MULTIMODAL_MODEL_TYPES: dict[str, str] = {
     "qwen3_5": "text_config",
     "qwen3_5_moe": "text_config",
     "mistral3": "text_config",
+    "glm5_next": "text_config",
 }
 
 # multimodal models fully supported by plugin mode
@@ -668,10 +669,15 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
         ):
             text_config_dict["quantization_config"] = config_dict["quantization_config"]
         text_model_type = text_config_dict.get("model_type", "deepseek_v3")
-        if text_model_type == "kimi_linear":
-            # Transformers does not ship KimiLinearConfig yet in this image.
-            # Keep the remote-code fields as plain PretrainedConfig attrs; the
-            # ATOM model normalizes the aliases it needs at construction time.
+        if text_model_type in ("kimi_linear", "glm5_next_text"):
+            # Transformers ships no schema for these in this image. Mapping them
+            # onto a near neighbour (e.g. deepseek_v3) would make
+            # `from_dict` silently DROP every field the neighbour does not
+            # declare -- for glm5_next_text that is layer_types,
+            # linear_attn_config, index_kpool, the hc_* group and swiglu_limit,
+            # i.e. most of what defines the architecture. Keep the fields
+            # verbatim as plain PretrainedConfig attrs; the ATOM model
+            # normalizes the aliases it needs at construction time.
             hf_config = PretrainedConfig.from_dict(text_config_dict)
         else:
             mapped_type = _CONFIG_REGISTRY.get(text_model_type, text_model_type)
