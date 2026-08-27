@@ -246,6 +246,7 @@ apply_prefixed_env() {
   while IFS='=' read -r name raw; do
     [[ "${name}" == "${prefix}"* ]] || continue
     value="${raw//\$\{ROLE_IP\}/${role_ip}}"
+    value="${value//\$\{HANDSHAKE_PORT\}/${HANDSHAKE_PORT}}"
     export "${name#${prefix}}=${value}"
   done < <(env)
 }

@@ -206,7 +206,9 @@ def role_env(
         model_cfg.get("env", {}).get(role, {}),
         suite_cfg.get("env", {}).get(role, {}),
     )
-    env = resolve_env_refs_in_value(env, preserve_names={"ROLE_IP"})
+    # ROLE_IP and HANDSHAKE_PORT are filled in by pd_server_atom.sh at
+    # launch time (host IP and 6301 + ATOMESH_SERVICE_PORT_OFFSET).
+    env = resolve_env_refs_in_value(env, preserve_names={"ROLE_IP", "HANDSHAKE_PORT"})
     return {str(key): str(value) for key, value in env.items()}
 
 
@@ -295,12 +297,7 @@ def build_cell(
                 f"{required_nodes} node(s)"
             )
         nodes = nodes[:required_nodes]
-    elif nodes and len(nodes) < required_nodes:
-        raise ValueError(
-            f"{suite_cfg.get('name', model_name)} needs at least "
-            f"{required_nodes} node(s)"
-        )
-    elif not nodes and not allow_auto_nodes:
+    elif nodes and len(nodes) < required_nodes or not nodes and not allow_auto_nodes:
         raise ValueError(
             f"{suite_cfg.get('name', model_name)} needs at least "
             f"{required_nodes} node(s)"
