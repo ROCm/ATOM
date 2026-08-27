@@ -68,7 +68,7 @@ def reuse_identical_rank_groups():
             for field in _COORD_FIELDS:
                 setattr(self, field, getattr(source, field))
 
-    built: dict[tuple[tuple[int, ...], ...], "ps.GroupCoordinator"] = {}
+    built: dict[tuple[tuple[int, ...], ...], ps.GroupCoordinator] = {}
     original = ps.init_model_parallel_group
 
     def init_or_alias(
