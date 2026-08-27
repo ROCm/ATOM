@@ -249,6 +249,25 @@ class StateSlotPool:
         if self.enabled:
             self._speculative.add(slot)
 
+    @staticmethod
+    def _anchor_of(seq) -> int | None:
+        """The one position this seq *knows* is a resume point, or None.
+
+        None and 0 are different answers and the distinction is the whole
+        policy: 0 would be a position, None means this seq has no known
+        position at all and therefore everything it files is a guess.
+        `_record_checkpoint_end` leaves `checkpoint_end_pos` at 0 on four
+        paths, so reading the attribute directly conflates "not the anchor"
+        with "no anchor exists" and demotes nothing in the second case.
+
+        None compares unequal to every real position, so a caller that tests
+        `pos != known` demotes everything -- which is what a seq with no known
+        resume point should do. Whether to demote at all is the caller's
+        separate question; see `publish_midstep` for `seq=None`.
+        """
+        pos = getattr(seq, "checkpoint_end_pos", 0) if seq is not None else 0
+        return pos or None
+
     def promote(self, slot: int) -> None:
         """A guess paid off: stop spending this one first.
 
@@ -513,13 +532,26 @@ class StateSlotPool:
         A position that is not this prompt's own end is marked speculative and
         goes to the LRU head — the ladder rung and the demand guess where the
         next turn will resume, the anchor knows; `mark_speculative` gives what
-        the difference measures. `seq` is optional so a caller with no sequence
-        in hand still publishes, as the anchor, which is the conservative half
-        of the choice.
+        the difference measures.
+
+        A seq with no anchor at all has *only* guesses, so all of them demote.
+        Reading `anchor == 0` as "demote nothing" is the inversion this exists
+        to prevent: `_record_checkpoint_end` leaves the anchor at 0 on four
+        paths, including every prompt too short to have a keepable end — the
+        majority of agentic first turns — and those seqs would then file ladder
+        and demand rungs at the LRU tail beside the genuine anchors of long
+        prompts, which are read back 85.2% of the time against their 2.8%.
+        Under pressure the pool would spend the anchors first.
+
+        `seq=None` demotes nothing, which is the other end of the same rule
+        rather than an exception to it: a caller with no sequence in hand
+        cannot tell a guess from knowledge, and over-keeping is the recoverable
+        error where over-demoting is not.
         """
-        anchor = getattr(seq, "checkpoint_end_pos", 0) if seq is not None else 0
+        demotes = seq is not None
+        known = self._anchor_of(seq)
         for slot, pos, h in reservations:
-            if anchor and pos != anchor:
+            if demotes and pos != known:
                 self.mark_speculative(slot)
             self._index(h, slot)
             self.release(slot)
@@ -555,8 +587,8 @@ class StateSlotPool:
         if not self.has_free():
             self.checkpoints_dropped += 1
             return
-        anchor = getattr(seq, "checkpoint_end_pos", 0)
-        guess = bool(anchor) and boundary_blocks * self.hash_block_size != anchor
+        known = self._anchor_of(seq)
+        guess = known is None or boundary_blocks * self.hash_block_size != known
         seq.state_slot = self.pop()
         seq.state_fork_src = old
         # Not released: `state_fork_src` names `old` as what this request's

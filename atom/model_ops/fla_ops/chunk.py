@@ -42,6 +42,7 @@ def chunk_gated_delta_rule_fwd(
     output_final_state: bool,
     cu_seqlens: torch.LongTensor | None = None,
     o: torch.Tensor | None = None,
+    keep_intermediate_states: bool = False,
 ):
     B, T = q.shape[0], q.shape[1]
     Hv = g.shape[2]
@@ -106,13 +107,27 @@ def chunk_gated_delta_rule_fwd(
         o=o,
     )
     # `h` is the recurrent state at EVERY chunk boundary — [B, NT, H, K, V],
-    # where h[:, j] is the state after j*chunk_size tokens. Returned whatever
-    # `SUPPRESS_LEVEL` says, because the SSM state cache reads checkpoints
-    # straight out of it: that is what lets a checkpoint be taken at an
-    # interior position without splitting the prefill into two forwards. The
-    # kernel computes it either way, so returning it costs nothing — only `w`
-    # is genuinely suppressed.
-    return g, o, A, final_state, (w if SUPPRESS_LEVEL >= 3 else None), h, v_new
+    # where h[:, j] is the state after j*chunk_size tokens. The SSM state cache
+    # reads checkpoints straight out of it, which is what lets a checkpoint be
+    # taken at an interior position without splitting the prefill into two
+    # forwards.
+    #
+    # Returned only when a caller asked for it. The kernel computes it either
+    # way, so returning it costs no compute — but it costs *lifetime*: handed
+    # back unconditionally, the caller's frame pins ~33 MB (T=8192, H=8,
+    # K=V=128) for the rest of that layer's forward, on every GDN prefill with
+    # checkpointing off, which is the default and every non-ATOM plugin caller.
+    # That raises the allocator high-water mark KV sizing is computed against,
+    # for nobody. Dropping the reference here frees it with the fwd frame.
+    return (
+        g,
+        o,
+        A,
+        final_state,
+        (w if SUPPRESS_LEVEL >= 3 else None),
+        (h if keep_intermediate_states else None),
+        v_new,
+    )
 
 
 class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
@@ -170,15 +185,17 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
             o=o,
+            keep_intermediate_states=keep_intermediate_states,
         )
         ctx.scale = scale
         ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
         # Per-chunk states, for the SSM state cache. Parked on the class so the
         # (fixed) 2-tuple return contract stays intact for every existing
-        # caller, including the vLLM and rtpllm plugins. Cleared rather than
-        # left alone when not asked for: a stale `h` from an earlier step is
-        # the wrong shape *and* the wrong tokens, and `pop` has no way to tell.
-        ChunkGatedDeltaRuleFunction.last_h = h if keep_intermediate_states else None
+        # caller, including the vLLM and rtpllm plugins. `h` is already None
+        # unless asked for -- assigned rather than skipped because a stale one
+        # from an earlier step is the wrong shape *and* the wrong tokens, and
+        # `pop` has no way to tell.
+        ChunkGatedDeltaRuleFunction.last_h = h
         # Skip the dtype cast when it's a no-op so the caller's buffer is
         # the literal returned tensor (preserves the inplace contract).
         if o.dtype != q.dtype:

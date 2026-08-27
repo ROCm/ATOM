@@ -12,6 +12,7 @@
 # Copy-transfer checkpoints are immutable PAGE-unit images; Active Slots are
 # reserved only for resident requests and never serve as checkpoint backing.
 
+import logging
 from math import inf, isinf
 from types import SimpleNamespace
 
@@ -313,6 +314,39 @@ class TestFreeListHalves:
 
         assert pool.pop() == 1
         assert pool.lookup(10) == 0
+
+    def test_a_seq_with_no_anchor_files_only_guesses(self):
+        """`checkpoint_end_pos == 0` means no known resume point, not "0 is it".
+
+        `_record_checkpoint_end` leaves the anchor at 0 on four paths, one of
+        which is every prompt too short to have a keepable end. Reading that as
+        "nothing to demote" files those seqs' ladder and demand rungs at the
+        LRU tail beside the real anchors of long prompts -- and then spends the
+        anchors first, which is the ordering `mark_speculative` exists to
+        invert.
+        """
+        pool = StateSlotPool(4)
+        drain(pool)
+        anchored = SimpleNamespace(checkpoint_end_pos=64)
+        unanchored = SimpleNamespace(checkpoint_end_pos=0)
+
+        pool.publish_midstep([(0, 64, 10)], anchored)
+        pool.publish_midstep([(1, 32, 11)], unanchored)
+
+        assert 0 not in pool._speculative, "the anchor's own position is known"
+        assert 1 in pool._speculative, "a seq with no anchor has only guesses"
+        assert pool.pop() == 1, "and the guess is spent first"
+
+    def test_publishing_without_a_seq_demotes_nothing(self):
+        """The caller cannot tell a guess from knowledge, so it keeps.
+
+        Over-keeping costs one eviction later; over-demoting spends an anchor
+        that would have been read back, and there is no way to get it back.
+        """
+        pool = StateSlotPool(4)
+        drain(pool)
+        pool.publish_midstep([(0, 32, 10), (1, 64, 11)], None)
+        assert not pool._speculative
 
     def test_speculative_checkpoints_keep_lru_among_themselves(self):
         pool = StateSlotPool(4)
@@ -2599,14 +2633,29 @@ class TestCacheStatsAttribution:
         assert stats.state_recoverable_loss_rate == 0.25
         assert stats.state_hit_rate + stats.state_recoverable_loss_rate == 0.875
 
-    def test_the_nesting_invariant_is_enforced_not_assumed(self):
-        """Every rate is a difference of two totals, so a violation reports a
-        negative percentage rather than failing. Catch it at the source."""
+    def test_a_violated_ordering_is_clamped_not_fatal(self, caplog):
+        """Every rate is a difference of two totals, so an out-of-order update
+        would report a negative percentage. Clamp it, and say so.
+
+        Not an assert: `num_cached_tokens` has four independent writers and the
+        CPU-offload wake can legitimately load more prefix than the GPU index
+        held, so an `AssertionError` here would take the engine down to protect
+        a log line -- and only in builds without `-O`, so the two would differ
+        in behaviour.
+        """
         stats = CacheStats(log_interval=10**6)
-        with pytest.raises(AssertionError, match="nesting"):
+        with caplog.at_level(logging.WARNING):
             stats.update(50, 128, 40, 45, 100)  # cached > compressed
-        with pytest.raises(AssertionError, match="ceiling"):
             stats.update(50, 128, 90, 60, 80)  # compressed > reusable
+
+        assert stats.total_requests == 2, "both were counted, neither raised"
+        assert sum("clamping" in r.message for r in caplog.records) == 2
+        # Clamped into order, so every rate stays inside [0, 1].
+        assert 0.0 <= stats.hit_rate <= 1.0
+        assert 0.0 <= stats.paged_hit_rate <= 1.0
+        assert 0.0 <= stats.state_hit_rate <= 1.0
+        assert stats.total_cached_tokens <= stats.total_compressed_tokens
+        assert stats.total_compressed_tokens <= stats.total_reusable_tokens
 
     def test_hit_tokens_are_counted_in_hash_blocks(self):
         """Under DCP one block_table entry spans `dcp` blocks of tokens."""

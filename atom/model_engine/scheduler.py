@@ -236,14 +236,39 @@ class CacheStats:
         here would mean duplicating that rule in a second place and letting the
         two drift.
         """
-        assert num_cached_tokens <= num_wanted_tokens <= num_compressed_tokens, (
-            "CacheStats nesting violated: "
-            f"{num_cached_tokens=} {num_wanted_tokens=} {num_compressed_tokens=}"
+        ordered = (
+            num_cached_tokens
+            <= num_wanted_tokens
+            <= num_compressed_tokens
+            <= num_reusable_tokens
+            <= num_full_tokens
         )
-        assert num_compressed_tokens <= num_reusable_tokens <= num_full_tokens, (
-            "CacheStats ceiling violated: "
-            f"{num_compressed_tokens=} {num_reusable_tokens=} {num_full_tokens=}"
-        )
+        if not ordered:
+            # Warned and clamped, not asserted. These are logging counters, and
+            # `num_cached_tokens` has four independent writers -- the CPU-offload
+            # wake at `_wake_offloaded_seq` sets it without touching the two
+            # hit-block counters `can_allocate` derives the rest from, so an
+            # LMCache resume that loads more prefix than the GPU index held
+            # produces `cached > wanted` legitimately. Aborting `schedule()`
+            # over it would take the engine down to protect a log line, and
+            # would do so only in builds without `-O`, so the two would differ
+            # in behaviour. Clamping keeps the rates monotone and the run alive.
+            logger.warning(
+                "CacheStats ordering violated, clamping: cached=%d wanted=%d "
+                "compressed=%d reusable=%d full=%d",
+                num_cached_tokens,
+                num_wanted_tokens,
+                num_compressed_tokens,
+                num_reusable_tokens,
+                num_full_tokens,
+            )
+            num_full_tokens = max(num_full_tokens, 0)
+            num_reusable_tokens = min(max(num_reusable_tokens, 0), num_full_tokens)
+            num_compressed_tokens = min(
+                max(num_compressed_tokens, 0), num_reusable_tokens
+            )
+            num_wanted_tokens = min(max(num_wanted_tokens, 0), num_compressed_tokens)
+            num_cached_tokens = min(max(num_cached_tokens, 0), num_wanted_tokens)
         self.total_requests += 1
         self.total_cached_tokens += num_cached_tokens
         self.total_full_tokens += num_full_tokens

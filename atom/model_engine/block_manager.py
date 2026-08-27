@@ -543,11 +543,21 @@ class BlockManager:
             protected_hash=protected_hash,
         )
         self._record_checkpoint_end(seq)
-        # Last, because it reads `checkpoint_end_pos` to decide how far the
-        # chain has to reach.
-        self._extend_hash_chain(seq, block_hashes)
         if not self._has_page_units(num_new_blocks, protected_hash):
             return -1
+        # After the refusal, not before it. The chain is O(prompt) xxhash plus
+        # two temporaries per block, and a refused admission discards it — a
+        # 128k prompt queued behind a full pool paid ~2000 rounds per waiting
+        # request per scheduling pass for a list nobody read. Nothing above
+        # consumes it: `_record_checkpoint_demand` takes `block_hashes` as an
+        # argument, and `_record_checkpoint_end` derives its position from
+        # `num_prompt_tokens` alone. Its one reader is `midstep_positions`.
+        #
+        # Which makes it free today: the call returns at its first line while
+        # no backend declares `readable_midstep` (see
+        # `GDNStateMixin.state_transfer`). Kept in place, and in the right
+        # place, because that is a policy decision and this is not.
+        self._extend_hash_chain(seq, block_hashes)
         return num_cached_blocks
 
     def allocate(self, seq: Sequence, num_cached_blocks: int = 0):
