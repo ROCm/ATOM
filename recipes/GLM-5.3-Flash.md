@@ -119,8 +119,28 @@ llvm/ADT/Sequence.h:275: iota_range(T, T, bool): Assertion `Begin <= End' failed
 
 Independent of (a) — it still fires after the forget-gate fix. Every block-FP8 Linear
 and the MoE experts route through this kernel, so no FP8 `glm5_next` forward runs on
-MI355X without a substitute. Worked around with a torch-only dequant bundle for the
-reference run; ATOM will use its own aiter block-FP8 GEMMs and is unaffected.
+MI355X without a substitute. Replaced with `fp8_aiter_backend.py`, which routes to
+`aiter.gemm_a8w8_blockscale` — the block-FP8 GEMM ATOM already ships — and matches a
+torch dequant reference at cosine 0.9997 (the residual is FP8 activation quant, which
+is what the checkpoint was trained for).
+
+**c) aiter kernels launch on the current CUDA device, not the tensor's device.**
+Found while wiring (b). With a multi-GPU `device_map`, accelerate's hooks move tensors
+to `cuda:1..3` but never change the CUDA context, so `torch.cuda.current_device()`
+stays `0`. Ordinary torch ops dispatch on the tensor's device; aiter's do not — they
+launch on the current device and silently read and write the wrong GPU's memory:
+
+```
+[fp8-verify] FAIL in grouped_matmul call #21: finite=False
+    devices: ['cuda:1', 'cuda:1', 'cuda:1'] current=0
+```
+
+All inputs were finite and well-scaled; the output came back NaN. It reproduces only
+past the first device boundary, so the first ~20 calls look fine — the failure mode is
+a model that loads, runs, and emits garbage. transformers warns about exactly this for
+DeepGEMM in its FP8 loader; aiter has the same constraint and no such guard. Fixed by
+wrapping every aiter call in `with torch.cuda.device(tensor.device)`. Not a concern for
+ATOM proper (one device per rank), but it bites any multi-device single-process use.
 
 ## 5. Reference oracle
 
@@ -135,8 +155,25 @@ The harness lives in [`recipes/glm5_3_flash/`](glm5_3_flash):
 | --- | --- |
 | `Dockerfile` | ROCm torch 2.10 + transformers 5.16.1 reference image (`glm53-ref:tf5161`) |
 | `ref_run.py` | loads the checkpoint, dumps oracle logits, generates |
-| `fp8_torch_fallback.py` | torch-only stand-in for the broken gfx950 FP8 Triton kernel (§4b) |
+| `fp8_aiter_backend.py` | routes block-FP8 through `aiter.gemm_a8w8_blockscale` (default) |
+| `fp8_torch_fallback.py` | torch-only dequant bundle; slower, BF16 activations, cross-check |
+| `aiter_fp8_check.py` | aiter block-FP8 GEMM vs torch dequant on a real GLM weight |
 | `kpool_parity_atom.py` | ATOM k-pool op vs `transformers`, on real weights |
+
+Env knobs on `ref_run.py`: `GLM53_FP8_BACKEND=aiter|torch`, `GLM53_MAX_NEW_TOKENS`,
+`GLM53_FP8_VERIFY=1` (runs both backends every call and reports the first divergence
+with shapes and devices — how §4c was found).
+
+Measured on 4× MI355X, 21-token prompt, greedy:
+
+| FP8 backend | decode |
+| --- | --- |
+| `aiter` (`gemm_a8w8_blockscale`) | 4.25 tok/s |
+| `torch` (dequant reference) | 2.68 tok/s |
+
+Both are far off what ATOM will do — this path is `device_map="auto"` pipeline
+parallelism with one GPU active at a time, eager attention, no paged KV, a Python
+loop over experts, and the dense k-pool indexer. It exists to be *correct*, not fast.
 
 On the bring-up machine: weights at `/raid/carhuang/models/GLM-5.3-Flash`
 (62 shards, 305.8 GiB, verified), oracle logits at

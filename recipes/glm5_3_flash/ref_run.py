@@ -9,13 +9,28 @@ import json
 import os
 import time
 
-import fp8_torch_fallback
 import torch
 from transformers import AutoConfig, AutoModelForImageTextToText, AutoTokenizer
 
 MP = "/models/GLM-5.3-Flash"
 OUT = "/out"
 PROMPT = "Give three reasons why the sky appears blue."
+# "aiter"  -> ATOM's gemm_a8w8_blockscale (fast, FP8 activations as trained)
+# "torch"  -> pure-torch dequant (slow, BF16 activations; useful as a cross-check)
+FP8_BACKEND = os.environ.get("GLM53_FP8_BACKEND", "aiter")
+MAX_NEW_TOKENS = int(os.environ.get("GLM53_MAX_NEW_TOKENS", "32"))
+
+
+def install_fp8_backend() -> None:
+    """Replace the hub FP8 kernel, which does not compile on gfx950."""
+    if FP8_BACKEND == "aiter":
+        import fp8_aiter_backend
+
+        fp8_aiter_backend.install(verify=os.environ.get("GLM53_FP8_VERIFY") == "1")
+    else:
+        import fp8_torch_fallback
+
+        fp8_torch_fallback.install()
 
 
 def unfp8_stray_bf16_linears(model) -> None:
@@ -53,9 +68,9 @@ def unfp8_stray_bf16_linears(model) -> None:
 
 
 def main() -> None:
-    # The hub FP8 Triton kernel compiles to an LLVM assert on gfx950; swap in the
-    # torch-only bundle before anything can trigger a lazy load of the real one.
-    fp8_torch_fallback.install()
+    # The hub FP8 Triton kernel compiles to an LLVM assert on gfx950; swap in a
+    # working backend before anything can trigger a lazy load of the real one.
+    install_fp8_backend()
 
     t0 = time.time()
     cfg = AutoConfig.from_pretrained(MP)
@@ -149,7 +164,7 @@ def main() -> None:
     print("\n=== generation ===", flush=True)
     t1 = time.time()
     with torch.no_grad():
-        gen = model.generate(ids, max_new_tokens=32, do_sample=False)
+        gen = model.generate(ids, max_new_tokens=MAX_NEW_TOKENS, do_sample=False)
     text = tok.decode(gen[0, ids.shape[1] :], skip_special_tokens=False)
     dt = time.time() - t1
     ntok = gen.shape[1] - ids.shape[1]
