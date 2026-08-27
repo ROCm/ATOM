@@ -5,7 +5,7 @@ there run to thousands of tokens, and v1 of this model is only exact at or below
 `index_topk` (2048) tokens; and this one uses the same prompt as `ref_run.py` so
 the greedy continuation can be compared directly.
 
-  python -m recipes.glm5_3_flash.atom_run --model /models/GLM-5.3-Flash -tp 4
+  python -m tools.glm5_3_flash.atom_run --model /models/GLM-5.3-Flash -tp 4
 """
 
 import argparse

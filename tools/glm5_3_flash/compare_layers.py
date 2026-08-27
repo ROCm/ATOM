@@ -11,7 +11,7 @@ Produce the ATOM side first:
   ATOM_FWD_DUMP_DIR=/out/atomdump \\
   ATOM_FWD_DUMP_BLOCK_CLASS=Glm5NextDecoderLayer \\
   ATOM_FWD_DUMP_LAYER_ATTR=layer_num \\
-  ATOM_FWD_DUMP_LAYERS=0,1,2,3,4,5 python -m recipes.glm5_3_flash.atom_run ...
+  ATOM_FWD_DUMP_LAYERS=0,1,2,3,4,5 python -m tools.glm5_3_flash.atom_run ...
 """
 
 from __future__ import annotations

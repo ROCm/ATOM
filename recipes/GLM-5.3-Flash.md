@@ -9,7 +9,7 @@
 > that would let the server actually accept an image. See §7.
 
 ```bash
-python -m recipes.glm5_3_flash.atom_run --model /models/GLM-5.3-Flash -tp 4 \
+python -m tools.glm5_3_flash.atom_run --model /models/GLM-5.3-Flash -tp 4 \
     --kv-cache-dtype bf16 --enforce-eager --max-tokens 64
 ```
 
@@ -171,7 +171,7 @@ against. Loads in ~131 s across 4× MI355X and generates coherent text.
 
 Artifacts (on the bring-up machine):
 
-The harness lives in [`recipes/glm5_3_flash/`](glm5_3_flash):
+The harness lives in [`tools/glm5_3_flash/`](../tools/glm5_3_flash):
 
 | File | Purpose |
 | --- | --- |
@@ -202,12 +202,12 @@ On the bring-up machine: weights at `/raid/carhuang/models/GLM-5.3-Flash`
 `/raid/carhuang/glm53_out/ref_logits.pt` and `ref_top10.json`.
 
 ```bash
-docker build -t glm53-ref:tf5161 recipes/glm5_3_flash
+docker build -t glm53-ref:tf5161 tools/glm5_3_flash
 docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video \
   --shm-size 64G --ipc=host --privileged -e HIP_VISIBLE_DEVICES=0,1,2,3 \
   -v /raid/carhuang/models/GLM-5.3-Flash:/models/GLM-5.3-Flash:ro \
   -v /raid/carhuang/glm53_out:/out \
-  -v $PWD/recipes/glm5_3_flash:/w -w /w \
+  -v $PWD/tools/glm5_3_flash:/w -w /w \
   --entrypoint python3 glm53-ref:tf5161 -u ref_run.py
 ```
 
