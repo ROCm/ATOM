@@ -147,6 +147,8 @@ export SLURM_JOB_NAME="${PLUGIN_CI_CELL_ID}-${GITHUB_RUN_ID:-local}-${GITHUB_RUN
 export SLURM_OUTPUT="${LOG_ROOT}/slurm-%j.out"
 export SLURM_ERROR="${LOG_ROOT}/slurm-%j.err"
 export SLURM_CANCEL_HELPER="${RESULT_DIR}/${PLUGIN_CI_CELL_ID}.slurm-cancel.sh"
+SUBMIT_LOCK_FILE="${SLURM_SUBMIT_LOCK_FILE:-/shared_nfs/ATOM_PLUGIN_CI/.sbatch-submit.lock}"
+MAX_SUBMITTED_JOBS="${SLURM_MAX_SUBMITTED_JOBS:-3}"
 SLURM_LOG_POLL_INTERVAL="${SLURM_LOG_POLL_INTERVAL:-30}"
 USES_SPUR_CONTROLLER=1
 
@@ -156,6 +158,8 @@ echo "plugin=${PLUGIN_CI_PLUGIN}"
 echo "nodes=${NODE_LIST:-auto}"
 echo "slurm_job_name=${SLURM_JOB_NAME}"
 echo "log_root=${LOG_ROOT}"
+echo "submit_lock_file=${SUBMIT_LOCK_FILE}"
+echo "max_submitted_jobs=${MAX_SUBMITTED_JOBS}"
 
 mkdir -p "${RESULT_DIR}"
 
@@ -217,10 +221,49 @@ printf ' %q' "${SBATCH_CMD[@]}"
 echo
 write_slurm_cancel_helper ""
 
+if ! command -v flock >/dev/null 2>&1; then
+  echo "ERROR: flock not found; cannot serialize Slurm submissions" >&2
+  exit 127
+fi
+if ! [[ "${MAX_SUBMITTED_JOBS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: SLURM_MAX_SUBMITTED_JOBS must be a positive integer" >&2
+  exit 2
+fi
+mkdir -p "$(dirname "${SUBMIT_LOCK_FILE}")"
+exec 9>"${SUBMIT_LOCK_FILE}"
+echo "=== waiting for global Slurm submission lock ==="
+flock -x 9
+echo "=== acquired global Slurm submission lock ==="
+
+while true; do
+  if ! SLURM_USER_JOBS="$(
+    squeue --controller "${SPUR_CONTROLLER_ADDR}" \
+      --user "${CURRENT_USER}" \
+      --noheader \
+      --format="%A" 2>&1
+  )"; then
+    echo "WARNING: unable to query current Slurm jobs: ${SLURM_USER_JOBS}" >&2
+    flock -u 9
+    sleep "${SLURM_SUBMIT_SLOT_POLL_INTERVAL:-30}"
+    flock -x 9
+    continue
+  fi
+  SUBMITTED_JOB_COUNT="$(awk 'NF { count++ } END { print count + 0 }' <<< "${SLURM_USER_JOBS}")"
+  if [[ "${SUBMITTED_JOB_COUNT}" -lt "${MAX_SUBMITTED_JOBS}" ]]; then
+    break
+  fi
+  echo "=== Slurm submitted-job limit reached (${SUBMITTED_JOB_COUNT}/${MAX_SUBMITTED_JOBS}); waiting ==="
+  flock -u 9
+  sleep "${SLURM_SUBMIT_SLOT_POLL_INTERVAL:-30}"
+  flock -x 9
+done
+
 set +e
 SBATCH_OUTPUT="$("${SBATCH_CMD[@]}")"
 SBATCH_RC=$?
 set -e
+flock -u 9
+exec 9>&-
 echo "${SBATCH_OUTPUT}"
 
 if [[ "${SBATCH_RC}" -ne 0 ]]; then
