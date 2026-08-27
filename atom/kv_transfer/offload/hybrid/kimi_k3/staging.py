@@ -172,7 +172,9 @@ class StagedTransfer:
         stream and does not wait for the forward that wrote the entry. That
         wait is the caller's (`state_tier._do_spill`); see the class docstring.
         """
-        from atom.kv_transfer.offload.triton_kv_staging import fused_pack_chunk_major
+        from atom.kv_transfer.offload.dense.triton_kv_staging import (
+            fused_pack_chunk_major,
+        )
 
         segments = list(segments)
         seg_bytes = self._segment_block_bytes(segments)

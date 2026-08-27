@@ -138,7 +138,18 @@ class StateByteCodec:
         if obj is None:
             self.puts_refused += 1
             return False
-        self._staged.pack(self._backend.page_unit_views(unit_ids), obj)
+        # `batched_put` discharges the reference it is handed, so the success
+        # path owes nothing -- but only if it is reached. A throwing `pack`
+        # skips it and strands the allocation at ref_count=1, which LMCache
+        # reports much later as "garbage collected with ref_count=1,
+        # pin_count=0" and which shrinks the CPU pool by one entry per failure
+        # until the tier can no longer allocate at all. `get` already guards
+        # its own reference with `finally` for the same reason.
+        try:
+            self._staged.pack(self._backend.page_unit_views(unit_ids), obj)
+        except Exception:
+            obj.ref_count_down()
+            raise
         self._storage.batched_put([self.key(h)], [obj])
         return True
 
