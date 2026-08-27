@@ -50,6 +50,15 @@ if [ "$TYPE" == "launch" ]; then
   # Clear stale compile cache to avoid NameError from outdated generated code
   echo "Clearing compile cache..."
   rm -rf ~/.cache/atom/*
+  # AgentX concurrency counts SESSION TREES, not in-flight requests: one
+  # session fans out into subagent bursts, so the scheduler needs headroom the
+  # catalog cannot express (it does not know the cell's concurrency). Same 2x
+  # the InferenceX recipe uses.
+  AGENTIC_LAUNCH_ARGS=()
+  if [ "${BENCH_KIND:-random}" == "aiperf_agentic" ] && [ -n "${CONC:-}" ]; then
+    AGENTIC_LAUNCH_ARGS=(--max-num-seqs "$(( CONC * 2 ))")
+    echo "Agentic run: --max-num-seqs $(( CONC * 2 )) (2x concurrency ${CONC})"
+  fi
   PROFILER_ARGS=""
   if [ "${ENABLE_TORCH_PROFILER:-0}" == "1" ]; then
     PROFILER_ARGS="--torch-profiler-dir /app/trace --mark-trace"
@@ -74,9 +83,9 @@ if [ "$TYPE" == "launch" ]; then
   print_device_mapping_debug
   echo ""
   echo "========== ATOM server command =========="
-  echo "PYTHONUNBUFFERED=1 $RTL_CMD python -m atom.entrypoints.openai_server --model $MODEL_PATH ${SERVER_PORT_ARGS[@]} $PROFILER_ARGS ${EXTRA_ARGS[@]}"
+  echo "PYTHONUNBUFFERED=1 $RTL_CMD python -m atom.entrypoints.openai_server --model $MODEL_PATH ${SERVER_PORT_ARGS[@]} $PROFILER_ARGS ${EXTRA_ARGS[@]} ${AGENTIC_LAUNCH_ARGS[@]+${AGENTIC_LAUNCH_ARGS[@]}}"
   echo "=========================================="
-  PYTHONUNBUFFERED=1 $RTL_CMD python -m atom.entrypoints.openai_server --model "$MODEL_PATH" "${SERVER_PORT_ARGS[@]}" $PROFILER_ARGS "${EXTRA_ARGS[@]}" > "$ATOM_SERVER_LOG" 2>&1 &
+  PYTHONUNBUFFERED=1 $RTL_CMD python -m atom.entrypoints.openai_server --model "$MODEL_PATH" "${SERVER_PORT_ARGS[@]}" $PROFILER_ARGS "${EXTRA_ARGS[@]}" ${AGENTIC_LAUNCH_ARGS[@]+"${AGENTIC_LAUNCH_ARGS[@]}"} > "$ATOM_SERVER_LOG" 2>&1 &
   atom_server_pid=$!
   tail -f "$ATOM_SERVER_LOG" &
   _tail_launch_pid=$!
@@ -423,6 +432,7 @@ if [ "$TYPE" == "benchmark" ]; then
   echo "========== Running benchmark test =========="
   ATOM_CLIENT_LOG="${ATOM_CLIENT_LOG:-/tmp/atom_client.log}"
   RESULT_FILENAME=${RESULT_FILENAME:-benchmark_result}
+  BENCH_KIND="${BENCH_KIND:-random}"
   PROFILE_ARG=""
   if [ "${ENABLE_TORCH_PROFILER:-0}" == "1" ]; then
     PROFILE_ARG="--profile"
@@ -431,6 +441,40 @@ if [ "$TYPE" == "benchmark" ]; then
   # Build the benchmark command as an array so the printed command is exactly
   # what runs (no echo/cmd drift). $PROFILE_ARG and $BENCH_EXTRA_ARGS stay
   # unquoted so they word-split into 0+ args, matching the previous behavior.
+  # `aiperf_agentic` replays AgentX session traces instead of the random
+  # ISL/OSL sweep. The runner is shared with the ATOMesh pipeline so both
+  # publish the same fields; see .github/scripts/aiperf_agentic.sh.
+  if [ "$BENCH_KIND" == "aiperf_agentic" ]; then
+    # shellcheck source=aiperf_agentic.sh
+    source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/aiperf_agentic.sh"
+    export BENCHMARK_KIND="aiperf_agentic"
+    export MODEL_NAME="${MODEL_NAME:-$MODEL_PATH}"
+    export TOPOLOGY="${TOPOLOGY:-single-node}"
+    if [[ "${SERVER_ARGS:-}" == *"--enable-dp-attention"* ]]; then
+      export DISPLAY_TOPOLOGY="${DISPLAY_TOPOLOGY:-single-node-dpa}"
+      # Sessions are sticky; the id has to travel with the request or a
+      # session's turns scatter across DP ranks and lose their prefix cache.
+      export AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID=true
+    else
+      export DISPLAY_TOPOLOGY="${DISPLAY_TOPOLOGY:-single-node}"
+      unset AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID
+    fi
+    AGENTIC_OUT_DIR="${AGENTIC_OUT_DIR:-./aiperf-artifacts-c${CONC}}"
+    ensure_aiperf
+    # The replay is only part of the wall clock: AIPerf configures the dataset
+    # and drains a warmup grace period on either side of it, each with its own
+    # multi-minute timeout. Budget those rather than let the drain supervisor
+    # cut a healthy run.
+    BENCH_MAX_MIN=$(( AIPERF_BENCHMARK_DURATION / 60 + 60 ))
+    echo "Agentic replay: ${AIPERF_BENCHMARK_DURATION}s at concurrency ${CONC}"
+    echo "  scenario=${AIPERF_SCENARIO} dataset=${AIPERF_PUBLIC_DATASET}"
+    echo "  artifacts=${AGENTIC_OUT_DIR} drain budget=${BENCH_MAX_MIN}min"
+    if (( AIPERF_BENCHMARK_DURATION < 900 )); then
+      echo "  WARNING: below the scenario's 900s floor -- --unsafe-override is"
+      echo "           active and results carry submission_valid=false."
+    fi
+  else
+    BENCH_MAX_MIN=60
   BENCH_CMD=(
     python -m atom.benchmarks.benchmark_serving
     --model="$MODEL_PATH" --backend=vllm --base-url="http://localhost:${ATOM_SERVER_PORT}"
@@ -448,13 +492,19 @@ if [ "$TYPE" == "benchmark" ]; then
   echo "Benchmark command:"
   printf '%q ' "${BENCH_CMD[@]}"
   echo
+  fi
   # Background the benchmark + tee pipeline in its own process group so
   # wait_infer_drain.sh can supervise the engine in the foreground and
   # SIGTERM the whole group on hang/fault. Same pattern as the accuracy
   # block — see comments there.
   set -m
   (
-    "${BENCH_CMD[@]}" 2>&1 | tee "$ATOM_CLIENT_LOG"
+    if [ "$BENCH_KIND" == "aiperf_agentic" ]; then
+      run_aiperf_agentic "http://localhost:${ATOM_SERVER_PORT}" "$CONC" \
+        "$AGENTIC_OUT_DIR" "http://localhost:${ATOM_SERVER_PORT}/metrics"
+    else
+      "${BENCH_CMD[@]}"
+    fi 2>&1 | tee "$ATOM_CLIENT_LOG"
   ) &
   CLIENT_PID=$!
   set +m
@@ -465,7 +515,7 @@ if [ "$TYPE" == "benchmark" ]; then
   # c=1024 with num_prompts=conc*10) take ~48 min wall (warmup + 10240 reqs);
   # 30 min cut them off mid-run (drain exit 4). Real hangs/faults still
   # surface fast via STUCK_POLLS / fault detection, not MAX_MIN.
-  bash scripts/wait_infer_drain.sh ${ATOM_SERVER_PORT} 60 10 "$ATOM_CLIENT_LOG" 18
+  bash scripts/wait_infer_drain.sh ${ATOM_SERVER_PORT} "$BENCH_MAX_MIN" 10 "$ATOM_CLIENT_LOG" 18
   DRAIN_RC=$?
   if [ "$DRAIN_RC" -ne 0 ]; then
     echo "wait_infer_drain.sh exit=$DRAIN_RC — killing benchmark pgid $CLIENT_PID"
@@ -480,8 +530,18 @@ if [ "$TYPE" == "benchmark" ]; then
   fi
   wait "$CLIENT_PID" || true
 
+  if [ "$BENCH_KIND" == "aiperf_agentic" ]; then
+    # AIPerf's own export carries the metrics; this converts it into the same
+    # dashboard shape `benchmark_serving` emits, so the summarizer needs no
+    # special case. ISL/OSL below are labels for the random sweep and have no
+    # meaning for a trace replay.
+    write_aiperf_dashboard_json \
+      "${AGENTIC_OUT_DIR}/profile_export_aiperf.json" \
+      "${RESULT_FILENAME}.json" "$CONC"
+  fi
+
   # Inject ISL/OSL into result JSON for summary table
-  if [ -f "${RESULT_FILENAME}.json" ]; then
+  if [ "$BENCH_KIND" != "aiperf_agentic" ] && [ -f "${RESULT_FILENAME}.json" ]; then
     RESULT_PATH="${RESULT_FILENAME}.json" python3 - <<'PY'
 import json
 import os

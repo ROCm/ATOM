@@ -125,6 +125,10 @@ def _variant_record(model: dict[str, Any], variant: dict[str, Any]) -> dict[str,
         "prefix": model["prefix"],
         "args": build_args(model.get("config", {}), variant),
         "bench_args": variant.get("bench_args", ""),
+        # Which client runs the workload. "random" is `benchmark_serving`'s
+        # ISL/OSL sweep; "aiperf_agentic" replays AgentX session traces. See
+        # `.github/scripts/aiperf_agentic.sh`.
+        "bench_kind": variant.get("bench_kind", "random"),
         "suffix": variant.get("suffix", ""),
         "runner": model["runner"],
         "env_vars": build_env_vars(model, variant),
@@ -195,16 +199,22 @@ def build_cells(
     path: str | Path,
     param_lists: str | None = None,
     model_filter: set[str] | None = None,
+    bench_kind_filter: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Expand the catalog into fully-resolved benchmark cells.
 
     Each cell self-describes one run:
-        display, prefix, suffix, model_path, server_args, bench_args, env_vars,
-        runner, isl, osl, conc, ratio, result_filename
+        display, prefix, suffix, model_path, server_args, bench_args, bench_kind,
+        env_vars, runner, isl, osl, conc, ratio, result_filename
 
     `param_lists` (workflow_dispatch) overrides the catalog scenarios with an
     explicit grid; otherwise per-variant/default scenarios are used. `model_filter`
     keeps only models whose prefix is in the set (None = all).
+
+    `bench_kind_filter` keeps only variants running that client. The two kinds
+    live in separate workflows because their costs differ by an order of
+    magnitude -- an agentic cell replays for an hour -- so the nightly asks for
+    `{"random"}` and would otherwise pick up the agentic variants by prefix.
     """
     catalog = _load_catalog(path)
     default_scenarios = catalog.get("default_scenarios", [])
@@ -213,6 +223,8 @@ def build_cells(
         if model_filter is not None and model["prefix"] not in model_filter:
             continue
         rec = _variant_record(model, variant)
+        if bench_kind_filter is not None and rec["bench_kind"] not in bench_kind_filter:
+            continue
         if param_lists:
             scenarios = _scenarios_from_param_lists(
                 param_lists, rec["conc_min"], rec["conc_max"]
@@ -231,6 +243,7 @@ def build_cells(
                         "model_path": rec["path"],
                         "server_args": rec["args"],
                         "bench_args": rec["bench_args"],
+                        "bench_kind": rec["bench_kind"],
                         "env_vars": rec["env_vars"],
                         "runner": rec["runner"],
                         "isl": sc["isl"],
@@ -265,6 +278,7 @@ def build_cell_configs(
     path: str | Path,
     param_lists: str | None = None,
     model_filter: set[str] | None = None,
+    bench_kind_filter: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Group cells into first-level matrix configs: one per (variant, scenario).
 
@@ -281,7 +295,12 @@ def build_cell_configs(
     is rebuilt per concurrency inside the template from
     ``{prefix}{suffix}-{isl}-{osl}-{conc}-{ratio_str}`` (unchanged naming contract).
     """
-    cells = build_cells(path, param_lists=param_lists, model_filter=model_filter)
+    cells = build_cells(
+        path,
+        param_lists=param_lists,
+        model_filter=model_filter,
+        bench_kind_filter=bench_kind_filter,
+    )
 
     configs: dict[tuple, dict[str, Any]] = {}
     for c in cells:
@@ -291,6 +310,7 @@ def build_cell_configs(
             c["model_path"],
             c["server_args"],
             c["env_vars"],
+            c["bench_kind"],
             c["isl"],
             c["osl"],
             c["ratio"],
@@ -304,6 +324,7 @@ def build_cell_configs(
                 "model_path": c["model_path"],
                 "server_args": c["server_args"],
                 "bench_args": c["bench_args"],
+                "bench_kind": c["bench_kind"],
                 "env_vars": c["env_vars"],
                 "runner": c["runner"],
                 "isl": c["isl"],

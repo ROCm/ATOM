@@ -74,6 +74,28 @@
           "bench_args": "--use-chat-template",
           "conc_min": 64,
           "conc_max": 512
+        },
+        {
+          "label": "Agentic MTP3",
+          "suffix": "-agentic-mtp3",
+          "bench_kind": "aiperf_agentic",
+          "extra_args": "--method mtp --num-speculative-tokens 3 --spec-decode-acceptance-rate 0.4966666667 --enable_prefix_caching --gpu-memory-utilization 0.9 --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384 --state-checkpoint-interval-tokens 8192 --level 3 --cudagraph-mode FULL",
+          "conc_min": 1,
+          "conc_max": 48,
+          "scenarios": [
+            {"isl": 262144, "osl": 1024, "concurrency": [1, 2, 8, 16, 32, 48, 64, 128, 256], "random_range_ratio": 0.8}
+          ]
+        },
+        {
+          "label": "Agentic DPA MTP3",
+          "suffix": "-agentic-dpa-mtp3",
+          "bench_kind": "aiperf_agentic",
+          "extra_args": "--method mtp --num-speculative-tokens 3 --spec-decode-acceptance-rate 0.4966666667 --enable_prefix_caching --gpu-memory-utilization 0.9 --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384 --state-checkpoint-interval-tokens 8192 --level 3 --cudagraph-mode FULL --enable-dp-attention",
+          "conc_min": 64,
+          "conc_max": 256,
+          "scenarios": [
+            {"isl": 262144, "osl": 1024, "concurrency": [1, 2, 8, 16, 32, 48, 64, 128, 256], "random_range_ratio": 0.8}
+          ]
         }
       ]
     },

@@ -82,8 +82,17 @@ def main() -> int:
         model_filter = {k for k in model_keys if inputs.get(k)}
         param_lists = inputs.get("param_lists") or DEFAULT_PARAM_LISTS
 
+    # Default `random`: the nightly must not pick up the agentic variants,
+    # whose cells replay for an hour each. atom-agentic-benchmark.yaml sets
+    # this to `aiperf_agentic` to select exactly the other side.
+    bench_kinds = {
+        k for k in os.environ.get("BENCH_KIND_FILTER", "random").split(",") if k
+    }
     configs = build_cell_configs(
-        CATALOG, param_lists=param_lists, model_filter=model_filter
+        CATALOG,
+        param_lists=param_lists,
+        model_filter=model_filter,
+        bench_kind_filter=bench_kinds,
     )
     _emit(configs)
 

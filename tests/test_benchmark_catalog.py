@@ -246,3 +246,50 @@ def test_build_cell_configs_one_config_per_server_key():
         for c in configs
     ]
     assert len(keys) == len(set(keys))
+
+
+def test_bench_kind_filter_keeps_the_two_workflows_apart():
+    """The nightly must never pick up an agentic cell.
+
+    An agentic cell replays for a full hour where a random cell is minutes, so
+    the two live in separate workflows. Nothing enforces that but this field:
+    the variants share the `deepseek-v4-pro` prefix, so a prefix filter alone
+    puts them in the nightly. `atom-benchmark.yaml` passes no BENCH_KIND_FILTER
+    and `build_benchmark_matrix.py` defaults it to `random`;
+    `atom-agentic-benchmark.yaml` sets `aiperf_agentic`.
+    """
+    everything = catalog.build_cells(CATALOG)
+    nightly = catalog.build_cells(CATALOG, bench_kind_filter={"random"})
+    agentic = catalog.build_cells(CATALOG, bench_kind_filter={"aiperf_agentic"})
+
+    assert {c["bench_kind"] for c in nightly} == {"random"}
+    assert {c["bench_kind"] for c in agentic} == {"aiperf_agentic"}
+    # A partition: every cell lands in exactly one side.
+    assert len(nightly) + len(agentic) == len(everything)
+    assert agentic, "catalog has no agentic variants -- did bench_kind get dropped?"
+
+
+def test_agentic_variants_carry_what_the_recipe_requires():
+    """Flags the InferenceX single-node recipe sets that the shared config does not.
+
+    `--enable_prefix_caching` is the one that bites: the DeepSeek-V4-Pro config
+    turns prefix caching OFF for every variant, and the agentic recipe needs it
+    ON. `build_args` appends variant args after config args, so the positive
+    form (underscores, matching the BooleanOptionalAction dest) wins -- but only
+    if it is actually there.
+    """
+    agentic = catalog.build_cells(CATALOG, bench_kind_filter={"aiperf_agentic"})
+    for cell in agentic:
+        args = cell["server_args"]
+        assert "--enable_prefix_caching" in args, cell["result_filename"]
+        assert args.index("--no-enable_prefix_caching") < args.index(
+            "--enable_prefix_caching"
+        ), f"negation must come first to be overridden: {cell['result_filename']}"
+        for flag in ("--cudagraph-mode FULL", "--method mtp", "-tp 8"):
+            assert flag in args, f"{flag} missing from {cell['result_filename']}"
+
+    dpa = [c for c in agentic if "--enable-dp-attention" in c["server_args"]]
+    plain = [c for c in agentic if "--enable-dp-attention" not in c["server_args"]]
+    assert dpa and plain, "expected both a TP band and a DPA band"
+    # Small concurrency on TP, large on DPA -- the bands must not overlap.
+    assert max(c["conc"] for c in plain) < min(c["conc"] for c in dpa)
