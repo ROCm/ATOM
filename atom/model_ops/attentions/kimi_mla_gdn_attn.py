@@ -278,7 +278,60 @@ class _KimiMLAGDNCommon(GDNStateMixin):
                 )
             lo = unit * block
             views.extend(plane[lo : lo + block] for plane in planes)
-        return views
+
+        # ---- cut the padding tail off the final unit ----
+        #
+        # An image is `image_bytes`, but it occupies `ceil(image_bytes /
+        # page_unit_bytes)` WHOLE units, so the last one is mostly padding: at
+        # K3's 2,138,112 B unit and 58,079,232 B image that is 28 units =
+        # 59,867,136 B, of which 1,787,904 belong to no image.
+        #
+        # `_checkpoint_copy_plan` already knows this -- it hands
+        # `plan_segmented_copy` the unit stream *and* `spec.image_bytes`, so the
+        # HBM copy writes only the leading `image_bytes` and leaves the tail
+        # alone. Gathering whole units for the CPU tier skipped that argument
+        # and asked the packer for the padding too, against a MemoryObj
+        # `StateByteCodec.put` sizes at `entry_bytes` -- which IS `image_bytes`.
+        # Every store died with "MemoryObj tensor is too small for 59867136
+        # bytes; got 58079232".
+        #
+        # The trim is byte-exact rather than view-aligned because the image does
+        # not end on one: 58,079,232 leaves 350,208 B of the last unit in use,
+        # which is 20.96 rows of it. That view is reinterpreted as `uint8` and
+        # sliced; the packer sizes segments as `numel * element_size`, so it
+        # costs nothing to accept. The load side needs no counterpart -- it
+        # scatters into `state_entry_views`, which sums to `entry_bytes`.
+        #
+        # Inline rather than a helper method: the unit tests drive this function
+        # with a `SimpleNamespace` stand-in for `self`, so a second attribute
+        # would have to be stubbed by every one of them.
+        runtime = getattr(self.model_runner, "state_runtime", None)
+        spec = None if runtime is None else runtime.checkpoint_spec
+        # `getattr`: a fork build carries no spec, and the unit tests hand this
+        # a stand-in that carries no `image_bytes`. Either way there is no image
+        # size to trim against, and the whole-unit stream is the right answer.
+        budget = int(getattr(spec, "image_bytes", 0) or 0) if spec else 0
+        if not budget:
+            return views
+        out: list[torch.Tensor] = []
+        for view in views:
+            nbytes = view.numel() * view.element_size()
+            if budget >= nbytes:
+                out.append(view)
+                budget -= nbytes
+                continue
+            if budget > 0:
+                out.append(view.reshape(-1).view(torch.uint8)[:budget])
+                budget = 0
+            break
+        if budget:
+            raise RuntimeError(
+                f"a checkpoint image is {spec.image_bytes} B but its "
+                f"{len(views)} unit views hold "
+                f"{int(spec.image_bytes) - budget} B; "
+                "the unit geometry and the image size disagree"
+            )
+        return out
 
     def build_kv_cache_tensor(self, layer_id: int, module):
         from atom.config import KVCacheTensor
