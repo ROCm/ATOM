@@ -334,7 +334,12 @@ models:
           concurrency: [48]
           server:
             common_args:
-              <<: *glm52_agentic_common_args
+              kv_cache_dtype: fp8
+              block_size: 16
+              max_num_seqs: 512
+              enable_prefix_caching: true
+              decode_max_num_seqs: 512
+              online_quant_config: '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","*expert*"]}'
               gpu_memory_utilization: 0.85
               extra_args: "--level 3 --method mtp --num-speculative-tokens 3 --spec-decode-acceptance-rate 0.6633"
           prefill:
