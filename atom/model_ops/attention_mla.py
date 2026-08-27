@@ -67,6 +67,11 @@ from atom.utils.forward_context import (
     get_forward_context,
 )
 
+# Cap on the KV-split budget: aiter cuts the KV walk into
+# `min(num_clusters, cap * batch_size)` parts, and a negative cap means uncapped
+# -- as many parts as the machine has clusters (v1_2_device.cuh:894).
+_MLA_SPLIT_BUDGET_AUTO = -1
+
 
 def _sparse_index_workspace(
     out: torch.Tensor | None,
@@ -1744,7 +1749,7 @@ class MLAAttention(nn.Module):
             max_seqlen_qo=1,
             uni_seqlen_qo=1,
             fast_mode=1,
-            max_split_per_batch=16,
+            max_split_per_batch=_MLA_SPLIT_BUDGET_AUTO,
         )
 
     def _forward_decode(
@@ -1884,9 +1889,7 @@ class MLAAttention(nn.Module):
             # (max_seqlen_qo=2).
             is_sparse_mtp = self.is_sparse_mla and attn_metadata.max_seqlen_q > 1
 
-            if self._should_rebuild_sparse_dcp_persistent_metadata(
-                use_persistent_mode
-            ):
+            if self._should_rebuild_sparse_dcp_persistent_metadata(use_persistent_mode):
                 self._rebuild_sparse_dcp_persistent_metadata(
                     attn_metadata,
                     q,

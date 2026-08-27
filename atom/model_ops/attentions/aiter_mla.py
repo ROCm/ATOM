@@ -30,6 +30,7 @@ from atom.distributed.pcp_utils import (
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mla import (
     _MLA_MIN_HEADS,
+    _MLA_SPLIT_BUDGET_AUTO,
     MLAAttention,
     mla_dcp_decode_is_persistent,
     mla_dcp_kernel_num_heads,
@@ -55,11 +56,6 @@ try:
     )
 except (TypeError, ValueError):
     _MLA_META_SUPPORTS_MAX_SPLIT = False
-
-# Cap on the KV-split budget: aiter cuts the KV walk into
-# `min(num_clusters, cap * batch_size)` parts, and a negative cap means uncapped
-# -- as many parts as the machine has clusters (v1_2_device.cuh:894).
-_MLA_SPLIT_BUDGET_AUTO = -1
 
 
 def _mla_seg_meta_kwargs() -> dict:
