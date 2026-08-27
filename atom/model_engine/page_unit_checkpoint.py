@@ -5,7 +5,8 @@
 
 from __future__ import annotations
 
-from collections import OrderedDict
+from collections import OrderedDict, deque
+from time import monotonic
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 
@@ -114,9 +115,15 @@ class PageUnitCheckpointStore:
         self,
         pool: BlockPool,
         spec: PagedStateCheckpointSpec,
+        offload_sink: bool = False,
     ):
         self.pool = pool
         self.spec = spec
+        # Whether anything downstream can carry a store. False leaves the
+        # offload queue permanently empty and takes no pins, which is what a
+        # deployment with no CPU tier must cost: a pin nobody releases would
+        # hold 127 blocks per checkpoint out of the pool forever.
+        self._offload_sink = offload_sink
         self.hash_to_checkpoint: dict[int, int] = {}
         self.records: dict[int, CheckpointRecord] = {}
         self._pending_by_hash: dict[int, int] = {}
@@ -126,6 +133,18 @@ class PageUnitCheckpointStore:
         self._inflight_restores: list[int] = []
         self._next_checkpoint_id = 0
         self.evictions = 0
+        # Checkpoints that reached READY and have not been offered to the CPU
+        # tier yet. Candidates only: NOT pinned, so one still counts as free
+        # space and `_next_victim` may spend it. The pin is taken later, in
+        # `take_offload_stores`, and only for the few actually in flight.
+        self._offload_ready: deque[int] = deque()
+        # prefix_hash -> (checkpoint_id, monotonic when the pin was taken).
+        # Keyed by hash because that is all the worker's report carries -- by
+        # the time a store lands its request is long gone. At most one live
+        # record per hash, which `begin_store` enforces by refusing a hash it
+        # already holds or has pending.
+        self._offload_pins: dict[int, tuple[int, float]] = {}
+        self.offload_pins_reclaimed = 0
 
     @property
     def units_per_checkpoint(self) -> int:
@@ -326,10 +345,125 @@ class PageUnitCheckpointStore:
             record.state = READY
             self.hash_to_checkpoint[record.prefix_hash] = checkpoint_id
             self._lru[checkpoint_id] = None
+            self._queue_offload_store(checkpoint_id, record)
 
         restores, self._inflight_restores = self._inflight_restores, []
         for checkpoint_id in restores:
             self._release_restore_pin(checkpoint_id)
+
+    # ------------------------------- offload ------------------------------- #
+    def _queue_offload_store(self, checkpoint_id: int, record) -> None:
+        """Nominate this checkpoint for the CPU tier. Takes no pin.
+
+        **The READY transition, and not anywhere else.** Three candidate
+        moments and only this one works:
+
+        - `begin_store` is too early: the scatter has not ridden a batch, so
+          the units do not hold the image yet.
+        - `_evict` / `unindex` are too late. They fire when the pool wants
+          those units *now*, so a multi-millisecond D2H started there holds 127
+          of the most-wanted blocks at the worst possible moment.
+        - READY is the moment the bytes first exist and the moment the record
+          is least wanted -- it has just entered the LRU at the cold end, which
+          is the furthest any checkpoint ever is from being spent.
+
+        Nomination, not reservation. A queued candidate is unpinned, so it
+        still counts as free space and `_next_victim` may spend it: the pool
+        never waits on the CPU tier, and a checkpoint the pool needed more than
+        the tier did simply loses its copy. Dedup is free -- `begin_store`
+        already refuses a hash it holds or has pending, so one hash is
+        nominated once.
+        """
+        if not self._offload_sink:
+            return
+        self._offload_ready.append(checkpoint_id)
+
+    def take_offload_stores(
+        self, max_inflight: int
+    ) -> list[tuple[int, tuple[int, ...]]]:
+        """`(prefix_hash, unit_ids)` to hand the tier now, pinning each.
+
+        **This is where the pin is taken**, not at READY, and that is what
+        bounds it. A pin lives in this process while the D2H runs in the
+        worker, so it spans several scheduler passes; pinning at READY would
+        make every checkpoint un-evictable for that whole window and break the
+        one thing #2045's admission argument rests on -- that a READY unpinned
+        checkpoint counts as available to live KV. Pinning only what is
+        actually in flight caps the damage at `max_inflight` images.
+
+        Over the cap, candidates wait rather than being dropped: they stay
+        nominated, unpinned and evictable, and are offered again next pass if
+        they are still around.
+
+        Drained, not read: a second submission would store the same image
+        twice, and the second report would unpin a record the first released.
+        """
+        out: list[tuple[int, tuple[int, ...]]] = []
+        while self._offload_ready and len(self._offload_pins) < max_inflight:
+            checkpoint_id = self._offload_ready.popleft()
+            record = self.records.get(checkpoint_id)
+            # Spent while it waited -- which nomination deliberately allows --
+            # or already in flight under this hash. Nothing to send either way.
+            if record is None or record.state != READY:
+                continue
+            if record.prefix_hash in self._offload_pins:
+                continue
+            record.pin_count += 1
+            self._offload_pins[record.prefix_hash] = (checkpoint_id, monotonic())
+            out.append((record.prefix_hash, record.unit_ids))
+        return out
+
+    def settle_offload_store(self, prefix_hash: int) -> None:
+        """One store reported, either way. Release the units it was holding.
+
+        Success and failure release identically: the pin exists to keep the
+        bytes still during the copy, and the copy is over either way. Whether
+        the hash becomes reachable is `StateOffloadIndex`'s business, not this
+        one's.
+        """
+        entry = self._offload_pins.pop(prefix_hash, None)
+        if entry is None:
+            return
+        self._release_offload_pin(entry[0])
+
+    def reclaim_stale_offload_pins(self, timeout_s: float) -> int:
+        """Release pins whose report never came, after `timeout_s`.
+
+        The pin lives here in the engine process and the D2H runs in the
+        worker, so a lost report -- a crashed worker, a dropped completion --
+        would hold 127 blocks out of the pool forever. This is the unit-side
+        twin of `Scheduler._reconcile_stalled_deferred_saves` and takes the
+        same window, derived from LMCache's own pin timeout, for the same
+        reason: by then upstream has force-unpinned and stopped reading.
+
+        Recovery is total, which is what makes 20 lines enough: a leaked pin
+        breaks no `BlockPool` invariant and leaves no half-released state, so
+        zeroing the count restores the record exactly.
+        """
+        if timeout_s <= 0 or not self._offload_pins:
+            return 0
+        cutoff = monotonic() - timeout_s
+        stale = [h for h, (_cid, at) in self._offload_pins.items() if at <= cutoff]
+        for prefix_hash in stale:
+            checkpoint_id, _at = self._offload_pins.pop(prefix_hash)
+            self._release_offload_pin(checkpoint_id)
+            self.offload_pins_reclaimed += 1
+        return len(stale)
+
+    def _release_offload_pin(self, checkpoint_id: int) -> None:
+        record = self.records.get(checkpoint_id)
+        if record is None:
+            return
+        if record.pin_count <= 0:
+            raise AssertionError("checkpoint offload pin underflow")
+        record.pin_count -= 1
+        if record.state == EVICTING and record.pin_count == 0:
+            # `unindex` fired during the copy: the boundary's KV block was
+            # spent, so this image is unreachable in HBM from now on. The copy
+            # was still worth finishing -- the CPU copy outliving the HBM one
+            # is the entire point of the tier -- and only now do the units go
+            # back.
+            self._release_record(checkpoint_id)
 
     def _release_restore_pin(self, checkpoint_id: int) -> None:
         record = self.records.get(checkpoint_id)
@@ -418,9 +552,10 @@ class PagedStateCheckpointCoordinator:
         pool: BlockPool,
         spec: PagedStateCheckpointSpec,
         enabled: bool,
+        offload_sink: bool = False,
     ) -> None:
         self.enabled = enabled
-        self.store = PageUnitCheckpointStore(pool, spec)
+        self.store = PageUnitCheckpointStore(pool, spec, offload_sink=offload_sink)
         # Keyed by `(seq id, prefix hash)` rather than by seq: two boundaries of
         # one prompt are two checkpoints, and keying by seq alone let the later
         # one overwrite the earlier before either was stored. Re-reaching the
@@ -543,6 +678,20 @@ class PagedStateCheckpointCoordinator:
     def ensure_free_units(self, count: int) -> bool:
         return self.store.ensure_free_units(count)
 
+    def take_offload_stores(
+        self, max_inflight: int
+    ) -> list[tuple[int, tuple[int, ...]]]:
+        """`(prefix_hash, unit_ids)` to hand the tier now. See the store."""
+        return self.store.take_offload_stores(max_inflight)
+
+    def settle_offload_store(self, prefix_hash: int) -> None:
+        """One store reported, either way; release the units it was holding."""
+        self.store.settle_offload_store(prefix_hash)
+
+    def reclaim_stale_offload_pins(self, timeout_s: float) -> int:
+        """Release offload pins whose report never came. See the store."""
+        return self.store.reclaim_stale_offload_pins(timeout_s)
+
     def unindex(self, h: int) -> None:
         # `_pending` is keyed by `(seq, hash)`, so one hash can be pending for
         # several sequences at once -- two turns of a conversation reaching the
@@ -573,5 +722,8 @@ class PagedStateCheckpointCoordinator:
             "checkpoints_kept": self.checkpoints_kept,
             "checkpoints_dropped": self.checkpoints_dropped,
             "checkpoints_evicted": self.store.evictions,
+            # Non-zero means store reports are being lost, which would
+            # otherwise show only as a pool that has quietly shrunk.
+            "offload_pins_reclaimed": self.store.offload_pins_reclaimed,
             "checkpoints_orphaned": self.checkpoints_orphaned,
         }

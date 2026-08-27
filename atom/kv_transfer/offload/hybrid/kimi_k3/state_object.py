@@ -27,9 +27,11 @@ class StateByteCodec:
     multi-plane state layouts cannot be expressed in LMCache's token-major
     model at all.
 
-    `entry_index` is not always a pool group -- on the spill path it is a
-    staging-ring slot, on the load path a real group. Both index the same
-    `state_entry_views` space.
+    The two directions read different things, and that is not an oversight:
+    a store gathers the checkpoint's PAGE units (`page_unit_views`) because
+    #2045 is where the image lives, while a load scatters into the Active Slot
+    the resuming forward will read (`state_entry_views`). The blob is the same
+    ordered byte stream either way.
     """
 
     def __init__(
@@ -55,6 +57,7 @@ class StateByteCodec:
         self._worker_id = int(worker_id)
         self._layout_id = layout_id
         self._misfit_reads = 0
+        self.puts_refused = 0
         self._storage = None
         # Never hard-code a size: V4 keeps six compressor fields across
         # n_csa/n_hca layers plus an optional window; GDN keeps
@@ -111,24 +114,36 @@ class StateByteCodec:
             torch.uint8,
         )
 
-    def put(self, h: int, entry_index: int) -> bool:
-        """Spill one entry. Returns False when nothing was stored.
+    def put(self, h: int, unit_ids) -> bool:
+        """Store one checkpoint image. False when nothing was stored.
 
-        A refusal is not an error: `_allocate` returns None under memory
-        pressure with nothing evictable, and spilling is best-effort -- the
-        pool counted the eviction either way, so the cost is one later miss.
+        The source is the checkpoint's PAGE units, not an Active Slot: under
+        #2045 that is where the image lives, and `page_unit_views` names those
+        bytes as the contiguous tensors the packer takes. The two directions
+        are deliberately asymmetric -- a load writes the slot (`get`) -- and
+        they compose because #2045's copy plan intersects two *ordered byte
+        streams*, so a blob gathered in unit order is byte-identical to one
+        gathered in slot order.
+
+        A refusal is not an error. `_allocate` returns None under CPU memory
+        pressure with nothing evictable, and a 53.6 MiB request is refused
+        sooner than a KV chunk's 884 KB, so the state leg is the first to feel
+        a full pool. Best-effort by design: the cost is one later miss, and
+        `puts_refused` is what makes it visible instead of a silent hit-rate
+        drift.
         """
         if self._storage is None:
             return False
         obj = self._allocate(self.entry_bytes)
         if obj is None:
+            self.puts_refused += 1
             return False
-        self._staged.pack(self._backend.state_entry_views(entry_index), obj)
+        self._staged.pack(self._backend.page_unit_views(unit_ids), obj)
         self._storage.batched_put([self.key(h)], [obj])
         return True
 
-    def get(self, h: int, entry_index: int) -> bool:
-        """Load one entry back into `entry_index`. False on a miss.
+    def get(self, h: int, slot: int) -> bool:
+        """Load one image back into Active Slot `slot`. False on a miss.
 
         The reference must be discharged here: `get_blocking` does a
         `ref_count_up()` on the caller's behalf, and without the matching down
@@ -162,7 +177,7 @@ class StateByteCodec:
             obj.ref_count_down()
             return False
         try:
-            self._staged.unpack(obj, self._backend.state_entry_views(entry_index))
+            self._staged.unpack(obj, self._backend.state_entry_views(slot))
         finally:
             obj.ref_count_down()
         return True

@@ -380,3 +380,134 @@ def test_a_store_refuses_when_the_policy_leaves_the_loop_short():
 
     assert store._next_checkpoint_id == before, "a refused store took an identity"
     assert len(store.records) == 100
+
+
+# ── offloading a checkpoint to the CPU tier ───────────────────────────────
+
+
+def offload_store(**kw):
+    pool, store = make_store(**kw)
+    store._offload_sink = True
+    return pool, store
+
+
+class TestOffloadNomination:
+    """READY nominates; `take_offload_stores` is what pins.
+
+    Splitting the two is the whole design. A pin lives in the engine process
+    while the D2H runs in the worker, so it spans several scheduler passes;
+    pinning at READY would make EVERY checkpoint un-evictable for that window
+    and break the one thing #2045's admission argument rests on -- that a READY
+    unpinned checkpoint counts as available to live KV.
+    """
+
+    def test_reaching_ready_nominates_without_pinning(self):
+        _pool, store = offload_store()
+        cid, _op = ready(store, 11)
+        assert store.records[cid].pin_count == 0
+        assert store._is_evictable(cid), "a nominee must still be spendable"
+
+    def test_handing_it_over_is_what_pins(self):
+        _pool, store = offload_store()
+        cid, _op = ready(store, 11)
+        stores = store.take_offload_stores(max_inflight=4)
+        assert stores == [(11, store.records[cid].unit_ids)]
+        assert store.records[cid].pin_count == 1
+        assert not store._is_evictable(cid)
+
+    def test_a_nominee_the_pool_needed_more_is_simply_gone(self):
+        """Nomination deliberately leaves it spendable, so `_next_victim` may
+        take it. Losing a CPU copy is the right price for never making the
+        pool wait on the tier."""
+        _pool, store = offload_store()
+        cid, _op = ready(store, 11)
+        store._evict(cid)
+        assert store.take_offload_stores(max_inflight=4) == []
+
+    def test_no_sink_nominates_nothing(self):
+        """A pin nobody can release holds a whole image out of the pool
+        forever, so a deployment with no tier must take none."""
+        _pool, store = make_store()  # _offload_sink defaults False
+        ready(store, 11)
+        assert store.take_offload_stores(max_inflight=4) == []
+
+    def test_it_is_offered_once(self):
+        _pool, store = offload_store()
+        ready(store, 11)
+        assert len(store.take_offload_stores(max_inflight=4)) == 1
+        assert store.take_offload_stores(max_inflight=4) == []
+
+
+class TestOffloadInflightCap:
+    """The cap is what bounds how much of the pool a slow backend can hold."""
+
+    def test_over_the_cap_the_rest_wait_rather_than_drop(self):
+        _pool, store = offload_store(num_units=40)
+        for h in (11, 12, 13):
+            ready(store, h)
+        first = store.take_offload_stores(max_inflight=2)
+        assert len(first) == 2
+        # The third is still nominated, unpinned, and offered again next pass.
+        assert store.take_offload_stores(max_inflight=2) == []
+        store.settle_offload_store(first[0][0])
+        assert len(store.take_offload_stores(max_inflight=2)) == 1
+
+    def test_a_waiting_nominee_stays_evictable(self):
+        _pool, store = offload_store(num_units=40)
+        for h in (11, 12):
+            ready(store, h)
+        store.take_offload_stores(max_inflight=1)
+        waiting = store.lookup(12)
+        assert store._is_evictable(waiting)
+
+
+class TestOffloadPinRelease:
+    def test_success_and_failure_release_identically(self):
+        """The pin keeps the bytes still during the copy, and the copy is over
+        either way. Whether the hash becomes reachable is the index's business."""
+        for _ in range(2):
+            _pool, store = offload_store()
+            cid, _op = ready(store, 11)
+            store.take_offload_stores(max_inflight=4)
+            store.settle_offload_store(11)
+            assert store.records[cid].pin_count == 0
+
+    def test_a_report_for_a_hash_never_sent_is_a_no_op(self):
+        _pool, store = offload_store()
+        cid, _op = ready(store, 11)
+        store.settle_offload_store(11)
+        assert store.records[cid].pin_count == 0
+
+    def test_unindex_during_the_copy_holds_the_units_to_the_end(self):
+        """The tier's whole point: the CPU copy outliving the HBM one. So
+        `unindex` must not pull the source out from under a running D2H."""
+        pool, store = offload_store()
+        cid, _op = ready(store, 11)
+        units = store.records[cid].unit_ids
+        store.take_offload_stores(max_inflight=4)
+
+        store.unindex(11)
+        assert cid in store.records, "the units are still being read"
+        assert all(pool.is_used(u) for u in units)
+
+        store.settle_offload_store(11)
+        assert cid not in store.records
+        assert not any(pool.is_used(u) for u in units)
+
+    def test_a_lost_report_is_reclaimed_and_counted(self):
+        """The pin is in this process and the copy is in the worker, so a
+        crashed worker would otherwise hold an image out of the pool forever."""
+        _pool, store = offload_store()
+        cid, _op = ready(store, 11)
+        store.take_offload_stores(max_inflight=4)
+
+        assert store.reclaim_stale_offload_pins(timeout_s=3600) == 0
+        assert store.reclaim_stale_offload_pins(timeout_s=-1) == 0, "disabled"
+        assert store.reclaim_stale_offload_pins(timeout_s=0.0) == 0, "disabled"
+
+        assert store.reclaim_stale_offload_pins(timeout_s=1e-9) == 1
+        assert store.records[cid].pin_count == 0
+        assert store.offload_pins_reclaimed == 1
+        # And recovery is total: the record is spendable again, unbroken.
+        assert store._is_evictable(cid)
+        assert store.lookup(11) == cid

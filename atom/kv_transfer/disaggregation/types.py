@@ -369,6 +369,7 @@ def completion_req_key(completion: ConnectorCompletionId) -> str:
 _DUCK_TYPED_WORK_FIELDS = (
     "requests",
     "state_loads",
+    "state_stores",
     "lookup_requests_in_step",
     "reqs_to_recv",
     "reqs_to_save",

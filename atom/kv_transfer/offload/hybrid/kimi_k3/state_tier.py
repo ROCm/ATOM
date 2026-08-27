@@ -58,20 +58,17 @@ class StateOffloadTier:
 
         fut.add_done_callback(_discard)
 
-    def submit_store(self, h: int, slot: int) -> None:
-        """Pack `slot`'s state under `h` and hand it to LMCache.
+    def submit_store(self, h: int, unit_ids) -> None:
+        """Pack the checkpoint image in `unit_ids` under `h`, for LMCache.
 
-        No `ready_event`. The staging ring is gone (#2045 makes the source hold
-        still on its own), so nothing on the compute stream is producing these
-        bytes for us to fence against -- `StagedTransfer.pack` gathers straight
-        from the source on its own stream.
-
-        NOTE: nothing calls this yet. Phase 2 removed the ring that used to
-        drive it and Phase 3 gives it its new caller, whose source is the
-        checkpoint's PAGE units rather than a slot. Kept rather than deleted so
-        the two halves of the change stay reviewable apart.
+        No `ready_event`, unlike the old spill. The staging ring is gone: the
+        units are reserved out of the KV pool and pinned by the engine for the
+        length of this transfer, so nothing on the compute stream is producing
+        or overwriting them and `StagedTransfer.pack` gathers straight from
+        where they sit -- one copy instead of two, and none of it on the
+        forward's stream.
         """
-        self._register(self._executor.submit(self._do_store, h, slot))
+        self._register(self._executor.submit(self._do_store, h, unit_ids))
 
     def submit_load(self, req_id: str, h: int, slot: int) -> None:
         """Fetch `h` into pool slot `slot` for the parked request `req_id`.
@@ -106,10 +103,10 @@ class StateOffloadTier:
     def shutdown(self) -> None:
         self._executor.shutdown(wait=True)
 
-    def _do_store(self, h: int, slot: int) -> None:
+    def _do_store(self, h: int, unit_ids) -> None:
         stored = False
         try:
-            stored = bool(self.codec.put(h, slot))
+            stored = bool(self.codec.put(h, unit_ids))
         except Exception:  # a store is best effort by design
             logger.warning("state offload: store of hash %d failed", h, exc_info=True)
         with self._lock:

@@ -175,6 +175,7 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
         if isinstance(metadata, LMCacheOffloadMetadata):
             self._arm_joint_loads(metadata)
             self._start_state_loads(metadata)
+            self._start_state_stores(metadata)
         super().start_load_kv(metadata)
 
     def _arm_joint_loads(self, metadata) -> None:
@@ -213,6 +214,33 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
             return
         for req_id, h, group in loads:
             self._state_tier.submit_load(req_id, int(h), int(group))
+
+    def _start_state_stores(self, metadata) -> None:
+        """Hand this step's ready checkpoints to the tier's executor.
+
+        No producer fence and no staging copy. The source is the checkpoint's
+        PAGE units, which #2045 reserves out of the KV pool and the engine pins
+        for the duration -- so nothing on the compute stream is writing them
+        and the packer gathers straight from where they sit.
+
+        A store with no tier is reported failed rather than dropped: the engine
+        is holding those units pinned against a report, and silence would leave
+        them to the reconciler's full timeout.
+        """
+        stores = getattr(metadata, "state_stores", None)
+        if not stores:
+            return
+        if self._state_tier is None:
+            logger.warning(
+                "kimi_k3 offload: %d state store(s) with no tier; failing them "
+                "so the engine releases their units now rather than on timeout.",
+                len(stores),
+            )
+            for h, _units in stores:
+                self._state_store_failed_locally.add(int(h))
+            return
+        for h, unit_ids in stores:
+            self._state_tier.submit_store(int(h), tuple(int(u) for u in unit_ids))
 
     def _fail_state_loads(self, loads) -> None:
         for req_id, _h, _group in loads:
@@ -278,6 +306,7 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler):
         # A state load shares no shape with a KV transfer -- no token ids, no
         # block ids, no chunking -- only the park/report lifecycle.
         self._pending_state_loads: list[tuple] = []
+        self._pending_state_stores: list[tuple] = []
         # A finished request whose save is queued keeps its blocks pinned
         # (`should_defer_free`), so the queue depth is also how much of the pool
         # a slow backend can hold. Same knob and default the DSV4 layout bounds
@@ -292,12 +321,21 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler):
         # Channel reports drained by the engine each step.
         self._state_indexed: set[int] = set()
         self._state_index_failed: set[int] = set()
+        # Stores this worker could not even attempt (no tier). Reported as
+        # failures so the engine releases their pinned units immediately.
+        self._state_store_failed_locally: set[int] = set()
 
     # -- state load queue --------------------------------------------------
     def enqueue_state_loads(self, loads) -> bool:
         if not loads:
             return False
         self._pending_state_loads.extend(loads)
+        return True
+
+    def enqueue_state_stores(self, stores) -> bool:
+        if not stores:
+            return False
+        self._pending_state_stores.extend(stores)
         return True
 
     def build_connector_meta(self) -> LMCacheOffloadMetadata:
@@ -307,6 +345,11 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler):
         # into a group the first transfer is already filling.
         meta.state_loads = self._pending_state_loads
         self._pending_state_loads = []
+        # Drained for the same reason: a second submission would store the same
+        # image twice, and the second report would unpin a record the first
+        # already released.
+        meta.state_stores = self._pending_state_stores
+        self._pending_state_stores = []
         return meta
 
     def _may_emit_save(self) -> bool:
@@ -450,7 +493,8 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler):
     def take_state_reports(self) -> tuple[set[int], set[int]]:
         """Drain this step's tier store reports for the engine-side index."""
         indexed = self._state_indexed
-        failed = self._state_index_failed
+        failed = self._state_index_failed | self._state_store_failed_locally
         self._state_indexed = set()
         self._state_index_failed = set()
+        self._state_store_failed_locally = set()
         return indexed, failed

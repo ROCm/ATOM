@@ -157,6 +157,15 @@ class BlockManager:
                 "the only checkpoint placement."
             )
         checkpoint_spec = state_runtime.checkpoint_spec
+        # Read here rather than beside `state_offload` below, because the
+        # coordinator has to know at construction whether anything can carry a
+        # store: without a sink it must nominate nothing, since a pin nobody
+        # releases holds a whole image out of the pool forever.
+        from atom.model_engine.state_offload import kv_connector_hosts_state_tier
+
+        kv_offload_enabled = kv_connector_hosts_state_tier(
+            getattr(config, "kv_transfer_config", None)
+        )
         self.paged_state_checkpoints: PagedStateCheckpointCoordinator | None = None
         if checkpoint_spec is not None:
             enabled = self.enable_prefix_caching and self.num_state_slots > 0
@@ -164,6 +173,7 @@ class BlockManager:
                 self.kv,
                 checkpoint_spec,
                 enabled=enabled,
+                offload_sink=kv_offload_enabled,
             )
         # The rolling state class: per-request slots plus a content index over
         # the free ones. A checkpoint IS a free slot whose content is still
@@ -220,10 +230,7 @@ class BlockManager:
         # Class names already warned about in `state_checkpoint_fates`. See
         # there for why the warning latches.
         self._warned_no_checkpoint_fates: set[str] = set()
-        from atom.model_engine.state_offload import (
-            StateOffloadIndex,
-            kv_connector_hosts_state_tier,
-        )
+        from atom.model_engine.state_offload import StateOffloadIndex
 
         # Joint boundaries, split by what the state leg cost: `hbm` forked a
         # resident checkpoint, `tier` paid an entry-sized H2D and a park. Almost
@@ -250,9 +257,6 @@ class BlockManager:
                 "joint KV load needs it and stays off",
                 exc_info=True,
             )
-        kv_offload_enabled = kv_connector_hosts_state_tier(
-            getattr(config, "kv_transfer_config", None)
-        )
         self.state_offload: StateOffloadIndex | None = None
         # (req_id, hash, target_group) admitted this pass and not yet handed to
         # the connector. Kept here rather than in the index because the slot
@@ -1020,6 +1024,38 @@ class BlockManager:
         slot = self._orphan_load_slots.pop(req_id, None)
         if slot is not None:
             self.state.release(slot)
+
+    def take_state_stores(self, max_inflight: int) -> list[tuple]:
+        """`(hash, unit_ids)` for checkpoints to hand the CPU tier this pass.
+
+        Pins each as it hands it over; `settle_state_store` releases. Empty
+        without a coordinator (the fork backends), which is correct rather than
+        a gap: a fork checkpoint is a state slot, and #2045 is what moved K3's
+        into the KV pool where a set of units can be read without being
+        rescued first.
+        """
+        if self.paged_state_checkpoints is None or self.state_offload is None:
+            return []
+        return self.paged_state_checkpoints.take_offload_stores(max_inflight)
+
+    def settle_state_store(self, prefix_hash: int, ok: bool) -> None:
+        """One store reported. Release the units, and index the hash if it landed.
+
+        Success and failure release the pin identically -- it existed to keep
+        the bytes still during the copy, and the copy is over either way.
+        Only the indexing differs, because only a hash whose bytes are really
+        there may be voted for.
+        """
+        if self.paged_state_checkpoints is not None:
+            self.paged_state_checkpoints.settle_offload_store(int(prefix_hash))
+        if ok and self.state_offload is not None:
+            self.state_offload.note_stored(int(prefix_hash))
+
+    def reclaim_stale_state_store_pins(self, timeout_s: float) -> int:
+        """Release store pins whose report never came. See the store."""
+        if self.paged_state_checkpoints is None:
+            return 0
+        return self.paged_state_checkpoints.reclaim_stale_offload_pins(timeout_s)
 
     def take_state_loads(self) -> list[tuple]:
         """`(req_id, hash, target_slot)` for loads admitted since the last call.

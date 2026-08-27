@@ -4644,11 +4644,13 @@ def _k3_scheduler() -> KimiK3OffloadScheduler:
     s._save_inflight = {}
     s._save_tracker = {}
     s._pending_state_loads = []
+    s._pending_state_stores = []
     s._save_inflight_since = {}
     s._save_stalled = False
     s._warned_save_stalled = False
     s._state_indexed = set()
     s._state_index_failed = set()
+    s._state_store_failed_locally = set()
     s._active_load_operations = {}
     s._do_save = True
     s._max_pending_saves = 4
@@ -4981,3 +4983,30 @@ def test_an_object_that_will_not_report_its_size_is_still_loaded():
 
     assert StateByteCodec._object_bytes(SimpleNamespace()) is None
     assert StateByteCodec._object_bytes(SimpleNamespace(get_size=lambda: 32)) == 32
+
+
+def test_state_stores_are_drained_into_the_metadata_exactly_once(monkeypatch):
+    """A second submission would store the same image twice, and the second
+    report would unpin a record the first already released."""
+    s = _k3_scheduler()
+    monkeypatch.setattr(
+        DenseOffloadScheduler,
+        "build_connector_meta",
+        lambda self: LMCacheOffloadMetadata(),
+    )
+    assert s.enqueue_state_stores([]) is False
+    assert s.enqueue_state_stores([(111, (1, 2, 3))]) is True
+
+    assert s.build_connector_meta().state_stores == [(111, (1, 2, 3))]
+    assert s.build_connector_meta().state_stores == []
+
+
+def test_a_step_whose_only_work_is_a_state_store_reaches_the_worker():
+    """Same shape as the `state_loads` bug: a store carries no `LMCacheReqMeta`,
+    so a work test that only counts requests drops the step -- and here the cost
+    is 127 blocks pinned against a report nobody was asked to produce."""
+    from atom.kv_transfer.disaggregation.types import connector_metadata_has_work
+
+    meta = LMCacheOffloadMetadata()
+    meta.state_stores = [(111, (1, 2))]
+    assert connector_metadata_has_work(meta)

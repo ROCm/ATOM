@@ -64,6 +64,34 @@ _LMCACHE_PIN_TIMEOUT_DEFAULT_S = 300.0
 # it on a 1ms poll and the answer is a process constant.
 _SAVE_ABANDON_TIMEOUT_S: float | None = None
 
+# Memoised result of `_offload_max_pending_saves`, a process constant likewise.
+_MAX_PENDING_OFFLOAD: int | None = None
+
+
+def _offload_max_pending_saves() -> int:
+    """How many offload transfers may be outstanding at once, engine-side.
+
+    Shared with the KV leg's `OFFLOAD_MAX_PENDING_SAVES` rather than given a
+    knob of its own: a KV save and a state store both hold the bytes they are
+    reading out of the same pool while they run, so the queue depth is one
+    question about one resource. Two independent numbers would let an operator
+    raise one and unknowingly double what a slow backend can pin.
+    """
+    global _MAX_PENDING_OFFLOAD
+    if _MAX_PENDING_OFFLOAD is not None:
+        return _MAX_PENDING_OFFLOAD
+    raw = os.environ.get("OFFLOAD_MAX_PENDING_SAVES", "2")
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "invalid OFFLOAD_MAX_PENDING_SAVES=%r; using 2 for the state tier",
+            raw,
+        )
+        value = 2
+    _MAX_PENDING_OFFLOAD = max(1, value)
+    return _MAX_PENDING_OFFLOAD
+
 
 def _offload_save_abandon_timeout_s() -> float:
     """Seconds a finished request's blocks may sit deferred on an offload save
@@ -1919,6 +1947,7 @@ class Scheduler:
             connector_meta_output = None
             if self.kv_connector is not None:
                 self._publish_state_loads()
+                self._publish_state_stores()
                 connector_meta_output = self.kv_connector.build_connector_meta()
 
             # Freeze, per seq, whether this chunk finishes the prompt. Uses the
@@ -2079,6 +2108,7 @@ class Scheduler:
         connector_meta_output = None
         if self.kv_connector is not None:
             self._publish_state_loads()
+            self._publish_state_stores()
             connector_meta_output = self.kv_connector.build_connector_meta()
 
         decode_batch = ScheduledBatch(
@@ -2499,6 +2529,44 @@ class Scheduler:
         )
         if settle is not None:
             settle(req_id, ok=ok)
+
+    def _publish_state_stores(self) -> None:
+        """Hand this pass's ready checkpoints to the connector for the CPU tier.
+
+        Beside `_publish_state_loads` and on the same schedule, so one pass
+        makes one decision about the tier. The cap is the same
+        `OFFLOAD_MAX_PENDING_SAVES` the KV leg uses and for the same reason:
+        each outstanding transfer holds the bytes it is reading out of the
+        pool, so the queue depth is also how much of the pool a slow backend
+        can pin.
+
+        `take_state_stores` pins as it hands over, so anything the connector
+        will not carry has to be settled here rather than left to the
+        reconciler's full timeout -- the units are already held.
+        """
+        if self.kv_connector is None:
+            return
+        take = getattr(getattr(self, "block_manager", None), "take_state_stores", None)
+        if take is None:
+            return
+        stores = take(_offload_max_pending_saves())
+        if not stores:
+            return
+        accepted = False
+        enqueue = getattr(self.kv_connector, "enqueue_state_stores", None)
+        if enqueue is not None:
+            accepted = bool(enqueue(stores))
+        if accepted:
+            return
+        logger.warning(
+            "state offload: %s did not carry %d state store(s); releasing "
+            "their units now. The tier's index should not have been installed "
+            "against this connector.",
+            type(self.kv_connector).__name__,
+            len(stores),
+        )
+        for prefix_hash, _units in stores:
+            self.block_manager.settle_state_store(prefix_hash, ok=False)
 
     def _publish_state_loads(self) -> None:
         """Hand this pass's state-tier loads to the connector, before it builds
@@ -3404,12 +3472,27 @@ class Scheduler:
         # Indexed only on the report, never at submission: a hash advertised
         # before its bytes exist parks the next request over that prefix
         # against a `get` that must miss.
-        offload = getattr(getattr(self, "block_manager", None), "state_offload", None)
+        bm = getattr(self, "block_manager", None)
+        offload = getattr(bm, "state_offload", None)
         take = getattr(self.kv_connector, "take_state_reports", None)
         if offload is not None and take is not None:
-            indexed, _failed = take()
+            indexed, failed = take()
+            # Both settle the pin; only success indexes the hash. A hash whose
+            # bytes are not really there must never be voted for, and a pin
+            # exists to keep the source still during the copy -- which is over
+            # either way.
             for h in indexed:
-                offload.note_stored(int(h))
+                bm.settle_state_store(int(h), ok=True)
+            for h in failed:
+                bm.settle_state_store(int(h), ok=False)
+            # Unit-side twin of `_reconcile_stalled_deferred_saves`, on the same
+            # window and for the same reason: the pin lives in this process
+            # while the D2H runs in the worker, so a report lost to a crashed
+            # worker or a dropped completion would hold a whole image out of
+            # the pool forever. Recovery is total -- a leaked pin breaks no
+            # `BlockPool` invariant -- so zeroing the count restores the record
+            # exactly.
+            bm.reclaim_stale_state_store_pins(_offload_save_abandon_timeout_s())
 
     def get_request_counts(self) -> tuple[int, int]:
         """Returns (num_running_reqs, num_waiting_reqs)."""

@@ -165,6 +165,7 @@ class LMCacheOffloadMetadata(ConnectorMetadata):
         "requests",
         "lookup_requests_in_step",
         "state_loads",
+        "state_stores",
     )
 
     def __init__(self) -> None:
@@ -177,6 +178,10 @@ class LMCacheOffloadMetadata(ConnectorMetadata):
         # token ids, no block ids, no chunking -- only the park/report
         # lifecycle, which is why it rides the metadata rather than the batch.
         self.state_loads: list[tuple] = []
+        # (state_hash, unit_ids) for checkpoints leaving HBM for the CPU tier.
+        # Not keyed by request: by the time a store lands its request is long
+        # gone, and the hash is all the report carries back.
+        self.state_stores: list[tuple] = []
 
     def add_request(self, meta: LMCacheReqMeta) -> None:
         self.requests.append(meta)
