@@ -228,6 +228,58 @@ class _KimiMLAGDNCommon(GDNStateMixin):
         """Bytes in each destination segment of an image of `units` units."""
         return np.tile(self._page_unit_regions()[1], units)
 
+    def page_unit_views(self, unit_ids: Sequence[int]) -> list[torch.Tensor]:
+        """Tensor-view counterpart of `_page_unit_regions`, for the CPU tier.
+
+        `_page_unit_regions` hands the Triton descriptor raw int64 addresses,
+        which is right for a D2D copy the GPU issues. The LMCache staging
+        packer takes `list[torch.Tensor]` instead, so the same bytes have to be
+        nameable as views -- this is that seam, and it is the ONLY new one the
+        tier needs: a load writes the Active Slot directly and reuses
+        `state_entry_views`.
+
+        **Order is the contract.** Unit major, row minor -- the same ravel as
+        `_page_unit_bases`, which is the order `_checkpoint_copy_plan` builds
+        the destination stream in. Save and load both go through this one
+        function, so self-consistency would be enough on its own; the reason it
+        still has to match is that a blob written by one build must not be read
+        by another that ordered it differently, which is what the `layout_id` in
+        `StateByteCodec.key` is for.
+
+        **The `block_ratio` trap, same as `_page_unit_regions`.** `unit_ids`
+        carries *logical* block ids while `kv_cache` is shaped in *physical*
+        ones, and K3's ratio is 128. Flattening the two block axes together and
+        indexing by `unit * block_size` is what converts them: it is the same
+        arithmetic `_page_unit_bases` does in addresses, so the two cannot drift
+        into disagreeing about which bytes a unit owns.
+
+        Every view is contiguous, which the packer requires: a row of a
+        contiguous pool is contiguous, and a slice along its leading axis stays
+        so. `_page_unit_regions` is called first for its side effect -- it is
+        where the contiguity and granularity checks live.
+        """
+        _base, _stride = self._page_unit_regions()
+        cache = self.model_runner.kv_cache
+        rows, entry = cache.shape[0], cache.shape[3]
+        block = self.model_runner.block_size
+        # Logical blocks the pool holds, which is what a unit id indexes.
+        # Range-checked against THIS count, not the physical one: the physical
+        # count is `block_ratio` times smaller, so checking it would pass ids
+        # that address past the end of the tensor.
+        logical_blocks = (cache.shape[1] * cache.shape[2]) // block
+        planes = [cache[row].view(-1, entry) for row in range(rows)]
+        views: list[torch.Tensor] = []
+        for unit in unit_ids:
+            unit = int(unit)
+            if not 0 <= unit < logical_blocks:
+                raise IndexError(
+                    f"PAGE unit {unit} outside the pool's {logical_blocks} "
+                    "logical blocks"
+                )
+            lo = unit * block
+            views.extend(plane[lo : lo + block] for plane in planes)
+        return views
+
     def build_kv_cache_tensor(self, layer_id: int, module):
         from atom.config import KVCacheTensor
 

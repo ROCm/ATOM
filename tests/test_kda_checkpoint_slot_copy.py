@@ -442,3 +442,87 @@ class TestAStoreRestoreRoundTripMovesExactlyTheImage:
         for row in range(self.ROWS):
             tail = pool[row].reshape(-1)[len(units) * self.LOGICAL_BS * self.ENTRY :]
             assert int(tail.sum()) == 0
+
+
+class TestPageUnitViewsNameTheSameBytes:
+    """`page_unit_views` is the CPU tier's seam onto the PAGE units.
+
+    `_page_unit_regions` gives the Triton descriptor raw addresses; the LMCache
+    packer wants tensors. Two ways to name one set of bytes is exactly the kind
+    of pair that drifts, so every test here asks both and compares.
+    """
+
+    H = TestPageUnitAddressesAreArithmetic
+
+    def build(self, **kw):
+        stub, cache = self.H.build(self.H(), **kw)
+        stub.page_unit_views = K3._KimiMLAGDNCommon.page_unit_views.__get__(
+            stub, type(stub)
+        )
+        return stub, cache
+
+    def test_a_view_starts_exactly_where_the_address_says(self):
+        stub, _ = self.build()
+        units = [4, 0, 2]  # not ascending: ids are not a range
+        views = stub.page_unit_views(units)
+        addrs = stub._page_unit_bases([units])[0]
+        assert len(views) == len(addrs) == self.H.ROWS * len(units)
+        assert [v.data_ptr() for v in views] == addrs.tolist()
+
+    def test_a_view_is_exactly_one_region_long(self):
+        stub, _ = self.build()
+        views = stub.page_unit_views([1])
+        sizes = stub._page_unit_stream_sizes(1)
+        assert [v.numel() * v.element_size() for v in views] == sizes.tolist()
+
+    def test_the_order_is_unit_major_row_minor(self):
+        """The packer indexes segments positionally, so this order IS the blob
+        layout -- and `_checkpoint_copy_plan` built the HBM stream the same
+        way. A build that ordered it differently must not read another's blob,
+        which is what `layout_id` in the key covers."""
+        stub, _ = self.build()
+        units = [3, 1]
+        base, stride = stub._page_unit_regions()
+        want = [base[r] + u * stride[r] for u in units for r in range(self.H.ROWS)]
+        assert [v.data_ptr() for v in stub.page_unit_views(units)] == want
+
+    def test_every_view_is_contiguous(self):
+        """The Triton packer refuses a strided segment."""
+        stub, _ = self.build()
+        assert all(v.is_contiguous() for v in stub.page_unit_views([0, 2, 4]))
+
+    def test_a_unit_id_past_the_logical_count_is_refused(self):
+        """The `block_ratio` trap in its most dangerous form.
+
+        The bound is computed from the tensor rather than taken from the
+        harness's label, because that is the whole point: `unit_ids` counts
+        logical blocks and the tensor is shaped in physical ones, so a check
+        written against the wrong axis admits ids that read past the end.
+        """
+        stub, cache = self.build()
+        logical = (cache.shape[1] * cache.shape[2]) // self.H.LOGICAL_BS
+        assert logical != cache.shape[1], "the harness must exercise a ratio != 1"
+        assert stub.page_unit_views([logical - 1])  # the last valid id
+        with pytest.raises(IndexError, match="logical blocks"):
+            stub.page_unit_views([logical])
+
+    def test_the_views_do_not_reach_into_a_neighbouring_unit(self):
+        """Off-by-one here scrambles someone else's checkpoint rather than
+        running off the end, so the bound is asserted from the bytes."""
+        stub, cache = self.build()
+        flat = cache.reshape(-1)
+        seen = set()
+        logical = (cache.shape[1] * cache.shape[2]) // self.H.LOGICAL_BS
+        for unit in range(logical):
+            for v in stub.page_unit_views([unit]):
+                lo = (v.data_ptr() - flat.data_ptr()) // flat.element_size()
+                span = set(range(lo, lo + v.numel()))
+                assert not (span & seen), f"unit {unit} overlaps an earlier one"
+                seen |= span
+
+    def test_the_granularity_check_runs_before_any_view_is_handed_out(self):
+        stub, _ = self.build(
+            block_size=TestPageUnitAddressesAreArithmetic.LOGICAL_BS * 2
+        )
+        with pytest.raises(RuntimeError, match="granularity"):
+            stub.page_unit_views([0])
