@@ -937,8 +937,6 @@ class ModelRunner:
             config.parallel_config.data_parallel_master_ip,
             config.parallel_config.data_parallel_base_port,
         )
-        # Groups spanning the same ranks each build their own RCCL communicators,
-        # and the KV cache gets whatever the memory budget has left after them.
         with reuse_identical_rank_groups():
             # Both branches handle simulated TP: the PP path only to reject it,
             # since it would otherwise deadlock on a group sized for absent ranks.

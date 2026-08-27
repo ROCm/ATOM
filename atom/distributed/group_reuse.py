@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Share one set of RCCL communicators among parallel groups spanning identical ranks.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """Deduplicate parallel groups whose rank sets coincide.
 
@@ -8,21 +8,6 @@
 * ``device_group`` -- ``torch.distributed.new_group(backend="nccl")``
 * ``pynccl_comm``  -- a second, independent RCCL communicator over the *same* ranks
 * ``ca_comm`` / ``qr_comm`` -- CustomAllreduce / QuickAllReduce IPC buffers
-
-On MI355X (8x288GB) those cost 2.40GB, 2.40GB and 2.00GB respectively, i.e. 6.8GB
-per group. When ``tensor_parallel_size == decode_context_parallel_size == world_size``
-the TP, DCP and EP groups all span ranks ``{0..N-1}`` yet each builds its own set,
-and PCP/PP/DP degenerate to single-rank groups that still pay 0.54GB apiece for a
-communicator no message ever crosses. Measured on 8xMI355X with ``-tp 8 -dcp 8``:
-12.61GB for the six groups, of which 7.75GB is duplication.
-
-That matters because the KV cache is sized as the *residual* of the memory budget
-(see ``ModelRunner.get_num_blocks``): whatever the communicators hold is subtracted
-from ``available_for_kv`` one-for-one.
-
-The reuse trick is the one ATOM already applies to the vLLM plugin path in
-``atom/plugin/vllm/tp_group_reuse.py`` (PR #1804): skip ``GroupCoordinator.__init__``,
-which is what allocates, and graft the fields of an already-built group instead.
 
 Trade-off: aliased groups issue their collectives on one communicator, so those
 collectives serialize against each other. That is already true for TP/DCP/EP, whose
