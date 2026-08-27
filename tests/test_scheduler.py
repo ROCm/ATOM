@@ -1622,6 +1622,16 @@ class TestPreempt:
 # ── postprocess ────────────────────────────────────────────────────────────
 
 
+class _DSparkSpecConfig:
+    """The two fields Scheduler reads off speculative_config, DSpark-shaped."""
+
+    def __init__(self, num_speculative_tokens: int):
+        self.num_speculative_tokens = num_speculative_tokens
+
+    def use_dspark(self) -> bool:
+        return True
+
+
 class TestPostprocess:
     def _prefill(self, scheduler, seq):
         scheduler.add(seq)
@@ -1681,6 +1691,67 @@ class TestPostprocess:
         assert (
             sched.engine_stats.num_generation_tokens == 2
         ), "the post-EOS token must not be counted"
+
+    @staticmethod
+    def _sched_with_kv_role(kv_config):
+        """Scheduler carrying a kv_transfer_config, without standing up a real
+        connector (Mooncake's needs a distributed config and open ports)."""
+        cfg = MockConfig(
+            speculative_config=_DSparkSpecConfig(3), kv_transfer_config=kv_config
+        )
+        with mock.patch(
+            "atom.utils.forward_context.get_kvconnector", return_value=None
+        ):
+            return Scheduler(cfg)
+
+    def test_a_pd_producer_does_not_speculate(self):
+        """The producer hands off after T0 and never proposes, so speculation
+        must be off: with it on, postprocess pads mtp_k placeholders that hold
+        num_tokens short of max_tokens and the handoff never fires."""
+        for kv_config in (
+            {"kv_connector": "mooncake", "kv_role": "kv_producer"},
+            {
+                "kv_connector": "multi",
+                "connectors": [
+                    {"kv_connector": "lmcache_offload", "kv_role": "offload"},
+                    {"kv_connector": "mooncake", "kv_role": "kv_producer"},
+                ],
+            },
+        ):
+            sched = self._sched_with_kv_role(kv_config)
+            assert sched.use_spec is False
+            assert sched.mtp_k == 0
+
+    def test_a_pd_consumer_still_speculates(self):
+        sched = self._sched_with_kv_role(
+            {"kv_connector": "mooncake", "kv_role": "kv_consumer"}
+        )
+        assert sched.use_spec is True
+        assert sched.mtp_k == 3
+
+    def test_absent_drafts_leave_spec_token_ids_empty(self, seq_factory):
+        """A P/D producer runs with mtp_k set but never calls propose(): it
+        disables deferred output so the consumer consumes T0 once, and the
+        runner only drafts on the deferred path. postprocess used to index the
+        resulting None and take the prefill engine down on the first request."""
+        sched = Scheduler(MockConfig(speculative_config=_DSparkSpecConfig(3)))
+        assert sched.mtp_k == 3
+        seq = self._prefill(sched, seq_factory([1, 2, 3, 4]))
+
+        # What the runner emits with propose() skipped: counts are still real
+        # zero-filled arrays, only the drafts are absent.
+        sched.postprocess(
+            list(sched.running),
+            ScheduledBatchOutput(
+                req_ids=[seq.id],
+                token_ids=[(10,)],
+                num_rejected=np.zeros(1, dtype=np.int32),
+                num_bonus=np.zeros(1, dtype=np.int32),
+                draft_token_ids=None,
+            ),
+        )
+
+        assert list(seq.spec_token_ids) == []
 
     def test_eos_finishes(self, scheduler, seq_factory):
         seq = self._prefill(scheduler, seq_factory([1, 2, 3, 4]))
@@ -1796,6 +1867,33 @@ class TestScheduledBatchPDFirstDecodeMTP:
         )
 
         assert list(batch.scheduled_tokens) == [t0, *drafts]
+
+    def test_window_starts_at_t0_when_the_producer_sent_no_drafts(self):
+        """The producer does not speculate, so the handoff carries T0 alone.
+        The window must still open at T0: unpadded, the trailing mtp_k+1 slice
+        reaches back into the prompt and verifies prompt tokens as drafts."""
+        mtp_k = 3
+        prompt = [11, 22, 33, 44, 55, 66]
+        t0 = 14
+        sched = Scheduler(MockConfig(speculative_config=_DSparkSpecConfig(mtp_k)))
+        seq = Sequence(prompt, block_size=16)
+        seq.kv_transfer_params = {"first_token_id": t0}
+
+        sched._schedule_first_decode_after_remote_kv(seq)
+        seq.type = SequenceType.DECODE
+
+        batch = ScheduledBatch(
+            seqs={seq.id: seq},
+            num_scheduled_tokens=[mtp_k + 1],
+            total_tokens_num=mtp_k + 1,
+            total_tokens_num_decode=mtp_k + 1,
+            total_seqs_num=1,
+            total_seqs_num_decode=1,
+            num_spec_step=mtp_k,
+        )
+
+        assert list(batch.scheduled_tokens)[0] == t0
+        assert not set(batch.scheduled_tokens) & set(prompt)
 
     def test_normal_decode_window_unchanged(self):
         """offset >= 0 path is byte-for-byte the trailing mtp_k+1 slice."""

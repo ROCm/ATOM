@@ -41,7 +41,7 @@ from atom.distributed.pp_comm import (
     recv_intermediate_tensors,
 )
 from atom.distributed.simulated_tp import apply_simulated_tp, reject_simulated_tp
-from atom.kv_transfer.disaggregation import KVConnectorOutput
+from atom.kv_transfer.disaggregation import KVConnectorOutput, kv_config_has_producer
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
 from atom.model_engine.run_labels import build_run_label
@@ -158,16 +158,9 @@ def max_schedulable_decode_bs(
     return min(max_num_seqs, max_num_batched_tokens // full_q_len)
 
 
-def _kv_config_has_producer(kv_config: object) -> bool:
-    """Whether a KV config contains a P/D producer, including ``multi``."""
-    if not isinstance(kv_config, dict):
-        return False
-    if kv_config.get("kv_role") == "kv_producer":
-        return True
-    return any(
-        _kv_config_has_producer(sub)
-        for sub in kv_config.get("connectors", [])
-    )
+# Re-exported under the old private name: this module is where the predicate
+# used to live and where callers (and tests) still import it from.
+_kv_config_has_producer = kv_config_has_producer
 
 
 class TokenLocations(NamedTuple):
@@ -515,18 +508,20 @@ class tokenIDProcessor:
             token_ids = scheduled_tokens[
                 total_tokens_prefill : total_tokens_prefill + total_tokens_decode
             ]
-            if self.use_spec:
-                if (
-                    getattr(batch, "dynamic_spec_query_tokens_per_req", None)
-                    is not None
-                ):
-                    # RAGGED: scheduled_tokens is already the flat [anchor, drafts...]
-                    # so no rectangular reshape/overwrite is needed.
-                    pass
-                else:
-                    token_ids[:, 1:] = batch.scheduled_spec_decode_tokens
-
             self.input_ids.np[:total_tokens_decode] = token_ids
+            # RAGGED needs no overwrite: scheduled_tokens is already the flat
+            # [anchor, drafts...]. The uniform case does, and `scheduled_tokens`
+            # is flat here too -- reshape to one row per request the way the
+            # deferred path below does, rather than indexing it as if it were
+            # already rectangular.
+            if (
+                self.use_spec
+                and batch.num_spec_step > 0
+                and getattr(batch, "dynamic_spec_query_tokens_per_req", None) is None
+            ):
+                self.input_ids.np[:total_tokens_decode].reshape(
+                    -1, int(batch.num_spec_query_tokens)
+                )[:, 1:] = batch.scheduled_spec_decode_tokens
             return self.input_ids.copy_to_gpu(total_tokens_decode)
 
         # PD consumer first decode: no prior prefill step initialized
