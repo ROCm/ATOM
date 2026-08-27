@@ -1080,10 +1080,7 @@ class BlockManager:
         the received suffix needs registration. The trailing partial hash block
         remains unpublished, matching ``hash_blocks``.
 
-        Returns the number of complete received suffix blocks processed for
-        this sequence. This includes blocks annotated from an existing canonical
-        hash, so it is neither the total number of hashed prompt blocks nor
-        necessarily the number of newly inserted hash-index entries.
+        Returns the number of complete prompt hash blocks now registered.
         """
         if not self.enable_prefix_caching:
             return 0
@@ -1118,7 +1115,7 @@ class BlockManager:
         # prompt blocks. Mark that one-shot work complete so its first decode
         # output does not publish the same physical blocks again.
         seq.prefix_hashes_published = True
-        return num_full - start
+        return num_full
 
     def deallocate(self, seq: Sequence):
         for block_id in reversed(seq.block_table):
