@@ -30,6 +30,16 @@ on:
         type: string
         required: false
         default: ""
+      bench_kind:
+        description: "Benchmark client: random (benchmark_serving ISL/OSL sweep) or aiperf_agentic (AgentX trace replay)"
+        type: string
+        required: false
+        default: "random"
+      benchmark_duration:
+        description: "aiperf_agentic only: replay seconds. Under 900 forces --unsafe-override and stamps submission_valid=false."
+        type: string
+        required: false
+        default: ""
       env_vars:
         type: string
         required: false
@@ -166,8 +176,12 @@ jobs:
           # Substituting ${{ env.ARGS }} into a `bash -lc "..."` string instead
           # collides the JSON's double quotes with the outer quotes and strips
           # them (argparse: invalid loads value). Mirrors atom-test.yaml.
+          # BENCH_KIND + CONC reach `launch` too: an agentic run sizes
+          # --max-num-seqs off the cell's concurrency (AgentX counts session
+          # trees, and subagent fan-out needs the headroom).
           echo "ENABLE_TORCH_PROFILER=${{ inputs.enable_profiler && '1' || '0' }} \
             ENABLE_RTL_PROFILER=${{ inputs.enable_rtl && '1' || '0' }} \
+            BENCH_KIND=${{ inputs.bench_kind }} CONC=$CONC \
             .github/scripts/atom_test.sh launch $model_path $ARGS $EXTRA_LAUNCH_ARGS" \
             | docker exec -i atom-benchmark bash -l
 
@@ -177,6 +191,9 @@ jobs:
             -e RESULT_FILENAME="${{ env.RESULT_FILENAME }}" \
             -e SERVER_ARGS="$ARGS" \
             -e BENCH_EXTRA_ARGS="${{ inputs.bench_args }}" \
+            -e BENCH_KIND="${{ inputs.bench_kind }}" \
+            -e CONC="$CONC" \
+            ${{ inputs.benchmark_duration != '' && format('-e AIPERF_BENCHMARK_DURATION={0}', inputs.benchmark_duration) || '' }} \
             -e MP="$model_path" \
             atom-benchmark bash -lc '.github/scripts/atom_test.sh benchmark "$MP"'
 
