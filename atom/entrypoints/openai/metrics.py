@@ -139,8 +139,10 @@ class _AtomMetricsCollector:
         for name, documentation, value in (
             (
                 "atom:dp_affinity_new",
-                "Number of new sticky DP sessions assigned to a load-aware "
-                "cache owner.",
+                (
+                    "Number of new sticky DP sessions assigned to a load-aware "
+                    "cache owner."
+                ),
                 dp_router.get("affinity_new_total", 0),
             ),
             (
@@ -150,14 +152,18 @@ class _AtomMetricsCollector:
             ),
             (
                 "atom:dp_affinity_spill",
-                "Number of existing sessions moved off their cache owner; "
-                "strict affinity keeps this zero.",
+                (
+                    "Number of existing sessions moved off their cache owner; "
+                    "strict affinity keeps this zero."
+                ),
                 dp_router.get("affinity_spill_total", 0),
             ),
             (
                 "atom:dp_affinity_parent_ignored",
-                "Number of new child sessions independently placed instead of "
-                "inheriting a parent owner.",
+                (
+                    "Number of new child sessions independently placed instead of "
+                    "inheriting a parent owner."
+                ),
                 dp_router.get("affinity_parent_ignored_total", 0),
             ),
             (
@@ -167,8 +173,10 @@ class _AtomMetricsCollector:
             ),
             (
                 "atom:dp_route_load_balanced",
-                "Number of sessionless requests routed by the configured load "
-                "balancer.",
+                (
+                    "Number of sessionless requests routed by the configured load "
+                    "balancer."
+                ),
                 dp_router.get("load_balanced_total", 0),
             ),
         ):
@@ -193,9 +201,11 @@ class _AtomMetricsCollector:
             ),
             (
                 "atom:dp_queued_prefill_tokens",
-                "Current estimated uncached prefill-token debt per "
-                "data-parallel rank; later sticky turns charge only positive "
-                "prompt growth.",
+                (
+                    "Current estimated uncached prefill-token debt per "
+                    "data-parallel rank; later sticky turns charge only positive "
+                    "prompt growth."
+                ),
                 dp_router.get("queued_prefill_tokens_per_rank", []),
             ),
             (

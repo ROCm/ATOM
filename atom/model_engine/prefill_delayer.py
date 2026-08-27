@@ -81,7 +81,6 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Optional
 
 import torch
 
@@ -92,37 +91,37 @@ _DEBUG = os.environ.get("ATOM_PREFILL_DELAYER_DEBUG", "0") == "1"
 
 class PrefillDelayer:
     __slots__ = (
-        "dp_size",
-        "cpu_group",
-        "max_num_batched_tokens",
-        "target_fill",
-        "ttft_max_ticks",
-        "partial_max_ticks",
-        "stall_ticks",
-        "kv_high_watermark",
-        "token_usage_low_watermark",
-        "max_queue_ms",
-        "prefill_decode_interval",
+        "_decode_interval_remaining",
+        "_first",
+        "_hold_ticks",
+        "_prefill_executed_since_last_decision",
+        "_prev_pending",
         # buffer / episode state
         "_reduce_buf",
-        "_hold_ticks",
         "_stall_count",
-        "_prev_pending",
-        "_first",
-        "_decode_interval_remaining",
-        "_prefill_executed_since_last_decision",
         # stats
         "_stat_fire_fill",
+        "_stat_fire_kv",
+        "_stat_fire_nodecode",
+        "_stat_fire_partial",
+        "_stat_fire_queue_ms",
         "_stat_fire_stall",
         "_stat_fire_ttft",
-        "_stat_fire_kv",
-        "_stat_fire_partial",
-        "_stat_fire_nodecode",
-        "_stat_fire_queue_ms",
         "_stat_fire_vacuous",
         "_stat_hold",
         "_stat_hold_decode_interval",
         "_stat_log_every",
+        "cpu_group",
+        "dp_size",
+        "kv_high_watermark",
+        "max_num_batched_tokens",
+        "max_queue_ms",
+        "partial_max_ticks",
+        "prefill_decode_interval",
+        "stall_ticks",
+        "target_fill",
+        "token_usage_low_watermark",
+        "ttft_max_ticks",
     )
 
     def __init__(
@@ -135,8 +134,8 @@ class PrefillDelayer:
         partial_max_ticks: int = 100,
         stall_ticks: int = 10,
         kv_high_watermark: float = 0.9,
-        token_usage_low_watermark: Optional[float] = None,
-        max_queue_ms: Optional[float] = None,
+        token_usage_low_watermark: float | None = None,
+        max_queue_ms: float | None = None,
         prefill_decode_interval: int = 0,
     ):
         self.dp_size = dp_size
