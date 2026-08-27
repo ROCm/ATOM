@@ -49,6 +49,66 @@ from atom.utils import envs
 logger = logging.getLogger("atom")
 
 
+_STEP_BUDGET_TALLY: list[tuple[int, int, int, int, int, int]] = []
+_STEP_BUDGET_WINDOW = 500
+
+
+def _probe_step_budget(
+    n_pref_seqs: int,
+    n_dec_seqs: int,
+    pref_tokens: int,
+    dec_tokens: int,
+    reserve: int,
+    budget: int,
+) -> None:
+    """Per-step prefill/decode budget split, under ATOM_PROBE_STEP_BUDGET=1.
+
+    The decode-first reserve invites a wrong mental model. Without spec decode
+    it is ONE token per in-flight decode, so at dp8/conc1024 a rank reserves
+    ~128 of 16384 -- 0.8% of the prefill budget, nowhere near enough to move
+    TTFT on its own. If mixed batching costs TTFT, the cost is in how long a
+    step takes, not in how much budget prefill was denied, and only the
+    realised per-step numbers can tell those apart.
+
+    Accumulates and reports every 500 steps: per-step logging at ~10k steps a
+    run is what makes a log unreadable.
+    """
+    if not envs.ATOM_PROBE_STEP_BUDGET:
+        return
+    _STEP_BUDGET_TALLY.append(
+        (n_pref_seqs, n_dec_seqs, pref_tokens, dec_tokens, reserve, budget)
+    )
+    if len(_STEP_BUDGET_TALLY) < _STEP_BUDGET_WINDOW:
+        return
+    rows = _STEP_BUDGET_TALLY[:]
+    _STEP_BUDGET_TALLY.clear()
+    n = len(rows)
+    mixed = sum(1 for r in rows if r[0] > 0 and r[1] > 0)
+    pref_only = sum(1 for r in rows if r[0] > 0 and r[1] == 0)
+    dec_only = sum(1 for r in rows if r[0] == 0 and r[1] > 0)
+    avg = lambda i: sum(r[i] for r in rows) / n  # noqa: E731
+    mx = lambda i: max(r[i] for r in rows)  # noqa: E731
+    logger.warning(
+        "[probe] step budget over %d steps: mixed=%d prefill_only=%d "
+        "decode_only=%d | reserve avg=%.1f max=%d | prefill_budget avg=%.1f | "
+        "prefill_tok avg=%.1f max=%d | decode_tok avg=%.1f max=%d | "
+        "seqs avg %.1fP+%.1fD",
+        n,
+        mixed,
+        pref_only,
+        dec_only,
+        avg(4),
+        mx(4),
+        avg(5),
+        avg(2),
+        mx(2),
+        avg(3),
+        mx(3),
+        avg(0),
+        avg(1),
+    )
+
+
 def _prompt_tokens_of(result) -> int:
     """Prompt tokens in whatever a `_schedule()` returned.
 
@@ -1339,6 +1399,17 @@ class Scheduler:
                     seq, start, start + int(num_scheduled_tokens[i])
                 )
 
+            # Prefill-only step: it returns before the decode phase, so decode
+            # got nothing this step -- which is exactly the case worth counting.
+            _probe_step_budget(
+                num_seqs_prefill,
+                0,
+                total_tokens_num_prefill,
+                0,
+                decode_token_reserve,
+                prefill_budget,
+            )
+
             prefill_batch = ScheduledBatch(
                 seqs=scheduled_seqs,
                 num_scheduled_tokens=num_scheduled_tokens,
@@ -1510,6 +1581,15 @@ class Scheduler:
         total_tokens_num_prefill = sum(num_scheduled_tokens[:num_seqs_prefill])
         total_tokens_num_decode = sum(num_scheduled_tokens[num_seqs_prefill:])
         total_tokens_num = total_tokens_num_prefill + total_tokens_num_decode
+
+        _probe_step_budget(
+            num_seqs_prefill,
+            num_seqs_decode,
+            total_tokens_num_prefill,
+            total_tokens_num_decode,
+            decode_token_reserve,
+            prefill_budget,
+        )
 
         num_cached_tokens_list = [
             seq.num_cached_tokens for seq in scheduled_seqs.values()

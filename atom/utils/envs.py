@@ -585,6 +585,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # batches were all prefill-only, or all refused), in which case it has
     # validated nothing about this path. Costs one dict update per step.
     "ATOM_PROBE_TBO_MIXED": lambda: os.getenv("ATOM_PROBE_TBO_MIXED", "0") == "1",
+    # Log how each step's token budget was actually split between prefill and
+    # decode. Exists because the decode-first reserve is easy to reason about
+    # wrongly: with no spec decode it is one token per in-flight decode, so at
+    # dp8/conc1024 it is ~128 of 16384 (0.8%) and cannot by itself explain a
+    # TTFT change. Only a per-step tally settles what the budget really did.
+    "ATOM_PROBE_STEP_BUDGET": lambda: os.getenv("ATOM_PROBE_STEP_BUDGET", "0") == "1",
     # --- PCP MoE comm mode ---
     # Fold the PCP (prefill-context-parallel) dim into the MoE tp/ep sharding.
     # Only meaningful when prefill_context_parallel_size > 1;
