@@ -30,7 +30,14 @@ AIPERF_NUM_DATASET_ENTRIES="${AIPERF_NUM_DATASET_ENTRIES:-393}"
 AIPERF_BENCHMARK_DURATION="${AIPERF_BENCHMARK_DURATION:-3600}"
 AIPERF_WARMUP_REQUESTS_PER_LANE="${AIPERF_WARMUP_REQUESTS_PER_LANE:-10}"
 AIPERF_TRACE_IDLE_GAP_CAP_SECONDS="${AIPERF_TRACE_IDLE_GAP_CAP_SECONDS:-300}"
-AIPERF_WARMUP_GRACE_PERIOD="${AIPERF_WARMUP_GRACE_PERIOD:-1800}"
+# `--agentic-warmup-grace-period`, NOT `--warmup-grace-period`: aiperf
+# synthesizes the agentic warmup from the profiling phase rather than a
+# user-declared one, and its own help says the plain flag is only honoured
+# alongside `--warmup-duration` -- which an agentic run never sets. Passing
+# the plain one is therefore inert, and unset means the warmup barrier waits
+# INDEFINITELY for every primed trajectory to return (aiperf b7b16cf,
+# src/aiperf/config/flags/cli_config.py:2310-2330).
+AIPERF_AGENTIC_WARMUP_GRACE_PERIOD="${AIPERF_AGENTIC_WARMUP_GRACE_PERIOD:-1800}"
 AIPERF_TRAJECTORY_START_MIN_RATIO="${AIPERF_TRAJECTORY_START_MIN_RATIO:-0.25}"
 AIPERF_TRAJECTORY_START_MAX_RATIO="${AIPERF_TRAJECTORY_START_MAX_RATIO:-0.75}"
 AIPERF_FAILED_REQUEST_THRESHOLD="${AIPERF_FAILED_REQUEST_THRESHOLD:-0.10}"
@@ -126,7 +133,7 @@ run_aiperf_agentic() {
     --trajectory-start-max-ratio "${AIPERF_TRAJECTORY_START_MAX_RATIO}" \
     --warmup-requests-per-lane "${AIPERF_WARMUP_REQUESTS_PER_LANE}" \
     --trace-idle-gap-cap-seconds "${AIPERF_TRACE_IDLE_GAP_CAP_SECONDS}" \
-    --warmup-grace-period "${AIPERF_WARMUP_GRACE_PERIOD}" \
+    --agentic-warmup-grace-period "${AIPERF_AGENTIC_WARMUP_GRACE_PERIOD}" \
     --use-server-token-count \
     --no-gpu-telemetry \
     --tokenizer "${MODEL_PATH}" \
