@@ -1,16 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""The midstep write path is present, tested, and deliberately not enabled.
+"""The midstep write path is present and deliberately not enabled.
 
 `TestMidstepCheckpoints` builds its own `StateTransfer(readable_midstep=True)`,
 so the whole midstep suite passes whatever production declares. That is the
-right call for those tests -- they are about the mechanism -- but it means
-nothing anywhere would notice `GDNStateMixin.state_transfer` flipping the flag
-by accident. This is that notice.
+right call for those tests -- they are about the mechanism -- but it leaves
+nothing watching the flag itself. This is that watch, for the half of it that
+a CPU-only runner can see.
 
-Why it is off, in one line each, so re-enabling is a decision rather than a
-patch that looks harmless:
+Why it is off, so re-enabling is a decision rather than a patch that looks
+harmless:
 
   * the runner declines to write on six conditions `commit_midstep` cannot
     see, and publishes the hash regardless -- a findable image over bytes
@@ -24,35 +24,23 @@ patch that looks harmless:
     speculation.
 
 None of it has run under a server: Kimi-K3 takes the PAGE path and cannot
-reach this one. The numerical core *is* verified --
-`test_gdn_midstep_state_gpu.py` shows a slice of `h` is bit-exact against a
-forward stopped there -- which is why the machinery stays rather than being
-deleted.
+reach this one.
 
-Deliberately not behind `importorskip`: a module that skips itself when aiter
-is absent is a module the non-GPU CI runner never runs, which is how this
-would rot back to True unnoticed.
+`GDNStateMixin.state_transfer` is the other half of the flag and is NOT
+checked here. Reaching it means importing `gdn_attn`, which imports aiter at
+module level, and this suite runs on a plain CPU runner with neither aiter nor
+triton installed -- an import that would abort collection rather than skip.
+The GDN side belongs with the kernel tests, outside this repo's unit suite.
 """
 
 
-def test_gdn_does_not_declare_itself_midstep_readable():
-    from atom.model_ops.attentions.gdn_attn import GDNStateMixin
-
-    transfer = GDNStateMixin.state_transfer(object.__new__(GDNStateMixin))
-    assert transfer.readable_midstep is False, (
-        "GDN midstep writes silently store wrong state; see this module's "
-        "docstring before turning it back on"
-    )
-    assert transfer.forks, "the fork itself is unaffected"
-    assert transfer.fork_tokens == 1
-
-
-def test_the_paged_coordinator_agrees():
-    """Whatever GDN says, a PAGE class is never midstep-readable.
+def test_the_paged_coordinator_is_not_midstep_readable():
+    """A PAGE class is never midstep-readable, whatever GDN declares.
 
     Its image is copied out of a slot after the forward, so there are no
-    interior positions to slice -- a different reason from GDN's, reaching the
-    same answer, and the two must not drift into disagreeing.
+    interior positions to slice. A different reason from GDN's, reaching the
+    same answer today -- and if GDN's answer ever changes, this one must not
+    follow it by accident.
     """
     from atom.model_engine.page_unit_checkpoint import (
         PagedStateCheckpointCoordinator,
@@ -61,15 +49,26 @@ def test_the_paged_coordinator_agrees():
     assert PagedStateCheckpointCoordinator.readable_midstep is False
 
 
-def test_the_machinery_is_still_here():
-    """Off, not deleted -- the copy-out kernel and its entry point remain.
+def test_the_midstep_protocol_is_still_declared():
+    """Off, not deleted: `StateCache` still names the three-call protocol.
 
-    If this fails, someone removed the implementation instead of the flag, and
-    re-enabling is no longer a one-line decision.
+    If this fails, someone removed the interface instead of the flag, and
+    turning midstep back on is no longer a one-line decision.
     """
-    from atom.model_ops.fla_ops.state_checkpoint import write_state_checkpoints
+    from atom.model_engine.state_cache import StateCache
 
-    assert callable(write_state_checkpoints)
-    from atom.model_ops.fla_ops.chunk import pop_last_intermediate_states
+    for name in ("reserve_midstep", "publish_midstep", "cancel_midstep"):
+        assert hasattr(StateCache, name), f"{name} left the protocol"
 
-    assert callable(pop_last_intermediate_states)
+
+def test_a_readable_transfer_is_still_expressible():
+    """The flag is a real bivalued field, not a constant folded to False.
+
+    `StateTransfer` is pure data with no GPU dependency, so this holds on a
+    CPU runner: whoever re-enables the path needs the field to still carry the
+    claim, and whoever deletes the field should fail here first.
+    """
+    from atom.model_engine.state_runtime import StateTransfer
+
+    assert StateTransfer.fork(1, readable_midstep=True).readable_midstep is True
+    assert StateTransfer.fork(1).readable_midstep is False
