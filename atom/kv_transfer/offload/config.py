@@ -25,14 +25,10 @@ import torch
 
 from atom.distributed.dcp_utils import dcp_replicated_index_cache_enabled
 
-# Version 4 merges two independent PAGE-identity changes that each shipped as
-# "version 3". One added the effective index-cache dtype: FP4 and FP8 DSV4
-# indexers differ in region count and byte layout, so they must never reuse one
-# another's objects even under an identical HF config. The other added the GLM
-# replicated-index layout and IndexShare schedule, whose compact layer axis and
-# DCP-expanded index pages are incompatible with the sharded-index layout.
-# Objects from either version-3 generation are unreadable here.
-PAGE_LAYOUT_VERSION = 4
+# Version 3 adds the effective index-cache dtype to the PAGE identity. FP4 and
+# FP8 DSV4 indexers have different region counts and byte layouts, so they must
+# never reuse one another's objects even when the HF model config is identical.
+PAGE_LAYOUT_VERSION = 3
 _PAGE_FINGERPRINT_BYTES = 16
 _OFFLOAD_LAYOUT_ALIASES = {
     "hybrid": "hybrid",
