@@ -50,7 +50,6 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
     def __init__(self, config) -> None:
         super().__init__(config)
         self._state_tier = None
-        self._state_engine = None
         # Inert until a request has both legs, which only a joint boundary
         # produces; costs one dict lookup per report otherwise.
         self._joint_park = _JointPark()
@@ -119,68 +118,41 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
             world_size=world,
             worker_id=rank,
         )
-        codec.bind_storage_manager(self._state_storage_manager(cfg, meta, rank))
+        # ONE pool, shared with paged KV. A separate `atom-state-{rank}` engine
+        # used to be built here, on the argument that the KV write stream would
+        # evict the checkpoints. It does not hold up: state is 3-13% of a
+        # boundary's bytes, not a rounding error, and -- the part that decides
+        # it -- a request writes its KV chunks and its one state object inside
+        # the same prefill window, so they enter LMCache's LRU together and
+        # cool at the same rate. State is retired ALONGSIDE its own KV, which
+        # is what we want: a boundary whose KV is gone is worthless anyway.
+        #
+        # Two pools cost what one does not: independent eviction policies that
+        # must drift, and a joint boundary needs BOTH legs to survive together.
+        # #2045 made the same argument one tier up and won with it (state moved
+        # out of its reserved slots into the KV pool, 81.85% -> 93.60%).
+        #
+        # What one pool costs is a single `cache_policy` for both legs. That is
+        # real, and currently free: LRU is right for both. The FIFO override
+        # this used to set rested on "a state entry is written once and read
+        # once", which #2045's own numbers refute -- ~4,808 resumes over ~1,508
+        # checkpoints is ~3 reads each, and bursty re-access is LRU's home
+        # ground.
+        #
+        # `OFFLOAD_STATE_CPU_SIZE` is gone with it. #2045 deleted the HBM-side
+        # reservation for exactly this reason (`extra_entries=0`, 1.7 GiB
+        # returned) -- keeping the same knob one tier down repeats the thing it
+        # disproved. `LMCACHE_MAX_LOCAL_CPU_SIZE` is the one size to tune.
+        codec.bind_storage_manager(self._engine.storage_manager)
         # No index here: StateOffloadIndex lives in the engine process; both
         # directions report and the engine applies.
         self._state_tier = StateOffloadTier(codec)
         logger.info(
-            "kimi_k3 offload: state tier up, entry=%.2f MiB rank=%d",
+            "kimi_k3 offload: state tier up, entry=%.2f MiB rank=%d, "
+            "sharing the paged-KV CPU pool",
             entry_bytes / (1 << 20),
             rank,
         )
-
-    def _state_storage_manager(self, cfg, meta, rank: int):
-        """The tier's own CPU pool, not the paged-KV one.
-
-        Sharing loses both ways: the KV write stream is several times the
-        state volume so it evicts the checkpoints, and a stopped KV backend
-        takes the tier down with it.
-        """
-        raw = os.environ.get("OFFLOAD_STATE_CPU_SIZE", "16")
-        try:
-            gib = float(raw)
-        except ValueError:
-            logger.warning("kimi_k3 offload: invalid OFFLOAD_STATE_CPU_SIZE=%r", raw)
-            gib = 16.0
-        if gib <= 0:
-            logger.info("kimi_k3 offload: state tier shares the paged-KV CPU pool.")
-            return self._engine.storage_manager
-        try:
-            from lmcache.v1.cache_engine import LMCacheEngineBuilder
-            from lmcache.v1.memory_management import MemoryFormat
-
-            cfg.max_local_cpu_size = gib
-            # FIFO, while the KV pool keeps LMCache's LRU. A state entry is
-            # written once and read once (turn N+1 resumes off turn N's anchor
-            # and nobody looks again), so what decides its worth is age against
-            # the think time. LRU would promote an entry already consumed over
-            # one still waiting. Tied to the ladder being off; with rungs shared
-            # across conversations, entries stop being one-shot and LRU wins.
-            cfg.cache_policy = "FIFO"
-            engine = LMCacheEngineBuilder.get_or_create(
-                f"atom-state-{rank}",
-                cfg,
-                meta,
-                self._engine.gpu_connector,
-                lambda t, s: None,
-                lambda o, s: o,
-            )
-            engine.fmt = MemoryFormat.KV_2LTD
-            engine.post_init()
-            self._state_engine = engine
-            logger.info(
-                "kimi_k3 offload: state pool %.0f GiB/rank (paged KV keeps %s)",
-                gib,
-                os.environ.get("LMCACHE_MAX_LOCAL_CPU_SIZE", "<default>"),
-            )
-            return engine.storage_manager
-        except Exception:
-            logger.warning(
-                "kimi_k3 offload: no separate state pool; sharing the paged-KV "
-                "pool, where the KV write stream will evict checkpoints.",
-                exc_info=True,
-            )
-            return self._engine.storage_manager
 
     # -- per-step ----------------------------------------------------------
     def start_load_kv(self, metadata) -> None:
