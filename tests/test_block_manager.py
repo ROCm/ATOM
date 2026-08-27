@@ -142,7 +142,7 @@ class TestPublishLoadedPrefix:
         # from the GPU-only dcp_ops module used to calculate local block counts.
         monkeypatch.setattr(
             bm,
-            "_dcp_num_blocks",
+            "num_pool_blocks",
             lambda seq_len: (seq_len + bm.hash_block_size - 1) // bm.hash_block_size,
         )
         loaded = seq_factory(list(range(16)))

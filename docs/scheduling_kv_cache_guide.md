@@ -403,7 +403,7 @@ def can_allocate(self, seq: Sequence) -> int:
     if seq.has_per_req_cache and not self.state.has_free():
         return -1
     if not self.enable_prefix_caching:
-        if not self.kv.has_free(self._dcp_num_blocks(len(seq))):
+        if not self.kv.has_free(self.num_pool_blocks(len(seq))):
             return -1
     # ... (prefix caching dry-run returns the contiguous hit-block count)
 
