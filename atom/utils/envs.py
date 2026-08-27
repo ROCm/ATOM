@@ -118,10 +118,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Set to 0 to stop a refused state-cache hit from placing a checkpoint of
     # its own, leaving the prompt-end anchor as the only placement. Overrides
     # --state-checkpoint-demand so the policy can be flipped without touching a
-    # launch script. On measured cc-traces a demand rung is 47% of all
-    # checkpoint writes but reads back 2.8% of the time, against 85.2% for an
-    # anchor, so its write traffic may cost more in evictions than its reuse is
-    # worth. See `BlockManager._record_checkpoint_demand`.
+    # launch script. The rung's write traffic may cost more in evictions than
+    # its reuse is worth — see `BlockManager._record_checkpoint_demand`.
     "ATOM_STATE_CHECKPOINT_DEMAND": lambda: (
         os.getenv("ATOM_STATE_CHECKPOINT_DEMAND", "1") == "1"
     ),

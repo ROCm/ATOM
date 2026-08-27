@@ -152,10 +152,9 @@ class Sequence:
         # The demand is reactive — it only exists once a hit has already been
         # refused for want of a checkpoint, which is one request too late for
         # the position that serves the *next* turn of a conversation. On
-        # agentic traffic that position is where the reuse actually is: over
-        # the SemiAnalysis cc-traces, 93.5% of resumes land on a previous
-        # prompt's end and 0.0% on the interval ladder. So it is reserved up
-        # front rather than waited for.
+        # agentic traffic that position is where nearly all the reuse is (see
+        # `BlockManager._record_checkpoint_end`), so it is reserved up front
+        # rather than waited for.
         #
         # Written by `BlockManager._record_checkpoint_end` at admission, read
         # by `checkpoint_cut` and `checkpointers_at` — which must agree, the

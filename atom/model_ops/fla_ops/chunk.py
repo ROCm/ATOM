@@ -122,7 +122,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
     #
     # Captured only when `keep_intermediate_states` asks for it, i.e. when the
     # caller is ATOM's state-cache path and will actually pop it. `h` is large
-    # (33 MB at T=8192, H=8, K=V=128) and callers that never pop — the vLLM,
+    # (see `keep_intermediate_states`) and callers that never pop — the vLLM,
     # SGLang and rtpllm plugins among them — would otherwise pin one
     # indefinitely after their last forward.
     #
@@ -362,17 +362,8 @@ def pop_last_intermediate_states():
     cache can take a checkpoint at any chunk-aligned interior position without
     splitting the prefill into two forward passes.
 
-    Bit-exact against the alternative, despite appearances. ``h`` is stored in
-    the input dtype (bf16) while the recurrence carries fp32 internally, so a
-    state read out of it *is* pre-rounded — but the GDN state pool is bf16 too
-    (``GDNStateMixin._state_dtypes``), so ending the forward at that position
-    instead would round the same fp32 value on the way in. Measured on MI355
-    over 56 (seed, length, boundary) combinations: the checkpoint equals a
-    shortened re-run's stored state exactly, every time, and resuming from it
-    reproduces the remaining tokens' outputs bit for bit. See
-    ``tests/test_gdn_state_checkpoint_gpu.py``. A pool at higher precision than
-    ``h`` would break that, which is why kimi_linear — the one model whose v
-    side is fp32 — does not take this path.
+    ``h`` is stored in the input dtype; see ``GDNStateMixin.state_transfer``
+    for why that makes a checkpoint exact for every model on this path.
 
     Consumes the reference so a later caller cannot read a stale tensor, and
     returns None when the last forward was not asked to keep its states.

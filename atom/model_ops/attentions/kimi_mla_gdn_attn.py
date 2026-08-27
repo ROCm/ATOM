@@ -90,21 +90,16 @@ class _KimiMLAGDNCommon(GDNStateMixin):
         127 ordinary KV blocks — 0.112% of the paged pool — drawn from the same
         free list as everything else, and evicted by the same LRU.
 
-        Not midstep-readable, and that part of the old override still holds:
-        KDA calls `chunk_kimi_delta_attn`, which returns only the final state
-        and never exposes the per-chunk states an interior checkpoint would be
-        sliced out of. `PagedStateCheckpointCoordinator` says `False` for its
-        own reasons, so the two agree.
+        Not midstep-readable: KDA calls `chunk_kimi_delta_attn`, which returns
+        only the final state and never exposes the per-chunk states an interior
+        checkpoint would be sliced out of. `PagedStateCheckpointCoordinator`
+        says `False` for its own reasons, so the two agree.
 
-        The dtype objection that kept this on `fork` does not survive the
-        change of mechanism. It was: `_state_dtypes` gives kimi_linear an fp32
-        v side while the chunked states are bf16, so a checkpoint cut from `h`
-        would hand cached requests a rounded state. But a PAGE image is copied
-        out of the slot and back into a slot — both fp32, no kernel output in
-        between, no conversion anywhere. `kimi_k3.py` writes the slot with no
-        cast for the same reason ("last_state already has ssm_state's dtype").
-        Both dtypes are named in the layout id, so a build that changed either
-        cannot read another's images.
+        Dtype-safe by construction, which a checkpoint cut from `h` would not
+        be here — `_state_dtypes` gives kimi_linear an fp32 v side. An image is
+        copied slot to slot with no kernel output in between, so that fp32 side
+        round-trips exactly. Both dtypes are named in the layout id, so a build
+        that changed either cannot read another's images.
         """
         if not self._uses_paged_checkpoints():
             return StateTransfer.fork(1)

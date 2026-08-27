@@ -902,13 +902,12 @@ class BlockManager:
         against `demands_recorded` is where it would show if it did not.
 
         `--no-state-checkpoint-demand` drops the rung and leaves the prompt-end
-        anchor alone. Worth measuring because on the cc-traces a demand is 47%
-        of checkpoint writes and reads back 2.8% of the time, against 85.2% for
-        an anchor — so most of the write traffic buys almost nothing, and each
-        write evicts something. Whether *removing* those writes beats merely
-        demoting them (`StateSlotPool.mark_speculative`) is the open question:
-        the CPU replay scores the two identically, which is the signature of a
-        harness that models eviction order but not the cost of the write.
+        anchor alone. Worth measuring: the rung is most of the write traffic
+        and little of the read-back (`StateSlotPool.mark_speculative` has the
+        numbers), and each write evicts something. Whether *removing* those
+        writes beats merely demoting them is the open question — the CPU replay
+        scores the two identically, which is the signature of a harness that
+        models eviction order but not the cost of the write.
         """
         wanted = (
             self._gated_hit(seq, compressed_hit, block_hashes, assume_checkpointed=True)
@@ -1316,7 +1315,7 @@ class BlockManager:
         `checkpoint_demand_pos` is a boundary this seq was denied for want of a
         checkpoint (`_record_checkpoint_demand`); `checkpoint_end_pos` is this
         prompt's own end, which is the position agentic traffic actually resumes
-        at (93.5% of resumes on the cc-traces, against 0.0% on the ladder). Both
+        at (see `_record_checkpoint_end`). Both
         are admitted on the same terms: off the grid, and still subject to the
         `successor_room` test below — which `_record_checkpoint_end` pre-checks,
         so the cut and the keep cannot disagree. `checkpoint_cut` reads the same

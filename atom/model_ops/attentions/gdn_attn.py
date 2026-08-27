@@ -278,12 +278,9 @@ class GDNStateMixin:
         length. The recurrent state is rewritten whole, and every write path in
         `causal_conv1d` stores the full `state_len` window to the output slot —
         the short-chunk paths get there by loading the previous window from the
-        *input* slot, shifting left and appending x — so the new group stops
-        depending on the old one the moment the forward returns.
-
-        Reading the state layout alone suggests `conv_kernel_dim - 1` instead,
-        on the theory that a shorter forward leaves the new group holding a
-        window the old group still owns part of. The kernel closes that gap.
+        *input* slot, shifting left and appending x — so the new slot stops
+        depending on the old one the moment the forward returns. The layout
+        alone would suggest `conv_kernel_dim - 1`; the kernel closes that gap.
 
         A fork rather than a copy because the state is two per-family tensors
         rather than one contiguous entry, so there is no single range to
@@ -298,23 +295,11 @@ class GDNStateMixin:
         because `_checkpoint_targets` and the copy-out kernel exist; a backend
         that declares it without them keeps zero checkpoints and says nothing.
 
-        Costs no accuracy, which is worth stating because the obvious reading
-        says it must: `h` is bf16 while the recurrence carries fp32, so a state
-        sliced out of it is pre-rounded. The shortened forward it replaces
-        rounds the same fp32 value on the way into the pool, though, because
-        the two dtypes are the same one — `h` is allocated as `k.new_empty`
-        and `_state_dtypes` returns `config.torch_dtype` — so the rounding is
-        common to both paths and the difference is nil. Measured on MI355: the
-        checkpoint matches a cut prefill's stored state exactly across 56
-        (seed, length, boundary) combinations, and resuming from one reproduces
-        the remaining tokens' outputs bit for bit. See
-        `tests/test_gdn_state_checkpoint_gpu.py`.
-
-        That argument is about the two dtypes agreeing, not about the copy, so
-        it does not survive a pool allocated at higher precision than `h`.
-        `_state_dtypes` builds exactly one such pool — kimi_linear's fp32 v
-        side — and that model is already off this path for a different reason
-        (`_KimiMLAGDNCommon.state_transfer`).
+        Exact, not approximate: `h` is `k.new_empty` and `_state_dtypes`
+        returns `config.torch_dtype`, so slicing `h` rounds exactly where a
+        shortened forward would. This rests on the two dtypes agreeing;
+        kimi_linear's fp32 v side is the one pool that breaks it, and it
+        overrides (`_KimiMLAGDNCommon.state_transfer`).
         """
         return StateTransfer.fork(1, readable_midstep=True)
 
@@ -744,9 +729,8 @@ class GDNStateMixin:
         `cu_seqlens` / `chunk_offsets` locate each sequence within them — so
         the kernel reconstructs an absolute index as `cu_seqlens[row] + off`
         (conv) or `chunk_offsets[row] + off // 64` (SSM). Both bases are
-        per-sequence: omitting them is what made an earlier Python-loop
-        version silently capture one sequence's state into another's
-        checkpoint whenever a batch held two prefills.
+        per-sequence; a shared base silently captures one sequence's state into
+        another's checkpoint whenever a batch holds two prefills.
 
         A target is dropped when this step holds too few tokens before it to
         fill the conv window. Both halves of a checkpoint must land together —
@@ -755,10 +739,8 @@ class GDNStateMixin:
 
         Slots, not a separate checkpoint region: a checkpoint here IS an
         ordinary pool slot, indexed exactly as every other slot on this path
-        is. (The upstream branch appends checkpoints after the runtime slots
-        and offsets them by a `state_cache_base`; that region does not exist
-        in this pool.) One slot is the whole checkpoint — a resumed prefix has
-        no speculation to roll back, so it needs no scratch beside it.
+        is. One slot is the whole checkpoint — a resumed prefix has no
+        speculation to roll back, so it needs no scratch beside it.
         """
         all_saves = getattr(batch, "state_save_all", None)
         if not all_saves:
@@ -1187,10 +1169,6 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             return attn_metadata, positions
         gdn_metadata = self.prepare_gdn_metadata(batch, attn_metadata, is_prefill=True)
 
-        # Interior checkpoints: the impl slices them out of the chunk kernel's
-        # per-chunk states, so a checkpoint mid-prompt costs no extra forward.
-        # Positions at the step's end are sourced from the runtime slot; both
-        # kinds are tagged and written by one kernel.
         gdn_metadata.ssm_checkpoints = self._checkpoint_targets(batch)
         if gdn_metadata.ssm_checkpoints is not None:
             # Same mapping the chunk kernel builds internally, computed once

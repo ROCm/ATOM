@@ -457,12 +457,10 @@ class PagedStateCheckpointCoordinator:
         entries. Keying by seq alone would have the second overwrite the first
         before either is stored, which costs a shortened prefill chunk on every
         prompt and buys nothing. What makes keeping both affordable is the
-        image's price — 127 blocks, 0.112% of the paged pool, against a whole
-        53.6 MiB Active Slot under `fork`.
+        image's price against a whole Active Slot under `fork`.
 
-        The anchor is the placement that pays. Measured on the cc-traces, of
-        4,808 resumes with a nonzero KV hit, 93.5% land on a previous prompt end
-        and 0.0% on the 8192 ladder, so the grid's chunk cuts were pure cost;
+        The anchor is the placement that pays, and the ladder is not (see
+        `BlockManager._record_checkpoint_end`), so
         `--state-checkpoint-interval-tokens -1` drops the grid and leaves the
         anchor and the demand rung as the only two placements.
         """

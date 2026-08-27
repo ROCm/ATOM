@@ -365,8 +365,8 @@ class GatedDeltaNet(nn.Module):
                 cu_seqlens=non_spec_query_start_loc,
                 head_first=False,
                 use_qk_l2norm_in_kernel=True,
-                # Only when there is somewhere to put them: `h` is ~33 MB at
-                # T=8192 and is dropped on return otherwise.
+                # Only when there is somewhere to put them; `h` is large and is
+                # dropped on return otherwise.
                 keep_intermediate_states=ckpt is not None,
             )
             # Init cache
@@ -375,8 +375,8 @@ class GatedDeltaNet(nn.Module):
             )
             # SSM state cache: copy out every checkpoint this step reached.
             #
-            # A checkpoint group is never where the recurrence runs — the live
-            # state stays in the request's runtime group for its whole life —
+            # A checkpoint slot is never where the recurrence runs — the live
+            # state stays in the request's runtime slot for its whole life —
             # so BOTH kinds of position need a copy:
             #   interior  <- h[chunk boundary]
             #   step end  <- the runtime slot; NOT in `h`, which holds
@@ -385,12 +385,8 @@ class GatedDeltaNet(nn.Module):
             # runs after the scatter above so that slot holds this step's
             # final state, which is what an `is_end` target reads.
             #
-            # One launch over device index tensors, not a Python loop over
-            # targets: the loop cost a `copy_` pair per target per layer, and
-            # its per-sequence base arithmetic was easy to get wrong (`h` and
-            # `mixed_qkv` are batch-concatenated, so offsets need
-            # `chunk_offsets[row]` / `cu_seqlens[row]` — the kernel does that
-            # itself).
+            # One launch over device index tensors, so the per-sequence base
+            # arithmetic lives in the kernel — see `_checkpoint_targets`.
             #
             # Conv state needs no support from the conv kernel: it IS the last
             # `state_len` rows of the conv input ending at the position, the

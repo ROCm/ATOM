@@ -34,9 +34,9 @@ class StateSlotPool:
     `1 + num_spec` of them — one committed state plus a rollback slot per
     speculated token — while a checkpoint holds exactly one, because the
     rollback slots are scratch a resumed prefix has no use for. That asymmetry
-    is the point: this pool used to allocate the wide shape unconditionally, so
-    at `--num-speculative-tokens 2` every checkpoint wasted two thirds of its
-    bytes, and those bytes come out of the same budget as the KV cache.
+    is the point: allocating the wide shape unconditionally would cost a
+    checkpoint three slots at `--num-speculative-tokens 2` rather than one, out
+    of the same budget as the KV cache.
 
     The slots one request holds need not be adjacent. Nothing downstream reads
     them by arithmetic on a base: the ssm kernel gathers each index out of the
