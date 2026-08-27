@@ -55,14 +55,16 @@
           "suffix": "-dpa-tbo",
           "extra_args": "--enable-dp-attention --enable-tbo",
           "env_vars": "GPU_MAX_HW_QUEUES=5\nATOM_NUMA_BIND=1",
+          "bench_args": "--metric-percentiles 50,99,99.9,100",
           "conc_min": 256,
           "conc_max": 2048
         },
         {
           "label": "DPA TBO mixed",
           "suffix": "-dpa-tbo-mixed",
-          "extra_args": "--enable-dp-attention --enable-tbo --enable-mixed-prefill-decode --max-num-batched-tokens 16384",
+          "extra_args": "--enable-dp-attention --enable-tbo --enable-mixed-prefill-decode",
           "env_vars": "GPU_MAX_HW_QUEUES=5\nATOM_NUMA_BIND=1\nATOM_TBO_MIXED=1\nATOM_PROBE_TBO_MIXED=1",
+          "bench_args": "--metric-percentiles 50,99,99.9,100",
           "conc_min": 1024,
           "conc_max": 1024
         },
