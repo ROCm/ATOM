@@ -162,7 +162,12 @@ jobs:
           echo "Docker: ${DOCKER_IMAGE}"
 
       - name: Run benchmark
-        timeout-minutes: 80
+        # A trace replay is an hour of profiling on top of model load, dataset
+        # configuration and a warmup that primes every lane -- 80 min killed a
+        # c=48 cell 3.5 min from the end. Kept ABOVE `atom_test.sh`'s drain
+        # budget (duration/60 + 90) so that supervisor wins the race and says
+        # why; this is only the backstop for a hang before it starts counting.
+        timeout-minutes: ${{ inputs.bench_kind == 'aiperf_agentic' && 180 || 80 }}
         env:
           EXTRA_LAUNCH_ARGS: ${{ inputs.extra_args }}
         run: |
