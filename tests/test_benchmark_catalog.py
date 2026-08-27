@@ -340,13 +340,22 @@ def test_dp_agentic_variant_carries_the_session_routing_env():
         "ATOM_DP_LB_REQ_EQUIV=512",
         "ATOM_ENABLE_PREFILL_DELAYER=1",
         "ATOM_PREFILL_DECODE_INTERVAL=10",
+        # `--enable-tbo` is never just a flag in this catalog: every TBO variant
+        # pairs it with these two. Asserted alongside so the flag cannot travel
+        # without them.
+        "GPU_MAX_HW_QUEUES=5",
+        "ATOM_NUMA_BIND=1",
     }
-    agentic = catalog.build_cells(CATALOG, bench_kind_filter={"aiperf_agentic"})
-    for cell in agentic:
+    for cell in catalog.build_cells(CATALOG, bench_kind_filter={"aiperf_agentic"}):
         env = set(cell["env_vars"].splitlines())
-        is_dpa = "--enable-dp-attention" in cell["server_args"]
-        assert dp_only <= env if is_dpa else not (dp_only & env), cell[
-            "result_filename"
-        ]
+        args = cell["server_args"]
+        name = cell["result_filename"]
+        is_dpa = "--enable-dp-attention" in args
+        if is_dpa:
+            assert dp_only <= env, f"{name} missing {sorted(dp_only - env)}"
+            assert "--enable-tbo" in args, name
+        else:
+            assert not (dp_only & env), f"{name} carries {sorted(dp_only & env)}"
+            assert "--enable-tbo" not in args, name
         # Pinned so throughput is not read through a fluctuating accept rate.
-        assert "--spec-decode-acceptance-rate 0.4966666667" in cell["server_args"]
+        assert "--spec-decode-acceptance-rate 0.4966666667" in args, name
