@@ -704,7 +704,19 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
             )
             hf_config._multimodal_config = full_config
         except Exception:
-            hf_config._multimodal_config = None
+            # This image's transformers may have no class for the architecture
+            # (see _PLAIN_TEXT_CONFIG_MODEL_TYPES). Falling through to None would
+            # leave the model with no `vision_config` and no way to build its
+            # tower, so rebuild the multimodal config from the raw dict instead.
+            # Sub-configs are promoted to PretrainedConfig so consumers can use
+            # attribute access either way.
+            plain = PretrainedConfig.from_dict(
+                {k: v for k, v in config_dict.items() if not isinstance(v, dict)}
+            )
+            for field, value in config_dict.items():
+                if isinstance(value, dict):
+                    setattr(plain, field, PretrainedConfig.from_dict(value))
+            hf_config._multimodal_config = plain
         return hf_config
 
     if model_type in _PLAIN_CONFIG_MODEL_TYPES:

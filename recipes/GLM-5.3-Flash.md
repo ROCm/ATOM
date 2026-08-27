@@ -1,11 +1,12 @@
 # GLM-5.3-Flash Bring-Up Notes
 
-> **Status: runs end to end under ATOM on 4× MI355X, text-only, context ≤ 2048.**
-> `atom/models/glm5_next.py` loads every parameter of the checkpoint and
-> generates coherent text; per-layer hidden states match the transformers
-> reference to cosine ≥ 0.9997 at all 45 layers. Not yet done: contexts beyond
-> `index_topk` (needs the sparse k-pool path), the MTP draft layer, and the
-> vision tower. See §7.
+> **Status: runs end to end under ATOM on 4× MI355X, context ≤ 2048.**
+> `atom/models/glm5_next.py` loads every parameter of the checkpoint — language
+> model and vision tower — and generates coherent text; per-layer hidden states
+> match the transformers reference to cosine ≥ 0.9997 at all 45 layers, and the
+> vision tower is bit-exact in fp32. Not yet done: contexts beyond `index_topk`
+> (needs the sparse k-pool path), the MTP draft layer, and the image processor
+> that would let the server actually accept an image. See §7.
 
 ```bash
 python -m recipes.glm5_3_flash.atom_run --model /models/GLM-5.3-Flash -tp 4 \
@@ -257,6 +258,23 @@ Two traps worth knowing about when reproducing this:
   against a prefix the reference would not have written. The per-layer cosines
   above are the load-bearing evidence, not this number.
 
+**Vision tower** (`atom/models/glm5_next_vl.py`, `vision_parity.py`). Loaded with
+the real `model.visual.*` weights and compared against `Glm5NextVisionModel` on
+the merged `[n_tokens, 4096]` output that gets scattered onto image placeholders:
+
+| dtype + attention | (1,2,2) | (1,4,4) | (1,8,12) | (2,4,4) |
+| --- | --- | --- | --- | --- |
+| fp32 + SDPA (correctness) | **bit-exact** | **bit-exact** | **bit-exact** | **bit-exact** |
+| bf16 + aiter (serving) | .999555 | .999845 | .994098 | .999677 |
+
+The fp32 row is the assertion — same kernel as the reference, no BF16 rounding,
+so it isolates the maths: patch embed, the block-major 2-D rope layout, 24
+blocks, clamped SwiGLU, the 2×2 merge, downsample conv and merger are all exactly
+right. The bf16 row is the serving path and is reported, not asserted; it carries
+two roundings (aiter packed-varlen vs SDPA, and ATOM's single fused `[gate|up]`
+GEMM vs the reference's two) compounded over 24 blocks, on random patches far
+worse conditioned than real normalised image input.
+
 **Known numerical gap.** GLM clamps its expert SwiGLU at ±`swiglu_limit` (10.0),
 but only ATOM's `flydsl` and `mori` MoE paths plumb `swiglu_limit`; the default
 `standard`/CK path (`ck_moe_stage1/2`) drops it. Measured on the reference: the
@@ -285,7 +303,13 @@ CUDA graphs and MTP are both still on the table.
 3. **MTP draft layer** (checkpoint layer 45: `eh_proj` / `enorm` / `hnorm` /
    `shared_head.norm`, plus its own indexer). `index_share_for_mtp_iteration`
    means it reuses the main model's top-k.
-4. **Vision tower + processor** for image and video input.
+4. **The image input path.** The tower itself is done: built, loaded and
+   bit-exact in fp32 (§6), with the model implementing the engine's
+   `get_vision_embeddings` / `merge_multimodal_embeddings` contract. What is
+   missing is upstream of it — `Glm5NextProcessor` only exists in transformers
+   >= 5.16 while ATOM pins 5.12.1, so nothing turns an image into `pixel_values`
+   + `image_grid_thw`, and `model_engine/multimodal.py` has no `glm5_next`
+   branch. Video additionally needs frame sampling.
 5. **Performance**: CUDA graphs (currently `--enforce-eager`), MTP speculative
    decoding, and dropping the `hc` torch fallback once the fused path is trusted.
 6. **Upstream the transformers FP8 bug** (§4a) and the gfx950 Triton failure (§4b).

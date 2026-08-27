@@ -795,10 +795,12 @@ class Glm5NextModel(nn.Module):
 
 
 class Glm5NextForConditionalGeneration(nn.Module):
-    """GLM-5.3-Flash, text path.
+    """GLM-5.3-Flash.
 
     The checkpoint nests the language model under ``model.language_model.*`` and
-    the vision tower under ``model.visual.*``; only the former is built here.
+    the vision tower under ``model.visual.*``. Both are built here; the tower is
+    skipped only when there is no `vision_config` to build it from, or on a
+    pipeline rank that does not produce token embeddings.
     """
 
     packed_modules_mapping: ClassVar[dict] = {
@@ -806,19 +808,20 @@ class Glm5NextForConditionalGeneration(nn.Module):
         ".up_proj": (".gate_up_proj", 1),
         **_KDA_PACKED_MODULES_MAPPING,
     }
-    # Strip the multimodal nesting: the checkpoint stores the language model
-    # under `model.language_model.*`, while this module tree (and therefore the
-    # parameter names) is rooted at `model.*`. Conveniently that also lines the
-    # names up with the checkpoint's quantization_config, which already writes
-    # its exclusions as `model.layers.N....`, so no separate quant name mapping
-    # is needed.
+    # Strip the multimodal nesting. The language model's parameter names are
+    # rooted at `model.*` and the tower's at `visual.*`, which also lines the
+    # language names up with the checkpoint's quantization_config (it already
+    # writes exclusions as `model.layers.N....`), so no quant name mapping is
+    # needed. Order matters only in that neither key is a substring of the other.
     weights_mapping: ClassVar[dict[str, str]] = {
+        "model.visual.": "visual.",
         "model.language_model.": "model.",
     }
-    # Vision tower is not served (text path only). The MTP draft layer needs no
-    # entry here: it is checkpoint layer 45 and the loader drops any layer index
-    # at or beyond `num_hidden_layers`.
-    skip_weight_prefixes: ClassVar[list[str]] = ["model.visual."]
+    # Prefixes dropped when the tower is not built; set per-instance in __init__.
+    # The MTP draft layer needs no entry: it is checkpoint layer 45 and the
+    # loader drops any layer index at or beyond `num_hidden_layers`.
+    vision_weight_prefixes: ClassVar[tuple[str, ...]] = ("model.visual.",)
+    skip_weight_prefixes: ClassVar[list[str]] = []
 
     fall_back_to_pt_during_load = False
 
@@ -853,8 +856,72 @@ class Glm5NextForConditionalGeneration(nn.Module):
         self.moe_layers = [m.experts for m in self.moe_mlp_layers]
         self.expert_weights = []
 
+        self._init_vision_tower(atom_config)
+
+    def _init_vision_tower(self, atom_config: Config) -> None:
+        """Build the vision tower, or arrange for its weights to be skipped.
+
+        The tower only runs where token embeddings are produced, so under
+        pipeline parallelism it lives on the first rank alone. It is also skipped
+        when the config carries no `vision_config` -- the text path stays fully
+        usable in that case rather than failing to start.
+        """
+        multimodal = getattr(atom_config, "multimodal_config", None)
+        vision_config = getattr(multimodal, "vision_config", None)
+
+        if vision_config is None or not get_pp_group().is_first_rank:
+            self.visual = None
+            self.image_token_id = None
+            self.video_token_id = None
+            self.skip_weight_prefixes = list(self.vision_weight_prefixes)
+            return
+
+        from atom.models.glm5_next_vl import build_vision_tower
+
+        self.visual = build_vision_tower(vision_config)
+        self.image_token_id = getattr(multimodal, "image_token_id", None)
+        self.video_token_id = getattr(multimodal, "video_token_id", None)
+
+    @property
+    def has_vision_tower(self) -> bool:
+        return getattr(self, "visual", None) is not None
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
+
+    def get_vision_embeddings(
+        self, pixel_values: torch.Tensor, grid_thw: torch.Tensor
+    ) -> torch.Tensor:
+        """Patches -> one 4096-wide embedding per merged 2x2 block."""
+        if not self.has_vision_tower:
+            raise RuntimeError(
+                "GLM-5.3-Flash vision embeddings were requested but no tower is "
+                "built. Either the config carried no `vision_config`, or this is "
+                "a pipeline rank other than the first."
+            )
+        return self.visual(pixel_values, grid_thw)
+
+    def merge_multimodal_embeddings(
+        self,
+        input_ids: torch.Tensor,
+        inputs_embeds: torch.Tensor,
+        vision_embeds: torch.Tensor,
+    ) -> torch.Tensor:
+        """Scatter vision embeddings onto the image/video placeholder tokens."""
+        mask = torch.zeros_like(input_ids, dtype=torch.bool)
+        for token_id in (self.image_token_id, self.video_token_id):
+            if token_id is not None:
+                mask |= input_ids == token_id
+        n_slots = int(mask.sum())
+        if n_slots != vision_embeds.shape[0]:
+            raise ValueError(
+                f"GLM-5.3-Flash got {vision_embeds.shape[0]} vision embeddings for "
+                f"{n_slots} placeholder tokens. Each image contributes "
+                "(t*h*w)/spatial_merge_size**2 tokens, and multimodal prefills "
+                "must not be chunked."
+            )
+        inputs_embeds[mask] = vision_embeds.to(inputs_embeds.dtype)
+        return inputs_embeds
 
     def forward(
         self,
