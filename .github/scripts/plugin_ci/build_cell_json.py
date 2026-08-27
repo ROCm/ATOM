@@ -48,12 +48,8 @@ def main():
                 "PLUGIN_CI_SLURM_SUBMIT_RUNNER",
                 "atom-mi355-8gpu-vllm-sgl-ci",
             ),
-            "slurm_account": os.environ.get(
-                "PLUGIN_CI_SLURM_ACCOUNT", "amd-aifw-dev"
-            ),
-            "slurm_partition": os.environ.get(
-                "PLUGIN_CI_SLURM_PARTITION", "amd-spur"
-            ),
+            "slurm_account": os.environ.get("PLUGIN_CI_SLURM_ACCOUNT", "amd-aifw-dev"),
+            "slurm_partition": os.environ.get("PLUGIN_CI_SLURM_PARTITION", "amd-spur"),
             "log_root": os.environ.get(
                 "PLUGIN_CI_LOG_ROOT",
                 "/shared_nfs/ATOM_PLUGIN_CI/ATOM_SGLang_LOG/",
