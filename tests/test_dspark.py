@@ -1535,7 +1535,7 @@ def test_every_half_of_the_core_short_circuits_dummy_run():
         # `piecewise=False` is the decorator's eager route -- it just runs the
         # body, which is what has the guard.
         assert DeepseekV4Attention._attn_compress(layer, piecewise=False, x=x) is None
-        o = DeepseekV4Attention._attn_paged_core(layer, qkn, positions)
+        o = DeepseekV4Attention._sparse_attention(layer, qkn, positions)
         assert o.shape == (T, H * D) and torch.all(o == 0)
     finally:
         v4.get_forward_context = saved
@@ -1677,9 +1677,9 @@ def test_every_op_fake_agrees_with_its_body():
                 [A._attn_compress(layer, piecewise=False, x=x)],
             ),
             (
-                "v4_attn_paged_core",
+                "v4_sparse_attention",
                 [
-                    v4._v4_attn_paged_core_fake(
+                    v4._v4_sparse_attention_fake(
                         None,
                         None,
                         None,
@@ -1693,7 +1693,7 @@ def test_every_op_fake_agrees_with_its_body():
                         "L",
                     ).shape
                 ],
-                [A._attn_paged_core(layer, v4.QKNormRopeOut(), positions).shape],
+                [A._sparse_attention(layer, v4.QKNormRopeOut(), positions).shape],
             ),
         ]
     finally:
@@ -1707,7 +1707,7 @@ def test_every_op_fake_agrees_with_its_body():
 
 
 def test_paged_post_refuses_a_missing_q():
-    # `forward()`'s narrow branch always calls `v4_attn_paged_core`, so whatever
+    # `forward()`'s narrow branch always calls `v4_sparse_attention`, so whatever
     # fills its Q must run on EVERY narrow path. Gating `v4_qk_norm_rope` on
     # AF_PIECEWISE alone left plain PIECEWISE with no QK-norm at all and a None
     # Q going into an aiter kernel -- a GPU-side failure, and invisible to every
@@ -1745,7 +1745,7 @@ def test_paged_post_refuses_a_missing_q():
     v4.get_forward_context = lambda: fc
     try:
         with pytest.raises(AssertionError, match="did not run upstream"):
-            DeepseekV4Attention._attn_paged_core(
+            DeepseekV4Attention._sparse_attention(
                 layer,
                 QKNormRopeOut(),  # every field None -- the broken-gate shape
                 torch.zeros(T, dtype=torch.int32),

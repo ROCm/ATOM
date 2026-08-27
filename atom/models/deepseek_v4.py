@@ -210,7 +210,7 @@ def v4_attn_compress(x: torch.Tensor, layer_name: str) -> None:
     piece keys on num_tokens alone. The indexer top-k would belong here on the
     FP8 path (`_score_topk_decode_ragged` pads to a `bs * full_q` rectangle),
     but FP4 is the default and its varqlen path is token-shaped, so it sits in
-    `_attn_paged_core` with the rest of that granularity.
+    `_sparse_attention` with the rest of that granularity.
 
     It returns NOTHING, and does not need to: a split op's submodule is the one
     piece the backend leaves uncompiled (`backends.py`, `submod_names_to_compile`
@@ -244,7 +244,7 @@ def v4_attn_compress(x: torch.Tensor, layer_name: str) -> None:
     )
 
 
-def _v4_attn_paged_core_fake(
+def _v4_sparse_attention_fake(
     q_sa: torch.Tensor | None,
     kv: torch.Tensor | None,
     q_packed: torch.Tensor | None,
@@ -265,7 +265,7 @@ def _v4_attn_paged_core_fake(
     )
 
 
-def v4_attn_paged_core(
+def v4_sparse_attention(
     q_sa: torch.Tensor | None,
     kv: torch.Tensor | None,
     q_packed: torch.Tensor | None,
@@ -278,7 +278,7 @@ def v4_attn_paged_core(
     idx_q_scale: torch.Tensor | None,
     layer_name: str,
 ) -> torch.Tensor:
-    """`_attn_paged_core` as a Dynamo-OPAQUE op: CSA pack + the paged attention.
+    """`_sparse_attention` as a Dynamo-OPAQUE op: CSA pack + the paged attention.
 
     A REGULAR custom op, not a splitting one. Opacity is the point -- Dynamo
     never traces the body, so the paged kernels inside are reachable from a
@@ -302,14 +302,14 @@ def v4_attn_paged_core(
         k_packed=k_packed,
         k_rope=k_rope,
     )
-    return self._attn_paged_core(qkn, positions, idx_q_quant, idx_weights, idx_q_scale)
+    return self._sparse_attention(qkn, positions, idx_q_quant, idx_weights, idx_q_scale)
 
 
 direct_register_custom_op(
-    op_name="v4_attn_paged_core",
-    op_func=v4_attn_paged_core,
+    op_name="v4_sparse_attention",
+    op_func=v4_sparse_attention,
     mutates_args=[],
-    fake_impl=_v4_attn_paged_core_fake,
+    fake_impl=_v4_sparse_attention_fake,
 )
 
 
@@ -1648,7 +1648,7 @@ class Indexer(nn.Module):
             # launch.
             weights = self.weights_proj(x_full)
             # Return q_scale (don't stash on self — see __init__): it's threaded
-            # through the v4_attn_compress op and stashed eagerly in _attn_paged_core.
+            # through the v4_attn_compress op and stashed eagerly in _sparse_attention.
             return q_fp4, weights, q_scale
 
         q_fp8 = torch.empty_like(q, dtype=dtypes.fp8)
@@ -2859,7 +2859,7 @@ class DeepseekV4Attention(nn.Module):
         # PIECEWISE runs it eager. The dense pieces around it are token-shaped.
         torch.ops.aiter.v4_attn_compress(hidden, self.layer_name)
 
-        o = torch.ops.aiter.v4_attn_paged_core(
+        o = torch.ops.aiter.v4_sparse_attention(
             q_sa,
             kv,
             q_packed,
@@ -2885,7 +2885,7 @@ class DeepseekV4Attention(nn.Module):
         PIECEWISE asks for the indexer pre-projection and immediately materializes
         QK-norm/RoPE through v4_qk_norm_rope, so the downstream paged-core op
         receives already-shaped Q/K fields. FULL keeps the legacy indexer
-        forward_batched inside _attn_paged_core, so it leaves q/kv_pre and
+        forward_batched inside _sparse_attention, so it leaves q/kv_pre and
         qr/qr_scale live for the inline QK-norm and top-k path.
 
         The return order groups the two consumers: FULL reads q/kv_pre plus
@@ -2955,7 +2955,7 @@ class DeepseekV4Attention(nn.Module):
     ) -> torch.Tensor:
         """Output inverse RoPE + grouped output LoRA.
 
-        `o` arrives un-inverse-RoPE'd from `_attn_paged_core` on both paths. Owning the
+        `o` arrives un-inverse-RoPE'd from `_sparse_attention` on both paths. Owning the
         inverse RoPE here is what lets the mxscale branch fuse it into the
         group-quant, and keeps the attention halves free of wo_a path knowledge.
         """
@@ -3094,7 +3094,7 @@ class DeepseekV4Attention(nn.Module):
             x=hidden,
             compressor_already_launched=True,
         )
-        o = self._attn_paged_core(
+        o = self._sparse_attention(
             qkn,
             positions,
             x=hidden,
@@ -3255,7 +3255,7 @@ class DeepseekV4Attention(nn.Module):
     # than a passed experiment: on the captured path this core reads none of the
     # inputs that used to need it.
     #
-    def _attn_paged_core(
+    def _sparse_attention(
         self,
         qkn: "QKNormRopeOut",
         positions: torch.Tensor,
@@ -3286,7 +3286,7 @@ class DeepseekV4Attention(nn.Module):
                 dtype=torch.bfloat16,
             )
         assert qkn.q_sa is not None or qkn.q_packed is not None, (
-            "_attn_paged_core got no Q: `_qk_norm_rope` did not run upstream. "
+            "_sparse_attention got no Q: `_qk_norm_rope` did not run upstream. "
             "Every narrow path must run it -- gating it on AF_PIECEWISE alone "
             "left plain PIECEWISE feeding None into the paged attention."
         )

@@ -237,7 +237,7 @@ class DeepseekV4AttentionVllm(DeepseekV4AttentionBase):
     * NARROW split (PIECEWISE — the FULL_AND_PIECEWISE prefill/mixed path): the
       Q/KV/indexer projections run as a *captured* dense piece (``_attn_pre``)
       at the padded width and the attention runs as three ops, never through
-      ``forward_impl`` — reconciled in the ``_attn_paged_core`` override below,
+      ``forward_impl`` — reconciled in the ``_sparse_attention`` override below,
       which is the one of the three that reads the real-sized metadata. (This is
       the path exercised by the launch config; without that clip the padded
       ``q`` reaches ``sparse_attn_v4_paged_prefill`` while ``kv_indptr_prefix``
@@ -274,7 +274,7 @@ class DeepseekV4AttentionVllm(DeepseekV4AttentionBase):
                     return torch.nn.functional.pad(out, (0, 0, 0, num_in - num_real))
         return super().forward_impl(x, positions)
 
-    def _attn_paged_core(
+    def _sparse_attention(
         self,
         qkn,
         positions: torch.Tensor,
@@ -320,7 +320,7 @@ class DeepseekV4AttentionVllm(DeepseekV4AttentionBase):
                             return t[:num_real]
                         return t
 
-                    o = super()._attn_paged_core(
+                    o = super()._sparse_attention(
                         dataclasses.replace(
                             qkn,
                             **{
@@ -337,7 +337,7 @@ class DeepseekV4AttentionVllm(DeepseekV4AttentionBase):
                         _clip(qr_scale),
                     )
                     return torch.nn.functional.pad(o, (0, 0, 0, num_in - num_real))
-        return super()._attn_paged_core(
+        return super()._sparse_attention(
             qkn, positions, idx_q_quant, idx_weights, idx_q_scale, x, qr, qr_scale
         )
 
