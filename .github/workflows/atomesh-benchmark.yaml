@@ -125,6 +125,9 @@ on:
           - mia1-p02-g42,mia1-p02-g44
           - mia1-p02-g42,mia1-p02-g47
           - mia1-p02-g44,mia1-p02-g47
+          # single_node cases only use the first entry, so keep orderings that
+          # let any one of the three nodes be selected.
+          - mia1-p02-g47,mia1-p02-g44
           - mia1-p01-g36,mia1-p01-g43
       atomesh_2p1d_nodes:
         description: 'ATOMesh 2P1D nodes'
