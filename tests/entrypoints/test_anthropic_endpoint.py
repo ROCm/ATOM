@@ -876,8 +876,19 @@ class TestAnEffortIsNotAnOptIn:
             (Req(thinking={"type": "enabled"}), True),
             (Req(thinking={"type": "disabled"}), False),
             (Req(reasoning_effort="none"), False),
+            # A third mode, not a spelling of "on": the model decides per turn.
+            (Req(thinking={"type": "adaptive"}), None),
+            (Req(thinking={"type": "auto"}), None),
         ],
-        ids=["nothing", "effort-only", "on", "off", "effort-none"],
+        ids=[
+            "nothing",
+            "effort-only",
+            "on",
+            "off",
+            "effort-none",
+            "adaptive",
+            "auto",
+        ],
     )
     def test_only_an_explicit_statement_resolves(self, req, expected):
         assert resolve_thinking(req)[0] is expected

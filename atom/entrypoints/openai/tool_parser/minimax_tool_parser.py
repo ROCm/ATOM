@@ -25,7 +25,15 @@ import json
 import re
 from typing import Any, ClassVar
 
-from .schema import build_param_types, coerce_json_or_raw
+from .schema import (
+    build_param_schemas,
+    build_param_types,
+    coerce_json_or_raw,
+    coerce_param_value,
+    declared_properties,
+    item_schema,
+    schema_type,
+)
 from .tool_parser import (
     RegionParse,
     ToolCall,
@@ -70,18 +78,160 @@ _INVOKE_RE = re.compile(
     + r"*)",
     re.DOTALL,
 )
-# Ends at the matching close tag, at the next parameter, at the close of the
-# invoke, or at end of input. That last alternative is what keeps a value the
-# model was cut off inside; without it a `max_tokens` truncation arrived as a
-# call with `{}` arguments while Qwen and GLM returned the partial value.
-_PARAM_RE = re.compile(
-    r"<([\w-]+)>(.*?)"
-    r"(?:" + _NS + r"</\1>"
-    r"|(?=" + _NS + r"<[\w-]+>)"
-    r"|(?=" + _NS + r"</invoke>)"
-    r"|\Z)",
-    re.DOTALL,
+# --- Value reading -------------------------------------------------------
+#
+# An object or array argument is written as child elements -- the chat template
+# spells this out and shows it. A flat scan for `<tag>value</tag>` reads
+# `<tags><item>a</item></tags>` as an empty `tags` plus a stray `item`, so the
+# schema has to decide where descending stops.
+
+_XML_TAG_RE = re.compile(r"<(/?)\s*([^\s/>]+)([^>]*?)/?>", re.DOTALL)
+_NAME_ATTR_RE = re.compile(
+    r"""name\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))""", re.DOTALL
 )
+
+# The wrapper tags, which are the only markup that can follow a value the model
+# was cut off inside: `_INVOKE_RE` already ends the body before the next
+# `<invoke ` or `</invoke>`. Without this the value ran on into the wrapper and
+# the tool was called with the format's own markup as data.
+_CALL_MARKUP = ("<tool_call>", "</tool_call>")
+
+_STRING_SCHEMA_TYPES = ("string", "str", "text", "varchar", "char", "enum")
+_ARRAY_SCHEMA_TYPES = ("array", "list", "tuple", "set")
+_OBJECT_SCHEMA_TYPES = ("object", "dict", "map", "struct")
+
+
+def _attr_name(attrs: str) -> str:
+    m = _NAME_ATTR_RE.search(attrs or "")
+    if m is None:
+        return ""
+    return next((g for g in m.groups() if g is not None), "").strip()
+
+
+def _element_key(tag: str, attrs: str) -> str:
+    # M3 names an argument with the element itself; older MiniMax builds write
+    # `<parameter name="location">`.
+    if tag == "parameter":
+        return _attr_name(attrs) or tag
+    return tag
+
+
+def _element_body(text: str, match: "re.Match") -> tuple[str, int]:
+    """Body of the element opened by ``match``, plus where to resume scanning.
+
+    Depth-tracked so ``<opts><opts>..</opts></opts>`` closes on the right tag.
+    An element a truncated call left open yields what arrived, which keeps a
+    partial tool call usable.
+    """
+    tag = re.escape(match.group(2))
+    opener = re.compile(r"<" + tag + r"(?:\s[^>]*)?>", re.DOTALL)
+    closer = re.compile(r"</\s*" + tag + r"\s*>")
+    depth, pos = 1, match.end()
+    while True:
+        nxt_close = closer.search(text, pos)
+        if nxt_close is None:
+            return _up_to_call_markup(text[match.end() :]), len(text)
+        nxt_open = opener.search(text, pos)
+        if nxt_open is not None and nxt_open.start() < nxt_close.start():
+            depth += 1
+            pos = nxt_open.end()
+            continue
+        depth -= 1
+        if depth == 0:
+            return text[match.end() : nxt_close.start()], nxt_close.end()
+        pos = nxt_close.end()
+
+
+def _up_to_call_markup(rest: str) -> str:
+    cuts = [at for at in (rest.find(m) for m in _CALL_MARKUP) if at != -1]
+    return rest[: min(cuts)] if cuts else rest
+
+
+def _xml_children(
+    body: str,
+    expected: tuple[str, ...] = (),
+    recover_lost_openers: bool = False,
+) -> list[tuple[str, str]]:
+    """Top-level ``(name, raw inner text)`` child elements; ``[]`` for a leaf.
+
+    Also recovers an element whose opening tag never arrived: many of M3's added
+    tokens are tag-shaped and marked special, so
+    ``decode(skip_special_tokens=True)`` erases the opener and leaves the closing
+    tag, and the argument would be dropped without a word.
+
+    Recovery is narrow, because a stray ``</x>`` inside a value is usually just
+    text: always directly inside ``<invoke>``, where nothing else can be outside
+    an element, and deeper only for a name ``expected`` declares.
+    """
+    out: list[tuple[str, str]] = []
+    pos = 0
+    text_start = 0
+    while True:
+        m = _XML_TAG_RE.search(body, pos)
+        if m is None:
+            return out
+        if m.group(1):  # closing tag with no opening tag before it
+            name = m.group(2)
+            leading = body[text_start : m.start()]
+            if leading.strip() and (recover_lost_openers or name in expected):
+                out.append((name, leading.strip("\n")))
+            pos = text_start = m.end()
+            continue
+        inner, pos = _element_body(body, m)
+        out.append((_element_key(m.group(2), m.group(3)), inner))
+        text_start = pos
+
+
+def _leaf_value(raw: str, kind: str | None) -> Any:
+    # `strip_framing=False`: this format writes the value between its tags, so a
+    # declared `string` can legitimately end in a newline.
+    if kind is not None:
+        return coerce_param_value(raw, kind, strip_framing=False)
+    return coerce_json_or_raw(raw, None, strip_framing=False)
+
+
+def _value_from_schema(raw: str, schema: Any) -> Any:
+    """Read one element's inner text against its JSON-Schema fragment.
+
+    A declared ``string`` stays text even when it contains markup: tool
+    arguments really do carry HTML and ``a < b``. With no schema at all, the
+    XML's own shape decides.
+    """
+    kind = schema_type(schema)
+
+    if kind in _STRING_SCHEMA_TYPES:
+        return _leaf_value(raw, kind)
+
+    if kind in _ARRAY_SCHEMA_TYPES:
+        items = item_schema(schema)
+        children = _xml_children(raw)
+        if children:
+            return [_value_from_schema(text, items) for _, text in children]
+        if not raw.strip():
+            return []
+        # A lone scalar where an array was declared: wrap it, so the client
+        # still gets the type it asked for.
+        value = _leaf_value(raw, kind)
+        return value if isinstance(value, list) else [value]
+
+    if kind in _OBJECT_SCHEMA_TYPES:
+        props = declared_properties(schema)
+        children = _xml_children(raw, expected=tuple(props))
+        if children:
+            return {
+                name: _value_from_schema(text, props.get(name))
+                for name, text in children
+            }
+        return {} if not raw.strip() else _leaf_value(raw, kind)
+
+    children = _xml_children(raw)
+    if not children:
+        return _leaf_value(raw, kind)
+    if all(name == "item" for name, _ in children):
+        return [_value_from_schema(text, None) for _, text in children]
+    return {name: _value_from_schema(text, None) for name, text in children}
+
+
 _FIRST_TAG_RE = re.compile(r"^" + _NS + r"<([\w-]+)>")
 
 
@@ -166,6 +316,18 @@ class MiniMaxParser(ToolCallParser):
         )
 
     @classmethod
+    def call_prefill(cls, function_name: str | None = None) -> str:
+        """See :meth:`ToolCallParser.call_prefill`. Checked against M3."""
+        prefix = f"{MINIMAX_NS}<tool_call>\n"
+        if function_name:
+            # The name reaches the prompt as markup, so a quote or angle bracket
+            # in it would open a tag of its own.
+            if any(ch in function_name for ch in '"<>'):
+                return ""
+            prefix += f'{MINIMAX_NS}<invoke name="{function_name}">'
+        return prefix
+
+    @classmethod
     def detect(cls, text: str) -> bool:
         """Detect the MiniMax-M3 ns_token tool-call format."""
         return MINIMAX_NS in text
@@ -175,6 +337,7 @@ class MiniMaxParser(ToolCallParser):
         cls, region: str, tools: list | None, *, at_end: bool
     ) -> RegionParse:
         param_types = build_param_types(tools)
+        param_schemas = build_param_schemas(tools)
         tool_calls: list[ToolCall] = []
         spans: list[tuple[int, int]] = []
         for m in _INVOKE_RE.finditer(region):
@@ -191,12 +354,18 @@ class MiniMaxParser(ToolCallParser):
                 name, body, param_types, at_end=at_end
             ):
                 continue
-            types = param_types.get(name, {})
-            args: dict[str, Any] = {}
-            for pm in _PARAM_RE.finditer(body):
-                k = pm.group(1).strip()
-                if k:
-                    args[k] = coerce_json_or_raw(pm.group(2), types.get(k))
+            properties = param_schemas.get(name, {})
+            # The body is walked with the ns_token removed, which leaves plain
+            # XML. Only the body: the span below is measured on the raw region,
+            # because that is the text the caller cuts the markup out of.
+            args = {
+                key: _value_from_schema(raw, properties.get(key))
+                for key, raw in _xml_children(
+                    body.replace(MINIMAX_NS, ""),
+                    expected=tuple(properties),
+                    recover_lost_openers=True,
+                )
+            }
             spans.append(
                 (cls.markup_begin(region, m.start()), cls.markup_end(region, m.end()))
             )

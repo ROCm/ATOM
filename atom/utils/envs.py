@@ -215,6 +215,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT": lambda: (
         os.getenv("ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT", "1") == "1"
     ),
+    # --- Serving (OpenAI-compatible API server) ---
+    # When set, the API server requires this key on every request
+    # ("Authorization: Bearer <key>" or "x-api-key") and answers 401 otherwise.
+    # The --api-key CLI flag takes precedence; unset means no authentication.
+    "ATOM_API_KEY": lambda: os.getenv("ATOM_API_KEY", ""),
     # --- Profiling & Logging ---
     "ATOM_TORCH_PROFILER_DIR": lambda: os.getenv("ATOM_TORCH_PROFILER_DIR", None),
     # Move the startup heap (model, compiled graph, tokenizer, KV block pool)

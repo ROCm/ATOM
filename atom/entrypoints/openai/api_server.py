@@ -29,7 +29,9 @@ from typing import TYPE_CHECKING, Any
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from starlette.datastructures import Headers, MutableHeaders
 from transformers import AutoProcessor, AutoTokenizer
 
 if TYPE_CHECKING:
@@ -41,6 +43,7 @@ from atom.model_engine.llm_engine import _load_tokenizer
 from atom.model_engine.multimodal import build_multimodal_inputs
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import new_token_ids
+from atom.utils import envs
 from atom.utils.arg_parser import FlexibleArgumentParser
 from atom.utils.gc_utils import (
     freeze_gc_heap,
@@ -54,6 +57,11 @@ from .chat_encoders import (
     load_custom_message_encoder,
     render_probe_prompt,
     resolve_reasoning_toggle,
+)
+from .chat_request import (
+    normalize_chat_messages,
+    template_supported_roles,
+    validate_request_messages,
 )
 from .metrics import AtomMetricsExporter
 from .protocol import (
@@ -151,6 +159,14 @@ processor: Any | None = None
 model_name: str = ""
 default_chat_template_kwargs: dict[str, Any] = {}
 custom_message_encoder: Any | None = None
+# Extension roles ("root", "developer") the loaded chat template branches on
+# itself. The rest are rewritten by chat_request.normalize_chat_messages so the
+# instruction they carry is not dropped. Probed once at startup: it depends only
+# on the template source.
+template_extension_roles: frozenset = frozenset()
+# Accepted API keys. Empty (the default) disables authentication, so a no-auth
+# deployment is unaffected.
+api_keys: set = set()
 _seq_id_to_request_id: dict[int, str] = {}
 _stream_loops: dict[str, AbstractEventLoop] = {}
 _request_start_times: dict[str, float] = {}
@@ -479,6 +495,30 @@ async def _client_stream(
 # ============================================================================
 
 
+def _named_tool_choice(tool_choice: Any) -> str | None:
+    """The function name a ``tool_choice`` object names, or None."""
+    if isinstance(tool_choice, dict):
+        fn = tool_choice.get("function")
+        if isinstance(fn, dict) and isinstance(fn.get("name"), str):
+            return fn["name"]
+    return None
+
+
+def _forces_tool_call(tool_choice: Any) -> bool:
+    return (
+        tool_choice in ("required", "any")
+        or _named_tool_choice(tool_choice) is not None
+    )
+
+
+def _close_open_reasoning(prompt: str) -> str:
+    # A forced call is appended to the assistant turn, and appending it inside an
+    # open reasoning block would make the call part of the model's thinking.
+    if reasoning_dialect is None or not prompt_starts_in_reasoning(prompt):
+        return prompt
+    return prompt + reasoning_dialect.think_end_marker
+
+
 def _build_sampling_params(
     temperature: float,
     max_tokens: int,
@@ -487,6 +527,7 @@ def _build_sampling_params(
     top_k: int = -1,
     top_p: float = 1.0,
     n: int = 1,
+    seed: int | None = None,
 ) -> SamplingParams:
     return SamplingParams(
         temperature=temperature,
@@ -496,6 +537,7 @@ def _build_sampling_params(
         stop_strings=stop_strings,
         ignore_eos=ignore_eos,
         n=n,
+        seed=seed,
     )
 
 
@@ -1553,6 +1595,90 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="ATOM OpenAI API Server", lifespan=lifespan)
 
 
+# ---- Authentication ----
+
+# Reachable without a key even when one is configured: liveness/readiness probes
+# (CI polls /health before the engine is usable) and the OpenAPI schema.
+_AUTH_EXEMPT_PATHS = frozenset({"/health", "/docs", "/redoc", "/openapi.json"})
+
+
+def _extract_api_key(headers: Headers) -> str:
+    """The key presented in ``Authorization: Bearer`` or ``x-api-key``."""
+    authorization = headers.get("authorization") or ""
+    if authorization.lower().startswith("bearer "):
+        return authorization[len("bearer ") :].strip()
+    return (headers.get("x-api-key") or "").strip()
+
+
+class APIKeyAuthMiddleware:
+    """Enforce API-key auth when the server was started with ``--api-key``.
+
+    Raw ASGI rather than ``@app.middleware("http")``: Starlette's
+    ``BaseHTTPMiddleware`` pumps every response through an extra task group and
+    memory stream, which lands on the SSE hot path.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if (
+            scope["type"] != "http"
+            or not api_keys
+            or scope.get("path") in _AUTH_EXEMPT_PATHS
+            or _extract_api_key(Headers(scope=scope)) in api_keys
+        ):
+            return await self.app(scope, receive, send)
+        response = JSONResponse(
+            status_code=401,
+            content={
+                "error": {
+                    "message": (
+                        "Incorrect API key provided. You can pass it as an "
+                        "'Authorization: Bearer <key>' header."
+                    ),
+                    "type": "invalid_request_error",
+                    "code": "invalid_api_key",
+                }
+            },
+        )
+        await response(scope, receive, send)
+
+
+app.add_middleware(APIKeyAuthMiddleware)
+
+
+# ---- Request id ----
+
+
+class RequestIDMiddleware:
+    """Stamp every response with an ``x-request-id`` header.
+
+    Registered last so it ends up outermost, which is what puts the header on
+    the 401 :class:`APIKeyAuthMiddleware` answers with. Raw ASGI for the reason
+    given there. Mints its own id rather than echoing an inbound one, keeping a
+    caller-supplied header out of the response.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        request_id = f"req_{uuid.uuid4().hex}"
+
+        async def send_with_request_id(message):
+            if message["type"] == "http.response.start":
+                MutableHeaders(scope=message)["x-request-id"] = request_id
+            await send(message)
+
+        await self.app(scope, receive, send_with_request_id)
+
+
+app.add_middleware(RequestIDMiddleware)
+
+
 # ---- Error handlers ----
 
 
@@ -1565,6 +1691,50 @@ async def value_error_handler(request: Request, exc: ValueError):
                 "message": str(exc),
                 "type": "invalid_request_error",
                 "code": 400,
+            }
+        },
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_error_handler(
+    request: Request, exc: RequestValidationError
+):
+    """Render pydantic failures as OpenAI's 400, not FastAPI's 422."""
+    errors = exc.errors()
+    if errors:
+        first = errors[0]
+        location = ".".join(str(p) for p in first.get("loc", ()) if p != "body")
+        message = first.get("msg", "invalid request")
+        message = f"{location}: {message}" if location else message
+    else:  # pragma: no cover - pydantic always reports at least one error
+        message = "invalid request"
+    return JSONResponse(
+        status_code=400,
+        content={
+            "error": {
+                "message": message,
+                "type": "invalid_request_error",
+                "code": 400,
+            }
+        },
+    )
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Render HTTPExceptions in OpenAI's ``{"error": {...}}`` envelope."""
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": {
+                "message": str(exc.detail),
+                "type": (
+                    "invalid_request_error"
+                    if exc.status_code < 500
+                    else "internal_server_error"
+                ),
+                "code": exc.status_code,
             }
         },
     )
@@ -1598,7 +1768,10 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
     try:
         request.tools = normalize_chat_tools(request.tools)
         validate_chat_request(request)
-        messages = request.get_messages()
+        messages = normalize_chat_messages(
+            validate_request_messages(request),
+            supported_roles=template_extension_roles,
+        )
 
         merged_kwargs = dict(default_chat_template_kwargs)
         if request.chat_template_kwargs:
@@ -1610,6 +1783,19 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             merged_kwargs["response_format"] = request.response_format
         if isinstance(request.tool_choice, str):
             merged_kwargs["tool_choice"] = request.tool_choice
+        named_tool = _named_tool_choice(request.tool_choice)
+        if named_tool is not None:
+            # A model cannot call a tool it was never given. That it calls one at
+            # all is the prefill further down: a template may ignore the kwarg
+            # below, and M3's does.
+            merged_kwargs["tool_choice"] = "required"
+            request.tools = [
+                t
+                for t in (request.tools or [])
+                if isinstance(t, dict)
+                and isinstance(t.get("function"), dict)
+                and t["function"].get("name") == named_tool
+            ]
         _th_enabled, _th_effort = resolve_thinking(request)
         if request.thinking is not None or request.reasoning_effort is not None:
             # By the name this template actually reads. `thinking` was
@@ -1632,11 +1818,12 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         sampling_params = _build_sampling_params(
             temperature=request.temperature,
             max_tokens=request.get_max_tokens(),
-            stop_strings=request.stop,
+            stop_strings=request.get_stop(),
             ignore_eos=request.ignore_eos,
             top_k=request.top_k,
             top_p=request.top_p,
             n=effective_n,
+            seed=request.seed,
         )
 
         request_id = f"chatcmpl-{uuid.uuid4().hex}"
@@ -1672,6 +1859,20 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 tools=request.tools,
                 **merged_kwargs,
             )
+
+        # Start the call rather than ask for it: ATOM has no constrained
+        # decoding, and the kwarg above is a no-op on a template that does not
+        # read it. A format with no opener leaves the prompt untouched.
+        tool_call_prefix = ""
+        if (
+            not is_multimodal
+            and tool_call_parser_cls is not None
+            and _forces_tool_call(request.tool_choice)
+        ):
+            prefill = tool_call_parser_cls.call_prefill(named_tool)
+            if prefill:
+                prompt = _close_open_reasoning(prompt) + prefill
+                tool_call_prefix = prefill
 
         # The K3 template may inject the opening reasoning marker into the prompt
         # itself; if so the stream begins mid-thought and the ReasoningFilter must
@@ -1712,6 +1913,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     tool_choice=request.tool_choice,
                     reasoning=_reasoning,
                     tool_parser_cls=tool_call_parser_cls,
+                    tool_call_prefix=tool_call_prefix,
                 )
             else:
                 seq_id, stream_collector, num_prompt_tokens = (
@@ -1736,6 +1938,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     tool_choice=request.tool_choice,
                     reasoning=_reasoning,
                     tool_parser_cls=tool_call_parser_cls,
+                    tool_call_prefix=tool_call_prefix,
                 )
             return StreamingResponse(
                 _client_stream(gen, request_id),
@@ -1766,6 +1969,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 tool_choice=request.tool_choice,
                 reasoning=_reasoning,
                 tool_parser_cls=tool_call_parser_cls,
+                tool_call_prefix=tool_call_prefix,
             )
         elif is_multimodal:
             final_output = await _run_nonstream_with_disconnect(
@@ -1790,6 +1994,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 tool_choice=request.tool_choice,
                 reasoning=_reasoning,
                 tool_parser_cls=tool_call_parser_cls,
+                tool_call_prefix=tool_call_prefix,
             )
         elif effective_n > 1:
             outputs = await _race_disconnect(
@@ -1813,6 +2018,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 tool_choice=request.tool_choice,
                 reasoning=_reasoning,
                 tool_parser_cls=tool_call_parser_cls,
+                tool_call_prefix=tool_call_prefix,
             )
         else:
             final_output = await _run_nonstream_with_disconnect(
@@ -1837,6 +2043,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 tool_choice=request.tool_choice,
                 reasoning=_reasoning,
                 tool_parser_cls=tool_call_parser_cls,
+                tool_call_prefix=tool_call_prefix,
             )
         _log_request_model("response", request_id, resp)
         return resp
@@ -1864,11 +2071,12 @@ async def completions(request: CompletionRequest, raw_request: Request):
         sampling_params = _build_sampling_params(
             temperature=request.temperature,
             max_tokens=request.get_max_tokens(),
-            stop_strings=request.stop,
+            stop_strings=request.get_stop(),
             ignore_eos=request.ignore_eos,
             top_k=request.top_k,
             top_p=request.top_p,
             n=effective_n,
+            seed=request.seed,
         )
 
         request_id = f"cmpl-{uuid.uuid4().hex}"
@@ -2460,6 +2668,7 @@ def main():
     global tool_call_parser_cls, model_starts_in_reasoning, reasoning_toggle
     global reasoning_dialect
     global custom_message_encoder, _stream_batch_dispatcher
+    global template_extension_roles, api_keys
 
     parser = FlexibleArgumentParser(description="ATOM OpenAI API Server")
     EngineArgs.add_cli_args(parser)
@@ -2509,6 +2718,17 @@ def main():
         ),
     )
     parser.add_argument(
+        "--api-key",
+        type=str,
+        action="append",
+        default=None,
+        help=(
+            "Require this key on every request ('Authorization: Bearer <key>' "
+            "or 'x-api-key'); repeatable. Falls back to ATOM_API_KEY. "
+            "Unset means no authentication."
+        ),
+    )
+    parser.add_argument(
         "--default-chat-template-kwargs",
         type=str,
         default=None,
@@ -2535,6 +2755,12 @@ def main():
         _request_logger.addHandler(fh)
         logger.info(f"Request logging enabled: {args.request_log}")
 
+    api_keys = {k.strip() for k in (args.api_key or []) if k and k.strip()}
+    if not api_keys and envs.ATOM_API_KEY:
+        api_keys = {envs.ATOM_API_KEY.strip()}
+    if api_keys:
+        logger.info(f"API-key authentication enabled ({len(api_keys)} key(s))")
+
     if args.default_chat_template_kwargs:
         default_chat_template_kwargs = json.loads(args.default_chat_template_kwargs)
         logger.info(f"Default chat template kwargs: {default_chat_template_kwargs}")
@@ -2556,6 +2782,13 @@ def main():
     logger.info(f"Initializing engine with model {args.model}...")
     engine_args = EngineArgs.from_cli_args(args)
     _template_source = chat_template_source(tokenizer, custom_message_encoder)
+    template_extension_roles = template_supported_roles(_template_source)
+    if template_extension_roles:
+        logger.info(
+            "Chat template handles extension roles: %s (others are folded into "
+            "'system' so their instructions are not dropped)",
+            sorted(template_extension_roles),
+        )
     reasoning_dialect, _dialect_stated = resolve_dialect(
         _template_source,
         render_probe_prompt(tokenizer, custom_message_encoder, tools=False) or "",

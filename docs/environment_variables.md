@@ -169,6 +169,12 @@ land. See `atom/model_ops/v4_backend_gate.py` for the selector.
 | **ATOM_V4_BACKEND** | str | `legacy` | `legacy` keeps the per-seq dispatch loop. `new` routes through `V4AttentionBackend`. Layer-restricted by `ATOM_V4_BACKEND_LAYERS` if set. |
 | **ATOM_V4_BACKEND_LAYERS** | csv int | "" (= all) | Comma-separated layer ids that use the new backend (others stay legacy). Empty means: apply `ATOM_V4_BACKEND` uniformly. Used for layer-by-layer bisect during migration (e.g. `0,3,15,30`). |
 
+## Serving (OpenAI-compatible API server)
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_API_KEY** | str | "" (no auth) | When set, `atom.entrypoints.openai_server` requires this key on every request (`Authorization: Bearer <key>` or `x-api-key`) and answers `401` otherwise. `/health` stays open for probes. The `--api-key` CLI flag takes precedence and may be repeated to accept several keys. |
+
 ## Profiling & debugging
 
 | Variable | Type | Default | Description |

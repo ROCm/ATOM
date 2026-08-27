@@ -188,7 +188,7 @@ class ChatCompletionRequest(BaseModel):
     top_p: float | None = DEFAULT_TOP_P
     max_tokens: int | None = DEFAULT_MAX_TOKENS
     max_completion_tokens: int | None = None
-    stop: list[str] | None = None
+    stop: str | list[str] | None = None
     ignore_eos: bool | None = False
     stream: bool | None = False
     seed: int | None = None
@@ -220,14 +220,27 @@ class ChatCompletionRequest(BaseModel):
             return self.max_tokens
         return DEFAULT_MAX_TOKENS
 
+    def get_stop(self) -> list[str] | None:
+        """Normalize ``stop`` to a list; the OpenAI API accepts a bare string."""
+        if isinstance(self.stop, str):
+            return [self.stop]
+        return self.stop
+
     def get_messages(self) -> list[ChatMessage]:
-        """Get messages from either 'messages' or 'prompt' field."""
-        if self.messages is not None:
-            return self.messages
-        elif self.prompt is not None:
-            return self.prompt
-        else:
+        """Get messages from either 'messages' or 'prompt' field.
+
+        Raises:
+            ValueError: when neither field is present, or the conversation is
+                empty. An empty conversation still renders a valid generation
+                prompt, so without this check the model answers a request
+                carrying no instruction at all.
+        """
+        messages = self.messages or self.prompt
+        if messages:
+            return messages
+        if self.messages is None and self.prompt is None:
             raise ValueError("Either 'messages' or 'prompt' field is required")
+        raise ValueError("'messages' must contain at least one message")
 
 
 class CompletionRequest(BaseModel):
@@ -242,14 +255,21 @@ class CompletionRequest(BaseModel):
     top_p: float | None = DEFAULT_TOP_P
     max_tokens: int | None = DEFAULT_MAX_TOKENS
     max_completion_tokens: int | None = None
-    stop: list[str] | None = None
+    stop: str | list[str] | None = None
     ignore_eos: bool | None = False
     stream: bool | None = False
+    seed: int | None = None
     # Optional KV-transfer metadata for P/D disaggregation.
     kv_transfer_params: dict[str, Any] | None = None
     # Optional DPA routing hint inserted by atomesh for DP-aware workers.
     data_parallel_rank: int | None = None
     n: int | None = 1
+
+    def get_stop(self) -> list[str] | None:
+        """Normalize ``stop`` to a list; the OpenAI API accepts a bare string."""
+        if isinstance(self.stop, str):
+            return [self.stop]
+        return self.stop
 
     def get_max_tokens(self) -> int:
         """Return the effective generation cap for completion requests."""

@@ -343,6 +343,27 @@ class ToolCallParser(ABC):
         return end_of_markup(region, at, cls.CALL_CLOSERS, cls.CALL_FILLERS)
 
     @classmethod
+    def call_prefill(cls, function_name: str | None = None) -> str:
+        """Assistant-turn prefix that leaves a tool call the only continuation.
+
+        This is how ``tool_choice: "required"`` and a named choice are kept
+        without constrained decoding: append this dialect's opening tokens to
+        the generation prompt and there is nothing sensible left to write but
+        the call. Asking the model in the prompt does not work.
+
+        ``function_name`` also opens the named invocation.
+
+        ``""`` means this format offers no opener and the caller leaves the
+        prompt alone. Override it only once the opener has been checked against
+        the model that emits it.
+
+        The text returned is *prompt*, so it never appears in the output. The
+        caller must hand it back to the parser (``tool_call_prefix``) or the
+        call arrives with its opening tag missing.
+        """
+        return ""
+
+    @classmethod
     def find_start(cls, text: str) -> int:
         """Index of the earliest start marker, or -1."""
         positions = [i for i in (text.find(m) for m in cls.START_MARKERS) if i != -1]

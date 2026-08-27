@@ -2719,6 +2719,10 @@ class ModelRunner:
             ub_max_tokens_across_dp=ub_max_tokens_across_dp,
         )
 
+    # Class-level default so postprocess is safe on paths that never reach
+    # prepare_sample, such as dummy warmup runs.
+    _sampling_seeds = None
+
     def prepare_sample(
         self, batch: ScheduledBatch
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, bool, bool]:
@@ -2743,11 +2747,20 @@ class ModelRunner:
         needs_topk = (batch.top_ks != -1).any()
         needs_topp = (batch.top_ps < 1.0).any()
 
+        # The collapse below leaves one element for the whole batch, which a
+        # seeded row cannot use: it is re-sampled against its own filter values.
+        seed_payload = getattr(batch, "sampling_seeds", None)
+        may_collapse_uniform = seed_payload is None
+
         if needs_topk:
             top_k_buffer = self.forward_vars["top_ks"]
             top_k_buffer.np[:bs] = batch.top_ks
             # If all values are the same, only copy one element to save bandwidth
-            if bs > 1 and (batch.top_ks == batch.top_ks[0]).all():
+            if (
+                may_collapse_uniform
+                and bs > 1
+                and (batch.top_ks == batch.top_ks[0]).all()
+            ):
                 top_ks = top_k_buffer.copy_to_gpu(1)
             else:
                 top_ks = top_k_buffer.copy_to_gpu(bs)
@@ -2758,12 +2771,18 @@ class ModelRunner:
             top_p_buffer = self.forward_vars["top_ps"]
             top_p_buffer.np[:bs] = batch.top_ps
             # If all values are the same, only copy one element to save bandwidth
-            if bs > 1 and (batch.top_ps == batch.top_ps[0]).all():
+            if (
+                may_collapse_uniform
+                and bs > 1
+                and (batch.top_ps == batch.top_ps[0]).all()
+            ):
                 top_ps = top_p_buffer.copy_to_gpu(1)
             else:
                 top_ps = top_p_buffer.copy_to_gpu(bs)
         else:
             top_ps = None
+
+        self._sampling_seeds = seed_payload
 
         return temperatures, top_ks, top_ps, all_greedy, needs_independent_noise
 
@@ -3266,6 +3285,7 @@ class ModelRunner:
                 top_ps,
                 all_greedy,
                 needs_independent_noise=needs_independent_noise,
+                seeds=self._sampling_seeds,
             )
             num_reject_tokens = self.tokenID_processor.default_num_rejected_tokens[:bs]
             next_token_locs = num_reject_tokens
@@ -3283,6 +3303,7 @@ class ModelRunner:
                 top_ps=top_ps,
                 all_greedy=all_greedy,
                 needs_independent_noise=needs_independent_noise,
+                seeds=self._sampling_seeds,
             )
             # Validate shapes match expectations
             if target_logits.shape[0] != len(spec_decode_metadata.draft_token_ids):

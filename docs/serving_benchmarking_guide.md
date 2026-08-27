@@ -59,10 +59,11 @@ clients (curl, OpenAI SDK, lm-eval) work without modification.
 | `temperature` | `Optional[float]` | `1.0` | Sampling temperature |
 | `top_p` | `Optional[float]` | `1.0` | Nucleus sampling threshold |
 | `max_tokens` | `Optional[int]` | `256` | Maximum tokens to generate |
-| `stop` | `Optional[List[str]]` | `None` | Stop strings |
+| `stop` | `Optional[str \| List[str]]` | `None` | Stop string(s) |
 | `ignore_eos` | `Optional[bool]` | `False` | Ignore end-of-sequence token |
 | `stream` | `Optional[bool]` | `False` | Enable server-sent events streaming |
 | `seed` | `Optional[int]` | `None` | Random seed |
+| `thinking` | `Optional[Dict]` | `None` | Reasoning toggle: `{"type": "enabled"}`, `{"type": "disabled"}` or `{"type": "adaptive"}` (let the model decide) |
 
 **CompletionRequest** fields:
 
@@ -73,9 +74,10 @@ clients (curl, OpenAI SDK, lm-eval) work without modification.
 | `temperature` | `Optional[float]` | `1.0` | Sampling temperature |
 | `top_p` | `Optional[float]` | `1.0` | Nucleus sampling threshold |
 | `max_tokens` | `Optional[int]` | `256` | Maximum tokens to generate |
-| `stop` | `Optional[List[str]]` | `None` | Stop strings |
+| `stop` | `Optional[str \| List[str]]` | `None` | Stop string(s) |
 | `ignore_eos` | `Optional[bool]` | `False` | Ignore end-of-sequence token |
 | `stream` | `Optional[bool]` | `False` | Enable SSE streaming |
+| `seed` | `Optional[int]` | `None` | Random seed |
 
 ### Response models
 
@@ -91,6 +93,31 @@ Both `ChatCompletionResponse` and `CompletionResponse` include:
 
 Streaming responses use the SSE (Server-Sent Events) protocol with
 `data: [DONE]\n\n` as the termination signal.
+
+### Tool calling
+
+`tool_choice` controls whether the model may call a tool:
+
+| Value | What happens |
+|---|---|
+| `auto` (default) | the model decides |
+| `none` | the model will not call a tool |
+| `required` | the server pushes the model into making a call |
+| `{"type":"function","function":{"name":"X"}}` | only `X` is offered, and the server pushes the model into calling that one |
+
+`required` and named choices are best-effort. ATOM has no constrained decoding,
+so the server starts the call for the model rather than guaranteeing one, and it
+can only do that for formats it knows how to start — MiniMax today.
+
+When the reply is only a tool call, `content` is `null` and `finish_reason` is
+`"tool_calls"`.
+
+### Errors
+
+A bad request now comes back as `400` with an
+`{"error": {"message", "type", "code"}}` body instead of reaching the model. If
+the server was started with `--api-key` (or `ATOM_API_KEY`), a request without
+the right key gets `401`.
 
 #### Delivery under load
 
@@ -487,6 +514,7 @@ Server-specific CLI arguments:
 |----------|---------|-------------|
 | `--host` | `0.0.0.0` | Bind address |
 | `--server-port` | `8000` | HTTP port (note: `--port` is for internal engine communication) |
+| `--api-key` | — | Require this key on every request (`Authorization: Bearer <key>` or `x-api-key`); repeatable. Falls back to `ATOM_API_KEY`. Unset = no authentication |
 | `--timeout-keep-alive` | `5` | Seconds an idle keep-alive connection is held. Pooling clients hold their end longer (aiohttp defaults to 15s), so a caller that pauses for longer than this reuses a socket the server already closed and has to re-send. Raise it past the caller's idle window to avoid that |
 | `--disable-uvicorn-access-log` | off | Stop uvicorn logging a line per HTTP request. It copies a `LogRecord` and writes to the same stdout as the engine, on the event loop |
 | `--tool-call-parser` | `auto` | Tool-call wire format. `auto` reads it from the model's chat template at startup (Jinja, or a model-side `encoding/encoding_*.py`); a name — `dsml`, `glm`, `kimi`, `kimi_k3`, `minimax`, `qwen` — overrides. When neither resolves, tool calls are delivered as plain text and the startup log says so; the format is never guessed from output. On the OpenAI server an unknown name is refused at startup, before the weights load, rather than silently disabling tool parsing. The atomesh entrypoint deliberately does not refuse: it shares the flag with the mesh router, which declares its own vocabulary for it, so a name ATOM does not recognise is logged at INFO, forwarded to the router, and ATOM falls back to reading the chat template. Check the log for `is not one of ATOM's formats` if a format you specified is not taking effect |

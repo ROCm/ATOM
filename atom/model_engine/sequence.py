@@ -176,6 +176,10 @@ class Sequence:
         self.top_p = sampling_params.top_p
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
+        # Offsetting by sibling_index keeps fan-out siblings from collapsing
+        # onto the same completion while leaving the group reproducible.
+        seed = getattr(sampling_params, "seed", None)
+        self.seed = None if seed is None else seed + sibling_index
         self.stop_strings = sampling_params.stop_strings
         # Same type as `token_ids`, because the stop check compares a slice of
         # that against these and an `array("i")` never equals a list.

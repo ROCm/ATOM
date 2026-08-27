@@ -295,4 +295,16 @@ def apply_chat_template(
     kwargs["add_generation_prompt"] = True
     if tools:
         kwargs["tools"] = tools
-    return tokenizer.apply_chat_template(messages, **kwargs)
+    try:
+        return tokenizer.apply_chat_template(messages, **kwargs)
+    except TemplateError as exc:
+        # Templates reject malformed conversations with {{ raise_exception(...) }}
+        # -- MiniMax-M3 does this for a tool message with no preceding tool call.
+        # That is bad input, so it has to read as 400 rather than 500. Only the
+        # exact type: UndefinedError and TemplateSyntaxError subclass it and mean
+        # the template itself is broken, which is a server fault.
+        if type(exc) is not TemplateError:
+            raise
+        raise ValueError(
+            f"This model's chat template rejected the conversation: {exc}"
+        ) from exc

@@ -30,6 +30,7 @@ from atom.config import Config
 from atom.kv_transfer.disaggregation import KVConnectorOutput
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.request import RequestOutput
+from atom.model_engine.sampling_control import build_seed_rows
 from atom.model_engine.sequence import (
     Sequence,
     SequenceStatus,
@@ -423,6 +424,7 @@ class ScheduledBatch:
             [getattr(seq, "needs_independent_noise", False) for seq in seqs.values()],
             dtype=bool,
         )
+        self.sampling_seeds = build_seed_rows(seqs.values())
 
         self.is_first_decode_without_local_prefill = [
             seq.is_first_decode for seq in seqs.values()
