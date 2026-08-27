@@ -45,6 +45,7 @@ Three deliberate v1 decisions, each exact rather than approximate:
 Not yet wired: the MTP draft layer (checkpoint layer 45) and the vision tower.
 """
 
+import os
 from itertools import islice
 from typing import Any, ClassVar
 
@@ -197,7 +198,11 @@ class Glm5NextHyperConnection(nn.Module):
         self.norm_eps = float(config.rms_norm_eps)
 
         # aiter's mhc kernels trap unless hidden % 512 == 0 or % 256 == 0.
+        # GLM53_DISABLE_FUSED_MHC=1 forces the torch reference path, for
+        # bisecting numerical differences against transformers.
         dim_ok = config.hidden_size % 512 == 0 or config.hidden_size % 256 == 0
+        if os.environ.get("GLM53_DISABLE_FUSED_MHC") == "1":
+            dim_ok = False
         self._mhc_pre = getattr(aiter, "mhc_pre", None) if dim_ok else None
         self._mhc_post = getattr(aiter, "mhc_post", None) if dim_ok else None
 

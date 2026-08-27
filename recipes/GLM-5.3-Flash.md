@@ -1,9 +1,21 @@
 # GLM-5.3-Flash Bring-Up Notes
 
-> **Status: in progress — not yet servable under ATOM.**
-> This documents the architecture analysis, the ATOM component mapping, the
-> validated pieces, and the reference oracle to build the port against. The ATOM
-> model itself (`atom/models/glm5_next.py`) is not written yet.
+> **Status: runs end to end under ATOM on 4× MI355X, text-only, context ≤ 2048.**
+> `atom/models/glm5_next.py` loads every parameter of the checkpoint and
+> generates coherent text; per-layer hidden states match the transformers
+> reference to cosine ≥ 0.9997 at all 45 layers. Not yet done: contexts beyond
+> `index_topk` (needs the sparse k-pool path), the MTP draft layer, and the
+> vision tower. See §7.
+
+```bash
+python -m recipes.glm5_3_flash.atom_run --model /models/GLM-5.3-Flash -tp 4 \
+    --kv-cache-dtype bf16 --enforce-eager --max-tokens 64
+```
+
+Needs an aiter with `chunk_kimi_delta_attn` and `mla_decode_fwd(causal=...)` —
+`rocm/atom-dev:nightly_202608270231` or newer. Earlier images fail with
+`No module named 'aiter.ops.triton.kimi_delta_attn'` or
+`mla_decode_fwd() got an unexpected keyword argument 'causal'`.
 
 [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) is a natively
 multimodal MoE model from Z.ai — 320B total / 18B active, 1M context, FP8 weights,
@@ -47,7 +59,7 @@ assembly plus one new op, not a from-scratch port.
 | KDA linear attention | `KimiKDAAttention` (`models/kimi_k3.py`), aiter `kimi_delta_attn` Triton kernels | Very close. Same **separate `q/k/v_conv1d`** layout as the checkpoint, per-head `A_log`, per-channel `dt_bias`, `f_a`/`f_b` forget gate, and it already reads `linear_attn_config.gate_lower_bound`. |
 | mHC hyper-connections | `hc_split_sinkhorn` (`model_ops/sparse_attn_v4.py`), `Block.hc_pre`/`hc_post` (`models/deepseek_v4.py`) | **Math-exact.** Same sigmoid gates, same Sinkhorn schedule including the special first iteration, same `HC_POST_MULT = 2.0`. Checkpoint tensor names (`hc_attn_fn`/`base`/`scale`) are already what `Block` expects, and `hc_attn_fn` is `[24, 16384]` = exactly its `mixes` layout. `dim=4096` satisfies the fused aiter `mhc_pre`/`mhc_post` `% 512 == 0` constraint. |
 | k-pool DSA indexer | **new** — `model_ops/kpool_indexer.py` (this branch) | DeepSeek-V4's `Compressor` pools the same way at `compress_ratio=4` with an `ape` term, but overlapping + RoPE'd. GLM's is non-overlapping and NoPE. |
-| MLA | `model_ops/attention_mla.py`; NoPE via the `_NoPositionalRotaryEmbedding` trick in `kimi_k3.py` | Needs a NoPE path (`qk_rope_head_dim == 0`) through the MLA backends. |
+| MLA | `model_ops/attention_mla.py` via `MLAModules`, NoPE via `_NoPositionalRotaryEmbedding` | Works with a zero-width rope slice. Padding the rope lanes with zeros would also be exact but is impossible: `qk_nope_head_dim` is already 256 and the CK prefill kernel caps head dims at 256. |
 | MoE 288 × sigmoid/`noaux_tc` | `model_ops/fused_moe`, `models/glm4_moe.py`, `deepseek_v2.py` | Direct. |
 | Block FP8 128×128 | existing DeepSeek block-FP8 path | Direct. |
 | MTP (layer 45) | `deepseek_mtp.py` / `glm4_moe_mtp.py` | Layer 45 is a full DSA layer plus `eh_proj`/`enorm`/`hnorm`/`shared_head.norm`. `index_share_for_mtp_iteration` means it reuses the main model's top-k. |
@@ -55,9 +67,9 @@ assembly plus one new op, not a from-scratch port.
 
 ### Checkpoint → model weight remap
 
-The checkpoint does not match the `transformers` module tree; the authoritative
-remap is in `transformers/conversion_mapping.py` under `"glm5_next"`. ATOM's loader
-must reproduce it:
+The checkpoint does not match the `transformers` module tree. The authoritative
+remap for *transformers* is in `transformers/conversion_mapping.py` under
+`"glm5_next"`:
 
 | Checkpoint | Model |
 | --- | --- |
@@ -70,6 +82,15 @@ must reproduce it:
 
 Everything lives under `model.language_model.*` / `model.visual.*`; `lm_head` is
 top-level and BF16.
+
+ATOM needs less of this. It declares the mHC parameters flat on the layer exactly
+as the checkpoint names them (`hc_attn_fn`, ...), keeps `q/k/v_conv1d` separate
+like the checkpoint (Kimi-K3 already does), and folds the low-rank KDA output
+gate after load, so its whole `weights_mapping` is one rule:
+`"model.language_model." -> "model."`. `model.visual.*` is dropped via
+`skip_weight_prefixes`, and checkpoint layer 45 (MTP) is dropped automatically by
+the loader's past-last-layer filter. Only the expert and q/k/v fusions go through
+`packed_modules_mapping`.
 
 ## 3. What is validated
 
@@ -205,20 +226,69 @@ The user is asking why the sky appears blue. This is a classic physics question
 about Rayleigh scattering. Let me think about the actual scientific reasons.
 ```
 
-## 6. Remaining work
+## 6. Validation of the ATOM port
 
-1. `atom/models/glm5_next.py` — config normalisation (`linear_attn_config` →
-   the `linear_*` names `KimiKDAAttention` reads), the mHC decoder block, KDA and
-   NoPE-MLA layers, MoE, and the weight remap above.
-2. A paged/ragged k-pool indexer that reads pooled state from the KV cache instead of
-   rebuilding pools densely each step; `kpool_indexer.py` is its correctness oracle.
-3. Hybrid cache sizing — a paged KV pool for the 11 DSA layers *and* a KDA recurrent
-   state pool for the 34 linear layers (upstream notes the KDA pool is what usually
-   caps concurrency).
-4. NoPE path through the MLA attention backends.
-5. Vision tower + processor; MTP draft layer.
-6. Register `Glm5NextForConditionalGeneration` in
-   `model_runner.py:support_model_arch_dict`.
+**Per-layer hidden states vs the reference** (`compare_layers.py`), 21-token
+prompt, TP4, BF16 KV. Cosine of the mHC residual `[21, 4, 4096]` at each layer:
+
+| layer | 0 | 3 | 7 | 11 | 19 | 27 | 35 | 43 | 44 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| cosine | 0.99972 | 0.99976 | 0.99970 | 0.99999 | 1.00003 | 0.99999 | 1.00002 | 0.99998 | 0.99998 |
+
+It does **not** degrade with depth, which is the thing to check — a wired-up-wrong
+component compounds, and this does not. Relative error holds at 1–2%, consistent
+with FP8 activations plus a different kernel stack. (Cosine marginally above 1.0
+is fp32 rounding in a reduction over 344k elements.)
+
+Two traps worth knowing about when reproducing this:
+
+* **Dump the right forward.** `ATOM_FWD_DUMP_ONE_SHOT` defaults on and writes only
+  the *first* call, which is the warmup pass over 16384 dummy tokens. Comparing
+  against that shows cosine 0.08 at layer 0 and looks like a catastrophic bug.
+  Set `ATOM_FWD_DUMP_ONE_SHOT=0` and take the call whose row count equals the
+  prompt length; `compare_layers.py` does this.
+* **Teacher-forced rank-1 agreement is not a clean metric once trajectories
+  fork.** `score_atom_tokens.py` scores ATOM's generated tokens under the
+  reference. ATOM gets 67% rank-1 / mean p 0.58, against a baseline of 98.4% /
+  0.86 for the reference's own torch-FP8 output rescored with the aiter-FP8
+  backend. That gap is mostly an artifact: the baseline sequences never diverge,
+  while ATOM's forks at position 4 — on `' why'` (p 0.63) vs `' about'` (p 0.11),
+  a genuinely split distribution — and every later position is then scored
+  against a prefix the reference would not have written. The per-layer cosines
+  above are the load-bearing evidence, not this number.
+
+**Known numerical gap.** GLM clamps its expert SwiGLU at ±`swiglu_limit` (10.0),
+but only ATOM's `flydsl` and `mori` MoE paths plumb `swiglu_limit`; the default
+`standard`/CK path (`ck_moe_stage1/2`) drops it. Measured on the reference: the
+clamp binds on under 0.001% of elements, with max |gate| 19.6 and max |up| 14.2 —
+so it is real but small. The dense layers (0–2) are unaffected; they go through
+`swiglu_oai_split`.
+
+**Performance**, 21-token prompt, TP4, `--enforce-eager`, batch 1, no MTP:
+
+| | TTFT | TPOT | decode |
+| --- | --- | --- | --- |
+| ATOM | 3.12 s | 45 ms | ~22 tok/s |
+| transformers + aiter FP8 | — | — | 4.25 tok/s |
+| transformers + torch FP8 | — | — | 2.68 tok/s |
+
+CUDA graphs and MTP are both still on the table.
+
+## 7. Remaining work
+
+1. **Contexts beyond 2048.** The sparse k-pool path: a paged/ragged indexer that
+   reads pooled state from the KV cache instead of rebuilding pools densely each
+   step, wired into the sparse MLA backend. `model_ops/kpool_indexer.py` is its
+   correctness oracle and `Glm5NextIndexer` already holds the weights.
+2. **`swiglu_limit` in the MoE** — either route to a backend that honours it or
+   plumb it through the CK path (§6).
+3. **MTP draft layer** (checkpoint layer 45: `eh_proj` / `enorm` / `hnorm` /
+   `shared_head.norm`, plus its own indexer). `index_share_for_mtp_iteration`
+   means it reuses the main model's top-k.
+4. **Vision tower + processor** for image and video input.
+5. **Performance**: CUDA graphs (currently `--enforce-eager`), MTP speculative
+   decoding, and dropping the `hc` torch fallback once the fused path is trusted.
+6. **Upstream the transformers FP8 bug** (§4a) and the gfx950 Triton failure (§4b).
 
 Upstream, for reference: sglang PR #36507 (16.6k lines, 144 files) and vLLM PR
 #53906 (12.5k lines, 85 files). Both are NVIDIA-first — sglang ships `.cuh` + TileLang

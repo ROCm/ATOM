@@ -171,6 +171,24 @@ def main() -> None:
     print(text, flush=True)
     print(f"\n[{ntok} tokens in {dt:.1f}s = {ntok / dt:.2f} tok/s]", flush=True)
 
+    # Same shape as atom_gen.json so score_atom_tokens.py can grade this run too.
+    # Scoring a reference run with the *other* FP8 backend gives the baseline
+    # disagreement attributable to FP8 numerics alone, which is what any ATOM
+    # figure has to be judged against.
+    with open(f"{OUT}/ref_gen.json", "w") as f:
+        json.dump(
+            {
+                "prompt": PROMPT,
+                "prompt_ids": ids[0].tolist(),
+                "output_ids": gen[0, ids.shape[1] :].tolist(),
+                "text": text,
+                "fp8_backend": FP8_BACKEND,
+            },
+            f,
+            indent=1,
+        )
+    print(f"wrote {OUT}/ref_gen.json", flush=True)
+
 
 if __name__ == "__main__":
     main()
