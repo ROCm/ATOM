@@ -123,7 +123,7 @@ from atom.plugin.vllm.attention.layer_sparse_mla import (
     IndexerDecoratorForPluginMode,
 )
 from atom.quant_spec import should_skip_online_quant
-from atom.utils import dsa_logits_dump, envs
+from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import get_forward_context
@@ -1405,7 +1405,6 @@ def _dcp_index_comm_required(dcp_world_size: int, replicated_index_cache: bool) 
 
 def _dcp_decode_candidate_exchange(
     attn_metadata,
-    k_cache_prefix: str,
     padded_q_fp8_decode_tokens: torch.Tensor,
     kv_cache: torch.Tensor,
     weights: torch.Tensor,
@@ -1467,7 +1466,6 @@ def _dcp_decode_candidate_exchange(
         KVBlockSize=runner_block_size,
         Preshuffle=True,
     )
-    dsa_logits_dump.record("dcp_local", k_cache_prefix, local_logits, local_ctx)
     # ---- local top-k -> exchange candidates -> deterministic merge ----
     # k_loc is the constant `topk_tokens`, never the live local length: the
     # exchanged size must be static for CUDAGraph. Short contexts therefore ship
@@ -1817,7 +1815,6 @@ def sparse_attn_indexer(
         if _dcp_index_comm_required(dcp_world_size, replicated_index_cache):
             _dcp_decode_candidate_exchange(
                 attn_metadata,
-                k_cache_prefix,
                 padded_q_fp8_decode_tokens,
                 kv_cache,
                 weights,
@@ -1847,9 +1844,6 @@ def sparse_attn_indexer(
             )
         assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
         if logits is not None:
-            dsa_logits_dump.record(
-                "full", k_cache_prefix, logits, decode_metadata.context_lens
-            )
             # Non-DCP: one rank holds the whole plane, so top-k is already
             # global. The DCP branch produced topk_indices_decode itself.
             topk_indices_decode = topk_indices[:num_decode_tokens, :topk_tokens]

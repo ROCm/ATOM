@@ -73,7 +73,6 @@ from atom.spec_decode.drafter import Drafter
 from atom.spec_decode.factory import build_drafter
 from atom.utils import (
     CpuGpuBuffer,
-    dsa_logits_dump,
     envs,
     get_hf_text_config,
     init_exit_handler,
@@ -3205,7 +3204,6 @@ class ModelRunner:
 
                 graph_key = (graph_bs, max_q_len)
                 self.graphs[graph_key].replay()
-                dsa_logits_dump.flush(graph_bs, max_q_len)
                 hidden_states = self.forward_vars["outputs"][:num_tokens]
                 # Drafter aux buffers (if any) refresh on replay: their in-place
                 # copy ops were captured into the graph.
