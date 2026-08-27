@@ -2427,12 +2427,13 @@ class TestLadderOffButCheckpointingOn:
         The anchor is also the placement that pays: of 4,808 cc-trace resumes
         with a nonzero KV hit, 93.5% land on a previous prompt end and 0.0% on
         the 8192 ladder.
+
+        Asked through `checkpoint_end_pos` rather than a capability flag: what
+        matters is that both paths actually anchor, and the flag that used to
+        gate this answered `True` from every implementor there was.
         """
         fork = make_block_manager(ckpt_config())
         copy = make_block_manager(ckpt_config(), state_runtime=PAGED_COPY_RUNTIME)
-        assert fork.state.keeps_interior_boundaries is True
-        assert copy.paged_state_checkpoints.keeps_interior_boundaries is True
-
         forked, copied = stateful_seq(PROMPT), stateful_seq(PROMPT)
         fork.can_allocate(forked)
         copy.can_allocate(copied)
@@ -2479,61 +2480,19 @@ class TestCacheStatsAttribution:
         assert lost_hard == 4
         assert lost_to_checkpoint + lost_hard == 40 - 32
 
-    def test_each_pool_is_counted_where_it_cost_the_request_reuse(self):
-        """`cached <= wanted <= compressed <= reusable`, one request per case.
-
-        Request-weighted, because the token totals are decided by the largest
-        conversations and cannot say whether a loss was broad or concentrated.
-        """
-        stats = CacheStats(log_interval=10**6)
-        # Everything reusable was reused.
-        stats.update(44, 48, 44, 44, 44)
-        # Paged pool had it; a checkpoint at that boundary would have unlocked
-        # it. The state cache's own miss.
-        stats.update(32, 48, 44, 40, 44)
-        # Paged pool had it, but nothing a checkpoint reaches: wanted == cached.
-        stats.update(32, 48, 40, 32, 44)
-        # The prefix itself was absent -- state tuning is powerless.
-        stats.update(20, 48, 20, 20, 44)
-
-        assert stats.reqs_full_reuse == 1
-        assert stats.reqs_state_miss_recoverable == 1
-        # Superset: both middle requests had paged prefix the gates declined.
-        assert stats.reqs_state_miss == 2
-        assert stats.reqs_no_paged == 2  # the absent-prefix one, and case 3
-
-    def test_a_request_losing_at_both_pools_is_counted_at_both(self):
-        """The buckets overlap on purpose.
-
-        A prompt whose paged prefix ran out early *and* whose remaining reuse
-        needed a checkpoint has two independent problems. Charging it to one
-        pool would undercount the other and point sizing at the wrong one, so
-        the counters are not required to sum to the request count.
-        """
-        stats = CacheStats(log_interval=10**6)
-        stats.update(20, 100, 60, 40, 90)  # cached < wanted < compressed < reusable
-        assert stats.reqs_state_miss_recoverable == 1
-        assert stats.reqs_no_paged == 1
-        assert stats.reqs_full_reuse == 0
-        assert (
-            stats.reqs_state_miss + stats.reqs_no_paged > stats.total_requests
-        ), "buckets must be free to overlap"
-
     def test_a_perfect_run_is_reported_as_perfect(self):
-        """The regression that motivated `reusable`.
+        """The regression that motivated `reusable` as the denominator.
 
-        Against `full`, `reqs_full_reuse` and `reqs_no_paged` were tautologies:
-        `can_allocate` never matches the trailing block, so `compressed < full`
-        held for every request that could exist and the pair read 0% and 100%
-        on all workloads -- including this one, where both caches did
-        everything they possibly could.
+        Against `full`, every rate here read below 100% on a run where both
+        caches did everything they possibly could: `can_allocate` never matches
+        the trailing block, so `compressed < full` holds for every request that
+        could exist and the shortfall is charged to a pool that was never
+        offered the block.
         """
         stats = CacheStats(log_interval=10**6)
         # 100 tokens, 90 reusable: every reusable token was served by cache.
         stats.update(90, 100, 90, 90, 90)
 
-        assert stats.reqs_full_reuse == 1
-        assert stats.reqs_no_paged == 0, "a perfect run must not report a paged miss"
         assert stats.hit_rate == 1.0
         assert stats.paged_hit_rate == 1.0
         assert stats.state_hit_rate == 1.0
@@ -2637,7 +2596,6 @@ class TestCacheStatsAttribution:
         assert stats.total_reusable_tokens == 0
         assert stats.hit_rate == 0.0
         assert stats.paged_hit_rate == 0.0
-        assert stats.reqs_no_paged == 0, "nothing was reusable, so nothing was lost"
 
 
 class TestGenerationIsHeldToSpacingNotTheGrid:

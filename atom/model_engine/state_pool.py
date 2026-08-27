@@ -62,11 +62,6 @@ class StateSlotPool:
         # reason `BlockManager` still cuts prefill chunks onto rungs; see
         # `StateTransfer.readable_midstep`.
         self.readable_midstep: bool = self.transfer.readable_midstep
-        # Each boundary this class keeps is its own slot in the index, so an
-        # anchor and a prompt-end checkpoint coexist rather than overwrite.
-        # That is what makes the prompt-end anchor worth its prefill chunk
-        # here — see `BlockManager._record_checkpoint_end`.
-        self.keeps_interior_boundaries: bool = True
         self.hash_block_size: int = hash_block_size
         if self.transfer.copies:
             raise ValueError("PAGE-copy checkpoints do not belong to StateSlotPool")

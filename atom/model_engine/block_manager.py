@@ -1001,24 +1001,6 @@ class BlockManager:
         )
         if isinf(room):
             return
-        # A class that keeps only its *last* boundary gains nothing from an
-        # anchor and pays a prefill chunk for it. The PAGE coordinator files one
-        # pending checkpoint per seq (`_pending[id(seq)]`, and it discards
-        # `boundary_blocks` outright), so the prompt-end checkpoint that lands a
-        # chunk later overwrites the anchor before either is stored: measured on
-        # the copy path, the anchor buys one extra prefill chunk per prompt and
-        # moves the hit rate by exactly zero.
-        #
-        # The anchor earns its chunk only where two boundaries can coexist,
-        # which under `fork` they do — each is its own slot in the index. Asked
-        # as "does this class hold more than the last boundary" rather than by
-        # naming the backend, so a future multi-boundary copy class opts in by
-        # answering yes.
-        if not any(
-            c.applies(seq) and getattr(c, "keeps_interior_boundaries", True)
-            for c in self.state_caches
-        ):
-            return
         # The rightmost grid position that still leaves `room` behind it.
         #
         # Not simply `num_prompt_tokens` floored: a checkpoint at P binds the

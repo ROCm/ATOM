@@ -402,22 +402,6 @@ class PagedStateCheckpointCoordinator:
     # readable midstep — present because `BlockManager` calls them across every
     # member of `state_caches` without asking which kind it holds.
     readable_midstep = False
-    # Every boundary a seq reaches is kept, not just its last: `checkpoint`
-    # files one pending entry *per hash*, so an anchor and the prompt-end
-    # checkpoint that follows it a chunk later both survive to be stored.
-    #
-    # This was False, and with one entry per seq it had to be — the anchor was
-    # overwritten before it was stored, so it bought a shortened prefill chunk
-    # on every prompt and moved the hit rate by zero. What makes it affordable
-    # to keep both is the image's price: 127 blocks, 0.112% of the paged pool,
-    # against a whole 53.6 MiB Active Slot under `fork`.
-    #
-    # And the anchor is the placement that matters. Measured on the cc-traces,
-    # of 4,808 resumes with a nonzero KV hit, 93.5% land on a previous prompt
-    # end and 0.0% on the 8192 ladder — so the grid's chunk cuts were pure
-    # cost. Run with `--state-checkpoint-interval-tokens -1` to drop the grid
-    # and leave the anchor and the demand as the only two placements.
-    keeps_interior_boundaries = True
 
     def reserve_midstep(self, seq, positions: list[tuple[int, int]]) -> list[tuple]:
         del seq, positions
@@ -466,6 +450,22 @@ class PagedStateCheckpointCoordinator:
         return 0
 
     def checkpoint(self, seq: Sequence, boundary_blocks: int, h: int) -> None:
+        """File a boundary to be stored, keyed by hash rather than by seq.
+
+        Every boundary a seq reaches survives, not just its last: an anchor and
+        the prompt-end checkpoint that follows it a chunk later are separate
+        entries. Keying by seq alone would have the second overwrite the first
+        before either is stored, which costs a shortened prefill chunk on every
+        prompt and buys nothing. What makes keeping both affordable is the
+        image's price — 127 blocks, 0.112% of the paged pool, against a whole
+        53.6 MiB Active Slot under `fork`.
+
+        The anchor is the placement that pays. Measured on the cc-traces, of
+        4,808 resumes with a nonzero KV hit, 93.5% land on a previous prompt end
+        and 0.0% on the 8192 ladder, so the grid's chunk cuts were pure cost;
+        `--state-checkpoint-interval-tokens -1` drops the grid and leaves the
+        anchor and the demand rung as the only two placements.
+        """
         del boundary_blocks
         if self.applies(seq) and seq.state_slot >= 0:
             self._pending[(id(seq), h)] = (seq, h)
