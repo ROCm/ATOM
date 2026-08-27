@@ -1054,23 +1054,26 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         gfx = get_gfx()
         self.is_gfx1250 = gfx == "gfx1250"
         self.act_quant = MoEActivationQuant.from_model_config(moe.a_quant_dtype)
-        # TP only. Under EP the routed experts go through the modular kernel and
-        # the mori all-to-all, which hand the expert GEMM dispatched rows rather
-        # than this layer's own tokens; the Triton/gluon EP backend that consumes
-        # those is not landed on this branch. So EP forces both flags off and
-        # runs FlyDSL fused_moe -- half-applying them would prepare the weights
-        # in the Triton layout for a kernel that never runs.
         ep_moe = self.moe.use_ep
         if envs.is_set("ATOM_USE_TRITON_MOE"):
             use_triton_moe = envs.ATOM_USE_TRITON_MOE
         else:
-            use_triton_moe = gfx.startswith("gfx94") or (
-                gfx.startswith("gfx95") and envs.ATOM_USE_TRITON_GEMM
+            use_triton_moe = not ep_moe and (
+                gfx.startswith("gfx94")
+                or (gfx.startswith("gfx95") and envs.ATOM_USE_TRITON_GEMM)
             )
+        # One env flag, two disjoint paths. TP runs the experts inside apply();
+        # EP runs them from the modular kernel, between the mori dispatch and
+        # combine, over rows that arrived from other ranks. They share the aiter
+        # kernels but nothing else -- different weight prep, different routing
+        # source -- so they are tracked separately rather than by one `use_triton`
+        # that each call site has to re-interpret.
         self.use_triton = use_triton_moe and not ep_moe
+        self.use_triton_ep = use_triton_moe and ep_moe
         # Phase split: keep the weights in the FlyDSL layout and run the Triton
         # /gluon kernel on decode only, over a zero-copy view rebuilt in apply().
         # Narrows ATOM_USE_TRITON_MOE, so it is inert unless that path is on.
+        # TP only, since it hangs off use_triton.
         self.use_triton_decode = self.use_triton and envs.ATOM_USE_TRITON_MOE_DECODE
 
         # EPLB owns logical-to-physical routing, load recording, and live expert
@@ -1080,9 +1083,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if getattr(get_current_atom_config(), "eplb_enable", False):
             self.use_triton = False
             self.use_triton_decode = False
-        assert not (envs.ATOM_USE_TRITON_MOE_A4W4 and not self.use_triton), (
-            "ATOM_USE_TRITON_MOE_A4W4=1 requires the Triton MoE path, but it is "
-            f"off (ATOM_USE_TRITON_MOE={int(use_triton_moe)}, use_ep={ep_moe}, "
+            self.use_triton_ep = False
+        assert not (
+            envs.ATOM_USE_TRITON_MOE_A4W4
+            and not (self.use_triton or self.use_triton_ep)
+        ), (
+            "ATOM_USE_TRITON_MOE_A4W4=1 requires a Triton MoE path, but it is off "
+            f"(ATOM_USE_TRITON_MOE={int(use_triton_moe)}, use_ep={ep_moe}, "
             f"eplb_enable={getattr(get_current_atom_config(), 'eplb_enable', False)})."
         )
 
@@ -1255,37 +1262,52 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
             use_triton_gfx1250_silu = False
 
-        # ── A. Triton/gluon GUGU experts (gfx1250 + SiLU) ─────────────────────
-        # gfx1250-only by construction: use_triton_gfx1250_silu carries
-        # is_gfx1250. CDNA SiLU layers fall through to branch B, whose
-        # moe_gemm_a16w4 / a4w4 / a8w4 kernels take the GGUU layout.
-        if use_triton_gfx1250_silu:
+        # ── A. Triton/gluon GUGU experts: TP (gfx1250 + SiLU) or EP ───────────
+        if use_triton_gfx1250_silu or self.use_triton_ep:
             from aiter.ops.triton.utils.shuffle import (
                 moe_weight_decode_view,
                 shuffle_scale_moe,
             )
 
-            layer.w13_weight.data = moe_shuffle_weight(
-                layer.w13_weight,
-                experts_cnt=self.num_experts,
-                is_guinterleave=True,
-                gate_up=True,
-            )
-            layer.w2_weight.data = moe_shuffle_weight(
-                layer.w2_weight,
-                experts_cnt=self.num_experts,
-                is_guinterleave=True,
-                gate_up=False,
-            )
-            layer.w13_weight.is_shuffled = True
-            layer.w2_weight.is_shuffled = True
-            # GUGU interleaves stage1 bias rows to [g0, u0, g1, u1, ...] to
-            # match the weight rows moe_shuffle_weight just interleaved.
-            if layer.w13_bias is not None:
-                layer.w13_bias.data = interleave_gate_up_rows(layer.w13_bias.data)
+            if self.is_gfx1250:
+                layer.w13_weight.data = moe_shuffle_weight(
+                    layer.w13_weight,
+                    experts_cnt=self.num_experts,
+                    is_guinterleave=True,
+                    gate_up=True,
+                )
+                layer.w2_weight.data = moe_shuffle_weight(
+                    layer.w2_weight,
+                    experts_cnt=self.num_experts,
+                    is_guinterleave=True,
+                    gate_up=False,
+                )
+                layer.w13_weight.is_shuffled = True
+                layer.w2_weight.is_shuffled = True
+                # GUGU interleaves stage1 bias rows to [g0, u0, g1, u1, ...].
+                # NOTE: the CDNA branch below interleaves the weight rows but
+                # NOT the bias, so a biased EP layer on CDNA is inconsistent.
+                # Pre-existing; DeepSeek-V4 has no MoE bias so it is latent.
+                if layer.w13_bias is not None:
+                    layer.w13_bias.data = interleave_gate_up_rows(layer.w13_bias.data)
 
-            w13_weight = moe_weight_decode_view(layer.w13_weight.data)
-            w2_weight = moe_weight_decode_view(layer.w2_weight.data)
+            if self.is_gfx1250:
+                w13_weight = moe_weight_decode_view(layer.w13_weight.data)
+                w2_weight = moe_weight_decode_view(layer.w2_weight.data)
+            else:
+                w13_unshuffled = layer.w13_weight.data
+                if w13_unshuffled.dtype != torch.uint8:
+                    w13_unshuffled = w13_unshuffled.view(torch.uint8)
+                assert w13_unshuffled.shape[1] == 2 * self.intermediate_size, (
+                    "expected w13_weight (E, 2*intermediate, K_packed) so dim 1 is "
+                    f"the gate/up axis, got {tuple(w13_unshuffled.shape)}"
+                )
+                w13_unshuffled = interleave_gate_up_rows(w13_unshuffled)
+                w2_unshuffled = layer.w2_weight.data
+                if w2_unshuffled.dtype != torch.uint8:
+                    w2_unshuffled = w2_unshuffled.view(torch.uint8)
+                w13_weight = w13_unshuffled.transpose(-2, -1)
+                w2_weight = w2_unshuffled.transpose(-2, -1)
 
             raw_w13_scale = layer.w13_weight_scale.data
             raw_w2_scale = layer.w2_weight_scale.data
@@ -1303,10 +1325,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w2_scale_in = raw_w2_scale.transpose(-2, -1)
 
             w13_scale, w13_swizzle_layout = shuffle_scale_moe(
-                w13_scale_in, return_layout=True, scale_kwidth=4
+                w13_scale_in,
+                return_layout=True,
+                scale_kwidth=4 if self.is_gfx1250 else 8,
             )
             w2_scale, w2_swizzle_layout = shuffle_scale_moe(
-                w2_scale_in, return_layout=True, scale_kwidth=4
+                w2_scale_in,
+                return_layout=True,
+                scale_kwidth=4 if self.is_gfx1250 else 8,
             )
 
             del layer.w13_weight
@@ -1690,7 +1716,89 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             moe_extra_args["linear_beta"] = getattr(
                 layer, "activation_situ_linear_beta", None
             )
+        if self.use_triton_ep and self.using_modular_kernel:
+            assert getattr(layer, "w13_swizzle_layout", None) is not None, (
+                "use_triton_ep is on but this layer carries the FlyDSL weight "
+                "layout; flydsl fused_moe cannot serve as a fallback because "
+                "block A publishes the GUGU layout under the same names."
+            )
+            moe_extra_args["triton_experts"] = {
+                "w13_weight": layer.w13_weight,
+                "w2_weight": layer.w2_weight,
+                "w13_scale": layer.w13_weight_scale,
+                "w2_scale": layer.w2_weight_scale,
+                "w13_swizzle_layout": layer.w13_swizzle_layout,
+                "w2_swizzle_layout": layer.w2_swizzle_layout,
+                "a13_scale": getattr(layer, "w13_input_scale", None),
+                "a2_scale": getattr(layer, "w2_input_scale", None),
+                "w1_bias": getattr(layer, "w13_bias", None),
+                "w2_bias": getattr(layer, "w2_bias", None),
+                "swiglu_limit": getattr(layer, "swiglu_limit", 10.0),
+            }
+
         if self.fused_experts is None:
+            # Serves prefill as well as decode: the gfx1250 gluon kernel's
+            # prefill bug is fixed, and process_weights_after_loading no longer
+            # builds the FlyDSL scale layout under use_triton_ep, so there is no
+            # flydsl fallback left to drop back to.
+            if (
+                self.use_triton_ep
+                and self.is_gfx1250
+                and getattr(layer, "w13_weight_preshuffled", None) is not None
+            ):
+                from atom.model_ops.fused_moe_triton import (
+                    routing_from_dispatched,
+                    triton_kernel_fused_experts,
+                )
+
+                M = topk_ids.shape[0]
+                num_local_tokens = topk_ids.new_empty(1, dtype=torch.int32).fill_(M)
+                # No scatter geometry: this path has no EP transport to deliver
+                # into, so GEMM2 reduces locally and dst_row is unused.
+                routing_data, gather_idx, scatter_idx, gate_valid, _dst_row = (
+                    routing_from_dispatched(
+                        topk_weights,
+                        topk_ids,
+                        expert_map,
+                        self.num_experts,
+                        num_local_tokens,
+                    )
+                )
+                return triton_kernel_fused_experts(
+                    None,  # output_tensor: the GUGU path allocates its own
+                    x,
+                    layer.w13_weight_preshuffled,
+                    layer.w2_weight_preshuffled,
+                    routing_data,
+                    gather_idx,
+                    scatter_idx,
+                    topk=routing_data.n_expts_act,
+                    use_triton_gfx1250_silu=True,
+                    w13_scale=layer.w13_weight_scale_a8w4,
+                    w2_scale=layer.w2_weight_scale_a8w4,
+                    w13_swizzle_layout=layer.w13_swizzle_layout_a8w4,
+                    w2_swizzle_layout=layer.w2_swizzle_layout_a8w4,
+                    a13_scale=getattr(layer, "w13_input_scale", None),
+                    a2_scale=getattr(layer, "w2_input_scale", None),
+                    w1_bias=getattr(layer, "w13_bias", None),
+                    w2_bias=getattr(layer, "w2_bias", None),
+                    swiglu_limit=getattr(layer, "swiglu_limit", 10.0),
+                    apply_router_weight_on_input=apply_router_weight_on_input,
+                    gate_valid=gate_valid,
+                )
+
+            # Reaching flydsl with use_triton_ep on means the Triton branch
+            # above was skipped (wrong arch, or the a8w4 prep never ran). The
+            # FlyDSL scale layout was not built for this layer, so w13/w2
+            # _weight_scale are None -- fail with the reason rather than let
+            # fused_moe dereference None deep in a kernel launch.
+            assert not self.use_triton_ep, (
+                "use_triton_ep is on but the Triton EP path is unavailable here "
+                f"(is_gfx1250={self.is_gfx1250}, w13_weight_preshuffled="
+                f"{getattr(layer, 'w13_weight_preshuffled', None) is not None}); "
+                "flydsl fused_moe cannot serve as a fallback because the FlyDSL "
+                "scale layout is skipped under use_triton_ep."
+            )
             return fused_moe(
                 x,
                 layer.w13_weight,

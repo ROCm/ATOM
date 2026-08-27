@@ -21,6 +21,7 @@
 from math import prod
 
 import torch
+import triton
 from aiter import ActivationType
 from aiter.ops.triton.fusions.fused_clamp_act_mul import fused_clamp_act_mul
 from aiter.ops.triton.utils._triton.arch_info import get_arch
@@ -95,6 +96,100 @@ def _swizzle_mxfp4(
     )
 
 
+def routing_from_dispatched(
+    dispatch_weights: torch.Tensor,
+    dispatch_ids: torch.Tensor,
+    expert_map: torch.Tensor,
+    num_local_experts: int,
+    num_local_tokens: torch.Tensor,
+    ep_scatter_geometry=None,
+):
+    """Build triton RoutingData / gather / scatter from mori-dispatched rows.
+    Thin wrapper over aiter's ``ep_sort_routing``, which owns the sort itself
+    (gating, histogram, scatter) because the EP path cannot use ``routing()``:
+    that starts from router logits, but after the all-to-all the top-k choice is
+    already made and the rows have been permuted across ranks. What stays here is
+    the tile geometry, the ExptData allocation and the packaging -- shaped by
+    three facts about the post-dispatch buffer:
+    1. Rows are per-token: mori sends one copy per (token, destination rank), so
+       a row carries the full top-k tuple with only *some* entries owned here.
+       Non-local entries go to a sentinel bin that is sliced off the histogram,
+       so the matmul schedules no block for them.
+    2. The flat gate index must stay ``row * topk + slot``, because the matmul
+       recovers the activation row as ``gather_idx // N_EXPTS_ACT``. Non-local
+       entries are therefore **masked, never compacted** -- compacting would
+       break that arithmetic and silently read the wrong rows.
+    3. ``num_local_tokens`` is a device tensor and rows past it hold garbage from
+       the over-allocated receive buffer. Masking them the same way keeps this
+       function sync-free and its shapes static (so it stays cudagraph-safe).
+       It is REQUIRED, not optional: the mori buffer always has M > R, so
+       skipping the row mask would fold garbage rows into the histogram as live
+       gates -- silently wrong rather than an error.
+    Returns ``(routing_data, gather_indx, scatter_indx, gate_valid, dst_row)`` --
+    the first three match ``routing()``; ``gate_valid`` is the extra piece EP
+    needs, since ``routing()`` never produces dead gates. ``dst_row`` is None
+    unless ``ep_scatter_geometry`` asked for the combine-scatter map.
+    """
+    from aiter.ops.triton.moe.moe_routing.routing import (
+        ExptData,
+        RoutingData,
+        _compute_expt_data_internal,
+        ep_sort_routing,
+    )
+
+    M, topk = dispatch_ids.shape
+    device = dispatch_ids.device
+    n_gates = M * topk
+
+    # gate_valid is in flat gate order (row * topk + slot) -- the same layout
+    # scatter_indx uses, so reduce_grouped's .view(-1, n_expts_act) lines up
+    # slot-for-slot. A dead slot's sorted position is never written by the GEMM
+    # (the sentinel keeps the matmul off it), so the reduce must be told to skip
+    # it rather than sum uninitialized memory.
+
+    # Same derivation as routing_torch. Note n_gates counts every gate slot while
+    # only ~1/topk are live under EP, so this overstates real per-expert
+    # occupancy and picks larger tiles than the work needs. That is a
+    # perf/tiling concern, not correctness: the matmul wraps its gather with
+    # `offs_x_m % hist[e]` and masks stores with `offs_m < hist[e]`, so a
+    # mostly-empty tile recomputes a live row rather than reading garbage.
+    #
+    # Allocation-only (no kernel), and hoisted above the sort because
+    # ep_sort_routing fills these buffers in the same launches as the histogram
+    # and the scatter.
+    global_num_experts = max(1, expert_map.numel() - 1)
+    tokens_per_expt = max(1, n_gates // global_num_experts)
+    block_m = max(16, min(triton.next_power_of_2(tokens_per_expt), 128))
+    expt_data_bufs = _compute_expt_data_internal(
+        num_local_experts, n_gates, block_m, device
+    )
+    token_offs_raw, token_offs_pad, block_pid_map, _blocks1, _BLOCK, _block_m_log2 = (
+        expt_data_bufs
+    )
+
+    hist_full, topk_indx, gate_indx, gate_scal, gate_valid, dst_row = ep_sort_routing(
+        dispatch_weights,
+        dispatch_ids,
+        expert_map,
+        num_local_experts,
+        num_local_tokens,
+        M,
+        topk,
+        n_gates,
+        expt_data_bufs,
+        ep_scatter_geometry=ep_scatter_geometry,
+    )
+    # The tail bin holds the sentinel (non-local) count, which the matmul must
+    # schedule no tile for.
+    hist = hist_full[:num_local_experts]
+    expt_data = ExptData(hist, token_offs_raw, token_offs_pad, block_pid_map)
+
+    routing_data = RoutingData(
+        block_m, gate_scal, hist, num_local_experts, topk, expt_data
+    )
+    return routing_data, topk_indx, gate_indx, gate_valid, dst_row
+
+
 def _resize_cache(x: torch.Tensor, v: tuple[int, ...]) -> torch.Tensor:
     """
     Shrink the given tensor and apply the given view to it.  This is
@@ -122,10 +217,10 @@ def _gluon_fused_quant_supported(m, n, k, routing_data) -> bool:
     it -- an unsupported pick returns uninitialised scales, and there is no
     assert on the aiter side to catch it.
 
-    block_m comes from routing_data (tokens-per-expert), NOT from a prefill
-    /decode flag: a decode step at high enough concurrency raises block_m above
-    16 and lands on the prefill kernel. So this has to be recomputed per call,
-    not cached per layer.
+    block_m comes from routing_data (tokens-per-expert, see
+    routing_from_dispatched), NOT from a prefill/decode flag: a decode step at
+    high enough concurrency raises block_m above 16 and lands on the prefill
+    kernel. So this has to be recomputed per call, not cached per layer.
 
     Defers the persistent decision to aiter's own selector instead of restating
     its thresholds, so this stays correct if that heuristic moves. The selector
@@ -155,8 +250,11 @@ def _fused_experts_silu_gugu(
     w2_bias: torch.Tensor | None = None,
     swiglu_limit: float = 10.0,
     apply_router_weight_on_input: bool = False,
+    gate_valid: torch.Tensor | None = None,
     preshuffled: bool | None = None,
     act_quant: MoEActivationQuant = MoEActivationQuant.BF16,
+    y_out: torch.Tensor | None = None,
+    ep_scatter=None,
 ) -> torch.Tensor:
     """Fused-SiLU MoE experts over GUGU (interleaved ``[gate, up]``) weights.
 
@@ -183,13 +281,22 @@ def _fused_experts_silu_gugu(
     _test/ep_moe_bench_report.md): the a4w4 GEMMs are genuinely faster (halved
     weight traffic) but the doubled quant costs more than the GEMM saving.
 
-    GEMM2 reduces locally and allocates its own output. aiter's kernels also
-    accept a caller-owned reduction buffer and an EP combine-scatter target, but
-    both exist for the expert-parallel path, which is not wired up here -- this
-    is the TP entry point only.
+    ``y_out``, when given, is where GEMM2's grouped reduction writes -- typically
+    the leading rows of a taller caller-owned buffer, so the EP path can hand
+    mori's combine a full-M tensor without copying this result into it. It is
+    GEMM2's output only; GEMM1's intermediate is always kernel-allocated.
+
+    ``ep_scatter`` replaces that reduction entirely: GEMM2 delivers its un-reduced
+    rows into a peer combine-staging window and the sum happens in the EP combine,
+    once every rank has delivered. Mutually exclusive with ``y_out`` -- one names a
+    reduced output, the other says there is no local reduction to produce one.
     """
     assert hidden_states.ndim == 2
     assert hidden_states.dtype == torch.bfloat16
+    assert y_out is None or ep_scatter is None, (
+        "y_out and ep_scatter are alternatives: the first names GEMM2's reduced "
+        "output, the second says the rows leave unreduced"
+    )
 
     gammas = routing_data.gate_scal if routing_data else None
 
@@ -200,6 +307,10 @@ def _fused_experts_silu_gugu(
     )
 
     if envs.ATOM_USE_TRITON_MOE_A4W4 or act_quant == MoEActivationQuant.FP4:
+        assert ep_scatter is None, (
+            "the scatter-fused EP combine is wired through moe_gemm_a8w4 only; "
+            "moe_gemm_a4w4 has no ep_scatter, so a4w4 must use the gather combine"
+        )
         # ``moe_gemm_a4w4`` has no ``preshuffled`` parameter, so it can only
         # consume the plain (E, K, N) weight -- i.e. a4w4 is a CDNA-only variant.
         # Handed a gfx1250 WMMA-preshuffled weight it reads N as N // 16 and
@@ -242,6 +353,10 @@ def _fused_experts_silu_gugu(
             scatter_indx=scatter_indx,
             gammas=None if apply_router_weight_on_input else gammas,
             swizzle_mx_scale=w2_swizzle_layout,
+            # Only GEMM2 feeds reduce_grouped, so the mask belongs here. GEMM1's
+            # dead slots are already skipped by the sentinel histogram.
+            gate_valid=gate_valid,
+            y_out=y_out,
         )
 
     x_fp8, x_scale = downcast_to_mxfp(hidden_states, torch.float8_e4m3fn, axis=-1)
@@ -307,6 +422,11 @@ def _fused_experts_silu_gugu(
         gammas=None if apply_router_weight_on_input else gammas,
         swizzle_mx_scale=w2_swizzle_layout,
         preshuffled=_preshuffled,
+        # Only GEMM2 feeds reduce_grouped, so the mask belongs here. GEMM1's
+        # dead slots are already skipped by the sentinel histogram.
+        gate_valid=gate_valid,
+        y_out=y_out,
+        ep_scatter=ep_scatter,
     )
 
 
@@ -394,9 +514,14 @@ def triton_kernel_fused_experts(
     # [g0,u0,g1,u1,...]) w13, instead of the general path's GGUU ([gate|up]).
     # The caller is the authority: the layout was decided by
     # process_weights_after_loading, and nothing in the tensors themselves
-    # distinguishes the two. Named for the condition that gates it in
-    # Mxfp4MoEMethod: gfx1250 + SiLU on the TP path.
+    # distinguishes the two. Named for the TP condition that gates it in
+    # Mxfp4MoEMethod, which is the only caller that passes it conditionally --
+    # the EP callers pass True unconditionally and do run on CDNA, where
+    # `preshuffled` resolves to False.
     use_triton_gfx1250_silu: bool = False,
+    # EP only: dead-gate mask for rows the all-to-all did not route here.
+    # routing() never produces dead gates, so the TP callers leave it None.
+    gate_valid: torch.Tensor | None = None,
     # GUGU only. None = pick by arch (pre-shuffled only on gfx1250, where the
     # gluon kernel supports it). Overridable so the two weight layouts can be
     # A/B'd from one process: pre-shuffle is a pure layout change, so the same
@@ -404,6 +529,15 @@ def triton_kernel_fused_experts(
     # process_weights_after_loading's is_gfx1250 branch without needing a
     # reference implementation.
     preshuffled: bool | None = None,
+    # GUGU only. Buffer GEMM2's grouped reduction writes into, in place of a
+    # kernel-allocated one; may be a row-slice of a taller tensor. Distinct from
+    # `output_tensor`, which the GGUU path resizes to (M, K) and which the GUGU
+    # path ignores. The kernel asserts shape/dtype/device/last-dim-contiguity.
+    y_out: torch.Tensor | None = None,
+    # GUGU only. Deliver GEMM2's un-reduced rows to an EP combine-staging window
+    # instead of reducing them locally (aiter's EpCombineScatter). Alternative to
+    # y_out, not a companion.
+    ep_scatter=None,
 ) -> torch.Tensor:
     # type check, uint8 means mxfp4
     assert hidden_states.dtype == torch.bfloat16
@@ -443,9 +577,17 @@ def triton_kernel_fused_experts(
             w2_bias=w2_bias,
             swiglu_limit=swiglu_limit,
             apply_router_weight_on_input=apply_router_weight_on_input,
+            gate_valid=gate_valid,
             preshuffled=preshuffled,
             act_quant=act_quant,
+            y_out=y_out,
+            ep_scatter=ep_scatter,
         )
+
+    assert y_out is None and ep_scatter is None, (
+        "y_out / ep_scatter are only wired through the GUGU fused-SiLU path; the "
+        "GGUU path writes its result into `output_tensor`."
+    )
 
     # aiter kernels expect 2d inputs/outputs
     M, K = hidden_states.shape[-2:]

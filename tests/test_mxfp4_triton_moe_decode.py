@@ -99,6 +99,7 @@ def _prep_method(*, use_triton, use_triton_decode, num_experts, intermediate):
     reads, so the prep can run without create_weights()/a real FusedMoEConfig."""
     method = object.__new__(moe_mod.Mxfp4MoEMethod)
     method.use_triton = use_triton
+    method.use_triton_ep = False
     method.use_triton_decode = use_triton_decode
     method.is_gfx1250 = True
     method.is_guinterleave = True
@@ -262,6 +263,7 @@ def _apply_dispatch_probe(monkeypatch, *, use_triton_decode, is_prefill):
 
     method = object.__new__(moe_mod.Mxfp4MoEMethod)
     method.use_triton = True
+    method.use_triton_ep = False
     method.use_triton_decode = use_triton_decode
     method.is_gfx1250 = True
     method.is_guinterleave = True
