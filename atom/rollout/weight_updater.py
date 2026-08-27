@@ -21,41 +21,6 @@ class WeightUpdaterMixin:
       - self.clear_kv_cache() — method
     """
 
-    def _invalidate_cudagraphs_after_weight_update(self) -> None:
-        """Drop stale CUDA graphs after online weight updates.
-
-        Recapture is intentionally deferred to ``resume_memory``/wake-up, where
-        MemoryManagerMixin verifies that both weights and KV cache are resident
-        on GPU.  This avoids recapturing against an incomplete post-update
-        memory state while preventing stale graph replay.
-        """
-        if getattr(self, "enforce_eager", False):
-            return
-
-        # No-eager policy: weights are updated in-place (param.data.copy_ and
-        # in-place shuffle preserve the parameter storage/address), so captured
-        # CUDA graphs read the refreshed values from the same addresses and stay
-        # valid. Keep the graphs resident instead of dropping+recapturing them,
-        # which under expandable_segments faults during post-wake graph capture.
-        return
-
-        torch.cuda.synchronize()
-        graphs = getattr(self, "graphs", None)
-        if graphs:
-            self._graphs_backup_keys = list(graphs.keys())
-            graphs.clear()
-        if hasattr(self, "graph_logits"):
-            self.graph_logits.clear()
-        if hasattr(self, "graph_aux_hidden"):
-            self.graph_aux_hidden.clear()
-        if hasattr(self, "graph_pool"):
-            self.graph_pool = None
-        tbo_graphs = getattr(getattr(self, "model", None), "tbo_graphs", None)
-        if tbo_graphs is not None:
-            tbo_graphs.clear()
-        torch.cuda.empty_cache()
-        logger.info(f"{self.label}: CUDA graphs invalidated after weight update")
-
     def _get_param_to_module_mapping(self) -> dict[str, tuple]:
         """
         Get or build the parameter name to module mapping.
@@ -457,9 +422,6 @@ class WeightUpdaterMixin:
         if hasattr(self, "_packed_weight_accum"):
             self._packed_weight_accum.clear()
 
-        if clear_kv_cache:
-            self._invalidate_cudagraphs_after_weight_update()
-
         logger.info(
             f"{self.label}: Weight update complete - "
             f"updated={updated}, skipped={skipped}, "
@@ -582,8 +544,6 @@ class WeightUpdaterMixin:
                             f"{list(self._packed_weight_accum.keys())}"
                         )
                     self._packed_weight_accum.clear()
-                self._invalidate_cudagraphs_after_weight_update()
-
             logger.info(
                 f"{self.label}: SHM weight update bucket done - "
                 f"updated={updated}, skipped={skipped}, "
@@ -747,8 +707,6 @@ class WeightUpdaterMixin:
                         f"{list(self._packed_weight_accum.keys())}"
                     )
                 self._packed_weight_accum.clear()
-            self._invalidate_cudagraphs_after_weight_update()
-
         logger.info(
             f"{self.label}: IPC weight update bucket done - "
             f"updated={updated}, skipped={skipped}, "
