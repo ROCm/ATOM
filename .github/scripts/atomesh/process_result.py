@@ -27,6 +27,9 @@ RESULT_RE = re.compile(
 )
 TOPOLOGY_RE = re.compile(r"(?P<p>\d+)p(?P<d>\d+)d", re.IGNORECASE)
 TP_RE = re.compile(r"tp(?P<tp>\d+)", re.IGNORECASE)
+DUAL_TP_RE = re.compile(r"tp(?P<prefill_tp>\d+)-tp(?P<decode_tp>\d+)", re.IGNORECASE)
+CPP_PP_RE = re.compile(r"(?:cpp|pp)(?P<pp>\d+)", re.IGNORECASE)
+PP_ARG_RE = re.compile(r"--pipeline-parallel-size(?:=|\s+)(\d+)", re.IGNORECASE)
 EVAL_CONC_RE = re.compile(r"(?:^|[_-])c(?P<conc>\d+)(?:$|[_-])", re.IGNORECASE)
 EVAL_TOPOLOGY_RE = re.compile(
     r"(?:^|[_-])(?P<topology>\d+p\d+d(?:[_-]dpa)?)(?:$|[_-])",
@@ -197,7 +200,6 @@ def topology_resources(
         )
     )
     topology = TOPOLOGY_RE.search(text)
-    tp = TP_RE.search(text)
     prefill_workers = int_value(
         payload.get("prefill_workers"), payload.get("num_prefill_workers")
     )
@@ -214,14 +216,36 @@ def topology_resources(
     decode_tp = int_value(
         payload.get("decode_tp"), payload.get("decode_tensor_parallel_size")
     )
-    if tp:
-        prefill_tp = prefill_tp or int(tp.group("tp"))
-        decode_tp = decode_tp or int(tp.group("tp"))
+    dual_tp = DUAL_TP_RE.search(text)
+    if dual_tp:
+        prefill_tp = prefill_tp or int(dual_tp.group("prefill_tp"))
+        decode_tp = decode_tp or int(dual_tp.group("decode_tp"))
+    else:
+        tp = TP_RE.search(text)
+        if tp:
+            tp_size = int(tp.group("tp"))
+            prefill_tp = prefill_tp or tp_size
+            decode_tp = decode_tp or tp_size
+
+    prefill_pp = int_value(
+        payload.get("prefill_pp"), payload.get("prefill_pipeline_parallel_size")
+    )
+    if prefill_pp is None:
+        cpp_pp = CPP_PP_RE.search(text)
+        if cpp_pp:
+            prefill_pp = int(cpp_pp.group("pp"))
+    if prefill_pp is None:
+        for key in ("prefill_extra_server_args",):
+            pp_match = PP_ARG_RE.search(string_value(payload.get(key)))
+            if pp_match:
+                prefill_pp = int(pp_match.group(1))
+                break
+    prefill_pp = prefill_pp or 1
 
     num_prefill_gpu = int_value(payload.get("num_prefill_gpu"))
     num_decode_gpu = int_value(payload.get("num_decode_gpu"))
     if num_prefill_gpu is None and prefill_workers and prefill_tp:
-        num_prefill_gpu = prefill_workers * prefill_tp
+        num_prefill_gpu = prefill_workers * prefill_tp * prefill_pp
     if num_decode_gpu is None and decode_workers and decode_tp:
         num_decode_gpu = decode_workers * decode_tp
     total_gpu = int_value(payload.get("total_gpu"))
@@ -234,6 +258,7 @@ def topology_resources(
         "decode_workers": decode_workers,
         "prefill_tp": prefill_tp,
         "decode_tp": decode_tp,
+        "prefill_pp": prefill_pp,
         "num_prefill_gpu": num_prefill_gpu,
         "num_decode_gpu": num_decode_gpu,
         "total_gpu": total_gpu,
@@ -334,6 +359,9 @@ def enrich_payload(
     enriched.setdefault("decode_workers", env.get("DECODE_WORKERS"))
     enriched.setdefault("prefill_tp", env.get("PREFILL_TP"))
     enriched.setdefault("decode_tp", env.get("DECODE_TP"))
+    enriched.setdefault(
+        "prefill_extra_server_args", env.get("PREFILL_EXTRA_SERVER_ARGS")
+    )
     runner = env.get("SLURM_SUBMIT_RUNNER", "")
     if hardware:
         enriched["hardware"] = hardware
