@@ -379,6 +379,11 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             assert (
                 not self.is_producer
             ), "Only the decode (consumer) side handles do_remote_prefill"
+            # Preserve the producer's final, possibly checkpoint-moved source
+            # slot before replacing local_slot_index with the consumer's slot.
+            params["remote_slot_index"] = params.get(
+                "remote_slot_index", params.get("local_slot_index", -1)
+            )
             self._reqs_need_recv[seq.id] = (seq, list(seq.block_table), slot_index)
             params["do_remote_prefill"] = False
             params["local_slot_index"] = slot_index
@@ -401,12 +406,13 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             params["num_computed_blocks"] = num_computed_blocks
             logger.debug(
                 "[SCHEDULER-CONSUMER] Queued req %s for remote KV recv "
-                "(%d blocks, %d locally cached, slot=%d), transfer_id=%s, "
-                "remote_host=%s, remote_handshake_port=%s",
+                "(%d blocks, %d locally cached, dst_slot=%d, src_slot=%d), "
+                "transfer_id=%s, remote_host=%s, remote_handshake_port=%s",
                 seq.id,
                 len(seq.block_table),
                 num_computed_blocks,
                 slot_index,
+                params["remote_slot_index"],
                 params.get("transfer_id"),
                 params.get("remote_host"),
                 params.get("remote_handshake_port"),
@@ -429,6 +435,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         draft_token_ids = (
             [int(x) for x in drafts] if drafts is not None and len(drafts) else []
         )
+        final_state_slot = getattr(seq, "state_slot", -1)
         seq.kv_transfer_params_output = {
             "do_remote_prefill": True,
             "do_remote_decode": False,
@@ -447,9 +454,17 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             "transfer_id": seq.id,
             "first_token_id": first_token_id,
             "draft_token_ids": draft_token_ids,
-            "local_slot_index": getattr(seq, "state_slot", -1),
+            "local_slot_index": final_state_slot,
+            # Keep source and destination namespaces separate on the consumer:
+            # its allocation overwrites local_slot_index with the destination.
+            "remote_slot_index": final_state_slot,
             "prefix_cache_hit_tokens": getattr(seq, "prefix_cache_hit_tokens", 0),
         }
+        logger.debug(
+            "[PD-STATE-SLOT] producer-finished transfer_id=%s final_src_slot=%d",
+            seq.id,
+            final_state_slot,
+        )
 
         if not self.is_producer:
             transfer_id = self.request_id_to_transfer_id.pop(seq.id, None)
@@ -1002,6 +1017,11 @@ class MooncakeConnector(KVConnectorBase):
                 request_body.update(
                     {
                         "has_slot_regions": True,
+                        # Recurrent state is slot-indexed, and prefix
+                        # checkpointing may move the producer request after its
+                        # initial allocation.
+                        "src_slot_index": meta.remote_slot_index,
+                        "src_swa_block_ids": meta.remote_swa_block_ids,
                         "dst_slot_index": meta.local_slot_index,
                         "consumer_block_base_addrs": [
                             b for b, _ in self._block_regions
@@ -1217,6 +1237,18 @@ class MooncakeConnector(KVConnectorBase):
             )
 
             request_src_block_ids = request_data.get("src_block_ids")
+            final_src_slot = -1
+            if has_slot_data:
+                try:
+                    final_src_slot = int(request_data["src_slot_index"])
+                except (KeyError, TypeError, ValueError):
+                    pass
+                if final_src_slot < 0:
+                    raise RuntimeError(
+                        "stateful Mooncake transfer is missing the producer's "
+                        f"final source slot (req_id={req_id}, "
+                        f"transfer_id={transfer_id})"
+                    )
             if self.pp_size == 1:
                 # TP-TP: authoritative block_ids come from the local prefill
                 # cache (populated by the scheduler). Wait for it.
@@ -1252,7 +1284,7 @@ class MooncakeConnector(KVConnectorBase):
                     "slot_index": (
                         cached["slot_index"]
                         if cached
-                        else request_data.get("src_slot_index", -1)
+                        else final_src_slot
                     ),
                 }
 
@@ -1272,6 +1304,22 @@ class MooncakeConnector(KVConnectorBase):
                     len(dst_block_ids),
                 )
                 return
+            if has_slot_data:
+                initial_src_slot = int(prefill_data.get("slot_index", -1))
+                prefill_data = dict(prefill_data)
+                prefill_data["slot_index"] = final_src_slot
+                prefill_data["swa_block_ids"] = request_data.get(
+                    "src_swa_block_ids", prefill_data.get("swa_block_ids", [])
+                )
+                logger.debug(
+                    "[PD-STATE-SLOT] transfer req_id=%s transfer_id=%s "
+                    "initial_src_slot=%d final_src_slot=%d dst_slot=%d",
+                    req_id,
+                    transfer_id,
+                    initial_src_slot,
+                    final_src_slot,
+                    int(request_data.get("dst_slot_index", -1)),
+                )
             target = f"{consumer_host}:{consumer_rpc_port}"
 
             if hasattr(self.transfer_engine, "get_first_buffer_address"):

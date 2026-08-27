@@ -127,6 +127,23 @@ def test_build_req_meta_reads_remote_pp_size():
     assert meta.remote_pp_size == 4
 
 
+def test_build_req_meta_keeps_remote_and_local_state_slots_distinct():
+    meta = ConnectorMetadata._build_req_meta(
+        req_id="r0",
+        local_block_ids=[0],
+        kv_transfer_params={
+            "remote_block_ids": [5],
+            "remote_host": "h",
+            "remote_handshake_port": 6301,
+            "tp_size": 1,
+            "local_slot_index": 11,
+            "remote_slot_index": 7,
+        },
+    )
+    assert meta.local_slot_index == 11
+    assert meta.remote_slot_index == 7
+
+
 def test_build_req_meta_defaults_pp_size_one():
     meta = ConnectorMetadata._build_req_meta(
         req_id="r0",
@@ -161,6 +178,7 @@ def test_producer_advertises_remote_pp_size():
         spec_token_ids=None,
         block_table=[1, 2, 3],
         id=99,
+        state_slot=7,
         state_slots=[],
         kv_transfer_params_output=None,
     )
@@ -168,6 +186,48 @@ def test_producer_advertises_remote_pp_size():
     assert seq.kv_transfer_params_output["remote_pp_size"] == 4
     assert seq.kv_transfer_params_output["hash_block_size"] == 64
     assert seq.kv_transfer_params_output["remote_block_ids"] == [1, 2, 3]
+    assert seq.kv_transfer_params_output["remote_slot_index"] == 7
+
+
+@pytest.mark.parametrize(
+    "producer_slots",
+    [
+        # Compatibility form emitted by older producers.
+        {"local_slot_index": 7},
+        # The explicit source slot must win over the legacy field.
+        {"local_slot_index": 3, "remote_slot_index": 7},
+    ],
+)
+def test_consumer_preserves_producer_final_slot_before_setting_destination(
+    producer_slots,
+):
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    sched = _mooncake_consumer_scheduler(mc)
+
+    # Nothing locally cached, so the incremental-transfer branch resolves to a
+    # full transfer and leaves the slot bookkeeping under test alone.
+    seq = SimpleNamespace(
+        id="decode-1",
+        state_slot=11,
+        block_table=[1, 2],
+        has_per_req_cache=False,
+        num_cached_tokens=0,
+        kv_transfer_params={
+            "do_remote_prefill": True,
+            "transfer_id": "prefill-1",
+            "hash_block_size": 64,
+            **producer_slots,
+        },
+    )
+    sched.update_state_after_alloc(seq)
+
+    assert seq.kv_transfer_params["remote_slot_index"] == 7
+    assert seq.kv_transfer_params["local_slot_index"] == 11
+    meta = sched.build_connector_meta().reqs_to_recv["decode-1"]
+    assert meta.remote_slot_index == 7
+    assert meta.local_slot_index == 11
 
 
 def _mooncake_consumer_scheduler(mc, hash_block_size=64):
@@ -448,6 +508,77 @@ def _make_connector(**overrides):
     for k, v in overrides.items():
         setattr(conn, k, v)
     return conn
+
+
+def _make_transfer_connector(prefill_data, captured):
+    conn = _make_connector()
+    conn.pp_size = 1
+    conn.pp_rank = 0
+    conn.tp_size = 1
+    conn.transfer_engine = object()
+    conn._transfer_refcount_lock = threading.Lock()
+    conn._transfer_refcount = {}
+    conn._completed_prefills_lock = threading.Lock()
+    conn._completed_prefills = {}
+    conn.done_sending = set()
+    conn._wait_for_prefill_data = lambda _transfer_id: dict(prefill_data)
+    conn._execute_block_slot_transfer = (
+        lambda request, target, src, dst, data, req_id: captured.append(
+            (request, target, src, dst, data, req_id)
+        )
+        or True
+    )
+    conn._send_write_done = lambda *_args: None
+    return conn
+
+
+def _stateful_write_request(**overrides):
+    request = {
+        "request_id": "decode-1",
+        "transfer_id": "prefill-1",
+        "consumer_host": "10.0.0.2",
+        "consumer_rpc_port": 42000,
+        "dst_block_ids": [9],
+        "notify_host": "10.0.0.2",
+        "notify_port": 42001,
+        "consumer_tp_size": 1,
+        "write_nonce": 1,
+        "has_slot_regions": True,
+        "src_slot_index": 7,
+        "src_swa_block_ids": [7],
+        "dst_slot_index": 11,
+    }
+    request.update(overrides)
+    return request
+
+
+def test_tp_transfer_uses_final_source_slot_after_checkpoint_move():
+    captured = []
+    conn = _make_transfer_connector(
+        {"block_ids": [3], "slot_index": 3, "swa_block_ids": [3]}, captured
+    )
+
+    conn._execute_transfer(_stateful_write_request())
+
+    assert len(captured) == 1
+    transferred = captured[0][4]
+    assert transferred["slot_index"] == 7
+    assert transferred["swa_block_ids"] == [7]
+
+
+@pytest.mark.parametrize("invalid_slot", [-1, None, "invalid"])
+def test_stateful_transfer_without_final_source_slot_fails_closed(
+    caplog, invalid_slot
+):
+    captured = []
+    conn = _make_transfer_connector(
+        {"block_ids": [3], "slot_index": 3, "swa_block_ids": [3]}, captured
+    )
+
+    conn._execute_transfer(_stateful_write_request(src_slot_index=invalid_slot))
+
+    assert captured == []
+    assert "missing the producer's final source slot" in caplog.text
 
 
 def test_write_done_correct_nonce_accepted():
