@@ -391,9 +391,16 @@ class LLMEngine:
                 "checkpoints_kept",
                 "checkpoints_dropped",
                 "checkpoints_evicted",
+                # Says the *paged* pool is too small, where `evicted` says the
+                # state pool is -- opposite fixes, so it cannot be folded in.
+                "checkpoints_orphaned",
                 "demands_recorded",
                 "demands_declined_no_room",
                 "chunks_cut_for_demand",
+                # Both cut counters or neither: their ratio is what separates a
+                # placement that converges from one that pays per request, and
+                # one of them missing makes the other unreadable.
+                "chunks_cut_for_end",
             )
         }
         # `reusable`, not `full`: a request's trailing block is never a reuse
@@ -415,12 +422,13 @@ class LLMEngine:
                 totals["wanted_tokens"] - totals["cached_tokens"]
             ),
             "lost_unrecoverable": rate(compressed - totals["wanted_tokens"]),
-            # Per-pool rates, each against its own denominator so they isolate
-            # one pool and multiply back to `hit`. The state cache is scored
-            # against what the paged pool actually handed it, never against
-            # `reusable` -- otherwise a KV eviction reads as a state-cache
-            # miss. See `CacheStats.paged_hit_rate` / `state_hit_rate`.
-            "paged_hit": rate(compressed),
+            # The state cache's own rate, scored against what the paged pool
+            # actually handed it rather than against `reusable` -- otherwise a
+            # KV eviction reads as a state-cache miss and points tuning at the
+            # wrong pool. `compressed_hit` above is already the paged pool's
+            # half of the same split and the two multiply back to `hit`, so a
+            # `paged_hit` alias for it was a second name for one number.
+            # See `CacheStats.paged_hit_rate` / `state_hit_rate`.
             "state_hit": rate(totals["cached_tokens"], compressed),
             "state_recoverable_loss": rate(
                 totals["wanted_tokens"] - totals["cached_tokens"], compressed
@@ -485,6 +493,7 @@ class LLMEngine:
             "demands_recorded",
             "demands_declined_no_room",
             "chunks_cut_for_demand",
+            "chunks_cut_for_end",
         )
         cache_totals = {
             key: sum(int(stats.get(key, 0)) for stats in cache_rank_stats)

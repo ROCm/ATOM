@@ -1333,18 +1333,27 @@ class Scheduler:
         # "No slots ever existed" is the permanent case, distinguished from
         # "all busy" by the pool's total capacity.
         # An empty free list means either "all slots in use" — which the
-        # schedule loop handles by waiting — or "no slots were ever created",
-        # the permanent case, and only that one is worth warning about.
+        # schedule loop handles by waiting — or "the pool can never hold one
+        # request", the permanent case, and only that one is worth warning
+        # about.
+        #
+        # Measured against what one request needs, not against zero. A pool of
+        # 3 slots where a request takes `1 + num_spec` = 4 is as permanently
+        # unschedulable as an empty one; `== 0` would let it wait forever in
+        # silence. The group-shaped predicate this replaced divided before
+        # comparing, so it caught that case for free.
         if (
             seq.has_per_req_cache
-            and not bm.state.has_free()
-            and bm.num_state_slots == 0
+            and not bm.state.has_free(bm.state_slots_per_req)
+            and bm.num_state_slots < bm.state_slots_per_req
         ):
             logger.warning(
-                "Request %s will never be scheduled: needs per-req cache "
-                "slot but no slots were allocated (max_num_seqs=0 for "
-                "this model type).",
+                "Request %s will never be scheduled: needs %d per-req cache "
+                "slot(s) but the pool holds %d (max_num_seqs=0 for this model "
+                "type, or --num-speculative-tokens too high for it).",
                 seq.id,
+                bm.state_slots_per_req,
+                bm.num_state_slots,
             )
 
     def take_rejected(self) -> list[Sequence]:

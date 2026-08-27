@@ -286,22 +286,32 @@ class GDNStateMixin:
         rather than one contiguous entry, so there is no single range to
         duplicate — and at one token the fork binds almost nothing anyway.
 
-        Midstep-readable, which is a separate claim and rests on separate
-        machinery: the chunk kernel materializes the recurrent state at every
-        64-token boundary and `write_state_checkpoints` copies those out, so a
-        checkpoint inside a prompt is a copy rather than a shortened forward.
-        The engine stops cutting prefill chunks onto the checkpoint ladder for
-        this backend — see `BlockManager.checkpoint_cut`. True here only
-        because `_checkpoint_targets` and the copy-out kernel exist; a backend
-        that declares it without them keeps zero checkpoints and says nothing.
+        NOT midstep-readable, though the machinery for it is present and its
+        numerical claim holds. The chunk kernel materializes the recurrent
+        state at every 64-token boundary, `write_state_checkpoints` copies
+        those out, and `tests/test_gdn_midstep_state_gpu.py` shows a slice of
+        `h` is bit-exact against a forward stopped there. What is missing is
+        everything between: the write path declines on six conditions that
+        `commit_midstep` cannot see, its row index spans three differently
+        scoped sequence lists, and its SSM read floors to a 64 grid that
+        `midstep_positions` does not enforce (`hash_block_size` defaults to
+        16). Each of those stores a findable image holding the wrong state,
+        which is worse than storing nothing.
 
-        Exact, not approximate: `h` is `k.new_empty` and `_state_dtypes`
-        returns `config.torch_dtype`, so slicing `h` rounds exactly where a
-        shortened forward would. This rests on the two dtypes agreeing;
-        kimi_linear's fp32 v side is the one pool that breaks it, and it
-        overrides (`_KimiMLAGDNCommon.state_transfer`).
+        None of it has ever run under a server: Kimi-K3 takes the PAGE path and
+        cannot reach this one, so every measurement in this area is of the
+        other mechanism. Declaring `False` costs a shortened prefill chunk per
+        placement — the cost every backend paid before — and is what the
+        evidence supports. Flip it back with the fixes and an end-to-end run,
+        not before.
+
+        Exact, not approximate, when it is turned back on: `h` is `k.new_empty`
+        and `_state_dtypes` returns `config.torch_dtype`, so slicing `h` rounds
+        exactly where a shortened forward would. That rests on the two dtypes
+        agreeing; kimi_linear's fp32 v side is the one pool that breaks it, and
+        it overrides (`_KimiMLAGDNCommon.state_transfer`).
         """
-        return StateTransfer.fork(1, readable_midstep=True)
+        return StateTransfer.fork(1, readable_midstep=False)
 
     def state_spec(self) -> SubPoolSpec:
         """The GDN state pool: conv_state + temporal_state over all GDN
@@ -560,6 +570,13 @@ class GDNStateMixin:
         per sequence bounds it. The caller checks that bound rather than growing
         on demand: a descriptor that did not fit would otherwise be silently
         truncated into a copy of the wrong shape.
+
+        The store half of that bound is not a property of the batch -- it is
+        held by `PagedStateCheckpointCoordinator._supersede`, which keeps one
+        pending boundary per sequence. A change that let two of a sequence's
+        boundaries drain together would raise from `build()` here, and would be
+        storing one of them from the wrong slot besides; the two constraints
+        have the same owner and move together.
         """
         if getattr(self, "_checkpoint_descriptor", None) is None:
             plan = self._checkpoint_copy_plan()

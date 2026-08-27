@@ -1088,6 +1088,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         caller checks that bound rather than growing on demand: a descriptor
         that did not fit would otherwise be silently truncated into a copy of
         the wrong shape.
+
+        The store half is held by `PagedStateCheckpointCoordinator._supersede`,
+        which keeps one pending boundary per sequence -- see the longer note on
+        `GDNStateMixin._checkpoint_descriptor_buffer`.
         """
         if self._checkpoint_descriptor is None:
             plan = self._checkpoint_copy_plan()

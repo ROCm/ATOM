@@ -1272,11 +1272,20 @@ class BlockManager:
         budget (`plan_pools`) — so the actionable reading is always a
         comparison: paged evicting while state sits mostly vacant means the
         split is wrong, both evicting means the budget is.
+
+        The fates come from `_state_checkpoint_cache`, not from `self.state`.
+        Under PAGE the two are different objects — `self.state` is built with
+        `StateTransfer.none()` and never sees a `checkpoint()` — so reading it
+        here printed four zeros for the life of the server while
+        `checkpoint_funnel` reported the real numbers from the coordinator. Two
+        outputs with the same metric names disagreeing is how a tuning session
+        concludes checkpointing never fires. Occupancy stays on `self.state`:
+        that is the slot pool either way, and the coordinator has none.
         """
         return (
             self.kv.eviction_stats()
             | self.state.occupancy()
-            | self.state.checkpoint_fates()
+            | self._state_checkpoint_cache.checkpoint_fates()
         )
 
     def checkpointers_at(

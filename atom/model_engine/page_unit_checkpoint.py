@@ -463,10 +463,40 @@ class PagedStateCheckpointCoordinator:
         `BlockManager._record_checkpoint_end`), so
         `--state-checkpoint-interval-tokens -1` drops the grid and leaves the
         anchor and the demand rung as the only two placements.
+
+        One entry per seq per drain, though, and that is not the same as one
+        per seq. A pending boundary names a hash and the slot that will be read
+        for it, and the slot is read at the drain -- so two boundaries surviving
+        into one drain would both be stored from whatever the *last* forward
+        left there, filing the earlier hash over the later state. A request
+        resuming on it would continue from a point ahead of its own prefix, and
+        nothing downstream could tell: `_validate_paged_state_op` checks layout,
+        size and unit count, all of which still match.
+
+        A drain normally follows every forward, so the two boundaries of one
+        prompt are ordinarily stored from separate slots correctly. The
+        exception is a pass that schedules nothing (`scheduler.py:1828` passes
+        `state_maintenance_ops=None` on an empty batch), which carries
+        `_pending` into the next drain. `_supersede` resolves that the only way
+        the bytes allow: the newer boundary is the one the slot actually holds,
+        so it wins and the older is dropped rather than mis-stored.
         """
         del boundary_blocks
         if self.applies(seq) and seq.state_slot >= 0:
+            self._supersede(id(seq))
             self._pending[(id(seq), h)] = (seq, h)
+
+    def _supersede(self, seq_id: int) -> None:
+        """Drop this seq's earlier pending boundaries; the slot has moved on.
+
+        Counted as dropped, not silently forgotten: this is reuse the placement
+        asked for and did not get, and it is the only signal that empty passes
+        are costing checkpoints.
+        """
+        stale = [k for k in self._pending if k[0] == seq_id]
+        for key in stale:
+            del self._pending[key]
+        self.checkpoints_dropped += len(stale)
 
     def forget_pending(self, seq: Sequence) -> None:
         """Drop every boundary this seq had pending, not just its last.
@@ -487,6 +517,9 @@ class PagedStateCheckpointCoordinator:
     ) -> tuple[tuple[CheckpointStoreOp, ...], tuple[CheckpointRestoreOp, ...]]:
         pending, self._pending = self._pending, {}
         for seq, h in pending.values():
+            # Safe to read now because `checkpoint` keeps at most one pending
+            # boundary per seq: this slot holds the state as of that boundary
+            # and no other. See `_supersede`.
             src_slot = seq.state_slot
             if src_slot < 0 or self.store.contains_or_pending(h):
                 continue
@@ -522,6 +555,16 @@ class PagedStateCheckpointCoordinator:
             self.checkpoints_orphaned += 1
 
     def clear_index(self) -> None:
+        """Drop everything, for `/reset_prefix_cache`-style admin calls.
+
+        None of the four fates moves, and that is deliberate rather than an
+        oversight: each argues for a different fix — `dropped` for a bigger
+        pool, `evicted` for a longer-lived one, `orphaned` for a bigger paged
+        pool — and an operator emptying the cache on purpose argues for none of
+        them. Charging a reset to any of them would send tuning after a number
+        the operator created. The reset is visible in the drop in
+        `checkpoints_kept`'s growth rate, and in the admin call itself.
+        """
         self._pending.clear()
         self.store.clear()
 

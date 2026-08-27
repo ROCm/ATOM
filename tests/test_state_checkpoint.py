@@ -1195,13 +1195,18 @@ class TestPagedCopyCheckpoint:
         assert not hasattr(scheduler.block_manager, "state_copies_for_batch")
         assert not hasattr(scheduler.block_manager, "state_transfers_for_batch")
 
-    def test_two_boundaries_of_one_seq_are_both_stored(self):
-        """They used to collide: `_pending` was keyed by seq, so the second
-        overwrote the first before either was stored, and the prompt-end anchor
-        was never worth its prefill chunk. Keyed by `(seq, hash)` both survive.
+    def test_only_the_boundary_the_slot_holds_is_stored(self):
+        """Two undrained boundaries of one seq store one image, not two.
 
-        Affordable because an image is `units_per_checkpoint` blocks out of the
-        paged pool rather than a whole Active Slot.
+        A store reads `seq.state_slot` at the drain, so two entries surviving
+        into one drain would both be copied out of whatever the last forward
+        left there -- the earlier hash filed over the later state. Storing both
+        is exactly the bug: two findable images, one of which returns a state
+        from further along the prompt than the hash it answers to.
+
+        Ordinarily a drain follows each forward and the two boundaries are
+        stored separately and correctly; this is the empty-pass case, where
+        `state_maintenance_ops=None` carries `_pending` forward.
         """
         bm = make_block_manager(
             paged_copy_config(),
@@ -1214,9 +1219,33 @@ class TestPagedCopyCheckpoint:
         checkpoints.checkpoint(seq, boundary_blocks=2, h=202)
         ops = bm.take_state_maintenance_ops()
 
-        assert len(ops.checkpoint_stores) == 2
-        assert not hasattr(seq, "pending_checkpoint")
+        assert len(ops.checkpoint_stores) == 1
         bm.complete_previous_state_batch()
+        assert checkpoints.store.contains(202), "the state the slot holds"
+        assert not checkpoints.store.contains(101), "would have been mis-stored"
+
+    def test_a_drain_between_forwards_stores_both(self):
+        """The ordinary case: one boundary per forward, each drained in turn.
+
+        This is what the anchor rests on -- the anchor and the prompt-end
+        checkpoint a chunk later are separate forwards, so both are stored,
+        each from the slot as it was.
+        """
+        bm = make_block_manager(
+            paged_copy_config(),
+            state_runtime=PAGED_COPY_RUNTIME,
+        )
+        seq = self._admitted(bm)
+        checkpoints = bm.paged_state_checkpoints
+
+        checkpoints.checkpoint(seq, boundary_blocks=1, h=101)
+        assert len(bm.take_state_maintenance_ops().checkpoint_stores) == 1
+        bm.complete_previous_state_batch()
+
+        checkpoints.checkpoint(seq, boundary_blocks=2, h=202)
+        assert len(bm.take_state_maintenance_ops().checkpoint_stores) == 1
+        bm.complete_previous_state_batch()
+
         assert checkpoints.store.contains(101)
         assert checkpoints.store.contains(202)
 
@@ -2440,12 +2469,20 @@ class TestLadderOffButCheckpointingOn:
         assert forked.checkpoint_end_pos > 0, "fork should anchor"
         assert copied.checkpoint_end_pos > 0, "copy should anchor too now"
 
-    def test_two_boundaries_of_one_prompt_both_stay_pending(self):
-        """The property the anchor rests on, asked of the coordinator directly.
+    def test_a_later_boundary_supersedes_an_undrained_earlier_one(self):
+        """One pending boundary per seq, because one slot holds one state.
 
-        Two different hashes from one sequence are two checkpoints. Reaching
-        the *same* hash twice is one boundary reached twice and still collapses
-        -- that is what the hash in the key is for.
+        A pending entry names a hash and is stored from `seq.state_slot` at the
+        drain. Two entries surviving into one drain would both be stored from
+        whatever the last forward left in that slot, filing the earlier hash
+        over the later state -- a resuming request would then continue from
+        ahead of its own prefix, and `_validate_paged_state_op` would pass,
+        because layout, size and unit count are all still right.
+
+        This test previously asserted the opposite and was wrong to: it pinned
+        the coexistence without pinning that each was stored from its own slot,
+        which the drain cannot do. The newer boundary wins because it is the
+        one the slot actually holds.
         """
         copy = make_block_manager(ckpt_config(), state_runtime=PAGED_COPY_RUNTIME)
         coord = copy.paged_state_checkpoints
@@ -2454,13 +2491,27 @@ class TestLadderOffButCheckpointingOn:
 
         coord.checkpoint(seq, 4, 111)
         coord.checkpoint(seq, 8, 222)
-        assert len(coord._pending) == 2, "an anchor and a prompt end coexist"
+        assert [h for _sid, h in coord._pending] == [222], "the slot holds 222"
+        assert coord.checkpoints_dropped == 1, "111 is lost reuse, and counted"
 
         coord.checkpoint(seq, 8, 222)
-        assert len(coord._pending) == 2, "the same boundary twice is still one"
+        assert len(coord._pending) == 1, "the same boundary twice is still one"
+        assert coord.checkpoints_dropped == 2, "superseding itself still counts"
 
         coord.forget_pending(seq)
-        assert not coord._pending, "a released slot takes all of them with it"
+        assert not coord._pending, "a released slot takes it with it"
+
+    def test_two_seqs_do_not_supersede_each_other(self):
+        """Superseding is per sequence -- each has its own slot."""
+        copy = make_block_manager(ckpt_config(), state_runtime=PAGED_COPY_RUNTIME)
+        coord = copy.paged_state_checkpoints
+        first, second = stateful_seq(PROMPT), stateful_seq(PROMPT)
+        first.state_slots, second.state_slots = [0], [1]
+
+        coord.checkpoint(first, 4, 111)
+        coord.checkpoint(second, 4, 222)
+        assert len(coord._pending) == 2
+        assert coord.checkpoints_dropped == 0
 
 
 class TestCacheStatsAttribution:
