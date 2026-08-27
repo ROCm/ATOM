@@ -665,7 +665,7 @@ class PagedAttentionImpl(nn.Module):
             v_cache_5d = self._view_v_cache_for_pa_decode_bf16_asm(v_cache, k_cache)
 
             output = torch.empty(q_5d.shape, dtype=torch.bfloat16, device=q.device)
-            # CUDAGraph decode pads scheduled_bs up to graph_bs. PA ASM has no
+            # CUDAGraph decode pads scheduled_bs up to running_bs. PA ASM has no
             # work for padded rows (context_len == 0); zero output so padded rows
             # stay deterministic.
             split_rows = max(

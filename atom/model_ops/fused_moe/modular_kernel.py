@@ -294,9 +294,9 @@ class FusedMoEModularKernel(torch.nn.Module):
         """Trim the mori dispatch buffer's dead tail before fused_moe.
 
         Default (native/sglang/rtp) policy: under a uniform all-ranks-decode
-        batch, trim to the static graph_bs*dp bound so the shape is
+        batch, trim to the static running_tokens*dp bound so the shape is
         consistent across cudagraph capture/replay. mori dispatch dedups per
-        destination rank, so a rank receives at most graph_bs tokens per source
+        destination rank, so a rank receives at most running_tokens per source
         rank -- the bound must not multiply by topk. atom-vllm needs a different,
         exact received-token trim for DP+EP mixed batches and overrides this
         method via a plugin patch -- keep this body frontend-agnostic.
@@ -306,8 +306,8 @@ class FusedMoEModularKernel(torch.nn.Module):
             return dispatch_a1, dispatch_scale, dispatch_ids, dispatch_weights
 
         dp_size = get_dp_group().world_size
-        # graph_bs keeps the trimmed shape consistent during capture/replay.
-        total_valid_tokens = context.graph_bs * dp_size
+        # running_tokens keeps the trimmed shape consistent capture-to-replay.
+        total_valid_tokens = context.running_tokens * dp_size
         all_ranks_decode = getattr(context, "dp_uniform_decode", not context.is_prefill)
         if total_valid_tokens < dispatch_a1.shape[0] and all_ranks_decode:
             dispatch_a1 = dispatch_a1[:total_valid_tokens]
