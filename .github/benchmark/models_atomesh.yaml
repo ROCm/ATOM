@@ -346,7 +346,7 @@ models:
             workers: 1
             tp: 1
             cudagraph: none
-            extra_args: "--pp 4 --enforce-eager --max-num-batched-tokens 8192"
+            extra_args: "--pipeline-parallel-size 4 --enforce-eager --max-num-batched-tokens 8192"
           decode:
             workers: 1
             tp: 4
