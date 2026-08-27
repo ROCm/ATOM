@@ -225,7 +225,12 @@ def build_cells(
         rec = _variant_record(model, variant)
         if bench_kind_filter is not None and rec["bench_kind"] not in bench_kind_filter:
             continue
-        if param_lists:
+        # `param_lists` is a dispatch grid of (isl, osl, conc, ratio), which only
+        # describes the random sweep. An agentic variant's isl/osl are labels and
+        # its concurrency bands are the point of the run, so letting the default
+        # grid override them would silently replace the whole workload with one
+        # 1024/1024 c=128 cell.
+        if param_lists and rec["bench_kind"] == "random":
             scenarios = _scenarios_from_param_lists(
                 param_lists, rec["conc_min"], rec["conc_max"]
             )

@@ -154,8 +154,14 @@ def test_result_filename_contract():
 
 def test_param_lists_override_and_conc_band():
     # c=512 only survives for the DP-attention variants (others capped at 256).
+    # Filtered to `random` the way every production caller is: a dispatch grid
+    # does not apply to the agentic variants, so unfiltered they would come
+    # through here carrying their own concurrency bands.
     cells = catalog.build_cells(
-        CATALOG, param_lists="1024,1024,512,0.7", model_filter={"deepseek-v4-pro"}
+        CATALOG,
+        param_lists="1024,1024,512,0.7",
+        model_filter={"deepseek-v4-pro"},
+        bench_kind_filter={"random"},
     )
     assert sorted(c["suffix"] for c in cells) == [
         "-dpa",
@@ -293,3 +299,28 @@ def test_agentic_variants_carry_what_the_recipe_requires():
     assert dpa and plain, "expected both a TP band and a DPA band"
     # Small concurrency on TP, large on DPA -- the bands must not overlap.
     assert max(c["conc"] for c in plain) < min(c["conc"] for c in dpa)
+
+
+def test_param_lists_does_not_overwrite_an_agentic_workload():
+    """A dispatch grid describes the random sweep only.
+
+    `param_lists` is (isl, osl, conc, ratio) and workflow_dispatch always sends
+    one, defaulted. Applying it to an agentic variant would replace the whole
+    trace-replay workload -- its concurrency bands, which are the point of the
+    run -- with a single 1024/1024 c=128 cell, and silently: the run would look
+    like it worked.
+    """
+    grid = "1024,1024,128,0.8"
+    agentic = catalog.build_cells(
+        CATALOG, param_lists=grid, bench_kind_filter={"aiperf_agentic"}
+    )
+    assert agentic
+    assert {c["isl"] for c in agentic} != {1024}
+    assert {c["conc"] for c in agentic} != {128}
+    # Identical to what it resolves to with no grid at all.
+    assert agentic == catalog.build_cells(CATALOG, bench_kind_filter={"aiperf_agentic"})
+
+    # The random variants still take the grid.
+    rnd = catalog.build_cells(CATALOG, param_lists=grid, bench_kind_filter={"random"})
+    assert {c["isl"] for c in rnd} == {1024}
+    assert {c["conc"] for c in rnd} == {128}

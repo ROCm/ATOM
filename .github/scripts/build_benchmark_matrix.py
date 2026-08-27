@@ -35,6 +35,8 @@ DEFAULT_PARAM_LISTS = "1024,1024,128,0.8"
 
 # workflow_dispatch inputs that are NOT model toggles.
 RESERVED_INPUTS = {
+    "agentic",
+    "agentic_duration",
     "extra_args",
     "image",
     "runner",
@@ -82,12 +84,18 @@ def main() -> int:
         model_filter = {k for k in model_keys if inputs.get(k)}
         param_lists = inputs.get("param_lists") or DEFAULT_PARAM_LISTS
 
-    # Default `random`: the nightly must not pick up the agentic variants,
-    # whose cells replay for an hour each. atom-agentic-benchmark.yaml sets
-    # this to `aiperf_agentic` to select exactly the other side.
-    bench_kinds = {
-        k for k in os.environ.get("BENCH_KIND_FILTER", "random").split(",") if k
-    }
+    # The nightly must never pick up the agentic variants -- nine cells at an
+    # hour each. `BENCH_KIND_FILTER` is the explicit override
+    # (atom-agentic-benchmark.yaml pins it to `aiperf_agentic`); otherwise a
+    # dispatch opts in per run via the `agentic` checkbox and a schedule never
+    # does.
+    env_filter = os.environ.get("BENCH_KIND_FILTER", "")
+    if env_filter:
+        bench_kinds = {k for k in env_filter.split(",") if k}
+    else:
+        bench_kinds = {"random"}
+        if event != "schedule" and inputs.get("agentic"):
+            bench_kinds.add("aiperf_agentic")
     configs = build_cell_configs(
         CATALOG,
         param_lists=param_lists,

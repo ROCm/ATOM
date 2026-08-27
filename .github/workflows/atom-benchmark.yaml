@@ -58,6 +58,14 @@ on:
         description: "Benchmark Llama-3.3-70B-Instruct-MXFP4"
         type: boolean
         default: true
+      agentic:
+        description: "ALSO run the agentic AgentX trace replay (DeepSeek-V4-Pro, 9 cells x ~1h GPU). Off by default; the nightly never runs it."
+        type: boolean
+        default: false
+      agentic_duration:
+        description: "Agentic replay seconds per cell. 3600 = official; under 900 forces --unsafe-override and stamps submission_valid=false."
+        type: string
+        default: "3600"
       extra_args:
         description: "Extra arguments to pass to the ATOM server"
         type: string
@@ -144,6 +152,8 @@ jobs:
       model_path: ${{ matrix.config.model_path }}
       server_args: ${{ matrix.config.server_args }}
       bench_args: ${{ matrix.config.bench_args }}
+      bench_kind: ${{ matrix.config.bench_kind }}
+      benchmark_duration: ${{ inputs.agentic_duration || '' }}
       env_vars: ${{ matrix.config.env_vars }}
       runner: ${{ (github.event_name == 'workflow_dispatch' && inputs.runner != '' && inputs.runner) || matrix.config.runner }}
       isl: ${{ matrix.config.isl }}
