@@ -494,6 +494,32 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_TBO_PREFILL_MIN_TOKENS": lambda: int(
         os.getenv("ATOM_TBO_PREFILL_MIN_TOKENS", "8192")
     ),
+    # Allow TBO to split a mixed prefill+decode batch. The cut is required to
+    # land inside the prefill region, giving ubatch 0 = pure prefill and
+    # ubatch 1 = [prefill tail | every decode row]; V4 rebuilds both from the
+    # parent's prefill SEGMENT metadata.
+    #
+    # Measured on V4-Pro dp8+DPA+TBO (no EP, no prefix caching), n=2 per arm,
+    # output throughput: +4.5% at ISL 2048/conc 512, +12.0% at ISL 8192/conc
+    # 512, +18.1% at ISL 8192/conc 2048; mean TTFT -14% to -19% throughout.
+    # The gain tracks how much prefill there is to hide the TP all-reduce
+    # behind, so it shrinks as a rank's prefill approaches
+    # ATOM_TBO_PREFILL_MIN_TOKENS and the split starts getting refused.
+    #
+    # The conc-2048 figure was re-measured after rebasing onto main (it read
+    # +14.5% before) with an aiter bump in the same step, so the 3.6pp is not
+    # attributable to either alone. Both arms of every A/B ran the same code
+    # and the same aiter, which is what makes each delta valid.
+    #
+    # Still off by default: with it off a mixed batch vetoes TBO through
+    # `can_split`, and that is the behaviour every existing baseline was
+    # measured under.
+    "ATOM_TBO_MIXED": lambda: os.getenv("ATOM_TBO_MIXED", "0") == "1",
+    # Log how many mixed batches TBO split vs refused, and why. Diagnostic
+    # only: an accuracy run can pass while the mixed split never fires (the
+    # batches were all prefill-only, or all refused), in which case it has
+    # validated nothing about this path. Costs one dict update per step.
+    "ATOM_PROBE_TBO_MIXED": lambda: os.getenv("ATOM_PROBE_TBO_MIXED", "0") == "1",
     # --- PCP MoE comm mode ---
     # Fold the PCP (prefill-context-parallel) dim into the MoE tp/ep sharding.
     # Only meaningful when prefill_context_parallel_size > 1;

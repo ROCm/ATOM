@@ -97,6 +97,111 @@ def _precompute_prefill_req_split(
     return meets_min_tokens, True, ub0, ub1
 
 
+_MIXED_SPLIT_TALLY: dict[str, int] = {}
+
+
+def _probe_mixed_split(outcome: str) -> None:
+    """Tally mixed-split outcomes under ATOM_PROBE_TBO_MIXED=1.
+
+    Exists because a green accuracy run is not by itself evidence that the
+    mixed+TBO path ran: if every batch was prefill-only, or every split was
+    refused, the run exercised the ordinary prefill path and says nothing about
+    this one. The tally is what turns "it passed" into "it passed *and* it ran
+    N times".
+
+    The `gate:*` keys are this rank's vote; `build:*` is the one that settles
+    it. `can_split` is AND-reduced across DP, so a rank can vote to split every
+    step and still never split -- only a `build:` count proves the new V4
+    metadata builders actually ran.
+
+    Logged on each outcome's FIRST occurrence, then every 200 events. Each line
+    carries the whole tally, so the last one printed gives the counts.
+
+    The first-occurrence rule is what makes the probe answer its own question:
+    an earlier version logged only at 1 and at multiples of 200, and a gsm8k run
+    that never reached 200 mixed batches printed one line -- `{'gate:split': 1}`
+    -- and nothing after, so whether `build:mixed_ubatch` ever fired was exactly
+    as unknown as before the probe existed.
+
+    There is deliberately no atexit summary: an earlier version registered one
+    and it never fired in 12 runs, because teardown SIGKILLs the spawn workers.
+    """
+    from atom.utils import envs
+
+    if not envs.ATOM_PROBE_TBO_MIXED:
+        return
+    first_of_kind = outcome not in _MIXED_SPLIT_TALLY
+    _MIXED_SPLIT_TALLY[outcome] = _MIXED_SPLIT_TALLY.get(outcome, 0) + 1
+    total = sum(_MIXED_SPLIT_TALLY.values())
+    if first_of_kind or total % 200 == 0:
+        import logging
+
+        # logging.getLogger("atom"), not aiter's logger: AITER_LOG_LEVEL=WARNING
+        # silently swallows anything logged through the latter.
+        logging.getLogger("atom").warning(
+            "[probe] tbo mixed-split after %d mixed batches: %s",
+            total,
+            dict(sorted(_MIXED_SPLIT_TALLY.items())),
+        )
+
+
+def _precompute_mixed_token_split(
+    num_scheduled_tokens: np.ndarray,
+    num_reqs: int,
+    num_pref_tokens: int,
+    min_pref: int,
+) -> tuple[bool, bool, int, int]:
+    """Mixed ``[prefill | decode]``, token-midpoint split over the WHOLE batch.
+
+    Differs from `_precompute_prefill_token_split` in what it counts: that one
+    sums only ``num_scheduled_tokens[:num_pref_reqs]``, which for a mixed batch
+    silently drops every decode row and produces ub0/ub1 that do not add up to
+    the tokens actually forwarded.
+
+    ``meets_min_tokens`` still keys off the PREFILL tokens alone: the bar exists
+    to skip TBO when there is not enough prefill compute to hide communication
+    behind, and a few hundred decode rows do not change that.
+
+    MUST mirror `split_mixed_token_midpoint` in ubatch_splitting.py -- the
+    cross-DP MAX-reduce of ub0/ub1 sizes the per-ubatch buffers, so the two
+    disagreeing is an all_gather size mismatch, i.e. a hang.
+    """
+    total_tokens = int(
+        np.asarray(num_scheduled_tokens[:num_reqs], dtype=np.int64).sum()
+    )
+    # can_split: need >= 2 tokens to cut into two non-empty halves.
+    if total_tokens < 2:
+        _probe_mixed_split("gate:refused:tiny")
+        return False, False, 0, 0
+    ub0 = total_tokens // 2
+
+    # One contiguous cut of a `[prefill | decode]` layout can never leave BOTH
+    # halves mixed: whichever side the cut falls on, the other side is pure.
+    # Require it to land strictly inside the prefill region, which gives
+    #     ubatch 0 = pure prefill      (the ordinary prefill path, unchanged)
+    #     ubatch 1 = [prefill tail | every decode row]   (mixed)
+    # so both ubatches keep is_prefill=True and only ubatch 1 needs mixed
+    # metadata.
+    #
+    # The other landing -- cut at or past the prefill tokens -- would make
+    # ubatch 1 pure DECODE while its parent context says is_prefill=True, and
+    # TBO builds per-ubatch contexts off the parent's mode
+    # (`_make_ubatch_context` branches on `ctx.context.is_prefill`, one branch
+    # for all ubatches). Supporting that needs per-ubatch mode switching, which
+    # is a separate piece of work; refuse the split instead.
+    #
+    # Real mixed batches are overwhelmingly prefill (measured: 15831 prefill vs
+    # 379 decode tokens), so the midpoint lands inside the prefill region and
+    # this rejects almost nothing.
+    if ub0 >= num_pref_tokens:
+        _probe_mixed_split("gate:refused:decode_heavy")
+        return False, False, 0, 0
+
+    meets_min_tokens = not (min_pref > 0 and num_pref_tokens < min_pref)
+    _probe_mixed_split("gate:split" if meets_min_tokens else "gate:refused:below_min")
+    return meets_min_tokens, True, ub0, total_tokens - ub0
+
+
 def _precompute_decode(batch) -> tuple[bool, bool, int, int]:
     """Decode, split by request count (uniform tokens per request).
 
@@ -149,6 +254,27 @@ def local_tbo_precompute(
     """
     if not config.enable_tbo:
         return False, False, 0, 0
+
+    if getattr(batch, "is_mixed", False):
+        from atom.utils import envs
+
+        # Off by default. The path is complete, accuracy-verified and measured
+        # +4.5% to +14.5% output throughput, but every existing baseline was
+        # taken with a mixed batch vetoing TBO here, so flipping the default
+        # silently moves them. See ATOM_TBO_MIXED.
+        if not envs.ATOM_TBO_MIXED:
+            # Report the refusal HERE, not in `_maybe_create_tbo_slices`.
+            # `can_split` is AND-reduced across DP precisely so that one rank's
+            # inability to split turns TBO off for everyone; a rank that stays
+            # silent here and bails out later runs 1 ubatch while its peers run
+            # 2, and the per-ubatch collectives deadlock.
+            return False, False, 0, 0
+        return _precompute_mixed_token_split(
+            num_scheduled_tokens,
+            batch.total_seqs_num,
+            batch.total_tokens_num_prefill,
+            envs.ATOM_TBO_PREFILL_MIN_TOKENS,
+        )
 
     if is_prefill:
         from atom.utils import envs

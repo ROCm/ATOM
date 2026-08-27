@@ -523,6 +523,11 @@ def test_v4_core_inputs_come_from_the_signature():
         "idx_q_quant",
         "idx_weights",
         "idx_q_scale",
+        # `out` is the mixed prefill+decode path's output slot: each segment
+        # runs the core with `out=` its slice of the combined tensor so one
+        # o_proj covers both. None on every other path, like the idx_* inputs
+        # above it.
+        "out",
     )
 
 

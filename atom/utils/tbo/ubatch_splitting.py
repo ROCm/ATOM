@@ -3,7 +3,6 @@
 
 import logging
 from dataclasses import dataclass
-from typing import Optional
 
 import numpy as np
 import torch
@@ -52,21 +51,37 @@ class UBatchSlice:
     request_slice: slice  # which requests belong to this micro-batch
     token_slice: slice  # which tokens belong to this micro-batch (for prefill)
 
+    # Where this ubatch's own prefill/decode boundary falls, in ubatch-LOCAL
+    # coordinates. `None` on both when the parent batch is not mixed.
+    #
+    # A mixed batch is laid out `[prefill rows | decode rows]`, and a token
+    # split lands wherever it lands, so the two ubatches carry different
+    # amounts of each: cut inside the prefill region and ubatch 1 gets
+    # `[prefill tail | every decode row]`; cut inside the decode region and
+    # ubatch 0 gets `[every prefill row | decode head]`. Neither ubatch can
+    # infer its own boundary from the parent's, so it is recorded per slice.
+    num_prefill_tokens: int | None = None
+    num_prefill_seqs: int | None = None
+
 
 def maybe_create_ubatch_slices(
     num_reqs: int,
     num_tokens: int,
     num_ubatches: int = 2,
     is_prefill: bool = False,
-    num_scheduled_tokens: Optional[np.ndarray] = None,
-    max_tokens_per_ubatch: Optional[int] = None,
+    num_scheduled_tokens: np.ndarray | None = None,
+    max_tokens_per_ubatch: int | None = None,
     force: bool = False,
-) -> Optional[list[UBatchSlice]]:
+    num_prefill_seqs: int | None = None,
+    num_prefill_tokens: int | None = None,
+) -> list[UBatchSlice] | None:
     """Split a batch into N micro-batch slices.
 
     For decode: split by request count (uniform tokens per request).
     For prefill: token-balanced split so each ubatch has roughly equal
                  token count, respecting request boundaries.
+    For mixed (`num_prefill_*` given): token midpoint over the whole batch,
+                 with each slice recording its own prefill boundary.
 
     Returns None if the batch is too small to split or if the split
     would produce a ubatch exceeding max_tokens_per_ubatch.
@@ -78,6 +93,21 @@ def maybe_create_ubatch_slices(
     """
     if num_ubatches <= 1:
         return None
+
+    # Mixed batches have their own splitter: the cut spans both segments and
+    # each slice has to record where its own prefill ends. Dispatch before the
+    # prefill/decode paths below, which would only see the prefill rows.
+    if num_prefill_tokens is not None:
+        assert (
+            num_scheduled_tokens is not None
+        ), "mixed split needs per-row token counts for the whole batch"
+        return split_mixed_token_midpoint(
+            num_reqs,
+            num_prefill_seqs,
+            num_prefill_tokens,
+            num_scheduled_tokens,
+            num_ubatches,
+        )
 
     # Token-midpoint prefill split can cut *inside* a request, so it works
     # even with a single request (bs=1) — only require that there are at
@@ -136,8 +166,8 @@ def _split_prefill_balanced(
     num_reqs: int,
     num_scheduled_tokens: list[int],
     num_ubatches: int,
-    max_tokens_per_ubatch: Optional[int],
-) -> Optional[list[UBatchSlice]]:
+    max_tokens_per_ubatch: int | None,
+) -> list[UBatchSlice] | None:
     """Split prefill requests into ubatches balanced by token count.
 
     Finds the request boundary closest to total_tokens / num_ubatches,
@@ -193,8 +223,8 @@ def _split_prefill_token_midpoint(
     num_reqs: int,
     num_scheduled_tokens: list[int],
     num_ubatches: int,
-    max_tokens_per_ubatch: Optional[int],
-) -> Optional[list[UBatchSlice]]:
+    max_tokens_per_ubatch: int | None,
+) -> list[UBatchSlice] | None:
     """split prefill at the exact token midpoint."""
     toks = np.asarray(num_scheduled_tokens[:num_reqs], dtype=np.int64)
     total_tokens = int(toks.sum())
@@ -234,6 +264,79 @@ def _split_prefill_token_midpoint(
                     max_tokens_per_ubatch,
                 )
                 return None
+
+    return slices
+
+
+def split_mixed_token_midpoint(
+    num_reqs: int,
+    num_prefill_seqs: int,
+    num_prefill_tokens: int,
+    num_scheduled_tokens,
+    num_ubatches: int = 2,
+) -> list[UBatchSlice] | None:
+    """Split a mixed ``[prefill | decode]`` batch at the token midpoint.
+
+    Same cut as :func:`_split_prefill_token_midpoint` -- exact token fractions
+    over the WHOLE batch, so a request may be cut through -- with one addition:
+    each slice also records how much of itself is prefill, because that differs
+    per ubatch and nothing downstream can rederive it.
+
+    The prefill rows are `[0, num_prefill_seqs)` / `[0, num_prefill_tokens)`
+    and the decode rows follow, so a slice's prefill part is just its
+    intersection with those ranges.
+
+    MUST stay in step with `_precompute_mixed_token_split` in ubatching.py: the
+    ub0/ub1 token counts it reports are MAX-reduced across DP to size the
+    per-ubatch buffers, and a disagreement there is an all_gather size mismatch,
+    i.e. a hang. Both derive the cut from ``(total * i) // num_ubatches``.
+
+    Returns None if the batch cannot be cut into `num_ubatches` non-empty
+    pieces, letting the caller fall back to running unsplit.
+    """
+    toks = np.asarray(num_scheduled_tokens[:num_reqs], dtype=np.int64)
+    total_tokens = int(toks.sum())
+    if total_tokens < num_ubatches:
+        return None
+
+    # Mirror `_precompute_mixed_token_split`'s structural gate: every cut but
+    # the last must land strictly inside the prefill region, so that only the
+    # final ubatch straddles the prefill/decode boundary and every earlier one
+    # is pure prefill. A cut at or past `num_prefill_tokens` would leave a pure
+    # DECODE ubatch under a parent context that says is_prefill=True, which TBO
+    # cannot express today.
+    if (total_tokens * (num_ubatches - 1)) // num_ubatches >= num_prefill_tokens:
+        return None
+
+    # cu[i] = index of request i's first token.
+    cu = np.zeros(num_reqs + 1, dtype=np.int64)
+    np.cumsum(toks, out=cu[1:])
+
+    split_points = [(total_tokens * i) // num_ubatches for i in range(1, num_ubatches)]
+
+    slices: list[UBatchSlice] = []
+    tok_start = 0
+    for tok_end in split_points + [total_tokens]:
+        if tok_end <= tok_start:
+            # Degenerate cut (more ubatches than tokens); caller falls back.
+            return None
+        req_start = int(np.searchsorted(cu, tok_start, side="right") - 1)
+        req_stop = int(np.searchsorted(cu, tok_end - 1, side="right"))
+
+        # Intersect with the prefill region. `max(0, ...)` covers the ubatch
+        # that starts past the boundary and is therefore pure decode.
+        ub_pref_tokens = max(0, min(tok_end, num_prefill_tokens) - tok_start)
+        ub_pref_seqs = max(0, min(req_stop, num_prefill_seqs) - req_start)
+
+        slices.append(
+            UBatchSlice(
+                request_slice=slice(req_start, req_stop),
+                token_slice=slice(tok_start, tok_end),
+                num_prefill_tokens=ub_pref_tokens,
+                num_prefill_seqs=ub_pref_seqs,
+            )
+        )
+        tok_start = tok_end
 
     return slices
 
