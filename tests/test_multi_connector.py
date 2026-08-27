@@ -527,3 +527,44 @@ def test_real_constructor_populates_the_pairing_state(monkeypatch, pp_rank, hold
     w.start_load_kv(MultiConnectorMetadata([ConnectorMetadata(), _save_meta(9)]))
     out = w.get_finished()
     assert out.finished_sending == (set() if holds_send else {9})
+
+
+def test_a_state_only_step_under_multi_is_not_dropped():
+    """A step whose only work is a state load must reach the worker.
+
+    `state_loads` carries no `LMCacheReqMeta`, so a wrapper that answers from
+    its own (always empty) fields reports no work, the engine drops the
+    snapshot, and the request parked on that load is woken by nothing.
+    """
+    from atom.kv_transfer.disaggregation.types import connector_metadata_has_work
+    from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata
+
+    sub = LMCacheOffloadMetadata()
+    sub.state_loads = [("req-1", 12345, 7)]
+
+    assert connector_metadata_has_work(sub)
+    assert connector_metadata_has_work(MultiConnectorMetadata([sub]))
+
+
+def test_a_multi_wrapper_over_idle_subs_still_reports_no_work():
+    from types import SimpleNamespace
+
+    from atom.kv_transfer.disaggregation.types import connector_metadata_has_work
+    from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata
+
+    assert not connector_metadata_has_work(
+        MultiConnectorMetadata([LMCacheOffloadMetadata(), SimpleNamespace()])
+    )
+
+
+def test_every_metadata_field_a_subclass_adds_is_declared_work_or_not():
+    """`WORK_FIELDS` must name real attributes, or a typo silences a field.
+
+    A misspelled entry is invisible: `getattr` returns None, the field never
+    counts, and the only symptom is a parked request much later.
+    """
+    from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata
+
+    meta = LMCacheOffloadMetadata()
+    for name in LMCacheOffloadMetadata.WORK_FIELDS:
+        assert hasattr(meta, name), f"WORK_FIELDS names a missing attribute: {name}"

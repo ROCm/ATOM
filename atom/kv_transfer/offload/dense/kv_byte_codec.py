@@ -64,6 +64,15 @@ class DenseKVByteCodec:
         preserving the original non-MLA behaviour."""
         self._segments: list[torch.Tensor] = []
         for kvt in kv_caches.values():
+            # A hybrid registers its per-request recurrent state in the same
+            # dict, because the linear-attention forward reads it from
+            # `kv_cache_data`. It is indexed by request slot, not by block, so
+            # including it either fails the divisibility check below or -- if
+            # the slot count happens to divide `num_blocks` -- inflates
+            # `bytes_per_block` past what `block_regions` describes. The tier
+            # reaches those bytes through `state_entry_views`.
+            if getattr(kvt, "per_request_state", False):
+                continue
             for t in (
                 getattr(kvt, "k_cache", None),
                 getattr(kvt, "v_cache", None),

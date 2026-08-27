@@ -4624,3 +4624,20 @@ def test_multi_metadata_exposes_sub_meta_unpins():
     assert not connector_metadata_has_work(
         MultiConnectorMetadata(metas=[LMCacheOffloadMetadata()])
     )
+
+
+def test_a_layout_whose_claim_and_transfer_share_a_boundary_claims_the_end():
+    """The base seam: claim as far as the transfer reached, never below HBM.
+
+    Correct for every layout that aims its claim and its transfer at the same
+    place, which is dense and dsv4. A layout that aims them apart overrides it;
+    the seam exists because getting it wrong is silent -- the request simply
+    starts further along than its state supports.
+    """
+    from atom.kv_transfer.offload.dense.connector import DenseOffloadScheduler
+
+    sched = object.__new__(DenseOffloadScheduler)
+    seq = SimpleNamespace(id=1)
+    assert sched._claim_after_load(seq, 4096, 8192) == 8192
+    # Never below the HBM floor, whatever the transfer reported.
+    assert sched._claim_after_load(seq, 4096, 0) == 4096

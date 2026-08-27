@@ -1408,6 +1408,10 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
                 replay_buf_g=(
                     runner.replayssm_buf_g[gdn_idx] if self.replayssm else None
                 ),
+                # Slot-addressed recurrent state, not paged KV. It has to be
+                # registered (the linear-attention forward reads its state out
+                # of `kv_cache_data`), but no block-addressed mover may touch it.
+                per_request_state=True,
             )
         return super().build_kv_cache_tensor(layer_id, module)
 

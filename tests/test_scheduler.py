@@ -1367,3 +1367,93 @@ class TestComputeDetailedAggregates:
         assert batch.detailed_sqsq == 9  # 3^2
         assert batch.detailed_sqsk == 300  # 3 * 100
         assert batch.detailed_sk == 100
+
+
+class TestStalledOffloadSaveReclaim:
+    """`_reconcile_stalled_deferred_saves`: the way out for a save nobody answers.
+
+    LMCache's pin monitor force-unpins a stalled transfer without emitting a
+    completion, so `should_defer_free` stays True forever, `has_pending_kv_work()`
+    never clears, and the engine busy-loops with every GPU idle. Reproduced on
+    the k3-dev line as a hard hang under a tight pool.
+    """
+
+    @staticmethod
+    def _sched(monkeypatch, deferred):
+        import atom.model_engine.scheduler as sched_mod
+
+        # The window is memoised as a process constant; tests choose their own.
+        monkeypatch.setattr(sched_mod, "_SAVE_ABANDON_TIMEOUT_S", 100.0)
+        s = object.__new__(sched_mod.Scheduler)
+        s.deferred_free_blocks = {seq.id: seq for seq in deferred}
+        s._abandoned_saves = 0
+        s._next_save_reconcile_at = 0.0
+        freed: list[int] = []
+        s.block_manager = SimpleNamespace(deallocate=lambda q: freed.append(q.id))
+        return s, freed
+
+    def test_a_save_past_the_window_gets_its_blocks_back(self, monkeypatch):
+        import time as _time
+
+        now = _time.monotonic()
+        stale = SimpleNamespace(id=1, _deferred_save_at=now - 500.0)
+        fresh = SimpleNamespace(id=2, _deferred_save_at=now)
+        s, freed = self._sched(monkeypatch, [stale, fresh])
+
+        assert s._reconcile_stalled_deferred_saves() == 1
+        assert freed == [1], "only the stalled save is reclaimed"
+        assert 2 in s.deferred_free_blocks, "a save still inside its window is kept"
+        assert s._abandoned_saves == 1
+
+    def test_it_self_throttles_so_a_1ms_poll_is_cheap(self, monkeypatch):
+        import time as _time
+
+        stale = SimpleNamespace(id=1, _deferred_save_at=_time.monotonic() - 500.0)
+        s, freed = self._sched(monkeypatch, [stale])
+
+        assert s._reconcile_stalled_deferred_saves() == 1
+        # Second call inside the throttle interval must not rescan.
+        s.deferred_free_blocks = {
+            9: SimpleNamespace(id=9, _deferred_save_at=_time.monotonic() - 500.0)
+        }
+        assert s._reconcile_stalled_deferred_saves() == 0
+        assert freed == [1]
+
+    def test_a_non_positive_window_restores_wait_forever(self, monkeypatch):
+        import atom.model_engine.scheduler as sched_mod
+        import time as _time
+
+        monkeypatch.setattr(sched_mod, "_SAVE_ABANDON_TIMEOUT_S", 0.0)
+        s = object.__new__(sched_mod.Scheduler)
+        s.deferred_free_blocks = {
+            1: SimpleNamespace(id=1, _deferred_save_at=_time.monotonic() - 1e6)
+        }
+        s._abandoned_saves = 0
+        s._next_save_reconcile_at = 0.0
+        s.block_manager = SimpleNamespace(deallocate=lambda q: pytest.fail("reclaimed"))
+
+        assert s._reconcile_stalled_deferred_saves() == 0
+
+    def test_the_window_sits_above_lmcaches_own_pin_timeout(self, monkeypatch):
+        """Deriving it from LMCache's knob IS the safety argument.
+
+        Two independent env vars would let ours be set below the timeout it has
+        to exceed, and nothing would say so.
+        """
+        import atom.model_engine.scheduler as sched_mod
+
+        monkeypatch.setattr(sched_mod, "_SAVE_ABANDON_TIMEOUT_S", None)
+        monkeypatch.setenv("LMCACHE_EC_PIN_TIMEOUT_SEC", "900")
+        assert sched_mod._offload_save_abandon_timeout_s() == 930.0
+
+        monkeypatch.setattr(sched_mod, "_SAVE_ABANDON_TIMEOUT_S", None)
+        monkeypatch.delenv("LMCACHE_EC_PIN_TIMEOUT_SEC", raising=False)
+        assert sched_mod._offload_save_abandon_timeout_s() == 330.0
+
+    def test_a_late_report_on_a_reclaimed_save_is_not_an_assertion(self):
+        """`finished_sending` used to assert the sequence was still deferred."""
+        import atom.model_engine.scheduler as sched_mod
+        import inspect
+
+        src = inspect.getsource(sched_mod.Scheduler._update_from_kv_xfer_finished)
+        assert "not found in deferred_free_blocks" not in src

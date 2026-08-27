@@ -18,6 +18,7 @@ This module provides:
 from __future__ import annotations
 
 import logging
+import os
 import struct
 import threading
 import time
@@ -44,6 +45,73 @@ from atom.model_engine.state_runtime import (
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
+
+
+# How often the stalled-save reconciler actually scans deferred_free_blocks. The
+# engine polls KV progress every millisecond (KV_IDLE_DRAIN_INTERVAL_S), so the
+# reconciler no-ops until this interval has passed.
+_SAVE_RECONCILE_INTERVAL_S = 5.0
+
+# Seconds added on top of LMCache's own pin timeout before the engine reclaims a
+# save that never reported. See `_offload_save_abandon_timeout_s` for why the sum
+# and not the timeout itself is the safe window.
+_SAVE_ABANDON_MARGIN_S = 30.0
+
+# What LMCache's pin monitor uses when `LMCACHE_EC_PIN_TIMEOUT_SEC` is unset.
+_LMCACHE_PIN_TIMEOUT_DEFAULT_S = 300.0
+
+# Memoised result of `_offload_save_abandon_timeout_s`; the reconciler asks for
+# it on a 1ms poll and the answer is a process constant.
+_SAVE_ABANDON_TIMEOUT_S: float | None = None
+
+
+def _offload_save_abandon_timeout_s() -> float:
+    """Seconds a finished request's blocks may sit deferred on an offload save
+    before the engine reclaims them itself.
+
+    A deferred save's blocks are freed only when the connector reports
+    `finished_saving`, so a lost report leaves them deferred forever:
+    `has_pending_kv_work()` never clears and the engine busy-loops with every
+    GPU idle -- a hard hang under a tight pool, a slow block leak under a large
+    one.
+
+    **Why reclaiming cannot race a live copy.** `OffloadWorkerMixin._guard`
+    reports `finished_saving` on both the success and the exception path, so a
+    report is lost only when `self._engine.store(...)` neither returns nor
+    raises -- it is parked inside LMCache. Two things follow, and together they
+    are exhaustive:
+
+      * the save that is parked is not copying. LMCache's pin monitor
+        force-unpins its source after `pin_timeout_sec` and stops reading the
+        blocks; reclaiming after that window therefore frees blocks nobody
+        holds.
+      * a save queued behind a parked one never reaches `store()` at all, so
+        its blocks were never read to begin with.
+
+    Derived from LMCache's own `LMCACHE_EC_PIN_TIMEOUT_SEC` rather than an ATOM
+    knob of its own, because the ordering above is the whole safety argument: a
+    second env var could be set below the timeout it must exceed, and nothing
+    would say so. Raising LMCache's pin timeout now carries this window with it.
+    A non-positive value disables reclamation and restores the wait-forever
+    behaviour.
+    """
+    global _SAVE_ABANDON_TIMEOUT_S
+    if _SAVE_ABANDON_TIMEOUT_S is not None:
+        return _SAVE_ABANDON_TIMEOUT_S
+    pin = _LMCACHE_PIN_TIMEOUT_DEFAULT_S
+    raw = os.environ.get("LMCACHE_EC_PIN_TIMEOUT_SEC")
+    if raw is not None:
+        try:
+            pin = float(raw)
+        except ValueError:
+            logger.warning(
+                "invalid LMCACHE_EC_PIN_TIMEOUT_SEC=%r; assuming LMCache's %.0fs "
+                "default for the offload save abandon window",
+                raw,
+                _LMCACHE_PIN_TIMEOUT_DEFAULT_S,
+            )
+    _SAVE_ABANDON_TIMEOUT_S = pin + _SAVE_ABANDON_MARGIN_S if pin > 0 else 0.0
+    return _SAVE_ABANDON_TIMEOUT_S
 
 
 class SpecStats:
@@ -938,6 +1006,10 @@ class Scheduler:
         self.finished_recving_kv_req_ids: list[int] = []
         self.failed_recving_kv_req_ids: list[int] = []
         self.deferred_free_blocks: dict[int, Sequence] = {}
+        # Reclamation bookkeeping for offload saves whose completion is never
+        # reported (see `_reconcile_stalled_deferred_saves`).
+        self._abandoned_saves: int = 0
+        self._next_save_reconcile_at: float = 0.0
 
         # Scheduling delay for batching efficiency
         self.prev_time = 0.0
@@ -1264,6 +1336,51 @@ class Scheduler:
             callback(seq)
         self.deferred_free_blocks.pop(seq.id, None)
         self.block_manager.deallocate(seq)
+
+    def _reconcile_stalled_deferred_saves(self) -> int:
+        """Reclaim blocks whose offload save has stalled past the abandon timeout.
+
+        `_maybe_release_deferred` cannot do this: the connector still reports the
+        save as pending (`should_defer_free` stays True), which is exactly why
+        the blocks were never released. Once the save has been deferred longer
+        than `_offload_save_abandon_timeout_s()` -- set above LMCache's pin
+        timeout, so upstream has force-unpinned and released the source bytes --
+        the blocks are safe to return to the pool. Without this, a single
+        never-reported save keeps `has_pending_kv_work()` True forever and the
+        engine busy-loops with every GPU idle.
+
+        Mirrors the producer `finished_sending` reclaim (pop + deallocate),
+        deliberately not re-invoking `request_finished`: it was already called
+        when the request finished, before the block free was deferred.
+        """
+        timeout = _offload_save_abandon_timeout_s()
+        if timeout <= 0 or not self.deferred_free_blocks:
+            return 0
+        now = time.monotonic()
+        if now < self._next_save_reconcile_at:
+            return 0
+        self._next_save_reconcile_at = now + _SAVE_RECONCILE_INTERVAL_S
+        stalled = [
+            seq
+            for seq in list(self.deferred_free_blocks.values())
+            if getattr(seq, "_deferred_save_at", None) is not None
+            and now - seq._deferred_save_at >= timeout
+        ]
+        for seq in stalled:
+            self.deferred_free_blocks.pop(seq.id, None)
+            self.block_manager.deallocate(seq)
+            self._abandoned_saves += 1
+        if stalled:
+            logger.warning(
+                "Reclaimed %d offload save(s) still deferred after %.0fs with no "
+                "completion report (LMCache force-unpins a stalled save without "
+                "reporting it); freed their blocks so the engine does not stall. "
+                "total abandoned_saves=%d",
+                len(stalled),
+                timeout,
+                self._abandoned_saves,
+            )
+        return len(stalled)
 
     def _unschedulable_reason(self, seq: Sequence) -> str | None:
         """Return a human-readable reason if `seq` is permanently unschedulable.
@@ -2783,6 +2900,9 @@ class Scheduler:
                         "Deferring block free for seq %s until KV save completes.",
                         seq.id,
                     )
+                    # Stamp when the save was deferred so the reconciler can
+                    # reclaim it if the completion report never arrives.
+                    seq._deferred_save_at = time.monotonic()
                     self.deferred_free_blocks[seq.id] = seq
                 else:
                     self.block_manager.deallocate(seq)
@@ -3047,7 +3167,10 @@ class Scheduler:
             ), "Only producer should free blocks after sending KV"
             logger.debug("Finished sending KV transfer for request %s", req_id)
             seq = self._deferred_sequence(req_id)
-            assert seq is not None, f"req_id={req_id} not found in deferred_free_blocks"
+            if seq is None:
+                # Already reclaimed by `_reconcile_stalled_deferred_saves` after
+                # a stall; a late completion report has nothing left to free.
+                continue
             self.deferred_free_blocks.pop(seq.id, None)
             self.block_manager.deallocate(seq)
 

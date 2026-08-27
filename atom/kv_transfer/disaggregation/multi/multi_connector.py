@@ -68,6 +68,7 @@ from atom.kv_transfer.disaggregation.types import (
     KVConnectorOutput,
     SaveCompletionId,
     completion_req_key,
+    connector_metadata_has_work,
 )
 
 logger = logging.getLogger("atom")
@@ -159,6 +160,20 @@ class MultiConnectorMetadata(ConnectorMetadata):
     def __init__(self, metas: list) -> None:
         super().__init__()
         self.metas = list(metas)
+
+    def has_work(self) -> bool:
+        """Ask the subs; this wrapper holds none of the work itself.
+
+        Its own base fields are always empty -- everything lives in `metas` --
+        so answering from them alone drops every step whose only work belongs
+        to a sub. Delegating rather than mirroring the subs' fields is the
+        point: the aggregating properties below exist for the idle-dispatch
+        path and have to name each field, so one added to a sub and forgotten
+        here is a permanently parked request, not a wasted step.
+        """
+        return super().has_work() or any(
+            connector_metadata_has_work(m) for m in self.metas
+        )
 
     @property
     def requests(self):
