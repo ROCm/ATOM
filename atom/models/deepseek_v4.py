@@ -187,10 +187,10 @@ def v4_attention_with_output(
 
 
 # ---------------------------------------------------------------------------
-# Narrow PIECEWISE split, by GRANULARITY: the two batch-shaped kernels
-# (compressor + indexer top-k) are the split op; everything token-shaped is in
-# the dense pieces on either side. AF_PIECEWISE additionally CAPTURES the split
-# op; plain PIECEWISE runs it eager. That flag is the only difference.
+# Narrow PIECEWISE split, by GRANULARITY: the batch-shaped compressor is the
+# split op; token-shaped work stays in the dense pieces on either side.
+# AF_PIECEWISE additionally CAPTURES the split op; plain PIECEWISE runs it
+# eager. That flag is the only difference.
 # ---------------------------------------------------------------------------
 
 
@@ -2822,57 +2822,57 @@ class DeepseekV4Attention(nn.Module):
         x: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
-        # Split-op granularity depends on the cudagraph mode.
-        #  - PIECEWISE / AF_PIECEWISE -> NARROW split, by granularity: the two
-        #    BATCH-shaped kernels (compressor + indexer top-k) are the split op;
-        #    everything token-shaped is compiled into the dense pieces on either
-        #    side of it (projections + QK-norm/RoPE before, CSA pack + the paged
-        #    attention after). The two modes share this structure exactly; only
-        #    `capture` differs, and that lives in `piecewise_core`, not here.
-        #  - FULL / NONE -> WIDE split: the whole attention is one eager op for
-        #    torch compile (`v4_attention_with_output` -> `forward_impl`).
         cg_mode = get_current_atom_config().compilation_config.cudagraph_mode
-        # resolve to plain bool (Dynamo folds it; traced _attn_pre reads this)
+        # Resolve to a plain bool: Dynamo folds it, and traced _attn_pre reads it.
         self.attn_ffn_piecewise = (
             cg_mode is not None and cg_mode.is_attn_ffn_piecewise()
         )
         if cg_mode is not None and cg_mode.requires_piecewise_compilation():
-            (
-                _q,
-                _kv_pre,
-                _qr,
-                _qr_scale,
-                x,
-                idx_q_quant,
-                idx_weights,
-                idx_q_scale,
-                q_sa,
-                kv,
-                q_packed,
-                q_rope,
-                k_packed,
-                k_rope,
-            ) = self._attn_pre(x, positions)
-            # One graph per granularity. The dense piece this sits in holds the
-            # token-shaped work (projections, `qk_norm_rope` above; CSA pack and
-            # the paged attention below); the split op holds the batch-shaped
-            # pair, and is keyed with the batch shape accordingly.
-            torch.ops.aiter.v4_attn_compress(x, self.layer_name)
-            o = torch.ops.aiter.v4_attn_paged_core(
-                q_sa,
-                kv,
-                q_packed,
-                q_rope,
-                k_packed,
-                k_rope,
-                positions,
-                idx_q_quant,
-                idx_weights,
-                idx_q_scale,
-                self.layer_name,
-            )
-            return self._attn_post(o, positions)
+            return self._forward_piecewise_attention(x, positions)
         return torch.ops.aiter.v4_attention_with_output(x, positions, self.layer_name)
+
+    def _forward_piecewise_attention(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        """Narrow split order: pre/proj+norm -> compressor -> paged core -> post."""
+
+        (
+            _q,
+            _kv_pre,
+            _qr,
+            _qr_scale,
+            hidden,
+            idx_q_quant,
+            idx_weights,
+            idx_q_scale,
+            q_sa,
+            kv,
+            q_packed,
+            q_rope,
+            k_packed,
+            k_rope,
+        ) = self._attn_pre(x, positions)
+
+        # Batch-shaped side effect. AF_PIECEWISE captures this op; plain
+        # PIECEWISE runs it eager. The dense pieces around it are token-shaped.
+        torch.ops.aiter.v4_attn_compress(hidden, self.layer_name)
+
+        o = torch.ops.aiter.v4_attn_paged_core(
+            q_sa,
+            kv,
+            q_packed,
+            q_rope,
+            k_packed,
+            k_rope,
+            positions,
+            idx_q_quant,
+            idx_weights,
+            idx_q_scale,
+            self.layer_name,
+        )
+        return self._attn_post(o, positions)
 
     def _attn_pre(
         self,
@@ -2880,19 +2880,16 @@ class DeepseekV4Attention(nn.Module):
         positions: torch.Tensor,
         run_indexer_proj: bool = True,
     ):
-        """Q/KV (+ optional indexer input) projections (graphable, num_tokens).
+        """Graphable projection/norm prelude shared by both attention paths.
 
-        Shared by both attention paths:
-          - PIECEWISE (narrow split): run_indexer_proj=True — the indexer Q/weights
-            projection is compiled into the graphed piece here; the eager core
-            then only does the paged score/top-k via `score_topk_from`.
-          - FULL (wide split): run_indexer_proj=False — the legacy `forward_impl`
-            keeps the indexer's `forward_batched` inline in the core (unchanged
-            ordering), so no indexer projection happens here.
+        PIECEWISE asks for the indexer pre-projection and immediately materializes
+        QK-norm/RoPE through v4_qk_norm_rope, so the downstream paged-core op
+        receives already-shaped Q/K fields. FULL keeps the legacy indexer
+        forward_batched inside _attn_paged_core, so it leaves q/kv_pre and
+        qr/qr_scale live for the inline QK-norm and top-k path.
 
-        Returns (q, kv_pre, qr, qr_scale, x, idx_q_quant, idx_weights, idx_q_scale);
-        the last three are None when run_indexer_proj is False or the layer has no
-        indexer (idx_q_scale is also None on the FP8 indexer path).
+        The return order groups the two consumers: FULL reads q/kv_pre plus
+        qr/qr_scale; PIECEWISE reads idx_* plus the flattened QK/RoPE fields.
         """
         assert (
             x.dim() == 2 and x.shape[-1] == self.dim
@@ -3086,31 +3083,24 @@ class DeepseekV4Attention(nn.Module):
             attn_md.block_tables,
         )
 
-        # Q/KV projections (indexer projection deferred to the core's inline
-        # forward_batched -> run_indexer_proj=False). x already UE8M0-quantised
-        # above, so _attn_pre must NOT re-quantise -> its guard is a no-op here
-        # because we pass the already-processed x (the flag re-clones, harmless
-        # on the dead path, but we rely on the assert keeping this off anyway).
-        # run_indexer_proj=False -> the last three (indexer outputs) are None here.
-        # run_indexer_proj=False, so the AF branch in `_attn_pre` is off and the
-        # trailing slots come back None -- FULL composes the three halves itself,
-        # in the original order.
-        q, kv_pre, qr, qr_scale, x, *_ = self._attn_pre(
+        # FULL order: compressor launch overlaps projections, then inline
+        # QK-norm/RoPE, compressor join, paged core, and output projection.
+        q, kv_pre, qr, qr_scale, hidden, *_ = self._attn_pre(
             x, positions, run_indexer_proj=False
         )
-        # The three halves, composed here in the order the single inline body
-        # used to run them. `piecewise=False` runs the decorated core eagerly
-        # (no graph, no output slot); `compressor_already_launched=True` because
-        # this WIDE/FULL path launched the compressor above — the decorator
-        # forwards that bool to the body as a pass-through config arg.
-        # `idx_q_quant=None` keeps the indexer's inline `forward_batched`, which
-        # is what still needs `qr`/`qr_scale`/`positions` in the core signature.
         qkn = self._qk_norm_rope(q, kv_pre, positions)
-        self._attn_compress(piecewise=False, x=x, compressor_already_launched=True)
-        # `idx_q_quant=None` keeps the indexer's inline `forward_batched`, which
-        # is the only reason x/qr/qr_scale are threaded here.
-        o = self._attn_paged_core(qkn, positions, x=x, qr=qr, qr_scale=qr_scale)
-        # Output LoRA + wo_b.
+        self._attn_compress(
+            piecewise=False,
+            x=hidden,
+            compressor_already_launched=True,
+        )
+        o = self._attn_paged_core(
+            qkn,
+            positions,
+            x=hidden,
+            qr=qr,
+            qr_scale=qr_scale,
+        )
         return self._attn_post(o, positions)
 
     # Nothing is copied per step. Every input comes from the dense piece
@@ -3128,19 +3118,12 @@ class DeepseekV4Attention(nn.Module):
         x: torch.Tensor | None = None,  # [num_tokens, dim] hidden state
         compressor_already_launched: bool = False,
     ) -> None:
-        """The BATCH-shaped half: compressor launch + side-stream join.
+        """Batch-shaped compressor launch plus side-stream join.
 
-        The only kernel left whose launch is sized by the batch, which is why this
-        graph keys on `(layer, num_tokens, bucket_bs, q_eff)` while a dense piece
-        keys on num_tokens alone -- one graph per granularity. Everything
-        token-shaped is in the pieces around it (`_qk_norm_rope` before,
-        `_attn_paged_core` after), including the paged attention itself, which only
-        ever sat here because torch.compile could not trace it.
-
-        `capture` is the ONLY difference between PIECEWISE and AF_PIECEWISE: off,
-        this runs eager and delivers into the persistent slot the downstream piece
-        was captured reading. `compressor_already_launched` is True from
-        `forward_impl`, which launches it before the projections to overlap them.
+        PIECEWISE launches the compressor here. FULL launches it before
+        projections for overlap, then calls this with compressor_already_launched
+        to perform the same join. AF_PIECEWISE differs only by asking
+        piecewise_core to capture/replay this side-effect body.
         """
         fc = get_forward_context()
         # warmup_model runs BEFORE allocate_kv_cache, so the Compressor's and
@@ -3313,11 +3296,8 @@ class DeepseekV4Attention(nn.Module):
         state_slot_out = attn_md.state_slot_out
 
         # Indexer score/top-k, then translate the seq-local result -> physical
-        # paged offsets in the active CSA buffer. Both token-shaped: the FP4
-        # varqlen scorer takes `padded_tokens = q_fp4.size(0)` with a constant
-        # `n_ctas` grid, and `csa_translate_pack`'s grid is `topk_local.shape`.
-        # They read what the compressor wrote on the far side of the split, so
-        # the ordering comes from that op's returned token.
+        # paged offsets in the active CSA buffer. Both are token-shaped and run
+        # after the compressor split op in the narrow PIECEWISE order.
         if self.indexer is not None and not self.skip_topk:
             topk_local = self.indexer.topk(
                 x,
