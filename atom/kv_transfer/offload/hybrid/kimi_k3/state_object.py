@@ -104,7 +104,13 @@ class StateByteCodec:
         from lmcache.utils import CacheEngineKey
 
         digest = xxhash.xxh64()
-        digest.update(int(h).to_bytes(8, "little", signed=True))
+        # Unsigned, and it must be: an ATOM block hash is `xxh64().intdigest()`,
+        # which spans the full 0..2**64-1, and `BlockManager.compute_hash`
+        # chains it with `prefix.to_bytes(8, "little")` -- unsigned too. With
+        # `signed=True` every hash above 2**63-1 raised `OverflowError: int too
+        # big to convert` from inside the `batched_put` argument list, which is
+        # about half of them: a measured 27 of 46 stores.
+        digest.update(int(h).to_bytes(8, "little", signed=False))
         digest.update(self._layout_id.encode())
         return CacheEngineKey(
             self._model_name,
@@ -134,6 +140,13 @@ class StateByteCodec:
         """
         if self._storage is None:
             return False
+        # Before the allocation, not inside the `batched_put` argument list.
+        # `key` is pure and can raise (it did: see the `signed` note there), and
+        # an argument-position raise happens *after* the allocation and *before*
+        # `batched_put` can take ownership -- stranding the MemoryObj exactly
+        # the way a throwing `pack` used to. Computing it first removes the
+        # window rather than guarding it.
+        key = self.key(h)
         obj = self._allocate(self.entry_bytes)
         if obj is None:
             self.puts_refused += 1
@@ -147,10 +160,10 @@ class StateByteCodec:
         # its own reference with `finally` for the same reason.
         try:
             self._staged.pack(self._backend.page_unit_views(unit_ids), obj)
+            self._storage.batched_put([key], [obj])
         except Exception:
             obj.ref_count_down()
             raise
-        self._storage.batched_put([self.key(h)], [obj])
         return True
 
     def get(self, h: int, slot: int) -> bool:
