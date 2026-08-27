@@ -72,11 +72,10 @@ def normalize_chat_tools(tools: Any) -> Any:
 def _tool_parser_for_request(parser_cls, tools):
     """Return the parser this request actually needs.
 
-    SGLang only activates tool parsing when the request has effective tools.
-    Doing otherwise lets an ordinary ``<tool_call>`` quotation open an
-    unbounded region on a no-tools request, withholding the rest of the stream
-    until EOS. Keep parsers that also consume model-wide channel framing,
-    though: Kimi-K3 wraps every answer in such markers, even without tools.
+    A no-tools request cannot produce a dispatchable tool call. Disable parsers
+    whose markers only open tool-call regions so an unclosed marker remains
+    ordinary content instead of withholding the stream until EOS. Parsers that
+    consume model-wide channel framing must remain active without tools.
     """
     if parser_cls is None or tools:
         return parser_cls
