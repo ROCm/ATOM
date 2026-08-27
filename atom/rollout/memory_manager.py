@@ -97,13 +97,6 @@ class MemoryManagerMixin:
                 f"{self.label}: no-eager sleep keeps weights + CUDA graphs resident"
             )
             return
-        # Release CUDA graphs first — they hold references to weight memory
-        # and prevent freeing GPU memory.
-        if not self.enforce_eager and hasattr(self, "graphs") and self.graphs:
-            self._graphs_backup_keys = list(self.graphs.keys())
-            self.graphs.clear()
-            self.graph_pool = None
-            logger.info(f"{self.label}: CUDA graphs released for sleep")
         # Discard GPU weight data but keep shape/dtype metadata so that
         # weight sync (SHM or IPC) can do param.data.copy_() later.
         # The weights are always overwritten after resume, so offloading

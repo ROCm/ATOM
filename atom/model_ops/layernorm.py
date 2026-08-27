@@ -29,6 +29,10 @@ from torch import Tensor, nn
 from torch.overrides import handle_torch_function, has_torch_function_unary
 
 
+_rmsnorm2d_fwd_supports_model_sensitive: bool | None = None
+_rmsnorm2d_fwd_with_add_supports_model_sensitive: bool | None = None
+
+
 def silu(input: Tensor, inplace: bool = False) -> Tensor:
     r"""Apply the Sigmoid Linear Unit (SiLU) function, element-wise.
 
@@ -58,14 +62,24 @@ def silu(input: Tensor, inplace: bool = False) -> Tensor:
 def rmsnorm2d_fwd_(
     x: torch.Tensor, weight: torch.Tensor, eps: float, dim: int
 ) -> torch.Tensor:
+    global _rmsnorm2d_fwd_supports_model_sensitive
+
     ori_shape = x.shape
     x = x.reshape(-1, dim)
-    try:
-        out = rmsnorm2d_fwd(x, weight, eps, use_model_sensitive_rmsnorm=1)
-    except TypeError as error:
-        if "use_model_sensitive_rmsnorm" not in str(error):
-            raise
-        out = rmsnorm2d_fwd(x, weight, eps)
+    if _rmsnorm2d_fwd_supports_model_sensitive is not False:
+        try:
+            out = rmsnorm2d_fwd(x, weight, eps, use_model_sensitive_rmsnorm=1)
+        except TypeError as error:
+            if (
+                _rmsnorm2d_fwd_supports_model_sensitive is True
+                or "use_model_sensitive_rmsnorm" not in str(error)
+            ):
+                raise
+            _rmsnorm2d_fwd_supports_model_sensitive = False
+        else:
+            _rmsnorm2d_fwd_supports_model_sensitive = True
+            return out.view(ori_shape)
+    out = rmsnorm2d_fwd(x, weight, eps)
     return out.view(ori_shape)
 
 
@@ -73,18 +87,34 @@ def rmsnorm2d_fwd_(
 def rmsnorm2d_fwd_with_add_(
     x: torch.Tensor, weight: torch.Tensor, residual: torch.Tensor, eps: float, dim: int
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    global _rmsnorm2d_fwd_with_add_supports_model_sensitive
+
     ori_shape = x.shape
     x = x.reshape(-1, dim)
     out = torch.empty_like(x)
     residual_out = torch.empty_like(x)
-    try:
-        rmsnorm2d_fwd_with_add(
-            out, x, residual, residual_out, weight, eps, use_model_sensitive_rmsnorm=1
-        )
-    except TypeError as error:
-        if "use_model_sensitive_rmsnorm" not in str(error):
-            raise
-        rmsnorm2d_fwd_with_add(out, x, residual, residual_out, weight, eps)
+    if _rmsnorm2d_fwd_with_add_supports_model_sensitive is not False:
+        try:
+            rmsnorm2d_fwd_with_add(
+                out,
+                x,
+                residual,
+                residual_out,
+                weight,
+                eps,
+                use_model_sensitive_rmsnorm=1,
+            )
+        except TypeError as error:
+            if (
+                _rmsnorm2d_fwd_with_add_supports_model_sensitive is True
+                or "use_model_sensitive_rmsnorm" not in str(error)
+            ):
+                raise
+            _rmsnorm2d_fwd_with_add_supports_model_sensitive = False
+        else:
+            _rmsnorm2d_fwd_with_add_supports_model_sensitive = True
+            return out.view(ori_shape), residual_out.view(ori_shape)
+    rmsnorm2d_fwd_with_add(out, x, residual, residual_out, weight, eps)
     return out.view(ori_shape), residual_out.view(ori_shape)
 
 
