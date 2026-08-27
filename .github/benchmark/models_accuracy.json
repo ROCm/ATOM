@@ -311,14 +311,14 @@
     "model_name": "GLM-5.3-Flash",
     "model_path": "zai-org/GLM-5.3-Flash",
     "extraArgs": "--kv_cache_dtype fp8 -tp 8 --max-model-len 2048 --max-num-batched-tokens 2048 --max-num-seqs 32 --gpu-memory-utilization 0.85 --no-enable_prefix_caching",
-    "client_command": "lm_eval --model local-completions --model_args model=${MODEL_PATH},base_url=http://localhost:8000/v1/completions,num_concurrent=32,max_retries=3,tokenized_requests=False,max_length=2048 --tasks gsm8k --num_fewshot 3 --batch_size 1 --output_path ${OUTPUT_PATH} --log_samples",
+    "client_command": "lm_eval --model local-chat-completions --model_args model=${MODEL_PATH},base_url=http://localhost:8000/v1/chat/completions,num_concurrent=32,max_retries=3,tokenized_requests=False,max_gen_toks=512 --tasks gsm8k --num_fewshot 3 --batch_size 65 --apply_chat_template --fewshot_as_multiturn --output_path ${OUTPUT_PATH} --log_samples",
     "env_vars": "",
     "runner": "linux-atom-do-mi350x-8",
     "test_level": "nightly",
-    "accuracy_threshold": 0.9,
-    "accuracy_baseline": 0.9257,
+    "accuracy_threshold": 0.94,
+    "accuracy_baseline": 0.9659,
     "accuracy_baseline_model": "zai-org/GLM-5.3-Flash",
-    "_baseline_note": "ATOM native FP8 gsm8k 3-shot over all 1319 questions: flexible-extract=0.9257 with the default CUDAGraph path (eager measured 0.9204, i.e. equal within stderr +/-0.0072). Prefix caching is off because the KDA recurrent state is per-request. Threshold 0.90 leaves ~2.5pp headroom."
+    "_baseline_note": "ATOM native FP8 gsm8k over all 1319 questions, chat + 3-shot fewshot_as_multiturn: flexible-extract=0.9659, strict-match=0.9651 (SGLang publishes 0.9704-0.9757 for the same model on H100/H200/GB300). USE CHAT, NOT RAW COMPLETIONS, and keep the shots: lm_eval's gsm8k filters are built for the few-shot '#### N' convention, and this model replies in markdown/LaTeX with a trailing '**Check:** ...' line. 0-shot chat therefore scores strict-match=0.0000 and flexible-extract=0.8362 on a model whose answers are ~98% correct. num_fewshot must stay at 3 until the pooled kpool path lands: 5-shot multiturn prompts plus the generation budget exceed --max-model-len 2048 and every request fails with HTTP 400. Prefix caching is off because the KDA recurrent state is per-request. Threshold 0.94 leaves ~2.5pp headroom."
   },
   {
     "model_name": "GLM-5.2-MXFP4",

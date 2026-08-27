@@ -27,13 +27,30 @@ AITER_LOG_LEVEL=WARNING python -m atom.entrypoints.openai_server \
 
 ## Accuracy
 
-`lm_eval --tasks gsm8k --num_fewshot 3` over the full 1319 questions, TP8,
-`--kv_cache_dtype fp8`, `--max-model-len 2048`:
+`lm_eval` over the full 1319 GSM8K questions, TP8, `--kv_cache_dtype fp8`,
+`--max-model-len 2048`:
 
-| Filter | exact_match |
-|---|---|
-| flexible-extract | 0.9204 ± 0.0075 |
-| strict-match | 0.9212 ± 0.0074 |
+| Protocol | flexible-extract | strict-match |
+|---|---|---|
+| **chat, 3-shot `--fewshot_as_multiturn`** (use this) | **0.9659** | **0.9651** |
+| raw `/v1/completions`, 3-shot | 0.9257 | 0.9257 |
+| chat, 0-shot | 0.8362 | 0.0000 |
+
+For reference, SGLang publishes 0.9704-0.9757 for this model on
+H100/H200/GB300, measured with its own `sgl-eval run gsm8k` harness.
+
+**Measure in chat mode WITH few-shot, or the number is meaningless.** lm_eval's
+gsm8k filters are built around the few-shot `#### N` convention, while this
+model answers in markdown/LaTeX and appends a `**Check:** ...` verification
+line. Drop the shots and strict-match finds no `####` at all (0.0000) while
+flexible-extract's "last number in the text" lands inside the verification tail
+-- 0.8362 on a model that is actually right far more often. An extraction-free
+audit of those same 1319 replies finds the correct value present in 1292 of
+them (97.95%), with only 26 genuinely wrong.
+
+`--num_fewshot` must stay at 3 until the pooled kpool path lands: 5-shot
+multiturn prompts plus the generation budget exceed the 2048 context cap and
+every request fails with HTTP 400.
 
 ## Context-length limit (important)
 
