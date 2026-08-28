@@ -392,7 +392,11 @@ def _filter_owned_prefill(
 
     per_row = []
     for t in range(rows):
-        s, e = int(out_kv_indptr[t]), int(out_kv_indptr[t + 1])
+        s = int(out_kv_indptr[t])
+        # The persistent metadata reserves one dummy slot for a rank-local
+        # zero-length row. Only the true owned count belongs to the partition
+        # being checked here; the dummy is neutralized by the DCP LSE merge.
+        e = s + int(owned_counts[t])
         slots = out[s:e]
         blk, off = slots // block_size, slots % block_size
         req = int(token_req[t])
