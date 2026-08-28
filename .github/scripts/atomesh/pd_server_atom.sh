@@ -32,6 +32,8 @@ xP="${xP:-1}"
 yD="${yD:-1}"
 PREFILL_TP_SIZE="${PREFILL_TP_SIZE:-8}"
 DECODE_TP_SIZE="${DECODE_TP_SIZE:-8}"
+PREFILL_DCP_SIZE="${PREFILL_DCP_SIZE:-1}"
+DECODE_DCP_SIZE="${DECODE_DCP_SIZE:-1}"
 PREFILL_ENABLE_DP="${PREFILL_ENABLE_DP:-false}"
 DECODE_ENABLE_DP="${DECODE_ENABLE_DP:-false}"
 
@@ -109,6 +111,9 @@ HF_OVERRIDES="${HF_OVERRIDES:-}"
 SPEC_METHOD="${SPEC_METHOD:-}"
 DRAFT_MODEL_PATH="${DRAFT_MODEL_PATH:-}"
 NUM_SPEC_TOKENS="${NUM_SPEC_TOKENS:-}"
+SPEC_DECODE_ACCEPTANCE_LENGTH="${SPEC_DECODE_ACCEPTANCE_LENGTH:-}"
+STATE_CHECKPOINT_INTERVAL_TOKENS="${STATE_CHECKPOINT_INTERVAL_TOKENS:-}"
+STATE_CHECKPOINT_SLOTS="${STATE_CHECKPOINT_SLOTS:-}"
 EXTRA_SERVER_ARGS="${EXTRA_SERVER_ARGS:-}"
 PREFILL_EXTRA_SERVER_ARGS="${PREFILL_EXTRA_SERVER_ARGS:-}"
 DECODE_EXTRA_SERVER_ARGS="${DECODE_EXTRA_SERVER_ARGS:-}"
@@ -180,6 +185,7 @@ AIPERF_VENV="${AIPERF_VENV:-/tmp/atomesh-aiperf-venv}"
 AIPERF_COMMIT="${AIPERF_COMMIT:-b7b16cf851885567988a643282266bce74e34437}"
 AIPERF_SCENARIO="${AIPERF_SCENARIO:-inferencex-agentx-mvp}"
 AIPERF_PUBLIC_DATASET="${AIPERF_PUBLIC_DATASET:-semianalysis_cc_traces_weka_062126_256k}"
+AIPERF_APPLY_CHAT_TEMPLATE="${AIPERF_APPLY_CHAT_TEMPLATE:-false}"
 AIPERF_MAX_CONTEXT_LENGTH="${AIPERF_MAX_CONTEXT_LENGTH:-262144}"
 AIPERF_NUM_DATASET_ENTRIES="${AIPERF_NUM_DATASET_ENTRIES:-393}"
 AIPERF_BENCHMARK_DURATION="${AIPERF_BENCHMARK_DURATION:-1800}"
@@ -320,12 +326,18 @@ else
   done
 fi
 
-prefill_parallel=(-tp "${PREFILL_TP_SIZE}")
+prefill_parallel=(
+  -tp "${PREFILL_TP_SIZE}"
+  --decode-context-parallel-size "${PREFILL_DCP_SIZE}"
+)
 if [[ "${PREFILL_ENABLE_DP}" == "true" ]]; then
   prefill_parallel+=("--enable-dp-attention")
 fi
 
-decode_parallel=(-tp "${DECODE_TP_SIZE}")
+decode_parallel=(
+  -tp "${DECODE_TP_SIZE}"
+  --decode-context-parallel-size "${DECODE_DCP_SIZE}"
+)
 if [[ "${DECODE_ENABLE_DP}" == "true" ]]; then
   decode_parallel+=("--enable-dp-attention")
 fi
@@ -403,6 +415,19 @@ if [[ -n "${DRAFT_MODEL_PATH}" ]]; then
 fi
 if [[ -n "${NUM_SPEC_TOKENS}" ]]; then
   server_common+=(--num-speculative-tokens "${NUM_SPEC_TOKENS}")
+fi
+if [[ -n "${SPEC_DECODE_ACCEPTANCE_LENGTH}" ]]; then
+  server_common+=(
+    --spec-decode-acceptance-length "${SPEC_DECODE_ACCEPTANCE_LENGTH}"
+  )
+fi
+if [[ -n "${STATE_CHECKPOINT_INTERVAL_TOKENS}" ]]; then
+  server_common+=(
+    --state-checkpoint-interval-tokens "${STATE_CHECKPOINT_INTERVAL_TOKENS}"
+  )
+fi
+if [[ -n "${STATE_CHECKPOINT_SLOTS}" ]]; then
+  server_common+=(--state-checkpoint-slots "${STATE_CHECKPOINT_SLOTS}")
 fi
 
 wait_http() {
@@ -885,9 +910,14 @@ run_aiperf_agentic_benchmark() {
     local aiperf_json="${out_dir}/profile_export_aiperf.json"
     local dashboard_json="${RUN_DIR}/benchmark_results/${result_file}"
     local -a unsafe_args=()
+    local -a chat_template_args=()
     if (( AIPERF_BENCHMARK_DURATION < 900 )) \
       || [[ "${AIPERF_UNSAFE_OVERRIDE}" == "1" || "${AIPERF_UNSAFE_OVERRIDE}" == "true" ]]; then
       unsafe_args+=(--unsafe-override)
+    fi
+    if [[ "${AIPERF_APPLY_CHAT_TEMPLATE}" == "1" \
+      || "${AIPERF_APPLY_CHAT_TEMPLATE}" == "true" ]]; then
+      chat_template_args+=(--apply-chat-template)
     fi
 
     echo "[aiperf] ${result_file}"
@@ -920,6 +950,7 @@ run_aiperf_agentic_benchmark() {
       --no-gpu-telemetry \
       --tokenizer "${MODEL_PATH}" \
       --tokenizer-trust-remote-code \
+      "${chat_template_args[@]}" \
       --max-context-length "${AIPERF_MAX_CONTEXT_LENGTH}" \
       --num-dataset-entries "${AIPERF_NUM_DATASET_ENTRIES}" \
       --slice-duration "${AIPERF_SLICE_DURATION}" \
@@ -1132,10 +1163,10 @@ run_benchmark_and_eval() {
     return
   fi
   if [[ "${BENCHMARK_KIND}" == "aiperf_agentic" \
-    && "${EVAL_TASK}" == "swebench_lite" \
+    && ( "${EVAL_TASK}" == "swebench_lite" || "${EVAL_TASK}" == "gsm8k" ) \
     && ( "${RUN_EVAL}" == "true" || "${RUN_EVAL}" == "1" ) ]]; then
-    # Agentic performance cases require a fresh prefix-cache state. Run their
-    # trace benchmark before the independent SWE-bench workload.
+    # Agentic performance cases require a fresh prefix/state-cache state. Run
+    # their trace benchmark before any independent accuracy workload.
     run_benchmark
     run_eval
   else

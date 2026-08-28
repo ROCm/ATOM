@@ -269,11 +269,12 @@ models:
             env:
               decode:
                 MAX_JOBS: "16"
-            benchmark:
+            benchmark: &agentic_1m_aiperf
               kind: aiperf_agentic
               aiperf_commit: b7b16cf851885567988a643282266bce74e34437
               scenario: inferencex-agentx-mvp
               public_dataset: semianalysis_cc_traces_weka_062126
+              apply_chat_template: true
               max_context_length: 1048576
               num_dataset_entries: 393
               benchmark_duration: 3600
@@ -371,6 +372,166 @@ models:
       limit: null
       model_type: local-completions
       endpoint: completions
+
+  Kimi-K3-MXFP4:
+    backend: atom
+    model_path: "${ATOMESH_MODEL_ROOT}/Kimi-K3"
+    precision: MXFP4
+    env:
+      common:
+        PYTHONNOUSERSITE: "1"
+        PYTHONHASHSEED: "0"
+        AITER_SITUV2_A4W4: "1"
+        AITER_QUICK_REDUCE_QUANTIZATION: INT4
+        AITER_FLYDSL_STAGE2_FP8: "1"
+        ATOM_MLA_MAX_SPLIT_PER_BATCH: "256"
+        ATOM_STATE_CHECKPOINT_DEMAND: "0"
+        ATOM_ENABLE_REPLAYSSM: "0"
+      prefill: {}
+      decode: {}
+    server:
+      common_args:
+        trust_remote_code: true
+        kv_cache_dtype: fp8
+        block_size: 128
+        enable_prefix_caching: true
+        max_model_len: ""
+        state_checkpoint_interval_tokens: -1
+        online_quant_config: '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*self_attn.[qkv]_conv1d*","*block_sparse_moe.experts*","*block_sparse_moe.routed_expert_*","*vision_tower*","*mm_projector*"]}'
+    suites:
+      nightly:
+        # One concurrency per job keeps the prefix/state caches independent.
+        - <<: &kimi_k3_agentic_tp8
+            topology: 1p1d
+            pd_worker_layout: multi_node
+            nodes: "${ATOMESH_1P1D_NODES}"
+            isl: [1048576]
+            osl: 1024
+            server:
+              common_args:
+                gpu_memory_utilization: 0.88
+                max_num_seqs: 32
+                max_num_batched_tokens: 8192
+                method: dspark
+                draft_model: "${ATOMESH_MODEL_ROOT}/Kimi-K3-DSpark"
+                num_speculative_tokens: 7
+                spec_decode_acceptance_length: 3.84
+            prefill:
+              workers: 1
+              tp: 8
+            decode:
+              workers: 1
+              tp: 8
+              cudagraph: none
+            benchmark:
+              <<: *agentic_1m_aiperf
+              aiperf_commit: 754356e9a39acc6cc6afb242d123bb57c3fb6f75
+            run_eval: false
+          name: kimi-k3-mxfp4-1p1d-tp8-dspark7-agentic-1m-c1
+          concurrency: [1]
+
+        - <<: *kimi_k3_agentic_tp8
+          name: kimi-k3-mxfp4-1p1d-tp8-dspark7-agentic-1m-c2
+          concurrency: [2]
+
+        - <<: *kimi_k3_agentic_tp8
+          name: kimi-k3-mxfp4-1p1d-tp8-dspark7-agentic-1m-c4
+          concurrency: [4]
+
+        - &kimi_k3_agentic_dcp8_lmcache
+          <<: *kimi_k3_agentic_tp8
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c8
+          concurrency: [8]
+          server:
+            common_args: &kimi_k3_agentic_dspark3_args
+              gpu_memory_utilization: 0.88
+              max_num_seqs: 32
+              max_num_batched_tokens: 4096
+              method: dspark
+              draft_model: "${ATOMESH_MODEL_ROOT}/Kimi-K3-DSpark"
+              num_speculative_tokens: 3
+              spec_decode_acceptance_length: 3.00
+              state_checkpoint_slots: 96
+          prefill:
+            workers: 1
+            tp: 8
+            dcp: 8
+          decode:
+            workers: 1
+            tp: 8
+            dcp: 8
+            cudagraph: none
+          env:
+            common:
+              ATOM_ENABLE_REPLAYSSM: "1"
+            prefill: &kimi_k3_agentic_lmcache100_env
+              LMCACHE_LOCAL_CPU: "True"
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "100"
+              LMCACHE_CHUNK_SIZE: "1024"
+              LMCACHE_ENABLE_OUTPUT_PATH_MODE: "1"
+              LMCACHE_ENABLE_LAYOUT_FILE_MODE: "1"
+              OFFLOAD_KV_FOR_HYBRID: "1"
+              OFFLOAD_PROFILE: "1"
+              PREFILL_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":6301},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
+
+        - <<: *kimi_k3_agentic_dcp8_lmcache
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c12
+          concurrency: [12]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_dspark3_args
+              max_num_seqs: 24
+
+        - &kimi_k3_agentic_no_dspark
+          <<: *kimi_k3_agentic_dcp8_lmcache
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-state-1m-c32
+          concurrency: [32]
+          server:
+            common_args: &kimi_k3_agentic_no_dspark_args
+              gpu_memory_utilization: 0.86
+              max_num_seqs: 64
+              max_num_batched_tokens: 8192
+          env:
+            common:
+              ATOM_ENABLE_REPLAYSSM: "0"
+            prefill:
+              <<: *kimi_k3_agentic_lmcache100_env
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "96"
+              OFFLOAD_STATE: "1"
+              OFFLOAD_STATE_CPU_SIZE: "32"
+              OFFLOAD_STATE_STAGING_GROUPS: "8"
+              OFFLOAD_STATE_MIN_LOAD_TOKENS: "0"
+              OFFLOAD_GPU_STAGING_CHUNKS: "32"
+
+        - <<: *kimi_k3_agentic_no_dspark
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-state-1m-c40
+          concurrency: [40]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 80
+
+        - <<: *kimi_k3_agentic_no_dspark
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-state-1m-c56
+          concurrency: [56]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              gpu_memory_utilization: 0.88
+              max_num_seqs: 72
+              max_num_batched_tokens: 4096
+          run_eval: true
+          eval_concurrency: [56]
+
+    accuracy:
+      task: gsm8k
+      fewshot: 5
+      limit: null
+      model_type: local-chat-completions
+      endpoint: chat/completions
+      max_gen_toks: 16384
+      apply_chat_template: true
 
   Kimi-K2.5-MXFP4:
     backend: atom

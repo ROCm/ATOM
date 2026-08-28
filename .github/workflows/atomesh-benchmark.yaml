@@ -44,7 +44,7 @@ on:
         default: false
         type: boolean
       model_names:
-        description: 'When run_all_models=false, run all cases in the selected suite for these model families. Comma-separated: DeepSeek-V4-Pro,GLM-5.2-MXFP4,Kimi-K2.5-MXFP4,MiniMax-M3-MXFP4,MiniMax-M3-MXFP8'
+        description: 'When run_all_models=false, run all cases in the selected suite for these model families. Comma-separated: DeepSeek-V4-Pro,GLM-5.2-MXFP4,Kimi-K3-MXFP4,Kimi-K2.5-MXFP4,MiniMax-M3-MXFP4,MiniMax-M3-MXFP8'
         required: false
         default: ''
         type: string
@@ -64,7 +64,17 @@ on:
             glm-52-mxfp4-1p1d-tp4-dpa-agentic-lmcache-1m-c32,
             glm-52-mxfp4-1p1d-tp4-dpa-agentic-lmcache-1m-c48
 
-          Kimi:
+          Kimi-K3:
+            kimi-k3-mxfp4-1p1d-tp8-dspark7-agentic-1m-c1,
+            kimi-k3-mxfp4-1p1d-tp8-dspark7-agentic-1m-c2,
+            kimi-k3-mxfp4-1p1d-tp8-dspark7-agentic-1m-c4,
+            kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c8,
+            kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c12,
+            kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-state-1m-c32,
+            kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-state-1m-c40,
+            kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-state-1m-c56
+
+          Kimi-K2.5:
             kimi-k25-1p1d-tp4,kimi-k25-1p1d-tp4-tp8,
             kimi-k25-2p1d-tp4,kimi-k25-1p2d-tp4
 

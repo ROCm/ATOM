@@ -382,6 +382,10 @@ def enrich_payload(
     enriched.setdefault("decode_workers", env.get("DECODE_WORKERS"))
     enriched.setdefault("prefill_tp", env.get("PREFILL_TP"))
     enriched.setdefault("decode_tp", env.get("DECODE_TP"))
+    enriched.setdefault("prefill_dcp", env.get("PREFILL_DCP_SIZE"))
+    enriched.setdefault("decode_dcp", env.get("DECODE_DCP_SIZE"))
+    enriched.setdefault("speculative_method", env.get("SPEC_METHOD"))
+    enriched.setdefault("num_speculative_tokens", env.get("NUM_SPEC_TOKENS"))
     runner = env.get("SLURM_SUBMIT_RUNNER", "")
     if hardware:
         enriched["hardware"] = hardware
