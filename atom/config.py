@@ -600,6 +600,29 @@ class QuantizationConfig:
             self.apply_exclude_name_mapping(quant_exclude_name_mapping)
 
 
+# Rows per block that `deepgemm_fp8_paged_mqa_logits` requires to stay in its
+# preshuffled layout, which is the only layout it computes correctly -- with
+# `Preshuffle=False` it disagrees with the flat `fp8_mqa_logits` kernel by ~100%
+# at every block size, and aiter's assert guards only the preshuffle side. Any
+# cache that kernel pages over must therefore hold a multiple of this many rows
+# per block. Sizing constants belong to whoever enforces them, and the block
+# size is set here.
+_MQA_LOGITS_PRESHUFFLE_ROWS = 16
+
+
+def glm5_kpool_block_size(index_kpool: int) -> int:
+    """Tokens per KV block that lets GLM-5.3's pooled index cache be exact.
+
+    A block of B tokens needs ``B // index_kpool`` index rows, and that count
+    must be a multiple of `_MQA_LOGITS_PRESHUFFLE_ROWS`. The smallest B that
+    satisfies it is the product, and the smallest is what we want: a larger
+    block only adds paging waste, while a smaller one forces the cache to be
+    padded back up to one row per token -- which is the whole cost being
+    removed here.
+    """
+    return index_kpool * _MQA_LOGITS_PRESHUFFLE_ROWS
+
+
 _CONFIG_REGISTRY: dict[str, str] = {
     "deepseek_v32": "deepseek_v3",
     "deepseek_v4": "deepseek_v3",  # V4 reuses V3 schema; V4-specific fields
@@ -1983,6 +2006,24 @@ class Config:
             v4_block_size = 256
             if self.kv_cache_block_size != v4_block_size:
                 self.kv_cache_block_size = v4_block_size
+
+        # GLM-5.3-Flash's indexer caches one pooled key per `index_kpool`
+        # tokens, so a KV block of B tokens needs only B // index_kpool index
+        # rows. Those rows are what `deepgemm_fp8_paged_mqa_logits` pages over,
+        # and it is correct only in its preshuffled layout, which requires the
+        # row count per block to be a multiple of 16. B = 16 would give 4 rows
+        # and force the index cache to be padded to one row per TOKEN, wasting
+        # `index_kpool - 1` of every `index_kpool` rows. B = 64 gives exactly
+        # 16. Same reasoning and same mechanism as the V4 override above: the
+        # BlockManager and slot_mapping assume one global block size, so it is
+        # set here and the attention builder sizes the index cache from it.
+        is_glm5_next = any("Glm5Next" in str(a) for a in arches)
+        if is_glm5_next:
+            index_kpool = int(getattr(self.hf_config, "index_kpool", 1) or 1)
+            if index_kpool > 1:
+                glm5_block_size = glm5_kpool_block_size(index_kpool)
+                if self.kv_cache_block_size != glm5_block_size:
+                    self.kv_cache_block_size = glm5_block_size
 
         # Keep ``None`` intact until the model architecture is known so an
         # omitted index-cache option remains distinguishable from an explicit

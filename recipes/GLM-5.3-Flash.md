@@ -1,14 +1,13 @@
 # GLM-5.3-Flash Bring-Up Notes
 
-> **Status: serving-accurate under ATOM on 8× MI355X, context ≤ 2048.**
+> **Status: serving-accurate under ATOM on 8× MI355X, long context included.**
 > `atom/models/glm5_next.py` loads every parameter of the checkpoint — language
-> model and vision tower — and scores **gsm8k flexible-extract 0.9682 /
-> strict-match 0.9689** over all 1319 questions (3-shot chat, TP8, bf16 KV; see
-> §8). Per-layer hidden states match the transformers reference to cosine
-> ≥ 0.9997 at all 45 layers, and the vision tower is bit-exact in fp32. Not yet
-> done: contexts beyond `index_topk` (needs the sparse k-pool path), the MTP
-> draft layer, and the image processor that would let the server actually accept
-> an image. See §8.
+> model and vision tower — and scores **gsm8k 0.9682 / 0.9689** at 3-shot on the
+> dense path and **0.9659 / 0.9666** at 16-shot on the pooled k-pool path, over
+> all 1319 questions (chat, TP8, bf16 KV; see §7). Per-layer hidden states match
+> the transformers reference to cosine ≥ 0.9997 at all 45 layers, and the vision
+> tower is bit-exact in fp32. Not yet done: the MTP draft layer, and the image
+> processor that would let the server actually accept an image. See §8.
 
 ```bash
 python -m tools.glm5_3_flash.atom_run --model /models/GLM-5.3-Flash -tp 4 \
@@ -340,13 +339,26 @@ CUDA graphs and MTP are both still on the table.
 `lm_eval` gsm8k, all 1319 questions, TP8, bf16 KV, `--max-model-len 2048`,
 chat + `--fewshot_as_multiturn`, greedy:
 
-| | flexible-extract | strict-match |
-| --- | --- | --- |
-| 3-shot | **0.9682** | **0.9689** |
+| | context | flexible-extract | strict-match |
+| --- | --- | --- | --- |
+| 3-shot (dense MLA) | 2048 | **0.9682** | **0.9689** |
+| 16-shot (pooled k-pool) | 8192 | **0.9659** | **0.9666** |
 
-Guarded by the `GLM-5.3-Flash` entry in `.github/benchmark/models_accuracy.json`
-(threshold 0.94). SGLang publishes 0.9704–0.9757 for this model, so the port is
-in line.
+Guarded by the `GLM-5.3-Flash` and `GLM-5.3-Flash-kpool-16shot` entries in
+`.github/benchmark/models_accuracy.json` (threshold 0.94). SGLang publishes
+0.9704–0.9757 for this model, so the port is in line.
+
+**Only the 16-shot row exercises the pooled path.** GSM8K prompts are short —
+3-shot is ~389 tokens, 5-shot ~645 — so at or below `index_topk` the indexer
+selects every token, `attention_mla` runs dense, and the pooled selection is
+computed and thrown away. 16-shot prompts run 2763–3591 tokens, so every one of
+the 1319 questions exceeds 2048 and pooled scoring plus pooled top-k decide what
+the model attends to. Do not quote a short-context score as evidence that pooled
+selection works; it only shows the pooled writes did no harm.
+
+Use `--max-model-len 8192`, not 4096: lm_eval samples its shots at random, the
+longest prompt is 3591 tokens, and 3591 + `max_gen_toks` 512 overflows a 4096
+cap — 4 requests 400 and lm_eval then aborts the whole eval.
 
 Three things about scoring this model that will otherwise waste a run:
 
@@ -364,10 +376,11 @@ Three things about scoring this model that will otherwise waste a run:
 
 ## 8. Remaining work
 
-1. **Contexts beyond 2048.** The sparse k-pool path: a paged/ragged indexer that
-   reads pooled state from the KV cache instead of rebuilding pools densely each
-   step, wired into the sparse MLA backend. `model_ops/kpool_indexer.py` is its
-   correctness oracle and `Glm5NextIndexer` already holds the weights.
+1. ~~**Contexts beyond 2048.**~~ Done — `model_ops/glm5_next/kpool.py` implements
+   the paged/ragged pooled indexer and `Glm5NextIndexer` drives it; measured at
+   16-shot in §7. `model_ops/kpool_indexer.py` remains as the dense
+   `transformers`-parity oracle it was written to be, and is not on the serving
+   path.
 2. **`swiglu_limit` in the MoE** — either route to a backend that honours it or
    plumb it through the CK path (§6).
 3. **MTP draft layer** (checkpoint layer 45: `eh_proj` / `enorm` / `hnorm` /

@@ -483,5 +483,18 @@
     "accuracy_baseline": 0.9682,
     "accuracy_baseline_model": "zai-org/GLM-5.3-Flash",
     "_baseline_note": "Dense MLA at or below index_topk (2048): the k-pool indexer selects every token there, so dense is numerically identical. ATOM native gsm8k over all 1319 questions, chat + 3-shot fewshot_as_multiturn: flexible-extract=0.9682, strict-match=0.9689 (SGLang publishes 0.9704-0.9757 for this model). USE CHAT, NOT RAW COMPLETIONS, AND KEEP THE SHOTS: lm_eval's gsm8k filters assume the few-shot '#### N' convention while this model answers in markdown/LaTeX, so 0-shot chat scores strict-match=0.0000 on replies that are ~98% correct -- audit with \"is the gold value anywhere in the reply\" before believing any low score. num_fewshot stays at 3 while max-model-len is 2048: 5-shot multiturn plus the generation budget overflows it and every request 400s. Prefix caching is off because the KDA recurrent state is per-request. Threshold 0.94 leaves ~2.8pp headroom."
+  },
+  {
+    "model_name": "GLM-5.3-Flash-kpool-16shot",
+    "model_path": "zai-org/GLM-5.3-Flash",
+    "extraArgs": "--kv_cache_dtype bf16 -tp 8 --max-model-len 8192 --max-num-batched-tokens 8192 --max-num-seqs 32 --gpu-memory-utilization 0.85 --no-enable_prefix_caching",
+    "client_command": "lm_eval --model local-chat-completions --model_args model=${MODEL_PATH},base_url=http://localhost:8000/v1/chat/completions,num_concurrent=32,max_retries=3,tokenized_requests=False,max_gen_toks=512 --tasks gsm8k --num_fewshot 16 --batch_size 65 --apply_chat_template --fewshot_as_multiturn --output_path ${OUTPUT_PATH} --log_samples",
+    "env_vars": "",
+    "runner": "linux-atom-do-mi350x-8",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.94,
+    "accuracy_baseline": 0.9659,
+    "accuracy_baseline_model": "zai-org/GLM-5.3-Flash",
+    "_baseline_note": "Guards the POOLED (kpool) indexer path. 16-shot prompts run 2763-3591 tokens, so every one of the 1319 questions exceeds index_topk=2048 and pooled scoring plus pooled top-k decide what the model attends to. The GLM-5.3-Flash entry above does NOT cover this: at or below index_topk the indexer selects every token, attention_mla runs dense, and the pooled selection is computed but never used -- a short-context score only shows the pooled writes did no harm. Measured 2026-08-28: flexible-extract=0.9659, strict-match=0.9666, matching the 0.9682/0.9689 of the dense 3-shot entry within run-to-run spread (two runs of identical code disagree on ~28 of 1319 questions in each direction). Needs --max-model-len 8192, not 4096: lm_eval samples its shots at random, the longest prompt is 3591 tokens, and 3591 + max_gen_toks 512 overflows a 4096 cap -- 4 requests then 400 and lm_eval aborts the whole eval after its retries."
   }
 ]

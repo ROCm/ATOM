@@ -655,8 +655,13 @@ class ModelRunner:
 
         rope_parameters = getattr(self.hf_text_config, "rope_parameters", None) or {}
         self.use_mrope = "mrope_section" in rope_parameters
+        # A sparse indexer is orthogonal to whether the model is pure MLA or a
+        # linear/MLA hybrid: GLM-5.3-Flash is both hybrid and sparse, so gating
+        # this on `use_mla` alone would silently leave its index cache unbound.
         self.is_deepseek_v32 = (
-            hasattr(hf_config, "index_topk") if self.use_mla else False
+            hasattr(hf_config, "index_topk")
+            if (self.use_mla or self.use_kimi_mla)
+            else False
         )
         # Initialize profiler for this rank (before _setup_device_and_distributed
         # so that dp config fields are still at their original values)
