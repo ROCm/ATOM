@@ -2074,8 +2074,6 @@ class MLAAttention(nn.Module):
                     paged_kv_indices = self.sparse_kv_indices_buffer
                     paged_kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens[:B]
                 if self.dcp_world_size > 1:
-                    # Region lengths are the DCP filter's per-token cumsum, not
-                    # sparse_kv_indptr's uniform stride; B counts tokens on both.
                     paged_kv_indptr = self.dcp_sparse_kv_indptr_buffer[: B + 1]
 
             dp_size = get_dp_group().world_size
