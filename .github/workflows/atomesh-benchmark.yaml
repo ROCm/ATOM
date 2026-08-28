@@ -116,28 +116,20 @@ on:
         default: ''
         type: string
       atomesh_1p1d_nodes:
-        description: 'ATOMesh 1P1D node pair'
+        description: |
+          ATOMesh 1P1D node pair. Use "auto" for runner defaults, or comma-separated Slurm node names.
+          Examples: mia1-p02-g42,mia1-p02-g44 (amd-frameworks), mia1-p01-g43,mia1-p01-g36 (amd-tw).
+          single_node cases only use the first entry.
         required: false
         default: auto
-        type: choice
-        options:
-          - auto
-          - mia1-p02-g42,mia1-p02-g44
-          - mia1-p02-g42,mia1-p02-g47
-          - mia1-p02-g44,mia1-p02-g47
-          # single_node cases only use the first entry, so keep orderings that
-          # let any one of the three nodes be selected.
-          - mia1-p02-g47,mia1-p02-g44
-          - mia1-p01-g43,mia1-p01-g36
-          - mia1-p01-g36,mia1-p01-g43
+        type: string
       atomesh_2p1d_nodes:
-        description: 'ATOMesh 2P1D nodes'
+        description: |
+          ATOMesh 2P1D nodes. Use "auto" for runner defaults, or comma-separated Slurm node names.
+          Example: mia1-p02-g42,mia1-p02-g44,mia1-p02-g47
         required: false
         default: auto
-        type: choice
-        options:
-          - auto
-          - mia1-p02-g42,mia1-p02-g44,mia1-p02-g47
+        type: string
       benchmark_concurrency:
         description: 'Optional benchmark concurrency override, e.g. 1,2,4 (no quotes)'
         required: false
