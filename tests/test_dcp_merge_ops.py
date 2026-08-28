@@ -12,6 +12,11 @@ Plus the two pieces DCP query replication (QREP) rests on:
   * ``DCPConfig`` / ``qrep_unsupported_reason`` -- parsing and feasibility gating
   * ``ColumnParallelLinear.make_row_view``      -- the narrow q_proj for prefill
 
+And the gathered query-head width tables from ``atom/model_ops/attention_mla.py``
+-- same category as the QREP gate above: pure config-time functions whose wrong
+answer is a silently miscomputing kernel, not a crash. See the section comment
+further down for which widths are unsafe where.
+
 The merge is the load-bearing one. ``cp_lse_ag_out_rs`` reconstructs a global
 softmax from per-rank partial attentions, so the test here is not "the kernel
 runs" but "summing the corrected per-rank outputs reproduces plain dense
@@ -45,6 +50,16 @@ try:
     from aiter import dtypes
 
     from atom.config import QuantizationConfig
+    from atom.model_ops.attention_mla import (
+        _MLA_DCP_KERNEL_WIDTHS,
+        _MLA_DCP_KERNEL_WIDTHS_NON_PERSISTENT,
+        _MLA_DCP_KERNEL_WIDTHS_NON_PERSISTENT_FP8,
+        _MLA_DCP_SPARSE_PREFILL_WIDTHS,
+        _MLA_DCP_SPARSE_PREFILL_WIDTHS_PERSISTENT,
+        mla_dcp_kernel_num_heads,
+        mla_dcp_sparse_prefill_is_persistent,
+        mla_dcp_sparse_prefill_num_heads,
+    )
     from atom.model_ops.dcp_ops import (
         _dcp_a2a_pack_kernel,
         _dcp_a2a_unpack_combine_kernel,
@@ -1138,3 +1153,120 @@ def test_row_view_refuses_unhandled_scale_layout(tp_group):
         pytest.skip("per_1x32 not constructible in this build")
     with pytest.raises(NotImplementedError, match="per-output-channel scale"):
         layer.make_row_view(0, ROWS)
+
+
+# ────────────────────────────────────────────── gathered query-head widths ──
+#
+# Both DCP call sites all-gather Q on the head dim, so the width reaching the
+# kernel is ``num_heads * dcp_world_size``, not the per-rank count. Not every
+# width computes correctly there: gqa=64 is served only by the PERSISTENT decode
+# kernel (fp8/fp8 aborts on it, bf16 silently miscomputes), and fp8 has no gqa=32
+# kernel outside persistent mode either. So the width table has to be picked by
+# the mode the kernel actually runs in.
+#
+# The invariant under test is the PAIRING: whichever persistence predicate a call
+# site uses, the width it pads to must come from the matching table. Asserting a
+# predicate's current value instead would just have to be edited by whoever
+# legitimately enables persistent sparse prefill; the pairing keeps holding
+# across that change, which is the point.
+
+# Per-rank counts that put the GATHERED width on each interesting value: 8 heads
+# x dcp8 and 16 x dcp4 both land on 64, the width GLM-5.2 uses and the one that
+# is wrong outside persistent mode.
+HEAD_WIDTH_SHAPES = [(8, 2), (8, 4), (8, 8), (16, 2), (16, 4), (32, 4), (4, 8)]
+HEAD_WIDTH_MIN = 16
+
+
+@needs_dcp_ops
+@pytest.mark.parametrize("num_heads, dcp", HEAD_WIDTH_SHAPES)
+@pytest.mark.parametrize("dtype", ["bf16", "fp8"])
+def test_non_persistent_decode_never_dispatches_gqa64(num_heads, dcp, dtype):
+    """gqa=64 is wrong for BOTH dtypes without persistent mode."""
+    w = mla_dcp_kernel_num_heads(
+        num_heads, dcp, HEAD_WIDTH_MIN, kv_cache_dtype=dtype, persistent=False
+    )
+    assert w != 64, f"non-persistent {dtype} decode selected gqa=64 ({num_heads}x{dcp})"
+
+
+@needs_dcp_ops
+@pytest.mark.parametrize("num_heads, dcp", HEAD_WIDTH_SHAPES)
+def test_non_persistent_fp8_decode_also_skips_gqa32(num_heads, dcp):
+    """fp8 has no gqa=32 kernel outside persistent mode; bf16 does."""
+    w = mla_dcp_kernel_num_heads(
+        num_heads, dcp, HEAD_WIDTH_MIN, kv_cache_dtype="fp8", persistent=False
+    )
+    assert w != 32, f"non-persistent fp8 decode selected gqa=32 ({num_heads}x{dcp})"
+
+
+@needs_dcp_ops
+@pytest.mark.parametrize("num_heads, dcp", HEAD_WIDTH_SHAPES)
+@pytest.mark.parametrize("dtype", ["bf16", "fp8"])
+def test_decode_width_comes_from_the_matching_table(num_heads, dcp, dtype):
+    gathered = max(num_heads * dcp, HEAD_WIDTH_MIN)
+    for persistent in (False, True):
+        w = mla_dcp_kernel_num_heads(
+            num_heads, dcp, HEAD_WIDTH_MIN, kv_cache_dtype=dtype, persistent=persistent
+        )
+        if persistent:
+            allowed = _MLA_DCP_KERNEL_WIDTHS
+        else:
+            allowed = (
+                _MLA_DCP_KERNEL_WIDTHS_NON_PERSISTENT_FP8
+                if dtype == "fp8"
+                else _MLA_DCP_KERNEL_WIDTHS_NON_PERSISTENT
+            )
+        if gathered <= allowed[-1]:  # past the table it falls back and warns
+            assert (
+                w in allowed
+            ), f"{dtype} persistent={persistent}: {w} not in {allowed}"
+            assert w >= gathered, "width must cover the gathered heads"
+
+
+@needs_dcp_ops
+@pytest.mark.parametrize("rebuild", [False, True])
+@pytest.mark.parametrize("num_heads, dcp", HEAD_WIDTH_SHAPES)
+@pytest.mark.parametrize("dtype", ["bf16", "fp8"])
+def test_sparse_prefill_width_matches_its_own_persistence_predicate(
+    num_heads, dcp, dtype, rebuild
+):
+    """The pairing this whole file exists for.
+
+    The width must come from the table for the mode ``_forward_prefill_mla``
+    will actually run in -- which is NOT decode's mode, because the prefill work
+    metadata is only built on the fp8 branch. Reading decode's answer here is
+    exactly how a bf16 sparse prefill would get padded to gqa=64 and then run
+    non-persistent.
+    """
+    persistent = mla_dcp_sparse_prefill_is_persistent(
+        dtype, dcp, True, sparse_metadata_rebuild=rebuild
+    )
+    w = mla_dcp_sparse_prefill_num_heads(
+        num_heads, dcp, HEAD_WIDTH_MIN, persistent=persistent
+    )
+    allowed = (
+        _MLA_DCP_SPARSE_PREFILL_WIDTHS_PERSISTENT
+        if persistent
+        else _MLA_DCP_SPARSE_PREFILL_WIDTHS
+    )
+    gathered = max(num_heads * dcp, HEAD_WIDTH_MIN)
+    if gathered <= allowed[-1]:
+        assert w in allowed, f"persistent={persistent}: {w} not in {allowed}"
+        assert w >= gathered
+    if not persistent:
+        assert w != 64, "non-persistent sparse prefill must not dispatch gqa=64"
+
+
+@needs_dcp_ops
+def test_sparse_prefill_persistent_table_would_allow_gqa64():
+    """The persistent row is wired up, not dead.
+
+    Guards against the table being present but unreachable -- if enabling
+    persistent sparse prefill still could not pick 64, the plumbing would be
+    pointless and the 64->128 padding would stay.
+    """
+    assert (
+        mla_dcp_sparse_prefill_num_heads(8, 8, HEAD_WIDTH_MIN, persistent=True) == 64
+    ), "persistent sparse prefill should reach gqa=64, not pad past it"
+    assert (
+        mla_dcp_sparse_prefill_num_heads(8, 8, HEAD_WIDTH_MIN, persistent=False) == 128
+    )

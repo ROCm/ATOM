@@ -360,6 +360,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_CUSTOM_ALL_GATHER": lambda: (
         os.getenv("ATOM_USE_CUSTOM_ALL_GATHER", "1").lower() == "1"
     ),
+    # Pure-DP LM head strategy (only active when the model TP group is size 1 and
+    # the DP group is size > 1, i.e. pure DP attention on decode; every other
+    # case — TP>1, DP off, prefill, ragged/draft rows — auto-falls back to the
+    # replicated path via `_can_use_dp_sharded_head`):
+    #   "all2all"   -> shard vocab across the DP group + gather hidden, then a
+    #                  single all-to-all delivers each rank its own rows x full
+    #                  vocab (config ③, minimal comm). DEFAULT.
+    #   "allgather" -> same shard/gather, but vocab all-gather + scatter rows
+    #                  (config ②); kept for A/B and as a fallback.
+    #   "default"   -> replicated full-vocab GEMM per DP rank (big GEMM, no comm);
+    #                  explicit opt-out.
+    "ATOM_DP_LM_HEAD_MODE": lambda: os.getenv(
+        "ATOM_DP_LM_HEAD_MODE", "all2all"
+    ).lower(),
     "ATOM_USE_FLYDSL_GDR": lambda: os.getenv("ATOM_USE_FLYDSL_GDR", "0").lower() == "1",
     # Capture each declared draft pass into a per-captured-size CUDAGraph as it is
     # warmed, so the draft replays instead of relaunching every kernel. 0 drafts
