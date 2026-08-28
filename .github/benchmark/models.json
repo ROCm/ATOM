@@ -79,7 +79,7 @@
           "label": "Agentic MTP3",
           "suffix": "-agentic-mtp3",
           "bench_kind": "aiperf_agentic",
-          "extra_args": "--method mtp --num-speculative-tokens 3 --spec-decode-acceptance-rate 0.4966666667 --enable_prefix_caching --gpu-memory-utilization 0.9 --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384 --state-checkpoint-interval-tokens 8192 --level 3 --cudagraph-mode FULL",
+          "extra_args": "--method mtp --num-speculative-tokens 3 --spec-decode-acceptance-length 2.49 --enable_prefix_caching --gpu-memory-utilization 0.9 --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384 --state-checkpoint-interval-tokens 8192 --level 3 --cudagraph-mode FULL",
           "conc_min": 1,
           "conc_max": 48,
           "scenarios": [
@@ -91,7 +91,7 @@
           "suffix": "-agentic-dpa-mtp3",
           "bench_kind": "aiperf_agentic",
           "env_vars": "ATOM_DP_SESSION_AFFINITY=1\nATOM_DP_LB_REQ_EQUIV=512\nATOM_ENABLE_PREFILL_DELAYER=1\nATOM_PREFILL_DECODE_INTERVAL=10",
-          "extra_args": "--method mtp --num-speculative-tokens 3 --spec-decode-acceptance-rate 0.4966666667 --enable_prefix_caching --gpu-memory-utilization 0.9 --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384 --state-checkpoint-interval-tokens 8192 --level 3 --cudagraph-mode FULL --enable-dp-attention",
+          "extra_args": "--method mtp --num-speculative-tokens 3 --spec-decode-acceptance-length 2.49 --enable_prefix_caching --gpu-memory-utilization 0.9 --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384 --state-checkpoint-interval-tokens 8192 --level 3 --cudagraph-mode FULL --enable-dp-attention",
           "conc_min": 48,
           "conc_max": 256,
           "scenarios": [

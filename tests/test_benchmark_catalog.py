@@ -367,5 +367,8 @@ def test_dp_agentic_variant_carries_the_session_routing_env():
         # TBO is off on both: it needs GPU_MAX_HW_QUEUES/ATOM_NUMA_BIND to go
         # with it, and the recipe these variants mirror does not run it.
         assert "--enable-tbo" not in args, name
-        # Pinned so throughput is not read through a fluctuating accept rate.
-        assert "--spec-decode-acceptance-rate 0.4966666667" in args, name
+        # The golden AL, as the reference publishes it. Pinned so throughput is
+        # not read through a fluctuating accept rate, and kept in the AL unit
+        # rather than the equivalent rate so it matches the literal in
+        # InferenceX's dsv4_fp4_mi355x_atom_mtp.sh.
+        assert "--spec-decode-acceptance-length 2.49" in args, name
