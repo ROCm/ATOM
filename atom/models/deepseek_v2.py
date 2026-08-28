@@ -1606,6 +1606,9 @@ def sparse_attn_indexer(
         weights_out = torch.empty(
             weights.shape, device=weights.device, dtype=torch.float32
         )
+        extra = (
+            {"compute_all_q_rope": True} if get_dcp_world_size() > 1 else {}
+        )
         indexer_qk_rope_quant_and_cache(
             q_bf16,
             q_fp8,
@@ -1625,6 +1628,7 @@ def sparse_attn_indexer(
             weights_scale,
             preshuffle=True,
             is_neox=is_neox_style,
+            **extra,
         )
         weights = weights_out
     else:
@@ -2321,14 +2325,10 @@ class Indexer(nn.Module):
         # rope q (1/pcp) and k (full) separately. The op then scores 1/pcp
         # queries against the gathered full KV and writes the full k-cache.
         pcp = _pcp_active()
-        # DCP must also take the unfused path: the fused q-rope/quant+cache op is
-        # driven by slot_mapping, which is -1 on every rank that does not own the
-        # current token, so those ranks skip it entirely and leave q_fp8 /
-        # weights_out uninitialized. Only the owner rank ends up with a valid
-        # query -- invisible while ctx <= index_topk (top-k selects everything
-        # anyway), garbage beyond it.
-        dcp = get_dcp_world_size() > 1
-        unfused_qk_rope = (not self.use_qk_rope_cache_fusion) or pcp or dcp
+        # With compute_all_q_rope, DCP uses the fused path even when this rank's
+        # slot is -1: Q/weights are produced on every rank, positions are clamped
+        # for padded rows, and only the owner rank writes K cache.
+        unfused_qk_rope = (not self.use_qk_rope_cache_fusion) or pcp
         positions_op = positions
         if unfused_qk_rope:
             q_pe, _ = torch.split(
