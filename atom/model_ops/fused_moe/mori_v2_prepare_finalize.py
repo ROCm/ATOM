@@ -48,6 +48,7 @@ from aiter.ops.flydsl.moe_common import GateMode
 
 import atom.model_ops.fused_moe.modular_kernel as mk
 from atom.model_ops.fused_moe.config import FusedMoEQuantConfig
+from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
 try:
@@ -540,11 +541,28 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         dispatch_ids = recv_idx
         dispatch_weights = recv_w
 
-        # num_local_tokens is left unset (expert_num_tokens=None): the grouped
-        # a8w4 path derives per-expert routing from the (already trimmed) global
-        # ids + expert_mask, exactly as test_moe_layer_ep.py does.
+        # The received-row count, for whoever needs it as a row mask.
+        #
+        # flydsl fused_moe does NOT: the grouped a8w4 path derives per-expert
+        # routing from the (already trimmed) global ids + expert_mask, and its
+        # kernels skip the tail past the device-side count on their own -- which
+        # is the whole correctness argument in _decode_recv_bound. So it stays
+        # None there, exactly as before.
+        #
+        # The Triton/gluon EP experts DO: ep_sort_routing hands this straight to
+        # _ep_gate_prep_scan_kernel, whose row mask is skipped entirely when it
+        # is None. The mori buffer always has M > R, so without it the garbage
+        # rows in [R, M) fold into the histogram as LIVE gates (on the rank
+        # owning global expert 0, a zeroed/stale id maps to local expert 0) and,
+        # under the scatter-fused combine, get delivered into staging slots
+        # belonging to real tokens. Silently wrong rather than an error.
+        #
+        # Capture-safe: a (1,) int32 device scalar, allocated once by the
+        # transport and re-zeroed per dispatch, so the pointer is stable across
+        # cudagraph capture/replay and nothing is read on the host.
         expert_tokens_meta = mk.ExpertTokensMetadata(
-            expert_num_tokens=None, expert_num_tokens_cpu=None
+            expert_num_tokens=(_total_recv_t if envs.ATOM_USE_TRITON_MOE else None),
+            expert_num_tokens_cpu=None,
         )
         return (
             dispatch_a1,
