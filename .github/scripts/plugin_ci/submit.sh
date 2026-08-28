@@ -268,6 +268,22 @@ write_slurm_cancel_helper "${JOB_ID}"
 set_slurm_job_log_paths "${JOB_ID}"
 monitor_slurm_job "${JOB_ID}"
 read_slurm_exit_code "${JOB_ID}"
+SLURM_STATUS_FILE="${LOG_ROOT}/slurm_job-${JOB_ID}/slurm-job.rc"
+if [[ "${SLURM_STATE}" == "unknown" && -s "${SLURM_STATUS_FILE}" ]]; then
+  batch_rc="$(tr -d '[:space:]' < "${SLURM_STATUS_FILE}")"
+  if [[ "${batch_rc}" =~ ^[0-9]+$ ]]; then
+    SLURM_JOB_RC="${batch_rc}"
+    SLURM_EXIT_CODE="${batch_rc}:0"
+    if [[ "${batch_rc}" -eq 0 ]]; then
+      SLURM_STATE="COMPLETED"
+    else
+      SLURM_STATE="FAILED"
+    fi
+    echo "Using batch script exit status because Slurm accounting is unavailable."
+  else
+    echo "WARNING: invalid batch script exit status: ${batch_rc}" >&2
+  fi
+fi
 SLURM_JOB_ACTIVE=0
 SBATCH_RC="${SLURM_JOB_RC}"
 echo "slurm_state=${SLURM_STATE}"
