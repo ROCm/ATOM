@@ -361,6 +361,11 @@ models:
             extra_args: "--decode-context-parallel-size 4 --cudagraph-mode FULL"
           env:
             common:
+              ATOMESH_AITER_INSTALL_PR: "1"
+              ATOMESH_AITER_REPO: "https://github.com/ROCm/aiter.git"
+              ATOMESH_AITER_GIT_REF: "refs/pull/5066/head"
+              ATOMESH_AITER_GIT_SHA: "ab2162f05b96416098c05882e41eb8373e4a92b2"
+              ATOMESH_AITER_MAX_JOBS: "16"
               ATOM_MLA_PAGE_SIZE: "1"
               ATOM_ONLINE_QUANT_STREAMING: "0"
               ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB: "2047"

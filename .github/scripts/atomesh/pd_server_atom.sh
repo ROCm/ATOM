@@ -286,6 +286,12 @@ host_name="$(hostname)"
 
 apply_prefixed_env "ATOMESH_ENV_" "${host_ip}"
 
+if [[ "${ATOMESH_AITER_INSTALL_PR:-0}" == "1" ]]; then
+  # Sourcing keeps the job-local virtualenv active for every server process.
+  # shellcheck source=install_aiter_pr.sh
+  source "${ATOMESH_SCRIPT_DIR}/install_aiter_pr.sh"
+fi
+
 IFS=',' read -r -a IP_ARRAY <<< "${IPADDRS}"
 
 prefill_args=()
@@ -385,6 +391,10 @@ build_server_cache_env() {
   cache_base="${ATOMESH_WORKER_CACHE_BASE:-${XDG_CACHE_HOME:-/tmp/atomesh-cache-${SLURM_JOB_ID:-local}-${NODE_RANK}}/workers}"
   cache_root="${cache_base}/${role}-${server_port}"
   mkdir -p "${cache_root}"/{home,xdg,torchinductor,triton,aiter/jit,flydsl}
+  if [[ -n "${ATOMESH_AITER_PREBUILT_JIT_DIR:-}" ]]; then
+    cp "${ATOMESH_AITER_PREBUILT_JIT_DIR}/module_cache.so" \
+      "${cache_root}/aiter/jit/module_cache.so"
+  fi
 
   out=(
     "HOME=${cache_root}/home"
