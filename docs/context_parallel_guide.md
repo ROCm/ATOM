@@ -263,10 +263,9 @@ existing TP ranks, so `world = tp` and `tp` must be divisible by `dcp`.
 > the ATOM server path is validated; the **vllm-atom plugin path is not yet
 > verified**.
 >
-> **DSA + DCP + MTP.** Speculative decode (MTP, `q > 1`) runs on both dense MLA
-> and sparse MLA / DSA under DCP on gfx950. Sparse layers verify at
-> `max_seqlen_q = 1` with one virtual row per draft position — see the DCP
-> Constraints & Compatibility table below.
+> **Not yet supported: DSA + DCP + MTP.** Speculative decode (MTP, `q > 1`) is
+> only available for dense MLA (gfx950); combining it with sparse attention under
+> DCP is rejected at runtime — see the DCP Constraints & Compatibility table below.
 
 ## When to use DCP
 
@@ -534,12 +533,11 @@ compacts its rank-local top-k. The rebuild consumes that layer's
 indptr, and work plan. This makes the persistent descriptors and the actual
 sparse regions agree without rebuilding metadata on shared layers.
 
-The implementation is scoped to native serving on gfx950 with page size 1.
-Every sparse row is a virtual q_len=1 row: decode has one per sequence, sparse
-prefill one per token, and MTP verify one per draft position, so all three
-build the work plan the same way. Unsupported paths (including gfx942 and
-plugin sparse DCP paths without the per-layer rebuild) remain non-persistent
-and round a gathered 64 up to **128**.
+The implementation is scoped to native, non-speculative serving on gfx950 with
+page size 1: decode is q_len=1, while sparse prefill is represented as per-token
+virtual q_len=1 rows. Unsupported paths (including gfx942 and plugin or
+speculative sparse DCP paths without the per-layer rebuild) remain
+non-persistent and round a gathered 64 up to **128**.
 
 **GLM-5.2 is the model that benefits**: 64 query heads at `-tp 8` is 8 per
 rank, so `-dcp 8` gathers exactly 64 and now dispatches the native persistent
@@ -552,94 +550,6 @@ capture, short decode, 7.7k-token sparse prefill/decode, and the full 1319
 GSM8K 5-shot set. Both topologies score **flexible-extract 0.9689 /
 strict-match 0.9666**. The TP8/DCP8 run also completes a 32-concurrent graph
 smoke with no traceback, HIP error, or engine failure.
-
-### DCP output-merge layout
-
-The LSE-corrected partial output is written directly in rank-major
-`[dcp × batch, local_heads, value_dim]` order. A dim-0 ReduceScatter therefore
-returns contiguous `[batch, local_heads, value_dim]` output without the two
-full-tensor `movedim(...).contiguous()` copies previously placed before and
-after the collective. This production path also skips materializing global LSE,
-which no caller consumed.
-
-On one MI355, the correction/layout stage at GLM-5.2's `H=64, D=512, DCP8`
-measured 13.0 us versus 15.5 us for the previous correction plus pre-RS copy at
-batch 1, 13.2 us versus 164.4 us at batch 16, and 417.2 us versus 866.1 us at
-8,192 rows. The numerical merge, empty-rank NaN scrub, CUDA graph path, and
-ReduceScatter result layout are unchanged.
-
-### Experimental GLM-5.2 replicated index cache
-
-Set `ATOM_DCP_REPLICATE_INDEX_CACHE=1` to keep the GLM-5.2 DSA index cache
-complete on every DCP rank. The main MLA KV cache remains round-robin sharded.
-Only the 21 `"full"` IndexShare layers allocate index rows; `"shared"` layers
-reuse the preceding full layer's top-k and persistent work plan.
-
-Each scheduler block's index page expands from `block_size` rank-local tokens
-to `block_size × dcp` global tokens. Every rank writes each new index K to that
-expanded page. Prefill then gathers the full K locally, and decode scores the
-global context and runs a single stable global top-k locally. Both the prefill
-index-K AllGather and decode candidate pack/AllGather/second-top-k are skipped.
-The existing ownership filter still partitions that global top-k into compact
-rank-local indices for the DCP-sharded MLA KV cache.
-
-The switch is off by default and stays native-only: `glm_moe_dsa`, DCP > 1,
-MLA page size 1, and no PCP or PP. PCP, PP, and RapidServe disaggregation fail
-fast at startup, as does any KV-transfer topology that cannot carry the widened
-index page — the accepted ones are standalone LMCache, standalone Mooncake
-(producer or consumer), and multi[Mooncake producer + LMCache offload]. MTP,
-GPU prefix caching, and CUDA graph replay use the same expanded-page lifetime
-and are supported.
-
-Replication trades index communication for cache capacity. For GLM-5.2 with
-78 MLA layers, 21 full index layers, block size 16, fp8 index width 144, and
-DCP8, index bytes per scheduler block increase from
-`78 × 16 × 144 = 179,712` to `21 × 16 × 8 × 144 = 387,072`.
-Including the unchanged MLA KV, total bytes per block rise from 898,560 to
-1,105,920 (+23.1%), so a fixed KV memory budget holds about 18.8% fewer blocks.
-At 2,048 global tokens this is about 3.16 MiB additional index storage per rank.
-
-**Validation** (TP8+DCP8, GLM-5.2-MXFP4, fp8 KV, no MTP): CUDA graph capture,
-short decode, an 8,192-input/128-output run at concurrency 16, and the full
-1,319-sample GSM8K 5-shot set all complete. Using the same lm-eval chat adapter,
-replicated index scores **0.9651 / 0.9621** (flexible/strict) versus the sharded
-index run's **0.9697 / 0.9697**; the 0.46/0.76-point difference is about
-0.7/1.1 combined standard errors and is not statistically significant. On the
-8K/128 benchmark,
-output throughput improves from 172.34 to 179.77 token/s (+4.3%), mean TPOT
-drops from 53.14 to 49.30 ms (-7.2%), and median ITL drops from 23.15 to
-19.43 ms (-16.1%). The fixed KV budget holds about 18.8% fewer blocks as
-described above.
-
-### LMCache compatibility
-
-The default sharded-index DCP layout is compatible with ATOM's
-`lmcache_offload` byte codec. LMCache stores each rank's local MLA/index shard;
-the connector uses `block_size × dcp` as the scheduler-visible virtual block,
-requires chunks to contain whole virtual blocks, includes DCP size in the PAGE
-namespace, and transfers the DSA index cache alongside MLA KV. Persistent sparse
-metadata is rebuilt after load and is not part of the stored byte payload.
-
-The replicated-index layout is compatible with the standalone
-`lmcache_offload` connector. Its opaque block payload contains all 78 local MLA
-KV shards plus the 21 compact, DCP-expanded full-index rows. PAGE namespace
-version 3 includes both the replicated-layout flag and the exact
-`indexer_types` schedule, so these objects cannot collide with old sharded
-objects or a different IndexShare mapping. Full-prompt hits are floored to a
-complete LMCache chunk after reserving the final token for recomputation;
-otherwise an 8,192-token hit becomes an invalid 8,191-token load and falls back
-to a full prefill.
-
-Only standalone `{"kv_connector":"lmcache_offload"}` is enabled in this
-experimental mode. PD connectors and a `multi` topology containing LMCache plus
-PD still fail fast because their transfer protocols have not been adapted to
-the expanded index pages.
-
-**Validated** (TP8+DCP8, 8,192-token prompt, fp8 KV): all eight ranks stored
-67.5 MiB each and subsequently restored 65.4 MiB/7,936 tokens with
-`status=ok`; TTFT fell from 5.87 s cold to 0.46 s with the remaining 256-token
-prefill. A repeated 20-sample GSM8K smoke completed 160/160 worker loads without
-fallback, traceback, or HIP error and kept flexible-extract accuracy at 0.95.
 
 **Kimi-K3 validated** (ATOM server, 8×MI355 gfx950, `-tp 8 -dcp 8`, fp8 KV, full 1319
 GSM8K 5-shot at 64 concurrency): **flexible-extract 0.9553 / strict-match
@@ -666,11 +576,9 @@ mask, so the intra-block mask has to be applied on global positions. This is
 handled by a dedicated **round-robin CP (`cprr`) MLA kernel**, selected
 automatically when DCP is on, `q > 1`, and the decode is causal.
 
-> **Dense and sparse MLA.** The `cprr` kernel above is the dense MLA (V3 / R1)
-> path. DSA / sparse MLA runs MTP under DCP through its own route: sparse layers
-> forward at `max_seqlen_q = 1`, one virtual row per draft position, each with
-> its own compacted rank-owned top-k, while dense layers keep the `q > 1`
-> metadata.
+> **Dense MLA only.** This applies to dense MLA (V3 / R1). **DSA / sparse MLA
+> (V3.2-Exp) does not support MTP under DCP yet** — sparse decode with `q > 1` is
+> rejected by an assert. Serve DSA + DCP without `--method mtp`.
 
 **Support matrix:**
 
@@ -747,7 +655,7 @@ contributing under DCP rather than collapsing back to single-token decode.
 | gathered head width 64 + fp8 KV | Native sparse / DSA prefill and q_len=1 decode on gfx950 rebuild persistent metadata per full IndexShare layer and run gqa64 directly; unsupported non-persistent paths still pad to 128 — see [Sparse DCP persistent attention and gqa=64](#sparse-dcp-persistent-attention-and-gqa64) |
 | speculative decode (MTP), dense MLA | Supported on **gfx950 only** (bf16/fp8, `num_speculative_tokens` 1–3); raises at startup on gfx942 |
 | speculative decode (DSpark), Kimi-K3 | Supported on gfx950; validated at `tp8 -dcp 8` with `num_speculative_tokens 2` |
-| speculative decode (MTP), sparse / DSA | Supported on **gfx950**; sparse layers verify per draft position at `max_seqlen_q = 1` while dense layers use the `q > 1` `cprr` path |
+| speculative decode (MTP), sparse / DSA | **Not supported** — sparse decode with `q > 1` under DCP is rejected by an assert |
 | vllm-atom plugin | Validated for dense MLA only; the sparse / DSA and Kimi-K3 plugin paths are not yet verified |
 | DCP + PCP | Independent dimensions (different phases); combined use not validated here |
 
