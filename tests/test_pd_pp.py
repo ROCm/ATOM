@@ -188,6 +188,43 @@ def test_mooncake_tcp_forces_transfer_engine_transport(monkeypatch):
     assert os.environ["MC_FORCE_TCP"] == "true"
 
 
+def test_mooncake_hip_disables_rdma_device_even_when_configured():
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    assert mc._select_ib_device("hip", "ionic_0", None) == ""
+    assert mc._select_ib_devices(" HIP ", "rdma0", None) == []
+
+
+def test_mooncake_hip_uses_nonempty_no_hca_engine_filter():
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    device_filter = mc._engine_device_filter("hip", [])
+    assert device_filter == mc.MOONCAKE_HIP_ONLY_DEVICE_FILTER
+    assert device_filter
+
+
+def test_mooncake_rdma_engine_filter_preserves_selected_hcas():
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    assert mc._engine_device_filter(
+        "rdma", ["ionic_4", "ionic_0"]
+    ) == "ionic_4,ionic_0"
+
+
+def test_mooncake_hip_clears_conflicting_transport_overrides(monkeypatch):
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    monkeypatch.setenv("MC_FORCE_TCP", "true")
+    monkeypatch.setenv("MC_DISABLE_HIP", "1")
+    mc._configure_mooncake_transport(" HIP ")
+    assert "MC_FORCE_TCP" not in os.environ
+    assert "MC_DISABLE_HIP" not in os.environ
+
+
 def test_mooncake_rdma_preserves_explicit_device():
     mc = pytest.importorskip(
         "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
