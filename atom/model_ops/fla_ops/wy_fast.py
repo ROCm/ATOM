@@ -91,7 +91,7 @@ def recompute_w_u_fwd_kernel(
         _p_u_1 = (i_v * BV) + tl.arange(0, BV)
         tl.store(
             u + (bos * H + i_h) * V + _p_u_0[:, None] * (H * V) + _p_u_1[None, :] * (1),
-            b_u.to(u + (bos * H + i_h) * V.dtype.element_ty),
+            b_u.to(u.dtype.element_ty),
             mask=(_p_u_0[:, None] < (T)) & (_p_u_1[None, :] < (V)),
         )
 
@@ -112,7 +112,7 @@ def recompute_w_u_fwd_kernel(
         _p_w_1 = (i_k * BK) + tl.arange(0, BK)
         tl.store(
             w + (bos * H + i_h) * K + _p_w_0[:, None] * (H * K) + _p_w_1[None, :] * (1),
-            b_w.to(w + (bos * H + i_h) * K.dtype.element_ty),
+            b_w.to(w.dtype.element_ty),
             mask=(_p_w_0[:, None] < (T)) & (_p_w_1[None, :] < (K)),
         )
 

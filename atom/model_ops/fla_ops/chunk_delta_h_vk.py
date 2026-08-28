@@ -150,7 +150,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_vk(
         _p_h1_1 = (0) + tl.arange(0, 64)
         tl.store(
             h + i_t * stride_h + _p_h1_0[:, None] * (K) + _p_h1_1[None, :] * (1),
-            b_h1.to(h + i_t * stride_h.dtype.element_ty),
+            b_h1.to(h.dtype.element_ty),
             mask=(_p_h1_0[:, None] < (V)) & (_p_h1_1[None, :] < (K)),
         )
         if K > 64:
@@ -158,7 +158,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_vk(
             _p_h2_1 = (64) + tl.arange(0, 64)
             tl.store(
                 h + i_t * stride_h + _p_h2_0[:, None] * (K) + _p_h2_1[None, :] * (1),
-                b_h2.to(h + i_t * stride_h.dtype.element_ty),
+                b_h2.to(h.dtype.element_ty),
                 mask=(_p_h2_0[:, None] < (V)) & (_p_h2_1[None, :] < (K)),
             )
         if K > 128:
@@ -166,7 +166,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_vk(
             _p_h3_1 = (128) + tl.arange(0, 64)
             tl.store(
                 h + i_t * stride_h + _p_h3_0[:, None] * (K) + _p_h3_1[None, :] * (1),
-                b_h3.to(h + i_t * stride_h.dtype.element_ty),
+                b_h3.to(h.dtype.element_ty),
                 mask=(_p_h3_0[:, None] < (V)) & (_p_h3_1[None, :] < (K)),
             )
         if K > 192:
@@ -174,7 +174,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_vk(
             _p_h4_1 = (192) + tl.arange(0, 64)
             tl.store(
                 h + i_t * stride_h + _p_h4_0[:, None] * (K) + _p_h4_1[None, :] * (1),
-                b_h4.to(h + i_t * stride_h.dtype.element_ty),
+                b_h4.to(h.dtype.element_ty),
                 mask=(_p_h4_0[:, None] < (V)) & (_p_h4_1[None, :] < (K)),
             )
 

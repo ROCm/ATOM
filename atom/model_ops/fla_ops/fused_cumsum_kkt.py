@@ -61,7 +61,7 @@ def _fused_cumsum_kkt_kernel(
     _p_g_out_0 = (i_t * BT) + tl.arange(0, BT)
     tl.store(
         g_cumsum_ptr + bos * H + i_h + _p_g_out_0 * (H),
-        b_g_cumsum.to(g_cumsum_ptr + bos * H + i_h.dtype.element_ty),
+        b_g_cumsum.to(g_cumsum_ptr.dtype.element_ty),
         mask=(_p_g_out_0 < (T_seq)),
     )
 
