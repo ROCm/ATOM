@@ -225,7 +225,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the record buffer fills).  Rollback becomes a cursor move.
     # See atom/model_ops/fla_ops/replayssm.py.
     "ATOM_ENABLE_REPLAYSSM": lambda: (
-        os.getenv("ATOM_ENABLE_REPLAYSSM", "0").lower() == "1"
+        None
+        if os.getenv("ATOM_ENABLE_REPLAYSSM") is None
+        else os.getenv("ATOM_ENABLE_REPLAYSSM", "0").lower() == "1"
     ),
     # Record-buffer depth L.  Must be >= 2*(mtp_k+1); raised automatically if
     # set too low.  Larger L means fewer checkpoint write-backs but a longer

@@ -171,7 +171,13 @@ class GDNStateMixin:
         # --- ReplaySSM ------------------------------------------------------
         # The verify window is mtp_k+1 tokens (anchor + drafts); the record
         # buffer has to hold two of them for the early-flush invariant.
-        self.replayssm = envs.ATOM_ENABLE_REPLAYSSM
+        # Default to whatever speculative decoding is doing: ReplaySSM pays for
+        # itself when there are drafts to roll back, and does not when there
+        # are none.  `ATOM_ENABLE_REPLAYSSM` overrides in either direction.
+        replayssm_override = envs.ATOM_ENABLE_REPLAYSSM
+        self.replayssm = (
+            self.use_spec_decode if replayssm_override is None else replayssm_override
+        )
         self.replayssm_max_query_len = self.num_spec + 1
         self.replayssm_route = envs.ATOM_REPLAYSSM_ROUTE
         self.replayssm_cache_len = 0
@@ -188,13 +194,27 @@ class GDNStateMixin:
                     self.replayssm_cache_len,
                 )
             logger.info(
-                "ReplaySSM enabled for linear attention: cache_len=%d, "
+                "ReplaySSM enabled for linear attention (%s): cache_len=%d, "
                 "route=%s, verify window=%d (1 state slot per request instead "
                 "of %d).",
+                (
+                    "ATOM_ENABLE_REPLAYSSM=1"
+                    if replayssm_override
+                    else "default, speculative decoding is on"
+                ),
                 self.replayssm_cache_len,
                 self.replayssm_route,
                 self.replayssm_max_query_len,
                 self.num_spec + 1,
+            )
+        else:
+            logger.info(
+                "ReplaySSM disabled for linear attention (%s).",
+                (
+                    "ATOM_ENABLE_REPLAYSSM=0"
+                    if replayssm_override is not None
+                    else "default, no speculative decoding"
+                ),
             )
 
         self.spec_state_indices_tensor = CpuGpuBuffer(
