@@ -78,6 +78,23 @@ multi-turn sessions, so the whole workload degrades to cold prefill.
 
 ## Client
 
+The environment matters as much as the flags — AIPerf reads these directly, and
+two of the timeouts are what let a long agentic replay finish at all:
+
+```bash
+export AIPERF_HTTP_TCP_USER_TIMEOUT=900000
+export AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT=300
+export AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES=0
+export AIPERF_DATASET_CONFIGURATION_TIMEOUT=1800
+export AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT=1800
+export AIPERF_UI_REALTIME_METRICS_ENABLED=true
+
+# DP-attention runs only. Sessions are sticky: without this the correlation id
+# does not travel with the request, a conversation's turns scatter across DP
+# ranks, and each turn misses the prefix KV the previous one wrote.
+export AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID=true
+```
+
 ```bash
 aiperf profile --scenario inferencex-agentx-mvp \
   --url http://localhost:$PORT --endpoint /v1/chat/completions \
