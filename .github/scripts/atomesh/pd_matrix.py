@@ -297,7 +297,12 @@ def build_cell(
                 f"{required_nodes} node(s)"
             )
         nodes = nodes[:required_nodes]
-    elif nodes and len(nodes) < required_nodes or not nodes and not allow_auto_nodes:
+    elif nodes and len(nodes) < required_nodes:
+        raise ValueError(
+            f"{suite_cfg.get('name', model_name)} needs at least "
+            f"{required_nodes} node(s)"
+        )
+    elif not nodes and not allow_auto_nodes:
         raise ValueError(
             f"{suite_cfg.get('name', model_name)} needs at least "
             f"{required_nodes} node(s)"
