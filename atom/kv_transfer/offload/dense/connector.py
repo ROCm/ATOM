@@ -443,11 +443,7 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         hit = int(hit)
         if hit == num_prompt:  # full-prompt hit → recompute last token
             hit -= 1
-        # The raw-byte connector transfers whole LMCache chunks, and the worker
-        # treats a short load as a failed one. Ask for the largest complete
-        # prefix and recompute the tail, rather than lose the whole prefix.
-        hit = self._chunk_floor(hit)
-        self._hit_save_floors[sid] = hit
+        self._hit_save_floors[sid] = self._chunk_floor(hit)
         need = hit - int(seq.num_cached_tokens)
         if need <= 0:
             if self._lookup_client is not None:
