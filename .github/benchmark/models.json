@@ -81,9 +81,9 @@
           "bench_kind": "aiperf_agentic",
           "extra_args": "--method mtp --num-speculative-tokens 3 --spec-decode-acceptance-length 2.49 --enable_prefix_caching --gpu-memory-utilization 0.9 --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384 --state-checkpoint-interval-tokens 8192 --level 3 --cudagraph-mode FULL",
           "conc_min": 1,
-          "conc_max": 48,
+          "conc_max": 16,
           "scenarios": [
-            {"isl": 262144, "osl": 1024, "concurrency": [1, 2, 8, 16, 32, 48, 64, 128, 256], "random_range_ratio": 0.8}
+            {"isl": 262144, "osl": 1024, "concurrency": [1, 2, 8, 16, 48, 64, 96, 128, 256], "random_range_ratio": 0.8}
           ]
         },
         {
@@ -95,7 +95,7 @@
           "conc_min": 48,
           "conc_max": 256,
           "scenarios": [
-            {"isl": 262144, "osl": 1024, "concurrency": [1, 2, 8, 16, 32, 48, 64, 128, 256], "random_range_ratio": 0.8}
+            {"isl": 262144, "osl": 1024, "concurrency": [1, 2, 8, 16, 48, 64, 96, 128, 256], "random_range_ratio": 0.8}
           ]
         }
       ]

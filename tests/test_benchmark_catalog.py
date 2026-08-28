@@ -308,11 +308,12 @@ def test_agentic_variants_carry_what_the_recipe_requires():
         c["conc"] for c in agentic if "--enable-dp-attention" not in c["server_args"]
     }
     assert dpa and plain, "expected both a TP band and a DPA band"
-    # Small concurrency on TP, large on DPA, and they must OVERLAP by at least
-    # one point: without a concurrency both run, the two curves are measured on
-    # disjoint workloads and no DP-vs-TP comparison is possible anywhere.
-    assert plain & dpa, f"bands are disjoint: TP {sorted(plain)}, DPA {sorted(dpa)}"
-    assert min(plain) < min(dpa) and max(plain) < max(dpa)
+    # Small concurrency on TP, large on DPA. The bands are contiguous rather
+    # than overlapping: DP takes over from 48 up, so a sweep spends no cell
+    # measuring the same concurrency twice. The cost is that no future run
+    # compares the two modes head to head at one concurrency -- that comparison
+    # exists only in already-measured data.
+    assert max(plain) < min(dpa), f"bands cross: TP {sorted(plain)}, DPA {sorted(dpa)}"
 
 
 def test_param_lists_does_not_overwrite_an_agentic_workload():
