@@ -438,71 +438,34 @@ if [ "$TYPE" == "benchmark" ]; then
     PROFILE_ARG="--profile"
     echo "Profiling enabled via --profile flag"
   fi
-  # Build the benchmark command as an array so the printed command is exactly
-  # what runs (no echo/cmd drift). $PROFILE_ARG and $BENCH_EXTRA_ARGS stay
-  # unquoted so they word-split into 0+ args, matching the previous behavior.
-  # `aiperf_agentic` replays AgentX session traces instead of the random
-  # ISL/OSL sweep. The runner is shared with the ATOMesh pipeline so both
-  # publish the same fields; see .github/scripts/aiperf_agentic.sh.
   if [ "$BENCH_KIND" == "aiperf_agentic" ]; then
+    # Replays AgentX session traces instead of the random ISL/OSL sweep.
+    # `agentic_prepare` sets AGENTIC_OUT_DIR and BENCH_MAX_MIN.
     # shellcheck source=aiperf_agentic.sh
     source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/aiperf_agentic.sh"
-    export BENCHMARK_KIND="aiperf_agentic"
-    export MODEL_NAME="${MODEL_NAME:-$MODEL_PATH}"
-    export TOPOLOGY="${TOPOLOGY:-single-node}"
-    if [[ "${SERVER_ARGS:-}" == *"--enable-dp-attention"* ]]; then
-      export DISPLAY_TOPOLOGY="${DISPLAY_TOPOLOGY:-single-node-dpa}"
-      # Session affinity headers. ATOM's DPA router reads `x-dynamo-session-id`
-      # (falling back to `x-correlation-id`, which AIPerf always sends) and
-      # `x-dynamo-parent-session-id` -- see `_get_dp_session_affinity_ids` in
-      # atom/entrypoints/openai/api_server.py. Only the Dynamo option sends the
-      # PARENT id, which is what carries the lineage of a forked agent tree; the
-      # generic `X-Session-ID` one sends a header ATOM does not read at all, and
-      # is kept only in case a router is ever put in front.
-      export AIPERF_HTTP_X_DYNAMO_SESSION_ID_FROM_CORRELATION_ID=true
-      export AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID=true
-    else
-      export DISPLAY_TOPOLOGY="${DISPLAY_TOPOLOGY:-single-node}"
-      unset AIPERF_HTTP_X_DYNAMO_SESSION_ID_FROM_CORRELATION_ID
-      unset AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID
-    fi
-    AGENTIC_OUT_DIR="${AGENTIC_OUT_DIR:-./aiperf-artifacts-c${CONC}}"
-    ensure_aiperf
-    # The replay is only part of the wall clock, and the rest is not small: on a
-    # c=48 cell, dataset configuration plus the warmup that primes every lane's
-    # prefix cache took 23.5 min BEFORE profiling started, and warmup scales with
-    # the lane count. Both bracketing phases carry their own 1800s timeouts, so
-    # budget 90 min around the replay rather than let this supervisor cut a
-    # healthy run. Must stay BELOW the workflow step's `timeout-minutes`, so that
-    # an overrun is killed here -- with a reason in the log -- rather than by the
-    # runner, which takes the whole step down silently.
-    BENCH_MAX_MIN=$(( AIPERF_BENCHMARK_DURATION / 60 + 90 ))
-    echo "Agentic replay: ${AIPERF_BENCHMARK_DURATION}s at concurrency ${CONC}"
-    echo "  scenario=${AIPERF_SCENARIO} dataset=${AIPERF_PUBLIC_DATASET}"
-    echo "  artifacts=${AGENTIC_OUT_DIR} drain budget=${BENCH_MAX_MIN}min"
-    if (( AIPERF_BENCHMARK_DURATION < 900 )); then
-      echo "  WARNING: below the scenario's 900s floor -- --unsafe-override is"
-      echo "           active and results carry submission_valid=false."
-    fi
+    agentic_prepare
   else
     BENCH_MAX_MIN=60
-  BENCH_CMD=(
-    python -m atom.benchmarks.benchmark_serving
-    --model="$MODEL_PATH" --backend=vllm --base-url="http://localhost:${ATOM_SERVER_PORT}"
-    --dataset-name=random
-    --random-input-len="$ISL" --random-output-len="$OSL" --random-range-ratio="$RANDOM_RANGE_RATIO"
-    --max-concurrency="$CONC"
-    --num-prompts="${NUM_PROMPTS_OVERRIDE:-$(( CONC * 10 ))}"
-    --trust-remote-code
-    --num-warmups="$(( CONC * 2 ))"
-    --request-rate=inf --ignore-eos
-    --save-result --percentile-metrics="ttft,tpot,itl,e2el"
-    --result-dir=. --result-filename="${RESULT_FILENAME}.json"
-    $PROFILE_ARG ${BENCH_EXTRA_ARGS:-}
-  )
-  echo "Benchmark command:"
-  printf '%q ' "${BENCH_CMD[@]}"
-  echo
+    # Build the benchmark command as an array so the printed command is exactly
+    # what runs (no echo/cmd drift). $PROFILE_ARG and $BENCH_EXTRA_ARGS stay
+    # unquoted so they word-split into 0+ args, matching the previous behavior.
+    BENCH_CMD=(
+      python -m atom.benchmarks.benchmark_serving
+      --model="$MODEL_PATH" --backend=vllm --base-url="http://localhost:${ATOM_SERVER_PORT}"
+      --dataset-name=random
+      --random-input-len="$ISL" --random-output-len="$OSL" --random-range-ratio="$RANDOM_RANGE_RATIO"
+      --max-concurrency="$CONC"
+      --num-prompts="${NUM_PROMPTS_OVERRIDE:-$(( CONC * 10 ))}"
+      --trust-remote-code
+      --num-warmups="$(( CONC * 2 ))"
+      --request-rate=inf --ignore-eos
+      --save-result --percentile-metrics="ttft,tpot,itl,e2el"
+      --result-dir=. --result-filename="${RESULT_FILENAME}.json"
+      $PROFILE_ARG ${BENCH_EXTRA_ARGS:-}
+    )
+    echo "Benchmark command:"
+    printf '%q ' "${BENCH_CMD[@]}"
+    echo
   fi
   # Background the benchmark + tee pipeline in its own process group so
   # wait_infer_drain.sh can supervise the engine in the foreground and

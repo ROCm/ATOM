@@ -83,6 +83,57 @@ aiperf_unsafe_args() {
   fi
 }
 
+# agentic_prepare
+#
+# Everything a single-node agentic cell needs before the replay: the labels the
+# dashboard payload carries, the session-affinity headers, the aiperf install,
+# and the supervision budget. Sets AGENTIC_OUT_DIR and BENCH_MAX_MIN for the
+# caller. Kept here rather than in the driver so the topology knowledge lives
+# with the runner that acts on it.
+agentic_prepare() {
+  export BENCHMARK_KIND="aiperf_agentic"
+  export MODEL_NAME="${MODEL_NAME:-$MODEL_PATH}"
+  export TOPOLOGY="${TOPOLOGY:-single-node}"
+
+  if [[ "${SERVER_ARGS:-}" == *"--enable-dp-attention"* ]]; then
+    export DISPLAY_TOPOLOGY="${DISPLAY_TOPOLOGY:-single-node-dpa}"
+    # Session affinity. ATOM's DPA router reads `x-dynamo-session-id` (falling
+    # back to `x-correlation-id`, which AIPerf always sends) and
+    # `x-dynamo-parent-session-id` -- see `_get_dp_session_affinity_ids` in
+    # atom/entrypoints/openai/api_server.py. Only the Dynamo option sends the
+    # PARENT id, which carries a forked agent tree's lineage; the generic
+    # `X-Session-ID` one sends a header ATOM does not read, kept in case a
+    # router is ever put in front.
+    export AIPERF_HTTP_X_DYNAMO_SESSION_ID_FROM_CORRELATION_ID=true
+    export AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID=true
+  else
+    export DISPLAY_TOPOLOGY="${DISPLAY_TOPOLOGY:-single-node}"
+    unset AIPERF_HTTP_X_DYNAMO_SESSION_ID_FROM_CORRELATION_ID
+    unset AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID
+  fi
+
+  AGENTIC_OUT_DIR="${AGENTIC_OUT_DIR:-./aiperf-artifacts-c${CONC}}"
+  ensure_aiperf
+
+  # The replay is only part of the wall clock, and the rest is not small: on a
+  # c=48 cell, dataset configuration plus the warmup that primes every lane's
+  # prefix cache took 23.5 min BEFORE profiling started, and warmup scales with
+  # the lane count. Both bracketing phases carry their own 1800s timeouts, so
+  # budget 90 min around the replay rather than let the drain supervisor cut a
+  # healthy run. Must stay BELOW the workflow step's `timeout-minutes`, so an
+  # overrun is killed there -- with a reason in the log -- rather than by the
+  # runner, which takes the whole step down silently.
+  BENCH_MAX_MIN=$(( AIPERF_BENCHMARK_DURATION / 60 + 90 ))
+
+  echo "Agentic replay: ${AIPERF_BENCHMARK_DURATION}s at concurrency ${CONC}"
+  echo "  scenario=${AIPERF_SCENARIO} dataset=${AIPERF_PUBLIC_DATASET}"
+  echo "  artifacts=${AGENTIC_OUT_DIR} drain budget=${BENCH_MAX_MIN}min"
+  if (( AIPERF_BENCHMARK_DURATION < 900 )); then
+    echo "  WARNING: below the scenario's 900s floor -- --unsafe-override is"
+    echo "           active and results carry submission_valid=false."
+  fi
+}
+
 # run_aiperf_agentic <url> <conc> <out_dir> [server_metrics_url ...]
 #
 # One replay against one endpoint. The caller owns the topology: it decides the
