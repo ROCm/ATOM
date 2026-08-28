@@ -124,9 +124,14 @@ def remap_qwen35_quant_config_for_sglang_plugin(atom_config: Any) -> None:
 
 
 def apply_prepare_model_adaptations(atom_config: Any, model_arch: str) -> None:
-    if model_arch == "Qwen3_5MoeForConditionalGeneration":
+    if model_arch in {
+        "Qwen3_5MoeForCausalLM",
+        "Qwen3_5MoeForConditionalGeneration",
+    }:
         _patch_qwen35_moe_text_for_sparse_moe_block(atom_config.hf_config)
     if model_arch in {
+        "Qwen3_5ForCausalLM",
+        "Qwen3_5MoeForCausalLM",
         "Qwen3_5ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
     }:

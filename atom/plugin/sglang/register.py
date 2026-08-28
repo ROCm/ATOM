@@ -1,6 +1,16 @@
 import logging
 import os
 
+from atom.plugin.sglang.models.kimi_k3_processor import (
+    register_kimi_k3_text_only_processor,
+)
+from atom.plugin.sglang.patches.prefill_compile_only_patch import (
+    apply_prefill_compile_only_patch,
+)
+from atom.plugin.sglang.patches.triton_kernel_retention_patch import (
+    apply_triton_kernel_retention_patch,
+)
+
 logger = logging.getLogger("atom.plugin.sglang.register")
 
 
@@ -119,17 +129,39 @@ def _install_decode_graph_forward_context_patch() -> None:
     DecodeCudaGraphRunner._atom_forward_context_patched = True
 
 
+def _register_tc_piecewise_attention_split_ops() -> None:
+    """Keep ATOM attention kernels outside captured piecewise subgraphs."""
+
+    from sglang.srt.compilation.compilation_config import SPLIT_OPS
+
+    # Qwen3.5 uses native returning ops for dynamic compile-only prefill and
+    # decode CUDA Graphs. Padded piecewise prefill keeps graph-stable mutating
+    # ops. Both variants must remain split boundaries so per-batch attention
+    # metadata stays live.
+    for op_name in (
+        "aiter.unified_attention_with_output_base",
+        "aiter.unified_attention_with_output_base.default",
+        "aiter.linear_attention_with_output_base",
+        "aiter.linear_attention_with_output_base.default",
+        "aiter.sglang_qwen35_attention_with_stable_output",
+        "aiter.sglang_qwen35_attention_with_stable_output.default",
+        "aiter.sglang_qwen35_linear_attention_with_stable_output",
+        "aiter.sglang_qwen35_linear_attention_with_stable_output.default",
+    ):
+        if op_name not in SPLIT_OPS:
+            SPLIT_OPS.append(op_name)
+
+
 def register_plugin() -> None:
     """Install ATOM patches that must run before SGLang parses server args."""
 
     _ensure_aiter_gpu_archs_env()
     _install_model_config_quant_patch()
     _install_loader_quant_patch()
+    _register_tc_piecewise_attention_split_ops()
     _install_decode_graph_forward_context_patch()
-    from atom.plugin.sglang.models.kimi_k3_processor import (
-        register_kimi_k3_text_only_processor,
-    )
-
+    apply_prefill_compile_only_patch()
+    apply_triton_kernel_retention_patch()
     register_kimi_k3_text_only_processor()
 
     try:

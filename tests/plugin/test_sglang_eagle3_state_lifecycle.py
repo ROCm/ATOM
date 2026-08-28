@@ -31,7 +31,7 @@ def _load_bridge_with_fake_modules(monkeypatch, eagle_cls, future_map_cls):
     monkeypatch.setitem(sys.modules, "sglang.srt.speculative.eagle_info", eagle_mod)
 
     bridge_path = (
-        Path(__file__).resolve().parents[1]
+        Path(__file__).resolve().parents[2]
         / "atom"
         / "plugin"
         / "sglang"
@@ -78,3 +78,67 @@ def test_v0517_filter_batch_reorders_plugin_state_for_same_length_permutation(
 
     assert draft_input.topk_index.squeeze(-1).tolist() == [2, 0, 1]
     assert draft_input._atom_sglang_eagle3_num_reject_tokens.tolist() == [30, 10, 20]
+
+
+def test_pool_future_store_skips_eagle_state_for_ordinary_payload(monkeypatch):
+    stash_calls = []
+
+    class FutureMap:
+        req_pool_size = 4
+        device = torch.device("cpu")
+
+        def stash(self, future_indices, payload):
+            stash_calls.append((future_indices, payload))
+            return "stored"
+
+        def _resolve_spec_extras(self, batch):
+            return batch
+
+    class EagleDraftInput:
+        def filter_batch(self, new_indices, new_indices_cpu=None):
+            return None
+
+        def merge_batch(self, spec_info):
+            return None
+
+    bridge = _load_bridge_with_fake_modules(monkeypatch, EagleDraftInput, FutureMap)
+    bridge._patch_sglang_eagle3_state_lifecycle()
+
+    future_map = FutureMap()
+    indices = torch.tensor([1], dtype=torch.long)
+    payload = types.SimpleNamespace()
+
+    assert future_map.stash(indices, payload) == "stored"
+    assert stash_calls == [(indices, payload)]
+    assert not hasattr(future_map, "_atom_eagle3_reject_tokens_buf")
+
+
+def test_pool_future_store_preserves_eagle_state(monkeypatch):
+    class FutureMap:
+        req_pool_size = 4
+        device = torch.device("cpu")
+
+        def stash(self, future_indices, payload):
+            return "stored"
+
+        def _resolve_spec_extras(self, batch):
+            return batch
+
+    class EagleDraftInput:
+        def filter_batch(self, new_indices, new_indices_cpu=None):
+            return None
+
+        def merge_batch(self, spec_info):
+            return None
+
+    bridge = _load_bridge_with_fake_modules(monkeypatch, EagleDraftInput, FutureMap)
+    bridge._patch_sglang_eagle3_state_lifecycle()
+
+    future_map = FutureMap()
+    indices = torch.tensor([1, 3], dtype=torch.long)
+    payload = types.SimpleNamespace(
+        _atom_sglang_eagle3_num_reject_tokens=torch.tensor([2, 1], dtype=torch.int32)
+    )
+
+    assert future_map.stash(indices, payload) == "stored"
+    assert future_map._atom_eagle3_reject_tokens_buf.tolist() == [0, 2, 0, 1]

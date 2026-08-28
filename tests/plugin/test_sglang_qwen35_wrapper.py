@@ -9,6 +9,7 @@ from contextlib import nullcontext
 from types import ModuleType
 from unittest.mock import patch
 
+import pytest
 import torch
 
 
@@ -108,6 +109,7 @@ def _make_fake_modules() -> dict[str, ModuleType]:
             "atom.plugin.sglang.runtime",
             SGLangForwardBatchMetadata=object,
             SGLangPluginRuntime=object,
+            get_model_arch_spec=lambda _arch: _Obj(bind_cache_views=None),
             plugin_runtime_scope=lambda **_kwargs: nullcontext(),
         ),
         "atom.plugin.sglang.models.base_model_wrapper": _module(
@@ -142,7 +144,14 @@ def test_qwen35_bf16_mapping_uses_fused_in_proj_layout():
     assert "in_proj_ba" not in remapped
 
 
-def test_qwen35_prepare_adaptations_remap_quant_config():
+@pytest.mark.parametrize(
+    "model_arch",
+    [
+        "Qwen3_5MoeForCausalLM",
+        "Qwen3_5MoeForConditionalGeneration",
+    ],
+)
+def test_qwen35_prepare_adaptations_remap_quant_config(model_arch):
     with patch.dict(sys.modules, _make_fake_modules()):
         sys.modules.pop("atom.plugin.sglang.models.qwen3_5", None)
         module = importlib.import_module("atom.plugin.sglang.models.qwen3_5")
@@ -165,9 +174,7 @@ def test_qwen35_prepare_adaptations_remap_quant_config():
             ),
         )
 
-        module.apply_prepare_model_adaptations(
-            atom_config, "Qwen3_5MoeForConditionalGeneration"
-        )
+        module.apply_prepare_model_adaptations(atom_config, model_arch)
 
     assert text_config.n_shared_experts == 1
     assert text_config.n_routed_experts == 256
