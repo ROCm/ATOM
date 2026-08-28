@@ -91,32 +91,27 @@ python3 -m pip install --upgrade --force-reinstall --no-deps \
 AITER_USE_SYSTEM_TRITON=1 MAX_JOBS="${AITER_MAX_JOBS}" \
   python3 -m pip install -e "${AITER_SOURCE_DIR}" \
     --no-build-isolation --no-deps
-# amd-aiter is installed with --no-deps above; pull in runtime packages the
-# op_tests smoke check needs (flydsl is pinned separately).
-python3 -m pip install einops ninja packaging pandas psutil pybind11
-
-# Editable installation builds module_aiter_core, while module_cache remains a
-# JIT module. Build and exercise the PR's DCP case once before any workers
-# start, avoiding a multi-process first-use race and rejecting a stale 18-arg
-# module_cache.so.
-env -u AITER_CACHE_DIR -u AITER_JIT_DIR \
-  AITER_REBUILD=1 AITER_USE_SYSTEM_TRITON=1 MAX_JOBS="${AITER_MAX_JOBS}" \
-  python3 "${AITER_SOURCE_DIR}/op_tests/test_indexer_qk_rope_quant_and_cache.py" \
-    -n 8 --num_heads 32 -d bf16 --valid_fraction 0.5 \
-    --compute_all_q_rope 1 --is_neox 1
 
 AITER_PREBUILT_JIT_DIR="${AITER_SOURCE_DIR}/aiter/jit"
-if [[ ! -f "${AITER_PREBUILT_JIT_DIR}/module_cache.so" ]]; then
-  echo "ERROR: AITER module_cache.so was not produced" >&2
-  exit 1
-fi
+aiter_base_site_packages="$(
+  "${AITER_BASE_PYTHON}" - <<'PY'
+import site
+
+print(":".join(site.getsitepackages()))
+PY
+)"
 
 export PATH="${AITER_VENV_DIR}/bin:${PATH}"
-export PYTHONPATH="${AITER_SOURCE_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
+export PYTHONPATH="${AITER_SOURCE_DIR}:${aiter_base_site_packages}${PYTHONPATH:+:${PYTHONPATH}}"
 export ATOMESH_AITER_PREBUILT_JIT_DIR="${AITER_PREBUILT_JIT_DIR}"
 hash -r
 
-env -u AITER_CACHE_DIR -u AITER_JIT_DIR python3 - <<'PY'
+# Editable installation builds module_aiter_core, while module_cache remains a
+# JIT module. Build it once in a single process before workers start, avoiding a
+# multi-process first-use race and rejecting a stale 18-arg module_cache.so.
+env -u AITER_CACHE_DIR -u AITER_JIT_DIR \
+  AITER_REBUILD=1 AITER_USE_SYSTEM_TRITON=1 MAX_JOBS="${AITER_MAX_JOBS}" \
+  python3 - <<'PY'
 import importlib.metadata
 
 import aiter
@@ -130,3 +125,8 @@ print(f"Installed amd-aiter: {importlib.metadata.version('amd-aiter')}")
 print(f"Imported aiter from: {aiter.__file__}")
 print(f"Verified module_cache ABI: {doc}")
 PY
+
+if [[ ! -f "${AITER_PREBUILT_JIT_DIR}/module_cache.so" ]]; then
+  echo "ERROR: AITER module_cache.so was not produced" >&2
+  exit 1
+fi
