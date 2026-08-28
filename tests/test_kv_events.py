@@ -56,6 +56,16 @@ def _bm_with_events(**overrides) -> BlockManager:
     return BlockManager(cfg)
 
 
+def _dcp_bm_with_events(monkeypatch) -> BlockManager:
+    bm = _bm_with_events(decode_context_parallel_size=2)
+    monkeypatch.setattr(
+        bm,
+        "num_pool_blocks",
+        lambda seq_len: (seq_len + bm.hash_block_size - 1) // bm.hash_block_size,
+    )
+    return bm
+
+
 # ── schema / msgspec round-trip ───────────────────────────────────────────
 
 
@@ -242,6 +252,56 @@ class TestBlockManagerHooks:
         # block_manager fixture has events disabled
         block_manager.record_remote_store(block_hashes=[1], token_ids=[0])
         assert block_manager.take_events() == []
+
+
+class TestDCPBlockStoredGranularity:
+    @staticmethod
+    def _only_stored_event(bm):
+        stored = [event for event in bm.take_events() if isinstance(event, BlockStored)]
+        assert len(stored) == 1
+        return stored[0]
+
+    @staticmethod
+    def _assert_hash_block_aligned(event, expected_hashes):
+        assert event.block_size == 8
+        assert len(event.block_hashes) == expected_hashes
+        assert len(event.token_ids) == expected_hashes * event.block_size
+
+    def test_hash_blocks_reports_hash_block_size(self, seq_factory, monkeypatch):
+        bm = _dcp_bm_with_events(monkeypatch)
+        seq = seq_factory(list(range(16)))
+        bm.allocate(seq)
+
+        bm.hash_blocks(seq, seq.num_prompt_tokens)
+
+        event = self._only_stored_event(bm)
+        self._assert_hash_block_aligned(event, expected_hashes=2)
+        assert event.token_ids == list(range(16))
+
+    def test_publish_loaded_prefix_reports_hash_block_size(
+        self, seq_factory, monkeypatch
+    ):
+        bm = _dcp_bm_with_events(monkeypatch)
+        seq = seq_factory(list(range(8)))
+        bm.allocate(seq)
+
+        assert bm.publish_loaded_prefix(seq, start_token=0, end_token=8) == 8
+
+        event = self._only_stored_event(bm)
+        self._assert_hash_block_aligned(event, expected_hashes=1)
+        assert event.token_ids == list(range(8))
+
+    def test_record_remote_store_reports_hash_block_size(self, monkeypatch):
+        bm = _dcp_bm_with_events(monkeypatch)
+
+        bm.record_remote_store(
+            block_hashes=[42, 43],
+            token_ids=list(range(16)),
+        )
+
+        event = self._only_stored_event(bm)
+        self._assert_hash_block_aligned(event, expected_hashes=2)
+        assert event.medium == MEDIUM_REMOTE
 
 
 # ── Publisher ──────────────────────────────────────────────────────────────

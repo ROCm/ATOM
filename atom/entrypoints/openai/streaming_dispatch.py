@@ -73,12 +73,17 @@ class IncrementalStreamDetokenizer:
 def merge_chunk(into: dict, new: dict) -> None:
     """Fold ``new`` into the chunk already waiting. ``into`` is modified.
 
-    ``text`` and ``token_ids`` are deltas, so concatenating them is exact.
-    ``token_ids`` is rebuilt rather than extended: the first chunk's list is the
-    engine's own ``output_tokens``, which must not be appended to.
+    Both deltas extend in place: ``into`` holds the copy ``put_nowait`` took,
+    and rebuilding them walked the whole accumulation on every merge.
     """
-    into["token_ids"] = [*into.get("token_ids", ()), *new.get("token_ids", ())]
-    into["text"] = into.get("text", "") + new.get("text", "")
+    into["token_ids"].extend(new.get("token_ids") or ())
+    # Popped so the string has one reference and CPython grows it in place;
+    # assigning `into["text"] + ...` back reallocates and copies per merge.
+    text = into.pop("text", "")
+    try:
+        text += new.get("text", "")
+    finally:
+        into["text"] = text
     into["finished"] = bool(into.get("finished") or new.get("finished"))
     for key in _LATEST_WINS:
         if new.get(key):
@@ -117,6 +122,9 @@ class StreamOutputCollector:
             tag, chunk = None, payload
         waiting = self._pending.get(tag)
         if waiting is None:
+            # A merge extends this list, so it has to be ours. The scheduler
+            # already copies per step, but that is too far away to rely on.
+            chunk["token_ids"] = list(chunk.get("token_ids") or ())
             self._pending[tag] = chunk
         else:
             merge_chunk(waiting, chunk)

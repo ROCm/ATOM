@@ -12,6 +12,8 @@ It follows the same construction-swap pattern as ``qwen3_next``: the
 variant, then restores it.
 """
 
+import dataclasses
+
 import torch
 
 from atom.models import deepseek_v4 as deepseek_v4_base
@@ -26,19 +28,11 @@ from atom.models.deepseek_v4 import (
 
 # isort: on
 from atom.plugin.vllm.deepseek_v4_bridge import ATOM_DEEPSEEK_V4_BLOCK_SIZE
-from atom.utils.attn_ffn_piecewise import decode_bucket_key, piecewise_core
 from atom.utils.forward_context import AttnState, get_forward_context
 
 # Compressor.forward and CSA translation read this module global at runtime, so
 # it must remain aligned with the vLLM proxy page geometry after construction.
 deepseek_v4_base._V4_BLOCK_SIZE = ATOM_DEEPSEEK_V4_BLOCK_SIZE
-
-# The native attention core's UNDECORATED body. ``DeepseekV4Attention._attn_core``
-# is wrapped by ``@piecewise_core``, which owns the cudagraph/output-slot
-# bookkeeping; ``DeepseekV4AttentionVllm._attn_core`` re-applies that same
-# decorator and so must call through to the body, not to the wrapper (which would
-# run the bookkeeping twice). ``__wrapped__`` is set by ``functools.wraps``.
-_NATIVE_ATTN_CORE = DeepseekV4AttentionBase._attn_core.__wrapped__
 
 
 class IndexerVllm(IndexerBase):
@@ -242,11 +236,12 @@ class DeepseekV4AttentionVllm(DeepseekV4AttentionBase):
       the ``forward_impl`` override below.
     * NARROW split (PIECEWISE — the FULL_AND_PIECEWISE prefill/mixed path): the
       Q/KV/indexer projections run as a *captured* dense piece (``_attn_pre``)
-      at the padded width, then the eager op (``v4_core_attention``) calls
-      ``_attn_core`` DIRECTLY, never ``forward_impl`` — reconciled in the
-      ``_attn_core`` override below. (This is the path exercised by the launch
-      config; without the ``_attn_core`` slice the padded ``q`` reaches
-      ``sparse_attn_v4_paged_prefill`` while ``kv_indptr_prefix`` is real-sized.)
+      at the padded width and the attention runs as three ops, never through
+      ``forward_impl`` — reconciled in the ``_sparse_attention`` override below,
+      which is the one of the three that reads the real-sized metadata. (This is
+      the path exercised by the launch config; without that clip the padded
+      ``q`` reaches ``sparse_attn_v4_paged_prefill`` while ``kv_indptr_prefix``
+      is real-sized.)
 
     In both, slice every per-token input down to the real token count before the
     (unchanged) native attention so per-token Q rows match the ``kv_indptr``
@@ -279,66 +274,44 @@ class DeepseekV4AttentionVllm(DeepseekV4AttentionBase):
                     return torch.nn.functional.pad(out, (0, 0, 0, num_in - num_real))
         return super().forward_impl(x, positions)
 
-    @piecewise_core(key=decode_bucket_key, copy_per_step=("positions",))
-    def _attn_core(
+    def _sparse_attention(
         self,
-        *,
-        x: torch.Tensor,
-        q: torch.Tensor,
-        kv_pre: torch.Tensor,
-        qr: torch.Tensor,
-        qr_scale: torch.Tensor,
+        qkn,
         positions: torch.Tensor,
         idx_q_quant: torch.Tensor | None = None,
         idx_weights: torch.Tensor | None = None,
         idx_q_scale: torch.Tensor | None = None,
-        compressor_already_launched: bool = False,
+        x: torch.Tensor | None = None,
+        qr: torch.Tensor | None = None,
+        qr_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # NARROW PIECEWISE entry (see class docstring): the ``v4_core_attention``
-        # split op calls this DIRECTLY, so ``forward_impl``'s slice never runs.
-        # ``_attn_pre`` projected every per-token tensor at the padded bucket
-        # width, but the sparse-attention metadata (``batch_id_per_token`` /
-        # ``kv_indptr_*``) is sized to the real token count. Clip all per-token
-        # inputs to that real count, run the native core, then pad the output
-        # back to the bucket width — the native core reads only real-sized
-        # metadata, and the padded-width output keeps the piecewise output buffer
-        # and the downstream graphed ``_attn_post`` piece at the captured shape.
+        # NARROW entry (see class docstring). The pieces upstream produced every
+        # per-token tensor at the padded bucket width, but the sparse-attention
+        # metadata this half reads (`batch_id_per_token`, `kv_indptr_*`) is sized
+        # to the real token count -- and this is the half that reads it, so this
+        # is where the two have to be reconciled. Clip in, pad out: the padded
+        # width is what the piecewise output buffer and the graphed `_attn_post`
+        # piece downstream were captured at.
         #
-        # This override re-applies ``@piecewise_core`` with the SAME key and
-        # ``copy_per_step`` as the base rather than wrapping the base's decorated
-        # method, because the decorator's bookkeeping must see the PADDED width:
-        # it keys the persistent output slot on ``x.shape[0]``, and that is the
-        # address the downstream dense piece was captured reading. Clipping
-        # outside the decorator would key the slot on the real count and hand
-        # back a short tensor, so the reconciliation has to happen INSIDE the
-        # body — which is why the calls below target the base's undecorated body
-        # (``__wrapped__``) instead of ``super()._attn_core``.
-        native_kwargs = {
-            "x": x,
-            "q": q,
-            "kv_pre": kv_pre,
-            "qr": qr,
-            "qr_scale": qr_scale,
-            "positions": positions,
-            "idx_q_quant": idx_q_quant,
-            "idx_weights": idx_weights,
-            "idx_q_scale": idx_q_scale,
-            "compressor_already_launched": compressor_already_launched,
-        }
-
+        # Decode is fully captured with metadata already padded to the bucket, so
+        # it runs at the padded width and must NOT be clipped.
+        #
+        # `x` is NOT clipped for the compressor in `_attn_compress`: its plan is
+        # built from the real lengths and addresses rows through it, so padded
+        # rows are never read. Untested on this path -- if prefill misbehaves
+        # here, that is the first thing to check.
         fc = get_forward_context()
         if not fc.context.is_dummy_run:
             attn_md = fc.attn_metadata
             if attn_md is not None and attn_md.state is not AttnState.DECODE:
-                num_in = x.size(0)
+                num_in = positions.size(0)
                 bid = attn_md.batch_id_per_token
                 num_real = bid.shape[0] if bid is not None else num_in
                 if num_real < num_in:
 
                     def _clip(t):
-                        # Clip only the leading (token) dim, and only when it is
-                        # the padded width — leaves per-seq / scalar tensors, the
-                        # pass-through config flag and any Nones untouched.
+                        # Leading (token) dim only, and only at the padded
+                        # width -- leaves per-seq tensors and Nones alone.
                         if (
                             isinstance(t, torch.Tensor)
                             and t.dim() >= 1
@@ -347,11 +320,26 @@ class DeepseekV4AttentionVllm(DeepseekV4AttentionBase):
                             return t[:num_real]
                         return t
 
-                    o = _NATIVE_ATTN_CORE(
-                        self, **{k: _clip(v) for k, v in native_kwargs.items()}
+                    o = super()._sparse_attention(
+                        dataclasses.replace(
+                            qkn,
+                            **{
+                                f.name: _clip(getattr(qkn, f.name))
+                                for f in dataclasses.fields(qkn)
+                            },
+                        ),
+                        positions[:num_real],
+                        _clip(idx_q_quant),
+                        _clip(idx_weights),
+                        _clip(idx_q_scale),
+                        _clip(x),
+                        _clip(qr),
+                        _clip(qr_scale),
                     )
                     return torch.nn.functional.pad(o, (0, 0, 0, num_in - num_real))
-        return _NATIVE_ATTN_CORE(self, **native_kwargs)
+        return super()._sparse_attention(
+            qkn, positions, idx_q_quant, idx_weights, idx_q_scale, x, qr, qr_scale
+        )
 
 
 class DeepseekV4ModelVllm(DeepseekV4ModelBase):
