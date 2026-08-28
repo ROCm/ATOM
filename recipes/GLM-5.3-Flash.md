@@ -65,8 +65,8 @@ Accuracy past the old cap, `lm_eval` gsm8k over all 1319 questions, TP8, fp8 KV:
 |---|---|---|---|
 | chat, 3-shot, `--max-model-len 2048` | ~389 | 0.9644 | 0.9651 |
 | chat, 5-shot, `--max-model-len 4096` | ~645 | 0.9674 | 0.9682 |
-| chat, 16-shot, `--max-model-len 8192`, index cache at B=16 | 2763-3591 | 0.9659 | 0.9659 |
-| **chat, 16-shot, `--max-model-len 8192`, index cache at B=64** | **2763-3591** | **0.9629** | **0.9636** |
+| chat, 16-shot, `--max-model-len 8192`, index cache at B=16 | 2763-3591 | 0.9659, 0.9644 | 0.9659, 0.9636 |
+| **chat, 16-shot, `--max-model-len 8192`, index cache at B=64** | **2763-3591** | **0.9613, 0.9629, 0.9644** | **0.9613, 0.9636, 0.9644** |
 
 The 16-shot row is the one that actually measures the pooled path: it is the only
 setting whose prompts *all* exceed `index_topk`, so pooled scoring and pooled top-k
@@ -75,16 +75,39 @@ dense MLA and the indexer's selection is computed but never used -- a short-cont
 benchmark says nothing about pooled selection, only that the pooled *writes* did no
 harm.
 
-The last row is the reclaimed index cache (see "How pooled entries are stored").
-It sits 0.30pp under the row above -- 0.6 of the +/-0.52pp stderr, and inside the
-0.9644-0.9674 spread these runs show across configurations whose selection is
-provably identical. Do not read that as "unchanged", though: this model is
-nondeterministic, so no single text-based run can resolve a delta this small in
-either direction. What establishes the relayout as correct is deterministic
-instead -- the slot arithmetic is unit-tested and mutation-checked in
-`tests/models/test_glm5_next_kpool.py`, and the needle below passes at three
-depths with its control. To tighten the aggregate, repeat the run rather than
-reasoning about a single sample.
+**Do not compare these configurations by their exact_match rates.** This model is
+nondeterministic, and the instability is far larger than any aggregate gap it
+produces. Joining two runs question by question -- same protocol, one on each
+index-cache layout -- gives:
+
+| filter | both right | both wrong | B=16 only | B=64 only | McNemar p |
+|---|---|---|---|---|---|
+| flexible-extract | 1258 | 33 | 14 | 14 | 1.00 |
+| strict-match | 1256 | 32 | 15 | 16 | 1.00 |
+
+**28-31 of 1319 questions flip between two runs, symmetrically.** An aggregate
+delta of 0.3pp is not 4 questions of signal; it is ~28 flips in each direction
+almost cancelling, and the residue is noise. Two runs of the *identical* B=16
+tree differ by 0.15pp for the same reason.
+
+That makes the rate difference useless at this scale and the binomial stderr
+(+/-0.5pp) the wrong error bar entirely -- it describes resampling the task, not
+re-running a fixed configuration. Estimating the spread from two runs is no
+better: the first two B=64 samples agreed to 0.16pp, which looked like a tight
+noise floor and was not; a third landed 0.31pp away, inside the B=16 range.
+
+`scripts/compare_lm_eval_paired.py` does the join (run both arms with
+`--log_samples`, then pass the two `--output_path` directories). It refuses to
+report on a partial join or an empty comparison, and keys on `(doc_id, filter)`
+because lm_eval writes one record per filter and keying on `doc_id` alone
+silently makes both filters report the same numbers.
+
+So: compare per question and report the flip counts, or compare something
+deterministic. What establishes this relayout as correct is the latter -- the
+slot arithmetic is unit-tested and mutation-checked in
+`tests/models/test_glm5_next_kpool.py`, the in-model oracle round-trips all 1392
+pools of a 5571-token sequence at cos 0.9994+, and the needle below passes at
+three depths with its control.
 
 Retrieval itself is checked by `scripts/run_longctx_needle.py`, which runs each
 needle depth twice with a different secret in an otherwise identical prompt. The
