@@ -516,16 +516,25 @@ assert lmcache.c_ops.__file__.endswith('.so'), 'c_ops fell back to python backen
 print('OK: lmcache', lmcache.__version__, 'HIP c_ops; torch', torch.__version__)"
 
 # ========== SemiAnalysis aiperf agentic benchmark tool ==========
-# Install the SemiAnalysis fork pinned to the commit that supports the SA
-# agentic datasets (semianalysis_cc_traces_weka_062126*).
+# The SemiAnalysis fork, which is what carries the SA agentic datasets
+# (semianalysis_cc_traces_weka_062126*).
+#
+# Tracks the default branch rather than a fixed SHA, so a rebuild follows
+# upstream the way InferenceX does -- it vendors aiperf as a submodule and moves
+# it, pinning no commit of its own. The cost is that the image is no longer
+# reproducible from the Dockerfile alone: two builds a week apart can ship
+# different aiperf. The resolved commit is echoed below so a built image can
+# always say what it actually has, and `SA_AIPERF_REF` takes a tag or SHA when a
+# build does need pinning.
 ARG INSTALL_SA_AIPERF=1
-ARG SA_AIPERF_COMMIT="754356e9a39acc6cc6afb242d123bb57c3fb6f75"
+ARG SA_AIPERF_REF="master"
 RUN if [ "${INSTALL_SA_AIPERF}" = "1" ]; then \
-        echo "========== [ATOM] Install SemiAnalysis aiperf (${SA_AIPERF_COMMIT}) =========="; \
+        echo "========== [ATOM] Install SemiAnalysis aiperf (ref=${SA_AIPERF_REF}) =========="; \
         rm -rf /opt/aiperf && \
         git clone https://github.com/SemiAnalysisAI/aiperf.git /opt/aiperf && \
         cd /opt/aiperf && \
-        git checkout "${SA_AIPERF_COMMIT}" && \
+        git checkout "${SA_AIPERF_REF}" && \
+        echo "[ATOM] aiperf resolved to $(git rev-parse HEAD)" && \
         "${VENV_PYTHON}" -m pip install -e . && \
         "${VENV_PYTHON}" -m pip show aiperf || true && \
         command -v aiperf && aiperf --help >/dev/null; \
