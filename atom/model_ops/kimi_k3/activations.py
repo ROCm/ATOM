@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import torch
 from aiter import QuantType, dtypes, get_hip_quant
+from aiter.ops.activation import situv2_and_mul_quant
 
 from atom.utils.decorators import mark_trace
 
@@ -163,6 +164,38 @@ def situ_and_mul(
         BLOCK=BLOCK,
     )
     return y.reshape(*lead, d)
+
+
+@mark_trace
+def situ_and_mul_quant(
+    x: torch.Tensor,
+    beta: float,
+    linear_beta: float | None,
+    quant_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """SiTUv2 gated activation fused with per-token quant.
+
+    Returns ``(quantized [m, d], scale [m, 1])`` for the consuming GEMM's
+    ``x_scale=`` path; falls back to activation-then-quant when the fused
+    AITER kernel does not cover the case.
+    """
+    d = x.shape[-1] // 2
+    fusable = (
+        x.ndim == 2
+        and x.numel() > 0
+        and x.dtype == torch.bfloat16
+        and quant_dtype == dtypes.fp8
+        and linear_beta is not None
+        and d % 8 == 0
+    )
+    if not fusable:
+        y = situ_and_mul(x, beta, linear_beta).reshape(-1, d)
+        return get_hip_quant(QuantType.per_Token)(y, quant_dtype=quant_dtype)
+    x = x.contiguous()
+    out = torch.empty((x.shape[0], d), dtype=quant_dtype, device=x.device)
+    scale = torch.empty((x.shape[0], 1), dtype=torch.float32, device=x.device)
+    situv2_and_mul_quant(out, x, scale, d, float(beta), float(linear_beta))
+    return out, scale
 
 
 @mark_trace

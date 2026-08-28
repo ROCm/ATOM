@@ -198,14 +198,27 @@ class _NoPositionalRotaryEmbedding(RotaryEmbedding):
 
 
 class SituAndMul(nn.Module):
-    def __init__(self, beta: float = 1.0, linear_beta: float | None = None):
+    def __init__(
+        self,
+        beta: float = 1.0,
+        linear_beta: float | None = None,
+        quant_type: QuantType | None = None,
+        quant_dtype: torch.dtype | None = None,
+    ):
         super().__init__()
         self.beta = beta
         self.linear_beta = linear_beta
+        # Only per-token FP8 fuses into the activation; other schemes stay in the Linear.
+        self.fuse_quant = quant_type == QuantType.per_Token and quant_dtype is not None
+        self.quant_dtype = quant_dtype
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        from atom.model_ops.kimi_k3 import situ_and_mul
+    def forward(
+        self, x: torch.Tensor
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        from atom.model_ops.kimi_k3 import situ_and_mul, situ_and_mul_quant
 
+        if self.fuse_quant:
+            return situ_and_mul_quant(x, self.beta, self.linear_beta, self.quant_dtype)
         return situ_and_mul(x, self.beta, self.linear_beta)
 
 
@@ -277,9 +290,14 @@ class KimiMLP(nn.Module):
         )
         if config.hidden_act != "situ":
             raise ValueError(f"Unsupported Kimi-K3 activation: {config.hidden_act}")
+        down_type, down_dtype = _effective_layer_quant(
+            quant_config, f"{prefix}.down_proj"
+        )
         self.act_fn = SituAndMul(
             beta=getattr(config, "activation_situ_beta", None) or 1.0,
             linear_beta=getattr(config, "activation_situ_linear_beta", None),
+            quant_type=down_type,
+            quant_dtype=down_dtype,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -288,7 +306,10 @@ class KimiMLP(nn.Module):
         x_scale = None
         if isinstance(x, tuple):
             x, x_scale = x
-        return self.down_proj(self.act_fn(self.gate_up_proj(x, x_scale)))
+        act = self.act_fn(self.gate_up_proj(x, x_scale))
+        if isinstance(act, tuple):
+            return self.down_proj(*act)
+        return self.down_proj(act)
 
 
 class KimiSparseMoeBlock(nn.Module):
