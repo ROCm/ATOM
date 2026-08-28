@@ -376,9 +376,13 @@ class CudagraphCaptureRunner:
         in_bufs: dict,
         refresh: dict,
         compute_fn: Callable,
-        out_buf: torch.Tensor,
+        out_buf: torch.Tensor | None,
     ) -> None:
         """Record `compute_fn(**in_bufs)` under `key`, landing in `out_buf`.
+
+        `out_buf` is None for a core that returns nothing -- one whose whole
+        effect is on paged state. Then there is nothing to copy and nothing for
+        replay to hand back.
 
         The output copy goes INSIDE the graph, so a later replay refreshes
         `out_buf` with no Python at all.
@@ -396,10 +400,12 @@ class CudagraphCaptureRunner:
             stream=torch.cuda.current_stream(),
             capture_error_mode=self._capture_error_mode,
         ):
-            out_buf.copy_(compute_fn(**in_bufs))
+            result = compute_fn(**in_bufs)
+            if out_buf is not None:
+                out_buf.copy_(result)
         self._graphs[key] = {"graph": graph, "in": refresh, "out": out_buf}
 
-    def replay(self, key, named_args: dict) -> torch.Tensor:
+    def replay(self, key, named_args: dict) -> torch.Tensor | None:
         """Refresh the inputs this runner owns, replay, and return the output."""
         entry = self._graphs[key]
         # Only the inputs this runner cloned are here. A zero-copy one is not:
@@ -409,4 +415,4 @@ class CudagraphCaptureRunner:
             if src is not None:
                 buf.copy_(src)
         entry["graph"].replay()
-        return entry["out"]  # the graph copied the result in for us
+        return entry["out"]  # None for a void core; else the graph copied it in

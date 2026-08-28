@@ -360,3 +360,24 @@ class FusedMoEConfig:
     @property
     def use_mori_kernels(self):
         return self.moe_parallel_config.use_mori_kernels
+
+
+def moe_kernel_token_capacity(
+    atom_config,
+    *,
+    dp_size: int,
+    use_all2all: bool,
+    dp_logical_ratio: int = 1,
+) -> int:
+    """Token rows MoE kernels must reserve for this rank.
+
+    DP-attention + TP MoE all-gathers hidden states across DP ranks before
+    routing. AITER fused-shared-expert topK metadata is a single preallocated
+    ``[T, topk+shared]`` buffer, so ``T`` must cover the gathered width:
+    ``max_num_batched_tokens * dp_size`` (times the simulated-DP repeat).
+    All2all/EP keeps tokens local, so the per-rank scheduler budget is enough.
+    """
+    tokens = atom_config.max_num_batched_tokens
+    if atom_config.enable_dp_attention and dp_size > 1 and not use_all2all:
+        tokens *= dp_size * max(int(dp_logical_ratio), 1)
+    return tokens

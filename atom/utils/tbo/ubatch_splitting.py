@@ -3,7 +3,6 @@
 
 import logging
 from dataclasses import dataclass
-from typing import Optional
 
 import numpy as np
 import torch
@@ -58,10 +57,10 @@ def maybe_create_ubatch_slices(
     num_tokens: int,
     num_ubatches: int = 2,
     is_prefill: bool = False,
-    num_scheduled_tokens: Optional[np.ndarray] = None,
-    max_tokens_per_ubatch: Optional[int] = None,
+    num_scheduled_tokens: np.ndarray | None = None,
+    max_tokens_per_ubatch: int | None = None,
     force: bool = False,
-) -> Optional[list[UBatchSlice]]:
+) -> list[UBatchSlice] | None:
     """Split a batch into N micro-batch slices.
 
     For decode: split by request count (uniform tokens per request).
@@ -136,8 +135,8 @@ def _split_prefill_balanced(
     num_reqs: int,
     num_scheduled_tokens: list[int],
     num_ubatches: int,
-    max_tokens_per_ubatch: Optional[int],
-) -> Optional[list[UBatchSlice]]:
+    max_tokens_per_ubatch: int | None,
+) -> list[UBatchSlice] | None:
     """Split prefill requests into ubatches balanced by token count.
 
     Finds the request boundary closest to total_tokens / num_ubatches,
@@ -193,8 +192,8 @@ def _split_prefill_token_midpoint(
     num_reqs: int,
     num_scheduled_tokens: list[int],
     num_ubatches: int,
-    max_tokens_per_ubatch: Optional[int],
-) -> Optional[list[UBatchSlice]]:
+    max_tokens_per_ubatch: int | None,
+) -> list[UBatchSlice] | None:
     """split prefill at the exact token midpoint."""
     toks = np.asarray(num_scheduled_tokens[:num_reqs], dtype=np.int64)
     total_tokens = int(toks.sum())
@@ -283,7 +282,7 @@ def _get_tbo_cpu_lens(attn_metadata: AttentionMetaData, field_name: str):
 def split_attn_metadata(
     attn_metadata: AttentionMetaData,
     ub_slice: UBatchSlice,
-    padded_bs: int,
+    running_bs: int,
 ) -> AttentionMetaData:
     """Split AttentionMetaData for a single micro-batch."""
     rs = ub_slice.request_slice
@@ -299,10 +298,10 @@ def split_attn_metadata(
         # clamp absolute token offsets to [ts.start, ts.stop], then re-base
         clamped = torch.clamp(seg, min=ts.start, max=ts.stop)
         ub_cu_seqlens_q = clamped - clamped[0]
-        # Pad remaining entries up to padded_bs + 1
-        if padded_bs > ub_num_reqs:
+        # Pad remaining entries up to running_bs + 1
+        if running_bs > ub_num_reqs:
             last_val = ub_cu_seqlens_q[-1]
-            pad_size = padded_bs - ub_num_reqs
+            pad_size = running_bs - ub_num_reqs
             padding = last_val.expand(pad_size)
             ub_cu_seqlens_q = torch.cat([ub_cu_seqlens_q, padding])
 
@@ -312,7 +311,7 @@ def split_attn_metadata(
         ub_slot_mapping = attn_metadata.slot_mapping[ts]
         # Pad with -1 for padded positions
         tok_count = ts.stop - ts.start
-        padded_tok_count = padded_bs
+        padded_tok_count = running_bs
         if padded_tok_count > tok_count:
             pad = torch.full(
                 (padded_tok_count - tok_count,),
@@ -326,9 +325,9 @@ def split_attn_metadata(
     ub_context_lens = None
     if attn_metadata.context_lens is not None:
         ub_context_lens = attn_metadata.context_lens[rs]
-        if padded_bs > ub_num_reqs:
+        if running_bs > ub_num_reqs:
             pad = torch.zeros(
-                padded_bs - ub_num_reqs,
+                running_bs - ub_num_reqs,
                 dtype=attn_metadata.context_lens.dtype,
                 device=attn_metadata.context_lens.device,
             )
@@ -338,9 +337,9 @@ def split_attn_metadata(
     ub_block_tables = None
     if attn_metadata.block_tables is not None:
         ub_block_tables = attn_metadata.block_tables[rs]
-        if padded_bs > ub_num_reqs:
+        if running_bs > ub_num_reqs:
             pad = torch.zeros(
-                padded_bs - ub_num_reqs,
+                running_bs - ub_num_reqs,
                 attn_metadata.block_tables.shape[1],
                 dtype=attn_metadata.block_tables.dtype,
                 device=attn_metadata.block_tables.device,
@@ -353,9 +352,9 @@ def split_attn_metadata(
         orig_indptr = attn_metadata.kv_indptr
         base = orig_indptr[req_start]
         ub_kv_indptr = orig_indptr[req_start : req_end + 1] - base
-        if padded_bs > ub_num_reqs:
+        if running_bs > ub_num_reqs:
             last_val = ub_kv_indptr[-1]
-            pad_size = padded_bs - ub_num_reqs
+            pad_size = running_bs - ub_num_reqs
             padding = last_val.expand(pad_size)
             ub_kv_indptr = torch.cat([ub_kv_indptr, padding])
 
@@ -366,9 +365,9 @@ def split_attn_metadata(
     ub_kv_last_page_lens = None
     if attn_metadata.kv_last_page_lens is not None:
         ub_kv_last_page_lens = attn_metadata.kv_last_page_lens[rs]
-        if padded_bs > ub_num_reqs:
+        if running_bs > ub_num_reqs:
             pad = torch.zeros(
-                padded_bs - ub_num_reqs,
+                running_bs - ub_num_reqs,
                 dtype=attn_metadata.kv_last_page_lens.dtype,
                 device=attn_metadata.kv_last_page_lens.device,
             )
@@ -380,9 +379,9 @@ def split_attn_metadata(
     ub_num_cached_tokens = None
     if attn_metadata.num_cached_tokens is not None:
         ub_num_cached_tokens = attn_metadata.num_cached_tokens[rs]
-        if padded_bs > ub_num_reqs:
+        if running_bs > ub_num_reqs:
             pad = torch.zeros(
-                padded_bs - ub_num_reqs,
+                running_bs - ub_num_reqs,
                 dtype=attn_metadata.num_cached_tokens.dtype,
                 device=attn_metadata.num_cached_tokens.device,
             )
@@ -391,9 +390,9 @@ def split_attn_metadata(
     ub_seq_starts = None
     if attn_metadata.seq_starts is not None:
         ub_seq_starts = attn_metadata.seq_starts[rs]
-        if padded_bs > ub_num_reqs:
+        if running_bs > ub_num_reqs:
             pad = torch.zeros(
-                padded_bs - ub_num_reqs,
+                running_bs - ub_num_reqs,
                 dtype=attn_metadata.seq_starts.dtype,
                 device=attn_metadata.seq_starts.device,
             )
@@ -407,9 +406,9 @@ def split_attn_metadata(
         orig = attn_metadata.sparse_kv_indptr
         base = orig[req_start]
         ub_sparse_kv_indptr = orig[req_start : req_end + 1] - base
-        if padded_bs > ub_num_reqs:
+        if running_bs > ub_num_reqs:
             last_val = ub_sparse_kv_indptr[-1]
-            pad_size = padded_bs - ub_num_reqs
+            pad_size = running_bs - ub_num_reqs
             padding = last_val.expand(pad_size)
             ub_sparse_kv_indptr = torch.cat([ub_sparse_kv_indptr, padding])
 
@@ -423,9 +422,9 @@ def split_attn_metadata(
             ub_cu_seqlens_k = clamped_k - clamped_k[0]
         else:
             ub_cu_seqlens_k = seg_k - seg_k[0]
-        if padded_bs > ub_num_reqs:
+        if running_bs > ub_num_reqs:
             last_val = ub_cu_seqlens_k[-1]
-            pad_size = padded_bs - ub_num_reqs
+            pad_size = running_bs - ub_num_reqs
             padding = last_val.expand(pad_size)
             ub_cu_seqlens_k = torch.cat([ub_cu_seqlens_k, padding])
 

@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import asyncio
+import hashlib
 import logging
 import multiprocessing
 import multiprocessing.shared_memory
@@ -9,6 +10,7 @@ import os
 import pickle
 import queue
 import weakref
+from dataclasses import dataclass
 from threading import Lock, Thread
 
 import zmq
@@ -16,13 +18,13 @@ import zmq.asyncio
 
 from atom.config import Config
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
+from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence
 from atom.utils import (
     envs,
     get_open_zmq_inproc_path,
     get_open_zmq_ipc_path,
     make_zmq_socket,
-    set_device_control_env_var,
 )
 
 logger = logging.getLogger("atom")
@@ -32,6 +34,79 @@ logger = logging.getLogger("atom")
 # the Config field can never diverge.
 DP_LB_STRATEGIES = ("round_robin", "least_requests", "least_tokens")
 DP_LB_DEFAULT = "least_requests"
+
+# Engine sockets for a multi-node run cannot use IPC paths, and the two ends
+# must derive identical TCP ports without negotiating. Both compute this plan
+# from the shared master port.
+INTERNODE_DP_SOCKET_PORT_OFFSET = 100
+INTERNODE_DP_PORTS_PER_ENGINE = 3
+
+
+@dataclass(frozen=True)
+class InternodeDPSocketPlan:
+    """The three TCP ports one engine's sockets use, in a multi-node run.
+
+    Single-node runs never build one of these: their engines are local, so
+    CoreManager hands them IPC paths from ``get_open_zmq_ipc_path()`` instead.
+    """
+
+    rank: int
+    input_port: int
+    output_port: int
+    control_port: int
+
+
+def build_internode_dp_socket_plan(
+    *, engine_count: int, master_port: int
+) -> list[InternodeDPSocketPlan]:
+    """Derive deterministic per-engine TCP ports from the DP master port.
+
+    Multi-node only -- ``CoreManager.__init__`` calls this when
+    ``is_multinode_dp`` and passes ``None`` otherwise, and that ``None`` is what
+    selects the IPC path (and, with it, the connect/bind polarity) further down.
+
+    Three ports per engine: requests, outputs, and control. Control is separate
+    so the request socket keeps a single writer thread (see _send_request).
+    """
+    base = master_port + INTERNODE_DP_SOCKET_PORT_OFFSET
+    return [
+        InternodeDPSocketPlan(
+            rank=rank,
+            input_port=base + rank * INTERNODE_DP_PORTS_PER_ENGINE,
+            output_port=base + rank * INTERNODE_DP_PORTS_PER_ENGINE + 1,
+            control_port=base + rank * INTERNODE_DP_PORTS_PER_ENGINE + 2,
+        )
+        for rank in range(engine_count)
+    ]
+
+
+def iter_dp_rank_assignments(config) -> list[tuple[int, int]]:
+    """The (global_dp_rank, local_dp_rank) pairs this node owns.
+
+    The global rank identifies the rank within the whole DP group; the local
+    rank indexes this node's GPUs. They coincide on a single node and diverge
+    on every node after the first.
+
+    Under DP-attention each TP rank becomes its own engine, so both the count
+    and the global offset scale by tp_size.
+    """
+    pc = config.parallel_config
+    tp_size = config.tensor_parallel_size
+    local_dp_size = pc.data_parallel_size_local
+    rank_offset = pc.data_parallel_rank if pc.is_multinode_dp else 0
+
+    if config.enable_dp_attention:
+        return [
+            (
+                (rank_offset + local_base) * tp_size + tp_rank,
+                local_base * tp_size + tp_rank,
+            )
+            for local_base in range(local_dp_size)
+            for tp_rank in range(tp_size)
+        ]
+    return [
+        (rank_offset + local_rank, local_rank) for local_rank in range(local_dp_size)
+    ]
 
 
 def _resolve_dp_engine_count(config: Config, logical: int) -> int:
@@ -74,7 +149,12 @@ def _resolve_dp_engine_count(config: Config, logical: int) -> int:
 
 class CoreManager:
     def _init_shared_state(
-        self, config: Config, *, label: str, local_engine_count: int
+        self,
+        config: Config,
+        *,
+        label: str,
+        local_engine_count: int,
+        global_engine_count: int | None = None,
     ) -> None:
         """Every field the inherited methods touch, before any engine is spawned.
 
@@ -89,10 +169,19 @@ class CoreManager:
         this class -- so the offline entrypoint, which is the one path that
         neither initialises nor assigns it, had its output thread die on the
         first streamed token and hung until CI timed out an hour later.
+
+        ``local_engine_count`` is the engines spawned on THIS node;
+        ``global_engine_count`` is the engines this manager routes to, which on
+        a coordinator spans other nodes too. They are equal on a single node.
+        Routing state sizes to the global count -- a short array would
+        IndexError the moment the balancer picked a remote rank.
         """
         self.label = label
         self._closed = False  # Track whether already closed
         self.local_engine_count = local_engine_count
+        self.global_engine_count = (
+            local_engine_count if global_engine_count is None else global_engine_count
+        )
         self.ctx = zmq.Context(io_threads=2)
         self.outputs_queue = queue.Queue[list[Sequence]]()
         self.utility_response_queue = queue.Queue()
@@ -101,6 +190,11 @@ class CoreManager:
         # an api_server <-> engine_core_mgr import cycle). Stays None on every
         # path that never streams, which the output thread checks for.
         self._flush_stream_batch_fn = None
+        # Longest prompt the KV pool can hold, reported by each rank's READY.
+        # None until the first one arrives, and thereafter the smallest across
+        # ranks: a DP rank sizes its pool from its own free memory, so a prompt
+        # is only safe to admit if it fits wherever the router sends it.
+        self.max_pool_tokens: int | None = None
         self.engine_core_processes = []
         self.input_sockets = []
         self.output_sockets = []
@@ -124,12 +218,36 @@ class CoreManager:
         # Read once here: this is a construction-time config value (CoreManager
         # is built after env/args are finalized), not a runtime-tunable knob.
         self._dp_lb_req_equiv = envs.ATOM_DP_LB_REQ_EQUIV
-        # Authoritative in-flight load per rank, maintained locally: incremented
-        # on dispatch, decremented on finish/abort. Guarded by _lb_lock because
-        # dispatch runs on the request thread while release runs on the per-rank
-        # output threads.
-        self._rank_reqs = [0] * local_engine_count
-        self._rank_tokens = [0] * local_engine_count
+        self._dp_session_affinity_enabled = envs.ATOM_DP_SESSION_AFFINITY
+        # Session id -> rank whose local prefix cache owns the session. Owners
+        # are immutable for the lifetime of the process: moving one turn to a
+        # light rank discards the dominant optimization in agentic workloads,
+        # namely reuse of the accumulated conversation prefix.
+        self._dp_session_owners: dict[str, int] = {}
+        # Last prompt length observed for each sticky session.  A later turn on
+        # the same owner normally reuses the old prompt, so only its positive
+        # growth is new prefill debt.  Keeping this small scalar per session
+        # avoids charging the complete cached conversation on every turn.
+        self._dp_session_prompt_tokens: dict[str, int] = {}
+        self._dp_route_counters = {
+            "affinity_new_total": 0,
+            "affinity_owner_hit_total": 0,
+            # Kept as an explicit invariant/metric: strict affinity must leave
+            # this at zero. It makes an accidental reintroduction of spill
+            # visible in benchmark artifacts.
+            "affinity_spill_total": 0,
+            "affinity_parent_ignored_total": 0,
+            "explicit_total": 0,
+            "load_balanced_total": 0,
+        }
+        self._rank_routed_total = [0] * self.global_engine_count
+        # Authoritative local load per rank. Request count is in-flight until
+        # finish/abort; token count is queued/in-flight PREFILL work and is
+        # released as soon as the first model output proves prefill completed.
+        # Guarded by _lb_lock because dispatch runs on the request thread while
+        # completion/release runs on the per-rank output threads.
+        self._rank_reqs = [0] * self.global_engine_count
+        self._rank_tokens = [0] * self.global_engine_count
         # seq_id -> (dp_rank, req_cost, tok_cost) so release subtracts exactly
         # what dispatch added, and only for ranks that were actually charged.
         self._seq_load = {}
@@ -149,24 +267,55 @@ class CoreManager:
     def __init__(self, config: Config):
         pp_size = config.pipeline_parallel_size
         self.pp_size = pp_size
+        pc = config.parallel_config
+        multinode = pc.is_multinode_dp
+        if multinode and pp_size > 1:
+            raise ValueError(
+                "Multi-node data parallelism combined with pipeline "
+                "parallelism (pipeline_parallel_size > 1) is not supported: "
+                "the engine index space folds PP stages into DP ranks, and the "
+                "two mappings have not been reconciled across nodes."
+            )
+
+        rank_assignments = iter_dp_rank_assignments(config)
         if config.enable_dp_attention:
             assert pp_size == 1, "Pipeline parallel + DP-attention is not supported yet"
-            logical = (
-                config.tensor_parallel_size * config.parallel_config.data_parallel_size
-            )
-            local_engine_count = _resolve_dp_engine_count(config, logical)
+            # One engine per assignment this node owns; on a single node that is
+            # the whole tp x dp grid. --fake-eplb may shrink it to the visible
+            # device count, taking the first N assignments.
+            local_engine_count = _resolve_dp_engine_count(config, len(rank_assignments))
             logger.info(
                 f"Enable dp attention, using {local_engine_count} data parallel ranks"
             )
-            config.parallel_config.data_parallel_size = local_engine_count
+            # Under DP-attention every TP rank becomes its own DP rank.
+            config.parallel_config.data_parallel_size *= config.tensor_parallel_size
+            config.parallel_config.data_parallel_size_local = local_engine_count
+            if multinode:
+                config.parallel_config.data_parallel_rank *= config.tensor_parallel_size
             config.tensor_parallel_size = 1
         else:
             dp_size = config.parallel_config.data_parallel_size
             assert not (
                 pp_size > 1 and dp_size > 1
             ), "Pipeline parallel combined with data parallel is not supported yet."
-            # One EngineCore per (dp_rank, pp_rank) stage.
-            local_engine_count = dp_size * pp_size
+            local_engine_count = len(rank_assignments) * pp_size
+
+        global_engine_count = (
+            config.parallel_config.data_parallel_size * pp_size
+            if not config.enable_dp_attention
+            else config.parallel_config.data_parallel_size
+        )
+        # Global DP rank 0's node owns the router; the others only host engines.
+        self.is_coordinator = not multinode or pc.data_parallel_rank == 0
+        socket_plan = (
+            build_internode_dp_socket_plan(
+                engine_count=global_engine_count,
+                master_port=pc.data_parallel_master_port,
+            )
+            if multinode
+            else None
+        )
+
         # Inter-stage ZMQ channels (head<->downstream metadata, last->head
         # tokens), shared across the single dp group. PP+DP would need per-group
         # sets — deferred with the assertion above. Not shared state: only this
@@ -180,7 +329,10 @@ class CoreManager:
             self.pp_kv_status_addr = get_open_zmq_ipc_path()
 
         self._init_shared_state(
-            config, label="Engine Core Mgr", local_engine_count=local_engine_count
+            config,
+            label="Engine Core Mgr",
+            local_engine_count=local_engine_count,
+            global_engine_count=global_engine_count,
         )
 
         import torch
@@ -193,11 +345,13 @@ class CoreManager:
 
         try:
             for engine_index in range(self.local_engine_count):
-                dp_rank = engine_index // self.pp_size
+                assignment_index = engine_index // self.pp_size
+                dp_rank, local_dp_rank = rank_assignments[assignment_index]
                 pp_rank = engine_index % self.pp_size
                 logger.info(
                     f"{self.label}: Creating EngineCore engine {engine_index}"
-                    f" (dp={dp_rank}, pp={pp_rank}) of {self.local_engine_count}"
+                    f" (global dp={dp_rank}, local dp={local_dp_rank}, "
+                    f"pp={pp_rank}) of {self.local_engine_count}"
                 )
 
                 # Create config for this (dp, pp) stage
@@ -205,6 +359,7 @@ class CoreManager:
 
                 rank_config = copy.deepcopy(config)
                 rank_config.parallel_config.data_parallel_rank = dp_rank
+                rank_config.parallel_config.data_parallel_rank_local = local_dp_rank
                 rank_config.parallel_config.pipeline_parallel_rank = pp_rank
                 if self.pp_size > 1:
                     rank_config.parallel_config.pp_meta_addrs = self.pp_meta_addrs
@@ -213,8 +368,19 @@ class CoreManager:
                         self.pp_kv_status_addr
                     )
 
+                if socket_plan is not None:
+                    plan = socket_plan[dp_rank]
+                    ip = config.parallel_config.data_parallel_master_ip
+                    engine_addresses = {
+                        "input_address": f"tcp://{ip}:{plan.input_port}",
+                        "output_address": f"tcp://{ip}:{plan.output_port}",
+                        "control_address": f"tcp://{ip}:{plan.control_port}",
+                    }
+                else:
+                    engine_addresses = None
+
                 engine_core_process, addresses, local_dp_rank = launch_engine_core(
-                    rank_config, dp_rank
+                    rank_config, dp_rank, local_dp_rank, addresses=engine_addresses
                 )
 
                 processes_info.append(
@@ -227,51 +393,86 @@ class CoreManager:
                 )
                 local_dp_ranks.append(local_dp_rank)
 
-            data_parallel = config.parallel_config.data_parallel_size > 1
             try:
+                # No visible-device mask is published here. Device placement is
+                # owned by ModelRunner._setup_device_and_distributed, which
+                # selects an ABSOLUTE cuda:{local_dp_rank*tp_size+rank}. Masking
+                # the child as well would renumber its devices and compound the
+                # two offsets -- see set_device_control_env_var's docstring.
                 for info, local_dp_rank in zip(processes_info, local_dp_ranks):
                     dp_rank = info["dp_rank"]
                     logger.info(
-                        f"{self.label}: Starting EngineCore for DP rank {dp_rank}/{self.local_engine_count}"
+                        f"{self.label}: Starting EngineCore for DP rank "
+                        f"{dp_rank}/{self.global_engine_count}"
                     )
-
-                    if data_parallel:
-                        with set_device_control_env_var(info["config"], local_dp_rank):
-                            info["process"].start()
-                    else:
-                        info["process"].start()
-
+                    info["process"].start()
                     self.engine_core_processes.append(info["process"])
 
-                    input_address = info["addresses"]["input_address"]
+                if not self.is_coordinator:
+                    # A worker node hosts engines but owns no router: the
+                    # coordinator binds every socket. Wait for the children and
+                    # return -- raising here would be caught by the enclosing
+                    # handler and reported as a startup failure.
+                    logger.info(
+                        f"{self.label}: worker node for global DP ranks "
+                        f"{[i['dp_rank'] for i in processes_info]}; "
+                        f"coordinator at "
+                        f"{config.parallel_config.data_parallel_master_ip}"
+                    )
+                    self._finalizer = weakref.finalize(self, self.close)
+                    self.async_output_queue = None
+                    self._output_handler_task = None
+                    self._asyncio_mode = False
+                    for proc in self.engine_core_processes:
+                        proc.join()
+                    return
+
+                if socket_plan is not None:
+                    bind_addresses = [
+                        {
+                            "input_address": f"tcp://0.0.0.0:{p.input_port}",
+                            "output_address": f"tcp://0.0.0.0:{p.output_port}",
+                            "control_address": f"tcp://0.0.0.0:{p.control_port}",
+                        }
+                        for p in socket_plan
+                    ]
+                else:
+                    bind_addresses = [info["addresses"] for info in processes_info]
+
+                for addresses in bind_addresses:
                     input_socket = make_zmq_socket(
-                        self.ctx, input_address, zmq.ROUTER, bind=True
+                        self.ctx, addresses["input_address"], zmq.ROUTER, bind=True
                     )
                     identity, _ = input_socket.recv_multipart()
                     self.input_sockets.append(input_socket)
                     self.engine_core_identities.append(identity)
 
-                    control_address = info["addresses"]["control_address"]
                     control_socket = make_zmq_socket(
-                        self.ctx, control_address, zmq.ROUTER, bind=True
+                        self.ctx, addresses["control_address"], zmq.ROUTER, bind=True
                     )
                     control_identity, _ = control_socket.recv_multipart()
                     self.control_sockets.append(control_socket)
                     self.control_identities.append(control_identity)
 
-                    output_address = info["addresses"]["output_address"]
-                    output_socket = make_zmq_socket(self.ctx, output_address, zmq.PULL)
+                    # PULL always binds; the engine's PUSH always connects.
+                    # True for ipc:// and tcp:// alike -- the transport
+                    # difference is carried by the address (the engine gets
+                    # tcp://<master_ip>:port, we bind tcp://0.0.0.0:port).
+                    output_socket = make_zmq_socket(
+                        self.ctx,
+                        addresses["output_address"],
+                        zmq.PULL,
+                        bind=True,
+                    )
                     self.output_sockets.append(output_socket)
-
-                    shutdown_path = get_open_zmq_inproc_path()
-                    self.shutdown_paths.append(shutdown_path)
+                    self.shutdown_paths.append(get_open_zmq_inproc_path())
 
                 self._wait_for_all_ready_signals()
                 logger.info(
                     f"{self.label}: All EngineCores are fully initialized and ready"
                 )
 
-                for dp_rank in range(self.local_engine_count):
+                for dp_rank in range(len(self.output_sockets)):
                     output_thread = self._create_output_thread(
                         dp_rank,
                         self.output_sockets[dp_rank],
@@ -281,7 +482,11 @@ class CoreManager:
                     self.output_threads.append(output_thread)
 
             finally:
-                if self.finished_procs():
+                # A worker node reaches this `finally` via its normal early
+                # return above, with its children already joined and dead.
+                # The liveness check does not apply to it -- dead children are
+                # expected, not a startup failure.
+                if self.is_coordinator and self.finished_procs():
                     logger.error(
                         f"{self.label}: Some processes failed to start, shutting down all"
                     )
@@ -296,12 +501,24 @@ class CoreManager:
             raise
 
         logger.info(
-            f"{self.label}: All {self.local_engine_count} EngineCores initialized and ready"
+            f"{self.label}: All {len(self.output_sockets)} EngineCores initialized and ready"
         )
         self._finalizer = weakref.finalize(self, self.close)
         self.async_output_queue = asyncio.Queue() if config.asyncio_mode else None
         self._output_handler_task = None
         self._asyncio_mode = config.asyncio_mode
+
+    def _record_ready_payload(self, data) -> None:
+        """Fold one rank's READY facts into the manager's view of capacity."""
+        if not data:
+            return
+        reported = data.get("max_pool_tokens")
+        if reported is None:
+            return
+        if self.max_pool_tokens is None:
+            self.max_pool_tokens = reported
+        else:
+            self.max_pool_tokens = min(self.max_pool_tokens, reported)
 
     def _wait_for_all_ready_signals(self):
         """Wait for READY signals from all DP ranks in parallel (no timeout)."""
@@ -309,8 +526,9 @@ class CoreManager:
         for dp_rank, output_socket in enumerate(self.output_sockets):
             poller.register(output_socket, zmq.POLLIN)
 
-        ready_received = [False] * self.local_engine_count
-        remaining = self.local_engine_count
+        engine_count = len(self.output_sockets)
+        ready_received = [False] * engine_count
+        remaining = engine_count
 
         while remaining > 0:
             socks = poller.poll()  # Wait indefinitely
@@ -330,6 +548,7 @@ class CoreManager:
                     logger.info(
                         f"{self.label}: DP rank {dp_rank} is fully initialized and ready"
                     )
+                    self._record_ready_payload(data)
                     ready_received[dp_rank] = True
                     remaining -= 1
                 elif request_type == EngineCoreRequestType.SHUTDOWN:
@@ -388,6 +607,11 @@ class CoreManager:
                         # once per step rather than twice per chunk.
                         dbg = logger.isEnabledFor(logging.DEBUG)
                         for seq_id, request_output in stream_outputs:
+                            # The first emitted model output means this
+                            # sequence's prompt prefill has completed. Keep the
+                            # request count charged for decode pressure, but
+                            # stop advertising its prompt as queued prefill.
+                            self._mark_seq_prefill_complete(seq_id)
                             callback = self._seq_id_to_callback.get(seq_id)
                             if dbg:
                                 logger.debug(
@@ -435,8 +659,32 @@ class CoreManager:
                         seqs = data
                         # Offline (non-streaming) completions arrive here as
                         # finished sequences; release their in-flight DP load.
+                        #
+                        # So do sequences the scheduler rejected before they
+                        # ever ran (`_unschedulable_reason`, abort-while-waiting)
+                        # — those never reach `postprocess`, so no STREAM chunk
+                        # is ever built for them. An online client is still
+                        # holding a callback and would wait forever, so the
+                        # terminal output it is owed has to be raised here.
+                        # Anything already delivered through STREAM has had its
+                        # callback popped by then (STREAM is enqueued ahead of
+                        # the finished-seq list and this socket is FIFO), so a
+                        # normal completion finds nothing to do below.
+                        delivered = False
                         for seq in seqs:
+                            delivered |= self._deliver_terminal_output(seq)
                             self._release_seq_load(seq.id)
+                        if delivered and self._flush_stream_batch_fn is not None:
+                            # The callbacks above only buffer into a thread-local;
+                            # without this flush the chunk never reaches the
+                            # request's collector and the client still hangs.
+                            try:
+                                self._flush_stream_batch_fn()
+                            except Exception as e:
+                                logger.warning(
+                                    f"{self.label}: flush_stream_batch failed: {e}",
+                                    exc_info=True,
+                                )
                         self.outputs_queue.put_nowait(seqs)
             finally:
                 # Close sockets.
@@ -496,10 +744,10 @@ class CoreManager:
         self._closed = True
 
         logger.info(
-            f"{self.label}: Shutting down all {self.local_engine_count} EngineCores"
+            f"{self.label}: Shutting down {len(self.input_sockets)} EngineCores"
         )
 
-        for dp_rank in range(self.local_engine_count):
+        for dp_rank in range(len(self.input_sockets)):
             self._shutdown_engine_core_rank(dp_rank)
 
         for input_socket in self.input_sockets:
@@ -605,12 +853,24 @@ class CoreManager:
             # drives the pipeline downstream.
             logger.debug(f"{self.label}: Add {len(seqs)} requests to PP head 0")
             self._send_request(0, pickle.dumps((EngineCoreRequestType.ADD, seqs)))
-        elif self.local_engine_count == 1:
-            # Single DP rank, send all requests
+        elif self._routable_engine_count == 1:
+            # Single routable engine, send all requests
             logger.debug(f"{self.label}: Add {len(seqs)} requests to DP rank 0")
             self._send_request(0, pickle.dumps((EngineCoreRequestType.ADD, seqs)))
         else:
             self._dispatch_to_dp_ranks(seqs)
+
+    @property
+    def _routable_engine_count(self) -> int:
+        """How many engine ranks this manager may route to.
+
+        Equals ``global_engine_count``, which on a coordinator spans other
+        nodes. Falls back to ``local_engine_count`` for callers that build the
+        routing state by hand instead of through ``_init_shared_state`` --
+        ``tests/test_dp_load_balance.py`` does exactly that, and single-node
+        callers predate the global/local split, where the two are equal anyway.
+        """
+        return getattr(self, "global_engine_count", self.local_engine_count)
 
     def _resolve_and_validate_hints(self, seqs: list[Sequence]) -> list[int | None]:
         """Resolve every seq's explicit ``data_parallel_rank`` hint and validate
@@ -625,13 +885,14 @@ class CoreManager:
         permanent in-flight-load leak).
         """
         hints: list[int | None] = []
+        engine_count = self._routable_engine_count
         for seq in seqs:
             raw = getattr(seq, "data_parallel_rank", None)
             hint = None if raw is None else int(raw)
-            if hint is not None and not 0 <= hint < self.local_engine_count:
+            if hint is not None and not 0 <= hint < engine_count:
                 raise ValueError(
                     f"Invalid data_parallel_rank={hint}; "
-                    f"local_engine_count={self.local_engine_count}"
+                    f"global_engine_count={engine_count}"
                 )
             hints.append(hint)
         return hints
@@ -651,14 +912,17 @@ class CoreManager:
         # getattr/int pass per seq.
         hints = self._resolve_and_validate_hints(seqs)
 
-        # round_robin is load-agnostic and skips the charge/release bookkeeping;
-        # the load-aware strategies track per-rank load.
-        track_load = self._dp_lb_strategy != "round_robin"
-        dp_seqs = [[] for _ in range(self.local_engine_count)]
+        # round_robin normally skips load bookkeeping. Session affinity still
+        # needs queued-prefill counters even if the fallback strategy is RR.
+        track_load = (
+            self._dp_lb_strategy != "round_robin" or self._dp_session_affinity_enabled
+        )
+        engine_count = self._routable_engine_count
+        dp_seqs = [[] for _ in range(engine_count)]
         reqs_snapshot = tokens_snapshot = None
         with self._lb_lock:
             for seq, hint in zip(seqs, hints):
-                dp_rank = hint if hint is not None else self._select_dp_rank_locked()
+                dp_rank = self._select_dp_rank_for_seq_locked(seq, hint)
                 if track_load:
                     self._charge_seq_load_locked(seq, dp_rank)
                 dp_seqs[dp_rank].append(seq)
@@ -674,7 +938,7 @@ class CoreManager:
         # charged above but will never produce a finished output to release them,
         # so we roll back their in-flight load before propagating — otherwise
         # routing skews forever.
-        dispatched = [False] * self.local_engine_count
+        dispatched = [False] * engine_count
         added = []
         try:
             for dp_rank, rank_seqs in enumerate(dp_seqs):
@@ -708,7 +972,7 @@ class CoreManager:
         # ranks, so a single grep shows both what changed and how balanced it is.
         if reqs_snapshot is not None:
             logger.info(
-                "%s: add %s | in-flight reqs=%s prefill_tokens=%s",
+                "%s: add %s | in-flight reqs=%s queued_prefill_tokens=%s",
                 self.label,
                 ", ".join(added),
                 reqs_snapshot,
@@ -731,7 +995,7 @@ class CoreManager:
         Fully-tied ranks are resolved by a rotating cursor so selection does not
         always fall on rank 0. See docs/distributed_guide.md for the rationale.
         """
-        n = self.local_engine_count
+        n = self._routable_engine_count
         if self._dp_lb_strategy == "round_robin":
             dp_rank = self._rank_rotation_cursor % n
             self._rank_rotation_cursor += 1
@@ -760,13 +1024,195 @@ class CoreManager:
         self._rank_rotation_cursor += 1
         return best_rank
 
+    def _stable_session_rank(self, session_id: str) -> int:
+        """Map a session to a stable rank with rendezvous hashing.
+
+        Python's built-in ``hash`` is process-randomized, so it cannot define
+        cache ownership. Rendezvous hashing is deterministic and, unlike a
+        simple modulo, remaps only sessions owned by a rank that is added or
+        removed. The DP width is tiny, and this runs only once per new session.
+        """
+        session_key = str(session_id).encode("utf-8")
+        best_rank = 0
+        best_score = -1
+        for rank in range(self._routable_engine_count):
+            digest = hashlib.blake2b(
+                session_key + rank.to_bytes(4, "little"), digest_size=8
+            ).digest()
+            score = int.from_bytes(digest, "little")
+            if score > best_score:
+                best_rank = rank
+                best_score = score
+        return best_rank
+
+    def _select_new_session_rank_locked(self, session_id: str) -> int:
+        """Place a new sticky session on the lightest DP rank.
+
+        Existing sessions never call this function: locality wins once an
+        owner has cache state.  Before that first placement there is no cache
+        to preserve, so use estimated outstanding prefill debt plus the
+        configured token-equivalent decode pressure.  Rendezvous hashing is
+        only the deterministic tie-breaker; it must not override real load.
+        """
+        session_key = str(session_id).encode("utf-8")
+        best_rank = 0
+        best_load = None
+        best_hash = -1
+        for rank in range(self._routable_engine_count):
+            load = (
+                self._rank_tokens[rank] + self._dp_lb_req_equiv * self._rank_reqs[rank]
+            )
+            tie_hash = int.from_bytes(
+                hashlib.blake2b(
+                    session_key + rank.to_bytes(4, "little"), digest_size=8
+                ).digest(),
+                "little",
+            )
+            if (
+                best_load is None
+                or load < best_load
+                or (load == best_load and tie_hash > best_hash)
+            ):
+                best_rank = rank
+                best_load = load
+                best_hash = tie_hash
+        return best_rank
+
+    def _record_dp_route_locked(self, decision: str, rank: int) -> int:
+        """Account for one routing decision and return its target rank."""
+        self._dp_route_counters[decision] += 1
+        self._rank_routed_total[rank] += 1
+        return rank
+
+    def _select_dp_rank_for_seq_locked(
+        self, seq: Sequence, explicit_rank: int | None
+    ) -> int:
+        """Route one sequence using explicit hint, strict owner, then load.
+
+        This intentionally matches SGLang Model Gateway's agentic routing
+        semantics: a stable correlation/session id selects one DP rank, and
+        every later turn stays there. Load cannot move an existing session;
+        doing so turns a cheap cache hit into a potentially huge prefill.
+
+        Parent lineage does not affect placement. Each child correlation id is
+        its own sticky session, preventing sibling subagents from dogpiling the
+        root's rank. Requests without a session retain normal load balancing.
+        """
+        if explicit_rank is not None:
+            if self._dp_session_affinity_enabled:
+                # An explicit placement is authoritative and becomes the
+                # session's owner for subsequent unhinted requests.
+                session_id = getattr(seq, "dp_session_id", None)
+                if session_id:
+                    old_owner = self._dp_session_owners.get(session_id)
+                    if old_owner is not None and old_owner != explicit_rank:
+                        # The new rank cannot be assumed to own the old prefix.
+                        self._dp_session_prompt_tokens.pop(session_id, None)
+                    self._dp_session_owners[session_id] = explicit_rank
+            return self._record_dp_route_locked("explicit_total", explicit_rank)
+
+        session_id = getattr(seq, "dp_session_id", None)
+        parent_id = getattr(seq, "dp_parent_session_id", None)
+        if not self._dp_session_affinity_enabled or not session_id:
+            rank = self._select_dp_rank_locked()
+            return self._record_dp_route_locked("load_balanced_total", rank)
+
+        owner = self._dp_session_owners.get(session_id)
+        if owner is None or not 0 <= owner < self._routable_engine_count:
+            owner = self._select_new_session_rank_locked(session_id)
+            self._dp_session_owners[session_id] = owner
+            if parent_id:
+                self._dp_route_counters["affinity_parent_ignored_total"] += 1
+            logger.debug(
+                "%s: DPA load-aware affinity new session=%s parent=%s owner=rank%d "
+                "load=%d tokens=%d reqs=%d",
+                self.label,
+                session_id,
+                parent_id,
+                owner,
+                self._rank_tokens[owner]
+                + self._dp_lb_req_equiv * self._rank_reqs[owner],
+                self._rank_tokens[owner],
+                self._rank_reqs[owner],
+            )
+            return self._record_dp_route_locked("affinity_new_total", owner)
+
+        return self._record_dp_route_locked("affinity_owner_hit_total", owner)
+
+    def get_dp_router_statistics(self) -> dict:
+        """Return a consistent, non-mutating snapshot of DP routing state."""
+        with self._lb_lock:
+            sessions_per_rank = [0] * self._routable_engine_count
+            for rank in self._dp_session_owners.values():
+                if 0 <= rank < self._routable_engine_count:
+                    sessions_per_rank[rank] += 1
+            return {
+                "enabled": self._routable_engine_count > 1,
+                **self._dp_route_counters,
+                "requests_per_rank": list(self._rank_routed_total),
+                "inflight_requests_per_rank": list(self._rank_reqs),
+                "queued_prefill_tokens_per_rank": list(self._rank_tokens),
+                "session_count_per_rank": sessions_per_rank,
+            }
+
     def _charge_seq_load_locked(self, seq: Sequence, dp_rank: int) -> None:
         """Record a seq's in-flight load on dp_rank. Caller must hold _lb_lock."""
         req_cost = 1
-        tok_cost = int(getattr(seq, "num_prompt_tokens", 0) or 0)
+        prompt_tokens = int(getattr(seq, "num_prompt_tokens", 0) or 0)
+        tok_cost = prompt_tokens
+        session_id = getattr(seq, "dp_session_id", None)
+        if self._dp_session_affinity_enabled and session_id:
+            previous_prompt_tokens = self._dp_session_prompt_tokens.get(session_id)
+            if previous_prompt_tokens is not None:
+                # Agentic turns normally extend their previous prompt.  Charge
+                # only that extension; request-equivalent load still accounts
+                # for lookup/decode pressure when the delta is zero.
+                tok_cost = max(0, prompt_tokens - previous_prompt_tokens)
+            self._dp_session_prompt_tokens[session_id] = prompt_tokens
         self._rank_reqs[dp_rank] += req_cost
         self._rank_tokens[dp_rank] += tok_cost
         self._seq_load[seq.id] = (dp_rank, req_cost, tok_cost)
+
+    def _deliver_terminal_output(self, seq) -> bool:
+        """Give an online client the terminal output for a seq that never streamed.
+
+        A sequence the scheduler rejected before it ran produced no tokens and
+        no STREAM chunk, so nothing has answered the client yet. Synthesises the
+        finished `RequestOutput` the normal path would have built in
+        `postprocess`, carrying `leave_reason` as the finish reason so the
+        response says why it ended rather than closing empty.
+
+        Returns whether a callback was invoked, so the caller knows to flush the
+        batch the callback buffered into. Offline sequences register no callback
+        and normal completions have had theirs popped by the STREAM that
+        delivered them, so both answer False and keep their existing path.
+        """
+        callback = self._seq_id_to_callback.pop(seq.id, None)
+        if callback is None:
+            return False
+        # Never empty: an empty reason reaches the client as `finish_reason:
+        # null`, which the OpenAI schema reserves for a choice still being
+        # generated -- so a client would keep waiting on a finished stream.
+        reason = seq.leave_reason or "rejected"
+        try:
+            callback(
+                RequestOutput(
+                    request_id=seq.id,
+                    output_tokens=[],
+                    finished=True,
+                    finish_reason=reason,
+                )
+            )
+        except Exception as e:
+            logger.warning(
+                f"Error delivering terminal output for sequence {seq.id}: {e}",
+                exc_info=True,
+            )
+            return False
+        logger.info(
+            "%s: seq %s returned without running: %s", self.label, seq.id, reason
+        )
+        return True
 
     def _release_seq_load(self, seq_id) -> None:
         """Undo a seq's in-flight load when it finishes or is aborted.
@@ -781,6 +1227,18 @@ class CoreManager:
             dp_rank, req_cost, tok_cost = entry
             self._rank_reqs[dp_rank] -= req_cost
             self._rank_tokens[dp_rank] -= tok_cost
+
+    def _mark_seq_prefill_complete(self, seq_id) -> None:
+        """Release only a sequence's prefill-token charge, once."""
+        with self._lb_lock:
+            entry = self._seq_load.get(seq_id)
+            if entry is None:
+                return
+            dp_rank, req_cost, tok_cost = entry
+            if tok_cost == 0:
+                return
+            self._rank_tokens[dp_rank] -= tok_cost
+            self._seq_load[seq_id] = (dp_rank, req_cost, 0)
 
     def reset_dp_router(self) -> None:
         """Reset all DP routing state (rotation cursor + in-flight load).
@@ -805,14 +1263,16 @@ class CoreManager:
                     len(self._seq_load),
                 )
             self._rank_rotation_cursor = 0
-            self._rank_reqs = [0] * self.local_engine_count
-            self._rank_tokens = [0] * self.local_engine_count
+            self._rank_reqs = [0] * self._routable_engine_count
+            self._rank_tokens = [0] * self._routable_engine_count
             self._seq_load.clear()
+            self._dp_session_owners.clear()
+            self._dp_session_prompt_tokens.clear()
 
     def send_utility_command(self, cmd: str, dp_rank: int | None = None):
         if dp_rank is None:
             # Send to all DP ranks
-            for rank in range(self.local_engine_count):
+            for rank in range(len(self.control_sockets)):
                 logger.debug(
                     f"{self.label}: Send utility command '{cmd}' to DP rank {rank}"
                 )
@@ -847,7 +1307,7 @@ class CoreManager:
         payload = {"cmd": cmd, **kwargs}
         # Serialize once and reuse for all ranks (optimization: avoid repeated pickle.dumps)
         serialized_payload = pickle.dumps((EngineCoreRequestType.UTILITY, payload))
-        for rank in range(self.local_engine_count):
+        for rank in range(len(self.control_sockets)):
             logger.debug(
                 f"{self.label}: Broadcast utility command '{cmd}' to DP rank {rank}"
             )
@@ -866,9 +1326,10 @@ class CoreManager:
 
         self.broadcast_utility_command(cmd, **kwargs)
 
-        # Collect one response per DP rank
+        # Collect one response per routable engine (must match the broadcast count
+        # len(self.control_sockets), which is the global engine count on a coordinator).
         responses = []
-        for _ in range(self.local_engine_count):
+        for _ in range(len(self.control_sockets)):
             try:
                 resp = self.utility_response_queue.get(timeout=timeout)
                 responses.append(resp)
@@ -880,21 +1341,26 @@ class CoreManager:
         return responses
 
     def _shutdown_engine_core_rank(self, dp_rank: int):
-        if dp_rank >= len(self.engine_core_processes):
-            return
+        # Determine whether this rank has a local process and/or a control socket.
+        # On a coordinator with remote engines, dp_rank may exceed the local
+        # process list -- but we still hold a live control socket for it, and
+        # the remote engine must receive SHUTDOWN so its worker node unblocks.
+        has_local_process = dp_rank < len(self.engine_core_processes)
+        process = self.engine_core_processes[dp_rank] if has_local_process else None
+        has_local_alive = process is not None and process.is_alive()
 
-        process = self.engine_core_processes[dp_rank]
-        if process is not None and process.is_alive():
+        has_control_socket = (
+            dp_rank < len(self.control_sockets)
+            and not self.control_sockets[dp_rank].closed
+        )
+
+        # Send SHUTDOWN if:
+        #   - local rank with a live process (original behavior), OR
+        #   - remote rank that has an open control socket (new: coordinator → worker).
+        should_send = has_local_alive or (not has_local_process and has_control_socket)
+        if should_send:
             try:
-                # Guard the socket actually used. A partial init -- an exception
-                # between the input and control handshakes -- leaves
-                # control_sockets shorter than engine_core_processes, and the
-                # IndexError would be swallowed below, reporting a clean
-                # shutdown for an engine that never received one.
-                if (
-                    dp_rank < len(self.control_sockets)
-                    and not self.control_sockets[dp_rank].closed
-                ):
+                if has_control_socket:
                     self._send_control(
                         dp_rank, pickle.dumps((EngineCoreRequestType.SHUTDOWN, None))
                     )
@@ -930,10 +1396,22 @@ class CoreManager:
         )
 
 
-def launch_engine_core(config: Config, dp_rank: int = 0):
-    input_address = get_open_zmq_ipc_path()
-    output_address = get_open_zmq_ipc_path()
-    control_address = get_open_zmq_ipc_path()
+def launch_engine_core(
+    config: Config,
+    dp_rank: int = 0,
+    local_dp_rank: int | None = None,
+    addresses: dict | None = None,
+):
+    if addresses is None:
+        input_address = get_open_zmq_ipc_path()
+        output_address = get_open_zmq_ipc_path()
+        control_address = get_open_zmq_ipc_path()
+    else:
+        # Multi-node: TCP endpoints derived from the shared port plan. The
+        # engine connects; the coordinator binds.
+        input_address = addresses["input_address"]
+        output_address = addresses["output_address"]
+        control_address = addresses["control_address"]
     import torch
 
     # Imported here, not at module scope: EngineCore pulls the heavy
@@ -945,16 +1423,20 @@ def launch_engine_core(config: Config, dp_rank: int = 0):
     if torch.multiprocessing.get_start_method(allow_none=True) is None:
         torch.multiprocessing.set_start_method("spawn", force=False)
 
+    if local_dp_rank is None:
+        local_dp_rank = dp_rank
     config.parallel_config.data_parallel_rank = dp_rank
-    config.parallel_config.data_parallel_rank_local = dp_rank
+    config.parallel_config.data_parallel_rank_local = local_dp_rank
     # Rides on the config rather than run_engine's signature, which every
     # EngineCore subclass would otherwise have to thread through.
     config.parallel_config.control_address = control_address
 
     # tp_world_size: the GPUs this DP rank really occupies.
     logger.info(
-        f"Creating EngineCore process: DP rank {dp_rank}, will use GPUs "
-        f"{dp_rank * config.tp_world_size} to {(dp_rank + 1) * config.tp_world_size - 1}"
+        f"Creating EngineCore process: global DP rank {dp_rank} "
+        f"(local {local_dp_rank}), GPUs "
+        f"{local_dp_rank * config.tp_world_size} to "
+        f"{(local_dp_rank + 1) * config.tp_world_size - 1}"
     )
 
     process = multiprocessing.Process(
@@ -974,7 +1456,7 @@ def launch_engine_core(config: Config, dp_rank: int = 0):
             "output_address": output_address,
             "control_address": control_address,
         },
-        dp_rank,
+        local_dp_rank,
     )
 
 
@@ -1168,8 +1650,9 @@ class DisaggCoreManager(CoreManager):
         sock = self.output_sockets[idx]
         while True:
             obj = sock.recv(copy=False)
-            request_type, _ = pickle.loads(obj)
+            request_type, data = pickle.loads(obj)
             if request_type == EngineCoreRequestType.READY:
+                self._record_ready_payload(data)
                 return
             if request_type == EngineCoreRequestType.SHUTDOWN:
                 raise RuntimeError(

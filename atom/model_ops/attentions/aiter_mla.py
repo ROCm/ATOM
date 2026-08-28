@@ -56,6 +56,11 @@ try:
 except (TypeError, ValueError):
     _MLA_META_SUPPORTS_MAX_SPLIT = False
 
+# Cap on the KV-split budget: aiter cuts the KV walk into
+# `min(num_clusters, cap * batch_size)` parts, and a negative cap means uncapped
+# -- as many parts as the machine has clusters (v1_2_device.cuh:894).
+_MLA_SPLIT_BUDGET_AUTO = -1
+
 
 def _mla_seg_meta_kwargs() -> dict:
     """Extra kwargs for ``get_mla_metadata_info_v1`` on the seg (page_size>1)
@@ -63,6 +68,33 @@ def _mla_seg_meta_kwargs() -> dict:
     if envs.ATOM_MLA_PAGE_SIZE > 1 and _MLA_META_SUPPORTS_MAX_SPLIT:
         return {"max_split_per_batch": 16}
     return {}
+
+
+def _global_index_cache_layer_ids(
+    indexer_types,
+    num_hidden_layers: int,
+    num_draft_layers: int,
+) -> tuple[int, ...]:
+    """Return global layers that own an index-key cache slice.
+
+    GLM-5.2 ``shared`` layers reuse a preceding full layer's temporary top-k
+    positions and do not construct an indexer, so their index-key cache slices
+    are dead. Other sparse MLA models have no ``indexer_types`` schedule and
+    retain the existing one-slice-per-layer layout.
+    """
+    target_layer_ids = range(num_hidden_layers)
+    if indexer_types is not None:
+        target_layer_ids = (
+            layer_id
+            for layer_id in target_layer_ids
+            # MTP layers are not included in indexer_types. Only the GLM
+            # "shared" value means no indexer module/cache owner; DeepSeek's
+            # index_topk_pattern "S" has different semantics and keeps a cache.
+            if layer_id >= len(indexer_types) or indexer_types[layer_id] != "shared"
+        )
+    return tuple(target_layer_ids) + tuple(
+        range(num_hidden_layers, num_hidden_layers + num_draft_layers)
+    )
 
 
 @dataclass
@@ -143,6 +175,55 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
     # prepare_mtp_decode's fused kernel when this is set (matches the MHA
     # backend). The fused kernel handles both sparse and dense MLA.
     fuse_mtp_decode_position_update = True
+
+    def _global_num_draft_layers(self) -> int:
+        """Return draft layers in the target MLA pool across all PP stages."""
+        runner = self.model_runner
+        spec_config = getattr(runner.config, "speculative_config", None)
+        # Eagle3 draft layers are owned by eagle3_draft_builder and use a
+        # separate KV pool. Only MTP-style draft layers share the target MLA
+        # pool and therefore belong in this pool's global KV/index-cache layout.
+        if spec_config is None or hasattr(runner, "eagle3_draft_builder"):
+            return 0
+        draft_hf_config = spec_config.draft_model_hf_config
+        # Mirror ModelRunner._get_total_num_layers(), which is authoritative for
+        # the rows actually allocated in this target MLA pool.
+        return getattr(draft_hf_config, "num_nextn_predict_layers", 1)
+
+    def _index_cache_layout(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        """Return (local, global) global-layer IDs owning index cache slices."""
+        from aiter.dist.parallel_state import get_pp_group
+
+        from atom.models.utils import get_pp_indices
+
+        runner = self.model_runner
+        hf_config = runner.config.hf_config
+        num_hidden_layers = hf_config.num_hidden_layers
+        pp_group = get_pp_group()
+        start_layer, end_layer = get_pp_indices(
+            num_hidden_layers, pp_group.rank_in_group, pp_group.world_size
+        )
+        num_local_target_layers = end_layer - start_layer
+        num_local_draft_layers = (
+            runner._get_total_num_layers() - num_local_target_layers
+        )
+        global_layer_ids = _global_index_cache_layer_ids(
+            getattr(hf_config, "indexer_types", None),
+            num_hidden_layers,
+            self._global_num_draft_layers(),
+        )
+        local_layer_ids = tuple(
+            layer_id
+            for layer_id in global_layer_ids
+            if start_layer <= layer_id < end_layer
+            # start_layer and end_layer DONOT contain draft layers
+            or (
+                num_hidden_layers
+                <= layer_id
+                < num_hidden_layers + num_local_draft_layers
+            )
+        )
+        return local_layer_ids, global_layer_ids
 
     def __init__(self, model_runner):
         if envs.ATOM_MLA_PAGE_SIZE > 1:
@@ -565,7 +646,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             "max_seqlen_qo": 1,
             "uni_seqlen_qo": 1,
             "fast_mode": 1,
-            "max_split_per_batch": 16,
+            "max_split_per_batch": _MLA_SPLIT_BUDGET_AUTO,
         }
         work_meta_data = var["sparse_mtp_work_meta_data"]
         work_info_set = var["sparse_mtp_work_info_set"]
@@ -609,12 +690,17 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         sparse_decode: bool = False,
         is_cp_round_robin: bool = False,
     ):
+        assert num_reject_tokens is None or num_reject_tokens.shape[0] >= bs, (
+            f"num_reject_tokens covers {num_reject_tokens.shape[0]} sequences "
+            f"but this asks for {bs}; the update kernel loads one per work item "
+            f"below `cu_num`, unconditionally"
+        )
         split_params = {
             "kv_granularity": max(self.block_size, 16),
             "max_seqlen_qo": max_q_len,
             "uni_seqlen_qo": max_q_len,
             "fast_mode": 1,
-            "max_split_per_batch": 16,
+            "max_split_per_batch": _MLA_SPLIT_BUDGET_AUTO,
         }
         # round-robin CP only lands on the full-build path: decode_update_mla_
         # metadata_v1 has no is_cp_round_robin arg and collapses qlen>1 to 1.
@@ -737,18 +823,21 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         parity with the MHA backend but unused (MLA's ``positions`` is already
         one entry per sequence at this point).
         """
+        running_bs = int(positions.shape[-1])  # rows; see the base contract
         del last_token_indices  # MLA positions are already per-seq (1 per token)
         var = self.model_runner.forward_vars
-        kv_indptr = var["kv_indptr"].gpu[: bs + 1]
-        cu_seqlens_q = var["cu_seqlens_q"].gpu[: bs + 1]
+        kv_indptr = var["kv_indptr"].gpu[: running_bs + 1]
+        cu_seqlens_q = var["cu_seqlens_q"].gpu[: running_bs + 1]
         if self.is_sparse:
-            sparse_kv_indptr = var["sparse_kv_indptr"].gpu[: bs + 1]
+            sparse_kv_indptr = var["sparse_kv_indptr"].gpu[: running_bs + 1]
         else:
             assert self.block_size == 1
             sparse_kv_indptr = None
 
         update_positions = positions_out is not None
-        context_lens = var["context_lens"].gpu[:bs] if update_context_lens else None
+        context_lens = (
+            var["context_lens"].gpu[:running_bs] if update_context_lens else None
+        )
 
         mtp_prepare_decode_mla_kernel[(1,)](
             kv_indptr,
@@ -756,7 +845,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             sparse_kv_indptr if self.is_sparse else kv_indptr,
             positions_out if update_positions else kv_indptr,
             context_lens if update_context_lens else kv_indptr,
-            bs,
+            running_bs,
             self.index_topk if self.is_sparse else 0,
             positions_out.stride(0) if update_positions else 1,
             IS_SPARSE=self.is_sparse,
@@ -776,13 +865,15 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             assert self.block_size == 1
             W = self.dcp_world_size
             r = self.dcp_rank
-            ctx_g = var["context_lens"].gpu[:bs].to(torch.int64)
+            ctx_g = var["context_lens"].gpu[:running_bs].to(torch.int64)
             base = ctx_g // W
             remainder = (ctx_g - base * W - r).clamp_(0, 1)
             local_ctx = (base + remainder).to(torch.int32)  # local KV tokens/blocks
             kv_indptr[0] = 0
-            kv_indptr[1 : bs + 1] = torch.cumsum(local_ctx, dim=0, dtype=torch.int32)
-            var["kv_last_page_lens"].gpu[:bs] = (local_ctx > 0).to(
+            kv_indptr[1 : running_bs + 1] = torch.cumsum(
+                local_ctx, dim=0, dtype=torch.int32
+            )
+            var["kv_last_page_lens"].gpu[:running_bs] = (local_ctx > 0).to(
                 var["kv_last_page_lens"].gpu.dtype
             )
             # Host upper bound for the index generator's loop (safe overestimate,
@@ -790,7 +881,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             local_max_k = max_seqlen_k // W + 1
 
         kv_indices_generate_triton(
-            var["block_tables"].gpu[:bs],
+            var["block_tables"].gpu[:running_bs],
             var["kv_indices"].gpu,
             kv_indptr,
             self.block_ratio,
@@ -800,7 +891,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # qlen==1 local decode: full build (not cprr; is_cp_round_robin=False),
             # over the just-rebuilt LOCAL kv_indptr / kv_last_page_lens.
             return self.set_mla_persistent_worker_buffers(
-                bs, 1, only_update=False, num_reject_tokens=None
+                running_bs, 1, only_update=False, num_reject_tokens=None
             )
         if self.is_sparse:
             # The MTP draft's single sparse block reads sparse_kv_indptr, but it
@@ -818,7 +909,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # reflects the reject-adjusted KV lengths, so num_reject_tokens is
             # not needed here.
             result = self.set_mla_persistent_worker_buffers(
-                bs,
+                running_bs,
                 1,
                 only_update=False,
                 num_reject_tokens=None,
@@ -826,6 +917,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             )
             result["sparse_kv_indptr"] = sparse_kv_indptr
         else:
+            # `bs`, not `running_bs`, and paired with `num_reject_tokens`: this count
+            # becomes `cu_num`, and the update kernel loads
+            # `num_reject_tokens[batch_id]` for every work item below it, before
+            # any length test. That tensor is the sampler's, so it is `bs` long.
+            # The two branches above pass no counts and so take the row count.
             result = self.set_mla_persistent_worker_buffers(
                 bs, max_seqlen_q, only_update, num_reject_tokens
             )
@@ -836,8 +932,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         tensor per layer (k_c + k_pe; V is absorbed into latent compression —
         no separate V cache or kv_scale).
 
-        DeepSeek-V3.2 sparse variant adds an indexer cache contribution
-        for every bound layer, including draft/MTP layers.
+        DeepSeek-V3.2 sparse variants add an indexer cache contribution
+        for every indexer-owning layer, including draft/MTP layers. GLM-5.2
+        shared layers do not own an indexer and are excluded.
         """
         runner = self.model_runner
         config = runner.config
@@ -849,8 +946,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         if runner.is_deepseek_v32:
             index_dim = hf_config.index_head_dim + 4
             aligned_index_dim = ((index_dim + 15) // 16) * 16
+            index_cache_layer_ids, _ = self._index_cache_layout()
             block_bytes += (
-                total_num_layers
+                len(index_cache_layer_ids)
                 * runner.block_size
                 * aligned_index_dim
                 * dtypes.fp8.itemsize
@@ -863,9 +961,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         """MLA: single 576-dim paged tensor per layer (k_c + k_pe packed,
         no separate V cache — MLA absorbs V into the latent compression).
 
-        DeepSeek-V3.2 sparse variant additionally allocates an `index_cache`
-        for the indexer module; the aligned dimension is also returned so
-        build_kv_cache_tensor can reslice without recomputing it.
+        DeepSeek-V3.2 sparse variants additionally allocate an `index_cache`
+        for indexer-owning layers; the aligned dimension and compact layer map
+        are returned so build_kv_cache_tensor can bind the correct slice.
         """
         runner = self.model_runner
         config = runner.config
@@ -886,9 +984,17 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # to avoid unaligned memory access in torch inductor.
             index_dim = hf_config.index_head_dim + 4
             aligned = ((index_dim + 15) // 16) * 16
+            index_cache_layer_ids, _ = self._index_cache_layout()
             out["aligned_index_dim"] = aligned
+            out["index_cache_layer_ids"] = index_cache_layer_ids
+            out["index_cache_layer_map"] = {
+                global_layer_id: compact_layer_id
+                for compact_layer_id, global_layer_id in enumerate(
+                    index_cache_layer_ids
+                )
+            }
             out["index_cache"] = torch.zeros(
-                total_num_layers,
+                len(index_cache_layer_ids),
                 runner.num_physical_kvcache_blocks,
                 runner.physical_block_size,
                 aligned,
@@ -920,9 +1026,22 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         num_slots = runner.num_physical_kvcache_blocks * runner.physical_block_size
         kv_cache = runner.kv_cache[layer_id].view(num_slots, 1, 576)
         module.max_model_len = runner.config.max_model_len
+        index_cache = None
         if runner.is_deepseek_v32 and module.indexer is not None:
+            # `layer_id` is a PP-local cache-row counter, while the compact map
+            # is keyed by global model layer IDs. On a non-first PP stage they
+            # differ (for example local 0 may be global 39), so use layer_num
+            # to avoid binding this indexer to another stage's compact row.
+            global_layer_id = getattr(module, "layer_num", None)
+            if global_layer_id not in runner.index_cache_layer_map:
+                raise RuntimeError(
+                    "Sparse MLA indexer layer is missing from the compact index "
+                    f"cache layout: layer_num={global_layer_id}"
+                )
+            index_cache_layer_id = runner.index_cache_layer_map[global_layer_id]
+            index_cache = runner.index_cache[index_cache_layer_id]
             # Use aligned dimension to avoid memory copy in torch inductor
-            module.indexer.k_cache.kv_cache[0] = runner.index_cache[layer_id].view(
+            module.indexer.k_cache.kv_cache[0] = index_cache.view(
                 runner.num_physical_kvcache_blocks * runner.physical_block_size,
                 1,
                 runner.aligned_index_dim,
@@ -934,9 +1053,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             v_cache=None,
             k_scale=None,
             v_scale=None,
-            index_cache=(
-                runner.index_cache[layer_id] if runner.is_deepseek_v32 else None
-            ),
+            index_cache=index_cache if runner.is_deepseek_v32 else None,
         )
 
     def get_kv_transfer_tensors(self):
@@ -974,10 +1091,61 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     )
                 )
 
+        block_region_consumer_indices = None
+        index_cache_layer_ids = getattr(runner, "index_cache_layer_ids", ())
+        if index_cache_layer_ids:
+            local_index_layer_ids, global_index_layer_ids = self._index_cache_layout()
+            if tuple(index_cache_layer_ids) != local_index_layer_ids:
+                raise RuntimeError(
+                    "Allocated and transfer-time index cache layouts disagree"
+                )
+            num_hidden_layers = runner.config.hf_config.num_hidden_layers
+            num_global_draft_layers = sum(
+                layer_id >= num_hidden_layers for layer_id in global_index_layer_ids
+            )
+            num_global_kv_layers = num_hidden_layers + num_global_draft_layers
+            # Unlike index_cache_layer_map (PP-local allocated rows), this map
+            # numbers compact index-cache rows in the consumer's global region
+            # list. It is used only to translate local P/D regions.
+            global_compact_index_slot_by_layer = {
+                global_layer_id: compact_layer_id
+                for compact_layer_id, global_layer_id in enumerate(
+                    global_index_layer_ids
+                )
+            }
+            from aiter.dist.parallel_state import get_pp_group
+
+            from atom.models.utils import get_pp_indices
+
+            pp_group = get_pp_group()
+            start_layer, end_layer = get_pp_indices(
+                num_hidden_layers, pp_group.rank_in_group, pp_group.world_size
+            )
+            num_local_target_layers = end_layer - start_layer
+            num_local_draft_layers = num_layers - num_local_target_layers
+            local_kv_layer_ids = tuple(range(start_layer, end_layer)) + tuple(
+                range(
+                    num_hidden_layers,
+                    num_hidden_layers + num_local_draft_layers,
+                )
+            )
+            if len(local_kv_layer_ids) != num_layers:
+                raise RuntimeError(
+                    "MLA KV cache layer count does not match the PP-local layout: "
+                    f"cache={num_layers}, layout={len(local_kv_layer_ids)}, "
+                    f"target={num_local_target_layers}, "
+                    f"draft={num_local_draft_layers}"
+                )
+            block_region_consumer_indices = list(local_kv_layer_ids) + [
+                num_global_kv_layers + global_compact_index_slot_by_layer[layer_id]
+                for layer_id in local_index_layer_ids
+            ]
+
         return KVTransferTensors(
             block_regions=block_regions,
             slot_regions=[],
             num_blocks=runner.config.num_kvcache_blocks,
+            block_region_consumer_indices=block_region_consumer_indices,
         )
 
     def _build_dcp_indexer_prefill_meta(self, attn_metadata, bs: int, counts, var):
@@ -1130,7 +1298,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 max_seqlen_qo=1,
                 uni_seqlen_qo=1,
                 fast_mode=1,
-                max_split_per_batch=16,
+                max_split_per_batch=_MLA_SPLIT_BUDGET_AUTO,
             )
             attn_metadata.sparse_prefill_work_meta_data = var[
                 "sparse_prefill_work_meta_data"
@@ -1506,7 +1674,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             max_seqlen_qo=1,
             uni_seqlen_qo=1,
             fast_mode=1,
-            max_split_per_batch=16,
+            max_split_per_batch=_MLA_SPLIT_BUDGET_AUTO,
         )
         attn_metadata.sparse_prefill_work_meta_data = var[
             "sparse_prefill_work_meta_data"
@@ -1828,7 +1996,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 "sparse_kv_last_page_lens"
             ].gpu[:bs]
 
-        # Use bs (graph_bs) >= 2 instead of scheduled_bs >= 2 to avoid accuracy issue:
+        # Use bs (running_bs) >= 2 instead of scheduled_bs >= 2 to avoid accuracy issue:
         if self.model_runner.config.enable_tbo_decode and bs >= 2:
             self._prepare_ubatch_decode(
                 scheduled_bs,
@@ -1857,10 +2025,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             (0, half),
             (half, bs),
         ]
-        padded_bs_list = [half, bs - half]
+        running_bs_list = [half, bs - half]
 
-        for ub_idx, ((req_start, req_end), padded_bs) in enumerate(
-            zip(ub_ranges, padded_bs_list)
+        for ub_idx, ((req_start, req_end), running_bs) in enumerate(
+            zip(ub_ranges, running_bs_list)
         ):
             p = f"ub{ub_idx}_"
             # How many real requests fall in this ubatch's range
@@ -1869,16 +2037,16 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             var[f"{p}context_lens"].np[:ub_real_reqs] = var["context_lens"].np[
                 req_start : req_start + ub_real_reqs
             ]
-            var[f"{p}context_lens"].np[ub_real_reqs:padded_bs] = 0
+            var[f"{p}context_lens"].np[ub_real_reqs:running_bs] = 0
 
             var[f"{p}kv_last_page_lens"].np[:ub_real_reqs] = var[
                 "kv_last_page_lens"
             ].np[req_start : req_start + ub_real_reqs]
-            var[f"{p}kv_last_page_lens"].np[ub_real_reqs:padded_bs] = 0
+            var[f"{p}kv_last_page_lens"].np[ub_real_reqs:running_bs] = 0
 
             tok_start = req_start * max_seqlen_q
             ub_real_tokens = ub_real_reqs * max_seqlen_q
-            padded_tok_count = padded_bs * max_seqlen_q
+            padded_tok_count = running_bs * max_seqlen_q
             var[f"{p}slot_mapping"].np[:ub_real_tokens] = var["slot_mapping"].np[
                 tok_start : tok_start + ub_real_tokens
             ]
@@ -1887,7 +2055,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             var[f"{p}block_tables"].np[:ub_real_reqs] = var["block_tables"].np[
                 req_start : req_start + ub_real_reqs
             ]
-            var[f"{p}block_tables"].np[ub_real_reqs:padded_bs] = 0
+            var[f"{p}block_tables"].np[ub_real_reqs:running_bs] = 0
 
             full_kv_indptr = var["kv_indptr"].np
             base = full_kv_indptr[req_start]
@@ -1897,7 +2065,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     full_kv_indptr[req_start + 1 : req_start + ub_real_reqs + 1] - base
                 )
             last_val = var[f"{p}kv_indptr"].np[ub_real_reqs] if ub_real_reqs > 0 else 0
-            var[f"{p}kv_indptr"].np[ub_real_reqs + 1 : padded_bs + 1] = last_val
+            var[f"{p}kv_indptr"].np[ub_real_reqs + 1 : running_bs + 1] = last_val
 
             if self.dcp_world_size > 1:
                 # Per-ubatch slice of the global kv_indptr (rebased); diffs (per-req
@@ -1913,7 +2081,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 g_last = (
                     var[f"{p}g_kv_indptr"].np[ub_real_reqs] if ub_real_reqs > 0 else 0
                 )
-                var[f"{p}g_kv_indptr"].np[ub_real_reqs + 1 : padded_bs + 1] = g_last
+                var[f"{p}g_kv_indptr"].np[ub_real_reqs + 1 : running_bs + 1] = g_last
 
             if self.is_sparse:
                 full_sparse = var["sparse_kv_indptr"].np
@@ -1930,7 +2098,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     else 0
                 )
                 var[f"{p}sparse_kv_indptr"].np[
-                    ub_real_reqs + 1 : padded_bs + 1
+                    ub_real_reqs + 1 : running_bs + 1
                 ] = sparse_last
 
             last_cu = ub_real_reqs * max_seqlen_q
@@ -1940,20 +2108,20 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 max_seqlen_q,
                 dtype=np.int32,
             )
-            var[f"{p}cu_seqlens_q"].np[ub_real_reqs + 1 : padded_bs + 1] = last_cu
+            var[f"{p}cu_seqlens_q"].np[ub_real_reqs + 1 : running_bs + 1] = last_cu
 
             vars_used = [
-                (f"{p}context_lens", padded_bs),
-                (f"{p}kv_last_page_lens", padded_bs),
+                (f"{p}context_lens", running_bs),
+                (f"{p}kv_last_page_lens", running_bs),
                 (f"{p}slot_mapping", padded_tok_count),
-                (f"{p}block_tables", padded_bs),
-                (f"{p}kv_indptr", padded_bs + 1),
-                (f"{p}cu_seqlens_q", padded_bs + 1),
+                (f"{p}block_tables", running_bs),
+                (f"{p}kv_indptr", running_bs + 1),
+                (f"{p}cu_seqlens_q", running_bs + 1),
             ]
             if self.dcp_world_size > 1:
-                vars_used.append((f"{p}g_kv_indptr", padded_bs + 1))
+                vars_used.append((f"{p}g_kv_indptr", running_bs + 1))
             if self.is_sparse:
-                vars_used.append((f"{p}sparse_kv_indptr", padded_bs + 1))
+                vars_used.append((f"{p}sparse_kv_indptr", running_bs + 1))
 
             for el, num in vars_used:
                 var[el].copy_to_gpu(num)
@@ -1964,39 +2132,39 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 else 0
             )
             kv_indices_generate_triton(
-                var[f"{p}block_tables"].gpu[:padded_bs],
+                var[f"{p}block_tables"].gpu[:running_bs],
                 var[f"{p}kv_indices"].gpu,
-                var[f"{p}kv_indptr"].gpu[: padded_bs + 1],
+                var[f"{p}kv_indptr"].gpu[: running_bs + 1],
                 self.block_ratio,
                 ub_max_seqlen_k,
             )
 
             self._set_ubatch_mla_buffers(
-                padded_bs,
+                running_bs,
                 max_seqlen_q,
                 ub_idx,
                 is_cp_round_robin=self.dcp_world_size > 1 and max_seqlen_q > 1,
             )
 
     def _set_ubatch_mla_buffers(
-        self, padded_bs, max_q_len, ubatch_idx, is_cp_round_robin=False
+        self, running_bs, max_q_len, ubatch_idx, is_cp_round_robin=False
     ):
         """Compute MLA work buffers for a per-ubatch forward_vars set."""
         p = f"ub{ubatch_idx}_"
         var = self.model_runner.forward_vars
 
-        kv_indptr_for_mla = var[f"{p}kv_indptr"].gpu[: padded_bs + 1]
-        kv_last_page_lens_for_mla = var[f"{p}kv_last_page_lens"].gpu[:padded_bs]
+        kv_indptr_for_mla = var[f"{p}kv_indptr"].gpu[: running_bs + 1]
+        kv_last_page_lens_for_mla = var[f"{p}kv_last_page_lens"].gpu[:running_bs]
         if self.is_sparse:
-            kv_indptr_for_mla = var[f"{p}sparse_kv_indptr"].gpu[: padded_bs + 1]
+            kv_indptr_for_mla = var[f"{p}sparse_kv_indptr"].gpu[: running_bs + 1]
             # Sparse KV is packed per token at page_size=1 -> last_page_len is 1.
             # The dense per-block buffer would over-read past the sparse indices
             # (see set_mla_persistent_worker_buffers). The all-1s sparse buffer is
             # batch-independent, so the shared (non-ubatch) copy is safe here.
-            kv_last_page_lens_for_mla = var["sparse_kv_last_page_lens"].gpu[:padded_bs]
+            kv_last_page_lens_for_mla = var["sparse_kv_last_page_lens"].gpu[:running_bs]
 
         get_mla_metadata_v1(
-            var[f"{p}cu_seqlens_q"].gpu[: padded_bs + 1],
+            var[f"{p}cu_seqlens_q"].gpu[: running_bs + 1],
             kv_indptr_for_mla,
             kv_last_page_lens_for_mla,
             self.persistent_num_heads,
@@ -2016,7 +2184,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             max_seqlen_qo=max_q_len,
             uni_seqlen_qo=max_q_len,
             fast_mode=1,
-            max_split_per_batch=16,
+            max_split_per_batch=_MLA_SPLIT_BUDGET_AUTO,
         )
 
     def build_for_cudagraph_capture(self, bs: int) -> AttentionMetaData:
@@ -2119,14 +2287,20 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             ].gpu[:bs]
         positions = var["positions"].copy_to_gpu(sum_tokens)
         context = Context(
-            positions=positions, is_prefill=False, batch_size=bs, graph_bs=bs
+            positions=positions,
+            is_prefill=False,
+            scheduled_bs=bs,
+            running_bs=bs,
+            # A capture runs a full synthetic batch: nothing is padded.
+            scheduled_tokens=sum_tokens,
+            running_tokens=sum_tokens,
         )
         return attn_matadata, context
 
     def build_ubatch_metadata(
         self,
         ubatch_idx: int,
-        padded_bs: int,
+        running_bs: int,
     ) -> AttentionMetaData:
         """Create per-ubatch AttentionMetaData from pre-allocated forward_vars."""
         var = self.model_runner.forward_vars
@@ -2135,28 +2309,28 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         # Compute MLA work buffers for this ubatch
         self._set_ubatch_mla_buffers(
-            padded_bs,
+            running_bs,
             max_q_len,
             ubatch_idx,
             is_cp_round_robin=self.dcp_world_size > 1 and max_q_len > 1,
         )
 
         attn = AttentionMetaData(
-            slot_mapping=var[f"{p}slot_mapping"].gpu[: padded_bs * max_q_len],
-            context_lens=var[f"{p}context_lens"].gpu[:padded_bs],
-            block_tables=var[f"{p}block_tables"].gpu[:padded_bs],
+            slot_mapping=var[f"{p}slot_mapping"].gpu[: running_bs * max_q_len],
+            context_lens=var[f"{p}context_lens"].gpu[:running_bs],
+            block_tables=var[f"{p}block_tables"].gpu[:running_bs],
             max_seqlen_q=max_q_len,
-            cu_seqlens_q=var[f"{p}cu_seqlens_q"].gpu[: padded_bs + 1],
-            kv_indptr=var[f"{p}kv_indptr"].gpu[: padded_bs + 1],
+            cu_seqlens_q=var[f"{p}cu_seqlens_q"].gpu[: running_bs + 1],
+            kv_indptr=var[f"{p}kv_indptr"].gpu[: running_bs + 1],
             kv_indices=var[f"{p}kv_indices"].gpu,
-            kv_last_page_lens=var[f"{p}kv_last_page_lens"].gpu[:padded_bs],
+            kv_last_page_lens=var[f"{p}kv_last_page_lens"].gpu[:running_bs],
             sparse_kv_indptr=(
-                var[f"{p}sparse_kv_indptr"].gpu[: padded_bs + 1]
+                var[f"{p}sparse_kv_indptr"].gpu[: running_bs + 1]
                 if self.is_sparse
                 else None
             ),
             sparse_kv_last_page_lens=(
-                var["sparse_kv_last_page_lens"].gpu[:padded_bs]
+                var["sparse_kv_last_page_lens"].gpu[:running_bs]
                 if self.is_sparse
                 else None
             ),
@@ -2171,7 +2345,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # Per-ubatch round-robin CP global kv_indptr (None when non-DCP). Consumed
         # by _forward_decode when dcp>1 and max_q_len>1 (MTP).
         attn.g_kv_indptr = (
-            var[f"{p}g_kv_indptr"].gpu[: padded_bs + 1]
+            var[f"{p}g_kv_indptr"].gpu[: running_bs + 1]
             if self.dcp_world_size > 1
             else None
         )
@@ -2181,7 +2355,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         self,
         attn_metadata: AttentionMetaData,
         ub_slice,
-        padded_bs: int,
+        running_bs: int,
         ubatch_idx: int = 0,
     ) -> AttentionMetaData:
         """
@@ -2190,7 +2364,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         del ubatch_idx  # MLA has no per-ubatch pooled buffers to disambiguate
         from atom.utils.tbo.ubatch_splitting import split_attn_metadata
 
-        ub_attn = split_attn_metadata(attn_metadata, ub_slice, padded_bs)
+        ub_attn = split_attn_metadata(attn_metadata, ub_slice, running_bs)
 
         ts = ub_slice.token_slice
         rs = ub_slice.request_slice

@@ -21,7 +21,12 @@ from atom.kv_transfer.disaggregation.multi.multi_connector import (
     MultiConnectorMetadata,
     MultiConnectorScheduler,
 )
-from atom.kv_transfer.disaggregation.types import ConnectorMetadata, KVConnectorOutput
+from atom.kv_transfer.disaggregation.types import (
+    ConnectorCompletion,
+    ConnectorMetadata,
+    KVConnectorOutput,
+    SaveOperationId,
+)
 
 # ---------------------------------------------------------------------------
 # Mock sub-connectors
@@ -88,6 +93,16 @@ class FakeSchedSub:
     def load_failed(self, req_id):
         self.load_failed_ids.append(req_id)
 
+    def process_completions(self, output):
+        # Mirrors OffloadSchedulerMixin: apply the completions, then hand the
+        # scheduler bare request ids.
+        for value in output.finished_saving:
+            self.save_finished(value)
+        output.finished_saving = {
+            getattr(value, "req_id", value) for value in output.finished_saving
+        }
+        return output
+
     def has_pending_work(self):
         return self.pending
 
@@ -101,6 +116,7 @@ class FakeSchedSub:
             "should_defer_free",
             "save_finished",
             "load_failed",
+            "process_completions",
             "has_pending_work",
         }
         if name in offload_api and not object.__getattribute__(self, "_offload"):
@@ -144,7 +160,7 @@ def _worker(connectors, pp_is_head=True):
     obj._connectors = connectors
     obj.is_producer = any(getattr(c, "is_producer", False) for c in connectors)
     obj._pp_is_head = pp_is_head
-    obj._pending_save = set()
+    obj._pending_save_ops = {}
     obj._sent = {}
     obj._saved = {}
     return obj
@@ -155,6 +171,21 @@ def _save_meta(*req_ids):
     meta = ConnectorMetadata()
     meta.requests = [
         SimpleNamespace(req_id=r, save_spec=object(), load_spec=None) for r in req_ids
+    ]
+    return meta
+
+
+def _save_operation_meta(*operations):
+    """Offload metadata carrying exact save operation identities."""
+    meta = ConnectorMetadata()
+    meta.requests = [
+        SimpleNamespace(
+            req_id=operation.req_id,
+            save_spec=object(),
+            load_spec=None,
+            save_operation=operation,
+        )
+        for operation in operations
     ]
     return meta
 
@@ -231,6 +262,22 @@ def test_offload_methods_forwarded_to_owning_sub():
     assert off.load_failed_ids == ["r2"]
 
 
+def test_process_completions_reaches_the_offload_sub():
+    # The scheduler calls process_completions and nothing else — it is the only
+    # caller of the offload sub's save_finished. Without the fan-out the sub's
+    # inflight saves never clear (has_pending_work stays true forever) and the
+    # exact SaveOperationId reaches a scheduler that looks requests up by id.
+    moriio = FakeSchedSub(is_producer=True)
+    off = FakeSchedSub(offload_methods=True)
+    sched = _sched([moriio, off])
+
+    op = SaveOperationId(9, 1)
+    out = sched.process_completions(KVConnectorOutput(finished_saving={op}))
+
+    assert off.saved == [op]
+    assert out.finished_saving == {9}
+
+
 def test_offload_methods_default_when_no_sub_implements():
     sched = _sched([FakeSchedSub(is_producer=True), FakeSchedSub()])
     seq = object()
@@ -275,7 +322,7 @@ def test_start_load_kv_routes_by_index_and_records_saves():
     w.start_load_kv(MultiConnectorMetadata([m0, m1]))
     assert a.loaded_meta is m0
     assert b.loaded_meta is m1
-    assert w._pending_save == {"101", "102"}
+    assert w._pending_save_ops == {"101": {101}, "102": {102}}
 
 
 def test_get_finished_unions_and_normalizes_tuple():
@@ -288,6 +335,27 @@ def test_get_finished_unions_and_normalizes_tuple():
     out = w.get_finished()
     assert out.finished_recving == {"d1", "d2"}
     assert out.failed_recving == {"f1"}
+
+
+def test_get_finished_carries_connector_completions():
+    # DSV4 reports its SLOT sidecar outcome only on a connector-owned channel.
+    # Dropping it here leaves the scheduler's _sidecar_save_inflight uncleared
+    # and has_pending_work() true forever.
+    done = ConnectorCompletion("dsv4.checkpoint.save", SaveOperationId(7, 1), True)
+    moriio = FakeWorkerSub(finished=(set(), set()))
+    off = FakeWorkerSub(finished=KVConnectorOutput(connector_completions={done}))
+    w = _worker([moriio, off])  # not producer: pass-through path
+    assert w.get_finished().connector_completions == {done}
+
+
+def test_paired_get_finished_carries_connector_completions():
+    # The pairing path builds its own output, so it needs the same union.
+    done = ConnectorCompletion("dsv4.checkpoint.save", SaveOperationId(7, 1), True)
+    off = FakeWorkerSub(
+        is_producer=True, finished=KVConnectorOutput(connector_completions={done})
+    )
+    w = _worker([off], pp_is_head=True)
+    assert w.get_finished().connector_completions == {done}
 
 
 def test_producer_offload_load_completion_uses_loading_state():
@@ -332,7 +400,7 @@ def test_send_is_withheld_until_save_completes():
 
     # offload will save r9
     w.start_load_kv(MultiConnectorMetadata([ConnectorMetadata(), _save_meta(9)]))
-    assert w._pending_save == {"9"}
+    assert w._pending_save_ops == {"9": {9}}
 
     # Step 1: moriio reports send done, offload's save still in flight.
     moriio._finished = ({9}, set())
@@ -347,7 +415,7 @@ def test_send_is_withheld_until_save_completes():
     out2 = w.get_finished()
     assert out2.finished_sending == {9}
     assert out2.finished_saving == {9}
-    assert w._pending_save == set()  # cleared after release
+    assert w._pending_save_ops == {}  # cleared after release
 
 
 def test_save_then_send_also_pairs():
@@ -370,9 +438,63 @@ def test_save_then_send_also_pairs():
     assert out2.finished_saving == {9}
 
 
+def test_pairing_matches_save_operation_id():
+    # The offload connector reports a SaveOperationId(req_id, generation), not
+    # a bare request id, whenever it tracks save generations. Pairing keys the
+    # send side by request, so the completion has to collapse onto req_id or
+    # every send is withheld forever and the producer never frees its blocks.
+    moriio = FakeWorkerSub(is_producer=True)
+    off = FakeWorkerSub()
+    w = _worker([moriio, off])
+    op = SaveOperationId(9, 3)
+    w.start_load_kv(
+        MultiConnectorMetadata([ConnectorMetadata(), _save_operation_meta(op)])
+    )
+    assert w._pending_save_ops == {"9": {op}}
+
+    moriio._finished = ({9}, set())
+    off._finished = KVConnectorOutput(finished_saving={op})
+    out = w.get_finished()
+    assert out.finished_sending == {9}
+    assert out.finished_saving == {op}
+    assert w._pending_save_ops == {}
+    assert w._sent == {}
+    assert w._saved == {}
+
+
+def test_pairing_waits_for_all_save_operation_ids():
+    # Hybrid offload can have multiple save generations for one request in
+    # flight. A request-level single-value _saved entry would overwrite the
+    # first completion and release the send after only one save.
+    moriio = FakeWorkerSub(is_producer=True)
+    off = FakeWorkerSub()
+    w = _worker([moriio, off])
+    op0 = SaveOperationId(9, 2)
+    op1 = SaveOperationId(9, 3)
+    w.start_load_kv(
+        MultiConnectorMetadata([ConnectorMetadata(), _save_operation_meta(op0, op1)])
+    )
+
+    moriio._finished = ({9}, set())
+    off._finished = KVConnectorOutput(finished_saving={op0})
+    out1 = w.get_finished()
+    assert out1.finished_sending == set()
+    assert out1.finished_saving == set()
+
+    moriio._finished = (set(), set())
+    off._finished = KVConnectorOutput(finished_saving={op1})
+    out2 = w.get_finished()
+    assert out2.finished_sending == {9}
+    assert out2.finished_saving == {op0, op1}
+    assert w._pending_save_ops == {}
+    assert w._sent == {}
+    assert w._saved == {}
+
+
 def test_non_head_pp_stage_does_not_pair():
     # Downstream stages never see mooncake's done_sending (it is recorded on
-    # stage 0 only), so pairing there would strand every save.
+    # stage 0 only), so pairing there would strand every save. get_finished
+    # returns before the release loop, so registering state there leaks it.
     moriio = FakeWorkerSub(is_producer=True)
     off = FakeWorkerSub(finished=KVConnectorOutput(finished_saving={9}))
     w = _worker([moriio, off], pp_is_head=False)
@@ -381,6 +503,7 @@ def test_non_head_pp_stage_does_not_pair():
     out = w.get_finished()
     assert out.finished_saving == {9}
     assert out.finished_sending == set()
+    assert w._pending_save_ops == {}
 
 
 @pytest.mark.parametrize("pp_rank, holds_send", [(0, True), (1, False)])

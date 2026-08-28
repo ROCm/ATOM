@@ -163,7 +163,7 @@ def test_kimi_k3_uses_dedicated_kda_metadata_backend():
         )
         assert issubclass(AtomKimiK3KDAMetadataBuilder, KimiK3KDAMetadataBuilder)
         assert issubclass(KimiK3KDAMetadata, GDNAttentionMetadata)
-        assert hasattr(
+        assert not hasattr(
             AtomGDNAttentionMetadataBuilder,
             "_compact_full_graph_decode_metadata",
         )
@@ -215,48 +215,17 @@ def test_kda_metadata_adapter_compacts_full_graph_padding():
         """)
 
 
-def test_gdn_metadata_adapter_compacts_full_graph_padding():
+def test_gdn_metadata_builder_does_not_compact_full_graph_padding():
     _run_without_test_stubs("""
-        from types import SimpleNamespace
-
-        import torch
-
         from atom.plugin.vllm.gdn_backend import AtomGDNAttentionMetadataBuilder
 
-        builder = SimpleNamespace(
-            use_full_cuda_graph=True,
-            decode_cudagraph_max_bs=4,
-            non_spec_state_indices_tensor=torch.zeros(4, dtype=torch.int32),
-            non_spec_query_start_loc=torch.zeros(5, dtype=torch.int32),
-            kv_cache_spec=SimpleNamespace(),
-            vllm_config=SimpleNamespace(
-                cache_config=SimpleNamespace(mamba_cache_mode="all")
-            ),
+        # vLLM 0.27+ pads FULL-graph decode metadata by num_reqs; a prior
+        # post-build compaction pass corrupted ssm_state on Qwen3.5 replay.
+        assert not hasattr(
+            AtomGDNAttentionMetadataBuilder,
+            "_compact_full_graph_decode_metadata",
         )
-        common = SimpleNamespace(
-            query_start_loc_cpu=torch.tensor([0, 1, 2, 2, 2], dtype=torch.int32),
-            query_start_loc=torch.tensor([0, 1, 2, 2, 2], dtype=torch.int32),
-            num_reqs=4,
-            block_table_tensor=torch.tensor([[5], [7], [0], [0]], dtype=torch.int32),
-            seq_lens=torch.ones(4, dtype=torch.int32),
-        )
-        metadata = SimpleNamespace(
-            num_prefills=0,
-            num_spec_decodes=0,
-            num_decodes=4,
-            num_decode_tokens=4,
-            non_spec_state_indices_tensor=None,
-            non_spec_query_start_loc=None,
-        )
-
-        AtomGDNAttentionMetadataBuilder._compact_full_graph_decode_metadata(
-            builder, common, metadata
-        )
-
-        assert metadata.num_decodes == 2
-        assert metadata.num_decode_tokens == 2
-        assert metadata.non_spec_state_indices_tensor.tolist() == [5, 7, -1, -1]
-        assert metadata.non_spec_query_start_loc.tolist() == [0, 1, 2, 2, 2]
+        assert "build" not in AtomGDNAttentionMetadataBuilder.__dict__
         """)
 
 

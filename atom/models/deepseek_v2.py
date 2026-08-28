@@ -40,7 +40,10 @@ from aiter import (
     top_k_per_row_prefill,
 )
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
-from aiter.dist.parallel_state import get_pp_group, get_tensor_model_parallel_world_size
+from aiter.dist.parallel_state import (
+    get_pp_group,
+    get_tensor_model_parallel_world_size,
+)
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.fused_fp8_quant import fused_reduce_rms_fp8_group_quant
@@ -79,6 +82,7 @@ from atom.model_ops.activation import SiluAndMul
 from atom.model_ops.attention_mla import (
     MLAModules,
     is_rocm_aiter_fp4bmm_enabled,
+    qrep_tp_override,
     triton_convert_req_index_to_global_index,
     triton_convert_req_index_to_global_index_dsa_prefill,
     triton_gather_kv_indices_sparse,
@@ -1573,7 +1577,9 @@ def sparse_attn_indexer(
         return torch.zeros_like(weights, dtype=torch.float32)
     # For MTP verify decode, max_seqlen_q > 1 so total decode tokens = batch_size * max_seqlen_q
     num_decode_tokens = (
-        context.batch_size * attn_metadata.max_seqlen_q if not context.is_prefill else 0
+        context.scheduled_bs * attn_metadata.max_seqlen_q
+        if not context.is_prefill
+        else 0
     )
     runner_block_size = get_current_atom_config().kv_cache_block_size
     cp_kv_cache_interleave_size = get_current_atom_config().dcp_config.interleave_size
@@ -1638,7 +1644,7 @@ def sparse_attn_indexer(
         if attn_metadata.max_seqlen_k <= topk_tokens:
             return weights
         prefill_metadata = attn_metadata
-        num_prefills = context.batch_size
+        num_prefills = context.scheduled_bs
         # Size the gathered-KV buffer off the KEY length, not the hidden/query
         # length. Under PCP the query side (hidden_states) is 1/pcp while `k` is
         # the full all-gathered key set, so `k.shape[0]` is the correct full
@@ -1781,12 +1787,12 @@ def sparse_attn_indexer(
         # we only have [num_block, block_size, head_dim],
         kv_cache = kv_cache.unsqueeze(-2)
         padded_q_fp8_decode_tokens = q_fp8[:num_decode_tokens].reshape(
-            context.batch_size, -1, *q_fp8.shape[1:]
+            context.scheduled_bs, -1, *q_fp8.shape[1:]
         )
         # TODO: move and optimize below logic with triton kernels
         batch_size = padded_q_fp8_decode_tokens.shape[0]
         next_n = padded_q_fp8_decode_tokens.shape[1]
-        assert batch_size == context.batch_size
+        assert batch_size == context.scheduled_bs
         num_padded_tokens = batch_size * next_n
         batch_size, next_n, _heads, _ = padded_q_fp8_decode_tokens.shape
         num_rows = batch_size * next_n
@@ -2430,6 +2436,9 @@ class DeepseekV2MLAAttention(nn.Module):
         assert num_heads % tp_size == 0
         self.num_local_heads = num_heads // tp_size
 
+        # DCP Query Replication: {} unless QREP is on -- see qrep_tp_override.
+        q_qrep_override = qrep_tp_override(tp_size)
+
         self.scaling = self.qk_head_dim**-0.5
         self.max_position_embeddings = max_position_embeddings
         self.layer_num = layer_num
@@ -2501,6 +2510,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.q_b_proj",
                 source_quant_dtype=source_quant_dtype,
+                **q_qrep_override,
             )
         else:
             self.q_proj = ColumnParallelLinear(
@@ -2510,6 +2520,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.q_proj",
                 source_quant_dtype=source_quant_dtype,
+                **q_qrep_override,
             )
 
             self.kv_a_proj_with_mqa = ReplicatedLinear(
