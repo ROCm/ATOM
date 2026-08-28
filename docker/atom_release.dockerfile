@@ -263,14 +263,19 @@ print('OK: lmcache', lmcache.__version__, 'HIP c_ops; torch', torch.__version__)
 # different aiperf. The resolved commit is echoed below so a built image can
 # always say what it actually has, and `SA_AIPERF_REF` takes a tag or SHA when a
 # build does need pinning.
+#
+# Empty by default rather than a branch name: the clone already lands on
+# whatever HEAD points at, so naming the branch would only add a way to break
+# -- an upstream rename would fail `git checkout` in a build that has nothing
+# to do with the rename.
 ARG INSTALL_SA_AIPERF=1
-ARG SA_AIPERF_REF="master"
+ARG SA_AIPERF_REF=""
 RUN if [ "${INSTALL_SA_AIPERF}" = "1" ]; then \
-        echo "========== [ATOM] Install SemiAnalysis aiperf (ref=${SA_AIPERF_REF}) =========="; \
+        echo "========== [ATOM] Install SemiAnalysis aiperf (ref=${SA_AIPERF_REF:-<default branch>}) =========="; \
         rm -rf /opt/aiperf && \
         git clone https://github.com/SemiAnalysisAI/aiperf.git /opt/aiperf && \
         cd /opt/aiperf && \
-        git checkout "${SA_AIPERF_REF}" && \
+        { [ -z "${SA_AIPERF_REF}" ] || git checkout "${SA_AIPERF_REF}"; } && \
         echo "[ATOM] aiperf resolved to $(git rev-parse HEAD)" && \
         sed -i '/^[[:space:]]*"transformers @ git+/d' pyproject.toml && \
         ! grep -q '^[[:space:]]*"transformers @ git+' pyproject.toml && \
