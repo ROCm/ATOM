@@ -39,6 +39,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # pressure) and a smaller value toward prompt-token balance (prefill
     # pressure). See engine_core_mgr.CoreManager._select_dp_rank_locked.
     "ATOM_DP_LB_REQ_EQUIV": lambda: int(os.getenv("ATOM_DP_LB_REQ_EQUIV", "512")),
+    # Place a new agent session on the lightest DP rank, then keep every later
+    # request on that immutable cache owner. Existing sessions never spill;
+    # child correlation ids are independently load-placed rather than
+    # inheriting their parent's owner.
+    "ATOM_DP_SESSION_AFFINITY": lambda: os.getenv(
+        "ATOM_DP_SESSION_AFFINITY", "0"
+    ).lower()
+    in {"1", "true", "yes", "on"},
     # Prefix for process titles set via set_process_title (shown in ps/top/rocm-smi)
     "ATOM_PROCESS_NAME_PREFIX": lambda: os.getenv("ATOM_PROCESS_NAME_PREFIX", "ATOM"),
     # SGLang's GLM-5.2 and DeepSeek V4 prefill CP paths still force
@@ -489,6 +497,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
         None
         if os.getenv("ATOM_PREFILL_DELAYER_MAX_QUEUE_MS", "") == ""
         else float(os.getenv("ATOM_PREFILL_DELAYER_MAX_QUEUE_MS"))
+    ),
+    # After a prefill forward, protect this many scheduler passes for decode
+    # before allowing another prefill. Mirrors SGLang's
+    # --prefill-decode-interval; 0 disables the hard interval.
+    "ATOM_PREFILL_DECODE_INTERVAL": lambda: int(
+        os.getenv("ATOM_PREFILL_DECODE_INTERVAL", "0")
     ),
     # --- TBO prefill ubatch splitting ---
     # Split prefill ubatches at the exact token midpoint (vLLM-DBO style),

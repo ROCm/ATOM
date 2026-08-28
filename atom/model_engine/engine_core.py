@@ -222,7 +222,20 @@ class EngineCore:
         maybe_attach_gc_debug_callback(name)
 
     def _send_ready_signal(self):
-        self.output_queue.put_nowait(("READY", None))
+        self.output_queue.put_nowait(("READY", self._ready_payload()))
+
+    def _ready_payload(self) -> dict[str, int] | None:
+        """Startup facts the frontend cannot read off its own Config.
+
+        `num_kvcache_blocks` is measured in this subprocess, so the API server's
+        Config still holds the placeholder. Publishing the derived prompt
+        ceiling rather than the raw block count leaves the dcp arithmetic with
+        its owner, `BlockManager`, and gives the frontend a single number to
+        compare a prompt against.
+        """
+        if self.scheduler is None:
+            return None
+        return {"max_pool_tokens": self.scheduler.block_manager.max_pool_tokens}
 
     def _post_model_load_hook(self):
         """Called after ModelRunner is initialized (model loaded) but before
@@ -373,6 +386,14 @@ class EngineCore:
             fwd_out = self.runner_mgr.call_func(
                 "forward", scheduled_batch, wait_out=True
             )
+            if (
+                self.scheduler.prefill_delayer is not None
+                and scheduled_batch.total_seqs_num_prefill > 0
+            ):
+                # Arm post-prefill decode protection only after the prefill
+                # forward really completed. A delayer FIRE merely grants
+                # admission and can still result in a decode/empty batch.
+                self.scheduler.prefill_delayer.notify_prefill_executed()
 
         # Aggregate KV transfer status from all workers (only when PD disaggregation is active)
         self._poll_kv_transfer_progress()
@@ -574,7 +595,7 @@ class EngineCore:
 
                 if isinstance(item, tuple) and item[0] == "READY":
                     # Send READY signal to indicate EngineCore is fully initialized
-                    obj = pickle.dumps((EngineCoreRequestType.READY, None))
+                    obj = pickle.dumps((EngineCoreRequestType.READY, item[1]))
                     socket.send(obj)
                     logger.debug(f"{self.label}: sent READY signal")
                     continue
@@ -636,6 +657,7 @@ class DPEngineCoreProc(EngineCore):
                     kv_high_watermark=envs.ATOM_PREFILL_DELAYER_KV_HIGH_WATERMARK,
                     token_usage_low_watermark=envs.ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK,
                     max_queue_ms=envs.ATOM_PREFILL_DELAYER_MAX_QUEUE_MS,
+                    prefill_decode_interval=envs.ATOM_PREFILL_DECODE_INTERVAL,
                 )
             )
 

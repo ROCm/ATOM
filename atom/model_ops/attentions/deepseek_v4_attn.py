@@ -3767,11 +3767,24 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # is_pure_decode was set by the caller at AttentionMetaData_DSV4
         # construction time; we only flip it (True→False) above when the
         # warmup carve-out fires (incomplete state_slot_out_cpu).
-        attn_metadata.kv_indices_swa = swa_indices_gpu[: int(swa_indptr_np[T])]
-        attn_metadata.kv_indices_csa = csa_indices_gpu[: int(csa_indptr_np[T])]
+        # Published WHOLE, not sliced to `indptr_np[T]`. That length is the
+        # cumsum of per-token KV spans, so it varies step to step at a FIXED
+        # num_tokens and no graph key pins it -- and a cudagraph bakes it. It
+        # only ever stayed correct because the buffer is sized for the worst
+        # case, so overshooting stayed inside the allocation.
+        #
+        # Nothing reads the length: `sparse_attn_v4_paged_decode` walks
+        # `kv_indices[kv_indptr[t] : kv_indptr[t+1]]` (see `paged_decode.py:104`)
+        # and `csa_translate_pack`'s grid comes from `topk_local.shape`. Both now
+        # sit in a dense piece keyed on num_tokens alone, so this matters under
+        # plain PIECEWISE too. `prepare_mtp_decode` (~:2381) and the sglang
+        # bridge already publish these whole. HCA keeps its slice as the
+        # write-side bound above, where the capacity assert can catch an overrun.
+        attn_metadata.kv_indices_swa = swa_indices_gpu
+        attn_metadata.kv_indices_csa = csa_indices_gpu
         attn_metadata.n_committed_per_token = n_committed_per_token_gpu
         attn_metadata.block_tables_per_token = block_tables_per_token_gpu
-        attn_metadata.kv_indices_hca = hca_indices_gpu  # already exact len
+        attn_metadata.kv_indices_hca = hca_indices_buf
         attn_metadata.kv_indptr_swa = swa_indptr_gpu
         attn_metadata.kv_indptr_csa = csa_indptr_gpu
         attn_metadata.kv_indptr_hca = hca_indptr_gpu
