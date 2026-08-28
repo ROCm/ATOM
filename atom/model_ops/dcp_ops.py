@@ -133,7 +133,12 @@ def _correct_attn_cp_out_kernel(
     )
 
     lse = tl.load(lses_ptr + lse_offsets)
-    lse = tl.where((lse != lse) | (lse == float("inf")), -float("inf"), lse)
+    lse = tl.where(
+        (lse != lse)  # noqa: PLR0124 - Triton NaN check
+        | (lse == float("inf")),
+        -float("inf"),
+        lse,
+    )
 
     lse_max = tl.max(lse, axis=0)
     lse_max = tl.where(lse_max == -float("inf"), 0, lse_max)
@@ -151,7 +156,8 @@ def _correct_attn_cp_out_kernel(
     local_lse = tl.load(lses_ptr + local_lse_offset)
     lse_diff = local_lse - global_lse
     lse_diff = tl.where(
-        (lse_diff != lse_diff) | (lse_diff == float("inf")),
+        (lse_diff != lse_diff)  # noqa: PLR0124 - Triton NaN check
+        | (lse_diff == float("inf")),
         -float("inf"),
         lse_diff,
     )
@@ -495,7 +501,21 @@ def cp_lse_a2a(cp_attn_out, cp_attn_lse, cp_group, return_lse: bool = False):
     return (out, out_lse) if return_lse else out
 
 
-def dcp_lse_merge(cp_attn_out, cp_attn_lse, cp_group, backend="a2a", ctx=None):
+def mask_empty_dcp_lse(
+    cp_attn_lse: torch.Tensor, owned_counts: torch.Tensor
+) -> torch.Tensor:
+    """Mark dummy-backed local rows as absent before the DCP softmax merge."""
+    return cp_attn_lse.masked_fill(owned_counts[:, None] == 0, float("-inf"))
+
+
+def dcp_lse_merge(
+    cp_attn_out,
+    cp_attn_lse,
+    cp_group,
+    backend="a2a",
+    ctx=None,
+    owned_counts=None,
+):
     """Reconstruct the global softmax from the per-rank partials.
 
     Dispatches to one of the two backends above. Both compute the same weighted
@@ -504,9 +524,16 @@ def dcp_lse_merge(cp_attn_out, cp_attn_lse, cp_group, backend="a2a", ctx=None):
     why one all-to-all can replace AllGather-LSE + ReduceScatter). Equivalent
     math, not bitwise identical.
 
+    ``owned_counts`` is the optional rank-local sparse-KV count per row. Empty
+    prefill rows contain a dummy cache slot to keep persistent metadata valid;
+    masking only their small LSE tensor here lets the existing merge kernels
+    suppress the corresponding output without another full-output pass.
+
     ``ctx`` is the Triton context the AG+RS backend caches its launches in; the
     a2a backend does not use one.
     """
+    if owned_counts is not None:
+        cp_attn_lse = mask_empty_dcp_lse(cp_attn_lse, owned_counts)
     if backend == "a2a":
         return cp_lse_a2a(cp_attn_out, cp_attn_lse, cp_group)
     return cp_lse_ag_out_rs(cp_attn_out, cp_attn_lse, cp_group, ctx=ctx)
@@ -1081,11 +1108,13 @@ def _compact_filter_dcp_prefill_kernel(
         tl.store(out_kv_indices + out_kv_start + dst, slot, mask=idx_valid)
         written += tl.sum(owned_i32)
 
-    # A row this rank owns nothing of is left EMPTY (zero-length region). That is
-    # both legal and correct for mla_decode_fwd: it writes lse = -inf, which
-    # cp_lse_ag_out_rs turns into a zero weight. Its `o` comes out NaN (0/0), so
-    # the caller zeroes those rows -- see _forward_prefill_mla. No dummy candidate
-    # is injected; the attention never sees fabricated KV.
+    # Persistent MLA's fast metadata builder does not handle zero-length rows:
+    # one empty row can leave that row and several following short rows without
+    # valid work descriptors. Reserve one slot for an empty row and point it at
+    # a valid dummy cache entry. The attention caller uses the original
+    # `owned_counts == 0` to replace this row with the exact softmax identity
+    # (O=0, LSE=-inf), so the dummy never contributes to the DCP merge.
+    tl.store(out_kv_indices + out_kv_start, 0, mask=written == 0)
 
 
 def triton_filter_and_convert_dcp_index_prefill(
@@ -1150,11 +1179,16 @@ def triton_filter_and_convert_dcp_index_prefill(
         ti_stride1,
     )
 
-    # Same device-side-only cumsum as the decode path (see its comment for why
-    # zero_() and dtype=torch.int32 are required).
+    # Keep the true counts in `owned_counts` for post-attention neutralization,
+    # but give every metadata row at least one valid slot. Persistent MLA's fast
+    # metadata path can corrupt work descriptors after a zero-length row.
+    metadata_counts = counts.clamp_min(1)
     out_kv_indptr[:1].zero_()
     torch.cumsum(
-        counts, dim=0, dtype=torch.int32, out=out_kv_indptr[1 : num_tokens + 1]
+        metadata_counts,
+        dim=0,
+        dtype=torch.int32,
+        out=out_kv_indptr[1 : num_tokens + 1],
     )
 
     _compact_filter_dcp_prefill_kernel[grid](

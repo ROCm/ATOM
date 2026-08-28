@@ -790,14 +790,23 @@ class MLAAttention(nn.Module):
             self._qrep_local_src = w
         return self._qrep_local_proj
 
-    def _dcp_merge(self, o, lse, ctx=None):
+    def _dcp_merge(self, o, lse, ctx=None, owned_counts=None):
         """Bind this layer's DCP group and backend to ``dcp_ops.dcp_lse_merge``."""
         from atom.model_ops.dcp_ops import dcp_lse_merge
 
-        return dcp_lse_merge(o, lse, self.dcp_group, self.dcp_comm_backend, ctx=ctx)
+        return dcp_lse_merge(
+            o,
+            lse,
+            self.dcp_group,
+            self.dcp_comm_backend,
+            ctx=ctx,
+            owned_counts=owned_counts,
+        )
 
     @mark_trace(prefix="dcp_project_merge_out", torch_compile=False)
-    def _dcp_project_merge_out(self, o, lse, ctx=None, merge_in_fp32=False):
+    def _dcp_project_merge_out(
+        self, o, lse, ctx=None, merge_in_fp32=False, owned_counts=None
+    ):
         """Shared tail of both DCP paths: PBM projection, merge, o_proj.
 
         With PBM the V up-projection runs on the whole group's head set BEFORE
@@ -810,9 +819,11 @@ class MLAAttention(nn.Module):
             )
         if merge_in_fp32:
             dtype = o.dtype
-            o = self._dcp_merge(o.float(), lse, ctx=ctx).to(dtype)
+            o = self._dcp_merge(o.float(), lse, ctx=ctx, owned_counts=owned_counts).to(
+                dtype
+            )
         else:
-            o = self._dcp_merge(o, lse, ctx=ctx)
+            o = self._dcp_merge(o, lse, ctx=ctx, owned_counts=owned_counts)
         if self.pbm_enabled:
             return self.o_proj(o.reshape(-1, self.num_heads * self.v_head_dim))
         return self._v_up_proj_and_o_proj(o)
@@ -831,7 +842,10 @@ class MLAAttention(nn.Module):
             q_out, kv_cache, attn_metadata, return_lse=True
         )
         return self._dcp_project_merge_out(
-            o, lse, merge_in_fp32=not self.dcp_prefill_merge_bf16_ok
+            o,
+            lse,
+            merge_in_fp32=not self.dcp_prefill_merge_bf16_ok,
+            owned_counts=self.dcp_owned_counts_buffer[: q_out.shape[0]],
         )
 
     @mark_trace(prefix="dcp_decode", torch_compile=False)

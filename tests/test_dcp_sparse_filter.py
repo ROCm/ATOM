@@ -397,21 +397,20 @@ def test_prefill_filter(seq_lens, interleave):
                 if owner == r
             ]
 
-            # Contract: a row this rank owns nothing of stays
-            # EMPTY -- no dummy candidate is injected. mla_decode_fwd accepts a
-            # zero-length region and writes lse=-inf; the caller zeroes the
-            # matching NaN `o`. So the region must be exactly length 0 and
-            # owned_counts must report 0.
+            # Contract: a row this rank owns nothing of gets one valid dummy
+            # slot so persistent MLA metadata never sees a zero-length row.
+            # owned_counts remains 0, allowing the caller to replace its
+            # attention result with O=0/LSE=-inf before the DCP merge.
             # Counted off the kernel's own indptr, never off the reference:
             # summing the reference's per-rank splits would reproduce `want` by
             # construction and assert nothing.
-            n_claimed += len(slots)
+            n_claimed += int(cnts[t])
 
             if not exp_slots:
                 n_empty += 1
-                assert len(slots) == 0 and cnts[t] == 0, (
-                    f"token={t} rank={r}: unowned row must stay empty, got "
-                    f"len={len(slots)} count={cnts[t]}"
+                assert list(slots) == [0] and cnts[t] == 0, (
+                    f"token={t} rank={r}: unowned row must hold one dummy, got "
+                    f"slots={list(slots)} count={cnts[t]}"
                 )
                 continue
 
