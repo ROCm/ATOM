@@ -355,6 +355,11 @@ def test_dp_agentic_variant_carries_the_session_routing_env():
         "ATOM_DP_LB_REQ_EQUIV=512",
         "ATOM_ENABLE_PREFILL_DELAYER=1",
         "ATOM_PREFILL_DECODE_INTERVAL=10",
+        # TBO never travels alone in this catalog -- every TBO variant pairs
+        # `--enable-tbo` with these two. Asserted alongside the routing vars so
+        # the flag cannot be moved without them.
+        "GPU_MAX_HW_QUEUES=5",
+        "ATOM_NUMA_BIND=1",
     }
     for cell in catalog.build_cells(CATALOG, bench_kind_filter={"aiperf_agentic"}):
         env = set(cell["env_vars"].splitlines())
@@ -365,9 +370,7 @@ def test_dp_agentic_variant_carries_the_session_routing_env():
             assert dp_only <= env, f"{name} missing {sorted(dp_only - env)}"
         else:
             assert not (dp_only & env), f"{name} carries {sorted(dp_only & env)}"
-        # TBO is off on both: it needs GPU_MAX_HW_QUEUES/ATOM_NUMA_BIND to go
-        # with it, and the recipe these variants mirror does not run it.
-        assert "--enable-tbo" not in args, name
+        assert ("--enable-tbo" in args) == is_dpa, name
         # The golden AL, as the reference publishes it. Pinned so throughput is
         # not read through a fluctuating accept rate, and kept in the AL unit
         # rather than the equivalent rate so it matches the literal in
