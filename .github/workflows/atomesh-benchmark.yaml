@@ -95,19 +95,23 @@ on:
           - atomesh-cicd-crusoe-mi355
           - atomesh-cicd-mi355-crusoe
       atomesh_slurm_account:
-        description: |
-          Optional Slurm account override. Use "auto" to omit (Slurm infers from nodelist when custom nodes are set).
-          Examples: amd-frameworks, amd-tw
+        description: 'Slurm account: amd-frameworks[42/44/47], amd-tw[36/43]'
         required: false
         default: auto
-        type: string
+        type: choice
+        options:
+          - auto
+          - amd-frameworks
+          - amd-tw
       atomesh_slurm_partition:
-        description: |
-          Optional Slurm partition override. Use "auto" to omit (Slurm infers from nodelist when custom nodes are set).
-          Examples: amd-frameworks, amd-tw
+        description: 'Slurm partition: amd-frameworks[42/44/47], amd-tw[36/43]'
         required: false
         default: auto
-        type: string
+        type: choice
+        options:
+          - auto
+          - amd-frameworks
+          - amd-tw
       atomesh_log_root:
         description: 'Root directory for ATOMesh Slurm logs'
         required: false
@@ -116,7 +120,7 @@ on:
       atomesh_1p1d_nodes:
         description: |
           ATOMesh 1P1D node pair. Use "auto" for runner defaults, or comma-separated Slurm node names.
-          Example: mia1-p02-g42,mia1-p02-g44
+          Examples: mia1-p02-g42,mia1-p02-g44 (amd-frameworks), mia1-p01-g43,mia1-p01-g36 (amd-tw).
           single_node cases only use the first entry.
         required: false
         default: auto
@@ -285,20 +289,6 @@ jobs:
           ATOMESH_EVAL_CONCURRENCY: ${{ github.event_name == 'workflow_dispatch' && inputs.eval_concurrency || '' }}
         run: |
           set -euo pipefail
-
-          # When custom nodes are provided, omit account/partition unless explicitly
-          # overridden so Slurm can infer them from --nodelist.
-          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
-            if [[ "${{ inputs.atomesh_1p1d_nodes }}" != "auto" || "${{ inputs.atomesh_2p1d_nodes }}" != "auto" ]]; then
-              if [[ "${{ inputs.atomesh_slurm_account }}" == "auto" ]]; then
-                export ATOMESH_SLURM_ACCOUNT=""
-              fi
-              if [[ "${{ inputs.atomesh_slurm_partition }}" == "auto" ]]; then
-                export ATOMESH_SLURM_PARTITION=""
-              fi
-            fi
-          fi
-
           MODEL_NAME=""
           CASE_NAME=""
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
@@ -424,15 +414,6 @@ jobs:
         run: |
           set -euo pipefail
           export PATH="/usr/local/slurm-24.05.5.1/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
-
-          if [[ "${{ inputs.atomesh_1p1d_nodes }}" != "auto" || "${{ inputs.atomesh_2p1d_nodes }}" != "auto" ]]; then
-            if [[ "${{ inputs.atomesh_slurm_account }}" == "auto" ]]; then
-              export ATOMESH_SLURM_ACCOUNT=""
-            fi
-            if [[ "${{ inputs.atomesh_slurm_partition }}" == "auto" ]]; then
-              export ATOMESH_SLURM_PARTITION=""
-            fi
-          fi
 
           if [[ -z "${RDMA_SMOKE_IMAGE}" ]]; then
             echo "::error::No ATOM image was resolved for the RDMA smoke test."
