@@ -246,6 +246,7 @@ write_aiperf_dashboard_json() {
   python3 - "${aiperf_json}" "${out_json}" "${conc}" <<'PY'
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -267,6 +268,11 @@ def pct(name, key):
     if isinstance(value, dict):
         return value.get(key)
     return None
+
+
+def _tp_from_server_args():
+    m = re.search(r"(?:^|\s)(?:-tp|--tensor-parallel-size)\s+(\d+)", os.environ.get("SERVER_ARGS", ""))
+    return int(m.group(1)) if m else 1
 
 
 def total_tokens(name):
@@ -304,16 +310,29 @@ payload = {
     ),
     "random_output_len": 1024,
     "max_concurrency": conc,
+    # The divisor for every per-chip figure. Taken from the server args because
+    # the agentic path skips the random branch's post-processing, which is where
+    # this used to be filled in.
+    "tensor_parallel_size": _tp_from_server_args(),
+    "output_sequence_length": avg("output_sequence_length"),
+    "input_sequence_length": avg("input_sequence_length"),
     "random_range_ratio": "",
     "request_throughput": avg("request_throughput"),
     "mean_ttft_ms": avg("time_to_first_token"),
     "median_ttft_ms": pct("time_to_first_token", "p50"),
+    "p90_ttft_ms": pct("time_to_first_token", "p90"),
     "p99_ttft_ms": pct("time_to_first_token", "p99"),
     "mean_itl_ms": avg("inter_token_latency"),
     "median_itl_ms": pct("inter_token_latency", "p50"),
+    # p90 ITL is not decoration: InferenceX's headline interactivity number is
+    # `1 / p90(inter_token_latency)` (utils/agentic/aggregation/request_metrics.py).
+    # Without this field the metric can only be recovered by scraping AIPerf's
+    # console table out of the job log, which is what we had to do.
+    "p90_itl_ms": pct("inter_token_latency", "p90"),
     "p99_itl_ms": pct("inter_token_latency", "p99"),
     "mean_e2el_ms": avg("request_latency"),
     "median_e2el_ms": pct("request_latency", "p50"),
+    "p90_e2el_ms": pct("request_latency", "p90"),
     "p99_e2el_ms": pct("request_latency", "p99"),
     "input_throughput": avg("input_token_throughput"),
     "output_throughput": avg("output_token_throughput"),
