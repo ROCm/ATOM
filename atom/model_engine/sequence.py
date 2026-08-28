@@ -146,6 +146,34 @@ class Sequence:
         # request counts again, which it should.
         self.checkpoint_demand_counted = False
         self.checkpoint_demand_declined = False
+        # The demand's sibling: this prompt's own end, floored to the hash
+        # grid. 0 = nowhere.
+        #
+        # The demand is reactive — it only exists once a hit has already been
+        # refused for want of a checkpoint, which is one request too late for
+        # the position that serves the *next* turn of a conversation. On
+        # agentic traffic that position is where nearly all the reuse is (see
+        # `BlockManager._record_checkpoint_end`), so it is reserved up front
+        # rather than waited for.
+        #
+        # Written by `BlockManager._record_checkpoint_end` at admission, read
+        # by `checkpoint_cut` and `checkpointers_at` — which must agree, the
+        # same contract `checkpoint_demand_pos` is held to.
+        self.checkpoint_end_pos = 0
+        # The chained content hash of every block of this prompt, not just the
+        # ones that hit. Empty unless the state backend reserves checkpoints
+        # midstep (`StateTransfer.readable_midstep`), which is the only caller
+        # that needs to name a position the forward has not reached yet — see
+        # `BlockManager._extend_hash_chain` for why it cannot simply be the
+        # `block_hashes` the admission scan built.
+        self.block_hashes: list[int] = []
+        # Slots taken for midstep checkpoints of the forward now in flight,
+        # as `(slot, position, hash)` — one slot each, since a checkpoint never
+        # carries speculation scratch. Filled by `BlockManager.plan_midstep`
+        # before the batch is built, drained by `commit_midstep` after it, and
+        # handed back by `cancel_midstep` if that forward never runs. Non-empty
+        # only between those two points.
+        self.midstep_reservations: list[tuple] = []
         # Where this seq last kept a checkpoint. Prefill lands on the grid so
         # this tracks it, but a speculative decode step lands wherever
         # `1 + accepted` puts it, and there the grid is unreachable — see
@@ -159,17 +187,25 @@ class Sequence:
         # garbage sampled tokens from intermediate chunks and to skip the
         # scheduler's Phase 1 scan when no partials exist.
         self.is_partial_prefill = False
+        # `new_block_table` is main's: an array("i") rather than a list,
+        # because every forward marshals these into the int32 buffer.
         self.block_table = new_block_table()
-        # Per-request cache slot index (filled by BlockManager.allocate()).
-        # -1 = unallocated. The slot indexes into the per-req cache tensors
-        # owned by ModelRunner (e.g. mamba_k_cache for GDN).
-        self.per_req_cache_group = -1
-        # Group the NEXT forward reads its incoming state from, when that is not
-        # the group it writes (`per_req_cache_group`). Set by BlockManager on a
-        # state fork — resuming from a checkpoint, or taking one — and
-        # cleared by the scheduler once a batch has carried it, so it describes
-        # exactly one forward. -1 = read and write the same group, the case for
-        # every step in between.
+        # Per-request state slots (filled by BlockManager.allocate()), indexing
+        # the per-req cache tensors owned by ModelRunner (e.g. mamba_k_cache for
+        # GDN). Empty = unallocated.
+        #
+        # `[0]` is the committed state, which every path reads and writes;
+        # `[1:]` is one rollback slot per speculated token, which only the
+        # spec-decode path touches. Held as a list rather than a base index
+        # because the slots are allocated one at a time and need not be
+        # adjacent — see `StateSlotPool`.
+        self.state_slots: list[int] = []
+        # Slot the NEXT forward reads its incoming state from, when that is not
+        # the slot it writes (`state_slot`). Set by BlockManager on a state fork
+        # — resuming from a checkpoint, or taking one — and cleared by the
+        # scheduler once a batch has carried it, so it describes exactly one
+        # forward. -1 = read and write the same slot, the case for every step in
+        # between. Always a single slot: a checkpoint is one slot wide.
         self.state_fork_src = -1
         self.temperature = sampling_params.temperature
         self.top_k = sampling_params.top_k
@@ -271,6 +307,31 @@ class Sequence:
         self.last_block_num_tokens = (
             self._num_tokens - (self.num_blocks - 1) * self.block_size
         )
+
+    @property
+    def state_slot(self) -> int:
+        """The committed state slot, or -1 if this seq holds none.
+
+        What every non-speculative path means by "the" slot: the one the
+        forward reads and writes, the one a fork gives away, the one a
+        checkpoint is. The rollback slots are `state_slots[1:]` and only the
+        spec-decode path has any use for them.
+        """
+        return self.state_slots[0] if self.state_slots else -1
+
+    @state_slot.setter
+    def state_slot(self, slot: int) -> None:
+        """Re-point the committed slot, keeping the rollback set.
+
+        A fork moves where the request writes without disturbing its scratch:
+        the speculation slots persist across forwards (step N's accepted slot
+        is step N+1's initial state), so they belong to the request rather than
+        to whichever slot it currently commits into.
+        """
+        if self.state_slots:
+            self.state_slots[0] = slot
+        else:
+            self.state_slots = [slot]
 
     @property
     def is_finished(self):

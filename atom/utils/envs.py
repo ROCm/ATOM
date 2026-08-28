@@ -115,6 +115,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION", "1") == "1"
     ),
+    # Set to 0 to stop a refused state-cache hit from placing a checkpoint of
+    # its own, leaving the prompt-end anchor as the only placement. Overrides
+    # --state-checkpoint-demand so the policy can be flipped without touching a
+    # launch script. The rung's write traffic may cost more in evictions than
+    # its reuse is worth — see `BlockManager._record_checkpoint_demand`.
+    "ATOM_STATE_CHECKPOINT_DEMAND": lambda: (
+        os.getenv("ATOM_STATE_CHECKPOINT_DEMAND", "1") == "1"
+    ),
     # DSA sparse-indexer prefill: KV-dimension chunk size (in tokens) for
     # `fp8_mqa_logits`. The dense logits buffer is [prefill_tokens, total_kv];
     # total_kv = sum of all co-scheduled prefill contexts and is NOT bounded by

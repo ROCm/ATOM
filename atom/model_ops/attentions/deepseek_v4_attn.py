@@ -1088,6 +1088,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         caller checks that bound rather than growing on demand: a descriptor
         that did not fit would otherwise be silently truncated into a copy of
         the wrong shape.
+
+        The store half is held by `PagedStateCheckpointCoordinator._supersede`,
+        which keeps one pending boundary per sequence -- see the longer note on
+        `GDNStateMixin._checkpoint_descriptor_buffer`.
         """
         if self._checkpoint_descriptor is None:
             plan = self._checkpoint_copy_plan()
@@ -2529,10 +2533,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # Inline block_tables CPU fill (H2D deferred to prep_stream).
         self.prepare_block_tables(batch)
 
-        group_np = np.asarray(batch.per_req_cache_groups[:scheduled_bs], dtype=np.int32)
-        if len(group_np) < scheduled_bs:
-            group_np = np.zeros(scheduled_bs, dtype=np.int32)
-        state_slot_np = self._physical_slots(group_np)
+        pool_np = np.asarray(batch.state_slots_committed[:scheduled_bs], dtype=np.int32)
+        if len(pool_np) < scheduled_bs:
+            pool_np = np.zeros(scheduled_bs, dtype=np.int32)
+        state_slot_np = self._physical_slots(pool_np)
         ss_buf = var["v4_meta_state_slot_out"]
         ss_buf.np[:scheduled_bs] = state_slot_np
         si_buf = var["v4_meta_state_slot_in"]
@@ -4114,8 +4118,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
     ):
         """Build `[scheduled_bs]` int32 tensor of per-request state-cache slots.
 
-        The state class declares `entries_per_req=1`, so slot index ==
-        per_req_cache_group. This
+        The state class declares `entries_per_req=1`, so a seq holds exactly one
+        pool slot and `state_slots_committed` is the whole story. This
         is what V4 forward uses to index `swa_kv` and `Compressor.kv_state`
         (the per-request state pool, distinct from the per-token paged-KV
         `slot_mapping`).
@@ -4124,17 +4128,15 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         copy is consumed by the V4 forward path to avoid `.tolist()` syncs
         (PR-A Phase 2).
         """
-        groups_np = np.asarray(
-            batch.per_req_cache_groups[:scheduled_bs], dtype=np.int32
-        )
+        pool_np = np.asarray(batch.state_slots_committed[:scheduled_bs], dtype=np.int32)
         # Warmup / dummy_run batches don't allocate per_req_cache slots
-        # (per_req_cache_groups is empty). Fall back to slot 0 for all seqs
+        # (state_slots_committed is empty). Fall back to slot 0 for all seqs
         # so V4 forward can take the normal path uniformly — slot 0's state
         # cache is reset on the first real prefill (start_pos==0 path masks
         # state reads, fresh writes overwrite warmup pollution).
-        if len(groups_np) < scheduled_bs:
-            groups_np = np.zeros(scheduled_bs, dtype=np.int32)
-        slots_np = self._physical_slots(groups_np)
+        if len(pool_np) < scheduled_bs:
+            pool_np = np.zeros(scheduled_bs, dtype=np.int32)
+        slots_np = self._physical_slots(pool_np)
         gpu = self._stage("v4_meta_state_slot_out", slots_np)
         if return_cpu:
             return gpu, slots_np
@@ -4146,7 +4148,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         """Per-seq read slot: the fork source where set, else the write slot.
 
         `out_np` is already in plane positions; the fork sources arrive as pool
-        groups and are converted here, so one index space comes out.
+        slots and are converted here, so one index space comes out.
         """
         srcs = getattr(batch, "state_fork_srcs", None)
         if not srcs or len(srcs) < scheduled_bs:
@@ -4154,22 +4156,22 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         src_np = np.asarray(srcs[:scheduled_bs], dtype=np.int32)
         return np.where(src_np >= 0, self._physical_slots(src_np), out_np)
 
-    def _physical_slots(self, groups: np.ndarray) -> np.ndarray:
-        """Pool groups as the plane positions every kernel addresses by.
+    def _physical_slots(self, pool_slots: np.ndarray) -> np.ndarray:
+        """Pool slots as the plane positions every kernel addresses by.
 
         The two run in opposite directions — see
         `UnifiedPoolGeometry.physical_slot` — and this is the only crossing.
         Everything downstream speaks positions: both planes' windows, the
         compressor state's strided view, and the DSpark draft's plane.
         """
-        return np.int32(self.pool_geometry.slot_positions - 1) - groups
+        return np.int32(self.pool_geometry.slot_positions - 1) - pool_slots
 
     def _populate_state_slot_in(
         self, batch: ScheduledBatch, scheduled_bs: int, out_np: np.ndarray
     ) -> torch.Tensor:
         """Read-side slot per seq: the fork source where set, else the write slot.
 
-        A fork means the seq reads the state group it published (or resumed
+        A fork means the seq reads the state slot it published (or resumed
         from) and writes a fresh one, for this forward only; `BlockManager`
         decides, the scheduler ships the pairing as `state_fork_srcs` and clears
         it after one batch.

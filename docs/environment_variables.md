@@ -169,6 +169,20 @@ land. See `atom/model_ops/v4_backend_gate.py` for the selector.
 | **ATOM_V4_BACKEND** | str | `legacy` | `legacy` keeps the per-seq dispatch loop. `new` routes through `V4AttentionBackend`. Layer-restricted by `ATOM_V4_BACKEND_LAYERS` if set. |
 | **ATOM_V4_BACKEND_LAYERS** | csv int | "" (= all) | Comma-separated layer ids that use the new backend (others stay legacy). Empty means: apply `ATOM_V4_BACKEND` uniformly. Used for layer-by-layer bisect during migration (e.g. `0,3,15,30`). |
 
+## State checkpoints
+
+For models carrying per-request recurrent state (GDN: Qwen3-Next / Qwen3.5;
+Kimi-K3's KDA; DeepSeek-V4's compressor ring), a checkpoint lets a later prefix
+hit resume mid-prompt instead of recomputing from zero. *Where* they are placed
+is a policy, set by `--state-checkpoint-interval-tokens` (three regimes carried
+by the sign — see the [configuration guide](configuration_guide.md)) and the
+flag below. Details in the state-checkpoint section of the
+[scheduling & KV cache guide](scheduling_kv_cache_guide.md).
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_STATE_CHECKPOINT_DEMAND** | bool | 1 (true) | Set to `0` to stop a prefix hit that was refused for want of a checkpoint from placing a rung of its own, leaving the prompt-end anchor as the only placement. Overrides `--state-checkpoint-demand`, so the policy can be A/B'd without editing a launch script. The rung is most of the checkpoint write traffic and little of the read-back, and every write evicts something — `StateSlotPool.mark_speculative` carries the measurement. |
+
 ## Profiling & debugging
 
 | Variable | Type | Default | Description |

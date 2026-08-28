@@ -352,18 +352,24 @@ class LLMEngine:
     def get_cache_statistics(self, timeout: float = 30.0) -> dict[str, Any]:
         """Return aggregated prefix-cache statistics across DP ranks.
 
-        The four rates are the ones `[Cache Stats]` logs, recomputed from
-        summed counters rather than averaged: ranks admit different numbers of
-        tokens, so the mean of their rates is not the rate of their union.
+        The rates are the ones `[Cache Stats]` and `[Cache Pools]` log,
+        recomputed from summed counters rather than averaged: ranks admit
+        different numbers of tokens, so the mean of their rates is not the rate
+        of their union.
 
-        `cached <= wanted <= compressed <= full` by construction, which is what
-        makes the differences below meaningful:
+        `cached <= wanted <= compressed <= reusable <= full` by construction,
+        which is what makes the differences below meaningful:
           hit                 reuse actually admitted
           compressed_hit      reuse the prefix index held, before the
                               per-request state classes had their say
           lost_to_checkpoint  declined only because no checkpoint existed at
                               that boundary — what a denser ladder recovers
           lost_unrecoverable  declined for a reason no checkpoint touches
+
+        `paged_hit` and `state_hit` split that into one number per pool, so a
+        caller can tell which to fix; `hit` alone cannot, since the same value
+        arises from a KV pool that lost the prefix and from a state cache that
+        refused to resume from it. They multiply back to `hit` exactly.
         """
         responses = self.core_mgr.broadcast_utility_command_sync(
             "get_cache_statistics", timeout=timeout
@@ -380,30 +386,52 @@ class LLMEngine:
                 "cached_tokens",
                 "compressed_tokens",
                 "wanted_tokens",
+                "reusable_tokens",
                 "full_tokens",
                 "checkpoints_kept",
                 "checkpoints_dropped",
                 "checkpoints_evicted",
+                # Says the *paged* pool is too small, where `evicted` says the
+                # state pool is -- opposite fixes, so it cannot be folded in.
+                "checkpoints_orphaned",
                 "demands_recorded",
                 "demands_declined_no_room",
                 "chunks_cut_for_demand",
+                # Both cut counters or neither: their ratio is what separates a
+                # placement that converges from one that pays per request, and
+                # one of them missing makes the other unreadable.
+                "chunks_cut_for_end",
             )
         }
-        full = totals["full_tokens"]
+        # `reusable`, not `full`: a request's trailing block is never a reuse
+        # candidate (prefill must forward one block for logits), so `full`
+        # charges both pools for tokens neither was offered and caps every
+        # rate below 100%. See `CacheStats.total_reusable_tokens`.
+        reusable = totals["reusable_tokens"]
 
-        def rate(num: int) -> float:
-            return num / full if full else 0.0
+        def rate(num: int, den: int = reusable) -> float:
+            return num / den if den else 0.0
 
+        compressed = totals["compressed_tokens"]
         return {
             "enabled": bool(rank_stats),
             **totals,
             "hit": rate(totals["cached_tokens"]),
-            "compressed_hit": rate(totals["compressed_tokens"]),
+            "compressed_hit": rate(compressed),
             "lost_to_checkpoint": rate(
                 totals["wanted_tokens"] - totals["cached_tokens"]
             ),
-            "lost_unrecoverable": rate(
-                totals["compressed_tokens"] - totals["wanted_tokens"]
+            "lost_unrecoverable": rate(compressed - totals["wanted_tokens"]),
+            # The state cache's own rate, scored against what the paged pool
+            # actually handed it rather than against `reusable` -- otherwise a
+            # KV eviction reads as a state-cache miss and points tuning at the
+            # wrong pool. `compressed_hit` above is already the paged pool's
+            # half of the same split and the two multiply back to `hit`, so a
+            # `paged_hit` alias for it was a second name for one number.
+            # See `CacheStats.paged_hit_rate` / `state_hit_rate`.
+            "state_hit": rate(totals["cached_tokens"], compressed),
+            "state_recoverable_loss": rate(
+                totals["wanted_tokens"] - totals["cached_tokens"], compressed
             ),
         }
 
@@ -465,6 +493,7 @@ class LLMEngine:
             "demands_recorded",
             "demands_declined_no_room",
             "chunks_cut_for_demand",
+            "chunks_cut_for_end",
         )
         cache_totals = {
             key: sum(int(stats.get(key, 0)) for stats in cache_rank_stats)

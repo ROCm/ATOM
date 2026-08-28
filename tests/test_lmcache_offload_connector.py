@@ -148,7 +148,7 @@ def _stateful_seq(
         num_cached_tokens=num_cached_tokens,
         block_table=list(range((num_prompt_tokens + 255) // 256)),
         has_per_req_cache=True,
-        per_req_cache_group=group,
+        state_slot=group,
         prefix_hashes_published=True,
         _state_initialized_after_alloc=True,
     )
@@ -2008,7 +2008,7 @@ def test_stateful_load_metadata_includes_slot_destination_group():
     seq = _stateful_seq(req_id=704, num_prompt_tokens=24_576)
     boundary_hash = _commit_sidecar(sched, seq, 8192)
     sched.get_num_new_matched_tokens(seq)
-    seq.per_req_cache_group = 3
+    seq.state_slot = 3
 
     sched.update_state_after_alloc(seq)
     assert sched.should_park_for_load_after_alloc(seq) is True
@@ -2115,7 +2115,7 @@ def test_stateful_load_rejects_nonzero_post_alloc_hbm_floor():
     seq = _stateful_seq(req_id=721, num_prompt_tokens=24_576)
     _commit_sidecar(sched, seq, 8192)
     sched.get_num_new_matched_tokens(seq)
-    seq.per_req_cache_group = 3
+    seq.state_slot = 3
     # Faithfully models BlockManager's post-allocation state-copy/prefix hit:
     # a group is assigned and the HBM frontier advances before offload decides.
     seq.num_cached_tokens = 256
@@ -2742,7 +2742,7 @@ def test_aborted_parked_load_defers_owned_resources_until_terminal(
         status=SequenceStatus.ABORTED,
         block_table=[10, 11],
         has_per_req_cache=True,
-        per_req_cache_group=3,
+        state_slot=3,
         _counted_as_inflight_load=True,
     )
 
@@ -2762,7 +2762,7 @@ def test_aborted_parked_load_defers_owned_resources_until_terminal(
     def deallocate(value):
         events.append(("deallocate", value.id))
         value.block_table.clear()
-        value.per_req_cache_group = -1
+        value.state_slot = -1
 
     host = Scheduler.__new__(Scheduler)
     host.kv_connector = _Connector()
@@ -2779,7 +2779,7 @@ def test_aborted_parked_load_defers_owned_resources_until_terminal(
     assert host.deferred_free_blocks[seq.id] is seq
     assert seq._awaiting_aborted_load_cleanup is True
     assert seq.block_table == [10, 11]
-    assert seq.per_req_cache_group == 3
+    assert seq.state_slot == 3
     assert host._num_parked_remote_kv == 1
 
     host._update_from_kv_xfer_finished(KVConnectorOutput(**{field: {seq.id}}))
@@ -2792,7 +2792,7 @@ def test_aborted_parked_load_defers_owned_resources_until_terminal(
     assert host.deferred_free_blocks == {}
     assert host._num_parked_remote_kv == 0
     assert seq.block_table == []
-    assert seq.per_req_cache_group == -1
+    assert seq.state_slot == -1
     assert host.finished_recving_kv_req_ids == []
     assert host.failed_recving_kv_req_ids == []
 
@@ -2808,7 +2808,7 @@ def test_aborted_parked_load_consumes_already_queued_terminal(queued_field):
         status=SequenceStatus.ABORTED,
         block_table=[12, 13],
         has_per_req_cache=True,
-        per_req_cache_group=4,
+        state_slot=4,
         _counted_as_inflight_load=True,
     )
 
@@ -2828,7 +2828,7 @@ def test_aborted_parked_load_consumes_already_queued_terminal(queued_field):
     def deallocate(value):
         events.append(("deallocate", value.id))
         value.block_table.clear()
-        value.per_req_cache_group = -1
+        value.state_slot = -1
 
     host = Scheduler.__new__(Scheduler)
     host.kv_connector = _Connector()
@@ -2852,7 +2852,7 @@ def test_aborted_parked_load_consumes_already_queued_terminal(queued_field):
     assert host.failed_recving_kv_req_ids == []
     assert host._num_parked_remote_kv == 0
     assert seq.block_table == []
-    assert seq.per_req_cache_group == -1
+    assert seq.state_slot == -1
     assert not hasattr(seq, "_awaiting_aborted_load_cleanup")
 
 
@@ -2874,7 +2874,7 @@ def test_abort_cleans_load_whose_terminal_was_already_consumed(
         status=SequenceStatus.WAITING_FOR_REMOTE_KVS,
         block_table=[14, 15],
         has_per_req_cache=True,
-        per_req_cache_group=5,
+        state_slot=5,
         _counted_as_inflight_load=True,
         num_cached_tokens=4,
         num_tokens=8,
@@ -2900,7 +2900,7 @@ def test_abort_cleans_load_whose_terminal_was_already_consumed(
     def deallocate(value):
         events.append(("deallocate", value.id))
         value.block_table.clear()
-        value.per_req_cache_group = -1
+        value.state_slot = -1
 
     host = Scheduler.__new__(Scheduler)
     host.kv_connector = _Connector()
@@ -2931,7 +2931,7 @@ def test_abort_cleans_load_whose_terminal_was_already_consumed(
     assert host.deferred_free_blocks == {}
     assert host._num_parked_remote_kv == 0
     assert seq.block_table == []
-    assert seq.per_req_cache_group == -1
+    assert seq.state_slot == -1
     assert not hasattr(seq, "_awaiting_aborted_load_cleanup")
 
 
