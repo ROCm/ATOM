@@ -2245,10 +2245,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 "sparse_kv_last_page_lens"
             ].gpu[:bs]
             if self.dcp_world_size > 1:
-                # The DCP top-k filter keys its block-table lookup off the query
-                # token's owning request. One token per request here, so the map
-                # is the identity -- but it has to exist, because the filter is
-                # shared with the MTP path where it is not.
+                # One token per request makes the filter's token -> request map
+                # the identity; it must still exist, since MTP shares the filter.
                 self._token_to_seq_idxs_gpu[:bs] = torch.arange(
                     bs, dtype=torch.int32, device=self.device
                 )
@@ -2555,10 +2553,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 "sparse_kv_last_page_lens"
             ].gpu[:bs]
             if self.dcp_world_size > 1:
-                # Same identity map prepare_decode builds: the DCP top-k filter
-                # keys its block-table lookup off the query token's owning
-                # request, and one token per request makes that the identity.
-                # It still has to exist, or the captured graph has no buffer.
+                # Same identity map prepare_decode builds; the captured graph
+                # needs the buffer to exist.
                 self._token_to_seq_idxs_gpu[:bs] = torch.arange(
                     bs, dtype=torch.int32, device=self.device
                 )

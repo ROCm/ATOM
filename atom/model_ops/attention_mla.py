@@ -740,10 +740,6 @@ class MLAAttention(nn.Module):
 
         self.dcp_persistent_supported = dcp_persistent_supported()
         self.dcp_prefill_merge_bf16_ok = dcp_prefill_merge_bf16_ok()
-        # Scope sparse persistent DCP to native attention. Every sparse row is a
-        # virtual q_len=1 row -- one per sequence at decode, per token at sparse
-        # prefill, per draft position under MTP -- so all three build the work
-        # plan the same way. Plugin DCP reconfigures its group after construction.
         self.sparse_dcp_metadata_rebuild = (
             self.is_sparse_mla and self.dcp_world_size > 1
         )
@@ -2078,10 +2074,8 @@ class MLAAttention(nn.Module):
                     paged_kv_indices = self.sparse_kv_indices_buffer
                     paged_kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens[:B]
                 if self.dcp_world_size > 1:
-                    # The DCP filter compacts each query token's owned top-k to
-                    # the front, so region lengths are its per-token cumsum, not
-                    # the uniform stride sparse_kv_indptr describes. B is a token
-                    # count on both paths.
+                    # Region lengths are the DCP filter's per-token cumsum, not
+                    # sparse_kv_indptr's uniform stride; B counts tokens on both.
                     paged_kv_indptr = self.dcp_sparse_kv_indptr_buffer[: B + 1]
 
             dp_size = get_dp_group().world_size
@@ -2092,10 +2086,10 @@ class MLAAttention(nn.Module):
                 dcp_world_size=self.dcp_world_size,
                 dcp_persistent_supported=self.dcp_persistent_supported,
             )
-            # Sparse DCP decode stays persistent: its full IndexShare layers
-            # rebuild the work plan below from the layer-local compact indptr,
-            # which the non-persistent split-KV reduce cannot describe -- it
-            # gives every row the same split count regardless of owned slots.
+            # Sparse DCP persistent decode is enabled only for ordinary q_len=1
+            # native serving. Its full IndexShare layers rebuild the work plan
+            # below from the layer-local compact indptr; plugin/speculative paths
+            # retain the established non-persistent fallback.
             if self.is_sparse_mla and self.dcp_world_size > 1:
                 use_persistent_mode = (
                     use_persistent_mode and self.sparse_dcp_metadata_rebuild

@@ -149,34 +149,6 @@ def _configure_mooncake_transport(protocol: str) -> None:
         os.environ["MC_FORCE_TCP"] = "true"
 
 
-# ---------------------------------------------------------------------------
-# DCP relayout: block/token mapping for a non-DCP producer -> DCP consumer push
-# ---------------------------------------------------------------------------
-#
-# The producer stores KV contiguously: global token ``g`` lives in block
-# ``g // block_size`` at offset ``g % block_size``. A DCP consumer's block-table
-# entry is a *virtual block* covering ``block_size * dcp_size`` global tokens,
-# of which each rank physically holds only its own share, so the push is a
-# relayout rather than a block copy, with a shape that differs per region.
-#
-# Sharded regions (kv_cache): tokens are interleave-sharded in groups of
-# ``interleave_size`` (S), so global ``g`` lives on rank ``(g // S) % W`` at
-# local index ``(g // (S*W)) * S + g % S``. Planned in token units, returned as
-# coalesced ``(src_offset, dst_offset, length)`` runs flat within the region
-# (block id * tokens-per-block + offset) for the caller to scale by
-# ``token_bytes = src_unit_bytes // block_size``. Addressing one token that way
-# needs its bytes contiguous, which holds for the MLA ``[num_slots, 1, 576]``
-# layout but not for MHA ``[blocks, heads, head_dim/x, block_size, x]``, so
-# callers must gate ``interleave_size < block_size`` on the former.
-#
-# Replicated regions (index_cache under ATOM_DCP_REPLICATE_INDEX_CACHE=1): every
-# rank holds a virtual block whole, so it is the concatenation of source blocks
-# ``[v*W, (v+1)*W)`` -- independent of rank and of S, with a destination
-# ``unit_bytes`` W times the source's. Planned in bytes, not tokens: an index
-# page is written preshuffled, so a source page landing at a sub-page offset
-# moves as one key run plus one scale run (see ``plan_replicated_index``).
-
-
 def _coalesce(
     src: np.ndarray, dst: np.ndarray, length: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -449,8 +421,6 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         self.dp_rank = config.parallel_config.data_parallel_rank
         self.pp_size = config.pipeline_parallel_size
         self.block_size = config.kv_cache_block_size
-        # Prefix-cache offsets count virtual blocks; same quantity as
-        # BlockManager.hash_block_size.
         self.hash_block_size = self.block_size * config.decode_context_parallel_size
         self.host_ip = get_ip()
 
