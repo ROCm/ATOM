@@ -16,6 +16,7 @@ from aiter import (
     flash_attn_varlen_func,
     fused_qk_rope_concat_and_cache_mla,
     get_hip_quant,
+    indexer_qk_rope_quant_and_cache as _indexer_qk_rope_quant_and_cache,
 )
 
 # The segmented (page_size>1) MLA cache kernels only exist in newer aiter
@@ -65,6 +66,50 @@ from atom.utils.forward_context import (
     ForwardContext,
     get_forward_context,
 )
+
+
+def indexer_qk_rope_quant_and_cache(
+    q: torch.Tensor,
+    q_out: torch.Tensor,
+    weights: torch.Tensor,
+    weights_out: torch.Tensor,
+    k: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_bias: torch.Tensor,
+    positions: torch.Tensor,
+    cos_cache: torch.Tensor,
+    sin_cache: torch.Tensor,
+    epsilon: float,
+    quant_block_size: int,
+    scale_fmt: str | None,
+    weights_scale: float,
+    preshuffle: bool = False,
+    is_neox: bool = True,
+) -> None:
+    """Run the fused indexer cache op with ATOM's DCP query semantics."""
+    _indexer_qk_rope_quant_and_cache(
+        q,
+        q_out,
+        weights,
+        weights_out,
+        k,
+        kv_cache,
+        slot_mapping,
+        norm_weight,
+        norm_bias,
+        positions,
+        cos_cache,
+        sin_cache,
+        epsilon,
+        quant_block_size,
+        scale_fmt,
+        weights_scale,
+        preshuffle=preshuffle,
+        is_neox=is_neox,
+        compute_all_q_rope=get_dcp_world_size() > 1,
+    )
 
 
 def _sparse_index_workspace(

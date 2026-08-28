@@ -35,7 +35,6 @@ from aiter import (
     gemm_a8w8_blockscale_bpreshuffle,
     get_hip_quant,
     indexer_k_quant_and_cache,
-    indexer_qk_rope_quant_and_cache,
     top_k_per_row_decode,
     top_k_per_row_prefill,
 )
@@ -81,6 +80,7 @@ from atom.model_ops import module_dispatch_ops as _module_dispatch_ops
 from atom.model_ops.activation import SiluAndMul
 from atom.model_ops.attention_mla import (
     MLAModules,
+    indexer_qk_rope_quant_and_cache,
     is_rocm_aiter_fp4bmm_enabled,
     qrep_tp_override,
     triton_convert_req_index_to_global_index,
@@ -1606,7 +1606,6 @@ def sparse_attn_indexer(
         weights_out = torch.empty(
             weights.shape, device=weights.device, dtype=torch.float32
         )
-        extra = {"compute_all_q_rope": True} if get_dcp_world_size() > 1 else {}
         indexer_qk_rope_quant_and_cache(
             q_bf16,
             q_fp8,
@@ -1626,7 +1625,6 @@ def sparse_attn_indexer(
             weights_scale,
             preshuffle=True,
             is_neox=is_neox_style,
-            **extra,
         )
         weights = weights_out
     else:
