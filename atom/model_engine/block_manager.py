@@ -295,7 +295,16 @@ class BlockManager:
             return self.kv.has_free(count)
         return self.paged_state_checkpoints.ensure_free_units(count)
 
-    def _dcp_num_blocks(self, seq_len: int) -> int:
+    def num_pool_blocks(self, seq_len: int) -> int:
+        """KV pool blocks a `seq_len`-token sequence occupies on this rank.
+
+        Under DCP a rank stores only its interleaved shard, so this is a factor
+        of `dcp_world_size` below the global `ceil(seq_len / block_size)`. The
+        pool is sized in these same per-rank units, so this is the only count
+        that may be compared against `kv.num_blocks` — whether to draw from the
+        pool (`can_allocate`/`allocate`) or to reject a prompt as too large for
+        it (`Scheduler._unschedulable_reason`).
+        """
         if self.dcp_world_size <= 1:
             return (seq_len + self.block_size - 1) // self.block_size
         from atom.model_ops.dcp_ops import get_dcp_local_seq_lens
@@ -307,6 +316,38 @@ class BlockManager:
             self.cp_kv_cache_interleave_size,
         )[0]
         return int((local_len + self.block_size - 1) // self.block_size)
+
+    @property
+    def max_pool_tokens(self) -> int:
+        """Longest prompt, in global tokens, whose KV fits an entirely empty pool.
+
+        Bisects `num_pool_blocks`, which is monotone in `seq_len`, rather than
+        inverting it in closed form: under block-level interleaving
+        (`cp_kv_cache_interleave_size > 1`) a rank's share is not a plain
+        `seq_len / dcp_world_size`, and an inverse derived by hand would drift
+        from the allocator as soon as that arithmetic moved. Runs once, at
+        startup.
+
+        Mirrors the ceiling `Scheduler._unschedulable_reason` enforces, so the
+        frontend can predict that verdict and refuse an oversized prompt with an
+        error while it is still answering the client, instead of leaving the
+        scheduler to discover it once the client is already waiting. The API
+        server needs it published because `num_kvcache_blocks` is measured in
+        the engine subprocess and its own Config never learns the value.
+        """
+        capacity = self.kv.num_blocks
+        # A prompt this long needs more than `capacity` blocks on some rank, so
+        # it bounds the search from above: each rank holds at least
+        # `1 / dcp_world_size` of it, i.e. over `capacity` blocks' worth.
+        hi = (capacity + 1) * self.block_size * max(1, self.dcp_world_size)
+        lo = 0
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if self.num_pool_blocks(mid) <= capacity:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
 
     def _effective_block_size(self):
         return self.block_size * self.dcp_world_size
@@ -399,7 +440,7 @@ class BlockManager:
         if seq.has_per_req_cache and not self.state.has_free():
             return -1
         if not self.enable_prefix_caching:
-            if not self._has_page_units(self._dcp_num_blocks(len(seq))):
+            if not self._has_page_units(self.num_pool_blocks(len(seq))):
                 return -1
             return 0
         # Step 1: compressed prefix (CSA/HCA/indexer share the block hash and
@@ -479,7 +520,7 @@ class BlockManager:
         # Pin the restore before fresh blocks can evict its checkpoint.
         if seq.has_per_req_cache and self.paged_state_checkpoints is not None:
             self._attach_state_group(seq, h if num_cached_blocks > 0 else -1)
-        for _ in range(num_cached_blocks, self._dcp_num_blocks(len(seq))):
+        for _ in range(num_cached_blocks, self.num_pool_blocks(len(seq))):
             seq.block_table.append(self._fresh_block())
         seq.num_cached_tokens = num_cached_blocks * self._hash_block_size()
 
@@ -629,7 +670,7 @@ class BlockManager:
                     store_run_hashes,
                     store_run_tokens,
                     store_run_parent,
-                    self.block_size,
+                    self.hash_block_size,
                 )
             )
         pos = base + num_new_tokens
@@ -1058,7 +1099,7 @@ class BlockManager:
                             # into a list already. See `_make_block_stored`.
                             list(token_ids),
                             parent_hash if parent_hash != -1 else None,
-                            self.block_size,
+                            self.hash_block_size,
                         )
                     )
 
@@ -1071,16 +1112,33 @@ class BlockManager:
         """Hash received prompt blocks into the prefix cache so subsequent
         turns can match them locally and transfer only the delta.
 
-        Only whole blocks are registered; trailing partial block left unhashed
-        (matches ``hash_blocks``). Returns the number of blocks hashed.
+        Under DCP, one block-table entry represents ``dcp_world_size`` physical
+        blocks and therefore ``hash_block_size`` global tokens. Hashing at the
+        physical ``block_size`` would attach several incompatible token ranges
+        to the same virtual block.
+
+        Blocks before ``num_cached_tokens`` are already indexed locally; only
+        the received suffix needs registration. The trailing partial hash block
+        remains unpublished, matching ``hash_blocks``.
+
+        Returns the number of complete received suffix blocks processed for
+        this sequence. This includes blocks annotated from an existing canonical
+        hash, so it is neither the total number of hashed prompt blocks nor
+        necessarily the number of newly inserted hash-index entries.
         """
         if not self.enable_prefix_caching:
             return 0
-        num_full = seq.num_prompt_tokens // self.block_size
+
+        hbs = self._hash_block_size()
+        num_full = seq.num_prompt_tokens // hbs
         num_full = min(num_full, len(seq.block_table))
-        h = -1
-        for i in range(num_full):
-            token_ids = seq.block(i)
+        start = min(seq.num_cached_tokens // hbs, num_full)
+        h = self._chain_parent_hash(seq, start)
+        if h is None:
+            return 0
+
+        for i in range(start, num_full):
+            token_ids = self._hash_block_tokens(seq, i)
             h = self.compute_hash(token_ids, h)
             block_id = seq.block_table[i]
             block = self.kv.block(block_id)
@@ -1095,7 +1153,13 @@ class BlockManager:
                         f"seq={seq.id} block={block_id} indexed={indexed_block_id}"
                     )
                 block.update(h, token_ids)
-        return num_full
+
+        seq.num_hashed_tokens = max(seq.num_hashed_tokens, num_full * hbs)
+        # The decode consumer has no local prefill postprocess to publish these
+        # prompt blocks. Mark that one-shot work complete so its first decode
+        # output does not publish the same physical blocks again.
+        seq.prefix_hashes_published = True
+        return num_full - start
 
     def deallocate(self, seq: Sequence):
         for block_id in reversed(seq.block_table):
@@ -1190,7 +1254,7 @@ class BlockManager:
                 block_hashes,
                 token_ids,
                 parent_block_hash,
-                self.block_size,
+                self.hash_block_size,
                 medium=MEDIUM_REMOTE,
             )
         )

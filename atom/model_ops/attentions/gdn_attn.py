@@ -595,6 +595,11 @@ class GDNStateMixin:
 class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
 
     reorder_batch_threshold: int = 1
+    # `prepare_mtp_decode` below regenerates kv_indices and nothing else, so it
+    # cannot absorb the position bump the fused path hands off to the backend.
+    # Inherited as True from the MHA builder, which made `EagleProposer` pass
+    # `update_context_lens` / `positions_out` into a signature that has neither.
+    fuse_mtp_decode_position_update = False
 
     def sub_pool_specs(self) -> list[SubPoolSpec]:
         """GDN hybrid: a paged KV pool holding ONLY the full-attention layer
@@ -727,6 +732,7 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         only_update: bool = False,
         num_reject_tokens=None,
     ):
+        running_bs = int(positions.shape[-1])  # rows; see the base contract
         var = self.model_runner.forward_vars
 
         # GDN hybrid models use paged KV cache for full-attention layers.
@@ -736,9 +742,9 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         # paged attention does not use persistent worker buffers that need
         # incremental updates (unlike MLA). The full kv_indices regeneration
         # is always correct regardless of the update mode.
-        kv_indptr = var["kv_indptr"].gpu[: bs + 1]
+        kv_indptr = var["kv_indptr"].gpu[: running_bs + 1]
         kv_indices_generate_triton(
-            var["block_tables"].gpu[:bs],
+            var["block_tables"].gpu[:running_bs],
             var["kv_indices"].gpu,
             kv_indptr,
             self.block_ratio,
@@ -747,7 +753,7 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
 
         result = {}
         if self.block_size == 1024:
-            result = self.set_aiter_persistent_worker_buffers(bs)
+            result = self.set_aiter_persistent_worker_buffers(running_bs)
         return result
 
     def build_for_cudagraph_capture(self, bs: int):
@@ -771,8 +777,16 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         attn_metadata.gdn_metadata = self._build_gdn_capture_metadata(bs)
 
         positions = var["positions"].copy_to_gpu(bs)
+        # A capture runs a full synthetic batch, so nothing is padded and the
+        # scheduled shape is the running one.
+        capture_tokens = bs * int(var["max_qlen"])
         context = Context(
-            positions=positions, is_prefill=False, batch_size=bs, graph_bs=bs
+            positions=positions,
+            is_prefill=False,
+            scheduled_bs=bs,
+            running_bs=bs,
+            scheduled_tokens=capture_tokens,
+            running_tokens=capture_tokens,
         )
         return attn_metadata, context
 

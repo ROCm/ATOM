@@ -97,7 +97,7 @@ ATOM uses a module-level global `ForwardContext` to pass metadata through CUDA g
   - `spec_decode_metadata` (`SpecDecodeMetadata`) — draft token IDs, target/bonus logits indices.
   - `kv_cache_data` (`dict[str, KVCacheTensor]`) — per-layer KV cache tensor references.
 
-- **`Context`** — lightweight struct: `positions`, `is_prefill`, `batch_size`, `graph_bs`, `is_draft`.
+- **`Context`** — lightweight struct: `positions`, `is_prefill`, `batch_size`, `running_bs`, `running_tokens`, `is_draft`. The last two are the step's DP-unified padded shape: sequences and hidden_states rows respectively.
 
 - **`DPMetadata`** — data parallel metadata with `num_tokens_across_dp()` (all-reduce), `max_tokens_across_dp`, and `chunked_sizes()` context manager.
 

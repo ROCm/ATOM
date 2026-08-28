@@ -89,6 +89,8 @@ class Sequence:
         mrope_positions: np.ndarray | None = None,
         mrope_position_delta: int = 0,
         data_parallel_rank: int | None = None,
+        dp_session_id: str | None = None,
+        dp_parent_session_id: str | None = None,
     ):
         # Built here rather than as a default argument: one instance shared by
         # every defaulting Sequence would be a mutable default in all but name.
@@ -245,6 +247,11 @@ class Sequence:
         # Explicitly requested DP rank, e.g. for cache aware DP routing.
         # Consumed by CoreManager._dispatch_to_dp_ranks as a routing hint.
         self.data_parallel_rank = data_parallel_rank
+        # Optional client session lineage used by CoreManager's cache-aware,
+        # token-load-aware DPA router.  These are routing metadata only; they
+        # are deliberately kept out of the model-facing request payload.
+        self.dp_session_id = dp_session_id
+        self.dp_parent_session_id = dp_parent_session_id
 
     def __len__(self):
         return self._num_tokens

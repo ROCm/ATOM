@@ -163,28 +163,21 @@ class SpecDecodeMetadata:
 
 @dataclass(frozen=True)
 class ForwardMode:
-    """Per-step dispatch decision: cudagraph vs eager + per-rank attention bs
-    + cross-DP MoE-pad bs.
+    """Per-step dispatch, and the two batch sizes ATOM names.
 
-    Two distinct sizes because they answer different questions:
-      - ``effective_bs`` sizes per-rank attention tensors (slot_mapping /
-        cu_seqlens_q). Must match ``input_ids.shape[0]`` (= local real tokens)
-        in eager so aiter's ``t == t_slot`` invariant holds.
-      - ``moe_pad_bs`` sizes ``context.graph_bs`` which MoE's
-        ``pad_for_all_gather`` reads to pad ``hidden_states`` before the
-        cross-DP ``all_gather``. Must be identical on every DP rank or the
-        collective shape-mismatches. Only matters when uniform_decode (the
-        variable-length all_gatherv path doesn't read it).
+    ``scheduled_bs`` is what this rank was handed; ``running_bs`` is what the
+    GPU is made to run. The second is DP-group-UNIFIED and that is its whole
+    point: MoE pads to it and a captured graph holds its collective at that
+    width, so a rank arriving with a different one hangs the group.
 
-    Two are equal on the cudagraph path (captured shape is unified by
-    construction) and on the non-uniform path (collective is variable-length,
-    so MoE doesn't care). They diverge only in the uniform-decode + eager
-    fallback corner — ``--enforce-eager`` and ``padded > graph_bs[-1]``.
+    An op reads whichever its own tensors carry. They differ in one corner --
+    uniform decode running eager -- where MoE pads while attention keeps its
+    unpadded rows for aiter's ``t == t_slot``.
     """
 
     use_cudagraph: bool
-    effective_bs: int
-    moe_pad_bs: int
+    scheduled_bs: int
+    running_bs: int
     is_prefill: bool
 
     @classmethod
@@ -192,77 +185,61 @@ class ForwardMode:
         cls,
         *,
         is_prefill: bool,
-        total_seqs_num: int,
-        scheduled_bs_decode: int,
-        num_input_tokens: int,
+        scheduled_bs: int,
+        running_tokens: int,
         dp_uniform_decode: bool,
         enforce_eager: bool,
-        graph_bs: list[int],
+        capture_sizes: list[int],
         mtp_step: int = 1,
     ) -> "ForwardMode":
-        """Compute dispatch + effective_bs + moe_pad_bs. Any new force-eager
+        """Pick dispatch and the step's ``running_bs``. Any new force-eager
         condition belongs here, not in caller-side checks."""
         if is_prefill:
-            # Prefill is always eager. effective_bs is the sequence count;
-            # per-token sums are tracked separately via cu_seqlens_q.
-            # moe_pad_bs is unused on prefill (MoE pad only fires for decode).
+            # Prefill is always eager, so nothing is padded and the two are the
+            # same number. Per-token sums ride cu_seqlens_q, not this.
             return cls(
                 use_cudagraph=False,
-                effective_bs=total_seqs_num,
-                moe_pad_bs=total_seqs_num,
+                scheduled_bs=scheduled_bs,
+                running_bs=scheduled_bs,
                 is_prefill=True,
             )
 
-        # padded_scheduled_bs is unified across DP ranks in uniform mode
-        # (num_input_tokens = max_tokens, set in ModelRunner._preprocess);
-        # local-equivalent in non-uniform mode.
-        padded_scheduled_bs = (num_input_tokens + mtp_step - 1) // mtp_step
+        # The sequences the step will run, recovered from the token count:
+        # DP-unified in uniform mode (`running_tokens` is the group max, set in
+        # ModelRunner._preprocess), local-equivalent otherwise.
+        unified_bs = (running_tokens + mtp_step - 1) // mtp_step
 
         if not dp_uniform_decode:
-            # Non-uniform: MoE goes through all_gatherv (variable-length,
-            # per-rank sizes); pad_for_all_gather is NOT reached so moe_pad_bs
-            # is irrelevant. Keep both at local for consistency.
+            # MoE goes through all_gatherv (variable-length, per-rank sizes),
+            # so pad_for_all_gather is never reached and there is nothing to
+            # unify. Running at the scheduled batch pads nothing.
             return cls(
                 use_cudagraph=False,
-                effective_bs=scheduled_bs_decode,
-                moe_pad_bs=scheduled_bs_decode,
+                scheduled_bs=scheduled_bs,
+                running_bs=scheduled_bs,
                 is_prefill=False,
             )
 
-        # From here on: dp_uniform_decode=True. MoE WILL go through
-        # pad_for_all_gather, so moe_pad_bs MUST be cross-rank unified.
-
-        if enforce_eager:
-            # --enforce-eager + uniform decode: attention input_ids is local
-            # real, so effective_bs = local; but MoE pad needs the unified
-            # padded_scheduled_bs.
+        # From here on uniform decode: MoE WILL pad_for_all_gather, so
+        # running_bs MUST be the same number on every rank.
+        if enforce_eager or unified_bs > capture_sizes[-1]:
+            # Eager under uniform decode, either forced or above the largest
+            # captured size. This is the one corner where the two differ:
+            # attention keeps its own scheduled batch while MoE pads to the
+            # unified one.
             return cls(
                 use_cudagraph=False,
-                effective_bs=scheduled_bs_decode,
-                moe_pad_bs=padded_scheduled_bs,
+                scheduled_bs=scheduled_bs,
+                running_bs=unified_bs,
                 is_prefill=False,
             )
 
-        if padded_scheduled_bs > graph_bs[-1]:
-            # Workload above the largest captured graph: eager fallback under
-            # uniform. Same split — attention local, MoE pad unified.
-            return cls(
-                use_cudagraph=False,
-                effective_bs=scheduled_bs_decode,
-                moe_pad_bs=padded_scheduled_bs,
-                is_prefill=False,
-            )
-
-        # CUDAGraph path: pick the smallest captured size that fits. Captured
-        # shape is unified by construction so attention and MoE pad agree.
-        eff = next(
-            (x for x in graph_bs if x >= padded_scheduled_bs),
-            padded_scheduled_bs,
-        )
+        # CUDAGraph: the smallest captured size that fits. Captured sizes are
+        # a static list every rank shares, so this is unified by construction.
         return cls(
             use_cudagraph=True,
-            effective_bs=eff,
-            moe_pad_bs=eff,
+            scheduled_bs=scheduled_bs,
+            running_bs=next((x for x in capture_sizes if x >= unified_bs), unified_bs),
             is_prefill=False,
         )
 
@@ -290,18 +267,33 @@ class ForwardMode:
             or attn_metadata.slot_mapping is None
         ):
             return
+        # Past the early-return nothing is padded, so the rows attention runs
+        # are exactly the scheduled ones.
         max_q = attn_metadata.max_seqlen_q
-        expected = self.effective_bs * max_q
+        expected = self.scheduled_bs * max_q
         actual_in = input_ids.shape[0]
         actual_slot = attn_metadata.slot_mapping.shape[0]
         assert actual_in == expected, (
-            f"eager input_ids length {actual_in} != effective_bs*max_q="
+            f"eager input_ids length {actual_in} != scheduled_bs*max_q="
             f"{expected} ({self})"
         )
         assert actual_slot == expected, (
-            f"eager slot_mapping length {actual_slot} != effective_bs*max_q="
+            f"eager slot_mapping length {actual_slot} != scheduled_bs*max_q="
             f"{expected} ({self}); attn_metadata_builder used a stale bs"
         )
+
+
+def running_tokens_from_bs(bs: int, *, is_prefill: bool, attn_metadata) -> int:
+    """``running_tokens`` for a bridge that only knows a request count.
+
+    Prefill returns that count verbatim, which is NOT a height: prompt lengths
+    are ragged, so no multiplier recovers one, and a number below the real
+    height just leaves the batch unpadded -- correct there, since a prefill
+    all_gather is variable-length.
+    """
+    if is_prefill or attn_metadata is None:
+        return bs
+    return bs * int(attn_metadata.max_seqlen_q)
 
 
 @dataclass
@@ -310,14 +302,24 @@ class Context:
     positions: torch.Tensor
     is_prefill: bool = False
     is_dummy_run: bool = False
-    batch_size: int = 0
-    graph_bs: int = 0
+    # What this rank was handed. Duplicated from `forward_mode` because a
+    # capture context has none; `scheduled_tokens` is what an eager forward
+    # actually runs.
+    scheduled_bs: int = 0
+    scheduled_tokens: int = 0
+    # The step's DP-unified padded shape. `running_bs` counts SEQUENCES (graph
+    # identity, the draft's pad width), `running_tokens` the hidden_states rows
+    # MoE pads to. Both stored, because the ratio is not always max_seqlen_q --
+    # a DSpark ragged step runs a flat bucket no rectangular bs*q recovers.
+    running_bs: int = 0
+    running_tokens: int = 0
     is_draft: bool = False
     # True iff all DP ranks are running pure decode this step (DP-disabled
     # case is treated as True). Mirrors vLLM's `uniform_decode` flag and
     # gates DP-specific variable-length all_gather/scatter paths.
     dp_uniform_decode: bool = True
-    # Single source of truth for cudagraph vs eager dispatch + effective_bs.
+    # Single source of truth for cudagraph vs eager dispatch + the step's
+    # scheduled_bs / running_bs.
     # Set by prepare_inputs via ForwardMode.decide(). None only on legacy
     # paths that haven't been routed through it (run_model falls back to
     # the original four-OR derivation in that case for back-compat).
@@ -344,8 +346,10 @@ class Context:
         positions: torch.Tensor,
         is_prefill: bool = False,
         is_dummy_run: bool = False,
-        batch_size: int = 0,
-        graph_bs: int = 0,
+        scheduled_bs: int = 0,
+        scheduled_tokens: int = 0,
+        running_bs: int = 0,
+        running_tokens: int = 0,
         is_draft: bool = False,
         dp_uniform_decode: bool = True,
         forward_mode: ForwardMode | None = None,
@@ -357,8 +361,10 @@ class Context:
         self.positions = positions
         self.is_prefill = is_prefill
         self.is_dummy_run = is_dummy_run
-        self.batch_size = batch_size
-        self.graph_bs = graph_bs
+        self.scheduled_bs = scheduled_bs
+        self.scheduled_tokens = scheduled_tokens
+        self.running_bs = running_bs
+        self.running_tokens = running_tokens
         self.is_draft = is_draft
         self.dp_uniform_decode = dp_uniform_decode
         self.forward_mode = forward_mode

@@ -105,6 +105,36 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
     def build(self, batch: ScheduledBatch, bs: int):
         raise NotImplementedError
 
+    def prepare_mtp_decode(
+        self,
+        bs: int,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        positions: torch.Tensor,
+        only_update: bool = False,
+        num_reject_tokens: torch.Tensor | None = None,
+    ):
+        """Rebuild this backend's metadata for one serial-draft mid-step.
+
+        The draft runs one row per sequence, and `positions` is that row buffer
+        -- so `positions.shape[-1]` is this step's `running_bs`, and it is what
+        every shape here follows. The `bs` argument is the `scheduled_bs`: the
+        count of those rows that carry a real sequence. They are equal whenever
+        nothing is padded, and an override must read the buffer rather than the
+        argument, because a drafter may run the wider batch the target just ran.
+
+        The LAST axis, not the first: MRoPE positions are `[3, N]` (the token
+        axis is last), and every other layout is `[N]`, where the two agree.
+
+        Backends that distinguish the two mark the padded tail so downstream
+        kernels skip it; those that do not simply never read `bs`, the same way
+        most ignore `only_update` / `num_reject_tokens`.
+
+        Returns per-forward metadata the caller installs on `attn_metadata`;
+        `{}` when the backend mutates it in place.
+        """
+        raise NotImplementedError
+
     @abstractmethod
     def build_for_cudagraph_capture(self, bs: int) -> AttentionMetaData:
         raise NotImplementedError
@@ -262,6 +292,13 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         ).interleave_size
         self.max_num_batched_tokens = model_runner.max_num_batched_tokens
         self.max_bs = model_runner.max_bs
+        # Every row's own index, resident so no step rebuilds it. One buffer for
+        # three readers that each want the same numbers: a cu_seqlens ramp at one
+        # token per sequence (hence `+ 1`), the real prefix a padded
+        # `batch_id_per_token` is restored from, and DSpark's token -> request map.
+        self.row_ids = torch.arange(
+            self.max_bs + 1, device=self.device, dtype=torch.int32
+        )
         self.max_num_blocks_per_seq = (
             config.max_model_len + self.block_size - 1
         ) // self.block_size
@@ -503,11 +540,11 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         self,
         attn_metadata: AttentionMetaData,
         ub_slice: UBatchSlice,
-        padded_bs: int,
+        running_bs: int,
         ubatch_idx: int = 0,
     ) -> AttentionMetaData:
         del ubatch_idx  # only used by builders with per-ubatch plan buffers
-        return split_attn_metadata(attn_metadata, ub_slice, padded_bs)
+        return split_attn_metadata(attn_metadata, ub_slice, running_bs)
 
     def _attach_tbo_prefill_cpu_lens(
         self, attn_metadata: AttentionMetaData, bs: int

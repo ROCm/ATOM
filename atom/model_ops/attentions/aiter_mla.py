@@ -690,6 +690,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         sparse_decode: bool = False,
         is_cp_round_robin: bool = False,
     ):
+        assert num_reject_tokens is None or num_reject_tokens.shape[0] >= bs, (
+            f"num_reject_tokens covers {num_reject_tokens.shape[0]} sequences "
+            f"but this asks for {bs}; the update kernel loads one per work item "
+            f"below `cu_num`, unconditionally"
+        )
         split_params = {
             "kv_granularity": max(self.block_size, 16),
             "max_seqlen_qo": max_q_len,
@@ -818,18 +823,21 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         parity with the MHA backend but unused (MLA's ``positions`` is already
         one entry per sequence at this point).
         """
+        running_bs = int(positions.shape[-1])  # rows; see the base contract
         del last_token_indices  # MLA positions are already per-seq (1 per token)
         var = self.model_runner.forward_vars
-        kv_indptr = var["kv_indptr"].gpu[: bs + 1]
-        cu_seqlens_q = var["cu_seqlens_q"].gpu[: bs + 1]
+        kv_indptr = var["kv_indptr"].gpu[: running_bs + 1]
+        cu_seqlens_q = var["cu_seqlens_q"].gpu[: running_bs + 1]
         if self.is_sparse:
-            sparse_kv_indptr = var["sparse_kv_indptr"].gpu[: bs + 1]
+            sparse_kv_indptr = var["sparse_kv_indptr"].gpu[: running_bs + 1]
         else:
             assert self.block_size == 1
             sparse_kv_indptr = None
 
         update_positions = positions_out is not None
-        context_lens = var["context_lens"].gpu[:bs] if update_context_lens else None
+        context_lens = (
+            var["context_lens"].gpu[:running_bs] if update_context_lens else None
+        )
 
         mtp_prepare_decode_mla_kernel[(1,)](
             kv_indptr,
@@ -837,7 +845,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             sparse_kv_indptr if self.is_sparse else kv_indptr,
             positions_out if update_positions else kv_indptr,
             context_lens if update_context_lens else kv_indptr,
-            bs,
+            running_bs,
             self.index_topk if self.is_sparse else 0,
             positions_out.stride(0) if update_positions else 1,
             IS_SPARSE=self.is_sparse,
@@ -857,13 +865,15 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             assert self.block_size == 1
             W = self.dcp_world_size
             r = self.dcp_rank
-            ctx_g = var["context_lens"].gpu[:bs].to(torch.int64)
+            ctx_g = var["context_lens"].gpu[:running_bs].to(torch.int64)
             base = ctx_g // W
             remainder = (ctx_g - base * W - r).clamp_(0, 1)
             local_ctx = (base + remainder).to(torch.int32)  # local KV tokens/blocks
             kv_indptr[0] = 0
-            kv_indptr[1 : bs + 1] = torch.cumsum(local_ctx, dim=0, dtype=torch.int32)
-            var["kv_last_page_lens"].gpu[:bs] = (local_ctx > 0).to(
+            kv_indptr[1 : running_bs + 1] = torch.cumsum(
+                local_ctx, dim=0, dtype=torch.int32
+            )
+            var["kv_last_page_lens"].gpu[:running_bs] = (local_ctx > 0).to(
                 var["kv_last_page_lens"].gpu.dtype
             )
             # Host upper bound for the index generator's loop (safe overestimate,
@@ -871,7 +881,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             local_max_k = max_seqlen_k // W + 1
 
         kv_indices_generate_triton(
-            var["block_tables"].gpu[:bs],
+            var["block_tables"].gpu[:running_bs],
             var["kv_indices"].gpu,
             kv_indptr,
             self.block_ratio,
@@ -881,7 +891,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # qlen==1 local decode: full build (not cprr; is_cp_round_robin=False),
             # over the just-rebuilt LOCAL kv_indptr / kv_last_page_lens.
             return self.set_mla_persistent_worker_buffers(
-                bs, 1, only_update=False, num_reject_tokens=None
+                running_bs, 1, only_update=False, num_reject_tokens=None
             )
         if self.is_sparse:
             # The MTP draft's single sparse block reads sparse_kv_indptr, but it
@@ -899,7 +909,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # reflects the reject-adjusted KV lengths, so num_reject_tokens is
             # not needed here.
             result = self.set_mla_persistent_worker_buffers(
-                bs,
+                running_bs,
                 1,
                 only_update=False,
                 num_reject_tokens=None,
@@ -907,6 +917,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             )
             result["sparse_kv_indptr"] = sparse_kv_indptr
         else:
+            # `bs`, not `running_bs`, and paired with `num_reject_tokens`: this count
+            # becomes `cu_num`, and the update kernel loads
+            # `num_reject_tokens[batch_id]` for every work item below it, before
+            # any length test. That tensor is the sampler's, so it is `bs` long.
+            # The two branches above pass no counts and so take the row count.
             result = self.set_mla_persistent_worker_buffers(
                 bs, max_seqlen_q, only_update, num_reject_tokens
             )
@@ -1981,7 +1996,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 "sparse_kv_last_page_lens"
             ].gpu[:bs]
 
-        # Use bs (graph_bs) >= 2 instead of scheduled_bs >= 2 to avoid accuracy issue:
+        # Use bs (running_bs) >= 2 instead of scheduled_bs >= 2 to avoid accuracy issue:
         if self.model_runner.config.enable_tbo_decode and bs >= 2:
             self._prepare_ubatch_decode(
                 scheduled_bs,
@@ -2010,10 +2025,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             (0, half),
             (half, bs),
         ]
-        padded_bs_list = [half, bs - half]
+        running_bs_list = [half, bs - half]
 
-        for ub_idx, ((req_start, req_end), padded_bs) in enumerate(
-            zip(ub_ranges, padded_bs_list)
+        for ub_idx, ((req_start, req_end), running_bs) in enumerate(
+            zip(ub_ranges, running_bs_list)
         ):
             p = f"ub{ub_idx}_"
             # How many real requests fall in this ubatch's range
@@ -2022,16 +2037,16 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             var[f"{p}context_lens"].np[:ub_real_reqs] = var["context_lens"].np[
                 req_start : req_start + ub_real_reqs
             ]
-            var[f"{p}context_lens"].np[ub_real_reqs:padded_bs] = 0
+            var[f"{p}context_lens"].np[ub_real_reqs:running_bs] = 0
 
             var[f"{p}kv_last_page_lens"].np[:ub_real_reqs] = var[
                 "kv_last_page_lens"
             ].np[req_start : req_start + ub_real_reqs]
-            var[f"{p}kv_last_page_lens"].np[ub_real_reqs:padded_bs] = 0
+            var[f"{p}kv_last_page_lens"].np[ub_real_reqs:running_bs] = 0
 
             tok_start = req_start * max_seqlen_q
             ub_real_tokens = ub_real_reqs * max_seqlen_q
-            padded_tok_count = padded_bs * max_seqlen_q
+            padded_tok_count = running_bs * max_seqlen_q
             var[f"{p}slot_mapping"].np[:ub_real_tokens] = var["slot_mapping"].np[
                 tok_start : tok_start + ub_real_tokens
             ]
@@ -2040,7 +2055,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             var[f"{p}block_tables"].np[:ub_real_reqs] = var["block_tables"].np[
                 req_start : req_start + ub_real_reqs
             ]
-            var[f"{p}block_tables"].np[ub_real_reqs:padded_bs] = 0
+            var[f"{p}block_tables"].np[ub_real_reqs:running_bs] = 0
 
             full_kv_indptr = var["kv_indptr"].np
             base = full_kv_indptr[req_start]
@@ -2050,7 +2065,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     full_kv_indptr[req_start + 1 : req_start + ub_real_reqs + 1] - base
                 )
             last_val = var[f"{p}kv_indptr"].np[ub_real_reqs] if ub_real_reqs > 0 else 0
-            var[f"{p}kv_indptr"].np[ub_real_reqs + 1 : padded_bs + 1] = last_val
+            var[f"{p}kv_indptr"].np[ub_real_reqs + 1 : running_bs + 1] = last_val
 
             if self.dcp_world_size > 1:
                 # Per-ubatch slice of the global kv_indptr (rebased); diffs (per-req
@@ -2066,7 +2081,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 g_last = (
                     var[f"{p}g_kv_indptr"].np[ub_real_reqs] if ub_real_reqs > 0 else 0
                 )
-                var[f"{p}g_kv_indptr"].np[ub_real_reqs + 1 : padded_bs + 1] = g_last
+                var[f"{p}g_kv_indptr"].np[ub_real_reqs + 1 : running_bs + 1] = g_last
 
             if self.is_sparse:
                 full_sparse = var["sparse_kv_indptr"].np
@@ -2083,7 +2098,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     else 0
                 )
                 var[f"{p}sparse_kv_indptr"].np[
-                    ub_real_reqs + 1 : padded_bs + 1
+                    ub_real_reqs + 1 : running_bs + 1
                 ] = sparse_last
 
             last_cu = ub_real_reqs * max_seqlen_q
@@ -2093,20 +2108,20 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 max_seqlen_q,
                 dtype=np.int32,
             )
-            var[f"{p}cu_seqlens_q"].np[ub_real_reqs + 1 : padded_bs + 1] = last_cu
+            var[f"{p}cu_seqlens_q"].np[ub_real_reqs + 1 : running_bs + 1] = last_cu
 
             vars_used = [
-                (f"{p}context_lens", padded_bs),
-                (f"{p}kv_last_page_lens", padded_bs),
+                (f"{p}context_lens", running_bs),
+                (f"{p}kv_last_page_lens", running_bs),
                 (f"{p}slot_mapping", padded_tok_count),
-                (f"{p}block_tables", padded_bs),
-                (f"{p}kv_indptr", padded_bs + 1),
-                (f"{p}cu_seqlens_q", padded_bs + 1),
+                (f"{p}block_tables", running_bs),
+                (f"{p}kv_indptr", running_bs + 1),
+                (f"{p}cu_seqlens_q", running_bs + 1),
             ]
             if self.dcp_world_size > 1:
-                vars_used.append((f"{p}g_kv_indptr", padded_bs + 1))
+                vars_used.append((f"{p}g_kv_indptr", running_bs + 1))
             if self.is_sparse:
-                vars_used.append((f"{p}sparse_kv_indptr", padded_bs + 1))
+                vars_used.append((f"{p}sparse_kv_indptr", running_bs + 1))
 
             for el, num in vars_used:
                 var[el].copy_to_gpu(num)
@@ -2117,39 +2132,39 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 else 0
             )
             kv_indices_generate_triton(
-                var[f"{p}block_tables"].gpu[:padded_bs],
+                var[f"{p}block_tables"].gpu[:running_bs],
                 var[f"{p}kv_indices"].gpu,
-                var[f"{p}kv_indptr"].gpu[: padded_bs + 1],
+                var[f"{p}kv_indptr"].gpu[: running_bs + 1],
                 self.block_ratio,
                 ub_max_seqlen_k,
             )
 
             self._set_ubatch_mla_buffers(
-                padded_bs,
+                running_bs,
                 max_seqlen_q,
                 ub_idx,
                 is_cp_round_robin=self.dcp_world_size > 1 and max_seqlen_q > 1,
             )
 
     def _set_ubatch_mla_buffers(
-        self, padded_bs, max_q_len, ubatch_idx, is_cp_round_robin=False
+        self, running_bs, max_q_len, ubatch_idx, is_cp_round_robin=False
     ):
         """Compute MLA work buffers for a per-ubatch forward_vars set."""
         p = f"ub{ubatch_idx}_"
         var = self.model_runner.forward_vars
 
-        kv_indptr_for_mla = var[f"{p}kv_indptr"].gpu[: padded_bs + 1]
-        kv_last_page_lens_for_mla = var[f"{p}kv_last_page_lens"].gpu[:padded_bs]
+        kv_indptr_for_mla = var[f"{p}kv_indptr"].gpu[: running_bs + 1]
+        kv_last_page_lens_for_mla = var[f"{p}kv_last_page_lens"].gpu[:running_bs]
         if self.is_sparse:
-            kv_indptr_for_mla = var[f"{p}sparse_kv_indptr"].gpu[: padded_bs + 1]
+            kv_indptr_for_mla = var[f"{p}sparse_kv_indptr"].gpu[: running_bs + 1]
             # Sparse KV is packed per token at page_size=1 -> last_page_len is 1.
             # The dense per-block buffer would over-read past the sparse indices
             # (see set_mla_persistent_worker_buffers). The all-1s sparse buffer is
             # batch-independent, so the shared (non-ubatch) copy is safe here.
-            kv_last_page_lens_for_mla = var["sparse_kv_last_page_lens"].gpu[:padded_bs]
+            kv_last_page_lens_for_mla = var["sparse_kv_last_page_lens"].gpu[:running_bs]
 
         get_mla_metadata_v1(
-            var[f"{p}cu_seqlens_q"].gpu[: padded_bs + 1],
+            var[f"{p}cu_seqlens_q"].gpu[: running_bs + 1],
             kv_indptr_for_mla,
             kv_last_page_lens_for_mla,
             self.persistent_num_heads,
@@ -2272,14 +2287,20 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             ].gpu[:bs]
         positions = var["positions"].copy_to_gpu(sum_tokens)
         context = Context(
-            positions=positions, is_prefill=False, batch_size=bs, graph_bs=bs
+            positions=positions,
+            is_prefill=False,
+            scheduled_bs=bs,
+            running_bs=bs,
+            # A capture runs a full synthetic batch: nothing is padded.
+            scheduled_tokens=sum_tokens,
+            running_tokens=sum_tokens,
         )
         return attn_matadata, context
 
     def build_ubatch_metadata(
         self,
         ubatch_idx: int,
-        padded_bs: int,
+        running_bs: int,
     ) -> AttentionMetaData:
         """Create per-ubatch AttentionMetaData from pre-allocated forward_vars."""
         var = self.model_runner.forward_vars
@@ -2288,28 +2309,28 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         # Compute MLA work buffers for this ubatch
         self._set_ubatch_mla_buffers(
-            padded_bs,
+            running_bs,
             max_q_len,
             ubatch_idx,
             is_cp_round_robin=self.dcp_world_size > 1 and max_q_len > 1,
         )
 
         attn = AttentionMetaData(
-            slot_mapping=var[f"{p}slot_mapping"].gpu[: padded_bs * max_q_len],
-            context_lens=var[f"{p}context_lens"].gpu[:padded_bs],
-            block_tables=var[f"{p}block_tables"].gpu[:padded_bs],
+            slot_mapping=var[f"{p}slot_mapping"].gpu[: running_bs * max_q_len],
+            context_lens=var[f"{p}context_lens"].gpu[:running_bs],
+            block_tables=var[f"{p}block_tables"].gpu[:running_bs],
             max_seqlen_q=max_q_len,
-            cu_seqlens_q=var[f"{p}cu_seqlens_q"].gpu[: padded_bs + 1],
-            kv_indptr=var[f"{p}kv_indptr"].gpu[: padded_bs + 1],
+            cu_seqlens_q=var[f"{p}cu_seqlens_q"].gpu[: running_bs + 1],
+            kv_indptr=var[f"{p}kv_indptr"].gpu[: running_bs + 1],
             kv_indices=var[f"{p}kv_indices"].gpu,
-            kv_last_page_lens=var[f"{p}kv_last_page_lens"].gpu[:padded_bs],
+            kv_last_page_lens=var[f"{p}kv_last_page_lens"].gpu[:running_bs],
             sparse_kv_indptr=(
-                var[f"{p}sparse_kv_indptr"].gpu[: padded_bs + 1]
+                var[f"{p}sparse_kv_indptr"].gpu[: running_bs + 1]
                 if self.is_sparse
                 else None
             ),
             sparse_kv_last_page_lens=(
-                var["sparse_kv_last_page_lens"].gpu[:padded_bs]
+                var["sparse_kv_last_page_lens"].gpu[:running_bs]
                 if self.is_sparse
                 else None
             ),
@@ -2324,7 +2345,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # Per-ubatch round-robin CP global kv_indptr (None when non-DCP). Consumed
         # by _forward_decode when dcp>1 and max_q_len>1 (MTP).
         attn.g_kv_indptr = (
-            var[f"{p}g_kv_indptr"].gpu[: padded_bs + 1]
+            var[f"{p}g_kv_indptr"].gpu[: running_bs + 1]
             if self.dcp_world_size > 1
             else None
         )
@@ -2334,7 +2355,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         self,
         attn_metadata: AttentionMetaData,
         ub_slice,
-        padded_bs: int,
+        running_bs: int,
         ubatch_idx: int = 0,
     ) -> AttentionMetaData:
         """
@@ -2343,7 +2364,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         del ubatch_idx  # MLA has no per-ubatch pooled buffers to disambiguate
         from atom.utils.tbo.ubatch_splitting import split_attn_metadata
 
-        ub_attn = split_attn_metadata(attn_metadata, ub_slice, padded_bs)
+        ub_attn = split_attn_metadata(attn_metadata, ub_slice, running_bs)
 
         ts = ub_slice.token_slice
         rs = ub_slice.request_slice

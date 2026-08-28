@@ -9,6 +9,7 @@ import math
 import os
 import time
 from contextlib import contextmanager, nullcontext
+from functools import partial
 from typing import Any, NamedTuple
 
 import numpy as np
@@ -254,6 +255,14 @@ class tokenIDProcessor:
             cpu_tensor = gpu_tensor.to("cpu", non_blocking=True)
             event = torch.cuda.Event()
             event.record(self.async_copy_stream)
+        # No reverse wait here. `gpu_tensor` is a draft pass's captured output,
+        # so its address is fixed and the NEXT replay rewrites it -- but that
+        # replay sits behind a whole target forward on the default stream, while
+        # this copy is a few KB. Ordering the default stream against it would
+        # stall it for the copy every step, which is the overlap the side stream
+        # exists to buy. If a future change ever puts a replay closer than one
+        # forward away, the wait belongs immediately before THAT replay, not
+        # here.
         self.draft_token_ids_cpu.append((cpu_tensor, event))
 
     def recv_async_output_draft(self) -> np.ndarray:
@@ -568,7 +577,7 @@ class tokenIDProcessor:
         )
 
         # CUDAGraph tail padding. A replayed decode graph reads a fixed
-        # `graph_bs * tokens_per_seq` tokens out of this persistent buffer, but a
+        # `running_bs * tokens_per_seq` tokens out of this buffer, but a
         # step writes only the `total` it scheduled, and `bs` sits between two
         # captured buckets on most steps -- a 65-request batch replays the 128
         # graph, so 63 requests' worth of slots are never written. Nobody else
@@ -578,7 +587,9 @@ class tokenIDProcessor:
         # id, so the embedding gather stays in bounds either way.
         fill_to = total
         if not self.runner.enforce_eager:
-            gbs = next((g for g in reversed(self.runner.graph_bs) if g >= bs), None)
+            gbs = next(
+                (g for g in reversed(self.runner.capture_sizes) if g >= bs), None
+            )
             if gbs is not None:
                 fill_to = max(fill_to, int(gbs) * tokens_per_seq)
         if fill_to > total:
@@ -664,7 +675,7 @@ class ModelRunner:
 
         self._setup_device_and_distributed(rank, config)
 
-        self.graph_bs = [0]  # for eager fallback
+        self.capture_sizes = [0]  # for eager fallback
         # PIECEWISE cudagraph state, populated by capture_cudagraph. Empty when
         # capture never ran (enforce_eager), so the ragged-bucket paths no-op.
         self._piecewise_captured_tokens: set[int] = set()
@@ -2070,7 +2081,7 @@ class ModelRunner:
         batch,
         is_prefill,
         scheduled_bs,
-        actual_num_tokens,
+        scheduled_tokens,
         num_scheduled_tokens,
         tbo_collective_active: bool,
     ):
@@ -2089,7 +2100,7 @@ class ModelRunner:
         # so we don't desync from peers and hang.
         ubatch_slices = maybe_create_ubatch_slices(
             num_reqs=tbo_num_reqs,
-            num_tokens=actual_num_tokens,
+            num_tokens=scheduled_tokens,
             is_prefill=is_prefill,
             num_scheduled_tokens=num_scheduled_tokens if is_prefill else None,
             force=True,
@@ -2119,11 +2130,11 @@ class ModelRunner:
         to apply via ``_apply_dspark_shape_max``.
 
         Returns:
-            (num_input_tokens, num_tokens_across_dp, dp_uniform_decode,
+            (running_tokens, num_tokens_across_dp, dp_uniform_decode,
              max_tokens, tbo_collective_active, ub_max_tokens_across_dp,
              dspark_shape_max)
         """
-        num_input_tokens = batch.total_tokens_num
+        scheduled_tokens = batch.total_tokens_num
         is_prefill = batch.total_tokens_num_prefill > 0
         tbo_on = self.config.enable_tbo
         dp_size = self.config.parallel_config.data_parallel_size
@@ -2206,11 +2217,12 @@ class ModelRunner:
             # be forced into eager and lose the CUDAGraph decode path.
             self._dspark_decode_replay = True
             self._eplb_any_rank_has_prefill = None
+            # One rank pads to nobody, so running == scheduled here.
             return (
-                num_input_tokens,
+                scheduled_tokens,
                 None,
                 True,
-                num_input_tokens,
+                scheduled_tokens,
                 local_meets_min_tokens and local_can_split,
                 None,
                 dspark_shape,
@@ -2219,7 +2231,7 @@ class ModelRunner:
         sync = sync_dp_metadata(
             dp_group=get_dp_group().cpu_group,
             dp_size=dp_size,
-            num_input_tokens=num_input_tokens,
+            scheduled_tokens=scheduled_tokens,
             is_prefill=is_prefill,
             tbo_on=tbo_on,
             local_meets_min_tokens=local_meets_min_tokens,
@@ -2236,15 +2248,15 @@ class ModelRunner:
         dp_uniform_decode = (not sync.any_rank_has_prefill) or (
             not self.config.enable_dp_attention
         )
-        if dp_uniform_decode:
-            # CUDAGraph path: all ranks pad to the same max for fixed-size all_gather.
-            num_input_tokens = max_tokens
-        # else: variable-length path — each rank keeps its own token count.
+        # Only here does the count stop being this rank's own: under uniform
+        # decode every rank pads to the same max for a fixed-size all_gather.
+        # The variable-length path keeps its own, so the two stay equal.
+        running_tokens = max_tokens if dp_uniform_decode else scheduled_tokens
 
         self._dspark_decode_replay = dp_uniform_decode
 
         return (
-            num_input_tokens,
+            running_tokens,
             sync.num_tokens_across_dp,
             dp_uniform_decode,
             max_tokens,
@@ -2541,8 +2553,9 @@ class ModelRunner:
         # cached _preprocess tuple here so we DON'T issue a second all_gather.
         is_prefill = batch.total_tokens_num_prefill > 0
         bs = batch.total_seqs_num
+        scheduled_tokens = batch.total_tokens_num
         num_scheduled_tokens = np.asarray(batch.num_scheduled_tokens)
-        cu_seqlens_q, arange = self._get_cumsum_and_arange(num_scheduled_tokens)
+        cu_seqlens_q, _arange = self._get_cumsum_and_arange(num_scheduled_tokens)
         if preprocessed is None:
             preprocessed = self._preprocess(
                 batch,
@@ -2551,10 +2564,10 @@ class ModelRunner:
             )
             self._apply_dspark_shape_max(batch, preprocessed[6])
         (
-            num_input_tokens,
+            running_tokens,
             num_tokens_across_dp,
             dp_uniform_decode,
-            max_tokens,
+            _max_tokens,
             tbo_collective_active,
             ub_max_tokens_across_dp,
             _dspark_shape_max,
@@ -2572,12 +2585,12 @@ class ModelRunner:
         self.forward_vars["cu_seqlens_q"].np[1 : bs + 1] = cu_seqlens_q
 
         # mtp_step = per-seq decode token count, used by ForwardMode.decide to
-        # recover batch size as num_input_tokens // mtp_step. This is exactly
+        # recover batch size as running_tokens // mtp_step. This is exactly
         # the batch's single-source-of-truth decode length (= mtp_k+1, or the
-        # DSpark q-bucket when shrunk); num_input_tokens = scheduled_bs *
+        # DSpark q-bucket when shrunk); running_tokens = scheduled_bs *
         # num_spec_query_tokens, so the division recovers bs correctly. Prefill
         # has no drafter / uses 1.
-        decide_num_input_tokens = num_input_tokens
+        decide_running_tokens = running_tokens
         dp_bs = batch.dspark_dp_bs
         is_ragged = (
             getattr(batch, "dynamic_spec_query_tokens_per_req", None) is not None
@@ -2593,28 +2606,39 @@ class ModelRunner:
             q_eff = int(batch.num_spec_query_tokens)
             eff_bs = dp_bs if dp_bs is not None else batch.total_seqs_num_decode
             mtp_step = q_eff
-            decide_num_input_tokens = int(eff_bs) * q_eff
+            decide_running_tokens = int(eff_bs) * q_eff
         elif not is_prefill and hasattr(self, "drafter"):
             mtp_step = batch.num_spec_query_tokens
         else:
             mtp_step = (self.drafter.mtp_k + 1) if hasattr(self, "drafter") else 1
         forward_mode = ForwardMode.decide(
             is_prefill=is_prefill,
-            total_seqs_num=batch.total_seqs_num,
-            scheduled_bs_decode=batch.total_seqs_num_decode,
-            num_input_tokens=decide_num_input_tokens,
+            # `total_seqs_num`, not `total_seqs_num_prefill`: equal today, and
+            # the one that stays right once a prefill batch may also carry
+            # decode rows -- they go through the same attention call.
+            scheduled_bs=(
+                batch.total_seqs_num if is_prefill else batch.total_seqs_num_decode
+            ),
+            running_tokens=decide_running_tokens,
             dp_uniform_decode=dp_uniform_decode,
             enforce_eager=self.enforce_eager,
-            graph_bs=self.graph_bs,
+            capture_sizes=self.capture_sizes,
             mtp_step=mtp_step,
         )
 
         if not is_prefill:
-            scheduled_bs = batch.total_seqs_num_decode
-            bs = forward_mode.effective_bs  # single source of truth
-            assert bs >= scheduled_bs, (
-                f"effective_bs={bs} < scheduled_bs={scheduled_bs}; "
-                f"ForwardMode.decide invariant violated"
+            scheduled_bs = forward_mode.scheduled_bs
+            # Attention reads the padded width only where its tensors carry the
+            # padding; eager keeps the scheduled rows so aiter's t == t_slot
+            # holds against the local input_ids.
+            bs = (
+                forward_mode.running_bs
+                if forward_mode.attn_tensors_are_padded
+                else scheduled_bs
+            )
+            assert forward_mode.running_bs >= scheduled_bs, (
+                f"running_bs={forward_mode.running_bs} < "
+                f"scheduled_bs={scheduled_bs}; ForwardMode.decide invariant violated"
             )
             # Only pad cu_seqlens_q out to the cudagraph capture size if we
             # actually grew bs. Eager (bs == scheduled_bs) leaves the slice
@@ -2624,29 +2648,32 @@ class ModelRunner:
                     self.forward_vars["cu_seqlens_q"].np[scheduled_bs]
                 )
         attn_metadata, positions = self.attn_metadata_builder.build(batch=batch, bs=bs)
-        context_bs = batch.total_seqs_num_prefill if is_prefill else scheduled_bs
 
-        # MoE's pad_for_all_gather reads context.graph_bs to pad hidden_states
-        # before a cross-DP all_gather, so it must be unified across DP ranks
-        # under uniform decode (where pad path is taken). Use forward_mode's
-        # moe_pad_bs, which equals effective_bs except in the uniform-eager
-        # corner (enforce_eager / bs>graph_bs[-1]) where attention needs local
-        # but MoE pad needs the DP-unified padded_scheduled_bs.
-        graph_bs = num_input_tokens if is_prefill else forward_mode.moe_pad_bs
+        # The step's padded shape, in the two units its consumers read. Both
+        # must be identical on every DP rank: MoE pads hidden_states to
+        # `running_tokens` before the cross-DP all_gather, and a captured graph
+        # holds its collective at `running_bs`.
+        running_bs = forward_mode.running_bs
+        if not is_prefill:
+            # Prefill keeps whatever `_preprocess` settled on -- padded to the
+            # group max under uniform decode, its own count otherwise. Decode
+            # recomputes from the batch `decide` rounded up to, which is wider
+            # than that count whenever it landed on a captured size.
+            running_tokens = running_bs * int(attn_metadata.max_seqlen_q)
         drafter = getattr(self, "drafter", None)
         if not is_prefill and drafter is not None and drafter.is_block_drafter:
-            graph_bs = self._dspark_ragged_moe_graph_bs(batch, graph_bs)
+            running_tokens = self._dspark_ragged_running_tokens(batch, running_tokens)
         context = Context(
             positions=positions,
             is_prefill=is_prefill,
             is_dummy_run=batch.is_dummy_run,
-            batch_size=context_bs,
-            graph_bs=graph_bs,
+            scheduled_bs=forward_mode.scheduled_bs,
+            scheduled_tokens=scheduled_tokens,
+            running_bs=running_bs,
+            running_tokens=running_tokens,
             dp_uniform_decode=dp_uniform_decode,
             forward_mode=forward_mode,
         )
-
-        actual_num_tokens = batch.total_tokens_num
 
         spec_decode_metadata = None
         if not is_prefill and hasattr(self, "drafter") and not batch.is_dummy_run:
@@ -2676,7 +2703,7 @@ class ModelRunner:
                 batch,
                 is_prefill,
                 scheduled_bs if not is_prefill else 0,
-                actual_num_tokens,
+                scheduled_tokens,
                 num_scheduled_tokens,
                 tbo_collective_active,
             )
@@ -2685,13 +2712,12 @@ class ModelRunner:
             attn_metadata=attn_metadata,
             atom_config=self.config,
             context=context,
-            num_tokens=actual_num_tokens,
+            num_tokens=scheduled_tokens,
             num_tokens_across_dp=num_tokens_across_dp,
             spec_decode_metadata=spec_decode_metadata,
             ubatch_slices=ubatch_slices,
             ub_max_tokens_across_dp=ub_max_tokens_across_dp,
         )
-        return graph_bs
 
     def prepare_sample(
         self, batch: ScheduledBatch
@@ -3002,7 +3028,7 @@ class ModelRunner:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         forward_context = get_forward_context()
         context = forward_context.context
-        bs = context.batch_size
+        bs = context.scheduled_bs
         is_prefill = context.is_prefill
         positions = context.positions
 
@@ -3028,10 +3054,8 @@ class ModelRunner:
             use_cudagraph=forward_mode.use_cudagraph,
             is_dummy=context.is_dummy_run,
             tbo_on=forward_context.ubatch_slices is not None,
-            bs=bs,
-            # The CUDAGraph replays a padded batch (context.graph_bs); pass it so
-            # the label shows bs=<real>/<graph> when they differ.
-            graph_bs=context.graph_bs if forward_mode.use_cudagraph else None,
+            scheduled_bs=bs,
+            running_bs=context.running_bs,
             batch=batch,
             detailed_suffix=self._detailed_label_suffix(batch),
         )
@@ -3156,13 +3180,13 @@ class ModelRunner:
             # decode[bs=128 tok=128 d=128] / decode[... p=2 d=126 spec=3] /
             # dummy_decode[...] — see build_run_label.
             with record_function(label):
-                graph_bs = context.graph_bs
+                running_bs = context.running_bs
                 max_q_len = forward_context.attn_metadata.max_seqlen_q
-                num_tokens = context.batch_size * max_q_len  # real (output slice)
+                num_tokens = context.scheduled_bs * max_q_len  # real (output slice)
 
                 if self._piecewise_cg_active():
                     num_tokens_pad, real_tokens, _captured = (
-                        self._piecewise_replay_shape(batch, graph_bs, max_q_len)
+                        self._piecewise_replay_shape(batch, running_bs, max_q_len)
                     )
                     # Pad tail to a legal vocab id / position (builder fills to
                     # graph_cap >= num_tokens_pad, so a no-op safety net).
@@ -3202,7 +3226,7 @@ class ModelRunner:
                     logits = self.model.compute_logits(hidden_states)
                     return logits, hidden_states
 
-                graph_key = (graph_bs, max_q_len)
+                graph_key = (running_bs, max_q_len)
                 self.graphs[graph_key].replay()
                 hidden_states = self.forward_vars["outputs"][:num_tokens]
                 # Drafter aux buffers (if any) refresh on replay: their in-place
@@ -3412,14 +3436,14 @@ class ModelRunner:
         # Runs after EVERY target forward -- `postprocess` (hence propose) is
         # skipped for a middle chunk. Not on the aligning step: that pass is one
         # the peers never mirror.
-        run_context_pass = (
+        run_compute_draft_kv = (
             drafter is not None
             and not pp_non_last
             and not batch.is_dummy_run
-            and not (will_align_draft and drafter.precompute_duplicates_propose)
+            and not (will_align_draft and drafter.draft_kv_duplicates_propose)
         )
-        if run_context_pass:
-            drafter.precompute_context_kv(
+        if run_compute_draft_kv:
+            drafter.compute_draft_kv(
                 get_forward_context().context.positions,
                 hidden_states,
                 batch.next_token_ids,
@@ -3633,7 +3657,7 @@ class ModelRunner:
                 # The window is named from the tag the capture loop stashes
                 # before each prof.step(), not from a step counter: batch sizes
                 # are skipped (_piecewise_skip_capture) and repeated (once per
-                # q-bucket), so any index into self.graph_bs drifts out of sync
+                # q-bucket), so any index into self.capture_sizes drifts out of sync
                 # with what was actually captured.
                 #
                 # A cleared tag means this is the trailing window that opens
@@ -3773,7 +3797,7 @@ class ModelRunner:
                 return int(b)
         return None
 
-    def _piecewise_replay_shape(self, batch, graph_bs, max_q_len):
+    def _piecewise_replay_shape(self, batch, running_bs, max_q_len):
         """Pick the PIECEWISE replay token count for one decode step.
 
         Returns ``(num_tokens_pad, real_tokens, captured)``:
@@ -3808,23 +3832,20 @@ class ModelRunner:
             for b in buckets:
                 if b >= real_tokens and q > 0 and b % q == 0:
                     return b, real_tokens, _replay
-            return max(real_tokens, graph_bs * max_q_len), real_tokens, False
+            return max(real_tokens, running_bs * max_q_len), real_tokens, False
 
-        num_tokens_pad = graph_bs * max_q_len
+        num_tokens_pad = running_bs * max_q_len
         captured = num_tokens_pad in self._piecewise_captured_tokens
         return num_tokens_pad, num_tokens_pad, captured
 
-    def _dspark_ragged_moe_graph_bs(self, batch, default_graph_bs):
-        """MoE all_gather pad row count for a DSpark ragged PIECEWISE decode step.
+    def _dspark_ragged_running_tokens(self, batch, default_running_tokens):
+        """``running_tokens`` for a DSpark ragged PIECEWISE decode step.
 
-        ``context.graph_bs`` is what MoE's ``pad_for_all_gather`` pads
-        hidden_states to before the cross-DP all_gather, so every DP rank must
-        agree on it. But DSpark ragged does NOT replay at a rectangular bs*q
-        grid: it replays at the flat num_tokens bucket ``_piecewise_replay_shape``
-        picks from the DP-max total token count. Derive graph_bs from that SAME
-        bucket (bucket // q) so the padded row count matches the tokens actually
-        forwarded. Falls back to ``default_graph_bs`` when this isn't a DSpark
-        ragged step or the bucket isn't an exact multiple of q.
+        A ragged step replays at a flat num_tokens bucket, not a rectangular
+        bs*q grid, so the height MoE pads to IS that bucket. Picking the same
+        one ``_piecewise_replay_shape`` will (hence the identical q-divisibility
+        filter) is what keeps the eager ranks' all_gather equal to the size
+        baked into the replaying ranks' graph.
         """
         dp_total_tokens = batch.dspark_dp_total_tokens
         if (
@@ -3832,18 +3853,12 @@ class ModelRunner:
             or dp_total_tokens is None
             or not self._piecewise_sorted_tokens
         ):
-            return default_graph_bs
+            return default_running_tokens
         q = int(batch.num_spec_query_tokens)
-        buckets = self._piecewise_sorted_tokens
-        # Select the SAME q-divisible bucket N that _piecewise_replay_shape picks
-        # (smallest captured bucket >= dp_total_tokens with q | N), and return
-        # graph_bs = N // q. Then graph_bs*max_seqlen_q == N on EVERY rank, so the
-        # eager (dummy) MoE all_gather size equals the size baked into the real
-        # ranks' replayed piecewise graph -> no cross-rank collective mismatch.
-        for b in buckets:
+        for b in self._piecewise_sorted_tokens:
             if b >= int(dp_total_tokens) and q > 0 and b % q == 0:
-                return int(b) // q
-        return default_graph_bs
+                return int(b)
+        return default_running_tokens
 
     def _dspark_capture_q_buckets(self, full_q: int) -> list[int]:
         """DSpark query-length buckets to capture graphs for (paper Phase 2).
@@ -3954,7 +3969,7 @@ class ModelRunner:
         key. The rectangle bucket was already captured by the caller.
         """
         positions = self.forward_vars["positions"].gpu
-        for b in self.graph_bs:
+        for b in self.capture_sizes:
             num_tokens_pad = b * max_q_len
             if num_tokens_pad >= rectangle_tokens or num_tokens_pad < bs:
                 # >= rectangle: the rectangle case (already captured) or larger.
@@ -4011,17 +4026,10 @@ class ModelRunner:
             )
             self._force_aiter_unreg_capture_for_piecewise()
         start_time = time.time()
-        if self.config.compilation_config.cudagraph_capture_sizes:
-            self.graph_bs = self.config.compilation_config.cudagraph_capture_sizes
-        else:
-            cuda_graph_sizes = self.config.compilation_config.cuda_graph_sizes
-            if len(cuda_graph_sizes) == 1:
-                self.graph_bs = [1, 2, 4, 8] + [
-                    i for i in range(16, cuda_graph_sizes[0] + 1, 16)
-                ]
-            elif len(cuda_graph_sizes) > 1:
-                self.graph_bs = cuda_graph_sizes
-        self.graph_bs.sort(reverse=True)
+        # Config owns the declared ladder; the runner only narrows it to what
+        # this deployment can actually schedule (see the bound below).
+        self.capture_sizes = self.config.capture_sizes
+        self.capture_sizes.sort(reverse=True)
 
         # Drop any capture size the scheduler could never produce. `schedule_decode`
         # bounds a decode batch two ways: at most `max_num_seqs` sequences, and at
@@ -4049,9 +4057,9 @@ class ModelRunner:
         max_bs = max_schedulable_decode_bs(
             max_seq_bs, self.config.max_num_batched_tokens, full_q_len
         )
-        oversized = [s for s in self.graph_bs if s > max_bs]
+        oversized = [s for s in self.capture_sizes if s > max_bs]
         if oversized:
-            self.graph_bs = [s for s in self.graph_bs if s <= max_bs]
+            self.capture_sizes = [s for s in self.capture_sizes if s <= max_bs]
             logger.warning(
                 "cudagraph capture sizes %s exceed the schedulable batch size "
                 "min(max_num_seqs=%d, max_num_batched_tokens=%d // (mtp_k+1)=%d "
@@ -4062,9 +4070,9 @@ class ModelRunner:
                 full_q_len,
                 max_tok_bs,
                 max_bs,
-                self.graph_bs,
+                self.capture_sizes,
             )
-        assert self.graph_bs, (
+        assert self.capture_sizes, (
             f"no cudagraph capture sizes left: the scheduler can only reach "
             f"bs <= min(max_num_seqs={max_seq_bs}, "
             f"max_num_batched_tokens={self.config.max_num_batched_tokens} // "
@@ -4146,7 +4154,9 @@ class ModelRunner:
         with pause_gc(), graph_capture() as capture_ctx, self.capture_profiler as prof:
             for max_q_len in q_buckets:
                 capture_range = (
-                    tqdm.tqdm(self.graph_bs) if self.rank == 0 else self.graph_bs
+                    tqdm.tqdm(self.capture_sizes)
+                    if self.rank == 0
+                    else self.capture_sizes
                 )
                 for bs in capture_range:
                     if self.rank == 0:
@@ -4296,7 +4306,21 @@ class ModelRunner:
                     if prof is not None:
                         prof.step()
                         self._capture_trace_tag = None
-        self.graph_bs.sort(reverse=False)
+            # Inside the `with`: graph_capture() arms the custom all-reduce for
+            # capture and pause_gc() keeps the collector from aborting one. The
+            # drafter gets the capture builder already bound to this backend's
+            # signature -- which of them takes a `max_q_len` is the runner's to
+            # know, and it is the same probe the loop above ran.
+            if hasattr(self, "drafter"):
+                self.drafter.warmup_draft_graphs(
+                    (
+                        partial(build_capture, max_q_len=full_q_len)
+                        if supports_dynamic_q_len
+                        else build_capture
+                    ),
+                    capture_ctx.stream,
+                )
+        self.capture_sizes.sort(reverse=False)
 
         # PIECEWISE: sorted 1D num_tokens buckets for run_model's round_up_1d(Σ)
         # dispatch (bisect_left over this to pick the tightest captured shape).
@@ -4347,7 +4371,7 @@ class ModelRunner:
                 f"Consider reducing gpu_memory_utilization."
             )
 
-        return time.time() - start_time, self.graph_bs, _pool_bytes
+        return time.time() - start_time, self.capture_sizes, _pool_bytes
 
     @torch.inference_mode()
     def _maybe_calibrate_dspark_sps(self, max_q_len: int, n_iters: int = 20) -> None:
@@ -4390,7 +4414,7 @@ class ModelRunner:
 
         token_points: list[int] = []
         sps_points: list[float] = []
-        for bs in self.graph_bs:
+        for bs in self.capture_sizes:
             graph = self.graphs.get((bs, max_q_len))
             if graph is None:
                 continue
