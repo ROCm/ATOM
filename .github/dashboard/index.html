@@ -3208,6 +3208,7 @@ function atomeshLatencyRowsHTML(row) {
     [mean, p90, p99].map(v => Number.isFinite(v) ? fmtNum(v, 2) : '—').join(' / ')
   }</span></div>`).join('');
 }
+
 function atomeshDpAttentionLabel(row) {
   if (row.prefillDpa && row.decodeDpa) return 'True';
   if (row.prefillDpa) return 'Prefill only';
