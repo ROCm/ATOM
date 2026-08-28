@@ -60,7 +60,7 @@ assembly plus one new op, not a from-scratch port.
 | --- | --- | --- |
 | KDA linear attention | `KimiKDAAttention` (`models/kimi_k3.py`), aiter `kimi_delta_attn` Triton kernels | Very close. Same **separate `q/k/v_conv1d`** layout as the checkpoint, per-head `A_log`, per-channel `dt_bias`, `f_a`/`f_b` forget gate, and it already reads `linear_attn_config.gate_lower_bound`. |
 | mHC hyper-connections | `hc_split_sinkhorn` (`model_ops/sparse_attn_v4.py`), `Block.hc_pre`/`hc_post` (`models/deepseek_v4.py`) | **Math-exact.** Same sigmoid gates, same Sinkhorn schedule including the special first iteration, same `HC_POST_MULT = 2.0`. Checkpoint tensor names (`hc_attn_fn`/`base`/`scale`) are already what `Block` expects, and `hc_attn_fn` is `[24, 16384]` = exactly its `mixes` layout. `dim=4096` satisfies the fused aiter `mhc_pre`/`mhc_post` `% 512 == 0` constraint. |
-| k-pool DSA indexer | **new** — `model_ops/kpool_indexer.py` (this branch) | DeepSeek-V4's `Compressor` pools the same way at `compress_ratio=4` with an `ape` term, but overlapping + RoPE'd. GLM's is non-overlapping and NoPE. |
+| k-pool DSA indexer | **new** — `model_ops/glm5_next/kpool.py` (serving path) with `model_ops/kpool_indexer.py` as its dense `transformers`-parity oracle | DeepSeek-V4's `Compressor` pools the same way at `compress_ratio=4` with an `ape` term, but overlapping + RoPE'd. GLM's is non-overlapping and NoPE. |
 | MLA | `model_ops/attention_mla.py` via `MLAModules`, NoPE via `_NoPositionalRotaryEmbedding` | Needs the rope block materialized at `_ROPE_PAD = 64` lanes of zeros, giving the 576-wide KV entry every ROCm MLA kernel assumes. A zero-*width* slice is not viable — see §4d. |
 | MoE 288 × sigmoid/`noaux_tc` | `model_ops/fused_moe`, `models/glm4_moe.py`, `deepseek_v2.py` | Direct. |
 | Block FP8 128×128 | existing DeepSeek block-FP8 path | Direct. |
@@ -102,6 +102,18 @@ lengths 7 / 64 / 300 / 2048 / 3000 and with left padding of 5 and 17 tokens
 (`seq=3000` exceeds `index_topk`, so genuine sparse pool selection is exercised).
 
 Unit tests (CPU, synthetic weights): `tests/model_ops/test_kpool_indexer.py`.
+
+**Gap worth knowing before reviewing this branch: the k-pool code that actually
+serves — `atom/model_ops/glm5_next/kpool.py` — has no bit-exact unit test here.**
+The test above covers `kpool_indexer.py`, the dense oracle, which is not on the
+serving path. The end-to-end evidence for the pooled path is the 16-shot gsm8k
+score in §7 plus a controlled long-context retrieval check, and a benchmark
+score cannot pin the things a unit test can: that the pooling softmax is
+per-dimension rather than per-slot, that the Hadamard is orthonormal, and the
+pool/tail slot arithmetic. Every one of those has spellings that produce finite,
+plausible keys and a gsm8k score in the right range while still being wrong. The
+bit-exact suite for these ops exists on the parallel port's branch
+(`tests/models/test_glm5_next_kpool.py`) and should be brought across.
 
 To re-run the weights-based parity check you need the checkpoint and one GPU:
 
@@ -336,8 +348,8 @@ CUDA graphs and MTP are both still on the table.
 
 ## 7. Measured serving accuracy
 
-`lm_eval` gsm8k, all 1319 questions, TP8, bf16 KV, `--max-model-len 2048`,
-chat + `--fewshot_as_multiturn`, greedy:
+`lm_eval` gsm8k, all 1319 questions, TP8, bf16 KV, chat +
+`--fewshot_as_multiturn`, greedy. `--max-model-len` matches the context column:
 
 | | context | flexible-extract | strict-match |
 | --- | --- | --- | --- |

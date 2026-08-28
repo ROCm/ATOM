@@ -491,7 +491,7 @@
     "client_command": "lm_eval --model local-chat-completions --model_args model=${MODEL_PATH},base_url=http://localhost:8000/v1/chat/completions,num_concurrent=32,max_retries=3,tokenized_requests=False,max_gen_toks=512 --tasks gsm8k --num_fewshot 16 --batch_size 65 --apply_chat_template --fewshot_as_multiturn --output_path ${OUTPUT_PATH} --log_samples",
     "env_vars": "",
     "runner": "linux-atom-do-mi350x-8",
-    "test_level": "nightly",
+    "test_level": "pr",
     "accuracy_threshold": 0.94,
     "accuracy_baseline": 0.9659,
     "accuracy_baseline_model": "zai-org/GLM-5.3-Flash",

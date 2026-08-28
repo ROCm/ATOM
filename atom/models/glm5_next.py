@@ -45,7 +45,10 @@ Three decisions worth knowing about, each exact rather than approximate:
    ``KimiKDAAttention`` -- and all of its state-cache, TP and CUDA-graph
    integration -- reusable unchanged.
 
-Not yet wired: the MTP draft layer (checkpoint layer 45) and the vision tower.
+Not yet wired: the MTP draft layer (checkpoint layer 45), and the image INPUT
+path -- the vision tower itself is built and loaded from ``model.visual.*``
+(``glm5_next_vl.py``), but nothing upstream turns an image into ``pixel_values``
+yet, so it cannot be reached at serving time. See ``recipes/GLM-5.3-Flash.md``.
 """
 
 import os
