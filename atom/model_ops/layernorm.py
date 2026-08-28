@@ -70,10 +70,12 @@ def rmsnorm2d_fwd_(
         try:
             out = rmsnorm2d_fwd(x, weight, eps, use_model_sensitive_rmsnorm=1)
         except TypeError as error:
-            if (
-                _rmsnorm2d_fwd_supports_model_sensitive is True
-                or "use_model_sensitive_rmsnorm" not in str(error)
-            ):
+            msg = str(error)
+            unsupported_kw = (
+                "unexpected keyword argument" in msg
+                and "use_model_sensitive_rmsnorm" in msg
+            )
+            if _rmsnorm2d_fwd_supports_model_sensitive is True or not unsupported_kw:
                 raise
             _rmsnorm2d_fwd_supports_model_sensitive = False
         else:
@@ -105,9 +107,14 @@ def rmsnorm2d_fwd_with_add_(
                 use_model_sensitive_rmsnorm=1,
             )
         except TypeError as error:
+            msg = str(error)
+            unsupported_kw = (
+                "unexpected keyword argument" in msg
+                and "use_model_sensitive_rmsnorm" in msg
+            )
             if (
                 _rmsnorm2d_fwd_with_add_supports_model_sensitive is True
-                or "use_model_sensitive_rmsnorm" not in str(error)
+                or not unsupported_kw
             ):
                 raise
             _rmsnorm2d_fwd_with_add_supports_model_sensitive = False
