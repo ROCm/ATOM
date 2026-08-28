@@ -339,6 +339,35 @@ _metrics_refresh_task: asyncio.Task | None = None
 _METRICS_REFRESH_INTERVAL_SECONDS = 5.0
 
 
+def _get_dp_session_affinity_ids(
+    raw_request: Request | None,
+) -> tuple[str | None, str | None]:
+    """Extract AIPerf session lineage for CoreManager's DPA router.
+
+    AIPerf keeps ``X-Correlation-ID`` stable across the turns of one session.
+    When its Dynamo-affinity header option is enabled it also sends the parent
+    session ID for forked agent trees. CoreManager retains that lineage for
+    observability but deliberately assigns each child correlation ID its own
+    strict cache owner, matching SGLang's agentic routing. Clients without a
+    session header retain normal DP load balancing.
+    """
+    if os.environ.get("ATOM_DP_SESSION_AFFINITY", "0").lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return None, None
+    if raw_request is None:
+        return None, None
+
+    session_id = raw_request.headers.get(
+        "x-dynamo-session-id"
+    ) or raw_request.headers.get("x-correlation-id")
+    parent_id = raw_request.headers.get("x-dynamo-parent-session-id")
+    return session_id, parent_id
+
+
 # ============================================================================
 # Request/Response Logging
 # ============================================================================
@@ -529,12 +558,44 @@ def _get_engine_max_model_len() -> int | None:
     return getattr(_get_engine_config(), "max_model_len", None)
 
 
+def _get_engine_max_pool_tokens() -> int | None:
+    """Longest prompt the KV pool can hold, as each engine rank reported it.
+
+    None before the engine is up, or on a manager that never learned it, in
+    which case the scheduler remains the only enforcer.
+    """
+    return getattr(getattr(engine, "core_mgr", None), "max_pool_tokens", None)
+
+
+def _validate_pool_capacity(
+    num_prompt_tokens: int, max_pool_tokens: int | None
+) -> None:
+    """Refuse a prompt whose KV cannot fit even a completely empty pool.
+
+    `max_model_len` is a declared limit; this is a physical one, since the pool
+    is sized from whatever device memory is free once the weights are loaded, so
+    on a tight pool it binds first. The scheduler checks it too, but only once
+    the request reaches the engine — by then the client holds a response it will
+    never be answered on, so the request has to be turned away here instead.
+    """
+    if max_pool_tokens is None or int(num_prompt_tokens) <= int(max_pool_tokens):
+        return
+
+    raise ValueError(
+        f"This server's KV cache holds at most {max_pool_tokens} tokens for a "
+        f"single request, and your prompt contains at least {num_prompt_tokens} "
+        f"input tokens. Please shorten the prompt, or restart the server with a "
+        f"higher --gpu-memory-utilization to enlarge the cache."
+    )
+
+
 def _validate_sequence_context_length(seq) -> None:
     _validate_context_length(
         seq.num_prompt_tokens,
         seq.max_tokens,
         _get_engine_max_model_len(),
     )
+    _validate_pool_capacity(seq.num_prompt_tokens, _get_engine_max_pool_tokens())
 
 
 def _has_multimodal_content(messages: list[Any]) -> bool:
@@ -774,6 +835,8 @@ async def generate_async(
     request_id: str,
     kv_transfer_params: dict[str, Any] | None = None,
     data_parallel_rank: int | None = None,
+    dp_session_id: str | None = None,
+    dp_parent_session_id: str | None = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Generate text asynchronously for non-streaming requests."""
     token_queue: asyncio.Queue = asyncio.Queue()
@@ -820,6 +883,8 @@ async def generate_async(
             stream_callback=completion_callback,
             kv_transfer_params=kv_transfer_params,
             data_parallel_rank=data_parallel_rank,
+            dp_session_id=dp_session_id,
+            dp_parent_session_id=dp_parent_session_id,
         )
 
     seq = await loop.run_in_executor(None, do_preprocess)
@@ -899,6 +964,8 @@ async def generate_async_multimodal(
     sampling_params: SamplingParams,
     request_id: str,
     data_parallel_rank: int | None = None,
+    dp_session_id: str | None = None,
+    dp_parent_session_id: str | None = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Generate text asynchronously for one multimodal request."""
     token_queue: asyncio.Queue = asyncio.Queue()
@@ -930,6 +997,8 @@ async def generate_async_multimodal(
             stream_callback=completion_callback,
             multimodal_data=multimodal_data,
             data_parallel_rank=data_parallel_rank,
+            dp_session_id=dp_session_id,
+            dp_parent_session_id=dp_parent_session_id,
         )
 
     seq = await loop.run_in_executor(None, do_preprocess)
@@ -997,6 +1066,8 @@ async def generate_async_fanout(
     kv_transfer_params: dict[str, Any] | None = None,
     multimodal_data: dict[str, Any] | None = None,
     data_parallel_rank: int | None = None,
+    dp_session_id: str | None = None,
+    dp_parent_session_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """Non-streaming n>1 path: fan out N siblings and await all of them.
 
@@ -1048,6 +1119,8 @@ async def generate_async_fanout(
             multimodal_data=multimodal_data,
             parent_request_id=request_id,
             data_parallel_rank=data_parallel_rank,
+            dp_session_id=dp_session_id,
+            dp_parent_session_id=dp_parent_session_id,
         )
 
     seqs = await loop.run_in_executor(None, do_preprocess)
@@ -1139,6 +1212,8 @@ async def setup_streaming_request(
     kv_transfer_params: dict[str, Any] | None = None,
     multimodal_data: dict[str, Any] | None = None,
     data_parallel_rank: int | None = None,
+    dp_session_id: str | None = None,
+    dp_parent_session_id: str | None = None,
 ) -> tuple[int, StreamOutputCollector, int]:
     """Set up a streaming request with the engine.
 
@@ -1172,6 +1247,8 @@ async def setup_streaming_request(
             kv_transfer_params=kv_transfer_params,
             multimodal_data=multimodal_data,
             data_parallel_rank=data_parallel_rank,
+            dp_session_id=dp_session_id,
+            dp_parent_session_id=dp_parent_session_id,
         )
         _seq_id_to_request_id[seq.id] = request_id
         return seq
@@ -1339,6 +1416,8 @@ async def setup_streaming_request_fanout(
     kv_transfer_params: dict[str, Any] | None = None,
     multimodal_data: dict[str, Any] | None = None,
     data_parallel_rank: int | None = None,
+    dp_session_id: str | None = None,
+    dp_parent_session_id: str | None = None,
 ) -> tuple[list[int], StreamOutputCollector, int]:
     """Fan-out variant of :func:`setup_streaming_request`.
 
@@ -1389,6 +1468,8 @@ async def setup_streaming_request_fanout(
             multimodal_data=multimodal_data,
             parent_request_id=request_id,
             data_parallel_rank=data_parallel_rank,
+            dp_session_id=dp_session_id,
+            dp_parent_session_id=dp_parent_session_id,
         )
         for seq in seqs:
             _seq_id_to_request_id[seq.id] = request_id
@@ -1559,7 +1640,12 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         )
 
         request_id = f"chatcmpl-{uuid.uuid4().hex}"
-        dp_rank = request.data_parallel_rank
+        dp_session_id, dp_parent_session_id = _get_dp_session_affinity_ids(raw_request)
+        dp_routing = {
+            "data_parallel_rank": request.data_parallel_rank,
+            "dp_session_id": dp_session_id,
+            "dp_parent_session_id": dp_parent_session_id,
+        }
 
         _log_request_model("request", request_id, request)
 
@@ -1611,7 +1697,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                         request_id,
                         multimodal_data=stream_multimodal_data,
                         kv_transfer_params=request.kv_transfer_params,
-                        data_parallel_rank=dp_rank,
+                        **dp_routing,
                     )
                 )
                 gen = stream_chat_response_fanout(
@@ -1635,7 +1721,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                         request_id,
                         multimodal_data=stream_multimodal_data,
                         kv_transfer_params=request.kv_transfer_params,
-                        data_parallel_rank=dp_rank,
+                        **dp_routing,
                     )
                 )
                 gen = stream_chat_response(
@@ -1665,7 +1751,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     request_id,
                     multimodal_data=multimodal_data,
                     kv_transfer_params=request.kv_transfer_params,
-                    data_parallel_rank=dp_rank,
+                    **dp_routing,
                 ),
                 raw_request,
                 request_id,
@@ -1688,7 +1774,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     multimodal_data,
                     sampling_params,
                     request_id,
-                    data_parallel_rank=dp_rank,
+                    **dp_routing,
                 ),
                 raw_request,
                 request_id,
@@ -1712,7 +1798,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     sampling_params,
                     request_id,
                     kv_transfer_params=request.kv_transfer_params,
-                    data_parallel_rank=dp_rank,
+                    **dp_routing,
                 ),
                 raw_request,
                 request_id,
@@ -1735,7 +1821,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     sampling_params,
                     request_id,
                     kv_transfer_params=request.kv_transfer_params,
-                    data_parallel_rank=dp_rank,
+                    **dp_routing,
                 ),
                 raw_request,
                 request_id,
@@ -1786,7 +1872,12 @@ async def completions(request: CompletionRequest, raw_request: Request):
         )
 
         request_id = f"cmpl-{uuid.uuid4().hex}"
-        dp_rank = request.data_parallel_rank
+        dp_session_id, dp_parent_session_id = _get_dp_session_affinity_ids(raw_request)
+        dp_routing = {
+            "data_parallel_rank": request.data_parallel_rank,
+            "dp_session_id": dp_session_id,
+            "dp_parent_session_id": dp_parent_session_id,
+        }
 
         _log_request_model("request", request_id, request)
 
@@ -1799,7 +1890,7 @@ async def completions(request: CompletionRequest, raw_request: Request):
                         sampling_params,
                         request_id,
                         kv_transfer_params=request.kv_transfer_params,
-                        data_parallel_rank=dp_rank,
+                        **dp_routing,
                     )
                 )
                 gen = stream_completion_response_fanout(
@@ -1818,7 +1909,7 @@ async def completions(request: CompletionRequest, raw_request: Request):
                         sampling_params,
                         request_id,
                         kv_transfer_params=request.kv_transfer_params,
-                        data_parallel_rank=dp_rank,
+                        **dp_routing,
                     )
                 )
                 gen = stream_completion_response(
@@ -1843,7 +1934,7 @@ async def completions(request: CompletionRequest, raw_request: Request):
                     sampling_params,
                     request_id,
                     kv_transfer_params=request.kv_transfer_params,
-                    data_parallel_rank=request.data_parallel_rank,
+                    **dp_routing,
                 ),
                 raw_request,
                 request_id,
@@ -1858,7 +1949,7 @@ async def completions(request: CompletionRequest, raw_request: Request):
                     sampling_params,
                     request_id,
                     kv_transfer_params=request.kv_transfer_params,
-                    data_parallel_rank=request.data_parallel_rank,
+                    **dp_routing,
                 ),
                 raw_request,
                 request_id,

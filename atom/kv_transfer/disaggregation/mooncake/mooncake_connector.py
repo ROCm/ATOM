@@ -92,7 +92,7 @@ def _swa_ring_ids(seq) -> list[int]:
     any SWA regions at all, which only the connector knows -- see the guard at
     the transfer site.
     """
-    slot = getattr(seq, "per_req_cache_group", -1)
+    slot = getattr(seq, "state_slot", -1)
     return [int(slot)] if slot is not None and slot >= 0 else []
 
 
@@ -306,6 +306,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         self.dp_rank = config.parallel_config.data_parallel_rank
         self.pp_size = config.pipeline_parallel_size
         self.block_size = config.kv_cache_block_size
+        self.hash_block_size = self.block_size * config.decode_context_parallel_size
         self.host_ip = get_ip()
 
         # Pending requests: req_id -> (Sequence, block_table)
@@ -371,7 +372,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
                 self.transfer_id_to_request_id[transfer_id] = seq.id
                 self.request_id_to_transfer_id[seq.id] = transfer_id
 
-        slot_index = getattr(seq, "per_req_cache_group", -1)
+        slot_index = getattr(seq, "state_slot", -1)
 
         # Consumer side: queue for remote KV loading
         if params.get("do_remote_prefill"):
@@ -385,8 +386,18 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             # prefix cache. Per-request state (including the SWA ring slot) is
             # not covered by a block-only delta, so it takes a full transfer.
             num_computed_blocks = 0
-            if not seq.has_per_req_cache and self.block_size > 0:
-                num_computed_blocks = seq.num_cached_tokens // self.block_size
+            remote_hash_block_size = params.get("hash_block_size")
+            if remote_hash_block_size != self.hash_block_size:
+                logger.warning(
+                    "PD incremental transfer disabled for req %s: producer "
+                    "hash_block_size=%r, consumer hash_block_size=%d; "
+                    "falling back to full transfer",
+                    seq.id,
+                    remote_hash_block_size,
+                    self.hash_block_size,
+                )
+            elif not seq.has_per_req_cache and self.hash_block_size > 0:
+                num_computed_blocks = seq.num_cached_tokens // self.hash_block_size
             params["num_computed_blocks"] = num_computed_blocks
             logger.info(
                 "[SCHEDULER-CONSUMER] Queued req %s for remote KV recv "
@@ -432,10 +443,11 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             "tp_size": self.tp_size,
             "dp_rank": self.dp_rank,
             "remote_pp_size": self.pp_size,
+            "hash_block_size": self.hash_block_size,
             "transfer_id": seq.id,
             "first_token_id": first_token_id,
             "draft_token_ids": draft_token_ids,
-            "local_slot_index": getattr(seq, "per_req_cache_group", -1),
+            "local_slot_index": getattr(seq, "state_slot", -1),
             "prefix_cache_hit_tokens": getattr(seq, "prefix_cache_hit_tokens", 0),
         }
 
@@ -592,6 +604,7 @@ class MooncakeConnector(KVConnectorBase):
         self._has_slot_regions: bool = False
         # (base_addr, bytes_per_block) per region
         self._block_regions: list[tuple[int, int]] = []
+        self._block_region_consumer_indices: list[int] | None = None
         # Sliding-window regions, keyed by the request's state slot (not by the
         # compressed block_table above). Kept whole rather than as
         # `(base, unit)` because a window region may be reverse-indexed, and
@@ -739,6 +752,17 @@ class MooncakeConnector(KVConnectorBase):
 
         # Populate block/slot region lists for transfer offset computation
         self._block_regions = [(r.base_addr, r.unit_bytes) for r in tt.block_regions]
+        self._block_region_consumer_indices = getattr(
+            tt, "block_region_consumer_indices", None
+        )
+        if self._block_region_consumer_indices is not None and len(
+            self._block_region_consumer_indices
+        ) != len(self._block_regions):
+            raise ValueError(
+                "block_region_consumer_indices must match block_regions: "
+                f"{len(self._block_region_consumer_indices)} != "
+                f"{len(self._block_regions)}"
+            )
         # Window regions, transferred one whole entry per state slot.
         self._swa_block_regions = list(tt.swa_block_regions)
         self._slot_regions = [(r.base_addr, r.unit_bytes) for r in tt.slot_regions]
@@ -1335,6 +1359,7 @@ class MooncakeConnector(KVConnectorBase):
         num_local_regions: int,
         num_consumer_regions: int,
         consumer_num_layers: int | None = None,
+        explicit_indices: list[int] | None = None,
     ) -> list[int]:
         """Map this stage's local RDMA regions onto the consumer's region list.
 
@@ -1342,6 +1367,13 @@ class MooncakeConnector(KVConnectorBase):
         ``(i // L) * stride + start_layer + (i % L)``.
         Identity for pp_size == 1. Raises on layout mismatch.
         """
+        if explicit_indices is not None:
+            if len(explicit_indices) != num_local_regions:
+                raise ValueError(
+                    "Explicit consumer region map length does not match local "
+                    f"regions: {len(explicit_indices)} != {num_local_regions}"
+                )
+            return explicit_indices
         if (
             consumer_num_layers is not None
             and self.pp_size > 1
@@ -1396,6 +1428,7 @@ class MooncakeConnector(KVConnectorBase):
             num_regions,
             len(consumer_base_addrs),
             request_data.get("consumer_num_layers"),
+            self._block_region_consumer_indices,
         )
         for region_idx in range(num_regions):
             src_base = self.kv_caches_base_addr[region_idx]
@@ -1455,6 +1488,7 @@ class MooncakeConnector(KVConnectorBase):
             len(self._block_regions),
             len(consumer_block_addrs),
             request_data.get("consumer_num_layers"),
+            self._block_region_consumer_indices,
         )
         for region_idx, (src_base, bpb) in enumerate(self._block_regions):
             cidx = block_cmap[region_idx]

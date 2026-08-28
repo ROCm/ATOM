@@ -27,6 +27,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_RANK": lambda: int(os.getenv("ATOM_DP_RANK", "0")),
     "ATOM_DP_RANK_LOCAL": lambda: int(os.getenv("ATOM_DP_RANK_LOCAL", "0")),
     "ATOM_DP_SIZE": lambda: int(os.getenv("ATOM_DP_SIZE", "1")),
+    "ATOM_DP_SIZE_LOCAL": lambda: int(os.getenv("ATOM_DP_SIZE_LOCAL", "1")),
     "ATOM_DP_MASTER_IP": lambda: os.getenv("ATOM_DP_MASTER_IP", "127.0.0.1"),
     "ATOM_DP_MASTER_PORT": lambda: int(os.getenv("ATOM_DP_MASTER_PORT", "29500")),
     # Rendezvous base port; set per role when prefill/decode share a node.
@@ -38,6 +39,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # pressure) and a smaller value toward prompt-token balance (prefill
     # pressure). See engine_core_mgr.CoreManager._select_dp_rank_locked.
     "ATOM_DP_LB_REQ_EQUIV": lambda: int(os.getenv("ATOM_DP_LB_REQ_EQUIV", "512")),
+    # Place a new agent session on the lightest DP rank, then keep every later
+    # request on that immutable cache owner. Existing sessions never spill;
+    # child correlation ids are independently load-placed rather than
+    # inheriting their parent's owner.
+    "ATOM_DP_SESSION_AFFINITY": lambda: os.getenv(
+        "ATOM_DP_SESSION_AFFINITY", "0"
+    ).lower()
+    in {"1", "true", "yes", "on"},
     # Prefix for process titles set via set_process_title (shown in ps/top/rocm-smi)
     "ATOM_PROCESS_NAME_PREFIX": lambda: os.getenv("ATOM_PROCESS_NAME_PREFIX", "ATOM"),
     # SGLang's GLM-5.2 and DeepSeek V4 prefill CP paths still force
@@ -105,6 +114,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION", "1") == "1"
+    ),
+    # Set to 0 to stop a refused state-cache hit from placing a checkpoint of
+    # its own, leaving the prompt-end anchor as the only placement. Overrides
+    # --state-checkpoint-demand so the policy can be flipped without touching a
+    # launch script. The rung's write traffic may cost more in evictions than
+    # its reuse is worth — see `BlockManager._record_checkpoint_demand`.
+    "ATOM_STATE_CHECKPOINT_DEMAND": lambda: (
+        os.getenv("ATOM_STATE_CHECKPOINT_DEMAND", "1") == "1"
     ),
     # DSA sparse-indexer prefill: KV-dimension chunk size (in tokens) for
     # `fp8_mqa_logits`. The dense logits buffer is [prefill_tokens, total_kv];
@@ -200,6 +217,28 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_GDN_DECODE_LOSSY_FAST": lambda: (
         os.getenv("ATOM_ENABLE_GDN_DECODE_LOSSY_FAST", "0").lower() == "1"
     ),
+    # --- ReplaySSM (linear-attention state) ---
+    # Cache the SSM *inputs* (k, u, g) instead of one full recurrent state per
+    # speculative token.  The state pool stops scaling with the MTP window --
+    # e.g. Kimi-K3 at mtp_k=2, 64 seqs, tp=8 drops from 10.3 GiB to ~3.5 GiB --
+    # and the full-state write moves off the per-step path (rewritten only when
+    # the record buffer fills).  Rollback becomes a cursor move.
+    # See atom/model_ops/fla_ops/replayssm.py.
+    "ATOM_ENABLE_REPLAYSSM": lambda: (
+        None
+        if os.getenv("ATOM_ENABLE_REPLAYSSM") is None
+        else os.getenv("ATOM_ENABLE_REPLAYSSM", "0").lower() == "1"
+    ),
+    # Record-buffer depth L.  Must be >= 2*(mtp_k+1); raised automatically if
+    # set too low.  Larger L means fewer checkpoint write-backs but a longer
+    # rebuild each step; upstream measured 8-16 as the sweet spot.
+    "ATOM_REPLAYSSM_CACHE_LEN": lambda: int(
+        os.getenv("ATOM_REPLAYSSM_CACHE_LEN", "16")
+    ),
+    # "auto" | "serial" | "ut".  The UT-transform verify route only beats the
+    # serial one at verify windows >= ~12 tokens (measured on gfx950), so
+    # "auto" keeps practical MTP windows on the serial route.
+    "ATOM_REPLAYSSM_ROUTE": lambda: os.getenv("ATOM_REPLAYSSM_ROUTE", "auto").lower(),
     "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT": lambda: (
         os.getenv("ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT", "1") == "1"
     ),
@@ -284,7 +323,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Quantize eligible modules as they load to reduce peak memory. Streaming
     # quantizes local TP shards, so results may differ slightly from offline.
     "ATOM_ONLINE_QUANT_STREAMING": lambda: (
-        os.getenv("ATOM_ONLINE_QUANT_STREAMING", "1").lower() in ("1", "true")
+        os.getenv("ATOM_ONLINE_QUANT_STREAMING", "0").lower() in ("1", "true")
     ),
     # Tail workers for H2D, quantization, and source release. More workers
     # increase overlap and in-flight memory; 0 runs inline.
@@ -316,6 +355,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_USE_CUSTOM_ALL_GATHER", "1").lower() == "1"
     ),
     "ATOM_USE_FLYDSL_GDR": lambda: os.getenv("ATOM_USE_FLYDSL_GDR", "0").lower() == "1",
+    # Capture each declared draft pass into a per-captured-size CUDAGraph as it is
+    # warmed, so the draft replays instead of relaunching every kernel. 0 drafts
+    # eagerly. On by default: DSpark tp1 acceptance is 65.25% captured vs 65.21%
+    # eager. Named for the draft, not a flavor -- see `DraftGraph.will_capture`.
+    "ATOM_DRAFT_CUDAGRAPH": lambda: (
+        os.getenv("ATOM_DRAFT_CUDAGRAPH", "1").lower() == "1"
+    ),
     # --- MoE (DeepSeek-style shared experts) ---
     # Dual-stream MoE only when num_tokens <= threshold; 0 disables dual-stream registration.
     "ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD": lambda: int(
@@ -481,6 +527,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
         None
         if os.getenv("ATOM_PREFILL_DELAYER_MAX_QUEUE_MS", "") == ""
         else float(os.getenv("ATOM_PREFILL_DELAYER_MAX_QUEUE_MS"))
+    ),
+    # After a prefill forward, protect this many scheduler passes for decode
+    # before allowing another prefill. Mirrors SGLang's
+    # --prefill-decode-interval; 0 disables the hard interval.
+    "ATOM_PREFILL_DECODE_INTERVAL": lambda: int(
+        os.getenv("ATOM_PREFILL_DECODE_INTERVAL", "0")
     ),
     # --- TBO prefill ubatch splitting ---
     # Split prefill ubatches at the exact token midpoint (vLLM-DBO style),
