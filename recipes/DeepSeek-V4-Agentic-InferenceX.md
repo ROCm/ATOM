@@ -149,9 +149,12 @@ the concurrency.
 
 ### AIPerf version
 
-Both sides run the SemiAnalysis fork at 0.12.0. Our images track its default
-branch; the CI client pins `754356e9`, the same commit the InferenceX
-`utils/aiperf` submodule points at, so the two agree.
+Both sides run the SemiAnalysis fork at 0.12.0, pinned to `754356e9` -- the
+commit your `utils/aiperf` submodule points at -- in the image and in the CI
+client alike. We follow that pointer by hand rather than tracking aiperf's
+master, since your bump history shows it is a deliberate pin: four moves in the
+first half of August, and a same-day revert on 2026-07-28. If you move it,
+tell us and we will follow.
 
 ## Measured
 

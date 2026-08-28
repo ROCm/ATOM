@@ -256,20 +256,22 @@ print('OK: lmcache', lmcache.__version__, 'HIP c_ops; torch', torch.__version__)
 # The SemiAnalysis fork, which is what carries the SA agentic datasets
 # (semianalysis_cc_traces_weka_062126*).
 #
-# Tracks the default branch rather than a fixed SHA, so a rebuild follows
-# upstream the way InferenceX does -- it vendors aiperf as a submodule and moves
-# it, pinning no commit of its own. The cost is that the image is no longer
-# reproducible from the Dockerfile alone: two builds a week apart can ship
-# different aiperf. The resolved commit is echoed below so a built image can
-# always say what it actually has, and `SA_AIPERF_REF` takes a tag or SHA when a
-# build does need pinning.
+# Pinned to the commit InferenceX's `utils/aiperf` submodule points at, so our
+# image ships the aiperf they measure with. Their pointer is a deliberate,
+# frequently-moved pin -- four bumps in the first half of August 2026, and a
+# same-day revert on 2026-07-28 -- with commit titles that read "pin AIPerf v1
+# timing watchdog", "pin additive AIPerf main warmup". Tracking aiperf's master
+# instead would take in exactly the upstream changes they evaluate and
+# sometimes reject.
 #
-# Empty by default rather than a branch name: the clone already lands on
-# whatever HEAD points at, so naming the branch would only add a way to break
-# -- an upstream rename would fail `git checkout` in a build that has nothing
-# to do with the rename.
+# It therefore has to be followed by hand. To re-check:
+#   git ls-tree main utils/aiperf     # in a clone of SemiAnalysisAI/InferenceX
+#
+# `SA_AIPERF_REF` accepts any ref; empty means "whatever HEAD points at", which
+# is why the checkout below is conditional rather than naming a branch (an
+# upstream default-branch rename would otherwise break unrelated builds).
 ARG INSTALL_SA_AIPERF=1
-ARG SA_AIPERF_REF=""
+ARG SA_AIPERF_REF="754356e9a39acc6cc6afb242d123bb57c3fb6f75"
 RUN if [ "${INSTALL_SA_AIPERF}" = "1" ]; then \
         echo "========== [ATOM] Install SemiAnalysis aiperf (ref=${SA_AIPERF_REF:-<default branch>}) =========="; \
         rm -rf /opt/aiperf && \
