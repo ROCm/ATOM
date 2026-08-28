@@ -452,11 +452,18 @@ if [ "$TYPE" == "benchmark" ]; then
     export TOPOLOGY="${TOPOLOGY:-single-node}"
     if [[ "${SERVER_ARGS:-}" == *"--enable-dp-attention"* ]]; then
       export DISPLAY_TOPOLOGY="${DISPLAY_TOPOLOGY:-single-node-dpa}"
-      # Sessions are sticky; the id has to travel with the request or a
-      # session's turns scatter across DP ranks and lose their prefix cache.
+      # Session affinity headers. ATOM's DPA router reads `x-dynamo-session-id`
+      # (falling back to `x-correlation-id`, which AIPerf always sends) and
+      # `x-dynamo-parent-session-id` -- see `_get_dp_session_affinity_ids` in
+      # atom/entrypoints/openai/api_server.py. Only the Dynamo option sends the
+      # PARENT id, which is what carries the lineage of a forked agent tree; the
+      # generic `X-Session-ID` one sends a header ATOM does not read at all, and
+      # is kept only in case a router is ever put in front.
+      export AIPERF_HTTP_X_DYNAMO_SESSION_ID_FROM_CORRELATION_ID=true
       export AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID=true
     else
       export DISPLAY_TOPOLOGY="${DISPLAY_TOPOLOGY:-single-node}"
+      unset AIPERF_HTTP_X_DYNAMO_SESSION_ID_FROM_CORRELATION_ID
       unset AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID
     fi
     AGENTIC_OUT_DIR="${AGENTIC_OUT_DIR:-./aiperf-artifacts-c${CONC}}"
