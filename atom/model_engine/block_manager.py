@@ -259,7 +259,11 @@ class BlockManager:
                     getattr(config, "kv_transfer_config", None)
                 ).chunk_size
             )
-        except Exception:
+        except Exception:  # noqa: BLE001
+            # Blind on purpose: this runs at model load, the import reaches a
+            # third-party package that may be absent entirely, and the only
+            # consequence of not knowing the chunk size is that the joint KV
+            # load stays off. Refusing to start would be worse.
             logger.warning(
                 "state offload: could not read the LMCache chunk size; the "
                 "joint KV load needs it and stays off",

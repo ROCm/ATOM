@@ -75,30 +75,21 @@ class StateByteCodec:
     def key(self, h: int):
         """ATOM's hash, bound to the geometry the bytes were written under.
 
-        **Two jobs, and the second one is why this is not the bare hash.**
-
-        *Build safety.* The same prefix hash maps to a completely different
-        image under a different `num_spec`, TP size, or conv/ssm dtype. A size
-        mismatch would be caught by `entry_bytes`; the same size with a
-        different order or meaning reads back silently wrong state, and a
-        request resumed onto wrong state produces wrong output with nothing
-        raised anywhere. #2045 already encodes all of it in `layout_id`
-        (layers / conv shape+dtype / ssm shape+dtype / order / tp / spec /
-        carry) and enforces it HBM-side in `_validate_paged_state_op`; this is
-        the CPU side of the same check.
+        *Build safety.* One prefix hash maps to a different image under a
+        different `num_spec`, TP size, or conv/ssm dtype. A size mismatch is
+        caught by `entry_bytes`; the same size with a different order reads back
+        silently wrong state, and a request resumed onto it produces wrong
+        output with nothing raised. `layout_id` already names all of it and is
+        enforced HBM-side -- this is the CPU side of the same check.
 
         *Namespace separation.* `CacheEngineKey` has no field saying what an
-        entry IS -- KV chunk keys come from `ChunkedTokenDatabase`'s chunk hash
-        and state keys from ATOM's chained block hash, both plain integers in
-        one space. Since Phase 3a they also share one pool. They were separated
-        only accidentally, by this side hard-coding `torch.uint8` while KV
-        carries the KV dtype. Folding `layout_id` in makes them disjoint by
-        construction: no KV key can ever carry a K3 layout id.
+        entry IS, KV and state keys come from different hash functions into one
+        integer space, and both now share one pool. Folding `layout_id` in makes
+        the two spaces disjoint by construction.
 
-        Not a plain `hash((h, layout_id))`: Python's `hash` of a str is salted
-        per process (`PYTHONHASHSEED`), so a restart would silently orphan every
-        entry written by the previous run. `xxh64` is what the block hashes
-        themselves use.
+        `xxh64`, not `hash((h, layout_id))`: Python salts `hash` of a str per
+        process, so a restart would silently orphan every entry the previous run
+        wrote.
         """
         import xxhash
         from lmcache.utils import CacheEngineKey
@@ -123,20 +114,15 @@ class StateByteCodec:
     def put(self, h: int, unit_ids) -> bool:
         """Store one checkpoint image. False when nothing was stored.
 
-        The source is the checkpoint's PAGE units, not an Active Slot: under
-        #2045 that is where the image lives, and `page_unit_views` names those
-        bytes as the contiguous tensors the packer takes. The two directions
-        are deliberately asymmetric -- a load writes the slot (`get`) -- and
-        they compose because #2045's copy plan intersects two *ordered byte
-        streams*, so a blob gathered in unit order is byte-identical to one
-        gathered in slot order.
+        Reads the checkpoint's PAGE units, while `get` writes an Active Slot.
+        The asymmetry is deliberate and safe: the copy plan intersects two
+        *ordered byte streams*, so a blob gathered in unit order is
+        byte-identical to one gathered in slot order.
 
-        A refusal is not an error. `_allocate` returns None under CPU memory
-        pressure with nothing evictable, and a 53.6 MiB request is refused
-        sooner than a KV chunk's 884 KB, so the state leg is the first to feel
-        a full pool. Best-effort by design: the cost is one later miss, and
-        `puts_refused` is what makes it visible instead of a silent hit-rate
-        drift.
+        A refusal is not an error -- `_allocate` returns None under CPU memory
+        pressure, and a whole image is refused sooner than a KV chunk, so the
+        state leg feels a full pool first. `puts_refused` makes that visible
+        instead of a silent hit-rate drift.
         """
         if self._storage is None:
             return False
@@ -211,22 +197,23 @@ class StateByteCodec:
         """Bytes in a `MemoryObj`, or None when it will not say.
 
         `get_size()` is the documented accessor; the tensor is the fallback for
-        the buffer-backed objects that have no size of their own. None means
-        "cannot check", never "size 0" -- refusing a load we cannot measure
-        would turn an unknown into a guaranteed miss.
+        the buffer-backed objects that have no size of their own (their
+        `.tensor` is None). None means "cannot measure", never "size 0" --
+        refusing a load we cannot measure would turn an unknown into a
+        guaranteed miss.
+
+        Neither accessor is wrapped: an allocator that raises when asked its own
+        object's size is broken in a way this method must not paper over, and
+        swallowing it here would turn every read into a silent miss.
         """
         get_size = getattr(obj, "get_size", None)
         if callable(get_size):
-            try:
-                return int(get_size())
-            except Exception:
-                pass
+            size = get_size()
+            if size is not None:
+                return int(size)
         tensor = getattr(obj, "tensor", None)
         if tensor is not None:
-            try:
-                return int(tensor.numel()) * tensor.element_size()
-            except Exception:
-                pass
+            return int(tensor.numel()) * tensor.element_size()
         return None
 
     def contains(self, h: int) -> bool:
@@ -240,24 +227,16 @@ class StateByteCodec:
     def _allocate(self, nbytes: int) -> Any:
         from lmcache.v1.memory_management import MemoryFormat
 
-        # `MixedMemoryAllocator.allocate` accepts BINARY_BUFFER (-> a
-        # BytesBufferMemoryObj, whose `.tensor` is None and would fail
-        # `StagedTransfer.memory_tensor`) or one of the tensor formats
-        # {KV_2LTD, KV_2TD, KV_T2D, KV_MLA_FMT, EC_TD}; anything else, BINARY
-        # included, hits its `raise ValueError`. The shape/dtype above already
-        # force a flat opaque blob regardless of `fmt`, so the value is inert
-        # apart from passing that check -- same reasoning as the KV path's
-        # `self._engine.fmt = MemoryFormat.KV_2LTD` in connector.py.
+        # `fmt` is inert: the shape/dtype above already force a flat opaque
+        # blob. It is passed only because `MixedMemoryAllocator.allocate`
+        # rejects anything outside its tensor formats -- same reason the KV path
+        # sets `self._engine.fmt`.
+        #
         # `busy_loop=False` because this is a *store*. LMCache's own
-        # `LocalCPUBackend.allocate` docstring is explicit that busy_loop "should
-        # only be used for retrieve", since "many stores happen concurrently (if
-        # they busy_loop, deadlock happens)". Its default is True, and under that
-        # default a pool with no eviction candidate spins `while True` on 0.1s
-        # sleeps with no attempt bound -- so it would never return the None this
-        # method's caller is written to handle, and would instead hang the state
-        # tier's save worker for as long as CPU memory stays full. LMCache's own
-        # store paths pass False here for the same reason (`cache_engine.py:666`,
-        # `local_disk_backend.py:468`, `storage_manager.py:96`).
+        # `LocalCPUBackend.allocate` says busy_loop "should only be used for
+        # retrieve", since "many stores happen concurrently (if they busy_loop,
+        # deadlock happens)" -- and its default is True, under which a full pool
+        # spins forever instead of returning the None this caller handles.
         return self._storage.allocate(
             torch.Size([nbytes]),
             torch.uint8,

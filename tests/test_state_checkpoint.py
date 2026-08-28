@@ -1591,7 +1591,7 @@ class TestPagedCopyCheckpoint:
         """`state_offload is None` short-circuits before anything else: a
         boundary both legs must reach is meaningless with one leg missing."""
         bm = self._joint_bm()
-        first, h = self._prompt_with_a_rung_at(bm, 8)
+        first, _h = self._prompt_with_a_rung_at(bm, 8)
         victim = first.block_table[1]
         bm.deallocate(first)
         self._break_the_kv_chain_at(bm, victim)

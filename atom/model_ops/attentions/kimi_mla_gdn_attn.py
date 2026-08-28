@@ -231,32 +231,23 @@ class _KimiMLAGDNCommon(GDNStateMixin):
     def page_unit_views(self, unit_ids: Sequence[int]) -> list[torch.Tensor]:
         """Tensor-view counterpart of `_page_unit_regions`, for the CPU tier.
 
-        `_page_unit_regions` hands the Triton descriptor raw int64 addresses,
-        which is right for a D2D copy the GPU issues. The LMCache staging
-        packer takes `list[torch.Tensor]` instead, so the same bytes have to be
-        nameable as views -- this is that seam, and it is the ONLY new one the
-        tier needs: a load writes the Active Slot directly and reuses
-        `state_entry_views`.
+        `_page_unit_regions` gives raw addresses for the Triton descriptor; the
+        LMCache packer takes `list[torch.Tensor]`, so the same bytes need naming
+        as views. This is the tier's only new seam -- a load writes the Active
+        Slot directly and reuses `state_entry_views`.
 
-        **Order is the contract.** Unit major, row minor -- the same ravel as
-        `_page_unit_bases`, which is the order `_checkpoint_copy_plan` builds
-        the destination stream in. Save and load both go through this one
-        function, so self-consistency would be enough on its own; the reason it
-        still has to match is that a blob written by one build must not be read
-        by another that ordered it differently, which is what the `layout_id` in
-        `StateByteCodec.key` is for.
+        Order is the contract: unit major, row minor, the same ravel as
+        `_page_unit_bases`. Cross-build safety is `layout_id` in
+        `StateByteCodec.key`, not this order.
 
-        **The `block_ratio` trap, same as `_page_unit_regions`.** `unit_ids`
-        carries *logical* block ids while `kv_cache` is shaped in *physical*
-        ones, and K3's ratio is 128. Flattening the two block axes together and
-        indexing by `unit * block_size` is what converts them: it is the same
-        arithmetic `_page_unit_bases` does in addresses, so the two cannot drift
-        into disagreeing about which bytes a unit owns.
+        `unit_ids` carries *logical* block ids while `kv_cache` is shaped in
+        *physical* ones (K3's ratio is 128). Flattening the two block axes and
+        indexing by `unit * block_size` is that conversion -- the same
+        arithmetic `_page_unit_bases` does in addresses, so the two cannot
+        drift. Range-checked against the logical count for the same reason.
 
-        Every view is contiguous, which the packer requires: a row of a
-        contiguous pool is contiguous, and a slice along its leading axis stays
-        so. `_page_unit_regions` is called first for its side effect -- it is
-        where the contiguity and granularity checks live.
+        `_page_unit_regions` runs first for its side effect: the contiguity and
+        granularity checks live there.
         """
         _base, _stride = self._page_unit_regions()
         cache = self.model_runner.kv_cache

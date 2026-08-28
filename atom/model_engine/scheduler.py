@@ -94,34 +94,23 @@ def _offload_max_pending_saves() -> int:
 
 
 def _offload_save_abandon_timeout_s() -> float:
-    """Seconds a finished request's blocks may sit deferred on an offload save
-    before the engine reclaims them itself.
+    """Seconds a deferred offload save may sit before the engine reclaims it.
 
-    A deferred save's blocks are freed only when the connector reports
-    `finished_saving`, so a lost report leaves them deferred forever:
-    `has_pending_kv_work()` never clears and the engine busy-loops with every
-    GPU idle -- a hard hang under a tight pool, a slow block leak under a large
-    one.
+    Blocks are freed on `finished_saving`, so a lost report leaves them deferred
+    forever: `has_pending_kv_work()` never clears and the engine busy-loops with
+    every GPU idle.
 
-    **Why reclaiming cannot race a live copy.** `OffloadWorkerMixin._guard`
-    reports `finished_saving` on both the success and the exception path, so a
-    report is lost only when `self._engine.store(...)` neither returns nor
-    raises -- it is parked inside LMCache. Two things follow, and together they
-    are exhaustive:
+    Reclaiming cannot race a live copy. `OffloadWorkerMixin._guard` reports on
+    both the success and the exception path, so a report is lost only when
+    `store()` neither returns nor raises -- it is parked inside LMCache. Then
+    either the parked save is not copying (LMCache force-unpinned its source
+    after `pin_timeout_sec`) or a save queued behind it never reached `store()`.
+    Both cases are safe once that window has passed.
 
-      * the save that is parked is not copying. LMCache's pin monitor
-        force-unpins its source after `pin_timeout_sec` and stops reading the
-        blocks; reclaiming after that window therefore frees blocks nobody
-        holds.
-      * a save queued behind a parked one never reaches `store()` at all, so
-        its blocks were never read to begin with.
-
-    Derived from LMCache's own `LMCACHE_EC_PIN_TIMEOUT_SEC` rather than an ATOM
-    knob of its own, because the ordering above is the whole safety argument: a
-    second env var could be set below the timeout it must exceed, and nothing
-    would say so. Raising LMCache's pin timeout now carries this window with it.
-    A non-positive value disables reclamation and restores the wait-forever
-    behaviour.
+    Derived from LMCache's own `LMCACHE_EC_PIN_TIMEOUT_SEC` rather than a knob
+    of its own, because that ordering IS the safety argument -- two independent
+    env vars could be set the wrong way round with nothing to say so.
+    Non-positive disables reclamation.
     """
     global _SAVE_ABANDON_TIMEOUT_S
     if _SAVE_ABANDON_TIMEOUT_S is not None:

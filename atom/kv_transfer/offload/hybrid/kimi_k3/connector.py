@@ -150,31 +150,14 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
             worker_id=rank,
             layout_id=layout_id,
         )
-        # ONE pool, shared with paged KV. A separate `atom-state-{rank}` engine
-        # used to be built here, on the argument that the KV write stream would
-        # evict the checkpoints. It does not hold up: state is 3-13% of a
-        # boundary's bytes, not a rounding error, and -- the part that decides
-        # it -- a request writes its KV chunks and its one state object inside
-        # the same prefill window, so they enter LMCache's LRU together and
-        # cool at the same rate. State is retired ALONGSIDE its own KV, which
-        # is what we want: a boundary whose KV is gone is worthless anyway.
-        #
-        # Two pools cost what one does not: independent eviction policies that
-        # must drift, and a joint boundary needs BOTH legs to survive together.
-        # #2045 made the same argument one tier up and won with it (state moved
-        # out of its reserved slots into the KV pool, 81.85% -> 93.60%).
-        #
-        # What one pool costs is a single `cache_policy` for both legs. That is
-        # real, and currently free: LRU is right for both. The FIFO override
-        # this used to set rested on "a state entry is written once and read
-        # once", which #2045's own numbers refute -- ~4,808 resumes over ~1,508
-        # checkpoints is ~3 reads each, and bursty re-access is LRU's home
-        # ground.
-        #
-        # `OFFLOAD_STATE_CPU_SIZE` is gone with it. #2045 deleted the HBM-side
-        # reservation for exactly this reason (`extra_entries=0`, 1.7 GiB
-        # returned) -- keeping the same knob one tier down repeats the thing it
-        # disproved. `LMCACHE_MAX_LOCAL_CPU_SIZE` is the one size to tune.
+        # ONE pool, shared with paged KV, and one `cache_policy` with it.
+        # A request writes its KV chunks and its one state object inside the
+        # same prefill window, so both enter LMCache's LRU together and cool at
+        # the same rate -- state is retired alongside its own KV, which is what
+        # we want, since a boundary whose KV is gone is worthless. Two pools
+        # would buy independent eviction policies that must drift, while a joint
+        # boundary needs both legs to survive together.
+        # `LMCACHE_MAX_LOCAL_CPU_SIZE` is the one size to tune.
         codec.bind_storage_manager(self._engine.storage_manager)
         # No index here: StateOffloadIndex lives in the engine process; both
         # directions report and the engine applies.
@@ -235,14 +218,13 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
     def _start_state_stores(self, metadata) -> None:
         """Hand this step's ready checkpoints to the tier's executor.
 
-        No producer fence and no staging copy. The source is the checkpoint's
-        PAGE units, which #2045 reserves out of the KV pool and the engine pins
-        for the duration -- so nothing on the compute stream is writing them
-        and the packer gathers straight from where they sit.
+        No producer fence and no staging copy: the source is the checkpoint's
+        PAGE units, reserved out of the KV pool and pinned by the engine, so the
+        packer gathers straight from where they sit.
 
-        A store with no tier is reported failed rather than dropped: the engine
-        is holding those units pinned against a report, and silence would leave
-        them to the reconciler's full timeout.
+        A store with no tier is reported failed rather than dropped -- the
+        engine holds those units pinned against a report, and silence would
+        leave them to the reconciler's full timeout.
         """
         stores = getattr(metadata, "state_stores", None)
         if not stores:

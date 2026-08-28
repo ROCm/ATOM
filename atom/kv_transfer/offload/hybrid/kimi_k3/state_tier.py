@@ -1,18 +1,15 @@
 # SPDX-License-Identifier: MIT
-"""Worker-side spill and load driver for the state offload tier.
+"""Worker-side store and load driver for the state offload tier.
 
-One executor of its own, separate from the KV connector's `_load_executor` and
-`_save_executor` so that state transfers and KV transfers cannot block each
-other -- but a single one, shared by this tier's own stores and loads. See
-`submit_load` for why the KV connector's load/save split is not copied here.
+One executor of its own, separate from the KV connector's, so state and KV
+transfers cannot block each other -- but a single one shared by this tier's own
+stores and loads; see `submit_load`.
 
-This class **reports, and the engine applies**. It runs in a spawned runner
-process while `StateOffloadIndex` lives in the engine process, so this side
-cannot index a hash directly. `take_store_reports` and
-`get_finished` hand their sets to the connector, which emits the first as
-`ConnectorCompletion`s on its own channel and merges the second into
-`finished_loading`/`failed_loading`. The failed-hash set exists to resolve the
-aggregator's quorum: without it a partial store would pin the hash forever.
+This class **reports, and the engine applies**. `StateOffloadIndex` lives in the
+engine process, so nothing here can index a hash directly: `take_store_reports`
+and `get_finished` hand their sets to the connector. The failed-hash set exists
+to resolve the aggregator's quorum -- without it a partial store pins the hash
+forever.
 """
 
 import logging
@@ -61,27 +58,21 @@ class StateOffloadTier:
     def submit_store(self, h: int, unit_ids) -> None:
         """Pack the checkpoint image in `unit_ids` under `h`, for LMCache.
 
-        No `ready_event`, unlike the old spill. The staging ring is gone: the
-        units are reserved out of the KV pool and pinned by the engine for the
-        length of this transfer, so nothing on the compute stream is producing
-        or overwriting them and `StagedTransfer.pack` gathers straight from
-        where they sit -- one copy instead of two, and none of it on the
-        forward's stream.
+        No `ready_event`: the units are reserved out of the KV pool and pinned
+        by the engine for the length of this transfer, so nothing on the compute
+        stream is writing them and the packer gathers straight from where they
+        sit.
         """
         self._register(self._executor.submit(self._do_store, h, unit_ids))
 
     def submit_load(self, req_id: str, h: int, slot: int) -> None:
         """Fetch `h` into pool slot `slot` for the parked request `req_id`.
 
-        Shares one serial executor with the stores, unlike the KV connector's
-        split pair: `StagedTransfer` keeps its staging buffer in
-        `threading.local`, so a second thread costs a second resident buffer
-        per rank out of HBM the state pool is already short of.
-
-        A load is on the TTFT critical path and a store is not, so once stores
-        become frequent (Phase 3 fires one per checkpoint rather than one per
-        eviction) this queue wants a priority, or a load can wait behind
-        several stores. Measure `state_load_queue_wait_ms` before adding one.
+        Shares one serial executor with the stores: `StagedTransfer` keeps its
+        staging buffer in `threading.local`, so a second thread costs a second
+        resident buffer per rank. A load is on the TTFT critical path and a
+        store is not, so if stores become frequent this queue wants a priority;
+        measure `state_load_queue_wait_ms` before adding one.
         """
         self._register(self._executor.submit(self._do_load, req_id, h, slot))
 
@@ -107,7 +98,11 @@ class StateOffloadTier:
         stored = False
         try:
             stored = bool(self.codec.put(h, unit_ids))
-        except Exception:  # a store is best effort by design
+        except Exception:  # noqa: BLE001 -- see below
+            # Deliberately blind. `codec.put` reaches into LMCache, whose
+            # failure modes are its own, and a store that cannot happen must
+            # cost one checkpoint's CPU copy -- not this worker thread, whose
+            # death would strand every request parked on a later load.
             logger.warning("state offload: store of hash %d failed", h, exc_info=True)
         with self._lock:
             # Report, never apply: `StateOffloadIndex` lives in the engine
@@ -146,7 +141,10 @@ class StateOffloadTier:
         ok = False
         try:
             ok = bool(self.codec.get(h, slot))
-        except Exception:  # a failed load is a normal path
+        except Exception:  # noqa: BLE001 -- a failed load is a normal path
+            # Same reasoning as `_do_store`, and here a miss is expected:
+            # LMCache's LRU can drop bytes under a hash the index still
+            # advertises. The report below is what retracts the claim.
             logger.warning("state offload: load of hash %d failed", h, exc_info=True)
         with self._lock:
             if ok:

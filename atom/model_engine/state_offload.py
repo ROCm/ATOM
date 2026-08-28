@@ -5,14 +5,6 @@ One thing lives here and it touches no device: the set of hashes believed to be
 in LMCache, plus the loads offered against them. The bytes and the transfers are
 the worker's business (`kv_transfer/offload/hybrid/kimi_k3/state_tier.py`).
 
-There used to be a second thing -- a bounded ring of staging entries a spill
-copied an evicted checkpoint into. It existed for one reason: a checkpoint lived
-in a state slot, and `StateSlotPool.pop` handed that slot to the next request
-the instant it was evicted, so the bytes had to be rescued somewhere before they
-were overwritten. Under #2045 a K3 checkpoint is a PAGE image in the KV pool
-whose units are reserved and structurally un-takeable, so the source holds still
-on its own and the ring has nothing left to rescue. See `REBASE_PLAN_v2.md`.
-
 The set is in memory and never persisted: `LocalDiskBackend.__init__` starts
 from an empty dict and never scans its directory, so an index recovered from
 disk would be a pure false-positive generator. Index and bytes share one server

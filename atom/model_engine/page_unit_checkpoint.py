@@ -355,24 +355,15 @@ class PageUnitCheckpointStore:
     def _queue_offload_store(self, checkpoint_id: int, record) -> None:
         """Nominate this checkpoint for the CPU tier. Takes no pin.
 
-        **The READY transition, and not anywhere else.** Three candidate
-        moments and only this one works:
+        READY and nowhere else: `begin_store` is too early (the scatter has not
+        ridden a batch, so the units hold no image yet) and `_evict`/`unindex`
+        are too late (they fire when the pool wants those units *now*). READY is
+        when the bytes first exist and when the record is least wanted -- it has
+        just entered the LRU at the cold end.
 
-        - `begin_store` is too early: the scatter has not ridden a batch, so
-          the units do not hold the image yet.
-        - `_evict` / `unindex` are too late. They fire when the pool wants
-          those units *now*, so a multi-millisecond D2H started there holds 127
-          of the most-wanted blocks at the worst possible moment.
-        - READY is the moment the bytes first exist and the moment the record
-          is least wanted -- it has just entered the LRU at the cold end, which
-          is the furthest any checkpoint ever is from being spent.
-
-        Nomination, not reservation. A queued candidate is unpinned, so it
-        still counts as free space and `_next_victim` may spend it: the pool
-        never waits on the CPU tier, and a checkpoint the pool needed more than
-        the tier did simply loses its copy. Dedup is free -- `begin_store`
-        already refuses a hash it holds or has pending, so one hash is
-        nominated once.
+        Nomination, not reservation: a queued candidate is unpinned, so
+        `_next_victim` may still spend it. The pool never waits on the CPU tier.
+        Dedup is free -- `begin_store` refuses a hash it already holds.
         """
         if not self._offload_sink:
             return
@@ -388,20 +379,15 @@ class PageUnitCheckpointStore:
     ) -> list[tuple[int, tuple[int, ...]]]:
         """`(prefix_hash, unit_ids)` to hand the tier now, pinning each.
 
-        **This is where the pin is taken**, not at READY, and that is what
-        bounds it. A pin lives in this process while the D2H runs in the
-        worker, so it spans several scheduler passes; pinning at READY would
-        make every checkpoint un-evictable for that whole window and break the
-        one thing #2045's admission argument rests on -- that a READY unpinned
-        checkpoint counts as available to live KV. Pinning only what is
-        actually in flight caps the damage at `max_inflight` images.
+        The pin is taken HERE, not at READY, and that is what bounds it: a pin
+        lives in this process while the D2H runs in the worker, so it spans
+        several scheduler passes. Pinning at READY would make every checkpoint
+        un-evictable for that window and break the admission invariant that a
+        READY unpinned checkpoint counts as available to live KV.
 
-        Over the cap, candidates wait rather than being dropped: they stay
-        nominated, unpinned and evictable, and are offered again next pass if
-        they are still around.
-
-        Drained, not read: a second submission would store the same image
-        twice, and the second report would unpin a record the first released.
+        Over the cap, candidates wait rather than being dropped. Drained, not
+        read: a second submission would store the same image twice and the
+        second report would unpin a record the first released.
         """
         out: list[tuple[int, tuple[int, ...]]] = []
         while self._offload_ready and len(self._offload_pins) < max_inflight:
@@ -600,20 +586,16 @@ class PagedStateCheckpointCoordinator:
     def _reachable(self, h: int) -> bool:
         """Whether `h`'s image can be *produced*, in HBM or from the CPU tier.
 
-        Produced, not merely indexed. This scan runs right to left and stops at
-        the first boundary it accepts, so accepting one whose bytes nothing can
-        deliver does not cost a wasted lookup -- it costs the whole walk-back,
-        hiding every shorter checkpoint still resident in HBM.
-
-        HBM needs no preference rule: both tiers are keyed by the same content
-        hash, so the scan takes the rightmost boundary wherever it lives, and
-        `_attach_state_slots` tries HBM first regardless.
+        The scan runs right to left and stops at the first boundary it accepts,
+        so accepting one nothing can deliver costs the whole walk-back, hiding
+        every shorter checkpoint still in HBM. No preference rule is needed:
+        both tiers key on the same content hash and `_attach_state_slots` tries
+        HBM first regardless.
 
         The tier's half is deliberately optimistic -- `hashes` means "was stored
-        once", never "is still there", since LMCache's own LRU can drop bytes at
-        any time. A false positive costs one park plus a recompute and retracts
-        itself (`fail_load` -> `forget`); refusing to vote until certain would
-        cost a synchronous cross-process lookup on the admission path.
+        once", never "is still there". A false positive costs one park plus a
+        recompute and retracts itself (`fail_load` -> `forget`); being certain
+        would cost a synchronous cross-process lookup on the admission path.
         """
         if self.store.contains(h):
             return True
@@ -782,9 +764,8 @@ class PagedStateCheckpointCoordinator:
         because the two only mean anything against each other: `stores_completed`
         is worth reading only as a fraction of `checkpoints_kept`, and a tier
         that stored nothing is indistinguishable from a tier that was never
-        asked unless both numbers sit on one line. `StateGroupPool` did this
-        before #2045 moved K3's checkpoints here; restoring it makes the load
-        and store legs visible again under PAGE.
+        asked unless both numbers sit on one line. Folding them in makes the
+        load and store legs visible again under PAGE.
 
         Keys are prefixed `state_offload_` because the aggregation upstream is
         by key across every state class.
