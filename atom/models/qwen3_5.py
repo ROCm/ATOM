@@ -516,17 +516,14 @@ class Qwen3_5ForCausalLMBase(nn.Module):
             prefix=maybe_prefix(prefix, "model"),
         )
 
-        self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            prefix=maybe_prefix(prefix, "lm_head"),
-        )
         if config.tie_word_embeddings:
-            # Share the tensor, not the module: ParallelLMHead shards the vocab
-            # exactly like VocabParallelEmbedding, but its forward is a gemm.
-            # Aliasing the embedding module instead would send bf16 hidden
-            # states into F.embedding's integer indices arg.
-            self.lm_head.weight = self.model.embed_tokens.weight
+            self.lm_head = self.model.embed_tokens
+        else:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                prefix=maybe_prefix(prefix, "lm_head"),
+            )
 
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
