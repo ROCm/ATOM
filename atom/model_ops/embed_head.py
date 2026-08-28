@@ -351,8 +351,10 @@ class ParallelLMHead(VocabParallelEmbedding):
         if local_rows < max_rows:
             x = torch.cat([x, x.new_zeros(max_rows - local_rows, x.shape[1])], dim=0)
 
+        use_custom = envs.ATOM_USE_CUSTOM_ALL_GATHER
+
         # [max_rows, dim] -> [dp_size * max_rows, dim] (rank-major concat).
-        gathered = dp_group.all_gather(x.contiguous(), dim=0)
+        gathered = dp_group.all_gather(x.contiguous(), dim=0, use_custom=use_custom)
         w = self.weight[dp_rank * vshard : (dp_rank + 1) * vshard]  # [V/dp, dim]
         b = (
             None
@@ -383,6 +385,8 @@ class ParallelLMHead(VocabParallelEmbedding):
 
         # mode == "allgather": all-gather every rank's [Σrows, V/dp] shard into
         # the full vocab, then scatter this rank's own row block.
-        global_logits = dp_group.all_gather(logits_shard, dim=1)  # [Σrows, V]
+        global_logits = dp_group.all_gather(
+            logits_shard, dim=1, use_custom=use_custom
+        )  # [Σrows, V]
         start = dp_rank * max_rows
         return global_logits[start : start + local_rows].contiguous()
