@@ -36,7 +36,7 @@ from aiter import (
     get_hip_quant,
     indexer_k_quant_and_cache,
     indexer_qk_rope_quant_and_cache,
-    top_k_per_row_decode,
+    flydsl_top_k_per_row_decode,
     top_k_per_row_prefill,
 )
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
@@ -1469,7 +1469,7 @@ def _dcp_decode_candidate_exchange(
     local_idx = torch.empty(
         num_rows, k_loc, dtype=torch.int32, device=local_logits.device
     )
-    top_k_per_row_decode(
+    flydsl_top_k_per_row_decode(
         local_logits,
         next_n,
         local_ctx,
@@ -1515,7 +1515,7 @@ def _dcp_decode_candidate_exchange(
     cand_lens = torch.full(
         (num_rows,), n_cand, dtype=torch.int32, device=gathered_sc.device
     )
-    top_k_per_row_decode(
+    flydsl_top_k_per_row_decode(
         gathered_sc.view(torch.float32),
         1,
         cand_lens,
@@ -1834,7 +1834,7 @@ def sparse_attn_indexer(
             # Non-DCP: one rank holds the whole plane, so top-k is already
             # global. The DCP branch produced topk_indices_decode itself.
             topk_indices_decode = topk_indices[:num_decode_tokens, :topk_tokens]
-            top_k_per_row_decode(
+            flydsl_top_k_per_row_decode(
                 logits,
                 next_n,
                 decode_metadata.context_lens,
