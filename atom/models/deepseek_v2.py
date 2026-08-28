@@ -1606,9 +1606,7 @@ def sparse_attn_indexer(
         weights_out = torch.empty(
             weights.shape, device=weights.device, dtype=torch.float32
         )
-        extra = (
-            {"compute_all_q_rope": True} if get_dcp_world_size() > 1 else {}
-        )
+        extra = {"compute_all_q_rope": True} if get_dcp_world_size() > 1 else {}
         indexer_qk_rope_quant_and_cache(
             q_bf16,
             q_fp8,
