@@ -65,7 +65,8 @@ Accuracy past the old cap, `lm_eval` gsm8k over all 1319 questions, TP8, fp8 KV:
 |---|---|---|---|
 | chat, 3-shot, `--max-model-len 2048` | ~389 | 0.9644 | 0.9651 |
 | chat, 5-shot, `--max-model-len 4096` | ~645 | 0.9674 | 0.9682 |
-| **chat, 16-shot, `--max-model-len 8192`** | **2763-3591** | **0.9659** | **0.9659** |
+| chat, 16-shot, `--max-model-len 8192`, index cache at B=16 | 2763-3591 | 0.9659 | 0.9659 |
+| **chat, 16-shot, `--max-model-len 8192`, index cache at B=64** | **2763-3591** | **0.9629** | **0.9636** |
 
 The 16-shot row is the one that actually measures the pooled path: it is the only
 setting whose prompts *all* exceed `index_topk`, so pooled scoring and pooled top-k
@@ -73,6 +74,17 @@ decide what the model attends to on every question. Below 2048 `attention_mla` r
 dense MLA and the indexer's selection is computed but never used -- a short-context
 benchmark says nothing about pooled selection, only that the pooled *writes* did no
 harm.
+
+The last row is the reclaimed index cache (see "How pooled entries are stored").
+It sits 0.30pp under the row above -- 0.6 of the +/-0.52pp stderr, and inside the
+0.9644-0.9674 spread these runs show across configurations whose selection is
+provably identical. Do not read that as "unchanged", though: this model is
+nondeterministic, so no single text-based run can resolve a delta this small in
+either direction. What establishes the relayout as correct is deterministic
+instead -- the slot arithmetic is unit-tested and mutation-checked in
+`tests/models/test_glm5_next_kpool.py`, and the needle below passes at three
+depths with its control. To tighten the aggregate, repeat the run rather than
+reasoning about a single sample.
 
 Retrieval itself is checked by `scripts/run_longctx_needle.py`, which runs each
 needle depth twice with a different secret in an otherwise identical prompt. The
@@ -88,20 +100,58 @@ PYTHONPATH=$PWD ATOM_GLM5_KPOOL=1 python3 scripts/run_longctx_needle.py \
     --gpu_memory_utilization 0.85 --no-enable_prefix_caching
 ```
 
-### How pooled entries are stored
+### How pooled entries are stored, and why the block size is 64
 
-One pool covers 4 tokens and one block covers 16, so 16 pools span 4 token blocks.
-Pooled entries live 16-per-block in every 4th block of the request's own block
-table -- `pool p -> block_table[4 * (p // 16)], row p % 16` -- so the KV allocator,
-the paging and the cache shape are all unchanged. Three of every four blocks'
-index-cache regions go unused; reclaiming them is a future optimization.
+**`kv_cache_block_size` is forced to 64 for this model** (`Config.__post_init__`,
+the same mechanism DeepSeek-V4 uses to force 256). One index row covers
+`index_kpool` = 4 tokens, so a block of B tokens needs `B // 4` index rows, and
+that count must be a multiple of 16 -- see the preshuffle constraint below. B=64
+gives exactly 16 rows, so:
 
-Keeping 16 rows per block is **required**, not a convenience:
+    pool p  ->  block_table[p // 16], row p % 16
+
+One index block per KV block, addressed by the request's own block table with no
+remapping, and the index cache holds exactly the rows the pooled path writes --
+no padding in either direction. The KV allocator, the paging and the block
+manager are untouched; only the per-block byte cost changes.
+
+At B=16 the arithmetic does not close: `16 // 4` = 4 rows is not a multiple of
+16, so the cache had to keep one row per *token* and place pooled entries
+16-per-block in every 4th block, leaving three of every four blocks' index
+regions unwritten. Raising the block size removes that waste rather than
+managing it:
+
+| | bytes per token, 11 indexer layers |
+|---|---|
+| MLA KV | 6336 |
+| index cache at B=16 (one row per token) | 1584 |
+| index cache at B=64 (one row per pool) | 396 |
+| **total** | **7920 -> 6732, i.e. -15%** |
+
+Measured at TP8, fp8 KV: the engine reports `block_bytes` 126720 for a 16-token
+block before and 430848 for a 64-token block after -- 7920 B/token down to 6732,
+so the same KV budget holds **17.7% more tokens**. Quote it per token, not as a
+block count: `num_kvcache_blocks` also moves with `available_for_kv`, which
+differs between an offline engine and a server on the same GPUs, and comparing
+raw counts across two such runs measures the harness rather than the change.
+
+Paging is coarser, costing at most 63 padded token slots per request instead of
+15 -- about 5 MB across 32 concurrent requests, against millions of tokens
+gained. Prefix-cache granularity also coarsens, which is moot here: the KDA
+recurrent state is per-request, so this model runs with prefix caching off.
+
+The 16-rows-per-block floor is **required**, not a convenience:
 `deepgemm_fp8_paged_mqa_logits` is correct only in the preshuffled layout, and
 preshuffle needs `KVBlockSize % 16 == 0`. With `Preshuffle=False` it disagrees with
 the flat `fp8_mqa_logits` kernel by ~100% at *every* block size, and aiter's assert
 only guards the preshuffle case -- so a 4-row-per-block cache would be silently
-mis-scored rather than rejected.
+mis-scored rather than rejected. That is why the fix is a larger block rather
+than a narrower one.
+
+Two granularities that were equal before B was raised and must not be confused:
+`kv_cache_block_size` (64) converts a *token* id through the token block table,
+while `pool_rows` (16) is the index cache's rows per block. Swapping them writes
+pools to the wrong slots without erroring.
 
 ### Not supported with kpool
 

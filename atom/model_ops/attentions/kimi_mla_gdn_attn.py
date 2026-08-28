@@ -5,9 +5,11 @@ import numpy as np
 import torch
 from aiter import dtypes
 
+from atom.config import _MQA_LOGITS_PRESHUFFLE_ROWS
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mla import MLAAttention
+from atom.model_ops.glm5_next.kpool import pooled_path_enabled
 from atom.utils import envs
 
 from .aiter_mla import AiterMLAMetadataBuilder, mla_kv_entry_dim
@@ -74,12 +76,7 @@ class _KimiMLAGDNCommon(GDNStateMixin):
         if runner.is_deepseek_v32:
             # Sparse-indexer key cache rides the same paged pool (GLM-5.3-Flash).
             index_cache_layer_ids, _ = self._index_cache_layout()
-            block_bytes += (
-                len(index_cache_layer_ids)
-                * runner.block_size
-                * self._aligned_index_dim()
-                * dtypes.fp8.itemsize
-            )
+            block_bytes += len(index_cache_layer_ids) * self._index_cache_block_bytes()
         return [page_pool(block_bytes), self.state_spec()]
 
     def _aligned_index_dim(self) -> int:
@@ -101,6 +98,49 @@ class _KimiMLAGDNCommon(GDNStateMixin):
         """``index_kpool``, or 1 when this model does not pool indexer keys."""
         hf = self.model_runner.config.hf_config
         return int(getattr(hf, "index_kpool", 1) or 1)
+
+    def _index_rows_per_block(self) -> int:
+        """Index-cache rows one scheduler block owns.
+
+        With the pooled path on, one cached key covers ``index_kpool`` tokens,
+        so a block of ``block_size`` tokens needs ``block_size // index_kpool``
+        rows rather than one per token. `Config` picks the block size so this
+        stays a multiple of the preshuffled row count that
+        `deepgemm_fp8_paged_mqa_logits` requires.
+
+        Sizing, allocation, binding and the transfer-region byte count all read
+        this one method, so they cannot disagree about how large the cache is.
+        """
+        runner = self.model_runner
+        kpool = self._kpool_size()
+        if not pooled_path_enabled(kpool):
+            return runner.block_size
+        assert runner.block_size % kpool == 0, (
+            f"kv_cache_block_size={runner.block_size} is not divisible by "
+            f"index_kpool={kpool}; Config sets the block size for exactly this"
+        )
+        rows = runner.block_size // kpool
+        assert rows % _MQA_LOGITS_PRESHUFFLE_ROWS == 0, (
+            f"{rows} pooled rows per block is not a multiple of "
+            f"{_MQA_LOGITS_PRESHUFFLE_ROWS}, so deepgemm_fp8_paged_mqa_logits "
+            "cannot stay in the preshuffled layout -- the only one it computes "
+            "correctly. Raise kv_cache_block_size."
+        )
+        return rows
+
+    def _index_cache_block_bytes(self, index_cache_layer=None) -> int:
+        """Bytes one scheduler block occupies in one layer of the index cache.
+
+        This cache is indexed by scheduler block already, and with pooling it
+        holds fewer rows than tokens, so the base's `block_ratio` factor does
+        not apply. Called with no tensor by the sizing path, which needs the
+        number before anything is allocated.
+        """
+        return (
+            self._index_rows_per_block()
+            * self._aligned_index_dim()
+            * dtypes.fp8.itemsize
+        )
 
     def _kpool_tail_bytes(self) -> int:
         """Per-request tail bytes across every indexer-owning layer."""
@@ -201,10 +241,21 @@ class _KimiMLAGDNCommon(GDNStateMixin):
                     index_cache_layer_ids
                 )
             }
+            # Indexed by SCHEDULER block, not by physical row: with the
+            # pooled path on there are fewer index rows than tokens, so the
+            # `num_physical_kvcache_blocks x physical_block_size` shape the
+            # token-granular cache uses no longer describes this one. Blocks x
+            # rows-per-block does, at any compression, and it makes the bytes
+            # one scheduler block owns a plain `stride(0)`.
+            num_sched_blocks = (
+                runner.num_physical_kvcache_blocks
+                * runner.physical_block_size
+                // runner.block_size
+            )
             out["index_cache"] = torch.zeros(
                 len(index_cache_layer_ids),
-                runner.num_physical_kvcache_blocks,
-                runner.physical_block_size,
+                num_sched_blocks,
+                self._index_rows_per_block(),
                 aligned,
                 dtype=dtypes.fp8,
                 device="cuda",
@@ -249,8 +300,11 @@ class _KimiMLAGDNCommon(GDNStateMixin):
                         f"index cache layout: layer_num={layer_id}"
                     )
                 index_cache = runner.index_cache[runner.index_cache_layer_map[layer_id]]
+                # Flat row view: `indexer_k_quant_and_cache` addresses a
+                # slot as a single row id, and the pooled writer computes that
+                # id from the block table itself.
                 module.indexer.k_cache.kv_cache[0] = index_cache.view(
-                    runner.num_physical_kvcache_blocks * runner.physical_block_size,
+                    index_cache.shape[0] * index_cache.shape[1],
                     1,
                     runner.aligned_index_dim,
                 )

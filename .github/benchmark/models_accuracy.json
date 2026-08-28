@@ -329,9 +329,9 @@
     "runner": "linux-atom-do-mi350x-8",
     "test_level": "nightly",
     "accuracy_threshold": 0.94,
-    "accuracy_baseline": 0.9659,
+    "accuracy_baseline": 0.9629,
     "accuracy_baseline_model": "zai-org/GLM-5.3-Flash",
-    "_baseline_note": "Guards the POOLED (kpool) indexer path. 16-shot prompts run 2763-3591 tokens, so every one of the 1319 questions exceeds index_topk=2048 and pooled scoring plus pooled top-k decide what the model attends to. The 2048 entry above does NOT cover this: below index_topk attention_mla runs dense MLA and the indexer's selection is computed but never used, so a short-context score only shows the pooled writes did no harm. Measured 2026-08-28: flexible-extract=0.9659, strict-match=0.9659 -- equal to the 3-shot@2048 baseline. Needs --max-model-len 8192, not 4096: lm_eval samples its shots at random and the longest prompt is 3591 tokens, which with max_gen_toks=512 overflows a 4096 cap and 400s."
+    "_baseline_note": "Guards the POOLED (kpool) indexer path. 16-shot prompts run 2763-3591 tokens, so every one of the 1319 questions exceeds index_topk=2048 and pooled scoring plus pooled top-k decide what the model attends to. The 2048 entry above does NOT cover this: below index_topk attention_mla runs dense MLA and the indexer's selection is computed but never used, so a short-context score only shows the pooled writes did no harm. Measured 2026-08-28 at index-cache block size 64 (the reclaimed pooled layout): flexible-extract=0.9629, strict-match=0.9636. The same eval at block size 16 gave 0.9659/0.9659; the 0.30pp gap is 0.6 stderr and inside the 0.9644-0.9674 spread these runs show across configurations whose selection is provably identical, but the model is nondeterministic so a single run cannot resolve a delta that small either way -- the relayout is gated by mutation-checked slot-arithmetic unit tests and a controlled needle test, not by this number. Threshold 0.94 leaves ~2.2pp headroom. Needs --max-model-len 8192, not 4096: lm_eval samples its shots at random and the longest prompt is 3591 tokens, which with max_gen_toks=512 overflows a 4096 cap and 400s."
   },
   {
     "model_name": "GLM-5.2-MXFP4",

@@ -13,6 +13,7 @@ CPU-only; no GPU or aiter required.
 
 import torch
 
+from atom.config import _MQA_LOGITS_PRESHUFFLE_ROWS, glm5_kpool_block_size
 from atom.model_ops.glm5_next.kpool import (
     append_tail_to_topk,
     compress_pools_ref,
@@ -21,6 +22,8 @@ from atom.model_ops.glm5_next.kpool import (
     hadamard128_ref,
     history_group_budget_for_topk,
     pool_compress_ref,
+    pool_slot_mapping,
+    pooled_path_enabled,
     quant_fp8_ue8m0_ref,
 )
 
@@ -290,3 +293,87 @@ def test_tail_survives_prefill_to_decode(prefill_len):
         assert torch.equal(got, want), (prefill_len, pid)
         completed += 1
     assert completed >= 2, completed
+
+
+# --------------------------------------------------------------------------
+# Pooled cache geometry
+#
+# One index block per KV block, `pool_rows = kv_cache_block_size // kpool` rows
+# in each. Getting this wrong does not raise: pools land in another request's
+# blocks, or in rows the gather never reads, and the model simply attends to
+# the wrong keys. Nothing else in the suite touches the addressing.
+# --------------------------------------------------------------------------
+
+BLOCK_SIZE = glm5_kpool_block_size(POOL)
+POOL_ROWS = BLOCK_SIZE // POOL
+
+
+def test_block_size_makes_the_index_cache_exact():
+    """No padding either way: the pooled rows fill the block exactly."""
+    for kpool in (2, 4, 8):
+        block = glm5_kpool_block_size(kpool)
+        assert block % kpool == 0
+        assert (block // kpool) % _MQA_LOGITS_PRESHUFFLE_ROWS == 0
+        # Smallest such block: one step down and the constraint breaks.
+        assert (block - kpool) // kpool % _MQA_LOGITS_PRESHUFFLE_ROWS != 0
+
+
+def test_pool_rows_stay_in_the_preshuffled_layout():
+    """The constraint the block size exists to satisfy.
+
+    `deepgemm_fp8_paged_mqa_logits` is correct only preshuffled, and preshuffle
+    needs a multiple of 16 rows per block. At the old 16-token block this gave 4
+    and forced one index row per token; 64 gives exactly 16.
+    """
+    assert POOL_ROWS % _MQA_LOGITS_PRESHUFFLE_ROWS == 0
+    assert BLOCK_SIZE // POOL == POOL * POOL_ROWS // POOL  # 16 pools span a block
+
+
+def test_pool_slot_mapping_addresses_the_requests_own_blocks():
+    block_table = torch.tensor([[7, 3], [5, 9]], dtype=torch.int32)
+    pool_ids = torch.tensor([0, 1, POOL_ROWS, POOL_ROWS + 2, 0, POOL_ROWS])
+    req_idx = torch.tensor([0, 0, 0, 0, 1, 1])
+    got = pool_slot_mapping(block_table, pool_ids, req_idx, POOL_ROWS)
+    want = torch.tensor(
+        [
+            7 * POOL_ROWS + 0,  # req 0, first block
+            7 * POOL_ROWS + 1,
+            3 * POOL_ROWS + 0,  # req 0, second block: no ::kpool striding
+            3 * POOL_ROWS + 2,
+            5 * POOL_ROWS + 0,  # req 1 uses its own table, not req 0's
+            9 * POOL_ROWS + 0,
+        ]
+    )
+    assert torch.equal(got, want)
+
+
+def test_pool_slot_mapping_passes_negative_ids_through():
+    """`-1` is how a token that closes no pool is skipped by the cache write."""
+    block_table = torch.tensor([[7, 3]], dtype=torch.int32)
+    pool_ids = torch.tensor([-1, 2, -1])
+    req_idx = torch.tensor([0, 0, 0])
+    got = pool_slot_mapping(block_table, pool_ids, req_idx, POOL_ROWS)
+    assert got[0].item() == -1 and got[2].item() == -1
+    assert got[1].item() == 7 * POOL_ROWS + 2
+
+
+def test_every_pool_of_a_full_block_gets_a_distinct_row():
+    """No collisions and no gaps: the whole point of reclaiming the space."""
+    n_blocks = 4
+    block_table = torch.arange(n_blocks, dtype=torch.int32).unsqueeze(0)
+    pool_ids = torch.arange(n_blocks * POOL_ROWS)
+    req_idx = torch.zeros(n_blocks * POOL_ROWS, dtype=torch.int64)
+    slots = pool_slot_mapping(block_table, pool_ids, req_idx, POOL_ROWS)
+    assert slots.unique().numel() == slots.numel()
+    assert int(slots.max()) == n_blocks * POOL_ROWS - 1
+
+
+def test_pooled_path_switch_is_read_in_one_place(monkeypatch):
+    """Sizing and dispatch must get the same answer, so they share this."""
+    monkeypatch.delenv("ATOM_GLM5_KPOOL", raising=False)
+    assert pooled_path_enabled(4) is True
+    assert pooled_path_enabled(1) is False
+    monkeypatch.setenv("ATOM_GLM5_KPOOL", "0")
+    assert pooled_path_enabled(4) is False
+    monkeypatch.setenv("ATOM_GLM5_KPOOL", "1")
+    assert pooled_path_enabled(4) is True

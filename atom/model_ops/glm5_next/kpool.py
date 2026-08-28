@@ -29,8 +29,28 @@ Ported from vLLM PR #53906 (`vllm/models/glm5next/nvidia/ops/kpool_compress.py`)
 from __future__ import annotations
 
 import math
+import os
 
 import torch
+
+
+def pooled_path_enabled(index_kpool: int) -> bool:
+    """Whether the pooled indexer path is in force.
+
+    The ONE place ``ATOM_GLM5_KPOOL`` is read. The index cache is SIZED and
+    ALLOCATED from this and the indexer DISPATCHES on it, so the two must be
+    the same answer: sized pooled but dispatched token-granular, the fallback
+    would run against a cache a quarter of the rows it expects and write past
+    the end of every request's region.
+
+    Reading an env var here is safe in the way memory-sizing code needs: the
+    value is read inside the worker process, after the engine has spawned it,
+    by both the sizing call and the forward that consumes the result.
+    """
+    if index_kpool <= 1:
+        return False
+    return os.environ.get("ATOM_GLM5_KPOOL", "1") == "1"
+
 
 # The GLM-5.3-Flash indexer head dimension is fixed at 128 and the FP8 quant
 # block spans the whole head, so both are compile-time constants here.
@@ -425,32 +445,17 @@ def fwht128_quant_fp8(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 # --------------------------------------------------------------------------
 
 
-def pooled_block_table(block_table: torch.Tensor, pool_size: int) -> torch.Tensor:
-    """Derive the pool-granular block table from the request's token one.
-
-    One pool covers ``pool_size`` tokens and one block covers ``block_size``,
-    so ``block_size`` pools span ``pool_size`` token blocks: pooled entries are
-    stored ``block_size``-per-block in every ``pool_size``-th block the request
-    already owns. Keeping ``block_size`` rows per block is what lets the paged
-    MQA-logits kernel stay in its preshuffled layout, which is the only layout
-    it computes correctly (see `tests/models/test_glm5_next_kpool.py`).
-
-    ``.contiguous()`` is required, not tidiness: a strided view has
-    ``stride(-1) != 1`` and the gather kernel indexes it as dense.
-    """
-    return block_table[:, ::pool_size].contiguous()
-
-
 def pool_slot_mapping(
     pool_block_table: torch.Tensor,
     pool_ids: torch.Tensor,
     req_idx: torch.Tensor,
-    block_size: int,
+    pool_rows: int,
 ) -> torch.Tensor:
     """Physical cache slots for a batch's pools. ``-1`` passes through.
 
     Args:
-        pool_block_table: ``[bs, n_pool_blocks]`` from `pooled_block_table`.
+        pool_block_table: the request's own ``[bs, n_blocks]`` block table.
+                          One index block per KV block, so no remapping.
         pool_ids:         ``[n]`` per-entry pool id, ``-1`` where there is no
                           pool to write.
         req_idx:          ``[n]`` which request each entry belongs to. A
@@ -465,8 +470,8 @@ def pool_slot_mapping(
     valid = pool_ids >= 0
     ids = pool_ids.to(torch.int64).clamp_min(0)
     rows = req_idx.to(torch.int64)
-    blocks = pool_block_table.to(torch.int64)[rows, ids // block_size]
-    slots = blocks * block_size + (ids % block_size)
+    blocks = pool_block_table.to(torch.int64)[rows, ids // pool_rows]
+    slots = blocks * pool_rows + (ids % pool_rows)
     return torch.where(valid, slots, torch.full_like(slots, -1))
 
 

@@ -1001,6 +1001,18 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             )
         return [page_pool(block_bytes)]
 
+    def _index_cache_block_bytes(self, index_cache_layer: torch.Tensor) -> int:
+        """Bytes one SCHEDULER block owns in one layer of the index cache.
+
+        Here dim 0 counts PHYSICAL blocks and there is one row per token, so a
+        scheduler block spans `block_ratio` of them. A builder whose index
+        cache is indexed by scheduler block, or whose indexer compresses
+        several tokens into one row, overrides this -- applying `block_ratio`
+        to such a cache would over-report by exactly the compression ratio.
+        """
+        t = index_cache_layer
+        return t.stride(0) * t.element_size() * self.block_ratio
+
     def allocate_kv_cache_tensors(
         self, num_kv_heads: int, num_draft_layers: int
     ) -> dict:
@@ -1128,7 +1140,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         if hasattr(runner, "index_cache"):
             for layer_id in range(runner.index_cache.shape[0]):
                 t = runner.index_cache[layer_id]
-                bpb = t.stride(0) * t.element_size() * self.block_ratio
+                bpb = self._index_cache_block_bytes(t)
                 block_regions.append(
                     KVTransferRegion(
                         base_addr=t.data_ptr(),
@@ -1606,7 +1618,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         local_lens_allranks = np.stack(
             [get_dcp_local_seq_lens(cached_lens, dcp, r, s_itl) for r in range(dcp)],
             axis=1,
-        ).astype(np.int64)  # [bs, dcp]
+        ).astype(
+            np.int64
+        )  # [bs, dcp]
 
         # Number of local blocks per seq is identical on every rank
         # (= ceil(global_len / vbs)), so the padded local length is uniform and
@@ -2191,9 +2205,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     if ub_real_reqs > 0
                     else 0
                 )
-                var[f"{p}sparse_kv_indptr"].np[ub_real_reqs + 1 : running_bs + 1] = (
-                    sparse_last
-                )
+                var[f"{p}sparse_kv_indptr"].np[
+                    ub_real_reqs + 1 : running_bs + 1
+                ] = sparse_last
 
             last_cu = ub_real_reqs * max_seqlen_q
             var[f"{p}cu_seqlens_q"].np[: ub_real_reqs + 1] = np.arange(

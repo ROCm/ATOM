@@ -412,9 +412,7 @@ class Glm5NextIndexer(Indexer):
         independent implementations of the same selection -- which is what
         makes the short-context A/B a check and not a tautology.
         """
-        if self.index_kpool <= 1:
-            return False
-        return os.environ.get("ATOM_GLM5_KPOOL", "1") == "1"
+        return kpool_ops.pooled_path_enabled(self.index_kpool)
 
     def _assert_kpool_regime(self, max_seqlen_k: int) -> None:
         """Refuse the regime where pooled and token-granular top-k diverge."""
@@ -1604,11 +1602,17 @@ class Glm5NextForConditionalGeneration(Glm5NextForCausalLM):
 # top-k over pools, expands each selected pool back to its tokens, and always
 # appends the trailing incomplete pool.
 #
-# Pool p lives at `block_table[kpool * (p // block_size)]`, row `p % block_size`
-# (`kpool.pooled_block_table`): pooled rows stay `block_size`-per-block so the
-# paged MQA-logits kernel keeps its preshuffled layout -- the only one it
-# computes correctly, at any block size. Nothing in the KV allocator changes;
-# three of every four blocks' index-cache regions simply go unused.
+# Pool p lives at `block_table[p // pool_rows]`, row `p % pool_rows`, where
+# `pool_rows = kv_cache_block_size // kpool` is the index cache's rows per
+# block -- one index block per KV block, so the request's own block table
+# addresses the pooled cache with no remapping and the KV allocator is
+# untouched.
+#
+# `pool_rows` must stay a multiple of 16 or the paged MQA-logits kernel loses
+# its preshuffled layout, the only one it computes correctly. `Config` raises
+# `kv_cache_block_size` to `kpool * 16` for this model so that holds with no
+# rows to spare: the index cache is exactly `1/kpool` of one row per token,
+# which is all the pooled path ever writes.
 #
 # Below `index_topk` the pooled and token-granular selections are the SAME SET:
 # top-k picks every pool, so the expansion yields every token position. That is
@@ -1637,7 +1641,7 @@ def _kpool_write_completed_pools(
     index_kpool: int,
     head_dim: int,
     scale_fmt: str,
-    block_size: int,
+    pool_rows: int,
     chunk_start: torch.Tensor | None = None,
     tail_cache: torch.Tensor | None = None,
     state_slot_idx: torch.Tensor | None = None,
@@ -1683,7 +1687,7 @@ def _kpool_write_completed_pools(
         pool_bt,
         torch.where(closes, abs_pos // kpool, torch.full_like(abs_pos, -1)),
         req_idx,
-        block_size,
+        pool_rows,
     )
     indexer_k_quant_and_cache(
         pooled, kv_cache, slots, head_dim, scale_fmt, preshuffle=True
@@ -1820,9 +1824,17 @@ def _sparse_attn_indexer_kpool(
         )
 
     device = hidden_states.device
+    # Two different granularities, equal only by coincidence before the block
+    # size was raised: `block_size` is TOKENS per block, used to turn a token id
+    # into a slot through the token block table, while `pool_rows` is the index
+    # cache's ROWS per block. Confusing them writes pools to the wrong slots
+    # without erroring.
     block_size = get_current_atom_config().kv_cache_block_size
-    kv_cache = kv_cache.view(-1, block_size, kv_cache.shape[-1])
-    pool_bt = kpool_ops.pooled_block_table(attn_metadata.block_tables, index_kpool)
+    pool_rows = block_size // index_kpool
+    kv_cache = kv_cache.view(-1, pool_rows, kv_cache.shape[-1])
+    # One index block per KV block, so the request's own block table addresses
+    # the pooled cache unchanged.
+    pool_bt = attn_metadata.block_tables
     select_k = topk_tokens // index_kpool
     n_tokens = hidden_states.shape[0]
     n_head = q_fp8.shape[1]
@@ -1852,7 +1864,7 @@ def _sparse_attn_indexer_kpool(
             index_kpool,
             head_dim,
             scale_fmt,
-            block_size,
+            pool_rows,
             chunk_start=chunk_start,
             tail_cache=tail_cache,
             state_slot_idx=state_slot_idx,
@@ -2007,7 +2019,7 @@ def _sparse_attn_indexer_kpool(
         pool_bt,
         pool_ids,
         torch.arange(bs, device=device, dtype=torch.int64),
-        block_size,
+        pool_rows,
     )
     indexer_k_quant_and_cache(
         pooled, kv_cache, slots, head_dim, scale_fmt, preshuffle=True
@@ -2025,7 +2037,7 @@ def _sparse_attn_indexer_kpool(
         pool_ctx,
         pool_bt,
         pool_max_len,
-        KVBlockSize=block_size,
+        KVBlockSize=pool_rows,
         Preshuffle=True,
     )
     pool_topk = torch.empty((bs, select_k), dtype=torch.int32, device=device)
