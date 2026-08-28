@@ -348,6 +348,7 @@ class GatedDeltaNet(nn.Module):
 
         # 2.2: Process the remaining part
         if gdn_metadata.num_prefills > 0:
+            ckpt = gdn_metadata.ssm_checkpoints
             initial_state = ssm_state[non_spec_state_indices_in_tensor].contiguous()
             initial_state[~has_initial_state, ...] = 0
             (
@@ -364,11 +365,61 @@ class GatedDeltaNet(nn.Module):
                 cu_seqlens=non_spec_query_start_loc,
                 head_first=False,
                 use_qk_l2norm_in_kernel=True,
+                # Only when there is somewhere to put them; `h` is large and is
+                # dropped on return otherwise.
+                keep_intermediate_states=ckpt is not None,
             )
             # Init cache
             ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
                 ssm_state.dtype
             )
+            # SSM state cache: copy out every checkpoint this step reached.
+            #
+            # A checkpoint slot is never where the recurrence runs — the live
+            # state stays in the request's runtime slot for its whole life —
+            # so BOTH kinds of position need a copy:
+            #   interior  <- h[chunk boundary]
+            #   step end  <- the runtime slot; NOT in `h`, which holds
+            #                boundaries strictly before the end
+            # `_checkpoint_targets` tags the second kind with `is_end`. This
+            # runs after the scatter above so that slot holds this step's
+            # final state, which is what an `is_end` target reads.
+            #
+            # One launch over device index tensors, so the per-sequence base
+            # arithmetic lives in the kernel — see `_checkpoint_targets`.
+            #
+            # Conv state needs no support from the conv kernel: it IS the last
+            # `state_len` rows of the conv input ending at the position, the
+            # same bytes that kernel's end-of-sequence store writes.
+            if ckpt is not None:
+                from atom.model_ops.fla_ops.chunk import (
+                    CHUNK_SIZE,
+                    pop_last_intermediate_states,
+                )
+                from atom.model_ops.fla_ops.state_checkpoint import (
+                    write_state_checkpoints,
+                )
+
+                h = pop_last_intermediate_states()
+                if h is not None:
+                    # One launch for both halves. `conv_state` is
+                    # [slot, conv_dim, state_len] by here (see the transpose
+                    # above) and shares `slots` with the SSM half, so the two
+                    # always describe the same token position.
+                    write_state_checkpoints(
+                        h,
+                        ssm_state,
+                        mixed_qkv_non_spec,
+                        conv_state,
+                        ckpt["rows"],
+                        ckpt["slots"],
+                        ckpt["offs"],
+                        ckpt["is_end"],
+                        ckpt["runtime"],
+                        gdn_metadata.ssm_chunk_offsets,
+                        non_spec_query_start_loc,
+                        CHUNK_SIZE,
+                    )
         elif gdn_metadata.num_decodes > 0:
             if use_lossy_gdn_decode:
                 core_attn_out_non_spec, last_recurrent_state = (

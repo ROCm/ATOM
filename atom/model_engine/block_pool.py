@@ -87,6 +87,20 @@ class BlockPool:
         self._used: set[int] = set()
         # Raw PAGE units reserved by multi-unit objects such as state checkpoints.
         self._raw_unit_owner: dict[int, tuple[Hashable, int]] = {}
+        # Reusable content this pool destroyed, split by what destroyed it.
+        # Both are evictions in the sense that a later prefix hit is now
+        # impossible, and they read the same in a hit rate, but they want
+        # opposite fixes — the same reason `StateSlotPool` keeps `evicted`
+        # and `orphaned` apart:
+        #   `blocks_evicted`  the pool was out of vacant blocks and spent a
+        #                     cached one. Says the paged pool is too small.
+        #   `blocks_retired`  the boundary moved down over cached content.
+        #                     Says the split is wrong, not the total.
+        # Counted here rather than derived from `on_evict` because that hook
+        # also fires for relocation (`_adopt`), which destroys nothing: the
+        # hash moves to the block that adopted it.
+        self.blocks_evicted: int = 0
+        self.blocks_retired: int = 0
 
     # ------------------------------- counts -------------------------------- #
     @property
@@ -110,6 +124,35 @@ class BlockPool:
 
     def block(self, block_id: int) -> Block:
         return self.blocks[block_id]
+
+    @property
+    def num_reusable_free(self) -> int:
+        """Free blocks still holding content a prefix hit could claim.
+
+        The pool's headroom before the *next* allocation has to evict: while
+        vacant blocks remain this is slack, and once they are gone every
+        allocation spends one of these. `num_free - num_reusable_free` is the
+        vacant count, which is the number that actually has to reach zero
+        before `blocks_evicted` can start moving.
+        """
+        return sum(1 for b in self._free if self.blocks[b].hash != -1)
+
+    def eviction_stats(self) -> dict[str, int]:
+        """Content this pool destroyed, and the headroom it has left.
+
+        Counters, not rates, for the same reason `CacheStats.get_statistics`
+        hands back counts: a rate cannot be summed across DP ranks that saw
+        different traffic.
+        """
+        return {
+            "blocks_evicted": self.blocks_evicted,
+            "blocks_retired": self.blocks_retired,
+            "blocks_total": self.num_blocks,
+            "blocks_used": self.num_used,
+            "blocks_free": self.num_free,
+            "blocks_free_reusable": self.num_reusable_free,
+            "blocks_indexed": self.num_indexed,
+        }
 
     # ------------------------------- index --------------------------------- #
     def lookup(self, h: int) -> int:
@@ -140,15 +183,24 @@ class BlockPool:
         self._vacant = sorted(self._free)
         heapify(self._vacant)
 
-    def _unindex(self, block_id: int) -> None:
-        """Drop `block_id`'s index entry and forget what it held."""
+    def _unindex(self, block_id: int) -> bool:
+        """Drop `block_id`'s index entry and forget what it held.
+
+        Returns whether an index entry actually went — i.e. whether reusable
+        content was destroyed. A block with no hash, or one whose hash the
+        index has since re-pointed elsewhere, costs nothing to drop, and the
+        callers that count evictions must not count those.
+        """
         block = self.blocks[block_id]
+        dropped = False
         if block.hash != -1 and self._hash_to_block_id.get(block.hash) == block_id:
             del self._hash_to_block_id[block.hash]
+            dropped = True
             if self._on_evict is not None:
                 self._on_evict(block.hash)
         block.hash = -1
         block.token_ids = array.array("i")
+        return dropped
 
     # ---------------------------- allocation ------------------------------- #
     def _take_free(self) -> int:
@@ -194,7 +246,8 @@ class BlockPool:
         """Take `block_id` for fresh content, evicting whatever it held."""
         block = self.blocks[block_id]
         assert block.ref_count == 0
-        self._unindex(block_id)
+        if self._unindex(block_id):
+            self.blocks_evicted += 1
         block.reset()
         self._take_named(block_id)
         self._used.add(block_id)
@@ -307,7 +360,8 @@ class BlockPool:
             return None
         if top in self._free:
             self._take_named(top)
-            self._unindex(top)
+            if self._unindex(top):
+                self.blocks_retired += 1
             destination = -1
         else:
             destination = self._take_free()
@@ -325,7 +379,11 @@ class BlockPool:
         rewrites. The bytes are the caller's to move too — this is the
         bookkeeping half, and the two have to happen in the same pass.
         """
-        self._unindex(destination)
+        # The destination may have come off the cached half of the free list,
+        # in which case making room for the relocation destroyed its content.
+        # `retire_top` is the only caller, so the boundary is what spent it.
+        if self._unindex(destination):
+            self.blocks_retired += 1
         src, dst = self.blocks[source], self.blocks[destination]
         dst.ref_count, dst.hash, dst.token_ids = src.ref_count, src.hash, src.token_ids
         if src.hash != -1 and self._hash_to_block_id.get(src.hash) == source:
