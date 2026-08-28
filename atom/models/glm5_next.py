@@ -343,12 +343,13 @@ class Glm5NextIndexer(Indexer):
     and each selected pool expands back to its ``index_kpool`` token positions,
     with the trailing incomplete pool always selected.
 
-    The pooled scoring path is not implemented yet (see ``_assert_kpool_regime``).
-    Below ``index_topk`` candidates it is not needed: top-k then selects *every*
-    pool, so the expansion yields every token position regardless of the pooled
-    K values, and the token-granular selection this class inherits is exactly
-    equal to it.  Past that threshold the two genuinely differ, so it refuses
-    rather than returning a quietly wrong answer.
+    Both selections are available and ``use_kpool()`` chooses between them.
+    Below ``index_topk`` candidates they are exactly equal -- top-k then selects
+    *every* pool, so the expansion yields every token position regardless of the
+    pooled K values -- which is what makes a short-context comparison of the two
+    a real check rather than a tautology.  Past that threshold they genuinely
+    differ, so with ``ATOM_GLM5_KPOOL=0`` the token-granular fallback refuses
+    (see ``_assert_kpool_regime``) rather than returning a quietly wrong answer.
     """
 
     def __init__(

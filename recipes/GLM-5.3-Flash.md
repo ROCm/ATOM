@@ -22,8 +22,12 @@ Total checkpoint 328 GB → ~40 GB/GPU at `-tp 8`.
 AITER_LOG_LEVEL=WARNING python -m atom.entrypoints.openai_server \
   --model /data/amd_int/models/GLM-5.3-Flash \
   --kv_cache_dtype fp8 -tp 8 \
-  --max-model-len 2048
+  --max-model-len 8192
 ```
+
+`--max-model-len` is no longer capped at `index_topk` (2048); see "Context
+length". Past 2048 the pooled indexer decides what the model attends to, so a
+context beyond it is the configuration worth testing, not one to avoid.
 
 ## Accuracy
 
