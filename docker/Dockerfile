@@ -530,11 +530,10 @@ print('OK: lmcache', lmcache.__version__, 'HIP c_ops; torch', torch.__version__)
 # It therefore has to be followed by hand. To re-check:
 #   git ls-tree main utils/aiperf     # in a clone of SemiAnalysisAI/InferenceX
 #
-# `SA_AIPERF_REF` accepts any ref; empty means "whatever HEAD points at", which
-# is why the checkout below is conditional rather than naming a branch (an
-# upstream default-branch rename would otherwise break unrelated builds).
+# `SA_AIPERF_REF` accepts any ref and defaults to the latest `main` commit
+# available when the image is built.
 ARG INSTALL_SA_AIPERF=1
-ARG SA_AIPERF_REF="754356e9a39acc6cc6afb242d123bb57c3fb6f75"
+ARG SA_AIPERF_REF="main"
 RUN if [ "${INSTALL_SA_AIPERF}" = "1" ]; then \
         echo "========== [ATOM] Install SemiAnalysis aiperf (ref=${SA_AIPERF_REF:-<default branch>}) =========="; \
         rm -rf /opt/aiperf && \
