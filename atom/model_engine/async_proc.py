@@ -400,6 +400,16 @@ class AsyncIOProcManager:
     def call_func(self, func_name: str, *args, wait_out: bool = False):
         """Standard RPC call for non-KV operations."""
         logger.debug(f"{self.label}: call_func {func_name} {args}")
+        # A worker that dies makes monitor_procs() call exit(), which closes the
+        # broadcast shm — after which enqueue() fails inside aiter with a bare
+        # "'NoneType' object is not subscriptable" that names neither this queue
+        # nor the dead worker. Say what actually happened; the worker's own
+        # traceback is further up the log.
+        if not self.still_running:
+            raise RuntimeError(
+                f"{self.label}: call_func({func_name!r}) after shutdown — a model "
+                f"runner process died; see its traceback earlier in the log."
+            )
         msg = (func_name, *args)
         self.rpc_broadcast_mq.enqueue(msg)
         if wait_out:

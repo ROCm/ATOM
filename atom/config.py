@@ -1383,10 +1383,12 @@ class Config:
     disagg_weight_ack_addrs: list[str] = field(default_factory=list)
     # Bootstrap round 2: prefill PUSH → decode PULL (kvcache_args + num_blocks)
     disagg_kvcache_ipc_addrs: list[str] = field(default_factory=list)
-    # Which decode rank this process is (0-based), and how many there are.
-    # Under DP decode each rank owns its own scheduler, BlockManager and KV pool,
-    # and pairs with the prefill TP rank on the same GPU — so it must read
-    # `paths[disagg_decode_rank]` from the IPC handle rendezvous, not paths[0].
+    # Which decode PROCESS this is (0-based), and how many there are. Symmetric
+    # rapidserve has exactly one, at the same TP as prefill; under DP decode each
+    # rank owns its own scheduler, BlockManager and KV pool and therefore its own
+    # process. It offsets the GPU a decode worker pairs with in the IPC handle
+    # rendezvous (ModelRunner._disagg_pair_rank) — not the index itself, since
+    # a symmetric decode process still has one worker per GPU.
     disagg_decode_rank: int = 0
     disagg_num_decode_ranks: int = 1
     # True for the decode process in disagg mode: skip GPU weight/kvcache allocation.

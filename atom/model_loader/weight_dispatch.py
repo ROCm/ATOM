@@ -60,16 +60,9 @@ class WeightDispatcher:
         detect_fused_expert_fn: Callable[[str], bool] | None,
         get_fused_expert_mapping_fn: Callable[[], Sequence[tuple]] | None,
         load_fused_expert_weights_fn: Callable | None,
-        only_params: set[str] | None = None,
     ):
         self.model = model
         self.params_dict = params_dict
-        # Partial load: names this dispatcher may write. None = no restriction,
-        # which must stay byte-identical to the pre-existing behaviour — do NOT
-        # infer it from `params_dict`, whose `named_parameters()` dedups a
-        # Parameter registered under several names and would silently drop the
-        # duplicate registrations a full load depends on.
-        self.only_params = only_params
         self.hf_config = hf_config
         self.prefix = prefix
         self.spec_decode = spec_decode
@@ -222,10 +215,6 @@ class WeightDispatcher:
             if "mtp" in name and not self.spec_decode:
                 return True, name
             param = self.params_dict.get(name)
-            if param is not None and not self._allowed(name):
-                # Same rule as _parameter(): under a partial load this name
-                # belongs to another process.
-                return True, name
             if param is None:
                 # Parameter absent from model (e.g. weight scales for an
                 # unquantized drafter MTP block); skip silently.
@@ -280,18 +269,7 @@ class WeightDispatcher:
 
     # ── helpers ───────────────────────────────────────────────────────────
 
-    def _allowed(self, param_name: str) -> bool:
-        """Whether a partial load permits writing this parameter.
-
-        Always True for a normal (unrestricted) load. Under `only_params` the
-        excluded parameters are CUDA IPC aliases into another process, so
-        writing them would push checkpoint bytes into that process's weights.
-        """
-        return self.only_params is None or param_name in self.only_params
-
     def _parameter(self, orig_ckpt_name: str, param_name: str) -> nn.Parameter | None:
-        if not self._allowed(param_name):
-            return None
         try:
             return self.model.get_parameter(param_name)
         except AttributeError:

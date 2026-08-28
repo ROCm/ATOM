@@ -1711,15 +1711,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         if self.disagg_kv_write_masked:
             # Third pool needing a sink on non-owned rows (block_tables and
             # swa_block_tables are handled in prepare_block_tables): the
-            # compressor's per-request kv_state / score_state tails.
-            from atom.model_engine.block_manager import DUMP_INDEX
-
-            owned = self.disagg_owned_rows(batch)
-            state_slot_np = state_slot_np.copy()
-            if owned is None:
-                state_slot_np[:] = DUMP_INDEX
-            else:
-                state_slot_np[~owned[:scheduled_bs]] = DUMP_INDEX
+            # compressor's per-request kv_state / score_state tails. Same helper
+            # as the prefill path so the two cannot drift apart again.
+            state_slot_np = self.disagg_mask_state_slots(
+                batch, state_slot_np, scheduled_bs
+            )
         ss_buf = var["v4_meta_state_slot_groups"]
         ss_buf.np[:scheduled_bs] = state_slot_np
 
@@ -3262,7 +3258,15 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         """
         var = self.model_runner.forward_vars
         block_tables_np = var["block_tables"].np
-        for i, block_table in enumerate(batch.block_tables[:scheduled_bs]):
+        # Asymmetric rapidserve: rows this prefill rank does not own get scratch
+        # blocks. This is a SEPARATE implementation from the parent's
+        # prepare_block_tables (see the docstring), and V4 prefill only ever
+        # calls this one — masking added to the parent alone silently does
+        # nothing here, which is exactly how the compressed pool went unmasked.
+        tables = self.disagg_effective_block_tables(batch)
+        if tables is None:
+            tables = batch.block_tables
+        for i, block_table in enumerate(tables[:scheduled_bs]):
             block_tables_np[i] = 0
             block_tables_np[i, : len(block_table)] = block_table
         return var["block_tables"].copy_to_gpu(scheduled_bs)
@@ -3276,6 +3280,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         var = self.model_runner.forward_vars
         swa_np = var["swa_block_tables"].np
         swa_tables = getattr(batch, "swa_block_tables", None) or []
+        # Sink, not scratch: prefill never reads back its own SWA writes, so
+        # dumped rows may alias one reserved block. Same reason as the parent's
+        # prepare_block_tables — and same trap: V4 prefill uses only this copy.
+        swa_tables = self._disagg_sink_tables(batch, swa_tables)
         for i in range(scheduled_bs):
             swa_np[i] = 0
             if i < len(swa_tables):
@@ -3310,6 +3318,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # state reads, fresh writes overwrite warmup pollution).
         if len(groups_np) < scheduled_bs:
             groups_np = np.zeros(scheduled_bs, dtype=np.int32)
+        # Asymmetric rapidserve: rows this prefill rank does not own must not
+        # write their compressor tail into the live slot — see
+        # CommonAttentionBuilder.disagg_mask_state_slots. This is the PREFILL
+        # path; the mask used to exist only in prepare_decode, where
+        # disagg_kv_write_masked is always False, so it never ran at all.
+        groups_np = self.disagg_mask_state_slots(batch, groups_np, scheduled_bs)
         gpu = self._stage("v4_meta_state_slot_groups", groups_np)
         if return_cpu:
             return gpu, groups_np

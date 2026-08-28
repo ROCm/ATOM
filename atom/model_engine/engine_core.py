@@ -468,28 +468,48 @@ class DPEngineCoreProc(EngineCore):
         self.engines_running = True
         self._shutting_down = False
 
-        if envs.ATOM_ENABLE_PREFILL_DELAYER:
-            from atom.model_engine.prefill_delayer import PrefillDelayer
+        self._maybe_attach_prefill_delayer(config)
 
-            self.scheduler.set_prefill_delayer(
-                PrefillDelayer(
-                    dp_size=config.parallel_config.data_parallel_size,
-                    cpu_group=self.dp_group,
-                    max_num_batched_tokens=config.max_num_batched_tokens,
-                    target_fill=envs.ATOM_PREFILL_DELAYER_TARGET_FILL,
-                    ttft_max_ticks=envs.ATOM_PREFILL_DELAYER_TTFT_MAX_TICKS,
-                    partial_max_ticks=envs.ATOM_PREFILL_DELAYER_PARTIAL_MAX_TICKS,
-                    stall_ticks=envs.ATOM_PREFILL_DELAYER_STALL_TICKS,
-                    kv_high_watermark=envs.ATOM_PREFILL_DELAYER_KV_HIGH_WATERMARK,
-                    token_usage_low_watermark=envs.ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK,
-                    max_queue_ms=envs.ATOM_PREFILL_DELAYER_MAX_QUEUE_MS,
-                )
+    def _maybe_attach_prefill_delayer(self, config: Config) -> None:
+        """Attach the DP prefill delayer, when this engine has a scheduler.
+
+        Override point. The disagg decode engine defers scheduler creation until
+        after the kvcache IPC import, so `self.scheduler` is still None here —
+        and a decode engine has no prefill to delay in any case.
+        """
+        if not envs.ATOM_ENABLE_PREFILL_DELAYER:
+            return
+        if self.scheduler is None:
+            return
+        from atom.model_engine.prefill_delayer import PrefillDelayer
+
+        self.scheduler.set_prefill_delayer(
+            PrefillDelayer(
+                dp_size=config.parallel_config.data_parallel_size,
+                cpu_group=self.dp_group,
+                max_num_batched_tokens=config.max_num_batched_tokens,
+                target_fill=envs.ATOM_PREFILL_DELAYER_TARGET_FILL,
+                ttft_max_ticks=envs.ATOM_PREFILL_DELAYER_TTFT_MAX_TICKS,
+                partial_max_ticks=envs.ATOM_PREFILL_DELAYER_PARTIAL_MAX_TICKS,
+                stall_ticks=envs.ATOM_PREFILL_DELAYER_STALL_TICKS,
+                kv_high_watermark=envs.ATOM_PREFILL_DELAYER_KV_HIGH_WATERMARK,
+                token_usage_low_watermark=envs.ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK,
+                max_queue_ms=envs.ATOM_PREFILL_DELAYER_MAX_QUEUE_MS,
             )
+        )
 
     def _init_data_parallel(self, config: Config):
         dp_rank = config.parallel_config.data_parallel_rank
         dp_size = config.parallel_config.data_parallel_size
         local_dp_rank = config.parallel_config.data_parallel_rank_local
+
+        if dp_size <= 1:
+            # Symmetric rapidserve runs a single decode engine, which inherits
+            # this class only so the DP=N case can reuse the lockstep. With one
+            # rank there is no group to form and no peer to stay in step with.
+            self.dp_rank = dp_rank or 0
+            self.dp_group = None
+            return
 
         assert dp_size > 1
         assert local_dp_rank is not None
@@ -937,8 +957,20 @@ class PrefillEngineCore(EngineCore):
             pass
 
 
-class DecodeEngineCore(EngineCore):
+class DecodeEngineCore(DPEngineCoreProc):
     """Disaggregated decode instance.
+
+    Inherits DPEngineCoreProc for the lockstep busy loop. Under an asymmetric
+    topology the N decode ranks form a DP group whose MoE all_gather /
+    reduce_scatter (moe.py:362) is a COLLECTIVE — every rank must execute a
+    forward on every step or the ones that do will block forever on the ones
+    that do not. That is precisely what happens while draining: ranks run out of
+    sequences at different times, and without the `has_unfinished` all-reduce
+    plus `_execute_dummy_batch` the still-busy ranks hang and their in-flight
+    requests are never completed.
+
+    Degrades cleanly to the plain EngineCore loop at dp_size == 1 (symmetric
+    rapidserve), where there is no peer to stay in step with.
 
     Responsibilities:
     - Owns the BlockManager and the KV cache tensor.
@@ -950,6 +982,29 @@ class DecodeEngineCore(EngineCore):
     - Exports the kv_cache IPC handle to prefill at startup.
     - Runs normal CUDA-graph-accelerated decode.
     """
+
+    def _maybe_attach_prefill_delayer(self, config: Config) -> None:
+        """No-op: a decode engine has no prefill to delay.
+
+        Also unavoidable — this runs inside super().__init__(), and decode does
+        not create its scheduler until after the kvcache IPC import has set
+        num_kvcache_blocks (BlockManager asserts num_blocks > 0). The base class
+        guards on `self.scheduler is None` too; this override records that the
+        omission is intentional rather than incidental.
+        """
+        return
+
+    @property
+    def _dp_lockstep(self) -> bool:
+        return getattr(self, "dp_group", None) is not None
+
+    def busy_loop(self):
+        # DP=N: DPEngineCoreProc's loop, which keeps every rank issuing a
+        # forward (real or dummy) so the MoE collectives always match.
+        # DP=1: nothing to synchronise, so take the plain loop.
+        if self._dp_lockstep:
+            return DPEngineCoreProc.busy_loop(self)
+        return EngineCore.busy_loop(self)
 
     def __init__(self, config: Config, input_address: str, output_address: str):
         self._disagg_d2p_addr = config.disagg_d2p_addr  # PUSH: send BlockAssignment

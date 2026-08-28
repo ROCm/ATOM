@@ -858,18 +858,47 @@ class ModelRunner:
         construct on the meta device and import weights via IPC instead.
         """
         config = self.config
-        self.model = model_class(config)
-        torch.set_default_device(None)
-        self._load_weights_from_disk()
+        # Asymmetric rapidserve: prefill produces decode's TP=1 weights as well
+        # as its own TP=N shards, from this one checkpoint pass. The twins have
+        # to exist BEFORE the load (they are fed by the same weight_loader call)
+        # and their constructor arguments have to be captured while the real
+        # model is built. See atom/model_engine/decode_twins.py.
+        build_twins = getattr(config, "disagg_prefill_tp_size", 0) > 1 and not getattr(
+            config, "disagg_is_decode", False
+        )
+        if build_twins:
+            from atom.model_engine.decode_twins import DecodeTwins, record_ctor_args
 
-    def _load_weights_from_disk(self, only_params: set[str] | None = None):
+            with record_ctor_args():
+                self.model = model_class(config)
+            # Built while the default device is still this rank's GPU — the same
+            # state the real model was constructed under. Doing it after the
+            # reset below lands every twin parameter on CPU, and the failure only
+            # surfaces much later at export ("_share_cuda_: only available on
+            # CUDA").
+            self.decode_twins = DecodeTwins.build(self.model, self.device)
+            torch.set_default_device(None)
+        else:
+            self.model = model_class(config)
+            torch.set_default_device(None)
+        self._load_weights_from_disk()
+        if build_twins:
+            self.decode_twins.drop_replicated_bare(self.model)
+            # Before finalize(): post-processing makes the two sides
+            # legitimately differ, so this is the only point where the twin and
+            # the shard are comparable at all.
+            self.decode_twins.verify_against_shards(self.model, self.rank)
+            self.decode_twins.finalize(self.model)
+            # And after finalize: bytes being right says nothing about whether
+            # TP=1 post-processing produced a layout that computes the same
+            # function. Reports only.
+            self.decode_twins.verify_post_processing(self.model, self.rank)
+
+    def _load_weights_from_disk(self):
         """Fill this rank's parameters from the checkpoint.
 
         Split out of _build_and_load_model so a subclass can construct the model
-        itself — e.g. partly on the meta device — and still reuse the standard
-        load path. `only_params` scopes both the load and the post-load
-        processing to a subset; see load_model's docstring for why that pairing
-        matters.
+        itself — e.g. on the meta device — and still reuse the standard load path.
         """
         config = self.config
         fused_shared_expert_load_fn = None
@@ -882,7 +911,6 @@ class ModelRunner:
             config.hf_config,
             config.load_dummy,
             load_fused_expert_weights_fn=fused_shared_expert_load_fn,
-            only_params=only_params,
         )
         load_elapsed = time.perf_counter() - load_start
         logger.info(
@@ -4140,7 +4168,18 @@ class ModelRunner:
 # process skips get_num_blocks (it owns no KV memory) and cannot recompute
 # them, so they travel with the KV IPC payload. Add to this tuple whenever a
 # builder starts reading another get_num_blocks-derived attribute.
-_KV_DIM_ATTRS = ("num_swa_blocks", "max_per_req_cache_slots")
+# Plain-int dimensions that KV BINDING depends on and that decode cannot derive
+# for itself, so prefill ships them alongside the tensors.
+#
+# num_kv_heads is here because _prepare_kv_dims computes it as
+# `num_key_value_heads // self.world_size` (model_runner.py:1889-1894), and under
+# ASYMMETRIC rapidserve the two processes disagree: prefill is TP=8, decode TP=1,
+# so decode would derive an 8x larger value and bind views that size over
+# prefill's allocation. MLA/V4 never reads it (the KV latent is head-independent,
+# so its shapes carry no head term), but the MHA backends size their KV with it
+# (aiter_attention.py:676,685 / triton_mha.py:125,132) — the producer's value is
+# the only correct one for any backend that does.
+_KV_DIM_ATTRS = ("num_swa_blocks", "max_per_req_cache_slots", "num_kv_heads")
 
 
 class RapidServeModelRunner(ModelRunner):
@@ -4169,14 +4208,30 @@ class RapidServeModelRunner(ModelRunner):
     def _disagg_pair_rank(self) -> int:
         """Index into the per-prefill-TP-rank IPC handle files.
 
-        Prefill writes one file per TP rank, so a prefill worker uses its own TP
-        rank. A decode process runs at TP=1 — `self.rank` is always 0 — but it
-        pairs with the prefill rank on ITS OWN GPU, so it must index by decode
-        rank instead. Identical for symmetric rapidserve, where decode rank is 0
-        and TP ranks line up one-to-one.
+        Prefill writes one file per TP rank and its TP rank IS its GPU, so a
+        prefill worker uses `self.rank`. A decode worker has to name the prefill
+        rank sharing ITS GPU, which is where the handle it must open was
+        exported — so this is a GPU index, not a rank index, and it has to
+        account for both ways decode spreads over GPUs:
+          - symmetric rapidserve: ONE decode process at TP=N, so worker `r` is
+            on GPU r and `disagg_decode_rank` is 0 for all of them;
+          - asymmetric rapidserve: N decode processes at TP=1, so `self.rank` is
+            always 0 and `disagg_decode_rank` alone carries the GPU.
+        Both are `disagg_decode_rank * stage_span + rank` (disagg_types.
+        disagg_pair_rank), the same arithmetic _setup_device_and_distributed uses
+        for the device itself. Deriving it from the config rather than reading
+        `self.device.index` keeps _assert_disagg_pairing below an independent
+        cross-check.
         """
         if self.config.disagg_is_decode:
-            return self.config.disagg_decode_rank
+            from atom.model_engine.disagg_types import disagg_pair_rank
+
+            return disagg_pair_rank(
+                self.config.disagg_decode_rank,
+                self.rank,
+                self.config.tensor_parallel_size
+                * self.config.prefill_context_parallel_size,
+            )
         return self.rank
 
     def _assert_disagg_pairing(self) -> None:
@@ -4185,19 +4240,28 @@ class RapidServeModelRunner(ModelRunner):
         CUDA IPC handles are per-device, so the pairing invariant is
         `device.index == _disagg_pair_rank` on both sides. It is easy to break
         from far away — a decode process gets its GPU from
-        `data_parallel_rank_local` (model_runner.py:970-983), so forgetting to
+        `data_parallel_rank_local` (model_runner.py:985-1003), so forgetting to
         set that silently lands every rank on cuda:0 and the failure surfaces
         much later as "storage on different device". Check it where the meaning
         is local instead.
+
+        Checked in BOTH topologies. It used to be asymmetric-only, which is how
+        a decode worker indexing the handle files by decode rank alone — always
+        0 under symmetric rapidserve, so every TP rank opened rank 0's file —
+        got past this point and died deep inside the import instead.
+
+        Assumes prefill TP rank p sits on cuda:p, i.e. rapidserve owns GPUs
+        starting at 0. DisaggCoreManager builds both configs that way (it
+        overwrites decode's data_parallel_rank_local outright), so an engine
+        pinned to a non-zero GPU base via ATOM_DP_RANK_LOCAL is out of scope
+        for rapidserve rather than a false positive here.
         """
-        if getattr(self.config, "disagg_prefill_tp_size", 0) <= 1:
-            return
         want = self._disagg_pair_rank
         got = self.device.index
         if got != want:
             role = "decode" if self.config.disagg_is_decode else "prefill"
             raise RuntimeError(
-                f"asymmetric rapidserve {role} pairing broken: this worker is on "
+                f"rapidserve {role} pairing broken: this worker is on "
                 f"cuda:{got} but is paired with prefill TP rank {want} (cuda:"
                 f"{want}). CUDA IPC handles are per-device, so the import would "
                 f"fail or alias the wrong GPU's memory. Check "
@@ -4241,70 +4305,15 @@ class RapidServeModelRunner(ModelRunner):
             super()._build_and_load_model(model_class)
             return
         # Decode imports prefill's weights via CUDA IPC and owns no weight
-        # memory. Build on the meta device so construction allocates zero GPU
-        # bytes (avoids the transient 2x-weights peak that OOMs at TP=4);
-        # import_model_weight_ipc_handles() materializes params from prefill,
-        # and RoPE caches are recomputed locally.
-        #
-        # Under an asymmetric topology the import cannot cover the TP-sharded
-        # attention weights (prefill's shards are the wrong shape for a TP=1
-        # consumer), so those stay on meta and are filled from the checkpoint
-        # afterwards by _load_unaliased_weights(). Building on meta first is what
-        # keeps the peak at the final footprint instead of ~2x.
+        # memory at all — including under an asymmetric topology, where prefill
+        # exports TP=1 twins for the tensors decode cannot share (see
+        # decode_twins.py). Build on the meta device so construction allocates
+        # zero GPU bytes (avoids the transient 2x-weights peak that OOMs at
+        # TP=4); import_model_weight_ipc_handles() materializes every parameter
+        # from prefill, and RoPE caches are recomputed locally.
         with self._init_weight_params_on_meta():
             self.model = model_class(config)
         torch.set_default_device(None)
-
-    def _load_unaliased_weights(self):
-        """Fill the parameters the IPC import could not cover, from the checkpoint.
-
-        Asymmetric rapidserve only. Decode runs attention at TP=1, so its
-        attention weights have no counterpart among prefill's Column/RowParallel
-        shards — import_model_weights(shape_aware=True) skips them and they are
-        still on meta at this point. They cannot be reconstructed from prefill's
-        shards either: preshuffled layouts and `tp_dim=1` quant scales are both
-        computed per-shard (linear.py:639-652), so stitching processed shards
-        together reproduces neither. Loading them here gives them the correct
-        TP=1 sharding AND the correct TP=1 post-load processing.
-
-        Runs AFTER the import on purpose. Everything already aliased stays real
-        and untouched, so the peak never exceeds the final footprint — building
-        real up front and freeing afterwards would cost ~2x weights instead.
-        """
-        names = [n for n, p in self.model.named_parameters() if p.is_meta]
-        if not names:
-            logger.info(
-                f"ModelRunner rank {self.rank}: IPC import covered every "
-                f"parameter; no local load needed"
-            )
-            return
-        logger.info(
-            f"ModelRunner rank {self.rank}: {len(names)} parameters not covered "
-            f"by the IPC import (TP-sharded on prefill) — loading from checkpoint"
-        )
-        # copy_ into meta fails, so give them real storage first. Only these
-        # allocate; the aliased majority is left alone. A new Parameter object is
-        # unavoidable — `p.data = <cuda tensor>` raises for a meta parameter
-        # ("incompatible tensor type"), which is why import_model_weights rebuilds
-        # too.
-        modules = dict(self.model.named_modules())
-        for name in names:
-            parent, _, attr = name.rpartition(".")
-            mod = modules.get(parent, self.model)
-            p = mod._parameters[attr]
-            new = torch.nn.Parameter(
-                torch.empty_like(p, device=self.device), requires_grad=p.requires_grad
-            )
-            # Carry over everything stamped on the Parameter OBJECT. Layers hang
-            # bound methods off it at construction — `self.weight.weight_loader =
-            # self.weight_loader` (linear.py:501, embed_head.py:158), plus
-            # `weight_loader_process` and quant markers — and the loader reaches
-            # for them by attribute. A bare replacement loses them and the load
-            # dies with "'Parameter' object has no attribute 'weight_loader'".
-            new.__dict__.update(p.__dict__)
-            mod._parameters[attr] = new
-        torch.set_default_device(None)
-        self._load_weights_from_disk(only_params=set(names))
 
     def _maybe_warmup(self):
         # Decode owns no GPU memory yet (weights/kvcache imported from prefill
@@ -4380,7 +4389,8 @@ class RapidServeModelRunner(ModelRunner):
     # temp-file rendezvous: every rank pickles its local handles to
     #   /tmp/atom_disagg_<tag>_rank<N>.pkl
     # Rank 0 waits until all N files exist, then returns the list of paths to
-    # the engine.  On the import side every rank reads its own file (index=self.rank).
+    # the engine.  On the import side every worker reads the file written by the
+    # prefill rank on ITS GPU (index=_disagg_pair_rank).
     # ------------------------------------------------------------------
 
     def _disagg_rank_file_path(self, tag: str, rank: int) -> str:
@@ -4425,30 +4435,6 @@ class RapidServeModelRunner(ModelRunner):
             + str([p for p in paths if not os.path.exists(p)])
         )
 
-    @staticmethod
-    def _sum_unique_storage_bytes(model) -> int:
-        """Bytes of GPU memory backing a model, counting each storage once.
-
-        Deduplicated by `data_ptr`: several parameters can be views of one
-        allocation (packed QKV, fused MoE weights), and counting those per
-        tensor would overstate the total.
-        """
-        seen: set[int] = set()
-        total = 0
-        tensors = list(model.parameters()) + [
-            b for b in model.buffers() if isinstance(b, torch.Tensor)
-        ]
-        for t in tensors:
-            if not t.is_cuda or t.numel() == 0:
-                continue
-            s = t.untyped_storage()
-            ptr = s.data_ptr()
-            if ptr in seen:
-                continue
-            seen.add(ptr)
-            total += s.nbytes()
-        return total
-
     def export_model_weight_ipc_handles(self) -> list[str] | None:
         """Export all model parameters as CUDA IPC handles (prefill process only).
 
@@ -4460,13 +4446,23 @@ class RapidServeModelRunner(ModelRunner):
         from atom.model_engine.ipc_utils import export_model_weight_handles
 
         logger.info(f"ModelRunner rank {self.rank}: export_model_weight_ipc_handles")
-        handles = export_model_weight_handles(self.model)
-        self._disagg_exported_bytes = self._sum_unique_storage_bytes(self.model)
-        logger.info(
-            f"[WT-EXPORT] rank {self.rank}: shared "
-            f"{self._disagg_exported_bytes / (1 << 30):.2f}GB of weights with the "
-            f"decode process (mapped, not copied)"
+        # Held for the life of the process: decode's parameters are IPC views
+        # into these allocations, so anything the export materialised (a
+        # `.contiguous()` copy of a non-contiguous tensor) must not be collected
+        # here or the consumer reads freed memory. The twins themselves are kept
+        # alive by `self.decode_twins`.
+        self._disagg_export_retain = []
+        handles = export_model_weight_handles(
+            self.model,
+            twins=getattr(self, "decode_twins", None),
+            retain=self._disagg_export_retain,
         )
+        if self._disagg_export_retain:
+            logger.info(
+                f"[WT-EXPORT] rank {self.rank}: retaining "
+                f"{len(self._disagg_export_retain)} materialised tensor(s) that "
+                f"decode aliases"
+            )
         self._disagg_write_rank_file("weights", handles)
         paths = self._disagg_collect_rank_files("weights")
         if paths is not None:
@@ -4476,15 +4472,14 @@ class RapidServeModelRunner(ModelRunner):
     def import_model_weight_ipc_handles(self, paths: list[str]) -> bool:
         """Replace model parameters with views into prefill's GPU allocation.
 
-        Each rank reads its own handles file (index=self.rank) and deletes it
-        after import — the producer and consumer ranks are co-located on the same
-        GPU, which is what makes the IPC handle valid.
+        Each worker reads the handles file written by the prefill rank on its own
+        GPU (index=_disagg_pair_rank) and deletes it after import — producer and
+        consumer being co-located is what makes the IPC handle valid.
 
-        Symmetric rapidserve aliases everything. Asymmetric rapidserve
-        (disagg_prefill_tp_size > 1) aliases only the tensors whose shapes match:
-        prefill's TP-sharded attention weights and decode's full matrices are
-        different tensors, not different views of one, so decode keeps the copy
-        it loaded for those. See import_model_weights(shape_aware=True).
+        Aliases EVERY parameter, symmetric or asymmetric. Under an asymmetric
+        topology prefill exported TP=1 twins for the tensors whose shape differs
+        (decode_twins.py), so by the time the handles arrive there is nothing
+        left for decode to load.
 
         Returns True as sentinel for wait_out=True.
         """
@@ -4499,36 +4494,25 @@ class RapidServeModelRunner(ModelRunner):
         with open(path, "rb") as f:
             handles = pickle.load(f)
         os.remove(path)
-        asymmetric = getattr(self.config, "disagg_prefill_tp_size", 0) > 1
-
-        # Attribute every byte this process costs the DEVICE, which is what
-        # prefill's `non_torch` term charges against its KV budget. Two distinct
-        # questions, and they have different fixes:
-        #   map_cost  - does IPC-mapping prefill's weights consume device memory?
-        #               If ~0 the sharing is genuinely free; if ~= the weight
-        #               size, rapidserve's whole memory model is not saving what
-        #               it claims on ROCm.
-        #   load_cost - what does loading our own un-aliased tensors cost, AFTER
-        #               empty_cache? If this far exceeds the ~35GB those tensors
-        #               should weigh, the loader is leaving allocator segments
-        #               behind (fragmented / unreleasable) rather than the
-        #               mapping being the problem.
         gb = 1 << 30
         free_start, dev_total = torch.cuda.mem_get_info()
-        import_model_weights(self.model, handles, shape_aware=asymmetric)
+        import_model_weights(self.model, handles)
+        # Three samples, not two. Folding the mapping and the cleanup into one
+        # delta made `map_cost` read -2.22GB, which looks like mapping returning
+        # memory and is really the reclaim below swamping a ~0 mapping cost.
+        # Measure the mapping on its own.
         free_mapped, _ = torch.cuda.mem_get_info()
-        mapped_storages = self._sum_unique_storage_bytes(self.model)
-        if asymmetric:
-            self._load_unaliased_weights()
         gc.collect()
         torch.cuda.empty_cache()
+        # Sampled AFTER the collect so this reports memory actually retained,
+        # not a transient high-water.
         free_end, _ = torch.cuda.mem_get_info()
         logger.info(
             f"[WT-IMPORT] rank {self.rank}: device accounting — "
             f"map_cost={(free_start - free_mapped) / gb:.2f}GB "
-            f"(storages now {mapped_storages / gb:.2f}GB) | "
-            f"load_cost={(free_mapped - free_end) / gb:.2f}GB | "
-            f"total_device_cost={(free_start - free_end) / gb:.2f}GB | "
+            f"(expected ~0: the import maps prefill's pages, it does not copy) | "
+            f"reclaimed={(free_end - free_mapped) / gb:.2f}GB "
+            f"(consumer tensors the import replaced, plus allocator cache) | "
             f"allocator allocated={torch.cuda.memory_allocated() / gb:.2f}GB "
             f"reserved={torch.cuda.memory_reserved() / gb:.2f}GB | "
             f"device free={free_end / gb:.2f}/{dev_total / gb:.2f}GB"
@@ -4608,8 +4592,9 @@ class RapidServeModelRunner(ModelRunner):
         backend the builder supports — MLA, MHA, GDN, V4, Eagle3 — works here
         without further changes.
 
-        TP-aware: each rank reads its own handles file (index=self.rank) and
-        deletes it after import.  Returns True as sentinel for wait_out=True.
+        TP-aware: each worker reads the handles file written by the prefill rank
+        on its own GPU (index=_disagg_pair_rank) and deletes it after import.
+        Returns True as sentinel for wait_out=True.
         """
         import pickle
 
@@ -4618,6 +4603,10 @@ class RapidServeModelRunner(ModelRunner):
         # Establish the dims binding depends on. Decode skips allocate_kv_cache
         # entirely (it owns no KV memory), so num_physical_kvcache_blocks,
         # num_kv_heads and the layer counts are otherwise never set here.
+        # Derives decode's own dims first; the imported _KV_DIM_ATTRS below then
+        # overwrite the ones that must match the PRODUCER rather than this
+        # process (num_kv_heads — see _KV_DIM_ATTRS). Order matters: the
+        # overwrite has to land before _bind_kv_tensors.
         self._prepare_kv_dims(num_kvcache_blocks)
         self._assert_disagg_pairing()
         path = paths[self._disagg_pair_rank]

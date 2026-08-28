@@ -16,7 +16,7 @@ SETTLE_SEC="${SETTLE_SEC:-20}"
 
 # Override by passing values as args: ./sweep.sh 1 4 16 64
 CONCURRENCIES=("${@:-}")
-[ -z "${CONCURRENCIES[0]:-}" ] && CONCURRENCIES=(32)  #(4 8 16 32 64 128 256 512)
+[ -z "${CONCURRENCIES[0]:-}" ] && CONCURRENCIES=(128)  #(4 8 16 32 64 128 256 512)
 INPUT_LENS=(8192)
 
 MODEL_SHORT="$(basename "$MODEL")"

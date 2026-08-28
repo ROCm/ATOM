@@ -25,13 +25,22 @@ import torch.nn as nn
 logger = logging.getLogger("atom")
 
 
-def _export_tensor(t: torch.Tensor) -> dict:
+def _export_tensor(t: torch.Tensor, retain: list | None = None) -> dict:
     """Serialize a CUDA tensor to a dict that can be pickled and sent cross-process.
 
     Uses tensor._share_cuda_() which calls hipIpcGetMemHandle on ROCm.
     Returns metadata needed to reconstruct the tensor on the other side.
+
+    `retain` collects any tensor this call MATERIALISED. `.contiguous()` on a
+    non-contiguous input returns a new tensor, and the handle is taken from that
+    copy's storage — if it is left to go out of scope here, the consumer's IPC
+    view points at freed memory. The producer must therefore hold a reference for
+    as long as the consumer might read it, i.e. the life of the process.
     """
+    src = t
     t = t.contiguous()
+    if retain is not None and t is not src:
+        retain.append(t)
     share_cuda_args = t.untyped_storage()._share_cuda_()
     return {
         "share_cuda_args": share_cuda_args,
@@ -144,56 +153,96 @@ def _tensor_meta_attrs(t: torch.Tensor) -> dict:
     }
 
 
+# Attributes produced by process_weights_after_loading that the str/bool sweep
+# below would miss. Named explicitly rather than widening the type filter:
+# blanket int copying would also carry `tp_size` / `tp_rank`, which legitimately
+# DIFFER between a TP=8 producer and a TP=1 consumer and are read by
+# `LinearBase.forward` (linear.py:988) — forcing the producer's values there
+# would turn a padding bug into a parallelism bug.
+_PRODUCER_ONLY_ATTRS = (
+    # Set only when a8w8 preshuffle pads the output (linear.py:827) and read
+    # alongside is_output_padded to slice the pad off (linear.py:985-987).
+    "_output_size_before_padding",
+)
+
+
 def _module_meta_attrs(mod: nn.Module) -> dict:
-    """Non-tensor str/bool attributes stashed on a module by post-load hooks.
+    """Non-tensor attributes stashed on a module by post-load hooks.
 
     Same class of bug as _tensor_meta_attrs, one level up: e.g. the swizzle
     layout labels ``w13_swizzle_layout`` / ``w2_swizzle_layout`` (moe.py:1109),
     which are plain strings initialised to None at construction and only filled
     by process_weights_after_loading.
 
-    Restricted to str/bool deliberately.  Layout labels and format flags live in
-    those types; ints/floats on a module are construction-time config, identical
-    in both processes, so carrying them would only bloat the payload.
+    str/bool covers layout labels and format flags. Anything else the hook
+    produces has to be named in _PRODUCER_ONLY_ATTRS — see the note there for
+    why the type filter is not simply widened.
     """
-    return {
+    out = {
         k: v
         for k, v in mod.__dict__.items()
         if not k.startswith("_")
         and k != "training"
         and isinstance(v, (str, bool))
     }
-
-
-def _expert_placement(model: nn.Module) -> dict:
-    """Per-MoE-module (ep_size, ep_rank, local_num_experts), for cross-checking.
-
-    Under asymmetric rapidserve the two processes reach the same expert sharding
-    by different routes — prefill via plain TP (`tp_size=8, tp_rank`), decode via
-    the DP-attention flatten (`flatten_tp_across_dp`, moe.py:133-139, giving
-    `tp_size = dp*tp, tp_rank = dp_rank`). Both land on ep_size=8 and
-    ep_rank=<this GPU>, and `determine_expert_map` is a pure function of those,
-    so rank k holds the same experts in both.
-
-    That agreement is load-bearing and NOT implied by tensor shape: every rank
-    holds `global_num_experts // ep_size` experts, so a divergent mapping (a
-    different flatten, a different DP-rank-to-GPU binding, EPLB rearranging one
-    process's placement but not the other's) produces identically-shaped tensors
-    holding the WRONG experts. Aliasing those is silent numerical corruption, so
-    the consumer verifies rather than assumes.
-    """
-    out: dict[str, tuple] = {}
-    for name, mod in model.named_modules():
-        if hasattr(mod, "ep_size") and hasattr(mod, "ep_rank"):
-            out[name] = (
-                int(mod.ep_size),
-                int(mod.ep_rank),
-                int(getattr(mod, "local_num_experts", -1)),
-            )
+    for k in _PRODUCER_ONLY_ATTRS:
+        if k in mod.__dict__:
+            out[k] = mod.__dict__[k]
     return out
 
 
-def export_model_weight_handles(model: nn.Module) -> dict:
+def _moe_placement(mod: nn.Module) -> tuple | None:
+    """(ep_size, ep_rank, local_num_experts, tp_size, tp_rank) for a MoE module.
+
+    One definition shared by producer and consumer on purpose: the two sides
+    compare these tuples, so a field added to one and not the other would make
+    the guard silently stop matching.
+    """
+    if not (hasattr(mod, "ep_size") and hasattr(mod, "ep_rank")):
+        return None
+    return (
+        int(mod.ep_size),
+        int(mod.ep_rank),
+        int(getattr(mod, "local_num_experts", -1)),
+        int(getattr(mod, "tp_size", -1)),
+        int(getattr(mod, "tp_rank", -1)),
+    )
+
+
+def _expert_placement(model: nn.Module) -> dict:
+    """Per-MoE-module sharding identity, for cross-checking across the alias.
+
+    Under asymmetric rapidserve the two processes reach the same MoE sharding by
+    different routes — prefill via plain TP (`tp_size=8, tp_rank=rank`), decode
+    via the DP-attention flatten (`flatten_tp_across_dp`, moe.py:133-139, giving
+    `tp_size = dp*tp, tp_rank = dp_rank`). Both land on the same split with the
+    same rank-to-GPU binding, so rank k holds the same slice in both.
+
+    WHICH split that is depends on `--enable-expert-parallel` (off by default,
+    config.py:1328). With it OFF the experts are TENSOR-sharded on the
+    intermediate dim (moe.py:2558) and ep_size is 1 on both sides; with it ON
+    the weights are sharded by whole expert and tp_size is 1 (moe.py:2727). Both
+    pairs are captured because checking only the expert fields would be vacuous
+    in the default configuration — (1, 0, N) on both sides no matter what.
+
+    That agreement is load-bearing and NOT implied by tensor shape: every rank
+    holds the same-shaped slice either way, so a divergent mapping (a different
+    flatten, a different DP-rank-to-GPU binding, EPLB rearranging one process's
+    placement but not the other's) produces identically-shaped tensors holding
+    the WRONG data. Aliasing those is silent numerical corruption, so the
+    consumer verifies rather than assumes.
+    """
+    out: dict[str, tuple] = {}
+    for name, mod in model.named_modules():
+        placement = _moe_placement(mod)
+        if placement is not None:
+            out[name] = placement
+    return out
+
+
+def export_model_weight_handles(
+    model: nn.Module, twins=None, retain: list | None = None
+) -> dict:
     """Export all model parameter tensors as CUDA IPC handles.
 
     Also exports MLA weight-absorbed tensors (W_K/W_K_scale/W_V/W_V_scale)
@@ -218,7 +267,7 @@ def export_model_weight_handles(model: nn.Module) -> dict:
     # aliased registrations and the other stays on meta.
     for name, param in model.named_parameters(remove_duplicate=False):
         key = f"__param__{name}"
-        handles[key] = _export_tensor(param.data)
+        handles[key] = _export_tensor(param.data, retain)
         # Read attrs off the Parameter object, not param.data — process_weights
         # stamps the Parameter (e.g. `layer.w13_weight.is_shuffled = True`).
         attrs = _tensor_meta_attrs(param)
@@ -228,7 +277,7 @@ def export_model_weight_handles(model: nn.Module) -> dict:
     for name, buf in model.named_buffers():
         if isinstance(buf, torch.Tensor) and buf.is_cuda and buf.numel() > 0:
             key = f"__buf__{name}"
-            handles[key] = _export_tensor(buf)
+            handles[key] = _export_tensor(buf, retain)
             attrs = _tensor_meta_attrs(buf)
             if attrs:
                 tensor_attrs[key] = attrs
@@ -243,7 +292,7 @@ def export_model_weight_handles(model: nn.Module) -> dict:
                 and val.numel() > 0
             ):
                 key = f"{mod_name}.{attr}" if mod_name else attr
-                handles[f"__attr__{key}"] = _export_tensor(val)
+                handles[f"__attr__{key}"] = _export_tensor(val, retain)
                 attrs = _tensor_meta_attrs(val)
                 if attrs:
                     tensor_attrs[f"__attr__{key}"] = attrs
@@ -251,14 +300,32 @@ def export_model_weight_handles(model: nn.Module) -> dict:
         if mattrs:
             module_attrs[mod_name] = mattrs
 
+    # Asymmetric rapidserve: overlay the TP=1 twins. Same names, so the consumer
+    # needs no special case — it just receives a full matrix where the producer's
+    # own parameter is a shard. Done last so a twin always wins.
+    n_overlaid = 0
+    if twins is not None:
+        for name, tensor in twins.overrides().items():
+            key = f"__param__{name}"
+            handles[key] = _export_tensor(tensor, retain)
+            attrs = _tensor_meta_attrs(tensor)
+            if attrs:
+                tensor_attrs[key] = attrs
+            n_overlaid += 1
+
     handles[_META_KEY] = {
         "tensor_attrs": tensor_attrs,
         "module_attrs": module_attrs,
+        # Authoritative, unlike `module_attrs`: these come from the TP=1 twins,
+        # so they must OVERRIDE whatever the consumer set at construction rather
+        # than only filling gaps. See DecodeTwins.module_attr_overrides.
+        "twin_module_attrs": (twins.module_attr_overrides() if twins else {}),
         "expert_placement": _expert_placement(model),
     }
     logger.info(
         f"[WT-EXPORT] {len(handles) - 1} tensors, "
-        f"{len(tensor_attrs)} with attrs, {len(module_attrs)} modules with attrs"
+        f"{len(tensor_attrs)} with attrs, {len(module_attrs)} modules with attrs, "
+        f"{n_overlaid} overlaid from TP=1 twins"
     )
     return handles
 
@@ -278,16 +345,12 @@ def _assert_expert_placement_matches(model: nn.Module, producer: dict) -> None:
         return  # producer has no MoE modules, or predates the sidecar field
     bad = []
     for name, mod in model.named_modules():
-        if not (hasattr(mod, "ep_size") and hasattr(mod, "ep_rank")):
+        mine = _moe_placement(mod)
+        if mine is None:
             continue
         theirs = producer.get(name)
         if theirs is None:
             continue
-        mine = (
-            int(mod.ep_size),
-            int(mod.ep_rank),
-            int(getattr(mod, "local_num_experts", -1)),
-        )
         if tuple(theirs) != mine:
             bad.append(f"{name}: producer={tuple(theirs)} consumer={mine}")
     if bad:
@@ -295,14 +358,13 @@ def _assert_expert_placement_matches(model: nn.Module, producer: dict) -> None:
             f"{len(bad)} MoE module(s) shard experts differently between the "
             f"prefill and decode processes, so their weights cannot be aliased "
             f"(the tensors are the same SHAPE but hold different experts). "
-            f"Expected (ep_size, ep_rank, local_num_experts) to agree:\n  "
+            f"Expected (ep_size, ep_rank, local_num_experts, tp_size, tp_rank) "
+            f"to agree:\n  "
             + "\n  ".join(bad[:10])
         )
 
 
-def import_model_weights(
-    model: nn.Module, handles: dict, shape_aware: bool = False
-) -> None:
+def import_model_weights(model: nn.Module, handles: dict) -> None:
     """Replace model parameters with views into another process's GPU allocation.
 
     Also restores MLA absorbed tensors exported by export_model_weight_handles.
@@ -313,21 +375,14 @@ def import_model_weights(
     are allocated.  The decode process's original weight tensors are freed when
     their reference counts drop to zero.
 
-    `shape_aware` is for asymmetric rapidserve (prefill TP=N, decode TP=1).
-    There the two processes disagree about attention weights — prefill holds
-    Column/RowParallel shards, decode needs full matrices — so those tensors
-    cannot be aliased at all and decode loads them itself. Aliasing is then
-    applied only where the producer's shape MATCHES the consumer's own, which
-    is exactly the replicated tensors and the EP-aligned expert weights (where
-    essentially all of the model's bytes live). Mismatched entries are skipped
-    and the consumer keeps the copy it loaded.
+    Under asymmetric rapidserve the producer exports TP=1 twins for the tensors
+    whose shape differs (decode_twins.py), so every entry aliases and the
+    consumer allocates nothing.
     """
-    _import_model_weights_impl(model, handles, shape_aware=shape_aware)
+    _import_model_weights_impl(model, handles)
 
 
-def _import_model_weights_impl(
-    model: nn.Module, handles: dict, shape_aware: bool
-) -> None:
+def _import_model_weights_impl(model: nn.Module, handles: dict) -> None:
     modules = dict(model.named_modules())
     # remove_duplicate=False to match the export and to materialize every
     # registration of a shared Parameter (see export note).
@@ -338,59 +393,21 @@ def _import_model_weights_impl(
     tensor_attrs = sidecar.get("tensor_attrs", {})
     module_attrs = sidecar.get("module_attrs", {})
 
-    if shape_aware:
-        # MoE aliasing rests on both processes deriving the SAME expert
-        # placement (see _expert_placement). Shape equality cannot detect a
-        # divergence — every rank holds global//ep_size experts either way — so
-        # check it explicitly before trusting a single alias.
-        _assert_expert_placement_matches(model, sidecar.get("expert_placement", {}))
+    # MoE aliasing rests on both processes deriving the SAME expert placement
+    # (see _expert_placement). Shape equality cannot detect a divergence — every
+    # rank holds global//ep_size experts either way — so check it explicitly
+    # before trusting a single alias. No-op when the producer has no MoE.
+    _assert_expert_placement_matches(model, sidecar.get("expert_placement", {}))
 
     def _restore_attrs(obj, key):
         """Re-stamp the producer's non-tensor attributes onto the rebuilt object."""
         for k, v in tensor_attrs.get(key, {}).items():
             setattr(obj, k, v)
 
-    n_aliased = 0
-    kept_local: list[str] = []
-
-    def _consumer_shape(key: str):
-        """The consumer's own shape for `key`, or None if it has no counterpart.
-
-        Under `shape_aware` a missing counterpart means the producer created the
-        tensor and the consumer did not (post-load-hook outputs), so there is
-        nothing to compare against and aliasing proceeds as normal.
-        """
-        for prefix in ("__param__", "__buf__"):
-            if key.startswith(prefix):
-                name = key[len(prefix) :]
-                # Explicit None checks: `a or b` on a multi-element tensor calls
-                # __bool__ and raises.
-                t = params.get(name)
-                if t is None:
-                    t = buffers.get(name)
-                return None if t is None else tuple(t.shape)
-        return None
-
-    def _materialize(key: str, meta: dict) -> torch.Tensor | None:
-        """The imported view for `key`, or None to keep the consumer's own copy."""
-        nonlocal n_aliased
-        if shape_aware:
-            want = _consumer_shape(key)
-            if want is not None and want != tuple(meta["shape"]):
-                # Asymmetric topology: this is a TP-sharded attention weight.
-                # Prefill's shard and decode's full matrix are different tensors,
-                # not different views of one — decode keeps what it loaded.
-                kept_local.append(key)
-                return None
-        n_aliased += 1
-        return _import_tensor(meta)
-
     for key, meta in handles.items():
         if key == _META_KEY:
             continue
-        t = _materialize(key, meta)
-        if t is None:
-            continue
+        t = _import_tensor(meta)
         if key.startswith("__param__"):
             # Rebuild the Parameter around the imported CUDA view (set_data fails
             # for meta->cuda). Create the slot if the consumer's meta model lacks
@@ -439,24 +456,54 @@ def _import_model_weights_impl(
     # Module-level non-tensor metadata (e.g. swizzle layout labels). Fill only
     # what the consumer lacks — mirrors the buffer policy above. Never clobber a
     # value the consumer computed itself during construction.
+    # Authoritative, NOT fill-the-gaps. The consumer never runs
+    # process_weights_after_loading for any module, so it has no computed value
+    # to protect — only construction-time defaults. The old `is None` guard
+    # therefore restored nothing at all for the common case: is_output_padded
+    # starts as False (linear.py:508), and `False is not None`, so 1343 modules'
+    # worth of post-load state was sent and silently dropped every run.
     restored_mod_attrs = 0
     for mod_name, attrs in module_attrs.items():
         mod = modules.get(mod_name)
         if mod is None:
             continue
         for k, v in attrs.items():
-            if getattr(mod, k, None) is None:
-                setattr(mod, k, v)
-                restored_mod_attrs += 1
+            setattr(mod, k, v)
+            restored_mod_attrs += 1
+    # Twin attributes are authoritative: the consumer runs TP=1 and never ran
+    # the post-load hook, so its own values (e.g. is_output_padded=False from
+    # __init__) are stale, not a computed result to preserve.
+    twin_attrs = sidecar.get("twin_module_attrs", {})
+    forced = 0
+    for mod_name, attrs in twin_attrs.items():
+        mod = modules.get(mod_name)
+        if mod is None:
+            continue
+        for k, v in attrs.items():
+            setattr(mod, k, v)
+            forced += 1
     logger.info(
         f"[WT-IMPORT] restored {sum(len(a) for a in tensor_attrs.values())} tensor "
-        f"attrs and {restored_mod_attrs} module attrs from the producer"
+        f"attrs and {restored_mod_attrs} module attrs from the producer; "
+        f"forced {forced} attr(s) from {len(twin_attrs)} TP=1 twin(s)"
     )
-    if shape_aware:
+    # A post-load hook may DELETE a parameter on the producer — V4's attention
+    # dequants wo_a to BF16 and then `delattr(self.wo_a, "weight_scale")`
+    # (deepseek_v4.py:2453). The consumer built on meta and never ran that hook,
+    # so it still declares the parameter and nothing arrives to fill it. Drop the
+    # stale slot: leaving a meta tensor in named_parameters() trips every
+    # subsequent sweep over the model.
+    dropped = 0
+    for mod_name, mod in list(model.named_modules()):
+        for attr in [n for n, p in mod.named_parameters(recurse=False) if p.is_meta]:
+            full = f"{mod_name}.{attr}" if mod_name else attr
+            if f"__param__{full}" not in handles:
+                del mod._parameters[attr]
+                dropped += 1
+    if dropped:
         logger.info(
-            f"[WT-IMPORT] asymmetric: {n_aliased} tensors aliased into the "
-            f"producer's allocation, {len(kept_local)} kept local (TP-sharded on "
-            f"the producer, full-size here): {sorted(kept_local)[:8]}"
+            f"[WT-IMPORT] dropped {dropped} meta parameter(s) the producer "
+            f"deleted during post-load processing"
         )
 
     leftover = [n for n, p in model.named_parameters() if p.is_meta] + [

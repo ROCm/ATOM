@@ -320,10 +320,180 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             return None
         return np.asarray(targets) == self.model_runner.rank
 
+    def _disagg_dump_row_fn(self, batch: ScheduledBatch):
+        """`f(row) -> True if this rank must dump that row's KV writes`.
+
+        Always returns a callable so the caller needs no branch. Outside
+        asymmetric rapidserve prefill it answers False for everything and the
+        slot arithmetic is untouched.
+
+        Matches `prepare_block_tables`' convention on the two edge cases: no
+        target info at all (warmup / dummy batches) means own nothing, and a row
+        past the end of the ownership array is likewise not owned. Both err
+        toward dumping, which is the safe direction — a dumped write is lost KV
+        for a request this rank was not responsible for, whereas a wrongly
+        committed one corrupts another decode rank's live sequence.
+        """
+        if not self.disagg_kv_write_masked:
+            return lambda i: False
+        owned = self.disagg_owned_rows(batch)
+        if owned is None:
+            return lambda i: True
+        return lambda i: i >= len(owned) or not owned[i]
+
+    def disagg_mask_state_slots(self, batch: ScheduledBatch, slots, scheduled_bs: int):
+        """Send non-owned rows' per-request state slot to the sink.
+
+        The third pool, after block_tables and swa_block_tables: V4's compressor
+        keeps a per-request kv_state / score_state tail, and a prefill rank that
+        does not own a row must not write that tail into the row's live slot on
+        its own GPU — that slot belongs to whatever sequence its co-located
+        decode rank put there.
+
+        Safe to call unguarded: a no-op unless this is an asymmetric-rapidserve
+        prefill rank, so callers do not need to repeat the condition (and the
+        prefill call site at deepseek_v4_attn.py:3314 does not).
+
+        Unlike the two paged pools, every dumped row shares ONE sink slot. That
+        is sound only because a single-pass prefill starts at start_pos == 0,
+        where state READS are masked — nothing reads back what these rows write,
+        so they cannot observe each other. Under chunked prefill a later chunk
+        would read the tail, dumped rows would alias, and this needs a per-row
+        scratch region like the paged pools have (block_manager.dump_block_count)
+        — which in turn needs the per-request pool widened past max_num_seqs.
+        """
+        if not self.disagg_kv_write_masked:
+            return slots
+        from atom.model_engine.block_manager import DUMP_INDEX
+
+        dump_row = self._disagg_dump_row_fn(batch)
+        out = np.array(slots, copy=True)
+        for i in range(min(scheduled_bs, len(out))):
+            if dump_row(i):
+                out[i] = DUMP_INDEX
+        return out
+
+    def disagg_effective_block_tables(self, batch: ScheduledBatch):
+        """Per-row block tables with non-owned rows moved into the scratch region.
+
+        Returns None when masking is off, so callers fall through to
+        `batch.block_tables` unchanged.
+
+        Every dumped row gets its OWN scratch blocks rather than all of them
+        collapsing onto DUMP_INDEX. That is load-bearing: V4's absorbed prefill
+        reads the KV back out of the paged cache during attention
+        (attention_mla.py:1067), so a row's KV has to survive, undisturbed by
+        its neighbours, from the fused write until the read. Sharing one block
+        made every dumped row see whichever token wrote last and poisoned the
+        TP all-reduce for the owning rank too.
+
+        Deliberately a pure function of the batch, recomputed by each caller
+        instead of cached: the write side (`slot_mapping`, built in
+        prepare_prefill) and the read side (`kv_indices`, generated from the
+        block-table buffer in prepare_block_tables) MUST agree, and the surest
+        way to keep two callers in step is to make the mapping deterministic
+        rather than shared mutable state.
+        """
+        if not self.disagg_kv_write_masked:
+            return None
+        out = self._disagg_scratch_tables(batch, batch.block_tables)
+        self._log_disagg_mask(batch, out)
+        return out
+
+    def _log_disagg_mask(self, batch: ScheduledBatch, masked) -> None:
+        """One line per early prefill batch showing what the mask actually did.
+
+        Throttled to the first few batches: this exists because the masking was
+        reasoned about at length before anyone confirmed it ran, and it turned
+        out V4 prefill called a different populator entirely. Cheap evidence
+        beats another round of inference from the source.
+        """
+        # Budget the first few batches AND, separately, the first few MIXED
+        # batches. Single-row batches say nothing about the case the per-row
+        # scratch region exists for — rows with different target ranks sharing
+        # one batch — and in practice the early batches are all single-row, so
+        # one shared counter hides exactly the interesting case.
+        mixed = len(set(getattr(batch, "target_ranks", None) or [0])) > 1
+        key = "_disagg_mask_logged_mixed" if mixed else "_disagg_mask_logged"
+        n = getattr(self, key, 0)
+        if n >= 3:
+            return
+        setattr(self, key, n + 1)
+        rank = self.model_runner.rank
+        targets = list(getattr(batch, "target_ranks", None) or [])
+        owned = sum(1 for i in range(len(masked)) if masked[i] is batch.block_tables[i])
+        logger.info(
+            "[DISAGG-MASK] prefill rank %d: %d row(s), target_ranks=%s, "
+            "owned=%d dumped=%d",
+            rank,
+            len(masked),
+            targets[:16],
+            owned,
+            len(masked) - owned,
+        )
+
+    def _disagg_sink_tables(self, batch: ScheduledBatch, tables):
+        """Point every block of a non-owned row at DUMP_INDEX.
+
+        For pools whose dumped writes are never read back, so rows may alias
+        and one reserved block suffices. Use _disagg_scratch_tables instead
+        wherever prefill reads its own writes within the forward.
+        """
+        if not self.disagg_kv_write_masked:
+            return tables
+        from atom.model_engine.block_manager import DUMP_INDEX
+
+        dump_row = self._disagg_dump_row_fn(batch)
+        return [
+            [DUMP_INDEX] * len(t) if dump_row(i) else t for i, t in enumerate(tables)
+        ]
+
+    def _disagg_scratch_tables(self, batch: ScheduledBatch, tables):
+        """Rewrite non-owned rows of `tables` onto fresh scratch blocks.
+
+        Shared by the compressed pool and the SWA pool. They are separate
+        physical pools that each reserve the same leading region, so both can
+        allocate from DUMP_INDEX independently.
+        """
+        if not self.disagg_kv_write_masked:
+            return tables
+        from atom.model_engine.block_manager import DUMP_INDEX, dump_block_count
+
+        dump_row = self._disagg_dump_row_fn(batch)
+        budget = dump_block_count(self.model_runner.config)
+        out, cursor = [], DUMP_INDEX
+        for i, table in enumerate(tables):
+            if not dump_row(i):
+                out.append(table)
+                continue
+            need = len(table)
+            if cursor + need > DUMP_INDEX + budget:
+                # Cannot happen for a batch within max_num_batched_tokens, which
+                # is what dump_block_count is sized from. Wrapping the cursor
+                # would silently reintroduce the aliasing this exists to stop,
+                # so say so instead.
+                raise RuntimeError(
+                    f"prefill KV scratch exhausted at row {i}: needed "
+                    f"{need} more blocks past {cursor}, region is {budget}. "
+                    f"dump_block_count is out of step with the scheduler's "
+                    f"batch bound."
+                )
+            out.append(list(range(cursor, cursor + need)))
+            cursor += need
+        return out
+
     def prepare_block_tables(self, batch: ScheduledBatch):
         var = self.model_runner.forward_vars
         block_tables = var["block_tables"].np
-        for i, block_table in enumerate(batch.block_tables):
+        # Non-owned rows are redirected to scratch HERE, at fill time, so the
+        # read side (kv_indices is generated from this buffer —
+        # aiter_mla.py:762) sees exactly the blocks the write side used. The old
+        # code filled real ids and then overwrote whole rows with DUMP_INDEX
+        # below, which pointed every logical block of a dumped row at one
+        # physical block and made prefill attention read garbage.
+        eff = self.disagg_effective_block_tables(batch)
+        tables = batch.block_tables if eff is None else eff
+        for i, block_table in enumerate(tables):
             block_tables[i] = 0
             block_tables[i, : len(block_table)] = block_table
         # paged-SWA: fill the parallel SWA block table in lockstep (decode
@@ -333,6 +503,17 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         swa_tables = getattr(batch, "swa_block_tables", None)
         if swa_buf is not None and swa_tables is not None:
             swa_np = swa_buf.np
+            # Collapse, not a scratch REGION — the opposite of the compressed
+            # pool above, and the SWA pool only reserves one block to match
+            # (block_manager.py, SlidingWindowPool construction). Handing SWA a
+            # region here would index blocks 1..n_dump, which in that pool are
+            # LIVE. Safe to alias because prefill never reads back what it
+            # writes here: its own window comes from the per-forward KV tensor,
+            # and only prefix positions page the pool
+            # (paged_prefill_indices.py:116-119, zero when chunk_start == 0).
+            # Decode DOES read these blocks — hence masking rather than
+            # skipping, so the owning rank's write still lands.
+            swa_tables = self._disagg_sink_tables(batch, swa_tables)
             for i, swa_table in enumerate(swa_tables):
                 swa_np[i] = 0
                 if len(swa_table):
@@ -340,18 +521,6 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
                     # out of window and never indexed by the SWA kernels, but a
                     # raw -1 phys would compute a negative paged offset → OOB.
                     swa_np[i, : len(swa_table)] = [max(0, b) for b in swa_table]
-
-        if self.disagg_kv_write_masked:
-            from atom.model_engine.block_manager import DUMP_INDEX
-
-            owned = self.disagg_owned_rows(batch)
-            n = len(batch.block_tables)
-            # No target info (warmup / dummy batches) => own nothing, so the
-            # writes cannot land in a live pool.
-            masked = slice(0, n) if owned is None else ~owned[:n]
-            block_tables[:n][masked] = DUMP_INDEX
-            if swa_buf is not None and swa_tables is not None:
-                swa_buf.np[: len(swa_tables)][masked] = DUMP_INDEX
 
     def _mrope_cpu_view(self, num_tokens: int) -> np.ndarray:
         return (
@@ -429,6 +598,16 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         max_seqlen_k = 0
         slot_mapping = []
         has_cached = False
+        # Asymmetric rapidserve: redirect the KV writes of rows this prefill
+        # rank does not own. `prepare_block_tables` masks the paged block table,
+        # but that is the READ side and it is published only when has_cached
+        # (see vars_used below) — the prefill KV WRITE is addressed by
+        # slot_mapping, which is built here from the raw `batch.block_tables`
+        # lists. Without this, every prefill TP rank commits every row's KV into
+        # its own GPU's cache, at block ids that belong to a DIFFERENT decode
+        # rank's sequences. See CommonAttentionBuilder.disagg_kv_write_masked.
+        eff = self.disagg_effective_block_tables(batch)
+        row_tables = batch.block_tables if eff is None else eff
         # seqs = list(batch.seqs.values())
         # seqs = seqs[:bs]
         for i in range(bs):
@@ -445,7 +624,13 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
             if not batch.block_tables:
                 continue
-            block_table = batch.block_tables[i]
+            # Substituting the table (rather than emitting -1 slots) keeps the
+            # write kernel on its normal path: the fused MLA kernels that
+            # consume slot_mapping also produce q_out, and they early-return on
+            # slot=-1 unless compute_all_q_rope is set (attention_mla.py
+            # :1573-1592). Dropping q_out for these rows would corrupt the TP
+            # all-reduced attention output for every rank.
+            block_table = row_tables[i]
             block_size = self.model_runner.block_size
             if self.dcp_world_size > 1:
                 virtual_block_size = block_size * self.dcp_world_size

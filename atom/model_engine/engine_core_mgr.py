@@ -922,6 +922,25 @@ class DisaggCoreManager(CoreManager):
         # scheduler, BlockManager and KV pool, so it needs its own EngineCore
         # process, exactly as CoreManager.__init__ does for non-disagg DPA.
         n_decode = config.tensor_parallel_size if asymmetric else 1
+        if asymmetric and config.enable_prefix_caching:
+            # Incompatible, and silently so — which is why this disables rather
+            # than trusting the flag. On a cache hit prefill skips the cached
+            # tokens and reads their KV back from the pool, but that prefix
+            # exists only on the GPU of the rank that ORIGINALLY served the
+            # sequence. Every other prefill TP rank reads its own GPU at those
+            # block ids and gets an unrelated sequence (or, once masked, the
+            # scratch region). MLA shards heads across TP and all-reduces the
+            # output, so one rank's garbage prefix corrupts the result for the
+            # owning rank too. No amount of write-side masking fixes this: the
+            # data is simply not on those GPUs.
+            logger.warning(
+                "Asymmetric rapidserve: disabling prefix caching. A cache hit "
+                "makes prefill read a prefix that only exists on the owning "
+                "rank's GPU, and the TP all-reduce spreads the resulting "
+                "garbage to every rank. Pass --no-enable-prefix-caching to "
+                "silence this."
+            )
+            config.enable_prefix_caching = False
         if asymmetric:
             logger.info(
                 "Asymmetric rapidserve: prefill TP=%d (1 process, %d workers), "
@@ -1008,11 +1027,16 @@ class DisaggCoreManager(CoreManager):
             dc.disagg_num_decode_ranks = n_decode
             if asymmetric:
                 # One attention rank per GPU, N of them: the DP-attention shape.
-                # tp_size=1 with dp_size=N keeps `dp*tp > 1`, so expert
-                # parallelism stays ON (moe.py:151) and decode's ep_size matches
-                # prefill's — which is what lets the MoE weights, where nearly
-                # all the bytes live, stay IPC-aliased. Only the TP=1 attention
-                # weights differ in shape and are loaded locally.
+                # tp_size=1 with dp_size=N keeps `dp*tp > 1`, and with
+                # enable_dp_attention the MoE flattens DP into TP
+                # (flatten_tp_across_dp, moe.py:133-139) to `tp_size = dp*tp,
+                # tp_rank = dp_rank`. That is the SAME 8-way split prefill gets
+                # from plain TP, with the same rank-to-GPU binding, which is what
+                # lets the MoE weights — nearly all the bytes — stay IPC-aliased.
+                # Whether that split is by tensor or by whole expert depends on
+                # --enable-expert-parallel (off by default); either way both
+                # sides derive it identically. Only the TP=1 attention weights
+                # differ in shape, and prefill builds those as twins.
                 dc.tensor_parallel_size = 1
                 dc.parallel_config.data_parallel_size = n_decode
                 dc.parallel_config.data_parallel_rank = k
