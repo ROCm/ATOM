@@ -35,16 +35,30 @@ python3 -m atom.entrypoints.openai_server \
 
 ## Server — DP attention (concurrency 48–256)
 
-Same, plus:
-
 ```bash
+export AITER_BF16_FP8_MOE_BOUND=0
+export ATOM_MOE_GU_ITLV=1
 export ATOM_DP_SESSION_AFFINITY=1
 export ATOM_DP_LB_REQ_EQUIV=512
 export ATOM_ENABLE_PREFILL_DELAYER=1
 export ATOM_PREFILL_DECODE_INTERVAL=10
 
-#   ... --enable-dp-attention
+python3 -m atom.entrypoints.openai_server \
+  --model $MODEL_PATH --server-port $PORT \
+  -tp 8 --kv_cache_dtype fp8 --index_cache_dtype fp4 \
+  --method mtp --num-speculative-tokens 3 \
+  --spec-decode-acceptance-rate 0.4966666667 \
+  --enable_prefix_caching \
+  --gpu-memory-utilization 0.9 \
+  --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384 \
+  --state-checkpoint-interval-tokens 8192 \
+  --level 3 --cudagraph-mode FULL \
+  --enable-dp-attention \
+  --max-num-seqs $(( CONC * 2 ))
 ```
+
+Against the TP command this adds `--enable-dp-attention` and the four
+`ATOM_DP_*` variables; everything else is identical.
 
 `ATOM_DP_SESSION_AFFINITY` is not optional here. Without it a conversation's
 turns land on different DP ranks, so the prefix KV written by one turn sits on
