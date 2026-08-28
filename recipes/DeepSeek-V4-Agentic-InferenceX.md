@@ -10,11 +10,17 @@ AIPerf itself echoed as `CLI Command:` in the run below.
 - Scenario: `inferencex-agentx-mvp`, dataset `semianalysis_cc_traces_weka_062126`
 - Reference run: ATOM Benchmark [run 33074134043], 3600 s per cell, 9/9 green
 
-Two variants: TP-only for the low-concurrency band, and DP-attention for the
-high one. They differ by `--enable-dp-attention` plus four routing env vars,
-and nothing else.
+Two variants, sweeping nine concurrencies between them:
 
-## Server — TP (concurrency 1–48)
+| variant | concurrency |
+|---|---|
+| TP | 1, 2, 8, 16 |
+| DP attention | 48, 64, 96, 128, 256 |
+
+They differ by `--enable-dp-attention` plus four routing env vars, and nothing
+else. The bands are contiguous, not overlapping: DP takes over from 48 up.
+
+## Server — TP (concurrency 1, 2, 8, 16)
 
 ```bash
 export AITER_BF16_FP8_MOE_BOUND=0
@@ -34,7 +40,7 @@ python3 -m atom.entrypoints.openai_server \
   --max-num-seqs $(( CONC * 2 ))
 ```
 
-## Server — DP attention (concurrency 48–256)
+## Server — DP attention (concurrency 48, 64, 96, 128, 256)
 
 ```bash
 export AITER_BF16_FP8_MOE_BOUND=0
@@ -139,8 +145,11 @@ num_gpus`, and `1 / p90(ITL)`.
 | DPA | 128 | 30,709 | 16.3 | 61.5 ms | 10.9 s | 93.4% |
 | DPA | 256 | 44,722 | 10.2 | 97.6 ms | 13.4 s | 93.4% |
 
-A c=32 cell also ran but its replay stopped at 834 s rather than 3600 s, so it
-is left out — the rates were in line, the sample was not.
+Measured before the bands were set to the table above, so it carries a TP c=48
+row the sweep no longer produces — kept because it is the only head-to-head
+against DP c=64 we have. A c=32 cell also ran but its replay stopped at 834 s
+rather than 3600 s, so it is left out: the rates were in line, the sample was
+not.
 
 Two things to read carefully in that table. `tok/s/chip` counts input tokens,
 and 93–96% of them are prefix-cache hits, so it is dominated by cache reads
