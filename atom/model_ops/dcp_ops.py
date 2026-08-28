@@ -980,7 +980,7 @@ def dcp_merge_candidates(recv: torch.Tensor, out: torch.Tensor) -> None:
     the model runs. They used to keep a hand-written mirror of this block, and
     the two silently diverged when the exchange was moved between modules.
     """
-    from aiter import top_k_per_row_decode
+    from aiter import flydsl_top_k_per_row_decode
 
     world, _, num_rows, k_loc = recv.shape
     n_cand = world * k_loc
@@ -993,7 +993,7 @@ def dcp_merge_candidates(recv: torch.Tensor, out: torch.Tensor) -> None:
     gathered_sc = recv[:, 0].permute(1, 0, 2).reshape(num_rows, n_cand).contiguous()
     cand_idx = torch.empty(num_rows, topk, dtype=torch.int32, device=recv.device)
     cand_lens = torch.full((num_rows,), n_cand, dtype=torch.int32, device=recv.device)
-    top_k_per_row_decode(
+    flydsl_top_k_per_row_decode(
         gathered_sc.view(torch.float32),
         1,
         cand_lens,
@@ -1042,7 +1042,7 @@ def dcp_decode_candidate_exchange(
     """
     # Imported here, not at module scope: this module must stay importable
     # without aiter so the CPU-only tests can exercise the merge kernels.
-    from aiter import top_k_per_row_decode
+    from aiter import flydsl_top_k_per_row_decode
     from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 
     dcp_world_size = get_dcp_world_size()
@@ -1077,7 +1077,7 @@ def dcp_decode_candidate_exchange(
     local_idx = torch.empty(
         num_rows, k_loc, dtype=torch.int32, device=local_logits.device
     )
-    top_k_per_row_decode(
+    flydsl_top_k_per_row_decode(
         local_logits,
         next_n,
         local_ctx,
