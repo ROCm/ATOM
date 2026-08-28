@@ -150,6 +150,7 @@ case "${RUNNER_NAME:-}" in
     ;;
   gbt350-odcdh1-b10-1)
     USES_SPUR_CONTROLLER=0
+    NODE_LIST=""
     ;;
 esac
 
