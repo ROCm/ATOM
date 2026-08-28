@@ -5051,3 +5051,36 @@ def test_every_member_the_scheduler_reads_is_reachable_through_the_shell():
         "Scheduler reads these off `kv_connector`, but the delegating shell "
         f"does not expose them, so each silently takes its default: {missing}"
     )
+
+
+def test_the_shells_no_impl_fallbacks_match_what_the_caller_unpacks():
+    """Existence is not enough -- a fallback of the wrong SHAPE is worse.
+
+    The sweep above catches a member the shell never defines. It does not catch
+    a member the shell defines with a fallback the caller cannot consume, which
+    is how `take_state_reports` returned three empty sets to
+    `indexed, failed = take()` and took the engine worker down mid-run: every
+    surviving TP rank then blocked forever in the next collective, so the server
+    accepted requests and returned nothing.
+
+    Drive the shell with an `_impl` that defines nothing, and hold each
+    fallback against the contract its caller relies on.
+    """
+    from types import SimpleNamespace
+
+    from atom.kv_transfer.offload.connector import LMCacheOffloadConnectorScheduler
+
+    shell = object.__new__(LMCacheOffloadConnectorScheduler)
+    shell._impl = SimpleNamespace()
+
+    indexed, failed = shell.take_state_reports()  # `indexed, failed = take()`
+    assert (indexed, failed) == (set(), set())
+
+    assert shell.enqueue_state_stores([]) is False  # `bool(enqueue(stores))`
+    assert shell.enqueue_state_loads([]) is False
+    # `int(getattr(..., "chunk_size", 0) or 0)`
+    assert shell.chunk_size is None or isinstance(shell.chunk_size, int)
+    assert shell.should_park_partial_prefill_for_load(None) is False
+    assert shell.load_finished(None) is True
+    # Unchanged, so a connector with no opinion does not shrink the chunk.
+    assert shell.adjust_prefill_chunk_after_alloc(None, 7) == 7

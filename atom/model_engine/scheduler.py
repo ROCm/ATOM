@@ -464,15 +464,17 @@ class CacheStats:
         """Reuse the lmcache CPU offload tier served, as a share of all reuse.
 
         Disjoint from the HBM walk on purpose: `total_offload_tokens` counts
-        reuse that sat *above* the paged pool (see `update`), so it is exactly
-        the reuse that becomes recompute the moment the tier is switched off.
-        Paired with `paged_hit_rate` (the HBM tier's share) it answers the
-        question the pipeline rates cannot -- of the reuse we served, how much
-        came from HBM vs from lmcache -- which is the whole case for the tier
-        on a given workload. For K3 the two are cleanly separable: KV prefixes
-        live in HBM (paged) while the recurrent-state checkpoints live in the
-        CPU tier (offload), and when the joint boundary reports state_hbm=0 the
-        entire state-hit is lmcache-served.
+        reuse claimed *above* what the walk could offer (see `update`), so it is
+        exactly the reuse that becomes recompute the moment the tier is switched
+        off -- the whole case for the tier on a given workload, in one number.
+
+        **Pairs with `hit_rate`, not with `paged_hit_rate`.** Both of those read
+        as "the HBM number" and only `hit_rate` is a served quantity:
+        `paged_hit_rate`'s numerator is `compressed`, how far the prefix walk
+        reached *before* the state gates cut it. `cached + offload ==
+        num_cached <= reusable` by construction, so `hit_rate` and this
+        partition the served reuse; `compressed + offload` does not and can
+        exceed the denominator.
         """
         return self._rate(self.total_offload_tokens, self.total_reusable_tokens)
 
@@ -611,15 +613,28 @@ class CacheStats:
         # the reuse that reverts to recompute when the tier is switched off --
         # i.e. the value of running lmcache on this workload, in one number.
         # Logged only when a tier is attached; the no-connector baseline has
-        # total_offload_tokens==0 and its tier split is trivially HBM=paged,
+        # total_offload_tokens==0 and its tier split is trivially HBM=all,
         # lmcache=0.
+        #
+        # The HBM half is `hit_rate` (`cached`), NOT `paged_hit_rate`
+        # (`compressed`). Both read as "the HBM number" and only one of them is
+        # a *served* quantity: `compressed` is how far the prefix walk reached
+        # before the state gates cut it, so it is reach, not reuse anybody got.
+        # Pairing it against `offload` mixes the two and the halves stop
+        # partitioning -- on K3's ordinary anchor-only shape (walk reaches 8
+        # blocks, the only resumable rung is at 3, the joint boundary lands at
+        # 10) it prints 80% + 70% = 150% of a denominator that is the ceiling.
+        # `cached + offload == num_cached <= reusable` by construction, so these
+        # two do partition, and `combined` is exactly the end-to-end rate.
         if self.total_offload_tokens:
+            served = self.total_cached_tokens + self.total_offload_tokens
             logger.info(
                 "[Cache Tiers] "
-                f"HBM-served (KV prefix resident): {paged:.2%} "
-                f"({self.total_compressed_tokens}/{self.total_reusable_tokens}), "
+                f"HBM-served (KV prefix resident): {self.hit_rate:.2%} "
+                f"({self.total_cached_tokens}/{self.total_reusable_tokens}), "
                 f"lmcache-served (CPU tier): {self.lmcache_hit_rate:.2%} "
-                f"({self.total_offload_tokens}/{self.total_reusable_tokens})"
+                f"({self.total_offload_tokens}/{self.total_reusable_tokens}), "
+                f"combined: {self._rate(served, self.total_reusable_tokens):.2%}"
             )
 
     @staticmethod

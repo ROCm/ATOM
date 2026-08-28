@@ -1502,3 +1502,88 @@ class TestStalledOffloadSaveReclaim:
 
         src = inspect.getsource(sched_mod.Scheduler._update_from_kv_xfer_finished)
         assert "not found in deferred_free_blocks" not in src
+
+
+class TestTheTierSplitPartitionsServedReuse:
+    """`[Cache Tiers]` exists to answer "what does the CPU tier buy", so its two
+    halves have to be two halves of one thing.
+
+    `cached` and `offload` are that: `cached` is what the HBM walk actually
+    handed over, `offload` is what the tier added on top, and they sum to
+    `num_cached`. `compressed` is NOT -- it is how far the walk reached before
+    the state gates cut it, so it counts reuse nobody got.
+    """
+
+    @staticmethod
+    def stats(**kw):
+        from atom.model_engine.scheduler import CacheStats
+
+        s = CacheStats()
+        s.update(**kw)
+        return s
+
+    def test_the_two_halves_sum_to_the_end_to_end_rate(self):
+        s = self.stats(
+            num_cached_tokens=300,
+            num_full_tokens=1200,
+            num_compressed_tokens=800,
+            num_wanted_tokens=300,
+            num_reusable_tokens=1000,
+            num_offload_tokens=700,
+        )
+        assert s.hit_rate + s.lmcache_hit_rate == pytest.approx(1.0)
+
+    def test_the_halves_never_exceed_the_denominator(self):
+        """K3's ordinary anchor-only shape: the walk reaches 8 blocks, the only
+        resumable rung is at 3, the joint boundary lands at 10. Pairing
+        `compressed` against `offload` prints 80% + 70% here -- 150% of a
+        denominator that is the ceiling."""
+        s = self.stats(
+            num_cached_tokens=300,  # the gate cut the walk from 800 to 300
+            num_full_tokens=1200,
+            num_compressed_tokens=800,
+            num_wanted_tokens=300,
+            num_reusable_tokens=1000,
+            num_offload_tokens=700,
+        )
+        assert s.paged_hit_rate + s.lmcache_hit_rate > 1.0, (
+            "precondition: this is the shape that makes the wrong pairing "
+            "exceed 100%, so the assertion below is not vacuous"
+        )
+        assert s.hit_rate + s.lmcache_hit_rate <= 1.0
+
+    def test_the_line_reports_cached_not_compressed(self, caplog):
+        """Reads the emitted text: swapping `hit_rate` back for
+        `paged_hit_rate` has to be what fails here."""
+        import logging
+
+        s = self.stats(
+            num_cached_tokens=300,
+            num_full_tokens=1200,
+            num_compressed_tokens=800,
+            num_wanted_tokens=300,
+            num_reusable_tokens=1000,
+            num_offload_tokens=700,
+        )
+        with caplog.at_level(logging.INFO, logger="atom"):
+            s._log_pools()
+        line = next(
+            r.getMessage() for r in caplog.records if "[Cache Tiers]" in r.getMessage()
+        )
+        assert "300/1000" in line, f"HBM half must be `cached`, got: {line}"
+        assert "800/1000" not in line, f"`compressed` is reach, not served: {line}"
+        assert "700/1000" in line
+
+    def test_no_tier_attached_emits_no_tier_line(self, caplog):
+        import logging
+
+        s = self.stats(
+            num_cached_tokens=300,
+            num_full_tokens=1200,
+            num_compressed_tokens=800,
+            num_wanted_tokens=300,
+            num_reusable_tokens=1000,
+        )
+        with caplog.at_level(logging.INFO, logger="atom"):
+            s._log_pools()
+        assert not any("[Cache Tiers]" in r.getMessage() for r in caplog.records)
