@@ -934,9 +934,7 @@ def dcp_merge_candidates(recv: torch.Tensor, out: torch.Tensor) -> None:
     # score plane is materialised.
     gathered_sc = recv[:, 0].permute(1, 0, 2).reshape(num_rows, n_cand).contiguous()
     cand_idx = torch.empty(num_rows, topk, dtype=torch.int32, device=recv.device)
-    cand_lens = torch.full(
-        (num_rows,), n_cand, dtype=torch.int32, device=recv.device
-    )
+    cand_lens = torch.full((num_rows,), n_cand, dtype=torch.int32, device=recv.device)
     top_k_per_row_decode(
         gathered_sc.view(torch.float32),
         1,

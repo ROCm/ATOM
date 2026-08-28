@@ -35,7 +35,6 @@ try:
     from aiter.ops.topk import top_k_per_row_decode
 
     from atom.model_ops.dcp_ops import (
-        dcp_gather_candidate_gids,
         dcp_global_pos,
         dcp_local_context_lens,
         dcp_merge_candidates,
@@ -519,9 +518,7 @@ def test_local_context_lens_prefers_published_buffer(world, interleave):
     rows = 37
     ctx = torch.randint(1, 100000, (rows,), dtype=torch.int32, device=DEV)
     published = torch.arange(rows, dtype=torch.int32, device=DEV)
-    got = dcp_local_context_lens(
-        _FakeMeta(ctx, published), 0, world, interleave, rows
-    )
+    got = dcp_local_context_lens(_FakeMeta(ctx, published), 0, world, interleave, rows)
     assert got is published
 
 
@@ -534,11 +531,7 @@ def test_local_context_lens_fallback_matches_reference(world, interleave):
     ref = torch.stack(
         [
             torch.tensor(
-                sum(
-                    1
-                    for p in range(int(c))
-                    if (p // interleave) % world == 0
-                ),
+                sum(1 for p in range(int(c)) if (p // interleave) % world == 0),
                 dtype=torch.int32,
                 device=DEV,
             )
