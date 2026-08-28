@@ -151,6 +151,9 @@ case "${RUNNER_NAME:-}" in
   gbt350-odcdh1-b10-1)
     USES_SPUR_CONTROLLER=0
     NODE_LIST=""
+    export SLURM_ACCOUNT=""
+    export SLURM_PARTITION=""
+    SLURM_QOS=""
     ;;
 esac
 
@@ -171,9 +174,9 @@ echo "cell=${PLUGIN_CI_CELL_ID}"
 echo "plugin=${PLUGIN_CI_PLUGIN}"
 echo "runner_name=${RUNNER_NAME:-unknown}"
 echo "nodes=${NODE_LIST:-auto}"
-echo "slurm_account=${SLURM_ACCOUNT}"
+echo "slurm_account=${SLURM_ACCOUNT:-default}"
 echo "slurm_partition=${SLURM_PARTITION:-default}"
-echo "slurm_qos=${SLURM_QOS}"
+echo "slurm_qos=${SLURM_QOS:-default}"
 if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
   echo "spur_controller=${SPUR_CONTROLLER_ADDR}"
 else
@@ -217,9 +220,13 @@ SBATCH_CMD=(
   --parsable
   --exclusive
   --export=ALL
-  --account "${SLURM_ACCOUNT}"
-  --qos "${SLURM_QOS}"
 )
+if [[ -n "${SLURM_ACCOUNT}" ]]; then
+  SBATCH_CMD+=(--account "${SLURM_ACCOUNT}")
+fi
+if [[ -n "${SLURM_QOS}" ]]; then
+  SBATCH_CMD+=(--qos "${SLURM_QOS}")
+fi
 if [[ -n "${SLURM_PARTITION}" ]]; then
   SBATCH_CMD+=(--partition "${SLURM_PARTITION}")
 fi
