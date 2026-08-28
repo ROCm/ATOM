@@ -37,6 +37,8 @@ try:
     from atom.model_ops.dcp_ops import (
         dcp_gather_candidate_gids,
         dcp_global_pos,
+        dcp_local_context_lens,
+        dcp_merge_candidates,
         dcp_pack_topk_candidates,
     )
 except ImportError as _e:  # triton/aiter absent on a CPU-only runner
@@ -139,34 +141,17 @@ def _build_gathered(global_logits, ctx, world, k=TOPK):
 
 
 def _merge(recv, k=TOPK):
-    """The production merge, mirrored exactly.
+    """The production merge -- the real one, not a copy of it.
 
-    Kept structurally identical to `_dcp_decode_candidate_exchange` in
-    `deepseek_v2.py`: only the score plane is materialised on the candidate dim,
-    aiter's stable one-block top-k picks row-local candidate indices, and
-    `dcp_gather_candidate_gids` maps those back to global ids straight off the
-    gathered buffer. (Before 2026-08-13 the top-k was a hand-written
-    `dcp_stable_topk`; before 2026-08-24 the gid map was a reshape + gather.)
+    This used to be a hand-written mirror of the block inlined in
+    `dcp_decode_candidate_exchange`, and the two silently diverged the moment
+    that function was moved between modules (the fused gid map was replaced by
+    a reshape+gather and no test noticed). Call the shared helper instead so a
+    divergence is impossible by construction.
     """
-    world, _, rows, k_loc = recv.shape
-    n_cand = world * k_loc
-    dev = recv.device
-    sc_all = recv[:, 0].permute(1, 0, 2).reshape(rows, n_cand).contiguous()
-    cand_idx = torch.empty(rows, k, dtype=torch.int32, device=dev)
-    cand_lens = torch.full((rows,), n_cand, dtype=torch.int32, device=dev)
-    top_k_per_row_decode(
-        sc_all.view(torch.float32),
-        1,
-        cand_lens,
-        cand_idx,
-        rows,
-        sc_all.stride(0),
-        sc_all.stride(1),
-        k,
-        stable=True,
-    )
-    out = torch.empty(rows, k, dtype=torch.int32, device=dev)
-    dcp_gather_candidate_gids(recv, cand_idx, out)
+    rows = recv.shape[2]
+    out = torch.empty(rows, k, dtype=torch.int32, device=recv.device)
+    dcp_merge_candidates(recv, out)
     return out
 
 
@@ -502,3 +487,101 @@ def test_prefill_filter_is_layout_independent(
             f"candidate set (missing {len(expected[t] - union[t])}, "
             f"extra {len(union[t] - expected[t])})"
         )
+
+
+# ---------------------------------------------------------------------------
+# Regression guards for the fusions themselves.
+#
+# The two checks below exist because both existing safety nets are blind to a
+# production path that stops *using* a fused helper: the correctness tests drove
+# a hand-written copy of the merge, and bench_dcp_indexer_fuse.py times the
+# primitives directly. When `dcp_decode_candidate_exchange` was moved between
+# modules its fused local_ctx read and fused gid map were replaced by the old
+# eager code, and every test and the benchmark still passed.
+# ---------------------------------------------------------------------------
+
+
+class _FakeMeta:
+    def __init__(self, ctx, published=None):
+        self.context_lens = ctx
+        if published is not None:
+            self.dcp_local_context_lens = published
+
+
+@pytest.mark.parametrize("world", [2, 4, 8])
+@pytest.mark.parametrize("interleave", [1, 16])
+def test_local_context_lens_prefers_published_buffer(world, interleave):
+    """The published host buffer must be returned as-is, not recomputed.
+
+    Identity, not equality: returning an equal-but-recomputed tensor is exactly
+    the regression this guards (8 elementwise kernels per full-index layer).
+    """
+    rows = 37
+    ctx = torch.randint(1, 100000, (rows,), dtype=torch.int32, device=DEV)
+    published = torch.arange(rows, dtype=torch.int32, device=DEV)
+    got = dcp_local_context_lens(
+        _FakeMeta(ctx, published), 0, world, interleave, rows
+    )
+    assert got is published
+
+
+@pytest.mark.parametrize("world", [2, 4, 8])
+@pytest.mark.parametrize("interleave", [1, 16])
+def test_local_context_lens_fallback_matches_reference(world, interleave):
+    """No published buffer (or a stale one) -> derive, and match the split."""
+    rows = 37
+    ctx = torch.randint(1, 100000, (rows,), dtype=torch.int32, device=DEV)
+    ref = torch.stack(
+        [
+            torch.tensor(
+                sum(
+                    1
+                    for p in range(int(c))
+                    if (p // interleave) % world == 0
+                ),
+                dtype=torch.int32,
+                device=DEV,
+            )
+            for c in ctx
+        ]
+    )
+    for meta in (
+        _FakeMeta(ctx),  # attribute absent
+        _FakeMeta(ctx, None),  # published but None (non-DCP metadata builder)
+        _FakeMeta(ctx, torch.zeros(rows + 1, dtype=torch.int32, device=DEV)),  # stale
+    ):
+        got = dcp_local_context_lens(meta, 0, world, interleave, rows)
+        assert got.dtype == torch.int32
+        torch.testing.assert_close(got, ref, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("world", [2, 8])
+def test_merge_launches_the_fused_kernel_count(world):
+    """The merge must stay at 3 device kernels (score copy, top-k, gid map).
+
+    The pre-fusion form of this block was 6+ (reshape copy, int64 index cast,
+    gather, copy_ on top of the same three), so this trips the moment the fused
+    gid map is swapped back out for a reshape+gather.
+    """
+    rows, k_loc = 8, 256
+    recv = torch.empty(world, 2, rows, k_loc, dtype=torch.int32, device=DEV)
+    recv[:, 0] = torch.randn(world, rows, k_loc, device=DEV).view(torch.int32)
+    recv[:, 1] = torch.randint(
+        0, 1 << 20, (world, rows, k_loc), dtype=torch.int32, device=DEV
+    )
+    out = torch.empty(rows, k_loc, dtype=torch.int32, device=DEV)
+
+    dcp_merge_candidates(recv, out)  # warm up any JIT before counting
+    torch.cuda.synchronize()
+
+    from torch.profiler import ProfilerActivity, profile
+
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        dcp_merge_candidates(recv, out)
+        torch.cuda.synchronize()
+    launches = sum(
+        e.count
+        for e in prof.key_averages()
+        if e.device_type == torch.autograd.DeviceType.CUDA and e.self_device_time_total
+    )
+    assert launches <= 4, f"merge launched {launches} kernels, expected <=4"

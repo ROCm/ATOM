@@ -108,15 +108,23 @@ def merge_attn_states_kernel(
     # padding at once.
     head_mask = head_valid[:, None] & (head_arange < HEAD_SIZE)[None, :]
 
-    lse_off = head_idx * num_tokens + token_idx
+    # 64-bit offsets. token_idx*num_heads*head_stride walks the whole output
+    # tensor, so it reaches num_tokens*num_heads*head_size -- 2.15e9 at
+    # MBT=131072 with 128 heads of 128, just past int32. program_id and the
+    # strides are all int32, so the product used to wrap there; widening the two
+    # indices once promotes every offset below and costs only address VALU.
+    t64 = token_idx.to(tl.int64)
+    h64 = head_idx.to(tl.int64)
+
+    lse_off = h64 * num_tokens + t64
     suf_off = (
-        token_idx * num_heads * prefix_head_stride
-        + head_idx[:, None] * prefix_head_stride
+        t64 * num_heads * prefix_head_stride
+        + h64[:, None] * prefix_head_stride
         + head_arange[None, :]
     )
     out_off = (
-        token_idx * num_heads * output_head_stride
-        + head_idx[:, None] * output_head_stride
+        t64 * num_heads * output_head_stride
+        + h64[:, None] * output_head_stride
         + head_arange[None, :]
     )
 
