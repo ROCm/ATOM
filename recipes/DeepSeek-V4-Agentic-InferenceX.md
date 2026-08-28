@@ -45,6 +45,8 @@ python3 -m atom.entrypoints.openai_server \
 ```bash
 export AITER_BF16_FP8_MOE_BOUND=0
 export ATOM_MOE_GU_ITLV=1
+export GPU_MAX_HW_QUEUES=5
+export ATOM_NUMA_BIND=1
 export ATOM_DP_SESSION_AFFINITY=1
 export ATOM_DP_LB_REQ_EQUIV=512
 export ATOM_ENABLE_PREFILL_DELAYER=1
@@ -61,12 +63,13 @@ python3 -m atom.entrypoints.openai_server \
   --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384 \
   --state-checkpoint-interval-tokens 8192 \
   --level 3 --cudagraph-mode FULL \
-  --enable-dp-attention \
+  --enable-dp-attention --enable-tbo \
   --max-num-seqs $(( CONC * 2 ))
 ```
 
-Against the TP command this adds `--enable-dp-attention` and the four
-`ATOM_DP_*` variables; everything else is identical.
+Against the TP command this adds `--enable-dp-attention --enable-tbo`, the four
+`ATOM_DP_*` routing variables, and the two `--enable-tbo` needs
+(`GPU_MAX_HW_QUEUES`, `ATOM_NUMA_BIND`); everything else is identical.
 
 `ATOM_DP_SESSION_AFFINITY` is not optional here. Without it a conversation's
 turns land on different DP ranks, so the prefix KV written by one turn sits on
@@ -116,7 +119,9 @@ against; the DP rows deliberately step outside it, because on this workload DP
 attention is where the throughput is — 44,722 vs 20,308 tok/s/chip — and we would
 rather show the trade than hide it. It is not free: the same rows carry TTFT of
 ~10 s against TP's ~1 s. Read them as a second operating point, not as an entry
-under your rules.
+under your rules. The DP rows also enable two-batch overlap (`--enable-tbo`),
+which the reference does not run either — the measured table below predates it,
+so those numbers are the DP path WITHOUT TBO.
 
 Everything else in the server command matches the reference literally, including
 the golden `--spec-decode-acceptance-length 2.49` and `--max-num-seqs` at twice
