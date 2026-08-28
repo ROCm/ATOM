@@ -16,6 +16,8 @@ from aiter import (
     flash_attn_varlen_func,
     fused_qk_rope_concat_and_cache_mla,
     get_hip_quant,
+)
+from aiter import (
     indexer_qk_rope_quant_and_cache as _indexer_qk_rope_quant_and_cache,
 )
 
