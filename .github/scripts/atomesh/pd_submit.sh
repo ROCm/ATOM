@@ -134,6 +134,9 @@ exports = {
     "AIPERF_COMMIT": benchmark.get("aiperf_commit", ""),
     "AIPERF_SCENARIO": benchmark.get("scenario", ""),
     "AIPERF_PUBLIC_DATASET": benchmark.get("public_dataset", ""),
+    "AIPERF_APPLY_CHAT_TEMPLATE": str(
+        benchmark.get("apply_chat_template", False)
+    ).lower(),
     "AIPERF_MAX_CONTEXT_LENGTH": benchmark.get("max_context_length", ""),
     "AIPERF_NUM_DATASET_ENTRIES": benchmark.get("num_dataset_entries", ""),
     "AIPERF_BENCHMARK_DURATION": benchmark.get("benchmark_duration", ""),
@@ -172,6 +175,8 @@ exports = {
     "DECODE_WORKERS": decode.get("workers", 1),
     "PREFILL_TP": prefill.get("tp", 8),
     "DECODE_TP": decode.get("tp", 8),
+    "PREFILL_DCP_SIZE": prefill.get("dcp", 1),
+    "DECODE_DCP_SIZE": decode.get("dcp", 1),
     "PREFILL_ENABLE_DP": str(prefill.get("enable_dp_attention", False)).lower(),
     "DECODE_ENABLE_DP": str(decode.get("enable_dp_attention", False)).lower(),
     "PREFILL_CUDAGRAPH": prefill.get("cudagraph", ""),
@@ -199,6 +204,13 @@ exports = {
     "SPEC_METHOD": server_args.get("method", ""),
     "DRAFT_MODEL_PATH": server_args.get("draft_model", ""),
     "NUM_SPEC_TOKENS": server_args.get("num_speculative_tokens", ""),
+    "SPEC_DECODE_ACCEPTANCE_LENGTH": server_args.get(
+        "spec_decode_acceptance_length", ""
+    ),
+    "STATE_CHECKPOINT_INTERVAL_TOKENS": server_args.get(
+        "state_checkpoint_interval_tokens", ""
+    ),
+    "STATE_CHECKPOINT_SLOTS": server_args.get("state_checkpoint_slots", ""),
     "EXTRA_SERVER_ARGS": server_args.get("extra_args", ""),
     "PREFILL_EXTRA_SERVER_ARGS": prefill.get("extra_args", ""),
     "DECODE_EXTRA_SERVER_ARGS": decode.get("extra_args", ""),

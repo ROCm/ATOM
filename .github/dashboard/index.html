@@ -690,6 +690,9 @@ function atomeshPointRow(point, meta, idx) {
     totalGpu: atomeshPointNumber(point, 'total_gpu'),
     prefillTp: atomeshPointNumber(point, 'prefill_tp'),
     decodeTp: atomeshPointNumber(point, 'decode_tp'),
+    prefillDcp: atomeshPointNumber(point, 'prefill_dcp'),
+    decodeDcp: atomeshPointNumber(point, 'decode_dcp'),
+    speculativeMethod: point.speculative_method || '',
     prefillWorkers: atomeshPointNumber(point, 'prefill_workers'),
     decodeWorkers: atomeshPointNumber(point, 'decode_workers'),
     numPrefillGpu: atomeshPointNumber(point, 'num_prefill_gpu'),
@@ -3092,6 +3095,12 @@ function atomeshTpLabel(row) {
   }
   return row.prefillTp ?? row.decodeTp ?? '—';
 }
+function atomeshDcpLabel(row) {
+  if (row.prefillDcp != null && row.decodeDcp != null && row.prefillDcp !== row.decodeDcp) {
+    return `P${row.prefillDcp}/D${row.decodeDcp}`;
+  }
+  return row.prefillDcp ?? row.decodeDcp ?? '—';
+}
 function atomeshDpAttentionLabel(row) {
   if (row.prefillDpa && row.decodeDpa) return 'True';
   if (row.prefillDpa) return 'Prefill only';
@@ -3145,6 +3154,8 @@ function showAtomeshPopover(row) {
       <div class="pop-row"><span class="pop-key">Topology</span><span class="pop-val" style="font-family:inherit">${escHTML(row.sourceTopology || row.topology || '—')}</span></div>
       <div class="pop-row"><span class="pop-key">Total GPUs</span><span class="pop-val">${atomeshDetailValue(row.totalGpu)}</span></div>
       <div class="pop-row"><span class="pop-key">Tensor Parallelism</span><span class="pop-val">${escHTML(String(atomeshTpLabel(row)))}</span></div>
+      <div class="pop-row"><span class="pop-key">Decode Context Parallelism</span><span class="pop-val">${escHTML(String(atomeshDcpLabel(row)))}</span></div>
+      <div class="pop-row"><span class="pop-key">Speculative Method</span><span class="pop-val">${escHTML(row.speculativeMethod || '—')}</span></div>
       <div class="pop-row"><span class="pop-key">Prefill/Decode Workers</span><span class="pop-val">${row.prefillWorkers ?? '—'} / ${row.decodeWorkers ?? '—'}</span></div>
       <div class="pop-row"><span class="pop-key">Prefill/Decode GPUs</span><span class="pop-val">${row.numPrefillGpu ?? '—'} / ${row.numDecodeGpu ?? '—'}</span></div>
       <div class="pop-row"><span class="pop-key">Expert Parallelism</span><span class="pop-val">${atomeshDetailValue(row.expertParallelism ?? 1)}</span></div>

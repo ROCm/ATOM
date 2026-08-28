@@ -27,6 +27,7 @@ RESULT_RE = re.compile(
 )
 TOPOLOGY_RE = re.compile(r"(?P<p>\d+)p(?P<d>\d+)d", re.IGNORECASE)
 TP_RE = re.compile(r"tp(?P<tp>\d+)", re.IGNORECASE)
+DCP_RE = re.compile(r"dcp(?P<dcp>\d+)", re.IGNORECASE)
 EVAL_CONC_RE = re.compile(r"(?:^|[_-])c(?P<conc>\d+)(?:$|[_-])", re.IGNORECASE)
 EVAL_TOPOLOGY_RE = re.compile(
     r"(?:^|[_-])(?P<topology>\d+p\d+d(?:[_-]dpa)?)(?:$|[_-])",
@@ -218,6 +219,17 @@ def topology_resources(
         prefill_tp = prefill_tp or int(tp.group("tp"))
         decode_tp = decode_tp or int(tp.group("tp"))
 
+    prefill_dcp = int_value(
+        payload.get("prefill_dcp"), payload.get("prefill_decode_context_parallel_size")
+    )
+    decode_dcp = int_value(
+        payload.get("decode_dcp"), payload.get("decode_context_parallel_size")
+    )
+    dcp = DCP_RE.search(text)
+    if dcp:
+        prefill_dcp = prefill_dcp or int(dcp.group("dcp"))
+        decode_dcp = decode_dcp or int(dcp.group("dcp"))
+
     num_prefill_gpu = int_value(payload.get("num_prefill_gpu"))
     num_decode_gpu = int_value(payload.get("num_decode_gpu"))
     if num_prefill_gpu is None and prefill_workers and prefill_tp:
@@ -234,6 +246,8 @@ def topology_resources(
         "decode_workers": decode_workers,
         "prefill_tp": prefill_tp,
         "decode_tp": decode_tp,
+        "prefill_dcp": prefill_dcp,
+        "decode_dcp": decode_dcp,
         "num_prefill_gpu": num_prefill_gpu,
         "num_decode_gpu": num_decode_gpu,
         "total_gpu": total_gpu,
@@ -334,6 +348,10 @@ def enrich_payload(
     enriched.setdefault("decode_workers", env.get("DECODE_WORKERS"))
     enriched.setdefault("prefill_tp", env.get("PREFILL_TP"))
     enriched.setdefault("decode_tp", env.get("DECODE_TP"))
+    enriched.setdefault("prefill_dcp", env.get("PREFILL_DCP_SIZE"))
+    enriched.setdefault("decode_dcp", env.get("DECODE_DCP_SIZE"))
+    enriched.setdefault("speculative_method", env.get("SPEC_METHOD"))
+    enriched.setdefault("num_speculative_tokens", env.get("NUM_SPEC_TOKENS"))
     runner = env.get("SLURM_SUBMIT_RUNNER", "")
     if hardware:
         enriched["hardware"] = hardware
@@ -426,6 +444,17 @@ def perf_point(
     input_tput = number(payload.get("input_throughput"))
     tpot_ms = number(payload.get("mean_tpot_ms"), payload.get("mean_itl_ms"))
     interactivity = interactivity_value(payload)
+    speculative_method = string_value(
+        payload.get("speculative_method"), payload.get("spec_method")
+    ).lower()
+    num_speculative_tokens = int_value(
+        payload.get("num_speculative_tokens"), payload.get("num_spec_tokens")
+    )
+    speculative_label = (
+        f"{speculative_method}{num_speculative_tokens}"
+        if speculative_method and num_speculative_tokens is not None
+        else speculative_method or None
+    )
 
     config_label = "_".join(
         part
@@ -489,6 +518,10 @@ def perf_point(
         "num_prompts": int_value(payload.get("num_prompts")),
         "prefill_tp": resources["prefill_tp"],
         "decode_tp": resources["decode_tp"],
+        "prefill_dcp": resources["prefill_dcp"],
+        "decode_dcp": resources["decode_dcp"],
+        "speculative_method": speculative_label,
+        "num_speculative_tokens": num_speculative_tokens,
         "prefill_workers": resources["prefill_workers"],
         "decode_workers": resources["decode_workers"],
         "prefill_dpa": resources["prefill_dpa"],
