@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Replace the image-baked AITER with a pinned pull-request revision.
 #
-# This file is sourced by pd_server_atom.sh so the job-local virtualenv and
-# PYTHONPATH remain active for the benchmark servers.
+# This file is sourced by pd_server_atom.sh. The job-local virtualenv is only
+# used to build/install the PR checkout; benchmark servers keep the container
+# interpreter so editable image packages (for example lmcache) stay importable.
 set -euo pipefail
 
 AITER_REPO="${ATOMESH_AITER_REPO:-https://github.com/ROCm/aiter.git}"
@@ -93,27 +94,22 @@ AITER_USE_SYSTEM_TRITON=1 MAX_JOBS="${AITER_MAX_JOBS}" \
     --no-build-isolation --no-deps
 
 AITER_PREBUILT_JIT_DIR="${AITER_SOURCE_DIR}/aiter/jit"
-aiter_base_site_packages="$(
-  "${AITER_BASE_PYTHON}" - <<'PY'
-import site
 
-print(":".join(site.getsitepackages()))
-PY
-)"
+# Leave the build venv before any runtime import checks. Servers must keep the
+# container interpreter (/opt/venv): a nested venv cannot see editable installs
+# such as lmcache even when site-packages is appended to PYTHONPATH.
+deactivate
 
-export PATH="${AITER_VENV_DIR}/bin:${PATH}"
-export PYTHONPATH="${AITER_SOURCE_DIR}:${aiter_base_site_packages}${PYTHONPATH:+:${PYTHONPATH}}"
+export PYTHONPATH="${AITER_SOURCE_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 export ATOMESH_AITER_PREBUILT_JIT_DIR="${AITER_PREBUILT_JIT_DIR}"
-hash -r
 
 # Editable installation builds module_aiter_core, while module_cache remains a
 # JIT module. Build and exercise the PR's DCP case once before any workers
 # start, avoiding a multi-process first-use race and rejecting a stale 18-arg
-# module_cache.so. PYTHONPATH above exposes the image venv (torch, pandas, …)
-# to the job-local interpreter.
+# module_cache.so.
 env -u AITER_CACHE_DIR -u AITER_JIT_DIR \
   AITER_REBUILD=1 AITER_USE_SYSTEM_TRITON=1 MAX_JOBS="${AITER_MAX_JOBS}" \
-  python3 "${AITER_SOURCE_DIR}/op_tests/test_indexer_qk_rope_quant_and_cache.py" \
+  "${AITER_BASE_PYTHON}" "${AITER_SOURCE_DIR}/op_tests/test_indexer_qk_rope_quant_and_cache.py" \
     -n 8 --num_heads 32 -d bf16 --valid_fraction 0.5 \
     --compute_all_q_rope 1 --is_neox 1
 
@@ -122,9 +118,7 @@ if [[ ! -f "${AITER_PREBUILT_JIT_DIR}/module_cache.so" ]]; then
   exit 1
 fi
 
-env -u AITER_CACHE_DIR -u AITER_JIT_DIR python3 - <<'PY'
-import importlib.metadata
-
+env -u AITER_CACHE_DIR -u AITER_JIT_DIR "${AITER_BASE_PYTHON}" - <<'PY'
 import aiter
 from aiter.jit.core import get_module
 
@@ -132,7 +126,6 @@ module_cache = get_module("module_cache")
 doc = module_cache.indexer_qk_rope_quant_and_cache.__doc__.splitlines()[0]
 if "compute_all_q_rope" not in doc:
     raise RuntimeError(f"module_cache has the old fused-indexer ABI: {doc}")
-print(f"Installed amd-aiter: {importlib.metadata.version('amd-aiter')}")
 print(f"Imported aiter from: {aiter.__file__}")
 print(f"Verified module_cache ABI: {doc}")
 PY
