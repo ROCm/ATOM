@@ -27,8 +27,8 @@ from atom.kv_transfer.offload.dense.connector import (
 from atom.kv_transfer.offload.hybrid.kimi_k3.staging import StagedTransfer
 from atom.kv_transfer.offload.hybrid.kimi_k3.state_object import StateByteCodec
 from atom.kv_transfer.offload.hybrid.kimi_k3.state_tier import (
-    _JointPark,
     StateOffloadTier,
+    _JointPark,
 )
 from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata
 
@@ -422,10 +422,13 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler):
         whether it ever answered.
         """
         sid = str(seq.id)
-        if self._save_stalled and sid not in self._save_inflight:
-            if self._has_pending_save(seq):
-                self._save_tracker.pop(sid, None)
-                return False
+        if (
+            self._save_stalled
+            and sid not in self._save_inflight
+            and self._has_pending_save(seq)
+        ):
+            self._save_tracker.pop(sid, None)
+            return False
         return super().should_defer_free(seq)
 
     # -- joint boundary ----------------------------------------------------

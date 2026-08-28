@@ -6,9 +6,9 @@
 from __future__ import annotations
 
 from collections import OrderedDict, deque
-from time import monotonic
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
+from time import monotonic
 
 from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.sequence import Sequence

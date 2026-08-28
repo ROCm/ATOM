@@ -1463,8 +1463,9 @@ class TestStalledOffloadSaveReclaim:
         assert freed == [1]
 
     def test_a_non_positive_window_restores_wait_forever(self, monkeypatch):
-        import atom.model_engine.scheduler as sched_mod
         import time as _time
+
+        import atom.model_engine.scheduler as sched_mod
 
         monkeypatch.setattr(sched_mod, "_SAVE_ABANDON_TIMEOUT_S", 0.0)
         s = object.__new__(sched_mod.Scheduler)
@@ -1495,8 +1496,9 @@ class TestStalledOffloadSaveReclaim:
 
     def test_a_late_report_on_a_reclaimed_save_is_not_an_assertion(self):
         """`finished_sending` used to assert the sequence was still deferred."""
-        import atom.model_engine.scheduler as sched_mod
         import inspect
+
+        import atom.model_engine.scheduler as sched_mod
 
         src = inspect.getsource(sched_mod.Scheduler._update_from_kv_xfer_finished)
         assert "not found in deferred_free_blocks" not in src
