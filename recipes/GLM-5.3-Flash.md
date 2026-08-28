@@ -74,9 +74,19 @@ dense MLA and the indexer's selection is computed but never used -- a short-cont
 benchmark says nothing about pooled selection, only that the pooled *writes* did no
 harm.
 
-Also verified: needle-in-a-haystack at ctx=5573 with a CONTROL (same prompt,
-different secret). The answer tracks the control, so the retrieval is real rather
-than a lucky guess.
+Retrieval itself is checked by `scripts/run_longctx_needle.py`, which runs each
+needle depth twice with a different secret in an otherwise identical prompt. The
+answer has to track the control, so a guess or an inference from the question
+cannot pass; and the script fails rather than reports green if any prompt came in
+under `index_topk`, since below that threshold nothing about selection is being
+measured. Passing at depths 0.1/0.5/0.9, ctx=5571:
+
+```bash
+PYTHONPATH=$PWD ATOM_GLM5_KPOOL=1 python3 scripts/run_longctx_needle.py \
+    --model /data/amd_int/models/GLM-5.3-Flash \
+    --kv_cache_dtype fp8 -tp 8 --max_model_len 8192 \
+    --gpu_memory_utilization 0.85 --no-enable_prefix_caching
+```
 
 ### How pooled entries are stored
 
