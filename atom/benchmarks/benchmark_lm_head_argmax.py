@@ -13,6 +13,7 @@ Input creation and correctness checks are outside the timed regions.
 import argparse
 import csv
 from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 
 import torch
@@ -107,9 +108,9 @@ def run_benchmark(args: argparse.Namespace) -> list[dict[str, int | float | str]
             torch.cuda.synchronize()
             del actual, expected
 
-            fused = lambda: lm_head_argmax_pack(logits, args.vocab_start_idx)
-            unfused = lambda: _unfused_lm_head_argmax_pack(
-                logits, args.vocab_start_idx
+            fused = partial(lm_head_argmax_pack, logits, args.vocab_start_idx)
+            unfused = partial(
+                _unfused_lm_head_argmax_pack, logits, args.vocab_start_idx
             )
 
             # Alternate measurement order to reduce systematic thermal bias.

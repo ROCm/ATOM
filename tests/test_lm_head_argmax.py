@@ -5,7 +5,7 @@ import torch
 
 pytest.importorskip("aiter")
 
-from atom.model_ops.lm_head_argmax import lm_head_argmax_pack  # noqa: E402
+from atom.model_ops.lm_head_argmax import lm_head_argmax_pack
 
 if not torch.cuda.is_available():
     pytest.skip("Triton kernels need a GPU", allow_module_level=True)
@@ -13,9 +13,7 @@ if not torch.cuda.is_available():
 
 def _reference(logits: torch.Tensor, vocab_start_idx: int) -> torch.Tensor:
     max_val, local_idx = logits.max(dim=-1)
-    return torch.stack(
-        [max_val.float(), (local_idx + vocab_start_idx).float()], dim=-1
-    )
+    return torch.stack([max_val.float(), (local_idx + vocab_start_idx).float()], dim=-1)
 
 
 @pytest.mark.parametrize("rows", [1, 7, 15])

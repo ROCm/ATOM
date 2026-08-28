@@ -1,7 +1,6 @@
 import torch
 import triton
 import triton.language as tl
-
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
 # Cap the vector width; larger vocabularies stream through multiple tiles.
