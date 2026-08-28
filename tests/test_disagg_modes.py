@@ -80,23 +80,72 @@ def test_pd_schedulers_label_their_engine_lines(
     assert Scheduler(MockConfig()).engine_stats.label == ""
 
 
-def test_decode_status_counts_fold_in_the_pd_queues(
+def test_decode_request_counts_fold_in_the_pd_queues(
     decode_scheduler_unconstrained, seq_factory
 ):
     """`allocate_waiting()` drains `waiting` almost at once, so a decode
     engine at full load parks its requests in `prefill_waiting` /
     `prefill_done`. Counting only the base pair reports an idle engine."""
     sched = decode_scheduler_unconstrained
-    assert sched._status_counts() == (0, 0)
+    assert sched.get_request_counts() == (0, 0)
 
     parked = seq_factory([1, 2, 3, 4])
     ready = seq_factory([5, 6, 7, 8])
     sched.prefill_waiting[parked.id] = parked
     sched.prefill_done.append(ready)
 
-    running, waiting = sched._status_counts()
+    running, waiting = sched.get_request_counts()
     assert waiting == 1, "prefill_waiting must count as waiting"
     assert running == 1, "prefill_done must count as running"
+
+
+def test_decode_metrics_and_status_line_agree(
+    decode_scheduler_unconstrained, seq_factory
+):
+    """The status line and `/metrics` must not describe the same engine
+    differently. `collect_metrics` reads `get_request_counts`, so overriding
+    anything else would leave the dashboard reporting an idle engine while the
+    log says it is at full load."""
+    sched = decode_scheduler_unconstrained
+    for i in range(3):
+        sched.prefill_waiting[i] = seq_factory([1, 2, 3, 4])
+    sched.prefill_done.append(seq_factory([5, 6, 7, 8]))
+
+    running, waiting = sched.get_request_counts()
+    assert (running, waiting) == (1, 3)
+    # Everything else that counts in-flight work derives from that one pair.
+    assert sched.get_num_unfinished_requests() == 4
+    assert sched.has_requests() is True
+    assert sched.has_unfinished_requests() is True
+
+
+def test_metrics_work_on_the_prefill_scheduler():
+    """`PrefillEngineCore` swaps in a `PrefillScheduler` and rewires the
+    utility handler to it, so `collect_metrics` has to survive a scheduler
+    that is not a `Scheduler` subclass and owns no BlockManager — it used to
+    raise AttributeError on `block_manager.kv` inside the busy loop."""
+    import queue
+
+    from atom.model_engine.engine_utility import EngineUtilityHandler
+    from atom.model_engine.scheduler import PrefillScheduler
+
+    sched = PrefillScheduler(MockConfig(enable_log_stats=True))
+    handler = EngineUtilityHandler(
+        runner_mgr=None,
+        output_queue=queue.Queue(),
+        label="PrefillEngineCore",
+        scheduler=sched,
+    )
+
+    metrics = handler.collect_metrics()
+    assert metrics["enabled"] is True
+    assert metrics["requests_running"] == 0
+    # No KV pool on this side (decode owns the blocks), so the snapshot omits
+    # those keys rather than reporting a pool of size zero. The aggregator
+    # sums with `.get(key, 0)`, so the decode rank's real figures still land.
+    assert not [k for k in metrics if k.startswith("kv_blocks")]
+
+    handler.push_metrics()  # must not raise from inside the busy loop
 
 
 def test_idle_heartbeat_is_available_on_every_scheduler(caplog):

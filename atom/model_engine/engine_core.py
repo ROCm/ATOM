@@ -305,6 +305,7 @@ class EngineCore:
                 if now >= next_metrics_push:
                     next_metrics_push = now + METRICS_PUSH_INTERVAL_S
                     self.utility_handler.push_metrics()
+                self.scheduler.heartbeat_throughput(now)
                 shutdown = shutdown or self.pull_and_process_input_queue()
                 if shutdown:
                     break
@@ -312,10 +313,8 @@ class EngineCore:
                     continue
                 if not self.scheduler.is_finished():
                     self._process_engine_step()
-                else:
-                    self.scheduler.heartbeat_throughput(now)
-                    if self.has_pending_kv_work():
-                        self._advance_idle_kv_transfer()
+                elif self.has_pending_kv_work():
+                    self._advance_idle_kv_transfer()
         finally:
             # Teardown runs even on exceptions so the sender thread/socket
             # don't leak. Isolate the final publish so a publisher hiccup
@@ -679,6 +678,7 @@ class DPEngineCoreProc(EngineCore):
                 if now >= next_metrics_push:
                     next_metrics_push = now + METRICS_PUSH_INTERVAL_S
                     self.utility_handler.push_metrics()
+                self.scheduler.heartbeat_throughput(now)
                 shutdown = shutdown or self.pull_and_process_input_queue()
                 local_unfinished = (
                     not self.scheduler.is_finished()
@@ -703,7 +703,6 @@ class DPEngineCoreProc(EngineCore):
 
                 if not global_has_unfinished and not self.engines_running:
                     self.engines_running = False
-                    self.scheduler.heartbeat_throughput(now)
                     if self.has_pending_kv_work():
                         # Local RPCs only. Anything that reaches schedule()
                         # would run the delayer's cross-DP all_reduce off
@@ -839,6 +838,7 @@ class PrefillEngineCore(EngineCore):
         self.scheduler = PrefillScheduler(
             config, disagg_cu_shm_name=config.disagg_cu_shm_name
         )
+        self.utility_handler.scheduler = self.scheduler
 
     def _post_model_load_hook(self):
         """Round 1 bootstrap: export weights → send to decode → wait for ACK.

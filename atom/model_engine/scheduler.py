@@ -49,6 +49,20 @@ from atom.utils import envs
 logger = logging.getLogger("atom")
 
 
+def _prompt_tokens_of(result) -> int:
+    """Prompt tokens in whatever a `_schedule()` returned.
+
+    The three schedulers disagree on the empty shape — bare `None` from
+    `Scheduler` and `DecodeScheduler`, `(None, {})` from `PrefillScheduler` —
+    so normalize here rather than at each caller. `total_tokens_num_prefill`
+    is 0 on a decode batch, which is what the throughput window wants: its
+    generation side is counted in `postprocess`, from tokens actually
+    committed.
+    """
+    batch = result[0] if isinstance(result, tuple) else result
+    return 0 if batch is None else batch.total_tokens_num_prefill
+
+
 def _optimal_cu_fraction(
     decode_batch: int, prefill_waiting_tokens: int
 ) -> float | None:
@@ -519,6 +533,7 @@ class Scheduler:
             mtp_k=self.mtp_k,
             enable_prefix_caching=config.enable_prefix_caching,
             enable_log_stats=config.enable_log_stats,
+            throughput_log_interval_s=config.throughput_log_interval,
         )
         if config.enable_prefix_caching:
             self.engine_stats.block_manager = self.block_manager
@@ -605,28 +620,23 @@ class Scheduler:
             return 0.0
         return bm.kv.num_used / total
 
-    def _status_counts(self) -> tuple[int, int]:
-        """(running, waiting) as the engine-status line should report them.
-
-        Overridable: a scheduler that parks admitted requests in queues of its
-        own has to fold them in here, or the line reports an idle engine while
-        it is at full load.
-        """
-        return len(self.running), len(self.waiting)
-
     def _record_throughput(
         self, num_prompt_tokens: int = 0, num_generation_tokens: int = 0
     ) -> None:
         """Feed this tick's token counts into the throughput section of
         `engine_stats` and emit the periodic engine-status log line once
-        `throughput_log_interval_s` has elapsed. No-op when
-        `--no-enable-log-stats` disabled the section — guarded here too so a
-        disabled tracker skips the `_kv_usage()` scan every tick."""
+        `throughput_log_interval_s` has elapsed.
+
+        No-op when `--no-enable-log-stats` disabled the section. The whole
+        added path is a handful of attribute reads — `_kv_usage()` is O(1),
+        two reads and a divide, despite sitting on the per-step path — so the
+        guard is for clarity, not for a cost worth avoiding.
+        """
         stats = self.engine_stats
         if not stats.throughput_enabled:
             return
         stats.update_throughput(num_prompt_tokens, num_generation_tokens)
-        num_running_reqs, num_waiting_reqs = self._status_counts()
+        num_running_reqs, num_waiting_reqs = self.get_request_counts()
         stats.maybe_log_throughput(
             num_running_reqs=num_running_reqs,
             num_waiting_reqs=num_waiting_reqs,
@@ -908,6 +918,21 @@ class Scheduler:
         return out
 
     def schedule(self) -> tuple[ScheduledBatch, dict[int, Sequence]]:
+        """Run a scheduling pass and close the throughput window.
+
+        **Override `_schedule`, not this.** The window's 10s cadence is a
+        whole-program invariant, and putting the tick here makes it depend on
+        one call rather than on a `_record_throughput()` hand-placed at every
+        early return inside `_schedule`. There are already several such
+        returns; the next one added would otherwise stall the status line for
+        as long as it fires, and nothing would fail — the log would just go
+        quiet, which is indistinguishable from an idle engine.
+        """
+        result = self._schedule()
+        self._record_throughput(num_prompt_tokens=_prompt_tokens_of(result))
+        return result
+
+    def _schedule(self) -> tuple[ScheduledBatch, dict[int, Sequence]] | None:
         """Select the next batch of sequences for a forward pass.
 
         Tries prefill first; if no new prefills are ready, falls back to
@@ -954,7 +979,6 @@ class Scheduler:
             delayer_allows = True
 
         if not self.running and not self.waiting:
-            self._record_throughput()
             return None
 
         # ---- Phase 1: resume partial prefills from running ----
@@ -1196,7 +1220,6 @@ class Scheduler:
             connector_meta_output = None
             if self.kv_connector is not None:
                 connector_meta_output = self.kv_connector.build_connector_meta()
-            self._record_throughput(num_prompt_tokens=total_tokens_num_prefill)
 
             # Freeze, per seq, whether this chunk finishes the prompt. Uses the
             # pre-advance offsets so it is correct whether or not schedule-time
@@ -1365,7 +1388,6 @@ class Scheduler:
             ),
         )
         self._consume_state_forks(scheduled_seqs)
-        self._record_throughput()
         return (decode_batch, scheduled_seqs)
 
     @staticmethod
@@ -2003,7 +2025,6 @@ class Scheduler:
                 seq.prefix_hashes_published = True
             token_ids = prev_token_ids[idx]
             num_new_token = len(token_ids)
-            num_new_generation_tokens += num_new_token
             token_logprob = None
             if token_logprobs is not None and seq.return_logprobs:
                 token_logprob = token_logprobs.get(seq.id)
@@ -2162,6 +2183,16 @@ class Scheduler:
                 # in stop_at_idx / num_new_token, so offset the cut by it.
                 keep = stop_at_idx + 1 + (1 if injected_t0 is not None else 0)
                 new_tokens = new_tokens[:keep]
+
+            # Counted here, not from `len(token_ids)` above: `new_tokens` is
+            # what reaches RequestOutput, and it differs from the forward's
+            # raw output in both directions — the truncation just above drops
+            # accepted drafts past EOS/stop, and `injected_t0` prepends the
+            # token the prefill process sampled. Counting the raw output made
+            # the status line disagree with what the client received and with
+            # `total_generation_tokens` below, which this same call derives
+            # from the post-truncation length.
+            num_new_generation_tokens += len(new_tokens)
 
             # Hash generated blocks. Deferred output: all tokens forwarded;
             # undeferred: last token not yet forwarded, so exclude it.
@@ -2633,6 +2664,7 @@ class PrefillScheduler:
             engine_index=dp_rank or 0,
             label="Prefill ",
             enable_log_stats=config.enable_log_stats,
+            throughput_log_interval_s=config.throughput_log_interval,
         )
         self.total_prompt_tokens = 0
         self.total_generation_tokens = 0
@@ -2674,6 +2706,16 @@ class PrefillScheduler:
         self.waiting.extend(seqs)
 
     def schedule(self):
+        """Run a scheduling pass and close the throughput window.
+
+        Override `_schedule`, not this — see `Scheduler.schedule` for why the
+        tick lives at the one entry point instead of at each early return.
+        """
+        result = self._schedule()
+        self._record_throughput(num_prompt_tokens=_prompt_tokens_of(result))
+        return result
+
+    def _schedule(self):
         """Schedule only sequences whose block_table has been populated.
 
         Sequences that do not yet have a block assignment (block_table is
@@ -2707,14 +2749,6 @@ class PrefillScheduler:
                 num_batched_tokens += num_new_tokens
                 num_seqs += 1
 
-        # Prefill produces no generation tokens, and KV lives on the decode
-        # side (no local BlockManager), so generation is 0 and KV usage is
-        # None — reported as `n/a`, not as an empty pool.
-        self.engine_stats.update_throughput(
-            num_prompt_tokens=num_batched_tokens, num_generation_tokens=0
-        )
-        self._log_throughput()
-
         if not scheduled_seqs:
             return None, {}
 
@@ -2739,19 +2773,31 @@ class PrefillScheduler:
             scheduled_seqs,
         )
 
-    def _log_throughput(self) -> None:
-        """Close the throughput window if it is due. No BlockManager here —
-        the decode process owns the KV blocks — so usage is reported `n/a`."""
-        self.engine_stats.maybe_log_throughput(
-            num_running_reqs=len(self.running),
-            num_waiting_reqs=len(self.waiting),
+    def _record_throughput(
+        self, num_prompt_tokens: int = 0, num_generation_tokens: int = 0
+    ) -> None:
+        """`Scheduler._record_throughput`'s counterpart for the prefill side.
+
+        This process schedules no decode, so generation stays 0, and the
+        decode process owns the KV blocks — no local BlockManager means
+        `kv_usage=None`, which the line reports as `n/a` rather than as a
+        real, empty pool.
+        """
+        stats = self.engine_stats
+        if not stats.throughput_enabled:
+            return
+        stats.update_throughput(num_prompt_tokens, num_generation_tokens)
+        num_running_reqs, num_waiting_reqs = self.get_request_counts()
+        stats.maybe_log_throughput(
+            num_running_reqs=num_running_reqs,
+            num_waiting_reqs=num_waiting_reqs,
             kv_usage=None,
         )
 
     def heartbeat_throughput(self, now: float) -> None:
         """Idle-pass counterpart of `Scheduler.heartbeat_throughput`."""
         if self.engine_stats.window_expired(now):
-            self._log_throughput()
+            self._record_throughput()
 
     def postprocess(self, seqs, fwd_output, stream_output_queue=None) -> list:
         """No-op: prefill produces no sampled tokens."""
@@ -2763,8 +2809,14 @@ class PrefillScheduler:
             return (True, seq.num_tokens - seq.num_cached_tokens)
         return (False, 0)
 
+    def get_request_counts(self) -> tuple[int, int]:
+        """(running, waiting). Not a `Scheduler` subclass, so this is declared
+        rather than inherited — the engine-status line and any metrics reader
+        expect every scheduler to answer it."""
+        return len(self.running), len(self.waiting)
+
     def get_num_unfinished_requests(self) -> int:
-        return len(self.waiting) + len(self.running)
+        return sum(self.get_request_counts())
 
 
 class DecodeScheduler(Scheduler):
@@ -2785,14 +2837,15 @@ class DecodeScheduler(Scheduler):
 
     _ENGINE_LABEL = "Decode "
 
-    def _status_counts(self) -> tuple[int, int]:
+    def get_request_counts(self) -> tuple[int, int]:
         """Fold in the two queues this scheduler adds.
 
         `allocate_waiting()` drains `waiting` almost immediately, so a request
         spends most of its life in `prefill_waiting` (blocks assigned, awaiting
         PrefillDone) and lands in `prefill_done` before `schedule()` promotes
         it. Counting only the base pair reports `Running: 0, Waiting: 0` on an
-        engine holding a full load of in-flight requests.
+        engine holding a full load of in-flight requests — on the status line
+        and, because `/metrics` reads this same method, on the dashboard too.
         """
         return (
             len(self.running) + len(self.prefill_done),
@@ -2829,6 +2882,10 @@ class DecodeScheduler(Scheduler):
         self.cu_fraction: float | None = None
 
     def is_finished(self) -> bool:
+        # Kept explicit rather than derived from get_request_counts: unlike the
+        # base it deliberately ignores `_rejected` and `deferred_free_blocks`.
+        # If a queue is ever added to this scheduler it has to be listed here
+        # *and* in get_request_counts.
         return (
             not self.waiting
             and not self.prefill_waiting
@@ -2836,18 +2893,11 @@ class DecodeScheduler(Scheduler):
             and not self.prefill_done
         )
 
-    def has_requests(self) -> bool:
-        return bool(
-            self.waiting or self.prefill_waiting or self.running or self.prefill_done
-        )
-
     def get_num_unfinished_requests(self) -> int:
-        return (
-            len(self.waiting)
-            + len(self.prefill_waiting)
-            + len(self.running)
-            + len(self.prefill_done)
-        )
+        # Derived, so the queue inventory lives in get_request_counts alone.
+        # `has_requests` / `has_unfinished_requests` come off the base's chain
+        # through this method and need no override of their own.
+        return sum(self.get_request_counts())
 
     def allocate_waiting(self) -> list[Sequence]:
         """Allocate KV blocks for sequences in waiting; move them to prefill_waiting.
@@ -2888,14 +2938,17 @@ class DecodeScheduler(Scheduler):
             seq.first_token_time = time.time()
             self.prefill_done.append(seq)
 
-    def schedule(self):
+    def _schedule(self):
         """Schedule decode-only batches.
 
         Sequences are promoted directly from prefill_waiting to running by
         on_prefill_done(); this method only schedules the running queue.
+
+        Overrides the base `_schedule`, so the inherited `schedule()` still
+        closes the throughput window on every one of the returns below.
         """
 
-        # This override does not call `super().schedule()`, but it does route
+        # This override does not call `super()._schedule()`, but it does route
         # through the same `block_manager.allocate` and the same `postprocess`,
         # so it owes the state pool the same two hooks. Without this one the
         # pins taken by every resume accumulate forever and admission starves.
@@ -2921,8 +2974,6 @@ class DecodeScheduler(Scheduler):
             self.cu_fraction = None
             if self._cu_shm is not None:
                 struct.pack_into("I", self._cu_shm.buf, 0, 0)
-            # Idle tick: still tick the 10s engine-status cadence.
-            self._record_throughput()
             return None
 
         scheduled_seqs: dict[int, Sequence] = {}
@@ -2955,8 +3006,6 @@ class DecodeScheduler(Scheduler):
             self.cu_fraction = None
             if self._cu_shm is not None:
                 struct.pack_into("I", self._cu_shm.buf, 0, 0)
-            # Nothing schedulable this tick: still tick the 10s cadence.
-            self._record_throughput()
             return None
 
         self.running.extendleft(reversed(scheduled_seqs.values()))
@@ -2973,7 +3022,6 @@ class DecodeScheduler(Scheduler):
                 pwait = sum(seq.num_tokens for seq in self.prefill_waiting.values())
                 self.cu_fraction = _optimal_cu_fraction(total_tokens_num_decode, pwait)
 
-        self._record_throughput()
         return (
             ScheduledBatch(
                 seqs=scheduled_seqs,

@@ -42,6 +42,8 @@ Defined in `atom/config.py`. The root dataclass that the engine consumes.
 | `kv_cache_dtype` | `str` | `"bf16"` | KV cache data type (`"bf16"` or `"fp8"`) |
 | `index_cache_dtype` | `str \| None` | `None` | Indexer-cache dtype, resolved after model detection. Native single-node DeepSeek-V4 defaults to `"fp4"` except on gfx942; plugin and KV-transfer integrations retain `"fp8"`. Other models inherit `kv_cache_dtype`. An explicit `"bf16"`, `"fp8"`, or `"fp4"` value is preserved. |
 | `enable_prefix_caching` | `bool` | `False` | Enable prefix caching to reuse KV blocks across requests sharing the same prefix |
+| `enable_log_stats` | `bool` | `True` | Emit the periodic engine-status line (running/waiting reqs, KV usage, prefix-cache hit rate, prompt/generation throughput). Scoped to that line: `[MTP Stats]` and `[Cache Stats]` have their own gates |
+| `throughput_log_interval` | `float` | `10.0` | Seconds between engine-status lines. Must be > 0 |
 | `state_checkpoint_interval_tokens` | `int` | `8192` | For models with per-request state (DeepSeek-V4 compressor ring, GDN recurrent state): keep a state checkpoint every N tokens of context, so a later prefix hit can resume there. A prompt shorter than N checkpoints nothing. Must be a multiple of the prefix-cache hash block size; `0` disables checkpoints. See the state-checkpoint section of the [scheduling & KV cache guide](scheduling_kv_cache_guide.md) |
 | `port` | `int` | `8006` | Engine internal communication port |
 | `torch_profiler_dir` | `str \| None` | `os.getenv("ATOM_TORCH_PROFILER_DIR", None)` | Directory for saving PyTorch profiler traces; creates the directory if it does not exist |
@@ -355,6 +357,8 @@ all flags via `add_cli_args()` and converts them into a `Config` via
 | `--data-parallel-size` | `-dp` | `int` | `1` | Data parallel size |
 | `--enforce-eager` | | flag | `False` | Enforce eager mode execution |
 | `--enable_prefix_caching` | | flag | `False` | Enable prefix caching |
+| `--enable-log-stats` / `--no-enable-log-stats` | | flag | `True` | Emit the periodic engine-status line |
+| `--throughput-log-interval` | | `float` | `10.0` | Seconds between engine-status lines |
 | `--port` | | `int` | `8006` | Engine internal port |
 | `--kv_cache_dtype` | | `str` | `"bf16"` | KV cache dtype; choices: `bf16`, `fp8` |
 | `--index-cache-dtype`, `--index_cache_dtype` | | `str` | `None` | Indexer-cache dtype; choices: `bf16`, `fp8`, `fp4`. When omitted, uses the architecture- and integration-aware `Config.index_cache_dtype` defaults described above. |

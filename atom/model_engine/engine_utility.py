@@ -341,7 +341,13 @@ class EngineUtilityHandler:
             result = {"enabled": False}
         else:
             running, waiting = self.scheduler.get_request_counts()
-            kv_pool = self.scheduler.block_manager.kv
+            # None on the P/D prefill side, which owns no blocks — the decode
+            # process does. Its snapshot then carries no kv_blocks_* keys at
+            # all rather than a fabricated empty pool; the aggregator sums with
+            # `.get(key, 0)`, so the decode rank's real figures come through
+            # unchanged.
+            block_manager = getattr(self.scheduler, "block_manager", None)
+            kv_pool = None if block_manager is None else block_manager.kv
             kv_connector = getattr(self.scheduler, "kv_connector", None)
 
             engine_stats = self.scheduler.engine_stats
@@ -382,13 +388,16 @@ class EngineUtilityHandler:
                     getattr(self.scheduler, "total_generation_tokens", 0)
                 ),
                 "preemptions": int(getattr(self.scheduler, "total_preemptions", 0)),
-                "kv_blocks_used": kv_pool.num_used,
-                "kv_blocks_free": kv_pool.num_free,
-                "kv_blocks_total": kv_pool.num_blocks,
-                "kv_blocks_indexed": kv_pool.num_indexed,
                 "mtp": mtp,
                 "cache": cache,
                 "offload": offload,
             }
+            if kv_pool is not None:
+                result |= {
+                    "kv_blocks_used": kv_pool.num_used,
+                    "kv_blocks_free": kv_pool.num_free,
+                    "kv_blocks_total": kv_pool.num_blocks,
+                    "kv_blocks_indexed": kv_pool.num_indexed,
+                }
 
         return result

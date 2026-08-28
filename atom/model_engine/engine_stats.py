@@ -3,22 +3,29 @@
 
 """Unified engine statistics.
 
-Holds :class:`EngineStats`, which replaced the former ``SpecStats`` /
-``CacheStats`` / ``ThroughputStats``. Kept out of ``scheduler.py`` because it
-is engine-level rather than scheduler-level: all three schedulers own one, and
-``engine_utility`` reads it to answer ``/debug/mtp_stats``, ``/debug/cache_stats``
-and ``/metrics``.
+Holds :class:`EngineStats`, which folds in the former ``SpecStats`` and
+``CacheStats`` and adds a throughput section alongside them. Kept out of
+``scheduler.py`` because it is engine-level rather than scheduler-level: every
+scheduler owns one, and ``engine_utility`` reads the one on the scheduler it
+was handed to answer ``/debug/mtp_stats``, ``/debug/cache_stats`` and
+``/metrics``.
+
+Both P/D processes replace the scheduler that ``EngineCore.__init__`` built
+the handler around, so each rewires ``utility_handler.scheduler`` to the one
+it actually runs; the prefill side's snapshot then carries no ``kv_blocks_*``
+keys, because the decode process owns the blocks.
 """
 
 import logging
 import time
+from collections import deque
 
 logger = logging.getLogger("atom")
 
 
 class EngineStats:
-    """Unified engine statistics, replacing the former ``SpecStats`` /
-    ``CacheStats`` / ``ThroughputStats``.
+    """Unified engine statistics: the former ``SpecStats`` and ``CacheStats``
+    folded together, with a throughput section added beside them.
 
     Three independent sections, each gated by its own enable flag and each
     emitting at its **own pace**:
@@ -48,6 +55,10 @@ class EngineStats:
         "_cache_interval_requests",
         "_cache_interval_wanted_tokens",
         "_cache_log_interval",
+        "_recent_cached_tokens",
+        "_recent_full_tokens",
+        "_recent_hits",
+        "_recent_window",
         "_spec_interval_distribution",
         "_spec_interval_draft_tokens",
         "_spec_log_interval",
@@ -82,6 +93,7 @@ class EngineStats:
         enable_log_stats: bool = False,
         spec_log_interval: int = 1000,
         cache_log_interval: int = 100,
+        cache_hit_rate_window: int = 1000,
         throughput_log_interval_s: float = 10.0,
     ):
         self.spec_enabled = use_spec
@@ -120,14 +132,27 @@ class EngineStats:
         self._cache_interval_full_tokens: int = 0
         self._cache_interval_compressed_tokens: int = 0
         self._cache_interval_wanted_tokens: int = 0
+        # Sliding window behind `recent_cache_hit_rate`, the figure the
+        # engine-status line reports. Mirrors vLLM's PrefixCachingMetrics: the
+        # last N requests, aggregated incrementally so `observe` stays O(1).
+        self._recent_window = cache_hit_rate_window
+        self._recent_hits: deque[tuple[int, int]] = deque()
+        self._recent_full_tokens: int = 0
+        self._recent_cached_tokens: int = 0
         # Set by Scheduler for pool occupancy logging.
         self.block_manager = None
         self._cache_interval_evicted_base: int = 0
 
         # ── throughput section ───────────────────────────────────────────
-        assert (
-            throughput_log_interval_s > 0
-        ), f"throughput_log_interval_s must be > 0, got {throughput_log_interval_s}"
+        # A real exception, not an assert: `python -O` strips asserts, and the
+        # only thing between a non-positive interval and the division in
+        # `maybe_log_throughput` is this check. Stripped, the engine would die
+        # of ZeroDivisionError inside the scheduler loop.
+        if throughput_log_interval_s <= 0:
+            raise ValueError(
+                "throughput_log_interval_s must be > 0, got "
+                f"{throughput_log_interval_s}"
+            )
         self.engine_index = engine_index
         # Distinguishes the P/D processes, which both run as engine index 0 and
         # usually log to the same place. "" for the aggregated engine.
@@ -244,15 +269,46 @@ class EngineStats:
         self._cache_interval_compressed_tokens += num_compressed_tokens
         self._cache_interval_wanted_tokens += num_wanted_tokens
 
+        # Slide the recent-requests window. One call is one request here, so
+        # the deque length is the request count directly.
+        self._recent_hits.append((num_full_tokens, num_cached_tokens))
+        self._recent_full_tokens += num_full_tokens
+        self._recent_cached_tokens += num_cached_tokens
+        if len(self._recent_hits) > self._recent_window:
+            old_full, old_cached = self._recent_hits.popleft()
+            self._recent_full_tokens -= old_full
+            self._recent_cached_tokens -= old_cached
+
         if self.total_requests % self._cache_log_interval == 0:
             self._log_cache()
             self._reset_cache_interval()
 
     @property
     def cache_hit_rate(self) -> float:
+        """Hit rate since process start. Feeds `/debug/cache_stats`, `/metrics`
+        and the cumulative row of the `[Cache Stats]` line, all of which are
+        lifetime figures by design."""
         if self.total_full_tokens == 0:
             return 0.0
         return self.total_cached_tokens / self.total_full_tokens
+
+    @property
+    def recent_cache_hit_rate(self) -> float | None:
+        """Hit rate over the last `cache_hit_rate_window` requests.
+
+        What the engine-status line reports, because every other field on that
+        line is windowed: a lifetime figure there stops tracking the workload,
+        and on a long run it is dominated by traffic hours old — one that hit
+        80% in its first hour and reused nothing for the next seven still
+        prints ~71% and barely moves. vLLM's `LoggingStatLogger` uses a
+        1000-request window for the same reason.
+
+        None when the window holds nothing, which the line renders `n/a`
+        rather than as a measured 0%.
+        """
+        if not self._recent_full_tokens:
+            return None
+        return self._recent_cached_tokens / self._recent_full_tokens
 
     def cache_statistics(self) -> dict:
         """Counters, not rates — the caller derives those.
@@ -354,10 +410,10 @@ class EngineStats:
     def window_expired(self, now: float) -> bool:
         """Whether the throughput window is due to close.
 
-        Split out so the busy loop's idle heartbeat can skip the rest of
-        `_record_throughput` on the overwhelming majority of its spins — it
-        calls this once per pass, and the answer is no all but once per
-        interval.
+        Split out so `heartbeat_throughput` can answer it without touching the
+        queues or the KV pool. The busy loops call that on *every* pass, busy
+        or idle, so this runs at loop frequency and says no all but once per
+        interval; it takes the `now` the loop already read.
         """
         return (
             self.throughput_enabled
@@ -374,7 +430,11 @@ class EngineStats:
             return
         now = time.monotonic()
         elapsed = now - self._throughput_last_log_time
-        if elapsed < self.throughput_log_interval_s:
+        # `elapsed <= 0` is unreachable while the interval holds the positive
+        # value `__init__` validated, but the interval is a public attribute
+        # and the division is two lines below; one compare keeps that division
+        # safe whatever the attribute has been set to since.
+        if elapsed < self.throughput_log_interval_s or elapsed <= 0:
             return
         if (
             self.num_prompt_tokens == 0
@@ -388,7 +448,12 @@ class EngineStats:
         generation_throughput = self.num_generation_tokens / elapsed
         # The prefix-cache hit rate is owned by this same object now; pull it
         # from the cache section rather than have the caller thread it in.
-        prefix_cache_hit_rate = self.cache_hit_rate if self.cache_enabled else None
+        # Windowed, like every other field on this line, and None — rendered
+        # `n/a` — when nothing has been measured. "0.0%" is a claim about
+        # reuse, and a P/D decode engine never reaches `update_cache` at all.
+        prefix_cache_hit_rate = (
+            self.recent_cache_hit_rate if self.cache_enabled else None
+        )
         logger.info(
             "%sEngine %03d: Avg prompt throughput: %.1f tokens/s, "
             "Avg generation throughput: %.1f tokens/s, Running: %d reqs, "

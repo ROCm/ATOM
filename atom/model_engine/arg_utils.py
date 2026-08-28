@@ -60,6 +60,7 @@ class EngineArgs:
     state_checkpoint_interval_tokens: int = 8192
     enable_chunked_prefill: bool = True
     enable_log_stats: bool = True
+    throughput_log_interval: float = 10.0
     scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
     gpu_memory_utilization: float = 0.9
@@ -431,9 +432,19 @@ class EngineArgs:
             "--enable-log-stats",
             action=argparse.BooleanOptionalAction,
             default=True,
-            help="Log periodic engine throughput/scheduler status "
-            "(running/waiting reqs, KV cache usage, prefix cache hit rate; "
-            "default: enabled). Use --no-enable-log-stats to disable.",
+            help="Log the periodic engine-status line (running/waiting reqs, "
+            "KV cache usage, prefix cache hit rate, prompt/generation "
+            "throughput; default: enabled). Use --no-enable-log-stats to "
+            "disable. Scoped to that line only: the [MTP Stats] and "
+            "[Cache Stats] lines have their own gates (--method mtp and "
+            "--enable-prefix-caching) and keep their own cadences.",
+        )
+        parser.add_argument(
+            "--throughput-log-interval",
+            type=float,
+            default=10.0,
+            help="Seconds between engine-status lines (default: 10, matching "
+            "vLLM). Must be > 0. Ignored when --no-enable-log-stats.",
         )
         parser.add_argument(
             "--max-num-seqs",

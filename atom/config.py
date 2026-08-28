@@ -1529,6 +1529,8 @@ class Config:
     enable_prefix_caching: bool = True
     enable_chunked_prefill: bool = True
     enable_log_stats: bool = True
+    # Seconds between engine-status lines. Validated > 0 by EngineStats.
+    throughput_log_interval: float = 10.0
     port: int = 8006
     torch_profiler_dir: str | None = field(
         default_factory=lambda: envs.ATOM_TORCH_PROFILER_DIR
