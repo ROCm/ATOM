@@ -567,6 +567,8 @@ jobs:
           LM_EVAL_NUM_FEWSHOT: ${{ matrix.lm_eval_num_fewshot }}
           LM_EVAL_NUM_CONCURRENT: ${{ matrix.lm_eval_num_concurrent }}
           LM_EVAL_USE_CHAT_COMPLETIONS: ${{ matrix.lm_eval_use_chat_completions || '0' }}
+          LM_EVAL_BATCH_SIZE: ${{ matrix.lm_eval_batch_size || 65 }}
+          LM_EVAL_GEN_KWARGS: ${{ matrix.lm_eval_gen_kwargs || '' }}
         run: |
           set -euo pipefail
 
@@ -596,6 +598,8 @@ jobs:
             -e LM_EVAL_NUM_FEWSHOT="${LM_EVAL_NUM_FEWSHOT}" \
             -e LM_EVAL_NUM_CONCURRENT="${LM_EVAL_NUM_CONCURRENT}" \
             -e LM_EVAL_USE_CHAT_COMPLETIONS="${LM_EVAL_USE_CHAT_COMPLETIONS}" \
+            -e LM_EVAL_BATCH_SIZE="${LM_EVAL_BATCH_SIZE}" \
+            -e LM_EVAL_GEN_KWARGS="${LM_EVAL_GEN_KWARGS}" \
             "$CONTAINER_NAME" bash -lc '
               (
                 set +e

@@ -39,6 +39,8 @@
       "lm_eval_num_concurrent": { "type": "integer", "minimum": 1 },
       "lm_eval_use_chat_completions": { "type": "string", "enum": ["0", "1", "true", "false"] },
       "lm_eval_extra_model_args": { "type": "string" },
+      "lm_eval_batch_size": { "type": "integer", "minimum": 1 },
+      "lm_eval_gen_kwargs": { "type": "string" },
       "_baseline_note": { "type": "string" }
     }
   }

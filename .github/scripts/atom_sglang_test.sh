@@ -33,6 +33,8 @@ export PYTHONDONTWRITEBYTECODE="${PYTHONDONTWRITEBYTECODE:-1}"
 #   LM_EVAL_NUM_CONCURRENT
 #   LM_EVAL_EXTRA_MODEL_ARGS
 #   LM_EVAL_USE_CHAT_COMPLETIONS
+#   LM_EVAL_BATCH_SIZE
+#   LM_EVAL_GEN_KWARGS
 
 TYPE=${1:-launch}
 if [[ "${TYPE}" != "start" && "${TYPE}" != "launch" && "${TYPE}" != "accuracy" ]]; then
@@ -56,6 +58,8 @@ LM_EVAL_NUM_FEWSHOT=${LM_EVAL_NUM_FEWSHOT:-3}
 LM_EVAL_NUM_CONCURRENT=${LM_EVAL_NUM_CONCURRENT:-65}
 LM_EVAL_EXTRA_MODEL_ARGS=${LM_EVAL_EXTRA_MODEL_ARGS:-}
 LM_EVAL_USE_CHAT_COMPLETIONS=${LM_EVAL_USE_CHAT_COMPLETIONS:-0}
+LM_EVAL_BATCH_SIZE=${LM_EVAL_BATCH_SIZE:-65}
+LM_EVAL_GEN_KWARGS=${LM_EVAL_GEN_KWARGS:-}
 
 MODEL_NAME=${SGLANG_MODEL_NAME:-}
 MODEL_PATH=${SGLANG_MODEL_PATH:-}
@@ -307,13 +311,16 @@ run_accuracy() {
   if [[ "${LM_EVAL_USE_CHAT_COMPLETIONS}" == "1" || "${LM_EVAL_USE_CHAT_COMPLETIONS}" == "true" ]]; then
     lm_eval_model="local-chat-completions"
     lm_eval_endpoint_path="/v1/chat/completions"
-    lm_eval_extra_args+=(--batch_size 65 --apply_chat_template --fewshot_as_multiturn)
+    lm_eval_extra_args+=(--batch_size "${LM_EVAL_BATCH_SIZE}" --apply_chat_template --fewshot_as_multiturn)
     lm_eval_model_args="model=${resolved_model_path},base_url=http://127.0.0.1:${SGLANG_PORT}${lm_eval_endpoint_path},num_concurrent=${LM_EVAL_NUM_CONCURRENT}"
   else
     lm_eval_model_args="model=${resolved_model_path},base_url=http://127.0.0.1:${SGLANG_PORT}${lm_eval_endpoint_path},num_concurrent=${LM_EVAL_NUM_CONCURRENT},max_retries=1,tokenized_requests=False,trust_remote_code=True"
   fi
   if [[ -n "${LM_EVAL_EXTRA_MODEL_ARGS}" ]]; then
     lm_eval_model_args="${lm_eval_model_args},${LM_EVAL_EXTRA_MODEL_ARGS#,}"
+  fi
+  if [[ -n "${LM_EVAL_GEN_KWARGS}" ]]; then
+    lm_eval_extra_args+=(--gen_kwargs "${LM_EVAL_GEN_KWARGS}")
   fi
 
   lm_eval --model "${lm_eval_model}" \

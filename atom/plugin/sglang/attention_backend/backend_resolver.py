@@ -60,19 +60,42 @@ def reconstruct_linear_metadata(
 
     mode = forward_batch.forward_mode
     batch_size = forward_batch.batch_size
+    # SGLang records the request count before DP/MLP-sync appends dummy rows.
+    # Without padding this field is None and every batch row is real.
+    real_batch_size = getattr(forward_batch, "_original_batch_size", None)
+    real_batch_size = batch_size if real_batch_size is None else int(real_batch_size)
+    real_batch_size = min(real_batch_size, batch_size)
     device = indices.device
+    if real_batch_size < indices.shape[0]:
+        # Mark DP/MLP-sync padding rows so they cannot read or write state.
+        indices = indices.clone()
+        indices[real_batch_size:] = -1
+
     if mode.is_decode_or_idle():
-        query_start_loc = torch.arange(
-            0, batch_size + 1, dtype=torch.int32, device=device
+        # Give each real decode request one token and every padded row zero tokens.
+        query_start_loc = torch.empty(batch_size + 1, dtype=torch.int32, device=device)
+        query_start_loc[: real_batch_size + 1] = torch.arange(
+            real_batch_size + 1, dtype=torch.int32, device=device
         )
+        query_start_loc[real_batch_size + 1 :] = real_batch_size
     elif mode.is_extend():
+        # Build variable-length query offsets using only real extend requests.
         query_start_loc = torch.empty(
             (batch_size + 1,), dtype=torch.int32, device=device
         )
-        query_start_loc[:batch_size] = forward_batch.extend_start_loc
-        query_start_loc[batch_size] = (
-            forward_batch.extend_start_loc[-1] + forward_batch.extend_seq_lens[-1]
-        )
+        if real_batch_size:
+            # End at the final real request instead of a synthetic padded row.
+            query_start_loc[:real_batch_size] = forward_batch.extend_start_loc[
+                :real_batch_size
+            ]
+            end = (
+                forward_batch.extend_start_loc[real_batch_size - 1]
+                + forward_batch.extend_seq_lens[real_batch_size - 1]
+            )
+        else:
+            # An empty real batch makes every synthetic row a zero-length query.
+            end = 0
+        query_start_loc[real_batch_size:] = end
     else:
         return None
 
