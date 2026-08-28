@@ -245,7 +245,9 @@ def test_decode_filter_block_interleave(interleave, g_ctxs, seed):
             got = out_buf[indptr[b] : indptr[b + 1]].cpu().tolist()
             assert true_counts[b] == len(exp[b])
             expected = exp[b] if exp[b] else [0]
-            assert got == expected, f"S={interleave} rank{rank} req{b}: {got} != {expected}"
+            assert (
+                got == expected
+            ), f"S={interleave} rank{rank} req{b}: {got} != {expected}"
         assert int((out_buf[: indptr[bs]] < 0).sum()) == 0, "-1 hole in region"
         per_rank_lens.append(true_counts)
 

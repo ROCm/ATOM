@@ -633,9 +633,7 @@ def _a2a_roundtrip(o_per_rank, lse_per_rank, n_ranks, owned_counts_per_rank=None
         o_r = o_per_rank[r].contiguous()
         l_r = lse_per_rank[r].contiguous().to(torch.float32)
         has_owned_counts = owned_counts_per_rank is not None
-        counts_r = (
-            owned_counts_per_rank[r].contiguous() if has_owned_counts else l_r
-        )
+        counts_r = owned_counts_per_rank[r].contiguous() if has_owned_counts else l_r
         _dcp_a2a_pack_kernel[(b, h_total)](
             o_r,
             l_r,
@@ -762,9 +760,7 @@ def test_a2a_scrubs_the_empty_rank():
     got = _a2a_roundtrip(o, lse, n_ranks, owned_counts)
     assert torch.isfinite(got).all(), "empty-rank NaN reached the a2a output"
     # Rank 0 contributed nothing, so the row is rank 1 alone (weight 1).
-    torch.testing.assert_close(
-        got[0].float(), o[1][0].float(), rtol=8e-3, atol=8e-3
-    )
+    torch.testing.assert_close(got[0].float(), o[1][0].float(), rtol=8e-3, atol=8e-3)
 
 
 @needs_dcp_ops
