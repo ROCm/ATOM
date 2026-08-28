@@ -210,6 +210,48 @@ def role_env(
     return {str(key): str(value) for key, value in env.items()}
 
 
+def _set_mooncake_protocol(config: dict[str, Any], protocol: str) -> bool:
+    """Set protocol on every Mooncake connector in a connector config."""
+    changed = False
+    if config.get("kv_connector") == "mooncake":
+        config["protocol"] = protocol
+        for key in ("ib_device", "ib_enable_alternate_hca", "ib_rail_offset"):
+            config.pop(key, None)
+        changed = True
+    for child in config.get("connectors", []):
+        if isinstance(child, dict):
+            changed = _set_mooncake_protocol(child, protocol) or changed
+    return changed
+
+
+def _single_node_hip_env(
+    env: dict[str, dict[str, str]],
+    prefill_cfg: dict[str, Any],
+) -> None:
+    """Force same-host P/D Mooncake traffic onto HIP IPC/xGMI."""
+    prefill_tp = int(prefill_cfg.get("tp", 8))
+    role_specs = (
+        ("prefill", "PREFILL_KV_TRANSFER_CONFIG", "kv_producer", 6301),
+        ("decode", "DECODE_KV_TRANSFER_CONFIG", "kv_consumer", 6301 + prefill_tp),
+    )
+    for role, key, kv_role, default_port in role_specs:
+        role_values = env[role]
+        raw = role_values.get(key)
+        if raw:
+            config = json.loads(raw)
+            if not _set_mooncake_protocol(config, "hip"):
+                continue
+        else:
+            config = {
+                "kv_role": kv_role,
+                "kv_connector": "mooncake",
+                "protocol": "hip",
+                "proxy_ip": "${ROLE_IP}",
+                "handshake_port": default_port,
+            }
+        role_values[key] = json.dumps(config, separators=(",", ":"))
+
+
 def build_cell(
     *,
     cfg: dict[str, Any],
@@ -343,6 +385,15 @@ def build_cell(
     )
     cell_id = slug(f"{model_name}-{suite_cfg.get('name', topology)}-{suite_name}")
     image = override_image or str(backend_cfg.get("image"))
+    cell_env = {
+        "common": role_env(defaults, backend_cfg, model_cfg, suite_cfg, "common"),
+        "prefill": role_env(defaults, backend_cfg, model_cfg, suite_cfg, "prefill"),
+        "decode": role_env(defaults, backend_cfg, model_cfg, suite_cfg, "decode"),
+        "router": role_env(defaults, backend_cfg, model_cfg, suite_cfg, "router"),
+    }
+    if single_node_pd:
+        _single_node_hip_env(cell_env, prefill_cfg)
+
     return {
         "id": cell_id,
         "suite": suite_name,
@@ -374,12 +425,7 @@ def build_cell(
             "router": router_cfg,
         },
         "server_args": server_args,
-        "env": {
-            "common": role_env(defaults, backend_cfg, model_cfg, suite_cfg, "common"),
-            "prefill": role_env(defaults, backend_cfg, model_cfg, suite_cfg, "prefill"),
-            "decode": role_env(defaults, backend_cfg, model_cfg, suite_cfg, "decode"),
-            "router": role_env(defaults, backend_cfg, model_cfg, suite_cfg, "router"),
-        },
+        "env": cell_env,
         "run_eval": bool(suite_cfg.get("run_eval", False)),
         "accuracy": {
             "task": str(accuracy_cfg.get("task", "gsm8k")),
