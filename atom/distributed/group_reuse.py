@@ -9,6 +9,11 @@
 * ``pynccl_comm``  -- a second, independent RCCL communicator over the *same* ranks
 * ``ca_comm`` / ``qr_comm`` -- CustomAllreduce / QuickAllReduce IPC buffers
 
+When several logical groups (TP/DCP/EP at ``tp == dcp == world_size``, plus the
+degenerate single-rank PCP/PP/DP) span the *same* set of ranks, we hand every one
+of them back the **same** ``GroupCoordinator`` instance instead of building a fresh
+one -- so a single set of RCCL communicators is shared outright.
+
 Trade-off: aliased groups issue their collectives on one communicator, so those
 collectives serialize against each other. That is already true for TP/DCP/EP, whose
 collectives are issued in sequence from the forward pass. Groups that must stay
@@ -24,49 +29,20 @@ from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
-# Every attribute GroupCoordinator.__init__ assigns; an alias must carry all of
-# them or callers reaching past the collective API will find a half-built object.
-_COORD_FIELDS = (
-    "rank",
-    "local_rank",
-    "ranks",
-    "world_size",
-    "rank_in_group",
-    "cpu_group",
-    "device_group",
-    "device",
-    "use_device_communicator",
-    "device_communicator",
-    "mq_broadcaster",
-)
-
 
 @contextlib.contextmanager
 def reuse_identical_rank_groups():
-    """Make ``init_model_parallel_group`` hand back an alias for a repeated rank set.
+    """Make ``init_model_parallel_group`` hand back the *same* instance for a repeated rank set.
 
     Scoped to the ``init_dist_env`` call: groups built later (eplb migration) keep
-    their own communicators. A no-op unless ``ATOM_REUSE_COMM_GROUPS`` is set.
+    their own communicators. A no-op unless ``ATOM_REUSE_COMM_GROUPS`` is set
+    (default on).
     """
     if not envs.ATOM_REUSE_COMM_GROUPS:
         yield
         return
 
     from aiter.dist import parallel_state as ps
-
-    class _AliasGroup(ps.GroupCoordinator):
-        """A GroupCoordinator sharing another one's communicators.
-
-        Deliberately does not call ``super().__init__`` -- that is the allocating
-        path. Only ``unique_name`` is its own, so ``_register_group`` and any
-        name-keyed lookup still resolve to distinct entries.
-        """
-
-        def __init__(self, source: "ps.GroupCoordinator", group_name: str | None):
-            self.unique_name = ps._get_unique_name(group_name or "anonymous")
-            ps._register_group(self)
-            for field in _COORD_FIELDS:
-                setattr(self, field, getattr(source, field))
 
     built: dict[tuple[tuple[int, ...], ...], ps.GroupCoordinator] = {}
     original = ps.init_model_parallel_group
@@ -85,25 +61,30 @@ def reuse_identical_rank_groups():
             source is not None
             and source.use_device_communicator == use_device_communicator
         ):
-            alias = _AliasGroup(source, group_name)
-            # The broadcaster is a shared-memory queue built over the gloo
-            # cpu_group, so it costs no VRAM and there is no reason to make two
-            # groups drive one queue. TP is the group that asks for one, and it is
-            # also the first built -- refusing to alias over it would strand the
-            # largest duplicate.
-            if use_message_queue_broadcaster and alias.world_size > 1:
+            # Reuse the whole GroupCoordinator instance -- the caller's global
+            # (e.g. _DCP/_EP) ends up pointing at the same object as the source
+            # (e.g. _TP), so they share one set of communicators outright.
+            if (
+                use_message_queue_broadcaster
+                and source.world_size > 1
+                and source.mq_broadcaster is None
+            ):
+                # The broadcaster is a shared-memory queue over the gloo
+                # cpu_group, so it costs no VRAM. TP asks for one and is built
+                # first, so the source normally already has it; only build one
+                # here if this rank set's source somehow lacks it.
                 from aiter.dist.shm_broadcast import MessageQueue
 
-                alias.mq_broadcaster = MessageQueue.create_from_process_group(
-                    alias.cpu_group, 1 << 22, 6
+                source.mq_broadcaster = MessageQueue.create_from_process_group(
+                    source.cpu_group, 1 << 22, 6
                 )
             logger.info(
-                "group_reuse: %s reuses the communicators of %s (ranks=%s)",
+                "group_reuse: %s reuses the group instance of %s (ranks=%s)",
                 group_name,
                 source.unique_name,
                 list(key[0]) if len(key) == 1 else key,
             )
-            return alias
+            return source
 
         group = original(
             group_ranks,
