@@ -89,9 +89,12 @@ export AIPERF_DATASET_CONFIGURATION_TIMEOUT=1800
 export AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT=1800
 export AIPERF_UI_REALTIME_METRICS_ENABLED=true
 
-# DP-attention runs only. Sessions are sticky: without this the correlation id
-# does not travel with the request, a conversation's turns scatter across DP
-# ranks, and each turn misses the prefix KV the previous one wrote.
+# DP-attention runs only — session affinity for ATOM's DPA router, which reads
+# `x-dynamo-session-id` (falling back to `x-correlation-id`, always sent) and
+# `x-dynamo-parent-session-id`. Only the Dynamo option emits that PARENT id,
+# which carries the lineage of a forked agent tree.
+export AIPERF_HTTP_X_DYNAMO_SESSION_ID_FROM_CORRELATION_ID=true
+# Sends X-Session-ID too. ATOM does not read it; kept for a router in front.
 export AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID=true
 ```
 
