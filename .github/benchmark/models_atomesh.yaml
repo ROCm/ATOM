@@ -363,7 +363,7 @@ models:
             common:
               ATOM_MLA_PAGE_SIZE: "1"
               ATOM_ONLINE_QUANT_STREAMING: "0"
-              ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB: "1024"
+              ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB: "2047"
               ATOM_USE_TRITON_MLA: "0"
               MAX_JOBS: "16"
               PYTHONHASHSEED: "0"
