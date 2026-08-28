@@ -321,6 +321,19 @@
     "_baseline_note": "ATOM native FP8 gsm8k over all 1319 questions, chat + 3-shot fewshot_as_multiturn: flexible-extract=0.9659, strict-match=0.9651 (SGLang publishes 0.9704-0.9757 for the same model on H100/H200/GB300). USE CHAT, NOT RAW COMPLETIONS, and keep the shots: lm_eval's gsm8k filters are built for the few-shot '#### N' convention, and this model replies in markdown/LaTeX with a trailing '**Check:** ...' line. 0-shot chat therefore scores strict-match=0.0000 and flexible-extract=0.8362 on a model whose answers are ~98% correct. num_fewshot must stay at 3 until the pooled kpool path lands: 5-shot multiturn prompts plus the generation budget exceed --max-model-len 2048 and every request fails with HTTP 400. Prefix caching is off because the KDA recurrent state is per-request. Threshold 0.94 leaves ~2.5pp headroom."
   },
   {
+    "model_name": "GLM-5.3-Flash-kpool-16shot",
+    "model_path": "zai-org/GLM-5.3-Flash",
+    "extraArgs": "--kv_cache_dtype fp8 -tp 8 --max-model-len 8192 --max-num-batched-tokens 8192 --max-num-seqs 32 --gpu-memory-utilization 0.85 --no-enable_prefix_caching",
+    "client_command": "lm_eval --model local-chat-completions --model_args model=${MODEL_PATH},base_url=http://localhost:8000/v1/chat/completions,num_concurrent=32,max_retries=3,tokenized_requests=False,max_gen_toks=512 --tasks gsm8k --num_fewshot 16 --batch_size 65 --apply_chat_template --fewshot_as_multiturn --output_path ${OUTPUT_PATH} --log_samples",
+    "env_vars": "",
+    "runner": "linux-atom-do-mi350x-8",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.94,
+    "accuracy_baseline": 0.9659,
+    "accuracy_baseline_model": "zai-org/GLM-5.3-Flash",
+    "_baseline_note": "Guards the POOLED (kpool) indexer path. 16-shot prompts run 2763-3591 tokens, so every one of the 1319 questions exceeds index_topk=2048 and pooled scoring plus pooled top-k decide what the model attends to. The 2048 entry above does NOT cover this: below index_topk attention_mla runs dense MLA and the indexer's selection is computed but never used, so a short-context score only shows the pooled writes did no harm. Measured 2026-08-28: flexible-extract=0.9659, strict-match=0.9659 -- equal to the 3-shot@2048 baseline. Needs --max-model-len 8192, not 4096: lm_eval samples its shots at random and the longest prompt is 3591 tokens, which with max_gen_toks=512 overflows a 4096 cap and 400s."
+  },
+  {
     "model_name": "GLM-5.2-MXFP4",
     "model_path": "amd/GLM-5.2-MXFP4",
     "extraArgs": "--kv_cache_dtype fp8 -tp 4 --online_quant_config '{\"global_quant_config\": \"ptpc_fp8\", \"exclude_layer\": [\"lm_head\", \"model.embed_tokens\", \"*.mlp.gate\", \"*expert*\"]}'",

@@ -275,6 +275,24 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         self.padded_num_attention_heads = max(self.num_attention_heads, _MLA_MIN_HEADS)
         self.is_sparse = model_runner.is_deepseek_v32
         self.index_topk = hf_config.index_topk if self.is_sparse else -1
+        # GLM-5.3's pooled indexer selects `index_topk // index_kpool` POOLS --
+        # index_topk tokens -- and then appends the trailing incomplete pool,
+        # which is never scored (`index_kpool_always_select_tail`). So a row can
+        # carry up to `index_topk + index_kpool - 1` entries, not index_topk.
+        # The per-row width also has to divide the conversion kernels' BLOCK_N,
+        # hence the round up to 128; the extra columns are never read, because
+        # `sparse_kv_indptr` caps each row at its true count.
+        #
+        # `index_topk` itself stays the sparse-vs-dense THRESHOLD: at or below
+        # it every pool is selected and the dense path is exactly equivalent.
+        self.index_kpool = (
+            int(getattr(hf_config, "index_kpool", 1) or 1) if self.is_sparse else 1
+        )
+        if self.is_sparse and self.index_kpool > 1:
+            width = self.index_topk + self.index_kpool - 1
+            self.index_topk_out = ((width + 127) // 128) * 128
+        else:
+            self.index_topk_out = self.index_topk
         self.dtype_kv = dtypes.d_dtypes[config.kv_cache_dtype]
         self.dtype_q = self.dtype_kv
 
@@ -382,7 +400,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             mla_metadata["sparse_kv_last_page_lens"].np[:] = 1
             mla_metadata["sparse_kv_last_page_lens"].copy_to_gpu()
             self._sparse_kv_indices_gpu = torch.empty(
-                self.max_num_batched_tokens * self.index_topk,
+                self.max_num_batched_tokens * self.index_topk_out,
                 dtype=torch.int32,
                 device=self.device,
             )
@@ -1256,11 +1274,41 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             src.astype(np.int32)
         ).to(dev, non_blocking=True)
 
+    def _sparse_selected_counts(self, seq_lens):
+        """How many KV entries the indexer actually selects for each row.
+
+        Token-granular: ``min(seq_len, index_topk)``.
+
+        Pooled (kpool): ``min(pools, index_topk // kpool) * kpool`` history
+        tokens plus the ``seq_len % kpool`` tail tokens, which are appended
+        unscored. Note this collapses to exactly ``seq_len`` whenever
+        ``seq_len <= index_topk`` -- the same value the token-granular
+        expression gives -- so the two paths agree below the threshold by
+        construction rather than by coincidence.
+        """
+        if self.index_kpool <= 1:
+            return np.minimum(seq_lens, self.index_topk)
+        kpool = self.index_kpool
+        pools = seq_lens // kpool
+        history = np.minimum(pools, self.index_topk // kpool) * kpool
+        return (history + seq_lens % kpool).astype(np.int32)
+
     def prepare_prefill(self, batch: ScheduledBatch):
         attn_metadata, positions = CommonAttentionBuilder.prepare_prefill(self, batch)
         bs = batch.total_seqs_num_prefill
         sum_scheduled_tokens = batch.total_tokens_num_prefill
         var = self.model_runner.forward_vars
+        # kpool writes ONE compressed key per index_kpool tokens into the paged
+        # index cache on every prefill, short or long, so it needs the block
+        # table even below the sparse threshold -- where the token-granular
+        # path never asks for one.
+        if (
+            self.is_sparse
+            and self.index_kpool > 1
+            and attn_metadata.block_tables is None
+        ):
+            self.prepare_block_tables(batch)
+            attn_metadata.block_tables = var["block_tables"].copy_to_gpu(bs)
         if self.is_sparse and attn_metadata.max_seqlen_k > self.index_topk:
             if attn_metadata.block_tables is None:
                 self.prepare_block_tables(batch)
@@ -1317,7 +1365,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             )
             var["sparse_kv_indptr"].np[0] = 0
             var["sparse_kv_indptr"].np[1 : sum_scheduled_tokens + 1] = np.cumsum(
-                np.minimum(sparse_counts, self.index_topk),
+                self._sparse_selected_counts(sparse_counts),
                 dtype=np.int32,
             )
             attn_metadata.sparse_kv_indptr = var["sparse_kv_indptr"].copy_to_gpu(
@@ -1558,9 +1606,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         local_lens_allranks = np.stack(
             [get_dcp_local_seq_lens(cached_lens, dcp, r, s_itl) for r in range(dcp)],
             axis=1,
-        ).astype(
-            np.int64
-        )  # [bs, dcp]
+        ).astype(np.int64)  # [bs, dcp]
 
         # Number of local blocks per seq is identical on every rank
         # (= ceil(global_len / vbs)), so the padded local length is uniform and
@@ -1895,7 +1941,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         }
 
         if self.is_sparse:
-            index_topk = self.index_topk
             if max_seqlen_q > 1:
                 # MTP verify: per-token sparse metadata
                 # Each token at offset j in seq s sees (context_lens[s] - max_seqlen_q + j + 1) KV entries
@@ -1906,7 +1951,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                         np.arange(1, max_seqlen_q + 1, dtype=np.int32), scheduled_bs
                     )
                 )
-                sparse_per_token_lens = np.clip(per_token_kv_lens, 0, index_topk)
+                sparse_per_token_lens = self._sparse_selected_counts(
+                    np.maximum(per_token_kv_lens, 0)
+                )
                 var["sparse_kv_indptr"].np[1 : sum_scheduled_tokens + 1] = np.cumsum(
                     sparse_per_token_lens, dtype=np.int32
                 )
@@ -1918,8 +1965,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 vars_used.append(("sparse_cu_seqlens_q", sum_tokens + 1))
                 metadata_deps.add("sparse_kv_indptr")
             else:
-                sparse_context_lens = np.clip(
-                    var["context_lens"].np[:bs], None, index_topk
+                sparse_context_lens = self._sparse_selected_counts(
+                    var["context_lens"].np[:bs]
                 )
                 var["sparse_kv_indptr"].np[1 : bs + 1] = np.cumsum(
                     sparse_context_lens, dtype=np.int32
@@ -2144,9 +2191,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     if ub_real_reqs > 0
                     else 0
                 )
-                var[f"{p}sparse_kv_indptr"].np[
-                    ub_real_reqs + 1 : running_bs + 1
-                ] = sparse_last
+                var[f"{p}sparse_kv_indptr"].np[ub_real_reqs + 1 : running_bs + 1] = (
+                    sparse_last
+                )
 
             last_cu = ub_real_reqs * max_seqlen_q
             var[f"{p}cu_seqlens_q"].np[: ub_real_reqs + 1] = np.arange(

@@ -5,6 +5,7 @@ import numpy as np
 import torch
 from aiter import dtypes
 
+from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mla import MLAAttention
 from atom.utils import envs
@@ -12,7 +13,7 @@ from atom.utils import envs
 from .aiter_mla import AiterMLAMetadataBuilder, mla_kv_entry_dim
 from .backends import AttentionBackend
 from .gdn_attn import GDNStateMixin
-from .sub_pool_spec import SubPoolSpec, page_pool
+from .sub_pool_spec import SubPoolSpec, page_pool, state_pool
 from .triton_mla import TritonMLAMetadataBuilder
 
 
@@ -85,6 +86,87 @@ class _KimiMLAGDNCommon(GDNStateMixin):
         """Indexer entry width, padded to 16B so inductor sees aligned rows."""
         hf = self.model_runner.config.hf_config
         return ((hf.index_head_dim + 4 + 15) // 16) * 16
+
+    # ---- kpool tail buffer -------------------------------------------------
+    #
+    # GLM-5.3-Flash's indexer caches one POOLED key per `index_kpool` tokens, so
+    # the in-progress pool's raw K and gate score have to outlive the step that
+    # produced them. They ride the per-request state slots KDA already owns
+    # rather than a second paged cache: the buffer is `index_kpool - 1` useful
+    # rows of 2 x head_dim bf16 per request per indexer layer -- well under a MB
+    # for the whole engine -- and it inherits the state pool's lifetime, fork
+    # and relocation semantics for free.
+
+    def _kpool_size(self) -> int:
+        """``index_kpool``, or 1 when this model does not pool indexer keys."""
+        hf = self.model_runner.config.hf_config
+        return int(getattr(hf, "index_kpool", 1) or 1)
+
+    def _kpool_tail_bytes(self) -> int:
+        """Per-request tail bytes across every indexer-owning layer."""
+        kpool = self._kpool_size()
+        if kpool <= 1 or not self.model_runner.is_deepseek_v32:
+            return 0
+        hf = self.model_runner.config.hf_config
+        index_cache_layer_ids, _ = self._index_cache_layout()
+        per_layer = 2 * kpool * hf.index_head_dim * torch.bfloat16.itemsize
+        return len(index_cache_layer_ids) * per_layer
+
+    def state_spec(self) -> SubPoolSpec:
+        """KDA recurrent state, plus GLM-5.3's kpool tail in the same entry.
+
+        Widening the existing entry rather than declaring a second class keeps
+        one slot id per request: the tail must be addressed by exactly the
+        index KDA's state is, or a request would read another's partial pool.
+        """
+        base = super().state_spec()
+        extra = self._kpool_tail_bytes()
+        if not extra:
+            return base
+        return state_pool(
+            base.name,
+            base.entry_bytes + extra,
+            entries_per_req=base.entries_per_req,
+            extra_entries=base.extra_entries,
+        )
+
+    def allocate_per_req_cache(self, entries: dict[str, int]) -> dict:
+        out = super().allocate_per_req_cache(entries)
+        if not self._kpool_tail_bytes():
+            return out
+        hf = self.model_runner.config.hf_config
+        index_cache_layer_ids, _ = self._index_cache_layout()
+        out["kpool_tail_cache"] = torch.zeros(
+            (
+                len(index_cache_layer_ids),
+                entries.get(STATE_SLOT_CLASS, 0),
+                2,  # 0 = K, 1 = gate score
+                self._kpool_size(),
+                hf.index_head_dim,
+            ),
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        return out
+
+    def relocate_state_slots(self, pairs) -> None:
+        """Move the tail with the KDA state it shares a slot group with.
+
+        Missing this would leave a relocated request reading the partial pool
+        of whichever request previously held its new slot -- a corruption that
+        only shows up once the pool boundary moves under load.
+        """
+        super().relocate_state_slots(pairs)
+        tail = getattr(self.model_runner, "kpool_tail_cache", None)
+        if tail is None or not pairs:
+            return
+        span = 1 + self.num_spec
+        dsts, srcs = [], []
+        for src_group, dst_group in pairs:
+            src, dst = src_group * span, dst_group * span
+            dsts.append(tail[:, dst : dst + span])
+            srcs.append(tail[:, src : src + span])
+        torch._foreach_copy_(dsts, srcs)
 
     def allocate_kv_cache_tensors(
         self, num_kv_heads: int, num_draft_layers: int
@@ -166,14 +248,20 @@ class _KimiMLAGDNCommon(GDNStateMixin):
                         "Sparse MLA indexer layer is missing from the compact "
                         f"index cache layout: layer_num={layer_id}"
                     )
-                index_cache = runner.index_cache[
-                    runner.index_cache_layer_map[layer_id]
-                ]
+                index_cache = runner.index_cache[runner.index_cache_layer_map[layer_id]]
                 module.indexer.k_cache.kv_cache[0] = index_cache.view(
                     runner.num_physical_kvcache_blocks * runner.physical_block_size,
                     1,
                     runner.aligned_index_dim,
                 )
+                # kpool: this layer's slice of the per-request tail buffer,
+                # bound here for the same reason the index cache is -- the
+                # indexer has no other route to a runner-owned tensor.
+                tail = getattr(runner, "kpool_tail_cache", None)
+                if tail is not None:
+                    module.indexer.kpool_tail_cache = tail[
+                        runner.index_cache_layer_map[layer_id]
+                    ]
             module.kv_cache = kv_cache
             return KVCacheTensor(
                 layer_num=layer_id,

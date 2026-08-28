@@ -45,12 +45,24 @@ from aiter.dist.parallel_state import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
 )
+from aiter.ops.cache import (
+    cp_gather_indexer_k_quant_cache,
+    indexer_k_quant_and_cache,
+)
+from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
+from aiter.ops.triton.attention.fp8_mqa_logits import fp8_mqa_logits
+from aiter.ops.triton.attention.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 from torch import nn
 
 from atom.config import Config, QuantizationConfig
-from atom.model_ops.attention_mla import MLAModules
+from atom.model_ops.attention_mla import (
+    MLAModules,
+    triton_convert_req_index_to_global_index,
+    triton_convert_req_index_to_global_index_dsa_prefill,
+)
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
+from atom.model_ops.glm5_next import kpool as kpool_ops
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import (
     ColumnParallelLinear,
@@ -59,7 +71,12 @@ from atom.model_ops.linear import (
 )
 from atom.model_ops.mhc import HyperConnection, MHCOps, hc_contract, hc_expand
 from atom.model_ops.utils import atom_parameter
-from atom.models.deepseek_v2 import DeepseekV2MLP, DeepseekV2MoE, Indexer
+from atom.models.deepseek_v2 import (
+    SPARSE_INDEXER_LOGITS_BUDGET_MB,
+    DeepseekV2MLP,
+    DeepseekV2MoE,
+    Indexer,
+)
 from atom.models.kimi_k3 import KimiKDAAttention, _NoPositionalRotaryEmbedding
 from atom.models.utils import (
     IntermediateTensors,
@@ -68,6 +85,7 @@ from atom.models.utils import (
     make_layers,
     maybe_prefix,
 )
+from atom.utils.custom_register import direct_register_custom_op
 
 # GLM-5.3-Flash's MLA is NoPE (`qk_rope_head_dim == 0`), but the ROCm stack
 # assumes a rope block exists in more places than is practical to special-case:
@@ -373,18 +391,97 @@ class Glm5NextIndexer(Indexer):
                 torch.empty(self.head_dim, self.hidden_size, dtype=torch.bfloat16)
             )
         self._kpool_warned = False
+        # Bound by the metadata builder alongside the index K cache.
+        self.kpool_tail_cache: torch.Tensor | None = None
+        # Selection width: `index_topk` history tokens PLUS the unscored tail,
+        # rounded up to the conversion kernels' BLOCK_N. Kept in sync with
+        # `AiterMLAMetadataBuilder.index_topk_out`, which sizes the buffer this
+        # writes into; the extra columns are never read because
+        # `sparse_kv_indptr` caps every row at its true count.
+        if self.index_kpool > 1:
+            width = self.topk_tokens + self.index_kpool - 1
+            self.topk_out_width = ((width + 127) // 128) * 128
+        else:
+            self.topk_out_width = self.topk_tokens
+
+    def use_kpool(self) -> bool:
+        """Whether to run the pooled indexer.
+
+        ``ATOM_GLM5_KPOOL`` switches the pooled write, the pooled scoring and
+        the pooled selection together, so the two settings are genuinely
+        independent implementations of the same selection -- which is what
+        makes the short-context A/B a check and not a tautology.
+        """
+        if self.index_kpool <= 1:
+            return False
+        return os.environ.get("ATOM_GLM5_KPOOL", "1") == "1"
 
     def _assert_kpool_regime(self, max_seqlen_k: int) -> None:
         """Refuse the regime where pooled and token-granular top-k diverge."""
         if self.index_kpool <= 1 or max_seqlen_k <= self.topk_tokens:
             return
+        if self.use_kpool():
+            return
         raise NotImplementedError(
-            "GLM-5.3-Flash kpool indexer: pooled top-k is not implemented yet, "
-            f"and this batch has max_seqlen_k={max_seqlen_k} > index_topk="
-            f"{self.topk_tokens}, where pooled selection genuinely differs from "
-            "the token-granular fallback. Cap the context at index_topk until "
-            "the pooled path lands -- returning the fallback here would be "
-            "silently wrong, not merely slower."
+            "GLM-5.3-Flash: this batch has max_seqlen_k="
+            f"{max_seqlen_k} > index_topk={self.topk_tokens}, where pooled "
+            "selection genuinely differs from the token-granular fallback, and "
+            "ATOM_GLM5_KPOOL=0 disabled the pooled path. Returning the fallback "
+            "here would be silently wrong, not merely slower."
+        )
+
+    def _maybe_dump_selection(self, attn_metadata) -> None:
+        """Save this layer's selected KV slots when ATOM_GLM5_KPOOL_DUMP is set.
+
+        Both the pooled and the token-granular path write the SAME buffer, so
+        one hook here captures either -- which is what makes the A/B a
+        comparison of two independent implementations rather than of one path
+        against its own past output.
+
+        Compare as SETS, not element-wise: the dense path emits in score order,
+        the pooled path in pool-expanded order. Attention is permutation
+        invariant over keys, so the set is what has to match.
+        """
+        path = os.environ.get("ATOM_GLM5_KPOOL_DUMP")
+        if not path or self.prefix != os.environ.get(
+            "ATOM_GLM5_KPOOL_DUMP_LAYER", self.prefix
+        ):
+            return
+        # This reads a device value (`.item()`), which CUDAGraph capture
+        # forbids outright -- and the profile/capture batches would be
+        # meaningless to compare anyway. Same guard every other probe in this
+        # file goes through, minus its dependence on ATOM_GLM5_DEBUG_STATS.
+        if _dbg_capturing():
+            return
+        from atom.utils.forward_context import get_forward_context
+
+        try:
+            if get_forward_context().context.is_dummy_run:
+                return
+        except (RuntimeError, AttributeError, AssertionError):
+            return
+        indptr = getattr(attn_metadata, "sparse_kv_indptr", None)
+        if indptr is None:
+            return
+        # An empty selection is not a passing comparison, it is a broken probe:
+        # two empty sets match trivially. Refuse to write a dump that would let
+        # the A/B report success without having compared anything.
+        total = int(indptr[int(indptr.shape[0]) - 1].item())
+        if total <= 0:
+            return
+        import torch as _torch
+
+        rows = int(indptr.shape[0]) - 1
+        _torch.save(
+            {
+                "prefix": self.prefix,
+                "indptr": indptr[: rows + 1].detach().cpu(),
+                "indices": self.sparse_kv_indices_buffer[: int(indptr[rows].item())]
+                .detach()
+                .cpu(),
+            },
+            f"{path}.r{_torch.cuda.current_device()}.{self.prefix}."
+            f"{'prefill' if attn_metadata.max_seqlen_q > 1 else 'decode'}.pt",
         )
 
     def forward_impl(
@@ -411,12 +508,83 @@ class Glm5NextIndexer(Indexer):
         # NoPE: no rope split, no rotation -- q and k are entirely "nope".
         k = self.k_norm(k)
         q = q.view(-1, self.head_dim)
-        q_fp8, q_scale = self.quant_func(q, quant_dtype=dtypes.fp8)
+        kpool = self.use_kpool()
+        if kpool:
+            # The pooled keys are cached Hadamard-rotated, so the query has to
+            # be rotated by the same orthonormal transform or the dot products
+            # mean nothing. Fused with the FP8 quant to avoid a round trip.
+            q_fp8, q_scale = kpool_ops.fwht128_quant_fp8(q)
+        else:
+            q_fp8, q_scale = self.quant_func(q, quant_dtype=dtypes.fp8)
         q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
         q_scale = q_scale.view(-1, self.n_head, 1)
         weights = (weights.unsqueeze(-1) * q_scale * self._weights_scale).squeeze(-1)
 
-        return self.sparse_attn_indexer_impl(
+        if kpool:
+            # The memory-profiling forward runs BEFORE the KV cache (and the
+            # tail buffer with it) exists, so "unbound" is expected there and
+            # only there -- the op discards dummy runs before touching either.
+            # Anywhere else it means this model is on a builder that never
+            # allocated the buffer, which must not be papered over.
+            tail_cache = self.kpool_tail_cache
+            if tail_cache is None:
+                assert get_forward_context().context.is_dummy_run, (
+                    "kpool needs its per-request tail buffer, which the MLA+GDN "
+                    "metadata builder binds next to the index K cache. Unbound "
+                    "on a real forward means this model is running on a builder "
+                    "that does not allocate it."
+                )
+                tail_cache = torch.zeros(
+                    1,
+                    2,
+                    self.index_kpool,
+                    self.head_dim,
+                    dtype=torch.bfloat16,
+                    device=hidden_states.device,
+                )
+            gdn = getattr(attn_metadata, "gdn_metadata", None)
+            state_slot_idx = None if gdn is None else gdn.non_spec_state_indices_tensor
+            if state_slot_idx is None:
+                # The profile/warmup forward carries no block tables, so the
+                # builder leaves gdn_metadata unset. That forward is a dummy
+                # run and the op discards it before touching any state; the
+                # placeholder only has to exist. CUDAGraph capture DOES get
+                # real slots (`_build_gdn_capture_metadata`), and it must --
+                # capture bakes this pointer in, so a zeros stand-in there
+                # would send every request's tail to slot 0 on replay.
+                state_slot_idx = torch.zeros(
+                    hidden_states.shape[0],
+                    dtype=torch.int32,
+                    device=hidden_states.device,
+                )
+            out = torch.ops.aiter.sparse_attn_indexer_kpool(
+                hidden_states,
+                self.k_cache.kv_cache[0],
+                q_fp8,
+                k,
+                # The gate that drives the pooling softmax comes from the same
+                # hidden states that produced k, so it stays token-aligned.
+                torch.nn.functional.linear(
+                    hidden_states, self.index_kpool_compress_gate
+                ),
+                weights,
+                self.index_kpool_compress_ape,
+                tail_cache,
+                state_slot_idx,
+                positions,
+                self.sparse_kv_indices_buffer,
+                self.topk_tokens,
+                self.index_kpool,
+                self.head_dim,
+                self.max_model_len,
+                self.topk_out_width,
+                self.scale_fmt,
+                self.stable_topk,
+            )
+            self._maybe_dump_selection(attn_metadata)
+            return out
+
+        out = self.sparse_attn_indexer_impl(
             hidden_states,
             self.k_cache.prefix,
             self.k_cache.kv_cache[0],
@@ -445,6 +613,8 @@ class Glm5NextIndexer(Indexer):
             False,
             self.stable_topk,
         )
+        self._maybe_dump_selection(attn_metadata)
+        return out
 
 
 def _mla_ref_check(layer, q_c, kv_c_normed, out) -> None:
@@ -1423,3 +1593,500 @@ class Glm5NextForConditionalGeneration(Glm5NextForCausalLM):
             f"model.language_model.layers.{n}.",
             f"model.layers.{n}.",
         ]
+
+
+# ==========================================================================
+# kpool: the pooled indexer path
+# ==========================================================================
+#
+# The token-granular indexer this file inherits from DeepSeek-V3.2 scores every
+# cached token. GLM-5.3 instead caches ONE key per `index_kpool` tokens, runs
+# top-k over pools, expands each selected pool back to its tokens, and always
+# appends the trailing incomplete pool.
+#
+# Pool p lives at `block_table[kpool * (p // block_size)]`, row `p % block_size`
+# (`kpool.pooled_block_table`): pooled rows stay `block_size`-per-block so the
+# paged MQA-logits kernel keeps its preshuffled layout -- the only one it
+# computes correctly, at any block size. Nothing in the KV allocator changes;
+# three of every four blocks' index-cache regions simply go unused.
+#
+# Below `index_topk` the pooled and token-granular selections are the SAME SET:
+# top-k picks every pool, so the expansion yields every token position. That is
+# the equality the A/B gate checks, and it exercises the pooled write, the
+# pooled scoring, the pooled top-k and the expansion all at once.
+
+
+def _kpool_request_index(cu_seqlens_q: torch.Tensor, n_tokens: int) -> torch.Tensor:
+    """Per-token request id for a flat prefill batch."""
+    counts = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).to(torch.int64)
+    return torch.repeat_interleave(
+        torch.arange(counts.shape[0], device=cu_seqlens_q.device, dtype=torch.int64),
+        counts,
+        output_size=n_tokens,
+    )
+
+
+def _kpool_write_completed_pools(
+    kv_cache: torch.Tensor,
+    k: torch.Tensor,
+    gate_score: torch.Tensor,
+    positions: torch.Tensor,
+    pool_bt: torch.Tensor,
+    req_idx: torch.Tensor,
+    compress_ape: torch.Tensor,
+    index_kpool: int,
+    head_dim: int,
+    scale_fmt: str,
+    block_size: int,
+    chunk_start: torch.Tensor | None = None,
+    tail_cache: torch.Tensor | None = None,
+    state_slot_idx: torch.Tensor | None = None,
+) -> None:
+    """Compress and cache every pool that closes inside this batch.
+
+    Every token is treated as a pool-completion candidate and non-completions
+    are masked off with a ``-1`` slot, which ``indexer_k_quant_and_cache``
+    skips. Compacting the valid rows first would cost two device syncs on the
+    eager prefill path and buys nothing numerically.
+
+    ``chunk_start`` (per request, absolute) enables cross-chunk carry-over for
+    pools split by chunked prefill; pass None when every request starts at 0.
+    """
+    kpool = index_kpool
+    n = k.shape[0]
+    if n < kpool:
+        return
+    row = torch.arange(n, device=k.device)
+    offs = torch.arange(kpool, device=k.device)
+    # Token i closes the pool spanning tokens i-(kpool-1) .. i.
+    idx = (row - (kpool - 1)).clamp_min(0)[:, None] + offs[None, :]
+    pool_k, pool_gate = k[idx], gate_score[idx]
+    if chunk_start is not None:
+        # Chunked prefill can split a request mid-pool. That pool's earlier
+        # tokens are not in this batch -- but they ARE in the tail buffer, which
+        # the previous chunk seeded with exactly them. Substitute those rows
+        # instead of refusing the batch (or, worse, compressing a pool from the
+        # wrong tokens: the pool would then be silently wrong forever, since
+        # nothing ever revisits it).
+        #
+        # Pool starts are multiples of kpool, so a slot's absolute position has
+        # `abs % kpool == s` and the tail row index is just the slot index.
+        abs_slot = positions.to(torch.int64)[:, None] - (kpool - 1) + offs[None, :]
+        from_tail = abs_slot < chunk_start[req_idx][:, None]
+        stash = tail_cache[state_slot_idx[req_idx]]  # [n, 2, kpool, head_dim]
+        pool_k = torch.where(from_tail[..., None], stash[:, 0], pool_k)
+        pool_gate = torch.where(from_tail[..., None], stash[:, 1], pool_gate)
+    pooled = kpool_ops.pool_and_rotate(pool_k, pool_gate, compress_ape)
+    abs_pos = positions.to(torch.int64)
+    closes = (abs_pos % kpool == kpool - 1) & (row >= kpool - 1)
+    slots = kpool_ops.pool_slot_mapping(
+        pool_bt,
+        torch.where(closes, abs_pos // kpool, torch.full_like(abs_pos, -1)),
+        req_idx,
+        block_size,
+    )
+    indexer_k_quant_and_cache(
+        pooled, kv_cache, slots, head_dim, scale_fmt, preshuffle=True
+    )
+
+
+def _kpool_pool_counts(seq_lens_k: torch.Tensor, kpool: int) -> torch.Tensor:
+    """Complete pools per request. The tail is never cached, only appended."""
+    return seq_lens_k.to(torch.int64) // kpool
+
+
+_KPOOL_REF_SEEN: set = set()
+
+
+def _kpool_verify_cache(
+    kv_cache, k, gate_score, positions, pool_bt, cu_q, ape, kpool, head_dim
+) -> None:
+    """ATOM_GLM5_KPOOL_REF=1: read the pooled keys back and check them.
+
+    The synthetic round-trip test proves the ADDRESSING; this proves the whole
+    write actually landed under the engine's real metadata -- that the k and
+    gate reaching the kernel are the right rows, that `positions` line up with
+    the slots, and that the gather reads back what was written. Those are
+    exactly the couplings a synthetic test cannot see.
+
+    Off by default: it gathers and syncs, so it is a debugging tool, not a
+    runtime check.
+    """
+    if os.environ.get("ATOM_GLM5_KPOOL_REF", "0") != "1" or _dbg_capturing():
+        return
+    from atom.utils.forward_context import get_forward_context
+
+    try:
+        if get_forward_context().context.is_dummy_run:
+            return
+    except (RuntimeError, AttributeError, AssertionError):
+        return
+    n_req = int(cu_q.shape[0]) - 1
+    if n_req < 1:
+        return
+    q0, q1 = int(cu_q[0].item()), int(cu_q[1].item())
+    seq_len = int(positions[q1 - 1].item()) + 1
+    n_pools = seq_len // kpool
+    # Only the pools whose four tokens are all inside this chunk can be checked
+    # against `k` here; earlier ones came from a previous chunk's tensors.
+    first = ((seq_len - (q1 - q0)) + kpool - 1) // kpool
+    if n_pools <= first:
+        return
+    key = (id(kv_cache), seq_len)
+    if key in _KPOOL_REF_SEEN:
+        return
+    _KPOOL_REF_SEEN.add(key)
+
+    from aiter.ops.cache import cp_gather_indexer_k_quant_cache
+
+    dst_k = torch.empty(n_pools, head_dim, dtype=dtypes.fp8, device=k.device)
+    dst_s = torch.empty(n_pools, 1, dtype=torch.float32, device=k.device)
+    cu = torch.tensor([0, n_pools], dtype=torch.int32, device=k.device)
+    cp_gather_indexer_k_quant_cache(
+        kv_cache, dst_k, dst_s.view(dtypes.fp8), pool_bt[:1], cu, preshuffle=True
+    )
+    got = (dst_k.float() * dst_s)[first:n_pools]
+
+    base = (first * kpool) - (seq_len - (q1 - q0)) + q0
+    m = (n_pools - first) * kpool
+    want = kpool_ops.pool_and_rotate(
+        k[base : base + m].view(-1, kpool, head_dim),
+        gate_score[base : base + m].view(-1, kpool, head_dim),
+        ape,
+    ).float()
+    num = (got * want).sum(-1)
+    den = got.norm(dim=-1) * want.norm(dim=-1) + 1e-9
+    cos = (num / den).min().item()
+    rel = ((got - want).abs().max() / want.abs().max().clamp_min(1e-9)).item()
+    print(
+        f"[kpool-ref] seq_len={seq_len} pools[{first}:{n_pools}] "
+        f"min_cos={cos:.6f} rel_err={rel:.4f}",
+        flush=True,
+    )
+
+
+def _sparse_attn_indexer_kpool(
+    hidden_states: torch.Tensor,
+    kv_cache: torch.Tensor,
+    q_fp8: torch.Tensor,
+    k: torch.Tensor,
+    gate_score: torch.Tensor,
+    weights: torch.Tensor,
+    compress_ape: torch.Tensor,
+    tail_cache: torch.Tensor,
+    state_slot_idx: torch.Tensor,
+    positions: torch.Tensor,
+    sparse_kv_indices_buffer: torch.Tensor,
+    topk_tokens: int,
+    index_kpool: int,
+    head_dim: int,
+    max_model_len: int,
+    topk_out_width: int,
+    scale_fmt: str,
+    stable_topk: bool,
+) -> torch.Tensor:
+    """Pooled sparse-indexer top-k. Writes ``sparse_kv_indices_buffer``.
+
+    Mirrors `deepseek_v2.sparse_attn_indexer` step for step, with pools where
+    it has tokens: the cache holds one compressed key per `index_kpool` tokens,
+    top-k selects `topk_tokens // index_kpool` POOLS, and the selection is
+    expanded back to token positions with the unscored tail appended.
+    """
+    from atom.config import get_current_atom_config
+    from atom.utils.forward_context import get_forward_context
+
+    forward_context = get_forward_context()
+    attn_metadata = forward_context.attn_metadata
+    context = forward_context.context
+    if context.is_dummy_run:
+        return torch.zeros_like(weights, dtype=torch.float32)
+
+    # Axes this landing does not cover. Each one would mis-index rather than
+    # fail, so refuse explicitly instead of returning a quietly wrong selection.
+    from atom.distributed.dcp_utils import get_dcp_world_size
+    from atom.distributed.pcp_utils import pcp_is_enabled
+
+    if get_dcp_world_size() > 1 or pcp_is_enabled():
+        raise NotImplementedError(
+            "GLM-5.3 kpool + DCP/PCP: both shard tokens round-robin across "
+            "ranks, which does not commute with pooling four CONSECUTIVE "
+            "tokens into one key. Run kpool at dcp=pcp=1."
+        )
+    if not context.is_prefill and attn_metadata.max_seqlen_q > 1:
+        raise NotImplementedError(
+            "GLM-5.3 kpool + speculative decode: the decode path assumes one "
+            f"token per request, got max_seqlen_q={attn_metadata.max_seqlen_q}. "
+            "GLM-5.3's MTP layer is not loaded, so this is unreachable today."
+        )
+
+    device = hidden_states.device
+    block_size = get_current_atom_config().kv_cache_block_size
+    kv_cache = kv_cache.view(-1, block_size, kv_cache.shape[-1])
+    pool_bt = kpool_ops.pooled_block_table(attn_metadata.block_tables, index_kpool)
+    select_k = topk_tokens // index_kpool
+    n_tokens = hidden_states.shape[0]
+    n_head = q_fp8.shape[1]
+
+    topk_indices = torch.full(
+        (n_tokens, topk_out_width), -1, dtype=torch.int32, device=device
+    )
+
+    if context.is_prefill:
+        cu_q = attn_metadata.cu_seqlens_q
+        req_idx = _kpool_request_index(cu_q, n_tokens)
+        chunk_start = None
+        if attn_metadata.has_cached:
+            cu_k0 = attn_metadata.cu_seqlens_k
+            nreq = cu_q.shape[0] - 1
+            chunk_start = (cu_k0[1 : nreq + 1] - cu_k0[:nreq]).to(torch.int64) - (
+                cu_q[1:] - cu_q[:-1]
+            ).to(torch.int64)
+        _kpool_write_completed_pools(
+            kv_cache,
+            k,
+            gate_score,
+            positions,
+            pool_bt,
+            req_idx,
+            compress_ape,
+            index_kpool,
+            head_dim,
+            scale_fmt,
+            block_size,
+            chunk_start=chunk_start,
+            tail_cache=tail_cache,
+            state_slot_idx=state_slot_idx,
+        )
+        # The trailing incomplete pool has to outlive this forward; decode
+        # finishes it one token at a time.
+        kpool_ops.kpool_seed_tail(
+            tail_cache, k, gate_score, positions, cu_q, state_slot_idx, index_kpool
+        )
+        _kpool_verify_cache(
+            kv_cache,
+            k,
+            gate_score,
+            positions,
+            pool_bt,
+            cu_q,
+            compress_ape,
+            index_kpool,
+            head_dim,
+        )
+        if attn_metadata.max_seqlen_k <= topk_tokens:
+            # Every pool would be selected; the caller runs dense, exactly as
+            # the token-granular path does below its own threshold.
+            return weights
+
+        bs = cu_q.shape[0] - 1
+        if attn_metadata.has_cached:
+            cu_k = attn_metadata.cu_seqlens_k
+            seq_lens_k = (cu_k[1 : bs + 1] - cu_k[:bs]).to(torch.int64)
+        else:
+            seq_lens_k = (cu_q[1:] - cu_q[:-1]).to(torch.int64)
+        pool_counts = _kpool_pool_counts(seq_lens_k, index_kpool)
+        pool_cu = torch.zeros(bs + 1, dtype=torch.int32, device=device)
+        pool_cu[1:] = torch.cumsum(pool_counts, 0).to(torch.int32)
+
+        # EXACTLY pool_cu[bs] rows, never more. `cp_gather_indexer_k_quant_cache`
+        # resolves each destination row to a request by scanning cu_seq_lens; a
+        # row past the last sequence matches nothing, leaves `batch_idx` as
+        # uninitialized shared memory, and indexes the block table with garbage
+        # -- an illegal memory access, surfacing later at whatever kernel next
+        # synchronizes. The token-granular path is safe only because it sizes
+        # this buffer to `total_kv` exactly, so do the same.
+        #
+        # This costs one D2H sync per prefill. Prefill is eager (never captured),
+        # and the builder already does host-side work per batch, so it is free
+        # in practice -- and much cheaper than being wrong.
+        max_pools = int(pool_cu[bs].item())
+        if max_pools <= 0:
+            return weights
+        k_fp8 = torch.empty([max_pools, head_dim], device=device, dtype=dtypes.fp8)
+        k_scale = torch.empty([max_pools, 1], device=device, dtype=torch.float32)
+        cp_gather_indexer_k_quant_cache(
+            kv_cache, k_fp8, k_scale.view(dtypes.fp8), pool_bt, pool_cu, preshuffle=True
+        )
+
+        # Per-query causal window, in POOLS: a query at absolute position p sees
+        # every pool that is COMPLETE at or before p, i.e. (p + 1) // kpool.
+        pool_ks = pool_cu.to(torch.int64)[req_idx]
+        pool_ke = pool_ks + (positions.to(torch.int64) + 1) // index_kpool
+        pool_ks = pool_ks.to(torch.int32)
+        pool_ke = pool_ke.to(torch.int32)
+
+        pool_topk = torch.empty((n_tokens, select_k), dtype=torch.int32, device=device)
+        # The logits buffer is [rows, max_pools] fp32 and max_pools is the sum
+        # over co-scheduled requests, which `max_num_batched_tokens` does not
+        # bound -- a burst of long-context requests can otherwise push one
+        # allocation into the GiB range. Same query-row chunking the
+        # token-granular path uses (deepseek_v2.py), and pooling has already
+        # divided the column count by index_kpool. Each chunk still scores the
+        # FULL pool set, so every row's top-k is exact with no cross-chunk merge.
+        budget_bytes = SPARSE_INDEXER_LOGITS_BUDGET_MB * 1024 * 1024
+        if (
+            budget_bytes > 0
+            and max_pools > 0
+            and budget_bytes // (max_pools * 4) < n_tokens
+        ):
+            budget_rows = budget_bytes // (max_pools * 4)
+            chunk_rows = (
+                (budget_rows // 128) * 128
+                if budget_rows >= 128
+                else 1 << (max(1, budget_rows).bit_length() - 1)
+            )
+        else:
+            chunk_rows = n_tokens
+        for c0 in range(0, n_tokens, chunk_rows):
+            c1 = min(c0 + chunk_rows, n_tokens)
+            row_starts = pool_ks[c0:c1]
+            row_ends = pool_ke[c0:c1]
+            logits = fp8_mqa_logits(
+                Q=q_fp8[c0:c1],
+                KV=k_fp8,
+                kv_scales=k_scale.squeeze(-1).contiguous(),
+                weights=weights[c0:c1],
+                cu_starts=row_starts,
+                cu_ends=row_ends,
+            )
+            top_k_per_row_prefill(
+                logits=logits,
+                rowStarts=row_starts,
+                rowEnds=row_ends,
+                indices=pool_topk[c0:c1],
+                values=None,
+                numRows=c1 - c0,
+                stride0=logits.stride(0),
+                stride1=logits.stride(1),
+                k=select_k,
+                stable=stable_topk,
+            )
+        # `pool_topk` indexes the batch-wide gathered pool buffer, while the
+        # converter below subtracts cu_seqlens_k[req] from each entry. Rebase
+        # both ends inside the expansion kernel: pool ids become request-local,
+        # emitted token ids get the request's key offset back.
+        kpool_ops.expand_pools_and_append_tail(
+            pool_topk,
+            (positions.to(torch.int32) + 1),
+            index_kpool,
+            out=topk_indices,
+            pool_base=pool_ks,
+            tok_base=attn_metadata.cu_seqlens_k.to(torch.int32)[req_idx],
+        )
+        triton_convert_req_index_to_global_index_dsa_prefill(
+            attn_metadata.sparse_cu_seqlens_q,
+            attn_metadata.sparse_kv_indptr,
+            attn_metadata.token_to_seq_idxs,
+            topk_indices,
+            attn_metadata.block_tables,
+            attn_metadata.cu_seqlens_k,
+            PAGE_SIZE=block_size,
+            NUM_TOPK_TOKENS=topk_out_width,
+            BLOCK_N=128,
+            out=sparse_kv_indices_buffer,
+        )
+        return weights
+
+    # ---- decode ----------------------------------------------------------
+    bs = context.scheduled_bs
+    pos = positions[:bs].to(torch.int64)
+    pooled = kpool_ops.kpool_decode_stash_and_pool(
+        tail_cache,
+        k[:bs],
+        gate_score[:bs],
+        positions[:bs],
+        state_slot_idx,
+        compress_ape,
+        index_kpool,
+    )
+    # Only a pool that closed on this token gets written; the rest carry a -1
+    # slot, which the cache write skips.
+    closes = (pos % index_kpool) == (index_kpool - 1)
+    pool_ids = torch.where(closes, pos // index_kpool, torch.full_like(pos, -1))
+    slots = kpool_ops.pool_slot_mapping(
+        pool_bt,
+        pool_ids,
+        torch.arange(bs, device=device, dtype=torch.int64),
+        block_size,
+    )
+    indexer_k_quant_and_cache(
+        pooled, kv_cache, slots, head_dim, scale_fmt, preshuffle=True
+    )
+
+    seq_lens = attn_metadata.context_lens[:bs]
+    pool_ctx = (seq_lens.to(torch.int32) // index_kpool).contiguous()
+    pool_max_len = -(-max_model_len // index_kpool)
+    logits = torch.empty([bs, pool_max_len], dtype=torch.float32, device=device)
+    deepgemm_fp8_paged_mqa_logits(
+        q_fp8[:bs].view(bs, 1, n_head, head_dim),
+        kv_cache.unsqueeze(-2),
+        weights[:bs],
+        logits,
+        pool_ctx,
+        pool_bt,
+        pool_max_len,
+        KVBlockSize=block_size,
+        Preshuffle=True,
+    )
+    pool_topk = torch.empty((bs, select_k), dtype=torch.int32, device=device)
+    top_k_per_row_decode(
+        logits,
+        1,
+        pool_ctx,
+        pool_topk,
+        bs,
+        logits.stride(0),
+        logits.stride(1),
+        k=select_k,
+        stable=stable_topk,
+    )
+    kpool_ops.expand_pools_and_append_tail(
+        pool_topk,
+        seq_lens.to(torch.int32),
+        index_kpool,
+        out=topk_indices[:bs],
+    )
+    triton_convert_req_index_to_global_index(
+        attn_metadata.cu_seqlens_q,
+        attn_metadata.kv_indptr,
+        attn_metadata.sparse_kv_indptr,
+        attn_metadata.kv_indices,
+        topk_indices,
+        NUM_TOPK_TOKENS=topk_out_width,
+        out=sparse_kv_indices_buffer,
+    )
+    return weights
+
+
+def _sparse_attn_indexer_kpool_fake(
+    hidden_states: torch.Tensor,
+    kv_cache: torch.Tensor,
+    q_fp8: torch.Tensor,
+    k: torch.Tensor,
+    gate_score: torch.Tensor,
+    weights: torch.Tensor,
+    compress_ape: torch.Tensor,
+    tail_cache: torch.Tensor,
+    state_slot_idx: torch.Tensor,
+    positions: torch.Tensor,
+    sparse_kv_indices_buffer: torch.Tensor,
+    topk_tokens: int,
+    index_kpool: int,
+    head_dim: int,
+    max_model_len: int,
+    topk_out_width: int,
+    scale_fmt: str,
+    stable_topk: bool,
+) -> torch.Tensor:
+    return torch.empty_like(weights, dtype=torch.float32)
+
+
+direct_register_custom_op(
+    op_name="sparse_attn_indexer_kpool",
+    op_func=_sparse_attn_indexer_kpool,
+    # The pooled cache write and the per-request tail stash are both in-place,
+    # and the MLA reads the indices right after: without declaring them,
+    # inductor is free to hoist that read above these writes.
+    mutates_args=["sparse_kv_indices_buffer", "tail_cache", "kv_cache"],
+    fake_impl=_sparse_attn_indexer_kpool_fake,
+)

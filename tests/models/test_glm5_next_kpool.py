@@ -16,6 +16,7 @@ import torch
 from atom.model_ops.glm5_next.kpool import (
     append_tail_to_topk,
     compress_pools_ref,
+    expand_and_append_tail_ref,
     expand_pools_to_tokens,
     hadamard128_ref,
     history_group_budget_for_topk,
@@ -63,14 +64,37 @@ def test_ape_is_applied_per_slot():
     ape = torch.full((POOL, HEAD_DIM), -30.0)
     ape[2] = 30.0
     out = pool_compress_ref(k, gate, ape)
-    torch.testing.assert_close(out, torch.full((1, HEAD_DIM), 7.0), atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(
+        out, torch.full((1, HEAD_DIM), 7.0), atol=1e-3, rtol=1e-3
+    )
 
 
-def test_hadamard128_is_an_involution_up_to_scale():
+def test_hadamard128_is_an_orthonormal_involution():
+    """H must be ORTHONORMAL (1/sqrt(128)), not the raw butterfly.
+
+    The rotation is applied to the pooled keys and to the indexer query, so
+    only the normalized transform preserves the dot products the logits are.
+    And the FP8 scale is ue8m0 -- a power of two -- while 1/sqrt(128) is
+    2**-3.5, so the two conventions do NOT quantize to the same bytes: this is
+    a correctness constraint, not a choice of units.
+    """
     torch.manual_seed(2)
     x = torch.randn(4, HEAD_DIM)
-    torch.testing.assert_close(hadamard128_ref(hadamard128_ref(x)), 128.0 * x,
-                               atol=1e-3, rtol=1e-4)
+    torch.testing.assert_close(
+        hadamard128_ref(hadamard128_ref(x)), x, atol=1e-4, rtol=1e-4
+    )
+
+
+def test_hadamard128_preserves_dot_products():
+    torch.manual_seed(9)
+    q = torch.randn(16, HEAD_DIM)
+    k = torch.randn(16, HEAD_DIM)
+    torch.testing.assert_close(
+        (hadamard128_ref(q) * hadamard128_ref(k)).sum(-1),
+        (q * k).sum(-1),
+        atol=1e-3,
+        rtol=1e-4,
+    )
 
 
 def test_fp8_quant_scale_is_power_of_two_and_bounded():
@@ -118,3 +142,151 @@ def test_append_tail_selects_the_in_progress_pool():
     assert out[0, 8:].tolist() == [8, 9, -1]
     # seq 8 is exactly pool-aligned: no tail tokens at all.
     assert out[1, 8:].tolist() == [-1, -1, -1]
+
+
+# --------------------------------------------------------------------------
+# GPU: every Triton kernel against the reference above.
+# --------------------------------------------------------------------------
+
+import pytest
+
+requires_gpu = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="kpool Triton kernels need a GPU"
+)
+
+
+@requires_gpu
+def test_pool_and_rotate_matches_reference():
+    from atom.model_ops.glm5_next.kpool import pool_and_rotate
+
+    torch.manual_seed(0)
+    for n in (1, 7, 8, 33, 1024):
+        k = torch.randn(n, POOL, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+        gate = torch.randn(n, POOL, HEAD_DIM, device="cuda", dtype=torch.bfloat16) * 2
+        ape = torch.randn(POOL, HEAD_DIM, device="cuda", dtype=torch.float32)
+
+        got = pool_and_rotate(k, gate, ape)
+        pooled = pool_compress_ref(k, gate, ape).to(torch.bfloat16).float()
+        want = hadamard128_ref(pooled).to(torch.bfloat16)
+        rel = (got.float() - want.float()).abs().max() / want.float().abs().max()
+        assert rel < 2e-2, (n, rel.item())
+
+
+@requires_gpu
+def test_query_rotation_quantizes_identically_to_the_reference():
+    from atom.model_ops.glm5_next.kpool import fwht128_quant_fp8
+
+    torch.manual_seed(3)
+    for n in (1, 31, 32, 100):
+        q = torch.randn(n, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+        q_fp8, q_scale = fwht128_quant_fp8(q)
+        rot = hadamard128_ref(q.float()).to(torch.bfloat16).float()
+        want_q, want_s = quant_fp8_ue8m0_ref(rot)
+        # The scale must be bit-identical: it is a power of two, so "close" is
+        # a factor of two wrong.
+        assert torch.equal(q_scale.squeeze(-1), want_s)
+        # quant_fp8_ue8m0_ref returns the UNROUNDED value; round it the way the
+        # store does before comparing.
+        assert torch.equal(q_fp8.float(), want_q.to(torch.float8_e4m3fn).float())
+
+
+@requires_gpu
+def test_fused_expand_matches_the_torch_composition():
+    from atom.model_ops.glm5_next.kpool import expand_pools_and_append_tail
+
+    torch.manual_seed(0)
+    for rows, ngroups in ((3, 2), (32, 512), (129, 8)):
+        pool_ids = torch.randint(
+            -1, 40, (rows, ngroups), dtype=torch.int32, device="cuda"
+        )
+        seq_lens = torch.randint(1, 200, (rows,), dtype=torch.int32, device="cuda")
+        got = expand_pools_and_append_tail(pool_ids, seq_lens, POOL)
+        want = expand_and_append_tail_ref(pool_ids, seq_lens, POOL)
+        assert torch.equal(got, want), (got[0][:12], want[0][:12])
+
+
+@requires_gpu
+def test_tail_lands_immediately_after_the_valid_history():
+    """The consumer reads only `min(pools, groups)*POOL + tail` entries per row.
+
+    So the tail must be compacted against the history, not parked at a fixed
+    column: otherwise every sequence whose length is not pool-aligned loses its
+    newest tokens -- and those are the ones the model most needs.
+    """
+    from atom.model_ops.glm5_next.kpool import expand_pools_and_append_tail
+
+    ngroups = 512
+    # 4 sequences, one per pool phase, all far below the 2048-token budget.
+    seq_lens = torch.tensor([40, 41, 42, 43], dtype=torch.int32, device="cuda")
+    # top-k pads past the row's valid pool count with -1, and that padding is
+    # exactly what a fixed-column tail would hand to attention. A pool_ids of
+    # plain arange(ngroups) hides the bug, because every padded slot then still
+    # decodes to a plausible in-range token id.
+    pool_ids = torch.arange(ngroups, dtype=torch.int32, device="cuda").repeat(4, 1)
+    for r, sl in enumerate(seq_lens.tolist()):
+        pool_ids[r, sl // POOL :] = -1
+    out = expand_pools_and_append_tail(pool_ids, seq_lens, POOL)
+    for r, sl in enumerate(seq_lens.tolist()):
+        consumed = min(sl // POOL, ngroups) * POOL + sl % POOL
+        assert consumed == sl, (sl, consumed)
+        got = out[r, :consumed].tolist()
+        assert got == list(range(sl)), (sl, got[:8], got[-8:])
+
+
+@requires_gpu
+@pytest.mark.parametrize("prefill_len", [16, 17, 18, 19, 64, 65, 66, 67])
+def test_tail_survives_prefill_to_decode(prefill_len):
+    """A pool assembled one token at a time across decode steps must equal the
+    same pool compressed in one shot.
+
+    This is the whole tail state machine: the pool that straddles the
+    prefill/decode boundary is the one the design can get wrong, and it is
+    wrong for only 3 of every 4 sequence lengths -- hence every phase.
+    """
+    from atom.model_ops.glm5_next.kpool import (
+        kpool_decode_stash_and_pool,
+        kpool_seed_tail,
+        pool_and_rotate,
+    )
+
+    torch.manual_seed(prefill_len)
+    dev = "cuda"
+    n_tok = prefill_len + 12
+    k = (torch.randn(n_tok, HEAD_DIM, device=dev) * 2).to(torch.bfloat16)
+    gate = (torch.randn(n_tok, HEAD_DIM, device=dev) * 2).to(torch.bfloat16)
+    ape = torch.randn(POOL, HEAD_DIM, device=dev, dtype=torch.float32)
+
+    tail = torch.zeros(8, 2, POOL, HEAD_DIM, dtype=torch.bfloat16, device=dev)
+    slot_idx = torch.tensor([3], dtype=torch.int32, device=dev)
+    kpool_seed_tail(
+        tail,
+        k[:prefill_len],
+        gate[:prefill_len],
+        torch.arange(prefill_len, dtype=torch.int32, device=dev),
+        torch.tensor([0, prefill_len], dtype=torch.int32, device=dev),
+        slot_idx,
+        POOL,
+    )
+
+    completed = 0
+    for pos in range(prefill_len, n_tok):
+        got = kpool_decode_stash_and_pool(
+            tail,
+            k[pos : pos + 1],
+            gate[pos : pos + 1],
+            torch.tensor([pos], dtype=torch.int32, device=dev),
+            slot_idx,
+            ape,
+            POOL,
+        )
+        if pos % POOL != POOL - 1:
+            continue  # pool incomplete; the caller marks the slot -1
+        pid = pos // POOL
+        want = pool_and_rotate(
+            k[pid * POOL : (pid + 1) * POOL].unsqueeze(0),
+            gate[pid * POOL : (pid + 1) * POOL].unsqueeze(0),
+            ape,
+        )
+        assert torch.equal(got, want), (prefill_len, pid)
+        completed += 1
+    assert completed >= 2, completed

@@ -48,27 +48,61 @@ flexible-extract's "last number in the text" lands inside the verification tail
 audit of those same 1319 replies finds the correct value present in 1292 of
 them (97.95%), with only 26 genuinely wrong.
 
-`--num_fewshot` must stay at 3 until the pooled kpool path lands: 5-shot
-multiturn prompts plus the generation budget exceed the 2048 context cap and
-every request fails with HTTP 400.
+`--num_fewshot` is no longer pinned at 3: kpool lifts the context cap, and both
+5-shot @4096 and 16-shot @8192 run clean (see "Context length").
 
-## Context-length limit (important)
+## Context length
 
-**`--max-model-len` must not exceed `index_topk` (2048) today.**
+`--max-model-len` is no longer capped at `index_topk`. The pooled (kpool) indexer
+path is implemented: the index cache stores one compressed key per `index_kpool`
+(4) tokens, top-k runs over `index_topk // index_kpool` (512) pools, each selected
+pool expands back to its 4 token positions, and the trailing incomplete pool is
+always appended unscored.
 
-The indexer's pooled (`index_kpool=4`) top-k is not implemented yet; ATOM falls
-back to token-granular selection. Below `index_topk` that fallback is not an
-approximation — top-k then selects *every* pool, so expanding the pools yields
-every token position regardless of the pooled K values, and the two are exactly
-equal. Past `index_topk` they genuinely differ, so `Glm5NextIndexer` raises
-`NotImplementedError` rather than returning a quietly wrong answer.
+Accuracy past the old cap, `lm_eval` gsm8k over all 1319 questions, TP8, fp8 KV:
 
-Lifting this means implementing the pooled path: the softmax-pool +
-Hadamard + FP8 compress kernel, the per-request tail cache for the in-progress
-pool, and pool→token expansion. DeepSeek-V4's `Compressor`
-(`atom/models/deepseek_v4.py`) already does the same softmax-pool-with-`ape`
-compression and drives `deepgemm_fp8_paged_mqa_logits` at pool granularity, so
-it is the natural starting point.
+| Protocol | prompt tokens | flexible-extract | strict-match |
+|---|---|---|---|
+| chat, 3-shot, `--max-model-len 2048` | ~389 | 0.9644 | 0.9651 |
+| chat, 5-shot, `--max-model-len 4096` | ~645 | 0.9674 | 0.9682 |
+| **chat, 16-shot, `--max-model-len 8192`** | **2763-3591** | **0.9659** | **0.9659** |
+
+The 16-shot row is the one that actually measures the pooled path: it is the only
+setting whose prompts *all* exceed `index_topk`, so pooled scoring and pooled top-k
+decide what the model attends to on every question. Below 2048 `attention_mla` runs
+dense MLA and the indexer's selection is computed but never used -- a short-context
+benchmark says nothing about pooled selection, only that the pooled *writes* did no
+harm.
+
+Also verified: needle-in-a-haystack at ctx=5573 with a CONTROL (same prompt,
+different secret). The answer tracks the control, so the retrieval is real rather
+than a lucky guess.
+
+### How pooled entries are stored
+
+One pool covers 4 tokens and one block covers 16, so 16 pools span 4 token blocks.
+Pooled entries live 16-per-block in every 4th block of the request's own block
+table -- `pool p -> block_table[4 * (p // 16)], row p % 16` -- so the KV allocator,
+the paging and the cache shape are all unchanged. Three of every four blocks'
+index-cache regions go unused; reclaiming them is a future optimization.
+
+Keeping 16 rows per block is **required**, not a convenience:
+`deepgemm_fp8_paged_mqa_logits` is correct only in the preshuffled layout, and
+preshuffle needs `KVBlockSize % 16 == 0`. With `Preshuffle=False` it disagrees with
+the flat `fp8_mqa_logits` kernel by ~100% at *every* block size, and aiter's assert
+only guards the preshuffle case -- so a 4-row-per-block cache would be silently
+mis-scored rather than rejected.
+
+### Not supported with kpool
+
+- **DCP / PCP.** Both shard tokens round-robin across ranks, which does not commute
+  with pooling four *consecutive* tokens into one key. Raises rather than
+  mis-indexing.
+- **Speculative decode.** The decode path assumes one token per request. GLM-5.3's
+  MTP layer is not loaded, so this is unreachable today.
+
+`ATOM_GLM5_KPOOL=0` restores token-granular selection, which still refuses a
+context past `index_topk`.
 
 ## Notes
 
