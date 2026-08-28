@@ -323,6 +323,14 @@ class ParallelLMHead(VocabParallelEmbedding):
         # DP-uniform invariant, so keep them on the replicated path for now.
         if context is None or getattr(context, "is_draft", False):
             return False
+        # Decode-only by design. Prefill slices x to one row per sequence, while
+        # _dp_sharded_logits pads to dp_metadata.max_tokens_across_dp (a *token*
+        # count). The two units disagree, so a prefill row count would over-pad
+        # into a huge DP collective / OOM. `dp_uniform_decode` alone does NOT
+        # exclude prefill: it is forced True whenever DP-attention is disabled
+        # (and defaults True), so gate on is_prefill explicitly.
+        if getattr(context, "is_prefill", False):
+            return False
         if not getattr(context, "dp_uniform_decode", False):
             return False
         return get_forward_context().dp_metadata is not None
