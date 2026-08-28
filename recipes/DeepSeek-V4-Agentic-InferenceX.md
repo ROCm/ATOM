@@ -25,6 +25,7 @@ else. The bands are contiguous, not overlapping: DP takes over from 48 up.
 ```bash
 export AITER_BF16_FP8_MOE_BOUND=0
 export ATOM_MOE_GU_ITLV=1
+export ATOM_GC_THRESHOLD=20000,50,50
 
 python3 -m atom.entrypoints.openai_server \
   --model $MODEL_PATH --served-model-name $MODEL_PATH \
@@ -45,6 +46,7 @@ python3 -m atom.entrypoints.openai_server \
 ```bash
 export AITER_BF16_FP8_MOE_BOUND=0
 export ATOM_MOE_GU_ITLV=1
+export ATOM_GC_THRESHOLD=20000,50,50
 export GPU_MAX_HW_QUEUES=5
 export ATOM_NUMA_BIND=1
 export ATOM_DP_SESSION_AFFINITY=1
