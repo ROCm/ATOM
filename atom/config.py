@@ -726,7 +726,7 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
                 model, trust_remote_code=trust_remote_code
             )
             hf_config._multimodal_config = full_config
-        except Exception:
+        except Exception:  # noqa: BLE001 - transformers raises anything here
             # This image's transformers may have no class for the architecture
             # (see _PLAIN_TEXT_CONFIG_MODEL_TYPES). Falling through to None would
             # leave the model with no `vision_config` and no way to build its
