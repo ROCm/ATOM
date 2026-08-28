@@ -149,12 +149,12 @@ jobs:
             lm_eval_num_fewshot: 5
             accuracy_test_threshold: 0.93
             runner: atom-mi355-8gpu-vllm-sgl-ci
-          - display_name: "Kimi-K3 TP8"
-            model_name: "Kimi-K3"
+          - display_name: "Kimi-K3 DSpark TP8"
+            model_name: "Kimi-K3-DSpark"
             model_path: "moonshotai/Kimi-K3"
+            draft_model_path: "Inferact/Kimi-K3-DSpark"
             client_command: "lm_eval --model local-completions --model_args model=${MODEL_PATH},base_url=http://127.0.0.1:${VLLM_PORT}/v1/completions,num_concurrent=64,max_retries=3,tokenized_requests=False,trust_remote_code=True --tasks gsm8k --num_fewshot ${LM_EVAL_NUM_FEWSHOT} --output_path ${OUTPUT_PATH}"
-            extra_args: "--trust-remote-code --language-model-only --tensor-parallel-size 8 --kv-cache-dtype fp8 --max-model-len 16384 --max-num-seqs 64 --max-num-batched-tokens 16384 --gpu-memory-utilization 0.93 --block-size 128 --no-enable-prefix-caching --compilation-config '{\"cudagraph_mode\":\"FULL_AND_PIECEWISE\"}' --additional-config '{\"online_quant_config\":{\"global_quant_config\":\"ptpc_fp8\",\"exclude_layer\":[\"lm_head\",\"model.embed_tokens\",\"*self_attn.[qkv]_conv1d*\",\"*block_sparse_moe.experts*\",\"*block_sparse_moe.routed_expert_*\",\"*vision_tower*\",\"*mm_projector*\"]}}'"
-            env_vars: "AITER_DISABLE_FMHA_OPUS=1"
+            extra_args: "--trust-remote-code --language-model-only --tensor-parallel-size 8 --kv-cache-dtype fp8 --max-model-len 16384 --max-num-seqs 64 --max-num-batched-tokens 16384 --gpu-memory-utilization 0.93 --block-size 128 --enable-prefix-caching --mamba-cache-mode align --compilation-config '{\"cudagraph_mode\":\"FULL_AND_PIECEWISE\"}' --additional-config '{\"online_quant_config\":{\"global_quant_config\":\"ptpc_fp8\",\"exclude_layer\":[\"lm_head\",\"model.embed_tokens\",\"*self_attn.[qkv]_conv1d*\",\"*block_sparse_moe.experts*\",\"*block_sparse_moe.routed_expert_*\",\"*vision_tower*\",\"*mm_projector*\"]}}' --speculative-config '{\"method\":\"dspark\",\"model\":\"/models/Inferact/Kimi-K3-DSpark\",\"num_speculative_tokens\":7}'"
             lm_eval_num_fewshot: 5
             accuracy_test_threshold: 0.95
             runner: atom-mi355-8gpu-vllm-sgl-ci
@@ -494,6 +494,41 @@ jobs:
             fi
           else
             echo "/models directory not mounted; skipping model download"
+          fi
+        env:
+          MODEL_DOWNLOAD_TIMEOUT: "3h"
+          MODEL_LOCK_WAIT_SECONDS: "7200"
+          MODEL_LOCK_POLL_INTERVAL: "30"
+          MODEL_PROGRESS_INTERVAL: "60"
+
+      - name: Download or refresh draft model if needed
+        if: ${{ success() && (matrix.draft_model_path || '') != '' }}
+        run: |
+          set -euo pipefail
+          draft_dir="/models/${{ matrix.draft_model_path }}"
+          if [ -z "${MODEL_CACHE_MOUNT}" ]; then
+            echo "::error::/models is not mounted on this runner, so the draft checkpoint"
+            echo "::error::${draft_dir} cannot be staged. ${{ matrix.display_name }} needs it."
+            exit 1
+          fi
+          model_use_lock="true"
+          if [ "${{ matrix.runner }}" = "atom-mi355-8gpu.predownload" ] || [ "${{ matrix.runner }}" = "atom-mi35x-8gpu-oot-acc" ]; then
+            model_use_lock="false"
+          fi
+          echo "Using shared model download script for ${draft_dir} (MODEL_USE_LOCK=${model_use_lock})"
+          if ! docker exec \
+            -e HF_TOKEN="${HF_TOKEN:-}" \
+            -e MODEL_ID="${{ matrix.draft_model_path }}" \
+            -e TARGET_DIR="${draft_dir}" \
+            -e MODEL_USE_LOCK="${model_use_lock}" \
+            -e MODEL_DOWNLOAD_TIMEOUT="${MODEL_DOWNLOAD_TIMEOUT}" \
+            -e MODEL_LOCK_WAIT_SECONDS="${MODEL_LOCK_WAIT_SECONDS}" \
+            -e MODEL_LOCK_POLL_INTERVAL="${MODEL_LOCK_POLL_INTERVAL}" \
+            -e MODEL_PROGRESS_INTERVAL="${MODEL_PROGRESS_INTERVAL}" \
+            "$CONTAINER_NAME" \
+            bash -lc 'bash /workspace/.github/scripts/download_model_with_lock.sh "$MODEL_ID" "$TARGET_DIR"'; then
+            echo "Draft model download failed for '${{ matrix.draft_model_path }}'. Aborting."
+            exit 1
           fi
         env:
           MODEL_DOWNLOAD_TIMEOUT: "3h"

@@ -12,6 +12,7 @@ from .protocol import (
     STREAM_DONE_MESSAGE,
     TEXT_COMPLETION_OBJECT,
     CompletionResponse,
+    openai_stop_reason,
 )
 from .sse import data_frame
 from .streaming_dispatch import StreamOutputCollector
@@ -32,6 +33,12 @@ def create_completion_chunk(
 
     ``index`` selects ``choices[0].index``; fan-out siblings share one SSE
     stream and are distinguished by this field.
+
+    ``finish_reason`` belongs on the terminal chunk and nowhere else, already
+    translated by `openai_stop_reason`. Both streaming paths here used to pass
+    the engine's own word on every *content* chunk while hardcoding `"stop"`
+    on the terminal one, so a single response reported `max_tokens` in a place
+    clients do not read and `stop` in the place they do.
     """
     chunk = {
         "id": request_id,
@@ -59,7 +66,8 @@ async def stream_completion_response(
     stream_collector: StreamOutputCollector,
     seq_id: int,
     num_prompt_tokens: int,
-    cleanup_fn,
+    cleanup_stream,
+    cleanup_request,
 ) -> AsyncGenerator[str, None]:
     """Generate streaming text completion response.
 
@@ -75,11 +83,15 @@ async def stream_completion_response(
     # so the finally below aborts the still-running seq; on normal completion
     # we flip this to False and skip the (no-op) abort.
     aborted = True
+    # The engine's own word, kept for the terminal chunk. It arrives on the
+    # chunk that reports `finished`, which is not the frame it belongs on.
+    engine_reason: str | None = None
     try:
         while True:
             chunk_data = await stream_collector.get()
             new_text = chunk_data["text"]
             num_tokens_output += len(chunk_data.get("token_ids", []))
+            engine_reason = chunk_data.get("finish_reason") or engine_reason
 
             extra_fields: dict[str, Any] = {}
             if "kv_transfer_params" in chunk_data:
@@ -89,7 +101,7 @@ async def stream_completion_response(
                 request_id,
                 model,
                 new_text,
-                finish_reason=chunk_data.get("finish_reason"),
+                finish_reason=None,  # the terminal chunk carries it
                 **extra_fields,
             )
 
@@ -113,7 +125,12 @@ async def stream_completion_response(
                 }
                 yield (
                     content_chunk
-                    + create_completion_chunk(request_id, model, "", "stop")
+                    + create_completion_chunk(
+                        request_id,
+                        model,
+                        "",
+                        openai_stop_reason(engine_reason) or "stop",
+                    )
                     + data_frame(usage_chunk)
                     + STREAM_DONE_MESSAGE
                 )
@@ -121,7 +138,8 @@ async def stream_completion_response(
 
             yield content_chunk
     finally:
-        cleanup_fn(request_id, seq_id, aborted=aborted)
+        cleanup_stream(seq_id, aborted=aborted)
+        cleanup_request(request_id)
 
 
 def build_completion_response(
@@ -138,7 +156,7 @@ def build_completion_response(
             {
                 "index": 0,
                 "text": final_output["text"],
-                "finish_reason": final_output["finish_reason"],
+                "finish_reason": openai_stop_reason(final_output["finish_reason"]),
             }
         ],
         usage={
@@ -171,7 +189,7 @@ def build_completion_response_multi(
         {
             "index": i,
             "text": out["text"],
-            "finish_reason": out["finish_reason"],
+            "finish_reason": openai_stop_reason(out["finish_reason"]),
         }
         for i, out in enumerate(final_outputs)
     ]
@@ -206,7 +224,8 @@ async def stream_completion_response_fanout(
     shared_collector: StreamOutputCollector,
     seq_ids: list[int],
     num_prompt_tokens: int,
-    cleanup_fn,
+    cleanup_stream,
+    cleanup_request,
 ) -> AsyncGenerator[str, None]:
     """Streaming variant multiplexing ``len(seq_ids)`` siblings into one SSE.
 
@@ -222,6 +241,7 @@ async def stream_completion_response_fanout(
     num_tokens_input = num_prompt_tokens
     num_tokens_output = [0] * n
     finished = [False] * n
+    engine_reasons: list[str | None] = [None] * n
 
     # Assume abort until every sibling has reported finished; a client
     # disconnect closes the generator first, leaving this True so the finally
@@ -234,6 +254,7 @@ async def stream_completion_response_fanout(
                 continue
             new_text = chunk_data["text"]
             num_tokens_output[idx] += len(chunk_data.get("token_ids", []))
+            engine_reasons[idx] = chunk_data.get("finish_reason") or engine_reasons[idx]
 
             extra_fields: dict[str, Any] = {}
             if "kv_transfer_params" in chunk_data:
@@ -243,7 +264,7 @@ async def stream_completion_response_fanout(
                 request_id,
                 model,
                 new_text,
-                finish_reason=chunk_data.get("finish_reason"),
+                finish_reason=None,  # the terminal chunk carries it
                 index=idx,
                 **extra_fields,
             )
@@ -270,7 +291,13 @@ async def stream_completion_response_fanout(
         # Coalesce the per-sibling stop chunks + usage + [DONE] into one send.
         yield (
             "".join(
-                create_completion_chunk(request_id, model, "", "stop", index=i)
+                create_completion_chunk(
+                    request_id,
+                    model,
+                    "",
+                    openai_stop_reason(engine_reasons[i]) or "stop",
+                    index=i,
+                )
                 for i in range(n)
             )
             + data_frame(usage_chunk)
@@ -278,4 +305,5 @@ async def stream_completion_response_fanout(
         )
     finally:
         for sid in seq_ids:
-            cleanup_fn(request_id, sid, aborted=aborted)
+            cleanup_stream(sid, aborted=aborted)
+        cleanup_request(request_id)

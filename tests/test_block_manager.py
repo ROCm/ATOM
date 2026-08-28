@@ -69,7 +69,7 @@ class TestAllocateDeallocate:
         seq = seq_factory([1, 2, 3, 4, 5, 6, 7, 8])
         block_manager.allocate(seq)
         block_manager.deallocate(seq)
-        assert seq.block_table == []
+        assert len(seq.block_table) == 0
         assert seq.num_cached_tokens == 0
 
     def test_deallocate_restores_capacity(self, block_manager, seq_factory):
@@ -142,7 +142,7 @@ class TestPublishLoadedPrefix:
         # from the GPU-only dcp_ops module used to calculate local block counts.
         monkeypatch.setattr(
             bm,
-            "_dcp_num_blocks",
+            "num_pool_blocks",
             lambda seq_len: (seq_len + bm.hash_block_size - 1) // bm.hash_block_size,
         )
         loaded = seq_factory(list(range(16)))
@@ -150,13 +150,55 @@ class TestPublishLoadedPrefix:
 
         assert bm.publish_loaded_prefix(loaded, start_token=0, end_token=8) == 8
         loaded_block = bm.kv.block(loaded.block_table[0])
-        assert loaded_block.token_ids == list(range(8))
+        assert list(loaded_block.token_ids) == list(range(8))
 
         probe = seq_factory(list(range(8)) + list(range(100, 108)))
         num_cached_blocks = bm.can_allocate(probe)
         assert num_cached_blocks == 1
         bm.allocate(probe, num_cached_blocks)
         assert probe.num_cached_tokens == 8
+
+    def test_skips_when_predecessor_unhashed(self, seq_factory):
+        """A gap before the loaded range logs an error and skips."""
+        cfg = MockConfig(num_kvcache_blocks=16, enable_prefix_caching=True)
+        bm = BlockManager(cfg)
+        tokens = list(range(24))
+
+        loaded = seq_factory(tokens)
+        bm.allocate(loaded)
+        # Blocks 0-1 unhashed — publish_loaded_prefix should skip, not crash.
+        assert bm.publish_loaded_prefix(loaded, start_token=8, end_token=16) == 0
+
+
+class TestHashChainGapSkip:
+    def test_hash_blocks_skips_on_gap(self, block_manager_prefix, seq_factory):
+        """A gap in the hash chain must skip, not mint false-root hashes."""
+        bm = block_manager_prefix
+        tokens = list(range(16))
+
+        seq = seq_factory(tokens)
+        bm.allocate(seq)
+        seq.num_cached_tokens = 8
+        bm.hash_blocks(seq, 8)
+
+        # Blocks 0-1 never hashed → hash_blocks should skip → blocks stay -1.
+        for b in seq.block_table:
+            assert bm.kv.block(b).hash == -1
+
+    def test_no_skip_when_chain_intact(self, block_manager_prefix, seq_factory):
+        bm = block_manager_prefix
+        seq = seq_factory(list(range(16)))
+        bm.allocate(seq)
+        bm.hash_blocks(seq, 16)
+        for b in seq.block_table:
+            assert bm.kv.block(b).hash != -1
+
+    def test_hash_blocks_clamps_to_block_table(self, block_manager_prefix, seq_factory):
+        bm = block_manager_prefix
+        seq = seq_factory(list(range(16)))
+        bm.allocate(seq)
+        seq.block_table.pop()
+        bm.hash_blocks(seq, 16)  # must not IndexError
 
 
 # ── can_append / may_append ────────────────────────────────────────────────
@@ -342,7 +384,7 @@ class TestPrefixCachingPreemption:
         # Simulate preemption
         bm.deallocate(s1)
         assert s1.num_cached_tokens == 0
-        assert s1.block_table == []
+        assert len(s1.block_table) == 0
 
         # Re-allocate — first block is a cache hit; the last full block is
         # force-recomputed so prefill has at least one token to forward.
@@ -510,3 +552,104 @@ class TestDecodeBlockHashing:
         bm.hash_decode_blocks(seq, seq.num_tokens)
         assert seq.num_hashed_tokens == 0
         assert not bm.kv.num_indexed
+
+
+# ── register_received_prefix (PD consumer) ─────────────────────────────────
+
+
+class TestRegisterReceivedPrefix:
+    @staticmethod
+    def _dcp_block_manager(monkeypatch):
+        cfg = MockConfig(
+            num_kvcache_blocks=12,
+            kv_cache_block_size=4,
+            decode_context_parallel_size=2,
+            enable_prefix_caching=True,
+        )
+        bm = BlockManager(cfg)
+        # Allocation normally asks dcp_ops for each rank's local token count.
+        # These scheduler tests only need the equivalent virtual-block count.
+        monkeypatch.setattr(
+            bm,
+            "num_pool_blocks",
+            lambda seq_len: (seq_len + bm.hash_block_size - 1) // bm.hash_block_size,
+        )
+        return bm
+
+    def test_registers_full_prompt_blocks_enabling_next_turn_hit(
+        self, block_manager_prefix, seq_factory
+    ):
+        bm = block_manager_prefix
+        # PD consumer: a remote-prefill request whose full prompt KV arrived via
+        # RDMA. It never ran a prefill forward, so its blocks are unhashed until
+        # register_received_prefix publishes them.
+        a = seq_factory(list(range(1, 13)))  # 12 tokens, bs=4 -> 3 full blocks
+        bm.allocate(a)
+        registered = bm.register_received_prefix(a)
+        assert registered == 3
+        # Next turn with the same prefix now hits locally (last block excluded).
+        b = seq_factory(list(range(1, 13)))
+        assert bm.can_allocate(b) == 2
+
+    def test_noop_without_prefix_caching(self, block_manager, seq_factory):
+        a = seq_factory(list(range(1, 13)))
+        block_manager.allocate(a)
+        assert block_manager.register_received_prefix(a) == 0
+
+    def test_excludes_trailing_partial_block(self, block_manager_prefix, seq_factory):
+        bm = block_manager_prefix
+        a = seq_factory(list(range(1, 11)))  # 10 tokens, bs=4 -> 2 full + partial
+        bm.allocate(a)
+        assert bm.register_received_prefix(a) == 2
+
+    def test_dcp_registers_at_hash_block_granularity(self, seq_factory, monkeypatch):
+        bm = self._dcp_block_manager(monkeypatch)
+        assert bm.block_size == 4
+        assert bm.hash_block_size == 8
+
+        seq = seq_factory(list(range(20)))
+        bm.allocate(seq)
+
+        assert bm.register_received_prefix(seq) == 2
+        assert seq.num_hashed_tokens == 16
+        assert seq.prefix_hashes_published is True
+        assert list(bm.kv.block(seq.block_table[0]).token_ids) == list(range(8))
+        assert list(bm.kv.block(seq.block_table[1]).token_ids) == list(range(8, 16))
+        assert bm.kv.block(seq.block_table[2]).hash == -1
+
+    def test_dcp_registers_only_suffix_after_local_cache_hit(
+        self, seq_factory, monkeypatch
+    ):
+        bm = self._dcp_block_manager(monkeypatch)
+
+        cached = seq_factory(list(range(16)))
+        bm.allocate(cached)
+        bm.hash_blocks(cached, cached.num_prompt_tokens)
+        bm.deallocate(cached)
+
+        received = seq_factory(list(range(32)))
+        num_cached_blocks = bm.can_allocate(received)
+        assert num_cached_blocks == 2
+        bm.allocate(received, num_cached_blocks)
+        cached_hashes = [
+            bm.kv.block(block_id).hash for block_id in received.block_table[:2]
+        ]
+        computed_token_groups = []
+        compute_hash = bm.compute_hash
+
+        def tracked_compute_hash(token_ids, prefix=-1):
+            computed_token_groups.append(list(token_ids))
+            return compute_hash(token_ids, prefix)
+
+        monkeypatch.setattr(bm, "compute_hash", tracked_compute_hash)
+
+        assert bm.register_received_prefix(received) == 2
+        assert received.num_cached_tokens == 16
+        assert received.num_hashed_tokens == 32
+        assert computed_token_groups == [list(range(16, 24)), list(range(24, 32))]
+        assert [
+            bm.kv.block(block_id).hash for block_id in received.block_table[:2]
+        ] == cached_hashes
+        assert all(
+            bm.kv.block(block_id).hash != -1 for block_id in received.block_table[2:]
+        )

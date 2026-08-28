@@ -13,13 +13,20 @@ import zmq
 
 from atom.config import Config, ParallelConfig
 from atom.kv_transfer.disaggregation import KVOutputAggregator
+from atom.kv_transfer.disaggregation.types import connector_metadata_has_work
 from atom.model_engine.async_proc import AsyncIOProcManager
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import EngineUtilityHandler
 from atom.model_engine.scheduler import DecodeScheduler, PrefillScheduler, Scheduler
-from atom.model_engine.sequence import Sequence, SequenceStatus, get_exit_sequence
+from atom.model_engine.sequence import (
+    Sequence,
+    SequenceStatus,
+    get_exit_sequence,
+    new_block_table,
+)
 from atom.model_engine.state_runtime import StateRuntime
 from atom.utils import (
+    engine_process_name,
     envs,
     init_exit_handler,
     make_zmq_socket,
@@ -27,6 +34,12 @@ from atom.utils import (
 )
 from atom.utils.distributed.utils import (
     stateless_destroy_torch_distributed_process_group,
+)
+from atom.utils.gc_utils import (
+    freeze_gc_heap,
+    maybe_attach_gc_debug_callback,
+    tune_gc,
+    unfreeze_gc_heap,
 )
 
 logger = logging.getLogger("atom")
@@ -36,8 +49,23 @@ logger = logging.getLogger("atom")
 # stale a Prometheus sample can be.
 METRICS_PUSH_INTERVAL_S = 5.0
 
+# Pace of the idle KV drain. The busy loops never block, so an unpaced drain
+# would fire one worker RPC round per spin; 1ms matches the PP head's existing
+# idle token-poll timeout and is far below any transfer latency.
+KV_IDLE_DRAIN_INTERVAL_S = 0.001
+
+# Upper bound on the drain that runs after the loop exits. A peer that died
+# mid-transfer leaves a completion that never arrives; exiting late beats
+# never exiting.
+KV_SHUTDOWN_DRAIN_TIMEOUT_S = 2.0
+
 
 class EngineCore:
+    # This process's name, for the title and every GC log line. A class
+    # attribute because it is per-process state and each engine is spawned into
+    # its own interpreter; `_setup_engine_process` is the only writer.
+    _process_name = "EngineCore"
+
     def __init__(self, config: Config, input_address: str, output_address: str):
         self.label = "Engine Core"
         self.input_queue = queue.Queue[Sequence]()
@@ -92,9 +120,11 @@ class EngineCore:
             # stage's slice = tp x pcp. Pipeline parallelism spans *separate*
             # EngineCores (one per stage, spawned by CoreManager), not extra
             # workers inside a single EngineCore — so pp does NOT multiply here.
+            # tp_world_size, not tensor_parallel_size: under simulated TP only
+            # the first tp_world_size shards get a process.
             self.runner_mgr = AsyncIOProcManager(
                 self._finalizer,
-                config.tensor_parallel_size * config.prefill_context_parallel_size,
+                config.tp_world_size * config.prefill_context_parallel_size,
                 config.runner_qualname,
                 config,
             )
@@ -143,10 +173,10 @@ class EngineCore:
             )
 
         self.kv_transfer_enabled = bool(config.kv_transfer_config)
+        self._next_idle_kv_drain = 0.0
         if self.kv_transfer_enabled:
-            self.kv_aggregator = KVOutputAggregator(
-                world_size=config.tensor_parallel_size
-            )
+            # Physical: one output per launched worker, else this waits forever.
+            self.kv_aggregator = KVOutputAggregator(world_size=config.tp_world_size)
 
         self.utility_handler = EngineUtilityHandler(
             self.runner_mgr,
@@ -155,11 +185,57 @@ class EngineCore:
             scheduler=self.scheduler,
         )
 
+        # KV cache allocated, graphs captured, BlockPool built: everything this
+        # process holds for its lifetime exists, and the next thing is traffic.
+        self._freeze_after_startup()
+
         self._send_ready_signal()
         logger.info(f"{self.label}: EngineCore fully initialized and ready")
 
+    def _freeze_after_startup(self):
+        """Freeze this process and its ModelRunner workers.
+
+        The workers are driven from here because only the caller knows warmup
+        is over -- weights, compile and capture all land via RPCs it sends, and
+        `--enforce-eager` skips the capture step entirely.
+        """
+        freeze_gc_heap(self._process_name)
+        try:
+            self.runner_mgr.call_func("freeze_gc_heap", wait_out=True)
+        except Exception as e:  # noqa: BLE001 - never fail startup over this
+            logger.warning(f"{self._process_name}: worker heap freeze skipped: {e}")
+
+    @staticmethod
+    def _setup_engine_process(name: str):
+        """Identity, orphan reaping and GC policy, for every `run_engine`.
+
+        The disaggregated overrides do not call the base one, and each omission
+        is silent: an unreaped orphan pins VRAM, an untitled process is
+        `python` in `ps`, an unattached callback leaves ATOM_GC_DEBUG inert.
+        """
+        from atom.utils import enable_orphan_reaping
+
+        EngineCore._process_name = name
+        set_process_title(name)
+        enable_orphan_reaping()  # orphans pin VRAM + IPC handles; see its docs
+        tune_gc()
+        maybe_attach_gc_debug_callback(name)
+
     def _send_ready_signal(self):
-        self.output_queue.put_nowait(("READY", None))
+        self.output_queue.put_nowait(("READY", self._ready_payload()))
+
+    def _ready_payload(self) -> dict[str, int] | None:
+        """Startup facts the frontend cannot read off its own Config.
+
+        `num_kvcache_blocks` is measured in this subprocess, so the API server's
+        Config still holds the placeholder. Publishing the derived prompt
+        ceiling rather than the raw block count leaves the dcp arithmetic with
+        its owner, `BlockManager`, and gives the frontend a single number to
+        compare a prompt against.
+        """
+        if self.scheduler is None:
+            return None
+        return {"max_pool_tokens": self.scheduler.block_manager.max_pool_tokens}
 
     def _post_model_load_hook(self):
         """Called after ModelRunner is initialized (model loaded) but before
@@ -173,6 +249,9 @@ class EngineCore:
         if not self.still_running:
             return
         self.still_running = False
+        # Frozen weights and KV cache are unreachable *and* uncollectable, so
+        # an engine destroyed in-process would read as a GPU memory leak.
+        unfreeze_gc_heap()
         if not hasattr(self, "runner_mgr"):
             self._send_engine_dead()
             return
@@ -198,32 +277,17 @@ class EngineCore:
 
     @staticmethod
     def run_engine(config: Config, input_address: str, output_address: str):
-        # Bind this EngineCore's lifetime to its parent (the server /
-        # CoreManager): if the parent exits, have the kernel reap this process —
-        # and, transitively, the ModelRunner workers it spawns — instead of
-        # leaving them orphaned. Orphans keep pinning GPU VRAM + the custom
-        # all-reduce IPC handles / rendezvous TCPStore, which makes the next
-        # restart reuse a stale hipIpc handle and crash. See
-        # atom.utils.enable_orphan_reaping for the full rationale.
-        from atom.utils import enable_orphan_reaping
+        EngineCore._setup_engine_process(engine_process_name(config))
 
-        enable_orphan_reaping()
         engine: EngineCore = None
         try:
             if config.pipeline_parallel_size > 1:
                 from atom.model_engine.pp_engine_core import PPEngineCoreProc
 
-                set_process_title(
-                    f"EngineCore_PP{config.parallel_config.pipeline_parallel_rank}"
-                )
                 engine = PPEngineCoreProc(config, input_address, output_address)
             elif config.parallel_config.data_parallel_size > 1:
-                set_process_title(
-                    f"EngineCore_DP{config.parallel_config.data_parallel_rank}"
-                )
                 engine = DPEngineCoreProc(config, input_address, output_address)
             else:
-                set_process_title("EngineCore")
                 engine = EngineCore(config, input_address, output_address)
             engine.busy_loop()
         except Exception as e:
@@ -261,10 +325,13 @@ class EngineCore:
                     continue
                 if not self.scheduler.is_finished():
                     self._process_engine_step()
+                elif self.has_pending_kv_work():
+                    self._advance_idle_kv_transfer()
         finally:
             # Teardown runs even on exceptions so the sender thread/socket
             # don't leak. Isolate the final publish so a publisher hiccup
             # cannot skip shutdown_kv_events().
+            self._drain_kv_work_at_exit()
             try:
                 self.scheduler.publish_kv_events()
             except Exception:
@@ -319,6 +386,14 @@ class EngineCore:
             fwd_out = self.runner_mgr.call_func(
                 "forward", scheduled_batch, wait_out=True
             )
+            if (
+                self.scheduler.prefill_delayer is not None
+                and scheduled_batch.total_seqs_num_prefill > 0
+            ):
+                # Arm post-prefill decode protection only after the prefill
+                # forward really completed. A delayer FIRE merely grants
+                # admission and can still result in a decode/empty batch.
+                self.scheduler.prefill_delayer.notify_prefill_executed()
 
         # Aggregate KV transfer status from all workers (only when PD disaggregation is active)
         self._poll_kv_transfer_progress()
@@ -350,11 +425,62 @@ class EngineCore:
 
         return True
 
+    def has_pending_kv_work(self) -> bool:
+        """True while KV transfer work outlives the scheduler queues.
+
+        ``postprocess`` parks a finished request in ``deferred_free_blocks``
+        and drops it from ``running`` in the same pass, so
+        ``Scheduler.is_finished()`` reads "idle" while that request's RDMA
+        send or offload save is still in flight. Every busy loop ORs this
+        predicate in next to ``is_finished()``; without it the last request's
+        completion signals are never polled, its deferred blocks are never
+        freed, and its save is never reported.
+
+        Every liveness condition lives here. The loops call this and nothing
+        else, so a new kind of pending work only has to be added once.
+        """
+        if not self.kv_transfer_enabled:
+            return False
+        if getattr(self.scheduler, "deferred_free_blocks", None):
+            return True
+        connector = getattr(self.scheduler, "kv_connector", None)
+        if connector is None or not hasattr(connector, "has_pending_work"):
+            return False
+        return bool(connector.has_pending_work())
+
     def _advance_idle_kv_transfer(self) -> None:
         # No forward batch will run this tick, but offload load/save work may
         # still need to be dispatched or reported back to the scheduler.
+        now = time.monotonic()
+        if now < self._next_idle_kv_drain:
+            return
+        self._next_idle_kv_drain = now + KV_IDLE_DRAIN_INTERVAL_S
         self._dispatch_idle_offload_work()
         self._poll_kv_transfer_progress()
+
+    def _drain_kv_work_at_exit(self) -> None:
+        """Give in-flight KV transfers a bounded window to report back.
+
+        The loop exits as soon as its queues are empty, so a save dispatched
+        by the final batch would otherwise be abandoned with its completion
+        unrecorded and its blocks still deferred.
+        """
+        if not self.kv_transfer_enabled:
+            return
+        deadline = time.monotonic() + KV_SHUTDOWN_DRAIN_TIMEOUT_S
+        try:
+            while self.has_pending_kv_work():
+                if time.monotonic() >= deadline:
+                    logger.warning(
+                        "%s: KV transfer still pending after %.1fs, exiting anyway",
+                        self.label,
+                        KV_SHUTDOWN_DRAIN_TIMEOUT_S,
+                    )
+                    break
+                self._advance_idle_kv_transfer()
+                time.sleep(KV_IDLE_DRAIN_INTERVAL_S)
+        except Exception:
+            logger.exception("KV transfer drain during shutdown failed")
 
     def _poll_kv_transfer_progress(self) -> None:
         if not self.kv_transfer_enabled:
@@ -369,7 +495,7 @@ class EngineCore:
         if connector is None or not getattr(connector, "is_offload", False):
             return
         meta = connector.build_connector_meta()
-        if meta is None or not getattr(meta, "requests", None):
+        if not connector_metadata_has_work(meta):
             return
         self.runner_mgr.call_func("process_kvconnector_output", meta)
 
@@ -469,7 +595,7 @@ class EngineCore:
 
                 if isinstance(item, tuple) and item[0] == "READY":
                     # Send READY signal to indicate EngineCore is fully initialized
-                    obj = pickle.dumps((EngineCoreRequestType.READY, None))
+                    obj = pickle.dumps((EngineCoreRequestType.READY, item[1]))
                     socket.send(obj)
                     logger.debug(f"{self.label}: sent READY signal")
                     continue
@@ -531,6 +657,7 @@ class DPEngineCoreProc(EngineCore):
                     kv_high_watermark=envs.ATOM_PREFILL_DELAYER_KV_HIGH_WATERMARK,
                     token_usage_low_watermark=envs.ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK,
                     max_queue_ms=envs.ATOM_PREFILL_DELAYER_MAX_QUEUE_MS,
+                    prefill_decode_interval=envs.ATOM_PREFILL_DECODE_INTERVAL,
                 )
             )
 
@@ -538,10 +665,17 @@ class DPEngineCoreProc(EngineCore):
         dp_rank = config.parallel_config.data_parallel_rank
         dp_size = config.parallel_config.data_parallel_size
         local_dp_rank = config.parallel_config.data_parallel_rank_local
+        local_dp_size = config.parallel_config.data_parallel_size_local
 
         assert dp_size > 1
         assert local_dp_rank is not None
-        assert 0 <= local_dp_rank <= dp_rank < dp_size
+        # Two independent bounds. The old chained form (local <= global) held
+        # only by coincidence on one node: the second node of a 2x4 run has
+        # local ranks 0..3 against global ranks 4..7.
+        assert 0 <= dp_rank < dp_size, f"dp_rank={dp_rank} outside [0,{dp_size})"
+        assert (
+            0 <= local_dp_rank < local_dp_size
+        ), f"local_dp_rank={local_dp_rank} outside [0,{local_dp_size})"
 
         self.dp_rank = dp_rank
         self.dp_group = config.parallel_config.stateless_init_dp_group()
@@ -589,6 +723,11 @@ class DPEngineCoreProc(EngineCore):
 
                 if not global_has_unfinished and not self.engines_running:
                     self.engines_running = False
+                    if self.has_pending_kv_work():
+                        # Local RPCs only. Anything that reaches schedule()
+                        # would run the delayer's cross-DP all_reduce off
+                        # lockstep, so the idle drain must stay off that path.
+                        self._advance_idle_kv_transfer()
                     continue
 
                 executed = self._process_engine_step()
@@ -599,6 +738,7 @@ class DPEngineCoreProc(EngineCore):
         finally:
             # Isolate the final publish so a publisher hiccup cannot skip
             # shutdown_kv_events() (which closes the sender thread/socket).
+            self._drain_kv_work_at_exit()
             try:
                 self.scheduler.publish_kv_events()
             except Exception:
@@ -831,7 +971,7 @@ class PrefillEngineCore(EngineCore):
             for seq in self.scheduler.waiting:
                 if seq.id in self._pending_assignments:
                     assignment = self._pending_assignments.pop(seq.id)
-                    seq.block_table = list(assignment.block_table)
+                    seq.block_table = new_block_table(assignment.block_table)
                     seq.num_cached_tokens = assignment.num_cached_tokens
 
     def _process_engine_step(self):
@@ -884,6 +1024,7 @@ class PrefillEngineCore(EngineCore):
 
     @staticmethod
     def run_engine(config: Config, input_address: str, output_address: str):
+        EngineCore._setup_engine_process("PrefillEngineCore")
         engine = None
         try:
             engine = PrefillEngineCore(config, input_address, output_address)
@@ -978,6 +1119,12 @@ class DecodeEngineCore(EngineCore):
             disagg_cu_shm_name=config.disagg_cu_shm_name,
             state_runtime=self.state_runtime,
         )
+        # The block pool exists only now, so the freeze inside
+        # `super().__init__()` ran before there was one to take. Safe to repeat:
+        # `_ready_deferred` held READY back, so nothing has been admitted yet
+        # and `gc.freeze()` is additive.
+        self._freeze_after_startup()
+
         # EngineUtilityHandler was built in super().__init__() with scheduler=None
         # (decode defers scheduler creation); wire the real one in for MTP stats.
         self.utility_handler.scheduler = self.scheduler
@@ -1140,6 +1287,7 @@ class DecodeEngineCore(EngineCore):
 
     @staticmethod
     def run_engine(config: Config, input_address: str, output_address: str):
+        EngineCore._setup_engine_process("DecodeEngineCore")
         engine = None
         try:
             engine = DecodeEngineCore(config, input_address, output_address)

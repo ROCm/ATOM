@@ -122,19 +122,18 @@ def fp4_indexer_enabled(index_cache_dtype: Any, *, warn: bool = False) -> bool:
     mismatch. Lives here rather than in either caller for the same reason as
     `FP4_MQA_*` above.
 
-    The FP4 mqa-logits / scatter kernels are gfx950 (MI355X / CDNA4) only; on any
-    other arch fall back to the FP8 indexer instead of failing. Pass `warn=True`
-    from the builder only — it runs once, while `Indexer.__init__` runs per CSA
-    layer and would repeat the message.
+    gfx942 keeps the FP8 indexer because its FP4 path is unsupported. Pass
+    `warn=True` from the builder only — it runs once, while `Indexer.__init__`
+    runs per CSA layer and would repeat the message.
     """
     if index_cache_dtype != "fp4":
         return False
     gfx = get_gfx()
-    if gfx != "gfx950":
+    if gfx == "gfx942":
         if warn:
             logger.warning(
-                "--index_cache_dtype fp4 requires a gfx950 (MI355X / CDNA4) GPU; "
-                "current arch is %r. Falling back to the FP8 indexer.",
+                "The DeepSeek-V4 FP4 indexer is unsupported on %r. Falling "
+                "back to the FP8 indexer.",
                 gfx,
             )
         return False

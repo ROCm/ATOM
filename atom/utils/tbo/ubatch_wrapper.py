@@ -50,7 +50,7 @@ class UBatchWrapper(nn.Module):
         self.comm_stream: torch.cuda.Stream | None = None
         # Barrier: ubatch threads + main thread
         self.ready_barrier = threading.Barrier(3)  # 2 ubatch threads + 1 main
-        # TBO CUDAGraph storage: keyed by (graph_bs, max_q_len)
+        # TBO CUDAGraph storage: keyed by (running_bs, max_q_len)
         self.tbo_graphs: dict[tuple, TBOGraphData] = {}
 
         # Persistent ubatch worker pool. Previously every forward spawned + joined
@@ -115,18 +115,18 @@ class UBatchWrapper(nn.Module):
 
         ub_dp_metadata = self._make_ubatch_dp_metadata(ctx, N)
 
-        full_graph_bs = ctx.context.graph_bs
+        full_running_bs = ctx.context.running_bs
         forward_contexts = []
         ub_inputs = []
 
-        # When using DP gather/scatter (no EP/all2all), compute
-        # DP-synchronized graph_bs per ubatch so MoE's pad_for_all_gather
-        # can just read context.graph_bs.  MORI path doesn't need this.
+        # When using DP gather/scatter (no EP/all2all), compute the
+        # DP-synchronized per-ubatch row count so MoE's pad_for_all_gather can
+        # just read context.running_tokens.  MORI path doesn't need this.
         dp_size = self._get_dp_size() if self.dp_gather_scatter else 1
-        ub_graph_bs_list = self._compute_ub_graph_bs(
+        ub_running_tokens_list = self._compute_ub_running_tokens(
             ctx,
             N,
-            full_graph_bs,
+            full_running_bs,
             dp_size,
             input_ids.device,
         )
@@ -134,16 +134,16 @@ class UBatchWrapper(nn.Module):
         for i, ub_slice in enumerate(ctx.ubatch_slices):
             ub_num_reqs = ub_slice.request_slice.stop - ub_slice.request_slice.start
             if ctx.context.is_prefill:
-                padded_bs = ub_num_reqs
+                ub_running_bs = ub_num_reqs
             else:
-                padded_bs = self._decode_ub_padded_bs(ctx, i, N, full_graph_bs)
+                ub_running_bs = self._decode_ub_running_bs(ctx, i, N, full_running_bs)
             ub_ctx = self._make_ubatch_context(
                 original_ctx,
                 ub_slice,
-                padded_bs,
+                ub_running_bs,
                 i,
                 ub_num_reqs,
-                ub_graph_bs=ub_graph_bs_list[i],
+                ub_running_tokens=ub_running_tokens_list[i],
                 dp_metadata=ub_dp_metadata[i] if ub_dp_metadata is not None else None,
             )
             forward_contexts.append(ub_ctx)
@@ -253,21 +253,22 @@ class UBatchWrapper(nn.Module):
         compute_stream = capture_stream
 
         # Build per-ubatch ForwardContexts from pre-allocated forward_vars.
-        full_graph_bs = ctx.context.graph_bs
+        full_running_bs = ctx.context.running_bs
+        max_q = int(getattr(ctx.attn_metadata, "max_seqlen_q", 1) or 1)
         ub_dp_metadata = self._make_ubatch_dp_metadata(ctx, N)
         forward_contexts = []
         ub_inputs = []
         for i, ub_slice in enumerate(ctx.ubatch_slices):
             if i < N - 1:
-                padded_bs = full_graph_bs // N
+                ub_running_bs = full_running_bs // N
             else:
-                padded_bs = full_graph_bs - (full_graph_bs // N) * (N - 1)
+                ub_running_bs = full_running_bs - (full_running_bs // N) * (N - 1)
             ub_ctx = self._make_ubatch_context(
                 ctx,
                 ub_slice,
-                padded_bs,
+                ub_running_bs,
                 i,
-                ub_graph_bs=padded_bs,
+                ub_running_tokens=ub_running_bs * max_q,
                 dp_metadata=ub_dp_metadata[i] if ub_dp_metadata is not None else None,
             )
             forward_contexts.append(ub_ctx)
@@ -353,7 +354,7 @@ class UBatchWrapper(nn.Module):
                 raise e
 
         # Store TBOContext objects to keep torch.Event alive during replay
-        graph_key = (ctx.context.graph_bs, ctx.attn_metadata.max_seqlen_q)
+        graph_key = (ctx.context.running_bs, ctx.attn_metadata.max_seqlen_q)
         self.tbo_graphs[graph_key] = TBOGraphData(
             graph=graph,
             tbo_ctxs=tbo_ctxs,
@@ -449,8 +450,8 @@ class UBatchWrapper(nn.Module):
         return metas
 
     @staticmethod
-    def _decode_ub_padded_bs(
-        ctx: ForwardContext, i: int, N: int, full_graph_bs: int
+    def _decode_ub_running_bs(
+        ctx: ForwardContext, i: int, N: int, full_running_bs: int
     ) -> int:
         """Per-ubatch padded request count for a decode micro-batch.
 
@@ -469,25 +470,27 @@ class UBatchWrapper(nn.Module):
             return max(1, ub_max[i] // max_q)
         # Fallback: local split (single-rank / value not precomputed).
         if i < N - 1:
-            return full_graph_bs // N
-        return full_graph_bs - (full_graph_bs // N) * (N - 1)
+            return full_running_bs // N
+        return full_running_bs - (full_running_bs // N) * (N - 1)
 
     @staticmethod
-    def _compute_ub_graph_bs(
+    def _compute_ub_running_tokens(
         ctx: ForwardContext,
         N: int,
-        full_graph_bs: int,
+        full_running_bs: int,
         dp_size: int,
         device: torch.device,
     ) -> list[int]:
-        """
-        For prefill (eager only): use cross-DP per-ubatch token MAX that
+        """Per-ubatch ``running_tokens`` -- what each micro-batch's MoE pads to.
+
+        In TOKENS on both branches, which is why neither multiplies by
+        ``dp_size``: pad_for_all_gather gathers across ranks itself.
+
+        For prefill (eager only): the cross-DP per-ubatch token MAX that
             ``ModelRunner._preprocess`` already packed into the single DP
             all_reduce (``ctx.ub_max_tokens_across_dp``). Falls back to
             local sizes when DP is off / value not precomputed.
-        For decode: per-rank padded_bs (the cross-DP all_gather in MoE's
-            pad_for_all_gather multiplies by dp_size itself, so do NOT
-            pre-multiply here).
+        For decode: the per-ubatch padded request count times ``max_seqlen_q``.
         """
         if ctx.context.is_prefill:
             if (
@@ -502,21 +505,20 @@ class UBatchWrapper(nn.Module):
                 ub_num_tokens = ub_slice.token_slice.stop - ub_slice.token_slice.start
                 ub_sizes.append(ub_num_tokens)
             return ub_sizes
-        else:
-            result = []
-            for i in range(N):
-                padded_bs = UBatchWrapper._decode_ub_padded_bs(ctx, i, N, full_graph_bs)
-                result.append(padded_bs)
-            return result
+        max_q = int(getattr(ctx.attn_metadata, "max_seqlen_q", 1) or 1)
+        return [
+            UBatchWrapper._decode_ub_running_bs(ctx, i, N, full_running_bs) * max_q
+            for i in range(N)
+        ]
 
     def _make_ubatch_context(
         self,
         ctx: ForwardContext,
         ub_slice: UBatchSlice,
-        padded_bs: int,
+        ub_running_bs: int,
         ubatch_idx: int = 0,
         actual_num_reqs: int | None = None,
-        ub_graph_bs: int | None = None,
+        ub_running_tokens: int | None = None,
         dp_metadata=None,
     ) -> ForwardContext:
         """Build a ForwardContext for a single micro-batch."""
@@ -526,11 +528,11 @@ class UBatchWrapper(nn.Module):
             ub_attn = self.attn_metadata_builder.build_ubatch_prefill_metadata(
                 ctx.attn_metadata,
                 ub_slice,
-                padded_bs,
+                ub_running_bs,
                 ubatch_idx=ubatch_idx,
             )
         else:
-            attn_bs = actual_num_reqs if actual_num_reqs is not None else padded_bs
+            attn_bs = actual_num_reqs if actual_num_reqs is not None else ub_running_bs
             ub_attn = self.attn_metadata_builder.build_ubatch_metadata(
                 ubatch_idx,
                 attn_bs,
@@ -538,18 +540,22 @@ class UBatchWrapper(nn.Module):
 
         # Split Context
         ub_num_tokens = ub_slice.token_slice.stop - ub_slice.token_slice.start
-        if ub_graph_bs is not None:
-            graph_bs = ub_graph_bs
+        if ub_running_tokens is not None:
+            running_tokens = ub_running_tokens
         elif ctx.context.is_prefill:
-            graph_bs = ub_num_tokens
+            running_tokens = ub_num_tokens
         else:
-            graph_bs = padded_bs
+            running_tokens = ub_running_bs * int(
+                getattr(ctx.attn_metadata, "max_seqlen_q", 1) or 1
+            )
         ub_context = Context(
             positions=ctx.context.positions[ub_slice.token_slice],
             is_prefill=ctx.context.is_prefill,
             is_dummy_run=ctx.context.is_dummy_run,
-            batch_size=ub_num_reqs,
-            graph_bs=graph_bs,
+            scheduled_bs=ub_num_reqs,
+            scheduled_tokens=ub_num_tokens,
+            running_bs=ub_running_bs,
+            running_tokens=running_tokens,
             is_draft=ctx.context.is_draft,
             # Carry over per-ubatch slice of input_ids for hash MoE (PCP+TBO mode).
             # run_model stores local (1/pcp) ids; each ubatch takes its token_slice.

@@ -32,22 +32,22 @@ def prepare_model(config: Any):
     logger.info("Prepare model for plugin mode, the upper engine is sglang")
     _set_framework_backbone("sglang")
 
-    model_arch = config.architectures[0]
+    from atom.plugin.sglang.runtime import resolve_model_arch_spec
+
+    source_model_arch = (getattr(config, "architectures", None) or [""])[0]
+    model_arch, model_adapter = resolve_model_arch_spec(config)
     if model_arch == "DeepseekV4ForCausalLM":
         from atom.plugin.sglang.deepseek_v4_bridge import (
             install_deepseek_v4_proxy_pool_patch,
         )
 
         install_deepseek_v4_proxy_pool_patch()
-    elif model_arch in (
-        "MiniMaxM3SparseForCausalLM",
-        "MiniMaxM3SparseForConditionalGeneration",
-    ):
-        from atom.plugin.sglang.minimax_m3_bridge import (
-            install_minimax_m3_pool_patch,
-        )
+    elif model_arch == "KimiK3ForConditionalGeneration":
+        from atom.plugin.sglang.kimi_k3_bridge import install_kimi_k3_pool_patch
 
-        install_minimax_m3_pool_patch()
+        # Model construction precedes ModelRunner.init_memory_pool(), so install
+        # the K3-only pool hooks here after the architecture is known.
+        install_kimi_k3_pool_patch()
 
     # Import here to avoid partial initialization while SGLang discovers models.
     from atom.plugin.register import (
@@ -60,20 +60,23 @@ def prepare_model(config: Any):
     if model_arch not in _ATOM_SUPPORTED_MODELS:
         supported_archs = list(_ATOM_SUPPORTED_MODELS.keys())
         raise ValueError(
-            f"ATOM does not support the required model architecture: {model_arch}. "
+            "ATOM does not support the required model architecture: "
+            f"{source_model_arch or '<unknown>'} (resolved as "
+            f"{model_arch or '<unknown>'}). "
             f"For now supported model architectures: {supported_archs}"
         )
 
     from atom.plugin.config import generate_atom_config_for_plugin_mode
 
     atom_config = generate_atom_config_for_plugin_mode(config)
+    if getattr(atom_config, "enable_tbo", False):
+        from atom.plugin.sglang.tbo import install_sglang_tbo_compat_patches
+
+        install_sglang_tbo_compat_patches()
 
     model_cls = _ATOM_SUPPORTED_MODELS[model_arch]
     logger.info("ATOM model class for %s is %s", model_arch, model_cls)
 
-    from atom.plugin.sglang.runtime import get_model_arch_spec
-
-    model_adapter = get_model_arch_spec(model_arch)
     if model_adapter.prepare_draft_model_config is not None:
         model_adapter.prepare_draft_model_config(atom_config, config)
     if model_adapter.prepare_config is not None:
@@ -81,7 +84,29 @@ def prepare_model(config: Any):
     else:
         _remap_quant_config_for_sglang_plugin(atom_config, model_cls)
 
-    register_ops_to_sglang(atom_config=atom_config)
+    # Qwen3-Next/Qwen3.5 model layers are already written against SGLang's
+    # RadixAttention contract. Keep SGLang's native attention backend so
+    # speculative TARGET_VERIFY uses its proven metadata/cache path.
+    if model_arch not in {
+        "Qwen3NextForCausalLM",
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
+    }:
+        register_ops_to_sglang(atom_config=atom_config)
+
+    # Qwen3.5 is the only family that runs DFLASH on the ATOM plugin today.
+    # SGLang's draft greedy sampler assumes a head without `shard_indices` is
+    # not vocab-parallel, which is wrong for ATOM's ParallelLMHead and yields
+    # garbage draft tokens at TP>1; see dflash_lm_head_bridge for the details.
+    if model_arch in {
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
+    }:
+        from atom.plugin.sglang.dflash_lm_head_bridge import (
+            install_dflash_lm_head_patch,
+        )
+
+        install_dflash_lm_head_patch()
     set_attn_cls()
 
     # Init aiter dist for using aiter custom collective ops.

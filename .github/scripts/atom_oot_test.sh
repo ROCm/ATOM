@@ -289,8 +289,8 @@ PY
     --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
     --trust-remote-code \
     --kv-cache-dtype fp8 \
-    "${extra_arg_array[@]}" \
     --no-enable-prefix-caching \
+    "${extra_arg_array[@]}" \
     > "${VLLM_LOG_FILE}" 2>&1 &
   echo $! > "${VLLM_PID_FILE}"
   echo "Server PID: $(cat "${VLLM_PID_FILE}")"

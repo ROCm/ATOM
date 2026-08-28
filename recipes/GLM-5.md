@@ -67,7 +67,9 @@ python3 -m atom.entrypoints.openai_server \
   --server-port 8010 \
   -tp <4-or-8> \
   --max-num-seqs 512 \
-  --enable-dp-attention
+  --enable-dp-attention \
+  --attn-prefill-chunk-size 131072 \
+  --long-prefill-token-threshold 131072
 ```
 
 The full 1319-sample GSM8K 20-shot evaluation with 65 concurrent requests produced the following results:
@@ -83,9 +85,10 @@ TP8 + DPA:
 
 |Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
 |-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
-|gsm8k|      3|flexible-extract|    20|exact_match|↑  |0.9295|±  |0.0071|
-|     |       |strict-match    |    20|exact_match|↑  |0.9303|±  |0.0070|
+|gsm8k|      3|flexible-extract|    20|exact_match|↑  |0.9340|±  |0.0068|
+|     |       |strict-match    |    20|exact_match|↑  |0.9363|±  |0.0067|
 
+DPA cannot currently be combined with PCP. PCP-only continues to use the existing MLA/PCP path.
 
 #### GLM-5.2 MXFP4 MTP Server
 
@@ -216,7 +219,7 @@ The following script can be used to benchmark the performance:
 
 ```bash
 python -m atom.benchmarks.benchmark_serving \
-    --model=zai-org/GLM-5-FP8 --backend=vllm --base-url=http://localhost:7777 \
+    --model=amd/GLM-5.2-MXFP4 --backend=vllm --base-url=http://localhost:7777 \
     --dataset-name=random \
     --random-input-len=${ISL} --random-output-len=${OSL} \
     --random-range-ratio 1.0 \
@@ -226,18 +229,18 @@ python -m atom.benchmarks.benchmark_serving \
     --save-result --result-dir=${result_dir} --result-filename=$RESULT_FILENAME.json \
     --percentile-metrics="ttft,tpot,itl,e2el"
 ```
-The performance number on 8 ranks is provided as a reference, with the following environment:
+The performance number on 4 ranks (TP4, MXFP4, no DPA/MTP) is provided as a reference, with the following environment:
 - docker image: rocm/atom:latest.
-- ATOM: zlr/glm5 branch.
+- model: `amd/GLM-5.2-MXFP4`.
 
 | ISL  | OSL  | Concurrency | Num Prompts | Output Throughput (tok/s) | Total Throughput (tok/s) |
 | ---- | ---- | ----------- | ----------- | ------------------------- | ------------------------ |
-| 1024 | 1024 | 4           | 40          | 151.13                    | 303.73                   |
-| 1024 | 1024 | 8           | 80          | 285.37                    | 568.63                   |
-| 1024 | 1024 | 16          | 160         | 528.32                    | 1062.26                  |
-| 1024 | 1024 | 32          | 320         | 925.64                    | 1848.35                  |
-| 1024 | 1024 | 64          | 640         | 1605.75                   | 3212.22                  |
-| 1024 | 1024 | 128         | 1280        | 2738.57                   | 5483.16                  |
+| 1024 | 1024 | 4           | 40          | 366.51                    | 733.02                   |
+| 1024 | 1024 | 8           | 80          | 598.63                    | 1197.26                  |
+| 1024 | 1024 | 16          | 160         | 995.58                    | 1991.16                  |
+| 1024 | 1024 | 32          | 320         | 1479.73                   | 2959.46                  |
+| 1024 | 1024 | 64          | 640         | 2421.87                   | 4843.74                  |
+| 1024 | 1024 | 128         | 1280        | 3979.69                   | 7959.37                  |
 
 Here are the steps to reinstall ATOM/AITER in the docker, if you are trying to verify with other specific commits:
 ```bash
@@ -262,17 +265,19 @@ We verified the lm_eval accuracy on gsm8k dataset with command:
 ```bash
 lm_eval \
 --model local-completions \
---model_args model=zai-org/GLM-5-FP8,base_url=http://localhost:7777/v1/completions,num_concurrent=64,max_retries=3,tokenized_requests=False \
+--model_args 'model=amd/GLM-5.2-MXFP4,base_url=http://localhost:7777//v1/chat/completions,api_key=EMPTY,eos_string=</s>,max_retries=5,num_concurrent=64,timeout=1800,tokenized_requests=False,max_length=1048576' \
+--apply_chat_template \
 --tasks gsm8k \
+--gen_kwargs max_tokens=16384,temperature=0,top_p=1 \
 --num_fewshot 5
 ```
 
-Here is the reference value when deploying on 8 ranks:
+Here is the reference value when deploying on 4 ranks (TP4, MXFP4, no DPA/MTP), full 1319-sample GSM8K with 64 concurrent requests:
 ```bash
-|Tasks|Version|     Filter     |n-shot|  Metric   |   |Value|   |Stderr|
-|-----|------:|----------------|-----:|-----------|---|----:|---|-----:|
-|gsm8k|      3|flexible-extract|     5|exact_match|↑  | 0.93|±  |0.0256|
-|     |       |strict-match    |     5|exact_match|↑  | 0.93|±  |0.0256|
+|Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
+|-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
+|gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.9742|±  |0.0044|
+|     |       |strict-match    |     5|exact_match|↑  |0.9727|±  |0.0045|
 ```
 
 ## GLM-5.2 (IndexShare)
@@ -286,16 +291,16 @@ Tips on server configuration:
 
 ### Performance baseline
 
-Reference numbers on 8×MI355X (TP8, FP8 weights, bf16 KV cache), using the benchmark command above with `--random-range-ratio 0.8`:
+Reference numbers on 4×MI355X (`amd/GLM-5.2-MXFP4`, TP4, MXFP4 weights, FP8 KV cache, no DPA/MTP), using the benchmark command above with `--random-range-ratio 0.8`:
 
 | ISL  | OSL  | Concurrency | Output Throughput (tok/s) | Total Throughput (tok/s) | Median TTFT (ms) | Median TPOT (ms) |
 | ---- | ---- | ----------- | ------------------------- | ------------------------ | ---------------- | ---------------- |
-| 1024 | 1024 | 1   | 79   | 158   | 102 | 12.5 |
-| 1024 | 1024 | 16  | 841  | 1690  | 95  | 18.5 |
-| 1024 | 1024 | 64  | 2074 | 4148  | 107 | 30.0 |
-| 8192 | 1024 | 1   | 73   | 669   | 409 | 13.2 |
-| 8192 | 1024 | 16  | 645  | 5818  | 418 | 23.3 |
-| 8192 | 1024 | 64  | 1210 | 10853 | 483 | 51.3 |
+| 1024 | 1024 | 1   | 105  | 203   | 101 | 9.4  |
+| 1024 | 1024 | 16  | 934  | 1870  | 102 | 16.8 |
+| 1024 | 1024 | 64  | 2145 | 4299  | 117 | 29.3 |
+| 8192 | 1024 | 1   | 97   | 816   | 363 | 10.0 |
+| 8192 | 1024 | 16  | 710  | 6395  | 411 | 21.8 |
+| 8192 | 1024 | 64  | 1299 | 11734 | 525 | 47.9 |
 
 ## GLM-5.2 Prefill Context Parallel (PCP)
 

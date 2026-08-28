@@ -171,18 +171,11 @@ FROM ${SGLANG_BASE_IMAGE} AS atom_sglang
 ARG GPU_ARCH
 ARG VENV_PYTHON="/opt/venv/bin/python"
 ARG SGLANG_REPO="https://github.com/sgl-project/sglang.git"
-ARG SGLANG_REF="v0.5.15.post1"
+ARG SGLANG_REF="v0.5.17"
 LABEL com.rocm.atom.sglang_ref="${SGLANG_REF}"
 
 ENV PATH="/opt/venv/bin:${PATH}"
 ENV PYTHONPATH="/app/sglang/python:/app/ATOM:${PYTHONPATH}"
-
-# Temporary backport: SGLang v0.5.15.post1, the latest release at the time of
-# this change, does not include the upstream Cohere2MoeConfig dataclass fix.
-# Remove this patch once SGLANG_REF includes:
-# https://github.com/sgl-project/sglang/commit/6a4ffcc34aae336e712792b1bbcbd142ba7114eb
-# Tracking issue: https://github.com/sgl-project/sglang/issues/28233
-COPY docker/patches/sglang/cohere2-moe-drop-invalid-hf-strict.patch /tmp/sglang-patches/cohere2-moe-drop-invalid-hf-strict.patch
 
 RUN echo "========== [SGLANG-ATOM 0/6] Check Aiter/FlyDSL/Triton versions before SGLang build ==========" && \
     "${VENV_PYTHON}" -m pip show atom amd-mori-nightly amd-aiter flydsl triton || true && \
@@ -203,7 +196,6 @@ RUN echo "========== [SGLANG-ATOM 1/6] Clone SGLang ==========" && \
     git clone "${SGLANG_REPO}" /app/sglang && \
     cd /app/sglang && \
     git checkout "${SGLANG_REF}" && \
-    git apply /tmp/sglang-patches/cohere2-moe-drop-invalid-hf-strict.patch && \
     git submodule update --init --recursive && \
     echo "sglang ref:" && \
     git rev-parse HEAD
@@ -220,7 +212,7 @@ RUN echo "========== [SGLANG-ATOM 2/6] Build sglang kernel ==========" && \
       test -n "${FINAL_AMDGPU_TARGET}"; \
       echo "GPU not detectable during build; fallback AMDGPU_TARGET=${FINAL_AMDGPU_TARGET} from GPU_ARCH=${GPU_ARCH}"; \
     fi && \
-    cd /app/sglang/sgl-kernel && \
+    cd /app/sglang/python/sglang/kernels/aot && \
     AMDGPU_TARGET="${FINAL_AMDGPU_TARGET}" "${VENV_PYTHON}" setup_rocm.py install && \
     "${VENV_PYTHON}" -m pip show sglang-kernel || true
 
@@ -246,13 +238,13 @@ RUN echo "========== [SGLANG-ATOM 3/6] Install SGLang dependencies ==========" &
       referencing \
       safetensors && \
     "${VENV_PYTHON}" -m pip install --no-cache-dir --no-deps \
-      compressed-tensors==0.13.0 \
+      compressed-tensors==0.15.0 \
       outlines==0.1.11 \
       petit_kernel==0.0.2 \
       timm==1.0.16 \
       torchao==0.9.0 \
       wave-lang==3.8.2 \
-      xgrammar==0.1.27 && \
+      xgrammar==0.2.1 && \
     "${VENV_PYTHON}" -m pip install --no-cache-dir \
       "cython>=0.29.36,<3.0" \
       "apache-tvm-ffi @ git+https://github.com/apache/tvm-ffi.git@37d0485b2058885bf4e7a486f7d7b2174a8ac1ce" \
@@ -524,16 +516,32 @@ assert lmcache.c_ops.__file__.endswith('.so'), 'c_ops fell back to python backen
 print('OK: lmcache', lmcache.__version__, 'HIP c_ops; torch', torch.__version__)"
 
 # ========== SemiAnalysis aiperf agentic benchmark tool ==========
-# Install the SemiAnalysis fork pinned to the commit that supports the SA
-# agentic datasets (semianalysis_cc_traces_weka_062126*).
+# The SemiAnalysis fork, which is what carries the SA agentic datasets
+# (semianalysis_cc_traces_weka_062126*).
+#
+# Pinned to the commit InferenceX's `utils/aiperf` submodule points at, so our
+# image ships the aiperf they measure with. Their pointer is a deliberate,
+# frequently-moved pin -- four bumps in the first half of August 2026, and a
+# same-day revert on 2026-07-28 -- with commit titles that read "pin AIPerf v1
+# timing watchdog", "pin additive AIPerf main warmup". Tracking aiperf's master
+# instead would take in exactly the upstream changes they evaluate and
+# sometimes reject.
+#
+# It therefore has to be followed by hand. To re-check:
+#   git ls-tree main utils/aiperf     # in a clone of SemiAnalysisAI/InferenceX
+#
+# `SA_AIPERF_REF` accepts any ref; empty means "whatever HEAD points at", which
+# is why the checkout below is conditional rather than naming a branch (an
+# upstream default-branch rename would otherwise break unrelated builds).
 ARG INSTALL_SA_AIPERF=1
-ARG SA_AIPERF_COMMIT="0d2aa0572ac685943d38c580675c4a61023581d3"
+ARG SA_AIPERF_REF="754356e9a39acc6cc6afb242d123bb57c3fb6f75"
 RUN if [ "${INSTALL_SA_AIPERF}" = "1" ]; then \
-        echo "========== [ATOM] Install SemiAnalysis aiperf (${SA_AIPERF_COMMIT}) =========="; \
+        echo "========== [ATOM] Install SemiAnalysis aiperf (ref=${SA_AIPERF_REF:-<default branch>}) =========="; \
         rm -rf /opt/aiperf && \
         git clone https://github.com/SemiAnalysisAI/aiperf.git /opt/aiperf && \
         cd /opt/aiperf && \
-        git checkout "${SA_AIPERF_COMMIT}" && \
+        { [ -z "${SA_AIPERF_REF}" ] || git checkout "${SA_AIPERF_REF}"; } && \
+        echo "[ATOM] aiperf resolved to $(git rev-parse HEAD)" && \
         "${VENV_PYTHON}" -m pip install -e . && \
         "${VENV_PYTHON}" -m pip show aiperf || true && \
         command -v aiperf && aiperf --help >/dev/null; \

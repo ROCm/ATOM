@@ -20,8 +20,8 @@ Weight prep uses aiter's own shuffles (``aiter.ops.shuffle``):
                ``shuffle_scale_a16w4(., E, gate_up=True)``  (g1u1 interleave)
   w2/w2_scale: ``shuffle_weight_a16w4(., 16, gate_up=False)`` /
                ``shuffle_scale_a16w4(., E, gate_up=False)``
-Shuffled tensors stay expert-major + contiguous, so EPLB's
-``get_eplb_weight_views`` (``tensor.view(num_local_experts, -1)``) still works.
+Shuffled tensors stay expert-major + contiguous, so EPLB can migrate their
+expert-major views in place.
 
 Memory: ONE MegaMoEV2 is shared across all MoE layers (process-level cache keyed
 by shape/quant/mtpr); per-layer weights are swapped in before forward
@@ -58,6 +58,13 @@ def build_mega_weights(layer) -> None:
     # aiter reference op_tests/multigpu_tests/test_mega_moe_v2.py weight prep.
     w13 = layer.w13_weight.data  # [E, 2*inter, hidden//2] fp4-packed uint8
     E = int(w13.shape[0])
+    expected_local = layer.local_num_experts
+    if E != expected_local:
+        raise RuntimeError(
+            "MegaMoE local weight width disagrees with the dispatch layout: "
+            f"weights={E}, dispatch={expected_local}. The shared expert must "
+            "occupy the fixed tail slot in every Mega weight tensor."
+        )
     layer._mega_w1 = shuffle_weight_a16w4(w13, 16, True).contiguous()
 
     s1 = layer.w13_weight_scale.data  # [E, 2*inter, hidden//32] e8m0
@@ -282,10 +289,17 @@ class MegaFusedExperts:
                 f"mega hardcodes SwiGLU; got activation={activation}"
             )
         # w1/w2 are the emptied AITER staging buffers -- mega reads layer._mega_*.
-        # expert_map is intentionally unused: mega consumes *global physical*
-        # expert ids (see run_mega_moe), while expert_map is the global->local
-        # index remap the per-rank kernels need. It is always non-None under EP.
+        # expert_map is intentionally unused: Mega consumes backend dispatch ids,
+        # while expert_map belongs to EPLB's routed physical space.
         del w1, w2, expert_map
+
+        local_weight_experts = int(self._layer._mega_w1.shape[0])
+        if local_weight_experts != self._layer.local_num_experts:
+            raise RuntimeError(
+                "MegaMoE weight/dispatch layout changed after preparation: "
+                f"weights={local_weight_experts}, "
+                f"expected={self._layer.local_num_experts}"
+            )
 
         return run_mega_moe(
             self._layer,
@@ -297,7 +311,7 @@ class MegaFusedExperts:
             experts=global_num_experts,
             # Infer top-k from the routing tensors, same as the standard kernels.
             topk=int(topk_ids.shape[1]),
-            # todo decode use graph_bs for perf
+            # todo decode use running_bs for perf
             mtpr=self._mtpr,
             swiglu_limit=getattr(self._layer, "swiglu_limit", 0.0),
             quant=self._quant,
