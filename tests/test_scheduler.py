@@ -184,9 +184,7 @@ class TestThroughputSection:
         a red build pointing at a regression that never happened.
         """
         interval = 10.0
-        stats = EngineStats(
-            enable_log_stats=True, throughput_log_interval_s=interval
-        )
+        stats = EngineStats(enable_log_stats=True, throughput_log_interval_s=interval)
         # 43s of idleness, closed silently by the heartbeat — that close is
         # what keeps the window start fresh.
         stats._throughput_last_log_time -= 43.0
@@ -1453,9 +1451,9 @@ class TestPostprocess:
             list(sched.running), self._output(seq.id, [10, 2, 99])
         )
         assert len(finished) == 1 and finished[0].leave_reason == "eos"
-        assert sched.engine_stats.num_generation_tokens == 2, (
-            "the post-EOS token must not be counted"
-        )
+        assert (
+            sched.engine_stats.num_generation_tokens == 2
+        ), "the post-EOS token must not be counted"
 
     def test_eos_finishes(self, scheduler, seq_factory):
         seq = self._prefill(scheduler, seq_factory([1, 2, 3, 4]))
