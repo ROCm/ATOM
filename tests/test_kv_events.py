@@ -60,7 +60,7 @@ def _dcp_bm_with_events(monkeypatch) -> BlockManager:
     bm = _bm_with_events(decode_context_parallel_size=2)
     monkeypatch.setattr(
         bm,
-        "_dcp_num_blocks",
+        "num_pool_blocks",
         lambda seq_len: (seq_len + bm.hash_block_size - 1) // bm.hash_block_size,
     )
     return bm
