@@ -470,5 +470,18 @@
     "accuracy_baseline": 0.95,
     "accuracy_baseline_model": "deepseek-ai/DeepSeek-V4-Pro",
     "_baseline_note": "TBO + dp-attention at conc=1000. Local 1319-sample GSM8K 3-shot, 4 runs = 0.9439/0.9484/0.9538/0.9530 (mean ~0.950, 2026-06-14, after TBO ids-gather + pad_for_all_gather fixes). Baseline 0.95; threshold 0.93 (~1.4pp below lowest 0.9439, conc=1000 variance)."
+  },
+  {
+    "model_name": "GLM-5.3-Flash",
+    "model_path": "zai-org/GLM-5.3-Flash",
+    "extraArgs": "--kv_cache_dtype bf16 -tp 8 --max-model-len 2048 --max-num-batched-tokens 2048 --max-num-seqs 32 --gpu-memory-utilization 0.85 --no-enable_prefix_caching",
+    "client_command": "lm_eval --model local-chat-completions --model_args model=${MODEL_PATH},base_url=http://localhost:8000/v1/chat/completions,num_concurrent=32,max_retries=3,tokenized_requests=False,max_gen_toks=512 --tasks gsm8k --num_fewshot 3 --batch_size 65 --apply_chat_template --fewshot_as_multiturn --output_path ${OUTPUT_PATH} --log_samples",
+    "env_vars": "",
+    "runner": "linux-atom-do-mi350x-8",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.94,
+    "accuracy_baseline": 0.9682,
+    "accuracy_baseline_model": "zai-org/GLM-5.3-Flash",
+    "_baseline_note": "Dense MLA at or below index_topk (2048): the k-pool indexer selects every token there, so dense is numerically identical. ATOM native gsm8k over all 1319 questions, chat + 3-shot fewshot_as_multiturn: flexible-extract=0.9682, strict-match=0.9689 (SGLang publishes 0.9704-0.9757 for this model). USE CHAT, NOT RAW COMPLETIONS, AND KEEP THE SHOTS: lm_eval's gsm8k filters assume the few-shot '#### N' convention while this model answers in markdown/LaTeX, so 0-shot chat scores strict-match=0.0000 on replies that are ~98% correct -- audit with \"is the gold value anywhere in the reply\" before believing any low score. num_fewshot stays at 3 while max-model-len is 2048: 5-shot multiturn plus the generation budget overflows it and every request 400s. Prefix caching is off because the KDA recurrent state is per-request. Threshold 0.94 leaves ~2.8pp headroom."
   }
 ]

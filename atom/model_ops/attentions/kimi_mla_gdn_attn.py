@@ -9,7 +9,7 @@ from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mla import MLAAttention
 from atom.utils import envs
 
-from .aiter_mla import AiterMLAMetadataBuilder
+from .aiter_mla import AiterMLAMetadataBuilder, mla_kv_entry_dim
 from .backends import AttentionBackend
 from .gdn_attn import GDNStateMixin
 from .sub_pool_spec import SubPoolSpec, page_pool
@@ -67,7 +67,7 @@ class _KimiMLAGDNCommon(GDNStateMixin):
         runner = self.model_runner
         config = runner.config
         hf = config.hf_config
-        entry = hf.kv_lora_rank + hf.qk_rope_head_dim
+        entry = mla_kv_entry_dim(hf)
         kv_dtype_size = dtypes.d_dtypes[config.kv_cache_dtype].itemsize
         block_bytes = self._num_cache_rows() * runner.block_size * entry * kv_dtype_size
         return [page_pool(block_bytes), self.state_spec()]
@@ -80,7 +80,7 @@ class _KimiMLAGDNCommon(GDNStateMixin):
         config = runner.config
         hf = config.hf_config
         num_layers = self._num_cache_rows()
-        entry = hf.kv_lora_rank + hf.qk_rope_head_dim
+        entry = mla_kv_entry_dim(hf)
         return {
             "kv_cache": torch.zeros(
                 num_layers,
@@ -120,7 +120,7 @@ class _KimiMLAGDNCommon(GDNStateMixin):
                 f"MLA cache row {row} for model layer {layer_id} "
                 f"exceeds {allocated_rows} allocated rows"
             )
-            entry = hf.kv_lora_rank + hf.qk_rope_head_dim
+            entry = mla_kv_entry_dim(hf)
             kv_cache = runner.kv_cache[row].view(-1, 1, entry)
             module.max_model_len = runner.config.max_model_len
             module.kv_cache = kv_cache

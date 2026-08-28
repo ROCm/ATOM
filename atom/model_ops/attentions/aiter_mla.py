@@ -70,6 +70,21 @@ def _mla_seg_meta_kwargs() -> dict:
     return {}
 
 
+def mla_kv_entry_dim(hf_config) -> int:
+    """Width of one MLA KV cache entry.
+
+    Normally ``kv_lora_rank + qk_rope_head_dim``. A NoPE model (GLM-5.3-Flash,
+    ``qk_rope_head_dim == 0``) materializes the rope block at a padded width and
+    holds it at zero so the standard 576-wide MLA kernels apply unchanged; it
+    declares that padded width as ``mla_kv_entry_dim``. Sizing the cache from
+    the raw config instead would allocate 512-wide rows under a 576-wide write.
+    """
+    declared = getattr(hf_config, "mla_kv_entry_dim", None)
+    if declared:
+        return int(declared)
+    return hf_config.kv_lora_rank + hf_config.qk_rope_head_dim
+
+
 def _global_index_cache_layer_ids(
     indexer_types,
     num_hidden_layers: int,

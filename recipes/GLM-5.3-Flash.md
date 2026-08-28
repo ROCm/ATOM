@@ -1,12 +1,14 @@
 # GLM-5.3-Flash Bring-Up Notes
 
-> **Status: runs end to end under ATOM on 4× MI355X, context ≤ 2048.**
+> **Status: serving-accurate under ATOM on 8× MI355X, context ≤ 2048.**
 > `atom/models/glm5_next.py` loads every parameter of the checkpoint — language
-> model and vision tower — and generates coherent text; per-layer hidden states
-> match the transformers reference to cosine ≥ 0.9997 at all 45 layers, and the
-> vision tower is bit-exact in fp32. Not yet done: contexts beyond `index_topk`
-> (needs the sparse k-pool path), the MTP draft layer, and the image processor
-> that would let the server actually accept an image. See §7.
+> model and vision tower — and scores **gsm8k flexible-extract 0.9682 /
+> strict-match 0.9689** over all 1319 questions (3-shot chat, TP8, bf16 KV; see
+> §8). Per-layer hidden states match the transformers reference to cosine
+> ≥ 0.9997 at all 45 layers, and the vision tower is bit-exact in fp32. Not yet
+> done: contexts beyond `index_topk` (needs the sparse k-pool path), the MTP
+> draft layer, and the image processor that would let the server actually accept
+> an image. See §8.
 
 ```bash
 python -m tools.glm5_3_flash.atom_run --model /models/GLM-5.3-Flash -tp 4 \
@@ -60,7 +62,7 @@ assembly plus one new op, not a from-scratch port.
 | KDA linear attention | `KimiKDAAttention` (`models/kimi_k3.py`), aiter `kimi_delta_attn` Triton kernels | Very close. Same **separate `q/k/v_conv1d`** layout as the checkpoint, per-head `A_log`, per-channel `dt_bias`, `f_a`/`f_b` forget gate, and it already reads `linear_attn_config.gate_lower_bound`. |
 | mHC hyper-connections | `hc_split_sinkhorn` (`model_ops/sparse_attn_v4.py`), `Block.hc_pre`/`hc_post` (`models/deepseek_v4.py`) | **Math-exact.** Same sigmoid gates, same Sinkhorn schedule including the special first iteration, same `HC_POST_MULT = 2.0`. Checkpoint tensor names (`hc_attn_fn`/`base`/`scale`) are already what `Block` expects, and `hc_attn_fn` is `[24, 16384]` = exactly its `mixes` layout. `dim=4096` satisfies the fused aiter `mhc_pre`/`mhc_post` `% 512 == 0` constraint. |
 | k-pool DSA indexer | **new** — `model_ops/kpool_indexer.py` (this branch) | DeepSeek-V4's `Compressor` pools the same way at `compress_ratio=4` with an `ape` term, but overlapping + RoPE'd. GLM's is non-overlapping and NoPE. |
-| MLA | `model_ops/attention_mla.py` via `MLAModules`, NoPE via `_NoPositionalRotaryEmbedding` | Works with a zero-width rope slice. Padding the rope lanes with zeros would also be exact but is impossible: `qk_nope_head_dim` is already 256 and the CK prefill kernel caps head dims at 256. |
+| MLA | `model_ops/attention_mla.py` via `MLAModules`, NoPE via `_NoPositionalRotaryEmbedding` | Needs the rope block materialized at `_ROPE_PAD = 64` lanes of zeros, giving the 576-wide KV entry every ROCm MLA kernel assumes. A zero-*width* slice is not viable — see §4d. |
 | MoE 288 × sigmoid/`noaux_tc` | `model_ops/fused_moe`, `models/glm4_moe.py`, `deepseek_v2.py` | Direct. |
 | Block FP8 128×128 | existing DeepSeek block-FP8 path | Direct. |
 | MTP (layer 45) | `deepseek_mtp.py` / `glm4_moe_mtp.py` | Layer 45 is a full DSA layer plus `eh_proj`/`enorm`/`hnorm`/`shared_head.norm`. `index_share_for_mtp_iteration` means it reuses the main model's top-k. |
@@ -113,7 +115,10 @@ pip install --no-cache-dir --no-deps \
 python kpool_parity_atom.py   # see §5
 ```
 
-## 4. Two upstream bugs found during bring-up
+## 4. Bugs found during bring-up
+
+(a)–(c) are upstream, in `transformers` and aiter. (d) was this port's own, and
+is the one that decided whether the model works at all.
 
 **a) `transformers` mis-quantizes the KDA forget gate.** The checkpoint's
 `quantization_config.modules_to_not_convert` names it
@@ -163,6 +168,44 @@ a model that loads, runs, and emits garbage. transformers warns about exactly th
 DeepGEMM in its FP8 loader; aiter has the same constraint and no such guard. Fixed by
 wrapping every aiter call in `with torch.cuda.device(tensor.device)`. Not a concern for
 ATOM proper (one device per rank), but it bites any multi-device single-process use.
+
+**d) A zero-WIDTH rope slice is not a viable way to express NoPE on ROCm.**
+The obvious reading of `qk_rope_head_dim == 0` is to leave it at 0 and let the
+MLA's rope half be an empty slice. That was this port's original choice and it is
+wrong in two independent ways, both measured:
+
+* **Accuracy collapses silently.** The paged MLA entry is sized
+  `kv_lora_rank + qk_rope_head_dim`, so it comes out 512 while aiter's asm decode
+  kernel is built for a 576-wide query. That kernel only *asserts* the 576 on the
+  gfx1250 path, and `cfg_mla_asm` never dispatches on head_size, so on gfx950 the
+  mismatch is computed rather than rejected. gsm8k measured **0.0099 /
+  0.0000**: 69% of replies empty, and of the rest an extraction-free audit found
+  the gold value in only 8.8% (a healthy run gives ~98%). Prefill is unaffected —
+  it goes through `flash_attn_varlen`, which is head-dim generic — so a
+  prefill-only per-layer cosine check reads 0.9997 and clears a broken model.
+* **It also crashes outright.** `KV_PeDim == 0` makes every
+  `tl.arange(0, KV_PeDim)` an `arange(0, 0)`, which Triton rejects at compile
+  time, and upstream aiter's three `gather_kv_b_proj` kernels have no guard for
+  it (`git show HEAD:...gather_kv_b_proj.py | grep -c 'KV_PeDim > 0'` → 0). It
+  fires only on the cached-prefix prefill path, so a single-prompt demo passes
+  and any concurrent run dies ~15 s in with
+  `NameError('kv_pe_data is not defined')`.
+
+The fix is `_ROPE_PAD = 64` in `atom/models/glm5_next.py`: materialize the rope
+block at 64 lanes and hold it at zero. The apparent objection — `qk_nope_head_dim`
+is already 256 and CK caps head_dim at 256 — conflates two constraints that apply
+to **different tensors**. The latent/cache/decode side wants 576; the per-head
+qk/prefill side wants ≤ 256. `MLAModules.rope_is_zero_pad` drops the zero lanes at
+every `flash_attn_varlen_func` site, which is exact, so both are satisfied at once.
+
+Two things this needs that are easy to miss. The padded width must be declared to
+the cache allocator as `config.mla_kv_entry_dim`: `KimiMLAGDNBackend` shadows the
+plain MLA allocator and sizes the pool from the raw config, so without it the pool
+is built 512 wide under a 576-wide write and the server dies at startup with
+`shape '[..., -1, 576]' is invalid`. And the pad must be appended by
+`_ZeroRopePad`, which is deliberately **not** an `nn.Module` — wrapping `q_b_proj`
+in one inserts a level into the parameter path and the weights silently never
+load.
 
 ## 5. Reference oracle
 
@@ -292,7 +335,34 @@ so it is real but small. The dense layers (0–2) are unaffected; they go throug
 
 CUDA graphs and MTP are both still on the table.
 
-## 7. Remaining work
+## 7. Measured serving accuracy
+
+`lm_eval` gsm8k, all 1319 questions, TP8, bf16 KV, `--max-model-len 2048`,
+chat + `--fewshot_as_multiturn`, greedy:
+
+| | flexible-extract | strict-match |
+| --- | --- | --- |
+| 3-shot | **0.9682** | **0.9689** |
+
+Guarded by the `GLM-5.3-Flash` entry in `.github/benchmark/models_accuracy.json`
+(threshold 0.94). SGLang publishes 0.9704–0.9757 for this model, so the port is
+in line.
+
+Three things about scoring this model that will otherwise waste a run:
+
+* **Chat mode with few-shot, always.** lm_eval's gsm8k filters assume the
+  few-shot `#### N` convention; this model answers in markdown/LaTeX. 0-shot chat
+  scores strict-match 0.0000 on replies that are ~98% correct.
+* **Never trust a low score before an extraction-free audit.** Ask whether the
+  gold value appears anywhere in the reply. That is what separates a filter
+  artefact from a real regression — it read 8.8% for the broken NoPE
+  representation (§4d) and 98.0% after the fix.
+* **The model is nondeterministic.** Six identical greedy requests give 2–3
+  distinct outputs, and two runs of identical code disagree on ~28 of 1319
+  questions in each direction. Judge changes on the 1319-question aggregate, or
+  better on a per-question paired comparison; never on sample text.
+
+## 8. Remaining work
 
 1. **Contexts beyond 2048.** The sparse k-pool path: a paged/ragged indexer that
    reads pooled state from the KV cache instead of rebuilding pools densely each

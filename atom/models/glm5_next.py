@@ -28,12 +28,12 @@ Three deliberate v1 decisions, each exact rather than approximate:
    The validated dense reference for the sparse path is
    ``model_ops.kpool_indexer``.
 
-2. **NoPE runs on a zero-width rope slice.** The text model is entirely NoPE
-   (``qk_rope_head_dim == 0``) while ATOM's MLA splits q/k into nope+rope parts,
-   so the rope half is simply empty and the rotary is the identity
-   (``_NoPositionalRotaryEmbedding``). Zero-padding those lanes instead would
-   also have been exact, but is impossible: ``qk_nope_head_dim`` is already 256
-   and the CK prefill kernel caps head dimensions at 256.
+2. **NoPE runs on a 64-wide block of zeros.** The text model is entirely NoPE
+   (``qk_rope_head_dim == 0``), but the ROCm MLA kernels assume the DeepSeek
+   576-wide KV entry, so the rope block is materialized at ``_ROPE_PAD`` lanes
+   and held at zero and the rotary is the identity
+   (``_NoPositionalRotaryEmbedding``). See ``_ROPE_PAD`` below for why a
+   zero-WIDTH slice does not work.
 
 3. **The KDA output gate is folded at load.** GLM's gate is low-rank
    (``g_b_proj @ g_a_proj``) where Kimi-K3's is a single ``g_proj``. Both are
@@ -92,14 +92,32 @@ from atom.models.utils import (
     maybe_prefix,
 )
 
-# NoPE is carried by a zero-width rope slice plus an identity rotary
-# (`_NoPositionalRotaryEmbedding`), not by padding.
+# GLM-5.3-Flash's MLA is NoPE (`qk_rope_head_dim == 0`), but the ROCm stack
+# assumes DeepSeek's geometry throughout: ATOM allocates the paged MLA entry at
+# a hard-coded 576 (`aiter_mla.py`), and aiter's asm decode kernel is built for
+# a 576-wide query -- it only ASSERTS that on the gfx1250 path, and its dispatch
+# table never keys on head_size, so on gfx950 a 512-wide query against a
+# 576-wide entry is silently mis-computed rather than rejected. Triton is no
+# better off: a zero `KV_PeDim` turns every `tl.arange(0, KV_PeDim)` into
+# `arange(0, 0)`, which Triton refuses at compile time, and upstream aiter's
+# `gather_kv_b_proj` kernels carry no guard for it -- so a zero-width rope also
+# crashes outright under chunked prefill.
 #
-# Padding the rope lanes with zeros looked attractive -- a zero q_pe dotted with
-# a zero k_pe is exactly NoPE, and it would have kept MLA on its well-trodden
-# rope path -- but it is not available here: `qk_nope_head_dim` is already 256
-# and the CK prefill kernel refuses head dimensions above that ("CK only
-# supports head dimension at most 256"), so any padding at all overflows it.
+# So the rope block is materialized at 64 lanes and held at **zero**. That is
+# bit-for-bit NoPE -- a zero block contributes `sum(0*0) == 0` to every QK dot
+# product -- and it makes the latent/cache side exactly the 576 those kernels
+# expect.
+#
+# The catch, and why this needs care rather than a blanket pad: the padding is
+# only valid on the LATENT side. `qk_nope_head_dim` is already 256, so a padded
+# per-head query would be 320 and CK's flash-attention caps head_dim at 256.
+# Kimi-K3 never hits this because its `qk_nope_head_dim` is 128 (128+64=192).
+# The two constraints apply to DIFFERENT tensors, so both are satisfiable:
+# `MLAModules.rope_is_zero_pad` makes the MLA drop the zero lanes at every
+# flash-attention site, which is exact, and each side sees the width it needs:
+#     latent / KV cache / decode : kv_lora_rank + 64 = 576
+#     per-head qk / prefill      : qk_nope_head_dim  = 256
+_ROPE_PAD = 64
 
 
 def _normalize_glm5_next_config(config) -> None:
@@ -142,7 +160,14 @@ def _normalize_glm5_next_config(config) -> None:
 
     # --- MLA aliases (the checkpoint is NoPE: qk_rope_head_dim == 0) ---
     config.glm5_is_nope = int(getattr(config, "qk_rope_head_dim", 0)) == 0
+    # Leave `qk_rope_head_dim` at its true 0 so the indexer stays NoPE; the MLA
+    # attention pads to `_ROPE_PAD` locally (see the module docstring).
     config.head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
+    # The KV cache entry must be sized for the PADDED rope block, not the
+    # checkpoint's 0. The backends size the paged pool off this
+    # (`aiter_mla.mla_kv_entry_dim`); deriving it from the raw config instead
+    # allocates 512-wide rows under a 576-wide write.
+    config.mla_kv_entry_dim = config.kv_lora_rank + _ROPE_PAD
 
     if getattr(config, "rope_parameters", None) is None:
         config.rope_parameters = {
@@ -488,13 +513,46 @@ class Glm5NextIndexer(nn.Module):
         )
 
 
+class _ZeroRopePad:
+    """Appends ``pad`` zero lanes per head to a projection's output.
+
+    Deliberately NOT an ``nn.Module``: wrapping the Linear in one would insert a
+    level into the parameter path (``q_b_proj.inner.weight``), which no longer
+    matches the checkpoint and leaves the weights at their init values -- a
+    silent, hard-to-spot failure. This holds only a reference, so the wrapped
+    Linear stays registered under its own name on the attention module.
+    """
+
+    def __init__(self, inner, num_heads: int, nope_dim: int, pad: int) -> None:
+        self.inner = inner
+        self.num_heads = num_heads
+        self.nope_dim = nope_dim
+        self.pad = pad
+
+    def __call__(self, x, x_scale=None):
+        y = self.inner(x, x_scale) if x_scale is not None else self.inner(x)
+        if isinstance(y, tuple):
+            y = y[0]
+        if self.pad == 0:
+            return y
+        tokens = y.shape[0]
+        out = y.new_zeros(tokens, self.num_heads, self.nope_dim + self.pad)
+        out[..., : self.nope_dim] = y.view(tokens, self.num_heads, self.nope_dim)
+        return out.view(tokens, self.num_heads * (self.nope_dim + self.pad))
+
+    def __getattr__(self, name):
+        # Forward `.weight`, `.quant_type`, ... to the wrapped Linear.
+        return getattr(self.__dict__["inner"], name)
+
+
 class Glm5NextMLAAttention(nn.Module):
     """NoPE MLA. Dense in v1 -- see the module docstring for why that is exact
     at or below ``index_topk`` tokens.
 
     The checkpoint has ``qk_rope_head_dim == 0``. ATOM's MLA still splits q/k
-    into nope+rope, so the rope half is an empty slice and the rotary is the
-    identity (``_NoPositionalRotaryEmbedding``).
+    into nope+rope, so the rope half is materialized at ``_ROPE_PAD`` lanes and
+    held at zero, and the rotary is the identity
+    (``_NoPositionalRotaryEmbedding``). See ``_ROPE_PAD``.
     """
 
     def __init__(
@@ -518,15 +576,18 @@ class Glm5NextMLAAttention(nn.Module):
         self.q_lora_rank = config.q_lora_rank
         self.kv_lora_rank = config.kv_lora_rank
         self.qk_nope_head_dim = config.qk_nope_head_dim
-        self.qk_rope_head_dim = config.qk_rope_head_dim  # padded; zero-filled
+        # The WIDENED rope block: 0 + `_ROPE_PAD` = 64, not the checkpoint's true
+        # rope width of 0. Everything the MLA kernels size off this -- the KV
+        # entry (512 + 64 = 576) and the per-head q/k -- sees the padded width;
+        # the pad lanes are identically zero. See `_ROPE_PAD` above.
+        self.qk_rope_head_dim = config.qk_rope_head_dim + _ROPE_PAD
         self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         self.v_head_dim = config.v_head_dim
         self.is_nope = bool(getattr(config, "glm5_is_nope", False))
         # The checkpoint's projections are sized for the *unpadded* widths.
-        self.ckpt_qk_head_dim = self.qk_nope_head_dim + (
-            0 if self.is_nope else self.qk_rope_head_dim
-        )
-        # Scores are scaled by the real (unpadded) head width.
+        self.ckpt_qk_head_dim = self.qk_nope_head_dim + config.qk_rope_head_dim
+        # Scores are scaled by the real (unpadded) head width -- the zero pad
+        # contributes nothing to a QK dot product and must not change the norm.
         self.scaling = self.ckpt_qk_head_dim**-0.5
 
         self.q_a_proj = ReplicatedLinear(
@@ -537,13 +598,14 @@ class Glm5NextMLAAttention(nn.Module):
             prefix=f"{prefix}.q_a_proj",
         )
         self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
-        # MLA applies q_proj internally and splits its output into nope|rope, so
-        # the NoPE zero-padding has to live in this weight rather than in the
-        # activation: allocate the padded width and load the checkpoint's 256-wide
-        # rows into the leading lanes of each head, leaving the rope lanes zero.
+        # Allocated at the CHECKPOINT width (256 per head), so the parameter
+        # matches the checkpoint tensor exactly and loads normally. The rope pad
+        # is appended at call time by `_ZeroRopePad` below rather than baked into
+        # this weight, which keeps the parameter path unchanged -- see that
+        # class for why a wrapper `nn.Module` would silently break loading.
         self.q_b_proj = ColumnParallelLinear(
             self.q_lora_rank,
-            self.num_heads * self.qk_head_dim,
+            self.num_heads * self.ckpt_qk_head_dim,
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.q_b_proj",
@@ -590,7 +652,10 @@ class Glm5NextMLAAttention(nn.Module):
             qk_head_dim=self.qk_head_dim,
             v_head_dim=self.v_head_dim,
             rotary_emb=self.rotary_emb,
-            q_proj=self.q_b_proj,
+            q_proj=_ZeroRopePad(
+                self.q_b_proj, self.num_local_heads, self.qk_nope_head_dim, _ROPE_PAD
+            ),
+            rope_is_zero_pad=_ROPE_PAD > 0,
             kv_b_proj=self.kv_b_proj,
             o_proj=self.o_proj,
             indexer=None,
@@ -618,8 +683,9 @@ class Glm5NextMLAAttention(nn.Module):
         # normalised compressed KV, not projected tensors.
         q_c = self.q_a_layernorm(self.q_a_proj(hidden_states))
         kv_c = self.kv_a_layernorm(self.kv_a_proj_with_mqa(hidden_states))
-        # NoPE: MLA wants a rope tensor, but its width is zero here, so this
-        # is an empty block that contributes nothing to the scores.
+        # NoPE: the key's rope block is `_ROPE_PAD` lanes of zeros. It is stored
+        # in the KV entry so the cache is the 576 the kernels expect, and it
+        # contributes `sum(0*0) == 0` to every score.
         k_pe = torch.zeros(
             kv_c.shape[0],
             self.qk_rope_head_dim,
