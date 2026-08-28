@@ -22,7 +22,7 @@ import struct
 import threading
 import time
 from collections import deque
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 
 import numpy as np
 
@@ -152,24 +152,52 @@ class CacheStats:
         "_interval_evicted_base",
         "_interval_full_tokens",
         "_interval_requests",
+        "_interval_reusable_tokens",
         "_interval_wanted_tokens",
         "_log_interval",
+        "_pool_pressure",
         "block_manager",
         "total_cached_tokens",
         "total_compressed_tokens",
         "total_full_tokens",
         "total_requests",
+        "total_reusable_tokens",
         "total_wanted_tokens",
     )
 
-    def __init__(self, log_interval: int = 100):
+    def __init__(
+        self,
+        log_interval: int = 100,
+        pool_pressure: Callable[[], dict[str, int]] | None = None,
+    ):
         self._log_interval = log_interval
+        # Read at log time rather than passed per update: the free-list scan
+        # behind it is O(free blocks), which is ~10k here and would be paid
+        # once per request for a line printed once per `log_interval`.
+        self._pool_pressure = pool_pressure
         self.total_requests: int = 0
         self.total_cached_tokens: int = 0
         self.total_full_tokens: int = 0
-        # Pre-gate compressed-prefix hit tokens. compressed - cached is reuse
-        # the Pool.STATE gates declined; full - compressed is reuse lost to
-        # compressed eviction or never there.
+        # The reuse ceiling, and the only honest denominator for a hit rate.
+        #
+        # `full` is not reachable: `BlockManager.can_allocate` matches over
+        # `range(n_hash_blocks - 1)`, because prefill must forward at least one
+        # block to produce sampler logits, so a request's own trailing block
+        # never comes from cache. Dividing by `full` therefore charges both
+        # pools for a block neither was ever offered, and reports a ceiling of
+        # 100% that no run can reach.
+        #
+        # It also silently rescales with sequence length -- the unreachable
+        # block is a fixed `hash_block_size`, so it is ~13% of a 1k prompt and
+        # ~0.05% of a 275k one. A hit rate divided by `full` thus moves with
+        # the length mix even when both pools behave identically, which is
+        # exactly the confound that makes two runs incomparable.
+        self.total_reusable_tokens: int = 0
+        # Pre-gate compressed-prefix hit tokens, and the boundary between the
+        # two pools: everything below it is the paged pool's doing, everything
+        # between it and `cached` is the state gates'. `reusable - compressed`
+        # is reuse the paged pool could not offer; `compressed - cached` is
+        # reuse it offered and the Pool.STATE gates declined.
         self.total_compressed_tokens: int = 0
         # Where the gates would have landed with every state ladder dense. It
         # sits between cached and compressed and splits the declined reuse in
@@ -185,6 +213,7 @@ class CacheStats:
         # Set by Scheduler for pool occupancy logging.
         self.block_manager = None
         self._interval_evicted_base: int = 0
+        self._interval_reusable_tokens: int = 0
 
     def update(
         self,
@@ -192,22 +221,64 @@ class CacheStats:
         num_full_tokens: int,
         num_compressed_tokens: int,
         num_wanted_tokens: int,
+        num_reusable_tokens: int,
     ) -> None:
         """Record cache stats for one prefill sequence.
 
-        All four are required because the reported rates are differences
-        between them: `cached <= wanted <= compressed <= full`. A defaulted
-        argument would silently report a negative rate rather than a missing
-        one.
+        All five are required because the reported rates are differences
+        between them: `cached <= wanted <= compressed <= reusable <= full`. A
+        defaulted argument would silently report a negative rate rather than a
+        missing one.
+
+        `reusable` is the caller's, not this class's, because the gap between
+        it and `full` is a `BlockManager` matching detail (the trailing block
+        has no stable hash, so it is never a reuse candidate). Recomputing it
+        here would mean duplicating that rule in a second place and letting the
+        two drift.
         """
+        ordered = (
+            num_cached_tokens
+            <= num_wanted_tokens
+            <= num_compressed_tokens
+            <= num_reusable_tokens
+            <= num_full_tokens
+        )
+        if not ordered:
+            # Warned and clamped, not asserted. These are logging counters, and
+            # `num_cached_tokens` has four independent writers -- the CPU-offload
+            # wake at `_wake_offloaded_seq` sets it without touching the two
+            # hit-block counters `can_allocate` derives the rest from, so an
+            # LMCache resume that loads more prefix than the GPU index held
+            # produces `cached > wanted` legitimately. Aborting `schedule()`
+            # over it would take the engine down to protect a log line, and
+            # would do so only in builds without `-O`, so the two would differ
+            # in behaviour. Clamping keeps the rates monotone and the run alive.
+            logger.warning(
+                "CacheStats ordering violated, clamping: cached=%d wanted=%d "
+                "compressed=%d reusable=%d full=%d",
+                num_cached_tokens,
+                num_wanted_tokens,
+                num_compressed_tokens,
+                num_reusable_tokens,
+                num_full_tokens,
+            )
+            num_full_tokens = max(num_full_tokens, 0)
+            num_reusable_tokens = min(max(num_reusable_tokens, 0), num_full_tokens)
+            num_compressed_tokens = min(
+                max(num_compressed_tokens, 0), num_reusable_tokens
+            )
+            num_wanted_tokens = min(max(num_wanted_tokens, 0), num_compressed_tokens)
+            num_cached_tokens = min(max(num_cached_tokens, 0), num_wanted_tokens)
         self.total_requests += 1
         self.total_cached_tokens += num_cached_tokens
         self.total_full_tokens += num_full_tokens
+        self.total_reusable_tokens += num_reusable_tokens
         self.total_compressed_tokens += num_compressed_tokens
         self.total_wanted_tokens += num_wanted_tokens
         self._interval_requests += 1
         self._interval_cached_tokens += num_cached_tokens
         self._interval_full_tokens += num_full_tokens
+        self._interval_reusable_tokens += num_reusable_tokens
         self._interval_compressed_tokens += num_compressed_tokens
         self._interval_wanted_tokens += num_wanted_tokens
 
@@ -217,9 +288,65 @@ class CacheStats:
 
     @property
     def hit_rate(self) -> float:
-        if self.total_full_tokens == 0:
-            return 0.0
-        return self.total_cached_tokens / self.total_full_tokens
+        """End-to-end reuse, against what was reusable at all.
+
+        Not against `total_full_tokens`: that denominator includes each
+        request's trailing block, which no cache is ever allowed to serve, so
+        it reports a ceiling nothing can reach and drifts with the prompt
+        length mix. `paged_hit_rate * state_hit_rate == hit_rate` exactly.
+        """
+        return self._rate(self.total_cached_tokens, self.total_reusable_tokens)
+
+    @property
+    def paged_hit_rate(self) -> float:
+        """The paged KV pool's own hit rate, with the state cache factored out.
+
+        Denominator is what the paged pool was asked for (`reusable`);
+        numerator is what it had (`compressed`). The state gates run strictly
+        after this and cannot change either term, so this number is unaffected
+        by checkpoint policy -- change `--state-checkpoint-*` and this should
+        not move. It answers "is the prefix still in KV?" and nothing else.
+
+        What it charges the pool for: eviction, capacity, and genuinely novel
+        prefixes. That last one is a workload property, not a defect, so this
+        rate has a ceiling below 100% set by how much of the traffic is new
+        text -- compare it against the dataset's theoretical prefix hit, not
+        against 100%.
+        """
+        return self._rate(self.total_compressed_tokens, self.total_reusable_tokens)
+
+    @property
+    def state_hit_rate(self) -> float:
+        """The state cache's own hit rate, with the paged pool factored out.
+
+        Denominator is what the paged pool actually offered (`compressed`),
+        NOT `reusable` -- the state gates never see a prefix the paged pool
+        already lost, and charging them for it would mean a KV eviction shows
+        up as a state-cache failure and sends tuning at the wrong pool. This
+        is the conditional probability: given the prefix was there, did a
+        checkpoint let us resume from it?
+
+        Unlike `paged_hit_rate`, 100% is genuinely reachable here: it means
+        every boundary the paged pool offered had a resumable checkpoint. The
+        gap decomposes into `state_recoverable_loss_rate` (a checkpoint would
+        have fixed it) and the remainder (nothing would have).
+        """
+        return self._rate(self.total_cached_tokens, self.total_compressed_tokens)
+
+    @property
+    def state_recoverable_loss_rate(self) -> float:
+        """The part of the state cache's miss that checkpoint placement owns.
+
+        Same denominator as `state_hit_rate`, so the two compose:
+        `state_hit_rate + state_recoverable_loss_rate` is the rate the state
+        cache would reach with a dense ladder. The distance from that to 1.0
+        is the part no checkpoint can buy, and so the honest cap on what any
+        amount of checkpoint capacity is worth.
+        """
+        return self._rate(
+            self.total_wanted_tokens - self.total_cached_tokens,
+            self.total_compressed_tokens,
+        )
 
     def get_statistics(self) -> dict:
         """Counters, not rates — the caller derives those.
@@ -233,6 +360,10 @@ class CacheStats:
             "cached_tokens": self.total_cached_tokens,
             "compressed_tokens": self.total_compressed_tokens,
             "wanted_tokens": self.total_wanted_tokens,
+            # The denominator for every rate here. `full_tokens` is reported
+            # too, but only so a consumer can see the unreachable gap; it is
+            # not a hit-rate denominator -- see `total_reusable_tokens`.
+            "reusable_tokens": self.total_reusable_tokens,
             "full_tokens": self.total_full_tokens,
         }
 
@@ -240,6 +371,7 @@ class CacheStats:
         self._interval_requests = 0
         self._interval_cached_tokens = 0
         self._interval_full_tokens = 0
+        self._interval_reusable_tokens = 0
         self._interval_compressed_tokens = 0
         self._interval_wanted_tokens = 0
 
@@ -258,13 +390,14 @@ class CacheStats:
         #   Lost-unrecoverable  compressed - wanted, declined for a reason no
         #                       checkpoint touches: the SWA tail is gone, or the
         #                       boundary is too near the prompt's end to fork.
-        # (full - compressed) is the rest: compressed eviction, or no reuse.
+        # (reusable - compressed) is the rest: compressed eviction, or no reuse.
         self._log_line(
             "Interval",
             self._interval_requests,
             self._interval_cached_tokens,
             self._interval_compressed_tokens,
             self._interval_wanted_tokens,
+            self._interval_reusable_tokens,
             self._interval_full_tokens,
         )
         self._log_line(
@@ -273,6 +406,7 @@ class CacheStats:
             self.total_cached_tokens,
             self.total_compressed_tokens,
             self.total_wanted_tokens,
+            self.total_reusable_tokens,
             self.total_full_tokens,
         )
         if self.block_manager is not None:
@@ -288,6 +422,87 @@ class CacheStats:
                 f"evicted this interval {evicted_iv} "
                 f"(total {occ['evicted_total']})"
             )
+        self._log_pools()
+        if self._pool_pressure is not None:
+            self._log_pressure(self._pool_pressure())
+
+    def _log_pools(self) -> None:
+        """Each pool's hit rate against its own denominator.
+
+        The `[Cache Stats]` line reports one end-to-end rate, which cannot say
+        which pool to fix: the same 85% is a KV pool that lost the prefix or a
+        state cache that refused to resume from it, and those want opposite
+        changes. Splitting needs two denominators, because the pools are in
+        series and the second only ever sees what the first passed on:
+
+            paged = compressed / reusable      "was the prefix still in KV?"
+            state = cached     / compressed    "given it was, could we resume?"
+            paged * state = cached / reusable = the end-to-end rate
+
+        So the product is exact, and the smaller factor is the bottleneck --
+        that comparison is the whole point of the line. Reading `state`
+        against `reusable` instead would fold KV evictions into the state
+        cache's score and point tuning at the wrong pool.
+
+        `+ckpt` is where `state` would land if every ladder were dense. It is
+        the ceiling on what checkpoint placement or more slots can buy; if it
+        sits near `state`, the state cache is already doing all it can and the
+        remaining loss is the paged pool's.
+        """
+        paged = self.paged_hit_rate
+        state = self.state_hit_rate
+        # Which factor is further from 1.0 loses more reuse, since the rates
+        # multiply. Named here rather than left to the reader because the
+        # comparison is against each other, not against 100%.
+        worse = "paged" if paged <= state else "state"
+        logger.info(
+            "[Cache Pools] "
+            f"paged-hit: {paged:.2%} "
+            f"({self.total_compressed_tokens}/{self.total_reusable_tokens}), "
+            f"state-hit: {state:.2%} "
+            f"({self.total_cached_tokens}/{self.total_compressed_tokens}), "
+            f"state-hit+ckpt: {state + self.state_recoverable_loss_rate:.2%}, "
+            f"combined: {self.hit_rate:.2%}, "
+            f"binding: {worse}"
+        )
+
+    @staticmethod
+    def _log_pressure(p: dict[str, int]) -> None:
+        """The two pools' own account of what they destroyed.
+
+        `full - compressed` in the line above is reuse the paged pool did not
+        have, but it cannot say why — a prompt with no shared prefix and a
+        prefix evicted an hour ago read identically. These counters separate
+        them, and are the only evidence that eviction happened at all:
+        `blocks_evicted == 0` at the end of a run means every miss above was
+        absence of reuse, not loss of it.
+
+        Vacant is called out because it is the leading indicator. Evictions
+        can only begin once it reaches 0, so a run that ends with vacant
+        blocks to spare never had paged pressure whatever its hit rate.
+        """
+        logger.info(
+            "[Pool Pressure] "
+            f"paged: {p['blocks_used']}/{p['blocks_total']} used, "
+            f"{p['blocks_free_reusable']} reusable-free, "
+            f"{p['blocks_free'] - p['blocks_free_reusable']} vacant, "
+            f"{p['blocks_indexed']} indexed | "
+            f"evicted: {p['blocks_evicted']}, retired: {p['blocks_retired']} | "
+            f"state: {p['slots_used']}/{p['slots_total']} used, "
+            f"{p['slots_held']} checkpointed, {p['slots_vacant']} vacant"
+        )
+        # The state pool's own losses, which `blocks_evicted` cannot express:
+        # a checkpoint can die without any block dying (`evicted`, the pool ran
+        # out of slots) or *because* a block died (`orphaned`, the prefix it
+        # was filed under left the KV index first). The pair says which pool to
+        # grow — see `StateSlotPool.__init__` for why they are kept apart.
+        logger.info(
+            "[Checkpoint Fates] "
+            f"kept: {p['checkpoints_kept']}, "
+            f"dropped: {p['checkpoints_dropped']}, "
+            f"evicted: {p['checkpoints_evicted']}, "
+            f"orphaned: {p['checkpoints_orphaned']}"
+        )
 
     @classmethod
     def _log_line(
@@ -297,15 +512,26 @@ class CacheStats:
         cached: int,
         compressed: int,
         wanted: int,
+        reusable: int,
         full: int,
     ) -> None:
+        """Every rate here is over `reusable`; `full` is shown, not divided by.
+
+        `Unreachable` is the gap between them -- the trailing block of each
+        request, which prefill must always compute. It is reported so the
+        older `full`-denominated numbers in past logs remain translatable, and
+        because a large value is itself a signal: it means short prompts
+        dominate, and a run whose length mix differs this much is not
+        comparable to another on hit rate alone.
+        """
         logger.info(
             f"[Cache Stats {label}] Reqs: {reqs}, "
-            f"Cached/Total: {cached}/{full}, "
-            f"Hit: {cls._rate(cached, full):.2%}, "
-            f"Compressed-hit: {cls._rate(compressed, full):.2%}, "
-            f"Lost-to-checkpoint: {cls._rate(wanted - cached, full):.2%}, "
-            f"Lost-unrecoverable: {cls._rate(compressed - wanted, full):.2%}"
+            f"Cached/Reusable: {cached}/{reusable}, "
+            f"Hit: {cls._rate(cached, reusable):.2%}, "
+            f"Compressed-hit: {cls._rate(compressed, reusable):.2%}, "
+            f"Lost-to-checkpoint: {cls._rate(wanted - cached, reusable):.2%}, "
+            f"Lost-unrecoverable: {cls._rate(compressed - wanted, reusable):.2%}, "
+            f"Unreachable: {cls._rate(full - reusable, full):.2%} of {full}"
         )
 
 
@@ -394,19 +620,39 @@ class ScheduledBatch:
         self.num_bonus = np.asarray(
             [seq.num_bonus_tokens for seq in seqs.values()], dtype=np.int32
         )
-        self.per_req_cache_groups = [
-            seq.per_req_cache_group
+        # One entry per state-holding seq: that seq's whole slot set, in
+        # allocation order. `[0]` is the committed state and `[1:]` is
+        # speculation rollback, one slot per speculated token. The sets are not
+        # adjacent and no backend may reconstruct them by arithmetic on a base
+        # — see `StateSlotPool`.
+        # Gated on `state_slot >= 0`, not on the list being non-empty: a seq
+        # whose committed slot was never claimed carries the -1 sentinel in a
+        # one-element list, which is truthy, and letting it through would shift
+        # every list positionally aligned with this one.
+        state_seqs = [
+            seq
             for seq in seqs.values()
-            if seq.has_per_req_cache and seq.per_req_cache_group >= 0
+            if seq.has_per_req_cache and seq.state_slot >= 0
         ]
-        # Read-side twin of the above, positionally aligned with it: the group
-        # this forward takes its incoming state from. Differs only on the one
-        # forward after a state fork; -1 elsewhere, which attention backends
-        # read as "same as the write group".
-        self.state_fork_srcs = [
-            seq.state_fork_src
-            for seq in seqs.values()
-            if seq.has_per_req_cache and seq.per_req_cache_group >= 0
+        self.state_slots = [seq.state_slots for seq in state_seqs]
+        # Column 0 broken out, because it is what every non-speculative backend
+        # wants and rebuilding it per step in each of them would cost the same
+        # Python loop several times over.
+        self.state_slots_committed = [seq.state_slot for seq in state_seqs]
+        # Read-side twin of the committed column, positionally aligned with it:
+        # the slot this forward takes its incoming state from. Differs only on
+        # the one forward after a state fork; -1 elsewhere, which attention
+        # backends read as "same as the write slot".
+        self.state_fork_srcs = [seq.state_fork_src for seq in state_seqs]
+        # Midstep checkpoints this forward must write, `[(slot, position)]` per
+        # seq, positionally aligned with `state_slots` like the fork sources
+        # above. A list per seq, not one entry: a readable backend takes every
+        # position the chunk covers rather than only the one it ends on.
+        # Positions are absolute prompt offsets; the backend rebases them onto
+        # the step's own tokens, which is the only frame its intermediates are
+        # in. Empty everywhere except a `readable_midstep` prefill.
+        self.state_save_all = [
+            [(g, p) for g, p, _h in seq.midstep_reservations] for seq in state_seqs
         ]
         # Physical moves are drained once per real batch.
         self.state_maintenance_ops = (
@@ -724,7 +970,9 @@ class Scheduler:
             SpecStats(mtp_k=self.mtp_k) if self.use_spec else None
         )
         self.cache_stats: CacheStats | None = (
-            CacheStats() if config.enable_prefix_caching else None
+            CacheStats(pool_pressure=self.block_manager.pool_pressure)
+            if config.enable_prefix_caching
+            else None
         )
         if self.cache_stats is not None:
             self.cache_stats.block_manager = self.block_manager
@@ -1110,18 +1358,27 @@ class Scheduler:
         # "No slots ever existed" is the permanent case, distinguished from
         # "all busy" by the pool's total capacity.
         # An empty free list means either "all slots in use" — which the
-        # schedule loop handles by waiting — or "no slots were ever created",
-        # the permanent case, and only that one is worth warning about.
+        # schedule loop handles by waiting — or "the pool can never hold one
+        # request", the permanent case, and only that one is worth warning
+        # about.
+        #
+        # Measured against what one request needs, not against zero. A pool of
+        # 3 slots where a request takes `1 + num_spec` = 4 is as permanently
+        # unschedulable as an empty one; `== 0` would let it wait forever in
+        # silence. The group-shaped predicate this replaced divided before
+        # comparing, so it caught that case for free.
         if (
             seq.has_per_req_cache
-            and not bm.state.has_free()
-            and bm.num_per_req_cache_groups == 0
+            and not bm.state.has_free(bm.state_slots_per_req)
+            and bm.num_state_slots < bm.state_slots_per_req
         ):
             logger.warning(
-                "Request %s will never be scheduled: needs per-req cache "
-                "slot but no slots were allocated (max_num_seqs=0 for "
-                "this model type).",
+                "Request %s will never be scheduled: needs %d per-req cache "
+                "slot(s) but the pool holds %d (max_num_seqs=0 for this model "
+                "type, or --num-speculative-tokens too high for it).",
                 seq.id,
+                bm.state_slots_per_req,
+                bm.num_state_slots,
             )
 
     def take_rejected(self) -> list[Sequence]:
@@ -1357,7 +1614,7 @@ class Scheduler:
             # don't clobber with local num_cached_blocks (always 0 on consumer).
             if not seq.prefix_cache_hit_tokens:
                 seq.prefix_cache_hit_tokens = (
-                    num_cached_blocks * self.block_manager.block_size
+                    num_cached_blocks * self.block_manager.hash_block_size
                 )
 
             self._notify_connector_after_prefill_alloc(seq)
@@ -1371,7 +1628,7 @@ class Scheduler:
                 continue
 
             seq.prefix_cache_hit_tokens = (
-                num_cached_blocks * self.block_manager.block_size
+                num_cached_blocks * self.block_manager.hash_block_size
             )
 
             chunk = self._adjust_prefill_chunk_after_alloc(seq, chunk)
@@ -1409,14 +1666,17 @@ class Scheduler:
         total_tokens_num_prefill = sum(num_scheduled_tokens)
 
         if num_seqs_prefill > 0:
+            # A cursor, not a hit count: it starts at the prefix-cache hit and
+            # then advances by each finished chunk, so a chunked prompt logs the
+            # same req_id repeatedly with this climbing by the previous `new`.
+            # Logged as "done" so those repeats don't read as a growing hit.
             num_cached_tokens_list = [
                 seq.num_cached_tokens for seq in scheduled_seqs.values()
             ]
-            cached_per_req = [s.num_cached_tokens for s in scheduled_seqs.values()]
             logger.info(
                 f"Scheduled prefill batch: {num_seqs_prefill} reqs, "
                 f"{total_tokens_num_prefill} new tokens "
-                f"(cached: {cached_per_req}, new: {num_scheduled_tokens}), "
+                f"(done: {num_cached_tokens_list}, new: {num_scheduled_tokens}), "
                 f"req_ids: {tuple(scheduled_seqs.keys())}"
             )
             self.prev_prompt = True
@@ -1444,6 +1704,19 @@ class Scheduler:
                     next_token_ids.append(
                         -1 if end >= seq.num_tokens else int(seq.token_ids[end])
                     )
+
+            # Reserve midstep checkpoint destinations for the chunks just
+            # settled. Here rather than inside `_finalize_prefill_chunk`
+            # because a reservation takes a slot off the free list, and
+            # admission for this pass only finishes above — planning any
+            # earlier would let a checkpoint's destination compete with a
+            # request still to be let in. The batch below snapshots what this
+            # leaves on each seq.
+            for i, seq in enumerate(scheduled_seqs.values()):
+                start = num_cached_tokens_list[i]
+                self.block_manager.plan_midstep(
+                    seq, start, start + int(num_scheduled_tokens[i])
+                )
 
             prefill_batch = ScheduledBatch(
                 seqs=scheduled_seqs,
@@ -1600,7 +1873,7 @@ class Scheduler:
         """Clear the fork flags the batch just snapshotted.
 
         A fork describes one forward: the batch carries `state_fork_src`, and
-        every later batch for the same seq must read and write the same group
+        every later batch for the same seq must read and write the same slot
         again. Cleared here rather than in the batch constructor so the snapshot
         stays free of side effects on Sequence.
         """
@@ -1818,7 +2091,7 @@ class Scheduler:
            position this seq itself was seen to want), shortening to the
            previous rung; `BlockManager.checkpoint_cut` owns the arithmetic, so
            that it cannot drift from the rule deciding what actually gets kept.
-        2. The forward carrying a fork has to fill the request's new group by
+        2. The forward carrying a fork has to fill the request's new slot by
            itself. If the budget left a chunk too short for that, drop the fork
            rather than the request — unless the source is shared with another
            request forking off it this step, which rules out taking it over. Then
@@ -1850,7 +2123,7 @@ class Scheduler:
         0 means "do not checkpoint here", for any of three reasons:
 
         - the request stops on this step, so there is nothing after it: no
-          forward to fork into the group a checkpoint would hand away, and no
+          forward to fork into the slot a checkpoint would hand away, and no
           batch to issue a copy on either;
         - the seq is still on its prompt, where the prefill call site has
           already decided using the prompt's own remainder;
@@ -1869,7 +2142,7 @@ class Scheduler:
         destination is complete when the copy lands, so any decode step will do.
 
         Otherwise plain decode carries exactly one token, and whether that is
-        enough to fill a fresh group is the backend's `min_fork_tokens` to say.
+        enough to fill a fresh slot is the backend's `min_fork_tokens` to say.
         """
         if finished or seq.type != SequenceType.DECODE:
             return 0
@@ -1901,11 +2174,20 @@ class Scheduler:
             # `block_size * dcp_world_size` tokens — so scaling by block_size
             # would under-report by the DCP factor.
             hbs = self.block_manager.hash_block_size
+            # The reuse ceiling, mirroring `can_allocate`'s match loop, which
+            # runs over `range(n_hash_blocks - 1)`: prefill must forward at
+            # least one block to produce sampler logits, so the trailing block
+            # is never a reuse candidate and no cache can be charged for it.
+            # Floored at 0 for a sequence shorter than one hash block, whose
+            # ceiling is genuinely zero — nothing about it is reusable.
+            n_hash_blocks = (seq.num_tokens + hbs - 1) // hbs
+            num_reusable_tokens = min(max(n_hash_blocks - 1, 0) * hbs, seq.num_tokens)
             self.cache_stats.update(
                 seq.num_cached_tokens,
                 seq.num_tokens,
                 seq.num_compressed_hit_blocks * hbs,
                 seq.num_wanted_hit_blocks * hbs,
+                num_reusable_tokens,
             )
         num_batched_tokens += chunk
         seq.status = SequenceStatus.RUNNING
@@ -2617,7 +2899,9 @@ class Scheduler:
         if not (prefix_caching or kv_events):
             return True
 
-        num_cached_blocks = seq.num_cached_tokens // bm.block_size
+        # num_cached_tokens is a global-token count. Under DCP each block-table
+        # entry spans one virtual hash block, not one rank-local physical block.
+        num_cached_blocks = seq.num_cached_tokens // bm.hash_block_size
         # PD consumer only: full prompt KV arrived via RDMA, safe to hash all.
         # Offload/LMCache path skipped — suffix KV not yet computed.
         if prefix_caching and not self._connector_flag("is_offload"):
@@ -2656,7 +2940,7 @@ class Scheduler:
         Offload waiters already own allocated blocks. If a fresh request at the
         head cannot allocate while a completed waiter sits behind it, the waiter
         cannot finish and free blocks. Preserve FIFO order within the ready and
-        blocked groups.
+        blocked slots.
         """
         if not self.waiting or not (
             self.finished_recving_kv_req_ids or self.failed_recving_kv_req_ids

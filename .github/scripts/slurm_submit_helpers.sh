@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 
-# Shared helpers for submitting and monitoring Slurm jobs. Callers configure
-# the SLURM_* variables below before sourcing this file.
+# Shared helpers for submitting, monitoring, and cancelling Slurm jobs.
+# Callers configure the SLURM_* variables and SLURM_CANCEL_HELPER before
+# sourcing this file.
 
 JOB_ID="${JOB_ID:-}"
 SLURM_JOB_ACTIVE="${SLURM_JOB_ACTIVE:-0}"
@@ -182,7 +183,7 @@ set_slurm_job_log_paths() {
 
 write_slurm_cancel_helper() {
   local job_id="${1:-}"
-  local helper="${SLURM_CANCEL_HELPER:-${RESULT_DIR}/${ATOMESH_CELL_ID}.slurm-cancel.sh}"
+  local helper="${SLURM_CANCEL_HELPER:?SLURM_CANCEL_HELPER must be set}"
 
   mkdir -p "$(dirname "${helper}")"
   {

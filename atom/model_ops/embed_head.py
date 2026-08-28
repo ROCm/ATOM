@@ -7,8 +7,9 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 from aiter.dist.communication_op import tensor_model_parallel_all_gather
-from aiter.dist.parallel_state import get_tp_group
+from aiter.dist.parallel_state import get_dp_group, get_tp_group
 from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.tuned_gemm import tgemm
 
 from atom.model_ops.lm_head_argmax import lm_head_argmax_pack
 from atom.model_ops.utils import atom_parameter
@@ -16,7 +17,6 @@ from atom.plugin import is_plugin_mode
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
 from atom.utils.forward_context import ForwardContext, get_forward_context
-from aiter.tuned_gemm import tgemm
 
 
 @triton.jit
@@ -249,6 +249,8 @@ class ParallelLMHead(VocabParallelEmbedding):
             if context.is_prefill and not context.is_draft:
                 last_indices = attn_metadata.cu_seqlens_q[1:] - 1
                 x = x[last_indices].contiguous()
+            if self._can_use_dp_sharded_head(context):
+                return self._dp_sharded_logits(x)
         logits = tgemm.mm(x, self.weight, self.bias)
         if self.tp_size > 1:
             use_custom = envs.ATOM_USE_CUSTOM_ALL_GATHER
@@ -284,3 +286,107 @@ class ParallelLMHead(VocabParallelEmbedding):
         winner = gathered[:, :, 0].argmax(dim=0)  # [N] winning rank (ties -> lowest)
         token = gathered[:, :, 1].gather(0, winner.unsqueeze(0)).squeeze(0)  # [N] fp32
         return token.to(torch.long)
+
+    # ------------------------------------------------------------------
+    # Pure-DP sharded LM head (config ② all-gather / ③ all-to-all).
+    #
+    # Precondition (checked by `_can_use_dp_sharded_head`): the model TP group is size 1
+    # (pure DP) and the DP group is size > 1. The lm_head weight is currently
+    # replicated on every DP rank, so each rank slices out its own vocab shard
+    # `weight[dp_rank*V/dp : (dp_rank+1)*V/dp]` at runtime — no weight-loader
+    # change needed for this prototype (the full weight still costs VRAM; a real
+    # rollout should shard it at load time).
+    # ------------------------------------------------------------------
+    def _can_use_dp_sharded_head(self, context) -> bool:
+        """Whether this step may run the DP-sharded LM head (pure-DP decode only).
+
+        Every DP rank must reach the SAME verdict from globally-synced state, or
+        the fixed-size collective in `_dp_sharded_logits` deadlocks. The strategy
+        (all-gather vs all2all) is read from ATOM_DP_LM_HEAD_MODE there.
+        """
+        dp_group = get_dp_group()
+        # Static: enabled, pure DP, vocab evenly shardable over a >1 DP group.
+        if (
+            envs.ATOM_DP_LM_HEAD_MODE not in ("allgather", "all2all")
+            or self.tp_size != 1
+            or dp_group.world_size <= 1
+            or self.num_embeddings % dp_group.world_size != 0
+        ):
+            return False
+        # Per-step: all ranks in an equal-length decode. Exclude draft (eagle
+        # keeps dp_uniform_decode=True despite ragged rows) and prefill (x is
+        # sliced to 1 row/seq, mismatching the token-count pad target).
+        if (
+            context is None
+            or getattr(context, "is_draft", False)
+            or getattr(context, "is_prefill", False)
+            or not getattr(context, "dp_uniform_decode", False)
+        ):
+            return False
+        return get_forward_context().dp_metadata is not None
+
+    def _dp_sharded_logits(self, x: torch.Tensor) -> torch.Tensor:
+        """Full-vocab logits for this rank's own rows via a DP-sharded head.
+
+        x: ``[local_rows, dim]`` (this DP rank's tokens). Under uniform decode
+        every rank pads to the DP-wide ``running_tokens`` so the collective is
+        fixed-size and identical on all ranks; the padded tail is dropped at the
+        end. returns: ``[local_rows, vocab]``.
+        """
+        mode = envs.ATOM_DP_LM_HEAD_MODE
+        dp_group = get_dp_group()
+        dp_size = dp_group.world_size
+        dp_rank = dp_group.rank_in_group
+        vshard = self.num_embeddings // dp_size
+
+        fc = get_forward_context()
+        local_rows = x.shape[0]
+        max_rows = int(fc.context.running_tokens)
+        # running_tokens is the padded height, so local_rows <= max_rows always;
+        # keep the guard as a loud tripwire rather than a silent DP-wide hang.
+        assert local_rows <= max_rows, (
+            f"DP LM head: local_rows={local_rows} > running_tokens={max_rows}; "
+            "hidden height exceeds the DP-uniform gather bucket."
+        )
+        if local_rows < max_rows:
+            x = torch.cat([x, x.new_zeros(max_rows - local_rows, x.shape[1])], dim=0)
+
+        use_custom = envs.ATOM_USE_CUSTOM_ALL_GATHER
+
+        # [max_rows, dim] -> [dp_size * max_rows, dim] (rank-major concat).
+        gathered = dp_group.all_gather(x.contiguous(), dim=0, use_custom=use_custom)
+        w = self.weight[dp_rank * vshard : (dp_rank + 1) * vshard]  # [V/dp, dim]
+        b = (
+            None
+            if self.bias is None
+            else self.bias[dp_rank * vshard : (dp_rank + 1) * vshard]
+        )
+        logits_shard = tgemm.mm(gathered, w, b)  # [dp_size * max_rows, V/dp]
+
+        if mode == "all2all":
+            # Send each destination rank only the block of rows it owns; receive
+            # this rank's rows on every peer's vocab shard.
+            logits_shard = logits_shard.contiguous()
+            out = torch.empty_like(logits_shard)
+            torch.distributed.all_to_all_single(
+                out.view(-1), logits_shard.view(-1), group=dp_group.device_group
+            )
+            # out is source-major [dp_size, max_rows, vshard]; the sampler wants
+            # the vocab shards concatenated along dim 1. The (dp <-> rows) axis
+            # swap is non-contiguous, so the following reshape materialises one
+            # copy — inherent to converting all-to-all's source-major output to
+            # row-major full-vocab logits. Slice to the real rows *before* the
+            # reshape so the copy only touches local_rows (not the padded tail).
+            return (
+                out.view(dp_size, max_rows, vshard)[:, :local_rows, :]
+                .permute(1, 0, 2)
+                .reshape(local_rows, dp_size * vshard)
+            )
+
+        # mode == "allgather": all-gather every rank's [Σrows, V/dp] shard into
+        # the full vocab, then scatter this rank's own row block.
+        global_logits = dp_group.all_gather(
+            logits_shard, dim=1, use_custom=use_custom
+        )  # [Σrows, V]
+        start = dp_rank * max_rows
+        return global_logits[start : start + local_rows].contiguous()

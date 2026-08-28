@@ -376,8 +376,17 @@ def moe_kernel_token_capacity(
     ``[T, topk+shared]`` buffer, so ``T`` must cover the gathered width:
     ``max_num_batched_tokens * dp_size`` (times the simulated-DP repeat).
     All2all/EP keeps tokens local, so the per-rank scheduler budget is enough.
+
+    ``repeat_rows`` also runs alone in ``forward_impl`` (the single-real-rank
+    path, with no gather to ride along with), so the simulated-DP repeat
+    applies at ``dp_size == 1`` too.
     """
     tokens = atom_config.max_num_batched_tokens
-    if atom_config.enable_dp_attention and dp_size > 1 and not use_all2all:
-        tokens *= dp_size * max(int(dp_logical_ratio), 1)
+    if use_all2all:
+        return tokens
+    repeat = max(int(dp_logical_ratio), 1)
+    if atom_config.enable_dp_attention and dp_size > 1:
+        return tokens * dp_size * repeat
+    if dp_size == 1:
+        return tokens * repeat
     return tokens
