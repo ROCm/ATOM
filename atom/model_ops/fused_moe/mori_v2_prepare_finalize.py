@@ -501,7 +501,7 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
     Both transports get the same grid shrink. The dispatch arena is padded to a
     huge static token_num (ws * max_num_inp_token_per_rank) while the received
     tokens occupy only the first ``total_recv`` rows, so under a uniform
-    all-ranks-decode batch it is capped at the static ``graph_bs * topk * dp``
+    all-ranks-decode batch it is capped at the static ``running_tokens*topk*dp``
     bound (the V1/base policy): the grid-bound aiter kernels (route-ksplit
     preshuffle, gather-reduce) then launch a grid sized to the decode bucket
     instead of the full arena, and the single-block route/psum kernels shrink too.
@@ -513,12 +513,12 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
         """Static recv-row bound for a uniform decode batch, else None (no shrink).
 
         Correctness / capture-safety:
-          * ``graph_bs`` is a python int, constant per captured cudagraph, so the
+          * ``running_tokens`` is a python int, fixed per captured graph, so the
             bound is static across capture/replay and no GPU->CPU sync is needed
             (unlike reading the device ``total_recv``).
-          * Under uniform decode each of ``dp`` ranks holds ``graph_bs`` tokens,
+          * Under uniform decode each of ``dp`` ranks holds ``running_tokens``,
             each routed to ``topk`` experts; worst case every route lands on this
-            rank, so ``total_recv <= graph_bs * topk * dp``. The bound therefore
+            rank, so ``total_recv <= running_tokens*topk*dp``. The bound therefore
             never drops a valid row, and the aiter kernels' device-side
             ``num_valid_routes`` guard still skips the exact within-buffer tail
             [total_recv, bound).
@@ -531,7 +531,7 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
         all_ranks_decode = getattr(context, "dp_uniform_decode", not context.is_prefill)
         if not all_ranks_decode:
             return None
-        bound = context.graph_bs * topk_ids.shape[1] * get_dp_group().world_size
+        bound = context.running_tokens * topk_ids.shape[1] * get_dp_group().world_size
         return bound if bound < arena_rows else None
 
     def _maybe_trim_dispatch_output(

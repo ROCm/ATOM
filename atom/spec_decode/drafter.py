@@ -1,5 +1,6 @@
 import abc
 import logging
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -11,11 +12,13 @@ from torch import nn
 
 from atom.config import Config
 from atom.model_loader.loader import load_model
+from atom.spec_decode.draft_graph import DraftGraph
 from atom.utils import CpuGpuBuffer, resolve_obj_by_qualname
 from atom.utils.forward_context import (
     DPMetadata,
     SpecDecodeMetadata,
     get_forward_context,
+    set_forward_context,
 )
 
 logger = logging.getLogger("atom")
@@ -166,12 +169,101 @@ class Drafter(abc.ABC):
         i32_kwargs = {"dtype": torch.int32, "device": self.device}
         i64_kwargs = {"dtype": torch.int64, "device": self.device}
         max_bs = self.config.max_num_seqs
-        self.arrange_bs = torch.arange(max_bs + 1, **i32_kwargs)
         self.cu_num_draft_tokens = CpuGpuBuffer(max_bs, **i32_kwargs)
         self.target_logits_indices = CpuGpuBuffer(max_bs * self.mtp_k, **i64_kwargs)
         self.bonus_logits_indices = CpuGpuBuffer(max_bs, **i64_kwargs)
 
+        self._build_draft_graphs()
+
+    # ---- draft passes ----
+    def _declare_draft_graphs(self) -> tuple[DraftGraph, ...]:
+        """Declare this drafter's warmable forwards. Opt-in.
+
+        A flavor whose model cannot answer the warmup/forward/epilogue must
+        declare nothing rather than merely decline to pad: warmup runs before
+        the pad and capture gates.
+        """
+        return ()
+
+    def _build_draft_graphs(self) -> None:
+        self.draft_graphs: tuple[DraftGraph, ...] = tuple(
+            pass_.bind(self.config, self.device)
+            for pass_ in self._declare_draft_graphs()
+        )
+
+    @torch.inference_mode()
+    def warmup_draft_graphs(self, build_context, stream) -> None:
+        """Run every declared pass once per captured size, paying its JIT here.
+
+        aiter's flydsl hgemm builds a kernel per tile config, in-process, so a
+        batch first seen mid-serve stalls that step and every restart pays
+        again: `hipModuleLoadData` per rank went 6 -> 0 on the 16k/20/50c
+        reproducer, with this and `propose`'s padding.
+
+        Warming `runner.capture_sizes` is the point -- `propose` runs at the batch
+        the target ran, which `ForwardMode.decide` picks out of that same list,
+        so warmed and reachable are one set by construction rather than two
+        that drift.
+
+        `build_context(bs=...)` synthesizes one decode batch. The runner passes
+        it already bound, because which backends take a `max_q_len` is the
+        runner's to know. Call INSIDE `graph_capture()` (it arms the custom
+        all-reduce for the optional capture) and after `allocate_kv_cache`, so
+        that context has real ring slots and `is_dummy_run=False`.
+
+        Whatever `propose` sets on the context, this must set too. A capture
+        bakes every Python branch taken while it is made, so a guard that reads
+        the context is decided once, here, for every replay -- `is_draft` gates
+        the aux-capture hook away from the draft's own forward, and warming
+        without it records that hook clobbering the buffer it protects. The
+        row counts are the same rule and the sharper case: they size the MoE
+        all_gather that goes INTO the recording, so a synthetic context left
+        describing the target bakes a collective the pass never runs at.
+        """
+        if not self.draft_graphs:
+            return
+        runner = self.runner
+        capture_sizes = sorted(runner.capture_sizes)  # capture leaves it descending
+        pool = runner.graph_pool
+        start = time.time()
+        for pass_ in self.draft_graphs:
+            for bs in capture_sizes:
+                attn_metadata, context = build_context(bs=bs)
+                context.is_draft = True
+                # The synthetic batch is full, so the pass's scheduled and
+                # running counts are the same number.
+                local_tokens = bs * self.draft_tokens_per_seq
+                context.scheduled_tokens = local_tokens
+                context.running_tokens = local_tokens
+                set_forward_context(
+                    attn_metadata=attn_metadata,
+                    atom_config=self.config,
+                    context=context,
+                    num_tokens=local_tokens,
+                )
+                pool = pass_.warmup(bs, pool=pool, stream=stream)
+        runner.graph_pool = pool
+        torch.cuda.synchronize()
+        if runner.rank == 0:
+            logger.info(
+                "Draft passes warmed at %s in %.2fs: %s",
+                capture_sizes,
+                time.time() - start,
+                [g.name for g in self.draft_graphs],
+            )
+
     # ---- flavor hooks ----
+    @property
+    def draft_tokens_per_seq(self) -> int:
+        """Tokens one sequence contributes to a DECLARED pass.
+
+        1 for a serial flavor, whose declared pass is the mid-step; a block
+        flavor drafts its whole width in one pass and overrides. Read by
+        `warmup_draft_graphs`, which must state the shape on a synthetic
+        context and cannot ask `propose`.
+        """
+        return 1
+
     @abc.abstractmethod
     def _resolve_mtp_k(self) -> int:
         """Return the per-request verify horizon (drafted tokens per step).
@@ -226,8 +318,8 @@ class Drafter(abc.ABC):
         return None
 
     @property
-    def precompute_duplicates_propose(self) -> bool:
-        """Is `precompute_context_kv` the pass propose's first draft step redoes?
+    def draft_kv_duplicates_propose(self) -> bool:
+        """Is `compute_draft_kv` the pass propose's first draft step redoes?
 
         True (EAGLE) means the two must never both run: the second is a
         collective the peers on `dummy_execution` do not mirror. False (DSpark)
@@ -328,7 +420,7 @@ class Drafter(abc.ABC):
         buf.np[:n] = anchors
         return buf.copy_to_gpu(n)
 
-    def precompute_context_kv(
+    def compute_draft_kv(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
@@ -458,14 +550,28 @@ class Drafter(abc.ABC):
             "lm_head",
         )
 
-    def _refresh_dp_metadata(self, forward_context, num_local_tokens: int) -> None:
+    def _publish_draft_shape(
+        self, forward_context, scheduled_tokens: int, running_tokens: int
+    ) -> None:
+        """Re-point the forward context at the pass about to run.
+
+        A draft reuses the target's context, whose counts are the verified
+        tokens -- not the draft's own width. Anything sizing a collective off
+        the context (MoE's `pad_for_all_gather` above all) would then use the
+        wrong height, so the draft states its shape here rather than letting
+        each consumer special-case `is_draft`. Both units: DP's variable-length
+        gather takes `running_tokens`, the pad needs to know how much is real.
+        """
+        context = forward_context.context
+        context.scheduled_tokens = scheduled_tokens
+        context.running_tokens = running_tokens
         parallel_config = self.config.parallel_config
         if parallel_config.data_parallel_size <= 1:
             return
-        forward_context.context.dp_uniform_decode = False
+        context.dp_uniform_decode = False
         forward_context.dp_metadata = DPMetadata.make(
             parallel_config,
-            num_local_tokens,
+            running_tokens,
         )
 
     def prepare_inputs(

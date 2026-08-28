@@ -37,7 +37,13 @@ def _install_forward_context_stubs():
     plugin_attention.AiterFlashAttentionPrefillMetadata = _KwargsObject
     sys.modules["atom.plugin.attention"] = plugin_attention
 
+    # The one real symbol: `running_tokens_from_bs` is pure arithmetic and
+    # imports standalone, and it is exactly the rule under test here -- a
+    # hand-copied stub would pass while the bridge converted rows wrongly.
+    from atom.utils.forward_context import running_tokens_from_bs
+
     utils_forward_context = types.ModuleType("atom.utils.forward_context")
+    utils_forward_context.running_tokens_from_bs = running_tokens_from_bs
     utils_forward_context.AttentionMetaData = _KwargsObject
     utils_forward_context.Context = _KwargsObject
     utils_forward_context._forward_kv_cache_context = SimpleNamespace(kv_cache_data={})

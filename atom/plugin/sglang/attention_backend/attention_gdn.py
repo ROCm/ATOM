@@ -462,8 +462,12 @@ class SGLangGDNForwardContext:
                 positions=forward_batch.positions,
                 is_prefill=is_prefill,
                 is_dummy_run=mode.is_idle(),
-                batch_size=forward_batch.batch_size,
-                graph_bs=forward_batch.batch_size,
+                scheduled_bs=forward_batch.batch_size,
+                running_bs=forward_batch.batch_size,
+                # `num_tokens` is already this step's flat row count, so no
+                # per-request multiplier is needed (nor available here).
+                scheduled_tokens=num_tokens,
+                running_tokens=num_tokens,
                 dp_uniform_decode=dp_uniform_decode,
             ),
             num_tokens,
