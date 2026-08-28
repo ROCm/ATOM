@@ -91,6 +91,9 @@ python3 -m pip install --upgrade --force-reinstall --no-deps \
 AITER_USE_SYSTEM_TRITON=1 MAX_JOBS="${AITER_MAX_JOBS}" \
   python3 -m pip install -e "${AITER_SOURCE_DIR}" \
     --no-build-isolation --no-deps
+# amd-aiter is installed with --no-deps above; pull in runtime packages the
+# op_tests smoke check needs (flydsl is pinned separately).
+python3 -m pip install einops ninja packaging pandas psutil pybind11
 
 # Editable installation builds module_aiter_core, while module_cache remains a
 # JIT module. Build and exercise the PR's DCP case once before any workers
