@@ -35,7 +35,6 @@ from aiter import (
     gemm_a8w8_blockscale_bpreshuffle,
     get_hip_quant,
     indexer_k_quant_and_cache,
-    indexer_qk_rope_quant_and_cache,
     flydsl_top_k_per_row_decode,
     top_k_per_row_prefill,
 )
