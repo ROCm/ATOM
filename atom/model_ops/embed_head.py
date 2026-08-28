@@ -329,9 +329,9 @@ class ParallelLMHead(VocabParallelEmbedding):
         """Full-vocab logits for this rank's own rows via a DP-sharded head.
 
         x: ``[local_rows, dim]`` (this DP rank's tokens). Under uniform decode
-        every rank pads to the DP-wide ``max_tokens_across_dp`` so the collective
-        is fixed-size and identical on all ranks; the padded tail is dropped at
-        the end. returns: ``[local_rows, vocab]``.
+        every rank pads to the DP-wide ``running_tokens`` so the collective is
+        fixed-size and identical on all ranks; the padded tail is dropped at the
+        end. returns: ``[local_rows, vocab]``.
         """
         mode = envs.ATOM_DP_LM_HEAD_MODE
         dp_group = get_dp_group()
@@ -339,14 +339,14 @@ class ParallelLMHead(VocabParallelEmbedding):
         dp_rank = dp_group.rank_in_group
         vshard = self.num_embeddings // dp_size
 
+        fc = get_forward_context()
         local_rows = x.shape[0]
-        max_rows = int(get_forward_context().dp_metadata.max_tokens_across_dp)
-        # Invariant under dp_uniform_decode: local_rows <= max_rows (the DP-wide
-        # max). If a caller (e.g. speculative padding) breaks it we cannot safely
-        # unilaterally fall back mid-collective, so surface it loudly instead.
+        max_rows = int(fc.context.running_tokens)
+        # running_tokens is the padded height, so local_rows <= max_rows always;
+        # keep the guard as a loud tripwire rather than a silent DP-wide hang.
         assert local_rows <= max_rows, (
-            f"DP LM head: local_rows={local_rows} > max_rows={max_rows}; "
-            "row count is not DP-uniform (spec/MTP padding not yet supported)."
+            f"DP LM head: local_rows={local_rows} > running_tokens={max_rows}; "
+            "hidden height exceeds the DP-uniform gather bucket."
         )
         if local_rows < max_rows:
             x = torch.cat([x, x.new_zeros(max_rows - local_rows, x.shape[1])], dim=0)
