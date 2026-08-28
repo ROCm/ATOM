@@ -98,7 +98,7 @@ class StateOffloadTier:
         stored = False
         try:
             stored = bool(self.codec.put(h, unit_ids))
-        except Exception:  # noqa: BLE001 -- see below
+        except Exception:  # deliberately blind, see below
             # Deliberately blind. `codec.put` reaches into LMCache, whose
             # failure modes are its own, and a store that cannot happen must
             # cost one checkpoint's CPU copy -- not this worker thread, whose
@@ -141,7 +141,7 @@ class StateOffloadTier:
         ok = False
         try:
             ok = bool(self.codec.get(h, slot))
-        except Exception:  # noqa: BLE001 -- a failed load is a normal path
+        except Exception:  # a failed load is a normal path
             # Same reasoning as `_do_store`, and here a miss is expected:
             # LMCache's LRU can drop bytes under a hash the index still
             # advertises. The report below is what retracts the claim.
