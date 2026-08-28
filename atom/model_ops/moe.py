@@ -2861,6 +2861,14 @@ class FusedMoE(torch.nn.Module):
         self.custom_routing_function = custom_routing_function
         self.scoring_func = scoring_func
         self.e_score_correction_bias = e_score_correction_bias
+        if atom_config.fake_eplb and e_score_correction_bias is not None:
+            # The noaux_tc bias is added on top of the score, so a bias wider than
+            # the synthetic logits' gap (~3.16 after sqrtsoftplus) picks the top-k
+            # by itself -- and `--load_dummy` never writes it, leaving recycled
+            # garbage that collapses every token onto one EP rank. `del` first: a
+            # plain tensor cannot overwrite the parameter registered above.
+            del self.e_score_correction_bias
+            self.e_score_correction_bias = torch.zeros_like(e_score_correction_bias)
         self.activation = activation
         if config is not None:
             self.activation_situ_beta = getattr(config, "activation_situ_beta", None)
