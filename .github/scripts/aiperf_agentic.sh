@@ -49,7 +49,43 @@ AIPERF_DATASET_CONFIGURATION_TIMEOUT="${AIPERF_DATASET_CONFIGURATION_TIMEOUT:-18
 AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT="${AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT:-1800}"
 AIPERF_UNSAFE_OVERRIDE="${AIPERF_UNSAFE_OVERRIDE:-}"
 
+# Lowest aiperf the agentic flags require. `--warmup-requests-per-lane` and
+# `--agentic-warmup-grace-period` do not exist before this, and a run started
+# with them would die on an unknown-argument error rather than measure anything.
+AIPERF_MIN_VERSION="${AIPERF_MIN_VERSION:-0.12.0}"
+
+_aiperf_version_ge() {
+  # $1 >= $2, dotted-decimal. `sort -V` puts the lower one first, so $1 wins
+  # when the head of the sorted pair is $2 (or the two are equal).
+  [[ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" == "$2" ]]
+}
+
 ensure_aiperf() {
+  # Prefer the aiperf the image already ships: the Dockerfile pins it to the
+  # same commit as AIPERF_COMMIT, so a matching image saves a clone plus an
+  # editable install per cell (~26s). Only the VERSION is checked, not the
+  # commit -- an image that is merely a few commits off still runs the same
+  # flags, while one that predates AIPERF_MIN_VERSION cannot.
+  #
+  # Note this is the server's own venv, so the client shares its site-packages;
+  # InferenceX isolates the two deliberately. That is a property of the image
+  # (it installs aiperf into /opt/venv at build time), not something reusing it
+  # introduces -- but it is why the fallback below builds a separate venv.
+  local img_bin img_ver
+  img_bin="$(command -v aiperf 2>/dev/null || true)"
+  if [[ -n "${img_bin}" ]]; then
+    img_ver="$("${img_bin}" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+    if [[ -n "${img_ver}" ]] && _aiperf_version_ge "${img_ver}" "${AIPERF_MIN_VERSION}"; then
+      AIPERF_VENV="$(dirname "$(dirname "${img_bin}")")"
+      echo "[aiperf] using the image's aiperf ${img_ver} (${img_bin})"
+      return
+    fi
+    echo "[aiperf] image ships aiperf ${img_ver:-<unknown>}, below the required" \
+         "${AIPERF_MIN_VERSION}; building our own"
+  else
+    echo "[aiperf] no aiperf on PATH; building our own"
+  fi
+
   local current_commit=""
   if [[ -d "${AIPERF_DIR}/.git" ]]; then
     current_commit="$(git -C "${AIPERF_DIR}" rev-parse HEAD 2>/dev/null || true)"
