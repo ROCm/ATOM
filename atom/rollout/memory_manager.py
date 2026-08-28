@@ -78,8 +78,6 @@ class MemoryManagerMixin:
         if "kv_cache" in tags:
             self._resume_kv_cache()
 
-        self._recapture_cudagraphs_if_needed()
-
         logger.info(f"{self.label}: GPU memory resumed, tags={tags}")
         return True
 
@@ -200,36 +198,3 @@ class MemoryManagerMixin:
         logger.info(
             f"{self.label}: KV cache re-allocated and bound ({num_blocks} blocks)"
         )
-
-    def _recapture_cudagraphs_if_needed(self) -> None:
-        """Recapture CUDA graphs if they were released during sleep.
-
-        CUDA graphs capture GPU memory addresses at capture time.  After
-        sleep/wake, weight and KV-cache tensors are at new addresses, so the
-        old graphs are invalid and must be recaptured.
-
-        We only recapture when **both** weights and KV cache are on GPU
-        (i.e., the model is fully ready for inference).
-        """
-        if self.enforce_eager:
-            return
-        if not hasattr(self, "_graphs_backup_keys") or not self._graphs_backup_keys:
-            return
-        # Only recapture if both weights and KV cache are on GPU
-        has_weights_on_gpu = any(p.is_cuda for p in self.model.parameters())
-        has_kv_cache = self.kv_cache is not None
-        if not has_weights_on_gpu or not has_kv_cache:
-            return
-        logger.info(f"{self.label}: Recapturing CUDA graphs after sleep/wake cycle")
-        try:
-            self.capture_cudagraph()
-            del self._graphs_backup_keys
-            logger.info(f"{self.label}: CUDA graph recapture completed")
-        except Exception as e:
-            logger.error(
-                f"{self.label}: CUDA graph recapture failed: {e}",
-                exc_info=True,
-            )
-            if hasattr(self, "_graphs_backup_keys"):
-                del self._graphs_backup_keys
-            raise

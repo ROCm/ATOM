@@ -28,7 +28,6 @@ from atom.utils import envs
 from torch import Tensor, nn
 from torch.overrides import handle_torch_function, has_torch_function_unary
 
-
 _rmsnorm2d_fwd_supports_model_sensitive: bool | None = None
 _rmsnorm2d_fwd_with_add_supports_model_sensitive: bool | None = None
 
