@@ -333,7 +333,7 @@ class WeightUpdaterMixin:
             except ImportError:
                 needs_shuffle = param.element_size() < 2
 
-        if needs_shuffle and param.dim() == 2:
+        if needs_shuffle and param.dim() in (2, 3):
             shuffle_weights(param)
 
     def update_weights(
