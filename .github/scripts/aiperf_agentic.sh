@@ -20,7 +20,7 @@
 
 AIPERF_DIR="${AIPERF_DIR:-/tmp/atom-aiperf}"
 AIPERF_VENV="${AIPERF_VENV:-/tmp/atom-aiperf-venv}"
-AIPERF_COMMIT="${AIPERF_COMMIT:-b7b16cf851885567988a643282266bce74e34437}"
+AIPERF_COMMIT="${AIPERF_COMMIT:-754356e9a39acc6cc6afb242d123bb57c3fb6f75}"
 AIPERF_SCENARIO="${AIPERF_SCENARIO:-inferencex-agentx-mvp}"
 AIPERF_PUBLIC_DATASET="${AIPERF_PUBLIC_DATASET:-semianalysis_cc_traces_weka_062126}"
 # Unset by default: the single-node recipe passes no --max-context-length.
