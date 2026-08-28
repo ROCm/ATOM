@@ -221,18 +221,27 @@ class TestPageUnitAddressesAreArithmetic:
     RATIO = 4  # block_ratio: physical blocks per logical block
     N_LOGICAL = 5
 
-    def build(self, block_size=None, spec_bytes=None):
+    def build(self, block_size=None, spec_bytes=None, image_bytes=None, dtype=None):
         phys_bs = self.LOGICAL_BS // self.RATIO or 1
-        cache = torch.arange(
-            self.ROWS * self.N_LOGICAL * self.RATIO * phys_bs * self.ENTRY,
-            dtype=torch.uint8,
-        ).reshape(self.ROWS, self.N_LOGICAL * self.RATIO, phys_bs, self.ENTRY)
-        region = self.LOGICAL_BS * self.ENTRY
-        runtime = SimpleNamespace(
-            checkpoint_spec=SimpleNamespace(
-                page_unit_bytes=self.ROWS * region if spec_bytes is None else spec_bytes
+        dtype = dtype or torch.uint8
+        cache = (
+            torch.arange(
+                self.ROWS * self.N_LOGICAL * self.RATIO * phys_bs * self.ENTRY,
+                dtype=torch.int64,
             )
+            .to(dtype)
+            .reshape(self.ROWS, self.N_LOGICAL * self.RATIO, phys_bs, self.ENTRY)
         )
+        region = self.LOGICAL_BS * self.ENTRY * cache.element_size()
+        spec = SimpleNamespace(
+            page_unit_bytes=self.ROWS * region if spec_bytes is None else spec_bytes
+        )
+        # Left OFF unless a test asks for it: `page_unit_views` trims to
+        # `image_bytes` only when the spec carries one, and the addressing tests
+        # above are about whole units.
+        if image_bytes is not None:
+            spec.image_bytes = image_bytes
+        runtime = SimpleNamespace(checkpoint_spec=spec)
         runner = SimpleNamespace(
             kv_cache=cache,
             block_size=self.LOGICAL_BS if block_size is None else block_size,
@@ -526,3 +535,93 @@ class TestPageUnitViewsNameTheSameBytes:
         )
         with pytest.raises(RuntimeError, match="granularity"):
             stub.page_unit_views([0])
+
+
+class TestPageUnitViewsStopAtTheImage:
+    """An image occupies WHOLE units, so the last one is mostly padding.
+
+    `_checkpoint_copy_plan` already knows this — it hands `plan_segmented_copy`
+    the unit stream *and* `spec.image_bytes`, and that function walks both
+    streams from offset 0, so the image is by construction the LEADING
+    `image_bytes` of the unit stream and the tail belongs to nobody.
+
+    `page_unit_views` is the tensor-view counterpart of the same addressing, so
+    it has to stop at the same place. Gathering whole units instead hands the
+    packer more bytes than `StateByteCodec.put` allocated, and every store dies
+    on "MemoryObj tensor is too small".
+
+    None of the addressing tests above reach this: their spec carries no
+    `image_bytes`, so they take the untrimmed path by construction.
+    """
+
+    H = TestPageUnitAddressesAreArithmetic
+
+    def build(self, **kw):
+        stub, cache = self.H.build(self.H(), **kw)
+        stub.page_unit_views = K3._KimiMLAGDNCommon.page_unit_views.__get__(
+            stub, type(stub)
+        )
+        return stub, cache
+
+    @staticmethod
+    def total(views):
+        return sum(v.numel() * v.element_size() for v in views)
+
+    def test_the_gathered_stream_is_exactly_the_image(self):
+        """The invariant the packer depends on, and the one that was broken."""
+        stub, _ = self.build(image_bytes=70)  # 3 units x 24 B = 72 B available
+        assert self.total(stub.page_unit_views([0, 1, 2])) == 70
+
+    def test_a_whole_unit_past_the_image_is_dropped_entirely(self):
+        stub, _ = self.build(image_bytes=20)
+        views = stub.page_unit_views([0, 1, 2])
+        assert self.total(views) == 20
+        assert len(views) == 3, "two whole views plus the one that straddles"
+
+    def test_an_image_that_lands_on_a_boundary_is_not_sliced(self):
+        stub, _ = self.build(image_bytes=72)
+        untrimmed, _ = self.build()
+        assert [v.shape for v in stub.page_unit_views([0, 1, 2])] == [
+            v.shape for v in untrimmed.page_unit_views([0, 1, 2])
+        ]
+
+    def test_the_kept_bytes_are_the_leading_bytes_and_nothing_else(self):
+        """Trimming must not reorder or reslice — it truncates. The blob is
+        read back by scattering into the slot in the same order, so a byte that
+        moves here lands in the wrong layer there, silently."""
+        stub, _ = self.build(image_bytes=70)
+        untrimmed, _ = self.build()
+        want = torch.cat(
+            [
+                v.reshape(-1).view(torch.uint8)
+                for v in untrimmed.page_unit_views([0, 1, 2])
+            ]
+        )[:70]
+        got = torch.cat(
+            [v.reshape(-1).view(torch.uint8) for v in stub.page_unit_views([0, 1, 2])]
+        )
+        assert torch.equal(got, want)
+
+    def test_a_multi_byte_dtype_is_sliced_by_bytes_not_elements(self):
+        """The straddling view is reinterpreted as uint8 before slicing, because
+        the image does not end on an element boundary in general. A slice taken
+        in elements would silently keep the wrong amount on any dtype wider than
+        a byte."""
+        stub, cache = self.build(dtype=torch.bfloat16, image_bytes=70)
+        assert cache.element_size() == 2
+        assert self.total(stub.page_unit_views([0, 1, 2])) == 70
+
+    def test_a_spec_with_no_image_size_keeps_whole_units(self):
+        """A fork build carries no spec at all, and there the whole-unit stream
+        is the right answer — there is nothing to trim against."""
+        stub, _ = self.build()  # no image_bytes on the spec
+        assert self.total(stub.page_unit_views([0, 1, 2])) == 3 * self.H.ROWS * (
+            self.H.LOGICAL_BS * self.H.ENTRY
+        )
+
+    def test_units_that_cannot_cover_the_image_raise(self):
+        """A short blob read back as valid is the one outcome worth crashing
+        over: it resumes a request onto a truncated state with no exception."""
+        stub, _ = self.build(image_bytes=80)  # more than the 72 B on offer
+        with pytest.raises(RuntimeError, match="disagree"):
+            stub.page_unit_views([0, 1, 2])
