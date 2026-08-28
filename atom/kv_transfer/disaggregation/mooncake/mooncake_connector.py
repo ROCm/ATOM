@@ -98,7 +98,7 @@ def _swa_ring_ids(seq) -> list[int]:
     any SWA regions at all, which only the connector knows -- see the guard at
     the transfer site.
     """
-    slot = getattr(seq, "per_req_cache_group", -1)
+    slot = getattr(seq, "state_slot", -1)
     return [int(slot)] if slot is not None and slot >= 0 else []
 
 
@@ -449,8 +449,8 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         self.dp_rank = config.parallel_config.data_parallel_rank
         self.pp_size = config.pipeline_parallel_size
         self.block_size = config.kv_cache_block_size
-        # The prefix-cache offset counts virtual blocks, not single blocks.
-        # Same quantity as BlockManager.hash_block_size.
+        # Prefix-cache offsets count virtual blocks; same quantity as
+        # BlockManager.hash_block_size.
         self.hash_block_size = self.block_size * config.decode_context_parallel_size
         self.host_ip = get_ip()
 
@@ -517,7 +517,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
                 self.transfer_id_to_request_id[transfer_id] = seq.id
                 self.request_id_to_transfer_id[seq.id] = transfer_id
 
-        slot_index = getattr(seq, "per_req_cache_group", -1)
+        slot_index = getattr(seq, "state_slot", -1)
 
         # Consumer side: queue for remote KV loading
         if params.get("do_remote_prefill"):
@@ -531,7 +531,17 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             # prefix cache. Per-request state (including the SWA ring slot) is
             # not covered by a block-only delta, so it takes a full transfer.
             num_computed_blocks = 0
-            if not seq.has_per_req_cache and self.hash_block_size > 0:
+            remote_hash_block_size = params.get("hash_block_size")
+            if remote_hash_block_size != self.hash_block_size:
+                logger.warning(
+                    "PD incremental transfer disabled for req %s: producer "
+                    "hash_block_size=%r, consumer hash_block_size=%d; "
+                    "falling back to full transfer",
+                    seq.id,
+                    remote_hash_block_size,
+                    self.hash_block_size,
+                )
+            elif not seq.has_per_req_cache and self.hash_block_size > 0:
                 num_computed_blocks = seq.num_cached_tokens // self.hash_block_size
             params["num_computed_blocks"] = num_computed_blocks
             logger.info(
@@ -578,10 +588,11 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             "tp_size": self.tp_size,
             "dp_rank": self.dp_rank,
             "remote_pp_size": self.pp_size,
+            "hash_block_size": self.hash_block_size,
             "transfer_id": seq.id,
             "first_token_id": first_token_id,
             "draft_token_ids": draft_token_ids,
-            "local_slot_index": getattr(seq, "per_req_cache_group", -1),
+            "local_slot_index": getattr(seq, "state_slot", -1),
             "prefix_cache_hit_tokens": getattr(seq, "prefix_cache_hit_tokens", 0),
         }
 

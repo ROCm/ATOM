@@ -35,10 +35,15 @@ def _scheduler(dcp_size):
     return MooncakeConnectorScheduler(config)
 
 
-def _seq(num_cached_tokens, num_blocks):
+def _seq(num_cached_tokens, num_blocks, dcp_size=4):
     return SimpleNamespace(
         id="req-0",
-        kv_transfer_params={"do_remote_prefill": True, "transfer_id": "t0"},
+        kv_transfer_params={
+            "do_remote_prefill": True,
+            "transfer_id": "t0",
+            # What the producer reports; a mismatch forces a full transfer.
+            "hash_block_size": BLOCK_SIZE * dcp_size,
+        },
         block_table=list(range(num_blocks)),
         num_cached_tokens=num_cached_tokens,
         has_per_req_cache=False,
@@ -50,7 +55,7 @@ def _seq(num_cached_tokens, num_blocks):
 @pytest.mark.parametrize("cached_virtual_blocks", [0, 1, 5])
 def test_offset_counts_virtual_blocks(dcp_size, cached_virtual_blocks):
     virtual_block = BLOCK_SIZE * dcp_size
-    seq = _seq(cached_virtual_blocks * virtual_block, num_blocks=64)
+    seq = _seq(cached_virtual_blocks * virtual_block, num_blocks=64, dcp_size=dcp_size)
 
     _scheduler(dcp_size).update_state_after_alloc(seq)
 
@@ -68,5 +73,13 @@ def test_partial_virtual_block_is_not_counted():
 def test_per_request_cache_forces_a_full_transfer():
     seq = _seq(BLOCK_SIZE * 4 * 3, num_blocks=64)
     seq.has_per_req_cache = True
+    _scheduler(4).update_state_after_alloc(seq)
+    assert seq.kv_transfer_params["num_computed_blocks"] == 0
+
+
+def test_producer_with_a_different_dcp_size_forces_a_full_transfer():
+    """The offset is in the producer's units, so the two sides must agree on
+    the virtual block before any of it can be skipped."""
+    seq = _seq(BLOCK_SIZE * 4 * 3, num_blocks=64, dcp_size=2)
     _scheduler(4).update_state_after_alloc(seq)
     assert seq.kv_transfer_params["num_computed_blocks"] == 0

@@ -67,6 +67,11 @@ from atom.utils.forward_context import (
     get_forward_context,
 )
 
+# Cap on the KV-split budget: aiter cuts the KV walk into
+# `min(num_clusters, cap * batch_size)` parts, and a negative cap means uncapped
+# -- as many parts as the machine has clusters (v1_2_device.cuh:894).
+_MLA_SPLIT_BUDGET_AUTO = -1
+
 
 def _sparse_index_workspace(
     out: torch.Tensor | None,
@@ -789,14 +794,23 @@ class MLAAttention(nn.Module):
             self._qrep_local_src = w
         return self._qrep_local_proj
 
-    def _dcp_merge(self, o, lse, ctx=None):
+    def _dcp_merge(self, o, lse, ctx=None, owned_counts=None):
         """Bind this layer's DCP group and backend to ``dcp_ops.dcp_lse_merge``."""
         from atom.model_ops.dcp_ops import dcp_lse_merge
 
-        return dcp_lse_merge(o, lse, self.dcp_group, self.dcp_comm_backend, ctx=ctx)
+        return dcp_lse_merge(
+            o,
+            lse,
+            self.dcp_group,
+            self.dcp_comm_backend,
+            ctx=ctx,
+            owned_counts=owned_counts,
+        )
 
     @mark_trace(prefix="dcp_project_merge_out", torch_compile=False)
-    def _dcp_project_merge_out(self, o, lse, ctx=None, merge_in_fp32=False):
+    def _dcp_project_merge_out(
+        self, o, lse, ctx=None, merge_in_fp32=False, owned_counts=None
+    ):
         """Shared tail of both DCP paths: PBM projection, merge, o_proj.
 
         With PBM the V up-projection runs on the whole group's head set BEFORE
@@ -809,9 +823,11 @@ class MLAAttention(nn.Module):
             )
         if merge_in_fp32:
             dtype = o.dtype
-            o = self._dcp_merge(o.float(), lse, ctx=ctx).to(dtype)
+            o = self._dcp_merge(o.float(), lse, ctx=ctx, owned_counts=owned_counts).to(
+                dtype
+            )
         else:
-            o = self._dcp_merge(o, lse, ctx=ctx)
+            o = self._dcp_merge(o, lse, ctx=ctx, owned_counts=owned_counts)
         if self.pbm_enabled:
             return self.o_proj(o.reshape(-1, self.num_heads * self.v_head_dim))
         return self._v_up_proj_and_o_proj(o)
@@ -830,7 +846,10 @@ class MLAAttention(nn.Module):
             q_out, kv_cache, attn_metadata, return_lse=True
         )
         return self._dcp_project_merge_out(
-            o, lse, merge_in_fp32=not self.dcp_prefill_merge_bf16_ok
+            o,
+            lse,
+            merge_in_fp32=not self.dcp_prefill_merge_bf16_ok,
+            owned_counts=self.dcp_owned_counts_buffer[: q_out.shape[0]],
         )
 
     @mark_trace(prefix="dcp_decode", torch_compile=False)
@@ -847,7 +866,17 @@ class MLAAttention(nn.Module):
         if not use_qrep:
             q_out = dcp_all_gather_query_heads(self.dcp_group, q_out)
         o, lse = self._forward_decode(q_out, kv_cache, attn_metadata, return_lse=True)
-        return self._dcp_project_merge_out(o, lse, ctx=self._cp_triton_ctx)
+        owned_counts = (
+            self.dcp_owned_counts_buffer[: q_out.shape[0]]
+            if self.is_sparse_mla and self.dcp_owned_counts_buffer is not None
+            else None
+        )
+        return self._dcp_project_merge_out(
+            o,
+            lse,
+            ctx=self._cp_triton_ctx,
+            owned_counts=owned_counts,
+        )
 
     def _v_up_proj(self, x, W_V=None, W_V_scale=None, num_heads=None):
         """V up-projection only: ``[B, N, kv_lora_rank] -> [B, N, v_head_dim]``.
@@ -1729,7 +1758,7 @@ class MLAAttention(nn.Module):
             max_seqlen_qo=1,
             uni_seqlen_qo=1,
             fast_mode=1,
-            max_split_per_batch=16,
+            max_split_per_batch=_MLA_SPLIT_BUDGET_AUTO,
         )
 
     def _forward_decode(
