@@ -33,7 +33,7 @@ def load(arm_dir):
             key = (d["doc_id"], d["filter"])
             if key in scores:
                 sys.exit(f"FAIL: duplicate record for {key} in {files[-1]}")
-            scores[key] = float(d["exact_match"])
+            scores[key] = (float(d["exact_match"]), d.get("prompt_hash"))
     return files[-1], scores
 
 
@@ -62,8 +62,31 @@ def main():
             "a partial join would compute b and c over a subset"
         )
 
+    # Matching doc_ids do NOT mean matching questions. Two runs at different
+    # few-shot counts or context lengths carry the same doc_id 0..N with the
+    # same filters, so the key sets agree while the prompts differ -- and the
+    # join then compares two different questions under one id and returns a
+    # confident, meaningless b and c. lm_eval seeds its few-shot sampling, so
+    # `prompt_hash` is identical across runs of the same protocol (verified
+    # 2638/2638 on a same-protocol pair) and differs the moment the protocol
+    # does. Pairing is only defined when the protocol is held fixed.
+    mismatched = [k for k in A if A[k][1] != B[k][1]]
+    if mismatched:
+        sys.exit(
+            f"FAIL: {len(mismatched)} of {len(A)} records have different "
+            "prompt_hash, so the two runs did not ask the same questions "
+            "(different --num_fewshot or --max-model-len?). A paired test needs "
+            "the protocol held fixed; comparing these would pair unrelated "
+            "questions under one doc_id."
+        )
+    if any(h is None for h, in ((A[k][1],) for k in A)):
+        print("WARNING: no prompt_hash in these records; protocol identity unverified")
+
     filters = sorted({f for _, f in A})
-    print(f"joined on {len(A)} records, no drops; filters: {filters}")
+    print(
+        f"joined on {len(A)} records, no drops, prompts identical; "
+        f"filters: {filters}"
+    )
 
     for filt in filters:
         docs = sorted(d for d, f in A if f == filt)
@@ -71,7 +94,7 @@ def main():
             sys.exit(f"FAIL: zero questions for filter {filt}")
         b = c = both = neither = 0
         for d in docs:
-            x, y = A[(d, filt)], B[(d, filt)]
+            x, y = A[(d, filt)][0], B[(d, filt)][0]
             if x > 0.5 and y < 0.5:
                 b += 1
             elif x < 0.5 and y > 0.5:
