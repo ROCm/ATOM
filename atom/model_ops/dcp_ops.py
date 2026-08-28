@@ -134,8 +134,7 @@ def _correct_attn_cp_out_kernel(
 
     lse = tl.load(lses_ptr + lse_offsets)
     lse = tl.where(
-        (lse != lse)  # noqa: PLR0124 - Triton NaN check
-        | (lse == float("inf")),
+        (lse != lse) | (lse == float("inf")),  # noqa: PLR0124 - Triton NaN check
         -float("inf"),
         lse,
     )
