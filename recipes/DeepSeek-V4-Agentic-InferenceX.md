@@ -21,10 +21,11 @@ export AITER_BF16_FP8_MOE_BOUND=0
 export ATOM_MOE_GU_ITLV=1
 
 python3 -m atom.entrypoints.openai_server \
-  --model $MODEL_PATH --server-port $PORT \
+  --model $MODEL_PATH --served-model-name $MODEL_PATH \
+  --host 0.0.0.0 --server-port $PORT \
   -tp 8 --kv_cache_dtype fp8 --index_cache_dtype fp4 \
   --method mtp --num-speculative-tokens 3 \
-  --spec-decode-acceptance-rate 0.4966666667 \
+  --spec-decode-acceptance-length 2.49 \
   --enable_prefix_caching \
   --gpu-memory-utilization 0.9 \
   --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384 \
@@ -44,10 +45,11 @@ export ATOM_ENABLE_PREFILL_DELAYER=1
 export ATOM_PREFILL_DECODE_INTERVAL=10
 
 python3 -m atom.entrypoints.openai_server \
-  --model $MODEL_PATH --server-port $PORT \
+  --model $MODEL_PATH --served-model-name $MODEL_PATH \
+  --host 0.0.0.0 --server-port $PORT \
   -tp 8 --kv_cache_dtype fp8 --index_cache_dtype fp4 \
   --method mtp --num-speculative-tokens 3 \
-  --spec-decode-acceptance-rate 0.4966666667 \
+  --spec-decode-acceptance-length 2.49 \
   --enable_prefix_caching \
   --gpu-memory-utilization 0.9 \
   --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384 \
@@ -84,9 +86,10 @@ aiperf profile --scenario inferencex-agentx-mvp \
   --output-artifact-dir ./aiperf-artifacts-c$CONC
 ```
 
-### One deliberate difference from `benchmark_lib.sh`
+### Differences from the reference scripts
 
-`build_replay_cmd` passes `--warmup-grace-period ${AGENTIC_WARMUP_GRACE_PERIOD:-1800}`.
+**1. The warmup grace flag.** `build_replay_cmd` passes
+`--warmup-grace-period ${AGENTIC_WARMUP_GRACE_PERIOD:-1800}`.
 We pass **`--agentic-warmup-grace-period`** instead, because AIPerf's own help
 says the plain flag is inert here:
 
@@ -99,6 +102,19 @@ and the barrier falls back to waiting indefinitely. The variable name in
 `benchmark_lib.sh` is already `AGENTIC_WARMUP_GRACE_PERIOD`, which suggests the
 agentic knob was the intent. Worth a look on your side — if the plain flag is
 right after all, we will match it.
+
+**2. The DP-attention variant is outside your recipe's envelope.**
+`dsv4_fp4_mi355x_atom_mtp.sh` hard-fails unless `TP=8`, `EP_SIZE=1` and
+`DP_ATTENTION=false`. Our TP rows above satisfy that and are the ones to compare
+against; the DP rows deliberately step outside it, because on this workload DP
+attention is where the throughput is — 44,722 vs 20,308 tok/s/chip — and we would
+rather show the trade than hide it. It is not free: the same rows carry TTFT of
+~10 s against TP's ~1 s. Read them as a second operating point, not as an entry
+under your rules.
+
+Everything else in the server command matches the reference literally, including
+the golden `--spec-decode-acceptance-length 2.49` and `--max-num-seqs` at twice
+the concurrency.
 
 ### AIPerf version
 
