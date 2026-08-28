@@ -298,40 +298,30 @@ class ParallelLMHead(VocabParallelEmbedding):
     # rollout should shard it at load time).
     # ------------------------------------------------------------------
     def _can_use_dp_sharded_head(self, context) -> bool:
-        """Whether this step may run the DP-sharded LM head (all-gather/all2all).
+        """Whether this step may run the DP-sharded LM head (pure-DP decode only).
 
-        The decision MUST depend only on globally-synced state so every DP rank
-        reaches the same verdict — otherwise the collective below deadlocks.
-        `context.dp_uniform_decode` is exactly that: it is False on *every* rank
-        whenever *any* rank is prefilling (see ModelRunner._preprocess), and
-        True only when all ranks run an equal-length decode step. The concrete
-        strategy (all-gather vs all2all) is read from ATOM_DP_LM_HEAD_MODE in
-        `_dp_sharded_logits`.
+        Every DP rank must reach the SAME verdict from globally-synced state, or
+        the fixed-size collective in `_dp_sharded_logits` deadlocks. The strategy
+        (all-gather vs all2all) is read from ATOM_DP_LM_HEAD_MODE there.
         """
-        if envs.ATOM_DP_LM_HEAD_MODE not in ("allgather", "all2all"):
-            return False
-        if self.tp_size != 1:
-            return False
         dp_group = get_dp_group()
-        if dp_group.world_size <= 1:
+        # Static: enabled, pure DP, vocab evenly shardable over a >1 DP group.
+        if (
+            envs.ATOM_DP_LM_HEAD_MODE not in ("allgather", "all2all")
+            or self.tp_size != 1
+            or dp_group.world_size <= 1
+            or self.num_embeddings % dp_group.world_size != 0
+        ):
             return False
-        # Vocab must divide evenly across the DP group for equal shards.
-        if self.num_embeddings % dp_group.world_size != 0:
-            return False
-        # Global agreement gate: all ranks in uniform (equal-length) decode.
-        # Draft/MTP passes carry irregular (padded) row counts that break the
-        # DP-uniform invariant, so keep them on the replicated path for now.
-        if context is None or getattr(context, "is_draft", False):
-            return False
-        # Decode-only by design. Prefill slices x to one row per sequence, while
-        # _dp_sharded_logits pads to dp_metadata.max_tokens_across_dp (a *token*
-        # count). The two units disagree, so a prefill row count would over-pad
-        # into a huge DP collective / OOM. `dp_uniform_decode` alone does NOT
-        # exclude prefill: it is forced True whenever DP-attention is disabled
-        # (and defaults True), so gate on is_prefill explicitly.
-        if getattr(context, "is_prefill", False):
-            return False
-        if not getattr(context, "dp_uniform_decode", False):
+        # Per-step: all ranks in an equal-length decode. Exclude draft (eagle
+        # keeps dp_uniform_decode=True despite ragged rows) and prefill (x is
+        # sliced to 1 row/seq, mismatching the token-count pad target).
+        if (
+            context is None
+            or getattr(context, "is_draft", False)
+            or getattr(context, "is_prefill", False)
+            or not getattr(context, "dp_uniform_decode", False)
+        ):
             return False
         return get_forward_context().dp_metadata is not None
 
