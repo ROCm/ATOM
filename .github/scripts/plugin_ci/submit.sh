@@ -139,6 +139,7 @@ PY
 )"
 
 SLURM_QOS="${SLURM_QOS:-amd-burst-qos}"
+USES_SPUR_CONTROLLER=1
 case "${RUNNER_NAME:-}" in
   plugin_runner_crusoe_v2_01|plugin_runner_crusoe_v2_02)
     export SPUR_CONTROLLER_ADDR="http://crs-m2m-cpu-spur-v2-001.crusoe.amd.com:6817"
@@ -146,6 +147,9 @@ case "${RUNNER_NAME:-}" in
     export SLURM_ACCOUNT="amd-aifw-dev"
     export SLURM_PARTITION=""
     SLURM_QOS="amd-aifw-dev-qos"
+    ;;
+  gbt350-odcdh1-b10-1)
+    USES_SPUR_CONTROLLER=0
     ;;
 esac
 
@@ -160,7 +164,6 @@ export SLURM_ERROR="${LOG_ROOT}/slurm-%j.err"
 export SLURM_CANCEL_HELPER="${RESULT_DIR}/${PLUGIN_CI_CELL_ID}.slurm-cancel.sh"
 SUBMIT_LOCK_FILE="${SLURM_SUBMIT_LOCK_FILE:-/home/junyyang/ATOM_PLUGIN_RUNNER/LOG/.sbatch-submit.lock}"
 SLURM_LOG_POLL_INTERVAL="${SLURM_LOG_POLL_INTERVAL:-30}"
-USES_SPUR_CONTROLLER=1
 
 echo "=== plugin CI cell ==="
 echo "cell=${PLUGIN_CI_CELL_ID}"
@@ -170,7 +173,11 @@ echo "nodes=${NODE_LIST:-auto}"
 echo "slurm_account=${SLURM_ACCOUNT}"
 echo "slurm_partition=${SLURM_PARTITION:-default}"
 echo "slurm_qos=${SLURM_QOS}"
-echo "spur_controller=${SPUR_CONTROLLER_ADDR}"
+if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
+  echo "spur_controller=${SPUR_CONTROLLER_ADDR}"
+else
+  echo "spur_controller=default"
+fi
 echo "slurm_job_name=${SLURM_JOB_NAME}"
 echo "log_root=${LOG_ROOT}"
 echo "submit_lock_file=${SUBMIT_LOCK_FILE}"
@@ -220,7 +227,11 @@ if [[ -n "${NODE_LIST}" ]]; then
 fi
 SBATCH_CMD+=(
   --job-name "${SLURM_JOB_NAME}"
-  --controller "${SPUR_CONTROLLER_ADDR}"
+)
+if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
+  SBATCH_CMD+=(--controller "${SPUR_CONTROLLER_ADDR}")
+fi
+SBATCH_CMD+=(
   --nodes "${NUM_NODES}"
   --ntasks "${NUM_NODES}"
   --ntasks-per-node 1
