@@ -72,6 +72,8 @@ def dcp_persistent_supported() -> bool:
     query shared by native and the vLLM plugin; cache the result once per
     ``__init__`` to avoid a per-forward ``get_gfx()`` (graph-break).
     """
+    if envs.ATOM_DISABLE_DCP_PERSISTENT:
+        return False
     from aiter.jit.utils.chip_info import get_gfx
 
     return get_gfx() == "gfx950"

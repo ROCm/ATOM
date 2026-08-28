@@ -68,6 +68,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DCP_REPLICATE_INDEX_CACHE": lambda: (
         os.getenv("ATOM_DCP_REPLICATE_INDEX_CACHE", "0") == "1"
     ),
+    # Diagnostic fallback for gfx950: force DCP onto the established
+    # non-persistent path instead of rebuilding sparse persistent metadata.
+    "ATOM_DISABLE_DCP_PERSISTENT": lambda: (
+        os.getenv("ATOM_DISABLE_DCP_PERSISTENT", "0") == "1"
+    ),
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
     "ATOM_USE_TRITON_MOE_DECODE": lambda: os.getenv("ATOM_USE_TRITON_MOE_DECODE", "0")
     == "1",
@@ -137,6 +142,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # "0" to fall back to the per-op Python path if a regression is suspected.
     "ATOM_ENABLE_GLM_FUSED_INDEXER": lambda: (
         os.getenv("ATOM_ENABLE_GLM_FUSED_INDEXER", "1") == "1"
+    ),
+    # Allow DCP to use the GLM fused indexer kernel. This requires AITER's
+    # compute_all_q_rope support: slot<0 rows still produce Q/weights, while
+    # only valid slots write K cache.
+    "ATOM_ENABLE_DCP_FUSED_INDEXER": lambda: (
+        os.getenv("ATOM_ENABLE_DCP_FUSED_INDEXER", "0") == "1"
     ),
     # Kimi-K3 DSpark draft: fuse the per-layer context-row KV write
     # (K3DSparkMLAAttention.write_context_kv) into one Triton kernel --
