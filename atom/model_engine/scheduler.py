@@ -459,6 +459,23 @@ class CacheStats:
             self.total_compressed_tokens,
         )
 
+    @property
+    def lmcache_hit_rate(self) -> float:
+        """Reuse the lmcache CPU offload tier served, as a share of all reuse.
+
+        Disjoint from the HBM walk on purpose: `total_offload_tokens` counts
+        reuse that sat *above* the paged pool (see `update`), so it is exactly
+        the reuse that becomes recompute the moment the tier is switched off.
+        Paired with `paged_hit_rate` (the HBM tier's share) it answers the
+        question the pipeline rates cannot -- of the reuse we served, how much
+        came from HBM vs from lmcache -- which is the whole case for the tier
+        on a given workload. For K3 the two are cleanly separable: KV prefixes
+        live in HBM (paged) while the recurrent-state checkpoints live in the
+        CPU tier (offload), and when the joint boundary reports state_hbm=0 the
+        entire state-hit is lmcache-served.
+        """
+        return self._rate(self.total_offload_tokens, self.total_reusable_tokens)
+
     def get_statistics(self) -> dict:
         """Counters, not rates — the caller derives those.
 
@@ -586,6 +603,24 @@ class CacheStats:
             f"combined: {self.hit_rate:.2%}, "
             f"binding: {worse}"
         )
+        # `[Cache Pools]` above is a *series* split (paged pool -> state pool),
+        # which answers "which pool to fix" but NOT "what does lmcache buy us".
+        # For that you need the *tier* split: how much of the reuse we served
+        # came from HBM (paged pool) vs from the lmcache CPU offload tier. The
+        # offload count sits above the HBM walk (see `update`), so it is exactly
+        # the reuse that reverts to recompute when the tier is switched off --
+        # i.e. the value of running lmcache on this workload, in one number.
+        # Logged only when a tier is attached; the no-connector baseline has
+        # total_offload_tokens==0 and its tier split is trivially HBM=paged,
+        # lmcache=0.
+        if self.total_offload_tokens:
+            logger.info(
+                "[Cache Tiers] "
+                f"HBM-served (KV prefix resident): {paged:.2%} "
+                f"({self.total_compressed_tokens}/{self.total_reusable_tokens}), "
+                f"lmcache-served (CPU tier): {self.lmcache_hit_rate:.2%} "
+                f"({self.total_offload_tokens}/{self.total_reusable_tokens})"
+            )
 
     @staticmethod
     def _log_pressure(p: dict[str, int]) -> None:
