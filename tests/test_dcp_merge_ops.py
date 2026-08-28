@@ -609,7 +609,7 @@ def test_projection_does_not_defeat_the_empty_rank_scrub():
 # ──────────────────────────────────────────────────────── A2A merge backend ──
 
 
-def _a2a_roundtrip(o_per_rank, lse_per_rank, n_ranks):
+def _a2a_roundtrip(o_per_rank, lse_per_rank, n_ranks, owned_counts_per_rank=None):
     """pack -> all-to-all -> combine, with the collective done as a local permute.
 
     ``all_to_all_single`` needs a real process group, which a single-process test
@@ -632,9 +632,14 @@ def _a2a_roundtrip(o_per_rank, lse_per_rank, n_ranks):
         send = torch.empty((n_ranks, b, h_local, d + pack), dtype=dtype, device=DEV)
         o_r = o_per_rank[r].contiguous()
         l_r = lse_per_rank[r].contiguous().to(torch.float32)
+        has_owned_counts = owned_counts_per_rank is not None
+        counts_r = (
+            owned_counts_per_rank[r].contiguous() if has_owned_counts else l_r
+        )
         _dcp_a2a_pack_kernel[(b, h_total)](
             o_r,
             l_r,
+            counts_r,
             send,
             o_r.stride(0),
             o_r.stride(1),
@@ -646,6 +651,7 @@ def _a2a_roundtrip(o_per_rank, lse_per_rank, n_ranks):
             H_LOCAL=h_local,
             HEAD_DIM=d,
             LSE_PACK=pack,
+            HAS_OWNED_COUNTS=has_owned_counts,
         )
         sends.append(send)
 
@@ -735,11 +741,11 @@ def test_a2a_lse_survives_the_16_bit_split():
 
 @needs_gpu
 def test_a2a_scrubs_the_empty_rank():
-    """Same hazard as the ag_rs path: a rank owning no KV returns o=NaN, lse=-inf.
+    """A dummy-backed empty rank has finite LSE and a meaningless output.
 
-    The combine kernel must force that contribution to a hard zero. Without it
-    NaN*0 = NaN survives the accumulation and poisons the row for every rank --
-    silently, since nothing raises.
+    The existing pack kernel must use the true count to send LSE=-inf, after
+    which the combine kernel forces its contribution to a hard zero. This is
+    the launch-free sparse-DCP zero-row path used by decode and prefill.
     """
     b, h, d, n_ranks = 2, 4, 32, 2
     g = torch.Generator(device=DEV).manual_seed(5)
@@ -747,14 +753,17 @@ def test_a2a_scrubs_the_empty_rank():
         torch.randn(b, h, d, generator=g, device=DEV).bfloat16() for _ in range(n_ranks)
     ]
     lse = [torch.randn(b, h, generator=g, device=DEV) for _ in range(n_ranks)]
-    o[0][0, 0] = float("nan")
-    lse[0][0, 0] = NEG_INF
+    o[0][0] = float("nan")
+    owned_counts = [
+        torch.tensor([0, 1], dtype=torch.int32, device=DEV),
+        torch.tensor([1, 1], dtype=torch.int32, device=DEV),
+    ]
 
-    got = _a2a_roundtrip(o, lse, n_ranks)
+    got = _a2a_roundtrip(o, lse, n_ranks, owned_counts)
     assert torch.isfinite(got).all(), "empty-rank NaN reached the a2a output"
     # Rank 0 contributed nothing, so the row is rank 1 alone (weight 1).
     torch.testing.assert_close(
-        got[0, 0].float(), o[1][0, 0].float(), rtol=8e-3, atol=8e-3
+        got[0].float(), o[1][0].float(), rtol=8e-3, atol=8e-3
     )
 
 

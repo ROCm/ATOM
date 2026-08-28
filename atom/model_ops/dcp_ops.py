@@ -292,6 +292,7 @@ def _lse_pack_slots(dtype: torch.dtype) -> int:
 def _dcp_a2a_pack_kernel(
     out_ptr,  # [B, H, D]      this rank's partial attention output
     lse_ptr,  # [B, H]         fp32
+    owned_counts_ptr,  # [B]   true rank-local sparse counts, or unused
     send_ptr,  # [N, B, H_LOCAL, D + LSE_PACK]
     out_stride_b,
     out_stride_h,
@@ -303,6 +304,7 @@ def _dcp_a2a_pack_kernel(
     H_LOCAL: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     LSE_PACK: tl.constexpr,
+    HAS_OWNED_COUNTS: tl.constexpr,
 ):
     """Scatter (output, lse) into the per-destination send buffer.
 
@@ -325,6 +327,11 @@ def _dcp_a2a_pack_kernel(
     tl.store(dst_base + d, src)
 
     lse = tl.load(lse_ptr + b * lse_stride_b + h * lse_stride_h)
+    if HAS_OWNED_COUNTS:
+        # Empty sparse-DCP rows carry one dummy KV slot so persistent metadata
+        # remains valid. Neutralize that slot while packing the existing A2A
+        # payload; this adds no kernel launch to the decode path.
+        lse = tl.where(tl.load(owned_counts_ptr + b) == 0, float("-inf"), lse)
     if LSE_PACK == 1:
         tl.store(dst_base + HEAD_DIM, lse)
     else:
@@ -422,7 +429,13 @@ def _dcp_a2a_unpack_combine_kernel(
     )
 
 
-def cp_lse_a2a(cp_attn_out, cp_attn_lse, cp_group, return_lse: bool = False):
+def cp_lse_a2a(
+    cp_attn_out,
+    cp_attn_lse,
+    cp_group,
+    return_lse: bool = False,
+    owned_counts=None,
+):
     """A2A backend: pack -> one all-to-all -> local LSE combine.
 
     Drop-in for ``cp_lse_ag_out_rs``: same inputs, same ``[B, H_local, D]``
@@ -433,6 +446,8 @@ def cp_lse_a2a(cp_attn_out, cp_attn_lse, cp_group, return_lse: bool = False):
         cp_attn_lse: ``[B, H]`` matching log-sum-exp, fp32.
         cp_group: DCP GroupCoordinator.
         return_lse: also return the merged ``[B, H_local]`` global LSE.
+        owned_counts: optional true rank-local sparse-KV count per row. Empty
+            rows are masked inside the existing A2A pack kernel.
     """
     n_ranks = cp_group.world_size
     if n_ranks == 1:
@@ -451,11 +466,20 @@ def cp_lse_a2a(cp_attn_out, cp_attn_lse, cp_group, return_lse: bool = False):
 
     cp_attn_out = cp_attn_out.contiguous()
     cp_attn_lse = cp_attn_lse.contiguous().to(torch.float32)
+    has_owned_counts = owned_counts is not None
+    if has_owned_counts:
+        owned_counts = owned_counts.contiguous()
+        assert owned_counts.numel() >= b
+    else:
+        # HAS_OWNED_COUNTS removes the load at compile time; use an existing
+        # device pointer so no placeholder tensor or allocation is introduced.
+        owned_counts = cp_attn_lse
 
     send = torch.empty((n_ranks, b, h_local, head_dim + pack), dtype=dtype, device=dev)
     _dcp_a2a_pack_kernel[(b, h_total)](
         cp_attn_out,
         cp_attn_lse,
+        owned_counts,
         send,
         cp_attn_out.stride(0),
         cp_attn_out.stride(1),
@@ -467,6 +491,7 @@ def cp_lse_a2a(cp_attn_out, cp_attn_lse, cp_group, return_lse: bool = False):
         H_LOCAL=h_local,
         HEAD_DIM=head_dim,
         LSE_PACK=pack,
+        HAS_OWNED_COUNTS=has_owned_counts,
     )
 
     # The N axis flips meaning here: it is "destination rank" on the way in and
@@ -531,10 +556,17 @@ def dcp_lse_merge(
     ``ctx`` is the Triton context the AG+RS backend caches its launches in; the
     a2a backend does not use one.
     """
-    if owned_counts is not None:
-        cp_attn_lse = mask_empty_dcp_lse(cp_attn_lse, owned_counts)
     if backend == "a2a":
-        return cp_lse_a2a(cp_attn_out, cp_attn_lse, cp_group)
+        return cp_lse_a2a(
+            cp_attn_out,
+            cp_attn_lse,
+            cp_group,
+            owned_counts=owned_counts,
+        )
+    if owned_counts is not None:
+        # AG+RS has no existing kernel before its LSE AllGather. The default
+        # A2A path above fuses this mask and remains launch-free.
+        cp_attn_lse = mask_empty_dcp_lse(cp_attn_lse, owned_counts)
     return cp_lse_ag_out_rs(cp_attn_out, cp_attn_lse, cp_group, ctx=ctx)
 
 
@@ -768,6 +800,7 @@ def _count_owned_dcp_kernel(
     global_kv_indptr,  # int32 [num_requests + 1] -- GLOBAL context (column range)
     token_indices_ptr,  # int32 [num_tokens, NUM_TOPK_TOKENS] -- GLOBAL top-k positions
     out_counts,  # int32 [num_requests] -- owned top-k count per request
+    out_metadata_counts,  # int32 [num_requests] -- max(out_counts, 1)
     DCP_RANK: tl.constexpr,
     DCP_WORLD: tl.constexpr,
     INTERLEAVE: tl.constexpr,  # cp_kv_cache_interleave_size S (1 = round-robin)
@@ -797,6 +830,7 @@ def _count_owned_dcp_kernel(
         count += tl.sum(owned.to(tl.int32))
 
     tl.store(out_counts + batch_id, count)
+    tl.store(out_metadata_counts + batch_id, tl.maximum(count, 1))
 
 
 @triton.jit
@@ -880,6 +914,11 @@ def _compact_filter_dcp_kernel(
         tl.store(out_kv_indices + out_kv_start + dst, slot, mask=idx_valid)
         written += tl.sum(owned_i32)
 
+    # Keep persistent fast-mode metadata valid for a rank that owns no selected
+    # KV. The A2A pack kernel neutralizes this dummy row's LSE without adding a
+    # separate pointwise launch.
+    tl.store(out_kv_indices + out_kv_start, 0, mask=written == 0)
+
 
 def triton_filter_and_convert_dcp_index(
     qo_indptr: torch.Tensor,  # int32 [num_requests + 1]
@@ -912,9 +951,9 @@ def triton_filter_and_convert_dcp_index(
     rewritten to the resulting per-request lengths. This replaces the earlier
     "fixed length + -1 sentinel" layout, whose holes broke aiter's lse output.
     Because the kept count depends on the per-layer top-k selection,
-    ``out_kv_indptr`` is layer-dependent and must be recomputed on every call --
-    it cannot feed the once-per-step persistent metadata, which is why sparse+DCP
-    runs non-persistent for now.
+    ``out_kv_indptr`` is layer-dependent. Sparse+DCP persistent mode therefore
+    rebuilds its work metadata after each full IndexShare layer and reuses that
+    plan in the following shared layers.
 
     The 8 ranks' kept sets are disjoint and their union is exactly the global
     top-k, which is what makes the downstream ``cp_lse_ag_out_rs`` merge valid.
@@ -941,11 +980,13 @@ def triton_filter_and_convert_dcp_index(
 
     # Pass 1: per-request count of owned top-k positions.
     counts = owned_counts[:num_batch]
+    metadata_counts = out_kv_indptr[1 : num_batch + 1]
     _count_owned_dcp_kernel[grid](
         qo_indptr_c,
         global_kv_indptr_c,
         token_indices_c,
         counts,
+        metadata_counts,
         dcp_rank,
         dcp_world_size,
         cp_kv_cache_interleave_size,
@@ -963,7 +1004,12 @@ def triton_filter_and_convert_dcp_index(
     # through a host->device copy, which HIP rejects while a graph is capturing
     # (hipErrorStreamCaptureUnsupported). Everything here must stay device-side.
     out_kv_indptr[:1].zero_()
-    torch.cumsum(counts, dim=0, dtype=torch.int32, out=out_kv_indptr[1 : num_batch + 1])
+    torch.cumsum(
+        metadata_counts,
+        dim=0,
+        dtype=torch.int32,
+        out=metadata_counts,
+    )
 
     # Pass 2: write the owned slots packed to the front of each region.
     _compact_filter_dcp_kernel[grid](
@@ -994,6 +1040,7 @@ def _count_owned_dcp_prefill_kernel(
     topk_indices,  # int32 [num_tokens, NUM_TOPK_TOKENS] -- FLAT KV indices
     cu_seqlens_k,  # int32 [num_req + 1] -- per-seq base of the flat KV axis
     out_counts,  # int32 [num_tokens]
+    out_metadata_counts,  # int32 [num_tokens], max(out_counts, 1)
     DCP_RANK: tl.constexpr,
     DCP_WORLD: tl.constexpr,
     INTERLEAVE: tl.constexpr,  # cp_kv_cache_interleave_size S (1 = round-robin)
@@ -1031,6 +1078,7 @@ def _count_owned_dcp_prefill_kernel(
         count += tl.sum(owned.to(tl.int32))
 
     tl.store(out_counts + token_id, count)
+    tl.store(out_metadata_counts + token_id, tl.maximum(count, 1))
 
 
 @triton.jit
@@ -1163,12 +1211,14 @@ def triton_filter_and_convert_dcp_index_prefill(
     grid = (num_tokens,)
 
     counts = owned_counts[:num_tokens]
+    metadata_counts = out_kv_indptr[1 : num_tokens + 1]
     _count_owned_dcp_prefill_kernel[grid](
         dsa_kv_indptr_c,
         token_to_seq_idxs_c,
         topk_indices_c,
         cu_seqlens_k_c,
         counts,
+        metadata_counts,
         dcp_rank,
         dcp_world_size,
         cp_kv_cache_interleave_size,
@@ -1178,16 +1228,15 @@ def triton_filter_and_convert_dcp_index_prefill(
         ti_stride1,
     )
 
-    # Keep the true counts in `owned_counts` for post-attention neutralization,
-    # but give every metadata row at least one valid slot. Persistent MLA's fast
-    # metadata path can corrupt work descriptors after a zero-length row.
-    metadata_counts = counts.clamp_min(1)
+    # The count kernel already wrote max(count, 1) into the destination tail,
+    # so this per-full-layer path needs neither an allocation nor another
+    # pointwise operator. Exact input/output overlap is supported by cumsum.
     out_kv_indptr[:1].zero_()
     torch.cumsum(
         metadata_counts,
         dim=0,
         dtype=torch.int32,
-        out=out_kv_indptr[1 : num_tokens + 1],
+        out=metadata_counts,
     )
 
     _compact_filter_dcp_prefill_kernel[grid](

@@ -867,7 +867,17 @@ class MLAAttention(nn.Module):
         if not use_qrep:
             q_out = dcp_all_gather_query_heads(self.dcp_group, q_out)
         o, lse = self._forward_decode(q_out, kv_cache, attn_metadata, return_lse=True)
-        return self._dcp_project_merge_out(o, lse, ctx=self._cp_triton_ctx)
+        owned_counts = (
+            self.dcp_owned_counts_buffer[: q_out.shape[0]]
+            if self.is_sparse_mla and self.dcp_owned_counts_buffer is not None
+            else None
+        )
+        return self._dcp_project_merge_out(
+            o,
+            lse,
+            ctx=self._cp_triton_ctx,
+            owned_counts=owned_counts,
+        )
 
     def _v_up_proj(self, x, W_V=None, W_V_scale=None, num_heads=None):
         """V up-projection only: ``[B, N, kv_lora_rank] -> [B, N, v_head_dim]``.

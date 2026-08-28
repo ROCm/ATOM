@@ -163,23 +163,26 @@ def test_decode_filter(name, g_ctxs, seed):
 
         exp = _decode_reference(g_ctxs, block_table, token_indices, rank)
         indptr = out_indptr.cpu().tolist()
+        true_counts = counts.cpu().tolist()
 
         for b in range(bs):
             got_len = indptr[b + 1] - indptr[b]
-            assert got_len == len(exp[b]), (
+            assert true_counts[b] == len(exp[b])
+            assert got_len == max(len(exp[b]), 1), (
                 f"[{name}] rank{rank} req{b}: region length {got_len} "
-                f"!= {len(exp[b])}"
+                f"!= metadata length {max(len(exp[b]), 1)}"
             )
         for b in range(bs):
             got = out_buf[indptr[b] : indptr[b + 1]].cpu().tolist()
-            assert got == exp[b], f"[{name}] rank{rank} req{b}: {got} != {exp[b]}"
+            expected = exp[b] if exp[b] else [0]
+            assert got == expected, f"[{name}] rank{rank} req{b}: {got} != {expected}"
 
         written = out_buf[: indptr[bs]]
         assert (
             int((written < 0).sum()) == 0
         ), f"[{name}] rank{rank}: -1 hole inside the compacted region"
 
-        per_rank_lens.append([indptr[b + 1] - indptr[b] for b in range(bs)])
+        per_rank_lens.append(true_counts)
 
     # Partition: every valid top-k token is claimed by exactly one rank.
     # Checked on COUNTS, not on slot values -- slots are per-rank local
@@ -237,11 +240,14 @@ def test_decode_filter_block_interleave(interleave, g_ctxs, seed):
 
         exp = _decode_reference(g_ctxs, block_table, token_indices, rank, interleave)
         indptr = out_indptr.cpu().tolist()
+        true_counts = counts.cpu().tolist()
         for b in range(bs):
             got = out_buf[indptr[b] : indptr[b + 1]].cpu().tolist()
-            assert got == exp[b], f"S={interleave} rank{rank} req{b}: {got} != {exp[b]}"
+            assert true_counts[b] == len(exp[b])
+            expected = exp[b] if exp[b] else [0]
+            assert got == expected, f"S={interleave} rank{rank} req{b}: {got} != {expected}"
         assert int((out_buf[: indptr[bs]] < 0).sum()) == 0, "-1 hole in region"
-        per_rank_lens.append([indptr[b + 1] - indptr[b] for b in range(bs)])
+        per_rank_lens.append(true_counts)
 
     for b, g in enumerate(g_ctxs):
         n = min(g, DEC_K)
