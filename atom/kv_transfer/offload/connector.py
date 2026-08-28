@@ -187,8 +187,15 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         return bool(callback(stores)) if callback is not None else False
 
     def take_state_reports(self):
+        # Contract is a 2-tuple (indexed, failed) -- matched by the kimi_k3 impl
+        # and by the sole caller `indexed, failed = take()` in
+        # scheduler._update_from_kv_xfer_finished. The no-tier fallback returned
+        # a 3-tuple, so any offload variant whose _impl lacks take_state_reports
+        # (e.g. dense/hybrid non-k3) but still exposes state_offload crashed the
+        # engine mid-run with "too many values to unpack (expected 2)", wedging
+        # all TP workers on the next collective. Return the 2-tuple empty set.
         callback = getattr(self._impl, "take_state_reports", None)
-        return callback() if callback is not None else (set(), set(), set())
+        return callback() if callback is not None else (set(), set())
 
     def get_statistics(self) -> dict[str, int]:
         return self._impl.get_statistics()
