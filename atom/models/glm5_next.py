@@ -795,7 +795,13 @@ class Glm5NextMLAAttention(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.qk_nope_head_dim = config.qk_nope_head_dim
-        # `_ROPE_PAD` is 0 today: the MLA runs at the checkpoint's true width.
+        # 0 + `_ROPE_PAD` = 64, NOT the checkpoint's true rope width of 0. The
+        # zero lanes are materialized here and dropped again only at the
+        # flash_attn call sites (`_drop_zero_rope_lanes`), so every consumer of
+        # this field -- the 576-wide KV entry, the k_out buffer the cached
+        # gather fills, and hence aiter's `KV_PeDim` -- sees 64. A reader who
+        # takes this for 0 will conclude the NoPE zero-width kernel paths are
+        # on this model's critical path; they are not.
         self.qk_rope_head_dim = config.qk_rope_head_dim + _ROPE_PAD
         self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         self.v_head_dim = config.v_head_dim
