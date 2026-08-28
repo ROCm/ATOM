@@ -99,6 +99,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FUSED_COMPRESS_USE_FLYDSL": lambda: os.getenv(
         "ATOM_FUSED_COMPRESS_USE_FLYDSL", "auto"
     ).lower(),
+    # gfx1250 wo_a grouped LoRA: flydsl a8w4 batched GEMM instead of BF16 einsum.
+    "ATOM_WO_A_USE_FLYDSL": lambda: os.getenv("ATOM_WO_A_USE_FLYDSL", "0") == "1",
     # QK-norm-rope-cache-quant fusion for Qwen3 dense and MoE; disabled by default.
     "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION", "0") == "1"
