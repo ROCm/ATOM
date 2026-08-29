@@ -4,12 +4,13 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from import_guard import skip_if_dependency_missing
 
 try:
     # aiter/triton absent under bare non-GPU pytest
     import atom.model_ops.moe as moe_mod
-except Exception as exc:  # noqa: BLE001
-    pytest.skip(f"requires full atom import env: {exc}", allow_module_level=True)
+except ImportError as exc:
+    skip_if_dependency_missing(exc, "requires full atom import env")
 
 
 def test_mega_method_is_mxfp4_specialization():
@@ -133,10 +134,11 @@ def test_mega_eplb_views_are_expert_major_aliases():
         _mega_w1_scale=torch.arange(12),
         _mega_w2=torch.arange(36),
         _mega_w2_scale=torch.arange(8),
+        local_num_experts=4,
     )
     method = object.__new__(moe_mod.MegaMxfp4MoEMethod)
 
-    views = method.get_eplb_weight_views(layer, 4)
+    views = method.get_eplb_weight_views(layer)
 
     assert [tuple(view.shape) for view in views] == [(4, 6), (4, 3), (4, 9), (4, 2)]
     views[0][2, 1] = -1
@@ -149,8 +151,77 @@ def test_mega_eplb_views_reject_non_expert_major_storage():
         _mega_w1_scale=torch.arange(12),
         _mega_w2=torch.arange(36),
         _mega_w2_scale=torch.arange(8),
+        local_num_experts=4,
     )
     method = object.__new__(moe_mod.MegaMxfp4MoEMethod)
 
     with pytest.raises(RuntimeError, match="evenly divisible"):
-        method.get_eplb_weight_views(layer, 4)
+        method.get_eplb_weight_views(layer)
+
+
+def test_mega_eplb_views_include_shared_expert():
+    layer = SimpleNamespace(
+        _mega_w1=torch.arange(30),
+        _mega_w1_scale=torch.arange(15),
+        _mega_w2=torch.arange(45),
+        _mega_w2_scale=torch.arange(10),
+        local_num_experts=5,
+    )
+    method = object.__new__(moe_mod.MegaMxfp4MoEMethod)
+
+    views = method.get_eplb_weight_views(layer)
+
+    assert [tuple(view.shape) for view in views] == [(5, 6), (5, 3), (5, 9), (5, 2)]
+    assert torch.equal(views[0], layer._mega_w1.view(5, -1))
+
+
+def test_mega_rejects_the_legacy_shared_expert_fusion(monkeypatch):
+    monkeypatch.setattr(
+        moe_mod, "get_current_atom_config", lambda: SimpleNamespace(moe_backend="mega")
+    )
+    layer = SimpleNamespace(
+        quant_method=object.__new__(moe_mod.MegaMxfp4MoEMethod),
+        expert_layout=SimpleNamespace(mode=moe_mod.SharedExpertMode.LEGACY_AITER),
+    )
+
+    with pytest.raises(NotImplementedError, match="dispatch space"):
+        moe_mod.FusedMoE._validate_moe_backend(layer)
+
+    layer.expert_layout.mode = moe_mod.SharedExpertMode.LOCAL_REPLICA
+    moe_mod.FusedMoE._validate_moe_backend(layer)
+    layer.expert_layout.mode = moe_mod.SharedExpertMode.EPLB_ROUTED
+    moe_mod.FusedMoE._validate_moe_backend(layer)
+
+
+def test_mega_backend_uses_global_dispatch_width(monkeypatch):
+    from atom.model_ops.fused_moe import flydsl_mega_experts as mega_module
+
+    captured = {}
+
+    def fake_run(_layer, _hidden, _weights, _ids, **kwargs):
+        captured.update(kwargs)
+        return "output"
+
+    monkeypatch.setattr(mega_module, "run_mega_moe", fake_run)
+    layer = SimpleNamespace(
+        _mega_w1=torch.empty(33, 1),
+        local_num_experts=33,
+        swiglu_limit=0.0,
+    )
+    backend = mega_module.MegaFusedExperts(
+        layer,
+        model_dim=16,
+        inter_dim=8,
+        mtpr=256,
+    )
+
+    output = backend(
+        hidden_states="hidden",
+        topk_weights="weights",
+        topk_ids=SimpleNamespace(shape=(1, 9)),
+        global_num_experts=264,
+    )
+
+    assert output == "output"
+    assert captured["experts"] == 264
+    assert captured["topk"] == 9

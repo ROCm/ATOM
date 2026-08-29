@@ -14,6 +14,7 @@ import torch
 from aiter.dist.parallel_state import get_tp_group
 from torch import nn
 
+from atom.config import DCPConfig
 from atom.distributed.dcp_utils import get_dcp_rank, get_dcp_world_size
 from atom.model_engine.page_unit_checkpoint import (
     CheckpointRestoreOp,
@@ -23,7 +24,8 @@ from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.state_runtime import StateTransfer
 from atom.model_ops.attention_mla import MLAModules
 from atom.model_ops.attentions.sub_pool_spec import SubPoolSpec
-from atom.utils import CpuGpuBuffer
+from atom.model_ops.dcp_ops import dcp_local_index, dcp_owner_rank
+from atom.utils import CpuGpuBuffer, pack_rows
 from atom.utils.forward_context import AttentionMetaData, AttnState
 from atom.utils.tbo.ubatch_splitting import (
     UBatchSlice,
@@ -103,6 +105,36 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
     def build(self, batch: ScheduledBatch, bs: int):
         raise NotImplementedError
 
+    def prepare_mtp_decode(
+        self,
+        bs: int,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        positions: torch.Tensor,
+        only_update: bool = False,
+        num_reject_tokens: torch.Tensor | None = None,
+    ):
+        """Rebuild this backend's metadata for one serial-draft mid-step.
+
+        The draft runs one row per sequence, and `positions` is that row buffer
+        -- so `positions.shape[-1]` is this step's `running_bs`, and it is what
+        every shape here follows. The `bs` argument is the `scheduled_bs`: the
+        count of those rows that carry a real sequence. They are equal whenever
+        nothing is padded, and an override must read the buffer rather than the
+        argument, because a drafter may run the wider batch the target just ran.
+
+        The LAST axis, not the first: MRoPE positions are `[3, N]` (the token
+        axis is last), and every other layout is `[N]`, where the two agree.
+
+        Backends that distinguish the two mark the padded tail so downstream
+        kernels skip it; those that do not simply never read `bs`, the same way
+        most ignore `only_update` / `num_reject_tokens`.
+
+        Returns per-forward metadata the caller installs on `attn_metadata`;
+        `{}` when the backend mutates it in place.
+        """
+        raise NotImplementedError
+
     @abstractmethod
     def build_for_cudagraph_capture(self, bs: int) -> AttentionMetaData:
         raise NotImplementedError
@@ -144,8 +176,54 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         return {}
 
     def state_transfer(self) -> StateTransfer:
-        """Declare this backend's per-request state checkpoint capability."""
+        """How this backend hands one request's state to another slot.
+
+        A checkpoint is the state as of some boundary, kept where a later
+        request can resume from it, so every backend with per-request state has
+        to say how one gets there. There are three answers:
+
+        `StateTransfer.fork(n)` — the state rolls and is not one range to
+        duplicate, so the old slot goes to the index and the request takes a
+        fresh one, reading the old and writing the new for exactly one forward.
+        That forward has to leave the new slot self-contained (a single read
+        index cannot span both), which takes `n` *committed* tokens.
+        `BlockManager` walks a checkpoint/hit point back to the previous block
+        boundary until it fits. Run by `StateSlotPool`.
+
+        `StateTransfer.copy(layout_id)` — one request's state is a contiguous
+        byte range, so the checkpoint is a duplicate of it and the owner is left
+        alone. No forward is bound and no boundary is disqualified for lack of
+        room, which is what makes a decode boundary checkpointable at all: a
+        decode step commits `1 + accepted_drafts` tokens and acceptance is not
+        knowable when the checkpoint has to be decided. Run by
+        `PagedStateCheckpointCoordinator`, which stores the image in PAGE units
+        rather than in a state slot; `layout_id` is what keeps a stored image
+        and the running geometry in agreement.
+
+        `StateTransfer.none()` (default) — no per-request state, or none that can
+        be handed over; the checkpoint index stays empty and prefix hits shrink
+        to 0 for its models.
+
+        `fork` and `copy` each take a second and independent argument,
+        `readable_midstep`: can this backend snapshot a boundary *inside* a
+        forward, or only at the forward's last token? False, the default, makes
+        `BlockManager` shorten a prefill chunk onto every checkpoint position —
+        one forward per rung. True says those positions can be read out of
+        intermediates the kernel already materializes, so the chunk runs full
+        length and the backend owes `write_state_checkpoints` instead.
+        """
         return StateTransfer.none()
+
+    def checkpoint_image_bytes(self) -> int | None:
+        """Bytes of an Active Slot a checkpoint image has to hold.
+
+        `None` means all of them: the safe answer, and the one a backend that
+        has not worked out which of its bytes a resumer skips should keep
+        giving. A backend returns less only when it can name bytes no resumer
+        reads — for a ring whose next reader starts exactly at the checkpoint
+        boundary, that is the whole ring.
+        """
+        return None
 
     def relocate_state_slots(self, pairs: Sequence[tuple[int, int]]) -> None:
         """Move live state between contiguous Active Slots."""
@@ -164,6 +242,16 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
             raise NotImplementedError(
                 f"{type(self).__name__} does not implement PAGE-backed state copy"
             )
+
+    def warmup_per_req_cache(self) -> None:
+        """Pay whatever the first checkpoint copy would pay, before serving.
+
+        Called once by ModelRunner after `allocate_per_req_cache`'s pools are
+        installed, which is the earliest a backend can reach its own addresses.
+        Nothing else warms this path: `execute_paged_state_copies` runs only
+        from `build()`, so a backend that compiles a kernel or fills a cache
+        there does it inside a live request's batch. A no-op by default.
+        """
 
     def get_kv_transfer_tensors(self) -> "KVTransferTensors | None":
         """Return RDMA transfer regions for PD disaggregation.
@@ -233,11 +321,24 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         hf_config = config.hf_config
         self.dcp_world_size = get_dcp_world_size()
         self.dcp_rank = get_dcp_rank()
+        # DCP KV-cache interleave granularity S (1 = token-level round-robin).
+        self.cp_kv_cache_interleave_size = getattr(
+            config, "dcp_config", DCPConfig()
+        ).interleave_size
         self.max_num_batched_tokens = model_runner.max_num_batched_tokens
         self.max_bs = model_runner.max_bs
+        # Every row's own index, resident so no step rebuilds it. One buffer for
+        # three readers that each want the same numbers: a cu_seqlens ramp at one
+        # token per sequence (hence `+ 1`), the real prefix a padded
+        # `batch_id_per_token` is restored from, and DSpark's token -> request map.
+        self.row_ids = torch.arange(
+            self.max_bs + 1, device=self.device, dtype=torch.int32
+        )
         self.max_num_blocks_per_seq = (
             config.max_model_len + self.block_size - 1
         ) // self.block_size
+        # Width of every `block_tables` buffer, and of anything gathered from one.
+        self.block_table_cols = self.max_num_blocks_per_seq // self.block_ratio
         # Per-rank attention head count. eagle.propose's mid-step path reads
         # this to gate the `do_attn_metadata_update` branch. Subclasses that
         # need a kernel-minimum-padded count set `self.padded_num_attention_heads`
@@ -253,9 +354,7 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             "slot_mapping": CpuGpuBuffer(self.max_num_batched_tokens, **i64_kwargs),
             "context_lens": CpuGpuBuffer(self.max_bs, **i32_kwargs),
             "block_tables": CpuGpuBuffer(
-                self.max_bs,
-                self.max_num_blocks_per_seq // self.block_ratio,
-                **i32_kwargs,
+                self.max_bs, self.block_table_cols, **i32_kwargs
             ),
             "cu_seqlens_q": CpuGpuBuffer(self.max_bs + 1, **i32_kwargs),
             "cu_seqlens_k": CpuGpuBuffer(self.max_bs + 1, **i32_kwargs),
@@ -272,12 +371,15 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         self.model_runner.forward_vars.update(attn_metadata)
         self.has_sliding_window = hasattr(hf_config, "sliding_window")
 
-    def prepare_block_tables(self, batch: ScheduledBatch):
+    def prepare_block_tables(self, batch: ScheduledBatch, limit: int | None = None):
+        """Marshal the batch's block tables into `forward_vars["block_tables"]`.
+
+        `limit` caps how many rows are taken, for callers scheduling fewer
+        sequences than the batch carries.
+        """
         var = self.model_runner.forward_vars
-        block_tables = var["block_tables"].np
-        for i, block_table in enumerate(batch.block_tables):
-            block_tables[i] = 0
-            block_tables[i, : len(block_table)] = block_table
+        rows = batch.block_tables if limit is None else batch.block_tables[:limit]
+        pack_rows(var["block_tables"].np, rows)
 
     def _mrope_cpu_view(self, num_tokens: int) -> np.ndarray:
         return (
@@ -374,12 +476,17 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             block_table = batch.block_tables[i]
             block_size = self.model_runner.block_size
             if self.dcp_world_size > 1:
-                virtual_block_size = block_size * self.dcp_world_size
+                W = self.dcp_world_size
+                S = self.cp_kv_cache_interleave_size
+                virtual_block_size = block_size * W
                 for pos in range(cached_seqlen, seqlen):
-                    vb_offset = pos % virtual_block_size
-                    if vb_offset % self.dcp_world_size == self.dcp_rank:
+                    # Block-level interleave: token pos is owned by rank
+                    # (pos//S)%W at local index (pos//(S*W))*S + pos%S. S=1 is the
+                    # original round-robin. blk_idx = pos // (block_size*W) equals
+                    # local_index // block_size (needs block_size % S == 0).
+                    if dcp_owner_rank(pos, W, S) == self.dcp_rank:
                         blk_idx = pos // virtual_block_size
-                        local_offset = vb_offset // self.dcp_world_size
+                        local_offset = dcp_local_index(pos, W, S) % block_size
                         slot_mapping.append(
                             block_table[blk_idx] * block_size + local_offset
                         )
@@ -468,11 +575,11 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         self,
         attn_metadata: AttentionMetaData,
         ub_slice: UBatchSlice,
-        padded_bs: int,
+        running_bs: int,
         ubatch_idx: int = 0,
     ) -> AttentionMetaData:
         del ubatch_idx  # only used by builders with per-ubatch plan buffers
-        return split_attn_metadata(attn_metadata, ub_slice, padded_bs)
+        return split_attn_metadata(attn_metadata, ub_slice, running_bs)
 
     def _attach_tbo_prefill_cpu_lens(
         self, attn_metadata: AttentionMetaData, bs: int

@@ -17,4 +17,6 @@ KVConnectorFactory.register(
     worker_class="LMCacheOffloadConnector",
     scheduler_module="atom.kv_transfer.offload.connector",
     scheduler_class="LMCacheOffloadConnectorScheduler",
+    aliases=("LMCacheOffloadConnector", "LMCacheConnectorV1"),
+    requires_pd_staging=False,
 )

@@ -136,11 +136,19 @@ def _v4_state_layout(vllm_config, kv_fp8: bool):
             torch.float32,
             float("-inf"),
         ),
+        # `in_checkpoint=False` for the same reason the native list says so
+        # (`deepseek_v4_attn._state_fields`): HCA pools `[P, P + 128)` with no
+        # overlap, so a checkpoint boundary owes it nothing. This list does not
+        # price an image today — only `plan_field_planes`, which ignores the
+        # flag, reads it — but two declarations of one layout disagreeing about
+        # the one rule `layout_id` fences is exactly what that fence cannot
+        # catch, since the id is derived from the native list alone.
         StateField(
             "hca_main_kv",
             n_hca,
             (128 + ring_extra, head_dim),
             torch.float32,
+            in_checkpoint=False,
         ),
         StateField(
             "hca_main_score",
@@ -148,6 +156,7 @@ def _v4_state_layout(vllm_config, kv_fp8: bool):
             (128 + ring_extra, head_dim),
             torch.float32,
             float("-inf"),
+            in_checkpoint=False,
         ),
     ]
     row_widths = [head_dim * (1 if kv_fp8 else 2)]
@@ -828,10 +837,10 @@ class _V4DecodeMetaBuffers:
             make_compress_plans as _mcp,
         )
 
-        # Decode CG plan slicing is `graph_bs * per_seq_bound` (computed inside
-        # make_compress_plans from these two scalars). graph_bs == num_slots
+        # Decode CG plan slicing is `running_bs * per_seq_bound` (computed inside
+        # make_compress_plans from these two scalars). running_bs == num_slots
         # (padded decode batch); max_q_len == 1 + max_spec_steps.
-        self.decode_graph_bs = S
+        self.decode_running_bs = S
         self.decode_q_len = max(1, T // S)
         self.plan_buffers: dict[int, dict] = {}
         for ratio, is_overlap in ratios_overlap:
@@ -1165,10 +1174,10 @@ def _make_compress_plans(
         ratios,
         plan_buffers=plan_buffers,
     )
-    # Eager path (graph_bs unset): make_compress_plans returns a full-buffer
+    # Eager path (running_bs unset): make_compress_plans returns a full-buffer
     # write slice (sentinel-padded). The eager bridge launches
     # update_compressor_states with exactly num_write rows, so re-slice down.
-    # Graph decode uses _make_decode_compress_plans (fixed graph_bs slice).
+    # Graph decode uses _make_decode_compress_plans (fixed running_bs slice).
     for plan in plans.values():
         plan.write_plan_gpu = plan.write_plan_gpu[: plan.num_write]
     return plans
@@ -1640,7 +1649,7 @@ def _make_decode_compress_plans(extend_lens_cpu, context_lens_cpu, bufs):
         np.ascontiguousarray(context_lens_cpu, dtype=np.int32),
         ratios_overlap,
         plan_buffers=bufs.plan_buffers,
-        graph_bs=bufs.decode_graph_bs,
+        running_bs=bufs.decode_running_bs,
         max_q_len=bufs.decode_q_len,
     )
 
@@ -2081,6 +2090,7 @@ def atom_deepseek_v4_forward_context(
     from atom.utils.forward_context import (
         Context,
         reset_forward_context,
+        running_tokens_from_bs,
         set_forward_context,
     )
 
@@ -2147,8 +2157,13 @@ def atom_deepseek_v4_forward_context(
         positions=positions,
         is_prefill=is_prefill,
         is_dummy_run=force_dummy or common_attn_metadata is None,
-        batch_size=batch_size,
-        graph_bs=batch_size,
+        scheduled_bs=batch_size,
+        # The rows this forward really runs -- what MoE will be handed.
+        scheduled_tokens=int(input_ids.shape[0]) if input_ids is not None else 0,
+        running_bs=batch_size,
+        running_tokens=running_tokens_from_bs(
+            batch_size, is_prefill=is_prefill, attn_metadata=attn_metadata
+        ),
         input_ids=input_ids,
     )
     set_forward_context(

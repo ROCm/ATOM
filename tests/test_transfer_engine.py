@@ -41,6 +41,7 @@ from atom.kv_transfer.disaggregation.kv_transfer_engine import (
     _RoleManager,
     set_role,
 )
+
 from atom.model_engine.sequence import Sequence
 from atom.utils import get_open_port, make_zmq_path
 
@@ -127,7 +128,7 @@ class TestMoRIIOWrapper:
         set_role(Role.PRODUCER)
         w = MoRIIOWrapper()
         w.done_remote_allocate_req_dict = {}
-        msg = f"{MoRIIOConstants.COMPLETION_PREFIX}:req-42".encode("utf-8")
+        msg = f"{MoRIIOConstants.COMPLETION_PREFIX}:req-42".encode()
         w._dispatch_message(msg)
         assert f"{MoRIIOConstants.COMPLETION_PREFIX}:req-42" in w.done_req_ids
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from types import SimpleNamespace
 from typing import Any
 
@@ -663,12 +664,22 @@ def install_deepseek_v4_proxy_pool_patch() -> None:
     """
 
     import sglang.srt.mem_cache.deepseek_v4_memory_pool as dsv4_pool
-    import sglang.srt.model_executor.model_runner_kv_cache_mixin as mixin
 
-    if getattr(mixin, "DeepSeekV4TokenToKVPool", None) is ATOMDeepSeekV4ProxyKVPool:
+    original_pool_cls = getattr(dsv4_pool, "DeepSeekV4TokenToKVPool", None)
+    if original_pool_cls is None:
+        raise RuntimeError("SGLang DeepSeekV4TokenToKVPool is not available")
+    if original_pool_cls is ATOMDeepSeekV4ProxyKVPool:
         return
-    mixin.DeepSeekV4TokenToKVPool = ATOMDeepSeekV4ProxyKVPool
+
+    dsv4_pool.DeepSeekV4TokenToKVPool = ATOMDeepSeekV4ProxyKVPool
     dsv4_pool.ATOMDeepSeekV4ProxyKVPool = ATOMDeepSeekV4ProxyKVPool
+
+    # SGLang 0.5.17 moved pool construction into mem_cache.kv_cache_configurator,
+    # which imports DeepSeekV4TokenToKVPool as a module-local symbol. Patch any
+    # already-loaded local aliases that still point at the original class.
+    for module in list(sys.modules.values()):
+        if getattr(module, "DeepSeekV4TokenToKVPool", None) is original_pool_cls:
+            module.DeepSeekV4TokenToKVPool = ATOMDeepSeekV4ProxyKVPool
 
 
 def _bind_compressor_state(
@@ -944,7 +955,7 @@ def _make_compress_plans(extend_lens_cpu, context_lens_cpu, device):
         [(4, True), (128, False)],
         plan_buffers=plan_buffers,
     )
-    # Eager path (graph_bs unset): full-buffer write slice; the eager bridge
+    # Eager path (running_bs unset): full-buffer write slice; the eager bridge
     # launches update_compressor_states with exactly num_write rows.
     for plan in plans.values():
         plan.write_plan_gpu = plan.write_plan_gpu[: plan.num_write]
@@ -1005,12 +1016,12 @@ class _V4SGLangDecodeGraphBuffers:
         self.idx_csa = i32(t * max(1, win + topk))
         self.idx_hca = i32(t * max(1, win + hca))
 
-        # Decode CG plan slicing is `graph_bs * per_seq_bound` (computed inside
-        # make_compress_plans). graph_bs == num_slots (padded decode batch);
+        # Decode CG plan slicing is `running_bs * per_seq_bound` (computed inside
+        # make_compress_plans). running_bs == num_slots (padded decode batch);
         # max_q_len == 1 + max_spec_steps (== max_decode_tokens // num_slots).
-        self.decode_graph_bs = s
+        self.decode_running_bs = s
         self.decode_q_len = max(1, t // s)
-        # Compress buffer sized to the graph_bs compress cap `s*ceil(qlen/ratio)`
+        # Compress buffer sized to the running_bs compress cap `s*ceil(qlen/ratio)`
         # (matches make_compress_plans' slice); write buffer to `s*K_pool`. Sizing
         # flat `s` would undersize the compress plan once ceil(qlen/ratio)>1 (mtp_k
         # >= 4). Mirrors the vllm bridge's `S*per_seq` sizing.
@@ -1126,7 +1137,7 @@ def _make_decode_graph_compress_plans(extend_lens_cpu, context_lens_cpu, bufs):
         np.ascontiguousarray(context_lens_cpu, dtype=np.int32),
         [(4, True), (128, False)],
         plan_buffers=bufs.plan_buffers,
-        graph_bs=bufs.decode_graph_bs,
+        running_bs=bufs.decode_running_bs,
         max_q_len=bufs.decode_q_len,
     )
 

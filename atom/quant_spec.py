@@ -97,6 +97,32 @@ def should_skip_online_quant(cur_type, cur_dtype, online_cfg) -> bool:
     )
 
 
+def should_stream_online_quant(
+    quant_config,
+    prefix: str,
+    source_quant_type,
+    source_quant_dtype,
+) -> bool:
+    """Return whether this source can be streamed to a distinct online target."""
+    # Attention stays in the post-load pass because MLA post-processing reads
+    # an already-loaded and processed kv_b_proj.
+    # Imported lazily to avoid a module-load cycle (envs/quark pull in config
+    # which can pull in quant_spec).
+    from atom.quantization.quark.utils import can_dequant_weight_online
+    from atom.utils import envs
+
+    if not envs.ATOM_ONLINE_QUANT_STREAMING:
+        return False
+    if quant_config is None or not getattr(quant_config, "online_quant", False):
+        return False
+    if not can_dequant_weight_online(source_quant_type, source_quant_dtype):
+        return False
+    online_cfg = quant_config.get_layer_quant_config(prefix, use_online_quant=True)
+    return not should_skip_online_quant(
+        source_quant_type, source_quant_dtype, online_cfg
+    )
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Structured parsed config
 # ──────────────────────────────────────────────────────────────────────
