@@ -102,6 +102,24 @@ def _dcp_local_slots(
     return torch.where(is_local, slots, pad_slot_id)
 
 
+def _keep_upstream_pads(
+    upstream_slots: "torch.Tensor", localized_slots: "torch.Tensor"
+) -> "torch.Tensor":
+    """Re-localize only the rows vLLM's kernel considers writable.
+
+    vLLM 0.28 stores ``PAD_SLOT_ID`` for rows that must not receive draft KV:
+    the rejected suffix of a speculative context span, and any row whose block
+    table entry is the null block (evicted / sliding-window padding). Those
+    decisions are about *whether* a row is writable at all, which the DCP
+    rewrite below has no business overturning -- recomputing a slot for them
+    would send draft KV into a live block, block 0 included. Only rows the
+    kernel already addressed get their slot moved into rank-local terms.
+    """
+    from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+
+    return torch.where(upstream_slots == PAD_SLOT_ID, upstream_slots, localized_slots)
+
+
 def apply_vllm_dspark_dcp_input_patch() -> None:
     """Make the DFlash/DSpark draft address the KV cache in per-rank terms.
 
@@ -173,16 +191,20 @@ def apply_vllm_dspark_dcp_input_patch() -> None:
             num_query_per_req,
             rounding_mode="floor",
         )
-        arg["query_slot_mapping"][:num_query_tokens].copy_(
-            _dcp_local_slots(
-                query_positions,
-                block_table,
-                query_req,
-                block_size,
-                cp_size,
-                cp_rank,
-                cp_interleave,
-                PAD_SLOT_ID,
+        query_slot_mapping = arg["query_slot_mapping"][:num_query_tokens]
+        query_slot_mapping.copy_(
+            _keep_upstream_pads(
+                query_slot_mapping,
+                _dcp_local_slots(
+                    query_positions,
+                    block_table,
+                    query_req,
+                    block_size,
+                    cp_size,
+                    cp_rank,
+                    cp_interleave,
+                    PAD_SLOT_ID,
+                ),
             )
         )
 
@@ -195,16 +217,20 @@ def apply_vllm_dspark_dcp_input_patch() -> None:
             torch.arange(num_context_tokens, device=context_positions.device),
             right=True,
         )
-        arg["context_slot_mapping"][:num_context_tokens].copy_(
-            _dcp_local_slots(
-                context_positions,
-                block_table,
-                context_req,
-                block_size,
-                cp_size,
-                cp_rank,
-                cp_interleave,
-                PAD_SLOT_ID,
+        context_slot_mapping = arg["context_slot_mapping"][:num_context_tokens]
+        context_slot_mapping.copy_(
+            _keep_upstream_pads(
+                context_slot_mapping,
+                _dcp_local_slots(
+                    context_positions,
+                    block_table,
+                    context_req,
+                    block_size,
+                    cp_size,
+                    cp_rank,
+                    cp_interleave,
+                    PAD_SLOT_ID,
+                ),
             )
         )
 
