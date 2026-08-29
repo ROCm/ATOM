@@ -270,6 +270,40 @@ jobs:
       CONTAINER_NAME: atom_test_${{ strategy.job-index }}
 
     steps:
+      - name: Prune stale Docker data on TW runners
+        if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'linux-atom-do-mi350x-8'
+        run: |
+          set -euo pipefail
+
+          runner_host="${RUNNER_NAME:-$(hostname)}"
+          case "${runner_host}" in
+            mia*|tw*|TW*)
+              ;;
+            *)
+              echo "Skipping stale Docker cleanup on non-TW runner: ${runner_host}"
+              exit 0
+              ;;
+          esac
+
+          if ! command -v docker >/dev/null 2>&1; then
+            echo "docker CLI is not available, skipping stale Docker cleanup"
+            exit 0
+          fi
+
+          docker_root="$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || true)"
+          docker_root="${docker_root:-/var/lib/docker}"
+          echo "Pruning Docker resources older than 30 days on TW runner: ${RUNNER_NAME:-$(hostname)}"
+          echo "Docker root: ${docker_root}"
+          df -h / "${docker_root}" || true
+          docker system df || true
+
+          docker container prune -f --filter "until=720h" || true
+          docker image prune -af --filter "until=720h" || true
+          docker builder prune -af --filter "until=720h" || true
+
+          docker system df || true
+          df -h / "${docker_root}" || true
+
       - name: Kill all Docker containers and clean up workspace
         if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'linux-atom-do-mi350x-8'
         run: |
@@ -667,7 +701,9 @@ jobs:
           # We should use non-root user to run the test to avoid this issue.
           set -x
           echo "========== Cleaning up workspace =========="
-          if [[ ${{ matrix.runner }} == atom-mi355-8gpu.predownload ]]; then
+          runner_label="${{ matrix.runner }}"
+          runner_host="${RUNNER_NAME:-$(hostname)}"
+          if [[ "${runner_label}" == "atom-mi355-8gpu.predownload" || "${runner_host}" == mia* || "${runner_host}" == tw* || "${runner_host}" == TW* ]]; then
             docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged rocm/pytorch:latest bash -lc "ls -la /workspace/ && find /workspace -mindepth 1 -delete" || true
           fi
           docker stop "$CONTAINER_NAME" || true
