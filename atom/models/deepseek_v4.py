@@ -48,7 +48,6 @@ from aiter.ops.batched_gemm_op_a8w8 import (
 )
 from aiter.ops.inverse_rope_group_quant import inverse_rope_group_quant
 from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
-from aiter.ops.flydsl import flydsl_fp8_mqa_logits as fp8_mqa_logits
 from aiter.ops.triton.fusions.fused_clamp_act_mul import (
     fused_clamp_act_mul,
 )
@@ -72,20 +71,12 @@ from atom.distributed.pcp_utils import (
     pcp_round_robin_split,
 )
 from atom.model_loader.loader import WeightsMapper
+from atom.model_ops.v4_indexer_utils import restore_cyclic_row_order
 
-
-def _restore_cyclic_row_order(
-    gathered: torch.Tensor,
-    world_size: int,
-    shard_rows: int,
-    total_rows: int,
-) -> torch.Tensor:
-    """Convert rank-major cyclic row shards back to the original row order."""
-    return (
-        gathered.view(world_size, shard_rows, -1)
-        .transpose(0, 1)
-        .reshape(world_size * shard_rows, -1)[:total_rows]
-    )
+if os.getenv("ATOM_DSV4_0731_OPTIMIZATIONS", "0") == "1":
+    from aiter.ops.flydsl import flydsl_fp8_mqa_logits as fp8_mqa_logits
+else:
+    from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 
 
 # Side-effect import: registers `torch.ops.aiter.maybe_dual_stream_forward`
@@ -1980,7 +1971,7 @@ class Indexer(nn.Module):
         gathered = tp_group.all_gather(padded, dim=0)
         # all_gather is rank-major; cyclic input rows must be transposed back
         # to token-major order. Tail padding is trimmed after interleaving.
-        return _restore_cyclic_row_order(
+        return restore_cyclic_row_order(
             gathered,
             tp_group.world_size,
             shard_rows,
