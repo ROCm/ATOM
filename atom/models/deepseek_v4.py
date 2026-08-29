@@ -42,7 +42,7 @@ from aiter.dist.parallel_state import (
 )
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.batched_gemm_op_a8w8 import batched_gemm_a8w8_mxscale
-from aiter.ops.inverse_rope_group_quant import inverse_rope_group_quant
+from atom.model_ops.aiter_compat import inverse_rope_group_quant
 from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.fusions.fused_clamp_act_mul import (
