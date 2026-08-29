@@ -29,6 +29,17 @@ class AiterMhaBackendForVllm:
     supported_dtypes: list = [torch.float16, torch.bfloat16]
     forward_includes_kv_cache_update: bool = True
 
+    @classmethod
+    def customize_spec(cls, spec):
+        """Adopt vLLM 0.28's post-hoc KV-spec hook without changing the spec.
+
+        These surfaces are duck-typed rather than derived from vLLM's
+        ``AttentionBackend``, so they do not inherit its default. vLLM calls
+        the hook while building KV cache specs; ATOM's kernels use the spec the
+        Attention layer already built.
+        """
+        return spec
+
     @staticmethod
     def get_name() -> str:
         return "CUSTOM"
@@ -146,6 +157,17 @@ class AiterMlaBackendForVllm:
     accept_output_buffer: bool = True
     supported_dtypes: list = [torch.float16, torch.bfloat16]
     forward_includes_kv_cache_update: bool = True
+
+    @classmethod
+    def customize_spec(cls, spec):
+        """Adopt vLLM 0.28's post-hoc KV-spec hook without changing the spec.
+
+        These surfaces are duck-typed rather than derived from vLLM's
+        ``AttentionBackend``, so they do not inherit its default. vLLM calls
+        the hook while building KV cache specs; ATOM's kernels use the spec the
+        Attention layer already built.
+        """
+        return spec
 
     @staticmethod
     def get_name() -> str:
@@ -408,6 +430,17 @@ class MiniMaxM3SparseAttentionBackend:
     supported_kv_cache_dtypes: list = ["bfloat16", "fp8", "fp8_e4m3"]
     forward_includes_kv_cache_update: bool = True
 
+    @classmethod
+    def customize_spec(cls, spec):
+        """Adopt vLLM 0.28's post-hoc KV-spec hook without changing the spec.
+
+        These surfaces are duck-typed rather than derived from vLLM's
+        ``AttentionBackend``, so they do not inherit its default. vLLM calls
+        the hook while building KV cache specs; ATOM's kernels use the spec the
+        Attention layer already built.
+        """
+        return spec
+
     @staticmethod
     def get_name() -> str:
         return "MINIMAX_M3_SPARSE"
@@ -571,6 +604,17 @@ class SparseMHAIndexerBackend(AiterMlaBackendForVllm):
 
 
 class GDNAttentionBackend:
+    @classmethod
+    def customize_spec(cls, spec):
+        """Adopt vLLM 0.28's post-hoc KV-spec hook without changing the spec.
+
+        These surfaces are duck-typed rather than derived from vLLM's
+        ``AttentionBackend``, so they do not inherit its default. vLLM calls
+        the hook while building KV cache specs; ATOM's kernels use the spec the
+        Attention layer already built.
+        """
+        return spec
+
     @staticmethod
     def get_name() -> str:
         return "ROCM_GDN_ATTENTION"
