@@ -51,6 +51,7 @@ from .sub_pool_spec import SubPoolSpec, page_pool
 
 logger = logging.getLogger("atom")
 
+
 # `max_split_per_batch` is only needed (and only exists in newer aiter builds)
 # for the segmented page_size>1 MLA path. Detect support once so the default
 # page_size=1 path never passes an unsupported kwarg.
@@ -1975,7 +1976,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
     ):
         scheduled_bs = batch.total_seqs_num_decode
         dropout_p = 0.0
-
         var = self.model_runner.forward_vars
         context_lens = np.asarray(batch.context_lens, dtype=np.int32)
         block_tables = batch.block_tables

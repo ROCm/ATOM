@@ -160,6 +160,7 @@ class ScheduledBatch:
         is_final_chunk: list[bool] | None = None,
         next_token_ids: list[int] | None = None,
         state_maintenance_ops: StateMaintenanceOps | None = None,
+        is_first_decode_without_local_prefill: list[bool] | None = None,
     ):
         if scheduled_spec_decode_tokens is None:
             scheduled_spec_decode_tokens = {}
@@ -233,9 +234,14 @@ class ScheduledBatch:
             dtype=bool,
         )
 
-        self.is_first_decode_without_local_prefill = [
-            seq.is_first_decode for seq in seqs.values()
-        ]
+        self.is_first_decode_without_local_prefill = (
+            [seq.is_first_decode for seq in seqs.values()]
+            if is_first_decode_without_local_prefill is None
+            else list(is_first_decode_without_local_prefill)
+        )
+        assert len(self.is_first_decode_without_local_prefill) == len(seqs), (
+            "first-decode flags must align with scheduled sequences"
+        )
         self.mrope_positions_by_req = {
             seq.id: seq.mrope_positions
             for seq in seqs.values()
@@ -3642,6 +3648,13 @@ class DecodeScheduler(Scheduler):
         if seq is not None:
             seq.num_cached_tokens = num_tokens_computed
             seq.append_token(sampled_token_id)
+            seq.is_first_decode = True
+            # Decode schedules a full target verification window.  The remote
+            # prefill producer normally sends only T0, so pad the missing draft
+            # positions exactly as the monolithic P/D handoff does.  Without
+            # this, the trailing mtp_k+1 slice reaches back into prompt tokens.
+            for _ in range(self.mtp_k):
+                seq.append_token(self.eos_token_id)
             seq.first_token_time = time.time()
             self.prefill_done.append(seq)
 
@@ -3686,6 +3699,7 @@ class DecodeScheduler(Scheduler):
         scheduled_seqs: dict[int, Sequence] = {}
         num_scheduled_tokens: list[int] = []
         scheduled_spec_decode_tokens: dict[int, np.ndarray] = {}
+        first_decode_flags: list[bool] = []
 
         with self._prefill_lock:
             while self.running and len(scheduled_seqs) < self.max_num_seqs:
@@ -3706,6 +3720,10 @@ class DecodeScheduler(Scheduler):
                     num_new_tokens = self.mtp_k + 1
                     self.block_manager.may_append(seq, num_new_tokens)
                     scheduled_seqs[seq.id] = seq
+                    is_first_decode = bool(seq.is_first_decode)
+                    first_decode_flags.append(is_first_decode)
+                    if is_first_decode:
+                        seq.is_first_decode = False
                     seq.type = SequenceType.DECODE
                     num_scheduled_tokens.append(num_new_tokens)
 
@@ -3741,6 +3759,7 @@ class DecodeScheduler(Scheduler):
                 scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
                 cu_stream_fraction=self.cu_fraction,
                 state_maintenance_ops=self.block_manager.take_state_maintenance_ops(),
+                is_first_decode_without_local_prefill=first_decode_flags,
             ),
             scheduled_seqs,
         )

@@ -6,7 +6,7 @@ import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
 from enum import Enum
-from typing import Any, Union
+from typing import Any, Collection, Union
 
 import numpy as np
 import torch
@@ -237,6 +237,7 @@ class ForwardMode:
         tbo_on: bool,
         local_tbo: tuple[bool, bool, int, int],
         max_seqlen_q: int,
+        graph_shapes: Collection[tuple[int, int]] | None = None,
     ) -> "ForwardMode":
         """Run the step's DP collective and settle its shape from the result.
 
@@ -308,7 +309,23 @@ class ForwardMode:
         # Whether the TARGET replays. It no longer decides how wide anything
         # is; when the batch answered four ways depending on this, `running_bs`
         # was per-rank on two of them and every consumer had to know which.
-        use_cudagraph = not is_prefill and unified and not enforce_eager and on_ladder
+        #
+        # The ladder answers the batch question alone, but a recording is keyed
+        # by `(running_bs, max_seqlen_q)`. A runner can own an MTP drafter while
+        # running a target-only q=1 forward -- notably a P/D prefill producer,
+        # which hands off after T0 and never proposes -- and capture may hold
+        # only the q=mtp_k+1 shapes. Being on the ladder would then claim a
+        # recording nobody made at this width.
+        shape_captured = (
+            graph_shapes is None or (running_bs, max_seqlen_q) in graph_shapes
+        )
+        use_cudagraph = (
+            not is_prefill
+            and unified
+            and not enforce_eager
+            and on_ladder
+            and shape_captured
+        )
 
         running_tokens, piecewise_captured = cls._running_tokens(
             is_prefill=is_prefill,

@@ -481,7 +481,6 @@ class tokenIDProcessor:
         GPU need to be copied into the corresponding slots into input_ids.
         """
         scheduled_tokens = batch.scheduled_tokens  # tokens per req
-        total_tokens = batch.total_tokens_num
         total_tokens_prefill = batch.total_tokens_num_prefill
         total_tokens_decode = batch.total_tokens_num_decode
         total_reqs_prefill = batch.total_seqs_num_prefill
@@ -519,9 +518,9 @@ class tokenIDProcessor:
                 and batch.num_spec_step > 0
                 and getattr(batch, "dynamic_spec_query_tokens_per_req", None) is None
             ):
-                self.input_ids.np[:total_tokens_decode].reshape(
-                    -1, int(batch.num_spec_query_tokens)
-                )[:, 1:] = batch.scheduled_spec_decode_tokens
+                self.input_ids.np[:total_tokens_decode].reshape(-1, max_seqlen_q)[
+                    :, 1:
+                ] = batch.scheduled_spec_decode_tokens
             return self.input_ids.copy_to_gpu(total_tokens_decode)
 
         # PD consumer first decode: no prior prefill step initialized
@@ -624,7 +623,11 @@ class tokenIDProcessor:
         if fill_to > total:
             self.input_ids.gpu[total:fill_to].zero_()
 
-        input_ids = self.input_ids.gpu[:total_tokens]
+        # `total` is the flat decode width this path actually staged.  It can
+        # differ from the scheduler's original total after a worker-side
+        # speculative q shrink, so slicing by `total_tokens` can silently drop
+        # draft rows and leave attention metadata wider than input_ids.
+        input_ids = self.input_ids.gpu[:total]
         return input_ids
 
     def prepare_draft_ids(
@@ -2638,6 +2641,15 @@ class ModelRunner:
             tbo_on=self.config.enable_tbo,
             local_tbo=self._local_tbo_eligibility(batch),
             max_seqlen_q=(batch.num_spec_step + 1 if shrunk_q is None else shrunk_q),
+            graph_shapes=(
+                None
+                if (
+                    self.enforce_eager
+                    or self._piecewise_cg_active()
+                    or not hasattr(self, "graphs")
+                )
+                else self.graphs.keys()
+            ),
         )
         # Stash the DP-wide prefill OR for the EPLB prefill gate; reused free by
         # on_forward_pass_end when the DP group == the migration (EP) group.
