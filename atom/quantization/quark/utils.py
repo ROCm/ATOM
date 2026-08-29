@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Iterable
 from typing import Any
 
@@ -8,7 +9,7 @@ import regex as re
 import torch
 import triton
 import triton.language as tl
-from aiter import QuantType
+from aiter import QuantType, dtypes
 
 _FP8_SOURCE_DTYPES = frozenset(
     {
@@ -255,9 +256,23 @@ def dequant_weight_online(
     if source_quant_type == QuantType.No:
         return weight
 
-    # Reject any non-8-bit source up front. The element dtype -- not just the
-    # block layout -- decides whether we can dequantize: MXFP4 (fp4x2) shares
-    # the per_1x32 layout with MXFP8 but is a target-only format.
+    is_mxfp4_source = source_quant_dtype == dtypes.fp4x2
+    enable_mxfp4_source = os.environ.get(
+        "ATOM_ENABLE_MXFP4_SOURCE_ONLINE_QUANT", "0"
+    ).lower() in {"1", "true", "yes", "on"}
+    if is_mxfp4_source and enable_mxfp4_source:
+        if source_quant_type != QuantType.per_1x32:
+            raise ValueError(
+                f"MXFP4 source requires per_1x32, got {source_quant_type}"
+            )
+        from aiter.ops.triton.moe.quant_moe import upcast_from_mxfp
+
+        output_dtype = torch.get_default_dtype()
+        if output_dtype not in (torch.float16, torch.bfloat16):
+            output_dtype = torch.bfloat16
+        return upcast_from_mxfp(
+            weight.view(torch.uint8), weight_scale, output_dtype, axis=-1
+        )
     if source_quant_dtype is not None and source_quant_dtype not in _FP8_SOURCE_DTYPES:
         raise ValueError(
             f"Unsupported online dequant source dtype={source_quant_dtype} "

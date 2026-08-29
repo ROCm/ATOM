@@ -38,13 +38,14 @@ from aiter import (
 )
 from aiter import silu_and_mul as aiter_silu_and_mul
 from aiter.dist.parallel_state import (
+    get_tp_group,
     get_tensor_model_parallel_world_size,
 )
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.batched_gemm_op_a8w8 import batched_gemm_a8w8_mxscale
 from aiter.ops.inverse_rope_group_quant import inverse_rope_group_quant
 from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
-from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
+from aiter.ops.flydsl import flydsl_fp8_mqa_logits as fp8_mqa_logits
 from aiter.ops.triton.fusions.fused_clamp_act_mul import (
     fused_clamp_act_mul,
 )
@@ -68,6 +69,21 @@ from atom.distributed.pcp_utils import (
     pcp_round_robin_split,
 )
 from atom.model_loader.loader import WeightsMapper
+
+
+def _restore_cyclic_row_order(
+    gathered: torch.Tensor,
+    world_size: int,
+    shard_rows: int,
+    total_rows: int,
+) -> torch.Tensor:
+    """Convert rank-major cyclic row shards back to the original row order."""
+    return (
+        gathered.view(world_size, shard_rows, -1)
+        .transpose(0, 1)
+        .reshape(world_size * shard_rows, -1)[:total_rows]
+    )
+
 
 # Side-effect import: registers `torch.ops.aiter.maybe_dual_stream_forward`
 # (shared with deepseek_v2) and `torch.ops.aiter.indexer_score_topk` (V4-only).
@@ -697,6 +713,16 @@ def make_v4_quant_config(hf_config, model_path=None, online_quant_config=None):
         # dequant→requant round-trip for these layers (which would either
         # crash on the moe assert or further damage already-quantized weights).
         if ".ffn.experts" in layer_name:
+            if use_online_quant and os.environ.get(
+                "ATOM_ENABLE_MXFP4_SOURCE_ONLINE_QUANT", "0"
+            ).lower() in {"1", "true", "yes", "on"}:
+                online_spec = orig_lookup(
+                    layer_name,
+                    use_online_quant=True,
+                    check_children=check_children,
+                )
+                if online_spec.quant_type != QuantType.No:
+                    return online_spec
             return routed_spec
         # BF16 / fp32 raw paths
         if (
@@ -1774,6 +1800,8 @@ class Indexer(nn.Module):
         Returns ``[total_tokens, topk]`` int32 (raw kernel output; caller remaps).
         """
         topk_out = torch.empty((total_tokens, topk), dtype=torch.int32, device=device)
+        if total_tokens == 0:
+            return topk_out
         budget_bytes = SPARSE_INDEXER_LOGITS_BUDGET_MB * 1024 * 1024
         if (
             budget_bytes > 0
@@ -1826,6 +1854,34 @@ class Indexer(nn.Module):
         """
         device = q_fp8.device
         total_tokens = q_fp8.size(0)
+        # The V4 indexer is replicated across tensor-parallel ranks.  During
+        # prefill every rank therefore used to score and radix-select the same
+        # query rows.  Shard rows (not heads/columns) so each row's exact top-k
+        # remains local, then all-gather only the int32 indices.  This avoids an
+        # all-reduce of the much larger dense fp32 logits matrix.
+        tp_group = get_tp_group()
+        row_shard = (
+            os.getenv("ATOM_INDEXER_PREFILL_ROW_SHARD", "0") == "1"
+            and tp_group.world_size > 1
+        )
+        global_total_tokens = total_tokens
+        shard_rows = total_tokens
+        row_indices = None
+        if row_shard:
+            shard_rows = (total_tokens + tp_group.world_size - 1) // tp_group.world_size
+            # Cyclic rows balance causal-window work across ranks. Contiguous
+            # quarters make the last rank own systematically longer windows,
+            # turning the following collective into a multi-ms wait.
+            row_indices = torch.arange(
+                tp_group.rank_in_group,
+                total_tokens,
+                tp_group.world_size,
+                dtype=torch.int64,
+                device=device,
+            )
+            q_fp8 = q_fp8[row_indices]
+            weights = weights[row_indices]
+            total_tokens = row_indices.numel()
         # K side: cache stores FP8 + 4-byte fp32 scale per row interleaved
         # (uint8 layout written by `indexer_k_quant_and_cache` from the inner
         # Compressor). `cp_gather_indexer_k_quant_cache` does paged-gather
@@ -1846,8 +1902,11 @@ class Indexer(nn.Module):
             preshuffle=True,
         )
 
-        cu_starts = indexer_meta["cu_starts_gpu"]  # [total_tokens] int32
-        cu_ends = indexer_meta["cu_ends_gpu"]  # [total_tokens] int32
+        cu_starts = indexer_meta["cu_starts_gpu"]
+        cu_ends = indexer_meta["cu_ends_gpu"]
+        if row_shard:
+            cu_starts = cu_starts[row_indices]
+            cu_ends = cu_ends[row_indices]
 
         # aiter `top_k_per_row_prefill` (radix kernel, parametric `k` via the
         # pybind kwarg). Honors per-row [cu_starts[i], cu_ends[i]) so cells
@@ -1885,14 +1944,36 @@ class Indexer(nn.Module):
             device=device,
             score_chunk=_score,
         )
-        seq_base = indexer_meta["seq_base_per_token_gpu"].unsqueeze(
-            1
-        )  # [total_tokens, 1] int32
-        return torch.where(
+        seq_base_all = indexer_meta["seq_base_per_token_gpu"]
+        seq_base = (
+            seq_base_all[row_indices] if row_shard else seq_base_all
+        ).unsqueeze(1)
+        topk_local = torch.where(
             topk_global < 0,
             topk_global,  # preserve -1 sentinel
             topk_global - seq_base,
         )  # [total_tokens, topk] int32, raw seq-local with -1 in tail
+        if not row_shard:
+            return topk_local
+
+        # Group collectives require an equal input shape on every rank.  Pad
+        # only the final rank's tail, gather in rank-major row order, then trim.
+        if total_tokens < shard_rows:
+            padded = torch.full(
+                (shard_rows, topk), -1, dtype=torch.int32, device=device
+            )
+            padded[:total_tokens].copy_(topk_local)
+        else:
+            padded = topk_local.contiguous()
+        gathered = tp_group.all_gather(padded, dim=0)
+        # all_gather is rank-major; cyclic input rows must be transposed back
+        # to token-major order. Tail padding is trimmed after interleaving.
+        return _restore_cyclic_row_order(
+            gathered,
+            tp_group.world_size,
+            shard_rows,
+            global_total_tokens,
+        )
 
     def _score_topk_decode(
         self,
