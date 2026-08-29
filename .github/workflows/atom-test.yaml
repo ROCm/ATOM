@@ -270,7 +270,7 @@ jobs:
       CONTAINER_NAME: atom_test_${{ strategy.job-index }}
 
     steps:
-      - name: Prune stale Docker data on TW runners
+      - name: Prune stale Docker data on self-hosted GPU runners
         if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'linux-atom-do-mi350x-8'
         run: |
           set -euo pipefail
