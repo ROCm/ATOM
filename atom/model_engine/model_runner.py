@@ -508,7 +508,6 @@ class tokenIDProcessor:
         GPU need to be copied into the corresponding slots into input_ids.
         """
         scheduled_tokens = batch.scheduled_tokens  # tokens per req
-        total_tokens = batch.total_tokens_num
         total_tokens_prefill = batch.total_tokens_num_prefill
         total_tokens_decode = batch.total_tokens_num_decode
         total_reqs_prefill = batch.total_seqs_num_prefill
@@ -656,7 +655,11 @@ class tokenIDProcessor:
             width=fill_to,
         )
 
-        input_ids = self.input_ids.gpu[:total_tokens]
+        # Slice by the width this path actually staged. Prefill returned above,
+        # so the decode total is the whole batch; a worker-side speculative q
+        # shrink rewrites it, and reading any other total here would leave the
+        # attention metadata wider than input_ids.
+        input_ids = self.input_ids.gpu[:total_tokens_decode]
         return input_ids
 
     def prepare_draft_ids(
@@ -2721,6 +2724,15 @@ class ModelRunner:
             tbo_on=self.config.enable_tbo,
             local_tbo=self._local_tbo_eligibility(batch),
             max_seqlen_q=(batch.num_spec_step + 1 if shrunk_q is None else shrunk_q),
+            graph_shapes=(
+                None
+                if (
+                    self.enforce_eager
+                    or self._piecewise_cg_active()
+                    or not hasattr(self, "graphs")
+                )
+                else self.graphs.keys()
+            ),
         )
         # Stash the DP-wide prefill OR for the EPLB prefill gate; reused free by
         # on_forward_pass_end when the DP group == the migration (EP) group.
