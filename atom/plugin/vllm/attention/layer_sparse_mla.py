@@ -24,7 +24,7 @@ from aiter import (
     indexer_qk_rope_quant_and_cache,
     top_k_per_row_decode,
 )
-from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
+from aiter.ops.flydsl import flydsl_fp8_mqa_logits as fp8_mqa_logits
 from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 
 from atom.plugin.prepare import is_vllm
