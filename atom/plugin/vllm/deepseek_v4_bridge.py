@@ -2130,7 +2130,17 @@ def atom_deepseek_v4_forward_context(
         scheduled_tokens=int(input_ids.shape[0]) if input_ids is not None else 0,
         running_bs=batch_size,
         running_tokens=running_tokens_from_bs(
-            batch_size, is_prefill=is_prefill, attn_metadata=attn_metadata
+            batch_size,
+            is_prefill=is_prefill,
+            # A `force_dummy` forward profiles memory on a throwaway batch, and
+            # its `attn_metadata` is the bare namespace built above -- `state`
+            # and `in_hipgraph` only, deliberately, because building real
+            # metadata here allocates and copies, which HIP forbids under
+            # stream capture. It therefore carries no sequence length, and
+            # there is no height to derive from it. Hand the helper the `None`
+            # it already documents as "count only", which is exactly the
+            # `graph_bs=batch_size` this call replaced.
+            attn_metadata=None if force_dummy else attn_metadata,
         ),
         input_ids=input_ids,
     )
