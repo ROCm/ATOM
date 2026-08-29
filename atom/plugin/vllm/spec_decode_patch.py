@@ -623,9 +623,19 @@ def _patch_vllm_deepseek_v4_mtp_first_pass_inputs() -> None:
     SpecDecodeBaseProposer.set_inputs_first_pass = wrapped_set_inputs_first_pass
 
 
+def _patch_vllm_dspark_dcp_inputs() -> None:
+    """Localize the DSpark draft's KV slots when DCP shards the pool."""
+    from atom.plugin.vllm.dspark_dcp_patch import (
+        apply_vllm_dspark_dcp_input_patch,
+    )
+
+    apply_vllm_dspark_dcp_input_patch()
+
+
 def apply_vllm_spec_decode_patch() -> None:
     """Patch vLLM speculative decoding for ATOM metadata compatibility."""
     _patch_dspark_fused_markov_sample()
+    _patch_vllm_dspark_dcp_inputs()
     _patch_vllm_llm_base_model_sharing()
     _patch_vllm_draft_kv_group_validation()
     _patch_vllm_draft_positions_on_metadata()

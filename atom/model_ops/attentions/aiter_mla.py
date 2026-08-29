@@ -30,6 +30,7 @@ from atom.distributed.pcp_utils import (
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mla import (
     _MLA_MIN_HEADS,
+    _MLA_SPLIT_BUDGET_AUTO,
     MLAAttention,
     mla_dcp_decode_is_persistent,
     mla_dcp_kernel_num_heads,
@@ -55,11 +56,6 @@ try:
     )
 except (TypeError, ValueError):
     _MLA_META_SUPPORTS_MAX_SPLIT = False
-
-# Cap on the KV-split budget: aiter cuts the KV walk into
-# `min(num_clusters, cap * batch_size)` parts, and a negative cap means uncapped
-# -- as many parts as the machine has clusters (v1_2_device.cuh:894).
-_MLA_SPLIT_BUDGET_AUTO = -1
 
 
 def _mla_seg_meta_kwargs() -> dict:
@@ -262,13 +258,23 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # kernel and stays non-persistent, where this metadata is unused); scale
         # by dcp only there so gfx942 keeps the original per-rank head sizing.
         dcp_persistent = dcp_persistent_supported()
+        self.sparse_dcp_metadata_rebuild = (
+            self.is_sparse
+            and self.dcp_world_size > 1
+            and dcp_persistent
+            and self.block_size == 1
+            and config.speculative_config is None
+        )
         if self.dcp_world_size > 1 and dcp_persistent:
             self.persistent_num_heads = mla_dcp_kernel_num_heads(
                 self.num_attention_heads,
                 self.dcp_world_size,
                 kv_cache_dtype=config.kv_cache_dtype,
                 persistent=mla_dcp_decode_is_persistent(
-                    self.is_sparse, self.dcp_world_size, dcp_persistent
+                    self.is_sparse,
+                    self.dcp_world_size,
+                    dcp_persistent,
+                    sparse_metadata_rebuild=self.sparse_dcp_metadata_rebuild,
                 ),
             )
         else:
@@ -323,6 +329,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # mla_decode_fwd(g_kv_indptr=...) to apply the global-position causal
             # mask for MTP (max_q_len > 1).
             "g_kv_indptr": CpuGpuBuffer(self.max_bs + 1, **i32_kwargs),
+            # Per-request LOCAL (this rank's shard) KV length under DCP. Same
+            # quantity `get_dcp_local_seq_lens` already produces here on the host;
+            # published so the sparse indexer does not recompute it on device once
+            # per full-index layer (21 layers on GLM-5.2). Layer-invariant: it
+            # depends only on context_lens / S / W / dcp_rank.
+            "dcp_local_context_lens": CpuGpuBuffer(self.max_bs, **i32_kwargs),
             "kv_indices": CpuGpuBuffer(
                 self.max_bs * self.max_num_blocks_per_seq,
                 **i32_kwargs,
@@ -371,6 +383,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 dtype=torch.int32,
                 device=self.device,
             )
+            sparse_prefill_num_heads = (
+                self.persistent_num_heads
+                if self.sparse_dcp_metadata_rebuild
+                else self.padded_num_attention_heads
+            )
             (
                 (spp_wmd_size, spp_wmd_type),
                 (spp_wi_size, spp_wi_type),
@@ -381,7 +398,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             ) = get_mla_metadata_info_v1(
                 self.max_num_batched_tokens,
                 1,  # sparse prefill treats each query token as q_len=1
-                self.padded_num_attention_heads,
+                sparse_prefill_num_heads,
                 self.dtype_q,
                 self.dtype_kv,
                 is_sparse=True,
@@ -1789,6 +1806,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 self.dcp_rank,
                 self.cp_kv_cache_interleave_size,
             )
+            # Publish it: the sparse indexer used to re-derive this on device with
+            # 8 elementwise kernels per full-index layer.
+            var["dcp_local_context_lens"].np[:scheduled_bs] = local_context_lens
+            var["dcp_local_context_lens"].np[scheduled_bs:bs] = 0
             num_blocks_per_seq = cdiv(local_context_lens, self.block_size)
         elif any(batch.is_first_decode_without_local_prefill):
             num_blocks_per_seq = [
@@ -1967,6 +1988,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # _forward_decode -> mla_decode_fwd for the MTP (max_q_len>1) cprr mask.
         attn_metadata.g_kv_indptr = (
             var["g_kv_indptr"].copy_to_gpu(bs + 1) if self.dcp_world_size > 1 else None
+        )
+        # Layer-invariant local KV lengths for the DCP sparse indexer (see the
+        # buffer's declaration). None off DCP so the consumer falls back.
+        attn_metadata.dcp_local_context_lens = (
+            var["dcp_local_context_lens"].copy_to_gpu(bs)
+            if self.dcp_world_size > 1
+            else None
         )
 
         if ctx_mla_ps_sparse is not None:

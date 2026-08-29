@@ -58,6 +58,7 @@ class EngineArgs:
     long_prefill_token_threshold: int = 0
     attn_prefill_chunk_size: int = 16384
     state_checkpoint_interval_tokens: int = 8192
+    state_checkpoint_demand: bool = True
     enable_chunked_prefill: bool = True
     scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
@@ -414,9 +415,29 @@ class EngineArgs:
                 "can resume there. "
                 "A prompt shorter than N publishes nothing, which is what keeps "
                 "the feature free on workloads that never reuse a prefix. Must "
-                "be a multiple of the prefix-cache hash block size; 0 disables "
-                "checkpoints entirely. Prefill chunks are aligned to these "
-                "positions, so this also quantizes chunk boundaries."
+                "be a multiple of the prefix-cache hash block size. Prefill "
+                "chunks are aligned to these positions, so this also quantizes "
+                "chunk boundaries. "
+                "0 disables state checkpointing entirely. -1 keeps it on but "
+                "places no interval rungs: checkpoints are then taken only "
+                "where a request is seen to want one and at each prompt's own "
+                "end, which is where agentic traffic actually resumes — every "
+                "rung costs the prompt that keeps it an extra prefill chunk, "
+                "and on measured traces the interval ladder is ~30x the writes "
+                "for reuse the other two placements already reach."
+            ),
+        )
+        parser.add_argument(
+            "--state-checkpoint-demand",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help=(
+                "Let a hit that was refused for want of a checkpoint place a "
+                "rung of its own. --no-state-checkpoint-demand leaves the "
+                "prompt-end anchor as the only placement. On measured traces a "
+                "demand is 47% of all checkpoint writes but reads back 2.8% of "
+                "the time, against 85.2% for an anchor, so the rung's write "
+                "traffic may cost more in evictions than its reuse is worth."
             ),
         )
         parser.add_argument(

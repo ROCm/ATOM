@@ -538,9 +538,11 @@ function atomeshSummaryHeaderKey(header) {
   return String(header || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
 }
 
-// Which definition produced a row's interactivity. The summary table prints a
-// human label ("p90 e2e" / "median TPOT") while the point payload carries the
-// raw method id, so fold both into the id and let the popover check one thing.
+// Which definition produced a point's interactivity, normalized from the
+// `interactivity_method` payload field. Kept tolerant rather than an equality
+// check: points published before the field existed carry nothing, and the
+// spelling has already changed once (#1925). The summary-table path derives the
+// method from which column is populated and does not come through here.
 function atomeshInteractivityMethod(value) {
   const text = String(value || '').toLowerCase();
   if (!text) return '';
@@ -567,7 +569,12 @@ function parseAtomeshSummaryRows(markdown) {
     const [isl, osl] = String(raw.islosl || '').split('/');
     const totalTputPerGpu = parseAtomeshNumber(raw.totaltoksgpu);
     const outputTputPerGpu = parseAtomeshNumber(raw.outputtoksgpu);
-    const interactivity = parseAtomeshNumber(raw.interactivity);
+    // One column per definition (see write_summary in process_result.py), so
+    // which one is populated is itself the method -- there is no discriminator
+    // column to read. A row carries at most one of these two.
+    const intvtyE2eNorm = parseAtomeshNumber(raw.intvtye2enorm);
+    const intvtyMedianTpot = parseAtomeshNumber(raw.intvtymediantpot);
+    const interactivity = Number.isFinite(intvtyE2eNorm) ? intvtyE2eNorm : intvtyMedianTpot;
     const gsm8k = parseAtomeshNumber(raw.gsm8k);
     const cacheHitPct = parseAtomeshNumber(String(raw.cachehit || '').replace('%', ''));
     const accuracyScore = parseAtomeshNumber(raw.accuracy) ?? gsm8k;
@@ -583,7 +590,8 @@ function parseAtomeshSummaryRows(markdown) {
       osl: parseAtomeshNumber(osl),
       concurrency: parseAtomeshNumber(raw.concurrency),
       interactivity,
-      interactivityMethod: atomeshInteractivityMethod(raw.intvtydef),
+      interactivityMethod: Number.isFinite(intvtyE2eNorm) ? 'p90_e2e_normalized' : 'median_tpot',
+      interactivityP90Itl: parseAtomeshNumber(raw.intvtyp90itl),
       totalTput: parseAtomeshNumber(raw.totaltoks),
       inputTput: parseAtomeshNumber(raw.inputtoks),
       outputTput: parseAtomeshNumber(raw.outputtoks),
@@ -657,6 +665,8 @@ function atomeshPointRow(point, meta, idx) {
     concurrency,
     interactivity,
     interactivityMethod: atomeshInteractivityMethod(point.interactivity_method),
+    // 1/p90(ITL). Reference: https://inferencex.semianalysis.com/inference
+    interactivityP90Itl: atomeshPointNumber(point, 'interactivity_p90_itl'),
     totalTput: atomeshPointNumber(point, 'total_tput'),
     inputTput: atomeshPointNumber(point, 'input_tput'),
     outputTput: atomeshPointNumber(point, 'output_tput'),
@@ -1222,6 +1232,37 @@ const PERF_METRICS = [
   { key: 'TPOT',        label: 'TPOT',              unit: 'ms',    lower: true },
   { key: 'TTFT',        label: 'TTFT',              unit: 'ms',    lower: true },
 ];
+// The two x-axis definitions InferenceX publishes, both computed from the same
+// per-request AIPerf records (see .github/scripts/atomesh/interactivity.py):
+//   E2E Normalized Interactivity = 1 / p90(ITL + TTFT/OSL)
+//   Interactivity                = 1 / p90(ITL)
+// The first amortizes prefill over the turn's output tokens, so on agentic traces
+// -- ~1M-token prefills -- the two differ by more than an order of magnitude.
+// They are alternative views of one point, never mixed on one axis.
+const ATOMESH_INTERACTIVITY_METRICS = [
+  {
+    key: 'e2e_normalized',
+    label: 'E2E Normalized Interactivity',
+    formula: '1 / p90(ITL + TTFT / output tokens) — amortizes prefill over the turn',
+    emptyHint: 'It is derived from every run, so an empty chart here means the selected rows have no throughput/latency data at all.',
+    value: row => row.interactivity,
+    frontierEligible: row => row.interactivityMethod === 'p90_e2e_normalized',
+  },
+  {
+    key: 'p90_itl',
+    label: 'Interactivity',
+    formula: '1 / p90(ITL) — decode speed only, matching InferenceX p90_intvty',
+    emptyHint: 'It is recorded only for agentic runs published after this metric was added; older points carry E2E Normalized Interactivity only.',
+    value: row => row.interactivityP90Itl,
+    frontierEligible: row => Number.isFinite(row.interactivityP90Itl),
+  },
+];
+
+function atomeshInteractivityMetric() {
+  return ATOMESH_INTERACTIVITY_METRICS.find(m => m.key === state.atomeshIntvtyMetric)
+    || ATOMESH_INTERACTIVITY_METRICS[0];
+}
+
 const state = {
   dashboardMode: 'Aggregated',
   filters: { backends: [...allBackends], models: [...allModels], islOsl: [...allIslOsl], conc: [...allConc], hardware: [defaultHardware] },
@@ -1229,6 +1270,7 @@ const state = {
   perfMetric: 'Total Tput',
   trendModelKey: allTrendModelKeys[0] || '',
   atomeshTrendModel: '',
+  atomeshIntvtyMetric: ATOMESH_INTERACTIVITY_METRICS[0].key,
   dataView: 'table',
   dataSort: { column: 'date', direction: 'desc' },
 };
@@ -3107,18 +3149,26 @@ function atomeshCacheHitRowHTML(row) {
     : '';
   return `<div class="pop-row"><span class="pop-key">Prefix Cache Hit Rate</span><span class="pop-val">${fmtNum(row.cacheHitRate * 100, 2)}%${tokens}</span></div>`;
 }
-// Two definitions share the `interactivity` field and the same chart axis:
-// agentic rows are 1/p90(TPOT + TTFT/OSL), everything else is 1000/median TPOT.
-// Name the one in force so points from the two families are not read as
-// directly comparable. A row with no method recorded predates the p90 work, so
-// it is median TPOT as well.
+// Two definitions share the `interactivity` field: agentic rows are
+// 1/p90(ITL + TTFT/OSL), everything else is 1000/median TPOT. Name the one in
+// force so points from the two families are not read as directly comparable. A
+// row with no method recorded predates the p90 work, so it is median TPOT as
+// well. `interactivityP90Itl` is a separate field with a single definition --
+// 1/p90(ITL) -- and so gets its own row rather than sharing this one.
 function atomeshInteractivityRowHTML(row) {
   const isP90 = row.interactivityMethod === 'p90_e2e_normalized';
-  const key = isP90 ? 'Interactivity p90 (tok/s/user)' : 'Interactivity (tok/s/user)';
+  const key = isP90 ? 'E2E Norm. Interactivity p90 (tok/s/user)' : 'Interactivity (tok/s/user)';
   const note = isP90 || !Number.isFinite(row.interactivity)
     ? ''
     : ` <span style="color:var(--text-tertiary)">(median TPOT)</span>`;
-  return `<div class="pop-row"><span class="pop-key">${key}</span><span class="pop-val">${atomeshDetailValue(row.interactivity, v => fmtNum(v, 3))}${note}</span></div>`;
+  let html = `<div class="pop-row"><span class="pop-key">${key}</span><span class="pop-val">${atomeshDetailValue(row.interactivity, v => fmtNum(v, 3))}${note}</span></div>`;
+  // Second row only when the plain metric was actually measured: rendering an
+  // em dash for every legacy point would suggest a value went missing rather
+  // than that the run predates the metric.
+  if (Number.isFinite(row.interactivityP90Itl)) {
+    html += `<div class="pop-row"><span class="pop-key">Interactivity p90 (tok/s/user)</span><span class="pop-val">${atomeshDetailValue(row.interactivityP90Itl, v => fmtNum(v, 3))}</span></div>`;
+  }
+  return html;
 }
 function showAtomeshPopover(row) {
   const runHref = safeHref(row.runUrl);
@@ -3191,6 +3241,7 @@ function syncToHash() {
   if (state.filters.conc.length !== allConc.length) parts.push('conc=' + state.filters.conc.join(','));
   parts.push('hardware=' + selectedHardware());
   if (state.activeTab !== 'performance') parts.push('tab=' + state.activeTab);
+  if (state.atomeshIntvtyMetric !== ATOMESH_INTERACTIVITY_METRICS[0].key) parts.push('intvty=' + state.atomeshIntvtyMetric);
   hashUpdateFromCode = true;
   window.location.hash = parts.join('&');
 }
@@ -3210,6 +3261,7 @@ function readFromHash() {
       const hw = v.split(',')[0];
       state.filters.hardware = hw && allHardware.includes(hw) ? [hw] : [defaultHardware];
     }
+    if (k === 'intvty' && ATOMESH_INTERACTIVITY_METRICS.some(m => m.key === v)) state.atomeshIntvtyMetric = v;
     if (k === 'tab') {
       state.activeTab = v;
       document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === v));
@@ -3664,6 +3716,13 @@ function atomeshCompletedCases() {
   return filteredAtomeshRows().filter(c => c.status === 'completed' && Number.isFinite(c.interactivity) && Number.isFinite(c.totalTputPerGpu));
 }
 
+// Rows that can actually be plotted on the currently selected x-axis. Narrower
+// than atomeshCompletedCases(): a row measured before the plain Interactivity
+// number was recorded is complete, but has nothing to put on that axis.
+function atomeshPlottableCases(metric) {
+  return atomeshCompletedCases().filter(c => Number.isFinite(metric.value(c)));
+}
+
 function atomeshPrimaryModel() {
   return filteredAtomeshRows()[0]?.model || 'ATOMesh';
 }
@@ -3707,7 +3766,10 @@ function renderAtomeshKPICards() {
   const rows = filteredAtomeshRows();
   const completed = atomeshCompletedCases();
   const best = completed.reduce((max, c) => !max || c.totalTputPerGpu > max.totalTputPerGpu ? c : max, null);
-  const bestInteractivity = completed.reduce((max, c) => !max || c.interactivity > max.interactivity ? c : max, null);
+  // Tracks the selected x-axis, so this card always describes the chart below it.
+  const intvtyMetric = atomeshInteractivityMetric();
+  const plottable = atomeshPlottableCases(intvtyMetric);
+  const bestInteractivity = plottable.reduce((max, c) => !max || intvtyMetric.value(c) > intvtyMetric.value(max) ? c : max, null);
   const acc = rows.find(c => Number.isFinite(atomeshAccuracyValue(c)));
   const accValue = atomeshAccuracyValue(acc);
   row.innerHTML = `
@@ -3718,8 +3780,8 @@ function renderAtomeshKPICards() {
         <div class="kpi-sub">${best ? `${best.model} ${best.islOsl} c=${best.concurrency}` : ''}</div>
       </div>
       <div class="kpi-card">
-        <div class="kpi-label">Best Interactivity</div>
-        <div class="kpi-value">${bestInteractivity ? fmtNum(bestInteractivity.interactivity, 2) : '—'} <span class="kpi-unit">tok/s/user</span></div>
+        <div class="kpi-label">Best ${escHTML(intvtyMetric.label)}</div>
+        <div class="kpi-value">${bestInteractivity ? fmtNum(intvtyMetric.value(bestInteractivity), 2) : '—'} <span class="kpi-unit">tok/s/user</span></div>
         <div class="kpi-sub">${bestInteractivity?.tpotMs ? `${fmtNum(bestInteractivity.tpotMs, 2)} ms TPOT` : ''}</div>
       </div>
     </div>
@@ -3754,9 +3816,15 @@ function renderAtomeshPerformanceTab() {
   const container = document.getElementById('tab-performance');
   destroyChartsIn(container);
   const rows = filteredAtomeshRows().sort((a, b) => _lc(a.model, b.model) || _lc(a.topology, b.topology) || (a.concurrency || 0) - (b.concurrency || 0));
-  const completed = atomeshCompletedCases().sort((a, b) => a.concurrency - b.concurrency);
+  const metric = atomeshInteractivityMetric();
+  const completedAll = atomeshCompletedCases();
+  const completed = atomeshPlottableCases(metric).sort((a, b) => a.concurrency - b.concurrency);
   if (!completed.length) {
-    container.innerHTML = '<div class="chart-empty">No completed ATOMesh performance row matches the current filters.</div>';
+    // Separate the two reasons: no rows at all is a filter problem, whereas rows
+    // without the selected metric means this axis has no data yet for them.
+    container.innerHTML = completedAll.length
+      ? `<div class="chart-empty">${escHTML(metric.label)} is not recorded for any of the ${completedAll.length} selected row(s). ${escHTML(metric.emptyHint)}</div>`
+      : '<div class="chart-empty">No completed ATOMesh performance row matches the current filters.</div>';
     return;
   }
   const chartGroups = {};
@@ -3783,7 +3851,7 @@ function renderAtomeshPerformanceTab() {
         label: isAgenticTraceRow(first)
           ? `${first.model} Agentic Trace · ${first.sourceTopology || first.topology}`
           : `${first.model} ${first.islOsl}`,
-        data: groupRows.map(c => ({ x: c.interactivity, y: c.totalTputPerGpu, row: c })),
+        data: groupRows.map(c => ({ x: metric.value(c), y: c.totalTputPerGpu, row: c })),
         borderColor: color.border,
         backgroundColor: color.border,
         borderWidth: 2,
@@ -3802,20 +3870,23 @@ function renderAtomeshPerformanceTab() {
     const agenticGroups = {};
     for (const row of modelRows) {
       if (!isAgenticTraceRow(row)) continue;
-      // Points published before the p90 e2e definition landed carry the legacy
-      // 1000/median_tpot number, which ignores prefill entirely and so reads far
-      // too optimistic — for the c48 traces by more than 50x. Their per-request
-      // records expired with the artifacts, so they can never be recomputed. They
-      // still render and stay clickable; they just cannot join a frontier, which
-      // would otherwise be defined by whichever points were measured the wrong way.
-      if (row.interactivityMethod !== 'p90_e2e_normalized') continue;
+      // modelRows is every filtered row, not just the plotted ones, so drop
+      // anything the current axis cannot place before considering the frontier.
+      if (!Number.isFinite(metric.value(row)) || !Number.isFinite(row.totalTputPerGpu)) continue;
+      // A point whose number came from the wrong definition still renders and
+      // stays clickable, but cannot join a frontier that would then be defined by
+      // whichever points were measured the wrong way. For the E2E axis those are
+      // the pre-#1925 points carrying 1000/median_tpot, which ignores prefill and
+      // so reads far too optimistic — for the c48 traces by more than 50x. Their
+      // per-request records expired with the artifacts and can never be recomputed.
+      if (!metric.frontierEligible(row)) continue;
       const key = `${row.model}|${row.islOsl}`;
       if (!agenticGroups[key]) agenticGroups[key] = [];
       agenticGroups[key].push(row);
     }
     for (const groupRows of Object.values(agenticGroups)) {
       const frontier = atomeshParetoFrontier(
-        groupRows.map(c => ({ x: c.interactivity, y: c.totalTputPerGpu, row: c }))
+        groupRows.map(c => ({ x: metric.value(c), y: c.totalTputPerGpu, row: c }))
       );
       if (frontier.length < 2) continue; // a single point is not a line
       const first = groupRows[0];
@@ -3849,8 +3920,12 @@ function renderAtomeshPerformanceTab() {
   });
 
   let html = `<div class="section-container"><div class="section-header">
-    <span class="section-title">ATOMesh Token Throughput per GPU vs. Interactivity</span>
+    <span class="section-title">ATOMesh Token Throughput per GPU vs. ${escHTML(metric.label)}</span>
     <span style="font-size:11px;color:var(--text-tertiary);overflow-wrap:anywhere">${completed.length}/${atomeshRows().length} selected rows · source: benchmark-action data.js</span>
+  </div>
+  <div class="model-selector" style="margin-bottom:var(--gap-md);justify-content:flex-start">
+    <span class="sel-label">X axis:</span>
+    ${ATOMESH_INTERACTIVITY_METRICS.map(m => `<button class="sel-btn ${m.key === metric.key ? 'active' : ''}" data-atomesh-intvty-metric="${escHTML(m.key)}" title="${escHTML(m.formula)}">${escHTML(m.label)}</button>`).join('')}
   </div>
   <div class="chart-grid">${chartSpecs.map(spec => `
     <div class="chart-card ${chartSpecs.length === 1 ? 'hero' : 'half'}">
@@ -3861,7 +3936,7 @@ function renderAtomeshPerformanceTab() {
   html += `<div class="section-container"><div class="section-header"><span class="section-title">Detail Table</span></div>
   <div class="table-watermark"><div class="table-watermark-scroll"><table class="perf-table"><thead><tr>
     <th>Backend</th><th>Model</th><th>Topology</th><th>ISL/OSL</th><th class="num">Conc</th>
-    <th class="num">Interactivity</th><th class="num">Total tok/s</th><th class="num">Input tok/s</th><th class="num">Output tok/s</th>
+    <th class="num">E2E Norm. Intvty</th><th class="num">Intvty</th><th class="num">Total tok/s</th><th class="num">Input tok/s</th><th class="num">Output tok/s</th>
     <th class="num">Total tok/s/GPU</th><th class="num">Input tok/s/GPU</th><th class="num">Output tok/s/GPU</th>
     <th class="num">TTFT ms</th><th class="num">TPOT ms</th><th class="num">E2E ms</th><th class="num">Accuracy</th><th>Run</th>
   </tr></thead><tbody>`;
@@ -3873,6 +3948,7 @@ function renderAtomeshPerformanceTab() {
       <td>${escHTML(c.islOsl)}</td>
       <td class="num">${c.concurrency}</td>
       <td class="num">${c.interactivity != null ? fmtNum(c.interactivity, 2) : '—'}</td>
+      <td class="num">${Number.isFinite(c.interactivityP90Itl) ? fmtNum(c.interactivityP90Itl, 2) : '—'}</td>
       <td class="num">${c.totalTput != null ? fmtNum(c.totalTput, 2) : '—'}</td>
       <td class="num">${c.inputTput != null ? fmtNum(c.inputTput, 2) : '—'}</td>
       <td class="num">${c.outputTput != null ? fmtNum(c.outputTput, 2) : '—'}</td>
@@ -3888,6 +3964,14 @@ function renderAtomeshPerformanceTab() {
   });
   html += '</tbody></table></div></div></div>';
   container.innerHTML = html;
+  container.querySelectorAll('[data-atomesh-intvty-metric]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      state.atomeshIntvtyMetric = btn.dataset.atomeshIntvtyMetric;
+      renderAtomeshKPICards();
+      renderAtomeshPerformanceTab();
+      syncToHash();
+    });
+  });
   container.querySelectorAll('tr[data-atomesh-row]').forEach(rowEl => {
     rowEl.addEventListener('click', (e) => {
       if (e.target.closest('a') || e.target.closest('button')) return;
@@ -3912,7 +3996,7 @@ function renderAtomeshPerformanceTab() {
               return `${c.model} ${c.islOsl} · c=${c.concurrency} · Topology: ${c.sourceTopology || c.topology || '—'}`;
             },
             label: item => [
-              ` Interactivity: ${fmtNum(item.parsed.x, 2)} tok/s/user`,
+              ` ${metric.label}: ${fmtNum(item.parsed.x, 2)} tok/s/user`,
               ` Total tok/s/GPU: ${fmtNum(item.parsed.y, 2)}`,
               ` ${atomeshAccuracyTaskLabel(item.raw.row.accuracyTask)}: ${atomeshAccuracyRaw(item.raw.row)}`,
             ],
@@ -3921,7 +4005,7 @@ function renderAtomeshPerformanceTab() {
           datalabels: { display: true, color: C_LEGEND, align: 'top', formatter: value => 'c' + value.row.concurrency },
         },
         scales: {
-          x: { grid: chartGridOpts(), title: { display: true, text: 'Interactivity (tok/s/user)', color: C_TICK }, ticks: { color: C_TICK }, grace: '10%' },
+          x: { grid: chartGridOpts(), title: { display: true, text: `${metric.label} (tok/s/user)`, color: C_TICK }, ticks: { color: C_TICK }, grace: '10%' },
           y: { grid: chartGridOpts(), title: { display: true, text: 'Token Throughput per GPU (tok/s/gpu)', color: C_TICK }, ticks: { color: C_TICK }, grace: '10%' },
         },
         onClick: (_e, elems) => {

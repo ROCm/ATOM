@@ -1666,9 +1666,9 @@ def test_every_op_fake_agrees_with_its_body():
                 [t.shape for t in v4._v4_qk_norm_rope_fake(q, kv_pre, positions, "L")],
                 [
                     t.shape
-                    for t in v4._qkn_to_list(
-                        A._qk_norm_rope(layer, q, kv_pre, positions), layer.kv_fp8
-                    )
+                    for t in A._qk_norm_rope(
+                        layer, q, kv_pre, positions
+                    ).custom_op_return()
                 ],
             ),
             (
@@ -1814,8 +1814,8 @@ def test_qk_norm_rope_shapes_match_what_the_paged_kernel_asserts():
     assert bf16.q_packed is None and bf16.q_rope is None
 
     # And the op's return list has to carry the active layout's four / two.
-    assert len(v4._qkn_to_list(fp8, True)) == 4
-    assert len(v4._qkn_to_list(bf16, False)) == 2
+    assert len(fp8.custom_op_return()) == 4
+    assert len(bf16.custom_op_return()) == 2
 
 
 # ---------------------------------------------------------------------------
