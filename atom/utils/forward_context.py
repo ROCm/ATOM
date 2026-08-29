@@ -6,7 +6,7 @@ import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
 from enum import Enum
-from typing import Any, Union
+from typing import Any, Collection, Union
 
 import numpy as np
 import torch
@@ -199,6 +199,7 @@ class ForwardMode:
         enforce_eager: bool,
         graph_bs: list[int],
         mtp_step: int = 1,
+        graph_shapes: Collection[tuple[int, int]] | None = None,
     ) -> "ForwardMode":
         """Compute dispatch + effective_bs + moe_pad_bs. Any new force-eager
         condition belongs here, not in caller-side checks."""
@@ -259,6 +260,17 @@ class ForwardMode:
             (x for x in graph_bs if x >= padded_scheduled_bs),
             padded_scheduled_bs,
         )
+        if graph_shapes is not None and (eff, mtp_step) not in graph_shapes:
+            # A runner can own an MTP drafter while executing a target-only
+            # q=1 forward (notably a P/D prefill producer). Capture may only
+            # contain the normal q=mtp_k+1 shapes, so batch-size eligibility
+            # alone is insufficient to select a graph.
+            return cls(
+                use_cudagraph=False,
+                effective_bs=scheduled_bs_decode,
+                moe_pad_bs=padded_scheduled_bs,
+                is_prefill=False,
+            )
         return cls(
             use_cudagraph=True,
             effective_bs=eff,

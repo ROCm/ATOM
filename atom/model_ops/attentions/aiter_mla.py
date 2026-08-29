@@ -46,6 +46,18 @@ from .sub_pool_spec import SubPoolSpec, page_pool
 
 logger = logging.getLogger("atom")
 
+
+def _decode_query_width(batch: ScheduledBatch, model_runner) -> int:
+    """Return the query width declared by this forward's batch."""
+    default_q = (
+        model_runner.drafter.mtp_k + 1 if hasattr(model_runner, "drafter") else 1
+    )
+    query_width = int(getattr(batch, "num_spec_query_tokens", default_q))
+    if query_width < 1:
+        raise ValueError(f"decode query width must be positive, got {query_width}")
+    return query_width
+
+
 # `max_split_per_batch` is only needed (and only exists in newer aiter builds)
 # for the segmented page_size>1 MLA path. Detect support once so the default
 # page_size=1 path never passes an unsupported kwarg.
@@ -1582,9 +1594,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
     def prepare_decode(self, batch: ScheduledBatch, bs: int):
         scheduled_bs = batch.total_seqs_num_decode
         dropout_p = 0.0
-        max_seqlen_q = 1
-        if hasattr(self.model_runner, "drafter"):
-            max_seqlen_q = self.model_runner.drafter.mtp_k + 1
+        # The batch is the per-forward source of truth. A P/D prefill producer
+        # may own a configured drafter while its current target-only decode
+        # batch declares a different query width; deriving it from the runner
+        # would make the attention metadata disagree with input_ids.
+        max_seqlen_q = _decode_query_width(batch, self.model_runner)
 
         var = self.model_runner.forward_vars
         context_lens = np.asarray(batch.context_lens, dtype=np.int32)

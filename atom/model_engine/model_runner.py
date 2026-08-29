@@ -591,7 +591,11 @@ class tokenIDProcessor:
         if fill_to > total:
             self.input_ids.gpu[total:fill_to].zero_()
 
-        input_ids = self.input_ids.gpu[:total_tokens]
+        # `total` is the flat decode width this path actually staged.  It can
+        # differ from the scheduler's original total after a worker-side
+        # speculative q shrink, so slicing by `total_tokens` can silently drop
+        # draft rows and leave attention metadata wider than input_ids.
+        input_ids = self.input_ids.gpu[:total]
         return input_ids
 
     def prepare_draft_ids(
@@ -2605,6 +2609,15 @@ class ModelRunner:
             enforce_eager=self.enforce_eager,
             graph_bs=self.graph_bs,
             mtp_step=mtp_step,
+            graph_shapes=(
+                None
+                if (
+                    self.enforce_eager
+                    or self._piecewise_cg_active()
+                    or not hasattr(self, "graphs")
+                )
+                else self.graphs.keys()
+            ),
         )
 
         if not is_prefill:
