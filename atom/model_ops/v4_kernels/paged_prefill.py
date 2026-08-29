@@ -45,6 +45,8 @@ Numerics: identical online-softmax + sink finalization to
 (then equivalent to a decode call with the same prefix indices).
 """
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -52,6 +54,10 @@ import triton.language as tl
 from atom.model_ops.v4_kernels.pool_index import row_offset
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
+
+_ENABLE_DSV4_0731_OPTIMIZATIONS = (
+    os.getenv("ATOM_DSV4_0731_OPTIMIZATIONS", "0") == "1"
+)
 
 try:
     from aiter.ops.pa_sparse_prefill_opus import pa_sparse_prefill_opus
@@ -312,21 +318,32 @@ def _sparse_attn_v4_paged_prefill_csa_kernel(
     p_end = tl.load(kv_indptr_prefix_ptr + t + 1)
     p_len = p_end - p_start
 
-    p_slot = tl.load(
-        kv_indices_prefix_ptr + p_start + p_k_offs,
-        mask=p_k_offs < p_len,
-        other=0,
-    )
-    for k_start in tl.range(0, p_len, PREFIX_BLOCK_K, loop_unroll_factor=8):
-        k_pos = k_start + p_k_offs
-        valid = k_pos < p_len
-        slot = p_slot
-        next_k_pos = k_pos + PREFIX_BLOCK_K
+    if _ENABLE_DSV4_0731_OPTIMIZATIONS:
         p_slot = tl.load(
-            kv_indices_prefix_ptr + p_start + next_k_pos,
-            mask=next_k_pos < p_len,
+            kv_indices_prefix_ptr + p_start + p_k_offs,
+            mask=p_k_offs < p_len,
             other=0,
         )
+    for k_start in tl.range(
+        0,
+        p_len,
+        PREFIX_BLOCK_K,
+        loop_unroll_factor=(8 if _ENABLE_DSV4_0731_OPTIMIZATIONS else 1),
+    ):
+        k_pos = k_start + p_k_offs
+        valid = k_pos < p_len
+        if _ENABLE_DSV4_0731_OPTIMIZATIONS:
+            slot = p_slot
+            next_k_pos = k_pos + PREFIX_BLOCK_K
+            p_slot = tl.load(
+                kv_indices_prefix_ptr + p_start + next_k_pos,
+                mask=next_k_pos < p_len,
+                other=0,
+            )
+        else:
+            slot = tl.load(
+                kv_indices_prefix_ptr + p_start + k_pos, mask=valid, other=0
+            )
         kv_ptrs = (
             unified_kv_ptr
             + row_offset(slot, pkv_stride_n)[:, None]
@@ -353,21 +370,27 @@ def _sparse_attn_v4_paged_prefill_csa_kernel(
     e_end = tl.load(kv_indptr_extend_ptr + t + 1)
     e_len = e_end - e_start
 
-    e_slot = tl.load(
-        kv_indices_extend_ptr + e_start + k_offs,
-        mask=k_offs < e_len,
-        other=0,
-    )
+    if _ENABLE_DSV4_0731_OPTIMIZATIONS:
+        e_slot = tl.load(
+            kv_indices_extend_ptr + e_start + k_offs,
+            mask=k_offs < e_len,
+            other=0,
+        )
     for e_k_start in tl.range(0, e_len, BLOCK_K):
         k_pos = e_k_start + k_offs
         valid = k_pos < e_len
-        slot = e_slot
-        next_k_pos = k_pos + BLOCK_K
-        e_slot = tl.load(
-            kv_indices_extend_ptr + e_start + next_k_pos,
-            mask=next_k_pos < e_len,
-            other=0,
-        )
+        if _ENABLE_DSV4_0731_OPTIMIZATIONS:
+            slot = e_slot
+            next_k_pos = k_pos + BLOCK_K
+            e_slot = tl.load(
+                kv_indices_extend_ptr + e_start + next_k_pos,
+                mask=next_k_pos < e_len,
+                other=0,
+            )
+        else:
+            slot = tl.load(
+                kv_indices_extend_ptr + e_start + k_pos, mask=valid, other=0
+            )
         kv_ptrs = kv_ptr + slot[:, None] * ekv_stride_n + d_offs[None, :] * ekv_stride_d
         kv = tl.load(kv_ptrs, mask=valid[:, None], other=0.0)
 
@@ -458,7 +481,10 @@ def _sparse_attn_v4_paged_prefill_triton(
     avg_prefix_len = kv_indices_prefix.numel() / max(T, 1)
     # HCA prefill has a very short prefix, while CSA has a long prefix. A
     # smaller prefix tile helps HCA but hurts CSA, so choose it by prefix size.
-    prefix_block_k = min(block_k, 16) if 0 < avg_prefix_len <= 16 else 16
+    if _ENABLE_DSV4_0731_OPTIMIZATIONS:
+        prefix_block_k = 16
+    else:
+        prefix_block_k = min(block_k, 16) if 0 < avg_prefix_len <= 16 else block_k
     # Prefix/extend indices are fully written in production; keep sentinel
     # checks only for non-short-prefix shapes for compatibility with legacy data.
     check_neg_one_sentinel = not (0 < avg_prefix_len <= 16)

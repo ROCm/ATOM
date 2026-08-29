@@ -81,11 +81,16 @@ This directory contains the following reproducible components:
 - A Dockerfile with a digest-pinned base image.
 - An `entrypoint.sh` containing the measured server configuration.
 
-The indexer assigns query rows cyclically across tensor-parallel ranks to balance causal-window work. Each rank gathers only compact `int32` top-k output, and the original token order is restored after the collective. The decode path is unchanged. Enable the feature with:
+All shared-path changes in this recipe are gated by
+`ATOM_DSV4_0731_OPTIMIZATIONS=1`. The production image enables the gate, while
+the default ATOM behavior remains unchanged when the variable is absent. The
+independent indexer row-sharding optimization additionally requires:
 
 ```bash
 ATOM_INDEXER_PREFILL_ROW_SHARD=1
 ```
+
+The indexer assigns query rows cyclically across tensor-parallel ranks to balance causal-window work. Each rank gathers only compact `int32` top-k output, and the original token order is restored after the collective. The decode path is unchanged.
 
 ### Row-Sharding Contribution
 

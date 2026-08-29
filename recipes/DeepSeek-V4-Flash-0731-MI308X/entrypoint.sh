@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+export ATOM_DSV4_0731_OPTIMIZATIONS=${ATOM_DSV4_0731_OPTIMIZATIONS:-1}
 MODEL_PATH=${MODEL_PATH:-/data/models/DeepSeek-V4-Flash-0731}
 SERVED_MODEL_NAME=${SERVED_MODEL_NAME:-DeepSeek-V4-Flash-0731}
 ONLINE_QUANT_CONFIG='{"layer_quant_config":{"*.experts":"per_block_fp8"}}'

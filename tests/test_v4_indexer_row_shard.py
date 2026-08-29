@@ -2,7 +2,7 @@
 
 import torch
 
-from atom.models.deepseek_v4 import _restore_cyclic_row_order
+from atom.model_ops.v4_indexer_utils import restore_cyclic_row_order
 
 
 def test_restore_cyclic_row_order_trims_tail_padding():
@@ -26,7 +26,7 @@ def test_restore_cyclic_row_order_trims_tail_padding():
         dtype=torch.int32,
     )
 
-    restored = _restore_cyclic_row_order(
+    restored = restore_cyclic_row_order(
         gathered, world_size=4, shard_rows=3, total_rows=10
     )
 
