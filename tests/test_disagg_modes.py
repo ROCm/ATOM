@@ -47,6 +47,36 @@ def test_decode_scheduler_skips_shm_when_name_empty(decode_scheduler_unconstrain
     assert decode_scheduler_unconstrained._cu_shm is None
 
 
+def test_decode_handoff_builds_full_mtp_window(seq_factory):
+    class SpecConfig:
+        num_speculative_tokens = 3
+
+        @staticmethod
+        def use_dspark():
+            return True
+
+    from atom.model_engine.scheduler import DecodeScheduler
+
+    scheduler = DecodeScheduler(
+        MockConfig(speculative_config=SpecConfig()), disagg_cu_shm_name=""
+    )
+    prompt = [11, 22, 33, 44, 55]
+    t0 = 14
+    seq = seq_factory(prompt)
+    scheduler.block_manager.allocate(seq)
+    scheduler.prefill_waiting[seq.id] = seq
+
+    scheduler.on_prefill_done(seq.id, len(prompt), t0)
+
+    assert seq.is_first_decode is True
+    assert list(seq.token_ids[-4:]) == [t0, 2, 2, 2]
+    assert not set(seq.token_ids[-4:]) & set(prompt)
+
+    batch, _ = scheduler.schedule()
+    assert batch.is_first_decode_without_local_prefill == [True]
+    assert seq.is_first_decode is False
+
+
 # ── Unconstrained: batches carry cu_stream_fraction=None ─────────────────
 
 
