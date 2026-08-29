@@ -154,6 +154,11 @@ def register_platform() -> str | None:
 
     apply_vllm_rocm_dcp_full_graph_patch()
 
+    # aiter's custom all-reduce needs vLLM's rendezvous to stay on a TCPStore.
+    from atom.plugin.vllm.dist_store_patch import apply_vllm_tcp_store_patch
+
+    apply_vllm_tcp_store_patch()
+
     # Do not call _set_plugin_mode() here. SGLang (and other stacks) discover
     # vllm.platform_plugins and would set atom's backbone to "vllm" before
     # importing SGLang plugin modules — then atom.models.qwen3_5's ``if is_vllm():``
