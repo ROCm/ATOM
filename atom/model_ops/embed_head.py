@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import triton
 import triton.language as tl
@@ -10,6 +9,7 @@ from aiter.dist.communication_op import tensor_model_parallel_all_gather
 from aiter.dist.parallel_state import get_dp_group, get_tp_group
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.tuned_gemm import tgemm
+from torch import nn
 
 from atom.model_ops.lm_head_argmax import lm_head_argmax_pack
 from atom.model_ops.utils import atom_parameter
@@ -303,6 +303,11 @@ class ParallelLMHead(VocabParallelEmbedding):
         Every DP rank must reach the SAME verdict from globally-synced state, or
         the fixed-size collective in `_dp_sharded_logits` deadlocks. The strategy
         (all-gather vs all2all) is read from ATOM_DP_LM_HEAD_MODE there.
+
+        `is_prefill` below is per-rank, which is safe only because
+        `running_tokens_are_unified` is the DP-reduced form of the same
+        question: a prefilling peer drives it False on every rank, so no rank
+        can answer True here while another answers False.
         """
         dp_group = get_dp_group()
         # Static: enabled, pure DP, vocab evenly shardable over a >1 DP group.
@@ -313,14 +318,14 @@ class ParallelLMHead(VocabParallelEmbedding):
             or self.num_embeddings % dp_group.world_size != 0
         ):
             return False
-        # Per-step: all ranks in an equal-length decode. Exclude draft (eagle
-        # keeps dp_uniform_decode=True despite ragged rows) and prefill (x is
-        # sliced to 1 row/seq, mismatching the token-count pad target).
+        # Per-step: all ranks at one height. Exclude draft (eagle leaves the
+        # flag True despite ragged rows) and prefill (x is sliced to 1 row/seq,
+        # mismatching the token-count pad target).
         if (
             context is None
             or getattr(context, "is_draft", False)
             or getattr(context, "is_prefill", False)
-            or not getattr(context, "dp_uniform_decode", False)
+            or not getattr(context, "running_tokens_are_unified", False)
         ):
             return False
         return get_forward_context().dp_metadata is not None

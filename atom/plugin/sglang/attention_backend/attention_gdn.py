@@ -454,7 +454,7 @@ class SGLangGDNForwardContext:
         effective_forward_mode = (
             global_forward_mode if global_forward_mode is not None else mode
         )
-        dp_uniform_decode = not enable_dp_attention or bool(
+        running_tokens_are_unified = not enable_dp_attention or bool(
             effective_forward_mode.is_decode_or_idle()
         )
         return (
@@ -468,7 +468,7 @@ class SGLangGDNForwardContext:
                 # per-request multiplier is needed (nor available here).
                 scheduled_tokens=num_tokens,
                 running_tokens=num_tokens,
-                dp_uniform_decode=dp_uniform_decode,
+                running_tokens_are_unified=running_tokens_are_unified,
             ),
             num_tokens,
         )

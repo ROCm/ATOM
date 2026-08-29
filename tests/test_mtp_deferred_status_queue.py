@@ -45,8 +45,8 @@ def test_middle_prefills_preserve_status_until_mixed_final_batch():
 
     # Pure middle chunks skip postprocess, so neither the deferred-token queue
     # nor its matching MTP-status queue may advance.
-    tokenIDProcessor.prepare_input_ids(processor, _prefill_batch([False]))
-    tokenIDProcessor.prepare_input_ids(processor, _prefill_batch([False, False]))
+    tokenIDProcessor.prepare_input_ids(processor, _prefill_batch([False]), 1)
+    tokenIDProcessor.prepare_input_ids(processor, _prefill_batch([False, False]), 1)
 
     processor.recv_mtp_status_async.assert_not_called()
     np.testing.assert_array_equal(processor.prev_rejected_num, [7])
@@ -55,7 +55,7 @@ def test_middle_prefills_preserve_status_until_mixed_final_batch():
     # If any request reaches its final chunk, the batch runs postprocess. Its
     # status dequeue must therefore happen exactly once, even though another
     # request in the same batch is still a middle chunk.
-    tokenIDProcessor.prepare_input_ids(processor, _prefill_batch([False, True]))
+    tokenIDProcessor.prepare_input_ids(processor, _prefill_batch([False, True]), 1)
 
     processor.recv_mtp_status_async.assert_called_once_with()
     np.testing.assert_array_equal(processor.prev_rejected_num, [2])

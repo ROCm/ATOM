@@ -118,7 +118,6 @@ class EagleProposer(Drafter):
         self.step = DraftGraph(
             forward=self._step_forward,
             inputs=inputs,
-            pads=True,
             warmup_inputs=self._step_warmup_inputs,
         )
         return (self.step,)
@@ -270,17 +269,17 @@ class EagleProposer(Drafter):
             return
         forward_context = get_forward_context()
         context = forward_context.context
-        bs = context.scheduled_bs
-        anchors = next_token_ids[:bs]
+        scheduled_bs = context.scheduled_bs
+        anchors = next_token_ids[:scheduled_bs]
         if any(t < 0 for t in anchors):
             return
 
         # Anchor row per sequence = `cu_seqlens_q[1:] - 1`, the rule
         # `propose_draft_token_ids` uses on a pure prefill step.
-        last_token_indices = self.prepare_inputs(bs, 1)
+        last_token_indices = self.prepare_inputs(scheduled_bs, 1)
         anchor_ids = forward_context.context.draft_anchor_overrides
         assert anchor_ids is not None
-        anchor_ids = anchor_ids[:bs]
+        anchor_ids = anchor_ids[:scheduled_bs]
 
         # `positions` is the padded forward buffer; the target's own output row
         # count is this batch's real token count, and all three inputs below
@@ -344,7 +343,12 @@ class EagleProposer(Drafter):
         )
 
     def _enter_decode_metadata(
-        self, bs, running_bs, positions, last_token_indices, num_reject_tokens
+        self,
+        scheduled_bs,
+        running_bs,
+        positions,
+        last_token_indices,
+        num_reject_tokens,
     ):
         """Rewrite the target's attn_metadata to one row per sequence.
 
@@ -401,11 +405,11 @@ class EagleProposer(Drafter):
         cu_seqlens_q[: running_bs + 1] = builder.row_ids[: running_bs + 1]
         if target_uses_mla and has_flat_kv:
             # MLA: block_size=1, kv_indptr tracks tokens
-            # Per REAL request: `num_reject_tokens` is bs-long and a pad row
+            # Per REAL request: `num_reject_tokens` is scheduled_bs-long, a pad row
             # rejected nothing. Their `kv_indptr` keeps what the target left,
             # which is one of its own valid ranges, so their reads stay in
             # bounds; their WRITES are what has to be neutralized, below.
-            kv_indptr[1 : bs + 1] -= torch.cumsum(num_reject_tokens, dim=0)
+            kv_indptr[1 : scheduled_bs + 1] -= torch.cumsum(num_reject_tokens, dim=0)
         if positions.ndim == 1:
             positions = torch.index_select(positions, 0, last_token_indices)
         else:
@@ -435,11 +439,12 @@ class EagleProposer(Drafter):
         forward_context = get_forward_context()
         context = forward_context.context
         attn_metadata = forward_context.attn_metadata
-        bs = context.scheduled_bs
-        # Steps 1+ run at the row count the target just replayed, so every
-        # mid-step lands on a shape the startup sweep already warmed. No pass
-        # declared (MRoPE) means the loop runs the model directly, at `bs`.
-        running_bs = self.step.target_running_bs(bs, context) if self.step else bs
+        scheduled_bs = context.scheduled_bs
+        # Mid-steps run at the recorded shape the startup sweep warmed -- but
+        # only when one exists at this batch. Widening is for reaching a
+        # recording; without one it just hands the variable-length MoE gather
+        # padded rows it is contracted not to receive.
+        running_bs = context.running_bs if self.step is not None else scheduled_bs
         context.is_draft = True
 
         assert self.runner is not None
@@ -461,7 +466,10 @@ class EagleProposer(Drafter):
             hidden_states = target_hidden_states
 
         draft_token_ids = torch.empty(
-            bs, self.mtp_k, dtype=next_token_ids.dtype, device=next_token_ids.device
+            scheduled_bs,
+            self.mtp_k,
+            dtype=next_token_ids.dtype,
+            device=next_token_ids.device,
         )
         if envs.ATOM_DEBUG_FORCE_SKIP_DRAFT_MODEL:
             draft_token_ids.fill_(-1)
@@ -476,7 +484,7 @@ class EagleProposer(Drafter):
         # cache is indexed by runner.block_size blocks.
         if draft_uses_mha:
             attn_metadata.slot_mapping = var["slot_mapping"].gpu[: len(input_ids)]
-            attn_metadata.block_tables = var["block_tables"].gpu[:bs]
+            attn_metadata.block_tables = var["block_tables"].gpu[:scheduled_bs]
         elif attn_metadata.slot_mapping is not None:
             # Make MLA draft slot_mapping == q rows. DeepSeek-V4 uses
             # block_tables + context_lens (slot_mapping is None) — nothing to
@@ -492,15 +500,17 @@ class EagleProposer(Drafter):
 
         # Mid-steps run padded and may replay; step 0 does neither, so it is
         # labelled as the plain batch it is.
-        step0_label = f"bs={bs}"
+        step0_label = f"bs={scheduled_bs}"
         mid_label = (
-            self.step.label(bs, running_bs, context) if self.step else step0_label
+            self.step.label(scheduled_bs, running_bs) if self.step else step0_label
         )
         for i in range(self.mtp_k):
-            # `tok` is this step's real row count, which is NOT `bs`: step 0 runs
+            # `tok` is this step's real row count, which is NOT `scheduled_bs`:
+            # step 0 runs
             # over the target's whole token stream (a prefill chunk, or
-            # bs*(mtp_k+1) on decode) and only steps 1+ run one row per sequence.
-            # Labelling both as `bs` collapsed the draft's two shape axes into
+            # scheduled_bs*(mtp_k+1) on decode) and only steps 1+ run one row
+            # per sequence.
+            # Labelling both as `scheduled_bs` collapsed its two shape axes into
             # one. Taken pre-PCP-split on purpose -- the sharded count is a
             # rank-local detail, and this is the count `_refresh_dp_metadata`
             # reports.
@@ -514,11 +524,13 @@ class EagleProposer(Drafter):
                 # tensor matches. DSpark reports `running_bs * num_draft` for the
                 # same reason.
                 # Step 0 carries the target's whole token stream and pads
-                # nothing; steps 1+ run the padded row count, of which `bs`
-                # rows are real.
+                # nothing; steps 1+ run the padded row count, of which
+                # `scheduled_bs` rows are real.
                 self._publish_draft_shape(
                     forward_context,
-                    scheduled_tokens=bs if i else input_ids.shape[0],
+                    # Mid-steps compute every padded row, so both units are the
+                    # padded one; step 0 carries the target's stream and pads nothing.
+                    scheduled_tokens=running_bs if i else input_ids.shape[0],
                     running_tokens=running_bs if i else input_ids.shape[0],
                 )
                 # ---- Prefill Context Parallel (draft i==0 prefill) --------
@@ -560,7 +572,6 @@ class EagleProposer(Drafter):
                     # a batch the startup sweep already warmed.
                     ret_hidden_states = self.step.run(
                         running_bs,
-                        context,
                         **self._stage_step_inputs(
                             running_bs, d_input_ids, d_positions, d_hidden
                         ),
@@ -585,7 +596,7 @@ class EagleProposer(Drafter):
                 sample_hidden_states = (
                     torch.index_select(ret_hidden_states, 0, last_token_indices)
                     if i == 0
-                    else ret_hidden_states[:bs]
+                    else ret_hidden_states[:scheduled_bs]
                 )
                 # Every draft model EagleProposer can build implements this --
                 # the DSpark archs in support_draft_model_arch_dict do not, but
@@ -606,7 +617,7 @@ class EagleProposer(Drafter):
                     )
                     if i == 0:
                         i0_max_seqlen_q, positions = self._enter_decode_metadata(
-                            bs,
+                            scheduled_bs,
                             running_bs,
                             positions,
                             last_token_indices,
@@ -642,11 +653,11 @@ class EagleProposer(Drafter):
                         attn_metadata.context_lens[:running_bs] += 1
                         positions += 1
                         mtp_decode_kwargs = {}
-                    # `bs` stays the REAL sequence count; the builder reads
-                    # the padded row count off `positions`, which is the
+                    # `scheduled_bs` stays the REAL sequence count; the builder
+                    # reads the padded row count off `positions`, which is the
                     # pass's own buffer and therefore already `running_bs` long.
                     workinfos = self.runner.attn_metadata_builder.prepare_mtp_decode(
-                        bs,
+                        scheduled_bs,
                         (
                             attn_metadata.max_seqlen_q
                             if not do_attn_metadata_update
@@ -693,8 +704,8 @@ class EagleProposer(Drafter):
                     # Outside the branch above: a backend that RETURNS a
                     # slot_mapping computed it over `running_bs` rows too, so leaving
                     # this inside was how those pad rows kept a live slot.
-                    if running_bs > bs:
-                        attn_metadata.slot_mapping[bs:] = -1
+                    if running_bs > scheduled_bs:
+                        attn_metadata.slot_mapping[scheduled_bs:] = -1
 
                     input_ids = new_draft_ids
                     hidden_states = sample_hidden_states

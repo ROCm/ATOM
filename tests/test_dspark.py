@@ -981,9 +981,7 @@ def _stub_forward_context(*, scheduled_bs, target_bs, use_cudagraph=True):
         is_dummy_run=False,
         is_draft=False,
         positions=None,
-        forward_mode=types.SimpleNamespace(
-            use_cudagraph=use_cudagraph, running_bs=target_bs
-        ),
+        forward_mode=types.SimpleNamespace(use_cudagraph=use_cudagraph),
     )
     # `prepare_decode` publishes the ring slots at the PADDED batch, so the stub
     # does too -- the block slices to that length and nothing stages it.
@@ -994,9 +992,26 @@ def _stub_forward_context(*, scheduled_bs, target_bs, use_cudagraph=True):
     return types.SimpleNamespace(context=context, attn_metadata=attn_metadata)
 
 
-def _proposer_with_graph_bs(monkeypatch, *, eplb=False, mtp_k=5, window=128):
-    """A DSparkProposer carrying only what the block pass reads."""
+def _proposer_with_graph_bs(
+    monkeypatch, *, eplb=False, mtp_k=5, window=128, captured=True
+):
+    """A DSparkProposer carrying only what the block pass reads.
+
+    ``captured`` is the fixture keeping its own name's promise: the startup
+    sweep records every capture size, and `propose` widens only for a batch
+    that has a recording. Answered through `is_captured` rather than by filling
+    `_cuda_graphs`, so `run` still reaches the backbone -- the only place these
+    tests can watch the width. `captured=False` is the no-recording case, where
+    widening would hand the variable-length MoE gather rows nothing replays.
+    """
+    from atom.spec_decode.draft_graph import DraftGraph
     from atom.spec_decode.dspark_proposer import DSparkProposer
+
+    monkeypatch.setattr(
+        DraftGraph,
+        "is_captured",
+        lambda self, running_bs: captured and running_bs in _GRAPH_BS,
+    )
 
     monkeypatch.setattr(DSparkProposer, "_with_draft", False, raising=False)
     monkeypatch.setattr(
@@ -1031,7 +1046,7 @@ def _proposer_with_graph_bs(monkeypatch, *, eplb=False, mtp_k=5, window=128):
     return p
 
 
-def _run_propose(p, fc, real_bs, monkeypatch, seen):
+def _run_propose(p, fc, scheduled_bs, monkeypatch, seen):
     import atom.spec_decode.dspark_proposer as mod
 
     def _backbone(ids, pos, num_draft):
@@ -1067,18 +1082,18 @@ def _run_propose(p, fc, real_bs, monkeypatch, seen):
     monkeypatch.setattr(mod, "get_forward_context", lambda: fc)
     return p.propose(
         target_token_ids=None,
-        target_positions=torch.arange(real_bs, dtype=torch.int64) * 7 + 3,
-        target_hidden_states=torch.zeros(real_bs, 4),
+        target_positions=torch.arange(scheduled_bs, dtype=torch.int64) * 7 + 3,
+        target_hidden_states=torch.zeros(scheduled_bs, 4),
         num_reject_tokens=None,
-        next_token_ids=torch.full((real_bs,), 5, dtype=torch.int32),
-        last_token_indices=torch.arange(real_bs, dtype=torch.int64),
+        next_token_ids=torch.full((scheduled_bs,), 5, dtype=torch.int32),
+        last_token_indices=torch.arange(scheduled_bs, dtype=torch.int64),
     )
 
 
 @pytest.mark.parametrize(
-    "real_bs,expect_B", [(44, 48), (50, 64), (1, 1), (64, 64), (35, 48)]
+    "scheduled_bs,expect_B", [(44, 48), (50, 64), (1, 1), (64, 64), (35, 48)]
 )
-def test_propose_drafts_at_the_captured_graph_bs(monkeypatch, real_bs, expect_B):
+def test_propose_drafts_at_the_captured_graph_bs(monkeypatch, scheduled_bs, expect_B):
     """The block runs at the target's running_bs, not the live batch size.
 
     Without this the drafter hands aiter a fresh width on every distinct decode
@@ -1087,42 +1102,112 @@ def test_propose_drafts_at_the_captured_graph_bs(monkeypatch, real_bs, expect_B)
     """
     seen = {}
     p = _proposer_with_graph_bs(monkeypatch)
-    fc = _stub_forward_context(scheduled_bs=real_bs, target_bs=expect_B)
-    out = _run_propose(p, fc, real_bs, monkeypatch, seen)
+    fc = _stub_forward_context(scheduled_bs=scheduled_bs, target_bs=expect_B)
+    out = _run_propose(p, fc, scheduled_bs, monkeypatch, seen)
 
     assert seen["B"] == expect_B
     assert seen["positions_B"] == expect_B
     # The block does not touch the target's ring slots: they arrive already at
     # the padded length, so there is nothing to install and nothing to restore.
     assert seen["slots"].shape[0] >= expect_B
-    assert seen["slots"][:real_bs].tolist() == list(range(100, 100 + real_bs))
-    assert out.shape[0] == real_bs
+    assert seen["slots"][:scheduled_bs].tolist() == list(range(100, 100 + scheduled_bs))
+    assert out.shape[0] == scheduled_bs
 
     # ...but the rows it fabricated must scatter no draft KV. Their ring slot is
     # the 0 `prepare_decode` fills that tail with, and 0 is a real position, so
     # an unmasked pad row writes into another request's window.
     t = p.mtp_k
     ids = seen["batch_ids"]
-    assert ids[: real_bs * t].tolist() == [i // t for i in range(real_bs * t)]
-    assert ids[real_bs * t : expect_B * t].tolist() == [-1] * (expect_B - real_bs) * t
+    assert ids[: scheduled_bs * t].tolist() == [i // t for i in range(scheduled_bs * t)]
+    assert (
+        ids[scheduled_bs * t : expect_B * t].tolist()
+        == [-1] * (expect_B - scheduled_bs) * t
+    )
 
 
-@pytest.mark.parametrize(
-    "cudagraph,eplb,why",
-    [
-        (False, False, "eager: the target pinned no wider batch to follow"),
-        (True, True, "pad rows would poison the expert-load histogram"),
-    ],
-)
-def test_propose_leaves_the_batch_alone_when_nothing_pins_a_wider_one(
-    monkeypatch, cudagraph, eplb, why
-):
+def test_propose_reports_the_rows_it_ran_not_the_rows_that_were_real(monkeypatch):
+    """Both units at the padded height, because the pass computed every row.
+
+    `_publish_draft_shape` re-points the context at THIS pass, and MoE's
+    variable-length gather takes `scheduled_tokens` as "how many rows did you
+    hand me". Reporting the real count against a padded tensor is a contract
+    break, not a conservative choice: `dp_gather_hidden_and_router` asserts the
+    two agree, and it aborted 8/8 ranks on the first decode step the moment a
+    batch had no recording to replay.
+
+    Runs with no recording precisely because that is the case the old code got
+    away with by never reaching the Python.
+    """
     seen = {}
-    p = _proposer_with_graph_bs(monkeypatch, eplb=eplb)
-    fc = _stub_forward_context(scheduled_bs=44, target_bs=48, use_cudagraph=cudagraph)
+    p = _proposer_with_graph_bs(monkeypatch, captured=False)
+    fc = _stub_forward_context(scheduled_bs=44, target_bs=48)
     out = _run_propose(p, fc, 44, monkeypatch, seen)
-    assert seen["B"] == 44, why
-    assert out.shape[0] == 44
+
+    t = p.mtp_k
+    assert seen["B"] == 48, "the pass runs the agreed batch, recording or not"
+    assert fc.context.scheduled_tokens == fc.context.running_tokens == 48 * t
+    assert out.shape[0] == 44, "sliced back to the real requests on the way out"
+    # ...and the fabricated rows still scatter no draft KV.
+    ids = seen["batch_ids"]
+    assert ids[44 * t : 48 * t].tolist() == [-1] * (4 * t)
+
+
+def test_propose_pads_under_eplb_exactly_as_it_does_without_it(monkeypatch):
+    """EPLB is not a reason to decline the padding, though it used to be.
+
+    The stated reason was the expert-load histogram: a pad row routes through
+    the draft's MoE and `select_experts_with_record` counts it. But the TARGET
+    pads on every cudagraph decode step and its rows reach the same recorder
+    (`eplb_map_and_record_fused` masks nothing), in far greater volume -- so
+    declining here protected nothing and only cost the draft its warmed shape.
+
+    Asserting the two are EQUAL, not that either is 48: a future term that
+    reads the config back into the width fails here whichever way it leans.
+    """
+    seen_on, seen_off = {}, {}
+    _run_propose(
+        _proposer_with_graph_bs(monkeypatch, eplb=True),
+        _stub_forward_context(scheduled_bs=44, target_bs=48),
+        44,
+        monkeypatch,
+        seen_on,
+    )
+    _run_propose(
+        _proposer_with_graph_bs(monkeypatch, eplb=False),
+        _stub_forward_context(scheduled_bs=44, target_bs=48),
+        44,
+        monkeypatch,
+        seen_off,
+    )
+    assert seen_on["B"] == seen_off["B"] == 48
+
+
+def test_propose_replays_at_the_agreed_batch_even_when_it_had_to_pad(monkeypatch):
+    """The seam, end to end through `propose`.
+
+    A step whose real batch is 44 runs the block at the agreed 48 and stands in
+    for the recording there. Watched through the recording being returned and
+    the backbone never running -- asserting the label alone would pass on a
+    `run` that replays nothing.
+    """
+    seen = {}
+    p = _proposer_with_graph_bs(monkeypatch)
+    recorded = (
+        torch.full((48, p.mtp_k), 9, dtype=torch.int32),
+        torch.zeros(48, p.mtp_k),
+    )
+    replays = []
+    p.block._cuda_graphs[48] = (
+        types.SimpleNamespace(replay=lambda: replays.append(1)),
+        recorded,
+    )
+    fc = _stub_forward_context(scheduled_bs=44, target_bs=48)
+    out = _run_propose(p, fc, 44, monkeypatch, seen)
+    assert replays == [1], "must replay the recording at the agreed batch"
+    assert "B" not in seen, "the backbone must not run when the recording stands in"
+    # Sliced back to the real batch: the 4 fabricated rows are the recording's
+    # to compute and nobody's to return.
+    assert out.tolist() == recorded[0][:44, : p.mtp_k].tolist()
 
 
 def test_propose_pads_a_dp_sync_dummy_exactly_like_the_rank_with_work(monkeypatch):
@@ -1348,12 +1433,12 @@ def test_the_separate_draft_model_path_declares_no_draft_graph(monkeypatch):
     the warmup and epilogue reach for -- and `warmup` runs both BEFORE it
     consults the pad/capture gates. So an unpaddable-but-declared pass still
     takes the startup sweep through `_block_warmup_inputs` and dies with an
-    AttributeError, which is what leaving this at `pads = False` used to do.
+    AttributeError, so declining to pad was never enough to keep it out.
     """
     from atom.spec_decode.dspark_proposer import DSparkProposer
 
     p = _proposer_with_graph_bs(monkeypatch)
-    assert p.draft_graphs and p.block.pads
+    assert p.draft_graphs and p.block is not None
 
     monkeypatch.setattr(DSparkProposer, "_with_draft", True, raising=False)
     p._build_draft_graphs()

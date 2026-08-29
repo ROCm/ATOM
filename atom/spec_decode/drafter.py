@@ -568,7 +568,7 @@ class Drafter(abc.ABC):
         parallel_config = self.config.parallel_config
         if parallel_config.data_parallel_size <= 1:
             return
-        context.dp_uniform_decode = False
+        context.running_tokens_are_unified = False
         forward_context.dp_metadata = DPMetadata.make(
             parallel_config,
             running_tokens,

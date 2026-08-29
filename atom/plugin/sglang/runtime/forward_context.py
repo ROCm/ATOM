@@ -152,7 +152,7 @@ def _resolve_num_tokens_across_dp(
     return num_tokens_across_dp
 
 
-def _resolve_dp_uniform_decode(
+def _resolve_running_tokens_are_unified(
     atom_config: Any,
     forward_batch: ForwardBatch,
 ) -> bool:
@@ -796,7 +796,9 @@ def _set_atom_forward_context(
     # ubatch `max_seqlen_q` times too wide. Prefill's value is unread there.
     running_bs = batch_size if is_prefill else max(1, running_tokens // max_q)
 
-    dp_uniform_decode = _resolve_dp_uniform_decode(atom_config, forward_batch)
+    running_tokens_are_unified = _resolve_running_tokens_are_unified(
+        atom_config, forward_batch
+    )
     context = Context(
         positions=positions,
         is_prefill=is_prefill,
@@ -805,7 +807,7 @@ def _set_atom_forward_context(
         scheduled_tokens=num_tokens,
         running_bs=running_bs,
         running_tokens=running_tokens,
-        dp_uniform_decode=dp_uniform_decode,
+        running_tokens_are_unified=running_tokens_are_unified,
     )
     set_forward_context(
         attn_metadata=attn_metadata,
