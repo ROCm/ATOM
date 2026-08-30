@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import logging
-
 from collections import OrderedDict, deque
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass

@@ -5182,9 +5182,9 @@ class TestJointLegsShareOneCompletionIdentity:
         """Nothing armed it, so neither channel may be held back."""
         worker = _k3_worker()
         kv_only = LoadOperationId("r9", 0)
-        done, failed = worker._settle_joint({kv_only}, set(), set(), set())
+        done, _failed = worker._settle_joint({kv_only}, set(), set(), set())
         assert done == {kv_only}
-        done, failed = worker._settle_joint(set(), set(), {"r8"}, set())
+        done, _failed = worker._settle_joint(set(), set(), {"r8"}, set())
         assert done == {"r8"}
 
 
