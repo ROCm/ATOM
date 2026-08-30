@@ -328,30 +328,59 @@ class _KimiMLAGDNCommon(GDNStateMixin):
             )
         return out
 
+    def _page_unit_index_cache(self) -> torch.Tensor | None:
+        """The indexer key cache a PAGE unit owns a region of, or `None`.
+
+        Read through the same predicate `sub_pool_specs` prices with, so the
+        two cannot disagree: a unit owns index-cache bytes exactly when the
+        pool was priced with them.
+        """
+        runner = self.model_runner
+        if not runner.is_deepseek_v32:
+            return None
+        return getattr(runner, "index_cache", None)
+
     def _page_unit_regions(self) -> tuple[np.ndarray, np.ndarray]:
         """Base address and per-unit stride of every region a PAGE id owns.
 
         The destination side of a checkpoint copy. `GDNStateMixin` knows where
         a state slot's bytes are; this knows where a KV block's are, because
-        this class owns the MLA pool.
+        this class owns the paged pool.
 
         `kv_cache` is `(rows, physical_blocks, physical_block_size, entry)`,
         so a block owns one contiguous region per row and the rows are a fixed
         stride apart. Affine in the block id, and a property of the pool rather
         than of any block, so it is worked out once.
 
+        A block owns more than the MLA pool once the model has a sparse
+        indexer. GLM-5.3-Flash's index cache rides this same paged pool and
+        `sub_pool_specs` prices a unit with those bytes in it, so they are
+        named here too -- as DSV4 names its indexer pools, and for the same
+        reason: `units_per_checkpoint` is `ceil(image / page_unit_bytes)`, so
+        regions that cover less than a unit was priced for leave the tail of
+        every image with nowhere to land. That cache is `(layers,
+        scheduler_blocks, rows_per_block, aligned_dim)`, indexed by the
+        logical block a unit id already names, so a unit owns one contiguous
+        region per indexer layer and the layers are a fixed stride apart --
+        the same shape of answer the MLA rows give.
+
         The units are the trap. `unit_ids` carries **logical** block ids -- what
-        `BlockPool` hands out and what `sub_pool_specs` priced -- while the
+        `BlockPool` hands out and what `sub_pool_specs` priced -- while the MLA
         tensor is shaped in **physical** blocks, and K3's `block_ratio` is 128.
-        So a region is `runner.block_size` tokens wide, not
+        So a region there is `runner.block_size` tokens wide, not
         `physical_block_size`, and the two differ by exactly that ratio. The
-        assertion below is what makes a mix-up a startup error rather than 127
-        blocks of scrambled state: it is the one relation that cannot hold if
-        the granularity is wrong.
+        index cache needs no such conversion; its block axis is logical
+        already. The assertion below is what makes a mix-up a startup error
+        rather than 127 blocks of scrambled state: it is the one relation that
+        cannot hold if the granularity is wrong.
         """
         runner = self.model_runner
         cache = runner.kv_cache
-        owner = cache.data_ptr()
+        index_cache = self._page_unit_index_cache()
+        owner = (
+            cache.data_ptr(),
+            None if index_cache is None else index_cache.data_ptr(),
+        )
         cached = getattr(self, "_page_unit_region_cache", None)
         if cached is not None and cached[0] == owner:
             return cached[1]
@@ -364,20 +393,40 @@ class _KimiMLAGDNCommon(GDNStateMixin):
         # One logical block's bytes inside one row.
         region = runner.block_size * entry * item
         row_stride = cache.stride(0) * item
+        bases = [cache.data_ptr() + row * row_stride for row in range(rows)]
+        sizes = [region] * rows
+
+        index_layers, index_region = 0, 0
+        if index_cache is not None:
+            if not index_cache.is_contiguous():
+                raise RuntimeError("the index cache must be contiguous to be copied")
+            index_item = index_cache.element_size()
+            index_layers = index_cache.shape[0]
+            layer_stride = index_cache.stride(0) * index_item
+            index_region = index_cache.stride(1) * index_item
+            bases += [
+                index_cache.data_ptr() + layer * layer_stride
+                for layer in range(index_layers)
+            ]
+            sizes += [index_region] * index_layers
 
         runtime = getattr(runner, "state_runtime", None)
         spec = None if runtime is None else runtime.checkpoint_spec
-        page_unit_bytes = spec.page_unit_bytes if spec is not None else rows * region
-        if rows * region != page_unit_bytes:
+        owned = sum(sizes)
+        page_unit_bytes = spec.page_unit_bytes if spec is not None else owned
+        if owned != page_unit_bytes:
+            gives = f"{rows} rows x {region} B"
+            if index_cache is not None:
+                gives += f" + {index_layers} index layers x {index_region} B"
             raise RuntimeError(
                 f"a PAGE unit is {page_unit_bytes} B but this pool gives a "
-                f"logical block {rows} rows x {region} B = {rows * region} B; "
-                "the two disagree about block granularity"
+                f"logical block {gives} = {owned} B; the two disagree about "
+                "block granularity"
             )
-        base = np.array(
-            [owner + row * row_stride for row in range(rows)], dtype=np.int64
+        regions = (
+            np.array(bases, dtype=np.int64),
+            np.array(sizes, dtype=np.int64),
         )
-        regions = (base, np.full(rows, region, dtype=np.int64))
         self._page_unit_region_cache = (owner, regions)
         return regions
 

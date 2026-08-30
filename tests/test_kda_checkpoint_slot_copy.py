@@ -237,9 +237,12 @@ class TestPageUnitAddressesAreArithmetic:
             kv_cache=cache,
             block_size=self.LOGICAL_BS if block_size is None else block_size,
             state_runtime=runtime,
+            # K3 itself: no sparse indexer, so the MLA pool is all a unit owns.
+            is_deepseek_v32=False,
         )
         stub = SimpleNamespace(model_runner=runner, _page_unit_region_cache=None)
         for name in (
+            "_page_unit_index_cache",
             "_page_unit_regions",
             "_page_unit_bases",
             "_page_unit_stream_sizes",
@@ -351,6 +354,7 @@ class TestAStoreRestoreRoundTripMovesExactlyTheImage:
             block_size=self.LOGICAL_BS,
             num_gdn_attn_state=self.N_LAYERS,
             state_runtime=runtime,
+            is_deepseek_v32=False,
         )
         stub = SimpleNamespace(
             model_runner=runner,
@@ -368,6 +372,7 @@ class TestAStoreRestoreRoundTripMovesExactlyTheImage:
         ):
             setattr(stub, name, getattr(Mixin, name).__get__(stub, type(stub)))
         for name in (
+            "_page_unit_index_cache",
             "_page_unit_regions",
             "_page_unit_bases",
             "_page_unit_stream_sizes",
@@ -441,4 +446,212 @@ class TestAStoreRestoreRoundTripMovesExactlyTheImage:
         # Beyond the units the image claimed, the pool is untouched.
         for row in range(self.ROWS):
             tail = pool[row].reshape(-1)[len(units) * self.LOGICAL_BS * self.ENTRY :]
+            assert int(tail.sum()) == 0
+
+
+class TestAnIndexerSharesThePageUnit:
+    """GLM-5.3-Flash's index cache rides the same paged pool as its MLA rows.
+
+    `sub_pool_specs` adds the index cache to the price of a block, so a unit
+    is the MLA regions AND one index region per indexer layer. Naming only the
+    MLA side is not a smaller copy — `units_per_checkpoint` is
+    `ceil(image / page_unit_bytes)`, priced against the whole block, so the
+    tail of every image would have no region to land in.
+    """
+
+    ROWS = 2  # MLA layers
+    ENTRY = 4
+    LOGICAL_BS = 8  # tokens per logical block
+    RATIO = 2  # block_ratio: physical blocks per logical block
+    N_LOGICAL = 6
+    INDEX_LAYERS = 3
+    INDEX_ROWS = 2  # index rows one block owns, i.e. pooled: block_size // kpool
+    INDEX_DIM = 3
+    # Production stores fp8 here. Two bytes wide in the test on purpose: at one
+    # byte a dropped `element_size()` is an identity, and the region arithmetic
+    # is what is under test.
+    INDEX_DT = torch.bfloat16
+
+    @property
+    def region(self) -> int:
+        return self.LOGICAL_BS * self.ENTRY
+
+    @property
+    def index_region(self) -> int:
+        return self.INDEX_ROWS * self.INDEX_DIM * self.INDEX_DT.itemsize
+
+    @property
+    def unit_bytes(self) -> int:
+        return self.ROWS * self.region + self.INDEX_LAYERS * self.index_region
+
+    def build(self, spec_bytes=None, indexed=True):
+        phys_bs = self.LOGICAL_BS // self.RATIO
+        cache = torch.zeros(
+            self.ROWS,
+            self.N_LOGICAL * self.RATIO,
+            phys_bs,
+            self.ENTRY,
+            dtype=torch.uint8,
+        )
+        # `(layers, scheduler_blocks, rows_per_block, aligned_dim)`: the block
+        # axis is logical already, which is why nothing here divides by
+        # `block_ratio` the way the MLA side must.
+        index_cache = torch.zeros(
+            self.INDEX_LAYERS,
+            self.N_LOGICAL,
+            self.INDEX_ROWS,
+            self.INDEX_DIM,
+            dtype=self.INDEX_DT,
+        )
+        runtime = SimpleNamespace(
+            checkpoint_spec=SimpleNamespace(
+                page_unit_bytes=self.unit_bytes if spec_bytes is None else spec_bytes
+            )
+        )
+        runner = SimpleNamespace(
+            kv_cache=cache,
+            index_cache=index_cache,
+            block_size=self.LOGICAL_BS,
+            state_runtime=runtime,
+            is_deepseek_v32=indexed,
+        )
+        stub = SimpleNamespace(model_runner=runner, _page_unit_region_cache=None)
+        for name in (
+            "_page_unit_index_cache",
+            "_page_unit_regions",
+            "_page_unit_bases",
+            "_page_unit_stream_sizes",
+        ):
+            method = getattr(K3._KimiMLAGDNCommon, name)
+            setattr(stub, name, method.__get__(stub, type(stub)))
+        return stub, cache, index_cache
+
+    def test_a_unit_owns_one_region_per_mla_row_and_one_per_indexer_layer(self):
+        stub, _, _ = self.build()
+        base, stride = stub._page_unit_regions()
+        assert len(base) == len(stride) == self.ROWS + self.INDEX_LAYERS
+        assert stride.tolist() == (
+            [self.region] * self.ROWS + [self.index_region] * self.INDEX_LAYERS
+        )
+
+    def test_the_index_addresses_are_the_ones_slicing_gives(self):
+        """The oracle, written out here rather than kept in production."""
+        stub, _, index_cache = self.build()
+        for unit in range(self.N_LOGICAL):
+            addrs = stub._page_unit_bases([[unit]])[0]
+            for layer in range(self.INDEX_LAYERS):
+                assert addrs[self.ROWS + layer] == index_cache[layer, unit].data_ptr()
+
+    def test_the_regions_sum_to_what_the_unit_was_priced_at(self):
+        """The relation the pool and the copy both depend on, and the one that
+        broke when the indexer joined the pool: sizing counted the index cache
+        into a block's bytes while the copy still described the MLA rows
+        alone, and startup aborted on the mismatch."""
+        stub, _, _ = self.build()
+        spec = stub.model_runner.state_runtime.checkpoint_spec
+        assert int(stub._page_unit_regions()[1].sum()) == spec.page_unit_bytes
+
+    def test_a_unit_priced_without_the_index_cache_is_refused(self):
+        stub, _, _ = self.build(spec_bytes=self.ROWS * self.region)
+        with pytest.raises(RuntimeError, match="index layers"):
+            stub._page_unit_regions()
+
+    def test_a_model_without_an_indexer_keeps_the_mla_regions_alone(self):
+        """K3 shares this code and prices no index cache into its blocks."""
+        stub, _, _ = self.build(spec_bytes=self.ROWS * self.region, indexed=False)
+        base, stride = stub._page_unit_regions()
+        assert len(base) == len(stride) == self.ROWS
+
+    def test_a_non_contiguous_index_cache_is_refused_not_mis_addressed(self):
+        stub, _, index_cache = self.build()
+        stub.model_runner.index_cache = index_cache.transpose(0, 1)
+        with pytest.raises(RuntimeError, match="contiguous"):
+            stub._page_unit_regions()
+
+    def test_the_regions_are_worked_out_once_but_notice_a_moved_index_cache(self):
+        """Two pools now, so the key has to be both: an index cache that moved
+        under a cached answer scatters into whatever holds that address next."""
+        stub, _, index_cache = self.build()
+        first = stub._page_unit_regions()
+        assert stub._page_unit_regions() is first
+
+        stub.model_runner.index_cache = torch.zeros_like(index_cache)
+        assert stub._page_unit_regions() is not first
+
+
+class TestAnImageSpansBothPoolsIntact:
+    """Store a slot into units that reach into the index cache, gather it back.
+
+    Host `memmove`, as in the pure-MLA round trip above: what is under test is
+    which bytes the descriptor names.
+    """
+
+    SLOTS = 4
+    GEO = TestAnIndexerSharesThePageUnit()
+
+    def build(self):
+        from atom.model_ops.attentions.paged_state_copy import plan_segmented_copy
+
+        stub, pool, index_cache = self.GEO.build()
+        k = torch.zeros((N_LAYERS, self.SLOTS) + SHAPE_K, dtype=DT_K)
+        v = torch.zeros((N_LAYERS, self.SLOTS) + SHAPE_V, dtype=DT_V)
+        for s in range(self.SLOTS):
+            k[:, s].view(torch.uint8).fill_(0x10 + s)
+            v[:, s].view(torch.uint8).fill_(0x40 + s)
+        runner = stub.model_runner
+        runner.mamba_k_cache = k
+        runner.mamba_v_cache = v
+        runner.num_gdn_attn_state = N_LAYERS
+        stub._state_shape_for_runner = lambda: (SHAPE_K, SHAPE_V)
+        stub._state_dtypes = lambda: (DT_K, DT_V)
+        for name in (
+            "_checkpoint_plane_shapes",
+            "_checkpoint_num_slots",
+            "_checkpoint_layer_ranges",
+            "_checkpoint_segment_sizes",
+            "_checkpoint_slot_bases",
+            "checkpoint_image_bytes",
+        ):
+            setattr(stub, name, getattr(Mixin, name).__get__(stub, type(stub)))
+        return stub, k, v, pool, index_cache, plan_segmented_copy
+
+    def units_for(self, stub):
+        image = stub.checkpoint_image_bytes()
+        return list(range(-(-image // self.GEO.unit_bytes)))
+
+    def test_the_image_arrives_intact_in_a_different_slot(self):
+        stub, k, v, _, _, plan_fn = self.build()
+        units = self.units_for(stub)
+        assert len(units) <= self.GEO.N_LOGICAL
+
+        round_trip = TestAStoreRestoreRoundTripMovesExactlyTheImage.round_trip
+        round_trip(self, stub, plan_fn, units, src=1, dst=3)
+        assert torch.equal(k[:, 3], k[:, 1])
+        assert torch.equal(v[:, 3], v[:, 1])
+
+    def test_the_image_really_uses_its_index_regions(self):
+        """Otherwise the test above would pass on a copy that quietly fit in
+        the MLA rows -- which is what makes the priced tail a live question."""
+        stub, _, _, _, index_cache, plan_fn = self.build()
+        units = self.units_for(stub)
+        mla_only = self.GEO.ROWS * self.GEO.region * len(units)
+        assert stub.checkpoint_image_bytes() > mla_only
+
+        round_trip = TestAStoreRestoreRoundTripMovesExactlyTheImage.round_trip
+        round_trip(self, stub, plan_fn, units, src=1, dst=3)
+        assert index_cache.view(torch.uint8).any()
+
+    def test_no_block_beyond_the_image_is_written(self):
+        """The units an image claims are pinned; anything past them belongs to
+        a live request, in either pool."""
+        stub, _, _, pool, index_cache, plan_fn = self.build()
+        units = self.units_for(stub)
+
+        round_trip = TestAStoreRestoreRoundTripMovesExactlyTheImage.round_trip
+        round_trip(self, stub, plan_fn, units, src=1, dst=3)
+        for row in range(self.GEO.ROWS):
+            tail = pool[row].reshape(-1)[len(units) * self.GEO.region :]
+            assert int(tail.sum()) == 0
+        for layer in range(self.GEO.INDEX_LAYERS):
+            tail = index_cache[layer, len(units) :].reshape(-1).view(torch.uint8)
             assert int(tail.sum()) == 0
