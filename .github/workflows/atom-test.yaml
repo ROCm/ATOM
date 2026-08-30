@@ -270,6 +270,43 @@ jobs:
       CONTAINER_NAME: atom_test_${{ strategy.job-index }}
 
     steps:
+      - name: Prune stale Docker data on TW runners
+        if: matrix.runner == 'linux-atom-do-mi350x-8'
+        run: |
+          set -euo pipefail
+
+          if ! command -v docker >/dev/null 2>&1; then
+            echo "docker CLI is not available, skipping stale Docker cleanup"
+            exit 0
+          fi
+
+          if ! docker info >/dev/null 2>&1; then
+            echo "Docker daemon is not available, skipping stale Docker cleanup"
+            exit 0
+          fi
+
+          docker_root="$(docker info --format '{{.DockerRootDir}}')"
+          docker_root="${docker_root:-/var/lib/docker}"
+          echo "Pruning Docker resources older than 30 days on runner: ${RUNNER_NAME:-$(hostname)}"
+          echo "Docker root: ${docker_root}"
+          df -h / "${docker_root}" || true
+          docker system df || true
+
+          available_kb="$(df -Pk "${docker_root}" 2>/dev/null | awk 'NR == 2 {print $4}' || true)"
+          threshold_kb=$((500 * 1024 * 1024))
+          if [ "${available_kb:-0}" -ge "${threshold_kb}" ]; then
+            echo "Docker root has at least 500 GiB free, skipping stale Docker cleanup"
+            exit 0
+          fi
+
+          echo "Docker root has less than 500 GiB free, pruning Docker resources older than 30 days"
+          docker container prune -f --filter "until=720h" || true
+          docker image prune -af --filter "until=720h" || true
+          docker builder prune -af --filter "until=720h" || true
+
+          docker system df || true
+          df -h / "${docker_root}" || true
+
       - name: Kill all Docker containers and clean up workspace
         if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'linux-atom-do-mi350x-8'
         run: |
@@ -667,7 +704,8 @@ jobs:
           # We should use non-root user to run the test to avoid this issue.
           set -x
           echo "========== Cleaning up workspace =========="
-          if [[ ${{ matrix.runner }} == atom-mi355-8gpu.predownload ]]; then
+          runner_label="${{ matrix.runner }}"
+          if [[ "${runner_label}" == "linux-atom-do-mi350x-8" ]]; then
             docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged rocm/pytorch:latest bash -lc "ls -la /workspace/ && find /workspace -mindepth 1 -delete" || true
           fi
           docker stop "$CONTAINER_NAME" || true

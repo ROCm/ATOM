@@ -2974,7 +2974,7 @@ class FusedMoE(torch.nn.Module):
         _dp_shard = self.use_ep and atom_config.enable_dp_attention
         self.balance_router_logits = (
             init_balance_router_logits(
-                self.global_num_experts,
+                self.expert_layout.num_routed,
                 top_k,
                 self.ep_size if self.use_ep else 1,
                 self.dp_size if _dp_shard else 1,
