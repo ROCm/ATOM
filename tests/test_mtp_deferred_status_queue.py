@@ -4,7 +4,13 @@ from unittest import mock
 import numpy as np
 import pytest
 
-pytest.importorskip("aiter", reason="requires AITER to import model_runner")
+# On the module, not on "aiter" -- see tests/test_dspark.py for why a name-only
+# guard passes on the non-GPU runner and then aborts collection.
+pytest.importorskip(
+    "atom.model_engine.model_runner",
+    reason="requires AITER to import model_runner",
+    exc_type=ImportError,
+)
 
 from atom.model_engine.model_runner import tokenIDProcessor
 from atom.model_engine.scheduler import ScheduledBatch

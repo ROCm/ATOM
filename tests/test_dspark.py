@@ -9,7 +9,15 @@ import types
 
 import pytest
 
-pytest.importorskip("aiter", reason="the compiled draft imports aiter at module load")
+# Named on the module, not on "aiter": a test collected after one that stubs
+# `sys.modules["aiter"]` (tests/test_pd_pp.py does) sees the name import fine
+# and dies on a symbol, which is a collection error and takes the suite with
+# it. `exc_type` is what turns that ImportError into a skip.
+pytest.importorskip(
+    "atom.spec_decode.drafter",
+    reason="the compiled draft imports aiter at module load",
+    exc_type=ImportError,
+)
 
 import torch
 
