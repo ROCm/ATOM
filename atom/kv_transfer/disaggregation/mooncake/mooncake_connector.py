@@ -421,7 +421,8 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         self.dp_rank = config.parallel_config.data_parallel_rank
         self.pp_size = config.pipeline_parallel_size
         self.block_size = config.kv_cache_block_size
-        self.hash_block_size = self.block_size * config.decode_context_parallel_size
+        self.dcp_size = config.decode_context_parallel_size
+        self.hash_block_size = self.block_size * self.dcp_size
         self.host_ip = get_ip()
 
         # Pending requests: req_id -> (Sequence, block_table)
@@ -502,14 +503,15 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             # not covered by a block-only delta, so it takes a full transfer.
             num_computed_blocks = 0
             remote_hash_block_size = params.get("hash_block_size")
-            if remote_hash_block_size != self.hash_block_size:
+            if remote_hash_block_size != self.block_size:
                 logger.warning(
                     "PD incremental transfer disabled for req %s: producer "
-                    "hash_block_size=%r, consumer hash_block_size=%d; "
+                    "hash_block_size=%r, consumer block_size=%d (dcp=%d); "
                     "falling back to full transfer",
                     seq.id,
                     remote_hash_block_size,
-                    self.hash_block_size,
+                    self.block_size,
+                    self.dcp_size,
                 )
             elif not seq.has_per_req_cache and self.hash_block_size > 0:
                 num_computed_blocks = seq.num_cached_tokens // self.hash_block_size
