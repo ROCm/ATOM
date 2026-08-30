@@ -92,12 +92,10 @@ def q(value):
     return shlex.quote(str(shell_value(value)))
 
 slurm_submit_runner = runner.get("slurm_submit_runner", "atomesh-cicd")
-action_runner_v2_01 = "atomesh_action_runner_v2_01"
 spur_controller_addr = runner.get("spur_controller_addr")
 crusoe_runner_labels = {
     "atomesh-cicd-crusoe-mi355",
     "atomesh-cicd-mi355-crusoe",
-    action_runner_v2_01,
 }
 if not spur_controller_addr:
     if slurm_submit_runner in crusoe_runner_labels:
@@ -269,7 +267,11 @@ SLURM_ACCOUNTING_POLL_INTERVAL="${SLURM_ACCOUNTING_POLL_INTERVAL:-2}"
 if [[ -z "${NODE_LIST:-}" && -n "${SLURM_NODELIST:-}" ]]; then
   NODE_LIST="${SLURM_NODELIST}"
 fi
-if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh_action_runner_v2_01" ]]; then
+if [[ "${RUNNER_NAME:-}" == "atomesh_action_runner_v2_01" ]]; then
+  NODE_LIST="crsuse2-m2m-v2-030,crsuse2-m2m-v2-031,crsuse2-m2m-v2-032,crsuse2-m2m-v2-044"
+  SPUR_CONTROLLER_ADDR="http://crs-m2m-cpu-spur-v2-001.crusoe.amd.com:6817"
+  SLURM_ACCOUNT="amd-aifw-dev"
+  SLURM_PARTITION=""
   if ! [[ "${NUM_NODES:-}" =~ ^[1-9][0-9]*$ ]]; then
     echo "ERROR: NUM_NODES must be a positive integer for candidate-node selection" >&2
     exit 2
@@ -281,10 +283,12 @@ if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh_action_runner_v2_01" ]]; then
   fi
   # Slurm 24.05 selects the requested --nodes subset from --nodelist.
   echo "candidate_nodes=${NODE_LIST}"
+  SLURM_NODELIST="${NODE_LIST}"
+else
+  SLURM_NODELIST="${SLURM_NODELIST:-${NODE_LIST}}"
 fi
-SLURM_NODELIST="${SLURM_NODELIST:-${NODE_LIST}}"
 USES_SPUR_CONTROLLER=0
-if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" || "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-crusoe-mi355" || "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi355-crusoe" || "${SLURM_SUBMIT_RUNNER}" == "atomesh_action_runner_v2_01" ]]; then
+if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" || "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-crusoe-mi355" || "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi355-crusoe" || "${RUNNER_NAME:-}" == "atomesh_action_runner_v2_01" ]]; then
   USES_SPUR_CONTROLLER=1
 fi
 
@@ -676,7 +680,7 @@ else
   if [[ -n "${SLURM_PARTITION}" ]]; then
     SBATCH_CMD+=(--partition "${SLURM_PARTITION}")
   fi
-  if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-crusoe-mi355" || "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi355-crusoe" || "${SLURM_SUBMIT_RUNNER}" == "atomesh_action_runner_v2_01" ]]; then
+  if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-crusoe-mi355" || "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi355-crusoe" || "${RUNNER_NAME:-}" == "atomesh_action_runner_v2_01" ]]; then
     SBATCH_CMD+=(--qos amd-aifw-dev-qos)
   fi
   SBATCH_CMD+=(

@@ -14,7 +14,6 @@ from typing import Any
 import yaml
 
 ENV_REF_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
-ACTION_RUNNER_V2_01 = "atomesh_action_runner_v2_01"
 
 
 def deep_merge(*items: dict[str, Any]) -> dict[str, Any]:
@@ -299,7 +298,6 @@ def build_cell(
     )
     required_nodes = required_node_count(pd_worker_layout, prefill_cfg, decode_cfg)
     slurm_submit_runner = str(runner_cfg.get("slurm_submit_runner", ""))
-    selects_from_candidate_nodes = slurm_submit_runner == ACTION_RUNNER_V2_01
     allow_auto_nodes = slurm_submit_runner in {
         "atomesh-cicd-mi350",
         "atomesh-cicd-crusoe-mi355",
@@ -308,18 +306,7 @@ def build_cell(
     requires_explicit_candidate_nodes = slurm_submit_runner == "atomesh-cicd-mi350"
 
     nodes = resolve_nodes(suite_cfg.get("nodes"))
-    if selects_from_candidate_nodes:
-        if not nodes:
-            raise ValueError(
-                f"{suite_cfg.get('name', model_name)} needs a non-empty "
-                "ATOMesh action-runner candidate nodelist"
-            )
-        if len(nodes) < required_nodes:
-            raise ValueError(
-                f"{suite_cfg.get('name', model_name)} needs at least "
-                f"{required_nodes} candidate node(s)"
-            )
-    elif allow_auto_nodes and not requires_explicit_candidate_nodes:
+    if allow_auto_nodes and not requires_explicit_candidate_nodes:
         nodes = []
     if allow_auto_nodes and requires_explicit_candidate_nodes:
         if not nodes:
@@ -332,13 +319,13 @@ def build_cell(
                 f"{suite_cfg.get('name', model_name)} needs at least "
                 f"{required_nodes} node(s)"
             )
-    elif single_node_pd and not selects_from_candidate_nodes:
+    elif single_node_pd:
         if not nodes and not allow_auto_nodes:
             raise ValueError(
                 f"{suite_cfg.get('name', model_name)} needs at least one node"
             )
         nodes = nodes[:1]
-    elif prefill_single_node_pd and not selects_from_candidate_nodes:
+    elif prefill_single_node_pd:
         if nodes and len(nodes) < required_nodes:
             raise ValueError(
                 f"{suite_cfg.get('name', model_name)} needs at least "
@@ -360,11 +347,7 @@ def build_cell(
             f"{suite_cfg.get('name', model_name)} needs at least "
             f"{required_nodes} node(s)"
         )
-    num_nodes = (
-        required_nodes
-        if allow_auto_nodes or selects_from_candidate_nodes
-        else len(nodes)
-    )
+    num_nodes = required_nodes if allow_auto_nodes else len(nodes)
 
     server_args = deep_merge(
         model_cfg.get("server", {}).get("common_args", {}),
