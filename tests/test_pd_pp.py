@@ -554,7 +554,11 @@ class _FakeMeta:
 
 
 def _fake_batch(req_ids, meta):
-    return SimpleNamespace(req_ids=list(req_ids), connector_meta_output=meta)
+    return SimpleNamespace(
+        req_ids=list(req_ids),
+        connector_meta_output=meta,
+        total_tokens_num=sum(getattr(meta, "num_tokens", [0]) or [0]) if meta else 0,
+    )
 
 
 def _pp_engine_core_cls():
@@ -574,7 +578,7 @@ def _pp_engine_core_cls():
     return PPEngineCoreProc
 
 
-def _fake_head(batch):
+def _fake_head(batch, *, stage_ack=None):
     PPEngineCoreProc = _pp_engine_core_cls()
 
     head = SimpleNamespace(
@@ -588,6 +592,8 @@ def _fake_head(batch):
         scheduler=MagicMock(),
         _poll_kv_transfer_progress=MagicMock(),
     )
+    if stage_ack is not None:
+        head.pp_transport.recv_tokens.return_value = stage_ack
     head.scheduler.schedule.side_effect = [(batch, {}), None]
     head.scheduler.take_rejected.return_value = None
     head._dispatch_connector_only_batch = (
@@ -627,14 +633,19 @@ def test_pp_head_skips_empty_meta_of_request_less_batch():
 
 def test_pp_head_forwards_normal_batch_with_meta():
     """A batch with requests keeps the original path: dispatch, send, forward."""
+    _pp_engine_core_cls()
+    from atom.model_engine.pp_engine_core import _pipeline_stage_ack
+
     meta = _FakeMeta(["load-r1"])
     batch = _fake_batch([7], meta)
     batch.produces_output = lambda: False
-    head = _fake_head(batch)
+    head = _fake_head(batch, stage_ack=_pipeline_stage_ack(batch))
 
     assert _dispatched_metas(head) == [meta]
     head.pp_transport.send_metadata.assert_called_once_with(batch)
     head.runner_mgr.call_func.assert_any_call("forward", batch, wait_out=True)
+    head.pp_transport.recv_tokens.assert_called()
+    assert len(head._in_flight) == 0
 
 
 def test_pp_downstream_skips_forward_for_request_less_batch():
@@ -645,6 +656,7 @@ def test_pp_downstream_skips_forward_for_request_less_batch():
     stage = SimpleNamespace(
         kv_transfer_enabled=True,
         is_last=True,
+        pp_rank=3,
         runner_mgr=MagicMock(),
         pp_transport=MagicMock(),
         scheduler=MagicMock(),
@@ -665,3 +677,37 @@ def test_pp_downstream_skips_forward_for_request_less_batch():
     ]
     assert forwards == []
     stage.pp_transport.send_tokens.assert_not_called()
+
+
+def test_pp_last_stage_sends_ack_for_middle_chunk():
+    """Last stage must ack middle-chunk forwards so the head bounds PP depth."""
+    PPEngineCoreProc = _pp_engine_core_cls()
+    from atom.model_engine.pp_engine_core import _pipeline_stage_ack
+
+    batch = _fake_batch([9], None)
+    batch.produces_output = lambda: False
+    batch.total_tokens_num = 64
+
+    stage = SimpleNamespace(
+        kv_transfer_enabled=False,
+        is_last=True,
+        pp_rank=3,
+        runner_mgr=MagicMock(),
+        pp_transport=MagicMock(),
+        scheduler=MagicMock(),
+        utility_handler=MagicMock(),
+        utility_queue=MagicMock(),
+        _is_idle_rl_weights_offloaded=lambda: False,
+        _poll_and_send_kv_status=MagicMock(),
+    )
+    stage.pull_and_process_input_queue = MagicMock(side_effect=[False, True])
+    stage.pp_transport.recv_metadata.return_value = batch
+    stage.runner_mgr.call_func.return_value = MagicMock()
+
+    PPEngineCoreProc._downstream_busy_loop(stage)
+
+    stage.pp_transport.send_tokens.assert_called_once()
+    ack = stage.pp_transport.send_tokens.call_args.args[0]
+    expected = _pipeline_stage_ack(batch)
+    assert list(ack.req_ids) == list(expected.req_ids)
+    assert ack.token_ids == expected.token_ids

@@ -8,6 +8,8 @@ import logging
 import queue
 from collections import deque
 
+import numpy as np
+
 from atom.distributed.pp_transport import PPStageTransport
 from atom.kv_transfer.disaggregation.pp_kv_aggregator import PPKVAggregator
 from atom.kv_transfer.disaggregation.types import (
@@ -16,9 +18,22 @@ from atom.kv_transfer.disaggregation.types import (
     connector_metadata_has_work,
 )
 from atom.model_engine.engine_core import EngineCore
-from atom.model_engine.scheduler import ScheduledBatch
+from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
 
 logger = logging.getLogger("atom")
+
+
+def _pipeline_stage_ack(batch: ScheduledBatch) -> ScheduledBatchOutput:
+    """Last-stage ack that a middle-chunk forward finished (no sampled tokens)."""
+    n = len(batch.req_ids)
+    return ScheduledBatchOutput(
+        req_ids=list(batch.req_ids),
+        token_ids=[()] * n,
+        num_rejected=np.zeros(n, dtype=np.int32),
+        num_bonus=np.zeros(n, dtype=np.int32),
+        draft_token_ids=None,
+        is_deferred_out=False,
+    )
 
 # Collect poll timeout when the step made no other progress: bounds both
 # new-request admission latency and busy-spinning while batches are in flight.
@@ -129,13 +144,6 @@ class PPEngineCoreProc(EngineCore):
         poll_ms = 0 if launched else _PP_HEAD_IDLE_POLL_MS
         while self._in_flight:
             scheduled_batch, seqs, needs_output = self._in_flight[0]
-            if not needs_output:
-                self._in_flight.popleft()
-                self.scheduler.release_pp_inflight(scheduled_batch)
-                if self._defer_prefix_hash:
-                    self._pending_prefix_hash.append((scheduled_batch, seqs))
-                continue
-
             fwd_out = self.pp_transport.recv_tokens(timeout_ms=poll_ms)
             if fwd_out is None:
                 break
@@ -148,21 +156,25 @@ class PPEngineCoreProc(EngineCore):
 
             self._in_flight.popleft()
             self.scheduler.release_pp_inflight(scheduled_batch)
-            self._flush_pending_prefix_hashes()
-            finished_seqs = self.scheduler.postprocess(
-                seqs.values(),
-                fwd_out,
-                stream_output_queue=self.stream_output_queue,
-                batch=scheduled_batch,
-            )
-            try:
-                while not self.stream_output_queue.empty():
-                    stream_outputs = self.stream_output_queue.get_nowait()
-                    self.output_queue.put_nowait(("STREAM", stream_outputs))
-            except queue.Empty:
-                pass
-            if finished_seqs:
-                self.output_queue.put_nowait(finished_seqs)
+
+            if needs_output:
+                self._flush_pending_prefix_hashes()
+                finished_seqs = self.scheduler.postprocess(
+                    seqs.values(),
+                    fwd_out,
+                    stream_output_queue=self.stream_output_queue,
+                    batch=scheduled_batch,
+                )
+                try:
+                    while not self.stream_output_queue.empty():
+                        stream_outputs = self.stream_output_queue.get_nowait()
+                        self.output_queue.put_nowait(("STREAM", stream_outputs))
+                except queue.Empty:
+                    pass
+                if finished_seqs:
+                    self.output_queue.put_nowait(finished_seqs)
+            elif self._defer_prefix_hash:
+                self._pending_prefix_hash.append((scheduled_batch, seqs))
 
     def _flush_pending_prefix_hashes(self):
         while self._pending_prefix_hash:
@@ -381,8 +393,11 @@ class PPEngineCoreProc(EngineCore):
                 if self.kv_transfer_enabled:
                     self._poll_and_send_kv_status()
 
-                if self.is_last and batch.produces_output():
-                    self.pp_transport.send_tokens(fwd_out)
+                if self.is_last:
+                    if batch.produces_output():
+                        self.pp_transport.send_tokens(fwd_out)
+                    else:
+                        self.pp_transport.send_tokens(_pipeline_stage_ack(batch))
         finally:
             # One last report so the head's exit drain can still reach its
             # per-stage quorum for saves that landed after the final poll.
