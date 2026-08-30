@@ -58,7 +58,31 @@ class LoadOperationId:
 
 LoadCompletionId = ReqId | LoadOperationId
 
-ConnectorCompletionId = ReqId | SaveOperationId | LoadOperationId
+
+@dataclass(frozen=True)
+class StateStoreOperationId:
+    """Exact identity of one hand-out of a state checkpoint to the CPU tier.
+
+    Not keyed by request: by the time a state store lands, the request that
+    produced the checkpoint is long gone and only the prefix hash remains. But
+    the hash alone is not an identity -- the same prefix is stored again after
+    an eviction or a load miss, and `KVOutputAggregator` tombstones every
+    `(channel, operation_id)` it has taken quorum on, so a second store under a
+    bare hash is dropped as a duplicate: its pin is never settled and its
+    bytes are never re-indexed. `generation` is what separates the attempts.
+    """
+
+    prefix_hash: int
+    generation: int
+
+    def __post_init__(self) -> None:
+        if self.generation < 0:
+            raise ValueError("state store generation must be nonnegative")
+
+
+ConnectorCompletionId = (
+    ReqId | SaveOperationId | LoadOperationId | StateStoreOperationId
+)
 ConnectorCompletionKey = tuple[str, ConnectorCompletionId]
 
 # ---------------------------------------------------------------------------

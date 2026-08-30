@@ -2612,8 +2612,8 @@ class Scheduler:
             type(self.kv_connector).__name__,
             len(stores),
         )
-        for prefix_hash, _units in stores:
-            self.block_manager.settle_state_store(prefix_hash, ok=False)
+        for op, _units in stores:
+            self.block_manager.settle_state_store(op, ok=False)
 
     def _publish_state_loads(self) -> None:
         """Hand this pass's state-tier loads to the connector, before it builds
@@ -3530,10 +3530,10 @@ class Scheduler:
             # bytes are not really there must never be voted for, and a pin
             # exists to keep the source still during the copy -- which is over
             # either way.
-            for h in indexed:
-                bm.settle_state_store(int(h), ok=True)
-            for h in failed:
-                bm.settle_state_store(int(h), ok=False)
+            for op in indexed:
+                bm.settle_state_store(op, ok=True)
+            for op in failed:
+                bm.settle_state_store(op, ok=False)
             # Unit-side twin of `_reconcile_stalled_deferred_saves`, on the same
             # window and for the same reason: the pin lives in this process
             # while the D2H runs in the worker, so a report lost to a crashed

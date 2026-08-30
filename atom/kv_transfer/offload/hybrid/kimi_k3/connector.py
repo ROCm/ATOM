@@ -252,11 +252,11 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
                 "so the engine releases their units now rather than on timeout.",
                 len(stores),
             )
-            for h, _units in stores:
-                self._state_store_failed_locally.add(int(h))
+            for op, _units in stores:
+                self._state_store_failed_locally.add(op)
             return
-        for h, unit_ids in stores:
-            self._state_tier.submit_store(int(h), tuple(int(u) for u in unit_ids))
+        for op, unit_ids in stores:
+            self._state_tier.submit_store(op, tuple(int(u) for u in unit_ids))
 
     def _fail_state_loads(self, loads) -> None:
         for req_id, _h, _group in loads:
@@ -276,13 +276,19 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
         # owner is long gone -- so they ride the connector-owned channel; the
         # aggregator's quorum is failure-dominant, which is what resolves a
         # partial store instead of pinning the key.
-        for h in indexed:
+        #
+        # The operation, not the bare hash. `KVOutputAggregator` tombstones
+        # every `(channel, operation_id)` it has taken quorum on, so a hash
+        # alone made the second store of a re-evicted prefix a duplicate: it
+        # was dropped before quorum, its pin waited for stale reclamation, and
+        # the CPU index never learned the bytes were back.
+        for op in indexed:
             out.connector_completions.add(
-                ConnectorCompletion(STATE_INDEX_CHANNEL, int(h), True)
+                ConnectorCompletion(STATE_INDEX_CHANNEL, op, True)
             )
-        for h in index_failed:
+        for op in index_failed:
             out.connector_completions.add(
-                ConnectorCompletion(STATE_INDEX_CHANNEL, int(h), False)
+                ConnectorCompletion(STATE_INDEX_CHANNEL, op, False)
             )
         return out
 
@@ -505,7 +511,7 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler):
                 if completion.succeeded
                 else self._state_index_failed
             )
-            target.add(int(completion.operation_id))
+            target.add(completion.operation_id)
             return True
         return super().connector_completion(completion)
 

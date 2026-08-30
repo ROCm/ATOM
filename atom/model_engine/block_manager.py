@@ -1066,7 +1066,7 @@ class BlockManager:
             self.state.release(slot)
 
     def take_state_stores(self, max_inflight: int) -> list[tuple]:
-        """`(hash, unit_ids)` for checkpoints to hand the CPU tier this pass.
+        """`(operation, unit_ids)` for checkpoints to hand the CPU tier.
 
         Pins each as it hands it over; `settle_state_store` releases. Empty
         without a coordinator (the fork backends), which is correct rather than
@@ -1080,21 +1080,26 @@ class BlockManager:
         self.state_offload.stores_attempted += len(out)
         return out
 
-    def settle_state_store(self, prefix_hash: int, ok: bool) -> None:
+    def settle_state_store(self, op, ok: bool) -> None:
         """One store reported. Release the units, and index the hash if it landed.
 
         Success and failure release the pin identically -- it existed to keep
         the bytes still during the copy, and the copy is over either way.
         Only the indexing differs, because only a hash whose bytes are really
         there may be voted for.
+
+        `op` is a `StateStoreOperationId`: the pin is released for that exact
+        generation, so a late report from a superseded attempt settles nothing.
+        The index is keyed by hash, because what a resume asks is whether the
+        prefix is in LMCache -- not which attempt put it there.
         """
         if self.paged_state_checkpoints is not None:
-            self.paged_state_checkpoints.settle_offload_store(int(prefix_hash))
+            self.paged_state_checkpoints.settle_offload_store(op)
         if self.state_offload is None:
             return
         if ok:
             self.state_offload.stores_completed += 1
-            self.state_offload.note_stored(int(prefix_hash))
+            self.state_offload.note_stored(int(op.prefix_hash))
         else:
             self.state_offload.stores_failed += 1
 

@@ -37,9 +37,12 @@ class StateOffloadTier:
         self._done: set[str] = set()
         self._failed: set[str] = set()
         self._inflight: set = set()
-        # The store path's two reports, drained by `take_store_reports`.
-        self._indexed: set[int] = set()
-        self._index_failed: set[int] = set()
+        # The store path's two reports, drained by `take_store_reports`. Sets
+        # of `StateStoreOperationId`, not of bare hashes: the engine settles
+        # the pin for that exact generation, and the aggregator would tombstone
+        # a bare hash after the first store of it.
+        self._indexed: set = set()
+        self._index_failed: set = set()
 
     def _register(self, fut) -> None:
         """Add *fut* to the inflight set and attach a callback that removes it
@@ -56,15 +59,20 @@ class StateOffloadTier:
 
         fut.add_done_callback(_discard)
 
-    def submit_store(self, h: int, unit_ids) -> None:
-        """Pack the checkpoint image in `unit_ids` under `h`, for LMCache.
+    def submit_store(self, op, unit_ids) -> None:
+        """Pack the checkpoint image in `unit_ids` for LMCache, under `op`.
+
+        `op` is a `StateStoreOperationId`; the bytes are keyed by
+        `op.prefix_hash` and the report is keyed by the whole operation, so
+        two attempts at one prefix write the same entry but settle their own
+        pins.
 
         No `ready_event`: the units are reserved out of the KV pool and pinned
         by the engine for the length of this transfer, so nothing on the compute
         stream is writing them and the packer gathers straight from where they
         sit.
         """
-        self._register(self._executor.submit(self._do_store, h, unit_ids))
+        self._register(self._executor.submit(self._do_store, op, unit_ids))
 
     def submit_load(self, req_id: str, h: int, slot: int) -> None:
         """Fetch `h` into pool slot `slot` for the parked request `req_id`.
@@ -95,34 +103,39 @@ class StateOffloadTier:
     def shutdown(self) -> None:
         self._executor.shutdown(wait=True)
 
-    def _do_store(self, h: int, unit_ids) -> None:
+    def _do_store(self, op, unit_ids) -> None:
         stored = False
         try:
-            stored = bool(self.codec.put(h, unit_ids))
+            stored = bool(self.codec.put(int(op.prefix_hash), unit_ids))
         except Exception:  # deliberately blind, see below
             # Deliberately blind. `codec.put` reaches into LMCache, whose
             # failure modes are its own, and a store that cannot happen must
             # cost one checkpoint's CPU copy -- not this worker thread, whose
             # death would strand every request parked on a later load.
-            logger.warning("state offload: store of hash %d failed", h, exc_info=True)
+            logger.warning(
+                "state offload: store of hash %d (generation %d) failed",
+                op.prefix_hash,
+                op.generation,
+                exc_info=True,
+            )
         with self._lock:
             # Report, never apply: `StateOffloadIndex` lives in the engine
             # process and this runs in a spawned runner. The engine applies
             # these via KVConnectorOutput.
             if stored:
-                self._indexed.add(int(h))
+                self._indexed.add(op)
             else:
                 # The failure channel lets the aggregator take quorum on
                 # `indexed | index_failed` instead of waiting for a second
                 # report that will never come from this rank.
-                self._index_failed.add(int(h))
+                self._index_failed.add(op)
 
-    def take_store_reports(self) -> tuple[set[int], set[int]]:
-        """`(hashes stored, hashes failed)` since the last call.
+    def take_store_reports(self) -> tuple[set, set]:
+        """`(operations stored, operations failed)` since the last call.
 
-        A hash appears in exactly one of the two per store. The aggregator's
-        quorum over them is failure-dominant, so a partial store resolves in
-        the same step rather than pinning the key.
+        An operation appears in exactly one of the two. The aggregator's quorum
+        over them is failure-dominant, so a partial store resolves in the same
+        step rather than pinning the key.
         """
         with self._lock:
             indexed = set(self._indexed)

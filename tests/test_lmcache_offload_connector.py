@@ -29,6 +29,7 @@ from atom.kv_transfer.disaggregation.types import (
     KVTransferRegion,
     LoadOperationId,
     SaveOperationId,
+    StateStoreOperationId,
 )
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload._block_gpu_connector import BlockGPUConnector
@@ -5185,3 +5186,52 @@ class TestJointLegsShareOneCompletionIdentity:
         assert done == {kv_only}
         done, failed = worker._settle_joint(set(), set(), {"r8"}, set())
         assert done == {"r8"}
+
+
+# ── kimi_k3: a re-stored prefix must survive the aggregator's tombstone ────
+
+
+class TestStateStoreCompletionsCarryAGeneration:
+    """`KVOutputAggregator` tombstones every `(channel, operation_id)` it has
+    taken quorum on -- `should_tombstone` for the connector channel is
+    `lambda _key: True`. Under a bare hash the second store of a re-evicted
+    prefix was therefore dropped before quorum: its pin waited for stale
+    reclamation and the CPU index never learned the bytes were back."""
+
+    @staticmethod
+    def _report(agg, op):
+        out = KVConnectorOutput()
+        out.connector_completions.add(
+            ConnectorCompletion(STATE_INDEX_CHANNEL, op, True)
+        )
+        return agg.aggregate([out]).connector_completions
+
+    def test_a_bare_hash_would_be_dropped_the_second_time(self):
+        """Pins the aggregator behaviour this fix works around, so a change to
+        it does not silently make the generation look unnecessary."""
+        agg = KVOutputAggregator(world_size=1)
+        assert self._report(agg, 4242) != set()
+        assert self._report(agg, 4242) == set()
+
+    def test_two_generations_of_one_hash_both_reach_the_engine(self):
+        agg = KVOutputAggregator(world_size=1)
+        first = StateStoreOperationId(4242, 1)
+        second = StateStoreOperationId(4242, 2)
+        assert self._report(agg, first) == {
+            ConnectorCompletion(STATE_INDEX_CHANNEL, first, True)
+        }
+        assert self._report(agg, second) == {
+            ConnectorCompletion(STATE_INDEX_CHANNEL, second, True)
+        }
+
+    def test_the_scheduler_half_keeps_the_operation_whole(self):
+        """`connector_completion` used to narrow the id to `int`, which would
+        undo the generation on the way to `settle_state_store`."""
+        s = _k3_scheduler()
+        op = StateStoreOperationId(4242, 7)
+        assert s.connector_completion(
+            ConnectorCompletion(STATE_INDEX_CHANNEL, op, True)
+        )
+        indexed, failed = s.take_state_reports()
+        assert indexed == {op}
+        assert failed == set()

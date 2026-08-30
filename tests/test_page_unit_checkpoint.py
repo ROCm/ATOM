@@ -411,7 +411,8 @@ class TestOffloadNomination:
         _pool, store = offload_store()
         cid, _op = ready(store, 11)
         stores = store.take_offload_stores(max_inflight=4)
-        assert stores == [(11, store.records[cid].unit_ids)]
+        [(op, unit_ids)] = stores
+        assert (op.prefix_hash, unit_ids) == (11, store.records[cid].unit_ids)
         assert store.records[cid].pin_count == 1
         assert not store._is_evictable(cid)
 
@@ -468,14 +469,16 @@ class TestOffloadPinRelease:
         for _ in range(2):
             _pool, store = offload_store()
             cid, _op = ready(store, 11)
-            store.take_offload_stores(max_inflight=4)
-            store.settle_offload_store(11)
+            [(sent, _units)] = store.take_offload_stores(max_inflight=4)
+            store.settle_offload_store(sent)
             assert store.records[cid].pin_count == 0
 
     def test_a_report_for_a_hash_never_sent_is_a_no_op(self):
+        from atom.kv_transfer.disaggregation.types import StateStoreOperationId
+
         _pool, store = offload_store()
         cid, _op = ready(store, 11)
-        store.settle_offload_store(11)
+        store.settle_offload_store(StateStoreOperationId(11, 1))
         assert store.records[cid].pin_count == 0
 
     def test_unindex_during_the_copy_holds_the_units_to_the_end(self):
@@ -484,15 +487,66 @@ class TestOffloadPinRelease:
         pool, store = offload_store()
         cid, _op = ready(store, 11)
         units = store.records[cid].unit_ids
-        store.take_offload_stores(max_inflight=4)
+        [(sent, _units)] = store.take_offload_stores(max_inflight=4)
 
         store.unindex(11)
         assert cid in store.records, "the units are still being read"
         assert all(pool.is_used(u) for u in units)
 
-        store.settle_offload_store(11)
+        store.settle_offload_store(sent)
         assert cid not in store.records
         assert not any(pool.is_used(u) for u in units)
+
+    def test_two_generations_of_one_hash_each_settle_their_own_pin(self):
+        """The same prefix is stored again after an eviction or a load miss.
+
+        Keyed by bare hash, the aggregator tombstoned the first store and the
+        second was dropped before quorum -- its pin waited for the stale
+        reclaimer and its bytes were never re-indexed. Each hand-out gets its
+        own generation, so both attempts settle.
+        """
+        _pool, store = offload_store()
+        cid1, _op = ready(store, 11)
+        [(first, _u)] = store.take_offload_stores(max_inflight=4)
+        store.settle_offload_store(first)
+        assert store.records[cid1].pin_count == 0
+
+        store.unindex(11)
+        cid2, _op = ready(store, 11)
+        [(second, _u)] = store.take_offload_stores(max_inflight=4)
+        assert second != first, "a re-store is its own operation"
+        assert second.prefix_hash == first.prefix_hash
+        store.settle_offload_store(second)
+        assert store.records[cid2].pin_count == 0
+
+    def test_a_late_report_from_a_superseded_attempt_settles_nothing(self):
+        """A reclaimed pin's report can still be in flight. It must not release
+        the pin a newer attempt at the same hash is holding."""
+        _pool, store = offload_store()
+        cid, _op = ready(store, 11)
+        [(first, _u)] = store.take_offload_stores(max_inflight=4)
+        assert store.reclaim_stale_offload_pins(timeout_s=1e-9) == 1
+
+        [(second, _u)] = store.take_offload_stores(max_inflight=4) or [(None, None)]
+        if second is None:  # the nomination was drained by the first hand-out
+            store._queue_offload_store(cid, store.records[cid])
+            [(second, _u)] = store.take_offload_stores(max_inflight=4)
+        assert store.records[cid].pin_count == 1
+
+        store.settle_offload_store(first)  # the late one
+        assert store.records[cid].pin_count == 1, "the newer pin still stands"
+        store.settle_offload_store(second)
+        assert store.records[cid].pin_count == 0
+
+    def test_one_hash_may_not_have_two_stores_in_flight(self):
+        """The generation tells sequential attempts apart; it does not license
+        concurrent ones, which would copy the same bytes twice and have the
+        first report unpin what the second is holding."""
+        _pool, store = offload_store()
+        cid, _op = ready(store, 11)
+        assert len(store.take_offload_stores(max_inflight=4)) == 1
+        store._queue_offload_store(cid, store.records[cid])
+        assert store.take_offload_stores(max_inflight=4) == []
 
     def test_a_lost_report_is_reclaimed_and_counted(self):
         """The pin is in this process and the copy is in the worker, so a

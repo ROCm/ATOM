@@ -10,6 +10,7 @@ from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from time import monotonic
 
+from atom.kv_transfer.disaggregation.types import StateStoreOperationId
 from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.sequence import Sequence
 
@@ -138,12 +139,19 @@ class PageUnitCheckpointStore:
         # space and `_next_victim` may spend it. The pin is taken later, in
         # `take_offload_stores`, and only for the few actually in flight.
         self._offload_ready: deque[int] = deque()
-        # prefix_hash -> (checkpoint_id, monotonic when the pin was taken).
-        # Keyed by hash because that is all the worker's report carries -- by
-        # the time a store lands its request is long gone. At most one live
-        # record per hash, which `begin_store` enforces by refusing a hash it
-        # already holds or has pending.
-        self._offload_pins: dict[int, tuple[int, float]] = {}
+        # StateStoreOperationId -> (checkpoint_id, monotonic when pinned).
+        # A store's report carries no request -- by the time one lands its owner
+        # is long gone -- so the hash is the only thing left to name it by. The
+        # hash ALONE is not an identity though: the same prefix is stored again
+        # after an eviction or a load miss, and `KVOutputAggregator` tombstones
+        # every `(channel, operation_id)` it has taken quorum on, so the second
+        # store under a bare hash was dropped as a duplicate -- its pin held
+        # until stale reclamation and its bytes never re-indexed. The
+        # generation separates the attempts, and keying the pins by the whole
+        # operation is also what stops a late report from an earlier attempt
+        # from settling a newer pin for the same hash.
+        self._offload_pins: dict[StateStoreOperationId, tuple[int, float]] = {}
+        self._offload_generation = 0
         self.offload_pins_reclaimed = 0
 
     @property
@@ -376,8 +384,8 @@ class PageUnitCheckpointStore:
 
     def take_offload_stores(
         self, max_inflight: int
-    ) -> list[tuple[int, tuple[int, ...]]]:
-        """`(prefix_hash, unit_ids)` to hand the tier now, pinning each.
+    ) -> list[tuple[StateStoreOperationId, tuple[int, ...]]]:
+        """`(operation, unit_ids)` to hand the tier now, pinning each.
 
         The pin is taken HERE, not at READY, and that is what bounds it: a pin
         lives in this process while the D2H runs in the worker, so it spans
@@ -388,8 +396,14 @@ class PageUnitCheckpointStore:
         Over the cap, candidates wait rather than being dropped. Drained, not
         read: a second submission would store the same image twice and the
         second report would unpin a record the first released.
+
+        Each hand-out gets its own generation, so a prefix stored again after
+        an eviction is a different operation from the one that stored it
+        before. Two attempts at the same hash may not be in flight at once --
+        `_hash_in_flight` refuses that -- but they may follow one another
+        closely enough that the earlier one's report is still on the wire.
         """
-        out: list[tuple[int, tuple[int, ...]]] = []
+        out: list[tuple[StateStoreOperationId, tuple[int, ...]]] = []
         while self._offload_ready and len(self._offload_pins) < max_inflight:
             checkpoint_id = self._offload_ready.popleft()
             record = self.records.get(checkpoint_id)
@@ -397,22 +411,40 @@ class PageUnitCheckpointStore:
             # or already in flight under this hash. Nothing to send either way.
             if record is None or record.state != READY:
                 continue
-            if record.prefix_hash in self._offload_pins:
+            if self._hash_in_flight(record.prefix_hash):
                 continue
+            self._offload_generation += 1
+            op = StateStoreOperationId(
+                int(record.prefix_hash), self._offload_generation
+            )
             record.pin_count += 1
-            self._offload_pins[record.prefix_hash] = (checkpoint_id, monotonic())
-            out.append((record.prefix_hash, record.unit_ids))
+            self._offload_pins[op] = (checkpoint_id, monotonic())
+            out.append((op, record.unit_ids))
         return out
 
-    def settle_offload_store(self, prefix_hash: int) -> None:
+    def _hash_in_flight(self, prefix_hash: int) -> bool:
+        """Whether some generation of `prefix_hash` is already pinned.
+
+        Kept from when the pins were keyed by hash: two live stores of one
+        image would copy the same bytes twice and the second report would unpin
+        a record the first already released. The generation exists to tell
+        *sequential* attempts apart, not to license concurrent ones.
+        """
+        return any(op.prefix_hash == prefix_hash for op in self._offload_pins)
+
+    def settle_offload_store(self, op: StateStoreOperationId) -> None:
         """One store reported, either way. Release the units it was holding.
 
         Success and failure release identically: the pin exists to keep the
         bytes still during the copy, and the copy is over either way. Whether
         the hash becomes reachable is `StateOffloadIndex`'s business, not this
         one's.
+
+        Matched on the whole operation: a report from an attempt whose pin was
+        already reclaimed names a generation no longer here and settles
+        nothing, rather than releasing a newer attempt's pin.
         """
-        entry = self._offload_pins.pop(prefix_hash, None)
+        entry = self._offload_pins.pop(op, None)
         if entry is None:
             return
         self._release_offload_pin(entry[0])
@@ -434,9 +466,9 @@ class PageUnitCheckpointStore:
         if timeout_s <= 0 or not self._offload_pins:
             return 0
         cutoff = monotonic() - timeout_s
-        stale = [h for h, (_cid, at) in self._offload_pins.items() if at <= cutoff]
-        for prefix_hash in stale:
-            checkpoint_id, _at = self._offload_pins.pop(prefix_hash)
+        stale = [op for op, (_cid, at) in self._offload_pins.items() if at <= cutoff]
+        for op in stale:
+            checkpoint_id, _at = self._offload_pins.pop(op)
             self._release_offload_pin(checkpoint_id)
             self.offload_pins_reclaimed += 1
         return len(stale)
@@ -720,13 +752,13 @@ class PagedStateCheckpointCoordinator:
 
     def take_offload_stores(
         self, max_inflight: int
-    ) -> list[tuple[int, tuple[int, ...]]]:
-        """`(prefix_hash, unit_ids)` to hand the tier now. See the store."""
+    ) -> list[tuple[StateStoreOperationId, tuple[int, ...]]]:
+        """`(operation, unit_ids)` to hand the tier now. See the store."""
         return self.store.take_offload_stores(max_inflight)
 
-    def settle_offload_store(self, prefix_hash: int) -> None:
+    def settle_offload_store(self, op: StateStoreOperationId) -> None:
         """One store reported, either way; release the units it was holding."""
-        self.store.settle_offload_store(prefix_hash)
+        self.store.settle_offload_store(op)
 
     def reclaim_stale_offload_pins(self, timeout_s: float) -> int:
         """Release offload pins whose report never came. See the store."""
