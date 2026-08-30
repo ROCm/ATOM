@@ -41,6 +41,7 @@ __pycache__
 *.pyc
 .eggs
 *.egg-info
+atom/proto/**/*_proto.py
 
 # editor
 .vscode

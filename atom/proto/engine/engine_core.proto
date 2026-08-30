@@ -1,0 +1,152 @@
+syntax = "proto3";
+
+package atom.engine;
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/struct.proto";
+
+message SamplingParameters {
+  double temperature = 1;
+  int32 top_k = 2;
+  double top_p = 3;
+  int32 max_tokens = 4;
+  bool ignore_eos = 5;
+  repeated string stop_strings = 6;
+  bool return_logprobs = 7;
+  int32 n = 8;
+  optional int32 logprobs = 9;
+}
+
+message Ndarray {
+  string dtype = 1;
+  repeated int64 shape = 2;
+  bytes data = 3;
+}
+
+message Tensor {
+  string dtype = 1;
+  repeated int64 shape = 2;
+  bytes data = 3;
+}
+
+message MultimodalData {
+  map<string, Tensor> tensors = 1;
+}
+
+enum SequenceStatus {
+  SEQUENCE_STATUS_UNSPECIFIED = 0;
+  SEQUENCE_STATUS_WAITING_FOR_REMOTE_KVS = 1;
+  SEQUENCE_STATUS_WAITING = 2;
+  SEQUENCE_STATUS_RUNNING = 3;
+  SEQUENCE_STATUS_ABORTED = 4;
+  SEQUENCE_STATUS_FINISHED = 5;
+  SEQUENCE_STATUS_EXIT_ENGINE = 6;
+}
+
+enum SequenceType {
+  SEQUENCE_TYPE_UNSPECIFIED = 0;
+  SEQUENCE_TYPE_DUMMY = 1;
+  SEQUENCE_TYPE_PREFILL = 2;
+  SEQUENCE_TYPE_DECODE = 3;
+}
+
+message Sequence {
+  int64 id = 1;
+  optional string external_request_id = 2;
+  SequenceStatus status = 3;
+  SequenceType type = 4;
+  int32 block_size = 5;
+  repeated sint32 token_ids = 6;
+  repeated sint32 output_tokens = 7;
+  repeated sint32 block_table = 8;
+  repeated TokenSequence stop_token_sequences = 9;
+  sint32 last_token = 10;
+  int32 num_tokens = 11;
+  int32 num_prompt_tokens = 12;
+  int32 num_cached_tokens = 13;
+  int32 num_hashed_tokens = 14;
+  int32 num_compressed_hit_blocks = 15;
+  int32 num_wanted_hit_blocks = 16;
+  int32 checkpoint_demand_pos = 17;
+  bool checkpoint_demand_counted = 18;
+  bool checkpoint_demand_declined = 19;
+  int32 last_checkpoint_pos = 20;
+  int32 prefix_cache_hit_tokens = 21;
+  bool is_partial_prefill = 22;
+  sint32 per_req_cache_group = 23;
+  sint32 state_fork_src = 24;
+  bool is_first_decode = 25;
+  bool prefix_hashes_published = 26;
+  repeated double logprobs = 27;
+  int32 num_placeholder_tokens = 28;
+  Ndarray spec_token_ids = 29;
+  optional int32 dspark_next_ell = 30;
+  double arrive_time = 31;
+  double first_token_time = 32;
+  double leave_time = 33;
+  string leave_reason = 34;
+  SamplingParameters sampling = 35;
+  google.protobuf.Struct kv_transfer_params = 36;
+  google.protobuf.Struct kv_transfer_params_output = 37;
+  MultimodalData multimodal_data = 38;
+  Ndarray mrope_positions = 39;
+  int32 mrope_position_delta = 40;
+  bool has_per_req_cache = 41;
+  int32 num_draft_tokens = 42;
+  bool needs_independent_noise = 43;
+  optional string parent_request_id = 44;
+  int32 sibling_index = 45;
+  optional int32 data_parallel_rank = 46;
+  int32 num_rejected = 47;
+  int32 num_bonus_tokens = 48;
+}
+
+message TokenSequence {
+  repeated sint32 values = 1;
+}
+
+message AddRequest { repeated Sequence sequences = 1; }
+message AddResponse { repeated Sequence sequences = 1; }
+
+message RequestOutput {
+  int64 request_id = 1;
+  repeated sint32 output_tokens = 2;
+  bool finished = 3;
+  optional string finish_reason = 4;
+  google.protobuf.Struct kv_transfer_params_output = 5;
+  int32 num_cached_tokens = 6;
+}
+
+message StreamOutput {
+  int64 sequence_id = 1;
+  RequestOutput output = 2;
+}
+
+message StreamChunk { repeated StreamOutput outputs = 1; }
+
+message UtilityCommand {
+  string command = 1;
+  google.protobuf.Struct arguments = 2;
+}
+
+message UtilityResponse {
+  string command = 1;
+  google.protobuf.Value result = 2;
+}
+
+message ReadySignal { optional int64 max_pool_tokens = 1; }
+message MetricsSnapshot { google.protobuf.Struct values = 1; }
+
+message EngineCoreEnvelope {
+  uint32 wire_version = 1;
+  oneof payload {
+    AddRequest add_request = 10;
+    AddResponse add_response = 11;
+    UtilityCommand utility_command = 12;
+    UtilityResponse utility_response = 13;
+    ReadySignal ready = 14;
+    MetricsSnapshot metrics = 15;
+    StreamChunk stream = 16;
+    google.protobuf.Empty shutdown = 17;
+  }
+}

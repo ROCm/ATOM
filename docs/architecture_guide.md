@@ -256,7 +256,8 @@ Each attention backend provides its own `prepare_mtp_decode()` implementation:
 | File | Description |
 |------|-------------|
 | `atom/model_engine/llm_engine.py` | `LLMEngine` user-facing API, `InputOutputProcessor` for tokenization/detokenization and TTFT/TPOT statistics |
-| `atom/model_engine/engine_core.py` | `EngineCore` main execution loop, `DPEngineCoreProc` data-parallel variant, `EngineCoreRequestType` message protocol |
+| `atom/model_engine/engine_core.py` | `EngineCore` main execution loop and `DPEngineCoreProc` data-parallel variant |
+| `atom/model_engine/ipc_utils.py` | Protobuf codecs for EngineCore and disaggregated runtime IPC |
 | `atom/model_engine/engine_core_mgr.py` | `CoreManager` ZMQ orchestration, process launching, load-balanced DP dispatch |
 | `atom/model_engine/model_runner.py` | `ModelRunner` per-GPU execution (model loading, CUDA graph capture, forward pass), `tokenIDProcessor` deferred output handling |
 | `atom/model_engine/scheduler.py` | `Scheduler` prefill-first scheduling, `ScheduledBatch` batch descriptor, `ScheduledBatchOutput` forward results |
