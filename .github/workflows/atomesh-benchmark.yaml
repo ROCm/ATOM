@@ -75,7 +75,7 @@ on:
         default: rocm/atom-dev:latest
         type: string
       atomesh_slurm_submit_runner:
-        description: 'GitHub runner label used to submit Slurm jobs: atomesh-cicd = TW MI355X, atomesh-cicd-mi350 = Spur MI350X, atomesh-cicd-crusoe-mi355/atomesh-cicd-mi355-crusoe = Crusoe MI355X'
+        description: 'GitHub runner label used to submit Slurm jobs: atomesh-cicd = TW MI355X, atomesh-cicd-mi350 = Spur MI350X, atomesh-cicd-crusoe-mi355/atomesh-cicd-mi355-crusoe = Crusoe MI355X, atomesh_action_runner_v2_01 = Crusoe v2'
         required: false
         default: atomesh-cicd
         type: choice
@@ -84,6 +84,7 @@ on:
           - atomesh-cicd-mi350
           - atomesh-cicd-crusoe-mi355
           - atomesh-cicd-mi355-crusoe
+          - atomesh_action_runner_v2_01
       atomesh_slurm_account:
         description: 'Slurm account: amd-frameworks[42/44/47], amd-tw[36/43]'
         required: false
@@ -341,6 +342,11 @@ jobs:
           )
           PY
           else
+            if [[ "${ATOMESH_SLURM_SUBMIT_RUNNER}" == "atomesh_action_runner_v2_01" ]]; then
+              # Keep action-runner v2 jobs on the four dedicated Crusoe v2 nodes.
+              export ATOMESH_1P1D_NODES=crsuse2-m2m-v2-030,crsuse2-m2m-v2-031,crsuse2-m2m-v2-032,crsuse2-m2m-v2-044
+              export ATOMESH_2P1D_NODES=crsuse2-m2m-v2-030,crsuse2-m2m-v2-031,crsuse2-m2m-v2-032,crsuse2-m2m-v2-044
+            fi
             python3 .github/scripts/atomesh/pd_matrix.py \
               --suite "$SUITE" \
               ${MODEL_NAME:+--model "$MODEL_NAME"} \
@@ -436,7 +442,7 @@ jobs:
 
           squeue_cmd=(squeue)
           scancel_cmd=(scancel)
-          if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-crusoe-mi355" || "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi355-crusoe" ]]; then
+          if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-crusoe-mi355" || "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi355-crusoe" || "${SLURM_SUBMIT_RUNNER}" == "atomesh_action_runner_v2_01" ]]; then
             # controller="http://crs-m2m-cpu-spur-005.crusoe.amd.com:6817" #crusoe旧版本
             controller="http://crs-m2m-cpu-spur-v2-001.crusoe.amd.com:6817" #crusoe v2 controller (v2-009 is node agent only)
             squeue_cmd+=(--controller "${controller}")
@@ -546,7 +552,7 @@ jobs:
           SLURM_CANCEL_HELPER="${RESULT_DIR}/${{ matrix.id }}.slurm-cancel.sh"
           SLURM_JOB_NAME="${{ matrix.id }}-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
           SPUR_CONTROLLER_ADDR="${SPUR_CONTROLLER_ADDR:-}"
-          if [[ -z "${SPUR_CONTROLLER_ADDR}" && ( "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-crusoe-mi355" || "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi355-crusoe" ) ]]; then
+          if [[ -z "${SPUR_CONTROLLER_ADDR}" && ( "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-crusoe-mi355" || "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi355-crusoe" || "${SLURM_SUBMIT_RUNNER}" == "atomesh_action_runner_v2_01" ) ]]; then
             # SPUR_CONTROLLER_ADDR="http://crs-m2m-cpu-spur-005.crusoe.amd.com:6817" #crusoe旧版本
             SPUR_CONTROLLER_ADDR="http://crs-m2m-cpu-spur-v2-001.crusoe.amd.com:6817" #crusoe v2 controller (v2-009 is node agent only)
           elif [[ -z "${SPUR_CONTROLLER_ADDR}" && "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
@@ -556,7 +562,7 @@ jobs:
           scancel_slurm_by_name_from_wrapper() {
             command -v scancel >/dev/null 2>&1 || return 0
             local -a scancel_cmd=(scancel)
-            if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" || "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-crusoe-mi355" || "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi355-crusoe" ]]; then
+            if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" || "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-crusoe-mi355" || "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi355-crusoe" || "${SLURM_SUBMIT_RUNNER}" == "atomesh_action_runner_v2_01" ]]; then
               scancel_cmd+=(--controller "${SPUR_CONTROLLER_ADDR}")
             fi
             scancel_cmd+=(--user "${CURRENT_USER}" --name "${SLURM_JOB_NAME}")
