@@ -450,6 +450,48 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             return False
         return bool(c.enqueue_state_loads(loads))
 
+    def enqueue_state_stores(self, stores) -> bool:
+        """Symmetric to `enqueue_state_loads`: the one sub that hosts the tier
+        owns the stores; False if none can.
+
+        Without this forwarder the engine's `getattr(connector,
+        "enqueue_state_stores")` misses on the shell, so it takes the "did not
+        carry" branch and releases each store's PAGE units *before* the D2H --
+        the CPU tier can never fill under `kv_connector: multi`, even with an
+        offload sub-connector configured. `_adopt_state_tier` already guarantees
+        at most one tier, so "first" is "only" here too.
+        """
+        c = _first_with(self._connectors, "enqueue_state_stores")
+        if c is None:
+            return False
+        return bool(c.enqueue_state_stores(stores))
+
+    def take_state_reports(self):
+        """`(indexed, failed)` from the tier sub, else two empty sets.
+
+        The engine unpacks exactly this 2-tuple (`indexed, failed = take()` in
+        `scheduler._update_from_kv_xfer_finished`). Missing here, the engine
+        never drains store reports, so pins never settle and stored hashes are
+        never indexed -- the CPU tier fills but nothing can be found in it.
+        """
+        c = _first_with(self._connectors, "take_state_reports")
+        if c is None:
+            return set(), set()
+        return c.take_state_reports()
+
+    def take_state_source_releases(self) -> set:
+        """Stores whose PAGE units the GPU has finished reading, from the tier
+        sub; empty set if none.
+
+        Its own forwarder rather than a third element of `take_state_reports`,
+        for the reason the offload connector records: that tuple's arity is a
+        contract with the caller, and widening it once already wedged the pool.
+        """
+        c = _first_with(self._connectors, "take_state_source_releases")
+        if c is None:
+            return set()
+        return c.take_state_source_releases()
+
     def should_park_partial_prefill_for_load(self, seq: Any) -> bool:
         c = _first_with(self._connectors, "should_park_partial_prefill_for_load")
         return c.should_park_partial_prefill_for_load(seq) if c is not None else False

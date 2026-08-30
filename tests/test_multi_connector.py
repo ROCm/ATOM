@@ -62,6 +62,9 @@ class FakeSchedSub:
             self.load_failed_ids = []
             self.pending = False
             self.state_loads = []
+            self.state_stores = []
+            self.state_reports = (set(), set())
+            self.state_source_releases = set()
 
     def get_num_new_matched_tokens(self, seq):
         return self._match
@@ -111,6 +114,16 @@ class FakeSchedSub:
         self.state_loads.extend(loads)
         return True
 
+    def enqueue_state_stores(self, stores):
+        self.state_stores.extend(stores)
+        return True
+
+    def take_state_reports(self):
+        return self.state_reports
+
+    def take_state_source_releases(self):
+        return set(self.state_source_releases)
+
     def __getattribute__(self, name):
         # Hide offload-specific methods unless this mock opts in, so
         # MultiConnector's hasattr() guards are exercised realistically.
@@ -124,6 +137,9 @@ class FakeSchedSub:
             "process_completions",
             "has_pending_work",
             "enqueue_state_loads",
+            "enqueue_state_stores",
+            "take_state_reports",
+            "take_state_source_releases",
         }
         if name in offload_api and not object.__getattribute__(self, "_offload"):
             raise AttributeError(name)
@@ -402,6 +418,38 @@ def test_no_sub_to_carry_a_state_load_is_reported_not_swallowed():
     plain = FakeSchedSub()
     accepted = _sched([plain, FakeSchedSub()]).enqueue_state_loads([(1, 111, 0)])
     assert accepted is False
+
+
+def test_state_stores_and_reports_forward_to_the_owning_sub():
+    """The store leg is symmetric to the load leg, but only the load forwarder
+    existed. The engine calls `enqueue_state_stores`, `take_state_reports` and
+    `take_state_source_releases` on whatever connector it holds; under `multi`
+    that is the composite. Missing these, `enqueue_state_stores` misses on the
+    shell, the engine takes its "did not carry" branch and releases each store's
+    PAGE units before the D2H, and reports/source-releases are never drained --
+    so the CPU tier cannot fill or be found under `kv_connector: multi`.
+    """
+    moriio = FakeSchedSub(is_producer=True)  # no offload methods
+    off = FakeSchedSub(is_offload=True, offload_methods=True)
+    off.state_reports = ({7}, {9})
+    off.state_source_releases = {7, 9}
+    sched = _sched([moriio, off])
+
+    assert sched.enqueue_state_stores([(111, (1, 2, 3))]) is True
+    assert off.state_stores == [(111, (1, 2, 3))]
+    assert sched.take_state_reports() == ({7}, {9})
+    assert sched.take_state_source_releases() == {7, 9}
+    assert not hasattr(moriio, "enqueue_state_stores")
+
+
+def test_state_stores_default_when_no_sub_implements():
+    """No tier under the composite: refuse the stores (not silently accept) and
+    drain nothing, matching the offload connector's own no-tier fallbacks. A
+    swallowed store would strand its pinned PAGE units."""
+    sched = _sched([FakeSchedSub(is_producer=True), FakeSchedSub()])
+    assert sched.enqueue_state_stores([(1, (0,))]) is False
+    assert sched.take_state_reports() == (set(), set())
+    assert sched.take_state_source_releases() == set()
 
 
 def test_the_composite_exposes_the_sub_connectors_state_tier():
