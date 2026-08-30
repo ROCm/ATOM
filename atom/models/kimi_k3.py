@@ -201,12 +201,27 @@ class _NoPositionalRotaryEmbedding(RotaryEmbedding):
 
 
 class SituAndMul(nn.Module):
-    def __init__(self, beta: float = 1.0, linear_beta: float | None = None):
+    def __init__(
+        self,
+        beta: float = 1.0,
+        linear_beta: float | None = None,
+        fused_quant: bool = False,
+    ):
         super().__init__()
         self.beta = beta
         self.linear_beta = linear_beta
+        # Fuse per-token FP8 quant into the activation only when the consuming
+        # down_proj runs a8w8 per-token FP8 AND linear_beta is set (the aiter
+        # kernel always applies the linear-beta tanh to the up half).
+        self.fused_quant = fused_quant and linear_beta is not None
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if self.fused_quant:
+            from atom.model_ops.kimi_k3 import situ_and_mul_quant
+
+            return situ_and_mul_quant(x, self.beta, self.linear_beta)
         from atom.model_ops.kimi_k3 import situ_and_mul
 
         return situ_and_mul(x, self.beta, self.linear_beta)
@@ -280,9 +295,19 @@ class KimiMLP(nn.Module):
         )
         if config.hidden_act != "situ":
             raise ValueError(f"Unsupported Kimi-K3 activation: {config.hidden_act}")
+        # Fuse SiTUv2 + activation quant when down_proj is a8w8 per-token FP8
+        # (ptpc_fp8): the fused kernel emits (fp8, scale) so down_proj skips its
+        # standalone quant. gate_up/down share a scheme, so probe down_proj.
+        down_type, down_dtype = _effective_layer_quant(
+            quant_config, f"{prefix}.down_proj"
+        )
+        self._fuse_act_quant = (
+            down_type == QuantType.per_Token and down_dtype == dtypes.fp8
+        )
         self.act_fn = SituAndMul(
             beta=getattr(config, "activation_situ_beta", None) or 1.0,
             linear_beta=getattr(config, "activation_situ_linear_beta", None),
+            fused_quant=self._fuse_act_quant,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -291,7 +316,13 @@ class KimiMLP(nn.Module):
         x_scale = None
         if isinstance(x, tuple):
             x, x_scale = x
-        return self.down_proj(self.act_fn(self.gate_up_proj(x, x_scale)))
+        act = self.act_fn(self.gate_up_proj(x, x_scale))
+        # When act_fn fused the down_proj activation quant it returns (fp8, scale);
+        # forward that scale so down_proj skips its own quant.
+        if isinstance(act, tuple):
+            act, act_scale = act
+            return self.down_proj(act, x_scale=act_scale)
+        return self.down_proj(act)
 
 
 class KimiSparseMoeBlock(nn.Module):
@@ -712,6 +743,13 @@ class KimiFullAttention(nn.Module):
             a_scheme[0] in _RMS_FUSABLE_QUANT_TYPES and a_scheme == g_scheme
         )
         self.input_quant_prefix = f"{prefix}.fused_qkv_a_proj"
+        # Fuse sigmoid(g_proj) * attn_out + activation quant into one triton kernel
+        # when o_proj runs a8w8 per-token FP8 (ptpc_fp8): the fused kernel emits
+        # (fp8, scale) so o_proj skips its standalone quant.
+        o_type, o_dtype = _effective_layer_quant(quant_config, f"{prefix}.o_proj")
+        self.fuse_sigmoid_mul_quant = (
+            o_type == QuantType.per_Token and o_dtype == dtypes.fp8
+        )
 
     def forward(
         self, positions: torch.Tensor, hidden_states: torch.Tensor
@@ -759,9 +797,19 @@ class KimiFullAttention(nn.Module):
             transpose_scale=True,
         )
         attn_out = self.attn(q, kv, k_rope, positions, q_scale=q_scale)
-        attn_out = attn_out * torch.sigmoid(
-            self.g_proj(hidden_states, hidden_states_scale)
-        )
+        gate = self.g_proj(hidden_states, hidden_states_scale)
+        if self.fuse_sigmoid_mul_quant:
+            from atom.model_ops.triton_fused_sigmoid_mul_quant import (
+                fused_sigmoid_mul_fp8_quant,
+            )
+
+            # sigmoid(gate) * attn_out + per-token fp8 quant in one kernel; the
+            # (fp8, scale) feeds o_proj's a8w8 per-token path directly.
+            attn_fp8, attn_scale = fused_sigmoid_mul_fp8_quant(
+                attn_out, gate, per_token=True
+            )
+            return self.o_proj(attn_fp8, x_scale=attn_scale)
+        attn_out = attn_out * torch.sigmoid(gate)
         return self.o_proj(attn_out)
 
 
