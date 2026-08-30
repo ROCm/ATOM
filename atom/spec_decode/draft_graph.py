@@ -115,8 +115,8 @@ class DraftGraph:
 
     @property
     def will_capture(self) -> bool:
-        """Whether warmup also captures. One gate for every flavor, since the
-        graph is made by the shared ``warmup``."""
+        """Whether warmup also captures. The name `envs.ATOM_DRAFT_CUDAGRAPH`
+        points at, and the only thing that decides it."""
         return envs.ATOM_DRAFT_CUDAGRAPH
 
     def label(self, scheduled_bs: int, running_bs: int) -> str:
@@ -192,9 +192,8 @@ class DraftGraph:
         widths (measured -- V4-Flash-DSpark tp8 + DPA hung 8/8 on the first
         real decode). Neither is reachable from an agreed batch, so neither is
         available to get wrong. Safe on a dummy and on a prefill step for one
-        reason: ``warmup`` asserts the recording holds a REAL
-        ``[scheduled_bs, T]`` pass,
-        and this pass is that shape whatever the target just did.
+        reason: ``Drafter.warmup_draft_graphs`` records on a real decode-shaped
+        context, and this pass is that shape whatever the target just did.
         """
         return running_bs in self._cuda_graphs
 

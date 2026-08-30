@@ -971,7 +971,7 @@ def test_forward_spec_passes_the_batch_through_unpadded(is_dummy, B):
 _GRAPH_BS = [1, 2, 4, 8, 16, 32, 48, 64, 128, 256]
 
 
-def _stub_forward_context(*, scheduled_bs, target_bs, use_cudagraph=True):
+def _stub_forward_context(*, scheduled_bs, target_bs):
     context = types.SimpleNamespace(
         scheduled_bs=scheduled_bs,
         running_bs=target_bs,
@@ -983,7 +983,6 @@ def _stub_forward_context(*, scheduled_bs, target_bs, use_cudagraph=True):
         is_draft=False,
         is_prefill=False,
         positions=None,
-        forward_mode=types.SimpleNamespace(use_cudagraph=use_cudagraph),
     )
     # `prepare_decode` publishes the ring slots at the PADDED batch, so the stub
     # does too -- the block slices to that length and nothing stages it.
@@ -1018,12 +1017,6 @@ def _proposer_with_graph_bs(
     monkeypatch.setattr(DSparkProposer, "_with_draft", False, raising=False)
     monkeypatch.setattr(
         DSparkProposer, "aux_for", lambda self, h: [torch.zeros(1)], raising=False
-    )
-    monkeypatch.setattr(
-        DSparkProposer,
-        "_refresh_dp_metadata",
-        lambda self, fc, n: None,
-        raising=False,
     )
     monkeypatch.setattr(DSparkProposer, "verify_scheduler", None, raising=False)
 

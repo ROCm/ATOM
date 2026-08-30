@@ -269,7 +269,6 @@ class ForwardMode:
                 # other flavor keeps its own and the two extra wire rows are
                 # not sent.
                 max_seqlen_q=max_seqlen_q if is_block_drafter else None,
-                local_is_dummy=batch.is_dummy_run,
             )
             # The group's query length, taken BEFORE the rows are read off it:
             # a rank still on its local q settles on a different `running_tokens`
@@ -312,7 +311,6 @@ class ForwardMode:
         use_cudagraph = not is_prefill and unified and not enforce_eager and on_ladder
 
         running_tokens, piecewise_captured = cls._running_tokens(
-            batch=batch,
             is_prefill=is_prefill,
             unified=unified,
             running_bs=running_bs,
@@ -336,11 +334,9 @@ class ForwardMode:
             sync=sync,
         )
 
-    @classmethod
+    @staticmethod
     def _running_tokens(
-        cls,
         *,
-        batch,
         is_prefill: bool,
         unified: bool,
         running_bs: int,
@@ -362,9 +358,10 @@ class ForwardMode:
             # allocated.
             return scheduled_tokens, False
         if is_prefill:
-            # Unified AND prefilling means one rank, a prefilling peer having
-            # made the step ragged. Prompts are ragged too, so no product
-            # recovers a height and this rank's own count is the whole answer.
+            # Reachable on one rank only: a group of one is unified whatever it
+            # runs, while under DP any prefill clears `unified` above. Prompts
+            # are ragged, so no product recovers a height and this rank's own
+            # count is the whole answer.
             return scheduled_tokens, False
 
         # The batch was rounded onto the ladder AFTER the sync, so this runs rows
@@ -454,14 +451,9 @@ class ForwardMode:
             f"state_slot_out length {slot_out_rows} != running_bs="
             f"{self.running_bs} ({self})"
         )
-        # Nothing here about the rectangle. Both statements one could make --
-        # `running_tokens <= running_bs * max_seqlen_q`, and `running_tokens`
-        # tiling at `max_seqlen_q` -- hold by construction on a unified step,
-        # and `_running_tokens` deliberately produces a height ABOVE the
-        # rectangle when nothing recorded holds the run. Each was written,
-        # revert-run, and found green with the assertion removed: an assertion
-        # no test can break is weight, and one of the two would have failed a
-        # step the decider considers correct.
+        # No rectangle assertion: `_running_tokens` deliberately returns a
+        # height ABOVE `running_bs * max_seqlen_q` when nothing recorded holds
+        # the run.
 
 
 def running_tokens_from_bs(bs: int, *, is_prefill: bool, attn_metadata) -> int:

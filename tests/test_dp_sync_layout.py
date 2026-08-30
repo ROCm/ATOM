@@ -44,12 +44,12 @@ def _sync(monkeypatch, *, peers, **kw):
 
 
 def _base(**kw):
-    base = dict(
-        scheduled_tokens=10,
-        scheduled_bs=2,
-        is_prefill=False,
-        tbo_on=False,
-    )
+    base = {
+        "scheduled_tokens": 10,
+        "scheduled_bs": 2,
+        "is_prefill": False,
+        "tbo_on": False,
+    }
     return {**base, **kw}
 
 
@@ -149,20 +149,16 @@ def test_the_dspark_block_starts_after_the_tbo_block_in_both_widths(monkeypatch)
 
     Both widths are exercised because the offset is the thing that moved, and
     with TBO off it is the only arithmetic between the fixed head and DSpark.
-    The dummy flag is read off a PEER, not off us: with only our own row set, a
-    shifted offset would land on some other nonzero field and still say True.
+    The length is read off a PEER carrying a value no other row holds, so a
+    shifted offset reads one of the head's fields and reports it.
     """
     for tbo_on in (False, True):
         head = 7 if tbo_on else 3
         r = _sync(
             monkeypatch,
-            peers=[_with(head + 1, 1)],
-            **_base(tbo_on=tbo_on, max_seqlen_q=3, local_is_dummy=False),
+            peers=[_with(head, 9)],
+            **_base(tbo_on=tbo_on, max_seqlen_q=3),
         )
-        assert r.max_seqlen_q_across_dp == 3, f"tbo_on={tbo_on}"
-        assert r.any_dummy, f"tbo_on={tbo_on}"
-        assert not _sync(
-            monkeypatch,
-            peers=[],
-            **_base(tbo_on=tbo_on, max_seqlen_q=3, local_is_dummy=False),
-        ).any_dummy, f"tbo_on={tbo_on}"
+        assert r.max_seqlen_q_across_dp == 9, f"tbo_on={tbo_on}"
+        alone = _sync(monkeypatch, peers=[], **_base(tbo_on=tbo_on, max_seqlen_q=3))
+        assert alone.max_seqlen_q_across_dp == 3, f"tbo_on={tbo_on}"

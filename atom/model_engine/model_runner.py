@@ -524,7 +524,8 @@ class tokenIDProcessor:
         # `max_seqlen_q` is the single source of truth for the uniform
         # case (= mtp_k+1 for plain MTP, or the DSpark q-bucket when shrunk this
         # step); `dynamic_spec_query_tokens_per_req` overrides it per request
-        # when DSpark runs ragged. See `ScheduledBatch.max_seqlen_q`.
+        # when DSpark runs ragged. See `ForwardMode.max_seqlen_q`, which the
+        # step settles and the batch no longer carries.
         _per_req = getattr(batch, "dynamic_spec_query_tokens_per_req", None)
         tokens_per_seq = max_seqlen_q if self.use_spec else 1
 
@@ -685,10 +686,10 @@ class ModelRunner:
 
         self.capture_sizes = [0]  # for eager fallback
         # The same ladder as an ASCENDING int32 array, which is what
-        # `ForwardMode.decide` searches. Separate from the list because the
-        # list is re-sorted in both directions during capture; this one is
-        # written twice (here, and once capture has narrowed the ladder) and
-        # never mutated, so a search over it cannot read a transient order.
+        # `ForwardMode.decide` searches. Separate from the list because the list
+        # is re-sorted in both directions during capture; rebound (never
+        # mutated) once capture narrows it, so a search cannot read a transient
+        # order.
         self.capture_sizes_np = np.asarray(self.capture_sizes, dtype=np.int32)
         # PIECEWISE cudagraph state, populated by capture_cudagraph. Empty when
         # capture never ran (enforce_eager), so the ragged-bucket paths no-op.
@@ -2134,7 +2135,7 @@ class ModelRunner:
         return ubatch_slices
 
     def _local_tbo_eligibility(
-        self, batch: ScheduledBatch, num_scheduled_tokens: np.ndarray | None
+        self, batch: ScheduledBatch
     ) -> tuple[bool, bool, int, int]:
         """This rank's TBO answer, and the PCP flags that ride with it.
 
@@ -2150,10 +2151,8 @@ class ModelRunner:
             self._pcp_bal_groups = None
             return (False, False, 0, 0)
 
-        if num_scheduled_tokens is None:
-            num_scheduled_tokens = np.asarray(batch.num_scheduled_tokens)
         local_tbo = local_tbo_precompute(
-            self.config, batch, is_prefill, num_scheduled_tokens
+            self.config, batch, is_prefill, np.asarray(batch.num_scheduled_tokens)
         )
 
         # PCP+TBO prefill: split requests into two GROUPS at a request boundary
@@ -2422,10 +2421,9 @@ class ModelRunner:
         input_ids: torch.Tensor,
         forward_mode: ForwardMode,
     ):
-        # `forward_mode` is settled in `prepare_model` -- it needs the DP-max q
-        # before `prepare_input_ids` sizes the buffer -- and is always supplied,
-        # so the step issues one cross-DP collective rather than two. The q-bucket
-        # shrink ran there too, so the batch is already reduced here.
+        # Always supplied, settled in `prepare_model` (which is where the reason
+        # lives). The q-bucket shrink ran there too, so `batch` is already
+        # reduced here.
         is_prefill = batch.total_tokens_num_prefill > 0
         scheduled_bs = batch.total_seqs_num
         scheduled_tokens = batch.total_tokens_num
@@ -2588,9 +2586,7 @@ class ModelRunner:
                 hasattr(self, "drafter") and self.drafter.is_block_drafter
             ),
             tbo_on=self.config.enable_tbo,
-            local_tbo=self._local_tbo_eligibility(
-                batch, np.asarray(batch.num_scheduled_tokens)
-            ),
+            local_tbo=self._local_tbo_eligibility(batch),
             max_seqlen_q=(batch.num_spec_step + 1 if shrunk_q is None else shrunk_q),
         )
         # Stash the DP-wide prefill OR for the EPLB prefill gate; reused free by
@@ -2600,7 +2596,6 @@ class ModelRunner:
             if forward_mode.sync is None
             else forward_mode.sync.any_rank_has_prefill
         )
-        self._dspark_decode_replay = forward_mode.running_tokens_are_unified
         total_tokens_num = batch.total_tokens_num
         assert total_tokens_num > 0
 
@@ -2864,7 +2859,7 @@ class ModelRunner:
         )
 
         # Single canonical shape check; contract owned by ForwardMode, which
-        # internally short-circuits for prefill / cudagraph.
+        # short-circuits only on prefill. The padded step is the one it is for.
         forward_mode.assert_shape_contract(input_ids, forward_context.attn_metadata)
 
         # Profiler label. Kind (prefix) distinguishes real/dummy and
@@ -3085,6 +3080,15 @@ class ModelRunner:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
         bs = batch.total_seqs_num
         if spec_decode_metadata is None:
+            # The LM head emitted one row per sequence the step FORWARDED,
+            # which prefill pads to `running_bs` for the draft pass that
+            # follows it. Cut to the scheduled batch here and nowhere else:
+            # this is the boundary where a padded forward becomes a
+            # per-request result, and everything below counts requests -- the
+            # sampler's per-row parameters and the logprob gather both. Cut
+            # after either and the pad rows divide `[running_bs, V]` by
+            # `[scheduled_bs, 1]`.
+            logits = logits[:bs]
             sampled_tokens = self.sampler(
                 logits,
                 temperatures,
@@ -3093,12 +3097,6 @@ class ModelRunner:
                 all_greedy,
                 needs_independent_noise=needs_independent_noise,
             )
-            # The LM head emitted one row per sequence the step FORWARDED,
-            # which prefill pads to `running_bs` for the draft pass that
-            # follows it. Cut to the scheduled batch here and nowhere else:
-            # this is the boundary where a padded forward becomes a
-            # per-request result, and everything below counts requests.
-            sampled_tokens = sampled_tokens[:bs]
             num_reject_tokens = self.tokenID_processor.default_num_rejected_tokens[:bs]
             next_token_locs = num_reject_tokens
         else:
@@ -3331,7 +3329,7 @@ class ModelRunner:
     def _dp_draft_lockstep_active(self) -> bool:
         """Are this rank's draft passes bound to what the DP peers run?
 
-        Only under DP attention -- `_refresh_dp_metadata` returns early at
+        Only under DP attention -- `_publish_draft_shape` returns early at
         `data_parallel_size <= 1`, where an output-less batch legitimately
         drafts nothing. PP is excluded via `is_deferred_out`.
         """
@@ -4032,10 +4030,8 @@ class ModelRunner:
                     ),
                     capture_ctx.stream,
                 )
-        self.capture_sizes.sort(reverse=False)
-        # Sorted here rather than trusted: this is the only writer, so the
-        # ascending contract `decide` searches under holds by construction.
-        self.capture_sizes_np = np.sort(np.asarray(self.capture_sizes, dtype=np.int32))
+        self.capture_sizes.sort()
+        self.capture_sizes_np = np.asarray(self.capture_sizes, dtype=np.int32)
 
         # PIECEWISE: sorted 1D num_tokens buckets for run_model's round_up_1d(Σ)
         # dispatch (bisect_left over this to pick the tightest captured shape).

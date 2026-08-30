@@ -2471,10 +2471,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         var = self.model_runner.forward_vars
         scheduled_bs = batch.total_seqs_num_decode
         context_lens_np = np.asarray(batch.context_lens, dtype=np.int32)
-        # Per-seq decode forward length: single source of truth on the batch
-        # (= num_spec_step+1 for plain MTP, or the DSpark q-bucket when shrunk).
-        # positions/attn use this so the (running_bs, q) graph is selected. See
-        # ScheduledBatch.max_seqlen_q.
+        # Per-seq decode forward length, settled by the step rather than carried
+        # on the batch (= num_spec_step+1 for plain MTP, or the DSpark q-bucket
+        # when shrunk). positions/attn use this so the (running_bs, q) graph is
+        # selected. See `ForwardMode.max_seqlen_q`.
         # MTP: roll back ctx by `num_rejected` so this fwd's positions overwrite
         # last fwd's rejected-draft slots (matches aiter_mla.py:701 /
         # aiter_attention.py:542). `batch.context_lens` = `seq.num_tokens`
@@ -2543,14 +2543,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         si_buf.np[:scheduled_bs] = self._state_slot_in_np(
             batch, scheduled_bs, state_slot_np
         )
-        # Published at the PADDED `running_bs`, like the ubatch path below does,
-        # so a consumer that runs the padded batch -- a speculative drafter --
-        # can slice to it. Decode can widen the VIEW and prefill cannot (see
-        # `_populate_state_slot_mappings`): here `cu_seqlens_q` is padded to the
-        # same batch, so a consumer inferring bs from these slots stays
-        # consistent. Every reader either masks the pad tail out
-        # (`batch_id_per_token = -1`) or discards those rows, so 0 is as good a
-        # filler here as it is there.
+        # Published at the PADDED `running_bs`, like the ubatch path below, so
+        # a consumer that runs the padded batch -- a speculative drafter -- can
+        # slice to it; `cu_seqlens_q` is padded to the same batch, so a consumer
+        # inferring bs from these slots stays consistent. Every reader either
+        # masks the pad tail out (`batch_id_per_token = -1`) or discards those
+        # rows, so 0 is a legal filler.
         ss_buf.np[scheduled_bs:running_bs] = 0
         si_buf.np[scheduled_bs:running_bs] = 0
 
@@ -4165,10 +4163,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         if len(pool_np) < scheduled_bs:
             pool_np = np.zeros(scheduled_bs, dtype=np.int32)
         slots_np = self._physical_slots(pool_np)
-        buf = self.model_runner.forward_vars["v4_meta_state_slot_out"]
-        buf.np[scheduled_bs:running_bs] = 0
-        buf.np[:scheduled_bs] = slots_np
-        gpu = buf.copy_to_gpu(running_bs)
+        gpu = self._stage("v4_meta_state_slot_out", slots_np, pad_to=running_bs)
         if return_cpu:
             return gpu, slots_np
         return gpu
@@ -4216,10 +4211,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         replays a CUDAGraph that captured this pointer, so it has to be the same
         address on every step.
         """
-        buf = self.model_runner.forward_vars["v4_meta_state_slot_in"]
-        buf.np[scheduled_bs:running_bs] = 0
-        buf.np[:scheduled_bs] = self._state_slot_in_np(batch, scheduled_bs, out_np)
-        return buf.copy_to_gpu(running_bs)
+        return self._stage(
+            "v4_meta_state_slot_in",
+            self._state_slot_in_np(batch, scheduled_bs, out_np),
+            pad_to=running_bs,
+        )
 
     def build_for_cudagraph_capture(
         self, bs: int, max_q_len: int | None = None, num_tokens_pad: int | None = None
@@ -4735,11 +4731,15 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             for ratio, name in _DEST_ROW_BUFFERS.items()
         }
 
-    def _stage(self, name: str, arr) -> torch.Tensor:
+    def _stage(self, name: str, arr, pad_to: int | None = None) -> torch.Tensor:
         """Write numpy `arr` into `forward_vars[name]` (CpuGpuBuffer) and
         return its GPU view sliced to len(arr). Asserts the buffer is large
         enough and that `arr.dtype` matches the buffer dtype (callers must
         cast to the buffer dtype before staging).
+
+        `pad_to` zero-fills the tail out to a wider view -- the padded batch a
+        drafter runs. Zero is a real slot, so the caller owes those rows a
+        reason they are never read.
         """
         buf = self.model_runner.forward_vars[name]
         n = arr.shape[0] if arr.ndim > 0 else 1
@@ -4756,8 +4756,14 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             f"but got arr with dtype {arr.dtype}. Cast arr to the correct "
             f"dtype before calling _stage."
         )
+        width = n if pad_to is None else pad_to
+        assert width <= cap, (
+            f"V4 buffer {name!r} too small: need {width} padded, have {cap}. "
+            f"Increase the corresponding bound in _alloc_v4_metadata_buffers."
+        )
+        buf.np[n:width] = 0
         buf.np[:n] = arr
-        return buf.copy_to_gpu(n)
+        return buf.copy_to_gpu(width)
 
     @staticmethod
     def _make_gather_slot(

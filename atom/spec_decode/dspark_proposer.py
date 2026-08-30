@@ -783,6 +783,12 @@ class DSparkProposer(Drafter):
             attn_metadata.reduce_final_map = ps["reduce_final_map"]
             attn_metadata.reduce_partial_map = ps["reduce_partial_map"]
 
+        # `[bs, T]` against a paged KV cache however the target just ran. Left
+        # True, every MLA layer takes its prefill branch, which reads
+        # cu_seqlens_k / chunk_meta / _gather_cached_kv_b_proj -- none of which
+        # the retarget above touches, because none of them describe this batch.
+        # Not restored: the Context is rebuilt per forward, like `is_draft`.
+        forward_context.context.is_prefill = False
         # The separate-draft path pads nothing, so both heights are
         # `scheduled_bs * T` -- this rank's own request count, which the group
         # can only discover. Nothing rules this path out under DP either:
@@ -793,23 +799,6 @@ class DSparkProposer(Drafter):
             running_tokens=scheduled_bs * T,
             running_tokens_are_unified=False,
         )
-
-        # The block pass is ALWAYS decode-shaped -- T queries per request against
-        # a paged KV cache -- even on a step where the target just prefilled. But
-        # `is_prefill` is a property of the step, not of the model being run, so
-        # on a prefill step it is still True here and every MLA layer would take
-        # its prefill branch, which reads cu_seqlens_k / chunk_meta /
-        # _gather_cached_kv_b_proj -- none of which the retarget above touches,
-        # because none of them describe this batch. Force the decode shape.
-        #
-        # EagleProposer does the same (`_enter_decode_metadata`) but only from
-        # its SECOND draft step: its first step deliberately reuses the target's
-        # own layout, which is why this is the caller's write and not
-        # `_publish_draft_shape`'s. DSpark has exactly one block pass and it is
-        # never that shape, so this is unconditional. Not restored afterwards --
-        # the Context is rebuilt per forward, the same reason `is_draft` above
-        # is not restored.
-        forward_context.context.is_prefill = False
 
         dtype_q = self._blk_dtype_q
         if dtype_q is None:

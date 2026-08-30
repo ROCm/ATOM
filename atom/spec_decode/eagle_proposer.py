@@ -505,37 +505,25 @@ class EagleProposer(Drafter):
             self.step.label(scheduled_bs, running_bs) if self.step else step0_label
         )
         for i in range(self.mtp_k):
-            # `tok` is this step's real row count, which is NOT `scheduled_bs`:
-            # step 0 runs
-            # over the target's whole token stream (a prefill chunk, or
+            # `tok` is this step's real row count, NOT `scheduled_bs`: step 0
+            # runs the target's whole token stream (a prefill chunk, or
             # scheduled_bs*(mtp_k+1) on decode) and only steps 1+ run one row
-            # per sequence.
-            # Labelling both as `scheduled_bs` collapsed its two shape axes into
-            # one. Taken pre-PCP-split on purpose -- the sharded count is a
-            # rank-local detail, and this is the count `_refresh_dp_metadata`
-            # reports.
+            # per sequence -- labelling both as `scheduled_bs` collapsed the two
+            # shape axes into one. Taken pre-PCP-split on purpose: the sharded
+            # count is a rank-local detail.
             with record_function(
                 f"propose_eagle[{i}/{self.mtp_k} tok={input_ids.shape[0]} "
                 f"{mid_label if i else step0_label}]"
             ):
-                # Re-sync DP token
-                # The count the forward RUNS, which at i>=1 is the padded one
-                # -- DP sizes its all_gatherv from this, and aiter asserts the
-                # tensor matches. DSpark reports `running_bs * num_draft` for the
-                # same reason.
-                # Step 0 carries the target's whole token stream and pads
-                # nothing; steps 1+ run the padded row count, of which
-                # `scheduled_bs` rows are real.
                 self._publish_draft_shape(
                     forward_context,
-                    # Steps 1+ run a row per sequence, `scheduled_bs` of them
-                    # real; step 0 carries the target's stream and pads nothing.
+                    # Steps 1+ run one row per sequence, padded to `running_bs`
+                    # with `scheduled_bs` of them real -- DP sizes its gather
+                    # from the count the forward RUNS. Step 0 carries the
+                    # target's stream and pads nothing.
                     scheduled_tokens=scheduled_bs if i else input_ids.shape[0],
                     running_tokens=running_bs if i else input_ids.shape[0],
-                    # Only a widened mid-step runs a height the group agreed
-                    # on: step 0 carries this rank's own token stream, and with
-                    # no recording to widen to, `running_bs` above is just
-                    # `scheduled_bs`.
+                    # Only a widened mid-step runs a height the group agreed on.
                     running_tokens_are_unified=i > 0 and self.step is not None,
                 )
                 # ---- Prefill Context Parallel (draft i==0 prefill) --------

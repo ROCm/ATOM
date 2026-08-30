@@ -230,10 +230,9 @@ class Drafter(abc.ABC):
             for bs in capture_sizes:
                 attn_metadata, context = build_context(bs=bs)
                 context.is_draft = True
-                # A recording bakes whichever branch these pick, so state them
-                # rather than inherit two defaults that happen to agree. Every
-                # warmed pass declares the same pair: the graphs belong to the
-                # DSpark block and to Eagle's mid-steps, and step 0 has none.
+                # Every warmed pass is decode-shaped and DP-uniform: the graphs
+                # belong to the DSpark block and Eagle's mid-steps, and step 0
+                # has none. Stated, not inherited, per the rule above.
                 context.is_prefill = False
                 context.running_tokens_are_unified = True
                 # The synthetic batch is full, so the pass's scheduled and

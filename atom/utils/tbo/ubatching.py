@@ -194,12 +194,6 @@ class DPSyncResult:
     # the graph-shape sync no longer needs its own separate all_reduce (halves
     # the per-step DP round-trips).
     max_seqlen_q_across_dp: int | None = None
-    # True iff EVERY DP rank is running a dummy forward this step (AND-reduce of
-    # per-rank is_dummy). Used to gate DSpark cudagraph dummy-replay: an all-dummy
-    # step has no real rank replaying to rendezvous with, so all ranks must stay
-    # eager (vLLM never runs an all-idle forward). Only meaningful when
-    # ``max_seqlen_q`` was passed (DSpark + DP); False otherwise.
-    any_dummy: bool = False
 
 
 def sync_dp_metadata(
@@ -214,13 +208,12 @@ def sync_dp_metadata(
     local_can_split: bool = False,
     local_ub_tokens: tuple[int, int] = (0, 0),
     max_seqlen_q: int | None = None,
-    local_is_dummy: bool = False,
 ) -> DPSyncResult:
     """Single packed DP all_gather over all per-rank scalars a decode/prefill
     step needs synchronized: DP token padding, the prefill fan-out, the
     cross-DP TBO gate, and (when active) the DSpark graph-shape MAX.
 
-    A block drafter folds its per-seq length sync in here too (2 extra fields),
+    A block drafter folds its per-seq length sync in here too (one extra field),
     so the step issues one collective instead of two.
 
     Pre-Plan-B this required up to 3 separate all_reduces per step
@@ -240,7 +233,6 @@ def sync_dp_metadata(
       row 5 : ub0_tokens               -> ub_max_tokens_across_dp[0]              [TBO only]
       row 6 : ub1_tokens               -> ub_max_tokens_across_dp[1]              [TBO only]
       row k+0 : max_seqlen_q           -> max_seqlen_q_across_dp (MAX)  [DSpark only]
-      row k+1 : is_dummy (0/1)         -> any_dummy (OR)                [DSpark only]
 
     Rows 0 and 1 are the same batch in ATOM's two units; both ride this one
     collective because agreeing on only one of them still leaves two shapes.
@@ -249,7 +241,7 @@ def sync_dp_metadata(
 
     ``max_seqlen_q`` folds a block drafter's per-step graph-shape sync into this
     same packed all_gather. It is global-config gated (DSpark on + DP), so every
-    rank appends the same 2 fields and the payload stays symmetric.
+    rank appends the same field and the payload stays symmetric.
 
     Neither the batch nor the token total needs a row of its own here: rows 1 and
     0 already carry them, and a step that reaches the reduction with every rank
@@ -257,7 +249,7 @@ def sync_dp_metadata(
     """
     tbo_fields = 7 if tbo_on else 3
     dspark_on = max_seqlen_q is not None
-    n_fields = tbo_fields + (2 if dspark_on else 0)
+    n_fields = tbo_fields + (1 if dspark_on else 0)
     local = torch.zeros(n_fields, dtype=torch.int32, device="cpu")
     local[0] = scheduled_tokens
     local[1] = scheduled_bs
@@ -269,7 +261,6 @@ def sync_dp_metadata(
         local[6] = local_ub_tokens[1]
     if dspark_on:
         local[tbo_fields + 0] = max_seqlen_q
-        local[tbo_fields + 1] = 1 if local_is_dummy else 0
 
     gathered = [
         torch.empty(n_fields, dtype=torch.int32, device="cpu") for _ in range(dp_size)
@@ -305,11 +296,8 @@ def sync_dp_metadata(
             )
 
     max_seqlen_q_across_dp: int | None = None
-    any_dummy = False
     if dspark_on:
         max_seqlen_q_across_dp = int(sync[tbo_fields + 0].max())
-        # OR-reduce: True if ANY rank is a dummy this step.
-        any_dummy = bool(sync[tbo_fields + 1].any())
 
     return DPSyncResult(
         num_tokens_across_dp=num_tokens_across_dp,
@@ -318,7 +306,6 @@ def sync_dp_metadata(
         tbo_collective_active=tbo_collective_active,
         ub_max_tokens_across_dp=ub_max_tokens_across_dp,
         max_seqlen_q_across_dp=max_seqlen_q_across_dp,
-        any_dummy=any_dummy,
     )
 
 
