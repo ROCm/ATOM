@@ -230,6 +230,12 @@ class Drafter(abc.ABC):
             for bs in capture_sizes:
                 attn_metadata, context = build_context(bs=bs)
                 context.is_draft = True
+                # A recording bakes whichever branch these pick, so state them
+                # rather than inherit two defaults that happen to agree. Every
+                # warmed pass declares the same pair: the graphs belong to the
+                # DSpark block and to Eagle's mid-steps, and step 0 has none.
+                context.is_prefill = False
+                context.running_tokens_are_unified = True
                 # The synthetic batch is full, so the pass's scheduled and
                 # running counts are the same number.
                 local_tokens = bs * self.draft_tokens_per_seq
@@ -551,7 +557,12 @@ class Drafter(abc.ABC):
         )
 
     def _publish_draft_shape(
-        self, forward_context, scheduled_tokens: int, running_tokens: int
+        self,
+        forward_context,
+        scheduled_tokens: int,
+        running_tokens: int,
+        *,
+        running_tokens_are_unified: bool,
     ) -> None:
         """Re-point the forward context at the pass about to run.
 
@@ -565,38 +576,29 @@ class Drafter(abc.ABC):
         `running_tokens` how many the pass runs -- they differ exactly when the
         batch was widened.
 
-        The pass is UNIFORM across DP and not a prefill whatever the target
-        just did: its height is `running_bs * draft width`, one from `decide`'s
-        reduction and one from config. `decide`'s own answer describes the
-        TARGET's counts, which a prefilling peer makes ragged; it does not
-        describe this pass.
+        Both flags below are the caller's to answer, because this seam cannot
+        see either. `running_tokens_are_unified` claims every OTHER rank runs
+        this height too -- true where it is `context.running_bs` (`decide`'s
+        reduction) times a config width, false where it came off this rank's
+        own batch or token stream. `is_prefill` is left alone for the same
+        reason: a pass on its own `[bs, T]` shape must clear it, one carrying
+        the target's stream must not.
         """
         context = forward_context.context
         context.scheduled_tokens = scheduled_tokens
         context.running_tokens = running_tokens
-        # Declared whatever the DP size: which path this pass is on is a fact
-        # about the pass, not about the group. Only the metadata below needs a
-        # group to exist.
-        context.is_prefill = False
         parallel_config = self.config.parallel_config
+        # A group of one is uniform whatever it runs; only the table needs peers.
         if parallel_config.data_parallel_size <= 1:
             return
-        context.running_tokens_are_unified = True
-        # Written here, not all_reduced: every rank's height is the same two
-        # agreed inputs multiplied, so there is nothing to ask. `make`'s assert
-        # cannot catch a wrong table (it checks this rank's entry, which a
-        # uniform fill satisfies) -- a probe against the all_reduced one found
-        # no disagreement over a 100k/c50 run and a full GSM8K, same score
-        # either way. `device` is explicit: the default one is not the host.
+        context.running_tokens_are_unified = running_tokens_are_unified
+        # The answer travels, not the table it implies -- `make` owns both ways
+        # of reaching one, and skipping its all_reduce is why this is worth
+        # stating at all.
         forward_context.dp_metadata = DPMetadata.make(
             parallel_config,
             running_tokens,
-            num_tokens_across_dp=torch.full(
-                (parallel_config.data_parallel_size,),
-                running_tokens,
-                dtype=torch.int32,
-                device="cpu",
-            ),
+            unified=running_tokens_are_unified,
         )
 
     def prepare_inputs(

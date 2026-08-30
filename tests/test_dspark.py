@@ -1182,16 +1182,17 @@ def test_propose_sizes_the_draft_gather_without_asking_the_group(monkeypatch):
 
 
 def test_propose_puts_the_pass_on_the_path_its_own_shape_is_on(monkeypatch):
-    """The pass is uniform across DP and is not a prefill.
+    """The block pass is uniform across DP and is not a prefill.
 
     Its height is `running_bs * draft width`, and both factors are the step's
     own reduction or config -- so every rank runs the same number of rows,
-    whatever `decide` said about the TARGET's counts. `is_prefill` moves with
-    it because the padded gather reads it to choose which height to check
-    against, and this pass is `[bs, T]` however the target ran.
+    whatever `decide` said about the TARGET's counts. That is what lets the
+    table below be declared rather than asked for.
 
-    The same fact the table below is built on: declaring ragged while filling a
-    uniform table is two statements that cannot both hold.
+    `is_prefill` is a SEPARATE write by this same caller, not a consequence of
+    publishing a shape -- the padded gather reads it to choose which of the two
+    heights to check the rows against. Asserted here rather than one seam down
+    because the drafter reusing the target's prefill layout needs the opposite.
     """
     seen = {}
     p = _proposer_with_graph_bs(monkeypatch)
@@ -1209,6 +1210,92 @@ def test_propose_puts_the_pass_on_the_path_its_own_shape_is_on(monkeypatch):
     assert fc.context.running_tokens_are_unified is True
     assert fc.context.is_prefill is False
     assert fc.dp_metadata == "dp_meta"
+
+
+class _BareFlavor(mod_drafter.Drafter):
+    """The abstract methods, stubbed. `_publish_draft_shape` reads neither."""
+
+    _resolve_mtp_k = propose = staticmethod(lambda *a, **k: None)
+
+
+def _bare_drafter(dp_size):
+    """A Drafter carrying only what `_publish_draft_shape` reads.
+
+    Not a DSparkProposer: the tests below are about the seam every flavor goes
+    through, and the one that gets it wrong is the one with no fixture.
+    """
+    drafter = object.__new__(_BareFlavor)
+    drafter.config = types.SimpleNamespace(
+        parallel_config=types.SimpleNamespace(
+            data_parallel_size=dp_size, data_parallel_rank=0
+        )
+    )
+    return drafter
+
+
+def test_a_height_the_group_did_not_agree_on_is_asked_for_not_declared(monkeypatch):
+    """A draft pass sized off this rank alone still costs the collective.
+
+    `running_bs * width` is the same number everywhere; a pass carrying this
+    rank's own token stream is not, and declaring it uniform states an equality
+    no reduction ever checked.
+
+    What travels is the answer, not the table it implies -- how `make` then
+    builds one is tested against the real thing in tests/test_dp_metadata.py.
+    The two counts are pinned apart so forwarding the wrong one fails here.
+    """
+    seen = {}
+
+    def _make(cfg, batchsize, num_tokens_across_dp=None, *, unified=False):
+        seen["batchsize"] = batchsize
+        seen["table"] = num_tokens_across_dp
+        seen["unified"] = unified
+        return "dp_meta"
+
+    monkeypatch.setattr(mod_drafter.DPMetadata, "make", staticmethod(_make))
+    fc = _stub_forward_context(scheduled_bs=44, target_bs=48)
+
+    _bare_drafter(2)._publish_draft_shape(
+        fc,
+        scheduled_tokens=308,
+        running_tokens=336,
+        running_tokens_are_unified=False,
+    )
+    assert fc.context.running_tokens_are_unified is False
+    assert seen["unified"] is False, "a ragged height has to be discovered"
+
+    _bare_drafter(2)._publish_draft_shape(
+        fc,
+        scheduled_tokens=308,
+        running_tokens=336,
+        running_tokens_are_unified=True,
+    )
+    assert fc.context.running_tokens_are_unified is True
+    assert seen["batchsize"] == 336, "the group is told what the pass RUNS"
+    assert seen["unified"] is True, "an agreed height is worth no ask"
+    assert seen["table"] is None, "the answer travels, not a table built here"
+
+
+def test_publishing_a_shape_does_not_decide_whether_it_is_a_prefill():
+    """Two different questions, and one drafter answers them differently.
+
+    A draft step that reuses the target's own prefill layout -- Eagle's first
+    -- runs the target's ragged token stream through metadata that still
+    describes a prefill, so clearing the flag here would send every MLA layer,
+    the indexer and PCP down the decode branch on a pass that is not one.
+    """
+    fc = _stub_forward_context(scheduled_bs=44, target_bs=48)
+    fc.context.is_prefill = True
+
+    # dp_size 1: no metadata to build, so nothing but the flag is under test.
+    _bare_drafter(1)._publish_draft_shape(
+        fc,
+        scheduled_tokens=337,
+        running_tokens=337,
+        running_tokens_are_unified=False,
+    )
+
+    assert fc.context.is_prefill is True
 
 
 def test_propose_pads_under_eplb_exactly_as_it_does_without_it(monkeypatch):

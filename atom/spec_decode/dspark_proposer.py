@@ -587,10 +587,18 @@ class DSparkProposer(Drafter):
         self.model.model.index_buffers(num_draft, window, self.device).mask_pad_tail(
             self.runner.attn_metadata_builder.row_ids, scheduled_bs, running_bs
         )
+        # The block pass is `[bs, T]` however the target ran, and
+        # `pad_for_all_gather` reads `is_prefill` to pick which count below to
+        # check its rows against -- left True it checks the scheduled one and
+        # asserts as soon as the batch is widened.
+        context.is_prefill = False
         self._publish_draft_shape(
             forward_context,
             scheduled_tokens=scheduled_bs * num_draft,
             running_tokens=running_bs * num_draft,
+            # `running_bs` is `decide`'s reduction and `num_draft` config, so
+            # every rank reaches this height on its own.
+            running_tokens_are_unified=True,
         )
         label = self.block.label(scheduled_bs, running_bs)
         with record_function(f"propose_dspark[{label} T={num_draft}]"):
@@ -776,27 +784,31 @@ class DSparkProposer(Drafter):
             attn_metadata.reduce_partial_map = ps["reduce_partial_map"]
 
         # The separate-draft path pads nothing, so both heights are
-        # `scheduled_bs * T`.
+        # `scheduled_bs * T` -- this rank's own request count, which the group
+        # can only discover. Nothing rules this path out under DP either:
+        # `--enable-dp-attention` folds TP into the DP size.
         self._publish_draft_shape(
             forward_context,
             scheduled_tokens=scheduled_bs * T,
             running_tokens=scheduled_bs * T,
+            running_tokens_are_unified=False,
         )
 
         # The block pass is ALWAYS decode-shaped -- T queries per request against
         # a paged KV cache -- even on a step where the target just prefilled. But
         # `is_prefill` is a property of the step, not of the model being run, so
         # on a prefill step it is still True here and every MLA layer would take
-        # its prefill branch (attention_mla.py:1238, and again at :1443), which
-        # reads cu_seqlens_k / chunk_meta / _gather_cached_kv_b_proj -- none of
-        # which the retarget above touches, because none of them describe this
-        # batch. Force the decode shape.
+        # its prefill branch, which reads cu_seqlens_k / chunk_meta /
+        # _gather_cached_kv_b_proj -- none of which the retarget above touches,
+        # because none of them describe this batch. Force the decode shape.
         #
-        # EagleProposer does the same (eagle_proposer.py:358) but only from its
-        # SECOND draft step: its first step deliberately reuses the target's own
-        # layout. DSpark has exactly one block pass and it is never that shape,
-        # so this is unconditional. Not restored afterwards -- the Context is
-        # rebuilt per forward, the same reason `is_draft` above is not restored.
+        # EagleProposer does the same (`_enter_decode_metadata`) but only from
+        # its SECOND draft step: its first step deliberately reuses the target's
+        # own layout, which is why this is the caller's write and not
+        # `_publish_draft_shape`'s. DSpark has exactly one block pass and it is
+        # never that shape, so this is unconditional. Not restored afterwards --
+        # the Context is rebuilt per forward, the same reason `is_draft` above
+        # is not restored.
         forward_context.context.is_prefill = False
 
         dtype_q = self._blk_dtype_q

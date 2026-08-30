@@ -83,21 +83,36 @@ class DPMetadata:
         # attn_metadata: Any,
         num_tokens: int,
         num_tokens_across_dp: torch.Tensor | None = None,
+        *,
+        unified: bool = False,
     ) -> "DPMetadata":
+        """Per-rank token counts for this pass, and the sizes derived from them.
 
+        Three ways to a table, and the caller picks by what it knows. Hand one
+        over and it is taken as given. Say `unified` and every rank runs
+        `num_tokens`, so it is that number repeated. Say neither and it is
+        discovered, at the cost of one CPU all_reduce.
+
+        `unified` cannot be checked here -- the assert below reads this rank's
+        own entry, which a repeated fill satisfies by construction. A wrong
+        claim surfaces later, as a fixed-size collective posted at mismatched
+        heights.
+        """
         assert parallel_config.data_parallel_size > 1
         dp_size = parallel_config.data_parallel_size
         dp_rank = parallel_config.data_parallel_rank
         batchsize = num_tokens
 
-        # If num_tokens_across_dp is None, it will be computed by all_reduce
-        # Otherwise, num_tokens_across_dp[dp_rank] should be equal to batchsize
-        assert (
-            num_tokens_across_dp is None or num_tokens_across_dp[dp_rank] == batchsize
+        # A supplied table already says what every rank runs: its own entry is
+        # this pass's height, and saying it again can only disagree.
+        assert num_tokens_across_dp is None or (
+            not unified and num_tokens_across_dp[dp_rank] == batchsize
         )
         if num_tokens_across_dp is None:
-            num_tokens_across_dp = DPMetadata.num_tokens_across_dp(
-                batchsize, dp_size, dp_rank
+            num_tokens_across_dp = (
+                torch.full((dp_size,), batchsize, dtype=torch.int32, device="cpu")
+                if unified
+                else DPMetadata.num_tokens_across_dp(batchsize, dp_size, dp_rank)
             )
         max_tokens_across_dp_cpu = torch.max(num_tokens_across_dp)
         cu_tokens_across_dp_cpu = torch.cumsum(num_tokens_across_dp, dim=0)

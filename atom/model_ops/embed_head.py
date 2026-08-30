@@ -318,9 +318,10 @@ class ParallelLMHead(VocabParallelEmbedding):
             or self.num_embeddings % dp_group.world_size != 0
         ):
             return False
-        # Per-step: all ranks at one height. Exclude draft (eagle leaves the
-        # flag True despite ragged rows) and prefill (x is sliced to 1 row/seq,
-        # mismatching the token-count pad target).
+        # Per-step: all ranks at one height. `is_draft` is its own question,
+        # not shorthand for the flag below -- a drafter states uniformity per
+        # pass, so a draft arrives with either answer. Prefill is excluded
+        # because x is sliced to 1 row/seq, mismatching the pad target.
         if (
             context is None
             or getattr(context, "is_draft", False)

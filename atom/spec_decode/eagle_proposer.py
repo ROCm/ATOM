@@ -532,6 +532,11 @@ class EagleProposer(Drafter):
                     # real; step 0 carries the target's stream and pads nothing.
                     scheduled_tokens=scheduled_bs if i else input_ids.shape[0],
                     running_tokens=running_bs if i else input_ids.shape[0],
+                    # Only a widened mid-step runs a height the group agreed
+                    # on: step 0 carries this rank's own token stream, and with
+                    # no recording to widen to, `running_bs` above is just
+                    # `scheduled_bs`.
+                    running_tokens_are_unified=i > 0 and self.step is not None,
                 )
                 # ---- Prefill Context Parallel (draft i==0 prefill) --------
                 # The draft's first pass is a prefill that reuses the target's
