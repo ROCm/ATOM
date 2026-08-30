@@ -778,7 +778,7 @@ class PagedStateCheckpointCoordinator:
         """
         return self.store.contains(h)
 
-    def attach_offload(self, index) -> None:
+    def attach_offload(self, index, *, sink: bool = True) -> None:
         """Wire the CPU tier in, after both objects exist.
 
         Not a constructor argument because the two are built in the wrong
@@ -790,7 +790,10 @@ class PagedStateCheckpointCoordinator:
         units nothing releases.
         """
         self.offload = index
-        self.store._offload_sink = index is not None
+        # `sink` is the store half specifically: a load-only role still votes
+        # off `hashes` but must nominate nothing, since a nomination that is
+        # handed over takes a pin nobody will release.
+        self.store._offload_sink = index is not None and bool(sink)
 
     def take_offload_stores(
         self, max_inflight: int

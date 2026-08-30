@@ -161,11 +161,21 @@ class BlockManager:
         # coordinator has to know at construction whether anything can carry a
         # store: without a sink it must nominate nothing, since a pin nobody
         # releases holds a whole image out of the pool forever.
-        from atom.model_engine.state_offload import kv_connector_hosts_state_tier
+        from atom.model_engine.state_offload import state_tier_capability
 
-        kv_offload_enabled = kv_connector_hosts_state_tier(
-            getattr(config, "kv_transfer_config", None)
-        )
+        # A capability derived from the whole config, not the connector's name.
+        # The name only says which class is constructed; whether that class
+        # builds a `StateOffloadTier` also depends on the layout it resolves,
+        # the pipeline depth, and its role. Installing an index against a
+        # worker that will refuse the tier is what left stores emitted with
+        # nowhere to go.
+        self.state_tier_capability = state_tier_capability(config)
+        kv_offload_enabled = self.state_tier_capability.hosts_state_tier
+        if not kv_offload_enabled and self.state_tier_capability.reason:
+            logger.info(
+                "[State Cache] CPU state tier off: %s.",
+                self.state_tier_capability.reason,
+            )
         self.paged_state_checkpoints: PagedStateCheckpointCoordinator | None = None
         if checkpoint_spec is not None:
             enabled = self.enable_prefix_caching and self.num_state_slots > 0
@@ -287,13 +297,19 @@ class BlockManager:
         # units the coordinator owns, not a slot the pool is about to hand
         # away -- which is what the staging ring existed to rescue.
         if kv_offload_enabled:
-            self.state_offload = StateOffloadIndex()
+            self.state_offload = StateOffloadIndex(
+                can_store=self.state_tier_capability.can_store_state,
+                can_load=self.state_tier_capability.can_load_state,
+            )
             # Attached rather than passed at construction: the coordinator is
             # built before the switch is read (it needs `checkpoint_spec`,
             # which comes off `state_runtime`). One object, two uses -- the
             # coordinator votes off `hashes` and drains stores into it.
             if self.paged_state_checkpoints is not None:
-                self.paged_state_checkpoints.attach_offload(self.state_offload)
+                self.paged_state_checkpoints.attach_offload(
+                    self.state_offload,
+                    sink=self.state_tier_capability.can_store_state,
+                )
         # The demand funnel: recorded at admission, cut for when a prefill
         # chunk is shortened to land on it, kept when the state pool files it.
         # Counted at all three because a gap between any two is a different
@@ -1075,6 +1091,10 @@ class BlockManager:
         rescued first.
         """
         if self.paged_state_checkpoints is None or self.state_offload is None:
+            return []
+        if not self.state_offload.can_store:
+            # A load-only role. Handing over a store pins units against a
+            # report the worker's save half will never produce.
             return []
         out = self.paged_state_checkpoints.take_offload_stores(max_inflight)
         self.state_offload.stores_attempted += len(out)

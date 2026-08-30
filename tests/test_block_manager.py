@@ -733,7 +733,14 @@ def test_state_offload_is_none_when_tier_is_off(block_manager):
 
 # ── the index is built only where something can report to it ─────────────
 
-_OFFLOAD_KVC = {"kv_connector": "lmcache_offload", "kv_role": "offload"}
+# The layout is part of the capability, not an incidental detail: only K3
+# offloads per-request state, so an offload connector on a dense model hosts no
+# tier however it is configured.
+_OFFLOAD_KVC = {
+    "kv_connector": "lmcache_offload",
+    "kv_role": "offload",
+    "offload_layout": "kimi_k3",
+}
 
 
 def _bm_with_state_tier(monkeypatch, kv_transfer_config):
@@ -777,6 +784,64 @@ def test_the_index_is_built_for_the_offload_connector(monkeypatch):
     # #2045 moved the checkpoint into the KV pool, so the tier no longer
     # reaches into the slot pool at all -- that coupling was the staging ring.
     assert not any(hasattr(cache, "offload") for cache in bm.state_caches)
+
+
+def test_a_dense_layout_hosts_no_state_tier_however_it_is_configured(monkeypatch):
+    """The name check said yes to every `lmcache_offload`. Only K3's worker
+    half builds a `StateOffloadTier`: dense has no per-request state and DSV4
+    keeps its own in the SLOT sidecar."""
+    for layout in ("dense", "hybrid"):
+        bm = _bm_with_state_tier(
+            monkeypatch, {**_OFFLOAD_KVC, "offload_layout": layout}
+        )
+        assert bm.state_offload is None, layout
+        assert layout in bm.state_tier_capability.reason
+
+
+def test_pipeline_parallelism_hosts_no_state_tier(monkeypatch):
+    """The worker refuses PP outright -- `CacheEngineKey` has no PP component,
+    so two stages at one TP rank would overwrite each other. The engine used to
+    build an index anyway and emit stores with nowhere to go."""
+    cfg = MockConfig(
+        enable_prefix_caching=True,
+        kv_transfer_config=_OFFLOAD_KVC,
+        pool_entries={"state": 4},
+        pool_entries_per_req={"state": 1},
+    )
+    cfg.pipeline_parallel_size = 2
+    bm = BlockManager(cfg)
+    assert bm.state_offload is None
+    assert "pipeline_parallel_size=2" in bm.state_tier_capability.reason
+
+
+def test_a_producer_role_stores_but_never_votes_for_a_load(monkeypatch):
+    bm = _bm_with_state_tier(monkeypatch, {**_OFFLOAD_KVC, "kv_role": "kv_producer"})
+    assert bm.state_offload is not None
+    assert bm.state_offload.can_store and not bm.state_offload.can_load
+    bm.state_offload.note_stored(11)
+    assert bm.state_offload.request_load("r1", 11) is False
+
+
+def test_a_consumer_role_votes_but_never_hands_over_a_store(monkeypatch):
+    bm = _bm_with_state_tier(monkeypatch, {**_OFFLOAD_KVC, "kv_role": "kv_consumer"})
+    assert bm.state_offload is not None
+    assert bm.state_offload.can_load and not bm.state_offload.can_store
+    assert bm.take_state_stores(4) == []
+
+
+def test_a_multi_listing_two_offload_connectors_is_refused(monkeypatch):
+    """The tier's bytes ride one connector's worker half and its completions
+    ride that connector's `get_finished`, so two providers would each hold half
+    an answer."""
+    bm = _bm_with_state_tier(
+        monkeypatch,
+        {
+            "kv_connector": "multi",
+            "connectors": [_OFFLOAD_KVC, dict(_OFFLOAD_KVC)],
+        },
+    )
+    assert bm.state_offload is None
+    assert "expected one" in bm.state_tier_capability.reason
 
 
 def test_the_index_is_built_for_a_multi_that_lists_the_offload_backend(
