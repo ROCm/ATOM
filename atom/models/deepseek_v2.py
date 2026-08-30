@@ -89,8 +89,7 @@ from atom.model_ops.attention_mla import (
 )
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.dcp_ops import (
-    dcp_decode_candidate_exchange,
-    triton_filter_and_convert_dcp_index,
+    dcp_decode_candidate_exchange_fused,
     triton_filter_and_convert_dcp_index_prefill,
 )
 from atom.model_ops.embed_head import (
@@ -1664,20 +1663,24 @@ def sparse_attn_indexer(
         dcp_world_size = get_dcp_world_size()
         logits = None
         if dcp_world_size > 1:
-            dcp_rank = get_dcp_rank()
-            dcp_decode_candidate_exchange(
+            # Emits this rank's owned KV slots straight into the buffers, so
+            # topk_indices stays untouched and the filter/convert below is
+            # skipped -- see dcp_decode_candidate_exchange_fused.
+            dcp_decode_candidate_exchange_fused(
                 attn_metadata,
                 padded_q_fp8_decode_tokens,
                 kv_cache,
                 weights,
-                topk_indices,
-                dcp_rank,
+                get_dcp_rank(),
                 num_decode_tokens,
                 topk_tokens,
                 max_model_len,
                 runner_block_size,
                 stable_topk,
                 cp_kv_cache_interleave_size,
+                out_kv_indices=sparse_kv_indices_buffer,
+                out_kv_indptr=dcp_sparse_kv_indptr_buffer,
+                owned_counts=dcp_owned_counts_buffer,
             )
         else:
             logits = torch.empty(
@@ -1720,26 +1723,11 @@ def sparse_attn_indexer(
                 out=sparse_kv_indices_buffer,
             )
         elif dcp_world_size > 1:
-            # topk_indices now hold GLOBAL positions. Keep only this rank's owned
-            # tokens ((p//S)%W == r), de-interleave to the local index, map to the
-            # local main-KV slot, and COMPACT them to the front -- non-owned
-            # positions are dropped, not marked with -1, because holes break
-            # aiter's lse output. The compacted per-request lengths are written
-            # into dcp_sparse_kv_indptr_buffer for this layer's attention.
-            triton_filter_and_convert_dcp_index(
-                attn_metadata.cu_seqlens_q,
-                attn_metadata.g_kv_indptr,
-                attn_metadata.block_tables,
-                topk_indices,
-                dcp_rank,
-                dcp_world_size,
-                runner_block_size,
-                out_kv_indptr=dcp_sparse_kv_indptr_buffer,
-                owned_counts=dcp_owned_counts_buffer,
-                NUM_TOPK_TOKENS=topk_tokens,
-                out=sparse_kv_indices_buffer,
-                cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
-            )
+            # The fused merge already wrote sparse_kv_indices_buffer and
+            # dcp_sparse_kv_indptr_buffer (filter + localize + compaction in the
+            # same kernel), so topk_indices was never materialised and there is
+            # nothing left to convert.
+            pass
         else:
             triton_convert_req_index_to_global_index(
                 attn_metadata.cu_seqlens_q,
