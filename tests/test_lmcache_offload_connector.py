@@ -5235,3 +5235,99 @@ class TestStateStoreCompletionsCarryAGeneration:
         indexed, failed = s.take_state_reports()
         assert indexed == {op}
         assert failed == set()
+
+
+# ── kimi_k3: loads must not queue behind a backlog of stores ───────────────
+
+
+class TestStateLoadsAndStoresRunInSeparateLanes:
+    """A load is on the TTFT critical path and a store is not, but one serial
+    executor made that ordering unenforceable: a load submitted in a later step
+    sat behind every store already queued, and a stuck store blocked all of
+    them. Putting same-step loads first cannot overtake queued work."""
+
+    class _BlockingCodec:
+        """A codec whose stores hang until released; loads always land."""
+
+        def __init__(self):
+            self.gate = threading.Event()
+            self.loaded = threading.Event()
+
+        def put(self, h, unit_ids, on_source_released=None):
+            self.gate.wait(timeout=5)
+            if on_source_released is not None:
+                on_source_released()
+            return True
+
+        def get(self, h, slot):
+            self.loaded.set()
+            return True
+
+    def _tier(self, codec, **kw):
+        from atom.kv_transfer.offload.hybrid.kimi_k3.state_tier import (
+            StateOffloadTier,
+        )
+
+        return StateOffloadTier(codec, **kw)
+
+    def test_a_load_lands_while_a_store_is_still_stuck(self):
+        codec = self._BlockingCodec()
+        tier = self._tier(codec)
+        try:
+            for gen in range(4):
+                tier.submit_store(StateStoreOperationId(gen, gen + 1), (0,))
+            tier.submit_load("r1", 77, 0)
+            assert codec.loaded.wait(
+                timeout=5
+            ), "the load waited behind the store backlog"
+            done, failed = tier.get_finished()
+            assert done == {"r1"}
+            assert failed == set()
+        finally:
+            codec.gate.set()
+            tier.shutdown()
+
+    def test_one_shared_staging_buffer_still_separates_the_queues(self):
+        """`staging_lanes=1` halves the standing HBM: a load then waits out the
+        single in-flight store, but still not the backlog behind it."""
+        codec = self._BlockingCodec()
+        tier = self._tier(codec, staging_lanes=1)
+        try:
+            for gen in range(3):
+                tier.submit_store(StateStoreOperationId(gen, gen + 1), (0,))
+            tier.submit_load("r1", 77, 0)
+            assert not codec.loaded.wait(timeout=0.2), "held by the in-flight store"
+            codec.gate.set()
+            assert codec.loaded.wait(timeout=5)
+        finally:
+            codec.gate.set()
+            tier.shutdown()
+
+    def test_the_oldest_store_age_is_visible_while_it_hangs(self):
+        codec = self._BlockingCodec()
+        tier = self._tier(codec)
+        try:
+            assert tier.oldest_store_age_s() == 0.0
+            tier.submit_store(StateStoreOperationId(1, 1), (0,))
+            assert tier.oldest_store_age_s() >= 0.0
+            assert tier.stats()["state_stores_inflight"] == 1
+        finally:
+            codec.gate.set()
+            tier.drain()
+            assert tier.oldest_store_age_s() == 0.0
+            tier.shutdown()
+
+    def test_load_queue_wait_is_measured(self):
+        """The metric the old comment told readers to measure did not exist."""
+        codec = self._BlockingCodec()
+        codec.gate.set()
+        tier = self._tier(codec)
+        try:
+            tier.submit_load("r1", 77, 0)
+            tier.drain()
+            stats = tier.stats()
+            assert stats["state_loads_started"] == 1
+            assert stats["state_load_queue_wait_ms_last"] >= 0.0
+            assert "state_load_queue_wait_ms_max" in stats
+        finally:
+            tier.shutdown()

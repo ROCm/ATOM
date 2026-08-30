@@ -15,9 +15,14 @@ forever.
 import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from time import monotonic
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+#: A load waiting longer than this for its lane is worth a line: it is time
+#: added straight to TTFT, and the in-flight *count* cannot show it.
+_LOAD_WAIT_WARN_MS = 50.0
 
 
 class StateOffloadTier:
@@ -28,11 +33,31 @@ class StateOffloadTier:
     Neither side can hold a second opinion about what is stored.
     """
 
-    def __init__(self, codec, *, max_workers: int = 1) -> None:
+    def __init__(self, codec, *, max_workers: int = 1, staging_lanes: int = 2) -> None:
         self.codec = codec
-        self._executor = ThreadPoolExecutor(
-            max_workers=max_workers, thread_name_prefix="lmc-state"
+        # Two lanes, not one queue. A load is on the TTFT critical path and a
+        # store is not, but a single serial executor made that ordering
+        # unenforceable: a load submitted in a later scheduler step queued
+        # behind every store already sitting in front of it, and one store
+        # stuck in gather/D2H blocked every later load for as long as it ran.
+        # Putting same-step loads first in the submit order does not help --
+        # it cannot overtake work already queued.
+        self._load_executor = ThreadPoolExecutor(
+            max_workers=max_workers, thread_name_prefix="lmc-state-load"
         )
+        self._store_executor = ThreadPoolExecutor(
+            max_workers=max_workers, thread_name_prefix="lmc-state-store"
+        )
+        # What the lanes share is HBM, not a queue. `StagedTransfer` keeps its
+        # staging buffer in `threading.local` and sizes it to a whole entry
+        # (~55 MiB on K3), so each lane inside a transfer holds one. The
+        # budget is stated here rather than left implicit in the thread count:
+        # 2 gives each lane its own buffer, so a load never waits on a store at
+        # all; 1 makes them share one, halving the standing HBM at the cost of
+        # a load waiting out the single in-flight store. Either way a load
+        # never queues behind a *backlog* of stores, which is the actual
+        # head-of-line problem.
+        self._staging_budget = threading.BoundedSemaphore(max(1, int(staging_lanes)))
         self._lock = threading.Lock()
         self._done: set[str] = set()
         self._failed: set[str] = set()
@@ -51,6 +76,14 @@ class StateOffloadTier:
         self._source_released: set = set()
         self._indexed: set = set()
         self._index_failed: set = set()
+        # Latency, not operation counts. The in-flight cap bounds how many
+        # transfers are outstanding; it says nothing about bytes or about how
+        # long a load waited, which is what a TTFT regression is made of.
+        self.load_queue_wait_ms_last = 0.0
+        self.load_queue_wait_ms_max = 0.0
+        self.loads_started = 0
+        # op -> monotonic at submission, for `oldest_store_age_s`.
+        self._store_submitted_at: dict = {}
 
     def _register(self, fut) -> None:
         """Add *fut* to the inflight set and attach a callback that removes it
@@ -67,6 +100,31 @@ class StateOffloadTier:
 
         fut.add_done_callback(_discard)
 
+    def oldest_store_age_s(self) -> float:
+        """How long the oldest unfinished store has been outstanding.
+
+        Zero when nothing is in flight. This is the number that says a backend
+        has stopped rather than being busy, and the one the in-flight *count*
+        cannot express.
+        """
+        with self._lock:
+            if not self._store_submitted_at:
+                return 0.0
+            oldest = min(self._store_submitted_at.values())
+        return max(0.0, monotonic() - oldest)
+
+    def stats(self) -> dict:
+        """Queue latency for the periodic line. Counters live in the engine."""
+        with self._lock:
+            inflight_stores = len(self._store_submitted_at)
+        return {
+            "state_load_queue_wait_ms_last": round(self.load_queue_wait_ms_last, 2),
+            "state_load_queue_wait_ms_max": round(self.load_queue_wait_ms_max, 2),
+            "state_loads_started": self.loads_started,
+            "state_stores_inflight": inflight_stores,
+            "state_oldest_store_age_s": round(self.oldest_store_age_s(), 2),
+        }
+
     def submit_store(self, op, unit_ids) -> None:
         """Pack the checkpoint image in `unit_ids` for LMCache, under `op`.
 
@@ -80,18 +138,20 @@ class StateOffloadTier:
         stream is writing them and the packer gathers straight from where they
         sit.
         """
-        self._register(self._executor.submit(self._do_store, op, unit_ids))
+        with self._lock:
+            self._store_submitted_at[op] = monotonic()
+        self._register(self._store_executor.submit(self._do_store, op, unit_ids))
 
     def submit_load(self, req_id: str, h: int, slot: int) -> None:
         """Fetch `h` into pool slot `slot` for the parked request `req_id`.
 
-        Shares one serial executor with the stores: `StagedTransfer` keeps its
-        staging buffer in `threading.local`, so a second thread costs a second
-        resident buffer per rank. A load is on the TTFT critical path and a
-        store is not, so if stores become frequent this queue wants a priority;
-        measure `state_load_queue_wait_ms` before adding one.
+        Its own lane, so a load is never behind a backlog of stores. What the
+        two lanes still share is the staging-memory budget; see `__init__`.
+        `state_load_queue_wait_ms` measures what is left of the wait.
         """
-        self._register(self._executor.submit(self._do_load, req_id, h, slot))
+        self._register(
+            self._load_executor.submit(self._do_load, req_id, h, slot, monotonic())
+        )
 
     def drain(self) -> None:
         """Block until every submitted transfer has settled. Tests and shutdown
@@ -109,7 +169,8 @@ class StateOffloadTier:
         return done, failed
 
     def shutdown(self) -> None:
-        self._executor.shutdown(wait=True)
+        self._load_executor.shutdown(wait=True)
+        self._store_executor.shutdown(wait=True)
 
     def _do_store(self, op, unit_ids) -> None:
         stored = False
@@ -120,11 +181,14 @@ class StateOffloadTier:
             released = True
 
         try:
-            stored = bool(
-                self.codec.put(
-                    int(op.prefix_hash), unit_ids, on_source_released=_source_released
+            with self._staging_budget:
+                stored = bool(
+                    self.codec.put(
+                        int(op.prefix_hash),
+                        unit_ids,
+                        on_source_released=_source_released,
+                    )
                 )
-            )
         except Exception:  # deliberately blind, see below
             # Deliberately blind. `codec.put` reaches into LMCache, whose
             # failure modes are its own, and a store that cannot happen must
@@ -143,6 +207,7 @@ class StateOffloadTier:
             # time control is here the GPU has stopped reading them either way.
             # Withholding this on the failure paths would hold an image out of
             # the KV pool until the stale reclaimer noticed.
+            self._store_submitted_at.pop(op, None)
             self._source_released.add(op)
             # Report, never apply: `StateOffloadIndex` lives in the engine
             # process and this runs in a spawned runner. The engine applies
@@ -181,7 +246,7 @@ class StateOffloadTier:
             self._source_released.clear()
         return released
 
-    def _do_load(self, req_id: str, h: int, slot: int) -> None:
+    def _do_load(self, req_id: str, h: int, slot: int, submitted_at=None) -> None:
         # The bytes land in the committed slot, where the resuming request
         # reads them.
         #
@@ -189,9 +254,25 @@ class StateOffloadTier:
         # under a hash the engine's index still advertises. Retracting that
         # claim is the engine's job -- it owns the index -- and it does it from
         # the report below.
+        if submitted_at is not None:
+            waited_ms = max(0.0, monotonic() - submitted_at) * 1000.0
+            with self._lock:
+                self.load_queue_wait_ms_last = waited_ms
+                self.load_queue_wait_ms_max = max(
+                    self.load_queue_wait_ms_max, waited_ms
+                )
+                self.loads_started += 1
+            if waited_ms >= _LOAD_WAIT_WARN_MS:
+                logger.warning(
+                    "state offload: a state load waited %.0fms for its lane "
+                    "(oldest store outstanding %.1fs). This is TTFT.",
+                    waited_ms,
+                    self.oldest_store_age_s(),
+                )
         ok = False
         try:
-            ok = bool(self.codec.get(h, slot))
+            with self._staging_budget:
+                ok = bool(self.codec.get(h, slot))
         except Exception:  # a failed load is a normal path
             # Same reasoning as `_do_store`, and here a miss is expected:
             # LMCache's LRU can drop bytes under a hash the index still
