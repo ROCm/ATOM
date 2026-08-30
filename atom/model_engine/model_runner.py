@@ -2719,9 +2719,15 @@ class ModelRunner:
             ub_max_tokens_across_dp=ub_max_tokens_across_dp,
         )
 
-    def prepare_sample(
-        self, batch: ScheduledBatch
-    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, bool, bool]:
+    def prepare_sample(self, batch: ScheduledBatch) -> tuple[
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        bool,
+        bool,
+        np.ndarray | None,
+        np.ndarray | None,
+    ]:
         bs = batch.total_seqs_num
 
         # Check on CPU whether all requests are greedy (temperature=0)
@@ -2765,7 +2771,21 @@ class ModelRunner:
         else:
             top_ps = None
 
-        return temperatures, top_ks, top_ps, all_greedy, needs_independent_noise
+        sampling_seeds = batch.sampling_seeds
+        sampling_steps = batch.sampling_steps
+        if sampling_seeds is not None and not (sampling_seeds >= 0).any():
+            sampling_seeds = None
+            sampling_steps = None
+
+        return (
+            temperatures,
+            top_ks,
+            top_ps,
+            all_greedy,
+            needs_independent_noise,
+            sampling_seeds,
+            sampling_steps,
+        )
 
     def prepare_model(self, batch: ScheduledBatch):
         self._dspark_apply_q_bucket(batch)
@@ -2785,9 +2805,15 @@ class ModelRunner:
         total_tokens_num = batch.total_tokens_num
         assert total_tokens_num > 0
 
-        temperatures, top_ks, top_ps, all_greedy, needs_independent_noise = (
-            self.prepare_sample(batch)
-        )
+        (
+            temperatures,
+            top_ks,
+            top_ps,
+            all_greedy,
+            needs_independent_noise,
+            sampling_seeds,
+            sampling_steps,
+        ) = self.prepare_sample(batch)
         input_ids = self.tokenID_processor.prepare_input_ids(batch)
         self.prepare_inputs(batch, input_ids, preprocessed=preprocessed)
 
@@ -2816,6 +2842,8 @@ class ModelRunner:
             top_ps,
             all_greedy,
             needs_independent_noise,
+            sampling_seeds,
+            sampling_steps,
         )
 
     @staticmethod
@@ -3255,6 +3283,8 @@ class ModelRunner:
         # following for draft
         hidden_states: torch.Tensor,
         needs_independent_noise: bool = False,
+        sampling_seeds: np.ndarray | None = None,
+        sampling_steps: np.ndarray | None = None,
     ) -> ScheduledBatchOutput:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
         bs = batch.total_seqs_num
@@ -3266,6 +3296,8 @@ class ModelRunner:
                 top_ps,
                 all_greedy,
                 needs_independent_noise=needs_independent_noise,
+                sequence_seeds=sampling_seeds,
+                sequence_steps=sampling_steps,
             )
             num_reject_tokens = self.tokenID_processor.default_num_rejected_tokens[:bs]
             next_token_locs = num_reject_tokens
@@ -3419,6 +3451,8 @@ class ModelRunner:
             top_ps,
             all_greedy,
             needs_independent_noise,
+            sampling_seeds,
+            sampling_steps,
         ) = self.prepare_model(batch)
         self._mark_staging_h2d_enqueued()
         logits, hidden_states = self.run_model(input_ids, batch)
@@ -3486,6 +3520,8 @@ class ModelRunner:
             all_greedy,
             hidden_states,
             needs_independent_noise=needs_independent_noise,
+            sampling_seeds=sampling_seeds,
+            sampling_steps=sampling_steps,
         )
 
         reset_forward_context()
