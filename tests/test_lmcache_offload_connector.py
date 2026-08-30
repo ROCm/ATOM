@@ -5331,3 +5331,88 @@ class TestStateLoadsAndStoresRunInSeparateLanes:
             assert "state_load_queue_wait_ms_max" in stats
         finally:
             tier.shutdown()
+
+    class _EarlyReleaseCodec:
+        """`put` releases the source (D2H drained) and then stalls in the CPU
+        `batched_put`, so a drain can observe the early release *before* the
+        store completes -- exactly the window the source/store split exists
+        for."""
+
+        def __init__(self):
+            self.released = threading.Event()
+            self.gate = threading.Event()
+
+        def put(self, h, unit_ids, on_source_released=None):
+            if on_source_released is not None:
+                on_source_released()  # D2H is done here, CPU put is not
+            self.released.set()
+            self.gate.wait(timeout=5)
+            return True
+
+        def get(self, h, slot):
+            return True
+
+    def test_source_release_is_emitted_once_early_not_again_at_store_end(self):
+        """The release must land the instant the D2H drains (before the CPU
+        put), and must not be re-emitted when `_do_store` returns. A second
+        emission across two engine drains double-unpins the same record."""
+        codec = self._EarlyReleaseCodec()
+        tier = self._tier(codec)
+        op = StateStoreOperationId(1, 1)
+        try:
+            tier.submit_store(op, (0,))
+            assert codec.released.wait(timeout=5), "the D2H callback never fired"
+            # Early: units handed back while the CPU put is still running.
+            assert tier.take_source_releases() == {op}
+            # Finish the store; the end-of-store backstop must stay silent.
+            codec.gate.set()
+            tier.drain()
+            assert tier.take_source_releases() == set(), "source release re-emitted"
+            assert tier.take_store_reports() == ({op}, set())
+        finally:
+            codec.gate.set()
+            tier.shutdown()
+
+    def test_a_refused_store_still_releases_its_units(self):
+        """A refused allocation never fires the D2H callback and never read the
+        units, so the backstop must release them -- withholding it would hold an
+        image out of the KV pool until the stale reclaimer noticed."""
+
+        class _RefuseCodec:
+            def put(self, h, unit_ids, on_source_released=None):
+                return False  # allocation refused; callback never reached
+
+            def get(self, h, slot):
+                return True
+
+        tier = self._tier(_RefuseCodec())
+        op = StateStoreOperationId(2, 1)
+        try:
+            tier.submit_store(op, (0,))
+            tier.drain()
+            assert tier.take_source_releases() == {op}
+            assert tier.take_store_reports() == (set(), {op})
+        finally:
+            tier.shutdown()
+
+    def test_a_throwing_store_still_releases_its_units(self):
+        """A throwing `pack` drains the device before it propagates, so the GPU
+        has stopped reading the units by the time control returns -- the backstop
+        releases them and the store is reported failed, not lost."""
+
+        class _ThrowCodec:
+            def put(self, h, unit_ids, on_source_released=None):
+                raise RuntimeError("pack blew up")
+
+            def get(self, h, slot):
+                return True
+
+        tier = self._tier(_ThrowCodec())
+        op = StateStoreOperationId(3, 1)
+        try:
+            tier.submit_store(op, (0,))
+            tier.drain()
+            assert tier.take_source_releases() == {op}
+            assert tier.take_store_reports() == (set(), {op})
+        finally:
+            tier.shutdown()

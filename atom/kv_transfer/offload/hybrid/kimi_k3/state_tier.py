@@ -177,8 +177,21 @@ class StateOffloadTier:
         released = False
 
         def _source_released() -> None:
+            # Fires from `codec.put` the moment `pack`'s gather+D2H have
+            # drained (state_object.put), before `batched_put`. Publish the
+            # release *here*, early: the PAGE units are the KV pool's and the
+            # GPU has stopped reading them, so hand them back now instead of
+            # holding a whole image out of the pool across the CPU put. Under
+            # `self._lock` because `take_source_releases` drains the set from
+            # the engine thread; the flag makes the end-of-store backstop a
+            # no-op so the release is emitted exactly once (a second emission
+            # would double-unpin on the engine side).
             nonlocal released
-            released = True
+            with self._lock:
+                if released:
+                    return
+                released = True
+                self._source_released.add(op)
 
         try:
             with self._staging_budget:
@@ -201,14 +214,19 @@ class StateOffloadTier:
                 exc_info=True,
             )
         with self._lock:
-            # Always released, on every exit. A refused allocation never read
-            # the units at all, and a throwing `pack` has drained the device
-            # before it propagated (`StagedTransfer._drain_device`), so by the
-            # time control is here the GPU has stopped reading them either way.
-            # Withholding this on the failure paths would hold an image out of
-            # the KV pool until the stale reclaimer noticed.
+            # Backstop, not the primary path: on success the D2H callback above
+            # already published the release early, so this must NOT add it again
+            # -- a second emission across two engine drains is the double-unpin.
+            # It still fires on the paths the callback never reached: a refused
+            # allocation never read the units, and a throwing `pack` drained the
+            # device before it propagated (`StagedTransfer._drain_device`), so
+            # the GPU has stopped reading them there too. Withholding it on those
+            # paths would hold an image out of the KV pool until the stale
+            # reclaimer noticed.
             self._store_submitted_at.pop(op, None)
-            self._source_released.add(op)
+            if not released:
+                released = True
+                self._source_released.add(op)
             # Report, never apply: `StateOffloadIndex` lives in the engine
             # process and this runs in a spawned runner. The engine applies
             # these via KVConnectorOutput.
