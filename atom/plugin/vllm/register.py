@@ -294,6 +294,16 @@ def register_model() -> None:
         vllm_model_registry._try_load_model_cls.cache_clear()
         vllm_model_registry._try_inspect_model_cls.cache_clear()
 
+    # vLLM rejects Kimi-K3 DSpark under DCP while validating the speculative
+    # config. That validation runs later than this hook but earlier than any
+    # model is built, and unlike register_platform -- which vLLM invokes from
+    # inside its own import -- here vllm.engine is safe to import.
+    from atom.plugin.vllm.dspark_dcp_patch import (
+        apply_vllm_dspark_dcp_config_patch,
+    )
+
+    apply_vllm_dspark_dcp_config_patch()
+
     # patch attention process weights after loading
     # to avoid the specific handle in ATOM loader
     try:
