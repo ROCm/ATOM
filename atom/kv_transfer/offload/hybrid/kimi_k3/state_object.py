@@ -111,7 +111,7 @@ class StateByteCodec:
             torch.uint8,
         )
 
-    def put(self, h: int, unit_ids) -> bool:
+    def put(self, h: int, unit_ids, on_source_released=None) -> bool:
         """Store one checkpoint image. False when nothing was stored.
 
         Reads the checkpoint's PAGE units, while `get` writes an Active Slot.
@@ -123,6 +123,13 @@ class StateByteCodec:
         pressure, and a whole image is refused sooner than a KV chunk, so the
         state leg feels a full pool first. `puts_refused` makes that visible
         instead of a silent hit-rate drift.
+
+        `on_source_released` fires the moment `pack` returns, which is after
+        the gather and the D2H have both been synchronized -- i.e. the moment
+        the GPU has stopped reading the checkpoint's PAGE units. It is separate
+        from the return value on purpose: the units are the KV pool's, and
+        holding them across `batched_put` would keep an image out of the pool
+        for a CPU operation that cannot touch them.
         """
         if self._storage is None:
             return False
@@ -146,6 +153,10 @@ class StateByteCodec:
         # its own reference with `finally` for the same reason.
         try:
             self._staged.pack(self._backend.page_unit_views(unit_ids), obj)
+            # Source first: `pack` has synchronized the stream that reads the
+            # units, so nothing on the device touches them from here.
+            if on_source_released is not None:
+                on_source_released()
             self._storage.batched_put([key], [obj])
         except Exception:
             obj.ref_count_down()

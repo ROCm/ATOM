@@ -548,6 +548,24 @@ class TestOffloadPinRelease:
         store._queue_offload_store(cid, store.records[cid])
         assert store.take_offload_stores(max_inflight=4) == []
 
+    def test_a_reclaimed_store_is_remembered_so_it_cannot_be_indexed(self):
+        """The reclaimer cannot tell a lost report from a worker still inside
+        the gather, so the units come back but the image is forfeited."""
+        _pool, store = offload_store()
+        _cid, _op = ready(store, 11)
+        [(op, _u)] = store.take_offload_stores(max_inflight=4)
+        assert not store.was_reclaimed(op)
+        assert store.reclaim_stale_offload_pins(timeout_s=1e-9) == 1
+        assert store.was_reclaimed(op)
+
+    def test_a_store_that_reported_in_time_is_not_marked_reclaimed(self):
+        _pool, store = offload_store()
+        _cid, _op = ready(store, 11)
+        [(op, _u)] = store.take_offload_stores(max_inflight=4)
+        store.settle_offload_store(op)
+        assert store.reclaim_stale_offload_pins(timeout_s=1e-9) == 0
+        assert not store.was_reclaimed(op)
+
     def test_a_lost_report_is_reclaimed_and_counted(self):
         """The pin is in this process and the copy is in the worker, so a
         crashed worker would otherwise hold an image out of the pool forever."""

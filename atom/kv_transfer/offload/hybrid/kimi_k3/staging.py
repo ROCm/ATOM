@@ -202,9 +202,21 @@ class StagedTransfer:
                 self._finish(state, state.copy_stream)
             except Exception:
                 staging_buffer.free_event_valid = False
+                # The caller must release the source units on this path too --
+                # otherwise a failed store holds a whole image out of the KV
+                # pool. Draining the device first is what makes that safe: the
+                # gather reads those units, and returning them while a kernel
+                # is still queued would let the pool hand them to another
+                # request whose writes the gather would then pick up.
+                self._drain_device()
                 raise
             finally:
                 self.release_buffer_if_requested(staging_buffer)
+
+    def _drain_device(self) -> None:
+        """Wait out every kernel this device has queued. Failure paths only."""
+        if self._use_cuda():
+            torch.cuda.synchronize(self.device)
 
     def unpack(self, src: Any, segments: list[torch.Tensor]) -> None:
         """Scatter one packed object back over `segments` -- `pack`'s mirror.

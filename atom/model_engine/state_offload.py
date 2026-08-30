@@ -47,6 +47,12 @@ class StateOffloadIndex:
         self.stores_completed = 0
         self.stores_failed = 0
         self.stores_refused = 0
+        # Stores that reported success after the stale reclaimer had already
+        # taken their source units back. Not counted as completed: nothing can
+        # say the worker had stopped reading, so the image is forfeited rather
+        # than indexed. Any non-zero value means the reclaim window is firing
+        # on live transfers and is set too low.
+        self.stores_untrusted = 0
 
     # ------------------------------- stores -------------------------------- #
     def note_stored(self, h: int) -> None:
@@ -134,6 +140,7 @@ class StateOffloadIndex:
             "stores_completed": self.stores_completed,
             "stores_failed": self.stores_failed,
             "stores_refused": self.stores_refused,
+            "stores_untrusted": self.stores_untrusted,
             # Load leg.
             "loads_attempted": self.loads_attempted,
             "loads_completed": self.loads_completed,

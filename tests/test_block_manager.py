@@ -798,3 +798,72 @@ def test_a_multi_without_the_offload_backend_gets_no_index(monkeypatch):
         {"kv_connector": "multi", "connectors": [{"kv_connector": "moriio"}]},
     )
     assert bm.state_offload is None
+
+
+# ── a store whose source was reclaimed must not be indexed ─────────────────
+
+
+class TestReclaimedStoresAreNotIndexed:
+    """`reclaim_stale_offload_pins` cannot prove the worker stopped reading:
+    a K3 state store bypasses `CacheEngine.store()` and gathers ATOM PAGE units
+    directly, so LMCache's GPU-source pin monitor does not cover them. If the
+    reader had not stopped, the pool may have handed those units to another
+    request whose writes the gather picked up -- a CPU image that is a mix of
+    two prefixes under the first one's hash."""
+
+    class _Coordinator:
+        def __init__(self, reclaimed):
+            self._reclaimed = reclaimed
+            self.settled = []
+
+        def was_reclaimed(self, op):
+            return op in self._reclaimed
+
+        def settle_offload_store(self, op):
+            self.settled.append(op)
+
+    def _bm(self, reclaimed=()):
+        from atom.model_engine.state_offload import StateOffloadIndex
+
+        bm = object.__new__(BlockManager)
+        bm.paged_state_checkpoints = self._Coordinator(set(reclaimed))
+        bm.state_offload = StateOffloadIndex()
+        return bm
+
+    def test_a_normal_store_is_indexed(self):
+        from atom.kv_transfer.disaggregation.types import StateStoreOperationId
+
+        bm = self._bm()
+        op = StateStoreOperationId(11, 1)
+        bm.settle_state_store(op, ok=True)
+        assert 11 in bm.state_offload.hashes
+        assert bm.state_offload.stores_completed == 1
+        assert bm.state_offload.stores_untrusted == 0
+
+    def test_a_reclaimed_store_reporting_success_is_forfeited(self):
+        from atom.kv_transfer.disaggregation.types import StateStoreOperationId
+
+        op = StateStoreOperationId(11, 1)
+        bm = self._bm(reclaimed=[op])
+        bm.settle_state_store(op, ok=True)
+        assert 11 not in bm.state_offload.hashes, "voting for it is wrong output"
+        assert bm.state_offload.stores_completed == 0
+        assert bm.state_offload.stores_untrusted == 1
+
+    def test_the_units_go_back_either_way(self):
+        from atom.kv_transfer.disaggregation.types import StateStoreOperationId
+
+        op = StateStoreOperationId(11, 1)
+        bm = self._bm(reclaimed=[op])
+        bm.settle_state_store(op, ok=True)
+        assert bm.paged_state_checkpoints.settled == [op]
+
+    def test_the_source_release_is_what_normally_returns_them(self):
+        from atom.kv_transfer.disaggregation.types import StateStoreOperationId
+
+        bm = self._bm()
+        op = StateStoreOperationId(11, 1)
+        bm.release_state_store_source(op)
+        assert bm.paged_state_checkpoints.settled == [op]
+        # ...and it does not touch the index, which the store report owns.
+        assert bm.state_offload.hashes == set()

@@ -1093,15 +1093,47 @@ class BlockManager:
         The index is keyed by hash, because what a resume asks is whether the
         prefix is in LMCache -- not which attempt put it there.
         """
+        reclaimed = False
         if self.paged_state_checkpoints is not None:
+            reclaimed = self.paged_state_checkpoints.was_reclaimed(op)
+            # Idempotent: normally the source release already returned these
+            # units, and this is the backstop for a store that failed before
+            # it ever read them.
             self.paged_state_checkpoints.settle_offload_store(op)
         if self.state_offload is None:
+            return
+        if ok and reclaimed:
+            # The stale reclaimer took this store's units back before it
+            # reported, and nothing can say whether the worker had stopped
+            # reading them. If it had not, the pool may have handed them to
+            # another request whose writes the gather picked up, making the CPU
+            # image a mix of two prefixes filed under the first one's hash --
+            # and a resume onto that is silent wrong output. The bytes may well
+            # be fine; there is no way to know, so they are forfeited.
+            self.state_offload.stores_untrusted += 1
+            logger.warning(
+                "state offload: %s reported stored, but its units were "
+                "reclaimed while it ran; refusing to index it.",
+                op,
+            )
             return
         if ok:
             self.state_offload.stores_completed += 1
             self.state_offload.note_stored(int(op.prefix_hash))
         else:
             self.state_offload.stores_failed += 1
+
+    def release_state_store_source(self, op) -> None:
+        """The GPU has finished reading this store's PAGE units; hand them back.
+
+        Separate from `settle_state_store` because the two answer different
+        questions: the units are the KV pool's and are free as soon as the D2H
+        drains, while whether the CPU put succeeded is decided afterwards and
+        cannot touch them. Holding an image out of the pool across that would
+        cost reuse for nothing.
+        """
+        if self.paged_state_checkpoints is not None:
+            self.paged_state_checkpoints.settle_offload_store(op)
 
     def reclaim_stale_state_store_pins(self, timeout_s: float) -> int:
         """Release store pins whose report never came. See the store."""

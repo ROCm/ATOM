@@ -3530,6 +3530,15 @@ class Scheduler:
             # bytes are not really there must never be voted for, and a pin
             # exists to keep the source still during the copy -- which is over
             # either way.
+            # The source release first, and separately: it hands the PAGE
+            # units back the moment the GPU stopped reading them, which is
+            # before the CPU put has been decided. Waiting for the store
+            # report would keep a whole image out of the pool across an
+            # operation that cannot touch it.
+            release = getattr(self.kv_connector, "take_state_source_releases", None)
+            if release is not None:
+                for op in release():
+                    bm.release_state_store_source(op)
             for op in indexed:
                 bm.settle_state_store(op, ok=True)
             for op in failed:

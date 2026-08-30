@@ -197,6 +197,17 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         callback = getattr(self._impl, "take_state_reports", None)
         return callback() if callback is not None else (set(), set())
 
+    def take_state_source_releases(self) -> set:
+        """Stores whose PAGE units the GPU has finished reading.
+
+        Its own forwarder rather than a third element of `take_state_reports`,
+        for the reason recorded above: that tuple's arity is a contract with
+        the caller, and widening it is exactly the change that wedged the pool
+        once already. An impl without a state tier releases nothing.
+        """
+        callback = getattr(self._impl, "take_state_source_releases", None)
+        return callback() if callback is not None else set()
+
     def get_statistics(self) -> dict[str, int]:
         return self._impl.get_statistics()
 

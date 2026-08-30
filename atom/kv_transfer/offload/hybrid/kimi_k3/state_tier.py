@@ -37,10 +37,18 @@ class StateOffloadTier:
         self._done: set[str] = set()
         self._failed: set[str] = set()
         self._inflight: set = set()
-        # The store path's two reports, drained by `take_store_reports`. Sets
-        # of `StateStoreOperationId`, not of bare hashes: the engine settles
-        # the pin for that exact generation, and the aggregator would tombstone
-        # a bare hash after the first store of it.
+        # The store path's reports, drained by `take_store_reports`. Sets of
+        # `StateStoreOperationId`, not of bare hashes: the engine settles the
+        # pin for that exact generation, and the aggregator would tombstone a
+        # bare hash after the first store of it.
+        #
+        # `_source_released` is a separate report from `_indexed` because the
+        # two answer different questions and land at different times. The
+        # source is the KV pool's PAGE units and is free the instant the D2H
+        # drains; whether the CPU put succeeded is decided afterwards and
+        # cannot touch them. Reporting only the second would hold an image out
+        # of the pool across an operation that does not need it.
+        self._source_released: set = set()
         self._indexed: set = set()
         self._index_failed: set = set()
 
@@ -105,8 +113,18 @@ class StateOffloadTier:
 
     def _do_store(self, op, unit_ids) -> None:
         stored = False
+        released = False
+
+        def _source_released() -> None:
+            nonlocal released
+            released = True
+
         try:
-            stored = bool(self.codec.put(int(op.prefix_hash), unit_ids))
+            stored = bool(
+                self.codec.put(
+                    int(op.prefix_hash), unit_ids, on_source_released=_source_released
+                )
+            )
         except Exception:  # deliberately blind, see below
             # Deliberately blind. `codec.put` reaches into LMCache, whose
             # failure modes are its own, and a store that cannot happen must
@@ -119,6 +137,13 @@ class StateOffloadTier:
                 exc_info=True,
             )
         with self._lock:
+            # Always released, on every exit. A refused allocation never read
+            # the units at all, and a throwing `pack` has drained the device
+            # before it propagated (`StagedTransfer._drain_device`), so by the
+            # time control is here the GPU has stopped reading them either way.
+            # Withholding this on the failure paths would hold an image out of
+            # the KV pool until the stale reclaimer noticed.
+            self._source_released.add(op)
             # Report, never apply: `StateOffloadIndex` lives in the engine
             # process and this runs in a spawned runner. The engine applies
             # these via KVConnectorOutput.
@@ -143,6 +168,18 @@ class StateOffloadTier:
             self._indexed.clear()
             self._index_failed.clear()
         return indexed, index_failed
+
+    def take_source_releases(self) -> set:
+        """Operations whose PAGE units the GPU has finished reading.
+
+        Drained apart from `take_store_reports`, and usually in the same step:
+        both are reported once `_do_store` returns, but the release is what
+        hands the units back and the store report is what indexes the hash.
+        """
+        with self._lock:
+            released = set(self._source_released)
+            self._source_released.clear()
+        return released
 
     def _do_load(self, req_id: str, h: int, slot: int) -> None:
         # The bytes land in the committed slot, where the resuming request

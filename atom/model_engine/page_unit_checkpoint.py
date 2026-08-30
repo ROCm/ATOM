@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from collections import OrderedDict, deque
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
@@ -13,6 +15,12 @@ from time import monotonic
 from atom.kv_transfer.disaggregation.types import StateStoreOperationId
 from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.sequence import Sequence
+
+logger = logging.getLogger("atom")
+
+#: How many reclaimed store operations to remember. Only has to outlive a
+#: report already on the wire, which is one step, so this is generous.
+_RECLAIMED_MEMORY = 4096
 
 COPYING = "COPYING"
 READY = "READY"
@@ -153,6 +161,11 @@ class PageUnitCheckpointStore:
         self._offload_pins: dict[StateStoreOperationId, tuple[int, float]] = {}
         self._offload_generation = 0
         self.offload_pins_reclaimed = 0
+        # Operations whose pin the stale reclaimer took back. Bounded, because
+        # this only has to outlive a report already on the wire. A store whose
+        # source was reclaimed underneath it may not be indexed -- see
+        # `was_reclaimed`.
+        self._offload_reclaimed: OrderedDict = OrderedDict()
 
     @property
     def units_per_checkpoint(self) -> int:
@@ -454,14 +467,29 @@ class PageUnitCheckpointStore:
 
         The pin lives here in the engine process and the D2H runs in the
         worker, so a lost report -- a crashed worker, a dropped completion --
-        would hold 127 blocks out of the pool forever. This is the unit-side
-        twin of `Scheduler._reconcile_stalled_deferred_saves` and takes the
-        same window, derived from LMCache's own pin timeout, for the same
-        reason: by then upstream has force-unpinned and stopped reading.
+        would hold a whole image out of the pool forever. This is the unit-side
+        twin of `Scheduler._reconcile_stalled_deferred_saves`.
 
-        Recovery is total, which is what makes 20 lines enough: a leaked pin
-        breaks no `BlockPool` invariant and leaves no half-released state, so
-        zeroing the count restores the record exactly.
+        **This is a last resort and it does not prove the reader stopped.** It
+        used to be justified by LMCache's own pin timeout, on the grounds that
+        by then upstream has force-unpinned and stopped reading. That argument
+        does not hold for this source: a K3 state store bypasses
+        `CacheEngine.store()` entirely and gathers ATOM PAGE units through
+        `page_unit_views -> StagedTransfer.pack -> storage_manager.batched_put`,
+        and those units are not covered by LMCache's GPU-source pin monitor.
+        Nothing here can tell a lost report from a worker still inside the
+        gather.
+
+        What follows from that is not that the units may never be reclaimed --
+        that would leak an image per dropped completion -- but that a store
+        whose source was reclaimed can no longer be trusted: if the reader had
+        not stopped, the pool may have handed those units to another request
+        whose writes the gather then picked up, and the CPU image is a mix of
+        two prefixes under the first one's hash. Resuming onto it is silent
+        wrong output. So the operation is remembered here and
+        `BlockManager.settle_state_store` refuses to index it. The reclaim
+        recovers the memory and forfeits the entry, which is the only pair of
+        outcomes this can honestly offer.
         """
         if timeout_s <= 0 or not self._offload_pins:
             return 0
@@ -470,8 +498,22 @@ class PageUnitCheckpointStore:
         for op in stale:
             checkpoint_id, _at = self._offload_pins.pop(op)
             self._release_offload_pin(checkpoint_id)
+            self._offload_reclaimed[op] = None
+            while len(self._offload_reclaimed) > _RECLAIMED_MEMORY:
+                self._offload_reclaimed.popitem(last=False)
             self.offload_pins_reclaimed += 1
+            logger.warning(
+                "state offload: reclaimed the units of store %s after %.1fs "
+                "with no report. The worker may still be reading them, so the "
+                "image will not be indexed even if a report arrives later.",
+                op,
+                timeout_s,
+            )
         return len(stale)
+
+    def was_reclaimed(self, op) -> bool:
+        """Whether this store's source was taken back before it reported."""
+        return op in self._offload_reclaimed
 
     def _release_offload_pin(self, checkpoint_id: int) -> None:
         record = self.records.get(checkpoint_id)
@@ -763,6 +805,10 @@ class PagedStateCheckpointCoordinator:
     def reclaim_stale_offload_pins(self, timeout_s: float) -> int:
         """Release offload pins whose report never came. See the store."""
         return self.store.reclaim_stale_offload_pins(timeout_s)
+
+    def was_reclaimed(self, op) -> bool:
+        """Whether this store's source was taken back before it reported."""
+        return self.store.was_reclaimed(op)
 
     def unindex(self, h: int) -> None:
         # `_pending` is keyed by `(seq, hash)`, so one hash can be pending for

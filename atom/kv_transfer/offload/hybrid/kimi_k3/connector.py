@@ -39,6 +39,12 @@ logger = logging.getLogger("atom")
 #: partial store resolve instead of pinning a key forever.
 STATE_INDEX_CHANNEL = "k3_state_index"
 
+#: The other half of a store's completion: the GPU has stopped reading the
+#: checkpoint's PAGE units. Separate from the index channel because the units
+#: are the KV pool's and are free as soon as the D2H drains, while whether the
+#: CPU put succeeded is decided afterwards and cannot touch them.
+STATE_SOURCE_CHANNEL = "k3_state_source"
+
 #: A save outstanding longer than this is a backend that stopped, not one that
 #: is busy: a 4096-token store costs ~65ms.
 SAVE_STALL_SECONDS = 120.0
@@ -290,6 +296,10 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
             out.connector_completions.add(
                 ConnectorCompletion(STATE_INDEX_CHANNEL, op, False)
             )
+        for op in self._state_tier.take_source_releases():
+            out.connector_completions.add(
+                ConnectorCompletion(STATE_SOURCE_CHANNEL, op, True)
+            )
         return out
 
     def _settle_joint(self, kv_done, kv_failed, state_done, state_failed):
@@ -341,8 +351,9 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler):
         self._save_stalled = False
         self._warned_save_stalled = False
         # Channel reports drained by the engine each step.
-        self._state_indexed: set[int] = set()
-        self._state_index_failed: set[int] = set()
+        self._state_indexed: set = set()
+        self._state_index_failed: set = set()
+        self._state_source_released: set = set()
         # Stores this worker could not even attempt (no tier). Reported as
         # failures so the engine releases their pinned units immediately.
         self._state_store_failed_locally: set[int] = set()
@@ -505,6 +516,9 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler):
 
     # -- connector-owned channels -----------------------------------------
     def connector_completion(self, completion) -> bool:
+        if completion.channel == STATE_SOURCE_CHANNEL:
+            self._state_source_released.add(completion.operation_id)
+            return True
         if completion.channel == STATE_INDEX_CHANNEL:
             target = (
                 self._state_indexed
@@ -514,6 +528,18 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler):
             target.add(completion.operation_id)
             return True
         return super().connector_completion(completion)
+
+    def take_state_source_releases(self) -> set:
+        """Drain the stores whose PAGE units the GPU has finished reading.
+
+        A method of its own rather than a third element of
+        `take_state_reports`: that tuple's arity is a contract between this
+        class and the delegating shell's fallback, and widening it once
+        already cost every TP worker in the pool.
+        """
+        released = self._state_source_released
+        self._state_source_released = set()
+        return released
 
     def take_state_reports(self) -> tuple[set[int], set[int]]:
         """Drain this step's tier store reports for the engine-side index."""
