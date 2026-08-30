@@ -297,6 +297,8 @@ def test_dense_mla_decode_pads_small_head_count():
             paged_kv_last_page_len=torch.tensor([1], dtype=torch.int32),
             fold_factor=None,
             max_qo_len=1,
+            causal=True,
+            g_kv_indptr=None,
         )
         output, lse = layer_mla.AttentionForVllmMLA._forward_decode(
             attention,
@@ -360,6 +362,8 @@ def test_dense_mla_decode_pads_gathered_dcp_heads():
             paged_kv_last_page_len=torch.tensor([1], dtype=torch.int32),
             fold_factor=None,
             max_qo_len=1,
+            causal=True,
+            g_kv_indptr=None,
         )
         output, lse = layer_mla.AttentionForVllmMLA._forward_decode(
             attention,
@@ -372,4 +376,209 @@ def test_dense_mla_decode_pads_gathered_dcp_heads():
         assert seen["num_heads"] == 128
         assert output.shape == (1, 96, 8)
         assert lse.shape == (1, 96)
+        """)
+
+
+def test_dcp_local_slots_match_the_unsharded_layout_at_cp1():
+    import torch
+
+    from atom.plugin.vllm.dspark_dcp_patch import _dcp_local_slots
+
+    block_size = 4
+    block_table = torch.tensor([[10, 11, 12], [20, 21, 22]], dtype=torch.int32)
+    positions = torch.tensor([0, 3, 4, 7, 8], dtype=torch.int64)
+    token_req = torch.tensor([0, 0, 1, 1, 0], dtype=torch.int64)
+
+    slots = _dcp_local_slots(
+        positions.clone(),
+        block_table,
+        token_req,
+        block_size,
+        cp_size=1,
+        cp_rank=0,
+        cp_interleave=1,
+        pad_slot_id=-1,
+    )
+    # block_id * block_size + position % block_size, with no rank filtering.
+    assert slots.tolist() == [40, 43, 84, 87, 48]
+
+
+def test_dcp_local_slots_keep_only_this_ranks_round_robin_share():
+    import torch
+
+    from atom.plugin.vllm.dspark_dcp_patch import _dcp_local_slots
+
+    block_size, cp_size = 4, 2
+    # One block-table entry now spans block_size * cp_size = 8 global tokens.
+    block_table = torch.tensor([[10, 11]], dtype=torch.int32)
+    positions = torch.arange(16, dtype=torch.int64)
+    token_req = torch.zeros(16, dtype=torch.int64)
+
+    per_rank = [
+        _dcp_local_slots(
+            positions.clone(),
+            block_table,
+            token_req,
+            block_size,
+            cp_size=cp_size,
+            cp_rank=rank,
+            cp_interleave=1,
+            pad_slot_id=-1,
+        ).tolist()
+        for rank in range(cp_size)
+    ]
+
+    # Rank r owns exactly the positions with p % cp_size == r, packed densely
+    # into its own physical block, and drops the rest.
+    assert per_rank[0] == [40, -1, 41, -1, 42, -1, 43, -1] + [
+        44,
+        -1,
+        45,
+        -1,
+        46,
+        -1,
+        47,
+        -1,
+    ]
+    assert per_rank[1] == [-1, 40, -1, 41, -1, 42, -1, 43] + [
+        -1,
+        44,
+        -1,
+        45,
+        -1,
+        46,
+        -1,
+        47,
+    ]
+    # Every global position is stored by exactly one rank.
+    for p in range(16):
+        assert sum(per_rank[r][p] != -1 for r in range(cp_size)) == 1
+
+
+def test_atom_patch_hides_dcp_from_speculative_config_validation():
+    _run_without_test_stubs("""
+        from types import SimpleNamespace
+
+        from vllm.engine.arg_utils import EngineArgs
+
+        from atom.plugin.vllm.dspark_dcp_patch import (
+            apply_vllm_dspark_dcp_config_patch,
+        )
+
+        seen = {}
+
+        def stub(self, target_model_config, target_parallel_config):
+            # Stands in for the real constructor, whose only DCP-dependent
+            # behaviour is the raise this patch exists to skip.
+            seen["dcp"] = target_parallel_config.decode_context_parallel_size
+            return "spec-config"
+
+        EngineArgs.create_speculative_config = stub
+        apply_vllm_dspark_dcp_config_patch()
+
+        args = SimpleNamespace(speculative_config={"method": "dspark"})
+        parallel_config = SimpleNamespace(decode_context_parallel_size=8)
+        result = EngineArgs.create_speculative_config(args, None, parallel_config)
+
+        assert result == "spec-config"
+        # Masked for the duration of the call, restored the moment it returns.
+        assert seen["dcp"] == 1
+        assert parallel_config.decode_context_parallel_size == 8
+
+        # Without a speculative config, or without DCP, nothing is touched.
+        seen.clear()
+        no_dcp = SimpleNamespace(decode_context_parallel_size=1)
+        EngineArgs.create_speculative_config(args, None, no_dcp)
+        assert seen["dcp"] == 1
+        """)
+
+
+def test_dcp_multi_token_decode_selects_the_round_robin_kernel():
+    _run_without_test_stubs("""
+        from types import SimpleNamespace
+
+        import torch
+
+        from atom.model_ops.attention_mla import MLAAttention
+        from atom.plugin.vllm.attention import layer_mla
+
+        seen = {}
+
+        def fake_mla_decode_fwd(q, _kv, output, *_args, **kwargs):
+            seen.update(kwargs)
+            output.fill_(1)
+            lse = torch.ones(
+                q.shape[0], q.shape[1], dtype=torch.float32, device=q.device
+            )
+            return output, lse
+
+        layer_mla.mla_decode_fwd = fake_mla_decode_fwd
+
+        def run(max_qo_len, causal, g_kv_indptr):
+            attention = SimpleNamespace(
+                num_heads=12,
+                min_query_heads=16,
+                kv_lora_rank=8,
+                dcp_world_size=8,
+                dcp_rank=3,
+                kv_cache_dtype="fp8",
+                is_sparse_mla=False,
+                dcp_persistent_supported=True,
+                scale=1.0,
+                _q_scale=None,
+                _k_scale=None,
+            )
+            MLAAttention._configure_dcp_decode_head_padding(attention, 8)
+            attention._pad_decode_query_heads = (
+                lambda q: MLAAttention._pad_decode_query_heads(attention, q)
+            )
+            attention._restore_decode_query_heads = (
+                lambda output, num_heads: (
+                    MLAAttention._restore_decode_query_heads(
+                        attention, output, num_heads
+                    )
+                )
+            )
+            decode = SimpleNamespace(
+                attn_out_dtype=torch.bfloat16,
+                use_persistent_metadata=False,
+                paged_kv_indptr=torch.tensor([0, 1], dtype=torch.int32),
+                paged_kv_indices=torch.tensor([0], dtype=torch.int32),
+                qo_indptr=torch.tensor([0, max_qo_len], dtype=torch.int32),
+                paged_kv_last_page_len=torch.tensor([1], dtype=torch.int32),
+                fold_factor=None,
+                max_qo_len=max_qo_len,
+                causal=causal,
+                g_kv_indptr=g_kv_indptr,
+            )
+            seen.clear()
+            layer_mla.AttentionForVllmMLA._forward_decode(
+                attention,
+                torch.zeros(max_qo_len, 96, 8, dtype=torch.bfloat16),
+                torch.zeros(1, 8, dtype=torch.bfloat16),
+                SimpleNamespace(decode=decode),
+            )
+            return dict(seen)
+
+        indptr = torch.tensor([0, 40], dtype=torch.int32)
+
+        # Causal verify block: the mask has to be placed on global positions,
+        # so the kernel gets the cprr parameters.
+        cprr = run(max_qo_len=8, causal=True, g_kv_indptr=indptr)
+        assert cprr["cp_world_size"] == 8
+        assert cprr["cp_rank"] == 3
+        assert cprr["g_kv_indptr"] is indptr
+        assert cprr["causal"] is True
+
+        # Bidirectional draft block: nothing to mask, plain kernel.
+        plain = run(max_qo_len=8, causal=False, g_kv_indptr=None)
+        assert plain["cp_world_size"] == 1
+        assert plain["cp_rank"] == 0
+        assert plain["g_kv_indptr"] is None
+        assert plain["causal"] is False
+
+        # Single-token decode sees all of its local KV; no mask either.
+        single = run(max_qo_len=1, causal=True, g_kv_indptr=None)
+        assert single["cp_world_size"] == 1
+        assert single["g_kv_indptr"] is None
         """)

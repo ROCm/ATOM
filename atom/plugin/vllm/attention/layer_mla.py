@@ -862,6 +862,27 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
 
         return_lse = self.dcp_world_size > 1
 
+        # DCP + multi-token decode (DSpark verify, MTP): KV is round-robin
+        # sharded, so a causal intra-block mask has to be placed on GLOBAL
+        # positions g(j) = j * world + rank rather than on the rank-local row
+        # order the kernel otherwise sees. Handing over g_kv_indptr plus the
+        # cp world/rank selects aiter's cprr variant, which does exactly that.
+        # A single-token decode needs no mask (one query, all local KV), and
+        # neither does a bidirectional block -- DSpark drafts non-causally, so
+        # every query legitimately sees every KV row.
+        decode_md = attn_metadata.decode
+        cp_world_size = 1
+        cp_rank = 0
+        g_kv_indptr = None
+        if self.dcp_world_size > 1 and decode_md.max_qo_len > 1 and decode_md.causal:
+            cp_world_size = self.dcp_world_size
+            cp_rank = self.dcp_rank
+            g_kv_indptr = decode_md.g_kv_indptr
+            assert g_kv_indptr is not None, (
+                "causal multi-token decode under DCP requires "
+                "attn_metadata.decode.g_kv_indptr from the metadata builder"
+            )
+
         _, lse = mla_decode_fwd(
             q,
             kv_buffer.view(-1, 1, 1, q.shape[-1]),
@@ -881,6 +902,10 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
             q_scale=self._q_scale,
             kv_scale=self._k_scale,
             return_lse=return_lse,
+            g_kv_indptr=g_kv_indptr,
+            cp_world_size=cp_world_size,
+            cp_rank=cp_rank,
+            causal=decode_md.causal,
         )
         if do_fold:
             o = o.view(ori_total_s, ori_nhead, -1)

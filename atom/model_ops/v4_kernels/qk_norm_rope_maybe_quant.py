@@ -71,6 +71,22 @@ class QKNormRopeOut:
     k_packed: torch.Tensor | None = None
     k_rope: torch.Tensor | None = None
 
+    def custom_op_return(self) -> list["torch.Tensor"]:
+        """This struct as a custom op's return value: the active layout's
+        tensors, in the order the boundary carries them.
+
+        A custom op schema cannot express this struct. It has no dataclass, and
+        `Tensor[]` cannot hold None (`infer_schema` rejects
+        `list[Tensor | None]` outright), while half of these fields always are
+        None -- so what crosses is the live ones only, and the ORDER is the
+        contract the caller re-expands by. Which layout is live is readable off
+        the struct itself -- the inactive path's fields stay None, as above --
+        so callers do not thread `kv_fp8` through to say it a second time.
+        """
+        if self.q_packed is not None:
+            return [self.q_packed, self.q_rope, self.k_packed, self.k_rope]
+        return [self.q_sa, self.kv]
+
 
 # Lazy-imported flydsl path (optional dependency). Set to None when flydsl
 # is unavailable; the dispatch in ``qk_norm_rope_maybe_quant`` will fall
