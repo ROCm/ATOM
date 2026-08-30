@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1788030498533,
+  "lastUpdate": 1788116767541,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -37780,6 +37780,478 @@ window.BENCHMARK_DATA = {
             "value": 0,
             "unit": "count",
             "extra": "cell=pd-chat-3p1d-conc8 router=pd policy=round_robin workers=4 prefill=3 decode=1 producers=1 consumers=8 duration_seconds=180 request_number=1655684 Run: https://github.com/ROCm/ATOM/actions/runs/33267292293"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Lingpeng Jin",
+            "username": "valarLip",
+            "email": "103567126+valarLip@users.noreply.github.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "0b4f1ddba3767d59ac87d881525fabb26081a15b",
+          "message": "Settle a step's shape once, and fix the three defects that exposed (#2088)\n\n* refactor(engine): settle a step's shape once, in the two units it has\n\nEvery consumer used to re-derive its own width. `bs * max_seqlen_q` was\ncomputed in nine places, the flat replay bucket was searched twice with\ndifferent operands, and the two searches came to disagree -- a step could\nreport a captured graph at a width nothing had recorded. `ForwardMode.decide`\nis now the only thing that answers the question, and it answers it in the only\ntwo units the engine has: `running_bs` for everything per-sequence,\n`running_tokens` for everything per-row. `scheduled_*` stays this rank's own\ncount, and is what a result slices back to.\n\nThe batch is one rule on every kind of step: the DP reduction, rounded onto\nthe capture ladder. It used to branch four ways on how the step dispatched,\nand two of those arms handed back a per-rank count -- so a graph key, a draft\npass and an attention plan could each be holding a different width, and every\nconsumer had to know which kind it had. Dispatch is now asked separately:\n`use_cudagraph` says whether the target replays and sizes nothing.\n\nThe two units are agreed across DP to different extents, deliberately.\n`running_bs` always is. `running_tokens` is agreed exactly when\n`running_tokens_are_unified`, because off it MoE takes the variable-length\ngather, whose contract is that the rows it was handed are the rows this rank\nscheduled -- an over-wide per-sequence array costs a few sentinel rows, an\nover-wide height is a contract break.\n\n`_running_tokens` searches the ladder with `searchsorted` over an ascending\nint32 array built where the ladder is finalised. The list it used to scan is\nsorted descending for the length of `capture_cudagraph`, so a first-match scan\nread the largest size for that whole window and said nothing about it.\n\nAlso here:\n\n- The draft pass reports the rows it RAN, not the rows that were real. It\n  pads its own inputs and computes every one of them, so reporting\n  `scheduled_bs * num_draft` against a `running_bs * num_draft` tensor was a\n  contract break, not a conservative choice; `dp_gather_hidden_and_router`\n  asserts the two agree and aborted 8/8 ranks on the first decode step\n  whenever a batch had no recording to replay (`ATOM_DRAFT_CUDAGRAPH=0`).\n\n- `assert_shape_contract` covers the padded step, which is the only one that\n  can be wrong. It used to return early whenever `running_bs != scheduled_bs`,\n  exempting exactly that case; a mismatch then reached the model as lost\n  accuracy rather than as a failure here.\n\n- The prefill draft pass reaches a warmed shape: prefill rounds onto the same\n  ladder as a decode step, and its per-sequence tail is padded to match.\n\n- One name for this rank's sequence count. `real_bs` and `bs` were two\n  spellings of `Context.scheduled_bs` across the drafters; 47 sites.\n\n- `ScheduledBatch` no longer carries `max_seqlen_q`, `dspark_dp_bs` or\n  `dynamic_num_tokens_pad`. A scheduler object was holding numbers the DP\n  group settled after it was built.\n\nV4-Flash-DSpark tp8 + DPA, k=7, fp8 KV, GSM8K 1319 x3: 0.9492 / 0.9515 /\n0.9477. Unit suite 4712 passed.\n\n* fix(spec-decode): stop the draft pass handing out storage it does not own\n\nA rank idling behind someone else's long chunked prefill faulted all eight\nranks on V4-Flash-DSpark at 100k/c50: the target's embedding gather took an\nindex outside the vocab. Three defects on the draft path, in the order found.\n\n1. `DraftGraph.run` returned the recording's own tensors.\n\nA replay hands back the tensors the capture allocated. Those live in the pool\nevery captured size shares, and the pool packs a later size's capture into\nmemory the earlier ones released -- so replaying an earlier size rewrites\naddresses a later one's live output now holds. Holding a Python reference does\nnot stop that, which is the whole difference from the eager allocator.\n\nDSpark's draft ids are the only value in the engine that outlives the step\nthat made it: deferred output feeds them back as the next decode step's\n`input_ids` without a D2H. Read a step later they were another size's\nactivations, float bit patterns arriving as vocab indices.\n\nShown without the fault: stamp a sentinel into the bs=2 recording's output,\nreplay the bs=1 graph, and bs=1's activations come back -- while the\nfirst-captured size is never dirtied. `run` now copies a replay's result out\nof the pool; the eager path allocates normally and is untouched.\n\n2. A DP-sync dummy passed for a carried-over request.\n\n`dummy_execution` fabricates its sequence with a fixed id, so a second dummy\nmatched the first in `get_token_locations` and read that \"request's\" anchor\nand drafts out of `prev_token_ids` / `draft_token_ids`. Measured: `src=[0]` on\na dummy batch, whose seven draft slots then held 968440611 and similar. A\nfabricated batch carries nothing over, and the early return also skips the\nper-request loop -- most of the steps under DP attention are dummies.\n\nIt still becomes `prev_batch` on purpose: reporting lags a step, so the dummy\nis what flushes the last real step's output to the host, and its own token\nlands on the key the deferred flag overwrites.\n\n3. The draft pass reported the target's counts as its own.\n\n`_publish_draft_shape` now states both units honestly, declares the pass\nuniform across DP and not a prefill whatever the target just did, and fills\nthe DP table locally rather than all_reducing it: `running_bs` came out of\n`decide`'s one collective and the width is config, so there is nothing to ask.\n`DPMetadata.make`'s assert cannot catch a wrong table -- it checks this rank's\nown entry, which a uniform fill satisfies -- so a probe compared it against\nthe all_reduced one on every pass and found no disagreement across 8 ranks,\nover a 100k/c50 benchmark and a full GSM8K.\n\nVerified on V4-Flash-DSpark, tp8 + dp-attention, fp8 KV / fp4 indexer,\n--num-speculative-tokens 7:\n\n  100k/10/c50   drains clean, 106,043 tok/s (was an 8-rank abort)\n  GSM8K 1319    0.9522 flexible / 0.9522 strict, fewshot 3\n  acceptance    48.6%, 4.40 tokens per forward\n  unit tests    4719 passed, 0 failed\n\nThe local DP table was suspected of costing 0.9pp and does not: n=3 each way,\nfully interleaved (0.9477/0.9515/0.9522 local, 0.9454/0.9522/0.9522\nall_reduced). Single GSM8K runs on this model span 1.5pp.\n\n* fix(spec-decode): let the caller say whether its draft pass is uniform\n\n`_publish_draft_shape` asserted two things on behalf of every drafter that\ncalled it: that the pass was not a prefill, and that every DP rank was\nrunning the same height. Both hold for the DSpark block pass, which is\n`running_bs * num_draft` -- `decide`'s reduction times a config width. Only\none of the three call sites is that pass.\n\nEagle's first draft step runs the target's own token stream against the\ntarget's still-prefill metadata. Clearing `is_prefill` there sends the MLA\nlayers, the indexer and PCP down their decode branches on a pass that is a\nprefill, and declaring that height uniform states an equality no reduction\nchecked -- `input_ids.shape[0]` is this rank's `total_tokens_num`. Its\nmid-steps are uniform only when a recording exists to widen to; without one\n`running_bs` falls back to `scheduled_bs`. Kimi-K3's separate-draft path\npublishes `scheduled_bs * T`, also rank-local, and nothing rules it out\nunder DP: `--enable-dp-attention` folds TP into the DP size.\n\n`make` asserts only THIS rank's entry, which a uniform fill satisfies by\nconstruction, so a wrong claim survives to the fixed-size gather in\n`dp_gather_hidden_and_router` and lands as a mismatched collective.\n\nSo the seam states neither on anyone's behalf:\n\n  - `running_tokens_are_unified` is a required keyword. DSpark's block pass\n    passes True, Kimi-K3 False, Eagle `i > 0 and self.step is not None`.\n  - `is_prefill` goes back to being the caller's write. Two of the three\n    already had one; the block pass never did, and needs one now that it\n    reports `scheduled_bs * num_draft` -- `pad_for_all_gather` checks rows\n    against the scheduled count when the flag is True and would assert on\n    the first widened batch.\n  - `DPMetadata.make` takes `unified` and owns both ways to a table, so the\n    answer travels instead of the tensor it implies. Supplying a table and\n    claiming uniformity is now rejected rather than silently ordered.\n  - `warmup_draft_graphs` states the pair it bakes rather than inheriting\n    two defaults that happen to agree.\n\nEagle and Kimi-K3 are restored to their pre-9a3313953 behaviour; the DSpark\nblock pass is unchanged, only its writer moved.\n\nVerified on V4-Flash-DSpark, tp8 + dp-attention, fp8 KV / fp4 indexer,\n--num-speculative-tokens 7 -- the one configuration here that reaches the DP\nbranch. GSM8K 1319, fewshot 3, server restarted between runs:\n\n  0.9469 / 0.9469 / 0.9538   mean 0.9492, acceptance 47.6%, 4.37 tok/fwd\n\nagainst 0.9505 (local table) and 0.9499 (all_reduced) on 9a3313953, whose\nsample ranges this one overlaps in both directions. Single runs on this model\nspan 1.5pp. Eagle and Kimi-K3 have no recipe on this box and were not run.\n\n`DPMetadata.make` needs no aiter, so tests/test_dp_metadata.py runs in CI --\nthe drafter-level tests cannot, since spec_decode/drafter.py imports aiter at\nmodule load.\n\n  unit tests   4725 passed, 0 failed\n\n* fix(engine): cut a prefill's logits to the requests before sampling them\n\nRounding every step onto the capture ladder gave prefill a `running_bs`\nabove its own batch, and `prepare_prefill` pads `cu_seqlens_q` out to it so\na following draft pass reaches a warmed shape. The LM head slices prefill\nrows by that array, so `compute_logits` returns `running_bs` rows -- while\n`prepare_sample` sizes `temperatures` / `top_ks` / `top_ps` at\n`batch.total_seqs_num`, because those describe requests.\n\n`postprocess` cut the SAMPLED IDS back to the scheduled batch, one step too\nlate. Three prefill sequences on the default ladder run four rows, so any\nrequest setting `top_p < 1` or `top_k != -1` on a non-greedy batch reached\n`scaled_logits = logits / temperatures.unsqueeze(-1)` as `[4, V] / [3, 1]`\nand raised. The logprob path was already broken the same way and stayed\nbroken after that cut: `log_probs.gather(-1, sampled_tokens.unsqueeze(-1))`\ngathered `[running_bs, V]` by `[scheduled_bs, 1]`.\n\nBoth come from one uncut tensor, so the fix is to cut it: `logits[:bs]`\nbefore the sampler rather than `sampled_tokens[:bs]` after it. Greedy\nbatches took `argmax` and temperature-only ones over-read the parameter\nbuffer silently, which is why GSM8K and the benchmarks never saw it.\n\nAlso here, from the same review pass:\n\n- `_stage` grows `pad_to`. Both V4 state-slot publishers had hand-inlined\n  its body to get a padded width, dropping its buffer-capacity and dtype\n  assertions along the way.\n\n- The packed DP wire loses `any_dummy`. Nothing has read it since it was\n  added, its own comment describes an AND-reduce over an `.any()`, and the\n  layout was being renumbered anyway -- a block drafter now appends one\n  int32 instead of two.\n\n- `_running_tokens` drops a `batch` parameter it never read (and a `cls`),\n  `_local_tbo_eligibility` an argument with one caller and one value, whose\n  `np.asarray` now runs below the `enable_tbo` early return rather than on\n  every step. `capture_sizes_np` stops sorting an already-sorted list.\n\n- `_dspark_decode_replay` is deleted: its only reader,\n  `_piecewise_replay_shape`, went with the shape refactor and the per-step\n  write survived it.\n\n- Dangling names: two comments cited `ScheduledBatch.max_seqlen_q`, which\n  that refactor deleted; three cited `_refresh_dp_metadata`, renamed before\n  this branch began -- one of them a `raising=False` monkeypatch that\n  therefore neutralised nothing. `is_captured` credited `warmup` with an\n  assert it does not contain, a state-slot comment cited\n  `_populate_state_slot_mappings` as evidence for the opposite of what that\n  function documents, and the call site of `assert_shape_contract` still\n  said it skips cudagraph steps -- covering those is what the refactor\n  changed it to do. `docs/environment_variables.md` still documented the\n  EPLB capture opt-out that went away with `DraftGraph.pads`.\n\n- Comment volume, where the same fact was written more than once: the draft\n  loop's eight-line publish carried 27 lines with one sentence in it three\n  times; `assert_shape_contract` closed with eight lines about two\n  assertions deliberately not written; the ladder's sortedness was\n  explained three times, two of them disagreeing. Net 55 lines.\n\n  unit tests   4729 passed, 0 failed\n\n* fix(tests): guard on the module a test needs, not on the name aiter\n\n`tests/test_postprocess_width.py` aborted collection on the non-GPU runner,\nwhich is not one failed test -- pytest exits 2 and the other 4700 never run.\n\n`pytest.importorskip(\"aiter\")` only skips on ModuleNotFoundError, and on that\nrunner `aiter` is importable by the time this file is reached:\n`tests/test_pd_pp.py` does `sys.modules.setdefault(\"aiter\", ModuleType(\"aiter\"))`\nat module scope and never restores it, so every module collected after it\n(pd < po) sees the name resolve and dies reading a symbol off it --\n`cannot import name 'destroy_dist_env' from 'aiter' (unknown location)`.\n`tests/import_guard.py` already documents this shape as how the non-GPU job\nactually fails.\n\nNaming the module the test actually needs catches both shapes, and `exc_type`\nis what makes the second one a skip:\n\n    mod = pytest.importorskip(\n        \"atom.model_engine.model_runner\", exc_type=ImportError, reason=...\n    )\n\n`test_dspark.py` and `test_mtp_deferred_status_queue.py` carry the same\nname-only guard and survive today only by sorting before `test_pd_pp.py`.\nAlphabetical order is not a guard, so they move to the same idiom.\n\nThe probe that was supposed to catch this modelled `aiter` ABSENT, where a\nname-only guard skips correctly -- so it passed the file that broke CI.\n`/app/logs_claude/check_tests_import_without_aiter.py` now runs an ABSENT and\na HOLLOW pass; HOLLOW reproduces the runner's error verbatim, and the whole\ntests/ tree is clean in both.\n\nThe stub leak in `test_pd_pp.py` is left alone: restoring `sys.modules` there\nis a change to a PD test whose fixtures are not examined here, and no file\ndepends on the leak.\n\n  unit tests   4731 passed, 0 failed\n\n* perf(spec-decode): record the MTP draft head with the backbone that feeds it\n\nEagleProposer declared a DraftGraph with no epilogue, so a mid-step replayed\nthe backbone and then ran `compute_draft_ids` eager -- an LM head, a TP\nall_gather and an argmax, once per draft step, outside the recording.\n\nTwo things had to change, and the first is why this was never done:\n\n`compute_argmax_token` reached `all_gather` without `use_custom`, whose\ndefault is False, so it took RCCL. `graph_capture()` arms the custom\nimplementation and only that one, which is what `logits_in_graph =\nworld_size == 1` has meant since `0cad4aabe` (\"NCCL all_gather which is not\ngraph-capturable on HIP when TP > 1\"). The logits path two functions up\nalready passes `envs.ATOM_USE_CUSTOM_ALL_GATHER`; the argmax path did not.\nWith it, capture succeeds at tp8 -- that rationale was stale, not wrong.\n\nThe epilogue then returns `(hidden_states, ids)`, both: the next mid-step\nreads the hidden states and they exist only inside the recording. It runs the\nhead over every row rather than `[:scheduled_bs]`, since a capture bakes the\nlength it was made at; the caller slices on the way out.\n\nMeasured on V4-Pro MTP3, tp8, same 100k/10/c50 shape both ways, rank_0\n`propose_eagle` spans -- host kernel launches left outside the graph:\n\n  mid-step 1   18.29 -> 9.53   (the rest is prepare_mtp_decode at the i==1\n                                metadata boundary, not the head)\n  mid-step 2   10.31 -> 1.51\n\n  GSM8K 1319   0.9515 flexible, was 0.9545\n  acceptance   64.47% / 66.11%, was 64.27% / 66.24%; 2.93 / 2.98 tok/fwd,\n               unchanged -- the probe that would see a token differ\n\nThroughput is NOT measured. Both arms are single-shot and profiled, and step\n0's span moved 19.1 -> 9.6 ms between the two runs while nothing touched it\n(step 0 never enters a graph), so this shape cannot size a sub-percent\neffect. A decode-dominated shape with alternating arms would.\n\n`_owned` clones both tuple elements on replay. Neither outlives a replay here\n-- `stage()` copies the hidden states before the next one, and the ids land in\n`draft_token_ids` immediately -- so the hidden-state clone is waste, ~688 KB\nper mid-step at bs=48. Left alone: teaching the seam which output to skip is a\nknob on the seam that returned pool storage three commits ago, and the cost is\nalready inside the launch counts above.\n\nNo unit test: `EagleProposer.propose` has no harness, and asserting on the\none-line `_step_head` would not reach the property (the graph returns both,\nthe loop slices the ids). GPU evidence only.\n\n  unit tests   4731 passed, 0 failed\n\n* fix(attention): cut the padded prefill arrays back to the requests they describe\n\n`CommonAttentionBuilder.prepare_prefill` pads `cu_seqlens_q`, `cu_seqlens_k`\nand `context_lens` out to `running_bs` and uploads them at that width, so a\ndraft pass that follows the prefill sees clean tail rows. Every consumer that\nstill counted requests off one of them broke the moment a batch's sequence\ncount fell off the capture ladder -- which is most of them:\n\n    RuntimeError: The expanded size of the tensor (21) must match the existing\n    size (32) at non-singleton dimension 0\n\nSix accuracy jobs failed that way. The heavy matrix had been SKIPPED on this\nbranch's earlier pushes, so this is the first run that exercised it; the green\n\"ATOM Test\" on 7ef28c3a3 and 64f088dbf says nothing about accuracy. DeepSeek-V4\npassed throughout because it has its own backend and never reaches the common\nbuilder -- which is also why local V4 testing never saw it.\n\nEach site cuts to the count already in scope. Nothing gains a parameter or a\nfield, and every cut restores the width the same line had before 8234bf468:\n\n    aiter_mla.py          context_lens[:bs] under the kv_indptr cumsum\n    aiter_attention.py    both per-seq args of make_sparse_prefill_metadata,\n                          sliced like the block tables directly above them\n    attention_mla.py      the two chunked-prefill varlen calls take as many\n                          q-cums as the chunk built k-cums; the paged call\n                          takes kv_last_page_lens' width\n    attention_mha.py      unified_attention's two per-seq args, cut to the\n                          block table it indexes with them\n    triton_mha.py         the fake block table's row count, from the batch\n                          rather than from the padded array's length\n    gdn_attn.py           query_start_loc, PREFILL ONLY -- that function also\n                          serves decode, whose padding predates this and whose\n                          consumers are written for it\n\n`minimax_m3/sparse_attn.py` and `index_topk.py` need no edit: their widths come\nfrom the aiter_attention call above, and clamping them locally would hide a\nreal disagreement instead of fixing one.\n\nVerified by reproducing first. GLM-5.2-MXFP4 MTP tp4 died on its first prefill\nbatch with the error above on four ranks and zero completions; after the fix:\n\n  GLM-5.2-MXFP4 MTP   0.9249 flexible / 0.9280 strict, acceptance 75.3%\n                      (threshold 0.92, accept threshold 0.595), 0 tracebacks\n  MiniMax-M3-MXFP4    0.9393 flexible / 0.9401 strict (baseline 0.9363,\n                      threshold 0.93), tp8 5-shot chat, 0 tracebacks\n  unit tests          4731 passed, 0 failed\n\nBetween them those two cover four of the sites: MiniMax reaches the\naiter_attention pair and the two minimax_m3 consumers downstream of it, GLM the\naiter_mla one. The other four models that failed -- Qwen3-Next-80B,\nQwen3.5-397B, DeepSeek-R1-0528-FP4 MTP, Kimi-K2.7 -- have no recipe on this\nbox and were NOT run; their sites were checked statically against 8234bf468^\ninstead. The gdn_attn edit landed after both e2e runs and neither model uses\nthat backend, so it carries static evidence only.\n\nKnown cost of fixing it this way: six sites now spell \"the requests this rank\nscheduled\" six different ways, two of them by reading a length off another\narray that happens to be unpadded. The invariant that keeps those two correct\nis not stated anywhere.",
+          "timestamp": "2026-08-30T17:20:01Z",
+          "url": "https://github.com/ROCm/ATOM/commit/0b4f1ddba3767d59ac87d881525fabb26081a15b"
+        },
+        "date": 1788116730554,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "Atomesh-Mocker::pd-chat-1p1d-conc1 request throughput",
+            "value": 2976.5,
+            "unit": "req/s",
+            "extra": "cell=pd-chat-1p1d-conc1 router=pd policy=round_robin workers=2 prefill=1 decode=1 producers=1 consumers=1 duration_seconds=180 request_number=535770 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-1p1d-conc1 avg latency",
+            "value": 0.32,
+            "unit": "ms",
+            "extra": "cell=pd-chat-1p1d-conc1 router=pd policy=round_robin workers=2 prefill=1 decode=1 producers=1 consumers=1 duration_seconds=180 request_number=535770 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-1p1d-conc1 p99 latency",
+            "value": 0.36,
+            "unit": "ms",
+            "extra": "cell=pd-chat-1p1d-conc1 router=pd policy=round_robin workers=2 prefill=1 decode=1 producers=1 consumers=1 duration_seconds=180 request_number=535770 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-1p1d-conc1 p999 latency",
+            "value": 0.42,
+            "unit": "ms",
+            "extra": "cell=pd-chat-1p1d-conc1 router=pd policy=round_robin workers=2 prefill=1 decode=1 producers=1 consumers=1 duration_seconds=180 request_number=535770 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-1p1d-conc1 failed requests",
+            "value": 0,
+            "unit": "count",
+            "extra": "cell=pd-chat-1p1d-conc1 router=pd policy=round_robin workers=2 prefill=1 decode=1 producers=1 consumers=1 duration_seconds=180 request_number=535770 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-1p1d-conc16 request throughput",
+            "value": 11304.89,
+            "unit": "req/s",
+            "extra": "cell=pd-chat-1p1d-conc16 router=pd policy=round_robin workers=2 prefill=1 decode=1 producers=1 consumers=16 duration_seconds=180 request_number=2034881 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-1p1d-conc16 avg latency",
+            "value": 1.38,
+            "unit": "ms",
+            "extra": "cell=pd-chat-1p1d-conc16 router=pd policy=round_robin workers=2 prefill=1 decode=1 producers=1 consumers=16 duration_seconds=180 request_number=2034881 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-1p1d-conc16 p99 latency",
+            "value": 2.59,
+            "unit": "ms",
+            "extra": "cell=pd-chat-1p1d-conc16 router=pd policy=round_robin workers=2 prefill=1 decode=1 producers=1 consumers=16 duration_seconds=180 request_number=2034881 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-1p1d-conc16 p999 latency",
+            "value": 3.33,
+            "unit": "ms",
+            "extra": "cell=pd-chat-1p1d-conc16 router=pd policy=round_robin workers=2 prefill=1 decode=1 producers=1 consumers=16 duration_seconds=180 request_number=2034881 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-1p1d-conc16 failed requests",
+            "value": 0,
+            "unit": "count",
+            "extra": "cell=pd-chat-1p1d-conc16 router=pd policy=round_robin workers=2 prefill=1 decode=1 producers=1 consumers=16 duration_seconds=180 request_number=2034881 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-1p1d-conc2 request throughput",
+            "value": 4909.02,
+            "unit": "req/s",
+            "extra": "cell=pd-chat-1p1d-conc2 router=pd policy=round_robin workers=2 prefill=1 decode=1 producers=1 consumers=2 duration_seconds=180 request_number=883623 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-1p1d-conc2 avg latency",
+            "value": 0.39,
+            "unit": "ms",
+            "extra": "cell=pd-chat-1p1d-conc2 router=pd policy=round_robin workers=2 prefill=1 decode=1 producers=1 consumers=2 duration_seconds=180 request_number=883623 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-1p1d-conc2 p99 latency",
+            "value": 0.54,
+            "unit": "ms",
+            "extra": "cell=pd-chat-1p1d-conc2 router=pd policy=round_robin workers=2 prefill=1 decode=1 producers=1 consumers=2 duration_seconds=180 request_number=883623 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-1p1d-conc2 p999 latency",
+            "value": 0.62,
+            "unit": "ms",
+            "extra": "cell=pd-chat-1p1d-conc2 router=pd policy=round_robin workers=2 prefill=1 decode=1 producers=1 consumers=2 duration_seconds=180 request_number=883623 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-1p1d-conc2 failed requests",
+            "value": 0,
+            "unit": "count",
+            "extra": "cell=pd-chat-1p1d-conc2 router=pd policy=round_robin workers=2 prefill=1 decode=1 producers=1 consumers=2 duration_seconds=180 request_number=883623 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-1p1d-conc4 request throughput",
+            "value": 7386.79,
+            "unit": "req/s",
+            "extra": "cell=pd-chat-1p1d-conc4 router=pd policy=round_robin workers=2 prefill=1 decode=1 producers=1 consumers=4 duration_seconds=180 request_number=1329622 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-1p1d-conc4 avg latency",
+            "value": 0.52,
+            "unit": "ms",
+            "extra": "cell=pd-chat-1p1d-conc4 router=pd policy=round_robin workers=2 prefill=1 decode=1 producers=1 consumers=4 duration_seconds=180 request_number=1329622 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-1p1d-conc4 p99 latency",
+            "value": 0.86,
+            "unit": "ms",
+            "extra": "cell=pd-chat-1p1d-conc4 router=pd policy=round_robin workers=2 prefill=1 decode=1 producers=1 consumers=4 duration_seconds=180 request_number=1329622 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-1p1d-conc4 p999 latency",
+            "value": 1.15,
+            "unit": "ms",
+            "extra": "cell=pd-chat-1p1d-conc4 router=pd policy=round_robin workers=2 prefill=1 decode=1 producers=1 consumers=4 duration_seconds=180 request_number=1329622 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-1p1d-conc4 failed requests",
+            "value": 0,
+            "unit": "count",
+            "extra": "cell=pd-chat-1p1d-conc4 router=pd policy=round_robin workers=2 prefill=1 decode=1 producers=1 consumers=4 duration_seconds=180 request_number=1329622 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-1p1d-conc8 request throughput",
+            "value": 9535.01,
+            "unit": "req/s",
+            "extra": "cell=pd-chat-1p1d-conc8 router=pd policy=round_robin workers=2 prefill=1 decode=1 producers=1 consumers=8 duration_seconds=180 request_number=1716302 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-1p1d-conc8 avg latency",
+            "value": 0.81,
+            "unit": "ms",
+            "extra": "cell=pd-chat-1p1d-conc8 router=pd policy=round_robin workers=2 prefill=1 decode=1 producers=1 consumers=8 duration_seconds=180 request_number=1716302 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-1p1d-conc8 p99 latency",
+            "value": 1.49,
+            "unit": "ms",
+            "extra": "cell=pd-chat-1p1d-conc8 router=pd policy=round_robin workers=2 prefill=1 decode=1 producers=1 consumers=8 duration_seconds=180 request_number=1716302 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-1p1d-conc8 p999 latency",
+            "value": 1.9,
+            "unit": "ms",
+            "extra": "cell=pd-chat-1p1d-conc8 router=pd policy=round_robin workers=2 prefill=1 decode=1 producers=1 consumers=8 duration_seconds=180 request_number=1716302 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-1p1d-conc8 failed requests",
+            "value": 0,
+            "unit": "count",
+            "extra": "cell=pd-chat-1p1d-conc8 router=pd policy=round_robin workers=2 prefill=1 decode=1 producers=1 consumers=8 duration_seconds=180 request_number=1716302 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-2p1d-conc1 request throughput",
+            "value": 3008.95,
+            "unit": "req/s",
+            "extra": "cell=pd-chat-2p1d-conc1 router=pd policy=round_robin workers=3 prefill=2 decode=1 producers=1 consumers=1 duration_seconds=180 request_number=541611 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-2p1d-conc1 avg latency",
+            "value": 0.32,
+            "unit": "ms",
+            "extra": "cell=pd-chat-2p1d-conc1 router=pd policy=round_robin workers=3 prefill=2 decode=1 producers=1 consumers=1 duration_seconds=180 request_number=541611 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-2p1d-conc1 p99 latency",
+            "value": 0.36,
+            "unit": "ms",
+            "extra": "cell=pd-chat-2p1d-conc1 router=pd policy=round_robin workers=3 prefill=2 decode=1 producers=1 consumers=1 duration_seconds=180 request_number=541611 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-2p1d-conc1 p999 latency",
+            "value": 0.43,
+            "unit": "ms",
+            "extra": "cell=pd-chat-2p1d-conc1 router=pd policy=round_robin workers=3 prefill=2 decode=1 producers=1 consumers=1 duration_seconds=180 request_number=541611 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-2p1d-conc1 failed requests",
+            "value": 0,
+            "unit": "count",
+            "extra": "cell=pd-chat-2p1d-conc1 router=pd policy=round_robin workers=3 prefill=2 decode=1 producers=1 consumers=1 duration_seconds=180 request_number=541611 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-2p1d-conc16 request throughput",
+            "value": 10955.08,
+            "unit": "req/s",
+            "extra": "cell=pd-chat-2p1d-conc16 router=pd policy=round_robin workers=3 prefill=2 decode=1 producers=1 consumers=16 duration_seconds=180 request_number=1971914 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-2p1d-conc16 avg latency",
+            "value": 1.42,
+            "unit": "ms",
+            "extra": "cell=pd-chat-2p1d-conc16 router=pd policy=round_robin workers=3 prefill=2 decode=1 producers=1 consumers=16 duration_seconds=180 request_number=1971914 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-2p1d-conc16 p99 latency",
+            "value": 2.69,
+            "unit": "ms",
+            "extra": "cell=pd-chat-2p1d-conc16 router=pd policy=round_robin workers=3 prefill=2 decode=1 producers=1 consumers=16 duration_seconds=180 request_number=1971914 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-2p1d-conc16 p999 latency",
+            "value": 3.47,
+            "unit": "ms",
+            "extra": "cell=pd-chat-2p1d-conc16 router=pd policy=round_robin workers=3 prefill=2 decode=1 producers=1 consumers=16 duration_seconds=180 request_number=1971914 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-2p1d-conc16 failed requests",
+            "value": 0,
+            "unit": "count",
+            "extra": "cell=pd-chat-2p1d-conc16 router=pd policy=round_robin workers=3 prefill=2 decode=1 producers=1 consumers=16 duration_seconds=180 request_number=1971914 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-2p1d-conc2 request throughput",
+            "value": 4999.78,
+            "unit": "req/s",
+            "extra": "cell=pd-chat-2p1d-conc2 router=pd policy=round_robin workers=3 prefill=2 decode=1 producers=1 consumers=2 duration_seconds=180 request_number=899961 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-2p1d-conc2 avg latency",
+            "value": 0.38,
+            "unit": "ms",
+            "extra": "cell=pd-chat-2p1d-conc2 router=pd policy=round_robin workers=3 prefill=2 decode=1 producers=1 consumers=2 duration_seconds=180 request_number=899961 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-2p1d-conc2 p99 latency",
+            "value": 0.53,
+            "unit": "ms",
+            "extra": "cell=pd-chat-2p1d-conc2 router=pd policy=round_robin workers=3 prefill=2 decode=1 producers=1 consumers=2 duration_seconds=180 request_number=899961 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-2p1d-conc2 p999 latency",
+            "value": 0.6,
+            "unit": "ms",
+            "extra": "cell=pd-chat-2p1d-conc2 router=pd policy=round_robin workers=3 prefill=2 decode=1 producers=1 consumers=2 duration_seconds=180 request_number=899961 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-2p1d-conc2 failed requests",
+            "value": 0,
+            "unit": "count",
+            "extra": "cell=pd-chat-2p1d-conc2 router=pd policy=round_robin workers=3 prefill=2 decode=1 producers=1 consumers=2 duration_seconds=180 request_number=899961 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-2p1d-conc4 request throughput",
+            "value": 7501.03,
+            "unit": "req/s",
+            "extra": "cell=pd-chat-2p1d-conc4 router=pd policy=round_robin workers=3 prefill=2 decode=1 producers=1 consumers=4 duration_seconds=180 request_number=1350186 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-2p1d-conc4 avg latency",
+            "value": 0.51,
+            "unit": "ms",
+            "extra": "cell=pd-chat-2p1d-conc4 router=pd policy=round_robin workers=3 prefill=2 decode=1 producers=1 consumers=4 duration_seconds=180 request_number=1350186 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-2p1d-conc4 p99 latency",
+            "value": 0.84,
+            "unit": "ms",
+            "extra": "cell=pd-chat-2p1d-conc4 router=pd policy=round_robin workers=3 prefill=2 decode=1 producers=1 consumers=4 duration_seconds=180 request_number=1350186 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-2p1d-conc4 p999 latency",
+            "value": 1.07,
+            "unit": "ms",
+            "extra": "cell=pd-chat-2p1d-conc4 router=pd policy=round_robin workers=3 prefill=2 decode=1 producers=1 consumers=4 duration_seconds=180 request_number=1350186 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-2p1d-conc4 failed requests",
+            "value": 0,
+            "unit": "count",
+            "extra": "cell=pd-chat-2p1d-conc4 router=pd policy=round_robin workers=3 prefill=2 decode=1 producers=1 consumers=4 duration_seconds=180 request_number=1350186 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-2p1d-conc8 request throughput",
+            "value": 9675.77,
+            "unit": "req/s",
+            "extra": "cell=pd-chat-2p1d-conc8 router=pd policy=round_robin workers=3 prefill=2 decode=1 producers=1 consumers=8 duration_seconds=180 request_number=1741638 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-2p1d-conc8 avg latency",
+            "value": 0.8,
+            "unit": "ms",
+            "extra": "cell=pd-chat-2p1d-conc8 router=pd policy=round_robin workers=3 prefill=2 decode=1 producers=1 consumers=8 duration_seconds=180 request_number=1741638 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-2p1d-conc8 p99 latency",
+            "value": 1.48,
+            "unit": "ms",
+            "extra": "cell=pd-chat-2p1d-conc8 router=pd policy=round_robin workers=3 prefill=2 decode=1 producers=1 consumers=8 duration_seconds=180 request_number=1741638 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-2p1d-conc8 p999 latency",
+            "value": 1.87,
+            "unit": "ms",
+            "extra": "cell=pd-chat-2p1d-conc8 router=pd policy=round_robin workers=3 prefill=2 decode=1 producers=1 consumers=8 duration_seconds=180 request_number=1741638 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-2p1d-conc8 failed requests",
+            "value": 0,
+            "unit": "count",
+            "extra": "cell=pd-chat-2p1d-conc8 router=pd policy=round_robin workers=3 prefill=2 decode=1 producers=1 consumers=8 duration_seconds=180 request_number=1741638 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-3p1d-conc1 request throughput",
+            "value": 2984.12,
+            "unit": "req/s",
+            "extra": "cell=pd-chat-3p1d-conc1 router=pd policy=round_robin workers=4 prefill=3 decode=1 producers=1 consumers=1 duration_seconds=180 request_number=537142 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-3p1d-conc1 avg latency",
+            "value": 0.32,
+            "unit": "ms",
+            "extra": "cell=pd-chat-3p1d-conc1 router=pd policy=round_robin workers=4 prefill=3 decode=1 producers=1 consumers=1 duration_seconds=180 request_number=537142 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-3p1d-conc1 p99 latency",
+            "value": 0.36,
+            "unit": "ms",
+            "extra": "cell=pd-chat-3p1d-conc1 router=pd policy=round_robin workers=4 prefill=3 decode=1 producers=1 consumers=1 duration_seconds=180 request_number=537142 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-3p1d-conc1 p999 latency",
+            "value": 0.41,
+            "unit": "ms",
+            "extra": "cell=pd-chat-3p1d-conc1 router=pd policy=round_robin workers=4 prefill=3 decode=1 producers=1 consumers=1 duration_seconds=180 request_number=537142 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-3p1d-conc1 failed requests",
+            "value": 0,
+            "unit": "count",
+            "extra": "cell=pd-chat-3p1d-conc1 router=pd policy=round_robin workers=4 prefill=3 decode=1 producers=1 consumers=1 duration_seconds=180 request_number=537142 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-3p1d-conc16 request throughput",
+            "value": 11222.02,
+            "unit": "req/s",
+            "extra": "cell=pd-chat-3p1d-conc16 router=pd policy=round_robin workers=4 prefill=3 decode=1 producers=1 consumers=16 duration_seconds=180 request_number=2019963 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-3p1d-conc16 avg latency",
+            "value": 1.39,
+            "unit": "ms",
+            "extra": "cell=pd-chat-3p1d-conc16 router=pd policy=round_robin workers=4 prefill=3 decode=1 producers=1 consumers=16 duration_seconds=180 request_number=2019963 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-3p1d-conc16 p99 latency",
+            "value": 2.61,
+            "unit": "ms",
+            "extra": "cell=pd-chat-3p1d-conc16 router=pd policy=round_robin workers=4 prefill=3 decode=1 producers=1 consumers=16 duration_seconds=180 request_number=2019963 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-3p1d-conc16 p999 latency",
+            "value": 3.33,
+            "unit": "ms",
+            "extra": "cell=pd-chat-3p1d-conc16 router=pd policy=round_robin workers=4 prefill=3 decode=1 producers=1 consumers=16 duration_seconds=180 request_number=2019963 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-3p1d-conc16 failed requests",
+            "value": 0,
+            "unit": "count",
+            "extra": "cell=pd-chat-3p1d-conc16 router=pd policy=round_robin workers=4 prefill=3 decode=1 producers=1 consumers=16 duration_seconds=180 request_number=2019963 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-3p1d-conc2 request throughput",
+            "value": 4938.71,
+            "unit": "req/s",
+            "extra": "cell=pd-chat-3p1d-conc2 router=pd policy=round_robin workers=4 prefill=3 decode=1 producers=1 consumers=2 duration_seconds=180 request_number=888968 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-3p1d-conc2 avg latency",
+            "value": 0.39,
+            "unit": "ms",
+            "extra": "cell=pd-chat-3p1d-conc2 router=pd policy=round_robin workers=4 prefill=3 decode=1 producers=1 consumers=2 duration_seconds=180 request_number=888968 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-3p1d-conc2 p99 latency",
+            "value": 0.53,
+            "unit": "ms",
+            "extra": "cell=pd-chat-3p1d-conc2 router=pd policy=round_robin workers=4 prefill=3 decode=1 producers=1 consumers=2 duration_seconds=180 request_number=888968 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-3p1d-conc2 p999 latency",
+            "value": 0.61,
+            "unit": "ms",
+            "extra": "cell=pd-chat-3p1d-conc2 router=pd policy=round_robin workers=4 prefill=3 decode=1 producers=1 consumers=2 duration_seconds=180 request_number=888968 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-3p1d-conc2 failed requests",
+            "value": 0,
+            "unit": "count",
+            "extra": "cell=pd-chat-3p1d-conc2 router=pd policy=round_robin workers=4 prefill=3 decode=1 producers=1 consumers=2 duration_seconds=180 request_number=888968 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-3p1d-conc4 request throughput",
+            "value": 7388.79,
+            "unit": "req/s",
+            "extra": "cell=pd-chat-3p1d-conc4 router=pd policy=round_robin workers=4 prefill=3 decode=1 producers=1 consumers=4 duration_seconds=180 request_number=1329982 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-3p1d-conc4 avg latency",
+            "value": 0.52,
+            "unit": "ms",
+            "extra": "cell=pd-chat-3p1d-conc4 router=pd policy=round_robin workers=4 prefill=3 decode=1 producers=1 consumers=4 duration_seconds=180 request_number=1329982 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-3p1d-conc4 p99 latency",
+            "value": 0.86,
+            "unit": "ms",
+            "extra": "cell=pd-chat-3p1d-conc4 router=pd policy=round_robin workers=4 prefill=3 decode=1 producers=1 consumers=4 duration_seconds=180 request_number=1329982 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-3p1d-conc4 p999 latency",
+            "value": 1.12,
+            "unit": "ms",
+            "extra": "cell=pd-chat-3p1d-conc4 router=pd policy=round_robin workers=4 prefill=3 decode=1 producers=1 consumers=4 duration_seconds=180 request_number=1329982 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-3p1d-conc4 failed requests",
+            "value": 0,
+            "unit": "count",
+            "extra": "cell=pd-chat-3p1d-conc4 router=pd policy=round_robin workers=4 prefill=3 decode=1 producers=1 consumers=4 duration_seconds=180 request_number=1329982 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-3p1d-conc8 request throughput",
+            "value": 9459.73,
+            "unit": "req/s",
+            "extra": "cell=pd-chat-3p1d-conc8 router=pd policy=round_robin workers=4 prefill=3 decode=1 producers=1 consumers=8 duration_seconds=180 request_number=1702751 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-3p1d-conc8 avg latency",
+            "value": 0.81,
+            "unit": "ms",
+            "extra": "cell=pd-chat-3p1d-conc8 router=pd policy=round_robin workers=4 prefill=3 decode=1 producers=1 consumers=8 duration_seconds=180 request_number=1702751 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-3p1d-conc8 p99 latency",
+            "value": 1.52,
+            "unit": "ms",
+            "extra": "cell=pd-chat-3p1d-conc8 router=pd policy=round_robin workers=4 prefill=3 decode=1 producers=1 consumers=8 duration_seconds=180 request_number=1702751 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-3p1d-conc8 p999 latency",
+            "value": 1.94,
+            "unit": "ms",
+            "extra": "cell=pd-chat-3p1d-conc8 router=pd policy=round_robin workers=4 prefill=3 decode=1 producers=1 consumers=8 duration_seconds=180 request_number=1702751 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
+          },
+          {
+            "name": "Atomesh-Mocker::pd-chat-3p1d-conc8 failed requests",
+            "value": 0,
+            "unit": "count",
+            "extra": "cell=pd-chat-3p1d-conc8 router=pd policy=round_robin workers=4 prefill=3 decode=1 producers=1 consumers=8 duration_seconds=180 request_number=1702751 Run: https://github.com/ROCm/ATOM/actions/runs/33327041626"
           }
         ]
       }
