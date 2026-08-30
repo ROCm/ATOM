@@ -485,6 +485,13 @@ class MLAModules:
     # still run sparse attention (reusing the prior "full" layer's top-k), so
     # sparsity must be derived from the model, not from whether this layer owns
     # an indexer. Defaults keep non-sparse models unchanged.
+    # True when `qk_rope_head_dim` lanes exist only as ZERO PADDING, i.e. a NoPE
+    # model widened so the latent/cache side matches what the MLA kernels
+    # hard-code (576). The padded lanes contribute `sum(0*0) == 0` to every QK
+    # dot product, so prefill may -- and must -- drop them: `qk_nope_head_dim`
+    # is already 256 for GLM-5.3 and CK's flash-attention caps head_dim at 256,
+    # so a padded 320-wide query is refused outright.
+    rope_is_zero_pad: bool = False
     is_sparse: bool = False
     topk_tokens: int | None = None
 
@@ -590,6 +597,14 @@ class MLAAttention(nn.Module):
         self.qk_rope_head_dim = mla_modules.qk_rope_head_dim
         self.qk_head_dim = mla_modules.qk_head_dim
         self.v_head_dim = mla_modules.v_head_dim
+        # NoPE MLA (GLM-5.3-Flash): there is no positional component at all --
+        # query and key are entirely the "nope" half and the KV entry is just
+        # `kv_lora_rank`. `rotary_emb` remains a well-formed module so the
+        # attribute reads below (cos_cache / sin_cache / is_neox_style) stay
+        # valid, but it must never be APPLIED: the rope slices are 0-wide, so
+        # rotating them is at best a no-op and at worst an out-of-bounds read.
+        self.no_rope = mla_modules.qk_rope_head_dim == 0
+        self.rope_is_zero_pad = mla_modules.rope_is_zero_pad
         self.rotary_emb = mla_modules.rotary_emb
         self.q_proj = mla_modules.q_proj
         self.o_proj = mla_modules.o_proj
@@ -877,6 +892,23 @@ class MLAAttention(nn.Module):
         if self.head_pad > 0:
             return torch.nn.functional.pad(q, (0, 0, 0, self.head_pad))
         return q
+
+    def _drop_rope_pad(self, *tensors):
+        """Slice the zero rope-pad lanes off q/k before flash-attention.
+
+        A NoPE model widened to `kv_lora_rank + 64` for the MLA kernels also
+        widens the per-head q/k to `qk_nope_head_dim + 64`. For GLM-5.3 that is
+        320, and CK's flash-attention caps head_dim at 256. The trailing lanes
+        are identically zero, so dropping them is exact. Applied at EVERY
+        flash_attn_varlen_func site: prefill has several variants (plain,
+        cached-single-pass, chunked context/suffix) and fixing only the one that
+        a short-prompt smoke test happens to reach leaves the others to fail
+        later, under chunked prefill, as a head-dim error.
+        """
+        if not self.rope_is_zero_pad:
+            return tensors if len(tensors) > 1 else tensors[0]
+        out = tuple(t[..., : self.qk_nope_head_dim] for t in tensors)
+        return out if len(out) > 1 else out[0]
 
     def _restore_query_heads(
         self, output: torch.Tensor, num_heads: int | None = None
@@ -1251,6 +1283,7 @@ class MLAAttention(nn.Module):
             getattr(attn_metadata, "shuffle_kv_block_indptr", None),
             getattr(attn_metadata, "shuffle_kv_block_indices", None),
         )
+        prefill_q, k_full = self._drop_rope_pad(prefill_q, k_full)
         output = flash_attn_varlen_func(
             q=prefill_q,
             k=k_full,
@@ -1368,6 +1401,7 @@ class MLAAttention(nn.Module):
         k_new = torch.cat(
             (k_nope_new, k_rope_new.expand((*k_nope_new.shape[:-1], -1))), dim=-1
         )
+        prefill_q, k_new = self._drop_rope_pad(prefill_q, k_new)
         new_out, new_lse = flash_attn_varlen_func(
             q=prefill_q,
             k=k_new,
@@ -1421,6 +1455,7 @@ class MLAAttention(nn.Module):
                         else None
                     ),
                 )
+                prefill_q, k_chunk = self._drop_rope_pad(prefill_q, k_chunk)
                 suf_out, suf_lse = flash_attn_varlen_func(
                     q=prefill_q,
                     k=k_chunk,
@@ -1546,6 +1581,7 @@ class MLAAttention(nn.Module):
             k = torch.cat((k_nope, k_pe.expand((*k_nope.shape[:-1], -1))), dim=-1)
 
             # 5. flash attention over the (unmasked) context chunk.
+            prefill_q, k = self._drop_rope_pad(prefill_q, k)
             ctx_out, ctx_lse = flash_attn_varlen_func(
                 q=prefill_q,
                 k=k,
@@ -1678,6 +1714,7 @@ class MLAAttention(nn.Module):
 
             k = torch.cat((k_nope, k_rope.expand((*k_nope.shape[:-1], -1))), dim=-1)
 
+        q, k = self._drop_rope_pad(q, k)
         output = flash_attn_varlen_func(
             q=q,
             k=k,
@@ -2273,7 +2310,7 @@ class MLAAttention(nn.Module):
         projection -- normally the strided ``[..., q_lora_rank:]`` half of a
         fused q/kv projection, which both paths below read without copying.
         """
-        use_fused = self._ctx_kv_fusion_enabled and (
+        use_fused = self._ctx_kv_fusion_enabled and not self.no_rope and (
             # A plain [num_blocks, block_size, entry] cache (a per-token cache
             # is that with block_size 1). The empty pre-allocation every layer
             # holds before allocate_kv_cache fails here too, so a premature
@@ -2337,7 +2374,8 @@ class MLAAttention(nn.Module):
         # optional. So pass a throwaway for the query side, exactly as
         # deepseek_v2 does for its own k-only rope under PCP.
         k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim)
-        _, k_pe = self.rotary_emb(positions, torch.empty_like(k_pe), k_pe)
+        if not self.no_rope:
+            _, k_pe = self.rotary_emb(positions, torch.empty_like(k_pe), k_pe)
         self._pcp_write_full_kv(kv_cache, kv_c, k_pe, slot_mapping)
 
     def forward_impl(
@@ -2376,7 +2414,8 @@ class MLAAttention(nn.Module):
                 -1, self.num_heads, self.qk_head_dim
             )
             prefill_q_pe = prefill_q[..., self.qk_nope_head_dim :]
-            self.rotary_emb(positions, prefill_q_pe, k_rope)
+            if not self.no_rope:
+                self.rotary_emb(positions, prefill_q_pe, k_rope)
 
             if kv_cache.numel() > 0:
                 if envs.ATOM_USE_TRITON_MLA and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV:
@@ -2569,9 +2608,10 @@ class MLAAttention(nn.Module):
                     # kernel's throwaway owned-slot write. The rope kernel is
                     # 2-component and needs a non-None partner, so pass a
                     # throwaway query of matching length.
-                    self.rotary_emb(
-                        positions_full, k_rope_full, torch.empty_like(k_rope_full)
-                    )
+                    if not self.no_rope:
+                        self.rotary_emb(
+                            positions_full, k_rope_full, torch.empty_like(k_rope_full)
+                        )
                     self._pcp_write_full_kv(
                         kv_cache,
                         k_nope_full,
