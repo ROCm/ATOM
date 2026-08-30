@@ -117,6 +117,8 @@ class EagleProposer(Drafter):
         }
         self.step = DraftGraph(
             forward=self._step_forward,
+            epilogue=self._step_head,
+            capture_epilogue=True,
             inputs=inputs,
             warmup_inputs=self._step_warmup_inputs,
         )
@@ -136,6 +138,16 @@ class EagleProposer(Drafter):
         return self.model(
             input_ids=input_ids, positions=positions, hidden_states=hidden_states
         )
+
+    def _step_head(self, out, running_bs, **_):
+        """The mid-step's draft ids, recorded with the backbone that made them.
+
+        Both come back because the next mid-step reads the hidden states and
+        they exist only inside the recording. Every row, never
+        `[:scheduled_bs]`: a capture bakes the length it was made at. Slicing
+        is the caller's, on the way out.
+        """
+        return out, self.model.compute_draft_ids(out)
 
     def _build_draft_model(self, model_class) -> nn.Module:
         draft_model_hf_config = self.speculative_config.draft_model_hf_config
@@ -562,8 +574,9 @@ class EagleProposer(Drafter):
                     self.model.model.set_skip_topk(False)
                 if i and self.step is not None:
                     # Steps 1+ are the declared pass: one row per sequence, at
-                    # a batch the startup sweep already warmed.
-                    ret_hidden_states = self.step.run(
+                    # a batch the startup sweep already warmed. The head rides
+                    # in the recording, so this hands back both of its outputs.
+                    ret_hidden_states, graphed_ids = self.step.run(
                         running_bs,
                         **self._stage_step_inputs(
                             running_bs, d_input_ids, d_positions, d_hidden
@@ -575,6 +588,7 @@ class EagleProposer(Drafter):
                         positions=d_positions,
                         hidden_states=d_hidden,
                     )
+                    graphed_ids = None
                 if pcp_draft_prefill:
                     ret_hidden_states = pcp_allgather_rerange(
                         ret_hidden_states, pcp_ws
@@ -591,6 +605,8 @@ class EagleProposer(Drafter):
                     if i == 0
                     else ret_hidden_states[:scheduled_bs]
                 )
+                # Only step 0 and a flavor with no declared pass land here; a
+                # recorded mid-step produced its ids inside the graph.
                 # Every draft model EagleProposer can build implements this --
                 # the DSpark archs in support_draft_model_arch_dict do not, but
                 # they are DSparkProposer's and never reach this loop. All of
@@ -599,7 +615,11 @@ class EagleProposer(Drafter):
                 # compute_logits().argmax(-1) here because is_draft suppresses
                 # the LM head's prefill last-token slice. How the ids are
                 # produced stays the model's business, not this loop's.
-                new_draft_ids = self.model.compute_draft_ids(sample_hidden_states)
+                new_draft_ids = (
+                    graphed_ids[:scheduled_bs]
+                    if graphed_ids is not None
+                    else self.model.compute_draft_ids(sample_hidden_states)
+                )
                 draft_token_ids[:, i] = new_draft_ids
 
                 if i < self.mtp_k - 1:

@@ -282,7 +282,12 @@ class ParallelLMHead(VocabParallelEmbedding):
         # Pack (val, idx) as fp32 — idx < 2^24 is exact — and all-gather only the
         # per-rank reductions ([N, 2]) instead of the full logits.
         packed = lm_head_argmax_pack(logits, self.vocab_start_idx)
-        gathered = get_tp_group().all_gather(packed, dim=0).view(self.tp_size, -1, 2)
+        # Custom, like the logits path above: `graph_capture()` arms only that
+        # one, and a draft pass records this. The RCCL path is what made the
+        # head un-capturable on HIP at TP > 1.
+        use_custom = envs.ATOM_USE_CUSTOM_ALL_GATHER
+        gathered = get_tp_group().all_gather(packed, dim=0, use_custom=use_custom)
+        gathered = gathered.view(self.tp_size, -1, 2)
         winner = gathered[:, :, 0].argmax(dim=0)  # [N] winning rank (ties -> lowest)
         token = gathered[:, :, 1].gather(0, winner.unsqueeze(0)).squeeze(0)  # [N] fp32
         return token.to(torch.long)
