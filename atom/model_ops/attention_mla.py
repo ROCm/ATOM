@@ -1425,7 +1425,11 @@ class MLAAttention(nn.Module):
                     q=prefill_q,
                     k=k_chunk,
                     v=v_chunk,
-                    cu_seqlens_q=attn_metadata.cu_seqlens_q,
+                    # As many q-cums as k-cums -- varlen takes its batch from
+                    # the q side, and the chunk's were built unpadded.
+                    cu_seqlens_q=attn_metadata.cu_seqlens_q[
+                        : chunk_meta.cu_seqlens_k[c].shape[0]
+                    ],
                     cu_seqlens_k=chunk_meta.cu_seqlens_k[c],
                     max_seqlen_q=attn_metadata.max_seqlen_q,
                     max_seqlen_k=chunk_meta.max_seqlen_k[c],
@@ -1550,7 +1554,9 @@ class MLAAttention(nn.Module):
                 q=prefill_q,
                 k=k,
                 v=v,
-                cu_seqlens_q=attn_metadata.cu_seqlens_q,
+                cu_seqlens_q=attn_metadata.cu_seqlens_q[
+                    : chunk_meta.cu_seqlens_k[c].shape[0]
+                ],
                 cu_seqlens_k=chunk_meta.cu_seqlens_k[c],
                 max_seqlen_q=attn_metadata.max_seqlen_q,
                 max_seqlen_k=chunk_meta.max_seqlen_k[c],
@@ -1732,7 +1738,10 @@ class MLAAttention(nn.Module):
             device=q.device,
         )
 
-        paged_cu_seqlens_q = attn_metadata.cu_seqlens_q
+        # The paged kernels take their batch from the q-cums; cut them to a
+        # per-seq array the prefill builder left unpadded.
+        n_seqs = attn_metadata.kv_last_page_lens.shape[0]
+        paged_cu_seqlens_q = attn_metadata.cu_seqlens_q[: n_seqs + 1]
         paged_kv_indptr = attn_metadata.kv_indptr
         paged_kv_indices = attn_metadata.kv_indices
         kv_last_page_lens = attn_metadata.kv_last_page_lens

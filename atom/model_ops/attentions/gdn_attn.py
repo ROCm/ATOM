@@ -1020,7 +1020,12 @@ class GDNStateMixin:
         if prepare_block_tables:
             self.prepare_block_tables(batch)
 
+        # Prefill only: `prepare_prefill` pads this past the requests it
+        # scheduled, for a draft pass that follows. Decode's padding is older
+        # than that and everything below is written for it.
         query_start_loc = attn_metadata.cu_seqlens_q
+        if is_prefill:
+            query_start_loc = query_start_loc[: num_prefills + 1]
         nums_dict, batch_ptr, token_chunk_offset_ptr = None, None, None
         if not self.use_spec_decode or is_prefill:
             self.prepare_state_indices(batch, with_spec=False)

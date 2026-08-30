@@ -907,9 +907,11 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 attn_metadata.context_lens[:bs],
                 bs,
             )
+            # Sliced like the block tables above -- `num_prefills` counts
+            # requests, and these two are padded past it.
             attn_metadata.sparse_attention_metadata = make_sparse_prefill_metadata(
-                cu_seqlens_q=attn_metadata.cu_seqlens_q,
-                seq_lens=attn_metadata.context_lens,
+                cu_seqlens_q=attn_metadata.cu_seqlens_q[: bs + 1],
+                seq_lens=attn_metadata.context_lens[:bs],
                 block_table=sparse_block_tables,
                 slot_mapping=attn_metadata.slot_mapping,
                 max_query_len=attn_metadata.max_seqlen_q,

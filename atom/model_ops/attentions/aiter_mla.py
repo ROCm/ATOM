@@ -1361,8 +1361,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             attn_metadata.kv_indices = var["kv_indices"].gpu
             attn_metadata.kv_indptr = var["kv_indptr"].gpu[: bs + 1]
             attn_metadata.kv_indptr[0] = 0
+            # `context_lens` is padded past the requests this indptr counts.
             attn_metadata.kv_indptr[1 : bs + 1] = torch.cumsum(
-                attn_metadata.context_lens, 0
+                attn_metadata.context_lens[:bs], 0
             )
             attn_metadata.kv_last_page_lens = var["kv_last_page_lens"].gpu[:bs]
 
