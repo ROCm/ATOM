@@ -35,6 +35,33 @@ def use_pa_decode_bf16_asm() -> bool:
     )
 
 
+def _kv_descale_pair(k_scale, v_scale, per_tensor_scale, reads_kv_cache=True):
+    """Pick the (k_descale, v_descale) pair for a ``unified_attention`` call.
+
+    The SHUFFLE writers (``triton_fused_norm_rope_cache``,
+    ``fused_qk_norm_rope_cache_quant_shuffle``,
+    ``reshape_and_cache_with_pertoken_quant``) quantize fp8 KV PER TOKEN and
+    fill ``k_scale``/``v_scale`` as ``[num_blocks, num_kv_heads, block_size]``.
+    ``per_tensor_scale`` (``self.kv_scale``) is only the fallback for the NHD
+    ``fused_qk_rope`` path, which sets ``per_token_quant=False``, and for bf16
+    caches. Descaling a per-token cache with the scalar reads it as if it were
+    unit-scaled and inflates K/V by ``fp8_max/amax`` (~400x) -> garbage.
+
+    ``reads_kv_cache=False`` means raw unquantized bf16 K/V is being fed in
+    place of the cache, so the per-token scales must NOT be applied.
+    """
+    if not reads_kv_cache:
+        return per_tensor_scale, per_tensor_scale
+    if (
+        k_scale is not None
+        and v_scale is not None
+        and k_scale.numel() > 1
+        and v_scale.numel() > 1
+    ):
+        return k_scale, v_scale
+    return per_tensor_scale, per_tensor_scale
+
+
 class PagedAttentionImpl(nn.Module):
     """
     Attention paged implementation
@@ -493,6 +520,9 @@ class PagedAttentionImpl(nn.Module):
             o = torch.empty_like(q)
 
         num_seqs = attn_metadata.context_lens.shape[0]
+        paged_k_descale, paged_v_descale = _kv_descale_pair(
+            k_scale, v_scale, self.kv_scale
+        )
 
         if envs.ATOM_USE_UNIFIED_ATTN or self.use_flash_layout:
             # print(q.shape, k_cache.shape, v_cache.shape)
@@ -518,8 +548,11 @@ class PagedAttentionImpl(nn.Module):
                 block_table=attn_metadata.block_tables,
                 softcap=0,
                 q_descale=None,
-                k_descale=self.kv_scale,
-                v_descale=self.kv_scale,
+                # Paged attention always reads the KV cache, so a per-token
+                # quantized cache must be descaled per token here. The
+                # run_pa_decode_gluon branch below already does this.
+                k_descale=paged_k_descale,
+                v_descale=paged_v_descale,
                 sinks=self.sinks,
                 shuffled_kv_cache=shuffled_kv_cache,
             )
@@ -805,6 +838,7 @@ class PagedAttentionImpl(nn.Module):
         # already written into the paged flash-layout cache during rope_cache
         # are read straight from `k_cache`/`v_cache`, identical to the
         # prefix-cache-hit path.
+        reads_kv_cache = True
         if envs.ATOM_USE_UNIFIED_ATTN or attn_metadata.has_cached:
             k_for_attn = k_cache
             v_for_attn = v_cache
@@ -812,12 +846,17 @@ class PagedAttentionImpl(nn.Module):
             # 4D flash layout is in use.
             shuffled_kv_cache = not self.use_flash_layout
         else:
+            reads_kv_cache = False
             #   k: [total_tokens, num_kv_heads, head_size]
             #     -> [total_tokens, 1, num_kv_heads, head_size]
             k_for_attn = k.unsqueeze(1)
             v_for_attn = v.unsqueeze(1)
             # Raw K/V is fed as a block_size=1 flash-layout cache, never shuffled.
             shuffled_kv_cache = False
+
+        prefill_k_descale, prefill_v_descale = _kv_descale_pair(
+            k_scale, v_scale, self.kv_scale, reads_kv_cache
+        )
 
         unified_attention(
             q,
@@ -835,8 +874,8 @@ class PagedAttentionImpl(nn.Module):
             block_table=attn_metadata.block_tables,
             softcap=0,
             q_descale=None,
-            k_descale=self.kv_scale,
-            v_descale=self.kv_scale,
+            k_descale=prefill_k_descale,
+            v_descale=prefill_v_descale,
             sinks=self.sinks,
             shuffled_kv_cache=shuffled_kv_cache,
         )
