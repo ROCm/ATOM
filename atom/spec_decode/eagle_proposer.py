@@ -528,9 +528,9 @@ class EagleProposer(Drafter):
                 # `scheduled_bs` rows are real.
                 self._publish_draft_shape(
                     forward_context,
-                    # Mid-steps compute every padded row, so both units are the
-                    # padded one; step 0 carries the target's stream and pads nothing.
-                    scheduled_tokens=running_bs if i else input_ids.shape[0],
+                    # Steps 1+ run a row per sequence, `scheduled_bs` of them
+                    # real; step 0 carries the target's stream and pads nothing.
+                    scheduled_tokens=scheduled_bs if i else input_ids.shape[0],
                     running_tokens=running_bs if i else input_ids.shape[0],
                 )
                 # ---- Prefill Context Parallel (draft i==0 prefill) --------

@@ -412,6 +412,14 @@ class tokenIDProcessor:
         num_prev = len(prev_req_ids)
         num_cur = len(cur_req_ids)
 
+        # A fabricated batch carries nothing over -- and the DP-sync dummy
+        # reuses one id, so without this the next dummy matches it and reads a
+        # request that never existed out of `prev_token_ids`/`draft_token_ids`.
+        # Real ids are non-negative and never matched it either way.
+        if self.prev_batch.is_dummy_run:
+            none = np.empty(0, dtype=np.intp)
+            return TokenLocations(none, none, np.arange(num_cur, dtype=np.intp))
+
         prev_id_to_idx = dict(zip(prev_req_ids, range(num_prev)))
 
         deferred_curr = np.empty(num_cur, dtype=np.intp)
@@ -1166,7 +1174,14 @@ class ModelRunner:
             logger.info(*args)
 
     def dummy_execution(self):
-        """Execute dummy decode batch for DP synchronization."""
+        """Execute dummy decode batch for DP synchronization.
+
+        Two mechanisms lean on the fabricated id being -1: this pass flushes
+        the previous real step's tokens (`prepare_sampled_ids` reports the
+        batch before), and its own land on the key the deferred flag then
+        overwrites. What -1 must NOT do is look like a request --
+        `get_token_locations`.
+        """
         has_drafter = hasattr(self, "drafter")
         mtp_k = self.drafter.mtp_k if has_drafter else 0
         mtp_factor = mtp_k + 1

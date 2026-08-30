@@ -826,6 +826,10 @@ class ScheduledBatch:
         Decode batches always do. A pure-prefill batch yields a token only
         when at least one seq is on its final chunk; a batch of middle chunks
         produces nothing.
+
+        A DP-sync dummy answers True and must: reporting lags a step, so the
+        dummy is what flushes the last real one. Skip its `postprocess` and
+        the request waking up after it has an anchor on neither side.
         """
         if self.total_seqs_num_decode > 0:
             return True

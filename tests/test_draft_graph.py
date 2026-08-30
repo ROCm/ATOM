@@ -188,6 +188,60 @@ def test_run_replays_the_recording_instead_of_the_forward():
     assert (forwards, replays) == ([4], [1]), "recorded: must replay, not re-run"
 
 
+def test_a_replay_hands_back_a_value_not_the_recordings_own_storage():
+    """What `run` returns has to survive the next replay of any other size.
+
+    The recording's tensors are allocated inside the capture, so they live in
+    the pool every captured size shares; the pool packs a later size's capture
+    into memory the earlier ones released, and a replay rewrites every address
+    it recorded whatever holds it now. Holding a Python reference does not
+    stop that -- which is exactly why this cannot be left to the caller.
+
+    Written as "the recording changing underneath must not change what was
+    handed out", because that is the failure: DSpark's draft ids are read a
+    step later as the next forward's `input_ids`, and another size's replay
+    had turned them into that size's activations. The target's embedding
+    gathered on those floats and faulted all eight ranks.
+    """
+
+    class _Graph:
+        def replay(self):
+            pass
+
+    ids = torch.full((4, 3), 9, dtype=torch.int32)
+    conf = torch.zeros(4, 3)
+    g = _graph(epilogue=lambda out, running_bs, **rows: out, capture_epilogue=True)
+    g._cuda_graphs[4] = (_Graph(), (ids, conf))
+
+    got_ids, got_conf = g.run(
+        4, **g.stage(4, {"row": torch.zeros(4, dtype=torch.int32)})
+    )
+    assert got_ids.tolist() == ids.tolist(), "the replay's values, unchanged"
+
+    # A later replay at another size lands on the recording's storage.
+    ids.fill_(1234)
+    conf.fill_(5.0)
+    assert got_ids.tolist() != ids.tolist(), "handed out a window into the recording"
+    assert got_conf.tolist() != conf.tolist(), "every output, not just the ids"
+
+
+def test_the_eager_path_hands_back_what_it_allocated():
+    """...and only a replay needs the copy.
+
+    Without a recording the pass allocates normally, where holding the
+    reference is what keeps the storage. Copying there would be pure cost, so
+    the identity is asserted rather than left to inspection.
+    """
+    made = torch.zeros(2, 3)
+    g = _graph(
+        forward=lambda running_bs, **rows: made,
+        epilogue=lambda out, running_bs, **rows: out,
+        capture_epilogue=True,
+    )
+    assert not g.is_captured(2)
+    assert g.run(2, **g.stage(2, {"row": torch.zeros(2, dtype=torch.int32)})) is made
+
+
 def test_a_dummy_replays_in_lockstep_with_the_real_ranks():
     """`is_dummy_run` is per-rank, so no decision that feeds a collective may
     read it.

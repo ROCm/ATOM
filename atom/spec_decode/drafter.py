@@ -559,19 +559,44 @@ class Drafter(abc.ABC):
         tokens -- not the draft's own width. Anything sizing a collective off
         the context (MoE's `pad_for_all_gather` above all) would then use the
         wrong height, so the draft states its shape here rather than letting
-        each consumer special-case `is_draft`. Both units: DP's variable-length
-        gather takes `running_tokens`, the pad needs to know how much is real.
+        each consumer special-case `is_draft`.
+
+        Both units: `scheduled_tokens` is how many rows carry a real request,
+        `running_tokens` how many the pass runs -- they differ exactly when the
+        batch was widened.
+
+        The pass is UNIFORM across DP and not a prefill whatever the target
+        just did: its height is `running_bs * draft width`, one from `decide`'s
+        reduction and one from config. `decide`'s own answer describes the
+        TARGET's counts, which a prefilling peer makes ragged; it does not
+        describe this pass.
         """
         context = forward_context.context
         context.scheduled_tokens = scheduled_tokens
         context.running_tokens = running_tokens
+        # Declared whatever the DP size: which path this pass is on is a fact
+        # about the pass, not about the group. Only the metadata below needs a
+        # group to exist.
+        context.is_prefill = False
         parallel_config = self.config.parallel_config
         if parallel_config.data_parallel_size <= 1:
             return
-        context.running_tokens_are_unified = False
+        context.running_tokens_are_unified = True
+        # Written here, not all_reduced: every rank's height is the same two
+        # agreed inputs multiplied, so there is nothing to ask. `make`'s assert
+        # cannot catch a wrong table (it checks this rank's entry, which a
+        # uniform fill satisfies) -- a probe against the all_reduced one found
+        # no disagreement over a 100k/c50 run and a full GSM8K, same score
+        # either way. `device` is explicit: the default one is not the host.
         forward_context.dp_metadata = DPMetadata.make(
             parallel_config,
             running_tokens,
+            num_tokens_across_dp=torch.full(
+                (parallel_config.data_parallel_size,),
+                running_tokens,
+                dtype=torch.int32,
+                device="cpu",
+            ),
         )
 
     def prepare_inputs(

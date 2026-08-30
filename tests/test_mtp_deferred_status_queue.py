@@ -22,6 +22,72 @@ def _prefill_batch(is_final_chunk: list[bool]) -> ScheduledBatch:
     return batch
 
 
+def _batch_with_ids(req_ids: list[int], *, is_dummy_run: bool) -> ScheduledBatch:
+    """The two fields `get_token_locations` reads, and nothing else."""
+    batch = object.__new__(ScheduledBatch)
+    batch.req_ids = req_ids
+    batch.is_dummy_run = is_dummy_run
+    return batch
+
+
+def _locations(prev: ScheduledBatch, cur: ScheduledBatch):
+    processor = object.__new__(tokenIDProcessor)
+    processor.prev_batch = prev
+    return tokenIDProcessor.get_token_locations(processor, cur)
+
+
+def test_a_dummy_carries_nothing_over_to_the_next_dummy():
+    """Back-to-back DP-sync dummies must not look like one carried-over request.
+
+    `dummy_execution` fabricates its sequence with a fixed id, so a second
+    dummy matches the first by id and is taken for a request that ran last
+    step. It then reads that "request's" anchor and drafts out of
+    `prev_token_ids` / `draft_token_ids`, which by then hold whatever the draft
+    pass's graph-pool storage was overwritten with -- out-of-vocab ids that
+    fault the target's embedding gather. A rank idling behind someone else's
+    long chunked prefill runs dummies back to back, so this is the ordinary
+    case at high concurrency, not a corner.
+    """
+    dummy_id = -1  # what dummy_execution builds; the collision is with ITSELF
+    first = _batch_with_ids([dummy_id], is_dummy_run=True)
+    second = _batch_with_ids([dummy_id], is_dummy_run=True)
+
+    locs = _locations(first, second)
+
+    assert locs.deferred_curr.tolist() == []
+    assert locs.deferred_prev.tolist() == []
+    assert locs.new_curr.tolist() == [0]
+
+
+def test_a_real_batch_after_a_dummy_takes_the_host_path():
+    """...and so does a real request that wakes up after one.
+
+    Not a consolation prize for the line above: the dummy's own `postprocess`
+    reports the PREVIOUS batch's tokens, so by the time this request is
+    scheduled its anchor is already on the host. Reading `prev_token_ids`
+    instead would be reading the dummy's forward.
+    """
+    dummy = _batch_with_ids([-1], is_dummy_run=True)
+    real = _batch_with_ids([7, 9], is_dummy_run=False)
+
+    locs = _locations(dummy, real)
+
+    assert locs.deferred_curr.tolist() == []
+    assert locs.new_curr.tolist() == [0, 1]
+
+
+def test_a_real_batch_still_carries_over_from_a_real_batch():
+    """The dummy rule must not cost an ordinary decode step its deferred rows."""
+    prev = _batch_with_ids([7, 9], is_dummy_run=False)
+    cur = _batch_with_ids([9, 11], is_dummy_run=False)
+
+    locs = _locations(prev, cur)
+
+    assert locs.deferred_curr.tolist() == [0]  # req 9 is position 0 now...
+    assert locs.deferred_prev.tolist() == [1]  # ...and was position 1 before
+    assert locs.new_curr.tolist() == [1]
+
+
 def _processor() -> tokenIDProcessor:
     processor = object.__new__(tokenIDProcessor)
     processor.input_ids = SimpleNamespace(

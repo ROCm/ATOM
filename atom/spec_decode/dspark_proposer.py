@@ -106,6 +106,10 @@ class DSparkProposer(Drafter):
         it does all_gather the vocab shard; ``capture_epilogue`` says whether
         that one collective is captured with the rest.
 
+        Its ids are what `DraftGraph.run` copies out of the pool: deferred
+        output feeds them back as the next step's `input_ids`, so they are the
+        one thing here that outlives the pass.
+
         It must be WARMED regardless: the head has its own per-shape flydsl
         builder, and leaving it out of the warm is exactly how
         `hipModuleLoadData` went 0 -> 4 on the reproducer once.
@@ -583,14 +587,9 @@ class DSparkProposer(Drafter):
         self.model.model.index_buffers(num_draft, window, self.device).mask_pad_tail(
             self.runner.attn_metadata_builder.row_ids, scheduled_bs, running_bs
         )
-        # Both units at the padded height: this pass computes every row it
-        # was given, so that IS how many it ran. Reporting the real count
-        # while handing the gather the padded one is the contract break --
-        # `dp_gather_hidden_and_router` asserts an eager step padded nothing,
-        # and it aborted 8/8 the moment a batch had no recording to replay.
         self._publish_draft_shape(
             forward_context,
-            scheduled_tokens=running_bs * num_draft,
+            scheduled_tokens=scheduled_bs * num_draft,
             running_tokens=running_bs * num_draft,
         )
         label = self.block.label(scheduled_bs, running_bs)

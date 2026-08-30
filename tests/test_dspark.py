@@ -13,6 +13,7 @@ pytest.importorskip("aiter", reason="the compiled draft imports aiter at module 
 
 import torch
 
+import atom.spec_decode.drafter as mod_drafter
 from atom.model_ops.v4_kernels.dspark_fp8_indices import DSparkIndexBuffers
 from atom.models.deepseek_v4_dspark import (
     DSparkConfidenceHead,
@@ -980,6 +981,7 @@ def _stub_forward_context(*, scheduled_bs, target_bs, use_cudagraph=True):
         running_tokens=target_bs * 337,
         is_dummy_run=False,
         is_draft=False,
+        is_prefill=False,
         positions=None,
         forward_mode=types.SimpleNamespace(use_cudagraph=use_cudagraph),
     )
@@ -1125,18 +1127,12 @@ def test_propose_drafts_at_the_captured_graph_bs(monkeypatch, scheduled_bs, expe
     )
 
 
-def test_propose_reports_the_rows_it_ran_not_the_rows_that_were_real(monkeypatch):
-    """Both units at the padded height, because the pass computed every row.
+def test_propose_states_both_units_of_its_own_pass(monkeypatch):
+    """The draft's shape, and it is the pass's own, not the target's.
 
-    `_publish_draft_shape` re-points the context at THIS pass, and MoE's
-    variable-length gather takes `scheduled_tokens` as "how many rows did you
-    hand me". Reporting the real count against a padded tensor is a contract
-    break, not a conservative choice: `dp_gather_hidden_and_router` asserts the
-    two agree, and it aborted 8/8 ranks on the first decode step the moment a
-    batch had no recording to replay.
-
-    Runs with no recording precisely because that is the case the old code got
-    away with by never reaching the Python.
+    `scheduled_tokens` is how many rows carry a real request, `running_tokens`
+    how many the pass runs, and they DIFFER exactly when the batch was widened.
+    Pinned 44 against 48 so a version that reports one number twice cannot pass.
     """
     seen = {}
     p = _proposer_with_graph_bs(monkeypatch, captured=False)
@@ -1145,11 +1141,74 @@ def test_propose_reports_the_rows_it_ran_not_the_rows_that_were_real(monkeypatch
 
     t = p.mtp_k
     assert seen["B"] == 48, "the pass runs the agreed batch, recording or not"
-    assert fc.context.scheduled_tokens == fc.context.running_tokens == 48 * t
+    assert fc.context.scheduled_tokens == 44 * t
+    assert fc.context.running_tokens == 48 * t
     assert out.shape[0] == 44, "sliced back to the real requests on the way out"
     # ...and the fabricated rows still scatter no draft KV.
     ids = seen["batch_ids"]
     assert ids[44 * t : 48 * t].tolist() == [-1] * (4 * t)
+
+
+def test_propose_sizes_the_draft_gather_without_asking_the_group(monkeypatch):
+    """No collective here. The step already ran its one.
+
+    Every rank's draft height is the same number by construction --
+    `running_bs` came out of that reduction and the draft width is config -- so
+    each can write the whole table itself. `DPMetadata.make` all_reduces it
+    when the table is not supplied, which cost one CPU collective per draft
+    pass: `mtp_k` of them per step for the serial drafters.
+
+    Watched by making the ask itself fail, not by counting calls: a version
+    that asks would otherwise pass here on a stub that answers.
+    """
+    seen = {}
+    p = _proposer_with_graph_bs(monkeypatch)
+    p.config.parallel_config = types.SimpleNamespace(
+        data_parallel_size=2, data_parallel_rank=0
+    )
+
+    def _must_not_ask(*a, **k):
+        raise AssertionError("draft asked the group for a height it already knows")
+
+    monkeypatch.setattr(
+        mod_drafter.DPMetadata, "num_tokens_across_dp", staticmethod(_must_not_ask)
+    )
+    fc = _stub_forward_context(scheduled_bs=44, target_bs=48)
+    fc.dp_metadata = None
+    _run_propose(p, fc, 44, monkeypatch, seen)
+
+    t = p.mtp_k
+    assert fc.dp_metadata.get_sizes_across_dp() == [48 * t, 48 * t]
+
+
+def test_propose_puts_the_pass_on_the_path_its_own_shape_is_on(monkeypatch):
+    """The pass is uniform across DP and is not a prefill.
+
+    Its height is `running_bs * draft width`, and both factors are the step's
+    own reduction or config -- so every rank runs the same number of rows,
+    whatever `decide` said about the TARGET's counts. `is_prefill` moves with
+    it because the padded gather reads it to choose which height to check
+    against, and this pass is `[bs, T]` however the target ran.
+
+    The same fact the table below is built on: declaring ragged while filling a
+    uniform table is two statements that cannot both hold.
+    """
+    seen = {}
+    p = _proposer_with_graph_bs(monkeypatch)
+    p.config.parallel_config = types.SimpleNamespace(
+        data_parallel_size=2, data_parallel_rank=0
+    )
+    monkeypatch.setattr(
+        mod_drafter.DPMetadata, "make", staticmethod(lambda *a, **k: "dp_meta")
+    )
+    fc = _stub_forward_context(scheduled_bs=44, target_bs=48)
+    fc.context.is_prefill = True
+    fc.dp_metadata = None
+    _run_propose(p, fc, 44, monkeypatch, seen)
+
+    assert fc.context.running_tokens_are_unified is True
+    assert fc.context.is_prefill is False
+    assert fc.dp_metadata == "dp_meta"
 
 
 def test_propose_pads_under_eplb_exactly_as_it_does_without_it(monkeypatch):
@@ -1189,6 +1248,7 @@ def test_propose_replays_at_the_agreed_batch_even_when_it_had_to_pad(monkeypatch
     for the recording there. Watched through the recording being returned and
     the backbone never running -- asserting the label alone would pass on a
     `run` that replays nothing.
+
     """
     seen = {}
     p = _proposer_with_graph_bs(monkeypatch)

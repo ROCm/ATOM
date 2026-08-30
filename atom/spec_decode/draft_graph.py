@@ -19,6 +19,19 @@ if TYPE_CHECKING:
     from atom.config import Config
 
 
+def _owned(value: Any) -> Any:
+    """A copy the graph pool cannot re-issue.
+
+    Whole return, not the one output known to outlive its step: which that is
+    belongs to the flavor, not to this seam.
+    """
+    if isinstance(value, torch.Tensor):
+        return value.clone()
+    if isinstance(value, tuple):
+        return tuple(_owned(v) for v in value)
+    return value
+
+
 @dataclass(frozen=True)
 class StagedInput:
     """One staged input's type: everything but the leading batch axis."""
@@ -197,6 +210,12 @@ class DraftGraph:
         answer rounded on a ladder every rank shares, so every rank answers
         alike and nothing about the step needs to reach here -- see
         :meth:`is_captured`.
+
+        What leaves here is a VALUE. A replay hands back the tensors the
+        capture allocated, and the pool re-issues those addresses to sizes
+        captured later -- a reference does not hold them the way the eager
+        allocator's does. Only ``capture_epilogue`` can put a survivor in
+        there; the eager path allocates normally and needs no copy.
         """
         captured = (
             self._cuda_graphs.get(running_bs) if self.is_captured(running_bs) else None
@@ -206,6 +225,8 @@ class DraftGraph:
         else:
             graph, out = captured
             graph.replay()
+            if self.capture_epilogue:
+                out = _owned(out)
         return (
             out
             if self.capture_epilogue
