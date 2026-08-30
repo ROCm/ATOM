@@ -15,6 +15,7 @@ forever.
 import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -166,51 +167,90 @@ class _JointPark:
     """
 
     def __init__(self) -> None:
-        self._need: dict[str, set[str]] = {}
-        self._failed: set[str] = set()
-        self._ready: set[str] = set()
-        self._ready_failed: set[str] = set()
+        self._need: dict[Any, set[str]] = {}
+        self._failed: set = set()
+        self._ready: set = set()
+        self._ready_failed: set = set()
+        # The two legs do not report the same identity. The KV leg reports
+        # whatever `_load_completion_id` yields -- a typed `LoadOperationId`
+        # whenever the scheduler issued one, which for an offload load is
+        # always -- while the state tier is keyed by request and reports the
+        # bare id. The park is filed under the KV identity, because that is
+        # what has to reach the engine on `finished_loading`; this maps the
+        # bare id onto it so a state report can find its own park.
+        self._alias: dict = {}
+        self._alias_of: dict = {}
 
-    def arm(self, req_id: str, *, needs_kv: bool, needs_state: bool) -> None:
+    def arm(
+        self,
+        req_id: str,
+        *,
+        needs_kv: bool,
+        needs_state: bool,
+        kv_id=None,
+    ) -> None:
+        """Park `req_id`, filed under `kv_id` when the KV leg reports one.
+
+        `kv_id` must be exactly what the KV worker will put on
+        `finished_loading`/`failed_loading` for this load, because that report
+        is matched by equality and nothing translates it on the way in.
+        """
         need = set()
         if needs_kv:
             need.add("kv")
         if needs_state:
             need.add("state")
-        self._need[req_id] = need
+        key = req_id if kv_id is None else kv_id
+        self._need[key] = need
+        if key != req_id:
+            self._alias[req_id] = key
+            self._alias_of[key] = req_id
         if not need:
-            self._ready.add(req_id)
+            self._release(key)
 
-    def settle_kv(self, req_id: str, ok: bool) -> None:
-        self._settle(req_id, "kv", ok)
+    def settle_kv(self, ident, ok: bool) -> None:
+        self._settle(ident, "kv", ok)
 
-    def settle_state(self, req_id: str, ok: bool) -> None:
-        self._settle(req_id, "state", ok)
+    def settle_state(self, ident, ok: bool) -> None:
+        self._settle(ident, "state", ok)
 
-    def _settle(self, req_id: str, leg: str, ok: bool) -> None:
-        need = self._need.get(req_id)
+    def _resolve(self, ident):
+        """The park key for either leg's identity. Identity when unarmed."""
+        return self._alias.get(ident, ident)
+
+    def _settle(self, ident, leg: str, ok: bool) -> None:
+        key = self._resolve(ident)
+        need = self._need.get(key)
         if need is None:
             return
         need.discard(leg)
         if not ok:
-            self._failed.add(req_id)
+            self._failed.add(key)
         if need:
             return
-        del self._need[req_id]
-        if req_id in self._failed:
-            self._failed.discard(req_id)
-            self._ready_failed.add(req_id)
-        else:
-            self._ready.add(req_id)
+        self._release(key)
 
-    def waits_for(self, req_id: str) -> bool:
-        """Whether this park still owes `req_id` a leg.
+    def _release(self, key) -> None:
+        self._need.pop(key, None)
+        bare = self._alias_of.pop(key, None)
+        if bare is not None:
+            self._alias.pop(bare, None)
+        if key in self._failed:
+            self._failed.discard(key)
+            self._ready_failed.add(key)
+        else:
+            self._ready.add(key)
+
+    def waits_for(self, ident) -> bool:
+        """Whether this park still owes `ident`'s request a leg.
 
         Asked before settling: the legs report through channels a single-leg
         request also uses, and `_settle` ignores unknown ids, which is
-        indistinguishable from a leg that landed.
+        indistinguishable from a leg that landed. Accepts either leg's
+        identity, so the caller does not have to know which channel it is
+        draining.
         """
-        return req_id in self._need
+        return self._resolve(ident) in self._need
 
     def take_ready(self) -> tuple[set[str], set[str]]:
         ready, failed = set(self._ready), set(self._ready_failed)

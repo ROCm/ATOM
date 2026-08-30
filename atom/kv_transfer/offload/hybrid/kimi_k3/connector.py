@@ -184,6 +184,18 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
         Both legs surface on the KV completion channel, so an id in both would
         collapse into one wake and resume the suffix prefill while the other
         transfer is still writing.
+
+        **The two legs do not report the same identity.** The KV worker reports
+        `_load_completion_id(req)`, which is `req.load_operation` whenever the
+        scheduler issued one -- and `build_connector_meta` issues one for every
+        load, so in practice it is always the typed `LoadOperationId`. The state
+        tier is keyed by request and reports the bare id. Arming under the bare
+        id therefore parked nothing the KV leg could ever settle: `waits_for`
+        was false for the `LoadOperationId`, the KV completion passed straight
+        through, and the engine could resume the suffix prefill while the state
+        H2D was still writing the Active Slot -- silent wrong output, and a park
+        entry leaked per joint load. The park is filed under the KV identity,
+        which is also the one that has to reach the engine.
         """
         loads = getattr(metadata, "state_loads", None) or ()
         state_ids = {req_id for req_id, _h, _slot in loads}
@@ -191,7 +203,12 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
             return
         for req in metadata.requests:
             if req.load_spec is not None and req.req_id in state_ids:
-                self._joint_park.arm(req.req_id, needs_kv=True, needs_state=True)
+                self._joint_park.arm(
+                    req.req_id,
+                    needs_kv=True,
+                    needs_state=True,
+                    kv_id=self._load_completion_id(req),
+                )
 
     def _start_state_loads(self, metadata) -> None:
         """Hand this step's state loads to the tier's executor.

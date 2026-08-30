@@ -57,8 +57,10 @@ from atom.kv_transfer.offload.hybrid.dsv4.policy import (
 from atom.kv_transfer.offload.hybrid.kimi_k3.connector import (
     SAVE_STALL_SECONDS,
     STATE_INDEX_CHANNEL,
+    KimiK3OffloadConnector,
     KimiK3OffloadScheduler,
 )
+from atom.kv_transfer.offload.hybrid.kimi_k3.state_tier import _JointPark
 from atom.kv_transfer.offload.metadata import (
     ATOMRawBytesLMCacheMetadata,
     LMCacheOffloadMetadata,
@@ -5084,3 +5086,102 @@ def test_the_shells_no_impl_fallbacks_match_what_the_caller_unpacks():
     assert shell.load_finished(None) is True
     # Unchanged, so a connector with no opinion does not shrink the chunk.
     assert shell.adjust_prefill_chunk_after_alloc(None, 7) == 7
+
+
+# ── kimi_k3: the two joint legs report different identities ───────────────
+
+
+def _k3_worker() -> KimiK3OffloadConnector:
+    """Only what the joint overrides touch. `_state_tier` is a sentinel object
+    because `get_finished` refuses to run its state half without one."""
+    c = KimiK3OffloadConnector.__new__(KimiK3OffloadConnector)
+    c._joint_park = _JointPark()
+    c._state_tier = None
+    c._do_load = True
+    return c
+
+
+def _k3_load_req(req_id: str, generation: int = 0):
+    """A load request shaped like `build_connector_meta`'s: it always attaches a
+    `load_operation`, which is what makes the KV leg report the typed id."""
+    return SimpleNamespace(
+        req_id=req_id,
+        load_spec=object(),
+        load_operation=LoadOperationId(req_id, generation),
+    )
+
+
+class TestJointLegsShareOneCompletionIdentity:
+    """The KV leg reports `LoadOperationId`, the state tier reports the bare id.
+
+    Arming under the bare id parked nothing the KV leg could settle: the KV
+    completion passed straight through and the engine could resume the suffix
+    prefill while the state H2D was still writing the Active Slot. These pin
+    the identity down with a real `LoadOperationId`, not two raw ids.
+    """
+
+    def test_a_park_armed_with_a_kv_id_answers_to_both_legs(self):
+        park = _JointPark()
+        kv_id = LoadOperationId("r1", 3)
+        park.arm("r1", needs_kv=True, needs_state=True, kv_id=kv_id)
+        assert park.waits_for(kv_id)
+        assert park.waits_for("r1")
+
+    def test_the_kv_leg_alone_does_not_wake_the_request(self):
+        worker = _k3_worker()
+        req = _k3_load_req("r1")
+        meta = SimpleNamespace(state_loads=[("r1", 99, 0)], requests=[req])
+        worker._arm_joint_loads(meta)
+
+        # Exactly what the dense worker puts on the wire for this load.
+        kv_report = {req.load_operation}
+        done, failed = worker._settle_joint(kv_report, set(), set(), set())
+        assert done == set(), "KV must not pass through while state is in flight"
+        assert failed == set()
+
+    def test_both_legs_wake_it_once_under_the_kv_identity(self):
+        worker = _k3_worker()
+        req = _k3_load_req("r1")
+        worker._arm_joint_loads(
+            SimpleNamespace(state_loads=[("r1", 99, 0)], requests=[req])
+        )
+        worker._settle_joint({req.load_operation}, set(), set(), set())
+        done, failed = worker._settle_joint(set(), set(), {"r1"}, set())
+        # The engine matches `finished_loading` against the operation it issued,
+        # so the wake has to carry that identity, not the bare id.
+        assert done == {req.load_operation}
+        assert failed == set()
+        assert not worker._joint_park.waits_for("r1")
+
+    def test_either_leg_failing_fails_the_pair(self):
+        worker = _k3_worker()
+        req = _k3_load_req("r1")
+        worker._arm_joint_loads(
+            SimpleNamespace(state_loads=[("r1", 99, 0)], requests=[req])
+        )
+        worker._settle_joint({req.load_operation}, set(), set(), set())
+        done, failed = worker._settle_joint(set(), set(), set(), {"r1"})
+        assert done == set()
+        assert failed == {req.load_operation}
+
+    def test_the_park_does_not_leak_an_entry_per_joint_load(self):
+        worker = _k3_worker()
+        for i in range(4):
+            req = _k3_load_req(f"r{i}")
+            worker._arm_joint_loads(
+                SimpleNamespace(state_loads=[(req.req_id, 99, 0)], requests=[req])
+            )
+            worker._settle_joint({req.load_operation}, set(), {req.req_id}, set())
+        park = worker._joint_park
+        assert park._need == {}
+        assert park._alias == {}
+        assert park._alias_of == {}
+
+    def test_a_single_leg_request_still_passes_straight_through(self):
+        """Nothing armed it, so neither channel may be held back."""
+        worker = _k3_worker()
+        kv_only = LoadOperationId("r9", 0)
+        done, failed = worker._settle_joint({kv_only}, set(), set(), set())
+        assert done == {kv_only}
+        done, failed = worker._settle_joint(set(), set(), {"r8"}, set())
+        assert done == {"r8"}
