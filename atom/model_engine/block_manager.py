@@ -861,7 +861,22 @@ class BlockManager:
         # Pin the restore before fresh blocks can evict its checkpoint.
         state_holds = True
         if seq.has_per_req_cache and self.paged_state_checkpoints is not None:
-            state_holds = self._attach_state_slots(seq, hit_hash)
+            # The joint boundary, when there is one -- the same rule the fork
+            # branch below already used, and the PAGE branch did not.
+            #
+            # `hit_hash` is the hash at the HBM hit, and a joint boundary sits
+            # strictly above it by construction. Two ways that went wrong here:
+            # with `num_cached_blocks == 0` the loop never assigned `hit_hash`
+            # at all, so this took the `-1` cold-start exit and requested no
+            # state whatsoever; with a non-zero hit it restored the checkpoint
+            # covering `[0, hbm)`. Either way the KV leg then loaded to the
+            # joint boundary and `_claim_after_load` raised `num_cached_tokens`
+            # to it, so the forward resumed over a prefix the state does not
+            # cover. Silent wrong output, no exception.
+            joint_hash = seq.state_joint_boundary_hash
+            state_holds = self._attach_state_slots(
+                seq, joint_hash if joint_hash != -1 else hit_hash
+            )
         for _ in range(len(seq.block_table), self.num_pool_blocks(len(seq))):
             seq.block_table.append(self._fresh_block())
         seq.num_cached_tokens = num_cached_blocks * hbs
@@ -883,6 +898,29 @@ class BlockManager:
             )
         if seq.has_per_req_cache:
             seq._state_initialized_after_alloc = False
+        # A claimed joint boundary must have a state leg behind it. The two
+        # decisions are made in different places -- `can_allocate` picks the
+        # boundary, `_attach_state_slots` secures the state -- and every way
+        # they have disagreed so far ends the same way: the KV leg loads to the
+        # boundary, `_claim_after_load` claims it, and the forward runs over a
+        # prefix no state covers. This is the backstop that turns any such
+        # disagreement into a recompute instead, and it is deliberately a
+        # separate check from `state_holds` rather than folded into it: it
+        # holds even if the code above stops asking the right question.
+        if (
+            state_holds
+            and seq.has_per_req_cache
+            and seq.state_joint_boundary_hash != -1
+            and not self._state_leg_secured(seq)
+        ):
+            self.state_gate_lost_boundary += 1
+            logger.warning(
+                "state offload: a joint boundary was admitted for request %s "
+                "with no state restore or load behind it; disowning it. This "
+                "is a bug in the joint gate, not a cache miss.",
+                seq.id,
+            )
+            state_holds = False
         if not state_holds:
             # No state behind the boundary means it is not this request's
             # history. Disown it -- blocks stay claimed and the forward
@@ -891,6 +929,24 @@ class BlockManager:
             seq.num_cached_tokens = 0
             seq.state_joint_boundary_tokens = 0
             seq.state_joint_boundary_hash = -1
+
+    def _state_leg_secured(self, seq: Sequence) -> bool:
+        """Whether something will really put state behind this seq's boundary.
+
+        Exactly three ways that can be true, and they are the three exits
+        `_attach_state_slots` takes when it returns True with a boundary
+        claimed: a PAGE restore was queued, a fork source was adopted or read,
+        or a CPU load was requested. A cold start is not one of them -- it
+        returns True as well, which is correct with no boundary and wrong with
+        one.
+        """
+        if getattr(seq, "state_load_hash", -1) != -1:
+            return True  # a CPU load is in flight for it
+        if getattr(seq, "state_fork_src", -1) != -1:
+            return True  # a fork checkpoint is its source
+        if self.paged_state_checkpoints is None:
+            return False
+        return self.paged_state_checkpoints.restore_queued_for(seq.state_slot)
 
     def _attach_state_slots(self, seq: Sequence, hit_hash: int) -> bool:
         """Give `seq` its state slots, resuming from a checkpoint when one exists.

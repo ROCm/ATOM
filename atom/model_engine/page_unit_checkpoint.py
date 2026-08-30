@@ -314,6 +314,10 @@ class PageUnitCheckpointStore:
             layout_id=self.spec.layout_id,
         )
 
+    def restore_queued_for(self, dst_slot: int) -> bool:
+        """Whether a queued restore will write `dst_slot` on the next batch."""
+        return any(op.dst_slot == dst_slot for _cid, op in self._queued_restores)
+
     def begin_restore(
         self, prefix_hash: int, dst_slot: int
     ) -> CheckpointRestoreOp | None:
@@ -734,6 +738,14 @@ class PagedStateCheckpointCoordinator:
         for key in [k for k in self._pending if k[0] == seq_id]:
             del self._pending[key]
         self.store.cancel_queued_restore(seq.state_slot)
+
+    def restore_queued_for(self, dst_slot: int) -> bool:
+        """Whether a queued restore will write `dst_slot` on the next batch.
+
+        The evidence that a PAGE checkpoint really is behind a boundary the
+        request has claimed; see `BlockManager._state_leg_secured`.
+        """
+        return self.store.restore_queued_for(dst_slot)
 
     def begin_restore(self, h: int, dst_slot: int) -> bool:
         return self.store.begin_restore(h, dst_slot) is not None

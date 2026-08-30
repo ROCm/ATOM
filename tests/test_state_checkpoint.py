@@ -3544,3 +3544,83 @@ def test_checkpoint_funnel_includes_second_state_class():
     assert (
         funnel.get("checkpoints_dropped", 0) >= 2
     ), "checkpoints_dropped from SecondPoolStub missing from checkpoint_funnel()"
+
+
+# ── a claimed joint boundary must have a state leg behind it ───────────────
+
+
+class TestPagedAllocateAimsTheStateLegAtTheJointBoundary:
+    """`can_allocate` picks the boundary and `_attach_state_slots` secures the
+    state, and the PAGE branch of `allocate` used to hand it `hit_hash` -- the
+    hash at the *HBM* hit -- while the fork branch already used the joint one.
+
+    Both ways of getting that wrong end identically: the KV leg loads to the
+    boundary, `_claim_after_load` raises `num_cached_tokens` to it, and the
+    forward resumes over a prefix the recurrent state does not cover.
+    """
+
+    class _TierIndex:
+        def __init__(self, *hashes):
+            self.hashes = set(hashes)
+            self.pending_loads = {}
+            self.requested = []
+            self.can_store = True
+            self.can_load = True
+
+        def request_load(self, req_id, h):
+            if h not in self.hashes:
+                return False
+            self.pending_loads[req_id] = h
+            self.requested.append((req_id, h))
+            return True
+
+    def _bm(self, *tier_hashes):
+        bm = make_block_manager(paged_copy_config(), state_runtime=PAGED_COPY_RUNTIME)
+        index = self._TierIndex(*tier_hashes)
+        bm.state_offload = index
+        bm.paged_state_checkpoints.attach_offload(index)
+        return bm, index
+
+    def _joint_seq(self, bm, tokens, *, boundary_hash_value, claim_tokens):
+        seq = stateful_seq(list(tokens))
+        seq.state_joint_boundary_hash = boundary_hash_value
+        seq.state_joint_boundary_tokens = claim_tokens
+        seq.state_joint_claim_tokens = claim_tokens
+        return seq
+
+    def test_the_state_leg_is_aimed_at_the_boundary_not_the_hbm_hit(self):
+        """`num_cached_blocks == 0`, so `hit_hash` is never assigned and the
+        old code took the cold-start exit: no restore, no load, and a boundary
+        still claimed."""
+        bm, index = self._bm(4242)
+        seq = self._joint_seq(bm, range(48), boundary_hash_value=4242, claim_tokens=0)
+        bm.allocate(seq, 0)
+
+        assert index.requested == [
+            (seq.id, 4242)
+        ], "the state leg must be aimed at the joint boundary"
+        assert seq.state_joint_boundary_hash == 4242, "the boundary still stands"
+
+    def test_a_boundary_with_no_state_behind_it_is_disowned(self):
+        """The backstop. Whatever the gate decided, a request may not resume
+        over a prefix nothing put state behind."""
+        bm, _index = self._bm()  # the tier has nothing
+        seq = self._joint_seq(bm, range(48), boundary_hash_value=4242, claim_tokens=0)
+        before = bm.state_gate_lost_boundary
+        bm.allocate(seq, 0)
+
+        assert seq.state_joint_boundary_hash == -1
+        assert seq.state_joint_boundary_tokens == 0
+        assert seq.num_cached_tokens == 0
+        assert bm.state_gate_lost_boundary > before
+
+    def test_a_cold_start_without_a_boundary_is_untouched(self):
+        """The gate must not fire on the ordinary path: no boundary claimed,
+        so a cold slot is exactly right."""
+        bm, _index = self._bm()
+        seq = stateful_seq(list(range(48)))
+        before = bm.state_gate_lost_boundary
+        bm.allocate(seq, 0)
+
+        assert seq.state_slot >= 0
+        assert bm.state_gate_lost_boundary == before
