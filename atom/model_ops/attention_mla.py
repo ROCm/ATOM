@@ -1775,10 +1775,7 @@ class MLAAttention(nn.Module):
             device=q.device,
         )
 
-        # The paged kernels take their batch from the q-cums; cut them to a
-        # per-seq array the prefill builder left unpadded.
-        n_seqs = attn_metadata.kv_last_page_lens.shape[0]
-        paged_cu_seqlens_q = attn_metadata.cu_seqlens_q[: n_seqs + 1]
+        paged_cu_seqlens_q = attn_metadata.cu_seqlens_q
         paged_kv_indptr = attn_metadata.kv_indptr
         paged_kv_indices = attn_metadata.kv_indices
         kv_last_page_lens = attn_metadata.kv_last_page_lens
@@ -1799,6 +1796,16 @@ class MLAAttention(nn.Module):
                     : paged_cu_seqlens_q.shape[0]
                 ]
             max_q_len = 1
+        else:
+            # The paged kernels take their batch from the q-cums; cut them to
+            # the per-seq array the prefill builder left unpadded. Only this
+            # branch has one to cut to: the builder fills `kv_last_page_lens`
+            # for a drafter or a cached prefix, and leaves it None otherwise,
+            # sparse carrying its own per-QUERY lengths instead. Reading it
+            # before the split aborted all eight ranks on the first sparse
+            # prefill that had neither -- GLM-5.3-Flash with prefix caching off.
+            n_seqs = kv_last_page_lens.shape[0]
+            paged_cu_seqlens_q = paged_cu_seqlens_q[: n_seqs + 1]
 
         final_lse = None
         if kv_c_and_k_pe_cache.numel() > 0:
