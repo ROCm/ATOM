@@ -255,6 +255,7 @@ SLURM_LOG_ROOT="${SLURM_LOG_ROOT//\$\{USER\}/${CURRENT_USER}}"
 SLURM_LOG_ROOT="${SLURM_LOG_ROOT//\$USER/${CURRENT_USER}}"
 export LOG_ROOT="${SLURM_LOG_ROOT%/}/${ATOMESH_CELL_ID}-${GITHUB_RUN_ID:-local}-$(date +%Y%m%d%H%M%S)"
 export SLURM_JOB_NAME="${ATOMESH_CELL_ID}-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
+export SLURM_CANCEL_HELPER="${RESULT_DIR}/${ATOMESH_CELL_ID}.slurm-cancel.sh"
 if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
   export SLURM_OUTPUT="/tmp/atomesh-%j.out"
   export SLURM_ERROR="/tmp/atomesh-%j.err"
@@ -338,7 +339,7 @@ stream_spur_shared_logs_once() {
 if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
   SLURM_EXTRA_LOG_STREAMER=stream_spur_shared_logs_once
 fi
-source "${REPO_ROOT}/.github/scripts/atomesh/slurm_submit_helpers.sh"
+source "${REPO_ROOT}/.github/scripts/slurm_submit_helpers.sh"
 install_slurm_cancel_traps
 
 IFS=',' read -r -a NODE_ARRAY <<< "${NODE_LIST}"

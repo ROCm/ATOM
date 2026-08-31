@@ -294,6 +294,16 @@ def register_model() -> None:
         vllm_model_registry._try_load_model_cls.cache_clear()
         vllm_model_registry._try_inspect_model_cls.cache_clear()
 
+    # vLLM rejects Kimi-K3 DSpark under DCP while validating the speculative
+    # config. That validation runs later than this hook but earlier than any
+    # model is built, and unlike register_platform -- which vLLM invokes from
+    # inside its own import -- here vllm.engine is safe to import.
+    from atom.plugin.vllm.dspark_dcp_patch import (
+        apply_vllm_dspark_dcp_config_patch,
+    )
+
+    apply_vllm_dspark_dcp_config_patch()
+
     # patch attention process weights after loading
     # to avoid the specific handle in ATOM loader
     try:
@@ -328,6 +338,12 @@ def register_model() -> None:
     from atom.plugin.vllm.mori_patch import apply_vllm_mori_patch
 
     apply_vllm_mori_patch()
+
+    from atom.plugin.vllm.qwen35_attention_patch import (
+        apply_qwen35_vllm_attention_patch,
+    )
+
+    apply_qwen35_vllm_attention_patch()
     # Expose batch-ordered req_ids to ATOM metadata builders so the DeepSeek-V4
     # proxy can key state-slot allocation on the request id (host-resident)
     # instead of a D2H copy of the first block id.

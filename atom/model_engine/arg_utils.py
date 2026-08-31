@@ -59,10 +59,14 @@ class EngineArgs:
     long_prefill_token_threshold: int = 0
     attn_prefill_chunk_size: int = 16384
     state_checkpoint_interval_tokens: int = 8192
+    state_checkpoint_demand: bool = True
     enable_chunked_prefill: bool = True
     enable_dynamic_chunking: bool = False
     dynamic_chunking_smooth_factor: float = 0.75
     dynamic_chunking_min_chunk_size: int = 4096
+    enable_log_stats: bool = True
+    throughput_log_interval: float = 10.0
+    cache_hit_rate_window: int = 1000
     scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
     gpu_memory_utilization: float = 0.9
@@ -418,9 +422,29 @@ class EngineArgs:
                 "can resume there. "
                 "A prompt shorter than N publishes nothing, which is what keeps "
                 "the feature free on workloads that never reuse a prefix. Must "
-                "be a multiple of the prefix-cache hash block size; 0 disables "
-                "checkpoints entirely. Prefill chunks are aligned to these "
-                "positions, so this also quantizes chunk boundaries."
+                "be a multiple of the prefix-cache hash block size. Prefill "
+                "chunks are aligned to these positions, so this also quantizes "
+                "chunk boundaries. "
+                "0 disables state checkpointing entirely. -1 keeps it on but "
+                "places no interval rungs: checkpoints are then taken only "
+                "where a request is seen to want one and at each prompt's own "
+                "end, which is where agentic traffic actually resumes — every "
+                "rung costs the prompt that keeps it an extra prefill chunk, "
+                "and on measured traces the interval ladder is ~30x the writes "
+                "for reuse the other two placements already reach."
+            ),
+        )
+        parser.add_argument(
+            "--state-checkpoint-demand",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help=(
+                "Let a hit that was refused for want of a checkpoint place a "
+                "rung of its own. --no-state-checkpoint-demand leaves the "
+                "prompt-end anchor as the only placement. On measured traces a "
+                "demand is 47% of all checkpoint writes but reads back 2.8% of "
+                "the time, against 85.2% for an anchor, so the rung's write "
+                "traffic may cost more in evictions than its reuse is worth."
             ),
         )
         parser.add_argument(
@@ -459,6 +483,34 @@ class EngineArgs:
                 "Floor for solved chunk sizes. Every extra chunk rebuilds the "
                 "cached prefix again, so this bounds how much work shrinking adds."
             ),
+        )
+        parser.add_argument(
+            "--enable-log-stats",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="Log the periodic engine-status line (running/waiting reqs, "
+            "KV cache usage, prefix cache hit rate, prompt/generation "
+            "throughput; default: enabled). Use --no-enable-log-stats to "
+            "disable. Applies to offline LLM(...) as well as to the server. "
+            "Scoped to that line only: the [MTP Stats] and "
+            "[Cache Stats] lines have their own gates (--method mtp and "
+            "--enable-prefix-caching) and keep their own cadences.",
+        )
+        parser.add_argument(
+            "--throughput-log-interval",
+            type=float,
+            default=10.0,
+            help="Seconds between engine-status lines (default: 10, matching "
+            "vLLM). Must be > 0. Ignored when --no-enable-log-stats.",
+        )
+        parser.add_argument(
+            "--cache-hit-rate-window",
+            type=int,
+            default=1000,
+            help="Requests in the sliding window behind the engine-status "
+            "line's prefix cache hit rate (default: 1000, matching vLLM). "
+            "Must be > 0. Only the status line is windowed; /metrics and "
+            "[Cache Stats] stay cumulative.",
         )
         parser.add_argument(
             "--max-num-seqs",

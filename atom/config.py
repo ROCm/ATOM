@@ -47,6 +47,13 @@ class KVCacheTensor:
     # DSA sparse layers (GLM-5.2 / DeepSeek-V3.2): indexer key cache, block-major
     # ``(num_blocks, block_size, aligned_index_dim)``. Omitted for non-DSA layers.
     index_cache: torch.Tensor | None = None
+    # ReplaySSM record buffers for linear-attention layers: this layer's slice
+    # of the (k, u, g) pools.  None for every other attention type.  Carried
+    # here because the layer-id -> linear-attn-index mapping already lives in
+    # the builder's `build_kv_cache_tensor`.
+    replay_buf_k: torch.Tensor = None
+    replay_buf_u: torch.Tensor = None
+    replay_buf_g: torch.Tensor = None
 
 
 @dataclass
@@ -1502,10 +1509,20 @@ class Config:
     long_prefill_token_threshold: int = 0
     attn_prefill_chunk_size: int = 16384
     # Tokens between rungs of the state-checkpoint ladder, shared by every
-    # Pool.STATE class; 0 = no ladder. Must be a multiple of the prefix-cache
-    # hash block size (asserted in BlockManager). See
-    # BlockManager.checkpointers_at.
+    # Pool.STATE class. Must be a multiple of the prefix-cache hash block size
+    # (snapped, with a warning, in BlockManager).
+    #   >0  a rung every N tokens
+    #    0  state checkpointing off entirely
+    #   -1  no interval rungs, but the demand rung and the prompt-end anchor
+    #       still place checkpoints
+    # See BlockManager.checkpointers_at.
     state_checkpoint_interval_tokens: int = 8192
+    # Whether a refused hit may place a rung of its own. Off leaves the
+    # prompt-end anchor as the only placement; the rung reads back far less
+    # often than the anchor, so its worth is an open question — see
+    # `StateSlotPool.mark_speculative` for the measurement and
+    # `BlockManager._record_checkpoint_demand` for the placement.
+    state_checkpoint_demand: bool = True
     scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
     max_model_len: int | None = None
@@ -1533,6 +1550,12 @@ class Config:
     # Floor for solved chunks. Every extra chunk re-pays the cached-prefix
     # rebuild, so the floor is what bounds that amplification.
     dynamic_chunking_min_chunk_size: int = 4096
+    enable_log_stats: bool = True
+    # Seconds between engine-status lines. Validated > 0 by EngineStats.
+    throughput_log_interval: float = 10.0
+    # Requests in the sliding window behind the status line's prefix-cache hit
+    # rate. Validated > 0 by EngineStats.
+    cache_hit_rate_window: int = 1000
     port: int = 8006
     torch_profiler_dir: str | None = field(
         default_factory=lambda: envs.ATOM_TORCH_PROFILER_DIR
@@ -1550,7 +1573,6 @@ class Config:
     # sizes the process group and the token collectives.
     dp_logical_size: int = 0
     master_addr: str = "127.0.0.1"
-    graph_bs: list[int] | None = None
     enable_dp_attention: bool = False
     # DP request-routing strategy used by CoreManager to pick an engine rank:
     # "round_robin" | "least_requests" (default) | "least_tokens". Only has an
@@ -1639,17 +1661,22 @@ class Config:
         visible = torch.cuda.device_count()
         return visible if 0 < visible < tp else tp
 
-    def _set_cudagraph_sizes(self):
-        if self.compilation_config.cudagraph_capture_sizes:
-            self.graph_bs = self.compilation_config.cudagraph_capture_sizes
-        else:
-            cuda_graph_sizes = self.compilation_config.cuda_graph_sizes
-            if len(cuda_graph_sizes) == 1:
-                self.graph_bs = [1, 2, 4, 8] + [
-                    i for i in range(16, cuda_graph_sizes[0] + 1, 16)
-                ]
-            elif len(cuda_graph_sizes) > 1:
-                self.graph_bs = cuda_graph_sizes
+    @property
+    def capture_sizes(self) -> list[int]:
+        """The declared CUDAGraph capture ladder, in batch sizes.
+
+        Declared, not schedulable -- `ModelRunner` drops what its own token
+        budget can never produce, a bound needing the drafter's resolved
+        `mtp_k` that config cannot see. Returns a copy: the runner sorts and
+        filters in place.
+        """
+        declared = self.compilation_config.cudagraph_capture_sizes
+        if declared:
+            return list(declared)
+        sizes = self.compilation_config.cuda_graph_sizes
+        if len(sizes) == 1:
+            return [1, 2, 4, 8] + list(range(16, sizes[0] + 1, 16))
+        return list(sizes)
 
     def __post_init__(self):
         self.moe_backend = self.moe_backend.strip().lower()
@@ -1881,18 +1908,17 @@ class Config:
         # only for server mode or plugin mode(vllm)
         # for torch compile policy, plugin mode(vllm) uses the ATOM compile policy
         # for cuda graph capture, plugin mode(vllm) uses the vLLM's cuda graph capture policy
-        if not is_plugin_mode() or (
-            self.plugin_config is not None and self.plugin_config.is_vllm
-        ):
-            if self.compilation_config.level == CompilationLevel.PIECEWISE:
-                self.compilation_config.set_splitting_ops_for_v1()
-                self._set_cudagraph_sizes()
-                # Keep an explicit cudagraph_mode (e.g. FULL); default to
-                # PIECEWISE only when unset. splitting_ops/sizes are set either
-                # way so the model is still piece-split-compiled at level 3.
-                if self.compilation_config.cudagraph_mode is None:
-                    self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
-                self.compilation_config.init_with_cudagraph_sizes()
+        if (
+            not is_plugin_mode()
+            or (self.plugin_config is not None and self.plugin_config.is_vllm)
+        ) and self.compilation_config.level == CompilationLevel.PIECEWISE:
+            self.compilation_config.set_splitting_ops_for_v1()
+            # Keep an explicit cudagraph_mode (e.g. FULL); default to
+            # PIECEWISE only when unset. splitting_ops/sizes are set either
+            # way so the model is still piece-split-compiled at level 3.
+            if self.compilation_config.cudagraph_mode is None:
+                self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+            self.compilation_config.init_with_cudagraph_sizes()
 
         self.torch_dtype = (
             self.hf_config.dtype
