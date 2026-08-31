@@ -39,16 +39,23 @@ class StagedTransfer:
     constant, so a single object of a different size breaks both invariants.
     State is not a member of that loop.
 
-    **The cross-thread producer fence is the caller's, not this class's.**
-    Nothing here waits on the forward's compute stream: `pack` issues its
-    gather on a private `pack_stream`, and the two `_StagingBuffer` events only
-    order this worker's own streams against each other. The fence commit
-    7427e05e added to fix KV corruption on reload is recorded on the RPC thread
-    and `synchronize()`d by the caller -- `connector.py`'s `save_ready_event`
-    for KV, and `state_tier._do_spill`'s `ready_event.synchronize()` before
-    `codec.put` for state. Do not delete either believing this class covers it:
-    without them the gather reads the staging entry's previous occupant, which
-    is silent state corruption.
+    **This class does not fence the producer; the caller keeps the source
+    quiescent.** Nothing here waits on the forward's compute stream: `pack`
+    issues its gather on a private `pack_stream`, and the two `_StagingBuffer`
+    events only order this worker's own streams against each other. The two
+    callers make the source safe by different means:
+
+    * KV -- `connector.py` records the fence commit 7427e05e added to fix KV
+      corruption on reload on the RPC thread and `synchronize()`s it through
+      `save_ready_event` before handing the blocks over.
+    * State -- `state_tier.submit_store` needs no event: the PAGE units are
+      reserved out of the KV pool and engine-pinned for the whole transfer, so
+      nothing on the compute stream is writing them and the gather reads them
+      where they sit.
+
+    Do not delete the KV `save_ready_event` believing this class covers it:
+    without it the gather reads the staging entry's previous occupant, which is
+    silent corruption.
     """
 
     def __init__(
@@ -169,8 +176,10 @@ class StagedTransfer:
         The event around that copy makes the *consumer* side safe: whoever
         reads the MemoryObj next must not see a D2H still in flight. It says
         nothing about the *producer* side -- this gather runs on a private
-        stream and does not wait for the forward that wrote the entry. That
-        wait is the caller's (`state_tier._do_spill`); see the class docstring.
+        stream and does not wait for the forward that wrote the entry. Keeping
+        the source quiescent is the caller's job (KV via `save_ready_event`,
+        state via reserved-and-pinned units in `state_tier.submit_store`); see
+        the class docstring.
         """
         from atom.kv_transfer.offload.dense.triton_kv_staging import (
             fused_pack_chunk_major,

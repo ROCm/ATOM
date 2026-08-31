@@ -39,9 +39,10 @@ Merge strategy mirrors vLLM's ``MultiConnector``, adapted to ATOM's
 * ``get_finished`` — union the completion sets, **but** see the send/save
   pairing below.
 * ``_state_tier`` — the state offload tier, if a sub built one, re-exposed on
-  the composite. ``AttentionBackend._submit_state_spills`` reads this attribute
-  off whatever connector the forward context holds, so without it the engine's
-  spills are staged and never submitted.
+  the composite by ``_adopt_state_tier`` at ``register_kv_caches`` time (which
+  also refuses a config that lists two offload subs). Mirroring the sub's tier
+  on the composite keeps the attribute defined, so a probe for it resolves to
+  the real tier instead of raising ``AttributeError``.
 
 Send/save pairing (the one tricky correctness point)
 ----------------------------------------------------
@@ -241,9 +242,10 @@ class MultiConnector(KVConnectorBase):
         self._pending_save_ops: dict[str, set[SaveCompletionId]] = {}
         self._sent: dict[str, Any] = {}
         self._saved: dict[str, set[SaveCompletionId]] = {}
-        # The state tier of whichever sub owns one. Always defined:
-        # `_submit_state_spills` probes it every batch, and a composite without
-        # the attribute would swallow every spill and starve the ring.
+        # The state tier of whichever sub owns one. Adopted in
+        # `register_kv_caches` via `_adopt_state_tier`; set to None here so the
+        # attribute exists before the subs register -- a probe for it must
+        # resolve, not raise `AttributeError`.
         self._state_tier = None
 
     @property
