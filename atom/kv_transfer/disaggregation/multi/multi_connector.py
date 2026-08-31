@@ -425,6 +425,22 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
     # The scheduler guards every one of these with hasattr(), so MultiConnector
     # only needs to expose them when a sub-connector implements them.
 
+    @property
+    def chunk_size(self) -> int | None:
+        """The offload sub's KV transfer grid, in tokens.
+
+        `Scheduler._resolve_waiting_remote_kv` stamps
+        `seq.offload_kv_chunk_tokens` from `getattr(self.kv_connector,
+        "chunk_size", 0)`, and under `multi` `self.kv_connector` IS this
+        composite. Without this forwarder the getattr default (0) wins, so
+        `_joint_kv_boundary` sees a zero chunk grid and refuses every joint KV
+        load with `no_chunk_size` -- the K3 state tier's KV leg is silently off
+        under `kv_connector: multi`. Delegate to the one offload sub (at most
+        one hosts the tier, so "first" is "only").
+        """
+        c = _first_with(self._connectors, "chunk_size")
+        return getattr(c, "chunk_size", None) if c is not None else None
+
     def should_park_for_load_after_alloc(self, seq: Any) -> bool:
         c = _first_with(self._connectors, "should_park_for_load_after_alloc")
         return c.should_park_for_load_after_alloc(seq) if c is not None else False

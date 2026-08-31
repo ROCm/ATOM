@@ -85,6 +85,21 @@ class LMCacheOffloadConnector(KVConnectorBase):
     def __init__(self, config) -> None:
         self._impl = _build_worker(config)
 
+    @property
+    def _state_tier(self):
+        """Expose the implementation's KDA state tier through the shell.
+
+        `MultiConnector._adopt_state_tier` probes `_state_tier` on each
+        sub-connector to find the one offload backend that built a state tier.
+        Under the `multi` shell the sub IS this object, not the `kimi_k3` impl
+        behind `_impl`, so without this forwarder the probe reads None on every
+        member and the composite never adopts the tier that was actually built
+        -- state spills silently go nowhere. Mirrors the scheduler shell's
+        `chunk_size` forwarder and the "every probed member appears on the
+        shell" contract on `LMCacheOffloadConnectorScheduler`.
+        """
+        return getattr(self._impl, "_state_tier", None)
+
     def register_kv_caches(
         self, kv_caches, transfer_tensors=None, num_blocks=None
     ) -> None:
