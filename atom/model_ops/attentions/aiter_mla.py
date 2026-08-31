@@ -742,6 +742,20 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     ub_max_bs + 1,
                     **i32_kwargs,
                 )
+                # Owning request of each query token, numbered within the ubatch:
+                # the DCP top-k filter uses it to index this ubatch's block_tables.
+                # Refreshed per step in _prepare_ubatch_decode; seeded here so a
+                # CUDAGraph capture before the first real step sees a valid map.
+                var[f"{p}token_to_seq_idxs"] = CpuGpuBuffer(
+                    ub_max_bs * max_seqlen_qo,
+                    **i32_kwargs,
+                )
+                var[f"{p}token_to_seq_idxs"].cpu.copy_(
+                    torch.arange(ub_max_bs, dtype=torch.int32).repeat_interleave(
+                        max_seqlen_qo
+                    )
+                )
+                var[f"{p}token_to_seq_idxs"].copy_to_gpu()
 
             # MLA work buffers per ubatch (GPU only)
             var[f"{p}work_meta_data"] = torch.empty(
@@ -2357,6 +2371,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     "index_slot_mapping"
                 ].np[tok_start : tok_start + ub_real_tokens]
                 var[f"{p}index_slot_mapping"].np[ub_real_tokens:padded_tok_count] = -1
+            if self.is_sparse:
+                var[f"{p}token_to_seq_idxs"].np[:padded_tok_count] = np.repeat(
+                    np.arange(running_bs, dtype=np.int32), max_seqlen_q
+                )
 
             var[f"{p}block_tables"].np[:ub_real_reqs] = var["block_tables"].np[
                 req_start : req_start + ub_real_reqs
@@ -2428,6 +2446,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 vars_used.append((f"{p}g_kv_indptr", running_bs + 1))
             if self.is_sparse:
                 vars_used.append((f"{p}sparse_kv_indptr", running_bs + 1))
+                vars_used.append((f"{p}token_to_seq_idxs", padded_tok_count))
             if self.replicate_index_cache:
                 vars_used.append((f"{p}index_slot_mapping", padded_tok_count))
 
@@ -2661,6 +2680,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             reduce_partial_map=var[f"{p}reduce_partial_map"],
         )
         attn.dtype_q = self.dtype_q
+        if self.is_sparse:
+            attn.token_to_seq_idxs = var[f"{p}token_to_seq_idxs"].gpu[
+                : running_bs * max_q_len
+            ]
         if self.replicate_index_cache:
             attn.index_slot_mapping = var[f"{p}index_slot_mapping"].gpu[
                 : running_bs * max_q_len
@@ -2719,6 +2742,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             and attn_metadata.token_to_seq_idxs is not None
         ):
             ub_attn.token_to_seq_idxs = attn_metadata.token_to_seq_idxs[ts] - req_start
+
+        if getattr(attn_metadata, "index_slot_mapping", None) is not None:
+            # Absolute cache addresses, so a token slice needs no rebase. Its
+            # presence is also what selects the replicated index layout in the
+            # indexer -- dropping it would silently fall back to the sharded one.
+            ub_attn.index_slot_mapping = attn_metadata.index_slot_mapping[ts]
 
         total_tokens = (
             attn_metadata.slot_mapping.shape[0]
