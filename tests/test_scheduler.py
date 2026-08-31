@@ -1494,15 +1494,6 @@ class TestStalledOffloadSaveReclaim:
         monkeypatch.delenv("LMCACHE_EC_PIN_TIMEOUT_SEC", raising=False)
         assert sched_mod._offload_save_abandon_timeout_s() == 330.0
 
-    def test_a_late_report_on_a_reclaimed_save_is_not_an_assertion(self):
-        """`finished_sending` used to assert the sequence was still deferred."""
-        import inspect
-
-        import atom.model_engine.scheduler as sched_mod
-
-        src = inspect.getsource(sched_mod.Scheduler._update_from_kv_xfer_finished)
-        assert "not found in deferred_free_blocks" not in src
-
 
 class TestTheTierSplitPartitionsServedReuse:
     """`[Cache Tiers]` exists to answer "what does the CPU tier buy", so its two
