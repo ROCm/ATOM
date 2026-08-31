@@ -75,8 +75,15 @@ class FakeSchedSub:
             self.state_stores = []
             self.state_reports = (set(), set())
             self.state_source_releases = set()
+            self.pending_load = False
+            self.cancelled = []
 
     def get_num_new_matched_tokens(self, seq):
+        # Model the offload lookup's side effect: a matching prefix arms a load
+        # (LMCache pin + _load_specs) that update_state_after_alloc would later
+        # turn into a real recv. A miss arms nothing.
+        if self._offload and self._match[0] > 0:
+            self.pending_load = True
         return self._match
 
     def build_connector_meta(self):
@@ -106,6 +113,11 @@ class FakeSchedSub:
 
     def load_failed(self, req_id):
         self.load_failed_ids.append(req_id)
+
+    def cancel_pending_load(self, seq):
+        # Idempotent, like the real connector's `_load_lifecycles` guard.
+        self.cancelled.append(seq)
+        self.pending_load = False
 
     def process_completions(self, output):
         # Mirrors OffloadSchedulerMixin: apply the completions, then hand the
@@ -144,6 +156,7 @@ class FakeSchedSub:
             "should_defer_free",
             "save_finished",
             "load_failed",
+            "cancel_pending_load",
             "process_completions",
             "has_pending_work",
             "enqueue_state_loads",
@@ -245,6 +258,53 @@ def test_matched_tokens_earlier_connector_wins_over_later():
 def test_no_match_returns_zero():
     sched = _sched([FakeSchedSub(), FakeSchedSub()])
     assert sched.get_num_new_matched_tokens(object()) == (0, False)
+
+
+def test_losing_offload_sub_load_is_cancelled_when_another_sub_wins():
+    """Review #6b. The lookup arms a load; only the winner may keep it.
+
+    In `[moriio, lmcache_offload]`, moriio answers the match first, but the
+    offload sub's own lookup still armed a KV load for the same prefix. Because
+    `update_state_after_alloc` fans to every sub, that armed load would fire
+    into the same block table moriio is already filling -- a second writer plus
+    an unaccounted `finished_loading`. Once moriio wins, the composite must
+    cancel the offload sub's pending load.
+    """
+    moriio = FakeSchedSub(is_producer=True, match=(5, True))
+    off = FakeSchedSub(is_offload=True, offload_methods=True, match=(4, True))
+    seq = object()
+    sched = _sched([moriio, off])
+
+    assert sched.get_num_new_matched_tokens(seq) == (5, True)  # moriio wins
+    assert off.cancelled == [seq]  # its armed load was undone
+    assert off.pending_load is False
+
+
+def test_winning_offload_sub_keeps_its_load():
+    """The mirror: when the offload sub is the first match, its load is the one
+    that owns the block table, so it must NOT be cancelled."""
+    moriio = FakeSchedSub(is_producer=True, match=(0, False))
+    off = FakeSchedSub(is_offload=True, offload_methods=True, match=(4, True))
+    seq = object()
+    sched = _sched([moriio, off])
+
+    assert sched.get_num_new_matched_tokens(seq) == (4, True)  # offload wins
+    assert off.cancelled == []
+    assert off.pending_load is True
+
+
+def test_cancel_pending_load_forwards_to_offload_subs():
+    """The scheduler abandons a parked load by calling `cancel_pending_load` on
+    the connector it holds -- the composite under `multi`. With no forwarder the
+    offload sub never heard it and leaked the load; fan to every sub that arms
+    loads (idempotent, and moriio has no such method)."""
+    moriio = FakeSchedSub(is_producer=True)
+    off = FakeSchedSub(is_offload=True, offload_methods=True)
+    seq = object()
+    _sched([moriio, off]).cancel_pending_load(seq)
+
+    assert off.cancelled == [seq]
+    assert not hasattr(moriio, "cancel_pending_load")
 
 
 def test_update_and_finished_fan_out_to_all():

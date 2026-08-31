@@ -435,13 +435,52 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
     # -- base interface -----------------------------------------------------
 
     def get_num_new_matched_tokens(self, seq: Any) -> tuple[int, bool]:
-        """First-hit-wins: the first sub that reports a match owns the load."""
+        """First-hit-wins, and undo the losers' armed loads.
+
+        A sub's lookup is not side-effect-free: an offload sub arms a KV load
+        for any prefix it matches -- it takes an LMCache lookup pin, records a
+        `_load_specs` entry and a `_lookup_in_step` id, so `update_state_after_
+        alloc` (which the composite fans to *every* sub) later flips
+        `can_load=True` and recv-queues that request. Only the first matching
+        sub owns the load. If a second sub also matched -- moriio winning ahead
+        of the offload tier, or a dense offload shell ahead of the kimi_k3 one
+        -- the loser's armed load fires into the same block table on
+        `update_state_after_alloc`: a second writer over the winner's KV, plus a
+        `finished_loading` the scheduler never accounted. So once a winner is
+        chosen, cancel every other sub's pending load. `cancel_pending_load` is
+        idempotent and guarded by `_load_lifecycles`, so a sub that armed
+        nothing (a miss, or moriio which has no such method) is a no-op.
+        """
         result = (0, False)
+        winner = None
         for c in self._connectors:
             toks, needs_load = c.get_num_new_matched_tokens(seq)
-            if result[0] == 0 and toks > 0:
+            if winner is None and toks > 0:
                 result = (toks, needs_load)
+                winner = c
+        if winner is not None:
+            for c in self._connectors:
+                if c is not winner:
+                    fn = getattr(c, "cancel_pending_load", None)
+                    if callable(fn):
+                        fn(seq)
         return result
+
+    def cancel_pending_load(self, seq: Any) -> None:
+        """Forward a load cancellation to every sub that arms loads.
+
+        The scheduler calls this on `self.kv_connector` -- the composite under
+        `multi` -- when a parked load is abandoned (park timeout, request
+        finished before its transfer). Only offload subs implement it, and the
+        composite had no forwarder, so under `multi` the cancel never reached
+        the offload sub: its `_load_specs`/`_reqs_need_recv`/lookup pin leaked
+        and the abandoned request stayed recv-queued. Idempotent per sub (the
+        `_load_lifecycles` guard), so fanning to all is safe.
+        """
+        for c in self._connectors:
+            fn = getattr(c, "cancel_pending_load", None)
+            if callable(fn):
+                fn(seq)
 
     def build_connector_meta(self) -> MultiConnectorMetadata:
         return MultiConnectorMetadata(
