@@ -899,6 +899,40 @@ def test_lmcache_connector_maps_token_ranges_to_block_ids():
         )
 
 
+def test_dense_codec_rejects_per_request_state_by_default():
+    """A GDN model registered on the plain dense path drops its slot-indexed
+    recurrent state into kv_caches. The dense path cannot keep a restored KV
+    prefix aligned with that state, so the codec must fail closed rather than
+    skip it (which would register successfully and produce silent wrong
+    output). kimi_k3 opts in via permit_per_request_state=True to skip it,
+    because it owns a state tier that moves the state separately."""
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+
+    kv_caches = {
+        "l0": SimpleNamespace(
+            k_cache=torch.arange(6 * 2, dtype=torch.uint8).reshape(6, 2),
+            v_cache=torch.arange(6 * 2, dtype=torch.uint8).reshape(6, 2),
+            k_scale=None,
+            v_scale=None,
+        ),
+        "state": SimpleNamespace(
+            per_request_state=True,
+            state=torch.arange(4 * 5, dtype=torch.uint8).reshape(4, 5),
+        ),
+    }
+
+    with pytest.raises(ValueError, match="per-request recurrent state"):
+        DenseKVByteCodec(kv_caches)
+
+    # Opt in (kimi_k3): the state tensor is skipped, only the KV layer is moved.
+    codec = DenseKVByteCodec(kv_caches, permit_per_request_state=True)
+    assert len(codec._segments) == 2  # k_cache + v_cache, state excluded
+    assert codec.num_blocks == 6
+
+
 def test_lmcache_connector_maps_dcp_ranges_on_virtual_block_grid():
     import torch
 

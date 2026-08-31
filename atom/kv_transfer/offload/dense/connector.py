@@ -69,6 +69,13 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
     # producer semantic that would wrongly deallocate live offload blocks).
     # Executor plumbing + get_finished come from OffloadWorkerMixin.
 
+    # Whether a per-request recurrent-state tensor in the registered kv_caches is
+    # tolerated. The plain dense path has no rule keeping a restored KV prefix
+    # aligned with linear-attention state, so it must reject such a model
+    # (GDN: Qwen3-Next, MiniMax-M3, Qwen3.5) and fail fast. A hybrid connector
+    # that owns a state tier (kimi_k3) overrides this to True.
+    _permit_per_request_state = False
+
     def __init__(self, config) -> None:
         self._config = config
         self._init_worker_common(config)  # kv_role, executors, lock, tallies
@@ -94,7 +101,11 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         # num_blocks is the physical block count (num_physical_kvcache_blocks),
         # threaded from the model runner. MLA stores its KV token-major, so the
         # codec can't infer the block count from tensor.shape[0]; pass it.
-        self._codec = DenseKVByteCodec(kv_caches, num_blocks=num_blocks)
+        self._codec = DenseKVByteCodec(
+            kv_caches,
+            num_blocks=num_blocks,
+            permit_per_request_state=self._permit_per_request_state,
+        )
         # Shared opaque-uint8 engine build; the chunked GPU connector needs
         # cfg.chunk_size, so it's built inside the factory once cfg exists.
         self._engine, cfg, meta = build_offload_engine(

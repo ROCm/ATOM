@@ -53,6 +53,11 @@ SAVE_STALL_SECONDS = 120.0
 class KimiK3OffloadConnector(DenseOffloadConnector):
     """Worker side: dense KV, plus spill/load of the per-request state."""
 
+    # This connector owns a state tier and moves the per-request recurrent state
+    # through it, so the dense codec must SKIP the state tensor rather than
+    # reject it. The base rejects it (silent-wrong-output guard); we opt in here.
+    _permit_per_request_state = True
+
     def __init__(self, config) -> None:
         super().__init__(config)
         self._state_tier = None
