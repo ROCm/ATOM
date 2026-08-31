@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1788180726646,
+  "lastUpdate": 1788195572769,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -2323,6 +2323,57 @@ window.BENCHMARK_DATA = {
             "value": 0.7415,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/33391340897 | Threshold: 0.73 | Baseline: 0.75 | BaselineModel: meta-llama/Meta-Llama-3-8B-Instruct | BaselineNote: HF reports 0.796 but 8-shot CoT; CI uses 3-shot, not comparable | Docker: rocm/atom-dev:nightly_202608301440 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.7392 | fewshot: 3 | Model: /models/meta-llama/Meta-Llama-3-8B-Instruct"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "jasen",
+            "username": "Jasen2201",
+            "email": "yajizhan@amd.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "171de4553944a8bee86c587928e4afa1211d0448",
+          "message": "Log the KV transfer hot path at debug, not info (#2092)\n\nEvery per-request and per-step step of a PD KV transfer was logged at\ninfo: the consumer's write_request, the producer's receipt of it, the\nRDMA write itself, the per-rank and all-stage write-done notifications,\nstart_load_kv, get_finished, build_connector_meta, and the per-seq\nPD transition/first-decode/decode lines in the scheduler. At 48-way\nconcurrency and pp=4 that is ~36 lines per request on the consumer and\n~16 on the producer, which buries the startup and failure lines that\nactually need reading.\n\nMove those to debug. A one-hour 4842-request run drops from 403k to 25k\ndecode lines and from 599k to 228k prefill lines (of which 196k are\nLMCache's own pin-timeout and allocation warnings, not ours).\n\nStartup and registration lines stay at info, as do every warning, error\nand exception on the transfer paths. PD backpressure also stays at info\n— it reports a real stall — but now prints every 1000 schedule ticks\ninstead of every 100.",
+          "timestamp": "2026-08-31T13:47:56Z",
+          "url": "https://github.com/ROCm/ATOM/commit/171de4553944a8bee86c587928e4afa1211d0448"
+        },
+        "date": 1788195534925,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.9484,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/33413428249 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202608301440 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9484 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP accuracy (GSM8K)",
+            "value": 0.9492,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/33413428249 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202608301440 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9492 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP MTP acceptance (%)",
+            "value": 66.16,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/33413428249 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202608301440 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9492 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP avg toks/fwd (tok/fwd)",
+            "value": 2.98,
+            "unit": "tok/fwd"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.8749,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/33413428249 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202608301440 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.3071 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
