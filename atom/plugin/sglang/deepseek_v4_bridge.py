@@ -9,6 +9,12 @@ from typing import Any
 import numpy as np
 import torch
 
+from atom.model_ops.attentions.v4_pool_geometry import (
+    CSA_RATIO,
+    DENSE_RATIO,
+    HCA_RATIO,
+    WindowParams,
+)
 from atom.plugin.sglang.runtime.context import is_draft_extend_mode
 
 ATOM_DEEPSEEK_V4_BLOCK_SIZE = 128
@@ -21,8 +27,50 @@ except Exception:  # noqa: BLE001
 _V4_FP8_SUPPORTED_GFX = ("gfx950", "gfx1250")
 _V4_FP8_DOWNGRADE_WARNED = False
 _V4_SWA_DEST_RATIOS = (0, 4, 128)
+_CSA_ENVELOPE_ROWS = ATOM_DEEPSEEK_V4_BLOCK_SIZE // CSA_RATIO
 
 logger = logging.getLogger(__name__)
+
+
+class _PerLayerPoolGeometry:
+    """Address the SGLang proxy's independent per-layer cache planes.
+
+    Unlike native ATOM's interleaved multi-layer plane, every SGLang layer owns
+    one ``[compressed rows, window rows]`` view. Shared index builders still
+    need the same geometry surface, but each class therefore has one contiguous
+    ring after its own compressed rows.
+    """
+
+    __slots__ = ("block_size", "num_blocks", "ring_slots")
+
+    def __init__(self, *, num_blocks: int, ring_slots: int, block_size: int) -> None:
+        self.num_blocks = int(num_blocks)
+        self.ring_slots = int(ring_slots)
+        self.block_size = int(block_size)
+
+    @property
+    def classes(self) -> tuple[int, ...]:
+        return (DENSE_RATIO, CSA_RATIO, HCA_RATIO)
+
+    @property
+    def envelope_rows(self) -> int:
+        return max(1, self.block_size // HCA_RATIO)
+
+    def block_rows(self, ratio: int) -> int:
+        return (
+            self.block_size // ratio
+            if ratio in (CSA_RATIO, HCA_RATIO)
+            else 0
+        )
+
+    def window_params(self, ratio: int) -> WindowParams:
+        return WindowParams(
+            ring_start=self.num_blocks * self.block_rows(ratio),
+            slot_rows=self.ring_slots,
+            ring_slots=self.ring_slots,
+            ring_stride=self.ring_slots,
+            run_rows=self.ring_slots,
+        )
 
 
 def _resolve_v4_index_topk(model: Any = None, proxy_pool: Any = None) -> int:
@@ -143,12 +191,8 @@ def _warn_dsv4_fp8_downgrade(gfx: str | None) -> None:
 
 
 def _proxy_pool_geometry(proxy_pool: Any):
-    from atom.model_ops.attentions.v4_pool_geometry import UnifiedPoolGeometry
-
-    return UnifiedPoolGeometry(
-        proxy_pool.stage_ratios,
+    return _PerLayerPoolGeometry(
         num_blocks=proxy_pool.num_blocks,
-        num_slots=proxy_pool.num_slots,
         ring_slots=proxy_pool.swa_cache_size,
         block_size=ATOM_DEEPSEEK_V4_BLOCK_SIZE,
     )
@@ -166,7 +210,9 @@ def _resolve_v4_pool_geometry(md, proxy_pool, model=None):
         geometry = _proxy_pool_geometry(proxy_pool)
         proxy_pool._atom_v4_geometry = geometry
     md.pool_geometry = geometry
-    md.envelope_rows = int(geometry.envelope_rows)
+    # CSA cache views are per layer, so one physical block advances by that
+    # layer's 32 compressed rows. HCA helpers use geometry.envelope_rows (1).
+    md.envelope_rows = _CSA_ENVELOPE_ROWS
     return geometry
 
 
@@ -378,22 +424,6 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
                 num_pages = self.num_slots * self.swa_cache_size + self.num_blocks * k
 
                 nope_start = offset
-                swa_nope_bytes = (
-                    self.num_slots
-                    * self.swa_cache_size
-                    * ATOM_DEEPSEEK_V4_FP8_PACKED_DIM
-                )
-                swa_view = (
-                    self._take(offset, swa_nope_bytes)
-                    .view(fp8_dtype)
-                    .view(
-                        self.num_slots,
-                        self.swa_cache_size,
-                        ATOM_DEEPSEEK_V4_FP8_PACKED_DIM,
-                    )
-                )
-                offset += swa_nope_bytes
-
                 main_view = None
                 if ratio in (4, 128):
                     main_nope_bytes = (
@@ -417,6 +447,22 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
                     )
                     offset += main_nope_bytes
 
+                swa_nope_bytes = (
+                    self.num_slots
+                    * self.swa_cache_size
+                    * ATOM_DEEPSEEK_V4_FP8_PACKED_DIM
+                )
+                swa_view = (
+                    self._take(offset, swa_nope_bytes)
+                    .view(fp8_dtype)
+                    .view(
+                        self.num_slots,
+                        self.swa_cache_size,
+                        ATOM_DEEPSEEK_V4_FP8_PACKED_DIM,
+                    )
+                )
+                offset += swa_nope_bytes
+
                 unified.append(
                     self.raw_arena[nope_start:offset]
                     .view(fp8_dtype)
@@ -424,20 +470,6 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
                 )
 
                 rope_start = offset
-                swa_rope_bytes = (
-                    self.num_slots * self.swa_cache_size * self.qk_rope_head_dim * 2
-                )
-                swa_rope_view = (
-                    self._take(offset, swa_rope_bytes)
-                    .view(torch.bfloat16)
-                    .view(
-                        self.num_slots,
-                        self.swa_cache_size,
-                        self.qk_rope_head_dim,
-                    )
-                )
-                offset += swa_rope_bytes
-
                 main_rope_view = None
                 if ratio in (4, 128):
                     main_rope_bytes = self.num_blocks * k * self.qk_rope_head_dim * 2
@@ -454,6 +486,20 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
                         )
                     )
                     offset += main_rope_bytes
+
+                swa_rope_bytes = (
+                    self.num_slots * self.swa_cache_size * self.qk_rope_head_dim * 2
+                )
+                swa_rope_view = (
+                    self._take(offset, swa_rope_bytes)
+                    .view(torch.bfloat16)
+                    .view(
+                        self.num_slots,
+                        self.swa_cache_size,
+                        self.qk_rope_head_dim,
+                    )
+                )
+                offset += swa_rope_bytes
 
                 unified_rope.append(
                     self.raw_arena[rope_start:offset]
@@ -487,18 +533,13 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
                 continue
 
             layer_start = offset
-            swa_bytes = self.num_slots * self.swa_cache_size * self.head_dim * 2
-            swa_view = (
-                self._take(offset, swa_bytes)
-                .view(torch.bfloat16)
-                .view(self.num_slots, self.swa_cache_size, self.head_dim)
+            k = (
+                ATOM_DEEPSEEK_V4_BLOCK_SIZE // ratio
+                if ratio in (CSA_RATIO, HCA_RATIO)
+                else 0
             )
-            offset += swa_bytes
-            swa.append(swa_view)
-            swa_rope.append(None)
-
-            if ratio == 4:
-                k = ATOM_DEEPSEEK_V4_BLOCK_SIZE // 4
+            main = None
+            if k:
                 main_bytes = self.num_blocks * k * self.head_dim * 2
                 main = (
                     self._take(offset, main_bytes)
@@ -509,15 +550,29 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
                     )
                 )
                 offset += main_bytes
-                unified.append(
-                    self.raw_arena[layer_start:offset]
-                    .view(torch.bfloat16)
-                    .view(
-                        self.num_slots * self.swa_cache_size + self.num_blocks * k,
-                        self.head_dim,
-                    )
+
+            swa_bytes = self.num_slots * self.swa_cache_size * self.head_dim * 2
+            swa_view = (
+                self._take(offset, swa_bytes)
+                .view(torch.bfloat16)
+                .view(self.num_slots, self.swa_cache_size, self.head_dim)
+            )
+            offset += swa_bytes
+            swa.append(swa_view)
+            swa_rope.append(None)
+
+            unified.append(
+                self.raw_arena[layer_start:offset]
+                .view(torch.bfloat16)
+                .view(
+                    self.num_blocks * k + self.num_slots * self.swa_cache_size,
+                    self.head_dim,
                 )
-                unified_rope.append(None)
+            )
+            unified_rope.append(None)
+
+            if ratio == 4:
+                assert main is not None
                 idx_bytes = self.num_blocks * k * self.index_dim
                 idx = (
                     self._take(offset, idx_bytes)
@@ -532,33 +587,9 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
                 csa_main_rope.append(None)
                 csa_indexer.append(idx)
             elif ratio == 128:
-                k = ATOM_DEEPSEEK_V4_BLOCK_SIZE // 128
-                main_bytes = self.num_blocks * k * self.head_dim * 2
-                main = (
-                    self._take(offset, main_bytes)
-                    .view(torch.bfloat16)
-                    .as_strided(
-                        size=(self.num_blocks, k, self.head_dim),
-                        stride=(k * self.head_dim, self.head_dim, 1),
-                    )
-                )
-                offset += main_bytes
-                unified.append(
-                    self.raw_arena[layer_start:offset]
-                    .view(torch.bfloat16)
-                    .view(
-                        self.num_slots * self.swa_cache_size + self.num_blocks * k,
-                        self.head_dim,
-                    )
-                )
-                unified_rope.append(None)
+                assert main is not None
                 hca_main.append(main)
                 hca_main_rope.append(None)
-            else:
-                unified.append(
-                    swa_view.view(self.num_slots * self.swa_cache_size, self.head_dim)
-                )
-                unified_rope.append(None)
 
         return {
             "unified": unified,
