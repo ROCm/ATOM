@@ -22,6 +22,7 @@ from aiter.dist.parallel_state import (
     get_pcp_group,
     get_prefill_context_model_parallel_rank,
     get_prefill_context_model_parallel_world_size,
+    get_tp_group,
 )
 
 
@@ -57,6 +58,28 @@ def get_pcp_rank() -> int:
 
 def pcp_is_enabled() -> bool:
     return get_pcp_world_size() > 1
+
+
+def pcp_merged_tp_grid() -> Optional[tuple[int, int]]:
+    """`(size, rank)` of the pcp-folded TP grid, or None when the fold is off.
+
+    Lets a per-token module that is otherwise pcp-redundant shard on the same
+    `pcp_size * tp_size` grid FusedMoE already uses, so the existing tp
+    all_reduce + pcp reduce_scatter/all_reduce sum its partials for free.
+
+    The flatten must stay `pcp_rank * tp_size + tp_rank`, byte-identical to
+    `moe.py` `_make_parallel_config`: it gives each TP group a contiguous slice
+    and its PCP partner the next one. The reversed mapping overlaps partners and
+    double-counts.
+    """
+    from atom.utils import envs
+
+    pcp_size = get_pcp_world_size()
+    if pcp_size <= 1 or not bool(envs.ATOM_PCP_MOE_MERGE):
+        return None
+    tp_size = get_tp_group().world_size
+    tp_rank = 0 if tp_size == 1 else get_tp_group().rank_in_group
+    return pcp_size * tp_size, get_pcp_rank() * tp_size + tp_rank
 
 
 def pcp_pad_len(
