@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import triton
 import triton.language as tl
@@ -10,6 +9,7 @@ from aiter.dist.communication_op import tensor_model_parallel_all_gather
 from aiter.dist.parallel_state import get_dp_group, get_tp_group
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.tuned_gemm import tgemm
+from torch import nn
 
 from atom.model_ops.lm_head_argmax import lm_head_argmax_pack
 from atom.model_ops.utils import atom_parameter
@@ -282,7 +282,12 @@ class ParallelLMHead(VocabParallelEmbedding):
         # Pack (val, idx) as fp32 — idx < 2^24 is exact — and all-gather only the
         # per-rank reductions ([N, 2]) instead of the full logits.
         packed = lm_head_argmax_pack(logits, self.vocab_start_idx)
-        gathered = get_tp_group().all_gather(packed, dim=0).view(self.tp_size, -1, 2)
+        # Custom, like the logits path above: `graph_capture()` arms only that
+        # one, and a draft pass records this. The RCCL path is what made the
+        # head un-capturable on HIP at TP > 1.
+        use_custom = envs.ATOM_USE_CUSTOM_ALL_GATHER
+        gathered = get_tp_group().all_gather(packed, dim=0, use_custom=use_custom)
+        gathered = gathered.view(self.tp_size, -1, 2)
         winner = gathered[:, :, 0].argmax(dim=0)  # [N] winning rank (ties -> lowest)
         token = gathered[:, :, 1].gather(0, winner.unsqueeze(0)).squeeze(0)  # [N] fp32
         return token.to(torch.long)
@@ -303,6 +308,11 @@ class ParallelLMHead(VocabParallelEmbedding):
         Every DP rank must reach the SAME verdict from globally-synced state, or
         the fixed-size collective in `_dp_sharded_logits` deadlocks. The strategy
         (all-gather vs all2all) is read from ATOM_DP_LM_HEAD_MODE there.
+
+        `is_prefill` below is per-rank, which is safe only because
+        `running_tokens_are_unified` is the DP-reduced form of the same
+        question: a prefilling peer drives it False on every rank, so no rank
+        can answer True here while another answers False.
         """
         dp_group = get_dp_group()
         # Static: enabled, pure DP, vocab evenly shardable over a >1 DP group.
@@ -313,14 +323,15 @@ class ParallelLMHead(VocabParallelEmbedding):
             or self.num_embeddings % dp_group.world_size != 0
         ):
             return False
-        # Per-step: all ranks in an equal-length decode. Exclude draft (eagle
-        # keeps dp_uniform_decode=True despite ragged rows) and prefill (x is
-        # sliced to 1 row/seq, mismatching the token-count pad target).
+        # Per-step: all ranks at one height. `is_draft` is its own question,
+        # not shorthand for the flag below -- a drafter states uniformity per
+        # pass, so a draft arrives with either answer. Prefill is excluded
+        # because x is sliced to 1 row/seq, mismatching the pad target.
         if (
             context is None
             or getattr(context, "is_draft", False)
             or getattr(context, "is_prefill", False)
-            or not getattr(context, "dp_uniform_decode", False)
+            or not getattr(context, "running_tokens_are_unified", False)
         ):
             return False
         return get_forward_context().dp_metadata is not None

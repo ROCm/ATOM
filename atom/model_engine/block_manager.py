@@ -850,7 +850,7 @@ class BlockManager:
         # HBM is still `num_cached_blocks`, and the joint boundary only decides
         # where the two loads are aimed.
         self._joint_kv_boundary(seq, num_cached_blocks, block_hashes, record=record)
-        # Instrumentation: the pre-gate hit, so CacheStats can separate reuse
+        # Instrumentation: the pre-gate hit, so EngineStats can separate reuse
         # the gates declined (compressed_hit - num_cached_blocks) from reuse
         # lost to compressed eviction (everything above compressed_hit).
         seq.num_compressed_hit_blocks = compressed_hit
@@ -945,8 +945,7 @@ class BlockManager:
                 # actually claimed as cached, and drop any joint boundary that
                 # sits above them so the KV leg cannot resume over a gap.
                 claimed_tokens = i * hbs
-                if i < num_cached_blocks:
-                    num_cached_blocks = i
+                num_cached_blocks = min(num_cached_blocks, i)
                 if (
                     int(getattr(seq, "state_joint_boundary_tokens", 0) or 0)
                     > claimed_tokens
@@ -1608,7 +1607,7 @@ class BlockManager:
         second time with every ladder dense: how far would it have reached? What
         that recovers is reuse being declined only because nobody checkpointed
         there. What it does not recover is gone whatever anybody stores. The two
-        land in `num_wanted_hit_blocks` (which `CacheStats` splits the declined
+        land in `num_wanted_hit_blocks` (which `EngineStats` splits the declined
         reuse by) and `checkpoint_demand_pos` (which the ladder acts on).
 
         The demand is a rung of this seq's own, off the interval grid, and the

@@ -138,8 +138,8 @@ to pre-EAGLE-3.1 ATOM.
 
 ## Runtime acceptance stats
 
-ATOM's scheduler already emits per-window acceptance via the `SpecStats`
-class (`atom/model_engine/scheduler.py`). With
+ATOM's scheduler already emits per-window acceptance via the spec section of
+`EngineStats` (`atom/model_engine/engine_stats.py`). With
 `num_speculative_tokens=3`, a `[MTP Stats]` line appears every 1000 decode
 steps in the server log:
 

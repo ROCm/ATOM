@@ -161,25 +161,37 @@ def chunk_fused_fwd_kernel_vk(
 
     if USE_INITIAL_STATE:
         h0_p = h0 + (i_n * H + i_h) * V * K
-        p_h0_1 = tl.make_block_ptr(
-            h0_p, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0)
-        )
-        b_h1 += tl.load(p_h0_1, boundary_check=(0, 1)).to(tl.float32)
+        _p_h0_1_0 = (i_v * BV) + tl.arange(0, BV)
+        _p_h0_1_1 = (0) + tl.arange(0, 64)
+        b_h1 += tl.load(
+            h0_p + _p_h0_1_0[:, None] * (K) + _p_h0_1_1[None, :] * (1),
+            mask=(_p_h0_1_0[:, None] < (V)) & (_p_h0_1_1[None, :] < (K)),
+            other=0.0,
+        ).to(tl.float32)
         if K > 64:
-            p_h0_2 = tl.make_block_ptr(
-                h0_p, (V, K), (K, 1), (i_v * BV, 64), (BV, 64), (1, 0)
-            )
-            b_h2 += tl.load(p_h0_2, boundary_check=(0, 1)).to(tl.float32)
+            _p_h0_2_0 = (i_v * BV) + tl.arange(0, BV)
+            _p_h0_2_1 = (64) + tl.arange(0, 64)
+            b_h2 += tl.load(
+                h0_p + _p_h0_2_0[:, None] * (K) + _p_h0_2_1[None, :] * (1),
+                mask=(_p_h0_2_0[:, None] < (V)) & (_p_h0_2_1[None, :] < (K)),
+                other=0.0,
+            ).to(tl.float32)
         if K > 128:
-            p_h0_3 = tl.make_block_ptr(
-                h0_p, (V, K), (K, 1), (i_v * BV, 128), (BV, 64), (1, 0)
-            )
-            b_h3 += tl.load(p_h0_3, boundary_check=(0, 1)).to(tl.float32)
+            _p_h0_3_0 = (i_v * BV) + tl.arange(0, BV)
+            _p_h0_3_1 = (128) + tl.arange(0, 64)
+            b_h3 += tl.load(
+                h0_p + _p_h0_3_0[:, None] * (K) + _p_h0_3_1[None, :] * (1),
+                mask=(_p_h0_3_0[:, None] < (V)) & (_p_h0_3_1[None, :] < (K)),
+                other=0.0,
+            ).to(tl.float32)
         if K > 192:
-            p_h0_4 = tl.make_block_ptr(
-                h0_p, (V, K), (K, 1), (i_v * BV, 192), (BV, 64), (1, 0)
-            )
-            b_h4 += tl.load(p_h0_4, boundary_check=(0, 1)).to(tl.float32)
+            _p_h0_4_0 = (i_v * BV) + tl.arange(0, BV)
+            _p_h0_4_1 = (192) + tl.arange(0, 64)
+            b_h4 += tl.load(
+                h0_p + _p_h0_4_0[:, None] * (K) + _p_h0_4_1[None, :] * (1),
+                mask=(_p_h0_4_0[:, None] < (V)) & (_p_h0_4_1[None, :] < (K)),
+                other=0.0,
+            ).to(tl.float32)
 
     # ----- main chunk loop -----
     # Each chunk runs the recurrence step (kernel 5 work) and emits its
@@ -216,59 +228,83 @@ def chunk_fused_fwd_kernel_vk(
             b_h4_q = tl.trans(b_h4_bf)
 
         # K-tile 1
-        p_q1 = tl.make_block_ptr(
-            q_p, (T, K), (stride_q, 1), (i_t * BT, 0), (BT, 64), (1, 0)
-        )
         # b_k as (K, T) so that dot(b_q, b_k) -> [BT, BT].
-        p_k1 = tl.make_block_ptr(
-            k_p, (K, T), (1, stride_k), (0, i_t * BT), (64, BT), (0, 1)
+        _p_q1_0 = (i_t * BT) + tl.arange(0, BT)
+        _p_q1_1 = (0) + tl.arange(0, 64)
+        b_q1 = tl.load(
+            q_p + _p_q1_0[:, None] * (stride_q) + _p_q1_1[None, :] * (1),
+            mask=(_p_q1_0[:, None] < (T)) & (_p_q1_1[None, :] < (K)),
+            other=0.0,
         )
-        b_q1 = tl.load(p_q1, boundary_check=(0, 1))
-        b_k1 = tl.load(p_k1, boundary_check=(0, 1))
+        _p_k1_0 = (0) + tl.arange(0, 64)
+        _p_k1_1 = (i_t * BT) + tl.arange(0, BT)
+        b_k1 = tl.load(
+            k_p + _p_k1_0[:, None] * (1) + _p_k1_1[None, :] * (stride_k),
+            mask=(_p_k1_0[:, None] < (K)) & (_p_k1_1[None, :] < (T)),
+            other=0.0,
+        )
         # b_h1_q is [64, BV] in input dtype — fold into b_o ∈ [BT, BV] via
         # b_q1 @ b_h1_q which is [BT, 64] @ [64, BV] = [BT, BV].
         b_o += tl.dot(b_q1, b_h1_q)
         b_A += tl.dot(b_q1, b_k1)
 
         if K > 64:
-            p_q2 = tl.make_block_ptr(
-                q_p, (T, K), (stride_q, 1), (i_t * BT, 64), (BT, 64), (1, 0)
+            _p_q2_0 = (i_t * BT) + tl.arange(0, BT)
+            _p_q2_1 = (64) + tl.arange(0, 64)
+            b_q2 = tl.load(
+                q_p + _p_q2_0[:, None] * (stride_q) + _p_q2_1[None, :] * (1),
+                mask=(_p_q2_0[:, None] < (T)) & (_p_q2_1[None, :] < (K)),
+                other=0.0,
             )
-            p_k2 = tl.make_block_ptr(
-                k_p, (K, T), (1, stride_k), (64, i_t * BT), (64, BT), (0, 1)
+            _p_k2_0 = (64) + tl.arange(0, 64)
+            _p_k2_1 = (i_t * BT) + tl.arange(0, BT)
+            b_k2 = tl.load(
+                k_p + _p_k2_0[:, None] * (1) + _p_k2_1[None, :] * (stride_k),
+                mask=(_p_k2_0[:, None] < (K)) & (_p_k2_1[None, :] < (T)),
+                other=0.0,
             )
-            b_q2 = tl.load(p_q2, boundary_check=(0, 1))
-            b_k2 = tl.load(p_k2, boundary_check=(0, 1))
             b_o += tl.dot(b_q2, b_h2_q)
             b_A += tl.dot(b_q2, b_k2)
         if K > 128:
-            p_q3 = tl.make_block_ptr(
-                q_p, (T, K), (stride_q, 1), (i_t * BT, 128), (BT, 64), (1, 0)
+            _p_q3_0 = (i_t * BT) + tl.arange(0, BT)
+            _p_q3_1 = (128) + tl.arange(0, 64)
+            b_q3 = tl.load(
+                q_p + _p_q3_0[:, None] * (stride_q) + _p_q3_1[None, :] * (1),
+                mask=(_p_q3_0[:, None] < (T)) & (_p_q3_1[None, :] < (K)),
+                other=0.0,
             )
-            p_k3 = tl.make_block_ptr(
-                k_p, (K, T), (1, stride_k), (128, i_t * BT), (64, BT), (0, 1)
+            _p_k3_0 = (128) + tl.arange(0, 64)
+            _p_k3_1 = (i_t * BT) + tl.arange(0, BT)
+            b_k3 = tl.load(
+                k_p + _p_k3_0[:, None] * (1) + _p_k3_1[None, :] * (stride_k),
+                mask=(_p_k3_0[:, None] < (K)) & (_p_k3_1[None, :] < (T)),
+                other=0.0,
             )
-            b_q3 = tl.load(p_q3, boundary_check=(0, 1))
-            b_k3 = tl.load(p_k3, boundary_check=(0, 1))
             b_o += tl.dot(b_q3, b_h3_q)
             b_A += tl.dot(b_q3, b_k3)
         if K > 192:
-            p_q4 = tl.make_block_ptr(
-                q_p, (T, K), (stride_q, 1), (i_t * BT, 192), (BT, 64), (1, 0)
+            _p_q4_0 = (i_t * BT) + tl.arange(0, BT)
+            _p_q4_1 = (192) + tl.arange(0, 64)
+            b_q4 = tl.load(
+                q_p + _p_q4_0[:, None] * (stride_q) + _p_q4_1[None, :] * (1),
+                mask=(_p_q4_0[:, None] < (T)) & (_p_q4_1[None, :] < (K)),
+                other=0.0,
             )
-            p_k4 = tl.make_block_ptr(
-                k_p, (K, T), (1, stride_k), (192, i_t * BT), (64, BT), (0, 1)
+            _p_k4_0 = (192) + tl.arange(0, 64)
+            _p_k4_1 = (i_t * BT) + tl.arange(0, BT)
+            b_k4 = tl.load(
+                k_p + _p_k4_0[:, None] * (1) + _p_k4_1[None, :] * (stride_k),
+                mask=(_p_k4_0[:, None] < (K)) & (_p_k4_1[None, :] < (T)),
+                other=0.0,
             )
-            b_q4 = tl.load(p_q4, boundary_check=(0, 1))
-            b_k4 = tl.load(p_k4, boundary_check=(0, 1))
             b_o += tl.dot(b_q4, b_h4_q)
             b_A += tl.dot(b_q4, b_k4)
 
         # Apply chunk-relative gating to the inter-chunk attn output and the
         # intra-chunk A. (Identical to chunk_fwd_kernel_o.)
         if USE_G:
-            p_g = tl.make_block_ptr(g_p, (T,), (stride_g,), (i_t * BT,), (BT,), (0,))
-            b_g = tl.load(p_g, boundary_check=(0,))
+            _p_g_0 = (i_t * BT) + tl.arange(0, BT)
+            b_g = tl.load(g_p + _p_g_0 * (stride_g), mask=(_p_g_0 < (T)), other=0.0)
             b_o = b_o * exp(b_g)[:, None]
             b_A = b_A * exp(b_g[:, None] - b_g[None, :])
 
@@ -283,19 +319,25 @@ def chunk_fused_fwd_kernel_vk(
         # running the recurrence so we use the same bytes for both: the
         # o-emit needs u for the intra-chunk piece, the recurrence needs
         # the (g-decayed, gated) version for b_h.
-        p_u = tl.make_block_ptr(
-            u_p, (T, V), (stride_u, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
+        _p_u_0 = (i_t * BT) + tl.arange(0, BT)
+        _p_u_1 = (i_v * BV) + tl.arange(0, BV)
+        b_u = tl.load(
+            u_p + _p_u_0[:, None] * (stride_u) + _p_u_1[None, :] * (1),
+            mask=(_p_u_0[:, None] < (T)) & (_p_u_1[None, :] < (V)),
+            other=0.0,
         )
-        b_u = tl.load(p_u, boundary_check=(0, 1))
 
         # Compose o_c: inter-chunk + intra-chunk causal, both scaled by 1/sqrt(K).
         b_o = b_o * scale + tl.dot(b_A.to(b_u.dtype), b_u) * scale
 
         # Write the chunk's output to HBM.
-        p_o = tl.make_block_ptr(
-            o_p, (T, V), (stride_o, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
+        _p_o_0 = (i_t * BT) + tl.arange(0, BT)
+        _p_o_1 = (i_v * BV) + tl.arange(0, BV)
+        tl.store(
+            o_p + _p_o_0[:, None] * (stride_o) + _p_o_1[None, :] * (1),
+            b_o.to(o_p.dtype.element_ty),
+            mask=(_p_o_0[:, None] < (T)) & (_p_o_1[None, :] < (V)),
         )
-        tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
         # === recurrence step: update S_BV ===
         # The mathematics matches chunk_gated_delta_rule_fwd_kernel_h_blockdim64_vk:
@@ -304,30 +346,42 @@ def chunk_fused_fwd_kernel_vk(
         #   3. b_h *= exp(g_last)                (per-chunk gate on prior state)
         #   4. b_h += k_c^T @ b_v_new            (rank-BT update)
         # Step 1: load w-chunk for each K-tile and accumulate b_v ∈ [BT, BV].
-        p_w1 = tl.make_block_ptr(
-            w_p, (T, K), (stride_w, 1), (i_t * BT, 0), (BT, 64), (1, 0)
+        _p_w1_0 = (i_t * BT) + tl.arange(0, BT)
+        _p_w1_1 = (0) + tl.arange(0, 64)
+        b_w1 = tl.load(
+            w_p + _p_w1_0[:, None] * (stride_w) + _p_w1_1[None, :] * (1),
+            mask=(_p_w1_0[:, None] < (T)) & (_p_w1_1[None, :] < (K)),
+            other=0.0,
         )
-        b_w1 = tl.load(p_w1, boundary_check=(0, 1))
         # b_h1 is [BV, 64]; w_chunk is [BT, 64]; want b_v ∈ [BT, BV] =
         # b_w @ b_h.T = [BT, 64] @ [64, BV].
         b_v = tl.dot(b_w1, tl.trans(b_h1).to(b_w1.dtype))
         if K > 64:
-            p_w2 = tl.make_block_ptr(
-                w_p, (T, K), (stride_w, 1), (i_t * BT, 64), (BT, 64), (1, 0)
+            _p_w2_0 = (i_t * BT) + tl.arange(0, BT)
+            _p_w2_1 = (64) + tl.arange(0, 64)
+            b_w2 = tl.load(
+                w_p + _p_w2_0[:, None] * (stride_w) + _p_w2_1[None, :] * (1),
+                mask=(_p_w2_0[:, None] < (T)) & (_p_w2_1[None, :] < (K)),
+                other=0.0,
             )
-            b_w2 = tl.load(p_w2, boundary_check=(0, 1))
             b_v += tl.dot(b_w2, tl.trans(b_h2).to(b_w2.dtype))
         if K > 128:
-            p_w3 = tl.make_block_ptr(
-                w_p, (T, K), (stride_w, 1), (i_t * BT, 128), (BT, 64), (1, 0)
+            _p_w3_0 = (i_t * BT) + tl.arange(0, BT)
+            _p_w3_1 = (128) + tl.arange(0, 64)
+            b_w3 = tl.load(
+                w_p + _p_w3_0[:, None] * (stride_w) + _p_w3_1[None, :] * (1),
+                mask=(_p_w3_0[:, None] < (T)) & (_p_w3_1[None, :] < (K)),
+                other=0.0,
             )
-            b_w3 = tl.load(p_w3, boundary_check=(0, 1))
             b_v += tl.dot(b_w3, tl.trans(b_h3).to(b_w3.dtype))
         if K > 192:
-            p_w4 = tl.make_block_ptr(
-                w_p, (T, K), (stride_w, 1), (i_t * BT, 192), (BT, 64), (1, 0)
+            _p_w4_0 = (i_t * BT) + tl.arange(0, BT)
+            _p_w4_1 = (192) + tl.arange(0, 64)
+            b_w4 = tl.load(
+                w_p + _p_w4_0[:, None] * (stride_w) + _p_w4_1[None, :] * (1),
+                mask=(_p_w4_0[:, None] < (T)) & (_p_w4_1[None, :] < (K)),
+                other=0.0,
             )
-            b_w4 = tl.load(p_w4, boundary_check=(0, 1))
             b_v += tl.dot(b_w4, tl.trans(b_h4).to(b_w4.dtype))
 
         # b_v ← b_u - (w @ S^T)   — the corrected delta value
@@ -340,10 +394,10 @@ def chunk_fused_fwd_kernel_vk(
             # Reload g for this chunk; same b_g as we computed for o above
             # — but we let the compiler decide whether to re-load or reuse.
             # (Triton can CSE this when the inputs are constant.)
-            p_g_recur = tl.make_block_ptr(
-                g_p, (T,), (stride_g,), (i_t * BT,), (BT,), (0,)
+            _p_g_recur_0 = (i_t * BT) + tl.arange(0, BT)
+            b_g_recur = tl.load(
+                g_p + _p_g_recur_0 * (stride_g), mask=(_p_g_recur_0 < (T)), other=0.0
             )
-            b_g_recur = tl.load(p_g_recur, boundary_check=(0,))
             b_g_last = tl.load(g_p + last_idx * stride_g)
             mask_chunk = (i_t * BT + tl.arange(0, BT)) < T
             b_v = b_v * tl.where(mask_chunk, exp(b_g_last - b_g_recur), 0)[:, None]
@@ -372,23 +426,37 @@ def chunk_fused_fwd_kernel_vk(
     # ----- epilogue: write final recurrent state -----
     if STORE_FINAL_STATE:
         ht_p = ht + (i_n * H + i_h) * V * K
-        p_ht1 = tl.make_block_ptr(ht_p, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0))
-        tl.store(p_ht1, b_h1.to(p_ht1.dtype.element_ty), boundary_check=(0, 1))
+        _p_ht1_0 = (i_v * BV) + tl.arange(0, BV)
+        _p_ht1_1 = (0) + tl.arange(0, 64)
+        tl.store(
+            ht_p + _p_ht1_0[:, None] * (K) + _p_ht1_1[None, :] * (1),
+            b_h1.to(ht_p.dtype.element_ty),
+            mask=(_p_ht1_0[:, None] < (V)) & (_p_ht1_1[None, :] < (K)),
+        )
         if K > 64:
-            p_ht2 = tl.make_block_ptr(
-                ht_p, (V, K), (K, 1), (i_v * BV, 64), (BV, 64), (1, 0)
+            _p_ht2_0 = (i_v * BV) + tl.arange(0, BV)
+            _p_ht2_1 = (64) + tl.arange(0, 64)
+            tl.store(
+                ht_p + _p_ht2_0[:, None] * (K) + _p_ht2_1[None, :] * (1),
+                b_h2.to(ht_p.dtype.element_ty),
+                mask=(_p_ht2_0[:, None] < (V)) & (_p_ht2_1[None, :] < (K)),
             )
-            tl.store(p_ht2, b_h2.to(p_ht2.dtype.element_ty), boundary_check=(0, 1))
         if K > 128:
-            p_ht3 = tl.make_block_ptr(
-                ht_p, (V, K), (K, 1), (i_v * BV, 128), (BV, 64), (1, 0)
+            _p_ht3_0 = (i_v * BV) + tl.arange(0, BV)
+            _p_ht3_1 = (128) + tl.arange(0, 64)
+            tl.store(
+                ht_p + _p_ht3_0[:, None] * (K) + _p_ht3_1[None, :] * (1),
+                b_h3.to(ht_p.dtype.element_ty),
+                mask=(_p_ht3_0[:, None] < (V)) & (_p_ht3_1[None, :] < (K)),
             )
-            tl.store(p_ht3, b_h3.to(p_ht3.dtype.element_ty), boundary_check=(0, 1))
         if K > 192:
-            p_ht4 = tl.make_block_ptr(
-                ht_p, (V, K), (K, 1), (i_v * BV, 192), (BV, 64), (1, 0)
+            _p_ht4_0 = (i_v * BV) + tl.arange(0, BV)
+            _p_ht4_1 = (192) + tl.arange(0, 64)
+            tl.store(
+                ht_p + _p_ht4_0[:, None] * (K) + _p_ht4_1[None, :] * (1),
+                b_h4.to(ht_p.dtype.element_ty),
+                mask=(_p_ht4_0[:, None] < (V)) & (_p_ht4_1[None, :] < (K)),
             )
-            tl.store(p_ht4, b_h4.to(p_ht4.dtype.element_ty), boundary_check=(0, 1))
 
 
 # ---------------------------------------------------------------------------

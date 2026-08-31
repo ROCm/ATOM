@@ -128,8 +128,8 @@ class Sequence:
         # The same hit asked counterfactually: how far it would have reached
         # with a state checkpoint at every boundary. Equal to the admitted hit
         # when nothing was lost to a missing checkpoint, so the difference is
-        # the reuse a checkpoint would have delivered — what CacheStats reports
-        # as recoverable.
+        # the reuse a checkpoint would have delivered — what the EngineStats
+        # cache section reports as recoverable.
         self.num_wanted_hit_blocks = 0
         # That gap as a prompt position, once it is worth a forward: the one
         # place off the checkpoint grid where this seq's prefill is cut so a
