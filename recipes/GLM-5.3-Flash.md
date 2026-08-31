@@ -10,8 +10,8 @@
 > processor that would let the server actually accept an image. See §8.
 
 ```bash
-python -m tools.glm5_3_flash.atom_run --model /models/GLM-5.3-Flash -tp 4 \
-    --kv-cache-dtype bf16 --enforce-eager --max-tokens 64
+python -m atom.examples.simple_inference --model /models/GLM-5.3-Flash -tp 4 \
+    --kv_cache_dtype bf16 --enforce-eager --max-tokens 64
 ```
 
 Needs an aiter with `chunk_kimi_delta_attn` and `mla_decode_fwd(causal=...)` —
@@ -115,16 +115,11 @@ plausible keys and a gsm8k score in the right range while still being wrong. The
 bit-exact suite for these ops exists on the parallel port's branch
 (`tests/models/test_glm5_next_kpool.py`) and should be brought across.
 
-To re-run the weights-based parity check you need the checkpoint and one GPU:
-
-```bash
-# transformers >= 5.16 is required for glm5_next; install --no-deps into a ROCm
-# image so pip does not replace ROCm torch with the CUDA wheel.
-pip install --no-cache-dir --no-deps \
-    "transformers==5.16.1" "tokenizers>=0.23.1,<0.24" "accelerate" \
-    "kernels==0.16.0" "kernels-data"
-python kpool_parity_atom.py   # see §5
-```
+That parity check ran against `transformers` on the real checkpoint during
+bring-up, on the reference harness described in §5. The harness is not carried
+in this tree — it needs `transformers>=5.16` for `glm5_next` while ATOM pins
+5.12.1 — so the standing guard in CI is the CPU unit test above; the weights
+comparison is a bring-up result, reproducible by rebuilding the harness.
 
 ## 4. Bugs found during bring-up
 
@@ -223,22 +218,30 @@ load.
 A working `transformers` reference on this hardware, for diffing the ATOM port
 against. Loads in ~131 s across 4× MI355X and generates coherent text.
 
-Artifacts (on the bring-up machine):
+**The harness itself is not in this tree.** It was bring-up scaffolding: it
+pins `transformers==5.16.1` against ATOM's 5.12.1, so it cannot even be
+imported from an ATOM environment, and most of it exists only to work around
+the gfx950 `finegrained-fp8` failure of §4b. What it established is recorded
+here and in §6. Rebuilding it takes four things, and the two that are not
+obvious are the reason this section exists:
 
-The harness lives in [`tools/glm5_3_flash/`](../tools/glm5_3_flash):
-
-| File | Purpose |
-| --- | --- |
-| `Dockerfile` | ROCm torch 2.10 + transformers 5.16.1 reference image (`glm53-ref:tf5161`) |
-| `ref_run.py` | loads the checkpoint, dumps oracle logits, generates |
-| `fp8_aiter_backend.py` | routes block-FP8 through `aiter.gemm_a8w8_blockscale` (default) |
-| `fp8_torch_fallback.py` | torch-only dequant bundle; slower, BF16 activations, cross-check |
-| `aiter_fp8_check.py` | aiter block-FP8 GEMM vs torch dequant on a real GLM weight |
-| `kpool_parity_atom.py` | ATOM k-pool op vs `transformers`, on real weights |
-
-Env knobs on `ref_run.py`: `GLM53_FP8_BACKEND=aiter|torch`, `GLM53_MAX_NEW_TOKENS`,
-`GLM53_FP8_VERIFY=1` (runs both backends every call and reports the first divergence
-with shapes and devices — how §4c was found).
+* **A separate image** — ROCm torch plus `transformers==5.16.1` and
+  `kernels==0.16.0`, installed `--no-deps` so pip does not replace ROCm torch
+  with the CUDA wheel. `glm5_next` does not exist in earlier transformers.
+* **A replacement for the `finegrained-fp8` hub kernel**, which does not
+  compile on gfx950 (§4b) and which every block-FP8 Linear and every MoE expert
+  goes through. Two work, and building *both* is the point: route block-FP8
+  through `aiter.gemm_a8w8_blockscale` — the same DeepSeek-style 128×128 kernel
+  the checkpoint wants, quantising the activation as its
+  `activation_scheme: dynamic` intends — or dequantise the weights and run a
+  plain torch matmul, which is slower and keeps BF16 activations. Running the
+  two against each other on every call, and reporting the first divergence with
+  shapes and devices, is how the aiter multi-GPU bug of §4c was found; neither
+  backend alone shows it.
+* **`device_map="auto"` over 4× MI355X**, and the §4c warning applies: without
+  that fix the model loads, runs, and emits NaN past the first device boundary.
+* **A fixed prompt, greedy**, with the logits dumped, so §6 has something to
+  diff against.
 
 Measured on 4× MI355X, 21-token prompt, greedy:
 
@@ -250,20 +253,6 @@ Measured on 4× MI355X, 21-token prompt, greedy:
 Both are far off what ATOM will do — this path is `device_map="auto"` pipeline
 parallelism with one GPU active at a time, eager attention, no paged KV, a Python
 loop over experts, and the dense k-pool indexer. It exists to be *correct*, not fast.
-
-On the bring-up machine: weights at `/raid/carhuang/models/GLM-5.3-Flash`
-(62 shards, 305.8 GiB, verified), oracle logits at
-`/raid/carhuang/glm53_out/ref_logits.pt` and `ref_top10.json`.
-
-```bash
-docker build -t glm53-ref:tf5161 tools/glm5_3_flash
-docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video \
-  --shm-size 64G --ipc=host --privileged -e HIP_VISIBLE_DEVICES=0,1,2,3 \
-  -v /raid/carhuang/models/GLM-5.3-Flash:/models/GLM-5.3-Flash:ro \
-  -v /raid/carhuang/glm53_out:/out \
-  -v $PWD/tools/glm5_3_flash:/w -w /w \
-  --entrypoint python3 glm53-ref:tf5161 -u ref_run.py
-```
 
 Reference next-token distribution for `"Give three reasons why the sky appears blue."`
 (21 tokens, chat template, greedy):
@@ -283,8 +272,10 @@ about Rayleigh scattering. Let me think about the actual scientific reasons.
 
 ## 6. Validation of the ATOM port
 
-**Per-layer hidden states vs the reference** (`compare_layers.py`), 21-token
-prompt, TP4, BF16 KV. Cosine of the mHC residual `[21, 4, 4096]` at each layer:
+**Per-layer hidden states vs the reference**, 21-token prompt, TP4, BF16 KV.
+ATOM's side comes from its own `ATOM_FWD_DUMP_DIR` block hooks; the reference
+side from the same prompt under per-decoder-layer hooks on the §5 harness.
+Cosine of the mHC residual `[21, 4, 4096]` at each layer:
 
 | layer | 0 | 3 | 7 | 11 | 19 | 27 | 35 | 43 | 44 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -301,20 +292,22 @@ Two traps worth knowing about when reproducing this:
   the *first* call, which is the warmup pass over 16384 dummy tokens. Comparing
   against that shows cosine 0.08 at layer 0 and looks like a catastrophic bug.
   Set `ATOM_FWD_DUMP_ONE_SHOT=0` and take the call whose row count equals the
-  prompt length; `compare_layers.py` does this.
+  prompt length.
 * **Teacher-forced rank-1 agreement is not a clean metric once trajectories
-  fork.** `score_atom_tokens.py` scores ATOM's generated tokens under the
-  reference. ATOM gets 67% rank-1 / mean p 0.58, against a baseline of 98.4% /
-  0.86 for the reference's own torch-FP8 output rescored with the aiter-FP8
+  fork.** Scoring ATOM's generated tokens under the reference — one forward
+  over `prompt + ATOM's own tokens`, asking at each position what probability
+  the reference gives the token ATOM picked — ATOM gets 67% rank-1 / mean
+  p 0.58, against a baseline of 98.4% / 0.86 for the reference's own torch-FP8
+  output rescored with the aiter-FP8
   backend. That gap is mostly an artifact: the baseline sequences never diverge,
   while ATOM's forks at position 4 — on `' why'` (p 0.63) vs `' about'` (p 0.11),
   a genuinely split distribution — and every later position is then scored
   against a prefix the reference would not have written. The per-layer cosines
   above are the load-bearing evidence, not this number.
 
-**Vision tower** (`atom/models/glm5_next_vl.py`, `vision_parity.py`). Loaded with
-the real `model.visual.*` weights and compared against `Glm5NextVisionModel` on
-the merged `[n_tokens, 4096]` output that gets scattered onto image placeholders:
+**Vision tower** (`atom/models/glm5_next_vl.py`). Loaded with the real
+`model.visual.*` weights and compared against `Glm5NextVisionModel` on the
+merged `[n_tokens, 4096]` output that gets scattered onto image placeholders:
 
 | dtype + attention | (1,2,2) | (1,4,4) | (1,8,12) | (2,4,4) |
 | --- | --- | --- | --- | --- |
