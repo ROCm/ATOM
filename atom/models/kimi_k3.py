@@ -53,6 +53,7 @@ from atom.model_ops.mamba_ops.causal_conv1d import (
 )
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.rotary_embedding import RotaryEmbedding
+from atom.model_ops.triton_fused_sigmoid_mul_quant import fused_sigmoid_mul_maybe_quant
 from atom.model_ops.utils import atom_parameter
 from atom.models.utils import (
     IntermediateTensors,
@@ -744,12 +745,14 @@ class KimiFullAttention(nn.Module):
         )
         self.input_quant_prefix = f"{prefix}.fused_qkv_a_proj"
         # Fuse sigmoid(g_proj) * attn_out + activation quant into one triton kernel
-        # when o_proj runs a8w8 per-token FP8 (ptpc_fp8): the fused kernel emits
-        # (fp8, scale) so o_proj skips its standalone quant.
+        # when o_proj runs FP8 in a scheme the fused kernel emits: per-token
+        # (ptpc_fp8) or per-1x128 block.
         o_type, o_dtype = _effective_layer_quant(quant_config, f"{prefix}.o_proj")
-        self.fuse_sigmoid_mul_quant = (
-            o_type == QuantType.per_Token and o_dtype == dtypes.fp8
+        self.fuse_sigmoid_mul_quant = o_dtype == dtypes.fp8 and o_type in (
+            QuantType.per_Token,
+            QuantType.per_1x128,
         )
+        self.o_proj_quant_type = o_type
 
     def forward(
         self, positions: torch.Tensor, hidden_states: torch.Tensor
@@ -798,19 +801,15 @@ class KimiFullAttention(nn.Module):
         )
         attn_out = self.attn(q, kv, k_rope, positions, q_scale=q_scale)
         gate = self.g_proj(hidden_states, hidden_states_scale)
-        if self.fuse_sigmoid_mul_quant:
-            from atom.model_ops.triton_fused_sigmoid_mul_quant import (
-                fused_sigmoid_mul_fp8_quant,
-            )
-
-            # sigmoid(gate) * attn_out + per-token fp8 quant in one kernel; the
-            # (fp8, scale) feeds o_proj's a8w8 per-token path directly.
-            attn_fp8, attn_scale = fused_sigmoid_mul_fp8_quant(
-                attn_out, gate, per_token=True
-            )
-            return self.o_proj(attn_fp8, x_scale=attn_scale)
-        attn_out = attn_out * torch.sigmoid(gate)
-        return self.o_proj(attn_out)
+        # sigmoid(gate) * attn_out, fused with fp8 quant when o_proj runs fp8
+        # (per-token ptpc_fp8 or per-1x128 block).
+        attn_out, attn_scale = fused_sigmoid_mul_maybe_quant(
+            attn_out,
+            gate,
+            quant=self.fuse_sigmoid_mul_quant,
+            quant_type=self.o_proj_quant_type,
+        )
+        return self.o_proj(attn_out, x_scale=attn_scale)
 
 
 def _kda_attention_with_output_fake(

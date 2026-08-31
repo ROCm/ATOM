@@ -5,12 +5,12 @@ single Triton kernel. The output can be passed directly to
 ``LinearBase.forward(x_fp8, x_scale=scale)`` to skip the internal quant step.
 """
 
+import aiter
 import torch
-from torch import Tensor
 import triton
 import triton.language as tl
-
-import aiter
+from aiter import QuantType
+from torch import Tensor
 
 fp8_dtype = aiter.dtypes.fp8
 
@@ -286,3 +286,44 @@ def fused_sigmoid_mul_fp8_quant(
         out_scale = out_scale.view(M, num_scale_cols)
 
     return out_fp8, out_scale
+
+
+def fused_sigmoid_mul_maybe_quant(
+    attn_output: Tensor,
+    gate: Tensor,
+    quant: bool = False,
+    quant_type: QuantType = QuantType.per_Token,
+    transpose_scale: bool | None = None,
+) -> tuple[Tensor, Tensor | None]:
+    """sigmoid(gate) * attn_output, optionally fused with FP8 quant.
+
+    Unifies the quant and non-quant paths behind one call site so the caller
+    always does ``o_proj(x, x_scale=scale)``:
+
+    - ``quant=False``: return ``(sigmoid(gate) * attn_output bf16, None)``. The
+      ``None`` scale makes ``o_proj(x, x_scale=None)`` fall back to its own
+      standalone activation quant.
+    - ``quant=True``: fuse sigmoid(gate) * attn_output + FP8 quant into one
+      Triton kernel and return ``(x_fp8, x_scale)`` for o_proj's ``x_scale=``
+      path. ``quant_type`` selects the scheme:
+      ``QuantType.per_Token`` -> a8w8 per-token scale ``[M, 1]`` (Kimi-K3 o_proj
+      under ptpc_fp8); ``QuantType.per_1x128`` -> per-1x128 block scales
+      (``transpose_scale`` controls their layout, as in
+      :func:`fused_sigmoid_mul_fp8_quant`).
+    """
+    if not quant:
+        return attn_output * torch.sigmoid(gate), None
+    if quant_type == QuantType.per_Token:
+        return fused_sigmoid_mul_fp8_quant(attn_output, gate, per_token=True)
+    if quant_type == QuantType.per_1x128:
+        return fused_sigmoid_mul_fp8_quant(
+            attn_output,
+            gate,
+            group_size=128,
+            transpose_scale=transpose_scale,
+            per_token=False,
+        )
+    raise ValueError(
+        f"fused_sigmoid_mul_maybe_quant: unsupported quant_type {quant_type}; "
+        "expected QuantType.per_Token or QuantType.per_1x128"
+    )
