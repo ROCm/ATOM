@@ -73,13 +73,21 @@ DEC_K = 256  # NUM_TOPK_TOKENS (must be a multiple of BLOCK_N=128)
 DEC_PAGE = 16  # runner physical block size
 
 
-def _build_decode_case(g_ctxs, max_blocks, seed):
-    """Random global top-k selections + block table for the given contexts."""
+def _build_decode_case(g_ctxs, max_blocks, seed, max_seqlen_q=1):
+    """Random global top-k selections + block table for the given contexts.
+
+    ``max_seqlen_q`` is the MTP verify width: a request contributes that many
+    query rows, each with its own top-k and its own context (a draft chain
+    extends the context by one per step). Rows then outnumber requests, and
+    ``token_to_seq_idxs`` is the only thing that resolves a row to a block
+    table -- at width 1 it degenerates to the identity the decode path had.
+    """
     gen = torch.Generator().manual_seed(seed)
     bs = len(g_ctxs)
 
-    # One query token per request, so the token -> request map is the identity.
-    token_to_seq_idxs = torch.arange(bs, dtype=torch.int32)
+    token_to_seq_idxs = torch.arange(bs, dtype=torch.int32).repeat_interleave(
+        max_seqlen_q
+    )
 
     # Physical blocks are deliberately shuffled so a wrong slot formula cannot
     # accidentally match a "logical == physical" identity mapping.
@@ -89,23 +97,27 @@ def _build_decode_case(g_ctxs, max_blocks, seed):
         .to(torch.int32)
     )
 
-    token_indices = torch.full((bs, DEC_K), -1, dtype=torch.int32)
-    for b, g in enumerate(g_ctxs):
-        n = min(g, DEC_K)
-        # distinct global positions in [0, g), in the indexer's (arbitrary) order
-        picks = torch.randperm(g, generator=gen)[:n]
-        token_indices[b, :n] = picks.to(torch.int32)
-    return token_to_seq_idxs, block_table, token_indices
+    ctxs = [g + j for g in g_ctxs for j in range(max_seqlen_q)]
+    token_indices = torch.full((len(ctxs), DEC_K), -1, dtype=torch.int32)
+    for t, ctx in enumerate(ctxs):
+        n = min(ctx, DEC_K)
+        # distinct global positions in [0, ctx), in the indexer's (arbitrary) order
+        picks = torch.randperm(ctx, generator=gen)[:n]
+        token_indices[t, :n] = picks.to(torch.int32)
+    return token_to_seq_idxs, block_table, token_indices, ctxs
 
 
-def _decode_reference(g_ctxs, block_table, token_indices, rank, interleave=1):
-    """Expected compacted slots per request, taken from the write side."""
+def _decode_reference(
+    ctxs, token_to_seq_idxs, block_table, token_indices, rank, interleave=1
+):
+    """Expected compacted slots per query row, taken from the write side."""
     out = []
-    for b, g in enumerate(g_ctxs):
-        n = min(g, DEC_K)
+    for t, ctx in enumerate(ctxs):
+        b = int(token_to_seq_idxs[t])
+        n = min(ctx, DEC_K)
         slots = []
         for c in range(n):
-            tok = int(token_indices[b, c])
+            tok = int(token_indices[t, c])
             if tok < 0:
                 continue
             # ownership AND placement both come from the writer
@@ -117,21 +129,27 @@ def _decode_reference(g_ctxs, block_table, token_indices, rank, interleave=1):
 
 
 @pytest.mark.parametrize(
-    "name, g_ctxs, seed",
+    "name, g_ctxs, max_seqlen_q, seed",
     [
-        ("short ctx (< topk)", [13], 1),
-        ("multi-request mixed", [13, 100, 7, 300], 2),
-        ("ctx > topk (clipped)", [1000, 4096], 3),
-        ("page boundary", [DEC_PAGE * DEC_W, DEC_PAGE * DEC_W + 1], 4),
+        ("short ctx (< topk)", [13], 1, 1),
+        ("multi-request mixed", [13, 100, 7, 300], 1, 2),
+        ("ctx > topk (clipped)", [1000, 4096], 1, 3),
+        ("page boundary", [DEC_PAGE * DEC_W, DEC_PAGE * DEC_W + 1], 1, 4),
         # ctx=2 with W=4 leaves ranks 2 and 3 owning nothing for that request.
-        ("zero-owned ranks", [2, 1], 5),
+        ("zero-owned ranks", [2, 1], 1, 5),
+        # MTP verify: rows outnumber requests, so the block table can only be
+        # reached through token_to_seq_idxs. Shuffled physical blocks make
+        # resolving a row against the wrong request land on the wrong KV.
+        ("mtp k=3", [37, 128, 5, 260], 4, 6),
+        ("mtp k=1, page boundary", [DEC_PAGE * DEC_W, 3], 2, 7),
     ],
 )
-def test_decode_filter(name, g_ctxs, seed):
-    bs = len(g_ctxs)
-    max_blocks = max(1, (max(g_ctxs) + DEC_PAGE * DEC_W - 1) // (DEC_PAGE * DEC_W)) + 1
-    token_to_seq_idxs, block_table, token_indices = _build_decode_case(
-        g_ctxs, max_blocks, seed
+def test_decode_filter(name, g_ctxs, max_seqlen_q, seed):
+    rows = len(g_ctxs) * max_seqlen_q
+    span = max(g_ctxs) + max_seqlen_q - 1  # the last draft row's context
+    max_blocks = max(1, (span + DEC_PAGE * DEC_W - 1) // (DEC_PAGE * DEC_W)) + 1
+    token_to_seq_idxs, block_table, token_indices, ctxs = _build_decode_case(
+        g_ctxs, max_blocks, seed, max_seqlen_q
     )
 
     t2s_g = token_to_seq_idxs.to(DEV)
@@ -140,13 +158,13 @@ def test_decode_filter(name, g_ctxs, seed):
 
     per_rank_lens = []
     for rank in range(DEC_W):
-        out_buf = torch.full((bs * DEC_K,), -999, dtype=torch.int32, device=DEV)
-        out_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=DEV)
-        counts = torch.zeros(bs, dtype=torch.int32, device=DEV)
+        out_buf = torch.full((rows * DEC_K,), -999, dtype=torch.int32, device=DEV)
+        out_indptr = torch.zeros(rows + 1, dtype=torch.int32, device=DEV)
+        counts = torch.zeros(rows, dtype=torch.int32, device=DEV)
 
         triton_filter_and_convert_dcp_index(
             t2s_g,
-            bs,
+            rows,
             bt_g,
             ti_g,
             rank,
@@ -159,23 +177,25 @@ def test_decode_filter(name, g_ctxs, seed):
         )
         torch.cuda.synchronize()
 
-        exp = _decode_reference(g_ctxs, block_table, token_indices, rank)
+        exp = _decode_reference(
+            ctxs, token_to_seq_idxs, block_table, token_indices, rank
+        )
         indptr = out_indptr.cpu().tolist()
         true_counts = counts.cpu().tolist()
 
-        for b in range(bs):
-            got_len = indptr[b + 1] - indptr[b]
-            assert true_counts[b] == len(exp[b])
-            assert got_len == max(len(exp[b]), 1), (
-                f"[{name}] rank{rank} req{b}: region length {got_len} "
-                f"!= metadata length {max(len(exp[b]), 1)}"
+        for t in range(rows):
+            got_len = indptr[t + 1] - indptr[t]
+            assert true_counts[t] == len(exp[t])
+            assert got_len == max(len(exp[t]), 1), (
+                f"[{name}] rank{rank} row{t}: region length {got_len} "
+                f"!= metadata length {max(len(exp[t]), 1)}"
             )
-        for b in range(bs):
-            got = out_buf[indptr[b] : indptr[b + 1]].cpu().tolist()
-            expected = exp[b] if exp[b] else [0]
-            assert got == expected, f"[{name}] rank{rank} req{b}: {got} != {expected}"
+        for t in range(rows):
+            got = out_buf[indptr[t] : indptr[t + 1]].cpu().tolist()
+            expected = exp[t] if exp[t] else [0]
+            assert got == expected, f"[{name}] rank{rank} row{t}: {got} != {expected}"
 
-        written = out_buf[: indptr[bs]]
+        written = out_buf[: indptr[rows]]
         assert (
             int((written < 0).sum()) == 0
         ), f"[{name}] rank{rank}: -1 hole inside the compacted region"
@@ -188,10 +208,10 @@ def test_decode_filter(name, g_ctxs, seed):
     # across ranks are expected and carry no information. Counts summing to n
     # rules out both dropped and double-claimed tokens, which is what
     # cp_lse_ag_out_rs needs.
-    for b, g in enumerate(g_ctxs):
-        n = min(g, DEC_K)
-        total = sum(per_rank_lens[rank][b] for rank in range(DEC_W))
-        assert total == n, f"[{name}] req{b}: kept {total} of {n} top-k tokens"
+    for t, ctx in enumerate(ctxs):
+        n = min(ctx, DEC_K)
+        total = sum(per_rank_lens[rank][t] for rank in range(DEC_W))
+        assert total == n, f"[{name}] row{t}: kept {total} of {n} top-k tokens"
 
 
 @pytest.mark.parametrize("interleave", [2, 4])  # both divide DEC_PAGE=16
@@ -206,7 +226,7 @@ def test_decode_filter_block_interleave(interleave, g_ctxs, seed):
     filter kernel's owner/offset math is pinned to the write side at S>1."""
     bs = len(g_ctxs)
     max_blocks = max(1, (max(g_ctxs) + DEC_PAGE * DEC_W - 1) // (DEC_PAGE * DEC_W)) + 1
-    token_to_seq_idxs, block_table, token_indices = _build_decode_case(
+    token_to_seq_idxs, block_table, token_indices, ctxs = _build_decode_case(
         g_ctxs, max_blocks, seed
     )
     t2s_g = token_to_seq_idxs.to(DEV)
@@ -235,7 +255,9 @@ def test_decode_filter_block_interleave(interleave, g_ctxs, seed):
         )
         torch.cuda.synchronize()
 
-        exp = _decode_reference(g_ctxs, block_table, token_indices, rank, interleave)
+        exp = _decode_reference(
+            ctxs, token_to_seq_idxs, block_table, token_indices, rank, interleave
+        )
         indptr = out_indptr.cpu().tolist()
         true_counts = counts.cpu().tolist()
         for b in range(bs):

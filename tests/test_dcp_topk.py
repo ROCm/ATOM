@@ -275,24 +275,30 @@ def test_reruns_stay_valid_even_when_the_set_shifts():
 # to a test that only inspects topk_indices.
 
 
-def _filter_owned(token_indices, ctx, rank, world, block_size=16):
+def _filter_owned(token_indices, ctx, rank, world, block_size=16, max_seqlen_q=1):
     """Run the production filter for one rank; return its owned GLOBAL positions.
 
     The kernel emits physical slots, so this rebuilds the slot->global mapping
     with an identity block_table, letting the test assert on positions.
+
+    ``max_seqlen_q`` groups the rows into MTP verify chains: a request owns that
+    many consecutive rows and one block table, so a row resolved against the
+    wrong request addresses another request's blocks.
     """
     from atom.model_ops.dcp_ops import triton_filter_and_convert_dcp_index
 
     rows = token_indices.shape[0]
+    assert rows % max_seqlen_q == 0
+    bs = rows // max_seqlen_q
     dev = token_indices.device
     vbs = block_size * world
     n_blocks = (ctx + vbs - 1) // vbs
-    block_table = torch.arange(rows * n_blocks, dtype=torch.int32, device=dev).reshape(
-        rows, n_blocks
+    block_table = torch.arange(bs * n_blocks, dtype=torch.int32, device=dev).reshape(
+        bs, n_blocks
     )
-    # One query token per request here, so the token -> request map is the
-    # identity; MTP is what makes it non-trivial.
-    token_to_seq_idxs = torch.arange(rows, dtype=torch.int32, device=dev)
+    token_to_seq_idxs = torch.arange(
+        bs, dtype=torch.int32, device=dev
+    ).repeat_interleave(max_seqlen_q)
     out_kv_indptr = torch.zeros(rows + 1, dtype=torch.int32, device=dev)
     owned_counts = torch.zeros(rows, dtype=torch.int32, device=dev)
     out = torch.zeros(rows * TOPK, dtype=torch.int32, device=dev)
@@ -318,28 +324,33 @@ def _filter_owned(token_indices, ctx, rank, world, block_size=16):
         s, e = int(out_kv_indptr[r]), int(out_kv_indptr[r + 1])
         slots = out[s:e]
         blk, off = slots // block_size, slots % block_size
-        g = (blk - r * n_blocks) * vbs + off * world + rank
+        g = (blk - (r // max_seqlen_q) * n_blocks) * vbs + off * world + rank
         per_row.append(g)
     return per_row
 
 
 @pytest.mark.parametrize(
-    "name, rows, ctx, world",
+    "name, rows, ctx, world, max_seqlen_q",
     [
-        ("ctx < topk (the regression case)", 4, 1000, 8),
-        ("ctx just over topk", 4, 2500, 8),
-        ("long ctx", 4, 32768, 8),
-        ("W=2", 4, 1000, 2),
+        ("ctx < topk (the regression case)", 4, 1000, 8, 1),
+        ("ctx just over topk", 4, 2500, 8, 1),
+        ("long ctx", 4, 32768, 8, 1),
+        ("W=2", 4, 1000, 2, 1),
+        # MTP verify: 4 rows are 1 request's draft chain, not 4 requests.
+        ("mtp k=3", 4, 1000, 8, 4),
+        ("mtp k=1, two requests", 4, 2500, 8, 2),
     ],
 )
-def test_filter_partitions_topk_disjointly(name, rows, ctx, world):
+def test_filter_partitions_topk_disjointly(name, rows, ctx, world, max_seqlen_q):
     gl = _make_logits(rows, ctx, seed=11)
     out, _ = _simulate(gl, ctx, world)
     expected = [set(out[r][out[r] >= 0].cpu().tolist()) for r in range(rows)]
 
     union = [set() for _ in range(rows)]
     for rank in range(world):
-        for r, g in enumerate(_filter_owned(out, ctx, rank, world)):
+        for r, g in enumerate(
+            _filter_owned(out, ctx, rank, world, max_seqlen_q=max_seqlen_q)
+        ):
             ids = set(g.cpu().tolist())
             assert all(
                 i % world == rank for i in ids
