@@ -403,12 +403,13 @@ models:
         # One concurrency per job keeps the prefix/state caches independent.
         - <<: &kimi_k3_agentic_tp8
             topology: 1p1d
+            display_topology: 1P1D-TP8-DSPARK7
             pd_worker_layout: multi_node
             nodes: "${ATOMESH_1P1D_NODES}"
             isl: [1048576]
             osl: 1024
             server:
-              common_args:
+              common_args: &kimi_k3_agentic_dspark7_args
                 gpu_memory_utilization: 0.88
                 max_num_seqs: 32
                 max_num_batched_tokens: 8192
@@ -437,10 +438,18 @@ models:
         - <<: *kimi_k3_agentic_tp8
           name: kimi-k3-mxfp4-1p1d-tp8-dspark7-agentic-1m-c4
           concurrency: [4]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_dspark7_args
+              state_checkpoint_slots: 64
+          env:
+            common:
+              ATOM_ENABLE_REPLAYSSM: "1"
 
         - &kimi_k3_agentic_dcp8_lmcache
           <<: *kimi_k3_agentic_tp8
           name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c8
+          display_topology: 1P1D-TP8-DCP8-DSPARK3
           concurrency: [8]
           server:
             common_args: &kimi_k3_agentic_dspark3_args
@@ -486,6 +495,7 @@ models:
         - &kimi_k3_agentic_no_dspark
           <<: *kimi_k3_agentic_dcp8_lmcache
           name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-state-1m-c32
+          display_topology: 1P1D-TP8-DCP8
           concurrency: [32]
           server:
             common_args: &kimi_k3_agentic_no_dspark_args
