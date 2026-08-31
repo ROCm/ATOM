@@ -213,7 +213,7 @@ def test_mooncake_rdma_auto_selects_from_physical_gpu(monkeypatch):
     assert mc._select_ib_device("rdma", "", 5) == "auto5"
 
 
-def test_mooncake_rdma_adds_alternate_hca_for_upper_rail_gpu(monkeypatch):
+def test_mooncake_rdma_registers_all_alternate_hcas_for_upper_rail_gpu(monkeypatch):
     mc = pytest.importorskip(
         "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
     )
@@ -225,11 +225,11 @@ def test_mooncake_rdma_adds_alternate_hca_for_upper_rail_gpu(monkeypatch):
         "",
         4,
         enable_alternate_hca=True,
-        rail_offset=4,
-    ) == ["ionic_4", "ionic_0"]
+        hca_count=8,
+    ) == ["ionic_4", *(f"ionic_{idx}" for idx in range(4)), *(f"ionic_{idx}" for idx in range(5, 8))]
 
 
-def test_mooncake_rdma_does_not_add_alternate_hca_for_lower_rail_gpu(monkeypatch):
+def test_mooncake_rdma_registers_all_alternate_hcas_for_lower_rail_gpu(monkeypatch):
     mc = pytest.importorskip(
         "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
     )
@@ -241,23 +241,43 @@ def test_mooncake_rdma_does_not_add_alternate_hca_for_lower_rail_gpu(monkeypatch
         "",
         3,
         enable_alternate_hca=True,
-        rail_offset=4,
-    ) == ["ionic_3"]
+        hca_count=8,
+    ) == ["ionic_3", "ionic_0", "ionic_1", "ionic_2", *(f"ionic_{idx}" for idx in range(4, 8))]
 
 
-def test_mooncake_rdma_rejects_nonpositive_rail_offset(monkeypatch):
+def test_mooncake_rdma_skips_missing_alternate_hcas(monkeypatch):
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    monkeypatch.setattr(mc, "_auto_select_ib_device", lambda idx: f"ionic_{idx}")
+    monkeypatch.setattr(
+        mc,
+        "_ib_device_exists",
+        lambda device: device in {"ionic_3", "ionic_0", "ionic_7"},
+    )
+
+    assert mc._select_ib_devices(
+        "rdma",
+        "",
+        3,
+        enable_alternate_hca=True,
+        hca_count=8,
+    ) == ["ionic_3", "ionic_0", "ionic_7"]
+
+
+def test_mooncake_rdma_rejects_nonpositive_hca_count(monkeypatch):
     mc = pytest.importorskip(
         "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
     )
     monkeypatch.setattr(mc, "_auto_select_ib_device", lambda idx: f"ionic_{idx}")
 
-    with pytest.raises(ValueError, match="ib_rail_offset"):
+    with pytest.raises(ValueError, match="ib_hca_count"):
         mc._select_ib_devices(
             "rdma",
             "",
             4,
             enable_alternate_hca=True,
-            rail_offset=0,
+            hca_count=0,
         )
 
 

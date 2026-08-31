@@ -127,7 +127,7 @@ def _select_ib_devices(
     phys_idx: int | None,
     *,
     enable_alternate_hca: bool = False,
-    rail_offset: int = 4,
+    hca_count: int = 8,
 ) -> list[str]:
     """Resolve the HCAs on which Mooncake registers this rank's GPU memory."""
     if protocol.strip().lower() == "tcp":
@@ -137,14 +137,15 @@ def _select_ib_devices(
     if phys_idx is None:
         raise ValueError("physical GPU index is required for RDMA device selection")
 
-    devices = [_auto_select_ib_device(phys_idx)]
+    primary = _auto_select_ib_device(phys_idx)
+    devices = [primary]
     if enable_alternate_hca:
-        if rail_offset <= 0:
-            raise ValueError("ib_rail_offset must be a positive integer")
-        if phys_idx >= rail_offset:
-            alternate = _auto_select_ib_device(phys_idx - rail_offset)
-            if alternate not in devices and _ib_device_exists(alternate):
-                devices.append(alternate)
+        if hca_count <= 0:
+            raise ValueError("ib_hca_count must be a positive integer")
+        for idx in range(hca_count):
+            device = _auto_select_ib_device(idx)
+            if device not in devices and _ib_device_exists(device):
+                devices.append(device)
     return devices
 
 
@@ -530,10 +531,9 @@ class MooncakeConnector(KVConnectorBase):
         # cannot activate an available HCA as an alternate path.
         # AMD GPU nodes pair GPU N with NIC N, but the HCA name is cluster
         # dependent: Spur MI350 exposes ionic_N while older setups used rdmaN.
-        # By default, register only with the local NIC. Rail-constrained
-        # clusters may opt into a second HCA so the remote peer can use a
-        # reachable same-rail NIC; initialization fails if that HCA cannot
-        # register this GPU's memory.
+        # By default, register only with the local NIC. Cross-rail PD may opt
+        # into registering on ionic_0..ionic_{N-1} so any remote rank can reach
+        # this GPU's buffers via a reachable HCA.
         _configure_mooncake_transport(self.protocol)
         configured_ib_device = kv_transfer_config.get(
             "ib_device", ""
@@ -541,7 +541,7 @@ class MooncakeConnector(KVConnectorBase):
         enable_alternate_hca = bool(
             kv_transfer_config.get("ib_enable_alternate_hca", False)
         )
-        rail_offset = int(kv_transfer_config.get("ib_rail_offset", 4))
+        hca_count = int(kv_transfer_config.get("ib_hca_count", 8))
         phys_idx: int | None = None
         if self.protocol.strip().lower() != "tcp" and not configured_ib_device:
             visible_idx = torch.cuda.current_device()
@@ -558,7 +558,7 @@ class MooncakeConnector(KVConnectorBase):
             configured_ib_device,
             phys_idx,
             enable_alternate_hca=enable_alternate_hca,
-            rail_offset=rail_offset,
+            hca_count=hca_count,
         )
         ib_device = ",".join(ib_devices)
         primary_ib_device = ib_devices[0] if ib_devices else ""

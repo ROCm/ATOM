@@ -391,7 +391,7 @@ models:
       prefill: {}
       decode:
         DECODE_KV_TRANSFER_CONFIG: >-
-          {"kv_role":"kv_consumer","kv_connector":"mooncake","proxy_ip":"${ROLE_IP}","handshake_port":6301,"ib_enable_alternate_hca":true,"ib_rail_offset":4}
+          {"kv_role":"kv_consumer","kv_connector":"mooncake","proxy_ip":"${ROLE_IP}","handshake_port":6301,"ib_enable_alternate_hca":true,"ib_hca_count":8}
     server:
       common_args:
         trust_remote_code: true
