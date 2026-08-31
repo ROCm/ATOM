@@ -551,6 +551,7 @@ class CoreManager:
                     self._record_ready_payload(data)
                     ready_received[dp_rank] = True
                     remaining -= 1
+                    poller.unregister(socket)
                 elif request_type == EngineCoreRequestType.SHUTDOWN:
                     raise RuntimeError(
                         f"{self.label}: Received unexpected SHUTDOWN signal from DP rank {dp_rank} during initialization"

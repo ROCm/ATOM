@@ -385,6 +385,7 @@ class EngineUtilityHandler:
                 "kv_blocks_free": kv_pool.num_free,
                 "kv_blocks_total": kv_pool.num_blocks,
                 "kv_blocks_indexed": kv_pool.num_indexed,
+                "block_size": self.scheduler.block_manager.block_size,
                 "mtp": mtp,
                 "cache": cache,
                 "offload": offload,
