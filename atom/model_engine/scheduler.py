@@ -3551,6 +3551,13 @@ class Scheduler:
             # `BlockPool` invariant -- so zeroing the count restores the record
             # exactly.
             bm.reclaim_stale_state_store_pins(_offload_save_abandon_timeout_s())
+            # Load-side twin of the same defence: `deallocate` parks a slot when
+            # it tears down a request whose state load is still in flight, on the
+            # promise that `settle_state_load` will hand it back. A crashed
+            # worker or dropped completion breaks that promise and the slot sits
+            # off the free list forever, wedging `can_allocate`'s state gate.
+            # Same window, same "cannot tell lost from slow" caveat as the pins.
+            bm.reconcile_orphan_load_slots(_offload_save_abandon_timeout_s())
 
     def get_request_counts(self) -> tuple[int, int]:
         """Returns (num_running_reqs, num_waiting_reqs)."""

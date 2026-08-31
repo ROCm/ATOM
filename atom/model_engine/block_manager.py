@@ -4,6 +4,7 @@
 import array
 import logging
 from math import inf, isinf
+from time import monotonic
 
 import numpy as np
 import xxhash
@@ -263,11 +264,21 @@ class BlockManager:
         self._joint_chunk_tokens = 0
         try:
             from atom.kv_transfer.offload import config as offcfg
+            from atom.model_engine.state_offload import _offload_subconfig
 
+            kvcfg = getattr(config, "kv_transfer_config", None) or {}
+            # Under `multi` the lmcache.* keys (chunk_size, offload_layout) live
+            # on the offload SUB-connector, not the composite. Passing the raw
+            # composite here read a zero chunk grid, and `_joint_kv_boundary`
+            # then refused every joint KV load with `no_chunk_size`. Unwrap the
+            # sub the same way `state_tier_capability` does, so the gate's chunk
+            # size and the tier the capability check builds stay consistent.
+            if isinstance(kvcfg, dict) and kvcfg.get("kv_connector") == "multi":
+                sub, _why = _offload_subconfig(kvcfg)
+                if sub is not None:
+                    kvcfg = sub
             self._joint_chunk_tokens = int(
-                offcfg.build_lmcache_config(
-                    getattr(config, "kv_transfer_config", None)
-                ).chunk_size
+                offcfg.build_lmcache_config(kvcfg).chunk_size
             )
         except Exception:
             # Blind on purpose: this runs at model load, the import reaches a
@@ -288,6 +299,16 @@ class BlockManager:
         # bytes landed. The slot is off the free list until the report comes
         # back; see `deallocate`.
         self._orphan_load_slots: dict = {}
+        # req_id -> monotonic stamp, parallel to `_orphan_load_slots`. The hold
+        # above trusts `settle_state_load` to "always come": it does not, if the
+        # worker that owed the report crashed or its completion was dropped. Then
+        # the slot sits off the free list forever and the state gate in
+        # `can_allocate` wedges the pool once every slot is stranded. This stamps
+        # the wait so `reconcile_orphan_load_slots` can reclaim it after the same
+        # abandon window the store pins use -- the load-side twin of
+        # `reclaim_stale_state_store_pins`.
+        self._orphan_load_slots_at: dict = {}
+        self._orphan_load_slots_reclaimed: int = 0
         # `kv_offload_enabled` is the whole switch: without a connector to
         # carry a transfer there is nothing beneath the pool, and a hash whose
         # KV left HBM could not be resumed from anyway.
@@ -1115,6 +1136,7 @@ class BlockManager:
             return
         self.state_offload.abandon_load(req_id)
         slot = self._orphan_load_slots.pop(req_id, None)
+        self._orphan_load_slots_at.pop(req_id, None)
         if slot is not None:
             self.state.release(slot)
 
@@ -1134,6 +1156,7 @@ class BlockManager:
         else:
             self.state_offload.fail_load(req_id)
         slot = self._orphan_load_slots.pop(req_id, None)
+        self._orphan_load_slots_at.pop(req_id, None)
         if slot is not None:
             self.state.release(slot)
 
@@ -1216,6 +1239,48 @@ class BlockManager:
         if self.paged_state_checkpoints is None:
             return 0
         return self.paged_state_checkpoints.reclaim_stale_offload_pins(timeout_s)
+
+    def reconcile_orphan_load_slots(self, timeout_s: float) -> int:
+        """Free load slots whose `settle_state_load` never came, after `timeout_s`.
+
+        The load-side twin of `reclaim_stale_state_store_pins`. `deallocate`
+        parks a slot in `_orphan_load_slots` when it tears down a request whose
+        state load is still in flight, on the promise that the worker reports
+        every load and `settle_state_load` will hand it back. A crashed worker
+        or a dropped completion breaks that promise, and the slot then sits off
+        the free list forever -- `can_allocate`'s state gate refuses new
+        per-request work once enough slots are stranded, wedging the pool with
+        no fault to point at.
+
+        **This is a last resort and cannot tell a lost report from a slow
+        worker still writing the slot** -- the same limitation the store-pin
+        twin documents. Reclaiming under a live H2D hands the next request a
+        buffer someone else is filling, with `has_initial_state` already true
+        over it. So the window must be the abandon timeout, not a tight one:
+        long enough that a report still in flight has already arrived. The
+        index leg was abandoned back in `deallocate`, so nothing here touches
+        it; a late report finds the slot already popped and releases nothing.
+        """
+        if timeout_s <= 0 or not self._orphan_load_slots_at:
+            return 0
+        cutoff = monotonic() - timeout_s
+        stale = [
+            req_id
+            for req_id, at in self._orphan_load_slots_at.items()
+            if at <= cutoff
+        ]
+        for req_id in stale:
+            self._orphan_load_slots_at.pop(req_id, None)
+            slot = self._orphan_load_slots.pop(req_id, None)
+            if slot is not None:
+                self.state.release(slot)
+            # The index leg was already abandoned in `deallocate` when the slot
+            # was parked; only the slot itself outlived the report. Do not touch
+            # the index again here -- a second `abandon_load` would double-count
+            # the miss. A late report that still calls in finds the slot popped
+            # and releases nothing.
+            self._orphan_load_slots_reclaimed += 1
+        return len(stale)
 
     def take_state_loads(self) -> list[tuple]:
         """`(req_id, hash, target_slot)` for loads admitted since the last call.
@@ -2196,6 +2261,7 @@ class BlockManager:
             # scratch is nobody's destination and goes back regardless.
             if seq.state_load_hash != -1 and self.state_offload is not None:
                 self._orphan_load_slots[seq.id] = seq.state_slot
+                self._orphan_load_slots_at[seq.id] = monotonic()
                 # Abandoned, not failed: an abort says nothing about the bytes,
                 # and forgetting the hash would cost the next request over this
                 # prefix a full recompute.
