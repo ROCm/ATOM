@@ -5096,10 +5096,11 @@ def _k3_worker(*, tier: bool = True) -> KimiK3OffloadConnector:
     """Only what the joint overrides touch.
 
     `_state_tier` is a truthy sentinel by default and never called: these tests
-    drive `_arm_joint_loads`/`_settle_joint` directly. It has to be present
-    because both refuse to coordinate a park without a tier -- with no tier the
-    state leg is unsettleable, so a KV-only passthrough is the correct
-    behaviour. `tier=False` exercises that path.
+    drive `_arm_joint_loads`/`_settle_joint` directly. A joint load is armed
+    with or without a tier -- with no tier the state leg is failed for recompute
+    (`_fail_state_loads`) and the park settles the pair into `failed_loading`
+    once the KV leg lands, rather than letting the KV leg pass through as a
+    phantom state-restore success. `tier=False` exercises that path.
     """
     c = KimiK3OffloadConnector.__new__(KimiK3OffloadConnector)
     c._joint_park = _JointPark()
@@ -5184,18 +5185,39 @@ class TestJointLegsShareOneCompletionIdentity:
         assert park._alias == {}
         assert park._alias_of == {}
 
-    def test_with_no_tier_the_kv_leg_is_not_parked_at_all(self):
-        """The state leg is unsettleable without a tier -- `_start_state_loads`
-        fails those loads for recompute -- so arming would leave the park owing
-        a KV leg forever and leak an entry per load. A KV-only passthrough is
-        what a load with no state leg should do."""
+    def test_with_no_tier_the_joint_load_fails_for_recompute(self):
+        """No tier means the state leg cannot be served, so the pair must reach
+        the engine as `failed_loading` (recompute), never as a phantom success.
+
+        Arming a joint load with no tier and then failing its state leg
+        (`_fail_state_loads`) leaves the park owing only the KV leg; when the KV
+        completion lands, `_settle_joint` releases the pair into `failed_loading`
+        -- and the park does not leak the entry, because that same KV completion
+        is what releases it. Skipping the arm instead let the KV leg pass through
+        as `finished_loading`, which `Scheduler._settle_state_load(ok=True)`
+        miscounts as a state restore that never happened."""
         worker = _k3_worker(tier=False)
         req = _k3_load_req("r1")
-        worker._arm_joint_loads(
-            SimpleNamespace(state_loads=[("r1", 99, 0)], requests=[req])
-        )
+        meta = SimpleNamespace(state_loads=[("r1", 99, 0)], requests=[req])
+        worker._arm_joint_loads(meta)
+        assert worker._joint_park.waits_for(req.load_operation)
+
+        # `_start_state_loads` on the no-tier path fails the state leg.
+        worker._start_state_loads(meta)
+        # The KV leg has not landed yet: the pair is still held, not passed.
+        done, failed = worker._settle_joint(set(), set(), set(), set())
+        assert done == set()
+        assert failed == set()
+        assert worker._joint_park.waits_for(req.load_operation)
+
+        # KV completion lands -> the pair resolves to failed, and nothing leaks.
+        done, failed = worker._settle_joint({req.load_operation}, set(), set(), set())
+        assert done == set(), "no phantom finished_loading with no tier"
+        assert failed == {req.load_operation}
         assert not worker._joint_park.waits_for(req.load_operation)
         assert worker._joint_park._need == {}
+        assert worker._joint_park._alias == {}
+        assert worker._joint_park._alias_of == {}
 
     def test_a_single_leg_request_still_passes_straight_through(self):
         """Nothing armed it, so neither channel may be held back."""

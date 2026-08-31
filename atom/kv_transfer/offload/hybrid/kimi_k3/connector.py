@@ -228,21 +228,24 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
         H2D was still writing the Active Slot -- silent wrong output, and a park
         entry leaked per joint load. The park is filed under the KV identity,
         which is also the one that has to reach the engine.
+
+        **No tier is armed exactly like a tier.** An earlier guard skipped the
+        arm when `_state_tier is None`, reasoning that an unsettleable state leg
+        left the park owing the KV leg forever. But `_start_state_loads` fails
+        these loads (`_fail_state_loads` -> `settle_state(ok=False)`), and with
+        the arm in place that failure lands on a real park entry -- the pair is
+        marked failed and owes only the KV leg. `get_finished` then drains the
+        park on the no-tier path too (before its `_state_tier is None` return),
+        so the KV completion settles the pair into `failed_loading` and the
+        request recomputes. Skipping the arm instead let the KV leg pass through
+        as `finished_loading`, and `Scheduler._settle_state_load(ok=True)`
+        counted a state restore that never happened -- silent wrong output. The
+        arm is what makes the failure reportable; the drain is what keeps it
+        from leaking (the KV completion always arrives and releases the entry).
         """
         loads = getattr(metadata, "state_loads", None) or ()
         state_ids = {req_id for req_id, _h, _slot in loads}
         if not state_ids or not self._do_load:
-            return
-        if self._state_tier is None:
-            # No tier means the state leg is unsettleable: `_start_state_loads`
-            # fails these loads for recompute, and `get_finished` returns at the
-            # `self._state_tier is None` guard BEFORE it drains the park via
-            # `_settle_joint`. Arming here would leave the park owing the KV leg
-            # forever -- the KV completion passes through un-held and the
-            # `_need`/`_alias`/`_alias_of` entry leaks, one per joint load per
-            # tier-None step. With no tier there is nothing to coordinate, so
-            # letting the KV load flow through the base path un-parked is exactly
-            # the correct behaviour for a KV-only load.
             return
         for req in metadata.requests:
             if req.load_spec is not None and req.req_id in state_ids:
@@ -325,6 +328,20 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
                 )
             self._store_failed_no_tier = set()
         if self._state_tier is None:
+            # Joint loads are still armed with no tier (see `_arm_joint_loads`)
+            # and their state leg has already failed (`_fail_state_loads`), so
+            # the park owes only the KV leg. Drain it here -- before the return
+            # -- with empty state reports (the tier that would produce them
+            # never built): a landed KV completion settles the pair into
+            # `failed_loading` and the request recomputes, instead of flowing
+            # through as `finished_loading` and being miscounted a state restore
+            # by `Scheduler._settle_state_load(ok=True)`. This is also what keeps
+            # the arm from leaking: the KV completion arrives and releases the
+            # entry. A state-only load (no KV leg) is not armed here and is
+            # instead reclaimed by `reconcile_orphan_load_slots`' abandon window.
+            out.finished_loading, out.failed_loading = self._settle_joint(
+                out.finished_loading, out.failed_loading, set(), set()
+            )
             return out
         indexed, index_failed = self._state_tier.take_store_reports()
         state_done, state_failed = self._state_tier.get_finished()
