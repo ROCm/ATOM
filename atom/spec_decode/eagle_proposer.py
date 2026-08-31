@@ -386,6 +386,13 @@ class EagleProposer(Drafter):
         cu_seqlens_q = var["cu_seqlens_q"].gpu[: running_bs + 1]
         attn_metadata.cu_seqlens_q = cu_seqlens_q
         attn_metadata.slot_mapping = slot_mapping
+        if getattr(builder, "replicate_index_cache", False):
+            # The replicated index cache has its own mapping, and the indexer
+            # picks it over slot_mapping -- it has to drop to one row per
+            # sequence here too. `prepare_mtp_decode` refreshes it per step.
+            attn_metadata.index_slot_mapping = builder.rebuild_draft_index_slots(
+                scheduled_bs, running_bs
+            )
         if has_flat_kv:
             kv_indptr = var["kv_indptr"].gpu[: running_bs + 1]
             kv_indices = var["kv_indices"].gpu

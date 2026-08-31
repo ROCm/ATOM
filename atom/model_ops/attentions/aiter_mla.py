@@ -469,9 +469,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 mla_metadata["index_slot_mapping"] = CpuGpuBuffer(
                     self.max_num_batched_tokens, **i64_kwargs
                 )
-                # CUDAGraph capture may execute cache writes before the first
-                # scheduled batch. Point those dummy writes at a valid slot.
-                mla_metadata["index_slot_mapping"].np.fill(0)
+                # -1 is the aiter cache kernels' skip sentinel; block 0 is a
+                # real allocatable block, so an unrefreshed row must not carry it.
+                mla_metadata["index_slot_mapping"].np.fill(-1)
                 mla_metadata["index_slot_mapping"].copy_to_gpu()
             mla_metadata["cu_seqlen_ke"] = CpuGpuBuffer(
                 self.max_num_batched_tokens, **i32_kwargs
@@ -721,7 +721,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     ub_max_bs * max_seqlen_qo,
                     **i64_kwargs,
                 )
-                var[f"{p}index_slot_mapping"].np.fill(0)
+                var[f"{p}index_slot_mapping"].np.fill(-1)
                 var[f"{p}index_slot_mapping"].copy_to_gpu()
             var[f"{p}block_tables"] = CpuGpuBuffer(
                 ub_max_bs, self.block_table_cols, **i32_kwargs
@@ -1069,6 +1069,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 sparse_decode=True,
             )
             result["sparse_kv_indptr"] = sparse_kv_indptr
+            index_slots = self.rebuild_draft_index_slots(bs, running_bs)
+            if index_slots is not None:
+                result["index_slot_mapping"] = index_slots
         else:
             # `bs`, not `running_bs`, and paired with `num_reject_tokens`: this count
             # becomes `cu_num`, and the update kernel loads
@@ -1406,7 +1409,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         var = self.model_runner.forward_vars
         if self.replicate_index_cache:
             if batch.is_dummy_run:
-                var["index_slot_mapping"].np[:sum_scheduled_tokens] = 0
+                var["index_slot_mapping"].np[:sum_scheduled_tokens] = -1
             else:
                 index_slots = [
                     self._replicated_index_slot(block_table, pos)
@@ -1943,6 +1946,33 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             + pos % expanded_page_size
         )
 
+    def rebuild_draft_index_slots(self, scheduled_bs: int, running_bs: int):
+        """Replicated index slots for an MTP draft step: one row per sequence.
+
+        The target step publishes one entry per verify token; a draft step runs
+        one row per sequence at the advanced ``context_lens``, so the mapping has
+        to be rebuilt rather than sliced. No owner filter -- the index cache is
+        replicated, so every rank writes every token. Padded rows get the skip
+        sentinel. Returns the rebuilt view, or None when replication is off.
+        """
+        if not self.replicate_index_cache:
+            return None
+        var = self.model_runner.forward_vars
+        expanded_page_size = self.model_runner.block_size * self.dcp_world_size
+        pos = var["context_lens"].gpu[:running_bs].to(torch.int64) - 1
+        page = (
+            var["block_tables"]
+            .gpu[:running_bs]
+            .gather(1, (pos // expanded_page_size).unsqueeze(1))
+            .squeeze(1)
+        )
+        slots = page.to(torch.int64) * expanded_page_size + pos % expanded_page_size
+        if running_bs > scheduled_bs:
+            slots[scheduled_bs:] = -1
+        out = var["index_slot_mapping"].gpu[:running_bs]
+        out.copy_(slots)
+        return out
+
     def prepare_decode(
         self,
         batch: ScheduledBatch,
@@ -2009,7 +2039,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         var["context_lens"].np[:scheduled_bs] = context_lens
         var["context_lens"].np[scheduled_bs:running_bs] = 0
         if self.replicate_index_cache:
-            var["index_slot_mapping"].np[:running_tokens] = 0
+            var["index_slot_mapping"].np[:running_tokens] = -1
             if not batch.is_dummy_run:
                 var["index_slot_mapping"].np[:sum_scheduled_tokens] = [
                     self._replicated_index_slot(block_table, pos)
@@ -2326,7 +2356,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 var[f"{p}index_slot_mapping"].np[:ub_real_tokens] = var[
                     "index_slot_mapping"
                 ].np[tok_start : tok_start + ub_real_tokens]
-                var[f"{p}index_slot_mapping"].np[ub_real_tokens:padded_tok_count] = 0
+                var[f"{p}index_slot_mapping"].np[ub_real_tokens:padded_tok_count] = -1
 
             var[f"{p}block_tables"].np[:ub_real_reqs] = var["block_tables"].np[
                 req_start : req_start + ub_real_reqs
