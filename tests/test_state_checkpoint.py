@@ -1865,7 +1865,7 @@ class TestDemandDrivenCheckpoints:
         """`--no-state-checkpoint-demand` drops the rung, nothing else.
 
         The refusal is still measured — `num_wanted_hit_blocks` is what
-        `CacheStats` splits declined reuse by, and turning the placement off
+        `EngineStats` splits declined reuse by, and turning the placement off
         must not blind that. What goes is only the placement, leaving the grid
         and this prompt's own anchor to carry the checkpoints.
         """

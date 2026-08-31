@@ -456,7 +456,8 @@ class EngineArgs:
             help="Log the periodic engine-status line (running/waiting reqs, "
             "KV cache usage, prefix cache hit rate, prompt/generation "
             "throughput; default: enabled). Use --no-enable-log-stats to "
-            "disable. Scoped to that line only: the [MTP Stats] and "
+            "disable. Applies to offline LLM(...) as well as to the server. "
+            "Scoped to that line only: the [MTP Stats] and "
             "[Cache Stats] lines have their own gates (--method mtp and "
             "--enable-prefix-caching) and keep their own cadences.",
         )

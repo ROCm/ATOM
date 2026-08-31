@@ -372,6 +372,9 @@ class EngineUtilityHandler:
             )
             result = {
                 "enabled": True,
+                # "prefill" / "decode" / "" — lets the aggregator recognise a
+                # P/D pair, where one request is held by both ranks at once.
+                "role": getattr(self.scheduler, "_METRICS_ROLE", ""),
                 "requests_running": running,
                 "requests_waiting": waiting,
                 "requests_parked_kv_load": int(

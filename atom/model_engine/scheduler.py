@@ -431,6 +431,7 @@ class Scheduler:
     """
 
     _ENGINE_LABEL = ""
+    _METRICS_ROLE = ""
 
     def __init__(
         self,
@@ -642,15 +643,21 @@ class Scheduler:
         `engine_stats` and emit the periodic engine-status log line once
         `throughput_log_interval_s` has elapsed.
 
-        No-op when `--no-enable-log-stats` disabled the section. The whole
-        added path is a handful of attribute reads — `_kv_usage()` is O(1),
-        two reads and a divide, despite sitting on the per-step path — so the
-        guard is for clarity, not for a cost worth avoiding.
+        No-op when `--no-enable-log-stats` disabled the section.
+
+        The token counts must be accumulated on every call — they are what the
+        line reports — but the three arguments below it are read fresh and then
+        discarded on all but one call in `interval / step_time`, which at a 10s
+        interval is about one in ten thousand. `window_expired` is a subtract
+        and a compare, so gating on it keeps the per-step cost to the counter
+        update.
         """
         stats = self.engine_stats
         if not stats.throughput_enabled:
             return
         stats.update_throughput(num_prompt_tokens, num_generation_tokens)
+        if not stats.window_expired(time.monotonic()):
+            return
         num_running_reqs, num_waiting_reqs = self.get_request_counts()
         stats.maybe_log_throughput(
             num_running_reqs=num_running_reqs,
@@ -951,7 +958,7 @@ class Scheduler:
         self._rejected = []
         return out
 
-    def schedule(self) -> tuple[ScheduledBatch, dict[int, Sequence]]:
+    def schedule(self) -> tuple[ScheduledBatch, dict[int, Sequence]] | None:
         """Run a scheduling pass and close the throughput window.
 
         **Override `_schedule`, not this.** The window's 10s cadence is a
@@ -2729,6 +2736,12 @@ class PrefillScheduler:
     - Decode scheduling is never performed.
     """
 
+    # Every request here is also held by the decode side, whose queues span
+    # the full lifetime; the aggregator drops this rank's counts so an
+    # in-flight prefill is not counted on both. See `_METRICS_ROLE` on
+    # `Scheduler`.
+    _METRICS_ROLE = "prefill"
+
     def __init__(self, config: Config, disagg_cu_shm_name: str = ""):
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
@@ -2870,12 +2883,15 @@ class PrefillScheduler:
         This process schedules no decode, so generation stays 0, and the
         decode process owns the KV blocks — no local BlockManager means
         `kv_usage=None`, which the line reports as `n/a` rather than as a
-        real, empty pool.
+        real, empty pool. Same `window_expired` gate as the base class, and
+        for the same reason.
         """
         stats = self.engine_stats
         if not stats.throughput_enabled:
             return
         stats.update_throughput(num_prompt_tokens, num_generation_tokens)
+        if not stats.window_expired(time.monotonic()):
+            return
         num_running_reqs, num_waiting_reqs = self.get_request_counts()
         stats.maybe_log_throughput(
             num_running_reqs=num_running_reqs,
@@ -2925,6 +2941,7 @@ class DecodeScheduler(Scheduler):
     """
 
     _ENGINE_LABEL = "Decode "
+    _METRICS_ROLE = "decode"
 
     def get_request_counts(self) -> tuple[int, int]:
         """Fold in the two queues this scheduler adds.
