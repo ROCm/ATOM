@@ -1900,6 +1900,7 @@ class BlockManager:
             "state_hbm": self.state_hbm,
             "state_tier": self.state_tier,
             "state_gate_lost_boundary": self.state_gate_lost_boundary,
+            "orphan_load_slots_reclaimed": self._orphan_load_slots_reclaimed,
         } | self.state_checkpoint_fates()
 
     def pool_pressure(self) -> dict[str, int]:
