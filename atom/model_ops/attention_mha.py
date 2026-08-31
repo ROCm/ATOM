@@ -819,7 +819,12 @@ class PagedAttentionImpl(nn.Module):
             # Raw K/V is fed as a block_size=1 flash-layout cache, never shuffled.
             shuffled_kv_cache = False
 
-        n_block_rows = attn_metadata.block_tables.shape[0]
+        # Same guard as the MLA prefill site: block_tables defaults to None and
+        # the base builder only uploads one when `has_cached`. The aiter backend
+        # backfills it, but only when `batch.block_tables` is non-empty, so the
+        # narrowing has to tolerate its absence rather than dereference it.
+        block_tables = attn_metadata.block_tables
+        n_block_rows = None if block_tables is None else block_tables.shape[0]
         unified_attention(
             q,
             k_for_attn,
@@ -827,8 +832,16 @@ class PagedAttentionImpl(nn.Module):
             o,
             # Cut to the rows of the block table this indexes with them: the
             # prefill builder pads both past the requests it scheduled.
-            cu_seqlens_q=attn_metadata.cu_seqlens_q[: n_block_rows + 1],
-            seqused_k=attn_metadata.context_lens[:n_block_rows],
+            cu_seqlens_q=(
+                attn_metadata.cu_seqlens_q
+                if n_block_rows is None
+                else attn_metadata.cu_seqlens_q[: n_block_rows + 1]
+            ),
+            seqused_k=(
+                attn_metadata.context_lens
+                if n_block_rows is None
+                else attn_metadata.context_lens[:n_block_rows]
+            ),
             max_seqlen_q=attn_metadata.max_seqlen_q,
             max_seqlen_k=attn_metadata.max_seqlen_k,
             softmax_scale=self.scale,

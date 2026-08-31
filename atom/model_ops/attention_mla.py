@@ -1735,8 +1735,17 @@ class MLAAttention(nn.Module):
 
         # The paged kernels take their batch from the q-cums; cut them to a
         # per-seq array the prefill builder left unpadded.
-        n_seqs = attn_metadata.kv_last_page_lens.shape[0]
-        paged_cu_seqlens_q = attn_metadata.cu_seqlens_q[: n_seqs + 1]
+        #
+        # Guarded on kv_last_page_lens: AiterMLAMetadataBuilder.prepare_prefill
+        # only fills it when a drafter exists or the batch has a prefix-cache
+        # hit, so a plain first-chunk prefill leaves it None. That was harmless
+        # while the value was merely passed through -- the sparse branch below
+        # overwrites all four of these, and the dense kernels take None -- but
+        # slicing it here raised AttributeError on the first prefill batch.
+        paged_cu_seqlens_q = attn_metadata.cu_seqlens_q
+        if attn_metadata.kv_last_page_lens is not None:
+            n_seqs = attn_metadata.kv_last_page_lens.shape[0]
+            paged_cu_seqlens_q = paged_cu_seqlens_q[: n_seqs + 1]
         paged_kv_indptr = attn_metadata.kv_indptr
         paged_kv_indices = attn_metadata.kv_indices
         kv_last_page_lens = attn_metadata.kv_last_page_lens

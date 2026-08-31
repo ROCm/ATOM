@@ -457,6 +457,17 @@ def sparse_attn_indexer_plugin_mode(
         batch_size = padded_q_fp8_decode_tokens.shape[0]
         next_n = padded_q_fp8_decode_tokens.shape[1]
         assert batch_size == decode_metadata.seq_lens.shape[0]
+        # deepgemm_fp8_paged_mqa_logits grids over `batch_size * next_n`, so that
+        # is the height its `logits` must have. Sizing off num_decode_tokens is
+        # only equivalent while the query rows are unpadded -- pack_seq_triton
+        # above pads to a rectangle, and the kernel would then write past the
+        # end. requires_padding is hardcoded False at the one construction site
+        # (attention/metadata.py), so state the dependency rather than leave a
+        # buffer overrun waiting for whoever turns it on.
+        assert not decode_metadata.requires_padding, (
+            "padded decode rows need logits sized [batch_size * next_n, ...]; "
+            "see deepgemm_fp8_paged_mqa_logits' grid"
+        )
         logits = torch.empty(
             [num_decode_tokens, max_model_len], dtype=torch.float32, device="cuda"
         )
