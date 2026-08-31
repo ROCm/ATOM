@@ -357,6 +357,13 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         # prefix is stored to LMCache once prefill computes it
         # (seq.prefix_hashes_published flips True), chunk by chunk.
         self._save_tracker: dict[str, list] = {}
+        # Round-robin cursor over `_save_tracker`: the last sid that emitted a
+        # save. `build_connector_meta` resumes the save scan just after it so a
+        # bounded save queue (`_may_emit_save`) is shared fairly. Without it the
+        # scan always restarts at the insertion-ordered head, and a long
+        # multi-chunk request there re-wins the freed slot every step and
+        # starves later requests (their blocks stay pinned by should_defer_free).
+        self._save_rr_last: str | None = None
         # sid -> exact save generation.  Exact matching prevents a delayed TP
         # notification for an older request lifecycle from releasing the
         # current request's deferred blocks.
@@ -634,7 +641,15 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         # chunked prefill, seq.num_cached_tokens advances after each prefill
         # chunk's forward has completed; use it as the D2H-safe frontier.
         chunk = self.chunk_size or 256
-        for sid, entry in self._save_tracker.items():
+        # Round-robin start: resume just after the last sid we emitted a save
+        # for, so a bounded `_may_emit_save` queue is shared fairly instead of
+        # always favouring the insertion-ordered head (see `_save_rr_last`).
+        tracker_sids = list(self._save_tracker.keys())
+        if tracker_sids and self._save_rr_last in self._save_tracker:
+            start = (tracker_sids.index(self._save_rr_last) + 1) % len(tracker_sids)
+            tracker_sids = tracker_sids[start:] + tracker_sids[:start]
+        for sid in tracker_sids:
+            entry = self._save_tracker[sid]
             if not self._do_save:
                 continue
             if not self._may_emit_save():
@@ -675,6 +690,7 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             )
             entry[1] = aligned
             self._save_inflight[sid] = save_operation
+            self._save_rr_last = sid
         dispatched = set(meta.lookup_requests_in_step)
         self._lookup_in_step = [
             sid for sid in self._lookup_in_step if sid not in dispatched

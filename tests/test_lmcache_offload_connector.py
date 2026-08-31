@@ -4680,6 +4680,7 @@ def _k3_scheduler() -> KimiK3OffloadScheduler:
     s.chunk_size = 256
     s._save_inflight = {}
     s._save_tracker = {}
+    s._save_rr_last = None
     s._pending_state_loads = []
     s._pending_state_stores = []
     s._save_inflight_since = {}
@@ -4703,6 +4704,59 @@ def _k3_seq(*, hbm: int, joint: int = 0, kv: int = 0, claimed: int = 0):
         state_joint_kv_tokens=kv,
         state_joint_claim_tokens=claimed,
     )
+
+
+def test_bounded_saves_are_shared_round_robin_not_head_first():
+    """With a bounded ``_may_emit_save`` (kimi_k3 caps outstanding saves), the
+    save scan must rotate over ``_save_tracker`` so a long multi-chunk request
+    at the insertion-ordered head cannot re-win the freed slot every step and
+    starve later requests -- whose blocks stay pinned by ``should_defer_free``
+    until their save drains. Without the round-robin cursor the emission order
+    would be [100, 100, 100]; with it, each request gets a turn."""
+
+    class _Cap1(DenseOffloadScheduler):
+        def _may_emit_save(self):  # one save outstanding at a time
+            return len(self._save_inflight) < 1
+
+        def _track_save_statistics(self, *a, **k):
+            pass
+
+    s = _Cap1.__new__(_Cap1)
+    s.chunk_size = 256
+    s.block_size = 256
+    s._do_save = True
+    s._do_load = False
+    s._reqs_need_recv = {}
+    s._lookup_in_step = []
+    s._save_tracker = {}
+    s._save_inflight = {}
+    s._save_nonce = 0
+    s._save_rr_last = None
+
+    seqs = {}
+    for i in range(3):
+        sid = str(100 + i)
+        seq = SimpleNamespace(
+            id=100 + i,
+            num_prompt_tokens=4096,
+            token_ids=list(range(4096)),
+            num_cached_tokens=0,
+            block_table=list(range(16)),
+        )
+        s._save_tracker[sid] = [seq, 0]
+        seqs[sid] = seq
+
+    emitted = []
+    for _ in range(3):
+        for seq in seqs.values():  # every request computes one more chunk
+            seq.num_cached_tokens += 256
+        meta = s.build_connector_meta()
+        saves = [r for r in meta.requests if r.save_spec is not None]
+        assert len(saves) == 1  # the cap admits exactly one per step
+        emitted.append(str(saves[0].req_id))
+        s._save_inflight.clear()  # that save completes, freeing the one slot
+
+    assert emitted == ["100", "101", "102"]
 
 
 def test_layout_selection_picks_kimi_k3_for_a_kda_config():
