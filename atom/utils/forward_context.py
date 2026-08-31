@@ -6,12 +6,15 @@ import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
 from enum import Enum
-from typing import Any, Union
+from typing import TYPE_CHECKING, Any, Union
 
 import numpy as np
 import torch
 
 from atom.config import Config, CUDAGraphMode, KVCacheTensor, ParallelConfig
+
+if TYPE_CHECKING:
+    from atom.utils.tbo.ubatching import DPMetadataBuffers
 
 
 class AttnState(Enum):
@@ -237,8 +240,7 @@ class ForwardMode:
         tbo_on: bool,
         local_tbo: tuple[bool, bool, int, int],
         max_seqlen_q: int,
-        dp_sync_device: torch.device | str = "cpu",
-        dp_sync_buffer: torch.Tensor | None = None,
+        dp_sync_buffers: "DPMetadataBuffers | None" = None,
     ) -> "ForwardMode":
         """Run the step's DP collective and settle its shape from the result.
 
@@ -260,8 +262,7 @@ class ForwardMode:
             sync = sync_dp_metadata(
                 dp_group=dp_group,
                 dp_size=dp_size,
-                device=dp_sync_device,
-                gathered_buffer=dp_sync_buffer,
+                buffers=dp_sync_buffers,
                 scheduled_tokens=scheduled_tokens,
                 scheduled_bs=scheduled_bs,
                 is_prefill=is_prefill,

@@ -99,7 +99,7 @@ from atom.utils.tbo import (
     local_tbo_precompute,
     maybe_create_ubatch_slices,
 )
-from atom.utils.tbo.ubatching import DP_METADATA_MAX_FIELDS
+from atom.utils.tbo.ubatching import DPMetadataBuffers
 
 logger = logging.getLogger("atom")
 
@@ -689,12 +689,8 @@ class ModelRunner:
         self._dp_metadata_device_sync = (
             dp_size > 1 and envs.ATOM_DP_METADATA_DEVICE_SYNC
         )
-        self._dp_metadata_gathered_buffer = (
-            torch.empty(
-                dp_size * DP_METADATA_MAX_FIELDS,
-                dtype=torch.int32,
-                device=self.device,
-            )
+        self._dp_metadata_buffers = (
+            DPMetadataBuffers.allocate(dp_size, self.device)
             if self._dp_metadata_device_sync
             else None
         )
@@ -2601,8 +2597,7 @@ class ModelRunner:
                 if dp_group is not None
                 else None
             ),
-            dp_sync_device=(self.device if self._dp_metadata_device_sync else "cpu"),
-            dp_sync_buffer=self._dp_metadata_gathered_buffer,
+            dp_sync_buffers=self._dp_metadata_buffers,
             enforce_eager=self.enforce_eager,
             capture_sizes=self.capture_sizes_np,
             captured_tokens=(

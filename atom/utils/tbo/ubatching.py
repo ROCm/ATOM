@@ -11,8 +11,58 @@ import torch
 from atom.config import get_current_atom_config
 
 # Largest packed metadata vector: 7 base/TBO fields plus one DSpark field.
-# ModelRunner allocates one output buffer of this size and reuses it every step.
 DP_METADATA_MAX_FIELDS = 8
+
+
+@dataclass
+class DPMetadataBuffers:
+    """Persistent staging for the device/RCCL metadata path.
+
+    The scheduler produces all fields on the host, so putting them into a GPU
+    tensor one scalar at a time turns each assignment into a synchronous H2D
+    runtime call.  Keep both directions pinned and reuse one device pair so a
+    step is exactly one H2D, one collective, and one D2H on an independent
+    stream.  The final stream synchronization is required because Python
+    consumes the gathered values immediately.
+    """
+
+    dp_size: int
+    local_cpu: torch.Tensor
+    local_device: torch.Tensor
+    gathered_device: torch.Tensor
+    gathered_cpu: torch.Tensor
+    local_numpy: np.ndarray
+    stream: torch.cuda.Stream
+
+    @classmethod
+    def allocate(cls, dp_size: int, device: torch.device | str) -> "DPMetadataBuffers":
+        device = torch.device(device)
+        if dp_size <= 1:
+            raise ValueError(f"device metadata sync needs dp_size > 1, got {dp_size}")
+        if device.type != "cuda":
+            raise ValueError("device metadata sync needs a CUDA/ROCm device")
+
+        local_cpu = torch.empty(
+            DP_METADATA_MAX_FIELDS,
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=True,
+        )
+        gathered_cpu = torch.empty(
+            dp_size * DP_METADATA_MAX_FIELDS,
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=True,
+        )
+        return cls(
+            dp_size=dp_size,
+            local_cpu=local_cpu,
+            local_device=torch.empty_like(local_cpu, device=device),
+            gathered_device=torch.empty_like(gathered_cpu, device=device),
+            gathered_cpu=gathered_cpu,
+            local_numpy=local_cpu.numpy(),
+            stream=torch.cuda.Stream(device=device),
+        )
 
 
 def tbo_overlap_enabled() -> bool:
@@ -206,8 +256,7 @@ def sync_dp_metadata(
     dp_size: int,
     scheduled_tokens: int,
     scheduled_bs: int,
-    device: torch.device | str = "cpu",
-    gathered_buffer: torch.Tensor | None = None,
+    buffers: DPMetadataBuffers | None = None,
     is_prefill: bool,
     tbo_on: bool,
     local_meets_min_tokens: bool = False,
@@ -253,52 +302,63 @@ def sync_dp_metadata(
     0 already carry them, and a step that reaches the reduction with every rank
     decoding has `scheduled_tokens` == its decode total on every rank.
     """
+    fields = [scheduled_tokens, scheduled_bs, 1 if is_prefill else 0]
+    if tbo_on:
+        fields.extend(
+            (
+                1 if local_meets_min_tokens else 0,
+                1 if local_can_split else 0,
+                local_ub_tokens[0],
+                local_ub_tokens[1],
+            )
+        )
+    if max_seqlen_q is not None:
+        fields.append(max_seqlen_q)
+
     tbo_fields = 7 if tbo_on else 3
     dspark_on = max_seqlen_q is not None
-    n_fields = tbo_fields + (1 if dspark_on else 0)
-    local = torch.zeros(n_fields, dtype=torch.int32, device=device)
-    local[0] = scheduled_tokens
-    local[1] = scheduled_bs
-    local[2] = 1 if is_prefill else 0
-    if tbo_on:
-        local[3] = 1 if local_meets_min_tokens else 0
-        local[4] = 1 if local_can_split else 0
-        local[5] = local_ub_tokens[0]
-        local[6] = local_ub_tokens[1]
-    if dspark_on:
-        local[tbo_fields + 0] = max_seqlen_q
+    n_fields = len(fields)
+    assert n_fields == tbo_fields + (1 if dspark_on else 0)
 
-    if local.device.type == "cpu":
+    if buffers is None:
+        local = torch.tensor(fields, dtype=torch.int32, device="cpu")
         gathered = [torch.empty_like(local) for _ in range(dp_size)]
         torch.distributed.all_gather(gathered, local, group=dp_group)
         sync = torch.stack(gathered, dim=1)  # [n_fields, dp_size]
     else:
-        # RCCL is about an order of magnitude faster than Gloo for this tiny
-        # rendezvous on an 8-GPU node.  Gather contiguously and perform one D2H
-        # transfer: parsing individual device scalars would add a stream sync
-        # for every .item()/.bool() below.
-        required_numel = dp_size * n_fields
-        if gathered_buffer is None:
-            gathered_flat = torch.empty(
-                required_numel, dtype=torch.int32, device=local.device
+        if buffers.dp_size != dp_size:
+            raise ValueError(
+                f"metadata buffers are for dp_size={buffers.dp_size}, got {dp_size}"
             )
-        else:
-            if (
-                gathered_buffer.ndim != 1
-                or not gathered_buffer.is_contiguous()
-                or gathered_buffer.dtype != torch.int32
-                or gathered_buffer.device != local.device
-                or gathered_buffer.numel() < required_numel
-            ):
-                raise ValueError(
-                    "gathered_buffer must be a contiguous 1-D int32 tensor on "
-                    f"{local.device} with at least {required_numel} elements"
-                )
-            gathered_flat = gathered_buffer[:required_numel]
-        torch.distributed.all_gather_into_tensor(gathered_flat, local, group=dp_group)
-        sync = gathered_flat.cpu().view(dp_size, n_fields).T
 
-    num_tokens_across_dp = sync[0]
+        # Pack on the CPU as one vector.  Assigning these fields directly to a
+        # device tensor emits one synchronous hipMemcpyWithStream per scalar;
+        # the first then waits behind the previous model forward and destroys
+        # the overlap this path is intended to recover.
+        buffers.local_numpy[:n_fields] = fields
+        local_cpu = buffers.local_cpu[:n_fields]
+        local_device = buffers.local_device[:n_fields]
+        required_numel = dp_size * n_fields
+        gathered_device = buffers.gathered_device[:required_numel]
+        gathered_cpu = buffers.gathered_cpu[:required_numel]
+
+        # The metadata has no dependency on the preceding model kernels.  A
+        # dedicated stream lets its H2D and RCCL work overlap those kernels;
+        # ProcessGroupNCCL orders the gathered output back onto this stream
+        # before the D2H copy.  Synchronize once, at the point Python consumes
+        # the result.
+        with torch.cuda.stream(buffers.stream):
+            local_device.copy_(local_cpu, non_blocking=True)
+            torch.distributed.all_gather_into_tensor(
+                gathered_device, local_device, group=dp_group
+            )
+            gathered_cpu.copy_(gathered_device, non_blocking=True)
+        buffers.stream.synchronize()
+        sync = gathered_cpu.view(dp_size, n_fields).T
+
+    # Device sync reuses its host landing buffer next step.  Preserve the old
+    # result-ownership contract for callers that retain the ForwardMode.
+    num_tokens_across_dp = sync[0].clone() if buffers is not None else sync[0]
     max_bs_across_dp = int(sync[1].max())
     any_rank_has_prefill = bool(sync[2].any())
     tbo_collective_active = False

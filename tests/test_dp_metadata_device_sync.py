@@ -9,7 +9,11 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from atom.utils.forward_context import ForwardMode
-from atom.utils.tbo.ubatching import DP_METADATA_MAX_FIELDS, sync_dp_metadata
+from atom.utils.tbo.ubatching import (
+    DP_METADATA_MAX_FIELDS,
+    DPMetadataBuffers,
+    sync_dp_metadata,
+)
 
 
 def _device_sync_worker(rank: int, world_size: int, init_file: str) -> None:
@@ -21,17 +25,17 @@ def _device_sync_worker(rank: int, world_size: int, init_file: str) -> None:
         world_size=world_size,
     )
     try:
-        gathered_buffer = torch.empty(
-            world_size * DP_METADATA_MAX_FIELDS,
-            dtype=torch.int32,
-            device=torch.device("cuda", rank),
-        )
-        buffer_ptr = gathered_buffer.data_ptr()
+        buffers = DPMetadataBuffers.allocate(world_size, torch.device("cuda", rank))
+        buffer_ptrs = {
+            "local_cpu": buffers.local_cpu.data_ptr(),
+            "local_device": buffers.local_device.data_ptr(),
+            "gathered_device": buffers.gathered_device.data_ptr(),
+            "gathered_cpu": buffers.gathered_cpu.data_ptr(),
+        }
         result = sync_dp_metadata(
             dp_group=dist.group.WORLD,
             dp_size=world_size,
-            device=torch.device("cuda", rank),
-            gathered_buffer=gathered_buffer,
+            buffers=buffers,
             scheduled_tokens=11 + 6 * rank,
             scheduled_bs=2 + rank,
             is_prefill=True,
@@ -50,15 +54,27 @@ def _device_sync_worker(rank: int, world_size: int, init_file: str) -> None:
         assert result.ub_max_tokens_across_dp == (8, 9)
         assert result.max_seqlen_q_across_dp == 5
 
-        assert gathered_buffer.data_ptr() == buffer_ptr
-        assert gathered_buffer.view(
+        assert buffers.local_cpu.is_pinned()
+        assert buffers.gathered_cpu.is_pinned()
+        assert buffers.stream != torch.cuda.current_stream(rank)
+        assert buffers.local_device[:DP_METADATA_MAX_FIELDS].cpu().tolist() == [
+            11 + 6 * rank,
+            2 + rank,
+            1,
+            1 if rank == 1 else 0,
+            1,
+            5 + 3 * rank,
+            6 + 3 * rank,
+            4 + rank,
+        ]
+        assert buffers.gathered_device.view(
             world_size, DP_METADATA_MAX_FIELDS
         ).cpu().tolist() == [
             [11, 2, 1, 0, 1, 5, 6, 4],
             [17, 3, 1, 1, 1, 8, 9, 5],
         ]
 
-        # The same max-sized allocation also backs the smaller no-TBO/no-DSpark
+        # The same max-sized allocations also back the smaller no-TBO/no-DSpark
         # wire format. Exercise the production ForwardMode forwarding path too.
         small_mode = ForwardMode.decide(
             batch=SimpleNamespace(
@@ -68,8 +84,7 @@ def _device_sync_worker(rank: int, world_size: int, init_file: str) -> None:
             ),
             dp_group=dist.group.WORLD,
             dp_size=world_size,
-            dp_sync_device=torch.device("cuda", rank),
-            dp_sync_buffer=gathered_buffer,
+            dp_sync_buffers=buffers,
             enforce_eager=False,
             capture_sizes=[1, 2, 4, 8],
             captured_tokens=None,
@@ -80,8 +95,13 @@ def _device_sync_worker(rank: int, world_size: int, init_file: str) -> None:
         )
         small = small_mode.sync
         assert small is not None
-        assert gathered_buffer.data_ptr() == buffer_ptr
-        assert gathered_buffer[: world_size * 3].cpu().tolist() == [
+        assert {
+            "local_cpu": buffers.local_cpu.data_ptr(),
+            "local_device": buffers.local_device.data_ptr(),
+            "gathered_device": buffers.gathered_device.data_ptr(),
+            "gathered_cpu": buffers.gathered_cpu.data_ptr(),
+        } == buffer_ptrs
+        assert buffers.gathered_device[: world_size * 3].cpu().tolist() == [
             4,
             4,
             0,
@@ -91,6 +111,9 @@ def _device_sync_worker(rank: int, world_size: int, init_file: str) -> None:
         ]
         assert small.num_tokens_across_dp.tolist() == [4, 5]
         assert small.max_bs_across_dp == 5
+        # The returned rank vector owns its storage; reusing the pinned D2H
+        # landing buffer for this second call must not mutate the first result.
+        assert result.num_tokens_across_dp.tolist() == [11, 17]
     finally:
         dist.destroy_process_group()
 

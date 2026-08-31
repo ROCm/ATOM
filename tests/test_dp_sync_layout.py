@@ -10,9 +10,10 @@ hang on eight ranks, not as a failure here.
 The collective itself is faked, so this runs on CPU with no DP group.
 """
 
+import pytest
 import torch
 
-from atom.utils.tbo.ubatching import sync_dp_metadata
+from atom.utils.tbo.ubatching import DPMetadataBuffers, sync_dp_metadata
 
 
 class _FakeGroup:
@@ -20,6 +21,13 @@ class _FakeGroup:
 
     def __init__(self, peers):
         self.peers = peers
+
+
+def test_device_metadata_buffers_reject_invalid_topology():
+    with pytest.raises(ValueError, match="dp_size > 1"):
+        DPMetadataBuffers.allocate(1, "cuda")
+    with pytest.raises(ValueError, match="CUDA/ROCm"):
+        DPMetadataBuffers.allocate(2, "cpu")
 
 
 def _sync(monkeypatch, *, peers, **kw):

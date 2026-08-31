@@ -13,7 +13,7 @@ This document describes the environment variables used in the ATOM project.
 | **ATOM_DP_MASTER_PORT** | int | 29500 | Master port for DP ranks coordination. |
 | **ATOM_DP_LB_REQ_EQUIV** | int | 512 | Token-equivalent decode pressure assigned to each in-flight request by `least_tokens` routing. |
 | **ATOM_DP_SESSION_AFFINITY** | bool | false | Load-place each new session, then keep later turns on the same prefix-cache owner. Reads `X-Dynamo-Session-ID`, falling back to `X-Correlation-ID`. |
-| **ATOM_DP_METADATA_DEVICE_SYNC** | bool | false | With more than one DP-attention rank, exchange the packed per-forward token/prefill/TBO metadata over the device/RCCL group instead of CPU/Gloo. The gathered tensor is copied to the host once for scheduler decisions. |
+| **ATOM_DP_METADATA_DEVICE_SYNC** | bool | false | With more than one DP-attention rank, exchange the packed per-forward token/prefill/TBO metadata over the device/RCCL group instead of CPU/Gloo. Persistent pinned buffers and a dedicated stream stage one H2D and one D2H per step before the scheduler consumes the result. |
 
 ## Prefill delayer (DP attention)
 
