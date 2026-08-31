@@ -1262,8 +1262,10 @@ class Scheduler:
                 and num_new_tokens > self.max_num_batched_tokens
             ):
                 continue
-            # KV-pressured requests definitely cannot prefill.
-            return self.block_manager.can_allocate(seq) >= 0
+            # KV-pressured requests definitely cannot prefill. A fit probe, not
+            # an admission -- `record=False` so it does not move the joint-
+            # boundary funnel counters for a seq it may never schedule.
+            return self.block_manager.can_allocate(seq, record=False) >= 0
         return False
 
     def _kv_usage(self) -> float:
