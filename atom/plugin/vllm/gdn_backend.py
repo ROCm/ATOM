@@ -22,8 +22,6 @@ from vllm.v1.attention.backends.registry import (
 )
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID, mamba_get_block_table_tensor
 
-from atom.plugin.vllm.qwen35_plugin_scope import is_qwen35_35b_a3b_vllm_plugin_model
-
 logger = logging.getLogger("atom")
 
 _GDN_BACKEND_REGISTERED = False
@@ -34,22 +32,20 @@ class AtomGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
 
     Inherits vLLM's GDN builder so runner-side ``isinstance`` checks for spec
     decode continue to work.  The post-build compaction rebuilds request-indexed
-    metadata for FULL-cudagraph padded decode rows: vLLM pads a decode batch out
-    to a captured graph size and leaves the padded request slots in the
-    metadata, but ATOM's GDN decode kernel is request-indexed and walks them,
-    folding the padded rows into ssm_state.  Kimi-K3 runs the same pass from its
-    own builder (``AtomKimiK3KDAMetadataBuilder._adapt_full_graph_decode_metadata``).
+    metadata for the rows a FULL-cudagraph decode was padded with.
 
-    Qwen3.5-35B-A3B block-FP8 is the one configuration where the compaction hurt
-    instead of helping (#1985), so it keeps vLLM's metadata untouched -- the
-    same scope the rest of that fix already uses.  Dropping the pass for *every*
-    GDN model cost Qwen3.5-397B-A17B-MXFP4 TP4 ~6 points of gsm8k under the
-    ``FULL_AND_PIECEWISE`` cudagraph mode the accuracy harness runs.
+    vLLM cannot mark those rows itself on this path.  For a pure-decode batch
+    ``max_query_len`` is 1, so ``split_decodes_and_prefills`` takes its fast
+    path and returns ``num_decodes = num_reqs`` -- the *padded* request count.
+    Its own guard then reads
+    ``non_spec_state_indices_tensor[num_decodes:].fill_(NULL_BLOCK_ID)``, which
+    is a no-op once ``num_decodes == batch_size``, so the padded slots keep
+    whatever ``block_table_tensor[:, 0]`` held.  ATOM's GDN decode kernel is
+    request-indexed, so it walks them and folds them into ssm_state.
+
+    Kimi-K3 runs the same pass from its own builder
+    (``AtomKimiK3KDAMetadataBuilder._adapt_full_graph_decode_metadata``).
     """
-
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        self._compact_full_graph_decode = not is_qwen35_35b_a3b_vllm_plugin_model()
 
     def build(  # type: ignore[override]
         self,
@@ -66,10 +62,7 @@ class AtomGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
             fast_build=fast_build,
         )
-        if self._compact_full_graph_decode:
-            self._compact_full_graph_decode_metadata(
-                common_attn_metadata, attn_metadata
-            )
+        self._compact_full_graph_decode_metadata(common_attn_metadata, attn_metadata)
         return attn_metadata
 
     def _compact_full_graph_decode_metadata(

@@ -272,34 +272,6 @@ def test_gdn_metadata_builder_compacts_full_graph_padding():
         """)
 
 
-def test_gdn_metadata_compaction_skips_qwen35_35b_a3b():
-    _run_without_test_stubs("""
-        from unittest.mock import patch
-
-        from atom.plugin.vllm.gdn_backend import AtomGDNAttentionMetadataBuilder
-
-        # Qwen3.5-35B-A3B block-FP8 is the one configuration the compaction hurt
-        # (#1985); it keeps vLLM's untouched metadata.
-        with patch(
-            "atom.plugin.vllm.gdn_backend.is_qwen35_35b_a3b_vllm_plugin_model",
-            return_value=True,
-        ), patch.object(
-            AtomGDNAttentionMetadataBuilder.__bases__[0], "__init__", lambda self: None
-        ):
-            builder = AtomGDNAttentionMetadataBuilder()
-        assert builder._compact_full_graph_decode is False
-
-        with patch(
-            "atom.plugin.vllm.gdn_backend.is_qwen35_35b_a3b_vllm_plugin_model",
-            return_value=False,
-        ), patch.object(
-            AtomGDNAttentionMetadataBuilder.__bases__[0], "__init__", lambda self: None
-        ):
-            builder = AtomGDNAttentionMetadataBuilder()
-        assert builder._compact_full_graph_decode is True
-        """)
-
-
 def test_aiter_tp_group_must_match_vllm_dcp_order():
     _run_without_test_stubs("""
         from types import SimpleNamespace
