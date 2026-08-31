@@ -1352,6 +1352,21 @@ class MooncakeConnector(KVConnectorBase):
             write_nonce = request_data.get("write_nonce", 0)
             has_slot_data = request_data.get("has_slot_regions", False)
 
+            if has_slot_data and consumer_dcp_size > 1:
+                # _execute_block_slot_transfer pairs whole blocks, so it has no
+                # way to express a consumer block that holds every dcp_size-th
+                # token. The block-count check below now admits that ratio, so
+                # refuse here rather than write another rank's KV.
+                logger.error(
+                    "[PRODUCER] req %s carries per-request state regions and "
+                    "the consumer runs dcp_size=%d; the slot-transfer path has "
+                    "no DCP relayout. Aborting instead of writing misaligned "
+                    "KV.",
+                    req_id,
+                    consumer_dcp_size,
+                )
+                return
+
             logger.info(
                 "[PRODUCER] _execute_transfer: req_id=%s, transfer_id=%s, "
                 "consumer=%s:%s, dst_blocks=%d, has_slot_data=%s",
@@ -1590,7 +1605,15 @@ class MooncakeConnector(KVConnectorBase):
         consumer_roles = request_data.get("consumer_region_roles")
         if consumer_roles is not None:
             for region_idx in range(num_regions):
-                remote_role = consumer_roles[cmap[region_idx]]
+                cidx = cmap[region_idx]
+                if cidx >= len(consumer_roles):
+                    raise RuntimeError(
+                        f"Consumer sent {len(consumer_roles)} region roles for "
+                        f"{len(consumer_base_addrs)} regions (req {req_id}); "
+                        "region pairing cannot be checked against a peer this "
+                        "far out of sync."
+                    )
+                remote_role = consumer_roles[cidx]
                 if self._block_region_roles[region_idx] != remote_role:
                     raise RuntimeError(
                         f"Region role mismatch for req {req_id}: local region "
@@ -1607,6 +1630,13 @@ class MooncakeConnector(KVConnectorBase):
         replicates_index = request_data.get("consumer_replicates_index_cache", False)
         sharded_plan = None
         if dcp_size > 1:
+            if self.dcp_size > 1:
+                raise RuntimeError(
+                    f"Producer runs dcp_size={self.dcp_size}; the relayout "
+                    "reads its blocks as whole global ones, so a sharded "
+                    "producer would be replanned against tokens it does not "
+                    "hold. Run the prefill node without DCP."
+                )
             sharded_plan = plan_sharded(
                 src_block_ids,
                 dst_block_ids,
@@ -1619,7 +1649,7 @@ class MooncakeConnector(KVConnectorBase):
             # a whole-page interleave keeps the sharded plan page-aligned.
             if (
                 not replicates_index
-                and interleave < self.block_size
+                and interleave != self.block_size
                 and INDEX_CACHE_ROLE in self._block_region_roles
             ):
                 raise RuntimeError(
@@ -1641,7 +1671,15 @@ class MooncakeConnector(KVConnectorBase):
                 and replicates_index
                 and self._block_region_roles[region_idx] == INDEX_CACHE_ROLE
             ):
-                key_bytes, scale_bytes = self._block_region_planes[region_idx]
+                planes = self._block_region_planes[region_idx]
+                if planes is None:
+                    raise RuntimeError(
+                        f"Region {region_idx} is registered as "
+                        f"{INDEX_CACHE_ROLE} but reports no key/scale plane "
+                        "sizes; a replicated index page cannot be split into "
+                        "its two destination runs without them."
+                    )
+                key_bytes, scale_bytes = planes
                 plan = plan_replicated_index(
                     src_block_ids,
                     dst_block_ids,
