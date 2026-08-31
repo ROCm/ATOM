@@ -135,6 +135,24 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         self._impl = _build_scheduler(config)
 
     @property
+    def has_state_tier(self) -> bool:
+        """True when the selected impl actually hosts the KDA state tier.
+
+        This shell defines the whole state face (`enqueue_state_stores`,
+        `enqueue_state_loads`, `take_state_reports`,
+        `take_state_source_releases`) unconditionally, delegating through
+        `getattr` to `_impl` and returning the no-tier default when the impl
+        does not implement a method. So method *presence on the shell* cannot
+        tell a tier-hosting `kimi_k3` impl from a `dense`/`hybrid` impl that has
+        none -- which is exactly how `MultiConnector._first_with`, selecting by
+        attribute presence, routed every state call to a dense offload shell
+        whose `_impl` silently returns the no-tier defaults. Probe the impl for
+        the store entry point instead: the real state face lives there (only
+        `KimiK3OffloadScheduler` defines `enqueue_state_stores`).
+        """
+        return getattr(self._impl, "enqueue_state_stores", None) is not None
+
+    @property
     def chunk_size(self) -> int | None:
         """The KV leg's transfer grid, in tokens.
 

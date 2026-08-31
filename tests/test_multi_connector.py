@@ -43,6 +43,7 @@ class FakeSchedSub:
         is_producer=False,
         is_offload=False,
         offload_methods=False,
+        has_state_tier=None,
     ):
         self._match = match
         self.is_producer = is_producer
@@ -52,6 +53,15 @@ class FakeSchedSub:
         self.finished_calls = []
         self.meta = ConnectorMetadata()
         self._offload = offload_methods
+        # The real `LMCacheOffloadConnectorScheduler` shell defines the whole
+        # state face unconditionally and exposes `has_state_tier` to say whether
+        # its `_impl` actually carries the tier. An offload shell always has the
+        # flag; a producer like moriio has no such attribute at all. Default a
+        # tier-carrying shell to True so existing offload subs keep routing.
+        if offload_methods:
+            self.has_state_tier = (
+                offload_methods if has_state_tier is None else has_state_tier
+            )
 
         if offload_methods:
             self.park = False
@@ -440,6 +450,40 @@ def test_state_stores_and_reports_forward_to_the_owning_sub():
     assert sched.take_state_reports() == ({7}, {9})
     assert sched.take_state_source_releases() == {7, 9}
     assert not hasattr(moriio, "enqueue_state_stores")
+
+
+def test_state_calls_route_by_tier_ownership_not_method_presence():
+    """The reason `_first_with` was the wrong selector for the state face.
+
+    Every `LMCacheOffloadConnectorScheduler` shell -- dense OR kimi_k3 --
+    defines the whole state face unconditionally, delegating through `getattr`
+    to its `_impl` and returning the no-tier default when the impl has none. So
+    with `[dense_offload, kimi_k3_offload]` both subs answer `hasattr` for
+    `enqueue_state_stores`, and `_first_with` picks the dense shell -- whose
+    `_impl` silently refuses every store, discards every load, and drains no
+    reports. The tier actually lives on the second sub.
+
+    Selection must follow `has_state_tier` (does the `_impl` really host the
+    tier), not method presence. Here the dense-like shell is first and carries
+    no tier; the kimi_k3-like shell is second and does. Every state call must
+    land on the second.
+    """
+    dense = FakeSchedSub(is_offload=True, offload_methods=True, has_state_tier=False)
+    k3 = FakeSchedSub(is_offload=True, offload_methods=True, has_state_tier=True)
+    k3.state_reports = ({7}, {9})
+    k3.state_source_releases = {7, 9}
+    sched = _sched([dense, k3])
+
+    assert sched.enqueue_state_stores([(111, (1, 2, 3))]) is True
+    assert sched.enqueue_state_loads([(1, 111, 0)]) is True
+    assert sched.take_state_reports() == ({7}, {9})
+    assert sched.take_state_source_releases() == {7, 9}
+
+    # The tier-carrying sub got everything; the dense shell got nothing.
+    assert k3.state_stores == [(111, (1, 2, 3))]
+    assert k3.state_loads == [(1, 111, 0)]
+    assert dense.state_stores == []
+    assert dense.state_loads == []
 
 
 def test_state_stores_default_when_no_sub_implements():

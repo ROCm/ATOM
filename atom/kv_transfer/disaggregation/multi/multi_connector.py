@@ -411,6 +411,27 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         # offload backend (Scheduler._is_offload_connector reads this).
         self.is_offload = any(getattr(c, "is_offload", False) for c in self._connectors)
 
+    def _state_tier_sub(self):
+        """The one sub-connector that actually hosts the state offload tier.
+
+        Selection is by real capability (`has_state_tier`), never by method
+        presence: `LMCacheOffloadConnectorScheduler` defines the entire state
+        face on every layout, so `_first_with(..., "enqueue_state_stores")`
+        picks a dense offload shell -- whose `_impl` has no tier and returns
+        False / empty for every state call -- ahead of the `kimi_k3` shell that
+        owns the tier. The result was that, under
+        `connectors: [lmcache_offload(dense), lmcache_offload(kimi_k3)]`, stores
+        settled failed, loads were abandoned and recomputed, and the real
+        reports were never drained. `_adopt_state_tier` (worker side) already
+        refuses a config with two tiers, so "first" here is "only"; returns
+        None when no sub hosts a tier (state forwarders then fall to their
+        no-tier defaults).
+        """
+        for c in self._connectors:
+            if getattr(c, "has_state_tier", False):
+                return c
+        return None
+
     # -- base interface -----------------------------------------------------
 
     def get_num_new_matched_tokens(self, seq: Any) -> tuple[int, bool]:
@@ -460,10 +481,15 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         composite. Without this forwarder the getattr default (0) wins, so
         `_joint_kv_boundary` sees a zero chunk grid and refuses every joint KV
         load with `no_chunk_size` -- the K3 state tier's KV leg is silently off
-        under `kv_connector: multi`. Delegate to the one offload sub (at most
-        one hosts the tier, so "first" is "only").
+        under `kv_connector: multi`.
+
+        Prefer the state-tier sub's grid: `_joint_kv_boundary` aligns against
+        it, and with two offload subs (dense + kimi_k3) `_first_with` would have
+        handed back the dense sub's grid. Fall back to any offload sub's grid
+        when no tier is configured, so a plain `[moriio, lmcache_offload(dense)]`
+        still gets its dense KV chunk size.
         """
-        c = _first_with(self._connectors, "chunk_size")
+        c = self._state_tier_sub() or _first_with(self._connectors, "chunk_size")
         return getattr(c, "chunk_size", None) if c is not None else None
 
     def should_park_for_load_after_alloc(self, seq: Any) -> bool:
@@ -485,8 +511,11 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         The False is not a formality: every load here belongs to a parked
         request only a report can wake, and the caller's `hasattr` guard cannot
         catch a swallowed one because this method always exists.
+
+        Select by `has_state_tier`, not method presence -- see
+        `_state_tier_sub`.
         """
-        c = _first_with(self._connectors, "enqueue_state_loads")
+        c = self._state_tier_sub()
         if c is None:
             return False
         return bool(c.enqueue_state_loads(loads))
@@ -501,8 +530,11 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         the CPU tier can never fill under `kv_connector: multi`, even with an
         offload sub-connector configured. `_adopt_state_tier` already guarantees
         at most one tier, so "first" is "only" here too.
+
+        Select by `has_state_tier`, not method presence -- see
+        `_state_tier_sub`.
         """
-        c = _first_with(self._connectors, "enqueue_state_stores")
+        c = self._state_tier_sub()
         if c is None:
             return False
         return bool(c.enqueue_state_stores(stores))
@@ -514,8 +546,11 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         `scheduler._update_from_kv_xfer_finished`). Missing here, the engine
         never drains store reports, so pins never settle and stored hashes are
         never indexed -- the CPU tier fills but nothing can be found in it.
+
+        Select by `has_state_tier`, not method presence -- see
+        `_state_tier_sub`.
         """
-        c = _first_with(self._connectors, "take_state_reports")
+        c = self._state_tier_sub()
         if c is None:
             return set(), set()
         return c.take_state_reports()
@@ -527,8 +562,11 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         Its own forwarder rather than a third element of `take_state_reports`,
         for the reason the offload connector records: that tuple's arity is a
         contract with the caller, and widening it once already wedged the pool.
+
+        Select by `has_state_tier`, not method presence -- see
+        `_state_tier_sub`.
         """
-        c = _first_with(self._connectors, "take_state_source_releases")
+        c = self._state_tier_sub()
         if c is None:
             return set()
         return c.take_state_source_releases()
