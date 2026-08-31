@@ -59,6 +59,16 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
         # Inert until a request has both legs, which only a joint boundary
         # produces; costs one dict lookup per report otherwise.
         self._joint_park = _JointPark()
+        # Stores this worker could not even attempt because the tier never
+        # built. Drained in `get_finished` into the SAME completion channels a
+        # real tier failure uses (index-failed + source-release), so the engine
+        # unpins their PAGE units now. This is a *worker-process* field; the
+        # scheduler's report path lives in a different process and cannot see a
+        # set written here -- the earlier code wrote a scheduler-only attribute
+        # from the worker, which does not exist here and raised AttributeError
+        # on the no-tier store path, taking the whole step's KV loads/saves down
+        # with it (super().start_load_kv never ran).
+        self._store_failed_no_tier: set[int] = set()
 
     def register_kv_caches(
         self, kv_caches: dict, transfer_tensors=None, num_blocks: int | None = None
@@ -110,6 +120,22 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
             # not caught: a zero-entry pool with the tier on is a sizing bug.
             logger.warning(
                 "kimi_k3 offload: %s owns no per-request state views; tier off.",
+                type(backend).__name__,
+            )
+            return
+
+        # The load direction reads `state_entry_views` (validated just above);
+        # the STORE direction reads `page_unit_views`, a *different* backend
+        # method (StateByteCodec.put -> backend.page_unit_views). A backend that
+        # implements one but not the other would build the tier and pass every
+        # load, then AttributeError on the first store -- and the tier's blind
+        # `except Exception` masks it as an endlessly "failed" store. Probe the
+        # store method at construction so the mismatch fails fast and visibly.
+        if not callable(getattr(backend, "page_unit_views", None)):
+            logger.warning(
+                "kimi_k3 offload: %s has state_entry_views but no callable "
+                "page_unit_views; the store path needs it, so a tier would fail "
+                "every store silently. State tier off.",
                 type(backend).__name__,
             )
             return
@@ -207,6 +233,17 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
         state_ids = {req_id for req_id, _h, _slot in loads}
         if not state_ids or not self._do_load:
             return
+        if self._state_tier is None:
+            # No tier means the state leg is unsettleable: `_start_state_loads`
+            # fails these loads for recompute, and `get_finished` returns at the
+            # `self._state_tier is None` guard BEFORE it drains the park via
+            # `_settle_joint`. Arming here would leave the park owing the KV leg
+            # forever -- the KV completion passes through un-held and the
+            # `_need`/`_alias`/`_alias_of` entry leaks, one per joint load per
+            # tier-None step. With no tier there is nothing to coordinate, so
+            # letting the KV load flow through the base path un-parked is exactly
+            # the correct behaviour for a KV-only load.
+            return
         for req in metadata.requests:
             if req.load_spec is not None and req.req_id in state_ids:
                 self._joint_park.arm(
@@ -259,7 +296,7 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
                 len(stores),
             )
             for op, _units in stores:
-                self._state_store_failed_locally.add(op)
+                self._store_failed_no_tier.add(op)
             return
         for op, unit_ids in stores:
             self._state_tier.submit_store(op, tuple(int(u) for u in unit_ids))
@@ -271,6 +308,22 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
     # -- completions -------------------------------------------------------
     def get_finished(self):
         out = super().get_finished()
+        # No-tier store failures must reach the engine even when the tier never
+        # built -- the engine pinned their PAGE units and is holding them
+        # against a report. Emit the tier's own failure pairing: index-failed so
+        # the aggregator takes quorum instead of waiting for a second report,
+        # plus a source-release so the units are freed now rather than on the
+        # reconciler's full timeout. Drained BEFORE the tier-None early return
+        # below, because that is exactly the case that populated this set.
+        if self._store_failed_no_tier:
+            for op in self._store_failed_no_tier:
+                out.connector_completions.add(
+                    ConnectorCompletion(STATE_INDEX_CHANNEL, op, False)
+                )
+                out.connector_completions.add(
+                    ConnectorCompletion(STATE_SOURCE_CHANNEL, op, True)
+                )
+            self._store_failed_no_tier = set()
         if self._state_tier is None:
             return out
         indexed, index_failed = self._state_tier.take_store_reports()
@@ -350,13 +403,14 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler):
         self._save_inflight_since: dict[str, float] = {}
         self._save_stalled = False
         self._warned_save_stalled = False
-        # Channel reports drained by the engine each step.
+        # Channel reports drained by the engine each step. No-tier store
+        # failures arrive here too, via the worker's STATE_INDEX_CHANNEL /
+        # STATE_SOURCE_CHANNEL completions -- the worker cannot write a
+        # scheduler field directly (different process), so there is no
+        # engine-side "failed locally" set to merge.
         self._state_indexed: set = set()
         self._state_index_failed: set = set()
         self._state_source_released: set = set()
-        # Stores this worker could not even attempt (no tier). Reported as
-        # failures so the engine releases their pinned units immediately.
-        self._state_store_failed_locally: set[int] = set()
 
     # -- state load queue --------------------------------------------------
     def enqueue_state_loads(self, loads) -> bool:
@@ -391,6 +445,23 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler):
         return (
             not self._save_stalled
             and len(self._save_inflight) < self._max_pending_saves
+        )
+
+    def has_pending_work(self) -> bool:
+        """Base KV liveness, plus this variant's state queues.
+
+        `DenseOffloadScheduler.has_pending_work` ORs only the KV load/save
+        trackers, so a step whose only outstanding work is a queued state load
+        or a last-of-burst state checkpoint reads as idle -- and the engine can
+        stop stepping before the tier is ever handed that work. Both queues are
+        drained into metadata every `build_connector_meta`, so OR-ing them keeps
+        the predicate monotone: it goes False the step after the work is
+        dispatched and never latches the busy loop.
+        """
+        return (
+            super().has_pending_work()
+            or bool(self._pending_state_loads)
+            or bool(self._pending_state_stores)
         )
 
     # -- save stall --------------------------------------------------------
@@ -542,10 +613,14 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler):
         return released
 
     def take_state_reports(self) -> tuple[set[int], set[int]]:
-        """Drain this step's tier store reports for the engine-side index."""
+        """Drain this step's tier store reports for the engine-side index.
+
+        Both real tier failures and no-tier worker failures land in
+        `_state_index_failed` via STATE_INDEX_CHANNEL, so there is a single
+        source of truth to drain.
+        """
         indexed = self._state_indexed
-        failed = self._state_index_failed | self._state_store_failed_locally
+        failed = self._state_index_failed
         self._state_indexed = set()
         self._state_index_failed = set()
-        self._state_store_failed_locally = set()
         return indexed, failed
