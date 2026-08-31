@@ -284,7 +284,11 @@ def test_mooncake_rdma_registers_all_alternate_hcas_for_upper_rail_gpu(monkeypat
         4,
         enable_alternate_hca=True,
         hca_count=8,
-    ) == ["ionic_4", *(f"ionic_{idx}" for idx in range(4)), *(f"ionic_{idx}" for idx in range(5, 8))]
+    ) == [
+        "ionic_4",
+        *(f"ionic_{idx}" for idx in range(4)),
+        *(f"ionic_{idx}" for idx in range(5, 8)),
+    ]
 
 
 def test_mooncake_rdma_registers_all_alternate_hcas_for_lower_rail_gpu(monkeypatch):
@@ -300,7 +304,13 @@ def test_mooncake_rdma_registers_all_alternate_hcas_for_lower_rail_gpu(monkeypat
         3,
         enable_alternate_hca=True,
         hca_count=8,
-    ) == ["ionic_3", "ionic_0", "ionic_1", "ionic_2", *(f"ionic_{idx}" for idx in range(4, 8))]
+    ) == [
+        "ionic_3",
+        "ionic_0",
+        "ionic_1",
+        "ionic_2",
+        *(f"ionic_{idx}" for idx in range(4, 8)),
+    ]
 
 
 def test_mooncake_rdma_skips_missing_alternate_hcas(monkeypatch):
