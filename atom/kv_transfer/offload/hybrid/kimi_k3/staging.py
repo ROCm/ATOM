@@ -184,10 +184,21 @@ class StagedTransfer:
             state = self.thread_state()
             staging_buffer = state.staging_buffer
             if dst_tensor.is_cuda and dst_tensor.device == self.device:
-                with state.stream_ctx(state.pack_stream):
-                    fused_pack_chunk_major(segments, seg_bytes, [1], [0], dst_tensor)
-                if state.pack_stream is not None:
-                    state.pack_stream.synchronize()
+                # Direct-to-device fast path: no staging hop, but the gather
+                # still reads the source units on `pack_stream`. If the kernel
+                # launch raises we must drain before propagating -- otherwise
+                # the caller frees those units while a queued gather is still
+                # about to read them (same hazard as the general path's except).
+                try:
+                    with state.stream_ctx(state.pack_stream):
+                        fused_pack_chunk_major(
+                            segments, seg_bytes, [1], [0], dst_tensor
+                        )
+                    if state.pack_stream is not None:
+                        state.pack_stream.synchronize()
+                except Exception:
+                    self._drain_device()
+                    raise
                 return
             device_buf = self.ensure_buffer(staging_buffer, nbytes)
             try:
@@ -238,10 +249,22 @@ class StagedTransfer:
             state = self.thread_state()
             staging_buffer = state.staging_buffer
             if src_tensor.is_cuda and src_tensor.device == self.device:
-                with state.stream_ctx(state.pack_stream):
-                    fused_unpack_chunk_major(src_tensor, segments, seg_bytes, [1], [0])
-                if state.pack_stream is not None:
-                    state.pack_stream.synchronize()
+                # Direct-from-device fast path: the unpack kernel writes the
+                # destination `segments` (the request's state slots) on
+                # `pack_stream`. If the launch raises we must drain before
+                # propagating -- otherwise the caller frees those slots while a
+                # queued kernel is still about to write them, corrupting the
+                # next request that gets the slot (mirror of the general path).
+                try:
+                    with state.stream_ctx(state.pack_stream):
+                        fused_unpack_chunk_major(
+                            src_tensor, segments, seg_bytes, [1], [0]
+                        )
+                    if state.pack_stream is not None:
+                        state.pack_stream.synchronize()
+                except Exception:
+                    self._drain_device()
+                    raise
                 return
             device_buf = self.ensure_buffer(staging_buffer, nbytes)
             try:
@@ -256,6 +279,12 @@ class StagedTransfer:
                 self._finish(state, state.pack_stream)
             except Exception:
                 staging_buffer.free_event_valid = False
+                # Mirror of pack()'s except: the unpack kernel scatters into the
+                # caller's destination segments on pack_stream. Returning while
+                # that kernel is still queued would let the owner reuse the
+                # slots under a pending write -- silent state corruption. Drain
+                # every queued kernel before propagating the failure.
+                self._drain_device()
                 raise
             finally:
                 self.release_buffer_if_requested(staging_buffer)
