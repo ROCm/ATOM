@@ -57,11 +57,7 @@ class _PerLayerPoolGeometry:
         return max(1, self.block_size // HCA_RATIO)
 
     def block_rows(self, ratio: int) -> int:
-        return (
-            self.block_size // ratio
-            if ratio in (CSA_RATIO, HCA_RATIO)
-            else 0
-        )
+        return self.block_size // ratio if ratio in (CSA_RATIO, HCA_RATIO) else 0
 
     def window_params(self, ratio: int) -> WindowParams:
         return WindowParams(
