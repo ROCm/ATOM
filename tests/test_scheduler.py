@@ -53,22 +53,25 @@ class TestSpecSection:
 class TestCacheSection:
     def test_update_accumulates_tokens(self):
         stats = EngineStats(enable_prefix_caching=True)
-        # update_cache(cached, full, compressed, wanted)
-        stats.update_cache(4, 10, 8, 6)
+        # update_cache(cached, full, compressed, wanted, reusable)
+        stats.update_cache(4, 10, 8, 6, 9)
         assert stats.total_requests == 1
         assert stats.total_cached_tokens == 4
         assert stats.total_full_tokens == 10
         assert stats.total_compressed_tokens == 8
         assert stats.total_wanted_tokens == 6
+        assert stats.total_reusable_tokens == 9
 
     def test_hit_rate_zero_when_no_updates(self):
         stats = EngineStats(enable_prefix_caching=True)
         assert stats.cache_hit_rate == 0.0
 
-    def test_hit_rate_matches_cached_over_full(self):
+    def test_hit_rate_is_over_reusable_not_full(self):
+        """`full` includes the trailing block no cache may serve, so the rate is
+        denominated in `reusable` — 4/8, not 4/10."""
         stats = EngineStats(enable_prefix_caching=True)
-        stats.update_cache(4, 10, 8, 6)
-        assert stats.cache_hit_rate == 0.4
+        stats.update_cache(4, 10, 8, 6, 8)
+        assert stats.cache_hit_rate == 0.5
 
     def test_recent_hit_rate_tracks_the_window_not_all_history(self):
         """The reviewer's scenario: a long run whose early traffic reused a lot
@@ -76,11 +79,11 @@ class TestCacheSection:
         and barely moves; the windowed one follows the current workload."""
         stats = EngineStats(enable_prefix_caching=True, cache_hit_rate_window=100)
         for _ in range(100):  # early: 80% reuse
-            stats.update_cache(80, 100, 80, 80)
+            stats.update_cache(80, 100, 80, 80, 100)
         assert stats.recent_cache_hit_rate == pytest.approx(0.8)
 
         for _ in range(100):  # later: none at all, filling the window
-            stats.update_cache(0, 100, 0, 0)
+            stats.update_cache(0, 100, 0, 0, 100)
         assert stats.recent_cache_hit_rate == pytest.approx(0.0)
         # Lifetime still reports the average of both halves, as it should.
         assert stats.cache_hit_rate == pytest.approx(0.4)
@@ -93,16 +96,16 @@ class TestCacheSection:
         """The deque must not grow with the run — it is a fixed-size window."""
         stats = EngineStats(enable_prefix_caching=True, cache_hit_rate_window=10)
         for _ in range(500):
-            stats.update_cache(1, 10, 1, 1)
+            stats.update_cache(1, 10, 1, 1, 10)
         assert len(stats._recent_hits) == 10
-        assert stats._recent_full_tokens == 100  # 10 requests x 10 tokens
+        assert stats._recent_reusable_tokens == 100  # 10 requests x 10 tokens
         assert stats.total_requests == 500, "lifetime counters keep counting"
 
     def test_update_is_noop_when_cache_disabled(self):
         """The cache section gates internally, so a disabled EngineStats
         ignores update_cache rather than the caller having to guard it."""
         stats = EngineStats(enable_prefix_caching=False)
-        stats.update_cache(4, 10, 8, 6)
+        stats.update_cache(4, 10, 8, 6, 9)
         assert stats.total_requests == 0
         assert stats.total_cached_tokens == 0
 
@@ -262,13 +265,13 @@ class TestThroughputSection:
             enable_prefix_caching=True,
             throughput_log_interval_s=1e-6,
         )
-        stats.update_cache(4, 10, 8, 6)  # cached=4 of full=10
+        stats.update_cache(4, 10, 8, 6, 8)  # cached=4 of reusable=8
         with caplog.at_level(logging.INFO, logger="atom"):
             stats.update_throughput(num_prompt_tokens=10)
             stats.maybe_log_throughput(
                 num_running_reqs=1, num_waiting_reqs=0, kv_usage=0.1
             )
-        assert "Prefix cache hit rate: 40.0%" in caplog.text
+        assert "Prefix cache hit rate: 50.0%" in caplog.text
 
     def test_label_defaults_to_empty_so_the_line_is_unchanged(self):
         assert EngineStats(enable_log_stats=True).label == ""

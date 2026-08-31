@@ -2575,11 +2575,11 @@ class TestCacheStatsAttribution:
         could exist and the shortfall is charged to a pool that was never
         offered the block.
         """
-        stats = CacheStats(log_interval=10**6)
+        stats = EngineStats(enable_prefix_caching=True, cache_log_interval=10**6)
         # 100 tokens, 90 reusable: every reusable token was served by cache.
-        stats.update(90, 100, 90, 90, 90)
+        stats.update_cache(90, 100, 90, 90, 90)
 
-        assert stats.hit_rate == 1.0
+        assert stats.cache_hit_rate == 1.0
         assert stats.paged_hit_rate == 1.0
         assert stats.state_hit_rate == 1.0
 
@@ -2591,18 +2591,18 @@ class TestCacheStatsAttribution:
         scored against `compressed`, not `reusable` -- otherwise a KV eviction
         shows up as a state-cache failure and sends tuning at the wrong pool.
         """
-        stats = CacheStats(log_interval=10**6)
+        stats = EngineStats(enable_prefix_caching=True, cache_log_interval=10**6)
         # Of 100 reusable, the paged pool had 80 (80%); of those 80 the state
         # gates admitted 60 (75%). End to end: 60%.
-        stats.update(60, 128, 80, 70, 100)
+        stats.update_cache(60, 128, 80, 70, 100)
 
         assert stats.paged_hit_rate == 0.80
         assert stats.state_hit_rate == 0.75
-        assert stats.hit_rate == 0.60
+        assert stats.cache_hit_rate == 0.60
         # approx, not ==: the identity is exact over the integer counters, but
         # each rate is a float division first, so the product carries rounding.
         assert stats.paged_hit_rate * stats.state_hit_rate == pytest.approx(
-            stats.hit_rate
+            stats.cache_hit_rate
         )
 
     def test_a_kv_eviction_does_not_lower_the_state_cache_score(self):
@@ -2612,10 +2612,10 @@ class TestCacheStatsAttribution:
         boundary the paged pool offered -- must score the same on
         `state_hit_rate` however much prefix the paged pool lost.
         """
-        healthy = CacheStats(log_interval=10**6)
-        healthy.update(100, 128, 100, 100, 100)
-        evicted = CacheStats(log_interval=10**6)
-        evicted.update(40, 128, 40, 40, 100)  # paged pool lost 60% of the prefix
+        healthy = EngineStats(enable_prefix_caching=True, cache_log_interval=10**6)
+        healthy.update_cache(100, 128, 100, 100, 100)
+        evicted = EngineStats(enable_prefix_caching=True, cache_log_interval=10**6)
+        evicted.update_cache(40, 128, 40, 40, 100)  # paged pool lost 60% of the prefix
 
         assert evicted.paged_hit_rate < healthy.paged_hit_rate
         assert evicted.state_hit_rate == healthy.state_hit_rate == 1.0
@@ -2626,9 +2626,9 @@ class TestCacheStatsAttribution:
         The distance from there to 1.0 is loss no checkpoint touches, and so
         the honest cap on what more groups are worth.
         """
-        stats = CacheStats(log_interval=10**6)
+        stats = EngineStats(enable_prefix_caching=True, cache_log_interval=10**6)
         # 80 offered, 50 admitted; a dense ladder would have reached 70.
-        stats.update(50, 128, 80, 70, 100)
+        stats.update_cache(50, 128, 80, 70, 100)
 
         assert stats.state_hit_rate == 0.625
         assert stats.state_recoverable_loss_rate == 0.25
@@ -2644,15 +2644,15 @@ class TestCacheStatsAttribution:
         a log line -- and only in builds without `-O`, so the two would differ
         in behaviour.
         """
-        stats = CacheStats(log_interval=10**6)
+        stats = EngineStats(enable_prefix_caching=True, cache_log_interval=10**6)
         with caplog.at_level(logging.WARNING):
-            stats.update(50, 128, 40, 45, 100)  # cached > compressed
-            stats.update(50, 128, 90, 60, 80)  # compressed > reusable
+            stats.update_cache(50, 128, 40, 45, 100)  # cached > compressed
+            stats.update_cache(50, 128, 90, 60, 80)  # compressed > reusable
 
         assert stats.total_requests == 2, "both were counted, neither raised"
         assert sum("clamping" in r.message for r in caplog.records) == 2
         # Clamped into order, so every rate stays inside [0, 1].
-        assert 0.0 <= stats.hit_rate <= 1.0
+        assert 0.0 <= stats.cache_hit_rate <= 1.0
         assert 0.0 <= stats.paged_hit_rate <= 1.0
         assert 0.0 <= stats.state_hit_rate <= 1.0
         assert stats.total_cached_tokens <= stats.total_compressed_tokens
@@ -2682,8 +2682,8 @@ class TestCacheStatsAttribution:
         sched._schedule_prefill_seq(seq, 44, {}, [], 0, 0)
 
         matchable_blocks = sched.block_manager._n_hash_blocks(seq) - 1
-        assert sched.cache_stats.total_reusable_tokens == matchable_blocks * hbs
-        assert sched.cache_stats.total_reusable_tokens < seq.num_tokens
+        assert sched.engine_stats.total_reusable_tokens == matchable_blocks * hbs
+        assert sched.engine_stats.total_reusable_tokens < seq.num_tokens
 
     def test_a_sequence_below_one_block_has_nothing_to_reuse(self):
         """The `n_hash_blocks - 1` ceiling goes negative for a short prompt.
@@ -2692,10 +2692,10 @@ class TestCacheStatsAttribution:
         prefill must compute -- and a negative denominator would invert every
         rate on the line.
         """
-        stats = CacheStats(log_interval=10**6)
-        stats.update(0, 10, 0, 0, 0)
+        stats = EngineStats(enable_prefix_caching=True, cache_log_interval=10**6)
+        stats.update_cache(0, 10, 0, 0, 0)
         assert stats.total_reusable_tokens == 0
-        assert stats.hit_rate == 0.0
+        assert stats.cache_hit_rate == 0.0
         assert stats.paged_hit_rate == 0.0
 
 
