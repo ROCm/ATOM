@@ -436,6 +436,16 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             if hasattr(c, "request_finished"):
                 c.request_finished(seq)
 
+    def abandon_save(self, req_id: Any) -> None:
+        # Reclamation of a stalled offload save (see
+        # `DenseOffloadConnector.abandon_save`). Only the offload sub tracks
+        # `_save_inflight`; forward to whichever sub implements it. Idempotent
+        # (pop-with-default), so fanning to all is harmless.
+        for c in self._connectors:
+            fn = getattr(c, "abandon_save", None)
+            if callable(fn):
+                fn(req_id)
+
     # -- offload-specific methods, forwarded to the owning sub --------------
     # The scheduler guards every one of these with hasattr(), so MultiConnector
     # only needs to expose them when a sub-connector implements them.

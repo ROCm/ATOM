@@ -170,6 +170,9 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
     def save_finished(self, req_id) -> None:
         self._impl.save_finished(req_id)
 
+    def abandon_save(self, req_id) -> None:
+        self._impl.abandon_save(req_id)
+
     def load_failed(self, req_id):
         return self._impl.load_failed(req_id)
 

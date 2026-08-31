@@ -1431,6 +1431,8 @@ class TestStalledOffloadSaveReclaim:
         s.deferred_free_blocks = {seq.id: seq for seq in deferred}
         s._abandoned_saves = 0
         s._next_save_reconcile_at = 0.0
+        # Production always sets this (possibly None); reclaim now notifies it.
+        s.kv_connector = None
         freed: list[int] = []
         s.block_manager = SimpleNamespace(deallocate=lambda q: freed.append(q.id))
         return s, freed
@@ -1447,6 +1449,23 @@ class TestStalledOffloadSaveReclaim:
         assert freed == [1], "only the stalled save is reclaimed"
         assert 2 in s.deferred_free_blocks, "a save still inside its window is kept"
         assert s._abandoned_saves == 1
+
+    def test_reclaim_notifies_the_connector_to_drop_the_save(self, monkeypatch):
+        """Freeing blocks is not enough: without `abandon_save` the connector's
+        `_save_inflight` keeps the request, `has_pending_kv_work()` never clears,
+        and the engine busy-loops (review finding #4)."""
+        import time as _time
+
+        now = _time.monotonic()
+        stale = SimpleNamespace(id=1, _deferred_save_at=now - 500.0)
+        s, freed = self._sched(monkeypatch, [stale])
+        abandoned: list = []
+        s.kv_connector = SimpleNamespace(abandon_save=lambda sid: abandoned.append(sid))
+
+        assert s._reconcile_stalled_deferred_saves() == 1
+        assert freed == [1]
+        # Notified with the string request id, matching the connector's sid keys.
+        assert abandoned == ["1"]
 
     def test_it_self_throttles_so_a_1ms_poll_is_cheap(self, monkeypatch):
         import time as _time

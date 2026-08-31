@@ -327,6 +327,17 @@ class OffloadSchedulerMixin:
         self.total_save_requests += 1
         self.total_saved_tokens += tokens
 
+    def _cancel_save_statistics(self, operation) -> None:
+        """Forget a save retired without a terminal (scheduler abandon).
+
+        Mirror of `_cancel_load_statistics`: the bytes were never persisted, so
+        this must not bump `total_save_requests`/`total_saved_tokens` the way
+        `_finish_save_statistics` does -- it only drops the inflight-tokens entry
+        so the pending gauge does not leak.
+        """
+
+        self._save_inflight_tokens.pop(operation, None)
+
     def get_statistics(self) -> dict[str, int]:
         """Return cumulative counters and exact-operation queue depths."""
 

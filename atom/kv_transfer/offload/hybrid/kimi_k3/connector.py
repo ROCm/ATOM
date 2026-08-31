@@ -494,6 +494,18 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler):
                 len(self._save_inflight),
             )
 
+    def abandon_save(self, req_id) -> None:
+        """Drop a reclaimed save, then recompute the stall latch.
+
+        K3 ages saves off `_save_inflight` (`_refresh_save_stall`). Once the
+        base drops the inflight entry, re-run the refresh so the age index sheds
+        the abandoned sid (its `_save_inflight_since` sweep) and the stall latch
+        clears -- otherwise `_save_stalled` stays stuck True on a save that is
+        already gone.
+        """
+        super().abandon_save(req_id)
+        self._refresh_save_stall()
+
     def should_defer_free(self, seq) -> bool:
         """Base behaviour, plus an escape when the backend has stopped.
 

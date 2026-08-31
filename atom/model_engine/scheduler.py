@@ -1415,6 +1415,19 @@ class Scheduler:
         callback = getattr(self.kv_connector, "should_defer_free", None)
         return bool(callable(callback) and callback(seq))
 
+    def _connector_abandon_save(self, seq: Sequence) -> None:
+        """Tell the connector to drop a save this reclaim just abandoned.
+
+        Without it the connector's `_save_inflight` (and, on K3, the stall
+        latch) keeps the reclaimed request forever: `should_defer_free` stays
+        True and `has_pending_kv_work()` never goes False, so the engine
+        busy-loops. Guarded because not every connector implements offload
+        saves.
+        """
+        callback = getattr(self.kv_connector, "abandon_save", None)
+        if callable(callback):
+            callback(str(seq.id))
+
     def _maybe_release_deferred(self, seq: Sequence) -> None:
         if (
             seq.id not in self.deferred_free_blocks
@@ -1443,7 +1456,12 @@ class Scheduler:
 
         Mirrors the producer `finished_sending` reclaim (pop + deallocate),
         deliberately not re-invoking `request_finished`: it was already called
-        when the request finished, before the block free was deferred.
+        when the request finished, before the block free was deferred. It does
+        notify the connector via `abandon_save`, though -- freeing the blocks
+        here is not enough on its own: the connector still holds the save in
+        `_save_inflight` (and, on K3, in the stall latch), so `should_defer_free`
+        would stay True and `has_pending_kv_work()` would never clear without
+        that drop.
 
         The complement of the K3 connector's stall escape
         (`kimi_k3.connector.SAVE_STALL_SECONDS`), not a duplicate of it: that
@@ -1467,6 +1485,7 @@ class Scheduler:
         ]
         for seq in stalled:
             self.deferred_free_blocks.pop(seq.id, None)
+            self._connector_abandon_save(seq)
             self.block_manager.deallocate(seq)
             self._abandoned_saves += 1
         if stalled:

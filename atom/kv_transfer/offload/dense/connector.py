@@ -684,7 +684,8 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
 
         Feeds ``EngineCore.has_pending_kv_work()``, so it reads only state
         that clears itself: ``_reqs_need_recv`` is emptied by every
-        ``build_connector_meta`` and ``_save_inflight`` by ``save_finished``.
+        ``build_connector_meta`` and ``_save_inflight`` by ``save_finished``
+        (or ``abandon_save`` when the scheduler reclaims a stalled save).
         Saves that are queued but not yet dispatched are covered there by the
         scheduler's ``deferred_free_blocks``, which ``should_defer_free``
         keeps populated for exactly those requests.
@@ -704,6 +705,29 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             return
         self._save_inflight.pop(sid, None)
         self._finish_save_statistics(req_id)
+
+    def abandon_save(self, req_id) -> None:
+        """Force-drop a save the scheduler reclaimed after it stalled.
+
+        `save_finished` is the completion path: it matches the exact
+        `SaveOperationId` and, handed a raw request id while an exact generation
+        is parked, deliberately refuses -- a delayed TP notification must not
+        complete a newer lifecycle. Reclamation is the opposite need. The
+        scheduler's `_reconcile_stalled_deferred_saves` has already freed the
+        blocks of a save the backend never reported (LMCache force-unpins a
+        stalled save without a completion) and holds only the raw request id, so
+        drop the entry unconditionally. Without this the entry lingers,
+        `should_defer_free` stays True and `has_pending_work` never clears, and
+        the engine busy-loops with every GPU idle. Not a completion: the bytes
+        were never persisted, so the statistics are *cancelled*, not finished,
+        and the tracker entry is dropped so the save loop cannot re-emit it
+        against freed blocks.
+        """
+        sid = str(req_id.req_id if isinstance(req_id, SaveOperationId) else req_id)
+        operation = self._save_inflight.pop(sid, None)
+        if operation is not None:
+            self._cancel_save_statistics(operation)
+        self._save_tracker.pop(sid, None)
 
     def load_failed(self, req_id) -> bool:
         sid = str(req_id.req_id if isinstance(req_id, LoadOperationId) else req_id)
