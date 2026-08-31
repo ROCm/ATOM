@@ -113,7 +113,6 @@ class StagedTransfer:
                 dtype=torch.uint8,
                 device=self.device,
             )
-            staging_buffer.free_event_valid = False
         return staging_buffer.tensor[:nbytes]
 
     def release_buffer_if_requested(
@@ -123,7 +122,6 @@ class StagedTransfer:
         if not self._release_after_transfer:
             return
         staging_buffer.tensor = None
-        staging_buffer.free_event_valid = False
 
     def memory_tensor(self, memory_obj: Any, nbytes: int) -> torch.Tensor:
         tensor = getattr(memory_obj, "tensor", None)
@@ -221,7 +219,6 @@ class StagedTransfer:
                     )
                 self._finish(state, state.copy_stream)
             except Exception:
-                staging_buffer.free_event_valid = False
                 # The caller must release the source units on this path too --
                 # otherwise a failed store holds a whole image out of the KV
                 # pool. Draining the device first is what makes that safe: the
@@ -287,7 +284,6 @@ class StagedTransfer:
                     fused_unpack_chunk_major(device_buf, segments, seg_bytes, [1], [0])
                 self._finish(state, state.pack_stream)
             except Exception:
-                staging_buffer.free_event_valid = False
                 # Mirror of pack()'s except: the unpack kernel scatters into the
                 # caller's destination segments on pack_stream. Returning while
                 # that kernel is still queued would let the owner reuse the
@@ -306,8 +302,11 @@ class StagedTransfer:
 
     @staticmethod
     def _finish(state: _ThreadTransferState, producer) -> None:
-        """Publish the result: the buffer is free again once `producer` drains,
-        and the caller may not observe the bytes until it has."""
-        state.staging_buffer.free_event.record(producer)
-        state.staging_buffer.free_event_valid = True
+        """Publish the result synchronously: block until `producer` drains, so
+        the buffer is free and the caller may observe the bytes on return.
+
+        Unlike `run_staged_pipeline`, this path does not hand a `free_event`
+        to a later consumer -- `producer.synchronize()` is the whole fence -- so
+        it deliberately leaves the shared buffer's `free_event`/
+        `free_event_valid` untouched."""
         producer.synchronize()
