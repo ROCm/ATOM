@@ -955,7 +955,7 @@ def _make_compress_plans(extend_lens_cpu, context_lens_cpu, device):
         [(4, True), (128, False)],
         plan_buffers=plan_buffers,
     )
-    # Eager path (graph_bs unset): full-buffer write slice; the eager bridge
+    # Eager path (running_bs unset): full-buffer write slice; the eager bridge
     # launches update_compressor_states with exactly num_write rows.
     for plan in plans.values():
         plan.write_plan_gpu = plan.write_plan_gpu[: plan.num_write]
@@ -1016,12 +1016,12 @@ class _V4SGLangDecodeGraphBuffers:
         self.idx_csa = i32(t * max(1, win + topk))
         self.idx_hca = i32(t * max(1, win + hca))
 
-        # Decode CG plan slicing is `graph_bs * per_seq_bound` (computed inside
-        # make_compress_plans). graph_bs == num_slots (padded decode batch);
+        # Decode CG plan slicing is `running_bs * per_seq_bound` (computed inside
+        # make_compress_plans). running_bs == num_slots (padded decode batch);
         # max_q_len == 1 + max_spec_steps (== max_decode_tokens // num_slots).
-        self.decode_graph_bs = s
+        self.decode_running_bs = s
         self.decode_q_len = max(1, t // s)
-        # Compress buffer sized to the graph_bs compress cap `s*ceil(qlen/ratio)`
+        # Compress buffer sized to the running_bs compress cap `s*ceil(qlen/ratio)`
         # (matches make_compress_plans' slice); write buffer to `s*K_pool`. Sizing
         # flat `s` would undersize the compress plan once ceil(qlen/ratio)>1 (mtp_k
         # >= 4). Mirrors the vllm bridge's `S*per_seq` sizing.
@@ -1137,7 +1137,7 @@ def _make_decode_graph_compress_plans(extend_lens_cpu, context_lens_cpu, bufs):
         np.ascontiguousarray(context_lens_cpu, dtype=np.int32),
         [(4, True), (128, False)],
         plan_buffers=bufs.plan_buffers,
-        graph_bs=bufs.decode_graph_bs,
+        running_bs=bufs.decode_running_bs,
         max_q_len=bufs.decode_q_len,
     )
 

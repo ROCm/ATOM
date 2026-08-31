@@ -8,14 +8,24 @@ constructed Python objects and uses them in ``AtomStandaloneRouter``.
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
 import importlib
 import importlib.util
 import json
 import logging
-from pathlib import Path
 import sys
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
+
+from atom.entrypoints.openai.tool_parser.registry import (
+    TOOL_CALL_PARSER_HELP,
+    validate_tool_call_parser,
+)
+from atom.utils.gc_utils import (
+    freeze_gc_heap,
+    maybe_attach_gc_debug_callback,
+    tune_gc,
+)
 
 logger = logging.getLogger("atom")
 
@@ -76,7 +86,7 @@ def print_version(verbose: bool = False) -> None:
             else atomesh_runner.version_string
         )
         print(version_fn())
-    except Exception:
+    except Exception:  # noqa: BLE001 - a version banner must not fail the CLI
         print("Atomesh Python interface")
 
 
@@ -101,12 +111,12 @@ def initialize_standalone_service(
 ) -> Any:
     from atom.entrypoints.atomesh.atom_standalone_service import AtomStandaloneService
 
-    global engine, tokenizer
     return AtomStandaloneService(
         engine=engine,
         tokenizer=tokenizer,
         model_name=args.model,
         default_chat_template_kwargs=default_chat_template_kwargs,
+        tool_call_parser=getattr(args, "tool_call_parser", None),
     )
 
 
@@ -133,6 +143,35 @@ def split_standalone_mesh_args(raw_args: list[str]) -> tuple[list[str], list[str
     return python_args, mesh_args
 
 
+def _is_atom_tool_call_parser(value: str | None) -> bool:
+    """Whether this name is one ATOM's own resolver understands.
+
+    A question, not an assertion: the mesh router answers to a different set
+    of names for the same flag, and neither side owns the other's.
+    """
+    if value is None:
+        return False
+    try:
+        validate_tool_call_parser(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _forward_tool_call_parser(value: str | None) -> list[str]:
+    """Give the mesh router back the flag the Python parser just consumed.
+
+    `--tool-call-parser` has two consumers with two vocabularies: the Rust
+    router declares its own (`cliargs.rs`, sglang spelling) and reads it in
+    `app_context`, and the Python service resolves it to a `ToolCallParser`.
+    Until this entrypoint registered the flag it reached the router as an
+    unrecognised arg and was passed straight through; registering it made
+    `parse_known_args` swallow it, so the router silently lost a setting that
+    had been reaching it. Both need it, so both get it.
+    """
+    return [] if value is None else ["--tool-call-parser", value]
+
+
 def json_object_arg(raw_value: str) -> dict[str, Any]:
     try:
         parsed = json.loads(raw_value)
@@ -157,6 +196,14 @@ def parse_standalone_args(raw_args: list[str]) -> StandaloneArgs:
     )
     EngineArgs.add_cli_args(parser)
     parser.add_argument(
+        "--tool-call-parser",
+        type=str,
+        # Not "auto": that is what *unset* resolves to anyway, and telling the
+        # two apart is what decides whether the mesh router is told as well.
+        default=None,
+        help=TOOL_CALL_PARSER_HELP,
+    )
+    parser.add_argument(
         "--default-chat-template-kwargs",
         type=json_object_arg,
         default=None,
@@ -168,10 +215,35 @@ def parse_standalone_args(raw_args: list[str]) -> StandaloneArgs:
 
     python_raw_args, mesh_network_args = split_standalone_mesh_args(raw_args)
     engine_args, mesh_args = parser.parse_known_args(python_raw_args)
+    forwarded = engine_args.tool_call_parser
+
+    # Not validated against ATOM's vocabulary here, and that is the point.
+    # This flag has two consumers with disjoint vocabularies: the Rust router
+    # declares its own (`json`, `python`, `xml`, `hermes`) and ATOM's
+    # resolver takes `dsml`, `glm`, `kimi`, `kimi_k3`, `minimax`, `qwen`.
+    # Raising on a name ATOM does not know would kill any existing standalone
+    # deployment launched with a router name -- before this entrypoint
+    # registered the flag at all, those passed straight through.
+    #
+    # So: a name ATOM knows binds ATOM's parser, anything else is the
+    # router's and ATOM falls back to reading the chat template. Either way
+    # the value reaches the router, and the choice is logged.
+    if engine_args.tool_call_parser is not None and not _is_atom_tool_call_parser(
+        engine_args.tool_call_parser
+    ):
+        logger.info(
+            "--tool-call-parser=%r is not one of ATOM's formats, so it is "
+            "forwarded to the mesh router and ATOM reads its own format from "
+            "the chat template.",
+            engine_args.tool_call_parser,
+        )
+        engine_args.tool_call_parser = None
 
     return StandaloneArgs(
         engine_args=engine_args,
-        mesh_args=mesh_args + mesh_network_args,
+        mesh_args=(
+            mesh_args + mesh_network_args + _forward_tool_call_parser(forwarded)
+        ),
         default_chat_template_kwargs=engine_args.default_chat_template_kwargs or {},
     )
 
@@ -185,6 +257,13 @@ def launch_atom_standalone(atomesh_runner: Any, raw_args: list[str]) -> None:
         standalone_args.engine_args,
         standalone_args.default_chat_template_kwargs,
     )
+
+    # This frontend is the api_server's counterpart -- same tokenizer, same
+    # per-request accumulators -- but it builds its engine itself and never
+    # runs that FastAPI lifespan, so it has to apply the GC policy here.
+    tune_gc()
+    maybe_attach_gc_debug_callback("atomesh")
+    freeze_gc_heap("atomesh")
 
     print("\033[32mATOM starting...\033[0m")
     print(f"\033[32mHost: {cli_args['host']}:{cli_args['port']}\033[0m")

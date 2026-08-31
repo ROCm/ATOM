@@ -60,6 +60,8 @@ def test_rtp_sparse_attn_indexer_bridge_forwards_to_main_indexer(monkeypatch):
     monkeypatch.setitem(sys.modules, "atom.models.deepseek_v2", fake_deepseek)
 
     tensor = torch.empty(1)
+    dcp_indptr = torch.empty(0, dtype=torch.int32)
+    dcp_counts = torch.empty(0, dtype=torch.int32)
     output = module.rtp_sparse_attn_indexer(
         tensor,
         "indexer.prefix",
@@ -74,6 +76,8 @@ def test_rtp_sparse_attn_indexer_bridge_forwards_to_main_indexer(monkeypatch):
         4096,
         1,
         tensor,
+        dcp_indptr,
+        dcp_counts,
         tensor,
         tensor,
         1e-6,
@@ -83,6 +87,7 @@ def test_rtp_sparse_attn_indexer_bridge_forwards_to_main_indexer(monkeypatch):
         1.0,
         True,
         False,
+        False,
     )
 
     assert output is expected
@@ -90,6 +95,8 @@ def test_rtp_sparse_attn_indexer_bridge_forwards_to_main_indexer(monkeypatch):
     assert calls[0][0] is tensor
     assert calls[0][1] == "indexer.prefix"
     assert calls[0][6:12] == (128, None, 2048, 64, 4096, 1)
+    assert calls[0][13] is dcp_indptr
+    assert calls[0][14] is dcp_counts
 
 
 def test_rtp_sparse_attn_indexer_uses_rtp_topk_path_when_context_exists(monkeypatch):
@@ -139,6 +146,8 @@ def test_rtp_sparse_attn_indexer_uses_rtp_topk_path_when_context_exists(monkeypa
         4096,
         1,
         torch.empty(1, 2048, dtype=torch.int32),
+        torch.empty(0, dtype=torch.int32),
+        torch.empty(0, dtype=torch.int32),
         tensor,
         tensor,
         1e-6,
@@ -147,6 +156,7 @@ def test_rtp_sparse_attn_indexer_uses_rtp_topk_path_when_context_exists(monkeypa
         tensor,
         1.0,
         True,
+        False,
         False,
     )
 
@@ -172,6 +182,8 @@ def test_rtp_sparse_attn_indexer_fake_bridge_forwards_to_main_fake(monkeypatch):
     monkeypatch.setitem(sys.modules, "atom.models.deepseek_v2", fake_deepseek)
 
     tensor = torch.empty(1)
+    dcp_indptr = torch.empty(0, dtype=torch.int32)
+    dcp_counts = torch.empty(0, dtype=torch.int32)
     output = module.rtp_sparse_attn_indexer_fake(
         tensor,
         "indexer.prefix",
@@ -186,6 +198,8 @@ def test_rtp_sparse_attn_indexer_fake_bridge_forwards_to_main_fake(monkeypatch):
         4096,
         1,
         tensor,
+        dcp_indptr,
+        dcp_counts,
         tensor,
         tensor,
         1e-6,
@@ -195,6 +209,7 @@ def test_rtp_sparse_attn_indexer_fake_bridge_forwards_to_main_fake(monkeypatch):
         1.0,
         True,
         False,
+        False,
     )
 
     assert output is expected
@@ -202,6 +217,8 @@ def test_rtp_sparse_attn_indexer_fake_bridge_forwards_to_main_fake(monkeypatch):
     assert calls[0][0] is tensor
     assert calls[0][1] == "indexer.prefix"
     assert calls[0][6:12] == (128, None, 2048, 64, 4096, 1)
+    assert calls[0][13] is dcp_indptr
+    assert calls[0][14] is dcp_counts
 
 
 def test_rtp_sparse_attn_indexer_short_prefill_fills_causal_topk(monkeypatch):
@@ -245,6 +262,8 @@ def test_rtp_sparse_attn_indexer_short_prefill_fills_causal_topk(monkeypatch):
         4096,
         3,
         topk_buffer,
+        torch.empty(0, dtype=torch.int32),
+        torch.empty(0, dtype=torch.int32),
         tensor,
         tensor,
         1e-6,
@@ -253,6 +272,7 @@ def test_rtp_sparse_attn_indexer_short_prefill_fills_causal_topk(monkeypatch):
         tensor,
         1.0,
         True,
+        False,
         False,
     )
 

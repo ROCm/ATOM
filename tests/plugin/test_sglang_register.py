@@ -11,8 +11,9 @@ under test.
 import importlib
 import sys
 from types import ModuleType
-import pytest
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from atom.plugin import prepare as plugin_prepare
 

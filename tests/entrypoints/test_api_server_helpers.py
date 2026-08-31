@@ -13,12 +13,15 @@ rather than block the rest of the suite.
 
 from __future__ import annotations
 
+import ast
 import asyncio
+import inspect
 import sys
 import types
 from types import SimpleNamespace
 
 import pytest
+from import_guard import skip_if_dependency_missing
 
 
 def _install_api_server_stubs() -> list[str]:
@@ -54,14 +57,14 @@ def _install_api_server_stubs() -> list[str]:
             sys.modules[mod_name] = stub
             injected.append(mod_name)
 
-    class _StubCoreManager:  # noqa: D401 - placeholder
+    class _StubCoreManager:
         def __init__(self, *a, **kw):
             pass
 
         def add_request(self, reqs):
             return None
 
-    class _StubEngineArgs:  # noqa: D401 - placeholder
+    class _StubEngineArgs:
         @classmethod
         def add_cli_args(cls, parser):
             return parser
@@ -86,7 +89,11 @@ try:
     import importlib
 
     api_server = importlib.import_module("atom.entrypoints.openai.api_server")
-except Exception as exc:  # pragma: no cover - environment-dependent skip
+except ImportError as exc:  # pragma: no cover - environment-dependent skip
+    # Re-raises unless a third-party dependency is what is missing. It used to
+    # skip on anything, so a syntax error in `api_server.py` silenced this
+    # whole module and the suite still reported a clean run.
+    skip_if_dependency_missing(exc, "api_server import unavailable")
     api_server = None  # type: ignore[assignment]
     _import_error = exc
     # NB: do NOT reset _injected_modules here. When api_server import fails
@@ -175,6 +182,40 @@ class TestBuildSamplingParams:
             )
 
 
+class TestDPSessionAffinityHeaders:
+    def test_disabled_drops_session_metadata(self, monkeypatch):
+        monkeypatch.setenv("ATOM_DP_SESSION_AFFINITY", "0")
+        request = SimpleNamespace(
+            headers={
+                "x-dynamo-session-id": "child",
+                "x-dynamo-parent-session-id": "parent",
+            }
+        )
+        assert api_server._get_dp_session_affinity_ids(request) == (None, None)
+
+    def test_extracts_dynamo_session_lineage(self, monkeypatch):
+        monkeypatch.setenv("ATOM_DP_SESSION_AFFINITY", "1")
+        request = SimpleNamespace(
+            headers={
+                "x-dynamo-session-id": "child",
+                "x-dynamo-parent-session-id": "parent",
+                "x-correlation-id": "fallback",
+            }
+        )
+        assert api_server._get_dp_session_affinity_ids(request) == (
+            "child",
+            "parent",
+        )
+
+    def test_correlation_id_is_session_fallback(self, monkeypatch):
+        monkeypatch.setenv("ATOM_DP_SESSION_AFFINITY", "true")
+        request = SimpleNamespace(headers={"x-correlation-id": "session"})
+        assert api_server._get_dp_session_affinity_ids(request) == (
+            "session",
+            None,
+        )
+
+
 class TestAnthropicSamplingParams:
     def test_request_overrides_model_then_neutral_defaults(self, monkeypatch):
         captured = {}
@@ -256,4 +297,106 @@ class TestValidateContextLength:
             num_prompt_tokens=129,
             max_tokens=8,
             max_model_len=None,
+        )
+
+
+class TestARequestIsNotSerialisedForALogNobodyKeeps:
+    """Building the log entry is the callee's job, not the caller's.
+
+    ``_log_request_event`` returns immediately when request logging is off,
+    but Python evaluates its arguments first, so
+    ``_log_request_event("request", rid, request.model_dump())`` dumped every
+    message and every tool schema on the event loop and threw the result away
+    -- 20-26 us per request on an agent-shaped one, at all four call sites.
+    The guard has to run before the dump, which is what
+    ``_log_request_model`` is for.
+
+    Asserted on whether ``model_dump`` ran, not on how long it took: the
+    defect is an evaluation order, and an order is exactly observable.
+    """
+
+    class _Model:
+        def __init__(self) -> None:
+            self.dumps = 0
+
+        def model_dump(self) -> dict:
+            self.dumps += 1
+            return {"big": "payload"}
+
+    def test_nothing_is_dumped_while_request_logging_is_off(self, monkeypatch):
+        monkeypatch.setattr(api_server, "_request_logger", None)
+        model = self._Model()
+        api_server._log_request_model("request", "req-1", model)
+        assert model.dumps == 0, "the request was serialised for a log that is off"
+
+    def test_it_is_dumped_once_when_request_logging_is_on(self, monkeypatch):
+        written: list[str] = []
+        monkeypatch.setattr(
+            api_server, "_request_logger", SimpleNamespace(info=written.append)
+        )
+        model = self._Model()
+        api_server._log_request_model("request", "req-1", model)
+        assert model.dumps == 1
+        assert written and "payload" in written[0], "the entry never reached the log"
+
+    @staticmethod
+    def _module_ast():
+        return ast.parse(inspect.getsource(api_server))
+
+    def _eager_sites(self):
+        """Every ``_log_request_event(..., x.model_dump())`` outside the helper.
+
+        ``_log_request_model``'s own body is that call, and there it is
+        correct -- it runs after the guard. Excluding it by name rather than
+        by weakening the pattern, because the pattern is the whole test.
+        """
+        tree = self._module_ast()
+        helper = next(
+            (
+                n
+                for n in ast.walk(tree)
+                if isinstance(n, ast.FunctionDef) and n.name == "_log_request_model"
+            ),
+            None,
+        )
+        exempt = {id(n) for n in ast.walk(helper)} if helper is not None else set()
+        return [
+            f"line {node.lineno}"
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and id(node) not in exempt
+            and getattr(node.func, "id", None) == "_log_request_event"
+            for arg in node.args
+            if isinstance(arg, ast.Call)
+            and getattr(arg.func, "attr", None) == "model_dump"
+        ]
+
+    def test_the_scan_sees_the_endpoints(self):
+        """The positive control: the endpoints must be using the helper.
+
+        Without this the test passes on a module that stopped calling either
+        function -- green, and reading nothing. The same silent retirement
+        already happened once on this branch to the seeding scan.
+        """
+        tree = self._module_ast()
+        used = [
+            n.lineno
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Call)
+            and getattr(n.func, "id", None) == "_log_request_model"
+        ]
+        assert len(used) >= 4, f"only {len(used)} call sites use the helper: {used}"
+
+    def test_no_call_site_dumps_before_the_guard(self):
+        """The four sites this was written for, checked where they live.
+
+        A helper nothing calls fixes nothing, and these sites sit in async
+        route handlers no unit test reaches -- so the source is read instead,
+        and an endpoint added later that spells it the old way is caught the
+        moment it is written.
+        """
+        eager = self._eager_sites()
+        assert not eager, (
+            "_log_request_event is being handed a model_dump() built before "
+            f"the guard can decline it: {eager}. Use _log_request_model."
         )

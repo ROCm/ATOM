@@ -10,8 +10,9 @@ prepare_model.
 """
 
 import sys
-import pytest
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from atom.plugin import prepare as plugin_runtime
 from atom.plugin.sglang import prepare as sglang_prepare

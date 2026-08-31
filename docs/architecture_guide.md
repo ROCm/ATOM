@@ -97,7 +97,7 @@ ATOM uses a module-level global `ForwardContext` to pass metadata through CUDA g
   - `spec_decode_metadata` (`SpecDecodeMetadata`) — draft token IDs, target/bonus logits indices.
   - `kv_cache_data` (`dict[str, KVCacheTensor]`) — per-layer KV cache tensor references.
 
-- **`Context`** — lightweight struct: `positions`, `is_prefill`, `batch_size`, `graph_bs`, `is_draft`.
+- **`Context`** — lightweight struct: `positions`, `is_prefill`, `batch_size`, `running_bs`, `running_tokens`, `is_draft`. The last two are the step's DP-unified padded shape: sequences and hidden_states rows respectively.
 
 - **`DPMetadata`** — data parallel metadata with `num_tokens_across_dp()` (all-reduce), `max_tokens_across_dp`, and `chunked_sizes()` context manager.
 
@@ -180,7 +180,8 @@ The `Sequence` class (in `atom/model_engine/sequence.py`) is the central data st
 | `num_prompt_tokens` | `int` | Length of the original prompt |
 | `num_tokens` | `int` (property) | Total length including generated tokens |
 | `block_table` | `list[int]` | KV cache block IDs allocated to this sequence |
-| `per_req_cache_group` | `int` | Per-request stateful-attention slot index (currently used by hybrid Qwen3-Next / Qwen3.5 GDN layers; future stateful attentions plug in via the same mechanism); `-1` if unallocated or not a stateful-attention model |
+| `state_slots` | `list[int]` | Every per-request stateful-attention slot the sequence holds: `[0]` committed, `[1:]` speculation rollback (Qwen3-Next / Qwen3.5 GDN layers, Kimi-K3 KDA, the DeepSeek-V4 compressor ring; future stateful attentions plug in via the same mechanism). Empty if unallocated or not a stateful-attention model |
+| `state_slot` | `int` (property) | `state_slots[0]`, or `-1` — the slot the forward reads and writes |
 | `status` | `SequenceStatus` | Current lifecycle state |
 | `type` | `SequenceType` | Current execution type |
 | `temperature` | `float` | Sampling temperature |

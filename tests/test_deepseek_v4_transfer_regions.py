@@ -7,6 +7,7 @@ import importlib.util
 import sys
 import types
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -26,6 +27,7 @@ _ROPE_HEAD_DIM = 4
 _CSA_ROWS_PER_BLOCK = 64
 _INDEX_ROW_BYTES = 132
 _CSA_REGION_COUNT = 2
+_FP4_K_TILES = 1
 
 
 def test_generic_transfer_tensors_default_to_no_full_slot_expectation():
@@ -152,9 +154,12 @@ def _transfer_builder(
     builder.csa_layers = [0, 2]
     builder.csa_rows_per_block = _CSA_ROWS_PER_BLOCK
     builder._index_row_bytes = _INDEX_ROW_BYTES
+    builder._idx_k_tiles = _FP4_K_TILES
     builder.pool_geometry = geo
     builder.compress_ratios = ratios
     builder._checkpoint_range_cache = None
+    builder._page_unit_region_cache = None
+    builder._page_unit_region_owners = ()
 
     if kv_dtype == "fp8":
         row_widths = [
@@ -167,15 +172,41 @@ def _transfer_builder(
         torch.empty(geo.plane_bytes(row_bytes), dtype=torch.uint8)
         for row_bytes in row_widths
     ]
-    indexers = torch.empty(
-        (
-            len(builder.csa_layers),
-            num_blocks,
-            builder.csa_rows_per_block,
-            builder._index_row_bytes,
-        ),
-        dtype=torch.uint8,
-    )
+    if indexer_fp4:
+        indexers = torch.empty(
+            (
+                len(builder.csa_layers),
+                num_blocks,
+                builder._idx_k_tiles,
+                4,
+                builder.csa_rows_per_block,
+                16,
+            ),
+            dtype=torch.uint8,
+        )
+        indexer_scales = torch.empty(
+            (
+                len(builder.csa_layers),
+                num_blocks,
+                builder._idx_k_tiles,
+                4,
+                builder.csa_rows_per_block,
+            ),
+            dtype=torch.uint8,
+        )
+        indexer_pools = [indexers, indexer_scales]
+    else:
+        indexers = torch.empty(
+            (
+                len(builder.csa_layers),
+                num_blocks,
+                builder.csa_rows_per_block,
+                builder._index_row_bytes,
+            ),
+            dtype=torch.uint8,
+        )
+        indexer_scales = None
+        indexer_pools = [indexers]
     config = SimpleNamespace(
         kv_transfer_config=transfer_config or {},
         pipeline_parallel_size=pipeline_parallel_size,
@@ -194,25 +225,29 @@ def _transfer_builder(
         checkpoint_spec=PagedStateCheckpointSpec(
             page_unit_bytes=(
                 sum(geo.block_bytes(width) for width in row_widths)
-                + len(builder.csa_layers)
-                * builder.csa_rows_per_block
-                * builder._index_row_bytes
+                + sum(
+                    len(builder.csa_layers) * pool.stride(1) * pool.element_size()
+                    for pool in indexer_pools
+                )
             ),
             slot_bytes=sum(geo.slot_bytes(width) for width in row_widths),
             image_bytes=builder.checkpoint_image_bytes(),
             layout_id=layout_id,
         ),
     )
-    builder.model_runner = SimpleNamespace(
-        config=config,
-        state_runtime=state_runtime,
-        num_physical_kvcache_blocks=num_blocks,
-        pool_plan=SimpleNamespace(entries={STATE_SLOT_CLASS: num_slots}),
-        v4_unified_kv=planes[0],
-        v4_kv_plane=planes[0],
-        v4_kv_plane_rope=planes[1] if len(planes) == 2 else None,
-        v4_csa_idx_kv=indexers,
-    )
+    runner_values = {
+        "config": config,
+        "state_runtime": state_runtime,
+        "num_physical_kvcache_blocks": num_blocks,
+        "pool_plan": SimpleNamespace(entries={STATE_SLOT_CLASS: num_slots}),
+        "v4_unified_kv": planes[0],
+        "v4_kv_plane": planes[0],
+        "v4_kv_plane_rope": planes[1] if len(planes) == 2 else None,
+        "v4_csa_idx_kv": indexers,
+    }
+    if indexer_scales is not None:
+        runner_values["v4_csa_idx_kv_scale"] = indexer_scales
+    builder.model_runner = SimpleNamespace(**runner_values)
     return builder, geo, planes, row_widths
 
 
@@ -266,7 +301,10 @@ def _assert_transfer_geometry(
         unified_codec.slot_bytes
     )
 
-    assert len(transfer.block_regions) == len(planes) + _CSA_REGION_COUNT
+    indexer_pool_count = 2 if builder._indexer_fp4 else 1
+    assert len(transfer.block_regions) == (
+        len(planes) + indexer_pool_count * _CSA_REGION_COUNT
+    )
     assert len(transfer.swa_block_regions) == len(planes)
     assert transfer.slot_regions == []
     assert all(not region.reverse_indexed for region in transfer.block_regions)
@@ -283,14 +321,28 @@ def _assert_transfer_geometry(
     _assert_plane_region_geometry(transfer, geo, planes, row_widths)
 
     indexer_regions = transfer.block_regions[len(planes) :]
-    for region, tensor in zip(
+    expected_indexer_regions = [
+        (pool[pos], f"{role_prefix}.layer_{layer_id}")
+        for pool, role_prefix in builder._indexer_page_pools()
+        for pos, layer_id in enumerate(builder.csa_layers)
+    ]
+    for region, (tensor, role) in zip(
         indexer_regions,
-        builder.model_runner.v4_csa_idx_kv,
+        expected_indexer_regions,
         strict=True,
     ):
         assert region.base_addr == tensor.data_ptr()
-        assert region.unit_bytes == _CSA_ROWS_PER_BLOCK * _INDEX_ROW_BYTES
+        assert region.unit_bytes == tensor.stride(0) * tensor.element_size()
         assert region.total_bytes == tensor.numel() * tensor.element_size()
+        assert region.semantic_role == role
+
+    checkpoint_bases, checkpoint_strides = builder._page_unit_regions()
+    assert checkpoint_bases.tolist() == [
+        region.base_addr for region in transfer.block_regions
+    ]
+    assert checkpoint_strides.tolist() == [
+        region.unit_bytes for region in transfer.block_regions
+    ]
 
 
 def test_bf16_transfer_regions_cover_page_and_full_slot_geometry(v4_builder_cls):
@@ -324,47 +376,80 @@ def test_fp8_transfer_regions_cover_both_pages_and_full_slots(v4_builder_cls):
     assert len(builder.get_kv_transfer_tensors().swa_block_regions) == 2
 
 
-def test_explicit_row_width_oracle_rejects_mutated_builder_helper(v4_builder_cls):
-    builder, geo, planes, row_widths = _transfer_builder(
+def test_page_region_sizing_rejects_mutated_builder_helper(v4_builder_cls):
+    builder, _, _, row_widths = _transfer_builder(
         v4_builder_cls,
         kv_dtype="bf16",
         transfer_config={"kv_connector": "LMCacheOffloadConnector"},
     )
     builder._plane_row_widths = lambda: [row_widths[0] + 1]
 
+    with pytest.raises(RuntimeError, match="do not cover the sized PAGE unit"):
+        builder.get_kv_transfer_tensors()
+
+
+def test_fp4_indexer_offload_covers_data_and_scale_page_regions(v4_builder_cls):
+    builder, geo, planes, row_widths = _transfer_builder(
+        v4_builder_cls,
+        kv_dtype="fp8",
+        transfer_config={
+            "kv_connector": "LMCacheOffloadConnector",
+            "kv_role": "offload",
+        },
+        indexer_fp4=True,
+    )
+
+    _assert_transfer_geometry(builder, geo, planes, row_widths)
+
     transfer = builder.get_kv_transfer_tensors()
-    with pytest.raises(AssertionError):
-        _assert_plane_region_geometry(transfer, geo, planes, row_widths)
+    assert transfer is not None
+    data_bytes = _FP4_K_TILES * 4 * _CSA_ROWS_PER_BLOCK * 16
+    scale_bytes = _FP4_K_TILES * 4 * _CSA_ROWS_PER_BLOCK
+    assert [region.unit_bytes for region in transfer.block_regions[-4:]] == [
+        data_bytes,
+        data_bytes,
+        scale_bytes,
+        scale_bytes,
+    ]
+    assert [region.semantic_role for region in transfer.block_regions[-4:]] == [
+        "dsv4.csa_indexer.fp4_data.layer_0",
+        "dsv4.csa_indexer.fp4_data.layer_2",
+        "dsv4.csa_indexer.fp4_scale.layer_0",
+        "dsv4.csa_indexer.fp4_scale.layer_2",
+    ]
+    assert len(transfer.swa_block_regions) == len(planes)
 
 
-@pytest.mark.parametrize(
-    "transfer_config",
-    [
-        pytest.param(
-            {"kv_connector": "LMCacheOffloadConnector", "kv_role": "offload"},
-            id="offload",
-        ),
-        pytest.param(
-            {"kv_connector": "MooncakeConnector", "kv_role": "kv_both"},
-            id="pd",
-        ),
-    ],
-)
-def test_fp4_indexer_rejects_every_active_transfer_before_region_registration(
-    v4_builder_cls,
-    transfer_config,
-):
+def test_fp4_indexer_pd_transfer_remains_unsupported(v4_builder_cls):
     builder, *_ = _transfer_builder(
         v4_builder_cls,
         kv_dtype="fp8",
-        transfer_config=transfer_config,
+        transfer_config={"kv_connector": "mooncake", "kv_role": "kv_both"},
         indexer_fp4=True,
     )
 
     with pytest.raises(
         NotImplementedError,
-        match="unmapped FP4 indexer scale pool",
+        match=r"PD transfer.*index_cache_dtype fp4.*unsupported",
     ):
+        builder.get_kv_transfer_tensors()
+
+
+def test_page_region_registration_rejects_incomplete_geometry(v4_builder_cls):
+    builder, *_ = _transfer_builder(
+        v4_builder_cls,
+        kv_dtype="fp8",
+        transfer_config={"kv_connector": "LMCacheOffloadConnector"},
+        indexer_fp4=True,
+    )
+    runtime = builder.model_runner.state_runtime
+    spec = runtime.checkpoint_spec
+    builder.model_runner.state_runtime = replace(
+        runtime,
+        checkpoint_spec=replace(spec, page_unit_bytes=spec.page_unit_bytes + 1),
+    )
+
+    with pytest.raises(RuntimeError, match="do not cover the sized PAGE unit"):
         builder.get_kv_transfer_tensors()
 
 

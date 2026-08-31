@@ -837,10 +837,10 @@ class _V4DecodeMetaBuffers:
             make_compress_plans as _mcp,
         )
 
-        # Decode CG plan slicing is `graph_bs * per_seq_bound` (computed inside
-        # make_compress_plans from these two scalars). graph_bs == num_slots
+        # Decode CG plan slicing is `running_bs * per_seq_bound` (computed inside
+        # make_compress_plans from these two scalars). running_bs == num_slots
         # (padded decode batch); max_q_len == 1 + max_spec_steps.
-        self.decode_graph_bs = S
+        self.decode_running_bs = S
         self.decode_q_len = max(1, T // S)
         self.plan_buffers: dict[int, dict] = {}
         for ratio, is_overlap in ratios_overlap:
@@ -1174,10 +1174,10 @@ def _make_compress_plans(
         ratios,
         plan_buffers=plan_buffers,
     )
-    # Eager path (graph_bs unset): make_compress_plans returns a full-buffer
+    # Eager path (running_bs unset): make_compress_plans returns a full-buffer
     # write slice (sentinel-padded). The eager bridge launches
     # update_compressor_states with exactly num_write rows, so re-slice down.
-    # Graph decode uses _make_decode_compress_plans (fixed graph_bs slice).
+    # Graph decode uses _make_decode_compress_plans (fixed running_bs slice).
     for plan in plans.values():
         plan.write_plan_gpu = plan.write_plan_gpu[: plan.num_write]
     return plans
@@ -1649,7 +1649,7 @@ def _make_decode_compress_plans(extend_lens_cpu, context_lens_cpu, bufs):
         np.ascontiguousarray(context_lens_cpu, dtype=np.int32),
         ratios_overlap,
         plan_buffers=bufs.plan_buffers,
-        graph_bs=bufs.decode_graph_bs,
+        running_bs=bufs.decode_running_bs,
         max_q_len=bufs.decode_q_len,
     )
 
@@ -2090,6 +2090,7 @@ def atom_deepseek_v4_forward_context(
     from atom.utils.forward_context import (
         Context,
         reset_forward_context,
+        running_tokens_from_bs,
         set_forward_context,
     )
 
@@ -2156,8 +2157,13 @@ def atom_deepseek_v4_forward_context(
         positions=positions,
         is_prefill=is_prefill,
         is_dummy_run=force_dummy or common_attn_metadata is None,
-        batch_size=batch_size,
-        graph_bs=batch_size,
+        scheduled_bs=batch_size,
+        # The rows this forward really runs -- what MoE will be handed.
+        scheduled_tokens=int(input_ids.shape[0]) if input_ids is not None else 0,
+        running_bs=batch_size,
+        running_tokens=running_tokens_from_bs(
+            batch_size, is_prefill=is_prefill, attn_metadata=attn_metadata
+        ),
         input_ids=input_ids,
     )
     set_forward_context(

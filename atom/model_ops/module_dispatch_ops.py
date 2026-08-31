@@ -55,19 +55,19 @@ def maybe_dual_stream_forward(
     # Under TBO the two micro-batches already overlap on separate threads
     from atom.utils.tbo.ubatching import tbo_active
 
-    # Graph ownership belongs to the active frontend.  Only a concrete
-    # PIECEWISE runtime decision is unsafe here: per-piece capture closes over
-    # the main stream while this forward forks work onto `alt_stream`.  Eager
-    # NONE and whole-model FULL capture both support the fork/join topology.
-    is_piecewise_cudagraph = (
+    # Graph ownership belongs to the active frontend.  Eager NONE and
+    # whole-model FULL capture both support the fork/join topology; PIECEWISE
+    # capture holds it too, but is opt-in (ATOM_DUAL_STREAM_PIECEWISE).
+    piecewise_blocked = (
         get_current_cudagraph_runtime_mode() == CUDAGraphMode.PIECEWISE
+        and not envs.ATOM_DUAL_STREAM_PIECEWISE
     )
 
     if (
         self._use_dual_stream
         and 0 < num_tokens <= threshold
         and not tbo_active()
-        and not is_piecewise_cudagraph
+        and not piecewise_blocked
     ):
         return self.dual_stream_moe_forward(hidden_states)
     return self.single_stream_moe_forward(hidden_states)

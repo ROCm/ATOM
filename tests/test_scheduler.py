@@ -430,7 +430,7 @@ class TestSchedule:
         sched.schedule()
 
         assert pinned.status == SequenceStatus.WAITING
-        assert pinned.block_table == []
+        assert len(pinned.block_table) == 0
         assert sched.waiting.popleft() is pinned
         sched.kv_connector = None
         replacement = seq_factory([10, 11, 12, 13])
@@ -562,7 +562,7 @@ class TestSchedule:
         )
 
         assert seq.num_cached_tokens == 10
-        assert seq.output_tokens == [999, sched.eos_token_id]
+        assert list(seq.output_tokens) == [999, sched.eos_token_id]
 
 
 # ── _waiting_new_token_count (PrefillDelayer queue signal) ─────────────────
@@ -897,7 +897,7 @@ class TestPrefixCaching:
             )
             batch, _ = sched.schedule()  # next decode step
 
-        assert seq1.token_ids == prompt + generated
+        assert list(seq1.token_ids) == prompt + generated
         # 20 tokens on the seq, but token 20 was sampled this step and no
         # forward has written its KV — the block it closes stays unhashed until
         # the next step consumes it.
@@ -1086,7 +1086,7 @@ class TestPreempt:
         scheduler.schedule()
         scheduler.preempt(seq)
         assert seq.status == SequenceStatus.WAITING
-        assert seq.block_table == []
+        assert len(seq.block_table) == 0
 
 
 # ── postprocess ────────────────────────────────────────────────────────────

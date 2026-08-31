@@ -21,10 +21,12 @@ import threading
 import weakref
 from contextlib import ExitStack
 from threading import Thread
+from typing import ClassVar
 
 import zmq
 import zmq.asyncio
 from aiter.dist.shm_broadcast import MessageQueue
+
 from atom.kv_transfer.disaggregation import KVOutputAggregator
 from atom.utils import (
     get_mp_context,
@@ -34,7 +36,9 @@ from atom.utils import (
     resolve_obj_by_qualname,
     set_process_title,
     shutdown_all_processes,
+    worker_process_name,
 )
+from atom.utils.gc_utils import maybe_attach_gc_debug_callback, tune_gc
 from atom.utils.numa_utils import numa_bind_to_node
 
 logger = logging.getLogger("atom")
@@ -83,31 +87,43 @@ class AsyncIOProc:
 
         enable_orphan_reaping()
 
+        # Named once, before anything logs: `ps`, the GC lines here and the
+        # freeze line the runner emits over RPC all have to be the same string,
+        # or a dp deployment's workers are indistinguishable from each other.
+        name = worker_process_name(args[0] if args else None, rank)
+        set_process_title(name)
+
+        # Second-order next to the EngineCore's call but not zero: without it
+        # a freeze still lands at the wave boundary, where the prefill burst
+        # churns enough objects to trigger gen-2 here. Runs before the model
+        # is built so the thresholds cover the startup heap. Freezing that heap
+        # happens later, via the EngineCore's `freeze_gc_heap` RPC.
+        tune_gc()
+        maybe_attach_gc_debug_callback(name)
+
         # NUMA-local CPU/memory pinning (see atom.utils.numa_utils).
         # Auto-detects the GPU's local node by default; gated by
         # ATOM_NUMA_BIND. Must run before any large allocation / native
         # (mooncake) thread spawn so the mask is inherited by child threads and
-        # first-touch lands memory locally. The global GPU index is
-        # dp_rank*tp_size+tp_rank (engine_core_mgr GPU assignment).
+        # first-touch lands memory locally. The node-local GPU index is
+        # dp_local_rank*tp_size+tp_rank (engine_core_mgr GPU assignment).
+        # Best-effort: any failure here is logged and skipped rather than
+        # taking the worker down, hence the blanket except.
         try:
             cfg = args[0]
-            gpu = (
-                cfg.parallel_config.data_parallel_rank * cfg.tensor_parallel_size + rank
-            )
+            # Node-local: this indexes a GPU on THIS machine. The global rank
+            # would run off the end of a later node's device list.
+            dp_local_rank = cfg.parallel_config.data_parallel_rank_local
+            if dp_local_rank is None:
+                dp_local_rank = cfg.parallel_config.data_parallel_rank
+            gpu = dp_local_rank * cfg.tp_world_size + rank
             numa_bind_to_node(gpu, label)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - binding is an optimization
+            # NUMA binding only affects locality, never correctness, so any
+            # failure (missing libnuma, restricted cpuset, odd topology) must
+            # degrade to an unbound worker rather than kill it.
             logger.warning(f"AsyncIOProc({label}): NUMA bind skipped: {e}")
         self.label = f"AsyncIOProc({label})"
-        # Set process title so this GPU worker is distinguishable by rank in
-        # ps/top/rocm-smi (otherwise all workers show as "python").
-        try:
-            cfg = args[0]
-            if cfg.parallel_config.data_parallel_size > 1:
-                set_process_title(f"DP{cfg.parallel_config.data_parallel_rank}TP{rank}")
-            else:
-                set_process_title(f"TP{rank}")
-        except Exception:
-            set_process_title(f"TP{rank}")
         self.io_addrs = io_addrs
         self.io_queues = queue.Queue(), queue.Queue()
         self.io_threads: list[threading.Thread] = []
@@ -171,8 +187,11 @@ class AsyncIOProc:
             if hasattr(mq, "buffer") and hasattr(mq.buffer, "shared_memory"):
                 try:
                     mq.buffer.shared_memory.close()
-                except Exception:
-                    pass
+                except Exception as e:  # noqa: BLE001 - teardown must not raise
+                    # Already-closed handles and a racing peer's unlink both
+                    # land here; neither is actionable during shutdown, but a
+                    # silent pass hides genuine leaks from anyone debugging one.
+                    logger.debug(f"{self.label}: shm close failed: {e}")
 
     def recv_input_from_socket(self, addr: str, input_queue: queue.Queue):
         with ExitStack() as stack, zmq.Context() as ctx:
@@ -204,7 +223,10 @@ class AsyncIOProc:
 
     # Functions that require all TP ranks to synchronize via barrier before
     # rank 0 returns, so the caller can safely reuse/overwrite shared buffers.
-    _BARRIER_FUNCS = {"update_weights_from_ipc", "update_weights_from_shm"}
+    _BARRIER_FUNCS: ClassVar[set[str]] = {
+        "update_weights_from_ipc",
+        "update_weights_from_shm",
+    }
 
     def busy_loop(self):
         """Main event loop: dequeue RPCs and dispatch to runners."""
@@ -360,8 +382,11 @@ class AsyncIOProcManager:
                         shm.unlink()
                         mq.buffer.is_creator = False
                     shm.close()
-                except Exception:
-                    pass
+                except Exception as e:  # noqa: BLE001 - teardown must not raise
+                    # Creator side: an unlink of an already-removed segment is
+                    # the common case and is harmless. Log rather than pass so
+                    # a real leak is visible to whoever goes looking.
+                    logger.debug(f"{self.label}: shm unlink/close failed: {e}")
 
     def process_output_sockets(self, output_address: str):
         """Receive results from rank 0's primary output channel."""

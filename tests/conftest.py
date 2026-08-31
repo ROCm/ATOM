@@ -11,9 +11,11 @@
 # resolves its two AITER handles on first use), and every other third-party
 # import here is a declared dependency, so a plain CPU runner has them.
 
+import dataclasses
 import sys
 from itertools import count
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -25,6 +27,7 @@ if ATOM_ROOT not in sys.path:
 
 # ── 2. Import atom submodules ──────────────────────────────────────────────
 
+from atom.config import Config
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import Sequence
@@ -72,6 +75,48 @@ class MockConfig:
         defaults.update(overrides)
         for k, v in defaults.items():
             setattr(self, k, v)
+
+
+def atom_config_double(**overrides):
+    """A stand-in for `atom.config.Config`, with the real Config's fields.
+
+    Derived from `dataclasses.fields(Config)` rather than hand-listed, so a
+    field production adds arrives here with its real default instead of
+    raising `AttributeError` the first time a code path reads it. That is not
+    hypothetical: `topK.is_rocm_aiter_fusion_shared_expert_enabled_for_quant_
+    config` grew a read of `enable_dp_attention`, and the hand-built namespace
+    in `test_shared_expert_dispatch` had no such attribute -- four tests red on
+    every machine that can run them, which is only a machine with aiter,
+    because the module `importorskip`s it. CI has no aiter, so CI never saw
+    them and nobody was told.
+
+    `MockConfig` below is the older, narrower answer to the same question --
+    "exactly the attributes that BlockManager and Scheduler read" -- and it
+    can drift the same way. It is left alone because its callers assert on the
+    small surface it declares; new doubles should start here.
+
+    An override naming something that is not a Config field is refused. That
+    is the other direction of the same drift: a field renamed in production
+    leaves a test setting an attribute nothing reads, which passes and means
+    nothing.
+    """
+    values = {}
+    for f in dataclasses.fields(Config):
+        if f.default is not dataclasses.MISSING:
+            values[f.name] = f.default
+        elif f.default_factory is not dataclasses.MISSING:
+            values[f.name] = f.default_factory()
+        else:
+            # `model` and the `init=False` fields a real Config fills in from
+            # the checkpoint. A test that needs one overrides it.
+            values[f.name] = None
+    unknown = sorted(set(overrides) - set(values))
+    assert not unknown, (
+        f"not Config fields: {unknown}. Either the name is wrong or "
+        f"production renamed it and this override now sets nothing."
+    )
+    values.update(overrides)
+    return SimpleNamespace(**values)
 
 
 # ── 4. Fixtures ────────────────────────────────────────────────────────────

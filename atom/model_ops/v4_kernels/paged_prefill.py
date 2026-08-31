@@ -651,20 +651,10 @@ def sparse_attn_v4_paged_prefill(
             attn_sink,
             softmax_scale,
         )  # [S, H, head_dim] bf16
-    if get_gfx() == "gfx1250":
-        return pa_prefill_sparse(
-            q,
-            unified_kv,
-            kv_indices_prefix,
-            kv_indptr_prefix,
-            kv,
-            kv_indices_extend,
-            kv_indptr_extend,
-            attn_sink,
-            softmax_scale,
-        )
     # Backend selection: prefer OPUS when available; fall back to Triton on
     # import failure, env override, or runtime error (e.g. unsupported GPU).
+    # OPUS covers both archs: gfx950 from source, gfx1250 from a prebuilt code
+    # object (bf16 only — fp16 raises and falls through).
     if not envs.ATOM_FORCE_ATTN_TRITON and _HAS_OPUS:
         try:
             return pa_sparse_prefill_opus(
@@ -681,6 +671,19 @@ def sparse_attn_v4_paged_prefill(
             )
         except RuntimeError:
             pass
+    if get_gfx() == "gfx1250":
+        # gfx12 Triton fallback; allocates its own output (no `out=` kwarg).
+        return pa_prefill_sparse(
+            q,
+            unified_kv,
+            kv_indices_prefix,
+            kv_indptr_prefix,
+            kv,
+            kv_indices_extend,
+            kv_indptr_extend,
+            attn_sink,
+            softmax_scale,
+        )
     return _sparse_attn_v4_paged_prefill_triton(
         q,
         unified_kv,

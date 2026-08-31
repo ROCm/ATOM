@@ -123,6 +123,19 @@
     "_baseline_note": "Online quantization on top of DeepSeek-R1-0528 MTP (FP8 native): global ptpc_fp8 + expert layers mxfp4, excluding lm_head and *.gate.*. Threshold set to 0.93 (same headroom as DeepSeek-R1-0528-FP4 MTP) as a conservative placeholder for the MoE-MXFP4 accuracy drop."
   },
   {
+    "model_name": "DeepSeek-R1-0528 MTP Streaming Online-Quant",
+    "model_path": "deepseek-ai/DeepSeek-R1-0528",
+    "extraArgs": "--kv_cache_dtype fp8 -tp 8 --online_quant_config '{\"global_quant_config\":\"ptpc_fp8\",\"layer_quant_config\":{\"*expert*\":\"mxfp4\"},\"exclude_layer\":[\"lm_head\",\"*.gate.*\"]}' --method mtp --num-speculative-tokens 3",
+    "env_vars": "ATOM_ONLINE_QUANT_STREAMING=1",
+    "runner": "linux-atom-do-mi350x-8",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.93,
+    "mtp_accept_threshold": 0.582,
+    "accuracy_baseline": 0.9553,
+    "accuracy_baseline_model": "deepseek-ai/DeepSeek-R1-0528",
+    "_baseline_note": "Nightly streaming variant of DeepSeek-R1-0528 MTP online quantization. Covers streaming load with its default settings, mixed FP8/MXFP4 quantization, inference accuracy, and MTP acceptance."
+  },
+  {
     "model_name": "gpt-oss-120b",
     "model_path": "openai/gpt-oss-120b",
     "extraArgs": "--kv_cache_dtype fp8 --gpu-memory-utilization 0.5",

@@ -597,7 +597,7 @@ def update_compressor_states(
       write_plan:   [grid, 4] int32 — packed (ragged_id, batch_id, position, _);
                     each active row = one token to write. `grid` (== shape[0])
                     is the caller-supplied slice length: the decode-tight
-                    `graph_bs * min(qlen, K_pool)` on the CUDAGraph path, tight
+                    `running_bs * min(qlen, K_pool)` on the CUDAGraph path, tight
                     `num_write` on the eager path, or the full buffer capacity
                     for the extend-shaped verify path. Inactive tail rows carry
                     sentinel `position=-1` and are skipped.

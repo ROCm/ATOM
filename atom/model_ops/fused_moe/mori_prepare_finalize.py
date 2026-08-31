@@ -30,6 +30,27 @@ logger = logging.getLogger("atom")
 _NUM_TBO_UBATCHES = 2
 
 
+def select_mori_kernel_params(
+    *, low_latency: bool, internode: bool
+) -> tuple[str, int, int, int]:
+    """Pick the MoRI kernel and its launch geometry.
+
+    Returns ``(kernel_name, warp_num_per_block, block_num, rdma_block_num)``.
+    The name is resolved against ``mori.ops.EpDispatchCombineKernelType`` by the
+    caller so this stays importable (and testable) without mori installed.
+
+    `internode` must come from a real topology probe. It used to be inferred
+    from ``world_size <= 8``, which is a GPUs-per-node assumption rather than a
+    measurement: 2 nodes x 4 GPUs reads as intra-node and selects kernels that
+    assume P2P mappings across a boundary that has none.
+    """
+    if low_latency:
+        return ("AsyncLL", 8, 64, 32)
+    if internode:
+        return ("InterNodeV1", 16, 32, 16)
+    return ("IntraNode", 16, 80, 0)
+
+
 @lru_cache(maxsize=8)
 def init_mori_op(
     rank: int,
@@ -43,6 +64,7 @@ def init_mori_op(
     data_type_itemsize: int,
     max_token_type_size: int,
     low_latency: bool = False,
+    internode: bool = False,
     instance_id: int = 0,
     scale_type_size: int = torch.float32.itemsize,
     quant_type: str = "none",
@@ -50,7 +72,8 @@ def init_mori_op(
     """
     Create a mori op instance.
       - low_latency=True  → AsyncLL (dispatch_send/recv, combine_send/recv)
-      - low_latency=False → IntraNode
+      - internode=True    → InterNodeV1 (RDMA across nodes)
+      - otherwise         → IntraNode
     """
     import mori
 
@@ -60,21 +83,10 @@ def init_mori_op(
             data_type = dt
             break
 
-    if low_latency:
-        kernel_type = mori.ops.EpDispatchCombineKernelType.AsyncLL
-        warp_num_per_block = 8
-        block_num = 64
-        rdma_block_num = 32
-    elif world_size <= 8:
-        kernel_type = mori.ops.EpDispatchCombineKernelType.IntraNode
-        warp_num_per_block = 16
-        block_num = 80
-        rdma_block_num = 0
-    else:
-        kernel_type = mori.ops.EpDispatchCombineKernelType.InterNodeV1
-        warp_num_per_block = 16
-        block_num = 32
-        rdma_block_num = 16
+    kernel_name, warp_num_per_block, block_num, rdma_block_num = (
+        select_mori_kernel_params(low_latency=low_latency, internode=internode)
+    )
+    kernel_type = getattr(mori.ops.EpDispatchCombineKernelType, kernel_name)
 
     mori_config = mori.ops.EpDispatchCombineConfig(
         rank=rank,

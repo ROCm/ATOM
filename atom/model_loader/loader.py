@@ -24,6 +24,7 @@ if "F8_E8M0" not in safetensors.torch._TYPES and hasattr(torch, "float8_e8m0fnu"
 from aiter.dist.parallel_state import get_tp_group
 
 from atom.model_loader.loading_core import load_weights_into_model, rank_tag
+from atom.model_loader.online_quant_streaming import OnlineQuantStreamer
 from atom.model_loader.weight_iterator import (
     safetensors_weights_iterator,
 )
@@ -138,6 +139,8 @@ def _save_online_quant_info(
     model_name_or_path: str,
     elapsed_seconds: float,
     online_quant_config: dict,
+    timing_scope: str,
+    peak_gpu_memory_gb: float | None,
 ):
     """Save online quantization info to a JSON file (rank 0 only)."""
     if get_tp_group().rank_in_group != 0:
@@ -154,6 +157,10 @@ def _save_online_quant_info(
         "model": model_name_or_path,
         "online_quant_config": online_quant_config,
         "elapsed_seconds": round(elapsed_seconds, 3),
+        "timing_scope": timing_scope,
+        "peak_gpu_memory_gb": (
+            round(peak_gpu_memory_gb, 3) if peak_gpu_memory_gb is not None else None
+        ),
         "num_layers": len(oq_layers),
         "layers": oq_layers,
     }
@@ -272,6 +279,15 @@ def load_model(
         except Exception:  # noqa: BLE001
             return True
 
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
+    # Quantize eligible modules as soon as their source weights complete.
+    # This must also run for speculative draft loads: those modules were built
+    # with the same meta-backed streaming parameters as the target. `spec_decode`
+    # only changes checkpoint-name selection; it must not disable materialization.
+    online_quant_streamer = OnlineQuantStreamer.maybe_create(model, load_dummy)
+
     loaded_weights_record = load_weights_into_model(
         model=model,
         model_name_or_path=model_name_or_path,
@@ -285,12 +301,16 @@ def load_model(
         fuse_shared_expert=_fuse_shared_expert,
         is_rank0=_is_rank0,
         weights_iterator=safetensors_weights_iterator,
+        online_quant_streamer=online_quant_streamer,
     )
 
     # Dummy modes other than "empty" fill the skipped-load params with finite
     # values before post-processing, so shuffle/swizzle runs on clean constants.
     if load_dummy and load_dummy != "empty":
         initialize_dummy_weights(model, load_dummy)
+
+    if online_quant_streamer is not None:
+        online_quant_streamer.replay_stragglers_and_report(_is_rank0())
 
     has_online_quant = any(
         getattr(m, "online_quant", False)
@@ -300,12 +320,43 @@ def load_model(
         )
         for _, m in model.named_modules()
     )
-    if has_online_quant:
-        logger.info("Weight post-processing started (includes online quantization)")
+    streamed_done = (
+        online_quant_streamer.done_module_ids
+        if online_quant_streamer is not None
+        else frozenset()
+    )
+    stream_candidate_count = (
+        len(online_quant_streamer.candidates)
+        if online_quant_streamer is not None
+        else 0
+    )
+    stream_fallback_count = stream_candidate_count - len(streamed_done)
+    if online_quant_streamer is not None:
+        logger.info(
+            "[%s] Streaming online quantization: %d/%d eligible modules were "
+            "quantized while loading; the post-load pass remains enabled to "
+            "quantize %d fallback module(s) and finish weight processing",
+            rank_tag(),
+            len(streamed_done),
+            stream_candidate_count,
+            stream_fallback_count,
+        )
+    elif has_online_quant:
+        logger.info(
+            "[%s] Post-load online quantization and weight processing started",
+            rank_tag(),
+        )
     pp_start = time.perf_counter()
 
+    # Parent-first traversal is significant for streaming-deferred children:
+    # their parent first combines source weights, then the child's normal hook
+    # online-quantizes the final fused weight.
     for module_name, module in model.named_modules():
-        if hasattr(module, "process_weights_after_loading"):
+        # Avoid repeating module post-processing already run by the streamer.
+        if (
+            hasattr(module, "process_weights_after_loading")
+            and id(module) not in streamed_done
+        ):
             module.process_weights_after_loading()
         quant_method = getattr(module, "quant_method", None)
 
@@ -329,6 +380,11 @@ def load_model(
     # the load time the caller reports, so it is timed unconditionally: without
     # this line a shuffle-dominated load is indistinguishable from a slow read.
     pp_elapsed = time.perf_counter() - pp_start
+    peak_gpu_memory_gb = (
+        torch.cuda.max_memory_allocated() / (1 << 30)
+        if torch.cuda.is_available()
+        else None
+    )
     if not has_online_quant:
         logger.info(
             "[%s] Weight post-processing done: %.2f seconds",
@@ -346,18 +402,59 @@ def load_model(
                 qc = getattr(module, "quant_config", None)
                 if qc is not None and hasattr(qc, "online_quant_config_raw"):
                     raw_online_quant_config = qc.online_quant_config_raw
-        logger.info(
-            "[%s] Weight post-processing done: %.2f seconds, "
-            "%d layers online-quantized",
-            rank_tag(),
-            pp_elapsed,
-            len(oq_layers),
-        )
+        if online_quant_streamer is not None:
+            logger.info(
+                "[%s] Post-stream fallback and weight processing done: %.2f "
+                "seconds; %d module(s) quantized while loading, %d fallback "
+                "module(s) quantized after loading, %d layers online-quantized "
+                "in total",
+                rank_tag(),
+                pp_elapsed,
+                len(streamed_done),
+                stream_fallback_count,
+                len(oq_layers),
+            )
+            timing_scope = "post_stream_fallback_and_weight_processing"
+        else:
+            logger.info(
+                "[%s] Post-load online quantization and weight processing done: "
+                "%.2f seconds, %d layers online-quantized",
+                rank_tag(),
+                pp_elapsed,
+                len(oq_layers),
+            )
+            timing_scope = "post_load_online_quantization_and_weight_processing"
         _save_online_quant_info(
             oq_layers,
             model_name_or_path,
             pp_elapsed,
             raw_online_quant_config or {},
+            timing_scope,
+            peak_gpu_memory_gb,
         )
+
+    # Measure both loading and post-processing for comparable peak memory.
+    if peak_gpu_memory_gb is not None:
+        if online_quant_streamer is not None:
+            logger.info(
+                "[%s] Peak GPU memory during streaming weight loading and "
+                "online quantization: %.2f GB",
+                rank_tag(),
+                peak_gpu_memory_gb,
+            )
+        elif has_online_quant:
+            logger.info(
+                "[%s] Peak GPU memory during weight loading and post-load "
+                "online quantization: %.2f GB",
+                rank_tag(),
+                peak_gpu_memory_gb,
+            )
+        else:
+            logger.info(
+                "[%s] Peak GPU memory during weight loading and "
+                "post-processing: %.2f GB",
+                rank_tag(),
+                peak_gpu_memory_gb,
+            )
 
     return loaded_weights_record

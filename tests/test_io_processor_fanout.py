@@ -23,7 +23,7 @@ import pytest
 if "atom.model_engine.engine_core_mgr" not in sys.modules:
     _stub = types.ModuleType("atom.model_engine.engine_core_mgr")
 
-    class _StubCoreManager:  # noqa: D401 - placeholder
+    class _StubCoreManager:
         def __init__(self, *a, **kw):
             self.added = []
 
@@ -34,9 +34,9 @@ if "atom.model_engine.engine_core_mgr" not in sys.modules:
     _stub.DisaggCoreManager = _StubCoreManager
     sys.modules["atom.model_engine.engine_core_mgr"] = _stub
 
-from atom.model_engine.llm_engine import InputOutputProcessor  # noqa: E402
-from atom.model_engine.sequence import Sequence  # noqa: E402
-from atom.sampling_params import SamplingParams  # noqa: E402
+from atom.model_engine.llm_engine import InputOutputProcessor
+from atom.model_engine.sequence import Sequence
+from atom.sampling_params import SamplingParams
 
 
 @pytest.fixture(autouse=True)

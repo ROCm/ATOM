@@ -23,10 +23,10 @@ from typing import Any
 
 import torch
 
-# Version 2 adds explicit DSV4 KV/index dimensions and DCP virtual-block byte
-# mapping to the PAGE identity. Keeping it separate prevents version-1 objects
-# from being reused after the layout correction.
-PAGE_LAYOUT_VERSION = 2
+# Version 3 adds the effective index-cache dtype to the PAGE identity. FP4 and
+# FP8 DSV4 indexers have different region counts and byte layouts, so they must
+# never reuse one another's objects even when the HF model config is identical.
+PAGE_LAYOUT_VERSION = 3
 _PAGE_FINGERPRINT_BYTES = 16
 _OFFLOAD_LAYOUT_ALIASES = {
     "hybrid": "hybrid",
@@ -179,6 +179,7 @@ def build_page_namespace(
             else "dense-opaque-block"
         ),
         "kv_cache_dtype": str(getattr(config, "kv_cache_dtype", "auto")),
+        "index_cache_dtype": str(getattr(config, "index_cache_dtype", "auto")),
         "block_size": _strict_integer(
             "PAGE block size",
             config.kv_cache_block_size,
@@ -213,7 +214,7 @@ def build_page_namespace(
     digest = hashlib.blake2b(
         canonical,
         digest_size=_PAGE_FINGERPRINT_BYTES,
-        person=b"ATOM-PAGE-CFG-v2",
+        person=b"ATOM-PAGE-CFG-v3",
     ).hexdigest()
     return f"{base_model_name}::atom-page-v{layout_version}-{digest}"
 

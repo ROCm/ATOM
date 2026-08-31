@@ -52,6 +52,7 @@ class WeightDispatcher:
         submit: Callable[..., None],
         staging_pool: Any,
         batching_enabled: bool,
+        batching_excluded: Callable[[nn.Parameter], bool] | None,
         default_weight_loader: Callable,
         packed_modules_mapping: Mapping[str, Any],
         expert_index: Mapping[str, tuple[str, int, str]],
@@ -60,6 +61,7 @@ class WeightDispatcher:
         detect_fused_expert_fn: Callable[[str], bool] | None,
         get_fused_expert_mapping_fn: Callable[[], Sequence[tuple]] | None,
         load_fused_expert_weights_fn: Callable | None,
+        on_fused_param: Callable[[nn.Parameter], None] | None = None,
     ):
         self.model = model
         self.params_dict = params_dict
@@ -69,6 +71,7 @@ class WeightDispatcher:
         self.submit = submit
         self.staging_pool = staging_pool
         self.batching_enabled = batching_enabled
+        self.batching_excluded = batching_excluded
         self.default_weight_loader = default_weight_loader
         self.packed_modules_mapping = packed_modules_mapping
         self.expert_index = expert_index
@@ -77,6 +80,8 @@ class WeightDispatcher:
         self.detect_fused_expert_fn = detect_fused_expert_fn
         self.get_fused_expert_mapping_fn = get_fused_expert_mapping_fn
         self.load_fused_expert_weights_fn = load_fused_expert_weights_fn
+        # Fused writes bypass `submit` and need storage prepared first.
+        self.on_fused_param = on_fused_param
 
         self.loaded_weights_record: set[str] = set()
         self.dropped_ckpt_keys: list[tuple[str, str]] = []
@@ -181,6 +186,8 @@ class WeightDispatcher:
             # the staging pool must not also own it -- see ExpertStagingPool's
             # ownership rule.
             self.staging_pool.decline(self.params_dict[name_mapped])
+            if self.on_fused_param is not None:
+                self.on_fused_param(self.params_dict[name_mapped])
 
             # Generic call - model provides implementation details
             num_experts = getattr(self.hf_config, "n_routed_experts", 0) or getattr(
@@ -194,7 +201,7 @@ class WeightDispatcher:
                 shard_id,
                 num_experts,
             ):
-                self._record(name)
+                self._record(name_mapped)
                 return True
         return False
 
@@ -219,7 +226,14 @@ class WeightDispatcher:
                 # Parameter absent from model (e.g. weight scales for an
                 # unquantized drafter MTP block); skip silently.
                 return True, name
-            if self.batching_enabled and self.staging_pool.is_batchable(param, name):
+            batching_excluded = (
+                self.batching_excluded is not None and self.batching_excluded(param)
+            )
+            if (
+                self.batching_enabled
+                and not batching_excluded
+                and self.staging_pool.is_batchable(param, name)
+            ):
                 self.submit(
                     self.staging_pool.stage, param, name, shard_id, expert_id, tensor
                 )

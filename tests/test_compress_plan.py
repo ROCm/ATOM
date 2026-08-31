@@ -3,7 +3,7 @@
 
 Covers the three slicing modes (eager / decode-CUDAGraph / extend-shaped verify)
 and the CUDAGraph invariance that lets the decode write grid shrink to
-`graph_bs * min(qlen, K_pool)` while keeping `[bs, graph_bs)` padding rows
+`running_bs * min(qlen, K_pool)` while keeping `[bs, running_bs)` padding rows
 sentinel-filled. No GPU required — a fake CpuGpuBuffer backs the plan tensors.
 """
 
@@ -62,7 +62,7 @@ def _uniform_decode(bs, qlen, ctx=100):
     return extend, context
 
 
-# ── eager path (graph_bs=None) ────────────────────────────────────────────
+# ── eager path (running_bs=None) ────────────────────────────────────────────
 
 
 def test_eager_compress_tight_write_full_buffer():
@@ -76,11 +76,11 @@ def test_eager_compress_tight_write_full_buffer():
         assert p.write_plan_gpu.shape[0] == 200
 
 
-# ── decode CUDAGraph path (graph_bs set) ──────────────────────────────────
+# ── decode CUDAGraph path (running_bs set) ──────────────────────────────────
 
 
 def test_decode_cg_slice_equals_graph_bs_times_bound():
-    graph_bs, qlen = 8, 4
+    running_bs, qlen = 8, 4
     extend, context = _uniform_decode(bs=5, qlen=qlen)
     bufs = _buffers()
     plans = make_compress_plans(
@@ -88,13 +88,13 @@ def test_decode_cg_slice_equals_graph_bs_times_bound():
         context,
         RATIOS_OVERLAP,
         plan_buffers=bufs,
-        graph_bs=graph_bs,
+        running_bs=running_bs,
         max_q_len=qlen,
     )
     for ratio, is_overlap in RATIOS_OVERLAP:
         p = plans[ratio]
-        exp_ccap = graph_bs * ((qlen + ratio - 1) // ratio)
-        exp_wcap = graph_bs * min(qlen, _k_pool(ratio, is_overlap))
+        exp_ccap = running_bs * ((qlen + ratio - 1) // ratio)
+        exp_wcap = running_bs * min(qlen, _k_pool(ratio, is_overlap))
         assert p.compress_plan_gpu.shape[0] == exp_ccap
         assert p.write_plan_gpu.shape[0] == exp_wcap
 
@@ -102,14 +102,14 @@ def test_decode_cg_slice_equals_graph_bs_times_bound():
 def test_decode_write_count_is_bs_times_bound():
     # For decode (qlen <= K_pool) every query token lands in the ring window,
     # so num_write is EXACTLY bs * min(qlen, K_pool) — content-independent.
-    graph_bs, qlen, bs = 8, 4, 5
+    running_bs, qlen, bs = 8, 4, 5
     extend, context = _uniform_decode(bs=bs, qlen=qlen)
     plans = make_compress_plans(
         extend,
         context,
         RATIOS_OVERLAP,
         plan_buffers=_buffers(),
-        graph_bs=graph_bs,
+        running_bs=running_bs,
         max_q_len=qlen,
     )
     for ratio, is_overlap in RATIOS_OVERLAP:
@@ -117,15 +117,15 @@ def test_decode_write_count_is_bs_times_bound():
 
 
 def test_decode_padding_region_is_sentinel():
-    # The [n_write, cap) tail == the [bs, graph_bs) padding seqs → all sentinel.
-    graph_bs, qlen, bs = 8, 4, 5
+    # The [n_write, cap) tail == the [bs, running_bs) padding seqs → all sentinel.
+    running_bs, qlen, bs = 8, 4, 5
     extend, context = _uniform_decode(bs=bs, qlen=qlen)
     plans = make_compress_plans(
         extend,
         context,
         RATIOS_OVERLAP,
         plan_buffers=_buffers(),
-        graph_bs=graph_bs,
+        running_bs=running_bs,
         max_q_len=qlen,
     )
     for ratio, _ in RATIOS_OVERLAP:
@@ -137,47 +137,47 @@ def test_decode_padding_region_is_sentinel():
 
 
 def test_decode_cg_invariant_across_real_bs():
-    # Same (graph_bs, qlen), different real bs → identical slice shapes. This is
-    # the CUDAGraph capture/replay invariant: capture runs at bs==graph_bs,
-    # replay at bs<graph_bs, both must dispatch the same-shaped kernel.
-    graph_bs, qlen = 16, 2
+    # Same (running_bs, qlen), different real bs → identical slice shapes. This is
+    # the CUDAGraph capture/replay invariant: capture runs at bs==running_bs,
+    # replay at bs<running_bs, both must dispatch the same-shaped kernel.
+    running_bs, qlen = 16, 2
     shapes = {}
-    for bs in (graph_bs, 1, 7):
+    for bs in (running_bs, 1, 7):
         extend, context = _uniform_decode(bs=bs, qlen=qlen)
         plans = make_compress_plans(
             extend,
             context,
             RATIOS_OVERLAP,
             plan_buffers=_buffers(),
-            graph_bs=graph_bs,
+            running_bs=running_bs,
             max_q_len=qlen,
         )
         shapes[bs] = {
             r: (plans[r].compress_plan_gpu.shape[0], plans[r].write_plan_gpu.shape[0])
             for r, _ in RATIOS_OVERLAP
         }
-    assert shapes[graph_bs] == shapes[1] == shapes[7]
+    assert shapes[running_bs] == shapes[1] == shapes[7]
 
 
 # ── empty fwd ─────────────────────────────────────────────────────────────
 
 
 def test_empty_fwd_decode_cg_matches_caps_all_sentinel():
-    graph_bs, qlen = 8, 4
-    extend = np.zeros(graph_bs, dtype=np.int32)
-    context = np.zeros(graph_bs, dtype=np.int32)
+    running_bs, qlen = 8, 4
+    extend = np.zeros(running_bs, dtype=np.int32)
+    context = np.zeros(running_bs, dtype=np.int32)
     plans = make_compress_plans(
         extend,
         context,
         RATIOS_OVERLAP,
         plan_buffers=_buffers(),
-        graph_bs=graph_bs,
+        running_bs=running_bs,
         max_q_len=qlen,
     )
     for ratio, is_overlap in RATIOS_OVERLAP:
         p = plans[ratio]
         assert p.num_write == 0 and p.num_compress == 0
-        assert p.write_plan_gpu.shape[0] == graph_bs * min(
+        assert p.write_plan_gpu.shape[0] == running_bs * min(
             qlen, _k_pool(ratio, is_overlap)
         )
         assert (p.write_plan_gpu[:, POSITION_COL] == -1).all()
@@ -221,7 +221,7 @@ def test_graph_bs_and_decode_cap_mutually_exclusive():
             context,
             RATIOS_OVERLAP,
             plan_buffers=_buffers(),
-            graph_bs=4,
+            running_bs=4,
             max_q_len=2,
             decode_capacity_per_ratio={4: 8, 128: 8},
         )

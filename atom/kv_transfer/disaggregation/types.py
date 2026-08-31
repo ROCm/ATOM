@@ -138,6 +138,10 @@ class KVTransferTensors:
     slot_regions: list[KVTransferRegion]
     num_blocks: int
     num_slots: int = 0
+    # Optional producer-local -> consumer-global mapping for non-uniform block
+    # region layouts. Uniform per-layer groups leave this unset and use the
+    # connector's existing group-major inference.
+    block_region_consumer_indices: list[int] | None = None
     # Legacy field name: full per-request SLOT regions keyed by pool group.
     # `unit_bytes` includes compressor state and SWA, not just one ring.
     swa_block_regions: list[KVTransferRegion] = field(default_factory=list)
@@ -327,6 +331,16 @@ class ConnectorMetadata:
         self.reqs_to_recv[request_id] = self._build_req_meta(
             request_id, local_block_ids, kv_transfer_params, local_swa_block_ids
         )
+
+
+def completion_req_key(completion: ConnectorCompletionId) -> str:
+    """Request identity shared by every shape a completion can take.
+
+    Offload reports ``SaveOperationId``/``LoadOperationId`` or a bare request
+    id; the send side and the scheduler only know requests. Pairing the two
+    means collapsing onto the request id first, or the lookup never hits.
+    """
+    return str(getattr(completion, "req_id", completion))
 
 
 def connector_metadata_has_work(metadata: object | None) -> bool:

@@ -665,7 +665,7 @@ class PagedAttentionImpl(nn.Module):
             v_cache_5d = self._view_v_cache_for_pa_decode_bf16_asm(v_cache, k_cache)
 
             output = torch.empty(q_5d.shape, dtype=torch.bfloat16, device=q.device)
-            # CUDAGraph decode pads scheduled_bs up to graph_bs. PA ASM has no
+            # CUDAGraph decode pads scheduled_bs up to running_bs. PA ASM has no
             # work for padded rows (context_len == 0); zero output so padded rows
             # stay deterministic.
             split_rows = max(
@@ -819,13 +819,16 @@ class PagedAttentionImpl(nn.Module):
             # Raw K/V is fed as a block_size=1 flash-layout cache, never shuffled.
             shuffled_kv_cache = False
 
+        n_block_rows = attn_metadata.block_tables.shape[0]
         unified_attention(
             q,
             k_for_attn,
             v_for_attn,
             o,
-            cu_seqlens_q=attn_metadata.cu_seqlens_q,
-            seqused_k=attn_metadata.context_lens,
+            # Cut to the rows of the block table this indexes with them: the
+            # prefill builder pads both past the requests it scheduled.
+            cu_seqlens_q=attn_metadata.cu_seqlens_q[: n_block_rows + 1],
+            seqused_k=attn_metadata.context_lens[:n_block_rows],
             max_seqlen_q=attn_metadata.max_seqlen_q,
             max_seqlen_k=attn_metadata.max_seqlen_k,
             softmax_scale=self.scale,

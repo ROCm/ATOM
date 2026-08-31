@@ -27,10 +27,12 @@ Caller contract:
   where `n_compress[t]` is 0 for SWA, `min(n_committed_csa, index_topk)`
   for CSA, `n_committed_hca` for HCA.
 - `swa_indices` / `csa_indices` / `hca_indices` capacity ≥ corresponding
-  indptr[T]; this kernel only writes the SWA-prefix segment at the slice
-  tail `[indptr[t+1] - n, indptr[t+1])` per token. The compress section is
-  filled elsewhere (HCA: numpy fill in caller, CSA: `csa_translate_pack`
-  per layer).
+  indptr[T]; this kernel writes the SWA-prefix segment at the slice tail
+  `[indptr[t+1] - n, indptr[t+1])` per token, and — given
+  `hca_block_tables` — the HCA compress section at the head, which then
+  tile the slice exactly. CSA's head is filled per layer by
+  `csa_translate_pack`; a caller that does not pass block tables fills
+  HCA's itself.
 """
 
 import numpy as np
@@ -45,6 +47,7 @@ from atom.model_ops.attentions.v4_pool_geometry import (
     UnifiedPoolGeometry,
 )
 from atom.model_ops.v4_kernels.pool_index import (
+    compress_row,
     served_window_params,
     window_constexprs,
     window_row,
@@ -90,6 +93,8 @@ def _v4_paged_decode_indices_kernel(
     dense_ring_start,  # per-class window bases; the only terms the boundary moves
     csa_ring_start,
     hca_ring_start,
+    hca_block_tables_ptr,  # [bs, bt_stride_bs] int32 — only read if HCA_FROM_BT
+    hca_bt_stride_bs,
     win: tl.constexpr,  # window_size — max SWA prefix slots
     BLOCK_N: tl.constexpr,  # next_pow2(win)
     HAS_CSA: tl.constexpr,  # caller has layers of this class to serve
@@ -107,6 +112,9 @@ def _v4_paged_decode_indices_kernel(
     HCA_SLOT_ROWS: tl.constexpr,
     HCA_RING_STRIDE: tl.constexpr,
     HCA_RUN_ROWS: tl.constexpr,
+    HCA_FROM_BT: tl.constexpr,  # also fill the HCA compress section
+    HCA_ENVELOPE_ROWS: tl.constexpr,
+    HCA_ROWS_PER_BLOCK: tl.constexpr,
 ):
     """One program per token. Writes `n = min(positions[t]+1, win)` pool rows
     to the SWA prefix segment, placed at the TAIL of each token's slice in the
@@ -224,6 +232,29 @@ def _v4_paged_decode_indices_kernel(
                 HCA_RUN_ROWS,
             ),
         )
+        if HCA_FROM_BT:
+            # Compress section, at the slice HEAD. Its length is not passed in:
+            # the slice was sized `n + n_committed_hca[bid]`, so what the SWA
+            # prefix leaves is exactly the committed count — the two tile the
+            # slice, which is why nothing pre-fills it.
+            hca_start = tl.load(hca_indptr_ptr + t)
+            n_hca = hca_end - hca_start - n
+            # Entry k is row k % HCA_ROWS_PER_BLOCK of physical block
+            # k // HCA_ROWS_PER_BLOCK, matching the compressor's cache view.
+            bt_row = bid * hca_bt_stride_bs
+            for j in tl.range(0, n_hca, BLOCK_N):
+                k = j + i
+                k_mask = k < n_hca
+                bt = tl.load(
+                    hca_block_tables_ptr + bt_row + k // HCA_ROWS_PER_BLOCK,
+                    mask=k_mask,
+                    other=0,
+                )
+                tl.store(
+                    hca_indices_ptr + hca_start + k,
+                    compress_row(bt, k % HCA_ROWS_PER_BLOCK, HCA_ENVELOPE_ROWS),
+                    mask=k_mask,
+                )
 
 
 @mark_trace
@@ -242,6 +273,8 @@ def write_v4_paged_decode_indices(
     T: int,
     win: int,
     geometry: UnifiedPoolGeometry,
+    hca_block_tables: torch.Tensor | None = None,
+    hca_rows_per_block: int = 0,
     prefix: str = "",
 ) -> None:
     """In-place fill SWA / CSA / HCA window-prefix offsets via a single
@@ -285,9 +318,17 @@ def write_v4_paged_decode_indices(
                                    DIFFERENT rows now, so a caller that only
                                    needs one can no longer alias them all onto
                                    it and let the writes agree.
-      hca_indices:         [>=hca_indptr[T]] int32 OUT — same semantics; HCA
-                                   compress section (slice head) filled in the
-                                   caller via numpy fill.
+      hca_indices:         [>=hca_indptr[T]] int32 OUT — same semantics, plus
+                                   the compress section at the slice head when
+                                   `hca_block_tables` is given. Opt-in because
+                                   the bridges fill that section themselves,
+                                   from a different row formula.
+      hca_block_tables:    [bs, cols] int32 — the source for that fill. Must
+                                   be numbered like `batch_id_per_token`: in a
+                                   TBO ubatch, the ubatch-sliced buffer, not
+                                   the global one.
+      hca_rows_per_block:  int — `block_size // HCA_RATIO`, the rows the
+                                   compressor packs per physical block.
       dest_rows:           {ratio: [>=T] int32 OUT} — the row token `t`'s own
                                    KV goes to in a layer of that class. Needed
                                    for every class that is both served by the
@@ -322,6 +363,11 @@ def write_v4_paged_decode_indices(
     has_hca = hca_indices is not None
     assert has_csa == (csa_indptr is not None)
     assert has_hca == (hca_indptr is not None)
+    hca_from_bt = hca_block_tables is not None
+    if hca_from_bt:
+        assert has_hca, "hca_block_tables given without an HCA buffer to fill"
+        assert hca_rows_per_block > 0
+        assert hca_block_tables.dim() == 2
 
     # A class that is off — not in the geometry, or one the caller did not ask
     # for — still needs a pointer and a value for every `constexpr`, because
@@ -363,6 +409,8 @@ def write_v4_paged_decode_indices(
         dense.ring_start,
         csa.ring_start,
         hca.ring_start,
+        hca_block_tables if hca_from_bt else swa_indices,
+        hca_block_tables.stride(0) if hca_from_bt else 0,
         win=win,
         BLOCK_N=BLOCK_N,
         HAS_CSA=has_csa,
@@ -371,6 +419,9 @@ def write_v4_paged_decode_indices(
         **window_constexprs(dense, "DENSE_"),
         **window_constexprs(csa, "CSA_"),
         **window_constexprs(hca, "HCA_"),
+        HCA_FROM_BT=hca_from_bt,
+        HCA_ENVELOPE_ROWS=geometry.envelope_rows,
+        HCA_ROWS_PER_BLOCK=hca_rows_per_block,
     )
 
 

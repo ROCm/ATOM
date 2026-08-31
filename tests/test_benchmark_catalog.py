@@ -22,8 +22,8 @@ WORKFLOW = REPO / ".github" / "workflows" / "atom-benchmark.yaml"
 
 sys.path.insert(0, str(SCRIPTS))
 
-import catalog  # noqa: E402
-from build_benchmark_matrix import RESERVED_INPUTS  # noqa: E402
+import catalog
+from build_benchmark_matrix import RESERVED_INPUTS
 
 # Legacy hard-coded matrix `exclude` block (suffix, concurrency) pairs. The
 # refactor must reproduce exactly this pruning via per-variant conc bands.

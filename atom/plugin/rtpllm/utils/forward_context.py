@@ -38,6 +38,7 @@ from atom.utils.forward_context import (
     Context,
     _forward_kv_cache_context,
     reset_forward_context,
+    running_tokens_from_bs,
     set_forward_context,
     set_kv_cache_data,
 )
@@ -1635,11 +1636,17 @@ class RTPForwardContext:
             batch_size = int(attn_metadata.plugin_metadata.num_decodes)
         if batch_size <= 0:
             raise ValueError("RTP plugin failed to derive non-zero batch size.")
+        is_prefill = bool(getattr(attn_inputs, "is_prefill", False))
         context = Context(
             positions=positions,
-            is_prefill=bool(getattr(attn_inputs, "is_prefill", False)),
-            batch_size=batch_size,
-            graph_bs=batch_size,
+            is_prefill=is_prefill,
+            scheduled_bs=batch_size,
+            # The rows this forward really runs; MRoPE keeps the token axis last.
+            scheduled_tokens=int(positions.shape[-1]),
+            running_bs=batch_size,
+            running_tokens=running_tokens_from_bs(
+                batch_size, is_prefill=is_prefill, attn_metadata=attn_metadata
+            ),
         )
         return cls(
             gdn_metadata=gdn_metadata,
