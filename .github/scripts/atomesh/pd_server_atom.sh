@@ -712,6 +712,7 @@ run_benchmark() {
         --ignore-eos \
         --save-result \
         --percentile-metrics='ttft,tpot,itl,e2el' \
+        --metric-percentiles='90,99' \
         --result-dir="${RUN_DIR}/benchmark_results" \
         --result-filename="${result_file}"
     done
@@ -811,12 +812,15 @@ payload = {
     "request_throughput": avg("request_throughput"),
     "mean_ttft_ms": avg("time_to_first_token"),
     "median_ttft_ms": pct("time_to_first_token", "p50"),
+    "p90_ttft_ms": pct("time_to_first_token", "p90"),
     "p99_ttft_ms": pct("time_to_first_token", "p99"),
     "mean_itl_ms": avg("inter_token_latency"),
     "median_itl_ms": pct("inter_token_latency", "p50"),
+    "p90_itl_ms": pct("inter_token_latency", "p90"),
     "p99_itl_ms": pct("inter_token_latency", "p99"),
     "mean_e2el_ms": avg("request_latency"),
     "median_e2el_ms": pct("request_latency", "p50"),
+    "p90_e2el_ms": pct("request_latency", "p90"),
     "p99_e2el_ms": pct("request_latency", "p99"),
     "input_throughput": avg("input_token_throughput"),
     "output_throughput": avg("output_token_throughput"),
