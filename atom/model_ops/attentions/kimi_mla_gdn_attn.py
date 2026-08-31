@@ -240,6 +240,9 @@ class _KimiMLAGDNCommon(GDNStateMixin):
                 v_cache=runner.mamba_v_cache[row],
                 k_scale=None,
                 v_scale=None,
+                replay_buf_k=(runner.replayssm_buf_k[row] if self.replayssm else None),
+                replay_buf_u=(runner.replayssm_buf_u[row] if self.replayssm else None),
+                replay_buf_g=(runner.replayssm_buf_g[row] if self.replayssm else None),
             )
 
         if hasattr(module, "base_attention") and getattr(module, "use_mla", False):
@@ -270,8 +273,8 @@ class _KimiMLAGDNCommon(GDNStateMixin):
 
         return None
 
-    def prepare_prefill(self, batch: ScheduledBatch):
-        attn_metadata, positions = super().prepare_prefill(batch)
+    def prepare_prefill(self, batch: ScheduledBatch, running_bs: int):
+        attn_metadata, positions = super().prepare_prefill(batch, running_bs)
         if batch.block_tables == []:
             attn_metadata.gdn_metadata = None
             return attn_metadata, positions
@@ -283,8 +286,16 @@ class _KimiMLAGDNCommon(GDNStateMixin):
         )
         return attn_metadata, positions
 
-    def prepare_decode(self, batch: ScheduledBatch, bs: int):
-        attn_metadata, positions = super().prepare_decode(batch, bs)
+    def prepare_decode(
+        self,
+        batch: ScheduledBatch,
+        running_bs: int,
+        running_tokens: int,
+        max_seqlen_q: int,
+    ):
+        attn_metadata, positions = super().prepare_decode(
+            batch, running_bs, running_tokens, max_seqlen_q
+        )
         self._attach_gdn_decode_metadata(
             batch,
             attn_metadata,

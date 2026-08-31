@@ -163,23 +163,26 @@ def test_decode_filter(name, g_ctxs, seed):
 
         exp = _decode_reference(g_ctxs, block_table, token_indices, rank)
         indptr = out_indptr.cpu().tolist()
+        true_counts = counts.cpu().tolist()
 
         for b in range(bs):
             got_len = indptr[b + 1] - indptr[b]
-            assert got_len == len(exp[b]), (
+            assert true_counts[b] == len(exp[b])
+            assert got_len == max(len(exp[b]), 1), (
                 f"[{name}] rank{rank} req{b}: region length {got_len} "
-                f"!= {len(exp[b])}"
+                f"!= metadata length {max(len(exp[b]), 1)}"
             )
         for b in range(bs):
             got = out_buf[indptr[b] : indptr[b + 1]].cpu().tolist()
-            assert got == exp[b], f"[{name}] rank{rank} req{b}: {got} != {exp[b]}"
+            expected = exp[b] if exp[b] else [0]
+            assert got == expected, f"[{name}] rank{rank} req{b}: {got} != {expected}"
 
         written = out_buf[: indptr[bs]]
         assert (
             int((written < 0).sum()) == 0
         ), f"[{name}] rank{rank}: -1 hole inside the compacted region"
 
-        per_rank_lens.append([indptr[b + 1] - indptr[b] for b in range(bs)])
+        per_rank_lens.append(true_counts)
 
     # Partition: every valid top-k token is claimed by exactly one rank.
     # Checked on COUNTS, not on slot values -- slots are per-rank local
@@ -237,11 +240,16 @@ def test_decode_filter_block_interleave(interleave, g_ctxs, seed):
 
         exp = _decode_reference(g_ctxs, block_table, token_indices, rank, interleave)
         indptr = out_indptr.cpu().tolist()
+        true_counts = counts.cpu().tolist()
         for b in range(bs):
             got = out_buf[indptr[b] : indptr[b + 1]].cpu().tolist()
-            assert got == exp[b], f"S={interleave} rank{rank} req{b}: {got} != {exp[b]}"
+            assert true_counts[b] == len(exp[b])
+            expected = exp[b] if exp[b] else [0]
+            assert (
+                got == expected
+            ), f"S={interleave} rank{rank} req{b}: {got} != {expected}"
         assert int((out_buf[: indptr[bs]] < 0).sum()) == 0, "-1 hole in region"
-        per_rank_lens.append([indptr[b + 1] - indptr[b] for b in range(bs)])
+        per_rank_lens.append(true_counts)
 
     for b, g in enumerate(g_ctxs):
         n = min(g, DEC_K)
@@ -251,9 +259,11 @@ def test_decode_filter_block_interleave(interleave, g_ctxs, seed):
 
 # ────────────────────────────────────────────────────────────── prefill side ──
 
-PRE_W = 8
+PRE_W = 8  # overridden per-test below
 PRE_PAGE = 16
-PRE_TOPK = 256  # multiple of BLOCK_N=128; production runs index_topk=2048
+PRE_TOPK = (
+    256  # multiple of BLOCK_N=128; production runs index_topk=2048 (see the prod case)
+)
 
 
 def _build_prefill_case(seq_lens):
@@ -348,11 +358,14 @@ def _run_prefill(case, interleave=1):
     return per_rank
 
 
+@pytest.mark.parametrize("world", [8, 4, 2])  # production ships dcp8; 4/2 untested
 @pytest.mark.parametrize("interleave", [1, 4])  # 4 divides PRE_PAGE=16
 @pytest.mark.parametrize(
     "seq_lens", [[400], [300, 240], [17, 5, 1]], ids=["single", "two-seq", "tiny"]
 )
-def test_prefill_filter(seq_lens, interleave):
+def test_prefill_filter(seq_lens, interleave, world):
+    global PRE_W
+    PRE_W = world
     case = _build_prefill_case(np.asarray(seq_lens, dtype=np.int32))
     per_rank = _run_prefill(case, interleave)
 
@@ -397,21 +410,20 @@ def test_prefill_filter(seq_lens, interleave):
                 if owner == r
             ]
 
-            # Contract: a row this rank owns nothing of stays
-            # EMPTY -- no dummy candidate is injected. mla_decode_fwd accepts a
-            # zero-length region and writes lse=-inf; the caller zeroes the
-            # matching NaN `o`. So the region must be exactly length 0 and
-            # owned_counts must report 0.
+            # Contract: a row this rank owns nothing of gets one valid dummy
+            # slot so persistent MLA metadata never sees a zero-length row.
+            # owned_counts remains 0, allowing the caller to replace its
+            # attention result with O=0/LSE=-inf before the DCP merge.
             # Counted off the kernel's own indptr, never off the reference:
             # summing the reference's per-rank splits would reproduce `want` by
             # construction and assert nothing.
-            n_claimed += len(slots)
+            n_claimed += int(cnts[t])
 
             if not exp_slots:
                 n_empty += 1
-                assert len(slots) == 0 and cnts[t] == 0, (
-                    f"token={t} rank={r}: unowned row must stay empty, got "
-                    f"len={len(slots)} count={cnts[t]}"
+                assert list(slots) == [0] and cnts[t] == 0, (
+                    f"token={t} rank={r}: unowned row must hold one dummy, got "
+                    f"slots={list(slots)} count={cnts[t]}"
                 )
                 continue
 
