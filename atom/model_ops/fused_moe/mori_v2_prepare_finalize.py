@@ -196,7 +196,15 @@ _MEGA_TRANSPORTS: dict = {}
 # bf16 | fp8 | fp4, and it must MATCH the expert GEMM's A operand -- on gfx1250
 # that is fp4 unless AITER_FORCE_A8W4=1. A mismatch is a row-width error, not a
 # slow path. Read once: init_mega_transport runs per MoE layer (61x for V4-Pro).
-_MEGA_WIRE = os.environ.get("MEGA_WIRE", "bf16")
+#
+# Checked here as well as in aiter: this module passes dispatch_wire= down
+# explicitly, so aiter's own env read -- and its guard -- never runs for us.
+if os.environ.get("MEGA_WIRE") not in (None, os.environ.get("MEGA_DISPATCH_WIRE")):
+    raise RuntimeError(
+        "MEGA_WIRE was renamed to MEGA_DISPATCH_WIRE; update the launch script, "
+        "the old name is no longer read"
+    )
+_MEGA_DISPATCH_WIRE = os.environ.get("MEGA_DISPATCH_WIRE", "bf16")
 
 
 def init_mega_transport(
@@ -240,8 +248,9 @@ def init_mega_transport(
         hidden_pad,
         intermediate_pad,
         swiglu_limit,
-        # Keyed on: the wire sets the payload width and whether out_scales exists.
-        _MEGA_WIRE,
+        # Keyed on: the wire sets the payload width and whether the scale
+        # region exists.
+        _MEGA_DISPATCH_WIRE,
     )
     cached = _MEGA_TRANSPORTS.get(key)
     if cached is not None:
@@ -273,9 +282,18 @@ def init_mega_transport(
         swiglu_limit=swiglu_limit,
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
-        # Passed, not left to aiter's own read of $MEGA_WIRE, so the key and the
+        # Passed, not left to aiter's own read of the env, so the key and the
         # transport cannot drift.
-        dispatch_wire=_MEGA_WIRE,
+        dispatch_wire=_MEGA_DISPATCH_WIRE,
+        # Only mori's dispatch carries the scale row, so a quantizing wire has
+        # no other backend to run on. Named here rather than left to
+        # $MEGA_DISPATCH, whose default is flydsl: otherwise asking for fp4 is
+        # rejected at the first MoE layer for a reason the operator did not set.
+        **(
+            {"dispatch_backend": "mori"}
+            if _MEGA_DISPATCH_WIRE in ("fp8", "fp4")
+            else {}
+        ),
     )
     comm.barrier()
     _MEGA_TRANSPORTS[key] = mega
