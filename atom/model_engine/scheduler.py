@@ -2631,15 +2631,36 @@ class Scheduler:
         if settle is not None:
             settle(req_id, ok=ok)
 
+    def _state_store_pending_cap(self) -> int:
+        """The running-plus-queued cap for state-tier stores.
+
+        Read off the connector's own `_max_pending_saves` -- the canonical
+        `_offload_common.max_pending_saves` value it computed from
+        `kv_connector_extra_config` and `OFFLOAD_COPY_WORKERS`, the exact bound
+        the KV leg's `_may_emit_save` enforces. Sharing that number rather than
+        re-reading the bare `OFFLOAD_MAX_PENDING_SAVES` default of 2 keeps the
+        two legs from pinning different amounts of the same pool, and honours a
+        per-connector `"max_pending_saves"` override the env reader never sees.
+        Falls back to the env reader for a connector (or test double) that never
+        computed one, and through the delegating shell's `_impl`.
+        """
+        conn = self.kv_connector
+        cap = getattr(conn, "_max_pending_saves", None)
+        if cap is None:
+            cap = getattr(getattr(conn, "_impl", None), "_max_pending_saves", None)
+        if isinstance(cap, int) and not isinstance(cap, bool) and cap > 0:
+            return cap
+        return _offload_max_pending_saves()
+
     def _publish_state_stores(self) -> None:
         """Hand this pass's ready checkpoints to the connector for the CPU tier.
 
         Beside `_publish_state_loads` and on the same schedule, so one pass
-        makes one decision about the tier. The cap is the same
-        `OFFLOAD_MAX_PENDING_SAVES` the KV leg uses and for the same reason:
-        each outstanding transfer holds the bytes it is reading out of the
-        pool, so the queue depth is also how much of the pool a slow backend
-        can pin.
+        makes one decision about the tier. The cap is the connector's own
+        `_max_pending_saves` (see `_state_store_pending_cap`) -- the same bound
+        the KV leg's `_may_emit_save` enforces, and for the same reason: each
+        outstanding transfer holds the bytes it is reading out of the pool, so
+        the queue depth is also how much of the pool a slow backend can pin.
 
         `take_state_stores` pins as it hands over, so anything the connector
         will not carry has to be settled here rather than left to the
@@ -2650,7 +2671,7 @@ class Scheduler:
         take = getattr(getattr(self, "block_manager", None), "take_state_stores", None)
         if take is None:
             return
-        stores = take(_offload_max_pending_saves())
+        stores = take(self._state_store_pending_cap())
         if not stores:
             return
         accepted = False
