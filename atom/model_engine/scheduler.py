@@ -2625,7 +2625,13 @@ class Scheduler:
         """
         if self.kv_connector is None:
             return
-        loads = self.block_manager.take_state_loads()
+        # Guarded like the `_settle_state_load` / `_publish_state_stores`
+        # siblings: a scheduler built without a block manager (the connector
+        # test doubles) would otherwise AttributeError on the bare deref.
+        take = getattr(getattr(self, "block_manager", None), "take_state_loads", None)
+        if take is None:
+            return
+        loads = take()
         if not loads:
             return
         accepted = False
