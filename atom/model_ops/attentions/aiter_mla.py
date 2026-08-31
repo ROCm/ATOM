@@ -1226,8 +1226,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             src.astype(np.int32)
         ).to(dev, non_blocking=True)
 
-    def prepare_prefill(self, batch: ScheduledBatch):
-        attn_metadata, positions = CommonAttentionBuilder.prepare_prefill(self, batch)
+    def prepare_prefill(self, batch: ScheduledBatch, running_bs: int):
+        attn_metadata, positions = CommonAttentionBuilder.prepare_prefill(
+            self, batch, running_bs
+        )
         bs = batch.total_seqs_num_prefill
         sum_scheduled_tokens = batch.total_tokens_num_prefill
         var = self.model_runner.forward_vars
@@ -1359,8 +1361,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             attn_metadata.kv_indices = var["kv_indices"].gpu
             attn_metadata.kv_indptr = var["kv_indptr"].gpu[: bs + 1]
             attn_metadata.kv_indptr[0] = 0
+            # `context_lens` is padded past the requests this indptr counts.
             attn_metadata.kv_indptr[1 : bs + 1] = torch.cumsum(
-                attn_metadata.context_lens, 0
+                attn_metadata.context_lens[:bs], 0
             )
             attn_metadata.kv_last_page_lens = var["kv_last_page_lens"].gpu[:bs]
 
@@ -1734,12 +1737,15 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             + dcp_local_index(pos, W, S) % block_size
         )
 
-    def prepare_decode(self, batch: ScheduledBatch, bs: int):
+    def prepare_decode(
+        self,
+        batch: ScheduledBatch,
+        running_bs: int,
+        running_tokens: int,
+        max_seqlen_q: int,
+    ):
         scheduled_bs = batch.total_seqs_num_decode
         dropout_p = 0.0
-        max_seqlen_q = 1
-        if hasattr(self.model_runner, "drafter"):
-            max_seqlen_q = self.model_runner.drafter.mtp_k + 1
 
         var = self.model_runner.forward_vars
         context_lens = np.asarray(batch.context_lens, dtype=np.int32)
@@ -1790,12 +1796,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         # Use scheduled_bs since in dummy run, total_seqs_num_decode is 1.
         sum_scheduled_tokens = scheduled_bs * max_seqlen_q
-        var["slot_mapping"].np[: bs * max_seqlen_q] = -1
+        var["slot_mapping"].np[:running_tokens] = -1
         if not batch.is_dummy_run:
             var["slot_mapping"].np[:sum_scheduled_tokens] = slot_mapping
         var["positions"].np[:sum_scheduled_tokens] = positions
         var["context_lens"].np[:scheduled_bs] = context_lens
-        var["context_lens"].np[scheduled_bs:bs] = 0
+        var["context_lens"].np[scheduled_bs:running_bs] = 0
 
         if self.dcp_world_size > 1:
             from atom.model_ops.dcp_ops import get_dcp_local_seq_lens
@@ -1809,7 +1815,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # Publish it: the sparse indexer used to re-derive this on device with
             # 8 elementwise kernels per full-index layer.
             var["dcp_local_context_lens"].np[:scheduled_bs] = local_context_lens
-            var["dcp_local_context_lens"].np[scheduled_bs:bs] = 0
+            var["dcp_local_context_lens"].np[scheduled_bs:running_bs] = 0
             num_blocks_per_seq = cdiv(local_context_lens, self.block_size)
         elif any(batch.is_first_decode_without_local_prefill):
             num_blocks_per_seq = [
@@ -1832,7 +1838,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         self.prepare_block_tables(batch)
         var["kv_indptr"].np[1 : scheduled_bs + 1] = kv_indptr
-        var["kv_indptr"].np[scheduled_bs + 1 : bs + 1] = sum_blocks
+        var["kv_indptr"].np[scheduled_bs + 1 : running_bs + 1] = sum_blocks
         if self.dcp_world_size > 1:
             # Global (un-sharded) token-level kv_indptr for the round-robin CP
             # causal mask (page_size=1 -> token granularity). context_lens is the
@@ -1840,7 +1846,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             g_kv_indptr = np.cumsum(context_lens[:scheduled_bs], dtype=np.int32)
             var["g_kv_indptr"].np[0] = 0
             var["g_kv_indptr"].np[1 : scheduled_bs + 1] = g_kv_indptr
-            var["g_kv_indptr"].np[scheduled_bs + 1 : bs + 1] = (
+            var["g_kv_indptr"].np[scheduled_bs + 1 : running_bs + 1] = (
                 g_kv_indptr[-1] if scheduled_bs > 0 else 0
             )
         if self.dcp_world_size > 1 and self.block_size != 1:
@@ -1854,14 +1860,14 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             var["kv_last_page_lens"].np[:scheduled_bs] = (
                 batch.last_block_num_tokens if self.block_size != 1 else 1
             )
-        var["kv_last_page_lens"].np[scheduled_bs:bs] = 0
+        var["kv_last_page_lens"].np[scheduled_bs:running_bs] = 0
         vars_used = [
-            ("slot_mapping", bs * max_seqlen_q),
-            ("context_lens", bs),
-            ("cu_seqlens_q", bs + 1),
-            # ("kv_indptr", bs + 1),
-            ("kv_last_page_lens", bs),
-            ("block_tables", bs),
+            ("slot_mapping", running_tokens),
+            ("context_lens", running_bs),
+            ("cu_seqlens_q", running_bs + 1),
+            # ("kv_indptr", running_bs + 1),
+            ("kv_last_page_lens", running_bs),
+            ("block_tables", running_bs),
         ]
         metadata_deps = {
             "cu_seqlens_q",
@@ -1884,7 +1890,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 var["sparse_kv_indptr"].np[1 : sum_scheduled_tokens + 1] = np.cumsum(
                     sparse_per_token_lens, dtype=np.int32
                 )
-                sum_tokens = bs * max_seqlen_q
+                sum_tokens = running_tokens
                 var["sparse_kv_indptr"].np[
                     sum_scheduled_tokens + 1 : sum_tokens + 1
                 ] = var["sparse_kv_indptr"].np[sum_scheduled_tokens]
@@ -1893,15 +1899,15 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 metadata_deps.add("sparse_kv_indptr")
             else:
                 sparse_context_lens = np.clip(
-                    var["context_lens"].np[:bs], None, index_topk
+                    var["context_lens"].np[:running_bs], None, index_topk
                 )
-                var["sparse_kv_indptr"].np[1 : bs + 1] = np.cumsum(
+                var["sparse_kv_indptr"].np[1 : running_bs + 1] = np.cumsum(
                     sparse_context_lens, dtype=np.int32
                 )
-                var["sparse_kv_indptr"].np[scheduled_bs : bs + 1] = var[
+                var["sparse_kv_indptr"].np[scheduled_bs : running_bs + 1] = var[
                     "sparse_kv_indptr"
                 ].np[scheduled_bs]
-                vars_used.append(("sparse_kv_indptr", bs + 1))
+                vars_used.append(("sparse_kv_indptr", running_bs + 1))
                 metadata_deps.add("sparse_kv_indptr")
 
         vars_for_metadata = [(el, num) for el, num in vars_used if el in metadata_deps]
@@ -1916,7 +1922,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # async overlap.
         disagg = self.model_runner.config.enable_rapidserve
         ctx = {}
-        ctx["kv_indptr"] = var["kv_indptr"].copy_to_gpu(bs + 1)
+        ctx["kv_indptr"] = var["kv_indptr"].copy_to_gpu(running_bs + 1)
         if disagg:
             ctx_rest = {el: var[el].copy_to_gpu(num) for el, num in vars_remaining}
             ctx.update(ctx_rest)
@@ -1950,8 +1956,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         ctx.update({el: var[el].copy_to_gpu(num) for el, num in vars_for_metadata})
 
         if is_sparse_mtp:
-            sum_tokens = bs * max_seqlen_q
-            ctx_mla_ps = self.set_mla_persistent_worker_buffers(bs, max_seqlen_q)
+            sum_tokens = running_tokens
+            ctx_mla_ps = self.set_mla_persistent_worker_buffers(
+                running_bs, max_seqlen_q
+            )
             ctx_mla_ps_sparse = self._set_mla_persistent_worker_buffers_sparse_mtp(
                 sum_tokens
             )
@@ -1961,13 +1969,15 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # masks on global positions g(j)=j*W+r instead of local-causal trim.
             cp_round_robin = self.dcp_world_size > 1 and max_seqlen_q > 1
             # For cprr, build metadata over the REAL requests (scheduled_bs), not
-            # the cudagraph-padded bs. The padded tail is 0-query, which the cprr
+            # the cudagraph-padded running_bs. The padded tail is 0-query, which the cprr
             # metadata kernel mishandles (num_qo_tiles=0 -> div-by-zero; and its
             # is_cp_round_robin "no trim" is overridden by the nhead=128 M-fold
             # qk_batch_ratio branch). The persistent kernel is work_indptr-driven,
-            # so scheduled_bs metadata naturally skips the padding rows. Eager has
-            # scheduled_bs == bs, so this is a no-op there.
-            meta_bs = scheduled_bs if cp_round_robin else bs
+            # so scheduled_bs metadata naturally skips the padding rows. A step
+            # that padded nothing reaches here with the two equal, and then this
+            # is a no-op -- but eager no longer implies that, since a DP-unified
+            # batch pads off the graph path too.
+            meta_bs = scheduled_bs if cp_round_robin else running_bs
             ctx_mla_ps = self.set_mla_persistent_worker_buffers(
                 meta_bs, max_seqlen_q, is_cp_round_robin=cp_round_robin
             )
@@ -1987,12 +1997,14 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # non-DCP / qlen=1 paths keep the plain kernel). Consumed by
         # _forward_decode -> mla_decode_fwd for the MTP (max_q_len>1) cprr mask.
         attn_metadata.g_kv_indptr = (
-            var["g_kv_indptr"].copy_to_gpu(bs + 1) if self.dcp_world_size > 1 else None
+            var["g_kv_indptr"].copy_to_gpu(running_bs + 1)
+            if self.dcp_world_size > 1
+            else None
         )
         # Layer-invariant local KV lengths for the DCP sparse indexer (see the
         # buffer's declaration). None off DCP so the consumer falls back.
         attn_metadata.dcp_local_context_lens = (
-            var["dcp_local_context_lens"].copy_to_gpu(bs)
+            var["dcp_local_context_lens"].copy_to_gpu(running_bs)
             if self.dcp_world_size > 1
             else None
         )
@@ -2002,7 +2014,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 setattr(attn_metadata, k, v)
 
         if is_sparse_mtp:
-            sum_tokens = bs * max_seqlen_q
+            sum_tokens = running_tokens
             attn_metadata.sparse_cu_seqlens_q = var["sparse_cu_seqlens_q"].gpu[
                 : sum_tokens + 1
             ]
@@ -2022,13 +2034,14 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # the kernel over-read past the written sparse-index region).
             attn_metadata.sparse_kv_last_page_lens = var[
                 "sparse_kv_last_page_lens"
-            ].gpu[:bs]
+            ].gpu[:running_bs]
 
-        # Use bs (running_bs) >= 2 instead of scheduled_bs >= 2 to avoid accuracy issue:
-        if self.model_runner.config.enable_tbo_decode and bs >= 2:
+        # running_bs, not scheduled_bs: the padded rows have to be split into the
+        # ubatches too, or accuracy drifts.
+        if self.model_runner.config.enable_tbo_decode and running_bs >= 2:
             self._prepare_ubatch_decode(
                 scheduled_bs,
-                bs,
+                running_bs,
                 max_seqlen_q,
                 context_lens,
             )

@@ -93,8 +93,16 @@ class TritonMLAMetadataBuilder(AiterMLAMetadataBuilder):
             "triton_lse": var["triton_lse"][:rows],
         }
 
-    def prepare_decode(self, batch: ScheduledBatch, bs: int):
-        attn_metadata, positions = super().prepare_decode(batch, bs)
+    def prepare_decode(
+        self,
+        batch: ScheduledBatch,
+        running_bs: int,
+        running_tokens: int,
+        max_seqlen_q: int,
+    ):
+        attn_metadata, positions = super().prepare_decode(
+            batch, running_bs, running_tokens, max_seqlen_q
+        )
         for name, buf in self._cut_decode_buffers(
             batch.total_seqs_num_decode,
             attn_metadata.max_seqlen_k,
@@ -139,8 +147,8 @@ class TritonMLAMetadataBuilder(AiterMLAMetadataBuilder):
             var["kv_indptr"].gpu[: running_bs + 1],
         )
 
-    def prepare_prefill(self, batch: ScheduledBatch):
-        attn_metadata, positions = super().prepare_prefill(batch)
+    def prepare_prefill(self, batch: ScheduledBatch, running_bs: int):
+        attn_metadata, positions = super().prepare_prefill(batch, running_bs)
 
         if envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV and attn_metadata.has_cached:
             # The shuffled cached-prefix gather (gather_kv_b_proj with

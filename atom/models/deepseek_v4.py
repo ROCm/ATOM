@@ -3271,12 +3271,12 @@ class DeepseekV4Attention(nn.Module):
         fc = get_forward_context()
         # Row count off the Q, NOT off `positions`. The Q descends from the
         # hidden state through `wqkv_a`/`wq_b`, so it carries the same token
-        # count the residual stream does. `positions` does not have to: under
-        # `--enable-dp-attention`, a step where any rank is prefilling takes the
-        # variable-length path (`model_runner.py`, `dp_uniform_decode`) and the
-        # two can differ. Sizing the attention output by `positions` then hands
-        # the mHC residual a mismatched `m` -- an aiter shape assert deep inside
-        # a compiled piece, far from here.
+        # count the residual stream does. `positions` does not have to: a step
+        # where any DP rank is prefilling takes the variable-length path (see
+        # `running_tokens_are_unified` in `forward_context.py`) and the two can
+        # differ. Sizing the attention output by `positions` then hands the mHC
+        # residual a mismatched `m` -- an aiter shape assert deep inside a
+        # compiled piece, far from here.
         q_rows = qkn.q_sa if qkn.q_sa is not None else qkn.q_packed
         assert q_rows is not None, (
             "_sparse_attention got no Q: `_qk_norm_rope` did not run upstream. "
@@ -3879,7 +3879,7 @@ class MoE(nn.Module):
 
         ids_2d = ids.unsqueeze(-1)
         dp_eager_mode = (
-            not ctx.context.dp_uniform_decode
+            not ctx.context.running_tokens_are_unified
         ) and ctx.dp_metadata is not None
         if dp_eager_mode:
             from atom.model_ops.moe import all_gatherv

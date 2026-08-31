@@ -457,14 +457,13 @@ def sparse_attn_indexer_plugin_mode(
         batch_size = padded_q_fp8_decode_tokens.shape[0]
         next_n = padded_q_fp8_decode_tokens.shape[1]
         assert batch_size == decode_metadata.seq_lens.shape[0]
-        num_padded_tokens = batch_size * next_n
         logits = torch.empty(
-            [batch_size * next_n, max_model_len], dtype=torch.float32, device="cuda"
+            [num_decode_tokens, max_model_len], dtype=torch.float32, device="cuda"
         )
         deepgemm_fp8_paged_mqa_logits(
             padded_q_fp8_decode_tokens,
             kv_cache,
-            weights[:num_padded_tokens],
+            weights[:num_decode_tokens],
             logits,
             decode_metadata.seq_lens,
             decode_metadata.block_table,
@@ -475,7 +474,6 @@ def sparse_attn_indexer_plugin_mode(
             WavePerEU=2,
         )
 
-        num_rows = logits.shape[0]
         assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
         topk_indices_decode = topk_indices[:num_decode_tokens, :topk_tokens]
         top_k_per_row_decode(
@@ -483,7 +481,7 @@ def sparse_attn_indexer_plugin_mode(
             next_n,
             decode_metadata.seq_lens,
             topk_indices_decode,
-            num_rows,
+            num_decode_tokens,
             logits.stride(0),
             logits.stride(1),
             stable=stable_topk,
