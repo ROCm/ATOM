@@ -5310,26 +5310,11 @@ class TestStateLoadsAndStoresRunInSeparateLanes:
             assert tier.oldest_store_age_s() == 0.0
             tier.submit_store(StateStoreOperationId(1, 1), (0,))
             assert tier.oldest_store_age_s() >= 0.0
-            assert tier.stats()["state_stores_inflight"] == 1
+            assert len(tier._store_submitted_at) == 1
         finally:
             codec.gate.set()
             tier.drain()
             assert tier.oldest_store_age_s() == 0.0
-            tier.shutdown()
-
-    def test_load_queue_wait_is_measured(self):
-        """The metric the old comment told readers to measure did not exist."""
-        codec = self._BlockingCodec()
-        codec.gate.set()
-        tier = self._tier(codec)
-        try:
-            tier.submit_load("r1", 77, 0)
-            tier.drain()
-            stats = tier.stats()
-            assert stats["state_loads_started"] == 1
-            assert stats["state_load_queue_wait_ms_last"] >= 0.0
-            assert "state_load_queue_wait_ms_max" in stats
-        finally:
             tier.shutdown()
 
     class _EarlyReleaseCodec:

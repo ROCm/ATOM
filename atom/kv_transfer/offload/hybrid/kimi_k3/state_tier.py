@@ -76,12 +76,6 @@ class StateOffloadTier:
         self._source_released: set = set()
         self._indexed: set = set()
         self._index_failed: set = set()
-        # Latency, not operation counts. The in-flight cap bounds how many
-        # transfers are outstanding; it says nothing about bytes or about how
-        # long a load waited, which is what a TTFT regression is made of.
-        self.load_queue_wait_ms_last = 0.0
-        self.load_queue_wait_ms_max = 0.0
-        self.loads_started = 0
         # op -> monotonic at submission, for `oldest_store_age_s`.
         self._store_submitted_at: dict = {}
 
@@ -113,18 +107,6 @@ class StateOffloadTier:
             oldest = min(self._store_submitted_at.values())
         return max(0.0, monotonic() - oldest)
 
-    def stats(self) -> dict:
-        """Queue latency for the periodic line. Counters live in the engine."""
-        with self._lock:
-            inflight_stores = len(self._store_submitted_at)
-        return {
-            "state_load_queue_wait_ms_last": round(self.load_queue_wait_ms_last, 2),
-            "state_load_queue_wait_ms_max": round(self.load_queue_wait_ms_max, 2),
-            "state_loads_started": self.loads_started,
-            "state_stores_inflight": inflight_stores,
-            "state_oldest_store_age_s": round(self.oldest_store_age_s(), 2),
-        }
-
     def submit_store(self, op, unit_ids) -> None:
         """Pack the checkpoint image in `unit_ids` for LMCache, under `op`.
 
@@ -147,7 +129,7 @@ class StateOffloadTier:
 
         Its own lane, so a load is never behind a backlog of stores. What the
         two lanes still share is the staging-memory budget; see `__init__`.
-        `state_load_queue_wait_ms` measures what is left of the wait.
+        `_do_load` warns when that remaining wait crosses `_LOAD_WAIT_WARN_MS`.
         """
         self._register(
             self._load_executor.submit(self._do_load, req_id, h, slot, monotonic())
@@ -274,12 +256,6 @@ class StateOffloadTier:
         # the report below.
         if submitted_at is not None:
             waited_ms = max(0.0, monotonic() - submitted_at) * 1000.0
-            with self._lock:
-                self.load_queue_wait_ms_last = waited_ms
-                self.load_queue_wait_ms_max = max(
-                    self.load_queue_wait_ms_max, waited_ms
-                )
-                self.loads_started += 1
             if waited_ms >= _LOAD_WAIT_WARN_MS:
                 logger.warning(
                     "state offload: a state load waited %.0fms for its lane "
