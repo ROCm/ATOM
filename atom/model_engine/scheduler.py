@@ -379,6 +379,16 @@ class CacheStats:
         self._interval_reusable_tokens += num_reusable_tokens
         self._interval_compressed_tokens += num_compressed_tokens
         self._interval_wanted_tokens += num_wanted_tokens
+        # `num_offload_tokens` is outside the `cached <= ... <= reusable` chain,
+        # so the ordering clamp above never bounded it -- but the rates pair it
+        # with `cached` against the same `reusable` denominator (`hit_rate` and
+        # `lmcache_hit_rate` are meant to partition served reuse), and the
+        # documented invariant is `cached + offload <= reusable`. A CPU-tier
+        # resume can report more offload reuse than the HBM walk left room for;
+        # clamp so the combined rate cannot exceed 100%.
+        num_offload_tokens = max(
+            0, min(num_offload_tokens, num_reusable_tokens - num_cached_tokens)
+        )
         self.total_offload_tokens += num_offload_tokens
         self._interval_offload_tokens += num_offload_tokens
 
