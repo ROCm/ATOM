@@ -2694,7 +2694,10 @@ class Scheduler:
             len(stores),
         )
         for op, _units in stores:
-            self.block_manager.settle_state_store(op, ok=False)
+            # `attempted=False`: this refusal is already counted once above as
+            # `stores_refused`; the units must still be released, but the store
+            # never reached a worker, so it is not a `stores_failed`.
+            self.block_manager.settle_state_store(op, ok=False, attempted=False)
 
     def _publish_state_loads(self) -> None:
         """Hand this pass's state-tier loads to the connector, before it builds

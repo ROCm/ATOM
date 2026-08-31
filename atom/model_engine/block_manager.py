@@ -1260,13 +1260,19 @@ class BlockManager:
         self.state_offload.stores_attempted += len(out)
         return out
 
-    def settle_state_store(self, op, ok: bool) -> None:
+    def settle_state_store(self, op, ok: bool, attempted: bool = True) -> None:
         """One store reported. Release the units, and index the hash if it landed.
 
         Success and failure release the pin identically -- it existed to keep
         the bytes still during the copy, and the copy is over either way.
         Only the indexing differs, because only a hash whose bytes are really
         there may be voted for.
+
+        `attempted` is `False` for a store a connector *refused* to carry: the
+        pin still has to be released here, but the copy never reached a worker,
+        so it is not a `stores_failed` -- the caller counts the refusal once as
+        `stores_refused`, and bumping `stores_failed` too would double-count the
+        same event under two names.
 
         `op` is a `StateStoreOperationId`: the pin is released for that exact
         generation, so a late report from a superseded attempt settles nothing.
@@ -1300,7 +1306,7 @@ class BlockManager:
         if ok:
             self.state_offload.stores_completed += 1
             self.state_offload.note_stored(int(op.prefix_hash))
-        else:
+        elif attempted:
             self.state_offload.stores_failed += 1
 
     def release_state_store_source(self, op) -> None:
