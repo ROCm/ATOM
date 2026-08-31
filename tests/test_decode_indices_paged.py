@@ -245,3 +245,151 @@ def test_one_row_per_block_reduces_to_the_block_stride():
     assert np.array_equal(
         got, expected
     ), "with one row per block an entry is just its block's first row"
+
+
+# --- HCA compress section built in the kernel from the block tables -------
+# The section used to be a numpy scatter in the caller, shipped whole every
+# step. The kernel fills it now, so what needs holding is that it lands on the
+# same rows the numpy oracle names, that head and tail tile each slice with no
+# cell left over, and that a caller which does not opt in still gets nothing.
+BT_COLS = 16
+ROWS_PER_BLOCK = 2
+
+
+def _hca_case(bs, n_hca_per_seq, positions, geometry=GEOMETRY):
+    """One decode token per seq plus a `-1` pad token, with HCA heads sized
+    from `n_hca_per_seq` — the same `n + n_committed_hca` the builder uses."""
+    t_total = bs + 1
+    batch_id = list(range(bs)) + [-1]
+    rng = np.random.default_rng(bs * 17 + sum(n_hca_per_seq))
+    bt_np = rng.integers(0, 4, size=(bs, BT_COLS)).astype(np.int32)
+    n_per = [min(p + 1, WIN) for p in positions]
+
+    ptr = [0]
+    for t in range(t_total):
+        live = batch_id[t] >= 0
+        ptr.append(ptr[-1] + (n_per[t] + n_hca_per_seq[t] if live else 0))
+
+    dev = {"dtype": torch.int32, "device": DEV}
+    hca_indices = torch.full((ptr[-1],), -7, **dev)
+    swa_indptr = torch.tensor(
+        np.cumsum([0] + [n_per[t] if batch_id[t] >= 0 else 0 for t in range(t_total)]),
+        **dev,
+    )
+    write_v4_paged_decode_indices(
+        state_slot_per_seq=torch.tensor(SLOTS[:1] * bs, **dev),
+        batch_id_per_token=torch.tensor(batch_id, **dev),
+        positions=torch.tensor(positions, **dev),
+        swa_indptr=swa_indptr,
+        csa_indptr=None,
+        hca_indptr=torch.tensor(ptr, **dev),
+        swa_indices=torch.full((int(swa_indptr[-1]),), -7, **dev),
+        csa_indices=None,
+        hca_indices=hca_indices,
+        dest_rows={
+            r: torch.full((t_total,), -7, **dev)
+            for r in (DENSE_RATIO, CSA_RATIO, HCA_RATIO)
+        },
+        T=t_total,
+        win=WIN,
+        geometry=geometry,
+        hca_block_tables=torch.from_numpy(bt_np).to(DEV),
+        hca_rows_per_block=ROWS_PER_BLOCK,
+    )
+    torch.cuda.synchronize()
+    return hca_indices.cpu().numpy(), ptr, bt_np, n_per
+
+
+def _oracle_heads(ptr, bt_np, n_hca_per_seq, geometry):
+    """The rows the replaced numpy scatter would have written, per slice."""
+    out = {}
+    for t, n_hca in enumerate(n_hca_per_seq):
+        if n_hca == 0:
+            continue
+        e = np.arange(n_hca, dtype=np.int64)
+        out[t] = hca_compress_paged_offsets(
+            e,
+            np.full(n_hca, t, dtype=np.int64),
+            bt_np,
+            geometry.envelope_rows,
+            ROWS_PER_BLOCK,
+        )
+    return out
+
+
+# Counts that cross the two-rows-per-block boundary in both directions, plus a
+# seq with nothing committed and a batch bigger than one wave of tokens.
+@pytest.mark.parametrize(
+    "n_hca_per_seq,positions",
+    [
+        ([1, 2, 3], [5, 20, 13]),
+        ([0, 1, 8], [0, 3, 30]),
+        ([31, 2, 0], [40, 1, 9]),
+        ([7] * 12, list(range(1, 13))),
+    ],
+    ids=["small", "one-empty", "wide-and-empty", "twelve-seqs"],
+)
+def test_hca_head_matches_the_numpy_scatter_it_replaces(n_hca_per_seq, positions):
+    bs = len(n_hca_per_seq)
+    got, ptr, bt_np, _ = _hca_case(bs, n_hca_per_seq + [0], positions + [0])
+    for t, want in _oracle_heads(ptr, bt_np, n_hca_per_seq, GEOMETRY).items():
+        head = got[ptr[t] : ptr[t] + len(want)]
+        assert np.array_equal(head, want), f"slice {t}: got {head}, want {want}"
+
+
+@pytest.mark.parametrize(
+    "n_hca_per_seq,positions",
+    [([1, 2, 3], [5, 20, 13]), ([0, 1, 8], [0, 3, 30]), ([7] * 12, list(range(1, 13)))],
+    ids=["small", "one-empty", "twelve-seqs"],
+)
+def test_head_and_tail_tile_every_slice(n_hca_per_seq, positions):
+    """No cell of a live slice keeps the poison, and no pad slice exists.
+
+    This is what lets the caller drop the `-1` pre-fill: if the two sections
+    ever stopped meeting, the gap would be a stale index into the pool.
+    """
+    bs = len(n_hca_per_seq)
+    got, ptr, _, _ = _hca_case(bs, n_hca_per_seq + [0], positions + [0])
+    assert not (got == -7).any(), f"uncovered cells at {np.flatnonzero(got == -7)}"
+    assert ptr[bs + 1] == ptr[bs], "the -1 pad token was given a slice"
+
+
+def test_without_block_tables_the_head_is_left_alone():
+    """The other five callers fill this section themselves, from a different
+    row formula, so opting out has to mean the kernel writes none of it."""
+    n_hca_per_seq, positions = [3, 4, 5], [5, 20, 13]
+    bs = len(n_hca_per_seq)
+    t_total = bs + 1
+    n_per = [min(p + 1, WIN) for p in positions] + [0]
+    batch_id = list(range(bs)) + [-1]
+    ptr = [0]
+    for t in range(t_total):
+        live = batch_id[t] >= 0
+        ptr.append(ptr[-1] + ((n_per[t] + (n_hca_per_seq + [0])[t]) if live else 0))
+
+    dev = {"dtype": torch.int32, "device": DEV}
+    hca_indices = torch.full((ptr[-1],), -7, **dev)
+    swa_indptr = torch.tensor(np.cumsum([0] + n_per), **dev)
+    write_v4_paged_decode_indices(
+        state_slot_per_seq=torch.tensor(SLOTS[:1] * bs, **dev),
+        batch_id_per_token=torch.tensor(batch_id, **dev),
+        positions=torch.tensor(positions + [0], **dev),
+        swa_indptr=swa_indptr,
+        csa_indptr=None,
+        hca_indptr=torch.tensor(ptr, **dev),
+        swa_indices=torch.full((int(swa_indptr[-1]),), -7, **dev),
+        csa_indices=None,
+        hca_indices=hca_indices,
+        dest_rows={
+            r: torch.full((t_total,), -7, **dev)
+            for r in (DENSE_RATIO, CSA_RATIO, HCA_RATIO)
+        },
+        T=t_total,
+        win=WIN,
+        geometry=GEOMETRY,
+    )
+    torch.cuda.synchronize()
+    got = hca_indices.cpu().numpy()
+    for t in range(bs):
+        head = got[ptr[t] : ptr[t] + n_hca_per_seq[t]]
+        assert (head == -7).all(), f"slice {t} head was written: {head}"

@@ -11,6 +11,8 @@ This document describes the environment variables used in the ATOM project.
 | **ATOM_DP_SIZE** | int | 1 | Total number of data parallel ranks. |
 | **ATOM_DP_MASTER_IP** | str | 127.0.0.1 | Master IP address for DP ranks coordination. |
 | **ATOM_DP_MASTER_PORT** | int | 29500 | Master port for DP ranks coordination. |
+| **ATOM_DP_LB_REQ_EQUIV** | int | 512 | Token-equivalent decode pressure assigned to each in-flight request by `least_tokens` routing. |
+| **ATOM_DP_SESSION_AFFINITY** | bool | false | Load-place each new session, then keep later turns on the same prefix-cache owner. Reads `X-Dynamo-Session-ID`, falling back to `X-Correlation-ID`. |
 
 ## Prefill delayer (DP attention)
 
@@ -29,13 +31,14 @@ no wall-clock skew). See `atom/model_engine/prefill_delayer.py`. Active only whe
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | **ATOM_ENABLE_PREFILL_DELAYER** | bool | true | Master switch for the prefill coalescer. |
-| **ATOM_PREFILL_DELAYER_TARGET_FILL** | float | 0.7 | Release once accumulated pending tokens reach `target_fill × max_num_batched_tokens` (averaged across prefillable ranks). In (0, 1]; higher = fewer, larger prefills at some TTFT cost. Clamped to (0, 1]. |
-| **ATOM_PREFILL_DELAYER_TTFT_MAX_TICKS** | int | 30 | Max consecutive scheduler ticks a held prefill waits before force-release. Values `< 1` clamped to 1. |
-| **ATOM_PREFILL_DELAYER_PARTIAL_MAX_TICKS** | int | 8 | Tighter bound for a held mid-chunked-prefill (it holds allocated KV). Values `< 1` clamped to 1. |
-| **ATOM_PREFILL_DELAYER_STALL_TICKS** | int | 3 | After this many consecutive non-growing ticks, release (burst ended, more won't come). Values `< 1` clamped to 1. |
+| **ATOM_PREFILL_DELAYER_TARGET_FILL** | float | 0.9 | Release once accumulated pending tokens reach `target_fill × max_num_batched_tokens` (averaged across prefillable ranks). In (0, 1]; higher = fewer, larger prefills at some TTFT cost. Clamped to (0, 1]. |
+| **ATOM_PREFILL_DELAYER_TTFT_MAX_TICKS** | int | 200 | Max consecutive scheduler ticks a held prefill waits before force-release. Values `< 1` clamped to 1. |
+| **ATOM_PREFILL_DELAYER_PARTIAL_MAX_TICKS** | int | 100 | Tighter bound for a held mid-chunked-prefill (it holds allocated KV). Values `< 1` clamped to 1. |
+| **ATOM_PREFILL_DELAYER_STALL_TICKS** | int | 10 | After this many consecutive non-growing ticks, release (burst ended, more won't come). Values `< 1` clamped to 1. |
 | **ATOM_PREFILL_DELAYER_KV_HIGH_WATERMARK** | float | 0.9 | At/above this KV usage a prefillable rank force-releases (can't accumulate a bigger batch anyway). |
 | **ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK** | float\|"" | "" (None) | If set, a prefillable rank below this KV usage force-releases (GPU starving). |
 | **ATOM_PREFILL_DELAYER_MAX_QUEUE_MS** | float\|"" | "" (None) | TTFT SLA guard: if any rank's oldest schedulable waiting prefill has queued (since arrival) ≥ this many ms, force-release regardless of the fill target. Measures true end-to-end wait (backlog + coalescer holds), unlike the tick-based TTFT bound which only caps one hold episode. Empty = disabled; set to your TTFT budget (a small value under heavy backlog fires every tick and defeats coalescing). |
+| **ATOM_PREFILL_DECODE_INTERVAL** | int | 0 | After an executed prefill forward, protect this many scheduler passes for decode before admitting another prefill. `0` disables the interval. |
 | **ATOM_PREFILL_DELAYER_DEBUG** | bool | false | Per-tick FIRE/HOLD debug logging. |
 | **ATOM_PREFILL_DELAYER_LOG_EVERY** | int | 1000 | Emit aggregate stats (per-exit fire counts + hold rate) every N decisions (0 disables). |
 
@@ -50,6 +53,9 @@ no wall-clock skew). See `atom/model_engine/prefill_delayer.py`. Active only whe
 | **ATOM_LOADER_PREFETCH_THREADS** | int | 4 | Concurrent sequential readers used by the prefetcher. The device saturates at ~2 streams, so raising this mostly adds contention with the loader; `0` is clamped to `1` (use `ATOM_LOADER_PREFETCH=false` to switch prefetching off). |
 | **ATOM_LOADER_PREFETCH_BLOCK_MB** | int | 16 | Read block size for the prefetcher, in MiB. |
 | **ATOM_LOADER_FADVISE** | bool | `false` | Issue `posix_fadvise(SEQUENTIAL\|WILLNEED)` per shard before reading it. Off by default and ignored while `ATOM_LOADER_PREFETCH` is on: `WILLNEED` is a hint the kernel drops for most of a 350 GiB checkpoint, and running both makes the kernel read ahead over random-ish ranges while the prefetcher streams the same files, so the two compete for the device. Only useful with prefetching disabled. |
+| **ATOM_ONLINE_QUANT_STREAMING** | bool | `false` | Opt in to quantizing eligible online-quant modules as soon as their checkpoint weights are complete, then release source storage to reduce load-time peak memory. Only active with a valid online quantization config. See the [streaming online quantization guide](./online_quantization_streaming_guide.md). |
+| **ATOM_ONLINE_QUANT_STREAMING_HOST_STAGING** | bool | `true` | Assemble streamed module weights in CPU storage before one H2D transfer. Keeps the checkpoint walk parallel; disabling it buffers loader calls and forces the checkpoint walk to one thread. |
+| **ATOM_ONLINE_QUANT_STREAMING_THREADS** | int | `4` | Tail workers for H2D, per-module quantization, and source release. More workers increase overlap and in-flight memory; `0` runs finalization inline. |
 
 ## Plugin mode
 
@@ -96,6 +102,7 @@ combine knob as a quality/throughput tradeoff.
 | **ATOM_ENABLE_DS_QKNORM_FUSION** | bool | 1 (true) | If set to `1`, use the fused Q/K RMSNorm path (`fused_qk_rmsnorm`) in the DeepSeek MLA attention module when Q-LoRA is enabled and QK norm+quant fusion is not used. If set to `0`, apply separate RMSNorm for the Q and KV branches instead. |
 | **ATOM_ENABLE_DS_QKNORM_QUANT_FUSION** | bool | 1 (true) | If set to `1`, fuse QK norm with quantization in MLA attention module. |
 | **ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD** | int | 1024 | Upper bound on MoE token count (`num_tokens` in the MoE forward) for using the dual-stream path: shared experts on a secondary CUDA stream while routed experts run on the default stream. If `num_tokens` exceeds this value, that forward uses single-stream MoE instead. Set to `0` to disable dual-stream setup entirely (no alt stream, no `maybe_dual_stream_forward` registration). |
+| **ATOM_DUAL_STREAM_PIECEWISE** | bool | 0 | Opt-in: allow a PIECEWISE-captured graph piece to hold the MoE dual-stream fork/join (shared experts on `alt_stream` overlapping routed experts). Capture is not the obstacle — `set_forward_context` runs inside `graph_capture()`, so the main stream the fork waits on is the stream capture runs on — and vLLM and SGLang both keep this overlap on inside piecewise graphs (SGLang runs dual-stream *only* inside a graph). Measured on V4-Pro-DSpark under `AF_PIECEWISE`: the fork survives capture, hides 77.5% of shared-expert time, and leaves GSM8K and MTP acceptance unmoved. Off by default only because no throughput win has been demonstrated, and because each replayed piece then carries its own driver-allocated stream (368 vs 2 distinct streams on a tp8 rank trace). The dispatcher is shared, so this moves V2/V3.2/K3 as well. Eager (`NONE`) and whole-model `FULL` are unaffected. |
 
 ### DSpark block sampling
 
@@ -123,6 +130,20 @@ materializes two `[B, V]` fp32 tensors that only an `argmax` reads. See
 | **ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT** | bool | 1 (true) | If set to `1`, use Triton kernel to fuse RMSNorm with quantization. |
 | **ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT** | bool | 1 (true) | If set to `1`, use Triton kernel to fuse SiLU and mul with quantization in MLP module. |
 
+### Draft CUDAGraphs (all drafter flavors)
+
+A drafter declares its forward passes as `DraftGraph`s (`atom/spec_decode/drafter.py`).
+At the end of CUDAGraph capture the runner runs each one once per captured batch
+size, so the per-shape JIT — aiter's flydsl builds an hgemm per tile config,
+in-process — is paid at startup instead of stalling a serving step. At serve
+time a pass runs at the batch the target just ran, which `ForwardMode.decide`
+picks out of those same `capture_sizes` — that is what makes a warmed shape and a
+reachable shape one set rather than two lists that drift. The switch below decides whether that warm also *records*.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_DRAFT_CUDAGRAPH** | bool | 1 (true) | Capture each declared draft pass into a per-`capture_sizes` CUDAGraph as it is warmed, so a draft pass replays instead of relaunching every kernel. `0` keeps the warmup (and therefore the JIT saving) but drafts eagerly. Only passes that declare a graph are captured — the separate-draft Kimi-K3 path declares none, so this is inert there. EPLB no longer declines the padding: the target pads on every cudagraph decode step and its rows reach the same expert-load recorder, so declining on the draft protected nothing. A DP-sync dummy DOES replay, in lockstep with the ranks holding work — `is_dummy_run` is per-rank, so gating on it splits one DP group across two collectives. Measured on V4-Flash-DSpark tp1: GSM8K 0.9527 / acceptance 65.25% captured against 0.9497 / 65.21% eager, i.e. indistinguishable; on tp4 with the LM head inside the capture, draft kernel launches went 30 → 0 per pass and draft wall time 915.8 → 118.9 µs. Read per pass at warmup time, so set it before the server starts. Grep a trace for a trailing ` graph` in a `propose_*` label to confirm which passes replayed. |
+
 ### DSpark drafting
 
 The Kimi-K3 DSpark draft writes the target's context rows into its own paged MLA
@@ -148,6 +169,20 @@ land. See `atom/model_ops/v4_backend_gate.py` for the selector.
 | **ATOM_V4_BACKEND** | str | `legacy` | `legacy` keeps the per-seq dispatch loop. `new` routes through `V4AttentionBackend`. Layer-restricted by `ATOM_V4_BACKEND_LAYERS` if set. |
 | **ATOM_V4_BACKEND_LAYERS** | csv int | "" (= all) | Comma-separated layer ids that use the new backend (others stay legacy). Empty means: apply `ATOM_V4_BACKEND` uniformly. Used for layer-by-layer bisect during migration (e.g. `0,3,15,30`). |
 
+## State checkpoints
+
+For models carrying per-request recurrent state (GDN: Qwen3-Next / Qwen3.5;
+Kimi-K3's KDA; DeepSeek-V4's compressor ring), a checkpoint lets a later prefix
+hit resume mid-prompt instead of recomputing from zero. *Where* they are placed
+is a policy, set by `--state-checkpoint-interval-tokens` (three regimes carried
+by the sign — see the [configuration guide](configuration_guide.md)) and the
+flag below. Details in the state-checkpoint section of the
+[scheduling & KV cache guide](scheduling_kv_cache_guide.md).
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_STATE_CHECKPOINT_DEMAND** | bool | 1 (true) | Set to `0` to stop a prefix hit that was refused for want of a checkpoint from placing a rung of its own, leaving the prompt-end anchor as the only placement. Overrides `--state-checkpoint-demand`, so the policy can be A/B'd without editing a launch script. The rung is most of the checkpoint write traffic and little of the read-back, and every write evicts something — `StateSlotPool.mark_speculative` carries the measurement. |
+
 ## Profiling & debugging
 
 | Variable | Type | Default | Description |
@@ -156,6 +191,21 @@ land. See `atom/model_ops/v4_backend_gate.py` for the selector.
 | **ATOM_PROFILER_MORE** | bool | 0 (false) | When `ATOM_TORCH_PROFILER_DIR` is set and this is `1`, enables detailed profiling: `record_shapes`, `with_stack`, and `profile_memory`. Applies to both the run-phase profiler and the CUDA-graph capture profiler. |
 | **ATOM_ENABLE_DETAILED_ANNOTATION** | bool | 0 (false) | When profiling is active, appends detailed attention aggregates to the `prefill[]`/`decode[]` trace labels: `sqsq` (Σ N_Q²), `sqsk` (Σ N_Q·N_KV), and `sk` (Σ N_KV), where N_Q is the scheduled query tokens and N_KV the KV length per request. Used to estimate attention FLOPs for downstream roofline analysis. |
 | **ATOM_LOG_MORE** | bool | 0 (false) | If set to `1`, use verbose logging format (includes process name, PID, path, line number, function name). |
+
+## Garbage collection
+
+CPython's generation-2 pass is stop-the-world and walks every tracked
+container, so its cost tracks the live heap — which in a serving process is
+almost entirely startup state (model, compiled graph, tokenizer, KV block
+pool) that is never garbage. Measured on DeepSeek-V4-Flash-DSpark tp1: 242.8 ms
+in the EngineCore, up to 596 ms in a ModelRunner worker, while reclaiming zero
+objects once startup was done. See `atom/utils/gc_utils.py`.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_GC_FREEZE** | bool | 1 (true) | Move the startup heap into CPython's permanent generation once warmup is done, so collections stop scanning it. Applied in every process that outlives startup — the API server, the atomesh frontend, every EngineCore and every ModelRunner worker; undone on engine shutdown so an in-process teardown does not leak. Set `0` to keep the pre-freeze behaviour. |
+| **ATOM_GC_DEBUG** | bool | 0 (false) | Log every collection: generation, duration, objects reclaimed, objects tracked. Costly — counting the tracked set on every pass added ~90s of startup on a V4-Flash tp1 — but the only way to see these pauses, since a stall in the EngineCore idles the workers with no event in their torch trace. |
+| **ATOM_GC_THRESHOLD** | csv int | "" (= CPython default 700,10,10) | `t0,t1,t2` for `gc.set_threshold()`. Thresholds are per-interpreter, so each process reads it independently. A fallback for `ATOM_GC_FREEZE=0`: this spaces collections out, freezing removes what one costs. |
 
 ### Debug dump (`atom.utils.debug_helper`)
 

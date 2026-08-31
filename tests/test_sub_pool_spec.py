@@ -124,6 +124,35 @@ class TestPlanPools:
         assert plan.reserved_bytes[ENTRY_STATE] == (8 + 3) * 10
         assert plan.entries[ENTRY_KV] == 8
 
+    def test_extra_entries_are_a_flat_cushion_not_a_per_request_one(self):
+        """`extra_entries` is passed through, NOT multiplied by the width.
+
+        The distinction matters for anything a cushion holds that is not a
+        live request: a checkpoint takes one slot because it holds a committed
+        state and has nothing to roll back, where a live request takes
+        `1 + num_spec` because it speculates. `BlockManager` counts slots raw,
+        with no `entries // entries_per_req` rounding to align to.
+
+        No backend passes a nonzero `extra_entries` today. This pins the
+        arithmetic so the next one to want a cushion gets a flat one rather
+        than `width x` what it asked for -- at `spr == 3` below, that is 32
+        slots against 96, with the difference staying in the paged pool.
+        """
+        spr = 3  # 1 + num_spec, the GDN width
+        specs = [
+            page_pool(100),
+            state_pool(ENTRY_STATE, 10, entries_per_req=spr, extra_entries=32),
+        ]
+        plan = plan_pools(specs, available_bytes=100_000, max_num_seqs=8)
+        assert plan.entries[ENTRY_STATE] == 8 * spr + 32
+
+        wide = [
+            page_pool(100),
+            state_pool(ENTRY_STATE, 10, entries_per_req=spr, extra_entries=32 * spr),
+        ]
+        wide_plan = plan_pools(wide, available_bytes=100_000, max_num_seqs=8)
+        assert wide_plan.entries[ENTRY_KV] < plan.entries[ENTRY_KV]
+
     def test_paged_pool_floors_at_zero_rather_than_going_negative(self):
         specs = [page_pool(1_000_000), state_pool(ENTRY_STATE, 100, entries_per_req=1)]
         plan = plan_pools(specs, available_bytes=10_000, max_num_seqs=8)

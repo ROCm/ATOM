@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import array
 from collections.abc import Callable
-from copy import copy
 from enum import Enum, auto
 from itertools import count
 from typing import Any
@@ -10,6 +10,36 @@ from typing import Any
 import numpy as np
 
 from atom.sampling_params import SamplingParams
+
+
+def new_token_ids(token_ids=()) -> array.array:
+    """A sequence's token ids.
+
+    An `array("i")` rather than a list for two reasons that both scale with
+    context. The scheduler copies a slice of this into the flat
+    `scheduled_tokens` buffer every step -- a whole chunk of it on a prefill --
+    and from a list that is one CPython int unboxing per token, 0.28 ms for a
+    16k chunk against 0.001 ms from an array. And a list of 100k ids costs
+    3.4 MiB of boxed ints where the array costs 0.38.
+
+    Behaves as a list for append/pop/index/len/iterate/slice-delete, and holds
+    negative ids (the exit sentinel is -1). It does NOT compare equal to a
+    list, which is why `stop_token_sequences` below is converted too, and why
+    `BlockManager.compute_hash` pins its dtype.
+    """
+    return array.array("i", token_ids)
+
+
+def new_block_table(block_ids=()) -> array.array:
+    """A sequence's physical block ids.
+
+    An `array("i")` rather than a list because every forward marshals these
+    into the int32 `block_tables` buffer, where a list costs one CPython int
+    unboxing per block (~17k per step at 50 seqs x 100k ctx) and an array is a
+    memcpy. It behaves as a list for append/pop/index/len/iterate; it has no
+    `.clear()` (use `del bt[:]`) and no `.copy()` (use `list(bt)`).
+    """
+    return array.array("i", block_ids)
 
 
 class SequenceStatus(Enum):
@@ -59,6 +89,8 @@ class Sequence:
         mrope_positions: np.ndarray | None = None,
         mrope_position_delta: int = 0,
         data_parallel_rank: int | None = None,
+        dp_session_id: str | None = None,
+        dp_parent_session_id: str | None = None,
     ):
         # Built here rather than as a default argument: one instance shared by
         # every defaulting Sequence would be a mutable default in all but name.
@@ -69,7 +101,7 @@ class Sequence:
         self.external_request_id = request_id
         self.status = SequenceStatus.WAITING
         self.type = SequenceType.DUMMY
-        self.token_ids = copy(token_ids)
+        self.token_ids = new_token_ids(token_ids)
         self.last_token = token_ids[-1]
         self.num_draft_tokens = num_draft_tokens
         # `has_per_req_cache=True` means this seq's attention type maintains
@@ -105,6 +137,43 @@ class Sequence:
         # `BlockManager._record_checkpoint_demand` at admission; this one is
         # read by `checkpoint_cut` and `checkpointers_at`, which must agree.
         self.checkpoint_demand_pos = 0
+        # Which of the two demand counters this seq has already been put
+        # against. `can_allocate` re-runs for a sequence the queue keeps
+        # deferring, and the position above cannot serve as the marker for
+        # either one: a declined demand writes 0 back, so it does not remember
+        # the decline, and a decline retracts a demand the recorded counter had
+        # already taken. Both are cleared by `deallocate`, so a re-admitted
+        # request counts again, which it should.
+        self.checkpoint_demand_counted = False
+        self.checkpoint_demand_declined = False
+        # The demand's sibling: this prompt's own end, floored to the hash
+        # grid. 0 = nowhere.
+        #
+        # The demand is reactive — it only exists once a hit has already been
+        # refused for want of a checkpoint, which is one request too late for
+        # the position that serves the *next* turn of a conversation. On
+        # agentic traffic that position is where nearly all the reuse is (see
+        # `BlockManager._record_checkpoint_end`), so it is reserved up front
+        # rather than waited for.
+        #
+        # Written by `BlockManager._record_checkpoint_end` at admission, read
+        # by `checkpoint_cut` and `checkpointers_at` — which must agree, the
+        # same contract `checkpoint_demand_pos` is held to.
+        self.checkpoint_end_pos = 0
+        # The chained content hash of every block of this prompt, not just the
+        # ones that hit. Empty unless the state backend reserves checkpoints
+        # midstep (`StateTransfer.readable_midstep`), which is the only caller
+        # that needs to name a position the forward has not reached yet — see
+        # `BlockManager._extend_hash_chain` for why it cannot simply be the
+        # `block_hashes` the admission scan built.
+        self.block_hashes: list[int] = []
+        # Slots taken for midstep checkpoints of the forward now in flight,
+        # as `(slot, position, hash)` — one slot each, since a checkpoint never
+        # carries speculation scratch. Filled by `BlockManager.plan_midstep`
+        # before the batch is built, drained by `commit_midstep` after it, and
+        # handed back by `cancel_midstep` if that forward never runs. Non-empty
+        # only between those two points.
+        self.midstep_reservations: list[tuple] = []
         # Where this seq last kept a checkpoint. Prefill lands on the grid so
         # this tracks it, but a speculative decode step lands wherever
         # `1 + accepted` puts it, and there the grid is unreachable — see
@@ -118,17 +187,25 @@ class Sequence:
         # garbage sampled tokens from intermediate chunks and to skip the
         # scheduler's Phase 1 scan when no partials exist.
         self.is_partial_prefill = False
-        self.block_table = []
-        # Per-request cache slot index (filled by BlockManager.allocate()).
-        # -1 = unallocated. The slot indexes into the per-req cache tensors
-        # owned by ModelRunner (e.g. mamba_k_cache for GDN).
-        self.per_req_cache_group = -1
-        # Group the NEXT forward reads its incoming state from, when that is not
-        # the group it writes (`per_req_cache_group`). Set by BlockManager on a
-        # state fork — resuming from a checkpoint, or taking one — and
-        # cleared by the scheduler once a batch has carried it, so it describes
-        # exactly one forward. -1 = read and write the same group, the case for
-        # every step in between.
+        # `new_block_table` is main's: an array("i") rather than a list,
+        # because every forward marshals these into the int32 buffer.
+        self.block_table = new_block_table()
+        # Per-request state slots (filled by BlockManager.allocate()), indexing
+        # the per-req cache tensors owned by ModelRunner (e.g. mamba_k_cache for
+        # GDN). Empty = unallocated.
+        #
+        # `[0]` is the committed state, which every path reads and writes;
+        # `[1:]` is one rollback slot per speculated token, which only the
+        # spec-decode path touches. Held as a list rather than a base index
+        # because the slots are allocated one at a time and need not be
+        # adjacent — see `StateSlotPool`.
+        self.state_slots: list[int] = []
+        # Slot the NEXT forward reads its incoming state from, when that is not
+        # the slot it writes (`state_slot`). Set by BlockManager on a state fork
+        # — resuming from a checkpoint, or taking one — and cleared by the
+        # scheduler once a batch has carried it, so it describes exactly one
+        # forward. -1 = read and write the same slot, the case for every step in
+        # between. Always a single slot: a checkpoint is one slot wide.
         self.state_fork_src = -1
         self.temperature = sampling_params.temperature
         self.top_k = sampling_params.top_k
@@ -136,7 +213,11 @@ class Sequence:
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
         self.stop_strings = sampling_params.stop_strings
-        self.stop_token_sequences = stop_token_sequences or []
+        # Same type as `token_ids`, because the stop check compares a slice of
+        # that against these and an `array("i")` never equals a list.
+        self.stop_token_sequences = [
+            new_token_ids(s) for s in (stop_token_sequences or [])
+        ]
         self.is_first_decode = False
         # Set to True by Scheduler.postprocess after BlockManager.hash_blocks
         # has registered the prompt blocks for prefix caching. The trigger has
@@ -147,10 +228,18 @@ class Sequence:
         # would never fire for the prefill blocks; this flag does.
         self.prefix_hashes_published = False
         self.return_logprobs = bool(getattr(sampling_params, "logprobs", False))
-        self.logprobs: list[float] = []
+        # One entry per completion token, so the same reason `token_ids` is an
+        # array applies: a list would box a PyFloat per token and hand the
+        # collector a slot to walk for each one. `json.dumps` is the only
+        # consumer that needs a list, and it converts at its own boundary.
+        self.logprobs: array.array = array.array("d")
         # stream callback
         self.stream_callback = stream_callback
-        self.output_tokens = []  # cache for newly generate tokens
+        # The completion half of `token_ids`, kept in step with it by every
+        # writer, so it is the same array type for the same reasons.
+        self.output_tokens = new_token_ids()
+        # Placeholders from previous postprocess; overwritten in place.
+        self.num_placeholder_tokens: int = 0
 
         # save speculative tokens if is_deferred_output = False or prefill is inter
         self.spec_token_ids: np.ndarray = np.array([], dtype=np.int32)
@@ -194,6 +283,11 @@ class Sequence:
         # Explicitly requested DP rank, e.g. for cache aware DP routing.
         # Consumed by CoreManager._dispatch_to_dp_ranks as a routing hint.
         self.data_parallel_rank = data_parallel_rank
+        # Optional client session lineage used by CoreManager's cache-aware,
+        # token-load-aware DPA router.  These are routing metadata only; they
+        # are deliberately kept out of the model-facing request payload.
+        self.dp_session_id = dp_session_id
+        self.dp_parent_session_id = dp_parent_session_id
 
     def __len__(self):
         return self._num_tokens
@@ -213,6 +307,31 @@ class Sequence:
         self.last_block_num_tokens = (
             self._num_tokens - (self.num_blocks - 1) * self.block_size
         )
+
+    @property
+    def state_slot(self) -> int:
+        """The committed state slot, or -1 if this seq holds none.
+
+        What every non-speculative path means by "the" slot: the one the
+        forward reads and writes, the one a fork gives away, the one a
+        checkpoint is. The rollback slots are `state_slots[1:]` and only the
+        spec-decode path has any use for them.
+        """
+        return self.state_slots[0] if self.state_slots else -1
+
+    @state_slot.setter
+    def state_slot(self, slot: int) -> None:
+        """Re-point the committed slot, keeping the rollback set.
+
+        A fork moves where the request writes without disturbing its scratch:
+        the speculation slots persist across forwards (step N's accepted slot
+        is step N+1's initial state), so they belong to the request rather than
+        to whichever slot it currently commits into.
+        """
+        if self.state_slots:
+            self.state_slots[0] = slot
+        else:
+            self.state_slots = [slot]
 
     @property
     def is_finished(self):

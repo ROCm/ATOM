@@ -785,6 +785,10 @@ cache_total_tokens = total_tokens("total_usage_prompt_tokens")
 
 payload = {
     "benchmark_backend": "atom",
+    # Directory holding this run's profile_export.jsonl, so process_result.py can
+    # find the per-request records both interactivity definitions are computed
+    # from, without reconstructing the directory name.
+    "aiperf_artifact_dir": src.parent.name,
     "benchmark_model_name": os.environ.get("MODEL_NAME")
     or data.get("model")
     or data.get("model_id"),

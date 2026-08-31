@@ -45,6 +45,7 @@ class PluginConfig:
     vllm_scheduler_config: Any = None
     vllm_cache_config: Any = None
     vllm_quant_config: Any = None
+    vllm_use_atom_attention: bool = True
 
     # sglang specific
     sglang_model_opt_config: Any = None
@@ -300,6 +301,9 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
     )
 
     vllm_quant_config = config.quant_config
+    vllm_use_atom_attention = os.getenv(
+        "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION", "0"
+    ).lower() not in ("1", "true", "yes")
 
     plugin_config = PluginConfig(
         # common config
@@ -314,6 +318,7 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
         vllm_scheduler_config=vllm_scheduler_config,
         vllm_cache_config=vllm_cache_config,
         vllm_quant_config=vllm_quant_config,
+        vllm_use_atom_attention=vllm_use_atom_attention,
     )
 
     # specific
@@ -369,11 +374,17 @@ def _generate_atom_config_from_sglang_config(config: Any):
     from sglang.srt.configs.model_config import ModelConfig as SglangModelConfig
     from sglang.srt.configs.modelopt_config import ModelOptConfig
     from sglang.srt.distributed import get_tensor_model_parallel_rank
-    from sglang.srt.layers.dp_attention import (
-        get_attention_cp_rank,
-        get_attention_cp_size,
-        get_attention_tp_rank,
-        get_attention_tp_size,
+    from sglang.srt.distributed.parallel_state import (
+        get_attn_context_model_parallel_rank as get_attention_cp_rank,
+    )
+    from sglang.srt.distributed.parallel_state import (
+        get_attn_context_model_parallel_world_size as get_attention_cp_size,
+    )
+    from sglang.srt.distributed.parallel_state import (
+        get_attn_tensor_model_parallel_rank as get_attention_tp_rank,
+    )
+    from sglang.srt.distributed.parallel_state import (
+        get_attn_tensor_model_parallel_world_size as get_attention_tp_size,
     )
     from sglang.srt.server_args import (
         ZMQ_TCP_PORT_DELTA,
@@ -407,7 +418,11 @@ def _generate_atom_config_from_sglang_config(config: Any):
     online_quant_config = sglang_model_loader_extra_config.pop(
         "online_quant_config", None
     )
-    server_args.model_loader_extra_config = json.dumps(sglang_model_loader_extra_config)
+    sanitized_model_loader_extra_config = json.dumps(sglang_model_loader_extra_config)
+    try:
+        server_args.model_loader_extra_config = sanitized_model_loader_extra_config
+    except AttributeError:
+        pass
     hf_overrides = json.loads(
         getattr(server_args, "json_model_override_args", None) or "{}"
     )
@@ -423,7 +438,7 @@ def _generate_atom_config_from_sglang_config(config: Any):
     sgl_load_config = LoadConfig(
         load_format=server_args.load_format,
         download_dir=server_args.download_dir,
-        model_loader_extra_config=server_args.model_loader_extra_config,
+        model_loader_extra_config=sanitized_model_loader_extra_config,
         remote_instance_weight_loader_seed_instance_ip=server_args.remote_instance_weight_loader_seed_instance_ip,
         remote_instance_weight_loader_seed_instance_service_port=server_args.remote_instance_weight_loader_seed_instance_service_port,
         remote_instance_weight_loader_send_weights_group_ports=server_args.remote_instance_weight_loader_send_weights_group_ports,

@@ -13,6 +13,7 @@ from atom.model_ops.fla_ops import (
     fused_recurrent_gated_delta_rule,
     gdn_decode_update_lossy_fast,
 )
+from atom.model_ops.fla_ops.replayssm import replayssm_gated_delta_rule
 from atom.model_ops.mamba_ops.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
@@ -173,8 +174,13 @@ class GatedDeltaNet(nn.Module):
             return core_attn_out
 
         gdn_cache = fwd_ctx.kv_cache_data
-        conv_state = gdn_cache[f"layer_{self.layer_num}"].k_cache
-        ssm_state = gdn_cache[f"layer_{self.layer_num}"].v_cache
+        layer_cache = gdn_cache[f"layer_{self.layer_num}"]
+        conv_state = layer_cache.k_cache
+        # Under ReplaySSM this pool holds one checkpoint per request rather
+        # than one state per speculative token; the per-draft states it used
+        # to hold are reconstructed from `replay_buf_*` on demand.
+        ssm_state = layer_cache.v_cache
+        use_replayssm = getattr(gdn_metadata, "replayssm", False)
 
         has_initial_state = gdn_metadata.has_initial_state
         spec_query_start_loc = gdn_metadata.spec_query_start_loc
@@ -219,6 +225,9 @@ class GatedDeltaNet(nn.Module):
 
         use_lossy_gdn_decode = (
             envs.ATOM_ENABLE_GDN_DECODE_LOSSY_FAST
+            # The lossy fast path writes the full state back every step, which
+            # is precisely what ReplaySSM removes; the two are alternatives.
+            and not use_replayssm
             and spec_sequence_masks is None
             and gdn_metadata.num_prefills == 0
             and gdn_metadata.num_decodes > 0
@@ -244,7 +253,18 @@ class GatedDeltaNet(nn.Module):
                 ],
                 num_accepted_tokens=num_accepted_tokens,
                 query_start_loc=spec_query_start_loc,
-                max_query_len=spec_state_indices_tensor.size(-1),
+                # The verify window, which sizes the conv rollback window
+                # (state_len = kernel_width-1 + max_query_len-1) and hence the
+                # kernel's NP2_STATELEN tile. It used to be inferred from the
+                # slot table's last dim, which only coincided with the window
+                # because that table carried one column per draft; state that
+                # dependency explicitly so a narrower table cannot silently
+                # truncate the conv state.
+                max_query_len=(
+                    gdn_metadata.replayssm_max_query_len
+                    if use_replayssm
+                    else spec_state_indices_tensor.size(-1)
+                ),
                 validate_data=False,
             )
             num_tokens_spec = query_spec.shape[0]
@@ -330,24 +350,55 @@ class GatedDeltaNet(nn.Module):
 
         # 2.1: Process the multi-query part
         if spec_sequence_masks is not None:
-            core_attn_out_spec, last_recurrent_state = fused_recurrent_gated_delta_rule(
-                q=query_spec,
-                k=key_spec,
-                v=value_spec,
-                g=g_spec,
-                beta=beta_spec,
-                initial_state=ssm_state,
-                inplace_final_state=True,
-                cu_seqlens=spec_query_start_loc[: gdn_metadata.num_spec_decodes + 1],
-                ssm_state_indices=spec_state_indices_tensor,
-                num_accepted_tokens=num_accepted_tokens,
-                use_qk_l2norm_in_kernel=True,
-            )
+            if use_replayssm:
+                # No per-draft state snapshot: the kernel rebuilds the state
+                # from the checkpoint plus the committed records, so the
+                # rejected drafts of the previous step are undone simply by
+                # `write_pos` never having advanced past them.
+                nsd = gdn_metadata.num_spec_decodes
+                core_attn_out_spec = replayssm_gated_delta_rule(
+                    q=query_spec,
+                    k=key_spec,
+                    v=value_spec,
+                    g=g_spec,
+                    beta=beta_spec,
+                    ckpt=ssm_state,
+                    buf_k=layer_cache.replay_buf_k,
+                    buf_u=layer_cache.replay_buf_u,
+                    buf_g=layer_cache.replay_buf_g,
+                    write_pos=gdn_metadata.write_pos,
+                    slot_idx=gdn_metadata.slot_idx[:nsd],
+                    cu_seqlens=spec_query_start_loc[: nsd + 1],
+                    max_query_len=gdn_metadata.replayssm_max_query_len,
+                    use_qk_l2norm_in_kernel=True,
+                    is_kda=False,
+                    route=gdn_metadata.replayssm_route,
+                )
+                last_recurrent_state = None
+            else:
+                core_attn_out_spec, last_recurrent_state = (
+                    fused_recurrent_gated_delta_rule(
+                        q=query_spec,
+                        k=key_spec,
+                        v=value_spec,
+                        g=g_spec,
+                        beta=beta_spec,
+                        initial_state=ssm_state,
+                        inplace_final_state=True,
+                        cu_seqlens=spec_query_start_loc[
+                            : gdn_metadata.num_spec_decodes + 1
+                        ],
+                        ssm_state_indices=spec_state_indices_tensor,
+                        num_accepted_tokens=num_accepted_tokens,
+                        use_qk_l2norm_in_kernel=True,
+                    )
+                )
         else:
             core_attn_out_spec, last_recurrent_state = None, None
 
         # 2.2: Process the remaining part
         if gdn_metadata.num_prefills > 0:
+            ckpt = gdn_metadata.ssm_checkpoints
             initial_state = ssm_state[non_spec_state_indices_in_tensor].contiguous()
             initial_state[~has_initial_state, ...] = 0
             (
@@ -364,11 +415,82 @@ class GatedDeltaNet(nn.Module):
                 cu_seqlens=non_spec_query_start_loc,
                 head_first=False,
                 use_qk_l2norm_in_kernel=True,
+                # Only when there is somewhere to put them; `h` is large and is
+                # dropped on return otherwise.
+                keep_intermediate_states=ckpt is not None,
             )
             # Init cache
             ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
                 ssm_state.dtype
             )
+            # SSM state cache: copy out every checkpoint this step reached.
+            #
+            # A checkpoint slot is never where the recurrence runs — the live
+            # state stays in the request's runtime slot for its whole life —
+            # so BOTH kinds of position need a copy:
+            #   interior  <- h[chunk boundary]
+            #   step end  <- the runtime slot; NOT in `h`, which holds
+            #                boundaries strictly before the end
+            # `_checkpoint_targets` tags the second kind with `is_end`. This
+            # runs after the scatter above so that slot holds this step's
+            # final state, which is what an `is_end` target reads.
+            #
+            # One launch over device index tensors, so the per-sequence base
+            # arithmetic lives in the kernel — see `_checkpoint_targets`.
+            #
+            # Conv state needs no support from the conv kernel: it IS the last
+            # `state_len` rows of the conv input ending at the position, the
+            # same bytes that kernel's end-of-sequence store writes.
+            if ckpt is not None:
+                from atom.model_ops.fla_ops.chunk import (
+                    CHUNK_SIZE,
+                    pop_last_intermediate_states,
+                )
+                from atom.model_ops.fla_ops.state_checkpoint import (
+                    write_state_checkpoints,
+                )
+
+                h = pop_last_intermediate_states()
+                if h is not None:
+                    # One launch for both halves. `conv_state` is
+                    # [slot, conv_dim, state_len] by here (see the transpose
+                    # above) and shares `slots` with the SSM half, so the two
+                    # always describe the same token position.
+                    write_state_checkpoints(
+                        h,
+                        ssm_state,
+                        mixed_qkv_non_spec,
+                        conv_state,
+                        ckpt["rows"],
+                        ckpt["slots"],
+                        ckpt["offs"],
+                        ckpt["is_end"],
+                        ckpt["runtime"],
+                        gdn_metadata.ssm_chunk_offsets,
+                        non_spec_query_start_loc,
+                        CHUNK_SIZE,
+                    )
+        elif gdn_metadata.num_decodes > 0 and use_replayssm:
+            nd = gdn_metadata.num_decodes
+            core_attn_out_non_spec = replayssm_gated_delta_rule(
+                q=query_non_spec,
+                k=key_non_spec,
+                v=value_non_spec,
+                g=g_non_spec,
+                beta=beta_non_spec,
+                ckpt=ssm_state,
+                buf_k=layer_cache.replay_buf_k,
+                buf_u=layer_cache.replay_buf_u,
+                buf_g=layer_cache.replay_buf_g,
+                write_pos=gdn_metadata.write_pos,
+                slot_idx=gdn_metadata.slot_idx[:nd],
+                cu_seqlens=non_spec_query_start_loc[: nd + 1],
+                max_query_len=gdn_metadata.replayssm_max_query_len,
+                use_qk_l2norm_in_kernel=True,
+                is_kda=False,
+                route=gdn_metadata.replayssm_route,
+            )
+            last_recurrent_state = None
         elif gdn_metadata.num_decodes > 0:
             if use_lossy_gdn_decode:
                 core_attn_out_non_spec, last_recurrent_state = (

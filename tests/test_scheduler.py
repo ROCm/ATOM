@@ -7,8 +7,14 @@ from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
+import pytest
 from conftest import MockConfig
 
+from atom.kv_transfer.disaggregation.types import (
+    KVConnectorOutput,
+    SaveOperationId,
+)
+from atom.kv_transfer.offload._offload_common import OffloadSchedulerMixin
 from atom.model_engine.scheduler import (
     ScheduledBatch,
     ScheduledBatchOutput,
@@ -50,6 +56,11 @@ class TestSchedulerAddQuery:
         scheduler.add(seq_factory([1, 2, 3]))
         assert not scheduler.is_finished()
 
+    def test_deferred_offload_work_keeps_scheduler_alive(self, scheduler):
+        scheduler.deferred_free_blocks[17] = SimpleNamespace(id=17)
+
+        assert not scheduler.is_finished()
+
     def test_extend(self, scheduler, seq_factory):
         scheduler.extend([seq_factory([1]), seq_factory([2])])
         assert scheduler.get_num_unfinished_requests() == 2
@@ -70,13 +81,107 @@ class TestSchedulerAddQuery:
 
 
 class TestSchedule:
+    def test_non_offload_abort_keeps_existing_receive_cleanup(self):
+        seq = SimpleNamespace(
+            id=96,
+            status=SequenceStatus.ABORTED,
+            _counted_as_inflight_load=True,
+        )
+        sched = Scheduler.__new__(Scheduler)
+        sched._rejected = []
+        sched.deferred_free_blocks = {}
+        sched.finished_recving_kv_req_ids = []
+        sched.failed_recving_kv_req_ids = []
+        sched._num_parked_remote_kv = 1
+        sched.kv_connector = SimpleNamespace(is_offload=False)
+
+        sched._reject_aborted_waiting(seq)
+
+        assert sched.deferred_free_blocks == {}
+        assert sched._num_parked_remote_kv == 0
+        assert sched._rejected == [seq]
+
+    @pytest.mark.parametrize("first_terminal", ["load", "save"])
+    def test_aborted_load_and_save_both_finish_before_release(
+        self,
+        first_terminal,
+    ):
+        load = 97
+        save = 97
+        seq = SimpleNamespace(
+            id=97,
+            status=SequenceStatus.ABORTED,
+            block_table=[1],
+            has_per_req_cache=False,
+            _counted_as_inflight_load=True,
+        )
+        events = []
+
+        class _Connector(OffloadSchedulerMixin):
+            is_offload = True
+            is_producer = False
+
+            def __init__(self):
+                self.pending_save = True
+
+            def load_finished(self, operation):
+                events.append(("load_finished", operation))
+                return operation == load
+
+            def save_finished(self, operation):
+                events.append(("save_finished", operation))
+                if operation == save:
+                    self.pending_save = False
+
+            def should_defer_free(self, value):
+                assert value is seq
+                return self.pending_save
+
+            def request_finished(self, value):
+                events.append(("request_finished", value.id))
+
+        sched = Scheduler.__new__(Scheduler)
+        sched.waiting = deque()
+        sched.running = deque()
+        sched._rejected = []
+        sched.deferred_free_blocks = {}
+        sched.finished_recving_kv_req_ids = []
+        sched.failed_recving_kv_req_ids = []
+        sched._num_parked_remote_kv = 1
+        sched.kv_connector = _Connector()
+        sched.block_manager = SimpleNamespace(
+            deallocate=lambda value: events.append(("deallocate", value.id))
+        )
+        sched._reject_aborted_waiting(seq)
+
+        assert sched.deferred_free_blocks == {seq.id: seq}
+        assert seq._awaiting_aborted_load_cleanup is True
+
+        outputs = {
+            "load": KVConnectorOutput(finished_loading={load}),
+            "save": KVConnectorOutput(finished_saving={save}),
+        }
+        second_terminal = "save" if first_terminal == "load" else "load"
+
+        sched._update_from_kv_xfer_finished(outputs[first_terminal])
+
+        assert sched.deferred_free_blocks == {seq.id: seq}
+        assert not any(event[0] == "deallocate" for event in events)
+
+        sched._update_from_kv_xfer_finished(outputs[second_terminal])
+
+        assert sched.deferred_free_blocks == {}
+        assert sched._num_parked_remote_kv == 0
+        assert events.count(("request_finished", seq.id)) == 1
+        assert events.count(("deallocate", seq.id)) == 1
+
     def test_empty_returns_none(self, scheduler):
         assert scheduler.schedule() is None
 
     def test_prefill(self, scheduler, seq_factory):
         seq = seq_factory([1, 2, 3, 4])
         scheduler.add(seq)
-        batch, seqs = scheduler.schedule()
+        batch, _seqs = scheduler.schedule()
         assert batch.total_seqs_num_prefill == 1
         assert batch.total_tokens_num_prefill == 4
         assert seq.status == SequenceStatus.RUNNING
@@ -240,6 +345,99 @@ class TestSchedule:
         assert SequenceStatus.RUNNING in statuses
         assert SequenceStatus.WAITING in statuses
 
+    def test_decode_preemption_skips_save_pinned_victim(self, seq_factory):
+        sched = Scheduler(MockConfig(num_kvcache_blocks=2, kv_cache_block_size=4))
+        current = seq_factory([1, 2, 3, 4])
+        pinned_victim = seq_factory([5, 6, 7, 8])
+        sched.add(current)
+        sched.add(pinned_victim)
+        sched.schedule()
+        current.num_cached_tokens = current.num_prompt_tokens
+        pinned_victim.num_cached_tokens = pinned_victim.num_prompt_tokens
+        current.append_token(9)
+        pinned_victim.append_token(10)
+        operation = SaveOperationId(pinned_victim.id, 50)
+
+        class _Connector(OffloadSchedulerMixin):
+            is_producer = False
+            is_offload = True
+            _do_load = False
+
+            def __init__(self):
+                self.pending = {operation}
+
+            def should_defer_free(self, seq):
+                return seq is pinned_victim and operation in self.pending
+
+            def save_finished(self, value):
+                self.pending.discard(value)
+
+            def build_connector_meta(self):
+                return None
+
+        sched.kv_connector = _Connector()
+        pinned_blocks = list(pinned_victim.block_table)
+
+        batch, _ = sched.schedule()
+
+        assert current.status == SequenceStatus.WAITING
+        assert pinned_victim.status == SequenceStatus.RUNNING
+        assert list(pinned_victim.block_table[:1]) == pinned_blocks
+        assert list(batch.req_ids) == [pinned_victim.id]
+
+    def test_decode_preemption_stalls_pinned_current_until_save_terminal(
+        self, seq_factory
+    ):
+        sched = Scheduler(MockConfig(num_kvcache_blocks=1, kv_cache_block_size=4))
+        pinned = seq_factory([1, 2, 3, 4])
+        sched.add(pinned)
+        sched.schedule()
+        pinned.num_cached_tokens = pinned.num_prompt_tokens
+        pinned.append_token(9)
+        operation = SaveOperationId(pinned.id, 51)
+
+        class _Connector(OffloadSchedulerMixin):
+            is_producer = False
+            is_offload = True
+            _do_load = False
+
+            def __init__(self):
+                self.pending = {operation}
+
+            def should_defer_free(self, seq):
+                return seq is pinned and operation in self.pending
+
+            def save_finished(self, value):
+                self.pending.discard(value)
+
+            def build_connector_meta(self):
+                return None
+
+        sched.kv_connector = _Connector()
+        pinned_blocks = list(pinned.block_table)
+
+        blocked, _ = sched.schedule()
+
+        assert list(blocked.req_ids) == []
+        assert pinned.status == SequenceStatus.RUNNING
+        assert list(pinned.block_table) == pinned_blocks
+        assert sched.preempt(pinned) is False
+        assert list(pinned.block_table) == pinned_blocks
+
+        sched._update_from_kv_xfer_finished(
+            KVConnectorOutput(finished_saving={operation})
+        )
+        sched.schedule()
+
+        assert pinned.status == SequenceStatus.WAITING
+        assert len(pinned.block_table) == 0
+        assert sched.waiting.popleft() is pinned
+        sched.kv_connector = None
+        replacement = seq_factory([10, 11, 12, 13])
+        sched.add(replacement)
+        resumed, _ = sched.schedule()
+        assert list(resumed.req_ids) == [replacement.id]
+
     def test_ready_remote_kv_waiter_is_promoted_ahead_of_fresh_head(self):
         sched = Scheduler.__new__(Scheduler)
         fresh = SimpleNamespace(id=1, status=SequenceStatus.WAITING)
@@ -364,7 +562,7 @@ class TestSchedule:
         )
 
         assert seq.num_cached_tokens == 10
-        assert seq.output_tokens == [999, sched.eos_token_id]
+        assert list(seq.output_tokens) == [999, sched.eos_token_id]
 
 
 # ── _waiting_new_token_count (PrefillDelayer queue signal) ─────────────────
@@ -699,7 +897,7 @@ class TestPrefixCaching:
             )
             batch, _ = sched.schedule()  # next decode step
 
-        assert seq1.token_ids == prompt + generated
+        assert list(seq1.token_ids) == prompt + generated
         # 20 tokens on the seq, but token 20 was sampled this step and no
         # forward has written its KV — the block it closes stays unhashed until
         # the next step consumes it.
@@ -888,7 +1086,7 @@ class TestPreempt:
         scheduler.schedule()
         scheduler.preempt(seq)
         assert seq.status == SequenceStatus.WAITING
-        assert seq.block_table == []
+        assert len(seq.block_table) == 0
 
 
 # ── postprocess ────────────────────────────────────────────────────────────

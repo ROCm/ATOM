@@ -1,5 +1,7 @@
 import asyncio
 
+import pytest
+
 from atom.entrypoints.openai.streaming_dispatch import (
     IncrementalStreamDetokenizer,
     StreamBatchDispatcher,
@@ -10,7 +12,10 @@ from atom.entrypoints.openai.streaming_dispatch import (
 
 class _Utf8ByteTokenizer:
     def decode(self, token_ids, skip_special_tokens=True):
-        return bytes(token_ids).decode("utf-8", errors="replace")
+        # `bytes(x)` of an `array("i")` copies its buffer -- four bytes per id
+        # -- where from a list it takes the values. A real tokenizer reads ids,
+        # so this double has to as well; keep the `list`.
+        return bytes(list(token_ids)).decode("utf-8", errors="replace")
 
 
 class _ImmediateLoop:
@@ -334,16 +339,72 @@ def test_two_steps_keep_their_order_within_one_stream():
     assert chunk["finished"] is True
 
 
-def test_merge_keeps_end_of_stream_and_never_extends_the_engines_list():
-    """A swallowed terminal flag hangs its client; a mutated list corrupts the engine."""
-    engine_tokens = [1]
-    into = {"token_ids": engine_tokens, "text": "a", "finished": True}
-    merge_chunk(into, {"token_ids": [2], "text": "b", "finished": False})
+def test_merge_keeps_end_of_stream_and_never_extends_the_producers_list():
+    """A swallowed terminal flag hangs its client; a mutated list corrupts the producer."""
+    produced = [1]
+    collector = StreamOutputCollector("request-1")
+    collector.put_nowait({"token_ids": produced, "text": "a", "finished": True})
+    collector.put_nowait({"token_ids": [2], "text": "b", "finished": False})
 
-    assert into["finished"] is True
-    assert into["text"] == "ab"
-    assert into["token_ids"] == [1, 2]
-    assert engine_tokens == [1]
+    chunk = _resolve(collector.get())
+
+    assert chunk["finished"] is True
+    assert chunk["text"] == "ab"
+    assert chunk["token_ids"] == [1, 2]
+    assert produced == [1]
+
+
+def test_put_nowait_gives_merge_chunk_a_list_it_may_extend():
+    """`merge_chunk` extends in place; it used to create this key itself."""
+    collector = StreamOutputCollector("request-1")
+    collector.put_nowait({"text": "a"})
+
+    assert collector._pending[None]["token_ids"] == []
+
+
+def test_merge_extends_in_place_instead_of_rebuilding():
+    """Rebuilding walks the whole accumulation, which is what a stall grows."""
+    collector = StreamOutputCollector("request-1")
+    collector.put_nowait({"token_ids": [1], "text": "a"})
+    accumulating = collector._pending[None]["token_ids"]
+    for token in (2, 3, 4):
+        collector.put_nowait({"token_ids": [token], "text": "b"})
+
+    assert collector._pending[None]["token_ids"] is accumulating
+    assert accumulating == [1, 2, 3, 4]
+
+
+@pytest.mark.parametrize("depth", (1, 2, 17, 500))
+def test_a_merged_stream_reads_the_same_as_an_unmerged_one(depth):
+    """A consumer must not be able to tell how far behind it fell."""
+    tokens = list(range(depth + 1))
+    unmerged = StreamOutputCollector("request-1")
+    merged = StreamOutputCollector("request-2")
+    delivered = []
+    for index, token in enumerate(tokens):
+        finished = index == len(tokens) - 1
+        unmerged.put_nowait(
+            {"token_ids": [token], "text": f"{token} ", "finished": finished}
+        )
+        delivered.append(_resolve(unmerged.get()))
+        merged.put_nowait(
+            {"token_ids": [token], "text": f"{token} ", "finished": finished}
+        )
+
+    folded = _resolve(merged.get())
+
+    assert folded["text"] == "".join(chunk["text"] for chunk in delivered)
+    assert folded["token_ids"] == tokens
+    assert folded["finished"] is True
+
+
+def test_merge_keeps_the_text_it_had_when_the_delta_is_not_a_string():
+    """The text is popped to keep its refcount at one; a raise must not drop it."""
+    into = {"token_ids": [1], "text": "acc"}
+    with pytest.raises(TypeError):
+        merge_chunk(into, {"token_ids": [2], "text": None})
+
+    assert into["text"] == "acc"
 
 
 def test_dispatcher_keeps_no_per_stream_state():
@@ -378,4 +439,4 @@ def test_each_stream_gets_its_own_detokenizer():
     first, second = dispatcher.new_state(), dispatcher.new_state()
 
     assert first is not second
-    assert first.tokens == [] and second.tokens == []
+    assert not first.tokens and not second.tokens

@@ -4,12 +4,22 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime
 import json
 import re
+import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
+
+from interactivity import (
+    METHOD_MEDIAN_TPOT,
+    METHOD_P90_E2E,
+    agentic_interactivity,
+    locate_records,
+)
+
+AGENTIC_BENCHMARK_KIND = "aiperf_agentic"
 
 RESULT_RE = re.compile(
     r"^pd-(?P<backend>[^-]+)-(?P<model>.+)-(?P<topology>[^-]+(?:-[^-]+)*)-"
@@ -97,6 +107,13 @@ def round_or_none(*values: Any, digits: int = 4) -> float | None:
 
 
 def interactivity_value(payload: dict[str, Any]) -> float | None:
+    # An already-resolved value wins: apply_p90_e2e_interactivity() writes the
+    # p90 e2e normalized number here, and without this branch perf_point() would
+    # silently re-derive the legacy median-TPOT value and overwrite it.
+    explicit = number(payload.get("interactivity"))
+    if explicit and explicit > 0:
+        return explicit
+
     median_tpot = number(payload.get("median_tpot_ms"), payload.get("median_itl_ms"))
     if median_tpot and median_tpot > 0:
         return 1000.0 / median_tpot
@@ -106,6 +123,60 @@ def interactivity_value(payload: dict[str, Any]) -> float | None:
         return 1000.0 / tpot
 
     return None
+
+
+def apply_agentic_interactivity(
+    path: Path, payload: dict[str, Any], fields: dict[str, Any]
+) -> None:
+    """Set both interactivity definitions from the per-request AIPerf records.
+
+    Agentic traces run a ~1M-token prefill per turn, so 1000/median_TPOT sees
+    only the decode phase and hides the prefill cost entirely. The InferenceX
+    definition amortizes TTFT over the turn's output tokens and takes p90 of the
+    result -- see interactivity.py. It needs profile_export.jsonl, which only
+    AIPerf writes, so standard ISL/OSL runs keep the legacy formula and are
+    tagged as such.
+
+    The same pass also yields the plain 1/p90(ITL) number InferenceX plots as
+    "Interactivity", stored alongside as ``interactivity_p90_itl`` so the
+    dashboard can offer both as x-axes for the same point.
+    """
+    if string_value(payload.get("benchmark_kind")) != AGENTIC_BENCHMARK_KIND:
+        payload.setdefault("interactivity_method", METHOD_MEDIAN_TPOT)
+        return
+
+    records = locate_records(
+        path,
+        model=string_value(fields.get("model")) or None,
+        topology=string_value(fields.get("topology")) or None,
+        concurrency=int_value(fields.get("conc")),
+        artifact_dir=string_value(payload.get("aiperf_artifact_dir")) or None,
+    )
+    if records is None:
+        print(
+            f"WARNING: {path.name} is an agentic result but no per-request "
+            f"records were found next to it; falling back to "
+            f"{METHOD_MEDIAN_TPOT} interactivity",
+            file=sys.stderr,
+        )
+        payload["interactivity_method"] = METHOD_MEDIAN_TPOT
+        return
+
+    try:
+        result = agentic_interactivity(records)
+    except (OSError, ValueError) as exc:
+        print(
+            f"WARNING: cannot compute {METHOD_P90_E2E} interactivity from "
+            f"{records}: {exc}; falling back to {METHOD_MEDIAN_TPOT}",
+            file=sys.stderr,
+        )
+        payload["interactivity_method"] = METHOD_MEDIAN_TPOT
+        return
+
+    payload["interactivity"] = result["value"]
+    payload["interactivity_method"] = METHOD_P90_E2E
+    payload["interactivity_n_requests"] = result["n_requests"]
+    payload["interactivity_p90_itl"] = result["itl_value"]
 
 
 def parse_payload_date(payload: dict[str, Any]) -> tuple[str | None, int | None]:
@@ -298,6 +369,7 @@ def enrich_payload(
         "mean_tpot_ms",
         number(enriched.get("mean_tpot_ms"), enriched.get("mean_itl_ms")),
     )
+    apply_agentic_interactivity(path, enriched, fields)
     enriched.setdefault("interactivity", interactivity_value(enriched))
     resources = topology_resources(enriched, fields)
     total_gpu = resources["total_gpu"]
@@ -430,6 +502,17 @@ def perf_point(
         "num_decode_gpu": resources["num_decode_gpu"],
         "total_gpu": total_gpu,
         "interactivity": round_or_none(interactivity),
+        # Which definition produced the value above -- agentic points computed
+        # from per-request records report p90_e2e_normalized, everything else
+        # reports median_tpot. The dashboard labels the two differently.
+        "interactivity_method": string_value(payload.get("interactivity_method"))
+        or METHOD_MEDIAN_TPOT,
+        "interactivity_n_requests": int_value(payload.get("interactivity_n_requests")),
+        # 1/p90(ITL) -- what InferenceX plots as plain "Interactivity", as opposed
+        # to the E2E-normalized number in "interactivity" above. Only points
+        # computed from per-request records carry it, so its presence is its
+        # definition and no companion _method field is needed.
+        "interactivity_p90_itl": round_or_none(payload.get("interactivity_p90_itl")),
         # Prefill prefix-cache token hit rate as a 0-1 fraction. Absent unless the
         # case enables prefix caching and the run was long enough for the engine
         # to print a "[Cache Stats]" line.
@@ -627,23 +710,46 @@ def find_eval_scores(root: Path) -> dict[tuple[str, str, int], dict[str, Any]]:
     return scores
 
 
+def is_p90_e2e(row: dict[str, Any]) -> bool:
+    """Was this row's ``interactivity`` computed per-request, not from median TPOT?
+
+    A missing ``interactivity_method`` means the row predates the field, which is
+    the legacy median-TPOT definition -- so anything that does not name the p90
+    method is median TPOT.
+    """
+    return row.get("interactivity_method") == METHOD_P90_E2E
+
+
 def write_summary(rows: list[dict[str, Any]], summary_path: Path) -> None:
+    """Render the CI step summary, one column per interactivity definition.
+
+    The header names the definition, so no discriminator column is needed and no
+    column carries two different quantities. A row fills at most two of the
+    three: agentic runs get E2E norm + p90 ITL, everything else -- including an
+    agentic run whose per-request records were missing and fell back -- gets
+    median TPOT. ``fmt()`` renders None as "--", so "not applicable" and "value
+    missing" look alike, which is what a reader of this table wants.
+    """
     lines = [
         "### ATOMesh Model Performance Benchmark Summary",
         "",
-        "| Hardware | Model | Topology | ISL/OSL | Concurrency | Interactivity | Total tok/s | Input tok/s | Output tok/s | Total tok/s/GPU | Input tok/s/GPU | Output tok/s/GPU | TTFT ms | TPOT ms | E2E ms | Cache Hit | Accuracy Task | Accuracy |",
-        "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: |",
+        "| Hardware | Model | Topology | ISL/OSL | Concurrency | Intvty E2E norm | Intvty p90 ITL | Intvty median TPOT | Total tok/s | Input tok/s | Output tok/s | Total tok/s/GPU | Input tok/s/GPU | Output tok/s/GPU | TTFT ms | TPOT ms | E2E ms | Cache Hit | Accuracy Task | Accuracy |",
+        "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: |",
     ]
     for row in rows:
         lines.append(
-            "| {hardware} | {model} | {topology} | {isl}/{osl} | {conc} | {interactivity} | {total} | {input_} | {output} | {total_per_gpu} | {input_per_gpu} | {output_per_gpu} | {ttft} | {tpot} | {e2e} | {cache_hit} | {accuracy_task} | {accuracy} |".format(
+            "| {hardware} | {model} | {topology} | {isl}/{osl} | {conc} | {intvty_e2e} | {intvty_p90_itl} | {intvty_median_tpot} | {total} | {input_} | {output} | {total_per_gpu} | {input_per_gpu} | {output_per_gpu} | {ttft} | {tpot} | {e2e} | {cache_hit} | {accuracy_task} | {accuracy} |".format(
                 hardware=row.get("hardware", "--"),
                 model=row.get("benchmark_model_name", "--"),
                 topology=row.get("display_topology") or row.get("topology", "--"),
                 isl=row.get("random_input_len", "--"),
                 osl=row.get("random_output_len", "--"),
                 conc=row.get("max_concurrency", "--"),
-                interactivity=fmt(row.get("interactivity")),
+                intvty_e2e=(fmt(row.get("interactivity")) if is_p90_e2e(row) else "--"),
+                intvty_p90_itl=fmt(row.get("interactivity_p90_itl")),
+                intvty_median_tpot=(
+                    "--" if is_p90_e2e(row) else fmt(row.get("interactivity"))
+                ),
                 total=fmt(row.get("total_token_throughput")),
                 input_=fmt(row.get("input_throughput")),
                 output=fmt(row.get("output_throughput")),

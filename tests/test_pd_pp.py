@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: MIT
 # PD-disaggregation + pipeline-parallel unit tests (GPU-free).
 
+import logging
 import os
 import sys
 import threading
 import types
+from collections import deque
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -104,7 +106,7 @@ def test_consumer_targets_every_producer_stage_port():
 
 
 # ---------------------------------------------------------------------------
-# remote_pp_size plumbing
+# remote topology metadata plumbing
 # ---------------------------------------------------------------------------
 
 
@@ -146,6 +148,7 @@ def test_producer_advertises_remote_pp_size():
     sched = object.__new__(mc.MooncakeConnectorScheduler)
     sched.pp_size = 4
     sched.tp_size = 1
+    sched.hash_block_size = 64
     sched.dp_rank = 0
     sched.engine_id = "eng"
     sched.host_ip = "10.0.0.1"
@@ -158,12 +161,67 @@ def test_producer_advertises_remote_pp_size():
         spec_token_ids=None,
         block_table=[1, 2, 3],
         id=99,
-        per_req_cache_group=-1,
+        state_slots=[],
         kv_transfer_params_output=None,
     )
     mc.MooncakeConnectorScheduler.request_finished(sched, seq)
     assert seq.kv_transfer_params_output["remote_pp_size"] == 4
+    assert seq.kv_transfer_params_output["hash_block_size"] == 64
     assert seq.kv_transfer_params_output["remote_block_ids"] == [1, 2, 3]
+
+
+def _mooncake_consumer_scheduler(mc, hash_block_size=64):
+    sched = object.__new__(mc.MooncakeConnectorScheduler)
+    sched.is_producer = False
+    sched.hash_block_size = hash_block_size
+    sched.request_id_to_transfer_id = {}
+    sched.transfer_id_to_request_id = {}
+    sched._reqs_need_recv = {}
+    sched._reqs_need_save = {}
+    return sched
+
+
+def _remote_prefill_seq(remote_hash_block_size):
+    params = {"do_remote_prefill": True}
+    if remote_hash_block_size is not None:
+        params["hash_block_size"] = remote_hash_block_size
+    return SimpleNamespace(
+        id=99,
+        kv_transfer_params=params,
+        block_table=[1, 2, 3],
+        per_req_cache_group=-1,
+        has_per_req_cache=False,
+        num_cached_tokens=128,
+    )
+
+
+def test_matching_hash_block_size_enables_incremental_transfer():
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    sched = _mooncake_consumer_scheduler(mc)
+    seq = _remote_prefill_seq(remote_hash_block_size=64)
+
+    sched.update_state_after_alloc(seq)
+
+    assert seq.kv_transfer_params["num_computed_blocks"] == 2
+
+
+@pytest.mark.parametrize("remote_hash_block_size", [32, None])
+def test_mismatched_or_missing_hash_block_size_forces_full_transfer(
+    remote_hash_block_size, caplog
+):
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    sched = _mooncake_consumer_scheduler(mc)
+    seq = _remote_prefill_seq(remote_hash_block_size)
+
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        sched.update_state_after_alloc(seq)
+
+    assert seq.kv_transfer_params["num_computed_blocks"] == 0
+    assert "falling back to full transfer" in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -304,11 +362,11 @@ def _starts(partitions):
 
 
 def test_region_map_identity_when_pp1():
-    assert consumer_region_indices(156, 78, 0, 78, 1) == list(range(156))
+    assert consumer_region_indices(156, 78, 0, 156, 1) == list(range(156))
 
 
 def test_region_map_identity_when_empty():
-    assert consumer_region_indices(0, 0, 5, 78, 4) == []
+    assert consumer_region_indices(0, 0, 5, 156, 4) == []
 
 
 def test_region_map_group_major_single_group():
@@ -317,36 +375,125 @@ def test_region_map_group_major_single_group():
 
 
 def test_region_map_group_major_two_groups_mla():
-    # MLA: 2 groups [kv, index], stage=20 layers @ start 18, N=78.
-    got = consumer_region_indices(40, 20, 18, 78, 4)
+    # MLA: 2 groups [kv, index], stage=20 layers @ start 18, consumer has 156.
+    got = consumer_region_indices(40, 20, 18, 156, 4)
     assert got[:20] == list(range(18, 38))
     assert got[20:] == list(range(78 + 18, 78 + 38))
 
 
 def test_region_map_undefined_when_not_multiple():
-    assert consumer_region_indices(41, 20, 18, 78, 4) is None
+    assert consumer_region_indices(41, 20, 18, 156, 4) is None
+
+
+def test_region_map_undefined_when_groups_uneven():
+    # 2 local groups against a consumer list that is not 2 whole groups.
+    assert consumer_region_indices(40, 20, 18, 157, 4) is None
 
 
 def test_region_map_stages_tile_consumer_no_overlap():
-    # GLM-5.2: 78 layers, PP4 partition [18,20,20,20], 2 groups (kv + index).
+    # Uniform MLA layout: 78 layers, PP4 partition [18,20,20,20],
+    # 2 complete groups (kv + per-layer index).
     partitions, num_hidden, groups = [18, 20, 20, 20], 78, 2
     covered = []
     for start, n_local in zip(_starts(partitions), partitions):
         covered.extend(
-            consumer_region_indices(n_local * groups, n_local, start, num_hidden, 4)
+            consumer_region_indices(
+                n_local * groups, n_local, start, num_hidden * groups, 4
+            )
         )
     total = num_hidden * groups
     assert sorted(covered) == list(range(total))
     assert len(covered) == len(set(covered))  # no overlap
 
 
+def test_region_map_stages_tile_consumer_with_mtp_layer():
+    # Last PP stage binds the draft KV layer, making its group one entry
+    # wider. Stride derived from consumer region count keeps all stages aligned.
+    partitions, num_hidden, groups = [20, 20, 20, 18], 78, 2
+    consumer_layers = num_hidden + 1  # + MTP layer 78
+    covered = []
+    for stage, (start, n_local) in enumerate(zip(_starts(partitions), partitions)):
+        if stage == len(partitions) - 1:
+            n_local += 1
+        covered.extend(
+            consumer_region_indices(
+                n_local * groups, n_local, start, consumer_layers * groups, 4
+            )
+        )
+    assert sorted(covered) == list(range(consumer_layers * groups))
+    assert len(covered) == len(set(covered))
+
+
+def test_region_map_undefined_when_producer_drafts_and_consumer_does_not():
+    # Prefill with --method mtp against a consumer without it: the last stage's
+    # 19th layer has nowhere to land. Must refuse rather than alias onto the
+    # consumer's next group.
+    assert consumer_region_indices(38, 19, 60, 78 * 2, 4) is None
+
+
+def test_region_map_consumer_mtp_layer_left_unwritten_is_fine():
+    # Benign: the producer simply never writes the consumer's MTP layer.
+    got = consumer_region_indices(36, 18, 60, 79 * 2, 4)
+    assert got[:18] == list(range(60, 78))
+    assert got[18:] == list(range(79 + 60, 79 + 78))
+
+
 def test_region_map_group_major_beats_naive_offset():
     # Regression guard: a naive additive offset (start_layer*groups + i) would
     # misroute group-major layouts. Stage1's index-group region 0 (local idx 20)
     # must land in the consumer's index group (>=78), not at 36+20=56 (kv group).
-    cmap = consumer_region_indices(40, 20, 18, 78, 4)
+    cmap = consumer_region_indices(40, 20, 18, 156, 4)
     assert cmap[20] == 78 + 18
     assert cmap[20] != 56
+
+
+def test_explicit_region_map_supports_compact_index_group():
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    conn = object.__new__(mc.MooncakeConnector)
+    # PP stage 1 owns target layers [18, 38). In this synthetic IndexShare
+    # schedule only global layers 18, 22, 26, 30, and 34 own index caches.
+    explicit = list(range(18, 38)) + [83, 84, 85, 86, 87]
+
+    assert (
+        conn._consumer_region_map(
+            len(explicit), len(explicit), explicit_indices=explicit
+        )
+        == explicit
+    )
+
+
+def test_compact_index_region_maps_tile_consumer_without_overlap():
+    partitions = [18, 20, 20, 20]
+    num_hidden = 78
+    full_layer_ids = tuple(range(0, num_hidden, 4))
+    full_layer_slots = {layer_id: slot for slot, layer_id in enumerate(full_layer_ids)}
+    covered = []
+
+    for start, n_local in zip(_starts(partitions), partitions):
+        local_layers = tuple(range(start, start + n_local))
+        local_full_layers = tuple(
+            layer_id for layer_id in local_layers if layer_id in full_layer_slots
+        )
+        explicit = list(local_layers) + [
+            num_hidden + full_layer_slots[layer_id] for layer_id in local_full_layers
+        ]
+        covered.extend(explicit)
+
+    expected = list(range(num_hidden + len(full_layer_ids)))
+    assert sorted(covered) == expected
+    assert len(covered) == len(set(covered))
+
+
+def test_explicit_region_map_rejects_length_mismatch():
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    conn = object.__new__(mc.MooncakeConnector)
+
+    with pytest.raises(ValueError, match="length does not match"):
+        conn._consumer_region_map(3, 2, explicit_indices=[0, 1])
 
 
 # ---------------------------------------------------------------------------
@@ -472,3 +619,127 @@ def test_write_done_blocks_fenced_on_completion():
     conn._pending_recv_blocks["r1"] = [10, 20, 30]
     conn._record_write_done("r1", 0, 0, 0)
     assert conn._blocks_pending_fence == [10, 20, 30]
+
+
+# ---------------------------------------------------------------------------
+# PP head: request-less batches still carry KV connector metadata
+# ---------------------------------------------------------------------------
+
+
+class _FakeMeta:
+    def __init__(self, requests):
+        self.requests = list(requests)
+
+
+def _fake_batch(req_ids, meta):
+    return SimpleNamespace(req_ids=list(req_ids), connector_meta_output=meta)
+
+
+def _pp_engine_core_cls():
+    # The aiter stubs above shadow the real package; fill in the submodules the
+    # engine-core import chain reaches for.
+    for name, attrs in (
+        ("aiter.dist.shm_broadcast", ("MessageQueue",)),
+        ("aiter.ops.communication", ("set_custom_all_reduce",)),
+    ):
+        if name not in sys.modules:
+            mod = types.ModuleType(name)
+            for attr in attrs:
+                setattr(mod, attr, MagicMock())
+            sys.modules[name] = mod
+    from atom.model_engine.pp_engine_core import PPEngineCoreProc
+
+    return PPEngineCoreProc
+
+
+def _fake_head(batch):
+    PPEngineCoreProc = _pp_engine_core_cls()
+
+    head = SimpleNamespace(
+        _in_flight=deque(),
+        _defer_prefix_hash=False,
+        pp_size=4,
+        kv_transfer_enabled=True,
+        output_queue=MagicMock(),
+        runner_mgr=MagicMock(),
+        pp_transport=MagicMock(),
+        scheduler=MagicMock(),
+        _poll_kv_transfer_progress=MagicMock(),
+    )
+    head.scheduler.schedule.side_effect = [(batch, {}), None]
+    head.scheduler.take_rejected.return_value = None
+    head._dispatch_connector_only_batch = (
+        PPEngineCoreProc._dispatch_connector_only_batch.__get__(head)
+    )
+    PPEngineCoreProc._pp_head_step(head)
+    return head
+
+
+def _dispatched_metas(head):
+    return [
+        c.args[1]
+        for c in head.runner_mgr.call_func.call_args_list
+        if c.args and c.args[0] == "process_kvconnector_output"
+    ]
+
+
+def test_pp_head_dispatches_meta_of_request_less_batch():
+    """All sequences parked on offload loads -> no batch, but the metadata that
+    starts those loads must still reach the workers, or the head deadlocks."""
+    meta = _FakeMeta(["load-r1"])
+    head = _fake_head(_fake_batch([], meta))
+
+    assert _dispatched_metas(head) == [meta]
+    head.pp_transport.send_metadata.assert_called_once()
+    assert head.pp_transport.send_metadata.call_args.args[0].req_ids == []
+    head.runner_mgr.call_func.assert_any_call("flush_pp_send", wait_out=True)
+
+
+def test_pp_head_skips_empty_meta_of_request_less_batch():
+    """An idle head must not broadcast metadata that carries no work."""
+    for meta in (None, _FakeMeta([])):
+        head = _fake_head(_fake_batch([], meta))
+        assert _dispatched_metas(head) == []
+        head.pp_transport.send_metadata.assert_not_called()
+
+
+def test_pp_head_forwards_normal_batch_with_meta():
+    """A batch with requests keeps the original path: dispatch, send, forward."""
+    meta = _FakeMeta(["load-r1"])
+    batch = _fake_batch([7], meta)
+    batch.produces_output = lambda: False
+    head = _fake_head(batch)
+
+    assert _dispatched_metas(head) == [meta]
+    head.pp_transport.send_metadata.assert_called_once_with(batch)
+    head.runner_mgr.call_func.assert_any_call("forward", batch, wait_out=True)
+
+
+def test_pp_downstream_skips_forward_for_request_less_batch():
+    """Downstream must apply the metadata but run no forward for it."""
+    PPEngineCoreProc = _pp_engine_core_cls()
+
+    meta = _FakeMeta(["load-r1"])
+    stage = SimpleNamespace(
+        kv_transfer_enabled=True,
+        is_last=True,
+        runner_mgr=MagicMock(),
+        pp_transport=MagicMock(),
+        scheduler=MagicMock(),
+        utility_handler=MagicMock(),
+        utility_queue=MagicMock(),
+        _is_idle_rl_weights_offloaded=lambda: False,
+        _poll_and_send_kv_status=MagicMock(),
+    )
+    # One pass over the loop body, then shut down.
+    stage.pull_and_process_input_queue = MagicMock(side_effect=[False, True])
+    stage.pp_transport.recv_metadata.return_value = _fake_batch([], meta)
+
+    PPEngineCoreProc._downstream_busy_loop(stage)
+
+    stage.runner_mgr.call_func.assert_any_call("process_kvconnector_output", meta)
+    forwards = [
+        c for c in stage.runner_mgr.call_func.call_args_list if c.args[0] == "forward"
+    ]
+    assert forwards == []
+    stage.pp_transport.send_tokens.assert_not_called()

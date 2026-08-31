@@ -2,6 +2,7 @@
 # Tests for atom/sampling_params.py
 
 import pytest
+
 from atom.sampling_params import SamplingParams
 
 

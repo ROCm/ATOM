@@ -1,5 +1,6 @@
 import abc
 import logging
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -11,11 +12,13 @@ from torch import nn
 
 from atom.config import Config
 from atom.model_loader.loader import load_model
+from atom.spec_decode.draft_graph import DraftGraph
 from atom.utils import CpuGpuBuffer, resolve_obj_by_qualname
 from atom.utils.forward_context import (
     DPMetadata,
     SpecDecodeMetadata,
     get_forward_context,
+    set_forward_context,
 )
 
 logger = logging.getLogger("atom")
@@ -166,15 +169,106 @@ class Drafter(abc.ABC):
         i32_kwargs = {"dtype": torch.int32, "device": self.device}
         i64_kwargs = {"dtype": torch.int64, "device": self.device}
         max_bs = self.config.max_num_seqs
-        self.arrange_bs = torch.arange(max_bs + 1, **i32_kwargs)
         self.cu_num_draft_tokens = CpuGpuBuffer(max_bs, **i32_kwargs)
         self.target_logits_indices = CpuGpuBuffer(max_bs * self.mtp_k, **i64_kwargs)
         self.bonus_logits_indices = CpuGpuBuffer(max_bs, **i64_kwargs)
-        # Scheduler-supplied anchors. Pinned so the H2D stays async; building a
-        # tensor from the python list would block on a per-forward path.
-        self.anchor_staging = CpuGpuBuffer(max_bs, **i32_kwargs)
+
+        self._build_draft_graphs()
+
+    # ---- draft passes ----
+    def _declare_draft_graphs(self) -> tuple[DraftGraph, ...]:
+        """Declare this drafter's warmable forwards. Opt-in.
+
+        A flavor whose model cannot answer the warmup/forward/epilogue must
+        declare nothing rather than merely decline to pad: warmup runs before
+        the pad and capture gates.
+        """
+        return ()
+
+    def _build_draft_graphs(self) -> None:
+        self.draft_graphs: tuple[DraftGraph, ...] = tuple(
+            pass_.bind(self.config, self.device)
+            for pass_ in self._declare_draft_graphs()
+        )
+
+    @torch.inference_mode()
+    def warmup_draft_graphs(self, build_context, stream) -> None:
+        """Run every declared pass once per captured size, paying its JIT here.
+
+        aiter's flydsl hgemm builds a kernel per tile config, in-process, so a
+        batch first seen mid-serve stalls that step and every restart pays
+        again: `hipModuleLoadData` per rank went 6 -> 0 on the 16k/20/50c
+        reproducer, with this and `propose`'s padding.
+
+        Warming `runner.capture_sizes` is the point -- `propose` runs at the batch
+        the target ran, which `ForwardMode.decide` picks out of that same list,
+        so warmed and reachable are one set by construction rather than two
+        that drift.
+
+        `build_context(bs=...)` synthesizes one decode batch. The runner passes
+        it already bound, because which backends take a `max_q_len` is the
+        runner's to know. Call INSIDE `graph_capture()` (it arms the custom
+        all-reduce for the optional capture) and after `allocate_kv_cache`, so
+        that context has real ring slots and `is_dummy_run=False`.
+
+        Whatever `propose` sets on the context, this must set too. A capture
+        bakes every Python branch taken while it is made, so a guard that reads
+        the context is decided once, here, for every replay -- `is_draft` gates
+        the aux-capture hook away from the draft's own forward, and warming
+        without it records that hook clobbering the buffer it protects. The
+        row counts are the same rule and the sharper case: they size the MoE
+        all_gather that goes INTO the recording, so a synthetic context left
+        describing the target bakes a collective the pass never runs at.
+        """
+        if not self.draft_graphs:
+            return
+        runner = self.runner
+        capture_sizes = sorted(runner.capture_sizes)  # capture leaves it descending
+        pool = runner.graph_pool
+        start = time.time()
+        for pass_ in self.draft_graphs:
+            for bs in capture_sizes:
+                attn_metadata, context = build_context(bs=bs)
+                context.is_draft = True
+                # Every warmed pass is decode-shaped and DP-uniform: the graphs
+                # belong to the DSpark block and Eagle's mid-steps, and step 0
+                # has none. Stated, not inherited, per the rule above.
+                context.is_prefill = False
+                context.running_tokens_are_unified = True
+                # The synthetic batch is full, so the pass's scheduled and
+                # running counts are the same number.
+                local_tokens = bs * self.draft_tokens_per_seq
+                context.scheduled_tokens = local_tokens
+                context.running_tokens = local_tokens
+                set_forward_context(
+                    attn_metadata=attn_metadata,
+                    atom_config=self.config,
+                    context=context,
+                    num_tokens=local_tokens,
+                )
+                pool = pass_.warmup(bs, pool=pool, stream=stream)
+        runner.graph_pool = pool
+        torch.cuda.synchronize()
+        if runner.rank == 0:
+            logger.info(
+                "Draft passes warmed at %s in %.2fs: %s",
+                capture_sizes,
+                time.time() - start,
+                [g.name for g in self.draft_graphs],
+            )
 
     # ---- flavor hooks ----
+    @property
+    def draft_tokens_per_seq(self) -> int:
+        """Tokens one sequence contributes to a DECLARED pass.
+
+        1 for a serial flavor, whose declared pass is the mid-step; a block
+        flavor drafts its whole width in one pass and overrides. Read by
+        `warmup_draft_graphs`, which must state the shape on a synthetic
+        context and cannot ask `propose`.
+        """
+        return 1
+
     @abc.abstractmethod
     def _resolve_mtp_k(self) -> int:
         """Return the per-request verify horizon (drafted tokens per step).
@@ -227,6 +321,16 @@ class Drafter(abc.ABC):
         """Confidence-schedule verify planner (DSpark Level B), or None when the
         drafter uses fixed-length verification."""
         return None
+
+    @property
+    def draft_kv_duplicates_propose(self) -> bool:
+        """Is `compute_draft_kv` the pass propose's first draft step redoes?
+
+        True (EAGLE) means the two must never both run: the second is a
+        collective the peers on `dummy_execution` do not mirror. False (DSpark)
+        means it writes storage propose only reads, so it always runs.
+        """
+        return False
 
     # ---- aux-hidden-state ownership (drafter-owned, hook-based) ----
     def arm_aux_capture(self, target_model: nn.Module) -> None:
@@ -314,12 +418,14 @@ class Drafter(abc.ABC):
         """Scheduler-supplied anchors as an int32 GPU tensor, without blocking.
 
         `-1` entries survive as-is; callers read them as "sampling supplies it".
+        Uses ``forward_vars`` so the PP ring clones it per in-flight slot.
         """
         n = len(anchors)
-        self.anchor_staging.np[:n] = anchors
-        return self.anchor_staging.copy_to_gpu(n)
+        buf = self.runner.forward_vars["draft_next_tokens"]
+        buf.np[:n] = anchors
+        return buf.copy_to_gpu(n)
 
-    def precompute_context_kv(
+    def compute_draft_kv(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
@@ -332,10 +438,7 @@ class Drafter(abc.ABC):
         context maintained there covers a chunked prefill's final chunk alone.
 
         `next_token_ids` is the token one position past this forward, per seq:
-        -1 where sampling supplies it, None on unlabelled batches. A drafter
-        reading the target's TOKEN stream needs it (it sits one position ahead,
-        so its last row has no token otherwise); one reading hidden states does
-        not. Default is a no-op -- no cross-forward context, nothing to absorb.
+        -1 where sampling supplies it, None on unlabelled batches.
         """
         return
 
@@ -452,14 +555,49 @@ class Drafter(abc.ABC):
             "lm_head",
         )
 
-    def _refresh_dp_metadata(self, forward_context, num_local_tokens: int) -> None:
+    def _publish_draft_shape(
+        self,
+        forward_context,
+        scheduled_tokens: int,
+        running_tokens: int,
+        *,
+        running_tokens_are_unified: bool,
+    ) -> None:
+        """Re-point the forward context at the pass about to run.
+
+        A draft reuses the target's context, whose counts are the verified
+        tokens -- not the draft's own width. Anything sizing a collective off
+        the context (MoE's `pad_for_all_gather` above all) would then use the
+        wrong height, so the draft states its shape here rather than letting
+        each consumer special-case `is_draft`.
+
+        Both units: `scheduled_tokens` is how many rows carry a real request,
+        `running_tokens` how many the pass runs -- they differ exactly when the
+        batch was widened.
+
+        Both flags below are the caller's to answer, because this seam cannot
+        see either. `running_tokens_are_unified` claims every OTHER rank runs
+        this height too -- true where it is `context.running_bs` (`decide`'s
+        reduction) times a config width, false where it came off this rank's
+        own batch or token stream. `is_prefill` is left alone for the same
+        reason: a pass on its own `[bs, T]` shape must clear it, one carrying
+        the target's stream must not.
+        """
+        context = forward_context.context
+        context.scheduled_tokens = scheduled_tokens
+        context.running_tokens = running_tokens
         parallel_config = self.config.parallel_config
+        # A group of one is uniform whatever it runs; only the table needs peers.
         if parallel_config.data_parallel_size <= 1:
             return
-        forward_context.context.dp_uniform_decode = False
+        context.running_tokens_are_unified = running_tokens_are_unified
+        # The answer travels, not the table it implies -- `make` owns both ways
+        # of reaching one, and skipping its all_reduce is why this is worth
+        # stating at all.
         forward_context.dp_metadata = DPMetadata.make(
             parallel_config,
-            num_local_tokens,
+            running_tokens,
+            unified=running_tokens_are_unified,
         )
 
     def prepare_inputs(
