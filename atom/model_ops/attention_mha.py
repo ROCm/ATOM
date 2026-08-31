@@ -819,16 +819,23 @@ class PagedAttentionImpl(nn.Module):
             # Raw K/V is fed as a block_size=1 flash-layout cache, never shuffled.
             shuffled_kv_cache = False
 
-        n_block_rows = attn_metadata.block_tables.shape[0]
+        # Number of requests this step scheduled, taken from the context rather
+        # than from a companion array's shape. prepare_prefill fills exactly
+        # cu_seqlens_q[:scheduled_bs + 1] and context_lens[:scheduled_bs] and
+        # pads the tail out to running_bs, so this is that width by definition.
+        # block_tables.shape[0] was an indirect proxy for it, and one that is
+        # optional besides -- the base builder uploads a table only when
+        # `has_cached`, so the old narrowing had to special-case its absence.
+        n_seqs = fwd_ctx.context.scheduled_bs
         unified_attention(
             q,
             k_for_attn,
             v_for_attn,
             o,
-            # Cut to the rows of the block table this indexes with them: the
-            # prefill builder pads both past the requests it scheduled.
-            cu_seqlens_q=attn_metadata.cu_seqlens_q[: n_block_rows + 1],
-            seqused_k=attn_metadata.context_lens[:n_block_rows],
+            # Cut to the requests actually scheduled: the prefill builder pads
+            # both of these past them.
+            cu_seqlens_q=attn_metadata.cu_seqlens_q[: n_seqs + 1],
+            seqused_k=attn_metadata.context_lens[:n_seqs],
             max_seqlen_q=attn_metadata.max_seqlen_q,
             max_seqlen_k=attn_metadata.max_seqlen_k,
             softmax_scale=self.scale,
