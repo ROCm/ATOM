@@ -6,6 +6,7 @@
 
 import logging
 import queue
+import time
 from collections import deque
 
 from atom.distributed.pp_transport import PPStageTransport
@@ -15,7 +16,7 @@ from atom.kv_transfer.disaggregation.types import (
     completion_req_key,
     connector_metadata_has_work,
 )
-from atom.model_engine.engine_core import EngineCore
+from atom.model_engine.engine_core import METRICS_PUSH_INTERVAL_S, EngineCore
 from atom.model_engine.scheduler import ScheduledBatch
 
 logger = logging.getLogger("atom")
@@ -63,9 +64,19 @@ class PPEngineCoreProc(EngineCore):
 
     def _head_busy_loop(self):
         shutdown = False
+        next_metrics_push = 0.0
         try:
             while True:
                 self.utility_handler.process_queue(self.utility_queue, self)
+                # Head only: every stage shares one output socket and one
+                # dp_rank, so a downstream push -- whose Scheduler holds no
+                # queue, no BlockManager counters and no cache stats -- would
+                # land on the same `latest_metrics` slot and blank the real
+                # snapshot.
+                now = time.monotonic()
+                if now >= next_metrics_push:
+                    next_metrics_push = now + METRICS_PUSH_INTERVAL_S
+                    self.utility_handler.push_metrics()
                 shutdown = shutdown or self.pull_and_process_input_queue()
                 if shutdown:
                     break

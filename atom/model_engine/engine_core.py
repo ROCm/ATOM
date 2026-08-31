@@ -858,6 +858,10 @@ class PrefillEngineCore(EngineCore):
         self.scheduler = PrefillScheduler(
             config, disagg_cu_shm_name=config.disagg_cu_shm_name
         )
+        # EngineUtilityHandler was built in `super().__init__()` against the
+        # base Scheduler this just replaced; leaving it bound there publishes
+        # the discarded object's counters.
+        self.utility_handler.scheduler = self.scheduler
 
     def _post_model_load_hook(self):
         """Round 1 bootstrap: export weights → send to decode → wait for ACK.
