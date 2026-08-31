@@ -4295,7 +4295,7 @@ class FusedMoE(torch.nn.Module):
         if use_dp_gather_scatter:
             ctx = get_forward_context()
             dp_group = get_dp_group()
-            dp_eager_mode = not ctx.context.dp_uniform_decode
+            dp_eager_mode = not ctx.context.running_tokens_are_unified
 
             from atom.utils.tbo.ubatching import tbo_active
 
