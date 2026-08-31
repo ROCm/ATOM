@@ -349,16 +349,6 @@ def _qkn_placeholder(layer, q: torch.Tensor, num_tokens: int, *, zeros: bool):
     return QKNormRopeOut(q_sa=alloc((num_tokens, h, d)), kv=alloc((num_tokens, d)))
 
 
-def _qkn_to_list(qkn: "QKNormRopeOut", kv_fp8: bool) -> list[torch.Tensor]:
-    """Flatten for the op boundary: a custom op schema carries no dataclass, and
-    no Optionals in a tuple return, so this is the active layout's fields as a
-    list. Shared with the fake impl, which is what keeps the two from
-    disagreeing on length."""
-    if kv_fp8:
-        return [qkn.q_packed, qkn.q_rope, qkn.k_packed, qkn.k_rope]
-    return [qkn.q_sa, qkn.kv]
-
-
 def _v4_qk_norm_rope_fake(
     q: torch.Tensor,
     kv_pre: torch.Tensor,
@@ -367,7 +357,7 @@ def _v4_qk_norm_rope_fake(
 ) -> list[torch.Tensor]:
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
-    return _qkn_to_list(_qkn_placeholder(self, q, q.shape[0], zeros=False), self.kv_fp8)
+    return _qkn_placeholder(self, q, q.shape[0], zeros=False).custom_op_return()
 
 
 def v4_qk_norm_rope(
@@ -385,7 +375,7 @@ def v4_qk_norm_rope(
     """
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
-    return _qkn_to_list(self._qk_norm_rope(q, kv_pre, positions), self.kv_fp8)
+    return self._qk_norm_rope(q, kv_pre, positions).custom_op_return()
 
 
 direct_register_custom_op(
@@ -3281,12 +3271,12 @@ class DeepseekV4Attention(nn.Module):
         fc = get_forward_context()
         # Row count off the Q, NOT off `positions`. The Q descends from the
         # hidden state through `wqkv_a`/`wq_b`, so it carries the same token
-        # count the residual stream does. `positions` does not have to: under
-        # `--enable-dp-attention`, a step where any rank is prefilling takes the
-        # variable-length path (`model_runner.py`, `dp_uniform_decode`) and the
-        # two can differ. Sizing the attention output by `positions` then hands
-        # the mHC residual a mismatched `m` -- an aiter shape assert deep inside
-        # a compiled piece, far from here.
+        # count the residual stream does. `positions` does not have to: a step
+        # where any DP rank is prefilling takes the variable-length path (see
+        # `running_tokens_are_unified` in `forward_context.py`) and the two can
+        # differ. Sizing the attention output by `positions` then hands the mHC
+        # residual a mismatched `m` -- an aiter shape assert deep inside a
+        # compiled piece, far from here.
         q_rows = qkn.q_sa if qkn.q_sa is not None else qkn.q_packed
         assert q_rows is not None, (
             "_sparse_attention got no Q: `_qk_norm_rope` did not run upstream. "
@@ -3889,7 +3879,7 @@ class MoE(nn.Module):
 
         ids_2d = ids.unsqueeze(-1)
         dp_eager_mode = (
-            not ctx.context.dp_uniform_decode
+            not ctx.context.running_tokens_are_unified
         ) and ctx.dp_metadata is not None
         if dp_eager_mode:
             from atom.model_ops.moe import all_gatherv
