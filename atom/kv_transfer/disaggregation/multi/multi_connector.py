@@ -71,6 +71,7 @@ from atom.kv_transfer.disaggregation.types import (
     ConnectorMetadata,
     KVConnectorOutput,
     SaveCompletionId,
+    StateStoreOperationId,
     completion_req_key,
     connector_metadata_has_work,
 )
@@ -350,7 +351,19 @@ class MultiConnector(KVConnectorBase):
         # Pair each request's send and save before releasing either.
         for r in send_now:
             self._sent[str(r)] = r
+        # State-tier store completions (`StateStoreOperationId`: a
+        # (prefix_hash, generation) pair) have no send counterpart to pair
+        # against. Parking them in `self._saved` leaked for the life of the
+        # process -- their key never enters `self._sent`, so the pop below never
+        # fired. They are terminal on their own: release immediately. Match on
+        # the exact type, not `hasattr(r, "req_id")` -- a bare `ReqId` save
+        # completion (a plain str/int) has no `req_id` attribute either and must
+        # still go through send/save pairing on a producer node.
+        state_saves: set = set()
         for r in save_now:
+            if isinstance(r, StateStoreOperationId):
+                state_saves.add(r)
+                continue
             key = completion_req_key(r)
             self._saved.setdefault(key, set()).add(r)
             pending_ops = self._pending_save_ops.get(key)
@@ -369,7 +382,7 @@ class MultiConnector(KVConnectorBase):
             rel_save.update(self._saved.pop(key, set()))
 
         out.finished_sending = rel_send
-        out.finished_saving = rel_save
+        out.finished_saving = rel_save | state_saves
         return out
 
     def get_finished_recv_blocks(self) -> list[int]:
