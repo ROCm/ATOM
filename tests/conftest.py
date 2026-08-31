@@ -59,6 +59,7 @@ class MockConfig:
             "enable_prefix_caching": False,
             "enable_log_stats": True,
             "throughput_log_interval": 10.0,
+            "cache_hit_rate_window": 1000,
             "enable_chunked_prefill": True,
             "max_num_seqs": 4,
             "max_num_batched_tokens": 64,

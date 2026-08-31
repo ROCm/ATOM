@@ -1548,6 +1548,9 @@ class Config:
     enable_log_stats: bool = True
     # Seconds between engine-status lines. Validated > 0 by EngineStats.
     throughput_log_interval: float = 10.0
+    # Requests in the sliding window behind the status line's prefix-cache hit
+    # rate. Validated > 0 by EngineStats.
+    cache_hit_rate_window: int = 1000
     port: int = 8006
     torch_profiler_dir: str | None = field(
         default_factory=lambda: envs.ATOM_TORCH_PROFILER_DIR

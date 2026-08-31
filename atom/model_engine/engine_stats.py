@@ -162,6 +162,10 @@ class EngineStats:
         # Sliding window behind `recent_cache_hit_rate`, the figure the
         # engine-status line reports. Mirrors vLLM's PrefixCachingMetrics: the
         # last N requests, aggregated incrementally so `observe` stays O(1).
+        if cache_hit_rate_window <= 0:
+            raise ValueError(
+                f"cache_hit_rate_window must be > 0, got {cache_hit_rate_window}"
+            )
         self._recent_window = cache_hit_rate_window
         self._recent_hits: deque[tuple[int, int]] = deque()
         self._recent_reusable_tokens: int = 0

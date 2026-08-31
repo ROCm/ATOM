@@ -213,3 +213,112 @@ def test_decode_schedule_records_throughput_when_log_stats_on(seq_factory):
     batch, seqs = sched.schedule()
     assert batch is not None
     assert seq.id in seqs
+
+
+# ── /metrics does not count a P/D request twice ────────────────────────────
+
+
+def _aggregate(*snapshots):
+    """Run the real aggregator over hand-built rank snapshots.
+
+    `get_metrics_statistics` only reads `core_mgr.latest_metrics`, so a stub
+    with that attribute exercises the actual aggregation code without an
+    engine, GPUs, or a running EngineCore.
+    """
+    from types import SimpleNamespace
+
+    from atom.model_engine.llm_engine import LLMEngine
+
+    engine = SimpleNamespace(
+        core_mgr=SimpleNamespace(
+            latest_metrics=dict(enumerate(snapshots)),
+            get_dp_router_statistics=dict,
+        )
+    )
+    return LLMEngine.get_metrics_statistics(engine)
+
+
+def _snapshot(role, running, waiting, **extra):
+    return {
+        "enabled": True,
+        "role": role,
+        "requests_running": running,
+        "requests_waiting": waiting,
+        **extra,
+    }
+
+
+def test_snapshots_carry_their_pd_role():
+    """The aggregation below keys off `role`, so the snapshot has to carry it.
+
+    Half the fix lives in `collect_metrics`; without this the aggregator could
+    be perfectly correct and still see `role` missing from every rank, quietly
+    falling back to the summing path that double-counts.
+    """
+    import queue
+
+    from atom.model_engine.engine_utility import EngineUtilityHandler
+    from atom.model_engine.scheduler import (
+        DecodeScheduler,
+        PrefillScheduler,
+        Scheduler,
+    )
+
+    def role_of(sched):
+        handler = EngineUtilityHandler(
+            runner_mgr=None,
+            output_queue=queue.Queue(),
+            label="test",
+            scheduler=sched,
+        )
+        return handler.collect_metrics()["role"]
+
+    assert role_of(PrefillScheduler(MockConfig())) == "prefill"
+    assert role_of(DecodeScheduler(MockConfig(), disagg_cu_shm_name="")) == "decode"
+    # The aggregated (non-P/D) engine is neither half of a pair.
+    assert role_of(Scheduler(MockConfig())) == ""
+
+
+def test_pd_queue_depths_are_not_double_counted():
+    """One in-flight request is held by both P/D ranks at the same instant —
+    the prefill rank's `running` and the decode rank's `prefill_waiting`. The
+    decode side's queues already span the whole lifetime, so summing the pair
+    reports more requests than exist."""
+    metrics = _aggregate(
+        _snapshot("prefill", running=6, waiting=2),
+        _snapshot("decode", running=3, waiting=6),
+    )
+    assert metrics["requests_running"] == 3
+    assert metrics["requests_waiting"] == 6
+
+
+def test_cumulative_counters_still_sum_across_the_pd_pair():
+    """Only queue depths are deduplicated. Lifetime counters are written on
+    one side only, so dropping the prefill rank from *those* would lose real
+    numbers rather than remove a duplicate."""
+    metrics = _aggregate(
+        _snapshot("prefill", running=6, waiting=2, requests_finished=0, preemptions=1),
+        _snapshot("decode", running=3, waiting=6, requests_finished=40, preemptions=2),
+    )
+    assert metrics["requests_finished"] == 40
+    assert metrics["preemptions"] == 3
+
+
+def test_queue_depths_sum_when_no_rank_is_a_decode_rank():
+    """Two DP ranks of an aggregated engine. Neither is half of a pair, so
+    their queues are disjoint and must add up."""
+    metrics = _aggregate(
+        _snapshot("", running=4, waiting=1),
+        _snapshot("", running=5, waiting=2),
+    )
+    assert metrics["requests_running"] == 9
+    assert metrics["requests_waiting"] == 3
+
+
+def test_prefill_only_window_still_reports_its_queues():
+    """Between the prefill rank's first metrics push and the decode rank's,
+    the prefill counts are all there is — and nothing is duplicating them yet,
+    so reporting 0 here would blank the dashboard instead of deduplicating."""
+    metrics = _aggregate(_snapshot("prefill", running=6, waiting=2))
+    assert metrics["requests_running"] == 6
+    assert metrics["requests_waiting"] == 2

@@ -549,6 +549,7 @@ class Scheduler:
             enable_prefix_caching=config.enable_prefix_caching,
             enable_log_stats=config.enable_log_stats,
             throughput_log_interval_s=config.throughput_log_interval,
+            cache_hit_rate_window=config.cache_hit_rate_window,
             pool_pressure=self.block_manager.pool_pressure,
         )
         if config.enable_prefix_caching:

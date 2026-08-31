@@ -2549,7 +2549,7 @@ class TestLadderOffButCheckpointingOn:
         assert coord.checkpoints_dropped == 0
 
 
-class TestCacheStatsAttribution:
+class TestCacheAttribution:
     """Splitting declined reuse into the part a checkpoint reaches and the rest.
 
     One number for both makes "does demand-driven checkpointing apply to this

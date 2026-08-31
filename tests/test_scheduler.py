@@ -233,6 +233,20 @@ class TestThroughputSection:
         )
         assert sched.engine_stats.throughput_log_interval_s == 2.5
 
+    def test_hit_rate_window_comes_from_config(self):
+        """Same wiring as the interval above: `--cache-hit-rate-window` has to
+        reach EngineStats rather than stop at Config."""
+        sched = Scheduler(MockConfig(cache_hit_rate_window=250))
+        assert sched.engine_stats._recent_window == 250
+
+    def test_non_positive_hit_rate_window_is_rejected(self):
+        """0 would evict each request as it arrives and read `n/a` forever;
+        a negative window never evicts, turning the "recent" rate into a
+        lifetime one. Neither should fail silently — and a bare assert would,
+        under `python -O`."""
+        with pytest.raises(ValueError, match="cache_hit_rate_window"):
+            EngineStats(enable_prefix_caching=True, cache_hit_rate_window=0)
+
     def test_window_expired_gates_the_heartbeat(self):
         stats = EngineStats(enable_log_stats=True, throughput_log_interval_s=10.0)
         assert stats.window_expired(time.monotonic()) is False
