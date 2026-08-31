@@ -866,14 +866,33 @@ class BlockManager:
             h = self.compute_hash(token_ids, h)
             block_id = self.kv.lookup(h)
             if block_id == -1:
-                # Evicted between `can_allocate` and here. Unreachable for the
-                # cached range (nothing evicts inside one admission), so only
-                # the widened tail can land here: stop claiming and let the rest
-                # come from the free pool.
-                assert (
-                    i >= num_cached_blocks
-                ), f"cached block {i} of {num_cached_blocks} vanished during allocate"
-                seq.state_joint_claim_tokens = i * hbs
+                # Evicted between `can_allocate` and here. For the widened joint
+                # tail this is expected -- LMCache or the state tier still holds
+                # it and the forward refetches. For the cached range it should be
+                # unreachable (nothing evicts inside one admission), but an
+                # `assert i >= num_cached_blocks` vanishes under `python -O`, and
+                # the old fall-through then recorded `num_cached_blocks * hbs` as
+                # cached over a prefix it could not claim, left `hit_hash`
+                # unassigned (cold-start state exit), and clamped only
+                # `state_joint_claim_tokens` while `boundary`/`kv` stayed above
+                # the claimed region -- silent wrong output on both counts. Use
+                # real control flow instead: never treat more than the `i` blocks
+                # actually claimed as cached, and drop any joint boundary that
+                # sits above them so the KV leg cannot resume over a gap.
+                claimed_tokens = i * hbs
+                if i < num_cached_blocks:
+                    num_cached_blocks = i
+                if (
+                    int(getattr(seq, "state_joint_boundary_tokens", 0) or 0)
+                    > claimed_tokens
+                ):
+                    seq.state_joint_boundary_tokens = 0
+                    seq.state_joint_boundary_hash = -1
+                    seq.state_joint_kv_tokens = 0
+                seq.state_joint_claim_tokens = min(
+                    int(getattr(seq, "state_joint_claim_tokens", 0) or 0),
+                    claimed_tokens,
+                )
                 break
             self.kv.claim(block_id)
             seq.block_table.append(block_id)
