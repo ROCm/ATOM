@@ -598,7 +598,12 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler):
             )
             target.add(completion.operation_id)
             return True
-        return super().connector_completion(completion)
+        # Channels this connector does not own. `DenseOffloadConnector` and the
+        # rest of the MRO define no `connector_completion`, so `super().` would
+        # raise AttributeError; `False` is the caller's contract for "unhandled"
+        # (see `_offload_common._apply_connector_completions`) and matches the
+        # DSV4 sibling connector.
+        return False
 
     def take_state_source_releases(self) -> set:
         """Drain the stores whose PAGE units the GPU has finished reading.
