@@ -612,6 +612,7 @@ jobs:
           set -euo pipefail
           mkdir -p atomesh-results
           SUMMARY_PATH="atomesh-results/${MATRIX_ID}-summary.md"
+          AIPERF_RAW_PATH="atomesh-results/${MATRIX_ID}-aiperf-raw.md"
           BENCHMARK_ACTION_INPUT="atomesh-results/${MATRIX_ID}-benchmark-action.json"
 
           python3 .github/scripts/atomesh/process_result.py \
@@ -621,6 +622,11 @@ jobs:
             --hardware "${ATOMESH_DASHBOARD_HARDWARE}" \
             --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
+          # Empty for standard ISL/OSL cases: only AIPerf writes the console dump.
+          python3 .github/scripts/atomesh/aiperf_console_report.py \
+            "atomesh-results/${MATRIX_ID}" \
+            --output "${AIPERF_RAW_PATH}"
+
           {
             echo "## ${MATRIX_ID}"
             echo
@@ -629,9 +635,16 @@ jobs:
               echo
             fi
             cat "${SUMMARY_PATH}"
+            if [ -s "${AIPERF_RAW_PATH}" ]; then
+              echo
+              cat "${AIPERF_RAW_PATH}"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
           cat "${SUMMARY_PATH}"
+          if [ -s "${AIPERF_RAW_PATH}" ]; then
+            cat "${AIPERF_RAW_PATH}"
+          fi
 
       - name: Upload model benchmark artifacts
         if: always()
@@ -671,7 +684,17 @@ jobs:
             --summary atomesh-benchmark-summary.md \
             --hardware "${ATOMESH_DASHBOARD_HARDWARE}" \
             --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          # Empty for standard ISL/OSL cases: only AIPerf writes the console dump.
+          python3 .github/scripts/atomesh/aiperf_console_report.py \
+            atomesh-results \
+            --output atomesh-aiperf-raw.md
           cat atomesh-benchmark-summary.md >> "$GITHUB_STEP_SUMMARY"
+          if [[ -s atomesh-aiperf-raw.md ]]; then
+            {
+              echo
+              cat atomesh-aiperf-raw.md
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
           ENTRY_COUNT="$(python3 - <<'PY'
           import json
           from pathlib import Path
@@ -696,6 +719,8 @@ jobs:
           path: |
             atomesh-benchmark-action.json
             atomesh-benchmark-summary.md
+            atomesh-aiperf-raw.md
+          if-no-files-found: ignore
 
   dashboard:
     concurrency:
