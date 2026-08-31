@@ -1946,6 +1946,11 @@ class MLAAttention(nn.Module):
                 "Sparse DCP persistent decode metadata rebuild currently "
                 "supports non-speculative q_len=1 only."
             )
+        elif work_prefix == "sparse_mtp_":
+            assert attn_metadata.max_seqlen_q > 1, (
+                "sparse_mtp_ work buffers describe the per-token verify layout; "
+                "a q_len=1 step must use the unprefixed ones."
+            )
         assert q.shape[1] == self.dcp_kernel_num_heads
         get_mla_metadata_v1(
             paged_cu_seqlens_q,

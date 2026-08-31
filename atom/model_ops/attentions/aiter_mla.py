@@ -556,6 +556,14 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # Allocate a second set of persistent work buffers for sparse MTP
             # per-token layout: max_bs*max_seqlen_qo virtual seqs, each q_len=1.
             smt_max_bs = self.max_bs * max_seqlen_qo
+            # Same widening as sparse prefill: when the rebuild is live these
+            # descriptors are regenerated for the DCP-gathered query width, so
+            # they must be sized for it and not for a single rank's heads.
+            sparse_mtp_num_heads = (
+                self.persistent_num_heads
+                if self.sparse_dcp_metadata_rebuild
+                else self.padded_num_attention_heads
+            )
             (
                 (smt_wmd_size, smt_wmd_type),
                 (smt_wi_size, smt_wi_type),
@@ -566,7 +574,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             ) = get_mla_metadata_info_v1(
                 smt_max_bs,
                 1,  # max_seqlen_qo=1 for per-token
-                self.padded_num_attention_heads,
+                sparse_mtp_num_heads,
                 self.dtype_q,
                 self.dtype_kv,
                 is_sparse=True,
