@@ -519,7 +519,17 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler):
         tied to LMCache's own force-unpin window. Neither mechanism subsumes the
         other: this one asks whether the backend ever took the save, that one
         whether it ever answered.
+
+        An active load is checked *first*, before the stall escape: the base's
+        `should_defer_free` holds blocks while a load is still reading/writing
+        them (`_has_active_load`), and the escape must not override that. A
+        request whose save has stalled can still have a live load into the same
+        block table; releasing those blocks mid-load is the free-while-writing
+        corruption the escape is not meant to cause. No-load requests are
+        unaffected -- the base checks the same predicate first anyway.
         """
+        if self._has_active_load(seq):
+            return True
         sid = str(seq.id)
         if (
             self._save_stalled
