@@ -450,9 +450,13 @@ class PageUnitCheckpointStore:
             self._offload_pins[op] = (checkpoint_id, monotonic())
             out.append((op, record.unit_ids))
         # Re-queue the deferred nominations for the next drain, once the
-        # colliding in-flight generation has had a chance to settle.
+        # colliding in-flight generation has had a chance to settle. The drain
+        # is `popleft()` (oldest at the left), so `extend` would append these
+        # older, already-waiting nominations *behind* newer ones and let them
+        # starve until they age out at the `state != READY` check. Put them
+        # back at the front, preserving their original oldest-first order.
         if deferred:
-            self._offload_ready.extend(deferred)
+            self._offload_ready.extendleft(reversed(deferred))
         return out
 
     def _hash_in_flight(self, prefix_hash: int) -> bool:
