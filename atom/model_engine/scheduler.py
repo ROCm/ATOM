@@ -1645,7 +1645,7 @@ class Scheduler:
             )
             self.waiting.extend(skipped_waiting_requests)
 
-        if self._num_parked_remote_kv > 0 and self._schedule_tick % 100 == 0:
+        if self._num_parked_remote_kv > 0 and self._schedule_tick % 1000 == 0:
             logger.info(
                 "PD backpressure: parked=%d, waiting=%d, running=%d, "
                 "resident=%d/%d, kv_usage=%.2f",
@@ -1793,7 +1793,7 @@ class Scheduler:
                 if not is_first or has_injected_t0:
                     self.block_manager.may_append(seq, num_new_tokens)
                 if is_first:
-                    logger.info(
+                    logger.debug(
                         "[PD-FIRST-DECODE] seq %s: num_tokens=%d, "
                         "blocks=%d, injected_t0=%s, "
                         "last_block_num=%d, context_will_be=%d",
@@ -2025,7 +2025,7 @@ class Scheduler:
                 for d in drafts:
                     seq.append_token(int(d))
                 seq.spec_token_ids = np.asarray(drafts, dtype=np.int32)
-        logger.info(
+        logger.debug(
             "[PD-TRANSITION] seq %s: num_tokens=%d, "
             "num_prompt=%d, blocks=%d, first_token=%s, "
             "last_5_tids=%s",
@@ -2581,7 +2581,7 @@ class Scheduler:
                 seq.spec_token_ids = draft_token_ids[idx]
 
             if seq.num_completion_tokens <= 3 and seq.kv_transfer_params:
-                logger.info(
+                logger.debug(
                     "[PD-DECODE] seq %s: comp_tokens=%d, "
                     "new_token=%s, num_tokens=%d, blocks=%d",
                     seq.id,
@@ -2723,7 +2723,7 @@ class Scheduler:
                 )
 
                 if request_output.kv_transfer_params_output is not None:
-                    logger.info("KV transfer output present in stream output.")
+                    logger.debug("KV transfer output present in stream output.")
 
                 stream_outputs.append((seq.id, request_output))
                 logger.debug(
