@@ -211,6 +211,32 @@ def situ_and_mul_quant(
     return out, scale
 
 
+def situ_and_mul_maybe_quant(
+    x: torch.Tensor,
+    beta: float,
+    linear_beta: float | None,
+    quant: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """SiTUv2 gated activation, optionally fused with per-token FP8 quant.
+
+    Unifies the quant and non-quant paths behind one call site so the caller
+    always does ``down_proj(x, x_scale=scale)``:
+
+    - ``quant=False``: return ``(bf16 [..., d], None)``. The ``None`` scale makes
+      ``down_proj(x, x_scale=None)`` fall back to its own standalone activation
+      quant.
+    - ``quant=True``: fuse SiTUv2 + per-token FP8 quant into one aiter kernel and
+      return ``(fp8 [m, d], scale [m, 1])`` for down_proj's ``x_scale=`` path
+      (dense-MLP / shared-expert under ptpc_fp8).
+
+    Unlike :func:`fused_sigmoid_mul_maybe_quant`, there is no scheme selector: the
+    aiter ``situv2_and_mul_quant`` kernel implements only the per-token scheme.
+    """
+    if quant:
+        return situ_and_mul_quant(x, beta, linear_beta)
+    return situ_and_mul(x, beta, linear_beta), None
+
+
 @mark_trace
 def rmsnorm_gated(
     x: torch.Tensor,

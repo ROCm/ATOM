@@ -216,16 +216,14 @@ class SituAndMul(nn.Module):
         # kernel always applies the linear-beta tanh to the up half).
         self.fused_quant = fused_quant and linear_beta is not None
 
-    def forward(
-        self, x: torch.Tensor
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if self.fused_quant:
-            from atom.model_ops.kimi_k3 import situ_and_mul_quant
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        from atom.model_ops.kimi_k3 import situ_and_mul_maybe_quant
 
-            return situ_and_mul_quant(x, self.beta, self.linear_beta)
-        from atom.model_ops.kimi_k3 import situ_and_mul
-
-        return situ_and_mul(x, self.beta, self.linear_beta)
+        # Always (activation, scale): (fp8, scale) when fused, else (bf16, None),
+        # so KimiMLP takes the same down_proj(x_scale=) call site.
+        return situ_and_mul_maybe_quant(
+            x, self.beta, self.linear_beta, quant=self.fused_quant
+        )
 
 
 class KimiRMSNormGated(nn.Module):
@@ -317,13 +315,10 @@ class KimiMLP(nn.Module):
         x_scale = None
         if isinstance(x, tuple):
             x, x_scale = x
-        act = self.act_fn(self.gate_up_proj(x, x_scale))
-        # When act_fn fused the down_proj activation quant it returns (fp8, scale);
-        # forward that scale so down_proj skips its own quant.
-        if isinstance(act, tuple):
-            act, act_scale = act
-            return self.down_proj(act, x_scale=act_scale)
-        return self.down_proj(act)
+        # act_fn always returns (activation, scale): (fp8, scale) when it fused the
+        # down_proj activation quant, else (bf16, None) so down_proj self-quantizes.
+        act, act_scale = self.act_fn(self.gate_up_proj(x, x_scale))
+        return self.down_proj(act, x_scale=act_scale)
 
 
 class KimiSparseMoeBlock(nn.Module):
