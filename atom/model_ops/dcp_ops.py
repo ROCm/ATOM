@@ -1046,22 +1046,26 @@ def dcp_decode_candidate_exchange(
     from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 
     dcp_world_size = get_dcp_world_size()
-    batch_size, next_n = padded_q_fp8_decode_tokens.shape[:2]
-    num_rows = batch_size * next_n
-    num_padded_tokens = num_rows
+    next_n = padded_q_fp8_decode_tokens.shape[1]
     assert attn_metadata.max_seqlen_q == 1, (
         "DCP + DeepSeek-V3.2 sparse indexer (DSA) currently supports "
         "qlen=1 decode only (MTP verify not yet supported)."
     )
     local_ctx = dcp_local_context_lens(
-        attn_metadata, dcp_rank, dcp_world_size, cp_kv_cache_interleave_size, num_rows
+        attn_metadata,
+        dcp_rank,
+        dcp_world_size,
+        cp_kv_cache_interleave_size,
+        num_decode_tokens,
     )
     l_max = (max_model_len + dcp_world_size - 1) // dcp_world_size
-    local_logits = torch.empty([num_rows, l_max], dtype=torch.float32, device="cuda")
+    local_logits = torch.empty(
+        [num_decode_tokens, l_max], dtype=torch.float32, device="cuda"
+    )
     deepgemm_fp8_paged_mqa_logits(
         padded_q_fp8_decode_tokens,
         kv_cache,
-        weights[:num_padded_tokens],
+        weights[:num_decode_tokens],
         local_logits,
         local_ctx,
         attn_metadata.block_tables,
@@ -1075,14 +1079,14 @@ def dcp_decode_candidate_exchange(
     # (-inf, -1) padding, which the merge drops.
     k_loc = topk_tokens
     local_idx = torch.empty(
-        num_rows, k_loc, dtype=torch.int32, device=local_logits.device
+        num_decode_tokens, k_loc, dtype=torch.int32, device=local_logits.device
     )
     top_k_per_row_decode(
         local_logits,
         next_n,
         local_ctx,
         local_idx,
-        num_rows,
+        num_decode_tokens,
         local_logits.stride(0),
         local_logits.stride(1),
         k_loc,
@@ -1090,7 +1094,7 @@ def dcp_decode_candidate_exchange(
     )
     # [2, rows, k_loc]: plane 0 = score, plane 1 = int32 gid bits.
     send = torch.empty(
-        2, num_rows, k_loc, dtype=torch.float32, device=local_logits.device
+        2, num_decode_tokens, k_loc, dtype=torch.float32, device=local_logits.device
     )
     dcp_pack_topk_candidates(
         local_logits,
@@ -1107,7 +1111,7 @@ def dcp_decode_candidate_exchange(
     recv = (
         get_dcp_group()
         .all_gather(send.view(torch.int32), dim=0)
-        .view(dcp_world_size, 2, num_rows, k_loc)
+        .view(dcp_world_size, 2, num_decode_tokens, k_loc)
     )
     dcp_merge_candidates(recv, topk_indices[:num_decode_tokens, :topk_tokens])
 

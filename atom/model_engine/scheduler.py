@@ -789,20 +789,10 @@ class ScheduledBatch:
 
         self.is_dummy_run = is_dummy_run
         self.num_spec_step = num_spec_step
-        self.num_spec_query_tokens = num_spec_step + 1
         # DSpark RAGGED (paper §5.2): per-request decode query lengths [bs]
         # (ell_r + 1). None unless _dspark_apply_ragged set it this step; when
         # set, consumers use it (per-seq) instead of the scalar above.
         self.dynamic_spec_query_tokens_per_req = None
-
-        # DSpark DP graph-shape sync (see model_runner._apply_dspark_shape_max):
-        # DP-max decode bs / ragged token total, so every DP rank replays the same
-        # cudagraph shape. None outside DSpark-under-DP steps.
-        self.dspark_dp_bs = None
-        self.dspark_dp_total_tokens = None
-        # Flat PIECEWISE replay token count for this decode step (set in
-        # prepare_inputs). None when N/A -> consumers use bs*max_seqlen_q.
-        self.dynamic_num_tokens_pad = None
 
         # Detailed attention aggregates (set by Scheduler.compute_detailed_aggregates
         # when profiling is active and ATOM_ENABLE_DETAILED_ANNOTATION is set).
@@ -836,6 +826,10 @@ class ScheduledBatch:
         Decode batches always do. A pure-prefill batch yields a token only
         when at least one seq is on its final chunk; a batch of middle chunks
         produces nothing.
+
+        A DP-sync dummy answers True and must: reporting lags a step, so the
+        dummy is what flushes the last real one. Skip its `postprocess` and
+        the request waking up after it has an anchor on neither side.
         """
         if self.total_seqs_num_decode > 0:
             return True

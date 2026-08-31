@@ -26,7 +26,7 @@ import atom.model_ops.fused_moe.modular_kernel as mk
 
 def _trim(monkeypatch, *, running_tokens, dp_size, topk, recv_rows):
     context = SimpleNamespace(
-        running_tokens=running_tokens, is_prefill=False, dp_uniform_decode=True
+        running_tokens=running_tokens, is_prefill=False, running_tokens_are_unified=True
     )
     monkeypatch.setattr(
         mk, "get_forward_context", lambda: SimpleNamespace(context=context)
