@@ -420,14 +420,27 @@ class PageUnitCheckpointStore:
         closely enough that the earlier one's report is still on the wire.
         """
         out: list[tuple[StateStoreOperationId, tuple[int, ...]]] = []
+        # Nominations whose hash is transiently in flight: held aside and
+        # re-queued after the pass, NOT dropped (see below).
+        deferred: list = []
         while self._offload_ready and len(self._offload_pins) < max_inflight:
             checkpoint_id = self._offload_ready.popleft()
             record = self.records.get(checkpoint_id)
-            # Spent while it waited -- which nomination deliberately allows --
-            # or already in flight under this hash. Nothing to send either way.
+            # Spent while it waited -- which nomination deliberately allows.
+            # Terminal: there is nothing left to store, so drop it.
             if record is None or record.state != READY:
                 continue
             if self._hash_in_flight(record.prefix_hash):
+                # NOT terminal. The record is still READY and is a live, valid
+                # nomination; its only problem is that an earlier generation of
+                # the same hash is still on the wire (an eviction + re-store of
+                # one prefix while the first store is mid-flight). Dropping it
+                # here -- as a bare `continue` did -- lost this checkpoint image
+                # from the store queue for good once the in-flight copy settled.
+                # Defer it to a later pass instead. Held aside rather than
+                # re-appended inside the loop so a hash that stays in flight
+                # cannot spin this call.
+                deferred.append(checkpoint_id)
                 continue
             self._offload_generation += 1
             op = StateStoreOperationId(
@@ -436,6 +449,10 @@ class PageUnitCheckpointStore:
             record.pin_count += 1
             self._offload_pins[op] = (checkpoint_id, monotonic())
             out.append((op, record.unit_ids))
+        # Re-queue the deferred nominations for the next drain, once the
+        # colliding in-flight generation has had a chance to settle.
+        if deferred:
+            self._offload_ready.extend(deferred)
         return out
 
     def _hash_in_flight(self, prefix_hash: int) -> bool:
