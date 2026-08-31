@@ -571,7 +571,7 @@ class TestRegisterReceivedPrefix:
         # These scheduler tests only need the equivalent virtual-block count.
         monkeypatch.setattr(
             bm,
-            "_dcp_num_blocks",
+            "num_pool_blocks",
             lambda seq_len: (seq_len + bm.hash_block_size - 1) // bm.hash_block_size,
         )
         return bm

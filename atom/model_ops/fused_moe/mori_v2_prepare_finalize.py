@@ -528,8 +528,10 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
         context = get_forward_context().context
         if context is None:
             return None
-        all_ranks_decode = getattr(context, "dp_uniform_decode", not context.is_prefill)
-        if not all_ranks_decode:
+        tokens_unified = getattr(
+            context, "running_tokens_are_unified", not context.is_prefill
+        )
+        if not tokens_unified:
             return None
         bound = context.running_tokens * topk_ids.shape[1] * get_dp_group().world_size
         return bound if bound < arena_rows else None

@@ -19,6 +19,19 @@ if TYPE_CHECKING:
     from atom.config import Config
 
 
+def _owned(value: Any) -> Any:
+    """A copy the graph pool cannot re-issue.
+
+    Whole return, not the one output known to outlive its step: which that is
+    belongs to the flavor, not to this seam.
+    """
+    if isinstance(value, torch.Tensor):
+        return value.clone()
+    if isinstance(value, tuple):
+        return tuple(_owned(v) for v in value)
+    return value
+
+
 @dataclass(frozen=True)
 class StagedInput:
     """One staged input's type: everything but the leading batch axis."""
@@ -39,10 +52,9 @@ class DraftGraph:
 
     * **warmup** -- run it once per ``capture_sizes`` entry at startup, paying its
       per-shape JIT there rather than mid-serve. Needs nothing.
-    * **pad** -- run at the batch the target just ran, which the startup sweep
+    * **pad** -- run at the batch the step settled on, which the startup sweep
       warmed, rather than at whatever this step's batch happens to be. Needs
-      ``inputs`` (fixed addresses to pad into) and ``pads`` (an assertion that
-      the fabricated rows reach nothing).
+      ``inputs``: fixed addresses for the fabricated rows to land in.
     * **capture** -- record it. Needs pad.
 
     The pass is ``epilogue ∘ forward``. Warmup always runs both, so nothing
@@ -54,16 +66,16 @@ class DraftGraph:
     ``warmup_inputs`` makes that startup batch plausible, since warming on zeros
     compiles a shape no real batch draws.
 
-    Everything here counts SEQUENCES, in the target's own words: ``bs`` is the
-    scheduled batch, ``running_bs`` is what it actually runs at, and
-    ``capture_sizes`` is the ladder the startup sweep warms.
+    Everything here counts SEQUENCES, in the target's own words:
+    ``scheduled_bs`` is what this rank was handed, ``running_bs`` is the
+    DP-agreed batch a recording holds, and ``capture_sizes`` is the ladder
+    the startup sweep warms.
     """
 
     forward: Callable[..., Any]  # (running_bs, **staged) -> Any
     epilogue: Callable[..., Any] | None = None  # (fwd_out, running_bs, **staged)
     capture_epilogue: bool = False
     inputs: "Mapping[str, StagedInput]" = field(default_factory=dict)
-    pads: bool = False
     warmup_inputs: Callable[..., None] | None = None
 
     _buffers: dict[str, torch.Tensor] = field(init=False, default_factory=dict)
@@ -87,9 +99,9 @@ class DraftGraph:
         their addresses, and one born on the capture step would come out of the
         graph's own private pool.
         """
-        assert not self.pads or self.inputs, (
-            f"{self.name} says it may pad but stages nothing, so there is no "
-            f"buffer for the fabricated rows to land in"
+        assert self.inputs, (
+            f"{self.name} stages nothing, so a fabricated row has no buffer "
+            f"to land in -- declare no pass rather than an unpaddable one"
         )
         self._buffers = {
             role: torch.zeros(
@@ -103,46 +115,12 @@ class DraftGraph:
 
     @property
     def will_capture(self) -> bool:
-        """Whether warmup also captures. One gate for every flavor, since the
-        graph is made by the shared ``warmup``."""
-        return self.pads and envs.ATOM_DRAFT_CUDAGRAPH
+        """Whether warmup also captures. The name `envs.ATOM_DRAFT_CUDAGRAPH`
+        points at, and the only thing that decides it."""
+        return envs.ATOM_DRAFT_CUDAGRAPH
 
-    def target_running_bs(self, bs: int, context) -> int:
-        """The batch the target just ran at, or ``bs`` when it pinned none.
-
-        Never a batch the drafter picks. ``context.running_bs`` IS what the
-        target ran: ``model_runner`` builds the attention metadata with it, so
-        every per-sequence buffer already reaches that far -- ``slot_mapping``
-        -1, ``context_lens`` 0, ring slots published -- and a pad row fabricates
-        nothing the backend has not already accounted for, on any backend and
-        without the drafter knowing each one's convention. It is a warmed shape
-        by construction too: on the cudagraph path ``ForwardMode.decide`` picks
-        it out of ``capture_sizes``, the list the startup sweep warms. And it is
-        DP-unified, which is what lets the draft's own collectives line up.
-
-        Off the cudagraph path nothing is padded -- ``running_bs`` is then the
-        scheduled batch, and that is the only safe answer anyway, since nobody
-        sized the target's metadata past the real batch there.
-
-        An empty batch is never widened: a pad row is a copy of the last real
-        one, and there is no last real one to copy. Declining the padding rather
-        than the pass is deliberate -- under DP every rank still has to reach the
-        draft's collectives.
-
-        ``is_dummy_run`` is deliberately NOT read, for the reason spelled out in
-        :meth:`_replays`: it is per-rank, so any term keyed on it splits the DP
-        group into two shapes.
-
-        """
-        mode = context.forward_mode
-        if not bs or not self.pads:
-            return bs
-        if mode is None or not mode.use_cudagraph:
-            return bs
-        return max(bs, int(context.running_bs))
-
-    def label(self, real_bs: int, running_bs: int, context) -> str:
-        """``bs=<real>/<pad>`` plus a trailing ``graph`` when this step replays.
+    def label(self, scheduled_bs: int, running_bs: int) -> str:
+        """``bs=<scheduled>/<running>``, plus ``graph`` when this step replays.
 
         One convention, one implementation: "did the draft get into a graph" is
         then a single grep across every flavor, rather than each flavor writing
@@ -150,8 +128,8 @@ class DraftGraph:
         predicate `run` does, so the mark cannot claim a replay that did not
         happen.
         """
-        return f"bs={real_bs}/{running_bs}" + (
-            " graph" if self._replays(running_bs, context) else ""
+        return f"bs={scheduled_bs}/{running_bs}" + (
+            " graph" if self.is_captured(running_bs) else ""
         )
 
     def stage(
@@ -159,23 +137,13 @@ class DraftGraph:
     ) -> dict[str, torch.Tensor]:
         """Copy every input into its fixed buffer, widening the batch to ``running_bs``.
 
-        The only way in, because ``pads`` is the part of the contract nothing
-        else can check: a pass that lies about it still runs and still returns
-        the right shape -- its fabricated rows just land in another sequence's
-        KV.
-
-        How many rows are real comes from the sources, not from the caller: a
+        How many rows are real comes from the sources, never from the caller: a
         count that cannot disagree with the tensor it describes.
         """
         counts = {t.shape[0] for t in srcs.values()}
         assert len(counts) <= 1, (
             f"{self.name} was handed batches of {sorted(counts)}; they "
             f"describe one step, so one of them is not this step's"
-        )
-        bs = counts.pop() if counts else running_bs
-        assert running_bs == bs or self.pads, (
-            f"{self.name} was asked for {running_bs} rows against {bs} real ones, "
-            f"but never said its fabricated rows are inert"
         )
         return {
             role: self._stage_one(role, running_bs, src) for role, src in srcs.items()
@@ -206,54 +174,58 @@ class DraftGraph:
             f"{tuple(buf.shape[1:])} per sequence. MRoPE positions ([3, N]) are "
             f"the case that reaches here"
         )
-        bs = src.shape[0]
-        out[:bs].copy_(src)
-        if running_bs > bs:
-            out[bs:].copy_(src[-1])  # copy_ broadcasts; no expand needed
+        scheduled_bs = src.shape[0]
+        out[:scheduled_bs].copy_(src)
+        if running_bs > scheduled_bs:
+            out[scheduled_bs:].copy_(src[-1])  # broadcasts; no expand needed
         return out
 
     def is_captured(self, running_bs: int) -> bool:
-        """Whether a recording exists at this shape. Not whether it may be used."""
-        return running_bs in self._cuda_graphs
+        """Whether a recording exists at this batch -- and so whether this step
+        replays, the two having become one question.
 
-    def _replays(self, running_bs: int, context) -> bool:
-        """Whether THIS step stands in for a recording.
-
-        A recording holds the collective at the width it was made for, so every
-        term here must be one the whole DP group agrees on -- which is why
-        `is_dummy_run` may not enter. A DP-sync dummy is per-rank, so gating on
-        it makes the rank with work replay while the rest issue eagerly, and
-        all of them wait forever (measured: V4-Flash-DSpark tp8 + DPA hung 8/8
-        on the first real decode). Replaying is safe on a dummy anyway --
-        `warmup` asserts the recording was made on a REAL context.
+        Nothing about the step enters. A recording holds its collective at one
+        width, so the decision has to be one the whole DP group agrees on, and
+        ``running_bs`` was reduced in ``sync_dp_metadata`` before it got here.
+        That is what a second term used to buy: ``is_dummy_run`` and
+        ``is_prefill`` are both per-rank, and either splits the group into two
+        widths (measured -- V4-Flash-DSpark tp8 + DPA hung 8/8 on the first
+        real decode). Neither is reachable from an agreed batch, so neither is
+        available to get wrong. Safe on a dummy and on a prefill step for one
+        reason: ``Drafter.warmup_draft_graphs`` records on a real decode-shaped
+        context, and this pass is that shape whatever the target just did.
         """
-        mode = context.forward_mode
-        return mode is not None and mode.use_cudagraph and self.is_captured(running_bs)
+        return running_bs in self._cuda_graphs
 
     @property
     def _to_capture(self) -> Callable[..., Any]:
         """What a graph holds -- and so what a replay stands in for."""
         return self._forward_and_epilogue if self.capture_epilogue else self.forward
 
-    def run(self, running_bs: int, context, **staged) -> Any:
-        """Replay this batch size's graph, then whatever it did not cover.
+    def run(self, running_bs: int, **staged) -> Any:
+        """Replay this batch's graph, then whatever it did not cover.
 
-        Takes the step, not just its shape: a recording stands in for the branch
-        the flavor took while it was made, and a dummy took a different one --
-        ``warmup`` asserts it ran on a real context precisely so the recording
-        holds the real branch. Refusing the padding is not enough, because a
-        dummy's own batch can be a captured size on its own.
+        The batch is the whole argument. `running_bs` is the reduction's own
+        answer rounded on a ladder every rank shares, so every rank answers
+        alike and nothing about the step needs to reach here -- see
+        :meth:`is_captured`.
+
+        What leaves here is a VALUE. A replay hands back the tensors the
+        capture allocated, and the pool re-issues those addresses to sizes
+        captured later -- a reference does not hold them the way the eager
+        allocator's does. Only ``capture_epilogue`` can put a survivor in
+        there; the eager path allocates normally and needs no copy.
         """
         captured = (
-            self._cuda_graphs.get(running_bs)
-            if self._replays(running_bs, context)
-            else None
+            self._cuda_graphs.get(running_bs) if self.is_captured(running_bs) else None
         )
         if captured is None:
             out = self._to_capture(running_bs, **staged)
         else:
             graph, out = captured
             graph.replay()
+            if self.capture_epilogue:
+                out = _owned(out)
         return (
             out
             if self.capture_epilogue

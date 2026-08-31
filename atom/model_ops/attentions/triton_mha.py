@@ -41,8 +41,8 @@ class TritonMHAMetadataBuilder(AiterAttentionMetadataBuilder):
     for both prefill and decode.
     """
 
-    def prepare_prefill(self, batch: ScheduledBatch):
-        attn_metadata, positions = super().prepare_prefill(batch)
+    def prepare_prefill(self, batch: ScheduledBatch, running_bs: int):
+        attn_metadata, positions = super().prepare_prefill(batch, running_bs)
 
         # When there are no cached tokens, the base builder leaves
         # `block_tables=None` because AiterBackend's prefill consumes raw q/k/v
@@ -70,7 +70,8 @@ class TritonMHAMetadataBuilder(AiterAttentionMetadataBuilder):
                 # raw K/V as a kv_cache. row i = [cu_seqlens_k[i], ...,
                 # cu_seqlens_k[i]+max-1].
                 cu_k = attn_metadata.cu_seqlens_k
-                num_seqs = cu_k.shape[0] - 1
+                # `cu_k` is padded past them; this table is one row per request.
+                num_seqs = batch.total_seqs_num_prefill
                 offsets = cu_k[:num_seqs]
                 attn_metadata.block_tables = offsets.unsqueeze(1) + torch.arange(
                     attn_metadata.max_seqlen_k, dtype=torch.int32, device=cu_k.device

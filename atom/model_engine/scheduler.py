@@ -148,19 +148,39 @@ class ScheduledBatch:
         self.num_bonus = np.asarray(
             [seq.num_bonus_tokens for seq in seqs.values()], dtype=np.int32
         )
-        self.per_req_cache_groups = [
-            seq.per_req_cache_group
+        # One entry per state-holding seq: that seq's whole slot set, in
+        # allocation order. `[0]` is the committed state and `[1:]` is
+        # speculation rollback, one slot per speculated token. The sets are not
+        # adjacent and no backend may reconstruct them by arithmetic on a base
+        # — see `StateSlotPool`.
+        # Gated on `state_slot >= 0`, not on the list being non-empty: a seq
+        # whose committed slot was never claimed carries the -1 sentinel in a
+        # one-element list, which is truthy, and letting it through would shift
+        # every list positionally aligned with this one.
+        state_seqs = [
+            seq
             for seq in seqs.values()
-            if seq.has_per_req_cache and seq.per_req_cache_group >= 0
+            if seq.has_per_req_cache and seq.state_slot >= 0
         ]
-        # Read-side twin of the above, positionally aligned with it: the group
-        # this forward takes its incoming state from. Differs only on the one
-        # forward after a state fork; -1 elsewhere, which attention backends
-        # read as "same as the write group".
-        self.state_fork_srcs = [
-            seq.state_fork_src
-            for seq in seqs.values()
-            if seq.has_per_req_cache and seq.per_req_cache_group >= 0
+        self.state_slots = [seq.state_slots for seq in state_seqs]
+        # Column 0 broken out, because it is what every non-speculative backend
+        # wants and rebuilding it per step in each of them would cost the same
+        # Python loop several times over.
+        self.state_slots_committed = [seq.state_slot for seq in state_seqs]
+        # Read-side twin of the committed column, positionally aligned with it:
+        # the slot this forward takes its incoming state from. Differs only on
+        # the one forward after a state fork; -1 elsewhere, which attention
+        # backends read as "same as the write slot".
+        self.state_fork_srcs = [seq.state_fork_src for seq in state_seqs]
+        # Midstep checkpoints this forward must write, `[(slot, position)]` per
+        # seq, positionally aligned with `state_slots` like the fork sources
+        # above. A list per seq, not one entry: a readable backend takes every
+        # position the chunk covers rather than only the one it ends on.
+        # Positions are absolute prompt offsets; the backend rebases them onto
+        # the step's own tokens, which is the only frame its intermediates are
+        # in. Empty everywhere except a `readable_midstep` prefill.
+        self.state_save_all = [
+            [(g, p) for g, p, _h in seq.midstep_reservations] for seq in state_seqs
         ]
         # Physical moves are drained once per real batch.
         self.state_maintenance_ops = (
@@ -297,20 +317,10 @@ class ScheduledBatch:
 
         self.is_dummy_run = is_dummy_run
         self.num_spec_step = num_spec_step
-        self.num_spec_query_tokens = num_spec_step + 1
         # DSpark RAGGED (paper §5.2): per-request decode query lengths [bs]
         # (ell_r + 1). None unless _dspark_apply_ragged set it this step; when
         # set, consumers use it (per-seq) instead of the scalar above.
         self.dynamic_spec_query_tokens_per_req = None
-
-        # DSpark DP graph-shape sync (see model_runner._apply_dspark_shape_max):
-        # DP-max decode bs / ragged token total, so every DP rank replays the same
-        # cudagraph shape. None outside DSpark-under-DP steps.
-        self.dspark_dp_bs = None
-        self.dspark_dp_total_tokens = None
-        # Flat PIECEWISE replay token count for this decode step (set in
-        # prepare_inputs). None when N/A -> consumers use bs*max_seqlen_q.
-        self.dynamic_num_tokens_pad = None
 
         # Detailed attention aggregates (set by Scheduler.compute_detailed_aggregates
         # when profiling is active and ATOM_ENABLE_DETAILED_ANNOTATION is set).
@@ -344,6 +354,10 @@ class ScheduledBatch:
         Decode batches always do. A pure-prefill batch yields a token only
         when at least one seq is on its final chunk; a batch of middle chunks
         produces nothing.
+
+        A DP-sync dummy answers True and must: reporting lags a step, so the
+        dummy is what flushes the last real one. Skip its `postprocess` and
+        the request waking up after it has an anchor on neither side.
         """
         if self.total_seqs_num_decode > 0:
             return True
@@ -534,6 +548,7 @@ class Scheduler:
             enable_prefix_caching=config.enable_prefix_caching,
             enable_log_stats=config.enable_log_stats,
             throughput_log_interval_s=config.throughput_log_interval,
+            pool_pressure=self.block_manager.pool_pressure,
         )
         if config.enable_prefix_caching:
             self.engine_stats.block_manager = self.block_manager
@@ -900,18 +915,27 @@ class Scheduler:
         # "No slots ever existed" is the permanent case, distinguished from
         # "all busy" by the pool's total capacity.
         # An empty free list means either "all slots in use" — which the
-        # schedule loop handles by waiting — or "no slots were ever created",
-        # the permanent case, and only that one is worth warning about.
+        # schedule loop handles by waiting — or "the pool can never hold one
+        # request", the permanent case, and only that one is worth warning
+        # about.
+        #
+        # Measured against what one request needs, not against zero. A pool of
+        # 3 slots where a request takes `1 + num_spec` = 4 is as permanently
+        # unschedulable as an empty one; `== 0` would let it wait forever in
+        # silence. The group-shaped predicate this replaced divided before
+        # comparing, so it caught that case for free.
         if (
             seq.has_per_req_cache
-            and not bm.state.has_free()
-            and bm.num_per_req_cache_groups == 0
+            and not bm.state.has_free(bm.state_slots_per_req)
+            and bm.num_state_slots < bm.state_slots_per_req
         ):
             logger.warning(
-                "Request %s will never be scheduled: needs per-req cache "
-                "slot but no slots were allocated (max_num_seqs=0 for "
-                "this model type).",
+                "Request %s will never be scheduled: needs %d per-req cache "
+                "slot(s) but the pool holds %d (max_num_seqs=0 for this model "
+                "type, or --num-speculative-tokens too high for it).",
                 seq.id,
+                bm.state_slots_per_req,
+                bm.num_state_slots,
             )
 
     def take_rejected(self) -> list[Sequence]:
@@ -1214,14 +1238,17 @@ class Scheduler:
         total_tokens_num_prefill = sum(num_scheduled_tokens)
 
         if num_seqs_prefill > 0:
+            # A cursor, not a hit count: it starts at the prefix-cache hit and
+            # then advances by each finished chunk, so a chunked prompt logs the
+            # same req_id repeatedly with this climbing by the previous `new`.
+            # Logged as "done" so those repeats don't read as a growing hit.
             num_cached_tokens_list = [
                 seq.num_cached_tokens for seq in scheduled_seqs.values()
             ]
-            cached_per_req = [s.num_cached_tokens for s in scheduled_seqs.values()]
             logger.info(
                 f"Scheduled prefill batch: {num_seqs_prefill} reqs, "
                 f"{total_tokens_num_prefill} new tokens "
-                f"(cached: {cached_per_req}, new: {num_scheduled_tokens}), "
+                f"(done: {num_cached_tokens_list}, new: {num_scheduled_tokens}), "
                 f"req_ids: {tuple(scheduled_seqs.keys())}"
             )
             self.prev_prompt = True
@@ -1249,6 +1276,19 @@ class Scheduler:
                     next_token_ids.append(
                         -1 if end >= seq.num_tokens else int(seq.token_ids[end])
                     )
+
+            # Reserve midstep checkpoint destinations for the chunks just
+            # settled. Here rather than inside `_finalize_prefill_chunk`
+            # because a reservation takes a slot off the free list, and
+            # admission for this pass only finishes above — planning any
+            # earlier would let a checkpoint's destination compete with a
+            # request still to be let in. The batch below snapshots what this
+            # leaves on each seq.
+            for i, seq in enumerate(scheduled_seqs.values()):
+                start = num_cached_tokens_list[i]
+                self.block_manager.plan_midstep(
+                    seq, start, start + int(num_scheduled_tokens[i])
+                )
 
             prefill_batch = ScheduledBatch(
                 seqs=scheduled_seqs,
@@ -1405,7 +1445,7 @@ class Scheduler:
         """Clear the fork flags the batch just snapshotted.
 
         A fork describes one forward: the batch carries `state_fork_src`, and
-        every later batch for the same seq must read and write the same group
+        every later batch for the same seq must read and write the same slot
         again. Cleared here rather than in the batch constructor so the snapshot
         stays free of side effects on Sequence.
         """
@@ -1623,7 +1663,7 @@ class Scheduler:
            position this seq itself was seen to want), shortening to the
            previous rung; `BlockManager.checkpoint_cut` owns the arithmetic, so
            that it cannot drift from the rule deciding what actually gets kept.
-        2. The forward carrying a fork has to fill the request's new group by
+        2. The forward carrying a fork has to fill the request's new slot by
            itself. If the budget left a chunk too short for that, drop the fork
            rather than the request — unless the source is shared with another
            request forking off it this step, which rules out taking it over. Then
@@ -1655,7 +1695,7 @@ class Scheduler:
         0 means "do not checkpoint here", for any of three reasons:
 
         - the request stops on this step, so there is nothing after it: no
-          forward to fork into the group a checkpoint would hand away, and no
+          forward to fork into the slot a checkpoint would hand away, and no
           batch to issue a copy on either;
         - the seq is still on its prompt, where the prefill call site has
           already decided using the prompt's own remainder;
@@ -1674,7 +1714,7 @@ class Scheduler:
         destination is complete when the copy lands, so any decode step will do.
 
         Otherwise plain decode carries exactly one token, and whether that is
-        enough to fill a fresh group is the backend's `min_fork_tokens` to say.
+        enough to fill a fresh slot is the backend's `min_fork_tokens` to say.
         """
         if finished or seq.type != SequenceType.DECODE:
             return 0
@@ -1706,11 +1746,20 @@ class Scheduler:
             # `block_size * dcp_world_size` tokens — so scaling by block_size
             # would under-report by the DCP factor.
             hbs = self.block_manager.hash_block_size
+            # The reuse ceiling, mirroring `can_allocate`'s match loop, which
+            # runs over `range(n_hash_blocks - 1)`: prefill must forward at
+            # least one block to produce sampler logits, so the trailing block
+            # is never a reuse candidate and no cache can be charged for it.
+            # Floored at 0 for a sequence shorter than one hash block, whose
+            # ceiling is genuinely zero — nothing about it is reusable.
+            n_hash_blocks = (seq.num_tokens + hbs - 1) // hbs
+            num_reusable_tokens = min(max(n_hash_blocks - 1, 0) * hbs, seq.num_tokens)
             self.engine_stats.update_cache(
                 seq.num_cached_tokens,
                 seq.num_tokens,
                 seq.num_compressed_hit_blocks * hbs,
                 seq.num_wanted_hit_blocks * hbs,
+                num_reusable_tokens,
             )
         num_batched_tokens += chunk
         seq.status = SequenceStatus.RUNNING
@@ -2478,7 +2527,7 @@ class Scheduler:
         Offload waiters already own allocated blocks. If a fresh request at the
         head cannot allocate while a completed waiter sits behind it, the waiter
         cannot finish and free blocks. Preserve FIFO order within the ready and
-        blocked groups.
+        blocked slots.
         """
         if not self.waiting or not (
             self.finished_recving_kv_req_ids or self.failed_recving_kv_req_ids

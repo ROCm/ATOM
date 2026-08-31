@@ -2861,6 +2861,14 @@ class FusedMoE(torch.nn.Module):
         self.custom_routing_function = custom_routing_function
         self.scoring_func = scoring_func
         self.e_score_correction_bias = e_score_correction_bias
+        if atom_config.fake_eplb and e_score_correction_bias is not None:
+            # The noaux_tc bias is added on top of the score, so a bias wider than
+            # the synthetic logits' gap (~3.16 after sqrtsoftplus) picks the top-k
+            # by itself -- and `--load_dummy` never writes it, leaving recycled
+            # garbage that collapses every token onto one EP rank. `del` first: a
+            # plain tensor cannot overwrite the parameter registered above.
+            del self.e_score_correction_bias
+            self.e_score_correction_bias = torch.zeros_like(e_score_correction_bias)
         self.activation = activation
         if config is not None:
             self.activation_situ_beta = getattr(config, "activation_situ_beta", None)
@@ -2966,7 +2974,7 @@ class FusedMoE(torch.nn.Module):
         _dp_shard = self.use_ep and atom_config.enable_dp_attention
         self.balance_router_logits = (
             init_balance_router_logits(
-                self.global_num_experts,
+                self.expert_layout.num_routed,
                 top_k,
                 self.ep_size if self.use_ep else 1,
                 self.dp_size if _dp_shard else 1,
@@ -4287,7 +4295,7 @@ class FusedMoE(torch.nn.Module):
         if use_dp_gather_scatter:
             ctx = get_forward_context()
             dp_group = get_dp_group()
-            dp_eager_mode = not ctx.context.dp_uniform_decode
+            dp_eager_mode = not ctx.context.running_tokens_are_unified
 
             from atom.utils.tbo.ubatching import tbo_active
 

@@ -180,7 +180,8 @@ The `Sequence` class (in `atom/model_engine/sequence.py`) is the central data st
 | `num_prompt_tokens` | `int` | Length of the original prompt |
 | `num_tokens` | `int` (property) | Total length including generated tokens |
 | `block_table` | `list[int]` | KV cache block IDs allocated to this sequence |
-| `per_req_cache_group` | `int` | Per-request stateful-attention slot index (currently used by hybrid Qwen3-Next / Qwen3.5 GDN layers; future stateful attentions plug in via the same mechanism); `-1` if unallocated or not a stateful-attention model |
+| `state_slots` | `list[int]` | Every per-request stateful-attention slot the sequence holds: `[0]` committed, `[1:]` speculation rollback (Qwen3-Next / Qwen3.5 GDN layers, Kimi-K3 KDA, the DeepSeek-V4 compressor ring; future stateful attentions plug in via the same mechanism). Empty if unallocated or not a stateful-attention model |
+| `state_slot` | `int` (property) | `state_slots[0]`, or `-1` — the slot the forward reads and writes |
 | `status` | `SequenceStatus` | Current lifecycle state |
 | `type` | `SequenceType` | Current execution type |
 | `temperature` | `float` | Sampling temperature |
