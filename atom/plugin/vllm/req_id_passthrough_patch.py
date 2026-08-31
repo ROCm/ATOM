@@ -96,9 +96,15 @@ def _wrap_execute_dummy_batch() -> bool:
     try:
         from vllm.v1.worker.gpu_worker import Worker
     except ImportError as e:
+        logger.debug(
+            "ATOM vLLM req_id passthrough patch: Worker unavailable (%s), skip",
+            e,
+        )
+        return False
+    except Exception as e:  # noqa: BLE001 - a broken vLLM must not abort registration
         logger.warning(
-            "ATOM plugin: cannot import vLLM Worker to mark DP dummy batches "
-            "(%s); DeepSeek-V4 state writes on an idle rank will not be skipped",
+            "ATOM plugin: importing vLLM Worker failed unexpectedly (%s); "
+            "DeepSeek-V4 state writes on an idle rank will not be skipped",
             e,
         )
         return False
@@ -130,7 +136,7 @@ def apply_vllm_req_id_passthrough_patch() -> bool:
         )
     try:
         from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-    except ImportError as e:  # pragma: no cover - import guard
+    except Exception as e:  # noqa: BLE001  # pragma: no cover - import guard
         logger.debug(
             "ATOM vLLM req_id passthrough patch: GPUModelRunner unavailable (%s), "
             "skip",
