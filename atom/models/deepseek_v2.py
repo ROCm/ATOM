@@ -1733,9 +1733,16 @@ def sparse_attn_indexer(
             # into dcp_sparse_kv_indptr_buffer for this layer's attention. The
             # row unit is the query token, so each MTP draft position gets its
             # own compacted region.
+            # Cover the padded row count, not just the scheduled one: the
+            # attention kernel reads dcp_sparse_kv_indptr_buffer[: B + 1] with B
+            # padded, and any row left over from the previous step makes that
+            # window non-monotonic. Padded rows hold no top-k, so -1 them first
+            # -- the filter's only validity guard is `tok >= 0`.
+            num_index_tokens = topk_indices.shape[0]
+            topk_indices[num_decode_tokens:num_index_tokens].fill_(-1)
             triton_filter_and_convert_dcp_index(
                 attn_metadata.token_to_seq_idxs,
-                num_decode_tokens,
+                num_index_tokens,
                 attn_metadata.block_tables,
                 topk_indices,
                 dcp_rank,
