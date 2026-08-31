@@ -24,7 +24,7 @@ def tbo_enabled() -> bool:
 
 # =====================================================================
 # DP-side TBO helpers (formerly ModelRunner._local_tbo_precompute and
-# the inline sync block inside ModelRunner._preprocess).
+# the inline sync block inside ForwardMode.decide).
 # =====================================================================
 
 
@@ -175,6 +175,11 @@ class DPSyncResult:
 
     # [dp_size] int32 CPU tensor — each rank's input token count.
     num_tokens_across_dp: torch.Tensor
+    # DP-MAX of the scheduled SEQUENCE count -- the companion to
+    # `num_tokens_across_dp` in the other unit. Reduced on EVERY step, not just
+    # uniform decode: a captured graph holds its collective at one batch, so a
+    # per-rank count is precisely what splits the group into two widths.
+    max_bs_across_dp: int
     # True iff ANY rank has at least one prefill seq this step.
     any_rank_has_prefill: bool
     # True iff TBO on AND OR(meets_min_tokens) AND AND(can_split) AND uniform.
@@ -184,17 +189,11 @@ class DPSyncResult:
     tbo_collective_active: bool
     # (ub0_max, ub1_max) across DP — only set when tbo_collective_active.
     ub_max_tokens_across_dp: tuple[int, int] | None
-    # DP-MAX of the DSpark decode shape (q, decode_bs, total_tokens) — only set when
-    # ``dspark_shape`` was passed in (DSpark active + DP). Folded into this
-    # packed all_gather so DSpark's graph-shape sync no longer needs its own
-    # separate all_reduce (halves the per-step DP round-trips).
-    dspark_shape_max: tuple[int, int, int] | None = None
-    # True iff EVERY DP rank is running a dummy forward this step (AND-reduce of
-    # per-rank is_dummy). Used to gate DSpark cudagraph dummy-replay: an all-dummy
-    # step has no real rank replaying to rendezvous with, so all ranks must stay
-    # eager (vLLM never runs an all-idle forward). Only meaningful when
-    # ``dspark_shape`` was passed (DSpark + DP); False otherwise.
-    any_dummy: bool = False
+    # DP-MAX of the per-seq decode length — only set when ``max_seqlen_q`` was
+    # passed in (a block drafter under DP). Folded into this packed all_gather so
+    # the graph-shape sync no longer needs its own separate all_reduce (halves
+    # the per-step DP round-trips).
+    max_seqlen_q_across_dp: int | None = None
 
 
 def sync_dp_metadata(
@@ -202,64 +201,66 @@ def sync_dp_metadata(
     dp_group,
     dp_size: int,
     scheduled_tokens: int,
+    scheduled_bs: int,
     is_prefill: bool,
     tbo_on: bool,
     local_meets_min_tokens: bool = False,
     local_can_split: bool = False,
     local_ub_tokens: tuple[int, int] = (0, 0),
-    dspark_shape: tuple[int, int, int] | None = None,
-    local_is_dummy: bool = False,
+    max_seqlen_q: int | None = None,
 ) -> DPSyncResult:
     """Single packed DP all_gather over all per-rank scalars a decode/prefill
     step needs synchronized: DP token padding, the prefill fan-out, the
     cross-DP TBO gate, and (when active) the DSpark graph-shape MAX.
 
-    DSpark folds its [q, bs, total_tokens] shape sync in here too (3 extra
-    fields), so the step issues one collective instead of two.
+    A block drafter folds its per-seq length sync in here too (one extra field),
+    so the step issues one collective instead of two.
 
     Pre-Plan-B this required up to 3 separate all_reduces per step
     (``get_dp_padding`` / this sync / a third inside
     ``UBatchWrapper``). Now one all_gather of ``n_fields`` int32 values
-    per rank suffices. When TBO is off only the first 2 fields are
-    exchanged (saves 60 % payload + skips :func:`local_tbo_precompute`
+    per rank suffices. When TBO is off only the first 3 fields are
+    exchanged (saves 57 % payload + skips :func:`local_tbo_precompute`
     at the call site).
 
     Layout (``sync`` is ``[n_fields, dp_size]``):
 
-      row 0 : scheduled_tokens        -> num_tokens_across_dp
-      row 1 : is_prefill (0/1)         -> any_rank_has_prefill (OR)
-      row 2 : meets_min_tokens (0/1)   -> OR  -> any rank reached the min-token bar [TBO only]
-      row 3 : can_split (0/1)          -> AND -> every rank can split              [TBO only]
-      row 4 : ub0_tokens               -> ub_max_tokens_across_dp[0]              [TBO only]
-      row 5 : ub1_tokens               -> ub_max_tokens_across_dp[1]              [TBO only]
-      row k+0 : dspark q               -> dspark_shape_max[0] (MAX)     [DSpark only]
-      row k+1 : dspark decode_bs       -> dspark_shape_max[1] (MAX)     [DSpark only]
-      row k+2 : dspark total_tokens    -> dspark_shape_max[2] (MAX)     [DSpark only]
+      row 0 : scheduled_tokens         -> num_tokens_across_dp
+      row 1 : scheduled_bs             -> max_bs_across_dp (MAX)
+      row 2 : is_prefill (0/1)         -> any_rank_has_prefill (OR)
+      row 3 : meets_min_tokens (0/1)   -> OR  -> any rank reached the min-token bar [TBO only]
+      row 4 : can_split (0/1)          -> AND -> every rank can split              [TBO only]
+      row 5 : ub0_tokens               -> ub_max_tokens_across_dp[0]              [TBO only]
+      row 6 : ub1_tokens               -> ub_max_tokens_across_dp[1]              [TBO only]
+      row k+0 : max_seqlen_q           -> max_seqlen_q_across_dp (MAX)  [DSpark only]
+
+    Rows 0 and 1 are the same batch in ATOM's two units; both ride this one
+    collective because agreeing on only one of them still leaves two shapes.
 
     Gate: ``active = OR(meets_min_tokens) AND AND(can_split) AND uniform``.
 
-    ``dspark_shape`` folds DSpark's per-step graph-shape sync (the DP-MAX of
-    (q, decode_bs, total_tokens) from ``_dspark_local_shape``) into this same
-    packed all_gather. It is global-config gated (DSpark on + DP), so every
-    rank appends the same 3 fields and the payload stays symmetric.
+    ``max_seqlen_q`` folds a block drafter's per-step graph-shape sync into this
+    same packed all_gather. It is global-config gated (DSpark on + DP), so every
+    rank appends the same field and the payload stays symmetric.
+
+    Neither the batch nor the token total needs a row of its own here: rows 1 and
+    0 already carry them, and a step that reaches the reduction with every rank
+    decoding has `scheduled_tokens` == its decode total on every rank.
     """
-    tbo_fields = 6 if tbo_on else 2
-    dspark_on = dspark_shape is not None
-    # +1 extra DSpark field: per-rank is_dummy (OR-reduced -> any_dummy).
-    n_fields = tbo_fields + (4 if dspark_on else 0)
+    tbo_fields = 7 if tbo_on else 3
+    dspark_on = max_seqlen_q is not None
+    n_fields = tbo_fields + (1 if dspark_on else 0)
     local = torch.zeros(n_fields, dtype=torch.int32, device="cpu")
     local[0] = scheduled_tokens
-    local[1] = 1 if is_prefill else 0
+    local[1] = scheduled_bs
+    local[2] = 1 if is_prefill else 0
     if tbo_on:
-        local[2] = 1 if local_meets_min_tokens else 0
-        local[3] = 1 if local_can_split else 0
-        local[4] = local_ub_tokens[0]
-        local[5] = local_ub_tokens[1]
+        local[3] = 1 if local_meets_min_tokens else 0
+        local[4] = 1 if local_can_split else 0
+        local[5] = local_ub_tokens[0]
+        local[6] = local_ub_tokens[1]
     if dspark_on:
-        local[tbo_fields + 0] = dspark_shape[0]
-        local[tbo_fields + 1] = dspark_shape[1]
-        local[tbo_fields + 2] = dspark_shape[2]
-        local[tbo_fields + 3] = 1 if local_is_dummy else 0
+        local[tbo_fields + 0] = max_seqlen_q
 
     gathered = [
         torch.empty(n_fields, dtype=torch.int32, device="cpu") for _ in range(dp_size)
@@ -268,7 +269,8 @@ def sync_dp_metadata(
     sync = torch.stack(gathered, dim=1)  # [n_fields, dp_size]
 
     num_tokens_across_dp = sync[0]
-    any_rank_has_prefill = bool(sync[1].any())
+    max_bs_across_dp = int(sync[1].max())
+    any_rank_has_prefill = bool(sync[2].any())
     tbo_collective_active = False
     ub_max_tokens_across_dp: tuple[int, int] | None = None
     if tbo_on:
@@ -277,40 +279,33 @@ def sync_dp_metadata(
         # that rank would run 1 ubatch while peers run 2 → per-ubatch collective
         # size mismatch → RCCL hang. Under-filled-but-splittable ranks are then
         # force-split (see maybe_create_ubatch_slices force=True) to stay aligned.
-        tbo_collective_active = bool(sync[2].any()) and bool(sync[3].all())
+        tbo_collective_active = bool(sync[3].any()) and bool(sync[4].all())
         # Mixed-mode guard: ALWAYS require a uniform batch mode (all prefill or
         # all decode) across DP. A prefill rank running 2 ubatches alongside a
         # decode rank running 2 ubatches still issues different collectives per
         # ubatch → hang. (Previously gated behind require_uniform_mode; with the
         # OR-reduce this must be unconditional.)
         if tbo_collective_active:
-            prefill_rank_count = int(sync[1].sum())
+            prefill_rank_count = int(sync[2].sum())
             uniform_mode = prefill_rank_count == 0 or prefill_rank_count == dp_size
             tbo_collective_active = uniform_mode
         if tbo_collective_active:
             ub_max_tokens_across_dp = (
-                int(sync[4].max()),
                 int(sync[5].max()),
+                int(sync[6].max()),
             )
 
-    dspark_shape_max: tuple[int, int, int] | None = None
-    any_dummy = False
+    max_seqlen_q_across_dp: int | None = None
     if dspark_on:
-        dspark_shape_max = (
-            int(sync[tbo_fields + 0].max()),
-            int(sync[tbo_fields + 1].max()),
-            int(sync[tbo_fields + 2].max()),
-        )
-        # OR-reduce: True if ANY rank is a dummy this step.
-        any_dummy = bool(sync[tbo_fields + 3].any())
+        max_seqlen_q_across_dp = int(sync[tbo_fields + 0].max())
 
     return DPSyncResult(
         num_tokens_across_dp=num_tokens_across_dp,
+        max_bs_across_dp=max_bs_across_dp,
         any_rank_has_prefill=any_rank_has_prefill,
         tbo_collective_active=tbo_collective_active,
         ub_max_tokens_across_dp=ub_max_tokens_across_dp,
-        dspark_shape_max=dspark_shape_max,
-        any_dummy=any_dummy,
+        max_seqlen_q_across_dp=max_seqlen_q_across_dp,
     )
 
 

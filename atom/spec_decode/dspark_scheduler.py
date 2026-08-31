@@ -21,7 +21,7 @@ paper Appendix A), not a perf optimization — see ``_GREEDY_EARLY_STOP``.
 
 from __future__ import annotations
 
-from typing import Sequence
+from collections.abc import Sequence
 
 import torch
 
@@ -326,32 +326,6 @@ def resolve_q_buckets(spec: str, max_q: int) -> list[int]:
             out.add(v)
     out.add(max_q)  # always keep the full bucket as fallback
     return sorted(out)
-
-
-def flat_bucket_fits(total_tokens: int, q: int, buckets) -> bool:
-    """Can a captured flat num_tokens bucket hold ``total_tokens`` at per-seq
-    bound ``q``?
-
-    The predicate ``ModelRunner._dynamic_num_tokens_pad`` searches with, split
-    out so the ragged shrink can ask it BEFORE rewriting the batch. When no
-    bucket matches, that lookup returns None and every caller falls back to
-    ``bs * max_seqlen_q`` -- a replay over MORE tokens than the ragged rebuild
-    populated, whose tail still holds the previous step's ids. Those reach the
-    draft's Markov transition-table lookup as out-of-range indices: a
-    device-side trap attributed to whatever kernel was in flight, nowhere near
-    the shrink that caused it.
-
-    Args:
-        total_tokens: real flat token total the step would carry.
-        q: per-seq length bound (``num_spec_query_tokens``). Non-positive never
-            matches -- it would make the divisibility test meaningless.
-        buckets: captured flat num_tokens buckets. Empty/None means no flat
-            bucket set exists (FULL rather than PIECEWISE cudagraphs, or
-            pre-warmup), so no ragged shrink is representable.
-    """
-    if q <= 0 or not buckets:
-        return False
-    return any(b >= total_tokens and b % q == 0 for b in buckets)
 
 
 def quantize_to_bucket(q: int, buckets: list[int]) -> int:

@@ -1020,7 +1020,12 @@ class GDNStateMixin:
         if prepare_block_tables:
             self.prepare_block_tables(batch)
 
+        # Prefill only: `prepare_prefill` pads this past the requests it
+        # scheduled, for a draft pass that follows. Decode's padding is older
+        # than that and everything below is written for it.
         query_start_loc = attn_metadata.cu_seqlens_q
+        if is_prefill:
+            query_start_loc = query_start_loc[: num_prefills + 1]
         nums_dict, batch_ptr, token_chunk_offset_ptr = None, None, None
         if not self.use_spec_decode or is_prefill:
             self.prepare_state_indices(batch, with_spec=False)
@@ -1414,8 +1419,9 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
     def prepare_prefill(  # type: ignore[override]
         self,
         batch: ScheduledBatch,
+        running_bs: int,
     ) -> GDNAttentionMetadata:
-        attn_metadata, positions = super().prepare_prefill(batch)
+        attn_metadata, positions = super().prepare_prefill(batch, running_bs)
         if batch.block_tables == []:
             attn_metadata.gdn_metadata = None
             return attn_metadata, positions
@@ -1438,16 +1444,20 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
     def prepare_decode(  # type: ignore[override]
         self,
         batch: ScheduledBatch,
-        bs: int,
+        running_bs: int,
+        running_tokens: int,
+        max_seqlen_q: int,
     ) -> GDNAttentionMetadata:
-        attn_metadata, positions = super().prepare_decode(batch, bs)
+        attn_metadata, positions = super().prepare_decode(
+            batch, running_bs, running_tokens, max_seqlen_q
+        )
         self.model_runner.forward_vars["cu_seqlens_q"].cpu[
-            bs:
+            running_bs:
         ] = batch.total_tokens_num_decode
         # we fill the attn_metadata cu_seqlens_q here since aiter attn won't calc it for decode
         attn_metadata.cu_seqlens_q = self.model_runner.forward_vars[
             "cu_seqlens_q"
-        ].copy_to_gpu(bs + 1)
+        ].copy_to_gpu(running_bs + 1)
 
         self._attach_gdn_decode_metadata(batch, attn_metadata)
         return attn_metadata, positions

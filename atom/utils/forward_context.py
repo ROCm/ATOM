@@ -83,21 +83,36 @@ class DPMetadata:
         # attn_metadata: Any,
         num_tokens: int,
         num_tokens_across_dp: torch.Tensor | None = None,
+        *,
+        unified: bool = False,
     ) -> "DPMetadata":
+        """Per-rank token counts for this pass, and the sizes derived from them.
 
+        Three ways to a table, and the caller picks by what it knows. Hand one
+        over and it is taken as given. Say `unified` and every rank runs
+        `num_tokens`, so it is that number repeated. Say neither and it is
+        discovered, at the cost of one CPU all_reduce.
+
+        `unified` cannot be checked here -- the assert below reads this rank's
+        own entry, which a repeated fill satisfies by construction. A wrong
+        claim surfaces later, as a fixed-size collective posted at mismatched
+        heights.
+        """
         assert parallel_config.data_parallel_size > 1
         dp_size = parallel_config.data_parallel_size
         dp_rank = parallel_config.data_parallel_rank
         batchsize = num_tokens
 
-        # If num_tokens_across_dp is None, it will be computed by all_reduce
-        # Otherwise, num_tokens_across_dp[dp_rank] should be equal to batchsize
-        assert (
-            num_tokens_across_dp is None or num_tokens_across_dp[dp_rank] == batchsize
+        # A supplied table already says what every rank runs: its own entry is
+        # this pass's height, and saying it again can only disagree.
+        assert num_tokens_across_dp is None or (
+            not unified and num_tokens_across_dp[dp_rank] == batchsize
         )
         if num_tokens_across_dp is None:
-            num_tokens_across_dp = DPMetadata.num_tokens_across_dp(
-                batchsize, dp_size, dp_rank
+            num_tokens_across_dp = (
+                torch.full((dp_size,), batchsize, dtype=torch.int32, device="cpu")
+                if unified
+                else DPMetadata.num_tokens_across_dp(batchsize, dp_size, dp_rank)
             )
         max_tokens_across_dp_cpu = torch.max(num_tokens_across_dp)
         cu_tokens_across_dp_cpu = torch.cumsum(num_tokens_across_dp, dim=0)
@@ -163,130 +178,292 @@ class SpecDecodeMetadata:
 
 @dataclass(frozen=True)
 class ForwardMode:
-    """Per-step dispatch, and the two batch sizes ATOM names.
+    """One step's shape, settled once, in the only two units ATOM has.
 
-    ``scheduled_bs`` is what this rank was handed; ``running_bs`` is what the
-    GPU is made to run. The second is DP-group-UNIFIED and that is its whole
-    point: MoE pads to it and a captured graph holds its collective at that
-    width, so a rank arriving with a different one hangs the group.
+    ``running_bs`` sizes everything per-sequence (attention above all);
+    ``running_tokens`` everything per-row (MoE above all). ``scheduled_*`` is
+    this rank's own, and what a result slices back to.
 
-    An op reads whichever its own tensors carry. They differ in one corner --
-    uniform decode running eager -- where MoE pads while attention keeps its
-    unpadded rows for aiter's ``t == t_slot``.
+    They are agreed across DP to different extents, and the difference is the
+    point. ``running_bs`` is agreed on EVERY step -- it is the reduction on a
+    ladder every rank shares -- because a captured graph holds its collective
+    at that batch and a rank arriving with another one hangs the group.
+    ``running_tokens`` is agreed exactly when ``running_tokens_are_unified``:
+    off it, MoE takes the variable-length gather, whose contract is that the
+    rows it was handed are the rows THIS rank scheduled, so a group height
+    there would claim rows nobody allocated. An over-wide per-sequence array
+    costs a few sentinel rows; an over-wide height is a contract break.
+
+    Nothing downstream recomputes a width. ``running_bs * q`` is NOT
+    ``running_tokens`` on a ragged step, and every site that rederived one from
+    the other is a site where the two came to disagree.
+
+    ``decide`` owns the whole chain -- the collective, adopting its reductions
+    onto the batch, the ladder, both widths -- because the steps are not
+    separable: the reduced query length rewrites the batch, and everything else
+    is read off it afterwards.
     """
 
     use_cudagraph: bool
-    scheduled_bs: int
-    running_bs: int
     is_prefill: bool
+    scheduled_bs: int
+    scheduled_tokens: int
+    running_bs: int
+    running_tokens: int
+    running_tokens_are_unified: bool
+    # Query rows per sequence this step. `num_spec_step + 1` unless a DSpark
+    # shrink cut it, then DP-MAX'd -- so it is the group's, like the widths.
+    max_seqlen_q: int
+    # A PIECEWISE recording exists at `running_tokens`, so this step may replay.
+    piecewise_captured: bool
+    # TBO's cross-DP AND, or the local answer on one rank -- there being no peer
+    # to veto it. Settled here so the gate has one source at every dp_size.
+    tbo_collective_active: bool
+    # What else the one per-step collective returned: per-rank token counts, the
+    # DSpark shape max. Not shape. None on a single rank.
+    sync: Any | None = None
 
     @classmethod
     def decide(
         cls,
         *,
-        is_prefill: bool,
-        scheduled_bs: int,
-        running_tokens: int,
-        dp_uniform_decode: bool,
+        batch,
+        dp_size: int,
+        dp_group,
         enforce_eager: bool,
         capture_sizes: list[int],
-        mtp_step: int = 1,
+        captured_tokens: list[int] | None,
+        is_block_drafter: bool,
+        tbo_on: bool,
+        local_tbo: tuple[bool, bool, int, int],
+        max_seqlen_q: int,
     ) -> "ForwardMode":
-        """Pick dispatch and the step's ``running_bs``. Any new force-eager
-        condition belongs here, not in caller-side checks."""
-        if is_prefill:
-            # Prefill is always eager, so nothing is padded and the two are the
-            # same number. Per-token sums ride cu_seqlens_q, not this.
-            return cls(
-                use_cudagraph=False,
+        """Run the step's DP collective and settle its shape from the result.
+
+        Any new force-eager condition belongs here, not in a caller-side check.
+        """
+        # Lazy: `atom.utils.tbo`'s package init reaches back into this module.
+        from atom.utils.tbo.ubatching import sync_dp_metadata
+
+        is_prefill = batch.total_tokens_num_prefill > 0
+        scheduled_tokens = batch.total_tokens_num
+        # The whole batch, never a per-kind count: `schedule` returns its
+        # prefill batch before it can add a decode row, so the two are equal
+        # today, and this is the one that survives a mixed batch.
+        scheduled_bs = batch.total_seqs_num
+        meets_min, can_split, ub0, ub1 = local_tbo
+
+        sync = None
+        if dp_size > 1:
+            sync = sync_dp_metadata(
+                dp_group=dp_group,
+                dp_size=dp_size,
+                scheduled_tokens=scheduled_tokens,
                 scheduled_bs=scheduled_bs,
-                running_bs=scheduled_bs,
-                is_prefill=True,
+                is_prefill=is_prefill,
+                tbo_on=tbo_on,
+                local_meets_min_tokens=meets_min,
+                local_can_split=can_split,
+                local_ub_tokens=(ub0, ub1),
+                # Only a block drafter needs the group to agree on it; every
+                # other flavor keeps its own and the two extra wire rows are
+                # not sent.
+                max_seqlen_q=max_seqlen_q if is_block_drafter else None,
             )
+            # The group's query length, taken BEFORE the rows are read off it:
+            # a rank still on its local q settles on a different `running_tokens`
+            # than its peers.
+            if sync.max_seqlen_q_across_dp is not None:
+                max_seqlen_q = sync.max_seqlen_q_across_dp
+            unified_bs = sync.max_bs_across_dp
+            tbo_collective_active = sync.tbo_collective_active
+            # One meaning and only one: every rank is decoding, so the group max
+            # pads them level and `scheduled_tokens` reduces to a decode count on
+            # every rank. A prefilling peer makes the step ragged across the
+            # group, and then each rank runs its own count through the
+            # variable-length gather.
+            unified = not sync.any_rank_has_prefill
+        else:
+            # One rank pads to nobody, so it has one height by construction, and
+            # its TBO answer stands unvetoed.
+            unified_bs, unified = scheduled_bs, True
+            tbo_collective_active = tbo_on and meets_min and can_split
 
-        # The sequences the step will run, recovered from the token count:
-        # DP-unified in uniform mode (`running_tokens` is the group max, set in
-        # ModelRunner._preprocess), local-equivalent otherwise.
-        unified_bs = (running_tokens + mtp_step - 1) // mtp_step
+        # ---- the batch: one rule, every step ---------------------------
+        # `unified_bs` is the reduction's own answer and the ladder is a rule
+        # every rank shares, so this is DP-agreed by construction -- not by a
+        # case analysis a future branch could get wrong. That is the whole
+        # property: a graph key, a draft pass and an attention plan all read
+        # this one field and cannot end up holding two widths.
+        #
+        # One lookup answers both of the step's questions. `capture_sizes` is
+        # ascending int32 (`ModelRunner.capture_sizes_np`, sorted where it is
+        # built and never mutated), so the insertion point IS the smallest size
+        # that holds the batch, and running off the end IS "no recording can".
+        rung = int(np.searchsorted(capture_sizes, unified_bs))
+        on_ladder = rung < len(capture_sizes)
+        running_bs = int(capture_sizes[rung]) if on_ladder else unified_bs
 
-        if not dp_uniform_decode:
-            # MoE goes through all_gatherv (variable-length, per-rank sizes),
-            # so pad_for_all_gather is never reached and there is nothing to
-            # unify. Running at the scheduled batch pads nothing.
-            return cls(
-                use_cudagraph=False,
-                scheduled_bs=scheduled_bs,
-                running_bs=scheduled_bs,
-                is_prefill=False,
-            )
+        # ---- dispatch: a different question, asked separately ----------
+        # Whether the TARGET replays. It no longer decides how wide anything
+        # is; when the batch answered four ways depending on this, `running_bs`
+        # was per-rank on two of them and every consumer had to know which.
+        use_cudagraph = not is_prefill and unified and not enforce_eager and on_ladder
 
-        # From here on uniform decode: MoE WILL pad_for_all_gather, so
-        # running_bs MUST be the same number on every rank.
-        if enforce_eager or unified_bs > capture_sizes[-1]:
-            # Eager under uniform decode, either forced or above the largest
-            # captured size. This is the one corner where the two differ:
-            # attention keeps its own scheduled batch while MoE pads to the
-            # unified one.
-            return cls(
-                use_cudagraph=False,
-                scheduled_bs=scheduled_bs,
-                running_bs=unified_bs,
-                is_prefill=False,
-            )
-
-        # CUDAGraph: the smallest captured size that fits. Captured sizes are
-        # a static list every rank shares, so this is unified by construction.
+        running_tokens, piecewise_captured = cls._running_tokens(
+            is_prefill=is_prefill,
+            unified=unified,
+            running_bs=running_bs,
+            scheduled_tokens=scheduled_tokens,
+            num_tokens_across_dp=None if sync is None else sync.num_tokens_across_dp,
+            captured_tokens=captured_tokens,
+            is_block_drafter=is_block_drafter,
+            max_seqlen_q=max_seqlen_q,
+        )
         return cls(
-            use_cudagraph=True,
+            use_cudagraph=use_cudagraph,
+            is_prefill=is_prefill,
             scheduled_bs=scheduled_bs,
-            running_bs=next((x for x in capture_sizes if x >= unified_bs), unified_bs),
-            is_prefill=False,
+            scheduled_tokens=scheduled_tokens,
+            running_bs=running_bs,
+            running_tokens=running_tokens,
+            running_tokens_are_unified=unified,
+            max_seqlen_q=max_seqlen_q,
+            piecewise_captured=piecewise_captured,
+            tbo_collective_active=tbo_collective_active,
+            sync=sync,
         )
 
-    @property
-    def attn_tensors_are_padded(self) -> bool:
-        """True iff per-token attention tensors carry padding this step
-        (cudagraph today; update if other padded layouts are added)."""
-        return self.use_cudagraph
+    @staticmethod
+    def _running_tokens(
+        *,
+        is_prefill: bool,
+        unified: bool,
+        running_bs: int,
+        scheduled_tokens: int,
+        num_tokens_across_dp,
+        captured_tokens,
+        is_block_drafter: bool,
+        max_seqlen_q: int,
+    ) -> tuple[int, bool]:
+        """``(running_tokens, piecewise_captured)``.
+
+        `pad_for_all_gather` asserts the first equals the rows the tensor really
+        has, so it is not "the biggest count anyone reported": it is what THIS
+        forward will produce.
+        """
+        if not unified:
+            # Nothing padded the tensor -- the varlen gather sends each rank its
+            # own count -- so a height from the group would claim rows nobody
+            # allocated.
+            return scheduled_tokens, False
+        if is_prefill:
+            # Reachable on one rank only: a group of one is unified whatever it
+            # runs, while under DP any prefill clears `unified` above. Prompts
+            # are ragged, so no product recovers a height and this rank's own
+            # count is the whole answer.
+            return scheduled_tokens, False
+
+        # The batch was rounded onto the ladder AFTER the sync, so this runs rows
+        # no rank reported; group-agreed all the same, both factors having come
+        # out of the reduction.
+        q = max_seqlen_q
+        running_tokens = running_bs * q
+        if not captured_tokens:
+            return running_tokens, False
+        if not is_block_drafter:
+            # Rectangular layout: one row per (seq, query), which every per-token
+            # buffer spans and `slot_mapping[i * q + j]` addresses through. Anything
+            # under the product would leave the tail of that rectangle unwritten.
+            return running_tokens, running_tokens in captured_tokens
+
+        # Marker-driven layout: the rows are one flat run, so the width is the
+        # smallest recorded one that holds it, not a product -- q-divisible
+        # because the per-seq structures tile the run at that stride. Every rank
+        # is decoding here, so `scheduled_tokens` IS a decode count on each of
+        # them and row 0's reduction is the group's run. `None` is one rank.
+        run = (
+            scheduled_tokens
+            if num_tokens_across_dp is None
+            else int(num_tokens_across_dp.max())
+        )
+        recorded = next((n for n in captured_tokens if n >= run and n % q == 0), None)
+        if recorded is None:
+            # Nothing recorded holds the run, so forward it eagerly rather than
+            # claim a graph nobody made at this width.
+            return max(run, running_tokens), False
+        return recorded, True
 
     def assert_shape_contract(
         self,
         input_ids: "torch.Tensor",
         attn_metadata: "AttentionMetaData",
     ) -> None:
-        """Validate ``input_ids`` / ``slot_mapping`` against this ForwardMode.
+        """Tie what the builder published to what this step settled.
 
-        Skips prefill (variable-length) and cudagraph (graph-internal shape);
-        callers invoke unconditionally to keep dispatch decisions centralised.
+        Covers the PADDED step, which is the only one that can be wrong: a
+        width is either both units' or neither's, and every way they have come
+        apart -- a builder on a stale batch, a per-seq array widened while the
+        per-token ones were not -- shows up as one of the equalities below. The
+        version that skipped whenever ``running_bs != scheduled_bs`` exempted
+        exactly that case, so a mismatch reached the model and surfaced as lost
+        accuracy rather than as a failure here.
+
+        Shapes only, never values: reading a device tensor's contents on this
+        path is a D2H sync per step.
+
+        Prefill is still out. Its rows are the prompt's, so no product of a
+        batch and a query length describes them, and its per-seq tail is padded
+        for a following draft pass rather than for anything this step runs.
         """
-        if self.is_prefill or self.attn_tensors_are_padded:
+        if self.is_prefill or input_ids is None or attn_metadata is None:
             return
-        if (
-            input_ids is None
-            or attn_metadata is None
-            or attn_metadata.slot_mapping is None
-        ):
-            return
-        # Past the early-return nothing is padded, so the rows attention runs
-        # are exactly the scheduled ones.
-        max_q = attn_metadata.max_seqlen_q
-        expected = self.scheduled_bs * max_q
-        actual_in = input_ids.shape[0]
-        actual_slot = attn_metadata.slot_mapping.shape[0]
-        assert actual_in == expected, (
-            f"eager input_ids length {actual_in} != scheduled_bs*max_q="
-            f"{expected} ({self})"
+
+        def _rows(name):
+            t = getattr(attn_metadata, name, None)
+            return None if t is None else int(t.shape[0])
+
+        # `input_ids` is the argument, this rank's own rows -- the cudagraph
+        # branch re-slices the buffer to `running_tokens` itself.
+        assert input_ids.shape[0] == self.scheduled_tokens, (
+            f"input_ids length {input_ids.shape[0]} != scheduled_tokens="
+            f"{self.scheduled_tokens} ({self})"
         )
-        assert actual_slot == expected, (
-            f"eager slot_mapping length {actual_slot} != scheduled_bs*max_q="
-            f"{expected} ({self}); attn_metadata_builder used a stale bs"
+        assert self.scheduled_tokens <= self.running_tokens, (
+            f"running_tokens={self.running_tokens} is below the rows this rank "
+            f"scheduled ({self.scheduled_tokens}) ({self})"
         )
+        # Per-token: sized by `running_tokens`, the height everything per-row runs.
+        slot_rows = _rows("slot_mapping")
+        assert slot_rows in (None, self.running_tokens), (
+            f"slot_mapping length {slot_rows} != running_tokens="
+            f"{self.running_tokens} ({self}); the builder used another width"
+        )
+        # Per-sequence: sized by `running_bs`. `cu_seqlens_q` carries the extra
+        # boundary entry; the state slots are V4's and absent elsewhere.
+        cu_rows = _rows("cu_seqlens_q")
+        assert cu_rows in (None, self.running_bs + 1), (
+            f"cu_seqlens_q length {cu_rows} != running_bs+1="
+            f"{self.running_bs + 1} ({self})"
+        )
+        slot_out_rows = _rows("state_slot_out")
+        assert slot_out_rows in (None, self.running_bs), (
+            f"state_slot_out length {slot_out_rows} != running_bs="
+            f"{self.running_bs} ({self})"
+        )
+        # No rectangle assertion: `_running_tokens` deliberately returns a
+        # height ABOVE `running_bs * max_seqlen_q` when nothing recorded holds
+        # the run.
 
 
 def running_tokens_from_bs(bs: int, *, is_prefill: bool, attn_metadata) -> int:
-    """``running_tokens`` for a bridge that only knows a request count.
+    """``running_tokens`` for a BRIDGE that only knows a request count.
 
-    Prefill returns that count verbatim, which is NOT a height: prompt lengths
+    Native ATOM never calls this -- it reads `ForwardMode.running_tokens`. A
+    plugin bridge has no ForwardMode, so it reconstructs the rectangle here and
+    nowhere else.
+
+    Prefill returns the count verbatim, which is NOT a height: prompt lengths
     are ragged, so no multiplier recovers one, and a number below the real
     height just leaves the batch unpadded -- correct there, since a prefill
     all_gather is variable-length.
@@ -310,19 +487,20 @@ class Context:
     # The step's DP-unified padded shape. `running_bs` counts SEQUENCES (graph
     # identity, the draft's pad width), `running_tokens` the hidden_states rows
     # MoE pads to. Both stored, because the ratio is not always max_seqlen_q --
-    # a DSpark ragged step runs a flat bucket no rectangular bs*q recovers.
+    # a DSpark ragged step runs a packed width no rectangular bs*q recovers.
     running_bs: int = 0
     running_tokens: int = 0
     is_draft: bool = False
-    # True iff all DP ranks are running pure decode this step (DP-disabled
-    # case is treated as True). Mirrors vLLM's `uniform_decode` flag and
-    # gates DP-specific variable-length all_gather/scatter paths.
-    dp_uniform_decode: bool = True
-    # Single source of truth for cudagraph vs eager dispatch + the step's
-    # scheduled_bs / running_bs.
-    # Set by prepare_inputs via ForwardMode.decide(). None only on legacy
-    # paths that haven't been routed through it (run_model falls back to
-    # the original four-OR derivation in that case for back-compat).
+    # Every rank of the group is decoding, so `running_tokens` above is the
+    # group's number and not this rank's own. That is what picks MoE's
+    # fixed-size all_gather over the variable-length one, and so what makes a
+    # captured graph usable at all. One meaning, deliberately: it once also
+    # stood for "dp-attention is off", and readers needing the strong claim --
+    # `_can_use_dp_sharded_head` above all -- silently got the weak one.
+    running_tokens_are_unified: bool = True
+    # The step's whole shape decision. Set by `prepare_model` via
+    # `ForwardMode.decide`; None only on a capture context, which declares its
+    # shape rather than reading one.
     forward_mode: ForwardMode | None = None
     # Optional flat token ids for the current forward. Read by callbacks
     # invoked inside Dynamo-opaque custom ops (e.g. V4 MoE hash routing)
@@ -351,7 +529,7 @@ class Context:
         running_bs: int = 0,
         running_tokens: int = 0,
         is_draft: bool = False,
-        dp_uniform_decode: bool = True,
+        running_tokens_are_unified: bool = True,
         forward_mode: ForwardMode | None = None,
         input_ids: torch.Tensor | None = None,
         ubatch_token_offset: int = 0,
@@ -366,7 +544,7 @@ class Context:
         self.running_bs = running_bs
         self.running_tokens = running_tokens
         self.is_draft = is_draft
-        self.dp_uniform_decode = dp_uniform_decode
+        self.running_tokens_are_unified = running_tokens_are_unified
         self.forward_mode = forward_mode
         self.input_ids = input_ids
         self.ubatch_token_offset = ubatch_token_offset
@@ -552,8 +730,8 @@ class ForwardContext:
 
     ubatch_slices: list[Any] | None = None
 
-    # Cross-DP MAX of per-ubatch token counts, precomputed in
-    # ``ModelRunner._preprocess`` and propagated here so
+    # Cross-DP MAX of per-ubatch token counts, reduced in the step's one packed
+    # all_gather (``ForwardMode.decide``) and propagated here so
     # ``UBatchWrapper._compute_ub_graph_bs`` no longer needs its own
     # per-ubatch all_reduce. Shape: tuple of length N == len(ubatch_slices).
     # None when DP is off or when TBO is not active this step.

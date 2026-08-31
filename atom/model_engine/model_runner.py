@@ -98,7 +98,6 @@ from atom.utils.tbo import (
     UBatchWrapper,
     local_tbo_precompute,
     maybe_create_ubatch_slices,
-    sync_dp_metadata,
 )
 
 logger = logging.getLogger("atom")
@@ -413,6 +412,14 @@ class tokenIDProcessor:
         num_prev = len(prev_req_ids)
         num_cur = len(cur_req_ids)
 
+        # A fabricated batch carries nothing over -- and the DP-sync dummy
+        # reuses one id, so without this the next dummy matches it and reads a
+        # request that never existed out of `prev_token_ids`/`draft_token_ids`.
+        # Real ids are non-negative and never matched it either way.
+        if self.prev_batch.is_dummy_run:
+            none = np.empty(0, dtype=np.intp)
+            return TokenLocations(none, none, np.arange(num_cur, dtype=np.intp))
+
         prev_id_to_idx = dict(zip(prev_req_ids, range(num_prev)))
 
         deferred_curr = np.empty(num_cur, dtype=np.intp)
@@ -447,6 +454,7 @@ class tokenIDProcessor:
     def prepare_input_ids(
         self,
         batch: ScheduledBatch,
+        max_seqlen_q: int,
     ) -> torch.Tensor:
         """Prepare the input IDs for the current batch.
 
@@ -513,12 +521,13 @@ class tokenIDProcessor:
         num_deferred_seqs = len(deferred_curr_indices)
         num_new_seqs = len(new_curr_indices)
 
-        # `num_spec_query_tokens` is the single source of truth for the uniform
+        # `max_seqlen_q` is the single source of truth for the uniform
         # case (= mtp_k+1 for plain MTP, or the DSpark q-bucket when shrunk this
         # step); `dynamic_spec_query_tokens_per_req` overrides it per request
-        # when DSpark runs ragged. See `ScheduledBatch.num_spec_query_tokens`.
+        # when DSpark runs ragged. See `ForwardMode.max_seqlen_q`, which the
+        # step settles and the batch no longer carries.
         _per_req = getattr(batch, "dynamic_spec_query_tokens_per_req", None)
-        tokens_per_seq = int(batch.num_spec_query_tokens) if self.use_spec else 1
+        tokens_per_seq = max_seqlen_q if self.use_spec else 1
 
         # Receive and map bonus_list to current batch order
         self.num_rejected = batch.num_rejected
@@ -676,6 +685,12 @@ class ModelRunner:
         self._setup_device_and_distributed(rank, config)
 
         self.capture_sizes = [0]  # for eager fallback
+        # The same ladder as an ASCENDING int32 array, which is what
+        # `ForwardMode.decide` searches. Separate from the list because the list
+        # is re-sorted in both directions during capture; rebound (never
+        # mutated) once capture narrows it, so a search cannot read a transient
+        # order.
+        self.capture_sizes_np = np.asarray(self.capture_sizes, dtype=np.int32)
         # PIECEWISE cudagraph state, populated by capture_cudagraph. Empty when
         # capture never ran (enforce_eager), so the ragged-bucket paths no-op.
         self._piecewise_captured_tokens: set[int] = set()
@@ -1160,7 +1175,14 @@ class ModelRunner:
             logger.info(*args)
 
     def dummy_execution(self):
-        """Execute dummy decode batch for DP synchronization."""
+        """Execute dummy decode batch for DP synchronization.
+
+        Two mechanisms lean on the fabricated id being -1: this pass flushes
+        the previous real step's tokens (`prepare_sampled_ids` reports the
+        batch before), and its own land on the key the deferred flag then
+        overwrites. What -1 must NOT do is look like a request --
+        `get_token_locations`.
+        """
         has_drafter = hasattr(self, "drafter")
         mtp_k = self.drafter.mtp_k if has_drafter else 0
         mtp_factor = mtp_k + 1
@@ -2088,7 +2110,7 @@ class ModelRunner:
         """Create TBO ubatch slices when the collective DP decision is True.
 
         With the packed-reduce path the eligibility (local + cross-DP AND)
-        is decided in ``_preprocess``; here we just realise the split.
+        is decided in ``ForwardMode.decide``; here we just realise the split.
         """
         if not tbo_collective_active:
             return None
@@ -2112,161 +2134,50 @@ class ModelRunner:
             )
         return ubatch_slices
 
-    def _preprocess(
-        self,
-        batch: ScheduledBatch,
-        num_scheduled_tokens: np.ndarray | None = None,
-        dspark_shape: tuple[int, int, int] | None = None,
-    ):
-        """Per-step DP sync: token padding, prefill fan-out, TBO decision.
+    def _local_tbo_eligibility(
+        self, batch: ScheduledBatch
+    ) -> tuple[bool, bool, int, int]:
+        """This rank's TBO answer, and the PCP flags that ride with it.
 
-        Thin wrapper over :func:`atom.utils.tbo.sync_dp_metadata` (the
-        actual collective) and :func:`atom.utils.tbo.local_tbo_precompute`
-        (the rank-local TBO eligibility / per-ubatch token split).
-
-        ``dspark_shape`` (local q, decode_bs, total_tokens) folds DSpark's graph-shape
-        DP-MAX into this same all_gather so the two per-step collectives become
-        one; the reduced max is returned as the 7th tuple element for the caller
-        to apply via ``_apply_dspark_shape_max``.
-
-        Returns:
-            (running_tokens, num_tokens_across_dp, dp_uniform_decode,
-             max_tokens, tbo_collective_active, ub_max_tokens_across_dp,
-             dspark_shape_max)
+        `(meets_min_tokens, can_split, ub0_tokens, ub1_tokens)`. The first two
+        are reduced across DP inside the step's one packed all_gather -- OR and
+        AND respectively -- so this is the local half of that question, not a
+        decision. Sets the PCP+TBO routing flags as a side effect because they
+        come out of the same sizing.
         """
-        scheduled_tokens = batch.total_tokens_num
         is_prefill = batch.total_tokens_num_prefill > 0
-        tbo_on = self.config.enable_tbo
-        dp_size = self.config.parallel_config.data_parallel_size
+        if not self.config.enable_tbo:
+            self._pcp_tbo_balanced_active = False
+            self._pcp_bal_groups = None
+            return (False, False, 0, 0)
 
-        # Rank-local TBO precompute (needed for both dp==1 fast path and
-        # the cross-DP packed gather below). `meets_min_tokens` = this rank's
-        # prefill reached the min-token bar (e.g. 8k), OR-reduced across DP;
-        # `can_split` = structurally splittable, AND-reduced across DP.
-        local_meets_min_tokens, local_can_split, local_ub0, local_ub1 = (
-            False,
-            False,
-            0,
-            0,
+        local_tbo = local_tbo_precompute(
+            self.config, batch, is_prefill, np.asarray(batch.num_scheduled_tokens)
         )
-        if tbo_on:
-            if num_scheduled_tokens is None:
-                num_scheduled_tokens = np.asarray(batch.num_scheduled_tokens)
-            local_meets_min_tokens, local_can_split, local_ub0, local_ub1 = (
-                local_tbo_precompute(
-                    self.config, batch, is_prefill, num_scheduled_tokens
-                )
-            )
 
         # PCP+TBO prefill: split requests into two GROUPS at a request boundary
         # (never split a sequence's tokens), so each ubatch = "non-TBO PCP on a
         # request subset". Requires num_reqs >= 2 (request-boundary split needs
         # two non-empty groups); bs=1 falls back to non-TBO.
         pcp_size = self.config.prefill_context_parallel_size
-        # True for eligible PCP+TBO request-boundary split prefill; read by
-        # build_ubatch / run_model / prepare_prefill to route the per-group path.
+        # Read by build_ubatch / run_model / prepare_prefill to route the
+        # per-group path; reset every step so a stale value cannot route one.
         self._pcp_tbo_balanced_active = False
-        # Per-group descriptors; reset each step, set in prepare_inputs
-        # request-boundary-split branch. Guards run_model/build_ubatch against
-        # stale values.
         self._pcp_bal_groups = None
-        if tbo_on and is_prefill and pcp_size > 1 and not batch.is_dummy_run:
-            num_prefill_reqs = batch.total_seqs_num_prefill
-            n_prefill = batch.total_tokens_num_prefill
-            # Rough local sizing for TBO eligibility. PCP is always dp=1, so the
-            # dp_size<=1 fast path below returns local_eligible verbatim as
-            # tbo_collective_active; local_ub0/ub1 are only used by the dp>1
-            # sync path (never hit under PCP).
-            local_tokens = n_prefill // pcp_size
-            local_eligible = num_prefill_reqs >= 2 and local_tokens >= 2
-            local_ub0 = local_tokens // 2
-            local_ub1 = local_tokens - local_ub0
-            self._pcp_tbo_balanced_active = local_eligible
+        if is_prefill and pcp_size > 1 and not batch.is_dummy_run:
+            # PCP is always dp=1, so the single-rank path returns this verbatim
+            # as `tbo_collective_active`; ub0/ub1 are only read under dp > 1.
+            local_tokens = batch.total_tokens_num_prefill // pcp_size
+            eligible = batch.total_seqs_num_prefill >= 2 and local_tokens >= 2
+            ub0 = local_tokens // 2
+            local_tbo = (eligible, eligible, ub0, local_tokens - ub0)
+            self._pcp_tbo_balanced_active = eligible
+        return local_tbo
 
-        # PCP+TBO prefill: split requests into two GROUPS at a request boundary
-        # (never split a sequence's tokens), so each ubatch = "non-TBO PCP on a
-        # request subset". Requires num_reqs >= 2 (request-boundary split needs
-        # two non-empty groups); bs=1 falls back to non-TBO.
-        pcp_size = self.config.prefill_context_parallel_size
-        # True for eligible PCP+TBO request-boundary split prefill; read by
-        # build_ubatch / run_model / prepare_prefill to route the per-group path.
-        self._pcp_tbo_balanced_active = False
-        # Per-group descriptors; reset each step, set in prepare_inputs
-        # request-boundary-split branch. Guards run_model/build_ubatch against
-        # stale values.
-        self._pcp_bal_groups = None
-        if tbo_on and is_prefill and pcp_size > 1 and not batch.is_dummy_run:
-            num_prefill_reqs = batch.total_seqs_num_prefill
-            n_prefill = batch.total_tokens_num_prefill
-            # Rough local sizing for TBO eligibility. PCP is always dp=1, so the
-            # dp_size<=1 fast path below returns local_eligible verbatim as
-            # tbo_collective_active; local_ub0/ub1 are only used by the dp>1
-            # sync path (never hit under PCP).
-            local_tokens = n_prefill // pcp_size
-            local_eligible = num_prefill_reqs >= 2 and local_tokens >= 2
-            local_ub0 = local_tokens // 2
-            local_ub1 = local_tokens - local_ub0
-            self._pcp_tbo_balanced_active = local_eligible
-
-        if dp_size <= 1:
-            # Single-rank: TBO decision is purely local; no collective needed.
-            # Both bits must hold (reached min-tokens AND able to split).
-            # dp_uniform_decode=True mirrors the DP-disabled case in the
-            # multi-rank branch (`not enable_dp_attention` => True) and the
-            # Context default — otherwise single-GPU/TP-only decode would
-            # be forced into eager and lose the CUDAGraph decode path.
-            self._dspark_decode_replay = True
-            self._eplb_any_rank_has_prefill = None
-            # One rank pads to nobody, so running == scheduled here.
-            return (
-                scheduled_tokens,
-                None,
-                True,
-                scheduled_tokens,
-                local_meets_min_tokens and local_can_split,
-                None,
-                dspark_shape,
-            )
-
-        sync = sync_dp_metadata(
-            dp_group=get_dp_group().cpu_group,
-            dp_size=dp_size,
-            scheduled_tokens=scheduled_tokens,
-            is_prefill=is_prefill,
-            tbo_on=tbo_on,
-            local_meets_min_tokens=local_meets_min_tokens,
-            local_can_split=local_can_split,
-            local_ub_tokens=(local_ub0, local_ub1),
-            dspark_shape=dspark_shape,
-            local_is_dummy=bool(getattr(batch, "is_dummy_run", False)),
-        )
-
-        # Stash the DP-wide prefill OR for the EPLB prefill gate. Reused for free
-        # by on_forward_pass_end when the DP group == the migration (EP) group.
-        self._eplb_any_rank_has_prefill = sync.any_rank_has_prefill
-        max_tokens = int(sync.num_tokens_across_dp.max())
-        dp_uniform_decode = (not sync.any_rank_has_prefill) or (
-            not self.config.enable_dp_attention
-        )
-        # Only here does the count stop being this rank's own: under uniform
-        # decode every rank pads to the same max for a fixed-size all_gather.
-        # The variable-length path keeps its own, so the two stay equal.
-        running_tokens = max_tokens if dp_uniform_decode else scheduled_tokens
-
-        self._dspark_decode_replay = dp_uniform_decode
-
-        return (
-            running_tokens,
-            sync.num_tokens_across_dp,
-            dp_uniform_decode,
-            max_tokens,
-            sync.tbo_collective_active,
-            sync.ub_max_tokens_across_dp,
-            sync.dspark_shape_max,
-        )
-
-    def _dspark_apply_q_bucket(self, batch: ScheduledBatch) -> None:
-        """Shrink this decode step's verify length to one CUDA-graph bucket q.
+    def _dspark_apply_q_bucket(self, batch: ScheduledBatch) -> int | None:
+        """Shrink this decode step's verify length to one CUDA-graph bucket q,
+        and return it -- or None when nothing shrank and the step keeps the
+        configured `num_spec_step + 1`.
 
         q = quantize_up(max ell_i + 1) over the batch (ell_i = last step's
         per-req schedule). All seqs then forward q tokens (anchor + q-1 drafts)
@@ -2277,16 +2188,14 @@ class ModelRunner:
         tokens truncated to q-1); KV stays reserved at mtp_k+1. No-op unless
         DSpark confidence scheduling is on and this is a pure-decode batch.
         """
-        # Idempotency guard: prepare_model calls this before prepare_input_ids,
-        # and prepare_inputs (also reachable standalone for dummy/warmup) calls
-        # it again — only the first application must shrink the batch.
-        if getattr(batch, "_dspark_q_applied", False):
-            return
+        # No idempotency guard: `prepare_model` is the one caller and runs
+        # this once per batch. It used to be two, and the guard returned
+        # early on the second -- which now means returning None, i.e. the
+        # FULL length, undoing the shrink it was written to protect.
         if not (hasattr(self, "drafter") and self.drafter.uses_confidence_schedule):
-            return
+            return None
         if batch.total_tokens_num_prefill > 0:
-            return  # mixed/prefill step: keep full length
-        batch._dspark_q_applied = True
+            return None  # mixed/prefill step: keep full length
         scheduled_bs = batch.total_seqs_num_decode
         if scheduled_bs <= 0:
             return
@@ -2315,8 +2224,7 @@ class ModelRunner:
         # dspark.ragged_graph_sizes set. Anchor lower bound (q>=num_bonus+1)
         # is applied PER REQUEST so each seg can hold its own anchor.
         if self.config.dspark.ragged:
-            self._dspark_apply_ragged(batch, scheduled_bs, full_q, by_req)
-            return
+            return self._dspark_apply_ragged(batch, scheduled_bs, full_q, by_req)
         # ====================================================================
 
         # ---- Q-BUCKET path (older batch-uniform padding scheme) ------------
@@ -2375,13 +2283,11 @@ class ModelRunner:
         batch.num_scheduled_tokens = nst
         batch.total_tokens_num_decode = int(nst[:scheduled_bs].sum())
         batch.total_tokens_num = prefill_tok + batch.total_tokens_num_decode
-        # Publish the chosen q as the single source of truth (see ScheduledBatch
-        # .num_spec_query_tokens). All downstream length consumers read this.
-        batch.num_spec_query_tokens = q
         # Truncate each request's draft block to q-1 (regular matrix: all seqs q-1).
         spec = batch.scheduled_spec_decode_tokens
         if spec is not None and getattr(spec, "size", 0) > 0:
             batch.scheduled_spec_decode_tokens = np.ascontiguousarray(spec[:, : q - 1])
+        return q
 
     def _dspark_apply_ragged(self, batch, scheduled_bs, full_q, by_req):
         """DSpark per-request RAGGED verify (paper §5.2 avoid-padding).
@@ -2440,11 +2346,11 @@ class ModelRunner:
         # batch is rewritten. Shrinking the flat token layout is only safe if the
         # replay can follow it down; when it cannot, the rebuild is what makes
         # the step unsafe, so the decision has to come first.
-        #   * num_spec_query_tokens (scalar) q_eff : the PER-SEQ length bound
+        #   * max_seqlen_q (scalar) q_eff : the PER-SEQ length bound
         #     (>= max(new_len), quantized up to a captured bucket). Per-seq
         #     structures (compressor grid, rectangular indexer) size by it, so no
         #     seq can overflow them. It is NOT the total compute size -- that is
-        #     the flat num_tokens bucket (dynamic_num_tokens_pad), sized to the
+        #     the flat num_tokens bucket (running_tokens), sized to the
         #     real sum, so a long-tail seq no longer inflates the batch row count.
         buckets = resolve_q_buckets(self.config.dspark.ragged_graph_sizes, full_q)
         if self.enforce_eager:
@@ -2455,16 +2361,23 @@ class ModelRunner:
             # Graph: q_eff = smallest bucket >= the real MAX per-seq len, so no
             # seq ever exceeds q_eff. Per-seq structures (compressor grid,
             # rectangular indexer) size by q_eff and can't overflow -- no separate
-            # full_q cap needed. The TOTAL compute size is chosen apart from this
-            # by the flat num_tokens bucket (dynamic_num_tokens_pad, sized to the
-            # real sum), so q_eff no longer needs to track the sum/avg.
+            # full_q cap needed. The TOTAL compute size is `running_tokens`,
+            # settled apart from this by `ForwardMode`, so q_eff no longer needs
+            # to track the sum/avg.
             q_eff = (
                 quantize_to_bucket(int(new_len.max()), buckets)
                 if scheduled_bs > 0
                 else full_q
             )
-            if not self._ragged_flat_bucket_exists(int(new_len.sum()), q_eff):
-                return  # replay cannot follow the shrink -> stay rectangular
+            # Under FULL cudagraphs nothing flat is recorded, so a packed run has
+            # no width to land on and shrinking buys nothing -- the replay is
+            # rectangular either way. WHICH width it lands on is not asked here:
+            # `ForwardMode.decide` settles that on the DP-agreed total, and a
+            # second search on this rank's own count is how the two came to
+            # disagree. A miss there forwards the run eagerly, which is what the
+            # branch above already does under `enforce_eager`.
+            if not self._piecewise_cg_active():
+                return  # stay rectangular
 
         # Rebuild scheduled_tokens (flat) to the ragged per-seq layout: keep the
         # first new_len[i] of each seq's old segment (token[0]=anchor, rest=draft
@@ -2491,178 +2404,64 @@ class ModelRunner:
         # Two sources of truth (TRUE FLAT, paper §5.2): tokens are flat-packed
         # [0:Σ] with the per-seq ragged new_len.
         #   * dynamic_spec_query_tokens_per_req : the true ragged per-seq lengths.
-        #   * num_spec_query_tokens (scalar) q_eff : computed above, before the
-        #     rebuild, together with the replay-shape feasibility check.
-        batch.num_spec_query_tokens = int(q_eff)
+        #   * the scalar q_eff, RETURNED to `prepare_model` -- computed above,
+        #     before the rebuild, together with the replay-shape feasibility
+        #     check.
         batch.dynamic_spec_query_tokens_per_req = new_len
 
         # (No flat scheduled_spec_decode_tokens is built here: the ragged
         # input_ids are assembled downstream by `fill_deferred_decode_ids` from
         # prev_token_ids (anchor) + draft_token_ids, which never consults
         # scheduled_spec_decode_tokens.)
-
-    def _dspark_local_shape(self, batch: ScheduledBatch) -> tuple[int, int, int] | None:
-        """Local (q, decode_bs, total_tokens) for the DSpark DP graph-shape sync,
-        or None when the sync does not apply (single-DP or non-DSpark).
-
-        Symmetric across ranks every step regardless of prefill/decode: on a
-        prefill step this returns (1, 0, 0) so the DP-MAX reduction still has a
-        well-defined identity contribution and every rank participates in the
-        same collective (matching the pre-merge all_reduce semantics)."""
-        if self.config.parallel_config.data_parallel_size <= 1:
-            return None
-        drafter = getattr(self, "drafter", None)
-        if drafter is None or not drafter.is_block_drafter:
-            return None
-        local_q = int(getattr(batch, "num_spec_query_tokens", 1))
-        local_bs = int(getattr(batch, "total_seqs_num_decode", 0))
-        # Also DP-max the ragged decode token total (total_tokens_num_decode).
-        # PIECEWISE 1D-ragged replays at a num_tokens bucket sized to this total;
-        # to keep the MoE all_gather row count identical across ranks (else RCCL
-        # deadlock) every rank must pick the SAME bucket, so bisect on the DP-max
-        # total, not the local one.
-        local_total_tokens = int(getattr(batch, "total_tokens_num_decode", 0))
-        return local_q, local_bs, local_total_tokens
-
-    def _apply_dspark_shape_max(
-        self, batch: ScheduledBatch, shape_max: tuple[int, int, int] | None
-    ) -> None:
-        """Adopt the DP-MAX (q, decode_bs, total_tokens) across DP ranks so every
-        rank captures/replays an identical decode graph shape (else the MoE
-        all_gather pads to divergent rows -> RCCL deadlock). Raising q/bs/total
-        only enlarges graph capacity (real tokens stay flat-packed in [0:total])
-        and leaves per-request num_scheduled_tokens untouched, so it is always
-        lossless. The DP-max is computed via ``_dspark_local_shape`` and the
-        collective is folded into ``sync_dp_metadata``'s packed all_gather."""
-        if shape_max is None:
-            return
-        batch.num_spec_query_tokens = int(shape_max[0])
-        batch.dspark_dp_bs = int(shape_max[1])
-        batch.dspark_dp_total_tokens = int(shape_max[2])
+        return int(q_eff)
 
     def prepare_inputs(
         self,
         batch: ScheduledBatch,
-        input_ids: torch.Tensor = None,
-        preprocessed: tuple | None = None,
+        input_ids: torch.Tensor,
+        forward_mode: ForwardMode,
     ):
-        # NOTE: DSpark q-bucket shrink happens in prepare_model BEFORE
-        # prepare_input_ids, so the batch is already reduced when we get here.
-        # ``preprocessed``: when prepare_model already ran the merged DP collective
-        # (to get the DSpark DP-max q before prepare_input_ids), it passes the
-        # cached _preprocess tuple here so we DON'T issue a second all_gather.
+        # Always supplied, settled in `prepare_model` (which is where the reason
+        # lives). The q-bucket shrink ran there too, so `batch` is already
+        # reduced here.
         is_prefill = batch.total_tokens_num_prefill > 0
-        bs = batch.total_seqs_num
+        scheduled_bs = batch.total_seqs_num
         scheduled_tokens = batch.total_tokens_num
         num_scheduled_tokens = np.asarray(batch.num_scheduled_tokens)
         cu_seqlens_q, _arange = self._get_cumsum_and_arange(num_scheduled_tokens)
-        if preprocessed is None:
-            preprocessed = self._preprocess(
-                batch,
-                num_scheduled_tokens=num_scheduled_tokens,
-                dspark_shape=self._dspark_local_shape(batch),
-            )
-            self._apply_dspark_shape_max(batch, preprocessed[6])
-        (
-            running_tokens,
-            num_tokens_across_dp,
-            dp_uniform_decode,
-            _max_tokens,
-            tbo_collective_active,
-            ub_max_tokens_across_dp,
-            _dspark_shape_max,
-        ) = preprocessed
-        # NOTE: self._dspark_decode_replay is set inside _preprocess (it needs
-        # the DP sync result), so it's already current here for build()/run_model.
-
-        # Precompute the flat replay token count once here (before attn build +
-        # run_model) so the attn builder's positions padding matches it.
-        batch.dynamic_num_tokens_pad = self._dynamic_num_tokens_pad(batch)
+        sync = forward_mode.sync
+        num_tokens_across_dp = None if sync is None else sync.num_tokens_across_dp
+        tbo_collective_active = forward_mode.tbo_collective_active
+        ub_max_tokens_across_dp = None if sync is None else sync.ub_max_tokens_across_dp
+        running_tokens_are_unified = forward_mode.running_tokens_are_unified
 
         if not tbo_collective_active:
             self._pcp_tbo_balanced_active = False
 
-        self.forward_vars["cu_seqlens_q"].np[1 : bs + 1] = cu_seqlens_q
-
-        # mtp_step = per-seq decode token count, used by ForwardMode.decide to
-        # recover batch size as running_tokens // mtp_step. This is exactly
-        # the batch's single-source-of-truth decode length (= mtp_k+1, or the
-        # DSpark q-bucket when shrunk); running_tokens = scheduled_bs *
-        # num_spec_query_tokens, so the division recovers bs correctly. Prefill
-        # has no drafter / uses 1.
-        decide_running_tokens = running_tokens
-        dp_bs = batch.dspark_dp_bs
-        is_ragged = (
-            getattr(batch, "dynamic_spec_query_tokens_per_req", None) is not None
-        )
-        if not is_prefill and (dp_bs is not None or is_ragged):
-            # DSpark: the real Σtokens is irregular, but we
-            # replay the rectangular (bs, q_eff) graph whose capacity is bs*q_eff
-            # (q_eff = num_spec_query_tokens, the quantized bucket). Feed
-            # ForwardMode the GRAPH-CAPACITY token count so it recovers
-            # padded_scheduled_bs = bs*q_eff // q_eff = bs and picks the matching
-            # (bs, q_eff) graph; the real ragged tokens sit in [0:Σ], the tail is
-            # -1 padding (CTAs bail).
-            q_eff = int(batch.num_spec_query_tokens)
-            eff_bs = dp_bs if dp_bs is not None else batch.total_seqs_num_decode
-            mtp_step = q_eff
-            decide_running_tokens = int(eff_bs) * q_eff
-        elif not is_prefill and hasattr(self, "drafter"):
-            mtp_step = batch.num_spec_query_tokens
-        else:
-            mtp_step = (self.drafter.mtp_k + 1) if hasattr(self, "drafter") else 1
-        forward_mode = ForwardMode.decide(
-            is_prefill=is_prefill,
-            # `total_seqs_num`, not `total_seqs_num_prefill`: equal today, and
-            # the one that stays right once a prefill batch may also carry
-            # decode rows -- they go through the same attention call.
-            scheduled_bs=(
-                batch.total_seqs_num if is_prefill else batch.total_seqs_num_decode
-            ),
-            running_tokens=decide_running_tokens,
-            dp_uniform_decode=dp_uniform_decode,
-            enforce_eager=self.enforce_eager,
-            capture_sizes=self.capture_sizes,
-            mtp_step=mtp_step,
-        )
+        self.forward_vars["cu_seqlens_q"].np[1 : scheduled_bs + 1] = cu_seqlens_q
 
         if not is_prefill:
-            scheduled_bs = forward_mode.scheduled_bs
-            # Attention reads the padded width only where its tensors carry the
-            # padding; eager keeps the scheduled rows so aiter's t == t_slot
-            # holds against the local input_ids.
-            bs = (
-                forward_mode.running_bs
-                if forward_mode.attn_tensors_are_padded
-                else scheduled_bs
-            )
             assert forward_mode.running_bs >= scheduled_bs, (
                 f"running_bs={forward_mode.running_bs} < "
                 f"scheduled_bs={scheduled_bs}; ForwardMode.decide invariant violated"
             )
-            # Only pad cu_seqlens_q out to the cudagraph capture size if we
-            # actually grew bs. Eager (bs == scheduled_bs) leaves the slice
-            # empty so no overwrite happens.
-            if bs > scheduled_bs:
-                self.forward_vars["cu_seqlens_q"].np[scheduled_bs + 1 : bs + 1] = (
-                    self.forward_vars["cu_seqlens_q"].np[scheduled_bs]
-                )
-        attn_metadata, positions = self.attn_metadata_builder.build(batch=batch, bs=bs)
-
-        # The step's padded shape, in the two units its consumers read. Both
-        # must be identical on every DP rank: MoE pads hidden_states to
-        # `running_tokens` before the cross-DP all_gather, and a captured graph
-        # holds its collective at `running_bs`.
+            # Flat-extend the cumsum over the fabricated rows. Attention runs at
+            # `running_bs` on every decode step, replayed or not: keeping the
+            # scheduled rows when eager made a third width nobody could name,
+            # and every consumer had to know which of the two it was holding.
+            self.forward_vars["cu_seqlens_q"].np[
+                scheduled_bs + 1 : forward_mode.running_bs + 1
+            ] = self.forward_vars["cu_seqlens_q"].np[scheduled_bs]
+        # The step's two units, read from where they were settled: `running_bs`
+        # sizes everything per-sequence, `running_tokens` everything per-row.
         running_bs = forward_mode.running_bs
-        if not is_prefill:
-            # Prefill keeps whatever `_preprocess` settled on -- padded to the
-            # group max under uniform decode, its own count otherwise. Decode
-            # recomputes from the batch `decide` rounded up to, which is wider
-            # than that count whenever it landed on a captured size.
-            running_tokens = running_bs * int(attn_metadata.max_seqlen_q)
-        drafter = getattr(self, "drafter", None)
-        if not is_prefill and drafter is not None and drafter.is_block_drafter:
-            running_tokens = self._dspark_ragged_running_tokens(batch, running_tokens)
+        running_tokens = forward_mode.running_tokens
+        attn_metadata, positions = self.attn_metadata_builder.build(
+            batch=batch,
+            running_bs=running_bs,
+            running_tokens=running_tokens,
+            max_seqlen_q=forward_mode.max_seqlen_q,
+        )
         context = Context(
             positions=positions,
             is_prefill=is_prefill,
@@ -2671,7 +2470,7 @@ class ModelRunner:
             scheduled_tokens=scheduled_tokens,
             running_bs=running_bs,
             running_tokens=running_tokens,
-            dp_uniform_decode=dp_uniform_decode,
+            running_tokens_are_unified=running_tokens_are_unified,
             forward_mode=forward_mode,
         )
 
@@ -2768,28 +2567,45 @@ class ModelRunner:
         return temperatures, top_ks, top_ps, all_greedy, needs_independent_noise
 
     def prepare_model(self, batch: ScheduledBatch):
-        self._dspark_apply_q_bucket(batch)
-        # DSpark-only early DP sync: only DSpark under DP needs the DP-max q
-        # BEFORE prepare_input_ids (to size input_ids). Run the merged packed
-        # all_gather (TBO + DSpark [q, bs, total_tokens]) ONCE here and reuse it in
-        # prepare_inputs, so the step issues a single cross-DP collective.
-        dspark_shape = self._dspark_local_shape(batch)
-        preprocessed = None
-        if dspark_shape is not None:
-            preprocessed = self._preprocess(
-                batch,
-                num_scheduled_tokens=np.asarray(batch.num_scheduled_tokens),
-                dspark_shape=dspark_shape,
-            )
-            self._apply_dspark_shape_max(batch, preprocessed[6])
+        shrunk_q = self._dspark_apply_q_bucket(batch)
+        # The step's shape, settled once. Here rather than in prepare_inputs
+        # because DSpark under DP needs the reduced query length BEFORE
+        # prepare_input_ids sizes the buffer, and because one call site is the
+        # only way the step is guaranteed a single cross-DP collective.
+        dp_size = self.config.parallel_config.data_parallel_size
+        forward_mode = ForwardMode.decide(
+            batch=batch,
+            dp_size=dp_size,
+            dp_group=get_dp_group().cpu_group if dp_size > 1 else None,
+            enforce_eager=self.enforce_eager,
+            capture_sizes=self.capture_sizes_np,
+            captured_tokens=(
+                self._piecewise_sorted_tokens if self._piecewise_cg_active() else None
+            ),
+            is_block_drafter=(
+                hasattr(self, "drafter") and self.drafter.is_block_drafter
+            ),
+            tbo_on=self.config.enable_tbo,
+            local_tbo=self._local_tbo_eligibility(batch),
+            max_seqlen_q=(batch.num_spec_step + 1 if shrunk_q is None else shrunk_q),
+        )
+        # Stash the DP-wide prefill OR for the EPLB prefill gate; reused free by
+        # on_forward_pass_end when the DP group == the migration (EP) group.
+        self._eplb_any_rank_has_prefill = (
+            None
+            if forward_mode.sync is None
+            else forward_mode.sync.any_rank_has_prefill
+        )
         total_tokens_num = batch.total_tokens_num
         assert total_tokens_num > 0
 
         temperatures, top_ks, top_ps, all_greedy, needs_independent_noise = (
             self.prepare_sample(batch)
         )
-        input_ids = self.tokenID_processor.prepare_input_ids(batch)
-        self.prepare_inputs(batch, input_ids, preprocessed=preprocessed)
+        input_ids = self.tokenID_processor.prepare_input_ids(
+            batch, forward_mode.max_seqlen_q
+        )
+        self.prepare_inputs(batch, input_ids, forward_mode=forward_mode)
 
         # Stage the speculative inputs while this forward's normal staging
         # window is still open.  Both buffers are pinned and reused, so copying
@@ -3032,18 +2848,18 @@ class ModelRunner:
         is_prefill = context.is_prefill
         positions = context.positions
 
-        # Dispatch is owned by ForwardMode.decide() (called in prepare_inputs).
+        # Dispatch is owned by ForwardMode.decide() (called in prepare_model).
         # Every run_model caller MUST go through prepare_inputs first, so
         # forward_mode is always set here.
         forward_mode = context.forward_mode
         assert forward_mode is not None, (
             "context.forward_mode is None; run_model invoked without going "
-            "through prepare_inputs. Add ForwardMode.decide() at the new "
+            "through prepare_model. Add ForwardMode.decide() at the new "
             "entry point instead of re-deriving the 4-OR dispatch here."
         )
 
         # Single canonical shape check; contract owned by ForwardMode, which
-        # internally short-circuits for prefill / cudagraph.
+        # short-circuits only on prefill. The padded step is the one it is for.
         forward_mode.assert_shape_contract(input_ids, forward_context.attn_metadata)
 
         # Profiler label. Kind (prefix) distinguishes real/dummy and
@@ -3181,58 +2997,63 @@ class ModelRunner:
             # dummy_decode[...] — see build_run_label.
             with record_function(label):
                 running_bs = context.running_bs
-                max_q_len = forward_context.attn_metadata.max_seqlen_q
-                num_tokens = context.scheduled_bs * max_q_len  # real (output slice)
+                running_tokens = forward_mode.running_tokens
+                scheduled_tokens = context.scheduled_tokens
 
                 if self._piecewise_cg_active():
-                    num_tokens_pad, real_tokens, _captured = (
-                        self._piecewise_replay_shape(batch, running_bs, max_q_len)
-                    )
-                    # Pad tail to a legal vocab id / position (builder fills to
-                    # graph_cap >= num_tokens_pad, so a no-op safety net).
-                    if num_tokens_pad > real_tokens:
+                    # Pad tail to a legal vocab id / position, from THIS rank's
+                    # own rows out to the width the step settled on. A group-max
+                    # lower bound leaves `[scheduled, max)` holding the previous
+                    # step's ids on every rank below the max, and those reach the
+                    # draft's Markov lookup as out-of-range indices.
+                    if running_tokens > scheduled_tokens:
                         self.forward_vars["input_ids"].gpu[
-                            real_tokens:num_tokens_pad
+                            scheduled_tokens:running_tokens
                         ].zero_()
                         self.forward_vars["positions"].gpu[
-                            real_tokens:num_tokens_pad
+                            scheduled_tokens:running_tokens
                         ].zero_()
                     _pos = (
-                        self._mrope_positions_view(num_tokens_pad)
+                        self._mrope_positions_view(running_tokens)
                         if self.use_mrope
-                        else self.forward_vars["positions"].gpu[:num_tokens_pad]
+                        else self.forward_vars["positions"].gpu[:running_tokens]
                     )
                     forward_context.cudagraph_runtime_mode = (
-                        CUDAGraphMode.PIECEWISE if _captured else CUDAGraphMode.NONE
+                        CUDAGraphMode.PIECEWISE
+                        if forward_mode.piecewise_captured
+                        else CUDAGraphMode.NONE
                     )
                     forward_context.batch_descriptor = BatchDescriptor(
-                        num_tokens=num_tokens_pad
+                        num_tokens=running_tokens
                     )
                     model_output = self.model(
-                        self.forward_vars["input_ids"].gpu[:num_tokens_pad], _pos
+                        self.forward_vars["input_ids"].gpu[:running_tokens], _pos
                     )
                     forward_context.cudagraph_runtime_mode = CUDAGraphMode.NONE
                     forward_context.batch_descriptor = None
                     # model_output is always a plain Tensor; drafter aux capture
                     # (if any) already wrote its own buffers inside the forward.
-                    # Spec keeps the padded [0:Σ] layout (postprocess/draft
-                    # re-gather to bs via next_token_locs); non-spec slices to the
-                    # real num_tokens so pad rows never leak into sampled_token_ids
-                    # -> prev_token_ids -> next-step shape mismatch.
-                    hidden_states = model_output
-                    _is_spec = hasattr(self, "drafter")
-                    _slice_len = num_tokens_pad if _is_spec else num_tokens
-                    hidden_states = hidden_states[:_slice_len]
+                    # Spec keeps the padded layout (postprocess/draft re-gather to
+                    # bs via next_token_locs); non-spec cuts to the scheduled rows
+                    # so pad rows never leak into sampled_token_ids ->
+                    # prev_token_ids -> next-step shape mismatch.
+                    hidden_states = model_output[
+                        : (
+                            running_tokens
+                            if hasattr(self, "drafter")
+                            else scheduled_tokens
+                        )
+                    ]
                     logits = self.model.compute_logits(hidden_states)
                     return logits, hidden_states
 
-                graph_key = (running_bs, max_q_len)
+                graph_key = (running_bs, forward_context.attn_metadata.max_seqlen_q)
                 self.graphs[graph_key].replay()
-                hidden_states = self.forward_vars["outputs"][:num_tokens]
+                hidden_states = self.forward_vars["outputs"][:scheduled_tokens]
                 # Drafter aux buffers (if any) refresh on replay: their in-place
                 # copy ops were captured into the graph.
                 if self.logits_in_graph:
-                    logits = self.graph_logits[graph_key][:num_tokens]
+                    logits = self.graph_logits[graph_key][:scheduled_tokens]
                 else:
                     logits = self.model.compute_logits(hidden_states)
 
@@ -3259,6 +3080,15 @@ class ModelRunner:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
         bs = batch.total_seqs_num
         if spec_decode_metadata is None:
+            # The LM head emitted one row per sequence the step FORWARDED,
+            # which prefill pads to `running_bs` for the draft pass that
+            # follows it. Cut to the scheduled batch here and nowhere else:
+            # this is the boundary where a padded forward becomes a
+            # per-request result, and everything below counts requests -- the
+            # sampler's per-row parameters and the logprob gather both. Cut
+            # after either and the pad rows divide `[running_bs, V]` by
+            # `[scheduled_bs, 1]`.
+            logits = logits[:bs]
             sampled_tokens = self.sampler(
                 logits,
                 temperatures,
@@ -3499,7 +3329,7 @@ class ModelRunner:
     def _dp_draft_lockstep_active(self) -> bool:
         """Are this rank's draft passes bound to what the DP peers run?
 
-        Only under DP attention -- `_refresh_dp_metadata` returns early at
+        Only under DP attention -- `_publish_draft_shape` returns early at
         `data_parallel_size <= 1`, where an output-less batch legitimately
         drafts nothing. PP is excluded via `is_deferred_out`.
         """
@@ -3602,7 +3432,7 @@ class ModelRunner:
             and batch.total_tokens_num_prefill == 0
         ):
             full_q = self.drafter.mtp_k + 1
-            q_actual = batch.num_spec_query_tokens
+            q_actual = forward_context.context.forward_mode.max_seqlen_q
             if 1 <= q_actual < full_q:
                 last_token_offset = last_token_offset - (full_q - q_actual)
 
@@ -3739,126 +3569,6 @@ class ModelRunner:
                     "capture path for cudagraph-safe DP collectives.",
                     getter,
                 )
-
-    def _ragged_flat_bucket_exists(self, total_tokens: int, q: int) -> bool:
-        """Can a captured flat num_tokens bucket hold a ragged step of
-        ``total_tokens`` at per-seq bound ``q``?
-
-        Same predicate ``_dynamic_num_tokens_pad`` searches with -- keep the two
-        in step. Asked BEFORE ``_dspark_apply_ragged`` rewrites the batch,
-        because when no bucket matches that function returns None and every
-        caller falls back to ``bs * max_seqlen_q``: a replay over MORE tokens
-        than the ragged rebuild populated. The ``[total : bs*q]`` tail is then
-        whatever the previous step left in the input buffer, and those stale ids
-        reach the draft's Markov transition-table lookup as out-of-range
-        indices -- a device-side trap attributed to whatever kernel happened to
-        be in flight, nowhere near here.
-
-        The usual way to get here is FULL (non-PIECEWISE) cudagraphs, where no
-        flat bucket set is captured at all: then NO ragged shrink is
-        representable and the caller must stay rectangular. Shrinking buys
-        nothing in that mode anyway -- the replay is rectangular either way.
-        """
-        if not self._piecewise_cg_active():
-            return False
-        from atom.spec_decode.dspark_scheduler import flat_bucket_fits
-
-        return flat_bucket_fits(
-            total_tokens, q, getattr(self, "_piecewise_sorted_tokens", None)
-        )
-
-    def _dynamic_num_tokens_pad(self, batch) -> int | None:
-        """Flat PIECEWISE replay token count for a ragged decode step, or None so
-        callers fall back to ``bs * max_seqlen_q``.
-
-        Mirrors the ragged branch of ``_piecewise_replay_shape``: the smallest
-        captured q-divisible num_tokens bucket >= the (DP-max) real token total.
-        None for non-ragged / non-piecewise / prefill / no-match.
-
-        Dummy batches are INCLUDED: a DP-lockstep dummy rank must pad to the same
-        flat token count as the real ranks or it cannot replay alongside them."""
-        if (
-            batch is None
-            or batch.total_tokens_num_prefill > 0
-            or not self._piecewise_cg_active()
-            or not self._piecewise_sorted_tokens
-            or not hasattr(self, "drafter")
-        ):
-            return None
-        dp_total = batch.dspark_dp_total_tokens
-        real_tokens = (
-            int(dp_total)
-            if dp_total is not None
-            else int(batch.total_tokens_num_decode)
-        )
-        q = int(batch.num_spec_query_tokens)
-        for b in self._piecewise_sorted_tokens:
-            if b >= real_tokens and q > 0 and b % q == 0:
-                return int(b)
-        return None
-
-    def _piecewise_replay_shape(self, batch, running_bs, max_q_len):
-        """Pick the PIECEWISE replay token count for one decode step.
-
-        Returns ``(num_tokens_pad, real_tokens, captured)``:
-        - ``num_tokens_pad``: token count to forward (the captured bucket size).
-        - ``real_tokens``: real tokens present in ``[0:real_tokens]``.
-        - ``captured``: whether a matching cudagraph bucket exists (else eager).
-
-        DSpark (has drafter, TP-only) replays at a flat num_tokens bucket sized
-        to the REAL ragged token total (= total_tokens_num_decode) so MoE/linear
-        shrink with it (dynamic verify length); attention is eager on the flat
-        [0:total] tokens, the [total:pad] tail is masked. Non-spec (or DP) uses
-        the rectangular bucket num_tokens == bs.
-        """
-        use_ragged_bucket = (
-            batch is not None
-            and self._piecewise_sorted_tokens
-            and hasattr(self, "drafter")
-        )
-        if use_ragged_bucket:
-            dp_total_tokens = batch.dspark_dp_total_tokens
-            real_tokens = (
-                int(dp_total_tokens)
-                if dp_total_tokens is not None
-                else int(batch.total_tokens_num_decode)
-            )
-            buckets = self._piecewise_sorted_tokens
-            q = int(max_q_len)
-            # Pick the q-divisible bucket N. q is num_spec_query_tokens, already
-            # quantized to a captured bucket by _dspark_apply_ragged, so the
-            # divisibility test is satisfiable by construction.
-            _replay = bool(getattr(self, "_dspark_decode_replay", False))
-            for b in buckets:
-                if b >= real_tokens and q > 0 and b % q == 0:
-                    return b, real_tokens, _replay
-            return max(real_tokens, running_bs * max_q_len), real_tokens, False
-
-        num_tokens_pad = running_bs * max_q_len
-        captured = num_tokens_pad in self._piecewise_captured_tokens
-        return num_tokens_pad, num_tokens_pad, captured
-
-    def _dspark_ragged_running_tokens(self, batch, default_running_tokens):
-        """``running_tokens`` for a DSpark ragged PIECEWISE decode step.
-
-        A ragged step replays at a flat num_tokens bucket, not a rectangular
-        bs*q grid, so the height MoE pads to IS that bucket. Picking the same
-        one ``_piecewise_replay_shape`` will (hence the identical q-divisibility
-        filter) is what keeps the eager ranks' all_gather equal to the size
-        baked into the replaying ranks' graph.
-        """
-        dp_total_tokens = batch.dspark_dp_total_tokens
-        if (
-            not self._piecewise_cg_active()
-            or dp_total_tokens is None
-            or not self._piecewise_sorted_tokens
-        ):
-            return default_running_tokens
-        q = int(batch.num_spec_query_tokens)
-        for b in self._piecewise_sorted_tokens:
-            if b >= int(dp_total_tokens) and q > 0 and b % q == 0:
-                return int(b)
-        return default_running_tokens
 
     def _dspark_capture_q_buckets(self, full_q: int) -> list[int]:
         """DSpark query-length buckets to capture graphs for (paper Phase 2).
@@ -4320,7 +4030,8 @@ class ModelRunner:
                     ),
                     capture_ctx.stream,
                 )
-        self.capture_sizes.sort(reverse=False)
+        self.capture_sizes.sort()
+        self.capture_sizes_np = np.asarray(self.capture_sizes, dtype=np.int32)
 
         # PIECEWISE: sorted 1D num_tokens buckets for run_model's round_up_1d(Σ)
         # dispatch (bisect_left over this to pick the tightest captured shape).

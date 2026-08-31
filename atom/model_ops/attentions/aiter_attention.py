@@ -873,8 +873,10 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             )
         return workinfos
 
-    def prepare_prefill(self, batch: ScheduledBatch):
-        attn_metadata, positions = CommonAttentionBuilder.prepare_prefill(self, batch)
+    def prepare_prefill(self, batch: ScheduledBatch, running_bs: int):
+        attn_metadata, positions = CommonAttentionBuilder.prepare_prefill(
+            self, batch, running_bs
+        )
         if self._has_sparse_attention and not attn_metadata.has_cached:
             bs = batch.total_seqs_num_prefill
             self.prepare_block_tables(batch)
@@ -905,9 +907,11 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 attn_metadata.context_lens[:bs],
                 bs,
             )
+            # Sliced like the block tables above -- `num_prefills` counts
+            # requests, and these two are padded past it.
             attn_metadata.sparse_attention_metadata = make_sparse_prefill_metadata(
-                cu_seqlens_q=attn_metadata.cu_seqlens_q,
-                seq_lens=attn_metadata.context_lens,
+                cu_seqlens_q=attn_metadata.cu_seqlens_q[: bs + 1],
+                seq_lens=attn_metadata.context_lens[:bs],
                 block_table=sparse_block_tables,
                 slot_mapping=attn_metadata.slot_mapping,
                 max_query_len=attn_metadata.max_seqlen_q,
@@ -1063,11 +1067,16 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         )
         ub_attn.max_seqlen_k = int(ctx_lens.max())
 
-    def prepare_decode(self, batch: ScheduledBatch, bs: int):
+    def prepare_decode(
+        self,
+        batch: ScheduledBatch,
+        running_bs: int,
+        running_tokens: int,
+        max_seqlen_q: int,
+    ):
         scheduled_bs = batch.total_seqs_num_decode
         self.total_blocks = 0
         dropout_p = 0.0
-        max_seqlen_q = batch.num_spec_step + 1
         min_seqlen_q = 0
 
         context_lens = np.asarray(batch.context_lens, dtype=np.int32)
@@ -1103,7 +1112,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
 
         var = self.model_runner.forward_vars
         sum_scheduled_tokens = batch.total_tokens_num_decode
-        var["slot_mapping"].np[: bs * max_seqlen_q] = -1
+        var["slot_mapping"].np[:running_tokens] = -1
         if not batch.is_dummy_run:
             var["slot_mapping"].np[:sum_scheduled_tokens] = slot_mapping[
                 :sum_scheduled_tokens
@@ -1111,7 +1120,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
 
         var["positions"].np[:sum_scheduled_tokens] = positions
         var["context_lens"].np[:scheduled_bs] = context_lens
-        var["context_lens"].np[scheduled_bs:bs] = 0
+        var["context_lens"].np[scheduled_bs:running_bs] = 0
 
         # Prepare kv_indptr and kv_indices for persistent attention
         num_blocks_per_seq = cdiv(context_lens, self.block_size)
@@ -1120,19 +1129,19 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
 
         var["kv_indptr"].np[0] = 0
         var["kv_indptr"].np[1 : scheduled_bs + 1] = kv_indptr
-        var["kv_indptr"].np[scheduled_bs + 1 : bs + 1] = sum_blocks
+        var["kv_indptr"].np[scheduled_bs + 1 : running_bs + 1] = sum_blocks
 
         vars_used = [
-            ("slot_mapping", bs * max_seqlen_q),
-            ("context_lens", bs),
-            ("cu_seqlens_q", bs + 1),
-            ("block_tables", bs),
-            ("kv_indptr", bs + 1),
+            ("slot_mapping", running_tokens),
+            ("context_lens", running_bs),
+            ("cu_seqlens_q", running_bs + 1),
+            ("block_tables", running_bs),
+            ("kv_indptr", running_bs + 1),
         ]
 
         ctx = {el: var[el].copy_to_gpu(num) for el, num in vars_used}
         if self.block_size in (256, 1024):
-            ctx_pa_ps = self.set_aiter_persistent_worker_buffers(bs)
+            ctx_pa_ps = self.set_aiter_persistent_worker_buffers(running_bs)
             ctx.update(ctx_pa_ps)
 
         ctx["kv_indices"] = var["kv_indices"].gpu
@@ -1178,10 +1187,10 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             positions = mrope_positions
         else:
             positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
-        if self.model_runner.config.enable_tbo_decode and bs >= 2:
+        if self.model_runner.config.enable_tbo_decode and running_bs >= 2:
             self._prepare_ubatch_decode(
                 scheduled_bs,
-                bs,
+                running_bs,
                 max_seqlen_q,
                 context_lens,
             )

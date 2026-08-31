@@ -8,7 +8,6 @@ lived only there, nothing would check them at all.
 """
 
 import dataclasses
-import types
 
 import pytest
 import torch
@@ -19,7 +18,6 @@ from atom.spec_decode.draft_graph import DraftGraph, StagedInput
 def _graph(**kw):
     """A pass over one int32 input, bound to a stub config."""
     kw.setdefault("inputs", {"row": StagedInput(dtype=torch.int32)})
-    kw.setdefault("pads", True)
     g = DraftGraph(
         forward=kw.pop("forward", lambda running_bs, **rows: running_bs), **kw
     )
@@ -27,76 +25,46 @@ def _graph(**kw):
     return g.bind(config, torch.device("cpu"))
 
 
-def _ctx(*, running_bs, use_cudagraph=True, dummy=False, running_tokens=None):
-    """A forward context carrying only what `target_running_bs` reads."""
-    return types.SimpleNamespace(
-        is_dummy_run=dummy,
-        running_bs=running_bs,
-        running_tokens=running_bs if running_tokens is None else running_tokens,
-        forward_mode=types.SimpleNamespace(
-            use_cudagraph=use_cudagraph, running_bs=running_bs
-        ),
-    )
+def test_an_unwidened_empty_batch_stages_nothing():
+    """`stage` tail-repeats `src[-1]`, which a zero-row source does not have.
 
-
-@pytest.mark.parametrize("bs,ran_at,want", [(44, 48, 48), (50, 64, 64), (64, 64, 64)])
-def test_the_pad_batch_is_the_one_the_target_ran(bs, ran_at, want):
-    """Never a batch the drafter picks. The target sized its per-sequence
-    metadata with `running_bs`, so that is exactly how far a pad row may
-    reach; anything wider reads a row nobody wrote this step."""
-    assert _graph().target_running_bs(bs, _ctx(running_bs=ran_at)) == want
-
-
-def test_an_empty_batch_is_never_widened():
-    """A pad row is a copy of the last real row, and there is none.
-
-    `stage` would reach `src[-1]` on a zero-row source and raise IndexError,
-    which is a much worse way to learn that a rank was kept alive purely to
-    reach the draft's collectives.
+    No caller can ask for one: `prepare_model` asserts the batch carries tokens,
+    so every drafter sees at least one row. Pinned as the boundary anyway --
+    entering at the real count must stay a no-op, not an IndexError.
     """
     g = _graph()
-    assert g.target_running_bs(0, _ctx(running_bs=48)) == 0
     assert g.stage(0, {"row": torch.zeros(0, dtype=torch.int32)})["row"].shape[0] == 0
 
 
-def test_the_pad_batch_counts_sequences_and_never_rows():
-    """The context carries the step's padded shape in both units, and only one
-    of them is a batch.
+def test_owning_a_recording_says_nothing_about_a_batch_it_is_not_at():
+    """The proposers widen to `running_bs` only when `is_captured` says that
+    batch replays, so this answer decides whether a pad row is ever fabricated.
 
-    `running_tokens` is what MoE pads hidden_states to; on a DSpark ragged step
-    it is a flat token bucket that no bs*q recovers, so reading it here would
-    stage hundreds of fabricated sequences. Pinned with the two far apart --
-    equal values would prove nothing about which one is read.
+    It has to be about the batch it was ASKED about. Answering out of inventory
+    -- "I own 48, so yes" -- would widen a 256-batch step to rows no recording
+    covers, and the pass would then hand the variable-length MoE gather padded
+    rows on a step that replays nothing.
     """
-    ctx = _ctx(running_bs=48, running_tokens=16336)
-    assert _graph().target_running_bs(44, ctx) == 48
-
-
-def test_nothing_is_padded_where_the_target_pinned_no_batch():
     g = _graph()
-    # Planted first: owning a graph at 48 is NOT a licence to pad to it. Only a
-    # replayed target sizes its per-sequence metadata past the real batch, and
-    # a pad row that reaches further takes its ring slot -- which DSpark's block
-    # SCATTERS draft KV through -- from a row nobody wrote this step.
     g._cuda_graphs[48] = ("graph", "out")
-    ctx = _ctx(running_bs=256, use_cudagraph=False)
-    assert g.target_running_bs(44, ctx) == 44, "eager: nobody sized metadata past bs"
+    assert g.is_captured(48)
+    assert not g.is_captured(256)
+    assert not g.is_captured(44)
 
 
-def test_a_pass_that_cannot_pad_stays_at_the_real_batch():
-    """`pads` gates the padding, not just the capture -- EPLB turns it off
-    because pad rows would route through the draft's MoE and land in the
-    expert-load histogram."""
-    g = _graph(pads=False)
-    assert g.target_running_bs(44, _ctx(running_bs=48)) == 44
-    assert not g.will_capture
+def test_nothing_recorded_means_no_batch_replays():
+    """`ATOM_DRAFT_CUDAGRAPH=0` leaves the inventory empty, and then every
+    batch must answer no -- that is what keeps the eager pass unpadded."""
+    g = _graph()
+    assert not any(g.is_captured(n) for n in (0, 1, 44, 48, 256))
 
 
-def test_declaring_pads_without_inputs_is_refused():
-    """`pads` promises the fabricated rows land somewhere inert; with nothing
-    staged there is no buffer for them to land in at all."""
+def test_a_pass_that_stages_nothing_is_refused():
+    """A fabricated row has to land somewhere. Every declared pass may pad now,
+    so staging nothing is not an unpaddable pass -- it is no pass at all, and
+    the flavor must decline the declaration instead."""
     with pytest.raises(AssertionError, match="stages nothing"):
-        _graph(inputs={}, pads=True)
+        _graph(inputs={})
 
 
 def test_staged_tail_repeats_a_real_row_rather_than_zero_filling():
@@ -137,22 +105,6 @@ def test_staging_a_source_whose_leading_axis_is_not_the_batch_fails_loudly():
         g._stage_one("row", 8, torch.zeros(3, 8, dtype=torch.int32))
 
 
-def test_padding_a_pass_that_never_called_its_pad_rows_inert_is_refused():
-    """`pads` is the only part of the contract nothing else can check.
-
-    A pass that lies about it still runs and still returns the right shape; the
-    fabricated rows just land in another sequence's KV.
-    """
-    src = {"row": torch.zeros(3, dtype=torch.int32)}
-    assert _graph(pads=True).stage(4, src)["row"].shape[0] == 4
-
-    g = _graph(pads=False)
-    with pytest.raises(AssertionError, match="fabricated rows are inert"):
-        g.stage(4, src)
-    # Unpadded entry stays legal -- the contract is about fabricated rows only.
-    assert g.stage(3, src)["row"].shape[0] == 3
-
-
 def test_sources_that_disagree_on_the_batch_are_refused():
     """They describe one step, so one of them is not this step's."""
     g = _graph(
@@ -188,17 +140,17 @@ def test_warmup_runs_the_epilogue_too_not_just_the_capturable_forward(monkeypatc
     assert ran == ["forward", "epilogue"]
 
 
-def test_warmup_happens_before_the_pad_and_capture_gates(monkeypatch):
-    """A pass that pads nothing and captures nothing is still WARMED.
+def test_warmup_happens_before_the_capture_gate(monkeypatch):
+    """A pass that captures nothing is still WARMED.
 
     That ordering is deliberate -- the JIT is worth paying at startup either
-    way -- but it means declining to pad does not keep a flavor's forward off
-    the startup sweep. A flavor whose model cannot answer it must decline the
-    whole pass.
+    way -- but it means turning capture off does not keep a flavor's forward
+    off the startup sweep. A flavor whose model cannot answer it must decline
+    the whole pass.
     """
     monkeypatch.setenv("ATOM_DRAFT_CUDAGRAPH", "0")
     ran = []
-    g = _graph(pads=False, forward=lambda running_bs, **rows: ran.append("forward"))
+    g = _graph(forward=lambda running_bs, **rows: ran.append("forward"))
     assert not g.will_capture
     g.warmup(8)
     assert ran == ["forward"]
@@ -226,15 +178,68 @@ def test_run_replays_the_recording_instead_of_the_forward():
     g = _graph(forward=lambda running_bs, **rows: forwards.append(running_bs))
     src = {"row": torch.zeros(4, dtype=torch.int32)}
 
-    real = _ctx(running_bs=4)
     assert not g.is_captured(4)
-    g.run(4, real, **g.stage(4, src))
+    g.run(4, **g.stage(4, src))
     assert (forwards, replays) == ([4], []), "no recording: must run the forward"
 
     g._cuda_graphs[4] = (_Graph(), "recorded")
     assert g.is_captured(4)
-    assert g.run(4, real, **g.stage(4, src)) == "recorded"
+    assert g.run(4, **g.stage(4, src)) == "recorded"
     assert (forwards, replays) == ([4], [1]), "recorded: must replay, not re-run"
+
+
+def test_a_replay_hands_back_a_value_not_the_recordings_own_storage():
+    """What `run` returns has to survive the next replay of any other size.
+
+    The recording's tensors are allocated inside the capture, so they live in
+    the pool every captured size shares; the pool packs a later size's capture
+    into memory the earlier ones released, and a replay rewrites every address
+    it recorded whatever holds it now. Holding a Python reference does not
+    stop that -- which is exactly why this cannot be left to the caller.
+
+    Written as "the recording changing underneath must not change what was
+    handed out", because that is the failure: DSpark's draft ids are read a
+    step later as the next forward's `input_ids`, and another size's replay
+    had turned them into that size's activations. The target's embedding
+    gathered on those floats and faulted all eight ranks.
+    """
+
+    class _Graph:
+        def replay(self):
+            pass
+
+    ids = torch.full((4, 3), 9, dtype=torch.int32)
+    conf = torch.zeros(4, 3)
+    g = _graph(epilogue=lambda out, running_bs, **rows: out, capture_epilogue=True)
+    g._cuda_graphs[4] = (_Graph(), (ids, conf))
+
+    got_ids, got_conf = g.run(
+        4, **g.stage(4, {"row": torch.zeros(4, dtype=torch.int32)})
+    )
+    assert got_ids.tolist() == ids.tolist(), "the replay's values, unchanged"
+
+    # A later replay at another size lands on the recording's storage.
+    ids.fill_(1234)
+    conf.fill_(5.0)
+    assert got_ids.tolist() != ids.tolist(), "handed out a window into the recording"
+    assert got_conf.tolist() != conf.tolist(), "every output, not just the ids"
+
+
+def test_the_eager_path_hands_back_what_it_allocated():
+    """...and only a replay needs the copy.
+
+    Without a recording the pass allocates normally, where holding the
+    reference is what keeps the storage. Copying there would be pure cost, so
+    the identity is asserted rather than left to inspection.
+    """
+    made = torch.zeros(2, 3)
+    g = _graph(
+        forward=lambda running_bs, **rows: made,
+        epilogue=lambda out, running_bs, **rows: out,
+        capture_epilogue=True,
+    )
+    assert not g.is_captured(2)
+    assert g.run(2, **g.stage(2, {"row": torch.zeros(2, dtype=torch.int32)})) is made
 
 
 def test_a_dummy_replays_in_lockstep_with_the_real_ranks():
@@ -263,30 +268,32 @@ def test_a_dummy_replays_in_lockstep_with_the_real_ranks():
     g._cuda_graphs[1] = (_Graph(), "recorded")
     src = {"row": torch.zeros(1, dtype=torch.int32)}
 
-    for dummy in (False, True):
-        ctx = _ctx(running_bs=1, dummy=dummy)
-        assert g.run(1, ctx, **g.stage(1, src)) == "recorded"
-        assert " graph" in g.label(1, 1, ctx)
+    for _dummy in (False, True):
+        assert g.run(1, **g.stage(1, src)) == "recorded"
+        assert " graph" in g.label(1, 1)
     assert (forwards, replays) == ([], [1, 1]), "both ranks replay, neither runs"
 
 
-@pytest.mark.parametrize("use_cudagraph", [True, False])
-def test_the_replay_decision_never_differs_between_a_dummy_and_a_real_step(
-    use_cudagraph,
-):
-    """The property the case above pins, stated over the whole decision.
+def test_the_replay_decision_is_a_function_of_the_batch_and_nothing_else():
+    """Every term the decision reads has to be one the whole DP group agrees on.
 
-    Every term `_replays` reads has to be one the whole DP group agrees on;
-    `use_cudagraph` and the batch are (``ForwardMode.decide`` derives both from
-    DP-unified counts), and nothing else may enter. Asserting the equality
-    rather than the two values is what makes a future third term fail here.
+    `running_bs` is, having been reduced in `sync_dp_metadata`. The step's own
+    kind is not: `is_dummy_run` is per-rank, and so is `is_prefill` (one rank
+    prefills while another decodes). Either would split the group into two
+    collective widths -- the first one measured, V4-Flash-DSpark tp8 + DPA
+    hanging 8/8 on the first real decode.
+
+    Pinned as an interface property rather than a value: the decision takes the
+    batch and nothing else, so a future term cannot be added without changing
+    this signature.
     """
-    g = _graph()
-    g._cuda_graphs[8] = ("graph", "out")
-    real = _ctx(running_bs=8, use_cudagraph=use_cudagraph)
-    dummy = _ctx(running_bs=8, use_cudagraph=use_cudagraph, dummy=True)
-    assert g.target_running_bs(8, real) == g.target_running_bs(8, dummy)
-    assert g.label(8, 8, real) == g.label(8, 8, dummy)
+    import inspect
+
+    params = list(inspect.signature(DraftGraph.is_captured).parameters)
+    assert params == ["self", "running_bs"], (
+        f"is_captured grew a term beyond the agreed batch: {params}. Anything "
+        "keyed on the step's kind is per-rank and hangs the DP group."
+    )
 
 
 def test_the_capture_gate_reaches_the_env_that_names_it(monkeypatch):
