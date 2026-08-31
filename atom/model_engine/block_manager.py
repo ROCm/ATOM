@@ -1929,25 +1929,26 @@ class BlockManager:
         comparison: paged evicting while state sits mostly vacant means the
         split is wrong, both evicting means the budget is.
 
-        The fates come from `_state_checkpoint_cache`, not from `self.state`.
-        Under PAGE the two are different objects — `self.state` is built with
-        `StateTransfer.none()` and never sees a `checkpoint()` — so reading it
-        here printed four zeros for the life of the server while
-        `checkpoint_funnel` reported the real numbers from the coordinator. Two
-        outputs with the same metric names disagreeing is how a tuning session
-        concludes checkpointing never fires. Occupancy stays on `self.state`:
-        that is the slot pool either way, and the coordinator has none.
+        The fates come from `state_checkpoint_fates()`, the aggregator, not
+        from `self.state` and not from a single `_state_checkpoint_cache`.
+        Under PAGE `self.state` is built with `StateTransfer.none()` and never
+        sees a `checkpoint()`, so reading it here printed four zeros for the
+        life of the server; and reading `_state_checkpoint_cache` alone omits
+        any second state class the aggregator folds in. Either way the number
+        disagreed with the `checkpoint_funnel` line -- which already goes
+        through the aggregator -- and two outputs with the same metric names
+        disagreeing is how a tuning session concludes checkpointing never
+        fires. Occupancy stays on `self.state`: that is the slot pool either
+        way, and the coordinator has none.
         """
-        # `_state_checkpoint_cache`, not `self.state`: under #2045 a K3
-        # checkpoint is a PAGE image the coordinator owns, and the slot pool
-        # holds none -- so reading the pool here printed `kept: 0` beside a
-        # `state checkpoints:` line saying 112, two counters for one fact
-        # disagreeing in the same log. `occupancy()` stays on the pool, which
-        # is the thing that has slots.
+        # `state_checkpoint_fates()`, matching `checkpoint_funnel`: it sums
+        # every state class, so a build with a second class is not silently
+        # undercounted here while the funnel line reports the full total.
+        # `occupancy()` stays on the pool, which is the thing that has slots.
         return (
             self.kv.eviction_stats()
             | self.state.occupancy()
-            | self._state_checkpoint_cache.checkpoint_fates()
+            | self.state_checkpoint_fates()
         )
 
     def checkpointers_at(
