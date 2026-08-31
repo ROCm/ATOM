@@ -1857,7 +1857,14 @@ class Scheduler:
             if chunk is None or (atomic_prefill and chunk < num_new_tokens):
                 self.waiting.appendleft(seq)
                 break
-            self.block_manager.allocate(seq, num_cached_blocks)
+            if not self.block_manager.allocate(seq, num_cached_blocks):
+                # A state-less joint boundary could not be privatised without
+                # risking a shared decoding sequence's blocks (finding #2).
+                # Return the seq to waiting for a clean recompute once the pool
+                # has room, and stop admitting this pass.
+                self.block_manager.deallocate(seq)
+                self.waiting.appendleft(seq)
+                break
 
             # The hit the request kept, not the one `can_allocate` offered:
             # `allocate` may disown the boundary, and `num_cached_blocks` is the
@@ -1888,7 +1895,13 @@ class Scheduler:
                         "load.",
                         seq.id,
                     )
-                    self.block_manager.cancel_state_load(seq)
+                    if not self.block_manager.cancel_state_load(seq):
+                        # Disown could not be backed (finding #2); requeue for a
+                        # clean recompute instead of parking a load into shared
+                        # blocks.
+                        self.block_manager.deallocate(seq)
+                        self.waiting.appendleft(seq)
+                        break
                 self._park_for_remote_load(seq, skipped_waiting_requests)
                 continue
 
@@ -1903,8 +1916,17 @@ class Scheduler:
                     seq.state_joint_boundary_tokens,
                     seq.num_cached_tokens,
                 )
+                # Privatise the claimed prefix (finding #2) so recompute-from-0
+                # cannot tear a shared decode. cancel_state_load does it when a
+                # CPU state load was pending; otherwise disown directly.
                 if seq.state_load_hash != -1:
-                    self.block_manager.cancel_state_load(seq)
+                    disowned = self.block_manager.cancel_state_load(seq)
+                else:
+                    disowned = self.block_manager.disown_claimed_prefix(seq)
+                if not disowned:
+                    self.block_manager.deallocate(seq)
+                    self.waiting.appendleft(seq)
+                    break
                 seq.num_cached_tokens = 0
                 seq.state_joint_boundary_tokens = 0
                 seq.state_joint_boundary_hash = -1
@@ -2252,7 +2274,11 @@ class Scheduler:
             # admission, otherwise the resume runs with `num_cached_tokens > 0`
             # over a group nobody filled -- `has_initial_state` reads that as
             # "the recurrence continues". Before `offload_loaded_tokens` is set
-            # below, so that field records the disowned figure.
+            # below, so that field records the disowned figure. Privatise the
+            # claimed prefix (finding #2): the offload resume path reuses this
+            # exact block_table without re-allocating, so recompute-from-0 would
+            # otherwise tear a shared decode.
+            disowned = self.block_manager.disown_claimed_prefix(seq)
             seq.num_cached_tokens = 0
             seq.state_load_hash = -1
             # A joint boundary that failed on either leg is not this request's
@@ -2260,6 +2286,11 @@ class Scheduler:
             # would let the connector clamp a later lookup to it.
             seq.state_joint_boundary_tokens = 0
             seq.state_joint_boundary_hash = -1
+            if not disowned:
+                # Cannot back private copies; drop the whole table so the
+                # re-admission rebuilds a clean one via can_allocate/allocate
+                # (empty block_table disqualifies the offload-resume shortcut).
+                self.block_manager.deallocate(seq)
         seq.offload_loaded = False
         seq.offload_loaded_tokens = seq.num_cached_tokens
         seq.offload_load_start_tokens = None
@@ -3872,7 +3903,11 @@ class DecodeScheduler(Scheduler):
                 if self.block_manager.can_allocate(seq) < 0:
                     logger.warning("Cannot allocate prefill")
                     break
-                self.block_manager.allocate(seq)
+                if not self.block_manager.allocate(seq):
+                    # Disown could not be backed (finding #2); leave the seq at
+                    # the front of waiting to retry once the pool has room.
+                    self.block_manager.deallocate(seq)
+                    break
             self.waiting.popleft()
 
             self.prefill_waiting[seq.id] = seq

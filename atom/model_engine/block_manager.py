@@ -439,6 +439,48 @@ class BlockManager:
         self.kv.allocate(block_id)
         return block_id
 
+    def disown_claimed_prefix(self, seq: Sequence, keep_blocks: int = 0) -> bool:
+        """Make this seq's claimed canonical prefix private, in place.
+
+        A disown sets ``num_cached_tokens = 0`` so the forward recomputes from
+        token 0, but ``block_table`` still points at the hash-indexed blocks
+        this seq took with ``kv.claim`` -- blocks another sequence may be
+        decoding out of. Recomputing writes KV in place into those shared
+        blocks and tears the other holder's values (non-reproducible
+        corruption -- this is review finding #2). This hands each claimed
+        prefix block in ``block_table[keep_blocks:]`` back (``kv.free``) and
+        drops a fresh private block (``_fresh_block``) into the same slot, so
+        the table length and every other position's mapping are unchanged. The
+        fresh tail (``hash == -1``) is already private and is left untouched;
+        so is a still-shared block below ``keep_blocks``.
+
+        Returns ``False`` when the pool cannot back the private copies -- the
+        caller must then abandon this admission (deallocate + requeue) rather
+        than run a forward over shared blocks. Only blocks still shared at
+        ``ref_count > 1`` cost a net PAGE unit here (``free`` releases nothing
+        while another holder remains), and ``can_allocate`` never reserved them
+        (it subtracts already-used hit blocks from ``num_new_blocks``); those
+        are reserved up front. ``ref_count == 1`` blocks recycle their own unit
+        and never fail.
+        """
+        if not self.enable_prefix_caching:
+            return True
+        table = seq.block_table
+        n_shared = sum(
+            1
+            for i in range(keep_blocks, len(table))
+            if self.kv.block(table[i]).hash != -1
+            and self.kv.block(table[i]).ref_count > 1
+        )
+        if n_shared and not self._ensure_page_units(n_shared):
+            return False
+        for i in range(keep_blocks, len(table)):
+            if self.kv.block(table[i]).hash == -1:
+                continue  # already-private fresh tail (or a prior disown)
+            self.kv.free(table[i])
+            table[i] = self._fresh_block()
+        return True
+
     def _checkpoint_has_room(
         self, live_blocks: int = 0, protected_hash: int | None = None
     ) -> bool:
@@ -832,7 +874,7 @@ class BlockManager:
         self._extend_hash_chain(seq, block_hashes)
         return num_cached_blocks
 
-    def allocate(self, seq: Sequence, num_cached_blocks: int = 0):
+    def allocate(self, seq: Sequence, num_cached_blocks: int = 0) -> bool:
         """Allocate blocks for `seq`. `num_cached_blocks` is the hit count
         returned by `can_allocate` (0 if caller didn't call it).
 
@@ -841,6 +883,11 @@ class BlockManager:
         KV. This keeps the manager correct under future chunked-prefill
         scheduling: a block spanning multiple steps must not be published as
         a hash until fully filled.
+
+        Returns ``True`` on success. Returns ``False`` only when a state-less
+        joint boundary had to be disowned (finding #2) and the pool could not
+        back the private prefix copies; the caller must then deallocate and
+        requeue the seq rather than run a forward over shared blocks.
         """
         assert not seq.block_table
         # Two extents, and they are not the same number. `num_cached_blocks` is
@@ -963,12 +1010,19 @@ class BlockManager:
             state_holds = False
         if not state_holds:
             # No state behind the boundary means it is not this request's
-            # history. Disown it -- blocks stay claimed and the forward
-            # recomputes. Keeping it is silent wrong output, since
-            # `has_initial_state` (`gdn_attn.py`) is `num_cached_tokens > 0`.
+            # history. Disown it -- the forward recomputes from 0. Privatise the
+            # claimed prefix first (finding #2): recomputing over the shared
+            # canonical blocks would tear another sequence's decode. Keeping the
+            # boundary is silent wrong output too, since `has_initial_state`
+            # (`gdn_attn.py`) is `num_cached_tokens > 0`.
+            if not self.disown_claimed_prefix(seq):
+                # Pool cannot back the private copies; signal the caller to
+                # deallocate and requeue for a clean recompute next pass.
+                return False
             seq.num_cached_tokens = 0
             seq.state_joint_boundary_tokens = 0
             seq.state_joint_boundary_hash = -1
+        return True
 
     def _state_leg_secured(self, seq: Sequence) -> bool:
         """Whether something will really put state behind this seq's boundary.
@@ -1131,19 +1185,27 @@ class BlockManager:
         self._state_loads.append((seq.id, hit_hash, seq.state_slot))
         return True
 
-    def cancel_state_load(self, seq: Sequence) -> None:
+    def cancel_state_load(self, seq: Sequence) -> bool:
         """Withdraw a load requested this pass, before anything was issued.
         Only legal before `take_state_loads` handed it over; afterwards the
         bytes are on their way and the slot must be held. The boundary is
-        disowned exactly as `allocate` would have.
+        disowned exactly as `allocate` would have -- including privatising the
+        claimed prefix (finding #2) so the recompute cannot tear a shared
+        decode.
+
+        Returns ``False`` when the pool cannot back the private copies; the
+        caller must abandon this admission rather than resume over the shared
+        prefix. ``True`` when there was nothing to cancel or the disown held.
         """
         if seq.state_load_hash == -1:
-            return
+            return True
         self._state_loads = [e for e in self._state_loads if e[0] != seq.id]
         if self.state_offload is not None:
             self.state_offload.abandon_load(seq.id)
         seq.state_load_hash = -1
+        disowned = self.disown_claimed_prefix(seq)
         seq.num_cached_tokens = 0
+        return disowned
 
     def abandon_state_load(self, req_id) -> None:
         """Give up on a load without blaming the bytes for it.

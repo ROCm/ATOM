@@ -118,6 +118,87 @@ class TestJointClaimReusesResidentBlocks:
         assert len(set(seq.block_table)) == 5
 
 
+class TestDisownClaimedPrefix:
+    """A disown recomputes from token 0 while the block table still points at
+    hash-indexed blocks a *live* peer is decoding out of. Recomputing writes KV
+    in place into those shared blocks and tears the peer's values (review
+    finding #2 -- the precision-corruption main suspect). `disown_claimed_prefix`
+    hands each shared claimed block back and drops a fresh private block into the
+    same slot, so the forward can only overwrite blocks this seq owns alone.
+    """
+
+    def _shared_prefix(self, seq_factory, num_kvcache_blocks=32):
+        """Two live seqs sharing a 4-block claimed prefix (ref_count == 2)."""
+        cfg = MockConfig(
+            num_kvcache_blocks=num_kvcache_blocks,
+            kv_cache_block_size=4,
+            enable_prefix_caching=True,
+        )
+        bm = BlockManager(cfg)
+        tokens = list(range(20))
+        holder = seq_factory(tokens)
+        bm.allocate(holder, 0)
+        bm.hash_blocks(holder, len(tokens))
+        # A second live seq claims the same 4 resident blocks via the joint
+        # boundary -- now every prefix block is held at ref_count == 2.
+        seq = seq_factory(tokens)
+        seq.state_joint_claim_tokens = 16
+        bm.allocate(seq, 2)
+        shared = list(seq.block_table[:4])
+        assert all(bm.kv.block(b).ref_count == 2 for b in shared)
+        return bm, holder, seq, shared
+
+    def test_disown_privatizes_shared_blocks_in_place(self, seq_factory):
+        bm, holder, seq, shared = self._shared_prefix(seq_factory)
+        table_before = list(seq.block_table)
+
+        assert bm.disown_claimed_prefix(seq) is True
+
+        # Same length, same tail slot -- only the shared prefix slots changed.
+        assert len(seq.block_table) == len(table_before)
+        assert seq.block_table[4] == table_before[4]
+        # The four claimed slots now hold fresh private blocks: none is one of
+        # the shared canonical blocks, and each is hash == -1 (private).
+        for i in range(4):
+            assert seq.block_table[i] not in shared
+            assert bm.kv.block(seq.block_table[i]).hash == -1
+        # The peer still holds every shared block, now back at ref_count == 1.
+        assert list(holder.block_table[:4]) == shared
+        for b in shared:
+            assert bm.kv.block(b).ref_count == 1
+
+    def test_disown_leaves_no_leak_after_deallocate(self, seq_factory):
+        bm, holder, seq, _ = self._shared_prefix(seq_factory)
+        bm.disown_claimed_prefix(seq)
+        bm.deallocate(seq)
+        bm.deallocate(holder)
+        assert bm.kv.num_used == 0
+
+    def test_disown_fails_when_pool_cannot_back_private_copies(self, seq_factory):
+        # 6 blocks: holder takes 4, seq's fresh tail takes 1, leaving 1 free --
+        # fewer than the 4 private copies the disown needs, so it must refuse
+        # rather than silently reuse the shared blocks.
+        bm, holder, seq, shared = self._shared_prefix(seq_factory, num_kvcache_blocks=6)
+        assert bm.kv.has_free(4) is False
+
+        assert bm.disown_claimed_prefix(seq) is False
+
+        # Refusal is total: the table is untouched and the peer's blocks are
+        # still shared, so the caller can safely deallocate + requeue.
+        assert list(seq.block_table[:4]) == shared
+        for b in shared:
+            assert bm.kv.block(b).ref_count == 2
+
+    def test_disown_is_a_noop_without_prefix_caching(self, seq_factory):
+        cfg = MockConfig(num_kvcache_blocks=8, kv_cache_block_size=4)
+        bm = BlockManager(cfg)
+        seq = seq_factory(list(range(16)))
+        bm.allocate(seq)
+        table_before = list(seq.block_table)
+        assert bm.disown_claimed_prefix(seq) is True
+        assert list(seq.block_table) == table_before
+
+
 # ── allocate / deallocate ──────────────────────────────────────────────────
 
 
