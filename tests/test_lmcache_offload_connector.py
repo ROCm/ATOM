@@ -5092,12 +5092,18 @@ def test_the_shells_no_impl_fallbacks_match_what_the_caller_unpacks():
 # ── kimi_k3: the two joint legs report different identities ───────────────
 
 
-def _k3_worker() -> KimiK3OffloadConnector:
-    """Only what the joint overrides touch. `_state_tier` is a sentinel object
-    because `get_finished` refuses to run its state half without one."""
+def _k3_worker(*, tier: bool = True) -> KimiK3OffloadConnector:
+    """Only what the joint overrides touch.
+
+    `_state_tier` is a truthy sentinel by default and never called: these tests
+    drive `_arm_joint_loads`/`_settle_joint` directly. It has to be present
+    because both refuse to coordinate a park without a tier -- with no tier the
+    state leg is unsettleable, so a KV-only passthrough is the correct
+    behaviour. `tier=False` exercises that path.
+    """
     c = KimiK3OffloadConnector.__new__(KimiK3OffloadConnector)
     c._joint_park = _JointPark()
-    c._state_tier = None
+    c._state_tier = object() if tier else None
     c._do_load = True
     return c
 
@@ -5177,6 +5183,19 @@ class TestJointLegsShareOneCompletionIdentity:
         assert park._need == {}
         assert park._alias == {}
         assert park._alias_of == {}
+
+    def test_with_no_tier_the_kv_leg_is_not_parked_at_all(self):
+        """The state leg is unsettleable without a tier -- `_start_state_loads`
+        fails those loads for recompute -- so arming would leave the park owing
+        a KV leg forever and leak an entry per load. A KV-only passthrough is
+        what a load with no state leg should do."""
+        worker = _k3_worker(tier=False)
+        req = _k3_load_req("r1")
+        worker._arm_joint_loads(
+            SimpleNamespace(state_loads=[("r1", 99, 0)], requests=[req])
+        )
+        assert not worker._joint_park.waits_for(req.load_operation)
+        assert worker._joint_park._need == {}
 
     def test_a_single_leg_request_still_passes_straight_through(self):
         """Nothing armed it, so neither channel may be held back."""

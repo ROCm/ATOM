@@ -1265,9 +1265,7 @@ class BlockManager:
             return 0
         cutoff = monotonic() - timeout_s
         stale = [
-            req_id
-            for req_id, at in self._orphan_load_slots_at.items()
-            if at <= cutoff
+            req_id for req_id, at in self._orphan_load_slots_at.items() if at <= cutoff
         ]
         for req_id in stale:
             self._orphan_load_slots_at.pop(req_id, None)
