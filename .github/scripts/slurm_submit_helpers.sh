@@ -350,7 +350,13 @@ read_slurm_exit_code() {
   deadline=$(( $(date +%s) + SLURM_ACCOUNTING_TIMEOUT ))
   while true; do
     if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
-      sacct_line="$(sacct --account "${SLURM_ACCOUNT}" --brief --noheader 2>/dev/null | awk -v job_id="${job_id}" '$1 == job_id { print $2 "|" $3; exit }' || true)"
+      if [[ -n "${SLURM_ACCOUNT:-}" ]]; then
+        sacct_line="$(sacct --account "${SLURM_ACCOUNT}" --brief --noheader 2>/dev/null | awk -v job_id="${job_id}" '$1 == job_id { print $2 "|" $3; exit }' || true)"
+      elif [[ -n "${SPUR_ACCOUNTING_ADDR:-}" ]]; then
+        sacct_line="$(sacct --accounting "${SPUR_ACCOUNTING_ADDR}" --brief --noheader 2>/dev/null | awk -v job_id="${job_id}" '$1 == job_id { print $2 "|" $3; exit }' || true)"
+      else
+        sacct_line="$(sacct -j "${job_id}" -X -n -P -o State,ExitCode 2>/dev/null | awk -F'|' 'NF { print; exit }' || true)"
+      fi
     else
       sacct_line="$(sacct -j "${job_id}" -X -n -P -o State,ExitCode 2>/dev/null | awk -F'|' 'NF { print; exit }' || true)"
     fi
