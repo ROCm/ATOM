@@ -558,62 +558,103 @@ function atomeshHardwareKey(value) {
   return text || 'unknown';
 }
 
+// process_result.py names the interactivity column after the definition that
+// produced it ("Interactivity (P90 E2E Normalized)"), so the key is not a fixed
+// string. Everything else in the table has a stable header.
+const ATOMESH_INTERACTIVITY_KEY = 'interactivity';
+
+function atomeshSummaryInteractivityKey(headers) {
+  return headers.find(header => header.startsWith(ATOMESH_INTERACTIVITY_KEY))
+    || ATOMESH_INTERACTIVITY_KEY;
+}
+
+// TP/DCP cells collapse to a single number when prefill and decode agree and
+// read "P8/D4" when they do not.
+function parseAtomeshPdLabel(text) {
+  const value = String(text || '').trim();
+  const split = value.match(/^P(\d+)\s*\/\s*D(\d+)$/i);
+  if (split) return { prefill: Number(split[1]), decode: Number(split[2]) };
+  const single = parseAtomeshNumber(value);
+  return { prefill: single, decode: single };
+}
+
 function parseAtomeshSummaryRows(markdown) {
-  const lines = String(markdown || '').split(/\r?\n/).filter(line => line.trim().startsWith('|'));
+  const lines = String(markdown || '')
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(line => line.startsWith('|'));
   if (lines.length < 3) return [];
   const headers = lines[0].split('|').slice(1, -1).map(h => atomeshSummaryHeaderKey(h.trim()));
-  return lines.slice(2).map((line, idx) => {
-    const cells = line.split('|').slice(1, -1).map(cell => cell.trim());
-    const raw = {};
-    headers.forEach((header, i) => { raw[header] = cells[i] || ''; });
-    const [isl, osl] = String(raw.islosl || '').split('/');
-    const totalTputPerGpu = parseAtomeshNumber(raw.totaltoksgpu);
-    const outputTputPerGpu = parseAtomeshNumber(raw.outputtoksgpu);
-    // One column per definition (see write_summary in process_result.py), so
-    // which one is populated is itself the method -- there is no discriminator
-    // column to read. A row carries at most one of these two.
-    const intvtyE2eNorm = parseAtomeshNumber(raw.intvtye2enorm);
-    const intvtyMedianTpot = parseAtomeshNumber(raw.intvtymediantpot);
-    const interactivity = Number.isFinite(intvtyE2eNorm) ? intvtyE2eNorm : intvtyMedianTpot;
-    const gsm8k = parseAtomeshNumber(raw.gsm8k);
-    const cacheHitPct = parseAtomeshNumber(String(raw.cachehit || '').replace('%', ''));
-    const accuracyScore = parseAtomeshNumber(raw.accuracy) ?? gsm8k;
-    const accuracyTask = raw.accuracytask || (Number.isFinite(gsm8k) ? 'gsm8k' : '');
-    return {
-      id: `atomesh-summary-${idx}`,
-      backend: ATOMESH_DATA.backend,
-      hardware: atomeshHardwareKey(raw.hardware),
-      model: raw.model || 'unknown',
-      topology: raw.topology || 'unknown',
-      islOsl: raw.islosl || '--',
-      isl: parseAtomeshNumber(isl),
-      osl: parseAtomeshNumber(osl),
-      concurrency: parseAtomeshNumber(raw.concurrency),
-      interactivity,
-      interactivityMethod: Number.isFinite(intvtyE2eNorm) ? 'p90_e2e_normalized' : 'median_tpot',
-      interactivityP90Itl: parseAtomeshNumber(raw.intvtyp90itl),
-      totalTput: parseAtomeshNumber(raw.totaltoks),
-      inputTput: parseAtomeshNumber(raw.inputtoks),
-      outputTput: parseAtomeshNumber(raw.outputtoks),
-      totalTputPerGpu,
-      inputTputPerGpu: parseAtomeshNumber(raw.inputtoksgpu),
-      outputTputPerGpu,
-      ttftMs: parseAtomeshNumber(raw.ttftms),
-      tpotMs: parseAtomeshNumber(raw.tpotms),
-      e2eMs: parseAtomeshNumber(raw.e2ems),
-      // The summary table prints this column as a percentage; the point payload
-      // carries a 0-1 fraction, so normalise to the fraction here too.
-      cacheHitRate: cacheHitPct != null ? cacheHitPct / 100 : null,
-      accuracyTask,
-      accuracyMetric: accuracyTask === 'gsm8k' ? 'flexible-extract' : '',
-      accuracyScore,
-      accuracyRaw: raw.accuracy || raw.gsm8k || '--',
-      gsm8k,
-      gsm8kRaw: raw.gsm8k || '--',
-      runUrl: ATOMESH_DATA.runUrl,
-      status: Number.isFinite(interactivity) && Number.isFinite(totalTputPerGpu ?? outputTputPerGpu) ? 'completed' : 'incomplete',
-    };
-  }).filter(row => row.model !== 'unknown' || row.topology !== 'unknown');
+  const interactivityKey = atomeshSummaryInteractivityKey(headers);
+  // A bare "Interactivity" header means the table mixes both definitions and so
+  // cannot name one. Leave the method unset rather than inventing one; older
+  // summaries carried it in an "Intvty def" column of their own, which still wins.
+  const headerMethod = interactivityKey === ATOMESH_INTERACTIVITY_KEY ? '' : interactivityKey;
+  return lines.slice(2)
+    // Guard against a second table appended below this one: its alignment row
+    // would otherwise be read as data.
+    .filter(line => !/^\|[\s:|-]+\|$/.test(line))
+    .map((line, idx) => {
+      const cells = line.split('|').slice(1, -1).map(cell => cell.trim());
+      const raw = {};
+      headers.forEach((header, i) => { raw[header] = cells[i] || ''; });
+      const [isl, osl] = String(raw.islosl || '').split('/');
+      const totalTputPerGpu = parseAtomeshNumber(raw.totaltoksgpu);
+      const outputTputPerGpu = parseAtomeshNumber(raw.outputtoksgpu);
+      const interactivity = parseAtomeshNumber(raw[interactivityKey]);
+      const gsm8k = parseAtomeshNumber(raw.gsm8k);
+      const cacheHitPct = parseAtomeshNumber(String(raw.cachehit || '').replace('%', ''));
+      const accuracyScore = parseAtomeshNumber(raw.accuracy) ?? gsm8k;
+      const accuracyTask = raw.accuracytask || (Number.isFinite(gsm8k) ? 'gsm8k' : '');
+      const tp = parseAtomeshPdLabel(raw.tp);
+      const dcp = parseAtomeshPdLabel(raw.dcp);
+      return {
+        id: `atomesh-summary-${idx}`,
+        backend: ATOMESH_DATA.backend,
+        hardware: atomeshHardwareKey(raw.hardware),
+        model: raw.model || 'unknown',
+        topology: raw.topology || 'unknown',
+        islOsl: raw.islosl || '--',
+        isl: parseAtomeshNumber(isl),
+        osl: parseAtomeshNumber(osl),
+        concurrency: parseAtomeshNumber(raw.concurrency),
+        interactivity,
+        interactivityMethod: atomeshInteractivityMethod(raw.intvtydef || headerMethod),
+        totalTput: parseAtomeshNumber(raw.totaltoks),
+        inputTput: parseAtomeshNumber(raw.inputtoks),
+        outputTput: parseAtomeshNumber(raw.outputtoks),
+        totalTputPerGpu,
+        inputTputPerGpu: parseAtomeshNumber(raw.inputtoksgpu),
+        outputTputPerGpu,
+        // `*ms` are the pre-p90 header spellings, kept so summaries archived
+        // before the percentile columns landed still populate the mean.
+        ttftMs: parseAtomeshNumber(raw.ttftmeanms ?? raw.ttftms),
+        ttftP90Ms: parseAtomeshNumber(raw.ttftp90ms),
+        ttftP99Ms: parseAtomeshNumber(raw.ttftp99ms),
+        tpotMs: parseAtomeshNumber(raw.tpotmeanms ?? raw.tpotms),
+        tpotP90Ms: parseAtomeshNumber(raw.tpotp90ms),
+        tpotP99Ms: parseAtomeshNumber(raw.tpotp99ms),
+        e2eMs: parseAtomeshNumber(raw.e2emeanms ?? raw.e2ems),
+        e2eP90Ms: parseAtomeshNumber(raw.e2ep90ms),
+        e2eP99Ms: parseAtomeshNumber(raw.e2ep99ms),
+        prefillTp: tp.prefill,
+        decodeTp: tp.decode,
+        prefillDcp: dcp.prefill,
+        decodeDcp: dcp.decode,
+        speculativeMethod: raw.spec && raw.spec !== '--' ? raw.spec : '',
+        // The summary table prints this column as a percentage; the point payload
+        // carries a 0-1 fraction, so normalise to the fraction here too.
+        cacheHitRate: cacheHitPct != null ? cacheHitPct / 100 : null,
+        accuracyTask,
+        accuracyMetric: accuracyTask === 'gsm8k' ? 'flexible-extract' : '',
+        accuracyScore,
+        accuracyRaw: raw.accuracy || raw.gsm8k || '--',
+        gsm8k,
+        gsm8kRaw: raw.gsm8k || '--',
+        runUrl: ATOMESH_DATA.runUrl,
+        status: Number.isFinite(interactivity) && Number.isFinite(totalTputPerGpu ?? outputTputPerGpu) ? 'completed' : 'incomplete',
+      };
+    }).filter(row => row.model !== 'unknown' || row.topology !== 'unknown');
 }
 
 function parseAtomeshPerfPointExtra(extra) {
@@ -674,8 +715,14 @@ function atomeshPointRow(point, meta, idx) {
     inputTputPerGpu: atomeshPointNumber(point, 'input_tput_per_gpu'),
     outputTputPerGpu,
     ttftMs: atomeshPointNumber(point, 'ttft_ms'),
+    ttftP90Ms: atomeshPointNumber(point, 'ttft_p90'),
+    ttftP99Ms: atomeshPointNumber(point, 'ttft_p99'),
     tpotMs: atomeshPointNumber(point, 'tpot_ms'),
+    tpotP90Ms: atomeshPointNumber(point, 'tpot_p90'),
+    tpotP99Ms: atomeshPointNumber(point, 'tpot_p99'),
     e2eMs: atomeshPointNumber(point, 'e2el_ms'),
+    e2eP90Ms: atomeshPointNumber(point, 'e2el_p90'),
+    e2eP99Ms: atomeshPointNumber(point, 'e2el_p99'),
     // Prefill prefix-cache token hit rate, 0-1. Only present for cases that run
     // with prefix caching on and long enough for the engine to report it.
     cacheHitRate: atomeshPointNumber(point, 'cache_hit_rate'),
@@ -700,6 +747,9 @@ function atomeshPointRow(point, meta, idx) {
     totalGpu: atomeshPointNumber(point, 'total_gpu'),
     prefillTp: atomeshPointNumber(point, 'prefill_tp'),
     decodeTp: atomeshPointNumber(point, 'decode_tp'),
+    prefillDcp: atomeshPointNumber(point, 'prefill_dcp'),
+    decodeDcp: atomeshPointNumber(point, 'decode_dcp'),
+    speculativeMethod: point.speculative_method || '',
     prefillWorkers: atomeshPointNumber(point, 'prefill_workers'),
     decodeWorkers: atomeshPointNumber(point, 'decode_workers'),
     numPrefillGpu: atomeshPointNumber(point, 'num_prefill_gpu'),
@@ -3134,6 +3184,30 @@ function atomeshTpLabel(row) {
   }
   return row.prefillTp ?? row.decodeTp ?? '—';
 }
+function atomeshDcpLabel(row) {
+  if (row.prefillDcp != null && row.decodeDcp != null && row.prefillDcp !== row.decodeDcp) {
+    return `P${row.prefillDcp}/D${row.decodeDcp}`;
+  }
+  return row.prefillDcp ?? row.decodeDcp ?? '—';
+}
+// process_result.py folds the token count into the method ("dspark-3") on both
+// the point and the summary paths, so this only has to reject the em-dash
+// placeholder a summary row carries when the case runs no speculative decoding.
+function atomeshSpeculativeLabel(row) {
+  const method = String(row.speculativeMethod || '').trim();
+  return !method || method === '--' ? '—' : method;
+}
+// Three statistics per metric: an agentic trace routinely has a p99 TTFT an order
+// of magnitude above its mean, which a lone averaged number hides completely.
+function atomeshLatencyRowsHTML(row) {
+  return [
+    ['TTFT', row.ttftMs, row.ttftP90Ms, row.ttftP99Ms],
+    ['TPOT', row.tpotMs, row.tpotP90Ms, row.tpotP99Ms],
+    ['E2E', row.e2eMs, row.e2eP90Ms, row.e2eP99Ms],
+  ].map(([label, mean, p90, p99]) => `<div class="pop-row"><span class="pop-key">${label} mean / p90 / p99 (ms)</span><span class="pop-val">${
+    [mean, p90, p99].map(v => Number.isFinite(v) ? fmtNum(v, 2) : '—').join(' / ')
+  }</span></div>`).join('');
+}
 function atomeshDpAttentionLabel(row) {
   if (row.prefillDpa && row.decodeDpa) return 'True';
   if (row.prefillDpa) return 'Prefill only';
@@ -3157,11 +3231,10 @@ function atomeshCacheHitRowHTML(row) {
 // 1/p90(ITL) -- and so gets its own row rather than sharing this one.
 function atomeshInteractivityRowHTML(row) {
   const isP90 = row.interactivityMethod === 'p90_e2e_normalized';
-  const key = isP90 ? 'E2E Norm. Interactivity p90 (tok/s/user)' : 'Interactivity (tok/s/user)';
-  const note = isP90 || !Number.isFinite(row.interactivity)
-    ? ''
-    : ` <span style="color:var(--text-tertiary)">(median TPOT)</span>`;
-  let html = `<div class="pop-row"><span class="pop-key">${key}</span><span class="pop-val">${atomeshDetailValue(row.interactivity, v => fmtNum(v, 3))}${note}</span></div>`;
+  // Same wording as the markdown summary's column header, so the two read as
+  // the same metric rather than two that happen to share a name.
+  const definition = isP90 ? 'P90 E2E Normalized' : '1 / median_tpot_s';
+  let html = `<div class="pop-row"><span class="pop-key">Interactivity (${definition}) (tok/s/user)</span><span class="pop-val">${atomeshDetailValue(row.interactivity, v => fmtNum(v, 3))}</span></div>`;
   // Second row only when the plain metric was actually measured: rendering an
   // em dash for every legacy point would suggest a value went missing rather
   // than that the run predates the metric.
@@ -3188,16 +3261,18 @@ function showAtomeshPopover(row) {
       <div class="pop-row"><span class="pop-key">Input Token Throughput per GPU</span><span class="pop-val">${atomeshDetailValue(row.inputTputPerGpu, v => fmtNum(v, 3))}</span></div>
       <div class="pop-row"><span class="pop-key">Output Token Throughput per GPU</span><span class="pop-val">${atomeshDetailValue(row.outputTputPerGpu, v => fmtNum(v, 3))}</span></div>
       <div class="pop-row"><span class="pop-key">Total tok/s</span><span class="pop-val">${atomeshDetailValue(row.totalTput, v => fmtNum(v, 3))}</span></div>
-      <div class="pop-row"><span class="pop-key">TTFT / TPOT / E2E</span><span class="pop-val">${[row.ttftMs, row.tpotMs, row.e2eMs].map(v => v != null ? fmtNum(v, 2) : '—').join(' / ')} ms</span></div>
+      ${atomeshLatencyRowsHTML(row)}
       ${atomeshCacheHitRowHTML(row)}
     </div>
     <div class="pop-section">
       <div class="pop-row"><span class="pop-key">Topology</span><span class="pop-val" style="font-family:inherit">${escHTML(row.sourceTopology || row.topology || '—')}</span></div>
       <div class="pop-row"><span class="pop-key">Total GPUs</span><span class="pop-val">${atomeshDetailValue(row.totalGpu)}</span></div>
       <div class="pop-row"><span class="pop-key">Tensor Parallelism</span><span class="pop-val">${escHTML(String(atomeshTpLabel(row)))}</span></div>
+      <div class="pop-row"><span class="pop-key">Decode Context Parallelism</span><span class="pop-val">${escHTML(String(atomeshDcpLabel(row)))}</span></div>
+      <div class="pop-row"><span class="pop-key">Speculative Method</span><span class="pop-val">${escHTML(atomeshSpeculativeLabel(row))}</span></div>
       <div class="pop-row"><span class="pop-key">Prefill/Decode Workers</span><span class="pop-val">${row.prefillWorkers ?? '—'} / ${row.decodeWorkers ?? '—'}</span></div>
       <div class="pop-row"><span class="pop-key">Prefill/Decode GPUs</span><span class="pop-val">${row.numPrefillGpu ?? '—'} / ${row.numDecodeGpu ?? '—'}</span></div>
-      <div class="pop-row"><span class="pop-key">Expert Parallelism</span><span class="pop-val">${atomeshDetailValue(row.expertParallelism ?? 1)}</span></div>
+      <div class="pop-row"><span class="pop-key">Expert Parallelism</span><span class="pop-val">${atomeshDetailValue(row.expertParallelism)}</span></div>
       <div class="pop-row"><span class="pop-key">DP Attention</span><span class="pop-val">${atomeshDpAttentionLabel(row)}</span></div>
       <div class="pop-row"><span class="pop-key">Concurrency</span><span class="pop-val">${atomeshDetailValue(row.concurrency)}</span></div>
       <div class="pop-row"><span class="pop-key">Precision</span><span class="pop-val">${escHTML(String(row.precision || '—').toUpperCase())}</span></div>
