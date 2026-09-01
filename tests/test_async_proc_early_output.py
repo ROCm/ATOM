@@ -24,7 +24,6 @@ class _Runner:
     def forward(self):
         assert self.output_sink is not None
         self.output_sink("early")
-        return None
 
     def dummy_execution(self):
         # Nested/self-driven forwards must not publish an unsolicited response.
