@@ -93,6 +93,7 @@ class EagleProposer(Drafter):
         if self.runner.use_mrope or self.mtp_k < 2:
             # mtp_k == 1 has no step 1+, so warming one would capture a graph
             # `propose` can never reach.
+            self._reuse_step_buffers = False
             return ()
         draft_hf = self.speculative_config.draft_model_hf_config
         # DeepSeek-V4 carries the mHC residual, so its hidden is [N, hc, dim]
@@ -115,6 +116,9 @@ class EagleProposer(Drafter):
                 dtype=self.dtype,
             ),
         }
+        self._reuse_step_buffers = bool(
+            getattr(self.model, "supports_draft_buffer_reuse", False)
+        )
         self.step = DraftGraph(
             forward=self._step_forward,
             epilogue=self._step_head,
@@ -139,7 +143,9 @@ class EagleProposer(Drafter):
             input_ids=input_ids, positions=positions, hidden_states=hidden_states
         )
 
-    def _step_head(self, out, running_bs, **_):
+    def _step_head(
+        self, out, running_bs, *, input_ids, hidden_states, **_
+    ):
         """The mid-step's draft ids, recorded with the backbone that made them.
 
         Both come back because the next mid-step reads the hidden states and
@@ -147,6 +153,10 @@ class EagleProposer(Drafter):
         `[:scheduled_bs]`: a capture bakes the length it was made at. Slicing
         is the caller's, on the way out.
         """
+        if self._reuse_step_buffers:
+            hidden_states.copy_(out[:running_bs])
+            self.model.compute_draft_ids(hidden_states, out=input_ids)
+            return hidden_states, input_ids
         return out, self.model.compute_draft_ids(out)
 
     def _build_draft_model(self, model_class) -> nn.Module:
@@ -600,11 +610,26 @@ class EagleProposer(Drafter):
                 # Step 0 gathers one row per sequence out of the token stream;
                 # steps 1+ already are one row per sequence -- sliced back off
                 # the padded batch, so nothing downstream sees a pad row.
-                sample_hidden_states = (
-                    torch.index_select(ret_hidden_states, 0, last_token_indices)
-                    if i == 0
-                    else ret_hidden_states[:scheduled_bs]
-                )
+                if i == 0:
+                    hidden_out = (
+                        self.step.buffer("hidden_states", scheduled_bs)
+                        if self._reuse_step_buffers
+                        else None
+                    )
+                    sample_hidden_states = (
+                        torch.index_select(
+                            ret_hidden_states,
+                            0,
+                            last_token_indices,
+                            out=hidden_out,
+                        )
+                        if hidden_out is not None
+                        else torch.index_select(
+                            ret_hidden_states, 0, last_token_indices
+                        )
+                    )
+                else:
+                    sample_hidden_states = ret_hidden_states[:scheduled_bs]
                 # Only step 0 and a flavor with no declared pass land here; a
                 # recorded mid-step produced its ids inside the graph.
                 # Every draft model EagleProposer can build implements this --
@@ -615,9 +640,20 @@ class EagleProposer(Drafter):
                 # compute_logits().argmax(-1) here because is_draft suppresses
                 # the LM head's prefill last-token slice. How the ids are
                 # produced stays the model's business, not this loop's.
+                ids_out = (
+                    self.step.buffer("input_ids", scheduled_bs)
+                    if self._reuse_step_buffers
+                    and graphed_ids is None
+                    and i + 1 < self.mtp_k
+                    else None
+                )
                 new_draft_ids = (
                     graphed_ids[:scheduled_bs]
                     if graphed_ids is not None
+                    else self.model.compute_draft_ids(
+                        sample_hidden_states, out=ids_out
+                    )
+                    if ids_out is not None
                     else self.model.compute_draft_ids(sample_hidden_states)
                 )
                 draft_token_ids[:, i] = new_draft_ids
