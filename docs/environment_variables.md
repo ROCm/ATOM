@@ -78,9 +78,6 @@ no wall-clock skew). See `atom/model_engine/prefill_delayer.py`. Active only whe
 | **ATOM_GLM5_KPOOL** | bool | 1 (true) | Enable the pooled sparse indexer. Setting `0` is an exact token-granular A/B only at or below `index_topk`; longer requests are refused. |
 | **ATOM_GLM5_FORCE_DENSE_MLA** | bool | 0 (false) | Disable sparse MLA for short-context bring-up comparisons. |
 | **ATOM_GLM5_DISABLE_FUSED_MHC** | bool | 0 (false) | Force the PyTorch mHC reference path instead of AITER's fused kernels. |
-| **ATOM_GLM5_KPOOL_DUMP** | str | — | Output prefix for dumping pooled/token-granular selections. |
-| **ATOM_GLM5_KPOOL_DUMP_LAYER** | str | — | Restrict selection dumps to one layer prefix; defaults to the current layer when unset. |
-| **ATOM_GLM5_KPOOL_REF** | bool | 0 (false) | Read pooled keys back from the real cache and log a reference comparison. Debug-only; synchronizes the device. |
 
 ## MoE all2all (MoRI) wire format
 

@@ -2034,17 +2034,19 @@ class Config:
         # set here and the attention builder sizes the index cache from it.
         is_glm5_next = any("Glm5Next" in str(a) for a in arches)
         if is_glm5_next:
-            unsupported_parallelism = []
+            unsupported_features = []
             if self.prefill_context_parallel_size > 1:
-                unsupported_parallelism.append("PCP")
+                unsupported_features.append("PCP")
             if self.decode_context_parallel_size > 1:
-                unsupported_parallelism.append("DCP")
+                unsupported_features.append("DCP")
             if self.speculative_config is not None:
-                unsupported_parallelism.append("speculative decoding")
-            if unsupported_parallelism:
+                unsupported_features.append("speculative decoding")
+            if self.enable_tbo or self.enable_tbo_decode:
+                unsupported_features.append("TBO")
+            if unsupported_features:
                 raise ValueError(
                     "GLM-5.3-Flash text serving does not yet support "
-                    f"{', '.join(unsupported_parallelism)}"
+                    f"{', '.join(unsupported_features)}"
                 )
             index_kpool = int(getattr(self.hf_config, "index_kpool", 1) or 1)
             if index_kpool > 1:

@@ -1373,8 +1373,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 # prefix plus previous query tokens in this chunk, not future chunk
                 # tokens.
                 seq_starts = var["cu_seqlens_k"].np[:bs]
-                seq_lens = var["cu_seqlens_k"].np[1 : bs + 1] - seq_starts
-                cached_lens = seq_lens - counts
+                full_seq_lens = var["cu_seqlens_k"].np[1 : bs + 1] - seq_starts
+                cached_lens = full_seq_lens - counts
                 repeated_seq_starts = np.repeat(seq_starts, counts)
                 repeated_cached_lens = np.repeat(cached_lens, counts)
                 var["cu_seqlen_ks"].np[:sum_scheduled_tokens] = np.repeat(
@@ -1392,6 +1392,14 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     var["cu_seqlens_q"].np[:bs], counts
                 )
                 sparse_counts = local_offsets + 1
+                full_seq_lens = counts
+            if self.index_kpool > 1:
+                # The pooled gather output must have exactly this many rows.
+                # Compute it from host metadata already owned by the builder,
+                # instead of synchronizing on pool_cu[-1] in every indexer layer.
+                attn_metadata.kpool_total_pools = int(
+                    np.sum(full_seq_lens // self.index_kpool)
+                )
             attn_metadata.cu_seqlen_ks = var["cu_seqlen_ks"].copy_to_gpu(
                 sum_scheduled_tokens
             )

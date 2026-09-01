@@ -61,8 +61,8 @@ assembly plus one new op, not a from-scratch port.
 | --- | --- | --- |
 | KDA linear attention | `KimiKDAAttention` (`models/kimi_k3.py`), aiter `kimi_delta_attn` Triton kernels | Very close. Same **separate `q/k/v_conv1d`** layout as the checkpoint, per-head `A_log`, per-channel `dt_bias`, `f_a`/`f_b` forget gate, and it already reads `linear_attn_config.gate_lower_bound`. |
 | mHC hyper-connections | `hc_split_sinkhorn` (`model_ops/sparse_attn_v4.py`), `Block.hc_pre`/`hc_post` (`models/deepseek_v4.py`) | **Math-exact.** Same sigmoid gates, same Sinkhorn schedule including the special first iteration, same `HC_POST_MULT = 2.0`. Checkpoint tensor names (`hc_attn_fn`/`base`/`scale`) are already what `Block` expects, and `hc_attn_fn` is `[24, 16384]` = exactly its `mixes` layout. `dim=4096` satisfies the fused aiter `mhc_pre`/`mhc_post` `% 512 == 0` constraint. |
-| k-pool DSA indexer | **new** — `model_ops/glm5_next/kpool.py`, with CPU geometry tests and direct GPU kernel/reference parity tests | DeepSeek-V4's `Compressor` pools the same way at `compress_ratio=4` with an `ape` term, but overlapping + RoPE'd. GLM's is non-overlapping and NoPE. |
-| MLA | `model_ops/attention_mla.py` via `MLAModules`, NoPE via `_NoPositionalRotaryEmbedding` | Needs the rope block materialized at `_ROPE_PAD = 64` lanes of zeros, giving the 576-wide KV entry every ROCm MLA kernel assumes. A zero-*width* slice is not viable — see §4d. |
+| k-pool DSA indexer | **new** — dispatch in `model_ops/glm5_next/indexer.py`, kernels in `model_ops/glm5_next/kpool.py`, with CPU geometry tests and direct GPU kernel/reference parity tests | DeepSeek-V4's `Compressor` pools the same way at `compress_ratio=4` with an `ape` term, but overlapping + RoPE'd. GLM's is non-overlapping and NoPE. |
+| MLA | `model_ops/attention_mla.py` via `MLAModules`, NoPE via `NoPositionalRotaryEmbedding` | Needs the rope block materialized at `_ROPE_PAD = 64` lanes of zeros, giving the 576-wide KV entry every ROCm MLA kernel assumes. A zero-*width* slice is not viable — see §4d. |
 | MoE 288 × sigmoid/`noaux_tc` | `model_ops/fused_moe`, `models/glm4_moe.py`, `deepseek_v2.py` | Direct. |
 | Block FP8 128×128 | existing DeepSeek block-FP8 path | Direct. |
 | MTP (layer 45) | `deepseek_mtp.py` / `glm4_moe_mtp.py` | Layer 45 is a full DSA layer plus `eh_proj`/`enorm`/`hnorm`/`shared_head.norm`. `index_share_for_mtp_iteration` means it reuses the main model's top-k. |
@@ -97,8 +97,9 @@ the loader's past-last-layer filter. Only the expert and q/k/v fusions go throug
 
 ## 3. What is validated
 
-The serving implementation is `atom/model_ops/glm5_next/kpool.py`; there is no
-second, dead indexer implementation. Its contracts are covered at three levels:
+The serving implementation is split between
+`atom/model_ops/glm5_next/{indexer,kpool}.py`; there is no second, dead indexer
+implementation. Its contracts are covered at three levels:
 
 * `tests/model_ops/test_glm5_kpool_geometry.py` runs on CPU and pins the shared
   producer/metadata output width, including `ATOM_GLM5_KPOOL=0`.
@@ -314,12 +315,9 @@ tower was removed from this text-only landing because no processor can produce
 its inputs under the pinned transformers version; loading it only consumed VRAM
 and left unexercised packed-weight mappings in production.
 
-**Known numerical gap.** GLM clamps its expert SwiGLU at ±`swiglu_limit` (10.0),
-but only ATOM's `flydsl` and `mori` MoE paths plumb `swiglu_limit`; the default
-`standard`/CK path (`ck_moe_stage1/2`) drops it. Measured on the reference: the
-clamp binds on under 0.001% of elements, with max |gate| 19.6 and max |up| 14.2 —
-so it is real but small. The dense layers (0–2) are unaffected; they go through
-`swiglu_oai_split`.
+GLM's expert SwiGLU limit (10.0) is attached to `FusedMoE`; current ATOM
+backends forward it into their fused activation path. The dense layers use
+`swiglu_oai_split` with the same limit.
 
 **Performance**, 21-token prompt, TP4, eager, batch 1, no MTP:
 
@@ -330,7 +328,9 @@ so it is real but small. The dense layers (0–2) are unaffected; they go throug
 | transformers + torch FP8 | — | — | 2.68 tok/s |
 
 The model now carries `@support_torch_compile`; TP8 level-3 compilation and
-whole-forward CUDA graph capture are smoke-tested. MTP remains unsupported.
+whole-forward CUDA graph capture are smoke-tested. Sharing the identity RoPE
+cache across all 11 MLA layers reduced measured `peak_torch` from 42.71 GiB to
+41.47 GiB per TP rank. MTP remains unsupported.
 
 ## 7. Measured serving accuracy
 
@@ -347,8 +347,10 @@ Guarded by the `GLM-5.3-Flash` and `GLM-5.3-Flash-kpool-16shot` entries in
 0.9704–0.9757 for this model, so the port is in line.
 
 Post-review validation on 2026-09-01, after merging current `main` and enabling
-level-3 compilation: the same 1319-question 16-shot run scored **0.9682 /
-0.9682** (flexible / strict), above both the catalog baseline and threshold.
+level-3 compilation, produced **0.9682 / 0.9682**. The final ATOM-style refactor
+(shared NoPE cache, split indexer dispatch, no D2H scalar read, ATOM Linear gate)
+produced **0.9659 / 0.9666** on the same 1319-question run, exactly matching the
+catalog baseline and comfortably clearing the 0.94 threshold.
 
 **Only the 16-shot row exercises the pooled path.** GSM8K prompts are short —
 3-shot is ~389 tokens, 5-shot ~645 — so at or below `index_topk` the indexer
@@ -378,14 +380,15 @@ Three things about scoring this model that will otherwise waste a run:
 
 ## 8. Remaining work
 
-1. ~~**Contexts beyond 2048.**~~ Done — `model_ops/glm5_next/kpool.py` implements
-   the paged/ragged pooled indexer and `Glm5NextIndexer` drives it; measured at
-   16-shot in §7 and checked directly against its torch kernel references.
-2. **`swiglu_limit` in the MoE** — either route to a backend that honours it or
-   plumb it through the CK path (§6).
-3. **MTP draft layer** (checkpoint layer 45: `eh_proj` / `enorm` / `hnorm` /
+1. ~~**Contexts beyond 2048.**~~ Done —
+   `model_ops/glm5_next/{indexer,kpool}.py` implements the paged/ragged pooled
+   indexer; measured at 16-shot in §7 and checked directly against its torch
+   kernel references.
+2. **MTP draft layer** (checkpoint layer 45: `eh_proj` / `enorm` / `hnorm` /
    `shared_head.norm`, plus its own indexer). `index_share_for_mtp_iteration`
    means it reuses the main model's top-k.
+3. **Parallel feature coverage.** PCP, DCP and TBO remain explicitly rejected
+   until their pooled-index metadata/state layouts have dedicated tests.
 4. **Multimodal serving.** Land the image processor, input builder, tower and
    packed-weight tests together. `Glm5NextProcessor` only exists in transformers
    >= 5.16 while ATOM pins 5.12.1; video additionally needs frame sampling.

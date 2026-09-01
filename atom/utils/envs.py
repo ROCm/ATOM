@@ -158,9 +158,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_GLM5_DISABLE_FUSED_MHC": lambda: (
         os.getenv("ATOM_GLM5_DISABLE_FUSED_MHC", "0") == "1"
     ),
-    "ATOM_GLM5_KPOOL_DUMP": lambda: os.getenv("ATOM_GLM5_KPOOL_DUMP", ""),
-    "ATOM_GLM5_KPOOL_DUMP_LAYER": lambda: os.getenv("ATOM_GLM5_KPOOL_DUMP_LAYER", ""),
-    "ATOM_GLM5_KPOOL_REF": lambda: (os.getenv("ATOM_GLM5_KPOOL_REF", "0") == "1"),
     # Kimi-K3 DSpark draft: fuse the per-layer context-row KV write
     # (K3DSparkMLAAttention.write_context_kv) into one Triton kernel --
     # RMSNorm(kv_c) + rope(k_pe) + concat + paged-cache store, versus today's
