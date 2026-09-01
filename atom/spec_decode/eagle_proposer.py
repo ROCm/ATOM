@@ -145,7 +145,7 @@ class EagleProposer(Drafter):
             input_ids=input_ids, positions=positions, hidden_states=hidden_states
         )
 
-    def _step_head(self, out, running_bs, *, hidden_states, **_):
+    def _step_head(self, out, running_bs, *, input_ids, hidden_states, **_):
         """The mid-step's draft ids, recorded with the backbone that made them.
 
         Both come back because the next mid-step reads the hidden states and
@@ -155,7 +155,8 @@ class EagleProposer(Drafter):
         """
         if self._reuse_step_buffers:
             hidden_states.copy_(out[:running_bs])
-            return hidden_states, self.model.compute_draft_ids(hidden_states)
+            self.model.compute_draft_ids(hidden_states, out=input_ids)
+            return hidden_states, input_ids
         return out, self.model.compute_draft_ids(out)
 
     def _build_draft_model(self, model_class) -> nn.Module:
@@ -639,11 +640,30 @@ class EagleProposer(Drafter):
                 # compute_logits().argmax(-1) here because is_draft suppresses
                 # the LM head's prefill last-token slice. How the ids are
                 # produced stays the model's business, not this loop's.
-                new_draft_ids = (
-                    graphed_ids[:scheduled_bs]
-                    if graphed_ids is not None
-                    else self.model.compute_draft_ids(sample_hidden_states)
+                ids_out = (
+                    self.step.buffer("input_ids", scheduled_bs)
+                    if self._reuse_step_buffers
+                    and graphed_ids is None
+                    and i + 1 < self.mtp_k
+                    else None
                 )
+                if graphed_ids is not None:
+                    next_input_ids = graphed_ids[:scheduled_bs]
+                    # The fixed ids feed the next replay, but exported draft ids
+                    # need owned storage that a later replay cannot overwrite
+                    # while their assembled matrix is copied to the host.
+                    new_draft_ids = (
+                        next_input_ids.clone()
+                        if self._reuse_step_buffers
+                        else next_input_ids
+                    )
+                else:
+                    new_draft_ids = (
+                        self.model.compute_draft_ids(sample_hidden_states, out=ids_out)
+                        if ids_out is not None
+                        else self.model.compute_draft_ids(sample_hidden_states)
+                    )
+                    next_input_ids = new_draft_ids
                 draft_token_ids[:, i] = new_draft_ids
 
                 if i < self.mtp_k - 1:
@@ -744,7 +764,7 @@ class EagleProposer(Drafter):
                     if running_bs > scheduled_bs:
                         attn_metadata.slot_mapping[scheduled_bs:] = -1
 
-                    input_ids = new_draft_ids
+                    input_ids = next_input_ids
                     hidden_states = sample_hidden_states
 
         # self.runner.debug(f"final {draft_token_ids=}")

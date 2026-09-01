@@ -264,6 +264,8 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         self,
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
+        *,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Greedy draft token ids via distributed argmax over the TP-sharded vocab —
         avoids all-gathering the full [N, vocab] logits every draft step.
@@ -277,7 +279,7 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         """
         current_step_idx = spec_step_idx % self.num_mtp_layers
         mtp_layer = self.layers[str(self.mtp_start_layer_idx + current_step_idx)]
-        return mtp_layer.shared_head.head.compute_argmax_token(hidden_states)
+        return mtp_layer.shared_head.head.compute_argmax_token(hidden_states, out=out)
 
     def set_skip_topk(self, skip: bool) -> None:
         """Toggle ``skip_topk`` on MTP sparse-attention layers.
@@ -406,6 +408,8 @@ class DeepSeekMTP(nn.Module):
         self,
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
+        *,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Distributed greedy argmax for the MTP draft rollout (GLM-5.2).
 
@@ -415,7 +419,7 @@ class DeepSeekMTP(nn.Module):
         per-rank reductions. Token-identical either way. See
         DeepSeekMultiTokenPredictor.compute_draft_ids.
         """
-        return self.model.compute_draft_ids(hidden_states, spec_step_idx)
+        return self.model.compute_draft_ids(hidden_states, spec_step_idx, out=out)
 
     def set_skip_topk(self, skip: bool) -> None:
         self.model.set_skip_topk(skip)

@@ -111,6 +111,21 @@ def test_direct_fixed_storage_still_gets_a_repeated_pad_tail():
     assert staged.tolist() == [7, 8, 8, 8, 8]
 
 
+def test_fixed_input_and_exported_snapshot_have_separate_lifetimes():
+    """The next replay reuses fixed ids while an owned snapshot may leave the GPU."""
+    g = _graph()
+    fixed_ids = g.buffer("row", 2)
+    fixed_ids.copy_(torch.tensor([7, 8], dtype=torch.int32))
+    exported_ids = fixed_ids.clone()
+
+    staged = g.stage(2, {"row": fixed_ids})["row"]
+    staged.copy_(torch.tensor([9, 10], dtype=torch.int32))
+
+    assert staged.data_ptr() == fixed_ids.data_ptr()
+    assert exported_ids.tolist() == [7, 8]
+    assert staged.tolist() == [9, 10]
+
+
 def test_fixed_storage_accessor_checks_role_and_capacity():
     g = _graph()
     with pytest.raises(AssertionError, match="no staged input"):
