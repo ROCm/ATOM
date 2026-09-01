@@ -560,53 +560,63 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler):
         super().abandon_save(req_id)
         self._refresh_save_stall()
 
-    def should_defer_free(self, seq) -> bool:
-        """Base behaviour, plus an escape when the backend has stopped.
+    def _save_is_stall_escaped(self, seq) -> bool:
+        """Whether a stalled, never-dispatched save lets these blocks go free.
 
-        A save already handed out is reading these blocks, so freeing them
-        would let the next request write into them mid-transfer and index the
-        result under this prefix's hash. One never handed out has no reader,
-        and holding it is what turns a stopped backend into a stopped engine.
+        A save already handed out is reading these blocks, so freeing them would
+        let the next request write into them mid-transfer and index the result
+        under this prefix's hash. One never handed out has no reader, and holding
+        it is what turns a stopped backend into a stopped engine.
 
-        That leaves the handed-out save with no way out, which is what
-        `Scheduler._reconcile_stalled_deferred_saves` covers, on a longer clock
-        tied to LMCache's own force-unpin window. Neither mechanism subsumes the
-        other: this one asks whether the backend ever took the save, that one
-        whether it ever answered.
-
-        An active load is checked *first*, before the stall escape: the base's
-        `should_defer_free` holds blocks while a load is still reading/writing
-        them (`_has_active_load`), and the escape must not override that. A
-        request whose save has stalled can still have a live load into the same
-        block table; releasing those blocks mid-load is the free-while-writing
-        corruption the escape is not meant to cause. No-load requests are
-        unaffected -- the base checks the same predicate first anyway.
+        The handed-out save is left to `Scheduler._reconcile_stalled_deferred_saves`,
+        on a longer clock tied to LMCache's force-unpin window. Neither subsumes
+        the other: this asks whether the backend ever took the save, that whether
+        it ever answered.
         """
-        if self._has_active_load(seq):
-            return True
         sid = str(seq.id)
-        if (
+        return (
             self._save_stalled
             and sid not in self._save_inflight
             and self._has_pending_save(seq)
-        ):
-            # Dropping the tracker entry here is load-bearing, not a tidy-up.
-            # Returning False lets the caller free the blocks, and on the
-            # preemption path (`Scheduler.preempt`) that free is a
-            # `block_manager.deallocate` with no `request_finished` call -- so
-            # nothing else removes this sid from `_save_tracker`. Left in, the
-            # base save loop would later (once the stall clears and
-            # `_may_emit_save` re-opens) emit a save reading `seq.block_table`,
-            # whose blocks are now freed and possibly reused: silent cross-prefix
-            # corruption. The loop does not re-check liveness, so the entry has
-            # to go the moment its blocks are surrendered. Dropping a stalled
-            # save is the intended outcome (this request's KV goes un-offloaded
-            # rather than wedging the engine), and `abandon_save` drops the
-            # matching `_save_inflight` entry on the handed-out twin for the same
-            # reason.
-            self._save_tracker.pop(sid, None)
+        )
+
+    def should_defer_free(self, seq) -> bool:
+        """Pure query: base behaviour, plus the stall escape.
+
+        An active load is checked *first*: the base holds blocks while a load is
+        still reading/writing them, and the escape must not override that -- a
+        stalled-save request can still have a live load into the same table, and
+        releasing mid-load is free-while-writing corruption.
+
+        This is a predicate only. `_is_preemptable`/`_maybe_release_deferred`
+        probe it, so it must not mutate. The `_save_tracker` cleanup the escape
+        needs on the preempt free (`block_manager.deallocate`, no
+        `request_finished`) is done by `release_stalled_save`, which the
+        scheduler calls at that free; the finished path pops the tracker in
+        `request_finished` (its `not should_defer_free` guard reads False here).
+        """
+        if self._has_active_load(seq):
+            return True
+        if self._save_is_stall_escaped(seq):
             return False
         return super().should_defer_free(seq)
+
+    def release_stalled_save(self, seq) -> None:
+        """Drop the tracker for a stall-escaped save whose blocks are being freed.
+
+        The mutator half of the escape in `should_defer_free`. The scheduler
+        calls this at `preempt`'s `block_manager.deallocate`, which runs no
+        `request_finished`, so nothing else removes this sid from
+        `_save_tracker`. Left in, the base save loop would later (once the stall
+        clears and `_may_emit_save` re-opens) emit a save reading a now-freed,
+        possibly-reused `seq.block_table`: silent cross-prefix corruption. The
+        loop does not re-check liveness, so the entry has to go the moment its
+        blocks are surrendered. Dropping the save is the intended outcome (this
+        request's KV goes un-offloaded rather than wedging the engine); guarded
+        by the same escape predicate so a non-stalled save is never dropped.
+        """
+        if self._save_is_stall_escaped(seq):
+            self._save_tracker.pop(str(seq.id), None)
 
     # -- joint boundary ----------------------------------------------------
     def _decide_load_after_alloc(self, seq, ls):

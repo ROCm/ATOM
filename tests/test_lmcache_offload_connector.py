@@ -4887,11 +4887,22 @@ def test_a_stalled_save_releases_blocks_it_never_handed_out(monkeypatch):
     s._save_inflight_since["9"] -= 2 * SAVE_STALL_SECONDS
     s._refresh_save_stall()
     assert s._save_stalled is True
-    # Never handed out -> dropped, blocks released.
+    # Never handed out -> the blocks may go free. `should_defer_free` is a pure
+    # query now: it answers False but does NOT drop the tracker (probed by
+    # `_is_preemptable`, so it must not mutate). It can be asked twice, safely.
     assert s.should_defer_free(seq) is False
+    assert s.should_defer_free(seq) is False
+    assert "7" in s._save_tracker
+    # The scheduler drops the tracker at the actual free, via the mutator half.
+    s.release_stalled_save(seq)
     assert "7" not in s._save_tracker
-    # Handed out -> still held, whatever the stall says.
-    assert s.should_defer_free(SimpleNamespace(id=9)) is True
+    # Idempotent: dropping an already-dropped save is a no-op.
+    s.release_stalled_save(seq)
+    # Handed out -> still held, whatever the stall says, and never dropped.
+    handed_out = SimpleNamespace(id=9)
+    assert s.should_defer_free(handed_out) is True
+    s.release_stalled_save(handed_out)
+    assert "9" in s._save_inflight
 
 
 def test_state_loads_are_drained_into_the_metadata_exactly_once(monkeypatch):

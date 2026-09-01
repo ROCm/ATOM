@@ -907,6 +907,21 @@ class Scheduler:
         callback = getattr(self.kv_connector, "should_defer_free", None)
         return bool(callable(callback) and callback(seq))
 
+    def _connector_release_stalled_save(self, seq: Sequence) -> None:
+        """Let the connector drop a stall-escaped save this free surrenders.
+
+        `preempt` frees blocks with `block_manager.deallocate` and no
+        `request_finished`, so a K3 request whose `should_defer_free` returned
+        False via its stall escape would keep its `_save_tracker` entry -- the
+        base save loop could later emit a save reading those now-freed blocks.
+        The connector's `should_defer_free` is a pure predicate, so this mutator
+        does the cleanup exactly at the free. Guarded because not every connector
+        offloads saves.
+        """
+        callback = getattr(self.kv_connector, "release_stalled_save", None)
+        if callable(callback):
+            callback(seq)
+
     def _connector_abandon_save(self, seq: Sequence) -> None:
         """Tell the connector to drop a save this reclaim just abandoned.
 
@@ -2333,6 +2348,10 @@ class Scheduler:
         if seq.is_partial_prefill:
             seq.is_partial_prefill = False
             self._partial_prefill_count -= 1
+        # This free runs no `request_finished`; drop any stall-escaped save
+        # tracker now so the connector's save loop cannot later read these
+        # surrendered blocks (the mutator half of `should_defer_free`'s escape).
+        self._connector_release_stalled_save(seq)
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
         return True

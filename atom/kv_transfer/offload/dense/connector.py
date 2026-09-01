@@ -706,6 +706,16 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         sid = str(seq.id)
         return sid in self._save_inflight or self._has_pending_save(seq)
 
+    def release_stalled_save(self, seq) -> None:
+        """Drop bookkeeping for a stall-escaped save the scheduler is freeing.
+
+        No-op on dense: its `should_defer_free` has no stall escape, so a request
+        with a pending save always defers and is never preemptable. K3 overrides
+        this to pop its `_save_tracker`. Defined here so every offload impl
+        answers the scheduler's `release_stalled_save` forward uniformly.
+        """
+        return None
+
     def has_pending_work(self) -> bool:
         """True while a load still needs dispatch or a save is unreported.
 

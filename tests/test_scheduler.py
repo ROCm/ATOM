@@ -1503,6 +1503,43 @@ class TestPreempt:
         assert seq.status == SequenceStatus.WAITING
         assert len(seq.block_table) == 0
 
+    def test_preempt_releases_stalled_save_before_freeing_blocks(
+        self, scheduler, seq_factory
+    ):
+        """A stall-escaped save is preemptable, and the free runs no
+        `request_finished`; the connector must be told to drop its save tracker
+        at the free, and told BEFORE the blocks are deallocated so its save loop
+        can never race in and read them."""
+        seq = seq_factory([1, 2, 3, 4])
+        scheduler.add(seq)
+        scheduler.schedule()
+        events: list[str] = []
+        block_table_at_release: list = []
+
+        class _Connector:
+            def should_defer_free(self, s):
+                return False  # stall-escaped -> preemptable
+
+            def release_stalled_save(self, s):
+                events.append("release")
+                block_table_at_release[:] = list(s.block_table)
+
+        scheduler.kv_connector = _Connector()
+        original_deallocate = scheduler.block_manager.deallocate
+
+        def _recording_deallocate(s):
+            events.append("deallocate")
+            return original_deallocate(s)
+
+        scheduler.block_manager.deallocate = _recording_deallocate
+
+        assert scheduler.preempt(seq) is True
+        # Released, and released first -- the blocks were still held then.
+        assert events == ["release", "deallocate"]
+        assert block_table_at_release  # non-empty at the moment of release
+        assert seq.status == SequenceStatus.WAITING
+        assert len(seq.block_table) == 0
+
 
 # ── postprocess ────────────────────────────────────────────────────────────
 
