@@ -633,6 +633,58 @@ class TestSchedule:
         assert list(batch2.scheduled_tokens) == list(range(6, 10))
         assert list(batch2.num_cached_tokens) == [6]
 
+    def test_multimodal_prefill_shortened_after_alloc_is_requeued_whole(
+        self, seq_factory
+    ):
+        # A multimodal prompt must forward in one chunk (its vision embeddings
+        # are scattered onto placeholder positions for the whole prompt). The
+        # pre-allocation atomic guard enforces that, but a post-allocation
+        # adjuster -- offload chunk deferral or state-checkpoint alignment --
+        # can shorten the chunk *after* that guard passed. When it does, the
+        # prompt must be requeued whole, not split into a partial chunk that
+        # would scatter the embeddings against the wrong positions.
+        sched = Scheduler(
+            MockConfig(
+                max_num_batched_tokens=64,
+                num_kvcache_blocks=100,
+                kv_cache_block_size=4,
+                enable_chunked_prefill=True,
+            )
+        )
+        # Whole 8-token prompt clears the pre-alloc guard (budget 64 >= 8);
+        # only the post-alloc adjuster shortens it.
+        sched._adjust_prefill_chunk_after_alloc = lambda seq, chunk: 4
+        seq = seq_factory(list(range(8)), multimodal_data={"pixel_values": object()})
+        sched.add(seq)
+
+        batch, _ = sched.schedule()
+
+        # Not split into a 4-token partial chunk -- deferred whole.
+        assert batch.total_seqs_num_prefill == 0
+        assert seq.is_partial_prefill is False
+        assert seq in sched.waiting
+
+    def test_text_prefill_shortened_after_alloc_still_splits(self, seq_factory):
+        # Control for the guard above: a non-multimodal prompt shortened by the
+        # same post-alloc adjuster is chunked as usual -- the requeue is
+        # multimodal-only.
+        sched = Scheduler(
+            MockConfig(
+                max_num_batched_tokens=64,
+                num_kvcache_blocks=100,
+                kv_cache_block_size=4,
+                enable_chunked_prefill=True,
+            )
+        )
+        sched._adjust_prefill_chunk_after_alloc = lambda seq, chunk: 4
+        seq = seq_factory(list(range(8)))
+        sched.add(seq)
+
+        batch, _ = sched.schedule()
+
+        assert batch.total_seqs_num_prefill == 1
+        assert list(batch.num_scheduled_tokens) == [4]
+
     def test_prefill_respects_block_availability(self, seq_factory):
         sched = Scheduler(MockConfig(num_kvcache_blocks=1, kv_cache_block_size=4))
         sched.add(seq_factory([1, 2, 3, 4]))  # 1 block

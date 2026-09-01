@@ -1457,6 +1457,24 @@ class Scheduler:
             chunk = self._adjust_prefill_chunk_after_alloc(seq, chunk)
             chunk = self._finalize_prefill_chunk(seq, seq.num_cached_tokens, chunk)
 
+            # Re-assert the atomic-prefill invariant against the *final* chunk.
+            # The guard above ran on the pre-allocation size, but the two
+            # adjusters just above can both shorten the chunk after the fact --
+            # `_adjust_prefill_chunk_after_alloc` defers part of a prefill for an
+            # offload load, and `_finalize_prefill_chunk` lands the chunk on a
+            # state-checkpoint rung. Either can leave a multimodal prompt split
+            # even though it passed the pre-alloc check, which would scatter the
+            # vision embeddings against the wrong positions (or, on a later
+            # chunk once `multimodal_data` is cleared, embed raw `<|media_pad|>`
+            # into the KV cache). Take it whole or not at all: undo this
+            # admission and wait for a step that can, exactly as the joint-disown
+            # path above requeues. `num_cached_tokens` is post-allocation, so
+            # this stays correct even if the prefix was disowned.
+            if atomic_prefill and chunk < seq.num_tokens - seq.num_cached_tokens:
+                self.block_manager.deallocate(seq)
+                self.waiting.appendleft(seq)
+                break
+
             self._assert_positive_prefill_chunk(chunk, num_new_tokens, budget_remaining)
             num_seqs_prefill, num_batched_tokens = self._schedule_prefill_seq(
                 seq,
