@@ -314,6 +314,18 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
         loads = getattr(metadata, "state_loads", None)
         if not loads:
             return
+        if not self._do_load:
+            # Symmetric with `_arm_joint_loads`' gate. Without it, a step that
+            # does not load (e.g. `kv_role: kv_consumer`) leaves the park unarmed
+            # -- `_arm_joint_loads` returned early on the same predicate -- yet
+            # still submits/fails these loads here. For a state-only load with no
+            # tier, `_fail_state_loads` -> `settle_state(req_id, False)` finds no
+            # armed park (`need is None`) and emits nothing, so the request sits
+            # in WAITING_FOR_REMOTE_KVS with nothing to wake it (the orphan
+            # reclaimer frees the slot but never wakes a live parked request).
+            # Gate both halves on the one predicate so neither runs without the
+            # other.
+            return
         if self._state_tier is None:
             # The engine's index can outlive a tier that refused to build. Fail
             # them so the requests recompute rather than park forever.
