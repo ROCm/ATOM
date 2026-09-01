@@ -258,7 +258,8 @@ ROWS_PER_BLOCK = 2
 
 def _hca_case(bs, n_hca_per_seq, positions, geometry=GEOMETRY):
     """One decode token per seq plus a `-1` pad token, with HCA heads sized
-    from `n_hca_per_seq` — the same `n + n_committed_hca` the builder uses."""
+    from `n_hca_per_seq` — the same `n + <HCA count>` slice the builder sizes,
+    parametrized here so a case can pick the count directly."""
     t_total = bs + 1
     batch_id = list(range(bs)) + [-1]
     rng = np.random.default_rng(bs * 17 + sum(n_hca_per_seq))

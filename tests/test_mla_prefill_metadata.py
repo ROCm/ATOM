@@ -92,6 +92,11 @@ def test_sparse_prefill_does_not_read_the_dense_last_page_lens(monkeypatch):
     """A sparse prefill with no drafter and no cached prefix must still run."""
     seen = _capture(monkeypatch)
     attn = _attn(is_sparse=True)
+    monkeypatch.setattr(
+        attention_mla,
+        "get_forward_context",
+        lambda: SimpleNamespace(context=SimpleNamespace(scheduled_bs=1)),
+    )
 
     n_tokens = 5
     sparse_cu_seqlens_q = torch.arange(n_tokens + 1, dtype=torch.int32)
@@ -126,6 +131,11 @@ def test_dense_prefill_cuts_the_q_cums_to_the_per_seq_array(monkeypatch):
     attn = _attn(is_sparse=False)
 
     n_seqs, n_tokens = 2, 6
+    monkeypatch.setattr(
+        attention_mla,
+        "get_forward_context",
+        lambda: SimpleNamespace(context=SimpleNamespace(scheduled_bs=n_seqs)),
+    )
     kv_last_page_lens = torch.tensor([3, 3], dtype=torch.int32)
     md = SimpleNamespace(
         kv_last_page_lens=kv_last_page_lens,
