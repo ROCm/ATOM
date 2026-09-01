@@ -13,10 +13,17 @@ from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.state_runtime import StateTransfer
 from atom.model_ops.attention_mla import MLAAttention
-from atom.model_ops.glm5_next.kpool import pooled_path_enabled
+from atom.model_ops.glm5_next.geometry import (
+    effective_kpool_size,
+    pooled_path_enabled,
+)
 from atom.utils import envs
 
-from .aiter_mla import AiterMLAMetadataBuilder, mla_kv_entry_dim
+from .aiter_mla import (
+    AiterMLAMetadataBuilder,
+    aligned_index_cache_dim,
+    mla_kv_entry_dim,
+)
 from .backends import AttentionBackend
 from .gdn_attn import GDNStateMixin
 from .sub_pool_spec import SubPoolSpec, page_pool, state_pool
@@ -160,8 +167,7 @@ class _KimiMLAGDNCommon(GDNStateMixin):
 
     def _aligned_index_dim(self) -> int:
         """Indexer entry width, padded to 16B so inductor sees aligned rows."""
-        hf = self.model_runner.config.hf_config
-        return ((hf.index_head_dim + 4 + 15) // 16) * 16
+        return aligned_index_cache_dim(self.model_runner.config.hf_config)
 
     # ---- kpool tail buffer -------------------------------------------------
     #
@@ -176,7 +182,8 @@ class _KimiMLAGDNCommon(GDNStateMixin):
     def _kpool_size(self) -> int:
         """``index_kpool``, or 1 when this model does not pool indexer keys."""
         hf = self.model_runner.config.hf_config
-        return int(getattr(hf, "index_kpool", 1) or 1)
+        configured = int(getattr(hf, "index_kpool", 1) or 1)
+        return effective_kpool_size(configured)
 
     def _index_rows_per_block(self) -> int:
         """Index-cache rows one scheduler block owns.

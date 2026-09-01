@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 
-"""Scope the raw multimodal-config fallback to GLM-5.3."""
+"""A failed full multimodal config load keeps the None sentinel."""
 
 import pytest
 from transformers import PretrainedConfig
@@ -37,26 +37,17 @@ def _config_dict(model_type: str, text_model_type: str) -> dict:
     }
 
 
-def test_glm5_rebuilds_its_known_raw_multimodal_schema(
-    monkeypatch, failed_full_config_load
+@pytest.mark.parametrize(
+    ("model_type", "text_model_type"),
+    [
+        ("glm5_next", "glm5_next_text"),
+        ("qwen3_5", "qwen3_5"),
+    ],
+)
+def test_failed_multimodal_config_load_keeps_the_failure_sentinel(
+    monkeypatch, failed_full_config_load, model_type, text_model_type
 ):
-    raw = _config_dict("glm5_next", "glm5_next_text")
-    monkeypatch.setattr(
-        PretrainedConfig,
-        "get_config_dict",
-        lambda *_args, **_kwargs: (raw, {}),
-    )
-
-    config = atom_config.get_hf_config("unused")
-
-    assert isinstance(config._multimodal_config, PretrainedConfig)
-    assert config._multimodal_config.vision_config.hidden_size == 8
-
-
-def test_other_multimodal_models_keep_the_failure_sentinel(
-    monkeypatch, failed_full_config_load
-):
-    raw = _config_dict("qwen3_5", "qwen3_5")
+    raw = _config_dict(model_type, text_model_type)
     monkeypatch.setattr(
         PretrainedConfig,
         "get_config_dict",

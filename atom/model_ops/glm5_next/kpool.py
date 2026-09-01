@@ -29,34 +29,16 @@ Ported from vLLM PR #53906 (`vllm/models/glm5next/nvidia/ops/kpool_compress.py`)
 from __future__ import annotations
 
 import math
-import os
 
 import torch
-
-
-def pooled_path_enabled(index_kpool: int) -> bool:
-    """Whether the pooled indexer path is in force.
-
-    The ONE place ``ATOM_GLM5_KPOOL`` is read. The index cache is SIZED and
-    ALLOCATED from this and the indexer DISPATCHES on it, so the two must be
-    the same answer: sized pooled but dispatched token-granular, the fallback
-    would run against a cache a quarter of the rows it expects and write past
-    the end of every request's region.
-
-    Reading an env var here is safe in the way memory-sizing code needs: the
-    value is read inside the worker process, after the engine has spawned it,
-    by both the sizing call and the forward that consumes the result.
-    """
-    if index_kpool <= 1:
-        return False
-    return os.environ.get("ATOM_GLM5_KPOOL", "1") == "1"
-
+from aiter import dtypes
 
 # The GLM-5.3-Flash indexer head dimension is fixed at 128 and the FP8 quant
 # block spans the whole head, so both are compile-time constants here.
 INDEX_HEAD_DIM = 128
 _INV_SQRT_128 = 1.0 / math.sqrt(128.0)
-FP8_MAX = 448.0  # torch.float8_e4m3fn
+FP8_DTYPE = dtypes.fp8
+FP8_MAX = float(torch.finfo(FP8_DTYPE).max)
 
 # --------------------------------------------------------------------------
 # Reference implementations (the correctness oracle; not the fast path)
@@ -110,12 +92,12 @@ def hadamard128_ref(x: torch.Tensor) -> torch.Tensor:
 
 
 def quant_fp8_ue8m0_ref(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Per-vector absmax FP8-e4m3 quant with a power-of-two (ue8m0) scale."""
+    """Per-vector absmax native-FP8 quant with a power-of-two scale."""
     fp8_max = FP8_MAX
     absmax = x.abs().amax(dim=-1, keepdim=True).clamp_min(1e-4)
     scale = torch.exp2(torch.ceil(torch.log2(absmax / fp8_max)))
     q = (x / scale).clamp(-fp8_max, fp8_max)
-    return q, scale.squeeze(-1)
+    return q.to(FP8_DTYPE), scale.squeeze(-1)
 
 
 def compress_pools_ref(
@@ -382,6 +364,7 @@ def _fwht_quant_kernel(
     n_rows,
     HEAD_DIM: tl.constexpr,
     BLOCK_R: tl.constexpr,
+    FP8_AMAX: tl.constexpr,
 ):
     """Fused Hadamard-128 + per-row absmax FP8 (ue8m0) quant of the query."""
     pid = tl.program_id(0)
@@ -403,8 +386,8 @@ def _fwht_quant_kernel(
     # Keep the division spelling used by the reference and aiter's key
     # quantizer. Multiplying by a rounded reciprocal can cross the ceil(log2)
     # step and choose a scale one binade away at boundary values.
-    scale = tl.exp2(tl.ceil(tl.log2(absmax / 448.0)))
-    y = tl.minimum(tl.maximum(x / scale[:, None], -448.0), 448.0)
+    scale = tl.exp2(tl.ceil(tl.log2(absmax / FP8_AMAX)))
+    y = tl.minimum(tl.maximum(x / scale[:, None], -FP8_AMAX), FP8_AMAX)
 
     tl.store(
         qout_ptr + rows[:, None] * HEAD_DIM + offs[None, :], y, mask=rmask[:, None]
@@ -424,9 +407,7 @@ def fwht128_quant_fp8(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """
     assert q.ndim == 2 and q.shape[1] == INDEX_HEAD_DIM, q.shape
     n_rows = q.shape[0]
-    q_fp8 = torch.empty(
-        (n_rows, INDEX_HEAD_DIM), dtype=torch.float8_e4m3fn, device=q.device
-    )
+    q_fp8 = torch.empty((n_rows, INDEX_HEAD_DIM), dtype=FP8_DTYPE, device=q.device)
     q_scale = torch.empty((n_rows, 1), dtype=torch.float32, device=q.device)
     if n_rows == 0:
         return q_fp8, q_scale
@@ -438,6 +419,7 @@ def fwht128_quant_fp8(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         n_rows,
         HEAD_DIM=INDEX_HEAD_DIM,
         BLOCK_R=block_r,
+        FP8_AMAX=FP8_MAX,
         num_warps=2,
     )
     return q_fp8, q_scale

@@ -35,6 +35,10 @@ from atom.model_ops.attention_mla import (
     mla_dcp_decode_is_persistent,
     mla_dcp_kernel_num_heads,
 )
+from atom.model_ops.glm5_next.geometry import (
+    effective_kpool_size,
+    topk_output_width,
+)
 from atom.utils import CpuGpuBuffer, envs, upload_numpy
 from atom.utils.block_convert import (
     kv_indices_generate_triton,
@@ -79,6 +83,12 @@ def mla_kv_entry_dim(hf_config) -> int:
     if declared:
         return int(declared)
     return hf_config.kv_lora_rank + hf_config.qk_rope_head_dim
+
+
+def aligned_index_cache_dim(hf_config) -> int:
+    """Indexer key plus fp32 scale, padded to a 16-byte row."""
+    index_dim = hf_config.index_head_dim + 4
+    return ((index_dim + 15) // 16) * 16
 
 
 def _global_index_cache_layer_ids(
@@ -281,14 +291,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         #
         # `index_topk` itself stays the sparse-vs-dense THRESHOLD: at or below
         # it every pool is selected and the dense path is exactly equivalent.
-        self.index_kpool = (
+        configured_kpool = (
             int(getattr(hf_config, "index_kpool", 1) or 1) if self.is_sparse else 1
         )
-        if self.is_sparse and self.index_kpool > 1:
-            width = self.index_topk + self.index_kpool - 1
-            self.index_topk_out = ((width + 127) // 128) * 128
-        else:
-            self.index_topk_out = self.index_topk
+        self.index_kpool = effective_kpool_size(configured_kpool)
+        self.index_topk_out = topk_output_width(self.index_topk, configured_kpool)
         self.dtype_kv = dtypes.d_dtypes[config.kv_cache_dtype]
         self.dtype_q = self.dtype_kv
 
@@ -1009,8 +1016,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         block_bytes = total_num_layers * runner.block_size * 576 * kv_dtype_size
         if runner.is_deepseek_v32:
-            index_dim = hf_config.index_head_dim + 4
-            aligned_index_dim = ((index_dim + 15) // 16) * 16
+            aligned_index_dim = aligned_index_cache_dim(hf_config)
             index_cache_layer_ids, _ = self._index_cache_layout()
             block_bytes += (
                 len(index_cache_layer_ids)
@@ -1059,8 +1065,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         if runner.is_deepseek_v32:
             # Align last dimension to 16 bytes for fp8 (1 byte per element)
             # to avoid unaligned memory access in torch inductor.
-            index_dim = hf_config.index_head_dim + 4
-            aligned = ((index_dim + 15) // 16) * 16
+            aligned = aligned_index_cache_dim(hf_config)
             index_cache_layer_ids, _ = self._index_cache_layout()
             out["aligned_index_dim"] = aligned
             out["index_cache_layer_ids"] = index_cache_layer_ids
@@ -1217,24 +1222,35 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     for layer_id in hybrid_mla_layers
                     if start_layer <= layer_id < end_layer
                 )
+                compact_mla_slot_by_layer = {
+                    global_layer_id: compact_layer_id
+                    for compact_layer_id, global_layer_id in enumerate(
+                        hybrid_mla_layers
+                    )
+                }
+                local_target_consumer_indices = tuple(
+                    compact_mla_slot_by_layer[layer_id]
+                    for layer_id in local_target_layer_ids
+                )
             else:
                 local_target_layer_ids = tuple(range(start_layer, end_layer))
+                local_target_consumer_indices = local_target_layer_ids
             num_local_target_layers = len(local_target_layer_ids)
             num_local_draft_layers = num_layers - num_local_target_layers
-            local_kv_layer_ids = local_target_layer_ids + tuple(
+            local_kv_consumer_indices = local_target_consumer_indices + tuple(
                 range(
-                    num_hidden_layers,
-                    num_hidden_layers + num_local_draft_layers,
+                    num_global_mla_layers,
+                    num_global_mla_layers + num_local_draft_layers,
                 )
             )
-            if len(local_kv_layer_ids) != num_layers:
+            if len(local_kv_consumer_indices) != num_layers:
                 raise RuntimeError(
                     "MLA KV cache layer count does not match the PP-local layout: "
-                    f"cache={num_layers}, layout={len(local_kv_layer_ids)}, "
+                    f"cache={num_layers}, layout={len(local_kv_consumer_indices)}, "
                     f"target={num_local_target_layers}, "
                     f"draft={num_local_draft_layers}"
                 )
-            block_region_consumer_indices = list(local_kv_layer_ids) + [
+            block_region_consumer_indices = list(local_kv_consumer_indices) + [
                 num_global_kv_layers + global_compact_index_slot_by_layer[layer_id]
                 for layer_id in local_index_layer_ids
             ]

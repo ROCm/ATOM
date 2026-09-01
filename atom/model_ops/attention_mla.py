@@ -603,13 +603,6 @@ class MLAAttention(nn.Module):
         self.qk_rope_head_dim = mla_modules.qk_rope_head_dim
         self.qk_head_dim = mla_modules.qk_head_dim
         self.v_head_dim = mla_modules.v_head_dim
-        # NoPE MLA (GLM-5.3-Flash): there is no positional component at all --
-        # query and key are entirely the "nope" half and the KV entry is just
-        # `kv_lora_rank`. `rotary_emb` remains a well-formed module so the
-        # attribute reads below (cos_cache / sin_cache / is_neox_style) stay
-        # valid, but it must never be APPLIED: the rope slices are 0-wide, so
-        # rotating them is at best a no-op and at worst an out-of-bounds read.
-        self.no_rope = mla_modules.qk_rope_head_dim == 0
         self.rope_is_zero_pad = mla_modules.rope_is_zero_pad
         self.rotary_emb = mla_modules.rotary_emb
         self.q_proj = mla_modules.q_proj
@@ -2333,29 +2326,25 @@ class MLAAttention(nn.Module):
         projection -- normally the strided ``[..., q_lora_rank:]`` half of a
         fused q/kv projection, which both paths below read without copying.
         """
-        use_fused = (
-            self._ctx_kv_fusion_enabled
-            and not self.no_rope
-            and (
-                # A plain [num_blocks, block_size, entry] cache (a per-token cache
-                # is that with block_size 1). The empty pre-allocation every layer
-                # holds before allocate_kv_cache fails here too, so a premature
-                # write still aborts in the per-op kernels rather than scribbling.
-                kv_cache.dim() == 3
-                and kv_cache.shape[-1] == self.kv_lora_rank + self.qk_rope_head_dim
-                and kv_cache.stride(-1) == 1
-                and kv_lora.dim() == 2
-                and kv_lora.stride(-1) == 1
-                # get_rope leaves cos/sin on the host until its first forward, which
-                # also casts them to the activation dtype. Until that has happened
-                # the kernel cannot read them (and would read fp32 where the per-op
-                # path reads bf16), so the first write of a layer takes the per-op
-                # path and moves them; every later one fuses.
-                and self.rotary_emb.cos_cache.device == kv_cache.device
-                # The fused kernel inlines ATOM RMSNorm's math; a Gemma-style norm
-                # (x * (1 + w)) or any other flavour must keep calling its module.
-                and isinstance(kv_a_layernorm, RMSNorm)
-            )
+        use_fused = self._ctx_kv_fusion_enabled and (
+            # A plain [num_blocks, block_size, entry] cache (a per-token cache
+            # is that with block_size 1). The empty pre-allocation every layer
+            # holds before allocate_kv_cache fails here too, so a premature
+            # write still aborts in the per-op kernels rather than scribbling.
+            kv_cache.dim() == 3
+            and kv_cache.shape[-1] == self.kv_lora_rank + self.qk_rope_head_dim
+            and kv_cache.stride(-1) == 1
+            and kv_lora.dim() == 2
+            and kv_lora.stride(-1) == 1
+            # get_rope leaves cos/sin on the host until its first forward, which
+            # also casts them to the activation dtype. Until that has happened
+            # the kernel cannot read them (and would read fp32 where the per-op
+            # path reads bf16), so the first write of a layer takes the per-op
+            # path and moves them; every later one fuses.
+            and self.rotary_emb.cos_cache.device == kv_cache.device
+            # The fused kernel inlines ATOM RMSNorm's math; a Gemma-style norm
+            # (x * (1 + w)) or any other flavour must keep calling its module.
+            and isinstance(kv_a_layernorm, RMSNorm)
         )
         # Every rejection above is silent and per call, so a layout the kernel
         # does not recognise would otherwise leave the fusion inert with nothing
@@ -2401,8 +2390,7 @@ class MLAAttention(nn.Module):
         # optional. So pass a throwaway for the query side, exactly as
         # deepseek_v2 does for its own k-only rope under PCP.
         k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim)
-        if not self.no_rope:
-            _, k_pe = self.rotary_emb(positions, torch.empty_like(k_pe), k_pe)
+        _, k_pe = self.rotary_emb(positions, torch.empty_like(k_pe), k_pe)
         self._pcp_write_full_kv(kv_cache, kv_c, k_pe, slot_mapping)
 
     def forward_impl(
@@ -2441,8 +2429,7 @@ class MLAAttention(nn.Module):
                 -1, self.num_heads, self.qk_head_dim
             )
             prefill_q_pe = prefill_q[..., self.qk_nope_head_dim :]
-            if not self.no_rope:
-                self.rotary_emb(positions, prefill_q_pe, k_rope)
+            self.rotary_emb(positions, prefill_q_pe, k_rope)
 
             if kv_cache.numel() > 0:
                 if envs.ATOM_USE_TRITON_MLA and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV:
@@ -2635,10 +2622,9 @@ class MLAAttention(nn.Module):
                     # kernel's throwaway owned-slot write. The rope kernel is
                     # 2-component and needs a non-None partner, so pass a
                     # throwaway query of matching length.
-                    if not self.no_rope:
-                        self.rotary_emb(
-                            positions_full, k_rope_full, torch.empty_like(k_rope_full)
-                        )
+                    self.rotary_emb(
+                        positions_full, k_rope_full, torch.empty_like(k_rope_full)
+                    )
                     self._pcp_write_full_kv(
                         kv_cache,
                         k_nope_full,

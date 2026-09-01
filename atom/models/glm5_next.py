@@ -28,8 +28,6 @@ Three decisions worth knowing about, each exact rather than approximate:
    (``deepseek_v2._pcp_sparse_active``: ``max_seqlen_k > index_topk``). Past that
    threshold the pooled path decides what is attended to; it lives in
    ``model_ops.glm5_next.kpool`` and is driven by ``Glm5NextIndexer``.
-   ``model_ops.kpool_indexer`` is the dense ``transformers``-parity oracle for
-   the selection maths and is NOT on the serving path.
 
 2. **NoPE runs on a 64-wide block of zeros.** The text model is entirely NoPE
    (``qk_rope_head_dim == 0``), but the ROCm MLA kernels assume the DeepSeek
@@ -45,13 +43,12 @@ Three decisions worth knowing about, each exact rather than approximate:
    ``KimiKDAAttention`` -- and all of its state-cache, TP and CUDA-graph
    integration -- reusable unchanged.
 
-Not yet wired: the MTP draft layer (checkpoint layer 45), and the image INPUT
-path -- the vision tower itself is built and loaded from ``model.visual.*``
-(``glm5_next_vl.py``), but nothing upstream turns an image into ``pixel_values``
-yet, so it cannot be reached at serving time. See ``recipes/GLM-5.3-Flash.md``.
+Not yet wired: the MTP draft layer (checkpoint layer 45) or multimodal input.
+The checkpoint's unreachable vision tower is skipped on the text-only path.
+See ``recipes/GLM-5.3-Flash.md``.
 """
 
-import os
+import logging
 from itertools import islice
 from typing import Any, ClassVar
 
@@ -83,6 +80,7 @@ from atom.model_ops.attention_mla import (
 )
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
+from atom.model_ops.glm5_next import geometry as kpool_geometry
 from atom.model_ops.glm5_next import kpool as kpool_ops
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import (
@@ -114,7 +112,11 @@ from atom.models.utils import (
     make_layers,
     maybe_prefix,
 )
+from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
+from atom.utils.decorators import support_torch_compile
+
+logger = logging.getLogger("atom")
 
 # GLM-5.3-Flash's MLA is NoPE (`qk_rope_head_dim == 0`), but the ROCm stack
 # assumes DeepSeek's geometry throughout: ATOM allocates the paged MLA entry at
@@ -247,10 +249,10 @@ class Glm5NextHyperConnection(nn.Module):
         self.norm_eps = float(config.rms_norm_eps)
 
         # aiter's mhc kernels trap unless hidden % 512 == 0 or % 256 == 0.
-        # GLM53_DISABLE_FUSED_MHC=1 forces the torch reference path, for
+        # ATOM_GLM5_DISABLE_FUSED_MHC=1 forces the torch reference path, for
         # bisecting numerical differences against transformers.
         dim_ok = config.hidden_size % 512 == 0 or config.hidden_size % 256 == 0
-        if os.environ.get("GLM53_DISABLE_FUSED_MHC") == "1":
+        if envs.ATOM_GLM5_DISABLE_FUSED_MHC:
             dim_ok = False
         self._mhc_pre = getattr(aiter, "mhc_pre", None) if dim_ok else None
         self._mhc_post = getattr(aiter, "mhc_post", None) if dim_ok else None
@@ -467,6 +469,18 @@ class Glm5NextKDAAttention(KimiKDAAttention):
     def __init__(self, atom_config: Config, quant_config, prefix: str = "") -> None:
         super().__init__(atom_config, quant_config, prefix=prefix)
         config = _text_config(atom_config.hf_config)
+        # Coverage is tracked per packed shard: the loader's parameter-level
+        # report cannot distinguish "q loaded" from "q/k/v all loaded" because
+        # all three checkpoint tensors target the same in_proj parameter.
+        self._loaded_input_shards: set[int] = set()
+        base_loader = self.in_proj.weight.weight_loader
+
+        def record_input_shard(param, loaded_weight, shard_id=None):
+            if shard_id is not None:
+                self._loaded_input_shards.add(int(shard_id))
+            return base_loader(param, loaded_weight, shard_id)
+
+        self.in_proj.weight.weight_loader = record_input_shard
         # Replaces the parent's `g_proj`, which this checkpoint does not have.
         self.g_a_proj = ReplicatedLinear(
             self.hidden_size,
@@ -487,6 +501,12 @@ class Glm5NextKDAAttention(KimiKDAAttention):
     def process_weights_after_loading(self) -> None:
         if getattr(self, "_in_proj_fused", False):
             return
+        missing = {0, 1, 2} - self._loaded_input_shards
+        if missing:
+            raise RuntimeError(
+                "Incomplete GLM-5.3 KDA input projection: missing checkpoint "
+                f"shards {sorted(missing)} from q/k/v"
+            )
         # in_proj is [q | k | v | g]; the checkpoint only supplied q/k/v, so
         # write the folded gate into the g shard before the parent appends its
         # b_proj / f_a_proj tails.
@@ -505,10 +525,6 @@ class Glm5NextKDAAttention(KimiKDAAttention):
         super().process_weights_after_loading()
 
 
-_DBG_STATS = os.environ.get("ATOM_GLM5_DEBUG_STATS", "0") == "1"
-_DBG_SEEN: set = set()
-
-
 def _dbg_capturing() -> bool:
     """True while this stream is being captured into a CUDA graph.
 
@@ -520,28 +536,6 @@ def _dbg_capturing() -> bool:
     try:
         return torch.cuda.is_current_stream_capturing()
     except (RuntimeError, AttributeError):
-        return False
-
-
-def _dbg_real_forward() -> bool:
-    """True only on a forward carrying REAL tokens.
-
-    The profile/warmup forward feeds a dummy batch whose input_ids are all the
-    same id, so every embedding is identical and every downstream diversity
-    metric reads as total collapse. CUDAGraph capture likewise feeds zeros.
-    Every probe must pass through here -- measuring either one produces
-    confident, completely fictitious findings.
-    """
-    if not _DBG_STATS or _dbg_capturing():
-        return False
-    from atom.utils.forward_context import get_forward_context
-
-    try:
-        ctx = get_forward_context()
-        if ctx is None or ctx.attn_metadata is None:
-            return False
-        return not ctx.context.is_dummy_run
-    except (RuntimeError, AttributeError, AssertionError):
         return False
 
 
@@ -616,19 +610,13 @@ class Glm5NextIndexer(Indexer):
             self.index_kpool_compress_gate = atom_parameter(
                 torch.empty(self.head_dim, self.hidden_size, dtype=torch.bfloat16)
             )
-        self._kpool_warned = False
         # Bound by the metadata builder alongside the index K cache.
         self.kpool_tail_cache: torch.Tensor | None = None
-        # Selection width: `index_topk` history tokens PLUS the unscored tail,
-        # rounded up to the conversion kernels' BLOCK_N. Kept in sync with
-        # `AiterMLAMetadataBuilder.index_topk_out`, which sizes the buffer this
-        # writes into; the extra columns are never read because
-        # `sparse_kv_indptr` caps every row at its true count.
-        if self.index_kpool > 1:
-            width = self.topk_tokens + self.index_kpool - 1
-            self.topk_out_width = ((width + 127) // 128) * 128
-        else:
-            self.topk_out_width = self.topk_tokens
+        # One helper owns the producer/metadata width contract, including the
+        # ATOM_GLM5_KPOOL off-switch.
+        self.topk_out_width = kpool_geometry.topk_output_width(
+            self.topk_tokens, self.index_kpool
+        )
 
     def use_kpool(self) -> bool:
         """Whether to run the pooled indexer.
@@ -638,7 +626,7 @@ class Glm5NextIndexer(Indexer):
         independent implementations of the same selection -- which is what
         makes the short-context A/B a check and not a tautology.
         """
-        return kpool_ops.pooled_path_enabled(self.index_kpool)
+        return kpool_geometry.pooled_path_enabled(self.index_kpool)
 
     def _assert_kpool_regime(self, max_seqlen_k: int) -> None:
         """Refuse the regime where pooled and token-granular top-k diverge."""
@@ -666,15 +654,13 @@ class Glm5NextIndexer(Indexer):
         the pooled path in pool-expanded order. Attention is permutation
         invariant over keys, so the set is what has to match.
         """
-        path = os.environ.get("ATOM_GLM5_KPOOL_DUMP")
-        if not path or self.prefix != os.environ.get(
-            "ATOM_GLM5_KPOOL_DUMP_LAYER", self.prefix
-        ):
+        path = envs.ATOM_GLM5_KPOOL_DUMP
+        dump_layer = envs.ATOM_GLM5_KPOOL_DUMP_LAYER or self.prefix
+        if not path or self.prefix != dump_layer:
             return
         # This reads a device value (`.item()`), which CUDAGraph capture
         # forbids outright -- and the profile/capture batches would be
-        # meaningless to compare anyway. Same guard every other probe in this
-        # file goes through, minus its dependence on ATOM_GLM5_DEBUG_STATS.
+        # meaningless to compare anyway.
         if _dbg_capturing():
             return
         from atom.utils.forward_context import get_forward_context
@@ -779,6 +765,10 @@ class Glm5NextIndexer(Indexer):
                 # real slots (`_build_gdn_capture_metadata`), and it must --
                 # capture bakes this pointer in, so a zeros stand-in there
                 # would send every request's tail to slot 0 on replay.
+                assert get_forward_context().context.is_dummy_run, (
+                    "kpool needs GDN state-slot metadata on every real forward; "
+                    "using a slot-0 placeholder would mix request tails."
+                )
                 state_slot_idx = torch.zeros(
                     hidden_states.shape[0],
                     dtype=torch.int32,
@@ -845,159 +835,6 @@ class Glm5NextIndexer(Indexer):
         )
         self._maybe_dump_selection(attn_metadata)
         return out
-
-
-def _mla_ref_check(layer, q_c, kv_c_normed, out) -> None:
-    """Numerical oracle for the NoPE + zero-pad MLA path.
-
-    Every structural check on this port passes (weights all load, routing is
-    healthy, token diversity is fine) yet quality is uniformly degraded, which
-    is what a subtly wrong kernel looks like. So recompute the same layer as
-    plain causal SDPA from the same weights and compare. Valid only on a whole-
-    prompt prefill, where the reference sees exactly the keys the kernel does.
-
-    Off unless ATOM_GLM5_MLA_REF=1 -- it materializes the full [T, H, 256] K/V
-    that MLA exists to avoid.
-    """
-    if os.environ.get("ATOM_GLM5_MLA_REF", "0") != "1" or not _dbg_real_forward():
-        return
-    from atom.utils.forward_context import get_forward_context
-
-    ctx = get_forward_context()
-    # Dispatch on prefill/decode BEFORE the once-per-layer guard: the guard key
-    # is set by the prefill call, so checking it first would swallow every
-    # decode call for that layer and print nothing at all.
-    is_prefill = bool(getattr(getattr(ctx, "context", None), "is_prefill", False))
-    if not is_prefill:
-        _mla_ref_check_decode(layer, q_c, out, ctx)
-        return
-    key = ("mla_ref", layer.layer_num)
-    if key in _DBG_SEEN:
-        return
-    _DBG_SEEN.add(key)
-
-    with torch.no_grad():
-        t = q_c.shape[0]
-        h = layer.num_local_heads
-        q = layer.q_b_proj(q_c)
-        if isinstance(q, tuple):
-            q = q[0]
-        q = q.reshape(t, h, -1)[..., : layer.qk_nope_head_dim]
-        kv = layer.kv_b_proj(kv_c_normed)
-        if isinstance(kv, tuple):
-            kv = kv[0]
-        kv = kv.reshape(t, h, layer.qk_nope_head_dim + layer.v_head_dim)
-        k = kv[..., : layer.qk_nope_head_dim]
-        v = kv[..., layer.qk_nope_head_dim :]
-        ref = torch.nn.functional.scaled_dot_product_attention(
-            q.transpose(0, 1).unsqueeze(0).float(),
-            k.transpose(0, 1).unsqueeze(0).float(),
-            v.transpose(0, 1).unsqueeze(0).float(),
-            is_causal=True,
-            scale=layer.scaling,
-        )
-        ref = ref.squeeze(0).transpose(0, 1).reshape(t, h * layer.v_head_dim)
-        ref = layer.o_proj(ref.to(q_c.dtype))
-        if isinstance(ref, tuple):
-            ref = ref[0]
-        d = (out.float() - ref.float()).abs()
-        denom = ref.float().abs().mean().clamp_min(1e-6)
-        cos = torch.nn.functional.cosine_similarity(
-            out.float().flatten(), ref.float().flatten(), dim=0
-        )
-        print(
-            f"[glm5-mla-ref] layer={layer.layer_num:02d} T={t} "
-            f"rel_err={float(d.mean() / denom):.4f} max_abs={float(d.max()):.4f} "
-            f"cos={float(cos):+.6f} out_absmax={float(out.float().abs().max()):.4f} "
-            f"ref_absmax={float(ref.float().abs().max()):.4f}",
-            flush=True,
-        )
-
-
-def _mla_ref_check_decode(layer, q_c, out, ctx) -> None:
-    """Same oracle, decode step.
-
-    Prefill and decode run DIFFERENT math: prefill attends q_nope [H, 256]
-    against materialized k_nope, while decode uses the absorbed form, dotting a
-    latent q [H, 512+64] straight against the cached KV entry. Verifying prefill
-    therefore says nothing about decode -- and the 64 zero-pad lanes this port
-    adds live in the decode kernel's hard-coded 576-wide entry. So rebuild the
-    attention from the KV cache and compare there too.
-
-    Needs a bf16 KV cache (an fp8 cache would have to be de-quantized here to
-    mean anything); it just reports and skips otherwise.
-    """
-    md = getattr(ctx, "attn_metadata", None)
-    if md is None:
-        return
-    if isinstance(md, dict):
-        md = next(iter(md.values()), None)
-    cache = getattr(layer.mla_attn, "kv_cache", None)
-    if md is None or cache is None or cache.numel() == 0:
-        return
-    n_done = sum(1 for k in _DBG_SEEN if isinstance(k, tuple) and k[0] == "mla_ref_d")
-    if n_done >= 3:
-        return
-    bt = getattr(md, "block_tables", None)
-    clen = getattr(md, "context_lens", None)
-    if bt is None or clen is None or q_c.shape[0] != 1:
-        return
-    _DBG_SEEN.add(("mla_ref_d", layer.layer_num, n_done))
-
-    with torch.no_grad():
-        entry = cache.reshape(-1, cache.shape[-1])
-        if entry.element_size() == 1:
-            print(
-                f"[glm5-mla-decref] layer={layer.layer_num:02d} skipped: fp8 cache",
-                flush=True,
-            )
-            return
-        bsz = int(clen[0])
-        # Page size comes from the engine config, NOT from a cache dimension.
-        # The natural MLA cache layout is [..., page_size, 1, 576] (see the
-        # `kv_buffer.view(-1, page_size, 1, ...)` in attention_mla); reading
-        # shape[-2] yields 1 and silently gathers one token per block, which
-        # makes the reference garbage and the kernels look broken.
-        from atom.config import get_current_atom_config
-
-        page = int(get_current_atom_config().kv_cache_block_size)
-        rows = bt[0][: (bsz + page - 1) // page].tolist()
-        idx = torch.cat(
-            [torch.arange(r * page, r * page + page, device=entry.device) for r in rows]
-        )[:bsz]
-        kv_entry = entry.index_select(0, idx)  # [L, 576]
-        kv_c = kv_entry[:, : layer.kv_lora_rank]
-        pad = kv_entry[:, layer.kv_lora_rank :]
-
-        h = layer.num_local_heads
-        q = layer.q_b_proj(q_c)
-        if isinstance(q, tuple):
-            q = q[0]
-        q = q.reshape(1, h, -1)[..., : layer.qk_nope_head_dim]
-        kv = layer.kv_b_proj(kv_c)
-        if isinstance(kv, tuple):
-            kv = kv[0]
-        kv = kv.reshape(bsz, h, layer.qk_nope_head_dim + layer.v_head_dim)
-        k = kv[..., : layer.qk_nope_head_dim]
-        v = kv[..., layer.qk_nope_head_dim :]
-        scores = torch.einsum("qhd,khd->hqk", q.float(), k.float()) * layer.scaling
-        ref = torch.einsum("hqk,khd->qhd", scores.softmax(-1), v.float())
-        ref = layer.o_proj(ref.reshape(1, h * layer.v_head_dim).to(q_c.dtype))
-        if isinstance(ref, tuple):
-            ref = ref[0]
-        cos = torch.nn.functional.cosine_similarity(
-            out.float().flatten(), ref.float().flatten(), dim=0
-        )
-        denom = ref.float().abs().mean().clamp_min(1e-6)
-        print(
-            f"[glm5-mla-decref] layer={layer.layer_num:02d} ctx_len={bsz} "
-            f"page={page} cache={tuple(cache.shape)} "
-            f"rel_err={float((out.float() - ref.float()).abs().mean() / denom):.4f} "
-            f"cos={float(cos):+.6f} ropepad_absmax={float(pad.float().abs().max()):.5f} "
-            f"out_absmax={float(out.float().abs().max()):.4f} "
-            f"ref_absmax={float(ref.float().abs().max()):.4f}",
-            flush=True,
-        )
 
 
 class _ZeroRopePad:
@@ -1146,7 +983,7 @@ class Glm5NextMLAAttention(nn.Module):
         # `index_topk` candidates that is not an approximation -- top-k would
         # select every token anyway -- so any output difference isolates a bug
         # in the indexer / sparse top-k path rather than in MLA itself.
-        force_dense = os.environ.get("ATOM_GLM5_FORCE_DENSE_MLA", "0") == "1"
+        force_dense = envs.ATOM_GLM5_FORCE_DENSE_MLA
         # The indexer is not called by MLA -- it has to be driven from this
         # forward. It writes the pooled index keys and the selected KV slots
         # that `is_sparse=True` then makes MLA read, so leaving it uncalled
@@ -1301,6 +1138,7 @@ class Glm5NextDecoderLayer(nn.Module):
         return self.hc.post_expand(x, residual, post, comb)
 
 
+@support_torch_compile
 class Glm5NextModel(nn.Module):
     def __init__(self, *, atom_config: Config, prefix: str = "") -> None:
         super().__init__()
@@ -1374,33 +1212,22 @@ class Glm5NextModel(nn.Module):
 
 
 class Glm5NextForConditionalGeneration(nn.Module):
-    """GLM-5.3-Flash.
-
-    The checkpoint nests the language model under ``model.language_model.*`` and
-    the vision tower under ``model.visual.*``. Both are built here; the tower is
-    skipped only when there is no `vision_config` to build it from, or on a
-    pipeline rank that does not produce token embeddings.
-    """
+    """Text-only GLM-5.3-Flash runtime."""
 
     packed_modules_mapping: ClassVar[dict] = {
         ".gate_proj": (".gate_up_proj", 0),
         ".up_proj": (".gate_up_proj", 1),
         **_KDA_PACKED_MODULES_MAPPING,
     }
-    # Strip the multimodal nesting. The language model's parameter names are
-    # rooted at `model.*` and the tower's at `visual.*`, which also lines the
-    # language names up with the checkpoint's quantization_config (it already
-    # writes exclusions as `model.layers.N....`), so no quant name mapping is
-    # needed. Order matters only in that neither key is a substring of the other.
+    # Strip the multimodal language nesting. The checkpoint's vision tower has
+    # no processor/input path in ATOM yet, so it is skipped rather than
+    # consuming VRAM with unreachable randomly-risky code.
     weights_mapping: ClassVar[dict[str, str]] = {
-        "model.visual.": "visual.",
         "model.language_model.": "model.",
     }
-    # Prefixes dropped when the tower is not built; set per-instance in __init__.
     # The MTP draft layer needs no entry: it is checkpoint layer 45 and the
     # loader drops any layer index at or beyond `num_hidden_layers`.
-    vision_weight_prefixes: ClassVar[tuple[str, ...]] = ("model.visual.",)
-    skip_weight_prefixes: ClassVar[list[str]] = []
+    skip_weight_prefixes: ClassVar[list[str]] = ["model.visual."]
 
     fall_back_to_pt_during_load = False
 
@@ -1435,72 +1262,8 @@ class Glm5NextForConditionalGeneration(nn.Module):
         self.moe_layers = [m.experts for m in self.moe_mlp_layers]
         self.expert_weights = []
 
-        self._init_vision_tower(atom_config)
-
-    def _init_vision_tower(self, atom_config: Config) -> None:
-        """Build the vision tower, or arrange for its weights to be skipped.
-
-        The tower only runs where token embeddings are produced, so under
-        pipeline parallelism it lives on the first rank alone. It is also skipped
-        when the config carries no `vision_config` -- the text path stays fully
-        usable in that case rather than failing to start.
-        """
-        multimodal = getattr(atom_config, "multimodal_config", None)
-        vision_config = getattr(multimodal, "vision_config", None)
-
-        if vision_config is None or not get_pp_group().is_first_rank:
-            self.visual = None
-            self.image_token_id = None
-            self.video_token_id = None
-            self.skip_weight_prefixes = list(self.vision_weight_prefixes)
-            return
-
-        from atom.models.glm5_next_vl import build_vision_tower
-
-        self.visual = build_vision_tower(vision_config)
-        self.image_token_id = getattr(multimodal, "image_token_id", None)
-        self.video_token_id = getattr(multimodal, "video_token_id", None)
-
-    @property
-    def has_vision_tower(self) -> bool:
-        return getattr(self, "visual", None) is not None
-
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
-
-    def get_vision_embeddings(
-        self, pixel_values: torch.Tensor, grid_thw: torch.Tensor
-    ) -> torch.Tensor:
-        """Patches -> one 4096-wide embedding per merged 2x2 block."""
-        if not self.has_vision_tower:
-            raise RuntimeError(
-                "GLM-5.3-Flash vision embeddings were requested but no tower is "
-                "built. Either the config carried no `vision_config`, or this is "
-                "a pipeline rank other than the first."
-            )
-        return self.visual(pixel_values, grid_thw)
-
-    def merge_multimodal_embeddings(
-        self,
-        input_ids: torch.Tensor,
-        inputs_embeds: torch.Tensor,
-        vision_embeds: torch.Tensor,
-    ) -> torch.Tensor:
-        """Scatter vision embeddings onto the image/video placeholder tokens."""
-        mask = torch.zeros_like(input_ids, dtype=torch.bool)
-        for token_id in (self.image_token_id, self.video_token_id):
-            if token_id is not None:
-                mask |= input_ids == token_id
-        n_slots = int(mask.sum())
-        if n_slots != vision_embeds.shape[0]:
-            raise ValueError(
-                f"GLM-5.3-Flash got {vision_embeds.shape[0]} vision embeddings for "
-                f"{n_slots} placeholder tokens. Each image contributes "
-                "(t*h*w)/spatial_merge_size**2 tokens, and multimodal prefills "
-                "must not be chunked."
-            )
-        inputs_embeds[mask] = vision_embeds.to(inputs_embeds.dtype)
-        return inputs_embeds
 
     def forward(
         self,
@@ -1633,7 +1396,7 @@ def _kpool_verify_cache(
     Off by default: it gathers and syncs, so it is a debugging tool, not a
     runtime check.
     """
-    if os.environ.get("ATOM_GLM5_KPOOL_REF", "0") != "1" or _dbg_capturing():
+    if not envs.ATOM_GLM5_KPOOL_REF or _dbg_capturing():
         return
     from atom.utils.forward_context import get_forward_context
 
@@ -1679,10 +1442,13 @@ def _kpool_verify_cache(
     den = got.norm(dim=-1) * want.norm(dim=-1) + 1e-9
     cos = (num / den).min().item()
     rel = ((got - want).abs().max() / want.abs().max().clamp_min(1e-9)).item()
-    print(
-        f"[kpool-ref] seq_len={seq_len} pools[{first}:{n_pools}] "
-        f"min_cos={cos:.6f} rel_err={rel:.4f}",
-        flush=True,
+    logger.info(
+        "[kpool-ref] seq_len=%d pools[%d:%d] min_cos=%.6f rel_err=%.4f",
+        seq_len,
+        first,
+        n_pools,
+        cos,
+        rel,
     )
 
 

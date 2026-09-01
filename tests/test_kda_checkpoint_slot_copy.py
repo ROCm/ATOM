@@ -511,7 +511,9 @@ class TestAnIndexerSharesThePageUnit:
     ENTRY = 4
     LOGICAL_BS = 8  # tokens per logical block
     RATIO = 2  # block_ratio: physical blocks per logical block
-    N_LOGICAL = 6
+    # Larger than the six PAGE units this fixture's checkpoint image needs, so
+    # the "past the image" assertions below inspect real storage, not empties.
+    N_LOGICAL = 8
     INDEX_LAYERS = 3
     INDEX_ROWS = 2  # index rows one block owns, i.e. pooled: block_size // kpool
     INDEX_DIM = 3
@@ -694,12 +696,17 @@ class TestAnImageSpansBothPoolsIntact:
         a live request, in either pool."""
         stub, _, _, pool, index_cache, plan_fn = self.build()
         units = self.units_for(stub)
+        pool_before = pool.clone()
+        index_before = index_cache.clone()
 
         round_trip = TestAStoreRestoreRoundTripMovesExactlyTheImage.round_trip
         round_trip(self, stub, plan_fn, units, src=1, dst=3)
         for row in range(self.GEO.ROWS):
-            tail = pool[row].reshape(-1)[len(units) * self.GEO.region :]
-            assert int(tail.sum()) == 0
+            offset = len(units) * self.GEO.region
+            tail = pool[row].reshape(-1)[offset:]
+            assert tail.numel() > 0
+            assert torch.equal(tail, pool_before[row].reshape(-1)[offset:])
         for layer in range(self.GEO.INDEX_LAYERS):
-            tail = index_cache[layer, len(units) :].reshape(-1).view(torch.uint8)
-            assert int(tail.sum()) == 0
+            tail = index_cache[layer, len(units) :]
+            assert tail.numel() > 0
+            assert torch.equal(tail, index_before[layer, len(units) :])

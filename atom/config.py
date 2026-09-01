@@ -653,7 +653,7 @@ _MULTIMODAL_MODEL_TYPES: dict[str, str] = {
     "qwen3_5": "text_config",
     "qwen3_5_moe": "text_config",
     "mistral3": "text_config",
-    "glm5_next": "text_config",  # GLM-5.3-Flash: hybrid KDA/DSA text + vision tower
+    "glm5_next": "text_config",  # GLM-5.3-Flash: text-only hybrid KDA/DSA runtime
 }
 
 # Text sub-config model_types that this image's transformers has no class for.
@@ -734,23 +734,11 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
             )
             hf_config._multimodal_config = full_config
         except Exception:  # noqa: BLE001 - transformers raises anything here
-            if model_type == "glm5_next":
-                # This image's transformers has no Glm5Next config class. Its
-                # tower still needs the raw vision_config, so rebuild only this
-                # known schema instead of changing the failure sentinel for
-                # every existing multimodal model.
-                plain = PretrainedConfig.from_dict(
-                    {k: v for k, v in config_dict.items() if not isinstance(v, dict)}
-                )
-                for field, value in config_dict.items():
-                    if isinstance(value, dict):
-                        setattr(plain, field, PretrainedConfig.from_dict(value))
-                hf_config._multimodal_config = plain
-            else:
-                # Existing consumers use None to report that their full
-                # multimodal config could not be loaded. A partial generic
-                # object can bypass those checks and run with default token IDs.
-                hf_config._multimodal_config = None
+            # Consumers use None to report that their full multimodal config
+            # could not be loaded. A partial generic object can bypass those
+            # checks and run with default token IDs. GLM-5.3 is text-only here,
+            # so it has no reason to weaken that contract.
+            hf_config._multimodal_config = None
         return hf_config
 
     if model_type in _PLAIN_CONFIG_MODEL_TYPES:
@@ -2046,6 +2034,18 @@ class Config:
         # set here and the attention builder sizes the index cache from it.
         is_glm5_next = any("Glm5Next" in str(a) for a in arches)
         if is_glm5_next:
+            unsupported_parallelism = []
+            if self.prefill_context_parallel_size > 1:
+                unsupported_parallelism.append("PCP")
+            if self.decode_context_parallel_size > 1:
+                unsupported_parallelism.append("DCP")
+            if self.speculative_config is not None:
+                unsupported_parallelism.append("speculative decoding")
+            if unsupported_parallelism:
+                raise ValueError(
+                    "GLM-5.3-Flash text serving does not yet support "
+                    f"{', '.join(unsupported_parallelism)}"
+                )
             index_kpool = int(getattr(self.hf_config, "index_kpool", 1) or 1)
             if index_kpool > 1:
                 glm5_block_size = glm5_kpool_block_size(index_kpool)

@@ -148,6 +148,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_GLM_FUSED_INDEXER": lambda: (
         os.getenv("ATOM_ENABLE_GLM_FUSED_INDEXER", "1") == "1"
     ),
+    # GLM-5.3 pooled sparse indexer. Disabling it is an exact A/B only while
+    # sequence length <= index_topk; the model refuses longer requests.
+    "ATOM_GLM5_KPOOL": lambda: os.getenv("ATOM_GLM5_KPOOL", "1") == "1",
+    # Bring-up/debug controls for the GLM-5.3 text path.
+    "ATOM_GLM5_FORCE_DENSE_MLA": lambda: (
+        os.getenv("ATOM_GLM5_FORCE_DENSE_MLA", "0") == "1"
+    ),
+    "ATOM_GLM5_DISABLE_FUSED_MHC": lambda: (
+        os.getenv("ATOM_GLM5_DISABLE_FUSED_MHC", "0") == "1"
+    ),
+    "ATOM_GLM5_KPOOL_DUMP": lambda: os.getenv("ATOM_GLM5_KPOOL_DUMP", ""),
+    "ATOM_GLM5_KPOOL_DUMP_LAYER": lambda: os.getenv(
+        "ATOM_GLM5_KPOOL_DUMP_LAYER", ""
+    ),
+    "ATOM_GLM5_KPOOL_REF": lambda: (
+        os.getenv("ATOM_GLM5_KPOOL_REF", "0") == "1"
+    ),
     # Kimi-K3 DSpark draft: fuse the per-layer context-row KV write
     # (K3DSparkMLAAttention.write_context_kv) into one Triton kernel --
     # RMSNorm(kv_c) + rope(k_pe) + concat + paged-cache store, versus today's

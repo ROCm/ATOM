@@ -1,17 +1,16 @@
 # GLM-5.3-Flash Bring-Up Notes
 
 > **Status: serving-accurate under ATOM on 8× MI355X, long context included.**
-> `atom/models/glm5_next.py` loads every parameter of the checkpoint — language
-> model and vision tower — and scores **gsm8k 0.9682 / 0.9689** at 3-shot on the
+> `atom/models/glm5_next.py` loads every text-model parameter (the unsupported
+> vision tower is skipped) and scores **gsm8k 0.9682 / 0.9689** at 3-shot on the
 > dense path and **0.9659 / 0.9666** at 16-shot on the pooled k-pool path, over
 > all 1319 questions (chat, TP8, bf16 KV; see §7). Per-layer hidden states match
-> the transformers reference to cosine ≥ 0.9997 at all 45 layers, and the vision
-> tower is bit-exact in fp32. Not yet done: the MTP draft layer, and the image
-> processor that would let the server actually accept an image. See §8.
+> the transformers reference to cosine ≥ 0.9997 at all 45 layers. Not yet done:
+> the MTP draft layer or multimodal serving. See §8.
 
 ```bash
 python -m atom.examples.simple_inference --model /models/GLM-5.3-Flash -tp 4 \
-    --kv_cache_dtype bf16 --enforce-eager --max-tokens 64
+    --kv_cache_dtype bf16 --max-tokens 64
 ```
 
 Needs an aiter with `chunk_kimi_delta_attn` and `mla_decode_fwd(causal=...)` —
@@ -26,7 +25,9 @@ text + image + video. Architecture: `Glm5NextForConditionalGeneration`, `model_t
 
 ## 1. Architecture
 
-45 text layers in a repeating hybrid pattern plus a 24-layer vision tower:
+45 text layers in a repeating hybrid pattern. The checkpoint also contains a
+24-layer vision tower, which ATOM deliberately skips until its input processor
+and serving path exist:
 
 | Component | Shape / setting |
 | --- | --- |
@@ -40,7 +41,7 @@ text + image + video. Architecture: `Glm5NextForConditionalGeneration`, `model_t
 | MoE | 288 routed (8/token) + 1 shared, `moe_intermediate_size` 2048, sigmoid + `noaux_tc`, `routed_scaling_factor` 2.5 |
 | Dense layers | first 3 (`first_k_dense_replace`), `intermediate_size` 12288 |
 | Quantization | block FP8 e4m3, `weight_block_size` [128, 128], dynamic activations |
-| Vision | 24 layers, hidden 1024, image 448, patch 14, spatial merge 2, temporal patch 2 → `out_hidden_size` 4096 |
+| Vision (not served) | 24 layers, hidden 1024, image 448, patch 14, spatial merge 2, temporal patch 2 → `out_hidden_size` 4096 |
 
 Two structural points that differ from every model ATOM currently serves:
 
@@ -60,12 +61,12 @@ assembly plus one new op, not a from-scratch port.
 | --- | --- | --- |
 | KDA linear attention | `KimiKDAAttention` (`models/kimi_k3.py`), aiter `kimi_delta_attn` Triton kernels | Very close. Same **separate `q/k/v_conv1d`** layout as the checkpoint, per-head `A_log`, per-channel `dt_bias`, `f_a`/`f_b` forget gate, and it already reads `linear_attn_config.gate_lower_bound`. |
 | mHC hyper-connections | `hc_split_sinkhorn` (`model_ops/sparse_attn_v4.py`), `Block.hc_pre`/`hc_post` (`models/deepseek_v4.py`) | **Math-exact.** Same sigmoid gates, same Sinkhorn schedule including the special first iteration, same `HC_POST_MULT = 2.0`. Checkpoint tensor names (`hc_attn_fn`/`base`/`scale`) are already what `Block` expects, and `hc_attn_fn` is `[24, 16384]` = exactly its `mixes` layout. `dim=4096` satisfies the fused aiter `mhc_pre`/`mhc_post` `% 512 == 0` constraint. |
-| k-pool DSA indexer | **new** — `model_ops/glm5_next/kpool.py` (serving path) with `model_ops/kpool_indexer.py` as its dense `transformers`-parity oracle | DeepSeek-V4's `Compressor` pools the same way at `compress_ratio=4` with an `ape` term, but overlapping + RoPE'd. GLM's is non-overlapping and NoPE. |
+| k-pool DSA indexer | **new** — `model_ops/glm5_next/kpool.py`, with CPU geometry tests and direct GPU kernel/reference parity tests | DeepSeek-V4's `Compressor` pools the same way at `compress_ratio=4` with an `ape` term, but overlapping + RoPE'd. GLM's is non-overlapping and NoPE. |
 | MLA | `model_ops/attention_mla.py` via `MLAModules`, NoPE via `_NoPositionalRotaryEmbedding` | Needs the rope block materialized at `_ROPE_PAD = 64` lanes of zeros, giving the 576-wide KV entry every ROCm MLA kernel assumes. A zero-*width* slice is not viable — see §4d. |
 | MoE 288 × sigmoid/`noaux_tc` | `model_ops/fused_moe`, `models/glm4_moe.py`, `deepseek_v2.py` | Direct. |
 | Block FP8 128×128 | existing DeepSeek block-FP8 path | Direct. |
 | MTP (layer 45) | `deepseek_mtp.py` / `glm4_moe_mtp.py` | Layer 45 is a full DSA layer plus `eh_proj`/`enorm`/`hnorm`/`shared_head.norm`. `index_share_for_mtp_iteration` means it reuses the main model's top-k. |
-| Vision tower | `kimi_k3_vl.py`, `qwen3_5_vl.py` | Standard ViT: fused `qkv`, `q_norm`/`k_norm`, gated MLP, `downsample`, `merger`. All BF16. |
+| Vision tower | Not shipped on this text-only path | Building and loading an unreachable tower consumes VRAM and exposed its weights to text-only packed-name rewrites. Add it with the processor and end-to-end multimodal coverage. |
 
 ### Checkpoint → model weight remap
 
@@ -96,30 +97,24 @@ the loader's past-last-layer filter. Only the expert and q/k/v fusions go throug
 
 ## 3. What is validated
 
-**`atom/model_ops/kpool_indexer.py`** — selects byte-identical token indices to
-`transformers`' `Glm5NextTextIndexer` on the real layer-3 weights, over sequence
-lengths 7 / 64 / 300 / 2048 / 3000 and with left padding of 5 and 17 tokens
-(`seq=3000` exceeds `index_topk`, so genuine sparse pool selection is exercised).
+The serving implementation is `atom/model_ops/glm5_next/kpool.py`; there is no
+second, dead indexer implementation. Its contracts are covered at three levels:
 
-Unit tests (CPU, synthetic weights): `tests/model_ops/test_kpool_indexer.py`.
+* `tests/model_ops/test_glm5_kpool_geometry.py` runs on CPU and pins the shared
+  producer/metadata output width, including `ATOM_GLM5_KPOOL=0`.
+* `tests/model_ops/test_glm5_kpool_kernels.py` runs on ROCm and compares the
+  production pooling/Hadamard/query-quant kernels directly with their torch
+  references. It also asserts that query quantization uses AITER's
+  architecture-dependent FP8 dtype and max.
+* The 16-shot GSM8K row in §7 drives pooled writes, scoring, expansion and MLA
+  consumption end to end. The state tests additionally cover chunk-boundary
+  tails, checkpoint copy, relocation and invalid CUDAGraph slots.
 
-**Gap worth knowing before reviewing this branch: the k-pool code that actually
-serves — `atom/model_ops/glm5_next/kpool.py` — has no bit-exact unit test here.**
-The test above covers `kpool_indexer.py`, the dense oracle, which is not on the
-serving path. The end-to-end evidence for the pooled path is the 16-shot gsm8k
-score in §7 plus a controlled long-context retrieval check, and a benchmark
-score cannot pin the things a unit test can: that the pooling softmax is
-per-dimension rather than per-slot, that the Hadamard is orthonormal, and the
-pool/tail slot arithmetic. Every one of those has spellings that produce finite,
-plausible keys and a gsm8k score in the right range while still being wrong. The
-bit-exact suite for these ops exists on the parallel port's branch
-(`tests/models/test_glm5_next_kpool.py`) and should be brought across.
-
-That parity check ran against `transformers` on the real checkpoint during
-bring-up, on the reference harness described in §5. The harness is not carried
-in this tree — it needs `transformers>=5.16` for `glm5_next` while ATOM pins
-5.12.1 — so the standing guard in CI is the CPU unit test above; the weights
-comparison is a bring-up result, reproducible by rebuilding the harness.
+During bring-up, a separate `transformers>=5.16` harness compared the real
+layer-3 weights over sequence lengths 7 / 64 / 300 / 2048 / 3000. That harness
+is not carried in this tree because ATOM pins transformers 5.12.1; its measured
+results remain bring-up evidence rather than a misleading CI test of different
+code.
 
 ## 4. Bugs found during bring-up
 
@@ -305,22 +300,19 @@ Two traps worth knowing about when reproducing this:
   against a prefix the reference would not have written. The per-layer cosines
   above are the load-bearing evidence, not this number.
 
-**Vision tower** (`atom/models/glm5_next_vl.py`). Loaded with the real
-`model.visual.*` weights and compared against `Glm5NextVisionModel` on the
-merged `[n_tokens, 4096]` output that gets scattered onto image placeholders:
+**Vision prototype (bring-up only, not shipped).** The external reference
+harness loaded `model.visual.*` and compared a prototype tower against
+`Glm5NextVisionModel` on merged `[n_tokens, 4096]` outputs:
 
 | dtype + attention | (1,2,2) | (1,4,4) | (1,8,12) | (2,4,4) |
 | --- | --- | --- | --- | --- |
 | fp32 + SDPA (correctness) | **bit-exact** | **bit-exact** | **bit-exact** | **bit-exact** |
 | bf16 + aiter (serving) | .999555 | .999845 | .994098 | .999677 |
 
-The fp32 row is the assertion — same kernel as the reference, no BF16 rounding,
-so it isolates the maths: patch embed, the block-major 2-D rope layout, 24
-blocks, clamped SwiGLU, the 2×2 merge, downsample conv and merger are all exactly
-right. The bf16 row is the serving path and is reported, not asserted; it carries
-two roundings (aiter packed-varlen vs SDPA, and ATOM's single fused `[gate|up]`
-GEMM vs the reference's two) compounded over 24 blocks, on random patches far
-worse conditioned than real normalised image input.
+These numbers record the prototype's math, not supported ATOM behavior. The
+tower was removed from this text-only landing because no processor can produce
+its inputs under the pinned transformers version; loading it only consumed VRAM
+and left unexercised packed-weight mappings in production.
 
 **Known numerical gap.** GLM clamps its expert SwiGLU at ±`swiglu_limit` (10.0),
 but only ATOM's `flydsl` and `mori` MoE paths plumb `swiglu_limit`; the default
@@ -329,7 +321,7 @@ clamp binds on under 0.001% of elements, with max |gate| 19.6 and max |up| 14.2 
 so it is real but small. The dense layers (0–2) are unaffected; they go through
 `swiglu_oai_split`.
 
-**Performance**, 21-token prompt, TP4, `--enforce-eager`, batch 1, no MTP:
+**Performance**, 21-token prompt, TP4, eager, batch 1, no MTP:
 
 | | TTFT | TPOT | decode |
 | --- | --- | --- | --- |
@@ -337,7 +329,8 @@ so it is real but small. The dense layers (0–2) are unaffected; they go throug
 | transformers + aiter FP8 | — | — | 4.25 tok/s |
 | transformers + torch FP8 | — | — | 2.68 tok/s |
 
-CUDA graphs and MTP are both still on the table.
+The model now carries `@support_torch_compile`; TP8 level-3 compilation and
+whole-forward CUDA graph capture are smoke-tested. MTP remains unsupported.
 
 ## 7. Measured serving accuracy
 
@@ -352,6 +345,10 @@ CUDA graphs and MTP are both still on the table.
 Guarded by the `GLM-5.3-Flash` and `GLM-5.3-Flash-kpool-16shot` entries in
 `.github/benchmark/models_accuracy.json` (threshold 0.94). SGLang publishes
 0.9704–0.9757 for this model, so the port is in line.
+
+Post-review validation on 2026-09-01, after merging current `main` and enabling
+level-3 compilation: the same 1319-question 16-shot run scored **0.9682 /
+0.9682** (flexible / strict), above both the catalog baseline and threshold.
 
 **Only the 16-shot row exercises the pooled path.** GSM8K prompts are short —
 3-shot is ~389 tokens, 5-shot ~645 — so at or below `index_topk` the indexer
@@ -383,23 +380,18 @@ Three things about scoring this model that will otherwise waste a run:
 
 1. ~~**Contexts beyond 2048.**~~ Done — `model_ops/glm5_next/kpool.py` implements
    the paged/ragged pooled indexer and `Glm5NextIndexer` drives it; measured at
-   16-shot in §7. `model_ops/kpool_indexer.py` remains as the dense
-   `transformers`-parity oracle it was written to be, and is not on the serving
-   path.
+   16-shot in §7 and checked directly against its torch kernel references.
 2. **`swiglu_limit` in the MoE** — either route to a backend that honours it or
    plumb it through the CK path (§6).
 3. **MTP draft layer** (checkpoint layer 45: `eh_proj` / `enorm` / `hnorm` /
    `shared_head.norm`, plus its own indexer). `index_share_for_mtp_iteration`
    means it reuses the main model's top-k.
-4. **The image input path.** The tower itself is done: built, loaded and
-   bit-exact in fp32 (§6), with the model implementing the engine's
-   `get_vision_embeddings` / `merge_multimodal_embeddings` contract. What is
-   missing is upstream of it — `Glm5NextProcessor` only exists in transformers
-   >= 5.16 while ATOM pins 5.12.1, so nothing turns an image into `pixel_values`
-   + `image_grid_thw`, and `model_engine/multimodal.py` has no `glm5_next`
-   branch. Video additionally needs frame sampling.
-5. **Performance**: CUDA graphs (currently `--enforce-eager`), MTP speculative
-   decoding, and dropping the `hc` torch fallback once the fused path is trusted.
+4. **Multimodal serving.** Land the image processor, input builder, tower and
+   packed-weight tests together. `Glm5NextProcessor` only exists in transformers
+   >= 5.16 while ATOM pins 5.12.1; video additionally needs frame sampling.
+   Until then `model.visual.*` is skipped so text serving does not pay its VRAM.
+5. **Performance**: tune the newly-enabled compiled path, add MTP speculative
+   decoding, and drop the `hc` torch fallback once the fused path is trusted.
 6. **Upstream the transformers FP8 bug** (§4a) and the gfx950 Triton failure (§4b).
 
 Upstream, for reference: sglang PR #36507 (16.6k lines, 144 files) and vLLM PR

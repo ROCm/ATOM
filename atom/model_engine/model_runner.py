@@ -1072,6 +1072,7 @@ class ModelRunner:
             "index_cache",
             "mamba_k_cache",
             "mamba_v_cache",
+            "kpool_tail_cache",
         ):
             if hasattr(self, attr):
                 delattr(self, attr)
@@ -2842,7 +2843,17 @@ class ModelRunner:
         self._pp_send_needs_sparse = (not pp.is_last_rank) and _is_shared(
             inner.end_layer
         )
-        self._pp_index_topk = int(self.config.hf_config.index_topk)
+        # Transfer the physical producer row width, not the logical top-k.
+        # GLM-5.3 appends up to index_kpool-1 tail tokens and rounds each row
+        # to 128 columns; slicing at index_topk would start every later row at
+        # the wrong offset.
+        self._pp_index_topk = int(
+            getattr(
+                self.attn_metadata_builder,
+                "index_topk_out",
+                self.config.hf_config.index_topk,
+            )
+        )
         if self._pp_recv_needs_sparse or self._pp_send_needs_sparse:
             logger.info(
                 "[%s] PP shared-indexer transfer: recv=%s send=%s "
