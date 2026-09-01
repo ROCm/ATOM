@@ -99,7 +99,12 @@ from atom.utils.tbo import (
     local_tbo_precompute,
     maybe_create_ubatch_slices,
 )
-from atom.utils.tbo.ubatching import DPMetadataBuffers
+from atom.utils.tbo.ubatching import (
+    DPMetadataBuffers,
+    PendingDPMetadataSync,
+    begin_sync_dp_metadata,
+    finish_sync_dp_metadata,
+)
 
 logger = logging.getLogger("atom")
 
@@ -170,6 +175,19 @@ class TokenLocations(NamedTuple):
     deferred_curr: np.ndarray
     deferred_prev: np.ndarray
     new_curr: np.ndarray
+
+
+class _PendingModelPreparation(NamedTuple):
+    """Batch-local work needed to finish ``prepare_model``.
+
+    On the device metadata path, ``dp_sync`` already has H2D, RCCL, and D2H
+    queued.  Keeping the ticket separate from its eventual reductions lets
+    independent host preparation cover that work before the first read.
+    """
+
+    max_seqlen_q: int
+    local_tbo: tuple[bool, bool, int, int]
+    dp_sync: PendingDPMetadataSync | None
 
 
 class tokenIDProcessor:
@@ -2577,39 +2595,110 @@ class ModelRunner:
 
         return temperatures, top_ks, top_ps, all_greedy, needs_independent_noise
 
-    def prepare_model(self, batch: ScheduledBatch):
+    def _begin_prepare_model(self, batch: ScheduledBatch) -> _PendingModelPreparation:
+        """Submit device metadata as soon as this worker owns the next batch.
+
+        The scheduler has only just fixed the fields at this point, so this is
+        the earliest correctness-preserving submission point.  Nothing here
+        touches ``forward_vars``; the exchange may therefore overlap staging-
+        buffer reuse gating as well as the independent preparation below.
+        """
+
         shrunk_q = self._dspark_apply_q_bucket(batch)
+        max_seqlen_q = batch.num_spec_step + 1 if shrunk_q is None else shrunk_q
+        local_tbo = self._local_tbo_eligibility(batch)
+        dp_sync = None
+
+        if self._dp_metadata_device_sync:
+            dp_size = self.config.parallel_config.data_parallel_size
+            dp_group = get_dp_group()
+            is_block_drafter = (
+                hasattr(self, "drafter") and self.drafter.is_block_drafter
+            )
+            meets_min, can_split, ub0, ub1 = local_tbo
+            dp_sync = begin_sync_dp_metadata(
+                dp_group=dp_group.device_group,
+                dp_size=dp_size,
+                buffers=self._dp_metadata_buffers,
+                scheduled_tokens=batch.total_tokens_num,
+                scheduled_bs=batch.total_seqs_num,
+                is_prefill=batch.total_tokens_num_prefill > 0,
+                tbo_on=self.config.enable_tbo,
+                local_meets_min_tokens=meets_min,
+                local_can_split=can_split,
+                local_ub_tokens=(ub0, ub1),
+                max_seqlen_q=max_seqlen_q if is_block_drafter else None,
+            )
+
+        return _PendingModelPreparation(
+            max_seqlen_q=max_seqlen_q,
+            local_tbo=local_tbo,
+            dp_sync=dp_sync,
+        )
+
+    def prepare_model(
+        self,
+        batch: ScheduledBatch,
+        preparation: _PendingModelPreparation | None = None,
+    ):
+        preparation = preparation or self._begin_prepare_model(batch)
         # The step's shape, settled once. Here rather than in prepare_inputs
         # because DSpark under DP needs the reduced query length BEFORE
         # prepare_input_ids sizes the buffer, and because one call site is the
         # only way the step is guaranteed a single cross-DP collective.
         dp_size = self.config.parallel_config.data_parallel_size
         dp_group = get_dp_group() if dp_size > 1 else None
-        forward_mode = ForwardMode.decide(
-            batch=batch,
-            dp_size=dp_size,
-            dp_group=(
-                (
-                    dp_group.device_group
-                    if self._dp_metadata_device_sync
-                    else dp_group.cpu_group
+        is_block_drafter = hasattr(self, "drafter") and self.drafter.is_block_drafter
+
+        def _decide(precomputed_sync=None):
+            return ForwardMode.decide(
+                batch=batch,
+                dp_size=dp_size,
+                dp_group=(
+                    (
+                        dp_group.device_group
+                        if self._dp_metadata_device_sync
+                        else dp_group.cpu_group
+                    )
+                    if dp_group is not None
+                    else None
+                ),
+                dp_sync_buffers=self._dp_metadata_buffers,
+                precomputed_sync=precomputed_sync,
+                enforce_eager=self.enforce_eager,
+                capture_sizes=self.capture_sizes_np,
+                captured_tokens=(
+                    self._piecewise_sorted_tokens
+                    if self._piecewise_cg_active()
+                    else None
+                ),
+                is_block_drafter=is_block_drafter,
+                tbo_on=self.config.enable_tbo,
+                local_tbo=preparation.local_tbo,
+                max_seqlen_q=preparation.max_seqlen_q,
+            )
+
+        input_ids = None
+        if preparation.dp_sync is not None:
+            # These values and copies depend only on the local ScheduledBatch.
+            # Run them while the metadata stream executes H2D -> RCCL -> D2H,
+            # and wait only before ForwardMode reads the gathered host buffer.
+            temperatures, top_ks, top_ps, all_greedy, needs_independent_noise = (
+                self.prepare_sample(batch)
+            )
+            if not is_block_drafter:
+                input_ids = self.tokenID_processor.prepare_input_ids(
+                    batch, preparation.max_seqlen_q
                 )
-                if dp_group is not None
-                else None
-            ),
-            dp_sync_buffers=self._dp_metadata_buffers,
-            enforce_eager=self.enforce_eager,
-            capture_sizes=self.capture_sizes_np,
-            captured_tokens=(
-                self._piecewise_sorted_tokens if self._piecewise_cg_active() else None
-            ),
-            is_block_drafter=(
-                hasattr(self, "drafter") and self.drafter.is_block_drafter
-            ),
-            tbo_on=self.config.enable_tbo,
-            local_tbo=self._local_tbo_eligibility(batch),
-            max_seqlen_q=(batch.num_spec_step + 1 if shrunk_q is None else shrunk_q),
-        )
+            sync = finish_sync_dp_metadata(preparation.dp_sync)
+            forward_mode = _decide(sync)
+        else:
+            # Keep the legacy CPU/Gloo path's ordering unchanged.
+            forward_mode = _decide()
+            temperatures, top_ks, top_ps, all_greedy, needs_independent_noise = (
+                self.prepare_sample(batch)
+            )
+
         # Stash the DP-wide prefill OR for the EPLB prefill gate; reused free by
         # on_forward_pass_end when the DP group == the migration (EP) group.
         self._eplb_any_rank_has_prefill = (
@@ -2620,12 +2709,10 @@ class ModelRunner:
         total_tokens_num = batch.total_tokens_num
         assert total_tokens_num > 0
 
-        temperatures, top_ks, top_ps, all_greedy, needs_independent_noise = (
-            self.prepare_sample(batch)
-        )
-        input_ids = self.tokenID_processor.prepare_input_ids(
-            batch, forward_mode.max_seqlen_q
-        )
+        if input_ids is None:
+            input_ids = self.tokenID_processor.prepare_input_ids(
+                batch, forward_mode.max_seqlen_q
+            )
         self.prepare_inputs(batch, input_ids, forward_mode=forward_mode)
 
         # Stage the speculative inputs while this forward's normal staging
@@ -3254,6 +3341,10 @@ class ModelRunner:
     @torch.inference_mode()
     @with_eplb_forward_monitor
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
+        # The metadata buffers are independent of forward_vars. Submit their
+        # H2D -> RCCL -> D2H chain before any staging-buffer reuse gate so even
+        # that host wait can cover device metadata progress.
+        preparation = self._begin_prepare_model(batch)
         # Make this forward's staging buffers safe to overwrite before
         # prepare_inputs writes them: rotate to a free slot if there is a ring,
         # otherwise wait out the previous forward's copies.
@@ -3270,7 +3361,7 @@ class ModelRunner:
             top_ps,
             all_greedy,
             needs_independent_noise,
-        ) = self.prepare_model(batch)
+        ) = self.prepare_model(batch, preparation)
         self._mark_staging_h2d_enqueued()
         logits, hidden_states = self.run_model(input_ids, batch)
 

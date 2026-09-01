@@ -241,6 +241,7 @@ class ForwardMode:
         local_tbo: tuple[bool, bool, int, int],
         max_seqlen_q: int,
         dp_sync_buffers: "DPMetadataBuffers | None" = None,
+        precomputed_sync: Any | None = None,
     ) -> "ForwardMode":
         """Run the step's DP collective and settle its shape from the result.
 
@@ -259,22 +260,24 @@ class ForwardMode:
 
         sync = None
         if dp_size > 1:
-            sync = sync_dp_metadata(
-                dp_group=dp_group,
-                dp_size=dp_size,
-                buffers=dp_sync_buffers,
-                scheduled_tokens=scheduled_tokens,
-                scheduled_bs=scheduled_bs,
-                is_prefill=is_prefill,
-                tbo_on=tbo_on,
-                local_meets_min_tokens=meets_min,
-                local_can_split=can_split,
-                local_ub_tokens=(ub0, ub1),
-                # Only a block drafter needs the group to agree on it; every
-                # other flavor keeps its own and the two extra wire rows are
-                # not sent.
-                max_seqlen_q=max_seqlen_q if is_block_drafter else None,
-            )
+            sync = precomputed_sync
+            if sync is None:
+                sync = sync_dp_metadata(
+                    dp_group=dp_group,
+                    dp_size=dp_size,
+                    buffers=dp_sync_buffers,
+                    scheduled_tokens=scheduled_tokens,
+                    scheduled_bs=scheduled_bs,
+                    is_prefill=is_prefill,
+                    tbo_on=tbo_on,
+                    local_meets_min_tokens=meets_min,
+                    local_can_split=can_split,
+                    local_ub_tokens=(ub0, ub1),
+                    # Only a block drafter needs the group to agree on it; every
+                    # other flavor keeps its own and the two extra wire rows are
+                    # not sent.
+                    max_seqlen_q=max_seqlen_q if is_block_drafter else None,
+                )
             # The group's query length, taken BEFORE the rows are read off it:
             # a rank still on its local q settles on a different `running_tokens`
             # than its peers.

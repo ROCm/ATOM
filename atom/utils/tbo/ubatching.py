@@ -250,6 +250,182 @@ class DPSyncResult:
     max_seqlen_q_across_dp: int | None = None
 
 
+@dataclass
+class PendingDPMetadataSync:
+    """An enqueued DP metadata exchange whose host result is not ready yet.
+
+    The device path deliberately separates submission from consumption so the
+    H2D, RCCL, and D2H can run while the caller prepares inputs that do not
+    depend on the group-wide result.  ``sync`` aliases the reusable pinned
+    landing buffer until :func:`finish_sync_dp_metadata` clones the retained
+    rank vector, so callers must finish one ticket before reusing its buffers.
+    """
+
+    sync: torch.Tensor
+    tbo_on: bool
+    dspark_on: bool
+    completion_stream: torch.cuda.Stream | None
+    clone_rank_tokens: bool
+    result: DPSyncResult | None = None
+
+
+def _metadata_fields(
+    *,
+    scheduled_tokens: int,
+    scheduled_bs: int,
+    is_prefill: bool,
+    tbo_on: bool,
+    local_meets_min_tokens: bool,
+    local_can_split: bool,
+    local_ub_tokens: tuple[int, int],
+    max_seqlen_q: int | None,
+) -> list[int]:
+    fields = [scheduled_tokens, scheduled_bs, 1 if is_prefill else 0]
+    if tbo_on:
+        fields.extend(
+            (
+                1 if local_meets_min_tokens else 0,
+                1 if local_can_split else 0,
+                local_ub_tokens[0],
+                local_ub_tokens[1],
+            )
+        )
+    if max_seqlen_q is not None:
+        fields.append(max_seqlen_q)
+
+    tbo_fields = 7 if tbo_on else 3
+    assert len(fields) == tbo_fields + (1 if max_seqlen_q is not None else 0)
+    return fields
+
+
+def begin_sync_dp_metadata(
+    *,
+    dp_group,
+    dp_size: int,
+    scheduled_tokens: int,
+    scheduled_bs: int,
+    buffers: DPMetadataBuffers | None = None,
+    is_prefill: bool,
+    tbo_on: bool,
+    local_meets_min_tokens: bool = False,
+    local_can_split: bool = False,
+    local_ub_tokens: tuple[int, int] = (0, 0),
+    max_seqlen_q: int | None = None,
+) -> PendingDPMetadataSync:
+    """Submit one packed metadata exchange without waiting for its D2H.
+
+    The CPU/Gloo fallback remains synchronous because its output is already a
+    host tensor.  The device/RCCL path returns after placing H2D, all-gather,
+    and D2H in order on the dedicated metadata stream.  The caller chooses the
+    latest safe point to call :func:`finish_sync_dp_metadata`.
+    """
+
+    fields = _metadata_fields(
+        scheduled_tokens=scheduled_tokens,
+        scheduled_bs=scheduled_bs,
+        is_prefill=is_prefill,
+        tbo_on=tbo_on,
+        local_meets_min_tokens=local_meets_min_tokens,
+        local_can_split=local_can_split,
+        local_ub_tokens=local_ub_tokens,
+        max_seqlen_q=max_seqlen_q,
+    )
+    n_fields = len(fields)
+
+    if buffers is None:
+        local = torch.tensor(fields, dtype=torch.int32, device="cpu")
+        gathered = [torch.empty_like(local) for _ in range(dp_size)]
+        torch.distributed.all_gather(gathered, local, group=dp_group)
+        sync = torch.stack(gathered, dim=1)  # [n_fields, dp_size]
+        return PendingDPMetadataSync(
+            sync=sync,
+            tbo_on=tbo_on,
+            dspark_on=max_seqlen_q is not None,
+            completion_stream=None,
+            clone_rank_tokens=False,
+        )
+
+    if buffers.dp_size != dp_size:
+        raise ValueError(
+            f"metadata buffers are for dp_size={buffers.dp_size}, got {dp_size}"
+        )
+
+    # Pack on the CPU as one vector. Assigning these fields directly to a
+    # device tensor emits one synchronous hipMemcpyWithStream per scalar.
+    buffers.local_numpy[:n_fields] = fields
+    local_cpu = buffers.local_cpu[:n_fields]
+    local_device = buffers.local_device[:n_fields]
+    required_numel = dp_size * n_fields
+    gathered_device = buffers.gathered_device[:required_numel]
+    gathered_cpu = buffers.gathered_cpu[:required_numel]
+
+    # Submit the complete dependency chain now, but do not block the host here.
+    # ProcessGroupNCCL orders its output on this stream, so the trailing D2H is
+    # the completion fence for the whole exchange.
+    with torch.cuda.stream(buffers.stream):
+        local_device.copy_(local_cpu, non_blocking=True)
+        torch.distributed.all_gather_into_tensor(
+            gathered_device, local_device, group=dp_group
+        )
+        gathered_cpu.copy_(gathered_device, non_blocking=True)
+
+    return PendingDPMetadataSync(
+        sync=gathered_cpu.view(dp_size, n_fields).T,
+        tbo_on=tbo_on,
+        dspark_on=max_seqlen_q is not None,
+        completion_stream=buffers.stream,
+        clone_rank_tokens=True,
+    )
+
+
+def finish_sync_dp_metadata(pending: PendingDPMetadataSync) -> DPSyncResult:
+    """Wait at first consumption and decode a pending packed exchange."""
+
+    if pending.result is not None:
+        return pending.result
+    if pending.completion_stream is not None:
+        pending.completion_stream.synchronize()
+
+    sync = pending.sync
+    tbo_on = pending.tbo_on
+    dspark_on = pending.dspark_on
+
+    # Device sync reuses its host landing buffer next step. Preserve the old
+    # result-ownership contract for callers that retain the ForwardMode.
+    num_tokens_across_dp = sync[0].clone() if pending.clone_rank_tokens else sync[0]
+    max_bs_across_dp = int(sync[1].max())
+    any_rank_has_prefill = bool(sync[2].any())
+    tbo_collective_active = False
+    ub_max_tokens_across_dp: tuple[int, int] | None = None
+    if tbo_on:
+        # OR(meets_min_tokens): one rank reaching the min-token bar turns TBO on
+        # for all. AND(can_split): but EVERY rank must be structurally splittable.
+        tbo_collective_active = bool(sync[3].any()) and bool(sync[4].all())
+        if tbo_collective_active:
+            prefill_rank_count = int(sync[2].sum())
+            uniform_mode = (
+                prefill_rank_count == 0 or prefill_rank_count == sync.shape[1]
+            )
+            tbo_collective_active = uniform_mode
+        if tbo_collective_active:
+            ub_max_tokens_across_dp = (int(sync[5].max()), int(sync[6].max()))
+
+    max_seqlen_q_across_dp: int | None = None
+    if dspark_on:
+        tbo_fields = 7 if tbo_on else 3
+        max_seqlen_q_across_dp = int(sync[tbo_fields].max())
+
+    pending.result = DPSyncResult(
+        num_tokens_across_dp=num_tokens_across_dp,
+        max_bs_across_dp=max_bs_across_dp,
+        any_rank_has_prefill=any_rank_has_prefill,
+        tbo_collective_active=tbo_collective_active,
+        ub_max_tokens_across_dp=ub_max_tokens_across_dp,
+        max_seqlen_q_across_dp=max_seqlen_q_across_dp,
+    )
+    return pending.result
+
+
 def sync_dp_metadata(
     *,
     dp_group,
@@ -302,100 +478,20 @@ def sync_dp_metadata(
     0 already carry them, and a step that reaches the reduction with every rank
     decoding has `scheduled_tokens` == its decode total on every rank.
     """
-    fields = [scheduled_tokens, scheduled_bs, 1 if is_prefill else 0]
-    if tbo_on:
-        fields.extend(
-            (
-                1 if local_meets_min_tokens else 0,
-                1 if local_can_split else 0,
-                local_ub_tokens[0],
-                local_ub_tokens[1],
-            )
+    return finish_sync_dp_metadata(
+        begin_sync_dp_metadata(
+            dp_group=dp_group,
+            dp_size=dp_size,
+            scheduled_tokens=scheduled_tokens,
+            scheduled_bs=scheduled_bs,
+            buffers=buffers,
+            is_prefill=is_prefill,
+            tbo_on=tbo_on,
+            local_meets_min_tokens=local_meets_min_tokens,
+            local_can_split=local_can_split,
+            local_ub_tokens=local_ub_tokens,
+            max_seqlen_q=max_seqlen_q,
         )
-    if max_seqlen_q is not None:
-        fields.append(max_seqlen_q)
-
-    tbo_fields = 7 if tbo_on else 3
-    dspark_on = max_seqlen_q is not None
-    n_fields = len(fields)
-    assert n_fields == tbo_fields + (1 if dspark_on else 0)
-
-    if buffers is None:
-        local = torch.tensor(fields, dtype=torch.int32, device="cpu")
-        gathered = [torch.empty_like(local) for _ in range(dp_size)]
-        torch.distributed.all_gather(gathered, local, group=dp_group)
-        sync = torch.stack(gathered, dim=1)  # [n_fields, dp_size]
-    else:
-        if buffers.dp_size != dp_size:
-            raise ValueError(
-                f"metadata buffers are for dp_size={buffers.dp_size}, got {dp_size}"
-            )
-
-        # Pack on the CPU as one vector.  Assigning these fields directly to a
-        # device tensor emits one synchronous hipMemcpyWithStream per scalar;
-        # the first then waits behind the previous model forward and destroys
-        # the overlap this path is intended to recover.
-        buffers.local_numpy[:n_fields] = fields
-        local_cpu = buffers.local_cpu[:n_fields]
-        local_device = buffers.local_device[:n_fields]
-        required_numel = dp_size * n_fields
-        gathered_device = buffers.gathered_device[:required_numel]
-        gathered_cpu = buffers.gathered_cpu[:required_numel]
-
-        # The metadata has no dependency on the preceding model kernels.  A
-        # dedicated stream lets its H2D and RCCL work overlap those kernels;
-        # ProcessGroupNCCL orders the gathered output back onto this stream
-        # before the D2H copy.  Synchronize once, at the point Python consumes
-        # the result.
-        with torch.cuda.stream(buffers.stream):
-            local_device.copy_(local_cpu, non_blocking=True)
-            torch.distributed.all_gather_into_tensor(
-                gathered_device, local_device, group=dp_group
-            )
-            gathered_cpu.copy_(gathered_device, non_blocking=True)
-        buffers.stream.synchronize()
-        sync = gathered_cpu.view(dp_size, n_fields).T
-
-    # Device sync reuses its host landing buffer next step.  Preserve the old
-    # result-ownership contract for callers that retain the ForwardMode.
-    num_tokens_across_dp = sync[0].clone() if buffers is not None else sync[0]
-    max_bs_across_dp = int(sync[1].max())
-    any_rank_has_prefill = bool(sync[2].any())
-    tbo_collective_active = False
-    ub_max_tokens_across_dp: tuple[int, int] | None = None
-    if tbo_on:
-        # OR(meets_min_tokens): one rank reaching the min-token bar turns TBO on
-        # for all. AND(can_split): but EVERY rank must be structurally splittable, else
-        # that rank would run 1 ubatch while peers run 2 → per-ubatch collective
-        # size mismatch → RCCL hang. Under-filled-but-splittable ranks are then
-        # force-split (see maybe_create_ubatch_slices force=True) to stay aligned.
-        tbo_collective_active = bool(sync[3].any()) and bool(sync[4].all())
-        # Mixed-mode guard: ALWAYS require a uniform batch mode (all prefill or
-        # all decode) across DP. A prefill rank running 2 ubatches alongside a
-        # decode rank running 2 ubatches still issues different collectives per
-        # ubatch → hang. (Previously gated behind require_uniform_mode; with the
-        # OR-reduce this must be unconditional.)
-        if tbo_collective_active:
-            prefill_rank_count = int(sync[2].sum())
-            uniform_mode = prefill_rank_count == 0 or prefill_rank_count == dp_size
-            tbo_collective_active = uniform_mode
-        if tbo_collective_active:
-            ub_max_tokens_across_dp = (
-                int(sync[5].max()),
-                int(sync[6].max()),
-            )
-
-    max_seqlen_q_across_dp: int | None = None
-    if dspark_on:
-        max_seqlen_q_across_dp = int(sync[tbo_fields + 0].max())
-
-    return DPSyncResult(
-        num_tokens_across_dp=num_tokens_across_dp,
-        max_bs_across_dp=max_bs_across_dp,
-        any_rank_has_prefill=any_rank_has_prefill,
-        tbo_collective_active=tbo_collective_active,
-        ub_max_tokens_across_dp=ub_max_tokens_across_dp,
-        max_seqlen_q_across_dp=max_seqlen_q_across_dp,
     )
 
 

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -12,8 +13,76 @@ from atom.utils.forward_context import ForwardMode
 from atom.utils.tbo.ubatching import (
     DP_METADATA_MAX_FIELDS,
     DPMetadataBuffers,
+    begin_sync_dp_metadata,
+    finish_sync_dp_metadata,
     sync_dp_metadata,
 )
+
+
+def test_device_sync_submission_defers_host_wait(monkeypatch):
+    """The device path must not synchronize until its result is consumed."""
+
+    class FakeStream:
+        def __init__(self):
+            self.synchronize_calls = 0
+
+        def synchronize(self):
+            self.synchronize_calls += 1
+
+    stream = FakeStream()
+    local_cpu = torch.empty(DP_METADATA_MAX_FIELDS, dtype=torch.int32)
+    gathered_cpu = torch.empty(2 * DP_METADATA_MAX_FIELDS, dtype=torch.int32)
+    buffers = SimpleNamespace(
+        dp_size=2,
+        local_cpu=local_cpu,
+        local_device=torch.empty_like(local_cpu),
+        gathered_device=torch.empty_like(gathered_cpu),
+        gathered_cpu=gathered_cpu,
+        local_numpy=local_cpu.numpy(),
+        stream=stream,
+    )
+
+    monkeypatch.setattr(torch.cuda, "stream", lambda unused: nullcontext())
+
+    def fake_all_gather_into_tensor(output, local, group=None):
+        del group
+        peer = local.clone()
+        peer[:] = torch.tensor([17, 3, 1, 1, 1, 8, 9, 5])
+        output.copy_(torch.cat((local, peer)))
+
+    monkeypatch.setattr(
+        torch.distributed, "all_gather_into_tensor", fake_all_gather_into_tensor
+    )
+
+    pending = begin_sync_dp_metadata(
+        dp_group=object(),
+        dp_size=2,
+        buffers=buffers,
+        scheduled_tokens=11,
+        scheduled_bs=2,
+        is_prefill=True,
+        tbo_on=True,
+        local_meets_min_tokens=False,
+        local_can_split=True,
+        local_ub_tokens=(5, 6),
+        max_seqlen_q=4,
+    )
+
+    assert stream.synchronize_calls == 0
+    assert buffers.local_device.tolist() == [11, 2, 1, 0, 1, 5, 6, 4]
+
+    result = finish_sync_dp_metadata(pending)
+    assert stream.synchronize_calls == 1
+    assert result.num_tokens_across_dp.tolist() == [11, 17]
+    assert result.max_bs_across_dp == 3
+    assert result.any_rank_has_prefill
+    assert result.tbo_collective_active
+    assert result.ub_max_tokens_across_dp == (8, 9)
+    assert result.max_seqlen_q_across_dp == 5
+
+    # Finishing twice is harmless and never adds a second host wait.
+    assert finish_sync_dp_metadata(pending) is result
+    assert stream.synchronize_calls == 1
 
 
 def _device_sync_worker(rank: int, world_size: int, init_file: str) -> None:
