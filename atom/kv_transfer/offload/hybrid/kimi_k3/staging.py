@@ -185,9 +185,17 @@ class StagedTransfer:
                     self._drain_device()
                     raise
                 return
-            device_buf = self.ensure_buffer(staging_buffer, nbytes)
             try:
                 with state.stream_ctx(state.pack_stream):
+                    # `ensure_buffer` may allocate device storage. Allocate it on
+                    # the first consumer stream (the gather below), not the
+                    # default stream, so a caching allocator cannot hand back
+                    # storage whose previous default-stream user is still running
+                    # and then let this side stream overwrite it early -- the CPU
+                    # tier would otherwise hold a mix of the image and unrelated
+                    # KV bytes under a valid prefix hash. Mirrors the hazard note
+                    # on `atom_lmcache_staging.py`'s `ensure_buffer` call.
+                    device_buf = self.ensure_buffer(staging_buffer, nbytes)
                     fused_pack_chunk_major(segments, seg_bytes, [1], [0], device_buf)
                 self._handoff(state, state.pack_stream, state.copy_stream)
                 with state.stream_ctx(state.copy_stream):
@@ -250,9 +258,11 @@ class StagedTransfer:
                     self._drain_device()
                     raise
                 return
-            device_buf = self.ensure_buffer(staging_buffer, nbytes)
             try:
                 with state.stream_ctx(state.copy_stream):
+                    # Allocate on the first consumer stream (the H2D copy below),
+                    # not the default stream -- see the matching note in `pack`.
+                    device_buf = self.ensure_buffer(staging_buffer, nbytes)
                     device_buf.copy_(
                         src_tensor,
                         non_blocking=src_tensor.device.type != "cpu",
