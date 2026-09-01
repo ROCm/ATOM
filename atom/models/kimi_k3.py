@@ -464,7 +464,7 @@ class KimiSparseMoeBlock(nn.Module):
             if envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0 and not tbo_active:
                 self._use_dual_stream = True
         if self._use_dual_stream:
-            # Register self so `maybe_dual_stream_forward2` can look this module up
+            # Register self so `maybe_dual_stream_split_forward` can look this module up
             # by prefix from static_forward_context (the op is Dynamo-opaque).
             cc = get_current_atom_config().compilation_config
             cc.static_forward_context[self.prefix] = self
@@ -500,12 +500,12 @@ class KimiSparseMoeBlock(nn.Module):
         """
         if self._use_dual_stream:
             if self._defer_shared_add:
-                # maybe_dual_stream_forward2 hands both branches back unsummed,
+                # maybe_dual_stream_split_forward hands both branches back unsummed,
                 # so the deferral survives the custom-op boundary and the next
                 # layer's attn_res absorbs the add. (The single-tensor op cannot:
                 # torch's schema inference has no representation for the
                 # optional second tensor, which is why this second op exists.)
-                return torch.ops.aiter.maybe_dual_stream_forward2(
+                return torch.ops.aiter.maybe_dual_stream_split_forward(
                     hidden_states, self.prefix
                 )
             # Nothing to defer -- either no shared branch, or the branches must
@@ -560,7 +560,7 @@ class KimiSparseMoeBlock(nn.Module):
     def single_stream_split_moe_forward(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Unsummed dispatch target for `maybe_dual_stream_forward2`.
+        """Unsummed dispatch target for `maybe_dual_stream_split_forward`.
 
         The split op reaches this whenever dual-stream is gated OFF for a given
         call (above the token threshold, under TBO, mid piecewise capture), so
@@ -579,7 +579,7 @@ class KimiSparseMoeBlock(nn.Module):
         that flag and `split_moe_forward` have drifted apart."""
         routed, shared = pair
         assert shared is not None, (
-            "maybe_dual_stream_forward2 requires an unsummed shared output, but "
+            "maybe_dual_stream_split_forward requires an unsummed shared output, but "
             "the MoE summed it; _defer_shared_add disagrees with split_moe_forward"
         )
         return routed, shared
@@ -626,7 +626,7 @@ class KimiSparseMoeBlock(nn.Module):
     def dual_stream_split_moe_forward(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Unsummed dual-stream dispatch target for `maybe_dual_stream_forward2`."""
+        """Unsummed dual-stream dispatch target for `maybe_dual_stream_split_forward`."""
         return self._assert_split(self._dual_stream_split(hidden_states))
 
     def _dual_stream_split(

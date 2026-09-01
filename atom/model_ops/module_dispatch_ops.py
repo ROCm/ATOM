@@ -20,7 +20,7 @@ the methods listed in each op's docstring.
 
 Currently registered:
   - torch.ops.aiter.maybe_dual_stream_forward  — V2/V3.2/V4 MoE (summed)
-  - torch.ops.aiter.maybe_dual_stream_forward2 — K3 MoE (routed/shared unsummed)
+  - torch.ops.aiter.maybe_dual_stream_split_forward — K3 MoE (routed/shared unsummed)
   - torch.ops.aiter.indexer_score_topk         — V4 sparse indexer
 """
 
@@ -126,7 +126,7 @@ direct_register_custom_op(
 # files.
 
 
-def maybe_dual_stream_forward2(
+def maybe_dual_stream_split_forward(
     hidden_states: torch.Tensor,
     layer_name: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -138,7 +138,7 @@ def maybe_dual_stream_forward2(
     return self.single_stream_split_moe_forward(hidden_states)
 
 
-def _maybe_dual_stream_forward2_fake(
+def _maybe_dual_stream_split_forward_fake(
     hidden_states: torch.Tensor,
     layer_name: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -146,10 +146,10 @@ def _maybe_dual_stream_forward2_fake(
 
 
 direct_register_custom_op(
-    op_name="maybe_dual_stream_forward2",
-    op_func=maybe_dual_stream_forward2,
+    op_name="maybe_dual_stream_split_forward",
+    op_func=maybe_dual_stream_split_forward,
     mutates_args=(),
-    fake_impl=_maybe_dual_stream_forward2_fake,
+    fake_impl=_maybe_dual_stream_split_forward_fake,
     tags=(torch.Tag.needs_fixed_stride_order,),
 )
 
