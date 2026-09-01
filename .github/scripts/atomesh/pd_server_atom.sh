@@ -242,11 +242,12 @@ dump_launch_info() {
 apply_prefixed_env() {
   local prefix="$1"
   local role_ip="$2"
+  local handshake_port="${3:-${HANDSHAKE_PORT}}"
   local name raw value
   while IFS='=' read -r name raw; do
     [[ "${name}" == "${prefix}"* ]] || continue
     value="${raw//\$\{ROLE_IP\}/${role_ip}}"
-    value="${value//\$\{HANDSHAKE_PORT\}/${HANDSHAKE_PORT}}"
+    value="${value//\$\{HANDSHAKE_PORT\}/${handshake_port}}"
     export "${name#${prefix}}=${value}"
   done < <(env)
 }
@@ -263,6 +264,7 @@ ROLE_ENV_NAMES=()
 apply_role_env() {
   local prefix="$1"
   local role_ip="$2"
+  local handshake_port="${3:-${HANDSHAKE_PORT}}"
   local name
   for name in ${ROLE_ENV_NAMES[@]+"${ROLE_ENV_NAMES[@]}"}; do
     unset "${name}"
@@ -274,8 +276,8 @@ apply_role_env() {
   done < <(env)
   # A name the common block also sets was just unset with the previous role's,
   # so put the common value back before the role overrides it.
-  apply_prefixed_env "ATOMESH_ENV_" "${role_ip}"
-  apply_prefixed_env "${prefix}" "${role_ip}"
+  apply_prefixed_env "ATOMESH_ENV_" "${role_ip}" "${handshake_port}"
+  apply_prefixed_env "${prefix}" "${role_ip}" "${handshake_port}"
 }
 
 host_ip="$(echo "${IPADDRS}" | tr ',' '\n' | sed -n "$((NODE_RANK + 1))p")"
@@ -571,7 +573,7 @@ start_prefill() {
   local handshake_port="${3:-${HANDSHAKE_PORT}}"
   local dp_master_port="${4:-${PREFILL_DP_MASTER_PORT}}"
   local dp_base_port="${5:-${PREFILL_DP_BASE_PORT}}"
-  apply_role_env "ATOMESH_PREFILL_ENV_" "${host_ip}"
+  apply_role_env "ATOMESH_PREFILL_ENV_" "${host_ip}" "${handshake_port}"
   local -a prefill_cache_env=()
   build_server_cache_env "prefill" "${server_port}" prefill_cache_env
   local -a prefill_dp_env=()
@@ -608,7 +610,7 @@ start_decode() {
   local handshake_port="${3:-${HANDSHAKE_PORT}}"
   local dp_master_port="${4:-${DECODE_DP_MASTER_PORT}}"
   local dp_base_port="${5:-${DECODE_DP_BASE_PORT}}"
-  apply_role_env "ATOMESH_DECODE_ENV_" "${host_ip}"
+  apply_role_env "ATOMESH_DECODE_ENV_" "${host_ip}" "${handshake_port}"
   local max_conc
   max_conc="$(echo "${BENCH_MAX_CONCURRENCY}" | tr 'x,' '\n' | sort -n | tail -1)"
   local decode_max_num_seqs="${MAX_NUM_SEQS}"

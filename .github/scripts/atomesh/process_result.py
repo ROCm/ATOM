@@ -28,7 +28,7 @@ RESULT_RE = re.compile(
 TOPOLOGY_RE = re.compile(r"(?P<p>\d+)p(?P<d>\d+)d", re.IGNORECASE)
 TP_RE = re.compile(r"tp(?P<tp>\d+)", re.IGNORECASE)
 DUAL_TP_RE = re.compile(r"tp(?P<prefill_tp>\d+)-tp(?P<decode_tp>\d+)", re.IGNORECASE)
-CPP_PP_RE = re.compile(r"(?:cpp|pp)(?P<pp>\d+)", re.IGNORECASE)
+CPP_PP_RE = re.compile(r"(?:^|[\s_-])(?:cpp|pp)(?P<pp>\d+)(?:$|[\s_-])", re.IGNORECASE)
 PP_ARG_RE = re.compile(r"--pipeline-parallel-size(?:=|\s+)(\d+)", re.IGNORECASE)
 EVAL_CONC_RE = re.compile(r"(?:^|[_-])c(?P<conc>\d+)(?:$|[_-])", re.IGNORECASE)
 EVAL_TOPOLOGY_RE = re.compile(
@@ -102,6 +102,12 @@ def string_value(*values: Any, default: str = "") -> str:
 def int_value(*values: Any) -> int | None:
     parsed = number(*values)
     return int(parsed) if parsed is not None else None
+
+
+def pp_from_server_args(payload: dict[str, Any], key: str) -> int | None:
+    """Pipeline-parallel size as the role's own launch flag set it."""
+    match = PP_ARG_RE.search(string_value(payload.get(key)))
+    return int(match.group(1)) if match else None
 
 
 def round_or_none(*values: Any, digits: int = 4) -> float | None:
@@ -232,27 +238,32 @@ def topology_resources(
             prefill_tp = prefill_tp or tp_size
             decode_tp = decode_tp or tp_size
 
+    # The launch flag outranks the topology label: it is what the server ran with.
     prefill_pp = int_value(
         payload.get("prefill_pp"), payload.get("prefill_pipeline_parallel_size")
     )
     if prefill_pp is None:
+        prefill_pp = pp_from_server_args(payload, "prefill_extra_server_args")
+    if prefill_pp is None:
         cpp_pp = CPP_PP_RE.search(text)
         if cpp_pp:
             prefill_pp = int(cpp_pp.group("pp"))
-    if prefill_pp is None:
-        for key in ("prefill_extra_server_args",):
-            pp_match = PP_ARG_RE.search(string_value(payload.get(key)))
-            if pp_match:
-                prefill_pp = int(pp_match.group(1))
-                break
     prefill_pp = prefill_pp or 1
+
+    # No topology label encodes a decode-side PP, so the flag is the only source.
+    decode_pp = int_value(
+        payload.get("decode_pp"), payload.get("decode_pipeline_parallel_size")
+    )
+    if decode_pp is None:
+        decode_pp = pp_from_server_args(payload, "decode_extra_server_args")
+    decode_pp = decode_pp or 1
 
     num_prefill_gpu = int_value(payload.get("num_prefill_gpu"))
     num_decode_gpu = int_value(payload.get("num_decode_gpu"))
     if num_prefill_gpu is None and prefill_workers and prefill_tp:
         num_prefill_gpu = prefill_workers * prefill_tp * prefill_pp
     if num_decode_gpu is None and decode_workers and decode_tp:
-        num_decode_gpu = decode_workers * decode_tp
+        num_decode_gpu = decode_workers * decode_tp * decode_pp
     total_gpu = int_value(payload.get("total_gpu"))
     if total_gpu is None and num_prefill_gpu is not None and num_decode_gpu is not None:
         total_gpu = num_prefill_gpu + num_decode_gpu
@@ -263,7 +274,6 @@ def topology_resources(
         "decode_workers": decode_workers,
         "prefill_tp": prefill_tp,
         "decode_tp": decode_tp,
-        "prefill_pp": prefill_pp,
         "num_prefill_gpu": num_prefill_gpu,
         "num_decode_gpu": num_decode_gpu,
         "total_gpu": total_gpu,
@@ -367,6 +377,7 @@ def enrich_payload(
     enriched.setdefault(
         "prefill_extra_server_args", env.get("PREFILL_EXTRA_SERVER_ARGS")
     )
+    enriched.setdefault("decode_extra_server_args", env.get("DECODE_EXTRA_SERVER_ARGS"))
     runner = env.get("SLURM_SUBMIT_RUNNER", "")
     if hardware:
         enriched["hardware"] = hardware
