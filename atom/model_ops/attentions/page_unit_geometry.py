@@ -122,9 +122,10 @@ class PageUnitGeometryMixin:
         drift. Range-checked against the logical count for the same reason.
 
         `_page_unit_regions` runs first for its side effect: the contiguity and
-        granularity checks live there.
+        granularity checks live there. Its return (base/stride addresses) is for
+        the Triton descriptor, not this view path -- called bare, not unpacked.
         """
-        _base, _stride = self._page_unit_regions()
+        self._page_unit_regions()
         cache = self.model_runner.kv_cache
         rows, entry = cache.shape[0], cache.shape[3]
         block = self.model_runner.block_size
