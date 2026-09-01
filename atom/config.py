@@ -734,19 +734,23 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
             )
             hf_config._multimodal_config = full_config
         except Exception:  # noqa: BLE001 - transformers raises anything here
-            # This image's transformers may have no class for the architecture
-            # (see _PLAIN_TEXT_CONFIG_MODEL_TYPES). Falling through to None would
-            # leave the model with no `vision_config` and no way to build its
-            # tower, so rebuild the multimodal config from the raw dict instead.
-            # Sub-configs are promoted to PretrainedConfig so consumers can use
-            # attribute access either way.
-            plain = PretrainedConfig.from_dict(
-                {k: v for k, v in config_dict.items() if not isinstance(v, dict)}
-            )
-            for field, value in config_dict.items():
-                if isinstance(value, dict):
-                    setattr(plain, field, PretrainedConfig.from_dict(value))
-            hf_config._multimodal_config = plain
+            if model_type == "glm5_next":
+                # This image's transformers has no Glm5Next config class. Its
+                # tower still needs the raw vision_config, so rebuild only this
+                # known schema instead of changing the failure sentinel for
+                # every existing multimodal model.
+                plain = PretrainedConfig.from_dict(
+                    {k: v for k, v in config_dict.items() if not isinstance(v, dict)}
+                )
+                for field, value in config_dict.items():
+                    if isinstance(value, dict):
+                        setattr(plain, field, PretrainedConfig.from_dict(value))
+                hf_config._multimodal_config = plain
+            else:
+                # Existing consumers use None to report that their full
+                # multimodal config could not be loaded. A partial generic
+                # object can bypass those checks and run with default token IDs.
+                hf_config._multimodal_config = None
         return hf_config
 
     if model_type in _PLAIN_CONFIG_MODEL_TYPES:

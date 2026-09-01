@@ -400,7 +400,10 @@ def _fwht_quant_kernel(
     x = tl.reshape(x, (BLOCK_R, HEAD_DIM))
 
     absmax = tl.maximum(tl.max(tl.abs(x), axis=1), 1e-4)
-    scale = tl.exp2(tl.ceil(tl.log2(absmax * (1.0 / 448.0))))
+    # Keep the division spelling used by the reference and aiter's key
+    # quantizer. Multiplying by a rounded reciprocal can cross the ceil(log2)
+    # step and choose a scale one binade away at boundary values.
+    scale = tl.exp2(tl.ceil(tl.log2(absmax / 448.0)))
     y = tl.minimum(tl.maximum(x / scale[:, None], -448.0), 448.0)
 
     tl.store(
@@ -614,7 +617,8 @@ def _kpool_seed_tail_kernel(
     gate_ptr,
     positions_ptr,
     cu_seqlens_q_ptr,
-    slot_idx_ptr,
+    slot_idx_in_ptr,
+    slot_idx_out_ptr,
     tail_ptr,
     HEAD_DIM: tl.constexpr,
     POOL: tl.constexpr,
@@ -638,17 +642,26 @@ def _kpool_seed_tail_kernel(
         return
     # Absolute position of tail token j, mapped back to its row in the batch.
     i = q_end - 1 - (tail_count - 1 - j)
-    if i < q_start:
-        return
-    slot = tl.load(slot_idx_ptr + r).to(tl.int64)
-    if slot < 0:
+    src_slot = tl.load(slot_idx_in_ptr + r).to(tl.int64)
+    dst_slot = tl.load(slot_idx_out_ptr + r).to(tl.int64)
+    if src_slot < 0 or dst_slot < 0:
         return
     offs = tl.arange(0, HEAD_DIM)
-    base = slot * (2 * POOL * HEAD_DIM) + j * HEAD_DIM
-    tl.store(tail_ptr + base + offs, tl.load(k_ptr + i * HEAD_DIM + offs))
+    src_base = src_slot * (2 * POOL * HEAD_DIM) + j * HEAD_DIM
+    dst_base = dst_slot * (2 * POOL * HEAD_DIM) + j * HEAD_DIM
+    from_chunk = i >= q_start
+    kval = tl.load(k_ptr + i * HEAD_DIM + offs, mask=from_chunk, other=0.0)
+    gval = tl.load(gate_ptr + i * HEAD_DIM + offs, mask=from_chunk, other=0.0)
+    kval = tl.where(from_chunk, kval, tl.load(tail_ptr + src_base + offs))
+    gval = tl.where(
+        from_chunk,
+        gval,
+        tl.load(tail_ptr + src_base + POOL * HEAD_DIM + offs),
+    )
+    tl.store(tail_ptr + dst_base + offs, kval)
     tl.store(
-        tail_ptr + base + POOL * HEAD_DIM + offs,
-        tl.load(gate_ptr + i * HEAD_DIM + offs),
+        tail_ptr + dst_base + POOL * HEAD_DIM + offs,
+        gval,
     )
 
 
@@ -660,6 +673,7 @@ def kpool_seed_tail(
     cu_seqlens_q: torch.Tensor,
     slot_idx: torch.Tensor,
     pool_size: int,
+    slot_idx_in: torch.Tensor | None = None,
 ) -> None:
     """Seed the per-request tail buffer at the end of prefill."""
     num_requests = cu_seqlens_q.shape[0] - 1
@@ -671,6 +685,7 @@ def kpool_seed_tail(
         gate.contiguous(),
         positions,
         cu_seqlens_q,
+        slot_idx if slot_idx_in is None else slot_idx_in,
         slot_idx,
         tail,
         HEAD_DIM=k.shape[-1],
@@ -683,7 +698,8 @@ def _kpool_decode_stash_and_pool_kernel(
     k_ptr,
     gate_ptr,
     positions_ptr,
-    slot_idx_ptr,
+    slot_idx_in_ptr,
+    slot_idx_out_ptr,
     tail_ptr,
     ape_ptr,
     out_ptr,
@@ -701,42 +717,49 @@ def _kpool_decode_stash_and_pool_kernel(
     model.
     """
     r = tl.program_id(0)
-    slot = tl.load(slot_idx_ptr + r).to(tl.int64)
-    if slot < 0:
+    src_slot = tl.load(slot_idx_in_ptr + r).to(tl.int64)
+    dst_slot = tl.load(slot_idx_out_ptr + r).to(tl.int64)
+    if src_slot < 0 or dst_slot < 0:
         return
     pos = tl.load(positions_ptr + r).to(tl.int32)
     phase = pos % POOL
     offs = tl.arange(0, HEAD_DIM)
-    base = slot * (2 * POOL * HEAD_DIM)
+    src_base = src_slot * (2 * POOL * HEAD_DIM)
+    dst_base = dst_slot * (2 * POOL * HEAD_DIM)
+    cur_k = tl.load(k_ptr + r * HEAD_DIM + offs)
+    cur_g = tl.load(gate_ptr + r * HEAD_DIM + offs)
 
-    # Stash this token at its pool phase.
-    tl.store(
-        tail_ptr + base + phase * HEAD_DIM + offs, tl.load(k_ptr + r * HEAD_DIM + offs)
-    )
-    tl.store(
-        tail_ptr + base + POOL * HEAD_DIM + phase * HEAD_DIM + offs,
-        tl.load(gate_ptr + r * HEAD_DIM + offs),
-    )
-
-    # Pool the whole tail. Slots past `phase` hold the previous pool's stale
-    # rows; they only matter when phase == POOL-1, where every slot is fresh.
+    # Read the partial pool from the input slot and materialize its updated
+    # form in the output slot. They differ when a prefix-cache checkpoint forks
+    # into a newly allocated slot.
     m = tl.full((HEAD_DIM,), float("-inf"), tl.float32)
     for s in tl.static_range(POOL):
-        g = tl.load(tail_ptr + base + POOL * HEAD_DIM + s * HEAD_DIM + offs).to(
-            tl.float32
+        g = tl.where(
+            s == phase,
+            cur_g,
+            tl.load(tail_ptr + src_base + POOL * HEAD_DIM + s * HEAD_DIM + offs),
         )
+        tl.store(tail_ptr + dst_base + POOL * HEAD_DIM + s * HEAD_DIM + offs, g)
+        g = g.to(tl.float32)
         a = tl.load(ape_ptr + s * HEAD_DIM + offs).to(tl.float32)
         m = tl.maximum(m, g + a)
     acc = tl.zeros((HEAD_DIM,), tl.float32)
     den = tl.zeros((HEAD_DIM,), tl.float32)
     for s in tl.static_range(POOL):
-        g = tl.load(tail_ptr + base + POOL * HEAD_DIM + s * HEAD_DIM + offs).to(
-            tl.float32
+        g = tl.where(
+            s == phase,
+            cur_g,
+            tl.load(tail_ptr + src_base + POOL * HEAD_DIM + s * HEAD_DIM + offs),
+        ).to(tl.float32)
+        kv = tl.where(
+            s == phase,
+            cur_k,
+            tl.load(tail_ptr + src_base + s * HEAD_DIM + offs),
         )
+        tl.store(tail_ptr + dst_base + s * HEAD_DIM + offs, kv)
         a = tl.load(ape_ptr + s * HEAD_DIM + offs).to(tl.float32)
         w = tl.exp(g + a - m)
-        kv = tl.load(tail_ptr + base + s * HEAD_DIM + offs).to(tl.float32)
-        acc += w * kv
+        acc += w * kv.to(tl.float32)
         den += w
     pooled = (acc / den).to(tl.bfloat16).to(tl.float32)
 
@@ -754,6 +777,7 @@ def kpool_decode_stash_and_pool(
     ape: torch.Tensor,
     pool_size: int,
     out: torch.Tensor | None = None,
+    slot_idx_in: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Stash the decode step's token and return each request's pooled vector.
 
@@ -764,7 +788,7 @@ def kpool_decode_stash_and_pool(
     num_requests = k.shape[0]
     head_dim = k.shape[-1]
     if out is None:
-        out = torch.empty(
+        out = torch.zeros(
             (num_requests, head_dim), dtype=torch.bfloat16, device=k.device
         )
     if num_requests == 0:
@@ -773,6 +797,7 @@ def kpool_decode_stash_and_pool(
         k.contiguous(),
         gate.contiguous(),
         positions,
+        slot_idx if slot_idx_in is None else slot_idx_in,
         slot_idx,
         tail,
         ape.contiguous().to(torch.float32),

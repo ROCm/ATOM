@@ -598,6 +598,12 @@ class Glm5NextIndexer(Indexer):
         self.kpool_always_select_tail = bool(
             getattr(config, "index_kpool_always_select_tail", True)
         )
+        if self.index_kpool > 1 and not self.kpool_always_select_tail:
+            raise NotImplementedError(
+                "GLM-5.3 kpool currently always appends the uncompressed tail; "
+                "index_kpool_always_select_tail=false would require scoring it "
+                "instead and cannot be silently ignored."
+            )
         if self.index_kpool > 1:
             # Pool-compression parameters. Held so the checkpoint loads
             # completely and so the pooled path can be switched on without a
@@ -762,6 +768,9 @@ class Glm5NextIndexer(Indexer):
                 )
             gdn = getattr(attn_metadata, "gdn_metadata", None)
             state_slot_idx = None if gdn is None else gdn.non_spec_state_indices_tensor
+            state_slot_idx_in = (
+                None if gdn is None else gdn.non_spec_state_indices_in_tensor
+            )
             if state_slot_idx is None:
                 # The profile/warmup forward carries no block tables, so the
                 # builder leaves gdn_metadata unset. That forward is a dummy
@@ -775,6 +784,8 @@ class Glm5NextIndexer(Indexer):
                     dtype=torch.int32,
                     device=hidden_states.device,
                 )
+            if state_slot_idx_in is None:
+                state_slot_idx_in = state_slot_idx
             out = torch.ops.aiter.sparse_attn_indexer_kpool(
                 hidden_states,
                 self.k_cache.kv_cache[0],
@@ -788,6 +799,7 @@ class Glm5NextIndexer(Indexer):
                 weights,
                 self.index_kpool_compress_ape,
                 tail_cache,
+                state_slot_idx_in,
                 state_slot_idx,
                 positions,
                 self.sparse_kv_indices_buffer,
@@ -1544,6 +1556,7 @@ def _kpool_write_completed_pools(
     pool_rows: int,
     chunk_start: torch.Tensor | None = None,
     tail_cache: torch.Tensor | None = None,
+    state_slot_idx_in: torch.Tensor | None = None,
     state_slot_idx: torch.Tensor | None = None,
 ) -> None:
     """Compress and cache every pool that closes inside this batch.
@@ -1558,12 +1571,14 @@ def _kpool_write_completed_pools(
     """
     kpool = index_kpool
     n = k.shape[0]
-    if n < kpool:
+    if n == 0:
         return
     row = torch.arange(n, device=k.device)
     offs = torch.arange(kpool, device=k.device)
     # Token i closes the pool spanning tokens i-(kpool-1) .. i.
-    idx = (row - (kpool - 1)).clamp_min(0)[:, None] + offs[None, :]
+    idx = (
+        (row - (kpool - 1)).clamp_min(0)[:, None] + offs[None, :]
+    ).clamp_max(n - 1)
     pool_k, pool_gate = k[idx], gate_score[idx]
     if chunk_start is not None:
         # Chunked prefill can split a request mid-pool. That pool's earlier
@@ -1577,12 +1592,18 @@ def _kpool_write_completed_pools(
         # `abs % kpool == s` and the tail row index is just the slot index.
         abs_slot = positions.to(torch.int64)[:, None] - (kpool - 1) + offs[None, :]
         from_tail = abs_slot < chunk_start[req_idx][:, None]
-        stash = tail_cache[state_slot_idx[req_idx]]  # [n, 2, kpool, head_dim]
+        read_slots = (
+            state_slot_idx if state_slot_idx_in is None else state_slot_idx_in
+        )
+        safe_slots = read_slots[req_idx].clamp_min(0)
+        stash = tail_cache[safe_slots]  # [n, 2, kpool, head_dim]
         pool_k = torch.where(from_tail[..., None], stash[:, 0], pool_k)
         pool_gate = torch.where(from_tail[..., None], stash[:, 1], pool_gate)
     pooled = kpool_ops.pool_and_rotate(pool_k, pool_gate, compress_ape)
     abs_pos = positions.to(torch.int64)
-    closes = (abs_pos % kpool == kpool - 1) & (row >= kpool - 1)
+    closes = abs_pos % kpool == kpool - 1
+    if state_slot_idx is not None:
+        closes &= state_slot_idx[req_idx] >= 0
     slots = kpool_ops.pool_slot_mapping(
         pool_bt,
         torch.where(closes, abs_pos // kpool, torch.full_like(abs_pos, -1)),
@@ -1678,6 +1699,7 @@ def _sparse_attn_indexer_kpool(
     weights: torch.Tensor,
     compress_ape: torch.Tensor,
     tail_cache: torch.Tensor,
+    state_slot_idx_in: torch.Tensor,
     state_slot_idx: torch.Tensor,
     positions: torch.Tensor,
     sparse_kv_indices_buffer: torch.Tensor,
@@ -1702,8 +1724,9 @@ def _sparse_attn_indexer_kpool(
     forward_context = get_forward_context()
     attn_metadata = forward_context.attn_metadata
     context = forward_context.context
+    result = weights.float().clone()
     if context.is_dummy_run:
-        return torch.zeros_like(weights, dtype=torch.float32)
+        return result
 
     # Axes this landing does not cover. Each one would mis-index rather than
     # fail, so refuse explicitly instead of returning a quietly wrong selection.
@@ -1767,12 +1790,20 @@ def _sparse_attn_indexer_kpool(
             pool_rows,
             chunk_start=chunk_start,
             tail_cache=tail_cache,
+            state_slot_idx_in=state_slot_idx_in,
             state_slot_idx=state_slot_idx,
         )
         # The trailing incomplete pool has to outlive this forward; decode
         # finishes it one token at a time.
         kpool_ops.kpool_seed_tail(
-            tail_cache, k, gate_score, positions, cu_q, state_slot_idx, index_kpool
+            tail_cache,
+            k,
+            gate_score,
+            positions,
+            cu_q,
+            state_slot_idx,
+            index_kpool,
+            slot_idx_in=state_slot_idx_in,
         )
         _kpool_verify_cache(
             kv_cache,
@@ -1788,7 +1819,7 @@ def _sparse_attn_indexer_kpool(
         if attn_metadata.max_seqlen_k <= topk_tokens:
             # Every pool would be selected; the caller runs dense, exactly as
             # the token-granular path does below its own threshold.
-            return weights
+            return result
 
         bs = cu_q.shape[0] - 1
         if attn_metadata.has_cached:
@@ -1813,7 +1844,7 @@ def _sparse_attn_indexer_kpool(
         # in practice -- and much cheaper than being wrong.
         max_pools = int(pool_cu[bs].item())
         if max_pools <= 0:
-            return weights
+            return result
         k_fp8 = torch.empty([max_pools, head_dim], device=device, dtype=dtypes.fp8)
         k_scale = torch.empty([max_pools, 1], device=device, dtype=torch.float32)
         cp_gather_indexer_k_quant_cache(
@@ -1897,7 +1928,7 @@ def _sparse_attn_indexer_kpool(
             BLOCK_N=128,
             out=sparse_kv_indices_buffer,
         )
-        return weights
+        return result
 
     # ---- decode ----------------------------------------------------------
     bs = context.scheduled_bs
@@ -1910,10 +1941,13 @@ def _sparse_attn_indexer_kpool(
         state_slot_idx,
         compress_ape,
         index_kpool,
+        slot_idx_in=state_slot_idx_in,
     )
     # Only a pool that closed on this token gets written; the rest carry a -1
     # slot, which the cache write skips.
-    closes = (pos % index_kpool) == (index_kpool - 1)
+    closes = ((pos % index_kpool) == (index_kpool - 1)) & (
+        state_slot_idx[:bs] >= 0
+    )
     pool_ids = torch.where(closes, pos // index_kpool, torch.full_like(pos, -1))
     slots = kpool_ops.pool_slot_mapping(
         pool_bt,
@@ -1967,7 +2001,7 @@ def _sparse_attn_indexer_kpool(
         NUM_TOPK_TOKENS=topk_out_width,
         out=sparse_kv_indices_buffer,
     )
-    return weights
+    return result
 
 
 def _sparse_attn_indexer_kpool_fake(
@@ -1979,6 +2013,7 @@ def _sparse_attn_indexer_kpool_fake(
     weights: torch.Tensor,
     compress_ape: torch.Tensor,
     tail_cache: torch.Tensor,
+    state_slot_idx_in: torch.Tensor,
     state_slot_idx: torch.Tensor,
     positions: torch.Tensor,
     sparse_kv_indices_buffer: torch.Tensor,

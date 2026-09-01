@@ -1187,7 +1187,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # offset must count the KV rows that actually exist -- the MLA
             # layers for a hybrid, every layer otherwise.
             num_global_mla_layers = (
-                len(hybrid_mla_layers) if hybrid_mla_layers else num_hidden_layers
+                len(hybrid_mla_layers)
+                if hybrid_mla_layers is not None
+                else num_hidden_layers
             )
             num_global_kv_layers = num_global_mla_layers + num_global_draft_layers
             # Unlike index_cache_layer_map (PP-local allocated rows), this map
@@ -1207,7 +1209,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             start_layer, end_layer = get_pp_indices(
                 num_hidden_layers, pp_group.rank_in_group, pp_group.world_size
             )
-            if hybrid_mla_layers:
+            if hybrid_mla_layers is not None:
                 local_target_layer_ids = tuple(
                     layer_id
                     for layer_id in hybrid_mla_layers

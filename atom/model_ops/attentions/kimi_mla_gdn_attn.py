@@ -118,12 +118,25 @@ class _KimiMLAGDNCommon(GDNStateMixin):
         # otherwise-identical builds disagree on the image's size; `carry`
         # is the narrowing rule, and dropping the conv tail later would be a
         # `v2` rather than a silent reinterpretation of a v1 image.
+        tail_shape_fn = getattr(self, "_kpool_tail_plane_shape", None)
+        tail_shape = None if tail_shape_fn is None else tail_shape_fn()
+        version = "v2" if tail_shape is not None else "v1"
+        order = "conv-all-layers,ssm-all-layers"
+        tail_layout = ""
+        if tail_shape is not None:
+            tail_bytes, tail_layers = tail_shape
+            order += ",kpool-tail-all-layers"
+            tail_layout = (
+                f":kpool-tail=layers:{tail_layers},bytes-per-layer:{tail_bytes},"
+                f"dtype:{torch.bfloat16}"
+            )
         layout_id = (
-            "kda-paged-state-v1"
+            f"kda-paged-state-{version}"
             f":layers={self.model_runner.num_gdn_attn_state}"
             f":conv={tuple(shape_k)},{dt_k}"
             f":ssm={tuple(shape_v)},{dt_v}"
-            ":order=conv-all-layers,ssm-all-layers"
+            f":order={order}"
+            f"{tail_layout}"
             f":tp={get_tp_group().world_size}"
             f":spec={self.num_spec}"
             ":carry=all"
@@ -211,12 +224,39 @@ class _KimiMLAGDNCommon(GDNStateMixin):
     def _kpool_tail_bytes(self) -> int:
         """Per-request tail bytes across every indexer-owning layer."""
         kpool = self._kpool_size()
-        if kpool <= 1 or not self.model_runner.is_deepseek_v32:
+        if kpool <= 1 or not getattr(self.model_runner, "is_deepseek_v32", False):
             return 0
         hf = self.model_runner.config.hf_config
         index_cache_layer_ids, _ = self._index_cache_layout()
         per_layer = 2 * kpool * hf.index_head_dim * torch.bfloat16.itemsize
         return len(index_cache_layer_ids) * per_layer
+
+    def _kpool_tail_plane_shape(self) -> tuple[int, int] | None:
+        """``(bytes per indexer layer, layer count)`` for checkpoint geometry."""
+        total = self._kpool_tail_bytes()
+        if not total:
+            return None
+        index_cache_layer_ids, _ = self._index_cache_layout()
+        layers = len(index_cache_layer_ids)
+        if layers <= 0 or total % layers:
+            raise RuntimeError(
+                "kpool tail bytes do not form an equal per-layer checkpoint plane"
+            )
+        return total // layers, layers
+
+    def _checkpoint_plane_shapes(self) -> list[tuple[int, int]]:
+        """KDA planes plus the partial kpool keys needed to resume exactly."""
+        shapes = super()._checkpoint_plane_shapes()
+        tail_shape = self._kpool_tail_plane_shape()
+        if tail_shape is not None:
+            shapes.append(tail_shape)
+        return shapes
+
+    def _checkpoint_plane_tensors(self) -> list[torch.Tensor]:
+        planes = super()._checkpoint_plane_tensors()
+        if self._kpool_tail_plane_shape() is not None:
+            planes.append(self.model_runner.kpool_tail_cache)
+        return planes
 
     def state_spec(self) -> SubPoolSpec:
         """KDA recurrent state, plus GLM-5.3's kpool tail in the same entry.
@@ -266,12 +306,10 @@ class _KimiMLAGDNCommon(GDNStateMixin):
         tail = getattr(self.model_runner, "kpool_tail_cache", None)
         if tail is None or not pairs:
             return
-        span = 1 + self.num_spec
         dsts, srcs = [], []
-        for src_group, dst_group in pairs:
-            src, dst = src_group * span, dst_group * span
-            dsts.append(tail[:, dst : dst + span])
-            srcs.append(tail[:, src : src + span])
+        for src, dst in pairs:
+            dsts.append(tail[:, dst])
+            srcs.append(tail[:, src])
         torch._foreach_copy_(dsts, srcs)
 
     def allocate_kv_cache_tensors(
