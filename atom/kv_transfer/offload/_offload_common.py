@@ -263,6 +263,34 @@ class OffloadWorkerMixin:
         return []
 
 
+class StateOffloadFace(ABC):
+    """The KDA state-tier surface, implemented only by the layout that hosts it.
+
+    `MultiConnector` and the delegating shell must tell a tier-hosting impl
+    (kimi_k3) from one with no state tier (dense / dsv4-page) so they route
+    state stores and loads to the right sub. They used to probe by method
+    *presence* -- but the shell defines the whole face unconditionally,
+    forwarding through `getattr` to `_impl`, so presence could not distinguish
+    them and every state call fell through to a dense impl's no-tier defaults
+    (stores recorded failed, loads dropped, reports empty). Make the face an
+    explicit type: only `KimiK3OffloadScheduler` inherits it, so
+    `isinstance(impl, StateOffloadFace)` is the honest predicate.
+
+    Narrow on purpose -- only the four tier methods. `chunk_size` is an instance
+    attribute set in `__init__`, not a class method, so it cannot be abstract
+    here without breaking construction; it stays a plain shell forward.
+    """
+
+    @abstractmethod
+    def enqueue_state_loads(self, loads) -> bool: ...
+    @abstractmethod
+    def enqueue_state_stores(self, stores) -> bool: ...
+    @abstractmethod
+    def take_state_reports(self) -> tuple[set[int], set[int]]: ...
+    @abstractmethod
+    def take_state_source_releases(self) -> set: ...
+
+
 class OffloadSchedulerMixin(ABC):
     """Layout-independent scheduler policy shared by dense and DSV4 offload.
 

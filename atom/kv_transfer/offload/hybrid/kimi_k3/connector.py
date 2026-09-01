@@ -20,6 +20,7 @@ from atom.kv_transfer.disaggregation.types import (
 )
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload._offload_common import (
+    StateOffloadFace,
     max_pending_saves,
     pp_aware_rank_and_world,
 )
@@ -414,9 +415,14 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
         return passthrough_done | ready, passthrough_failed | ready_failed
 
 
-class KimiK3OffloadScheduler(DenseOffloadScheduler):
+class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
     """Scheduler side: dense KV, plus the state tier's load queue and the
-    save-stall guard that keeps a stopped backend from stopping the engine."""
+    save-stall guard that keeps a stopped backend from stopping the engine.
+
+    Inherits `StateOffloadFace` -- the only offload scheduler that hosts the KDA
+    state tier -- so routing can select it with `isinstance` rather than probing
+    for a method the delegating shell defines on every layout (see
+    `StateOffloadFace` and the shell's `has_state_tier`)."""
 
     def __init__(self, config) -> None:
         super().__init__(config)

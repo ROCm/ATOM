@@ -5424,6 +5424,57 @@ def test_offload_mixin_lifecycle_is_enforced_at_construction():
     AllPresent()  # the full contract constructs cleanly
 
 
+def test_only_kimi_k3_wears_the_state_offload_face():
+    """`has_state_tier` routes state stores and loads, so it must key on a
+    property only the tier-hosting layout has. The shell defines every state
+    forward, so forward presence cannot be that key -- the face type can. Only
+    kimi_k3 hosts the state tier; dense and dsv4-page do not."""
+    from atom.kv_transfer.offload._offload_common import StateOffloadFace
+    from atom.kv_transfer.offload.hybrid.dsv4.connector import DSV4OffloadScheduler
+
+    assert issubclass(KimiK3OffloadScheduler, StateOffloadFace)
+    assert not issubclass(DenseOffloadScheduler, StateOffloadFace)
+    assert not issubclass(DSV4OffloadScheduler, StateOffloadFace)
+
+
+def test_state_offload_face_is_enforced_at_construction():
+    """Like the lifecycle contract: an impl that claims the face but leaves a
+    tier method unimplemented is a construction-time TypeError, not a shell
+    forward that silently returns the no-tier default."""
+    from atom.kv_transfer.offload._offload_common import StateOffloadFace
+
+    class MissingReports(StateOffloadFace):
+        def enqueue_state_loads(self, loads):
+            return True
+
+        def enqueue_state_stores(self, stores):
+            return True
+
+        def take_state_source_releases(self):
+            return set()
+
+        # take_state_reports deliberately left unimplemented.
+
+    with pytest.raises(TypeError, match="take_state_reports"):
+        MissingReports()
+
+
+def test_shell_has_state_tier_tracks_the_face_not_forward_presence():
+    """The regression `StateOffloadFace` closes: an `_impl` that merely *exposes*
+    `enqueue_state_stores` (as any shell forward would) but is not a real state
+    host must NOT read as tier-hosting. The old presence check said True here and
+    routed state calls to a no-tier impl; the isinstance check says False."""
+    from types import SimpleNamespace
+
+    from atom.kv_transfer.offload.connector import (
+        LMCacheOffloadConnectorScheduler as Shell,
+    )
+
+    shell = object.__new__(Shell)
+    shell._impl = SimpleNamespace(enqueue_state_stores=lambda stores: False)
+    assert shell.has_state_tier is False
+
+
 # ── kimi_k3: the two joint legs report different identities ───────────────
 
 

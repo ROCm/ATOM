@@ -22,6 +22,7 @@ from atom.kv_transfer.disaggregation.base import (
     KVConnectorBase,
     KVConnectorSchedulerBase,
 )
+from atom.kv_transfer.offload._offload_common import StateOffloadFace
 from atom.kv_transfer.offload.config import select_offload_layout
 
 logger = logging.getLogger("atom")
@@ -146,11 +147,11 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         tell a tier-hosting `kimi_k3` impl from a `dense`/`hybrid` impl that has
         none -- which is exactly how `MultiConnector._first_with`, selecting by
         attribute presence, routed every state call to a dense offload shell
-        whose `_impl` silently returns the no-tier defaults. Probe the impl for
-        the store entry point instead: the real state face lives there (only
-        `KimiK3OffloadScheduler` defines `enqueue_state_stores`).
+        whose `_impl` silently returns the no-tier defaults. Ask the impl's
+        *type* instead: only `KimiK3OffloadScheduler` inherits `StateOffloadFace`
+        (see there), so the check cannot be fooled by the shell's own forwards.
         """
-        return getattr(self._impl, "enqueue_state_stores", None) is not None
+        return isinstance(self._impl, StateOffloadFace)
 
     @property
     def chunk_size(self) -> int | None:
