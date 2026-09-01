@@ -1292,7 +1292,24 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             for layer_id in range(runner.index_cache.shape[0]):
                 t = runner.index_cache[layer_id]
                 bpb = t.stride(0) * t.element_size() * self.block_ratio
-                tokens_per_page = bpb // runner.aligned_index_dim
+                # One token occupies aligned_index_dim elements of an index row.
+                index_row_bytes = runner.aligned_index_dim * t.element_size()
+                if index_row_bytes <= 0 or bpb % index_row_bytes:
+                    raise RuntimeError(
+                        f"MLA index page of {bpb} bytes is not a whole number of "
+                        f"{index_row_bytes}-byte token rows "
+                        f"(aligned_index_dim={runner.aligned_index_dim}). The plane "
+                        "sizes below would not match the real layout, and the "
+                        "Mooncake relayout addresses the page through them."
+                    )
+                tokens_per_page = bpb // index_row_bytes
+                if tokens_per_page * (index_head_dim + 4) > bpb:
+                    raise RuntimeError(
+                        f"An index page holds {tokens_per_page} tokens of "
+                        f"{index_head_dim} key bytes plus a 4-byte scale, which "
+                        f"does not fit in {bpb} bytes; the key and scale planes "
+                        "would overlap."
+                    )
                 block_regions.append(
                     KVTransferRegion(
                         base_addr=t.data_ptr(),
