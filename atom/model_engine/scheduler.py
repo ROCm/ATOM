@@ -2139,12 +2139,28 @@ class Scheduler:
         two legs from pinning different amounts of the same pool, and honours a
         per-connector `"max_pending_saves"` override the env reader never sees.
         Falls back to the env reader for a connector (or test double) that never
-        computed one, and through the delegating shell's `_impl`.
+        computed one, and reaches the value through the delegating shell's
+        `_impl` and, under `kv_connector: multi`, through the state-tier sub --
+        `MultiConnectorScheduler` exposes neither `_max_pending_saves` nor
+        `_impl`, so without the sub probe the composite silently caps the state
+        leg at the env default of 2 while the KV leg keeps the sub's real bound.
         """
+
+        def _cap_of(obj):
+            cap = getattr(obj, "_max_pending_saves", None)
+            if cap is None:
+                cap = getattr(getattr(obj, "_impl", None), "_max_pending_saves", None)
+            return cap
+
         conn = self.kv_connector
-        cap = getattr(conn, "_max_pending_saves", None)
+        cap = _cap_of(conn)
         if cap is None:
-            cap = getattr(getattr(conn, "_impl", None), "_max_pending_saves", None)
+            # Under `multi` the bound lives on the state-tier sub (itself a
+            # delegating shell), reached the same way the state face is routed.
+            sub = getattr(conn, "_state_tier_sub", None)
+            tier = sub() if callable(sub) else None
+            if tier is not None:
+                cap = _cap_of(tier)
         if isinstance(cap, int) and not isinstance(cap, bool) and cap > 0:
             return cap
         return _offload_max_pending_saves()
