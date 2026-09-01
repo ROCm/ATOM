@@ -14,13 +14,18 @@ from atom.model_ops.layernorm import fused_dual_rmsnorm_cat
 
 
 @pytest.mark.parametrize("rows", [1, 2, 8])
-def test_fused_mtp_prologue_matches_unfused_fp8_path(rows: int):
+@pytest.mark.parametrize("token_dtype", [torch.int32, torch.int64])
+def test_fused_mtp_prologue_matches_unfused_fp8_path(
+    rows: int, token_dtype: torch.dtype
+):
     torch.manual_seed(1234 + rows)
     hidden_size = 6144
     vocab_size = 32
-    input_ids = torch.arange(rows, device="cuda", dtype=torch.long) % vocab_size
+    input_ids = torch.arange(rows, device="cuda", dtype=token_dtype) % vocab_size
     if rows > 1:
-        input_ids[-1] = vocab_size  # masked embedding row
+        input_ids[-1] = -1  # optimistic async-scheduling placeholder
+    if rows > 2:
+        input_ids[-2] = vocab_size  # positive out-of-range id
 
     embedding_weight = torch.randn(
         vocab_size, hidden_size, device="cuda", dtype=torch.bfloat16

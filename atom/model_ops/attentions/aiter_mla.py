@@ -66,6 +66,22 @@ def _mla_seg_meta_kwargs() -> dict:
     return {}
 
 
+def _pad_prefill_mla_draft_tail(
+    kv_indptr: torch.Tensor,
+    kv_last_page_lens: np.ndarray,
+    block_tables: np.ndarray,
+    scheduled_bs: int,
+    running_bs: int,
+) -> None:
+    """Give widened Eagle rows an empty, fully initialized MLA KV range."""
+    assert 0 < scheduled_bs <= running_bs
+    if scheduled_bs == running_bs:
+        return
+    kv_indptr[scheduled_bs + 1 : running_bs + 1] = kv_indptr[scheduled_bs]
+    kv_last_page_lens[scheduled_bs:running_bs] = 0
+    block_tables[scheduled_bs:running_bs] = 0
+
+
 def _global_index_cache_layer_ids(
     indexer_types,
     num_hidden_layers: int,
@@ -1356,22 +1372,30 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 )
             else:
                 var["kv_last_page_lens"].np[:bs] = 1
-            var["kv_last_page_lens"].copy_to_gpu()
 
             attn_metadata.kv_indices = var["kv_indices"].gpu
-            attn_metadata.kv_indptr = var["kv_indptr"].gpu[: bs + 1]
+            kv_indptr = var["kv_indptr"].gpu[: running_bs + 1]
+            attn_metadata.kv_indptr = kv_indptr[: bs + 1]
             attn_metadata.kv_indptr[0] = 0
             # `context_lens` is padded past the requests this indptr counts.
             attn_metadata.kv_indptr[1 : bs + 1] = torch.cumsum(
                 attn_metadata.context_lens[:bs], 0
             )
-            attn_metadata.kv_last_page_lens = var["kv_last_page_lens"].gpu[:bs]
 
             # kv_indices_generate_triton expects logical block_tables (one entry
             # per block_ratio tokens). Re-copy from var to get a fresh logical
             # snapshot independent of attn_metadata.block_tables sharing.
             self.prepare_block_tables(batch)
-            block_tables_for_kv = var["block_tables"].copy_to_gpu(bs)
+            _pad_prefill_mla_draft_tail(
+                kv_indptr,
+                var["kv_last_page_lens"].np,
+                var["block_tables"].np,
+                bs,
+                running_bs,
+            )
+            var["kv_last_page_lens"].copy_to_gpu(running_bs)
+            attn_metadata.kv_last_page_lens = var["kv_last_page_lens"].gpu[:bs]
+            block_tables_for_kv = var["block_tables"].copy_to_gpu(running_bs)[:bs]
             kv_indices_generate_triton(
                 block_tables_for_kv,
                 attn_metadata.kv_indices,

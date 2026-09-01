@@ -116,9 +116,11 @@ class EagleProposer(Drafter):
                 dtype=self.dtype,
             ),
         }
-        self._reuse_step_buffers = bool(
-            getattr(self.model, "supports_draft_buffer_reuse", False)
-        )
+        # Keep this capability at the non-compiled call site. DeepSeekMTPModel
+        # has the two-dimensional hidden-state and shared-head contracts needed
+        # to feed its fixed graph inputs directly; other draft architectures
+        # remain on the owned-output path.
+        self._reuse_step_buffers = draft_hf.architectures[0] == "DeepSeekMTPModel"
         self.step = DraftGraph(
             forward=self._step_forward,
             epilogue=self._step_head,

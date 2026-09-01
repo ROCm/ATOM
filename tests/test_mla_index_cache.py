@@ -4,7 +4,9 @@
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
+import torch
 
 from atom.models.utils import get_pp_indices
 
@@ -12,7 +14,10 @@ try:
     import aiter  # noqa: F401
 
     from atom.model_ops.attentions import aiter_mla
-    from atom.model_ops.attentions.aiter_mla import AiterMLAMetadataBuilder
+    from atom.model_ops.attentions.aiter_mla import (
+        AiterMLAMetadataBuilder,
+        _pad_prefill_mla_draft_tail,
+    )
 except (ImportError, RuntimeError) as exc:
     pytest.skip(f"aiter MLA backend unavailable: {exc}", allow_module_level=True)
 
@@ -25,6 +30,25 @@ def test_global_index_cache_layout_excludes_shared_and_keeps_mtp():
 
 def test_global_index_cache_layout_without_schedule_is_unchanged():
     assert aiter_mla._global_index_cache_layer_ids(None, 4, 1) == (0, 1, 2, 3, 4)
+
+
+def test_padded_prefill_mla_rows_have_empty_initialized_kv_ranges():
+    kv_indptr = torch.tensor([0, 3, 7, 101, 202], dtype=torch.int32)
+    kv_last_page_lens = np.array([3, 4, 9, 9], dtype=np.int32)
+    block_tables = np.full((4, 3), 17, dtype=np.int32)
+
+    _pad_prefill_mla_draft_tail(
+        kv_indptr,
+        kv_last_page_lens,
+        block_tables,
+        scheduled_bs=2,
+        running_bs=4,
+    )
+
+    assert kv_indptr.tolist() == [0, 3, 7, 7, 7]
+    assert kv_last_page_lens.tolist() == [3, 4, 0, 0]
+    assert block_tables[:2].tolist() == [[17, 17, 17], [17, 17, 17]]
+    assert not block_tables[2:].any()
 
 
 def test_global_index_cache_layout_includes_real_stack_draft_layers():

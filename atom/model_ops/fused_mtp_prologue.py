@@ -1,10 +1,9 @@
 """GLM/DeepSeek MTP embedding + dual RMSNorm + FP8 quant fusion."""
 
+import aiter
 import torch
 import triton
 import triton.language as tl
-
-import aiter
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
 _FP8_DTYPE = aiter.dtypes.fp8
@@ -30,24 +29,30 @@ def _fused_mtp_embedding_dual_rmsnorm_fp8_quant_kernel(
     FP8_INV: tl.constexpr,
     BLOCK_H: tl.constexpr,
 ):
-    row = tl.program_id(0)
+    row = tl.program_id(0).to(tl.int64)
     cols = tl.arange(0, BLOCK_H)
+    col_offsets = cols.to(tl.int64)
     mask = cols < hidden_size
 
-    token_id = tl.load(input_ids_ptr + row)
+    token_id = tl.load(input_ids_ptr + row).to(tl.int64)
     token_valid = (token_id >= 0) & (token_id < vocab_size)
+    safe_token_id = tl.where(token_valid, token_id, 0)
     embed = tl.load(
-        embedding_weight_ptr + token_id * embedding_stride_row + cols,
+        embedding_weight_ptr + safe_token_id * embedding_stride_row + col_offsets,
         mask=token_valid & mask,
         other=0.0,
     ).to(tl.float32)
     hidden = tl.load(
-        hidden_ptr + row * hidden_stride_row + cols,
+        hidden_ptr + row * hidden_stride_row + col_offsets,
         mask=mask,
         other=0.0,
     ).to(tl.float32)
-    enorm_weight = tl.load(enorm_weight_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-    hnorm_weight = tl.load(hnorm_weight_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    enorm_weight = tl.load(enorm_weight_ptr + col_offsets, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    hnorm_weight = tl.load(hnorm_weight_ptr + col_offsets, mask=mask, other=0.0).to(
+        tl.float32
+    )
 
     embed_rstd = tl.rsqrt(tl.sum(embed * embed, axis=0) / hidden_size + eps)
     hidden_rstd = tl.rsqrt(tl.sum(hidden * hidden, axis=0) / hidden_size + eps)
@@ -70,12 +75,12 @@ def _fused_mtp_embedding_dual_rmsnorm_fp8_quant_kernel(
     quant_embed = tl.clamp(norm_embed_f32 * inv_scale, -FP8_MAX, FP8_MAX)
     quant_hidden = tl.clamp(norm_hidden_f32 * inv_scale, -FP8_MAX, FP8_MAX)
     tl.store(
-        out_ptr + row * out_stride_row + cols,
+        out_ptr + row * out_stride_row + col_offsets,
         quant_embed.to(out_ptr.dtype.element_ty),
         mask=mask,
     )
     tl.store(
-        out_ptr + row * out_stride_row + hidden_size + cols,
+        out_ptr + row * out_stride_row + hidden_size + col_offsets,
         quant_hidden.to(out_ptr.dtype.element_ty),
         mask=mask,
     )

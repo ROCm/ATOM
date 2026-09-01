@@ -319,11 +319,6 @@ class DeepSeekMultiTokenPredictor(nn.Module):
 
 @support_torch_compile
 class DeepSeekMTP(nn.Module):
-    # EagleProposer may write the next-step ids/hidden directly into its fixed
-    # DraftGraph inputs. Keep this opt-in: other draft architectures can carry
-    # different hidden-state aliasing contracts.
-    supports_draft_buffer_reuse = True
-
     def __init__(self, atom_config: Config, prefix: str = ""):
         super().__init__()
         self.config = atom_config.hf_config
