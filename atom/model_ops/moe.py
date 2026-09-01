@@ -89,7 +89,6 @@ from atom.utils.forward_context import get_forward_context
 logger = logging.getLogger("atom")
 
 
-
 def _all_ranks_decode() -> bool:
     """True only when EVERY rank is decoding this step.
 
@@ -1272,6 +1271,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         is_silu = (
             getattr(layer, "activation", ActivationType.Silu) == ActivationType.Silu
         )
+
+        layer.use_fused_silu_gugu = self.is_gfx1250 and is_silu
+
         use_triton_gfx1250_silu = self.use_triton and self.is_gfx1250 and is_silu
 
         # Decode-only Triton leaves the layout to the FlyDSL prep (branch C) and
@@ -1595,9 +1597,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 triton_kernel_moe_forward,
             )
 
-            use_triton_gfx1250_silu = self.is_gfx1250 and (
-                activation == ActivationType.Silu
-            )
+            # Decided at weight prep, not re-derived here: see
+            # _process_weight_layout_after_loading.
+            use_triton_gfx1250_silu = layer.use_fused_silu_gugu
             if self.use_triton_decode:
                 (
                     w13_weight,
@@ -1648,7 +1650,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 n_expts_act = routing_data.n_expts_act
 
                 # Convert to triton routing data structures
-                num_tokens, n_expts_tot = router_logits.shape
+                _, n_expts_tot = router_logits.shape
 
                 if global_num_experts > 0:
                     n_expts_tot = global_num_experts
