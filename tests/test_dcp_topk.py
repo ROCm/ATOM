@@ -507,8 +507,7 @@ def test_prefill_filter_is_layout_independent(
 class _FakeMeta:
     def __init__(self, ctx, published=None):
         self.context_lens = ctx
-        if published is not None:
-            self.dcp_local_context_lens = published
+        self.dcp_local_context_lens = published
 
 
 @pytest.mark.parametrize("world", [2, 4, 8])
@@ -517,7 +516,7 @@ def test_local_context_lens_prefers_published_buffer(world, interleave):
     """The published host buffer must be returned as-is, not recomputed.
 
     Identity, not equality: returning an equal-but-recomputed tensor is exactly
-    the regression this guards (8 elementwise kernels per full-index layer).
+    the regression this guards (7 elementwise kernels per full-index layer).
     """
     rows = 37
     ctx = torch.randint(1, 100000, (rows,), dtype=torch.int32, device=DEV)
@@ -543,9 +542,8 @@ def test_local_context_lens_fallback_matches_reference(world, interleave):
         ]
     )
     for meta in (
-        _FakeMeta(ctx),  # attribute absent
-        _FakeMeta(ctx, None),  # published but None (non-DCP metadata builder)
-        _FakeMeta(ctx, torch.zeros(rows + 1, dtype=torch.int32, device=DEV)),  # stale
+        _FakeMeta(ctx),  # non-DCP or non-sparse metadata builder
+        _FakeMeta(ctx, torch.zeros(rows - 1, dtype=torch.int32, device=DEV)),  # stale
     ):
         got = dcp_local_context_lens(meta, 0, world, interleave, rows)
         assert got.dtype == torch.int32

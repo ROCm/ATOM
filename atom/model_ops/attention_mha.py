@@ -819,16 +819,24 @@ class PagedAttentionImpl(nn.Module):
             # Raw K/V is fed as a block_size=1 flash-layout cache, never shuffled.
             shuffled_kv_cache = False
 
-        n_block_rows = attn_metadata.block_tables.shape[0]
+        # Requests this step scheduled: the width prepare_prefill fills in
+        # cu_seqlens_q and context_lens before padding the tail to running_bs.
+        #
+        # context.scheduled_bs is batch.total_seqs_num, while the builder sized
+        # these arrays by total_seqs_num_prefill. The two differ only on a batch
+        # carrying decode rows, and such a batch leaves total_tokens_num_prefill
+        # at 0 -- hence is_prefill False, which is the branch this method is
+        # reached from. Every is_prefill batch sets the two counts equal.
+        n_seqs = fwd_ctx.context.scheduled_bs
         unified_attention(
             q,
             k_for_attn,
             v_for_attn,
             o,
-            # Cut to the rows of the block table this indexes with them: the
-            # prefill builder pads both past the requests it scheduled.
-            cu_seqlens_q=attn_metadata.cu_seqlens_q[: n_block_rows + 1],
-            seqused_k=attn_metadata.context_lens[:n_block_rows],
+            # Cut to the requests actually scheduled: the prefill builder pads
+            # both of these past them.
+            cu_seqlens_q=attn_metadata.cu_seqlens_q[: n_seqs + 1],
+            seqused_k=attn_metadata.context_lens[:n_seqs],
             max_seqlen_q=attn_metadata.max_seqlen_q,
             max_seqlen_k=attn_metadata.max_seqlen_k,
             softmax_scale=self.scale,

@@ -27,7 +27,7 @@ from atom.config import Config, QuantizationConfig, get_current_atom_config
 # Dynamo-opaque custom op that dispatches the MoE between single- and dual-stream
 # forwards (shared with deepseek_v2/v4). Imported for the registration only.
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
-from atom.model_ops.attention_mla import MLAModules
+from atom.model_ops.attention_mla import MLAModules, qrep_tp_override
 from atom.model_ops.attention_residual import AttnRes
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
@@ -622,12 +622,14 @@ class KimiFullAttention(nn.Module):
         self.q_a_layernorm = RMSNorm(
             self.q_lora_rank, eps=1e-6, prefix=f"{prefix}.q_a_layernorm"
         )
+        # DCP Query Replication: {} unless QREP is on -- see qrep_tp_override.
         self.q_b_proj = ColumnParallelLinear(
             self.q_lora_rank,
             self.num_heads * self.q_head_dim,
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.q_b_proj",
+            **qrep_tp_override(self.tp_size),
         )
         self.kv_a_layernorm = RMSNorm(
             self.kv_lora_rank, eps=1e-6, prefix=f"{prefix}.kv_a_layernorm"
