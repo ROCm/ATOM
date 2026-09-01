@@ -20,7 +20,7 @@ from aiter import (
     get_mla_metadata_v1,
     indexer_k_quant_and_cache,
     indexer_qk_rope_quant_and_cache,
-    top_k_per_row_decode,
+    flydsl_top_k_per_row_decode,
     top_k_per_row_prefill,
 )
 from aiter.mla import mla_decode_fwd
@@ -1389,7 +1389,7 @@ def sparse_attn_indexer_sglang_plugin_mode(
             KVBlockSize=page_size,
             WavePerEU=2,
         )
-        top_k_per_row_decode(
+        flydsl_top_k_per_row_decode(
             logits,
             1,
             seq_lens_i32,

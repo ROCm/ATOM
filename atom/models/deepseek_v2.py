@@ -35,7 +35,7 @@ from aiter import (
     gemm_a8w8_blockscale_bpreshuffle,
     get_hip_quant,
     indexer_k_quant_and_cache,
-    top_k_per_row_decode,
+    flydsl_top_k_per_row_decode,
     top_k_per_row_prefill,
 )
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
@@ -1699,7 +1699,7 @@ def sparse_attn_indexer(
             # Non-DCP: one rank holds the whole plane, so top-k is already
             # global. The DCP branch produced topk_indices_decode itself.
             topk_indices_decode = topk_indices[:num_decode_tokens, :topk_tokens]
-            top_k_per_row_decode(
+            flydsl_top_k_per_row_decode(
                 logits,
                 next_n,
                 decode_metadata.context_lens,
