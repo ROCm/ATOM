@@ -176,6 +176,15 @@ class KVTransferTensors:
     scatter_slot: Callable[[int, int], None] | None = None
     # Appended for positional compatibility with existing generic descriptors.
     expected_full_slot_region_count: int | None = None
+    # The attention metadata builder, published by `ModelRunner` after the tier
+    # is built inside `register_kv_caches` -- the one place builder and connector
+    # are both in scope. The kimi_k3 state tier reads its `state_runtime.
+    # checkpoint_spec.layout_id` to fold the state geometry into every key. Typed
+    # `object` because `types` must not import the model engine; None on every
+    # layout that has no state tier to name. Declared here rather than set as a
+    # loose runtime attribute so the field the connector reads is part of the
+    # contract, not an undocumented assignment two layers away.
+    state_backend: object | None = None
 
 
 @dataclass
