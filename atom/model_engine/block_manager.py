@@ -848,11 +848,6 @@ class BlockManager:
         # `_gated_hit` settles the two gates jointly; neither can be applied to
         # the other's answer.
         num_cached_blocks = self._gated_hit(seq, compressed_hit, block_hashes)
-        # A boundary LMCache and the tier can jointly reach, above this hit.
-        # Recorded on the seq rather than returned: what `allocate` claims from
-        # HBM is still `num_cached_blocks`, and the joint boundary only decides
-        # where the two loads are aimed.
-        self._joint_kv_boundary(seq, num_cached_blocks, block_hashes, record=record)
         # Instrumentation: the pre-gate hit, so EngineStats can separate reuse
         # the gates declined (compressed_hit - num_cached_blocks) from reuse
         # lost to compressed eviction (everything above compressed_hit).
@@ -880,6 +875,16 @@ class BlockManager:
         self._record_checkpoint_end(seq)
         if not self._has_page_units(num_new_blocks, protected_hash):
             return -1
+        # A boundary LMCache and the tier can jointly reach, above this hit.
+        # Recorded on the seq rather than returned: what `allocate` claims from
+        # HBM is still `num_cached_blocks`, and the joint boundary only decides
+        # where the two loads are aimed. Below the refusal, not above it, for the
+        # same reason _extend_hash_chain is: _joint_kv_boundary walks a chained
+        # xxhash up to the LMCache-only cap (_chain_to) plus a _gated_hit rescan,
+        # and a refused admission would discard all of it. Nothing between here
+        # and the refusal reads the seq's joint fields, and the author already
+        # moved _extend_hash_chain down for this exact cost -- this is its twin.
+        self._joint_kv_boundary(seq, num_cached_blocks, block_hashes, record=record)
         # After the refusal, not before it. The chain is O(prompt) xxhash plus
         # two temporaries per block, and a refused admission discards it — a
         # 128k prompt queued behind a full pool paid ~2000 rounds per waiting
