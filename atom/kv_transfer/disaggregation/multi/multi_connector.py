@@ -394,6 +394,21 @@ class MultiConnector(KVConnectorBase):
             blocks.extend(c.get_finished_recv_blocks())
         return blocks
 
+    def close(self) -> None:
+        """Tear down every sub-connector at worker teardown.
+
+        `ModelRunner.exit()` resolves `getattr(connector, "close", None)` on the
+        composite under `multi`; without this forwarder it returns None and no
+        sub is joined -- the offload sub's non-daemon `lmc-state-store` /
+        `lmc-state-load` / `offload-save` threads keep copying out of the KV pool
+        that `destroy_dist_env()` is about to release. Guard per sub (`getattr`):
+        a producer sub such as moriio need not implement `close`.
+        """
+        for c in self._connectors:
+            fn = getattr(c, "close", None)
+            if callable(fn):
+                fn()
+
 
 # ---------------------------------------------------------------------------
 # Scheduler side
@@ -695,3 +710,58 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         for c in self._connectors:
             if hasattr(c, "load_failed"):
                 c.load_failed(req_id)
+
+    def save_abandon_timeout_s(self) -> float:
+        """The reclaim window for the offload leg, else 0.0 (disabled).
+
+        `Scheduler._save_abandon_timeout_s` reads this off `self.kv_connector`
+        -- the composite under `multi` -- and `getattr`-defaults to 0.0 when it
+        is absent. 0.0 silently switches off all three leak reclaimers
+        (`_reconcile_stalled_deferred_saves`, `reclaim_stale_state_store_pins`,
+        `reconcile_orphan_load_slots`), so a missing forwarder here is not a
+        no-op: one lost save report then keeps `has_pending_kv_work()` True
+        forever, one dropped store completion pins a checkpoint image out of the
+        pool, one orphaned load slot wedges `can_allocate`'s state gate -- with
+        no fault to point at. The window is a global LMCache property
+        (`LMCACHE_EC_PIN_TIMEOUT_SEC + 30`), identical across offload subs;
+        prefer the tier sub, then any offload sub. Select by capability, never
+        method presence -- see `_state_tier_sub`.
+        """
+        c = self._state_tier_sub() or _first_with(
+            self._connectors, "save_abandon_timeout_s"
+        )
+        return c.save_abandon_timeout_s() if c is not None else 0.0
+
+    def release_stalled_save(self, seq: Any) -> None:
+        """Forward a stalled-save release to every sub that tracks saves.
+
+        `Scheduler._connector_release_stalled_save` calls this on
+        `self.kv_connector` when `_reconcile_stalled_deferred_saves` reclaims a
+        save the connector never reported done. Only the offload sub tracks
+        `_save_inflight`; fan to whichever subs implement it (idempotent
+        pop-with-default, like `abandon_save`), so a producer sub without saves
+        is a no-op. Absent here, the connector's stall clock never advances and
+        the offload save loop wedges permanently.
+        """
+        for c in self._connectors:
+            fn = getattr(c, "release_stalled_save", None)
+            if callable(fn):
+                fn(seq)
+
+    def get_statistics(self) -> dict[str, int]:
+        """Merge offload metrics across subs, summing shared counters.
+
+        `engine_utility` reads this off `self.kv_connector` under an `hasattr`
+        guard and renders `{}` when it is absent -- so under `multi` the whole
+        offload metrics block silently reads empty. Sum overlapping int keys
+        across every sub that reports (only offload subs do), rather than
+        first-hit, so a `[dense, kimi_k3]` composite reports both legs' totals.
+        """
+        merged: dict[str, int] = {}
+        for c in self._connectors:
+            fn = getattr(c, "get_statistics", None)
+            if not callable(fn):
+                continue
+            for k, v in fn().items():
+                merged[k] = merged.get(k, 0) + v
+        return merged

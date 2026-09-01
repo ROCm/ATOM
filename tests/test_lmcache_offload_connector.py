@@ -5195,7 +5195,41 @@ def test_a_step_whose_only_work_is_a_state_store_reaches_the_worker():
     assert connector_metadata_has_work(meta)
 
 
-# ── the delegating shell must expose everything the scheduler reads ────────
+# ── the delegating shells must expose everything their driver reads ────────
+#
+# There are two forwarding axes, not one, and every round of review has found
+# the same defect on whichever axis the last patch did not cover: the scheduler
+# reads members off `self.kv_connector` (the scheduler-side shell), the worker
+# reads members off `connector` (the worker-side shell), and BOTH axes have a
+# plain `LMCacheOffloadConnector*` shell AND a `Multi*` composite. A member
+# added to an `_impl` but not hand-forwarded on one of these four classes is a
+# silent fallthrough -- `close` (worker shells), `save_abandon_timeout_s` /
+# `release_stalled_save` / `get_statistics` (the multi scheduler composite) are
+# the most recent instances. The two sweeps below iterate both shells on each
+# axis so a fifth instance fails a test instead of shipping.
+
+
+def _shell_exposes(cls, name: str) -> bool:
+    """Whether `name` resolves on `cls`, counting attributes the constructor
+    sets on the instance (`self.<name> = ...`).
+
+    `hasattr(cls, name)` alone is not enough: `is_offload` / `is_producer` are
+    class attributes on the `LMCacheOffload*` shells but instance attributes on
+    the `Multi*` composites (assigned in `__init__` from the sub-connectors), so
+    a class-level `hasattr` would false-flag them as missing on the composite.
+    Parse the class source for `self.<name> =` to cover that case without
+    constructing the class (which needs a live config and a worker build).
+    """
+    import inspect
+    import re
+
+    if hasattr(cls, name):
+        return True
+    try:
+        src = inspect.getsource(cls)
+    except (OSError, TypeError):
+        return False
+    return bool(re.search(r"\bself\.%s\s*=" % re.escape(name), src))
 
 
 def test_every_member_the_scheduler_reads_is_reachable_through_the_shell():
@@ -5217,6 +5251,9 @@ def test_every_member_the_scheduler_reads_is_reachable_through_the_shell():
     import re
 
     import atom.model_engine.scheduler as sched_mod
+    from atom.kv_transfer.disaggregation.multi.multi_connector import (
+        MultiConnectorScheduler,
+    )
     from atom.kv_transfer.offload.connector import LMCacheOffloadConnectorScheduler
 
     src = inspect.getsource(sched_mod)
@@ -5241,6 +5278,7 @@ def test_every_member_the_scheduler_reads_is_reachable_through_the_shell():
         "should_defer_free",
         "abandon_save",
         "save_abandon_timeout_s",
+        "release_stalled_save",
         "request_finished",
         "build_connector_meta",
         "process_completions",
@@ -5256,12 +5294,76 @@ def test_every_member_the_scheduler_reads_is_reachable_through_the_shell():
         f"{lost}. Update the patterns (or this anchor set) intentionally."
     )
 
-    shell = LMCacheOffloadConnectorScheduler
-    missing = sorted(n for n in probed if not hasattr(shell, n))
-    assert not missing, (
-        "Scheduler reads these off `kv_connector`, but the delegating shell "
-        f"does not expose them, so each silently takes its default: {missing}"
+    # Both scheduler-side shells must expose every probed member: the plain
+    # `LMCacheOffloadConnectorScheduler` AND the `MultiConnectorScheduler`
+    # composite the engine holds under `kv_transfer_config: multi`. The
+    # composite's misses are the same silent default -- `Scheduler` reads it off
+    # `self.kv_connector`, which under `multi` IS the composite. The allow-list
+    # below is deliberately empty: a probed member the composite legitimately
+    # routes through `_state_tier_sub` instead of exposing (as `max_pending_saves`
+    # is, via an aliased `getattr` the regex does not match, so it never enters
+    # `probed`) would land here and SHOULD force a deliberate decision, not a
+    # default. If one ever does, add it here with the routing that covers it.
+    multi_routes_via_sub: set[str] = set()
+    for shell in (LMCacheOffloadConnectorScheduler, MultiConnectorScheduler):
+        allow = multi_routes_via_sub if shell is MultiConnectorScheduler else set()
+        missing = sorted(
+            n for n in probed if n not in allow and not _shell_exposes(shell, n)
+        )
+        assert not missing, (
+            f"Scheduler reads these off `kv_connector`, but {shell.__name__} does "
+            f"not expose them, so each silently takes its default: {missing}"
+        )
+
+
+def test_every_member_the_worker_reads_is_reachable_through_the_shell():
+    """The worker forwarding axis, swept the same way as the scheduler axis.
+
+    `ModelRunner` / `forward_context` hold the WORKER shell in `connector`, and
+    read members off it by hand exactly as the scheduler does off
+    `self.kv_connector`. This axis has its own two shells --
+    `LMCacheOffloadConnector` and the `MultiConnector` composite -- and the same
+    silent-fallthrough failure: `close` was added to every `_impl` and to the
+    scheduler shell but not to either worker shell, so `getattr(connector,
+    "close", None)` resolved to None and worker teardown never ran (use-after-
+    free on the KV pool at `destroy_dist_env`, or the interpreter-shutdown hang
+    `close` exists to prevent). Read the driver's source, not a hand-kept list,
+    for the same reason the scheduler sweep does.
+    """
+    import inspect
+    import re
+
+    import atom.model_engine.model_runner as mr_mod
+    import atom.utils.forward_context as fc_mod
+    from atom.kv_transfer.disaggregation.multi.multi_connector import MultiConnector
+    from atom.kv_transfer.offload.connector import LMCacheOffloadConnector
+
+    probed: set[str] = set()
+    for mod in (mr_mod, fc_mod):
+        src = inspect.getsource(mod)
+        probed |= set(re.findall(r'getattr\(\s*connector,\s*"([a-z_]+)"', src))
+        probed |= set(re.findall(r"\bconnector\.([a-z_]+)\(", src))
+        probed |= set(re.findall(r"\bconnector\.([a-z_]+)\b", src))
+    probed.discard("_impl")
+    assert probed, "the scan found nothing -- it has stopped matching the source"
+
+    # Same regex-rot guard as the scheduler sweep: anchor on reads we know the
+    # worker driver makes today, so a pattern that stops matching fails loudly
+    # here rather than shrinking `probed` in silence. `close` is the whole point
+    # of this sweep -- the member whose absence this test was written to catch.
+    must_be_seen = {"close", "register_kv_caches", "start_load_kv", "get_finished"}
+    lost = sorted(must_be_seen - probed)
+    assert not lost, (
+        "the scan no longer sees these known worker reads -- coverage silently "
+        f"dropped: {lost}. Update the patterns (or this anchor set) intentionally."
     )
+
+    for shell in (LMCacheOffloadConnector, MultiConnector):
+        missing = sorted(n for n in probed if not _shell_exposes(shell, n))
+        assert not missing, (
+            f"The worker reads these off `connector`, but {shell.__name__} does "
+            f"not expose them, so each silently takes its default: {missing}"
+        )
 
 
 def test_the_shells_no_impl_fallbacks_match_what_the_caller_unpacks():

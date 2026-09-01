@@ -115,6 +115,22 @@ class LMCacheOffloadConnector(KVConnectorBase):
     def get_finished_recv_blocks(self):
         return self._impl.get_finished_recv_blocks()
 
+    def close(self) -> None:
+        """Join the impl's save/load executors at worker teardown.
+
+        `ModelRunner.exit()` resolves this through
+        `getattr(connector, "close", None)` on `self.kv_connector` -- which is
+        this shell. Without the forwarder that getattr returns None, so
+        `OffloadWorkerMixin.close()` / `KimiK3OffloadConnector.close()` never
+        run: `destroy_dist_env()` then releases the KV pool while non-daemon
+        `lmc-state-store` / `lmc-state-load` / `offload-save` threads are still
+        copying out of it -- use-after-free on the KV tensors, or the
+        interpreter-shutdown hang `close()` exists to prevent. Every `_impl`
+        defines `close` (`OffloadWorkerMixin`), so this is a plain forward, the
+        same "every probed member appears on the shell" contract as `_state_tier`.
+        """
+        self._impl.close()
+
 
 class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
     """Scheduler-side shell delegating to the selected implementation.
