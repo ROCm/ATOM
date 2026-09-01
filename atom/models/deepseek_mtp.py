@@ -217,6 +217,13 @@ class DeepSeekMultiTokenPredictor(nn.Module):
             and isinstance(self.embed_tokens, ReplicatedEmbedding)
             and input_ids.ndim == 1
             and previous_hidden_states.ndim == 2
+            and input_ids.shape[0] == previous_hidden_states.shape[0]
+            and previous_hidden_states.is_contiguous()
+            and self.embed_tokens.weight.ndim == 2
+            and self.embed_tokens.weight.shape[1] == previous_hidden_states.shape[1]
+            and self.embed_tokens.weight.dtype == previous_hidden_states.dtype
+            and layer.enorm.weight.shape == (previous_hidden_states.shape[1],)
+            and layer.hnorm.weight.shape == (previous_hidden_states.shape[1],)
             and layer.eh_proj.quant_type.value == QuantType.per_Token.value
             and layer.eh_proj.params_dtype == dtypes.fp8
             and getattr(layer.eh_proj, "input_scale", None) is None
@@ -417,9 +424,7 @@ class DeepSeekMTP(nn.Module):
         per-rank reductions. Token-identical either way. See
         DeepSeekMultiTokenPredictor.compute_draft_ids.
         """
-        return self.model.compute_draft_ids(
-            hidden_states, spec_step_idx, out=out
-        )
+        return self.model.compute_draft_ids(hidden_states, spec_step_idx, out=out)
 
     def set_skip_topk(self, skip: bool) -> None:
         self.model.set_skip_topk(skip)

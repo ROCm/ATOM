@@ -143,9 +143,7 @@ class EagleProposer(Drafter):
             input_ids=input_ids, positions=positions, hidden_states=hidden_states
         )
 
-    def _step_head(
-        self, out, running_bs, *, input_ids, hidden_states, **_
-    ):
+    def _step_head(self, out, running_bs, *, input_ids, hidden_states, **_):
         """The mid-step's draft ids, recorded with the backbone that made them.
 
         Both come back because the next mid-step reads the hidden states and
@@ -650,11 +648,11 @@ class EagleProposer(Drafter):
                 new_draft_ids = (
                     graphed_ids[:scheduled_bs]
                     if graphed_ids is not None
-                    else self.model.compute_draft_ids(
-                        sample_hidden_states, out=ids_out
+                    else (
+                        self.model.compute_draft_ids(sample_hidden_states, out=ids_out)
+                        if ids_out is not None
+                        else self.model.compute_draft_ids(sample_hidden_states)
                     )
-                    if ids_out is not None
-                    else self.model.compute_draft_ids(sample_hidden_states)
                 )
                 draft_token_ids[:, i] = new_draft_ids
 

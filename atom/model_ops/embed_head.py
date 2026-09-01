@@ -283,9 +283,9 @@ class ParallelLMHead(VocabParallelEmbedding):
                 f"argmax out has shape {tuple(out.shape)}, expected "
                 f"{tuple(x.shape[:-1])}"
             )
-            assert out.dtype == torch.long and out.device == x.device, (
-                "argmax out must be an int64 tensor on the input device"
-            )
+            assert (
+                out.dtype == torch.long and out.device == x.device
+            ), "argmax out must be an int64 tensor on the input device"
         logits = tgemm.mm(x, self.weight, self.bias)  # [N, vocab/tp]
         if self.tp_size <= 1:
             token = logits.argmax(dim=-1)

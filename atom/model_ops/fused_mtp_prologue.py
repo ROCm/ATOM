@@ -7,7 +7,6 @@ import triton.language as tl
 import aiter
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
-
 _FP8_DTYPE = aiter.dtypes.fp8
 _FP8_MAX = float(torch.finfo(_FP8_DTYPE).max)
 
@@ -47,12 +46,8 @@ def _fused_mtp_embedding_dual_rmsnorm_fp8_quant_kernel(
         mask=mask,
         other=0.0,
     ).to(tl.float32)
-    enorm_weight = tl.load(enorm_weight_ptr + cols, mask=mask, other=0.0).to(
-        tl.float32
-    )
-    hnorm_weight = tl.load(hnorm_weight_ptr + cols, mask=mask, other=0.0).to(
-        tl.float32
-    )
+    enorm_weight = tl.load(enorm_weight_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    hnorm_weight = tl.load(hnorm_weight_ptr + cols, mask=mask, other=0.0).to(tl.float32)
 
     embed_rstd = tl.rsqrt(tl.sum(embed * embed, axis=0) / hidden_size + eps)
     hidden_rstd = tl.rsqrt(tl.sum(hidden * hidden, axis=0) / hidden_size + eps)
@@ -61,9 +56,7 @@ def _fused_mtp_embedding_dual_rmsnorm_fp8_quant_kernel(
     norm_embed = (embed * embed_rstd * enorm_weight).to(
         embedding_weight_ptr.dtype.element_ty
     )
-    norm_hidden = (hidden * hidden_rstd * hnorm_weight).to(
-        hidden_ptr.dtype.element_ty
-    )
+    norm_hidden = (hidden * hidden_rstd * hnorm_weight).to(hidden_ptr.dtype.element_ty)
     norm_embed_f32 = norm_embed.to(tl.float32)
     norm_hidden_f32 = norm_hidden.to(tl.float32)
 
