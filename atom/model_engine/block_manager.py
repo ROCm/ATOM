@@ -839,11 +839,19 @@ class BlockManager:
     def can_allocate(self, seq: Sequence, record: bool = True) -> int:
         """Return number of cache-hit blocks (>=0) if seq fits, else -1.
 
-        `record=False` marks a pure fit probe -- a caller asking only whether
-        the seq *could* be admitted, not admitting it. The answer is identical;
-        it just does not commit the joint boundary (neither the seq's joint
-        fields nor the funnel counters), so a probe that never admits anything
-        cannot inflate operator metrics (see `_joint_kv_boundary` /
+        `record=False` marks a fit probe -- a caller asking only whether the seq
+        *could* be admitted, not admitting it. The fit answer is identical. It is
+        not side-effect-free, though: the instrumentation write
+        (`num_compressed_hit_blocks`, line ~901) and the checkpoint-demand/-end
+        records (`_record_checkpoint_demand` / `_record_checkpoint_end`, which set
+        `num_wanted_hit_blocks` / `checkpoint_demand_pos` / `checkpoint_end_pos`)
+        run unconditionally, *before* the `record` gate. That is safe because the
+        sole probe caller -- `Scheduler`'s pre-admission fit test -- reads only
+        the `>= 0` return and never those fields, and the next real
+        `can_allocate` overwrites them before any other reader sees them. What
+        `record` actually gates is narrower: only the joint-boundary commit (the
+        seq's joint fields and the funnel counters), so a probe that never admits
+        cannot inflate the operator-visible funnel (see `_joint_kv_boundary` /
         `_commit_joint_boundary`).
 
         The hit count is the contiguous run of cache hits starting at the
