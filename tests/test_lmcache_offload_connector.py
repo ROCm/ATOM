@@ -5244,7 +5244,6 @@ def test_every_member_the_scheduler_reads_is_reachable_through_the_shell():
         "request_finished",
         "build_connector_meta",
         "process_completions",
-        "chunk_size",
         "enqueue_state_stores",
         "take_state_reports",
         "take_state_source_releases",
@@ -5296,8 +5295,6 @@ def test_the_shells_no_impl_fallbacks_match_what_the_caller_unpacks():
 
     assert shell.enqueue_state_stores([]) is False  # `bool(enqueue(stores))`
     assert shell.enqueue_state_loads([]) is False
-    # `int(getattr(..., "chunk_size", 0) or 0)`
-    assert shell.chunk_size is None or isinstance(shell.chunk_size, int)
     assert shell.should_park_partial_prefill_for_load(None) is False
     # Unchanged, so a connector with no opinion does not shrink the chunk.
     assert shell.adjust_prefill_chunk_after_alloc(None, 7) == 7

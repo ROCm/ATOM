@@ -88,9 +88,6 @@ class OffloadJointRecord:
     # reported it -- the KV leg's ceiling. Written before `can_allocate`, which
     # is where the two legs agree on one boundary. 0 = no lookup.
     kv_prefix_tokens: int = 0
-    # The connector's LMCache chunk size, in tokens, or 0. The KV leg moves
-    # whole chunks, so a joint boundary has to be a multiple of it.
-    kv_chunk_tokens: int = 0
     # The boundary both legs of a joint load are aimed at, or 0. Chosen by
     # `can_allocate`: the rightmost checkpoint rung the LMCache KV prefix
     # covers. `num_cached_tokens` stays at the HBM prefix until both legs
@@ -116,9 +113,9 @@ class OffloadJointRecord:
         The four joint fields move together -- a boundary is meaningless
         without the KV span aimed at it and the prefix claimed below it -- so
         the sites that abandon a joint load in full clear them through here
-        rather than by hand. Leaves `load_hash`, `kv_prefix_tokens`, and
-        `kv_chunk_tokens` untouched: they are set on their own paths and are
-        not part of the boundary this drops.
+        rather than by hand. Leaves `load_hash` and `kv_prefix_tokens`
+        untouched: they are set on their own paths and are not part of the
+        boundary this drops.
         """
         self.boundary_tokens = 0
         self.boundary_hash = -1

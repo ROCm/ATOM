@@ -1912,9 +1912,6 @@ class Scheduler:
         seq.offload_joint.kv_prefix_tokens = int(ext_tokens) + int(
             seq.num_cached_tokens
         )
-        seq.offload_joint.kv_chunk_tokens = int(
-            getattr(self.kv_connector, "chunk_size", 0) or 0
-        )
         return needs_remote_load
 
     def _schedule_first_decode_after_remote_kv(self, seq: Sequence) -> None:

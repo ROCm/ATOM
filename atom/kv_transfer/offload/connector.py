@@ -153,18 +153,6 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         """
         return isinstance(self._impl, StateOffloadFace)
 
-    @property
-    def chunk_size(self) -> int | None:
-        """The KV leg's transfer grid, in tokens.
-
-        Read by `Scheduler._resolve_waiting_remote_kv` to stamp
-        `seq.offload_joint.kv_chunk_tokens`, which is `_joint_kv_boundary`'s fallback
-        when `BlockManager` could not read the LMCache config at startup.
-        Without this forwarder that fallback was dead -- `getattr` returned its
-        0 default and the joint path refused with `no_chunk_size`.
-        """
-        return getattr(self._impl, "chunk_size", None)
-
     def get_num_new_matched_tokens(self, seq):
         return self._impl.get_num_new_matched_tokens(seq)
 

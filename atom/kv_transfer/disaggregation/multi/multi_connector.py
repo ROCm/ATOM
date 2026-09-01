@@ -511,33 +511,12 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
     # The scheduler guards every one of these with hasattr(), so MultiConnector
     # only needs to expose them when a sub-connector implements them.
 
-    @property
-    def chunk_size(self) -> int | None:
-        """The offload sub's KV transfer grid, in tokens.
-
-        `Scheduler._resolve_waiting_remote_kv` stamps
-        `seq.offload_joint.kv_chunk_tokens` from `getattr(self.kv_connector,
-        "chunk_size", 0)`, and under `multi` `self.kv_connector` IS this
-        composite. Without this forwarder the getattr default (0) wins, so
-        `_joint_kv_boundary` sees a zero chunk grid and refuses every joint KV
-        load with `no_chunk_size` -- the K3 state tier's KV leg is silently off
-        under `kv_connector: multi`.
-
-        Prefer the state-tier sub's grid: `_joint_kv_boundary` aligns against
-        it, and with two offload subs (dense + kimi_k3) `_first_with` would have
-        handed back the dense sub's grid. Fall back to any offload sub's grid
-        when no tier is configured, so a plain `[moriio, lmcache_offload(dense)]`
-        still gets its dense KV chunk size.
-        """
-        c = self._state_tier_sub() or _first_with(self._connectors, "chunk_size")
-        return getattr(c, "chunk_size", None) if c is not None else None
-
     def should_park_for_load_after_alloc(self, seq: Any) -> bool:
         # Prefer the state-tier sub, then any offload sub: this is a load
         # decision routed through `_decide_load_after_alloc`, which kimi_k3
         # overrides with a joint-boundary clamp. With two offload subs
         # (dense + kimi_k3) plain `_first_with` hands back the dense sub and the
-        # clamp is silently skipped. Mirrors the `chunk_size` forwarder.
+        # clamp is silently skipped.
         c = self._state_tier_sub() or _first_with(
             self._connectors, "should_park_for_load_after_alloc"
         )

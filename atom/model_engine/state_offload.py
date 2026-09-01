@@ -293,6 +293,50 @@ def state_tier_capability(config) -> StateTierCapability:
     return StateTierCapability(can_store, can_load, layout)
 
 
+def state_tier_chunk_tokens(config) -> int:
+    """The LMCache chunk size in tokens for the joint KV leg, or 0.
+
+    Decided from config for the same reason `state_tier_capability` is: this
+    runs in the engine process at `BlockManager.__init__`, and the scheduler
+    holds whatever `get_kvconnector` returned -- a connector object without
+    `chunk_size` would zero this and disable the joint KV load silently. The KV
+    leg moves whole LMCache chunks, so a joint boundary has to be a multiple of
+    this.
+
+    Kept out of `state_tier_capability` on purpose: that check is pure and has a
+    second caller (`hosts_state_tier`), and this reaches into LMCache -- an
+    optional dependency whose absence must not warn on an engine that hosts no
+    tier. Call this only when the capability says a tier is hosted; the WARNING
+    below is then worth printing, because a missing chunk size really does
+    disable the joint KV load.
+    """
+    try:
+        from atom.kv_transfer.offload.config import build_lmcache_config
+
+        kvcfg = getattr(config, "kv_transfer_config", None) or {}
+        # Under `multi` the lmcache.* keys (chunk_size, offload_layout) live on
+        # the offload SUB-connector, not the composite. Passing the raw
+        # composite here read a zero chunk grid. Unwrap the sub the same way
+        # `state_tier_capability` does, so the gate's chunk size and the tier
+        # the capability check builds stay consistent.
+        if isinstance(kvcfg, dict) and kvcfg.get("kv_connector") == "multi":
+            sub, _why = _offload_subconfig(kvcfg)
+            if sub is not None:
+                kvcfg = sub
+        return int(build_lmcache_config(kvcfg).chunk_size)
+    except Exception:
+        # Blind on purpose: this runs at model load, the import reaches a
+        # third-party package that may be absent entirely, and the only
+        # consequence of not knowing the chunk size is that the joint KV load
+        # stays off. Refusing to start would be worse.
+        logger.warning(
+            "state offload: could not read the LMCache chunk size; the joint "
+            "KV load needs it and stays off",
+            exc_info=True,
+        )
+        return 0
+
+
 #: The connector backends whose worker half can build a `StateOffloadTier`.
 #: `multi` qualifies when it lists exactly one.
 _STATE_TIER_BACKENDS = frozenset({"lmcache_offload"})
