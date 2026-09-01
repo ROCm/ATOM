@@ -169,6 +169,39 @@ class FakeSchedSub:
         return object.__getattribute__(self, name)
 
 
+class DestructiveSub:
+    """Faithful model of ``OffloadSchedulerMixin.process_completions``.
+
+    Unlike ``FakeSchedSub`` (which only appends to ``finished_saving``), this
+    reproduces the *destructive* behaviour the real mixin has: it filters
+    ``finished_loading`` down to the one load it owns and ``.clear()``s
+    ``connector_completions`` wholesale after skimming its own channel. Two of
+    these in one composite is the ``[dense, kimi_k3]`` shape from the review —
+    each sub rewrites the shared output and eats what the other owns.
+    """
+
+    is_offload = True
+
+    def __init__(self, *, owned_load, owned_channel):
+        self._owned_load = owned_load
+        self._owned_channel = owned_channel
+        self.settled_channels = []
+
+    def process_completions(self, output):
+        # Keep only the load this sub owns; the mixin drops the rest as "not
+        # mine" (dense/connector.py load_finished returns False on foreign ids).
+        output.finished_loading = {
+            v for v in output.finished_loading if v == self._owned_load
+        }
+        # Consume only this sub's completion channel...
+        for completion in output.connector_completions:
+            if completion.channel == self._owned_channel:
+                self.settled_channels.append(completion.channel)
+        # ...but clear ALL of them, exactly as the mixin does.
+        output.connector_completions.clear()
+        return output
+
+
 class FakeWorkerSub:
     """Worker-side sub-connector mock."""
 
@@ -369,6 +402,59 @@ def test_process_completions_reaches_the_offload_sub():
 
     assert off.saved == [op]
     assert out.finished_saving == {9}
+
+
+def test_process_completions_isolates_each_offload_sub():
+    # [dense, kimi_k3]: BOTH subs define process_completions, and each one is
+    # destructive — it filters finished_loading down to its own and .clear()s
+    # every completion channel. Fanning one mutable output through them in
+    # sequence lets the first sub eat the loads and completion channels the
+    # second owns, so a K3 state completion silently vanishes and the parked
+    # request never wakes. Each sub must operate on a private copy; the union
+    # of their results is what reaches the scheduler.
+    dense = DestructiveSub(owned_load="dense_load", owned_channel="dense_ch")
+    k3 = DestructiveSub(owned_load="k3_load", owned_channel="k3_state_index")
+    sched = _sched([dense, k3])
+
+    out = sched.process_completions(
+        KVConnectorOutput(
+            finished_loading={"dense_load", "k3_load"},
+            connector_completions={
+                ConnectorCompletion("dense_ch", SaveOperationId(1, 0), True),
+                ConnectorCompletion("k3_state_index", SaveOperationId(2, 0), True),
+            },
+        )
+    )
+
+    # Both loads survive the fan-out (sequential fan would drop k3_load)...
+    assert out.finished_loading == {"dense_load", "k3_load"}
+    # ...and each sub settled exactly its own channel (sequential fan would
+    # leave k3.settled_channels empty — dense cleared them first).
+    assert dense.settled_channels == ["dense_ch"]
+    assert k3.settled_channels == ["k3_state_index"]
+    # Every completion channel was consumed by its owner; none leak onward.
+    assert out.connector_completions == set()
+
+
+def test_process_completions_single_offload_sub_is_called_directly():
+    # The common [producer, offload] shape has exactly one process_completions
+    # handler. That must stay the direct, copy-free path so its in-place
+    # rewrites reach the caller unchanged.
+    only = DestructiveSub(owned_load="x", owned_channel="ch")
+    sched = _sched([FakeSchedSub(is_producer=True), only])
+
+    out = sched.process_completions(
+        KVConnectorOutput(
+            finished_loading={"x", "y"},
+            connector_completions={
+                ConnectorCompletion("ch", SaveOperationId(3, 0), True)
+            },
+        )
+    )
+
+    assert out.finished_loading == {"x"}
+    assert only.settled_channels == ["ch"]
+    assert out.connector_completions == set()
 
 
 def test_offload_methods_default_when_no_sub_implements():

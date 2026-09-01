@@ -61,6 +61,7 @@ analogue of vLLM's ``_extra_async_saves`` refcount.
 from __future__ import annotations
 
 import copy
+import dataclasses
 import logging
 from typing import Any
 
@@ -650,16 +651,60 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         )
 
     def process_completions(self, output: KVConnectorOutput) -> KVConnectorOutput:
-        """Let every sub apply its own completions and normalize the output.
+        """Let every offload sub apply its own completions and normalize output.
 
         Only offload defines this. Without the fan-out its save/load
         bookkeeping never clears and raw operation ids reach the scheduler,
         which looks requests up by bare id.
+
+        `OffloadSchedulerMixin.process_completions` is *destructive*: it
+        replaces `finished_loading`/`failed_loading`/`finished_saving` with only
+        the operations it recognises and `.clear()`s `connector_completions`
+        wholesale. Fanning one shared `output` through the subs in sequence
+        therefore lets the first offload sub drop the loads and clear the
+        completion channels the later subs own -- so a `[dense, kimi_k3]`
+        composite silently loses every K3 state completion: the parked request
+        never wakes, `settle_state_store` never runs, and the PAGE units stay
+        pinned until the stale reclaimer marks the image untrusted.
+
+        Give each offload sub a private copy of the mutated sets and merge the
+        results, so a sub only ever consumes what it owns. The single-offload
+        case (the common `[producer, offload]` shape) keeps the direct call --
+        no copy, byte-for-byte the old behaviour.
         """
-        for c in self._connectors:
-            handler = getattr(c, "process_completions", None)
-            if callable(handler):
-                output = handler(output)
+        handlers = [
+            handler
+            for c in self._connectors
+            if callable(handler := getattr(c, "process_completions", None))
+        ]
+        if not handlers:
+            return output
+        if len(handlers) == 1:
+            return handlers[0](output)
+
+        merged_loading: set = set()
+        merged_failed_loading: set = set()
+        merged_saving: set = set()
+        merged_completions: set = set()
+        for handler in handlers:
+            # Only the four fields the mixin rewrites need isolating; the rest
+            # (sending/recving) it never touches, so they stay shared.
+            sub_out = dataclasses.replace(
+                output,
+                finished_loading=set(output.finished_loading),
+                failed_loading=set(output.failed_loading),
+                finished_saving=set(output.finished_saving),
+                connector_completions=set(output.connector_completions),
+            )
+            sub_out = handler(sub_out)
+            merged_loading |= sub_out.finished_loading
+            merged_failed_loading |= sub_out.failed_loading
+            merged_saving |= sub_out.finished_saving
+            merged_completions |= sub_out.connector_completions
+        output.finished_loading = merged_loading
+        output.failed_loading = merged_failed_loading
+        output.finished_saving = merged_saving
+        output.connector_completions = merged_completions
         return output
 
     def save_finished(self, req_id: Any) -> None:
