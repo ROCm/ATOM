@@ -43,7 +43,25 @@ class PageUnitGeometryMixin:
         """
         runner = self.model_runner
         cache = runner.kv_cache
-        owner = cache.data_ptr()
+        # Key on the full layout, not `data_ptr()` alone. `model_runner.kv_cache`
+        # is reassigned in two places -- the P/D IPC import
+        # (`model_runner.py:4472`) and the rollout sleep/wake path
+        # (`rollout/memory_manager.py` deletes it, then `_resume_kv_cache` ->
+        # `allocate_kv_cache` with a possibly *reduced* block count). Address
+        # equality does not imply geometry equality: a same-start-address
+        # reallocation keeps `data_ptr()` but changes `stride(0)`, so `row_stride`
+        # (and thus every base for row > 0) goes stale while `rows`/`region`
+        # survive -- and the granularity assertion below could not catch it even
+        # if the early return did not skip it, since it never involves
+        # `row_stride`. Keying on `(data_ptr, shape, stride, element_size)` makes
+        # any of those changing a cache miss that rebuilds. Mirrors the DSV4
+        # sibling (`deepseek_v4_attn.py`), which keys on the same evidence.
+        owner = (
+            cache.data_ptr(),
+            tuple(cache.shape),
+            tuple(cache.stride()),
+            cache.element_size(),
+        )
         cached = getattr(self, "_page_unit_region_cache", None)
         if cached is not None and cached[0] == owner:
             return cached[1]
@@ -66,8 +84,9 @@ class PageUnitGeometryMixin:
                 f"logical block {rows} rows x {region} B = {rows * region} B; "
                 "the two disagree about block granularity"
             )
+        base_addr = cache.data_ptr()
         base = np.array(
-            [owner + row * row_stride for row in range(rows)], dtype=np.int64
+            [base_addr + row * row_stride for row in range(rows)], dtype=np.int64
         )
         regions = (base, np.full(rows, region, dtype=np.int64))
         self._page_unit_region_cache = (owner, regions)
