@@ -7,9 +7,11 @@ import sys
 import threading
 import types
 from collections import deque
+from itertools import pairwise
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 
 # Ensure aiter.dist.parallel_state exposes symbols mooncake_connector needs.
@@ -682,3 +684,148 @@ def test_pp_downstream_skips_forward_for_request_less_batch():
     ]
     assert forwards == []
     stage.pp_transport.send_tokens.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# DCP relayout planners
+# ---------------------------------------------------------------------------
+
+
+def _expand(plan):
+    """Runs -> the (src, dst) unit pairs they actually move."""
+    src, dst, length = plan
+    return [
+        (int(s) + i, int(d) + i)
+        for s, d, n in zip(src, dst, length)
+        for i in range(int(n))
+    ]
+
+
+def _sharded_reference(src_ids, dst_ids, block_size, dcp_size, rank, interleave):
+    """Per-token expectation, taken from the write-side ownership rule.
+
+    Local slot ``s`` on rank ``r`` holds global position
+    ``((s // S) * W + r) * S + (s % S)``, which the producer stored in its own
+    block table at ``g // block_size``. Deriving it a token at a time is what
+    makes this independent of the planner's run arithmetic.
+    """
+    pairs = []
+    for slot in range(len(dst_ids) * block_size):
+        g = ((slot // interleave) * dcp_size + rank) * interleave + slot % interleave
+        if g // block_size >= len(src_ids):
+            continue
+        pairs.append(
+            (
+                src_ids[g // block_size] * block_size + g % block_size,
+                dst_ids[slot // block_size] * block_size + slot % block_size,
+            )
+        )
+    return pairs
+
+
+@pytest.mark.parametrize(
+    "name, src_ids, dst_ids, block_size, dcp_size, rank, interleave",
+    [
+        ("round robin, rank 0", [5, 6, 7, 8], [2, 3], 2, 4, 0, 1),
+        ("round robin, last rank", [5, 6, 7, 8], [2, 3], 2, 4, 3, 1),
+        ("interleave 2", [11, 12, 13, 14, 15, 16, 17, 18], [3, 9], 8, 4, 2, 2),
+        ("whole-block interleave", [0, 1, 2, 3], [7, 4], 4, 2, 1, 4),
+        # The block manager sizes every rank's table from rank 0's share, so a
+        # higher rank can own a trailing virtual block with no source tokens.
+        ("trailing block has no source", [5, 6, 7], [2, 3], 2, 4, 2, 1),
+        ("shuffled ids", [9, 2, 30, 4], [8, 1], 2, 4, 1, 1),
+    ],
+)
+def test_plan_sharded_matches_the_write_side_ownership(
+    name, src_ids, dst_ids, block_size, dcp_size, rank, interleave
+):
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    plan = mc.plan_sharded(src_ids, dst_ids, block_size, dcp_size, rank, interleave)
+    assert _expand(plan) == _sharded_reference(
+        src_ids, dst_ids, block_size, dcp_size, rank, interleave
+    )
+
+
+def test_plan_sharded_ranks_partition_the_producer_tokens():
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    block_size, dcp_size, interleave = 8, 4, 2
+    dst_ids = [3, 9]
+    src_ids = [11, 12, 13, 14, 15, 16, 17, 18]  # exactly the global width
+
+    moved = []
+    for rank in range(dcp_size):
+        plan = mc.plan_sharded(src_ids, dst_ids, block_size, dcp_size, rank, interleave)
+        moved += [s for s, _ in _expand(plan)]
+
+    every_token = [b * block_size + t for b in src_ids for t in range(block_size)]
+    assert sorted(moved) == sorted(every_token)
+
+
+@pytest.mark.parametrize("interleave", [0, 3, 5, 12])
+def test_plan_sharded_rejects_an_interleave_that_does_not_tile_a_block(interleave):
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    with pytest.raises(ValueError, match="must divide block_size"):
+        mc.plan_sharded([0, 1], [0], 8, 4, 0, interleave)
+
+
+def test_coalesce_merges_only_runs_contiguous_on_both_sides():
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    src, dst, length = mc._coalesce(
+        np.array([0, 4, 8, 100]),
+        np.array([0, 4, 20, 24]),  # the 8 -> 20 hop breaks the destination run
+        np.array([4, 4, 4, 4]),
+    )
+    assert src.tolist() == [0, 8, 100]
+    assert dst.tolist() == [0, 20, 24]
+    assert length.tolist() == [8, 4, 4]
+
+
+def test_coalesce_handles_an_empty_plan():
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    src, dst, length = mc._coalesce(
+        np.empty(0, dtype=np.int64),
+        np.empty(0, dtype=np.int64),
+        np.empty(0, dtype=np.int64),
+    )
+    assert src.size == dst.size == length.size == 0
+
+
+def test_plan_replicated_index_splits_each_page_into_a_key_and_a_scale_run():
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    key, scale, dcp_size = 512, 64, 4
+    page = key + scale
+    src_ids = [10, 11, 12, 13, 14]  # 5 pages for 8 destination sub-pages
+    dst_ids = [2, 7]
+
+    src, dst, length = mc.plan_replicated_index(
+        src_ids, dst_ids, dcp_size, page, key, scale
+    )
+
+    kept_dst = [2, 2, 2, 2, 7]  # the last 3 sub-pages have no source page
+    kept_sub = [0, 1, 2, 3, 0]
+    assert src.tolist() == [b * page for b in src_ids] + [
+        b * page + key for b in src_ids
+    ]
+    assert dst.tolist() == [
+        d * page * dcp_size + s * key for d, s in zip(kept_dst, kept_sub)
+    ] + [
+        d * page * dcp_size + dcp_size * key + s * scale
+        for d, s in zip(kept_dst, kept_sub)
+    ]
+    assert length.tolist() == [key] * 5 + [scale] * 5
+
+    # Distinct source pages must not overwrite each other on the destination.
+    runs = sorted(zip(dst.tolist(), length.tolist()))
+    assert all(a + n <= b for (a, n), (b, _) in pairwise(runs))

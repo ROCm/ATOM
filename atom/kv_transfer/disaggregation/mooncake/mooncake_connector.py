@@ -187,6 +187,16 @@ def plan_sharded(
     it can own a trailing virtual block that has no source tokens at all.
     """
     S = int(interleave_size)
+    if not 1 <= S <= block_size or block_size % S:
+        # Runs are S long and start on an S-group boundary, so an interleave
+        # that does not tile a block puts a run astride two of them -- writing
+        # past one destination block into the next and leaving the tokens it
+        # skipped untransferred.
+        raise ValueError(
+            f"DCP interleave_size={interleave_size} must divide block_size="
+            f"{block_size}; the sharded plan cannot express a run that "
+            "straddles two blocks."
+        )
     src_ids = np.asarray(src_block_ids, dtype=np.int64)
     dst_ids = np.asarray(dst_block_ids, dtype=np.int64)
 

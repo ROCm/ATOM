@@ -1981,7 +1981,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             return None
         var = self.model_runner.forward_vars
         expanded_page_size = self.model_runner.block_size * self.dcp_world_size
-        pos = var["context_lens"].gpu[:running_bs].to(torch.int64) - 1
+        # prepare_decode zeroes a padded row's context_len, so clamp before the
+        # gather: the sentinel below lands after it, too late to keep pos=-1 out
+        # of the block table.
+        pos = (var["context_lens"].gpu[:running_bs].to(torch.int64) - 1).clamp_(min=0)
         page = (
             var["block_tables"]
             .gpu[:running_bs]

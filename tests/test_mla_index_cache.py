@@ -349,3 +349,35 @@ def test_transfer_regions_use_explicit_compact_consumer_map(monkeypatch):
         9,
         10,
     ]
+
+
+def test_draft_index_slots_skip_padded_rows_without_indexing_the_block_table():
+    """A padded row's context_len is 0, so ``pos = ctx - 1`` is -1.
+
+    ``_enter_decode_metadata`` rebuilds the mapping before the step's
+    ``context_lens += 1``, so the pad rows really are at 0 there, and gathering
+    the block table at -1 faults before the sentinel below can mask them.
+    """
+    import torch
+
+    scheduled_bs, running_bs = 2, 4
+    var = {
+        "context_lens": SimpleNamespace(
+            gpu=torch.tensor([70, 5, 0, 0], dtype=torch.int32)
+        ),
+        "block_tables": SimpleNamespace(
+            gpu=torch.tensor([[3, 9], [7, 0], [0, 0], [0, 0]], dtype=torch.int32)
+        ),
+        "index_slot_mapping": SimpleNamespace(
+            gpu=torch.zeros(running_bs, dtype=torch.int64)
+        ),
+    }
+    builder = object.__new__(AiterMLAMetadataBuilder)
+    builder.replicate_index_cache = True
+    builder.dcp_world_size = 4
+    builder.model_runner = SimpleNamespace(block_size=16, forward_vars=var)
+
+    slots = builder.rebuild_draft_index_slots(scheduled_bs, running_bs)
+
+    # Page width is block_size * dcp_world_size = 64.
+    assert slots.tolist() == [9 * 64 + 5, 7 * 64 + 4, -1, -1]
