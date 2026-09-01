@@ -120,6 +120,16 @@ def indexer_qk_rope_quant_and_cache(
     )
 
 
+def _narrow_prefill_cu_seqlens(
+    cu_seqlens_q: torch.Tensor,
+    kv_last_page_lens: torch.Tensor | None,
+) -> torch.Tensor:
+    """Drop builder padding only when per-sequence page metadata exists."""
+    if kv_last_page_lens is None:
+        return cu_seqlens_q
+    return cu_seqlens_q[: kv_last_page_lens.shape[0] + 1]
+
+
 def _sparse_index_workspace(
     out: torch.Tensor | None,
     total_out: int,
@@ -1745,9 +1755,12 @@ class MLAAttention(nn.Module):
         )
 
         # The paged kernels take their batch from the q-cums; cut them to a
-        # per-seq array the prefill builder left unpadded.
-        n_seqs = attn_metadata.kv_last_page_lens.shape[0]
-        paged_cu_seqlens_q = attn_metadata.cu_seqlens_q[: n_seqs + 1]
+        # per-seq array the prefill builder left unpadded. A plain first-chunk
+        # prefill can legitimately leave kv_last_page_lens unset.
+        paged_cu_seqlens_q = _narrow_prefill_cu_seqlens(
+            attn_metadata.cu_seqlens_q,
+            attn_metadata.kv_last_page_lens,
+        )
         paged_kv_indptr = attn_metadata.kv_indptr
         paged_kv_indices = attn_metadata.kv_indices
         kv_last_page_lens = attn_metadata.kv_last_page_lens
