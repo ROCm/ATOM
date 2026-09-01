@@ -1394,6 +1394,23 @@ class BlockManager:
         if self.paged_state_checkpoints is not None:
             self.paged_state_checkpoints.settle_offload_store(op)
 
+    def has_pending_state_store_pins(self) -> bool:
+        """Whether a dispatched state store is still awaiting its report.
+
+        The engine's liveness gate (`EngineCore.has_pending_kv_work`) ORs this
+        in so a step whose only outstanding work is a state store already handed
+        to the worker does not read as idle. Without it the store's PAGE units
+        stay pinned out of the KV pool until they age out, because the report
+        that would release them -- and the reclaim that is the report's only
+        backstop -- are both drained by `_poll_kv_transfer_progress`, which the
+        idle loop stops calling the moment liveness goes False. This is the
+        unit-store twin of the `deferred_free_blocks` condition the gate already
+        checks for the KV save leg.
+        """
+        if self.paged_state_checkpoints is None:
+            return False
+        return self.paged_state_checkpoints.has_offload_pins()
+
     def reclaim_stale_state_store_pins(self, timeout_s: float) -> int:
         """Release store pins whose report never came. See the store."""
         if self.paged_state_checkpoints is None:

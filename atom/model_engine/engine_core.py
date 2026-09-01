@@ -473,6 +473,16 @@ class EngineCore:
             return False
         if getattr(self.scheduler, "deferred_free_blocks", None):
             return True
+        # Unit-store twin of `deferred_free_blocks`: a state store handed to the
+        # worker keeps its PAGE units pinned out of the KV pool until its report
+        # settles them or the reclaim ages them out. Both exits run only from
+        # `_poll_kv_transfer_progress`, so the loop must keep polling while a
+        # pin is outstanding or the units leak until the abandon window. Guarded
+        # for the scheduler doubles that implement only the connector surface.
+        bm = getattr(self.scheduler, "block_manager", None)
+        pending_pins = getattr(bm, "has_pending_state_store_pins", None)
+        if pending_pins is not None and pending_pins():
+            return True
         connector = getattr(self.scheduler, "kv_connector", None)
         if connector is None or not hasattr(connector, "has_pending_work"):
             return False

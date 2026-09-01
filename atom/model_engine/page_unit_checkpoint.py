@@ -486,6 +486,22 @@ class PageUnitCheckpointStore:
             return
         self._release_offload_pin(entry[0])
 
+    def has_offload_pins(self) -> bool:
+        """Whether any dispatched store is still holding its PAGE units.
+
+        A pin lives here from the moment `take_offload_stores` hands a store to
+        the worker until either report path settles it (`settle_offload_store`,
+        driven by the source-release and index completions) or the last-resort
+        `reclaim_stale_offload_pins` times it out. It is therefore true exactly
+        while a store is dispatched-but-unreported, which is the interval the
+        engine must keep polling across: the completion that clears the pin --
+        and the reclaim that is its only other exit -- both run only from
+        `_poll_kv_transfer_progress`, which the idle loop skips once liveness
+        reads False. Because reclaim shares this same dict, the signal cannot
+        latch the busy loop: a lost report clears here when the reclaim fires.
+        """
+        return bool(self._offload_pins)
+
     def reclaim_stale_offload_pins(self, timeout_s: float) -> int:
         """Release pins whose report never came, after `timeout_s`.
 
@@ -836,6 +852,10 @@ class PagedStateCheckpointCoordinator:
     def settle_offload_store(self, op: StateStoreOperationId) -> None:
         """One store reported, either way; release the units it was holding."""
         self.store.settle_offload_store(op)
+
+    def has_offload_pins(self) -> bool:
+        """Whether any dispatched store is still pinning its units. See store."""
+        return self.store.has_offload_pins()
 
     def reclaim_stale_offload_pins(self, timeout_s: float) -> int:
         """Release offload pins whose report never came. See the store."""
