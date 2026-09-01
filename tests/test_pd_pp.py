@@ -829,3 +829,94 @@ def test_plan_replicated_index_splits_each_page_into_a_key_and_a_scale_run():
     # Distinct source pages must not overwrite each other on the destination.
     runs = sorted(zip(dst.tolist(), length.tolist()))
     assert all(a + n <= b for (a, n), (b, _) in pairwise(runs))
+
+
+def _dcp_block_transfer_producer(mc, roles):
+    """A pp1 producer with one region per role, ready for _execute_block_transfer."""
+    conn = object.__new__(mc.MooncakeConnector)
+    conn.pp_size = 1
+    conn.pp_rank = 0
+    conn._num_local_layers = len(roles)
+    conn._start_layer = 0
+    conn._block_region_consumer_indices = None
+    conn._block_region_roles = list(roles)
+    conn._block_region_planes = [None] * len(roles)
+    conn.kv_caches_base_addr = [0x1000 * (i + 1) for i in range(len(roles))]
+    conn._per_block_bytes_list = [576 * 16] * len(roles)
+    conn.block_size = 16
+    conn.dcp_size = 1
+    return conn
+
+
+def _dcp_block_transfer_request(conn, roles):
+    return {
+        "consumer_base_addrs": [0x9000 * (i + 1) for i in range(len(roles))],
+        "consumer_num_layers": len(roles),
+        "consumer_region_roles": list(roles),
+        "consumer_dcp_size": 4,
+        "consumer_dcp_rank": 0,
+        "consumer_dcp_interleave": 16,
+        "consumer_replicates_index_cache": False,
+    }
+
+
+def test_block_transfer_refuses_a_roleless_region_under_dcp():
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    # An EAGLE3 draft region is appended to the MLA builder's list with no
+    # semantic_role; the token-interleave relayout does not describe its layout.
+    roles = [mc.MLA_KV_ROLE, None]
+    conn = _dcp_block_transfer_producer(mc, roles)
+
+    with pytest.raises(RuntimeError, match="semantic_role"):
+        conn._execute_block_transfer(
+            _dcp_block_transfer_request(conn, roles),
+            "host:1",
+            list(range(8)),
+            [0, 1],
+            "req-0",
+        )
+
+
+def test_block_transfer_descriptors_match_scalar_arithmetic():
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    roles = [mc.MLA_KV_ROLE, mc.MLA_KV_ROLE]
+    conn = _dcp_block_transfer_producer(mc, roles)
+    request = _dcp_block_transfer_request(conn, roles)
+    src_block_ids, dst_block_ids = list(range(8)), [0, 1]
+    captured = {}
+
+    def _capture(target, src_addrs, dst_addrs, sizes, req_id, kind):
+        captured.update(src=src_addrs, dst=dst_addrs, sizes=sizes)
+        return True
+
+    conn._rdma_write_with_retry = _capture
+    assert conn._execute_block_transfer(
+        request, "host:1", src_block_ids, dst_block_ids, "req-0"
+    )
+
+    plan = mc.plan_sharded(
+        src_block_ids,
+        dst_block_ids,
+        conn.block_size,
+        request["consumer_dcp_size"],
+        request["consumer_dcp_rank"],
+        request["consumer_dcp_interleave"],
+    )
+    unit = conn._per_block_bytes_list[0] // conn.block_size
+    exp_src, exp_dst, exp_sizes = [], [], []
+    for region_idx in range(len(roles)):
+        for src_off, dst_off, run_len in zip(*plan):
+            exp_src.append(conn.kv_caches_base_addr[region_idx] + int(src_off) * unit)
+            exp_dst.append(
+                request["consumer_base_addrs"][region_idx] + int(dst_off) * unit
+            )
+            exp_sizes.append(int(run_len) * unit)
+
+    assert captured["src"] == exp_src
+    assert captured["dst"] == exp_dst
+    assert captured["sizes"] == exp_sizes
+    assert all(type(a) is int for a in captured["src"])

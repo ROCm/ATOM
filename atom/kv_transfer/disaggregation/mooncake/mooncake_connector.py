@@ -44,6 +44,7 @@ from atom.kv_transfer.disaggregation.port_offset import (
 )
 from atom.kv_transfer.disaggregation.types import (
     INDEX_CACHE_ROLE,
+    MLA_KV_ROLE,
     ConnectorMetadata,
     KVTransferRegion,
     ReqId,
@@ -223,11 +224,11 @@ def plan_replicated_index(
     ``indexer_k_quant_and_cache(preshuffle=True)`` stores a page as an
     MFMA-16x16-tiled fp8 key plane followed by an fp32 scale plane, so a page is
     only copyable whole -- addressing one of its tokens is not a byte range at
-    all. Source pages stay whole here, but the destination page is ``dcp_size``
-    of them wide and interleaves the two planes differently: its keys run
-    ``dcp_size * key_plane_bytes`` before its scales start. So each source page
-    splits into a key run and a scale run, landing at sub-page ``s`` of each
-    plane rather than at one sub-page offset of the page.
+    all. The destination page is ``dcp_size`` source pages wide and interleaves
+    the two planes differently: its keys run ``dcp_size * key_plane_bytes``
+    before its scales start. So each source page crosses as a key run and a
+    scale run, landing at sub-page ``s`` of each plane rather than at one
+    sub-page offset of the page.
     """
     src_ids = np.asarray(src_block_ids, dtype=np.int64)
     dst_ids = np.asarray(dst_block_ids, dtype=np.int64)
@@ -506,6 +507,10 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             # prefix cache. Per-request state (including the SWA ring slot) is
             # not covered by a block-only delta, so it takes a full transfer.
             num_computed_blocks = 0
+            # The producer turns each consumer block back into `dcp_size` of
+            # its own, so the two PHYSICAL block sizes have to match. The wire
+            # value is the producer's hash size, which is that only while the
+            # producer runs dcp=1, as CPP prefill does.
             remote_hash_block_size = params.get("hash_block_size")
             if remote_hash_block_size != self.block_size:
                 logger.warning(
@@ -1674,13 +1679,18 @@ class MooncakeConnector(KVConnectorBase):
             src_base = self.kv_caches_base_addr[region_idx]
             dst_base = consumer_base_addrs[cmap[region_idx]]
             bpb = self._per_block_bytes_list[region_idx]
+            role = self._block_region_roles[region_idx]
+            # sharded_plan addresses a block in MLA token units, so any other
+            # region would be relaid out under a rule that is not its layout.
+            if dcp_size > 1 and role != MLA_KV_ROLE and role != INDEX_CACHE_ROLE:
+                raise RuntimeError(
+                    f"Region {region_idx} has semantic_role {role!r}; under "
+                    f"consumer dcp_size={dcp_size} the only relayouts defined "
+                    f"are {MLA_KV_ROLE} and {INDEX_CACHE_ROLE}."
+                )
             plan = sharded_plan
             unit = 0
-            if (
-                dcp_size > 1
-                and replicates_index
-                and self._block_region_roles[region_idx] == INDEX_CACHE_ROLE
-            ):
+            if dcp_size > 1 and replicates_index and role == INDEX_CACHE_ROLE:
                 planes = self._block_region_planes[region_idx]
                 if planes is None:
                     raise RuntimeError(
@@ -1722,19 +1732,22 @@ class MooncakeConnector(KVConnectorBase):
                         "is built on."
                     )
                 unit = bpb // self.block_size
-            for src_off, dst_off, run_len in zip(*plan):
-                src_addrs.append(src_base + int(src_off) * unit)
-                dst_addrs.append(dst_base + int(dst_off) * unit)
-                sizes.append(int(run_len) * unit)
+            # One descriptor per token on a token-unit plan, so scale in the
+            # array; tolist() boxes to the Python ints the engine takes.
+            plan_src, plan_dst, plan_len = plan
+            src_addrs.extend((src_base + plan_src * unit).tolist())
+            dst_addrs.extend((dst_base + plan_dst * unit).tolist())
+            sizes.extend((plan_len * unit).tolist())
 
-        logger.debug(
-            "[PRODUCER] block RDMA write: req=%s, %d regions × %d blocks, "
-            "total_bytes=%d",
-            req_id,
-            num_regions,
-            len(src_block_ids),
-            sum(sizes),
-        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[PRODUCER] block RDMA write: req=%s, %d regions × %d blocks, "
+                "total_bytes=%d",
+                req_id,
+                num_regions,
+                len(src_block_ids),
+                sum(sizes),
+            )
 
         if not self._rdma_write_with_retry(
             target, src_addrs, dst_addrs, sizes, req_id, "block"
