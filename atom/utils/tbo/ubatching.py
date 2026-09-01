@@ -194,6 +194,11 @@ class DPSyncResult:
     # the graph-shape sync no longer needs its own separate all_reduce (halves
     # the per-step DP round-trips).
     max_seqlen_q_across_dp: int | None = None
+    # EPLB activity signals exclude synthetic dummy forwards. They let a DPA
+    # group advance a prefill- or decode-specific rebalance clock without an
+    # additional collective on every model step.
+    any_rank_has_real_prefill: bool = False
+    any_rank_has_decode: bool = False
 
 
 def sync_dp_metadata(
@@ -208,6 +213,7 @@ def sync_dp_metadata(
     local_can_split: bool = False,
     local_ub_tokens: tuple[int, int] = (0, 0),
     max_seqlen_q: int | None = None,
+    local_is_dummy: bool = False,
 ) -> DPSyncResult:
     """Single packed DP all_gather over all per-rank scalars a decode/prefill
     step needs synchronized: DP token padding, the prefill fan-out, the
@@ -219,19 +225,19 @@ def sync_dp_metadata(
     Pre-Plan-B this required up to 3 separate all_reduces per step
     (``get_dp_padding`` / this sync / a third inside
     ``UBatchWrapper``). Now one all_gather of ``n_fields`` int32 values
-    per rank suffices. When TBO is off only the first 3 fields are
-    exchanged (saves 57 % payload + skips :func:`local_tbo_precompute`
-    at the call site).
+    per rank suffices. When TBO is off only the first 4 fields are exchanged
+    (and :func:`local_tbo_precompute` is skipped at the call site).
 
     Layout (``sync`` is ``[n_fields, dp_size]``):
 
       row 0 : scheduled_tokens         -> num_tokens_across_dp
       row 1 : scheduled_bs             -> max_bs_across_dp (MAX)
       row 2 : is_prefill (0/1)         -> any_rank_has_prefill (OR)
-      row 3 : meets_min_tokens (0/1)   -> OR  -> any rank reached the min-token bar [TBO only]
-      row 4 : can_split (0/1)          -> AND -> every rank can split              [TBO only]
-      row 5 : ub0_tokens               -> ub_max_tokens_across_dp[0]              [TBO only]
-      row 6 : ub1_tokens               -> ub_max_tokens_across_dp[1]              [TBO only]
+      row 3 : is_dummy (0/1)           -> real prefill/decode activity for EPLB
+      row 4 : meets_min_tokens (0/1)   -> OR  -> any rank reached the min-token bar [TBO only]
+      row 5 : can_split (0/1)          -> AND -> every rank can split              [TBO only]
+      row 6 : ub0_tokens               -> ub_max_tokens_across_dp[0]              [TBO only]
+      row 7 : ub1_tokens               -> ub_max_tokens_across_dp[1]              [TBO only]
       row k+0 : max_seqlen_q           -> max_seqlen_q_across_dp (MAX)  [DSpark only]
 
     Rows 0 and 1 are the same batch in ATOM's two units; both ride this one
@@ -247,18 +253,20 @@ def sync_dp_metadata(
     0 already carry them, and a step that reaches the reduction with every rank
     decoding has `scheduled_tokens` == its decode total on every rank.
     """
-    tbo_fields = 7 if tbo_on else 3
+    base_fields = 4
+    tbo_fields = 8 if tbo_on else base_fields
     dspark_on = max_seqlen_q is not None
     n_fields = tbo_fields + (1 if dspark_on else 0)
     local = torch.zeros(n_fields, dtype=torch.int32, device="cpu")
     local[0] = scheduled_tokens
     local[1] = scheduled_bs
     local[2] = 1 if is_prefill else 0
+    local[3] = 1 if local_is_dummy else 0
     if tbo_on:
-        local[3] = 1 if local_meets_min_tokens else 0
-        local[4] = 1 if local_can_split else 0
-        local[5] = local_ub_tokens[0]
-        local[6] = local_ub_tokens[1]
+        local[4] = 1 if local_meets_min_tokens else 0
+        local[5] = 1 if local_can_split else 0
+        local[6] = local_ub_tokens[0]
+        local[7] = local_ub_tokens[1]
     if dspark_on:
         local[tbo_fields + 0] = max_seqlen_q
 
@@ -271,6 +279,9 @@ def sync_dp_metadata(
     num_tokens_across_dp = sync[0]
     max_bs_across_dp = int(sync[1].max())
     any_rank_has_prefill = bool(sync[2].any())
+    real_rank = sync[3] == 0
+    any_rank_has_real_prefill = bool(((sync[2] != 0) & real_rank).any())
+    any_rank_has_decode = bool(((sync[2] == 0) & real_rank).any())
     tbo_collective_active = False
     ub_max_tokens_across_dp: tuple[int, int] | None = None
     if tbo_on:
@@ -279,7 +290,7 @@ def sync_dp_metadata(
         # that rank would run 1 ubatch while peers run 2 → per-ubatch collective
         # size mismatch → RCCL hang. Under-filled-but-splittable ranks are then
         # force-split (see maybe_create_ubatch_slices force=True) to stay aligned.
-        tbo_collective_active = bool(sync[3].any()) and bool(sync[4].all())
+        tbo_collective_active = bool(sync[4].any()) and bool(sync[5].all())
         # Mixed-mode guard: ALWAYS require a uniform batch mode (all prefill or
         # all decode) across DP. A prefill rank running 2 ubatches alongside a
         # decode rank running 2 ubatches still issues different collectives per
@@ -291,8 +302,8 @@ def sync_dp_metadata(
             tbo_collective_active = uniform_mode
         if tbo_collective_active:
             ub_max_tokens_across_dp = (
-                int(sync[5].max()),
                 int(sync[6].max()),
+                int(sync[7].max()),
             )
 
     max_seqlen_q_across_dp: int | None = None
@@ -303,6 +314,8 @@ def sync_dp_metadata(
         num_tokens_across_dp=num_tokens_across_dp,
         max_bs_across_dp=max_bs_across_dp,
         any_rank_has_prefill=any_rank_has_prefill,
+        any_rank_has_real_prefill=any_rank_has_real_prefill,
+        any_rank_has_decode=any_rank_has_decode,
         tbo_collective_active=tbo_collective_active,
         ub_max_tokens_across_dp=ub_max_tokens_across_dp,
         max_seqlen_q_across_dp=max_seqlen_q_across_dp,

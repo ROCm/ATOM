@@ -265,8 +265,9 @@ class ForwardMode:
                 local_meets_min_tokens=meets_min,
                 local_can_split=can_split,
                 local_ub_tokens=(ub0, ub1),
+                local_is_dummy=bool(getattr(batch, "is_dummy_run", False)),
                 # Only a block drafter needs the group to agree on it; every
-                # other flavor keeps its own and the two extra wire rows are
+                # other flavor keeps its own and the extra wire row is
                 # not sent.
                 max_seqlen_q=max_seqlen_q if is_block_drafter else None,
             )
@@ -736,6 +737,12 @@ class ForwardContext:
     # per-ubatch all_reduce. Shape: tuple of length N == len(ubatch_slices).
     # None when DP is off or when TBO is not active this step.
     ub_max_tokens_across_dp: tuple | None = None
+
+    # One boolean per MoE input row. Populated lazily when decode-aware EPLB is
+    # enabled so padded CUDAGraph/DP rows do not pollute expert-load statistics.
+    # The tensor address remains stable under graph capture and is reused by all
+    # MoE layers in the forward.
+    eplb_token_mask: torch.Tensor | None = None
 
     # Cached current_stream() captured at set_forward_context() time, so
     # downstream code (V4 attention / MoE / metadata builder) doesn't have

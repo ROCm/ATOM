@@ -53,6 +53,17 @@ def _step(mgr):
     mgr.on_forward_pass_end(local_has_prefill=True, dp_any_has_prefill=True)
 
 
+def _decode_step(mgr):
+    """Advance a decode-aware manager with an already synchronized DP flag."""
+    mgr._dp_is_migration_group = True
+    mgr.on_forward_pass_end(
+        local_has_prefill=False,
+        dp_any_has_prefill=False,
+        local_has_decode=True,
+        dp_any_has_decode=True,
+    )
+
+
 def _spy_rebalance(mgr, fired):
     """Replace the runtime rebalance with a 0-yield spy that records each fire.
 
@@ -104,6 +115,109 @@ def test_manager_steps_with_dummy_and_triggers_by_interval(monkeypatch):
     _step(manager)  # 8th steady call -> fire
     assert fired == [1, 1]
     assert manager.rebalance_count == 2
+
+
+def test_first_rebalance_waits_for_full_load_window(monkeypatch):
+    monkeypatch.setattr(eplb, "get_tp_group", lambda: _FakeTPGroup(world_size=1))
+    monitor = eplb.ExpertLoadMonitor(enabled=True, window_size=4)
+    _record_single_pass(monitor, counts=[4, 0])
+    fired = []
+    manager = eplb.EPLBManager(
+        enabled=True,
+        monitor=monitor,
+        rebalance_interval=8,
+        rebalance_min_balancedness=0.8,
+        rebalance_balancedness_agg="min",
+    )
+    _spy_rebalance(manager, fired)
+
+    # interval/4 is only 2, but the placement must not be derived from less
+    # than the configured four-pass load window.
+    for _ in range(4):
+        _step(manager)
+    assert fired == []
+    _step(manager)
+    assert fired == [1]
+
+
+def test_decode_only_skew_is_recorded_and_triggers_rebalance(monkeypatch):
+    """Regression scenario for a saturated decode-only DPA worker.
+
+    Two hot experts start on rank 0's contiguous slots, so the measured rank
+    load is badly skewed. Decode mode must retain those samples, advance the
+    periodic scheduler without any prefill, and feed a placement whose maximum
+    per-rank work is lower than the initial layout.
+    """
+    monkeypatch.setattr(eplb, "get_tp_group", lambda: _FakeTPGroup(world_size=1))
+
+    monitor = eplb.ExpertLoadMonitor(enabled=True, window_size=2)
+    _init_monitor(monitor, num_layers=1, num_physical=4)
+    fired = []
+    manager = eplb.EPLBManager(
+        enabled=True,
+        monitor=monitor,
+        rebalance_interval=4,
+        rebalance_min_balancedness=0.8,
+        rebalance_balancedness_agg="min",
+        load_mode="decode",
+    )
+    manager.live_metadata = types.SimpleNamespace(ep_size=2)
+    _spy_rebalance(manager, fired)
+
+    for _ in range(3):
+        monitor.on_forward_start()
+        monitor.record(
+            layer_id=0,
+            topk_physical=torch.tensor(
+                [[0]] * 10 + [[1]] * 9 + [[2]], dtype=torch.int32
+            ),
+            num_physical=4,
+        )
+        monitor.on_forward_end(is_dummy_run=False, should_commit=True)
+        _decode_step(manager)
+
+    assert fired == [1]
+    assert manager.rebalance_count == 1
+    assert manager.last_balancedness == pytest.approx(10 / 19)
+
+    logical_load = monitor.dump_global_physical_load()
+    old_p2l = torch.tensor([[0, 1, 2, 3]], dtype=torch.int32)
+    new_p2l, _, _ = eplb.rebalance_experts(
+        logical_load,
+        num_physical=4,
+        num_groups=1,
+        num_nodes=1,
+        num_gpus=2,
+        enable_hierarchical=False,
+        old_p2l=old_p2l,
+    )
+
+    def max_rank_load(p2l):
+        weights = logical_load[0, p2l[0].to(torch.int64)].view(2, 2).sum(dim=1)
+        return int(weights.max().item())
+
+    assert max_rank_load(new_p2l) < max_rank_load(old_p2l)
+
+
+def test_decode_mode_ignores_prefill_activity(monkeypatch):
+    monitor = eplb.ExpertLoadMonitor(enabled=True, window_size=1)
+    manager = eplb.EPLBManager(
+        enabled=True,
+        monitor=monitor,
+        rebalance_interval=1,
+        rebalance_min_balancedness=0.8,
+        rebalance_balancedness_agg="min",
+        load_mode="decode",
+    )
+    manager._dp_is_migration_group = True
+    manager.on_forward_pass_end(
+        local_has_prefill=True,
+        dp_any_has_prefill=True,
+        local_has_decode=False,
+        dp_any_has_decode=False,
+    )
+    # The warm-start generator has not advanced.
+    assert manager.rebalance_count == 0
 
 
 def test_manager_balancedness_gate_skips_when_balanced(monkeypatch):
@@ -180,6 +294,60 @@ def test_manager_interval_must_cover_window():
             rebalance_min_balancedness=0.8,
             rebalance_balancedness_agg="min",
         )
+
+
+def test_manager_rejects_unknown_load_mode():
+    monitor = eplb.ExpertLoadMonitor(enabled=True, window_size=1)
+    with pytest.raises(AssertionError, match="load_mode"):
+        eplb.EPLBManager(
+            enabled=True,
+            monitor=monitor,
+            rebalance_interval=1,
+            rebalance_min_balancedness=0.8,
+            rebalance_balancedness_agg="min",
+            load_mode="tokens-from-mars",
+        )
+
+
+def test_manager_rejects_negative_max_rebalances():
+    monitor = eplb.ExpertLoadMonitor(enabled=True, window_size=1)
+    with pytest.raises(AssertionError, match="max_rebalances"):
+        eplb.EPLBManager(
+            enabled=True,
+            monitor=monitor,
+            rebalance_interval=1,
+            rebalance_min_balancedness=0.8,
+            rebalance_balancedness_agg="min",
+            max_rebalances=-1,
+        )
+
+
+def test_manager_freezes_after_configured_rebalance_limit(monkeypatch):
+    monkeypatch.setattr(eplb, "get_tp_group", lambda: _FakeTPGroup(world_size=1))
+    monitor = eplb.ExpertLoadMonitor(enabled=True, window_size=1)
+    _record_single_pass(monitor, counts=[4, 0])
+    fired = []
+    manager = eplb.EPLBManager(
+        enabled=True,
+        monitor=monitor,
+        rebalance_interval=4,
+        rebalance_min_balancedness=0.8,
+        rebalance_balancedness_agg="min",
+        max_rebalances=1,
+    )
+    manager.live_metadata = types.SimpleNamespace(ep_size=2)
+    _spy_rebalance(manager, fired)
+
+    # The warm-start window fires once; later automatic steps stay frozen.
+    _step(manager)
+    _step(manager)
+    assert fired == [1]
+    for _ in range(20):
+        _step(manager)
+    assert fired == [1]
+    assert manager.rebalance_count == 1
+    assert manager.automatic_rebalancing_frozen
+    assert not monitor.collecting
 
 
 def test_manager_trigger_offline_rebalance(monkeypatch):

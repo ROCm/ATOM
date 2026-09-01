@@ -196,23 +196,33 @@ class FusedMoEParallelConfig:
     # deployment wider than the box, in which case experts shard that many
     # times finer and each rank repeats the gathered tokens that many times.
     dp_logical_ratio: int = 1
+    requested_all2all_backend: str = "auto"
+
+    @property
+    def selected_all2all_backend(self) -> str | None:
+        if self.dp_size <= 1 or not self.use_ep or self.dp_logical_ratio != 1:
+            return None
+        if self.requested_all2all_backend == "none":
+            return None
+        if self.requested_all2all_backend == "rccl":
+            return "rccl"
+        if not envs.ATOM_DISABLE_MORI_EP and _has_module("mori"):
+            return "mori"
+        return None
 
     @property
     def use_all2all_kernels(self):
-        # Only use mori all2all kernels when expert parallel is enabled.
-        # Never while simulating: mori is real peer-to-peer, so absent ranks
-        # cannot be stood in for, and it derives a token's destination from
-        # num_experts // real peer count -- which disagrees with a finer map.
-        return (
-            self.dp_size > 1
-            and self.use_ep
-            and self.dp_logical_ratio == 1
-            and _has_module("mori")
-        )
+        # Routed all-to-all requires real peers. Simulated DP has a finer
+        # expert map than the launched process group and stays on the fallback.
+        return self.selected_all2all_backend is not None
 
     @property
     def use_mori_kernels(self):
-        return True
+        return self.selected_all2all_backend == "mori"
+
+    @property
+    def use_rccl_kernels(self):
+        return self.selected_all2all_backend == "rccl"
 
     @staticmethod
     def make(
@@ -234,6 +244,9 @@ class FusedMoEParallelConfig:
         # Only flatten DP into TP/EP when enable_dp_attention is True.
         # Otherwise, use pure DP for MoE.
         enable_dp_attention = parallel_config.enable_dp_attention
+        requested_all2all_backend = getattr(
+            parallel_config, "moe_all2all_backend", "auto"
+        )
 
         # When EP shards across the flattened DP * TP space (vLLM plugin under
         # EP), the ep rank must be computed in that flattened group space.
@@ -291,6 +304,7 @@ class FusedMoEParallelConfig:
                 ep_rank=0,
                 use_ep=False,
                 local_ep_size=1,
+                requested_all2all_backend=requested_all2all_backend,
             )
         # DP + EP / TP + EP / DP + TP + EP
         assert use_ep
@@ -312,6 +326,7 @@ class FusedMoEParallelConfig:
             ),
             local_ep_size=atom_config.parallel_config.data_parallel_size_local
             * tp_size_,
+            requested_all2all_backend=requested_all2all_backend,
         )
 
 
@@ -456,6 +471,16 @@ def dp_gather_hidden_and_router(
     ``reduce_scatter_with_unpadding`` must trim back to. ``sizes`` is non-None
     only in eager mode (needed later for ``reduce_scatterv``).
     """
+    atom_cfg = get_current_atom_config()
+    eplb_cfg = getattr(atom_cfg, "eplb_config", None)
+    eplb_enabled = bool(getattr(atom_cfg, "eplb_enable", False))
+    eplb_load_mode = getattr(eplb_cfg, "load_mode", "prefill")
+    local_selected_for_eplb = not ctx.context.is_dummy_run and (
+        eplb_load_mode == "all"
+        or (eplb_load_mode == "prefill" and ctx.context.is_prefill)
+        or (eplb_load_mode == "decode" and not ctx.context.is_prefill)
+    )
+
     if dp_eager_mode:
         sizes = ctx.dp_metadata.get_sizes_across_dp()
         # Eager means nothing was padded, so the context's two heights agree
@@ -476,9 +501,30 @@ def dp_gather_hidden_and_router(
             if r_dtype == hidden_states.dtype
             else router_logits.to(hidden_states.dtype)
         )
-        combined = torch.cat([hidden_states, r_for_gather], dim=-1)
+        parts = [hidden_states, r_for_gather]
+        gather_eplb_mask = (
+            eplb_enabled and getattr(ctx, "eplb_token_mask", None) is None
+        )
+        if gather_eplb_mask:
+            # A DPA step may mix prefill and decode ranks. Carry one selection
+            # bit per row in the existing variable-length collective so only
+            # source ranks chosen by EPLB load_mode contribute statistics.
+            selected = torch.full(
+                (hidden_states.shape[0], 1),
+                local_selected_for_eplb,
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            parts.append(selected)
+        combined = torch.cat(parts, dim=-1)
         combined = all_gatherv(combined, sizes, dp_group)
-        hidden_states, router_logits = combined.split([h_dim, r_dim], dim=-1)
+        if gather_eplb_mask:
+            hidden_states, router_logits, selected = combined.split(
+                [h_dim, r_dim, 1], dim=-1
+            )
+            ctx.eplb_token_mask = selected[:, 0] > 0
+        else:
+            hidden_states, router_logits = combined.split([h_dim, r_dim], dim=-1)
         hidden_states = hidden_states.contiguous()
         if router_logits.dtype != r_dtype:
             router_logits = router_logits.to(r_dtype)
@@ -487,7 +533,34 @@ def dp_gather_hidden_and_router(
         return hidden_states, router_logits, local_tokens, sizes
 
     hidden_states, local_tokens = all_gather_with_padding(hidden_states)
-    router_logits, _ = all_gather_with_padding(router_logits)
+
+    record_decode = eplb_enabled and eplb_load_mode in {"decode", "all"}
+    cached_mask = getattr(ctx, "eplb_token_mask", None)
+    if record_decode and not ctx.context.is_prefill and cached_mask is None:
+        # Decode graphs pad to a captured batch size. The attention slot map is
+        # already refreshed on every replay and marks those tail rows with -1.
+        # Gather the validity bit alongside router logits (one extra scalar per
+        # token, no extra collective) so EPLB ignores padding from every rank.
+        attn_metadata = ctx.attn_metadata
+        slot_mapping = getattr(attn_metadata, "slot_mapping", None)
+        if isinstance(slot_mapping, torch.Tensor):
+            padded_router, _ = pad_for_all_gather(router_logits)
+            local_mask = slot_mapping[: padded_router.shape[0]] >= 0
+            router_and_mask = torch.cat(
+                (padded_router, local_mask[:, None].to(padded_router.dtype)), dim=-1
+            )
+            gathered = get_dp_group().all_gather(
+                router_and_mask, use_custom=True, dim=0
+            )
+            router_logits = gathered[:, :-1].contiguous()
+            ctx.eplb_token_mask = gathered[:, -1] > 0
+        else:
+            # Backends without a slot map cannot expose dynamic graph padding.
+            # The EPLB mapper will conservatively skip decode accounting rather
+            # than train placement on arbitrary padded rows.
+            router_logits, _ = all_gather_with_padding(router_logits)
+    else:
+        router_logits, _ = all_gather_with_padding(router_logits)
     return hidden_states, router_logits, local_tokens, None
 
 
@@ -598,10 +671,30 @@ class FusedMoEMethodBase(QuantizeMethodBase):
     ) -> FusedMoEPrepareAndFinalize | None:
         from aiter.dist.parallel_state import get_ep_group
 
-        all2all_manager = get_ep_group().device_communicator.all2all_manager
-        assert all2all_manager is not None
-
         prepare_finalize: FusedMoEPrepareAndFinalize | None = None
+        ep_group = get_ep_group()
+
+        if moe.use_rccl_kernels:
+            from atom.model_ops.fused_moe.rccl_prepare_finalize import (
+                RcclPrepareAndFinalize,
+            )
+
+            return RcclPrepareAndFinalize(
+                ep_group,
+                num_local_experts=moe.num_local_experts,
+                max_tokens_per_rank=moe.max_num_tokens,
+                num_replicated_shared_experts=(
+                    moe.expert_layout.num_fused_shared_experts
+                    if moe.expert_layout.uses_dispatch_remap
+                    else 0
+                ),
+                num_routed_experts_per_rank=(
+                    moe.expert_layout.routed_physical_per_rank
+                ),
+            )
+
+        all2all_manager = ep_group.device_communicator.all2all_manager
+        assert all2all_manager is not None
 
         # TODO: could allow this now
         # assert not moe.use_flashinfer_cutlass_kernels, "Must be created in modelopt.py"
@@ -4324,6 +4417,12 @@ class FusedMoE(torch.nn.Module):
             if dp_repeat > 1:
                 hidden_states = repeat_rows(hidden_states, dp_repeat)
                 router_logits = repeat_rows(router_logits, dp_repeat)
+                eplb_mask = getattr(ctx, "eplb_token_mask", None)
+                if eplb_mask is not None:
+                    # A subsequent MoE layer sees the cached repeated mask; trim
+                    # it to the real gathered extent before repeating again.
+                    eplb_mask = eplb_mask[:gathered_rows]
+                    ctx.eplb_token_mask = repeat_rows(eplb_mask, dp_repeat)
 
             if _tbo:
                 tbo_switch_to_compute_sync()

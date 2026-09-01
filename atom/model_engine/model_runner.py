@@ -2589,13 +2589,17 @@ class ModelRunner:
             local_tbo=self._local_tbo_eligibility(batch),
             max_seqlen_q=(batch.num_spec_step + 1 if shrunk_q is None else shrunk_q),
         )
-        # Stash the DP-wide prefill OR for the EPLB prefill gate; reused free by
-        # on_forward_pass_end when the DP group == the migration (EP) group.
-        self._eplb_any_rank_has_prefill = (
-            None
-            if forward_mode.sync is None
-            else forward_mode.sync.any_rank_has_prefill
-        )
+        # Stash DP-wide real-work signals for EPLB's configurable load-mode gate.
+        # They exclude synthetic dummy ranks and reuse the step's existing packed
+        # DP metadata collective when the DP and expert-migration groups align.
+        if forward_mode.sync is None:
+            self._eplb_any_rank_has_prefill = None
+            self._eplb_any_rank_has_decode = None
+        else:
+            self._eplb_any_rank_has_prefill = (
+                forward_mode.sync.any_rank_has_real_prefill
+            )
+            self._eplb_any_rank_has_decode = forward_mode.sync.any_rank_has_decode
         total_tokens_num = batch.total_tokens_num
         assert total_tokens_num > 0
 

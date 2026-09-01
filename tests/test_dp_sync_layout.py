@@ -112,7 +112,7 @@ def test_the_prefill_flag_still_reads_as_a_flag_after_the_batch_row(monkeypatch)
 
 
 def test_the_tbo_rows_survive_the_batch_being_folded_in(monkeypatch):
-    """TBO's four fields shifted down with everything else.
+    """TBO's four fields follow the batch, mode, and dummy rows.
 
     `can_split` AND-reduces and `meets_min_tokens` OR-reduces, so reading each
     other's row inverts the gate. Pinned with the two disagreeing.
@@ -133,7 +133,7 @@ def test_the_tbo_rows_survive_the_batch_being_folded_in(monkeypatch):
     # One rank that cannot split vetoes the whole group.
     vetoed = _sync(
         monkeypatch,
-        peers=[_with(4, 0)],
+        peers=[_with(5, 0)],
         **_base(
             tbo_on=True,
             local_meets_min_tokens=True,
@@ -153,7 +153,7 @@ def test_the_dspark_block_starts_after_the_tbo_block_in_both_widths(monkeypatch)
     shifted offset reads one of the head's fields and reports it.
     """
     for tbo_on in (False, True):
-        head = 7 if tbo_on else 3
+        head = 8 if tbo_on else 4
         r = _sync(
             monkeypatch,
             peers=[_with(head, 9)],

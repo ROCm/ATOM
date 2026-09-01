@@ -21,6 +21,7 @@ except ImportError:
 import logging
 
 logger = logging.getLogger("atom")
+_WARNED_DECODE_MASK_UNAVAILABLE = False
 
 BufferCopyPlan = list[tuple[int, int]]
 
@@ -1370,6 +1371,12 @@ def count_physical_load(topk_physical: torch.Tensor, num_physical: int) -> torch
 class ExpertLoadMonitor:
     def __init__(self, *, enabled: bool, window_size: int):
         self.enabled = enabled
+        # Keep ``enabled`` stable for the process-local singleton identity.
+        # ``collecting`` can be disabled after a one-shot rebalance while EPLB
+        # remapping remains active. The fixed-address device flag is read by
+        # captured decode graphs so their histogram body becomes a cheap no-op.
+        self.collecting = enabled
+        self._recording_flag: torch.Tensor | None = None
         self.window_size = max(1, int(window_size))
         self._slot = 0
         self._filled = 0
@@ -1424,6 +1431,7 @@ class ExpertLoadMonitor:
             dtype=torch.int32,
             device=device,
         )
+        self._recording_flag = torch.ones((), dtype=torch.int32, device=device)
         self._num_layers = num_layers
         self._num_physical = num_physical
         self._device = device
@@ -1459,9 +1467,21 @@ class ExpertLoadMonitor:
         )
 
     def on_forward_start(self) -> None:
-        if not self.enabled or self._cur_pass_count is None:
+        if not self.enabled or not self.collecting or self._cur_pass_count is None:
             return
         self._cur_pass_count.zero_()
+
+    def stop_recording(self) -> None:
+        """Permanently stop load accounting while keeping EPLB remapping live."""
+        if not self.collecting:
+            return
+        self.collecting = False
+        if self._recording_flag is not None:
+            self._recording_flag.zero_()
+
+    @property
+    def recording_flag(self) -> torch.Tensor | None:
+        return self._recording_flag
 
     def pass_count_buffer(
         self, layer_id: int, num_physical: int
@@ -1470,7 +1490,7 @@ class ExpertLoadMonitor:
         if recording is disabled / uninitialized / out of capacity. Lets the
         fused EPLB map+record kernel atomic_add straight into the live buffer
         (same target as record())."""
-        if not self.enabled or self._cur_pass_count is None:
+        if not self.enabled or not self.collecting or self._cur_pass_count is None:
             return None
         if layer_id < 0 or layer_id >= self._num_layers:
             return None
@@ -1481,7 +1501,7 @@ class ExpertLoadMonitor:
     def record(
         self, *, layer_id: int, topk_physical: torch.Tensor, num_physical: int
     ) -> None:
-        if not self.enabled or layer_id < 0:
+        if not self.enabled or not self.collecting or layer_id < 0:
             return
         self._validate_record_shape(
             layer_id=layer_id,
@@ -1501,17 +1521,24 @@ class ExpertLoadMonitor:
                 tuple(topk_physical.shape),
             )
 
-    def on_forward_end(self, is_dummy_run: bool, is_pure_prefill: bool = True) -> None:
-        # Commit this pass's load to the sliding window ONLY on a real
-        # (non-dummy) pure-prefill forward -- EPLB balances on prefill load
-        # only, so decode / DP-mixed / dummy passes are dropped here. Committing
-        # is a purely local op, so gating it per-rank never desyncs the
-        # (step-driven, collective) rebalance -- lockstep is enforced separately
-        # by on_forward_pass_end, which advances on a group-uniform prefill flag.
+    def on_forward_end(
+        self,
+        is_dummy_run: bool,
+        is_pure_prefill: bool = True,
+        *,
+        should_commit: bool | None = None,
+    ) -> None:
+        # Commit only loads selected by EPLBConfig.load_mode. Selection is local:
+        # DPA ranks may run different batch modes in the same step, while the
+        # manager advances from a migration-group-uniform activity flag below.
+        # ``is_pure_prefill`` retains compatibility with the original API;
+        # new callers pass the mode-agnostic ``should_commit`` keyword.
+        commit = is_pure_prefill if should_commit is None else should_commit
         if (
             not self.enabled
+            or not self.collecting
             or is_dummy_run
-            or not is_pure_prefill
+            or not commit
             or self._cur_pass_count is None
             or self._expert_load_window is None
         ):
@@ -1610,8 +1637,8 @@ def get_live_expert_location_metadata() -> ExpertLocationMetadata | None:
 class EPLBManager:
     """Module-B scheduler/trigger manager.
 
-    Scope for now:
-    - periodic step progression on every forward (including dummy)
+    Scope:
+    - configurable prefill/decode/all load sampling and periodic progression
     - balancedness gate on module-A physical load
     - state-machine trigger for owner-provided C/D/E execution
     """
@@ -1625,6 +1652,8 @@ class EPLBManager:
         rebalance_min_balancedness: float,
         rebalance_balancedness_agg: str,
         placement_policy: str = "naive",
+        load_mode: str = "prefill",
+        max_rebalances: int = 0,
     ):
         self.enabled = enabled
         self.monitor = monitor
@@ -1632,6 +1661,8 @@ class EPLBManager:
         self.rebalance_min_balancedness = float(rebalance_min_balancedness)
         self.rebalance_balancedness_agg = str(rebalance_balancedness_agg).lower()
         self.placement_policy = str(placement_policy).lower().strip()
+        self.load_mode = str(load_mode).lower().strip()
+        self.max_rebalances = int(max_rebalances)
         assert self.rebalance_interval > 0, "eplb_rebalance_interval must be > 0"
         assert (
             self.rebalance_interval >= self.monitor.window_size
@@ -1640,9 +1671,16 @@ class EPLBManager:
             "min",
             "mean",
         ), "eplb_rebalance_balancedness_agg must be one of {'min','mean'}"
+        assert self.load_mode in (
+            "prefill",
+            "decode",
+            "all",
+        ), "eplb_load_mode must be one of {'prefill','decode','all'}"
+        assert self.max_rebalances >= 0, "eplb_max_rebalances must be >= 0"
         self._gen = self._entrypoint()
         self._rebalance_count = 0
         self._last_balancedness: float | None = None
+        self._automatic_rebalancing_frozen = False
         self.live_metadata: ExpertLocationMetadata | None = None
         self._moe_layers: dict[int, Any] = {}
         self._expert_weights_of_layer: dict[int, list[torch.Tensor]] = {}
@@ -1661,12 +1699,10 @@ class EPLBManager:
         self._nnodes: int = 1
         self._rebalance_layers_per_chunk: int = 64
         self._p2p_batch_chunk_size: int = 32
-        # True iff the DP group == the migration (EP) group. When True the DP
-        # sync's `any_rank_has_prefill` already spans exactly the migration
-        # collective, so the prefill gate reuses it for free (no extra collective).
-        # When False we OR the local prefill flag over the migration group
-        # ourselves. Resolved once in bind_runtime_owner (fail-safe default False
-        # => self-compute, which is always correct).
+        # True iff the DP group == the migration (EP) group. When True, packed DP
+        # metadata already provides group-wide real prefill/decode activity, so
+        # the load-mode gate reuses it for free. Otherwise we OR local selected
+        # activity over the migration group. Resolved once in bind_runtime_owner.
         self._dp_is_migration_group: bool = False
 
     def bind_runtime_owner(self, owner: Any) -> None:
@@ -1813,12 +1849,13 @@ class EPLBManager:
 
         logger.info(
             "EPLB runtime initialized: layers=%d num_logical=%d "
-            "num_physical=%d ep_size=%d ep_rank=%d",
+            "num_physical=%d ep_size=%d ep_rank=%d load_mode=%s",
             len(layers),
             num_logical,
             num_physical,
             ep_size,
             ep_rank,
+            self.load_mode,
         )
         self.monitor.initialize_for_metadata(self.live_metadata)
         # Initialize redundant physical slots the checkpoint loader left empty.
@@ -2049,34 +2086,58 @@ class EPLBManager:
     def last_balancedness(self) -> float | None:
         return self._last_balancedness
 
+    @property
+    def automatic_rebalancing_frozen(self) -> bool:
+        return self._automatic_rebalancing_frozen
+
     def on_forward_pass_end(
         self,
         local_has_prefill: bool,
         dp_any_has_prefill: bool | None = None,
+        local_has_decode: bool = False,
+        dp_any_has_decode: bool | None = None,
     ) -> None:
-        if not self.enabled:
+        if not self.enabled or self._automatic_rebalancing_frozen:
             return
 
-        # Resolve a migration-group-uniform has-prefill flag.
-        if self._dp_is_migration_group and dp_any_has_prefill is not None:
-            # DP group == migration group: reuse the DP sync's has-prefill OR for
-            # free (no extra collective).
-            has_prefill = dp_any_has_prefill
+        local_selected = self.should_record(local_has_prefill, local_has_decode)
+        can_reuse_dp_sync = self._dp_is_migration_group and (
+            (self.load_mode == "prefill" and dp_any_has_prefill is not None)
+            or (self.load_mode == "decode" and dp_any_has_decode is not None)
+            or (
+                self.load_mode == "all"
+                and dp_any_has_prefill is not None
+                and dp_any_has_decode is not None
+            )
+        )
+        if can_reuse_dp_sync:
+            # DP group == migration group: reuse the packed DP sync rather than
+            # inserting another per-token-step collective into decode.
+            has_selected_work = self.should_record(
+                dp_any_has_prefill, dp_any_has_decode
+            )
         else:
-            # OR the local has-prefill flag over exactly the migration collective
-            # (the group the rebalance actually runs on).
+            # OR selected real activity over exactly the group that performs the
+            # migration. Every member must advance the generator in lockstep.
             flag = torch.tensor(
-                [1 if local_has_prefill else 0], device="cuda", dtype=torch.int32
+                [1 if local_selected else 0], device="cuda", dtype=torch.int32
             )
             torch.distributed.all_reduce(
                 flag, op=torch.distributed.ReduceOp.MAX, group=self._migration_group
             )
-            has_prefill = bool(flag.item())
+            has_selected_work = bool(flag.item())
 
-        if not has_prefill:
-            # Pure-decode step across the migration group: do not advance.
+        if not has_selected_work:
             return
         next(self._gen)
+
+    def should_record(self, has_prefill: bool, has_decode: bool) -> bool:
+        """Whether a real local/group batch is selected by ``load_mode``."""
+        if self.load_mode == "prefill":
+            return has_prefill
+        if self.load_mode == "decode":
+            return has_decode
+        return has_prefill or has_decode
 
     def trigger_offline_rebalance(self, reason: str = "manual") -> None:
         if not self.enabled:
@@ -2090,16 +2151,25 @@ class EPLBManager:
             pass  # drain generator synchronously
 
     def _entrypoint(self):
-        # vllm-style warm start: the first LIVE rebalance fires after a quarter
-        # of the interval (equivalent to vllm initializing its rearrangement
-        # step counter to 3/4 of the interval), so balancing on real traffic
-        # kicks in early. Initial placement stays trivial (round-robin) until
-        # this first real-load rebalance
-        first_window = max(1, self.rebalance_interval // 4)
+        # vLLM-style warm start aims for interval/4, but never rebalance before
+        # the configured load window is full. A partial window made Agentic c96
+        # placement depend heavily on which trajectories happened to finish
+        # first and produced run-to-run regressions after migration.
+        first_window = max(1, self.monitor.window_size, self.rebalance_interval // 4)
         for _ in range(first_window):
             yield
         yield from self._rebalance()
         while True:
+            if self.max_rebalances and self._rebalance_count >= self.max_rebalances:
+                self._automatic_rebalancing_frozen = True
+                self.monitor.stop_recording()
+                logger.info(
+                    "EPLB automatic rebalancing and load recording frozen after "
+                    "%d completed rebalance(s)",
+                    self._rebalance_count,
+                )
+                while True:
+                    yield
             for _ in range(self.rebalance_interval):
                 yield
             yield from self._rebalance()
@@ -2324,6 +2394,8 @@ def get_eplb_manager(
     rebalance_min_balancedness: float,
     rebalance_balancedness_agg: str,
     placement_policy: str = "naive",
+    load_mode: str = "prefill",
+    max_rebalances: int = 0,
 ) -> EPLBManager:
     global _MANAGER
     if (
@@ -2336,6 +2408,8 @@ def get_eplb_manager(
         or _MANAGER.rebalance_balancedness_agg
         != str(rebalance_balancedness_agg).lower()
         or _MANAGER.placement_policy != str(placement_policy).lower().strip()
+        or _MANAGER.load_mode != str(load_mode).lower().strip()
+        or _MANAGER.max_rebalances != int(max_rebalances)
     ):
         _MANAGER = EPLBManager(
             enabled=enabled,
@@ -2344,6 +2418,8 @@ def get_eplb_manager(
             rebalance_min_balancedness=rebalance_min_balancedness,
             rebalance_balancedness_agg=rebalance_balancedness_agg,
             placement_policy=placement_policy,
+            load_mode=load_mode,
+            max_rebalances=max_rebalances,
         )
     return _MANAGER
 
@@ -2364,6 +2440,8 @@ def _get_configured_eplb_manager() -> EPLBManager | None:
         rebalance_min_balancedness=cfg.eplb_config.rebalance_min_balancedness,
         rebalance_balancedness_agg=cfg.eplb_config.rebalance_balancedness_agg,
         placement_policy=cfg.eplb_config.placement_policy,
+        load_mode=cfg.eplb_config.load_mode,
+        max_rebalances=cfg.eplb_config.max_rebalances,
     )
 
 
@@ -2412,28 +2490,37 @@ def with_eplb_forward_monitor(fn):
         # metadata (should not happen — init is fail-loud).
         if manager is None or manager.live_metadata is None:
             return fn(self, batch, *args, **kwargs)
+        # The learned expert map remains live, but a one-shot benchmark run no
+        # longer needs Python-side window maintenance or scheduler progression.
+        if manager.automatic_rebalancing_frozen:
+            return fn(self, batch, *args, **kwargs)
         monitor = manager.monitor
         monitor.on_forward_start()
         try:
             return fn(self, batch, *args, **kwargs)
         finally:
             is_dummy_run = getattr(batch, "is_dummy_run", False)
-            # Pure-prefill = has prefill tokens and no decode tokens (batches are
-            # not mixed today; the decode==0 check also future-proofs the TODO
-            # mixed batch). Local per-rank signal -- no DP sync needed, since only
-            # the (non-collective) window commit is gated; the step still advances.
-            is_pure_prefill = (
-                getattr(batch, "total_tokens_num_prefill", 0) > 0
-                and getattr(batch, "total_tokens_num_decode", 0) == 0
+            is_real = not is_dummy_run
+            local_has_prefill = (
+                is_real and getattr(batch, "total_tokens_num_prefill", 0) > 0
             )
-            # Recording gate commits clean load on pure-prefill only (local op).
-            monitor.on_forward_end(is_dummy_run, is_pure_prefill)
-            # Step gate advances on prefill ACTIVITY (has-prefill), reduced to a
-            # group-uniform flag. Coincides with the pure-prefill commit above
-            # under the no-mixed-batch invariant (see on_forward_pass_end).
-            local_has_prefill = getattr(batch, "total_tokens_num_prefill", 0) > 0
+            local_has_decode = (
+                is_real and getattr(batch, "total_tokens_num_decode", 0) > 0
+            )
+            monitor.on_forward_end(
+                is_dummy_run,
+                should_commit=manager.should_record(
+                    local_has_prefill, local_has_decode
+                ),
+            )
             dp_any_has_prefill = getattr(self, "_eplb_any_rank_has_prefill", None)
-            manager.on_forward_pass_end(local_has_prefill, dp_any_has_prefill)
+            dp_any_has_decode = getattr(self, "_eplb_any_rank_has_decode", None)
+            manager.on_forward_pass_end(
+                local_has_prefill=local_has_prefill,
+                dp_any_has_prefill=dp_any_has_prefill,
+                local_has_decode=local_has_decode,
+                dp_any_has_decode=dp_any_has_decode,
+            )
 
     return wrapper
 
@@ -2448,7 +2535,15 @@ def eplb_map_logical_to_physical(layer: Any, topk_ids: torch.Tensor) -> torch.Te
     """
     meta = get_live_expert_location_metadata()
     layer_id = getattr(layer, "layer_id", None)
-    if meta is None or not isinstance(layer_id, int):
+    # The target and speculative draft models share a process-local forward
+    # context, but the EPLB manager owns target-model layers only. Draft MoE
+    # layers use ids after the target range and must retain their static EP map.
+    if (
+        meta is None
+        or not isinstance(layer_id, int)
+        or layer_id < 0
+        or layer_id >= meta.num_layers
+    ):
         return topk_ids
     dispatch = meta.logical_to_rank_dispatch_physical_map[layer_id].to(
         device=topk_ids.device
@@ -2494,12 +2589,67 @@ def record_eplb_expert_load(layer: Any, topk_physical: torch.Tensor) -> None:
     )
     if num_physical <= 0:
         return
-    monitor = get_expert_load_monitor(
-        enabled=True, window_size=atom_cfg.eplb_config.load_window_size
-    )
+    monitor = _MANAGER.monitor if _MANAGER is not None else None
+    if monitor is None:
+        return
     monitor.record(
         layer_id=layer_id, topk_physical=topk_physical, num_physical=num_physical
     )
+
+
+def _eplb_record_mask(
+    topk_ids: torch.Tensor,
+) -> tuple[torch.Tensor | None, bool]:
+    """Return ``(valid_token_mask, safe_to_record)`` for the current forward.
+
+    The DPA gather path publishes a cross-rank selection mask for mixed-mode
+    steps. Decode CUDAGraphs may additionally append rows that are required for
+    a stable graph shape but do not belong to requests; their router output is
+    valid-looking and must not enter EPLB statistics. Attention's slot map is a
+    replay-safe fallback source of truth: real rows are >= 0, padding rows -1.
+    """
+    from atom.utils.forward_context import get_forward_context
+
+    ctx = get_forward_context()
+    fwd = getattr(ctx, "context", None)
+    num_rows = int(topk_ids.shape[0])
+    token_mask = getattr(ctx, "eplb_token_mask", None)
+    if isinstance(token_mask, torch.Tensor) and token_mask.numel() == num_rows:
+        return token_mask.reshape(-1).contiguous(), True
+
+    if fwd is None or getattr(fwd, "is_prefill", False):
+        return None, True
+    if not getattr(fwd, "dp_uniform_decode", True):
+        # Variable-length DPA has no padding. If it needed phase selection, the
+        # gather path would already have published a matching mask above.
+        return None, True
+
+    if token_mask is None:
+        attn_metadata = getattr(ctx, "attn_metadata", None)
+        slot_mapping = getattr(attn_metadata, "slot_mapping", None)
+        if isinstance(slot_mapping, torch.Tensor) and slot_mapping.numel() >= num_rows:
+            token_mask = slot_mapping.reshape(-1)[:num_rows] >= 0
+            ctx.eplb_token_mask = token_mask
+
+    if isinstance(token_mask, torch.Tensor) and token_mask.numel() == num_rows:
+        return token_mask.reshape(-1).contiguous(), True
+
+    # An eager/local decode with no graph padding is safe even if its attention
+    # backend does not expose slot_mapping.
+    if num_rows == int(getattr(fwd, "scheduled_tokens", -1)):
+        return None, True
+
+    global _WARNED_DECODE_MASK_UNAVAILABLE
+    if not _WARNED_DECODE_MASK_UNAVAILABLE:
+        logger.warning(
+            "EPLB decode load skipped: cannot identify real rows among %d MoE "
+            "rows (scheduled=%s, running=%s); expert routing is unaffected",
+            num_rows,
+            getattr(fwd, "scheduled_tokens", None),
+            getattr(fwd, "running_tokens", None),
+        )
+        _WARNED_DECODE_MASK_UNAVAILABLE = True
+    return None, False
 
 
 if _EPLB_HAS_TRITON:
@@ -2556,6 +2706,8 @@ if _EPLB_HAS_TRITON:
         cnt_ptr,  # [num_logical]    replica count per logical
         out_ids_ptr,  # [numel]          output physical ids (in dtype)
         load_ptr,  # [num_physical]   _cur_pass_count[layer_id]
+        recording_flag_ptr,  # scalar int32; fixed-address CUDAGraph runtime gate
+        valid_token_ptr,  # [num_tokens] bool; ignored when HAS_VALID_MASK=False
         num_logical,
         id_delta,
         num_physical,
@@ -2564,6 +2716,7 @@ if _EPLB_HAS_TRITON:
         BLOCK: tl.constexpr,
         NUM_BINS: tl.constexpr,  # next_pow2(num_physical + 1); last bins hold oob
         TOP_K: tl.constexpr,
+        HAS_VALID_MASK: tl.constexpr,
     ):
         pid = tl.program_id(0)
         offs = pid * BLOCK + tl.arange(0, BLOCK)
@@ -2586,13 +2739,22 @@ if _EPLB_HAS_TRITON:
         mapped = tl.where(need_spread, remote, mapped)
         phys = tl.where(valid, mapped, tl.where(is_tail, lid + id_delta, lid))
         tl.store(out_ids_ptr + offs, phys, mask=mask)
-        # out-of-range / masked-off lanes -> sentinel bin (== num_physical),
-        # excluded from the store below so they never touch load_ptr.
-        in_range = mask & (phys >= 0) & (phys < num_physical)
-        bin_idx = tl.where(in_range, phys, num_physical).to(tl.int32)
-        hist = tl.histogram(bin_idx, NUM_BINS)
-        bins = tl.arange(0, NUM_BINS)
-        tl.atomic_add(load_ptr + bins, hist, mask=bins < num_physical)
+        # Uniform runtime branch: after a one-shot rebalance the host clears
+        # this fixed-address flag. Already-captured decode graphs then retain
+        # remapping but skip histogram construction and atomics entirely.
+        if tl.load(recording_flag_ptr).to(tl.int1):
+            # out-of-range / masked-off lanes -> sentinel bin
+            # (== num_physical), excluded from the store below.
+            valid_token = True
+            if HAS_VALID_MASK:
+                valid_token = tl.load(
+                    valid_token_ptr + token_idx, mask=mask, other=0
+                ).to(tl.int1)
+            in_range = mask & valid_token & (phys >= 0) & (phys < num_physical)
+            bin_idx = tl.where(in_range, phys, num_physical).to(tl.int32)
+            hist = tl.histogram(bin_idx, NUM_BINS)
+            bins = tl.arange(0, NUM_BINS)
+            tl.atomic_add(load_ptr + bins, hist, mask=bins < num_physical)
 
 
 def eplb_map_and_record_fused(layer: Any, topk_ids: torch.Tensor) -> torch.Tensor:
@@ -2607,12 +2769,50 @@ def eplb_map_and_record_fused(layer: Any, topk_ids: torch.Tensor) -> torch.Tenso
     """
     meta = get_live_expert_location_metadata()
     layer_id = getattr(layer, "layer_id", None)
-    if meta is None or not isinstance(layer_id, int):
+    # MTP draft layers are not registered with the target-model EPLB manager.
+    # Leave their logical ids untouched so the caller's static expert_map is
+    # used, rather than indexing beyond the target placement table.
+    if (
+        meta is None
+        or not isinstance(layer_id, int)
+        or layer_id < 0
+        or layer_id >= meta.num_layers
+    ):
         return topk_ids
+
+    from atom.config import get_current_atom_config
+    from atom.utils.forward_context import get_forward_context
+
+    atom_cfg = get_current_atom_config()
+    eplb_enabled = bool(getattr(atom_cfg, "eplb_enable", False))
+    load_mode = getattr(atom_cfg.eplb_config, "load_mode", "prefill")
+    fwd = getattr(get_forward_context(), "context", None)
+    is_prefill = bool(getattr(fwd, "is_prefill", False))
+    monitor = _MANAGER.monitor if _MANAGER is not None else None
+    record_current_mode = (
+        eplb_enabled
+        and monitor is not None
+        and monitor.collecting
+        and (
+            load_mode == "all"
+            or (load_mode == "prefill" and is_prefill)
+            or (load_mode == "decode" and not is_prefill)
+        )
+    )
+    valid_token_mask = None
+    safe_to_record = True
+    if record_current_mode:
+        valid_token_mask, safe_to_record = _eplb_record_mask(topk_ids)
 
     if not _EPLB_HAS_TRITON:
         topk_physical = eplb_map_logical_to_physical(layer, topk_ids)
-        record_eplb_expert_load(layer, topk_physical)
+        if record_current_mode and safe_to_record:
+            to_record = (
+                topk_physical
+                if valid_token_mask is None
+                else topk_physical[valid_token_mask]
+            )
+            record_eplb_expert_load(layer, to_record)
         return topk_physical
 
     numel = topk_ids.numel()
@@ -2643,14 +2843,8 @@ def eplb_map_and_record_fused(layer: Any, topk_ids: torch.Tensor) -> torch.Tenso
     # Resolve record buffer (== _cur_pass_count[layer_id]); None disables it.
     # eplb_enable is static (server lifetime), so RECORD is a compile-time
     # constexpr -> cudagraph capture fixes it, no per-step host branch.
-    from atom.config import get_current_atom_config
-
     load_buf = None
-    atom_cfg = get_current_atom_config()
-    if bool(getattr(atom_cfg, "eplb_enable", False)):
-        monitor = get_expert_load_monitor(
-            enabled=True, window_size=atom_cfg.eplb_config.load_window_size
-        )
+    if record_current_mode and safe_to_record:
         load_buf = monitor.pass_count_buffer(layer_id, num_physical)
     record = load_buf is not None
 
@@ -2671,6 +2865,8 @@ def eplb_map_and_record_fused(layer: Any, topk_ids: torch.Tensor) -> torch.Tenso
             cnt,
             out,
             load_buf,
+            monitor.recording_flag,
+            valid_token_mask if valid_token_mask is not None else topk_c,
             num_logical,
             id_delta,
             num_physical,
@@ -2679,6 +2875,7 @@ def eplb_map_and_record_fused(layer: Any, topk_ids: torch.Tensor) -> torch.Tenso
             BLOCK=256,
             NUM_BINS=num_bins,
             TOP_K=top_k,
+            HAS_VALID_MASK=valid_token_mask is not None,
         )
     else:
         _eplb_remap_kernel[grid](
