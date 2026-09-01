@@ -96,6 +96,78 @@ vllm serve <model_name_or_path> \
     --kv-transfer-config '{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both"}'
 ```
 
+### GLM-5.2 on MI355X
+
+GLM-5.2 has two heterogeneous cache groups in the ATOM vLLM backend:
+
+- 78 MLA latent-cache layers with head size 576
+- 21 DSA index-cache layers with head size 132
+
+ATOM automatically selects LMCache GPU connector V3 for
+`GlmMoeDsaForCausalLM` and `DeepseekV32ForCausalLM`. The external/latest
+LMCache adapter is required; do not set `use_native=true`, disable V3, or enable
+LMCache layerwise mode for these models.
+
+The LMCache build must discover and register V3 KV layer groups before
+initializing its `StorageManager`. An unadapted build fails on the first save
+with either `shape (99) into shape (78)` or `group_prefix_sum` errors. Use a
+build that includes heterogeneous V3 pre-registration support before following
+this section.
+
+The following configuration was validated with `amd/GLM-5.2-MXFP4` on 4×
+MI355X:
+
+```bash
+export MODEL_PATH=/data/amd_int/models/GLM-5.2-MXFP4
+
+export PYTHONHASHSEED=0
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export AITER_USE_FLYDSL_MOE_SORTING=1
+
+export LMCACHE_LOCAL_CPU=True
+export LMCACHE_MAX_LOCAL_CPU_SIZE=64.0
+export LMCACHE_CHUNK_SIZE=256
+
+vllm serve "${MODEL_PATH}" \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --async-scheduling \
+    --load-format fastsafetensors \
+    --trust-remote-code \
+    --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE"}' \
+    --kv-cache-dtype fp8 \
+    --tensor-parallel-size 4 \
+    --max-model-len 8192 \
+    --max-num-seqs 4 \
+    --max-num-batched-tokens 8192 \
+    --gpu-memory-utilization 0.9 \
+    --enable-prefix-caching \
+    --additional-config \
+      '{"online_quant_config":{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","*expert*"]}}' \
+    --kv-transfer-config \
+      '{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both"}'
+```
+
+At startup, each worker should report both layer groups and the V3 connector:
+
+```text
+ATOM DSA model: enabled LMCache GPU connector V3 ...
+KV layer groups: [... layers=78 ... hs=576 ..., ... layers=21 ... hs=132 ...]
+init kv cache pointers success in VLLMPagedMemGPUConnectorV3
+```
+
+For an end-to-end load check, temporarily set `VLLM_SERVER_DEV_MODE=1` before
+launching. Send a long prompt once, then clear only the HBM prefix cache:
+
+```bash
+curl -X POST http://127.0.0.1:8000/reset_prefix_cache
+```
+
+Send the same prompt again and check `/metrics`. A nonzero increase in
+`vllm:external_prefix_cache_hits_total` with no increase in
+`vllm:prefix_cache_hits_total` proves that the request was restored from
+LMCache rather than HBM. Do not enable the development API in production.
+
 ### CPU DRAM + NVMe Offload (L2 + L3 tiers)
 
 Add NVMe disk as a third caching tier below CPU DRAM:
@@ -161,7 +233,10 @@ Use `--seed` for reproducible trace assignment when comparing configurations.
 LMCache works through vLLM's KV connector interface and is model-agnostic. It has been tested with:
 
 - **MiniMax-M2.5** (MoE, TP=2/4)
-- Other models supported by the ATOM vLLM plugin should work without modification
+- **GLM-5.2-MXFP4** (DSA/IndexShare, TP=4 on MI355X)
+- Models with heterogeneous or compressed KV-cache groups require explicit
+  connector support and must not be assumed compatible solely because the base
+  architecture can run in vLLM.
 
 ## References
 
