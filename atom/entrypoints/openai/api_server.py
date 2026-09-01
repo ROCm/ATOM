@@ -2565,6 +2565,25 @@ def main():
         reasoning_dialect.think_end_marker,
         "" if _dialect_stated else " (no dialect named in the chat template)",
     )
+    if (
+        args.spec_decode_acceptance_length is not None
+        or args.spec_decode_acceptance_rate is not None
+    ):
+        # Forced acceptance emits unverified draft tokens, which degenerate into
+        # nothing but this dialect's own channel framing once the context is long
+        # enough. Read as structure -- correctly -- that leaves a response with no
+        # content at all, and a client that requires some rejects the run. The
+        # text is already declared meaningless in this mode, so fall back to the
+        # dialect-blind filter, which leaks the framing as text and keeps the
+        # response non-empty. Nothing outside a forced-acceptance run sees this.
+        reasoning_dialect = None
+        logger.warning(
+            "Forced speculative acceptance is on, so reasoning is separated with "
+            "the dialect-blind fallback and this model's channel framing reaches "
+            "the client as text. Throughput stays measurable; the text was "
+            "already meaningless. Unset --spec-decode-acceptance-length / "
+            "--spec-decode-acceptance-rate to read reasoning properly again."
+        )
     model_starts_in_reasoning = template_opens_reasoning_implicitly(_template_source)
     if model_starts_in_reasoning:
         logger.info(
