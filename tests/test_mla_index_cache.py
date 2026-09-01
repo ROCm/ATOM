@@ -86,6 +86,10 @@ def _builder(
         ),
         block_size=16,
         is_deepseek_v32=True,
+        # allocate_kv_cache_tensors() sets this on the real ModelRunner
+        # (index_head_dim + one fp32 scale, rounded up to 16 bytes); the
+        # transfer-region builder divides page bytes by it.
+        aligned_index_dim=((index_head_dim + 4 + 15) // 16) * 16,
         _get_total_num_layers=lambda: total_local_layers,
     )
     builder = object.__new__(AiterMLAMetadataBuilder)
@@ -234,28 +238,29 @@ class _FakeCacheSlice:
 
 
 class _FakeTransferTensor:
-    def __init__(self, address):
+    def __init__(self, address, page_stride=1):
         self._address = address
+        self._page_stride = page_stride
 
     def stride(self, dim):
         assert dim == 0
-        return 1
+        return self._page_stride
 
     def element_size(self):
         return 1
 
     def numel(self):
-        return 8
+        return 8 * self._page_stride
 
     def data_ptr(self):
         return self._address
 
 
 class _FakeTransferStack:
-    def __init__(self, num_layers, address_base):
+    def __init__(self, num_layers, address_base, page_stride=1):
         self.shape = (num_layers,)
         self._layers = [
-            _FakeTransferTensor(address_base + layer_id)
+            _FakeTransferTensor(address_base + layer_id, page_stride)
             for layer_id in range(num_layers)
         ]
 
@@ -333,13 +338,20 @@ def test_transfer_regions_use_explicit_compact_consumer_map(monkeypatch):
     _mock_pp(monkeypatch, rank=1, world_size=2)
     builder.block_ratio = 1
     runner.kv_cache = _FakeTransferStack(4, 100)
-    runner.index_cache = _FakeTransferStack(3, 200)
+    # One index page is block_size tokens of aligned_index_dim bytes.
+    runner.index_cache = _FakeTransferStack(3, 200, page_stride=16 * 144)
     runner.index_cache_layer_ids = (3, 5, 6)
     runner.config.num_kvcache_blocks = 8
 
     transfer_tensors = builder.get_kv_transfer_tensors()
 
     assert len(transfer_tensors.block_regions) == 7
+    # The three index regions follow the four MLA KV regions. Each page holds
+    # 16 keys of index_head_dim bytes plus 16 fp32 scales; the rest of
+    # aligned_index_dim is padding and is not part of either plane.
+    index_regions = transfer_tensors.block_regions[4:]
+    assert [r.key_plane_bytes for r in index_regions] == [16 * 128] * 3
+    assert [r.scale_plane_bytes for r in index_regions] == [16 * 4] * 3
     assert transfer_tensors.block_region_consumer_indices == [
         3,
         4,
