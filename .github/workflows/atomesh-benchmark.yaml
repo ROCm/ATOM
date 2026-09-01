@@ -970,7 +970,15 @@ jobs:
           slurm_status_file="${run_dir}/slurm-job.rc"
           rm -f "${slurm_status_file}" "${slurm_status_file}.tmp"
           batch_script="${run_dir}/rdma-smoke.sbatch.sh"
-          cat > "${batch_script}" <<EOF
+          if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
+            # Spur launches this script on each node with SPUR_TASK_OFFSET; srun is unavailable.
+            cat > "${batch_script}" <<EOF
+          #!/usr/bin/env bash
+          set -euo pipefail
+          exec "${rank_script}"
+          EOF
+          else
+            cat > "${batch_script}" <<EOF
           #!/usr/bin/env bash
           set -euo pipefail
           set +e
@@ -982,6 +990,7 @@ jobs:
           mv "${slurm_status_file}.tmp" "${slurm_status_file}"
           exit "\${srun_rc}"
           EOF
+          fi
           chmod +x "${batch_script}"
 
           sbatch_cmd=(
