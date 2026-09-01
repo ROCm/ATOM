@@ -587,6 +587,10 @@ class AttentionMetaData:
     # prefill/MTP-verify and per seq in decode. Separate from kv_last_page_lens
     # (the dense per-seq buffer) so the two never clobber each other.
     sparse_kv_last_page_lens: torch.Tensor | None = None
+    # Absolute addresses into the replicated DSA index cache, one per query
+    # token. Its presence is the switch: not None makes the indexer use it in
+    # place of slot_mapping, None leaves the dcp-sharded index layout.
+    index_slot_mapping: torch.Tensor | None = None
 
     work_meta_data: torch.Tensor | None = None
     work_indptr: torch.Tensor | None = None
