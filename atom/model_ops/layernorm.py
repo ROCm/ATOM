@@ -29,7 +29,6 @@ from atom.quant_spec import LayerQuantConfig, should_skip_online_quant
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
 
-_use_model_sensitive_rmsnorm = envs.ATOM_USE_MODEL_SENSITIVE_RMSNORM
 _rmsnorm2d_fwd_supports_model_sensitive: bool | None = None
 _rmsnorm2d_fwd_with_add_supports_model_sensitive: bool | None = None
 
@@ -68,7 +67,7 @@ def rmsnorm2d_fwd_(
     ori_shape = x.shape
     x = x.reshape(-1, dim)
     if (
-        _use_model_sensitive_rmsnorm
+        envs.ATOM_USE_MODEL_SENSITIVE_RMSNORM
         and _rmsnorm2d_fwd_supports_model_sensitive is not False
     ):
         try:
@@ -100,7 +99,7 @@ def rmsnorm2d_fwd_with_add_(
     out = torch.empty_like(x)
     residual_out = torch.empty_like(x)
     if (
-        _use_model_sensitive_rmsnorm
+        envs.ATOM_USE_MODEL_SENSITIVE_RMSNORM
         and _rmsnorm2d_fwd_with_add_supports_model_sensitive is not False
     ):
         try:
