@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import importlib.util
 import itertools
 import logging
 import time
@@ -62,6 +63,30 @@ class LLMEngine:
                     data_parallel_master_port
                 )
         self.data_parallel_size = config.parallel_config.data_parallel_size
+        # TBO's two concurrent ubatches are supported by the mori EP
+        # dispatch/combine path. The EP collective fallback instead issues
+        # full DP all-gather/reduce-scatter operations from both ubatch streams;
+        # those streams can enter the collectives in opposite order and hang.
+        # Keep the fallback usable by serializing it until it has dedicated
+        # per-ubatch communicators, analogous to the PCP/TP guard below.
+        mori_ep_enabled = (
+            getattr(config, "moe_all2all_backend", "auto") in {"auto", "mori"}
+            and not envs.ATOM_DISABLE_MORI_EP
+            and importlib.util.find_spec("mori") is not None
+        )
+        if (
+            config.enable_dp_attention
+            and config.enable_expert_parallel
+            and config.enable_tbo
+            and not mori_ep_enabled
+        ):
+            logger.warning(
+                "Disabling TBO for the DP-attention + EP collective fallback: "
+                "concurrent all-gather/reduce-scatter ubatches can deadlock. "
+                "Use mori EP or run the fallback without --enable-tbo."
+            )
+            config.enable_tbo = False
+            config.enable_tbo_decode = False
         # PCP and DP-attention are not yet compatible: PCP stripe-splits
         # input_ids to 1/pcp_size in ForCausalLM.forward, but DP-attention's
         # `_gather_ids_for_dp` all-gathers using dp_metadata sizes computed on

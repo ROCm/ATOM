@@ -33,6 +33,42 @@ Tips on server configuration:
 - Clear compile cache before restarting after code changes: `rm -rf /root/.cache/atom/*`
 - V4-Pro reuses the DeepSeek-V3 config schema; V4-specific fields (compress ratios, hash layers, index head dims) are read from the HF config automatically.
 
+### Experimental native RCCL routed MoE
+
+ATOM can run expert dispatch/combine without MoRI through a native RCCL
+backend. Uniform decode uses a graph-safe pre-routed AllGather/ReduceScatter
+fast path. When DP and EP have the same width, prefill and mixed batches reuse
+the scheduler's token counts for variable-size AllGather/ReduceScatter; other
+topologies use variable-split routed `torch.distributed.all_to_all_single`:
+
+```bash
+AITER_BF16_FP8_MOE_BOUND=0 ATOM_MOE_GU_ITLV=1 AITER_LOG_LEVEL=WARNING \
+python -m atom.entrypoints.openai_server \
+  --model deepseek-ai/DeepSeek-V4-Pro \
+  --kv_cache_dtype fp8 -tp 8 \
+  --enable-expert-parallel --enable-dp-attention \
+  --all2all-backend rccl
+```
+
+The backend consumes the physical expert IDs produced by the existing routing
+and remapping path; it does not change EPLB policy or load accounting.
+Uniform decode packs hidden states plus compact top-k IDs/weights into one
+AllGather payload instead of gathering full router logits, runs the existing
+local fused expert kernel, and reduce-scatters the result.
+The variable-size path routes once on each source rank, gathers the packed
+hidden/ID/weight rows, runs the same local expert kernel, then reduce-scatters
+partial outputs to source-token order. Routed-expert IDs are preserved. Locally
+replicated shared experts are computed exactly once rather than once on every
+rank, and their owner is reassigned round-robin by global token row so one DPA
+rank with an unusually long request cannot hotspot its local shared-expert GEMM.
+
+The prefill/mixed path remains correctness-first rather than a MoRI performance
+replacement: the packed hidden/ID/weight payload is not yet produced by a fused
+GPU kernel, and wider flattened DP*TP expert groups still use the dynamic
+all-to-all fallback. TBO is not supported and is disabled for this backend. Use
+`--all2all-backend none` to select the original AllGather/ReduceScatter path, or
+omit the option to preserve automatic MoRI detection.
+
 ### MegaMoE fused MoE backend (`--moe-backend mega`)
 
 The routed-MoE implementation is selectable with `--moe-backend {standard,mega}`
