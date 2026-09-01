@@ -144,24 +144,22 @@ class MLAChunkContextMetadata:
     # --- DCP (Decode Context Parallel) prefill fields ---
     # Present only when dcp_world_size > 1. The cached context KV is sharded
     # (interleaved) across DCP ranks, so per chunk each rank gathers its local
-    # compressed KV via `local_slot_ids`, AllGathers, and `reorg_kvcache`
+    # compressed KV via `local_slot_ids`, AllGathers, and `ag_row_indices`
     # rebuilds the per-sequence contiguous layout. `cu_seqlens_k` above then
     # holds the GLOBAL per-seq chunk lengths (post-reorg) for flash attention.
     is_dcp: bool = False
     # Per chunk: absolute slot ids of this rank's local cached tokens, laid out
-    # per-seq contiguous and padded to `padded_local_chunk_seq_lens` (so every
-    # rank's AllGather block has identical `seq_tot` tokens).
+    # per-seq contiguous and padded so every rank's AllGather block has
+    # identical `seq_tot` tokens.
     local_slot_ids: list[torch.Tensor] | None = None
-    # Per chunk: per-seq padded local chunk length (list[list[int]]).
-    padded_local_chunk_seq_lens: list[list[int]] | None = None
-    # Per seq: real local context length on each rank (list[list[int]]), shared
-    # across chunks; used by reorg to drop padding.
-    local_context_lens_allranks: list[list[int]] | None = None
-    # Per chunk: number of local tokens per rank in the AllGather block (== sum
-    # of that chunk's padded_local_chunk_seq_lens).
+    # Per chunk: the reorg as a row map into the `[seq_tot * dcp, d]` AllGather
+    # buffer, per-seq contiguous and rank-major within a seq (length ==
+    # `total_tokens[c]`). Doubles as the fused gather's `kv_indices`, which is
+    # what lets the reorg, dequant, kv_b_proj and k_pe concat collapse into one
+    # kernel -- see `dcp_reorg_row_indices`.
+    ag_row_indices: list[torch.Tensor] | None = None
+    # Per chunk: number of local tokens per rank in the AllGather block.
     seq_tot: list[int] | None = None
-    # Local padded max context chunk size (local tokens per seq per chunk).
-    chunk_size: int | None = None
 
 
 def cdiv(a, b):
@@ -1523,23 +1521,26 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         `(g // (S*W)) * S + g % S` (S = cp_kv_cache_interleave_size; S=1 = the
         original round-robin `g % W` / `g // W`). This builder produces, per
         chunk, the metadata to (1) index_select this rank's local cached tokens,
-        (2) AllGather them, and (3) `reorg_kvcache` them into per-sequence
-        contiguous layout. `reorg_kvcache` needs only the per-rank *counts*
-        (from `get_dcp_local_seq_lens(..., S)`), not S-aware ordering: the cached
+        (2) AllGather them, and (3) reorg them into per-sequence contiguous
+        layout. The reorg needs only the per-rank *counts* (from
+        `get_dcp_local_seq_lens(..., S)`), not S-aware ordering: the cached
         context is fully visible (no causal mask) so attention is permutation-
-        invariant over it, and RoPE travels with each key — the existing S=1
-        reorg already emits a non-global order and is correct, so any S is too.
+        invariant over it, and RoPE travels with each key — the S=1 reorg
+        already emits a non-global order and is correct, so any S is too.
 
         Chunking is per-seq (plugin-style, not the global-axis chunking of the
         non-DCP builder): each chunk covers a `chunk_size`-token local window
-        [c*chunk_size, (c+1)*chunk_size) of every sequence, so `reorg_kvcache`
-        (which assumes a uniform per-rank block) can rebuild the layout.
+        [c*chunk_size, (c+1)*chunk_size) of every sequence, which is what makes
+        every rank's AllGather block the same size.
 
         Local token `p` of a sequence maps to physical slot
         `block_table[p // block_size] * block_size + (p % block_size)` — the
         same contiguous local packing used by the Phase-1 slot_mapping writes.
         """
-        from atom.model_ops.dcp_ops import get_dcp_local_seq_lens
+        from atom.model_ops.dcp_ops import (
+            dcp_reorg_row_indices,
+            get_dcp_local_seq_lens,
+        )
 
         dcp = self.dcp_world_size
         bsz = self.model_runner.block_size
@@ -1551,8 +1552,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             return None
         num_with_context = int((cached_lens > 0).sum())
 
-        # Real local context length per (seq, rank). Shared across chunks;
-        # reorg uses it to drop the per-seq padding.
+        # Real local context length per (seq, rank). Shared across chunks; the
+        # reorg row map uses it to drop the per-seq padding.
         s_itl = self.cp_kv_cache_interleave_size
         local_lens_allranks = np.stack(
             [get_dcp_local_seq_lens(cached_lens, dcp, r, s_itl) for r in range(dcp)],
@@ -1581,9 +1582,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         block_tables = batch.block_tables
 
         local_slot_ids_list: list[torch.Tensor] = []
+        ag_row_indices_list: list[torch.Tensor] = []
         cu_seqlens_k_list: list[torch.Tensor] = []
         total_tokens_list: list[int] = []
-        padded_local_chunk_seq_lens_list: list[list[int]] = []
         seq_tot_list: list[int] = []
         max_seqlen_k_list: list[int] = []
 
@@ -1607,8 +1608,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             cu_seqlens_k_list.append(upload_numpy(cu, self.device))
             total_tokens_list.append(int(cu[-1]))
             max_seqlen_k_list.append(int(global_chunk_len.max(initial=0)))
-            padded_local_chunk_seq_lens_list.append(plc.astype(np.int32).tolist())
             seq_tot_list.append(int(plc.sum()))
+            ag_row_indices_list.append(
+                upload_numpy(dcp_reorg_row_indices(plc, real_local_chunk), self.device)
+            )
 
             # This rank's local slot ids for the chunk, per-seq padded to plc[i].
             slot_segments: list[np.ndarray] = []
@@ -1638,10 +1641,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             v_workspace=self.v_chunk_workspace,
             is_dcp=True,
             local_slot_ids=local_slot_ids_list,
-            padded_local_chunk_seq_lens=padded_local_chunk_seq_lens_list,
-            local_context_lens_allranks=local_lens_allranks.tolist(),
+            ag_row_indices=ag_row_indices_list,
             seq_tot=seq_tot_list,
-            chunk_size=int(chunk_size),
         )
 
     def _apply_pcp_reindex(
