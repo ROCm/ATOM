@@ -2469,6 +2469,8 @@ class ModelRunner:
         batch: ScheduledBatch,
         input_ids: torch.Tensor,
         forward_mode: ForwardMode,
+        attn_host_preparation: Any | None = None,
+        spec_decode_metadata: Any | None = None,
     ):
         # Always supplied, settled in `prepare_model` (which is where the reason
         # lives). The q-bucket shrink ran there too, so `batch` is already
@@ -2487,9 +2489,10 @@ class ModelRunner:
         if not tbo_collective_active:
             self._pcp_tbo_balanced_active = False
 
-        self.forward_vars["cu_seqlens_q"].np[1 : scheduled_bs + 1] = cu_seqlens_q
+        if attn_host_preparation is None:
+            self.forward_vars["cu_seqlens_q"].np[1 : scheduled_bs + 1] = cu_seqlens_q
 
-        if not is_prefill:
+        if not is_prefill and attn_host_preparation is None:
             assert forward_mode.running_bs >= scheduled_bs, (
                 f"running_bs={forward_mode.running_bs} < "
                 f"scheduled_bs={scheduled_bs}; ForwardMode.decide invariant violated"
@@ -2505,12 +2508,39 @@ class ModelRunner:
         # sizes everything per-sequence, `running_tokens` everything per-row.
         running_bs = forward_mode.running_bs
         running_tokens = forward_mode.running_tokens
-        attn_metadata, positions = self.attn_metadata_builder.build(
-            batch=batch,
-            running_bs=running_bs,
-            running_tokens=running_tokens,
-            max_seqlen_q=forward_mode.max_seqlen_q,
-        )
+
+        # This metadata depends on the local scheduled batch and staged input
+        # ids only. Build it before the attention builder joins its early prep
+        # stream, so its small H2Ds and index-select can overlap the DSV4
+        # metadata uploads instead of extending the decode launch tail.
+        if (
+            spec_decode_metadata is None
+            and not is_prefill
+            and hasattr(self, "drafter")
+            and not batch.is_dummy_run
+        ):
+            decode_bs = batch.total_seqs_num_decode
+            spec_decode_metadata = self.drafter.calc_spec_decode_metadata(
+                num_scheduled_tokens[:decode_bs],
+                cu_seqlens_q[:decode_bs],
+                input_ids,
+            )
+
+        if attn_host_preparation is None:
+            attn_metadata, positions = self.attn_metadata_builder.build(
+                batch=batch,
+                running_bs=running_bs,
+                running_tokens=running_tokens,
+                max_seqlen_q=forward_mode.max_seqlen_q,
+            )
+        else:
+            attn_metadata, positions = self.attn_metadata_builder.build(
+                batch=batch,
+                running_bs=running_bs,
+                running_tokens=running_tokens,
+                max_seqlen_q=forward_mode.max_seqlen_q,
+                host_preparation=attn_host_preparation,
+            )
         context = Context(
             positions=positions,
             is_prefill=is_prefill,
@@ -2522,15 +2552,6 @@ class ModelRunner:
             running_tokens_are_unified=running_tokens_are_unified,
             forward_mode=forward_mode,
         )
-
-        spec_decode_metadata = None
-        if not is_prefill and hasattr(self, "drafter") and not batch.is_dummy_run:
-            scheduled_bs = batch.total_seqs_num_decode
-            spec_decode_metadata = self.drafter.calc_spec_decode_metadata(
-                num_scheduled_tokens[:scheduled_bs],
-                cu_seqlens_q[:scheduled_bs],
-                input_ids,
-            )
 
         pcp_size = self.config.prefill_context_parallel_size
         _pcp_tbo_balanced = (
@@ -2700,17 +2721,45 @@ class ModelRunner:
             )
 
         input_ids = None
+        attn_host_preparation = None
+        spec_decode_metadata = None
         if preparation.dp_sync is not None:
             # These values and copies depend only on the local ScheduledBatch.
             # Run them while the metadata stream executes H2D -> RCCL -> D2H,
             # and wait only before ForwardMode reads the gathered host buffer.
-            temperatures, top_ks, top_ps, all_greedy, needs_independent_noise = (
-                self.prepare_sample(batch)
-            )
             if not is_block_drafter:
                 input_ids = self.tokenID_processor.prepare_input_ids(
                     batch, preparation.max_seqlen_q
                 )
+            prepare_decode_host = getattr(
+                self.attn_metadata_builder, "prepare_decode_host", None
+            )
+            if (
+                prepare_decode_host is not None
+                and not is_block_drafter
+                and batch.total_tokens_num_prefill == 0
+            ):
+                with record_function("dsv4.prepare_decode_host_early"):
+                    attn_host_preparation = prepare_decode_host(
+                        batch, preparation.max_seqlen_q
+                    )
+            if (
+                input_ids is not None
+                and batch.total_tokens_num_prefill == 0
+                and hasattr(self, "drafter")
+                and not batch.is_dummy_run
+            ):
+                num_scheduled_tokens = np.asarray(batch.num_scheduled_tokens)
+                cu_seqlens_q, _ = self._get_cumsum_and_arange(num_scheduled_tokens)
+                decode_bs = batch.total_seqs_num_decode
+                spec_decode_metadata = self.drafter.calc_spec_decode_metadata(
+                    num_scheduled_tokens[:decode_bs],
+                    cu_seqlens_q[:decode_bs],
+                    input_ids,
+                )
+            temperatures, top_ks, top_ps, all_greedy, needs_independent_noise = (
+                self.prepare_sample(batch)
+            )
             with record_function("dp_metadata.finish_wait"):
                 sync = finish_sync_dp_metadata(preparation.dp_sync)
             forward_mode = _decide(sync)
@@ -2735,7 +2784,13 @@ class ModelRunner:
             input_ids = self.tokenID_processor.prepare_input_ids(
                 batch, forward_mode.max_seqlen_q
             )
-        self.prepare_inputs(batch, input_ids, forward_mode=forward_mode)
+        self.prepare_inputs(
+            batch,
+            input_ids,
+            forward_mode=forward_mode,
+            attn_host_preparation=attn_host_preparation,
+            spec_decode_metadata=spec_decode_metadata,
+        )
 
         # Stage the speculative inputs while this forward's normal staging
         # window is still open.  Both buffers are pinned and reused, so copying

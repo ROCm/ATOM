@@ -148,11 +148,28 @@ def test_device_metadata_wait_is_hidden_by_local_input_staging():
     device_body = ast.Module(body=device_branch.body, type_ignores=[])
     sample = _attribute_calls(device_body, "prepare_sample")
     input_ids = _attribute_calls(device_body, "prepare_input_ids")
+    decode_host = _name_calls(device_body, "prepare_decode_host")
+    spec_decode = _attribute_calls(device_body, "calc_spec_decode_metadata")
     finish = _name_calls(device_body, "finish_sync_dp_metadata")
     decide = _name_calls(device_body, "_decide")
 
-    assert len(sample) == len(input_ids) == len(finish) == len(decide) == 1
-    assert sample[0].lineno < input_ids[0].lineno < finish[0].lineno < decide[0].lineno
+    assert (
+        len(sample)
+        == len(input_ids)
+        == len(decode_host)
+        == len(spec_decode)
+        == len(finish)
+        == len(decide)
+        == 1
+    )
+    assert (
+        input_ids[0].lineno
+        < decode_host[0].lineno
+        < spec_decode[0].lineno
+        < sample[0].lineno
+        < finish[0].lineno
+        < decide[0].lineno
+    )
 
 
 def test_deferred_scheduler_output_precedes_current_draft_submission():
