@@ -1715,10 +1715,10 @@ def _run_rtp_sparse_attn_indexer_topk_only(
         return weights
 
     max_seqlen_q = int(getattr(attn_metadata, "max_seqlen_q", 1) or 1)
-    num_decode_tokens = int(context.batch_size) * max_seqlen_q
+    num_decode_tokens = int(context.scheduled_bs) * max_seqlen_q
     kv_cache_for_logits = kv_cache.unsqueeze(-2)
     padded_q_fp8_decode_tokens = q_fp8[:num_decode_tokens].reshape(
-        int(context.batch_size), -1, *q_fp8.shape[1:]
+        int(context.scheduled_bs), -1, *q_fp8.shape[1:]
     )
     batch_size, next_n, _heads, _dim = padded_q_fp8_decode_tokens.shape
     logits = torch.empty(
@@ -1770,6 +1770,8 @@ def rtp_sparse_attn_indexer(
     max_model_len: int,
     total_seq_lens: int,
     topk_indices_buffer: torch.Tensor,
+    dcp_sparse_kv_indptr_buffer: torch.Tensor,
+    dcp_owned_counts_buffer: torch.Tensor,
     k_norm_weight: torch.Tensor,
     k_norm_bias: torch.Tensor,
     k_norm_eps: float,
@@ -1829,6 +1831,8 @@ def rtp_sparse_attn_indexer(
             return weights
 
     if context is not None and attn_metadata is not None:
+        # rtp-llm never runs DCP, so the compact offsets/counts buffers stay
+        # empty placeholders and this top-k-only path leaves them untouched.
         return _run_rtp_sparse_attn_indexer_topk_only(
             hidden_states,
             kv_cache,
@@ -1872,6 +1876,8 @@ def rtp_sparse_attn_indexer(
         max_model_len,
         total_seq_lens,
         topk_indices_buffer,
+        dcp_sparse_kv_indptr_buffer,
+        dcp_owned_counts_buffer,
         k_norm_weight,
         k_norm_bias,
         k_norm_eps,
@@ -1899,6 +1905,8 @@ def rtp_sparse_attn_indexer_fake(
     max_model_len: int,
     total_seq_lens: int,
     topk_indices_buffer: torch.Tensor,
+    dcp_sparse_kv_indptr_buffer: torch.Tensor,
+    dcp_owned_counts_buffer: torch.Tensor,
     k_norm_weight: torch.Tensor,
     k_norm_bias: torch.Tensor,
     k_norm_eps: float,
@@ -1926,6 +1934,8 @@ def rtp_sparse_attn_indexer_fake(
         max_model_len,
         total_seq_lens,
         topk_indices_buffer,
+        dcp_sparse_kv_indptr_buffer,
+        dcp_owned_counts_buffer,
         k_norm_weight,
         k_norm_bias,
         k_norm_eps,
@@ -1942,6 +1952,10 @@ def rtp_sparse_attn_indexer_fake(
 direct_register_custom_op(
     op_name="rtp_sparse_attn_indexer",
     op_func=rtp_sparse_attn_indexer,
-    mutates_args=["topk_indices_buffer"],
+    mutates_args=[
+        "topk_indices_buffer",
+        "dcp_sparse_kv_indptr_buffer",
+        "dcp_owned_counts_buffer",
+    ],
     fake_impl=rtp_sparse_attn_indexer_fake,
 )
