@@ -587,6 +587,20 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler):
             and sid not in self._save_inflight
             and self._has_pending_save(seq)
         ):
+            # Dropping the tracker entry here is load-bearing, not a tidy-up.
+            # Returning False lets the caller free the blocks, and on the
+            # preemption path (`Scheduler.preempt`) that free is a
+            # `block_manager.deallocate` with no `request_finished` call -- so
+            # nothing else removes this sid from `_save_tracker`. Left in, the
+            # base save loop would later (once the stall clears and
+            # `_may_emit_save` re-opens) emit a save reading `seq.block_table`,
+            # whose blocks are now freed and possibly reused: silent cross-prefix
+            # corruption. The loop does not re-check liveness, so the entry has
+            # to go the moment its blocks are surrendered. Dropping a stalled
+            # save is the intended outcome (this request's KV goes un-offloaded
+            # rather than wedging the engine), and `abandon_save` drops the
+            # matching `_save_inflight` entry on the handed-out twin for the same
+            # reason.
             self._save_tracker.pop(sid, None)
             return False
         return super().should_defer_free(seq)
