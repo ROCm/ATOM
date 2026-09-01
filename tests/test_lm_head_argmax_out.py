@@ -1,7 +1,11 @@
 import pytest
 import torch
 
-from atom.model_ops import embed_head
+embed_head = pytest.importorskip(
+    "atom.model_ops.embed_head",
+    reason="embed_head requires the Triton/AITER runtime",
+    exc_type=ImportError,
+)
 
 
 def _tp1_head(logits: torch.Tensor, monkeypatch) -> embed_head.ParallelLMHead:
