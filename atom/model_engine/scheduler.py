@@ -2127,6 +2127,24 @@ class Scheduler:
         if settle is not None:
             settle(req_id, ok=ok)
 
+    def _abandon_state_load(self, req_id) -> None:
+        """Release a state group a load reserved *without* voting the outcome.
+
+        The 'neither outcome' release, for a joint load whose state H2D landed
+        intact but whose KV leg failed (an LMCache LRU miss on the KV chunk).
+        Settling that as a failure would call `StateOffloadIndex.fail_load` and
+        `forget(h)`, permanently un-advertising a state image whose bytes are
+        still present -- the next request over that prefix could have reloaded
+        it. `abandon_load` pops the pending reservation and releases the orphan
+        slot but keeps the hash loadable. Same guards as `_settle_state_load`:
+        no-op for an id the state index never issued and for a scheduler built
+        without a block manager (the connector test doubles)."""
+        abandon = getattr(
+            getattr(self, "block_manager", None), "abandon_state_load", None
+        )
+        if abandon is not None:
+            abandon(req_id)
+
     def _state_store_pending_cap(self) -> int:
         """The running-plus-queued cap for state-tier stores.
 
@@ -3095,6 +3113,18 @@ class Scheduler:
                 continue
             self.finished_recving_kv_req_ids.append(req_id)
 
+        # A joint load can fail on its KV leg alone while its state H2D landed
+        # intact (an LMCache LRU miss dropping the KV chunk). The connector
+        # advertises those survivors on a failure-dominant, TP-quorumed
+        # disposition channel, drained here on the same step the KV failure
+        # report arrives: a survivor is *abandoned* (pending released, hash
+        # kept loadable) rather than *failed* (hash forgotten). Everything else
+        # -- a genuine state-leg miss, or a connector that never advertises the
+        # channel -- still settles as a failure.
+        state_survived = getattr(
+            self.kv_connector, "take_state_load_survived", None
+        )
+        state_survived = state_survived() if state_survived is not None else set()
         for req_id in kv_connector_output.failed_loading or ():
             assert (
                 is_offload
@@ -3103,7 +3133,10 @@ class Scheduler:
                 "Offload KV load failed for request %s; falling back to prefill.",
                 req_id,
             )
-            self._settle_state_load(req_id, ok=False)
+            if req_id in state_survived:
+                self._abandon_state_load(req_id)
+            else:
+                self._settle_state_load(req_id, ok=False)
             if self._finish_aborted_load_cleanup(req_id):
                 continue
             self.failed_recving_kv_req_ids.append(req_id)

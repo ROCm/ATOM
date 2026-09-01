@@ -282,6 +282,19 @@ class _JointPark:
         self._failed: set = set()
         self._ready: set = set()
         self._ready_failed: set = set()
+        # Per-leg outcome, kept apart from the single failure-dominant `_failed`
+        # flag (finding #6). `_failed` fires when *either* leg fails, which is
+        # right for the KV wake -- half a load must recompute -- but wrong for
+        # the state index: a KV chunk that LMCache's LRU dropped fails the pair
+        # while the state H2D that landed is still intact, and routing that
+        # through `fail_load` would `forget` a hash whose bytes are present,
+        # denying it to every later request over the prefix. `_state_failed`
+        # records the keys whose *state* leg specifically missed, so `_release`
+        # can tell "keep the state hash, only KV recompute" (abandon) from "the
+        # state bytes are really gone" (fail/forget). `_dispositions` carries
+        # that verdict per released key out to the worker's completion channel.
+        self._state_failed: set = set()
+        self._dispositions: dict = {}
         # The two legs report different identities: the KV leg reports its typed
         # `LoadOperationId` (always issued for an offload load), the state tier
         # the bare request id. The park is filed under the KV identity -- that
@@ -335,6 +348,12 @@ class _JointPark:
         need.discard(leg)
         if not ok:
             self._failed.add(key)
+            if leg == "state":
+                # Only a state-leg miss is evidence the bytes are gone (finding
+                # #6). A KV-leg failure leaves `_state_failed` untouched, so the
+                # disposition `_release` files says "state intact" and the index
+                # abandons rather than forgets.
+                self._state_failed.add(key)
         if need:
             return
         self._release(key)
@@ -344,6 +363,15 @@ class _JointPark:
         bare = self._alias_of.pop(key, None)
         if bare is not None:
             self._alias.pop(bare, None)
+        # File the state-index verdict for this key before dropping the per-leg
+        # bookkeeping (finding #6): True means the state bytes are intact (the
+        # index should keep the hash -- `abandon_load`), False means the state
+        # leg itself missed (the index should drop it -- `fail_load`). Every
+        # released key gets one, success or failure, so the worker emits a
+        # completion the TP aggregator can bring to quorum alongside the KV load
+        # report rather than leaking a partially-reported key.
+        self._dispositions[key] = key not in self._state_failed
+        self._state_failed.discard(key)
         if key in self._failed:
             self._failed.discard(key)
             self._ready_failed.add(key)
@@ -366,3 +394,16 @@ class _JointPark:
         self._ready.clear()
         self._ready_failed.clear()
         return ready, failed
+
+    def take_dispositions(self) -> dict:
+        """State-index verdict per released key since the last drain (finding #6).
+
+        `{key: state_intact}` -- True keeps the hash (abandon), False forgets it
+        (fail). Drained together with `take_ready`: the worker turns each into a
+        `STATE_LOAD_DISPOSITION_CHANNEL` completion so the engine can override
+        the failure-dominant default of `fail_load` for a load whose only failed
+        leg was the KV chunk.
+        """
+        out = self._dispositions
+        self._dispositions = {}
+        return out

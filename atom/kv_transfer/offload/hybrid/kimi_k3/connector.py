@@ -49,6 +49,15 @@ STATE_INDEX_CHANNEL = "k3_state_index"
 #: CPU put succeeded is decided afterwards and cannot touch them.
 STATE_SOURCE_CHANNEL = "k3_state_source"
 
+#: The per-request state-load verdict, one completion per released joint/state
+#: load (finding #6). `succeeded=True` means the state H2D landed and the index
+#: must keep the hash even when the pair failed (a dropped KV chunk):
+#: `abandon_load`, not `fail_load`. `succeeded=False` means the state leg itself
+#: missed and the hash must be forgotten. Emitted for successful loads too so
+#: the aggregator reaches quorum on the same step the KV load report does,
+#: rather than leaving a partially-reported key pending forever.
+STATE_LOAD_DISPOSITION_CHANNEL = "k3_state_load_disposition"
+
 #: A save outstanding longer than this is a backend that stopped, not one that
 #: is busy: a 4096-token store costs ~65ms.
 SAVE_STALL_SECONDS = 120.0
@@ -402,12 +411,14 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
             out.finished_loading, out.failed_loading = self._settle_joint(
                 out.finished_loading, out.failed_loading, set(), set()
             )
+            self._emit_load_dispositions(out)
             return out
         indexed, index_failed = self._state_tier.take_store_reports()
         state_done, state_failed = self._state_tier.get_finished()
         out.finished_loading, out.failed_loading = self._settle_joint(
             out.finished_loading, out.failed_loading, state_done, state_failed
         )
+        self._emit_load_dispositions(out)
         # Store reports have no request identity (the owner is long gone), so
         # they ride the connector-owned channel with its failure-dominant quorum.
         # Keyed by operation, not bare hash: `KVOutputAggregator` tombstones each
@@ -453,6 +464,26 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
         ready, ready_failed = park.take_ready()
         return passthrough_done | ready, passthrough_failed | ready_failed
 
+    def _emit_load_dispositions(self, out) -> None:
+        """Turn this step's park verdicts into state-index completions (finding #6).
+
+        One `STATE_LOAD_DISPOSITION_CHANNEL` completion per released joint/state
+        load, keyed by the same identity the KV leg reported on
+        `finished/failed_loading` so the engine can correlate them. `succeeded`
+        is the state leg's own outcome: the engine keeps the hash (`abandon_load`)
+        for a failed pair whose state bytes are intact, and forgets it
+        (`fail_load`) only when the state leg itself missed. Emitting for the
+        successful loads too is deliberate -- the failure-dominant TP quorum
+        needs every worker that reported the load to report a verdict, or the
+        key never drains.
+        """
+        for key, state_intact in self._joint_park.take_dispositions().items():
+            out.connector_completions.add(
+                ConnectorCompletion(
+                    STATE_LOAD_DISPOSITION_CHANNEL, key, bool(state_intact)
+                )
+            )
+
 
 class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
     """Scheduler side: dense KV, plus the state tier's load queue and the
@@ -489,6 +520,10 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
         self._state_indexed: set = set()
         self._state_index_failed: set = set()
         self._state_source_released: set = set()
+        # Requests whose state H2D landed even though the joint load failed
+        # (finding #6). Drained by the engine before it settles `failed_loading`,
+        # to abandon rather than forget their still-present state hash.
+        self._state_load_survived: set = set()
 
     # -- state load queue --------------------------------------------------
     def enqueue_state_loads(self, loads) -> bool:
@@ -714,6 +749,21 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
             )
             target.add(completion.operation_id)
             return True
+        if completion.channel == STATE_LOAD_DISPOSITION_CHANNEL:
+            # Finding #6: a state load whose bytes survived a failed pair. Record
+            # only the survivors -- their `failed_loading` report must abandon
+            # the index (keep the hash) instead of failing it (forget). A
+            # genuine state miss drains `succeeded=False` and is left out, so the
+            # engine's default `fail_load` still forgets it. Normalise the KV
+            # identity to the bare request id here, matching how
+            # `process_completions` normalises `finished/failed_loading`, so the
+            # engine's set membership test lines up.
+            if completion.succeeded:
+                op = completion.operation_id
+                self._state_load_survived.add(
+                    op.req_id if hasattr(op, "req_id") else op
+                )
+            return True
         # Channels this connector does not own. `DenseOffloadConnector` and the
         # rest of the MRO define no `connector_completion`, so `super().` would
         # raise AttributeError; `False` is the caller's contract for "unhandled"
@@ -745,3 +795,14 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
         self._state_indexed = set()
         self._state_index_failed = set()
         return indexed, failed
+
+    def take_state_load_survived(self) -> set:
+        """Drain the requests whose state bytes outlived a failed joint load.
+
+        Finding #6. The engine consults this before settling `failed_loading`:
+        a member here abandons its state-index entry (keeps the loadable hash)
+        instead of failing it (forgetting a hash whose bytes are present).
+        """
+        survived = self._state_load_survived
+        self._state_load_survived = set()
+        return survived
