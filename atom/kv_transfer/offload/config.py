@@ -56,8 +56,17 @@ _HF_INTEGER_GEOMETRY_FIELDS = frozenset(_HF_PAGE_FIELDS) - {
     "indexer_dtype",
 }
 # GDN/linear model types carrying a per-request recurrent state but NOT in the
-# `kimi_linear` family `kimi_k3` owns. Mirrors `ModelRunner.is_qwen_next()`.
-# MiniMax-M2/M3 are absent by design (sparse/standard attention, no state).
+# `kimi_linear` family `kimi_k3` owns. Same set as `ModelRunner.is_qwen_next()`,
+# but note the attribute skew: the guard below reads `hf_config.model_type`
+# while `is_qwen_next` reads `hf_text_config.model_type`. On the native path
+# they agree only because `get_hf_config` flattens the text type up; `is_vllm()`
+# drops `qwen3_5`/`qwen3_5_moe` from that flatten, so if offload is ever wired
+# into plugin mode this guard must switch to the text config to stay in sync.
+# Unreachable today -- no plugin caller passes a `kv_transfer_config`.
+# MiniMax-M2/M3 are absent by design: M3 is sparse *paged* attention
+# (`MiniMaxM3SparseForCausalLM` -> `SparseMHAPagedAttentionImpl`), no recurrent
+# state, so the dense offload path handles it as ordinary paged KV -- it is NOT
+# a GDN/linear model despite some sibling comments once listing it as one.
 _GDN_LINEAR_MODEL_TYPES = frozenset(
     {"qwen3_next", "qwen3_next_mtp", "qwen3_5_text", "qwen3_5_moe_text"}
 )

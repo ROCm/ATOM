@@ -72,8 +72,8 @@ class DenseKVByteCodec:
         ``permit_per_request_state`` gates whether a per-request recurrent-state
         tensor in ``kv_caches`` is skipped or rejected. A hybrid connector that
         moves state through its own tier (kimi_k3) sets it True to skip. The
-        plain dense path leaves it False: a GDN model (Qwen3-Next, MiniMax-M3,
-        Qwen3.5) registered on ``lmcache_offload`` puts its slot-indexed mamba
+        plain dense path leaves it False: a GDN model (Qwen3-Next, Qwen3.5)
+        registered on ``lmcache_offload`` puts its slot-indexed mamba
         caches in this dict, and the dense path has no rule keeping its KV
         prefix aligned with that linear state -- restoring KV while the state is
         stale is silent wrong output. Skipping the tensor here used to hide that
@@ -95,7 +95,7 @@ class DenseKVByteCodec:
                         "DenseKVByteCodec: per-request recurrent state was "
                         "registered on the plain dense offload path. This is a "
                         "GDN/linear-attention model (e.g. Qwen3-Next, "
-                        "MiniMax-M3, Qwen3.5); the dense path would restore its "
+                        "Qwen3.5); the dense path would restore its "
                         "KV prefix while the recurrent state stayed stale -- "
                         "silent wrong output. Use a connector that owns a state "
                         "tier (kimi_k3), which passes "

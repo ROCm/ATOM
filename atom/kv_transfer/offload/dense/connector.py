@@ -72,7 +72,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
     # Whether a per-request recurrent-state tensor in the registered kv_caches is
     # tolerated. The plain dense path has no rule keeping a restored KV prefix
     # aligned with linear-attention state, so it must reject such a model
-    # (GDN: Qwen3-Next, MiniMax-M3, Qwen3.5) and fail fast. A hybrid connector
+    # (GDN: Qwen3-Next, Qwen3.5) and fail fast. A hybrid connector
     # that owns a state tier (kimi_k3) overrides this to True.
     _permit_per_request_state = False
 
