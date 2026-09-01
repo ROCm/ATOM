@@ -51,6 +51,24 @@ def test_padded_prefill_mla_rows_have_empty_initialized_kv_ranges():
     assert not block_tables[2:].any()
 
 
+def test_empty_dp_rank_initializes_every_padded_prefill_mla_row():
+    kv_indptr = torch.tensor([0, 101, 202], dtype=torch.int32)
+    kv_last_page_lens = np.full(2, 9, dtype=np.int32)
+    block_tables = np.full((2, 3), 17, dtype=np.int32)
+
+    _pad_prefill_mla_draft_tail(
+        kv_indptr,
+        kv_last_page_lens,
+        block_tables,
+        scheduled_bs=0,
+        running_bs=2,
+    )
+
+    assert kv_indptr.tolist() == [0, 0, 0]
+    assert not kv_last_page_lens.any()
+    assert not block_tables.any()
+
+
 def test_global_index_cache_layout_includes_real_stack_draft_layers():
     """Standalone DSpark MLA drafts share the target pool as N extra rows."""
     assert aiter_mla._global_index_cache_layer_ids(None, 61, 5) == tuple(range(61 + 5))

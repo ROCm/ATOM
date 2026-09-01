@@ -74,7 +74,7 @@ def _pad_prefill_mla_draft_tail(
     running_bs: int,
 ) -> None:
     """Give widened Eagle rows an empty, fully initialized MLA KV range."""
-    assert 0 < scheduled_bs <= running_bs
+    assert 0 <= scheduled_bs <= running_bs
     if scheduled_bs == running_bs:
         return
     kv_indptr[scheduled_bs + 1 : running_bs + 1] = kv_indptr[scheduled_bs]
