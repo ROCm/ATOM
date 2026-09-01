@@ -55,14 +55,41 @@ class InternodeDPSocketPlan:
     control_port: int
 
 
+@dataclass(frozen=True)
+class EngineCoreProcessAssignment:
+    """Identity of one EngineCore process and its pipeline stage."""
+
+    engine_rank: int
+    dp_rank: int
+    local_dp_rank: int
+    pp_rank: int
+
+
 def validate_rust_owned_engine_core_config(config: Config) -> None:
     """Reject topology modes the Rust-owned transport cannot represent."""
-    if config.pipeline_parallel_size != 1:
-        raise ValueError(
-            "Rust-owned EngineCore transport requires pipeline_parallel_size=1"
-        )
+    if config.pipeline_parallel_size > 1:
+        if config.enable_dp_attention:
+            raise ValueError(
+                "Rust-owned EngineCore transport does not support "
+                "DP-attention combined with pipeline parallelism"
+            )
+        if config.parallel_config.data_parallel_size != 1:
+            raise ValueError(
+                "Rust-owned EngineCore transport currently supports pipeline "
+                "parallelism only with data_parallel_size=1"
+            )
+        if config.tensor_parallel_size != config.tp_world_size:
+            raise ValueError(
+                "Rust-owned EngineCore transport does not support simulated TP "
+                "with pipeline parallelism"
+            )
     if config.parallel_config.is_multinode_dp:
-        raise ValueError("Rust-owned EngineCore transport does not support multi-node DP")
+        mode = (
+            "multi-node pipeline parallelism"
+            if config.pipeline_parallel_size > 1
+            else "multi-node DP"
+        )
+        raise ValueError(f"Rust-owned EngineCore transport does not support {mode}")
     if config.enable_dp_attention and config.fake_eplb:
         raise ValueError(
             "Rust-owned EngineCore transport does not support simulated "
@@ -98,7 +125,7 @@ def build_internode_dp_socket_plan(
 
 def plan_rust_owned_engine_core_endpoints(
     config: Config,
-    dp_ranks: list[int] | None = None,
+    assignments: list[EngineCoreProcessAssignment] | None = None,
 ) -> list[dict[str, int | str]]:
     """Allocate the normal EngineCore addresses for a Rust-owned frontend.
 
@@ -106,16 +133,18 @@ def plan_rust_owned_engine_core_endpoints(
     before the existing EngineCore processes connect to them.
     """
     validate_rust_owned_engine_core_config(config)
-    if dp_ranks is None:
-        dp_ranks = [dp_rank for dp_rank, _ in iter_dp_rank_assignments(config)]
+    if assignments is None:
+        assignments = iter_engine_core_process_assignments(config)
     return [
         {
-            "dp_rank": dp_rank,
+            "engine_rank": assignment.engine_rank,
+            "dp_rank": assignment.dp_rank,
+            "pp_rank": assignment.pp_rank,
             "input_address": get_open_zmq_ipc_path(),
             "control_address": get_open_zmq_ipc_path(),
             "output_address": get_open_zmq_ipc_path(),
         }
-        for dp_rank in dp_ranks
+        for assignment in assignments
     ]
 
 
@@ -145,6 +174,26 @@ def iter_dp_rank_assignments(config) -> list[tuple[int, int]]:
         ]
     return [
         (rank_offset + local_rank, local_rank) for local_rank in range(local_dp_size)
+    ]
+
+
+def iter_engine_core_process_assignments(
+    config: Config,
+    dp_assignments: list[tuple[int, int]] | None = None,
+) -> list[EngineCoreProcessAssignment]:
+    """Expand each locally owned DP pipeline into its EngineCore stages."""
+    if dp_assignments is None:
+        dp_assignments = iter_dp_rank_assignments(config)
+    pp_size = config.pipeline_parallel_size
+    return [
+        EngineCoreProcessAssignment(
+            engine_rank=dp_rank * pp_size + pp_rank,
+            dp_rank=dp_rank,
+            local_dp_rank=local_dp_rank,
+            pp_rank=pp_rank,
+        )
+        for dp_rank, local_dp_rank in dp_assignments
+        for pp_rank in range(pp_size)
     ]
 
 
@@ -238,7 +287,7 @@ class CoreManager:
         # is only safe to admit if it fits wherever the router sends it.
         self.max_pool_tokens: int | None = None
         self.engine_core_processes = []
-        self._engine_core_dp_ranks: list[int] = []
+        self._engine_core_engine_ranks: list[int] = []
         self._external_process_monitor_stop = Event()
         self._external_process_monitor_thread: Thread | None = None
         self.input_sockets = []
@@ -360,25 +409,36 @@ class CoreManager:
             if not config.enable_dp_attention
             else config.parallel_config.data_parallel_size
         )
-        spawned_rank_assignments = rank_assignments[:local_engine_count]
-        external_endpoints_by_rank = None
-        if self.external_transport_mode:
-            spawned_dp_ranks = [
-                dp_rank for dp_rank, _local_dp_rank in spawned_rank_assignments
-            ]
-            self.external_engine_core_endpoints = (
-                plan_rust_owned_engine_core_endpoints(config, spawned_dp_ranks)
+        owned_dp_assignments = (
+            rank_assignments[:local_engine_count]
+            if config.enable_dp_attention
+            else rank_assignments
+        )
+        process_assignments = iter_engine_core_process_assignments(
+            config, owned_dp_assignments
+        )
+        if len(process_assignments) != local_engine_count:
+            raise RuntimeError(
+                "EngineCore process assignment count does not match the planned "
+                f"local engine count: {len(process_assignments)} != {local_engine_count}"
             )
-            external_endpoints_by_rank = {
-                int(endpoint["dp_rank"]): endpoint
+        external_endpoints_by_engine_rank = None
+        if self.external_transport_mode:
+            self.external_engine_core_endpoints = (
+                plan_rust_owned_engine_core_endpoints(config, process_assignments)
+            )
+            external_endpoints_by_engine_rank = {
+                int(endpoint["engine_rank"]): endpoint
                 for endpoint in self.external_engine_core_endpoints
             }
-            expected_ranks = set(spawned_dp_ranks)
-            if set(external_endpoints_by_rank) != expected_ranks:
+            expected_ranks = {
+                assignment.engine_rank for assignment in process_assignments
+            }
+            if set(external_endpoints_by_engine_rank) != expected_ranks:
                 raise ValueError(
-                    "Rust-owned EngineCore endpoint ranks must exactly match spawned "
-                    f"EngineCore ranks: expected {sorted(expected_ranks)}, got "
-                    f"{sorted(external_endpoints_by_rank)}"
+                    "Rust-owned EngineCore endpoint engine ranks must exactly match "
+                    f"spawned EngineCores: expected {sorted(expected_ranks)}, got "
+                    f"{sorted(external_endpoints_by_engine_rank)}"
                 )
         # Global DP rank 0's node owns the router; the others only host engines.
         self.is_coordinator = not multinode or pc.data_parallel_rank == 0
@@ -441,12 +501,13 @@ class CoreManager:
                     dp_attention_enabled=config.enable_dp_attention,
                 )
 
-            for engine_index in range(self.local_engine_count):
-                assignment_index = engine_index // self.pp_size
-                dp_rank, local_dp_rank = rank_assignments[assignment_index]
-                pp_rank = engine_index % self.pp_size
+            for assignment in process_assignments:
+                engine_rank = assignment.engine_rank
+                dp_rank = assignment.dp_rank
+                local_dp_rank = assignment.local_dp_rank
+                pp_rank = assignment.pp_rank
                 logger.info(
-                    f"{self.label}: Creating EngineCore engine {engine_index}"
+                    f"{self.label}: Creating EngineCore engine {engine_rank}"
                     f" (global dp={dp_rank}, local dp={local_dp_rank}, "
                     f"pp={pp_rank}) of {self.local_engine_count}"
                 )
@@ -465,8 +526,8 @@ class CoreManager:
                         self.pp_kv_status_addr
                     )
 
-                if external_endpoints_by_rank is not None:
-                    engine_addresses = external_endpoints_by_rank[dp_rank]
+                if external_endpoints_by_engine_rank is not None:
+                    engine_addresses = external_endpoints_by_engine_rank[engine_rank]
                 elif socket_plan is not None:
                     plan = socket_plan[dp_rank]
                     ip = config.parallel_config.data_parallel_master_ip
@@ -486,7 +547,9 @@ class CoreManager:
                     {
                         "process": engine_core_process,
                         "addresses": addresses,
+                        "engine_rank": engine_rank,
                         "dp_rank": dp_rank,
+                        "pp_rank": pp_rank,
                         "config": rank_config,
                     }
                 )
@@ -495,18 +558,20 @@ class CoreManager:
             try:
                 # No visible-device mask is published here. Device placement is
                 # owned by ModelRunner._setup_device_and_distributed, which
-                # selects an ABSOLUTE cuda:{local_dp_rank*tp_size+rank}. Masking
-                # the child as well would renumber its devices and compound the
-                # two offsets -- see set_device_control_env_var's docstring.
+                # selects an absolute GPU from the DPxPPxPCPxTP layout. Masking
+                # the child as well would renumber devices and compound offsets
+                # -- see set_device_control_env_var's docstring.
                 for info, local_dp_rank in zip(processes_info, local_dp_ranks):
                     dp_rank = info["dp_rank"]
+                    engine_rank = info["engine_rank"]
+                    pp_rank = info["pp_rank"]
                     logger.info(
-                        f"{self.label}: Starting EngineCore for DP rank "
-                        f"{dp_rank}/{self.global_engine_count}"
+                        f"{self.label}: Starting EngineCore engine rank {engine_rank} "
+                        f"(DP {dp_rank}, PP {pp_rank})/{self.global_engine_count}"
                     )
                     info["process"].start()
                     self.engine_core_processes.append(info["process"])
-                    self._engine_core_dp_ranks.append(dp_rank)
+                    self._engine_core_engine_ranks.append(engine_rank)
 
                 if not self.is_coordinator:
                     # A worker node hosts engines but owns no router: the
@@ -527,11 +592,11 @@ class CoreManager:
                         proc.join()
                     return
 
-                if external_endpoints_by_rank is not None:
+                if external_endpoints_by_engine_rank is not None:
                     logger.info(
-                        "%s: Rust owns the EngineCore sockets for DP ranks %s",
+                        "%s: Rust owns the EngineCore sockets for engine ranks %s",
                         self.label,
-                        sorted(external_endpoints_by_rank),
+                        sorted(external_endpoints_by_engine_rank),
                     )
                     self.external_transport_owner.wait_until_all_connected()
                     ready_capacities = (
@@ -555,7 +620,7 @@ class CoreManager:
                 else:
                     bind_addresses = [info["addresses"] for info in processes_info]
 
-                if external_endpoints_by_rank is None:
+                if external_endpoints_by_engine_rank is None:
                     for addresses in bind_addresses:
                         input_socket = make_zmq_socket(
                             self.ctx, addresses["input_address"], zmq.ROUTER, bind=True
@@ -614,7 +679,7 @@ class CoreManager:
             self.close()
             raise
 
-        if external_endpoints_by_rank is None:
+        if external_endpoints_by_engine_rank is None:
             logger.info(
                 f"{self.label}: All {len(self.output_sockets)} EngineCores "
                 "initialized and ready"
@@ -993,14 +1058,14 @@ class CoreManager:
         def monitor_processes() -> None:
             reported: set[int] = set()
             while not self._external_process_monitor_stop.wait(0.2):
-                for dp_rank, process in zip(
-                    self._engine_core_dp_ranks, self.engine_core_processes
+                for engine_rank, process in zip(
+                    self._engine_core_engine_ranks, self.engine_core_processes
                 ):
-                    if dp_rank in reported or process.exitcode is None:
+                    if engine_rank in reported or process.exitcode is None:
                         continue
                     try:
-                        self.external_transport_owner.mark_rank_failed(
-                            dp_rank,
+                        self.external_transport_owner.mark_engine_failed(
+                            engine_rank,
                             f"EngineCore process exited with code {process.exitcode}",
                         )
                     except RuntimeError:
@@ -1009,13 +1074,13 @@ class CoreManager:
                         continue
                     except Exception as error:  # noqa: BLE001 - monitor must survive
                         logger.warning(
-                            "%s: failed to report DP rank %d process exit: %s",
+                            "%s: failed to report engine rank %d process exit: %s",
                             self.label,
-                            dp_rank,
+                            engine_rank,
                             error,
                         )
                         continue
-                    reported.add(dp_rank)
+                    reported.add(engine_rank)
 
         self._external_process_monitor_thread = Thread(
             target=monitor_processes,
@@ -1709,17 +1774,19 @@ def launch_engine_core(
     # EngineCore subclass would otherwise have to thread through.
     config.parallel_config.control_address = control_address
 
-    # tp_world_size: the GPUs this DP rank really occupies.
+    pp_rank = config.parallel_config.pipeline_parallel_rank
+    stage_span = config.tp_world_size * config.prefill_context_parallel_size
+    engine_rank = dp_rank * config.pipeline_parallel_size + pp_rank
+    first_gpu = (local_dp_rank * config.pipeline_parallel_size + pp_rank) * stage_span
     logger.info(
-        f"Creating EngineCore process: global DP rank {dp_rank} "
-        f"(local {local_dp_rank}), GPUs "
-        f"{local_dp_rank * config.tp_world_size} to "
-        f"{(local_dp_rank + 1) * config.tp_world_size - 1}"
+        f"Creating EngineCore process: engine rank {engine_rank}, global DP rank "
+        f"{dp_rank} (local {local_dp_rank}), PP rank {pp_rank}, GPUs {first_gpu} "
+        f"to {first_gpu + stage_span - 1}"
     )
 
     process = multiprocessing.Process(
         target=EngineCore.run_engine,
-        name=f"EngineCore-DP{dp_rank}",
+        name=f"EngineCore-E{engine_rank}-DP{dp_rank}-PP{pp_rank}",
         kwargs={
             "config": config,
             "input_address": input_address,

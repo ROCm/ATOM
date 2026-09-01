@@ -97,9 +97,15 @@ impl PyEngineCoreIpcRuntime {
         self.shutdown_engine_cores(py)
     }
 
-    fn mark_rank_failed(&self, dp_rank: usize, message: String) -> PyResult<()> {
+    fn mark_engine_failed(&self, engine_rank: usize, message: String) -> PyResult<()> {
         self.active_client()?
-            .mark_rank_failed(dp_rank, message)
+            .mark_engine_failed(engine_rank, message)
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+    }
+
+    fn mark_rank_failed(&self, rank: usize, message: String) -> PyResult<()> {
+        self.active_client()?
+            .mark_rank_failed(rank, message)
             .map_err(|error| PyRuntimeError::new_err(error.to_string()))
     }
 
@@ -325,6 +331,19 @@ fn extract_engine_core_topology(
                 "engine_core_endpoints[{index}].dp_rank must be non-negative"
             ))
         })?;
+        let optional_rank = |key: &str, default: usize| -> PyResult<usize> {
+            match endpoint.get_item(key)? {
+                Some(value) => value.extract::<usize>().map_err(|_| {
+                    PyValueError::new_err(format!(
+                        "engine_core_endpoints[{index}].{key} must be non-negative"
+                    ))
+                }),
+                None => Ok(default),
+            }
+        };
+        // Preserve the pre-PP endpoint schema for external PP=1 callers.
+        let engine_rank = optional_rank("engine_rank", dp_rank)?;
+        let pp_rank = optional_rank("pp_rank", 0)?;
         let address = |key: &str| {
             required(key)?.extract::<String>().map_err(|_| {
                 PyValueError::new_err(format!(
@@ -333,7 +352,9 @@ fn extract_engine_core_topology(
             })
         };
         endpoints.push(EngineCoreEndpoint {
+            engine_rank,
             dp_rank,
+            pp_rank,
             input_address: address("input_address")?,
             control_address: address("control_address")?,
             output_address: address("output_address")?,

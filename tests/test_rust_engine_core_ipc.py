@@ -13,6 +13,7 @@ def _config(**overrides):
     values = {
         "pipeline_parallel_size": 1,
         "tensor_parallel_size": 1,
+        "tp_world_size": 1,
         "enable_dp_attention": False,
         "enable_rapidserve": False,
         "fake_eplb": False,
@@ -39,13 +40,17 @@ def test_rust_owned_endpoint_plan_reuses_python_address_allocator(monkeypatch):
 
     assert endpoints == [
         {
+            "engine_rank": 0,
             "dp_rank": 0,
+            "pp_rank": 0,
             "input_address": "ipc:///tmp/atom-0",
             "control_address": "ipc:///tmp/atom-1",
             "output_address": "ipc:///tmp/atom-2",
         },
         {
+            "engine_rank": 1,
             "dp_rank": 1,
+            "pp_rank": 0,
             "input_address": "ipc:///tmp/atom-3",
             "control_address": "ipc:///tmp/atom-4",
             "output_address": "ipc:///tmp/atom-5",
@@ -53,10 +58,92 @@ def test_rust_owned_endpoint_plan_reuses_python_address_allocator(monkeypatch):
     ]
 
 
+@pytest.mark.parametrize("pp_size", [2, 4])
+def test_rust_owned_endpoint_plan_allocates_every_pp_stage(monkeypatch, pp_size):
+    allocated = iter(f"ipc:///tmp/pp-{index}" for index in range(pp_size * 3))
+    monkeypatch.setattr(
+        engine_core_mgr,
+        "get_open_zmq_ipc_path",
+        lambda: next(allocated),
+    )
+    config = _config(
+        pipeline_parallel_size=pp_size,
+        parallel_config=SimpleNamespace(
+            data_parallel_size=1,
+            data_parallel_size_local=1,
+            data_parallel_rank=0,
+            is_multinode_dp=False,
+        ),
+    )
+
+    endpoints = engine_core_mgr.plan_rust_owned_engine_core_endpoints(config)
+
+    assert [
+        (endpoint["engine_rank"], endpoint["dp_rank"], endpoint["pp_rank"])
+        for endpoint in endpoints
+    ] == [(rank, 0, rank) for rank in range(pp_size)]
+    assert len(
+        {
+            endpoint[address_name]
+            for endpoint in endpoints
+            for address_name in (
+                "input_address",
+                "control_address",
+                "output_address",
+            )
+        }
+    ) == pp_size * 3
+
+
+def test_engine_core_process_assignments_expand_pp_stages():
+    config = _config(
+        pipeline_parallel_size=4,
+        parallel_config=SimpleNamespace(
+            data_parallel_size=1,
+            data_parallel_size_local=1,
+            data_parallel_rank=0,
+            is_multinode_dp=False,
+        ),
+    )
+
+    assignments = engine_core_mgr.iter_engine_core_process_assignments(config)
+
+    assert [
+        (
+            assignment.engine_rank,
+            assignment.dp_rank,
+            assignment.local_dp_rank,
+            assignment.pp_rank,
+        )
+        for assignment in assignments
+    ] == [(rank, 0, 0, rank) for rank in range(4)]
+
+
 @pytest.mark.parametrize(
     "overrides",
     [
         {"pipeline_parallel_size": 2},
+        {
+            "pipeline_parallel_size": 2,
+            "enable_dp_attention": True,
+            "parallel_config": SimpleNamespace(
+                data_parallel_size=1,
+                data_parallel_size_local=1,
+                data_parallel_rank=0,
+                is_multinode_dp=False,
+            ),
+        },
+        {
+            "pipeline_parallel_size": 2,
+            "tensor_parallel_size": 4,
+            "tp_world_size": 2,
+            "parallel_config": SimpleNamespace(
+                data_parallel_size=1,
+                data_parallel_size_local=1,
+                data_parallel_rank=0,
+                is_multinode_dp=False,
+            ),
+        },
         {"enable_rapidserve": True},
         {"enable_dp_attention": True, "fake_eplb": True},
         {
@@ -95,6 +182,8 @@ def test_rust_owned_endpoint_plan_expands_dp_attention_ranks(monkeypatch):
     endpoints = engine_core_mgr.plan_rust_owned_engine_core_endpoints(config)
 
     assert [endpoint["dp_rank"] for endpoint in endpoints] == list(range(8))
+    assert [endpoint["engine_rank"] for endpoint in endpoints] == list(range(8))
+    assert {endpoint["pp_rank"] for endpoint in endpoints} == {0}
     addresses = {
         address
         for endpoint in endpoints
@@ -125,18 +214,18 @@ def test_core_manager_binds_rust_transport_before_starting_engine_cores():
     assert "dp_attention_enabled=config.enable_dp_attention" in source
 
 
-def test_external_process_monitor_reports_idle_rank_exit():
+def test_external_process_monitor_reports_idle_engine_exit():
     reported = []
     reported_event = Event()
     manager = engine_core_mgr.CoreManager.__new__(engine_core_mgr.CoreManager)
     manager.external_transport_mode = True
     manager._external_process_monitor_thread = None
     manager._external_process_monitor_stop = Event()
-    manager._engine_core_dp_ranks = [3]
+    manager._engine_core_engine_ranks = [3]
     manager.engine_core_processes = [SimpleNamespace(exitcode=-9)]
     manager.label = "test"
     manager.external_transport_owner = SimpleNamespace(
-        mark_rank_failed=lambda rank, message: (
+        mark_engine_failed=lambda rank, message: (
             reported.append((rank, message)),
             reported_event.set(),
         )

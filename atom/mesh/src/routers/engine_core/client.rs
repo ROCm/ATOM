@@ -68,37 +68,22 @@ enum RankCommand {
 
 type UtilityResponses = BTreeMap<String, BTreeMap<usize, UtilityResponse>>;
 
-fn failure_domain_ranks(
-    dp_attention_enabled: bool,
-    failed_rank: usize,
-    all_ranks: &[usize],
-) -> Vec<usize> {
-    if dp_attention_enabled {
-        all_ranks.to_vec()
-    } else {
-        vec![failed_rank]
-    }
-}
-
-fn deployment_is_ready(
-    dp_attention_enabled: bool,
-    healthy_ranks: usize,
-    total_ranks: usize,
-) -> bool {
-    healthy_ranks > 0 && (!dp_attention_enabled || healthy_ranks == total_ranks)
-}
-
 pub struct EngineCoreClient {
     _transport_context: Arc<Mutex<EngineCoreTransport>>,
-    rank_commands: BTreeMap<usize, std_mpsc::SyncSender<RankCommand>>,
+    engine_commands: BTreeMap<usize, std_mpsc::SyncSender<RankCommand>>,
+    pipeline_heads: BTreeMap<usize, usize>,
+    pipeline_stages: BTreeMap<usize, Vec<usize>>,
+    engine_to_dp: BTreeMap<usize, usize>,
+    engine_to_pp: BTreeMap<usize, usize>,
     routes: Arc<DashMap<i64, SequenceRoute>>,
     next_sequence_id: AtomicI64,
     stopped: Arc<AtomicBool>,
     collective_shutdown_started: AtomicBool,
+    failure_shutdown_engines: Mutex<HashSet<usize>>,
     admission_lock: Mutex<()>,
     scheduler: Mutex<DpScheduler>,
     latest_metrics: DashMap<usize, crate::proto::engine::MetricsSnapshot>,
-    rank_health: DashMap<usize, bool>,
+    engine_health: DashMap<usize, bool>,
     rank_timeout_strikes: DashMap<usize, u32>,
     utility_responses: Mutex<UtilityResponses>,
     poisoned_utility_commands: Mutex<HashSet<String>>,
@@ -410,6 +395,44 @@ impl std::fmt::Debug for EngineCoreClient {
 }
 
 impl EngineCoreClient {
+    fn failure_domain_ranks(
+        dp_attention_enabled: bool,
+        failed_dp_rank: usize,
+        pipeline_stages: &BTreeMap<usize, Vec<usize>>,
+    ) -> Vec<usize> {
+        if dp_attention_enabled {
+            pipeline_stages.values().flatten().copied().collect()
+        } else {
+            pipeline_stages
+                .get(&failed_dp_rank)
+                .cloned()
+                .unwrap_or_default()
+        }
+    }
+
+    fn deployment_is_ready(
+        dp_attention_enabled: bool,
+        healthy_pipelines: usize,
+        total_pipelines: usize,
+    ) -> bool {
+        healthy_pipelines > 0 && (!dp_attention_enabled || healthy_pipelines == total_pipelines)
+    }
+
+    fn request_engine_rank(
+        pipeline_heads: &BTreeMap<usize, usize>,
+        dp_rank: usize,
+    ) -> Option<usize> {
+        pipeline_heads.get(&dp_rank).copied()
+    }
+
+    fn is_user_output_from_head(
+        pipeline_heads: &BTreeMap<usize, usize>,
+        dp_rank: usize,
+        engine_rank: usize,
+    ) -> bool {
+        Self::request_engine_rank(pipeline_heads, dp_rank) == Some(engine_rank)
+    }
+
     pub fn new(
         transport: Arc<Mutex<EngineCoreTransport>>,
         dp_load_balance: &str,
@@ -426,30 +449,73 @@ impl EngineCoreClient {
             .lock()
             .take_rank_sockets()
             .map_err(|error| EngineError::ConnectionAcquireFailed(error.to_string()))?;
-        let ranks: Vec<_> = rank_sockets.keys().copied().collect();
-        let mut rank_commands = BTreeMap::new();
+        let engine_ranks: Vec<_> = rank_sockets.keys().copied().collect();
+        let mut pipeline_heads = BTreeMap::new();
+        let mut pipeline_stages: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        let mut engine_to_dp = BTreeMap::new();
+        let mut engine_to_pp = BTreeMap::new();
+        for (&engine_rank, sockets) in &rank_sockets {
+            let endpoint = &sockets.endpoint;
+            engine_to_dp.insert(engine_rank, endpoint.dp_rank);
+            engine_to_pp.insert(engine_rank, endpoint.pp_rank);
+            pipeline_stages
+                .entry(endpoint.dp_rank)
+                .or_default()
+                .push(engine_rank);
+            if endpoint.pp_rank == 0
+                && pipeline_heads
+                    .insert(endpoint.dp_rank, engine_rank)
+                    .is_some()
+            {
+                return Err(EngineError::RequestBuildFailed(format!(
+                    "multiple PP head stages configured for DP rank {}",
+                    endpoint.dp_rank
+                )));
+            }
+        }
+        for engine_ranks in pipeline_stages.values_mut() {
+            engine_ranks.sort_unstable_by_key(|engine_rank| engine_to_pp[engine_rank]);
+        }
+        let pipeline_ranks: Vec<_> = pipeline_stages.keys().copied().collect();
+        for &dp_rank in &pipeline_ranks {
+            if !pipeline_heads.contains_key(&dp_rank) {
+                return Err(EngineError::RequestBuildFailed(format!(
+                    "DP rank {dp_rank} has no pp_rank=0 EngineCore stage"
+                )));
+            }
+        }
+        let rank_timeout_strikes = pipeline_ranks.iter().map(|&rank| (rank, 0)).collect();
+        let mut engine_commands = BTreeMap::new();
         let mut rank_receivers = Vec::new();
-        for (dp_rank, sockets) in rank_sockets {
+        for (engine_rank, sockets) in rank_sockets {
             let (sender, receiver) = std_mpsc::sync_channel(1_024);
-            rank_commands.insert(dp_rank, sender);
-            rank_receivers.push((dp_rank, sockets, receiver));
+            engine_commands.insert(engine_rank, sender);
+            rank_receivers.push((engine_rank, sockets, receiver));
         }
         let client = Arc::new(Self {
             _transport_context: transport,
-            rank_commands,
+            engine_commands,
+            pipeline_heads,
+            pipeline_stages,
+            engine_to_dp,
+            engine_to_pp,
             routes: Arc::new(DashMap::new()),
             next_sequence_id: AtomicI64::new(1),
             stopped: Arc::new(AtomicBool::new(false)),
             collective_shutdown_started: AtomicBool::new(false),
+            failure_shutdown_engines: Mutex::new(HashSet::new()),
             admission_lock: Mutex::new(()),
             scheduler: Mutex::new(DpScheduler::new(
-                ranks.clone(),
+                pipeline_ranks,
                 dp_load_balance,
                 dp_lb_request_equivalent,
             )),
             latest_metrics: DashMap::new(),
-            rank_health: ranks.iter().map(|&rank| (rank, true)).collect(),
-            rank_timeout_strikes: ranks.into_iter().map(|rank| (rank, 0)).collect(),
+            engine_health: engine_ranks
+                .iter()
+                .map(|&engine_rank| (engine_rank, true))
+                .collect(),
+            rank_timeout_strikes,
             utility_responses: Mutex::new(BTreeMap::new()),
             poisoned_utility_commands: Mutex::new(HashSet::new()),
             utility_execution_lock: tokio::sync::Mutex::new(()),
@@ -462,8 +528,8 @@ impl EngineCoreClient {
             dp_attention_enabled,
             worker_handles: Mutex::new(Vec::new()),
         });
-        for (dp_rank, sockets, receiver) in rank_receivers {
-            if let Err(error) = Self::start_rank_worker(&client, dp_rank, sockets, receiver) {
+        for (engine_rank, sockets, receiver) in rank_receivers {
+            if let Err(error) = Self::start_rank_worker(&client, engine_rank, sockets, receiver) {
                 let _ = client.shutdown();
                 return Err(error);
             }
@@ -473,13 +539,16 @@ impl EngineCoreClient {
 
     fn start_rank_worker(
         client: &Arc<Self>,
-        dp_rank: usize,
+        engine_rank: usize,
         sockets: EngineCoreRankSockets,
         receiver: std_mpsc::Receiver<RankCommand>,
     ) -> Result<(), EngineError> {
+        let dp_rank = sockets.endpoint.dp_rank;
+        let pp_rank = sockets.endpoint.pp_rank;
+        let is_head = pp_rank == 0;
         let weak = Arc::downgrade(client);
         let handle = thread::Builder::new()
-            .name(format!("EngineCore-DP{dp_rank}"))
+            .name(format!("EngineCore-E{engine_rank}-DP{dp_rank}-PP{pp_rank}"))
             .spawn(move || {
                 while let Some(client) = weak.upgrade() {
                     let mut received = false;
@@ -487,21 +556,23 @@ impl EngineCoreClient {
                         match receiver.try_recv() {
                             Ok(RankCommand::Input(envelope)) => {
                                 received = true;
-                                if let Err(error) = sockets.send_input(dp_rank, &envelope) {
-                                    client.fail_rank(dp_rank, error.to_string());
+                                if let Err(error) = sockets.send_input(engine_rank, &envelope) {
+                                    client.fail_engine(engine_rank, error.to_string());
                                 }
                             }
                             Ok(RankCommand::Control(envelope)) => {
                                 received = true;
-                                if let Err(error) = sockets.send_control(dp_rank, &envelope) {
-                                    client.fail_rank(
-                                        dp_rank,
+                                if let Err(error) = sockets.send_control(engine_rank, &envelope) {
+                                    client.fail_engine(
+                                        engine_rank,
                                         format!(
-                                            "EngineCore DP rank {dp_rank} control send failed: {error}"
+                                            "EngineCore engine {engine_rank} (DP {dp_rank}, PP \
+                                             {pp_rank}) control send failed: {error}"
                                         ),
                                     );
                                     tracing::warn!(
-                                        "EngineCore DP rank {dp_rank} control send failed: {error}"
+                                        "EngineCore engine {engine_rank} (DP {dp_rank}, PP \
+                                         {pp_rank}) control send failed: {error}"
                                     );
                                 }
                             }
@@ -510,68 +581,71 @@ impl EngineCoreClient {
                                     wire_version: ENGINE_CORE_WIRE_VERSION,
                                     payload: Some(Payload::Shutdown(())),
                                 };
-                                if let Err(error) = sockets.send_control(dp_rank, &envelope) {
+                                if let Err(error) = sockets.send_control(engine_rank, &envelope) {
                                     tracing::warn!(
-                                        "EngineCore DP rank {dp_rank} shutdown failed: {error}"
+                                        "EngineCore engine {engine_rank} (DP {dp_rank}, PP \
+                                         {pp_rank}) shutdown failed: {error}"
                                     );
                                     return;
                                 }
                                 let deadline = Instant::now() + client.shutdown_timeout;
                                 while Instant::now() < deadline {
-                                    match sockets.receive_output_nonblocking(dp_rank) {
+                                    match sockets.receive_output_nonblocking(engine_rank) {
                                         Ok(Some(EngineCoreEnvelope {
                                             payload: Some(Payload::Shutdown(_)),
                                             ..
                                         })) => return,
                                         Ok(Some(envelope)) => {
-                                            client.handle_envelope(dp_rank, envelope);
+                                            client.handle_envelope(engine_rank, envelope);
                                         }
                                         Ok(None) => thread::sleep(Duration::from_millis(1)),
                                         Err(error) => {
-                                            client.rank_health.insert(dp_rank, false);
+                                            client.engine_health.insert(engine_rank, false);
                                             tracing::warn!(
-                                                "EngineCore DP rank {dp_rank} shutdown acknowledgement failed: {error}"
+                                                "EngineCore engine {engine_rank} (DP {dp_rank}, PP \
+                                                 {pp_rank}) shutdown acknowledgement failed: {error}"
                                             );
                                             return;
                                         }
                                     }
                                 }
                                 tracing::warn!(
-                                    "EngineCore DP rank {dp_rank} did not acknowledge shutdown"
+                                    "EngineCore engine {engine_rank} (DP {dp_rank}, PP {pp_rank}) \
+                                     did not acknowledge shutdown"
                                 );
-                                client.rank_health.insert(dp_rank, false);
+                                client.engine_health.insert(engine_rank, false);
                                 return;
                             }
                             Err(std_mpsc::TryRecvError::Empty) => break,
                             Err(std_mpsc::TryRecvError::Disconnected) => return,
                         }
                     }
-                    match sockets.receive_output_nonblocking(dp_rank) {
+                    match sockets.receive_output_nonblocking(engine_rank) {
                         Ok(Some(envelope)) => {
                             received = true;
-                            client.handle_envelope(dp_rank, envelope);
+                            client.handle_envelope(engine_rank, envelope);
                         }
                         Ok(None) => {}
                         Err(error @ EngineCoreTransportError::InvalidProtobuf { .. }) => {
-                            client.fail_rank(
-                                dp_rank,
+                            client.fail_engine(
+                                engine_rank,
                                 format!(
-                                    "EngineCore DP rank {dp_rank} emitted malformed output: {error}"
+                                    "EngineCore engine {engine_rank} (DP {dp_rank}, PP {pp_rank}) \
+                                     emitted malformed output: {error}"
                                 ),
                             );
                         }
-                        Err(error) => client.fail_rank(
-                            dp_rank,
-                            format!("EngineCore DP rank {dp_rank} output failed: {error}"),
+                        Err(error) => client.fail_engine(
+                            engine_rank,
+                            format!(
+                                "EngineCore engine {engine_rank} (DP {dp_rank}, PP {pp_rank}) \
+                                 output failed: {error}"
+                            ),
                         ),
                     }
-                    for sequence_id in client.expire_rank(dp_rank) {
-                        if let Err(error) =
-                            sockets.send_control(dp_rank, &abort_envelope(sequence_id))
-                        {
-                            tracing::warn!(
-                                "EngineCore DP rank {dp_rank} timeout abort failed: {error}"
-                            );
+                    if is_head {
+                        for sequence_id in client.expire_rank(dp_rank) {
+                            client.broadcast_abort(dp_rank, sequence_id);
                         }
                     }
                     if !received {
@@ -581,7 +655,8 @@ impl EngineCoreClient {
             })
             .map_err(|error| {
                 EngineError::ConnectionAcquireFailed(format!(
-                    "failed to start EngineCore DP rank {dp_rank} worker: {error}"
+                    "failed to start EngineCore engine {engine_rank} (DP {dp_rank}, PP {pp_rank}) \
+                     worker: {error}"
                 ))
             })?;
         client.worker_handles.lock().push(handle);
@@ -707,7 +782,14 @@ impl EngineCoreClient {
             );
         }
 
-        let send_result = self.rank_commands[&dp_rank].try_send(RankCommand::Input(envelope));
+        let head_engine_rank = Self::request_engine_rank(&self.pipeline_heads, dp_rank)
+            .ok_or_else(|| {
+                EngineError::ConnectionAcquireFailed(format!(
+                    "EngineCore DP rank {dp_rank} has no head stage"
+                ))
+            })?;
+        let send_result =
+            self.engine_commands[&head_engine_rank].try_send(RankCommand::Input(envelope));
         if let Err(error) = send_result {
             for sequence_id in &sequence_ids {
                 self.routes.remove(sequence_id);
@@ -715,10 +797,15 @@ impl EngineCoreClient {
             self.scheduler.lock().rollback(&reservation);
             let message = match error {
                 std_mpsc::TrySendError::Full(_) => {
-                    format!("EngineCore DP rank {dp_rank} command queue is full")
+                    format!(
+                        "EngineCore DP rank {dp_rank} head engine {head_engine_rank} command queue \
+                         is full"
+                    )
                 }
                 std_mpsc::TrySendError::Disconnected(_) => {
-                    format!("EngineCore DP rank {dp_rank} worker stopped")
+                    format!(
+                        "EngineCore DP rank {dp_rank} head engine {head_engine_rank} worker stopped"
+                    )
                 }
             };
             return Err(EngineError::ConnectionAcquireFailed(message));
@@ -732,9 +819,19 @@ impl EngineCoreClient {
         }))
     }
 
-    fn handle_envelope(&self, dp_rank: usize, envelope: EngineCoreEnvelope) {
+    fn handle_envelope(&self, engine_rank: usize, envelope: EngineCoreEnvelope) {
+        let dp_rank = self.engine_to_dp[&engine_rank];
         match envelope.payload {
             Some(Payload::Stream(chunk)) => {
+                if !Self::is_user_output_from_head(&self.pipeline_heads, dp_rank, engine_rank) {
+                    self.fail_engine(
+                        engine_rank,
+                        format!(
+                            "non-head EngineCore engine {engine_rank} emitted client STREAM output"
+                        ),
+                    );
+                    return;
+                }
                 self.rank_timeout_strikes.insert(dp_rank, 0);
                 for output in chunk.outputs {
                     let Some(output_value) = output.output else {
@@ -748,13 +845,22 @@ impl EngineCoreClient {
                 }
             }
             Some(Payload::AddResponse(response)) => {
+                if !Self::is_user_output_from_head(&self.pipeline_heads, dp_rank, engine_rank) {
+                    self.fail_engine(
+                        engine_rank,
+                        format!(
+                            "non-head EngineCore engine {engine_rank} emitted client AddResponse"
+                        ),
+                    );
+                    return;
+                }
                 self.rank_timeout_strikes.insert(dp_rank, 0);
                 for sequence in response.sequences {
                     self.handle_terminal_sequence(sequence);
                 }
             }
             Some(Payload::Metrics(metrics)) => {
-                self.latest_metrics.insert(dp_rank, metrics);
+                self.latest_metrics.insert(engine_rank, metrics);
             }
             Some(Payload::UtilityResponse(response)) => {
                 if response.command != "abort_request" {
@@ -762,11 +868,11 @@ impl EngineCoreClient {
                     responses
                         .entry(response.command.clone())
                         .or_default()
-                        .insert(dp_rank, response);
+                        .insert(engine_rank, response);
                 }
             }
             Some(Payload::Shutdown(_)) => {
-                self.fail_rank(dp_rank, "EngineCore shut down".to_string());
+                self.fail_engine(engine_rank, "EngineCore shut down".to_string());
             }
             Some(payload) => {
                 tracing::warn!("Ignoring unexpected EngineCore output payload: {payload:?}");
@@ -869,74 +975,111 @@ impl EngineCoreClient {
         }
     }
 
-    fn fail_rank(&self, dp_rank: usize, message: String) {
+    fn fail_engine(&self, engine_rank: usize, message: String) {
         let _admission_guard = self.admission_lock.lock();
         if self.stopped.load(Ordering::Acquire) {
             return;
         }
-        let all_ranks = self
-            .rank_health
+        let Some(&failed_dp_rank) = self.engine_to_dp.get(&engine_rank) else {
+            tracing::warn!("Ignoring failure for unknown EngineCore engine {engine_rank}");
+            return;
+        };
+        let failed_engine_ranks = Self::failure_domain_ranks(
+            self.dp_attention_enabled,
+            failed_dp_rank,
+            &self.pipeline_stages,
+        );
+        let failed_dp_ranks = failed_engine_ranks
             .iter()
-            .map(|entry| *entry.key())
-            .collect::<Vec<_>>();
-        let failed_ranks = failure_domain_ranks(self.dp_attention_enabled, dp_rank, &all_ranks);
+            .filter_map(|engine_rank| self.engine_to_dp.get(engine_rank).copied())
+            .collect::<HashSet<_>>();
         {
             let mut scheduler = self.scheduler.lock();
-            for &rank in &failed_ranks {
-                self.rank_health.insert(rank, false);
-                scheduler.disable_rank(rank);
+            for &failed_engine_rank in &failed_engine_ranks {
+                self.engine_health.insert(failed_engine_rank, false);
+            }
+            for &dp_rank in &failed_dp_ranks {
+                scheduler.disable_rank(dp_rank);
             }
         }
         let message = if self.dp_attention_enabled {
             format!(
-                "DP-attention collective failed because EngineCore rank {dp_rank} \
+                "DP-attention collective failed because EngineCore engine {engine_rank} \
                  became unavailable: {message}"
             )
         } else {
-            message
+            format!(
+                "Pipeline DP rank {failed_dp_rank} failed because EngineCore engine \
+                 {engine_rank} became unavailable: {message}"
+            )
         };
         let sequence_ids: Vec<_> = self
             .routes
             .iter()
-            .filter(|route| self.dp_attention_enabled || route.dp_rank == dp_rank)
+            .filter(|route| failed_dp_ranks.contains(&route.dp_rank))
             .map(|route| *route.key())
             .collect();
         for sequence_id in sequence_ids {
             self.fail_route(sequence_id, message.clone());
         }
-        if self.dp_attention_enabled
-            && !self
-                .collective_shutdown_started
-                .swap(true, Ordering::AcqRel)
-        {
-            for (&rank, sender) in &self.rank_commands {
-                match sender.try_send(RankCommand::Shutdown) {
-                    Ok(()) => {}
-                    Err(std_mpsc::TrySendError::Full(command)) => {
-                        let sender = sender.clone();
-                        if let Err(error) = thread::Builder::new()
-                            .name(format!("EngineCore-DP{rank}-ShutdownDispatch"))
-                            .spawn(move || {
-                                if let Err(error) = sender.send(command) {
-                                    tracing::warn!(
-                                        "Failed to queue DP-attention collective shutdown \
-                                         for EngineCore rank {rank}: {error}"
-                                    );
-                                }
-                            })
-                        {
-                            tracing::warn!(
-                                "Failed to start DP-attention shutdown dispatcher for \
-                                 EngineCore rank {rank}: {error}"
-                            );
+        // Preserve the pre-PP behavior for an ordinary one-engine DP rank:
+        // disabling it is sufficient. Multi-stage pipelines and DP-attention
+        // collectives must shut down their whole failure domain.
+        if !self.dp_attention_enabled && failed_engine_ranks.len() == 1 {
+            return;
+        }
+        if self.dp_attention_enabled {
+            self.collective_shutdown_started
+                .store(true, Ordering::Release);
+        }
+        for &failed_engine_rank in &failed_engine_ranks {
+            if self
+                .failure_shutdown_engines
+                .lock()
+                .contains(&failed_engine_rank)
+            {
+                continue;
+            }
+            let Some(sender) = self.engine_commands.get(&failed_engine_rank) else {
+                continue;
+            };
+            match sender.try_send(RankCommand::Shutdown) {
+                Ok(()) => {
+                    self.failure_shutdown_engines
+                        .lock()
+                        .insert(failed_engine_rank);
+                }
+                Err(std_mpsc::TrySendError::Full(command)) => {
+                    let sender = sender.clone();
+                    match thread::Builder::new()
+                        .name(format!("EngineCore-E{failed_engine_rank}-ShutdownDispatch"))
+                        .spawn(move || {
+                            if let Err(error) = sender.send(command) {
+                                tracing::warn!(
+                                    "Failed to queue failure-domain shutdown for EngineCore \
+                                         engine {failed_engine_rank}: {error}"
+                                );
+                            }
+                        }) {
+                        Ok(_) => {
+                            self.failure_shutdown_engines
+                                .lock()
+                                .insert(failed_engine_rank);
                         }
+                        Err(error) => tracing::warn!(
+                            "Failed to start failure-domain shutdown dispatcher for \
+                                 EngineCore engine {failed_engine_rank}: {error}"
+                        ),
                     }
-                    Err(std_mpsc::TrySendError::Disconnected(_)) => {
-                        tracing::warn!(
-                            "EngineCore rank {rank} worker stopped before DP-attention \
-                             collective shutdown"
-                        );
-                    }
+                }
+                Err(std_mpsc::TrySendError::Disconnected(_)) => {
+                    self.failure_shutdown_engines
+                        .lock()
+                        .insert(failed_engine_rank);
+                    tracing::warn!(
+                        "EngineCore engine {failed_engine_rank} worker stopped before \
+                             failure-domain shutdown"
+                    );
                 }
             }
         }
@@ -963,8 +1106,8 @@ impl EngineCoreClient {
                 *strikes >= 3
             };
             if strike_limit_reached {
-                self.fail_rank(
-                    dp_rank,
+                self.fail_engine(
+                    self.pipeline_heads[&dp_rank],
                     "EngineCore request timeout strike limit reached".to_string(),
                 );
             }
@@ -988,9 +1131,9 @@ impl EngineCoreClient {
             })),
         };
         let mut failures = Vec::new();
-        for (&dp_rank, sender) in &self.rank_commands {
+        for (&engine_rank, sender) in &self.engine_commands {
             if let Err(error) = sender.try_send(RankCommand::Control(envelope.clone())) {
-                failures.push(format!("rank {dp_rank}: {error}"));
+                failures.push(format!("engine {engine_rank}: {error}"));
             }
         }
         if !failures.is_empty() {
@@ -1007,20 +1150,28 @@ impl EngineCoreClient {
         let envelope = decode_control_frame(frame)?;
         let command = control_command(&envelope)?.to_string();
         self.ensure_utility_command_usable(&command)?;
-        self.ensure_rank_healthy(dp_rank)?;
+        self.ensure_pipeline_healthy(dp_rank)?;
         self.take_utility_responses(&command);
-        let sender = self.rank_commands.get(&dp_rank).ok_or_else(|| {
+        let engine_ranks = self.pipeline_stages.get(&dp_rank).ok_or_else(|| {
             EngineError::RequestBuildFailed(format!(
                 "requested EngineCore DP rank {dp_rank} does not exist"
             ))
         })?;
-        sender
-            .try_send(RankCommand::Control(envelope))
-            .map_err(|error| {
-                EngineError::ConnectionAcquireFailed(format!(
-                    "EngineCore DP rank {dp_rank} control queue failed: {error}"
-                ))
-            })?;
+        let mut failures = Vec::new();
+        for &engine_rank in engine_ranks {
+            if let Err(error) =
+                self.engine_commands[&engine_rank].try_send(RankCommand::Control(envelope.clone()))
+            {
+                failures.push(format!("engine {engine_rank}: {error}"));
+            }
+        }
+        if !failures.is_empty() {
+            self.poison_utility_command(&command);
+            return Err(EngineError::ConnectionAcquireFailed(format!(
+                "EngineCore DP rank {dp_rank} control send failed for {}",
+                failures.join(", ")
+            )));
+        }
         Ok(command)
     }
 
@@ -1031,16 +1182,16 @@ impl EngineCoreClient {
         self.take_utility_responses(&command);
         let mut failures = Vec::new();
         let mut sent = 0;
-        for (&dp_rank, sender) in &self.rank_commands {
+        for (&engine_rank, sender) in &self.engine_commands {
             if !self
-                .rank_health
-                .get(&dp_rank)
+                .engine_health
+                .get(&engine_rank)
                 .is_some_and(|healthy| *healthy)
             {
                 continue;
             }
             if let Err(error) = sender.try_send(RankCommand::Control(envelope.clone())) {
-                failures.push(format!("rank {dp_rank}: {error}"));
+                failures.push(format!("engine {engine_rank}: {error}"));
             } else {
                 sent += 1;
             }
@@ -1149,20 +1300,34 @@ impl EngineCoreClient {
         Ok(())
     }
 
-    fn ensure_rank_healthy(&self, dp_rank: usize) -> Result<(), EngineError> {
+    fn ensure_pipeline_healthy(&self, dp_rank: usize) -> Result<(), EngineError> {
         if self.stopped.load(Ordering::Acquire) {
             return Err(EngineError::ConnectionAcquireFailed(
                 "EngineCore client is shutting down".to_string(),
             ));
         }
-        match self.rank_health.get(&dp_rank) {
-            Some(healthy) if *healthy => Ok(()),
-            Some(_) => Err(EngineError::ConnectionAcquireFailed(format!(
-                "EngineCore DP rank {dp_rank} is unavailable"
-            ))),
-            None => Err(EngineError::RequestBuildFailed(format!(
+        let engine_ranks = self.pipeline_stages.get(&dp_rank).ok_or_else(|| {
+            EngineError::RequestBuildFailed(format!(
                 "requested EngineCore DP rank {dp_rank} does not exist"
-            ))),
+            ))
+        })?;
+        let unavailable = engine_ranks
+            .iter()
+            .copied()
+            .filter(|engine_rank| {
+                !self
+                    .engine_health
+                    .get(engine_rank)
+                    .is_some_and(|healthy| *healthy)
+            })
+            .collect::<Vec<_>>();
+        if unavailable.is_empty() {
+            Ok(())
+        } else {
+            Err(EngineError::ConnectionAcquireFailed(format!(
+                "EngineCore DP rank {dp_rank} is unavailable because engines \
+                 {unavailable:?} are unavailable"
+            )))
         }
     }
 
@@ -1173,7 +1338,7 @@ impl EngineCoreClient {
             ));
         }
         let unavailable = self
-            .rank_health
+            .engine_health
             .iter()
             .filter_map(|entry| (!*entry.value()).then_some(*entry.key()))
             .collect::<Vec<_>>();
@@ -1181,7 +1346,7 @@ impl EngineCoreClient {
             Ok(())
         } else {
             Err(EngineError::ConnectionAcquireFailed(format!(
-                "EngineCore utility command requires every rank, but ranks \
+                "EngineCore utility command requires every stage, but engines \
                  {unavailable:?} are unavailable"
             )))
         }
@@ -1198,13 +1363,25 @@ impl EngineCoreClient {
         self.latest_metrics
             .iter()
             .map(|entry| {
-                let values = entry
+                let engine_rank = *entry.key();
+                let mut values = entry
                     .value()
                     .values
                     .as_ref()
                     .map(prost_struct_to_json)
                     .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
-                (*entry.key(), values)
+                if let serde_json::Value::Object(values) = &mut values {
+                    values.insert("engine_rank".to_string(), engine_rank.into());
+                    values.insert(
+                        "dp_rank".to_string(),
+                        self.engine_to_dp[&engine_rank].into(),
+                    );
+                    values.insert(
+                        "pp_rank".to_string(),
+                        self.engine_to_pp[&engine_rank].into(),
+                    );
+                }
+                (engine_rank, values)
             })
             .collect()
     }
@@ -1213,32 +1390,64 @@ impl EngineCoreClient {
         if self.stopped.load(Ordering::Acquire) {
             return 0;
         }
-        self.rank_health
+        self.engine_health
             .iter()
             .filter(|entry| *entry.value())
             .count()
     }
 
     pub fn total_rank_count(&self) -> usize {
-        self.rank_health.len()
+        self.engine_health.len()
+    }
+
+    pub fn healthy_pipeline_count(&self) -> usize {
+        if self.stopped.load(Ordering::Acquire) {
+            return 0;
+        }
+        self.pipeline_stages
+            .values()
+            .filter(|engine_ranks| {
+                engine_ranks.iter().all(|engine_rank| {
+                    self.engine_health
+                        .get(engine_rank)
+                        .is_some_and(|healthy| *healthy)
+                })
+            })
+            .count()
+    }
+
+    pub fn total_pipeline_count(&self) -> usize {
+        self.pipeline_stages.len()
     }
 
     pub fn serving_ready(&self) -> bool {
-        let healthy = self.healthy_rank_count();
-        deployment_is_ready(self.dp_attention_enabled, healthy, self.total_rank_count())
+        let healthy_pipelines = self.healthy_pipeline_count();
+        Self::deployment_is_ready(
+            self.dp_attention_enabled,
+            healthy_pipelines,
+            self.total_pipeline_count(),
+        )
     }
 
-    pub fn mark_rank_failed(&self, dp_rank: usize, message: String) -> Result<(), EngineError> {
-        if !self.rank_health.contains_key(&dp_rank) {
+    pub fn mark_engine_failed(
+        &self,
+        engine_rank: usize,
+        message: String,
+    ) -> Result<(), EngineError> {
+        if !self.engine_health.contains_key(&engine_rank) {
             return Err(EngineError::RequestBuildFailed(format!(
-                "requested EngineCore DP rank {dp_rank} does not exist"
+                "requested EngineCore engine rank {engine_rank} does not exist"
             )));
         }
         if self.stopped.load(Ordering::Acquire) {
             return Ok(());
         }
-        self.fail_rank(dp_rank, message);
+        self.fail_engine(engine_rank, message);
         Ok(())
+    }
+
+    pub fn mark_rank_failed(&self, rank: usize, message: String) -> Result<(), EngineError> {
+        self.mark_engine_failed(rank, message)
     }
 
     pub fn load_snapshot(&self) -> BTreeMap<usize, (u64, u64)> {
@@ -1268,7 +1477,7 @@ impl EngineCoreClient {
         let _execution_guard = self.utility_execution_lock.lock().await;
         self.take_utility_responses(command);
         self.broadcast_utility(command, arguments)?;
-        let expected = self.rank_commands.len();
+        let expected = self.engine_commands.len();
         let deadline = tokio::time::Instant::now() + timeout;
         let mut responses = BTreeMap::new();
         loop {
@@ -1321,10 +1530,13 @@ impl EngineCoreClient {
             );
         }
         drop(admission_guard);
-        let mut failed_ranks = Vec::new();
-        for (&dp_rank, sender) in &self.rank_commands {
+        let mut failed_engines = Vec::new();
+        for (&engine_rank, sender) in &self.engine_commands {
+            if self.failure_shutdown_engines.lock().contains(&engine_rank) {
+                continue;
+            }
             if sender.send(RankCommand::Shutdown).is_err() {
-                failed_ranks.push(dp_rank);
+                failed_engines.push(engine_rank);
             }
         }
         let handles = std::mem::take(&mut *self.worker_handles.lock());
@@ -1333,9 +1545,9 @@ impl EngineCoreClient {
                 tracing::warn!("EngineCore rank worker panicked during shutdown");
             }
         }
-        if !failed_ranks.is_empty() && !self.collective_shutdown_started.load(Ordering::Acquire) {
+        if !failed_engines.is_empty() && !self.collective_shutdown_started.load(Ordering::Acquire) {
             return Err(EngineError::ConnectionAcquireFailed(format!(
-                "EngineCore DP rank workers stopped before shutdown: {failed_ranks:?}"
+                "EngineCore workers stopped before shutdown: {failed_engines:?}"
             )));
         }
         Ok(())
@@ -1348,11 +1560,20 @@ impl EngineCoreClient {
         self.scheduler
             .lock()
             .release(route.dp_rank, route.token_cost);
+        self.broadcast_abort(route.dp_rank, sequence_id);
+    }
+
+    fn broadcast_abort(&self, dp_rank: usize, sequence_id: i64) {
         let envelope = abort_envelope(sequence_id);
-        if let Err(error) =
-            self.rank_commands[&route.dp_rank].try_send(RankCommand::Control(envelope))
-        {
-            tracing::warn!("Failed to abort EngineCore sequence {sequence_id}: {error}");
+        for &engine_rank in &self.pipeline_stages[&dp_rank] {
+            if let Err(error) =
+                self.engine_commands[&engine_rank].try_send(RankCommand::Control(envelope.clone()))
+            {
+                tracing::warn!(
+                    "Failed to abort EngineCore sequence {sequence_id} on engine \
+                     {engine_rank}: {error}"
+                );
+            }
         }
     }
 }
@@ -1576,19 +1797,42 @@ mod tests {
 
     #[test]
     fn dp_attention_uses_collective_failure_domain() {
+        let pipeline_stages = BTreeMap::from([(0, vec![0, 1]), (1, vec![2, 3])]);
         assert_eq!(
-            failure_domain_ranks(true, 1, &[0, 1, 2, 3]),
+            EngineCoreClient::failure_domain_ranks(true, 1, &pipeline_stages),
             vec![0, 1, 2, 3]
         );
-        assert_eq!(failure_domain_ranks(false, 1, &[0, 1, 2, 3]), vec![1]);
+        assert_eq!(
+            EngineCoreClient::failure_domain_ranks(false, 1, &pipeline_stages),
+            vec![2, 3]
+        );
+    }
+
+    #[test]
+    fn pp_requests_and_user_outputs_use_only_the_head_stage() {
+        let pipeline_heads = BTreeMap::from([(0, 10), (1, 20)]);
+        assert_eq!(
+            EngineCoreClient::request_engine_rank(&pipeline_heads, 0),
+            Some(10)
+        );
+        assert!(EngineCoreClient::is_user_output_from_head(
+            &pipeline_heads,
+            0,
+            10
+        ));
+        assert!(!EngineCoreClient::is_user_output_from_head(
+            &pipeline_heads,
+            0,
+            11
+        ));
     }
 
     #[test]
     fn dp_attention_readiness_requires_every_rank() {
-        assert!(deployment_is_ready(true, 4, 4));
-        assert!(!deployment_is_ready(true, 3, 4));
-        assert!(deployment_is_ready(false, 3, 4));
-        assert!(!deployment_is_ready(false, 0, 4));
+        assert!(EngineCoreClient::deployment_is_ready(true, 4, 4));
+        assert!(!EngineCoreClient::deployment_is_ready(true, 3, 4));
+        assert!(EngineCoreClient::deployment_is_ready(false, 3, 4));
+        assert!(!EngineCoreClient::deployment_is_ready(false, 0, 4));
     }
 
     #[test]

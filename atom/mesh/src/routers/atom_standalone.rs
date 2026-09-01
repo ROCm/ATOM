@@ -829,6 +829,7 @@ impl RouterTrait for AtomStandaloneRouter {
         let client = self.engine_core_client.as_ref()?;
         let ranks = client.metrics_snapshot_json();
         let healthy_ranks = client.healthy_rank_count();
+        let healthy_pipelines = client.healthy_pipeline_count();
         let serving_ready = client.serving_ready();
         Some((
             serving_ready,
@@ -843,6 +844,10 @@ impl RouterTrait for AtomStandaloneRouter {
                 "ranks": ranks,
                 "healthy_ranks": healthy_ranks,
                 "total_ranks": client.total_rank_count(),
+                "healthy_engine_ranks": healthy_ranks,
+                "total_engine_ranks": client.total_rank_count(),
+                "healthy_pipelines": healthy_pipelines,
+                "total_pipelines": client.total_pipeline_count(),
             }),
         ))
     }

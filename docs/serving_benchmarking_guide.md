@@ -441,6 +441,14 @@ are exposed through `/engine_metrics`, but the Python `FrameWait` metric remains
 specific to `openai_server`; use the Rust HTTP/SSE metrics when diagnosing
 atomesh client-delivery stalls.
 
+Rust-owned atomesh standalone supports single-node pipeline parallelism when
+`data_parallel_size=1`. Rust gives every PP stage independent sockets, sends
+requests only to `pp_rank=0`, and accepts client-visible output only from that
+head stage. Readiness and management operations cover every stage, and
+`/engine_metrics` identifies snapshots by `engine_rank`, `dp_rank`, and
+`pp_rank`. Failure of any stage makes the pipeline unavailable. DP×PP,
+DP-attention×PP, multi-node PP, and RapidServe remain unsupported combinations.
+
 Measured at the frame and not at `StreamOutputCollector.get`, which is where it
 started and which cannot see the thing it was built for. The collector is where
 a stream waits for the *engine*, but the reasoning read-ahead and the tool-call
