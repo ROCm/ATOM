@@ -819,13 +819,14 @@ class PagedAttentionImpl(nn.Module):
             # Raw K/V is fed as a block_size=1 flash-layout cache, never shuffled.
             shuffled_kv_cache = False
 
-        # Number of requests this step scheduled, taken from the context rather
-        # than from a companion array's shape. prepare_prefill fills exactly
-        # cu_seqlens_q[:scheduled_bs + 1] and context_lens[:scheduled_bs] and
-        # pads the tail out to running_bs, so this is that width by definition.
-        # block_tables.shape[0] was an indirect proxy for it, and one that is
-        # optional besides -- the base builder uploads a table only when
-        # `has_cached`, so the old narrowing had to special-case its absence.
+        # Requests this step scheduled: the width prepare_prefill fills in
+        # cu_seqlens_q and context_lens before padding the tail to running_bs.
+        #
+        # context.scheduled_bs is batch.total_seqs_num, while the builder sized
+        # these arrays by total_seqs_num_prefill. The two differ only on a batch
+        # carrying decode rows, and such a batch leaves total_tokens_num_prefill
+        # at 0 -- hence is_prefill False, which is the branch this method is
+        # reached from. Every is_prefill batch sets the two counts equal.
         n_seqs = fwd_ctx.context.scheduled_bs
         unified_attention(
             q,

@@ -462,11 +462,9 @@ def sparse_attn_indexer_plugin_mode(
         # only equivalent while the query rows are unpadded -- pack_seq_triton
         # above pads to a rectangle, and the kernel would then write past the
         # end. requires_padding is hardcoded False at the one construction site
-        # (attention/metadata.py), so this is unreachable today.
-        #
-        # Not an assert: this guards a buffer overrun, and asserts are stripped
-        # under `python -O`, which would silently restore the overrun exactly
-        # when someone turns padding on.
+        # (attention/metadata.py), so this is unreachable today. Raised rather
+        # than asserted because `python -O` strips asserts, which would restore
+        # the overrun silently exactly when someone turns padding on.
         if decode_metadata.requires_padding:
             raise NotImplementedError(
                 "padded decode rows need logits sized [batch_size * next_n, "
