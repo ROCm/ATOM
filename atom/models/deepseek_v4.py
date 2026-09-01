@@ -3146,7 +3146,6 @@ class DeepseekV4Attention(nn.Module):
         """
         fc = get_forward_context()
         ctx = fc.context
-        ratio = self.compress_ratio
         n_p = attn_md.num_prefill_tokens
         n_d = hidden.size(0) - n_p
         saved_md = fc.attn_metadata
@@ -3164,6 +3163,22 @@ class DeepseekV4Attention(nn.Module):
         )
 
         def _seg(lo: int, hi: int, seg_md, is_prefill: bool) -> None:
+            # `_qk_norm_rope` and `_sparse_attention` both branch on
+            # `attn_md.state is AttnState.DECODE`, not on ctx.is_prefill. If the
+            # decode sub-metadata does not carry DECODE, the fused window write
+            # gets swa_dest_rows=None / batch_id_per_token=None and every decode
+            # row's SWA store is skipped -- no error, just wrong attention.
+            # Checked because a 13-point GSM8K drop with faults=0 is exactly
+            # that shape.
+            if is_prefill:
+                assert (
+                    seg_md.state is not AttnState.DECODE
+                ), f"prefill segment carries state={seg_md.state}"
+            else:
+                assert seg_md.state is AttnState.DECODE, (
+                    f"decode segment carries state={seg_md.state}, so its SWA "
+                    "window write is silently skipped"
+                )
             fc.attn_metadata = seg_md
             ctx.is_prefill = is_prefill
             if saved_input_ids is not None:
@@ -3173,26 +3188,49 @@ class DeepseekV4Attention(nn.Module):
             sl = slice(lo, hi)
             tag = "mixed_seg[prefill]" if is_prefill else "mixed_seg[decode]"
             with torch.profiler.record_function(f"{tag} n={hi - lo}"):
-                self.maybe_compressors_async(
-                    hidden[sl],
-                    seg_md.compress_plans[ratio] if ratio else None,
-                    seg_md.state_slot_in,
-                    seg_md.state_slot_out,
-                    seg_md.block_tables,
-                )
                 qkn = self._qk_norm_rope(q[sl], kv_pre[sl], positions[sl])
+                # `compressor_already_launched=False` so ONE call decides both
+                # halves of the compressor: it launches via
+                # `maybe_compressors_async` and joins on that call's OWN return
+                # value. Launching here and passing True instead splits the
+                # decision -- the True branch recomputes the condition as
+                # `_use_async_compress and fc.in_hipgraph and not tbo_active()`,
+                # which can disagree with what the launch actually did and skip
+                # the stream join, letting the attention read compressor output
+                # that is not written yet. This is how the pre-refactor core
+                # drove it per segment, for the same reason.
                 self._attn_compress(
                     piecewise=False,
                     x=hidden[sl],
-                    compressor_already_launched=True,
+                    compressor_already_launched=False,
                 )
-                out[sl] = self._sparse_attention(
+                _res = self._sparse_attention(
                     qkn,
                     positions[sl],
                     x=hidden[sl],
                     qr=qr[sl],
                     qr_scale=None if qr_scale is None else qr_scale[sl],
                 )
+                out[sl] = _res
+                if os.environ.get("ATOM_PROBE_MIXED_NORM") == "1":
+                    # Per-segment output magnitude. A segment that is wrong
+                    # usually shows it here -- zeros, NaN, or a norm an order
+                    # off the other half -- and that says WHICH half to read.
+                    import logging as _lg
+
+                    _lg.getLogger("atom").warning(
+                        "[probe] %s %s n=%d qkn_q=%.3e out=%.3e finite=%s",
+                        self.layer_name,
+                        "prefill" if is_prefill else "decode",
+                        hi - lo,
+                        float(
+                            (qkn.q_sa if qkn.q_sa is not None else qkn.q_packed)
+                            .float()
+                            .norm()
+                        ),
+                        float(_res.float().norm()),
+                        bool(torch.isfinite(_res).all()),
+                    )
 
         try:
             with torch.profiler.record_function(f"mixed[n_p={n_p} n_d={n_d}]"):
