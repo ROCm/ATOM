@@ -3,6 +3,7 @@
 
 import array
 import logging
+from dataclasses import dataclass
 from math import inf, isinf
 from time import monotonic
 
@@ -65,6 +66,34 @@ def _make_block_removed(hashes: list[int]) -> BlockRemoved:
 
 def _make_all_cleared() -> AllBlocksCleared:
     return AllBlocksCleared()
+
+
+@dataclass(frozen=True)
+class JointBoundaryDecision:
+    """The outcome of the joint-boundary computation, as a value.
+
+    `_joint_kv_boundary` is a pure function of the prompt and the current pool
+    state: it reads the seq's KV-leg inputs and the caches, computes where (if
+    anywhere) both legs can jointly resume, and returns this object WITHOUT
+    touching the seq or any funnel counter. The caller decides whether to
+    commit it -- a fit probe discards it, a real admission applies it via
+    `_commit_joint_boundary`. That is what removed the `record` flag that used
+    to thread down into the boundary computation: computing and recording are
+    now two separate steps in two different places.
+
+    `skip_reason is None` marks a real boundary and the four token/hash fields
+    carry it; otherwise `skip_reason` names why no joint boundary was found and
+    the other fields are unset. `state_from_hbm` tells the commit which tier the
+    STATE leg came from (HBM image vs. an image-sized H2D), decided here because
+    it is a read of the same cache state the boundary was computed against.
+    """
+
+    boundary_tokens: int = 0
+    boundary_hash: int = -1
+    kv_tokens: int = 0
+    claim_tokens: int = 0
+    state_from_hbm: bool = False
+    skip_reason: str | None = None
 
 
 class BlockManager:
@@ -639,17 +668,15 @@ class BlockManager:
         seq: Sequence,
         hbm_boundary: int,
         block_hashes: list[int],
-        record: bool = True,
-    ) -> int:
-        """Boundary above the HBM hit that BOTH legs can reach, 0 if none.
+    ) -> JointBoundaryDecision:
+        """The boundary above the HBM hit that BOTH legs can reach, as a value.
 
-        `record` is `False` for a pure fit probe (`can_allocate` asked only
-        "does this seq fit?", not admitted): the seq's joint fields are still
-        set -- a later real `can_allocate` overwrites them anyway -- but the
-        `joint_boundaries` / `state_hbm` / `state_tier` / `joint_skips` funnel
-        counters are left alone, so a probe that never admits anything does not
-        inflate the operator-visible checkpoint funnel. (The demand counters are
-        already per-seq idempotent and need no such guard.)
+        A pure computation: it reads the seq's KV-leg inputs and the caches and
+        returns a `JointBoundaryDecision`, but writes nothing on the seq and
+        moves no funnel counter. `can_allocate` decides whether to commit the
+        result -- a real admission calls `_commit_joint_boundary`, a fit probe
+        discards it. Separating the two is what let the `record` flag that used
+        to thread down through here disappear.
 
         `can_allocate` walks the HBM prefix cache and nothing else, so an
         evicted prefix stops at the first miss even when LMCache holds every
@@ -663,9 +690,8 @@ class BlockManager:
         B: overshooting costs one chunk into blocks the forward is about to
         rewrite, undershooting would be silent wrong output.
         """
-        seq.offload_joint.reset_joint()
         if self.state_offload is None:
-            return self._no_joint("off", record)
+            return self._no_joint("off")
         # PAGE is now the served class, not the excluded one. This used to
         # read `is not None` and refuse -- correct while a K3 checkpoint was an
         # Active Slot the tier spilled out of `StateSlotPool`. #2045 moved the
@@ -675,7 +701,7 @@ class BlockManager:
         # longer outlive its KV in HBM -- so when LMCache hands the KV back,
         # nothing hands the state back unless the two are fetched together.
         if not seq.has_per_req_cache or self.paged_state_checkpoints is None:
-            return self._no_joint("no_paged_checkpoints", record)
+            return self._no_joint("no_paged_checkpoints")
         hbs = self._hash_block_size()
         # From the connector's config, not the connector object: the scheduler
         # holds whatever `get_kvconnector` returned, and one without
@@ -685,37 +711,34 @@ class BlockManager:
         )
         lmc_tokens = int(seq.offload_joint.kv_prefix_tokens or 0)
         if chunk <= 0:
-            return self._no_joint("no_chunk_size", record)
+            return self._no_joint("no_chunk_size")
         # Floored to the grid everything below compares against, so the
         # covering-chunk check becomes true by construction rather than by
         # luck. (`get_num_new_matched_tokens` withholds one token on a
         # full-prompt hit, which takes the lookup off the grid.)
         lmc_tokens = (lmc_tokens // chunk) * chunk
         if lmc_tokens <= hbm_boundary * hbs:
-            return self._no_joint("lmcache_within_hbm", record)
+            return self._no_joint("lmcache_within_hbm")
         # The KV leg moves whole chunks and the blocks below the HBM prefix are
         # shared, so an unaligned start cannot be rounded down.
         if (hbm_boundary * hbs) % chunk != 0:
-            return self._no_joint("hbm_off_chunk_grid", record)
+            return self._no_joint("hbm_off_chunk_grid")
         cap = min(lmc_tokens // hbs, self._n_hash_blocks(seq) - 1)
         if cap <= hbm_boundary:
-            return self._no_joint("no_room_above_hbm", record)
+            return self._no_joint("no_room_above_hbm")
         chain = self._chain_to(seq, block_hashes, cap)
         # One scan: `_gated_hit` already returns the rightmost rung
         # `_resumable_from` accepts, so a decrement-and-rescan walk would spend
         # a fixpoint pass per rung to reach the same answer.
         candidate = self._gated_hit(seq, cap, chain)
         if candidate <= hbm_boundary:
-            return self._no_joint("no_rung_above_hbm", record)
+            return self._no_joint("no_rung_above_hbm")
         tokens = candidate * hbs
         h = chain[candidate - 1]
         # Cannot fail given the two premises above; kept as their assertion.
         kv_tokens = -(-tokens // chunk) * chunk
         if kv_tokens > lmc_tokens:
-            return self._no_joint("covering_chunk_beyond_lookup", record)
-        seq.offload_joint.boundary_tokens = tokens
-        seq.offload_joint.boundary_hash = h
-        seq.offload_joint.kv_tokens = kv_tokens
+            return self._no_joint("covering_chunk_beyond_lookup")
         # Everything up to the compressed hit is this prompt's KV and is still
         # in the pool -- what `_gated_hit` cut was resumability, not residency.
         # Below the joint boundary those blocks are read-only for this request
@@ -731,7 +754,7 @@ class BlockManager:
         # Floored to the chunk grid so the KV leg starts aligned and writes
         # only into blocks below it that nobody else can be reading.
         claim_tokens = ((claim_blocks * hbs) // chunk) * chunk
-        seq.offload_joint.claim_tokens = max(claim_tokens, hbm_boundary * hbs)
+        claim_tokens = max(claim_tokens, hbm_boundary * hbs)
         # `allocate` claims the boundary in whole hash blocks --
         # `claim_tokens // hbs` -- but the value above is floored to
         # the *chunk* grid, not the hash-block grid. When `hbs` does not divide
@@ -743,30 +766,57 @@ class BlockManager:
         # shipping case (`block_size * dcp_world_size == LMCACHE_CHUNK_SIZE`), so
         # it only surfaces at DCP world sizes that take `hbs` off the chunk grid.
         # Refuse the joint and recompute the tail rather than resume over a gap.
-        if seq.offload_joint.claim_tokens % hbs != 0:
-            seq.offload_joint.reset_joint()
-            return self._no_joint("claim_off_hash_grid", record)
-        if record:
-            self.joint_boundaries += 1
-            # Which tier the STATE leg came from. The KV leg's own tier is
-            # decided separately by `_decide_load_after_alloc`, which is why
-            # these are not named for the boundary as a whole.
-            if self.paged_state_checkpoints.contains(h):
-                self.state_hbm += 1
-            else:
-                self.state_tier += 1
-        return candidate
+        if claim_tokens % hbs != 0:
+            return self._no_joint("claim_off_hash_grid")
+        # Which tier the STATE leg came from. The KV leg's own tier is decided
+        # separately by `_decide_load_after_alloc`, which is why this is not
+        # named for the boundary as a whole. Read here, off the same cache the
+        # boundary was computed against, and carried on the decision so the
+        # commit does not have to look it up again.
+        return JointBoundaryDecision(
+            boundary_tokens=tokens,
+            boundary_hash=h,
+            kv_tokens=kv_tokens,
+            claim_tokens=claim_tokens,
+            state_from_hbm=self.paged_state_checkpoints.contains(h),
+        )
 
-    def _no_joint(self, reason: str, record: bool = True) -> int:
-        """Record why this admission got no joint boundary, and return 0.
-        Every reason is counted, including "this build is not even trying",
-        because a silent zero is indistinguishable from a feature that ran and
-        found nothing. `record=False` is the fit-probe path (see
-        `_joint_kv_boundary`): compute the answer without touching the funnel.
+    @staticmethod
+    def _no_joint(reason: str) -> JointBoundaryDecision:
+        """The empty decision, naming why no joint boundary was found.
+        Every reason is counted at commit time, including "this build is not
+        even trying", because a silent zero is indistinguishable from a feature
+        that ran and found nothing.
         """
-        if record:
-            self.joint_skips[reason] = self.joint_skips.get(reason, 0) + 1
-        return 0
+        return JointBoundaryDecision(skip_reason=reason)
+
+    def _commit_joint_boundary(
+        self, seq: Sequence, decision: JointBoundaryDecision
+    ) -> None:
+        """Apply a `JointBoundaryDecision` to the seq and the funnel counters.
+
+        The recording half of what `_joint_kv_boundary` used to do inline under
+        `record=True`: a real admission calls this, a fit probe does not, so the
+        counters move once per admission and never for a seq that only probed.
+        `reset_joint` first so a boundary that resolved to a skip this pass
+        leaves no stale span from a prior one -- the same clean-slate the old
+        code got from resetting at the top of every boundary walk.
+        """
+        seq.offload_joint.reset_joint()
+        if decision.skip_reason is not None:
+            self.joint_skips[decision.skip_reason] = (
+                self.joint_skips.get(decision.skip_reason, 0) + 1
+            )
+            return
+        seq.offload_joint.boundary_tokens = decision.boundary_tokens
+        seq.offload_joint.boundary_hash = decision.boundary_hash
+        seq.offload_joint.kv_tokens = decision.kv_tokens
+        seq.offload_joint.claim_tokens = decision.claim_tokens
+        self.joint_boundaries += 1
+        if decision.state_from_hbm:
+            self.state_hbm += 1
+        else:
+            self.state_tier += 1
 
     def _chain_to(
         self, seq: Sequence, block_hashes: list[int], blocks: int
@@ -789,9 +839,10 @@ class BlockManager:
 
         `record=False` marks a pure fit probe -- a caller asking only whether
         the seq *could* be admitted, not admitting it. The answer is identical;
-        it just does not move the joint-boundary funnel counters, so a probe
-        that never admits anything cannot inflate operator metrics (see
-        `_joint_kv_boundary`).
+        it just does not commit the joint boundary (neither the seq's joint
+        fields nor the funnel counters), so a probe that never admits anything
+        cannot inflate operator metrics (see `_joint_kv_boundary` /
+        `_commit_joint_boundary`).
 
         The hit count is the contiguous run of cache hits starting at the
         prompt's first block. On the first miss we break: subsequent blocks
@@ -870,15 +921,21 @@ class BlockManager:
         if not self._has_page_units(num_new_blocks, protected_hash):
             return -1
         # A boundary LMCache and the tier can jointly reach, above this hit.
-        # Recorded on the seq rather than returned: what `allocate` claims from
+        # Committed to the seq rather than returned: what `allocate` claims from
         # HBM is still `num_cached_blocks`, and the joint boundary only decides
-        # where the two loads are aimed. Below the refusal, not above it, for the
-        # same reason _extend_hash_chain is: _joint_kv_boundary walks a chained
-        # xxhash up to the LMCache-only cap (_chain_to) plus a _gated_hit rescan,
-        # and a refused admission would discard all of it. Nothing between here
-        # and the refusal reads the seq's joint fields, and the author already
-        # moved _extend_hash_chain down for this exact cost -- this is its twin.
-        self._joint_kv_boundary(seq, num_cached_blocks, block_hashes, record=record)
+        # where the two loads are aimed. `record` is the probe/admission split:
+        # a real admission commits the decision (seq fields + funnel counters), a
+        # fit probe computes and drops it, so a seq that never schedules cannot
+        # inflate the operator-visible funnel. Below the refusal, not above it,
+        # for the same reason _extend_hash_chain is: _joint_kv_boundary walks a
+        # chained xxhash up to the LMCache-only cap (_chain_to) plus a _gated_hit
+        # rescan, and a refused admission would discard all of it. Nothing
+        # between here and the refusal reads the seq's joint fields, and the
+        # author already moved _extend_hash_chain down for this exact cost --
+        # this is its twin.
+        decision = self._joint_kv_boundary(seq, num_cached_blocks, block_hashes)
+        if record:
+            self._commit_joint_boundary(seq, decision)
         # After the refusal, not before it. The chain is O(prompt) xxhash plus
         # two temporaries per block, and a refused admission discards it — a
         # 128k prompt queued behind a full pool paid ~2000 rounds per waiting
