@@ -44,13 +44,17 @@ class StateOffloadTier:
         self._store_executor = ThreadPoolExecutor(
             max_workers=max_workers, thread_name_prefix="lmc-state-store"
         )
-        # What the lanes share is HBM, not a queue. `StagedTransfer` keeps a
-        # per-thread staging buffer sized to a whole entry (~55 MiB on K3). The
-        # budget is stated here rather than left implicit in the thread count:
-        # 2 gives each lane its own buffer (a load never waits on a store); 1
-        # shares one, halving standing HBM at the cost of a load waiting out the
-        # single in-flight store. Either way a load never queues behind a
-        # *backlog* of stores, which is the actual head-of-line problem.
+        # `staging_lanes` gates *concurrency* between the load and store lanes,
+        # not standing HBM. `StagedTransfer._tls = threading.local()` keys the
+        # ~55 MiB staging buffer per thread, both executors are `max_workers=1`,
+        # and `release_after_transfer` defaults off -- so standing HBM is exactly
+        # two buffers (one per executor thread) whether this is 1 or 2. The knob
+        # only decides whether a load and a store may run at once:
+        #   2 (default): they overlap; the semaphore is never contended.
+        #   1: a load waits out any in-flight store, re-introducing the
+        #      head-of-line coupling the two-executor split exists to remove,
+        #      and saves zero HBM.
+        # Do not read this as an HBM lever; it is a lane-serialisation switch.
         self._staging_budget = threading.BoundedSemaphore(max(1, int(staging_lanes)))
         self._lock = threading.Lock()
         self._done: set[str] = set()
@@ -240,18 +244,25 @@ class StateOffloadTier:
         # under a hash the engine's index still advertises. Retracting that
         # claim is the engine's job -- it owns the index -- and it does it from
         # the report below.
-        if submitted_at is not None:
-            waited_ms = max(0.0, monotonic() - submitted_at) * 1000.0
-            if waited_ms >= _LOAD_WAIT_WARN_MS:
-                logger.warning(
-                    "state offload: a state load waited %.0fms for its lane "
-                    "(oldest store outstanding %.1fs). This is TTFT.",
-                    waited_ms,
-                    self.oldest_store_age_s(),
-                )
         ok = False
         try:
             with self._staging_budget:
+                # Measure the wait *after* acquiring the lane, not before. The
+                # semaphore acquire is the lane contention this metric exists to
+                # surface: under `staging_lanes=1` a load blocks here for a full
+                # ~55 MiB gather+D2H behind an in-flight store. Sampling
+                # `submitted_at` above the `with` timed only the executor-queue
+                # wait and was structurally blind to the acquire -- the one thing
+                # it was added to see. Now `waited_ms` spans both.
+                if submitted_at is not None:
+                    waited_ms = max(0.0, monotonic() - submitted_at) * 1000.0
+                    if waited_ms >= _LOAD_WAIT_WARN_MS:
+                        logger.warning(
+                            "state offload: a state load waited %.0fms for its "
+                            "lane (oldest store outstanding %.1fs). This is TTFT.",
+                            waited_ms,
+                            self.oldest_store_age_s(),
+                        )
                 ok = bool(self.codec.get(h, slot))
         except Exception:  # a failed load is a normal path
             # Same reasoning as `_do_store`, and here a miss is expected:

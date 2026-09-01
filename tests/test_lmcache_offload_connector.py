@@ -5898,9 +5898,12 @@ class TestStateLoadsAndStoresRunInSeparateLanes:
             codec.gate.set()
             tier.shutdown()
 
-    def test_one_shared_staging_buffer_still_separates_the_queues(self):
-        """`staging_lanes=1` halves the standing HBM: a load then waits out the
-        single in-flight store, but still not the backlog behind it."""
+    def test_one_lane_serialises_the_load_behind_the_inflight_store(self):
+        """`staging_lanes=1` serialises the two lanes: a load waits out the
+        single in-flight store, but still not the backlog behind it. It does
+        *not* change standing HBM -- the staging buffer is per-thread and both
+        executors are `max_workers=1`, so HBM is two buffers either way; this
+        knob only gates load/store concurrency, which is what this asserts."""
         codec = self._BlockingCodec()
         tier = self._tier(codec, staging_lanes=1)
         try:
