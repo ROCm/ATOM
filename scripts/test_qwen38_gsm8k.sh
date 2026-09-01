@@ -3,7 +3,7 @@
 # Supports dense BF16/block-FP8 and MoE Quark-MXFP4 checkpoints.
 #
 # Usage:
-#   scripts/test_qwen38_gsm8k.sh MODEL_PATH [TP_SIZE] [PORT] [SERVER_EXTRA_ARGS...]
+#   scripts/test_qwen38_gsm8k.sh MODEL [TP_SIZE] [PORT] [SERVER_EXTRA_ARGS...]
 #
 # Example:
 #   HIP_VISIBLE_DEVICES=0 scripts/test_qwen38_gsm8k.sh \
@@ -85,9 +85,14 @@ is_batch_size() {
     [[ "$1" == "auto" ]] || is_positive_integer "$1"
 }
 
-[[ -n "${MODEL_PATH}" ]] || die "请传入已下载模型的本地路径。"
-[[ -d "${MODEL_PATH}" ]] || die "模型目录不存在: ${MODEL_PATH}"
-[[ -f "${MODEL_PATH}/config.json" ]] || die "模型目录缺少 config.json: ${MODEL_PATH}"
+[[ -n "${MODEL_PATH}" ]] || die "请传入 Hugging Face 模型 ID 或本地模型目录。"
+if [[ -d "${MODEL_PATH}" ]]; then
+    [[ -f "${MODEL_PATH}/config.json" ]] \
+        || die "模型目录缺少 config.json: ${MODEL_PATH}"
+    MODEL_PATH="$(cd -- "${MODEL_PATH}" && pwd)"
+elif [[ -e "${MODEL_PATH}" ]]; then
+    die "MODEL 必须是 Hugging Face 模型 ID 或模型目录: ${MODEL_PATH}"
+fi
 is_positive_integer "${TP_SIZE}" || die "TP_SIZE 必须是正整数: ${TP_SIZE}"
 is_positive_integer "${PORT}" || die "PORT 必须是正整数: ${PORT}"
 is_non_negative_integer "${NUM_FEWSHOT}" || die "NUM_FEWSHOT 必须是非负整数。"
@@ -113,7 +118,6 @@ for command_name in python3 curl lm_eval; do
 done
 command -v setsid >/dev/null 2>&1 || die "缺少 setsid，无法安全管理 ATOM 子进程。"
 
-MODEL_PATH="$(cd -- "${MODEL_PATH}" && pwd)"
 mkdir -p "${RESULT_DIR}"
 cd "${REPO_ROOT}"
 export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
@@ -121,13 +125,23 @@ export OPENAI_API_KEY="${OPENAI_API_KEY:-EMPTY}"
 
 # Qwen3.8 reuses Qwen3.5 dense/MoE architectures. Accept the official dense
 # BF16/block-FP8 and text-only MoE Quark-MXFP4 variants.
-python3 - "${MODEL_PATH}/config.json" <<'PY'
+python3 - "${MODEL_PATH}" <<'PY'
 import json
 import sys
+from pathlib import Path
 
-config_path = sys.argv[1]
-with open(config_path, encoding="utf-8") as config_file:
-    config = json.load(config_file)
+model = sys.argv[1]
+config_path = Path(model) / "config.json"
+if config_path.is_file():
+    with config_path.open(encoding="utf-8") as config_file:
+        config = json.load(config_file)
+else:
+    from transformers import AutoConfig
+
+    config = AutoConfig.from_pretrained(
+        model,
+        trust_remote_code=True,
+    ).to_dict()
 
 architectures = config.get("architectures") or []
 model_type = config.get("model_type")

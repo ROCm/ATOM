@@ -1031,6 +1031,7 @@ class CoreManager:
             self.broadcast_utility_command("abort_request", req_id=req_id)
         except Exception as e:
             logger.warning(f"{self.label}: abort_request({req_id}) failed: {e}")
+            raise
 
     def broadcast_utility_command(self, cmd: str, **kwargs):
         payload = {"cmd": cmd, **kwargs}

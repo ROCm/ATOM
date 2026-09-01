@@ -15,7 +15,7 @@ import time
 from asyncio import AbstractEventLoop, Event
 from typing import Any, NamedTuple
 
-from atom.model_engine.stop_strings import IncrementalDetokenizer
+from atom.model_engine.stop_strings import StreamingTextState
 
 logger = logging.getLogger("atom")
 
@@ -174,7 +174,7 @@ class _BufferedChunk(NamedTuple):
 
     loop: AbstractEventLoop
     collector: Any
-    state: IncrementalDetokenizer
+    state: StreamingTextState
     chunk: dict
     tag: int | None
 
@@ -199,16 +199,16 @@ class StreamBatchDispatcher:
         self.tokenizer = tokenizer
         self._thread_local = threading.local()
 
-    def new_state(self) -> IncrementalDetokenizer:
+    def new_state(self, stop_strings: list[str] | None = None) -> StreamingTextState:
         """Make the detokenizer for one stream, for its callback to hold."""
-        return IncrementalDetokenizer(self.tokenizer)
+        return StreamingTextState(self.tokenizer, stop_strings)
 
     def enqueue(
         self,
         *,
         loop: AbstractEventLoop,
         collector: Any,
-        state: IncrementalDetokenizer,
+        state: StreamingTextState,
         chunk: dict,
         tag: int | None = None,
     ) -> None:
@@ -228,20 +228,11 @@ class StreamBatchDispatcher:
 
         by_loop: dict[AbstractEventLoop, list[tuple[Any, Any]]] = {}
         for item in buf:
-            delta = item.state.update(
+            item.chunk["text"] = item.state.update(
                 item.chunk.get("token_ids") or [],
                 bool(item.chunk.get("finished")),
+                item.chunk.get("stop_truncate_to", -1),
             )
-            # `stop_truncate_to` counts characters of the whole completion,
-            # because that is the only frame a stop string is defined in. A
-            # stream sends deltas, so it becomes "how much of this delta is
-            # still inside the cut" -- and the detokenizer's accumulated
-            # `text` is what converts between the two.
-            truncate_to = item.chunk.get("stop_truncate_to", -1)
-            if truncate_to >= 0:
-                emitted_before = len(item.state.text) - len(delta)
-                delta = delta[: max(0, truncate_to - emitted_before)]
-            item.chunk["text"] = delta
             payload = item.chunk if item.tag is None else (item.tag, item.chunk)
             by_loop.setdefault(item.loop, []).append((item.collector, payload))
 

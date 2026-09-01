@@ -30,10 +30,9 @@ def _import_sampler_module():
         "aiter.ops.triton",
         "aiter.ops.triton.softmax",
         "aiter.ops.triton.topk",
-        "atom.model_ops.sampler",
     )
     saved = {name: sys.modules.get(name) for name in stub_names}
-    for name in stub_names[:-1]:
+    for name in stub_names:
         module = types.ModuleType(name)
         module.__path__ = []
         # Any symbol sampler.py binds from AITER resolves to a mock.
@@ -41,7 +40,6 @@ def _import_sampler_module():
         sys.modules[name] = module
     sys.modules["aiter.ops.triton.softmax"].softmax = torch.softmax
     sys.modules["aiter.ops.triton.topk"].topk = torch.topk
-    sys.modules.pop("atom.model_ops.sampler", None)
     try:
         import atom.model_ops.sampler as sampler_module
 

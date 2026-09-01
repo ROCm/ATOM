@@ -292,6 +292,7 @@ class LLMEngine:
         self.add_request(
             token_ids_list,
             sampling_params,
+            stream_callback=lambda _request_output: None,
             multimodal_data_list=multimodal_data_list,
         )
         outputs = {}
@@ -564,10 +565,6 @@ class InputOutputProcessor:
         self.tokenizer = tokenizer
         self.block_size = block_size
         self.requests = {}
-        # req_id -> truncate_to, for requests a stop string ended. Written by
-        # the wrapped stream callback, read once by `postprocess`, which
-        # removes the entry with the request.
-        self._stop_string_hits: dict[int, int] = {}
         # Set by LLMEngine once its CoreManager exists. A stop string is
         # decided here, in the frontend, so ending the request means telling
         # the engine core to stop working on it.
@@ -624,23 +621,53 @@ class InputOutputProcessor:
         unchanged -- no detokenizer, no wrapper, no per-step work. That is the
         overwhelming majority of them.
         """
-        stops = sampling_params.stop_strings
+        stops = [stop for stop in (sampling_params.stop_strings or ()) if stop]
         if not stops:
             return callback
 
         detokenizer = IncrementalDetokenizer(self.tokenizer)
         include = sampling_params.include_stop_str_in_output
+        min_tokens = sampling_params.min_tokens
         # The abort is fire-and-forget and the engine keeps producing until it
         # lands, so more output can arrive for a request already stopped.
         # Everything after the first hit is dropped rather than re-checked.
-        state = {"stopped": False}
+        state = {
+            "stopped": False,
+            "abort_sent": False,
+            "completion_tokens": 0,
+            "truncate_to": -1,
+        }
+
+        def request_abort(request_id):
+            if state["abort_sent"] or self.abort_request is None:
+                return
+            try:
+                self.abort_request(request_id)
+                state["abort_sent"] = True
+            except Exception:
+                # Keep abort_sent false so a later engine chunk retries. The
+                # client waits for the genuine terminal output rather than
+                # being told the request finished while it still runs.
+                logger.warning(
+                    "Abort after stop string failed for request %s",
+                    request_id,
+                    exc_info=True,
+                )
 
         def on_output(request_output):
+            state["completion_tokens"] += len(request_output.output_tokens or ())
             if not state["stopped"]:
                 delta = detokenizer.update(
                     request_output.output_tokens or (), request_output.finished
                 )
-                hit = check_stop_strings(detokenizer.text, len(delta), stops, include)
+                # A stop string itself may consume one or more tokens. Waiting
+                # until the cumulative count is above the floor guarantees at
+                # least min_tokens tokens precede the terminal condition.
+                hit = (
+                    check_stop_strings(detokenizer.text, len(delta), stops, include)
+                    if state["completion_tokens"] > min_tokens
+                    else None
+                )
                 if hit is not None:
                     # Only the cut is kept. Which stop string matched is not
                     # reported: `finish_reason` already says one did, and
@@ -655,25 +682,25 @@ class InputOutputProcessor:
                         # what keeps that tail out of the final text.
                         truncate_to = len(detokenizer.text)
                     state["stopped"] = True
-                    request_output.finished = True
-                    request_output.finish_reason = "stop_sequence"
+                    state["truncate_to"] = truncate_to
                     request_output.stop_truncate_to = truncate_to
-                    self._stop_string_hits[request_output.request_id] = truncate_to
-                    if self.abort_request is not None:
-                        try:
-                            self.abort_request(request_output.request_id)
-                        except Exception:
-                            # The request ends for the client either way; a
-                            # failed abort only costs the tokens it would have
-                            # saved, and raising here would lose the output.
-                            logger.warning(
-                                "Abort after stop string failed for request %s",
-                                request_output.request_id,
-                                exc_info=True,
-                            )
+                    seq = getattr(self, "requests", {}).get(request_output.request_id)
+                    if seq is not None:
+                        seq.stop_truncate_to = truncate_to
+                    if request_output.finished:
+                        request_output.finish_reason = "stop_sequence"
+                    else:
+                        request_abort(request_output.request_id)
             elif not request_output.finished:
                 # Trailing output from before the abort landed.
+                request_abort(request_output.request_id)
                 return
+            else:
+                # Do not synthesize a terminal event at the text match. The
+                # real one may carry P/D KV-transfer metadata and is what lets
+                # EngineCoreManager retire the callback safely.
+                request_output.finish_reason = "stop_sequence"
+                request_output.stop_truncate_to = state["truncate_to"]
 
             if callback is not None:
                 callback(request_output)
@@ -815,16 +842,17 @@ class InputOutputProcessor:
             external_request_id = self._internal_to_external.pop(req.id, None)
             if external_request_id is not None:
                 self._external_to_internal.pop(external_request_id, None)
-            output_str = self.tokenizer.decode(req.completion_token_ids)
+            output_str = self.tokenizer.decode(
+                req.completion_token_ids, skip_special_tokens=True
+            )
             # A stop string ends the request from here, so this is also where
             # its two effects land: the text is cut where the client asked,
             # and the reason reads `stop_sequence` rather than whatever the
             # engine core happened to report for the tokens that arrived
             # before the abort took hold.
-            truncate_to = self._stop_string_hits.pop(req.id, None)
-            if truncate_to is not None:
-                if truncate_to >= 0:
-                    output_str = output_str[:truncate_to]
+            truncate_to = req.stop_truncate_to
+            if truncate_to >= 0:
+                output_str = output_str[:truncate_to]
                 req.leave_reason = "stop_sequence"
             req.leave_time = time.time()
 
@@ -860,15 +888,6 @@ class InputOutputProcessor:
                 "tpot": tpot,  # Time per output token in seconds
             }
         return outputs
-
-    def discard_stop_state(self, req_id) -> None:
-        """Forget a request's stop-string hit without producing an output.
-
-        `postprocess` is the ordinary consumer, but a request can leave
-        without reaching it -- a disconnected client, an abort -- and the
-        entry would then outlive the request.
-        """
-        self._stop_string_hits.pop(req_id, None)
 
     def has_pending_requests(self):
         return len(self.requests) > 0

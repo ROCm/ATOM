@@ -510,12 +510,13 @@ For each running sequence whose ID appears in `fwd_output.req_ids`:
 
 ### Stop condition checking
 
-The postprocessor checks stop conditions in priority order:
+The postprocessor selects the earliest eligible token-level stop:
 
-1. **Stop token sequences:** Compares the tail of `seq.token_ids` against each entry in `seq.stop_token_sequences`. Also checks the MTP-adjusted position for speculative decode. Sets `leave_reason = "stop_sequence"`.
-2. **EOS token:** If `self.eos_token_id` appears in the accepted tokens and `seq.ignore_eos` is `False`. Sets `leave_reason = "eos"`.
-3. **Stop token IDs:** If any accepted token is in `self.stop_token_ids` (from `Config.stop_token_ids`, derived from the model's generation config). Sets `leave_reason = "stop_{token_id}"`.
-4. **Max tokens:** If `seq.num_completion_tokens >= seq.max_tokens`. Sets `leave_reason = "max_tokens"`.
+1. **EOS token:** The first EOS in the accepted tokens when `seq.ignore_eos` is `False`.
+2. **Stop token IDs:** The first configured or request-level stop ID in the accepted tokens.
+3. **Max tokens:** The output cap, if it occurs before either natural stop.
+
+Each candidate is checked at its position within a speculative multi-token step, so a later accepted token cannot make an earlier stop cross `min_tokens`. Stop strings are matched against detokenized text in the frontend, where token-boundary-independent matching is possible.
 
 ### Stream output
 
@@ -629,9 +630,8 @@ class Sequence:
         token_ids: list[int],
         block_size: int,
         sampling_params=SamplingParams(),
-        stop_token_sequences: list[list[int]] = None,
         stream_callback: Optional[Callable[[Any], None]] = None,
-        id=None,
+        request_id: str | None = None,
     ):
 ```
 
@@ -654,9 +654,10 @@ class Sequence:
 | `last_token` | `int` | Most recently appended token ID |
 | `temperature` | `float` | Sampling temperature (from `SamplingParams`) |
 | `max_tokens` | `int` | Max completion tokens (from `SamplingParams`, default 64) |
+| `min_tokens` | `int` | Minimum completion length before a natural stop may fire |
 | `ignore_eos` | `bool` | Whether to ignore EOS tokens (from `SamplingParams`) |
 | `stop_strings` | `Optional[list[str]]` | Stop strings (from `SamplingParams`) |
-| `stop_token_sequences` | `list[list[int]]` | Token-level stop sequences |
+| `request_stop_token_ids` | `frozenset[int]` | Request-level token IDs that end generation |
 | `stream_callback` | `Optional[Callable]` | Per-sequence stream callback |
 | `output_tokens` | `list[int]` | Cache of newly generated tokens |
 | `spec_token_ids` | `list[int]` | Speculative draft token IDs for next step |

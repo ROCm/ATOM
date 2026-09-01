@@ -230,6 +230,30 @@ class TestSchedule:
         # One real sampled token, whatever the placeholder width happens to be.
         np.testing.assert_array_equal(batch.num_completion_tokens, [1])
 
+    def test_min_tokens_metadata_discounts_all_speculative_placeholders(
+        self, seq_factory
+    ):
+        seq = seq_factory([1, 2, 3, 4], sampling_params=SamplingParams(min_tokens=4))
+        # Steady-state deferred MTP-1 carries three physical slots beyond the
+        # one real completion token: two newly appended placeholders plus the
+        # verification slot postprocess discounts on entry.
+        for token in (10, 2, 2, 2):
+            seq.append_token(token)
+        seq.num_placeholder_tokens = 2
+        seq.num_rejected = 0
+
+        batch = ScheduledBatch(
+            seqs={seq.id: seq},
+            num_scheduled_tokens=[2],
+            total_tokens_num=2,
+            total_tokens_num_decode=2,
+            total_seqs_num=1,
+            total_seqs_num_decode=1,
+            num_spec_step=1,
+        )
+
+        np.testing.assert_array_equal(batch.num_completion_tokens, [1])
+
     def test_prefill_respects_max_num_seqs(self, seq_factory):
         sched = Scheduler(
             MockConfig(
@@ -1296,6 +1320,38 @@ class TestPostprocess:
         )
         assert len(finished) == 1
         assert finished[0].leave_reason == "eos"
+
+    def test_min_tokens_checks_the_stop_position_within_an_mtp_step(
+        self, scheduler, seq_factory
+    ):
+        seq = self._prefill(
+            scheduler,
+            seq_factory([1, 2, 3, 4], sampling_params=SamplingParams(min_tokens=5)),
+        )
+
+        finished = scheduler.postprocess(
+            list(scheduler.running), self._output(seq.id, [2, 10, 11, 12, 13])
+        )
+
+        assert finished == []
+        assert seq.num_completion_tokens == 5
+
+    def test_earlier_request_stop_id_wins_over_later_eos(self, scheduler, seq_factory):
+        seq = self._prefill(
+            scheduler,
+            seq_factory(
+                [1, 2, 3, 4],
+                sampling_params=SamplingParams(stop_token_ids=[11]),
+            ),
+        )
+
+        finished = scheduler.postprocess(
+            list(scheduler.running), self._output(seq.id, [11, 10, 2])
+        )
+
+        assert len(finished) == 1
+        assert finished[0].leave_reason == "stop_11"
+        assert finished[0].num_completion_tokens == 1
 
     def test_min_tokens_does_not_outlive_max_tokens(self, scheduler, seq_factory):
         """A floor that reaches the ceiling must still terminate there.

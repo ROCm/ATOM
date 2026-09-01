@@ -63,6 +63,7 @@ from atom.entrypoints.openai.tool_parser.registry import (
     resolve_tool_call_parser,
 )
 from atom.model_engine.sequence import new_token_ids
+from atom.model_engine.stop_strings import StreamingTextState
 
 logger = logging.getLogger("atom")
 
@@ -383,6 +384,7 @@ class AtomEngineService:
             tokenizer=self.tokenizer,
             stream_queue=request.stream_queue,
             n=1,
+            stop_strings=getattr(request.sampling_params, "stop_strings", None),
         )
 
         def completion_callback(request_output: Any) -> None:
@@ -404,6 +406,7 @@ class AtomEngineService:
             tokenizer=self.tokenizer,
             stream_queue=request.stream_queue,
             n=request.effective_n,
+            stop_strings=getattr(request.sampling_params, "stop_strings", None),
         )
 
         def make_callback(index: int):
@@ -579,6 +582,7 @@ class FanoutRequestState:
         self.per_first_token_at: list[float | None] = [None] * n
         self.per_last_token_at: list[float | None] = [None] * n
         self.per_finish_reason: list[str | None] = [None] * n
+        self.per_stop_truncate_to = [-1] * n
         self.finished = [False] * n
         self.num_tokens_input = 0
         self._lock = threading.Lock()
@@ -599,6 +603,7 @@ class FanoutRequestState:
                 self.per_tokens[index].extend(output_tokens)
             if request_output.finished:
                 self.per_finish_reason[index] = request_output.finish_reason
+                self.per_stop_truncate_to[index] = request_output.stop_truncate_to
                 self.finished[index] = True
                 if all(self.finished):
                     self.future.set_result(self._build_outputs(time.time()))
@@ -619,11 +624,14 @@ class FanoutRequestState:
                 and num_tokens_output > 1
                 else 0.0
             )
+            text = self.tokenizer.decode(
+                self.per_tokens[index], skip_special_tokens=True
+            )
+            if self.per_stop_truncate_to[index] >= 0:
+                text = text[: self.per_stop_truncate_to[index]]
             outputs.append(
                 {
-                    "text": self.tokenizer.decode(
-                        self.per_tokens[index], skip_special_tokens=True
-                    ),
+                    "text": text,
                     "token_ids": self.per_tokens[index],
                     "finish_reason": self.per_finish_reason[index],
                     "num_tokens_input": self.num_tokens_input,
@@ -643,11 +651,15 @@ class StreamRequestState:
         tokenizer: Any,
         stream_queue: queue.Queue[dict[str, Any]],
         n: int,
+        stop_strings: list[str] | None = None,
     ) -> None:
         self.request_id = request_id
         self.tokenizer = tokenizer
         self.stream_queue = stream_queue
         self.finished = [False] * n
+        self.text_states = [
+            StreamingTextState(tokenizer, stop_strings) for _ in range(n)
+        ]
         self._lock = threading.Lock()
 
     def record(self, index: int, request_output: Any) -> None:
@@ -656,10 +668,10 @@ class StreamRequestState:
                 return
 
             output_tokens = request_output.output_tokens or []
-            text = (
-                self.tokenizer.decode(output_tokens, skip_special_tokens=True)
-                if output_tokens
-                else ""
+            text = self.text_states[index].update(
+                output_tokens,
+                request_output.finished,
+                request_output.stop_truncate_to,
             )
             if output_tokens or request_output.finished:
                 event = {
@@ -1693,6 +1705,11 @@ class AtomStandaloneService:
             top_k=self._request_field(request, "top_k", DEFAULT_TOP_K),
             top_p=self._request_field(request, "top_p", DEFAULT_TOP_P),
             n=effective_n,
+            min_tokens=self._request_field(request, "min_tokens", 0),
+            stop_token_ids=self._request_field(request, "stop_token_ids"),
+            include_stop_str_in_output=self._request_field(
+                request, "include_stop_str_in_output", False
+            ),
         )
 
     @staticmethod

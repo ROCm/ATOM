@@ -333,6 +333,19 @@ def _optimal_cu_fraction(
         return 0.5
 
 
+def _first_allowed_stop_index(
+    step_token_ids,
+    candidate_ids,
+    completion_before: int,
+    minimum: int,
+) -> int | None:
+    for token_idx, token_id in enumerate(step_token_ids):
+        completion_at_stop = completion_before + token_idx + 1
+        if token_id in candidate_ids and completion_at_stop >= minimum:
+            return token_idx
+    return None
+
+
 class ScheduledBatch:
     """Immutable snapshot of sequences selected for a single forward pass.
 
@@ -422,16 +435,21 @@ class ScheduledBatch:
         # Both payloads below are read only while a sequence sits under its
         # floor, so the min_tokens=0 batch — the common case — skips them.
         if self.min_tokens.any():
-            # `num_completion_tokens` counts the trailing placeholders the last
-            # postprocess appended -- `mtp_k` of them when verifying drafts,
-            # plus one in deferred-output mode -- and those slots hold no
-            # sampled token yet. Counting them would let a request cross its
-            # floor early, by exactly the placeholder width, which is the
-            # correction `postprocess` makes for the same reason before it
-            # compares against `max_tokens`.
+            # Keep this count identical to postprocess's real-token view.  A
+            # running speculative sequence contains both the fresh placeholders
+            # appended after the previous step and the mtp_k + rejected slots
+            # that postprocess discounts before computing its committed length.
+            # Subtracting only num_placeholder_tokens therefore crosses the
+            # floor early under deferred speculative decode.
             self.num_completion_tokens = np.asarray(
                 [
-                    seq.num_completion_tokens - seq.num_placeholder_tokens
+                    max(
+                        0,
+                        seq.num_completion_tokens
+                        - seq.num_placeholder_tokens
+                        - num_spec_step
+                        - seq.num_rejected,
+                    )
                     for seq in seqs.values()
                 ],
                 dtype=np.int32,
@@ -2350,50 +2368,52 @@ class Scheduler:
             # Track the earliest stop position so `num_tokens` can drop the
             # spurious tail below.
             stop_at_idx: int | None = None
-            # A sequence below its `min_tokens` floor cannot stop naturally.
-            # The sampler's mask already keeps these same ids out of the
-            # logits it sampled from, so on the ordinary path this agrees with
-            # a decision already made. It is load-bearing where the mask does
-            # not reach: a token that arrived before the floor was raised, and
-            # any path that hands the scheduler ids it did not sample.
-            # `max_tokens` is deliberately left outside the guard -- the
-            # ceiling always wins, and `SamplingParams` has already rejected
-            # `min_tokens > max_tokens`.
-            # `seq.min_tokens` is 0 for every request that does not ask for a
-            # floor, so the common path stops at the first term.
-            below_min_tokens = (
-                seq.min_tokens > 0
-                and (num_tokens - seq.num_prompt_tokens) < seq.min_tokens
-            )
             # Every stop this block can decide is a *token* comparison, which
             # needs no tokenizer and so belongs here. Stop strings are the
             # exception and are matched on detokenized text by the frontend --
             # see `atom.model_engine.stop_strings`.
-            if not below_min_tokens:
-                # `config.stop_token_ids` is `generation_config.eos_token_id`
-                # minus the primary one -- the model's other end-of-turn
-                # tokens, EOS by another name -- so `ignore_eos` silences
-                # those along with EOS itself. A request's own stop ids are
-                # not EOS: the client named them, and they fire either way.
-                # vLLM draws the same line, by folding the model's extra ids
-                # into `stop_token_ids` only when `not ignore_eos` and then
-                # testing that set unconditionally.
-                stop_ids = seq.request_stop_token_ids
-                if not seq.ignore_eos:
-                    stop_ids = (
-                        self.stop_token_ids | stop_ids
-                        if stop_ids
-                        else self.stop_token_ids
-                    )
-                # Check the last token in the list for EOS
-                if token_ids and not seq.ignore_eos and self.eos_token_id in token_ids:
-                    leave_reason = "eos"
-                    stop_at_idx = token_ids.index(self.eos_token_id)
-                elif stop_ids and any(t in stop_ids for t in token_ids):
-                    stop_at_idx = next(
-                        i for i, t in enumerate(token_ids) if t in stop_ids
-                    )
-                    leave_reason = f"stop_{token_ids[stop_at_idx]}"
+            # A speculative step can return several tokens.  The floor must be
+            # checked at each candidate's position, not against the post-step
+            # total: an EOS at row 0 is still below min_tokens even when later
+            # accepted drafts take the whole step past the floor.
+            completion_before_step = num_tokens - seq.num_prompt_tokens - num_new_token
+
+            # `config.stop_token_ids` is `generation_config.eos_token_id`
+            # minus the primary one -- the model's other end-of-turn tokens,
+            # EOS by another name -- so `ignore_eos` silences those along with
+            # EOS itself. A request's own stop ids fire either way.
+            stop_ids = seq.request_stop_token_ids
+            if not seq.ignore_eos:
+                stop_ids = (
+                    self.stop_token_ids | stop_ids if stop_ids else self.stop_token_ids
+                )
+
+            eos_idx = (
+                _first_allowed_stop_index(
+                    token_ids,
+                    (self.eos_token_id,),
+                    completion_before_step,
+                    seq.min_tokens,
+                )
+                if token_ids and not seq.ignore_eos
+                else None
+            )
+            stop_id_idx = (
+                _first_allowed_stop_index(
+                    token_ids,
+                    stop_ids,
+                    completion_before_step,
+                    seq.min_tokens,
+                )
+                if stop_ids
+                else None
+            )
+            if eos_idx is not None and (stop_id_idx is None or eos_idx <= stop_id_idx):
+                leave_reason = "eos"
+                stop_at_idx = eos_idx
+            elif stop_id_idx is not None:
+                stop_at_idx = stop_id_idx
+                leave_reason = f"stop_{token_ids[stop_at_idx]}"
 
             # ``num_tokens`` is the real post-verification length. One MTP
             # forward can accept multiple tokens, so the final batch can cross

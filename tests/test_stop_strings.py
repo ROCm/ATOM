@@ -4,7 +4,11 @@
 """Stop strings, matched on text rather than on token ids."""
 
 from atom.model_engine.request import RequestOutput
-from atom.model_engine.stop_strings import IncrementalDetokenizer, check_stop_strings
+from atom.model_engine.stop_strings import (
+    IncrementalDetokenizer,
+    StreamingTextState,
+    check_stop_strings,
+)
 from atom.sampling_params import SamplingParams
 
 
@@ -89,6 +93,10 @@ def test_no_stops_and_no_new_text_are_both_no_ops():
     assert check_stop_strings("abcSTOP", 0, ["STOP"], False) is None
 
 
+def test_an_empty_stop_string_is_ignored():
+    assert check_stop_strings("abc", 3, [""], False) is None
+
+
 # --- the detokenizer -------------------------------------------------------
 
 
@@ -119,6 +127,14 @@ def test_text_accumulates_across_deltas():
     assert detok.text == "hello"
 
 
+def test_stream_holds_a_partial_stop_until_the_next_delta():
+    tok = _Tokenizer({1: "abc</ans", 2: "wer>tail"})
+    state = StreamingTextState(tok, ["</answer>"])
+
+    assert state.update([1], False) == "abc"
+    assert state.update([2], False, truncate_to=3) == ""
+
+
 # --- the frontend wrapper: where a stop string ends a request ---------------
 
 
@@ -131,7 +147,7 @@ class _Processor:
         self.aborted = []
         self.impl = InputOutputProcessor.__new__(InputOutputProcessor)
         self.impl.tokenizer = tokenizer
-        self.impl._stop_string_hits = {}
+        self.impl.requests = {}
         self.impl.abort_request = self.aborted.append
 
     def wrap(self, params, callback):
@@ -152,15 +168,23 @@ def test_a_stop_string_finishes_and_aborts_the_request():
     assert seen[-1].finished is False
     assert proc.aborted == []
 
-    cb(_output([2]))
+    hit_output = _output([2])
+    cb(hit_output)
+    assert hit_output.finished is False
+    assert seen[-1].finished is False
+    assert seen[-1].stop_truncate_to == 2  # cut back to "ab"
+    assert proc.aborted == [7], "the engine core has to be told to stop"
+
+    terminal = _output([], finished=True)
+    terminal.kv_transfer_params_output = {"blocks": [1]}
+    cb(terminal)
     assert seen[-1].finished is True
     assert seen[-1].finish_reason == "stop_sequence"
-    assert seen[-1].stop_truncate_to == 2  # cut back to "ab"
+    assert seen[-1].stop_truncate_to == 2
+    assert seen[-1].kv_transfer_params_output == {"blocks": [1]}
     # Which stop string matched is deliberately not reported -- `finish_reason`
     # already says one did, and OpenAI's schema has no field for the identity.
     assert not hasattr(seen[-1], "stop_reason")
-    assert proc.aborted == [7], "the engine core has to be told to stop"
-    assert proc.impl._stop_string_hits[7] == 2
 
 
 def test_output_arriving_before_the_abort_lands_is_dropped():
@@ -172,8 +196,29 @@ def test_output_arriving_before_the_abort_lands_is_dropped():
 
     cb(_output([1]))
     cb(_output([2]))
-    assert len(seen) == 1, "the client already got its finished chunk"
+    cb(_output([], finished=True))
+    assert len(seen) == 2, "only the trailing non-terminal chunk is dropped"
+    assert seen[-1].finished is True
     assert proc.aborted == [7], "and it is aborted once, not twice"
+
+
+def test_failed_abort_is_retried_on_the_next_engine_chunk():
+    tok = _Tokenizer({1: "STOP", 2: "extra"})
+    proc = _Processor(tok)
+    attempts = []
+
+    def flaky_abort(request_id):
+        attempts.append(request_id)
+        if len(attempts) == 1:
+            raise RuntimeError("control socket unavailable")
+
+    proc.impl.abort_request = flaky_abort
+    cb = proc.wrap(SamplingParams(stop_strings=["STOP"]), lambda _output: None)
+
+    cb(_output([1]))
+    cb(_output([2]))
+
+    assert attempts == [7, 7]
 
 
 def test_a_request_without_stop_strings_is_not_wrapped_at_all():
@@ -197,12 +242,15 @@ def test_include_stop_str_in_output_keeps_it():
 
     cb(_output([1]))
     cb(_output([2]))
-    assert seen[-1].finish_reason == "stop_sequence"
+    assert seen[-1].finished is False
     # The match ends the text, so `check_stop_strings` alone would say -1.
     # The wrapper pins the length anyway: the abort is asynchronous, and
     # tokens emitted before it lands would otherwise be appended past the
     # stop string with nothing left to cut them.
     assert seen[-1].stop_truncate_to == len("abSTOP")
+
+    cb(_output([], finished=True))
+    assert seen[-1].finish_reason == "stop_sequence"
 
 
 def test_a_tail_arriving_after_the_match_is_still_cut_off():
@@ -217,6 +265,23 @@ def test_a_tail_arriving_after_the_match_is_still_cut_off():
     )
 
     cb(_output([1]))
-    truncate_to = proc.impl._stop_string_hits[7]
+    truncate_to = seen[-1].stop_truncate_to
     # Whatever arrives next, the recorded cut still ends at the stop string.
     assert "abSTOP tail"[:truncate_to] == "abSTOP"
+
+
+def test_min_tokens_holds_off_stop_strings():
+    tok = _Tokenizer({1: ".", 2: "x", 3: "."})
+    proc = _Processor(tok)
+    seen = []
+    cb = proc.wrap(
+        SamplingParams(min_tokens=2, max_tokens=4, stop_strings=["."]),
+        seen.append,
+    )
+
+    cb(_output([1]))
+    cb(_output([2]))
+    assert proc.aborted == []
+
+    cb(_output([3]))
+    assert proc.aborted == [7]

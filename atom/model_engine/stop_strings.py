@@ -46,10 +46,18 @@ class IncrementalDetokenizer:
     number of deltas).
     """
 
-    __slots__ = ("prefix_offset", "read_offset", "text", "tokenizer", "tokens")
+    __slots__ = (
+        "prefix_offset",
+        "read_offset",
+        "text",
+        "tokenizer",
+        "tokens",
+        "track_text",
+    )
 
-    def __init__(self, tokenizer: Any):
+    def __init__(self, tokenizer: Any, *, track_text: bool = True):
         self.tokenizer = tokenizer
+        self.track_text = track_text
         # Only ever sliced into `tokenizer.decode`, which takes an array.
         self.tokens: array.array = new_token_ids()
         self.prefix_offset = 0
@@ -77,7 +85,62 @@ class IncrementalDetokenizer:
         else:
             delta = ""
 
-        self.text += delta
+        if self.track_text:
+            self.text += delta
+        return delta
+
+
+class StreamingTextState:
+    """Detokenize a stream without exposing a possible stop-string prefix.
+
+    A stop string may straddle engine steps.  Holding only the suffix that is
+    still a prefix of one of the configured stops prevents a later match from
+    requiring text already sent to the client to be retracted.
+    """
+
+    __slots__ = ("detokenizer", "emitted_chars", "stops")
+
+    def __init__(self, tokenizer: Any, stops: list[str] | None = None):
+        self.stops = tuple(stop for stop in (stops or ()) if stop)
+        self.detokenizer = IncrementalDetokenizer(
+            tokenizer, track_text=bool(self.stops)
+        )
+        self.emitted_chars = 0
+
+    @property
+    def tokens(self):
+        return self.detokenizer.tokens
+
+    def update(
+        self,
+        token_ids,
+        finished: bool,
+        truncate_to: int = -1,
+    ) -> str:
+        delta = self.detokenizer.update(token_ids, finished)
+        if not self.stops:
+            return delta
+
+        text = self.detokenizer.text
+        if truncate_to >= 0:
+            safe_end = min(truncate_to, len(text))
+        elif finished:
+            safe_end = len(text)
+        else:
+            held = 0
+            for stop in self.stops:
+                # A complete stop is handled by the frontend wrapper in this
+                # same engine step. Only a proper prefix needs carrying into
+                # the next step.
+                for prefix_len in range(1, len(stop)):
+                    if prefix_len > held and text.endswith(stop[:prefix_len]):
+                        held = prefix_len
+            safe_end = len(text) - held
+
+        if safe_end <= self.emitted_chars:
+            return ""
+        delta = text[self.emitted_chars : safe_end]
+        self.emitted_chars = safe_end
         return delta
 
 
@@ -110,6 +173,11 @@ def check_stop_strings(
     best_stop_index = 0
     best_end = sys.maxsize
     for stop_str in stop:
+        # The former token-level implementation ignored these because
+        # tokenizer.encode("") produced no ids. Preserve that behaviour
+        # rather than treating every position as an immediate match.
+        if not stop_str:
+            continue
         stop_index = output_text.find(stop_str, -new_char_count - len(stop_str) + 1)
         if stop_index == -1:
             continue

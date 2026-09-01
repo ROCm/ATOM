@@ -161,6 +161,19 @@ class Qwen3_5MoeForCausalLMVllm(ATOMMoEForCausalLM, IsHybrid):
     ) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
         return MambaStateCopyFuncCalculator.gated_delta_net_state_copy_func()
 
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # ATOM owns checkpoint iteration in plugin mode. Pass the model's
+        # fused-expert loader explicitly: loading_core discovers the format
+        # and mapping from the model, but deliberately does not infer this
+        # mutating callback.
+        del weights
+        return load_model_in_plugin_mode(
+            model=self.model,
+            config=self.atom_config,
+            prefix="model.",
+            load_fused_expert_weights_fn=self.model.load_fused_expert_weights,
+        )
+
 
 @MULTIMODAL_REGISTRY.register_processor(
     Qwen3VLMultiModalProcessor,

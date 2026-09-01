@@ -108,8 +108,6 @@ Both entries are `nightly` / `P0` on the `atom-plugin-acc-validation-runner-vllm
 
 Qwen3.8 alternates full attention with Gated-Delta-Net linear attention (one full layer every four). The GDN decode path needs request-indexed metadata, which interacts with vLLM's FULL CUDA graph padding:
 
-- vLLM pads a captured decode batch with zero-length rows at the **end** of `query_start_loc_cpu`. [`AtomGDNAttentionMetadataBuilder`](../../atom/plugin/vllm/gdn_backend.py) compacts that padded batch back to the real request prefix after `build()`.
-- The compaction slices `[:real_num_decodes]` instead of indexing with a GPU boolean mask. Building a device mask and using it for advanced indexing is not CUDA-graph safe on ROCm; the validation therefore stays on CPU.
-- The layout assumptions are asserted rather than assumed. If vLLM ever stops padding at the tail, emits multi-token decode rows, or changes the block-table shape, the builder raises a `RuntimeError` naming the broken assumption instead of silently reading the wrong state slots.
-
-This path is only entered when `use_full_cuda_graph` is set and the batch is pure decode (no prefills, no spec decode).
+- vLLM 0.27+ already pads FULL CUDA graph GDN metadata by request count and supplies `NULL_BLOCK_ID` for padded request slots.
+- [`AtomGDNAttentionMetadataBuilder`](../../atom/plugin/vllm/gdn_backend.py) therefore inherits vLLM's builder without a post-build compaction pass. Rewriting request-indexed metadata from the token-padded `num_actual_tokens` value shrinks `num_decodes` incorrectly and corrupts GDN `ssm_state` under graph replay.
+- Keep request padding owned by vLLM. Do not reintroduce token-count-based slicing or GPU boolean indexing in this builder.

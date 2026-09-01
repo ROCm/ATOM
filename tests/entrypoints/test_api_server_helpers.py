@@ -190,6 +190,28 @@ class TestBuildSamplingParams:
         )
         assert sp.min_tokens == 3
 
+    def test_nullable_min_tokens_uses_zero(self):
+        sp = api_server._build_sampling_params(
+            temperature=0.8,
+            max_tokens=16,
+            stop_strings=None,
+            ignore_eos=False,
+            min_tokens=None,
+        )
+        assert sp.min_tokens == 0
+
+    def test_request_stop_controls_propagate(self):
+        sp = api_server._build_sampling_params(
+            temperature=0.8,
+            max_tokens=16,
+            stop_strings=["END"],
+            ignore_eos=False,
+            stop_token_ids=[7],
+            include_stop_str_in_output=True,
+        )
+        assert sp.stop_token_ids == [7]
+        assert sp.include_stop_str_in_output is True
+
     def test_invalid_n_rejected_by_sampling_params(self):
         with pytest.raises(ValueError, match="n must be >= 1"):
             api_server._build_sampling_params(
@@ -307,12 +329,14 @@ class TestAnthropicSamplingParams:
             model="test",
             messages=[{"role": "user", "content": "Hi"}],
             temperature=0.0,
+            min_tokens=3,
         )
         asyncio.run(api_server.anthropic_messages(request, None))
 
         assert captured["temperature"] == 0.0
         assert captured["top_p"] == 0.95
         assert captured["top_k"] == -1
+        assert captured["min_tokens"] == 3
 
 
 class TestValidateContextLength:

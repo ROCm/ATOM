@@ -90,10 +90,13 @@ curl http://localhost:8000/v1/chat/completions -H 'Content-Type: application/jso
 }'
 ```
 
-The floor is enforced in two places, because no single one of them sees every way a request can end:
+The floor is enforced at every layer that can end a request:
 
-- **At the sampler**, [`apply_min_tokens_mask`](../atom/model_ops/sampler.py) masks the EOS id, the server's configured `stop_token_ids` and any **single-token** stop strings to `-inf` before sampling, for every request still below its floor. Masking logits (rather than dropping a sampled EOS) keeps the sampled distribution intact — feeding a sampled EOS back into the model would start a new message.
-- **At the scheduler**, `Scheduler.postprocess` refuses to finish a sequence below its floor. This is what holds off the one stop condition the sampler cannot see: a **multi-token** stop sequence, recognizable only after its whole suffix has landed. `max_tokens` stays outside that guard — the ceiling always wins, and `min_tokens > max_tokens` is rejected up front.
+- **At the sampler**, [`apply_min_tokens_mask`](../atom/model_ops/sampler.py) masks EOS, the server's configured `stop_token_ids`, and request-level `stop_token_ids` to `-inf` before sampling while the request is below its floor. Masking logits (rather than dropping a sampled EOS) keeps the sampled distribution intact.
+- **At the scheduler**, `Scheduler.postprocess` checks the completion length at the exact stop-token position. This matters when speculative decoding returns several tokens in one step: a later accepted draft cannot make an earlier EOS valid retroactively.
+- **At the frontend**, text-level stop strings are not checked until the request has passed its floor. Stop strings cannot be enforced in the token-only scheduler because they may cross token boundaries.
+
+`max_tokens` remains outside the floor guard: the ceiling always wins, and `min_tokens > max_tokens` is rejected up front.
 
 Further semantics:
 
