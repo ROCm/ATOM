@@ -20,6 +20,7 @@ from atom.kv_transfer.offload.atom_lmcache_staging import (
     _NullCtx,
     _StagingBuffer,
     _ThreadTransferState,
+    memory_object_as_uint8,
 )
 
 # ---------------------------------------------------------------------------
@@ -123,29 +124,6 @@ class StagedTransfer:
             return
         staging_buffer.tensor = None
 
-    def memory_tensor(self, memory_obj: Any, nbytes: int) -> torch.Tensor:
-        tensor = getattr(memory_obj, "tensor", None)
-        if tensor is None and hasattr(memory_obj, "get_tensor"):
-            tensor = memory_obj.get_tensor(0)
-        if tensor is None:
-            raise RuntimeError("ATOM LMCache connector: invalid MemoryObj tensor")
-        if tensor.dtype != torch.uint8:
-            raise TypeError(
-                "ATOM LMCache connector: MemoryObj tensor must be uint8, "
-                f"got {tensor.dtype}"
-            )
-        if not tensor.is_contiguous():
-            raise RuntimeError(
-                "ATOM LMCache connector: MemoryObj tensor not contiguous"
-            )
-        flat = tensor.reshape(-1)
-        if int(flat.numel()) < int(nbytes):
-            raise ValueError(
-                "ATOM LMCache connector: MemoryObj tensor is too small "
-                f"for {nbytes} bytes; got {int(flat.numel())}"
-            )
-        return flat[: int(nbytes)]
-
     # -- whole-entry transfer (state tier) --------------------------------
 
     @staticmethod
@@ -186,7 +164,7 @@ class StagedTransfer:
         segments = list(segments)
         seg_bytes = self._segment_block_bytes(segments)
         nbytes = sum(seg_bytes)
-        dst_tensor = self.memory_tensor(dst, nbytes)
+        dst_tensor = memory_object_as_uint8(dst, nbytes)
         with self._device_ctx():
             state = self.thread_state()
             staging_buffer = state.staging_buffer
@@ -250,7 +228,7 @@ class StagedTransfer:
         segments = list(segments)
         seg_bytes = self._segment_block_bytes(segments)
         nbytes = sum(seg_bytes)
-        src_tensor = self.memory_tensor(src, nbytes)
+        src_tensor = memory_object_as_uint8(src, nbytes)
         with self._device_ctx():
             state = self.thread_state()
             staging_buffer = state.staging_buffer
