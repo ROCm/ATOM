@@ -15,6 +15,7 @@ Usage:
 import asyncio
 import base64
 import binascii
+import contextlib
 import io
 import json
 import logging
@@ -940,10 +941,8 @@ async def generate_async(
         #      forever). Streaming pops via cleanup_stream instead.
         if seq is not None:
             if not _finished_ok:
-                try:
+                with contextlib.suppress(Exception):
                     engine.core_mgr.abort_request(seq.id)
-                except Exception:
-                    pass
             engine.io_processor.requests.pop(seq.id, None)
 
     text = delivered_text(all_token_ids)
@@ -1047,10 +1046,8 @@ async def generate_async_multimodal(
         # See generate_async: abort on early exit, always pop to avoid leak.
         if seq is not None:
             if not _finished_ok:
-                try:
+                with contextlib.suppress(Exception):
                     engine.core_mgr.abort_request(seq.id)
-                except Exception:
-                    pass
             engine.io_processor.requests.pop(seq.id, None)
 
     text = delivered_text(all_token_ids)
