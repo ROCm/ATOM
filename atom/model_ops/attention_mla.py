@@ -2112,10 +2112,10 @@ class MLAAttention(nn.Module):
                 dcp_world_size=self.dcp_world_size,
                 dcp_persistent_supported=self.dcp_persistent_supported,
             )
-            # Sparse DCP persistent decode is enabled only for ordinary q_len=1
-            # native serving. Its full IndexShare layers rebuild the work plan
-            # below from the layer-local compact indptr; plugin/speculative paths
-            # retain the established non-persistent fallback.
+            # Sparse DCP persistent decode rebuilds the work plan below from
+            # the layer-local compact indptr on every full IndexShare layer. An
+            # MTP verify step is per-token q_len=1 rows and rebuilds into the
+            # sparse_mtp_ work buffers, so it stays on this path too.
             if self.is_sparse_mla and self.dcp_world_size > 1:
                 use_persistent_mode = (
                     use_persistent_mode and self.sparse_dcp_metadata_rebuild

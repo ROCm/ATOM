@@ -537,11 +537,12 @@ compacts its rank-local top-k. The rebuild consumes that layer's
 indptr, and work plan. This makes the persistent descriptors and the actual
 sparse regions agree without rebuilding metadata on shared layers.
 
-The implementation is scoped to native, non-speculative serving on gfx950 with
-page size 1: decode is q_len=1, while sparse prefill is represented as per-token
-virtual q_len=1 rows. Unsupported paths (including gfx942 and plugin or
-speculative sparse DCP paths without the per-layer rebuild) remain
-non-persistent and round a gathered 64 up to **128**.
+The implementation covers native serving on gfx950 with page size 1, speculative
+decode included: decode is q_len=1, sparse prefill is represented as per-token
+virtual q_len=1 rows, and an MTP verify step rebuilds into its own
+`sparse_mtp_`-prefixed work buffers for the per-token layout. Paths without the
+per-layer rebuild (gfx942, or a page size above 1) remain non-persistent and
+round a gathered 64 up to **128**.
 
 **GLM-5.2 is the model that benefits**: 64 query heads at `-tp 8` is 8 per
 rank, so `-dcp 8` gathers exactly 64 and now dispatches the native persistent
