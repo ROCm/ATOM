@@ -427,6 +427,23 @@ class OffloadSchedulerMixin(ABC):
 
         return offload_save_abandon_timeout_s()
 
+    @property
+    def max_pending_saves(self) -> int | None:
+        """Running-plus-queued save bound this connector enforces, else None.
+
+        The public read of the per-connector `_max_pending_saves` that
+        `max_pending_saves(kvc, save_workers)` computes from
+        `kv_connector_extra_config` and `OFFLOAD_COPY_WORKERS`. The state leg
+        (`Scheduler._state_store_pending_cap`) shares this exact number with the
+        KV leg's `_may_emit_save` so both legs pin the same slice of the pool,
+        and honours a per-connector `"max_pending_saves"` override the env reader
+        never sees. None when the connector does not bound its save queue
+        (`_may_emit_save` always True, as on dense) -- the scheduler then falls
+        back to the env reader. Exposed so the scheduler never reaches through
+        the delegating shell's `_impl` for it.
+        """
+        return getattr(self, "_max_pending_saves", None)
+
     def _chunk_floor(self, tokens: int) -> int:
         chunk = int(self.chunk_size or 256)
         return (max(0, int(tokens)) // chunk) * chunk

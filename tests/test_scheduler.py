@@ -2009,6 +2009,43 @@ class TestStalledOffloadSaveReclaim:
         assert s._save_abandon_timeout_s() == 0.0
 
 
+class TestStateStorePendingCap:
+    """`_state_store_pending_cap`: the state leg reads the KV leg's save bound.
+
+    It must share the connector's real `max_pending_saves` so both legs pin the
+    same slice of the pool -- and read it off the *public* accessor, never by
+    reaching through the delegating shell's `_impl` (review finding §2b).
+    """
+
+    @staticmethod
+    def _sched(connector):
+        import atom.model_engine.scheduler as sched_mod
+
+        s = object.__new__(sched_mod.Scheduler)
+        s.kv_connector = connector
+        return s
+
+    def test_reads_the_public_bound_off_the_connector(self):
+        s = self._sched(SimpleNamespace(max_pending_saves=5))
+        assert s._state_store_pending_cap() == 5
+
+    def test_falls_back_to_env_when_the_connector_does_not_bound(self, monkeypatch):
+        """dense reports None (its save queue is unbounded); use the env reader."""
+        import atom.model_engine.scheduler as sched_mod
+
+        monkeypatch.setattr(sched_mod, "_MAX_PENDING_OFFLOAD", None)
+        monkeypatch.setenv("OFFLOAD_MAX_PENDING_SAVES", "3")
+        s = self._sched(SimpleNamespace(max_pending_saves=None))
+        assert s._state_store_pending_cap() == 3
+
+    def test_under_multi_reaches_the_bound_on_the_state_tier_sub(self):
+        """The composite bounds nothing of its own; the sub carries the bound."""
+        sub = SimpleNamespace(max_pending_saves=7)
+        conn = SimpleNamespace(max_pending_saves=None, _state_tier_sub=lambda: sub)
+        s = self._sched(conn)
+        assert s._state_store_pending_cap() == 7
+
+
 class TestTheTierSplitPartitionsServedReuse:
     """`[Cache Tiers]` exists to answer "what does the CPU tier buy", so its two
     halves have to be two halves of one thing.

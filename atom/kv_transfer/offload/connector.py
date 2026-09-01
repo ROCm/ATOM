@@ -259,6 +259,17 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         # the reclaim window from the connector because it is LMCache knowledge.
         return self._impl.save_abandon_timeout_s()
 
+    @property
+    def max_pending_saves(self) -> int | None:
+        """The state leg's running-plus-queued save bound, read off the impl.
+
+        `Scheduler._state_store_pending_cap` reads this off `self.kv_connector`
+        -- which is this shell -- so it must appear here rather than only on the
+        `_impl`, or the scheduler falls back to the bare env default of 2 and
+        the two legs pin different amounts of the same pool. Mirrors `chunk_size`.
+        """
+        return getattr(self._impl, "max_pending_saves", None)
+
     def get_statistics(self) -> dict[str, int]:
         return self._impl.get_statistics()
 

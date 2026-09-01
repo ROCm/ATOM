@@ -2127,7 +2127,7 @@ class Scheduler:
     def _state_store_pending_cap(self) -> int:
         """The running-plus-queued cap for state-tier stores.
 
-        Read off the connector's own `_max_pending_saves` -- the canonical
+        Read off the connector's public `max_pending_saves` -- the canonical
         `_offload_common.max_pending_saves` value it computed from
         `kv_connector_extra_config` and `OFFLOAD_COPY_WORKERS`, the exact bound
         the KV leg's `_may_emit_save` enforces. Sharing that number rather than
@@ -2135,28 +2135,22 @@ class Scheduler:
         two legs from pinning different amounts of the same pool, and honours a
         per-connector `"max_pending_saves"` override the env reader never sees.
         Falls back to the env reader for a connector (or test double) that never
-        computed one, and reaches the value through the delegating shell's
-        `_impl` and, under `kv_connector: multi`, through the state-tier sub --
-        `MultiConnectorScheduler` exposes neither `_max_pending_saves` nor
-        `_impl`, so without the sub probe the composite silently caps the state
-        leg at the env default of 2 while the KV leg keeps the sub's real bound.
+        bounded its save queue (`max_pending_saves` is None, as on dense) and,
+        under `kv_connector: multi`, reaches the bound through the state-tier sub
+        -- `MultiConnectorScheduler` bounds nothing of its own, so without the
+        sub probe the composite silently caps the state leg at the env default of
+        2 while the KV leg keeps the sub's real bound. The public accessor means
+        neither read reaches through the delegating shell's `_impl` any more.
         """
-
-        def _cap_of(obj):
-            cap = getattr(obj, "_max_pending_saves", None)
-            if cap is None:
-                cap = getattr(getattr(obj, "_impl", None), "_max_pending_saves", None)
-            return cap
-
         conn = self.kv_connector
-        cap = _cap_of(conn)
+        cap = getattr(conn, "max_pending_saves", None)
         if cap is None:
             # Under `multi` the bound lives on the state-tier sub (itself a
             # delegating shell), reached the same way the state face is routed.
             sub = getattr(conn, "_state_tier_sub", None)
             tier = sub() if callable(sub) else None
             if tier is not None:
-                cap = _cap_of(tier)
+                cap = getattr(tier, "max_pending_saves", None)
         if isinstance(cap, int) and not isinstance(cap, bool) and cap > 0:
             return cap
         return _offload_max_pending_saves()
@@ -2165,8 +2159,8 @@ class Scheduler:
         """Hand this pass's ready checkpoints to the connector for the CPU tier.
 
         Beside `_publish_state_loads` and on the same schedule, so one pass
-        makes one decision about the tier. The cap is the connector's own
-        `_max_pending_saves` (see `_state_store_pending_cap`) -- the same bound
+        makes one decision about the tier. The cap is the connector's public
+        `max_pending_saves` (see `_state_store_pending_cap`) -- the same bound
         the KV leg's `_may_emit_save` enforces, and for the same reason: each
         outstanding transfer holds the bytes it is reading out of the pool, so
         the queue depth is also how much of the pool a slow backend can pin.
