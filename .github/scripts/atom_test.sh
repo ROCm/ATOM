@@ -460,12 +460,14 @@ if [ "$TYPE" == "benchmark" ]; then
   set +m
 
   echo "========== Supervising benchmark with wait_infer_drain.sh =========="
-  # See accuracy block above for STUCK_POLLS=18 rationale.
-  # MAX_MIN=60: high-concurrency long-context runs (e.g. DP-attention 8k/1k
-  # c=1024 with num_prompts=conc*10) take ~48 min wall (warmup + 10240 reqs);
-  # 30 min cut them off mid-run (drain exit 4). Real hangs/faults still
-  # surface fast via STUCK_POLLS / fault detection, not MAX_MIN.
-  bash scripts/wait_infer_drain.sh ${ATOM_SERVER_PORT} 60 10 "$ATOM_CLIENT_LOG" 18
+  # Per-model overrides: ATOM_BENCHMARK_STUCK_POLLS, ATOM_BENCHMARK_MAX_MINUTES.
+  # Default stuck window is 18 × POLL_SEC (3 min); long-running cases (e.g.
+  # 8k/1k high concurrency) set ATOM_BENCHMARK_STUCK_POLLS in models.json.
+  benchmark_max_minutes=${ATOM_BENCHMARK_MAX_MINUTES:-120}
+  benchmark_stuck_polls=${ATOM_BENCHMARK_STUCK_POLLS:-18}
+  bash scripts/wait_infer_drain.sh \
+    ${ATOM_SERVER_PORT} "$benchmark_max_minutes" 10 \
+    "$ATOM_CLIENT_LOG" "$benchmark_stuck_polls"
   DRAIN_RC=$?
   if [ "$DRAIN_RC" -ne 0 ]; then
     echo "wait_infer_drain.sh exit=$DRAIN_RC — killing benchmark pgid $CLIENT_PID"

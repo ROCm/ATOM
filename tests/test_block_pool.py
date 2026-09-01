@@ -203,3 +203,70 @@ class TestRawPageUnits:
         assert units == [2]
         assert pool.retire_top() is None
         assert pool.num_blocks == 3
+
+
+class TestEvictionAccounting:
+    """The counters a benchmark reads to tell lost reuse from absent reuse.
+
+    A hit rate cannot distinguish them, so these have to be exact in both
+    directions: every destroyed cache entry counted once, and nothing counted
+    that did not destroy one.
+    """
+
+    def test_spending_a_cached_block_counts_an_eviction(self):
+        pool = BlockPool(num_blocks=2)
+        published(pool, pool.pop(), h=100)
+        published(pool, pool.pop(), h=200)
+        assert pool.blocks_evicted == 0  # freeing destroys nothing
+        pool.allocate(pool.pop())
+        assert pool.blocks_evicted == 1
+        assert pool.lookup(100) == -1
+
+    def test_reusing_a_vacant_block_is_not_an_eviction(self):
+        pool = BlockPool(num_blocks=2)
+        pool.allocate(pool.pop())
+        assert pool.blocks_evicted == 0
+
+    def test_reclaiming_a_block_by_hash_is_not_an_eviction(self):
+        # A prefix hit takes a named cached block off the free list. Its
+        # content is being *used*, so counting it would report the cache
+        # working as the cache failing.
+        pool = BlockPool(num_blocks=2)
+        published(pool, pool.pop(), h=100)
+        pool.claim(pool.lookup(100))
+        assert pool.blocks_evicted == 0
+
+    def test_the_boundary_is_counted_apart_from_ordinary_eviction(self):
+        # Same lost content, opposite fixes: `evicted` says the pool is too
+        # small, `retired` says the split is wrong.
+        pool = BlockPool(num_blocks=2, max_blocks=2)
+        published(pool, 0, h=100)
+        published(pool, 1, h=200)
+        pool.retire_top()
+        assert (pool.blocks_retired, pool.blocks_evicted) == (1, 0)
+
+    def test_retiring_a_vacant_block_costs_nothing(self):
+        pool = BlockPool(num_blocks=2, max_blocks=2)
+        pool.retire_top()
+        assert pool.blocks_retired == 0
+
+    def test_relocating_a_live_block_is_not_an_eviction_of_itself(self):
+        # `_adopt` unindexes the destination, then re-points the source's hash
+        # at it. The surviving hash must not be counted as destroyed.
+        pool = BlockPool(num_blocks=2, max_blocks=2)
+        pool.allocate(0)  # vacant destination
+        pool.free(0)
+        pool.allocate(1)
+        pool.publish(1, 300, toks(300))  # live, holds a hash
+        out = pool.retire_top()
+        assert out is not None and out.moved_to == 0
+        assert pool.lookup(300) == 0  # content survived the move
+        assert (pool.blocks_retired, pool.blocks_evicted) == (0, 0)
+
+    def test_vacant_is_the_headroom_before_eviction_starts(self):
+        pool = BlockPool(num_blocks=3)
+        published(pool, pool.pop(), h=100)
+        stats = pool.eviction_stats()
+        assert stats["blocks_free_reusable"] == 1
+        assert stats["blocks_free"] - stats["blocks_free_reusable"] == 2
+        assert stats["blocks_indexed"] == 1

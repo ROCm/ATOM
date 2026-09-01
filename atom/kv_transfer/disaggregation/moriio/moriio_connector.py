@@ -659,7 +659,7 @@ class MoRIIOConnector(KVConnectorBase):
                 if msg == MoRIIOConstants.GET_META_MSG:
                     # Phase 1: send engine metadata
                     sock.send_multipart((identity, b"", encoded_data))
-                    logger.info("Handshake: sent engine metadata to peer")
+                    logger.debug("Handshake: sent engine metadata to peer")
                     # Phase 2: send per-layer KV cache metadata
                     buf = msgpack.dumps(layer_name_to_local_kv_cache_metadata)
                     sock.send_multipart((identity, b"", buf))
@@ -769,7 +769,7 @@ class MoRIIOConnector(KVConnectorBase):
         thread safety).  Once all complete, the request is placed on
         ``_ready_requests`` for RDMA reads.
         """
-        logger.info(
+        logger.debug(
             "Initiating background handshake for req %s -> %s",
             req_id,
             remote_engine_id,
@@ -781,7 +781,7 @@ class MoRIIOConnector(KVConnectorBase):
         remote_dp_size = int(meta.remote_dp_size)
 
         def _on_all_done(_f: Future[Any], entry=(req_id, meta)):
-            logger.info("All handshakes completed for req %s", req_id)
+            logger.debug("All handshakes completed for req %s", req_id)
             self._ready_requests.put(entry)
             self.load_ready_flag[remote_engine_id] = True
             self.write_ready_flags[remote_engine_id] = True

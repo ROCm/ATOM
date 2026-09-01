@@ -9,10 +9,11 @@ prompt, or the small tail chunk of a chunked prefill). Every prefill forward
 has ~fixed cost (kernel launch, pad-to-shape, the lockstep MoE all-to-all), so a
 forward carrying 500 of a 16384-token budget wastes ~97% of that forward.
 
-The delayer's single job: **hold back prefill admission until the accumulated
-prefill is worth a forward, then release** — Nagle's algorithm for prefill.
-While it holds, decode keeps running (nothing is wasted); TTFT is bounded so a
-held request never starves.
+The delayer has two related jobs: **hold back prefill admission until the
+accumulated prefill is worth a forward, then release** — Nagle's algorithm for
+prefill — and optionally protect a fixed number of decode passes after every
+prefill. While it holds, decode keeps running; TTFT is bounded so a held request
+never starves.
 
 Single-rank / TP-only mode
 --------------------------
@@ -38,7 +39,10 @@ every rank computes the SAME FIRE/HOLD from the reduced values:
   G_running_dec   = total decode seqs across ranks
   any_kv_high/low = any prefillable rank at/above / below a KV watermark
   any_partial     = any rank mid-chunked-prefill
+  any_prefill_ran = any rank completed a prefill forward on the previous tick
 
+  if any_prefill_ran:                              arm decode interval
+  if post-prefill decode interval is active and decode exists: HOLD
   if n_prefillable == 0:                          FIRE   # nothing to do (vacuous)
   # -- must-fire bounds (release even if unaligned / underfilled) --
   if G_running_dec == 0:                          FIRE   # no decode to hide the wait behind
@@ -65,7 +69,7 @@ fires smaller — that is a request-routing problem, out of scope here.
 
 Cross-DP comms
 --------------
-Single ``all_reduce(SUM)`` over a 6-int64 cpu buffer (gloo-safe). Booleans are
+Single ``all_reduce(SUM)`` over an 8-int64 cpu buffer (gloo-safe). Booleans are
 encoded as 0/1 and read back as ``sum > 0`` (logical OR). All timing is
 tick-based (``hold_ticks``), which is deterministic across ranks — no per-rank
 wall-clock, so ranks never diverge on a timeout boundary. Fail-open on a
@@ -77,7 +81,6 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Optional
 
 import torch
 
@@ -88,33 +91,37 @@ _DEBUG = os.environ.get("ATOM_PREFILL_DELAYER_DEBUG", "0") == "1"
 
 class PrefillDelayer:
     __slots__ = (
-        "dp_size",
-        "cpu_group",
-        "max_num_batched_tokens",
-        "target_fill",
-        "ttft_max_ticks",
-        "partial_max_ticks",
-        "stall_ticks",
-        "kv_high_watermark",
-        "token_usage_low_watermark",
-        "max_queue_ms",
+        "_decode_interval_remaining",
+        "_first",
+        "_hold_ticks",
+        "_prefill_executed_since_last_decision",
+        "_prev_pending",
         # buffer / episode state
         "_reduce_buf",
-        "_hold_ticks",
         "_stall_count",
-        "_prev_pending",
-        "_first",
         # stats
         "_stat_fire_fill",
+        "_stat_fire_kv",
+        "_stat_fire_nodecode",
+        "_stat_fire_partial",
+        "_stat_fire_queue_ms",
         "_stat_fire_stall",
         "_stat_fire_ttft",
-        "_stat_fire_kv",
-        "_stat_fire_partial",
-        "_stat_fire_nodecode",
-        "_stat_fire_queue_ms",
         "_stat_fire_vacuous",
         "_stat_hold",
+        "_stat_hold_decode_interval",
         "_stat_log_every",
+        "cpu_group",
+        "dp_size",
+        "kv_high_watermark",
+        "max_num_batched_tokens",
+        "max_queue_ms",
+        "partial_max_ticks",
+        "prefill_decode_interval",
+        "stall_ticks",
+        "target_fill",
+        "token_usage_low_watermark",
+        "ttft_max_ticks",
     )
 
     def __init__(
@@ -122,13 +129,14 @@ class PrefillDelayer:
         dp_size: int,
         cpu_group,
         max_num_batched_tokens: int,
-        target_fill: float = 0.7,
-        ttft_max_ticks: int = 30,
-        partial_max_ticks: int = 8,
-        stall_ticks: int = 3,
+        target_fill: float = 0.9,
+        ttft_max_ticks: int = 200,
+        partial_max_ticks: int = 100,
+        stall_ticks: int = 10,
         kv_high_watermark: float = 0.9,
-        token_usage_low_watermark: Optional[float] = None,
-        max_queue_ms: Optional[float] = None,
+        token_usage_low_watermark: float | None = None,
+        max_queue_ms: float | None = None,
+        prefill_decode_interval: int = 0,
     ):
         self.dp_size = dp_size
         self.cpu_group = cpu_group
@@ -170,8 +178,14 @@ class PrefillDelayer:
         # same tick. (Contrast the removed per-rank hold-clock E1, which compared
         # each rank's own clock to a threshold for a GLOBAL decision → skew.)
         self.max_queue_ms = max_queue_ms
+        if prefill_decode_interval < 0:
+            raise ValueError(
+                "prefill_decode_interval must be non-negative; "
+                f"got {prefill_decode_interval}"
+            )
+        self.prefill_decode_interval = prefill_decode_interval
 
-        # 7-slot SUM-reduce buffer (gloo-safe). Encoding:
+        # 8-slot SUM-reduce buffer (gloo-safe). Encoding:
         #   slot 0 = prefillable        (SUM → n_prefillable)
         #   slot 1 = pending_tokens     (SUM → G_pending; fresh + partial remain)
         #   slot 2 = running_decode     (SUM → G_running_dec)
@@ -180,7 +194,9 @@ class PrefillDelayer:
         #   slot 5 = has_partial flag   (SUM>0 → any rank mid-chunked-prefill)
         #   slot 6 = queue_hot flag     (SUM>0 → any rank's oldest waiting prefill
         #                                aged past max_queue_ms; TTFT SLA guard)
-        self._reduce_buf = torch.zeros(7, dtype=torch.int64, device="cpu")
+        #   slot 7 = prefill_ran flag   (SUM>0 → a rank completed a prefill
+        #                                forward on the previous scheduler tick)
+        self._reduce_buf = torch.zeros(8, dtype=torch.int64, device="cpu")
 
         # Episode state. All ticks decide FIRE/HOLD in lockstep, so these evolve
         # identically on every rank (deterministic).
@@ -190,6 +206,8 @@ class PrefillDelayer:
         # First call fires immediately to seed the initial decode batch build-up
         # (mirrors SGL PR #19836's skip_first).
         self._first = True
+        self._decode_interval_remaining = 0
+        self._prefill_executed_since_last_decision = False
 
         # Per-exit fire counters + hold counter for periodic logging. Each exit
         # is counted separately so the log shows WHICH reason released prefill —
@@ -204,6 +222,7 @@ class PrefillDelayer:
         self._stat_fire_queue_ms = 0
         self._stat_fire_vacuous = 0
         self._stat_hold = 0
+        self._stat_hold_decode_interval = 0
         self._stat_log_every = int(
             os.environ.get("ATOM_PREFILL_DELAYER_LOG_EVERY", "1000")
         )
@@ -217,7 +236,8 @@ class PrefillDelayer:
             f"stall_ticks={self.stall_ticks} "
             f"kv_high_watermark={kv_high_watermark} "
             f"token_usage_low_watermark={token_usage_low_watermark} "
-            f"max_queue_ms={max_queue_ms}"
+            f"max_queue_ms={max_queue_ms} "
+            f"prefill_decode_interval={prefill_decode_interval}"
         )
 
     @staticmethod
@@ -265,13 +285,6 @@ class PrefillDelayer:
                 rank flags the TTFT SLA guard and all ranks release. 0 / no
                 waiting prefill / max_queue_ms=None → guard inactive.
         """
-        # First call fires unconditionally (one-time warmup seed); not counted in
-        # the per-exit stats so `fire_vacuous` stays exactly "n_prefillable == 0".
-        if self._first:
-            self._first = False
-            self._reset()
-            return True
-
         # KV + queue-age bounds are gated on this rank actually having prefill to
         # push (firing when this rank can't admit anything would be a no-op).
         low = self.token_usage_low_watermark
@@ -290,6 +303,7 @@ class PrefillDelayer:
         self._reduce_buf[4] = 1 if kv_low else 0
         self._reduce_buf[5] = 1 if has_partial else 0
         self._reduce_buf[6] = 1 if queue_hot else 0
+        self._reduce_buf[7] = 1 if self._prefill_executed_since_last_decision else 0
         if self.cpu_group is not None:
             try:
                 torch.distributed.all_reduce(
@@ -305,8 +319,8 @@ class PrefillDelayer:
                 self._reset()
                 return True
 
-        # One host<-device readback for all 7 slots (a single .tolist() beats
-        # seven .item() boundary crossings on this per-tick hot path).
+        # One host<-device readback for all 8 slots (a single .tolist() beats
+        # eight .item() boundary crossings on this per-tick hot path).
         (
             n_prefillable,
             g_pending,
@@ -315,11 +329,41 @@ class PrefillDelayer:
             kv_low_n,
             partial_n,
             queue_hot_n,
+            prefill_ran_n,
         ) = self._reduce_buf.tolist()
+        # This local execution report has now participated in the global
+        # decision. A later successful prefill forward sets it again.
+        self._prefill_executed_since_last_decision = False
         any_kv_high = kv_high_n > 0
         any_kv_low = kv_low_n > 0
         any_partial = partial_n > 0
         any_queue_hot = queue_hot_n > 0
+
+        # A prefill that actually ran on the previous tick arms the same
+        # countdown on every rank. Delayer FIRE is only permission to try:
+        # allocation, remote-KV handling, or queue changes may still produce a
+        # decode/empty batch, which must not start a decode-protection window.
+        if prefill_ran_n > 0:
+            self._decode_interval_remaining = self.prefill_decode_interval
+
+        # First call fires unconditionally (one-time warmup seed).
+        if self._first:
+            self._first = False
+            self._reset()
+            return True
+
+        # Hard post-prefill decode protection. The countdown is identical on
+        # all ranks because it is armed from the globally reduced prefillable
+        # count and schedule() calls this method in lockstep. Do not advance the
+        # coalescer's own hold/TTFT episode: SGLang applies the interval before
+        # invoking PrefillDelayer, so its delay budget starts afterwards.
+        if self._decode_interval_remaining > 0:
+            self._decode_interval_remaining -= 1
+            if n_prefillable > 0 and g_running_dec > 0:
+                self._stat_hold += 1
+                self._stat_hold_decode_interval += 1
+                self._maybe_log()
+                return False
 
         # Nothing to prefill anywhere → allow (vacuous), reset the episode.
         if n_prefillable == 0:
@@ -380,6 +424,15 @@ class PrefillDelayer:
         self._maybe_log()
         return True
 
+    def notify_prefill_executed(self) -> None:
+        """Report a completed local prefill forward.
+
+        The next lockstep decision folds this flag into the existing SUM
+        reduction, so every DP rank arms the interval together without adding
+        a second collective to the scheduler hot path.
+        """
+        self._prefill_executed_since_last_decision = True
+
     def _hold(self, g_pending: int) -> bool:
         self._hold_ticks += 1
         self._stat_hold += 1
@@ -426,6 +479,7 @@ class PrefillDelayer:
                 f"fire_nodecode={self._stat_fire_nodecode} "
                 f"fire_queue_ms={self._stat_fire_queue_ms} "
                 f"fire_vacuous={self._stat_fire_vacuous} "
+                f"hold_decode_interval={self._stat_hold_decode_interval} "
                 f"hold={self._stat_hold} "
                 f"(hold_rate={self._stat_hold / total:.2%})"
             )

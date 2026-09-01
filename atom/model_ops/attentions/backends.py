@@ -94,15 +94,57 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         raise NotImplementedError
 
     @abstractmethod
-    def prepare_decode(self, batch: ScheduledBatch, bs: int):
+    def prepare_decode(
+        self,
+        batch: ScheduledBatch,
+        running_bs: int,
+        running_tokens: int,
+        max_seqlen_q: int,
+    ):
         raise NotImplementedError
 
     @abstractmethod
-    def prepare_prefill(self, batch: ScheduledBatch):
+    def prepare_prefill(self, batch: ScheduledBatch, running_bs: int):
         raise NotImplementedError
 
     @abstractmethod
-    def build(self, batch: ScheduledBatch, bs: int):
+    def build(
+        self,
+        batch: ScheduledBatch,
+        running_bs: int,
+        running_tokens: int,
+        max_seqlen_q: int,
+    ):
+        raise NotImplementedError
+
+    def prepare_mtp_decode(
+        self,
+        bs: int,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        positions: torch.Tensor,
+        only_update: bool = False,
+        num_reject_tokens: torch.Tensor | None = None,
+    ):
+        """Rebuild this backend's metadata for one serial-draft mid-step.
+
+        The draft runs one row per sequence, and `positions` is that row buffer
+        -- so `positions.shape[-1]` is this step's `running_bs`, and it is what
+        every shape here follows. The `bs` argument is the `scheduled_bs`: the
+        count of those rows that carry a real sequence. They are equal whenever
+        nothing is padded, and an override must read the buffer rather than the
+        argument, because a drafter may run the wider batch the target just ran.
+
+        The LAST axis, not the first: MRoPE positions are `[3, N]` (the token
+        axis is last), and every other layout is `[N]`, where the two agree.
+
+        Backends that distinguish the two mark the padded tail so downstream
+        kernels skip it; those that do not simply never read `bs`, the same way
+        most ignore `only_update` / `num_reject_tokens`.
+
+        Returns per-forward metadata the caller installs on `attn_metadata`;
+        `{}` when the backend mutates it in place.
+        """
         raise NotImplementedError
 
     @abstractmethod
@@ -146,7 +188,42 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         return {}
 
     def state_transfer(self) -> StateTransfer:
-        """Declare this backend's per-request state checkpoint capability."""
+        """How this backend hands one request's state to another slot.
+
+        A checkpoint is the state as of some boundary, kept where a later
+        request can resume from it, so every backend with per-request state has
+        to say how one gets there. There are three answers:
+
+        `StateTransfer.fork(n)` — the state rolls and is not one range to
+        duplicate, so the old slot goes to the index and the request takes a
+        fresh one, reading the old and writing the new for exactly one forward.
+        That forward has to leave the new slot self-contained (a single read
+        index cannot span both), which takes `n` *committed* tokens.
+        `BlockManager` walks a checkpoint/hit point back to the previous block
+        boundary until it fits. Run by `StateSlotPool`.
+
+        `StateTransfer.copy(layout_id)` — one request's state is a contiguous
+        byte range, so the checkpoint is a duplicate of it and the owner is left
+        alone. No forward is bound and no boundary is disqualified for lack of
+        room, which is what makes a decode boundary checkpointable at all: a
+        decode step commits `1 + accepted_drafts` tokens and acceptance is not
+        knowable when the checkpoint has to be decided. Run by
+        `PagedStateCheckpointCoordinator`, which stores the image in PAGE units
+        rather than in a state slot; `layout_id` is what keeps a stored image
+        and the running geometry in agreement.
+
+        `StateTransfer.none()` (default) — no per-request state, or none that can
+        be handed over; the checkpoint index stays empty and prefix hits shrink
+        to 0 for its models.
+
+        `fork` and `copy` each take a second and independent argument,
+        `readable_midstep`: can this backend snapshot a boundary *inside* a
+        forward, or only at the forward's last token? False, the default, makes
+        `BlockManager` shorten a prefill chunk onto every checkpoint position —
+        one forward per rung. True says those positions can be read out of
+        intermediates the kernel already materializes, so the chunk runs full
+        length and the backend owes `write_state_checkpoints` instead.
+        """
         return StateTransfer.none()
 
     def checkpoint_image_bytes(self) -> int | None:
@@ -262,6 +339,13 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         ).interleave_size
         self.max_num_batched_tokens = model_runner.max_num_batched_tokens
         self.max_bs = model_runner.max_bs
+        # Every row's own index, resident so no step rebuilds it. One buffer for
+        # three readers that each want the same numbers: a cu_seqlens ramp at one
+        # token per sequence (hence `+ 1`), the real prefix a padded
+        # `batch_id_per_token` is restored from, and DSpark's token -> request map.
+        self.row_ids = torch.arange(
+            self.max_bs + 1, device=self.device, dtype=torch.int32
+        )
         self.max_num_blocks_per_seq = (
             config.max_model_len + self.block_size - 1
         ) // self.block_size
@@ -374,8 +458,8 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
 
         return self._copy_mrope_to_gpu(total_tokens)
 
-    def prepare_prefill(self, batch: ScheduledBatch):
-        bs = batch.total_seqs_num_prefill
+    def prepare_prefill(self, batch: ScheduledBatch, running_bs: int):
+        scheduled_bs = batch.total_seqs_num_prefill
         sum_scheduled_tokens = batch.total_tokens_num_prefill
         var = self.model_runner.forward_vars
         positions = []
@@ -386,8 +470,8 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         slot_mapping = []
         has_cached = False
         # seqs = list(batch.seqs.values())
-        # seqs = seqs[:bs]
-        for i in range(bs):
+        # seqs = seqs[:scheduled_bs]
+        for i in range(scheduled_bs):
             seqlen = batch.context_lens[i]
             cached_seqlen = batch.num_cached_tokens[i]
             if cached_seqlen > 0:
@@ -454,28 +538,38 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         var["positions"].np[:sum_scheduled_tokens] = positions
         var["slot_mapping"].np[:sum_scheduled_tokens] = -1
         var["slot_mapping"].np[: len(slot_mapping)] = slot_mapping
-        var["cu_seqlens_q"].np[: bs + 1] = cu_seqlens_q
-        var["cu_seqlens_k"].np[: bs + 1] = cu_seqlens_k
-        var["context_lens"].np[:bs] = batch.context_lens[:bs]
+        var["cu_seqlens_q"].np[: scheduled_bs + 1] = cu_seqlens_q
+        var["cu_seqlens_k"].np[: scheduled_bs + 1] = cu_seqlens_k
+        var["context_lens"].np[:scheduled_bs] = batch.context_lens[:scheduled_bs]
+        # Pad the per-sequence tail out to `running_bs`, the width a draft pass
+        # that follows this step runs at and the one `prepare_decode` fills to.
+        # A flat cumsum gives each fabricated row zero query length and a zero
+        # context makes it read nothing; left unwritten they hold the previous
+        # step's, and the drafter attends to a since-freed request's blocks.
+        var["cu_seqlens_q"].np[scheduled_bs + 1 : running_bs + 1] = cu_seqlens_q[-1]
+        var["cu_seqlens_k"].np[scheduled_bs + 1 : running_bs + 1] = cu_seqlens_k[-1]
+        var["context_lens"].np[scheduled_bs:running_bs] = 0
         min_seqlen_q = 0
         dropout_p = 0.0
         vars_used = [
-            ("cu_seqlens_q", bs + 1),
-            ("cu_seqlens_k", bs + 1),
+            ("cu_seqlens_q", running_bs + 1),
+            ("cu_seqlens_k", running_bs + 1),
             ("slot_mapping", sum_scheduled_tokens),
-            ("context_lens", bs),
+            ("context_lens", running_bs),
         ]
         if has_cached:
-            vars_used.append(("block_tables", bs))
-            vars_used.append(("seq_starts", bs))
+            vars_used.append(("block_tables", scheduled_bs))
+            vars_used.append(("seq_starts", scheduled_bs))
 
         ctx = {el: var[el].copy_to_gpu(num) for el, num in vars_used}
         num_cached_tokens = None
         if has_cached:
             num_cached_tokens = torch.tensor(
-                batch.num_cached_tokens[:bs], dtype=torch.int32, pin_memory=True
+                batch.num_cached_tokens[:scheduled_bs],
+                dtype=torch.int32,
+                pin_memory=True,
             ).cuda(non_blocking=True)
-            total_tokens = sum(batch.context_lens[:bs])
+            total_tokens = sum(batch.context_lens[:scheduled_bs])
         total_kv = total_tokens if has_cached else sum_scheduled_tokens
         attn_metadata = AttentionMetaData(
             # Cast to python int — numpy.int32 leaks in via batch.context_lens
@@ -503,11 +597,11 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         self,
         attn_metadata: AttentionMetaData,
         ub_slice: UBatchSlice,
-        padded_bs: int,
+        running_bs: int,
         ubatch_idx: int = 0,
     ) -> AttentionMetaData:
         del ubatch_idx  # only used by builders with per-ubatch plan buffers
-        return split_attn_metadata(attn_metadata, ub_slice, padded_bs)
+        return split_attn_metadata(attn_metadata, ub_slice, running_bs)
 
     def _attach_tbo_prefill_cpu_lens(
         self, attn_metadata: AttentionMetaData, bs: int
@@ -529,7 +623,29 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             attn_metadata, "cu_seqlens_k", var["cu_seqlens_k"].np[: bs + 1].copy()
         )
 
-    def build(self, batch: ScheduledBatch, bs: int):
+    def build(
+        self,
+        batch: ScheduledBatch,
+        running_bs: int,
+        running_tokens: int,
+        max_seqlen_q: int,
+    ):
+        """Build this step's metadata at the shape `prepare_inputs` settled.
+
+        The step's two units and nothing else: `running_bs` sizes everything
+        per-sequence, `running_tokens` everything per-row. Both arrive as
+        arguments because neither is derivable from `batch` -- the scheduler
+        built it before the DP sync and before any graph was picked -- and
+        neither is derivable from the other, since a ragged step replays a flat
+        token bucket rather than a `running_bs * q` grid.
+
+        Prefill takes only the first: its rows are the prompt's, so there is no
+        `running_tokens` to hand it, but its per-sequence tail still pads to
+        `running_bs` for the draft pass that follows. That padding is visible
+        past attention -- `cu_seqlens_q` doubles as the selector for the
+        sampler's rows, so the LM head emits `running_bs` of them. `postprocess`
+        cuts back to the scheduled batch, and that is the one place it does.
+        """
         # Run state maintenance on the compute stream before the forward.
         state_ops = batch.state_maintenance_ops
         if state_ops.relocations:
@@ -540,9 +656,9 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             )
         is_prefill = batch.total_tokens_num_prefill > 0
         if is_prefill:
-            return self.prepare_prefill(batch)
+            return self.prepare_prefill(batch, running_bs)
         else:
-            return self.prepare_decode(batch, bs)
+            return self.prepare_decode(batch, running_bs, running_tokens, max_seqlen_q)
 
 
 class AttentionImpl(nn.Module):

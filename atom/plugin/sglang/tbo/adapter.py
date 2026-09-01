@@ -36,8 +36,8 @@ class AdaptedSGLangUBatch:
     positions: torch.Tensor
     num_reqs: int
     num_tokens: int
-    padded_bs: int
-    graph_bs: int | None
+    running_bs: int
+    running_tokens: int | None
 
 
 def normalize_child_forward_batches(
@@ -93,7 +93,7 @@ def prepare_sglang_ubatch(
     child_forward_batch: ForwardBatch,
     *,
     is_prefill: bool,
-    full_graph_bs: int,
+    full_running_bs: int,
     ubatch_idx: int,
     num_ubatches: int,
     ub_max_tokens_across_dp: tuple[int, int] | None,
@@ -105,7 +105,7 @@ def prepare_sglang_ubatch(
     attention TP/CP alignment, or a CUDA Graph bucket, so use those tensors
     directly instead of slicing the parent and recreating the same padding.
     The merged output still uses the logical token count. Prefill also uses the
-    cross-DP maximum token count as graph_bs so every MORI rank allocates
+    cross-DP maximum token count as running_tokens so every MORI rank allocates
     matching communication buffers.
     """
 
@@ -137,27 +137,31 @@ def prepare_sglang_ubatch(
         )
 
     if is_prefill:
-        padded_bs = ub_num_reqs
+        running_bs = ub_num_reqs
     elif ubatch_idx < num_ubatches - 1:
-        padded_bs = full_graph_bs // num_ubatches
+        running_bs = full_running_bs // num_ubatches
     else:
-        padded_bs = full_graph_bs - (full_graph_bs // num_ubatches) * (num_ubatches - 1)
+        running_bs = full_running_bs - (full_running_bs // num_ubatches) * (
+            num_ubatches - 1
+        )
 
-    ub_graph_bs = child_padded_len
+    ub_running_tokens = child_padded_len
     if (
         is_prefill
         and ub_max_tokens_across_dp is not None
         and len(ub_max_tokens_across_dp) == num_ubatches
     ):
-        ub_graph_bs = max(ub_graph_bs, int(ub_max_tokens_across_dp[ubatch_idx]))
+        ub_running_tokens = max(
+            ub_running_tokens, int(ub_max_tokens_across_dp[ubatch_idx])
+        )
 
     return AdaptedSGLangUBatch(
         input_ids=ub_input_ids,
         positions=ub_positions,
         num_reqs=ub_num_reqs,
         num_tokens=ub_num_tokens,
-        padded_bs=padded_bs,
-        graph_bs=ub_graph_bs if is_prefill else None,
+        running_bs=running_bs,
+        running_tokens=ub_running_tokens if is_prefill else None,
     )
 
 

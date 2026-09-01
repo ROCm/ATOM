@@ -18,8 +18,9 @@ row ids rather than a materialised `[B, W+T, 512]` tensor.
 
 and `DSparkIndexBuffers.views` reads them back.
 
-`qo_indptr` and the scatter's `batch_ids` are constants that ride in the same
-`DSparkIndexBuffers` bundle. Everything is allocated once at `max_num_seqs` and
+`qo_indptr` is a constant riding in the same `DSparkIndexBuffers` bundle; the
+scatter's `batch_ids` is filled there too but follows how much of the batch is
+real, via `mask_pad_tail`. Everything is allocated once at `max_num_seqs` and
 only ever sliced, and shapes are statically known -- no `.item()`, no
 data-dependent allocation -- so a captured CUDA graph replays it.
 
@@ -131,16 +132,17 @@ class DSparkIndexBuffers:
     entries of the max-batch buffer ARE the batch-`B` answer.
 
     `draft_width` / `draft_window` are the shape the buffers were cut for, kept
-    here so no caller can hand a slice a different one; `qo_indptr` and
-    `batch_ids` are constants filled at allocation and never written again.
-    `built_for` is the batch the other three currently hold.
+    here so no caller can hand a slice a different one; `qo_indptr` is a
+    constant filled at allocation and never written again. `built_for` is the
+    batch `kv_indices` / `kv_indptr` / `draft_rows` currently hold; `batch_ids`
+    additionally follows how much of that batch is real, via `mask_pad_tail`.
     """
 
     kv_indices: torch.Tensor  # [max_b*T*(W+T)] int32
     kv_indptr: torch.Tensor  # [max_b*T+1] int32
     draft_rows: torch.Tensor  # [max_b*T] int32
     qo_indptr: torch.Tensor  # [max_b*T+1] int32, constant ramp
-    batch_ids: torch.Tensor  # [max_b*T] int32, constant [0]*T ++ [1]*T ++ ...
+    batch_ids: torch.Tensor  # [max_b*T] int32, [0]*T ++ [1]*T ++ ..., -1 on pad
     max_batch: int
     draft_width: int  # T
     draft_window: int  # W
@@ -157,13 +159,13 @@ class DSparkIndexBuffers:
         for its own decode AND verify forwards (`deepseek_v4_attn.py:3727`).
 
         `batch_ids` is the token -> request map the fused SWA scatter gates on
-        (`bid >= 0`). It carries no CG-pad sentinels, and needs none: the draft runs
-        at `context.batch_size`, which is `scheduled_bs`, the REAL decode batch
-        (`model_runner.py:2609`) -- not the padded `effective_bs` the target's
-        metadata is built at. The target can alias `cu_seqlens_q[:bs]` for its own
-        (`deepseek_v4_attn.py:2348`) because at one token per sequence that slice is
-        already `arange(bs)`; DSpark runs T tokens per request and needs each id
-        repeated T times, so there is nothing to alias.
+        (`bid >= 0`); `mask_pad_tail` rewrites it when a batch is padded. Filled
+        here rather than left ``empty`` because the startup sweep runs the block
+        first, and a buffer whose contract gives `-1` a meaning should not start
+        out undefined. The target can alias `cu_seqlens_q[:bs]` for its own
+        (`deepseek_v4_attn.py:2348`) because at one token per sequence that slice
+        is already `arange(bs)`; DSpark runs T tokens per request and needs each
+        id repeated T times, so there is nothing to alias.
         """
         n = max_batch * draft
         i32 = {"dtype": torch.int32, "device": device}
@@ -172,15 +174,25 @@ class DSparkIndexBuffers:
             kv_indptr=torch.empty(n + 1, **i32),
             draft_rows=torch.empty(n, **i32),
             qo_indptr=torch.arange(n + 1, **i32),
-            batch_ids=torch.arange(max_batch, **i32)
-            .view(max_batch, 1)
-            .expand(max_batch, draft)
-            .reshape(-1)
-            .contiguous(),
+            batch_ids=torch.arange(n, **i32) // draft,
             max_batch=max_batch,
             draft_width=draft,
             draft_window=window,
         )
+
+    def mask_pad_tail(self, row_ids: torch.Tensor, real_batch: int, batch: int) -> None:
+        """Sentinel the rows past `real_batch`, so the fused SWA write skips them.
+
+        Restores the prefix as well as marking the tail: a sentinel left on a row
+        that has since become real would drop that request's draft KV silently.
+        `row_ids` is the builder's `arange`, broadcast one id across the row's T
+        tokens -- one strided copy, no repeated map to keep anywhere.
+        """
+        t = self.draft_width
+        self.batch_ids[: real_batch * t].view(real_batch, t).copy_(
+            row_ids[:real_batch].unsqueeze(1)
+        )
+        self.batch_ids[real_batch * t : batch * t].fill_(-1)
 
     def build(
         self,

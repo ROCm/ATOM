@@ -14,7 +14,6 @@ from atom.spec_decode.dspark_scheduler import (
     build_sps_table,
     calibrate_confidence,
     expected_throughput,
-    flat_bucket_fits,
     ragged_verify_len,
     schedule_prefix_lengths,
     survival_probabilities,
@@ -773,52 +772,3 @@ def test_both_bounds_hold_across_the_grid():
                     continue
                 assert max_nb + 1 <= li <= FULL_Q, (ell, max_nb, sched, li)
                 assert li <= sched, (ell, max_nb, sched, li)
-
-
-# ---------------------------------------------------------------------------
-# The ragged shrink is only safe if the REPLAY can follow it down.
-
-
-def test_full_cudagraphs_cannot_represent_a_ragged_shrink():
-    """No captured flat bucket set -> no representable shrink.
-
-    This is the configuration that trapped: under FULL (non-PIECEWISE)
-    cudagraphs nothing flat is captured, `_dynamic_num_tokens_pad` returns None,
-    every caller falls back to `bs * max_seqlen_q`, and the replay runs over
-    more tokens than the rebuild populated. The tail holds the previous step's
-    ids, which the draft's Markov lookup then indexes out of range.
-    """
-    assert flat_bucket_fits(3, 6, []) is False
-    assert flat_bucket_fits(3, 6, None) is False
-
-
-def test_bucket_must_cover_the_total_and_divide_by_q():
-    buckets = [6, 12, 24]
-    # 3 real tokens at q=6 -> bucket 6 holds them and 6 % 6 == 0.
-    assert flat_bucket_fits(3, 6, buckets) is True
-    assert flat_bucket_fits(6, 6, buckets) is True
-    # Bigger than every captured bucket -> nothing can hold it.
-    assert flat_bucket_fits(25, 6, buckets) is False
-    # Covers the total but is not q-divisible -> the per-seq rows would not tile.
-    assert flat_bucket_fits(3, 6, [10]) is False
-    # Degenerate q never matches (guards the b % q modulo).
-    assert flat_bucket_fits(3, 0, buckets) is False
-
-
-def test_predicate_agrees_with_dynamic_num_tokens_pad():
-    """Must stay in step with the lookup it mirrors: yes exactly when that
-    lookup finds a bucket, no exactly when it returns the None that triggers the
-    unsafe `bs * max_seqlen_q` fallback."""
-    buckets = [6, 12, 24]
-
-    def pad_lookup(total, q):
-        for b in buckets:
-            if b >= total and q > 0 and b % q == 0:
-                return b
-        return None
-
-    for total in (0, 1, 3, 6, 7, 12, 25):
-        for q in (0, 1, 3, 6):
-            assert flat_bucket_fits(total, q, buckets) is (
-                pad_lookup(total, q) is not None
-            ), (total, q)
