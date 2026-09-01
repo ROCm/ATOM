@@ -1664,6 +1664,12 @@ class MooncakeConnector(KVConnectorBase):
                     f"{self.block_size}."
                 )
 
+        # plan_replicated_index reads only the block ids, dcp_size and the page
+        # geometry, and the first two are fixed for the whole request. Every
+        # index layer registers the same geometry, so without this the identical
+        # plan is rebuilt once per layer.
+        replicated_index_plans: dict[tuple[int, int, int], tuple] = {}
+
         for region_idx in range(num_regions):
             src_base = self.kv_caches_base_addr[region_idx]
             dst_base = consumer_base_addrs[cmap[region_idx]]
@@ -1684,14 +1690,18 @@ class MooncakeConnector(KVConnectorBase):
                         "its two destination runs without them."
                     )
                 key_bytes, scale_bytes = planes
-                plan = plan_replicated_index(
-                    src_block_ids,
-                    dst_block_ids,
-                    dcp_size,
-                    bpb,
-                    key_bytes,
-                    scale_bytes,
-                )
+                geometry = (bpb, key_bytes, scale_bytes)
+                plan = replicated_index_plans.get(geometry)
+                if plan is None:
+                    plan = plan_replicated_index(
+                        src_block_ids,
+                        dst_block_ids,
+                        dcp_size,
+                        bpb,
+                        key_bytes,
+                        scale_bytes,
+                    )
+                    replicated_index_plans[geometry] = plan
                 unit = 1  # already in bytes
             if plan is None:
                 for sb, db in zip(src_block_ids, dst_block_ids):
