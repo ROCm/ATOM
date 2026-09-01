@@ -73,6 +73,41 @@ _DEEPSEEK_V4_ARCHES: set[str] = {
     "DeepseekV4MTPModel",
 }
 _DEEPSEEK_V4_MTP_ARCHES: set[str] = _DEEPSEEK_V4_ARCHES - {_DEEPSEEK_V4_ARCH}
+_DSA_ARCHES: frozenset[str] = frozenset(
+    {"DeepseekV32ForCausalLM", "GlmMoeDsaForCausalLM"}
+)
+
+
+def _enable_lmcache_v3_for_dsa(vllm_config, model_arch: str) -> None:
+    """Select LMCache's heterogeneous-layer connector for DSA index caches."""
+    if model_arch not in _DSA_ARCHES:
+        return
+    kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+    if (
+        kv_transfer_config is None
+        or getattr(kv_transfer_config, "kv_connector", None) != "LMCacheConnectorV1"
+    ):
+        return
+    extra_config = kv_transfer_config.kv_connector_extra_config
+    if extra_config is None:
+        extra_config = {}
+        kv_transfer_config.kv_connector_extra_config = extra_config
+    if extra_config.get("use_native", False):
+        raise ValueError(
+            "ATOM DSA models require the external LMCache connector with GPU "
+            "connector V3; use_native=true selects vLLM's incompatible V2 adapter"
+        )
+    if extra_config.get("lmcache.use_gpu_connector_v3") is False:
+        raise ValueError(
+            "ATOM DSA models require lmcache.use_gpu_connector_v3=true because "
+            "MLA and indexer caches have heterogeneous layer shapes"
+        )
+    if "lmcache.use_gpu_connector_v3" not in extra_config:
+        extra_config["lmcache.use_gpu_connector_v3"] = True
+        logger.info(
+            "ATOM DSA model: enabled LMCache GPU connector V3 for heterogeneous "
+            "MLA and indexer KV-cache layers"
+        )
 
 
 def _probe_v4_routed_expert_dtype(model_path) -> str | None:
@@ -442,6 +477,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             self.atom_config.hf_config = self.config
         self.vllm_model_arch = selected_model_arch
         self.model_arch = model_arch
+        _enable_lmcache_v3_for_dsa(vllm_config, model_arch)
         logger.info(
             "ATOM vLLM hf config overrides: use_index_cache=%s, index_topk_freq=%s, "
             "index_topk_pattern=%s",
