@@ -705,7 +705,7 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         # Mixed dispatch comes AFTER state maintenance: it returns early, and a
         # mixed batch needs the same relocations / checkpoint copies as any other.
         if getattr(batch, "is_mixed", False):
-            return self.prepare_mixed(batch, bs)
+            return self.prepare_mixed(batch, running_bs)
         is_prefill = batch.total_tokens_num_prefill > 0
         if is_prefill:
             return self.prepare_prefill(batch, running_bs)
