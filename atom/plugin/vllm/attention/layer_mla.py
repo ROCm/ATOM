@@ -315,12 +315,11 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         # and asserts the type. ATOM keeps `dcp_world_size = -1` so vLLM's DCP
         # paths stay out of its decode kernels, so that constructor never ran
         # and every DCP>1 MLA run aborted on the assert while building metadata.
-        # The builder is the manager's only consumer here: it hands it the
-        # chunked-prefill workspace for the context KV all-gather.
+        # ATOM only needs the manager for the builder's chunked-prefill KV
+        # gather; its own decode paths do not call the manager.
         if dcp_size > 1 and getattr(self, "dcp_manager", None) is None:
             from vllm.v1.attention.ops.dcp_utils import MLADCPManager
 
-            layer_dtype = torch.get_default_dtype()
             self.dcp_manager = MLADCPManager(
                 vllm_config=vllm_config,
                 device=next(self.kv_b_proj.parameters()).device,
@@ -329,8 +328,8 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                 output_head_dim=self.kv_lora_rank,
                 # ATOM never feeds MLA a quantized query, so the query keeps
                 # the layer dtype (vLLM's `supports_quant_query_input` branch).
-                query_dtype=layer_dtype,
-                output_dtype=layer_dtype,
+                query_dtype=self.dtype,
+                output_dtype=self.dtype,
                 padded_num_heads=self.q_pad_num_heads,
                 is_lse_base_on_e=getattr(self, "lse_base_on_e", True),
                 use_pcp=getattr(self, "use_pcp", False),
