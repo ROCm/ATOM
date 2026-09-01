@@ -1247,6 +1247,46 @@ def _compact_filter_dcp_kernel(
     tl.store(out_kv_indices + out_kv_start, 0, mask=written == 0)
 
 
+def _assert_dcp_filter_rows(
+    num_tokens: int,
+    *,
+    token_to_seq_idxs: torch.Tensor,
+    topk_indices: torch.Tensor,
+    out_kv_indptr: torch.Tensor,
+    owned_counts: torch.Tensor,
+    block_table: torch.Tensor,
+) -> None:
+    """Check every tensor the ``(num_tokens,)`` grid indexes is long enough.
+
+    The kernels take raw pointers, and the slices built here
+    (``owned_counts[:num_tokens]``, ``out_kv_indptr[1 : num_tokens + 1]``)
+    truncate silently when the buffer is short -- the launch then reads and
+    writes past the end with no Python-side error. These buffers are sized
+    ``max_num_batched_tokens`` while ``num_tokens`` comes from the caller's
+    token count, so a padding or ubatch change is exactly what would break the
+    relation.
+    """
+    assert num_tokens >= 0, f"num_tokens must be non-negative, got {num_tokens}"
+    for name, tensor, needed in (
+        ("token_to_seq_idxs", token_to_seq_idxs, num_tokens),
+        ("topk_indices", topk_indices, num_tokens),
+        ("out_kv_indptr", out_kv_indptr, num_tokens + 1),
+        ("owned_counts", owned_counts, num_tokens),
+    ):
+        have = tensor.shape[0]
+        assert have >= needed, (
+            f"{name} holds {have} rows but the filter runs {num_tokens} query "
+            f"tokens and needs {needed}"
+        )
+    assert token_to_seq_idxs.dtype == torch.int32
+    assert out_kv_indptr.dtype == torch.int32
+    assert owned_counts.dtype == torch.int32
+    assert block_table.dim() == 2, (
+        "block_table must be [num_requests, max_blocks_per_request]; "
+        f"got shape {tuple(block_table.shape)}"
+    )
+
+
 def triton_filter_and_convert_dcp_index(
     token_to_seq_idxs: torch.Tensor,  # int32 [num_tokens] owning request per token
     num_tokens: int,
@@ -1293,6 +1333,14 @@ def triton_filter_and_convert_dcp_index(
     )
     assert 0 <= dcp_rank < dcp_world_size
     assert out is not None, "sparse_kv_indices_buffer (out) is required"
+    _assert_dcp_filter_rows(
+        num_tokens,
+        token_to_seq_idxs=token_to_seq_idxs,
+        topk_indices=token_indices,
+        out_kv_indptr=out_kv_indptr,
+        owned_counts=owned_counts,
+        block_table=block_table,
+    )
 
     token_to_seq_idxs_c = token_to_seq_idxs.contiguous()
     block_table_c = block_table.contiguous()
@@ -1519,6 +1567,14 @@ def triton_filter_and_convert_dcp_index_prefill(
     assert out is not None, "sparse_kv_indices_buffer (out) is required"
 
     num_tokens = dsa_kv_indptr.shape[0] - 1
+    _assert_dcp_filter_rows(
+        num_tokens,
+        token_to_seq_idxs=token_to_seq_idxs,
+        topk_indices=topk_indices,
+        out_kv_indptr=out_kv_indptr,
+        owned_counts=owned_counts,
+        block_table=block_table,
+    )
 
     dsa_kv_indptr_c = dsa_kv_indptr.contiguous()
     token_to_seq_idxs_c = token_to_seq_idxs.contiguous()
