@@ -10,12 +10,12 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Any, Tuple
+from typing import Any
 
 PREFIX = "window.BENCHMARK_DATA = "
 
 
-def parse_data(text: str) -> Tuple[Any, bool]:
+def parse_data(text: str) -> tuple[Any, bool]:
     """Parse data.js and return ``(data, has_trailing_semicolon)``."""
     if not text.startswith(PREFIX):
         raise ValueError(f"missing {PREFIX!r} prefix")
@@ -27,11 +27,11 @@ def parse_data(text: str) -> Tuple[Any, bool]:
 
     data = json.loads(payload)
     if not isinstance(data, dict):
-        raise ValueError("dashboard data must be a JSON object")
+        raise TypeError("dashboard data must be a JSON object")
 
     entries = data.get("entries")
     if not isinstance(entries, dict):
-        raise ValueError("dashboard data must contain an 'entries' object")
+        raise TypeError("dashboard data must contain an 'entries' object")
     if not entries or not any(
         isinstance(value, list) and value for value in entries.values()
     ):
@@ -40,7 +40,7 @@ def parse_data(text: str) -> Tuple[Any, bool]:
     return data, has_trailing_semicolon
 
 
-def normalize(text: str) -> Tuple[str, bool]:
+def normalize(text: str) -> tuple[str, bool]:
     """Validate text and remove only a terminal JavaScript semicolon."""
     _, has_trailing_semicolon = parse_data(text)
     if not has_trailing_semicolon:
