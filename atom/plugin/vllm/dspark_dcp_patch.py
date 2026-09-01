@@ -74,6 +74,7 @@ def _dcp_local_slots(
     cp_rank: int,
     cp_interleave: int,
     pad_slot_id: int,
+    valid_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Paged slots for ``positions``, as this DCP rank stores them.
 
@@ -85,6 +86,7 @@ def _dcp_local_slots(
 
     ``token_req`` gives each position its row of ``block_table``; the two index
     tensors are applied together so no per-token copy of a row is materialized.
+    Null blocks and rows excluded by ``valid_mask`` are never writable.
     """
     virtual_block = block_size * cp_size
     stride = block_table.shape[1]
@@ -99,25 +101,35 @@ def _dcp_local_slots(
         block_offset - run * cp_interleave
     )
     slots = block_number.to(torch.int64) * block_size + local_offset
-    return torch.where(is_local, slots, pad_slot_id)
+    is_writable = is_local & (block_number != 0)
+    if valid_mask is not None:
+        is_writable = is_writable & valid_mask
+    return torch.where(is_writable, slots, pad_slot_id)
 
 
-def _keep_upstream_pads(
-    upstream_slots: "torch.Tensor", localized_slots: "torch.Tensor"
-) -> "torch.Tensor":
-    """Re-localize only the rows vLLM's kernel considers writable.
-
-    vLLM 0.28 stores ``PAD_SLOT_ID`` for rows that must not receive draft KV:
-    the rejected suffix of a speculative context span, and any row whose block
-    table entry is the null block (evicted / sliding-window padding). Those
-    decisions are about *whether* a row is writable at all, which the DCP
-    rewrite below has no business overturning -- recomputing a slot for them
-    would send draft KV into a live block, block 0 included. Only rows the
-    kernel already addressed get their slot moved into rank-local terms.
-    """
-    from vllm.v1.attention.backends.utils import PAD_SLOT_ID
-
-    return torch.where(upstream_slots == PAD_SLOT_ID, upstream_slots, localized_slots)
+def _context_request_ids_and_valid_mask(
+    query_start_loc: torch.Tensor,
+    num_rejected: torch.Tensor,
+    num_reqs: int,
+    num_context_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Map flattened context rows to requests and exclude rejected suffixes."""
+    context_token_idx = torch.arange(
+        num_context_tokens,
+        device=query_start_loc.device,
+        dtype=torch.int64,
+    )
+    context_ends = query_start_loc[1 : num_reqs + 1].to(torch.int64)
+    context_req = torch.searchsorted(
+        context_ends,
+        context_token_idx,
+        right=True,
+    )
+    valid_context_ends = context_ends - num_rejected[:num_reqs].to(
+        device=query_start_loc.device,
+        dtype=torch.int64,
+    )
+    return context_req, context_token_idx < valid_context_ends[context_req]
 
 
 def apply_vllm_dspark_dcp_input_patch() -> None:
@@ -191,47 +203,45 @@ def apply_vllm_dspark_dcp_input_patch() -> None:
             num_query_per_req,
             rounding_mode="floor",
         )
-        query_slot_mapping = arg["query_slot_mapping"][:num_query_tokens]
-        query_slot_mapping.copy_(
-            _keep_upstream_pads(
-                query_slot_mapping,
-                _dcp_local_slots(
-                    query_positions,
-                    block_table,
-                    query_req,
-                    block_size,
-                    cp_size,
-                    cp_rank,
-                    cp_interleave,
-                    PAD_SLOT_ID,
-                ),
-            )
+        arg["query_slot_mapping"][:num_query_tokens].copy_(
+            _dcp_local_slots(
+                query_positions,
+                block_table,
+                query_req,
+                block_size,
+                cp_size,
+                cp_rank,
+                cp_interleave,
+                PAD_SLOT_ID,
+            ),
         )
 
         # Context rows: one per target token, laid out back to back in target
         # batch order, so query_start_loc says which request each belongs to.
+        # vLLM places rejected speculative suffix rows in this same span but
+        # marks them PAD; derive that validity explicitly because its null-block
+        # decision used an unsharded block index and is not trustworthy under
+        # DCP.
         num_context_tokens = input_batch.num_tokens
         context_positions = arg["context_positions"][:num_context_tokens]
-        context_req = torch.searchsorted(
-            input_batch.query_start_loc[1 : num_reqs + 1].to(torch.int64),
-            torch.arange(num_context_tokens, device=context_positions.device),
-            right=True,
+        context_req, context_is_valid = _context_request_ids_and_valid_mask(
+            input_batch.query_start_loc,
+            arg["num_rejected"],
+            num_reqs,
+            num_context_tokens,
         )
-        context_slot_mapping = arg["context_slot_mapping"][:num_context_tokens]
-        context_slot_mapping.copy_(
-            _keep_upstream_pads(
-                context_slot_mapping,
-                _dcp_local_slots(
-                    context_positions,
-                    block_table,
-                    context_req,
-                    block_size,
-                    cp_size,
-                    cp_rank,
-                    cp_interleave,
-                    PAD_SLOT_ID,
-                ),
-            )
+        arg["context_slot_mapping"][:num_context_tokens].copy_(
+            _dcp_local_slots(
+                context_positions,
+                block_table,
+                context_req,
+                block_size,
+                cp_size,
+                cp_rank,
+                cp_interleave,
+                PAD_SLOT_ID,
+                valid_mask=context_is_valid,
+            ),
         )
 
     dflash_speculator.DFlashSpeculator.set_attn = set_attn

@@ -36,22 +36,22 @@ def _atom_requires_tcp_store() -> bool:
 def apply_vllm_tcp_store_patch() -> None:
     from vllm.utils import network_utils
 
-    if getattr(network_utils, "_atom_tcp_store_patch", False):
-        return
-
     if not hasattr(network_utils, "aiter_requires_tcp_store"):
         # vLLM < 0.28 always used the TCP rendezvous; nothing to force.
         return
 
+    first_application = not getattr(network_utils, "_atom_tcp_store_patch", False)
     network_utils.aiter_requires_tcp_store = _atom_requires_tcp_store
-    # The executors bind the helper at import time; patch any that already ran.
+    # The executors bind the helper at import time. Re-sync every call so this
+    # patch self-heals if a module reload or another plugin replaced an alias.
     for module_name in _EXECUTOR_MODULES:
         module = sys.modules.get(module_name)
         if module is not None and hasattr(module, "aiter_requires_tcp_store"):
             module.aiter_requires_tcp_store = _atom_requires_tcp_store
 
     network_utils._atom_tcp_store_patch = True
-    logger.info(
-        "ATOM plugin: pinned the vLLM worker rendezvous to a TCPStore for "
-        "aiter custom all-reduce."
-    )
+    if first_application:
+        logger.info(
+            "ATOM plugin: pinned the vLLM worker rendezvous to a TCPStore for "
+            "aiter custom all-reduce."
+        )

@@ -1,3 +1,5 @@
+from typing import ClassVar
+
 import torch
 from vllm.v1.attention.backend import MultipleOf
 from vllm.v1.attention.backends.mla.prefill.base import MLAPrefillBackend
@@ -22,23 +24,29 @@ def _indexes_kv_by_block_stride_for_backend(backend_cls) -> bool:
     return layered_kv_cache_stride_order[0] != 0
 
 
-class AiterMhaBackendForVllm:
-    """vLLM-facing MHA backend surface for ATOM attention layers."""
-
-    accept_output_buffer: bool = False
-    supported_dtypes: list = [torch.float16, torch.bfloat16]
-    forward_includes_kv_cache_update: bool = True
+class _VllmAttentionBackendCompat:
+    """Compatibility surface for duck-typed ATOM attention backends."""
 
     @classmethod
     def customize_spec(cls, spec):
-        """Adopt vLLM 0.28's post-hoc KV-spec hook without changing the spec.
-
-        These surfaces are duck-typed rather than derived from vLLM's
-        ``AttentionBackend``, so they do not inherit its default. vLLM calls
-        the hook while building KV cache specs; ATOM's kernels use the spec the
-        Attention layer already built.
-        """
+        """Keep vLLM 0.28's post-hoc KV spec unchanged."""
         return spec
+
+    @classmethod
+    def supports_device_cpu_query_lens_mismatch(cls) -> bool:
+        """ATOM metadata builders plan from exact CPU query boundaries."""
+        return False
+
+
+class AiterMhaBackendForVllm(_VllmAttentionBackendCompat):
+    """vLLM-facing MHA backend surface for ATOM attention layers."""
+
+    accept_output_buffer: bool = False
+    supported_dtypes: ClassVar[list[torch.dtype]] = [
+        torch.float16,
+        torch.bfloat16,
+    ]
+    forward_includes_kv_cache_update: bool = True
 
     @staticmethod
     def get_name() -> str:
@@ -151,23 +159,15 @@ class AiterMhaFlexibleBlockBackendForVllm(AiterMhaBackendForVllm):
         return [MultipleOf(16)]
 
 
-class AiterMlaBackendForVllm:
+class AiterMlaBackendForVllm(_VllmAttentionBackendCompat):
     """vLLM-facing dense MLA backend surface for ATOM attention layers."""
 
     accept_output_buffer: bool = True
-    supported_dtypes: list = [torch.float16, torch.bfloat16]
+    supported_dtypes: ClassVar[list[torch.dtype]] = [
+        torch.float16,
+        torch.bfloat16,
+    ]
     forward_includes_kv_cache_update: bool = True
-
-    @classmethod
-    def customize_spec(cls, spec):
-        """Adopt vLLM 0.28's post-hoc KV-spec hook without changing the spec.
-
-        These surfaces are duck-typed rather than derived from vLLM's
-        ``AttentionBackend``, so they do not inherit its default. vLLM calls
-        the hook while building KV cache specs; ATOM's kernels use the spec the
-        Attention layer already built.
-        """
-        return spec
 
     @staticmethod
     def get_name() -> str:
@@ -265,7 +265,7 @@ class AiterMlaBackendForVllm:
 
 
 class AtomAiterMLAPrefillBackend(MLAPrefillBackend):
-    """vLLM 0.22 MLA prefill interface backed by ATOM's aiter path."""
+    """vLLM MLA prefill interface backed by ATOM's aiter path."""
 
     @staticmethod
     def get_name() -> str:
@@ -328,20 +328,29 @@ class AtomAiterMLAPrefillBackend(MLAPrefillBackend):
             return_softmax_lse,
         )
 
-    def run_prefill_context_chunk(self, chunk_idx: int, q, k, v):
+    def run_prefill_context_chunk(self, chunk, q, k, v, out=None):
         if self._layer is None:
             raise RuntimeError("ATOM MLA prefill backend is not bound to a layer.")
-        return self._layer._run_prefill_context_chunk(
-            self._prefill_metadata,
-            chunk_idx,
-            q,
-            k,
-            v,
+        if out is not None:
+            raise NotImplementedError(
+                "ATOM MLA context prefill does not support an output buffer."
+            )
+        return self._layer._flash_attn_varlen_diff_headdims(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=chunk.query_start_loc,
+            cu_seqlens_k=chunk.cu_seq_lens,
+            max_seqlen_q=chunk.max_query_len,
+            max_seqlen_k=chunk.max_seq_len,
+            softmax_scale=self.scale,
+            causal=False,
+            return_softmax_lse=True,
         )
 
 
 def build_vllm_mla_prefill_backend(layer, vllm_config):
-    """Create the vLLM 0.22 MLA prefill backend for an ATOM MLA layer."""
+    """Create the vLLM MLA prefill backend for an ATOM MLA layer."""
     return AtomAiterMLAPrefillBackend(
         layer=layer,
         num_heads=layer.num_heads,
@@ -422,24 +431,20 @@ class AiterSparseMlaIndexerBackendForVllm(AiterMlaBackendForVllm):
         return (cls.__module__, cls.__qualname__)
 
 
-class MiniMaxM3SparseAttentionBackend:
+class MiniMaxM3SparseAttentionBackend(_VllmAttentionBackendCompat):
     """vLLM-facing sparse MHA backend surface for MiniMax-M3."""
 
     accept_output_buffer: bool = True
-    supported_dtypes: list = [torch.float16, torch.bfloat16]
-    supported_kv_cache_dtypes: list = ["bfloat16", "fp8", "fp8_e4m3"]
+    supported_dtypes: ClassVar[list[torch.dtype]] = [
+        torch.float16,
+        torch.bfloat16,
+    ]
+    supported_kv_cache_dtypes: ClassVar[list[str]] = [
+        "bfloat16",
+        "fp8",
+        "fp8_e4m3",
+    ]
     forward_includes_kv_cache_update: bool = True
-
-    @classmethod
-    def customize_spec(cls, spec):
-        """Adopt vLLM 0.28's post-hoc KV-spec hook without changing the spec.
-
-        These surfaces are duck-typed rather than derived from vLLM's
-        ``AttentionBackend``, so they do not inherit its default. vLLM calls
-        the hook while building KV cache specs; ATOM's kernels use the spec the
-        Attention layer already built.
-        """
-        return spec
 
     @staticmethod
     def get_name() -> str:
@@ -603,18 +608,7 @@ class SparseMHAIndexerBackend(AiterMlaBackendForVllm):
         return (0, 1, 2)
 
 
-class GDNAttentionBackend:
-    @classmethod
-    def customize_spec(cls, spec):
-        """Adopt vLLM 0.28's post-hoc KV-spec hook without changing the spec.
-
-        These surfaces are duck-typed rather than derived from vLLM's
-        ``AttentionBackend``, so they do not inherit its default. vLLM calls
-        the hook while building KV cache specs; ATOM's kernels use the spec the
-        Attention layer already built.
-        """
-        return spec
-
+class GDNAttentionBackend(_VllmAttentionBackendCompat):
     @staticmethod
     def get_name() -> str:
         return "ROCM_GDN_ATTENTION"

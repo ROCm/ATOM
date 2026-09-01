@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from functools import partial as functools_partial
 from typing import ClassVar, Protocol
 
+import aiter.mla as aiter_mla
 import torch
 import triton
 import triton.language as tl
@@ -237,6 +238,11 @@ _dcp_kernel_width_warned = False
 _dcp_sparse_prefill_width_warned = False
 
 
+def _aiter_supports_mla_dcp_head_fold() -> bool:
+    """Whether aiter can fold DCP round-robin metadata with query heads."""
+    return hasattr(aiter_mla, "_fold_seqlen_indptr")
+
+
 def mla_dcp_decode_is_persistent(
     is_sparse: bool,
     dcp_world_size: int,
@@ -310,9 +316,9 @@ def mla_dcp_kernel_num_heads(
     DCP decode all-gathers Q on the head dim before calling the kernel, so what
     gets dispatched on is ``num_heads * dcp_world_size``; a single rank's head
     count is never seen and is the wrong thing to round. A persistent decode
-    takes that width as-is once it is a multiple of 16, dedicated kernel or
-    fold; a non-persistent one has no fold to fall back on and must be padded
-    onto a width that has its own kernel.
+    takes that width as-is once it is a multiple of 16 when the installed aiter
+    can fold DCP round-robin metadata with the heads. Older aiter builds and
+    non-persistent decode must be padded onto a dedicated kernel width.
 
     ``kv_cache_dtype`` only selects the non-persistent set: gqa=64 is excluded
     for both dtypes there (fp8 aborts on it, bf16 silently miscomputes it), and
@@ -320,17 +326,23 @@ def mla_dcp_kernel_num_heads(
     """
     gathered = mla_kernel_num_heads(max(num_heads * dcp_world_size, min_kernel_heads))
     if persistent:
-        if gathered <= _MLA_DCP_MAX_KERNEL_HEADS:
+        if (
+            _aiter_supports_mla_dcp_head_fold()
+            and gathered <= _MLA_DCP_MAX_KERNEL_HEADS
+        ):
             return gathered
+        # Older release-image aiter builds cannot fold DCP round-robin indptrs
+        # with query heads. Keep them on a dedicated kernel width instead.
+        widths = _MLA_DCP_KERNEL_WIDTHS
     else:
         widths = (
             _MLA_DCP_KERNEL_WIDTHS_NON_PERSISTENT_FP8
             if kv_cache_dtype.startswith("fp8")
             else _MLA_DCP_KERNEL_WIDTHS_NON_PERSISTENT
         )
-        for width in widths:
-            if width >= gathered:
-                return width
+    for width in widths:
+        if width >= gathered:
+            return width
     global _dcp_kernel_width_warned
     if not _dcp_kernel_width_warned:
         _dcp_kernel_width_warned = True
