@@ -1734,23 +1734,51 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             moe_extra_args["linear_beta"] = getattr(
                 layer, "activation_situ_linear_beta", None
             )
-        if (
-            self.use_triton_ep
-            and self.using_modular_kernel
-            and not self.use_triton_decode
-        ):
-            assert getattr(layer, "w13_swizzle_layout", None) is not None, (
-                "use_triton_ep is on but this layer carries the FlyDSL weight "
-                "layout; flydsl fused_moe cannot serve as a fallback because "
-                "block A publishes the GUGU layout under the same names."
-            )
+        _ep_triton_now = False
+        if self.use_triton_ep and self.using_modular_kernel:
+            # Phase split, transport version. FusedMoEModularKernel.forward runs
+            # its Triton block only when `triton_experts` is present and other-
+            # wise falls through to its flydsl fused_moe tail -- so publishing
+            # the dict on decode and withholding it on prefill IS the split, with
+            # no change needed on the modular-kernel side. Dispatch and combine
+            # are identical either way; only the expert GEMM in between moves.
+            #
+            # One weight copy in both phases: branch C's FlyDSL layout, with the
+            # zero-copy Triton view laid over it per call. That is the same
+            # premise as the TP path, and the asserts in
+            # _process_weight_layout_after_loading enforce it.
+            _ep_triton_now = True
+            if self.use_triton_decode:
+                _ep_triton_now = not get_forward_context().context.is_prefill
+            if self.use_triton_decode:
+                (
+                    _tw13,
+                    _tw2,
+                    _tw13_scale,
+                    _tw2_scale,
+                    _tw13_swz,
+                    _tw2_swz,
+                ) = self._triton_views_of_flydsl_weights(layer)
+            else:
+                assert getattr(layer, "w13_swizzle_layout", None) is not None, (
+                    "use_triton_ep is on but this layer carries the FlyDSL weight "
+                    "layout; flydsl fused_moe cannot serve as a fallback because "
+                    "block A publishes the GUGU layout under the same names."
+                )
+                _tw13 = layer.w13_weight
+                _tw2 = layer.w2_weight
+                _tw13_scale = layer.w13_weight_scale
+                _tw2_scale = layer.w2_weight_scale
+                _tw13_swz = layer.w13_swizzle_layout
+                _tw2_swz = layer.w2_swizzle_layout
+        if _ep_triton_now:
             moe_extra_args["triton_experts"] = {
-                "w13_weight": layer.w13_weight,
-                "w2_weight": layer.w2_weight,
-                "w13_scale": layer.w13_weight_scale,
-                "w2_scale": layer.w2_weight_scale,
-                "w13_swizzle_layout": layer.w13_swizzle_layout,
-                "w2_swizzle_layout": layer.w2_swizzle_layout,
+                "w13_weight": _tw13,
+                "w2_weight": _tw2,
+                "w13_scale": _tw13_scale,
+                "w2_scale": _tw2_scale,
+                "w13_swizzle_layout": _tw13_swz,
+                "w2_swizzle_layout": _tw2_swz,
                 "a13_scale": getattr(layer, "w13_input_scale", None),
                 "a2_scale": getattr(layer, "w2_input_scale", None),
                 "w1_bias": getattr(layer, "w13_bias", None),

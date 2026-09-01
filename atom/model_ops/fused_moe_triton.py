@@ -20,6 +20,8 @@
 
 from math import prod
 
+import os
+
 import torch
 import triton
 from aiter import ActivationType
@@ -307,30 +309,33 @@ def _fused_experts_silu_gugu(
     )
 
     if envs.ATOM_USE_TRITON_MOE_A4W4 or act_quant == MoEActivationQuant.FP4:
-        assert ep_scatter is None, (
-            "the scatter-fused EP combine is wired through moe_gemm_a8w4 only; "
-            "moe_gemm_a4w4 has no ep_scatter, so a4w4 must use the gather combine"
-        )
-        # ``moe_gemm_a4w4`` has no ``preshuffled`` parameter, so it can only
-        # consume the plain (E, K, N) weight -- i.e. a4w4 is a CDNA-only variant.
-        # Handed a gfx1250 WMMA-preshuffled weight it reads N as N // 16 and
-        # dies inside mxfp4_quant on a block-size assert with no hint as to why,
-        # so say it here instead.
-        assert not _preshuffled, (
-            "ATOM_USE_TRITON_MOE_A4W4 needs the plain (E, K, N) weight layout, "
-            "but this layer was prepared WMMA-preshuffled (gfx1250). "
-            "moe_gemm_a4w4 has no preshuffled variant -- a4w4 is CDNA-only."
+        # a4w4 takes the preshuffled gfx1250 weight through `preshuffle_weights`
+        # -- a different parameter name from a8w4's `preshuffled`, which is why
+        # this branch used to assert it did not exist. It does, it asserts the
+        # gluon backend, and it applies the same N*16 the decode view needs.
+        #
+        # `ep_scatter` likewise now exists on moe_gemm_a4w4, and both a4w4 gluon
+        # kernels carry the DstRow/EP_SCATTER epilogue, so it fuses into GEMM2's
+        # write-back rather than taking a standalone scatter_grouped pass.
+        #
+        # What a4w4 genuinely does NOT have is a static activation scale: its
+        # signature is (x, w, x_scales, w_scales, bias, routing_data, ...) with
+        # no x_static_scale/quant_static_scale. Passing a13_scale positionally
+        # into `bias` is exactly the bug this branch had.
+        assert a13_scale is None and a2_scale is None, (
+            "moe_gemm_a4w4 has no static activation scale (no x_static_scale / "
+            "quant_static_scale in its signature), so a13_scale/a2_scale would "
+            "be silently dropped. Only dynamic MX activation quant is supported."
         )
         x_fp4, x_scale = mxfp4_quant(hidden_states)
-        interm = moe_gemm_a4w4(
-            x_fp4,
-            w1,
-            x_scale,
-            w13_scale,
-            a13_scale,
-            None,
-            w1_bias,
-            routing_data,
+        # Keyword-addressed from `bias` on: a4w4 has SIX parameters before
+        # gather_indx where a8w4 has eight, so the a8w4 positional layout landed
+        # routing_data on gather_indx and raised "got multiple values for
+        # argument 'gather_indx'".
+        _gemm1_kwargs = dict(
+            bias=w1_bias,
+            routing_data=routing_data,
+            preshuffle_weights=_preshuffled,
             gather_indx=gather_indx,
             gammas=gammas if apply_router_weight_on_input else None,
             swizzle_mx_scale=w13_swizzle_layout,
@@ -339,17 +344,43 @@ def _fused_experts_silu_gugu(
             limit=swiglu_limit,
             swiglu_add_residual=False,
         )
-        # The launch a8w4 avoids via out_mx_quant=True.
-        interm_fp4, interm_scale = mxfp4_quant(interm)
+        # out_mx_quant folds the intermediate's MXFP4 requant into GEMM1's
+        # epilogue -- the launch a8w4 has always avoided -- returning exactly the
+        # (packed e2m1, e8m0 scales) pair mxfp4_quant would have produced, bit for
+        # bit. Correct, but OFF by default because on gfx1250 it does not pay:
+        # the epilogue quant costs GEMM1 more than the launch it removes.
+        #
+        #   layer03, ep4_conc2048_fake_eplb, --fuse-reduce-mori:
+        #     M=2048 (prefill, block_m=32)  GEMM1 144.8 -> 164.8us to drop a
+        #                                   15.5us launch; total 273.4 -> 279.7
+        #     M=64   (decode,  block_m=16)  GEMM1 130.2 -> 135.8us to drop a
+        #                                   2.3us launch;  total 214.4 -> 214.6
+        #
+        # Most likely the epilogue's extra live registers cost the whole GEMM
+        # occupancy, and the packed tile leaves via per-thread stores where the
+        # bf16 tile went out through TDM. Worth revisiting with a TDM store for
+        # the packed tile and a config retune for the mx epilogue.
+        #
+        # Gluon-only in any case: the triton fallback has no such epilogue.
+        _fuse_requant = (
+            get_arch() == "gfx1250"
+            and os.environ.get("ATOM_A4W4_FUSED_QUANT", "0") == "1"
+        )
+        if _fuse_requant:
+            interm_fp4, interm_scale = moe_gemm_a4w4(
+                x_fp4, w1, x_scale, w13_scale, out_mx_quant=True, **_gemm1_kwargs
+            )
+        else:
+            interm = moe_gemm_a4w4(x_fp4, w1, x_scale, w13_scale, **_gemm1_kwargs)
+            interm_fp4, interm_scale = mxfp4_quant(interm)
         return moe_gemm_a4w4(
             interm_fp4,
             w2,
             interm_scale,
             w2_scale,
-            a2_scale,
-            None,
-            w2_bias,
-            routing_data,
+            bias=w2_bias,
+            routing_data=routing_data,
+            preshuffle_weights=_preshuffled,
             scatter_indx=scatter_indx,
             gammas=None if apply_router_weight_on_input else gammas,
             swizzle_mx_scale=w2_swizzle_layout,
@@ -357,6 +388,7 @@ def _fused_experts_silu_gugu(
             # dead slots are already skipped by the sentinel histogram.
             gate_valid=gate_valid,
             y_out=y_out,
+            ep_scatter=ep_scatter,
         )
 
     x_fp8, x_scale = downcast_to_mxfp(hidden_states, torch.float8_e4m3fn, axis=-1)
