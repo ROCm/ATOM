@@ -669,10 +669,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # `np[:n] = arr; copy_to_gpu(n)` pattern instead of per-call
         # `torch.as_tensor(arr)` allocations.
         self._alloc_v4_metadata_buffers()
-        # Reused completion marker for the early decode-preparation stream.
-        # Recording it before the DP wait lets the main stream join with one
-        # wait_event after the result arrives, instead of wait_stream creating,
-        # recording, and destroying a temporary event on the critical path.
+        # Reused dependency markers for the early decode-preparation stream.
+        # Avoid wait_stream's per-step temporary event construction/destruction
+        # on both sides of the packed metadata upload.
+        self._decode_prep_start_event = torch.cuda.Event()
         self._decode_prep_done_event = torch.cuda.Event()
 
         self._ubatch_decode_meta: list | None = None
@@ -2651,38 +2651,72 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
         prep_stream = self.prep_stream
         current_stream = torch.cuda.current_stream()
-        prep_stream.wait_stream(current_stream)
+        self._decode_prep_start_event.record(current_stream)
+        prep_stream.wait_event(self._decode_prep_start_event)
         with torch.cuda.stream(prep_stream):
-            positions_gpu = var["positions"].copy_to_gpu(max_early_tokens)
-            cu_seqlens_q_gpu = var["cu_seqlens_q"].copy_to_gpu(self.max_bs + 1)
-            context_lens_gpu = var["context_lens"].copy_to_gpu(scheduled_bs)
-            block_tables_gpu = var["block_tables"].copy_to_gpu(scheduled_bs)
-            state_slot_gpu = var["v4_meta_state_slot_out"].copy_to_gpu(self.max_bs)
-            state_slot_in_gpu = var["v4_meta_state_slot_in"].copy_to_gpu(self.max_bs)
+            packed_upload = self._decode_upload_arena is not None
+            positions_gpu = var["positions"].gpu[:max_early_tokens]
+            cu_seqlens_q_gpu = var["cu_seqlens_q"].gpu[: self.max_bs + 1]
+            context_lens_gpu = var["context_lens"].gpu[:scheduled_bs]
+            block_tables_gpu = var["block_tables"].gpu[:scheduled_bs]
+            state_slot_gpu = var["v4_meta_state_slot_out"].gpu[: self.max_bs]
+            state_slot_in_gpu = var["v4_meta_state_slot_in"].gpu[: self.max_bs]
+            if not packed_upload:
+                var["positions"].copy_to_gpu(max_early_tokens)
+                var["cu_seqlens_q"].copy_to_gpu(self.max_bs + 1)
+                var["context_lens"].copy_to_gpu(scheduled_bs)
+                var["block_tables"].copy_to_gpu(scheduled_bs)
+                var["v4_meta_state_slot_out"].copy_to_gpu(self.max_bs)
+                var["v4_meta_state_slot_in"].copy_to_gpu(self.max_bs)
             staged_compress_plans = self._build_compress_plans(
                 extend_lens_np,
                 context_lens_np,
                 running_bs=self.max_bs,
                 max_q_len=full_q,
                 prepared=prepared_plans,
+                defer_device_copy=packed_upload,
             )
             batch_id_per_token_gpu = self._stage(
-                "v4_batch_id_per_token", batch_id_padded_np
+                "v4_batch_id_per_token",
+                batch_id_padded_np,
+                defer_device_copy=packed_upload,
             )
             n_committed_csa_per_seq_gpu = self._stage(
-                "v4_n_committed_csa_per_seq", n_csa_padded_np
+                "v4_n_committed_csa_per_seq",
+                n_csa_padded_np,
+                defer_device_copy=packed_upload,
             )
-            swa_indptr_gpu = self._stage("v4_kv_indptr_swa", swa_indptr_np)
-            csa_indptr_gpu = self._stage("v4_kv_indptr_csa", csa_indptr_np)
+            swa_indptr_gpu = self._stage(
+                "v4_kv_indptr_swa",
+                swa_indptr_np,
+                defer_device_copy=packed_upload,
+            )
+            csa_indptr_gpu = self._stage(
+                "v4_kv_indptr_csa",
+                csa_indptr_np,
+                defer_device_copy=packed_upload,
+            )
             n_committed_per_token_gpu = self._stage(
-                "v4_n_committed_per_token", n_committed_per_token_np
+                "v4_n_committed_per_token",
+                n_committed_per_token_np,
+                defer_device_copy=packed_upload,
             )
-            hca_indptr_gpu = self._stage("v4_kv_indptr_hca", hca_indptr_np)
+            hca_indptr_gpu = self._stage(
+                "v4_kv_indptr_hca",
+                hca_indptr_np,
+                defer_device_copy=packed_upload,
+            )
             qo_indptr_gpu = (
-                self._stage("v4_qo_indptr", qo_indptr_np)
+                self._stage(
+                    "v4_qo_indptr",
+                    qo_indptr_np,
+                    defer_device_copy=packed_upload,
+                )
                 if qo_indptr_np is not None
                 else None
             )
+            if packed_upload:
+                self._copy_decode_upload_arena(scheduled_bs)
 
             # The two layer-invariant helper kernels used to be submitted only
             # after the DP result was consumed.  Their active rows depend on the
@@ -2825,7 +2859,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
         state_slot_np = host_preparation.state_slot_np
         # ---- join the uploads submitted before the DP wait ----
-        prep_stream = self.prep_stream
         current_stream = torch.cuda.current_stream()
         positions = host_preparation.positions_gpu[:sum_scheduled_tokens_padded]
         cu_seqlens_q_gpu = host_preparation.cu_seqlens_q_gpu[: running_bs + 1]
@@ -4387,6 +4420,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         max_q_len: int | None = None,
         buf_prefix_ubatch: str = "",
         prepared: dict[int, PreparedCompressPlan] | None = None,
+        defer_device_copy: bool = False,
     ):
         """Build per-ratio CompressPlan dict consumed by batched compressor.
 
@@ -4437,6 +4471,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             running_bs=running_bs,
             max_q_len=max_q_len,
             prepared=prepared,
+            defer_device_copy=defer_device_copy,
         )
 
     def _slice_staged_compress_plans(
@@ -5019,6 +5054,97 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             self._alloc_v4_ubatch_decode_buffers(bufs, i32, i64)
 
         self.model_runner.forward_vars.update(bufs)
+        self._init_decode_upload_arena()
+
+    def _init_decode_upload_arena(self) -> None:
+        """Co-locate steady-decode host/device metadata for one packed H2D.
+
+        Decode previously submitted seventeen tiny transfers into independent
+        ``CpuGpuBuffer`` allocations. Their payload is only tens of KiB, but
+        Python/Torch/driver submission overhead serialized roughly 0.7 ms of
+        host preparation. Rebinding the buffers to typed views of one byte
+        arena preserves every address required by CUDAGraph while allowing the
+        hot path to upload them with one ``copy_``.
+
+        Pipeline parallel uses a ring of cloned ``forward_vars`` buffers; leave
+        that eager-only configuration on the existing per-buffer path. The
+        block table is deliberately last so the packed transfer can stop after
+        the scheduled rows instead of copying its full maximum allocation.
+        """
+
+        self._decode_upload_arena: CpuGpuBuffer | None = None
+        self._decode_upload_block_tables_offset = 0
+        if self.model_runner.config.pipeline_parallel_size > 1:
+            return
+
+        var = self.model_runner.forward_vars
+        names = [
+            "positions",
+            "cu_seqlens_q",
+            "context_lens",
+            "v4_meta_state_slot_out",
+            "v4_meta_state_slot_in",
+            "v4_batch_id_per_token",
+            "v4_n_committed_csa_per_seq",
+            "v4_kv_indptr_swa",
+            "v4_kv_indptr_csa",
+            "v4_n_committed_per_token",
+            "v4_kv_indptr_hca",
+            "v4_qo_indptr",
+        ]
+        if "ragged_extend" in var:
+            names.append("ragged_extend")
+        for ratio, _ in self._unique_compress_ratios_overlap:
+            names.extend((f"v4_compress_plan_{ratio}", f"v4_write_plan_{ratio}"))
+        names.append("block_tables")
+
+        layout: list[tuple[str, CpuGpuBuffer, int, int]] = []
+        offset = 0
+        for name in names:
+            buf = var[name]
+            assert isinstance(buf, CpuGpuBuffer)
+            alignment = buf.cpu.element_size()
+            offset = (offset + alignment - 1) // alignment * alignment
+            nbytes = buf.cpu.numel() * alignment
+            layout.append((name, buf, offset, nbytes))
+            offset += nbytes
+
+        arena = CpuGpuBuffer(
+            offset,
+            dtype=torch.uint8,
+            device=self.device,
+        )
+        for name, buf, start, nbytes in layout:
+            cpu_view = (
+                arena.cpu[start : start + nbytes]
+                .view(buf.cpu.dtype)
+                .view(buf.cpu.shape)
+            )
+            gpu_view = (
+                arena.gpu[start : start + nbytes]
+                .view(buf.gpu.dtype)
+                .view(buf.gpu.shape)
+            )
+            cpu_view.copy_(buf.cpu)
+            buf.cpu = cpu_view
+            buf.gpu = gpu_view
+            if hasattr(buf, "np"):
+                buf.np = cpu_view.numpy()
+            if name == "block_tables":
+                self._decode_upload_block_tables_offset = start
+
+        # Preserve one-time initializers such as compression-plan sentinels.
+        arena.gpu.copy_(arena.cpu)
+        self._decode_upload_arena = arena
+
+    def _copy_decode_upload_arena(self, scheduled_bs: int) -> None:
+        """Upload all decode metadata plus the active block-table rows."""
+
+        assert self._decode_upload_arena is not None
+        block_tables = self.model_runner.forward_vars["block_tables"]
+        row_bytes = block_tables.cpu.stride(0) * block_tables.cpu.element_size()
+        nbytes = self._decode_upload_block_tables_offset + scheduled_bs * row_bytes
+        self._decode_upload_arena.copy_to_gpu(nbytes)
 
     def _alloc_v4_ubatch_decode_buffers(self, bufs: dict, i32: dict, i64: dict) -> None:
         """Clone decode-path metadata buffers into ``ub{0,1}_`` prefixed sets.
@@ -5086,7 +5212,14 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             for ratio, name in _DEST_ROW_BUFFERS.items()
         }
 
-    def _stage(self, name: str, arr, pad_to: int | None = None) -> torch.Tensor:
+    def _stage(
+        self,
+        name: str,
+        arr,
+        pad_to: int | None = None,
+        *,
+        defer_device_copy: bool = False,
+    ) -> torch.Tensor:
         """Write numpy `arr` into `forward_vars[name]` (CpuGpuBuffer) and
         return its GPU view sliced to len(arr). Asserts the buffer is large
         enough and that `arr.dtype` matches the buffer dtype (callers must
@@ -5118,6 +5251,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         )
         buf.np[n:width] = 0
         buf.np[:n] = arr
+        if defer_device_copy:
+            return buf.gpu[:width]
         return buf.copy_to_gpu(width)
 
     @staticmethod

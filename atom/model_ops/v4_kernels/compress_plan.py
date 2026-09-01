@@ -147,6 +147,7 @@ def make_compress_plans(
     max_q_len: int | None = None,
     decode_capacity_per_ratio: dict[int, int] | None = None,
     prepared: dict[int, PreparedCompressPlan] | None = None,
+    defer_device_copy: bool = False,
 ) -> dict[int, CompressPlan]:
     """Build a CompressPlan per (ratio, overlap) variant.
 
@@ -202,6 +203,10 @@ def make_compress_plans(
       prepared: optional CPU-only rows returned by
                     :func:`prepare_compress_plans`. Supplying them skips numpy
                     construction and only pads/stages the reusable GPU buffers.
+      defer_device_copy: populate the CPU buffers and return the corresponding
+                    GPU views without issuing their individual H2D copies. The
+                    caller must copy the backing storage before consuming the
+                    views. Used by DSV4's packed decode-metadata upload.
 
     Returns:
       dict[ratio] -> CompressPlan. On empty fwd (`extend_lens_cpu.sum() == 0`)
@@ -286,8 +291,12 @@ def make_compress_plans(
             wbuf.np[:n_write] = write_plan
         if write_slice > n_write:
             wbuf.np[n_write:write_slice].fill(-1)  # sentinel
-        compress_plan_gpu = cbuf.copy_to_gpu(compress_slice)
-        write_plan_gpu = wbuf.copy_to_gpu(write_slice)
+        if defer_device_copy:
+            compress_plan_gpu = cbuf.gpu[:compress_slice]
+            write_plan_gpu = wbuf.gpu[:write_slice]
+        else:
+            compress_plan_gpu = cbuf.copy_to_gpu(compress_slice)
+            write_plan_gpu = wbuf.copy_to_gpu(write_slice)
 
         out[ratio] = CompressPlan(
             compress_plan_gpu=compress_plan_gpu,
