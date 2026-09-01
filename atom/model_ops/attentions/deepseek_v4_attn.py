@@ -377,7 +377,7 @@ class _MixedDecodeView:
 
     Only the fields `prepare_decode` (and `prepare_block_tables`) actually read
     are sliced; everything else delegates to the wrapped batch. Per-row arrays
-    (`context_lens`, `block_tables`, `per_req_cache_groups`) are sliced to drop
+    (`context_lens`, `block_tables`, `state_slots`) are sliced to drop
     the leading prefill rows; counts report the decode totals.
     """
 
@@ -394,9 +394,20 @@ class _MixedDecodeView:
         # (R1/dense has no SWA so its mixed path was unaffected).
         _swa = getattr(batch, "swa_block_tables", None)
         self.swa_block_tables = _swa[n_prefill_seqs:] if _swa is not None else _swa
-        # per_req_cache_groups holds only seqs with a per-req cache, in batch
-        # order; for V4 every seq has one, so the decode rows are the tail.
-        self.per_req_cache_groups = batch.per_req_cache_groups[n_prefill_seqs:]
+        # `per_req_cache_groups` became `state_slots`, and its filter tightened
+        # from `has_per_req_cache` to `has_per_req_cache and state_slot >= 0`.
+        # For V4 every seq has a per-req cache and a decode row always holds its
+        # slot, so the list still lines up with batch rows and the decode rows
+        # are the tail. But a filtered list CAN be shorter than the batch, and a
+        # positional slice of a shortened list misaligns silently -- every decode
+        # row would get another row's slot. Assert the alignment rather than
+        # inherit the old comment's assumption.
+        _slots = batch.state_slots
+        assert len(_slots) == batch.total_seqs_num, (
+            f"state_slots is filtered ({len(_slots)} of {batch.total_seqs_num} "
+            "rows); the positional decode slice below would misalign"
+        )
+        self.state_slots = _slots[n_prefill_seqs:]
         self.total_seqs_num_decode = batch.total_seqs_num_decode
         self.total_tokens_num_decode = batch.total_tokens_num_decode
         self.total_seqs_num_prefill = 0
