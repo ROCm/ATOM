@@ -10,7 +10,7 @@ tensors that are already there.
 That swap rests on one property of the row -> seq map: **the rows it marks
 invalid are a contiguous tail**. If they were interior, `index_select` over a
 prefix would fill the wrong rows and only the padding rows -- which the kernel
-skips because their `n_committed_per_token` is 0 -- would hide it. So the tail
+skips because their `csa_n_committed_per_token` is 0 -- would hide it. So the tail
 property is asserted directly, for both row layouts, before the gather is
 compared against the host expansion it replaces.
 
