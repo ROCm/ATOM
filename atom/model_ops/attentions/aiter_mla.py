@@ -342,31 +342,29 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     + "; ".join(unsupported)
                 )
 
-        self.full_index_layer_ids: tuple[int, ...] = ()
-        self.index_layer_to_cache_row: dict[int, int] = {}
         if self.replicate_index_cache:
+            # The cache rows themselves come from _index_cache_layout(); this is
+            # only the startup guard that the schedule it reads is well formed,
+            # since a missing or short indexer_types silently degrades to
+            # one-row-per-layer and the replicated page width would then be
+            # applied to rows that hold no indexer.
             indexer_types = getattr(hf_config, "indexer_types", None)
             if not indexer_types or len(indexer_types) != hf_config.num_hidden_layers:
                 raise ValueError(
                     "Replicated GLM index cache requires one indexer_types entry "
                     "per target layer"
                 )
-            self.full_index_layer_ids = tuple(
-                layer_id
-                for layer_id, indexer_type in enumerate(indexer_types)
-                if indexer_type == "full"
+            num_full_layers = sum(
+                1 for indexer_type in indexer_types if indexer_type == "full"
             )
-            if not self.full_index_layer_ids:
+            if not num_full_layers:
                 raise ValueError(
                     "Replicated GLM index cache found no full IndexShare layers"
                 )
-            self.index_layer_to_cache_row = {
-                layer_id: row for row, layer_id in enumerate(self.full_index_layer_ids)
-            }
             logger.info(
                 "Replicating GLM index cache for %d full IndexShare layers "
                 "across %d DCP ranks",
-                len(self.full_index_layer_ids),
+                num_full_layers,
                 self.dcp_world_size,
             )
 
@@ -1188,9 +1186,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 dtype=dtypes.fp8,
                 device="cuda",
             )
-            if replicate_index_cache:
-                out["index_layer_to_cache_row"] = self.index_layer_to_cache_row
-                out["full_index_layer_ids"] = self.full_index_layer_ids
         return out
 
     def build_kv_cache_tensor(self, layer_id: int, module):
@@ -1242,7 +1237,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 1,
                 runner.aligned_index_dim,
             )
-            module.indexer.replicate_index_cache = replicate_index_cache
         module.kv_cache = kv_cache
         return KVCacheTensor(
             layer_num=layer_id,
