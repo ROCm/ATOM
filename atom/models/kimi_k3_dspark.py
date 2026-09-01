@@ -561,14 +561,19 @@ class K3DSparkDecoderLayer(nn.Module):
         self.self_attn.write_context_kv(ctx_hidden, positions, slot_mapping)
 
     def forward(
-        self, positions: torch.Tensor, hidden_states: torch.Tensor
-    ) -> torch.Tensor:
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = residual + self.self_attn(positions, hidden_states)
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        return residual + self.mlp(hidden_states)
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        hidden_states = self.self_attn(positions, hidden_states)
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        return self.mlp(hidden_states), residual
 
 
 class KimiK3DSpark(DSparkDraftModel):
@@ -712,9 +717,10 @@ class KimiK3DSpark(DSparkDraftModel):
         draft_ids[:, 0] = input_ids
         hidden = self.embed_tokens(draft_ids.view(-1))
 
+        residual = None
         for layer in self.layers:
-            hidden = layer(positions, hidden)
-        hidden = self.final_norm(hidden)
+            hidden, residual = layer(positions, hidden, residual)
+        hidden, _ = self.final_norm(hidden, residual)
 
         base_logits = self.lm_head(hidden).view(bs, T, -1)
         return self._sample_block(base_logits, input_ids), None
