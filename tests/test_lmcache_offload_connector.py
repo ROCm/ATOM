@@ -5135,6 +5135,34 @@ def test_every_member_the_scheduler_reads_is_reachable_through_the_shell():
     probed.discard("_impl")
     assert probed, "the scan found nothing -- it has stopped matching the source"
 
+    # A regex sweep degrades silently: hoist one `getattr(self.kv_connector,
+    # "x")` into a local alias and that read simply stops matching, shrinking
+    # `probed` without emptying it, so `assert probed` above still passes and
+    # `x` is quietly no longer covered. Anchor on members we know are read
+    # through the shell today -- the past incidents plus the flags -- so a
+    # rewrite that hides one of them fails here loudly instead of vacuously.
+    # Each name below is currently matched by one of the four patterns; if the
+    # scheduler stops reading it (a real removal), delete it from this set in
+    # the same change, deliberately.
+    must_be_seen = {
+        "should_defer_free",
+        "abandon_save",
+        "request_finished",
+        "build_connector_meta",
+        "process_completions",
+        "chunk_size",
+        "enqueue_state_stores",
+        "take_state_reports",
+        "take_state_source_releases",
+        "is_offload",
+    }
+    lost = sorted(must_be_seen - probed)
+    assert not lost, (
+        "the scan no longer sees these known reads -- the scheduler now reaches "
+        f"them in a form the regex does not match, so coverage silently dropped: "
+        f"{lost}. Update the patterns (or this anchor set) intentionally."
+    )
+
     shell = LMCacheOffloadConnectorScheduler
     missing = sorted(n for n in probed if not hasattr(shell, n))
     assert not missing, (
@@ -5174,6 +5202,92 @@ def test_the_shells_no_impl_fallbacks_match_what_the_caller_unpacks():
     assert shell.load_finished(None) is True
     # Unchanged, so a connector with no opinion does not shrink the chunk.
     assert shell.adjust_prefill_chunk_after_alloc(None, 7) == 7
+
+
+def test_every_unconditional_shell_forward_exists_on_every_impl():
+    """The other half of the shell contract: a forward that does NOT guard.
+
+    Two tests above cover the members the scheduler reads off the shell, and the
+    getattr-guarded fallbacks the shell defines. Neither covers the third shape:
+    a shell method whose body is a bare `return self._impl.NAME(...)`. When the
+    variant `_impl` chosen for a layout does not define `NAME`, that forward
+    raises AttributeError inside a scheduler step -- and because the step runs on
+    every TP rank, one rank dies and the survivors block forever in the next
+    collective. The shell has three `_impl` types (dense / kimi_k3 / dsv4), so an
+    unconditional forward is only safe if the method resolves on all three.
+
+    Scan the shell's own source for those bare forwards -- reading the source,
+    not a hand-kept list, for the same reason the sweep above does -- and hold
+    each forwarded name against every concrete impl through its full MRO.
+    """
+    import ast
+    import inspect
+
+    from atom.kv_transfer.offload.connector import LMCacheOffloadConnectorScheduler
+    from atom.kv_transfer.offload.hybrid.dsv4.connector import DSV4OffloadScheduler
+
+    shell_src = inspect.getsource(LMCacheOffloadConnectorScheduler)
+    shell_ast = ast.parse(shell_src)
+    (shell_cls,) = [n for n in shell_ast.body if isinstance(n, ast.ClassDef)]
+
+    def _is_unconditional_forward(fn):
+        """A method whose ONLY statement (past a docstring) forwards straight to
+        `self._impl.<name>(...)` -- either `return self._impl.<name>(...)` or the
+        bare void call `self._impl.<name>(...)`. No getattr, no `if callable`: if
+        the impl lacks `<name>`, this raises AttributeError at call time."""
+        body = [
+            s
+            for s in fn.body
+            if not (isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant))
+        ]
+        if len(body) != 1:
+            return None
+        stmt = body[0]
+        if isinstance(stmt, ast.Return):
+            call = stmt.value
+        elif isinstance(stmt, ast.Expr):  # void forward, returns None implicitly
+            call = stmt.value
+        else:
+            return None
+        if not isinstance(call, ast.Call):
+            return None
+        target = call.func  # self._impl.<name>
+        if (
+            isinstance(target, ast.Attribute)
+            and isinstance(target.value, ast.Attribute)
+            and target.value.attr == "_impl"
+            and isinstance(target.value.value, ast.Name)
+            and target.value.value.id == "self"
+        ):
+            return target.attr
+        return None
+
+    forwards = sorted(
+        {
+            name
+            for fn in shell_cls.body
+            if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+            for name in [_is_unconditional_forward(fn)]
+            if name
+        }
+    )
+    assert forwards, "found no unconditional forwards -- the scan stopped matching"
+
+    impls = {
+        "dense": DenseOffloadScheduler,
+        "kimi_k3": KimiK3OffloadScheduler,
+        "dsv4": DSV4OffloadScheduler,
+    }
+    broken = {
+        layout: [name for name in forwards if not hasattr(cls, name)]
+        for layout, cls in impls.items()
+    }
+    broken = {layout: names for layout, names in broken.items() if names}
+    assert not broken, (
+        "the shell forwards these unconditionally, but the named `_impl` does "
+        "not define them, so the forward raises AttributeError mid-step and "
+        f"wedges the TP group for that layout: {broken}"
+    )
 
 
 # ── kimi_k3: the two joint legs report different identities ───────────────
