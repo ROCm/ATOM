@@ -1576,9 +1576,7 @@ def _kpool_write_completed_pools(
     row = torch.arange(n, device=k.device)
     offs = torch.arange(kpool, device=k.device)
     # Token i closes the pool spanning tokens i-(kpool-1) .. i.
-    idx = (
-        (row - (kpool - 1)).clamp_min(0)[:, None] + offs[None, :]
-    ).clamp_max(n - 1)
+    idx = ((row - (kpool - 1)).clamp_min(0)[:, None] + offs[None, :]).clamp_max(n - 1)
     pool_k, pool_gate = k[idx], gate_score[idx]
     if chunk_start is not None:
         # Chunked prefill can split a request mid-pool. That pool's earlier
@@ -1592,9 +1590,7 @@ def _kpool_write_completed_pools(
         # `abs % kpool == s` and the tail row index is just the slot index.
         abs_slot = positions.to(torch.int64)[:, None] - (kpool - 1) + offs[None, :]
         from_tail = abs_slot < chunk_start[req_idx][:, None]
-        read_slots = (
-            state_slot_idx if state_slot_idx_in is None else state_slot_idx_in
-        )
+        read_slots = state_slot_idx if state_slot_idx_in is None else state_slot_idx_in
         safe_slots = read_slots[req_idx].clamp_min(0)
         stash = tail_cache[safe_slots]  # [n, 2, kpool, head_dim]
         pool_k = torch.where(from_tail[..., None], stash[:, 0], pool_k)
@@ -1945,9 +1941,7 @@ def _sparse_attn_indexer_kpool(
     )
     # Only a pool that closed on this token gets written; the rest carry a -1
     # slot, which the cache write skips.
-    closes = ((pos % index_kpool) == (index_kpool - 1)) & (
-        state_slot_idx[:bs] >= 0
-    )
+    closes = ((pos % index_kpool) == (index_kpool - 1)) & (state_slot_idx[:bs] >= 0)
     pool_ids = torch.where(closes, pos // index_kpool, torch.full_like(pos, -1))
     slots = kpool_ops.pool_slot_mapping(
         pool_bt,

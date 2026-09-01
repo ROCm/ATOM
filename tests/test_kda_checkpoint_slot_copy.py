@@ -214,15 +214,9 @@ def hybrid_with_kpool_tail(num_slots: int = 4):
         config=SimpleNamespace(
             hf_config=SimpleNamespace(index_kpool=4, index_head_dim=2)
         ),
-        mamba_k_cache=torch.zeros(
-            (N_LAYERS, num_slots) + SHAPE_K, dtype=DT_K
-        ),
-        mamba_v_cache=torch.zeros(
-            (N_LAYERS, num_slots) + SHAPE_V, dtype=DT_V
-        ),
-        kpool_tail_cache=torch.zeros(
-            (2, num_slots, 2, 4, 2), dtype=torch.bfloat16
-        ),
+        mamba_k_cache=torch.zeros((N_LAYERS, num_slots) + SHAPE_K, dtype=DT_K),
+        mamba_v_cache=torch.zeros((N_LAYERS, num_slots) + SHAPE_V, dtype=DT_V),
+        kpool_tail_cache=torch.zeros((2, num_slots, 2, 4, 2), dtype=torch.bfloat16),
     )
     stub = object.__new__(K3._KimiMLAGDNCommon)
     stub.model_runner = runner
@@ -246,9 +240,7 @@ class TestHybridImageIncludesTheKpoolTail:
             N_LAYERS * (K_BYTES + V_BYTES) + 2 * tail_per_layer
         )
         assert stub._checkpoint_segment_sizes() == (
-            [K_BYTES] * N_LAYERS
-            + [V_BYTES] * N_LAYERS
-            + [tail_per_layer] * 2
+            [K_BYTES] * N_LAYERS + [V_BYTES] * N_LAYERS + [tail_per_layer] * 2
         )
 
     def test_tail_slot_addresses_follow_the_two_kda_planes(self):
@@ -259,9 +251,7 @@ class TestHybridImageIncludesTheKpoolTail:
         assert bases.shape == (tail.shape[1], 2 * N_LAYERS + tail.shape[0])
         for slot in range(tail.shape[1]):
             for layer in range(tail.shape[0]):
-                assert bases[slot, 2 * N_LAYERS + layer] == tail[
-                    layer, slot
-                ].data_ptr()
+                assert bases[slot, 2 * N_LAYERS + layer] == tail[layer, slot].data_ptr()
 
 
 class TestPageUnitAddressesAreArithmetic:

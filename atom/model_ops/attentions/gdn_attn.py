@@ -132,14 +132,10 @@ class GDNStateMixin:
             # 0-based (its layer_types[3] is the first full-attention layer, and
             # full_attn_layers correspondingly starts at 3).
             offset = 0 if model_type == "glm5_next_text" else 1
-            if model_type == "glm5_next_text" and hasattr(
-                hf, "glm5_full_attn_layers"
-            ):
+            if model_type == "glm5_next_text" and hasattr(hf, "glm5_full_attn_layers"):
                 # The model normalizer derives these from layer_types when a
                 # config revision omits the redundant linear-attn lists.
-                model_runner.full_attention_layers = list(
-                    hf.glm5_full_attn_layers
-                )
+                model_runner.full_attention_layers = list(hf.glm5_full_attn_layers)
                 model_runner.kda_attention_layers = list(hf.glm5_kda_layers)
             else:
                 model_runner.full_attention_layers = [
