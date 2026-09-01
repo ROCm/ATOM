@@ -1247,7 +1247,7 @@ def _compact_filter_dcp_kernel(
     tl.store(out_kv_indices + out_kv_start, 0, mask=written == 0)
 
 
-def _assert_dcp_filter_rows(
+def _check_dcp_filter_rows(
     num_tokens: int,
     *,
     token_to_seq_idxs: torch.Tensor,
@@ -1265,8 +1265,12 @@ def _assert_dcp_filter_rows(
     ``max_num_batched_tokens`` while ``num_tokens`` comes from the caller's
     token count, so a padding or ubatch change is exactly what would break the
     relation.
+
+    Raised rather than asserted because `python -O` strips asserts, which would
+    put the overrun back and leave it silent.
     """
-    assert num_tokens >= 0, f"num_tokens must be non-negative, got {num_tokens}"
+    if num_tokens < 0:
+        raise ValueError(f"num_tokens must be non-negative, got {num_tokens}")
     for name, tensor, needed in (
         ("token_to_seq_idxs", token_to_seq_idxs, num_tokens),
         ("topk_indices", topk_indices, num_tokens),
@@ -1274,17 +1278,23 @@ def _assert_dcp_filter_rows(
         ("owned_counts", owned_counts, num_tokens),
     ):
         have = tensor.shape[0]
-        assert have >= needed, (
-            f"{name} holds {have} rows but the filter runs {num_tokens} query "
-            f"tokens and needs {needed}"
+        if have < needed:
+            raise ValueError(
+                f"{name} holds {have} rows but the filter runs {num_tokens} "
+                f"query tokens and needs {needed}"
+            )
+    for name, tensor in (
+        ("token_to_seq_idxs", token_to_seq_idxs),
+        ("out_kv_indptr", out_kv_indptr),
+        ("owned_counts", owned_counts),
+    ):
+        if tensor.dtype != torch.int32:
+            raise TypeError(f"{name} must be int32, got {tensor.dtype}")
+    if block_table.dim() != 2:
+        raise ValueError(
+            "block_table must be [num_requests, max_blocks_per_request]; "
+            f"got shape {tuple(block_table.shape)}"
         )
-    assert token_to_seq_idxs.dtype == torch.int32
-    assert out_kv_indptr.dtype == torch.int32
-    assert owned_counts.dtype == torch.int32
-    assert block_table.dim() == 2, (
-        "block_table must be [num_requests, max_blocks_per_request]; "
-        f"got shape {tuple(block_table.shape)}"
-    )
 
 
 def triton_filter_and_convert_dcp_index(
@@ -1333,7 +1343,7 @@ def triton_filter_and_convert_dcp_index(
     )
     assert 0 <= dcp_rank < dcp_world_size
     assert out is not None, "sparse_kv_indices_buffer (out) is required"
-    _assert_dcp_filter_rows(
+    _check_dcp_filter_rows(
         num_tokens,
         token_to_seq_idxs=token_to_seq_idxs,
         topk_indices=token_indices,
@@ -1567,7 +1577,7 @@ def triton_filter_and_convert_dcp_index_prefill(
     assert out is not None, "sparse_kv_indices_buffer (out) is required"
 
     num_tokens = dsa_kv_indptr.shape[0] - 1
-    _assert_dcp_filter_rows(
+    _check_dcp_filter_rows(
         num_tokens,
         token_to_seq_idxs=token_to_seq_idxs,
         topk_indices=topk_indices,

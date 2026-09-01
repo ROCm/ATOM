@@ -464,3 +464,34 @@ def test_prefill_filter(seq_lens, interleave, world):
     # the zero-owned path must have been exercised -- guard against the empty-row
     # assertions passing vacuously.
     assert n_empty > 0, "expected some rank to own nothing for the early tokens"
+
+
+def test_filter_row_guard_raises_rather_than_asserts():
+    """A short buffer must surface as an exception `python -O` cannot strip.
+
+    The kernels take raw pointers, so this guard is the only thing between an
+    undersized scratch buffer and an out-of-bounds launch.
+    """
+    from atom.model_ops.dcp_ops import _check_dcp_filter_rows
+
+    rows = torch.zeros(8, dtype=torch.int32, device=DEV)
+    block_table = torch.zeros(2, 4, dtype=torch.int32, device=DEV)
+    kwargs = {
+        "token_to_seq_idxs": rows,
+        "topk_indices": rows,
+        "out_kv_indptr": rows,
+        "owned_counts": rows,
+        "block_table": block_table,
+    }
+
+    _check_dcp_filter_rows(7, **kwargs)
+
+    # out_kv_indptr needs num_tokens + 1, so 8 tokens is one row short.
+    with pytest.raises(ValueError, match="out_kv_indptr holds 8 rows"):
+        _check_dcp_filter_rows(8, **kwargs)
+
+    with pytest.raises(TypeError, match="owned_counts must be int32"):
+        _check_dcp_filter_rows(7, **{**kwargs, "owned_counts": rows.to(torch.int64)})
+
+    with pytest.raises(ValueError, match="block_table must be"):
+        _check_dcp_filter_rows(7, **{**kwargs, "block_table": block_table[0]})
