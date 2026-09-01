@@ -515,7 +515,7 @@ def apply_attn_res(
     out_eps: float = 1e-6,
     add_hidden2: torch.Tensor | None = None,
     quant_dtype: torch.dtype | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor | tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
     """Dispatch an opaque custom op whose CUDA implementation selects by concrete T.
 
     ``out_norm_weight`` folds the caller's rmsnorm of the result into the kernel;

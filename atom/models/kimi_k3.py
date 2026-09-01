@@ -484,13 +484,19 @@ class KimiSparseMoeBlock(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Returns ``(routed, shared)``, left unsummed.
+        """Returns ``(first, shared)``, where ``shared`` may be None.
 
-        The caller's next apply_attn_res folds both into its prefix on-load, so
-        deferring the add here removes a whole [T, H] elementwise kernel and its
-        HBM round-trip per MoE layer. ``shared`` is None when there are no shared
-        experts, or when the two branches had to be summed before a collective
-        (see `split_moe_forward`).
+        When ``shared`` is a tensor the two branches are left unsummed and
+        ``first`` is the routed branch alone: the caller's next apply_attn_res
+        folds both into its prefix on-load, so deferring the add removes a whole
+        [T, H] elementwise kernel and its HBM round-trip per MoE layer.
+
+        When ``shared`` is None, ``first`` is the module's *complete* output --
+        either because there are no shared experts, or because the two branches
+        were summed inside this module (the non-latent TP path must sum before
+        its single deferred all-reduce; see `split_moe_forward`). Callers must
+        therefore treat ``first`` as the whole result and not as a routed
+        partial that is still owed a shared add.
         """
         if self._use_dual_stream:
             if self._defer_shared_add:

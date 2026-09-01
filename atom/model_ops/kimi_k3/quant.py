@@ -11,11 +11,24 @@ round-trips for what is one load and one store of work.
 at the source's row stride and writes the contiguous quantized result, so the
 intermediate bf16 copy never exists.
 
-The ``strided_`` prefix is load-bearing: aiter exposes its own per-token quant
-(``get_hip_quant(QuantType.per_Token)``), which requires a contiguous input and
-is what this falls back to. The two are numerically interchangeable -- the
-kernel below is bit-exact against it -- so only the strided input distinguishes
-them, and the names have to say so.
+Why not an aiter quant? Both of aiter's per-token entry points were checked:
+
+* ``get_hip_quant(QuantType.per_Token)`` asserts a contiguous input
+  (``AITER_CHECK(input.is_contiguous())``, csrc/kernels/quant_kernels.cu), and
+  the kernel derives its row offset as ``blockIdx.x * cols`` with no stride
+  argument at all. Passing a slice does not raise -- it ``abort()``s the
+  process. This is still the fallback below, paid for with a ``.contiguous()``.
+* ``aiter.ops.triton.quant.dynamic_per_token_quant_fp8_i8`` *does* take
+  ``x_in.stride(0)``, but its kernel reuses that one offset for the store as
+  well as the load (``offs = pid * x_in_stride_r + ...``, used by both
+  ``tl.load`` and ``tl.store``). With the contiguous ``[T, D]`` output the
+  consuming GEMM needs, a strided input therefore writes out of bounds -- 1792
+  stray elements at T=17/D=128/stride=1024, and a hard IMA at T=4096. It also
+  divides by a zero scale on an all-zero row (NaN) where the HIP path does not.
+
+So the ``strided_`` prefix is load-bearing, and the kernel below is bit-exact
+against ``get_hip_quant(QuantType.per_Token)`` (verified over T in 1..4096 and
+non-power-of-two D) so that the fused and fallback paths stay interchangeable.
 """
 
 from __future__ import annotations
@@ -96,7 +109,7 @@ def strided_per_token_quant(
     GEMM is subsumed rather than merely reordered.
 
     Returns ``(quantized [T, D], scale [T, 1] float32)``, the layout a
-    per-token a8w8 GEMM takes as ``x_scale=``. Matches
+    per-token a8w8 GEMM takes as ``x_scale=``. Bit-exact against
     ``get_hip_quant(QuantType.per_Token)`` -- which is the fallback when triton
     is unavailable -- including the zero scale on an all-zero row.
     """
