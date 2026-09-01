@@ -259,6 +259,23 @@ jobs:
           print(f"Generated {len(entries)} dashboard entries")
           PY
 
+      - name: Prepare existing dashboard data
+        if: hashFiles('atomesh-mocker-dashboard-input.json') != ''
+        run: |
+          set -euo pipefail
+          cp .github/scripts/prepare_dashboard_data.py /tmp/prepare_dashboard_data.py
+          CURRENT_SHA=$(git rev-parse HEAD)
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin gh-pages
+          git checkout gh-pages
+          python3 /tmp/prepare_dashboard_data.py atomesh-mocker-dashboard/data.js --write
+          if [ -f atomesh-mocker-dashboard/data.js ]; then
+            git add atomesh-mocker-dashboard/data.js
+            git diff --cached --quiet || git commit -m "ci(dashboard): normalize benchmark data format"
+          fi
+          git checkout "$CURRENT_SHA"
+
       - name: Store benchmark result to dashboard
         if: hashFiles('atomesh-mocker-dashboard-input.json') != ''
         uses: benchmark-action/github-action-benchmark@v1
@@ -267,6 +284,7 @@ jobs:
           output-file-path: atomesh-mocker-dashboard-input.json
           gh-pages-branch: gh-pages
           benchmark-data-dir-path: atomesh-mocker-dashboard
+          skip-fetch-gh-pages: true
           auto-push: false
           max-items-in-chart: 300
           github-token: ${{ secrets.GITHUB_TOKEN }}

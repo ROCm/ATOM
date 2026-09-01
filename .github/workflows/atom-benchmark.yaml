@@ -261,6 +261,22 @@ jobs:
             --default-backend ATOM \
             --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
+      - name: Prepare existing dashboard data
+        run: |
+          set -euo pipefail
+          cp .github/scripts/prepare_dashboard_data.py /tmp/prepare_dashboard_data.py
+          CURRENT_SHA=$(git rev-parse HEAD)
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin gh-pages
+          git checkout gh-pages
+          python3 /tmp/prepare_dashboard_data.py benchmark-dashboard/data.js --write
+          if [ -f benchmark-dashboard/data.js ]; then
+            git add benchmark-dashboard/data.js
+            git diff --cached --quiet || git commit -m "ci(dashboard): normalize benchmark data format"
+          fi
+          git checkout "$CURRENT_SHA"
+
       - name: Store benchmark result to dashboard
         uses: benchmark-action/github-action-benchmark@v1
         with:
@@ -268,6 +284,7 @@ jobs:
           output-file-path: benchmark-action-input.json
           gh-pages-branch: gh-pages
           benchmark-data-dir-path: benchmark-dashboard
+          skip-fetch-gh-pages: true
           auto-push: false
           alert-threshold: "80%"
           comment-on-alert: true
