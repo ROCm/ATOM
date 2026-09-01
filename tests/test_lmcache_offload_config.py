@@ -150,6 +150,32 @@ def test_unknown_explicit_offload_layout_is_rejected(override):
         offcfg.select_offload_layout(config)
 
 
+@pytest.mark.parametrize(
+    "model_type",
+    ["qwen3_next", "qwen3_next_mtp", "qwen3_5_text", "qwen3_5_moe_text"],
+)
+def test_gdn_linear_model_offload_is_refused(model_type):
+    # A GDN model must be turned away at config resolution, not fall through to
+    # `dense` and restore a KV prefix over its stale recurrent state. Clear
+    # `compress_ratios` so the hybrid branch does not claim it first.
+    config = _config()
+    config.hf_config.compress_ratios = None
+    config.hf_config.model_type = model_type
+
+    with pytest.raises(ValueError, match="does not support GDN"):
+        offcfg.select_offload_layout(config)
+
+
+def test_minimax_and_dense_model_types_still_route_to_dense():
+    # The refusal must be narrow: a non-GDN model with no compress_ratios is
+    # ordinary dense, including MiniMax (sparse/standard attention, no state).
+    for model_type in ("minimax_m2", "minimax_m3", "llama", None):
+        config = _config()
+        config.hf_config.compress_ratios = None
+        config.hf_config.model_type = model_type
+        assert offcfg.select_offload_layout(config) == "dense"
+
+
 @pytest.mark.parametrize("invalid", [True, 256.0, "256"])
 @pytest.mark.parametrize("field", ["block", "chunk", "world", "hf"])
 def test_page_namespace_rejects_coerced_integer_geometry(field, invalid):

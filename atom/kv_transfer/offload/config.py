@@ -55,6 +55,12 @@ _HF_INTEGER_GEOMETRY_FIELDS = frozenset(_HF_PAGE_FIELDS) - {
     "compress_ratios",
     "indexer_dtype",
 }
+# GDN/linear model types carrying a per-request recurrent state but NOT in the
+# `kimi_linear` family `kimi_k3` owns. Mirrors `ModelRunner.is_qwen_next()`.
+# MiniMax-M2/M3 are absent by design (sparse/standard attention, no state).
+_GDN_LINEAR_MODEL_TYPES = frozenset(
+    {"qwen3_next", "qwen3_next_mtp", "qwen3_5_text", "qwen3_5_moe_text"}
+)
 
 logger = logging.getLogger("atom")
 
@@ -101,6 +107,21 @@ def select_offload_layout(config) -> str:
         return "kimi_k3"
     if getattr(hf_config, "compress_ratios", None):
         return "hybrid"
+    # GDN/linear models carry a per-request recurrent state no layout owns a
+    # tier for; `dense` would restore a KV prefix over stale state (silent wrong
+    # output). The dense codec fails closed on the state tensor, but that fires
+    # deep in `register_kv_caches` as a byte-layout mismatch -- refuse here where
+    # the message can name the cause.
+    if getattr(hf_config, "model_type", None) in _GDN_LINEAR_MODEL_TYPES:
+        raise ValueError(
+            "lmcache_offload does not support GDN/linear-attention models "
+            f"(model_type={getattr(hf_config, 'model_type', None)!r}; e.g. "
+            "Qwen3-Next, Qwen3.5). These carry a per-request recurrent state "
+            "that no offload layout owns a tier for -- restoring their KV "
+            "prefix while that state is stale is silent wrong output. Disable "
+            "offload for this model, or use a state-owning layout once one "
+            "exists for it (kimi_k3 owns only the kimi_linear family)."
+        )
     return "dense"
 
 
