@@ -88,6 +88,11 @@ Four rules carry the module:
 | `hybrid/kimi_k3/state_tier.py` | Worker-side store/load driver for the state tier on its own executor; reports store/finished/failed hash sets for the engine-side `StateOffloadIndex` to apply. |
 | `atom_lmcache_staging.py` | Per-thread CUDA streams, staging buffer, ready/free events, env helpers. |
 
+The engine-side counterpart of the state tier lives outside this directory:
+`atom/model_engine/state_offload.py` holds `StateOffloadIndex`, which applies the
+store/finished/failed hash sets that `hybrid/kimi_k3/state_tier.py` reports back,
+so a later prefix hit knows which checkpoints the CPU tier can actually serve.
+
 ## Architecture
 
 The connector is split across two processes, mirroring ATOM's P/D split:

@@ -183,6 +183,21 @@ flag below. Details in the state-checkpoint section of the
 |----------|------|---------|-------------|
 | **ATOM_STATE_CHECKPOINT_DEMAND** | bool | 1 (true) | Set to `0` to stop a prefix hit that was refused for want of a checkpoint from placing a rung of its own, leaving the prompt-end anchor as the only placement. Overrides `--state-checkpoint-demand`, so the policy can be A/B'd without editing a launch script. The rung is most of the checkpoint write traffic and little of the read-back, and every write evicts something — `StateSlotPool.mark_speculative` carries the measurement. |
 
+### LMCache offload tier
+
+Two knobs that govern the LMCache CPU/NVMe offload connector are read directly
+via `os.environ` rather than through `atom.utils.envs`, because ATOM does not
+own either default: one belongs to the LMCache library, the other to the
+offload connector itself (defined in
+`atom/kv_transfer/offload/_offload_common.py` and documented in full in
+`atom/kv_transfer/offload/README.md`). They are listed here so they are
+discoverable from the central env reference despite bypassing the registry.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **LMCACHE_EC_PIN_TIMEOUT_SEC** | float | LMCache's own (300) | LMCache's source-pin timeout. ATOM reads it only to derive the engine's save-abandon window (`pin + 30s`), so the two stay ordered — a lost store report is reclaimed only after LMCache would already have force-unpinned its source. Non-positive disables ATOM's reclamation. ATOM sets no default of its own; when unset it assumes LMCache's. |
+| **OFFLOAD_MAX_PENDING_SAVES** | int | `max(2, 2 × OFFLOAD_COPY_WORKERS)` | Bound on total in-flight offload transfers (running + queued) held before a SLOT snapshot or executor submission. A KV save and a state store both pin bytes out of the same pool while they run, so the KV leg and the K3 state tier share this one number rather than each carrying its own. |
+
 ## Profiling & debugging
 
 | Variable | Type | Default | Description |
