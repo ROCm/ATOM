@@ -328,6 +328,14 @@ class Qwen3ForCausalLM(nn.Module):
         super().__init__()
         self.atom_config = config
         self.hf_config = self.atom_config.hf_config
+        raw_true_vocab_size = os.environ.get("LUMENRL_ATOM_TRUE_VOCAB_SIZE", "0")
+        try:
+            self._true_vocab_size = int(raw_true_vocab_size or 0)
+        except (TypeError, ValueError):
+            raise ValueError(
+                "Invalid LUMENRL_ATOM_TRUE_VOCAB_SIZE="
+                f"{raw_true_vocab_size!r}; expected an integer"
+            ) from None
         self.model = Qwen3Model(
             atom_config=self.atom_config, prefix=maybe_prefix(prefix, "model")
         )
@@ -359,9 +367,8 @@ class Qwen3ForCausalLM(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         logits = self.lm_head(hidden_states)
-        true_vocab_size = int(os.environ.get("LUMENRL_ATOM_TRUE_VOCAB_SIZE", "0") or 0)
-        if true_vocab_size > 0 and logits.shape[-1] > true_vocab_size:
-            logits[..., true_vocab_size:] = float("-inf")
+        if self._true_vocab_size > 0 and logits.shape[-1] > self._true_vocab_size:
+            logits[..., self._true_vocab_size :] = float("-inf")
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
