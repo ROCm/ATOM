@@ -33,6 +33,41 @@ Tips on server configuration:
 - Clear compile cache before restarting after code changes: `rm -rf /root/.cache/atom/*`
 - V4-Pro reuses the DeepSeek-V3 config schema; V4-specific fields (compress ratios, hash layers, index head dims) are read from the HF config automatically.
 
+### Experimental native RCCL routed MoE
+
+ATOM can run expert dispatch/combine without MoRI through a native RCCL
+backend. Uniform decode uses a graph-safe pre-routed AllGather/ReduceScatter
+fast path. When DP and EP have the same width, prefill and mixed batches reuse
+the scheduler's token counts for variable-size AllGather/ReduceScatter; other
+topologies use variable-split routed `torch.distributed.all_to_all_single`:
+
+```bash
+AITER_BF16_FP8_MOE_BOUND=0 ATOM_MOE_GU_ITLV=1 AITER_LOG_LEVEL=WARNING \
+python -m atom.entrypoints.openai_server \
+  --model deepseek-ai/DeepSeek-V4-Pro \
+  --kv_cache_dtype fp8 -tp 8 \
+  --enable-expert-parallel --enable-dp-attention \
+  --all2all-backend rccl
+```
+
+The backend consumes the same physical expert IDs produced after EPLB remap.
+Uniform decode packs hidden states plus compact top-k IDs/weights into one
+AllGather payload instead of gathering full router logits, runs the existing
+local fused expert kernel, and reduce-scatters the result.
+The variable-size path routes once on each source rank, gathers the packed
+hidden/ID/weight rows, runs the same local expert kernel, then reduce-scatters
+partial outputs to source-token order. Routed-expert IDs are preserved. Locally
+replicated shared experts are computed exactly once rather than once on every
+rank, and their owner is reassigned round-robin by global token row so one DPA
+rank with an unusually long request cannot hotspot its local shared-expert GEMM.
+
+The prefill/mixed path remains correctness-first rather than a MoRI performance
+replacement: the packed hidden/ID/weight payload is not yet produced by a fused
+GPU kernel, and wider flattened DP*TP expert groups still use the dynamic
+all-to-all fallback. TBO is not supported and is disabled for this backend. Use
+`--all2all-backend none` to select the original AllGather/ReduceScatter path, or
+omit the option to preserve automatic MoRI detection.
+
 ### MegaMoE fused MoE backend (`--moe-backend mega`)
 
 The routed-MoE implementation is selectable with `--moe-backend {standard,mega}`
@@ -133,10 +168,12 @@ python -m atom.entrypoints.openai_server \
 
   | Key | Default | Meaning |
   |---|---|---|
+  | `load_mode` | `"prefill"` | Forward modes used for load sampling and the rebalance clock. `"decode"` enables decode-only EPLB; `"all"` combines both. Decode accounting excludes dummy/CUDAGraph padding rows. |
   | `num_redundant_experts` | `0` | Extra physical expert slots per MoE layer set aside for replicas. `0` = pure rearrangement only (no extra memory; still rebalances via re-placement). Must be a multiple of the GPU count. |
   | `placement_policy` | `"naive"` | How the redundant-expert budget is spent. `"naive"`: greedy-replicate + `balanced_packing` spreads replicas thinly (DeepSeek-reference algorithm) — works with `num_redundant_experts=0` (pure rearrangement) or `>0`. `"biased"`: fully replicates the top-K hottest experts to **every** GPU (K = `num_redundant_experts // num_gpus`), trading memory for eliminating cross-GPU traffic on the hottest experts — **requires `num_redundant_experts > 0` (K ≥ 1); with `num_redundant_experts=0` it silently computes K=0 and falls back to identical behavior as `"naive"` ** If you set `placement_policy="biased"` and don't see the expected throughput gain, check `num_redundant_experts` first. |
-  | `rebalance_interval` | `3000` | Forward-pass steps between rebalance attempts. **Tune to the workload**: prefill-heavy/short runs accumulate steps slowly — use a small interval (e.g. `200`) or a short eval simply never triggers a rebalance. Decode-heavy runs accumulate steps fast — too small an interval (e.g. `200` for a long decode run) fires rebalances every few seconds and the migration overhead itself becomes the bottleneck; use a larger interval (e.g. `3000`) so rebalances land roughly every 8–12× the load-window size. |
-  | `load_window_size` | `1000` | Non-dummy (real) forward passes accumulated into the load histogram before a rebalance decision uses it. Must be `<= rebalance_interval`. |
+  | `rebalance_interval` | `3000` | Selected forward-pass steps between rebalance attempts. **Tune to the workload**: a short eval may need a small interval (e.g. `200`) to trigger at all. With `load_mode="decode"`, too small an interval on long generations can make migration overhead the bottleneck; start around `1000`–`3000`. |
+  | `max_rebalances` | `0` | Maximum completed automatic rebalances; `0` means unlimited. Use `1` for benchmark serving: calibrate once on representative traffic, then freeze the learned placement so the measured phase cannot pay another expert-weight migration pause. A gate skip does not consume the limit. |
+  | `load_window_size` | `1000` | Non-dummy forwards selected by `load_mode` and accumulated into the load histogram before a rebalance decision uses it. Must be `<= rebalance_interval`. |
   | `rebalance_min_balancedness` | `2.0` | Gate: skip a rebalance if the measured per-GPU balancedness is already `>=` this value. Per-GPU balancedness is bounded by ~1.0 in practice, so the `2.0` default is **inert** (always rebalances every interval) — lower it toward `~0.85–0.9` to let already-balanced layers skip rebalancing (saves plan/migration cost when biased placement is already flat). |
   | `rebalance_balancedness_agg` | `"min"` | `"min"` or `"mean"` — how per-layer balancedness scores are aggregated for the gate. |
   | `rebalance_layers_per_chunk` | `64` | MoE layers migrated per rebalance chunk (chunking bounds per-rebalance P2P burst size). |
@@ -144,6 +181,43 @@ python -m atom.entrypoints.openai_server \
 
 - **Memory**: `num_redundant_experts=0` (pure rearrangement) costs nothing extra. Each redundant slot costs one extra physical expert's weights on the GPU(s) holding it — `biased` concentrates that cost onto every GPU for the top-K experts, `naive` spreads it thinly.
 - EPLB is safe to enable with `num_redundant_experts=0` any time EP is on — it just periodically re-places experts across the existing physical slots to flatten per-GPU load, with no placement/memory tradeoffs to reason about.
+- **Decode-heavy serving**: set `"load_mode":"decode"` so expert statistics and the rebalance clock follow actual decode traffic instead of prompt traffic. Use `"all"` only when one placement should represent both phases; token counts naturally weight larger prefill batches more heavily.
+
+For long-context Agentic benchmarks, the usual one-token-per-lane warmup does
+not contain enough decode steps to train `load_mode="decode"`. Run a short,
+representative decode calibration on the same server before measurement and set
+`"max_rebalances":1`; after the log reports
+`EPLB automatic rebalancing and load recording frozen`,
+start the scored run. Do not substitute `load_mode="all"` with the standard
+one-token Agentic warmup: prompt-trained placement can differ from generated-token
+routing and has regressed c96 decode measurements. The calibration requests must
+produce representative output tokens.
+
+The first automatic rebalance waits for at least a full `load_window_size`
+after startup. For Agentic traffic, do not reduce this merely to make a short
+smoke test trigger sooner: the resulting placement is sensitive to whichever
+trajectories finish first. Prefer a longer calibration window over a noisier
+early placement.
+
+Keep the default `"rebalance_layers_per_chunk":64` for throughput runs and move
+the resulting one-time pause into calibration. Splitting all 61 layers into
+single-layer online migrations increased total migration time and regressed c96
+throughput in testing. Once the one-shot placement freezes, EPLB also disables
+Python-side load-window maintenance and gates load histograms in already captured
+decode graphs.
+
+For a decode-throughput run, start with pure rearrangement and a conservative
+migration interval, then add replicas only after measuring the available memory:
+
+```bash
+python -m atom.entrypoints.openai_server \
+  --model deepseek-ai/DeepSeek-V4-Pro \
+  --kv_cache_dtype fp8 -tp 8 \
+  --enable-dp-attention --enable-expert-parallel \
+  --dp-load-balance least_tokens \
+  --eplb-enable \
+  --eplb-config '{"load_mode":"decode","load_window_size":1000,"rebalance_interval":3000,"max_rebalances":1,"rebalance_min_balancedness":0.9,"num_redundant_experts":0,"placement_policy":"naive"}'
+```
 
 **Measured effect** (8×MI355X, EP+DPA, 8k-in/1-out prefill, `mnbt=8192`, conc=128; relative to EP with EPLB disabled):
 
