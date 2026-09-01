@@ -269,6 +269,15 @@ def init_mega_transport(
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
     )
+    # Peer-region stride in the flat symmetric VA. triton_mega_moe needs it to
+    # address the combine staging window, and MegaMoE does not keep it.
+    #
+    # Read HERE -- every rank is constructing its transport and the barrier
+    # below follows -- because create_dev_comm() may be COLLECTIVE while the
+    # forward that consumes this is NOT rank-aligned: the Triton experts are
+    # picked per step, so a lazy first-use read could have only some ranks
+    # enter the collective, and hang.
+    mega._atom_per_rank_size = int(comm.create_dev_comm().per_rank_size)
     comm.barrier()
     _MEGA_TRANSPORTS[key] = mega
     logger.info(
@@ -345,30 +354,6 @@ def init_mori_v2_op(
     return op
 
 
-@dataclass(frozen=True)
-class _EpScatterTarget:
-    """Adapter between the transport's staging window and the aiter MoE kernels.
-
-    The transport describes the window (where the rows go); aiter's sort wants a
-    geometry object to build destinations with, and its GEMM wants the window plus
-    the resulting map. Splitting it this way keeps the sort's output -- ``dst_row``
-    -- the only thing that has to travel between the two calls.
-
-    Built once per model and cached, so `src_token_map` is carried only to check
-    that premise still holds -- see combine_scatter_target().
-    """
-
-    view: torch.Tensor
-    sort_geometry: Any
-    src_token_map: torch.Tensor
-
-    def make_scatter(self, dst_row: torch.Tensor):
-        from aiter.ops.triton.moe.reduce import EpCombineScatter
-
-        assert dst_row is not None, "the sort was not asked for a scatter map"
-        return EpCombineScatter(out=self.view, dst_row=dst_row)
-
-
 class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
     """Prepare/Finalize backed by mori dispatch_combine_v2 (sync path only)."""
 
@@ -389,11 +374,6 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         self.num_dispatchers_ = num_dispatchers
         # Routing handle stashed between prepare() and finalize() of one forward.
         self._routing = None
-        # Dispatch's recv-slot -> origin (rank, token) map, for the scatter-fused
-        # combine. Same lifetime as _routing.
-        self._src_token_map = None
-        # Model-lifetime cache of the scatter target built from it.
-        self._scatter_target = None
         # The fused transport's EP geometry; the rest of what MegaMoE fixes at
         # construction only shows up on the layer -- see bind_mega_transport().
         self._mega_geometry = mega_geometry
@@ -455,45 +435,6 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
     def supports_async(self) -> bool:
         return False
 
-    def combine_scatter_target(self):
-        """The combine staging window, or None if this transport has no such thing.
-
-        Only the fused transport does. The modular kernel asks through this hook
-        rather than testing a flag, so "can GEMM2 deliver un-reduced rows?" stays
-        the transport's answer to give.
-        """
-        if self.mega is None:
-            return None
-        assert self._src_token_map is not None, (
-            "combine_scatter_target() before prepare(): the reverse source map is "
-            "the dispatch's output, so the target does not exist until it has run"
-        )
-        cached = self._scatter_target
-        if (
-            cached is not None
-            and cached.src_token_map.data_ptr() == self._src_token_map.data_ptr()
-        ):
-            return cached
-        # Everything in here is constant for the model -- the arena offsets, the
-        # peer stride, the slot pitch -- so it is built once instead of rebuilding
-        # a raw-pointer tensor view for every layer of every step. The data_ptr
-        # comparison is what makes "constant" checked rather than assumed: each
-        # dispatch hands back a fresh view OBJECT over the same arena, so only its
-        # identity is expected to change, never where it points.
-        from aiter.ops.triton.moe.moe_routing.routing import EpScatterGeometry
-
-        target = self.mega.combine_scatter_target()
-        self._scatter_target = _EpScatterTarget(
-            view=target.view,
-            sort_geometry=EpScatterGeometry(
-                src_token_map=self._src_token_map,
-                max_tokens_per_rank=target.max_tokens_per_rank,
-                peer_rows=target.peer_rows,
-            ),
-            src_token_map=self._src_token_map,
-        )
-        return self._scatter_target
-
     def prepare(
         self,
         a1: torch.Tensor,
@@ -511,26 +452,21 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
 
         # bf16 dispatch, no wire quant: scales=None. indices carry global expert
         # ids (0..global_num_experts-1); the transport routes id -> rank = id //
-        # EPR. Both transports publish the same recv buffers, so what follows is
-        # identical either way -- MegaMoE's dispatch additionally leaves the
-        # reverse source map the scatter-fused combine needs.
-        if self.mega is not None:
-            recv_x, recv_w, recv_idx, _total_recv_t, routing = self.mega.dispatch(
-                a1.contiguous(),
-                topk_weights.to(torch.float32).contiguous(),
-                topk_ids.to(torch.int32).contiguous(),
+        # EPR.
+        #
+        # Gather transport only. MegaMoE never reaches prepare()/finalize() any
+        # more: MoriV2ModularKernel.forward sends it to triton_mega_moe (Triton
+        # experts) or to MegaMoE's own forward (flydsl experts), and both own
+        # their dispatch and combine end to end.
+        recv_x, recv_w, _recv_s, recv_idx, _total_recv_t, routing = (
+            self._op.dispatch(
+                a1,
+                topk_weights.to(torch.float32),
+                None,
+                topk_ids.to(torch.int32),
+                return_routing=True,
             )
-            self._src_token_map = routing.reverse_source_view
-        else:
-            recv_x, recv_w, _recv_s, recv_idx, _total_recv_t, routing = (
-                self._op.dispatch(
-                    a1,
-                    topk_weights.to(torch.float32),
-                    None,
-                    topk_ids.to(torch.int32),
-                    return_routing=True,
-                )
-            )
+        )
         self._routing = routing
 
         # Capture-safe: do NOT call _total_recv_t.item() (a GPU->CPU sync that is
@@ -583,15 +519,6 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         # topk_ids here is the ORIGINAL (pre-dispatch) routing, so shape[0] == ct.
         num_token = topk_ids.shape[0]
         assert self._routing is not None, "finalize() called before prepare()"
-        if self.mega is not None:
-            # `fused_expert_output` is deliberately ignored: the expert GEMM
-            # already delivered its rows into the staging window, so combine
-            # reads that rather than a tensor handed back through here. It
-            # returns exactly ct rows.
-            out = self.mega.combine(self._routing)
-            self._routing = None
-            self._src_token_map = None
-            return out
         out, _ = self._op.combine(fused_expert_output, routing=self._routing)
         self._routing = None
         return out[:num_token]
@@ -668,13 +595,75 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
         **kwargs,
     ) -> torch.Tensor:
         mega = self.prepare_finalize.mega
-        # MegaMoE owns the whole layer only when nothing else claims the expert
-        # GEMM. With the Triton/gluon experts configured, it is the transport
-        # instead: prepare() calls its dispatch, GEMM2 delivers into its staging
-        # window, finalize() calls its combine -- so the normal prepare ->
-        # experts -> finalize walk is what runs, and the recipe assert below does
-        # not apply (that recipe describes MegaMoE's own GEMM, which is unused).
-        if mega is None or (kwargs.get("moe_extra_args") or {}).get("triton_experts"):
+        triton_experts = (kwargs.get("moe_extra_args") or {}).get("triton_experts")
+
+        # MegaMoE as transport, with OUR experts, driven from one place.
+        #
+        # The alternative -- and what runs when this is off -- is the normal
+        # prepare -> experts -> finalize walk, where prepare() calls MegaMoE's
+        # dispatch, GEMM2 delivers into its staging window and finalize() calls
+        # its combine. That works, but it spreads one layer's transport across
+        # three methods and needs a public transport-only API on MegaMoE
+        # (dispatch / combine_scatter_target / combine) that exists solely for
+        # ATOM. triton_mega_moe does the same three steps in one function
+        # against MegaMoE's internals instead, so aiter needs no such API and
+        # the dispatch/combine underneath can later be swapped for our own.
+        #
+        # Bit-identical to the walk it replaces (mega fp4 + a4w4, mega bf16 +
+        # a4w4, mega bf16 + a8w4 all match to the last bit). Off by default
+        # until it has run a real serve.
+        if mega is not None and triton_experts is not None:
+            from atom.model_ops.fused_moe_triton import triton_mega_moe
+
+            assert not kwargs.get("apply_router_weight_on_input", False), (
+                "mori does not support apply_router_weight_on_input=True now."
+            )
+            arena_rows = (
+                self.prepare_finalize.num_dispatchers() * mega.max_tokens_per_rank
+            )
+            bound = self._decode_recv_bound(topk_ids, arena_rows)
+            # The "Direction-3" shrink, reproduced from the base-class walk: the
+            # bound leaves graph_bs*topk*dp rows, but mori de-duplicates per
+            # destination rank, so at most graph_bs*max_seqlen_q*dp can be live.
+            # Guarded by the same uniform-decode test, via `bound`: None there
+            # means a mixed/prefill batch, which keeps the full arena.
+            #
+            # Guarded on _all_ranks_decode(), NOT on `bound is not None`:
+            # _decode_recv_bound also returns None when the bound would not
+            # actually shrink the arena, and the base walk still applies M_eff in
+            # that case. Keying off `bound` would silently skip the trim there.
+            from atom.model_ops.moe import _all_ranks_decode
+
+            m_eff = None
+            if _all_ranks_decode():
+                _fwd_ctx = get_forward_context()
+                _ctx = _fwd_ctx.context
+                tokens_per_rank = _ctx.graph_bs
+                attn_md = _fwd_ctx.attn_metadata
+                if attn_md is not None and getattr(attn_md, "max_seqlen_q", None):
+                    tokens_per_rank *= attn_md.max_seqlen_q
+                m_eff = tokens_per_rank * get_dp_group().world_size
+            return triton_mega_moe(
+                mega,
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                w1=triton_experts["w13_weight"],
+                w2=triton_experts["w2_weight"],
+                w1_scale=triton_experts["w13_scale"],
+                w2_scale=triton_experts["w2_scale"],
+                expert_map=kwargs.get("expert_map"),
+                n_local_experts=w1.size(0),
+                w13_swizzle_layout=triton_experts["w13_swizzle_layout"],
+                w2_swizzle_layout=triton_experts["w2_swizzle_layout"],
+                w1_bias=triton_experts.get("w1_bias"),
+                w2_bias=triton_experts.get("w2_bias"),
+                swiglu_limit=triton_experts.get("swiglu_limit", 10.0),
+                recv_token_bound=bound,
+                m_eff=m_eff,
+            )
+
+        if mega is None or triton_experts:
             return super().forward(
                 hidden_states, w1, w2, topk_weights, topk_ids, **kwargs
             )

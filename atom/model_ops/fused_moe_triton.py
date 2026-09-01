@@ -235,6 +235,17 @@ def _gluon_fused_quant_supported(m, n, k, routing_data) -> bool:
     return get_kernel_config_gluon(m, n, k, routing_data)["persistent_iters"] <= 1
 
 
+# Pre-quantized MXFP4 activations. The caller already holds the (packed e2m1,
+# e8m0) pair -- straight out of a mori fp4 dispatch, say -- so there is nothing
+# to quantize and, more to the point, nothing to allocate: both tensors go into
+# moe_gemm_a4w4 as views. uint8 payload + a non-None a13_scale is the signal.
+#
+# a8w4 has no equivalent: its wire is bf16 and downcast_to_mxfp must materialise
+# a fresh (M, K) fp8 tensor plus scales on arrival, every layer.
+def _is_prequant_mxfp4(hidden_states, a13_scale) -> bool:
+    return hidden_states.dtype == torch.uint8 and a13_scale is not None
+
+
 def _fused_experts_silu_gugu(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -294,7 +305,13 @@ def _fused_experts_silu_gugu(
     reduced output, the other says there is no local reduction to produce one.
     """
     assert hidden_states.ndim == 2
-    assert hidden_states.dtype == torch.bfloat16
+    assert hidden_states.dtype == torch.bfloat16 or _is_prequant_mxfp4(
+        hidden_states, a13_scale
+    ), (
+        "activations are bf16, or already-MXFP4 (uint8 payload + a13_scale as "
+        f"its e8m0 rows); got {hidden_states.dtype} with "
+        f"a13_scale={'set' if a13_scale is not None else 'None'}"
+    )
     assert y_out is None or ep_scatter is None, (
         "y_out and ep_scatter are alternatives: the first names GEMM2's reduced "
         "output, the second says the rows leave unreduced"
@@ -308,7 +325,8 @@ def _fused_experts_silu_gugu(
         (get_arch() == "gfx1250") if preshuffled is None else bool(preshuffled)
     )
 
-    if envs.ATOM_USE_TRITON_MOE_A4W4 or act_quant == MoEActivationQuant.FP4:
+    _prequant = _is_prequant_mxfp4(hidden_states, a13_scale)
+    if envs.ATOM_USE_TRITON_MOE_A4W4 or act_quant == MoEActivationQuant.FP4 or _prequant:
         # a4w4 takes the preshuffled gfx1250 weight through `preshuffle_weights`
         # -- a different parameter name from a8w4's `preshuffled`, which is why
         # this branch used to assert it did not exist. It does, it asserts the
@@ -322,12 +340,27 @@ def _fused_experts_silu_gugu(
         # signature is (x, w, x_scales, w_scales, bias, routing_data, ...) with
         # no x_static_scale/quant_static_scale. Passing a13_scale positionally
         # into `bias` is exactly the bug this branch had.
-        assert a13_scale is None and a2_scale is None, (
-            "moe_gemm_a4w4 has no static activation scale (no x_static_scale / "
-            "quant_static_scale in its signature), so a13_scale/a2_scale would "
-            "be silently dropped. Only dynamic MX activation quant is supported."
+        assert a2_scale is None, (
+            "moe_gemm_a4w4 has no static activation scale for GEMM2 (no "
+            "x_static_scale / quant_static_scale in its signature), so a2_scale "
+            "would be silently dropped."
         )
-        x_fp4, x_scale = mxfp4_quant(hidden_states)
+        if _prequant:
+            # Zero-copy: these are views of whatever produced them (for the mori
+            # fp4 wire, the dispatch arena itself). moe_gemm_a4w4 takes the scale
+            # strides explicitly, so a13_scale may keep the transport's padded
+            # arrival pitch -- it does NOT have to be contiguous.
+            #
+            # It also wants the e8m0 rows UNSWIZZLED, which is what they already
+            # are: SWIZZLE_MX_SCALE applies to w_scales only.
+            x_fp4, x_scale = hidden_states, a13_scale
+        else:
+            assert a13_scale is None, (
+                "a13_scale on a bf16 activation would be silently dropped: "
+                "moe_gemm_a4w4 has no static activation scale. It is only read "
+                "as the e8m0 rows of an already-MXFP4 (uint8) payload."
+            )
+            x_fp4, x_scale = mxfp4_quant(hidden_states)
         # Keyword-addressed from `bias` on: a4w4 has SIX parameters before
         # gather_indx where a8w4 has eight, so the a8w4 positional layout landed
         # routing_data on gather_indx and raised "got multiple values for
@@ -362,10 +395,7 @@ def _fused_experts_silu_gugu(
         # the packed tile and a config retune for the mx epilogue.
         #
         # Gluon-only in any case: the triton fallback has no such epilogue.
-        _fuse_requant = (
-            get_arch() == "gfx1250"
-            and os.environ.get("ATOM_A4W4_FUSED_QUANT", "0") == "1"
-        )
+        _fuse_requant = True
         if _fuse_requant:
             interm_fp4, interm_scale = moe_gemm_a4w4(
                 x_fp4, w1, x_scale, w13_scale, out_mx_quant=True, **_gemm1_kwargs
@@ -571,8 +601,17 @@ def triton_kernel_fused_experts(
     # y_out, not a companion.
     ep_scatter=None,
 ) -> torch.Tensor:
-    # type check, uint8 means mxfp4
-    assert hidden_states.dtype == torch.bfloat16
+    # type check, uint8 means mxfp4 -- with a13_scale carrying its e8m0 rows
+    assert hidden_states.dtype == torch.bfloat16 or _is_prequant_mxfp4(
+        hidden_states, a13_scale
+    ), (
+        "activations must be bf16, or already-MXFP4: a uint8 packed-e2m1 payload "
+        "WITH a13_scale as its e8m0 rows. Got "
+        f"{hidden_states.dtype} / a13_scale="
+        f"{'set' if a13_scale is not None else 'None'}. A uint8 payload with no "
+        "a13_scale is what a mori fp4 dispatch hands an expert path that cannot "
+        "take it -- only the a4w4 experts can, so select those."
+    )
     assert w1_bias is None or w1_bias.dtype == torch.float32
     assert w2_bias is None or w2_bias.dtype == torch.float32
 
@@ -803,3 +842,196 @@ def triton_kernel_fused_experts(
 
     output_tensor = output_tensor.view(M, K)
     return output_tensor
+
+
+# ---------------------------------------------------------------------------
+# MegaMoE as transport only
+# ---------------------------------------------------------------------------
+def _mega_per_rank_size(mega) -> int:
+    """Bytes of the symmetric window each peer owns.
+
+    A pure read, deliberately: whoever builds the transport stamps this on at
+    construction, where every rank is aligned and a barrier follows. There is no
+    lazy fallback because the value comes from create_dev_comm(), which may be
+    COLLECTIVE, and this path is entered per rank -- under
+    ATOM_USE_TRITON_MOE_DECODE the Triton experts are picked from `is_prefill`,
+    so a first-use read could have a subset of ranks enter it, and hang.
+    """
+    size = getattr(mega, "_atom_per_rank_size", None)
+    if size is None:
+        raise RuntimeError(
+            "MegaMoE has no _atom_per_rank_size: whoever built this transport "
+            "must stamp it on at construction, where all ranks are aligned "
+            "(int(comm.create_dev_comm().per_rank_size)). Reading it lazily here "
+            "would enter a possibly-collective call from a per-rank branch. See "
+            "init_mega_transport in mori_v2_prepare_finalize.py."
+        )
+    return size
+
+
+def _mega_combine_window(mega):
+    """The combine staging window as one row-indexed [rows, hidden] bf16 view.
+
+    Every peer's slot region sits at the same stride in the flat symmetric VA and
+    the slot pitch is a power of two dividing that stride, so ONE row index
+    ``pe*peer_rows + origin_lid*topk + k`` addresses any (peer, slot) pair -- the
+    same collapse the fused GEMM2 epilogue performs in-kernel, handed out as a
+    strided view so an ordinary kernel can store through it. The rows a peer does
+    not own are never addressed, so the view needs no masking.
+
+    Constant for the model -- arena offsets, peer stride, slot pitch all fixed at
+    construction -- so it is built once per transport rather than per layer.
+
+    Returns (view, peer_rows, max_tokens_per_rank, topk).
+    """
+    cached = getattr(mega, "_atom_combine_window", None)
+    if cached is not None:
+        return cached
+
+    import torch
+
+    from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import _from_gpu_ptr
+
+    cfg = mega._config
+    per_rank = _mega_per_rank_size(mega)
+    slot_stride = cfg.combine_slot_stride_bytes
+    if per_rank % slot_stride:
+        raise RuntimeError(
+            f"per_rank_size={per_rank} is not a multiple of the combine slot "
+            f"stride {slot_stride}; a single row index cannot address both peer "
+            "and slot"
+        )
+    peer_rows = per_rank // slot_stride
+    slots = cfg.max_tokens_per_rank * cfg.topk
+    # local_ptr is this rank's alias of comb_inp; step back to peer 0's.
+    base = mega._arena.local_ptr("comb_inp") - cfg.rank * per_rank
+    # Sized to end at the LAST peer's last slot, not at a round
+    # world_size*peer_rows: the tail of that would run past the flat space.
+    rows = (cfg.world_size - 1) * peer_rows + slots
+    stride_elems = slot_stride // 2  # bf16 wire
+    view = _from_gpu_ptr(base, (rows * stride_elems,), torch.bfloat16).as_strided(
+        (rows, cfg.hidden_dim), (stride_elems, 1)
+    )
+    cached = (view, peer_rows, cfg.max_tokens_per_rank, cfg.topk)
+    mega._atom_combine_window = cached
+    return cached
+
+
+def triton_mega_moe(
+    mega,
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    *,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    expert_map: torch.Tensor,
+    n_local_experts: int,
+    w13_swizzle_layout=None,
+    w2_swizzle_layout=None,
+    w1_bias: torch.Tensor | None = None,
+    w2_bias: torch.Tensor | None = None,
+    swiglu_limit: float = 10.0,
+    act_quant: MoEActivationQuant = MoEActivationQuant.BF16,
+    recv_token_bound: int | None = None,
+    m_eff: int | None = None,
+) -> torch.Tensor:
+    """One MoE layer over MegaMoE's transport, with the Triton/gluon experts.
+
+    Functionally ``MegaMoEGfx1250.forward`` with its own grouped flydsl GEMM
+    swapped for ours: dispatch, experts, fused combine. The transport half is
+    MegaMoE's -- the same ``_dispatch`` and ``_combine``, so the same mori
+    all-to-all and the same barrier-free reduce -- and only the expert GEMM in
+    the middle differs.
+
+    Written against MegaMoE's INTERNALS on purpose. The alternative is a public
+    transport-only API on MegaMoE (dispatch / combine_scatter_target / combine),
+    which is a change to aiter for ATOM's benefit; keeping the orchestration here
+    means aiter stays untouched and this file owns the whole triton path, so the
+    dispatch and combine underneath can later be replaced with our own without
+    moving anything else. The cost is a binding to four private names --
+    ``_dispatch``, ``_combine``, ``_arena``, ``_config`` -- checked below so an
+    aiter refactor fails loudly here rather than silently misbehaving.
+
+    ``recv_token_bound`` caps how many recv slots the experts are shown (the
+    dispatch always fills a world*max_tokens_per_rank arena); ``m_eff`` narrows
+    it further, and is the Triton-only second stage -- see MoriV2ModularKernel.
+
+    GEMM2 delivers its un-reduced rows straight into the combine staging window,
+    so there is no local reduction and no ``y_out``: the summing happens inside
+    the combine once every rank has delivered.
+    """
+    from aiter.ops.triton.moe.moe_routing.routing import EpScatterGeometry
+    from aiter.ops.triton.moe.reduce import EpCombineScatter
+
+    for _name in ("_dispatch", "_combine", "_arena", "_config"):
+        if not hasattr(mega, _name):
+            raise RuntimeError(
+                f"MegaMoE has no {_name!r}: this path drives the transport "
+                "through its internals, which have moved. See triton_mega_moe."
+            )
+
+    recv_x, recv_w, recv_idx, total_recv, routing = mega._dispatch(
+        hidden_states.contiguous(),
+        topk_weights.to(torch.float32).contiguous(),
+        topk_ids.to(torch.int32).contiguous(),
+    )
+
+    # On a quantizing wire the payload arrives already MXFP4/MXFP8 and its e8m0
+    # rows sit in the arena. Take them as a view: the experts consume the
+    # transport's own buffers, with nothing quantized or allocated on arrival.
+    a13_scale = mega._recv_scales() if mega._config.is_quant_wire else None
+
+    if recv_token_bound is not None:
+        bound = min(int(recv_token_bound), recv_x.shape[0])
+        recv_x, recv_w, recv_idx = recv_x[:bound], recv_w[:bound], recv_idx[:bound]
+        if a13_scale is not None:
+            a13_scale = a13_scale[:bound]
+    if m_eff is not None:
+        m = min(int(m_eff), recv_x.shape[0])
+        recv_x, recv_w, recv_idx = recv_x[:m], recv_w[:m], recv_idx[:m]
+        if a13_scale is not None:
+            # Same rows, or the scales desynchronize from the payload.
+            a13_scale = a13_scale[:m]
+
+    view, peer_rows, max_tokens_per_rank, _topk = _mega_combine_window(mega)
+    routing_data, gather_indx, scatter_indx, gate_valid, dst_row = (
+        routing_from_dispatched(
+            recv_w,
+            recv_idx,
+            expert_map,
+            n_local_experts,
+            total_recv,
+            ep_scatter_geometry=EpScatterGeometry(
+                src_token_map=routing.reverse_source_view,
+                max_tokens_per_rank=max_tokens_per_rank,
+                peer_rows=peer_rows,
+            ),
+        )
+    )
+
+    triton_kernel_fused_experts(
+        None,
+        recv_x,
+        w1,
+        w2,
+        routing_data,
+        gather_indx,
+        scatter_indx,
+        topk=routing_data.n_expts_act,
+        use_triton_gfx1250_silu=True,
+        w13_scale=w1_scale,
+        w2_scale=w2_scale,
+        w13_swizzle_layout=w13_swizzle_layout,
+        w2_swizzle_layout=w2_swizzle_layout,
+        w1_bias=w1_bias,
+        w2_bias=w2_bias,
+        swiglu_limit=swiglu_limit,
+        gate_valid=gate_valid,
+        act_quant=act_quant,
+        a13_scale=a13_scale,
+        ep_scatter=EpCombineScatter(out=view, dst_row=dst_row),
+    )
+    return mega._combine(routing)
