@@ -10,7 +10,6 @@ import torch
 import triton
 import triton.language as tl
 from aiter import QuantType
-from aiter.jit.utils.torch_guard import torch_compile_guard
 from torch import Tensor
 
 fp8_dtype = aiter.dtypes.fp8
@@ -170,23 +169,6 @@ def _fused_sigmoid_mul_fp8_per_token_quant_kernel(
     tl.store(out_scale_ptr + pid_m, scale_out)
 
 
-def _fused_sigmoid_mul_fp8_per_token_quant_fake(
-    attn_output: Tensor, gate: Tensor
-) -> tuple[Tensor, Tensor]:
-    M, N = attn_output.shape
-    out_fp8 = torch.empty((M, N), dtype=fp8_dtype, device=attn_output.device)
-    out_scale = torch.empty((M, 1), dtype=torch.float32, device=attn_output.device)
-    return out_fp8, out_scale
-
-
-# mutates_args=[] -- outputs are allocated inside, so the op is functional.
-# torch.compile treats it as opaque via the fake above (mirrors
-# situ_and_mul_quant), so the raw ``grid=(M,)`` triton launch never forces the
-# token dim M to a constant. Without this the compiled Kimi-K3 forward would
-# specialize hidden_states.size()[0] and raise a ConstraintViolationError.
-@torch_compile_guard(
-    gen_fake=_fused_sigmoid_mul_fp8_per_token_quant_fake, mutates_args=[]
-)
 def _fused_sigmoid_mul_fp8_per_token_quant(
     attn_output: Tensor, gate: Tensor
 ) -> tuple[Tensor, Tensor]:
@@ -220,30 +202,38 @@ def _fused_sigmoid_mul_fp8_per_token_quant(
     return out_fp8, out_scale
 
 
-def _fused_sigmoid_mul_fp8_group_quant_fake(
-    attn_output: Tensor, gate: Tensor, group_size: int, transpose_scale: bool
+def fused_sigmoid_mul_fp8_quant(
+    attn_output: Tensor,
+    gate: Tensor,
+    group_size: int = 128,
+    transpose_scale: bool | None = None,
+    per_token: bool = False,
 ) -> tuple[Tensor, Tensor]:
-    M, N = attn_output.shape
-    out_fp8 = torch.empty((M, N), dtype=fp8_dtype, device=attn_output.device)
-    out_scale = torch.empty(
-        (M, N // group_size), dtype=torch.float32, device=attn_output.device
-    )
-    return out_fp8, out_scale
+    """Fused sigmoid(gate) * attn_output + FP8 quantization.
 
+    Args:
+        attn_output: [M, N] bf16/fp16 — attention output tensor.
+        gate: [M, N] bf16/fp16 — gating tensor (pre-sigmoid).
+        group_size: Quantization group size (default 128, matching per_1x128).
+        transpose_scale: If True, produce column-major x_scale (for preshuffle GEMM).
+                         If False, produce row-major x_scale (for non-preshuffle GEMM).
+                         If None (default), follows ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE env var.
+        per_token: If True, produce a single per-token (per-row) scale [M, 1]
+                   (a8w8 ptpc scheme) instead of per-``group_size`` block scales.
+                   ``group_size``/``transpose_scale`` are ignored in this mode.
 
-# mutates_args=[] -- outputs are allocated inside, so the op is functional.
-# Guarded for the same reason as the per-token leaf: the raw ``grid=(M, ...)``
-# triton launch would otherwise specialize the token dim M under torch.compile.
-@torch_compile_guard(gen_fake=_fused_sigmoid_mul_fp8_group_quant_fake, mutates_args=[])
-def _fused_sigmoid_mul_fp8_group_quant(
-    attn_output: Tensor, gate: Tensor, group_size: int, transpose_scale: bool
-) -> tuple[Tensor, Tensor]:
-    """Per-1x128 block variant: one FP8 scale per ``group_size`` columns.
-
-    Returns ``(x_fp8 [M, N], x_scale [M, N // group_size] float32)``.
-    ``transpose_scale`` controls only the internal scale buffer layout
-    (column- vs row-major); the returned logical shape is the same either way.
+    Returns:
+        (x_fp8, x_scale):
+            x_fp8: [M, N] FP8 — quantized sigmoid(gate) * attn_output.
+            x_scale: per-token mode -> [M, 1]; per-group mode -> [M, N // group_size].
     """
+    if per_token:
+        return _fused_sigmoid_mul_fp8_per_token_quant(attn_output, gate)
+    if transpose_scale is None:
+        from atom.utils import envs
+
+        transpose_scale = envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
+
     M, N = attn_output.shape
     assert (
         N % group_size == 0
@@ -296,46 +286,6 @@ def _fused_sigmoid_mul_fp8_group_quant(
         out_scale = out_scale.view(M, num_scale_cols)
 
     return out_fp8, out_scale
-
-
-def fused_sigmoid_mul_fp8_quant(
-    attn_output: Tensor,
-    gate: Tensor,
-    group_size: int = 128,
-    transpose_scale: bool | None = None,
-    per_token: bool = False,
-) -> tuple[Tensor, Tensor]:
-    """Fused sigmoid(gate) * attn_output + FP8 quantization.
-
-    Args:
-        attn_output: [M, N] bf16/fp16 — attention output tensor.
-        gate: [M, N] bf16/fp16 — gating tensor (pre-sigmoid).
-        group_size: Quantization group size (default 128, matching per_1x128).
-        transpose_scale: If True, produce column-major x_scale (for preshuffle GEMM).
-                         If False, produce row-major x_scale (for non-preshuffle GEMM).
-                         If None (default), follows ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE env var.
-        per_token: If True, produce a single per-token (per-row) scale [M, 1]
-                   (a8w8 ptpc scheme) instead of per-``group_size`` block scales.
-                   ``group_size``/``transpose_scale`` are ignored in this mode.
-
-    Returns:
-        (x_fp8, x_scale):
-            x_fp8: [M, N] FP8 — quantized sigmoid(gate) * attn_output.
-            x_scale: per-token mode -> [M, 1]; per-group mode -> [M, N // group_size].
-
-    The two triton launchers are wrapped as ``torch_compile_guard`` custom ops so
-    torch.compile treats them as opaque; the raw ``grid=(M, ...)`` launch inside
-    would otherwise specialize the token dim.
-    """
-    if per_token:
-        return _fused_sigmoid_mul_fp8_per_token_quant(attn_output, gate)
-    if transpose_scale is None:
-        from atom.utils import envs
-
-        transpose_scale = envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
-    return _fused_sigmoid_mul_fp8_group_quant(
-        attn_output, gate, group_size, transpose_scale
-    )
 
 
 def fused_sigmoid_mul_maybe_quant(
