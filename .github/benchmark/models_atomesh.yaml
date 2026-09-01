@@ -17,8 +17,6 @@ defaults:
     common:
       PYTHONUNBUFFERED: "1"
       ATOM_PD_RANK_MAPPING_POLICY: "${ATOMESH_PD_RANK_MAPPING_POLICY}"
-      HSA_NO_SCRATCH_RECLAIM: "1"
-      IONIC_LOCKFREE: all
 
 backends:
   atom:
