@@ -760,21 +760,9 @@ class LinearBase(nn.Module):
             self.output_partition_sizes,
         )
 
-        if online_quant_type == QuantType.per_1x128:
-            from atom.quantization.quark.utils import (
-                quantize_weight_to_fp8_128x128_blockscale,
-            )
-
-            # The blockscale GEMM path consumes true 128x128 scales shaped
-            # (N//128, K//128). Keep online load/reload aligned with the
-            # RLHF weight-sync requantization path.
-            q_weight, weight_scale = quantize_weight_to_fp8_128x128_blockscale(
-                weight, online_quant_dtype
-            )
-        else:
-            q_weight, weight_scale = quant_weight_online(
-                weight, online_quant_type, online_quant_dtype
-            )
+        q_weight, weight_scale = quant_weight_online(
+            weight, online_quant_type, online_quant_dtype
+        )
         if need_gather:
             q_weight, weight_scale = self._shard_quantized_weight(
                 q_weight, weight_scale
