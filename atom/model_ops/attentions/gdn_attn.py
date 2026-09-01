@@ -836,6 +836,17 @@ class GDNStateMixin:
         committed state (#2045), and the speculation scratch beside it is this
         request's own and resumable by nobody.
         """
+        # Reject a negative slot explicitly, for parity with the DSV4 twin
+        # (`deepseek_v4_attn.py`). `cache[layer, slot : slot + 1]` on a stray -1
+        # (the "no slot" sentinel used elsewhere on this path) silently gathers
+        # or scatters the last slot's state under this request's identity --
+        # silent cross-request corruption. The upstream invariant is that a real
+        # slot is non-negative (`StateSlotPool.pop` never returns negative, and
+        # `_attach_state_slots` pops before requesting the load), so this guards
+        # the shape rather than a demonstrated path; fail loudly if it is ever
+        # violated instead of corrupting silently.
+        if slot < 0:
+            raise IndexError(f"state_entry_views: invalid negative slot {slot}")
         views = []
         for cache in (
             self.model_runner.mamba_k_cache,
