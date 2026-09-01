@@ -26,6 +26,32 @@ from atom.model_engine.scheduler import (
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 from atom.sampling_params import SamplingParams
 
+
+class _OffloadMixinStub(OffloadSchedulerMixin):
+    """Concrete `OffloadSchedulerMixin` for scheduler tests.
+
+    `OffloadSchedulerMixin` declares the six save/load lifecycle methods abstract
+    so a missing forwarder is a construction-time TypeError. These test doubles
+    exercise only the scheduler's deferred-free / preemption paths, so this base
+    fills the contract with harmless defaults and each local `_Connector`
+    overrides the methods it drives.
+    """
+
+    is_producer = False
+    is_offload = True
+
+    def save_finished(self, req_id) -> None: ...
+    def abandon_save(self, req_id) -> None: ...
+    def release_stalled_save(self, seq) -> None: ...
+    def load_failed(self, req_id) -> bool:
+        return False
+
+    def load_finished(self, req_id) -> bool:
+        return True
+
+    def cancel_pending_load(self, seq) -> None: ...
+
+
 # ── EngineStats: spec section ────────────────────────────────────────────────
 
 
@@ -437,7 +463,7 @@ class TestSchedule:
         )
         events = []
 
-        class _Connector(OffloadSchedulerMixin):
+        class _Connector(_OffloadMixinStub):
             is_offload = True
             is_producer = False
 
@@ -730,7 +756,7 @@ class TestSchedule:
         pinned_victim.append_token(10)
         operation = SaveOperationId(pinned_victim.id, 50)
 
-        class _Connector(OffloadSchedulerMixin):
+        class _Connector(_OffloadMixinStub):
             is_producer = False
             is_offload = True
             _do_load = False
@@ -768,7 +794,7 @@ class TestSchedule:
         pinned.append_token(9)
         operation = SaveOperationId(pinned.id, 51)
 
-        class _Connector(OffloadSchedulerMixin):
+        class _Connector(_OffloadMixinStub):
             is_producer = False
             is_offload = True
             _do_load = False

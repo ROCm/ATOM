@@ -91,6 +91,32 @@ class _FailingLookupClient(_LookupClient):
         raise RuntimeError("lookup failed")
 
 
+class _OffloadMixinStub(OffloadSchedulerMixin):
+    """Concrete `OffloadSchedulerMixin` for tests that exercise only frontier and
+    completion mechanics, not a real save/load lifecycle.
+
+    The mixin now declares the six save/load methods abstract (a missing
+    forwarder is a construction-time TypeError, not a silent no-op behind the
+    shell). Test doubles must therefore satisfy the contract; this base fills it
+    with harmless defaults so the ABC constructs, and each local `_Connector`
+    overrides the one or two methods it asserts on.
+    """
+
+    is_producer = False
+    is_offload = True
+
+    def save_finished(self, req_id) -> None: ...
+    def abandon_save(self, req_id) -> None: ...
+    def release_stalled_save(self, seq) -> None: ...
+    def load_failed(self, req_id) -> bool:
+        return False
+
+    def load_finished(self, req_id) -> bool:
+        return True
+
+    def cancel_pending_load(self, seq) -> None: ...
+
+
 def _scheduler() -> LMCacheOffloadConnectorScheduler:
     sched = LMCacheOffloadConnectorScheduler.__new__(LMCacheOffloadConnectorScheduler)
     sched._config = SimpleNamespace()
@@ -2754,7 +2780,7 @@ def test_collapsed_sidecar_and_save_completion_clears_page_inflight():
 def test_offload_completion_processing_calls_load_terminal_once(field, callback):
     calls = []
 
-    class _Connector(OffloadSchedulerMixin):
+    class _Connector(_OffloadMixinStub):
         is_producer = False
         is_offload = True
 
@@ -2791,7 +2817,7 @@ def test_aborted_parked_load_defers_owned_resources_until_terminal(
         _counted_as_inflight_load=True,
     )
 
-    class _Connector(OffloadSchedulerMixin):
+    class _Connector(_OffloadMixinStub):
         is_producer = False
         is_offload = True
 
@@ -2857,7 +2883,7 @@ def test_aborted_parked_load_consumes_already_queued_terminal(queued_field):
         _counted_as_inflight_load=True,
     )
 
-    class _Connector(OffloadSchedulerMixin):
+    class _Connector(_OffloadMixinStub):
         is_producer = False
         is_offload = True
 
@@ -2927,7 +2953,7 @@ def test_abort_cleans_load_whose_terminal_was_already_consumed(
         offload_load_start_tokens=4,
     )
 
-    class _Connector(OffloadSchedulerMixin):
+    class _Connector(_OffloadMixinStub):
         is_producer = False
         is_offload = True
 
@@ -4095,7 +4121,7 @@ def test_finished_saving_releases_deferred_free_with_string_req_id():
         def deallocate(self, seq) -> None:
             self.deallocated.append(seq.id)
 
-    class _Connector(OffloadSchedulerMixin):
+    class _Connector(_OffloadMixinStub):
         is_producer = False
         is_offload = True
 
@@ -4905,6 +4931,57 @@ def test_a_stalled_save_releases_blocks_it_never_handed_out(monkeypatch):
     assert "9" in s._save_inflight
 
 
+def test_dsv4_abandon_save_drops_page_set_sidecar_and_tracker():
+    """A DSV4 save the backend never reported must be droppable in full.
+
+    `_reconcile_stalled_deferred_saves` frees the blocks and calls
+    `abandon_save(sid)` with only the raw request id. DSV4 tracks a *set* of
+    page save operations plus a SLOT sidecar (dense tracks one save per
+    request), so the dense single-pop would strand the rest: `has_pending_work`
+    would never clear and the engine would busy-loop with every GPU idle -- the
+    DSV4 twin of the dense stall. Before this method DSV4 had no `abandon_save`
+    at all, so the shell's guarded forward silently no-op'd and nothing was
+    dropped. Prove every channel clears and the pending gauge does not leak.
+    """
+    sched = _scheduler()
+    sid = "7"
+    op_a = SaveOperationId(7, 0)
+    op_b = SaveOperationId(7, 1)  # shared by the page set and the sidecar
+    sched._save_inflight[sid] = {op_a, op_b}
+    sched._sidecar_save_inflight[sid] = (op_b, 8, 0x1234)
+    sched._save_tracker[sid] = [SimpleNamespace(id=7), 0]
+    sched._track_save_statistics(op_a, 16)
+    sched._track_save_statistics(op_b, 24)
+    assert sched.has_pending_work() is True
+
+    sched.abandon_save(sid)
+
+    assert sid not in sched._save_inflight
+    assert sid not in sched._sidecar_save_inflight
+    assert sid not in sched._save_tracker
+    # Cancelled, not finished: the bytes never persisted, so neither the request
+    # count nor the inflight-token gauge may bump.
+    assert sched.get_statistics()["save_requests"] == 0
+    assert sched.get_statistics()["saves_pending"] == 0
+    assert sched.has_pending_work() is False
+    # Idempotent: abandoning an already-dropped save is a no-op.
+    sched.abandon_save(sid)
+    assert sched.has_pending_work() is False
+
+
+def test_dsv4_release_stalled_save_is_a_declared_no_op():
+    """DSV4's `should_defer_free` has no stall escape, so a request with a
+    pending save always defers and `release_stalled_save` has nothing to drop.
+    It exists (not inherited, not guarded away) so the abstract lifecycle
+    contract is satisfied and the shell can forward it unconditionally."""
+    sched = _scheduler()
+    seq = SimpleNamespace(id=7)
+    sched._save_tracker["7"] = [seq, 0]
+    sched.release_stalled_save(seq)
+    # A no-op: it must not touch tracker state the way K3's override does.
+    assert "7" in sched._save_tracker
+
+
 def test_state_loads_are_drained_into_the_metadata_exactly_once(monkeypatch):
     """A second submission would write the same entry into a group the first
     transfer is already filling."""
@@ -5193,7 +5270,13 @@ def test_the_shells_no_impl_fallbacks_match_what_the_caller_unpacks():
     accepted requests and returned nothing.
 
     Drive the shell with an `_impl` that defines nothing, and hold each
-    fallback against the contract its caller relies on.
+    remaining fallback against the contract its caller relies on. The set is
+    exactly the tier/policy methods that are OPTIONAL on an impl: the state face
+    (`take_state_reports`, `enqueue_state_*`), `chunk_size`, and the two prefill
+    hints. The save/load lifecycle is no longer here -- it is declared abstract
+    on `OffloadSchedulerMixin`, so those forwards are unconditional and every
+    real impl defines them (proven by the two sibling sweeps); a no-`_impl`
+    stub is not a valid impl for them.
     """
     from types import SimpleNamespace
 
@@ -5210,7 +5293,6 @@ def test_the_shells_no_impl_fallbacks_match_what_the_caller_unpacks():
     # `int(getattr(..., "chunk_size", 0) or 0)`
     assert shell.chunk_size is None or isinstance(shell.chunk_size, int)
     assert shell.should_park_partial_prefill_for_load(None) is False
-    assert shell.load_finished(None) is True
     # Unchanged, so a connector with no opinion does not shrink the chunk.
     assert shell.adjust_prefill_chunk_after_alloc(None, 7) == 7
 
@@ -5299,6 +5381,47 @@ def test_every_unconditional_shell_forward_exists_on_every_impl():
         "not define them, so the forward raises AttributeError mid-step and "
         f"wedges the TP group for that layout: {broken}"
     )
+
+
+def test_offload_mixin_lifecycle_is_enforced_at_construction():
+    """The abstract lifecycle contract is enforcement, not documentation.
+
+    `OffloadSchedulerMixin` inherits `ABC`, so ABCMeta refuses to instantiate a
+    subclass that leaves any of the six save/load methods unimplemented. This is
+    the mechanism that turns a missing forwarder into a construction-time
+    TypeError instead of a silent no-op behind the delegating shell -- the
+    failure mode that let DSV4 ship without `abandon_save`. (On a *plain* class
+    `@abstractmethod` is collected but never enforced; this test would pass
+    vacuously, so it also guards the `ABC` base itself.)
+    """
+    from atom.kv_transfer.offload._offload_common import OffloadSchedulerMixin
+
+    class MissingAbandon(OffloadSchedulerMixin):
+        def save_finished(self, req_id):
+            ...
+
+        def release_stalled_save(self, seq):
+            ...
+
+        def load_failed(self, req_id):
+            return False
+
+        def load_finished(self, req_id):
+            return True
+
+        def cancel_pending_load(self, seq):
+            ...
+
+        # abandon_save deliberately left unimplemented.
+
+    with pytest.raises(TypeError, match="abandon_save"):
+        MissingAbandon()
+
+    class AllPresent(MissingAbandon):
+        def abandon_save(self, req_id):
+            ...
+
+    AllPresent()  # the full contract constructs cleanly
 
 
 # ── kimi_k3: the two joint legs report different identities ───────────────

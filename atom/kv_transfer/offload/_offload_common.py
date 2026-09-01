@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 
 from atom.kv_transfer.disaggregation.types import (
@@ -262,13 +263,32 @@ class OffloadWorkerMixin:
         return []
 
 
-class OffloadSchedulerMixin:
+class OffloadSchedulerMixin(ABC):
     """Layout-independent scheduler policy shared by dense and DSV4 offload.
 
     Subclasses own lookup construction, metadata serialization, and any
     state-checkpoint policy. This mixin contains only token-frontier and load
     handoff mechanics whose invariants are identical for both layouts.
     """
+
+    # Save/load lifecycle contract. Declared abstract so a missing forwarder is
+    # a construction-time TypeError, not a silent no-op behind the delegating
+    # shell -- the failure mode that let DSV4 ship without abandon_save. The
+    # bodies differ by layout (dense keeps one save per request; DSV4 keeps a
+    # set plus a SLOT sidecar), so each impl supplies its own; the contract
+    # detail lives on those concrete overrides.
+    @abstractmethod
+    def save_finished(self, req_id) -> None: ...
+    @abstractmethod
+    def abandon_save(self, req_id) -> None: ...
+    @abstractmethod
+    def release_stalled_save(self, seq) -> None: ...
+    @abstractmethod
+    def load_failed(self, req_id) -> bool: ...
+    @abstractmethod
+    def load_finished(self, req_id) -> bool: ...
+    @abstractmethod
+    def cancel_pending_load(self, seq) -> None: ...
 
     def _init_offload_statistics(self) -> None:
         """Initialize layout-independent scheduler counters."""

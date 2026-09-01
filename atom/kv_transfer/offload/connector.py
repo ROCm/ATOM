@@ -183,9 +183,12 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         return self._impl.should_defer_free(seq)
 
     def release_stalled_save(self, seq) -> None:
-        callback = getattr(self._impl, "release_stalled_save", None)
-        if callback is not None:
-            callback(seq)
+        # Plain forward, not getattr-guarded: OffloadSchedulerMixin declares the
+        # save/load lifecycle abstract, so every _impl defines all six methods or
+        # fails at construction. A guard here would silently swallow a genuinely
+        # missing forwarder -- the exact failure mode the abstract contract exists
+        # to make loud.
+        self._impl.release_stalled_save(seq)
 
     def has_pending_work(self) -> bool:
         return self._impl.has_pending_work()
@@ -194,9 +197,7 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         self._impl.save_finished(req_id)
 
     def abandon_save(self, req_id) -> None:
-        callback = getattr(self._impl, "abandon_save", None)
-        if callback is not None:
-            callback(req_id)
+        self._impl.abandon_save(req_id)
 
     def load_failed(self, req_id):
         return self._impl.load_failed(req_id)
@@ -210,13 +211,13 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         return callback(seq) if callback is not None else False
 
     def cancel_pending_load(self, seq) -> None:
-        callback = getattr(self._impl, "cancel_pending_load", None)
-        if callback is not None:
-            callback(seq)
+        # Plain forward: the lifecycle contract (see release_stalled_save)
+        # guarantees every _impl defines this.
+        self._impl.cancel_pending_load(seq)
 
     def load_finished(self, req_id):
-        callback = getattr(self._impl, "load_finished", None)
-        return callback(req_id) if callback is not None else True
+        # Plain forward: guaranteed by the abstract lifecycle contract.
+        return self._impl.load_finished(req_id)
 
     def process_completions(self, output):
         return self._impl.process_completions(output)

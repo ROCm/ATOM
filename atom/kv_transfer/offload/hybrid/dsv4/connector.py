@@ -2399,6 +2399,41 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         self._save_inflight.pop(sid, None)
         self._finish_save_statistics(req_id)
 
+    def abandon_save(self, req_id) -> None:
+        """Force-drop a save the scheduler reclaimed after it stalled.
+
+        The completion path (`save_finished`) is precise: it discards one exact
+        `SaveOperationId` and leaves the rest of the request's inflight set. This
+        is the opposite need. `_reconcile_stalled_deferred_saves` has already
+        freed the blocks of a save the backend never reported, and holds only
+        the raw request id, so drop the *whole* request unconditionally -- the
+        page set and the SLOT sidecar. Without this the entries linger,
+        `should_defer_free` stays True and `has_pending_work` never clears, and
+        the engine busy-loops with every GPU idle (the DSV4 twin of the dense
+        stall). Not a completion: the bytes were never persisted, so every
+        operation's statistics are *cancelled*, not finished, and the tracker
+        entry is dropped so the save loop cannot re-emit against freed blocks.
+        """
+        sid = str(req_id.req_id if isinstance(req_id, SaveOperationId) else req_id)
+        inflight = self._save_inflight.pop(sid, None)
+        if inflight is not None:
+            for operation in inflight:
+                self._cancel_save_statistics(operation)
+        sidecar = self._sidecar_save_inflight.pop(sid, None)
+        if sidecar is not None:
+            self._cancel_save_statistics(sidecar[0])
+        self._save_tracker.pop(sid, None)
+
+    def release_stalled_save(self, seq) -> None:
+        """Drop bookkeeping for a stall-escaped save the scheduler is freeing.
+
+        No-op on DSV4: like dense, its `should_defer_free` has no stall escape,
+        so a request with a pending page or sidecar save always defers and is
+        never preemptable. Defined so every offload impl answers the scheduler's
+        `release_stalled_save` forward uniformly (the mixin declares it abstract).
+        """
+        return None
+
     def connector_completion(self, completion: ConnectorCompletion) -> bool:
         """Apply one TP-aggregated completion owned by the DSV4 scheduler."""
 
