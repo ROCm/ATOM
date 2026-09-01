@@ -2432,7 +2432,6 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         never preemptable. Defined so every offload impl answers the scheduler's
         `release_stalled_save` forward uniformly (the mixin declares it abstract).
         """
-        return None
 
     def connector_completion(self, completion: ConnectorCompletion) -> bool:
         """Apply one TP-aggregated completion owned by the DSV4 scheduler."""

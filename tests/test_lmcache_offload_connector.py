@@ -5339,12 +5339,10 @@ def test_every_unconditional_shell_forward_exists_on_every_impl():
         if len(body) != 1:
             return None
         stmt = body[0]
-        if isinstance(stmt, ast.Return):
-            call = stmt.value
-        elif isinstance(stmt, ast.Expr):  # void forward, returns None implicitly
-            call = stmt.value
-        else:
+        # `ast.Expr` is a void forward, which returns None implicitly.
+        if not isinstance(stmt, (ast.Return, ast.Expr)):
             return None
+        call = stmt.value
         if not isinstance(call, ast.Call):
             return None
         target = call.func  # self._impl.<name>
@@ -5400,11 +5398,9 @@ def test_offload_mixin_lifecycle_is_enforced_at_construction():
     from atom.kv_transfer.offload._offload_common import OffloadSchedulerMixin
 
     class MissingAbandon(OffloadSchedulerMixin):
-        def save_finished(self, req_id):
-            ...
+        def save_finished(self, req_id): ...
 
-        def release_stalled_save(self, seq):
-            ...
+        def release_stalled_save(self, seq): ...
 
         def load_failed(self, req_id):
             return False
@@ -5412,8 +5408,7 @@ def test_offload_mixin_lifecycle_is_enforced_at_construction():
         def load_finished(self, req_id):
             return True
 
-        def cancel_pending_load(self, seq):
-            ...
+        def cancel_pending_load(self, seq): ...
 
         # abandon_save deliberately left unimplemented.
 
@@ -5421,8 +5416,7 @@ def test_offload_mixin_lifecycle_is_enforced_at_construction():
         MissingAbandon()
 
     class AllPresent(MissingAbandon):
-        def abandon_save(self, req_id):
-            ...
+        def abandon_save(self, req_id): ...
 
     AllPresent()  # the full contract constructs cleanly
 

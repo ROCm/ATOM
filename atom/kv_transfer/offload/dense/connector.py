@@ -714,7 +714,6 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         this to pop its `_save_tracker`. Defined here so every offload impl
         answers the scheduler's `release_stalled_save` forward uniformly.
         """
-        return None
 
     def has_pending_work(self) -> bool:
         """True while a load still needs dispatch or a save is unreported.
