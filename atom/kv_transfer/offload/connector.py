@@ -95,9 +95,9 @@ class LMCacheOffloadConnector(KVConnectorBase):
         Under the `multi` shell the sub IS this object, not the `kimi_k3` impl
         behind `_impl`, so without this forwarder the probe reads None on every
         member and the composite never adopts the tier that was actually built
-        -- state spills silently go nowhere. Mirrors the scheduler shell's
-        `chunk_size` forwarder and the "every probed member appears on the
-        shell" contract on `LMCacheOffloadConnectorScheduler`.
+        -- state spills silently go nowhere. The same "every probed member
+        appears on the shell" contract enforced on
+        `LMCacheOffloadConnectorScheduler`.
         """
         return getattr(self._impl, "_state_tier", None)
 
@@ -254,7 +254,7 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         `Scheduler._state_store_pending_cap` reads this off `self.kv_connector`
         -- which is this shell -- so it must appear here rather than only on the
         `_impl`, or the scheduler falls back to the bare env default of 2 and
-        the two legs pin different amounts of the same pool. Mirrors `chunk_size`.
+        the two legs pin different amounts of the same pool.
         """
         return getattr(self._impl, "max_pending_saves", None)
 

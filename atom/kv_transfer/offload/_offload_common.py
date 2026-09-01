@@ -276,9 +276,9 @@ class StateOffloadFace(ABC):
     explicit type: only `KimiK3OffloadScheduler` inherits it, so
     `isinstance(impl, StateOffloadFace)` is the honest predicate.
 
-    Narrow on purpose -- only the four tier methods. `chunk_size` is an instance
-    attribute set in `__init__`, not a class method, so it cannot be abstract
-    here without breaking construction; it stays a plain shell forward.
+    Narrow on purpose -- only the four tier methods. Other impl attributes the
+    scheduler reads (e.g. `max_pending_saves`) stay plain shell forwards rather
+    than joining this face, which is exclusively the KDA state-tier contract.
     """
 
     @abstractmethod
