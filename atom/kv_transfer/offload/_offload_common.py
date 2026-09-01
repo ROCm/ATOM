@@ -415,6 +415,18 @@ class OffloadSchedulerMixin(ABC):
             "saves_pending": len(self._save_inflight_tokens),
         }
 
+    def save_abandon_timeout_s(self) -> float:
+        """Seconds a deferred save may sit before the engine reclaims it.
+
+        The value is LMCache knowledge -- it is derived from LMCache's own pin
+        timeout -- so it lives on the offload connector, and the scheduler asks
+        the connector for it rather than re-deriving the same env math on its own.
+        See `offload_save_abandon_timeout_s` for the safety argument. Concrete on
+        the mixin because every offload variant answers it identically.
+        """
+
+        return offload_save_abandon_timeout_s()
+
     def _chunk_floor(self, tokens: int) -> int:
         chunk = int(self.chunk_size or 256)
         return (max(0, int(tokens)) // chunk) * chunk
@@ -606,3 +618,56 @@ def max_pending_saves(kvc, save_workers: int) -> int:
     if capacity <= 0:
         raise ValueError("max pending saves must be a positive integer")
     return capacity
+
+
+# Seconds added on top of LMCache's own pin timeout before the engine reclaims a
+# save that never reported. See `offload_save_abandon_timeout_s` for why the sum
+# and not the timeout itself is the safe window.
+_SAVE_ABANDON_MARGIN_S = 30.0
+
+# What LMCache's pin monitor uses when `LMCACHE_EC_PIN_TIMEOUT_SEC` is unset.
+_LMCACHE_PIN_TIMEOUT_DEFAULT_S = 300.0
+
+# Memoised result of `offload_save_abandon_timeout_s`; the reconciler asks for it
+# on a 1ms poll and the answer is a process constant.
+_save_abandon_timeout_s: float | None = None
+
+
+def offload_save_abandon_timeout_s() -> float:
+    """Seconds a deferred offload save may sit before the engine reclaims it.
+
+    Blocks are freed on `finished_saving`, so a lost report leaves them deferred
+    forever: `has_pending_kv_work()` never clears and the engine busy-loops with
+    every GPU idle.
+
+    Reclaiming cannot race a live copy. `OffloadWorkerMixin._guard` reports on
+    both the success and the exception path, so a report is lost only when
+    `store()` neither returns nor raises -- it is parked inside LMCache. Then
+    either the parked save is not copying (LMCache force-unpinned its source
+    after `pin_timeout_sec`) or a save queued behind it never reached `store()`.
+    Both cases are safe once that window has passed.
+
+    Derived from LMCache's own `LMCACHE_EC_PIN_TIMEOUT_SEC` rather than a knob of
+    its own, because that ordering IS the safety argument -- two independent env
+    vars could be set the wrong way round with nothing to say so. This lives on
+    the offload connector, not the scheduler: it is LMCache knowledge, and the
+    scheduler now asks the connector for it (`save_abandon_timeout_s`).
+    Non-positive disables reclamation.
+    """
+    global _save_abandon_timeout_s
+    if _save_abandon_timeout_s is not None:
+        return _save_abandon_timeout_s
+    pin = _LMCACHE_PIN_TIMEOUT_DEFAULT_S
+    raw = os.environ.get("LMCACHE_EC_PIN_TIMEOUT_SEC")
+    if raw is not None:
+        try:
+            pin = float(raw)
+        except ValueError:
+            logger.warning(
+                "invalid LMCACHE_EC_PIN_TIMEOUT_SEC=%r; assuming LMCache's %.0fs "
+                "default for the offload save abandon window",
+                raw,
+                _LMCACHE_PIN_TIMEOUT_DEFAULT_S,
+            )
+    _save_abandon_timeout_s = pin + _SAVE_ABANDON_MARGIN_S if pin > 0 else 0.0
+    return _save_abandon_timeout_s

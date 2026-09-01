@@ -1894,17 +1894,19 @@ class TestStalledOffloadSaveReclaim:
     """
 
     @staticmethod
-    def _sched(monkeypatch, deferred):
+    def _sched(monkeypatch, deferred, connector=None):
         import atom.model_engine.scheduler as sched_mod
 
-        # The window is memoised as a process constant; tests choose their own.
-        monkeypatch.setattr(sched_mod, "_SAVE_ABANDON_TIMEOUT_S", 100.0)
         s = object.__new__(sched_mod.Scheduler)
         s.deferred_free_blocks = {seq.id: seq for seq in deferred}
         s._abandoned_saves = 0
         s._next_save_reconcile_at = 0.0
-        # Production always sets this (possibly None); reclaim now notifies it.
-        s.kv_connector = None
+        # The window is now sourced from the connector, not a scheduler constant:
+        # the scheduler asks `kv_connector.save_abandon_timeout_s()` for it (the
+        # value is LMCache knowledge). Tests choose their own via the stub.
+        if connector is None:
+            connector = SimpleNamespace(save_abandon_timeout_s=lambda: 100.0)
+        s.kv_connector = connector
         freed: list[int] = []
         s.block_manager = SimpleNamespace(deallocate=lambda q: freed.append(q.id))
         return s, freed
@@ -1930,9 +1932,12 @@ class TestStalledOffloadSaveReclaim:
 
         now = _time.monotonic()
         stale = SimpleNamespace(id=1, _deferred_save_at=now - 500.0)
-        s, freed = self._sched(monkeypatch, [stale])
         abandoned: list = []
-        s.kv_connector = SimpleNamespace(abandon_save=lambda sid: abandoned.append(sid))
+        connector = SimpleNamespace(
+            save_abandon_timeout_s=lambda: 100.0,
+            abandon_save=lambda sid: abandoned.append(sid),
+        )
+        s, freed = self._sched(monkeypatch, [stale], connector=connector)
 
         assert s._reconcile_stalled_deferred_saves() == 1
         assert freed == [1]
@@ -1958,13 +1963,14 @@ class TestStalledOffloadSaveReclaim:
 
         import atom.model_engine.scheduler as sched_mod
 
-        monkeypatch.setattr(sched_mod, "_SAVE_ABANDON_TIMEOUT_S", 0.0)
         s = object.__new__(sched_mod.Scheduler)
         s.deferred_free_blocks = {
             1: SimpleNamespace(id=1, _deferred_save_at=_time.monotonic() - 1e6)
         }
         s._abandoned_saves = 0
         s._next_save_reconcile_at = 0.0
+        # A connector reporting a non-positive window disables reclamation.
+        s.kv_connector = SimpleNamespace(save_abandon_timeout_s=lambda: 0.0)
         s.block_manager = SimpleNamespace(deallocate=lambda q: pytest.fail("reclaimed"))
 
         assert s._reconcile_stalled_deferred_saves() == 0
@@ -1973,17 +1979,34 @@ class TestStalledOffloadSaveReclaim:
         """Deriving it from LMCache's knob IS the safety argument.
 
         Two independent env vars would let ours be set below the timeout it has
-        to exceed, and nothing would say so.
+        to exceed, and nothing would say so. The derivation now lives on the
+        offload connector (`offload_save_abandon_timeout_s`), since the pin
+        timeout is LMCache knowledge; the scheduler only asks for the result.
+        """
+        import atom.kv_transfer.offload._offload_common as offload_common
+
+        monkeypatch.setattr(offload_common, "_save_abandon_timeout_s", None)
+        monkeypatch.setenv("LMCACHE_EC_PIN_TIMEOUT_SEC", "900")
+        assert offload_common.offload_save_abandon_timeout_s() == 930.0
+
+        monkeypatch.setattr(offload_common, "_save_abandon_timeout_s", None)
+        monkeypatch.delenv("LMCACHE_EC_PIN_TIMEOUT_SEC", raising=False)
+        assert offload_common.offload_save_abandon_timeout_s() == 330.0
+
+    def test_no_offload_connector_disables_reclamation(self):
+        """`_save_abandon_timeout_s` returns 0 when nothing offloads.
+
+        A non-offload connector (or none at all) has no save to reclaim, so the
+        scheduler must read a non-positive window and skip the scan rather than
+        raise reaching for a method that is not there.
         """
         import atom.model_engine.scheduler as sched_mod
 
-        monkeypatch.setattr(sched_mod, "_SAVE_ABANDON_TIMEOUT_S", None)
-        monkeypatch.setenv("LMCACHE_EC_PIN_TIMEOUT_SEC", "900")
-        assert sched_mod._offload_save_abandon_timeout_s() == 930.0
-
-        monkeypatch.setattr(sched_mod, "_SAVE_ABANDON_TIMEOUT_S", None)
-        monkeypatch.delenv("LMCACHE_EC_PIN_TIMEOUT_SEC", raising=False)
-        assert sched_mod._offload_save_abandon_timeout_s() == 330.0
+        s = object.__new__(sched_mod.Scheduler)
+        s.kv_connector = None
+        assert s._save_abandon_timeout_s() == 0.0
+        s.kv_connector = SimpleNamespace()  # a connector without the offload face
+        assert s._save_abandon_timeout_s() == 0.0
 
 
 class TestTheTierSplitPartitionsServedReuse:

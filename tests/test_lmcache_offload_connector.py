@@ -5235,6 +5235,7 @@ def test_every_member_the_scheduler_reads_is_reachable_through_the_shell():
     must_be_seen = {
         "should_defer_free",
         "abandon_save",
+        "save_abandon_timeout_s",
         "request_finished",
         "build_connector_meta",
         "process_completions",

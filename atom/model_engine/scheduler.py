@@ -55,18 +55,6 @@ logger = logging.getLogger("atom")
 # reconciler no-ops until this interval has passed.
 _SAVE_RECONCILE_INTERVAL_S = 5.0
 
-# Seconds added on top of LMCache's own pin timeout before the engine reclaims a
-# save that never reported. See `_offload_save_abandon_timeout_s` for why the sum
-# and not the timeout itself is the safe window.
-_SAVE_ABANDON_MARGIN_S = 30.0
-
-# What LMCache's pin monitor uses when `LMCACHE_EC_PIN_TIMEOUT_SEC` is unset.
-_LMCACHE_PIN_TIMEOUT_DEFAULT_S = 300.0
-
-# Memoised result of `_offload_save_abandon_timeout_s`; the reconciler asks for
-# it on a 1ms poll and the answer is a process constant.
-_SAVE_ABANDON_TIMEOUT_S: float | None = None
-
 # Memoised result of `_offload_max_pending_saves`, a process constant likewise.
 _MAX_PENDING_OFFLOAD: int | None = None
 
@@ -94,44 +82,6 @@ def _offload_max_pending_saves() -> int:
         value = 2
     _MAX_PENDING_OFFLOAD = max(1, value)
     return _MAX_PENDING_OFFLOAD
-
-
-def _offload_save_abandon_timeout_s() -> float:
-    """Seconds a deferred offload save may sit before the engine reclaims it.
-
-    Blocks are freed on `finished_saving`, so a lost report leaves them deferred
-    forever: `has_pending_kv_work()` never clears and the engine busy-loops with
-    every GPU idle.
-
-    Reclaiming cannot race a live copy. `OffloadWorkerMixin._guard` reports on
-    both the success and the exception path, so a report is lost only when
-    `store()` neither returns nor raises -- it is parked inside LMCache. Then
-    either the parked save is not copying (LMCache force-unpinned its source
-    after `pin_timeout_sec`) or a save queued behind it never reached `store()`.
-    Both cases are safe once that window has passed.
-
-    Derived from LMCache's own `LMCACHE_EC_PIN_TIMEOUT_SEC` rather than a knob
-    of its own, because that ordering IS the safety argument -- two independent
-    env vars could be set the wrong way round with nothing to say so.
-    Non-positive disables reclamation.
-    """
-    global _SAVE_ABANDON_TIMEOUT_S
-    if _SAVE_ABANDON_TIMEOUT_S is not None:
-        return _SAVE_ABANDON_TIMEOUT_S
-    pin = _LMCACHE_PIN_TIMEOUT_DEFAULT_S
-    raw = os.environ.get("LMCACHE_EC_PIN_TIMEOUT_SEC")
-    if raw is not None:
-        try:
-            pin = float(raw)
-        except ValueError:
-            logger.warning(
-                "invalid LMCACHE_EC_PIN_TIMEOUT_SEC=%r; assuming LMCache's %.0fs "
-                "default for the offload save abandon window",
-                raw,
-                _LMCACHE_PIN_TIMEOUT_DEFAULT_S,
-            )
-    _SAVE_ABANDON_TIMEOUT_S = pin + _SAVE_ABANDON_MARGIN_S if pin > 0 else 0.0
-    return _SAVE_ABANDON_TIMEOUT_S
 
 
 def _prompt_tokens_of(result) -> int:
@@ -949,13 +899,26 @@ class Scheduler:
         self.deferred_free_blocks.pop(seq.id, None)
         self.block_manager.deallocate(seq)
 
+    def _save_abandon_timeout_s(self) -> float:
+        """Seconds a deferred save may sit before reclamation, or 0 to disable.
+
+        Sourced from the offload connector (`save_abandon_timeout_s`), not
+        re-derived here: the window is a function of LMCache's own pin timeout,
+        which is the connector's knowledge, and keeping the derivation in one
+        place is what stops the safety ordering (reclaim strictly after LMCache
+        force-unpins) from silently drifting. Returns 0 when no offload connector
+        is attached, which disables reclamation -- there is nothing to reclaim.
+        """
+        callback = getattr(self.kv_connector, "save_abandon_timeout_s", None)
+        return callback() if callable(callback) else 0.0
+
     def _reconcile_stalled_deferred_saves(self) -> int:
         """Reclaim blocks whose offload save has stalled past the abandon timeout.
 
         `_maybe_release_deferred` cannot do this: the connector still reports the
         save as pending (`should_defer_free` stays True), which is exactly why
         the blocks were never released. Once the save has been deferred longer
-        than `_offload_save_abandon_timeout_s()` -- set above LMCache's pin
+        than `_save_abandon_timeout_s()` -- set above LMCache's pin
         timeout, so upstream has force-unpinned and released the source bytes --
         the blocks are safe to return to the pool. Without this, a single
         never-reported save keeps `has_pending_kv_work()` True forever and the
@@ -977,7 +940,7 @@ class Scheduler:
         this reclaims once the report is not coming. Between them every deferred
         save has a way out.
         """
-        timeout = _offload_save_abandon_timeout_s()
+        timeout = self._save_abandon_timeout_s()
         if timeout <= 0 or not self.deferred_free_blocks:
             return 0
         now = time.monotonic()
@@ -3205,14 +3168,14 @@ class Scheduler:
             # the pool forever. Recovery is total -- a leaked pin breaks no
             # `BlockPool` invariant -- so zeroing the count restores the record
             # exactly.
-            bm.reclaim_stale_state_store_pins(_offload_save_abandon_timeout_s())
+            bm.reclaim_stale_state_store_pins(self._save_abandon_timeout_s())
             # Load-side twin of the same defence: `deallocate` parks a slot when
             # it tears down a request whose state load is still in flight, on the
             # promise that `settle_state_load` will hand it back. A crashed
             # worker or dropped completion breaks that promise and the slot sits
             # off the free list forever, wedging `can_allocate`'s state gate.
             # Same window, same "cannot tell lost from slow" caveat as the pins.
-            bm.reconcile_orphan_load_slots(_offload_save_abandon_timeout_s())
+            bm.reconcile_orphan_load_slots(self._save_abandon_timeout_s())
 
     def get_request_counts(self) -> tuple[int, int]:
         """Returns (num_running_reqs, num_waiting_reqs)."""

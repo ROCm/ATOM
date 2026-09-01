@@ -253,6 +253,12 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         callback = getattr(self._impl, "take_state_source_releases", None)
         return callback() if callback is not None else set()
 
+    def save_abandon_timeout_s(self) -> float:
+        # Plain forward: the abstract lifecycle contract guarantees every _impl
+        # defines this (concrete on OffloadSchedulerMixin). The scheduler sources
+        # the reclaim window from the connector because it is LMCache knowledge.
+        return self._impl.save_abandon_timeout_s()
+
     def get_statistics(self) -> dict[str, int]:
         return self._impl.get_statistics()
 
