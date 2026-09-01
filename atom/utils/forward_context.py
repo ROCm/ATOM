@@ -61,6 +61,16 @@ class DPMetadata:
     max_tokens_across_dp: int  # Pre-computed int value for cudagraph compatibility
     local_sizes: list[int] | None = None
 
+    @classmethod
+    def from_sync_result(cls, sync: Any) -> "DPMetadata":
+        """Reuse token-count reductions decoded by the packed DP exchange."""
+
+        return cls(
+            max_tokens_across_dp_cpu=sync.max_tokens_across_dp_cpu,
+            cu_tokens_across_dp_cpu=sync.cu_tokens_across_dp_cpu,
+            max_tokens_across_dp=sync.max_tokens_across_dp,
+        )
+
     @staticmethod
     def num_tokens_across_dp(
         num_tokens: int, dp_size: int, dp_rank: int
@@ -868,10 +878,14 @@ def set_forward_context(
     ubatch_slices: list[Any] | None = None,
     in_hipgraph: bool = False,
     ub_max_tokens_across_dp: tuple | None = None,
+    dp_metadata: DPMetadata | None = None,
 ) -> None:
     global _forward_context
-    dp_metadata: DPMetadata | None = None
-    if atom_config.parallel_config.data_parallel_size > 1 and num_tokens is not None:
+    if (
+        dp_metadata is None
+        and atom_config.parallel_config.data_parallel_size > 1
+        and num_tokens is not None
+    ):
         dp_metadata = DPMetadata.make(
             atom_config.parallel_config,
             # attn_metadata,

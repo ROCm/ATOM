@@ -669,6 +669,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # `np[:n] = arr; copy_to_gpu(n)` pattern instead of per-call
         # `torch.as_tensor(arr)` allocations.
         self._alloc_v4_metadata_buffers()
+        # Reused completion marker for the early decode-preparation stream.
+        # Recording it before the DP wait lets the main stream join with one
+        # wait_event after the result arrives, instead of wait_stream creating,
+        # recording, and destroying a temporary event on the critical path.
+        self._decode_prep_done_event = torch.cuda.Event()
 
         self._ubatch_decode_meta: list | None = None
         # Filled on the first checkpoint copy — the pools do not exist yet
@@ -2739,6 +2744,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                     cta_info_out=self._v4_fp4_cta_info,
                 )
                 fp4_schedule_prepared = True
+            self._decode_prep_done_event.record()
 
         return _V4DecodeHostPreparation(
             batch_identity=id(batch),
@@ -2834,7 +2840,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             running_bs=running_bs,
             max_q_len=max_seqlen_q,
         )
-        current_stream.wait_stream(prep_stream)
+        current_stream.wait_event(self._decode_prep_done_event)
 
         attn_metadata = AttentionMetaData_DSV4(
             cu_seqlens_q=cu_seqlens_q_gpu,

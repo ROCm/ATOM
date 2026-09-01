@@ -229,6 +229,13 @@ class DPSyncResult:
 
     # [dp_size] int32 CPU tensor — each rank's input token count.
     num_tokens_across_dp: torch.Tensor
+    # The MoE forward context consumes the same rank-token row as a MAX and a
+    # cumulative sum.  Decode them once while the packed result is already hot
+    # on the CPU instead of dispatching another chain of tiny PyTorch CPU ops
+    # between the metadata wait and graph replay.
+    max_tokens_across_dp_cpu: torch.Tensor
+    cu_tokens_across_dp_cpu: torch.Tensor
+    max_tokens_across_dp: int
     # DP-MAX of the scheduled SEQUENCE count -- the companion to
     # `num_tokens_across_dp` in the other unit. Reduced on EVERY step, not just
     # uniform decode: a captured graph holds its collective at one batch, so a
@@ -387,36 +394,50 @@ def finish_sync_dp_metadata(pending: PendingDPMetadataSync) -> DPSyncResult:
         pending.completion_stream.synchronize()
 
     sync = pending.sync
+    sync_np = sync.numpy()
     tbo_on = pending.tbo_on
     dspark_on = pending.dspark_on
 
     # Device sync reuses its host landing buffer next step. Preserve the old
     # result-ownership contract for callers that retain the ForwardMode.
     num_tokens_across_dp = sync[0].clone() if pending.clone_rank_tokens else sync[0]
-    max_bs_across_dp = int(sync[1].max())
-    any_rank_has_prefill = bool(sync[2].any())
+    rank_tokens_np = num_tokens_across_dp.numpy()
+    max_tokens_index = int(np.argmax(rank_tokens_np))
+    max_tokens_across_dp = int(rank_tokens_np[max_tokens_index])
+    max_tokens_across_dp_cpu = num_tokens_across_dp[max_tokens_index]
+    cu_tokens_across_dp_cpu = torch.from_numpy(
+        np.cumsum(rank_tokens_np, dtype=np.int32)
+    )
+    max_bs_across_dp = int(sync_np[1].max())
+    any_rank_has_prefill = bool(sync_np[2].any())
     tbo_collective_active = False
     ub_max_tokens_across_dp: tuple[int, int] | None = None
     if tbo_on:
         # OR(meets_min_tokens): one rank reaching the min-token bar turns TBO on
         # for all. AND(can_split): but EVERY rank must be structurally splittable.
-        tbo_collective_active = bool(sync[3].any()) and bool(sync[4].all())
+        tbo_collective_active = bool(sync_np[3].any()) and bool(sync_np[4].all())
         if tbo_collective_active:
-            prefill_rank_count = int(sync[2].sum())
+            prefill_rank_count = int(sync_np[2].sum())
             uniform_mode = (
-                prefill_rank_count == 0 or prefill_rank_count == sync.shape[1]
+                prefill_rank_count == 0 or prefill_rank_count == sync_np.shape[1]
             )
             tbo_collective_active = uniform_mode
         if tbo_collective_active:
-            ub_max_tokens_across_dp = (int(sync[5].max()), int(sync[6].max()))
+            ub_max_tokens_across_dp = (
+                int(sync_np[5].max()),
+                int(sync_np[6].max()),
+            )
 
     max_seqlen_q_across_dp: int | None = None
     if dspark_on:
         tbo_fields = 7 if tbo_on else 3
-        max_seqlen_q_across_dp = int(sync[tbo_fields].max())
+        max_seqlen_q_across_dp = int(sync_np[tbo_fields].max())
 
     pending.result = DPSyncResult(
         num_tokens_across_dp=num_tokens_across_dp,
+        max_tokens_across_dp_cpu=max_tokens_across_dp_cpu,
+        cu_tokens_across_dp_cpu=cu_tokens_across_dp_cpu,
+        max_tokens_across_dp=max_tokens_across_dp,
         max_bs_across_dp=max_bs_across_dp,
         any_rank_has_prefill=any_rank_has_prefill,
         tbo_collective_active=tbo_collective_active,

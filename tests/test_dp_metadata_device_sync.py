@@ -74,6 +74,9 @@ def test_device_sync_submission_defers_host_wait(monkeypatch):
     result = finish_sync_dp_metadata(pending)
     assert stream.synchronize_calls == 1
     assert result.num_tokens_across_dp.tolist() == [11, 17]
+    assert result.max_tokens_across_dp_cpu.item() == 17
+    assert result.cu_tokens_across_dp_cpu.tolist() == [11, 28]
+    assert result.max_tokens_across_dp == 17
     assert result.max_bs_across_dp == 3
     assert result.any_rank_has_prefill
     assert result.tbo_collective_active
