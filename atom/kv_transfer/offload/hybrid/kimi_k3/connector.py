@@ -78,6 +78,22 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
         # with it (super().start_load_kv never ran).
         self._store_failed_no_tier: set[StateStoreOperationId] = set()
 
+    def close(self) -> None:
+        """Drain then join the state tier before the base executors.
+
+        The tier's store/load threads copy PAGE units out of the KV pool. Draining
+        first lets an in-flight transfer finish against a pool that is still
+        mapped; `shutdown` then joins the tier's own executors. Only after that
+        does the base close its save/load pools. Guarded because the tier is
+        `None` until `register_kv_caches` builds it (and stays `None` under PP or
+        on a non-owning layout).
+        """
+        tier = getattr(self, "_state_tier", None)
+        if tier is not None:
+            tier.drain()
+            tier.shutdown()
+        super().close()
+
     def register_kv_caches(
         self, kv_caches: dict, transfer_tensors=None, num_blocks: int | None = None
     ) -> None:

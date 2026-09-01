@@ -5384,6 +5384,68 @@ class TestJointLegsShareOneCompletionIdentity:
         assert done == set()
         assert failed == {req.load_operation}
 
+
+class _RecordingExecutor:
+    def __init__(self, log: list, name: str) -> None:
+        self._log = log
+        self._name = name
+
+    def shutdown(self, wait: bool = True) -> None:
+        self._log.append((self._name, "shutdown", wait))
+
+
+class _RecordingTier:
+    def __init__(self, log: list) -> None:
+        self._log = log
+
+    def drain(self) -> None:
+        self._log.append(("tier", "drain"))
+
+    def shutdown(self) -> None:
+        self._log.append(("tier", "shutdown"))
+
+
+def test_worker_close_drains_tier_then_joins_all_executors():
+    """Teardown order is load-bearing: the state tier drains (an in-flight copy
+    finishes against a still-mapped KV pool) and joins its own threads before
+    the base save/load pools go, and all of it before the pool is dropped."""
+    log: list = []
+    c = KimiK3OffloadConnector.__new__(KimiK3OffloadConnector)
+    c._state_tier = _RecordingTier(log)
+    c._save_executor = _RecordingExecutor(log, "save")
+    c._load_executor = _RecordingExecutor(log, "load")
+
+    c.close()
+
+    assert log == [
+        ("tier", "drain"),
+        ("tier", "shutdown"),
+        ("save", "shutdown", True),
+        ("load", "shutdown", True),
+    ]
+
+
+def test_worker_close_is_a_noop_when_no_tier_was_built():
+    """Under PP or a non-owning layout the tier is never built; close must still
+    join the base executors and not crash on the missing tier."""
+    log: list = []
+    c = KimiK3OffloadConnector.__new__(KimiK3OffloadConnector)
+    c._state_tier = None
+    c._save_executor = _RecordingExecutor(log, "save")
+    c._load_executor = _RecordingExecutor(log, "load")
+
+    c.close()
+
+    assert log == [("save", "shutdown", True), ("load", "shutdown", True)]
+    # Idempotent: executors already shut down, no tier -> nothing more recorded.
+    c.close()
+    assert log == [
+        ("save", "shutdown", True),
+        ("load", "shutdown", True),
+        ("save", "shutdown", True),
+        ("load", "shutdown", True),
+    ]
+
     def test_the_park_does_not_leak_an_entry_per_joint_load(self):
         worker = _k3_worker()
         for i in range(4):

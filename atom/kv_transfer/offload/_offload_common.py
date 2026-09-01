@@ -136,6 +136,22 @@ class OffloadWorkerMixin:
         self._done_load: set[LoadCompletionId] = set()
         self._failed_load: set[LoadCompletionId] = set()
 
+    def close(self) -> None:
+        """Join the save/load executors at worker teardown.
+
+        `ThreadPoolExecutor` threads are non-daemon, so a process that exits
+        without joining them either hangs on interpreter shutdown or logs a
+        `threads can no longer be started` error as atexit tears the pools down
+        out from under an in-flight copy. `ModelRunner.exit()` calls this before
+        it destroys the distributed env. Idempotent -- a second call finds the
+        executors already shut down. Subclasses that own further resources
+        (K3's state tier) override and call `super().close()` last.
+        """
+        for name in ("_save_executor", "_load_executor"):
+            executor = getattr(self, name, None)
+            if executor is not None:
+                executor.shutdown(wait=True)
+
     @staticmethod
     def _load_completion_id(req) -> LoadCompletionId:
         return getattr(req, "load_operation", None) or req.req_id

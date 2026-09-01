@@ -1039,6 +1039,15 @@ class ModelRunner:
         if not self.still_running:
             return
         self.still_running = False
+        # 0. Join any offload connector's copy threads. Its ThreadPoolExecutors
+        #    are non-daemon, so leaving them running wedges interpreter shutdown
+        #    or races an in-flight copy against atexit. Must run BEFORE the KV
+        #    pool it copies out of is dropped and before the dist env goes away.
+        #    Guarded: only offload workers define close() (moriio etc. do not).
+        connector = get_kvconnector()
+        close = getattr(connector, "close", None) if connector is not None else None
+        if callable(close):
+            close()
         # 1. Destroy distributed env (NCCL + CustomAllreduce + process groups)
         #    Must happen while ops module is still alive for CustomAllreduce cleanup.
         destroy_dist_env()
