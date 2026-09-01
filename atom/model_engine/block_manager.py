@@ -963,7 +963,15 @@ class BlockManager:
                 break
             self.kv.claim(block_id)
             seq.block_table.append(block_id)
-            if i + 1 == num_cached_blocks:
+            # Track the hash of the last claimed *cached* block as we go, not
+            # only when the loop reaches num_cached_blocks-1. If the block_id==-1
+            # branch above clamps num_cached_blocks to an earlier `i` (an
+            # eviction inside the cached range), the `i + 1 == num_cached_blocks`
+            # test never fired, leaving hit_hash == -1 while num_cached_tokens
+            # stayed > 0 -- a cold-start state restore over a prefix that is in
+            # fact cached. Assigning on every cached block leaves hit_hash on the
+            # last one actually claimed, whichever way the loop exits.
+            if i < num_cached_blocks:
                 hit_hash = h
         # Pin the restore before fresh blocks can evict its checkpoint.
         state_holds = True
