@@ -78,6 +78,43 @@
       ]
     },
     {
+      "display": "DeepSeek-V4-Pro EPLB r0 MegaMoE",
+      "path": "deepseek-ai/DeepSeek-V4-Pro",
+      "prefix": "deepseek-v4-pro-eplb",
+      "runner": "atom-mi355-8gpu.predownload",
+      "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1\nAITER_LOG_LEVEL=WARNING\nMORI_SHMEM_HEAP_SIZE=16G\nATOM_BENCHMARK_STUCK_POLLS=60",
+      "config": {
+        "tp": 8,
+        "kv_cache_dtype": "fp8",
+        "extra_args": "--index_cache_dtype fp4 --no-enable_prefix_caching --enable-dp-attention --enable-expert-parallel --eplb-enable --moe-backend mega"
+      },
+      "scenarios": [
+        {
+          "isl": 8192,
+          "osl": 1024,
+          "concurrency": [512, 4096],
+          "random_range_ratio": 0.8
+        }
+      ],
+      "variants": [
+        {
+          "label": "MegaMoE",
+          "suffix": "-mega",
+          "extra_args": "--eplb-config '{\"num_redundant_experts\": 0, \"placement_policy\": \"naive\", \"rebalance_interval\": 200, \"load_window_size\": 200, \"rebalance_min_balancedness\": 2.0}'",
+          "conc_min": 512,
+          "conc_max": 512
+        },
+        {
+          "label": "MegaMoE",
+          "suffix": "-mega",
+          "extra_args": "--eplb-config '{\"num_redundant_experts\": 0, \"placement_policy\": \"naive\", \"rebalance_interval\": 800, \"load_window_size\": 800, \"rebalance_min_balancedness\": 2.0}'",
+          "bench_args": "--num-prompts 20480 --num-warmups 256",
+          "conc_min": 4096,
+          "conc_max": 4096
+        }
+      ]
+    },
+    {
       "display": "DeepSeek-R1-0528-MXFP4",
       "path": "amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4",
       "prefix": "deepseek-r1-0528-mxfp4",
