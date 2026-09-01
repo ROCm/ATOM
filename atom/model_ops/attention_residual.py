@@ -30,6 +30,29 @@ def _rms_eps(norm: RMSNorm) -> float:
     return getattr(norm, "variance_epsilon", getattr(norm, "eps", 1e-6))
 
 
+def _fused_quant_dtype(norm: RMSNorm | None) -> torch.dtype | None:
+    """The activation dtype the attn_res kernel should quantize its store to.
+
+    ``out_norm`` is an RMSNorm the kernel absorbs (see AttnRes), so when that
+    module was built to fuse its activation quant, the kernel -- not a later
+    standalone quant op in each consuming Linear -- is what has to emit it.
+    Resolved per call, not cached: the loader's online-quant realignment
+    (``RMSNorm.online_quantize_activation``) can change the scheme after init.
+
+    None means store unquantized, which is both the no-quant case and the
+    schemes the kernel does not emit yet (only per-token FP8 is fused; per_1x128
+    and per_1x32 still quantize in the consumer).
+    """
+    if norm is None or not getattr(norm, "use_fused_quant", False):
+        return None
+    from aiter import QuantType
+    from aiter.utility.dtypes import fp8
+
+    if norm.quant_type.value != QuantType.per_Token.value:
+        return None
+    return fp8
+
+
 class AttnRes(nn.Module):
     """One attention-residual mixing site.
 
@@ -50,7 +73,11 @@ class AttnRes(nn.Module):
     * ``out_norm`` -- the caller's rmsnorm OF THE RESULT. Passing one is what
       decides the fusion: it is folded into the kernel's store and the returned
       mix comes back already normed and scaled, so the caller must not norm it
-      again. Given None, the mix is returned raw.
+      again. Given None, the mix is returned raw. An out_norm built with
+      ``fused_quant`` also has its activation quant folded into that same store,
+      so the mix comes back as the ``(fp8, scale)`` pair its ``forward()`` would
+      have returned (see ``_fused_quant_dtype``) -- one quant shared by every
+      consumer of the row, instead of one per consuming Linear.
 
     The upshot for callers is that forward() has one shape in every mode:
     hand it the prefix, the block, and any pending addends; get back
@@ -88,6 +115,16 @@ class AttnRes(nn.Module):
         # Set only on the site that closes out blocks (see maybe_close_block).
         self.block_size = block_size
         self.layer_idx = layer_idx
+        # Kernel-fused cat([block_residual, prefix_out], 1) from the attn_res
+        # call inside forward(), stashed for maybe_close_block() to consume
+        # instead of re-reading block_residual via a separate torch.cat. Reset
+        # at the top of every forward() and cleared once consumed; None means
+        # "no fused block was produced this call" (residuals disabled, no
+        # candidates yet, or a call that wasn't a close-block layer), in which
+        # case maybe_close_block() falls back to the plain torch.cat -- correct
+        # either way, this is purely a perf side-channel between the two calls
+        # that kimi_k3.py always makes back-to-back on the same instance.
+        self._pending_block_residual: torch.Tensor | None = None
 
     def process_weights_after_loading(self) -> None:
         # Fold the static rmsnorm gain and the scoring projection into one [H]
@@ -106,7 +143,7 @@ class AttnRes(nn.Module):
         block_residual: torch.Tensor | None = None,
         add_hidden: torch.Tensor | None = None,
         add_hidden2: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor | tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
         """Returns ``(mixed_output, prefix_out)``.
 
         The addends are the caller's ``prefix_sum = prefix_sum + ...``, folded
@@ -114,10 +151,17 @@ class AttnRes(nn.Module):
         ``prefix_out`` is that sum. A None ``prefix_sum`` means the block was
         just closed out and this site starts a fresh one, so the first addend
         IS the prefix.
+
+        ``mixed_output`` is an ``(fp8, scale)`` pair rather than a tensor when
+        ``out_norm`` fuses its activation quant, on both the kernel and the
+        no-candidates path -- the same shape either way, so consumers stay
+        agnostic to which one ran.
         """
         if prefix_sum is None:
             prefix_sum, add_hidden, add_hidden2 = add_hidden, add_hidden2, None
         assert prefix_sum is not None
+
+        self._pending_block_residual = None  # reset every call, see the field doc
 
         if self.enabled and block_residual is not None and block_residual.shape[1] > 0:
             score_weight = self.score_weight
@@ -126,7 +170,26 @@ class AttnRes(nn.Module):
                 score_weight = self.score_weight
             from atom.model_ops.kimi_k3 import apply_attn_res
 
-            return apply_attn_res(
+            # Ask the kernel to also emit the block-banking concat when this is
+            # a close-block layer, so maybe_close_block() (called right after
+            # this, on this same instance) can skip its torch.cat.
+            will_close = (
+                self.block_size is not None and self.layer_idx % self.block_size == 0
+            )
+            out_quant_dtype = _fused_quant_dtype(self.out_norm)
+            if not will_close:
+                return apply_attn_res(
+                    prefix_sum,
+                    block_residual,
+                    score_weight,
+                    self.eps,
+                    add_hidden,
+                    None if self.out_norm is None else self.out_norm.weight,
+                    self.out_eps,
+                    add_hidden2,
+                    out_quant_dtype=out_quant_dtype,
+                )
+            mixed_output, prefix_out, block_out = apply_attn_res(
                 prefix_sum,
                 block_residual,
                 score_weight,
@@ -135,7 +198,11 @@ class AttnRes(nn.Module):
                 None if self.out_norm is None else self.out_norm.weight,
                 self.out_eps,
                 add_hidden2,
+                close_block=True,
+                out_quant_dtype=out_quant_dtype,
             )
+            self._pending_block_residual = block_out
+            return mixed_output, prefix_out
 
         # Nothing to mix (residuals off, or no candidates yet). Apply by hand
         # what the kernel would otherwise have folded into its load and store.
@@ -157,11 +224,24 @@ class AttnRes(nn.Module):
         leaves prefix_sum None: the running sum has been banked as a candidate
         and the next site starts a fresh one from whatever it is handed.
         Residuals disabled, or a layer mid-block, means no change.
+
+        When the immediately preceding ``forward()`` call on this instance ran
+        the attn_res kernel (there were candidates to mix), it already computed
+        this same concat in-kernel (see ``_pending_block_residual`` and
+        ``_apply_attn_res_impl``'s ``close_block``) -- reuse that instead of
+        re-reading ``block_residual`` from HBM via ``torch.cat``. The very first
+        block (block_residual still empty, so forward() took the degenerate
+        no-mix path) has nothing cached, so this falls back to the plain cat,
+        which is cheap there anyway (concatenating with an empty tensor).
         """
         if not self.enabled or self.block_size is None:
             return block_residual, prefix_sum
         if self.layer_idx % self.block_size != 0:
             return block_residual, prefix_sum
         assert block_residual is not None
-        block_residual = torch.cat([block_residual, prefix_sum.unsqueeze(1)], dim=1)
+        if self._pending_block_residual is not None:
+            block_residual = self._pending_block_residual
+            self._pending_block_residual = None
+        else:
+            block_residual = torch.cat([block_residual, prefix_sum.unsqueeze(1)], dim=1)
         return block_residual, None
