@@ -264,9 +264,7 @@ class ParallelLMHead(VocabParallelEmbedding):
             # logits = torch.cat(all_logits, -1) if self.tp_rank == 0 else None
         return logits
 
-    def compute_argmax_token(
-        self, x: torch.Tensor, *, out: torch.Tensor | None = None
-    ) -> torch.Tensor:
+    def compute_argmax_token(self, x: torch.Tensor) -> torch.Tensor:
         """Greedy argmax token over the (TP-sharded) vocab — returns ``[N]`` token
         ids WITHOUT all-gathering the full ``[N, vocab]`` logits.
 
@@ -278,18 +276,9 @@ class ParallelLMHead(VocabParallelEmbedding):
         the lowest global index — ``torch.max`` picks the lowest local index, and
         ``argmax`` over ranks picks the lowest rank (== lowest vocab range).
         """
-        if out is not None:
-            assert out.shape == x.shape[:-1], (
-                f"argmax out has shape {tuple(out.shape)}, expected "
-                f"{tuple(x.shape[:-1])}"
-            )
-            assert (
-                out.dtype == torch.long and out.device == x.device
-            ), "argmax out must be an int64 tensor on the input device"
         logits = tgemm.mm(x, self.weight, self.bias)  # [N, vocab/tp]
         if self.tp_size <= 1:
-            token = logits.argmax(dim=-1)
-            return token if out is None else out.copy_(token)
+            return logits.argmax(dim=-1)
         # Pack (val, idx) as fp32 — idx < 2^24 is exact — and all-gather only the
         # per-rank reductions ([N, 2]) instead of the full logits.
         packed = lm_head_argmax_pack(logits, self.vocab_start_idx)
@@ -301,7 +290,7 @@ class ParallelLMHead(VocabParallelEmbedding):
         gathered = gathered.view(self.tp_size, -1, 2)
         winner = gathered[:, :, 0].argmax(dim=0)  # [N] winning rank (ties -> lowest)
         token = gathered[:, :, 1].gather(0, winner.unsqueeze(0)).squeeze(0)  # [N] fp32
-        return token.to(torch.long) if out is None else out.copy_(token)
+        return token.to(torch.long)
 
     # ------------------------------------------------------------------
     # Pure-DP sharded LM head (config ② all-gather / ③ all-to-all).
