@@ -4688,7 +4688,6 @@ def _k3_scheduler() -> KimiK3OffloadScheduler:
     s._warned_save_stalled = False
     s._state_indexed = set()
     s._state_index_failed = set()
-    s._state_store_failed_locally = set()
     s._active_load_operations = {}
     s._do_save = True
     s._max_pending_saves = 4
