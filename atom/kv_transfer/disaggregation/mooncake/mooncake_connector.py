@@ -152,13 +152,7 @@ def _configure_mooncake_transport(protocol: str) -> None:
 def _coalesce(
     src: np.ndarray, dst: np.ndarray, length: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Merge runs that are contiguous on both sides into single descriptors.
-
-    A virtual block's ``dcp_size`` replicated sources, and consecutively
-    allocated blocks in general, collapse into one descriptor whenever the
-    allocator handed out consecutive ids, which is the common case and keeps
-    the RDMA batch small.
-    """
+    """Merge runs that are contiguous on both sides into single descriptors."""
     if src.size == 0:
         empty = np.empty(0, dtype=np.int64)
         return empty, empty.copy(), empty.copy()
