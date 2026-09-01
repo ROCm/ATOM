@@ -1297,12 +1297,15 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                         "Mooncake relayout addresses the page through them."
                     )
                 tokens_per_page = bpb // index_row_bytes
-                if tokens_per_page * (index_head_dim + 4) > bpb:
+                # One fp32 scale per token holds only while the indexer
+                # quantizes a key row as a single block (Indexer.
+                # quant_block_size in deepseek_v2.py).
+                if index_head_dim != 128:
                     raise RuntimeError(
-                        f"An index page holds {tokens_per_page} tokens of "
-                        f"{index_head_dim} key bytes plus a 4-byte scale, which "
-                        f"does not fit in {bpb} bytes; the key and scale planes "
-                        "would overlap."
+                        f"An index row of {index_head_dim} key bytes does not "
+                        "match the indexer's 128-byte quantization block, so a "
+                        "token's scales are not the single fp32 the key/scale "
+                        "plane split assumes."
                     )
                 block_regions.append(
                     KVTransferRegion(
