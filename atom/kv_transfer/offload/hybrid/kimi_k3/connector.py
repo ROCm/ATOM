@@ -253,12 +253,36 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
         if not state_ids or not self._do_load:
             return
         for req in metadata.requests:
-            if req.load_spec is not None and req.req_id in state_ids:
+            if req.req_id not in state_ids:
+                continue
+            if req.load_spec is not None:
+                # Both legs: file the park under the KV identity, because that is
+                # the one that has to reach the engine on finished/failed_loading.
                 self._joint_park.arm(
                     req.req_id,
                     needs_kv=True,
                     needs_state=True,
                     kv_id=self._load_completion_id(req),
+                )
+            else:
+                # State-only load (no KV leg -- a plain HBM-index miss where the
+                # KV is resident but the recurrent state is not). Arm it too, on
+                # the state leg alone. Its SUCCESS already reached the engine via
+                # the _settle_joint passthrough (the tier reports the bare id and
+                # the engine waits on it), but its FAILURE did not: _fail_state_
+                # loads (including the no-tier path) settled a park that was never
+                # armed, so nothing was emitted and the request sat in
+                # WAITING_FOR_REMOTE_KVS for the life of the process --
+                # reconcile_orphan_load_slots only reclaims slots of already-
+                # deallocated seqs, it never wakes a live parked request. Arming
+                # on the state leg alone makes both outcomes land on a real entry:
+                # take_ready surfaces success into finished_loading and failure
+                # into failed_loading (recompute), under the same bare id the
+                # passthrough already used, so the engine matches it unchanged.
+                self._joint_park.arm(
+                    req.req_id,
+                    needs_kv=False,
+                    needs_state=True,
                 )
 
     def _start_state_loads(self, metadata) -> None:
@@ -333,17 +357,22 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
                 )
             self._store_failed_no_tier = set()
         if self._state_tier is None:
-            # Joint loads are still armed with no tier (see `_arm_joint_loads`)
-            # and their state leg has already failed (`_fail_state_loads`), so
-            # the park owes only the KV leg. Drain it here -- before the return
-            # -- with empty state reports (the tier that would produce them
-            # never built): a landed KV completion settles the pair into
-            # `failed_loading` and the request recomputes, instead of flowing
-            # through as `finished_loading` and being miscounted a state restore
-            # by `Scheduler._settle_state_load(ok=True)`. This is also what keeps
-            # the arm from leaking: the KV completion arrives and releases the
-            # entry. A state-only load (no KV leg) is not armed here and is
-            # instead reclaimed by `reconcile_orphan_load_slots`' abandon window.
+            # Both joint and state-only loads were armed by `_arm_joint_loads`
+            # even with no tier, and `_fail_state_loads` has already failed their
+            # state leg. Drain the park here -- before the return -- with empty
+            # tier reports (the tier that would produce them never built).
+            #   * A joint load (needs_kv) now owes only the KV leg: its landed KV
+            #     completion settles the pair into `failed_loading` and the
+            #     request recomputes, instead of flowing through as
+            #     `finished_loading` and being miscounted a state restore by
+            #     `Scheduler._settle_state_load(ok=True)`. The KV completion also
+            #     releases the entry, so the arm cannot leak.
+            #   * A state-only load (no KV leg) was released the moment
+            #     `_fail_state_loads` settled its only leg, so `take_ready`
+            #     (inside `_settle_joint`) surfaces it into `failed_loading` now
+            #     and the request recomputes -- rather than sitting in
+            #     WAITING_FOR_REMOTE_KVS until an abandon window that never wakes
+            #     a live parked request.
             out.finished_loading, out.failed_loading = self._settle_joint(
                 out.finished_loading, out.failed_loading, set(), set()
             )
