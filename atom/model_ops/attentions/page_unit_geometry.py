@@ -3,18 +3,13 @@
 
 """Where a checkpoint image's bytes live in the MLA paged pool.
 
-This is the destination side of a K3 PAGE-copy checkpoint: given logical block
-(PAGE unit) ids, it says which addresses -- and which tensor views -- of the KV
-pool a checkpoint copy lands on. `_KimiMLAGDNCommon` mixes it in over
-`GDNStateMixin`, whose stubs raise `NotImplementedError` for a pool it does not
-own.
+The destination side of a K3 PAGE-copy checkpoint: given logical block (PAGE
+unit) ids, it gives the addresses and tensor views of the KV pool a checkpoint
+copy lands on. `_KimiMLAGDNCommon` mixes it in over `GDNStateMixin`.
 
-Kept in its own module, free of any GPU/aiter import, for one reason: it is the
-CPU tier's only seam onto PAGE units, and it is pure arithmetic over
-`self.model_runner`. Living here it can be unit-tested on a runner with no GPU
-(the K3 builder's own module imports aiter at load and is `importorskip`ped on
-CI), so the geometry that decides where every checkpoint byte goes is actually
-exercised there.
+Kept aiter/GPU-import-free and pure over `self.model_runner` so this geometry --
+which decides where every checkpoint byte goes -- can be unit-tested on a
+GPU-less runner (the K3 builder's own module is `importorskip`ped on CI).
 """
 
 from __future__ import annotations
@@ -36,23 +31,15 @@ class PageUnitGeometryMixin:
     def _page_unit_regions(self) -> tuple[np.ndarray, np.ndarray]:
         """Base address and per-unit stride of every region a PAGE id owns.
 
-        The destination side of a checkpoint copy. `GDNStateMixin` knows where
-        a state slot's bytes are; this knows where a KV block's are, because
-        this class owns the MLA pool.
+        `kv_cache` is `(rows, physical_blocks, physical_block_size, entry)`: a
+        block owns one contiguous region per row, rows a fixed stride apart.
+        Affine in the block id and a pool property, so it is computed once.
 
-        `kv_cache` is `(rows, physical_blocks, physical_block_size, entry)`,
-        so a block owns one contiguous region per row and the rows are a fixed
-        stride apart. Affine in the block id, and a property of the pool rather
-        than of any block, so it is worked out once.
-
-        The units are the trap. `unit_ids` carries **logical** block ids -- what
-        `BlockPool` hands out and what `sub_pool_specs` priced -- while the
-        tensor is shaped in **physical** blocks, and K3's `block_ratio` is 128.
-        So a region is `runner.block_size` tokens wide, not
-        `physical_block_size`, and the two differ by exactly that ratio. The
-        assertion below is what makes a mix-up a startup error rather than 127
-        blocks of scrambled state: it is the one relation that cannot hold if
-        the granularity is wrong.
+        The units are the trap: `unit_ids` carries **logical** block ids while
+        the tensor is shaped in **physical** blocks (K3's `block_ratio` is 128),
+        so a region is `runner.block_size` tokens wide, not `physical_block_size`.
+        The granularity assertion below is the one relation that cannot hold if
+        the two are confused -- a startup error, not 127 blocks of scrambled state.
         """
         runner = self.model_runner
         cache = runner.kv_cache
@@ -108,22 +95,17 @@ class PageUnitGeometryMixin:
 
         `_page_unit_regions` gives raw addresses for the Triton descriptor; the
         LMCache packer takes `list[torch.Tensor]`, so the same bytes need naming
-        as views. This is the tier's only new seam -- a load writes the Active
-        Slot directly and reuses `state_entry_views`.
-
-        Order is the contract: unit major, row minor, the same ravel as
-        `_page_unit_bases`. Cross-build safety is `layout_id` in
-        `StateByteCodec.key`, not this order.
+        as views. Order is the contract: unit major, row minor, the same ravel
+        as `_page_unit_bases` (cross-build safety is `layout_id` in
+        `StateByteCodec.key`, not this order).
 
         `unit_ids` carries *logical* block ids while `kv_cache` is shaped in
-        *physical* ones (K3's ratio is 128). Flattening the two block axes and
-        indexing by `unit * block_size` is that conversion -- the same
-        arithmetic `_page_unit_bases` does in addresses, so the two cannot
-        drift. Range-checked against the logical count for the same reason.
+        *physical* ones (K3's ratio is 128); indexing by `unit * block_size` is
+        that conversion, range-checked against the logical count.
 
-        `_page_unit_regions` runs first for its side effect: the contiguity and
-        granularity checks live there. Its return (base/stride addresses) is for
-        the Triton descriptor, not this view path -- called bare, not unpacked.
+        `_page_unit_regions` runs first only for its side effect (the contiguity
+        and granularity checks). Its return is for the Triton descriptor, not
+        this view path -- called bare, not unpacked.
         """
         self._page_unit_regions()
         cache = self.model_runner.kv_cache
@@ -148,35 +130,24 @@ class PageUnitGeometryMixin:
 
         # ---- cut the padding tail off the final unit ----
         #
-        # An image is `image_bytes`, but it occupies `ceil(image_bytes /
-        # page_unit_bytes)` WHOLE units, so the last one is mostly padding: at
-        # K3's 2,138,112 B unit and 58,079,232 B image that is 28 units =
-        # 59,867,136 B, of which 1,787,904 belong to no image.
+        # An image occupies `ceil(image_bytes / page_unit_bytes)` WHOLE units,
+        # so the last one is mostly padding. The HBM copy already trims it
+        # (`_checkpoint_copy_plan` passes `plan_segmented_copy` both the unit
+        # stream and `spec.image_bytes`); gathering whole units for the CPU tier
+        # skipped that and offered the packer the padding too, against a
+        # MemoryObj `StateByteCodec.put` sizes at `entry_bytes` == `image_bytes`
+        # -- so every store died with "MemoryObj tensor is too small".
         #
-        # `_checkpoint_copy_plan` already knows this -- it hands
-        # `plan_segmented_copy` the unit stream *and* `spec.image_bytes`, so the
-        # HBM copy writes only the leading `image_bytes` and leaves the tail
-        # alone. Gathering whole units for the CPU tier skipped that argument
-        # and asked the packer for the padding too, against a MemoryObj
-        # `StateByteCodec.put` sizes at `entry_bytes` -- which IS `image_bytes`.
-        # Every store died with "MemoryObj tensor is too small for 59867136
-        # bytes; got 58079232".
-        #
-        # The trim is byte-exact rather than view-aligned because the image does
-        # not end on one: 58,079,232 leaves 350,208 B of the last unit in use,
-        # which is 20.96 rows of it. That view is reinterpreted as `uint8` and
-        # sliced; the packer sizes segments as `numel * element_size`, so it
-        # costs nothing to accept. The load side needs no counterpart -- it
-        # scatters into `state_entry_views`, which sums to `entry_bytes`.
-        #
-        # Inline rather than a helper method: the unit tests drive this function
-        # with a `SimpleNamespace` stand-in for `self`, so a second attribute
-        # would have to be stubbed by every one of them.
+        # Byte-exact, not view-aligned: an image need not end on a row boundary,
+        # so the boundary view is reinterpreted as `uint8` and sliced (the
+        # packer sizes segments as `numel * element_size`). The load side needs
+        # no counterpart -- it scatters into `state_entry_views`, which sums to
+        # `entry_bytes`. Inline, not a helper: the tests drive this with a
+        # `SimpleNamespace` `self`, and a helper would be one more stub each.
         runtime = getattr(self.model_runner, "state_runtime", None)
         spec = None if runtime is None else runtime.checkpoint_spec
-        # `getattr`: a fork build carries no spec, and the unit tests hand this
-        # a stand-in that carries no `image_bytes`. Either way there is no image
-        # size to trim against, and the whole-unit stream is the right answer.
+        # `getattr`: a fork build or a test stand-in carries no `image_bytes` --
+        # no image size to trim against, so the whole-unit stream is correct.
         budget = int(getattr(spec, "image_bytes", 0) or 0) if spec else 0
         if not budget:
             return views

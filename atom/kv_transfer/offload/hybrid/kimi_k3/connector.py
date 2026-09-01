@@ -67,14 +67,12 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
         # Inert until a request has both legs, which only a joint boundary
         # produces; costs one dict lookup per report otherwise.
         self._joint_park = _JointPark()
-        # Stores this worker could not even attempt because the tier never
-        # built. Drained in `get_finished` into the SAME completion channels a
-        # real tier failure uses (index-failed + source-release), so the engine
-        # unpins their PAGE units now. This is a *worker-process* field; the
-        # scheduler's report path lives in a different process and cannot see a
-        # set written here -- the earlier code wrote a scheduler-only attribute
-        # from the worker, which does not exist here and raised AttributeError
-        # on the no-tier store path, taking the whole step's KV loads/saves down
+        # Stores this worker could not attempt because the tier never built.
+        # Drained in `get_finished` into the same completion channels a real tier
+        # failure uses (index-failed + source-release), so the engine unpins
+        # their PAGE units now. A *worker-process* field: writing a scheduler-only
+        # attribute from here (as the earlier code did) raised AttributeError on
+        # the no-tier store path and took the whole step's KV loads/saves down
         # with it (super().start_load_kv never ran).
         self._store_failed_no_tier: set[StateStoreOperationId] = set()
 
@@ -123,9 +121,8 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
             )
             return
         # The geometry the bytes are written under, folded into every key so a
-        # build that changed any of it cannot read another's images. Read from
-        # the runtime rather than recomputed, so there is one owner of the
-        # string and the HBM and CPU sides cannot disagree about it.
+        # changed build cannot read another's images. Read from the runtime, not
+        # recomputed, so HBM and CPU sides share one owner of the string.
         spec = getattr(getattr(backend, "model_runner", None), "state_runtime", None)
         spec = getattr(spec, "checkpoint_spec", None)
         layout_id = getattr(spec, "layout_id", None)
@@ -148,13 +145,11 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
             )
             return
 
-        # The load direction reads `state_entry_views` (validated just above);
-        # the STORE direction reads `page_unit_views`, a *different* backend
-        # method (StateByteCodec.put -> backend.page_unit_views). A backend that
-        # implements one but not the other would build the tier and pass every
-        # load, then AttributeError on the first store -- and the tier's blind
-        # `except Exception` masks it as an endlessly "failed" store. Probe the
-        # store method at construction so the mismatch fails fast and visibly.
+        # The store reads `page_unit_views`, a *different* method than the load's
+        # `state_entry_views` (validated above). A backend with one but not the
+        # other would build the tier, pass every load, then AttributeError on the
+        # first store -- which the tier's blind `except` masks as an endlessly
+        # "failed" store. Probe it here so the mismatch fails fast and visibly.
         if not callable(getattr(backend, "page_unit_views", None)):
             logger.warning(
                 "kimi_k3 offload: %s has state_entry_views but no callable "
@@ -164,12 +159,10 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
             )
             return
 
-        # The store reads the checkpoint's PAGE units and the load writes an
-        # Active Slot, so the blob has to be the same length both ways. They are
-        # equal for K3 (a checkpoint covers the whole slot), and a model where
-        # they differ would silently truncate the store or over-read the load --
-        # so it is asserted here rather than assumed, at the one point both
-        # numbers are in scope.
+        # The store reads PAGE units and the load writes an Active Slot, so the
+        # blob must be the same length both ways (equal for K3: a checkpoint
+        # covers the whole slot). A model where they differ would truncate the
+        # store or over-read the load -- checked here, where both are in scope.
         image_bytes = int(getattr(spec, "image_bytes", 0) or 0)
         if image_bytes and image_bytes != entry_bytes:
             logger.warning(
@@ -206,14 +199,11 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
             worker_id=rank,
             layout_id=layout_id,
         )
-        # ONE pool, shared with paged KV, and one `cache_policy` with it.
-        # A request writes its KV chunks and its one state object inside the
-        # same prefill window, so both enter LMCache's LRU together and cool at
-        # the same rate -- state is retired alongside its own KV, which is what
-        # we want, since a boundary whose KV is gone is worthless. Two pools
-        # would buy independent eviction policies that must drift, while a joint
-        # boundary needs both legs to survive together.
-        # `LMCACHE_MAX_LOCAL_CPU_SIZE` is the one size to tune.
+        # ONE pool, shared with paged KV. A request writes its KV chunks and its
+        # one state object in the same prefill window, so both enter LMCache's
+        # LRU together and cool at the same rate -- exactly right, since a joint
+        # boundary needs both legs to survive together and a boundary whose KV is
+        # gone is worthless. `LMCACHE_MAX_LOCAL_CPU_SIZE` is the one size to tune.
         codec.bind_storage_manager(self._engine.storage_manager)
         # No index here: StateOffloadIndex lives in the engine process; both
         # directions report and the engine applies.
@@ -237,35 +227,26 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
     def _arm_joint_loads(self, metadata) -> None:
         """Hold a request owning both legs until both report.
 
-        Both legs surface on the KV completion channel, so an id in both would
+        Both legs surface on the KV completion channel, so an unheld id would
         collapse into one wake and resume the suffix prefill while the other
         transfer is still writing.
 
-        **The two legs do not report the same identity.** The KV worker reports
-        `_load_completion_id(req)`, which is `req.load_operation` whenever the
-        scheduler issued one -- and `build_connector_meta` issues one for every
-        load, so in practice it is always the typed `LoadOperationId`. The state
-        tier is keyed by request and reports the bare id. Arming under the bare
-        id therefore parked nothing the KV leg could ever settle: `waits_for`
-        was false for the `LoadOperationId`, the KV completion passed straight
-        through, and the engine could resume the suffix prefill while the state
-        H2D was still writing the Active Slot -- silent wrong output, and a park
-        entry leaked per joint load. The park is filed under the KV identity,
-        which is also the one that has to reach the engine.
+        **The two legs report different identities.** The KV worker reports the
+        typed `LoadOperationId` (always issued for a load); the state tier the
+        bare req id. So the park is filed under the KV identity (the one that has
+        to reach the engine), with the bare id aliased onto it. Arming under the
+        bare id instead parked nothing the KV leg could settle -- it passed
+        through and the engine resumed prefill while the state H2D was still
+        writing: silent wrong output, one leaked park per joint load.
 
         **No tier is armed exactly like a tier.** An earlier guard skipped the
-        arm when `_state_tier is None`, reasoning that an unsettleable state leg
-        left the park owing the KV leg forever. But `_start_state_loads` fails
-        these loads (`_fail_state_loads` -> `settle_state(ok=False)`), and with
-        the arm in place that failure lands on a real park entry -- the pair is
-        marked failed and owes only the KV leg. `get_finished` then drains the
-        park on the no-tier path too (before its `_state_tier is None` return),
-        so the KV completion settles the pair into `failed_loading` and the
-        request recomputes. Skipping the arm instead let the KV leg pass through
-        as `finished_loading`, and `Scheduler._settle_state_load(ok=True)`
-        counted a state restore that never happened -- silent wrong output. The
-        arm is what makes the failure reportable; the drain is what keeps it
-        from leaking (the KV completion always arrives and releases the entry).
+        arm when `_state_tier is None`; but `_start_state_loads` fails these
+        loads, and only an armed park turns that failure into a real
+        `failed_loading` (recompute). Skipping it let the KV leg pass through as
+        `finished_loading`, and `Scheduler._settle_state_load(ok=True)` counted a
+        state restore that never happened -- silent wrong output. `get_finished`
+        drains the park on the no-tier path too, so the arriving KV completion
+        settles the pair and the entry cannot leak.
         """
         loads = getattr(metadata, "state_loads", None) or ()
         state_ids = {req_id for req_id, _h, _slot in loads}
@@ -284,20 +265,13 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
                     kv_id=self._load_completion_id(req),
                 )
             else:
-                # State-only load (no KV leg -- a plain HBM-index miss where the
-                # KV is resident but the recurrent state is not). Arm it too, on
+                # State-only load (KV resident, recurrent state not). Arm it on
                 # the state leg alone. Its SUCCESS already reached the engine via
-                # the _settle_joint passthrough (the tier reports the bare id and
-                # the engine waits on it), but its FAILURE did not: _fail_state_
-                # loads (including the no-tier path) settled a park that was never
-                # armed, so nothing was emitted and the request sat in
-                # WAITING_FOR_REMOTE_KVS for the life of the process --
-                # reconcile_orphan_load_slots only reclaims slots of already-
-                # deallocated seqs, it never wakes a live parked request. Arming
-                # on the state leg alone makes both outcomes land on a real entry:
-                # take_ready surfaces success into finished_loading and failure
-                # into failed_loading (recompute), under the same bare id the
-                # passthrough already used, so the engine matches it unchanged.
+                # the `_settle_joint` passthrough, but its FAILURE did not: an
+                # unarmed park emitted nothing, so the request sat in
+                # WAITING_FOR_REMOTE_KVS forever (the orphan reclaimer never wakes
+                # a live parked request). Arming makes `take_ready` surface either
+                # outcome under the same bare id the passthrough already used.
                 self._joint_park.arm(
                     req.req_id,
                     needs_kv=False,
@@ -376,22 +350,15 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
                 )
             self._store_failed_no_tier = set()
         if self._state_tier is None:
-            # Both joint and state-only loads were armed by `_arm_joint_loads`
-            # even with no tier, and `_fail_state_loads` has already failed their
-            # state leg. Drain the park here -- before the return -- with empty
-            # tier reports (the tier that would produce them never built).
-            #   * A joint load (needs_kv) now owes only the KV leg: its landed KV
-            #     completion settles the pair into `failed_loading` and the
-            #     request recomputes, instead of flowing through as
-            #     `finished_loading` and being miscounted a state restore by
-            #     `Scheduler._settle_state_load(ok=True)`. The KV completion also
-            #     releases the entry, so the arm cannot leak.
-            #   * A state-only load (no KV leg) was released the moment
-            #     `_fail_state_loads` settled its only leg, so `take_ready`
-            #     (inside `_settle_joint`) surfaces it into `failed_loading` now
-            #     and the request recomputes -- rather than sitting in
-            #     WAITING_FOR_REMOTE_KVS until an abandon window that never wakes
-            #     a live parked request.
+            # `_arm_joint_loads` armed these even with no tier and
+            # `_fail_state_loads` failed their state leg; drain the park here,
+            # before the return, with empty tier reports. A joint load then owes
+            # only the KV leg -- its arriving KV completion settles the pair into
+            # `failed_loading` (recompute) and releases the entry, instead of
+            # passing through as a miscounted state restore. A state-only load
+            # was released when its one leg failed, so `take_ready` surfaces it
+            # into `failed_loading` now rather than leaving it stuck in
+            # WAITING_FOR_REMOTE_KVS.
             out.finished_loading, out.failed_loading = self._settle_joint(
                 out.finished_loading, out.failed_loading, set(), set()
             )
@@ -401,16 +368,12 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
         out.finished_loading, out.failed_loading = self._settle_joint(
             out.finished_loading, out.failed_loading, state_done, state_failed
         )
-        # Store reports have no request identity -- by the time one lands its
-        # owner is long gone -- so they ride the connector-owned channel; the
-        # aggregator's quorum is failure-dominant, which is what resolves a
-        # partial store instead of pinning the key.
-        #
-        # The operation, not the bare hash. `KVOutputAggregator` tombstones
-        # every `(channel, operation_id)` it has taken quorum on, so a hash
-        # alone made the second store of a re-evicted prefix a duplicate: it
-        # was dropped before quorum, its pin waited for stale reclamation, and
-        # the CPU index never learned the bytes were back.
+        # Store reports have no request identity (the owner is long gone), so
+        # they ride the connector-owned channel with its failure-dominant quorum.
+        # Keyed by operation, not bare hash: `KVOutputAggregator` tombstones each
+        # `(channel, operation_id)` it takes quorum on, so a bare hash made the
+        # second store of a re-evicted prefix a dropped duplicate -- its pin
+        # waited for stale reclamation and the CPU index never learned it was back.
         for op in indexed:
             out.connector_completions.add(
                 ConnectorCompletion(STATE_INDEX_CHANNEL, op, True)
@@ -599,17 +562,15 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler):
     def should_defer_free(self, seq) -> bool:
         """Pure query: base behaviour, plus the stall escape.
 
-        An active load is checked *first*: the base holds blocks while a load is
-        still reading/writing them, and the escape must not override that -- a
-        stalled-save request can still have a live load into the same table, and
-        releasing mid-load is free-while-writing corruption.
+        An active load is checked *first*: the escape must not override the base
+        holding blocks under a live load, or releasing mid-load is
+        free-while-writing corruption (a stalled-save request can still have one).
 
-        This is a predicate only. `_is_preemptable`/`_maybe_release_deferred`
-        probe it, so it must not mutate. The `_save_tracker` cleanup the escape
-        needs on the preempt free (`block_manager.deallocate`, no
-        `request_finished`) is done by `release_stalled_save`, which the
-        scheduler calls at that free; the finished path pops the tracker in
-        `request_finished` (its `not should_defer_free` guard reads False here).
+        Predicate only -- `_is_preemptable`/`_maybe_release_deferred` probe it, so
+        it must not mutate. The `_save_tracker` cleanup the escape needs on the
+        preempt free is done by `release_stalled_save`; the finished path pops
+        the tracker in `request_finished` (its `not should_defer_free` guard
+        reads False here).
         """
         if self._has_active_load(seq):
             return True
@@ -622,14 +583,12 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler):
 
         The mutator half of the escape in `should_defer_free`. The scheduler
         calls this at `preempt`'s `block_manager.deallocate`, which runs no
-        `request_finished`, so nothing else removes this sid from
-        `_save_tracker`. Left in, the base save loop would later (once the stall
-        clears and `_may_emit_save` re-opens) emit a save reading a now-freed,
-        possibly-reused `seq.block_table`: silent cross-prefix corruption. The
-        loop does not re-check liveness, so the entry has to go the moment its
-        blocks are surrendered. Dropping the save is the intended outcome (this
-        request's KV goes un-offloaded rather than wedging the engine); guarded
-        by the same escape predicate so a non-stalled save is never dropped.
+        `request_finished`, so nothing else removes this sid. Left in, the save
+        loop would later (once the stall clears) emit a save reading a now-freed,
+        possibly-reused `block_table` -- silent cross-prefix corruption, as the
+        loop does not re-check liveness. Dropping the save is intended (this KV
+        goes un-offloaded rather than wedging the engine); guarded by the same
+        escape predicate so a non-stalled save is never dropped.
         """
         if self._save_is_stall_escaped(seq):
             self._save_tracker.pop(str(seq.id), None)
@@ -654,16 +613,12 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler):
         joint = int(getattr(seq, "state_joint_boundary_tokens", 0) or 0)
         if joint <= hbm:
             return False, "per_req_cache_state_boundary", hbm, lmc, lmc - hbm, chunk
-        # Where the transfer starts, which is NOT where the request may call
-        # itself cached. `allocate` claimed every block the prefix walk matched,
-        # not just the resumable ones, so the KV below this is already in the
-        # pool and asking LMCache to send it back would move bytes the GPU
-        # holds -- and land a second copy of them in HBM, since
-        # `publish_loaded_prefix` keeps the existing canonical mapping and the
-        # freshly written blocks stay private to this request.
-        #
-        # `state_joint_claim_tokens` is floored to the chunk grid by
-        # `_joint_kv_boundary`, so this start is aligned whenever `hbm` was.
+        # Where the transfer starts -- NOT where the request may call itself
+        # cached. `allocate` claimed every matched block, not just resumable
+        # ones, so the KV below this is already resident; asking LMCache to
+        # resend it would land a second copy in HBM (`publish_loaded_prefix`
+        # keeps the canonical mapping, fresh blocks stay private). Floored to the
+        # chunk grid by `_joint_kv_boundary`, so aligned whenever `hbm` was.
         start = max(hbm, int(getattr(seq, "state_joint_claim_tokens", 0) or 0))
         # The KV leg moves whole chunks and the blocks below `start` are shared,
         # so an unaligned start cannot be rounded down.

@@ -1,15 +1,13 @@
 # SPDX-License-Identifier: MIT
 """Worker-side store and load driver for the state offload tier.
 
-One executor of its own, separate from the KV connector's, so state and KV
-transfers cannot block each other -- but a single one shared by this tier's own
-stores and loads; see `submit_load`.
+Its own executors, separate from the KV connector's, so state and KV transfers
+cannot block each other; see `__init__` for the store/load lane split.
 
-This class **reports, and the engine applies**. `StateOffloadIndex` lives in the
-engine process, so nothing here can index a hash directly: `take_store_reports`
-and `get_finished` hand their sets to the connector. The failed-hash set exists
-to resolve the aggregator's quorum -- without it a partial store pins the hash
-forever.
+This class **reports, and the engine applies**: `StateOffloadIndex` lives in the
+engine process, so `take_store_reports`/`get_finished` hand their sets to the
+connector rather than index a hash here. The failed-hash set resolves the
+aggregator's quorum -- without it a partial store pins the hash forever.
 """
 
 import logging
@@ -36,43 +34,37 @@ class StateOffloadTier:
     def __init__(self, codec, *, max_workers: int = 1, staging_lanes: int = 2) -> None:
         self.codec = codec
         # Two lanes, not one queue. A load is on the TTFT critical path and a
-        # store is not, but a single serial executor made that ordering
-        # unenforceable: a load submitted in a later scheduler step queued
-        # behind every store already sitting in front of it, and one store
-        # stuck in gather/D2H blocked every later load for as long as it ran.
-        # Putting same-step loads first in the submit order does not help --
-        # it cannot overtake work already queued.
+        # store is not; a single serial executor made that unenforceable -- a
+        # later-step load queued behind every store in front of it, and one
+        # store stuck in gather/D2H blocked every later load. Submit order
+        # cannot overtake work already queued.
         self._load_executor = ThreadPoolExecutor(
             max_workers=max_workers, thread_name_prefix="lmc-state-load"
         )
         self._store_executor = ThreadPoolExecutor(
             max_workers=max_workers, thread_name_prefix="lmc-state-store"
         )
-        # What the lanes share is HBM, not a queue. `StagedTransfer` keeps its
-        # staging buffer in `threading.local` and sizes it to a whole entry
-        # (~55 MiB on K3), so each lane inside a transfer holds one. The
+        # What the lanes share is HBM, not a queue. `StagedTransfer` keeps a
+        # per-thread staging buffer sized to a whole entry (~55 MiB on K3). The
         # budget is stated here rather than left implicit in the thread count:
-        # 2 gives each lane its own buffer, so a load never waits on a store at
-        # all; 1 makes them share one, halving the standing HBM at the cost of
-        # a load waiting out the single in-flight store. Either way a load
-        # never queues behind a *backlog* of stores, which is the actual
-        # head-of-line problem.
+        # 2 gives each lane its own buffer (a load never waits on a store); 1
+        # shares one, halving standing HBM at the cost of a load waiting out the
+        # single in-flight store. Either way a load never queues behind a
+        # *backlog* of stores, which is the actual head-of-line problem.
         self._staging_budget = threading.BoundedSemaphore(max(1, int(staging_lanes)))
         self._lock = threading.Lock()
         self._done: set[str] = set()
         self._failed: set[str] = set()
         self._inflight: set = set()
-        # The store path's reports, drained by `take_store_reports`. Sets of
-        # `StateStoreOperationId`, not of bare hashes: the engine settles the
-        # pin for that exact generation, and the aggregator would tombstone a
-        # bare hash after the first store of it.
+        # Store reports, drained by `take_store_reports`. Sets of
+        # `StateStoreOperationId`, not bare hashes: the engine settles the pin
+        # for that exact generation, and the aggregator would tombstone a bare
+        # hash after its first store.
         #
-        # `_source_released` is a separate report from `_indexed` because the
-        # two answer different questions and land at different times. The
-        # source is the KV pool's PAGE units and is free the instant the D2H
-        # drains; whether the CPU put succeeded is decided afterwards and
-        # cannot touch them. Reporting only the second would hold an image out
-        # of the pool across an operation that does not need it.
+        # `_source_released` is separate from `_indexed`: the source units are
+        # free the instant the D2H drains, while whether the CPU put succeeded
+        # is decided afterwards and cannot touch them. Reporting only the second
+        # would hold an image out of the pool across a CPU-only operation.
         self._source_released: set = set()
         self._indexed: set = set()
         self._index_failed: set = set()
@@ -159,15 +151,12 @@ class StateOffloadTier:
         released = False
 
         def _source_released() -> None:
-            # Fires from `codec.put` the moment `pack`'s gather+D2H have
-            # drained (state_object.put), before `batched_put`. Publish the
-            # release *here*, early: the PAGE units are the KV pool's and the
-            # GPU has stopped reading them, so hand them back now instead of
-            # holding a whole image out of the pool across the CPU put. Under
-            # `self._lock` because `take_source_releases` drains the set from
-            # the engine thread; the flag makes the end-of-store backstop a
-            # no-op so the release is emitted exactly once (a second emission
-            # would double-unpin on the engine side).
+            # Fires from `codec.put` once `pack`'s gather+D2H drain, before
+            # `batched_put`: the GPU has stopped reading the units, so hand them
+            # back now instead of holding a whole image out of the pool across
+            # the CPU put. Under `self._lock` (the engine thread drains the set);
+            # the flag makes the end-of-store backstop a no-op so the release is
+            # emitted once -- a second emission would double-unpin engine-side.
             nonlocal released
             with self._lock:
                 if released:
@@ -184,11 +173,11 @@ class StateOffloadTier:
                         on_source_released=_source_released,
                     )
                 )
-        except Exception:  # deliberately blind, see below
-            # Deliberately blind. `codec.put` reaches into LMCache, whose
-            # failure modes are its own, and a store that cannot happen must
-            # cost one checkpoint's CPU copy -- not this worker thread, whose
-            # death would strand every request parked on a later load.
+        except Exception:  # deliberately blind
+            # `codec.put` reaches into LMCache, whose failure modes are its own.
+            # A store that cannot happen must cost one checkpoint's CPU copy --
+            # not this worker thread, whose death would strand every request
+            # parked on a later load.
             logger.warning(
                 "state offload: store of hash %d (generation %d) failed",
                 op.prefix_hash,
@@ -196,28 +185,25 @@ class StateOffloadTier:
                 exc_info=True,
             )
         with self._lock:
-            # Backstop, not the primary path: on success the D2H callback above
-            # already published the release early, so this must NOT add it again
-            # -- a second emission across two engine drains is the double-unpin.
-            # It still fires on the paths the callback never reached: a refused
-            # allocation never read the units, and a throwing `pack` drained the
-            # device before it propagated (`StagedTransfer._drain_device`), so
-            # the GPU has stopped reading them there too. Withholding it on those
-            # paths would hold an image out of the KV pool until the stale
-            # reclaimer noticed.
+            # Backstop, not the primary path: on success the callback already
+            # published the release, so this must NOT re-add it (that second
+            # emission is the double-unpin). It fires only on paths the callback
+            # never reached -- a refused allocation never read the units, and a
+            # throwing `pack` drained the device first
+            # (`StagedTransfer._drain_device`) -- where withholding it would hold
+            # an image out of the pool until the stale reclaimer noticed.
             self._store_submitted_at.pop(op, None)
             if not released:
                 released = True
                 self._source_released.add(op)
             # Report, never apply: `StateOffloadIndex` lives in the engine
-            # process and this runs in a spawned runner. The engine applies
-            # these via KVConnectorOutput.
+            # process; the engine applies these via KVConnectorOutput.
             if stored:
                 self._indexed.add(op)
             else:
                 # The failure channel lets the aggregator take quorum on
-                # `indexed | index_failed` instead of waiting for a second
-                # report that will never come from this rank.
+                # `indexed | index_failed` rather than await a second report
+                # that will never come from this rank.
                 self._index_failed.add(op)
 
     def take_store_reports(self) -> tuple[set, set]:
@@ -296,12 +282,10 @@ class _JointPark:
         self._failed: set = set()
         self._ready: set = set()
         self._ready_failed: set = set()
-        # The two legs do not report the same identity. The KV leg reports
-        # whatever `_load_completion_id` yields -- a typed `LoadOperationId`
-        # whenever the scheduler issued one, which for an offload load is
-        # always -- while the state tier is keyed by request and reports the
-        # bare id. The park is filed under the KV identity, because that is
-        # what has to reach the engine on `finished_loading`; this maps the
+        # The two legs report different identities: the KV leg reports its typed
+        # `LoadOperationId` (always issued for an offload load), the state tier
+        # the bare request id. The park is filed under the KV identity -- that
+        # is what reaches the engine on `finished_loading` -- and this maps the
         # bare id onto it so a state report can find its own park.
         self._alias: dict = {}
         self._alias_of: dict = {}
