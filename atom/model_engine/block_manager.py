@@ -735,6 +735,23 @@ class BlockManager:
         # only into blocks below it that nobody else can be reading.
         claim_tokens = ((claim_blocks * hbs) // chunk) * chunk
         seq.state_joint_claim_tokens = max(claim_tokens, hbm_boundary * hbs)
+        # `allocate` claims the boundary in whole hash blocks --
+        # `state_joint_claim_tokens // hbs` -- but the value above is floored to
+        # the *chunk* grid, not the hash-block grid. When `hbs` does not divide
+        # `chunk`, a chunk-aligned claim is not hash-block-aligned: the floor
+        # drops the `[floor(claim_tokens/hbs)*hbs, claim_tokens)` tail into a
+        # fresh, unfilled block that `num_cached_tokens` (raised to the boundary
+        # once the KV leg lands) then counts as computed -- silent wrong output,
+        # with no exception. It is invisible whenever `hbs | chunk`, which is the
+        # shipping case (`block_size * dcp_world_size == LMCACHE_CHUNK_SIZE`), so
+        # it only surfaces at DCP world sizes that take `hbs` off the chunk grid.
+        # Refuse the joint and recompute the tail rather than resume over a gap.
+        if seq.state_joint_claim_tokens % hbs != 0:
+            seq.state_joint_boundary_tokens = 0
+            seq.state_joint_boundary_hash = -1
+            seq.state_joint_kv_tokens = 0
+            seq.state_joint_claim_tokens = 0
+            return self._no_joint("claim_off_hash_grid", record)
         if record:
             self.joint_boundaries += 1
             # Which tier the STATE leg came from. The KV leg's own tier is
