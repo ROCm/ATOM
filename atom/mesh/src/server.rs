@@ -61,6 +61,20 @@ pub struct AppState {
     pub router_manager: Option<Arc<RouterManager>>,
 }
 
+fn atom_standalone_router(state: &AppState) -> Option<Arc<dyn RouterTrait>> {
+    if state
+        .router
+        .as_any()
+        .is::<crate::routers::atom_standalone::AtomStandaloneRouter>()
+    {
+        return Some(state.router.clone());
+    }
+    state
+        .router_manager
+        .as_ref()
+        .and_then(|manager| manager.atom_standalone_router())
+}
+
 fn configured_worker_urls(config: &RouterConfig) -> Vec<String> {
     match &config.mode {
         RoutingMode::Regular { worker_urls } => worker_urls.clone(),
@@ -313,15 +327,76 @@ async fn v1_conversations_delete_item(
 }
 
 async fn flush_cache(State(state): State<Arc<AppState>>, _req: Request) -> Response {
+    let standalone_router = atom_standalone_router(&state);
+    if let Some(router) = standalone_router.as_ref().and_then(|router| {
+        router
+            .as_any()
+            .downcast_ref::<crate::routers::atom_standalone::AtomStandaloneRouter>()
+    }) {
+        return match router.flush_engine_cache().await {
+            Ok(()) => (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))).into_response(),
+            Err(error) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": error})),
+            )
+                .into_response(),
+        };
+    }
     WorkerManager::flush_cache_all(&state.context.worker_registry, &state.context.client)
         .await
         .into_response()
 }
 
 async fn get_loads(State(state): State<Arc<AppState>>, _req: Request) -> Response {
+    let standalone_router = atom_standalone_router(&state);
+    if let Some(router) = standalone_router.as_ref().and_then(|router| {
+        router
+            .as_any()
+            .downcast_ref::<crate::routers::atom_standalone::AtomStandaloneRouter>()
+    }) {
+        return match router.engine_loads() {
+            Some(loads) => (StatusCode::OK, Json(loads)).into_response(),
+            None => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
+    }
     WorkerManager::get_all_worker_loads(&state.context.worker_registry, &state.context.client)
         .await
         .into_response()
+}
+
+async fn engine_utility(state: &Arc<AppState>, command: &'static str) -> Response {
+    let standalone_router = atom_standalone_router(state);
+    let Some(router) = standalone_router.as_ref().and_then(|router| {
+        router
+            .as_any()
+            .downcast_ref::<crate::routers::atom_standalone::AtomStandaloneRouter>()
+    }) else {
+        return StatusCode::NOT_IMPLEMENTED.into_response();
+    };
+    match router.execute_engine_utility(command).await {
+        Ok(result) => Json(result).into_response(),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": error})),
+        )
+            .into_response(),
+    }
+}
+
+async fn start_profile(State(state): State<Arc<AppState>>) -> Response {
+    engine_utility(&state, "start_profile").await
+}
+
+async fn stop_profile(State(state): State<Arc<AppState>>) -> Response {
+    engine_utility(&state, "stop_profile").await
+}
+
+async fn cache_statistics(State(state): State<Arc<AppState>>) -> Response {
+    engine_utility(&state, "get_cache_statistics").await
+}
+
+async fn mtp_statistics(State(state): State<Arc<AppState>>) -> Response {
+    engine_utility(&state, "get_mtp_statistics").await
 }
 
 async fn create_worker(
@@ -504,6 +579,10 @@ pub fn build_app(
     let admin_routes = Router::new()
         .route("/flush_cache", post(flush_cache))
         .route("/get_loads", get(get_loads))
+        .route("/start_profile", post(start_profile))
+        .route("/stop_profile", post(stop_profile))
+        .route("/debug/cache_stats", get(cache_statistics))
+        .route("/debug/mtp_stats", get(mtp_statistics))
         .route("/parse/function_call", post(parse_function_call))
         .route("/parse/reasoning", post(parse_reasoning))
         // Tokenizer management endpoints
@@ -622,6 +701,15 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.router_config.health_check.timeout_secs
     );
 
+    // Rust already owns live EngineCore output sockets at this point. Create the
+    // standalone client before tokenizer loading so metrics and failure frames
+    // are drained while that potentially long startup job runs.
+    let early_router_manager = if config.router_config.atom_standalone {
+        Some(RouterManager::from_config(&config, &app_context).await?)
+    } else {
+        None
+    };
+
     // Submit startup tokenizer job if tokenizer path is configured
     // This runs before worker initialization to ensure tokenizer is available
     if let Some(tokenizer_source) = config
@@ -645,6 +733,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             cache_config: config.router_config.tokenizer_cache.to_option(),
             fail_on_duplicate: false,
         };
+        let tokenizer_id = tokenizer_config.id.clone();
 
         let job = Job::AddTokenizer {
             config: Box::new(tokenizer_config),
@@ -655,7 +744,39 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             .await
             .map_err(|e| format!("Failed to submit startup tokenizer job: {}", e))?;
 
-        info!("Startup tokenizer job submitted (will complete in background)");
+        let tokenizer_deadline = tokio::time::Instant::now() + Duration::from_secs(600);
+        loop {
+            if app_context
+                .tokenizer_registry
+                .get_by_id(&tokenizer_id)
+                .is_some()
+                || app_context
+                    .tokenizer_registry
+                    .get_by_name(tokenizer_source)
+                    .is_some()
+            {
+                info!("Startup tokenizer loaded and ready: {}", tokenizer_source);
+                break;
+            }
+            if let Some(status) = job_queue.get_status(&tokenizer_id) {
+                if status.status == "failed" {
+                    return Err(status
+                        .message
+                        .unwrap_or_else(|| {
+                            format!("Startup tokenizer '{}' failed to load", tokenizer_source)
+                        })
+                        .into());
+                }
+            }
+            if tokio::time::Instant::now() >= tokenizer_deadline {
+                return Err(format!(
+                    "Timed out waiting for startup tokenizer '{}' after 600s",
+                    tokenizer_source
+                )
+                .into());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     info!(
@@ -721,7 +842,10 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         worker_stats.total_workers, worker_stats.healthy_workers
     );
 
-    let router_manager = RouterManager::from_config(&config, &app_context).await?;
+    let router_manager = match early_router_manager {
+        Some(manager) => manager,
+        None => RouterManager::from_config(&config, &app_context).await?,
+    };
     let router: Arc<dyn RouterTrait> = router_manager.clone();
 
     if !config.router_config.health_check.disable_health_check {

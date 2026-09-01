@@ -10,7 +10,7 @@ import os
 import queue
 import weakref
 from dataclasses import dataclass
-from threading import Lock, Thread
+from threading import Event, Lock, Thread, current_thread
 
 import zmq
 import zmq.asyncio
@@ -55,6 +55,23 @@ class InternodeDPSocketPlan:
     control_port: int
 
 
+def validate_rust_owned_engine_core_config(config: Config) -> None:
+    """Reject topology modes the Rust-owned transport cannot represent."""
+    if config.pipeline_parallel_size != 1:
+        raise ValueError(
+            "Rust-owned EngineCore transport requires pipeline_parallel_size=1"
+        )
+    if config.parallel_config.is_multinode_dp:
+        raise ValueError("Rust-owned EngineCore transport does not support multi-node DP")
+    if config.enable_dp_attention and config.fake_eplb:
+        raise ValueError(
+            "Rust-owned EngineCore transport does not support simulated "
+            "DP attention with fake_eplb"
+        )
+    if config.enable_rapidserve:
+        raise ValueError("Rust-owned EngineCore transport does not support rapidserve")
+
+
 def build_internode_dp_socket_plan(
     *, engine_count: int, master_port: int
 ) -> list[InternodeDPSocketPlan]:
@@ -76,6 +93,29 @@ def build_internode_dp_socket_plan(
             control_port=base + rank * INTERNODE_DP_PORTS_PER_ENGINE + 2,
         )
         for rank in range(engine_count)
+    ]
+
+
+def plan_rust_owned_engine_core_endpoints(
+    config: Config,
+    dp_ranks: list[int] | None = None,
+) -> list[dict[str, int | str]]:
+    """Allocate the normal EngineCore addresses for a Rust-owned frontend.
+
+    Python remains the only address planner. Rust binds these exact addresses
+    before the existing EngineCore processes connect to them.
+    """
+    validate_rust_owned_engine_core_config(config)
+    if dp_ranks is None:
+        dp_ranks = [dp_rank for dp_rank, _ in iter_dp_rank_assignments(config)]
+    return [
+        {
+            "dp_rank": dp_rank,
+            "input_address": get_open_zmq_ipc_path(),
+            "control_address": get_open_zmq_ipc_path(),
+            "output_address": get_open_zmq_ipc_path(),
+        }
+        for dp_rank in dp_ranks
     ]
 
 
@@ -177,6 +217,9 @@ class CoreManager:
         """
         self.label = label
         self._closed = False  # Track whether already closed
+        if not hasattr(self, "external_transport_mode"):
+            self.external_transport_mode = False
+            self.external_transport_owner = None
         self.local_engine_count = local_engine_count
         self.global_engine_count = (
             local_engine_count if global_engine_count is None else global_engine_count
@@ -195,6 +238,9 @@ class CoreManager:
         # is only safe to admit if it fits wherever the router sends it.
         self.max_pool_tokens: int | None = None
         self.engine_core_processes = []
+        self._engine_core_dp_ranks: list[int] = []
+        self._external_process_monitor_stop = Event()
+        self._external_process_monitor_thread: Thread | None = None
         self.input_sockets = []
         self.output_sockets = []
         self.engine_core_identities = []
@@ -258,16 +304,26 @@ class CoreManager:
         self.control_sockets = []
         self.control_identities = []
         self._control_send_lock = Lock()
+        self._external_utility_lock = Lock()
         # dp_rank -> newest metrics snapshot, refreshed by the output threads
         # from EngineCore's own periodic push. Read directly by the exporter, so
         # scraping costs no round trip and cannot time out.
         self.latest_metrics: dict[int, dict] = {}
 
-    def __init__(self, config: Config):
+    def __init__(
+        self,
+        config: Config,
+        external_transport_factory=None,
+    ):
+        self.external_transport_mode = external_transport_factory is not None
+        self.external_transport_owner = None
+        self.external_engine_core_endpoints = None
         pp_size = config.pipeline_parallel_size
         self.pp_size = pp_size
         pc = config.parallel_config
         multinode = pc.is_multinode_dp
+        if self.external_transport_mode:
+            validate_rust_owned_engine_core_config(config)
         if multinode and pp_size > 1:
             raise ValueError(
                 "Multi-node data parallelism combined with pipeline "
@@ -304,6 +360,26 @@ class CoreManager:
             if not config.enable_dp_attention
             else config.parallel_config.data_parallel_size
         )
+        spawned_rank_assignments = rank_assignments[:local_engine_count]
+        external_endpoints_by_rank = None
+        if self.external_transport_mode:
+            spawned_dp_ranks = [
+                dp_rank for dp_rank, _local_dp_rank in spawned_rank_assignments
+            ]
+            self.external_engine_core_endpoints = (
+                plan_rust_owned_engine_core_endpoints(config, spawned_dp_ranks)
+            )
+            external_endpoints_by_rank = {
+                int(endpoint["dp_rank"]): endpoint
+                for endpoint in self.external_engine_core_endpoints
+            }
+            expected_ranks = set(spawned_dp_ranks)
+            if set(external_endpoints_by_rank) != expected_ranks:
+                raise ValueError(
+                    "Rust-owned EngineCore endpoint ranks must exactly match spawned "
+                    f"EngineCore ranks: expected {sorted(expected_ranks)}, got "
+                    f"{sorted(external_endpoints_by_rank)}"
+                )
         # Global DP rank 0's node owns the router; the others only host engines.
         self.is_coordinator = not multinode or pc.data_parallel_rank == 0
         socket_plan = (
@@ -343,6 +419,28 @@ class CoreManager:
         local_dp_ranks = []
 
         try:
+            if self.external_transport_mode:
+                # Bind before creating or starting any child. DEALER can reconnect
+                # to a late ROUTER, but making the Rust frontend ready first keeps
+                # startup deterministic and leaves no child waiting if bind fails.
+                speculative_config = config.speculative_config
+                num_draft_tokens = (
+                    int(speculative_config.num_speculative_tokens or 0)
+                    if speculative_config is not None
+                    else 0
+                )
+                self.external_transport_owner = external_transport_factory(
+                    self.external_engine_core_endpoints,
+                    config.kv_cache_block_size,
+                    max_model_len=config.max_model_len,
+                    dp_load_balance=config.dp_load_balance,
+                    dp_lb_request_equivalent=envs.ATOM_DP_LB_REQ_EQUIV,
+                    num_draft_tokens=num_draft_tokens,
+                    has_per_req_cache=config.has_per_req_cache,
+                    session_affinity_enabled=envs.ATOM_DP_SESSION_AFFINITY,
+                    dp_attention_enabled=config.enable_dp_attention,
+                )
+
             for engine_index in range(self.local_engine_count):
                 assignment_index = engine_index // self.pp_size
                 dp_rank, local_dp_rank = rank_assignments[assignment_index]
@@ -367,7 +465,9 @@ class CoreManager:
                         self.pp_kv_status_addr
                     )
 
-                if socket_plan is not None:
+                if external_endpoints_by_rank is not None:
+                    engine_addresses = external_endpoints_by_rank[dp_rank]
+                elif socket_plan is not None:
                     plan = socket_plan[dp_rank]
                     ip = config.parallel_config.data_parallel_master_ip
                     engine_addresses = {
@@ -406,6 +506,7 @@ class CoreManager:
                     )
                     info["process"].start()
                     self.engine_core_processes.append(info["process"])
+                    self._engine_core_dp_ranks.append(dp_rank)
 
                 if not self.is_coordinator:
                     # A worker node hosts engines but owns no router: the
@@ -426,7 +527,23 @@ class CoreManager:
                         proc.join()
                     return
 
-                if socket_plan is not None:
+                if external_endpoints_by_rank is not None:
+                    logger.info(
+                        "%s: Rust owns the EngineCore sockets for DP ranks %s",
+                        self.label,
+                        sorted(external_endpoints_by_rank),
+                    )
+                    self.external_transport_owner.wait_until_all_connected()
+                    ready_capacities = (
+                        self.external_transport_owner.wait_until_all_ready()
+                    )
+                    capacities = [
+                        capacity
+                        for _rank, capacity in ready_capacities
+                        if capacity is not None
+                    ]
+                    self.max_pool_tokens = min(capacities) if capacities else None
+                elif socket_plan is not None:
                     bind_addresses = [
                         {
                             "input_address": f"tcp://0.0.0.0:{p.input_port}",
@@ -438,47 +555,45 @@ class CoreManager:
                 else:
                     bind_addresses = [info["addresses"] for info in processes_info]
 
-                for addresses in bind_addresses:
-                    input_socket = make_zmq_socket(
-                        self.ctx, addresses["input_address"], zmq.ROUTER, bind=True
-                    )
-                    identity, _ = input_socket.recv_multipart()
-                    self.input_sockets.append(input_socket)
-                    self.engine_core_identities.append(identity)
+                if external_endpoints_by_rank is None:
+                    for addresses in bind_addresses:
+                        input_socket = make_zmq_socket(
+                            self.ctx, addresses["input_address"], zmq.ROUTER, bind=True
+                        )
+                        identity, _ = input_socket.recv_multipart()
+                        self.input_sockets.append(input_socket)
+                        self.engine_core_identities.append(identity)
 
-                    control_socket = make_zmq_socket(
-                        self.ctx, addresses["control_address"], zmq.ROUTER, bind=True
-                    )
-                    control_identity, _ = control_socket.recv_multipart()
-                    self.control_sockets.append(control_socket)
-                    self.control_identities.append(control_identity)
+                        control_socket = make_zmq_socket(
+                            self.ctx, addresses["control_address"], zmq.ROUTER, bind=True
+                        )
+                        control_identity, _ = control_socket.recv_multipart()
+                        self.control_sockets.append(control_socket)
+                        self.control_identities.append(control_identity)
 
-                    # PULL always binds; the engine's PUSH always connects.
-                    # True for ipc:// and tcp:// alike -- the transport
-                    # difference is carried by the address (the engine gets
-                    # tcp://<master_ip>:port, we bind tcp://0.0.0.0:port).
-                    output_socket = make_zmq_socket(
-                        self.ctx,
-                        addresses["output_address"],
-                        zmq.PULL,
-                        bind=True,
-                    )
-                    self.output_sockets.append(output_socket)
-                    self.shutdown_paths.append(get_open_zmq_inproc_path())
+                        # PULL always binds; the engine's PUSH always connects.
+                        output_socket = make_zmq_socket(
+                            self.ctx,
+                            addresses["output_address"],
+                            zmq.PULL,
+                            bind=True,
+                        )
+                        self.output_sockets.append(output_socket)
+                        self.shutdown_paths.append(get_open_zmq_inproc_path())
 
-                self._wait_for_all_ready_signals()
-                logger.info(
-                    f"{self.label}: All EngineCores are fully initialized and ready"
-                )
-
-                for dp_rank in range(len(self.output_sockets)):
-                    output_thread = self._create_output_thread(
-                        dp_rank,
-                        self.output_sockets[dp_rank],
-                        self.shutdown_paths[dp_rank],
+                    self._wait_for_all_ready_signals()
+                    logger.info(
+                        f"{self.label}: All EngineCores are fully initialized and ready"
                     )
-                    output_thread.start()
-                    self.output_threads.append(output_thread)
+
+                    for dp_rank in range(len(self.output_sockets)):
+                        output_thread = self._create_output_thread(
+                            dp_rank,
+                            self.output_sockets[dp_rank],
+                            self.shutdown_paths[dp_rank],
+                        )
+                        output_thread.start()
+                        self.output_threads.append(output_thread)
 
             finally:
                 # A worker node reaches this `finally` via its normal early
@@ -499,9 +614,17 @@ class CoreManager:
             self.close()
             raise
 
-        logger.info(
-            f"{self.label}: All {len(self.output_sockets)} EngineCores initialized and ready"
-        )
+        if external_endpoints_by_rank is None:
+            logger.info(
+                f"{self.label}: All {len(self.output_sockets)} EngineCores "
+                "initialized and ready"
+            )
+        else:
+            logger.info(
+                f"{self.label}: All {len(self.engine_core_processes)} EngineCores "
+                "connected and ready through the Rust transport"
+            )
+            self._start_external_process_monitor()
         self._finalizer = weakref.finalize(self, self.close)
         self.async_output_queue = asyncio.Queue() if config.asyncio_mode else None
         self._output_handler_task = None
@@ -608,9 +731,16 @@ class CoreManager:
                         self._shutdown_engine_core_rank(dp_rank)
                         break
                     elif payload_type == "stream":
-                        stream_outputs = EngineCoreIpcCodec.decode_stream(
-                            envelope.stream
-                        )
+                        try:
+                            stream_outputs = EngineCoreIpcCodec.decode_stream(
+                                envelope.stream
+                            )
+                        except Exception:
+                            logger.exception(
+                                f"{self.label} (DP {dp_rank}): dropping malformed "
+                                "STREAM payload"
+                            )
+                            continue
                         logger.debug(
                             f"{self.label}: Received STREAM message with {len(stream_outputs)} outputs"
                         )
@@ -758,6 +888,11 @@ class CoreManager:
             await self.async_output_queue.put(seqs)
 
     async def get_output_async(self) -> list[Sequence]:
+        if self.external_transport_mode:
+            raise RuntimeError(
+                "Python CoreManager output consumption is disabled because Rust owns "
+                "the EngineCore transport"
+            )
         if not self.async_output_queue:
             raise RuntimeError("Engine async mode not enabled")
 
@@ -773,10 +908,24 @@ class CoreManager:
         if self._closed:
             return
         self._closed = True
+        self._external_process_monitor_stop.set()
+        monitor = self._external_process_monitor_thread
+        if monitor is not None and monitor is not current_thread():
+            monitor.join(timeout=1)
 
         logger.info(
-            f"{self.label}: Shutting down {len(self.input_sockets)} EngineCores"
+            f"{self.label}: Shutting down {self.local_engine_count} EngineCores"
         )
+
+        if self.external_transport_owner is not None:
+            try:
+                self.external_transport_owner.shutdown_engine_cores()
+            except Exception as e:  # noqa: BLE001 - process cleanup must continue
+                logger.warning(
+                    "%s: Rust transport shutdown failed; falling back to process cleanup: %s",
+                    self.label,
+                    e,
+                )
 
         for dp_rank in range(len(self.input_sockets)):
             self._shutdown_engine_core_rank(dp_rank)
@@ -836,6 +985,45 @@ class CoreManager:
 
         logger.info(f"{self.label}: All EngineCores shut down")
 
+    def _start_external_process_monitor(self) -> None:
+        """Report child exits to Rust, whose ZMQ sockets cannot detect idle peers."""
+        if not self.external_transport_mode or self._external_process_monitor_thread:
+            return
+
+        def monitor_processes() -> None:
+            reported: set[int] = set()
+            while not self._external_process_monitor_stop.wait(0.2):
+                for dp_rank, process in zip(
+                    self._engine_core_dp_ranks, self.engine_core_processes
+                ):
+                    if dp_rank in reported or process.exitcode is None:
+                        continue
+                    try:
+                        self.external_transport_owner.mark_rank_failed(
+                            dp_rank,
+                            f"EngineCore process exited with code {process.exitcode}",
+                        )
+                    except RuntimeError:
+                        # Router construction installs the active Rust client after
+                        # CoreManager returns. Retry until that handoff completes.
+                        continue
+                    except Exception as error:  # noqa: BLE001 - monitor must survive
+                        logger.warning(
+                            "%s: failed to report DP rank %d process exit: %s",
+                            self.label,
+                            dp_rank,
+                            error,
+                        )
+                        continue
+                    reported.add(dp_rank)
+
+        self._external_process_monitor_thread = Thread(
+            target=monitor_processes,
+            name="EngineCoreExternalProcessMonitor",
+            daemon=True,
+        )
+        self._external_process_monitor_thread.start()
+
     def _send_request(self, dp_rank: int, payload: bytes) -> None:
         """Send one encoded request to an engine core. Hot path.
 
@@ -871,6 +1059,11 @@ class CoreManager:
             )
 
     def add_request(self, seqs: list[Sequence]):
+        if self.external_transport_mode:
+            raise RuntimeError(
+                "Python CoreManager request submission is disabled because Rust owns "
+                "the EngineCore transport"
+            )
         logger.debug(
             f"{self.label}: Add request, sequence ids: {[seq.id for seq in seqs]}"
         )
@@ -1301,6 +1494,16 @@ class CoreManager:
             self._dp_session_prompt_tokens.clear()
 
     def send_utility_command(self, cmd: str, dp_rank: int | None = None):
+        if self.external_transport_mode:
+            payload = EngineCoreIpcCodec.encode_utility_command({"cmd": cmd})
+            if dp_rank is None:
+                self.external_transport_owner.execute_control_frame_all(
+                    payload,
+                    self.global_engine_count,
+                )
+            else:
+                self.external_transport_owner.send_control_frame(dp_rank, payload)
+            return
         if dp_rank is None:
             # Send to all DP ranks
             for rank in range(len(self.control_sockets)):
@@ -1338,6 +1541,19 @@ class CoreManager:
         payload = {"cmd": cmd, **kwargs}
         # Serialize once and reuse for all ranks.
         serialized_payload = EngineCoreIpcCodec.encode_utility_command(payload)
+        if self.external_transport_mode:
+            if cmd == "abort_request":
+                # EngineCore intentionally emits no stored response for abort.
+                self.external_transport_owner.broadcast_control_frame(serialized_payload)
+            else:
+                # Other utility commands do respond. Execute and drain them under
+                # Rust's shared utility lock so a later command cannot consume
+                # these frames as its own.
+                self.external_transport_owner.execute_control_frame_all(
+                    serialized_payload,
+                    self.global_engine_count,
+                )
+            return
         for rank in range(len(self.control_sockets)):
             logger.debug(
                 f"{self.label}: Broadcast utility command '{cmd}' to DP rank {rank}"
@@ -1348,6 +1564,27 @@ class CoreManager:
     def broadcast_utility_command_sync(
         self, cmd: str, timeout: float = 300.0, **kwargs
     ):
+        if self.external_transport_mode:
+            with self._external_utility_lock:
+                payload = {"cmd": cmd, **kwargs}
+                serialized_payload = EngineCoreIpcCodec.encode_utility_command(payload)
+                raw_responses = (
+                    self.external_transport_owner.execute_control_frame_all(
+                        serialized_payload,
+                        self.global_engine_count,
+                        max(1, int(timeout * 1000)),
+                    )
+                )
+            responses = []
+            for _rank, frame in raw_responses:
+                envelope = EngineCoreIpcCodec.decode_engine_core_envelope(bytes(frame))
+                responses.append(
+                    EngineCoreIpcCodec.decode_utility_response(
+                        envelope.utility_response
+                    )
+                )
+            return responses
+
         # Drain any stale responses that might be left over
         while not self.utility_response_queue.empty():
             try:
@@ -1407,12 +1644,22 @@ class CoreManager:
                 )
 
     def get_output(self) -> list[Sequence]:
+        if self.external_transport_mode:
+            raise RuntimeError(
+                "Python CoreManager output consumption is disabled because Rust owns "
+                "the EngineCore transport"
+            )
         seqs = self.outputs_queue.get()
         if isinstance(seqs, BaseException):
             raise seqs
         return seqs
 
     def is_rest(self):
+        if self.external_transport_mode:
+            raise RuntimeError(
+                "Python CoreManager output state is unavailable because Rust owns "
+                "the EngineCore transport"
+            )
         return not self.outputs_queue.empty()
 
     def is_alive(self):

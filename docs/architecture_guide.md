@@ -154,8 +154,20 @@ ATOM uses a multi-process design with ZMQ sockets for inter-process communicatio
 
 | Socket | Type | Direction | Purpose |
 |---|---|---|---|
-| Input | `ROUTER` (CoreManager) / `DEALER` (EngineCore) | CoreManager → EngineCore | Send requests and control commands |
-| Output | `PUSH` (EngineCore) / `PULL` (CoreManager) | EngineCore → CoreManager | Return finished sequences and stream outputs |
+| Input | `ROUTER` (owner) / `DEALER` (EngineCore) | owner → EngineCore | Send AddRequest traffic from one writer |
+| Control | `ROUTER` (owner) / `DEALER` (EngineCore) | owner → EngineCore | Abort, utility and shutdown commands |
+| Output | `PUSH` (EngineCore) / `PULL` (owner) | EngineCore → owner | Return finished sequences and stream outputs |
+
+There are two mutually exclusive transport-owner modes:
+
+- Normal Python serving: `CoreManager` binds and consumes all three channels.
+- Atomesh standalone: `CoreManager` plans the addresses and invokes an injected Rust
+  transport factory before spawning EngineCore. Rust binds the channels, then
+  `CoreManager` starts the children and waits through that transport for their identity
+  handshakes and READY frames. Rust owns request/output routing after startup, while
+  `CoreManager` delegates management commands through the PyO3 control bridge.
+
+Python and Rust must never bind or consume the same EngineCore channel concurrently.
 
 **Process hierarchy:**
 

@@ -448,11 +448,6 @@ class EngineCoreIpcCodec:
             multimodal_data=EngineCoreIpcCodec._to_multimodal_data(
                 sequence.multimodal_data
             ),
-            mrope_positions=EngineCoreIpcCodec._to_ndarray(
-                sequence.mrope_positions
-                if sequence.mrope_positions is not None
-                else np.array([], dtype=np.int64)
-            ),
             mrope_position_delta=sequence.mrope_position_delta,
             has_per_req_cache=sequence.has_per_req_cache,
             num_draft_tokens=sequence.num_draft_tokens,
@@ -469,6 +464,10 @@ class EngineCoreIpcCodec:
             message.parent_request_id = sequence.parent_request_id
         if sequence.data_parallel_rank is not None:
             message.data_parallel_rank = sequence.data_parallel_rank
+        if sequence.mrope_positions is not None:
+            message.mrope_positions.CopyFrom(
+                EngineCoreIpcCodec._to_ndarray(sequence.mrope_positions)
+            )
         return message
 
     @staticmethod
@@ -509,7 +508,7 @@ class EngineCoreIpcCodec:
                 message.multimodal_data
             ),
             mrope_positions=EngineCoreIpcCodec._from_ndarray(message.mrope_positions)
-            if message.mrope_positions.dtype
+            if message.mrope_positions.dtype and message.mrope_positions.data
             else None,
             mrope_position_delta=message.mrope_position_delta,
             data_parallel_rank=message.data_parallel_rank

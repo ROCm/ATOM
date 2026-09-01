@@ -1,6 +1,10 @@
 use std::{
     io,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -12,6 +16,7 @@ use axum::{
     Json,
 };
 use bytes::Bytes;
+use parking_lot::Mutex;
 use pyo3::{
     types::{PyAnyMethods, PyDict, PyDictMethods, PyList, PyListMethods, PyTypeMethods},
     Bound, IntoPyObject, Py, PyAny, PyResult, Python,
@@ -22,35 +27,278 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::{
+    app_context::AppContext,
     protocols::{
         chat::ChatCompletionRequest,
+        common::StringOrArray,
         completion::CompletionRequest,
         generate::GenerateRequest,
         responses::{ResponsesGetParams, ResponsesRequest},
     },
-    routers::RouterTrait,
+    routers::{
+        engine_core::{EngineCoreClient, EngineCoreTransport},
+        grpc::completion_adapter::{
+            completion_to_generate, wrap_generate_response_as_completion,
+            wrap_streaming_generate_as_completion,
+        },
+        prepare::{self, generation_payload::GenerationPayload},
+        render,
+        token_handle::engine_error::EngineError,
+        RouterTrait,
+    },
 };
 
 type RouterResult<T> = Result<T, Response>;
 
 pub struct AtomStandaloneRouter {
-    pub service: Py<PyAny>,
+    pub service: Option<Py<PyAny>>,
+    pub engine_core_transport: Option<Arc<Mutex<EngineCoreTransport>>>,
+    engine_core_client: Option<Arc<EngineCoreClient>>,
+    engine_core_block_size: Option<i32>,
+    app_context: Arc<AppContext>,
+    default_chat_template_kwargs: Map<String, Value>,
+    session_affinity_enabled: bool,
     close_service_on_shutdown: bool,
     closed: AtomicBool,
 }
 
 pub struct AtomStandaloneRuntime {
-    pub service: Py<PyAny>,
+    pub service: Option<Py<PyAny>>,
+    pub engine_core_transport: Option<Arc<Mutex<EngineCoreTransport>>>,
+    pub engine_core_block_size: Option<i32>,
+    pub engine_core_max_model_len: Option<i64>,
+    pub engine_core_max_pool_tokens: Option<i64>,
+    pub engine_core_client_slot: Option<Arc<Mutex<Option<Arc<EngineCoreClient>>>>>,
+    pub engine_core_shutdown_grace_period_secs: u64,
+    pub engine_core_dp_load_balance: Option<String>,
+    pub engine_core_dp_lb_request_equivalent: Option<u64>,
+    pub engine_core_num_draft_tokens: Option<i32>,
+    pub engine_core_has_per_req_cache: Option<bool>,
+    pub engine_core_session_affinity_enabled: bool,
+    pub engine_core_dp_attention_enabled: bool,
+    pub default_chat_template_kwargs: Map<String, Value>,
     pub close_service_on_shutdown: bool,
 }
 
 impl AtomStandaloneRouter {
-    pub fn from_runtime(runtime: &AtomStandaloneRuntime) -> Self {
-        Python::attach(|py| Self {
-            service: runtime.service.clone_ref(py),
-            close_service_on_shutdown: runtime.close_service_on_shutdown,
-            closed: AtomicBool::new(false),
+    pub fn from_runtime(
+        runtime: &AtomStandaloneRuntime,
+        app_context: Arc<AppContext>,
+    ) -> Result<Self, String> {
+        Python::attach(|py| {
+            let engine_core_client = runtime
+                .engine_core_transport
+                .as_ref()
+                .map(|transport| {
+                    EngineCoreClient::new(
+                        transport.clone(),
+                        runtime
+                            .engine_core_dp_load_balance
+                            .as_deref()
+                            .unwrap_or("round_robin"),
+                        runtime.engine_core_dp_lb_request_equivalent.unwrap_or(256),
+                        Duration::from_secs(app_context.router_config.request_timeout_secs),
+                        runtime.engine_core_num_draft_tokens.unwrap_or(0),
+                        runtime.engine_core_has_per_req_cache.unwrap_or(false),
+                        runtime.engine_core_max_model_len,
+                        runtime.engine_core_max_pool_tokens,
+                        Duration::from_secs(runtime.engine_core_shutdown_grace_period_secs),
+                        runtime.engine_core_dp_attention_enabled,
+                    )
+                    .map_err(|error| error.to_string())
+                })
+                .transpose()?;
+            if let Some(slot) = runtime.engine_core_client_slot.as_ref() {
+                *slot.lock() = engine_core_client.clone();
+            }
+            Ok(Self {
+                service: runtime
+                    .service
+                    .as_ref()
+                    .map(|service| service.clone_ref(py)),
+                engine_core_transport: runtime.engine_core_transport.clone(),
+                engine_core_client,
+                engine_core_block_size: runtime.engine_core_block_size,
+                app_context,
+                default_chat_template_kwargs: runtime.default_chat_template_kwargs.clone(),
+                session_affinity_enabled: runtime.engine_core_session_affinity_enabled,
+                close_service_on_shutdown: runtime.close_service_on_shutdown,
+                closed: AtomicBool::new(false),
+            })
         })
+    }
+
+    pub async fn flush_engine_cache(&self) -> Result<(), String> {
+        self.engine_core_client
+            .as_ref()
+            .ok_or_else(|| "Rust EngineCore transport is not active".to_string())?
+            .execute_utility_all("clear_kv_cache", None, Duration::from_secs(300))
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn execute_engine_utility(&self, command: &str) -> Result<Value, String> {
+        let responses = self
+            .engine_core_client
+            .as_ref()
+            .ok_or_else(|| "Rust EngineCore transport is not active".to_string())?
+            .execute_utility_all_json(command, None, Duration::from_secs(300))
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(json!({"command": command, "ranks": responses}))
+    }
+
+    pub fn engine_loads(&self) -> Option<Value> {
+        self.engine_core_client.as_ref().map(|client| {
+            Value::Array(
+                client
+                    .load_snapshot()
+                    .into_iter()
+                    .map(|(rank, (requests, prompt_tokens))| {
+                        json!({
+                            "dp_rank": rank,
+                            "inflight_requests": requests,
+                            "inflight_prompt_tokens": prompt_tokens,
+                        })
+                    })
+                    .collect(),
+            )
+        })
+    }
+
+    fn engine_core_not_ready(endpoint: &'static str) -> Response {
+        Self::error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "ATOM standalone {endpoint} is waiting for the Rust EngineCore \
+                 request pipeline"
+            ),
+        )
+    }
+
+    fn routing_hints<T: Serialize>(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &T,
+    ) -> Result<(Option<usize>, Option<String>, Option<String>), String> {
+        let value = serde_json::to_value(body)
+            .map_err(|error| format!("failed to inspect request routing hints: {error}"))?;
+        let header_rank = headers
+            .and_then(|headers| headers.get("x-data-parallel-rank"))
+            .map(|value| {
+                value
+                    .to_str()
+                    .map_err(|_| "X-Data-Parallel-Rank must be valid UTF-8".to_string())?
+                    .parse::<usize>()
+                    .map_err(|_| "X-Data-Parallel-Rank must be a non-negative integer".to_string())
+            })
+            .transpose()?;
+        let body_rank = value
+            .get("data_parallel_rank")
+            .map(|rank| {
+                rank.as_u64()
+                    .and_then(|rank| usize::try_from(rank).ok())
+                    .ok_or_else(|| "data_parallel_rank must be a non-negative integer".to_string())
+            })
+            .transpose()?;
+        let preferred_rank = header_rank.or(body_rank);
+        if !self.session_affinity_enabled {
+            return Ok((preferred_rank, None, None));
+        }
+        let header_value = |name: &str| {
+            headers
+                .and_then(|headers| headers.get(name))
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+        };
+        let session_id = header_value("x-dynamo-session-id")
+            .or_else(|| header_value("x-correlation-id"))
+            .or_else(|| {
+                value
+                    .get("session_params")
+                    .and_then(Value::as_object)
+                    .and_then(|params| params.get("session_id").or_else(|| params.get("id")))
+                    .and_then(Value::as_str)
+                    .or_else(|| value.get("conversation_id").and_then(Value::as_str))
+                    .map(str::to_string)
+            });
+        let parent_session_id = header_value("x-dynamo-parent-session-id");
+        Ok((preferred_rank, session_id, parent_session_id))
+    }
+
+    fn contains_multimodal_input<T: Serialize>(body: &T) -> bool {
+        fn visit(value: &Value) -> bool {
+            match value {
+                Value::Object(object) => object.iter().any(|(key, value)| {
+                    matches!(
+                        key.as_str(),
+                        "image_data"
+                            | "video_data"
+                            | "audio_data"
+                            | "input_embeds"
+                            | "image_url"
+                            | "video_url"
+                            | "audio_url"
+                    ) && !value.is_null()
+                        || visit(value)
+                }),
+                Value::Array(values) => values.iter().any(visit),
+                _ => false,
+            }
+        }
+        serde_json::to_value(body).is_ok_and(|value| visit(&value))
+    }
+
+    fn encode_stop_sequences(
+        payload: &GenerationPayload,
+        response_context: &prepare::response_context::ResponseContext,
+    ) -> Result<Vec<Vec<u32>>, String> {
+        let stops: Vec<&str> = match payload.stop.stop.as_ref() {
+            Some(StringOrArray::String(stop)) => vec![stop.as_str()],
+            Some(StringOrArray::Array(stops)) => stops.iter().map(String::as_str).collect(),
+            None => Vec::new(),
+        };
+        stops
+            .into_iter()
+            .map(|stop| {
+                response_context
+                    .tokenizer
+                    .encode(stop, false)
+                    .map(|encoding| encoding.token_ids().to_vec())
+                    .map_err(|error| format!("failed to tokenize stop sequence: {error}"))
+            })
+            .collect()
+    }
+
+    fn apply_default_chat_template_kwargs(
+        &self,
+        body: &ChatCompletionRequest,
+    ) -> Result<ChatCompletionRequest, String> {
+        if self.default_chat_template_kwargs.is_empty() {
+            return Ok(body.clone());
+        }
+        let mut value = serde_json::to_value(body)
+            .map_err(|error| format!("failed to serialize chat request: {error}"))?;
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| "chat request did not serialize as an object".to_string())?;
+        let request_kwargs = object
+            .entry("chat_template_kwargs")
+            .or_insert_with(|| Value::Object(Map::new()));
+        if request_kwargs.is_null() {
+            *request_kwargs = Value::Object(Map::new());
+        }
+        let request_kwargs = request_kwargs
+            .as_object_mut()
+            .ok_or_else(|| "chat_template_kwargs must serialize as an object".to_string())?;
+        for (key, value) in &self.default_chat_template_kwargs {
+            request_kwargs
+                .entry(key.clone())
+                .or_insert_with(|| value.clone());
+        }
+        serde_json::from_value(value)
+            .map_err(|error| format!("failed to apply chat template defaults: {error}"))
     }
 
     fn not_implemented(endpoint: &'static str) -> Response {
@@ -82,6 +330,15 @@ impl AtomStandaloneRouter {
             })),
         )
             .into_response()
+    }
+
+    fn engine_dispatch_error(error: EngineError) -> Response {
+        let status = if matches!(error, EngineError::RequestBuildFailed(_)) {
+            StatusCode::BAD_REQUEST
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        };
+        Self::error_response(status, format!("EngineCore dispatch failed: {error}"))
     }
 
     fn run_chat_completion(&self, body: &ChatCompletionRequest) -> RouterResult<Value> {
@@ -134,6 +391,120 @@ impl AtomStandaloneRouter {
         )
     }
 
+    async fn execute_engine_core_chat(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ChatCompletionRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        if Self::contains_multimodal_input(body) {
+            return Self::error_response(
+                StatusCode::BAD_REQUEST,
+                "Rust EngineCore transport does not yet support multimodal input",
+            );
+        }
+        let body = match self.apply_default_chat_template_kwargs(body) {
+            Ok(body) => body,
+            Err(error) => {
+                return Self::error_response(StatusCode::BAD_REQUEST, error);
+            }
+        };
+        let (payload, response_context) = match prepare::prepare_chat(
+            Arc::new(body.clone()),
+            headers.cloned(),
+            model_id.map(str::to_string),
+            &self.app_context,
+        ) {
+            Ok(prepared) => prepared,
+            Err(response) => return response,
+        };
+        let Some(client) = self.engine_core_client.as_ref() else {
+            return Self::engine_core_not_ready("chat completion");
+        };
+        let encoded_stops = match Self::encode_stop_sequences(&payload, &response_context) {
+            Ok(stops) => stops,
+            Err(error) => {
+                return Self::error_response(StatusCode::INTERNAL_SERVER_ERROR, error);
+            }
+        };
+        let block_size = self.engine_core_block_size.unwrap_or(16);
+        let (preferred_rank, session_id, parent_session_id) =
+            match self.routing_hints(headers, &body) {
+                Ok(hints) => hints,
+                Err(error) => return Self::error_response(StatusCode::BAD_REQUEST, error),
+            };
+        let stream = match client.submit_routed(
+            &payload,
+            block_size,
+            preferred_rank,
+            session_id.as_deref(),
+            parent_session_id.as_deref(),
+            &encoded_stops,
+        ) {
+            Ok(stream) => stream,
+            Err(error) => return Self::engine_dispatch_error(error),
+        };
+        if body.stream {
+            render::chat_streaming::process(stream, response_context, "atom")
+        } else {
+            render::chat_aggregator::process(stream, response_context).await
+        }
+    }
+
+    async fn execute_engine_core_generate(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &GenerateRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        if Self::contains_multimodal_input(body) {
+            return Self::error_response(
+                StatusCode::BAD_REQUEST,
+                "Rust EngineCore transport does not yet support multimodal input",
+            );
+        }
+        let (payload, response_context) = match prepare::prepare_generate(
+            Arc::new(body.clone()),
+            headers.cloned(),
+            model_id.map(str::to_string),
+            &self.app_context,
+        ) {
+            Ok(prepared) => prepared,
+            Err(response) => return response,
+        };
+        let Some(client) = self.engine_core_client.as_ref() else {
+            return Self::engine_core_not_ready("generate");
+        };
+        let encoded_stops = match Self::encode_stop_sequences(&payload, &response_context) {
+            Ok(stops) => stops,
+            Err(error) => {
+                return Self::error_response(StatusCode::INTERNAL_SERVER_ERROR, error);
+            }
+        };
+        let block_size = self.engine_core_block_size.unwrap_or(16);
+        let (preferred_rank, session_id, parent_session_id) =
+            match self.routing_hints(headers, body) {
+                Ok(hints) => hints,
+                Err(error) => return Self::error_response(StatusCode::BAD_REQUEST, error),
+            };
+        let stream = match client.submit_routed(
+            &payload,
+            block_size,
+            preferred_rank,
+            session_id.as_deref(),
+            parent_session_id.as_deref(),
+            &encoded_stops,
+        ) {
+            Ok(stream) => stream,
+            Err(error) => return Self::engine_dispatch_error(error),
+        };
+        if body.stream {
+            render::generate_streaming::process(stream, response_context, "atom")
+        } else {
+            render::generate_aggregator::process(stream, response_context).await
+        }
+    }
+
     fn run_sse_service_stream<T: Serialize>(
         &self,
         body: &T,
@@ -142,6 +513,9 @@ impl AtomStandaloneRouter {
         close_method: &'static str,
         endpoint: &'static str,
     ) -> Response {
+        let Some(service) = self.service.as_ref() else {
+            return Self::engine_core_not_ready(endpoint);
+        };
         let request_value = match serde_json::to_value(body) {
             Ok(value) => value,
             Err(e) => {
@@ -154,7 +528,7 @@ impl AtomStandaloneRouter {
 
         let stream_id = match Python::attach(|py| -> PyResult<String> {
             let request = Self::json_to_py(py, &request_value)?;
-            self.service
+            service
                 .bind(py)
                 .call_method1(start_method, (request,))?
                 .extract::<String>()
@@ -168,7 +542,7 @@ impl AtomStandaloneRouter {
             }
         };
 
-        let service = Python::attach(|py| self.service.clone_ref(py));
+        let service = Python::attach(|py| service.clone_ref(py));
         let stream_id_for_worker = stream_id.clone();
         let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
         let _ = tokio::task::spawn_blocking(move || loop {
@@ -242,6 +616,9 @@ impl AtomStandaloneRouter {
         body: &T,
         endpoint: &'static str,
     ) -> RouterResult<Value> {
+        let Some(service) = self.service.as_ref() else {
+            return Err(Self::engine_core_not_ready(endpoint));
+        };
         let request_value = serde_json::to_value(body).map_err(|e| {
             Self::error_response(
                 StatusCode::BAD_REQUEST,
@@ -251,10 +628,7 @@ impl AtomStandaloneRouter {
 
         Python::attach(|py| -> PyResult<Value> {
             let request = Self::json_to_py(py, &request_value)?;
-            let response = self
-                .service
-                .bind(py)
-                .call_method1(method_name, (request,))?;
+            let response = service.bind(py).call_method1(method_name, (request,))?;
             Self::py_to_json(&response)
         })
         .map_err(|e| {
@@ -338,8 +712,11 @@ impl AtomStandaloneRouter {
     }
 
     fn python_type_name(&self) -> String {
+        let Some(service) = self.service.as_ref() else {
+            return "RustEngineCoreTransport".to_string();
+        };
         Python::attach(|py| {
-            self.service
+            service
                 .bind(py)
                 .get_type()
                 .name()
@@ -352,6 +729,17 @@ impl AtomStandaloneRouter {
         if self.closed.swap(true, Ordering::AcqRel) {
             return;
         }
+        let Some(service) = self.service.as_ref() else {
+            if let Some(client) = self.engine_core_client.as_ref() {
+                tracing::info!("Shutting down Rust-owned EngineCore transport ({reason})");
+                if let Err(error) = client.shutdown() {
+                    tracing::warn!("Failed to shut down EngineCore transport: {error}");
+                }
+            } else if let Some(transport) = self.engine_core_transport.as_ref() {
+                let _ = transport.lock().send_shutdown_all();
+            }
+            return;
+        };
         if !self.close_service_on_shutdown {
             tracing::info!(
                 "Skipping ATOM standalone Python service close because it is externally owned ({})",
@@ -362,7 +750,7 @@ impl AtomStandaloneRouter {
 
         tracing::info!("Closing ATOM standalone Python service ({})", reason);
         Python::attach(|py| {
-            if let Err(e) = self.service.bind(py).call_method0("close") {
+            if let Err(e) = service.bind(py).call_method0("close") {
                 tracing::warn!("Failed to close ATOM standalone Python service: {}", e);
             }
         });
@@ -389,11 +777,81 @@ impl RouterTrait for AtomStandaloneRouter {
     }
 
     async fn shutdown(&self) {
+        if self.service.is_none() {
+            if self.closed.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            if let Some(client) = self.engine_core_client.as_ref().cloned() {
+                tracing::info!("Shutting down Rust-owned EngineCore transport (server shutdown)");
+                match tokio::task::spawn_blocking(move || client.shutdown()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        tracing::warn!("Failed to shut down EngineCore transport: {error}");
+                    }
+                    Err(error) => {
+                        tracing::warn!("EngineCore shutdown task failed: {error}");
+                    }
+                }
+            } else if let Some(transport) = self.engine_core_transport.as_ref() {
+                let transport = transport.clone();
+                match tokio::task::spawn_blocking(move || transport.lock().send_shutdown_all())
+                    .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        tracing::warn!("Failed to shut down EngineCore transport: {error}");
+                    }
+                    Err(error) => {
+                        tracing::warn!("EngineCore transport shutdown task failed: {error}");
+                    }
+                }
+            }
+            return;
+        }
         self.close_service("server shutdown");
     }
 
+    fn standalone_readiness(&self) -> Option<(bool, usize, usize)> {
+        let client = self.engine_core_client.as_ref()?;
+        let healthy = client.healthy_rank_count();
+        let total = client.total_rank_count();
+        let tokenizer_ready = self
+            .app_context
+            .router_config
+            .tokenizer_path
+            .as_ref()
+            .or(self.app_context.router_config.model_path.as_ref())
+            .is_some_and(|name| self.app_context.tokenizer_registry.contains(name));
+        Some((tokenizer_ready && client.serving_ready(), healthy, total))
+    }
+
+    fn standalone_engine_metrics(&self) -> Option<(bool, Value)> {
+        let client = self.engine_core_client.as_ref()?;
+        let ranks = client.metrics_snapshot_json();
+        let healthy_ranks = client.healthy_rank_count();
+        let serving_ready = client.serving_ready();
+        Some((
+            serving_ready,
+            json!({
+                "status": if !serving_ready {
+                    "not_ready"
+                } else if ranks.is_empty() {
+                    "waiting_for_snapshot"
+                } else {
+                    "ready"
+                },
+                "ranks": ranks,
+                "healthy_ranks": healthy_ranks,
+                "total_ranks": client.total_rank_count(),
+            }),
+        ))
+    }
+
     async fn health_generate(&self, _req: Request<Body>) -> Response {
-        Self::not_implemented("health_generate")
+        if matches!(self.standalone_readiness(), Some((true, _, _))) {
+            return StatusCode::OK.into_response();
+        }
+        StatusCode::SERVICE_UNAVAILABLE.into_response()
     }
 
     async fn get_server_info(&self, _req: Request<Body>) -> Response {
@@ -408,35 +866,63 @@ impl RouterTrait for AtomStandaloneRouter {
     }
 
     async fn get_models(&self, _req: Request<Body>) -> Response {
+        let model = self
+            .app_context
+            .router_config
+            .model_path
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
         (
             StatusCode::OK,
             Json(json!({
                 "object": "list",
-                "data": []
+                "data": [{
+                    "id": model,
+                    "object": "model",
+                    "owned_by": "atom"
+                }]
             })),
         )
             .into_response()
     }
 
     async fn get_model_info(&self, _req: Request<Body>) -> Response {
+        if let Some(model) = self.app_context.router_config.model_path.as_ref() {
+            return (
+                StatusCode::OK,
+                Json(json!({
+                    "model_path": model,
+                    "backend": "atom_engine_core",
+                })),
+            )
+                .into_response();
+        }
         Self::not_implemented("get_model_info")
     }
 
     async fn route_generate(
         &self,
-        _headers: Option<&HeaderMap>,
-        _body: &GenerateRequest,
-        _model_id: Option<&str>,
+        headers: Option<&HeaderMap>,
+        body: &GenerateRequest,
+        model_id: Option<&str>,
     ) -> Response {
+        if self.engine_core_client.is_some() {
+            return self
+                .execute_engine_core_generate(headers, body, model_id)
+                .await;
+        }
         Self::not_implemented("generate")
     }
 
     async fn route_chat(
         &self,
-        _headers: Option<&HeaderMap>,
+        headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
-        _model_id: Option<&str>,
+        model_id: Option<&str>,
     ) -> Response {
+        if self.engine_core_client.is_some() {
+            return self.execute_engine_core_chat(headers, body, model_id).await;
+        }
         if body.stream {
             return self.run_chat_completion_stream(body);
         }
@@ -449,10 +935,26 @@ impl RouterTrait for AtomStandaloneRouter {
 
     async fn route_completion(
         &self,
-        _headers: Option<&HeaderMap>,
+        headers: Option<&HeaderMap>,
         body: &CompletionRequest,
-        _model_id: Option<&str>,
+        model_id: Option<&str>,
     ) -> Response {
+        if self.engine_core_client.is_some() {
+            let generate = match completion_to_generate(body) {
+                Ok(request) => request,
+                Err(message) => {
+                    return Self::error_response(StatusCode::BAD_REQUEST, message);
+                }
+            };
+            let response = self
+                .execute_engine_core_generate(headers, &generate, model_id)
+                .await;
+            return if body.stream {
+                wrap_streaming_generate_as_completion(response, body.model.clone()).await
+            } else {
+                wrap_generate_response_as_completion(response, body.model.clone()).await
+            };
+        }
         if body.stream {
             return self.run_completion_stream(body);
         }

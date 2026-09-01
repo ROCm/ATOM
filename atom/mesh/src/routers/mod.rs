@@ -19,6 +19,7 @@ use crate::protocols::{
 
 pub mod atom_standalone;
 pub mod comm;
+pub mod engine_core;
 pub mod factory;
 pub mod grpc;
 pub mod http_pd_router;
@@ -44,6 +45,16 @@ pub trait RouterTrait: Send + Sync + Debug {
 
     /// Gracefully release router-owned resources during server shutdown.
     async fn shutdown(&self) {}
+
+    /// Return standalone-owned readiness when no HTTP workers are registered.
+    fn standalone_readiness(&self) -> Option<(bool, usize, usize)> {
+        None
+    }
+
+    /// Return metrics owned by an in-process backend transport.
+    fn standalone_engine_metrics(&self) -> Option<(bool, serde_json::Value)> {
+        None
+    }
 
     /// Route a health generate request
     async fn health_generate(&self, _req: Request<Body>) -> Response {

@@ -9,6 +9,25 @@ from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 from atom.sampling_params import SamplingParams
 
 
+def test_python_decodes_rust_add_request_golden():
+    frame = bytes.fromhex(
+        "080152570a55082a1209726571756573742d311802200128103203020406"
+        "4a040a02c601500658036003b80101c00101f9010000000000e05e409a"
+        "021e09000000606666e63f101419000000c0ccccec3f2020320473746f"
+        "704001"
+    )
+    envelope = EngineCoreIpcCodec.decode_engine_core_envelope(frame)
+    [sequence] = EngineCoreIpcCodec.decode_add_request(envelope.add_request)
+    assert sequence.id == 42
+    assert sequence.external_request_id == "request-1"
+    assert list(sequence.token_ids) == [1, 2, 3]
+    assert sequence.num_prompt_tokens == 3
+    assert sequence.block_size == 16
+    assert sequence.sampling_params.max_tokens == 32
+    assert sequence.sampling_params.stop_strings == ["stop"]
+    assert sequence.stop_token_sequences == [[99]]
+
+
 def test_sequence_protobuf_roundtrip_preserves_engine_state():
     sequence = Sequence(
         [1, 2, 3],
@@ -46,6 +65,22 @@ def test_sequence_protobuf_roundtrip_preserves_engine_state():
     assert np.array_equal(decoded.mrope_positions, sequence.mrope_positions)
     assert decoded.dspark_next_ell == sequence.dspark_next_ell
     assert decoded.num_bonus_tokens == sequence.num_bonus_tokens
+
+
+def test_sequence_protobuf_roundtrip_preserves_absent_mrope_positions():
+    sequence = Sequence([1, 2], 16, SamplingParams(max_tokens=4), id=7)
+
+    encoded = EngineCoreIpcCodec.encode_sequence(sequence)
+    assert not encoded.HasField("mrope_positions")
+    assert EngineCoreIpcCodec.decode_sequence(encoded).mrope_positions is None
+
+    # Frames produced before the absence fix represented None as a typed,
+    # one-dimensional empty array. Keep decoding those frames as None so they
+    # cannot enter the MRoPE builder and be indexed as a 2-D position matrix.
+    encoded.mrope_positions.CopyFrom(
+        EngineCoreIpcCodec._to_ndarray(np.array([], dtype=np.int64))
+    )
+    assert EngineCoreIpcCodec.decode_sequence(encoded).mrope_positions is None
 
 
 def test_engine_core_envelope_rejects_unknown_wire_version():

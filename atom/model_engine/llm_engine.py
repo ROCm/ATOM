@@ -11,7 +11,11 @@ from typing import Any
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 from atom.config import Config
-from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
+from atom.model_engine.engine_core_mgr import (
+    CoreManager,
+    DisaggCoreManager,
+    validate_rust_owned_engine_core_config,
+)
 from atom.model_engine.multimodal import get_mrope_input_positions
 from atom.model_engine.sequence import Sequence
 from atom.sampling_params import SamplingParams
@@ -36,12 +40,15 @@ def _load_tokenizer(model: str, trust_remote_code: bool = False):
 class LLMEngine:
 
     def __init__(self, model, tokenizer=None, **kwargs):
+        external_transport_factory = kwargs.pop("external_transport_factory", None)
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         data_parallel_size = kwargs.get("data_parallel_size", 1)
         data_parallel_master_port = kwargs.get("data_parallel_master_port", None)
         config = Config(model, **config_kwargs)
         self.config = config
+        if external_transport_factory is not None:
+            validate_rust_owned_engine_core_config(config)
         self.tokenizer = tokenizer or _load_tokenizer(
             config.model, config.trust_remote_code
         )
@@ -140,7 +147,10 @@ class LLMEngine:
         if config.enable_rapidserve:
             self.core_mgr = DisaggCoreManager(config)
         else:
-            self.core_mgr = CoreManager(config)
+            self.core_mgr = CoreManager(
+                config,
+                external_transport_factory=external_transport_factory,
+            )
         self._step_lock = None
         self._pending_results = {}
         import json
@@ -556,37 +566,15 @@ class InputOutputProcessor:
         # Qwen3.5). Future stateful models (DeepseekV4, etc.) extend the set.
         self._external_to_internal: dict[str, int] = {}
         self._internal_to_external: dict[int, str] = {}
-        self.has_per_req_cache = False
+        self.has_per_req_cache = self.config.has_per_req_cache
         self.num_speculative_tokens = 0
         if (
             hasattr(self.config, "speculative_config")
             and self.config.speculative_config is not None
         ):
-            self.num_speculative_tokens = (
-                self.config.speculative_config.num_speculative_tokens
+            self.num_speculative_tokens = int(
+                self.config.speculative_config.num_speculative_tokens or 0
             )
-        if self.config.hf_config.model_type in self._per_req_cache_model_types():
-            self.has_per_req_cache = True
-
-    @staticmethod
-    def _per_req_cache_model_types() -> frozenset[str]:
-        """Single source of truth for which model_types use per-req cache.
-
-        Read by Sequence-construction (here) AND by ModelRunner's startup
-        sanity check, which asserts that any model whose attention builder
-        declares a per-request state sub-pool has its model_type
-        registered here. Adding a new stateful-attention model means
-        adding its model_type to this set.
-        """
-        return frozenset(
-            {
-                "qwen3_next",
-                "qwen3_5_text",
-                "qwen3_5_moe_text",
-                "kimi_linear",
-                "deepseek_v4",
-            }
-        )
 
     def preprocess(
         self,
