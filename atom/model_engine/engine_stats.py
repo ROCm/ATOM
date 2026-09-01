@@ -461,8 +461,9 @@ class EngineStats:
         those read as "the HBM number" and only `cache_hit_rate` is a served
         quantity: `paged_hit_rate`'s numerator is `compressed`, how far the
         prefix walk reached *before* the state gates cut it. `cached + offload
-        == num_cached <= reusable` by construction, so `cache_hit_rate` and this
-        partition the served reuse; `compressed + offload` does not and can
+        <= reusable` by construction (the clamp in `update_cache` enforces it),
+        so `cache_hit_rate` and this partition the served reuse; `compressed +
+        offload` does not and can
         exceed the denominator.
         """
         return self._rate(self.total_offload_tokens, self.total_reusable_tokens)
@@ -625,8 +626,9 @@ class EngineStats:
         # (`compressed`). Both read as "the HBM number" and only one of them is
         # a *served* quantity: `compressed` is how far the prefix walk reached
         # before the state gates cut it, so it is reach, not reuse anybody got.
-        # `cached + offload == num_cached <= reusable` by construction, so these
-        # two do partition, and `combined` is exactly the end-to-end rate.
+        # `cached + offload <= reusable` by construction (clamped in
+        # `update_cache`), so these two do partition, and `combined` is exactly
+        # the end-to-end rate.
         if self.total_offload_tokens:
             served = self.total_cached_tokens + self.total_offload_tokens
             logger.info(
