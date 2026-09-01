@@ -178,7 +178,9 @@ class TestDisownClaimedPrefix:
         # 6 blocks: holder takes 4, seq's fresh tail takes 1, leaving 1 free --
         # fewer than the 4 private copies the disown needs, so it must refuse
         # rather than silently reuse the shared blocks.
-        bm, holder, seq, shared = self._shared_prefix(seq_factory, num_kvcache_blocks=6)
+        bm, _holder, seq, shared = self._shared_prefix(
+            seq_factory, num_kvcache_blocks=6
+        )
         assert bm.kv.has_free(4) is False
 
         assert bm.disown_claimed_prefix(seq) is False
@@ -1013,3 +1015,60 @@ class TestReclaimedStoresAreNotIndexed:
         assert bm.paged_state_checkpoints.settled == [op]
         # ...and it does not touch the index, which the store report owns.
         assert bm.state_offload.hashes == set()
+
+
+# ── the LMCache chunk probe is gated on the capability ─────────────────────
+
+
+class TestJointChunkProbeIsGated:
+    """Reading the chunk size imports LMCache, which is an optional dependency.
+    Doing it unconditionally meant every engine without an offload connector
+    logged a full `ModuleNotFoundError` traceback at WARNING on startup, for a
+    number it has no use for -- and any caplog assertion downstream inherited
+    that noise."""
+
+    def _bm(self, kv_transfer_config):
+        cfg = MockConfig(
+            enable_prefix_caching=True,
+            kv_transfer_config=kv_transfer_config,
+            pool_entries={"state": 4},
+            pool_entries_per_req={"state": 1},
+        )
+        return BlockManager(cfg)
+
+    def test_an_engine_with_no_tier_does_not_probe_or_warn(self, caplog):
+        with caplog.at_level(logging.DEBUG, logger="atom"):
+            bm = self._bm({"kv_connector": "moriio"})
+        assert bm._joint_chunk_tokens == 0
+        assert "LMCache chunk size" not in caplog.text
+        assert "lmcache" not in caplog.text.lower()
+
+    def test_a_dense_offload_engine_does_not_probe_either(self, caplog):
+        """It has an offload connector but no state to offload, so a joint KV
+        load is impossible and the chunk grid is not its business."""
+        with caplog.at_level(logging.DEBUG, logger="atom"):
+            bm = self._bm(
+                {
+                    "kv_connector": "lmcache_offload",
+                    "kv_role": "offload",
+                    "offload_layout": "dense",
+                }
+            )
+        assert bm._joint_chunk_tokens == 0
+        assert "LMCache chunk size" not in caplog.text
+
+    def test_a_hosted_tier_still_probes_and_says_so_when_it_cannot_read(self, caplog):
+        """The warning is worth printing exactly here: the tier is on, so a
+        missing chunk size really does disable the joint KV load."""
+        with caplog.at_level(logging.WARNING, logger="atom"):
+            bm = self._bm(
+                {
+                    "kv_connector": "lmcache_offload",
+                    "kv_role": "offload",
+                    "offload_layout": "kimi_k3",
+                }
+            )
+        # lmcache is not installed in the unit-test environment, so the probe
+        # runs and fails -- which is the point: it ran.
+        assert bm._joint_chunk_tokens == 0
+        assert "LMCache chunk size" in caplog.text
