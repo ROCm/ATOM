@@ -292,7 +292,7 @@ def fused_sigmoid_mul_maybe_quant(
     attn_output: Tensor,
     gate: Tensor,
     quant: bool = False,
-    quant_type: QuantType = QuantType.per_Token,
+    quant_type_value: int = QuantType.per_Token.value,
     transpose_scale: bool | None = None,
 ) -> tuple[Tensor, Tensor | None]:
     """sigmoid(gate) * attn_output, optionally fused with FP8 quant.
@@ -305,17 +305,20 @@ def fused_sigmoid_mul_maybe_quant(
       standalone activation quant.
     - ``quant=True``: fuse sigmoid(gate) * attn_output + FP8 quant into one
       Triton kernel and return ``(x_fp8, x_scale)`` for o_proj's ``x_scale=``
-      path. ``quant_type`` selects the scheme:
-      ``QuantType.per_Token`` -> a8w8 per-token scale ``[M, 1]`` (Kimi-K3 o_proj
-      under ptpc_fp8); ``QuantType.per_1x128`` -> per-1x128 block scales
-      (``transpose_scale`` controls their layout, as in
+      path. ``quant_type_value`` selects the scheme:
+      ``QuantType.per_Token.value`` -> a8w8 per-token scale ``[M, 1]`` (Kimi-K3
+      o_proj under ptpc_fp8); ``QuantType.per_1x128.value`` -> per-1x128 block
+      scales (``transpose_scale`` controls their layout, as in
       :func:`fused_sigmoid_mul_fp8_quant`).
+
+    Takes the ``int`` ``QuantType.value``, not a ``QuantType``: Dynamo graph-breaks
+    comparing the pybind11 type inside a traced ``forward``.
     """
     if not quant:
         return attn_output * torch.sigmoid(gate), None
-    if quant_type == QuantType.per_Token:
+    if quant_type_value == QuantType.per_Token.value:
         return fused_sigmoid_mul_fp8_quant(attn_output, gate, per_token=True)
-    if quant_type == QuantType.per_1x128:
+    if quant_type_value == QuantType.per_1x128.value:
         return fused_sigmoid_mul_fp8_quant(
             attn_output,
             gate,
@@ -324,6 +327,7 @@ def fused_sigmoid_mul_maybe_quant(
             per_token=False,
         )
     raise ValueError(
-        f"fused_sigmoid_mul_maybe_quant: unsupported quant_type {quant_type}; "
-        "expected QuantType.per_Token or QuantType.per_1x128"
+        f"fused_sigmoid_mul_maybe_quant: unsupported quant_type_value "
+        f"{quant_type_value}; expected QuantType.per_Token.value "
+        "or QuantType.per_1x128.value"
     )

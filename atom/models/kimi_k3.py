@@ -749,7 +749,11 @@ class KimiFullAttention(nn.Module):
             QuantType.per_Token,
             QuantType.per_1x128,
         )
-        self.o_proj_quant_type = o_type
+        # .value, like qknorm_quant_type_value above: comparing the pybind11
+        # QuantType inside forward() graph-breaks Dynamo.
+        self.o_proj_quant_type_value = (
+            o_type.value if self.fuse_sigmoid_mul_quant else QuantType.No.value
+        )
 
     def forward(
         self, positions: torch.Tensor, hidden_states: torch.Tensor
@@ -804,7 +808,7 @@ class KimiFullAttention(nn.Module):
             attn_out,
             gate,
             quant=self.fuse_sigmoid_mul_quant,
-            quant_type=self.o_proj_quant_type,
+            quant_type_value=self.o_proj_quant_type_value,
         )
         return self.o_proj(attn_out, x_scale=attn_scale)
 
