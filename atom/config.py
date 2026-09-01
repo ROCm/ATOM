@@ -47,6 +47,13 @@ class KVCacheTensor:
     # DSA sparse layers (GLM-5.2 / DeepSeek-V3.2): indexer key cache, block-major
     # ``(num_blocks, block_size, aligned_index_dim)``. Omitted for non-DSA layers.
     index_cache: torch.Tensor | None = None
+    # ReplaySSM record buffers for linear-attention layers: this layer's slice
+    # of the (k, u, g) pools.  None for every other attention type.  Carried
+    # here because the layer-id -> linear-attn-index mapping already lives in
+    # the builder's `build_kv_cache_tensor`.
+    replay_buf_k: torch.Tensor = None
+    replay_buf_u: torch.Tensor = None
+    replay_buf_g: torch.Tensor = None
 
 
 @dataclass
@@ -796,8 +803,11 @@ class ParallelConfig:
     data_parallel_size: int = 1
     """Number of data parallel groups. MoE layers will be sharded according to
     the product of the tensor parallel size and data parallel size."""
-    data_parallel_size_local: int = 1
-    """Number of local data parallel groups."""
+    data_parallel_size_local: int | None = None
+    """DP ranks this node runs. Defaults to data_parallel_size, i.e. the
+    single-node case where every global rank is local. Set it below the global
+    size to give a node one slice of a multi-node run; it also reaches MoRI as
+    `gpu_per_node` (see model_ops/moe.py), so it must describe real hardware."""
     data_parallel_rank: int = 0
     """Rank of the data parallel group."""
     data_parallel_rank_local: int | None = None
@@ -823,8 +833,6 @@ class ParallelConfig:
     pp_kv_status_addr: str = ""
     """ZMQ endpoint where the head receives KV offload status from downstream
     PP stages. All downstream stages PUSH; the head PULLs."""
-    world_size: int = field(init=False)
-    """Vestigial: never assigned or read; engine_core derives worker count directly."""
     data_parallel_master_port: int = 29500
     """Port of the data parallel master."""
 
@@ -833,10 +841,20 @@ class ParallelConfig:
     data_parallel_master_ip: str = "127.0.0.1"
 
     @property
-    def world_size_across_dp(self) -> int:
-        """world_size_across_dp is TPxPPxDP, it is the size of the world
-        including data parallelism."""
-        return self.world_size * self.data_parallel_size
+    def is_multinode_dp(self) -> bool:
+        """Whether this node owns only part of the global DP group.
+
+        Inferred from the topology rather than a separate flag: either this
+        node runs fewer ranks than exist globally, or its slice starts at a
+        non-zero global rank.
+        """
+        # data_parallel_size_local is int | None in the declaration, but
+        # __post_init__ always resolves it before any caller can reach here.
+        assert self.data_parallel_size_local is not None
+        return (
+            self.data_parallel_size_local < self.data_parallel_size
+            or self.data_parallel_rank > 0
+        )
 
     def get_next_dp_init_port(self) -> int:
         """
@@ -890,6 +908,7 @@ class ParallelConfig:
         """
         factors: list[Any] = []
         factors.append(self.data_parallel_size)
+        factors.append(self.data_parallel_size_local)
         factors.append(self.data_parallel_rank)
         factors.append(self.data_parallel_rank_local)
         factors.append(self.data_parallel_master_ip)
@@ -911,6 +930,33 @@ class ParallelConfig:
             self.data_parallel_master_port = envs.ATOM_DP_MASTER_PORT
         if envs.is_set("ATOM_DP_BASE_PORT"):
             self.data_parallel_base_port = envs.ATOM_DP_BASE_PORT
+
+        if self.data_parallel_size < 1:
+            raise ValueError("data_parallel_size must be at least 1")
+
+        if envs.is_set("ATOM_DP_SIZE_LOCAL"):
+            self.data_parallel_size_local = envs.ATOM_DP_SIZE_LOCAL
+
+        # Default the local slice to the whole group: on one node every global
+        # rank is local, and that is the overwhelmingly common case.
+        if self.data_parallel_size_local is None:
+            self.data_parallel_size_local = self.data_parallel_size
+
+        if self.data_parallel_size_local < 1:
+            raise ValueError("data_parallel_size_local must be at least 1")
+        if self.data_parallel_rank < 0:
+            raise ValueError("data_parallel_rank must be non-negative")
+        if (
+            self.data_parallel_rank + self.data_parallel_size_local
+            > self.data_parallel_size
+        ):
+            raise ValueError(
+                f"data_parallel_rank ({self.data_parallel_rank}) + "
+                f"data_parallel_size_local ({self.data_parallel_size_local}) "
+                f"must not exceed data_parallel_size "
+                f"({self.data_parallel_size}): this node's slice would run off "
+                f"the end of the global DP group"
+            )
 
 
 _DSPARK_DEFAULT_MAX_BLOCK = 16
@@ -1392,17 +1438,30 @@ class EPLBConfig:
         return cls(**cfg)
 
 
+DCP_COMM_BACKENDS = ("ag_rs", "a2a")
+
+
 @dataclass
 class DCPConfig:
-    """DCP (Decode Context Parallel) sub-config. Today only interleave
-    granularity; room for future knobs (all-to-all backend, query
-    replication, ...) without growing the top-level CLI surface."""
+    """DCP (Decode Context Parallel) sub-config: interleave granularity, query
+    replication, output-merge placement and the merge collective backend --
+    knobs that would otherwise each grow the top-level CLI surface."""
 
     interleave_size: int = 1
+    enable_query_replication: bool = True
+    enable_project_before_merge: bool = True
+    comm_backend: str = "a2a"
 
     def __post_init__(self):
         self.interleave_size = int(self.interleave_size)
         assert self.interleave_size >= 1, "dcp.interleave_size must be >= 1"
+        self.enable_query_replication = bool(self.enable_query_replication)
+        self.enable_project_before_merge = bool(self.enable_project_before_merge)
+        self.comm_backend = str(self.comm_backend)
+        assert self.comm_backend in DCP_COMM_BACKENDS, (
+            f"dcp.comm_backend must be one of {list(DCP_COMM_BACKENDS)}; "
+            f"got {self.comm_backend!r}"
+        )
 
     @classmethod
     def from_dict(cls, cfg: dict | None) -> "DCPConfig":
@@ -1421,6 +1480,27 @@ class DCPConfig:
         return cls(**cfg)
 
 
+def qrep_unsupported_reason(
+    dcp_size: int, speculative_config, mxfp4_bmm: bool
+) -> str | None:
+    """Why DCP query replication cannot run here, or None if it can.
+
+    Kept a module-level pure function so it is unit-testable: the alternative,
+    exercising it through ``Config.__post_init__``, needs a real model directory
+    and an HF config. ``Config.__post_init__`` is its only production caller.
+    """
+    if dcp_size <= 1:
+        # No DCP group means there is no AllGather Q to remove.
+        return "decode_context_parallel_size <= 1 (no DCP group)"
+    if speculative_config is not None:
+        # MTP / eagle3 / dspark run a qlen>1 verify on the cprr kernel.
+        return "speculative decode (qlen>1 cprr path)"
+    if mxfp4_bmm:
+        # fp4 (mxfp4) absorbed BMM has a different scale structure.
+        return "fp4 (mxfp4) BMM weights"
+    return None
+
+
 @dataclass
 class Config:
     model: str
@@ -1429,10 +1509,20 @@ class Config:
     long_prefill_token_threshold: int = 0
     attn_prefill_chunk_size: int = 16384
     # Tokens between rungs of the state-checkpoint ladder, shared by every
-    # Pool.STATE class; 0 = no ladder. Must be a multiple of the prefix-cache
-    # hash block size (asserted in BlockManager). See
-    # BlockManager.checkpointers_at.
+    # Pool.STATE class. Must be a multiple of the prefix-cache hash block size
+    # (snapped, with a warning, in BlockManager).
+    #   >0  a rung every N tokens
+    #    0  state checkpointing off entirely
+    #   -1  no interval rungs, but the demand rung and the prompt-end anchor
+    #       still place checkpoints
+    # See BlockManager.checkpointers_at.
     state_checkpoint_interval_tokens: int = 8192
+    # Whether a refused hit may place a rung of its own. Off leaves the
+    # prompt-end anchor as the only placement; the rung reads back far less
+    # often than the anchor, so its worth is an open question — see
+    # `StateSlotPool.mark_speculative` for the measurement and
+    # `BlockManager._record_checkpoint_demand` for the placement.
+    state_checkpoint_demand: bool = True
     scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
     max_model_len: int | None = None
@@ -1455,6 +1545,12 @@ class Config:
     index_cache_dtype: str | None = None
     enable_prefix_caching: bool = True
     enable_chunked_prefill: bool = True
+    enable_log_stats: bool = True
+    # Seconds between engine-status lines. Validated > 0 by EngineStats.
+    throughput_log_interval: float = 10.0
+    # Requests in the sliding window behind the status line's prefix-cache hit
+    # rate. Validated > 0 by EngineStats.
+    cache_hit_rate_window: int = 1000
     port: int = 8006
     torch_profiler_dir: str | None = field(
         default_factory=lambda: envs.ATOM_TORCH_PROFILER_DIR
@@ -1472,7 +1568,6 @@ class Config:
     # sizes the process group and the token collectives.
     dp_logical_size: int = 0
     master_addr: str = "127.0.0.1"
-    graph_bs: list[int] | None = None
     enable_dp_attention: bool = False
     # DP request-routing strategy used by CoreManager to pick an engine rank:
     # "round_robin" | "least_requests" (default) | "least_tokens". Only has an
@@ -1561,17 +1656,22 @@ class Config:
         visible = torch.cuda.device_count()
         return visible if 0 < visible < tp else tp
 
-    def _set_cudagraph_sizes(self):
-        if self.compilation_config.cudagraph_capture_sizes:
-            self.graph_bs = self.compilation_config.cudagraph_capture_sizes
-        else:
-            cuda_graph_sizes = self.compilation_config.cuda_graph_sizes
-            if len(cuda_graph_sizes) == 1:
-                self.graph_bs = [1, 2, 4, 8] + [
-                    i for i in range(16, cuda_graph_sizes[0] + 1, 16)
-                ]
-            elif len(cuda_graph_sizes) > 1:
-                self.graph_bs = cuda_graph_sizes
+    @property
+    def capture_sizes(self) -> list[int]:
+        """The declared CUDAGraph capture ladder, in batch sizes.
+
+        Declared, not schedulable -- `ModelRunner` drops what its own token
+        budget can never produce, a bound needing the drafter's resolved
+        `mtp_k` that config cannot see. Returns a copy: the runner sorts and
+        filters in place.
+        """
+        declared = self.compilation_config.cudagraph_capture_sizes
+        if declared:
+            return list(declared)
+        sizes = self.compilation_config.cuda_graph_sizes
+        if len(sizes) == 1:
+            return [1, 2, 4, 8] + list(range(16, sizes[0] + 1, 16))
+        return list(sizes)
 
     def __post_init__(self):
         self.moe_backend = self.moe_backend.strip().lower()
@@ -1686,6 +1786,23 @@ class Config:
                 "dcp_config.interleave_size=1 with speculative decode, or disable "
                 "speculative decode for block-level interleave."
             )
+
+        # DCP Query Replication (QREP) first-cut gating: turn the flag OFF
+        # (warn, not error) for combinations not yet wired, so it can default to
+        # on without breaking mixed runs.
+        if self.dcp_config.enable_query_replication:
+            qrep_off = qrep_unsupported_reason(
+                self.decode_context_parallel_size,
+                self.speculative_config,
+                envs.ATOM_USE_TRITON_MXFP4_BMM,
+            )
+            if qrep_off is not None:
+                logger.warning(
+                    "dcp_config.enable_query_replication disabled: %s not "
+                    "supported in the first cut.",
+                    qrep_off,
+                )
+                self.dcp_config.enable_query_replication = False
         assert 1 <= self.pipeline_parallel_size
         self.hf_config = get_hf_config(
             self.model, trust_remote_code=self.trust_remote_code
@@ -1775,18 +1892,17 @@ class Config:
         # only for server mode or plugin mode(vllm)
         # for torch compile policy, plugin mode(vllm) uses the ATOM compile policy
         # for cuda graph capture, plugin mode(vllm) uses the vLLM's cuda graph capture policy
-        if not is_plugin_mode() or (
-            self.plugin_config is not None and self.plugin_config.is_vllm
-        ):
-            if self.compilation_config.level == CompilationLevel.PIECEWISE:
-                self.compilation_config.set_splitting_ops_for_v1()
-                self._set_cudagraph_sizes()
-                # Keep an explicit cudagraph_mode (e.g. FULL); default to
-                # PIECEWISE only when unset. splitting_ops/sizes are set either
-                # way so the model is still piece-split-compiled at level 3.
-                if self.compilation_config.cudagraph_mode is None:
-                    self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
-                self.compilation_config.init_with_cudagraph_sizes()
+        if (
+            not is_plugin_mode()
+            or (self.plugin_config is not None and self.plugin_config.is_vllm)
+        ) and self.compilation_config.level == CompilationLevel.PIECEWISE:
+            self.compilation_config.set_splitting_ops_for_v1()
+            # Keep an explicit cudagraph_mode (e.g. FULL); default to
+            # PIECEWISE only when unset. splitting_ops/sizes are set either
+            # way so the model is still piece-split-compiled at level 3.
+            if self.compilation_config.cudagraph_mode is None:
+                self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+            self.compilation_config.init_with_cudagraph_sizes()
 
         self.torch_dtype = (
             self.hf_config.dtype

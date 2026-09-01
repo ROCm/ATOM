@@ -13,6 +13,7 @@ from atom.distributed.pcp_utils import (
     pcp_pad_len,
     pcp_round_robin_split,
 )
+from atom.spec_decode.draft_graph import DraftGraph, StagedInput
 from atom.spec_decode.drafter import Drafter
 from atom.spec_decode.eagle3_kv_builder import Eagle3DraftBuilder
 from atom.utils import envs
@@ -68,6 +69,85 @@ class EagleProposer(Drafter):
 
     def _resolve_mtp_k(self) -> int:
         return self.speculative_config.num_speculative_tokens or 0
+
+    def _declare_draft_graphs(self):
+        """The mid-step pass: draft steps 1..k-1, one row per sequence.
+
+        Step 0 counts tokens, not sequences -- it runs the target's whole token
+        stream -- and is NOT declared: warming it needs a prefill-shaped
+        synthetic forward context, which the capture builder cannot produce. A
+        stub would claim to be warmable and not be.
+
+        Unlike DSpark's block, this pass does not carry its own metadata; it
+        reads the target's, which ``_enter_decode_metadata`` rewrites to one row
+        per sequence. That rewrite is what ``warmup_inputs`` replays, so the two
+        go through the same code rather than a copy that can drift.
+
+        MRoPE declares nothing, by the same rule Kimi-K3 does: its positions are
+        ``[3, N]``, so there is no leading batch axis to stage, hence nothing to
+        pad and nothing a graph could pin. Declaring anyway used to warm and
+        capture a ONE-dimensional-positions shape that serving never runs --
+        graphs nobody replays, paid for at every startup.
+        """
+        self.step = None
+        if self.runner.use_mrope or self.mtp_k < 2:
+            # mtp_k == 1 has no step 1+, so warming one would capture a graph
+            # `propose` can never reach.
+            return ()
+        draft_hf = self.speculative_config.draft_model_hf_config
+        # DeepSeek-V4 carries the mHC residual, so its hidden is [N, hc, dim]
+        # rather than [N, dim]. `hc_mult` is absent on every architecture that
+        # does not, which is exactly the two-dimensional case.
+        hc = getattr(draft_hf, "hc_mult", None)
+        inputs = {
+            # int64, not the int32 of the token buffer step 0 reads: a mid-step's
+            # ids come from `compute_draft_ids`, which is an argmax. The loop
+            # rebinds `input_ids` from one to the other, so the two halves
+            # genuinely differ.
+            "input_ids": StagedInput(dtype=torch.int64),
+            "positions": StagedInput(dtype=torch.int64),
+            "hidden_states": StagedInput(
+                shape=(
+                    (hc, draft_hf.hidden_size)
+                    if hc is not None
+                    else (draft_hf.hidden_size,)
+                ),
+                dtype=self.dtype,
+            ),
+        }
+        self.step = DraftGraph(
+            forward=self._step_forward,
+            epilogue=self._step_head,
+            capture_epilogue=True,
+            inputs=inputs,
+            warmup_inputs=self._step_warmup_inputs,
+        )
+        return (self.step,)
+
+    def _step_forward(self, running_bs, *, input_ids, positions, hidden_states):
+        """One mid-step draft forward at ``running_bs`` rows.
+
+        PCP does not appear here: only step 0 is a prefill and only a prefill is
+        query-sharded, so steps 1+ run full on every rank.
+
+        Nothing of the target's metadata is installed here. The pad rows are
+        already masked where it matters: `prepare_mtp_decode` writes `-1` into
+        `batch_id_per_token`, and the index kernel returns on `bid < 0` before it
+        ever loads a ring slot.
+        """
+        return self.model(
+            input_ids=input_ids, positions=positions, hidden_states=hidden_states
+        )
+
+    def _step_head(self, out, running_bs, **_):
+        """The mid-step's draft ids, recorded with the backbone that made them.
+
+        Both come back because the next mid-step reads the hidden states and
+        they exist only inside the recording. Every row, never
+        `[:scheduled_bs]`: a capture bakes the length it was made at. Slicing
+        is the caller's, on the way out.
+        """
+        return out, self.model.compute_draft_ids(out)
 
     def _build_draft_model(self, model_class) -> nn.Module:
         draft_model_hf_config = self.speculative_config.draft_model_hf_config
@@ -167,11 +247,11 @@ class EagleProposer(Drafter):
         return hidden
 
     @property
-    def precompute_duplicates_propose(self) -> bool:
+    def draft_kv_duplicates_propose(self) -> bool:
         # The pass below is propose's i==0 step: same rows, same anchors.
         return True
 
-    def precompute_context_kv(
+    def compute_draft_kv(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
@@ -191,7 +271,7 @@ class EagleProposer(Drafter):
 
         The all-middle batch (no -1) is the remaining case; under DP it runs
         `propose(align_only=True)` for its collectives -- the same redo -- so
-        `precompute_duplicates_propose` has the runner skip this call there.
+        `draft_kv_duplicates_propose` has the runner skip this call there.
 
         NOTE: unverified against real weights. `build_drafter` routes anything
         carrying `dspark_block_size` to `DSparkProposer`, and every model on
@@ -201,15 +281,17 @@ class EagleProposer(Drafter):
             return
         forward_context = get_forward_context()
         context = forward_context.context
-        bs = context.batch_size
-        anchors = next_token_ids[:bs]
+        scheduled_bs = context.scheduled_bs
+        anchors = next_token_ids[:scheduled_bs]
         if any(t < 0 for t in anchors):
             return
 
         # Anchor row per sequence = `cu_seqlens_q[1:] - 1`, the rule
         # `propose_draft_token_ids` uses on a pure prefill step.
-        last_token_indices = self.prepare_inputs(bs, 1)
-        anchor_ids = self.anchors_to_gpu(anchors)
+        last_token_indices = self.prepare_inputs(scheduled_bs, 1)
+        anchor_ids = forward_context.context.draft_anchor_overrides
+        assert anchor_ids is not None
+        anchor_ids = anchor_ids[:scheduled_bs]
 
         # `positions` is the padded forward buffer; the target's own output row
         # count is this batch's real token count, and all three inputs below
@@ -235,6 +317,123 @@ class EagleProposer(Drafter):
         finally:
             context.is_draft = was_draft
 
+    def _stage_step_inputs(self, running_bs, input_ids, positions, hidden_states):
+        """Stage one mid-step's inputs."""
+        return {
+            **self.step.stage(
+                running_bs, {"input_ids": input_ids, "hidden_states": hidden_states}
+            ),
+            # Already the pass's buffer: it had to be padded before the metadata
+            # rebuild read it, which is a step earlier than the rest.
+            "positions": positions,
+        }
+
+    def _step_warmup_inputs(self, running_bs, **staged):
+        """Put the warmup context into the shape a mid-step sees.
+
+        The capture builder hands a decode batch at the target's query width;
+        steps 1+ run one row per sequence, and every kernel they compile is
+        chosen from that shape. Replaying the same rewrite serving uses is the
+        point -- a warmup that built its own would warm a shape nobody asks for.
+
+        The same goes for state the model carries: `skip_topk` is read as a
+        Python branch inside the draft's attention, and `propose` turns it on
+        only after step 0. Warming without it records the branch that recomputes
+        the index, which a replay then repeats every step -- the sharing this
+        flavor logs as enabled would be dead, silently.
+        """
+        if self._share_mtp_indices:
+            self.model.model.set_skip_topk(True)
+        fc = get_forward_context()
+        # Where each synthetic sequence actually is. Warming at position 0 would
+        # compile a masked, near-empty window -- a shape steady-state decode
+        # never draws.
+        staged["positions"].copy_(fc.attn_metadata.context_lens[:running_bs])
+        zeros = torch.zeros(running_bs, dtype=torch.int32, device=self.device)
+        self._enter_decode_metadata(
+            running_bs, running_bs, staged["positions"], zeros.to(torch.int64), zeros
+        )
+
+    def _enter_decode_metadata(
+        self,
+        scheduled_bs,
+        running_bs,
+        positions,
+        last_token_indices,
+        num_reject_tokens,
+    ):
+        """Rewrite the target's attn_metadata to one row per sequence.
+
+        Run once, at the tail of draft step 0, and replayed by
+        ``warmup_inputs`` so warmup compiles the shapes serving asks for rather
+        than a copy of them.
+
+        Returns only what is not reachable through ``attn_metadata`` afterwards:
+        the target's original ``max_seqlen_q`` (which this overwrites, and
+        ``prepare_mtp_decode`` still wants) and the per-sequence positions. Every
+        buffer below is installed, so the loop reads it back from there rather
+        than holding a second name for it.
+        """
+        fc = get_forward_context()
+        attn_metadata, context = fc.attn_metadata, fc.context
+        var = self.runner.forward_vars
+        builder = self.runner.attn_metadata_builder
+        target_uses_mla = self.runner.use_mla
+        has_flat_kv = "kv_indices" in var
+        i0_max_seqlen_q = attn_metadata.max_seqlen_q
+        attn_metadata.max_seqlen_q = 1
+        slot_mapping = var["slot_mapping"].gpu[:running_bs]  # max_seqlen_q is 1 here
+        cu_seqlens_q = var["cu_seqlens_q"].gpu[: running_bs + 1]
+        attn_metadata.cu_seqlens_q = cu_seqlens_q
+        attn_metadata.slot_mapping = slot_mapping
+        if has_flat_kv:
+            kv_indptr = var["kv_indptr"].gpu[: running_bs + 1]
+            kv_indices = var["kv_indices"].gpu
+            attn_metadata.kv_indptr = kv_indptr
+            attn_metadata.kv_indices = kv_indices
+        if target_uses_mla:
+            kv_last_page_lens = var["kv_last_page_lens"].gpu[:running_bs]
+            attn_metadata.kv_last_page_lens = kv_last_page_lens
+            # Sparse (DSA) MLA decode packs KV per token at
+            # page_size=1, so it reads the all-1s
+            # sparse_kv_last_page_lens (NOT the dense per-block
+            # buffer, which makes the asm kernel over-read past
+            # the written sparse-index region -> illegal access).
+            # The draft reuses the target's attn_metadata but
+            # drops to max_seqlen_q=1, so it must re-point this to
+            # the per-seq all-1s slice itself.
+            if "sparse_kv_last_page_lens" in var:
+                attn_metadata.sparse_kv_last_page_lens = var[
+                    "sparse_kv_last_page_lens"
+                ].gpu[:running_bs]
+        # block_tables, context_lens, and sparse_kv_indptr are
+        # needed by both MHA and MLA+sparse attention
+        attn_metadata.block_tables = var["block_tables"].gpu[:running_bs]
+        attn_metadata.context_lens = var["context_lens"].gpu[:running_bs]
+        if "sparse_kv_indptr" in var:
+            attn_metadata.sparse_kv_indptr = var["sparse_kv_indptr"].gpu[
+                : running_bs + 1
+            ]
+        cu_seqlens_q[: running_bs + 1] = builder.row_ids[: running_bs + 1]
+        if target_uses_mla and has_flat_kv:
+            # MLA: block_size=1, kv_indptr tracks tokens
+            # Per REAL request: `num_reject_tokens` is scheduled_bs-long, a pad row
+            # rejected nothing. Their `kv_indptr` keeps what the target left,
+            # which is one of its own valid ranges, so their reads stay in
+            # bounds; their WRITES are what has to be neutralized, below.
+            kv_indptr[1 : scheduled_bs + 1] -= torch.cumsum(num_reject_tokens, dim=0)
+        if positions.ndim == 1:
+            positions = torch.index_select(positions, 0, last_token_indices)
+        else:
+            # MRoPE positions keep the token axis last (e.g.
+            # [3, num_tokens] for Qwen3.5), so select columns
+            # instead of indexing dim 0.
+            positions = torch.index_select(
+                positions, positions.ndim - 1, last_token_indices
+            )
+        context.is_prefill = False
+        return i0_max_seqlen_q, positions
+
     def propose(
         self,
         # [num_tokens]
@@ -252,7 +451,12 @@ class EagleProposer(Drafter):
         forward_context = get_forward_context()
         context = forward_context.context
         attn_metadata = forward_context.attn_metadata
-        bs = context.batch_size
+        scheduled_bs = context.scheduled_bs
+        # Mid-steps run at the recorded shape the startup sweep warmed -- but
+        # only when one exists at this batch. Widening is for reaching a
+        # recording; without one it just hands the variable-length MoE gather
+        # padded rows it is contracted not to receive.
+        running_bs = context.running_bs if self.step is not None else scheduled_bs
         context.is_draft = True
 
         assert self.runner is not None
@@ -274,12 +478,14 @@ class EagleProposer(Drafter):
             hidden_states = target_hidden_states
 
         draft_token_ids = torch.empty(
-            bs, self.mtp_k, dtype=next_token_ids.dtype, device=next_token_ids.device
+            scheduled_bs,
+            self.mtp_k,
+            dtype=next_token_ids.dtype,
+            device=next_token_ids.device,
         )
         if envs.ATOM_DEBUG_FORCE_SKIP_DRAFT_MODEL:
             draft_token_ids.fill_(-1)
         var = self.runner.forward_vars
-        target_uses_mla = self.runner.use_mla
         # Eaale3 only support mha currently
         draft_uses_mha = hasattr(self.runner, "eagle3_draft_builder")
 
@@ -290,7 +496,7 @@ class EagleProposer(Drafter):
         # cache is indexed by runner.block_size blocks.
         if draft_uses_mha:
             attn_metadata.slot_mapping = var["slot_mapping"].gpu[: len(input_ids)]
-            attn_metadata.block_tables = var["block_tables"].gpu[:bs]
+            attn_metadata.block_tables = var["block_tables"].gpu[:scheduled_bs]
         elif attn_metadata.slot_mapping is not None:
             # Make MLA draft slot_mapping == q rows. DeepSeek-V4 uses
             # block_tables + context_lens (slot_mapping is None) — nothing to
@@ -304,10 +510,34 @@ class EagleProposer(Drafter):
         # every iteration (used at i>=1 too, even though i==0 sets it).
         has_flat_kv = "kv_indices" in var
 
+        # Mid-steps run padded and may replay; step 0 does neither, so it is
+        # labelled as the plain batch it is.
+        step0_label = f"bs={scheduled_bs}"
+        mid_label = (
+            self.step.label(scheduled_bs, running_bs) if self.step else step0_label
+        )
         for i in range(self.mtp_k):
-            with record_function(f"draft[{i}/{self.mtp_k} bs={bs}]"):
-                # Re-sync DP token
-                self._refresh_dp_metadata(forward_context, input_ids.shape[0])
+            # `tok` is this step's real row count, NOT `scheduled_bs`: step 0
+            # runs the target's whole token stream (a prefill chunk, or
+            # scheduled_bs*(mtp_k+1) on decode) and only steps 1+ run one row
+            # per sequence -- labelling both as `scheduled_bs` collapsed the two
+            # shape axes into one. Taken pre-PCP-split on purpose: the sharded
+            # count is a rank-local detail.
+            with record_function(
+                f"propose_eagle[{i}/{self.mtp_k} tok={input_ids.shape[0]} "
+                f"{mid_label if i else step0_label}]"
+            ):
+                self._publish_draft_shape(
+                    forward_context,
+                    # Steps 1+ run one row per sequence, padded to `running_bs`
+                    # with `scheduled_bs` of them real -- DP sizes its gather
+                    # from the count the forward RUNS. Step 0 carries the
+                    # target's stream and pads nothing.
+                    scheduled_tokens=scheduled_bs if i else input_ids.shape[0],
+                    running_tokens=running_bs if i else input_ids.shape[0],
+                    # Only a widened mid-step runs a height the group agreed on.
+                    running_tokens_are_unified=i > 0 and self.step is not None,
+                )
                 # ---- Prefill Context Parallel (draft i==0 prefill) --------
                 # The draft's first pass is a prefill that reuses the target's
                 # 1/pcp-reindexed attn_metadata, so it must run on this rank's
@@ -342,11 +572,23 @@ class EagleProposer(Drafter):
                 # steps 1+ skip it and read the compacted sparse_kv buffer.
                 if self._share_mtp_indices and i == 0:
                     self.model.model.set_skip_topk(False)
-                ret_hidden_states = self.model(
-                    input_ids=d_input_ids,
-                    positions=d_positions,
-                    hidden_states=d_hidden,
-                )
+                if i and self.step is not None:
+                    # Steps 1+ are the declared pass: one row per sequence, at
+                    # a batch the startup sweep already warmed. The head rides
+                    # in the recording, so this hands back both of its outputs.
+                    ret_hidden_states, graphed_ids = self.step.run(
+                        running_bs,
+                        **self._stage_step_inputs(
+                            running_bs, d_input_ids, d_positions, d_hidden
+                        ),
+                    )
+                else:
+                    ret_hidden_states = self.model(
+                        input_ids=d_input_ids,
+                        positions=d_positions,
+                        hidden_states=d_hidden,
+                    )
+                    graphed_ids = None
                 if pcp_draft_prefill:
                     ret_hidden_states = pcp_allgather_rerange(
                         ret_hidden_states, pcp_ws
@@ -355,11 +597,16 @@ class EagleProposer(Drafter):
                     self.model.model.set_skip_topk(True)
                     self.model.model.compact_topk_indices(last_token_indices)
 
+                # Step 0 gathers one row per sequence out of the token stream;
+                # steps 1+ already are one row per sequence -- sliced back off
+                # the padded batch, so nothing downstream sees a pad row.
                 sample_hidden_states = (
                     torch.index_select(ret_hidden_states, 0, last_token_indices)
                     if i == 0
-                    else ret_hidden_states
+                    else ret_hidden_states[:scheduled_bs]
                 )
+                # Only step 0 and a flavor with no declared pass land here; a
+                # recorded mid-step produced its ids inside the graph.
                 # Every draft model EagleProposer can build implements this --
                 # the DSpark archs in support_draft_model_arch_dict do not, but
                 # they are DSparkProposer's and never reach this loop. All of
@@ -368,7 +615,11 @@ class EagleProposer(Drafter):
                 # compute_logits().argmax(-1) here because is_draft suppresses
                 # the LM head's prefill last-token slice. How the ids are
                 # produced stays the model's business, not this loop's.
-                new_draft_ids = self.model.compute_draft_ids(sample_hidden_states)
+                new_draft_ids = (
+                    graphed_ids[:scheduled_bs]
+                    if graphed_ids is not None
+                    else self.model.compute_draft_ids(sample_hidden_states)
+                )
                 draft_token_ids[:, i] = new_draft_ids
 
                 if i < self.mtp_k - 1:
@@ -378,60 +629,26 @@ class EagleProposer(Drafter):
                         and self.runner.attn_metadata_builder.num_attention_heads != 32
                     )
                     if i == 0:
-                        i0_max_seqlen_q = attn_metadata.max_seqlen_q
-                        attn_metadata.max_seqlen_q = 1
-                        slot_mapping = var["slot_mapping"].gpu[
-                            : bs * attn_metadata.max_seqlen_q
-                        ]
-                        cu_seqlens_q = var["cu_seqlens_q"].gpu[: bs + 1]
-                        attn_metadata.cu_seqlens_q = cu_seqlens_q
-                        attn_metadata.slot_mapping = slot_mapping
-                        if has_flat_kv:
-                            kv_indptr = var["kv_indptr"].gpu[: bs + 1]
-                            kv_indices = var["kv_indices"].gpu
-                            attn_metadata.kv_indptr = kv_indptr
-                            attn_metadata.kv_indices = kv_indices
-                        if target_uses_mla:
-                            kv_last_page_lens = var["kv_last_page_lens"].gpu[:bs]
-                            attn_metadata.kv_last_page_lens = kv_last_page_lens
-                            # Sparse (DSA) MLA decode packs KV per token at
-                            # page_size=1, so it reads the all-1s
-                            # sparse_kv_last_page_lens (NOT the dense per-block
-                            # buffer, which makes the asm kernel over-read past
-                            # the written sparse-index region -> illegal access).
-                            # The draft reuses the target's attn_metadata but
-                            # drops to max_seqlen_q=1, so it must re-point this to
-                            # the per-seq all-1s slice itself.
-                            if "sparse_kv_last_page_lens" in var:
-                                attn_metadata.sparse_kv_last_page_lens = var[
-                                    "sparse_kv_last_page_lens"
-                                ].gpu[:bs]
-                        # block_tables, context_lens, and sparse_kv_indptr are
-                        # needed by both MHA and MLA+sparse attention
-                        attn_metadata.block_tables = var["block_tables"].gpu[:bs]
-                        attn_metadata.context_lens = var["context_lens"].gpu[:bs]
-                        if "sparse_kv_indptr" in var:
-                            attn_metadata.sparse_kv_indptr = var[
-                                "sparse_kv_indptr"
-                            ].gpu[: bs + 1]
-                        cu_seqlens_q[: bs + 1] = self.arrange_bs[: bs + 1]
-                        if target_uses_mla and has_flat_kv:
-                            # MLA: block_size=1, kv_indptr tracks tokens
-                            kv_indptr[1 : bs + 1] -= torch.cumsum(
-                                num_reject_tokens, dim=0
-                            )
-                        if positions.ndim == 1:
-                            positions = torch.index_select(
-                                positions, 0, last_token_indices
-                            )
-                        else:
-                            # MRoPE positions keep the token axis last (e.g.
-                            # [3, num_tokens] for Qwen3.5), so select columns
-                            # instead of indexing dim 0.
-                            positions = torch.index_select(
-                                positions, positions.ndim - 1, last_token_indices
-                            )
-                        context.is_prefill = False
+                        i0_max_seqlen_q, positions = self._enter_decode_metadata(
+                            scheduled_bs,
+                            running_bs,
+                            positions,
+                            last_token_indices,
+                            num_reject_tokens,
+                        )
+                        # From here the loop owns the pass's positions buffer.
+                        # `prepare_mtp_decode` derives each step's SWA extents
+                        # from it, so it has to be `running_bs` long before THAT --
+                        # padding it with the other rows, just before the
+                        # forward, is a step too late.
+                        #
+                        # No MRoPE case to guard: a model whose positions keep
+                        # the token axis last declares no pass, so `self.step` is
+                        # None and these stay the target's own 2-D positions.
+                        if self.step is not None:
+                            positions = self.step.stage(
+                                running_bs, {"positions": positions}
+                            )["positions"]
 
                     # update metadata
                     attn_metadata.max_seqlen_k += 1
@@ -446,11 +663,14 @@ class EagleProposer(Drafter):
                             "positions_out": positions,
                         }
                     else:
-                        attn_metadata.context_lens[:bs] += 1
+                        attn_metadata.context_lens[:running_bs] += 1
                         positions += 1
                         mtp_decode_kwargs = {}
+                    # `scheduled_bs` stays the REAL sequence count; the builder
+                    # reads the padded row count off `positions`, which is the
+                    # pass's own buffer and therefore already `running_bs` long.
                     workinfos = self.runner.attn_metadata_builder.prepare_mtp_decode(
-                        bs,
+                        scheduled_bs,
                         (
                             attn_metadata.max_seqlen_q
                             if not do_attn_metadata_update
@@ -465,8 +685,14 @@ class EagleProposer(Drafter):
                     for k, v in workinfos.items():
                         attn_metadata.__dict__[k] = v
                     if has_flat_kv and "slot_mapping" not in workinfos:
-                        # MLA/MHA path: slot derived from flat kv_indices.
-                        raw_slots = kv_indices[kv_indptr[1 : bs + 1] - 1]
+                        # MLA/MHA path: slot derived from flat kv_indices. Both,
+                        # and the slot_mapping written below, are the ones
+                        # `_enter_decode_metadata` installed -- no backend
+                        # returns them, so this branch is exactly the case where
+                        # `attn_metadata` still holds them.
+                        raw_slots = attn_metadata.kv_indices[
+                            attn_metadata.kv_indptr[1 : running_bs + 1] - 1
+                        ]
                         builder = self.runner.attn_metadata_builder
                         if getattr(builder, "dcp_world_size", 1) > 1:
                             # DCP interleave-S: only rank ((ctx-1)//S) % W owns this
@@ -474,13 +700,25 @@ class EagleProposer(Drafter):
                             # raw_slots would point at a stale slot. Emit -1. S=1 is
                             # the original round-robin ``(ctx-1) % W``.
                             S = getattr(builder, "cp_kv_cache_interleave_size", 1)
-                            ctx = attn_metadata.context_lens[:bs]
+                            ctx = attn_metadata.context_lens[:running_bs]
                             owned = (
                                 ((ctx - 1) // S) % builder.dcp_world_size
                             ) == builder.dcp_rank
-                            slot_mapping[:] = torch.where(owned, raw_slots, -1)
+                            attn_metadata.slot_mapping[:] = torch.where(
+                                owned, raw_slots, -1
+                            )
                         else:
-                            slot_mapping[:] = raw_slots
+                            attn_metadata.slot_mapping[:] = raw_slots
+                    # A pad row's slot is some real sequence's, and the draft
+                    # writes KV through it. -1 is this path's existing "skip"
+                    # sentinel (the DCP branch above emits it too), and the aiter
+                    # cache kernels honour it.
+                    #
+                    # Outside the branch above: a backend that RETURNS a
+                    # slot_mapping computed it over `running_bs` rows too, so leaving
+                    # this inside was how those pad rows kept a live slot.
+                    if running_bs > scheduled_bs:
+                        attn_metadata.slot_mapping[scheduled_bs:] = -1
 
                     input_ids = new_draft_ids
                     hidden_states = sample_hidden_states

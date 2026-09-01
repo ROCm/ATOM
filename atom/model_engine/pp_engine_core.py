@@ -6,12 +6,14 @@
 
 import logging
 import queue
+import time
 from collections import deque
 
 from atom.distributed.pp_transport import PPStageTransport
 from atom.kv_transfer.disaggregation.pp_kv_aggregator import PPKVAggregator
 from atom.kv_transfer.disaggregation.types import (
     KVConnectorOutput,
+    completion_req_key,
     connector_metadata_has_work,
 )
 from atom.model_engine.engine_core import EngineCore
@@ -48,7 +50,7 @@ class PPEngineCoreProc(EngineCore):
         # per-request ring now and publishes nothing, so the exception is gone.
         self._defer_prefix_hash: bool = bm.enable_prefix_caching
         self._pp_kv_aggregator: PPKVAggregator | None = None
-        self._held_sending: dict = {}
+        self._held_sending: dict[str, tuple] = {}
         logger.info(
             f"{self.label}: PP stage {self.pp_rank}/{self.pp_size} "
             f"(head={self.is_head}, last={self.is_last}) ready"
@@ -65,6 +67,7 @@ class PPEngineCoreProc(EngineCore):
         try:
             while True:
                 self.utility_handler.process_queue(self.utility_queue, self)
+                self.scheduler.heartbeat_throughput(time.monotonic())
                 shutdown = shutdown or self.pull_and_process_input_queue()
                 if shutdown:
                     break
@@ -282,18 +285,26 @@ class PPEngineCoreProc(EngineCore):
         if self._pp_kv_aggregator is None:
             self._pp_kv_aggregator = PPKVAggregator(self.pp_size)
 
-        # MultiConnector releases a request's send and its stage-local save in
-        # the same poll (see its "Send/save pairing" docstring), so a send that
-        # arrives with no save alongside it belongs to a request no stage is
-        # saving — a prompt shorter than the offload chunk, or one whose chunks
-        # were already persisted. Holding those would strand them forever: no
-        # finished_saving is ever coming. Only the paired sends wait for the
-        # PP-wide save quorum.
-        local_saving = {str(rid) for rid in kvoutput.finished_saving or ()}
+        # MultiConnector emits a send together with its stage-local saves, so
+        # a send arriving alone belongs to a request no stage is saving —
+        # holding it would strand it forever. A paired send waits for the
+        # PP-wide quorum, which is per save generation, hence the whole set.
+        # It is complete: mooncake sends only after the request's last chunk.
+        local_saving = {
+            completion_req_key(rid) for rid in kvoutput.finished_saving or ()
+        }
         unpaired_sending = set()
         for rid in kvoutput.finished_sending or ():
-            if str(rid) in local_saving:
-                self._held_sending[str(rid)] = rid
+            key = completion_req_key(rid)
+            if key in local_saving:
+                self._held_sending[key] = (
+                    rid,
+                    {
+                        op
+                        for op in kvoutput.finished_saving
+                        if completion_req_key(op) == key
+                    },
+                )
             else:
                 unpaired_sending.add(rid)
         if unpaired_sending:
@@ -321,9 +332,15 @@ class PPEngineCoreProc(EngineCore):
         # Release held finished_sending whose global save is now complete.
         rel = set()
         for rid in result.finished_saving or ():
-            held = self._held_sending.pop(str(rid), None)
-            if held is not None:
-                rel.add(held)
+            key = completion_req_key(rid)
+            held = self._held_sending.get(key)
+            if held is None:
+                continue
+            raw, pending = held
+            pending.discard(rid)
+            if not pending:
+                del self._held_sending[key]
+                rel.add(raw)
         if rel:
             result.finished_sending = rel
         self.scheduler._update_from_kv_xfer_finished(result)

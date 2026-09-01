@@ -14,6 +14,10 @@ on:
         description: "Benchmark DeepSeek-V4-Pro"
         type: boolean
         default: true
+      deepseek-v4-pro-eplb:
+        description: "Benchmark DeepSeek-V4-Pro EPLB r0 + MegaMoE (8k1k, c=512/4096)"
+        type: boolean
+        default: true
       glm-5-2-fp8:
         description: "Benchmark GLM-5.2-FP8"
         type: boolean

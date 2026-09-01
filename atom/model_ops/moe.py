@@ -36,6 +36,7 @@ from atom.model_ops.fused_moe.config import (
     FusedMoEConfig,
     FusedMoEQuantConfig,
     fp8_w8a8_moe_quant_config,
+    moe_kernel_token_capacity,
     mxfp4_w4a8_moe_quant_config,
     mxfp4_w4a16_moe_quant_config,
 )
@@ -347,50 +348,47 @@ def naive_multicast(
 
 
 def pad_for_all_gather(x: torch.Tensor) -> tuple[torch.Tensor, int]:
-    """Pad ``x`` along dim 0 up to the uniform all-gather batch size.
+    """Pad ``x`` up to the uniform all-gather height, and return both.
 
-    Every DP rank must contribute the same number of rows to the uniform
-    all-gather, so a short batch is padded up to ``graph_bs`` (scaled by the
-    per-sequence query length when decoding with MTP > 1).
+    The height comes off the context, never off ``x``: this pads for a
+    collective, so guessing it from the tensor turns a caller's mistake into a
+    DP-wide hang instead of a local failure. A decode forward arrives already
+    at ``running_tokens`` (the runner padded ``input_ids``), a prefill at
+    ``scheduled_tokens``; a draft states its own pair before it runs
+    (`Drafter._publish_draft_shape`), so it needs no case here.
 
-    Pad rows are left UNINITIALIZED. The expert GEMM is per-token and
-    ``reduce_scatter_with_unpadding`` drops the pad region, so garbage there
-    cannot reach a real token's output. It DOES reach the EPLB counter:
-    ``get_moe_input`` gathers ``router_logits`` with the same padding, so
-    ``record_eplb_expert_load`` counts pad rows into the expert-load histogram.
-    Fix that by excluding pad rows from the counter, not by zeroing here —
-    all-zero logits route deterministically and skew it just as much.
+    ATOM therefore never reaches the copy below -- it only runs uniform decode,
+    where the two are equal. The bridges can, on a prefill they call uniform.
 
-    (An earlier revision claimed the pad MUST be zeroed, citing a ~0.7pp GSM8K
-    drop. It was written while ``zero_()`` was already commented out, and
-    restoring the zeroing measures no difference on V4-Flash-DSpark tp8 + DPA —
-    though that is not the V4-Pro TBO config the original was bisected on.)
-
-    Returns the (possibly padded) tensor and the original row count so the
-    caller can unpad after reduce-scatter.
+    Pad rows are left UNINITIALIZED: the expert GEMM is per-token and
+    ``reduce_scatter_with_unpadding`` drops them. They DO reach the EPLB
+    counter, since ``get_moe_input`` gathers ``router_logits`` the same way --
+    exclude them there rather than zeroing here, which skews it just as much.
     """
-    ctx = get_forward_context()
-    max_batch_size = ctx.context.graph_bs
-    if not ctx.context.is_prefill and ctx.attn_metadata is not None:
-        max_batch_size *= ctx.attn_metadata.max_seqlen_q
-
-    original_batch_size = x.shape[0]
-    padding_size = max_batch_size - original_batch_size
-    if padding_size <= 0:
-        return x, original_batch_size
+    ctx = get_forward_context().context
+    running_tokens = ctx.running_tokens
+    local_tokens = ctx.scheduled_tokens if ctx.is_prefill else running_tokens
+    assert x.shape[0] == local_tokens, (
+        f"MoE was handed {x.shape[0]} rows on a "
+        f"{'prefill' if ctx.is_prefill else 'decode'} step expecting "
+        f"{local_tokens} (scheduled_tokens={ctx.scheduled_tokens}, "
+        f"running_tokens={running_tokens})"
+    )
+    if local_tokens >= running_tokens:
+        return x, local_tokens
 
     padding_shape = list(x.shape)
-    padding_shape[0] = max_batch_size
+    padding_shape[0] = running_tokens
     padded_x = torch.empty(padding_shape, device=x.device, dtype=x.dtype)
-    padded_x[:original_batch_size, :].copy_(x)
-    # padded_x[original_batch_size:, :].zero_() # keep for debug
-    return padded_x, original_batch_size
+    padded_x[:local_tokens, :].copy_(x)
+    # padded_x[local_tokens:, :].zero_() # keep for debug
+    return padded_x, local_tokens
 
 
 def all_gather_with_padding(
     x: torch.Tensor, use_cag: bool = True
 ) -> tuple[torch.Tensor, int]:
-    padded_x, original_batch_size = pad_for_all_gather(x)
+    padded_x, local_tokens = pad_for_all_gather(x)
     # use_custom=True routes through CA IPC (outplace_all_gather). Default
     # use_custom=False falls back to torch.distributed.all_gather_into_tensor
     # (NCCL), whose WorkNCCL end-event recorded inside CUDAGraph capture is
@@ -398,7 +396,7 @@ def all_gather_with_padding(
     gathered_hidden_states = get_dp_group().all_gather(
         padded_x, use_custom=use_cag, dim=0
     )
-    return gathered_hidden_states, original_batch_size
+    return gathered_hidden_states, local_tokens
 
 
 def repeat_rows(x: torch.Tensor, times: int) -> torch.Tensor:
@@ -416,16 +414,14 @@ def repeat_rows(x: torch.Tensor, times: int) -> torch.Tensor:
     return x.repeat(times, *([1] * (x.dim() - 1)))
 
 
-def reduce_scatter_with_unpadding(
-    x: torch.Tensor, original_batch_size: int
-) -> torch.Tensor:
+def reduce_scatter_with_unpadding(x: torch.Tensor, local_tokens: int) -> torch.Tensor:
     dp_group = get_dp_group()
     scattered_output = dp_group.reduce_scatter_tensor(x)
 
     # Drop the rows pad_for_all_gather appended (padding is on dim 0). Their
     # contents were never initialized, so they must not survive past here.
-    if scattered_output.shape[0] > original_batch_size:
-        scattered_output = scattered_output[:original_batch_size]
+    if scattered_output.shape[0] > local_tokens:
+        scattered_output = scattered_output[:local_tokens]
 
     return scattered_output
 
@@ -455,13 +451,21 @@ def dp_gather_hidden_and_router(
       same token count, so a plain padded ``all_gather`` per tensor is
       enough.
 
-    Returns ``(hidden_states, router_logits, original_hidden_size, sizes)``;
-    ``sizes`` is non-None only in eager mode (needed later for
-    ``reduce_scatterv``).
+    Returns ``(hidden_states, router_logits, local_tokens, sizes)``, where
+    ``local_tokens`` is this rank's own height -- what ``reduce_scatterv`` /
+    ``reduce_scatter_with_unpadding`` must trim back to. ``sizes`` is non-None
+    only in eager mode (needed later for ``reduce_scatterv``).
     """
     if dp_eager_mode:
         sizes = ctx.dp_metadata.get_sizes_across_dp()
-        original_hidden_size = hidden_states.shape[0]
+        # Eager means nothing was padded, so the context's two heights agree
+        # and either is the row count to unpad back to. Taken from the context
+        # rather than the tensor for the reason `pad_for_all_gather` gives.
+        local_tokens = ctx.context.scheduled_tokens
+        assert hidden_states.shape[0] == local_tokens, (
+            f"MoE was handed {hidden_states.shape[0]} rows on an eager step "
+            f"expecting {local_tokens}"
+        )
         h_dim = hidden_states.shape[-1]
         r_dim = router_logits.shape[-1]
         r_dtype = router_logits.dtype
@@ -480,11 +484,11 @@ def dp_gather_hidden_and_router(
             router_logits = router_logits.to(r_dtype)
         else:
             router_logits = router_logits.contiguous()
-        return hidden_states, router_logits, original_hidden_size, sizes
+        return hidden_states, router_logits, local_tokens, sizes
 
-    hidden_states, original_hidden_size = all_gather_with_padding(hidden_states)
+    hidden_states, local_tokens = all_gather_with_padding(hidden_states)
     router_logits, _ = all_gather_with_padding(router_logits)
-    return hidden_states, router_logits, original_hidden_size, None
+    return hidden_states, router_logits, local_tokens, None
 
 
 @torch_compile_guard()
@@ -685,6 +689,13 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 "num_local_experts": moe.num_local_experts,
                 "num_experts_per_token": moe.experts_per_token,
                 "gpu_per_node": moe.moe_parallel_config.local_ep_size,
+                # The same probe the sync handle uses (aiter sets it from
+                # in_the_same_node_as). Sharing one source keeps prefill and
+                # decode on the same kernel type -- inferring it from
+                # `world_size <= 8` instead let them disagree on a 2-node x
+                # 4-GPU group, running IntraNode kernels across a boundary
+                # that has no P2P mapping.
+                "internode": all2all_manager.internode,
                 "data_type_itemsize": moe.in_dtype.itemsize,
                 "max_token_type_size": moe.in_dtype.itemsize,
                 "scale_type_size": scale_type_size,
@@ -692,7 +703,9 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             }
 
             tbo_mori_ops = None
-            sync_handle = handle  # IntraNode handle for prefill (sync path)
+            # Prefill (sync path). aiter picks its kernel from the same
+            # internode probe, so this is not necessarily IntraNode.
+            sync_handle = handle
             if is_async:
                 from atom.model_ops.fused_moe.mori_prepare_finalize import (
                     _NUM_TBO_UBATCHES,
@@ -2814,6 +2827,12 @@ class FusedMoE(torch.nn.Module):
                 self.expert_mask[start : start + self.local_num_experts] = 1
             else:
                 self.expert_mask = (self.expert_map > -1).to(torch.int32)
+        moe_token_capacity = moe_kernel_token_capacity(
+            atom_config,
+            dp_size=self.moe_parallel_config.dp_size,
+            use_all2all=self.moe_parallel_config.use_all2all_kernels,
+            dp_logical_ratio=self.moe_parallel_config.dp_logical_ratio,
+        )
         if self.expert_layout.mode is SharedExpertMode.LEGACY_AITER:
             init_aiter_topK_meta_data(
                 n_routed_experts=num_experts,
@@ -2826,7 +2845,7 @@ class FusedMoE(torch.nn.Module):
                     if is_rocm_aiter_fuse_routed_scaling_factor()
                     else 1 / self.routed_scaling_factor
                 ),
-                max_num_tokens=atom_config.max_num_batched_tokens,
+                max_num_tokens=moe_token_capacity,
                 is_EP=self.use_ep,
             )
         assert intermediate_size % self.tp_size == 0
@@ -2842,6 +2861,14 @@ class FusedMoE(torch.nn.Module):
         self.custom_routing_function = custom_routing_function
         self.scoring_func = scoring_func
         self.e_score_correction_bias = e_score_correction_bias
+        if atom_config.fake_eplb and e_score_correction_bias is not None:
+            # The noaux_tc bias is added on top of the score, so a bias wider than
+            # the synthetic logits' gap (~3.16 after sqrtsoftplus) picks the top-k
+            # by itself -- and `--load_dummy` never writes it, leaving recycled
+            # garbage that collapses every token onto one EP rank. `del` first: a
+            # plain tensor cannot overwrite the parameter registered above.
+            del self.e_score_correction_bias
+            self.e_score_correction_bias = torch.zeros_like(e_score_correction_bias)
         self.activation = activation
         if config is not None:
             self.activation_situ_beta = getattr(config, "activation_situ_beta", None)
@@ -2873,7 +2900,7 @@ class FusedMoE(torch.nn.Module):
             expert_layout=self.expert_layout,
             in_dtype=atom_config.torch_dtype,
             a_quant_dtype=a_quant_dtype,
-            max_num_tokens=atom_config.max_num_batched_tokens,
+            max_num_tokens=moe_token_capacity,
             has_bias=self.has_bias,
             # is_act_and_mul=True,
             is_lora_enabled=False,
@@ -2947,7 +2974,7 @@ class FusedMoE(torch.nn.Module):
         _dp_shard = self.use_ep and atom_config.enable_dp_attention
         self.balance_router_logits = (
             init_balance_router_logits(
-                self.global_num_experts,
+                self.expert_layout.num_routed,
                 top_k,
                 self.ep_size if self.use_ep else 1,
                 self.dp_size if _dp_shard else 1,
@@ -4255,8 +4282,10 @@ class FusedMoE(torch.nn.Module):
         # 1. Pure DP mode: only DP is used
         # 2. DP attention + EP mori Moe
         # 3. DP attention + TP All_gahter/reduce Moe
-        original_hidden_size = None
-        sizes = None
+        # `local_tokens` / `sizes` are bound inside the gather block below and
+        # read only inside the scatter block, which tests the same unchanged
+        # condition -- pre-seeding them with None would make a state the code
+        # cannot reach look representable.
         # Use all_gather/reduce_scatter when DP > 1 but not using mori all2all kernels
         use_dp_gather_scatter = (
             self.dp_size > 1
@@ -4266,7 +4295,7 @@ class FusedMoE(torch.nn.Module):
         if use_dp_gather_scatter:
             ctx = get_forward_context()
             dp_group = get_dp_group()
-            dp_eager_mode = not ctx.context.dp_uniform_decode
+            dp_eager_mode = not ctx.context.running_tokens_are_unified
 
             from atom.utils.tbo.ubatching import tbo_active
 
@@ -4282,7 +4311,7 @@ class FusedMoE(torch.nn.Module):
             (
                 hidden_states,
                 router_logits,
-                original_hidden_size,
+                local_tokens,
                 sizes,
             ) = dp_gather_hidden_and_router(
                 hidden_states, router_logits, dp_eager_mode, ctx, dp_group
@@ -4333,7 +4362,7 @@ class FusedMoE(torch.nn.Module):
                 )
             else:
                 final_hidden_states = reduce_scatter_with_unpadding(
-                    final_hidden_states, original_hidden_size
+                    final_hidden_states, local_tokens
                 )
             if _tbo:
                 tbo_switch_to_compute_sync()
