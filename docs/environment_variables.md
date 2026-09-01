@@ -155,6 +155,17 @@ that ever changes, so a fusion left inert by an unrecognised layout says so.
 |----------|------|---------|-------------|
 | **ATOM_DSPARK_FUSED_CTX_KV** | bool | 1 (true) | Write the context rows with one Triton kernel (RMSNorm + RoPE + concat + paged store) instead of four launches plus a throwaway `empty_like` for the RoPE's query side. Falls back per call when the cache layout or the RoPE is not the plain one the kernel understands (seg / shuffled-KV layouts keep their own write kernels), and until the RoPE's cos/sin cache has reached the device. Measured on Kimi-K3 (MI355X, TP8, fp8 KV): one 4.65 µs kernel replaces a 14 µs three-kernel chain, saving ~39 µs per drafting step at B=1 and ~36 µs at B=64. Set to `0` to force the per-op chain; that chain is the fallback above rather than debug code, so it stays reachable either way (it runs the first write of every layer). |
 
+## Decode context parallelism (DCP)
+
+Shape of the sparse-MLA (DSA) index cache under DCP. The index cache is normally
+sharded the same way the MLA latent KV is, which makes the indexer's global
+top-k a cross-rank candidate all-gather. See the
+[context parallel guide](context_parallel_guide.md).
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_DCP_REPLICATE_INDEX_CACHE** | bool | 0 (false) | Experimental. Keep the MLA latent KV sharded but replicate every full IndexShare layer's index cache on all DCP ranks, so each rank scores the whole sequence and the candidate all-gather/global-merge disappears. Costs `dcp_size` × index-cache memory, and widens an index page from `block_size` to `block_size * dcp_size` tokens. Enabling it raises at startup unless the whole supported topology holds: `glm_moe_dsa`, `-dcp > 1`, `ATOM_MLA_PAGE_SIZE=1`, no PCP, no PP, no RapidServe, and a KV-transfer config that is standalone LMCache, standalone Mooncake, or multi[Mooncake producer + LMCache offload]. In a P/D deployment this is a **decode-side** flag: a CPP prefill node runs pp>1/dcp=1 and the layout rejects both. |
+
 ## V4 attention backend (Migration)
 
 Selects between the legacy per-seq Python dispatch path in `atom/models/deepseek_v4.py`

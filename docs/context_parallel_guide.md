@@ -263,9 +263,12 @@ existing TP ranks, so `world = tp` and `tp` must be divisible by `dcp`.
 > the ATOM server path is validated; the **vllm-atom plugin path is not yet
 > verified**.
 >
-> **Not yet supported: DSA + DCP + MTP.** Speculative decode (MTP, `q > 1`) is
-> only available for dense MLA (gfx950); combining it with sparse attention under
-> DCP is rejected at runtime — see the DCP Constraints & Compatibility table below.
+> **DSA + DCP + MTP needs the replicated index cache.** Speculative decode
+> (MTP, `q > 1`) on sparse MLA under DCP requires
+> `ATOM_DCP_REPLICATE_INDEX_CACHE=1`. With the default *sharded* index cache the
+> global top-k comes from a cross-rank candidate all-gather that only handles
+> `qlen=1`, and an MTP verify step is rejected by an assert. Dense MLA is
+> unaffected. See the DCP Constraints & Compatibility table below.
 
 ## When to use DCP
 
@@ -291,6 +294,7 @@ existing TP ranks, so `world = tp` and `tp` must be divisible by `dcp`.
 | `--kv-cache-dtype fp8` | `auto` | Supported with DCP (per-tensor scale). `auto`/`bf16` also fine |
 | `--enable_prefix_caching` | off | Supported with DCP |
 | `--enable_chunked_prefill` / `--no-enable_chunked_prefill` | on | Chunked prefill is supported with DCP; on by default |
+| `ATOM_DCP_REPLICATE_INDEX_CACHE=1` | off | Sparse MLA (DSA) only: replicate the index cache on every DCP rank instead of sharding it, which drops the indexer's candidate all-gather and is what makes DSA + DCP + MTP work. See [Sparse MLA (DSA) + MTP](#sparse-mla-dsa--mtp) |
 
 | Goal (8 GPUs) | Command |
 |------|---------|
@@ -576,9 +580,12 @@ mask, so the intra-block mask has to be applied on global positions. This is
 handled by a dedicated **round-robin CP (`cprr`) MLA kernel**, selected
 automatically when DCP is on, `q > 1`, and the decode is causal.
 
-> **Dense MLA only.** This applies to dense MLA (V3 / R1). **DSA / sparse MLA
-> (V3.2-Exp) does not support MTP under DCP yet** — sparse decode with `q > 1` is
-> rejected by an assert. Serve DSA + DCP without `--method mtp`.
+> **Sparse MLA takes a different route.** The `cprr` kernel above is the dense
+> MLA (V3 / R1) path. **DSA / sparse MLA under DCP verifies MTP through the
+> per-query-token top-k filter instead**, and only with
+> `ATOM_DCP_REPLICATE_INDEX_CACHE=1` — see
+> [Sparse MLA (DSA) + MTP](#sparse-mla-dsa--mtp). Left on the default sharded
+> index cache, sparse decode with `q > 1` is still rejected by an assert.
 
 **Support matrix:**
 
@@ -607,6 +614,29 @@ Plugin path (`vllm serve`): add `--speculative-config '{"method":"mtp","num_spec
 
 Accuracy: gsm8k (DeepSeek-R1, tp8, 5-shot) matches the non-speculative DCP
 baseline (≈0.95) across bf16/fp8 and `num_speculative_tokens` 1/2/3.
+
+### Sparse MLA (DSA) + MTP
+
+Sparse decode does not use the `cprr` kernel. Its intra-block causality is
+already carried by the per-layer top-k, so the only thing MTP changes is the
+*row unit*: a verify step forwards `max_seqlen_q` draft positions per request,
+each with its own top-k, while the block table stays per request.
+`triton_filter_and_convert_dcp_index` therefore keys on the **query token**
+(`token_to_seq_idxs` maps a row back to its owning request) rather than on
+`qo_indptr`. At `qlen == 1` the two are identical, so the non-speculative path
+is unchanged.
+
+This requires **`ATOM_DCP_REPLICATE_INDEX_CACHE=1`**. The default sharded index
+cache reaches its global top-k through `dcp_decode_candidate_exchange`, which
+asserts `max_seqlen_q == 1`; replicating the index cache removes that exchange
+entirely, so every rank scores the whole sequence and each draft position gets
+its own compacted region. The cost is `dcp_size` × index-cache memory, and an
+index page widens from `block_size` to `block_size * dcp_size` tokens. See
+[environment variables](environment_variables.md#decode-context-parallelism-dcp)
+for the full startup gate.
+
+In a P/D deployment this is a **decode-side** flag. A CPP prefill node runs
+`pp > 1` / `dcp = 1`, and the layout rejects both.
 
 ### DSpark (Kimi-K3)
 
@@ -655,7 +685,8 @@ contributing under DCP rather than collapsing back to single-token decode.
 | gathered head width 64 + fp8 KV | Native sparse / DSA prefill and q_len=1 decode on gfx950 rebuild persistent metadata per full IndexShare layer and run gqa64 directly; unsupported non-persistent paths still pad to 128 — see [Sparse DCP persistent attention and gqa=64](#sparse-dcp-persistent-attention-and-gqa64) |
 | speculative decode (MTP), dense MLA | Supported on **gfx950 only** (bf16/fp8, `num_speculative_tokens` 1–3); raises at startup on gfx942 |
 | speculative decode (DSpark), Kimi-K3 | Supported on gfx950; validated at `tp8 -dcp 8` with `num_speculative_tokens 2` |
-| speculative decode (MTP), sparse / DSA | **Not supported** — sparse decode with `q > 1` under DCP is rejected by an assert |
+| speculative decode (MTP), sparse / DSA | Supported **only with `ATOM_DCP_REPLICATE_INDEX_CACHE=1`**; on the default sharded index cache sparse decode with `q > 1` is rejected by an assert |
+| `ATOM_DCP_REPLICATE_INDEX_CACHE` | Experimental, decode-side, `glm_moe_dsa` + `-dcp > 1` + page size 1 only; rejects PP, PCP and RapidServe at startup. Costs `dcp_size` × index-cache memory |
 | vllm-atom plugin | Validated for dense MLA only; the sparse / DSA and Kimi-K3 plugin paths are not yet verified |
 | DCP + PCP | Independent dimensions (different phases); combined use not validated here |
 
