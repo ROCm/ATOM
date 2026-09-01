@@ -219,11 +219,27 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
 
     # -- per-step ----------------------------------------------------------
     def start_load_kv(self, metadata) -> None:
-        if isinstance(metadata, LMCacheOffloadMetadata):
-            self._arm_joint_loads(metadata)
+        if not isinstance(metadata, LMCacheOffloadMetadata):
+            super().start_load_kv(metadata)
+            return
+        # The three state helpers run before super() so the KV leg is submitted
+        # against a park that already exists. They must not be able to skip
+        # super(): _JointPark's correctness -- and the refutation of the
+        # "park leaks on abort" candidate -- both rest on "the KV leg always
+        # reports", which holds only while super().start_load_kv() cannot be
+        # skipped. `ThreadPoolExecutor.submit` raises RuntimeError if the
+        # executor was shut down by a racing close() or the OS refuses a thread,
+        # and ModelRunner.process_kvconnector_output has no handler -- so each
+        # submit is isolated inside its helper (a failure fails just that item,
+        # into the same failed-load / failed-store channels a no-tier step uses,
+        # so the armed park resolves to a recompute instead of hanging), and
+        # super() runs in a finally so a KV load or save is never dropped.
+        self._arm_joint_loads(metadata)
+        try:
             self._start_state_loads(metadata)
             self._start_state_stores(metadata)
-        super().start_load_kv(metadata)
+        finally:
+            super().start_load_kv(metadata)
 
     def _arm_joint_loads(self, metadata) -> None:
         """Hold a request owning both legs until both report.
@@ -299,7 +315,19 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
             self._fail_state_loads(loads)
             return
         for req_id, h, group in loads:
-            self._state_tier.submit_load(req_id, int(h), int(group))
+            # Isolate each submit (finding #4): a shut-down executor or an OS
+            # thread refusal fails only this load -- settle its state leg False
+            # so the armed park resolves to a recompute -- and cannot take down
+            # the remaining loads or, via an escape past start_load_kv, the KV
+            # legs super() still owes.
+            try:
+                self._state_tier.submit_load(req_id, int(h), int(group))
+            except Exception:
+                logger.exception(
+                    "kimi_k3 offload: submit_load failed for %s; failing it.",
+                    req_id,
+                )
+                self._joint_park.settle_state(req_id, False)
 
     def _start_state_stores(self, metadata) -> None:
         """Hand this step's ready checkpoints to the tier's executor.
@@ -325,7 +353,18 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
                 self._store_failed_no_tier.add(op)
             return
         for op, unit_ids in stores:
-            self._state_tier.submit_store(op, tuple(int(u) for u in unit_ids))
+            # Isolate each submit (finding #4): route a submit failure into the
+            # same no-tier failure channel (get_finished drains it) so the engine
+            # releases the store's pinned PAGE units now rather than on the
+            # reconciler's full timeout, without escaping past super().
+            try:
+                self._state_tier.submit_store(op, tuple(int(u) for u in unit_ids))
+            except Exception:
+                logger.exception(
+                    "kimi_k3 offload: submit_store failed for %s; failing it.",
+                    op,
+                )
+                self._store_failed_no_tier.add(op)
 
     def _fail_state_loads(self, loads) -> None:
         for req_id, _h, _group in loads:
