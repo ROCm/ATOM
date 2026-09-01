@@ -379,23 +379,30 @@ def _fused_experts_silu_gugu(
         )
         # out_mx_quant folds the intermediate's MXFP4 requant into GEMM1's
         # epilogue -- the launch a8w4 has always avoided -- returning exactly the
-        # (packed e2m1, e8m0 scales) pair mxfp4_quant would have produced, bit for
-        # bit. Correct, but OFF by default because on gfx1250 it does not pay:
-        # the epilogue quant costs GEMM1 more than the launch it removes.
+        # (packed e2m1, e8m0 scales) pair mxfp4_quant would have produced, bit
+        # for bit.
         #
-        #   layer03, ep4_conc2048_fake_eplb, --fuse-reduce-mori:
-        #     M=2048 (prefill, block_m=32)  GEMM1 144.8 -> 164.8us to drop a
-        #                                   15.5us launch; total 273.4 -> 279.7
-        #     M=64   (decode,  block_m=16)  GEMM1 130.2 -> 135.8us to drop a
-        #                                   2.3us launch;  total 214.4 -> 214.6
+        # Gluon-only: moe_gemm_a4w4 asserts the gluon backend when out_mx_quant
+        # is set, because the triton fallback has no such epilogue and would
+        # silently write bf16. Hence the arch test rather than a plain True --
+        # on anything but gfx1250 this path must keep the separate launch.
+        #
+        # NOTE it does not currently pay for itself. GEMM1 grows by more than
+        # the launch it removes, measured twice and agreeing:
+        #
+        #   bench (layer03, ep4_conc2048_fake_eplb, --fuse-reduce-mori)
+        #     M=2048  GEMM1 144.8 -> 164.8us to drop a 15.5us launch
+        #             total 273.4 -> 279.7us
+        #   serve (6-layer, mega fp4, decode), per layer invocation
+        #     GEMM1 163.4 -> 188.4us (+25.0), quant 17.4 -> 0 (-17.4)
+        #             net +7.6us
         #
         # Most likely the epilogue's extra live registers cost the whole GEMM
         # occupancy, and the packed tile leaves via per-thread stores where the
         # bf16 tile went out through TDM. Worth revisiting with a TDM store for
-        # the packed tile and a config retune for the mx epilogue.
-        #
-        # Gluon-only in any case: the triton fallback has no such epilogue.
-        _fuse_requant = True
+        # the packed tile and a config retune for the mx epilogue -- which is
+        # why it stays wired up rather than being removed.
+        _fuse_requant = get_arch() == "gfx1250"
         if _fuse_requant:
             interm_fp4, interm_scale = moe_gemm_a4w4(
                 x_fp4, w1, x_scale, w13_scale, out_mx_quant=True, **_gemm1_kwargs
