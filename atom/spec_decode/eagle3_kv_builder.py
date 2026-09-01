@@ -5,6 +5,7 @@ from aiter import dtypes
 
 from atom.config import KVCacheTensor
 from atom.model_ops.attentions.sub_pool_spec import SubPoolSpec, page_pool
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -104,6 +105,31 @@ class Eagle3DraftBuilder:
         logger.info(f"Allocated Eagle3 draft KV cache: {cache.shape}")
         return {"eagle3_kv_cache": cache, "eagle3_kv_scale": scale}
 
+    @staticmethod
+    def _use_flash_layout(impl) -> bool:
+        """Whether to hand this draft module a flash (4D) view of the pool.
+
+        Mirrors the branch condition in `rope_cache`: of its three writers only
+        `fused_qk_rope_reshape_and_cache` emits a 4D VHD V, which no prefill
+        reader consumes. Those modules get flash instead (same kernel, one flag
+        flipped). The other two already write a SHUFFLE V that both prefill and
+        decode read, so a flash pool would only break them.
+        """
+        if impl is None or getattr(impl, "rotary_emb", None) is None:
+            return False
+        # rope_cache's first branch re-views V to SHUFFLE itself.
+        if (
+            getattr(impl, "q_norm", None) is not None
+            and getattr(impl, "k_norm", None) is not None
+        ):
+            return False
+        # rope_cache's `use_triton_attn`.
+        return bool(
+            envs.ATOM_FORCE_ATTN_TRITON
+            or impl.sliding_window != -1
+            or impl.head_dim != 128
+        )
+
     def build_kv_cache_tensor(self, layer_id: int, module):
         """Bind one draft attention module to its slice of the independent draft
         KV cache. Returns None for modules this builder does not own (wrong
@@ -118,19 +144,39 @@ class Eagle3DraftBuilder:
         idx = self._next_layer_id
         self._next_layer_id += 1
         cache = runner.eagle3_kv_cache
-        x = 16 // cache.element_size()
-        k_cache = cache[0, idx].view(
-            self.num_blocks,
-            self.num_kv_heads,
-            self.head_dim // x,
-            self.block_size,
-            x,
-        )
-        v_cache = cache[1, idx].view(
-            self.num_blocks,
-            self.num_kv_heads,
-            self.head_dim,
-            self.block_size,
+        impl = getattr(module, "impl", None)
+        flash = self._use_flash_layout(impl)
+        if flash:
+            # The pool is allocated [.., num_blocks, block_size, kv_heads,
+            # head_dim] -- already the flash layout, so take it unviewed.
+            k_cache = cache[0, idx]
+            v_cache = cache[1, idx]
+        else:
+            x = 16 // cache.element_size()
+            k_cache = cache[0, idx].view(
+                self.num_blocks,
+                self.num_kv_heads,
+                self.head_dim // x,
+                self.block_size,
+                x,
+            )
+            v_cache = cache[1, idx].view(
+                self.num_blocks,
+                self.num_kv_heads,
+                self.head_dim,
+                self.block_size,
+            )
+        if impl is not None:
+            impl.use_flash_layout = flash
+        # Which layout a draft pool got is otherwise invisible: both are views of
+        # the same allocation, so the shapes are the only thing that tells them
+        # apart, and reading the wrong one corrupts attention without faulting.
+        logger.info(
+            "Eagle3 draft layer %d KV layout: %s (K %s, V %s)",
+            layer_id,
+            "flash" if flash else "SHUFFLE-K/VHD-V",
+            tuple(k_cache.shape),
+            tuple(v_cache.shape),
         )
         module.max_model_len = runner.config.max_model_len
         if runner.config.kv_cache_dtype == "fp8":
