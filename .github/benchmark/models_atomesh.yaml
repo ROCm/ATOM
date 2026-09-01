@@ -534,6 +534,38 @@ models:
           run_eval: true
           eval_concurrency: [56]
 
+        - &kimi_k3_agentic_2p1d
+          <<: *kimi_k3_agentic_no_dspark
+          name: kimi-k3-mxfp4-2p1d-tp8-dcp8-agentic-lmcache-state-1m-c32
+          topology: 2p1d
+          display_topology: 2P1D-TP8-DCP8
+          nodes: "${ATOMESH_2P1D_NODES}"
+          concurrency: [32]
+          prefill:
+            workers: 2
+            tp: 8
+            dcp: 8
+          router:
+            policy: cache_aware
+
+        - <<: *kimi_k3_agentic_2p1d
+          name: kimi-k3-mxfp4-2p1d-tp8-dcp8-agentic-lmcache-state-1m-c40
+          concurrency: [40]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 80
+
+        - <<: *kimi_k3_agentic_2p1d
+          name: kimi-k3-mxfp4-2p1d-tp8-dcp8-agentic-lmcache-state-1m-c56
+          concurrency: [56]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              gpu_memory_utilization: 0.88
+              max_num_seqs: 72
+              max_num_batched_tokens: 4096
+
     accuracy:
       task: gsm8k
       fewshot: 5
