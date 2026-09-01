@@ -13,10 +13,25 @@ from types import SimpleNamespace
 
 import pytest
 
+_torch_stub = None
 try:
     import torch
 except ModuleNotFoundError:
-    sys.modules["torch"] = types.ModuleType("torch")
+    # Import-time only. The atom modules imported below do `import torch` at
+    # their own module scope, so `torch` has to be resolvable while this file is
+    # collected; a bare stub satisfies that. The torch-*using* tests here still
+    # need real torch (CI runs on CPU torch) and error without it -- the stub
+    # only keeps collection from aborting. Keep a handle so it can be removed the
+    # moment those imports have bound their references (see below): left in
+    # place, this empty module becomes *the* `torch` for every module collected
+    # afterwards, and since `run_unit_tests.sh` collects all of `tests/` in one
+    # process with unpinned order, a later module's `import torch` then finds a
+    # namespace with no `uint8`/`Tensor`/`cuda` and fails at collection -- which
+    # aborts the whole ~4100-test run rather than one file. This is the manual
+    # equivalent of the `monkeypatch.setitem` restore every other stub in this
+    # file uses; `monkeypatch` is unavailable at import scope.
+    _torch_stub = types.ModuleType("torch")
+    sys.modules["torch"] = _torch_stub
 
 from conftest import MockConfig
 
@@ -72,6 +87,14 @@ from atom.kv_transfer.offload.metadata import (
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import OffloadJointRecord, SequenceStatus
+
+if _torch_stub is not None and sys.modules.get("torch") is _torch_stub:
+    # The torch-dependent atom imports above have bound their `torch` references,
+    # so the import-time stub has done its job. Restore the prior absent state --
+    # only if our exact stub is still installed -- so a later-collected module
+    # re-resolves `torch` itself (real on CI, its own guard otherwise) rather
+    # than inheriting an empty namespace from this file. See the install site.
+    del sys.modules["torch"]
 
 
 class _LookupClient:
