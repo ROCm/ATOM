@@ -14,7 +14,10 @@ import logging
 import os
 import time
 
-from atom.kv_transfer.disaggregation.types import ConnectorCompletion
+from atom.kv_transfer.disaggregation.types import (
+    ConnectorCompletion,
+    StateStoreOperationId,
+)
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload._offload_common import (
     max_pending_saves,
@@ -73,7 +76,7 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
         # from the worker, which does not exist here and raised AttributeError
         # on the no-tier store path, taking the whole step's KV loads/saves down
         # with it (super().start_load_kv never ran).
-        self._store_failed_no_tier: set[int] = set()
+        self._store_failed_no_tier: set[StateStoreOperationId] = set()
 
     def register_kv_caches(
         self, kv_caches: dict, transfer_tensors=None, num_blocks: int | None = None
