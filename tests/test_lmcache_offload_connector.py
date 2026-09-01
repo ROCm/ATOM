@@ -71,7 +71,7 @@ from atom.kv_transfer.offload.metadata import (
 )
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.scheduler import Scheduler
-from atom.model_engine.sequence import SequenceStatus
+from atom.model_engine.sequence import OffloadJointRecord, SequenceStatus
 
 
 class _LookupClient:
@@ -188,6 +188,7 @@ def _stateful_seq(
         state_slot=group,
         prefix_hashes_published=True,
         _state_initialized_after_alloc=True,
+        offload_joint=OffloadJointRecord(),
     )
 
 
@@ -2951,6 +2952,7 @@ def test_abort_cleans_load_whose_terminal_was_already_consumed(
         num_tokens=8,
         offload_loaded_tokens=4,
         offload_load_start_tokens=4,
+        offload_joint=OffloadJointRecord(),
     )
 
     class _Connector(_OffloadMixinStub):
@@ -3012,6 +3014,7 @@ def test_consume_failed_remote_kv_does_not_repeat_terminal_callback():
         id=730,
         status=SequenceStatus.WAITING_FOR_REMOTE_KVS,
         num_cached_tokens=4,
+        offload_joint=OffloadJointRecord(),
     )
 
     class _Connector:
@@ -4725,9 +4728,11 @@ def _k3_seq(*, hbm: int, joint: int = 0, kv: int = 0, claimed: int = 0):
         id=1,
         has_per_req_cache=True,
         num_cached_tokens=hbm,
-        state_joint_boundary_tokens=joint,
-        state_joint_kv_tokens=kv,
-        state_joint_claim_tokens=claimed,
+        offload_joint=OffloadJointRecord(
+            boundary_tokens=joint,
+            kv_tokens=kv,
+            claim_tokens=claimed,
+        ),
     )
 
 

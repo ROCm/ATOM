@@ -663,10 +663,7 @@ class BlockManager:
         B: overshooting costs one chunk into blocks the forward is about to
         rewrite, undershooting would be silent wrong output.
         """
-        seq.state_joint_boundary_tokens = 0
-        seq.state_joint_boundary_hash = -1
-        seq.state_joint_kv_tokens = 0
-        seq.state_joint_claim_tokens = 0
+        seq.offload_joint.reset_joint()
         if self.state_offload is None:
             return self._no_joint("off", record)
         # PAGE is now the served class, not the excluded one. This used to
@@ -684,9 +681,9 @@ class BlockManager:
         # holds whatever `get_kvconnector` returned, and one without
         # `chunk_size` would zero this and disable the feature silently.
         chunk = self._joint_chunk_tokens or int(
-            getattr(seq, "offload_kv_chunk_tokens", 0) or 0
+            seq.offload_joint.kv_chunk_tokens or 0
         )
-        lmc_tokens = int(getattr(seq, "offload_kv_prefix_tokens", 0) or 0)
+        lmc_tokens = int(seq.offload_joint.kv_prefix_tokens or 0)
         if chunk <= 0:
             return self._no_joint("no_chunk_size", record)
         # Floored to the grid everything below compares against, so the
@@ -716,9 +713,9 @@ class BlockManager:
         kv_tokens = -(-tokens // chunk) * chunk
         if kv_tokens > lmc_tokens:
             return self._no_joint("covering_chunk_beyond_lookup", record)
-        seq.state_joint_boundary_tokens = tokens
-        seq.state_joint_boundary_hash = h
-        seq.state_joint_kv_tokens = kv_tokens
+        seq.offload_joint.boundary_tokens = tokens
+        seq.offload_joint.boundary_hash = h
+        seq.offload_joint.kv_tokens = kv_tokens
         # Everything up to the compressed hit is this prompt's KV and is still
         # in the pool -- what `_gated_hit` cut was resumability, not residency.
         # Below the joint boundary those blocks are read-only for this request
@@ -734,9 +731,9 @@ class BlockManager:
         # Floored to the chunk grid so the KV leg starts aligned and writes
         # only into blocks below it that nobody else can be reading.
         claim_tokens = ((claim_blocks * hbs) // chunk) * chunk
-        seq.state_joint_claim_tokens = max(claim_tokens, hbm_boundary * hbs)
+        seq.offload_joint.claim_tokens = max(claim_tokens, hbm_boundary * hbs)
         # `allocate` claims the boundary in whole hash blocks --
-        # `state_joint_claim_tokens // hbs` -- but the value above is floored to
+        # `claim_tokens // hbs` -- but the value above is floored to
         # the *chunk* grid, not the hash-block grid. When `hbs` does not divide
         # `chunk`, a chunk-aligned claim is not hash-block-aligned: the floor
         # drops the `[floor(claim_tokens/hbs)*hbs, claim_tokens)` tail into a
@@ -746,11 +743,8 @@ class BlockManager:
         # shipping case (`block_size * dcp_world_size == LMCACHE_CHUNK_SIZE`), so
         # it only surfaces at DCP world sizes that take `hbs` off the chunk grid.
         # Refuse the joint and recompute the tail rather than resume over a gap.
-        if seq.state_joint_claim_tokens % hbs != 0:
-            seq.state_joint_boundary_tokens = 0
-            seq.state_joint_boundary_hash = -1
-            seq.state_joint_kv_tokens = 0
-            seq.state_joint_claim_tokens = 0
+        if seq.offload_joint.claim_tokens % hbs != 0:
+            seq.offload_joint.reset_joint()
             return self._no_joint("claim_off_hash_grid", record)
         if record:
             self.joint_boundaries += 1
@@ -930,7 +924,7 @@ class BlockManager:
         hbs = self._hash_block_size()
         claim_blocks = max(
             num_cached_blocks,
-            int(getattr(seq, "state_joint_claim_tokens", 0) or 0) // hbs,
+            int(seq.offload_joint.claim_tokens or 0) // hbs,
         )
         h = -1
         hit_hash = -1
@@ -947,22 +941,21 @@ class BlockManager:
                 # the old fall-through then recorded `num_cached_blocks * hbs` as
                 # cached over a prefix it could not claim, left `hit_hash`
                 # unassigned (cold-start state exit), and clamped only
-                # `state_joint_claim_tokens` while `boundary`/`kv` stayed above
+                # `claim_tokens` while `boundary`/`kv` stayed above
                 # the claimed region -- silent wrong output on both counts. Use
                 # real control flow instead: never treat more than the `i` blocks
                 # actually claimed as cached, and drop any joint boundary that
                 # sits above them so the KV leg cannot resume over a gap.
                 claimed_tokens = i * hbs
                 num_cached_blocks = min(num_cached_blocks, i)
-                if (
-                    int(getattr(seq, "state_joint_boundary_tokens", 0) or 0)
-                    > claimed_tokens
-                ):
-                    seq.state_joint_boundary_tokens = 0
-                    seq.state_joint_boundary_hash = -1
-                    seq.state_joint_kv_tokens = 0
-                seq.state_joint_claim_tokens = min(
-                    int(getattr(seq, "state_joint_claim_tokens", 0) or 0),
+                # Partial reset by design: the claim is clamped, not zeroed,
+                # so this cannot go through `reset_joint`.
+                if int(seq.offload_joint.boundary_tokens or 0) > claimed_tokens:
+                    seq.offload_joint.boundary_tokens = 0
+                    seq.offload_joint.boundary_hash = -1
+                    seq.offload_joint.kv_tokens = 0
+                seq.offload_joint.claim_tokens = min(
+                    int(seq.offload_joint.claim_tokens or 0),
                     claimed_tokens,
                 )
                 break
@@ -993,7 +986,7 @@ class BlockManager:
             # joint boundary and `_claim_after_load` raised `num_cached_tokens`
             # to it, so the forward resumed over a prefix the state does not
             # cover. Silent wrong output, no exception.
-            joint_hash = seq.state_joint_boundary_hash
+            joint_hash = seq.offload_joint.boundary_hash
             state_holds = self._attach_state_slots(
                 seq, joint_hash if joint_hash != -1 else hit_hash
             )
@@ -1012,7 +1005,7 @@ class BlockManager:
             # above the HBM hit by construction. `num_cached_tokens` stays at
             # the HBM prefix until the KV leg lands, so the forward covers
             # `[hbm, num_prompt)` if anything goes wrong from here.
-            joint_hash = seq.state_joint_boundary_hash
+            joint_hash = seq.offload_joint.boundary_hash
             state_holds = self._attach_state_slots(
                 seq, joint_hash if joint_hash != -1 else hit_hash
             )
@@ -1030,7 +1023,7 @@ class BlockManager:
         if (
             state_holds
             and seq.has_per_req_cache
-            and seq.state_joint_boundary_hash != -1
+            and seq.offload_joint.boundary_hash != -1
             and not self._state_leg_secured(seq)
         ):
             self.state_gate_lost_boundary += 1
@@ -1053,8 +1046,10 @@ class BlockManager:
                 # deallocate and requeue for a clean recompute next pass.
                 return False
             seq.num_cached_tokens = 0
-            seq.state_joint_boundary_tokens = 0
-            seq.state_joint_boundary_hash = -1
+            # Clears only the boundary here, as the pre-record code did -- a
+            # partial reset, not a full `reset_joint`.
+            seq.offload_joint.boundary_tokens = 0
+            seq.offload_joint.boundary_hash = -1
         return True
 
     @staticmethod
@@ -1107,7 +1102,7 @@ class BlockManager:
         returns True as well, which is correct with no boundary and wrong with
         one.
         """
-        if getattr(seq, "state_load_hash", -1) != -1:
+        if seq.offload_joint.load_hash != -1:
             return True  # a CPU load is in flight for it
         if getattr(seq, "state_fork_src", -1) != -1:
             return True  # a fork checkpoint is its source
@@ -1254,7 +1249,7 @@ class BlockManager:
             return False
         if not self.state_offload.request_load(seq.id, hit_hash):
             return False
-        seq.state_load_hash = hit_hash
+        seq.offload_joint.load_hash = hit_hash
         self._state_loads.append((seq.id, hit_hash, seq.state_slot))
         return True
 
@@ -1270,12 +1265,12 @@ class BlockManager:
         caller must abandon this admission rather than resume over the shared
         prefix. ``True`` when there was nothing to cancel or the disown held.
         """
-        if seq.state_load_hash == -1:
+        if seq.offload_joint.load_hash == -1:
             return True
         self._state_loads = [e for e in self._state_loads if e[0] != seq.id]
         if self.state_offload is not None:
             self.state_offload.abandon_load(seq.id)
-        seq.state_load_hash = -1
+        seq.offload_joint.load_hash = -1
         disowned = self.disown_claimed_prefix(seq)
         seq.num_cached_tokens = 0
         return disowned
@@ -2436,7 +2431,7 @@ class BlockManager:
             # already true over it. Held until `settle_state_load`, which always
             # comes: the worker reports every load either way. The rollback
             # scratch is nobody's destination and goes back regardless.
-            if seq.state_load_hash != -1 and self.state_offload is not None:
+            if seq.offload_joint.load_hash != -1 and self.state_offload is not None:
                 self._orphan_load_slots[seq.id] = seq.state_slot
                 self._orphan_load_slots_at[seq.id] = monotonic()
                 # Abandoned, not failed: an abort says nothing about the bytes,
@@ -2451,7 +2446,7 @@ class BlockManager:
             seq.state_slots = []
             seq.state_fork_src = -1
 
-        seq.state_load_hash = -1
+        seq.offload_joint.load_hash = -1
 
     def can_append(self, seq: Sequence, num_new_tokens: int = 1) -> bool:
         seq_len = len(seq)

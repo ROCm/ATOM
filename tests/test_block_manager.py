@@ -99,7 +99,7 @@ class TestJointClaimReusesResidentBlocks:
         bm, tokens, resident = self._resident_prefix(seq_factory)
         seq = seq_factory(tokens)
         # The state gate cut the hit to 2 blocks; the walk had matched 4.
-        seq.state_joint_claim_tokens = 16
+        seq.offload_joint.claim_tokens = 16
         bm.allocate(seq, 2)
 
         # All four resident blocks are reused -- that is the transfer the KV
@@ -112,7 +112,7 @@ class TestJointClaimReusesResidentBlocks:
     def test_the_widened_claim_still_gives_every_position_a_block(self, seq_factory):
         bm, tokens, _ = self._resident_prefix(seq_factory)
         seq = seq_factory(tokens)
-        seq.state_joint_claim_tokens = 16
+        seq.offload_joint.claim_tokens = 16
         bm.allocate(seq, 2)
         assert len(seq.block_table) == 5
         assert len(set(seq.block_table)) == 5
@@ -142,7 +142,7 @@ class TestDisownClaimedPrefix:
         # A second live seq claims the same 4 resident blocks via the joint
         # boundary -- now every prefix block is held at ref_count == 2.
         seq = seq_factory(tokens)
-        seq.state_joint_claim_tokens = 16
+        seq.offload_joint.claim_tokens = 16
         bm.allocate(seq, 2)
         shared = list(seq.block_table[:4])
         assert all(bm.kv.block(b).ref_count == 2 for b in shared)

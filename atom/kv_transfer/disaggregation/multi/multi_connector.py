@@ -516,7 +516,7 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         """The offload sub's KV transfer grid, in tokens.
 
         `Scheduler._resolve_waiting_remote_kv` stamps
-        `seq.offload_kv_chunk_tokens` from `getattr(self.kv_connector,
+        `seq.offload_joint.kv_chunk_tokens` from `getattr(self.kv_connector,
         "chunk_size", 0)`, and under `multi` `self.kv_connector` IS this
         composite. Without this forwarder the getattr default (0) wins, so
         `_joint_kv_boundary` sees a zero chunk grid and refuses every joint KV

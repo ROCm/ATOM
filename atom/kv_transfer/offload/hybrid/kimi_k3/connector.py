@@ -616,7 +616,7 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
         hbm = int(seq.num_cached_tokens)
         lmc = int(ls.lmcache_cached_tokens)
         chunk = self.chunk_size or 256
-        joint = int(getattr(seq, "state_joint_boundary_tokens", 0) or 0)
+        joint = int(seq.offload_joint.boundary_tokens or 0)
         if joint <= hbm:
             return False, "per_req_cache_state_boundary", hbm, lmc, lmc - hbm, chunk
         # Where the transfer starts -- NOT where the request may call itself
@@ -625,13 +625,13 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
         # resend it would land a second copy in HBM (`publish_loaded_prefix`
         # keeps the canonical mapping, fresh blocks stay private). Floored to the
         # chunk grid by `_joint_kv_boundary`, so aligned whenever `hbm` was.
-        start = max(hbm, int(getattr(seq, "state_joint_claim_tokens", 0) or 0))
+        start = max(hbm, int(seq.offload_joint.claim_tokens or 0))
         # The KV leg moves whole chunks and the blocks below `start` are shared,
         # so an unaligned start cannot be rounded down.
         if start % chunk != 0:
             return False, "joint_unaligned_hbm_prefill", start, lmc, lmc - start, chunk
         # Transfer the chunk covering the boundary, claim only the boundary.
-        kv_target = int(getattr(seq, "state_joint_kv_tokens", 0) or 0) or joint
+        kv_target = int(seq.offload_joint.kv_tokens or 0) or joint
         if joint > lmc or kv_target > lmc:
             return False, "joint_boundary_above_lookup", start, lmc, lmc - start, chunk
         if kv_target <= start:
@@ -659,7 +659,7 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
         claiming the rounded-up figure would have the forward skip tokens the
         recurrent state does not cover.
         """
-        joint = int(getattr(seq, "state_joint_boundary_tokens", 0) or 0)
+        joint = int(seq.offload_joint.boundary_tokens or 0)
         return max(hbm, min(joint, lmc)) if joint else max(hbm, lmc)
 
     # -- connector-owned channels -----------------------------------------

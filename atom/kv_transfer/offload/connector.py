@@ -158,7 +158,7 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         """The KV leg's transfer grid, in tokens.
 
         Read by `Scheduler._resolve_waiting_remote_kv` to stamp
-        `seq.offload_kv_chunk_tokens`, which is `_joint_kv_boundary`'s fallback
+        `seq.offload_joint.kv_chunk_tokens`, which is `_joint_kv_boundary`'s fallback
         when `BlockManager` could not read the LMCache config at startup.
         Without this forwarder that fallback was dead -- `getattr` returned its
         0 default and the joint path refused with `no_chunk_size`.

@@ -1429,7 +1429,7 @@ class TestPagedCopyCheckpoint:
         second = stateful_seq(list(range(48)))
         assert bm._attach_state_slots(second, h) is True
 
-        assert second.state_load_hash == h
+        assert second.offload_joint.load_hash == h
         assert second.state_slot >= 0, "the H2D writes this slot directly"
         assert index.requested == [(second.id, h)]
         # No restore queued: there is nothing in HBM to gather from, and the
@@ -1452,7 +1452,7 @@ class TestPagedCopyCheckpoint:
         second = stateful_seq(list(range(48)))
         assert bm._attach_state_slots(second, h) is True
 
-        assert second.state_load_hash == -1
+        assert second.offload_joint.load_hash == -1
         assert index.requested == [], "a resident image must not pay a park"
         assert len(bm.take_state_maintenance_ops().checkpoint_restores) == 1
 
@@ -1471,7 +1471,7 @@ class TestPagedCopyCheckpoint:
 
         second = stateful_seq(list(range(48)))
         assert bm._attach_state_slots(second, h) is False
-        assert second.state_load_hash == -1
+        assert second.offload_joint.load_hash == -1
         assert bm.checkpoint_funnel()["state_gate_lost_boundary"] == 1
 
     # ── the joint boundary, which #2045 makes the only source of value ──
@@ -1553,14 +1553,14 @@ class TestPagedCopyCheckpoint:
         self._reset_joint_counters(bm)
 
         second = stateful_seq(PROMPT)
-        second.offload_kv_prefix_tokens = len(PROMPT)
+        second.offload_joint.kv_prefix_tokens = len(PROMPT)
         hbm_hit = bm.can_allocate(second)
 
         assert bm.joint_boundaries == 1, bm.joint_skips
-        assert second.state_joint_boundary_hash == h
-        assert second.state_joint_boundary_tokens == 8 * BLOCK
+        assert second.offload_joint.boundary_hash == h
+        assert second.offload_joint.boundary_tokens == 8 * BLOCK
         # The KV leg has real work: the walk stopped well below the boundary.
-        assert hbm_hit * BLOCK < second.state_joint_kv_tokens
+        assert hbm_hit * BLOCK < second.offload_joint.kv_tokens
 
     def test_the_split_says_which_tier_the_state_leg_came_from(self):
         """`state_tier` is the only counter here that cannot be non-zero with
@@ -1577,14 +1577,14 @@ class TestPagedCopyCheckpoint:
         # The checkpoint outlived the block that broke the chain, so the state
         # leg is free -- a gather out of resident units, no transfer.
         resident = stateful_seq(PROMPT)
-        resident.offload_kv_prefix_tokens = len(PROMPT)
+        resident.offload_joint.kv_prefix_tokens = len(PROMPT)
         bm.can_allocate(resident)
         assert (bm.state_hbm, bm.state_tier) == (1, 0)
 
         # Drop it from HBM too: now the state leg costs an image-sized H2D.
         bm.paged_state_checkpoints.unindex(h)
         from_cpu = stateful_seq(PROMPT)
-        from_cpu.offload_kv_prefix_tokens = len(PROMPT)
+        from_cpu.offload_joint.kv_prefix_tokens = len(PROMPT)
         bm.can_allocate(from_cpu)
         assert (bm.state_hbm, bm.state_tier) == (1, 1)
 
@@ -1599,7 +1599,7 @@ class TestPagedCopyCheckpoint:
         self._reset_joint_counters(bm)
 
         seq = stateful_seq(PROMPT)
-        seq.offload_kv_prefix_tokens = len(PROMPT)
+        seq.offload_joint.kv_prefix_tokens = len(PROMPT)
         bm.can_allocate(seq)
         assert bm.joint_boundaries == 0
         assert bm.joint_skips.get("off") == 1
@@ -3584,9 +3584,9 @@ class TestPagedAllocateAimsTheStateLegAtTheJointBoundary:
 
     def _joint_seq(self, bm, tokens, *, boundary_hash_value, claim_tokens):
         seq = stateful_seq(list(tokens))
-        seq.state_joint_boundary_hash = boundary_hash_value
-        seq.state_joint_boundary_tokens = claim_tokens
-        seq.state_joint_claim_tokens = claim_tokens
+        seq.offload_joint.boundary_hash = boundary_hash_value
+        seq.offload_joint.boundary_tokens = claim_tokens
+        seq.offload_joint.claim_tokens = claim_tokens
         return seq
 
     def test_the_state_leg_is_aimed_at_the_boundary_not_the_hbm_hit(self):
@@ -3600,7 +3600,7 @@ class TestPagedAllocateAimsTheStateLegAtTheJointBoundary:
         assert index.requested == [
             (seq.id, 4242)
         ], "the state leg must be aimed at the joint boundary"
-        assert seq.state_joint_boundary_hash == 4242, "the boundary still stands"
+        assert seq.offload_joint.boundary_hash == 4242, "the boundary still stands"
 
     def test_a_boundary_with_no_state_behind_it_is_disowned(self):
         """The backstop. Whatever the gate decided, a request may not resume
@@ -3610,8 +3610,8 @@ class TestPagedAllocateAimsTheStateLegAtTheJointBoundary:
         before = bm.state_gate_lost_boundary
         bm.allocate(seq, 0)
 
-        assert seq.state_joint_boundary_hash == -1
-        assert seq.state_joint_boundary_tokens == 0
+        assert seq.offload_joint.boundary_hash == -1
+        assert seq.offload_joint.boundary_tokens == 0
         assert seq.num_cached_tokens == 0
         assert bm.state_gate_lost_boundary > before
 
