@@ -368,6 +368,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 self.dcp_world_size,
             )
 
+        self._publishes_dcp_local_lens = self.is_sparse and self.dcp_world_size > 1
+        self._tbo_full_running_bs = 0
+
         # DCP decode all-gathers Q on the head dim, so the head count reaching
         # mla_decode_fwd (and thus the persistent decode metadata) is the padded
         # gathered width, not the per-rank one. Pad it the same way the module
@@ -448,18 +451,18 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # mla_decode_fwd(g_kv_indptr=...) to apply the global-position causal
             # mask for MTP (max_q_len > 1).
             "g_kv_indptr": CpuGpuBuffer(self.max_bs + 1, **i32_kwargs),
-            # Per-request LOCAL (this rank's shard) KV length under DCP. Same
-            # quantity `get_dcp_local_seq_lens` already produces here on the host;
-            # published so the sparse indexer does not recompute it on device once
-            # per full-index layer (21 layers on GLM-5.2). Layer-invariant: it
-            # depends only on context_lens / S / W / dcp_rank.
-            "dcp_local_context_lens": CpuGpuBuffer(self.max_bs, **i32_kwargs),
             "kv_indices": CpuGpuBuffer(
                 self.max_bs * self.max_num_blocks_per_seq,
                 **i32_kwargs,
             ),
             "kv_last_page_lens": CpuGpuBuffer(self.max_bs, **i32_kwargs),
         }
+        if self._publishes_dcp_local_lens:
+            # Layer-invariant qlen=1 sparse-DSA indexer metadata. It is derived
+            # from context_lens once per step and reused by every full layer.
+            mla_metadata["dcp_local_context_lens"] = CpuGpuBuffer(
+                self.max_bs, **i32_kwargs
+            )
         mla_metadata["kv_last_page_lens"].cpu.fill_(1)
         mla_metadata["kv_last_page_lens"].copy_to_gpu()
         if self.is_sparse:
@@ -2095,10 +2098,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 self.dcp_rank,
                 self.cp_kv_cache_interleave_size,
             )
-            # Publish it: the sparse indexer used to re-derive this on device with
-            # 8 elementwise kernels per full-index layer.
-            var["dcp_local_context_lens"].np[:scheduled_bs] = local_context_lens
-            var["dcp_local_context_lens"].np[scheduled_bs:running_bs] = 0
+            if self._publishes_dcp_local_lens:
+                # Publish once per step instead of launching 7 elementwise
+                # kernels in every full sparse-indexer layer.
+                var["dcp_local_context_lens"].np[:scheduled_bs] = local_context_lens
+                var["dcp_local_context_lens"].np[scheduled_bs:running_bs] = 0
             num_blocks_per_seq = cdiv(local_context_lens, self.block_size)
         elif any(batch.is_first_decode_without_local_prefill):
             num_blocks_per_seq = [
@@ -2152,6 +2156,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             ("kv_last_page_lens", running_bs),
             ("block_tables", running_bs),
         ]
+        if self._publishes_dcp_local_lens:
+            vars_used.append(("dcp_local_context_lens", running_bs))
         metadata_deps = {
             "cu_seqlens_q",
             "kv_last_page_lens",
@@ -2291,13 +2297,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             if self.dcp_world_size > 1
             else None
         )
-        # Layer-invariant local KV lengths for the DCP sparse indexer (see the
-        # buffer's declaration). None off DCP so the consumer falls back.
-        attn_metadata.dcp_local_context_lens = (
-            var["dcp_local_context_lens"].copy_to_gpu(running_bs)
-            if self.dcp_world_size > 1
-            else None
-        )
 
         if ctx_mla_ps_sparse is not None:
             for k, v in ctx_mla_ps_sparse.items():
@@ -2358,6 +2357,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         Splits the full-batch data into per-ubatch .
         """
         var = self.model_runner.forward_vars
+        self._tbo_full_running_bs = bs
         N = self._NUM_TBO_UBATCHES
         half = bs // N
 
@@ -2541,6 +2541,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
     def build_for_cudagraph_capture(self, bs: int) -> AttentionMetaData:
         var = self.model_runner.forward_vars
+        self._tbo_full_running_bs = bs
         # Self-consistent minimal KV metadata for capture: give every sequence
         # exactly 1 page (kv_indptr = [0,1,...,bs]) pointing at block 0, with a
         # 1-token last page. The split-KV stage1 asm kernel computes per batch
@@ -2584,6 +2585,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 np.arange(bs + 1, dtype=np.int32) * self.dcp_world_size
             )
             var["g_kv_indptr"].copy_to_gpu(bs + 1)
+        dcp_local_context_lens = None
+        if self._publishes_dcp_local_lens:
+            # The warmup forward reads this buffer before replay overwrites it.
+            # One local token matches the synthetic capture KV metadata above.
+            var["dcp_local_context_lens"].np[:bs] = 1
+            dcp_local_context_lens = var["dcp_local_context_lens"].copy_to_gpu(bs)
         if is_sparse_mtp:
             # Two sets: normal for dense layers, sparse_mtp for sparse layers
             ctx_mla_ps = self.set_mla_persistent_worker_buffers(bs, max_q_len)
@@ -2605,6 +2612,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             kv_indices=var["kv_indices"].gpu,
             kv_last_page_lens=var["kv_last_page_lens"].gpu[:bs],
             sparse_kv_indptr=sparse_kv_indptr,
+            dcp_local_context_lens=dcp_local_context_lens,
             **ctx_mla_ps,
         )
         attn_matadata.dtype_q = self.dtype_q
@@ -2669,6 +2677,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         var = self.model_runner.forward_vars
         p = f"ub{ubatch_idx}_"
         max_q_len = var["mtp_k"] + 1 if "mtp_k" in var else 1
+        dcp_local_context_lens = None
+        if self._publishes_dcp_local_lens:
+            requests_per_ubatch = self._tbo_full_running_bs // self._NUM_TBO_UBATCHES
+            request_start = ubatch_idx * requests_per_ubatch
+            dcp_local_context_lens = var["dcp_local_context_lens"].gpu[
+                request_start : request_start + running_bs
+            ]
 
         # Compute MLA work buffers for this ubatch
         self._set_ubatch_mla_buffers(
@@ -2687,6 +2702,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             kv_indptr=var[f"{p}kv_indptr"].gpu[: running_bs + 1],
             kv_indices=var[f"{p}kv_indices"].gpu,
             kv_last_page_lens=var[f"{p}kv_last_page_lens"].gpu[:running_bs],
+            dcp_local_context_lens=dcp_local_context_lens,
             sparse_kv_indptr=(
                 var[f"{p}sparse_kv_indptr"].gpu[: running_bs + 1]
                 if self.is_sparse

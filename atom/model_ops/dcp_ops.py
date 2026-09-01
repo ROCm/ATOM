@@ -19,6 +19,7 @@ import triton
 import triton.language as tl
 
 from atom.distributed.dcp_utils import get_dcp_group, get_dcp_world_size
+from atom.utils.forward_context import get_published_dcp_local_context_lens
 
 _AG_CUSTOM_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 
@@ -953,12 +954,12 @@ def dcp_local_context_lens(
 
     Depends only on context_lens / S / W / dcp_rank, so it is the same for every
     layer and prepare_decode already computes it on the host. Prefer that
-    published buffer -- deriving it here costs 8 elementwise kernels on every
+    published buffer -- deriving it here costs 7 elementwise kernels on every
     full-index layer (21 of them on GLM-5.2). The fallback keeps metadata
     builders that do not publish it working.
     """
-    local_ctx = getattr(attn_metadata, "dcp_local_context_lens", None)
-    if local_ctx is not None and local_ctx.shape[0] == num_rows:
+    local_ctx = get_published_dcp_local_context_lens(attn_metadata, num_rows)
+    if local_ctx is not None:
         return local_ctx
     g_ctx = attn_metadata.context_lens
     S = cp_kv_cache_interleave_size
