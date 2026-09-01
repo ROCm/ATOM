@@ -1762,9 +1762,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             attn_metadata.dcp_local_context_lens = None
             return
 
-        buffer = self.model_runner.forward_vars[
-            f"{prefix}dcp_local_context_lens"
-        ]
+        buffer = self.model_runner.forward_vars[f"{prefix}dcp_local_context_lens"]
         attn_metadata.dcp_local_context_lens = (
             buffer.copy_to_gpu(rows) if copy_to_gpu else buffer.gpu[:rows]
         )
@@ -2033,9 +2031,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             if self.dcp_world_size > 1
             else None
         )
-        self._attach_dcp_local_context_lens(
-            attn_metadata, running_bs, copy_to_gpu=True
-        )
+        self._attach_dcp_local_context_lens(attn_metadata, running_bs, copy_to_gpu=True)
 
         if ctx_mla_ps_sparse is not None:
             for k, v in ctx_mla_ps_sparse.items():
@@ -2155,9 +2151,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     var[f"{p}dcp_local_context_lens"].np[:ub_real_reqs] = var[
                         "dcp_local_context_lens"
                     ].np[req_start : req_start + ub_real_reqs]
-                    var[f"{p}dcp_local_context_lens"].np[
-                        ub_real_reqs:running_bs
-                    ] = 0
+                    var[f"{p}dcp_local_context_lens"].np[ub_real_reqs:running_bs] = 0
 
             if self.is_sparse:
                 full_sparse = var["sparse_kv_indptr"].np
@@ -2433,9 +2427,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             if self.dcp_world_size > 1
             else None
         )
-        self._attach_dcp_local_context_lens(
-            attn, running_bs, prefix=p
-        )
+        self._attach_dcp_local_context_lens(attn, running_bs, prefix=p)
         return attn
 
     def build_ubatch_prefill_metadata(

@@ -402,8 +402,7 @@ def test_cudagraph_capture_publishes_dcp_local_context_lens():
     np.testing.assert_array_equal(metadata.dcp_local_context_lens, np.ones(4))
     assert var["dcp_local_context_lens"].copy_sizes == [4]
     assert (
-        dcp_local_context_lens(metadata, 0, 4, 1, 4)
-        is metadata.dcp_local_context_lens
+        dcp_local_context_lens(metadata, 0, 4, 1, 4) is metadata.dcp_local_context_lens
     )
 
 
