@@ -1438,7 +1438,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         pf_bank = self._get_mixed_prefill_bank()
         self.model_runner.forward_vars = pf_bank
         try:
-            prefill_meta, _ = self.prepare_prefill(batch)
+            # A mixed batch is never padded to a captured graph width, so the
+            # prefill segment's running_bs IS its scheduled seq count.
+            prefill_meta, _ = self.prepare_prefill(batch, n_p_seqs)
             prefill_positions_np = pf_bank["positions"].np[:n_p_tokens].copy()
         finally:
             # Restore even on error so a failed mixed build can't leave the

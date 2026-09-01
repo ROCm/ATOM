@@ -2548,7 +2548,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         pf_bank = self._get_mixed_prefill_bank()
         self.model_runner.forward_vars = pf_bank
         try:
-            prefill_meta, _prefill_positions = self.prepare_prefill(batch)
+            # Same reasoning as the `prepare_decode` call below: a mixed batch is
+            # never padded to a captured graph width, so the prefill segment's
+            # running_bs IS its scheduled seq count.
+            prefill_meta, _prefill_positions = self.prepare_prefill(batch, n_p_seqs)
         finally:
             # Restore even on error so a failed mixed build can't leave the
             # runner pointed at the mirror bank.
