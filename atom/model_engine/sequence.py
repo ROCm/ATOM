@@ -72,7 +72,7 @@ def get_exit_sequence():
 class OffloadJointRecord:
     """The KV-transfer offload/joint-load protocol state for one sequence.
 
-    These seven values were seven flat attributes on `Sequence`, written from
+    These six values were six flat attributes on `Sequence`, written from
     `BlockManager` and `Scheduler` and read back by the offload connector, with
     the joint subset re-initialised by hand in several places -- so a reset that
     forgot one field left a stale span the connector would then act on. Grouped
@@ -263,7 +263,7 @@ class Sequence:
         # forward. -1 = read and write the same slot, the case for every step in
         # between. Always a single slot: a checkpoint is one slot wide.
         self.state_fork_src = -1
-        # The KV-transfer offload/joint-load protocol state -- seven values that
+        # The KV-transfer offload/joint-load protocol state -- six values that
         # move together through admission and load. Grouped so a joint reset
         # cannot forget a field; see `OffloadJointRecord`.
         self.offload_joint = OffloadJointRecord()
