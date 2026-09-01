@@ -575,6 +575,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # Per-ubatch global (un-sharded) kv_indptr for round-robin CP (see the
             # shared "g_kv_indptr" buffer). Filled in _build_ubatch when dcp>1.
             var[f"{p}g_kv_indptr"] = CpuGpuBuffer(ub_max_bs + 1, **i32_kwargs)
+            if self.is_sparse and self.dcp_world_size > 1:
+                # Keep the layer-invariant local lengths available to the opaque
+                # sparse-indexer op in TBO, just like the full-batch metadata.
+                var[f"{p}dcp_local_context_lens"] = CpuGpuBuffer(
+                    ub_max_bs, **i32_kwargs
+                )
             var[f"{p}kv_indices"] = CpuGpuBuffer(
                 self.max_bs * self.max_num_blocks_per_seq,
                 **i32_kwargs,
@@ -1737,6 +1743,32 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             + dcp_local_index(pos, W, S) % block_size
         )
 
+    def _attach_dcp_local_context_lens(
+        self,
+        attn_metadata: AttentionMetaData,
+        rows: int,
+        *,
+        prefix: str = "",
+        copy_to_gpu: bool = False,
+    ) -> None:
+        """Attach the precomputed local KV lengths on every decode metadata path.
+
+        The sparse indexer is an opaque custom op, so CUDA graph capture fixes
+        the branch selected by ``dcp_local_context_lens`` at capture time. Keep
+        eager, graph-capture, and TBO metadata construction in one helper to
+        prevent any path from silently recording the elementwise fallback.
+        """
+        if not self.is_sparse or self.dcp_world_size <= 1:
+            attn_metadata.dcp_local_context_lens = None
+            return
+
+        buffer = self.model_runner.forward_vars[
+            f"{prefix}dcp_local_context_lens"
+        ]
+        attn_metadata.dcp_local_context_lens = (
+            buffer.copy_to_gpu(rows) if copy_to_gpu else buffer.gpu[:rows]
+        )
+
     def prepare_decode(
         self,
         batch: ScheduledBatch,
@@ -2001,12 +2033,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             if self.dcp_world_size > 1
             else None
         )
-        # Layer-invariant local KV lengths for the DCP sparse indexer (see the
-        # buffer's declaration). None off DCP so the consumer falls back.
-        attn_metadata.dcp_local_context_lens = (
-            var["dcp_local_context_lens"].copy_to_gpu(running_bs)
-            if self.dcp_world_size > 1
-            else None
+        self._attach_dcp_local_context_lens(
+            attn_metadata, running_bs, copy_to_gpu=True
         )
 
         if ctx_mla_ps_sparse is not None:
@@ -2123,6 +2151,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     var[f"{p}g_kv_indptr"].np[ub_real_reqs] if ub_real_reqs > 0 else 0
                 )
                 var[f"{p}g_kv_indptr"].np[ub_real_reqs + 1 : running_bs + 1] = g_last
+                if self.is_sparse:
+                    var[f"{p}dcp_local_context_lens"].np[:ub_real_reqs] = var[
+                        "dcp_local_context_lens"
+                    ].np[req_start : req_start + ub_real_reqs]
+                    var[f"{p}dcp_local_context_lens"].np[
+                        ub_real_reqs:running_bs
+                    ] = 0
 
             if self.is_sparse:
                 full_sparse = var["sparse_kv_indptr"].np
@@ -2161,6 +2196,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             ]
             if self.dcp_world_size > 1:
                 vars_used.append((f"{p}g_kv_indptr", running_bs + 1))
+            if self.is_sparse and self.dcp_world_size > 1:
+                vars_used.append((f"{p}dcp_local_context_lens", running_bs))
             if self.is_sparse:
                 vars_used.append((f"{p}sparse_kv_indptr", running_bs + 1))
 
@@ -2273,6 +2310,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 np.arange(bs + 1, dtype=np.int32) * self.dcp_world_size
             )
             var["g_kv_indptr"].copy_to_gpu(bs + 1)
+        if self.is_sparse and self.dcp_world_size > 1:
+            # Capture uses one synthetic local KV token per request. Replay
+            # overwrites this same backing buffer with the real per-step values.
+            var["dcp_local_context_lens"].np[:bs] = 1
+            var["dcp_local_context_lens"].copy_to_gpu(bs)
         if is_sparse_mtp:
             # Two sets: normal for dense layers, sparse_mtp for sparse layers
             ctx_mla_ps = self.set_mla_persistent_worker_buffers(bs, max_q_len)
@@ -2303,6 +2345,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         attn_matadata.g_kv_indptr = (
             var["g_kv_indptr"].gpu[: bs + 1] if self.dcp_world_size > 1 else None
         )
+        self._attach_dcp_local_context_lens(attn_matadata, bs)
         if ctx_mla_ps_sparse is not None:
             for k, v in ctx_mla_ps_sparse.items():
                 setattr(attn_matadata, k, v)
@@ -2389,6 +2432,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             var[f"{p}g_kv_indptr"].gpu[: running_bs + 1]
             if self.dcp_world_size > 1
             else None
+        )
+        self._attach_dcp_local_context_lens(
+            attn, running_bs, prefix=p
         )
         return attn
 

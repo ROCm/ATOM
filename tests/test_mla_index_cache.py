@@ -4,6 +4,7 @@
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from atom.models.utils import get_pp_indices
@@ -13,6 +14,7 @@ try:
 
     from atom.model_ops.attentions import aiter_mla
     from atom.model_ops.attentions.aiter_mla import AiterMLAMetadataBuilder
+    from atom.model_ops.dcp_ops import dcp_local_context_lens
 except (ImportError, RuntimeError) as exc:
     pytest.skip(f"aiter MLA backend unavailable: {exc}", allow_module_level=True)
 
@@ -349,3 +351,86 @@ def test_transfer_regions_use_explicit_compact_consumer_map(monkeypatch):
         9,
         10,
     ]
+
+
+class _FakeMetadataBuffer:
+    def __init__(self, size):
+        self.np = np.zeros(size, dtype=np.int32)
+        self.gpu = np.zeros(size, dtype=np.int32)
+        self.copy_sizes = []
+
+    def copy_to_gpu(self, size):
+        self.copy_sizes.append(size)
+        self.gpu[:size] = self.np[:size]
+        return self.gpu[:size]
+
+
+def _capture_metadata_builder(dcp_world_size, *, is_sparse):
+    bs = 4
+    var = {
+        "slot_mapping": _FakeMetadataBuffer(bs),
+        "context_lens": _FakeMetadataBuffer(bs),
+        "block_tables": _FakeMetadataBuffer(bs),
+        "cu_seqlens_q": _FakeMetadataBuffer(bs + 1),
+        "kv_indptr": _FakeMetadataBuffer(bs + 1),
+        "kv_indices": _FakeMetadataBuffer(bs),
+        "kv_last_page_lens": _FakeMetadataBuffer(bs),
+        "positions": _FakeMetadataBuffer(bs),
+        "g_kv_indptr": _FakeMetadataBuffer(bs + 1),
+    }
+    if is_sparse:
+        var["sparse_kv_indptr"] = _FakeMetadataBuffer(bs + 1)
+        var["sparse_kv_last_page_lens"] = _FakeMetadataBuffer(bs)
+    if is_sparse and dcp_world_size > 1:
+        var["dcp_local_context_lens"] = _FakeMetadataBuffer(bs)
+
+    builder = object.__new__(AiterMLAMetadataBuilder)
+    builder.model_runner = SimpleNamespace(forward_vars=var)
+    builder.block_size = 1
+    builder.is_sparse = is_sparse
+    builder.dcp_world_size = dcp_world_size
+    builder.dtype_q = None
+    builder.set_mla_persistent_worker_buffers = lambda *args, **kwargs: {}
+    return builder, var
+
+
+def test_cudagraph_capture_publishes_dcp_local_context_lens():
+    builder, var = _capture_metadata_builder(dcp_world_size=4, is_sparse=True)
+
+    metadata, _ = builder.build_for_cudagraph_capture(bs=4)
+
+    np.testing.assert_array_equal(metadata.dcp_local_context_lens, np.ones(4))
+    assert var["dcp_local_context_lens"].copy_sizes == [4]
+    assert (
+        dcp_local_context_lens(metadata, 0, 4, 1, 4)
+        is metadata.dcp_local_context_lens
+    )
+
+
+def test_cudagraph_capture_keeps_tp_path_independent_of_dcp_buffer():
+    builder, var = _capture_metadata_builder(dcp_world_size=1, is_sparse=True)
+    assert "dcp_local_context_lens" not in var
+
+    metadata, _ = builder.build_for_cudagraph_capture(bs=4)
+
+    assert metadata.dcp_local_context_lens is None
+
+
+def test_cudagraph_capture_keeps_dense_dcp_independent_of_sparse_buffer():
+    builder, var = _capture_metadata_builder(dcp_world_size=4, is_sparse=False)
+    assert "dcp_local_context_lens" not in var
+
+    metadata, _ = builder.build_for_cudagraph_capture(bs=4)
+
+    assert metadata.dcp_local_context_lens is None
+
+
+def test_dcp_local_context_attachment_supports_ubatch_prefix():
+    builder, var = _capture_metadata_builder(dcp_world_size=4, is_sparse=True)
+    var["ub0_dcp_local_context_lens"] = _FakeMetadataBuffer(4)
+    var["ub0_dcp_local_context_lens"].gpu[:] = np.arange(4, dtype=np.int32)
+    metadata = SimpleNamespace()
+
+    builder._attach_dcp_local_context_lens(metadata, 3, prefix="ub0_")
+
+    np.testing.assert_array_equal(metadata.dcp_local_context_lens, [0, 1, 2])
