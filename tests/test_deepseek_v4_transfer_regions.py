@@ -73,10 +73,13 @@ def _stub_v4_runtime_imports():
     kernels = types.ModuleType("atom.model_ops.v4_kernels")
     kernels.FP4_MQA_BLOCK_K = 128
     kernels.FP4_MQA_PARALLEL_UNIT_NUM = 1
+    kernels.CompressPlan = object
+    kernels.PreparedCompressPlan = object
     for name in (
         "build_v4_paged_decode_indptr",
         "fp4_indexer_enabled",
         "hca_compress_paged_offsets",
+        "prepare_compress_plans",
         "write_v4_paged_decode_indices",
         "write_v4_paged_prefill_indices",
     ):

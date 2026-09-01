@@ -2583,9 +2583,7 @@ class ModelRunner:
             context=context,
             num_tokens=scheduled_tokens,
             num_tokens_across_dp=num_tokens_across_dp,
-            dp_metadata=(
-                None if sync is None else DPMetadata.from_sync_result(sync)
-            ),
+            dp_metadata=(None if sync is None else DPMetadata.from_sync_result(sync)),
             spec_decode_metadata=spec_decode_metadata,
             ubatch_slices=ubatch_slices,
             ub_max_tokens_across_dp=ub_max_tokens_across_dp,
