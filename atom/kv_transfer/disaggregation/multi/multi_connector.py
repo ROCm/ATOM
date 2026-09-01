@@ -532,11 +532,23 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         return getattr(c, "chunk_size", None) if c is not None else None
 
     def should_park_for_load_after_alloc(self, seq: Any) -> bool:
-        c = _first_with(self._connectors, "should_park_for_load_after_alloc")
+        # Prefer the state-tier sub, then any offload sub: this is a load
+        # decision routed through `_decide_load_after_alloc`, which kimi_k3
+        # overrides with a joint-boundary clamp. With two offload subs
+        # (dense + kimi_k3) plain `_first_with` hands back the dense sub and the
+        # clamp is silently skipped. Mirrors the `chunk_size` forwarder.
+        c = self._state_tier_sub() or _first_with(
+            self._connectors, "should_park_for_load_after_alloc"
+        )
         return c.should_park_for_load_after_alloc(seq) if c is not None else False
 
     def adjust_prefill_chunk_after_alloc(self, seq: Any, chunk: int) -> int:
-        c = _first_with(self._connectors, "adjust_prefill_chunk_after_alloc")
+        # State-tier sub first, for the reason in `should_park_for_load_after_alloc`:
+        # the prefill chunk kimi_k3 hands back is sized to the joint load it will
+        # arm, and the dense sub would answer with the unclamped chunk.
+        c = self._state_tier_sub() or _first_with(
+            self._connectors, "adjust_prefill_chunk_after_alloc"
+        )
         return (
             c.adjust_prefill_chunk_after_alloc(seq, chunk) if c is not None else chunk
         )
@@ -611,7 +623,12 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         return c.take_state_source_releases()
 
     def should_park_partial_prefill_for_load(self, seq: Any) -> bool:
-        c = _first_with(self._connectors, "should_park_partial_prefill_for_load")
+        # State-tier sub first, for the reason in `should_park_for_load_after_alloc`:
+        # parking a partial prefill for its load is the state tier's decision, and
+        # a second offload sub must not answer it in the tier sub's place.
+        c = self._state_tier_sub() or _first_with(
+            self._connectors, "should_park_partial_prefill_for_load"
+        )
         return c.should_park_partial_prefill_for_load(seq) if c is not None else False
 
     def should_defer_free(self, seq: Any) -> bool:
