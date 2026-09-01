@@ -2459,6 +2459,17 @@ class BlockManager:
                 # and forgetting the hash would cost the next request over this
                 # prefix a full recompute.
                 self.state_offload.abandon_load(seq.id)
+                # Drop any not-yet-taken load queued for this request, exactly as
+                # `cancel_state_load` does (finding #3). Without this, a requeued
+                # or preempted admission leaves its entry in `_state_loads`, and
+                # `_publish_state_loads` later hands the connector a load for a
+                # request no longer in `metadata.requests` -- the tier writes into
+                # a released or orphaned slot, and the completion can settle this
+                # request's NEXT-generation park, attributing a state restore to
+                # the wrong generation silently. A no-op once the load was taken
+                # (in flight): the entry is already gone and the orphan-slot path
+                # above holds the slot until `settle_state_load`.
+                self._state_loads = [e for e in self._state_loads if e[0] != seq.id]
                 self.state.release_many(seq.state_slots[1:])
             else:
                 self.state.release_many(seq.state_slots)
