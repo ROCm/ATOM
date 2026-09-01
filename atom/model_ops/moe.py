@@ -1230,6 +1230,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         is_silu = (
             getattr(layer, "activation", ActivationType.Silu) == ActivationType.Silu
         )
+
+        layer.use_fused_silu_gugu = self.is_gfx1250 and is_silu
+
         use_triton_gfx1250_silu = self.use_triton and self.is_gfx1250 and is_silu
 
         # Decode-only Triton leaves the layout to the FlyDSL prep (branch C) and
@@ -1527,9 +1530,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 triton_kernel_moe_forward,
             )
 
-            use_triton_gfx1250_silu = self.is_gfx1250 and (
-                activation == ActivationType.Silu
-            )
+            # Decided at weight prep, not re-derived here: see
+            # _process_weight_layout_after_loading.
+            use_triton_gfx1250_silu = layer.use_fused_silu_gugu
             if self.use_triton_decode:
                 (
                     w13_weight,
