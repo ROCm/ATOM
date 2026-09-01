@@ -74,6 +74,7 @@ def _stub_v4_runtime_imports():
     kernels.FP4_MQA_BLOCK_K = 128
     kernels.FP4_MQA_PARALLEL_UNIT_NUM = 1
     for name in (
+        "build_v4_paged_decode_indptr",
         "fp4_indexer_enabled",
         "hca_compress_paged_offsets",
         "write_v4_paged_decode_indices",

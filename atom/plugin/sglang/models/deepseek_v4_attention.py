@@ -326,7 +326,6 @@ def patch_deepseek_v4_attention_for_sglang(attn: nn.Module) -> None:
 
                 for name in (
                     "batch_id_per_token",
-                    "batch_id_per_token_cpu",
                     "skip_prefix_len_csa",
                 ):
                     slice_attr(name, num_real)
