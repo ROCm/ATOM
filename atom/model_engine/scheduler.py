@@ -934,7 +934,7 @@ class Scheduler:
         that drop.
 
         The complement of the K3 connector's stall escape
-        (`kimi_k3.connector.SAVE_STALL_SECONDS`), not a duplicate of it: that
+        (`kimi_k3.connector.save_stall_seconds()`), not a duplicate of it: that
         one releases the blocks of a save the backend never took, on a shorter
         clock, and leaves a save already handed out alone -- precisely the case
         this reclaims once the report is not coming. Between them every deferred

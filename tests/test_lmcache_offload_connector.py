@@ -71,10 +71,10 @@ from atom.kv_transfer.offload.hybrid.dsv4.policy import (
     _chained_prefix_hashes,
 )
 from atom.kv_transfer.offload.hybrid.kimi_k3.connector import (
-    SAVE_STALL_SECONDS,
     STATE_INDEX_CHANNEL,
     KimiK3OffloadConnector,
     KimiK3OffloadScheduler,
+    save_stall_seconds,
 )
 from atom.kv_transfer.offload.hybrid.kimi_k3.state_tier import _JointPark
 from atom.kv_transfer.offload.metadata import (
@@ -4938,7 +4938,7 @@ def test_a_stalled_save_releases_blocks_it_never_handed_out(monkeypatch):
 
     # Age the outstanding save rather than the process clock: `time.monotonic`
     # is the stdlib's, and patching it reaches every other test in the run.
-    s._save_inflight_since["9"] -= 2 * SAVE_STALL_SECONDS
+    s._save_inflight_since["9"] -= 2 * save_stall_seconds()
     s._refresh_save_stall()
     assert s._save_stalled is True
     # Never handed out -> the blocks may go free. `should_defer_free` is a pure

@@ -20,8 +20,10 @@ from atom.kv_transfer.disaggregation.types import (
 )
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload._offload_common import (
+    _SAVE_ABANDON_MARGIN_S,
     StateOffloadFace,
     max_pending_saves,
+    offload_save_abandon_timeout_s,
     pp_aware_rank_and_world,
 )
 from atom.kv_transfer.offload.dense.connector import (
@@ -58,9 +60,35 @@ STATE_SOURCE_CHANNEL = "k3_state_source"
 #: rather than leaving a partially-reported key pending forever.
 STATE_LOAD_DISPOSITION_CHANNEL = "k3_state_load_disposition"
 
-#: A save outstanding longer than this is a backend that stopped, not one that
-#: is busy: a 4096-token store costs ~65ms.
-SAVE_STALL_SECONDS = 120.0
+#: The connector's standalone stall clock, used only when reclamation is
+#: disabled (`LMCACHE_EC_PIN_TIMEOUT_SEC <= 0`) so there is no abandon window to
+#: stay under. A save outstanding longer than this is a backend that stopped,
+#: not one that is busy: a 4096-token store costs ~65ms.
+_SAVE_STALL_DEFAULT_S = 120.0
+
+
+def save_stall_seconds() -> float:
+    """Seconds a save may sit before this connector calls the path stalled.
+
+    Kept strictly under the scheduler's abandon window by construction. The two
+    are complements on one deferred save: this connector releases the blocks of
+    a save the backend never took, and `Scheduler._reconcile_stalled_deferred_
+    saves` reclaims a save already handed out once its report is not coming --
+    the scheduler docstring asserts this connector fires "on a shorter clock".
+    A hardcoded 120 s broke that the moment `LMCACHE_EC_PIN_TIMEOUT_SEC` put the
+    abandon window (`offload_save_abandon_timeout_s()` = pin + margin) below 120
+    -- e.g. pin=60 gives abandon 90 < 120, inverting the order with nothing to
+    detect it. Derive both from the one source instead: fire at LMCache's pin
+    timeout itself (abandon minus the margin -- the point upstream has
+    force-unpinned the source), but never above the 120 s default, so the
+    ordering holds for every pin value and the default behaviour is unchanged.
+    When reclamation is disabled (abandon <= 0) there is no window to stay
+    under, so use the default.
+    """
+    abandon = offload_save_abandon_timeout_s()
+    if abandon <= 0:
+        return _SAVE_STALL_DEFAULT_S
+    return min(_SAVE_STALL_DEFAULT_S, abandon - _SAVE_ABANDON_MARGIN_S)
 
 
 class KimiK3OffloadConnector(DenseOffloadConnector):
@@ -609,7 +637,7 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
             self._warned_save_stalled = False
             return
         oldest = min(self._save_inflight_since.values())
-        self._save_stalled = (now - oldest) > SAVE_STALL_SECONDS
+        self._save_stalled = (now - oldest) > save_stall_seconds()
         if self._save_stalled and not self._warned_save_stalled:
             self._warned_save_stalled = True
             logger.warning(
