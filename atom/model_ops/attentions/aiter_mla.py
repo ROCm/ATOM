@@ -372,6 +372,18 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 dtype=torch.int32,
                 device=self.device,
             )
+            # MTP iteration sharing has a longer lifetime than target-layer
+            # IndexShare: draft mid-steps can still consume their selected
+            # physical slots while continuous batching starts the next target
+            # prefill. A single target+draft scratch buffer therefore races.
+            # Keep the draft model's index output and DCP compact metadata in
+            # independent workspaces, matching its independent index-cache row.
+            has_mtp_draft = self._global_num_draft_layers() > 0
+            self._mtp_sparse_kv_indices_gpu = (
+                torch.empty_like(self._sparse_kv_indices_gpu)
+                if has_mtp_draft
+                else None
+            )
             # DCP sparse decode compacts each rank's owned top-k slots to the
             # front (no -1 holes), so the per-request region length becomes data-
             # AND layer-dependent.
@@ -384,6 +396,16 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 self.max_num_batched_tokens,
                 dtype=torch.int32,
                 device=self.device,
+            )
+            self._mtp_dcp_sparse_kv_indptr_gpu = (
+                torch.zeros_like(self._dcp_sparse_kv_indptr_gpu)
+                if has_mtp_draft
+                else None
+            )
+            self._mtp_dcp_owned_counts_gpu = (
+                torch.zeros_like(self._dcp_owned_counts_gpu)
+                if has_mtp_draft
+                else None
             )
             sparse_prefill_num_heads = (
                 self.persistent_num_heads
@@ -512,17 +534,50 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         if self.is_sparse:
             sfc = config.compilation_config.static_forward_context
+            num_hidden_layers = int(hf_config.num_hidden_layers)
+
+            def is_mtp_context(module) -> bool:
+                layer_num = getattr(module, "layer_num", None)
+                if layer_num is not None:
+                    return int(layer_num) >= num_hidden_layers
+                prefix = str(getattr(module, "prefix", ""))
+                parts = prefix.split(".")
+                if "layers" in parts:
+                    layer_pos = parts.index("layers") + 1
+                    if layer_pos < len(parts) and parts[layer_pos].isdigit():
+                        return int(parts[layer_pos]) >= num_hidden_layers
+                return False
+
             for module in sfc.values():
                 impl = getattr(module, "impl", None)
+                use_mtp_workspace = (
+                    self._mtp_sparse_kv_indices_gpu is not None
+                    and (is_mtp_context(module) or is_mtp_context(impl))
+                )
+                sparse_indices = (
+                    self._mtp_sparse_kv_indices_gpu
+                    if use_mtp_workspace
+                    else self._sparse_kv_indices_gpu
+                )
+                dcp_indptr = (
+                    self._mtp_dcp_sparse_kv_indptr_gpu
+                    if use_mtp_workspace
+                    else self._dcp_sparse_kv_indptr_gpu
+                )
+                dcp_counts = (
+                    self._mtp_dcp_owned_counts_gpu
+                    if use_mtp_workspace
+                    else self._dcp_owned_counts_gpu
+                )
                 # DCP compact buffers ride along with the indices buffer: the
                 # indexer writes all three, the attention impl reads the indices
                 # and the offsets in the same layer.
                 for tgt in (module, impl):
                     if tgt is None or not hasattr(tgt, "sparse_kv_indices_buffer"):
                         continue
-                    tgt.sparse_kv_indices_buffer = self._sparse_kv_indices_gpu
-                    tgt.dcp_sparse_kv_indptr_buffer = self._dcp_sparse_kv_indptr_gpu
-                    tgt.dcp_owned_counts_buffer = self._dcp_owned_counts_gpu
+                    tgt.sparse_kv_indices_buffer = sparse_indices
+                    tgt.dcp_sparse_kv_indptr_buffer = dcp_indptr
+                    tgt.dcp_owned_counts_buffer = dcp_counts
             self._token_to_seq_idxs_gpu = torch.zeros(
                 self.max_num_batched_tokens,
                 dtype=torch.int32,

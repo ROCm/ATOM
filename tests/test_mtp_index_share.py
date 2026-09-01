@@ -1,31 +1,40 @@
-"""Unit tests for MTP draft index_share_for_mtp_iteration helpers.
-
-Avoid importing ``atom.models.deepseek_mtp`` here: that module pulls in
-``atom.config`` (torch / aiter / transformers) and is brittle in lightweight
-test collection.  The helpers below mirror
-``DeepSeekMultiTokenPredictor.set_skip_topk`` /
-``compact_topk_indices`` — keep them in sync when editing production code.
-"""
+"""Unit tests for MTP draft ``index_share_for_mtp_iteration`` helpers."""
 
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import Any
 
 import pytest
 import torch
 
+from atom.spec_decode.mtp_index_share import (
+    can_reuse_mtp_indices,
+    compact_mtp_sparse_indices,
+    forward_with_fresh_mtp_indices,
+    forward_with_reused_mtp_indices,
+    set_mtp_index_reuse,
+    supports_mtp_index_share,
+)
+
 
 class _FakeMlaAttn:
-    def __init__(self, buf: torch.Tensor):
+    def __init__(self, buf: torch.Tensor, topk: int):
         self.sparse_kv_indices_buffer = buf
+        self.topk_tokens = topk
+
+
+class _FakeMlaFrontend:
+    """Match native ATOM, where the sparse buffer lives on ``mla_attn.impl``."""
+
+    def __init__(self, impl: _FakeMlaAttn):
+        self.impl = impl
 
 
 class _FakeSelfAttn:
-    def __init__(self, *, has_indexer: bool, buf: torch.Tensor):
+    def __init__(self, *, has_indexer: bool, buf: torch.Tensor, topk: int = 2):
         self.skip_topk = False
-        self.indexer = object() if has_indexer else None
-        self.mla_attn = _FakeMlaAttn(buf)
+        self.indexer = SimpleNamespace(topk_tokens=topk) if has_indexer else None
+        self.mla_attn = _FakeMlaFrontend(_FakeMlaAttn(buf, topk))
 
 
 class _FakeMtpBlock:
@@ -38,94 +47,196 @@ class _FakeLayer:
         self.mtp_block = _FakeMtpBlock(self_attn)
 
 
-def _set_skip_topk(layers: dict[str, Any], skip: bool) -> None:
-    """Mirror of ``DeepSeekMultiTokenPredictor.set_skip_topk``."""
-    for layer in layers.values():
-        mtp_block = getattr(layer, "mtp_block", None)
-        if mtp_block is None:
-            continue
-        self_attn = getattr(mtp_block, "self_attn", None)
-        if self_attn is None or not hasattr(self_attn, "skip_topk"):
-            continue
-        if getattr(self_attn, "indexer", None) is not None:
-            self_attn.skip_topk = skip
+class _FakePredictor:
+    def __init__(self, layers):
+        self.layers = layers
 
 
-def _compact_topk_indices(layers: dict[str, Any], slot_ids: torch.Tensor) -> None:
-    """Mirror of ``DeepSeekMultiTokenPredictor.compact_topk_indices``."""
-    num_slots = slot_ids.numel()
-    for layer in layers.values():
-        mtp_block = getattr(layer, "mtp_block", None)
-        if mtp_block is None:
-            continue
-        self_attn = getattr(mtp_block, "self_attn", None)
-        if self_attn is None:
-            continue
-        mla_attn = getattr(self_attn, "mla_attn", None)
-        if mla_attn is None:
-            continue
-        sparse_buf = getattr(mla_attn, "sparse_kv_indices_buffer", None)
-        if sparse_buf is not None and sparse_buf.numel() > 0:
-            sparse_buf[:num_slots] = sparse_buf[slot_ids]
+class _FakeCompiledModel:
+    """``__call__`` represents the compiled dispatcher; ``forward`` is eager."""
+
+    def __init__(self, predictor: _FakePredictor, *, fail: bool = False):
+        self.model = predictor
+        self.fail = fail
+        self.compiled_calls = 0
+        self.compiled_skip_values = []
+        self.eager_skip_values = []
+
+    def __call__(self, **kwargs):
+        del kwargs
+        self.compiled_calls += 1
+        self.compiled_skip_values.append(
+            [
+                layer.mtp_block.self_attn.skip_topk
+                for layer in self.model.layers.values()
+            ]
+        )
+        if self.fail:
+            raise RuntimeError("forward failed")
+        return "compiled-output"
+
+    def forward(self, **kwargs):
+        del kwargs
+        self.eager_skip_values.append(
+            [
+                layer.mtp_block.self_attn.skip_topk
+                for layer in self.model.layers.values()
+            ]
+        )
+        if self.fail:
+            raise RuntimeError("forward failed")
+        return "eager-output"
 
 
 def test_set_skip_topk_only_layers_with_indexer():
     buf0 = torch.zeros(4, 8, dtype=torch.int32)
     buf1 = torch.zeros(4, 8, dtype=torch.int32)
-    layers = {
-        "80": _FakeLayer(_FakeSelfAttn(has_indexer=True, buf=buf0)),
-        "81": _FakeLayer(_FakeSelfAttn(has_indexer=False, buf=buf1)),
-    }
+    indexed = _FakeSelfAttn(has_indexer=True, buf=buf0, topk=8)
+    unindexed = _FakeSelfAttn(has_indexer=False, buf=buf1, topk=8)
+    predictor = _FakePredictor(
+        {"80": _FakeLayer(indexed), "81": _FakeLayer(unindexed)}
+    )
 
-    _set_skip_topk(layers, True)
+    set_mtp_index_reuse(predictor, True)
 
-    assert layers["80"].mtp_block.self_attn.skip_topk is True
-    assert layers["81"].mtp_block.self_attn.skip_topk is False
+    assert indexed.skip_topk is True
+    assert unindexed.skip_topk is False
 
 
-def test_compact_topk_indices_gathers_rows_to_front():
-    buf = torch.arange(20, dtype=torch.int32).reshape(10, 2)
-    layers = {"80": _FakeLayer(_FakeSelfAttn(has_indexer=True, buf=buf))}
+def test_compact_flat_topk_buffer_gathers_whole_rows_to_front():
+    buf = torch.arange(20, dtype=torch.int32)
+    sparse_indptr = torch.tensor(
+        [0, 1, 3, 5, 7, 9, 11, 13, 15, 17, 20], dtype=torch.int32
+    )
+    predictor = _FakePredictor(
+        {"80": _FakeLayer(_FakeSelfAttn(has_indexer=True, buf=buf, topk=2))}
+    )
+    model = _FakeCompiledModel(predictor)
 
     slot_ids = torch.tensor([3, 7], dtype=torch.int64)
-    _compact_topk_indices(layers, slot_ids)
+    compact_mtp_sparse_indices(model, slot_ids, sparse_indptr, running_rows=2)
 
-    expected_row0 = torch.arange(6, 8, dtype=torch.int32)
-    expected_row1 = torch.arange(14, 16, dtype=torch.int32)
-    assert torch.equal(buf[0], expected_row0)
-    assert torch.equal(buf[1], expected_row1)
+    assert torch.equal(buf[:4], torch.tensor([5, 6, 13, 14], dtype=torch.int32))
 
 
-def test_compact_topk_indices_skips_empty_buffer():
-    empty = torch.empty(0, dtype=torch.int32)
-    layers = {"80": _FakeLayer(_FakeSelfAttn(has_indexer=True, buf=empty))}
-    _compact_topk_indices(layers, torch.tensor([0], dtype=torch.int64))
+def test_compact_shared_buffer_only_once():
+    buf = torch.arange(12, dtype=torch.int32)
+    predictor = _FakePredictor(
+        {
+            "80": _FakeLayer(_FakeSelfAttn(has_indexer=True, buf=buf, topk=2)),
+            "81": _FakeLayer(_FakeSelfAttn(has_indexer=True, buf=buf, topk=2)),
+        }
+    )
+
+    compact_mtp_sparse_indices(
+        _FakeCompiledModel(predictor),
+        torch.tensor([2, 0], dtype=torch.int64),
+        torch.arange(0, 14, 2, dtype=torch.int32),
+        running_rows=2,
+    )
+
+    assert torch.equal(buf[:4], torch.tensor([4, 5, 0, 1], dtype=torch.int32))
+
+
+def test_compact_repeats_last_real_row_for_graph_padding():
+    buf = torch.arange(12, dtype=torch.int32)
+    predictor = _FakePredictor(
+        {"80": _FakeLayer(_FakeSelfAttn(has_indexer=True, buf=buf, topk=2))}
+    )
+
+    compact_mtp_sparse_indices(
+        _FakeCompiledModel(predictor),
+        torch.tensor([2, 0], dtype=torch.int64),
+        torch.arange(0, 14, 2, dtype=torch.int32),
+        running_rows=4,
+    )
+
+    assert torch.equal(
+        buf[:8],
+        torch.tensor([4, 5, 0, 1, 0, 1, 0, 1], dtype=torch.int32),
+    )
+
+
+def test_fresh_index_forward_is_compiled_and_restores_reuse():
+    attn = _FakeSelfAttn(
+        has_indexer=True, buf=torch.arange(8, dtype=torch.int32), topk=2
+    )
+    predictor = _FakePredictor({"80": _FakeLayer(attn)})
+    model = _FakeCompiledModel(predictor)
+    set_mtp_index_reuse(predictor, True)
+
+    result = forward_with_fresh_mtp_indices(model, input_ids=torch.tensor([1]))
+
+    assert result == "compiled-output"
+    assert model.compiled_calls == 1
+    assert model.compiled_skip_values == [[False]]
+    assert model.eager_skip_values == []
+    assert attn.skip_topk is True
+
+
+def test_fresh_index_forward_restores_reuse_after_failure():
+    attn = _FakeSelfAttn(
+        has_indexer=True, buf=torch.arange(8, dtype=torch.int32), topk=2
+    )
+    predictor = _FakePredictor({"80": _FakeLayer(attn)})
+    model = _FakeCompiledModel(predictor, fail=True)
+    set_mtp_index_reuse(predictor, True)
+
+    with pytest.raises(RuntimeError, match="forward failed"):
+        forward_with_fresh_mtp_indices(model)
+
+    assert attn.skip_topk is True
+
+
+def test_reused_index_forward_is_eager_with_skip_enabled():
+    attn = _FakeSelfAttn(
+        has_indexer=True, buf=torch.arange(8, dtype=torch.int32), topk=2
+    )
+    predictor = _FakePredictor({"80": _FakeLayer(attn)})
+    model = _FakeCompiledModel(predictor)
+
+    result = forward_with_reused_mtp_indices(model, input_ids=torch.tensor([1]))
+
+    assert result == "eager-output"
+    assert model.compiled_calls == 0
+    assert model.eager_skip_values == [[True]]
 
 
 @pytest.mark.parametrize(
-    "method,index_share,index_topk,has_api,expected",
+    "context_lens,expected",
     [
-        ("mtp", True, 2048, True, True),
-        ("mtp", False, 2048, True, False),
-        ("eagle3", True, 2048, True, False),
-        ("mtp", True, None, True, False),
-        ("mtp", True, 2048, False, False),
+        ([2048, 4096], True),
+        ([2047, 4096], False),
+        ([4096], False),
     ],
 )
-def test_share_mtp_indices_gate(method, index_share, index_topk, has_api, expected):
-    draft_hf = SimpleNamespace(
-        index_share_for_mtp_iteration=index_share,
+def test_reuse_requires_every_scheduled_row_to_reach_topk(context_lens, expected):
+    assert can_reuse_mtp_indices(context_lens, num_rows=2, topk=2048) is expected
+
+
+def test_support_gate_requires_index_owning_sparse_attention():
+    supported = _FakePredictor(
+        {
+            "80": _FakeLayer(
+                _FakeSelfAttn(
+                    has_indexer=True,
+                    buf=torch.empty(0, dtype=torch.int32),
+                    topk=2,
+                )
+            )
+        }
     )
-    if index_topk is not None:
-        draft_hf.index_topk = index_topk
-    mtp_inner = (
-        SimpleNamespace(set_skip_topk=lambda _: None) if has_api else SimpleNamespace()
+    unsupported = _FakePredictor(
+        {
+            "80": _FakeLayer(
+                _FakeSelfAttn(
+                    has_indexer=False,
+                    buf=torch.empty(0, dtype=torch.int32),
+                    topk=2,
+                )
+            )
+        }
     )
 
-    share = (
-        method == "mtp"
-        and getattr(draft_hf, "index_share_for_mtp_iteration", False)
-        and hasattr(draft_hf, "index_topk")
-        and hasattr(mtp_inner, "set_skip_topk")
-    )
-    assert share is expected
+    assert supports_mtp_index_share(supported)
+    assert not supports_mtp_index_share(unsupported)

@@ -16,6 +16,14 @@ from atom.distributed.pcp_utils import (
 from atom.spec_decode.draft_graph import DraftGraph, StagedInput
 from atom.spec_decode.drafter import Drafter
 from atom.spec_decode.eagle3_kv_builder import Eagle3DraftBuilder
+from atom.spec_decode.mtp_index_share import (
+    can_reuse_mtp_indices,
+    compact_mtp_sparse_indices,
+    forward_with_fresh_mtp_indices,
+    forward_with_reused_mtp_indices,
+    set_mtp_index_reuse,
+    supports_mtp_index_share,
+)
 from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
@@ -47,24 +55,30 @@ class EagleProposer(Drafter):
 
     def __init__(self, atom_config, device: torch.device, runner):
         super().__init__(atom_config, device, runner)
-        # GLM-5.2 draft index sharing: step 0 runs the MTP indexer, steps 1+
-        # reuse sparse_kv_indices_buffer via skip_topk + compact_topk_indices.
+        # GLM-5.2 draft index sharing: step 0 stays on the compiled full-indexer
+        # path, while the separate reusable-index path is captured by DraftGraph.
+        # A mutable skip_topk flag cannot select between already-compiled graphs:
+        # support_torch_compile dispatches directly to its first bytecode.
         # Gated on method=mtp, DSA index_topk and the config flag, so other
         # draft backends are unchanged. (DSpark is DSparkProposer, not this
         # class, so it cannot reach here.)
         draft_hf = self.speculative_config.draft_model_hf_config
         mtp_inner = getattr(self.model, "model", None)
+        self._mtp_index_topk = int(getattr(draft_hf, "index_topk", 0) or 0)
         self._share_mtp_indices = (
             self.speculative_config.method == "mtp"
             and getattr(draft_hf, "index_share_for_mtp_iteration", False)
-            and hasattr(draft_hf, "index_topk")
+            and self._mtp_index_topk > 0
             and mtp_inner is not None
-            and hasattr(mtp_inner, "set_skip_topk")
+            and supports_mtp_index_share(mtp_inner)
         )
         if self._share_mtp_indices:
+            # The first inner compilation must contain the indexer. Reuse
+            # bypasses that immutable dispatcher and is captured outside it.
+            set_mtp_index_reuse(mtp_inner, False)
             logger.info(
                 "MTP draft index_share_for_mtp_iteration enabled: "
-                "step 0 computes indexer top-k, steps 1+ reuse the buffer."
+                "fresh-index uses compiled model; later steps reuse a captured buffer."
             )
 
     def _resolve_mtp_k(self) -> int:
@@ -309,11 +323,15 @@ class EagleProposer(Drafter):
         was_draft = context.is_draft
         context.is_draft = True
         try:
-            self.model(
-                input_ids=input_ids,
-                positions=positions[:num_tokens] + 1,
-                hidden_states=draft_hidden,
-            )
+            forward_kwargs = {
+                "input_ids": input_ids,
+                "positions": positions[:num_tokens] + 1,
+                "hidden_states": draft_hidden,
+            }
+            if self._share_mtp_indices:
+                forward_with_fresh_mtp_indices(self.model, **forward_kwargs)
+            else:
+                self.model(**forward_kwargs)
         finally:
             context.is_draft = was_draft
 
@@ -336,14 +354,12 @@ class EagleProposer(Drafter):
         chosen from that shape. Replaying the same rewrite serving uses is the
         point -- a warmup that built its own would warm a shape nobody asks for.
 
-        The same goes for state the model carries: `skip_topk` is read as a
-        Python branch inside the draft's attention, and `propose` turns it on
-        only after step 0. Warming without it records the branch that recomputes
-        the index, which a replay then repeats every step -- the sharing this
-        flavor logs as enabled would be dead, silently.
+        This graph is intentionally the full-indexer fallback. The reuse branch
+        runs eagerly at the exact scheduled batch size because its physical
+        sparse rows cannot be widened with synthetic MLA metadata.
         """
         if self._share_mtp_indices:
-            self.model.model.set_skip_topk(True)
+            set_mtp_index_reuse(self.model.model, False)
         fc = get_forward_context()
         # Where each synthetic sequence actually is. Warming at position 0 would
         # compile a masked, near-empty window -- a shape steady-state decode
@@ -486,6 +502,25 @@ class EagleProposer(Drafter):
         if envs.ATOM_DEBUG_FORCE_SKIP_DRAFT_MODEL:
             draft_token_ids.fill_(-1)
         var = self.runner.forward_vars
+        # Below top-k, prepare_mtp_decode grows each sparse CSR row as a new
+        # draft KV token becomes visible. Reusing the prior packed row would
+        # make attention read an unwritten element. Host context_lens are
+        # already staged by the metadata builder, so this gate adds no GPU sync.
+        reuse_mtp_indices = (
+            self._share_mtp_indices
+            # Native prefill stores one variable-length CSR region per query
+            # token. It cannot be reinterpreted as the q_len=1 draft layout.
+            and not context.is_prefill
+            and can_reuse_mtp_indices(
+                var["context_lens"].np,
+                scheduled_bs,
+                self._mtp_index_topk,
+            )
+        )
+        if reuse_mtp_indices:
+            # Reused physical sparse rows describe only real requests. Never
+            # widen this branch to a graph bucket with synthetic MLA metadata.
+            running_bs = scheduled_bs
         # Eaale3 only support mha currently
         draft_uses_mha = hasattr(self.runner, "eagle3_draft_builder")
 
@@ -514,7 +549,13 @@ class EagleProposer(Drafter):
         # labelled as the plain batch it is.
         step0_label = f"bs={scheduled_bs}"
         mid_label = (
-            self.step.label(scheduled_bs, running_bs) if self.step else step0_label
+            (
+                f"bs={scheduled_bs} reuse-eager"
+                if reuse_mtp_indices
+                else self.step.label(scheduled_bs, running_bs)
+            )
+            if self.step
+            else step0_label
         )
         for i in range(self.mtp_k):
             # `tok` is this step's real row count, NOT `scheduled_bs`: step 0
@@ -568,20 +609,34 @@ class EagleProposer(Drafter):
                         positions,
                         hidden_states,
                     )
-                # index_share_for_mtp_iteration: step 0 runs the MTP indexer;
-                # steps 1+ skip it and read the compacted sparse_kv buffer.
-                if self._share_mtp_indices and i == 0:
-                    self.model.model.set_skip_topk(False)
-                if i and self.step is not None:
-                    # Steps 1+ are the declared pass: one row per sequence, at
-                    # a batch the startup sweep already warmed. The head rides
-                    # in the recording, so this hands back both of its outputs.
+                if i and self.step is not None and not reuse_mtp_indices:
+                    # Short-context and non-sharing paths retain the original
+                    # full-indexer DraftGraph, including its safe padded layout.
                     ret_hidden_states, graphed_ids = self.step.run(
                         running_bs,
                         **self._stage_step_inputs(
                             running_bs, d_input_ids, d_positions, d_hidden
                         ),
                     )
+                elif self._share_mtp_indices and i == 0:
+                    # Step 0 owns the compiled full-indexer path.
+                    ret_hidden_states = forward_with_fresh_mtp_indices(
+                        self.model,
+                        input_ids=d_input_ids,
+                        positions=d_positions,
+                        hidden_states=d_hidden,
+                    )
+                    graphed_ids = None
+                elif self._share_mtp_indices:
+                    # MRoPE declares no DraftGraph, but still needs the explicit
+                    # eager reuse branch instead of the compiled dispatcher.
+                    ret_hidden_states = forward_with_reused_mtp_indices(
+                        self.model,
+                        input_ids=d_input_ids,
+                        positions=d_positions,
+                        hidden_states=d_hidden,
+                    )
+                    graphed_ids = None
                 else:
                     ret_hidden_states = self.model(
                         input_ids=d_input_ids,
@@ -593,9 +648,13 @@ class EagleProposer(Drafter):
                     ret_hidden_states = pcp_allgather_rerange(
                         ret_hidden_states, pcp_ws
                     )[:n_global_draft]
-                if self._share_mtp_indices and i == 0:
-                    self.model.model.set_skip_topk(True)
-                    self.model.model.compact_topk_indices(last_token_indices)
+                if reuse_mtp_indices and i == 0:
+                    compact_mtp_sparse_indices(
+                        self.model,
+                        last_token_indices,
+                        attn_metadata.sparse_kv_indptr,
+                        running_bs,
+                    )
 
                 # Step 0 gathers one row per sequence out of the token stream;
                 # steps 1+ already are one row per sequence -- sliced back off
