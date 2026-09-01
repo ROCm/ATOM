@@ -9,10 +9,19 @@ import types
 
 import pytest
 
-pytest.importorskip("aiter", reason="the compiled draft imports aiter at module load")
+# Named on the module, not on "aiter": a test collected after one that stubs
+# `sys.modules["aiter"]` (tests/test_pd_pp.py does) sees the name import fine
+# and dies on a symbol, which is a collection error and takes the suite with
+# it. `exc_type` is what turns that ImportError into a skip.
+pytest.importorskip(
+    "atom.spec_decode.drafter",
+    reason="the compiled draft imports aiter at module load",
+    exc_type=ImportError,
+)
 
 import torch
 
+import atom.spec_decode.drafter as mod_drafter
 from atom.model_ops.v4_kernels.dspark_fp8_indices import DSparkIndexBuffers
 from atom.models.deepseek_v4_dspark import (
     DSparkConfidenceHead,
@@ -970,7 +979,7 @@ def test_forward_spec_passes_the_batch_through_unpadded(is_dummy, B):
 _GRAPH_BS = [1, 2, 4, 8, 16, 32, 48, 64, 128, 256]
 
 
-def _stub_forward_context(*, scheduled_bs, target_bs, use_cudagraph=True):
+def _stub_forward_context(*, scheduled_bs, target_bs):
     context = types.SimpleNamespace(
         scheduled_bs=scheduled_bs,
         running_bs=target_bs,
@@ -980,10 +989,8 @@ def _stub_forward_context(*, scheduled_bs, target_bs, use_cudagraph=True):
         running_tokens=target_bs * 337,
         is_dummy_run=False,
         is_draft=False,
+        is_prefill=False,
         positions=None,
-        forward_mode=types.SimpleNamespace(
-            use_cudagraph=use_cudagraph, running_bs=target_bs
-        ),
     )
     # `prepare_decode` publishes the ring slots at the PADDED batch, so the stub
     # does too -- the block slices to that length and nothing stages it.
@@ -994,19 +1001,30 @@ def _stub_forward_context(*, scheduled_bs, target_bs, use_cudagraph=True):
     return types.SimpleNamespace(context=context, attn_metadata=attn_metadata)
 
 
-def _proposer_with_graph_bs(monkeypatch, *, eplb=False, mtp_k=5, window=128):
-    """A DSparkProposer carrying only what the block pass reads."""
+def _proposer_with_graph_bs(
+    monkeypatch, *, eplb=False, mtp_k=5, window=128, captured=True
+):
+    """A DSparkProposer carrying only what the block pass reads.
+
+    ``captured`` is the fixture keeping its own name's promise: the startup
+    sweep records every capture size, and `propose` widens only for a batch
+    that has a recording. Answered through `is_captured` rather than by filling
+    `_cuda_graphs`, so `run` still reaches the backbone -- the only place these
+    tests can watch the width. `captured=False` is the no-recording case, where
+    widening would hand the variable-length MoE gather rows nothing replays.
+    """
+    from atom.spec_decode.draft_graph import DraftGraph
     from atom.spec_decode.dspark_proposer import DSparkProposer
+
+    monkeypatch.setattr(
+        DraftGraph,
+        "is_captured",
+        lambda self, running_bs: captured and running_bs in _GRAPH_BS,
+    )
 
     monkeypatch.setattr(DSparkProposer, "_with_draft", False, raising=False)
     monkeypatch.setattr(
         DSparkProposer, "aux_for", lambda self, h: [torch.zeros(1)], raising=False
-    )
-    monkeypatch.setattr(
-        DSparkProposer,
-        "_refresh_dp_metadata",
-        lambda self, fc, n: None,
-        raising=False,
     )
     monkeypatch.setattr(DSparkProposer, "verify_scheduler", None, raising=False)
 
@@ -1031,7 +1049,7 @@ def _proposer_with_graph_bs(monkeypatch, *, eplb=False, mtp_k=5, window=128):
     return p
 
 
-def _run_propose(p, fc, real_bs, monkeypatch, seen):
+def _run_propose(p, fc, scheduled_bs, monkeypatch, seen):
     import atom.spec_decode.dspark_proposer as mod
 
     def _backbone(ids, pos, num_draft):
@@ -1067,18 +1085,18 @@ def _run_propose(p, fc, real_bs, monkeypatch, seen):
     monkeypatch.setattr(mod, "get_forward_context", lambda: fc)
     return p.propose(
         target_token_ids=None,
-        target_positions=torch.arange(real_bs, dtype=torch.int64) * 7 + 3,
-        target_hidden_states=torch.zeros(real_bs, 4),
+        target_positions=torch.arange(scheduled_bs, dtype=torch.int64) * 7 + 3,
+        target_hidden_states=torch.zeros(scheduled_bs, 4),
         num_reject_tokens=None,
-        next_token_ids=torch.full((real_bs,), 5, dtype=torch.int32),
-        last_token_indices=torch.arange(real_bs, dtype=torch.int64),
+        next_token_ids=torch.full((scheduled_bs,), 5, dtype=torch.int32),
+        last_token_indices=torch.arange(scheduled_bs, dtype=torch.int64),
     )
 
 
 @pytest.mark.parametrize(
-    "real_bs,expect_B", [(44, 48), (50, 64), (1, 1), (64, 64), (35, 48)]
+    "scheduled_bs,expect_B", [(44, 48), (50, 64), (1, 1), (64, 64), (35, 48)]
 )
-def test_propose_drafts_at_the_captured_graph_bs(monkeypatch, real_bs, expect_B):
+def test_propose_drafts_at_the_captured_graph_bs(monkeypatch, scheduled_bs, expect_B):
     """The block runs at the target's running_bs, not the live batch size.
 
     Without this the drafter hands aiter a fresh width on every distinct decode
@@ -1087,42 +1105,257 @@ def test_propose_drafts_at_the_captured_graph_bs(monkeypatch, real_bs, expect_B)
     """
     seen = {}
     p = _proposer_with_graph_bs(monkeypatch)
-    fc = _stub_forward_context(scheduled_bs=real_bs, target_bs=expect_B)
-    out = _run_propose(p, fc, real_bs, monkeypatch, seen)
+    fc = _stub_forward_context(scheduled_bs=scheduled_bs, target_bs=expect_B)
+    out = _run_propose(p, fc, scheduled_bs, monkeypatch, seen)
 
     assert seen["B"] == expect_B
     assert seen["positions_B"] == expect_B
     # The block does not touch the target's ring slots: they arrive already at
     # the padded length, so there is nothing to install and nothing to restore.
     assert seen["slots"].shape[0] >= expect_B
-    assert seen["slots"][:real_bs].tolist() == list(range(100, 100 + real_bs))
-    assert out.shape[0] == real_bs
+    assert seen["slots"][:scheduled_bs].tolist() == list(range(100, 100 + scheduled_bs))
+    assert out.shape[0] == scheduled_bs
 
     # ...but the rows it fabricated must scatter no draft KV. Their ring slot is
     # the 0 `prepare_decode` fills that tail with, and 0 is a real position, so
     # an unmasked pad row writes into another request's window.
     t = p.mtp_k
     ids = seen["batch_ids"]
-    assert ids[: real_bs * t].tolist() == [i // t for i in range(real_bs * t)]
-    assert ids[real_bs * t : expect_B * t].tolist() == [-1] * (expect_B - real_bs) * t
+    assert ids[: scheduled_bs * t].tolist() == [i // t for i in range(scheduled_bs * t)]
+    assert (
+        ids[scheduled_bs * t : expect_B * t].tolist()
+        == [-1] * (expect_B - scheduled_bs) * t
+    )
 
 
-@pytest.mark.parametrize(
-    "cudagraph,eplb,why",
-    [
-        (False, False, "eager: the target pinned no wider batch to follow"),
-        (True, True, "pad rows would poison the expert-load histogram"),
-    ],
-)
-def test_propose_leaves_the_batch_alone_when_nothing_pins_a_wider_one(
-    monkeypatch, cudagraph, eplb, why
-):
+def test_propose_states_both_units_of_its_own_pass(monkeypatch):
+    """The draft's shape, and it is the pass's own, not the target's.
+
+    `scheduled_tokens` is how many rows carry a real request, `running_tokens`
+    how many the pass runs, and they DIFFER exactly when the batch was widened.
+    Pinned 44 against 48 so a version that reports one number twice cannot pass.
+    """
     seen = {}
-    p = _proposer_with_graph_bs(monkeypatch, eplb=eplb)
-    fc = _stub_forward_context(scheduled_bs=44, target_bs=48, use_cudagraph=cudagraph)
+    p = _proposer_with_graph_bs(monkeypatch, captured=False)
+    fc = _stub_forward_context(scheduled_bs=44, target_bs=48)
     out = _run_propose(p, fc, 44, monkeypatch, seen)
-    assert seen["B"] == 44, why
-    assert out.shape[0] == 44
+
+    t = p.mtp_k
+    assert seen["B"] == 48, "the pass runs the agreed batch, recording or not"
+    assert fc.context.scheduled_tokens == 44 * t
+    assert fc.context.running_tokens == 48 * t
+    assert out.shape[0] == 44, "sliced back to the real requests on the way out"
+    # ...and the fabricated rows still scatter no draft KV.
+    ids = seen["batch_ids"]
+    assert ids[44 * t : 48 * t].tolist() == [-1] * (4 * t)
+
+
+def test_propose_sizes_the_draft_gather_without_asking_the_group(monkeypatch):
+    """No collective here. The step already ran its one.
+
+    Every rank's draft height is the same number by construction --
+    `running_bs` came out of that reduction and the draft width is config -- so
+    each can write the whole table itself. `DPMetadata.make` all_reduces it
+    when the table is not supplied, which cost one CPU collective per draft
+    pass: `mtp_k` of them per step for the serial drafters.
+
+    Watched by making the ask itself fail, not by counting calls: a version
+    that asks would otherwise pass here on a stub that answers.
+    """
+    seen = {}
+    p = _proposer_with_graph_bs(monkeypatch)
+    p.config.parallel_config = types.SimpleNamespace(
+        data_parallel_size=2, data_parallel_rank=0
+    )
+
+    def _must_not_ask(*a, **k):
+        raise AssertionError("draft asked the group for a height it already knows")
+
+    monkeypatch.setattr(
+        mod_drafter.DPMetadata, "num_tokens_across_dp", staticmethod(_must_not_ask)
+    )
+    fc = _stub_forward_context(scheduled_bs=44, target_bs=48)
+    fc.dp_metadata = None
+    _run_propose(p, fc, 44, monkeypatch, seen)
+
+    t = p.mtp_k
+    assert fc.dp_metadata.get_sizes_across_dp() == [48 * t, 48 * t]
+
+
+def test_propose_puts_the_pass_on_the_path_its_own_shape_is_on(monkeypatch):
+    """The block pass is uniform across DP and is not a prefill.
+
+    Its height is `running_bs * draft width`, and both factors are the step's
+    own reduction or config -- so every rank runs the same number of rows,
+    whatever `decide` said about the TARGET's counts. That is what lets the
+    table below be declared rather than asked for.
+
+    `is_prefill` is a SEPARATE write by this same caller, not a consequence of
+    publishing a shape -- the padded gather reads it to choose which of the two
+    heights to check the rows against. Asserted here rather than one seam down
+    because the drafter reusing the target's prefill layout needs the opposite.
+    """
+    seen = {}
+    p = _proposer_with_graph_bs(monkeypatch)
+    p.config.parallel_config = types.SimpleNamespace(
+        data_parallel_size=2, data_parallel_rank=0
+    )
+    monkeypatch.setattr(
+        mod_drafter.DPMetadata, "make", staticmethod(lambda *a, **k: "dp_meta")
+    )
+    fc = _stub_forward_context(scheduled_bs=44, target_bs=48)
+    fc.context.is_prefill = True
+    fc.dp_metadata = None
+    _run_propose(p, fc, 44, monkeypatch, seen)
+
+    assert fc.context.running_tokens_are_unified is True
+    assert fc.context.is_prefill is False
+    assert fc.dp_metadata == "dp_meta"
+
+
+class _BareFlavor(mod_drafter.Drafter):
+    """The abstract methods, stubbed. `_publish_draft_shape` reads neither."""
+
+    _resolve_mtp_k = propose = staticmethod(lambda *a, **k: None)
+
+
+def _bare_drafter(dp_size):
+    """A Drafter carrying only what `_publish_draft_shape` reads.
+
+    Not a DSparkProposer: the tests below are about the seam every flavor goes
+    through, and the one that gets it wrong is the one with no fixture.
+    """
+    drafter = object.__new__(_BareFlavor)
+    drafter.config = types.SimpleNamespace(
+        parallel_config=types.SimpleNamespace(
+            data_parallel_size=dp_size, data_parallel_rank=0
+        )
+    )
+    return drafter
+
+
+def test_a_height_the_group_did_not_agree_on_is_asked_for_not_declared(monkeypatch):
+    """A draft pass sized off this rank alone still costs the collective.
+
+    `running_bs * width` is the same number everywhere; a pass carrying this
+    rank's own token stream is not, and declaring it uniform states an equality
+    no reduction ever checked.
+
+    What travels is the answer, not the table it implies -- how `make` then
+    builds one is tested against the real thing in tests/test_dp_metadata.py.
+    The two counts are pinned apart so forwarding the wrong one fails here.
+    """
+    seen = {}
+
+    def _make(cfg, batchsize, num_tokens_across_dp=None, *, unified=False):
+        seen["batchsize"] = batchsize
+        seen["table"] = num_tokens_across_dp
+        seen["unified"] = unified
+        return "dp_meta"
+
+    monkeypatch.setattr(mod_drafter.DPMetadata, "make", staticmethod(_make))
+    fc = _stub_forward_context(scheduled_bs=44, target_bs=48)
+
+    _bare_drafter(2)._publish_draft_shape(
+        fc,
+        scheduled_tokens=308,
+        running_tokens=336,
+        running_tokens_are_unified=False,
+    )
+    assert fc.context.running_tokens_are_unified is False
+    assert seen["unified"] is False, "a ragged height has to be discovered"
+
+    _bare_drafter(2)._publish_draft_shape(
+        fc,
+        scheduled_tokens=308,
+        running_tokens=336,
+        running_tokens_are_unified=True,
+    )
+    assert fc.context.running_tokens_are_unified is True
+    assert seen["batchsize"] == 336, "the group is told what the pass RUNS"
+    assert seen["unified"] is True, "an agreed height is worth no ask"
+    assert seen["table"] is None, "the answer travels, not a table built here"
+
+
+def test_publishing_a_shape_does_not_decide_whether_it_is_a_prefill():
+    """Two different questions, and one drafter answers them differently.
+
+    A draft step that reuses the target's own prefill layout -- Eagle's first
+    -- runs the target's ragged token stream through metadata that still
+    describes a prefill, so clearing the flag here would send every MLA layer,
+    the indexer and PCP down the decode branch on a pass that is not one.
+    """
+    fc = _stub_forward_context(scheduled_bs=44, target_bs=48)
+    fc.context.is_prefill = True
+
+    # dp_size 1: no metadata to build, so nothing but the flag is under test.
+    _bare_drafter(1)._publish_draft_shape(
+        fc,
+        scheduled_tokens=337,
+        running_tokens=337,
+        running_tokens_are_unified=False,
+    )
+
+    assert fc.context.is_prefill is True
+
+
+def test_propose_pads_under_eplb_exactly_as_it_does_without_it(monkeypatch):
+    """EPLB is not a reason to decline the padding, though it used to be.
+
+    The stated reason was the expert-load histogram: a pad row routes through
+    the draft's MoE and `select_experts_with_record` counts it. But the TARGET
+    pads on every cudagraph decode step and its rows reach the same recorder
+    (`eplb_map_and_record_fused` masks nothing), in far greater volume -- so
+    declining here protected nothing and only cost the draft its warmed shape.
+
+    Asserting the two are EQUAL, not that either is 48: a future term that
+    reads the config back into the width fails here whichever way it leans.
+    """
+    seen_on, seen_off = {}, {}
+    _run_propose(
+        _proposer_with_graph_bs(monkeypatch, eplb=True),
+        _stub_forward_context(scheduled_bs=44, target_bs=48),
+        44,
+        monkeypatch,
+        seen_on,
+    )
+    _run_propose(
+        _proposer_with_graph_bs(monkeypatch, eplb=False),
+        _stub_forward_context(scheduled_bs=44, target_bs=48),
+        44,
+        monkeypatch,
+        seen_off,
+    )
+    assert seen_on["B"] == seen_off["B"] == 48
+
+
+def test_propose_replays_at_the_agreed_batch_even_when_it_had_to_pad(monkeypatch):
+    """The seam, end to end through `propose`.
+
+    A step whose real batch is 44 runs the block at the agreed 48 and stands in
+    for the recording there. Watched through the recording being returned and
+    the backbone never running -- asserting the label alone would pass on a
+    `run` that replays nothing.
+
+    """
+    seen = {}
+    p = _proposer_with_graph_bs(monkeypatch)
+    recorded = (
+        torch.full((48, p.mtp_k), 9, dtype=torch.int32),
+        torch.zeros(48, p.mtp_k),
+    )
+    replays = []
+    p.block._cuda_graphs[48] = (
+        types.SimpleNamespace(replay=lambda: replays.append(1)),
+        recorded,
+    )
+    fc = _stub_forward_context(scheduled_bs=44, target_bs=48)
+    out = _run_propose(p, fc, 44, monkeypatch, seen)
+    assert replays == [1], "must replay the recording at the agreed batch"
+    assert "B" not in seen, "the backbone must not run when the recording stands in"
+    # Sliced back to the real batch: the 4 fabricated rows are the recording's
+    # to compute and nobody's to return.
+    assert out.tolist() == recorded[0][:44, : p.mtp_k].tolist()
 
 
 def test_propose_pads_a_dp_sync_dummy_exactly_like_the_rank_with_work(monkeypatch):
@@ -1348,12 +1581,12 @@ def test_the_separate_draft_model_path_declares_no_draft_graph(monkeypatch):
     the warmup and epilogue reach for -- and `warmup` runs both BEFORE it
     consults the pad/capture gates. So an unpaddable-but-declared pass still
     takes the startup sweep through `_block_warmup_inputs` and dies with an
-    AttributeError, which is what leaving this at `pads = False` used to do.
+    AttributeError, so declining to pad was never enough to keep it out.
     """
     from atom.spec_decode.dspark_proposer import DSparkProposer
 
     p = _proposer_with_graph_bs(monkeypatch)
-    assert p.draft_graphs and p.block.pads
+    assert p.draft_graphs and p.block is not None
 
     monkeypatch.setattr(DSparkProposer, "_with_draft", True, raising=False)
     p._build_draft_graphs()

@@ -459,7 +459,7 @@ class UBatchWrapper(nn.Module):
         pads each ubatch to this size, so a per-rank-local split (which differs
         when ranks carry different decode batch sizes, e.g. during drain)
         desyncs the collective and faults. Derive it from the DP-unified
-        ``ub_max_tokens_across_dp`` (MAX-reduced in ModelRunner._preprocess),
+        ``ub_max_tokens_across_dp`` (MAX-reduced in ``ForwardMode.decide``),
         converting the per-ubatch token max back to a request count via
         ``max_seqlen_q``. Falls back to the local split only when DP is off or
         the precomputed value is unavailable.
@@ -487,7 +487,7 @@ class UBatchWrapper(nn.Module):
         ``dp_size``: pad_for_all_gather gathers across ranks itself.
 
         For prefill (eager only): the cross-DP per-ubatch token MAX that
-            ``ModelRunner._preprocess`` already packed into the single DP
+            ``ForwardMode.decide`` already packed into the single DP
             all_reduce (``ctx.ub_max_tokens_across_dp``). Falls back to
             local sizes when DP is off / value not precomputed.
         For decode: the per-ubatch padded request count times ``max_seqlen_q``.

@@ -179,7 +179,7 @@ jobs:
     env:
       AITER_ARTIFACT_ID: ${{ needs.download_aiter_wheel.outputs.aiter_artifact_id }}
       CONTAINER_NAME: plugin_ci_vllm_${{ github.run_id }}_${{ strategy.job-index }}
-      PLUGIN_CI_SLURM_NODES: crsuse2-m2m-v2-002,crsuse2-m2m-v2-027
+      PLUGIN_CI_SLURM_NODES: crsuse2-m2m-v2-002,crsuse2-m2m-v2-027,crsuse2-m2m-v2-030,crsuse2-m2m-v2-031,crsuse2-m2m-v2-032,crsuse2-m2m-v2-044,crsuse2-m2m-v2-050
       RESULT_DIR: plugin-ci-results
     steps:
       - name: Checkout ATOM repo

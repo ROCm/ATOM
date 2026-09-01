@@ -94,15 +94,27 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         raise NotImplementedError
 
     @abstractmethod
-    def prepare_decode(self, batch: ScheduledBatch, bs: int):
+    def prepare_decode(
+        self,
+        batch: ScheduledBatch,
+        running_bs: int,
+        running_tokens: int,
+        max_seqlen_q: int,
+    ):
         raise NotImplementedError
 
     @abstractmethod
-    def prepare_prefill(self, batch: ScheduledBatch):
+    def prepare_prefill(self, batch: ScheduledBatch, running_bs: int):
         raise NotImplementedError
 
     @abstractmethod
-    def build(self, batch: ScheduledBatch, bs: int):
+    def build(
+        self,
+        batch: ScheduledBatch,
+        running_bs: int,
+        running_tokens: int,
+        max_seqlen_q: int,
+    ):
         raise NotImplementedError
 
     def prepare_mtp_decode(
@@ -446,8 +458,8 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
 
         return self._copy_mrope_to_gpu(total_tokens)
 
-    def prepare_prefill(self, batch: ScheduledBatch):
-        bs = batch.total_seqs_num_prefill
+    def prepare_prefill(self, batch: ScheduledBatch, running_bs: int):
+        scheduled_bs = batch.total_seqs_num_prefill
         sum_scheduled_tokens = batch.total_tokens_num_prefill
         var = self.model_runner.forward_vars
         positions = []
@@ -458,8 +470,8 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         slot_mapping = []
         has_cached = False
         # seqs = list(batch.seqs.values())
-        # seqs = seqs[:bs]
-        for i in range(bs):
+        # seqs = seqs[:scheduled_bs]
+        for i in range(scheduled_bs):
             seqlen = batch.context_lens[i]
             cached_seqlen = batch.num_cached_tokens[i]
             if cached_seqlen > 0:
@@ -526,28 +538,38 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         var["positions"].np[:sum_scheduled_tokens] = positions
         var["slot_mapping"].np[:sum_scheduled_tokens] = -1
         var["slot_mapping"].np[: len(slot_mapping)] = slot_mapping
-        var["cu_seqlens_q"].np[: bs + 1] = cu_seqlens_q
-        var["cu_seqlens_k"].np[: bs + 1] = cu_seqlens_k
-        var["context_lens"].np[:bs] = batch.context_lens[:bs]
+        var["cu_seqlens_q"].np[: scheduled_bs + 1] = cu_seqlens_q
+        var["cu_seqlens_k"].np[: scheduled_bs + 1] = cu_seqlens_k
+        var["context_lens"].np[:scheduled_bs] = batch.context_lens[:scheduled_bs]
+        # Pad the per-sequence tail out to `running_bs`, the width a draft pass
+        # that follows this step runs at and the one `prepare_decode` fills to.
+        # A flat cumsum gives each fabricated row zero query length and a zero
+        # context makes it read nothing; left unwritten they hold the previous
+        # step's, and the drafter attends to a since-freed request's blocks.
+        var["cu_seqlens_q"].np[scheduled_bs + 1 : running_bs + 1] = cu_seqlens_q[-1]
+        var["cu_seqlens_k"].np[scheduled_bs + 1 : running_bs + 1] = cu_seqlens_k[-1]
+        var["context_lens"].np[scheduled_bs:running_bs] = 0
         min_seqlen_q = 0
         dropout_p = 0.0
         vars_used = [
-            ("cu_seqlens_q", bs + 1),
-            ("cu_seqlens_k", bs + 1),
+            ("cu_seqlens_q", running_bs + 1),
+            ("cu_seqlens_k", running_bs + 1),
             ("slot_mapping", sum_scheduled_tokens),
-            ("context_lens", bs),
+            ("context_lens", running_bs),
         ]
         if has_cached:
-            vars_used.append(("block_tables", bs))
-            vars_used.append(("seq_starts", bs))
+            vars_used.append(("block_tables", scheduled_bs))
+            vars_used.append(("seq_starts", scheduled_bs))
 
         ctx = {el: var[el].copy_to_gpu(num) for el, num in vars_used}
         num_cached_tokens = None
         if has_cached:
             num_cached_tokens = torch.tensor(
-                batch.num_cached_tokens[:bs], dtype=torch.int32, pin_memory=True
+                batch.num_cached_tokens[:scheduled_bs],
+                dtype=torch.int32,
+                pin_memory=True,
             ).cuda(non_blocking=True)
-            total_tokens = sum(batch.context_lens[:bs])
+            total_tokens = sum(batch.context_lens[:scheduled_bs])
         total_kv = total_tokens if has_cached else sum_scheduled_tokens
         attn_metadata = AttentionMetaData(
             # Cast to python int — numpy.int32 leaks in via batch.context_lens
@@ -601,7 +623,29 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             attn_metadata, "cu_seqlens_k", var["cu_seqlens_k"].np[: bs + 1].copy()
         )
 
-    def build(self, batch: ScheduledBatch, bs: int):
+    def build(
+        self,
+        batch: ScheduledBatch,
+        running_bs: int,
+        running_tokens: int,
+        max_seqlen_q: int,
+    ):
+        """Build this step's metadata at the shape `prepare_inputs` settled.
+
+        The step's two units and nothing else: `running_bs` sizes everything
+        per-sequence, `running_tokens` everything per-row. Both arrive as
+        arguments because neither is derivable from `batch` -- the scheduler
+        built it before the DP sync and before any graph was picked -- and
+        neither is derivable from the other, since a ragged step replays a flat
+        token bucket rather than a `running_bs * q` grid.
+
+        Prefill takes only the first: its rows are the prompt's, so there is no
+        `running_tokens` to hand it, but its per-sequence tail still pads to
+        `running_bs` for the draft pass that follows. That padding is visible
+        past attention -- `cu_seqlens_q` doubles as the selector for the
+        sampler's rows, so the LM head emits `running_bs` of them. `postprocess`
+        cuts back to the scheduled batch, and that is the one place it does.
+        """
         # Run state maintenance on the compute stream before the forward.
         state_ops = batch.state_maintenance_ops
         if state_ops.relocations:
@@ -612,9 +656,9 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             )
         is_prefill = batch.total_tokens_num_prefill > 0
         if is_prefill:
-            return self.prepare_prefill(batch)
+            return self.prepare_prefill(batch, running_bs)
         else:
-            return self.prepare_decode(batch, bs)
+            return self.prepare_decode(batch, running_bs, running_tokens, max_seqlen_q)
 
 
 class AttentionImpl(nn.Module):

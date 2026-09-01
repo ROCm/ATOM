@@ -28,9 +28,11 @@ class KimiK3DSparkDraft(KimiK3DSparkBase):
         hidden_states = (
             inputs_embeds if inputs_embeds is not None else self.embed_tokens(input_ids)
         )
+        residual = None
         for layer in self.layers:
-            hidden_states = layer(positions, hidden_states)
-        return self.final_norm(hidden_states)
+            hidden_states, residual = layer(positions, hidden_states, residual)
+        hidden_states, _ = self.final_norm(hidden_states, residual)
+        return hidden_states
 
     def write_combined_context_kv(
         self,

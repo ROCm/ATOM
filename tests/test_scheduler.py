@@ -2,6 +2,8 @@
 # Tests for atom/model_engine/scheduler.py — public API only
 
 
+import logging
+import time
 from collections import deque
 from types import SimpleNamespace
 from unittest import mock
@@ -15,34 +17,352 @@ from atom.kv_transfer.disaggregation.types import (
     SaveOperationId,
 )
 from atom.kv_transfer.offload._offload_common import OffloadSchedulerMixin
+from atom.model_engine.engine_stats import EngineStats
 from atom.model_engine.scheduler import (
     ScheduledBatch,
     ScheduledBatchOutput,
     Scheduler,
-    SpecStats,
 )
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 from atom.sampling_params import SamplingParams
 
-# ── SpecStats ──────────────────────────────────────────────────────────────
+# ── EngineStats: spec section ────────────────────────────────────────────────
 
 
-class TestSpecStats:
+class TestSpecSection:
     def test_no_division_by_zero_with_valid_mtp_k(self):
-        """SpecStats with mtp_k >= 1 must not raise on update()."""
-        stats = SpecStats(mtp_k=1)
+        """EngineStats spec section with mtp_k >= 1 must not raise on update."""
+        stats = EngineStats(use_spec=True, mtp_k=1)
         # Should not raise ZeroDivisionError
-        stats.update(num_accepted_tokens=1)
-        stats.update(num_accepted_tokens=2)
+        stats.update_spec(num_accepted_tokens=1)
+        stats.update_spec(num_accepted_tokens=2)
 
     def test_update_accumulates_draft_tokens(self):
-        stats = SpecStats(mtp_k=2)
-        stats.update(num_accepted_tokens=1)
+        stats = EngineStats(use_spec=True, mtp_k=2)
+        stats.update_spec(num_accepted_tokens=1)
         assert stats.total_draft_tokens == 2
 
     def test_acceptance_rate_zero_when_no_updates(self):
-        stats = SpecStats(mtp_k=3)
+        stats = EngineStats(use_spec=True, mtp_k=3)
         assert stats.acceptance_rate == 0.0
+
+
+# ── EngineStats: cache section ───────────────────────────────────────────────
+
+
+class TestCacheSection:
+    def test_update_accumulates_tokens(self):
+        stats = EngineStats(enable_prefix_caching=True)
+        # update_cache(cached, full, compressed, wanted, reusable)
+        stats.update_cache(4, 10, 8, 6, 9)
+        assert stats.total_requests == 1
+        assert stats.total_cached_tokens == 4
+        assert stats.total_full_tokens == 10
+        assert stats.total_compressed_tokens == 8
+        assert stats.total_wanted_tokens == 6
+        assert stats.total_reusable_tokens == 9
+
+    def test_hit_rate_zero_when_no_updates(self):
+        stats = EngineStats(enable_prefix_caching=True)
+        assert stats.cache_hit_rate == 0.0
+
+    def test_hit_rate_is_over_reusable_not_full(self):
+        """`full` includes the trailing block no cache may serve, so the rate is
+        denominated in `reusable` — 4/8, not 4/10."""
+        stats = EngineStats(enable_prefix_caching=True)
+        stats.update_cache(4, 10, 8, 6, 8)
+        assert stats.cache_hit_rate == 0.5
+
+    def test_recent_hit_rate_tracks_the_window_not_all_history(self):
+        """The reviewer's scenario: a long run whose early traffic reused a lot
+        and whose later traffic reuses nothing. The lifetime figure stays high
+        and barely moves; the windowed one follows the current workload."""
+        stats = EngineStats(enable_prefix_caching=True, cache_hit_rate_window=100)
+        for _ in range(100):  # early: 80% reuse
+            stats.update_cache(80, 100, 80, 80, 100)
+        assert stats.recent_cache_hit_rate == pytest.approx(0.8)
+
+        for _ in range(100):  # later: none at all, filling the window
+            stats.update_cache(0, 100, 0, 0, 100)
+        assert stats.recent_cache_hit_rate == pytest.approx(0.0)
+        # Lifetime still reports the average of both halves, as it should.
+        assert stats.cache_hit_rate == pytest.approx(0.4)
+
+    def test_recent_hit_rate_is_none_before_any_observation(self):
+        stats = EngineStats(enable_prefix_caching=True)
+        assert stats.recent_cache_hit_rate is None
+
+    def test_window_is_bounded(self):
+        """The deque must not grow with the run — it is a fixed-size window."""
+        stats = EngineStats(enable_prefix_caching=True, cache_hit_rate_window=10)
+        for _ in range(500):
+            stats.update_cache(1, 10, 1, 1, 10)
+        assert len(stats._recent_hits) == 10
+        assert stats._recent_reusable_tokens == 100  # 10 requests x 10 tokens
+        assert stats.total_requests == 500, "lifetime counters keep counting"
+
+    def test_update_is_noop_when_cache_disabled(self):
+        """The cache section gates internally, so a disabled EngineStats
+        ignores update_cache rather than the caller having to guard it."""
+        stats = EngineStats(enable_prefix_caching=False)
+        stats.update_cache(4, 10, 8, 6, 9)
+        assert stats.total_requests == 0
+        assert stats.total_cached_tokens == 0
+
+
+# ── EngineStats: throughput section ──────────────────────────────────────────
+
+
+class TestThroughputSection:
+    def test_update_accumulates_tokens(self):
+        stats = EngineStats(enable_log_stats=True)
+        stats.update_throughput(num_prompt_tokens=10, num_generation_tokens=5)
+        assert stats.num_prompt_tokens == 10
+        assert stats.num_generation_tokens == 5
+
+    def test_maybe_log_below_interval_keeps_counters(self):
+        """Time-based pace: below the wall-clock interval nothing is logged or
+        reset, so the accumulated counts survive to the next tick."""
+        stats = EngineStats(enable_log_stats=True, throughput_log_interval_s=1e6)
+        stats.update_throughput(num_prompt_tokens=10, num_generation_tokens=5)
+        stats.maybe_log_throughput(num_running_reqs=1, num_waiting_reqs=0, kv_usage=0.0)
+        assert stats.num_prompt_tokens == 10
+        assert stats.num_generation_tokens == 5
+
+    def test_update_is_noop_when_log_stats_disabled(self):
+        stats = EngineStats(enable_log_stats=False)
+        stats.update_throughput(num_prompt_tokens=10, num_generation_tokens=5)
+        assert stats.num_prompt_tokens == 0
+        assert stats.num_generation_tokens == 0
+
+    def test_an_all_quiet_window_closes_without_logging(self, caplog):
+        """A quiet engine must not fill the log with 0.0 lines — but the
+        window still has to close, because a stale start is what made the
+        first line after a lull divide its tokens by the whole lull."""
+        stats = EngineStats(enable_log_stats=True)
+        stats._throughput_last_log_time -= 43.0
+        with caplog.at_level(logging.INFO, logger="atom"):
+            stats.maybe_log_throughput(
+                num_running_reqs=0, num_waiting_reqs=0, kv_usage=0.0
+            )
+        assert "Engine" not in caplog.text, "all-quiet window must stay silent"
+        # Closed anyway: the start is fresh, so the next window measures its
+        # own interval rather than the 43s that preceded it.
+        assert time.monotonic() - stats._throughput_last_log_time < 1.0
+
+    def test_a_burst_then_idle_is_still_reported(self, caplog):
+        """Silence is gated on zero tokens *as well as* an empty engine, so a
+        window still holding a finished burst's tokens prints even though
+        nothing is running by the time it closes."""
+        stats = EngineStats(enable_log_stats=True)
+        stats.update_throughput(num_prompt_tokens=30000)
+        stats._throughput_last_log_time -= 43.0
+        with caplog.at_level(logging.INFO, logger="atom"):
+            stats.maybe_log_throughput(
+                num_running_reqs=0, num_waiting_reqs=0, kv_usage=0.0
+            )
+        assert "Engine 000" in caplog.text, "a burst must not be swallowed"
+        assert stats.num_prompt_tokens == 0, "reported tokens must be cleared"
+
+    def test_running_requests_keep_the_zero_line(self, caplog):
+        """Zero tokens with requests in flight means the engine is stuck —
+        exactly when the 0.0 line is worth printing. Only a window with
+        nothing running *and* nothing queued is suppressed."""
+        stats = EngineStats(enable_log_stats=True)
+        stats._throughput_last_log_time -= 43.0
+        with caplog.at_level(logging.INFO, logger="atom"):
+            stats.maybe_log_throughput(
+                num_running_reqs=8, num_waiting_reqs=0, kv_usage=0.5
+            )
+        assert "Avg prompt throughput: 0.0 tokens/s" in caplog.text
+        assert "Running: 8 reqs" in caplog.text
+
+    def test_idle_does_not_leave_the_window_start_stale(self, caplog):
+        """The regression this fixes: after a lull, the next active window
+        must measure its own interval, not lull-plus-interval.
+
+        Both stretches are moved on the clock rather than slept through. A
+        `sleep` here would put the assertion on a wall-time budget that a GC
+        pause or a contended runner can blow, turning an unrelated hiccup into
+        a red build pointing at a regression that never happened.
+        """
+        interval = 10.0
+        stats = EngineStats(enable_log_stats=True, throughput_log_interval_s=interval)
+        # 43s of idleness, closed silently by the heartbeat — that close is
+        # what keeps the window start fresh.
+        stats._throughput_last_log_time -= 43.0
+        stats.maybe_log_throughput(num_running_reqs=0, num_waiting_reqs=0, kv_usage=0.0)
+        # Work arrives, then exactly one interval goes by.
+        stats.update_throughput(num_prompt_tokens=7700)
+        stats._throughput_last_log_time -= interval
+        caplog.clear()  # only the line under test, so the parse below is exact
+        with caplog.at_level(logging.INFO, logger="atom"):
+            stats.maybe_log_throughput(
+                num_running_reqs=1, num_waiting_reqs=0, kv_usage=0.1
+            )
+        assert caplog.text.count("Avg prompt throughput: ") == 1
+        rate = float(caplog.text.split("Avg prompt throughput: ")[1].split(" ")[0])
+        # 7700 over the 10s window it belongs to (770/s). Without the silent
+        # close the window would still span the lull as well — 53s, ~145/s.
+        assert 700 < rate < 800, f"window does not match its own interval: {rate}"
+
+    def test_non_positive_interval_is_refused(self):
+        """A `ValueError`, not an `assert`: `python -O` strips asserts, and
+        this check is all that stands between the interval and a
+        ZeroDivisionError raised inside the scheduler loop."""
+        for bad in (0, -1, -0.5):
+            with pytest.raises(ValueError, match="throughput_log_interval_s"):
+                EngineStats(enable_log_stats=True, throughput_log_interval_s=bad)
+
+    def test_zero_elapsed_cannot_divide(self):
+        """The division is guarded at its own site too, so reaching it with a
+        window that has not advanced returns instead of raising."""
+        stats = EngineStats(enable_log_stats=True, throughput_log_interval_s=10.0)
+        stats.update_throughput(num_prompt_tokens=100)
+        # Interval tampered with after construction, window not advanced.
+        stats.throughput_log_interval_s = 0.0
+        stats._throughput_last_log_time = time.monotonic() + 5.0
+        stats.maybe_log_throughput(num_running_reqs=1, num_waiting_reqs=0, kv_usage=0.0)
+        assert stats.num_prompt_tokens == 100, "nothing should have been reported"
+
+    def test_interval_comes_from_config(self):
+        """`--throughput-log-interval` has to reach EngineStats, not just sit
+        on Config — the cadence was a hard-coded keyword default before."""
+        sched = Scheduler(
+            MockConfig(enable_log_stats=True, throughput_log_interval=2.5)
+        )
+        assert sched.engine_stats.throughput_log_interval_s == 2.5
+
+    def test_hit_rate_window_comes_from_config(self):
+        """Same wiring as the interval above: `--cache-hit-rate-window` has to
+        reach EngineStats rather than stop at Config."""
+        sched = Scheduler(MockConfig(cache_hit_rate_window=250))
+        assert sched.engine_stats._recent_window == 250
+
+    def test_non_positive_hit_rate_window_is_rejected(self):
+        """0 would evict each request as it arrives and read `n/a` forever;
+        a negative window never evicts, turning the "recent" rate into a
+        lifetime one. Neither should fail silently — and a bare assert would,
+        under `python -O`."""
+        with pytest.raises(ValueError, match="cache_hit_rate_window"):
+            EngineStats(enable_prefix_caching=True, cache_hit_rate_window=0)
+
+    def test_window_expired_gates_the_heartbeat(self):
+        stats = EngineStats(enable_log_stats=True, throughput_log_interval_s=10.0)
+        assert stats.window_expired(time.monotonic()) is False
+        assert stats.window_expired(time.monotonic() + 11.0) is True
+
+    def test_window_expired_is_false_when_log_stats_disabled(self):
+        stats = EngineStats(enable_log_stats=False)
+        assert stats.window_expired(time.monotonic() + 1e6) is False
+
+    def test_hit_rate_is_na_until_something_is_measured(self, caplog):
+        """Prefix caching enabled but nothing observed yet — "0.0%" would be a
+        claim about reuse made without ever having looked. This is the shape a
+        P/D decode engine is in permanently (it never reaches `update_cache`)
+        and the aggregated scheduler is in until its first prefill."""
+        stats = EngineStats(
+            enable_log_stats=True,
+            enable_prefix_caching=True,
+            throughput_log_interval_s=1e-6,
+        )
+        with caplog.at_level(logging.INFO, logger="atom"):
+            stats.update_throughput(num_generation_tokens=100)
+            stats.maybe_log_throughput(
+                num_running_reqs=8, num_waiting_reqs=0, kv_usage=0.5
+            )
+        assert "Prefix cache hit rate: n/a" in caplog.text
+
+    def test_hit_rate_appears_once_measured(self, caplog):
+        stats = EngineStats(
+            enable_log_stats=True,
+            enable_prefix_caching=True,
+            throughput_log_interval_s=1e-6,
+        )
+        stats.update_cache(4, 10, 8, 6, 8)  # cached=4 of reusable=8
+        with caplog.at_level(logging.INFO, logger="atom"):
+            stats.update_throughput(num_prompt_tokens=10)
+            stats.maybe_log_throughput(
+                num_running_reqs=1, num_waiting_reqs=0, kv_usage=0.1
+            )
+        assert "Prefix cache hit rate: 50.0%" in caplog.text
+
+    def test_label_defaults_to_empty_so_the_line_is_unchanged(self):
+        assert EngineStats(enable_log_stats=True).label == ""
+
+    def test_absent_kv_pool_logs_na_not_zero(self, caplog):
+        """`kv_usage=None` means "this scheduler owns no KV pool" (P/D prefill),
+        which must not read as a real, empty pool."""
+        stats = EngineStats(
+            enable_log_stats=True, label="Prefill ", throughput_log_interval_s=1e-6
+        )
+        with caplog.at_level(logging.INFO, logger="atom"):
+            stats.update_throughput(num_prompt_tokens=100)
+            stats.maybe_log_throughput(
+                num_running_reqs=2, num_waiting_reqs=1, kv_usage=None
+            )
+        line = caplog.text
+        assert "Prefill Engine 000" in line
+        assert "GPU KV cache usage: n/a" in line
+        # Prefix caching is off here too, so that one is n/a as well.
+        assert "Prefix cache hit rate: n/a" in line
+
+
+# ── schedule() closes the throughput window ────────────────────────────────
+
+
+class TestScheduleTicksTheWindow:
+    """`schedule()` is the single tick for the scheduling side.
+
+    These pin the property the tick was moved there for: no return path inside
+    `_schedule` can stall the 10s cadence. Written to fail under the two
+    mutations that previously stayed green — dropping the prompt-token
+    argument, and making the tick a no-op.
+    """
+
+    def test_prompt_tokens_reach_the_window(self, seq_factory):
+        """Catches a dropped `num_prompt_tokens`: the headline number of this
+        feature would otherwise read 0.0 forever with the suite still green."""
+        sched = Scheduler(MockConfig(enable_log_stats=True))
+        sched.add(seq_factory([1, 2, 3, 4]))
+        batch, _ = sched.schedule()
+        assert batch.total_tokens_num_prefill == 4
+        assert sched.engine_stats.num_prompt_tokens == 4
+
+    def test_empty_return_path_still_closes_the_window(self):
+        """`_schedule` bails out early with nothing running or waiting. The
+        window must still close, or an idle stretch lands in the denominator
+        of the next line."""
+        sched = Scheduler(MockConfig(enable_log_stats=True))
+        stats = sched.engine_stats
+        stats._throughput_last_log_time -= 43.0
+        assert sched.schedule() is None
+        assert time.monotonic() - stats._throughput_last_log_time < 1.0
+
+    def test_decode_override_inherits_the_tick(self, seq_factory):
+        """DecodeScheduler overrides `_schedule`, not `schedule()`, so it gets
+        the tick for free — the three hand-placed ones it used to carry could
+        all be deleted with its own test still passing."""
+        from atom.model_engine.scheduler import DecodeScheduler
+
+        sched = DecodeScheduler(
+            MockConfig(enable_log_stats=True), disagg_cu_shm_name=""
+        )
+        stats = sched.engine_stats
+        stats._throughput_last_log_time -= 43.0
+        assert sched.schedule() is None  # nothing running: early return
+        assert time.monotonic() - stats._throughput_last_log_time < 1.0
+
+    def test_prefill_scheduler_reports_its_prompt_tokens(self, seq_factory):
+        from atom.model_engine.scheduler import PrefillScheduler
+
+        sched = PrefillScheduler(MockConfig(enable_log_stats=True))
+        seq = seq_factory([10, 20, 30, 40])
+        seq.block_table = [0, 1]
+        seq.num_cached_tokens = 0
+        sched.add(seq)
+        sched.schedule()
+        assert sched.engine_stats.num_prompt_tokens == 4
 
 
 # ── add / extend / query ───────────────────────────────────────────────────
@@ -1114,6 +1434,43 @@ class TestPostprocess:
         )
         assert 10 in seq.token_ids
         assert finished == []
+
+    def test_generation_counted_from_committed_not_scheduled(self, seq_factory):
+        """Throughput's generation count comes from postprocess (the tokens
+        actually committed), not from schedule()'s scheduled draft count —
+        aligning with vLLM's `len(output.new_token_ids)`."""
+        sched = Scheduler(MockConfig(enable_log_stats=True))
+        sp = SamplingParams(ignore_eos=True, max_tokens=100)
+        seq = seq_factory([1, 2, 3, 4], sampling_params=sp)
+        sched.add(seq)
+        sched.schedule()
+        # schedule() does not feed generation tokens anymore.
+        assert sched.engine_stats.num_generation_tokens == 0
+        # Two committed tokens this step → generation count bumps by exactly 2.
+        sched.postprocess(list(sched.running), self._output(seq.id, [10, 11]))
+        assert sched.engine_stats.num_generation_tokens == 2
+
+    def test_generation_excludes_tokens_dropped_past_eos(self, seq_factory):
+        """Counted from what the client receives, not from the forward output.
+
+        The sampler does not inspect EOS, so on a spec-decode step it can emit
+        accepted drafts after it; postprocess trims them off `new_tokens`
+        before they reach RequestOutput. Counting the untrimmed output made the
+        status line claim tokens nobody was sent, and disagree with the
+        `total_generation_tokens` the same call derives from the trimmed length.
+        """
+        sched = Scheduler(MockConfig(enable_log_stats=True))
+        seq = seq_factory([1, 2, 3, 4])
+        sched.add(seq)
+        sched.schedule()
+        # EOS (2) lands second, so the trailing 99 never reaches the client.
+        finished = sched.postprocess(
+            list(sched.running), self._output(seq.id, [10, 2, 99])
+        )
+        assert len(finished) == 1 and finished[0].leave_reason == "eos"
+        assert (
+            sched.engine_stats.num_generation_tokens == 2
+        ), "the post-EOS token must not be counted"
 
     def test_eos_finishes(self, scheduler, seq_factory):
         seq = self._prefill(scheduler, seq_factory([1, 2, 3, 4]))
