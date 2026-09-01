@@ -153,3 +153,15 @@ def test_device_metadata_wait_is_hidden_by_local_input_staging():
 
     assert len(sample) == len(input_ids) == len(finish) == len(decide) == 1
     assert sample[0].lineno < input_ids[0].lineno < finish[0].lineno < decide[0].lineno
+
+
+def test_deferred_scheduler_output_precedes_current_draft_submission():
+    """The next schedule must overlap this step's MTP enqueue, not follow it."""
+
+    postprocess = _method("postprocess")
+    publish = _attribute_calls(postprocess, "_publish_forward_output_early")
+    propose = _attribute_calls(postprocess, "propose_draft_token_ids")
+
+    assert len(publish) == 1
+    assert len(propose) == 2  # deferred and ordinary/non-deferred paths
+    assert publish[0].lineno < min(call.lineno for call in propose)

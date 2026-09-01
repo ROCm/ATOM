@@ -283,6 +283,27 @@ class tokenIDProcessor:
         # here.
         self.draft_token_ids_cpu.append((cpu_tensor, event))
 
+    def take_draft_output(self) -> np.ndarray:
+        """Return generation N-1's draft IDs before enqueueing generation N.
+
+        The current target forward has already been enqueued when this is
+        called, so even an unexpectedly late previous D2H cannot starve the
+        device. In steady state that copy precedes the target on the GPU and
+        the event check is already complete.
+        """
+
+        token_ids = self.recv_async_output_draft()
+        return (
+            token_ids if self.prev_req_ids is not None else np.array([], dtype=np.int32)
+        )
+
+    def stage_draft_output(self, draft_token_ids: torch.Tensor) -> None:
+        """Queue generation N's draft IDs for generation N+1 to consume."""
+
+        self.draft_token_ids = draft_token_ids
+        self.pre_num_decode_token_per_seq = self.num_spec_tokens + 1
+        self.send_to_cpu_async_draft(draft_token_ids)
+
     def recv_async_output_draft(self) -> np.ndarray:
         if not self.draft_token_ids_cpu:
             return np.array([], dtype=np.int32)
@@ -634,15 +655,8 @@ class tokenIDProcessor:
             # host rows.
             ret = draft_token_ids.cpu().numpy()
         else:
-            self.draft_token_ids = draft_token_ids
-            self.pre_num_decode_token_per_seq = self.num_spec_tokens + 1
-            token_ids = self.recv_async_output_draft()
-            self.send_to_cpu_async_draft(draft_token_ids)
-            ret = (
-                token_ids
-                if self.prev_req_ids is not None
-                else np.array([], dtype=np.int32)
-            )
+            ret = self.take_draft_output()
+            self.stage_draft_output(draft_token_ids)
         return ret
 
 
@@ -667,6 +681,12 @@ class ModelRunner:
         self.tp_world_size = config.tp_world_size
         self.rank = rank
         self.label = f"Model Runner{rank}/{self.tp_world_size}"
+        # AsyncIOProc arms this only while servicing a top-level ``forward``
+        # RPC on the output-producing TP rank.  Deferred-output decoding can
+        # then release generation N-1 to the scheduler before it finishes
+        # enqueueing generation N's draft pass.
+        self._forward_output_sink = None
+        self._forward_output_published_early = False
         self.hf_text_config = get_hf_text_config(hf_config)
         if self.hf_text_config.model_type in ["llama"] and self.config.torch_dtype in [
             torch.bfloat16,
@@ -2616,19 +2636,20 @@ class ModelRunner:
                 hasattr(self, "drafter") and self.drafter.is_block_drafter
             )
             meets_min, can_split, ub0, ub1 = local_tbo
-            dp_sync = begin_sync_dp_metadata(
-                dp_group=dp_group.device_group,
-                dp_size=dp_size,
-                buffers=self._dp_metadata_buffers,
-                scheduled_tokens=batch.total_tokens_num,
-                scheduled_bs=batch.total_seqs_num,
-                is_prefill=batch.total_tokens_num_prefill > 0,
-                tbo_on=self.config.enable_tbo,
-                local_meets_min_tokens=meets_min,
-                local_can_split=can_split,
-                local_ub_tokens=(ub0, ub1),
-                max_seqlen_q=max_seqlen_q if is_block_drafter else None,
-            )
+            with record_function("dp_metadata.begin_async"):
+                dp_sync = begin_sync_dp_metadata(
+                    dp_group=dp_group.device_group,
+                    dp_size=dp_size,
+                    buffers=self._dp_metadata_buffers,
+                    scheduled_tokens=batch.total_tokens_num,
+                    scheduled_bs=batch.total_seqs_num,
+                    is_prefill=batch.total_tokens_num_prefill > 0,
+                    tbo_on=self.config.enable_tbo,
+                    local_meets_min_tokens=meets_min,
+                    local_can_split=can_split,
+                    local_ub_tokens=(ub0, ub1),
+                    max_seqlen_q=max_seqlen_q if is_block_drafter else None,
+                )
 
         return _PendingModelPreparation(
             max_seqlen_q=max_seqlen_q,
@@ -2690,7 +2711,8 @@ class ModelRunner:
                 input_ids = self.tokenID_processor.prepare_input_ids(
                     batch, preparation.max_seqlen_q
                 )
-            sync = finish_sync_dp_metadata(preparation.dp_sync)
+            with record_function("dp_metadata.finish_wait"):
+                sync = finish_sync_dp_metadata(preparation.dp_sync)
             forward_mode = _decide(sync)
         else:
             # Keep the legacy CPU/Gloo path's ordering unchanged.
@@ -3268,10 +3290,36 @@ class ModelRunner:
         token_ids_out = [token_id_dict[k] for k in req_ids_out]
 
         draft_token_ids: np.ndarray | None = None
+        fwd_output: ScheduledBatchOutput | None = None
+        dspark_ell = None
         if self.tokenID_processor.is_deferred_out:
             if hasattr(self, "drafter"):
                 prev_rejected_num = self.tokenID_processor.prev_rejected_num
                 prev_bonus_num = self.tokenID_processor.prev_bonus_num
+                publish_early = self._can_publish_forward_output_early()
+
+                if publish_early:
+                    # Everything the scheduler consumes belongs to generation
+                    # N-1 and is already available now. Publish it before
+                    # enqueueing generation N's MTP proposal so EngineCore can
+                    # schedule the next batch while that proposal runs.
+                    draft_token_ids = self.tokenID_processor.take_draft_output()
+                    verify_scheduler = getattr(self.drafter, "verify_scheduler", None)
+                    if verify_scheduler is not None:
+                        dspark_ell = verify_scheduler.ell_nonblocking()
+                    fwd_output = ScheduledBatchOutput(
+                        req_ids=req_ids_out,
+                        token_ids=token_ids_out,
+                        draft_token_ids=draft_token_ids,
+                        is_deferred_out=True,
+                        num_rejected=prev_rejected_num,
+                        num_bonus=prev_bonus_num,
+                        logprobs=logprobs_map,
+                        dspark_ell=dspark_ell,
+                    )
+                    with record_function("scheduler_output.publish_before_draft"):
+                        self._publish_forward_output_early(fwd_output)
+
                 self.tokenID_processor.send_mtp_status_to_cpu_async(
                     num_reject_tokens, next_token_locs, self.forward_done_event
                 )  # Async copy to CPU
@@ -3279,7 +3327,7 @@ class ModelRunner:
                     sampled_tokens.view(bs, -1), 1, next_token_locs.view(-1, 1)
                 ).view(bs)
                 self.tokenID_processor.prev_token_ids = next_token_ids
-                draft_token_ids = self.propose_draft_token_ids(
+                proposed_draft_token_ids = self.propose_draft_token_ids(
                     batch,
                     self.tokenID_processor.input_ids.gpu[
                         1 : batch.total_tokens_num + 1
@@ -3287,7 +3335,10 @@ class ModelRunner:
                     hidden_states,
                     next_token_ids,
                     num_reject_tokens,
+                    stage_deferred_output=publish_early,
                 )
+                if not publish_early:
+                    draft_token_ids = proposed_draft_token_ids
                 # self.debug(f"{num_bonus_tokens=}")
 
             elif prev_batch is not None:
@@ -3317,30 +3368,55 @@ class ModelRunner:
                     num_reject_tokens,
                 )
 
-        # DSpark Phase 2: carry this step's per-request ell back to the scheduler
-        # as a {req_id: ell} dict (req_id-keyed avoids any output/draft batch
-        # ordering ambiguity). The worker already fired this map in propose() via
-        # verify_scheduler.record_ell(batch.req_ids).
-        dspark_ell = None
-        drafter = getattr(self, "drafter", None)
-        verify_scheduler = getattr(drafter, "verify_scheduler", None)
-        if verify_scheduler is not None:
-            dspark_ell = verify_scheduler.ell_nonblocking()
+        if fwd_output is None:
+            # DSpark Phase 2: carry this step's per-request ell back to the
+            # scheduler as a {req_id: ell} dict. On the deferred-drafter path
+            # this was snapshotted before the new proposal so it could be
+            # published early; all other paths retain their original ordering.
+            drafter = getattr(self, "drafter", None)
+            verify_scheduler = getattr(drafter, "verify_scheduler", None)
+            if verify_scheduler is not None:
+                dspark_ell = verify_scheduler.ell_nonblocking()
+            fwd_output = ScheduledBatchOutput(
+                req_ids=req_ids_out,
+                token_ids=token_ids_out,
+                draft_token_ids=draft_token_ids,
+                is_deferred_out=self.tokenID_processor.is_deferred_out,
+                num_rejected=prev_rejected_num,
+                num_bonus=prev_bonus_num,
+                logprobs=logprobs_map,
+                dspark_ell=dspark_ell,
+            )
 
-        return ScheduledBatchOutput(
-            req_ids=req_ids_out,
-            token_ids=token_ids_out,
-            draft_token_ids=draft_token_ids,
-            is_deferred_out=self.tokenID_processor.is_deferred_out,
-            num_rejected=prev_rejected_num,
-            num_bonus=prev_bonus_num,
-            logprobs=logprobs_map,
-            dspark_ell=dspark_ell,
+        return fwd_output
+
+    def _set_forward_output_sink(self, sink) -> None:
+        """Bind the current top-level RPC's optional early-output sink."""
+
+        self._forward_output_sink = sink
+
+    def _can_publish_forward_output_early(self) -> bool:
+        """Whether this RPC may overlap scheduling with the draft tail."""
+
+        return bool(
+            getattr(self, "_dp_metadata_device_sync", False)
+            and getattr(self, "_forward_output_sink", None) is not None
         )
+
+    def _publish_forward_output_early(self, output: ScheduledBatchOutput) -> bool:
+        """Release a complete deferred output while this forward keeps enqueueing."""
+
+        sink = self._forward_output_sink
+        assert sink is not None
+        assert not self._forward_output_published_early
+        sink(output)
+        self._forward_output_published_early = True
+        return True
 
     @torch.inference_mode()
     @with_eplb_forward_monitor
-    def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
+    def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput | None:
+        self._forward_output_published_early = False
         # The metadata buffers are independent of forward_vars. Submit their
         # H2D -> RCCL -> D2H chain before any staging-buffer reuse gate so even
         # that host wait can cover device metadata progress.
@@ -3432,7 +3508,10 @@ class ModelRunner:
 
         reset_forward_context()
         self._record_forward_vars_event()
-        return fwd_output
+        # Rank 0 may already have sent this exact object while the current MTP
+        # proposal was still being enqueued. Returning None tells AsyncIOProc
+        # not to emit a duplicate response after the forward completes.
+        return None if self._forward_output_published_early else fwd_output
 
     @staticmethod
     def _is_pure_middle_chunk(batch) -> bool:
@@ -3491,6 +3570,7 @@ class ModelRunner:
         next_token_ids: torch.Tensor,
         num_reject_tokens: torch.Tensor,
         align_only: bool = False,
+        stage_deferred_output: bool = False,
     ):
         """`align_only` runs the draft purely for its DP collectives.
 
@@ -3571,6 +3651,10 @@ class ModelRunner:
         verify_scheduler = getattr(self.drafter, "verify_scheduler", None)
         if verify_scheduler is not None:
             verify_scheduler.record_ell(batch.req_ids[: batch.total_seqs_num])
+        if stage_deferred_output:
+            assert self.tokenID_processor.is_deferred_out
+            self.tokenID_processor.stage_draft_output(draft_token)
+            return None
         return self.tokenID_processor.prepare_draft_ids(batch, draft_token)
 
     def start_capture_profiler(self):

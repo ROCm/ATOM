@@ -179,3 +179,80 @@ def test_prefill_really_does_run_wider_than_it_scheduled():
     )
 
     assert (mode.scheduled_bs, mode.running_bs) == (3, 4)
+
+
+def test_deferred_output_is_published_before_current_draft_is_enqueued(monkeypatch):
+    """Let the scheduler work while this step's MTP proposal is still running.
+
+    Deferred output exposes only generation N-1.  Its sampled IDs, draft IDs,
+    and accept/reject status are therefore immutable before generation N's
+    proposal starts and can be sent to EngineCore at that boundary.
+    """
+
+    order = []
+    published = []
+    batch = _batch(1)
+    batch.total_tokens_num = 1
+
+    class _TokenProcessor:
+        is_deferred_out = True
+        prev_batch = types.SimpleNamespace(total_seqs_num=1)
+        prev_rejected_num = np.array([2], dtype=np.int32)
+        prev_bonus_num = np.array([1], dtype=np.int32)
+        default_num_rejected_tokens = torch.zeros(1, dtype=torch.int32)
+        input_ids = types.SimpleNamespace(gpu=torch.zeros(2, dtype=torch.int32))
+
+        def prepare_sampled_ids(self, *_args, **_kwargs):
+            self.prev_req_ids = [17]
+            return ({17: (41,), -1: 1}, None)
+
+        def take_draft_output(self):
+            order.append("take previous draft")
+            return np.array([[51, 52, 53]], dtype=np.int32)
+
+        def send_mtp_status_to_cpu_async(self, *_args):
+            order.append("stage current status")
+
+    runner = object.__new__(mod.ModelRunner)
+    runner.sampler = lambda *_args, **_kwargs: torch.tensor([7], dtype=torch.int32)
+    runner.forward_done_event = types.SimpleNamespace(record=lambda: None)
+    runner.tokenID_processor = _TokenProcessor()
+    runner.drafter = types.SimpleNamespace(mtp_k=3, verify_scheduler=None)
+    runner._forward_output_sink = lambda output: (
+        order.append("publish previous output"),
+        published.append(output),
+    )
+    runner._dp_metadata_device_sync = True
+    runner._forward_output_published_early = False
+
+    def _propose(*_args, **kwargs):
+        assert kwargs["stage_deferred_output"] is True
+        order.append("enqueue current draft")
+
+    runner.propose_draft_token_ids = _propose
+
+    monkeypatch.setattr(
+        mod,
+        "get_forward_context",
+        lambda: types.SimpleNamespace(spec_decode_metadata=None),
+    )
+    monkeypatch.setattr(
+        mod, "get_tp_group", lambda: types.SimpleNamespace(world_size=1)
+    )
+
+    result = runner.postprocess(
+        batch=batch,
+        logits=torch.zeros(1, 8),
+        temperatures=torch.ones(1),
+        top_ks=None,
+        top_ps=None,
+        all_greedy=False,
+        hidden_states=None,
+    )
+
+    assert order.index("publish previous output") < order.index("enqueue current draft")
+    assert published == [result]
+    assert result.req_ids == [17]
+    assert result.token_ids == [(41,)]
+    np.testing.assert_array_equal(result.draft_token_ids, [[51, 52, 53]])
+    assert runner._forward_output_published_early is True
