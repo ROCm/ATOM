@@ -1368,7 +1368,9 @@ class BlockManager:
         pin still has to be released here, but the copy never reached a worker,
         so it is not a `stores_failed` -- the caller counts the refusal once as
         `stores_refused`, and bumping `stores_failed` too would double-count the
-        same event under two names.
+        same event under two names. For the same reason it backs the optimistic
+        `stores_attempted` bump `take_state_stores` made at hand-out back out, so
+        a refusal does not linger in `attempted - completed - failed`.
 
         `op` is a `StateStoreOperationId`: the pin is released for that exact
         generation, so a late report from a superseded attempt settles nothing.
@@ -1404,6 +1406,13 @@ class BlockManager:
             self.state_offload.note_stored(int(op.prefix_hash))
         elif attempted:
             self.state_offload.stores_failed += 1
+        else:
+            # A refusal. `take_state_stores` bumped `stores_attempted` when it
+            # handed this op over, but it never reached a worker, so back that
+            # out: the event is counted once as `stores_refused`, and leaving it
+            # in `stores_attempted` would read as permanently in-flight in the
+            # `attempted - completed - failed` funnel.
+            self.state_offload.stores_attempted -= 1
 
     def release_state_store_source(self, op) -> None:
         """The GPU has finished reading this store's PAGE units; hand them back.
