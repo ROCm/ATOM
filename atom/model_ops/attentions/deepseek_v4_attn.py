@@ -698,6 +698,17 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
     @property
     def prep_stream(self):
+        # Device DP metadata already owns the high-priority stream carrying
+        # its H2D -> RCCL -> D2H chain.  Keep decode preparation on that same
+        # stream so its packed upload and helper kernels are submitted directly
+        # behind the collective instead of waking a separate stream.  The DP
+        # slot's completion event is recorded before this work, so the host can
+        # still consume the gathered metadata without waiting for decode prep.
+        dp_metadata_buffers = getattr(
+            self.model_runner, "_dp_metadata_buffers", None
+        )
+        if dp_metadata_buffers is not None:
+            return dp_metadata_buffers.stream
         return self.model_runner.async_execute_stream
 
     # ------------------------------------------------------------------ #

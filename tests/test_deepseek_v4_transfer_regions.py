@@ -128,6 +128,30 @@ def v4_builder_cls():
     return module.DeepseekV4AttentionMetadataBuilder
 
 
+def test_decode_prep_reuses_device_metadata_stream(v4_builder_cls):
+    builder = object.__new__(v4_builder_cls)
+    metadata_stream = object()
+    builder.model_runner = SimpleNamespace(
+        _dp_metadata_buffers=SimpleNamespace(stream=metadata_stream),
+        async_execute_stream=object(),
+    )
+
+    assert builder.prep_stream is metadata_stream
+
+
+def test_decode_prep_falls_back_to_async_stream_without_device_metadata(
+    v4_builder_cls,
+):
+    builder = object.__new__(v4_builder_cls)
+    async_stream = object()
+    builder.model_runner = SimpleNamespace(
+        _dp_metadata_buffers=None,
+        async_execute_stream=async_stream,
+    )
+
+    assert builder.prep_stream is async_stream
+
+
 def _transfer_builder(
     builder_cls,
     *,
