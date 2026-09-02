@@ -3121,9 +3121,7 @@ class Scheduler:
         # kept loadable) rather than *failed* (hash forgotten). Everything else
         # -- a genuine state-leg miss, or a connector that never advertises the
         # channel -- still settles as a failure.
-        state_survived = getattr(
-            self.kv_connector, "take_state_load_survived", None
-        )
+        state_survived = getattr(self.kv_connector, "take_state_load_survived", None)
         state_survived = state_survived() if state_survived is not None else set()
         for req_id in kv_connector_output.failed_loading or ():
             assert (

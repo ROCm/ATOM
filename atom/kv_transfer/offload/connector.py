@@ -246,6 +246,18 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         callback = getattr(self._impl, "take_state_reports", None)
         return callback() if callback is not None else (set(), set())
 
+    def take_state_load_survived(self) -> set:
+        """Requests whose state bytes outlived a failed joint load.
+
+        `Scheduler._update_from_kv_xfer_finished` reads this off the SHELL, so
+        without the forwarder the `getattr(..., None)` default won and every
+        survivor settled as a failure -- forgetting a hash whose bytes are
+        present, which is the opposite of what the channel exists to do. An
+        impl that does not advertise the channel survives nothing.
+        """
+        callback = getattr(self._impl, "take_state_load_survived", None)
+        return callback() if callback is not None else set()
+
     def take_state_source_releases(self) -> set:
         """Stores whose PAGE units the GPU has finished reading.
 

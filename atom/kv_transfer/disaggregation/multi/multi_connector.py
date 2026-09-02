@@ -601,6 +601,24 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             return set(), set()
         return c.take_state_reports()
 
+    def take_state_load_survived(self) -> set:
+        """Requests whose state bytes outlived a failed joint load, from the
+        tier sub; empty set if none.
+
+        `Scheduler._update_from_kv_xfer_finished` reads this off the composite,
+        and its `getattr(..., None)` default is indistinguishable from "nothing
+        survived" -- so without the forwarder every survivor under
+        `kv_connector: multi` settled as a failure, forgetting a hash whose
+        bytes are present.
+
+        Select by `has_state_tier`, not method presence -- see
+        `_state_tier_sub`.
+        """
+        c = self._state_tier_sub()
+        if c is None:
+            return set()
+        return c.take_state_load_survived()
+
     def take_state_source_releases(self) -> set:
         """Stores whose PAGE units the GPU has finished reading, from the tier
         sub; empty set if none.

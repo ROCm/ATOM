@@ -1890,9 +1890,7 @@ class BlockManager:
         # `_chain_to`, run to the full prompt width. Delegate rather than
         # duplicate the loop; the only thing local to this path is the midstep
         # gate above and writing the result to `seq`.
-        seq.block_hashes = self._chain_to(
-            seq, block_hashes, self._n_hash_blocks(seq)
-        )
+        seq.block_hashes = self._chain_to(seq, block_hashes, self._n_hash_blocks(seq))
 
     def midstep_positions(self, seq: Sequence, start: int, end: int) -> list[tuple]:
         """`(position, hash)` for every checkpoint a forward over `(start, end]`

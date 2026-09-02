@@ -5252,7 +5252,7 @@ def _shell_exposes(cls, name: str) -> bool:
         src = inspect.getsource(cls)
     except (OSError, TypeError):
         return False
-    return bool(re.search(r"\bself\.%s\s*=" % re.escape(name), src))
+    return bool(re.search(rf"\bself\.{re.escape(name)}\s*=", src))
 
 
 def test_every_member_the_scheduler_reads_is_reachable_through_the_shell():
@@ -5353,17 +5353,27 @@ def test_every_member_the_worker_reads_is_reachable_through_the_shell():
     `close` exists to prevent). Read the driver's source, not a hand-kept list,
     for the same reason the scheduler sweep does.
     """
-    import inspect
+    import pathlib
     import re
 
-    import atom.model_engine.model_runner as mr_mod
-    import atom.utils.forward_context as fc_mod
+    import atom
     from atom.kv_transfer.disaggregation.multi.multi_connector import MultiConnector
     from atom.kv_transfer.offload.connector import LMCacheOffloadConnector
 
+    # Read the driver sources off disk rather than importing them.
+    # `model_runner` imports aiter at module load, which is absent on the
+    # non-GPU CI runner -- importing it here would turn this sweep into a
+    # collection error on exactly the machine that runs it. The sweep only ever
+    # wanted the text.
+    root = pathlib.Path(atom.__file__).parent
+    sources = (
+        root / "model_engine" / "model_runner.py",
+        root / "utils" / "forward_context.py",
+    )
     probed: set[str] = set()
-    for mod in (mr_mod, fc_mod):
-        src = inspect.getsource(mod)
+    for path in sources:
+        assert path.is_file(), f"driver source moved: {path}"
+        src = path.read_text()
         probed |= set(re.findall(r'getattr\(\s*connector,\s*"([a-z_]+)"', src))
         probed |= set(re.findall(r"\bconnector\.([a-z_]+)\(", src))
         probed |= set(re.findall(r"\bconnector\.([a-z_]+)\b", src))
