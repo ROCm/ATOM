@@ -317,19 +317,21 @@ class BlockManager:
         # the connector. Kept here rather than in the index because the slot
         # is this object's fact.
         self._state_loads: list[tuple] = []
-        # req_id -> slot, for loads whose request was deallocated before the
-        # bytes landed. The slot is off the free list until the report comes
-        # back; see `deallocate`.
-        self._orphan_load_slots: dict = {}
-        # req_id -> monotonic stamp, parallel to `_orphan_load_slots`. The hold
-        # above trusts `settle_state_load` to "always come": it does not, if the
-        # worker that owed the report crashed or its completion was dropped. Then
-        # the slot sits off the free list forever and the state gate in
-        # `can_allocate` wedges the pool once every slot is stranded. This stamps
-        # the wait so `reconcile_orphan_load_slots` can reclaim it after the same
-        # abandon window the store pins use -- the load-side twin of
+        # req_id -> (slot, monotonic stamp), for loads whose request was
+        # deallocated before the bytes landed. The slot is off the free list
+        # until the report comes back; see `deallocate`. One dict, not two
+        # parallel ones keyed the same way: `seq.id` is per-request not
+        # per-admission, so a preempt/re-admit can park the same id twice, and
+        # two dicts let an overwrite of one desync from the other -- stranding a
+        # slot the reconciler can no longer find. The stamp trusts
+        # `settle_state_load` to "always come": it does not, if the worker that
+        # owed the report crashed or its completion was dropped. Then the slot
+        # would sit off the free list forever and the state gate in
+        # `can_allocate` would wedge the pool once every slot is stranded, so
+        # `reconcile_orphan_load_slots` reclaims it after the same abandon
+        # window the store pins use -- the load-side twin of
         # `reclaim_stale_state_store_pins`.
-        self._orphan_load_slots_at: dict = {}
+        self._orphan_load_slots: dict[object, tuple[int, float]] = {}
         self._orphan_load_slots_reclaimed: int = 0
         # `kv_offload_enabled` is the whole switch: without a connector to
         # carry a transfer there is nothing beneath the pool, and a hash whose
@@ -1312,10 +1314,9 @@ class BlockManager:
         if self.state_offload is None:
             return
         self.state_offload.abandon_load(req_id)
-        slot = self._orphan_load_slots.pop(req_id, None)
-        self._orphan_load_slots_at.pop(req_id, None)
-        if slot is not None:
-            self.state.release(slot)
+        parked = self._orphan_load_slots.pop(req_id, None)
+        if parked is not None:
+            self.state.release(parked[0])
 
     def settle_state_load(self, req_id, ok: bool) -> None:
         """Apply one worker load report. Keyed by request, like the KV load.
@@ -1332,10 +1333,9 @@ class BlockManager:
             self.state_offload.complete_load(req_id)
         else:
             self.state_offload.fail_load(req_id)
-        slot = self._orphan_load_slots.pop(req_id, None)
-        self._orphan_load_slots_at.pop(req_id, None)
-        if slot is not None:
-            self.state.release(slot)
+        parked = self._orphan_load_slots.pop(req_id, None)
+        if parked is not None:
+            self.state.release(parked[0])
 
     def take_state_stores(self, max_inflight: int) -> list[tuple]:
         """`(operation, unit_ids)` for checkpoints to hand the CPU tier.
@@ -1469,17 +1469,18 @@ class BlockManager:
         index leg was abandoned back in `deallocate`, so nothing here touches
         it; a late report finds the slot already popped and releases nothing.
         """
-        if timeout_s <= 0 or not self._orphan_load_slots_at:
+        if timeout_s <= 0 or not self._orphan_load_slots:
             return 0
         cutoff = monotonic() - timeout_s
         stale = [
-            req_id for req_id, at in self._orphan_load_slots_at.items() if at <= cutoff
+            req_id
+            for req_id, (_slot, at) in self._orphan_load_slots.items()
+            if at <= cutoff
         ]
         for req_id in stale:
-            self._orphan_load_slots_at.pop(req_id, None)
-            slot = self._orphan_load_slots.pop(req_id, None)
-            if slot is not None:
-                self.state.release(slot)
+            parked = self._orphan_load_slots.pop(req_id, None)
+            if parked is not None:
+                self.state.release(parked[0])
             # The index leg was already abandoned in `deallocate` when the slot
             # was parked; only the slot itself outlived the report. Do not touch
             # the index again here -- a second `abandon_load` would double-count
@@ -2466,8 +2467,7 @@ class BlockManager:
             # comes: the worker reports every load either way. The rollback
             # scratch is nobody's destination and goes back regardless.
             if seq.offload_joint.load_hash != -1 and self.state_offload is not None:
-                self._orphan_load_slots[seq.id] = seq.state_slot
-                self._orphan_load_slots_at[seq.id] = monotonic()
+                self._orphan_load_slots[seq.id] = (seq.state_slot, monotonic())
                 # Abandoned, not failed: an abort says nothing about the bytes,
                 # and forgetting the hash would cost the next request over this
                 # prefix a full recompute.

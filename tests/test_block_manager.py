@@ -1024,6 +1024,95 @@ class TestReclaimedStoresAreNotIndexed:
         assert bm.state_offload.hashes == set()
 
 
+# ── the orphan load slot lives in one dict of (slot, stamp) ────────────────
+
+
+class TestOrphanLoadSlotSingleDict:
+    """A load slot whose request was torn down before its bytes landed is
+    parked in one dict of `(slot, stamp)`. It used to live across two parallel
+    dicts keyed the same way, mutated in pairs at four sites -- a shape where an
+    overwrite or a half-applied pop could desync them, so the reconciler
+    (iterating the stamp dict) and the release (reading the slot dict) could
+    disagree and strand a slot off the pool free list. One dict makes that
+    unrepresentable: an entry is present with its slot and stamp together, or it
+    is gone."""
+
+    class _Pool:
+        def __init__(self):
+            self.released = []
+
+        def release(self, slot):
+            self.released.append(slot)
+
+    class _Index:
+        def __init__(self):
+            self.abandoned, self.completed, self.failed = [], [], []
+
+        def abandon_load(self, req_id):
+            self.abandoned.append(req_id)
+
+        def complete_load(self, req_id):
+            self.completed.append(req_id)
+
+        def fail_load(self, req_id):
+            self.failed.append(req_id)
+
+    def _bm(self):
+        bm = object.__new__(BlockManager)
+        bm.state = self._Pool()
+        bm.state_offload = self._Index()
+        bm._orphan_load_slots = {}
+        bm._orphan_load_slots_reclaimed = 0
+        return bm
+
+    def test_settle_frees_the_parked_slot_and_clears_the_entry(self):
+        from time import monotonic
+
+        bm = self._bm()
+        bm._orphan_load_slots["r"] = (7, monotonic())
+        bm.settle_state_load("r", ok=True)
+        assert bm.state.released == [7]
+        assert "r" not in bm._orphan_load_slots
+        assert bm.state_offload.completed == ["r"]
+
+    def test_abandon_frees_the_parked_slot(self):
+        from time import monotonic
+
+        bm = self._bm()
+        bm._orphan_load_slots["r"] = (7, monotonic())
+        bm.abandon_state_load("r")
+        assert bm.state.released == [7]
+        assert "r" not in bm._orphan_load_slots
+
+    def test_reconcile_frees_a_slot_whose_report_never_came(self):
+        from time import monotonic
+
+        bm = self._bm()
+        bm._orphan_load_slots["r"] = (7, monotonic())
+        assert bm.reconcile_orphan_load_slots(timeout_s=1e-9) == 1
+        assert bm.state.released == [7]
+        assert bm._orphan_load_slots_reclaimed == 1
+        assert "r" not in bm._orphan_load_slots
+
+    def test_reconcile_spares_a_slot_still_inside_its_window(self):
+        from time import monotonic
+
+        bm = self._bm()
+        bm._orphan_load_slots["r"] = (7, monotonic())
+        assert bm.reconcile_orphan_load_slots(timeout_s=3600) == 0
+        assert bm.state.released == []
+        assert "r" in bm._orphan_load_slots
+
+    def test_a_late_report_after_reconcile_releases_nothing(self):
+        from time import monotonic
+
+        bm = self._bm()
+        bm._orphan_load_slots["r"] = (7, monotonic())
+        bm.reconcile_orphan_load_slots(timeout_s=1e-9)
+        bm.settle_state_load("r", ok=True)  # the report finally arrives
+        assert bm.state.released == [7], "freed once by reconcile, not twice"
+
+
 # ── the LMCache chunk probe is gated on the capability ─────────────────────
 
 
