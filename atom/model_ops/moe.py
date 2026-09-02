@@ -1586,7 +1586,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 num_tokens, n_expts_tot = router_logits.shape
 
                 if global_num_experts > 0:
-                    n_expts_tot = global_num_experts
+                _num_tokenss_tot = global_num_experts
 
                 # Both preps publish the same six names, so there is nothing to
                 # select here -- only which kernel consumes them.
