@@ -110,9 +110,24 @@ def select_offload_layout(config) -> str:
     hf_config = getattr(config, "hf_config", None)
     if hf_config is None:
         return "dense"
+    # Resolve the family off the *text* config, exactly as the model-side
+    # predicates this mirrors do (`ModelRunner.is_qwen_next`/`is_kimi_linear`
+    # read `self.hf_text_config`). Two names in `_GDN_LINEAR_MODEL_TYPES` --
+    # `qwen3_5_text`, `qwen3_5_moe_text` -- are literally text-config model
+    # types, so the bare wrapper `model_type` would be the multimodal wrapper's
+    # and neither the `kimi_linear` nor the GDN branch would fire: Qwen3.5 would
+    # fall through to `dense` and die deep in `register_kv_caches` (the exact
+    # failure the refusal below exists to pre-empt), and a `kimi_linear`
+    # checkpoint wrapped in a `text_config` would silently run with no state tier.
+    # Local import: this module is on the early config path, and `atom.utils`
+    # pulls in transformers -- keep it out of module import time.
+    from atom.utils import get_hf_text_config
+
+    text_config = get_hf_text_config(hf_config)
+    model_type = getattr(text_config, "model_type", None)
     # K3's paged KV is ordinary dense MLA; what makes it its own family is the
     # KDA per-request state that a reusable prefix also needs.
-    if getattr(hf_config, "model_type", None) == "kimi_linear":
+    if model_type == "kimi_linear":
         return "kimi_k3"
     if getattr(hf_config, "compress_ratios", None):
         return "hybrid"
@@ -121,10 +136,10 @@ def select_offload_layout(config) -> str:
     # output). The dense codec fails closed on the state tensor, but that fires
     # deep in `register_kv_caches` as a byte-layout mismatch -- refuse here where
     # the message can name the cause.
-    if getattr(hf_config, "model_type", None) in _GDN_LINEAR_MODEL_TYPES:
+    if model_type in _GDN_LINEAR_MODEL_TYPES:
         raise ValueError(
             "lmcache_offload does not support GDN/linear-attention models "
-            f"(model_type={getattr(hf_config, 'model_type', None)!r}; e.g. "
+            f"(model_type={model_type!r}; e.g. "
             "Qwen3-Next, Qwen3.5). These carry a per-request recurrent state "
             "that no offload layout owns a tier for -- restoring their KV "
             "prefix while that state is stale is silent wrong output. Disable "
