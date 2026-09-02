@@ -5293,7 +5293,7 @@ def test_every_member_the_scheduler_reads_is_reachable_through_the_shell():
     readers += [
         re.escape(a)
         for a in re.findall(
-            r"^\s*([A-Za-z_]\w*)\s*=\s*self\.kv_connector\s*$", src, re.M
+            r"^\s*([A-Za-z_]\w*)\s*=\s*self\.kv_connector\s*$", src, re.MULTILINE
         )
     ]
     probed: set[str] = set()
