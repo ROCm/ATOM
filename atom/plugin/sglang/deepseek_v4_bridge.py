@@ -14,6 +14,8 @@ from atom.model_ops.attentions.v4_pool_geometry import (
     DENSE_RATIO,
     HCA_RATIO,
     WindowParams,
+    visible_csa,
+    visible_hca,
 )
 from atom.plugin.sglang.runtime.context import is_draft_extend_mode
 
@@ -1082,7 +1084,6 @@ class _V4SGLangDecodeGraphBuffers:
         self.cu_q = i32(t + 1)
         self.state_slot = i32(s)
         self.n_csa = i32(s)
-        self.n_hca = i32(s)
         self.batch_id = CpuGpuBuffer(t, dtype=torch.int32, device=device)
         self.swa_dest_rows = {ratio: i32(t) for ratio in _V4_SWA_DEST_RATIOS}
         self.n_committed_per_token = i32(t)
@@ -1169,7 +1170,6 @@ class _V4SGLangVerifyGraphBuffers:
         self.cu_q = i32(s + 1)
         self.state_slot = i32(s)
         self.n_csa = i32(s)
-        self.n_hca = i32(s)
         self.batch_id = i32(t)
         self.block_tables = i32(s, self.max_blocks)
 
@@ -1549,21 +1549,16 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
     md.batch_id_per_token_cpu = batch_np
     md.batch_id_per_token = bufs.stage(bufs.batch_id, batch_pad, t_pad)
     n_csa = (seq_np // 4).astype(np.int32)
-    n_hca = (seq_np // 128).astype(np.int32)
     md.n_committed_csa_per_seq_cpu = n_csa
-    md.n_committed_hca_per_seq_cpu = n_hca
     md.n_committed_csa_per_seq = bufs.stage(bufs.n_csa, n_csa, bs)
-    md.n_committed_hca_per_seq = bufs.stage(bufs.n_hca, n_hca, bs)
     md.compress_plans = _make_decode_graph_compress_plans(lens, seq_np, bufs)
 
     win = int(md.swa_window)
     index_topk = int(md.index_topk)
     if total:
         actual_swa = np.minimum(pos_np + 1, win).astype(np.int32)
-        csa_valid = np.minimum(
-            np.minimum((pos_np + 1) // 4, n_csa[batch_np]), index_topk
-        ).astype(np.int32)
-        hca_valid = n_hca[batch_np].astype(np.int32)
+        csa_valid = np.minimum(visible_csa(pos_np), index_topk).astype(np.int32)
+        hca_valid = visible_hca(pos_np).astype(np.int32)
     else:
         actual_swa = csa_valid = hca_valid = np.zeros(0, dtype=np.int32)
 
@@ -1583,7 +1578,7 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
     hca_indptr = bufs.stage(bufs.indptr_hca, hca_indptr_np, t_pad + 1)
 
     if total:
-        visible_np = np.minimum((pos_np + 1) // 4, n_csa[batch_np]).astype(np.int32)
+        visible_np = visible_csa(pos_np).astype(np.int32)
     else:
         visible_np = np.zeros(0, dtype=np.int32)
     md.n_committed_per_token = bufs.stage(bufs.n_committed_per_token, visible_np, t_pad)
@@ -1622,7 +1617,6 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
             batch_id_per_token=md.batch_id_per_token,
             positions=positions_gpu,
             hca_indptr=hca_indptr,
-            n_committed_hca_per_seq=md.n_committed_hca_per_seq,
             block_tables=md.block_tables,
             hca_indices=bufs.idx_hca.gpu,
             T=t_pad,
@@ -1650,10 +1644,7 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
     )
     safe_batch_id = md.batch_id_per_token.clamp_min(0)
     seq_base = cu_committed_gpu[safe_batch_id].to(torch.int32)
-    visible_end = seq_base + torch.minimum(
-        (positions_gpu.to(torch.int32) + 1) // 4,
-        md.n_committed_csa_per_seq[safe_batch_id],
-    ).to(torch.int32)
+    visible_end = seq_base + visible_csa(positions_gpu.to(torch.int32))
     md.indexer_meta = {
         "total_committed": int(cu_committed_cpu[-1]),
         "cu_committed_gpu": cu_committed_gpu,
@@ -1829,11 +1820,8 @@ def build_atom_v4_verify_graph_metadata_from_sglang(
     md.batch_id_per_token = bufs.stage(bufs.batch_id, batch_np, total)
 
     n_csa = (seq_np // 4).astype(np.int32)
-    n_hca = (seq_np // 128).astype(np.int32)
     md.n_committed_csa_per_seq_cpu = n_csa
-    md.n_committed_hca_per_seq_cpu = n_hca
     md.n_committed_csa_per_seq = bufs.stage(bufs.n_csa, n_csa, bs)
-    md.n_committed_hca_per_seq = bufs.stage(bufs.n_hca, n_hca, bs)
     md.compress_plans = (
         _make_verify_graph_compress_plans(lens, seq_np, bufs)
         if is_draft_extend
@@ -1849,11 +1837,8 @@ def build_atom_v4_verify_graph_metadata_from_sglang(
     swa_low = np.maximum(pos_np - win + 1, 0)
     extend_count = np.minimum(token_pos_in_chunk + 1, win).astype(np.int32)
     prefix_swa_count = np.maximum(chunk_start_pt - swa_low, 0).astype(np.int32)
-    csa_valid_k = np.minimum(
-        np.minimum((pos_np + 1) // 4, md.n_committed_csa_per_seq_cpu[batch_np]),
-        int(md.index_topk),
-    ).astype(np.int32)
-    hca_count = md.n_committed_hca_per_seq_cpu[batch_np].astype(np.int32)
+    csa_valid_k = np.minimum(visible_csa(pos_np), int(md.index_topk)).astype(np.int32)
+    hca_count = visible_hca(pos_np).astype(np.int32)
 
     ext_indptr_np = _counts_to_indptr(extend_count)
     swa_indptr_np = _counts_to_indptr(prefix_swa_count)
@@ -1875,7 +1860,6 @@ def build_atom_v4_verify_graph_metadata_from_sglang(
         chunk_start_per_seq=chunk_start_gpu,
         cu_seqlens_q_per_seq=cu_q[:-1],
         state_slot_per_seq=md.state_slot_mapping,
-        n_committed_hca_per_seq=md.n_committed_hca_per_seq,
         block_tables=block_tables,
         extend_indptr=ext_indptr,
         prefix_swa_indptr=swa_indptr,
@@ -1907,8 +1891,11 @@ def build_atom_v4_verify_graph_metadata_from_sglang(
     cu_committed_cpu[-1] = max(int(cu_committed_cpu[-1]), 1)
     cu_committed_gpu = bufs.stage(bufs.indexer_cu_committed, cu_committed_cpu, bs + 1)
     seq_base_cpu = cu_committed_cpu[batch_np].astype(np.int32)
+    # NOTE: the only surviving per-sequence bound on this axis. It disagrees
+    # with the `csa_valid_k` sizing above, which drops it -- resolve before
+    # trusting either.
     visible_end_cpu = seq_base_cpu + np.minimum(
-        (pos_np + 1) // 4, n_csa[batch_np]
+        visible_csa(pos_np), n_csa[batch_np]
     ).astype(np.int32)
     seq_base_gpu = bufs.stage(bufs.indexer_seq_base, seq_base_cpu, total)
     visible_end_gpu = bufs.stage(bufs.indexer_cu_ends, visible_end_cpu, total)
@@ -2058,25 +2045,19 @@ def build_atom_v4_attention_metadata_from_sglang(
     md.batch_id_per_token_cpu = batch_np
     md.batch_id_per_token = torch.from_numpy(batch_np).to(device=device)
     md.n_committed_csa_per_seq_cpu = (seq_np // 4).astype(np.int32)
-    md.n_committed_hca_per_seq_cpu = (seq_np // 128).astype(np.int32)
     md.n_committed_csa_per_seq = torch.from_numpy(md.n_committed_csa_per_seq_cpu).to(
-        device=device
-    )
-    md.n_committed_hca_per_seq = torch.from_numpy(md.n_committed_hca_per_seq_cpu).to(
         device=device
     )
     md.compress_plans = _make_compress_plans(lens, seq_np, device)
 
     if is_decode:
-        visible_np = np.minimum(
-            (pos_np + 1) // 4, md.n_committed_csa_per_seq_cpu[batch_np]
-        ).astype(np.int32)
+        visible_np = visible_csa(pos_np).astype(np.int32)
         md.n_committed_per_token = torch.from_numpy(visible_np).to(
             device=device, dtype=torch.int32
         )
         batch_ids = torch.from_numpy(batch_np).to(device=device, dtype=torch.long)
         md.block_tables_per_token = block_tables[batch_ids]
-        _populate_decode_indices(md, block_tables, pos_np, device)
+        _populate_decode_indices(md, block_tables, batch_np, pos_np, device)
         if proxy_pool.use_fp8_kv:
             _stage_decode_fp8_page_metadata(md, total, total)
     else:
@@ -2085,12 +2066,11 @@ def build_atom_v4_attention_metadata_from_sglang(
     return md
 
 
-def _populate_decode_indices(md, block_tables, pos_np, device) -> None:
+def _populate_decode_indices(md, block_tables, batch_np, pos_np, device) -> None:
     from atom.model_ops.v4_kernels import write_v4_paged_decode_indices
     from atom.plugin.vllm.deepseek_v4_ops import write_v4_decode_hca_compress_tail
 
     win = int(md.swa_window)
-    batch_np = md.batch_id_per_token_cpu
     if len(batch_np) == 0:
         empty = torch.empty(0, dtype=torch.int32, device=device)
         zero = torch.zeros(1, dtype=torch.int32, device=device)
@@ -2098,16 +2078,10 @@ def _populate_decode_indices(md, block_tables, pos_np, device) -> None:
         md.kv_indptr_swa = md.kv_indptr_csa = md.kv_indptr_hca = zero
         return
     swa_counts = np.minimum(pos_np + 1, win).astype(np.int32)
-    csa_counts = np.minimum(
-        np.minimum((pos_np + 1) // 4, int(md.index_topk)),
-        md.n_committed_csa_per_seq_cpu[batch_np],
-    ).astype(np.int32)
-    # Per-token causal cap, mirroring CSA above and the prefill kernel
-    # (n_hca = min((pos+1)//128, committed)); without it the indptr over-reserves
-    # vs the kernel's actual writes -> uninitialized HCA tail garbage.
-    hca_counts = np.minimum(
-        (pos_np + 1) // 128, md.n_committed_hca_per_seq_cpu[batch_np]
-    ).astype(np.int32)
+    # These SIZE each slice; the index kernels FILL it from the same two counts.
+    # Reserve exactly what they write or the slice tail is garbage.
+    csa_counts = np.minimum(visible_csa(pos_np), int(md.index_topk)).astype(np.int32)
+    hca_counts = visible_hca(pos_np).astype(np.int32)
     swa_indptr_np = _counts_to_indptr(swa_counts)
     csa_indptr_np = _counts_to_indptr(swa_counts + csa_counts)
     hca_indptr_np = _counts_to_indptr(swa_counts + hca_counts)
@@ -2158,7 +2132,6 @@ def _populate_decode_indices(md, block_tables, pos_np, device) -> None:
             batch_id_per_token=md.batch_id_per_token,
             positions=positions_gpu,
             hca_indptr=hca_indptr,
-            n_committed_hca_per_seq=md.n_committed_hca_per_seq,
             block_tables=block_tables,
             hca_indices=hca_indices,
             T=T,
@@ -2213,16 +2186,8 @@ def _populate_prefill_indices(md, block_tables, batch_np, pos_np, q_np, device) 
     swa_low = np.maximum(pos_np - win + 1, 0)
     extend_count = np.minimum(token_pos_in_chunk + 1, win).astype(np.int32)
     prefix_swa_count = np.maximum(chunk_start_pt - swa_low, 0).astype(np.int32)
-    csa_valid_k = np.minimum(
-        np.minimum((pos_np + 1) // 4, md.n_committed_csa_per_seq_cpu[batch_np]),
-        int(md.index_topk),
-    ).astype(np.int32)
-    # Per-token causal cap, mirroring CSA above and the prefill kernel
-    # (n_hca = min((pos+1)//128, committed)); without it the indptr over-reserves
-    # vs the kernel's actual writes -> uninitialized HCA tail garbage.
-    hca_count = np.minimum(
-        (pos_np + 1) // 128, md.n_committed_hca_per_seq_cpu[batch_np]
-    ).astype(np.int32)
+    csa_valid_k = np.minimum(visible_csa(pos_np), int(md.index_topk)).astype(np.int32)
+    hca_count = visible_hca(pos_np).astype(np.int32)
     ext_indptr_np = _counts_to_indptr(extend_count)
     swa_indptr_np = _counts_to_indptr(prefix_swa_count)
     csa_indptr_np = _counts_to_indptr(prefix_swa_count + csa_valid_k)
@@ -2251,7 +2216,6 @@ def _populate_prefill_indices(md, block_tables, batch_np, pos_np, q_np, device) 
         chunk_start_per_seq=t(chunk_start_per_seq),
         cu_seqlens_q_per_seq=t(q_np[:-1]),
         state_slot_per_seq=md.state_slot_mapping,
-        n_committed_hca_per_seq=md.n_committed_hca_per_seq,
         block_tables=block_tables,
         extend_indptr=t(ext_indptr_np),
         prefix_swa_indptr=t(swa_indptr_np),
@@ -2296,10 +2260,7 @@ def _populate_indexer(md, batch_np, positions, device) -> None:
         }
         return
     base = cu_gpu[bid].to(torch.int32)
-    end = base + torch.minimum(
-        (positions.to(torch.int32) + 1) // 4,
-        md.n_committed_csa_per_seq[bid],
-    ).to(torch.int32)
+    end = base + visible_csa(positions.to(torch.int32))
     md.indexer_meta = {
         "total_committed": int(cu[-1]),
         "cu_committed_gpu": cu_gpu,

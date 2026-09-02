@@ -130,12 +130,13 @@ class IndexerVllm(IndexerBase):
         """Paged decode top-k, extended for the DECODE slice of a mixed batch.
 
         Native ATOM only ever calls this for a *pure* decode forward, where the
-        step size is the batch-wide ``max_seqlen_q`` and the committed tensor is
-        the whole ``indexer_meta["n_committed_per_seq_gpu"]``. Under vLLM
-        continuous batching this also runs on the leading decode slice of a
-        MIXED batch, where neither holds: ``max_seqlen_q`` is the prefill max
-        (not the decode step size) and the committed tensor must be sliced to
-        the decode sub-batch. So ``indexer_score_topk`` passes ``next_n`` and
+        step size is the batch-wide ``max_seqlen_q`` and the bound is per TOKEN
+        (``csa_n_committed_per_token``); it puts no per-seq committed tensor in
+        ``indexer_meta`` at all. This bridge still stages one, because under
+        vLLM continuous batching the call also runs on the leading decode slice
+        of a MIXED batch, where ``max_seqlen_q`` is the prefill max (not the
+        decode step size) and the committed tensor must be sliced to the decode
+        sub-batch. So ``indexer_score_topk`` passes ``next_n`` and
         ``n_committed_per_seq`` explicitly for that case.
 
         When both are ``None`` (the pure-decode / spec-verify step) this is
