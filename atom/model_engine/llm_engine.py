@@ -134,6 +134,17 @@ class LLMEngine:
                     "ATOM_TBO_PREFILL_TOKEN_SPLIT is ignored under PCP: TBO "
                     "prefill uses request-boundary balanced grouping."
                 )
+            # TBO stripes positions per request group; the draft prefill split
+            # stripes the batch as one flat global sequence. The shards disagree
+            # on length and order, so refuse rather than crash inside the draft.
+            if config.enable_tbo and config.speculative_config is not None:
+                raise ValueError(
+                    "prefill_context_parallel_size > 1 (-pcp) with speculative "
+                    "decoding is not supported under TBO: TBO's PCP prefill "
+                    "splits per request group, which the draft model's global "
+                    "round-robin query split does not match. Drop --enable-tbo "
+                    "or run without a draft model."
+                )
         self.io_processor = InputOutputProcessor(
             config, self.tokenizer, config.kv_cache_block_size
         )
