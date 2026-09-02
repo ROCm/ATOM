@@ -747,6 +747,14 @@ class MooncakeConnector(KVConnectorBase):
         self._staging_pool_size: int = 0
         self._staging_free: list[int] = []
         self._staging_lock = threading.Lock()
+        self._index_staging_base_addr: int = 0
+        self._index_staging_slot_bytes: int = 0
+        self._index_staging_pool_size: int = 0
+        self._index_staging_chunk_pages: int = 0
+        self._index_staging_free: list[int] = []
+        self._index_staging_lock = threading.Lock()
+        self._build_sharded_index_plan = None
+        self._gather_sharded_index = None
 
         # --- Producer: completed prefill block_ids cache ---
         # Populated from ConnectorMetadata.reqs_to_save each step.
@@ -793,10 +801,13 @@ class MooncakeConnector(KVConnectorBase):
         self.request_id_to_transfer_id: dict[ReqId, TransferId] = {}
 
         # --- Producer: thread pool for RDMA writes ---
+        self._cuda_device = torch.cuda.current_device()
         if self.is_producer:
             self._send_executor = ThreadPoolExecutor(
                 max_workers=kv_transfer_config.get("num_worker_threads", 16),
                 thread_name_prefix="mooncake-send-worker",
+                initializer=torch.cuda.set_device,
+                initargs=(self._cuda_device,),
             )
 
         # --- ZMQ for metadata exchange ---
@@ -877,6 +888,14 @@ class MooncakeConnector(KVConnectorBase):
             self._staging_slot_bytes = tt.staging_region.unit_bytes
             self._staging_pool_size = tt.staging_pool_size
             self._staging_free = list(range(tt.staging_pool_size))
+        if tt.index_staging_region is not None:
+            self._index_staging_base_addr = tt.index_staging_region.base_addr
+            self._index_staging_slot_bytes = tt.index_staging_region.unit_bytes
+            self._index_staging_pool_size = tt.index_staging_pool_size
+            self._index_staging_chunk_pages = tt.index_staging_chunk_pages
+            self._index_staging_free = list(range(tt.index_staging_pool_size))
+            self._build_sharded_index_plan = tt.build_sharded_index_plan
+            self._gather_sharded_index = tt.gather_sharded_index
 
         # Populate block/slot region lists for transfer offset computation
         self._block_regions = [(r.base_addr, r.unit_bytes) for r in tt.block_regions]
@@ -942,6 +961,8 @@ class MooncakeConnector(KVConnectorBase):
         )
         if tt.staging_region is not None:
             all_regions.append(tt.staging_region)
+        if tt.index_staging_region is not None:
+            all_regions.append(tt.index_staging_region)
         for r in all_regions:
             offset = 0
             for chunk in self._rdma_chunk_sizes(r.total_bytes, r.unit_bytes):
@@ -1117,6 +1138,7 @@ class MooncakeConnector(KVConnectorBase):
                 # Role of each of this side's block regions, so the producer can
                 # check its per-region plan lands on the same kind of region.
                 "consumer_region_roles": self._block_region_roles,
+                "consumer_block_bpb": [bpb for _, bpb in self._block_regions],
                 "dst_block_ids": dst_block_ids,
                 # Source block_ids so downstream stages (no scheduler, no
                 # _completed_prefills) can transfer without a local lookup.
@@ -1235,6 +1257,24 @@ class MooncakeConnector(KVConnectorBase):
     def _release_staging_slot(self, idx: int) -> None:
         with self._staging_lock:
             self._staging_free.append(idx)
+
+    def _acquire_index_staging_slot(self) -> int:
+        with self._index_staging_lock:
+            if self._index_staging_free:
+                return self._index_staging_free.pop()
+        logger.warning(
+            "Index staging pool exhausted (size=%d), waiting for a slot",
+            self._index_staging_pool_size,
+        )
+        while True:
+            time.sleep(0.001)
+            with self._index_staging_lock:
+                if self._index_staging_free:
+                    return self._index_staging_free.pop()
+
+    def _release_index_staging_slot(self, idx: int) -> None:
+        with self._index_staging_lock:
+            self._index_staging_free.append(idx)
 
     # -----------------------------------------------------------------
     # KVConnectorBase: get_finished
@@ -1606,6 +1646,7 @@ class MooncakeConnector(KVConnectorBase):
         interleave = request_data.get("consumer_dcp_interleave", 1)
         replicates_index = request_data.get("consumer_replicates_index_cache", False)
         sharded_plan = None
+        stages_sharded_index = False
         if dcp_size > 1:
             sharded_plan = plan_sharded(
                 src_block_ids,
@@ -1615,25 +1656,57 @@ class MooncakeConnector(KVConnectorBase):
                 request_data["consumer_dcp_rank"],
                 interleave,
             )
-            # A preshuffled index page has no token-addressable bytes, so only
-            # a whole-page interleave keeps the sharded plan page-aligned.
-            if (
+            stages_sharded_index = (
                 not replicates_index
                 and interleave < self.block_size
                 and INDEX_CACHE_ROLE in self._block_region_roles
+            )
+            if stages_sharded_index and (
+                interleave != 1
+                or self.block_size % 16
+                or self._build_sharded_index_plan is None
+                or self._gather_sharded_index is None
+                or self._index_staging_chunk_pages <= 0
             ):
                 raise RuntimeError(
-                    f"A DCP interleave of {interleave} shards the DSA index "
-                    "cache below a page, which its preshuffled layout does not "
-                    "allow. Run the decode node with "
-                    "ATOM_DCP_REPLICATE_INDEX_CACHE=1, or with an interleave of "
-                    f"{self.block_size}."
+                    "Sharded preshuffled DSA index transfer requires "
+                    "interleave=1, a block size divisible by 16, and producer "
+                    "index staging; got "
+                    f"{interleave=}, block_size={self.block_size}, "
+                    f"has_staging={self._gather_sharded_index is not None and self._build_sharded_index_plan is not None}."
                 )
 
+        staged_regions: list[tuple[int, int, int]] = []
+        consumer_bpb = request_data.get("consumer_block_bpb")
         for region_idx in range(num_regions):
             src_base = self.kv_caches_base_addr[region_idx]
             dst_base = consumer_base_addrs[cmap[region_idx]]
             bpb = self._per_block_bytes_list[region_idx]
+            expected_consumer_bpb = (
+                bpb * dcp_size
+                if (
+                    dcp_size > 1
+                    and replicates_index
+                    and self._block_region_roles[region_idx] == INDEX_CACHE_ROLE
+                )
+                else bpb
+            )
+            if (
+                consumer_bpb is not None
+                and consumer_bpb[cmap[region_idx]] != expected_consumer_bpb
+            ):
+                raise RuntimeError(
+                    f"Region byte-size mismatch for req {req_id}: producer "
+                    f"region {region_idx} has {bpb}, consumer region "
+                    f"{cmap[region_idx]} has {consumer_bpb[cmap[region_idx]]}; "
+                    f"expected {expected_consumer_bpb}"
+                )
+            if (
+                stages_sharded_index
+                and self._block_region_roles[region_idx] == INDEX_CACHE_ROLE
+            ):
+                staged_regions.append((region_idx, dst_base, bpb))
+                continue
             plan = sharded_plan
             unit = 0
             if (
@@ -1675,21 +1748,105 @@ class MooncakeConnector(KVConnectorBase):
                 dst_addrs.append(dst_base + int(dst_off) * unit)
                 sizes.append(int(run_len) * unit)
 
-        logger.info(
-            "[PRODUCER] block RDMA write: req=%s, %d regions × %d blocks, "
-            "total_bytes=%d",
-            req_id,
-            num_regions,
-            len(src_block_ids),
-            sum(sizes),
-        )
+        if src_addrs:
+            logger.info(
+                "[PRODUCER] block RDMA write: req=%s, %d regions × %d blocks, "
+                "total_bytes=%d",
+                req_id,
+                num_regions - len(staged_regions),
+                len(src_block_ids),
+                sum(sizes),
+            )
 
-        if not self._rdma_write_with_retry(
-            target, src_addrs, dst_addrs, sizes, req_id, "block"
-        ):
-            logger.error("[PRODUCER] block transfer failed for req %s", req_id)
-            return False
+            if not self._rdma_write_with_retry(
+                target, src_addrs, dst_addrs, sizes, req_id, "block"
+            ):
+                logger.error("[PRODUCER] block transfer failed for req %s", req_id)
+                return False
+        for dst_start in range(0, len(dst_block_ids), self._index_staging_chunk_pages):
+            dst_chunk = dst_block_ids[
+                dst_start : dst_start + self._index_staging_chunk_pages
+            ]
+            src_start = dst_start * dcp_size
+            src_chunk = src_block_ids[
+                src_start : min(
+                    len(src_block_ids),
+                    (dst_start + len(dst_chunk)) * dcp_size,
+                )
+            ]
+            gather_plan = self._build_sharded_index_plan(
+                src_chunk,
+                dcp_size,
+                request_data["consumer_dcp_rank"],
+                interleave,
+            )
+
+            for region_idx, dst_base, bpb in staged_regions:
+                if not self._execute_staged_index_layer_chunk(
+                    target,
+                    region_idx,
+                    dst_base,
+                    bpb,
+                    dst_chunk,
+                    req_id,
+                    gather_plan,
+                ):
+                    return False
         return True
+
+    def _execute_staged_index_layer_chunk(
+        self,
+        target: str,
+        region_idx: int,
+        dst_base: int,
+        bytes_per_page: int,
+        dst_block_ids: list[int],
+        req_id: str,
+        gather_plan,
+    ) -> bool:
+        """GPU-repack one index layer/chunk, then RDMA its local pages."""
+
+        pool_idx = self._acquire_index_staging_slot()
+        try:
+            staging_base, staged_pages = self._gather_sharded_index(
+                region_idx,
+                gather_plan,
+                pool_idx,
+            )
+            if staged_pages != len(dst_block_ids):
+                raise RuntimeError(
+                    f"Index staging produced {staged_pages} pages for "
+                    f"{len(dst_block_ids)} destinations"
+                )
+            # The callback enqueues GPU writes on this worker thread's current
+            # stream. Fence them before Mooncake lets the NIC read.
+            torch.cuda.current_stream().synchronize()
+
+            src_page = np.arange(staged_pages, dtype=np.int64)
+            dst_page = np.asarray(dst_block_ids, dtype=np.int64)
+            length = np.full(staged_pages, bytes_per_page, dtype=np.int64)
+            src_addrs, dst_addrs, sizes = _coalesce(
+                staging_base + src_page * bytes_per_page,
+                dst_base + dst_page * bytes_per_page,
+                length,
+            )
+            if not self._rdma_write_with_retry(
+                target,
+                src_addrs.tolist(),
+                dst_addrs.tolist(),
+                sizes.tolist(),
+                req_id,
+                "staged-index",
+            ):
+                logger.error(
+                    "[PRODUCER] staged index transfer failed for req %s region %d",
+                    req_id,
+                    region_idx,
+                )
+                return False
+            return True
+        finally:
+            self._release_index_staging_slot(pool_idx)
 
     def _execute_block_slot_transfer(
         self,

@@ -942,31 +942,40 @@ def dcp_local_context_lens(
     dcp_rank: int,
     dcp_world_size: int,
     cp_kv_cache_interleave_size: int,
-    num_rows: int,
+    batch_size: int,
+    next_n: int = 1,
 ) -> torch.Tensor:
-    """This rank's per-request LOCAL KV length under interleave-S sharding.
+    """This rank's LOCAL KV length per query row under interleave-S sharding.
 
     Matches get_dcp_local_seq_lens / prepare_decode's slot split: each full S*W
     super-block gives every rank S tokens, and the tail remainder is handed out
     S at a time by rank. S=1 -> the round-robin base + (does this rank own the
     +1 tail?) split.
 
-    Depends only on context_lens / S / W / dcp_rank, so it is the same for every
-    layer and prepare_decode already computes it on the host. Prefer that
-    published buffer -- deriving it here costs 8 elementwise kernels on every
-    full-index layer (21 of them on GLM-5.2). The fallback keeps metadata
-    builders that do not publish it working.
+    For plain decode (``next_n=1``), one row represents one request and sees its
+    full context. For MTP verify, row ``(request, j)`` sees global prefix
+    ``ctx - next_n + 1 + j``. Returns one request-major flat int32 tensor with
+    ``batch_size * next_n`` entries.
+
+    Prepare-decode publishes the appropriate layer-invariant buffer on the host;
+    prefer it to avoid repeating device arithmetic on every full-index layer.
+    The fallback keeps metadata builders that do not publish it working.
     """
+    num_rows = batch_size * next_n
     local_ctx = getattr(attn_metadata, "dcp_local_context_lens", None)
     if local_ctx is not None and local_ctx.shape[0] == num_rows:
         return local_ctx
-    g_ctx = attn_metadata.context_lens
+
     S = cp_kv_cache_interleave_size
     W = dcp_world_size
-    full_chunks = g_ctx // (S * W)
-    base = full_chunks * S
-    remainder = (g_ctx - base * W - dcp_rank * S).clamp(0, S)
-    return (base + remainder).to(torch.int32)
+    g_ctx = attn_metadata.context_lens[:batch_size].to(torch.int64)
+    pos = torch.arange(next_n, device=g_ctx.device, dtype=torch.int64)
+    # Global prefix visible to each query position, clamped for the short
+    # contexts a padded cudagraph batch leaves behind.
+    visible = (g_ctx[:, None] - next_n + 1 + pos[None, :]).clamp_(min=0)
+    base = (visible // (S * W)) * S
+    remainder = (visible - base * W - dcp_rank * S).clamp_(0, S)
+    return (base + remainder).to(torch.int32).reshape(-1)
 
 
 def dcp_merge_candidates(recv: torch.Tensor, out: torch.Tensor) -> None:
@@ -1037,6 +1046,9 @@ def dcp_decode_candidate_exchange(
     differ from dcp=1 at that boundary. Exact fp32 score ties are rare, so this is
     a negligible boundary effect, not a systematic loss.
 
+    Handles both plain qlen=1 decode and MTP verify, whose rows are query tokens
+    rather than requests; only the local scoring differs (see the branch below).
+
     Writes the merged global top-k in place into
     topk_indices[:num_decode_tokens, :topk_tokens].
     """
@@ -1046,18 +1058,16 @@ def dcp_decode_candidate_exchange(
     from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 
     dcp_world_size = get_dcp_world_size()
-    next_n = padded_q_fp8_decode_tokens.shape[1]
-    assert attn_metadata.max_seqlen_q == 1, (
-        "DCP + DeepSeek-V3.2 sparse indexer (DSA) currently supports "
-        "qlen=1 decode only (MTP verify not yet supported)."
-    )
+    batch_size, next_n = padded_q_fp8_decode_tokens.shape[:2]
     local_ctx = dcp_local_context_lens(
         attn_metadata,
         dcp_rank,
         dcp_world_size,
         cp_kv_cache_interleave_size,
-        num_decode_tokens,
+        batch_size,
+        next_n,
     )
+    assert num_decode_tokens == batch_size * next_n
     l_max = (max_model_len + dcp_world_size - 1) // dcp_world_size
     local_logits = torch.empty(
         [num_decode_tokens, l_max], dtype=torch.float32, device="cuda"
@@ -1067,7 +1077,7 @@ def dcp_decode_candidate_exchange(
         kv_cache,
         weights[:num_decode_tokens],
         local_logits,
-        local_ctx,
+        local_ctx if next_n == 1 else local_ctx.view(batch_size, next_n),
         attn_metadata.block_tables,
         l_max,
         KVBlockSize=runner_block_size,
@@ -1081,9 +1091,12 @@ def dcp_decode_candidate_exchange(
     local_idx = torch.empty(
         num_decode_tokens, k_loc, dtype=torch.int32, device=local_logits.device
     )
+    # next_n=1 because `local_ctx` is already per row: the kernel's multi-token
+    # form would re-derive each row's bound from a per-request length, which is
+    # exactly the shard-unaware arithmetic the scoring loop above avoids.
     top_k_per_row_decode(
         local_logits,
-        next_n,
+        1,
         local_ctx,
         local_idx,
         num_decode_tokens,

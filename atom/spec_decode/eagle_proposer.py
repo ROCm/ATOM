@@ -410,6 +410,11 @@ class EagleProposer(Drafter):
         # needed by both MHA and MLA+sparse attention
         attn_metadata.block_tables = var["block_tables"].gpu[:running_bs]
         attn_metadata.context_lens = var["context_lens"].gpu[:running_bs]
+        if target_uses_mla and getattr(builder, "dcp_world_size", 1) > 1:
+            # Target verification publishes request-major [B*N] local lengths.
+            # Draft decode is qlen=1 and advances context_lens on device, so it
+            # must derive live [B] values rather than aliasing that verify buffer.
+            attn_metadata.dcp_local_context_lens = None
         if "sparse_kv_indptr" in var:
             attn_metadata.sparse_kv_indptr = var["sparse_kv_indptr"].gpu[
                 : running_bs + 1
