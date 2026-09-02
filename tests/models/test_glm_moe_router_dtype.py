@@ -10,7 +10,7 @@ it, without needing a GPU or a 408 GB checkpoint.
 import torch
 from transformers import PretrainedConfig
 
-from atom.models.deepseek_v2 import _moe_router_dtype
+from atom.models.moe_router import moe_router_dtype as _moe_router_dtype
 
 
 def _config(**kw) -> PretrainedConfig:

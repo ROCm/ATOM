@@ -19,11 +19,8 @@ from atom.model_ops.glm5_next.geometry import (
 )
 from atom.utils import envs
 
-from .aiter_mla import (
-    AiterMLAMetadataBuilder,
-    aligned_index_cache_dim,
-    mla_kv_entry_dim,
-)
+from ..mla_geometry import aligned_index_cache_dim, mla_kv_entry_dim
+from .aiter_mla import AiterMLAMetadataBuilder
 from .backends import AttentionBackend
 from .gdn_attn import GDNStateMixin
 from .sub_pool_spec import SubPoolSpec, page_pool, state_pool

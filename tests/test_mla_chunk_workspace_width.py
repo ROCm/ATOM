@@ -10,7 +10,7 @@ Anything sized from the raw config is then too narrow by exactly that pad.
 
 from types import SimpleNamespace
 
-from atom.model_ops.attentions.aiter_mla import mla_kv_entry_dim, mla_qk_head_dim
+from atom.model_ops.mla_geometry import mla_kv_entry_dim, mla_qk_head_dim
 
 
 def _deepseek_like():
