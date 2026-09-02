@@ -29,8 +29,6 @@ env:
   GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/ATOM.git' }}
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id || github.sha }}
   NIGHTLY_PLUGIN_IMAGE_TAG: rocm/atom-dev:vllm-latest
-  PLUGIN_CI_SLURM_ACCOUNT: amd-aifw-dev
-  PLUGIN_CI_SLURM_PARTITION: amd-spur
 
 jobs:
   ci-gate:
@@ -178,9 +176,7 @@ jobs:
     env:
       AITER_ARTIFACT_ID: ${{ needs.download_aiter_wheel.outputs.aiter_artifact_id }}
       CONTAINER_NAME: plugin_ci_vllm_${{ github.run_id }}_${{ strategy.job-index }}
-      PLUGIN_CI_SLURM_NODES: crsuse2-m2m-v2-002,crsuse2-m2m-v2-027,crsuse2-m2m-v2-030,crsuse2-m2m-v2-031,crsuse2-m2m-v2-032,crsuse2-m2m-v2-044,crsuse2-m2m-v2-050
       RESULT_DIR: plugin-ci-results
-      PLUGIN_CI_LOG_ROOT: ${{ github.workspace }}/plugin-ci-logs/vLLM_LOG
     steps:
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
@@ -191,13 +187,12 @@ jobs:
           name: aiter-whl
           path: aiter-whl
 
-      - name: Build vLLM Slurm cell
+      - name: Build vLLM cell
         id: cell
         env:
           MATRIX_JSON: ${{ toJson(matrix) }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          PLUGIN_CI_SLURM_SUBMIT_RUNNER: ${{ matrix.runner }}
           SKIP_DOCKER_LOGIN: ${{ github.event.pull_request.head.repo.fork && '1' || '0' }}
         run: |
           set -euo pipefail
@@ -206,19 +201,25 @@ jobs:
             --matrix-json "${MATRIX_JSON}" \
             --github-output
 
-      - name: Submit vLLM accuracy job to Slurm
+      - name: Run vLLM accuracy job
         env:
-          CELL_JSON: ${{ steps.cell.outputs.cell_json }}
+          MATRIX_MODEL_NAME: ${{ matrix.model_name }}
+          MATRIX_MODEL_PATH: ${{ matrix.model_path }}
+          MATRIX_CLIENT_COMMAND: ${{ matrix.client_command }}
+          MATRIX_EXTRA_ARGS: ${{ matrix.extra_args }}
+          MATRIX_ENV_VARS: ${{ matrix.env_vars }}
+          MATRIX_LM_EVAL_NUM_FEWSHOT: ${{ matrix.lm_eval_num_fewshot }}
+          MATRIX_ACCURACY_TEST_THRESHOLD: ${{ matrix.accuracy_test_threshold }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          SKIP_DOCKER_LOGIN: ${{ github.event.pull_request.head.repo.fork && '1' || '0' }}
           DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
           HF_TOKEN: ${{ secrets.AMD_HF_TOKEN }}
         run: |
           set -euo pipefail
-          chmod +x .github/scripts/plugin_ci/*.sh
-          bash .github/scripts/plugin_ci/submit.sh \
-            --plugin vllm \
-            --cell-json "${CELL_JSON}" \
-            --result-dir "${RESULT_DIR}"
+          chmod +x .github/scripts/plugin_ci/run_vllm_ci.sh
+          bash .github/scripts/plugin_ci/run_vllm_ci.sh
 
       - name: Add vLLM result to job summary
         if: always()
@@ -232,12 +233,9 @@ jobs:
 
           cell = json.loads(os.environ.get("CELL_JSON") or "{}")
           result_root = Path(os.environ["RESULT_DIR"])
-          job_ids = list(result_root.glob("*.slurm-job-id"))
           outputs = list(result_root.rglob("oot_accuracy_output.txt"))
           with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as summary:
               summary.write(f"## {cell.get('id', 'vLLM plugin CI')}\n\n")
-              if job_ids:
-                  summary.write(f"Slurm job: `{job_ids[0].read_text(encoding='utf-8').strip()}`\n\n")
               if outputs:
                   text = outputs[0].read_text(encoding="utf-8", errors="replace")
                   lines = text.splitlines()
@@ -254,7 +252,7 @@ jobs:
                       summary.write("\n".join(table) + "\n")
           PY
 
-      - name: Upload vLLM Slurm artifacts
+      - name: Upload vLLM artifacts
         if: always()
         uses: actions/upload-artifact@v7
         with:
