@@ -30,7 +30,7 @@ env:
 jobs:
   gpt-oss-120b-gsm8k:
     name: Accuracy gpt-oss-120b GSM8K
-    runs-on: [self-hosted, slurm-runner-mi355x-8gpu]
+    runs-on: [self-hosted, spur-runner-mi355x-8gpu]
     timeout-minutes: 45
     steps:
       - name: Checkout ATOM repo
@@ -48,7 +48,7 @@ jobs:
         with:
           container-name: ${{ env.CONTAINER_NAME }}
           base-image: ${{ env.ATOM_BASE_IMAGE }}
-          runner: slurm-runner-mi355x-8gpu
+          runner: spur-runner-mi355x-8gpu
           hf-token: ${{ secrets.AMD_HF_TOKEN }}
           network-host: "true"
 
@@ -65,7 +65,7 @@ jobs:
         id: gpu-info
         env:
           COLLECT_VERBOSE_GPU_INFO: "1"
-        run: bash .github/scripts/collect_gpu_info.sh "$CONTAINER_NAME" docker "slurm-runner-mi355x-8gpu"
+        run: bash .github/scripts/collect_gpu_info.sh "$CONTAINER_NAME" docker "spur-runner-mi355x-8gpu"
 
       - name: Install aiter from wheel
         env:

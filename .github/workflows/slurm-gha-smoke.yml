@@ -17,7 +17,7 @@ permissions:
 jobs:
   smoke:
     name: Slurm GPU runner smoke
-    runs-on: [self-hosted, slurm-runner-mi355x-1gpu]
+    runs-on: [self-hosted, spur-runner-mi355x-1gpu]
     timeout-minutes: 10
     steps:
       - name: Show runtime context
