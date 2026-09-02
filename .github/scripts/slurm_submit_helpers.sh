@@ -74,6 +74,49 @@ slurm_job_in_queue() {
   fi
 }
 
+select_random_idle_slurm_nodes() {
+  local want_count="$1"
+  shift
+  local -a candidates=("$@")
+  local -a sinfo_cmd=(sinfo -h -N)
+  local -a idle_nodes=()
+  local -a selected=()
+  local node state state_upper
+
+  if [[ "${want_count}" -lt 1 ]]; then
+    echo "ERROR: select_random_idle_slurm_nodes requires a positive node count" >&2
+    return 1
+  fi
+  if [[ "${#candidates[@]}" -lt "${want_count}" ]]; then
+    echo "ERROR: only ${#candidates[@]} candidate node(s) provided, need ${want_count}" >&2
+    return 1
+  fi
+  if ! command -v sinfo >/dev/null 2>&1; then
+    echo "ERROR: sinfo not found; unable to select idle Slurm nodes" >&2
+    return 1
+  fi
+
+  if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
+    sinfo_cmd+=(--controller "${SPUR_CONTROLLER_ADDR}")
+  fi
+
+  for node in "${candidates[@]}"; do
+    state="$("${sinfo_cmd[@]}" --nodelist "${node}" --format="%T" 2>/dev/null | awk 'NF { print $1; exit }' || true)"
+    state_upper="${state^^}"
+    if [[ "${state_upper}" == "IDLE" || "${state_upper}" == IDLE* ]]; then
+      idle_nodes+=("${node}")
+    fi
+  done
+
+  if [[ "${#idle_nodes[@]}" -lt "${want_count}" ]]; then
+    echo "ERROR: only ${#idle_nodes[@]} idle node(s) available among candidates (${candidates[*]}), need ${want_count}" >&2
+    return 1
+  fi
+
+  mapfile -t selected < <(printf '%s\n' "${idle_nodes[@]}" | shuf | head -n "${want_count}")
+  (IFS=,; echo "${selected[*]}")
+}
+
 wait_for_slurm_cancel() {
   local job_id="$1"
   local initial_signal="$2"

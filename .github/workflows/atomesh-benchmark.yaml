@@ -34,7 +34,7 @@ on:
           - smoke
           - nightly
       rdma_smoke_nodes:
-        description: 'Comma-separated Slurm nodes for the Mooncake RDMA smoke test; defaults to atomesh_1p1d_nodes'
+        description: 'Comma-separated Slurm nodes for the Mooncake RDMA smoke test; when more than two nodes are listed, two idle nodes are chosen at random'
         required: false
         default: ''
         type: string
@@ -443,12 +443,34 @@ jobs:
 
           nodes="${RDMA_SMOKE_NODES:-${ATOMESH_1P1D_NODES:-}}"
           nodes="${nodes// /}"
+          RDMA_SMOKE_TARGET_NODE_COUNT=2
+          USES_SPUR_CONTROLLER=0
+          SPUR_CONTROLLER_ADDR=""
+          SPUR_ACCOUNTING_ADDR=""
+          if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
+            USES_SPUR_CONTROLLER=1
+            SPUR_CONTROLLER_ADDR="http://134.199.196.72:6817"
+            SPUR_ACCOUNTING_ADDR="http://134.199.196.72:6819"
+          elif [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi355-crusoe" ]]; then
+            USES_SPUR_CONTROLLER=1
+            SPUR_CONTROLLER_ADDR="http://crs-m2m-cpu-spur-005.crusoe.amd.com:6817"
+            SPUR_ACCOUNTING_ADDR="http://crs-m2m-cpu-spur-005.crusoe.amd.com:6819"
+          fi
+          source "${GITHUB_WORKSPACE}/.github/scripts/slurm_submit_helpers.sh"
+          install_slurm_cancel_traps
+
           if [[ -n "${nodes}" ]]; then
             IFS=',' read -r -a node_list <<< "${nodes}"
+            if [[ "${#node_list[@]}" -gt "${RDMA_SMOKE_TARGET_NODE_COUNT}" ]]; then
+              echo "=== selecting ${RDMA_SMOKE_TARGET_NODE_COUNT} idle node(s) from ${#node_list[@]} candidates ==="
+              nodes="$(select_random_idle_slurm_nodes "${RDMA_SMOKE_TARGET_NODE_COUNT}" "${node_list[@]}")"
+              echo "selected_nodes=${nodes}"
+              IFS=',' read -r -a node_list <<< "${nodes}"
+            fi
             node_count="${#node_list[@]}"
           else
             # Allocate two nodes by default so both local and cross-node GDR are validated.
-            node_count=2
+            node_count="${RDMA_SMOKE_TARGET_NODE_COUNT}"
           fi
           if [[ "${node_count}" -lt 1 ]]; then
             echo "::error::GPUDirect RDMA smoke testing requires at least one Slurm node."
@@ -470,20 +492,6 @@ jobs:
           SLURM_ERROR="${run_dir}/slurm-%j.err"
           SLURM_CANCEL_HELPER="${run_dir}/slurm-cancel.sh"
           SLURM_LOG_POLL_INTERVAL="${SLURM_LOG_POLL_INTERVAL:-15}"
-          USES_SPUR_CONTROLLER=0
-          SPUR_CONTROLLER_ADDR=""
-          SPUR_ACCOUNTING_ADDR=""
-          if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
-            USES_SPUR_CONTROLLER=1
-            SPUR_CONTROLLER_ADDR="http://134.199.196.72:6817"
-            SPUR_ACCOUNTING_ADDR="http://134.199.196.72:6819"
-          elif [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi355-crusoe" ]]; then
-            USES_SPUR_CONTROLLER=1
-            SPUR_CONTROLLER_ADDR="http://crs-m2m-cpu-spur-005.crusoe.amd.com:6817"
-            SPUR_ACCOUNTING_ADDR="http://crs-m2m-cpu-spur-005.crusoe.amd.com:6819"
-          fi
-          source "${GITHUB_WORKSPACE}/.github/scripts/slurm_submit_helpers.sh"
-          install_slurm_cancel_traps
 
           rank_script="${run_dir}/run-rdma-smoke-rank.sh"
           cat > "${rank_script}" <<'RANK_SCRIPT'
