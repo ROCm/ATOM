@@ -587,9 +587,16 @@ class AttentionMetaData:
     # prefill/MTP-verify and per seq in decode. Separate from kv_last_page_lens
     # (the dense per-seq buffer) so the two never clobber each other.
     sparse_kv_last_page_lens: torch.Tensor | None = None
-    # Precomputed per-rank context lengths for qlen=1 sparse DSA + DCP decode.
-    # The padded running-width buffer is shared by eager, graph and TBO paths.
+    # Per-rank KV length of each SCORED QUERY TOKEN's causal window, for sparse
+    # DSA + DCP decode -- one row per query token, since MTP verify gives each
+    # draft position its own window. The padded running-width buffer is shared
+    # by eager, graph and TBO paths.
     dcp_local_context_lens: torch.Tensor | None = None
+    # Block-table row per scored query token, for the same indexer; both aiter
+    # ops address the table by row. Aliases block_tables when the step runs one
+    # query per sequence. Every producer that rewrites block_tables must rewrite
+    # this too -- a stale verify table has the right length but the wrong rows.
+    dcp_token_block_tables: torch.Tensor | None = None
 
     work_meta_data: torch.Tensor | None = None
     work_indptr: torch.Tensor | None = None
