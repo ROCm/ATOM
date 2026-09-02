@@ -14,13 +14,15 @@ contains three small `[4, 7168]` TP custom AllReduces plus the collectives in
 eager launch sequence lets TP ranks reach each rendezvous at different times.
 
 The new fast path captures the DeepSeek-V4 step-0 backbone and draft-id
-epilogue as one `DraftGraph`. On the measured TP8 workload, the median step-0
-GPU annotation fell from `3.130 ms` to `0.479 ms`. The per-step sum of the
-three AllReduce cross-rank envelopes fell from `2.337 ms` to `48.9 us`.
+epilogue as one `DraftGraph`. Replay is confirmed on all eight ranks, while
+prefill and unsupported layouts continue to use the eager fallback.
 
-This result is an operator-trace result, not a 900-second end-to-end benchmark
-claim. The implementation is intentionally restricted to the configuration
-that was validated.
+A corrected controlled comparison, with NUMA binding enabled on both arms and
+without RPC/forward debug markers, measured rank-0 step-0 P50 at `461.9 us`
+eager and `479.6 us` graphed. The graph was `17.7 us` (`3.8%`) slower in that
+sample, and the accompanying end-to-end comparison showed no attributable net
+gain. The implementation is therefore experimental graph-path infrastructure,
+not a demonstrated performance improvement.
 
 ## Workload and measurement
 
@@ -43,27 +45,22 @@ The optimized and baseline traces used the following decode configuration:
 The baseline was ATOM commit `4c2870b7`, where steps 1 and 2 already replayed
 complete backbone-plus-epilogue graphs. Only step 0 remained eager.
 
-The trace comparison uses two measurements:
-
-1. **Step-0 GPU annotation:** the P50 duration of
-   `propose_eagle[0/3 tok=4 ...]` on each rank, followed by the median of the
-   eight per-rank P50 values.
-2. **Collective envelope:** for each corresponding AllReduce call, align the
-   eight ranks by launch order and measure from the earliest rank's kernel
-   entry to the latest rank's kernel completion. Sum the three values for each
-   step, then report P50 across steps.
-
-The baseline trace contains 390 complete decode cycles. The optimized trace
-contains 475 complete decode cycles.
+The controlled trace comparison uses the P50 duration of the rank-0
+`propose_eagle[0/3 tok=4 ...]` GPU annotation. Both arms enable NUMA binding,
+and neither contains the extra RPC/forward debug markers that perturb CPU
+submission and overlap.
 
 ## Trace result
 
 | Metric | Baseline | Step-0 graph | Change |
 |---|---:|---:|---:|
-| Step-0 GPU annotation P50 | `3.130 ms` | `0.479 ms` | `-2.651 ms` (`-84.7%`) |
-| Three-AR envelope sum P50 | `2.337 ms` | `48.9 us` | `-97.9%` |
-| Three-AR entry-skew sum P50 | `2.314 ms` | `28.1 us` | `-98.8%` |
-| All captured draft-AR envelope sum P50 | 6 calls: `0.572 ms` | 9 calls: `0.241 ms` | More calls, lower total wait |
+| Rank-0 step-0 GPU annotation P50 | `461.9 us` | `479.6 us` | `+17.7 us` (`+3.8%`) |
+
+An earlier diagnostic comparison reported `3.130 ms` eager versus `0.479 ms`
+graphed and much smaller cross-rank AllReduce envelopes. That eager trace used
+additional RPC/forward instrumentation which slowed CPU execution and changed
+overlap, so those numbers are superseded by the controlled result above and
+must not be interpreted as graph speedup.
 
 Every rank in the optimized trace reports:
 
@@ -81,18 +78,15 @@ This confirms both sides of the dispatch decision: the rectangular decode
 path replays the recording, while the dynamic prefill path falls back to the
 existing eager implementation.
 
-## Why the eager path was expensive
+## Why the graph path is still useful
 
-The three baseline `[4, 7168]` AllReduce calls had a combined minimum-rank
-kernel duration of only about `20.8 us` per step. Their combined cross-rank
-envelope was `2.337 ms`. Most of the observed duration was therefore not the
-reduction arithmetic; it was time spent inside collective synchronization
-waiting for another rank to arrive.
-
-Capturing the backbone and epilogue gives all ranks one replay launch for the
-same fixed operation sequence. The three optimized AllReduces have only
-`28.1 us` of combined entry skew at P50, which is why changing the graph
-boundary is much more effective here than tuning the 56-CTA reduction kernel.
+Step 0 is the only serial-MTP pass that previously had no graph representation.
+Capturing it establishes fixed staging, replay, and fallback behavior for the
+full verification rectangle, and makes later launch-overhead experiments
+possible without changing model semantics. The corrected measurement shows
+that capture alone does not improve this workload; any follow-up optimization
+must reduce graph-external staging or improve end-to-end overlap, and must be
+validated with an uninstrumented end-to-end comparison.
 
 ## Implementation
 
@@ -224,7 +218,8 @@ the launch grid, while the baseline eager step-0 calls expose grid x = 56.
 ## Remaining work
 
 1. Run a paired 900-second end-to-end A/B with the same request trajectory and
-   compare ITL, output throughput, and acceptance.
+   compare ITL, output throughput, and acceptance; the current shorter
+   controlled comparison shows no attributable net gain.
 2. Run without forced acceptance and compare generated token IDs against the
    eager path.
 3. Add and validate DP, DCP, PCP, EP, and TBO support before relaxing the
