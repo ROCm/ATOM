@@ -1638,20 +1638,10 @@ jobs:
 
       - name: Prepare existing dashboard data
         if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0'
-        run: |
-          set -euo pipefail
-          cp .github/scripts/prepare_dashboard_data.py /tmp/prepare_dashboard_data.py
-          CURRENT_SHA=$(git rev-parse HEAD)
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git fetch origin gh-pages
-          git checkout gh-pages
-          python3 /tmp/prepare_dashboard_data.py benchmark-dashboard/data.js --write
-          if [ -f benchmark-dashboard/data.js ]; then
-            git add benchmark-dashboard/data.js
-            git diff --cached --quiet || git commit -m "ci(dashboard): normalize benchmark data format"
-          fi
-          git checkout "$CURRENT_SHA"
+        id: prepare_dashboard_data
+        uses: ./.github/actions/prepare-dashboard-data
+        with:
+          data-path: benchmark-dashboard/data.js
 
       - name: Store benchmark result to dashboard
         if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0'
@@ -1661,13 +1651,19 @@ jobs:
           output-file-path: benchmark-action-input.json
           gh-pages-branch: gh-pages
           benchmark-data-dir-path: benchmark-dashboard
-          skip-fetch-gh-pages: true
           auto-push: false
           alert-threshold: "80%"
           comment-on-alert: true
           fail-on-alert: false
           max-items-in-chart: 300
           github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Validate dashboard data after write
+        if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0'
+        uses: ./.github/actions/validate-dashboard-data
+        with:
+          data-path: benchmark-dashboard/data.js
+          min-entries: ${{ steps.prepare_dashboard_data.outputs.entry_count }}
 
       - name: Push dashboard data to gh-pages
         if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0'

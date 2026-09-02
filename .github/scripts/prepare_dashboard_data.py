@@ -12,42 +12,50 @@ import sys
 from pathlib import Path
 from typing import Any
 
-PREFIX = "window.BENCHMARK_DATA = "
+PREFIX = b"window.BENCHMARK_DATA = "
 
 
-def parse_data(text: str) -> tuple[Any, bool]:
-    """Parse data.js and return ``(data, has_trailing_semicolon)``."""
-    if not text.startswith(PREFIX):
-        raise ValueError(f"missing {PREFIX!r} prefix")
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-standard JSON constant {value!r}")
 
-    payload = text[len(PREFIX) :].strip()
-    has_trailing_semicolon = payload.endswith(";")
-    if has_trailing_semicolon:
-        payload = payload[:-1].rstrip()
 
-    data = json.loads(payload)
-    if not isinstance(data, dict):
-        raise TypeError("dashboard data must be a JSON object")
-
+def entry_count(data: Any) -> int:
     entries = data.get("entries")
     if not isinstance(entries, dict):
         raise TypeError("dashboard data must contain an 'entries' object")
-    if not entries or not any(
-        isinstance(value, list) and value for value in entries.values()
-    ):
-        raise ValueError("dashboard data contains no benchmark entries")
+    return sum(len(value) for value in entries.values() if isinstance(value, list))
+
+
+def parse_data(text: bytes) -> tuple[Any, bool]:
+    """Parse data.js and return ``(data, has_trailing_semicolon)``."""
+    if not text.startswith(PREFIX):
+        raise ValueError(f"missing {PREFIX.decode()!r} prefix")
+
+    payload = text[len(PREFIX) :].strip()
+    has_trailing_semicolon = False
+    while payload.endswith(b";"):
+        has_trailing_semicolon = True
+        payload = payload[:-1].rstrip()
+
+    data = json.loads(payload.decode("utf-8"), parse_constant=_reject_json_constant)
+    if not isinstance(data, dict):
+        raise TypeError("dashboard data must be a JSON object")
+
+    entry_count(data)
 
     return data, has_trailing_semicolon
 
 
-def normalize(text: str) -> tuple[str, bool]:
+def normalize(text: bytes) -> tuple[bytes, bool]:
     """Validate text and remove only a terminal JavaScript semicolon."""
     _, has_trailing_semicolon = parse_data(text)
     if not has_trailing_semicolon:
         return text, False
 
-    content_end = len(text.rstrip())
-    normalized = text[: content_end - 1] + text[content_end:]
+    content = text.rstrip()
+    while content.endswith(b";"):
+        content = content[:-1].rstrip()
+    normalized = content + text[len(text.rstrip()) :]
     return normalized, True
 
 
@@ -59,27 +67,42 @@ def main() -> int:
         action="store_true",
         help="Remove a terminal semicolon in place after validation.",
     )
+    parser.add_argument(
+        "--min-entries",
+        type=int,
+        default=None,
+        help="Require at least this many benchmark entries after validation.",
+    )
     args = parser.parse_args()
 
-    if not args.data_js.exists():
+    if not args.data_js.is_file():
         print(f"{args.data_js}: does not exist; allowing first dashboard run")
+        print("entry_count=0")
         return 0
 
     try:
-        original = args.data_js.read_text(encoding="utf-8")
+        original = args.data_js.read_bytes()
         normalized, changed = normalize(original)
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        data, _ = parse_data(normalized)
+        count = entry_count(data)
+        if args.min_entries is not None and count < args.min_entries:
+            raise ValueError(
+                f"dashboard entry count decreased from {args.min_entries} to {count}"
+            )
+    except (OSError, TypeError, ValueError) as exc:
         print(f"{args.data_js}: invalid dashboard data: {exc}", file=sys.stderr)
         return 1
 
     if changed and args.write:
-        args.data_js.write_text(normalized, encoding="utf-8")
+        args.data_js.write_bytes(normalized)
         print(f"{args.data_js}: removed terminal semicolon")
     elif changed:
-        print(f"{args.data_js}: valid but requires normalization")
+        print(f"{args.data_js}: valid but requires normalization", file=sys.stderr)
+        return 1
     else:
         print(f"{args.data_js}: valid")
 
+    print(f"entry_count={count}")
     return 0
 
 

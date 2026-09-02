@@ -61,7 +61,7 @@ jobs:
             -name="ruff" \
             -reporter=github-pr-review \
             -filter-mode=diff_context \
-            -fail-level=any
+            -fail-on-error=true
 
   validate-catalog:
     name: Validate accuracy catalogs against schema
