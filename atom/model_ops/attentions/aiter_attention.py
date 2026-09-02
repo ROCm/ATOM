@@ -11,7 +11,11 @@ import triton.language as tl
 from aiter.dist.parallel_state import get_tp_group
 
 from atom.model_engine.scheduler import ScheduledBatch
-from atom.model_ops.attention_mha import PagedAttentionImpl, use_pa_decode_bf16_asm
+from atom.model_ops.attention_mha import (
+    PagedAttentionImpl,
+    assert_kv_layout_matches,
+    use_pa_decode_bf16_asm,
+)
 from atom.utils import CpuGpuBuffer, envs, pack_rows, upload_numpy
 from atom.utils.block_convert import (
     block_table_convert_triton,
@@ -694,6 +698,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         module.max_model_len = config.max_model_len
         module.k_cache = k_cache
         module.v_cache = v_cache
+        assert_kv_layout_matches(getattr(module, "impl", None), k_cache)
         return KVCacheTensor(
             layer_num=layer_id,
             k_cache=k_cache,

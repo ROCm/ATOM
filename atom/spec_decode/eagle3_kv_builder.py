@@ -4,6 +4,7 @@ import torch
 from aiter import dtypes
 
 from atom.config import KVCacheTensor
+from atom.model_ops.attention_mha import assert_kv_layout_matches
 from atom.model_ops.attentions.sub_pool_spec import SubPoolSpec, page_pool
 from atom.utils import envs
 
@@ -109,11 +110,17 @@ class Eagle3DraftBuilder:
     def _use_flash_layout(impl) -> bool:
         """Whether to hand this draft module a flash (4D) view of the pool.
 
-        Mirrors the branch condition in `rope_cache`: of its three writers only
-        `fused_qk_rope_reshape_and_cache` emits a 4D VHD V, which no prefill
-        reader consumes. Those modules get flash instead (same kernel, one flag
-        flipped). The other two already write a SHUFFLE V that both prefill and
-        decode read, so a flash pool would only break them.
+        Mirrors `rope_cache`'s branch condition: of its three writers only
+        `fused_qk_rope_reshape_and_cache` emits the 4D V no prefill reader
+        consumes. Those modules get flash instead -- same kernel, one flag
+        flipped. A module reaching either other writer already gets a SHUFFLE V,
+        which a flash pool would only break.
+
+        KNOWN GAP: returns False for `rotary_emb is None`, which is right unless
+        `use_triton_attn` also holds -- then rope_cache's third writer takes
+        asm_layout=False and emits the same 4D V, so that draft keeps paying the
+        whole-pool convert. Not fixed here: the writer is `reshape_and_cache`,
+        with its own blast radius. See test_rope_less_draft_is_a_known_gap.
         """
         if impl is None or getattr(impl, "rotary_emb", None) is None:
             return False
@@ -168,13 +175,13 @@ class Eagle3DraftBuilder:
             )
         if impl is not None:
             impl.use_flash_layout = flash
-        # Which layout a draft pool got is otherwise invisible: both are views of
-        # the same allocation, so the shapes are the only thing that tells them
-        # apart, and reading the wrong one corrupts attention without faulting.
+        assert_kv_layout_matches(impl, k_cache)
+        # Otherwise invisible: both layouts are views of the same allocation, so
+        # only the shapes tell them apart.
         logger.info(
             "Eagle3 draft layer %d KV layout: %s (K %s, V %s)",
             layer_id,
-            "flash" if flash else "SHUFFLE-K/VHD-V",
+            "flash" if flash else "SHUFFLE-K / 4D-V",
             tuple(k_cache.shape),
             tuple(v_cache.shape),
         )

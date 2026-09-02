@@ -26,6 +26,29 @@ from atom.model_ops.base_attention import (
 )
 
 
+def assert_kv_layout_matches(impl, k_cache) -> None:
+    """A bound K of rank 4 means flash, rank 5 means SHUFFLE. Nothing else.
+
+    `rope_cache` picks the writer and `_dispatch_decode` the reader off
+    `use_flash_layout`, so a binder that leaves it disagreeing with the rank it
+    bound corrupts KV silently -- same element count, no shape error. Wired into
+    the binders that can produce either layout (AiterAttentionMetadataBuilder,
+    TritonMHAMetadataBuilder, Eagle3DraftBuilder, ModelRunner's PD rebind) so one
+    that forgets fails at bind time instead of at accuracy-review time.
+    """
+    if impl is None:
+        return
+    flash = bool(getattr(impl, "use_flash_layout", False))
+    rank = k_cache.dim()
+    if (rank == 4) is not flash:
+        raise AssertionError(
+            f"KV layout disagrees with use_flash_layout on {type(impl).__name__} "
+            f"layer {getattr(impl, 'layer_num', '?')}: bound K is {rank}-D "
+            f"({tuple(k_cache.shape)}) but use_flash_layout={flash}. A 4-D K is "
+            f"flash, a 5-D K is SHUFFLE; the binder must set the flag to match."
+        )
+
+
 @cache
 def use_pa_decode_bf16_asm() -> bool:
     return (
@@ -92,9 +115,10 @@ class PagedAttentionImpl(nn.Module):
         self.rotary_emb = rotary_emb
         self.q_norm = q_norm
         self.k_norm = k_norm
-        # Set by the attention backend's build_kv_cache_tensor when KV cache is
-        # allocated in flash layout [num_blocks, block_size, num_kv_heads, head_dim]
-        # for aiter triton unified_attention. AiterBackend keeps this False.
+        # Pool is flash (4D) [num_blocks, block_size, num_kv_heads, head_dim]
+        # rather than 5D SHUFFLE. Set at bind time by whichever builder allocates
+        # it; Eagle3DraftBuilder is the only one that sets True today. A builder
+        # that never assigns it gets SHUFFLE.
         self.use_flash_layout = False
 
         self.supports_quant_query_input = False
@@ -777,11 +801,16 @@ class PagedAttentionImpl(nn.Module):
         # shuffle  K:   [num_blocks, num_kv_heads, head_size // x, block_size, x]
         # shuffle  V:   [num_blocks, num_kv_heads, block_size // x, head_size, x]
         #
-        # For pure prefill (no cached tokens), raw key/value are passed as a
-        # block_size=1 flash-layout cache with a fake block_table:
+        # The `else` below passes raw key/value as a block_size=1 flash-layout
+        # cache with the fake block_table TritonMHAMetadataBuilder builds for it:
         #
         # key:    [num_tokens, 1, num_kv_heads, head_size]
         # value:  [num_tokens, 1, num_kv_heads, head_size]
+        #
+        # DEAD: dispatch_backend reaches here only via
+        # `ATOM_USE_UNIFIED_ATTN or use_flash_layout`, so `has_cached` below can
+        # never decide anything. Kept until the fake-table producer in
+        # triton_mha.py is retired with it; do not build on it.
 
         attn_metadata = fwd_ctx.attn_metadata
 
@@ -806,8 +835,7 @@ class PagedAttentionImpl(nn.Module):
         ):
             k_for_attn = k_cache
             v_for_attn = v_cache
-            # Reads the paged KV cache, which is 5D SHUFFLE unless the (default)
-            # 4D flash layout is in use.
+            # 5D SHUFFLE unless bound to a 4D flash pool (off by default).
             shuffled_kv_cache = not self.use_flash_layout
         else:
             #   k: [total_tokens, num_kv_heads, head_size]
@@ -859,6 +887,12 @@ class PagedAttentionImpl(nn.Module):
 
         atom_config = get_current_atom_config()
 
+        # Before the UNIFIED branch, which can return persistent_asm: the ASM
+        # paths address a 5D SHUFFLE pool and would read a flash pool's head_dim
+        # as its page size instead of faulting.
+        if self.use_flash_layout:
+            return self.paged_attention_triton
+
         if envs.ATOM_USE_UNIFIED_ATTN:
             if envs.ATOM_FORCE_ATTN_TRITON:
                 return self.paged_attention_triton
@@ -866,7 +900,7 @@ class PagedAttentionImpl(nn.Module):
                 return self.paged_attention_persistent_asm
             return self.paged_attention_triton
 
-        if self.use_triton_attn or self.use_flash_layout:
+        if self.use_triton_attn:
             return self.paged_attention_triton
 
         if use_pa_decode_bf16_asm():

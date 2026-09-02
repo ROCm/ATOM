@@ -4522,6 +4522,21 @@ class RapidServeModelRunner(ModelRunner):
                         )
                         module.k_cache = k_cache
                         module.v_cache = v_cache
+                        # Rebinds 5D SHUFFLE views, so the flag must say so.
+                        # KNOWN GAP: an Eagle3 MHA draft never gets here --
+                        # _get_total_num_layers excludes drafts owning their own
+                        # builder, so self.kv_cache has no slot for a draft layer
+                        # and the index above raises first. Fixing that is out of
+                        # scope; this keeps the invariant true for what does
+                        # reach here (target MHA layers, MLA-draft configs).
+                        from atom.model_ops.attention_mha import (
+                            assert_kv_layout_matches,
+                        )
+
+                        impl = getattr(module, "impl", None)
+                        if impl is not None:
+                            impl.use_flash_layout = False
+                        assert_kv_layout_matches(impl, k_cache)
                         layer_id += 1
                     elif hasattr(module, "use_mla") and module.use_mla:
                         kv_cache = self.kv_cache[layer_id].view(
