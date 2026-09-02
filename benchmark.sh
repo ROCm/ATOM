@@ -16,7 +16,7 @@ SETTLE_SEC="${SETTLE_SEC:-20}"
 
 # Override by passing values as args: ./sweep.sh 1 4 16 64
 CONCURRENCIES=("${@:-}")
-[ -z "${CONCURRENCIES[0]:-}" ] && CONCURRENCIES=(128)  #(4 8 16 32 64 128 256 512)
+[ -z "${CONCURRENCIES[0]:-}" ] && CONCURRENCIES=(64 128)  #(4 8 16 32 64 128 256 512)
 INPUT_LENS=(8192)
 
 MODEL_SHORT="$(basename "$MODEL")"
@@ -66,7 +66,7 @@ for INPUT in "${INPUT_LENS[@]}"; do
       --random-output-len "$OSL" \
       --random-range-ratio "$RANDOM_RANGE_RATIO" \
       --num-prompts "$((CONC * PROMPTS_PER_CONC))" \
-      --max-concurrency "$CONC" --num-warmups=512 \
+      --max-concurrency "$CONC" \
       --request-rate=inf --ignore-eos  \
       --save-result --percentile-metrics="ttft,tpot,itl,e2el" \
       --result-filename "$RESULT_FILENAME" \

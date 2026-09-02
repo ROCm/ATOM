@@ -36,6 +36,47 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # pressure) and a smaller value toward prompt-token balance (prefill
     # pressure). See engine_core_mgr.CoreManager._select_dp_rank_locked.
     "ATOM_DP_LB_REQ_EQUIV": lambda: int(os.getenv("ATOM_DP_LB_REQ_EQUIV", "512")),
+    # Which aiter all-to-all backend the expert-parallel MoE uses. Empty ->
+    # leave aiter's own default, which is hardcoded to "mori"
+    # (base_device_communicator.py:126; the config-driven selection there is
+    # commented out, so this is the only way to pick another one).
+    #
+    # Only "mori" and "flydsl" are implemented in this aiter build — its
+    # selector also names naive / allgather_reducescatter / pplx / deepep_* /
+    # flashinfer, but all2all.py defines no such classes and they raise
+    # ImportError.
+    #
+    # In practice only "mori" works end to end today. "flydsl" selects and
+    # builds its handle (the kwargs are filtered to its signature) but then
+    # fails in the forward:
+    #
+    #   TypeError: FlyDSLDispatchCombineIntraNodeOp.dispatch() takes from 5 to
+    #   6 positional arguments but 7 were given
+    #
+    # because MoriPrepareAndFinalize is written against MoRI's op contract:
+    #   mori.dispatch(input, weights, scales, indices, block_num,
+    #                 rdma_block_num, warp_per_block, ...) -> 4 values
+    #   flydsl.dispatch(input, weights, scales, indices, packed_recv_x)
+    #   flydsl.combine(input, weights, indices, packed_recv_x, cur_tok)
+    # Different arity, no tuning params, a caller-supplied receive buffer, and
+    # a different combine. Using it needs a FlyDSLPrepareAndFinalize, not a
+    # flag. Left selectable because that adapter is the only missing piece.
+    "ATOM_ALL2ALL_BACKEND": lambda: os.getenv("ATOM_ALL2ALL_BACKEND", ""),
+    # Force the expert-parallel MoE off MoRI's all-to-all and onto the DP
+    # all_gather / reduce path (moe.py:3697-3705, "mode 3"). Correct but
+    # slower: every rank sees every token instead of only the tokens routed to
+    # its experts.
+    #
+    # Exists because MoRI's all-to-all misbehaves when TWO expert-parallel
+    # groups share a GPU, which is exactly what rapidserve creates — a prefill
+    # process and a decode process per device, each with its own EP group and
+    # its own MoRI symmetric heap. Measured: DPA+EP alone is correct, and
+    # rapidserve+EP with the all-to-all disabled (dp_size=1) is correct, but
+    # rapidserve+DPA+EP produces garbage after the first token, which is the
+    # only combination with two groups per GPU.
+    "ATOM_DISABLE_MORI_ALL2ALL": lambda: (
+        os.getenv("ATOM_DISABLE_MORI_ALL2ALL", "0") == "1"
+    ),
     # Prefix for process titles set via set_process_title (shown in ps/top/rocm-smi)
     "ATOM_PROCESS_NAME_PREFIX": lambda: os.getenv("ATOM_PROCESS_NAME_PREFIX", "ATOM"),
     # SGLang's GLM-5.2 and DeepSeek V4 prefill CP paths still force

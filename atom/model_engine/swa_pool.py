@@ -39,7 +39,6 @@ class SlidingWindowPool:
         full_retain: bool = False,
         retention_interval: int = 0,
         checkpoint_frac: float = 0.5,
-        reserve_dump_blocks: int = 0,
     ):
         self.enabled: bool = num_blocks > 0
         self.window: int = window
@@ -83,24 +82,7 @@ class SlidingWindowPool:
         )
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
         self.hash_to_block_id: dict[int, int] = dict()
-        # Asymmetric rapidserve keeps SWA blocks [0, reserve_dump_blocks)
-        # permanently unallocated as the write sink for masked prefill TP ranks.
-        # A whole batch's worth, not one block: the sink is READ BACK during
-        # prefill attention, so dumped rows must not alias each other — see
-        # block_manager.dump_block_count.
-        #
-        # Clamping to num_blocks here was wrong: with a 1088-block SWA pool and
-        # a 1536-block request it reserved the ENTIRE pool and left zero blocks
-        # free, so no sequence could ever be admitted — a silent hang rather
-        # than an error. Refuse instead; the caller sizes the request.
-        if num_blocks > 0 and reserve_dump_blocks >= num_blocks:
-            raise ValueError(
-                f"SWA dump region ({reserve_dump_blocks} blocks) does not fit in "
-                f"the SWA pool ({num_blocks} blocks) — reserving it would leave "
-                f"nothing allocatable. Lower --max-num-seqs or "
-                f"--max-num-batched-tokens, or raise the SWA pool size."
-            )
-        first_free = reserve_dump_blocks if num_blocks > 0 else 0
+        first_free = 0
         self.free_block_ids: deque[int] = deque(range(first_free, num_blocks))
         self.free_block_ids_set: set[int] = set(range(first_free, num_blocks))
         self.used_block_ids: set[int] = set()

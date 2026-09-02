@@ -119,7 +119,13 @@ class FusedMoEParallelConfig:
 
     @property
     def use_all2all_kernels(self):
-        # Only use mori all2all kernels when expert parallel is enabled
+        # Only use mori all2all kernels when expert parallel is enabled.
+        # ATOM_DISABLE_MORI_ALL2ALL falls back to the DP all_gather/reduce path
+        # (mode 3 in the forward below) — correct, slower, and the only way to
+        # run EP when two EP groups share a GPU, as under rapidserve. See the
+        # env var's note in atom/utils/envs.py.
+        if envs.ATOM_DISABLE_MORI_ALL2ALL:
+            return False
         return self.dp_size > 1 and self.use_ep and _has_module("mori")
 
     @property
@@ -213,6 +219,70 @@ class FusedMoEParallelConfig:
             local_ep_size=atom_config.parallel_config.data_parallel_size_local
             * tp_size_,
         )
+
+
+def _filter_all2all_kwargs(manager, kwargs: dict) -> dict:
+    """Drop kwargs the chosen all-to-all backend does not accept.
+
+    The arg set is backend-specific: MoRI's _make_all2all_kwargs takes
+    `gpu_per_node`, FlyDSL's does not, and passing it raises
+
+        TypeError: FlyDSLAll2AllManager._make_all2all_kwargs() got an
+        unexpected keyword argument 'gpu_per_node'
+
+    Filtering against the signature rather than special-casing a name keeps
+    any future backend working. Only ever removes keys the callee could not
+    have accepted anyway — a missing REQUIRED arg still raises, loudly.
+    """
+    import inspect
+
+    fn = getattr(type(manager), "_make_all2all_kwargs", None)
+    if fn is None:
+        return kwargs
+    params = inspect.signature(fn).parameters
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return kwargs
+    accepted = {k: v for k, v in kwargs.items() if k in params}
+    dropped = sorted(set(kwargs) - set(accepted))
+    if dropped:
+        logger.info(
+            "all2all backend %s does not take %s; dropping",
+            type(manager).__name__,
+            dropped,
+        )
+    return accepted
+
+
+def _resolve_all2all_manager(ep_group):
+    """Return the EP all-to-all manager, honouring ATOM_ALL2ALL_BACKEND.
+
+    aiter hardcodes the backend to "mori" and leaves its config-driven
+    selection commented out (base_device_communicator.py:112-126), so the only
+    way to choose another is to set the attribute before the lazily-built
+    `all2all_manager` property is first read. Doing it here, at the single read
+    site, is what guarantees "before".
+    """
+    comm = ep_group.device_communicator
+    want = envs.ATOM_ALL2ALL_BACKEND
+    if want and want != getattr(comm, "all2all_backend", None):
+        if getattr(comm, "_all2all_manager_created", False):
+            # Already built with the default; setting it now would be ignored
+            # and the caller would silently get the wrong backend.
+            logger.warning(
+                "ATOM_ALL2ALL_BACKEND=%s ignored: the %s all2all manager was "
+                "already created. Something read all2all_manager before this "
+                "call site.",
+                want,
+                comm.all2all_backend,
+            )
+        else:
+            logger.info(
+                "EP all-to-all backend: %s (aiter default is %s)",
+                want,
+                comm.all2all_backend,
+            )
+            comm.all2all_backend = want
+    return comm.all2all_manager
 
 
 def naive_multicast_fake(
@@ -471,7 +541,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
     ) -> FusedMoEPrepareAndFinalize | None:
         from aiter.dist.parallel_state import get_ep_group
 
-        all2all_manager = get_ep_group().device_communicator.all2all_manager
+        all2all_manager = _resolve_all2all_manager(get_ep_group())
         assert all2all_manager is not None
 
         prepare_finalize: FusedMoEPrepareAndFinalize | None = None
@@ -532,7 +602,9 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             )
             from atom.utils.tbo.ubatching import tbo_enabled
 
-            handle = all2all_manager.get_handle(all_to_all_args)
+            handle = all2all_manager.get_handle(
+                _filter_all2all_kwargs(all2all_manager, all_to_all_args)
+            )
             is_async = tbo_enabled()
             atom_config = get_current_atom_config()
             low_latency = getattr(atom_config, "enable_low_latency", False)

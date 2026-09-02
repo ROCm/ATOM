@@ -857,42 +857,9 @@ class ModelRunner:
         Override point: subclasses (e.g. the rapidserve decode process) may
         construct on the meta device and import weights via IPC instead.
         """
-        config = self.config
-        # Asymmetric rapidserve: prefill produces decode's TP=1 weights as well
-        # as its own TP=N shards, from this one checkpoint pass. The twins have
-        # to exist BEFORE the load (they are fed by the same weight_loader call)
-        # and their constructor arguments have to be captured while the real
-        # model is built. See atom/model_engine/decode_twins.py.
-        build_twins = getattr(config, "disagg_prefill_tp_size", 0) > 1 and not getattr(
-            config, "disagg_is_decode", False
-        )
-        if build_twins:
-            from atom.model_engine.decode_twins import DecodeTwins, record_ctor_args
-
-            with record_ctor_args():
-                self.model = model_class(config)
-            # Built while the default device is still this rank's GPU — the same
-            # state the real model was constructed under. Doing it after the
-            # reset below lands every twin parameter on CPU, and the failure only
-            # surfaces much later at export ("_share_cuda_: only available on
-            # CUDA").
-            self.decode_twins = DecodeTwins.build(self.model, self.device)
-            torch.set_default_device(None)
-        else:
-            self.model = model_class(config)
-            torch.set_default_device(None)
+        self.model = model_class(self.config)
+        torch.set_default_device(None)
         self._load_weights_from_disk()
-        if build_twins:
-            self.decode_twins.drop_replicated_bare(self.model)
-            # Before finalize(): post-processing makes the two sides
-            # legitimately differ, so this is the only point where the twin and
-            # the shard are comparable at all.
-            self.decode_twins.verify_against_shards(self.model, self.rank)
-            self.decode_twins.finalize(self.model)
-            # And after finalize: bytes being right says nothing about whether
-            # TP=1 post-processing produced a layout that computes the same
-            # function. Reports only.
-            self.decode_twins.verify_post_processing(self.model, self.rank)
 
     def _load_weights_from_disk(self):
         """Fill this rank's parameters from the checkpoint.
@@ -4172,11 +4139,11 @@ class ModelRunner:
 # for itself, so prefill ships them alongside the tensors.
 #
 # num_kv_heads is here because _prepare_kv_dims computes it as
-# `num_key_value_heads // self.world_size` (model_runner.py:1889-1894), and under
-# ASYMMETRIC rapidserve the two processes disagree: prefill is TP=8, decode TP=1,
-# so decode would derive an 8x larger value and bind views that size over
-# prefill's allocation. MLA/V4 never reads it (the KV latent is head-independent,
-# so its shapes carry no head term), but the MHA backends size their KV with it
+# `num_key_value_heads // self.world_size` (model_runner.py:1889-1894). The two
+# processes run the same shape today, but if their world sizes ever diverge the
+# consumer would bind views of the wrong size over the producer's allocation.
+# MLA/V4 never reads it (the KV latent is head-independent, so its shapes carry
+# no head term), but the MHA backends size their KV with it
 # (aiter_attention.py:676,685 / triton_mha.py:125,132) — the producer's value is
 # the only correct one for any backend that does.
 _KV_DIM_ATTRS = ("num_swa_blocks", "max_per_req_cache_slots", "num_kv_heads")
@@ -4201,54 +4168,67 @@ class RapidServeModelRunner(ModelRunner):
         # rank, and prefill and decode have to derive the same session id or
         # they name different files.
         self._disagg_session_id = hashlib.md5(
-            config.disagg_d2p_addr.encode()
+            "|".join(config.disagg_d2p_addrs).encode()
         ).hexdigest()[:12]
 
     @property
-    def _disagg_pair_rank(self) -> int:
-        """Index into the per-prefill-TP-rank IPC handle files.
+    def _disagg_gpu_index(self) -> int:
+        """Which physical GPU this worker is on — the IPC pairing key.
 
-        Prefill writes one file per TP rank and its TP rank IS its GPU, so a
-        prefill worker uses `self.rank`. A decode worker has to name the prefill
-        rank sharing ITS GPU, which is where the handle it must open was
-        exported — so this is a GPU index, not a rank index, and it has to
-        account for both ways decode spreads over GPUs:
-          - symmetric rapidserve: ONE decode process at TP=N, so worker `r` is
-            on GPU r and `disagg_decode_rank` is 0 for all of them;
-          - asymmetric rapidserve: N decode processes at TP=1, so `self.rank` is
-            always 0 and `disagg_decode_rank` alone carries the GPU.
-        Both are `disagg_decode_rank * stage_span + rank` (disagg_types.
-        disagg_pair_rank), the same arithmetic _setup_device_and_distributed uses
-        for the device itself. Deriving it from the config rather than reading
-        `self.device.index` keeps _assert_disagg_pairing below an independent
-        cross-check.
+        A CUDA IPC handle is only openable on the device that produced it, so
+        prefill and decode must agree on this exactly. Both sides derive it the
+        same way `_setup_device_and_distributed` derives the device itself
+        (`model_runner.py:970-983`), via the shared pure helper in disagg_types:
+
+          - symmetric rapidserve: one process at TP=N, `data_parallel_rank_local`
+            is 0 and `rank` (0..N-1) is the GPU;
+          - paired rapidserve: N processes at TP=1, `rank` is always 0 and
+            `data_parallel_rank_local` is the GPU.
+
+        Deriving it from the config rather than reading `self.device.index`
+        keeps `_assert_disagg_pairing` an independent cross-check.
         """
-        if self.config.disagg_is_decode:
-            from atom.model_engine.disagg_types import disagg_pair_rank
+        from atom.model_engine.disagg_types import disagg_pair_rank
 
-            return disagg_pair_rank(
-                self.config.disagg_decode_rank,
-                self.rank,
-                self.config.tensor_parallel_size
-                * self.config.prefill_context_parallel_size,
-            )
+        pc = self.config.parallel_config
+        return disagg_pair_rank(
+            getattr(pc, "data_parallel_rank_local", 0) or 0,
+            self.rank,
+            self.config.tensor_parallel_size
+            * self.config.prefill_context_parallel_size,
+        )
+
+    @property
+    def _disagg_paths_index(self) -> int:
+        """Index into the handle-file list published by the PAIRED prefill.
+
+        NOT the GPU index. The list has one entry per worker of the prefill
+        process this one is paired with, so the right index is this worker's
+        position within that process:
+
+          - symmetric: prefill has N workers, decode worker r pairs with prefill
+            worker r -> r;
+          - paired: prefill has ONE worker, so -> 0, which `self.rank` already is.
+
+        The two coincide whenever prefill is a single process, which is why they
+        were one property until prefill itself became data-parallel.
+        """
         return self.rank
 
     def _assert_disagg_pairing(self) -> None:
         """The producer and consumer of an IPC handle must be on the SAME GPU.
 
         CUDA IPC handles are per-device, so the pairing invariant is
-        `device.index == _disagg_pair_rank` on both sides. It is easy to break
+        `device.index == _disagg_gpu_index` on both sides. It is easy to break
         from far away — a decode process gets its GPU from
         `data_parallel_rank_local` (model_runner.py:985-1003), so forgetting to
         set that silently lands every rank on cuda:0 and the failure surfaces
         much later as "storage on different device". Check it where the meaning
         is local instead.
 
-        Checked in BOTH topologies. It used to be asymmetric-only, which is how
-        a decode worker indexing the handle files by decode rank alone — always
-        0 under symmetric rapidserve, so every TP rank opened rank 0's file —
-        got past this point and died deep inside the import instead.
+        Checked in BOTH topologies. It was once gated to one of them, which is
+        how a decode worker indexing the handle files wrongly got past this
+        point and died deep inside the import instead.
 
         Assumes prefill TP rank p sits on cuda:p, i.e. rapidserve owns GPUs
         starting at 0. DisaggCoreManager builds both configs that way (it
@@ -4256,15 +4236,16 @@ class RapidServeModelRunner(ModelRunner):
         pinned to a non-zero GPU base via ATOM_DP_RANK_LOCAL is out of scope
         for rapidserve rather than a false positive here.
         """
-        want = self._disagg_pair_rank
+        want = self._disagg_gpu_index
         got = self.device.index
         if got != want:
             role = "decode" if self.config.disagg_is_decode else "prefill"
             raise RuntimeError(
                 f"rapidserve {role} pairing broken: this worker is on "
-                f"cuda:{got} but is paired with prefill TP rank {want} (cuda:"
-                f"{want}). CUDA IPC handles are per-device, so the import would "
-                f"fail or alias the wrong GPU's memory. Check "
+                f"cuda:{got} but its config puts it on cuda:{want}, which is "
+                f"the GPU it must share with its paired process. CUDA IPC "
+                f"handles are per-device, so the import would fail or alias "
+                f"the wrong GPU's memory. Check "
                 f"parallel_config.data_parallel_rank_local for this process."
             )
 
@@ -4305,9 +4286,8 @@ class RapidServeModelRunner(ModelRunner):
             super()._build_and_load_model(model_class)
             return
         # Decode imports prefill's weights via CUDA IPC and owns no weight
-        # memory at all — including under an asymmetric topology, where prefill
-        # exports TP=1 twins for the tensors decode cannot share (see
-        # decode_twins.py). Build on the meta device so construction allocates
+        # memory at all — prefill
+        # Build on the meta device so construction allocates
         # zero GPU bytes (avoids the transient 2x-weights peak that OOMs at
         # TP=4); import_model_weight_ipc_handles() materializes every parameter
         # from prefill, and RoPE caches are recomputed locally.
@@ -4390,7 +4370,7 @@ class RapidServeModelRunner(ModelRunner):
     #   /tmp/atom_disagg_<tag>_rank<N>.pkl
     # Rank 0 waits until all N files exist, then returns the list of paths to
     # the engine.  On the import side every worker reads the file written by the
-    # prefill rank on ITS GPU (index=_disagg_pair_rank).
+    # prefill rank on ITS GPU (index=_disagg_paths_index).
     # ------------------------------------------------------------------
 
     def _disagg_rank_file_path(self, tag: str, rank: int) -> str:
@@ -4411,20 +4391,29 @@ class RapidServeModelRunner(ModelRunner):
         """
         import pickle
 
-        path = self._disagg_rank_file_path(tag, self.rank)
+        path = self._disagg_rank_file_path(tag, self._disagg_gpu_index)
         with open(path, "wb") as f:
             pickle.dump(payload, f)
         return path
 
     def _disagg_collect_rank_files(self, tag: str) -> list[str] | None:
-        """Rank 0: poll until all world_size rank files exist, return paths.
+        """Rank 0: poll until this process's worker files exist, return paths.
         Other ranks: return None immediately (rank 0 is the sole publisher).
+
+        The files are keyed by GPU, not by worker rank, so that N data-parallel
+        prefill processes — every one of them rank 0 — cannot collide on a
+        single name. This process's workers occupy a contiguous GPU run starting
+        at its own base, and the returned list is ordered by worker rank so the
+        paired consumer can index it with `_disagg_paths_index`.
         """
         import time
 
         if self.rank != 0:
             return None
-        paths = [self._disagg_rank_file_path(tag, r) for r in range(self.world_size)]
+        base = self._disagg_gpu_index - self.rank
+        paths = [
+            self._disagg_rank_file_path(tag, base + r) for r in range(self.world_size)
+        ]
         deadline = time.monotonic() + 120  # 2 min timeout
         while time.monotonic() < deadline:
             if all(os.path.exists(p) for p in paths):
@@ -4449,13 +4438,10 @@ class RapidServeModelRunner(ModelRunner):
         # Held for the life of the process: decode's parameters are IPC views
         # into these allocations, so anything the export materialised (a
         # `.contiguous()` copy of a non-contiguous tensor) must not be collected
-        # here or the consumer reads freed memory. The twins themselves are kept
-        # alive by `self.decode_twins`.
+        # here or the consumer reads freed memory.
         self._disagg_export_retain = []
         handles = export_model_weight_handles(
-            self.model,
-            twins=getattr(self, "decode_twins", None),
-            retain=self._disagg_export_retain,
+            self.model, retain=self._disagg_export_retain
         )
         if self._disagg_export_retain:
             logger.info(
@@ -4473,13 +4459,11 @@ class RapidServeModelRunner(ModelRunner):
         """Replace model parameters with views into prefill's GPU allocation.
 
         Each worker reads the handles file written by the prefill rank on its own
-        GPU (index=_disagg_pair_rank) and deletes it after import — producer and
+        GPU (index=_disagg_paths_index) and deletes it after import — producer and
         consumer being co-located is what makes the IPC handle valid.
 
-        Aliases EVERY parameter, symmetric or asymmetric. Under an asymmetric
-        topology prefill exported TP=1 twins for the tensors whose shape differs
-        (decode_twins.py), so by the time the handles arrive there is nothing
-        left for decode to load.
+        Aliases EVERY parameter: prefill and decode run the same parallel
+        shape, so every tensor matches and decode loads nothing itself.
 
         Returns True as sentinel for wait_out=True.
         """
@@ -4489,7 +4473,7 @@ class RapidServeModelRunner(ModelRunner):
         from atom.model_engine.ipc_utils import import_model_weights
 
         self._assert_disagg_pairing()
-        path = paths[self._disagg_pair_rank]
+        path = paths[self._disagg_paths_index]
         logger.info(f"ModelRunner rank {self.rank}: reading weight handles from {path}")
         with open(path, "rb") as f:
             handles = pickle.load(f)
@@ -4528,10 +4512,54 @@ class RapidServeModelRunner(ModelRunner):
                 f"ModelRunner rank {self.rank}: {len(leftover)} tensors still on "
                 f"meta after IPC import (not materialized): {leftover[:10]}"
             )
+        self._init_moe_all2all_after_import()
         logger.info(
             f"ModelRunner rank {self.rank}: weight IPC import complete — own weights freed"
         )
         return True
+
+    def _init_moe_all2all_after_import(self) -> None:
+        """Build decode's MoE all-to-all path, which load_model would have built.
+
+        `init_prepare_finalize` constructs the modular kernel that performs
+        expert-parallel dispatch/combine, and it is reachable from exactly one
+        place: load_model's post-processing loop (model_loader/loader.py). Decode
+        never calls load_model — it builds on meta and imports prefill's weights —
+        so without this its `fused_experts` stays None and moe.py:1490 falls back
+        to a purely local fused_moe with no all-to-all and no DP gather (that
+        gather needs `not use_all2all_kernels`, so enabling MoRI removes it too).
+        Under expert parallelism each rank owns only a slice of the experts, so
+        every token routed to another rank's experts silently contributes nothing:
+        prefill's first token is correct and every decode token is wrong.
+
+        Runs after the IPC import because get_fused_moe_quant_config() reads the
+        materialized weights. Deliberately does NOT re-run
+        process_weights_after_loading(): prefill exports weights already
+        post-processed, and shuffling/swizzling them a second time corrupts them.
+
+        A no-op when the MoE needs no all-to-all — maybe_make_prepare_finalize()
+        returns None unless `use_all2all_kernels`, so TP-sharded MoE and the
+        ATOM_DISABLE_MORI_ALL2ALL bypass are unaffected.
+        """
+        from atom.model_ops.moe import FusedMoEMethodBase
+
+        built = 0
+        seen = 0
+        for module in self.model.modules():
+            quant_method = getattr(module, "quant_method", None)
+            if not isinstance(quant_method, FusedMoEMethodBase):
+                continue
+            seen += 1
+            if quant_method.using_modular_kernel:
+                continue  # init_prepare_finalize asserts it runs once
+            quant_method.init_prepare_finalize(module)
+            if quant_method.using_modular_kernel:
+                built += 1
+        if seen:
+            logger.info(
+                f"[MOE-COMM] rank {self.rank}: built all-to-all for {built}/{seen} "
+                f"MoE layers after IPC import"
+            )
 
     def export_kv_cache_ipc_handle(self) -> list[str] | None:
         """Export every KV tensor this backend allocated, as CUDA IPC handles.
@@ -4593,7 +4621,7 @@ class RapidServeModelRunner(ModelRunner):
         without further changes.
 
         TP-aware: each worker reads the handles file written by the prefill rank
-        on its own GPU (index=_disagg_pair_rank) and deletes it after import.
+        on its own GPU (index=_disagg_paths_index) and deletes it after import.
         Returns True as sentinel for wait_out=True.
         """
         import pickle
@@ -4609,7 +4637,7 @@ class RapidServeModelRunner(ModelRunner):
         # overwrite has to land before _bind_kv_tensors.
         self._prepare_kv_dims(num_kvcache_blocks)
         self._assert_disagg_pairing()
-        path = paths[self._disagg_pair_rank]
+        path = paths[self._disagg_paths_index]
         logger.info(
             f"ModelRunner rank {self.rank}: reading kvcache handles from {path}"
         )

@@ -209,14 +209,42 @@ def _moe_placement(mod: nn.Module) -> tuple | None:
     )
 
 
+def _moe_attr_inventory(model: nn.Module) -> dict:
+    """{module: {attr: type-name}} for every MoE module, names and types only.
+
+    A diagnostic, not a transport. The export below carries Parameters,
+    buffers, plain CUDA tensors and scalar metadata — but deliberately drops
+    underscore-prefixed names and any value that is neither a tensor nor a
+    str/bool/int/float. Expert-parallel MoE has more post-load state than the
+    tensor-parallel path, and a single missing kernel-selection attribute
+    produces wrong results with no error (see _tensor_meta_attrs on
+    `is_shuffled`). This lets the consumer say WHICH attribute it is missing
+    instead of leaving it to inference.
+    """
+    out: dict[str, dict] = {}
+    for name, mod in model.named_modules():
+        if not (hasattr(mod, "ep_size") and hasattr(mod, "ep_rank")):
+            continue
+        skip = (
+            "_parameters",
+            "_buffers",
+            "_modules",
+            "_non_persistent_buffers_set",
+        )
+        out[name] = {
+            k: type(v).__name__
+            for k, v in mod.__dict__.items()
+            if k not in skip
+        }
+    return out
+
+
 def _expert_placement(model: nn.Module) -> dict:
     """Per-MoE-module sharding identity, for cross-checking across the alias.
 
-    Under asymmetric rapidserve the two processes reach the same MoE sharding by
-    different routes — prefill via plain TP (`tp_size=8, tp_rank=rank`), decode
-    via the DP-attention flatten (`flatten_tp_across_dp`, moe.py:133-139, giving
-    `tp_size = dp*tp, tp_rank = dp_rank`). Both land on the same split with the
-    same rank-to-GPU binding, so rank k holds the same slice in both.
+    Prefill and decode run the same parallel shape, so they must land on the
+    same MoE split with the same rank-to-GPU binding — rank k holds the same
+    slice on both sides.
 
     WHICH split that is depends on `--enable-expert-parallel` (off by default,
     config.py:1328). With it OFF the experts are TENSOR-sharded on the
@@ -241,7 +269,7 @@ def _expert_placement(model: nn.Module) -> dict:
 
 
 def export_model_weight_handles(
-    model: nn.Module, twins=None, retain: list | None = None
+    model: nn.Module, retain: list | None = None
 ) -> dict:
     """Export all model parameter tensors as CUDA IPC handles.
 
@@ -300,32 +328,15 @@ def export_model_weight_handles(
         if mattrs:
             module_attrs[mod_name] = mattrs
 
-    # Asymmetric rapidserve: overlay the TP=1 twins. Same names, so the consumer
-    # needs no special case — it just receives a full matrix where the producer's
-    # own parameter is a shard. Done last so a twin always wins.
-    n_overlaid = 0
-    if twins is not None:
-        for name, tensor in twins.overrides().items():
-            key = f"__param__{name}"
-            handles[key] = _export_tensor(tensor, retain)
-            attrs = _tensor_meta_attrs(tensor)
-            if attrs:
-                tensor_attrs[key] = attrs
-            n_overlaid += 1
-
     handles[_META_KEY] = {
         "tensor_attrs": tensor_attrs,
         "module_attrs": module_attrs,
-        # Authoritative, unlike `module_attrs`: these come from the TP=1 twins,
-        # so they must OVERRIDE whatever the consumer set at construction rather
-        # than only filling gaps. See DecodeTwins.module_attr_overrides.
-        "twin_module_attrs": (twins.module_attr_overrides() if twins else {}),
         "expert_placement": _expert_placement(model),
+        "moe_attrs": _moe_attr_inventory(model),
     }
     logger.info(
         f"[WT-EXPORT] {len(handles) - 1} tensors, "
-        f"{len(tensor_attrs)} with attrs, {len(module_attrs)} modules with attrs, "
-        f"{n_overlaid} overlaid from TP=1 twins"
+        f"{len(tensor_attrs)} with attrs, {len(module_attrs)} modules with attrs"
     )
     return handles
 
@@ -364,6 +375,53 @@ def _assert_expert_placement_matches(model: nn.Module, producer: dict) -> None:
         )
 
 
+def _report_moe_attr_gaps(model: nn.Module, producer: dict) -> None:
+    """Name the MoE state that did not survive the handoff, if any.
+
+    Expert-parallel MoE carries post-load state the tensor-parallel path does
+    not, and the transport deliberately drops underscore-prefixed names and
+    values that are neither tensors nor str/bool/int/float. A single missing
+    kernel-selection attribute gives wrong results with no error, so report the
+    difference rather than leaving it to be inferred from bad output.
+
+    Diagnostic only — it never raises. Some differences are legitimate (the
+    consumer builds its own modules, so identity-typed entries can differ).
+    """
+    if not producer:
+        return
+    missing: list[str] = []
+    retyped: list[str] = []
+    for mod_name, attrs in producer.items():
+        try:
+            mod = model.get_submodule(mod_name)
+        except AttributeError:
+            continue
+        have = mod.__dict__
+        for attr, tname in attrs.items():
+            if attr not in have:
+                missing.append(f"{mod_name}.{attr}:{tname}")
+            elif type(have[attr]).__name__ != tname:
+                retyped.append(
+                    f"{mod_name}.{attr}:{tname}->{type(have[attr]).__name__}"
+                )
+    if missing or retyped:
+        logger.warning(
+            "[WT-IMPORT] MoE state gap after import: %d attribute(s) the "
+            "producer had are absent here, %d differ in type. Absent: %s. "
+            "Retyped: %s",
+            len(missing),
+            len(retyped),
+            sorted(set(missing))[:12],
+            sorted(set(retyped))[:12],
+        )
+    else:
+        logger.info(
+            "[WT-IMPORT] MoE state complete: every attribute across %d MoE "
+            "module(s) survived the handoff",
+            len(producer),
+        )
+
+
 def import_model_weights(model: nn.Module, handles: dict) -> None:
     """Replace model parameters with views into another process's GPU allocation.
 
@@ -375,8 +433,7 @@ def import_model_weights(model: nn.Module, handles: dict) -> None:
     are allocated.  The decode process's original weight tensors are freed when
     their reference counts drop to zero.
 
-    Under asymmetric rapidserve the producer exports TP=1 twins for the tensors
-    whose shape differs (decode_twins.py), so every entry aliases and the
+    Prefill and decode run the same parallel shape, so every entry aliases and the
     consumer allocates nothing.
     """
     _import_model_weights_impl(model, handles)
@@ -470,23 +527,11 @@ def _import_model_weights_impl(model: nn.Module, handles: dict) -> None:
         for k, v in attrs.items():
             setattr(mod, k, v)
             restored_mod_attrs += 1
-    # Twin attributes are authoritative: the consumer runs TP=1 and never ran
-    # the post-load hook, so its own values (e.g. is_output_padded=False from
-    # __init__) are stale, not a computed result to preserve.
-    twin_attrs = sidecar.get("twin_module_attrs", {})
-    forced = 0
-    for mod_name, attrs in twin_attrs.items():
-        mod = modules.get(mod_name)
-        if mod is None:
-            continue
-        for k, v in attrs.items():
-            setattr(mod, k, v)
-            forced += 1
     logger.info(
         f"[WT-IMPORT] restored {sum(len(a) for a in tensor_attrs.values())} tensor "
-        f"attrs and {restored_mod_attrs} module attrs from the producer; "
-        f"forced {forced} attr(s) from {len(twin_attrs)} TP=1 twin(s)"
+        f"attrs and {restored_mod_attrs} module attrs from the producer"
     )
+    _report_moe_attr_gaps(model, sidecar.get("moe_attrs", {}))
     # A post-load hook may DELETE a parameter on the producer — V4's attention
     # dequants wo_a to BF16 and then `delattr(self.wo_a, "weight_scale")`
     # (deepseek_v4.py:2453). The consumer built on meta and never ran that hook,

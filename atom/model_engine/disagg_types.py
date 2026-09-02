@@ -29,8 +29,8 @@ def disagg_pair_rank(decode_rank: int, worker_rank: int, stage_span: int) -> int
 
     - symmetric: ONE decode process at TP=N, so `worker_rank` (0..N-1) is the
       GPU and `decode_rank` is 0 for every worker;
-    - asymmetric: N decode processes at TP=1, so `worker_rank` is always 0 and
-      `decode_rank` is the GPU.
+    - paired: N processes per side at TP=1, so `worker_rank` is always 0 and
+      the process's DP rank is the GPU.
 
     Dropping either term collapses one topology onto GPU 0. `stage_span` is
     tp*pcp, matching ModelRunner._setup_device_and_distributed.

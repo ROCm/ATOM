@@ -1,0 +1,104 @@
+{
+  "args": {
+    "url": "http://localhost:8000/v1/completions",
+    "model": "deepseek-ai/DeepSeek-V4-Pro",
+    "mode": "facts",
+    "n": 32,
+    "max_tokens": 64,
+    "temperature": 0.0,
+    "timeout": 600.0,
+    "seed": 0,
+    "sequential": true,
+    "show_text": false,
+    "save": "dpa_alone.json",
+    "compare": null
+  },
+  "prompts": [
+    "The capital of France is",
+    "2 + 2 =",
+    "The largest planet in our solar system is",
+    "Water freezes at 0 degrees",
+    "The chemical symbol for gold is",
+    "The author of 'Romeo and Juliet' is",
+    "There are how many days in a leap year? Answer:",
+    "The square root of 81 is",
+    "The primary colour made by mixing blue and yellow is",
+    "The first person to walk on the moon was",
+    "10 * 12 =",
+    "The ocean between Europe and North America is the"
+  ],
+  "results": [
+    {
+      "ok": true,
+      "text": " Paris. The capital of Italy is Rome. The capital of Germany is Berlin. The capital of Spain is Madrid. The capital of Portugal is Lisbon. The capital of Belgium is Brussels. The capital of Austria is Vienna. The capital of Switzerland is Bern. The capital of the Netherlands is Amsterdam. The capital of Greece is",
+      "finish_reason": "max_tokens",
+      "latency": 2.001503899693489
+    },
+    {
+      "ok": true,
+      "text": " 4\n    // 2 + 2 = 4\n    // 2 + 2 = 4\n    // 2 + 2 = 4\n    // 2 + 2 = 4\n    // 2 + 2 = 4\n    // 2 + ",
+      "finish_reason": "max_tokens",
+      "latency": 2.003118126653135
+    },
+    {
+      "ok": true,
+      "text": " Jupiter. It is so big that more than 1,300 Earths could fit inside it! Jupiter is a gas giant, which means it is mostly made up of gas. The gas is so thick that it looks like a giant ball of cotton candy. Jupiter has a Great Red Spot, which is a giant storm",
+      "finish_reason": "max_tokens",
+      "latency": 2.0249654804356396
+    },
+    {
+      "ok": true,
+      "text": " Celsius and boils at 100 degrees C, while in Fahrenheit, water freezes at 32 degrees F and boils at 212 degrees F. You see that Celsius has 100 degrees between the freezing and boiling point, whereas Fahrenheit has 180 degrees between these two points. One degree Celsius is 1.8 times",
+      "finish_reason": "max_tokens",
+      "latency": 2.0020691361278296
+    },
+    {
+      "ok": true,
+      "text": " Au, from the Latin aurum meaning \u201cshining dawn.\u201d Aurora was the Roman goddess of dawn which links to the warm, yellow color of gold. Gold is a relatively rare element and is a precious metal that has been used for coinage, jewelry, and other arts. In the past, a gold standard was",
+      "finish_reason": "max_tokens",
+      "latency": 2.0281168348155916
+    },
+    {
+      "ok": true,
+      "text": " William Shakespeare.\",\"variants\":[],\"id\":\"trivia-176\",\"category\":\"Art\",\"subcategory\":\"Literature\",\"createdAt\":\"2025-03-26T22:46:46.893Z\",\"updatedAt\":\"2025-03-26T22:46:46.893Z\",\"correct",
+      "finish_reason": "max_tokens",
+      "latency": 2.313550019171089
+    },
+    {
+      "ok": true,
+      "text": " 366\nWhat is the capital of the United States? Answer: Washington, D.C.\nWhat is the largest planet in our solar system? Answer: Jupiter\nWhat is the smallest planet in our solar system? Answer: Mercury\nWhat is the largest country in the world by area? Answer: Russia\nWhat is",
+      "finish_reason": "max_tokens",
+      "latency": 2.319921358022839
+    },
+    {
+      "ok": true,
+      "text": " 9.0\nThe square root of 100 is 10.0\nThe square root of 121 is 11.0\nThe square root of 144 is 12.0\nThe square root of 169 is 13.0\nThe square root of 196 is 14.0",
+      "finish_reason": "max_tokens",
+      "latency": 2.042680276092142
+    },
+    {
+      "ok": true,
+      "text": " green. \u84dd\u548c\u9ec4\u6df7\u5408\u800c\u6210\u7684\u539f\u8272\u662f\u7eff\u8272\u3002\u2016 primary school \u5c0f\u5b66\n\nprime [praim] I a. \u2460\u9996\u8981\u7684\uff0c\u4e3b\u8981\u7684\uff1aa ~ reason \u4e3b\u8981\u7684\u7406\u7531 \u2461\u6700\u597d\u7684\uff0c\u7b2c\u4e00\u6d41\u7684\uff1a~ beef \u4e0a\u7b49\u725b\u8089 II n. \u2460\u9752\u6625\uff0c\u5168\u76db\u671f\uff1ain",
+      "finish_reason": "max_tokens",
+      "latency": 2.151262084953487
+    },
+    {
+      "ok": true,
+      "text": " Neil Armstrong. He was an American astronaut who was commander of the Apollo 11 mission. Armstrong stepped onto the lunar surface on July 20, 1969. As he did so, he spoke the famous words: \\\"That's one small step for a man, one giant leap for mankind.\\\" A camera was",
+      "finish_reason": "max_tokens",
+      "latency": 2.1498595969751477
+    },
+    {
+      "ok": true,
+      "text": " 120\n    // 120 / 12 = 10\n    // 120 / 10 = 12\n    // 120 / 8 = 15\n    // 120 / 6 = 20\n    // 120 / 5 = 24\n    // 120 / ",
+      "finish_reason": "max_tokens",
+      "latency": 1.8711245879530907
+    },
+    {
+      "ok": true,
+      "text": " Atlantic Ocean. The ocean between Asia and North America is the Pacific Ocean. The ocean between Africa and Australia is the Indian Ocean. The ocean between Antarctica and South America is the Southern Ocean. The ocean between Europe and Asia is the Arctic Ocean. The ocean between North America and South America is the Caribbean Sea. The ocean",
+      "finish_reason": "max_tokens",
+      "latency": 2.1299915378913283
+    }
+  ]
+}

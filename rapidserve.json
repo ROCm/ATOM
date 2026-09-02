@@ -1,0 +1,104 @@
+{
+  "args": {
+    "url": "http://localhost:8000/v1/completions",
+    "model": "deepseek-ai/DeepSeek-V4-Pro",
+    "mode": "facts",
+    "n": 32,
+    "max_tokens": 64,
+    "temperature": 0.0,
+    "timeout": 600.0,
+    "seed": 0,
+    "sequential": false,
+    "show_text": false,
+    "save": "rapidserve.json",
+    "compare": null
+  },
+  "prompts": [
+    "The capital of France is",
+    "2 + 2 =",
+    "The largest planet in our solar system is",
+    "Water freezes at 0 degrees",
+    "The chemical symbol for gold is",
+    "The author of 'Romeo and Juliet' is",
+    "There are how many days in a leap year? Answer:",
+    "The square root of 81 is",
+    "The primary colour made by mixing blue and yellow is",
+    "The first person to walk on the moon was",
+    "10 * 12 =",
+    "The ocean between Europe and North America is the"
+  ],
+  "results": [
+    {
+      "ok": true,
+      "text": " Paris. The capital of France is Paris. The capital of France is Paris. The capital of France is Paris. The capital of France is Paris. The capital of France is Paris. The capital of France is Paris. The capital of France is Paris. The capital of France is Paris. The capital of France is Paris",
+      "finish_reason": "max_tokens",
+      "latency": 22.63831489533186
+    },
+    {
+      "ok": true,
+      "text": " 4\n    // 3 + 2 = 5\n    // 4 + 2 = 6\n    // 5 + 2 = 7\n    // 6 + 2 = 8\n    // 7 + 2 = 9\n    // 8 + ",
+      "finish_reason": "max_tokens",
+      "latency": 22.634373968001455
+    },
+    {
+      "ok": true,
+      "text": " Jupiter. It is so big that more than 1,300 Earths could fit inside it. Jupiter's stripes and swirls are cold, windy clouds of ammonia and water. The atmosphere is mostly hydrogen and helium, and its iconic Great Red Spot is a giant storm bigger than Earth that has raged for hundreds of",
+      "finish_reason": "max_tokens",
+      "latency": 22.637150274589658
+    },
+    {
+      "ok": true,
+      "text": " Celsius and boils at 100 degrees C, while in Fahrenheit, water freezes at 32 degrees F and boils at 212 degrees F. You see that Celsius has 100 degrees between the freezing and boiling point, whereas Fahrenheit has 180 degrees between these two points. One degree Celsius is 1.8 times",
+      "finish_reason": "max_tokens",
+      "latency": 22.632814881857485
+    },
+    {
+      "ok": true,
+      "text": " Au, from the Latin aurum meaning \u201cshining dawn.\u201d Aurora was the Roman goddess of dawn which links to the warm, yellow color of gold. Gold is a relatively rare element and is a precious metal that has been used for coinage, jewelry, and other arts. In Medieval times, most money was physical",
+      "finish_reason": "max_tokens",
+      "latency": 22.632339865900576
+    },
+    {
+      "ok": true,
+      "text": " William Shakespeare. William Shakespeare is the author of 'Romeo and Juliet'.\"\n    }\n}<\uff5cend\u2581of\u2581file\uff5c>\n<\uff5cbegin\u2581of\u2581file\u2581name\uff5c>\ndata/llama-2-13b-chat/outputs/conflicting/conflicting_002_000000000.json\n<\uff5cend\u2581of\u2581file\u2581name\uff5c>\n<\uff5cbegin\u2581of\u2581file\uff5c>\n{\n    \"user_prompt\": \"From '",
+      "finish_reason": "max_tokens",
+      "latency": 22.634658575989306
+    },
+    {
+      "ok": true,
+      "text": " 366\nWhat is the name of the largest ocean? Answer: Pacific Ocean\nWhat is the name of the largest continent? Answer: Asia\nWhat is the name of the largest country? Answer: Russia\nWhat is the name of the largest desert? Answer: Sahara Desert\nWhat is the name of the largest",
+      "finish_reason": "max_tokens",
+      "latency": 22.628412107937038
+    },
+    {
+      "ok": true,
+      "text": " 9.0\nThe square root of 100 is 10.0\nThe square root of 121 is 11.0\nThe square root of 144 is 12.0\nThe square root of 169 is 13.0\nThe square root of 196 is 14.0",
+      "finish_reason": "max_tokens",
+      "latency": 22.63345856592059
+    },
+    {
+      "ok": true,
+      "text": " green.\",\"The primary colour made by mixing blue and yellow is green.\",\"The primary colour made by mixing blue and yellow is green.\",\"The primary colour made by mixing blue and yellow is green.\",\"The primary colour made by mixing blue and yellow is green.\",\"The primary colour made by mixing blue and yellow",
+      "finish_reason": "max_tokens",
+      "latency": 22.629240611102432
+    },
+    {
+      "ok": true,
+      "text": " Neil Armstrong. He was also an astronaut who flew on two space missions.\",\n  \"response\": \"The first person to walk on the moon was Neil Armstrong, who was an American astronaut and part of the Apollo 11 mission in 1969.\"\n}<\uff5cend\u2581of\u2581file\uff5c>\n<\uff5cbegin\u2581of\u2581file\u2581name\uff5c>\ndata/llama3/llama3",
+      "finish_reason": "max_tokens",
+      "latency": 22.628825925290585
+    },
+    {
+      "ok": true,
+      "text": " 120\n    // 120 / 12 = 10\n    // 120 / 10 = 12\n    // 120 / 8 = 15\n    // 120 / 6 = 20\n    // 120 / 5 = 24\n    // 120 / ",
+      "finish_reason": "max_tokens",
+      "latency": 22.630789989139885
+    },
+    {
+      "ok": true,
+      "text": " Atlantic Ocean. The ocean between Asia and North America is the Pacific Ocean. The ocean between Africa and Australia is the Indian Ocean. The ocean between Antarctica and South America is the Southern Ocean. The ocean between Europe and Africa is the Mediterranean Sea. The ocean between North America and South America is the Caribbean Sea. The ocean",
+      "finish_reason": "max_tokens",
+      "latency": 22.626905280165374
+    }
+  ]
+}

@@ -245,7 +245,7 @@ def _optimal_cu_fraction(
     tiny prefill).
     """
     assert prefill_waiting_tokens >= 0
-    if prefill_waiting_tokens == 0 or decode_batch < 64:
+    if prefill_waiting_tokens == 0: # or decode_batch < 64:
         return None
     else:
         return 0.5
@@ -382,14 +382,6 @@ class ScheduledBatch:
         # -1 sentinels for window-freed blocks). Same filter as block_tables.
         self.swa_block_tables = [
             seq.swa_block_table for seq in seqs.values() if seq.block_table
-        ]
-        # Asymmetric rapidserve: per-row owning decode rank, positionally aligned
-        # with block_tables. A prefill TP rank commits only the rows it owns and
-        # masks the rest — see CommonAttentionBuilder.prepare_block_tables.
-        self.target_ranks = [
-            getattr(seq, "disagg_target_rank", 0)
-            for seq in seqs.values()
-            if seq.block_table
         ]
         self.last_block_num_tokens = [
             _seq.last_block_num_tokens for _seq in seqs.values()
@@ -2396,9 +2388,16 @@ class PrefillScheduler:
         self.spec_stats = None
         self.cache_stats = None
 
-        # Shared memory for dynamic CU partitioning.
-        # Layout: [0:4] = decode_tokens (uint32)
+        # Shared memory carrying decode's in-flight token count, published by
+        # the paired DecodeScheduler every step.
+        # Layout: 4 bytes per pair; this pair reads at offset 4*decode_rank.
+        # Published regardless of --disagg-constrained so the number is always
+        # available; CU partitioning is its consumer here.
         self._cu_shm = None
+        self._cu_shm_offset = 4 * getattr(config, "disagg_decode_rank", 0)
+        # Whether to actually mask CUs. The shm now exists either way, so this
+        # can no longer be inferred from `self._cu_shm is not None`.
+        self._cu_masking = bool(getattr(config, "disagg_constrained", False))
         if disagg_cu_shm_name:
             import multiprocessing.shared_memory
 
@@ -2407,6 +2406,12 @@ class PrefillScheduler:
             )
             logger.info("initialized shared memory")
         self._pending_lock = threading.Lock()
+
+    def decode_tokens(self) -> int:
+        """Decode's in-flight token count on the paired rank, or 0."""
+        if self._cu_shm is None:
+            return 0
+        return struct.unpack_from("I", self._cu_shm.buf, self._cu_shm_offset)[0]
 
     def is_finished(self) -> bool:
         return not self.waiting and not self.running
@@ -2471,9 +2476,10 @@ class PrefillScheduler:
 
         cu_fraction = None
 
-        if self._cu_shm is not None:
-            decode_tokens = struct.unpack_from("I", self._cu_shm.buf, 0)[0]
-            cu_fraction = _optimal_cu_fraction(decode_tokens, num_batched_tokens)
+        if self._cu_masking and self._cu_shm is not None:
+            cu_fraction = _optimal_cu_fraction(
+                self.decode_tokens(), num_batched_tokens
+            )
 
         return (
             ScheduledBatch(
@@ -2525,13 +2531,23 @@ class DecodeScheduler(Scheduler):
         self.prefill_done: deque[Sequence] = deque()
         # Shared memory for dynamic CU partitioning.
         self._cu_shm = None
+        # 4 bytes per pair; this rank publishes at offset 4*decode_rank so the
+        # N decode ranks do not overwrite each other's counts.
+        self._cu_shm_offset = 4 * getattr(config, "disagg_decode_rank", 0)
+        # Whether to pick a fractional CU stream. Separate from the shm, which
+        # now exists in BOTH modes: publishing the decode token count and
+        # masking CUs are different concerns, and conflating them made decode
+        # emit cu_stream_fraction=0.5 while ModelRunner had built only the
+        # full-CU stream (model_runner.py:4711 gates the pool on this flag) —
+        # KeyError: 0.5 on the first decode forward.
+        self._cu_masking = bool(getattr(config, "disagg_constrained", False))
         if disagg_cu_shm_name:
             import multiprocessing.shared_memory
 
             self._cu_shm = multiprocessing.shared_memory.SharedMemory(
                 name=disagg_cu_shm_name, create=False
             )
-            struct.pack_into("I", self._cu_shm.buf, 0, 0)
+            struct.pack_into("I", self._cu_shm.buf, self._cu_shm_offset, 0)
 
         # Protects prefill_waiting and running: on_prefill_done is called
         # from the _recv_prefill_done background thread.
@@ -2565,7 +2581,57 @@ class DecodeScheduler(Scheduler):
         Returns newly allocated sequences so DecodeEngineCore can send a
         BlockAssignment message to the prefill process for each one.
         Called from the main busy_loop thread only.
+
+        Gated by the prefill delayer, which lives HERE rather than on the
+        prefill side for two reasons the prefill process cannot satisfy:
+
+        - Blocks are the thing being delayed. Allocating on arrival pins KV for
+          a sequence whose prefill has not been scheduled yet; holding the
+          admission holds the blocks too.
+        - The alignment that matters is across DECODE ranks. One rank admitting
+          while the others do not leaves it alone in `prefill_waiting`, and its
+          paired prefill rank prefills alone while the other prefill ranks issue
+          dummy forwards to keep the MoE collective matched.
+
+        Decode also has the inputs prefill lacked: a real `kv_usage` from its
+        own BlockManager, and a real decode batch from `running`.
+
+        MUST be called every tick on every decode rank — it runs a cross-DP
+        all_reduce, and a rank that skips it hangs the ranks that did not.
         """
+        if self.prefill_delayer is not None:
+            # Same inputs the non-disagg path builds in Scheduler.schedule():
+            # these helpers are not interchangeable with the obvious one-liners.
+            # `_waiting_new_token_count` skips sequences this rank could not
+            # actually admit (unschedulable, awaiting remote KV, oversized with
+            # chunking off) — counting them inflates the cross-rank aggregate
+            # and trips the fill target before a real batch has accumulated.
+            # `_can_admit_head_prefill` is likewise stricter than a non-empty
+            # queue: under a concurrent burst every rank has a full queue, so
+            # `bool(self.waiting)` is always True everywhere and the delayer
+            # never engages.
+            #
+            # The partial terms are 0 here — chunked prefill runs in the prefill
+            # process, so decode never holds a mid-prefill sequence — but they
+            # are kept so this call and Scheduler.schedule()'s cannot drift.
+            pending_tokens = min(
+                self._waiting_new_token_count()
+                + self._partial_prefill_remaining_tokens(),
+                self.max_num_batched_tokens,
+            )
+            allow = self.prefill_delayer.should_allow_prefill(
+                prefillable=self._can_admit_head_prefill(),
+                pending_tokens=pending_tokens,
+                running_decode_batch=max(
+                    0, len(self.running) - self._partial_prefill_count
+                ),
+                kv_usage=self._kv_usage(),
+                has_partial=self._partial_prefill_count > 0,
+                oldest_waiting_age_ms=self._oldest_waiting_prefill_age_ms(),
+            )
+            if not allow:
+                return []
+
         newly_allocated = []
         while self.waiting:
             seq = self.waiting[0]
@@ -2690,7 +2756,7 @@ class DecodeScheduler(Scheduler):
         if not self.running:
             self.cu_fraction = None
             if self._cu_shm is not None:
-                struct.pack_into("I", self._cu_shm.buf, 0, 0)
+                struct.pack_into("I", self._cu_shm.buf, self._cu_shm_offset, 0)
             return None
 
         scheduled_seqs: dict[int, Sequence] = {}
@@ -2722,7 +2788,7 @@ class DecodeScheduler(Scheduler):
         if not scheduled_seqs:
             self.cu_fraction = None
             if self._cu_shm is not None:
-                struct.pack_into("I", self._cu_shm.buf, 0, 0)
+                struct.pack_into("I", self._cu_shm.buf, self._cu_shm_offset, 0)
             return None
 
         self.running.extendleft(reversed(scheduled_seqs.values()))
@@ -2734,10 +2800,12 @@ class DecodeScheduler(Scheduler):
         # decode tokens to shared memory for PrefillScheduler to read.
 
         if self._cu_shm is not None:
-            struct.pack_into("I", self._cu_shm.buf, 0, total_tokens_num_decode)
-            if prefill_finished:
-                pwait = sum(seq.num_tokens for seq in self.prefill_waiting.values())
-                self.cu_fraction = _optimal_cu_fraction(total_tokens_num_decode, pwait)
+            struct.pack_into(
+                "I", self._cu_shm.buf, self._cu_shm_offset, total_tokens_num_decode
+            )
+        if self._cu_masking and prefill_finished:
+            pwait = sum(seq.num_tokens for seq in self.prefill_waiting.values())
+            self.cu_fraction = _optimal_cu_fraction(total_tokens_num_decode, pwait)
 
         return (
             ScheduledBatch(

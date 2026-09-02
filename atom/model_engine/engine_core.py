@@ -476,6 +476,10 @@ class DPEngineCoreProc(EngineCore):
         Override point. The disagg decode engine defers scheduler creation until
         after the kvcache IPC import, so `self.scheduler` is still None here —
         and a decode engine has no prefill to delay in any case.
+
+        `self.dp_group` may be None (dp_size == 1) and that is fine: the delayer
+        documents a single-rank mode where it coalesces locally and skips the
+        cross-rank all_reduce (prefill_delayer.py:19-24, :293).
         """
         if not envs.ATOM_ENABLE_PREFILL_DELAYER:
             return
@@ -653,7 +657,7 @@ _SCHED_DIM_KEYS = (
 )
 
 
-class PrefillEngineCore(EngineCore):
+class PrefillEngineCore(DPEngineCoreProc):
     """Disaggregated prefill instance.
 
     Responsibilities:
@@ -670,21 +674,50 @@ class PrefillEngineCore(EngineCore):
     - Does NOT sample tokens; completed sequences are discarded here.
     """
 
+    @property
+    def _dp_lockstep(self) -> bool:
+        return getattr(self, "dp_group", None) is not None
+
+    def busy_loop(self):
+        # DP=N: DPEngineCoreProc's loop, which keeps every rank issuing a
+        # forward (real or dummy) so the MoE collectives always match. Under the
+        # paired topology there are N prefill processes sharing one DP group, so
+        # a rank with nothing to prefill must still take part.
+        # DP=1 (symmetric rapidserve): nothing to synchronise, plain loop.
+        if self._dp_lockstep:
+            return DPEngineCoreProc.busy_loop(self)
+        return EngineCore.busy_loop(self)
+
+    def _maybe_attach_prefill_delayer(self, config: Config) -> None:
+        """No-op: under rapidserve the delayer lives on the DECODE side.
+
+        Delaying prefill means not admitting a sequence yet, and admission is
+        decode's decision — decode owns the BlockManager, so it is the process
+        that would otherwise pin KV blocks for a prefill it has not scheduled.
+        Decode also has the two inputs this side lacks: real KV usage, and a
+        real decode batch to hide the hold behind. See
+        DecodeScheduler.allocate_waiting.
+        """
+        return
+
     def __init__(self, config: Config, input_address: str, output_address: str):
 
         # Force eager mode — no CUDA graph capture on the prefill side.
         config.enforce_eager = True
 
-        self._disagg_d2p_addr = config.disagg_d2p_addr  # PULL: receive BlockAssignment
-        # One channel per decode rank: decode rank k pairs with the prefill TP
-        # rank on the same GPU, and a PrefillDone must reach the ONE rank that
-        # owns the sequence. Symmetric rapidserve has a single decode rank, so
-        # these are all length-1 lists there.
-        self._disagg_p2d_addrs = config.disagg_p2d_addrs  # PUSH: send PrefillDone
-        self._disagg_weight_ipc_addrs = config.disagg_weight_ipc_addrs
-        self._disagg_weight_ack_addrs = config.disagg_weight_ack_addrs
-        self._disagg_kvcache_ipc_addrs = config.disagg_kvcache_ipc_addrs
-        self._num_decode_ranks = config.disagg_num_decode_ranks
+        # This process's own slice of the per-pair channels. Prefill rank k and
+        # decode rank k share a GPU and talk only to each other — the IPC
+        # handles are valid nowhere else — so each list is narrowed to one entry
+        # and the loops below stay single-element fan-outs.
+        self._pair_rank = config.disagg_decode_rank
+        k = self._pair_rank
+        # PULL: BlockAssignment from THIS pair's decode rank only.
+        self._disagg_d2p_addr = config.disagg_d2p_addrs[k]
+        self._disagg_p2d_addrs = config.disagg_p2d_addrs[k : k + 1]
+        self._disagg_weight_ipc_addrs = config.disagg_weight_ipc_addrs[k : k + 1]
+        self._disagg_weight_ack_addrs = config.disagg_weight_ack_addrs[k : k + 1]
+        self._disagg_kvcache_ipc_addrs = config.disagg_kvcache_ipc_addrs[k : k + 1]
+        self._num_decode_ranks = 1
 
         # Maps seq_id → BlockAssignment, populated by the receiver thread.
         self._pending_assignments: dict = {}
@@ -708,6 +741,7 @@ class PrefillEngineCore(EngineCore):
         self.scheduler = PrefillScheduler(
             config, disagg_cu_shm_name=config.disagg_cu_shm_name
         )
+
 
     def _post_model_load_hook(self):
         """Round 1 bootstrap: export weights → send to decode → wait for ACK.
@@ -803,8 +837,7 @@ class PrefillEngineCore(EngineCore):
         # --- Open one PUSH socket per decode rank for PrefillDone ---
         # Prefill connects (not binds) so decode's PULL bind is ready first,
         # preventing messages from being dropped before decode connects.
-        # Indexed by decode rank: a PrefillDone must reach the rank that owns
-        # the sequence's KV, never fan out or round-robin.
+        # Exactly one entry: the decode rank paired with this process.
         self._p2d_socks = []
         for addr in self._disagg_p2d_addrs:
             s = self._disagg_ctx.socket(zmq.PUSH)
@@ -864,10 +897,9 @@ class PrefillEngineCore(EngineCore):
                     # decode. Must stay positionally aligned with block_table —
                     # the V4 index kernels use absolute logical indexing.
                     seq.swa_block_table = list(assignment.swa_block_table)
-                    # Which decode rank's KV pool these block IDs refer to. The
-                    # prefill TP rank sharing that GPU is the only one allowed to
-                    # commit this sequence's KV; every other rank masks its
-                    # writes to the dump block (see ScheduledBatch.target_ranks).
+                    # Which decode rank sent this. Under the paired topology a
+                    # prefill process only ever serves its own decode rank, so
+                    # this is informational rather than a routing key.
                     seq.disagg_target_rank = assignment.target_rank
 
     def _process_engine_step(self):
@@ -915,9 +947,9 @@ class PrefillEngineCore(EngineCore):
                     else []
                 ),
             )
-            # Route to the rank that allocated the blocks, not round-robin.
-            target = self._seq_target_rank.pop(seq_id, 0)
-            self._p2d_socks[target].send(
+            # One socket: this prefill process serves exactly one decode rank.
+            self._seq_target_rank.pop(seq_id, None)
+            self._p2d_socks[0].send(
                 pickle.dumps((DisaggMsgType.PREFILL_DONE, done))
             )
 
@@ -960,7 +992,7 @@ class PrefillEngineCore(EngineCore):
 class DecodeEngineCore(DPEngineCoreProc):
     """Disaggregated decode instance.
 
-    Inherits DPEngineCoreProc for the lockstep busy loop. Under an asymmetric
+    Inherits DPEngineCoreProc for the lockstep busy loop. Under a paired
     topology the N decode ranks form a DP group whose MoE all_gather /
     reduce_scatter (moe.py:362) is a COLLECTIVE — every rank must execute a
     forward on every step or the ones that do will block forever on the ones
@@ -984,13 +1016,13 @@ class DecodeEngineCore(DPEngineCoreProc):
     """
 
     def _maybe_attach_prefill_delayer(self, config: Config) -> None:
-        """No-op: a decode engine has no prefill to delay.
+        """Deferred, not skipped.
 
-        Also unavoidable — this runs inside super().__init__(), and decode does
-        not create its scheduler until after the kvcache IPC import has set
-        num_kvcache_blocks (BlockManager asserts num_blocks > 0). The base class
-        guards on `self.scheduler is None` too; this override records that the
-        omission is intentional rather than incidental.
+        This runs inside super().__init__(), before decode has a scheduler —
+        it defers creation until the kvcache IPC import has set
+        num_kvcache_blocks (BlockManager asserts num_blocks > 0). The real
+        attach happens right after DecodeScheduler is built; see the call in
+        the kvcache bootstrap.
         """
         return
 
@@ -1007,12 +1039,13 @@ class DecodeEngineCore(DPEngineCoreProc):
         return EngineCore.busy_loop(self)
 
     def __init__(self, config: Config, input_address: str, output_address: str):
-        self._disagg_d2p_addr = config.disagg_d2p_addr  # PUSH: send BlockAssignment
         # This rank's own slice of the per-decode-rank channels. Under DP decode
         # rank k lives on GPU k and bootstraps against the prefill TP rank on the
         # same GPU — the IPC handles are only valid there.
         self._decode_rank = config.disagg_decode_rank
         k = self._decode_rank
+        # PUSH: BlockAssignment to THIS pair's prefill rank only.
+        self._disagg_d2p_addr = config.disagg_d2p_addrs[k]
         self._disagg_p2d_addr = config.disagg_p2d_addrs[k]  # PULL: PrefillDone
         self._disagg_weight_ipc_addr = config.disagg_weight_ipc_addrs[k]
         self._disagg_weight_ack_addr = config.disagg_weight_ack_addrs[k]
@@ -1077,6 +1110,11 @@ class DecodeEngineCore(DPEngineCoreProc):
         # EngineUtilityHandler was built in super().__init__() with scheduler=None
         # (decode defers scheduler creation); wire the real one in for MTP stats.
         self.utility_handler.scheduler = self.scheduler
+        # Now that the scheduler exists, attach the prefill delayer. It gates
+        # DecodeScheduler.allocate_waiting, so KV blocks are not pinned for a
+        # sequence whose prefill is not ready to run, and every decode rank
+        # admits in the same tick.
+        DPEngineCoreProc._maybe_attach_prefill_delayer(self, config)
 
         # --- Now truly ready ---
         super()._send_ready_signal()
@@ -1189,22 +1227,37 @@ class DecodeEngineCore(DPEngineCoreProc):
     def pull_and_process_input_queue(self):
         """Override: add new sequences to waiting queue, then allocate blocks
         and send BlockAssignment to prefill for any that fit."""
+        exiting = False
         recv_reqs = []
         while not self.input_queue.empty():
             seqs = self.input_queue.get_nowait()
             for seq in seqs:
                 if seq.status == SequenceStatus.EXIT_ENGINE:
-                    return True
+                    exiting = True
+                    continue
                 recv_reqs.append(seq)
         if recv_reqs:
             self.scheduler.extend(recv_reqs)
-        for seq in self.scheduler.allocate_waiting():
-            self._send_block_assignment(seq)
-        return False
+        # Admission happens in _process_engine_step, NOT here. busy_loop calls
+        # this method unconditionally every iteration, so ticking the delayer
+        # from here spun every decode rank through a cross-DP all_reduce at full
+        # speed on an idle server — 150k decisions in three minutes, all
+        # fire_vacuous, starving the process of everything else.
+        return exiting
 
     def _process_engine_step(self):
         """Override: handle None from DecodeScheduler when prefill_waiting is
         non-empty but running is empty (sequences are still being prefilled)."""
+        # Admission first, and BEFORE the early return. allocate_waiting ticks
+        # the prefill delayer, whose cross-DP all_reduce every decode rank must
+        # enter on the same iterations — a rank that returns early hangs the
+        # others. That holds here because busy_loop only reaches this method
+        # when the all-reduced global_has_unfinished (or the previous
+        # iteration's value, engines_running) says some rank has work, so the
+        # entry condition is itself identical on every rank. An idle cluster
+        # reaches neither, which is what stops the spin.
+        for seq in self.scheduler.allocate_waiting():
+            self._send_block_assignment(seq)
         if not self.scheduler.has_requests():
             return False
         result = self.scheduler.schedule()

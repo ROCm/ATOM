@@ -415,7 +415,12 @@ class PrefillDelayer:
         )
         if total == 0:
             return
-        if total % self._stat_log_every == 0:
+        # Also log the FIRST real decision, not only every Nth. The counter is
+        # per PROCESS, and with N prefill ranks each one sees roughly
+        # total_prefills/N decisions — a run with a few hundred prefills spread
+        # over 8 ranks never reaches the default 1000, so the delayer looks dead
+        # when it is simply quiet. One line up front proves it is live.
+        if total == 1 or total % self._stat_log_every == 0:
             logger.info(
                 f"[PrefillDelayer stats] total={total} "
                 f"fire_fill={self._stat_fire_fill} "

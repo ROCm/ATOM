@@ -49,60 +49,12 @@ def _make_all_cleared() -> AllBlocksCleared:
     return AllBlocksCleared()
 
 
-# Physical index reserved as the KV write sink under asymmetric rapidserve.
-# MLA's KV latent is TP-replicated, so after a wide prefill EVERY rank holds an
-# identical copy — but only the rank co-located with a request's target GPU may
-# write it. The other ranks point their block table / SWA block table /
-# per-request cache slot at this index, so their redundant writes land in
-# scratch instead of corrupting the live pool. Masking indices (not control
-# flow) keeps the TP ranks in lockstep on their shared communicator.
-#
-# Reserved ONLY when asymmetric rapidserve is active; every other configuration
-# keeps its full block budget.
-DUMP_INDEX = 0
-
-
-def dump_block_count(config) -> int:
-    """How many physical blocks the prefill KV write sink needs.
-
-    ONE IS NOT ENOUGH, and that is the whole reason this function exists.
-    V4's sparse/absorbed prefill READS the KV back out of the paged cache —
-    `_forward_prefill_mla` runs `mla_decode_fwd` over `kv_indices`
-    (attention_mla.py:1067, aiter_mla.py:762) — so the fused kernel's write is a
-    prerequisite for the read, not just persistence for later decode steps. A
-    non-owned row's KV therefore has to stay intact AND distinct from every
-    other dumped row until attention has consumed it. Folding a whole batch onto
-    one block makes each row read whichever token happened to write last, which
-    corrupts the TP all-reduced output for the owning rank too.
-
-    Sized for exactly one prefill batch, which is how long the data must live:
-    every scheduled token, plus one partial block per sequence. This assumes a
-    sequence prefills in a single pass — under chunked prefill a later chunk
-    would need a prefix that scratch has already recycled, and the region would
-    have to become per-sequence and persistent instead.
-    """
-    block_size = getattr(config, "kv_cache_block_size", 0) or 1
-    tokens = getattr(config, "max_num_batched_tokens", 0) or 0
-    seqs = getattr(config, "max_num_seqs", 0) or 0
-    return (tokens + block_size - 1) // block_size + seqs
-
-
 class BlockManager:
     def __init__(self, config: Config):
         block_size = config.kv_cache_block_size
         num_blocks = config.num_kvcache_blocks
         assert num_blocks > 0
-        # See DUMP_INDEX / dump_block_count. Blocks [0, n_dump) stay permanently
-        # unallocated so masked prefill ranks have a sink big enough to hold a
-        # whole batch's non-owned rows WITHOUT them aliasing each other.
-        reserve_dump = getattr(config, "disagg_prefill_tp_size", 0) > 1
-        n_dump = dump_block_count(config) if reserve_dump else 0
-        assert not reserve_dump or n_dump < num_blocks, (
-            f"asymmetric rapidserve needs {n_dump} scratch blocks for the "
-            f"prefill KV sink but the pool only has {num_blocks}; lower "
-            f"--max-num-batched-tokens or --max-num-seqs"
-        )
-        first_free = DUMP_INDEX + n_dump
+        first_free = 0
         self.block_size = block_size
         self.dcp_world_size = config.decode_context_parallel_size
         # dcp_rank is always 0 here: BlockManager runs only on the scheduler
@@ -133,18 +85,8 @@ class BlockManager:
         # Each slot group contains slots_per_req() contiguous tensor indices
         # (1 for stateless / + num_spec for spec-decoding-aware variants).
         num_per_req_cache_groups: int = getattr(config, "num_per_req_cache_groups", 0)
-        # ONE scratch slot here, unlike the paged pools above. The pool is sized
-        # to exactly max_num_seqs and its width also fixes a pre-allocated tensor
-        # dimension and the KV memory accounting (model_runner.py:1706-1711), so
-        # it cannot be widened for scratch without re-deriving all three.
-        # Sound only while the compressor state is WRITE-ONLY during a
-        # single-pass prefill: dumped rows would then share this slot but never
-        # read it. If V4's compressor ever reads its own state back within the
-        # prefill forward, this needs the same per-row treatment as the paged
-        # pools and the sizing above has to move with it.
-        n_dump_slots = 1 if reserve_dump else 0
         self.free_per_req_cache_groups: list[int] = list(
-            range(min(n_dump_slots, num_per_req_cache_groups), num_per_req_cache_groups)
+            range(num_per_req_cache_groups)
         )
 
         # Sliding-window KV pool (DeepSeek-V4). A separate content-addressed pool
@@ -164,17 +106,6 @@ class BlockManager:
             full_retain=envs.ATOM_SWA_FULL_RETAIN,
             retention_interval=envs.ATOM_SWA_RETENTION_INTERVAL,
             checkpoint_frac=envs.ATOM_SWA_CHECKPOINT_FRAC,
-            # ONE block, not n_dump — unlike the compressed pool. Prefill
-            # reads the SWA pool back only for the PREFIX region; the current
-            # chunk's window is read from the per-forward KV tensor, not the
-            # pool (paged_prefill_indices.py:123-128 stores plain per-fwd rows
-            # for extend_indices, while :130-147 pages the prefix through
-            # swa_block_tables). With chunked prefill off and no prefix-cache
-            # hit, prefix_swa_count is 0, nothing reads what dumped rows wrote,
-            # and they may alias freely. Sizing this like the compressed pool
-            # asked a 1088-block SWA pool for 1536 blocks — SWA blocks are ~6.5x
-            # larger, so a per-row region there would cost ~15GB a rank.
-            reserve_dump_blocks=1 if reserve_dump else 0,
         )
 
     @property

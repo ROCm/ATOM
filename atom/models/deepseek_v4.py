@@ -111,6 +111,7 @@ from atom.model_ops.v4_kernels import (
     swa_write,
     update_compressor_states,
 )
+from aiter.dist.device_communicators.all2all import _has_module
 from atom.utils import envs, mark_spliting_op
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.decorators import mark_trace, support_torch_compile
@@ -4252,9 +4253,24 @@ class DeepseekV4ForCausalLM(nn.Module):
         # default [max_num_batched_tokens, hidden_size]. forward returns
         # the un-reduced mHC residual stack [N, hc, dim].
         self.extra_output_dims: tuple[int, ...] = (self.args.hc_mult,)
+        # True when the MoE will hand the gate DP-GATHERED gating_output, so
+        # the hash-routing ids must be gathered to match. That is exactly when
+        # FusedMoEParallelConfig.use_all2all_kernels is False under DP
+        # attention (moe.py "mode 3"), because MoRI's all-to-all routes
+        # per-rank and never gathers.
+        #
+        # `not enable_expert_parallel` alone was too narrow: it assumed EP
+        # always means MoRI. It does not — ATOM_DISABLE_MORI_ALL2ALL forces EP
+        # onto the gather path, and so does a build with no mori module. Either
+        # way the gate saw dp_size x tokens while ids stayed local, which trips
+        # `input_ids length N does not match gating_output num_tokens N*dp`
+        # in _hash_topk.
+        moe_will_gather = not config.enable_expert_parallel or (
+            envs.ATOM_DISABLE_MORI_ALL2ALL or not _has_module("mori")
+        )
         self._need_ids_gather = (
             config.enable_dp_attention
-            and not config.enable_expert_parallel
+            and moe_will_gather
             and self.args.n_hash_layers > 0
         )
 

@@ -1371,7 +1371,7 @@ class Config:
     # ZMQ IPC address: decode PUSH → prefill PULL (BlockAssignment messages).
     # Stays a single address with N decode ranks: many PUSHers to one PULLer is
     # native ZMQ, and prefill does not care which rank sent an assignment.
-    disagg_d2p_addr: str = ""
+    disagg_d2p_addrs: list = field(default_factory=list)
     # The reverse direction is per-rank — prefill must deliver a PrefillDone to
     # the ONE decode rank that owns the sequence — as is each bootstrap channel,
     # since decode rank k pairs with prefill rank k on GPU k. Index = decode rank.
@@ -1403,14 +1403,6 @@ class Config:
     # coordination between prefill and decode. When False (default),
     # use plain separate streams with no CU masking.
     disagg_constrained: bool = False
-    # Asymmetric rapidserve: prefill runs at this TP size while decode runs at
-    # tensor_parallel_size=1 (one attention rank per GPU), so a single request's
-    # prefill uses every GPU cooperatively (TTFT) while decode stays per-GPU.
-    # 0 = symmetric (both processes share tensor_parallel_size), the default.
-    # Set by DisaggCoreManager on BOTH configs: prefill reads it to know it owns
-    # the wide topology, decode reads it to know how many prefill TP shards a
-    # weight was split across when reconstructing full attention matrices.
-    disagg_prefill_tp_size: int = 0
 
     def _set_cudagraph_sizes(self):
         if self.compilation_config.cudagraph_capture_sizes:
