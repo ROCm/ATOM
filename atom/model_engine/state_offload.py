@@ -189,7 +189,6 @@ class StateTierCapability:
 
     can_store_state: bool
     can_load_state: bool
-    layout: str | None
     reason: str = ""
 
     @property
@@ -251,7 +250,7 @@ def state_tier_capability(config) -> StateTierCapability:
     """
     from atom.kv_transfer.offload.config import select_offload_layout
 
-    none = StateTierCapability(False, False, None, "")
+    none = StateTierCapability(False, False, "")
     cfg = getattr(config, "kv_transfer_config", None) or {}
     if not isinstance(cfg, dict):
         return replace(none, reason="no kv_transfer_config")
@@ -290,7 +289,7 @@ def state_tier_capability(config) -> StateTierCapability:
     can_load = role in _LOAD_ROLES
     if not (can_store or can_load):
         return replace(none, reason=f"kv_role {role!r} neither saves nor loads")
-    return StateTierCapability(can_store, can_load, layout)
+    return StateTierCapability(can_store, can_load)
 
 
 def state_tier_chunk_tokens(config) -> int:
@@ -340,14 +339,3 @@ def state_tier_chunk_tokens(config) -> int:
 #: The connector backends whose worker half can build a `StateOffloadTier`.
 #: `multi` qualifies when it lists exactly one.
 _STATE_TIER_BACKENDS = frozenset({"lmcache_offload"})
-
-
-def kv_connector_hosts_state_tier(config) -> bool:
-    """Whether the configured connector will really run the state tier.
-
-    Thin wrapper over `state_tier_capability` for callers that only need the
-    yes/no. Takes the whole config: the layout and the pipeline depth are as
-    much a part of the answer as the connector name, and passing only
-    `kv_transfer_config` is what made this a name check in the first place.
-    """
-    return state_tier_capability(config).hosts_state_tier
