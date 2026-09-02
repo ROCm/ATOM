@@ -285,11 +285,15 @@ class BlockManager:
         # resident checkpoint, `tier` paid an entry-sized H2D and a park. Almost
         # all `tier` means the state pool is too small for the concurrency.
         self.joint_boundaries = 0
-        self.state_hbm = 0
+        self.state_hbm_boundaries = 0
         # The number that says the tier is doing anything at all. Every other
         # counter here can be non-zero with the CPU tier switched off; this one
         # cannot, which makes it the only honest test of "did this feature run".
-        self.state_tier = 0
+        # Suffixed `_boundaries` so an int counter no longer shares the bare name
+        # `state_tier` with the state-tier object/module used across this PR
+        # (`kimi_k3.state_tier`, `_JointPark`, `_state_tier`). The exported funnel
+        # key and the log label keep the short `state_tier` string.
+        self.state_tier_boundaries = 0
         # Admissions whose gated boundary neither tier could produce by the time
         # `allocate` ran. Non-zero is expected under pressure (the CPU index is
         # optimistic, and an HBM checkpoint can be unindexed inside the same
@@ -816,9 +820,9 @@ class BlockManager:
         seq.offload_joint.claim_tokens = decision.claim_tokens
         self.joint_boundaries += 1
         if decision.state_from_hbm:
-            self.state_hbm += 1
+            self.state_hbm_boundaries += 1
         else:
-            self.state_tier += 1
+            self.state_tier_boundaries += 1
 
     def _chain_to(
         self, seq: Sequence, block_hashes: list[int], blocks: int
@@ -2091,8 +2095,8 @@ class BlockManager:
             "chunks_cut_for_demand": self.chunks_cut_for_demand,
             "chunks_cut_for_end": self.chunks_cut_for_end,
             "joint_boundaries": self.joint_boundaries,
-            "state_hbm": self.state_hbm,
-            "state_tier": self.state_tier,
+            "state_hbm": self.state_hbm_boundaries,
+            "state_tier": self.state_tier_boundaries,
             "state_gate_lost_boundary": self.state_gate_lost_boundary,
             "orphan_load_slots_reclaimed": self._orphan_load_slots_reclaimed,
         } | self.state_checkpoint_fates()

@@ -1508,8 +1508,8 @@ class Scheduler:
                 logger.info(
                     "joint kv: boundaries=%d (state_hbm=%d state_tier=%d) | %s",
                     chosen,
-                    self.block_manager.state_hbm,
-                    self.block_manager.state_tier,
+                    self.block_manager.state_hbm_boundaries,
+                    self.block_manager.state_tier_boundaries,
                     " ".join(f"{k}={v}" for k, v in sorted(skips.items())),
                 )
 

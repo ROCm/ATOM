@@ -1528,7 +1528,7 @@ class TestPagedCopyCheckpoint:
         bm.kv.allocate(block_id)  # takes it for fresh content, dropping the hash
 
     def _reset_joint_counters(self, bm):
-        bm.joint_boundaries = bm.state_hbm = bm.state_tier = 0
+        bm.joint_boundaries = bm.state_hbm_boundaries = bm.state_tier_boundaries = 0
         bm.joint_skips.clear()
 
     def test_a_page_class_now_gets_a_joint_boundary(self):
@@ -1579,14 +1579,14 @@ class TestPagedCopyCheckpoint:
         resident = stateful_seq(PROMPT)
         resident.offload_joint.kv_prefix_tokens = len(PROMPT)
         bm.can_allocate(resident)
-        assert (bm.state_hbm, bm.state_tier) == (1, 0)
+        assert (bm.state_hbm_boundaries, bm.state_tier_boundaries) == (1, 0)
 
         # Drop it from HBM too: now the state leg costs an image-sized H2D.
         bm.paged_state_checkpoints.unindex(h)
         from_cpu = stateful_seq(PROMPT)
         from_cpu.offload_joint.kv_prefix_tokens = len(PROMPT)
         bm.can_allocate(from_cpu)
-        assert (bm.state_hbm, bm.state_tier) == (1, 1)
+        assert (bm.state_hbm_boundaries, bm.state_tier_boundaries) == (1, 1)
 
     def test_no_tier_means_no_joint_boundary(self):
         """`state_offload is None` short-circuits before anything else: a
