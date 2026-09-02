@@ -328,6 +328,18 @@ class _JointPark:
         `finished_loading`/`failed_loading` for this load, because that report
         is matched by equality and nothing translates it on the way in.
         """
+        # Evict any bookkeeping a prior park for this same `req_id` left behind
+        # before filing the new one. A preempt/requeue re-arms the request,
+        # usually under a fresh `kv_id`; without this the old key's `_need`
+        # entry and its reverse `_alias_of[old_key] -> req_id` survive. A stray
+        # late `settle` for the old key would then `_release(old_key)`, whose
+        # `_alias_of` -> `_alias` cleanup pops `_alias[req_id]` -- the live
+        # mapping the re-armed park's state leg needs -- so that park's state
+        # report resolves to the bare id, finds no `_need`, and never unparks.
+        # `_purge` drops the stale key everywhere without emitting a
+        # ready/failed/disposition (an eviction, not a settled outcome).
+        self._purge(self._alias.pop(req_id, None))
+        self._purge(req_id)
         need = set()
         if needs_kv:
             need.add("kv")
@@ -340,6 +352,25 @@ class _JointPark:
             self._alias_of[key] = req_id
         if not need:
             self._release(key)
+
+    def _purge(self, key) -> None:
+        """Drop a key from every park structure without settling it.
+
+        Used only by re-arm to evict a stale prior park; unlike `_release` it
+        produces no `_ready`/`_ready_failed`/`_dispositions` entry, so an evicted
+        load never masquerades as a completed one. No-op on None (nothing was
+        aliased) and on an unknown key."""
+        if key is None or key not in self._need:
+            return
+        self._need.pop(key, None)
+        bare = self._alias_of.pop(key, None)
+        if bare is not None:
+            self._alias.pop(bare, None)
+        self._failed.discard(key)
+        self._state_failed.discard(key)
+        self._ready.discard(key)
+        self._ready_failed.discard(key)
+        self._dispositions.pop(key, None)
 
     def settle_kv(self, ident, ok: bool) -> None:
         self._settle(ident, "kv", ok)
