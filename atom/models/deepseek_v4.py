@@ -3148,6 +3148,20 @@ class DeepseekV4Attention(nn.Module):
         ctx = fc.context
         n_p = attn_md.num_prefill_tokens
         n_d = hidden.size(0) - n_p
+        # `n_d` is derived from the tensor, but the metadata handed to the decode
+        # segment describes a row count of its own. Under TBO those are two
+        # independent splits -- the ubatch boundary is a token midpoint, and
+        # `decode_attn_metadata` is carried over from the parent whole. If they
+        # disagree the decode segment indexes an N-row plan into an M-row tensor,
+        # which is an out-of-bounds read, not an exception. Check it here, where
+        # the numbers are still readable, rather than letting a HIP illegal
+        # access surface three kernels later in an unrelated GEMM.
+        _declared_d = getattr(attn_md, "num_decode_tokens", None)
+        assert _declared_d is None or _declared_d == n_d, (
+            f"mixed segment sizes disagree: tensor has {hidden.size(0)} rows "
+            f"({n_p} prefill + {n_d} decode) but metadata declares "
+            f"{_declared_d} decode tokens"
+        )
         saved_md = fc.attn_metadata
         saved_is_prefill = ctx.is_prefill
         saved_input_ids = ctx.input_ids
