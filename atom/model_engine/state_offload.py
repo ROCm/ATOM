@@ -216,8 +216,8 @@ class StateTierCapability:
     mismatch is what left stores emitted with nowhere to go, and it is the
     common root of the tier-none fallback paths.
 
-    `reason` is filled in whenever the tier is off, so the log says which of the
-    four conditions refused it rather than leaving the operator to guess.
+    `reason` is filled in whenever the tier is off, so the log names which check
+    refused it rather than leaving the operator to guess.
     """
 
     can_store_state: bool
@@ -288,8 +288,11 @@ def state_tier_capability(config) -> StateTierCapability:
     """What the worker will do for the state tier, decided from config alone.
 
     A capability descriptor rather than a name check, because the two are not
-    the same question and the worker refuses on three conditions the name
-    cannot see. Config alone because this runs in the engine process at
+    the same question and the worker refuses on conditions the name cannot see
+    (no transfer config, a `multi` composite with no offload sub, `pp_size > 1`,
+    an unknown explicit override, a layout that offloads no state, or a `kv_role`
+    that neither saves nor loads). Config alone because this runs in the engine
+    process at
     `BlockManager.__init__`, before any worker connector exists -- so it must
     agree with the worker by construction, which is why the layout comes from
     the same `select_offload_layout` the worker uses and the roles from the

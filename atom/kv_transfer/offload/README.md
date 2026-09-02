@@ -20,6 +20,13 @@ per-request state tier), `hybrid` when `hf_config.compress_ratios` is present
 override that choice without giving scheduler and worker different connector
 names.
 
+GDN/linear-attention models (`qwen3_next`, `qwen3_5_*`; e.g. Qwen3-Next,
+Qwen3.5) are the one family the resolver does **not** map to a layout: they carry
+a per-request recurrent state that no offload layout owns a tier for, so
+restoring their KV prefix while that state stays stale is silent wrong output.
+`select_offload_layout` refuses them at startup with a `ValueError` that names
+the cause, rather than falling through to `dense`.
+
 It is the **ATOM-native, in-engine** offload path: the connector plugs straight
 into ATOM's scheduler/worker via the shared
 [`KVConnectorFactory`](../disaggregation/factory.py), with no vLLM in the loop.
