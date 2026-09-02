@@ -45,6 +45,8 @@ def FusedMoEDecoratorForPluginMode(cls: Type[T]) -> Type[T]:
 
     class LazyMoEWrapper(original_cls):
         def __new__(cls, *args, **kwargs):
+            if cls is not LazyMoEWrapper:
+                return super().__new__(cls)
             decorated_cls = get_decorated_class()
             return decorated_cls(*args, **kwargs)
 
