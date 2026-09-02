@@ -135,15 +135,28 @@ class StateByteCodec:
         # ref_count=1 (LMCache reports "garbage collected with ref_count=1,
         # pin_count=0" much later), shrinking the CPU pool one entry per failure.
         # `get` guards its own reference with `finally` for the same reason.
+        #
+        # `handed_off` draws the line the bare `except` could not: it cannot tell
+        # "never reached `batched_put`" (must down the ref) from "reached it, it
+        # took ownership, then something raised" (must NOT down it). The second
+        # case is real -- an NVMe/L3 backend error or an eviction-path raise
+        # inside LMCache's put, after the CPU insert. Downing there drives the
+        # count to -1 / returns a still-indexed buffer to the allocator, and a
+        # later `get` for a DIFFERENT key hands that buffer back: wrong bytes
+        # unpacked into a request's Active Slot, no exception anywhere. Once the
+        # reference is passed to `batched_put`, ownership is its, success or raise.
+        handed_off = False
         try:
             self._staged.pack(self._backend.page_unit_views(unit_ids), obj)
             # Source first: `pack` has synchronized the stream that reads the
             # units, so nothing on the device touches them from here.
             if on_source_released is not None:
                 on_source_released()
+            handed_off = True
             self._storage.batched_put([key], [obj])
         except Exception:
-            obj.ref_count_down()
+            if not handed_off:
+                obj.ref_count_down()
             raise
         return True
 
