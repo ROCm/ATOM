@@ -71,10 +71,6 @@ class StagedTransfer:
         self._release_after_transfer = release_after_transfer
         self._tls = threading.local()
 
-    @property
-    def staging_buffer_bytes(self) -> int:
-        return self._staging_buffer_bytes
-
     def _use_cuda(self) -> bool:
         return self.device.type == "cuda"
 

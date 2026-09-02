@@ -54,7 +54,6 @@ class StateByteCodec:
         self._worker_id = int(worker_id)
         self._layout_id = layout_id
         self._misfit_reads = 0
-        self.puts_refused = 0
         self._storage = None
         # Never hard-code a size: V4 keeps six compressor fields across
         # n_csa/n_hca layers plus an optional window; GDN keeps
@@ -112,7 +111,7 @@ class StateByteCodec:
 
         A refusal is not an error -- `_allocate` returns None under CPU pressure,
         and a whole image is refused sooner than a KV chunk, so the state leg
-        feels a full pool first. `puts_refused` makes that visible.
+        feels a full pool first.
 
         `on_source_released` fires when `pack` returns -- after the gather and
         D2H are synchronized, i.e. once the GPU has stopped reading the units.
@@ -128,7 +127,6 @@ class StateByteCodec:
         key = self.key(h)
         obj = self._allocate(self.entry_bytes)
         if obj is None:
-            self.puts_refused += 1
             return False
         # `batched_put` discharges the reference it is handed -- but only if
         # reached. A throwing `pack` skips it and strands the allocation at
@@ -217,14 +215,6 @@ class StateByteCodec:
         if tensor is not None:
             return int(tensor.numel()) * tensor.element_size()
         return None
-
-    def contains(self, h: int) -> bool:
-        """Ask storage, never a local set -- a set goes stale the moment
-        LMCache's LRU evicts. `contains` answers with a location name or None,
-        so the truthiness test is the membership test."""
-        if self._storage is None:
-            return False
-        return bool(self._storage.contains(self.key(h)))
 
     def _allocate(self, nbytes: int) -> Any:
         from lmcache.v1.memory_management import MemoryFormat
