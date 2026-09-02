@@ -296,12 +296,32 @@ jobs:
             if [[ -n "${CASE_NAMES}" ]]; then
               CASE_NAME="${CASE_NAMES}"
             elif [[ "${RUN_ALL_MODELS}" != "true" ]]; then
-              if [[ -z "${MODEL_NAMES}" ]]; then
+              if [[ -z "${MODEL_NAMES}" && "${SUITE}" != "smoke" ]]; then
                 echo "::error::Set run_all_models=true, provide model_names, or provide case_names."
                 exit 1
               fi
               MODEL_NAME="${MODEL_NAMES}"
             fi
+          fi
+
+          if [[ "${SUITE}" == "smoke" && -z "${CASE_NAME}" && -z "${MODEL_NAME}" && "${RUN_ALL_MODELS}" != "true" ]]; then
+            python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          matrix = {"include": []}
+          Path("atomesh-matrix.json").write_text(
+              json.dumps(matrix, indent=2),
+              encoding="utf-8",
+          )
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+              output.write('matrix_json={"include":[]}\n')
+              output.write("has_matrix=false\n")
+          print("RDMA smoke workflow: skipping benchmark matrix generation")
+          PY
+            cat atomesh-matrix.json
+            exit 0
           fi
 
           if [[ "${GITHUB_EVENT_NAME}" == "schedule" && "${EVENT_SCHEDULE}" == "0 16 * * 5" ]]; then
