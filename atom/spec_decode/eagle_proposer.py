@@ -45,28 +45,6 @@ class EagleProposer(Drafter):
     flavor is its sibling ``DSparkProposer``; both share the ``Drafter`` base.
     """
 
-    def __init__(self, atom_config, device: torch.device, runner):
-        super().__init__(atom_config, device, runner)
-        # GLM-5.2 draft index sharing: step 0 runs the MTP indexer, steps 1+
-        # reuse sparse_kv_indices_buffer via skip_topk + compact_topk_indices.
-        # Gated on method=mtp, DSA index_topk and the config flag, so other
-        # draft backends are unchanged. (DSpark is DSparkProposer, not this
-        # class, so it cannot reach here.)
-        draft_hf = self.speculative_config.draft_model_hf_config
-        mtp_inner = getattr(self.model, "model", None)
-        self._share_mtp_indices = (
-            self.speculative_config.method == "mtp"
-            and getattr(draft_hf, "index_share_for_mtp_iteration", False)
-            and hasattr(draft_hf, "index_topk")
-            and mtp_inner is not None
-            and hasattr(mtp_inner, "set_skip_topk")
-        )
-        if self._share_mtp_indices:
-            logger.info(
-                "MTP draft index_share_for_mtp_iteration enabled: "
-                "step 0 computes indexer top-k, steps 1+ reuse the buffer."
-            )
-
     def _resolve_mtp_k(self) -> int:
         return self.speculative_config.num_speculative_tokens or 0
 
@@ -345,15 +323,7 @@ class EagleProposer(Drafter):
         steps 1+ run one row per sequence, and every kernel they compile is
         chosen from that shape. Replaying the same rewrite serving uses is the
         point -- a warmup that built its own would warm a shape nobody asks for.
-
-        The same goes for state the model carries: `skip_topk` is read as a
-        Python branch inside the draft's attention, and `propose` turns it on
-        only after step 0. Warming without it records the branch that recomputes
-        the index, which a replay then repeats every step -- the sharing this
-        flavor logs as enabled would be dead, silently.
         """
-        if self._share_mtp_indices:
-            self.model.model.set_skip_topk(True)
         fc = get_forward_context()
         # Where each synthetic sequence actually is. Warming at position 0 would
         # compile a masked, near-empty window -- a shape steady-state decode
@@ -423,6 +393,12 @@ class EagleProposer(Drafter):
                 attn_metadata.sparse_kv_last_page_lens = var[
                     "sparse_kv_last_page_lens"
                 ].gpu[:running_bs]
+            # The DCP top-k filter's row unit is the query token, and it reads
+            # this to pick the owning request's block table. The target left one
+            # entry per verify token; at one row per sequence it is the identity.
+            t2s = builder.rebuild_draft_token_to_seq_idxs(running_bs)
+            if t2s is not None:
+                attn_metadata.token_to_seq_idxs = t2s
         # block_tables, context_lens, and sparse_kv_indptr are
         # needed by both MHA and MLA+sparse attention
         attn_metadata.block_tables = var["block_tables"].gpu[:running_bs]
@@ -585,10 +561,6 @@ class EagleProposer(Drafter):
                         positions,
                         hidden_states,
                     )
-                # index_share_for_mtp_iteration: step 0 runs the MTP indexer;
-                # steps 1+ skip it and read the compacted sparse_kv buffer.
-                if self._share_mtp_indices and i == 0:
-                    self.model.model.set_skip_topk(False)
                 if i and self.step is not None:
                     # Steps 1+ are the declared pass: one row per sequence, at
                     # a batch the startup sweep already warmed. The head rides
@@ -610,9 +582,6 @@ class EagleProposer(Drafter):
                     ret_hidden_states = pcp_allgather_rerange(
                         ret_hidden_states, pcp_ws
                     )[:n_global_draft]
-                if self._share_mtp_indices and i == 0:
-                    self.model.model.set_skip_topk(True)
-                    self.model.model.compact_topk_indices(last_token_indices)
 
                 # Step 0 gathers one row per sequence out of the token stream;
                 # steps 1+ already are one row per sequence -- sliced back off

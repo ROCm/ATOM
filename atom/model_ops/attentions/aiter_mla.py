@@ -2039,6 +2039,25 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         out.copy_(slots)
         return out
 
+    def rebuild_draft_token_to_seq_idxs(self, running_bs: int):
+        """Owning request per query token for an MTP draft step.
+
+        The DCP top-k filter reads this to pick a row of ``block_tables``. The
+        target step publishes one entry per verify token
+        (``arange(bs).repeat_interleave(max_seqlen_q)``); a draft step runs one
+        row per sequence, which makes the map the identity. Padded rows carry no
+        top-k, but they still index the table, so cover ``running_bs``.
+
+        Returns the rebuilt view, or None when the model is not sparse (no
+        buffer, and no filter to read it).
+        """
+        if not self.is_sparse:
+            return None
+        self._token_to_seq_idxs_gpu[:running_bs] = torch.arange(
+            running_bs, dtype=torch.int32, device=self.device
+        )
+        return self._token_to_seq_idxs_gpu[:running_bs]
+
     def prepare_decode(
         self,
         batch: ScheduledBatch,
