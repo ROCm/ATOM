@@ -65,7 +65,7 @@ from aiter.dist.parallel_state import (
 )
 from torch import nn
 
-from atom.config import Config, QuantizationConfig
+from atom.config import Config, QuantizationConfig, get_current_atom_config
 from atom.model_ops.attention_mla import MLAModules
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
@@ -523,12 +523,19 @@ class Glm5NextKDAAttention(KimiKDAAttention):
     def process_weights_after_loading(self) -> None:
         if getattr(self, "_in_proj_fused", False):
             return
-        missing = {0, 1, 2} - self._loaded_input_shards
-        if missing:
-            raise RuntimeError(
-                "Incomplete GLM-5.3 KDA input projection: missing checkpoint "
-                f"shards {sorted(missing)} from q/k/v"
-            )
+        # `--load_dummy` never runs a weight_loader, so the shard set is empty
+        # by design and this coverage check would refuse to start on all 34 KDA
+        # layers. The check exists to catch a checkpoint that silently supplied
+        # only part of q/k/v; with no checkpoint there is nothing to catch. The
+        # gate fold below still runs, so the layer keeps the same shape and
+        # dtype it would have had.
+        if not getattr(get_current_atom_config(), "load_dummy", None):
+            missing = {0, 1, 2} - self._loaded_input_shards
+            if missing:
+                raise RuntimeError(
+                    "Incomplete GLM-5.3 KDA input projection: missing "
+                    f"checkpoint shards {sorted(missing)} from q/k/v"
+                )
         # in_proj is [q | k | v | g]; the checkpoint only supplied q/k/v, so
         # write the folded gate into the g shard before the parent appends its
         # b_proj / f_a_proj tails.
@@ -629,20 +636,6 @@ class Glm5NextIndexer(Indexer):
         """
         return kpool_geometry.pooled_path_enabled(self.index_kpool)
 
-    def _assert_kpool_regime(self, max_seqlen_k: int) -> None:
-        """Refuse the regime where pooled and token-granular top-k diverge."""
-        if self.index_kpool <= 1 or max_seqlen_k <= self.topk_tokens:
-            return
-        if self.use_kpool():
-            return
-        raise NotImplementedError(
-            "GLM-5.3-Flash: this batch has max_seqlen_k="
-            f"{max_seqlen_k} > index_topk={self.topk_tokens}, where pooled "
-            "selection genuinely differs from the token-granular fallback, and "
-            "ATOM_GLM5_KPOOL=0 disabled the pooled path. Returning the fallback "
-            "here would be silently wrong, not merely slower."
-        )
-
     def forward_impl(
         self,
         hidden_states: torch.Tensor,
@@ -655,8 +648,6 @@ class Glm5NextIndexer(Indexer):
 
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
-        if attn_metadata is not None:
-            self._assert_kpool_regime(int(getattr(attn_metadata, "max_seqlen_k", 0)))
 
         if rotary_emb is None:
             rotary_emb = self.rotary_emb

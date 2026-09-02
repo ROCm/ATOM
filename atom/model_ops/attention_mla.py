@@ -2730,6 +2730,9 @@ def _convert_req_index_to_global_index_kernel(
     kv_start = tl.load(kv_indptr + batch_id)
     kv_end = tl.load(kv_indptr + batch_id + 1)
     out_kv_start = tl.load(page_kv_indptr + batch_id)
+    # This request OWNS only [out_kv_start, out_kv_end); the output is packed
+    # by page_kv_indptr, so anything past it belongs to request batch_id + 1.
+    out_kv_end = tl.load(page_kv_indptr + batch_id + 1)
     kv_len = kv_end - kv_start
     qo_start = tl.load(qo_indptr + batch_id)
     qo_end = tl.load(qo_indptr + batch_id + 1)
@@ -2761,10 +2764,20 @@ def _convert_req_index_to_global_index_kernel(
 
         # Store results
         out_offset = out_kv_start + indice_id
+        # `valid_col_mask` bounds the column by kv_len, which counts entries on
+        # the INPUT side; it is not the width of this request's output region.
+        # A pooled selection makes the two diverge -- the row is padded out to
+        # `round_up(index_topk + kpool - 1, 128)` columns while the region holds
+        # at most `index_topk + kpool - 1` -- and a long context makes kv_len
+        # exceed both, so every column stores. The surplus columns are the top-k
+        # padding, -1, which `tl.where(out_val >= 0, ...)` turns into cache slot
+        # 0 and writes over the START of request batch_id + 1. OUT_NUMEL only
+        # catches the final request, so the corruption is silent for the rest.
         store_mask = (
             valid_token_row
             & valid_col_mask
             & (out_offset >= 0)
+            & (out_offset < out_kv_end)
             & (out_offset < OUT_NUMEL)
         )
         out_ptr_ij = out_kv_indices + out_offset

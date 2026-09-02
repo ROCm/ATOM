@@ -2054,6 +2054,33 @@ class Config:
                 if self.kv_cache_block_size != glm5_block_size:
                     self.kv_cache_block_size = glm5_block_size
 
+                # Turning sparsity off is an exact A/B only at or below
+                # `index_topk`; past it the dense/token-granular fallback is a
+                # DIFFERENT answer, not a slower one. Validate that at startup
+                # rather than per forward: `max_model_len` already bounds
+                # `max_seqlen_k`, so one check here replaces a branch on a
+                # 45-layer hot path, and it fails the launch cleanly instead of
+                # raising inside the model and taking the engine down with it
+                # mid-batch -- which is what both `envs.py` and
+                # `docs/environment_variables.md` describe as refusing the
+                # request.
+                index_topk = int(getattr(self.hf_config, "index_topk", 0) or 0)
+                sparsity_off = []
+                if not envs.ATOM_GLM5_KPOOL:
+                    sparsity_off.append("ATOM_GLM5_KPOOL=0")
+                if envs.ATOM_GLM5_FORCE_DENSE_MLA:
+                    sparsity_off.append("ATOM_GLM5_FORCE_DENSE_MLA=1")
+                if sparsity_off and index_topk and self.max_model_len > index_topk:
+                    raise ValueError(
+                        f"GLM-5.3-Flash: {', '.join(sparsity_off)} turns the "
+                        "pooled sparse selection off, which matches the pooled "
+                        f"path only while sequences stay at or below "
+                        f"index_topk={index_topk}. max_model_len is "
+                        f"{self.max_model_len}. Lower --max-model-len to "
+                        f"{index_topk} for the comparison, or drop the "
+                        "override."
+                    )
+
         # Keep ``None`` intact until the model architecture is known so an
         # omitted index-cache option remains distinguishable from an explicit
         # fp8/bf16 override. Native single-node V4 defaults to the FP4 indexer

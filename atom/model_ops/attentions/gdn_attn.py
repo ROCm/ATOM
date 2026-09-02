@@ -368,9 +368,14 @@ class GDNStateMixin:
         )
 
     def _is_kda(self) -> bool:
-        return (
-            getattr(self.model_runner.config.hf_config, "model_type", None)
-            == "kimi_linear"
+        # Both KDA models, matching the two sibling checks above. GLM-5.3-Flash
+        # was added to those and missed here, which mattered because this one
+        # feeds `_replayssm_buffer_shapes()`: answering "not KDA" for a KDA
+        # model sizes the ReplaySSM record buffers for the wrong head geometry
+        # and the recurrence writes past them.
+        return getattr(self.model_runner.config.hf_config, "model_type", None) in (
+            "kimi_linear",
+            "glm5_next_text",
         )
 
     def _replayssm_bytes_per_slot(self) -> int:
