@@ -41,19 +41,26 @@ def test_device_sync_submission_defers_host_wait(monkeypatch):
             self.synchronize_calls += 1
 
     stream = FakeStream()
-    completion_event = FakeEvent()
-    local_cpu = torch.empty(DP_METADATA_MAX_FIELDS, dtype=torch.int32)
-    gathered_cpu = torch.empty(2 * DP_METADATA_MAX_FIELDS, dtype=torch.int32)
-    buffers = SimpleNamespace(
+    slots = []
+    for _ in range(2):
+        local_cpu = torch.empty(DP_METADATA_MAX_FIELDS, dtype=torch.int32)
+        gathered_cpu = torch.empty(2 * DP_METADATA_MAX_FIELDS, dtype=torch.int32)
+        slots.append(
+            SimpleNamespace(
+                local_cpu=local_cpu,
+                local_device=torch.empty_like(local_cpu),
+                gathered_device=torch.empty_like(gathered_cpu),
+                gathered_cpu=gathered_cpu,
+                local_numpy=local_cpu.numpy(),
+                gathered_numpy=gathered_cpu.numpy(),
+                completion_event=FakeEvent(),
+                in_use=False,
+            )
+        )
+    buffers = DPMetadataBuffers(
         dp_size=2,
-        local_cpu=local_cpu,
-        local_device=torch.empty_like(local_cpu),
-        gathered_device=torch.empty_like(gathered_cpu),
-        gathered_cpu=gathered_cpu,
-        local_numpy=local_cpu.numpy(),
-        gathered_numpy=gathered_cpu.numpy(),
+        slots=tuple(slots),
         stream=stream,
-        completion_event=completion_event,
     )
 
     monkeypatch.setattr(torch.cuda, "stream", lambda unused: nullcontext())
@@ -61,7 +68,8 @@ def test_device_sync_submission_defers_host_wait(monkeypatch):
     def fake_all_gather_into_tensor(output, local, group=None):
         del group
         peer = local.clone()
-        peer[:] = torch.tensor([17, 3, 1, 1, 1, 8, 9, 5])
+        peer_values = [17, 3, 1, 1, 1, 8, 9, 5]
+        peer[:] = torch.tensor(peer_values[: local.numel()])
         output.copy_(torch.cat((local, peer)))
 
     monkeypatch.setattr(
@@ -83,12 +91,15 @@ def test_device_sync_submission_defers_host_wait(monkeypatch):
     )
 
     assert stream.synchronize_calls == 0
-    assert buffers.local_device.tolist() == [11, 2, 1, 0, 1, 5, 6, 4]
+    assert pending.buffer_slot == 0
+    assert slots[0].in_use
+    assert slots[0].local_device.tolist() == [11, 2, 1, 0, 1, 5, 6, 4]
 
     result = finish_sync_dp_metadata(pending)
     assert stream.synchronize_calls == 0
-    assert completion_event.record_calls == 1
-    assert completion_event.synchronize_calls == 1
+    assert slots[0].completion_event.record_calls == 1
+    assert slots[0].completion_event.synchronize_calls == 1
+    assert not slots[0].in_use
     assert result.num_tokens_across_dp.tolist() == [11, 17]
     assert result.max_tokens_across_dp_cpu.item() == 17
     assert result.cu_tokens_across_dp_cpu.tolist() == [11, 28]
@@ -102,7 +113,40 @@ def test_device_sync_submission_defers_host_wait(monkeypatch):
     # Finishing twice is harmless and never adds a second host wait.
     assert finish_sync_dp_metadata(pending) is result
     assert stream.synchronize_calls == 0
-    assert completion_event.synchronize_calls == 1
+    assert slots[0].completion_event.synchronize_calls == 1
+
+    # The following generation must use the other slot even though slot zero
+    # is already free. This avoids an adjacent-generation reuse dependency.
+    second = begin_sync_dp_metadata(
+        dp_group=object(),
+        dp_size=2,
+        buffers=buffers,
+        scheduled_tokens=12,
+        scheduled_bs=2,
+        is_prefill=False,
+        tbo_on=False,
+    )
+    assert second.buffer_slot == 1
+    assert slots[1].in_use
+    finish_sync_dp_metadata(second)
+    assert not slots[1].in_use
+
+
+def test_device_sync_ring_rejects_a_third_outstanding_generation():
+    slots = tuple(SimpleNamespace(in_use=False) for _ in range(2))
+    buffers = DPMetadataBuffers(dp_size=2, slots=slots, stream=SimpleNamespace())
+
+    first_index, _ = buffers.acquire_slot()
+    second_index, _ = buffers.acquire_slot()
+    assert (first_index, second_index) == (0, 1)
+    with pytest.raises(RuntimeError, match="ring exhausted"):
+        buffers.acquire_slot()
+
+    buffers.release_slot(first_index)
+    reused_index, _ = buffers.acquire_slot()
+    assert reused_index == first_index
+    buffers.release_slot(second_index)
+    buffers.release_slot(reused_index)
 
 
 def _device_sync_worker(rank: int, world_size: int, init_file: str) -> None:
@@ -115,12 +159,15 @@ def _device_sync_worker(rank: int, world_size: int, init_file: str) -> None:
     )
     try:
         buffers = DPMetadataBuffers.allocate(world_size, torch.device("cuda", rank))
-        buffer_ptrs = {
-            "local_cpu": buffers.local_cpu.data_ptr(),
-            "local_device": buffers.local_device.data_ptr(),
-            "gathered_device": buffers.gathered_device.data_ptr(),
-            "gathered_cpu": buffers.gathered_cpu.data_ptr(),
-        }
+        buffer_ptrs = tuple(
+            {
+                "local_cpu": slot.local_cpu.data_ptr(),
+                "local_device": slot.local_device.data_ptr(),
+                "gathered_device": slot.gathered_device.data_ptr(),
+                "gathered_cpu": slot.gathered_cpu.data_ptr(),
+            }
+            for slot in buffers.slots
+        )
         result = sync_dp_metadata(
             dp_group=dist.group.WORLD,
             dp_size=world_size,
@@ -143,10 +190,13 @@ def _device_sync_worker(rank: int, world_size: int, init_file: str) -> None:
         assert result.ub_max_tokens_across_dp == (8, 9)
         assert result.max_seqlen_q_across_dp == 5
 
-        assert buffers.local_cpu.is_pinned()
-        assert buffers.gathered_cpu.is_pinned()
+        assert len(buffers.slots) == 2
+        assert all(slot.local_cpu.is_pinned() for slot in buffers.slots)
+        assert all(slot.gathered_cpu.is_pinned() for slot in buffers.slots)
         assert buffers.stream != torch.cuda.current_stream(rank)
-        assert buffers.local_device[:DP_METADATA_MAX_FIELDS].cpu().tolist() == [
+        assert buffers.stream.priority < torch.cuda.current_stream(rank).priority
+        first_slot = buffers.slots[0]
+        assert first_slot.local_device[:DP_METADATA_MAX_FIELDS].cpu().tolist() == [
             11 + 6 * rank,
             2 + rank,
             1,
@@ -156,7 +206,7 @@ def _device_sync_worker(rank: int, world_size: int, init_file: str) -> None:
             6 + 3 * rank,
             4 + rank,
         ]
-        assert buffers.gathered_device.view(
+        assert first_slot.gathered_device.view(
             world_size, DP_METADATA_MAX_FIELDS
         ).cpu().tolist() == [
             [11, 2, 1, 0, 1, 5, 6, 4],
@@ -184,13 +234,20 @@ def _device_sync_worker(rank: int, world_size: int, init_file: str) -> None:
         )
         small = small_mode.sync
         assert small is not None
-        assert {
-            "local_cpu": buffers.local_cpu.data_ptr(),
-            "local_device": buffers.local_device.data_ptr(),
-            "gathered_device": buffers.gathered_device.data_ptr(),
-            "gathered_cpu": buffers.gathered_cpu.data_ptr(),
-        } == buffer_ptrs
-        assert buffers.gathered_device[: world_size * 3].cpu().tolist() == [
+        assert (
+            tuple(
+                {
+                    "local_cpu": slot.local_cpu.data_ptr(),
+                    "local_device": slot.local_device.data_ptr(),
+                    "gathered_device": slot.gathered_device.data_ptr(),
+                    "gathered_cpu": slot.gathered_cpu.data_ptr(),
+                }
+                for slot in buffers.slots
+            )
+            == buffer_ptrs
+        )
+        second_slot = buffers.slots[1]
+        assert second_slot.gathered_device[: world_size * 3].cpu().tolist() == [
             4,
             4,
             0,
@@ -200,8 +257,8 @@ def _device_sync_worker(rank: int, world_size: int, init_file: str) -> None:
         ]
         assert small.num_tokens_across_dp.tolist() == [4, 5]
         assert small.max_bs_across_dp == 5
-        # The returned rank vector owns its storage; reusing the pinned D2H
-        # landing buffer for this second call must not mutate the first result.
+        # The returned rank vector owns its storage independently of every
+        # ring slot; using the second slot must not mutate the first result.
         assert result.num_tokens_across_dp.tolist() == [11, 17]
     finally:
         dist.destroy_process_group()

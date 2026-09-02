@@ -562,6 +562,7 @@ class Drafter(abc.ABC):
         running_tokens: int,
         *,
         running_tokens_are_unified: bool,
+        precomputed_dp_metadata: DPMetadata | None = None,
     ) -> None:
         """Re-point the forward context at the pass about to run.
 
@@ -579,9 +580,10 @@ class Drafter(abc.ABC):
         see either. `running_tokens_are_unified` claims every OTHER rank runs
         this height too -- true where it is `context.running_bs` (`decide`'s
         reduction) times a config width, false where it came off this rank's
-        own batch or token stream. `is_prefill` is left alone for the same
-        reason: a pass on its own `[bs, T]` shape must clear it, one carrying
-        the target's stream must not.
+        own batch or token stream. `precomputed_dp_metadata` carries a table a
+        preceding pass already reduced for this exact token stream. `is_prefill`
+        is left alone for the same reason: a pass on its own `[bs, T]` shape
+        must clear it, one carrying the target's stream must not.
         """
         context = forward_context.context
         context.scheduled_tokens = scheduled_tokens
@@ -591,6 +593,13 @@ class Drafter(abc.ABC):
         if parallel_config.data_parallel_size <= 1:
             return
         context.running_tokens_are_unified = running_tokens_are_unified
+        if precomputed_dp_metadata is not None:
+            # Eagle step 0 consumes the target's exact, unpadded input stream.
+            # Its per-rank row counts were already returned by the target's
+            # packed DP metadata exchange, so asking Gloo for the same table a
+            # second time only serializes the proposal launch.
+            forward_context.dp_metadata = precomputed_dp_metadata
+            return
         # The answer travels, not the table it implies -- `make` owns both ways
         # of reaching one, and skipping its all_reduce is why this is worth
         # stating at all.

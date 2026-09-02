@@ -3,7 +3,7 @@
 
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import torch
@@ -12,29 +12,45 @@ from atom.config import get_current_atom_config
 
 # Largest packed metadata vector: 7 base/TBO fields plus one DSpark field.
 DP_METADATA_MAX_FIELDS = 8
+DP_METADATA_BUFFER_SLOTS = 2
+DP_METADATA_STREAM_PRIORITY = -1
 
 
 @dataclass
-class DPMetadataBuffers:
-    """Persistent staging for the device/RCCL metadata path.
+class _DPMetadataBufferSlot:
+    """One generation of reusable DP metadata staging storage."""
 
-    The scheduler produces all fields on the host, so putting them into a GPU
-    tensor one scalar at a time turns each assignment into a synchronous H2D
-    runtime call.  Keep both directions pinned and reuse one device pair so a
-    step is exactly one H2D, one collective, and one D2H on an independent
-    stream.  A completion event fences the trailing D2H before Python consumes
-    the gathered values.
-    """
-
-    dp_size: int
     local_cpu: torch.Tensor
     local_device: torch.Tensor
     gathered_device: torch.Tensor
     gathered_cpu: torch.Tensor
     local_numpy: np.ndarray
     gathered_numpy: np.ndarray
-    stream: torch.cuda.Stream
     completion_event: torch.cuda.Event
+    in_use: bool = False
+
+
+@dataclass
+class DPMetadataBuffers:
+    """Double-buffered staging for the device/RCCL metadata path.
+
+    The scheduler produces all fields on the host, so putting them into a GPU
+    tensor one scalar at a time turns each assignment into a synchronous H2D
+    runtime call. Each slot keeps both directions pinned and one device pair so
+    a step is exactly one H2D, one collective, and one D2H. Alternating slots
+    prevents the next generation from inheriting an allocator/ownership fence
+    from the tensors used by the previous generation.
+
+    Both slots share a high-priority stream. The tiny metadata chain can then
+    be dispatched between proposal kernels on the regular-priority compute
+    stream. A per-slot completion event fences the trailing D2H before Python
+    consumes that slot's gathered values.
+    """
+
+    dp_size: int
+    slots: tuple[_DPMetadataBufferSlot, ...]
+    stream: torch.cuda.Stream
+    _next_slot: int = field(default=0, init=False, repr=False)
 
     @classmethod
     def allocate(cls, dp_size: int, device: torch.device | str) -> "DPMetadataBuffers":
@@ -44,32 +60,68 @@ class DPMetadataBuffers:
         if device.type != "cuda":
             raise ValueError("device metadata sync needs a CUDA/ROCm device")
 
-        local_cpu = torch.empty(
-            DP_METADATA_MAX_FIELDS,
-            dtype=torch.int32,
-            device="cpu",
-            pin_memory=True,
+        # A negative CUDA/ROCm stream priority is higher than the default
+        # priority (zero). The metadata payload is tiny, so prioritising this
+        # stream lets it occupy proposal-kernel boundaries without moving the
+        # proposal itself or introducing a compute-stream wait.
+        stream = torch.cuda.Stream(
+            device=device,
+            priority=DP_METADATA_STREAM_PRIORITY,
         )
-        gathered_cpu = torch.empty(
-            dp_size * DP_METADATA_MAX_FIELDS,
-            dtype=torch.int32,
-            device="cpu",
-            pin_memory=True,
-        )
-        return cls(
-            dp_size=dp_size,
-            local_cpu=local_cpu,
-            local_device=torch.empty_like(local_cpu, device=device),
-            gathered_device=torch.empty_like(gathered_cpu, device=device),
-            gathered_cpu=gathered_cpu,
-            local_numpy=local_cpu.numpy(),
-            gathered_numpy=gathered_cpu.numpy(),
-            stream=torch.cuda.Stream(device=device),
-            # A non-blocking event uses the runtime's active-wait completion
-            # path.  Synchronizing the whole stream added a sizeable host wake
-            # delay after the tiny metadata D2H had already completed.
-            completion_event=torch.cuda.Event(enable_timing=False, blocking=False),
-        )
+        slots = []
+        for _ in range(DP_METADATA_BUFFER_SLOTS):
+            local_cpu = torch.empty(
+                DP_METADATA_MAX_FIELDS,
+                dtype=torch.int32,
+                device="cpu",
+                pin_memory=True,
+            )
+            gathered_cpu = torch.empty(
+                dp_size * DP_METADATA_MAX_FIELDS,
+                dtype=torch.int32,
+                device="cpu",
+                pin_memory=True,
+            )
+            slots.append(
+                _DPMetadataBufferSlot(
+                    local_cpu=local_cpu,
+                    local_device=torch.empty_like(local_cpu, device=device),
+                    gathered_device=torch.empty_like(gathered_cpu, device=device),
+                    gathered_cpu=gathered_cpu,
+                    local_numpy=local_cpu.numpy(),
+                    gathered_numpy=gathered_cpu.numpy(),
+                    # A non-blocking event uses the runtime's active-wait
+                    # completion path. Synchronizing the whole stream added a
+                    # sizeable host wake delay after the tiny D2H completed.
+                    completion_event=torch.cuda.Event(
+                        enable_timing=False,
+                        blocking=False,
+                    ),
+                )
+            )
+        return cls(dp_size=dp_size, slots=tuple(slots), stream=stream)
+
+    def acquire_slot(self) -> tuple[int, _DPMetadataBufferSlot]:
+        """Reserve the next ring slot until its pending result is consumed."""
+
+        slot_index = self._next_slot
+        slot = self.slots[slot_index]
+        if slot.in_use:
+            raise RuntimeError(
+                "DP metadata ring exhausted: finish an outstanding sync before "
+                f"reusing slot {slot_index}"
+            )
+        slot.in_use = True
+        self._next_slot = (slot_index + 1) % len(self.slots)
+        return slot_index, slot
+
+    def release_slot(self, slot_index: int) -> None:
+        """Return a completed ring slot to the producer."""
+
+        slot = self.slots[slot_index]
+        if not slot.in_use:
+            raise RuntimeError(f"DP metadata slot {slot_index} is not in use")
+        slot.in_use = False
 
 
 def tbo_overlap_enabled() -> bool:
@@ -270,9 +322,10 @@ class PendingDPMetadataSync:
 
     The device path deliberately separates submission from consumption so the
     H2D, RCCL, and D2H can run while the caller prepares inputs that do not
-    depend on the group-wide result.  ``sync`` aliases the reusable pinned
+    depend on the group-wide result. ``sync`` aliases one ring slot's pinned
     landing buffer until :func:`finish_sync_dp_metadata` clones the retained
-    rank vector, so callers must finish one ticket before reusing its buffers.
+    rank vector and releases that slot. Two tickets may therefore be in flight,
+    but a third submission must wait for one of them to be consumed.
     """
 
     sync: torch.Tensor
@@ -282,6 +335,8 @@ class PendingDPMetadataSync:
     completion_event: torch.cuda.Event | None
     sync_numpy: np.ndarray | None
     clone_rank_tokens: bool
+    buffers: DPMetadataBuffers | None = None
+    buffer_slot: int | None = None
     result: DPSyncResult | None = None
 
 
@@ -368,54 +423,54 @@ def begin_sync_dp_metadata(
             f"metadata buffers are for dp_size={buffers.dp_size}, got {dp_size}"
         )
 
-    # Pack on the CPU as one vector. Assigning these fields directly to a
-    # device tensor emits one synchronous hipMemcpyWithStream per scalar.
-    buffers.local_numpy[:n_fields] = fields
-    local_cpu = buffers.local_cpu[:n_fields]
-    local_device = buffers.local_device[:n_fields]
-    required_numel = dp_size * n_fields
-    gathered_device = buffers.gathered_device[:required_numel]
-    gathered_cpu = buffers.gathered_cpu[:required_numel]
+    slot_index, slot = buffers.acquire_slot()
+    try:
+        # Pack on the CPU as one vector. Assigning these fields directly to a
+        # device tensor emits one synchronous hipMemcpyWithStream per scalar.
+        slot.local_numpy[:n_fields] = fields
+        local_cpu = slot.local_cpu[:n_fields]
+        local_device = slot.local_device[:n_fields]
+        required_numel = dp_size * n_fields
+        gathered_device = slot.gathered_device[:required_numel]
+        gathered_cpu = slot.gathered_cpu[:required_numel]
 
-    # Submit the complete dependency chain now, but do not block the host here.
-    # ProcessGroupNCCL orders its output on this stream, so the trailing D2H is
-    # the completion fence for the whole exchange.
-    with torch.cuda.stream(buffers.stream):
-        local_device.copy_(local_cpu, non_blocking=True)
-        torch.distributed.all_gather_into_tensor(
-            gathered_device, local_device, group=dp_group
-        )
-        gathered_cpu.copy_(gathered_device, non_blocking=True)
-        buffers.completion_event.record()
+        # Submit the complete dependency chain now, but do not block the host.
+        # ProcessGroupNCCL orders its output on the high-priority metadata
+        # stream, so the trailing D2H is the completion fence for this slot.
+        with torch.cuda.stream(buffers.stream):
+            local_device.copy_(local_cpu, non_blocking=True)
+            torch.distributed.all_gather_into_tensor(
+                gathered_device, local_device, group=dp_group
+            )
+            gathered_cpu.copy_(gathered_device, non_blocking=True)
+            slot.completion_event.record()
+    except Exception:
+        buffers.release_slot(slot_index)
+        raise
 
     return PendingDPMetadataSync(
         sync=gathered_cpu.view(dp_size, n_fields).T,
         tbo_on=tbo_on,
         dspark_on=max_seqlen_q is not None,
         completion_stream=buffers.stream,
-        completion_event=buffers.completion_event,
-        sync_numpy=buffers.gathered_numpy[:required_numel].reshape(dp_size, n_fields).T,
+        completion_event=slot.completion_event,
+        sync_numpy=slot.gathered_numpy[:required_numel].reshape(dp_size, n_fields).T,
         clone_rank_tokens=True,
+        buffers=buffers,
+        buffer_slot=slot_index,
     )
 
 
-def finish_sync_dp_metadata(pending: PendingDPMetadataSync) -> DPSyncResult:
-    """Wait at first consumption and decode a pending packed exchange."""
-
-    if pending.result is not None:
-        return pending.result
-    if pending.completion_event is not None:
-        pending.completion_event.synchronize()
-    elif pending.completion_stream is not None:
-        pending.completion_stream.synchronize()
+def _decode_dp_metadata_result(pending: PendingDPMetadataSync) -> DPSyncResult:
+    """Decode one completed host landing buffer without owning its slot."""
 
     sync = pending.sync
     sync_np = pending.sync_numpy if pending.sync_numpy is not None else sync.numpy()
     tbo_on = pending.tbo_on
     dspark_on = pending.dspark_on
 
-    # Device sync reuses its host landing buffer next step. Preserve the old
-    # result-ownership contract for callers that retain the ForwardMode.
+    # Preserve the old ownership contract for callers that retain the
+    # ForwardMode after this ring slot is released and reused.
     if pending.clone_rank_tokens:
         # Keep result ownership without routing an eight-element copy through
         # the PyTorch dispatcher.  The NumPy allocation is owned by the tensor
@@ -457,7 +512,7 @@ def finish_sync_dp_metadata(pending: PendingDPMetadataSync) -> DPSyncResult:
         tbo_fields = 7 if tbo_on else 3
         max_seqlen_q_across_dp = int(sync_np[tbo_fields].max())
 
-    pending.result = DPSyncResult(
+    return DPSyncResult(
         num_tokens_across_dp=num_tokens_across_dp,
         max_tokens_across_dp_cpu=max_tokens_across_dp_cpu,
         cu_tokens_across_dp_cpu=cu_tokens_across_dp_cpu,
@@ -468,6 +523,25 @@ def finish_sync_dp_metadata(pending: PendingDPMetadataSync) -> DPSyncResult:
         ub_max_tokens_across_dp=ub_max_tokens_across_dp,
         max_seqlen_q_across_dp=max_seqlen_q_across_dp,
     )
+
+
+def finish_sync_dp_metadata(pending: PendingDPMetadataSync) -> DPSyncResult:
+    """Wait at first consumption, decode the result, and release its slot."""
+
+    if pending.result is not None:
+        return pending.result
+    try:
+        if pending.completion_event is not None:
+            pending.completion_event.synchronize()
+        elif pending.completion_stream is not None:
+            pending.completion_stream.synchronize()
+        pending.result = _decode_dp_metadata_result(pending)
+    finally:
+        if pending.buffers is not None and pending.buffer_slot is not None:
+            pending.buffers.release_slot(pending.buffer_slot)
+            pending.buffers = None
+            pending.buffer_slot = None
+    assert pending.result is not None
     return pending.result
 
 
