@@ -31,8 +31,6 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
-
 from atom.spec_decode.draft_kv_layout import use_flash_layout
 
 _ROOT = Path(__file__).resolve().parents[1]

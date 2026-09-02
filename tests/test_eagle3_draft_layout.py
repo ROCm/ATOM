@@ -126,10 +126,10 @@ def test_the_builder_publishes_its_choice_for_the_proposer():
     assert b.uses_flash_layout is True
 
     b2, _ = _builder_and_module(_impl(triton=False))
-    b2.build_kv_cache_tensor(0, SimpleNamespace(
-        base_attention=True, use_mla=False, impl=_impl(triton=True)
-    ))
-    b2.build_kv_cache_tensor(1, SimpleNamespace(
-        base_attention=True, use_mla=False, impl=_impl(triton=False)
-    ))
+    b2.build_kv_cache_tensor(
+        0, SimpleNamespace(base_attention=True, use_mla=False, impl=_impl(triton=True))
+    )
+    b2.build_kv_cache_tensor(
+        1, SimpleNamespace(base_attention=True, use_mla=False, impl=_impl(triton=False))
+    )
     assert b2.uses_flash_layout is True
