@@ -1,7 +1,13 @@
 use std::sync::Arc;
 
 use clap::Parser;
-use pyo3::{exceptions::PyRuntimeError, prelude::*, types::PyDict};
+use parking_lot::Mutex;
+use pyo3::{
+    exceptions::{PyRuntimeError, PyValueError},
+    prelude::*,
+    types::{PyAnyMethods, PyBytes, PyDict, PyDictMethods, PyList, PyListMethods},
+};
+use serde_json::{Map, Value};
 
 use crate::{
     cliargs::{
@@ -9,7 +15,12 @@ use crate::{
         parse_prefill_args_from, Backend, Cli, CliArgs, Commands,
     },
     config::RoutingMode,
-    routers::atom_standalone::AtomStandaloneRuntime,
+    routers::{
+        atom_standalone::AtomStandaloneRuntime,
+        engine_core::{
+            EngineCoreClient, EngineCoreEndpoint, EngineCoreEndpointTopology, EngineCoreTransport,
+        },
+    },
     server::{self, ServerConfig},
     version,
 };
@@ -17,6 +28,176 @@ use crate::{
 #[pyclass(name = "ServerConfig")]
 pub struct PyServerConfig {
     inner: Option<ServerConfig>,
+}
+
+#[pyclass(name = "EngineCoreIpcRuntime")]
+pub struct PyEngineCoreIpcRuntime {
+    pub(crate) inner: Arc<Mutex<EngineCoreTransport>>,
+    pub(crate) block_size: i32,
+    pub(crate) max_model_len: i64,
+    pub(crate) max_pool_tokens: Option<i64>,
+    pub(crate) client_slot: Arc<Mutex<Option<Arc<EngineCoreClient>>>>,
+    pub(crate) dp_load_balance: String,
+    pub(crate) dp_lb_request_equivalent: u64,
+    pub(crate) num_draft_tokens: i32,
+    pub(crate) has_per_req_cache: bool,
+    pub(crate) session_affinity_enabled: bool,
+    pub(crate) dp_attention_enabled: bool,
+}
+
+impl PyEngineCoreIpcRuntime {
+    fn active_client(&self) -> PyResult<Arc<EngineCoreClient>> {
+        self.client_slot.lock().clone().ok_or_else(|| {
+            PyRuntimeError::new_err(
+                "EngineCore client is not active; launch_mesh has not completed socket handoff",
+            )
+        })
+    }
+}
+
+#[pymethods]
+impl PyEngineCoreIpcRuntime {
+    fn wait_until_all_connected(&self, py: Python<'_>) -> PyResult<()> {
+        py.detach(|| {
+            self.inner
+                .lock()
+                .wait_until_all_connected()
+                .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+        })
+    }
+
+    fn wait_until_all_ready(&mut self, py: Python<'_>) -> PyResult<Vec<(usize, Option<i64>)>> {
+        let capacities = py.detach(|| {
+            self.inner
+                .lock()
+                .wait_until_all_ready()
+                .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+        })?;
+        self.max_pool_tokens = capacities.values().filter_map(|capacity| *capacity).min();
+        Ok(capacities.into_iter().collect())
+    }
+
+    fn shutdown_engine_cores(&self, py: Python<'_>) -> PyResult<()> {
+        if let Some(client) = self.client_slot.lock().clone() {
+            return py.detach(|| {
+                client
+                    .shutdown()
+                    .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+            });
+        }
+        py.detach(|| {
+            self.inner
+                .lock()
+                .send_shutdown_all()
+                .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+        })
+    }
+
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
+        self.shutdown_engine_cores(py)
+    }
+
+    fn mark_engine_failed(&self, engine_rank: usize, message: String) -> PyResult<()> {
+        self.active_client()?
+            .mark_engine_failed(engine_rank, message)
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+    }
+
+    fn mark_rank_failed(&self, rank: usize, message: String) -> PyResult<()> {
+        self.active_client()?
+            .mark_rank_failed(rank, message)
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+    }
+
+    fn send_control_frame(
+        &self,
+        py: Python<'_>,
+        dp_rank: usize,
+        protobuf_bytes: &[u8],
+    ) -> PyResult<String> {
+        let client = self.active_client()?;
+        py.detach(|| {
+            client
+                .send_control_frame(dp_rank, protobuf_bytes)
+                .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+        })
+    }
+
+    fn broadcast_control_frame(&self, py: Python<'_>, protobuf_bytes: &[u8]) -> PyResult<String> {
+        let client = self.active_client()?;
+        py.detach(|| {
+            client
+                .broadcast_control_frame(protobuf_bytes)
+                .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+        })
+    }
+
+    #[pyo3(signature = (protobuf_bytes, expected_count = None, timeout_ms = 300_000))]
+    fn execute_control_frame_all(
+        &self,
+        py: Python<'_>,
+        protobuf_bytes: &[u8],
+        expected_count: Option<usize>,
+        timeout_ms: u64,
+    ) -> PyResult<Vec<(usize, Py<PyBytes>)>> {
+        if timeout_ms == 0 {
+            return Err(PyValueError::new_err("timeout_ms must be positive"));
+        }
+        let client = self.active_client()?;
+        let frames = py.detach(|| {
+            client
+                .execute_control_frame_all_blocking(
+                    protobuf_bytes,
+                    expected_count,
+                    std::time::Duration::from_millis(timeout_ms),
+                )
+                .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+        })?;
+        Ok(frames
+            .into_iter()
+            .map(|(rank, frame)| (rank, PyBytes::new(py, &frame).unbind()))
+            .collect())
+    }
+
+    #[pyo3(signature = (command, expected_count = None, timeout_ms = 300_000))]
+    fn wait_utility_responses(
+        &self,
+        py: Python<'_>,
+        command: &str,
+        expected_count: Option<usize>,
+        timeout_ms: u64,
+    ) -> PyResult<Vec<(usize, Py<PyBytes>)>> {
+        if timeout_ms == 0 {
+            return Err(PyValueError::new_err("timeout_ms must be positive"));
+        }
+        let client = self.active_client()?;
+        let expected = expected_count.unwrap_or_else(|| client.total_rank_count());
+        let command = command.to_string();
+        let frames = py.detach(|| {
+            let deadline = std::time::Instant::now()
+                .checked_add(std::time::Duration::from_millis(timeout_ms))
+                .ok_or_else(|| PyValueError::new_err("timeout_ms is too large"))?;
+            let mut responses = std::collections::BTreeMap::new();
+            loop {
+                responses.extend(client.take_utility_response_frames(&command));
+                if responses.len() >= expected {
+                    return Ok(responses.into_iter().collect::<Vec<_>>());
+                }
+                if std::time::Instant::now() >= deadline {
+                    client.poison_utility_command(&command);
+                    return Err(PyRuntimeError::new_err(format!(
+                        "timed out waiting for {expected} EngineCore responses to {command:?}; got ranks {:?}",
+                        responses.keys().collect::<Vec<_>>()
+                    )));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        })?;
+        Ok(frames
+            .into_iter()
+            .map(|(rank, frame)| (rank, PyBytes::new(py, &frame).unbind()))
+            .collect())
+    }
 }
 
 #[pymethods]
@@ -52,27 +233,232 @@ impl PyServerConfig {
 
 #[pyfunction]
 #[pyo3(signature = (
+    engine_core_endpoints,
+    block_size,
+    max_model_len,
+    dp_load_balance = "round_robin",
+    dp_lb_request_equivalent = 256,
+    num_draft_tokens = 0,
+    has_per_req_cache = false,
+    receive_timeout_ms = 300_000,
+    session_affinity_enabled = false,
+    dp_attention_enabled = false
+))]
+pub fn bind_engine_core_ipc(
+    py: Python<'_>,
+    engine_core_endpoints: Py<PyAny>,
+    block_size: i32,
+    max_model_len: i64,
+    dp_load_balance: &str,
+    dp_lb_request_equivalent: u64,
+    num_draft_tokens: i32,
+    has_per_req_cache: bool,
+    receive_timeout_ms: i32,
+    session_affinity_enabled: bool,
+    dp_attention_enabled: bool,
+) -> PyResult<Py<PyEngineCoreIpcRuntime>> {
+    if receive_timeout_ms <= 0 {
+        return Err(PyValueError::new_err(
+            "receive_timeout_ms must be a positive integer",
+        ));
+    }
+    if block_size <= 0 {
+        return Err(PyValueError::new_err("block_size must be positive"));
+    }
+    if max_model_len <= 0 {
+        return Err(PyValueError::new_err("max_model_len must be positive"));
+    }
+    if num_draft_tokens < 0 {
+        return Err(PyValueError::new_err(
+            "num_draft_tokens must be non-negative",
+        ));
+    }
+    if !matches!(
+        dp_load_balance,
+        "round_robin" | "least_requests" | "least_tokens"
+    ) {
+        return Err(PyValueError::new_err(format!(
+            "unsupported dp_load_balance strategy {dp_load_balance:?}"
+        )));
+    }
+    let topology = extract_engine_core_topology(py, engine_core_endpoints)?;
+    let transport = EngineCoreTransport::bind(&topology, receive_timeout_ms)
+        .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+    Py::new(
+        py,
+        PyEngineCoreIpcRuntime {
+            inner: Arc::new(Mutex::new(transport)),
+            block_size,
+            max_model_len,
+            max_pool_tokens: None,
+            client_slot: Arc::new(Mutex::new(None)),
+            dp_load_balance: dp_load_balance.to_string(),
+            dp_lb_request_equivalent,
+            num_draft_tokens,
+            has_per_req_cache,
+            session_affinity_enabled,
+            dp_attention_enabled,
+        },
+    )
+}
+
+fn extract_engine_core_topology(
+    py: Python<'_>,
+    engine_core_endpoints: Py<PyAny>,
+) -> PyResult<EngineCoreEndpointTopology> {
+    let endpoint_list = engine_core_endpoints
+        .bind(py)
+        .cast::<PyList>()
+        .map_err(|_| PyValueError::new_err("engine_core_endpoints must be a list"))?;
+    if endpoint_list.is_empty() {
+        return Err(PyValueError::new_err(
+            "engine_core_endpoints must contain at least one endpoint",
+        ));
+    }
+
+    let mut endpoints = Vec::with_capacity(endpoint_list.len());
+    for (index, endpoint) in endpoint_list.iter().enumerate() {
+        let endpoint = endpoint.cast::<PyDict>().map_err(|_| {
+            PyValueError::new_err(format!("engine_core_endpoints[{index}] must be a mapping"))
+        })?;
+        let required = |key: &str| {
+            endpoint.get_item(key)?.ok_or_else(|| {
+                PyValueError::new_err(format!("engine_core_endpoints[{index}].{key} is required"))
+            })
+        };
+        let dp_rank = required("dp_rank")?.extract::<usize>().map_err(|_| {
+            PyValueError::new_err(format!(
+                "engine_core_endpoints[{index}].dp_rank must be non-negative"
+            ))
+        })?;
+        let optional_rank = |key: &str, default: usize| -> PyResult<usize> {
+            match endpoint.get_item(key)? {
+                Some(value) => value.extract::<usize>().map_err(|_| {
+                    PyValueError::new_err(format!(
+                        "engine_core_endpoints[{index}].{key} must be non-negative"
+                    ))
+                }),
+                None => Ok(default),
+            }
+        };
+        // Preserve the pre-PP endpoint schema for external PP=1 callers.
+        let engine_rank = optional_rank("engine_rank", dp_rank)?;
+        let pp_rank = optional_rank("pp_rank", 0)?;
+        let address = |key: &str| {
+            required(key)?.extract::<String>().map_err(|_| {
+                PyValueError::new_err(format!(
+                    "engine_core_endpoints[{index}].{key} must be a string"
+                ))
+            })
+        };
+        endpoints.push(EngineCoreEndpoint {
+            engine_rank,
+            dp_rank,
+            pp_rank,
+            input_address: address("input_address")?,
+            control_address: address("control_address")?,
+            output_address: address("output_address")?,
+        });
+    }
+
+    EngineCoreEndpointTopology::new(endpoints).map_err(PyValueError::new_err)
+}
+
+#[pyfunction]
+#[pyo3(signature = (
     *,
     server_config,
-    standalone_service = None
+    standalone_service = None,
+    engine_core_ipc = None,
+    default_chat_template_kwargs = None
 ))]
 pub fn launch_mesh(
     py: Python<'_>,
     mut server_config: PyRefMut<'_, PyServerConfig>,
     standalone_service: Option<Py<PyAny>>,
+    engine_core_ipc: Option<Py<PyEngineCoreIpcRuntime>>,
+    default_chat_template_kwargs: Option<Py<PyAny>>,
 ) -> PyResult<()> {
-    let runtime = standalone_service.map(|service| {
-        Arc::new(AtomStandaloneRuntime {
-            service,
-            close_service_on_shutdown: false,
-        })
-    });
-
+    let default_chat_template_kwargs = extract_json_object(py, default_chat_template_kwargs)?;
     let mut server_config = server_config.inner.take().unwrap();
+    let shutdown_grace_period_secs = server_config.shutdown_grace_period_secs;
+    let runtime = match (standalone_service, engine_core_ipc) {
+        (Some(_), Some(_)) => {
+            return Err(PyValueError::new_err(
+                "standalone_service and engine_core_ipc are mutually exclusive",
+            ));
+        }
+        (Some(service), None) => Some(Arc::new(AtomStandaloneRuntime {
+            service: Some(service),
+            engine_core_transport: None,
+            engine_core_block_size: None,
+            engine_core_max_model_len: None,
+            engine_core_max_pool_tokens: None,
+            engine_core_client_slot: None,
+            engine_core_shutdown_grace_period_secs: shutdown_grace_period_secs,
+            engine_core_dp_load_balance: None,
+            engine_core_dp_lb_request_equivalent: None,
+            engine_core_num_draft_tokens: None,
+            engine_core_has_per_req_cache: None,
+            engine_core_session_affinity_enabled: false,
+            engine_core_dp_attention_enabled: false,
+            default_chat_template_kwargs: default_chat_template_kwargs.clone(),
+            close_service_on_shutdown: false,
+        })),
+        (None, Some(engine_core_ipc)) => Some(Arc::new(AtomStandaloneRuntime {
+            service: None,
+            engine_core_transport: Some(engine_core_ipc.bind(py).borrow().inner.clone()),
+            engine_core_block_size: Some(engine_core_ipc.bind(py).borrow().block_size),
+            engine_core_max_model_len: Some(engine_core_ipc.bind(py).borrow().max_model_len),
+            engine_core_max_pool_tokens: engine_core_ipc.bind(py).borrow().max_pool_tokens,
+            engine_core_client_slot: Some(engine_core_ipc.bind(py).borrow().client_slot.clone()),
+            engine_core_shutdown_grace_period_secs: shutdown_grace_period_secs,
+            engine_core_dp_load_balance: Some(
+                engine_core_ipc.bind(py).borrow().dp_load_balance.clone(),
+            ),
+            engine_core_dp_lb_request_equivalent: Some(
+                engine_core_ipc.bind(py).borrow().dp_lb_request_equivalent,
+            ),
+            engine_core_num_draft_tokens: Some(engine_core_ipc.bind(py).borrow().num_draft_tokens),
+            engine_core_has_per_req_cache: Some(
+                engine_core_ipc.bind(py).borrow().has_per_req_cache,
+            ),
+            engine_core_session_affinity_enabled: engine_core_ipc
+                .bind(py)
+                .borrow()
+                .session_affinity_enabled,
+            engine_core_dp_attention_enabled: engine_core_ipc
+                .bind(py)
+                .borrow()
+                .dp_attention_enabled,
+            default_chat_template_kwargs,
+            close_service_on_shutdown: false,
+        })),
+        (None, None) => None,
+    };
+
     server_config.router_config.atom_standalone = runtime.is_some();
     server_config.atom_standalone_runtime = runtime;
 
     py.detach(move || startup_runtime(server_config))
+}
+
+fn extract_json_object(py: Python<'_>, value: Option<Py<PyAny>>) -> PyResult<Map<String, Value>> {
+    let Some(value) = value else {
+        return Ok(Map::new());
+    };
+    let serialized = py
+        .import("json")?
+        .call_method1("dumps", (value.bind(py),))?
+        .extract::<String>()?;
+    match serde_json::from_str::<Value>(&serialized)
+        .map_err(|error| PyValueError::new_err(error.to_string()))?
+    {
+        Value::Object(object) => Ok(object),
+        _ => Err(PyValueError::new_err(
+            "default_chat_template_kwargs must be a JSON object",
+        )),
+    }
 }
 
 fn startup_runtime(server_config: ServerConfig) -> PyResult<()> {
@@ -257,6 +643,8 @@ pub fn version_verbose_string() -> String {
 #[pymodule]
 pub fn atomesh_runner(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyServerConfig>()?;
+    m.add_class::<PyEngineCoreIpcRuntime>()?;
+    m.add_function(wrap_pyfunction!(bind_engine_core_ipc, m)?)?;
     m.add_function(wrap_pyfunction!(launch_mesh, m)?)?;
     m.add_function(wrap_pyfunction!(parse_from, m)?)?;
     m.add_function(wrap_pyfunction!(cliargs_backend_name, m)?)?;

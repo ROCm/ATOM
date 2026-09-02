@@ -39,6 +39,23 @@ async fn liveness() -> Response {
 }
 
 async fn readiness(State(state): State<Arc<AppState>>) -> Response {
+    if let Some((is_ready, healthy_ranks, total_ranks)) = state.router.standalone_readiness() {
+        let status = if is_ready {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        };
+        return (
+            status,
+            Json(json!({
+                "status": if is_ready { "ready" } else { "not ready" },
+                "healthy_engine_ranks": healthy_ranks,
+                "total_engine_ranks": total_ranks,
+            })),
+        )
+            .into_response();
+    }
+
     let workers = state.context.worker_registry.get_all();
     let healthy_workers: Vec<_> = workers.iter().filter(|w| w.is_healthy()).collect();
 
@@ -86,6 +103,17 @@ async fn health_generate(State(state): State<Arc<AppState>>, req: Request) -> Re
 }
 
 async fn engine_metrics(State(state): State<Arc<AppState>>) -> Response {
+    if let Some((is_available, metrics)) = state.router.standalone_engine_metrics() {
+        return (
+            if is_available {
+                StatusCode::OK
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            },
+            Json(metrics),
+        )
+            .into_response();
+    }
     collect_engine_metrics(&state.context.worker_registry, &state.context.client)
         .await
         .into_response()

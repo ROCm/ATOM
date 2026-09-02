@@ -13,6 +13,19 @@ macro_rules! set_env {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Rebuild triggers
     println!("cargo:rerun-if-changed=Cargo.toml");
+    println!("cargo:rerun-if-changed=../proto/engine/engine_core.proto");
+    println!("cargo:rerun-if-changed=../proto/engine/disagg.proto");
+
+    let protoc = protoc_bin_vendored::protoc_bin_path()?;
+    std::env::set_var("PROTOC", protoc);
+    let mut protobuf = prost_build::Config::new();
+    protobuf.compile_protos(
+        &[
+            "../proto/engine/engine_core.proto",
+            "../proto/engine/disagg.proto",
+        ],
+        &["../proto"],
+    )?;
 
     // Set version info environment variables
     let version = read_cargo_version().unwrap_or_else(|_| DEFAULT_VERSION.to_string());

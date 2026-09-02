@@ -102,6 +102,10 @@ jobs:
         env:
           UNIT_TEST_REPORT: unit-report.xml
         run: bash .github/scripts/run_unit_tests.sh
+      - name: Run Rust EngineCore tests
+        env:
+          PYO3_PYTHON: python3
+        run: cargo test --manifest-path atom/mesh/Cargo.toml --lib routers::engine_core
       - name: Upload JUnit report
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v7

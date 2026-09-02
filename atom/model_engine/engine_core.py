@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
-import pickle
 import queue
 import threading
 import time
@@ -15,8 +14,8 @@ from atom.config import Config, ParallelConfig
 from atom.kv_transfer.disaggregation import KVOutputAggregator
 from atom.kv_transfer.disaggregation.types import connector_metadata_has_work
 from atom.model_engine.async_proc import AsyncIOProcManager
-from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import EngineUtilityHandler
+from atom.model_engine.ipc_utils import DisaggIpcCodec, EngineCoreIpcCodec
 from atom.model_engine.scheduler import DecodeScheduler, PrefillScheduler, Scheduler
 from atom.model_engine.sequence import (
     Sequence,
@@ -25,6 +24,7 @@ from atom.model_engine.sequence import (
     new_block_table,
 )
 from atom.model_engine.state_runtime import StateRuntime
+from atom.proto.engine import disagg_proto
 from atom.utils import (
     engine_process_name,
     envs,
@@ -543,10 +543,13 @@ class EngineCore:
 
             while alive:
                 for sock, _ in poller.poll():
-                    # (RequestType, RequestData)
+                    # One versioned EngineCoreEnvelope per ZMQ frame.
                     obj = sock.recv(copy=False)
                     try:
-                        request_type, reqs = pickle.loads(obj)
+                        envelope = EngineCoreIpcCodec.decode_engine_core_envelope(
+                            obj.bytes
+                        )
+                        payload_type = envelope.WhichOneof("payload")
                     except Exception:
                         # This thread is the only way requests reach the engine,
                         # so letting it die strands every later request: the
@@ -559,22 +562,33 @@ class EngineCore:
                             f"({len(obj.bytes)} bytes)"
                         )
                         continue
-                    if request_type == EngineCoreRequestType.ADD:
+                    if payload_type == "add_request":
+                        reqs = EngineCoreIpcCodec.decode_add_request(
+                            envelope.add_request
+                        )
                         req_ids = [req.id for req in reqs]
                         logger.debug(
-                            f"{self.label}: input get {request_type} {req_ids}"
+                            f"{self.label}: input get ADD {req_ids}"
                         )
                         self.input_queue.put_nowait(reqs)
-                    elif request_type == EngineCoreRequestType.UTILITY:
-                        cmd = reqs.get("cmd") if isinstance(reqs, dict) else None
+                    elif payload_type == "utility_command":
+                        reqs = EngineCoreIpcCodec.decode_utility_command(
+                            envelope.utility_command
+                        )
+                        cmd = envelope.utility_command.command
                         logger.debug(f"{self.label}: input get UTILITY command: {cmd}")
                         self.utility_queue.put_nowait((cmd, reqs))
                         self._has_pending_utility = True
-                    elif request_type == EngineCoreRequestType.SHUTDOWN:
-                        logger.debug(f"{self.label}: input get {request_type}")
+                    elif payload_type == "shutdown":
+                        logger.debug(f"{self.label}: input get SHUTDOWN")
                         self.input_queue.put_nowait([get_exit_sequence()])
                         alive = False
-                        reason = request_type
+                        reason = payload_type
+                    else:
+                        logger.warning(
+                            f"{self.label}: dropping unexpected input payload "
+                            f"{payload_type!r}"
+                        )
             logger.debug(f"{self.label}: input thread exit due to {reason}")
 
     def process_output_sockets(self, output_address: str):
@@ -590,29 +604,27 @@ class EngineCore:
                 if isinstance(item, tuple) and item[0] == "STREAM":
                     # Send stream outputs
                     stream_outputs = item[1]
-                    obj = pickle.dumps((EngineCoreRequestType.STREAM, stream_outputs))
-                    socket.send(obj)
+                    socket.send(EngineCoreIpcCodec.encode_stream(stream_outputs))
                     continue
 
                 if isinstance(item, tuple) and item[0] == "READY":
                     # Send READY signal to indicate EngineCore is fully initialized
-                    obj = pickle.dumps((EngineCoreRequestType.READY, item[1]))
-                    socket.send(obj)
+                    socket.send(EngineCoreIpcCodec.encode_ready(item[1]))
                     logger.debug(f"{self.label}: sent READY signal")
                     continue
 
                 if isinstance(item, tuple) and item[0] == "METRICS":
-                    obj = pickle.dumps((EngineCoreRequestType.METRICS, item[1]))
-                    socket.send(obj)
+                    socket.send(EngineCoreIpcCodec.encode_metrics(item[1]))
                     continue
 
                 if isinstance(item, tuple) and item[0] == "UTILITY_RESPONSE":
                     # Send utility command response back to CoreManager
                     response_data = item[1]
-                    serialized_obj = pickle.dumps(
-                        (EngineCoreRequestType.UTILITY_RESPONSE, response_data)
+                    socket.send(
+                        EngineCoreIpcCodec.encode_utility_response(
+                            response_data.get("cmd", ""), response_data
+                        )
                     )
-                    socket.send(serialized_obj)
                     continue
 
                 # Regular finished sequences
@@ -622,14 +634,11 @@ class EngineCore:
                 ]
                 num_valid = len(valid_seqs)
                 if num_valid > 0:
-                    obj = pickle.dumps((EngineCoreRequestType.ADD, valid_seqs))
-                    socket.send(obj)
+                    socket.send(EngineCoreIpcCodec.encode_add_response(valid_seqs))
                     logger.info(f"{self.label}: output send {num_valid} reqs")
                 if len(valid_seqs) != len(seqs):
-                    socket.send(pickle.dumps((EngineCoreRequestType.SHUTDOWN, None)))
-                    logger.debug(
-                        f"{self.label}: output send {EngineCoreRequestType.SHUTDOWN}"
-                    )
+                    socket.send(EngineCoreIpcCodec.encode_shutdown())
+                    logger.debug(f"{self.label}: output send SHUTDOWN")
                     break
 
 
@@ -875,7 +884,7 @@ class PrefillEngineCore(EngineCore):
         weight_handles = self.runner_mgr.call_func(
             "export_model_weight_ipc_handles", wait_out=True
         )
-        weight_payload = pickle.dumps(weight_handles)
+        weight_payload = DisaggIpcCodec.encode_weight_handles(weight_handles)
         logger.info(
             f"PrefillEngineCore: sending weight handles ({len(weight_payload)} bytes)..."
         )
@@ -885,7 +894,7 @@ class PrefillEngineCore(EngineCore):
         logger.info("PrefillEngineCore: weight handles sent, waiting for ACK...")
         with self._disagg_ctx.socket(zmq.PULL) as ack_sock:
             ack_sock.connect(self._disagg_weight_ack_addr)
-            ack_sock.recv()
+            DisaggIpcCodec.decode_acknowledgement(ack_sock.recv())
         logger.info("PrefillEngineCore: weight ACK received — decode weights freed")
 
     def _send_ready_signal(self):
@@ -894,11 +903,8 @@ class PrefillEngineCore(EngineCore):
         kvcache_args = self.runner_mgr.call_func(
             "export_kv_cache_ipc_handle", wait_out=True
         )
-        kvcache_bundle = pickle.dumps(
-            {
-                "kvcache_args": kvcache_args,
-                "num_kvcache_blocks": self._config.num_kvcache_blocks,
-            }
+        kvcache_bundle = DisaggIpcCodec.encode_kv_cache_handles(
+            kvcache_args, self._config.num_kvcache_blocks
         )
         logger.info(
             f"PrefillEngineCore: sending kvcache bundle ({len(kvcache_bundle)} bytes)..."
@@ -941,20 +947,18 @@ class PrefillEngineCore(EngineCore):
 
     def _recv_block_assignments(self):
         """Background thread: pulls BlockAssignment messages from decode."""
-        from atom.model_engine.disagg_types import BlockAssignment, DisaggMsgType
-
         sock = self._assignment_sock
         while True:
             try:
                 raw = sock.recv()
             except zmq.error.ContextTerminated:
                 break
-            msg_type, payload = pickle.loads(raw)
-            if msg_type == DisaggMsgType.BLOCK_ASSIGNMENT:
-                assignment: BlockAssignment = payload
+            msg_type, payload = DisaggIpcCodec.decode_assignment_or_abort(raw)
+            if msg_type == "block_assignment":
+                assignment = payload
                 with self.scheduler._pending_lock:
                     self._pending_assignments[assignment.seq_id] = assignment
-            elif msg_type == DisaggMsgType.ABORT:
+            elif msg_type == "abort":
                 seq_id = payload
                 with self.scheduler._pending_lock:
                     self._pending_assignments.pop(seq_id, None)
@@ -978,8 +982,6 @@ class PrefillEngineCore(EngineCore):
                     seq.num_cached_tokens = assignment.num_cached_tokens
 
     def _process_engine_step(self):
-        from atom.model_engine.disagg_types import DisaggMsgType, PrefillDone
-
         self._apply_pending_assignments()
         if not self.scheduler.has_requests():
             return False
@@ -1009,12 +1011,12 @@ class PrefillEngineCore(EngineCore):
             scheduled_batch.num_scheduled_tokens,
             sampled_token_ids,
         ):
-            done = PrefillDone(
+            done = disagg_proto.PrefillDone(
                 seq_id=seq_id,
                 num_tokens_computed=int(num_tokens),
                 sampled_token_id=int(token_id),
             )
-            self._p2d_sock.send(pickle.dumps((DisaggMsgType.PREFILL_DONE, done)))
+            self._p2d_sock.send(DisaggIpcCodec.encode_prefill_done(done))
 
         # Remove completed sequences — prefill produces no output tokens.
         for seq in list(seqs.values()):
@@ -1090,8 +1092,9 @@ class DecodeEngineCore(EngineCore):
         with self._disagg_ctx.socket(zmq.PULL) as sock:
             sock.connect(self._disagg_kvcache_ipc_addr)
             raw = sock.recv()
-        bundle = pickle.loads(raw)
-        num_kvcache_blocks = bundle["num_kvcache_blocks"]
+        kvcache_args, num_kvcache_blocks = DisaggIpcCodec.decode_kv_cache_handles(
+            raw
+        )
         logger.info(
             f"DecodeEngineCore: received kvcache bundle ({num_kvcache_blocks} blocks)"
         )
@@ -1099,7 +1102,7 @@ class DecodeEngineCore(EngineCore):
         # --- Import kvcache — sets self.kv_cache + binds to attention modules ---
         self.runner_mgr.call_func(
             "import_kv_cache_ipc_handle",
-            bundle["kvcache_args"],
+            kvcache_args,
             num_kvcache_blocks,
             wait_out=True,
         )
@@ -1145,7 +1148,7 @@ class DecodeEngineCore(EngineCore):
         with self._disagg_ctx.socket(zmq.PULL) as w_sock:
             w_sock.connect(self._disagg_weight_ipc_addr)
             raw = w_sock.recv()
-        weight_handles = pickle.loads(raw)
+        weight_handles = DisaggIpcCodec.decode_weight_handles(raw)
         logger.info(
             f"DecodeEngineCore: received weight handles ({len(weight_handles)} params), importing..."
         )
@@ -1162,7 +1165,7 @@ class DecodeEngineCore(EngineCore):
         )
         with self._disagg_ctx.socket(zmq.PUSH) as ack_sock:
             ack_sock.bind(self._disagg_weight_ack_addr)
-            ack_sock.send(b"ok")
+            ack_sock.send(DisaggIpcCodec.encode_acknowledgement())
         logger.info("DecodeEngineCore: weight ACK sent")
 
     def _send_ready_signal(self):
@@ -1199,18 +1202,13 @@ class DecodeEngineCore(EngineCore):
 
     def _recv_prefill_done(self):
         """Background thread: receives PrefillDone messages from prefill."""
-        from atom.model_engine.disagg_types import DisaggMsgType, PrefillDone
-
         sock = self._p2d_recv_sock
         while True:
             try:
                 raw = sock.recv()
             except zmq.error.ContextTerminated:
                 break
-            msg_type, payload = pickle.loads(raw)
-            if msg_type != DisaggMsgType.PREFILL_DONE:
-                continue
-            done: PrefillDone = payload
+            done = DisaggIpcCodec.decode_prefill_done(raw)
             self.scheduler.on_prefill_done(
                 done.seq_id, done.num_tokens_computed, done.sampled_token_id
             )
@@ -1221,19 +1219,26 @@ class DecodeEngineCore(EngineCore):
 
     def _send_block_assignment(self, seq: Sequence):
         """Send BlockAssignment to prefill for a newly allocated sequence."""
-        from atom.model_engine.disagg_types import BlockAssignment, DisaggMsgType
-
-        assignment = BlockAssignment(
+        assignment = disagg_proto.BlockAssignment(
             seq_id=seq.id,
             block_table=list(seq.block_table),
             num_cached_tokens=seq.num_cached_tokens,
             context_len=seq.num_tokens,
         )
-        self._d2p_sock.send(pickle.dumps((DisaggMsgType.BLOCK_ASSIGNMENT, assignment)))
+        self._d2p_sock.send(DisaggIpcCodec.encode_block_assignment(assignment))
         logger.info(
             f"DecodeEngineCore: seq {seq.id} blocks assigned "
             f"({len(assignment.block_table)} blocks), waiting for prefill"
         )
+
+    def on_abort_request(self, seq_id: int | None) -> None:
+        """Propagate an abort to prefill's direct PD coordination channel."""
+        if seq_id is None:
+            return
+        aborted = self.scheduler.abort_pending_prefill(seq_id)
+        if aborted is not None:
+            self.output_queue.put_nowait([aborted])
+        self._d2p_sock.send(DisaggIpcCodec.encode_abort(seq_id))
 
     def pull_and_process_input_queue(self):
         """Override: add new sequences to waiting queue, then allocate blocks

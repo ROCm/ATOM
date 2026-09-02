@@ -746,6 +746,15 @@ class EngineArgs:
 
         return kwargs
 
-    def create_engine(self, tokenizer=None) -> LLMEngine:
+    def create_engine(
+        self,
+        tokenizer=None,
+        external_transport_factory=None,
+    ) -> LLMEngine:
         """Create and return an LLMEngine instance with the configured parameters."""
-        return LLMEngine(self.model, tokenizer=tokenizer, **self._get_engine_kwargs())
+        return LLMEngine(
+            self.model,
+            tokenizer=tokenizer,
+            external_transport_factory=external_transport_factory,
+            **self._get_engine_kwargs(),
+        )

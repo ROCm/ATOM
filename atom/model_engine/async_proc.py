@@ -105,8 +105,8 @@ class AsyncIOProc:
         # Auto-detects the GPU's local node by default; gated by
         # ATOM_NUMA_BIND. Must run before any large allocation / native
         # (mooncake) thread spawn so the mask is inherited by child threads and
-        # first-touch lands memory locally. The node-local GPU index is
-        # dp_local_rank*tp_size+tp_rank (engine_core_mgr GPU assignment).
+        # first-touch lands memory locally. The node-local GPU index follows the
+        # same DPxPPxPCPxTP layout as ModelRunner device assignment.
         # Best-effort: any failure here is logged and skipped rather than
         # taking the worker down, hence the blanket except.
         try:
@@ -116,7 +116,10 @@ class AsyncIOProc:
             dp_local_rank = cfg.parallel_config.data_parallel_rank_local
             if dp_local_rank is None:
                 dp_local_rank = cfg.parallel_config.data_parallel_rank
-            gpu = dp_local_rank * cfg.tp_world_size + rank
+            pp_rank = cfg.parallel_config.pipeline_parallel_rank
+            stage_span = cfg.tp_world_size * cfg.prefill_context_parallel_size
+            engine_index = dp_local_rank * cfg.pipeline_parallel_size + pp_rank
+            gpu = engine_index * stage_span + rank
             numa_bind_to_node(gpu, label)
         except Exception as e:  # noqa: BLE001 - binding is an optimization
             # NUMA binding only affects locality, never correctness, so any

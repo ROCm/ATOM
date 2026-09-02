@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package atom.engine;
+
+message BlockAssignment {
+  int64 seq_id = 1;
+  repeated sint32 block_table = 2;
+  int32 num_cached_tokens = 3;
+  int32 context_len = 4;
+}
+
+message PrefillDone {
+  int64 seq_id = 1;
+  int32 num_tokens_computed = 2;
+  int32 sampled_token_id = 3;
+}
+
+message DisaggEnvelope {
+  uint32 wire_version = 1;
+  oneof payload {
+    BlockAssignment block_assignment = 10;
+    PrefillDone prefill_done = 11;
+    int64 abort_seq_id = 12;
+  }
+}
+
+message WeightIpcBootstrap { repeated string rank_file_paths = 1; }
+message KvCacheIpcBootstrap {
+  repeated string rank_file_paths = 1;
+  int32 num_kvcache_blocks = 2;
+}
+message WeightIpcAck { bool acknowledged = 1; }

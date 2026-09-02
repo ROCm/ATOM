@@ -3,13 +3,11 @@
 #
 # These exercise the pure routing/bookkeeping helpers in isolation via
 # ``CoreManager.__new__`` — no engine cores, sockets, or GPU are created.
-# CoreManager gets ``EngineCoreRequestType`` from the lightweight
-# ``engine_core_protocol`` module and only lazy-imports the heavy ``EngineCore``
-# (which pulls aiter) inside ``launch_engine_core``, so importing CoreManager
-# here works on the CPU-only / mocked CI runner without any sys.modules stub;
-# conftest.py supplies the atom.* / zmq stubs the import chain needs.
+# CoreManager only lazy-imports the heavy ``EngineCore`` (which pulls aiter)
+# inside ``launch_engine_core``, so importing it here works on the CPU-only /
+# mocked CI runner; conftest.py supplies the atom.* / zmq stubs the import
+# chain needs.
 
-import pickle
 from threading import Lock
 
 import pytest
@@ -385,7 +383,7 @@ def test_explicit_hint_takes_priority_and_is_charged():
     assert mgr._rank_tokens[2] >= 30
 
 
-def test_dispatch_sends_explicit_hint_to_exact_engine_rank():
+def test_dispatch_sends_explicit_hint_to_exact_engine_rank(monkeypatch):
     class _RecordingSocket:
         def __init__(self):
             self.messages = []
@@ -402,12 +400,16 @@ def test_dispatch_sends_explicit_hint_to_exact_engine_rank():
     mgr._rank_tokens = [0, 0, 0, 10_000]
 
     seq = _FakeSeq("sticky", num_prompt_tokens=100, data_parallel_rank=3)
+    encoded_batches = []
+    monkeypatch.setattr(
+        "atom.model_engine.engine_core_mgr.EngineCoreIpcCodec.encode_add_request",
+        lambda seqs: encoded_batches.append(seqs) or b"protobuf",
+    )
     mgr._dispatch_to_dp_ranks([seq])
 
     assert [len(sock.messages) for sock in mgr.input_sockets] == [0, 0, 0, 1]
-    request_type, dispatched = pickle.loads(mgr.input_sockets[3].messages[0][1])
-    assert request_type.name == "ADD"
-    assert [item.id for item in dispatched] == [seq.id]
+    assert mgr.input_sockets[3].messages[0][1] == b"protobuf"
+    assert [[item.id for item in batch] for batch in encoded_batches] == [[seq.id]]
 
 
 def test_invalid_hint_still_supported_via_add_request_validation():
@@ -470,12 +472,15 @@ def test_resolve_and_validate_hints_accepts_and_returns_resolved():
     assert hints == [3, None]
 
 
-def test_send_failure_rolls_back_undispatched_charge():
+def test_send_failure_rolls_back_undispatched_charge(monkeypatch):
     # If a rank's send_multipart raises mid-batch, the seqs on ranks that were
     # NOT successfully handed off were charged but will never emit a finished
     # output to release them. Dispatch must roll those back so routing does not
     # skew permanently; already-sent ranks keep their (legitimate) charge.
-    # dispatch pickles (EngineCoreRequestType.ADD, seqs) with the real enum.
+    monkeypatch.setattr(
+        "atom.model_engine.engine_core_mgr.EngineCoreIpcCodec.encode_add_request",
+        lambda seqs: b"protobuf",
+    )
     class _FakeSocket:
         def __init__(self, fail=False):
             self.fail = fail

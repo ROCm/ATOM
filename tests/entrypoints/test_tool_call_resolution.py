@@ -204,21 +204,15 @@ class TestABadNameIsCaughtBeforeTheWeightsLoad:
 
 
 class TestTheMeshRouterStillGetsItsFlag:
-    """`--tool-call-parser` has two consumers: the Rust router declares one in
-    `cliargs.rs` and the Python service resolves one. Registering it here made
-    `parse_known_args` swallow it, so the router silently lost a setting that
-    had been passing straight through as an unrecognised arg.
-    """
+    """Only parser names implemented by the Rust router may be forwarded."""
 
     BASE: ClassVar[list] = ["--model", "/x", "--port", "9000"]
 
-    def test_it_reaches_both_layers(self):
-        args = atomesh_server.parse_standalone_args(
-            [*self.BASE, "--tool-call-parser", "dsml"]
-        )
-        assert args.engine_args.tool_call_parser == "dsml"
-        assert "--tool-call-parser" in args.mesh_args
-        assert args.mesh_args[args.mesh_args.index("--tool-call-parser") + 1] == "dsml"
+    def test_atom_only_parser_is_rejected(self):
+        with pytest.raises(SystemExit):
+            atomesh_server.parse_standalone_args(
+                [*self.BASE, "--tool-call-parser", "dsml"]
+            )
 
     def test_unset_forwards_nothing(self):
         """Not "auto" either: the router has its own default to apply."""
@@ -227,9 +221,7 @@ class TestTheMeshRouterStillGetsItsFlag:
         assert "--tool-call-parser" not in args.mesh_args
 
     def test_the_network_args_still_get_through(self):
-        args = atomesh_server.parse_standalone_args(
-            [*self.BASE, "--tool-call-parser", "glm"]
-        )
+        args = atomesh_server.parse_standalone_args(self.BASE)
         assert args.mesh_args[:2] == ["--port", "9000"]
 
 
@@ -267,14 +259,7 @@ class TestGlmDoesNotClaimEveryTemplate:
 
 
 class TestTheTwoVocabulariesCoexist:
-    """`--tool-call-parser` has two consumers that do not share a vocabulary.
-
-    The Rust router takes `json` / `python` / `xml` / `hermes`; ATOM's
-    resolver takes `dsml` / `glm` / `kimi` / `kimi_k3` / `minimax` / `qwen`.
-    Validating the flag against ATOM's set would have killed any existing
-    standalone deployment launched with a router name -- before the flag was
-    registered here at all, those passed straight through untouched.
-    """
+    """Rust parser names work; legacy Python-only names fail explicitly."""
 
     BASE: ClassVar[list] = ["--model", "/x", "--port", "9000"]
 
@@ -292,10 +277,9 @@ class TestTheTwoVocabulariesCoexist:
         ), "a name ATOM does not know must leave ATOM reading the template"
 
     @pytest.mark.parametrize("name", sorted(PARSERS_BY_NAME))
-    def test_an_atom_name_binds_atom_and_still_reaches_the_router(self, name):
-        args = self._parse(name)
-        assert args.engine_args.tool_call_parser == name
-        assert args.mesh_args[-2:] == ["--tool-call-parser", name]
+    def test_an_atom_only_name_is_rejected(self, name):
+        with pytest.raises(SystemExit):
+            self._parse(name)
 
     def test_unset_forwards_nothing_and_binds_nothing(self):
         args = atomesh_server.parse_standalone_args(self.BASE)

@@ -3038,12 +3038,30 @@ class DecodeScheduler(Scheduler):
         match the non-disagg postprocess state before the first decode step.
         """
 
-        seq = self.prefill_waiting.pop(seq_id, None)
-        if seq is not None:
-            seq.num_cached_tokens = num_tokens_computed
-            seq.append_token(sampled_token_id)
-            seq.first_token_time = time.time()
-            self.prefill_done.append(seq)
+        with self._prefill_lock:
+            seq = self.prefill_waiting.pop(seq_id, None)
+            if seq is not None:
+                seq.num_cached_tokens = num_tokens_computed
+                seq.append_token(sampled_token_id)
+                seq.first_token_time = time.time()
+                self.prefill_done.append(seq)
+
+    def abort_pending_prefill(self, seq_id: int) -> Sequence | None:
+        """Remove and release a sequence waiting at the PD prefill boundary."""
+        with self._prefill_lock:
+            seq = self.prefill_waiting.pop(seq_id, None)
+            if seq is None:
+                seq = next(
+                    (item for item in self.prefill_done if item.id == seq_id), None
+                )
+                if seq is not None:
+                    self.prefill_done.remove(seq)
+            if seq is None:
+                return None
+            self.block_manager.deallocate(seq)
+            seq.status = SequenceStatus.FINISHED
+            seq.leave_reason = "aborted"
+            return seq
 
     def _schedule(self):
         """Schedule decode-only batches.
@@ -3062,20 +3080,19 @@ class DecodeScheduler(Scheduler):
         self.block_manager.complete_previous_state_batch()
 
         prefill_finished = False
-        while self.prefill_done:
-            seq = self.prefill_done.popleft()
-            seq.status = SequenceStatus.RUNNING
-            seq.type = SequenceType.DECODE
-            # Append the first generated token sampled by the prefill process.
-            # In non-disagg mode, Scheduler.postprocess() does this after the
-            # prefill forward (is_deferred_out=True always appends one placeholder
-            # that is later overwritten with the real token from the async queue).
-            # In disagg mode the prefill process ran sampling and sent us the real
-            # token; appending it here puts num_tokens, context_lens, and
-            # slot_mapping in the same state as non-disagg before the first decode
-            # step.
-            self.running.append(seq)
-            prefill_finished = True
+        with self._prefill_lock:
+            while self.prefill_done:
+                seq = self.prefill_done.popleft()
+                seq.status = SequenceStatus.RUNNING
+                seq.type = SequenceType.DECODE
+                # Append the first generated token sampled by the prefill process.
+                # In non-disagg mode, Scheduler.postprocess() does this after the
+                # prefill forward (is_deferred_out=True always appends one
+                # placeholder that is later overwritten with the real token from
+                # the async queue). In disagg mode prefill sent the real token;
+                # appending it here restores that same state before decode.
+                self.running.append(seq)
+                prefill_finished = True
 
         if not self.running:
             self.cu_fraction = None

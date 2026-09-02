@@ -5,6 +5,7 @@ pub mod core;
 pub mod middleware;
 pub mod observability;
 pub mod policies;
+pub mod proto;
 pub mod python;
 pub use openai_protocol as protocols;
 pub use reasoning_parser;

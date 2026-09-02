@@ -72,6 +72,8 @@ class EngineUtilityHandler:
             try:
                 cmd, args = utility_queue.get_nowait()
                 self._execute_utility_command(cmd, args)
+                if cmd == "abort_request" and hasattr(engine, "on_abort_request"):
+                    engine.on_abort_request(args.get("req_id"))
                 # Track sleep/wake transitions
                 if cmd == "release_memory":
                     tags = args.get("tags", []) if isinstance(args, dict) else []

@@ -575,10 +575,12 @@ indefinitely for an identity handshake that never arrives.
 
 ### Restrictions
 
-- **Multi-node DP + pipeline parallel is rejected** with a `ValueError`. The
-  engine-index space folds PP stages into DP ranks and the two mappings are not
-  reconciled across nodes.
-- PP + DP is separately unsupported (single-node assertion, pre-existing).
+- Python-owned serving supports single-node `DP=1, PP>1`.
+- Rust-owned atomesh standalone also supports single-node `DP=1, PP>1`. Each
+  stage has a distinct `engine_rank`; Rust routes requests and client output
+  through the PP head while broadcasting control operations to all stages.
+- **Multi-node PP is rejected** with a `ValueError`.
+- DP×PP and DP-attention×PP remain unsupported in both transport-owner modes.
 
 ## 9. Wide expert parallelism (multi-node EP)
 

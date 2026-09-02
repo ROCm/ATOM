@@ -639,6 +639,19 @@ _PLUGIN_SUPPORTED_MULTIMODAL_MODELS: set[str] = {
     "qwen3_5_moe",
 }
 
+# Model families whose attention state includes a per-request buffer outside
+# the paged KV cache. This capability belongs to model configuration, not to a
+# particular request frontend.
+PER_REQ_CACHE_MODEL_TYPES: frozenset[str] = frozenset(
+    {
+        "qwen3_next",
+        "qwen3_5_text",
+        "qwen3_5_moe_text",
+        "kimi_linear",
+        "deepseek_v4",
+    }
+)
+
 
 def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConfig:
     config_dict, _ = PretrainedConfig.get_config_dict(
@@ -1633,6 +1646,11 @@ class Config:
     # coordination between prefill and decode. When False (default),
     # use plain separate streams with no CU masking.
     disagg_constrained: bool = False
+
+    @property
+    def has_per_req_cache(self) -> bool:
+        """Whether requests need state outside the paged KV cache."""
+        return self.hf_config.model_type in PER_REQ_CACHE_MODEL_TYPES
 
     @property
     def tp_world_size(self) -> int:

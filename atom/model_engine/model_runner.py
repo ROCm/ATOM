@@ -26,7 +26,12 @@ from aiter.dist.parallel_state import (
 from aiter.dist.utils import get_distributed_init_method
 from torch.profiler import record_function
 
-from atom.config import Config, CUDAGraphMode, set_current_atom_config
+from atom.config import (
+    PER_REQ_CACHE_MODEL_TYPES,
+    Config,
+    CUDAGraphMode,
+    set_current_atom_config,
+)
 from atom.distributed.pcp_utils import (
     PcpBalGroup,
     pcp_allgather_rerange,
@@ -785,22 +790,19 @@ class ModelRunner:
         # read 0 ("no pool yet") rather than trip over a missing attribute.
         self.pool_plan = PoolPlan.empty()
         self.state_runtime = StateRuntime()
-        # Sanity-check: any builder that allocates a per-request cache must
-        # have its model_type listed in `InputOutputProcessor`'s
-        # `per_req_cache_model_types` set; otherwise sequences will be
-        # constructed with `has_per_req_cache=False`, the BlockManager will
+        # Sanity-check: any builder that allocates a per-request cache must have
+        # its model_type listed in Config's capability set; otherwise sequences
+        # will be constructed with `has_per_req_cache=False`, the BlockManager will
         # never assign them a slot, and the builder will silently read
         # tensor[-1] on first decode. Catch the misconfiguration up front
         # rather than producing wrong outputs at inference time.
         if self._has_state_pool():
-            from atom.model_engine.llm_engine import InputOutputProcessor as _IOProc
-
             mt = self.config.hf_config.model_type
-            known = _IOProc._per_req_cache_model_types()
+            known = PER_REQ_CACHE_MODEL_TYPES
             assert mt in known, (
                 f"Attention builder {type(self.attn_metadata_builder).__name__} "
                 f"declares a per-request state pool but model_type={mt!r} is not in "
-                f"InputOutputProcessor.per_req_cache_model_types ({sorted(known)}). "
+                f"PER_REQ_CACHE_MODEL_TYPES ({sorted(known)}). "
                 "Add it to the set or sequences will not be assigned slots "
                 "(silent corruption)."
             )

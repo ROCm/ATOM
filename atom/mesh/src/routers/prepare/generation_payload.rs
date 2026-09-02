@@ -6,6 +6,8 @@
 
 use crate::protocols::common::StringOrArray;
 
+pub const DEFAULT_MAX_OUTPUT_TOKENS: i32 = 8_192;
+
 pub struct GenerationPayload {
     pub request_id: String,
     pub text: String,

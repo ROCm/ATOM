@@ -433,12 +433,21 @@ recovered by scrape time. Neither costs a timer: `asyncio.wait_for` measured
 This exists because the symptom that started this work was ten minutes of
 silence with every metric looking healthy.
 
-The atomesh standalone entrypoint has none of it. Its frames leave through
-`ChatCompletionStreamState.drain` / `CompletionStreamState.drain`, polled by
-the Rust router, which builds no `FrameWait`; and `AtomMetricsExporter` is
-constructed only by `openai_server`, so that deployment exposes no `/metrics`
-route at all. A stalled atomesh stream is therefore invisible rather than
-reported as zero.
+The current atomesh standalone hot path no longer polls
+`ChatCompletionStreamState.drain` / `CompletionStreamState.drain`. Rust owns the
+EngineCore protobuf sockets, converts STREAM/ADD_RESPONSE payloads into
+`TokenHandle`, and emits SSE through the mesh renderers. EngineCore snapshots
+are exposed through `/engine_metrics`, but the Python `FrameWait` metric remains
+specific to `openai_server`; use the Rust HTTP/SSE metrics when diagnosing
+atomesh client-delivery stalls.
+
+Rust-owned atomesh standalone supports single-node pipeline parallelism when
+`data_parallel_size=1`. Rust gives every PP stage independent sockets, sends
+requests only to `pp_rank=0`, and accepts client-visible output only from that
+head stage. Readiness and management operations cover every stage, and
+`/engine_metrics` identifies snapshots by `engine_rank`, `dp_rank`, and
+`pp_rank`. Failure of any stage makes the pipeline unavailable. DP×PP,
+DP-attention×PP, multi-node PP, and RapidServe remain unsupported combinations.
 
 Measured at the frame and not at `StreamOutputCollector.get`, which is where it
 started and which cannot see the thing it was built for. The collector is where

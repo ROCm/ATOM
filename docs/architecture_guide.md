@@ -65,9 +65,9 @@ A request flows through the system in ten steps:
 
 2. **`InputOutputProcessor.preprocess()`** — each prompt is tokenized via the HuggingFace tokenizer. A `Sequence` object is created to track the request's state, timing, and block allocation. `arrive_time` is recorded.
 
-3. **`CoreManager.add_request()`** — the list of `Sequence` objects is serialized with `pickle` and sent over a ZMQ `ROUTER` socket. When multiple DP ranks are active, requests are routed by a configurable load-balancing strategy (`least_requests` by default; `round_robin` and `least_tokens` also available).
+3. **Request transport** — in Python-owned serving, `CoreManager.add_request()` encodes the `Sequence` objects in an `EngineCoreEnvelope` protobuf and sends it over a ZMQ `ROUTER` socket. In atomesh standalone, Python request submission is disabled: Rust builds the same protobuf, owns the socket, and routes it directly. When multiple DP ranks are active, requests use the configured load-balancing strategy (`least_requests` by default; `round_robin` and `least_tokens` are also available).
 
-4. **`EngineCore.process_input_sockets()`** — an I/O thread on the `EngineCore` process receives the serialized data on a ZMQ `DEALER` socket, deserializes it, and places the sequences into the `input_queue`.
+4. **`EngineCore.process_input_sockets()`** — an I/O thread on the `EngineCore` process receives the protobuf frame on a ZMQ `DEALER` socket, decodes it, and places the sequences into the `input_queue`.
 
 5. **`EngineCore.busy_loop()`** — the main execution loop pulls from `input_queue` via `pull_and_process_input_queue()`, feeds new sequences into the scheduler, and repeatedly calls `_process_engine_step()` until all work is done.
 
@@ -80,7 +80,7 @@ A request flows through the system in ten steps:
 
 8. **`Scheduler.postprocess()`** — appends sampled tokens to each `Sequence`, records `first_token_time`, checks stop conditions (EOS, stop token IDs, stop token sequences, `max_tokens`), and moves finished sequences out of the running queue. The `BlockManager` deallocates blocks for finished sequences.
 
-9. **Output via ZMQ** — finished sequences are placed on the `output_queue`. A dedicated output thread serializes them and sends them over a ZMQ `PUSH` socket back to the `CoreManager`, which receives them on a `PULL` socket and places them in `outputs_queue`.
+9. **Output via ZMQ** — finished sequences are placed on the `output_queue`. A dedicated output thread encodes them as protobuf and sends them over a ZMQ `PUSH` socket back to the transport owner. Python-owned serving places decoded results in `outputs_queue`; Rust-owned standalone converts head-stage STREAM and ADD_RESPONSE messages directly into `TokenHandle` output.
 
 10. **`InputOutputProcessor.postprocess()`** — detokenizes completed sequences, computes TTFT (Time To First Token) and TPOT (Time Per Output Token), and returns structured output dictionaries.
 
@@ -130,7 +130,7 @@ ATOM uses a multi-process design with ZMQ sockets for inter-process communicatio
                     │  └────────────────────────────┘  │
                     └──────────────────────────────────┘
                           │                    ▲
-                 pickle   │                    │  pickle
+               protobuf   │                    │  protobuf
                           ▼                    │
            ┌──────────────────────────────────────┐
            │         EngineCore (Process)          │
@@ -154,12 +154,33 @@ ATOM uses a multi-process design with ZMQ sockets for inter-process communicatio
 
 | Socket | Type | Direction | Purpose |
 |---|---|---|---|
-| Input | `ROUTER` (CoreManager) / `DEALER` (EngineCore) | CoreManager → EngineCore | Send requests and control commands |
-| Output | `PUSH` (EngineCore) / `PULL` (CoreManager) | EngineCore → CoreManager | Return finished sequences and stream outputs |
+| Input | `ROUTER` (owner) / `DEALER` (EngineCore) | owner → EngineCore | Send AddRequest traffic from one writer |
+| Control | `ROUTER` (owner) / `DEALER` (EngineCore) | owner → EngineCore | Abort, utility and shutdown commands |
+| Output | `PUSH` (EngineCore) / `PULL` (owner) | EngineCore → owner | Return finished sequences and stream outputs |
+
+There are two mutually exclusive transport-owner modes:
+
+- Normal Python serving: `CoreManager` binds and consumes all three channels.
+- Atomesh standalone: `CoreManager` plans the addresses and invokes an injected Rust
+  transport factory before spawning EngineCore. Rust binds the channels, then
+  `CoreManager` starts the children and waits through that transport for their identity
+  handshakes and READY frames. Rust owns request/output routing after startup, while
+  `CoreManager` delegates management commands through the PyO3 control bridge.
+
+For single-node standalone pipeline parallelism, every `(dp_rank, pp_rank)` stage
+has a distinct `engine_rank` and its own input, control, and output sockets. The
+Rust scheduler routes a request to the `pp_rank=0` head only. Existing
+`PPStageTransport` channels carry metadata, sampled tokens, and KV status between
+Python EngineCore stages, while NCCL carries hidden states. Only the head may emit
+client STREAM or ADD_RESPONSE messages. READY, utility commands, metrics, failure
+detection, and shutdown include every stage. A failed stage disables and shuts down
+its entire pipeline.
+
+Python and Rust must never bind or consume the same EngineCore channel concurrently.
 
 **Process hierarchy:**
 
-- **`CoreManager`** spawns one `EngineCore` process per DP rank using `multiprocessing.Process`.
+- **`CoreManager`** spawns one `EngineCore` process per `(DP rank, PP stage)` using `multiprocessing.Process`.
 - Each **`EngineCore`** creates an `AsyncIOProcManager`, which in turn spawns one subprocess per TP rank.
 - Each **`ModelRunner`** subprocess initializes AITER's distributed environment via `init_dist_env()` from AITER, setting up NCCL communication across TP ranks.
 
@@ -257,7 +278,8 @@ Each attention backend provides its own `prepare_mtp_decode()` implementation:
 | File | Description |
 |------|-------------|
 | `atom/model_engine/llm_engine.py` | `LLMEngine` user-facing API, `InputOutputProcessor` for tokenization/detokenization and TTFT/TPOT statistics |
-| `atom/model_engine/engine_core.py` | `EngineCore` main execution loop, `DPEngineCoreProc` data-parallel variant, `EngineCoreRequestType` message protocol |
+| `atom/model_engine/engine_core.py` | `EngineCore` main execution loop and `DPEngineCoreProc` data-parallel variant |
+| `atom/model_engine/ipc_utils.py` | Protobuf codecs for EngineCore and disaggregated runtime IPC |
 | `atom/model_engine/engine_core_mgr.py` | `CoreManager` ZMQ orchestration, process launching, load-balanced DP dispatch |
 | `atom/model_engine/model_runner.py` | `ModelRunner` per-GPU execution (model loading, CUDA graph capture, forward pass), `tokenIDProcessor` deferred output handling |
 | `atom/model_engine/scheduler.py` | `Scheduler` prefill-first scheduling, `ScheduledBatch` batch descriptor, `ScheduledBatchOutput` forward results |

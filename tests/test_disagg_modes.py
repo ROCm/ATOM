@@ -47,6 +47,26 @@ def test_decode_scheduler_skips_shm_when_name_empty(decode_scheduler_unconstrain
     assert decode_scheduler_unconstrained._cu_shm is None
 
 
+def test_decode_abort_releases_sequence_waiting_for_prefill(
+    decode_scheduler_unconstrained, seq_factory, monkeypatch
+):
+    seq = seq_factory([10, 20, 30, 40])
+    decode_scheduler_unconstrained.prefill_waiting[seq.id] = seq
+    deallocated = []
+    monkeypatch.setattr(
+        decode_scheduler_unconstrained.block_manager,
+        "deallocate",
+        deallocated.append,
+    )
+
+    aborted = decode_scheduler_unconstrained.abort_pending_prefill(seq.id)
+
+    assert aborted is seq
+    assert seq.id not in decode_scheduler_unconstrained.prefill_waiting
+    assert deallocated == [seq]
+    assert seq.leave_reason == "aborted"
+
+
 # ── Unconstrained: batches carry cu_stream_fraction=None ─────────────────
 
 

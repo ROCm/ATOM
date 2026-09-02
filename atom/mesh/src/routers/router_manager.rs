@@ -145,7 +145,7 @@ impl RouterManager {
         self.routers.len()
     }
 
-    fn atom_standalone_router(&self) -> Option<Arc<dyn RouterTrait>> {
+    pub(crate) fn atom_standalone_router(&self) -> Option<Arc<dyn RouterTrait>> {
         let default_router = self
             .default_router
             .read()
@@ -197,6 +197,14 @@ impl RouterTrait for RouterManager {
         for router in routers.iter() {
             router.shutdown().await;
         }
+    }
+
+    fn standalone_readiness(&self) -> Option<(bool, usize, usize)> {
+        self.atom_standalone_router()?.standalone_readiness()
+    }
+
+    fn standalone_engine_metrics(&self) -> Option<(bool, Value)> {
+        self.atom_standalone_router()?.standalone_engine_metrics()
     }
 
     async fn health_generate(&self, req: Request<Body>) -> Response {

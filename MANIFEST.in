@@ -2,3 +2,4 @@ include atom/mesh/Cargo.toml
 include atom/mesh/Cargo.lock
 include atom/mesh/build.rs
 recursive-include atom/mesh/src *
+recursive-include atom/proto *.proto

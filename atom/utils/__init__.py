@@ -106,8 +106,8 @@ def set_device_control_env_var(config: "Config", local_dp_rank: int):
     Making it set a real ``HIP_VISIBLE_DEVICES`` was tried and reverted. The
     mask renumbers devices in the child (``cuda:0`` becomes the first *visible*
     GPU), but ``ModelRunner._setup_device_and_distributed`` independently
-    computes an ABSOLUTE index -- ``local_dp_rank * tp_size + rank`` -- and
-    selects ``cuda:{that}``. The two offsets compound: with ``-dp 4 -tp 2``,
+    computes an absolute index from the DPxPPxPCPxTP layout and selects
+    ``cuda:{that}``. The two offsets compound: with ``-dp 4 -tp 2``,
     DP rank 1 would get a mask of "2,3" (two visible devices) and then ask for
     ``cuda:2``, which no longer exists. Startup dies on the
     ``local_device_rank >= torch.cuda.device_count()`` check -- every

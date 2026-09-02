@@ -4,6 +4,17 @@ This directory contains the integration test suite for **atom/mesh**, organized 
 
 **Total: ~224 tests across 24 mesh test files.**
 
+EngineCore protobuf transport tests currently live as unit tests beside the
+implementation in `src/routers/engine_core/`:
+
+- `topology.rs`: duplicate rank/address validation.
+- `codec.rs`: Sequence construction, defaults, explicit rank and Python golden bytes.
+- `transport.rs`: ROUTER/DEALER handshake, READY/SHUTDOWN, wire version and duplicate bind.
+- `client.rs`: DP strategies, session prompt growth, rollback and raw control validation.
+
+CI runs these with `cargo test --lib routers::engine_core`. Process-level Python
+EngineCore and GPU inference tests remain separate from this mock-worker suite.
+
 ## Directory Structure
 
 ```
