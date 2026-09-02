@@ -67,6 +67,28 @@ def test_a_pass_that_stages_nothing_is_refused():
         _graph(inputs={})
 
 
+def test_a_pass_must_contribute_at_least_one_token_per_sequence():
+    with pytest.raises(AssertionError, match="tokens_per_seq=0"):
+        _graph(tokens_per_seq=0)
+
+
+def test_token_width_is_owned_by_each_pass():
+    """One drafter may declare a full-q first pass and a one-row mid-pass."""
+    first = _graph(tokens_per_seq=4)
+    middle = _graph()
+    assert first.tokens_per_seq == 4
+    assert middle.tokens_per_seq == 1
+
+
+def test_a_full_q_pass_stages_tokens_inside_each_sequence_row():
+    """Step 0 is flat in serving but fixed-width per sequence in its graph."""
+    g = _graph(inputs={"hidden": StagedInput(shape=(4, 2, 3), dtype=torch.float32)})
+    source = torch.arange(2 * 4 * 2 * 3, dtype=torch.float32).view(2, 4, 2, 3)
+    staged = g.stage(2, {"hidden": source})["hidden"]
+    assert staged.shape == (2, 4, 2, 3)
+    torch.testing.assert_close(staged, source)
+
+
 def test_staged_tail_repeats_a_real_row_rather_than_zero_filling():
     """Zero-filling faults the GPU at the first padded decode step.
 
