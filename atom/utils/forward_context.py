@@ -587,6 +587,9 @@ class AttentionMetaData:
     # prefill/MTP-verify and per seq in decode. Separate from kv_last_page_lens
     # (the dense per-seq buffer) so the two never clobber each other.
     sparse_kv_last_page_lens: torch.Tensor | None = None
+    # Precomputed per-rank context lengths for qlen=1 sparse DSA + DCP decode.
+    # The padded running-width buffer is shared by eager, graph and TBO paths.
+    dcp_local_context_lens: torch.Tensor | None = None
 
     work_meta_data: torch.Tensor | None = None
     work_indptr: torch.Tensor | None = None
@@ -621,6 +624,8 @@ class AttentionMetaData:
         cu_seqlen_ks: torch.Tensor | None = None,
         cu_seqlen_ke: torch.Tensor | None = None,
         sparse_kv_indptr: torch.Tensor | None = None,
+        sparse_kv_last_page_lens: torch.Tensor | None = None,
+        dcp_local_context_lens: torch.Tensor | None = None,
         work_meta_data: torch.Tensor | None = None,
         work_indptr: torch.Tensor | None = None,
         work_info_set: torch.Tensor | None = None,
@@ -656,6 +661,8 @@ class AttentionMetaData:
         self.cu_seqlen_ks = cu_seqlen_ks
         self.cu_seqlen_ke = cu_seqlen_ke
         self.sparse_kv_indptr = sparse_kv_indptr
+        self.sparse_kv_last_page_lens = sparse_kv_last_page_lens
+        self.dcp_local_context_lens = dcp_local_context_lens
         self.work_meta_data = work_meta_data
         self.work_indptr = work_indptr
         self.work_info_set = work_info_set
@@ -676,6 +683,23 @@ class AttentionMetaData:
             for field in fields(self)
             if field.name not in skip_fields
         }
+
+
+def get_published_dcp_local_context_lens(
+    attn_metadata: AttentionMetaData, num_rows: int
+) -> torch.Tensor | None:
+    """Return the valid prefix of a published sparse-DCP local-length buffer.
+
+    Metadata is allocated at the engine's padded running width while PIECEWISE
+    eager execution may score only the scheduled rows. The real requests are
+    always the prefix and the producer zero-fills the padded tail.
+    """
+    local_ctx = attn_metadata.dcp_local_context_lens
+    if local_ctx is None or local_ctx.shape[0] < num_rows:
+        return None
+    if local_ctx.shape[0] == num_rows:
+        return local_ctx
+    return local_ctx[:num_rows]
 
 
 @dataclass
