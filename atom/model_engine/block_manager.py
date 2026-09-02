@@ -928,17 +928,20 @@ class BlockManager:
         # Committed to the seq rather than returned: what `allocate` claims from
         # HBM is still `num_cached_blocks`, and the joint boundary only decides
         # where the two loads are aimed. `record` is the probe/admission split:
-        # a real admission commits the decision (seq fields + funnel counters), a
-        # fit probe computes and drops it, so a seq that never schedules cannot
-        # inflate the operator-visible funnel. Below the refusal, not above it,
-        # for the same reason _extend_hash_chain is: _joint_kv_boundary walks a
-        # chained xxhash up to the LMCache-only cap (_chain_to) plus a _gated_hit
-        # rescan, and a refused admission would discard all of it. Nothing
-        # between here and the refusal reads the seq's joint fields, and the
-        # author already moved _extend_hash_chain down for this exact cost --
-        # this is its twin.
-        decision = self._joint_kv_boundary(seq, num_cached_blocks, block_hashes)
+        # a real admission computes the boundary and commits it (seq fields +
+        # funnel counters); a fit probe skips it entirely. The `num_cached_blocks`
+        # returned below does not depend on the decision, so gating the
+        # computation -- not just the commit -- spares a probe the O(prompt) work
+        # for a value it would only discard: `_joint_kv_boundary` walks a chained
+        # xxhash up to the LMCache-only cap (`_chain_to`) plus a `_gated_hit`
+        # rescan. A 128k prompt at the front of a KV-pressured queue paid that
+        # full chain on every scheduling pass (`is_mixed_batch` peeks up to four
+        # waiting seqs with `record=False`) for a decision nothing read. Placed
+        # below the refusal, not above it, for the same reason `_extend_hash_chain`
+        # is: a refused admission would discard it, and nothing between here and
+        # the refusal reads the seq's joint fields -- this is that move's twin.
         if record:
+            decision = self._joint_kv_boundary(seq, num_cached_blocks, block_hashes)
             self._commit_joint_boundary(seq, decision)
         # After the refusal, not before it. The chain is O(prompt) xxhash plus
         # two temporaries per block, and a refused admission discards it — a
