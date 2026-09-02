@@ -177,9 +177,7 @@ class EagleProposer(Drafter):
             hidden_states=hidden_states.flatten(0, 1),
         )
 
-    def _first_step_head(
-        self, out, running_bs, *, last_token_indices, **_
-    ):
+    def _first_step_head(self, out, running_bs, *, last_token_indices, **_):
         """Keep only the per-sequence row that feeds step 1 and the LM head."""
         sample_hidden = torch.index_select(out, 0, last_token_indices)
         return sample_hidden, self.model.compute_draft_ids(sample_hidden)
@@ -192,7 +190,9 @@ class EagleProposer(Drafter):
         fc = get_forward_context()
         positions.copy_(fc.context.positions[: running_bs * q].view(running_bs, q) + 1)
         last_token_indices.copy_(
-            torch.arange(q - 1, running_bs * q, q, device=self.device, dtype=torch.int32)
+            torch.arange(
+                q - 1, running_bs * q, q, device=self.device, dtype=torch.int32
+            )
         )
 
     def _step_forward(self, running_bs, *, input_ids, positions, hidden_states):
