@@ -7,10 +7,15 @@ These are CPU-only: they pin the dtype decision and the numerical fact behind
 it, without needing a GPU or a 408 GB checkpoint.
 """
 
+import pytest
 import torch
 from transformers import PretrainedConfig
 
-from atom.models.moe_router import moe_router_dtype as _moe_router_dtype
+# `deepseek_v2` imports AITER at module scope, so this module cannot even be
+# collected on the CPU-only Pre Checkin runner without the guard.
+pytest.importorskip("aiter")
+
+from atom.models.deepseek_v2 import _moe_router_dtype
 
 
 def _config(**kw) -> PretrainedConfig:

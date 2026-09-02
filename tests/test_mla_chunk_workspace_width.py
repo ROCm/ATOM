@@ -10,7 +10,13 @@ Anything sized from the raw config is then too narrow by exactly that pad.
 
 from types import SimpleNamespace
 
-from atom.model_ops.mla_geometry import mla_kv_entry_dim, mla_qk_head_dim
+import pytest
+
+# `aiter_mla` imports AITER at module scope, so this module cannot even be
+# collected on the CPU-only Pre Checkin runner without the guard.
+pytest.importorskip("aiter")
+
+from atom.model_ops.attentions.aiter_mla import mla_kv_entry_dim, mla_qk_head_dim
 
 
 def _deepseek_like():
