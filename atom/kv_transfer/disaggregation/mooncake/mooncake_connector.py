@@ -1833,6 +1833,15 @@ class MooncakeConnector(KVConnectorBase):
                 dst_base + dst_page * bytes_per_page,
                 length,
             )
+            logger.info(
+                "[PRODUCER] staged index RDMA write: req=%s, region=%d, "
+                "pages=%d, descriptors=%d, total_bytes=%d",
+                req_id,
+                region_idx,
+                staged_pages,
+                len(src_addrs),
+                sum(sizes),
+            )
             if not self._rdma_write_with_retry(
                 target,
                 src_addrs.tolist(),
