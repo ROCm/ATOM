@@ -268,6 +268,12 @@ class PPEngineCoreProc(EngineCore):
             kvoutput.finished_loading
             or kvoutput.failed_loading
             or kvoutput.finished_saving
+            # connector_completions are offload channel events (kimi_k3 state
+            # dispositions, dsv4 checkpoint boundaries). They too span all PP
+            # stages, so they must reach the aggregator rather than the
+            # scheduler directly -- and count as "offload work" so this poll
+            # does not early-return and strand them.
+            or kvoutput.connector_completions
         )
         pp_messages = self.pp_transport.recv_kv_status(timeout_ms=0)
 
@@ -317,6 +323,7 @@ class PPEngineCoreProc(EngineCore):
             finished_loading=kvoutput.finished_loading,
             failed_loading=kvoutput.failed_loading,
             finished_saving=kvoutput.finished_saving,
+            connector_completions=kvoutput.connector_completions,
         )
         if not offload_local.is_empty():
             self._ingest_and_release(offload_local, 0)
