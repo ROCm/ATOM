@@ -125,7 +125,12 @@ class Eagle3DraftBuilder:
         self._next_layer_id += 1
         cache = runner.eagle3_kv_cache
         impl = getattr(module, "impl", None)
+        # Decide the layout and record it on the impl in the same breath: the
+        # flag is this binder's output, not an input to read back here. Every
+        # other assignment of it in the tree is a constant False.
         flash = self._use_flash_layout(impl)
+        if impl is not None:
+            impl.use_flash_layout = flash
         if flash:
             # The pool is allocated [.., num_blocks, block_size, kv_heads,
             # head_dim] -- already the flash layout, so take it unviewed.
@@ -146,8 +151,6 @@ class Eagle3DraftBuilder:
                 self.head_dim,
                 self.block_size,
             )
-        if impl is not None:
-            impl.use_flash_layout = flash
         # The proposer reads this to know whether the draft reaches the paged
         # read that needs a fresh block_tables. OR, not assign: the predicate is
         # per-layer (head_dim, sliding_window), so one flash layer is enough to
