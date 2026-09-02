@@ -5280,12 +5280,36 @@ def test_every_member_the_scheduler_reads_is_reachable_through_the_shell():
     from atom.kv_transfer.offload.connector import LMCacheOffloadConnectorScheduler
 
     src = inspect.getsource(sched_mod)
-    probed = set(re.findall(r'getattr\(\s*self\.kv_connector,\s*"([a-z_]+)"', src))
-    probed |= set(re.findall(r"self\.kv_connector\.([a-z_]+)\(", src))
-    probed |= set(re.findall(r"self\.kv_connector\.([a-z_]+)\b", src))
+
+    # The Scheduler reads the shell two ways: directly (`self.kv_connector.x`)
+    # and through a local alias it hoists first (`conn = self.kv_connector; ...
+    # getattr(conn, "x")`). A scan that only matched `self.kv_connector` would
+    # silently drop every aliased read -- which is exactly how `max_pending_saves`
+    # escaped coverage before: `_state_store_pending_cap` reads it off a `conn`
+    # alias. So collect the alias names too -- any `<name> = self.kv_connector`
+    # that binds the connector itself, not a `.method()` result (those end in a
+    # call, so the `\s*$` anchor excludes them) -- and sweep reads through each.
+    readers = [r"self\.kv_connector"]
+    readers += [
+        re.escape(a)
+        for a in re.findall(
+            r"^\s*([A-Za-z_]\w*)\s*=\s*self\.kv_connector\s*$", src, re.M
+        )
+    ]
+    probed: set[str] = set()
+    for r in readers:
+        probed |= set(re.findall(rf'getattr\(\s*{r},\s*"([a-z_]+)"', src))
+        probed |= set(re.findall(rf"{r}\.([a-z_]+)\(", src))
+        probed |= set(re.findall(rf"{r}\.([a-z_]+)\b", src))
     # `_connector_flag(name)` is the same read one indirection along.
     probed |= set(re.findall(r'_connector_flag\(\s*"([a-z_]+)"', src))
+    # `_impl` and `_state_tier_sub` are internal delegation helpers, not members
+    # of the forwarded face every shell must expose: `_impl` is the shell's own
+    # wrapped connector, and `_state_tier_sub` is the `multi` composite's private
+    # route to the state-tier sub, read only when the public `max_pending_saves`
+    # is None (so never on the plain shell, which always answers it).
     probed.discard("_impl")
+    probed.discard("_state_tier_sub")
     assert probed, "the scan found nothing -- it has stopped matching the source"
 
     # A regex sweep degrades silently: hoist one `getattr(self.kv_connector,
@@ -5309,6 +5333,10 @@ def test_every_member_the_scheduler_reads_is_reachable_through_the_shell():
         "take_state_reports",
         "take_state_source_releases",
         "is_offload",
+        # Read through the `conn` alias in `_state_store_pending_cap`; only the
+        # alias-aware sweep above sees it, so anchor it so a regression to a
+        # `self.kv_connector`-only scan fails here loudly.
+        "max_pending_saves",
     }
     lost = sorted(must_be_seen - probed)
     assert not lost, (
@@ -5321,13 +5349,16 @@ def test_every_member_the_scheduler_reads_is_reachable_through_the_shell():
     # `LMCacheOffloadConnectorScheduler` AND the `MultiConnectorScheduler`
     # composite the engine holds under `kv_transfer_config: multi`. The
     # composite's misses are the same silent default -- `Scheduler` reads it off
-    # `self.kv_connector`, which under `multi` IS the composite. The allow-list
-    # below is deliberately empty: a probed member the composite legitimately
-    # routes through `_state_tier_sub` instead of exposing (as `max_pending_saves`
-    # is, via an aliased `getattr` the regex does not match, so it never enters
-    # `probed`) would land here and SHOULD force a deliberate decision, not a
-    # default. If one ever does, add it here with the routing that covers it.
-    multi_routes_via_sub: set[str] = set()
+    # `self.kv_connector`, which under `multi` IS the composite.
+    #
+    # `max_pending_saves` is the one deliberate exception. The plain shell
+    # answers it as a public property; the composite bounds nothing of its own
+    # and routes the read through its state-tier sub (`_state_tier_sub`), so it
+    # does not expose the member directly. That routing is intentional -- it is
+    # listed here. Anything ELSE the composite fails to expose is NOT routed and
+    # lands as a failure below, forcing a deliberate decision rather than a
+    # silent default; add it here only with the routing that covers it.
+    multi_routes_via_sub: set[str] = {"max_pending_saves"}
     for shell in (LMCacheOffloadConnectorScheduler, MultiConnectorScheduler):
         allow = multi_routes_via_sub if shell is MultiConnectorScheduler else set()
         missing = sorted(
