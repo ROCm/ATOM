@@ -214,12 +214,19 @@ def mla_kernel_num_heads(num_heads: int) -> int:
     return -(-num_heads // _MLA_MIN_HEADS) * _MLA_MIN_HEADS
 
 
-# Gathered widths aiter serves with a dedicated kernel. The other multiples of
-# 16 (48, 80, 96, 112) are folded onto the 16-head kernel instead, and that fold
-# reinterprets head groups as extra sequence rows (total_s *= ori_nhead//16)
-# without touching kv_indptr, which desynchronises the row -> global position
-# mapping the round-robin causal mask runs on. DCP decode must avoid them.
+# Gathered widths aiter serves with a dedicated kernel.
 _MLA_DCP_KERNEL_WIDTHS = (16, 32, 64, 128)
+
+# Widest gathered query aiter has any MLA decode dispatch for; past it
+# mla_decode_fwd asserts rather than falling back to anything.
+#
+# A persistent decode reaches every multiple of 16 up to that: the widths
+# without a dedicated kernel (48, 80, 96, 112) fold onto the 16-head one, which
+# reinterprets head groups as extra sequence rows and rebuilds qo_indptr and the
+# kv indptrs to match, so the round-robin mask survives it. A NON-persistent one
+# does not -- aiter's fold is guarded on persistent mode -- so it stays on the
+# width sets below, which only hold widths that have their own kernel.
+_MLA_DCP_MAX_KERNEL_HEADS = 128
 
 _MLA_DCP_KERNEL_WIDTHS_NON_PERSISTENT = (16, 32, 128)
 _MLA_DCP_KERNEL_WIDTHS_NON_PERSISTENT_FP8 = (16, 128)
@@ -298,43 +305,42 @@ def mla_dcp_kernel_num_heads(
     kv_cache_dtype: str,
     persistent: bool,
 ) -> int:
-    """Width to pad the GATHERED query heads to for a DCP decode.
+    """Width to gather the query heads to for a DCP decode.
 
     DCP decode all-gathers Q on the head dim before calling the kernel, so what
     gets dispatched on is ``num_heads * dcp_world_size``; a single rank's head
-    count is never seen and is the wrong thing to pad. Round that gathered width
-    up to one aiter serves natively for the mode this decode actually runs in --
-    the folded widths are no use here because the fold breaks the round-robin
-    causal mask (see above), and gqa=64 is off the table on any
-    non-persistent decode (see _MLA_DCP_KERNEL_WIDTHS_NON_PERSISTENT).
+    count is never seen and is the wrong thing to round. A persistent decode
+    takes that width as-is once it is a multiple of 16, dedicated kernel or
+    fold; a non-persistent one has no fold to fall back on and must be padded
+    onto a width that has its own kernel.
 
-    ``kv_cache_dtype`` no longer selects whether gqa=64 is excluded -- it is
-    excluded for both dtypes -- but it still selects the non-persistent set,
-    because fp8 lacks a gqa=32 kernel there and bf16 does not.
+    ``kv_cache_dtype`` only selects the non-persistent set: gqa=64 is excluded
+    for both dtypes there (fp8 aborts on it, bf16 silently miscomputes it), and
+    fp8 lacks a gqa=32 kernel on top of that while bf16 does not.
     """
-    gathered = max(num_heads * dcp_world_size, min_kernel_heads)
-    # gqa=64 is dropped for BOTH dtypes without persistent mode (fp8 aborts on
-    # it, bf16 silently miscomputes it); fp8 drops 32 on top of that.
-    widths = _MLA_DCP_KERNEL_WIDTHS
-    if not persistent:
+    gathered = mla_kernel_num_heads(max(num_heads * dcp_world_size, min_kernel_heads))
+    if persistent:
+        if gathered <= _MLA_DCP_MAX_KERNEL_HEADS:
+            return gathered
+    else:
         widths = (
             _MLA_DCP_KERNEL_WIDTHS_NON_PERSISTENT_FP8
             if kv_cache_dtype.startswith("fp8")
             else _MLA_DCP_KERNEL_WIDTHS_NON_PERSISTENT
         )
-    for width in widths:
-        if width >= gathered:
-            return width
+        for width in widths:
+            if width >= gathered:
+                return width
     global _dcp_kernel_width_warned
     if not _dcp_kernel_width_warned:
         _dcp_kernel_width_warned = True
         logger.warning(
-            f"DCP decode gathers {gathered} query heads, past the widest natively "
-            f"dispatched MLA kernel ({widths[-1]}); falling back to "
-            "the folded kernel, which is incorrect for MTP (round-robin causal "
-            "mask). Lower decode_context_parallel_size or raise tp."
+            f"DCP decode gathers {gathered} query heads, past the widest MLA "
+            f"kernel aiter dispatches ({_MLA_DCP_MAX_KERNEL_HEADS}); it serves "
+            "neither a kernel nor a fold that wide and will abort in "
+            "mla_decode_fwd. Lower decode_context_parallel_size or raise tp."
         )
-    return mla_kernel_num_heads(gathered)
+    return gathered
 
 
 def mla_dcp_sparse_prefill_num_heads(
@@ -1738,9 +1744,17 @@ class MLAAttention(nn.Module):
             device=q.device,
         )
 
-        # The paged kernels take their batch from the q-cums; cut them to a
-        # per-seq array the prefill builder left unpadded.
-        n_seqs = attn_metadata.kv_last_page_lens.shape[0]
+        # The paged kernels take their batch from the q-cums; cut them to the
+        # requests actually scheduled, which is the width prepare_prefill fills
+        # before padding the tail out to running_bs.
+        #
+        # context.scheduled_bs is batch.total_seqs_num, while the builder sized
+        # these arrays by total_seqs_num_prefill. The two differ only on a batch
+        # carrying decode rows, and such a batch leaves total_tokens_num_prefill
+        # at 0 -- hence is_prefill False, which is the branch this function is
+        # reached from. Every is_prefill batch sets the two counts equal.
+        fwd_context = get_forward_context()
+        n_seqs = fwd_context.context.scheduled_bs
         paged_cu_seqlens_q = attn_metadata.cu_seqlens_q[: n_seqs + 1]
         paged_kv_indptr = attn_metadata.kv_indptr
         paged_kv_indices = attn_metadata.kv_indices
