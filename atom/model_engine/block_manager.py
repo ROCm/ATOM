@@ -1413,9 +1413,17 @@ class BlockManager:
         drains, while whether the CPU put succeeded is decided afterwards and
         cannot touch them. Holding an image out of the pool across that would
         cost reuse for nothing.
+
+        Phase one of the two-phase pin: it releases the units but leaves the
+        operation pinned as dispatched-but-unreported, so `has_offload_pins`
+        (and the liveness gate that ORs it in) keeps the engine polling until
+        the index report actually lands. Retiring the pin here -- as it once
+        did -- let liveness read idle while the store's report still sat
+        undrained in the worker, so `note_stored` never ran and the checkpoint
+        was never votable.
         """
         if self.paged_state_checkpoints is not None:
-            self.paged_state_checkpoints.settle_offload_store(op)
+            self.paged_state_checkpoints.release_offload_store_source(op)
 
     def has_pending_state_store_pins(self) -> bool:
         """Whether a dispatched state store is still awaiting its report.

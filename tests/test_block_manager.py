@@ -963,12 +963,16 @@ class TestReclaimedStoresAreNotIndexed:
         def __init__(self, reclaimed):
             self._reclaimed = reclaimed
             self.settled = []
+            self.released = []
 
         def was_reclaimed(self, op):
             return op in self._reclaimed
 
         def settle_offload_store(self, op):
             self.settled.append(op)
+
+        def release_offload_store_source(self, op):
+            self.released.append(op)
 
     def _bm(self, reclaimed=()):
         from atom.model_engine.state_offload import StateOffloadIndex
@@ -1012,7 +1016,10 @@ class TestReclaimedStoresAreNotIndexed:
         bm = self._bm()
         op = StateStoreOperationId(11, 1)
         bm.release_state_store_source(op)
-        assert bm.paged_state_checkpoints.settled == [op]
+        # Phase one hands the units back but leaves the pin in place, so the
+        # store still reads as dispatched-but-unreported until its report lands.
+        assert bm.paged_state_checkpoints.released == [op]
+        assert bm.paged_state_checkpoints.settled == [], "the pin is not retired"
         # ...and it does not touch the index, which the store report owns.
         assert bm.state_offload.hashes == set()
 

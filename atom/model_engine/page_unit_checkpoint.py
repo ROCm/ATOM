@@ -116,6 +116,26 @@ class CheckpointRecord:
     pin_count: int = 0
 
 
+@dataclass
+class _OffloadPin:
+    """A store that has been dispatched to the worker but not yet indexed.
+
+    Two-phase, because a store's life has two independent ends. The PAGE units
+    it gathers are the KV pool's and are free the moment the D2H gather drains
+    (`source_released`); whether the CPU `batched_put` then succeeded is decided
+    strictly afterwards and cannot touch them. The pin therefore holds the units
+    only until the source is released, but the *record itself* stays in
+    `_offload_pins` until the index report lands -- so `has_offload_pins` and
+    `_hash_in_flight`, which mean "dispatched but unreported", keep answering
+    from dispatch all the way to the report, across the gap the source release
+    opens in the middle.
+    """
+
+    checkpoint_id: int
+    pinned_at: float
+    source_released: bool = False
+
+
 class PageUnitCheckpointStore:
     """Content index and ownership table for split state images."""
 
@@ -158,7 +178,8 @@ class PageUnitCheckpointStore:
         # any real in-flight-plus-waiting count so it only bites a runaway.
         self._offload_backlog_cap = 8192
         self.offload_nominations_dropped = 0
-        # StateStoreOperationId -> (checkpoint_id, monotonic when pinned).
+        # StateStoreOperationId -> _OffloadPin (checkpoint, when pinned, whether
+        # the source units are already back).
         # A store's report carries no request -- by the time one lands its owner
         # is long gone -- so the hash is the only thing left to name it by. The
         # hash ALONE is not an identity though: the same prefix is stored again
@@ -169,7 +190,7 @@ class PageUnitCheckpointStore:
         # generation separates the attempts, and keying the pins by the whole
         # operation is also what stops a late report from an earlier attempt
         # from settling a newer pin for the same hash.
-        self._offload_pins: dict[StateStoreOperationId, tuple[int, float]] = {}
+        self._offload_pins: dict[StateStoreOperationId, _OffloadPin] = {}
         self._offload_generation = 0
         self.offload_pins_reclaimed = 0
         # Operations whose pin the stale reclaimer took back. Bounded, because
@@ -475,7 +496,7 @@ class PageUnitCheckpointStore:
                 int(record.prefix_hash), self._offload_generation
             )
             record.pin_count += 1
-            self._offload_pins[op] = (checkpoint_id, monotonic())
+            self._offload_pins[op] = _OffloadPin(checkpoint_id, monotonic())
             out.append((op, record.unit_ids))
         # Re-queue the deferred nominations for the next drain, once the
         # colliding in-flight generation has had a chance to settle. The drain
@@ -497,36 +518,63 @@ class PageUnitCheckpointStore:
         """
         return any(op.prefix_hash == prefix_hash for op in self._offload_pins)
 
-    def settle_offload_store(self, op: StateStoreOperationId) -> None:
-        """One store reported, either way. Release the units it was holding.
+    def release_offload_store_source(self, op: StateStoreOperationId) -> None:
+        """Phase one: the gather drained, so hand the PAGE units back now.
 
-        Success and failure release identically: the pin exists to keep the
-        bytes still during the copy, and the copy is over either way. Whether
-        the hash becomes reachable is `StateOffloadIndex`'s business, not this
-        one's.
+        This is the earlier of a store's two ends. It returns the units to the
+        KV pool the instant the D2H copy is done reading them -- holding an
+        image out of the pool across the subsequent CPU `batched_put` would cost
+        reuse for a step that cannot touch the units. But it does NOT remove the
+        operation from `_offload_pins`: the store is still dispatched-but-
+        unreported, so `has_offload_pins` and `_hash_in_flight` must keep
+        seeing it until the index report lands. It only marks the source gone,
+        so the report (or a reclaim) does not release the same units twice.
+
+        Idempotent, and matched on the whole operation: a release for a
+        generation no longer here -- already reported, or reclaimed -- does
+        nothing.
+        """
+        pin = self._offload_pins.get(op)
+        if pin is None or pin.source_released:
+            return
+        pin.source_released = True
+        self._release_offload_pin(pin.checkpoint_id)
+
+    def settle_offload_store(self, op: StateStoreOperationId) -> None:
+        """Phase two: the store reported, either way. Retire the operation.
+
+        Removes the pin so `has_offload_pins`/`_hash_in_flight` stop seeing this
+        operation -- the report is the true end of "dispatched but unreported".
+        The units are normally already back (`release_offload_store_source` ran
+        first); this is the backstop for a store that failed or reported before
+        its source was released, so the units are freed here only when they were
+        not freed there. Whether the hash becomes reachable is
+        `StateOffloadIndex`'s business, not this one's.
 
         Matched on the whole operation: a report from an attempt whose pin was
         already reclaimed names a generation no longer here and settles
         nothing, rather than releasing a newer attempt's pin.
         """
-        entry = self._offload_pins.pop(op, None)
-        if entry is None:
+        pin = self._offload_pins.pop(op, None)
+        if pin is None:
             return
-        self._release_offload_pin(entry[0])
+        if not pin.source_released:
+            self._release_offload_pin(pin.checkpoint_id)
 
     def has_offload_pins(self) -> bool:
-        """Whether any dispatched store is still holding its PAGE units.
+        """Whether any dispatched store is still awaiting its index report.
 
         A pin lives here from the moment `take_offload_stores` hands a store to
-        the worker until either report path settles it (`settle_offload_store`,
-        driven by the source-release and index completions) or the last-resort
-        `reclaim_stale_offload_pins` times it out. It is therefore true exactly
-        while a store is dispatched-but-unreported, which is the interval the
-        engine must keep polling across: the completion that clears the pin --
-        and the reclaim that is its only other exit -- both run only from
-        `_poll_kv_transfer_progress`, which the idle loop skips once liveness
-        reads False. Because reclaim shares this same dict, the signal cannot
-        latch the busy loop: a lost report clears here when the reclaim fires.
+        the worker until `settle_offload_store` retires it on the index report,
+        or the last-resort `reclaim_stale_offload_pins` times it out. The source
+        release in between hands the PAGE units back but leaves the pin, so this
+        stays true across it: it is therefore true exactly while a store is
+        dispatched-but-unreported, which is the interval the engine must keep
+        polling across -- the report that clears the pin, and the reclaim that
+        is its only other exit, both run only from `_poll_kv_transfer_progress`,
+        which the idle loop skips once liveness reads False. Because reclaim
+        shares this same dict, the signal cannot latch the busy loop: a lost
+        report clears here when the reclaim fires.
         """
         return bool(self._offload_pins)
 
@@ -562,14 +610,35 @@ class PageUnitCheckpointStore:
         if timeout_s <= 0 or not self._offload_pins:
             return 0
         cutoff = monotonic() - timeout_s
-        stale = [op for op, (_cid, at) in self._offload_pins.items() if at <= cutoff]
+        stale = [
+            op for op, pin in self._offload_pins.items() if pin.pinned_at <= cutoff
+        ]
         for op in stale:
-            checkpoint_id, _at = self._offload_pins.pop(op)
-            self._release_offload_pin(checkpoint_id)
+            pin = self._offload_pins.pop(op)
+            self.offload_pins_reclaimed += 1
+            if pin.source_released:
+                # The gather already drained and the units are back; only the
+                # index report was lost. Nothing to release again -- doing so
+                # would underflow the record -- and nothing to forfeit: the
+                # bytes are trustworthy because the reader provably stopped, so
+                # a late report may still index the hash. This is a lost report,
+                # not a taken-back source.
+                logger.warning(
+                    "state offload: store %s never reported after %.1fs; its "
+                    "units were already returned at source release, so only "
+                    "the index report is lost.",
+                    op,
+                    timeout_s,
+                )
+                continue
+            # The source was never released, so the worker may still be inside
+            # the gather. Taking the units back now means they cannot be
+            # trusted: the pool may hand them to another request whose writes
+            # this gather then picks up. Release and forfeit the entry.
+            self._release_offload_pin(pin.checkpoint_id)
             self._offload_reclaimed[op] = None
             while len(self._offload_reclaimed) > _RECLAIMED_MEMORY:
                 self._offload_reclaimed.popitem(last=False)
-            self.offload_pins_reclaimed += 1
             logger.warning(
                 "state offload: reclaimed the units of store %s after %.1fs "
                 "with no report. The worker may still be reading them, so the "
@@ -877,8 +946,12 @@ class PagedStateCheckpointCoordinator:
         """`(operation, unit_ids)` to hand the tier now. See the store."""
         return self.store.take_offload_stores(max_inflight)
 
+    def release_offload_store_source(self, op: StateStoreOperationId) -> None:
+        """The gather drained; hand the units back but keep the pin. See store."""
+        self.store.release_offload_store_source(op)
+
     def settle_offload_store(self, op: StateStoreOperationId) -> None:
-        """One store reported, either way; release the units it was holding."""
+        """One store reported, either way; retire the operation. See store."""
         self.store.settle_offload_store(op)
 
     def has_offload_pins(self) -> bool:

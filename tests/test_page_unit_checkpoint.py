@@ -481,6 +481,52 @@ class TestOffloadPinRelease:
         store.settle_offload_store(StateStoreOperationId(11, 1))
         assert store.records[cid].pin_count == 0
 
+    def test_source_release_frees_units_but_keeps_the_pin(self):
+        """Phase one: the gather drained, so the units go back -- but the store
+        is still dispatched-but-unreported, so the engine must keep polling for
+        its report. Retiring the pin here (as it once did) let liveness read
+        idle while the report still sat undrained, so it was never votable."""
+        _pool, store = offload_store()
+        cid, _op = ready(store, 11)
+        [(sent, _u)] = store.take_offload_stores(max_inflight=4)
+
+        store.release_offload_store_source(sent)
+        assert store.records[cid].pin_count == 0, "no longer pinned for the copy"
+        assert store._is_evictable(cid), "the units are the pool's again"
+        assert store.has_offload_pins(), "still unreported: keep polling"
+        assert store._hash_in_flight(11), "no second store of 11 yet"
+
+        store.settle_offload_store(sent)
+        assert not store.has_offload_pins()
+        assert not store._hash_in_flight(11)
+
+    def test_source_release_is_idempotent_and_does_not_double_free(self):
+        """A second release -- or a release after the report -- must not
+        decrement the record a second time and underflow the pin count."""
+        _pool, store = offload_store()
+        cid, _op = ready(store, 11)
+        [(sent, _u)] = store.take_offload_stores(max_inflight=4)
+        store.release_offload_store_source(sent)
+        store.release_offload_store_source(sent)  # idempotent
+        store.settle_offload_store(sent)
+        store.release_offload_store_source(sent)  # after the report: no pin left
+        assert store.records[cid].pin_count == 0
+
+    def test_a_source_released_store_that_never_reports_is_reclaimed_but_kept(self):
+        """Its units are already back and the reader provably stopped, so a lost
+        report is not the taken-back-source case: nothing is released again (no
+        underflow) and the image is NOT forfeited -- a late report may index."""
+        _pool, store = offload_store()
+        cid, _op = ready(store, 11)
+        [(sent, _u)] = store.take_offload_stores(max_inflight=4)
+        store.release_offload_store_source(sent)
+        assert store.records[cid].pin_count == 0
+
+        assert store.reclaim_stale_offload_pins(timeout_s=1e-9) == 1
+        assert store.records[cid].pin_count == 0, "not released twice"
+        assert not store.was_reclaimed(sent), "source-released bytes are trusted"
+        assert store.offload_pins_reclaimed == 1
+
     def test_unindex_during_the_copy_holds_the_units_to_the_end(self):
         """The tier's whole point: the CPU copy outliving the HBM one. So
         `unindex` must not pull the source out from under a running D2H."""
