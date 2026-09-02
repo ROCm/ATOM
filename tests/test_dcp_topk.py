@@ -238,32 +238,14 @@ def test_candidate_exchange_reproduces_global_topk(
         ), f"[{name}] ids differ from the reference with no threshold tie"
 
 
-def test_merge_agrees_across_ranks_on_a_fixed_buffer():
-    """The property the partition actually needs.
-
-    NOT "the pipeline returns the same answer every run" -- it cannot, because
-    aiter's local top-k picks arbitrarily among tied candidates. What must hold
-    is that re-merging the SAME gathered buffer returns the same answer, which is
-    what all-gather actually hands every rank. A merge that resolved a threshold
-    tie by scheduling order would let two ranks claim the same token -- and with
-    heavy ties the threshold bucket is exactly where that would show up.
-    """
-    rows, world, ctx = 16, 8, 65536
-    gl = _make_logits(rows, ctx, seed=9, tie_frac=0.99)
-    gathered, idxs = _build_gathered(gl, ctx, world)
-    bt, _ = _identity_block_table(rows, ctx, world, gathered.device)
-
-    for r in range(world):
-        first_out, first_ip = _merge_owned(gathered, idxs[r], bt, r, world, TOPK)
-        first_out, first_ip = first_out.clone(), first_ip.clone()
-        for i in range(10):
-            out, ip = _merge_owned(gathered, idxs[r], bt, r, world, TOPK)
-            assert torch.equal(
-                ip, first_ip
-            ), f"rank {r} merge {i}: indptr moved -- ranks would overlap"
-            assert torch.equal(
-                out, first_out
-            ), f"rank {r} merge {i}: slots moved -- ranks would overlap"
+# Re-merging the SAME gathered buffer must return the same answer, or two ranks
+# could claim the same token. That is a property of the op alone, and aiter owns
+# it: op_tests/test_flydsl_dcp_topk_merge.py::check_deterministic_across_runs
+# re-runs it 200 times per rank on tie-heavy and random inputs. Not duplicated
+# here. What this file still has to prove is the weaker end-to-end statement
+# below: the PIPELINE may return a different valid answer between runs, because
+# aiter's local top-k picks arbitrarily among tied candidates before the merge
+# ever sees them.
 
 
 def test_reruns_stay_valid_even_when_the_set_shifts():

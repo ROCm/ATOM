@@ -1699,8 +1699,10 @@ def sparse_attn_indexer(
             )
         assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
         if logits is not None:
-            # Non-DCP: one rank holds the whole plane, so top-k is already
-            # global. The DCP branch produced topk_indices_decode itself.
+            # Non-DCP only: one rank holds the whole plane, so top-k is already
+            # global. The DCP branch never sets `logits` -- it scores its own
+            # shard inside the fused exchange and writes the owned slots
+            # straight out, so there is no plane left to rank here.
             topk_indices_decode = topk_indices[:num_decode_tokens, :topk_tokens]
             top_k_per_row_decode(
                 logits,

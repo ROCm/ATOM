@@ -812,21 +812,6 @@ def dcp_local_context_lens(
 # ---------------------------------------------------------------------------
 
 
-# Per-(device, rows, k_loc) staging scratch. The op forbids allocating device
-# scratch internally, so the caller owns it; caching keeps the allocation out of
-# the captured decode graph.
-_staging_cache: dict = {}
-
-
-def _staging(device, rows: int, k_loc: int) -> torch.Tensor:
-    key = (device, rows, k_loc)
-    buf = _staging_cache.get(key)
-    if buf is None:
-        buf = torch.empty(rows, k_loc, dtype=torch.int32, device=device)
-        _staging_cache[key] = buf
-    return buf
-
-
 def dcp_decode_candidate_exchange_fused(
     attn_metadata,
     padded_q_fp8_decode_tokens: torch.Tensor,
@@ -906,6 +891,11 @@ def dcp_decode_candidate_exchange_fused(
     send = torch.empty(
         num_decode_tokens, k_loc, dtype=torch.float32, device=local_logits.device
     )
+    # The merge op allocates no device scratch of its own, so the caller owns
+    # its staging buffer -- same lifetime as the three above.
+    staging = torch.empty(
+        num_decode_tokens, k_loc, dtype=torch.int32, device=local_logits.device
+    )
     top_k_per_row_decode(
         local_logits,
         next_n,
@@ -928,7 +918,6 @@ def dcp_decode_candidate_exchange_fused(
         .view(dcp_world_size, num_decode_tokens, k_loc)
         .permute(1, 0, 2)
         .reshape(num_decode_tokens, n_cand)
-        .contiguous()
     )
 
     flydsl_dcp_topk_merge(
@@ -938,7 +927,7 @@ def dcp_decode_candidate_exchange_fused(
         out_kv_indices,
         out_kv_indptr,
         owned_counts,
-        _staging(local_logits.device, num_decode_tokens, k_loc),
+        staging,
         dcp_rank,
         dcp_world_size,
         topk_tokens,
