@@ -1493,7 +1493,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 n_expts_act = routing_data.n_expts_act
 
                 # Convert to triton routing data structures
-                num_tokens, n_expts_tot = router_logits.shape
+                _, n_expts_tot = router_logits.shape
 
                 if global_num_experts > 0:
                     n_expts_tot = global_num_experts
@@ -1656,6 +1656,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         """
         from aiter.ops.triton.fusions.fused_clamp_act_mul import fused_clamp_act_mul
         from aiter.ops.triton.gemm.basic.gemm_a16wfp4 import gemm_a16wfp4
+
         from atom.model_ops.swiglu_oai import swiglu_oai_split
 
         # Two activation flavours are supported, matching the routed experts:
