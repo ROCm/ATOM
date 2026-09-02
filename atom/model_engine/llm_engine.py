@@ -388,6 +388,12 @@ class LLMEngine:
                 "wanted_tokens",
                 "reusable_tokens",
                 "full_tokens",
+                # Reuse served from the CPU offload tier. Every rank reports it
+                # in `cache_statistics()`, but it was missing from this sum, so
+                # the DP-aggregated snapshot dropped the one counter the offload
+                # feature exists to move. Shares the `reusable` denominator with
+                # the HBM series but no numerator -- scored separately below.
+                "offload_tokens",
                 "checkpoints_kept",
                 "checkpoints_dropped",
                 "checkpoints_evicted",
@@ -440,6 +446,12 @@ class LLMEngine:
             "state_recoverable_loss": rate(
                 totals["wanted_tokens"] - totals["cached_tokens"], compressed
             ),
+            # CPU-tier reuse against the same `reusable` denominator as `hit`,
+            # matching `EngineStats.offload_hit_rate`. Disjoint from the HBM
+            # `hit` numerator (the offload tier serves what HBM missed), so it
+            # is not part of the `hit`/`compressed_hit` product and stands on
+            # its own.
+            "offload_hit": rate(totals["offload_tokens"]),
         }
 
     def get_metrics_statistics(self) -> dict[str, Any]:
