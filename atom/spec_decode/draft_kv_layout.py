@@ -42,7 +42,5 @@ def use_flash_layout(impl) -> bool:
         return False
     # rope_cache's `use_triton_attn`: the env is one of three terms, not all.
     return bool(
-        envs.ATOM_FORCE_ATTN_TRITON
-        or impl.sliding_window != -1
-        or impl.head_dim != 128
+        envs.ATOM_FORCE_ATTN_TRITON or impl.sliding_window != -1 or impl.head_dim != 128
     )

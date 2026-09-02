@@ -75,6 +75,7 @@ def test_the_predicate_imports_without_aiter(tmp_path):
         text=True,
         env=env,
         cwd=_ROOT,
+        check=False,  # the returncode is the assertion
     )
     assert got.returncode == 0, (
         "the predicate no longer imports without aiter, so on CI this file is "
