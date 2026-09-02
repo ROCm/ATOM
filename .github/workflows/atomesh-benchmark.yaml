@@ -550,10 +550,23 @@ jobs:
           docker "${docker_args[@]}" <<'CONTAINER_SCRIPT'
           set -euo pipefail
 
-          mapfile -t rdma_devices < <(
-            for device_path in /sys/class/infiniband/*; do
-              [[ -e "${device_path}" ]] && basename "${device_path}"
-            done
+          mapfile -t rdma_devices < <(python3 - <<'PY'
+          import os
+          import re
+
+          devices = [
+              name
+              for name in os.listdir("/sys/class/infiniband")
+              if os.path.isdir(os.path.join("/sys/class/infiniband", name))
+          ]
+
+          def sort_key(name: str) -> int:
+              match = re.search(r"(?:ionic_|rdma)(\d+)$", name)
+              return int(match.group(1)) if match else 10_000
+
+          for device in sorted(devices, key=sort_key):
+              print(device)
+          PY
           )
           if [[ "${#rdma_devices[@]}" -eq 0 ]]; then
             echo "ERROR: no RDMA devices found under /sys/class/infiniband" >&2
@@ -679,24 +692,57 @@ jobs:
             exit 1
           fi
 
-          # The initiator writes prefill VRAM into the decode target. Register
-          # each decode buffer on its local HCA and the prefill GPU's alternate
-          # HCA, then verify destination affinity selects the matching HCA.
+          HCA_COUNT=8
+
+          select_ib_devices_for_gpu() {
+            local phys_idx="$1"
+            local primary="${rdma_devices[phys_idx]}"
+            local -a selected=("${primary}")
+            local idx device existing
+            for ((idx = 0; idx < HCA_COUNT; idx++)); do
+              device="${rdma_devices[idx]:-}"
+              [[ -z "${device}" ]] && continue
+              for existing in "${selected[@]}"; do
+                [[ "${existing}" == "${device}" ]] && continue 2
+              done
+              selected+=("${device}")
+            done
+            (IFS=,; echo "${selected[*]}")
+          }
+
+          write_cuda0_nic_matrix() {
+            local matrix_path="$1"
+            shift
+            MATRIX_PATH="${matrix_path}" RDMA_MATRIX_DEVICES="${*}" python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          devices = os.environ["RDMA_MATRIX_DEVICES"].split()
+          Path(os.environ["MATRIX_PATH"]).write_text(
+              json.dumps({"cuda:0": [devices, []]}),
+              encoding="utf-8",
+          )
+          PY
+          }
+
+          # Mirror ATOM mooncake_connector ib_enable_alternate_hca + ib_hca_count:
+          # register decode VRAM on the local HCA first, then all reachable HCAs.
           for ((prefill_gpu_id = 0; prefill_gpu_id < 4; prefill_gpu_id++)); do
             decode_gpu_id=$((prefill_gpu_id + 4))
             prefill_rdma_device="${rdma_devices[prefill_gpu_id]}"
             decode_rdma_device="${rdma_devices[decode_gpu_id]}"
-            decode_device_csv="${decode_rdma_device},${prefill_rdma_device}"
+            decode_device_csv="$(select_ib_devices_for_gpu "${decode_gpu_id}")"
             prefill_matrix="/tmp/gdr-smoke-prefill-gpu-${prefill_gpu_id}-nic-priority.json"
             decode_matrix="/tmp/gdr-smoke-decode-gpu-${decode_gpu_id}-nic-priority.json"
-            printf '{"cuda:0":[["%s"],[]]}\n' "${prefill_rdma_device}" > "${prefill_matrix}"
-            printf '{"cuda:0":[["%s","%s"],[]]}\n' \
-              "${decode_rdma_device}" "${prefill_rdma_device}" > "${decode_matrix}"
+            write_cuda0_nic_matrix "${prefill_matrix}" "${prefill_rdma_device}"
+            IFS=',' read -r -a decode_ib_devices <<< "${decode_device_csv}"
+            write_cuda0_nic_matrix "${decode_matrix}" "${decode_ib_devices[@]}"
 
             target_log="/tmp/gdr-smoke-decode-gpu-${decode_gpu_id}-target.log"
             initiator_log="/tmp/gdr-smoke-prefill-gpu-${prefill_gpu_id}-initiator.log"
 
-            echo "=== GPUDirect RDMA prefill GPU ${prefill_gpu_id} (${prefill_rdma_device}) -> decode GPU ${decode_gpu_id} (${decode_rdma_device}, alternate ${prefill_rdma_device}) ==="
+            echo "=== GPUDirect RDMA prefill GPU ${prefill_gpu_id} (${prefill_rdma_device}) -> decode GPU ${decode_gpu_id} (${decode_device_csv}) ==="
             HIP_VISIBLE_DEVICES="${decode_gpu_id}" \
             "${validator_bin}" \
               --mode=target \
@@ -740,7 +786,7 @@ jobs:
                ! grep -q "Data validation passed" "${initiator_log}"; then
               cat "${initiator_log}" >&2
               cat "${target_log}" >&2
-              echo "ERROR: GPUDirect RDMA data validation failed from prefill GPU ${prefill_gpu_id} (${prefill_rdma_device}) to decode GPU ${decode_gpu_id} (${decode_rdma_device}, alternate ${prefill_rdma_device})" >&2
+              echo "ERROR: GPUDirect RDMA data validation failed from prefill GPU ${prefill_gpu_id} (${prefill_rdma_device}) to decode GPU ${decode_gpu_id} (${decode_device_csv})" >&2
               exit 1
             fi
             expected_affinity="local_device_name=${prefill_rdma_device}, peer_device_name=${prefill_rdma_device}"
@@ -756,7 +802,7 @@ jobs:
             kill "${target_pid}" 2>/dev/null || true
             wait "${target_pid}" 2>/dev/null || true
             target_pid=""
-            echo "GPUDirect RDMA passed from prefill GPU ${prefill_gpu_id} to decode GPU ${decode_gpu_id} via alternate HCA ${prefill_rdma_device}"
+            echo "GPUDirect RDMA passed from prefill GPU ${prefill_gpu_id} to decode GPU ${decode_gpu_id} via decode HCAs ${decode_device_csv}"
           done
           echo "Node-local GPUDirect RDMA passed for all four prefill/decode GPU pairs"
 
@@ -842,19 +888,19 @@ jobs:
               expected_peer_device="${decode_rdma_device}"
               is_cross_rail=0
               if [[ "${prefill_gpu_id}" -ne "${decode_gpu_id}" ]]; then
-                decode_device_csv="${decode_rdma_device},${prefill_rdma_device}"
+                decode_device_csv="$(select_ib_devices_for_gpu "${decode_gpu_id}")"
                 expected_peer_device="${prefill_rdma_device}"
                 is_cross_rail=1
               fi
               echo "=== Cross-node RDMA pair: prefill GPU ${prefill_gpu_id} (${prefill_rdma_device}) -> decode GPU ${decode_gpu_id} (${decode_device_csv}); expected peer HCA ${expected_peer_device} ==="
               prefill_matrix="/tmp/cross-node-prefill-gpu-${prefill_gpu_id}-nic-priority.json"
               decode_matrix="/tmp/cross-node-decode-gpu-${decode_gpu_id}-nic-priority.json"
-              printf '{"cuda:0":[["%s"],[]]}\n' "${prefill_rdma_device}" > "${prefill_matrix}"
+              write_cuda0_nic_matrix "${prefill_matrix}" "${prefill_rdma_device}"
               if [[ "${is_cross_rail}" -eq 1 ]]; then
-                printf '{"cuda:0":[["%s","%s"],[]]}\n' \
-                  "${decode_rdma_device}" "${prefill_rdma_device}" > "${decode_matrix}"
+                IFS=',' read -r -a decode_ib_devices <<< "${decode_device_csv}"
+                write_cuda0_nic_matrix "${decode_matrix}" "${decode_ib_devices[@]}"
               else
-                printf '{"cuda:0":[["%s"],[]]}\n' "${decode_rdma_device}" > "${decode_matrix}"
+                write_cuda0_nic_matrix "${decode_matrix}" "${decode_rdma_device}"
               fi
               ready_file="${SMOKE_RUN_DIR}/cross-node-ready-prefill-${prefill_gpu_id}-decode-${decode_gpu_id}"
               result_file="${SMOKE_RUN_DIR}/cross-node-result-prefill-${prefill_gpu_id}-decode-${decode_gpu_id}"
