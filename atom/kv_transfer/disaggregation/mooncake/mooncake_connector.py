@@ -1763,35 +1763,38 @@ class MooncakeConnector(KVConnectorBase):
             ):
                 logger.error("[PRODUCER] block transfer failed for req %s", req_id)
                 return False
-        for dst_start in range(0, len(dst_block_ids), self._index_staging_chunk_pages):
-            dst_chunk = dst_block_ids[
-                dst_start : dst_start + self._index_staging_chunk_pages
-            ]
-            src_start = dst_start * dcp_size
-            src_chunk = src_block_ids[
-                src_start : min(
-                    len(src_block_ids),
-                    (dst_start + len(dst_chunk)) * dcp_size,
+        if staged_regions:
+            for dst_start in range(
+                0, len(dst_block_ids), self._index_staging_chunk_pages
+            ):
+                dst_chunk = dst_block_ids[
+                    dst_start : dst_start + self._index_staging_chunk_pages
+                ]
+                src_start = dst_start * dcp_size
+                src_chunk = src_block_ids[
+                    src_start : min(
+                        len(src_block_ids),
+                        (dst_start + len(dst_chunk)) * dcp_size,
+                    )
+                ]
+                gather_plan = self._build_sharded_index_plan(
+                    src_chunk,
+                    dcp_size,
+                    request_data["consumer_dcp_rank"],
+                    interleave,
                 )
-            ]
-            gather_plan = self._build_sharded_index_plan(
-                src_chunk,
-                dcp_size,
-                request_data["consumer_dcp_rank"],
-                interleave,
-            )
 
-            for region_idx, dst_base, bpb in staged_regions:
-                if not self._execute_staged_index_layer_chunk(
-                    target,
-                    region_idx,
-                    dst_base,
-                    bpb,
-                    dst_chunk,
-                    req_id,
-                    gather_plan,
-                ):
-                    return False
+                for region_idx, dst_base, bpb in staged_regions:
+                    if not self._execute_staged_index_layer_chunk(
+                        target,
+                        region_idx,
+                        dst_base,
+                        bpb,
+                        dst_chunk,
+                        req_id,
+                        gather_plan,
+                    ):
+                        return False
         return True
 
     def _execute_staged_index_layer_chunk(

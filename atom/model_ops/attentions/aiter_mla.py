@@ -296,6 +296,49 @@ def gather_dcp_preshuffled_index_pages(
     return dst_pages
 
 
+def _mooncake_producer_transfer_configured(config) -> bool:
+    """Whether this worker is a Mooncake P/D producer."""
+
+    transfer_config = getattr(config, "kv_transfer_config", None)
+    if not isinstance(transfer_config, dict) or not transfer_config:
+        return False
+
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+    def is_mooncake_producer(sub_config, path):
+        if not isinstance(sub_config, dict):
+            return False
+        try:
+            connector = KVConnectorFactory.canonical_name(
+                sub_config.get("kv_connector"), path=path
+            )
+        except (TypeError, ValueError):
+            return False
+        return (
+            connector == "mooncake"
+            and sub_config.get("kv_role", "kv_producer") == "kv_producer"
+        )
+
+    try:
+        connector = KVConnectorFactory.canonical_name(
+            transfer_config.get("kv_connector"), path="kv_transfer_config"
+        )
+    except (TypeError, ValueError):
+        return False
+    if connector == "mooncake":
+        return is_mooncake_producer(transfer_config, "kv_transfer_config")
+    if connector != "multi":
+        return False
+
+    sub_configs = transfer_config.get("connectors")
+    if not isinstance(sub_configs, list):
+        return False
+    return any(
+        is_mooncake_producer(sub_config, f"kv_transfer_config.connectors[{index}]")
+        for index, sub_config in enumerate(sub_configs)
+    )
+
+
 def _replicated_index_cache_transfer_supported(config) -> bool:
     """Whether the target replicated-index transfer topology is configured."""
 
@@ -1481,7 +1524,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         index_staging_chunk_pages = 0
         build_sharded_index_plan = None
         gather_sharded_index = None
-        if hasattr(runner, "index_cache") and self.dcp_world_size == 1:
+        if (
+            hasattr(runner, "index_cache")
+            and self.dcp_world_size == 1
+            and _mooncake_producer_transfer_configured(runner.config)
+        ):
             # Mooncake's producer workers can receive requests from a DCP
             # consumer whose index cache is sharded below one MFMA tile. Keep a
             # small per-send-thread pool that repacks one index layer at a time;
