@@ -36,10 +36,7 @@ def test_normalize_leaves_valid_data_unchanged():
 
 
 def test_parse_data_rejects_javascript_nonstandard_constants():
-    text = (
-        b'window.BENCHMARK_DATA = {"entries":{"Benchmark":['
-        b'{"value":NaN}]}}'
-    )
+    text = b'window.BENCHMARK_DATA = {"entries":{"Benchmark":[' b'{"value":NaN}]}}'
 
     with pytest.raises(ValueError, match="non-standard JSON constant"):
         parse_data(text)
