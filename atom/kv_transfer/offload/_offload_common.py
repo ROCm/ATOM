@@ -183,12 +183,14 @@ class OffloadWorkerMixin:
 
     @staticmethod
     def _profile_enabled() -> bool:
-        return os.environ.get("OFFLOAD_PROFILE", "0").lower() not in {
-            "0",
-            "false",
-            "no",
-            "off",
-        }
+        # Same env-flag semantics as `atom_lmcache_staging._env_flag` (kept
+        # inline rather than imported: that module pulls in torch and this one
+        # is torch-free). Strip, and read the empty string as OFF -- `VAR=` is
+        # how a shell clears a flag inline, and a bare membership test would
+        # read "" as ON (not in the false set), the opposite of what the
+        # operator wrote; `VAR="off "` had the same trap.
+        raw = os.environ.get("OFFLOAD_PROFILE", "0").strip().lower()
+        return bool(raw) and raw not in {"0", "false", "no", "off"}
 
     def _last_gpu_connector_transfer_stats(self) -> dict[str, int | float]:
         gpu_connector = getattr(getattr(self, "_engine", None), "gpu_connector", None)
