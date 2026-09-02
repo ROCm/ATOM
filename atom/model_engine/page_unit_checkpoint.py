@@ -146,6 +146,18 @@ class PageUnitCheckpointStore:
         # space and `_next_victim` may spend it. The pin is taken later, in
         # `take_offload_stores`, and only for the few actually in flight.
         self._offload_ready: deque[int] = deque()
+        # Ceiling on that backlog. Under sustained tier backpressure the drain
+        # loop in `take_offload_stores` exits at its first iteration -- pins
+        # already at `max_inflight` -- and so never reaches the stale-drop that
+        # otherwise clears spent nominations. An unbounded nomination stream
+        # would then grow `_offload_ready` without limit with ids whose
+        # checkpoints have long since been evicted. A nomination is unpinned and
+        # the pool may spend its checkpoint anyway, so dropping the oldest
+        # (coldest) on overflow costs a missed offload, never a lost image: the
+        # checkpoint stays HBM-resident until it is evicted. Sized well above
+        # any real in-flight-plus-waiting count so it only bites a runaway.
+        self._offload_backlog_cap = 8192
+        self.offload_nominations_dropped = 0
         # StateStoreOperationId -> (checkpoint_id, monotonic when pinned).
         # A store's report carries no request -- by the time one lands its owner
         # is long gone -- so the hash is the only thing left to name it by. The
@@ -392,6 +404,22 @@ class PageUnitCheckpointStore:
         if not self._offload_sink:
             return
         self._offload_ready.append(checkpoint_id)
+        # Bound the backlog (see `_offload_backlog_cap`). popleft-on-overflow
+        # rather than a `deque(maxlen=)`: `take_offload_stores` re-queues
+        # deferred nominations with `extendleft`, and a maxlen deque would evict
+        # from whichever end an append pushed against -- dropping the freshly
+        # re-queued oldest entries we take pains to preserve there.
+        if len(self._offload_ready) > self._offload_backlog_cap:
+            if self.offload_nominations_dropped == 0:
+                logger.warning(
+                    "state offload nomination backlog exceeded %d; dropping "
+                    "oldest nominations. The CPU tier is draining checkpoints "
+                    "slower than they reach READY -- offload is falling behind.",
+                    self._offload_backlog_cap,
+                )
+            while len(self._offload_ready) > self._offload_backlog_cap:
+                self._offload_ready.popleft()
+                self.offload_nominations_dropped += 1
 
     @property
     def store_backlog(self) -> deque:
@@ -919,9 +947,13 @@ class PagedStateCheckpointCoordinator:
         if callable(stats):
             fates.update((f"state_offload_{k}", v) for k, v in stats().items())
             # A gauge, not a counter: how many nominations are waiting for a
-            # slot under `OFFLOAD_MAX_PENDING_SAVES`. The queue is unbounded and
-            # drained oldest-first, so a value that climbs and stays high means
-            # checkpoints are reaching READY faster than the tier drains them
-            # and fresh nominations are queueing behind stale ones.
+            # slot under `OFFLOAD_MAX_PENDING_SAVES`. The queue is bounded by
+            # `_offload_backlog_cap` and drained oldest-first, so a value that
+            # climbs toward the cap means checkpoints are reaching READY faster
+            # than the tier drains them and fresh nominations are queueing behind
+            # stale ones; at the cap the oldest are dropped, counted next to it.
             fates["state_offload_store_backlog"] = len(self.store.store_backlog)
+            fates["state_offload_nominations_dropped"] = (
+                self.store.offload_nominations_dropped
+            )
         return fates

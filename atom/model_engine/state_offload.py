@@ -12,6 +12,7 @@ lifetime.
 """
 
 import logging
+from collections import OrderedDict
 from dataclasses import dataclass, replace
 
 logger = logging.getLogger("atom")
@@ -33,7 +34,24 @@ class StateOffloadIndex:
         # load the worker will not serve parks the request that took it.
         self.can_store = bool(can_store)
         self.can_load = bool(can_load)
+        # The optimistic membership index (see the class docstring). It only
+        # grows on `note_stored` and shrinks on `forget` (a failed load), so a
+        # long-lived server that stored many distinct prefixes would grow it
+        # without bound. Cap it: `hashes` stays a plain set -- membership stays
+        # O(1) and every caller/test keeps `in` / `len` / `== set()` /
+        # `discard` -- and `_hash_lru` records insertion order beside it purely
+        # so the oldest hash can be dropped on overflow. The two move in
+        # lockstep (every add and every forget touches both), so `_hash_lru`
+        # never diverges in length from `hashes`. Dropping the oldest hash is
+        # safe for the same reason the index is optimistic: a false "not stored"
+        # only costs one recompute, never wrong output.
         self.hashes: set[int] = set()
+        self._hash_lru: OrderedDict[int, None] = OrderedDict()
+        # ~1M hashes -> a few tens of MB. Well above any working set that a
+        # tier of realistic capacity actually holds, so it bounds a leak
+        # without evicting live entries in normal operation.
+        self._hash_cap = 1 << 20
+        self.hashes_evicted = 0
         # req_id -> hash, for loads offered and not yet settled. Keyed by
         # request because that is what comes back, on the same
         # `finished_loading`/`failed_loading` channel a KV load uses.
@@ -68,11 +86,21 @@ class StateOffloadIndex:
         hash advertised before its bytes exist parks the next request over that
         prefix against a `get` that must miss.
         """
-        self.hashes.add(int(h))
+        h = int(h)
+        self.hashes.add(h)
+        # Reinsert at the young end whether or not it was already present, so a
+        # re-stored prefix is treated as freshly used, then trim the cold end.
+        self._hash_lru.pop(h, None)
+        self._hash_lru[h] = None
+        while len(self._hash_lru) > self._hash_cap:
+            old, _ = self._hash_lru.popitem(last=False)
+            self.hashes.discard(old)
+            self.hashes_evicted += 1
 
     def forget(self, h: int) -> None:
         """Drop a hash whose load failed, so the next request does not retry."""
         self.hashes.discard(h)
+        self._hash_lru.pop(h, None)
 
     # -------------------------------- loads -------------------------------- #
     def request_load(self, req_id, h: int) -> bool:
@@ -156,6 +184,11 @@ class StateOffloadIndex:
             "loads_completed": self.loads_completed,
             "loads_failed": self.loads_failed,
             "indexed": len(self.hashes),
+            # Non-zero means the index hit its `_hash_cap` and is dropping the
+            # coldest hashes. Harmless (a dropped hash just misses one reuse),
+            # but a climbing value means the cap is smaller than the live prefix
+            # working set and reuse is being left on the table.
+            "hashes_evicted": self.hashes_evicted,
         }
 
 
