@@ -35,6 +35,8 @@ from atom.model_ops.v4_kernels.paged_decode import (
     sparse_attn_v4_paged_decode_reference,
 )
 from atom.model_ops.v4_kernels.paged_decode_indices import (
+    build_v4_paged_decode_indptr,
+    build_v4_paged_decode_indptr_reference,
     hca_compress_paged_offsets,
     write_v4_paged_decode_indices,
     write_v4_paged_decode_indices_reference,
@@ -64,6 +66,8 @@ __all__ = [
     "FP4_MQA_PARALLEL_UNIT_NUM",
     "CompressPlan",
     "QKNormRopeOut",
+    "build_v4_paged_decode_indptr",
+    "build_v4_paged_decode_indptr_reference",
     "csa_translate_pack",
     "csa_translate_pack_reference",
     "fp4_indexer_enabled",

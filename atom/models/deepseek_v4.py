@@ -1967,7 +1967,7 @@ class Indexer(nn.Module):
             kv_cache_4d,
             weights,
             logits,
-            attn_md.n_committed_per_token[:total_tokens],
+            attn_md.csa_n_committed_per_token[:total_tokens],
             attn_md.block_tables_per_token[:total_tokens],
             self._max_model_len_idx,
             KVBlockSize=self.kv_cache.size(1),  # csa_rows_per_block = 64
@@ -1982,7 +1982,7 @@ class Indexer(nn.Module):
         top_k_per_row_decode(
             logits,
             1,
-            attn_md.n_committed_per_token[:total_tokens],
+            attn_md.csa_n_committed_per_token[:total_tokens],
             topk_local,
             total_tokens,
             logits.stride(0),
@@ -2199,7 +2199,7 @@ class Indexer(nn.Module):
             self.kv_scale,
             attn_md.block_tables_per_token[:total_tokens],
             weights,
-            attn_md.n_committed_per_token[:total_tokens],
+            attn_md.csa_n_committed_per_token[:total_tokens],
             max_seq_len,
             weight_scale=self._weights_scale,
             next_n=1,
@@ -2220,7 +2220,7 @@ class Indexer(nn.Module):
         top_k_per_row_decode(
             logits,
             1,
-            attn_md.n_committed_per_token[:total_tokens],
+            attn_md.csa_n_committed_per_token[:total_tokens],
             topk_local,
             total_tokens,
             logits.stride(0),
@@ -2413,7 +2413,7 @@ class Indexer(nn.Module):
             kv_cache_4d,
             w_rect[:R],
             logits,
-            attn_md.n_committed_per_token[:R],
+            attn_md.csa_n_committed_per_token[:R],
             attn_md.block_tables_per_token[:R],
             self._max_model_len_idx,
             KVBlockSize=self.kv_cache.size(1),
@@ -2428,7 +2428,7 @@ class Indexer(nn.Module):
         top_k_per_row_decode(
             logits,
             1,
-            attn_md.n_committed_per_token[:R],
+            attn_md.csa_n_committed_per_token[:R],
             topk_rect[:R],
             R,
             logits.stride(0),
@@ -3271,12 +3271,12 @@ class DeepseekV4Attention(nn.Module):
         fc = get_forward_context()
         # Row count off the Q, NOT off `positions`. The Q descends from the
         # hidden state through `wqkv_a`/`wq_b`, so it carries the same token
-        # count the residual stream does. `positions` does not have to: under
-        # `--enable-dp-attention`, a step where any rank is prefilling takes the
-        # variable-length path (`model_runner.py`, `dp_uniform_decode`) and the
-        # two can differ. Sizing the attention output by `positions` then hands
-        # the mHC residual a mismatched `m` -- an aiter shape assert deep inside
-        # a compiled piece, far from here.
+        # count the residual stream does. `positions` does not have to: a step
+        # where any DP rank is prefilling takes the variable-length path (see
+        # `running_tokens_are_unified` in `forward_context.py`) and the two can
+        # differ. Sizing the attention output by `positions` then hands the mHC
+        # residual a mismatched `m` -- an aiter shape assert deep inside a
+        # compiled piece, far from here.
         q_rows = qkn.q_sa if qkn.q_sa is not None else qkn.q_packed
         assert q_rows is not None, (
             "_sparse_attention got no Q: `_qk_norm_rope` did not run upstream. "
@@ -3521,10 +3521,10 @@ class DeepseekV4Attention(nn.Module):
 
         Fully fused into one triton kernel — no [T, index_topk] intermediates,
         no PyTorch fancy index. CG sentinel (batch_id=-1) and OOB clamp are
-        handled in-kernel. The kernel derives per-token `valid_k` inline from
-        `(positions[t]+1)//ratio` clamped by `n_committed_csa[bid]` and
-        `index_topk`, matching Indexer's per-row visibility — so every
-        reserved CSA cell gets written and no `-1` sentinel pre-fill is needed.
+        handled in-kernel. The kernel takes each token's `valid_k` from its own
+        `kv_indptr_csa` delta, which the builders sized as
+        `min(visible_csa(pos), index_topk)` — Indexer's per-row visibility — so
+        every reserved CSA cell gets written and no `-1` pre-fill is needed.
 
         Args:
           topk_local_raw: [total_tokens, index_topk] int32 — RAW seq-local
@@ -3879,7 +3879,7 @@ class MoE(nn.Module):
 
         ids_2d = ids.unsqueeze(-1)
         dp_eager_mode = (
-            not ctx.context.dp_uniform_decode
+            not ctx.context.running_tokens_are_unified
         ) and ctx.dp_metadata is not None
         if dp_eager_mode:
             from atom.model_ops.moe import all_gatherv

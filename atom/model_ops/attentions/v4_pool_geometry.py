@@ -72,6 +72,50 @@ DENSE_RATIO = 0
 CSA_RATIO = 4
 HCA_RATIO = 128
 
+# A token sees the compressed groups closed at or before its OWN position. The
+# per-sequence `ctx // ratio` is the LAST token's count, and an MTP or DSpark
+# sequence hands `1 + k` tokens to one forward, so the earlier ones would read
+# groups holding their own future drafts. It is not a second cap either: it
+# cannot bind while `pos < ctx`, which `require_step_within_full_q` keeps true
+# at ATOM's producers of per-seq step lengths. The plugin bridges inherit the
+# same premise from the host engine's `positions` and do not check it.
+#
+# Every host-side count comes from these two. The Triton kernels take the ratio
+# as a `constexpr` and divide inline; keep the spellings identical.
+
+
+def visible_csa(pos):
+    """CSA groups visible to the token at `pos` — int, numpy array or tensor."""
+    return (pos + 1) // CSA_RATIO
+
+
+def visible_hca(pos):
+    """HCA groups visible to the token at `pos` — int, numpy array or tensor."""
+    return (pos + 1) // HCA_RATIO
+
+
+def require_step_within_full_q(longest: int, full_q: int, source: str) -> None:
+    """A sequence may not forward more tokens in one step than `full_q`.
+
+    This is what `pos < ctx` reduces to, so ATOM's three producers of per-seq
+    forward lengths check it rather than assume it. Two things break together
+    when it fails. `positions` are anchored at `ctx - full_q`, so a longer step
+    puts its last token at or past `ctx` -- the one case where the per-sequence
+    bound the rule above drops would have bound something. And the DSpark
+    rectangle's `lead = full_q - len` goes negative, so
+    `_v4_decode_indptr_kernel` maps a whole band and reads tokens past the
+    sequence's span, stamping one sequence's visibility onto another's rows.
+
+    `ValueError`, not `assert`: the second failure is a device-side
+    out-of-bounds read, and `python -O` strips asserts.
+    """
+    if longest > full_q:
+        raise ValueError(
+            f"{source} forwards {longest} tokens for some sequence but full_q "
+            f"is {full_q}, which would place a token past its own context"
+        )
+
+
 # Not a compress ratio: a layer whose KV this row space does not hold at all.
 # A DSpark draft layer wants its window at a width the planes do not offer —
 # unquantized where the pool is packed — so the window becomes a state field

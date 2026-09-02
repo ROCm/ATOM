@@ -25,17 +25,19 @@ import torch
 import triton
 import triton.language as tl
 
+from atom.model_ops.attentions.v4_pool_geometry import HCA_RATIO
+
 
 @triton.jit
 def _v4_decode_hca_compress_tail_kernel(
     batch_id_per_token_ptr,  # [>=T] int — sentinel -1 in CG pad tail
     positions_ptr,  # [>=T] int — global token position
     hca_indptr_ptr,  # [>=T+1] int32 — ragged (SWA prefix + HCA committed)
-    n_committed_hca_per_seq_ptr,  # [num_reqs] int32 — per-seq HCA entry count
     block_tables_ptr,  # [num_reqs, MAX_BLOCKS] int — per-seq paged block ids
     bt_stride_bs,  # block_tables row stride (elements)
     hca_indices_ptr,  # [>=hca_indptr[T]] int32 OUT — HCA compress section (head)
     envelope_rows,  # rows occupied by one physical proxy block
+    HCA_R: tl.constexpr,  # HCA compress ratio — one group per this many tokens
     win: tl.constexpr,  # SWA window — per-token prefix length cap
     BLOCK_J: tl.constexpr,  # next_pow2(win) — HCA loop chunk size
 ):
@@ -58,7 +60,9 @@ def _v4_decode_hca_compress_tail_kernel(
     bid = tl.load(batch_id_per_token_ptr + t)
     if bid < 0:
         return  # CG-padded sentinel — leave outputs untouched
-    n_hca = tl.load(n_committed_hca_per_seq_ptr + bid)
+    # Groups closed at or before this token's own position -- see the rule next
+    # to `CSA_RATIO` in `v4_pool_geometry`.
+    n_hca = (tl.load(positions_ptr + t) + 1) // HCA_R
     # HCA compress section occupies the slice HEAD (offset 0); the SWA window
     # prefix sits at the tail, written by `write_v4_paged_decode_indices`.
     base = tl.load(hca_indptr_ptr + t)
@@ -82,11 +86,11 @@ def _v4_decode_indices_fused_kernel(
     swa_indices_ptr,  # [swa_total] int32 OUT
     csa_indices_ptr,  # [csa_total] int32 OUT (SWA-prefix segment only)
     hca_indices_ptr,  # [hca_total] int32 OUT (SWA prefix tail + HCA head)
-    n_committed_hca_per_seq_ptr,  # [num_reqs] int32 — per-seq HCA entry count
     block_tables_ptr,  # [num_reqs, MAX_BLOCKS] int — per-seq paged block ids
     bt_stride_bs,  # block_tables row stride (elements)
     cs,  # win_with_spec — ring-index modulo / SWA-region stride
     swa_pages,  # num_slots * cs — boundary into compress region
+    HCA_R: tl.constexpr,  # HCA compress ratio — one group per this many tokens
     win: tl.constexpr,  # SWA window — max prefix slots
     BLOCK_N: tl.constexpr,  # next_pow2(win)
 ):
@@ -120,7 +124,8 @@ def _v4_decode_indices_fused_kernel(
     tl.store(hca_indices_ptr + hca_end - n + i, paged, mask=mask)
 
     # --- HCA compress section (slice HEAD of hca) ---
-    n_hca = tl.load(n_committed_hca_per_seq_ptr + bid)
+    # Groups closed at or before this token's own position, as above.
+    n_hca = (pos + 1) // HCA_R
     base = tl.load(hca_indptr_ptr + t)
     bt_row_base = bid * bt_stride_bs
     for j in tl.range(0, n_hca, BLOCK_N):
@@ -141,7 +146,6 @@ def write_v4_decode_indices_fused(
     swa_indices: torch.Tensor,
     csa_indices: torch.Tensor,
     hca_indices: torch.Tensor,
-    n_committed_hca_per_seq: torch.Tensor,
     block_tables: torch.Tensor,
     T: int,
     win: int,
@@ -167,7 +171,6 @@ def write_v4_decode_indices_fused(
     assert swa_indices.dim() == 1
     assert csa_indices.dim() == 1
     assert hca_indices.dim() == 1
-    assert n_committed_hca_per_seq.dim() == 1
     assert block_tables.dim() == 2
 
     BLOCK_N = triton.next_power_of_2(win)
@@ -181,11 +184,11 @@ def write_v4_decode_indices_fused(
         swa_indices,
         csa_indices,
         hca_indices,
-        n_committed_hca_per_seq,
         block_tables,
         block_tables.stride(0),
         cs,
         swa_pages,
+        HCA_R=HCA_RATIO,
         win=win,
         BLOCK_N=BLOCK_N,
     )
@@ -196,7 +199,6 @@ def write_v4_decode_hca_compress_tail(
     batch_id_per_token: torch.Tensor,
     positions: torch.Tensor,
     hca_indptr: torch.Tensor,
-    n_committed_hca_per_seq: torch.Tensor,
     block_tables: torch.Tensor,
     hca_indices: torch.Tensor,
     T: int,
@@ -221,12 +223,11 @@ def write_v4_decode_hca_compress_tail(
 
     Args:
       batch_id_per_token:      ``[>=T]``   int — token→seq map; -1 skipped.
-      positions:               ``[>=T]``   int — global token positions (unused
-                                           since the compress section moved to the
-                                           slice head; kept for call-site parity).
+      positions:               ``[>=T]``   int — global token positions; each
+                                           token's HCA count is
+                                           ``(positions[t]+1)//128``.
       hca_indptr:              ``[>=T+1]`` int32 — ragged HCA indptr (same one
                                            passed to ``write_v4_paged_decode_indices``).
-      n_committed_hca_per_seq: ``[num_reqs]`` int32 — per-seq HCA entry count.
       block_tables:            ``[num_reqs, mnbs]`` int — per-seq paged blocks.
       hca_indices:             ``[>=hca_indptr[T]]`` int32 OUT — compress section
                                            (slice head) written; SWA prefix
@@ -240,7 +241,6 @@ def write_v4_decode_hca_compress_tail(
     assert batch_id_per_token.dim() == 1 and batch_id_per_token.shape[0] >= T
     assert positions.dim() == 1 and positions.shape[0] >= T
     assert hca_indptr.dim() == 1 and hca_indptr.shape[0] >= T + 1
-    assert n_committed_hca_per_seq.dim() == 1
     assert block_tables.dim() == 2
     assert hca_indices.dim() == 1
 
@@ -249,11 +249,11 @@ def write_v4_decode_hca_compress_tail(
         batch_id_per_token,
         positions,
         hca_indptr,
-        n_committed_hca_per_seq,
         block_tables,
         block_tables.stride(0),
         hca_indices,
         envelope_rows,
+        HCA_R=HCA_RATIO,
         win=win,
         BLOCK_J=BLOCK_J,
     )
