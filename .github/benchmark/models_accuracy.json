@@ -144,7 +144,7 @@
     "runner": "linux-atom-do-mi350x-8",
     "test_level": "pr",
     "accuracy_threshold": 0.87,
-    "accuracy_baseline": 0.9,
+    "accuracy_baseline": 0.90,
     "accuracy_baseline_model": "openai/gpt-oss-120b",
     "_baseline_note": "No public GSM8K baseline available"
   },
@@ -156,7 +156,7 @@
     "runner": "linux-atom-do-mi350x-8",
     "test_level": "main",
     "accuracy_threshold": 0.88,
-    "accuracy_baseline": 0.9,
+    "accuracy_baseline": 0.90,
     "accuracy_baseline_model": "meta-llama/Llama-3.3-70B-Instruct",
     "_baseline_note": "HF page inaccessible; needs CI measurement of baseline"
   },
@@ -218,7 +218,7 @@
     "runner": "linux-atom-do-mi350x-8",
     "test_level": "main",
     "accuracy_threshold": 0.87,
-    "accuracy_baseline": 0.9,
+    "accuracy_baseline": 0.90,
     "accuracy_baseline_model": "openai/gpt-oss-120b",
     "_baseline_note": "No public GSM8K baseline available"
   },
@@ -479,10 +479,10 @@
     "env_vars": "",
     "runner": "linux-atom-do-mi350x-8",
     "test_level": "pr",
-    "accuracy_threshold": 0.96,
-    "accuracy_baseline": 0.9659,
+    "accuracy_threshold": 0.94,
+    "accuracy_baseline": 0.9613,
     "accuracy_baseline_model": "zai-org/GLM-5.3-Flash",
-    "_baseline_note": "Guards the POOLED (kpool) indexer path. 16-shot prompts run 2763-3591 tokens, so every one of the 1319 questions exceeds index_topk=2048 and pooled scoring plus pooled top-k decide what the model attends to. The GLM-5.3-Flash entry above does NOT cover this: at or below index_topk the indexer selects every token, attention_mla runs dense, and the pooled selection is computed but never used -- a short-context score only shows the pooled writes did no harm. Measured 2026-08-28: flexible-extract=0.9659, strict-match=0.9666, matching the 0.9682/0.9689 of the dense 3-shot entry within run-to-run spread (two runs of identical code disagree on ~28 of 1319 questions in each direction). Needs --max-model-len 8192, not 4096: lm_eval samples its shots at random, the longest prompt is 3591 tokens, and 3591 + max_gen_toks 512 overflows a 4096 cap -- 4 requests then 400 and lm_eval aborts the whole eval after its retries. The short-context GLM-5.3-Flash entry (max-model-len 2048, 3-shot) was removed in favour of this one: below index_topk the indexer selects every token and attention_mla runs dense, so that entry exercised a strict subset of this path while costing a second 8-GPU nightly. THRESHOLD 0.96 IS TIGHT AGAINST THIS BASELINE: repeat runs of identical code have landed at 0.9613/0.9629/0.9644/0.9659, so the worst observed run clears 0.96 by 0.0013 and this entry can be expected to flake. 0.94 was the previous value and left ~2.5pp of headroom."
+    "_baseline_note": "Guards the POOLED (kpool) indexer path. 16-shot prompts run 2763-3591 tokens, so every one of the 1319 questions exceeds index_topk=2048 and pooled scoring plus pooled top-k decide what the model attends to. The GLM-5.3-Flash entry above does NOT cover this: at or below index_topk the indexer selects every token, attention_mla runs dense, and the pooled selection is computed but never used -- a short-context score only shows the pooled writes did no harm. Measured 2026-08-28: flexible-extract=0.9659, strict-match=0.9666, matching the 0.9682/0.9689 of the dense 3-shot entry within run-to-run spread (two runs of identical code disagree on ~28 of 1319 questions in each direction). Needs --max-model-len 8192, not 4096: lm_eval samples its shots at random, the longest prompt is 3591 tokens, and 3591 + max_gen_toks 512 overflows a 4096 cap -- 4 requests then 400 and lm_eval aborts the whole eval after its retries. The short-context GLM-5.3-Flash entry (max-model-len 2048, 3-shot) was removed in favour of this one: below index_topk the indexer selects every token and attention_mla runs dense, so that entry exercised a strict subset of this path while costing a second 8-GPU nightly. Threshold stays at 0.94. This entry is test_level pr, so every unrelated PR runs it on 8 GPUs; repeat runs of IDENTICAL code have landed at 0.9613/0.9629/0.9644/0.9659, so a 0.96 threshold is cleared by 0.0013 in the worst case and would fail roughly one PR in four on unchanged code -- a gate that flaky trains people to re-run until green and stops carrying information. Baseline is the 0.9613 measured on this tree; the 0.9659 it replaced came from an earlier branch and is optimistic here."
   },
   {
     "model_name": "GLM-5.3-FP8",

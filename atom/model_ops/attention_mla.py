@@ -903,6 +903,18 @@ class MLAAttention(nn.Module):
         cached-single-pass, chunked context/suffix) and fixing only the one that
         a short-prompt smoke test happens to reach leaves the others to fail
         later, under chunked prefill, as a head-dim error.
+
+        The slice is deliberately NOT made contiguous. It leaves
+        ``stride(-2) == qk_nope_head_dim + pad`` against ``size(-1) ==
+        qk_nope_head_dim``, and all five flash-attention sites take it as is.
+        Measured on gfx950 rather than assumed: against a ``.contiguous()``
+        copy of the same slice the output is bit-identical (max abs diff 0.0),
+        so the kernel takes its row pitch from the stride and not from
+        ``size(-1)``, and the call is ~1.5% slower at 4096 tokens -- far
+        cheaper than materializing K per chunk per layer.
+
+        Also idempotent, which is what makes the two sites that rebind
+        ``prefill_q`` inside a loop correct.
         """
         if not self.rope_is_zero_pad:
             return tensors if len(tensors) > 1 else tensors[0]

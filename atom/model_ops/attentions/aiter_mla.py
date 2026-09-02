@@ -1220,7 +1220,14 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # full-attention layers, so the KV rows are NOT one-per-layer.
             # `full_attention_layers` is set by the GDN state mixin for those
             # models; its absence means the dense one-row-per-layer layout.
-            hybrid_mla_layers = getattr(runner, "full_attention_layers", None)
+            # `or None`: the GDN state mixin derives this from
+            # `linear_attn_config["full_attn_layers"]` and leaves it EMPTY when the
+            # config omits that key, and an empty list is not None -- it would take
+            # the hybrid branch with zero MLA layers, so every index-cache region
+            # gets numbered on top of the KV regions instead of after them and a
+            # P/D transfer writes index bytes into KV rows. The length check below
+            # cannot catch it because both sides derive from the same empty list.
+            hybrid_mla_layers = getattr(runner, "full_attention_layers", None) or None
             num_global_draft_layers = sum(
                 layer_id >= num_hidden_layers for layer_id in global_index_layer_ids
             )

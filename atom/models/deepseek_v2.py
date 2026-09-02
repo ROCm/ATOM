@@ -346,7 +346,18 @@ def _moe_router_dtype(config: PretrainedConfig) -> torch.dtype | None:
     agree or the kernel reads the bias buffer at the wrong width, so this one
     dtype governs both.
     """
-    if getattr(config, "model_type", None) == "glm_moe_dsa":
+    # The MTP draft must match the target or speculation degrades: its config
+    # has `model_type` rewritten to "deepseek_mtp" by
+    # `SpeculativeConfig._MTP_TYPE_MAP` while keeping the GLM-only
+    # `index_share_for_mtp_iteration` marker, so a model_type test alone leaves
+    # the draft router in bf16 while the target runs fp32. The two then select
+    # different experts and the acceptance rate drops -- a throughput
+    # regression that leaves task accuracy intact and is correspondingly hard
+    # to attribute later. Same either/or the sibling predicates in this file
+    # use for exactly this reason.
+    if getattr(config, "model_type", None) == "glm_moe_dsa" or bool(
+        getattr(config, "index_share_for_mtp_iteration", False)
+    ):
         return torch.float32
     if getattr(config, "moe_router_dtype", None) == "float32":
         return torch.float32
@@ -1112,7 +1123,7 @@ class DeepseekV2MoE(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         reduce_results: bool = True,
         prefix: str = "",
-        alt_stream: Optional[torch.cuda.Stream] = None,
+        alt_stream: torch.cuda.Stream | None = None,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
