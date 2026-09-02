@@ -111,10 +111,10 @@ exports = {
     "SLURM_TIME_LIMIT": runner.get("time_limit", "03:00:00"),
     "SLURM_LOG_ROOT": runner.get(
         "log_root",
-        (
-            "/shared_nfs/ATOM_PLUGIN_CI/LOG/vLLM_LOG"
-            if os.environ["PLUGIN"] == "vllm"
-            else "/shared_nfs/ATOM_PLUGIN_CI/LOG/SGLang_LOG"
+        os.path.join(
+            os.environ.get("GITHUB_WORKSPACE") or os.getcwd(),
+            "plugin-ci-logs",
+            "vLLM_LOG" if os.environ["PLUGIN"] == "vllm" else "SGLang_LOG",
         ),
     ),
     "NODE_LIST": node_list,
@@ -171,7 +171,7 @@ export SLURM_JOB_NAME="${PLUGIN_CI_CELL_ID}-${GITHUB_RUN_ID:-local}-${GITHUB_RUN
 export SLURM_OUTPUT="${LOG_ROOT}/slurm-%j.out"
 export SLURM_ERROR="${LOG_ROOT}/slurm-%j.err"
 export SLURM_CANCEL_HELPER="${RESULT_DIR}/${PLUGIN_CI_CELL_ID}.slurm-cancel.sh"
-SUBMIT_LOCK_FILE="${SLURM_SUBMIT_LOCK_FILE:-/shared_nfs/ATOM_PLUGIN_CI/LOG/.sbatch-submit.lock}"
+SUBMIT_LOCK_FILE="${SLURM_SUBMIT_LOCK_FILE:-${GITHUB_WORKSPACE:-$(pwd)}/plugin-ci-logs/.sbatch-submit.lock}"
 SLURM_LOG_POLL_INTERVAL="${SLURM_LOG_POLL_INTERVAL:-30}"
 
 echo "=== plugin CI cell ==="

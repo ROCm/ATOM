@@ -52,10 +52,10 @@ def main():
             "slurm_partition": os.environ.get("PLUGIN_CI_SLURM_PARTITION", "amd-spur"),
             "log_root": os.environ.get(
                 "PLUGIN_CI_LOG_ROOT",
-                (
-                    "/shared_nfs/ATOM_PLUGIN_CI/LOG/vLLM_LOG"
-                    if args.plugin == "vllm"
-                    else "/shared_nfs/ATOM_PLUGIN_CI/LOG/SGLang_LOG"
+                os.path.join(
+                    os.environ.get("GITHUB_WORKSPACE") or os.getcwd(),
+                    "plugin-ci-logs",
+                    "vLLM_LOG" if args.plugin == "vllm" else "SGLang_LOG",
                 ),
             ),
             "gpus_per_node": int(os.environ.get("PLUGIN_CI_GPUS_PER_NODE", "8")),

@@ -31,7 +31,6 @@ env:
   NIGHTLY_PLUGIN_IMAGE_TAG: rocm/atom-dev:vllm-latest
   PLUGIN_CI_SLURM_ACCOUNT: amd-aifw-dev
   PLUGIN_CI_SLURM_PARTITION: amd-spur
-  PLUGIN_CI_LOG_ROOT: /shared_nfs/ATOM_PLUGIN_CI/LOG/vLLM_LOG
 
 jobs:
   ci-gate:
@@ -181,6 +180,7 @@ jobs:
       CONTAINER_NAME: plugin_ci_vllm_${{ github.run_id }}_${{ strategy.job-index }}
       PLUGIN_CI_SLURM_NODES: crsuse2-m2m-v2-002,crsuse2-m2m-v2-027,crsuse2-m2m-v2-030,crsuse2-m2m-v2-031,crsuse2-m2m-v2-032,crsuse2-m2m-v2-044,crsuse2-m2m-v2-050
       RESULT_DIR: plugin-ci-results
+      PLUGIN_CI_LOG_ROOT: ${{ github.workspace }}/plugin-ci-logs/vLLM_LOG
     steps:
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
