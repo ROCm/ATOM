@@ -322,6 +322,38 @@ def _is_neox_rope_style(
     return not bool(interleave)
 
 
+def _moe_router_dtype(config: PretrainedConfig) -> torch.dtype | None:
+    """Dtype the MoE router must run in, or None to keep the model dtype.
+
+    None preserves the historical behaviour and is what every model that does
+    not ask for something else gets.
+
+    GLM's `noaux_tc` correction bias is ~256 values packed into [6.02, 8.11]
+    with a median spacing of 6e-6 between neighbours. bf16 carries 8 mantissa
+    bits, so its ULP up there is 1/64 -- four orders of magnitude coarser than
+    the spacing. Storing that tensor at the model dtype collapses 238 distinct
+    values onto 8 and discards almost all of the selection signal it exists to
+    carry. Every `glm_moe_dsa` checkpoint on disk ships it as fp32, and vLLM
+    forces fp32 routing for this model_type unconditionally -- including
+    GLM-5/5.1/5.2, whose configs predate `moe_router_dtype` and therefore
+    cannot ask for it. Match that, keyed on the same signal, so a model does
+    not silently depend on whether its config generation happened to carry
+    the key.
+
+    The gate output dtype is not separately useful -- rounding the logits to
+    bf16 barely moves the top-k -- but it is not independent either: aiter's
+    `biased_grouped_topk` dispatches on `gating_output.dtype()` and then
+    reinterpret_casts `correction_bias` to that same `scalar_t`. The two must
+    agree or the kernel reads the bias buffer at the wrong width, so this one
+    dtype governs both.
+    """
+    if getattr(config, "model_type", None) == "glm_moe_dsa":
+        return torch.float32
+    if getattr(config, "moe_router_dtype", None) == "float32":
+        return torch.float32
+    return None
+
+
 def _can_fuse_indexer_wk_weights_proj(
     config: PretrainedConfig,
     quant_config: Optional[QuantizationConfig],
@@ -1095,6 +1127,10 @@ class DeepseekV2MoE(nn.Module):
                 "Only silu is supported for now."
             )
 
+        # None here means "model dtype", i.e. `torch.empty` and `gate()` behave
+        # exactly as they did before this was introduced.
+        self.router_dtype = _moe_router_dtype(config)
+
         self.gate = ReplicatedLinear(
             config.hidden_size,
             config.n_routed_experts,
@@ -1104,8 +1140,13 @@ class DeepseekV2MoE(nn.Module):
             prefix=f"{prefix}.gate",
         )
         if config.topk_method == "noaux_tc":
+            # The dtype has to be right HERE, at parameter creation: the loader
+            # casts the checkpoint tensor into whatever this holds, so an fp32
+            # bias landing in a bf16 parameter is rounded once, on load, and
+            # every later `.to(torch.float32)` in the MoE backends widens a
+            # number whose low bits are already gone.
             self.gate.e_score_correction_bias = atom_parameter(
-                torch.empty(config.n_routed_experts)
+                torch.empty(config.n_routed_experts, dtype=self.router_dtype)
             )
         else:
             self.gate.e_score_correction_bias = None
@@ -1168,7 +1209,12 @@ class DeepseekV2MoE(nn.Module):
             compilation_config.static_forward_context[prefix] = self
 
     def routed_expert_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        router_logits = self.gate(hidden_states)
+        # `otype` must match the correction bias -- see `_moe_router_dtype`.
+        router_logits = (
+            self.gate(hidden_states)
+            if self.router_dtype is None
+            else self.gate(hidden_states, otype=self.router_dtype)
+        )
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
