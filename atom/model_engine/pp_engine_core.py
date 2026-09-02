@@ -6,6 +6,7 @@
 
 import logging
 import queue
+import time
 from collections import deque
 
 from atom.distributed.pp_transport import PPStageTransport
@@ -66,6 +67,7 @@ class PPEngineCoreProc(EngineCore):
         try:
             while True:
                 self.utility_handler.process_queue(self.utility_queue, self)
+                self.scheduler.heartbeat_throughput(time.monotonic())
                 shutdown = shutdown or self.pull_and_process_input_queue()
                 if shutdown:
                     break

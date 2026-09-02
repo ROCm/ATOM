@@ -75,11 +75,10 @@ def _run(seqs):
     bid = np.repeat(np.arange(len(seqs), dtype=np.int32), lens)
     pos = np.concatenate([np.arange(s, s + n) for s, n in zip(starts, lens)])
     cs_pt = np.asarray(starts, dtype=np.int64)[bid]
-    n_hca_seq = np.asarray([max(s // HCA_RATIO, 0) for s in starts], dtype=np.int32)
 
     extend_count = np.minimum(pos - cs_pt + 1, WIN)
     prefix_swa_count = np.maximum(cs_pt - np.maximum(pos - WIN + 1, 0), 0)
-    n_hca = np.minimum((pos + 1) // HCA_RATIO, n_hca_seq[bid])
+    n_hca = (pos + 1) // HCA_RATIO
     csa_head = np.asarray([_csa_head(p) for p in pos])
 
     total = len(pos)
@@ -109,7 +108,6 @@ def _run(seqs):
         chunk_start_per_seq=torch.tensor(starts, dtype=torch.int32, device=DEV),
         cu_seqlens_q_per_seq=torch.tensor(cu, dtype=torch.int32, device=DEV),
         state_slot_per_seq=torch.tensor(slots, dtype=torch.int32, device=DEV),
-        n_committed_hca_per_seq=torch.tensor(n_hca_seq, dtype=torch.int32, device=DEV),
         block_tables=torch.tensor(bts, dtype=torch.int32, device=DEV),
         T=total,
         win=WIN,

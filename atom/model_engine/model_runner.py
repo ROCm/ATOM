@@ -19,6 +19,7 @@ import tqdm
 from aiter import destroy_dist_env, init_dist_env
 from aiter.dist.parallel_state import (
     get_dp_group,
+    get_pcp_group,
     get_pp_group,
     get_tp_group,
     graph_capture,
@@ -29,6 +30,7 @@ from torch.profiler import record_function
 from atom.config import Config, CUDAGraphMode, set_current_atom_config
 from atom.distributed.pcp_utils import (
     PcpBalGroup,
+    get_pcp_world_size,
     pcp_allgather_rerange,
     pcp_pad_len,
     pcp_round_robin_split,
@@ -3128,6 +3130,18 @@ class ModelRunner:
                 target_logits,
                 bonus_token_ids,
             )
+            # PCP ranks decode redundantly and are consistent only while their
+            # kernels agree bit-for-bit -- they don't (hidden differs by ~1 bf16
+            # ULP, flipping ~24% of the near-tie verify argmaxes). Accept counts
+            # then differ per rank and the emitted streams fork. Sync the
+            # decision instead: the ids and how many.
+            if get_pcp_world_size() > 1 and hasattr(self, "drafter"):
+                _g = get_pcp_group()
+                sampled_tokens = _g.broadcast(sampled_tokens.contiguous(), src=0)
+                if torch.is_tensor(num_bonus_tokens):
+                    num_bonus_tokens = _g.broadcast(
+                        num_bonus_tokens.contiguous(), src=0
+                    )
             num_reject_tokens = self.drafter.mtp_k - num_bonus_tokens
             next_token_locs = num_bonus_tokens
 
@@ -3450,6 +3464,11 @@ class ModelRunner:
             next_token_ids=next_token_ids,
             last_token_indices=last_token_indices,
         )
+        # PCP runs the drafter on every rank and the ids come out different.
+        # Align them before verification consumes them, so all ranks accept the
+        # same count.
+        if draft_token is not None and get_pcp_world_size() > 1:
+            draft_token = get_pcp_group().broadcast(draft_token.contiguous(), src=0)
         if align_only:
             return None
         # DSpark Phase 2: stash this step's scheduler-chosen ell keyed by req_id,

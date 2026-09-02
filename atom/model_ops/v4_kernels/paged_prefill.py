@@ -14,7 +14,8 @@ Caller contract:
     decode kernel: one row space holding a request's sliding windows and the
     compressed blocks alike (see `v4_pool_geometry`). For prefill, prefix
     indices select
-    (a) prior-chunk SWA history, (b) CSA topk, (c) HCA all-committed.
+    (a) prior-chunk SWA history, (b) CSA topk, (c) the HCA groups closed at or
+    before the token's own position.
   kv_indices_prefix: [total_prefix_indices] int32 — flat per-token slot
     lists. Per-token entries live in
     `kv_indices_prefix[kv_indptr_prefix[t] : kv_indptr_prefix[t+1]]`.

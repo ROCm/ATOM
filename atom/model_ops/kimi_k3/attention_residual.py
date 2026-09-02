@@ -13,9 +13,9 @@
 ``apply_attn_res`` (the entry point every AttnRes site calls) dispatches to
 aiter's ``attn_res_gate``. The Triton kernel in this module is the same math with
 the same launch-config-by-token-count dispatch and the same
-``add_hidden``/``add_hidden2``/``out_eps``/``close_block`` surface; it is kept as
-the A/B baseline behind the ``kimi_k3_apply_attn_res*`` custom ops, and does not
-implement the fused output quant that the aiter kernel now offers.
+``add_hidden``/``add_hidden2``/``out_eps``/``close_block``/``quant_dtype``
+surface, including the same fused per-token FP8 output quant; it is kept as the
+A/B baseline behind the ``kimi_k3_apply_attn_res*`` custom ops.
 
 The algorithm is flash-linear-attention's ``fused_attnres``
 (``fla/ops/attnres/fused.py``, MIT; read against fla 0.5.2), which is what the
@@ -63,6 +63,7 @@ if _HAS_TRITON:
         ps_ptr,
         sw_ptr,
         y_ptr,
+        ys_ptr,
         hs_ptr,
         hs2_ptr,
         pref_ptr,
@@ -73,6 +74,8 @@ if _HAS_TRITON:
         H,
         eps,
         out_eps,
+        fp8_max,
+        inv_fp8_max,
         stride_br_t,
         stride_br_b,
         stride_ps_t,
@@ -88,6 +91,7 @@ if _HAS_TRITON:
         DO_ADD2: tl.constexpr,  # fold a second addend (shared-expert output)
         WRITE_PREF: tl.constexpr,  # write the (summed) prefix back to pref_ptr
         OUT_NORM: tl.constexpr,  # fold the caller's output rmsnorm into the store
+        QUANT: tl.constexpr,  # fold the consumer's per-token quant into the store
         WRITE_BLOCK_CAT: tl.constexpr,  # also emit cat([block_residual, ps], 1)
     ):
         # One program per row t: rmsnorm each of the Bp = B+1 candidates, score =
@@ -210,6 +214,22 @@ if _HAS_TRITON:
             # Free: b_o is already fully formed in registers.
             rs = tl.rsqrt(tl.sum(tl.where(m_d, b_o * b_o, 0.0), axis=0) / H + out_eps)
             b_o = b_o * rs * tl.load(ow_ptr + o_d, mask=m_d, other=0.0).to(tl.float32)
+        if QUANT:
+            # Also free, and for the same reason OUT_NORM is: the row is already
+            # in registers, so the per-token amax is a register reduction and the
+            # store just narrows. Folding it here is what lets the consuming GEMM
+            # skip a standalone quant of this same [T, H] -- the fusion the
+            # RMSNorm module does on the paths where it, rather than this kernel,
+            # applies out_norm.
+            amax = tl.max(tl.where(m_d, tl.abs(b_o), 0.0), axis=0)
+            # amax * (1/fp8_max), not amax / fp8_max -- triton's ROCm fdiv is
+            # 1 ulp off IEEE and would put this row's scale on a different code
+            # than aiter's per-token quant, which the non-fused path uses for the
+            # same activation. See the same note in kimi_k3/quant.py.
+            scale = amax * inv_fp8_max
+            inv = tl.where(scale > 0.0, 1.0 / scale, 0.0)
+            b_o = tl.minimum(tl.maximum(b_o * inv, -fp8_max), fp8_max)
+            tl.store(ys_ptr + t, scale)
         tl.store(y_ptr + t * stride_yt + o_d, b_o.to(y_ptr.dtype.element_ty), mask=m_d)
 
 
@@ -242,8 +262,9 @@ def _apply_attn_res_impl(
     out_norm_weight: torch.Tensor | None = None,  # [H], folded: y = rmsnorm(y)
     out_eps: float = 1e-6,
     add_hidden2: torch.Tensor | None = None,  # [T, H], folded the same way
+    quant_dtype: torch.dtype | None = None,  # folded: y = per-token quant(y)
     close_block: bool = False,  # also emit cat([block_residual, prefix_out], 1)
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor | None]:
     """Block-residual soft-attention mix: rmsnorm each of the B+1 candidates,
     score = <normed, score_weight>, softmax over B+1, weighted sum.
 
@@ -251,7 +272,9 @@ def _apply_attn_res_impl(
     ``score_weight`` must already fold the rmsnorm gain into the scoring
     projection (see ``_attn_res_score_weight`` on the model side).
 
-    Returns ``(mixed_output, prefix_out, block_out)``. When ``add_hidden`` (and
+    Returns ``(mixed_output, y_scale, prefix_out, block_out)``, always at that
+    arity, with ``None`` in the two optional slots when ``quant_dtype`` and
+    ``close_block`` were not asked for. When ``add_hidden`` (and
     optionally ``add_hidden2``) is given, the caller's
     ``prefix_sum = prefix_sum + ...`` elementwise add is folded into the kernel
     on-load and ``prefix_out`` is that sum; otherwise ``prefix_out`` is
@@ -270,6 +293,12 @@ def _apply_attn_res_impl(
     launch re-reading block_residual from HBM (see ``AttnRes.maybe_close_block``,
     which is what would otherwise run that ``torch.cat``). Otherwise ``block_out``
     is ``None``.
+
+    ``quant_dtype`` folds the CONSUMING GEMM's per-token activation quant in as
+    well, narrowing ``mixed_output`` to that dtype and returning its [T, 1] fp32
+    per-token scale as ``y_scale``. It requires ``out_norm_weight``: quantizing
+    an unnormed mix would hand the consumer an activation on the wrong scale
+    entirely.
     """
     T, B, H = block_residual.shape
     Bp = B + 1
@@ -278,10 +307,23 @@ def _apply_attn_res_impl(
     if do_add2 and not do_add:
         raise ValueError("add_hidden2 requires add_hidden")
     out_norm = out_norm_weight is not None
+    quant = quant_dtype is not None
+    if quant and not out_norm:
+        raise ValueError("quant_dtype requires out_norm_weight")
+    fp8_max = float(torch.finfo(quant_dtype).max) if quant else 1.0
     br = block_residual.contiguous()
     ps = prefix_sum.contiguous()
     sw = score_weight.contiguous()
-    y = torch.empty((T, H), device=block_residual.device, dtype=prefix_sum.dtype)
+    y = torch.empty(
+        (T, H),
+        device=block_residual.device,
+        dtype=quant_dtype if quant else prefix_sum.dtype,
+    )
+    # Always allocated (triton needs a tensor); size 1 and never dereferenced
+    # when QUANT is False.
+    y_scale = torch.empty(
+        (T, 1) if quant else (1,), device=block_residual.device, dtype=torch.float32
+    )
     ow = out_norm_weight.contiguous() if out_norm else sw
     # hs/hs2/pref/bo pointers are always passed (triton needs a tensor); when
     # not adding/closing they alias ps and are never dereferenced (DO_ADD /
@@ -304,6 +346,7 @@ def _apply_attn_res_impl(
         ps,
         sw,
         y,
+        y_scale,
         hs,
         hs2,
         pref,
@@ -314,6 +357,8 @@ def _apply_attn_res_impl(
         H,
         float(eps),
         float(out_eps),
+        fp8_max,
+        1.0 / fp8_max,
         br.stride(0),
         br.stride(1),
         ps.stride(0),
@@ -331,9 +376,11 @@ def _apply_attn_res_impl(
         DO_ADD2=do_add2,
         WRITE_PREF=do_add,
         OUT_NORM=out_norm,
+        QUANT=quant,
         WRITE_BLOCK_CAT=close_block,
     )
-    return y, (pref if do_add else prefix_sum), block_out
+    prefix_out = pref if do_add else prefix_sum
+    return y, (y_scale if quant else None), prefix_out, block_out
 
 
 def _apply_attn_res_op(
@@ -344,7 +391,7 @@ def _apply_attn_res_op(
     out_norm_weight: torch.Tensor | None = None,
     out_eps: float = 1e-6,
 ) -> torch.Tensor:
-    mixed_output, _, _ = _apply_attn_res_impl(
+    mixed_output, _, _, _ = _apply_attn_res_impl(
         prefix_sum,
         block_residual,
         score_weight,
@@ -384,7 +431,7 @@ def _apply_attn_res_add_op(
     out_eps: float = 1e-6,
     add_hidden2: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    mixed_output, prefix_out, _ = _apply_attn_res_impl(
+    mixed_output, _, prefix_out, _ = _apply_attn_res_impl(
         prefix_sum,
         block_residual,
         score_weight,
@@ -428,7 +475,7 @@ def _apply_attn_res_close_block_op(
     out_eps: float = 1e-6,
     add_hidden2: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    mixed_output, prefix_out, block_out = _apply_attn_res_impl(
+    mixed_output, _, prefix_out, block_out = _apply_attn_res_impl(
         prefix_sum,
         block_residual,
         score_weight,
@@ -467,6 +514,110 @@ direct_register_custom_op(
     op_func=_apply_attn_res_close_block_op,
     mutates_args=[],
     fake_impl=_apply_attn_res_close_block_op_fake,
+)
+
+
+# Quantizing variants. Separate ops rather than an optional `quant_dtype` on the
+# two above because the return arity differs (the scale), and a schema's return
+# type is fixed at registration.
+
+
+def _apply_attn_res_quant_op(
+    prefix_sum: torch.Tensor,
+    block_residual: torch.Tensor,
+    score_weight: torch.Tensor,
+    eps: float,
+    out_norm_weight: torch.Tensor,
+    out_eps: float,
+    quant_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    y, y_scale, _, _ = _apply_attn_res_impl(
+        prefix_sum,
+        block_residual,
+        score_weight,
+        eps,
+        out_norm_weight=out_norm_weight,
+        out_eps=out_eps,
+        quant_dtype=quant_dtype,
+    )
+    return y, y_scale
+
+
+def _apply_attn_res_quant_op_fake(
+    prefix_sum: torch.Tensor,
+    block_residual: torch.Tensor,
+    score_weight: torch.Tensor,
+    eps: float,
+    out_norm_weight: torch.Tensor,
+    out_eps: float,
+    quant_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return (
+        torch.empty_like(prefix_sum, dtype=quant_dtype),
+        torch.empty(
+            (prefix_sum.shape[0], 1), device=prefix_sum.device, dtype=torch.float32
+        ),
+    )
+
+
+direct_register_custom_op(
+    op_name="kimi_k3_apply_attn_res_quant",
+    op_func=_apply_attn_res_quant_op,
+    mutates_args=[],
+    fake_impl=_apply_attn_res_quant_op_fake,
+)
+
+
+def _apply_attn_res_add_quant_op(
+    prefix_sum: torch.Tensor,
+    block_residual: torch.Tensor,
+    score_weight: torch.Tensor,
+    eps: float,
+    add_hidden: torch.Tensor,
+    out_norm_weight: torch.Tensor,
+    out_eps: float,
+    quant_dtype: torch.dtype,
+    add_hidden2: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    y, y_scale, prefix_out, _ = _apply_attn_res_impl(
+        prefix_sum,
+        block_residual,
+        score_weight,
+        eps,
+        add_hidden,
+        out_norm_weight=out_norm_weight,
+        out_eps=out_eps,
+        add_hidden2=add_hidden2,
+        quant_dtype=quant_dtype,
+    )
+    return y, y_scale, prefix_out
+
+
+def _apply_attn_res_add_quant_op_fake(
+    prefix_sum: torch.Tensor,
+    block_residual: torch.Tensor,
+    score_weight: torch.Tensor,
+    eps: float,
+    add_hidden: torch.Tensor,
+    out_norm_weight: torch.Tensor,
+    out_eps: float,
+    quant_dtype: torch.dtype,
+    add_hidden2: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return (
+        torch.empty_like(prefix_sum, dtype=quant_dtype),
+        torch.empty(
+            (prefix_sum.shape[0], 1), device=prefix_sum.device, dtype=torch.float32
+        ),
+        torch.empty_like(prefix_sum),
+    )
+
+
+direct_register_custom_op(
+    op_name="kimi_k3_apply_attn_res_add_quant",
+    op_func=_apply_attn_res_add_quant_op,
+    mutates_args=[],
+    fake_impl=_apply_attn_res_add_quant_op_fake,
 )
 
 

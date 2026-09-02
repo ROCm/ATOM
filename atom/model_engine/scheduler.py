@@ -6,13 +6,15 @@ Scheduling logic for batching prefill and decode requests.
 
 This module provides:
 
-- :class:`SpecStats`: Tracks speculative-decoding acceptance rates.
 - :class:`ScheduledBatch`: A frozen snapshot of sequences selected for the
   next forward pass, together with their block tables and metadata.
 - :class:`ScheduledBatchOutput`: Token-level outputs from a completed batch.
 - :class:`Scheduler`: The main scheduling loop that manages *waiting* and
   *running* queues, coordinates block allocation, and integrates with the
   KV disaggregation connector for remote prefill/decode.
+
+Every scheduler here owns an :class:`~atom.model_engine.engine_stats.EngineStats`
+(``self.engine_stats``); the class itself lives in ``engine_stats.py``.
 """
 
 from __future__ import annotations
@@ -22,13 +24,14 @@ import struct
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 
 import numpy as np
 
 from atom.config import Config
 from atom.kv_transfer.disaggregation import KVConnectorOutput
 from atom.model_engine.block_manager import BlockManager
+from atom.model_engine.engine_stats import EngineStats
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import (
     Sequence,
@@ -46,493 +49,18 @@ from atom.utils import envs
 logger = logging.getLogger("atom")
 
 
-class SpecStats:
-    """Tracks speculative decoding acceptance statistics."""
+def _prompt_tokens_of(result) -> int:
+    """Prompt tokens in whatever a `_schedule()` returned.
 
-    __slots__ = (
-        "_interval_distribution",
-        "_interval_draft_tokens",
-        "_log_interval",
-        "distribution",
-        "mtp_k",
-        "total_draft_tokens",
-    )
-
-    def __init__(self, mtp_k: int, log_interval: int = 1000):
-        self.mtp_k = mtp_k
-        # Log every log_interval decode steps (in terms of draft tokens)
-        self._log_interval = log_interval * mtp_k
-        self.total_draft_tokens: int = 0
-        self.distribution: dict[int, int] = {k: 0 for k in range(mtp_k + 1)}
-        # Per-interval tracking
-        self._interval_draft_tokens: int = 0
-        self._interval_distribution: dict[int, int] = {k: 0 for k in range(mtp_k + 1)}
-
-    def update(self, num_accepted_tokens: int) -> None:
-        """Record acceptance result for one sequence in one decode step."""
-        self.total_draft_tokens += self.mtp_k
-        self._interval_draft_tokens += self.mtp_k
-        num_bonus = num_accepted_tokens - 1
-        self.distribution[num_bonus] += 1
-        self._interval_distribution[num_bonus] += 1
-
-        if self.total_draft_tokens % self._log_interval == 0:
-            self._log()
-            self._reset_interval()
-
-    @property
-    def total_accepted(self) -> int:
-        """Total number of accepted bonus tokens across all steps."""
-        return sum(k * v for k, v in self.distribution.items())
-
-    @property
-    def total_steps(self) -> int:
-        """Total number of decode steps recorded."""
-        return sum(self.distribution.values())
-
-    @property
-    def acceptance_rate(self) -> float:
-        if self.total_draft_tokens == 0:
-            return 0.0
-        return self.total_accepted / self.total_draft_tokens
-
-    def get_statistics(self) -> dict:
-        """Return a summary dict compatible with engine_core reporting."""
-        return {
-            "total_draft_tokens": self.total_draft_tokens,
-            "total_accepted_tokens": self.total_accepted,
-            "acceptance_rate": self.acceptance_rate,
-            "distribution": dict(self.distribution),
-        }
-
-    def reset(self) -> None:
-        self.total_draft_tokens = 0
-        self.distribution = {k: 0 for k in range(self.mtp_k + 1)}
-        self._reset_interval()
-
-    def _reset_interval(self) -> None:
-        self._interval_draft_tokens = 0
-        self._interval_distribution = {k: 0 for k in range(self.mtp_k + 1)}
-
-    def _log(self) -> None:
-        ts = self.total_steps
-        if ts == 0:
-            return
-        # Interval stats
-        iv_steps = sum(self._interval_distribution.values())
-        if iv_steps == 0:
-            self._reset_interval()
-            return
-        iv_accepted = sum(k * v for k, v in self._interval_distribution.items())
-        iv_rate = (
-            iv_accepted / self._interval_draft_tokens
-            if self._interval_draft_tokens > 0
-            else 0.0
-        )
-        logger.info(
-            f"[MTP Stats Interval] Average toks/fwd: {1 + iv_accepted / iv_steps:.2f}, "
-            f"Accepted/Total Draft tokens: {iv_accepted}/{self._interval_draft_tokens}, "
-            f"Acceptance rate: {iv_rate:.2%}, "
-            f"Accepted tokens distribution: { {k: f'{v / iv_steps:.2%}' for k, v in self._interval_distribution.items()} }"
-        )
-        logger.info(
-            f"[MTP Stats         ] Average toks/fwd: {1 + self.total_accepted / ts:.2f}, "
-            f"Accepted/Total Draft tokens: {self.total_accepted}/{self.total_draft_tokens}, "
-            f"Acceptance rate: {self.acceptance_rate:.2%}, "
-            f"Accepted tokens distribution: { {k: f'{v / ts:.2%}' for k, v in self.distribution.items()} }"
-        )
-
-
-class CacheStats:
-    """Tracks prefix caching hit statistics."""
-
-    __slots__ = (
-        "_interval_cached_tokens",
-        "_interval_compressed_tokens",
-        "_interval_evicted_base",
-        "_interval_full_tokens",
-        "_interval_requests",
-        "_interval_reusable_tokens",
-        "_interval_wanted_tokens",
-        "_log_interval",
-        "_pool_pressure",
-        "block_manager",
-        "total_cached_tokens",
-        "total_compressed_tokens",
-        "total_full_tokens",
-        "total_requests",
-        "total_reusable_tokens",
-        "total_wanted_tokens",
-    )
-
-    def __init__(
-        self,
-        log_interval: int = 100,
-        pool_pressure: Callable[[], dict[str, int]] | None = None,
-    ):
-        self._log_interval = log_interval
-        # Read at log time rather than passed per update: the free-list scan
-        # behind it is O(free blocks), which is ~10k here and would be paid
-        # once per request for a line printed once per `log_interval`.
-        self._pool_pressure = pool_pressure
-        self.total_requests: int = 0
-        self.total_cached_tokens: int = 0
-        self.total_full_tokens: int = 0
-        # The reuse ceiling, and the only honest denominator for a hit rate.
-        #
-        # `full` is not reachable: `BlockManager.can_allocate` matches over
-        # `range(n_hash_blocks - 1)`, because prefill must forward at least one
-        # block to produce sampler logits, so a request's own trailing block
-        # never comes from cache. Dividing by `full` therefore charges both
-        # pools for a block neither was ever offered, and reports a ceiling of
-        # 100% that no run can reach.
-        #
-        # It also silently rescales with sequence length -- the unreachable
-        # block is a fixed `hash_block_size`, so it is ~13% of a 1k prompt and
-        # ~0.05% of a 275k one. A hit rate divided by `full` thus moves with
-        # the length mix even when both pools behave identically, which is
-        # exactly the confound that makes two runs incomparable.
-        self.total_reusable_tokens: int = 0
-        # Pre-gate compressed-prefix hit tokens, and the boundary between the
-        # two pools: everything below it is the paged pool's doing, everything
-        # between it and `cached` is the state gates'. `reusable - compressed`
-        # is reuse the paged pool could not offer; `compressed - cached` is
-        # reuse it offered and the Pool.STATE gates declined.
-        self.total_compressed_tokens: int = 0
-        # Where the gates would have landed with every state ladder dense. It
-        # sits between cached and compressed and splits the declined reuse in
-        # two: below it a checkpoint was missing, above it nothing would have
-        # helped. Without the split "declined" is one number and whether
-        # demand-driven checkpointing applies to a workload is unfalsifiable.
-        self.total_wanted_tokens: int = 0
-        self._interval_requests: int = 0
-        self._interval_cached_tokens: int = 0
-        self._interval_full_tokens: int = 0
-        self._interval_compressed_tokens: int = 0
-        self._interval_wanted_tokens: int = 0
-        # Set by Scheduler for pool occupancy logging.
-        self.block_manager = None
-        self._interval_evicted_base: int = 0
-        self._interval_reusable_tokens: int = 0
-
-    def update(
-        self,
-        num_cached_tokens: int,
-        num_full_tokens: int,
-        num_compressed_tokens: int,
-        num_wanted_tokens: int,
-        num_reusable_tokens: int,
-    ) -> None:
-        """Record cache stats for one prefill sequence.
-
-        All five are required because the reported rates are differences
-        between them: `cached <= wanted <= compressed <= reusable <= full`. A
-        defaulted argument would silently report a negative rate rather than a
-        missing one.
-
-        `reusable` is the caller's, not this class's, because the gap between
-        it and `full` is a `BlockManager` matching detail (the trailing block
-        has no stable hash, so it is never a reuse candidate). Recomputing it
-        here would mean duplicating that rule in a second place and letting the
-        two drift.
-        """
-        ordered = (
-            num_cached_tokens
-            <= num_wanted_tokens
-            <= num_compressed_tokens
-            <= num_reusable_tokens
-            <= num_full_tokens
-        )
-        if not ordered:
-            # Warned and clamped, not asserted. These are logging counters, and
-            # `num_cached_tokens` has four independent writers -- the CPU-offload
-            # wake at `_wake_offloaded_seq` sets it without touching the two
-            # hit-block counters `can_allocate` derives the rest from, so an
-            # LMCache resume that loads more prefix than the GPU index held
-            # produces `cached > wanted` legitimately. Aborting `schedule()`
-            # over it would take the engine down to protect a log line, and
-            # would do so only in builds without `-O`, so the two would differ
-            # in behaviour. Clamping keeps the rates monotone and the run alive.
-            logger.warning(
-                "CacheStats ordering violated, clamping: cached=%d wanted=%d "
-                "compressed=%d reusable=%d full=%d",
-                num_cached_tokens,
-                num_wanted_tokens,
-                num_compressed_tokens,
-                num_reusable_tokens,
-                num_full_tokens,
-            )
-            num_full_tokens = max(num_full_tokens, 0)
-            num_reusable_tokens = min(max(num_reusable_tokens, 0), num_full_tokens)
-            num_compressed_tokens = min(
-                max(num_compressed_tokens, 0), num_reusable_tokens
-            )
-            num_wanted_tokens = min(max(num_wanted_tokens, 0), num_compressed_tokens)
-            num_cached_tokens = min(max(num_cached_tokens, 0), num_wanted_tokens)
-        self.total_requests += 1
-        self.total_cached_tokens += num_cached_tokens
-        self.total_full_tokens += num_full_tokens
-        self.total_reusable_tokens += num_reusable_tokens
-        self.total_compressed_tokens += num_compressed_tokens
-        self.total_wanted_tokens += num_wanted_tokens
-        self._interval_requests += 1
-        self._interval_cached_tokens += num_cached_tokens
-        self._interval_full_tokens += num_full_tokens
-        self._interval_reusable_tokens += num_reusable_tokens
-        self._interval_compressed_tokens += num_compressed_tokens
-        self._interval_wanted_tokens += num_wanted_tokens
-
-        if self.total_requests % self._log_interval == 0:
-            self._log()
-            self._reset_interval()
-
-    @property
-    def hit_rate(self) -> float:
-        """End-to-end reuse, against what was reusable at all.
-
-        Not against `total_full_tokens`: that denominator includes each
-        request's trailing block, which no cache is ever allowed to serve, so
-        it reports a ceiling nothing can reach and drifts with the prompt
-        length mix. `paged_hit_rate * state_hit_rate == hit_rate` exactly.
-        """
-        return self._rate(self.total_cached_tokens, self.total_reusable_tokens)
-
-    @property
-    def paged_hit_rate(self) -> float:
-        """The paged KV pool's own hit rate, with the state cache factored out.
-
-        Denominator is what the paged pool was asked for (`reusable`);
-        numerator is what it had (`compressed`). The state gates run strictly
-        after this and cannot change either term, so this number is unaffected
-        by checkpoint policy -- change `--state-checkpoint-*` and this should
-        not move. It answers "is the prefix still in KV?" and nothing else.
-
-        What it charges the pool for: eviction, capacity, and genuinely novel
-        prefixes. That last one is a workload property, not a defect, so this
-        rate has a ceiling below 100% set by how much of the traffic is new
-        text -- compare it against the dataset's theoretical prefix hit, not
-        against 100%.
-        """
-        return self._rate(self.total_compressed_tokens, self.total_reusable_tokens)
-
-    @property
-    def state_hit_rate(self) -> float:
-        """The state cache's own hit rate, with the paged pool factored out.
-
-        Denominator is what the paged pool actually offered (`compressed`),
-        NOT `reusable` -- the state gates never see a prefix the paged pool
-        already lost, and charging them for it would mean a KV eviction shows
-        up as a state-cache failure and sends tuning at the wrong pool. This
-        is the conditional probability: given the prefix was there, did a
-        checkpoint let us resume from it?
-
-        Unlike `paged_hit_rate`, 100% is genuinely reachable here: it means
-        every boundary the paged pool offered had a resumable checkpoint. The
-        gap decomposes into `state_recoverable_loss_rate` (a checkpoint would
-        have fixed it) and the remainder (nothing would have).
-        """
-        return self._rate(self.total_cached_tokens, self.total_compressed_tokens)
-
-    @property
-    def state_recoverable_loss_rate(self) -> float:
-        """The part of the state cache's miss that checkpoint placement owns.
-
-        Same denominator as `state_hit_rate`, so the two compose:
-        `state_hit_rate + state_recoverable_loss_rate` is the rate the state
-        cache would reach with a dense ladder. The distance from that to 1.0
-        is the part no checkpoint can buy, and so the honest cap on what any
-        amount of checkpoint capacity is worth.
-        """
-        return self._rate(
-            self.total_wanted_tokens - self.total_cached_tokens,
-            self.total_compressed_tokens,
-        )
-
-    def get_statistics(self) -> dict:
-        """Counters, not rates — the caller derives those.
-
-        Every rate this class reports is a ratio of two of these totals, and a
-        rate cannot be aggregated across DP ranks that saw different token
-        counts. Handing back the counts keeps the merge a sum.
-        """
-        return {
-            "requests": self.total_requests,
-            "cached_tokens": self.total_cached_tokens,
-            "compressed_tokens": self.total_compressed_tokens,
-            "wanted_tokens": self.total_wanted_tokens,
-            # The denominator for every rate here. `full_tokens` is reported
-            # too, but only so a consumer can see the unreachable gap; it is
-            # not a hit-rate denominator -- see `total_reusable_tokens`.
-            "reusable_tokens": self.total_reusable_tokens,
-            "full_tokens": self.total_full_tokens,
-        }
-
-    def _reset_interval(self) -> None:
-        self._interval_requests = 0
-        self._interval_cached_tokens = 0
-        self._interval_full_tokens = 0
-        self._interval_reusable_tokens = 0
-        self._interval_compressed_tokens = 0
-        self._interval_wanted_tokens = 0
-
-    @staticmethod
-    def _rate(num: int, den: int) -> float:
-        return num / den if den > 0 else 0.0
-
-    def _log(self) -> None:
-        # compressed = pre-gate prefix hit; cached = post-gate (admitted); the
-        # two differ by what the Pool.STATE gates declined, and `wanted` splits
-        # that difference where it matters:
-        #   Lost-to-checkpoint  wanted - cached, reuse a checkpoint at that
-        #                       boundary would have delivered. What the demand
-        #                       rung goes after; expected to fall toward 0 on a
-        #                       workload with a genuinely shared prefix.
-        #   Lost-unrecoverable  compressed - wanted, declined for a reason no
-        #                       checkpoint touches: the SWA tail is gone, or the
-        #                       boundary is too near the prompt's end to fork.
-        # (reusable - compressed) is the rest: compressed eviction, or no reuse.
-        self._log_line(
-            "Interval",
-            self._interval_requests,
-            self._interval_cached_tokens,
-            self._interval_compressed_tokens,
-            self._interval_wanted_tokens,
-            self._interval_reusable_tokens,
-            self._interval_full_tokens,
-        )
-        self._log_line(
-            "        ",
-            self.total_requests,
-            self.total_cached_tokens,
-            self.total_compressed_tokens,
-            self.total_wanted_tokens,
-            self.total_reusable_tokens,
-            self.total_full_tokens,
-        )
-        if self.block_manager is not None:
-            occ = self.block_manager.pool_occupancy()
-            evicted_iv = occ["evicted_total"] - self._interval_evicted_base
-            self._interval_evicted_base = occ["evicted_total"]
-            total = occ["total"] or 1
-            logger.info(
-                f"[Cache Pool          ] "
-                f"used {occ['used']} ({occ['used'] / total:.0%}), "
-                f"free {occ['free']} ({occ['free'] / total:.0%}), "
-                f"retained-cache {occ['retained']}, "
-                f"evicted this interval {evicted_iv} "
-                f"(total {occ['evicted_total']})"
-            )
-        self._log_pools()
-        if self._pool_pressure is not None:
-            self._log_pressure(self._pool_pressure())
-
-    def _log_pools(self) -> None:
-        """Each pool's hit rate against its own denominator.
-
-        The `[Cache Stats]` line reports one end-to-end rate, which cannot say
-        which pool to fix: the same 85% is a KV pool that lost the prefix or a
-        state cache that refused to resume from it, and those want opposite
-        changes. Splitting needs two denominators, because the pools are in
-        series and the second only ever sees what the first passed on:
-
-            paged = compressed / reusable      "was the prefix still in KV?"
-            state = cached     / compressed    "given it was, could we resume?"
-            paged * state = cached / reusable = the end-to-end rate
-
-        So the product is exact, and the smaller factor is the bottleneck --
-        that comparison is the whole point of the line. Reading `state`
-        against `reusable` instead would fold KV evictions into the state
-        cache's score and point tuning at the wrong pool.
-
-        `+ckpt` is where `state` would land if every ladder were dense. It is
-        the ceiling on what checkpoint placement or more slots can buy; if it
-        sits near `state`, the state cache is already doing all it can and the
-        remaining loss is the paged pool's.
-        """
-        paged = self.paged_hit_rate
-        state = self.state_hit_rate
-        # Which factor is further from 1.0 loses more reuse, since the rates
-        # multiply. Named here rather than left to the reader because the
-        # comparison is against each other, not against 100%.
-        worse = "paged" if paged <= state else "state"
-        logger.info(
-            "[Cache Pools] "
-            f"paged-hit: {paged:.2%} "
-            f"({self.total_compressed_tokens}/{self.total_reusable_tokens}), "
-            f"state-hit: {state:.2%} "
-            f"({self.total_cached_tokens}/{self.total_compressed_tokens}), "
-            f"state-hit+ckpt: {state + self.state_recoverable_loss_rate:.2%}, "
-            f"combined: {self.hit_rate:.2%}, "
-            f"binding: {worse}"
-        )
-
-    @staticmethod
-    def _log_pressure(p: dict[str, int]) -> None:
-        """The two pools' own account of what they destroyed.
-
-        `full - compressed` in the line above is reuse the paged pool did not
-        have, but it cannot say why — a prompt with no shared prefix and a
-        prefix evicted an hour ago read identically. These counters separate
-        them, and are the only evidence that eviction happened at all:
-        `blocks_evicted == 0` at the end of a run means every miss above was
-        absence of reuse, not loss of it.
-
-        Vacant is called out because it is the leading indicator. Evictions
-        can only begin once it reaches 0, so a run that ends with vacant
-        blocks to spare never had paged pressure whatever its hit rate.
-        """
-        logger.info(
-            "[Pool Pressure] "
-            f"paged: {p['blocks_used']}/{p['blocks_total']} used, "
-            f"{p['blocks_free_reusable']} reusable-free, "
-            f"{p['blocks_free'] - p['blocks_free_reusable']} vacant, "
-            f"{p['blocks_indexed']} indexed | "
-            f"evicted: {p['blocks_evicted']}, retired: {p['blocks_retired']} | "
-            f"state: {p['slots_used']}/{p['slots_total']} used, "
-            f"{p['slots_held']} checkpointed, {p['slots_vacant']} vacant"
-        )
-        # The state pool's own losses, which `blocks_evicted` cannot express:
-        # a checkpoint can die without any block dying (`evicted`, the pool ran
-        # out of slots) or *because* a block died (`orphaned`, the prefix it
-        # was filed under left the KV index first). The pair says which pool to
-        # grow — see `StateSlotPool.__init__` for why they are kept apart.
-        logger.info(
-            "[Checkpoint Fates] "
-            f"kept: {p['checkpoints_kept']}, "
-            f"dropped: {p['checkpoints_dropped']}, "
-            f"evicted: {p['checkpoints_evicted']}, "
-            f"orphaned: {p['checkpoints_orphaned']}"
-        )
-
-    @classmethod
-    def _log_line(
-        cls,
-        label: str,
-        reqs: int,
-        cached: int,
-        compressed: int,
-        wanted: int,
-        reusable: int,
-        full: int,
-    ) -> None:
-        """Every rate here is over `reusable`; `full` is shown, not divided by.
-
-        `Unreachable` is the gap between them -- the trailing block of each
-        request, which prefill must always compute. It is reported so the
-        older `full`-denominated numbers in past logs remain translatable, and
-        because a large value is itself a signal: it means short prompts
-        dominate, and a run whose length mix differs this much is not
-        comparable to another on hit rate alone.
-        """
-        logger.info(
-            f"[Cache Stats {label}] Reqs: {reqs}, "
-            f"Cached/Reusable: {cached}/{reusable}, "
-            f"Hit: {cls._rate(cached, reusable):.2%}, "
-            f"Compressed-hit: {cls._rate(compressed, reusable):.2%}, "
-            f"Lost-to-checkpoint: {cls._rate(wanted - cached, reusable):.2%}, "
-            f"Lost-unrecoverable: {cls._rate(compressed - wanted, reusable):.2%}, "
-            f"Unreachable: {cls._rate(full - reusable, full):.2%} of {full}"
-        )
+    The three schedulers disagree on the empty shape — bare `None` from
+    `Scheduler` and `DecodeScheduler`, `(None, {})` from `PrefillScheduler` —
+    so normalize here rather than at each caller. `total_tokens_num_prefill`
+    is 0 on a decode batch, which is what the throughput window wants: its
+    generation side is counted in `postprocess`, from tokens actually
+    committed.
+    """
+    batch = result[0] if isinstance(result, tuple) else result
+    return 0 if batch is None else batch.total_tokens_num_prefill
 
 
 def _optimal_cu_fraction(
@@ -902,6 +430,9 @@ class Scheduler:
     :meth:`_update_from_kv_xfer_finished` (both sides).
     """
 
+    _ENGINE_LABEL = ""
+    _METRICS_ROLE = ""
+
     def __init__(
         self,
         config: Config,
@@ -960,16 +491,9 @@ class Scheduler:
                 "Drafts are produced for handoff; this engine verifies none.",
                 pp_size,
             )
-        self.spec_stats: SpecStats | None = (
-            SpecStats(mtp_k=self.mtp_k) if self.use_spec else None
-        )
-        self.cache_stats: CacheStats | None = (
-            CacheStats(pool_pressure=self.block_manager.pool_pressure)
-            if config.enable_prefix_caching
-            else None
-        )
-        if self.cache_stats is not None:
-            self.cache_stats.block_manager = self.block_manager
+        # `engine_stats` (spec / cache / throughput sections) is constructed
+        # below, once `dp_rank` — the throughput section's engine index — is
+        # known.
         # Dashboard counters update only at request lifecycle boundaries.
         self.total_prompt_tokens = 0
         self.total_generation_tokens = 0
@@ -1017,6 +541,19 @@ class Scheduler:
             if parallel_cfg is not None
             else None
         )
+        self.engine_stats = EngineStats(
+            engine_index=dp_rank or 0,
+            label=self._ENGINE_LABEL,
+            use_spec=self.use_spec,
+            mtp_k=self.mtp_k,
+            enable_prefix_caching=config.enable_prefix_caching,
+            enable_log_stats=config.enable_log_stats,
+            throughput_log_interval_s=config.throughput_log_interval,
+            cache_hit_rate_window=config.cache_hit_rate_window,
+            pool_pressure=self.block_manager.pool_pressure,
+        )
+        if config.enable_prefix_caching:
+            self.engine_stats.block_manager = self.block_manager
         if kv_events_cfg is not None and kv_events_cfg.enable:
             self.kv_event_publisher: _EventPublisher = _make_publisher(
                 enabled=True,
@@ -1099,6 +636,40 @@ class Scheduler:
         if total <= 0:
             return 0.0
         return bm.kv.num_used / total
+
+    def _record_throughput(
+        self, num_prompt_tokens: int = 0, num_generation_tokens: int = 0
+    ) -> None:
+        """Feed this tick's token counts into the throughput section of
+        `engine_stats` and emit the periodic engine-status log line once
+        `throughput_log_interval_s` has elapsed.
+
+        No-op when `--no-enable-log-stats` disabled the section.
+
+        The token counts must be accumulated on every call — they are what the
+        line reports — but the three arguments below it are read fresh and then
+        discarded on all but one call in `interval / step_time`, which at a 10s
+        interval is about one in ten thousand. `window_expired` is a subtract
+        and a compare, so gating on it keeps the per-step cost to the counter
+        update.
+        """
+        stats = self.engine_stats
+        if not stats.throughput_enabled:
+            return
+        stats.update_throughput(num_prompt_tokens, num_generation_tokens)
+        if not stats.window_expired(time.monotonic()):
+            return
+        num_running_reqs, num_waiting_reqs = self.get_request_counts()
+        stats.maybe_log_throughput(
+            num_running_reqs=num_running_reqs,
+            num_waiting_reqs=num_waiting_reqs,
+            kv_usage=self._kv_usage(),
+        )
+
+    def heartbeat_throughput(self, now: float) -> None:
+        """Close the throughput window on time while the engine sits idle."""
+        if self.engine_stats.window_expired(now):
+            self._record_throughput()
 
     def _waiting_new_token_count(self) -> int:
         """Sum of new (uncached) tokens across the ADMITTABLE waiting queue,
@@ -1388,7 +959,22 @@ class Scheduler:
         self._rejected = []
         return out
 
-    def schedule(self) -> tuple[ScheduledBatch, dict[int, Sequence]]:
+    def schedule(self) -> tuple[ScheduledBatch, dict[int, Sequence]] | None:
+        """Run a scheduling pass and close the throughput window.
+
+        **Override `_schedule`, not this.** The window's 10s cadence is a
+        whole-program invariant, and putting the tick here makes it depend on
+        one call rather than on a `_record_throughput()` hand-placed at every
+        early return inside `_schedule`. There are already several such
+        returns; the next one added would otherwise stall the status line for
+        as long as it fires, and nothing would fail — the log would just go
+        quiet, which is indistinguishable from an idle engine.
+        """
+        result = self._schedule()
+        self._record_throughput(num_prompt_tokens=_prompt_tokens_of(result))
+        return result
+
+    def _schedule(self) -> tuple[ScheduledBatch, dict[int, Sequence]] | None:
         """Select the next batch of sequences for a forward pass.
 
         Tries prefill first; if no new prefills are ready, falls back to
@@ -1645,7 +1231,7 @@ class Scheduler:
             )
             self.waiting.extend(skipped_waiting_requests)
 
-        if self._num_parked_remote_kv > 0 and self._schedule_tick % 100 == 0:
+        if self._num_parked_remote_kv > 0 and self._schedule_tick % 1000 == 0:
             logger.info(
                 "PD backpressure: parked=%d, waiting=%d, running=%d, "
                 "resident=%d/%d, kv_usage=%.2f",
@@ -1793,7 +1379,7 @@ class Scheduler:
                 if not is_first or has_injected_t0:
                     self.block_manager.may_append(seq, num_new_tokens)
                 if is_first:
-                    logger.info(
+                    logger.debug(
                         "[PD-FIRST-DECODE] seq %s: num_tokens=%d, "
                         "blocks=%d, injected_t0=%s, "
                         "last_block_num=%d, context_will_be=%d",
@@ -2025,7 +1611,7 @@ class Scheduler:
                 for d in drafts:
                     seq.append_token(int(d))
                 seq.spec_token_ids = np.asarray(drafts, dtype=np.int32)
-        logger.info(
+        logger.debug(
             "[PD-TRANSITION] seq %s: num_tokens=%d, "
             "num_prompt=%d, blocks=%d, first_token=%s, "
             "last_5_tids=%s",
@@ -2163,7 +1749,7 @@ class Scheduler:
         num_batched_tokens: int,
     ) -> tuple[int, int]:
         num_seqs_prefill += 1
-        if self.cache_stats:
+        if self.engine_stats.cache_enabled:
             # Hit counts are in hash blocks — one block_table entry spans
             # `block_size * dcp_world_size` tokens — so scaling by block_size
             # would under-report by the DCP factor.
@@ -2176,7 +1762,7 @@ class Scheduler:
             # ceiling is genuinely zero — nothing about it is reusable.
             n_hash_blocks = (seq.num_tokens + hbs - 1) // hbs
             num_reusable_tokens = min(max(n_hash_blocks - 1, 0) * hbs, seq.num_tokens)
-            self.cache_stats.update(
+            self.engine_stats.update_cache(
                 seq.num_cached_tokens,
                 seq.num_tokens,
                 seq.num_compressed_hit_blocks * hbs,
@@ -2440,6 +2026,7 @@ class Scheduler:
 
         finished_seqs = []
         stream_outputs = []
+        num_new_generation_tokens = 0
 
         need_placeholder = is_deferred_out or self.spec_decode_local
         # Drafts occupy trailing slots only on an engine that verifies them; a
@@ -2527,11 +2114,11 @@ class Scheduler:
                 # the target — vLLM gates this via
                 # `if scheduled_spec_token_ids and generated_token_ids`.
                 if (
-                    self.spec_stats
+                    self.engine_stats.spec_enabled
                     and num_new_token > 0
                     and (num_new_token + num_rejected) > 1
                 ):
-                    self.spec_stats.update(num_new_token)
+                    self.engine_stats.update_spec(num_new_token)
                 seq.num_rejected = num_rejected
                 seq.num_bonus_tokens = num_bonus
                 # DSpark Phase 2: stash this step's scheduler-chosen ell on the
@@ -2581,7 +2168,7 @@ class Scheduler:
                 seq.spec_token_ids = draft_token_ids[idx]
 
             if seq.num_completion_tokens <= 3 and seq.kv_transfer_params:
-                logger.info(
+                logger.debug(
                     "[PD-DECODE] seq %s: comp_tokens=%d, "
                     "new_token=%s, num_tokens=%d, blocks=%d",
                     seq.id,
@@ -2687,6 +2274,16 @@ class Scheduler:
             if num_tokens - seq.num_prompt_tokens >= 1 and seq.first_token_time == 0.0:
                 seq.first_token_time = time.time()
 
+            # Counted here, not from `len(token_ids)` above: `new_tokens` is
+            # what reaches RequestOutput, and it differs from the forward's
+            # raw output in both directions — the truncation just above drops
+            # accepted drafts past EOS/stop, and `injected_t0` prepends the
+            # token the prefill process sampled. Counting the raw output made
+            # the status line disagree with what the client received and with
+            # `total_generation_tokens` below, which this same call derives
+            # from the post-truncation length.
+            num_new_generation_tokens += len(new_tokens)
+
             # Hash generated blocks. Deferred output: all tokens forwarded;
             # undeferred: last token not yet forwarded, so exclude it.
             self.block_manager.hash_decode_blocks(
@@ -2723,7 +2320,7 @@ class Scheduler:
                 )
 
                 if request_output.kv_transfer_params_output is not None:
-                    logger.info("KV transfer output present in stream output.")
+                    logger.debug("KV transfer output present in stream output.")
 
                 stream_outputs.append((seq.id, request_output))
                 logger.debug(
@@ -2783,6 +2380,10 @@ class Scheduler:
             else:
                 self.block_manager.deallocate(seq)
             self.running.remove(seq)
+
+        self.engine_stats.update_throughput(
+            num_generation_tokens=num_new_generation_tokens
+        )
         return finished_seqs
 
     def compute_detailed_aggregates(
@@ -3136,6 +2737,12 @@ class PrefillScheduler:
     - Decode scheduling is never performed.
     """
 
+    # Every request here is also held by the decode side, whose queues span
+    # the full lifetime; the aggregator drops this rank's counts so an
+    # in-flight prefill is not counted on both. See `_METRICS_ROLE` on
+    # `Scheduler`.
+    _METRICS_ROLE = "prefill"
+
     def __init__(self, config: Config, disagg_cu_shm_name: str = ""):
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
@@ -3146,8 +2753,22 @@ class PrefillScheduler:
         self.use_spec = False
         self.spec_decode_local = False
         self.mtp_k = 0
-        self.spec_stats = None
-        self.cache_stats = None
+        # Only the throughput section applies to the prefill side: it does not
+        # speculate, and it has no BlockManager to source prefix-cache hits.
+        # Throughput follows config.enable_log_stats (default True), matching
+        # the aggregated Scheduler and the decode side.
+        parallel_cfg = getattr(config, "parallel_config", None)
+        dp_rank = (
+            getattr(parallel_cfg, "data_parallel_rank", None)
+            if parallel_cfg is not None
+            else None
+        )
+        self.engine_stats = EngineStats(
+            engine_index=dp_rank or 0,
+            label="Prefill ",
+            enable_log_stats=config.enable_log_stats,
+            throughput_log_interval_s=config.throughput_log_interval,
+        )
         self.total_prompt_tokens = 0
         self.total_generation_tokens = 0
         self.total_finished_requests = 0
@@ -3188,6 +2809,16 @@ class PrefillScheduler:
         self.waiting.extend(seqs)
 
     def schedule(self):
+        """Run a scheduling pass and close the throughput window.
+
+        Override `_schedule`, not this — see `Scheduler.schedule` for why the
+        tick lives at the one entry point instead of at each early return.
+        """
+        result = self._schedule()
+        self._record_throughput(num_prompt_tokens=_prompt_tokens_of(result))
+        return result
+
+    def _schedule(self):
         """Schedule only sequences whose block_table has been populated.
 
         Sequences that do not yet have a block assignment (block_table is
@@ -3245,6 +2876,35 @@ class PrefillScheduler:
             scheduled_seqs,
         )
 
+    def _record_throughput(
+        self, num_prompt_tokens: int = 0, num_generation_tokens: int = 0
+    ) -> None:
+        """`Scheduler._record_throughput`'s counterpart for the prefill side.
+
+        This process schedules no decode, so generation stays 0, and the
+        decode process owns the KV blocks — no local BlockManager means
+        `kv_usage=None`, which the line reports as `n/a` rather than as a
+        real, empty pool. Same `window_expired` gate as the base class, and
+        for the same reason.
+        """
+        stats = self.engine_stats
+        if not stats.throughput_enabled:
+            return
+        stats.update_throughput(num_prompt_tokens, num_generation_tokens)
+        if not stats.window_expired(time.monotonic()):
+            return
+        num_running_reqs, num_waiting_reqs = self.get_request_counts()
+        stats.maybe_log_throughput(
+            num_running_reqs=num_running_reqs,
+            num_waiting_reqs=num_waiting_reqs,
+            kv_usage=None,
+        )
+
+    def heartbeat_throughput(self, now: float) -> None:
+        """Idle-pass counterpart of `Scheduler.heartbeat_throughput`."""
+        if self.engine_stats.window_expired(now):
+            self._record_throughput()
+
     def postprocess(self, seqs, fwd_output, stream_output_queue=None) -> list:
         """No-op: prefill produces no sampled tokens."""
         return []
@@ -3255,8 +2915,14 @@ class PrefillScheduler:
             return (True, seq.num_tokens - seq.num_cached_tokens)
         return (False, 0)
 
+    def get_request_counts(self) -> tuple[int, int]:
+        """(running, waiting). Not a `Scheduler` subclass, so this is declared
+        rather than inherited — the engine-status line and any metrics reader
+        expect every scheduler to answer it."""
+        return len(self.running), len(self.waiting)
+
     def get_num_unfinished_requests(self) -> int:
-        return len(self.waiting) + len(self.running)
+        return sum(self.get_request_counts())
 
 
 class DecodeScheduler(Scheduler):
@@ -3274,6 +2940,24 @@ class DecodeScheduler(Scheduler):
     on_prefill_done() promotes sequences directly from prefill_waiting to
     running.  schedule() only schedules the running queue as decode batches.
     """
+
+    _ENGINE_LABEL = "Decode "
+    _METRICS_ROLE = "decode"
+
+    def get_request_counts(self) -> tuple[int, int]:
+        """Fold in the two queues this scheduler adds.
+
+        `allocate_waiting()` drains `waiting` almost immediately, so a request
+        spends most of its life in `prefill_waiting` (blocks assigned, awaiting
+        PrefillDone) and lands in `prefill_done` before `schedule()` promotes
+        it. Counting only the base pair reports `Running: 0, Waiting: 0` on an
+        engine holding a full load of in-flight requests — on the status line
+        and, because `/metrics` reads this same method, on the dashboard too.
+        """
+        return (
+            len(self.running) + len(self.prefill_done),
+            len(self.waiting) + len(self.prefill_waiting),
+        )
 
     def __init__(
         self,
@@ -3305,6 +2989,10 @@ class DecodeScheduler(Scheduler):
         self.cu_fraction: float | None = None
 
     def is_finished(self) -> bool:
+        # Kept explicit rather than derived from get_request_counts: unlike the
+        # base it deliberately ignores `_rejected` and `deferred_free_blocks`.
+        # If a queue is ever added to this scheduler it has to be listed here
+        # *and* in get_request_counts.
         return (
             not self.waiting
             and not self.prefill_waiting
@@ -3312,18 +3000,11 @@ class DecodeScheduler(Scheduler):
             and not self.prefill_done
         )
 
-    def has_requests(self) -> bool:
-        return bool(
-            self.waiting or self.prefill_waiting or self.running or self.prefill_done
-        )
-
     def get_num_unfinished_requests(self) -> int:
-        return (
-            len(self.waiting)
-            + len(self.prefill_waiting)
-            + len(self.running)
-            + len(self.prefill_done)
-        )
+        # Derived, so the queue inventory lives in get_request_counts alone.
+        # `has_requests` / `has_unfinished_requests` come off the base's chain
+        # through this method and need no override of their own.
+        return sum(self.get_request_counts())
 
     def allocate_waiting(self) -> list[Sequence]:
         """Allocate KV blocks for sequences in waiting; move them to prefill_waiting.
@@ -3364,14 +3045,17 @@ class DecodeScheduler(Scheduler):
             seq.first_token_time = time.time()
             self.prefill_done.append(seq)
 
-    def schedule(self):
+    def _schedule(self):
         """Schedule decode-only batches.
 
         Sequences are promoted directly from prefill_waiting to running by
         on_prefill_done(); this method only schedules the running queue.
+
+        Overrides the base `_schedule`, so the inherited `schedule()` still
+        closes the throughput window on every one of the returns below.
         """
 
-        # This override does not call `super().schedule()`, but it does route
+        # This override does not call `super()._schedule()`, but it does route
         # through the same `block_manager.allocate` and the same `postprocess`,
         # so it owes the state pool the same two hooks. Without this one the
         # pins taken by every resume accumulate forever and admission starves.

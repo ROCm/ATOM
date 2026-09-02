@@ -236,7 +236,6 @@ def _slice_v4_graph_metadata_for_capture(
 
     for name in (
         "batch_id_per_token",
-        "batch_id_per_token_cpu",
         "slot_mapping",
         "kv_indices_swa",
         "kv_indices_csa",
@@ -265,8 +264,6 @@ def _slice_v4_graph_metadata_for_capture(
         "state_slot_mapping_cpu",
         "n_committed_csa_per_seq",
         "n_committed_csa_per_seq_cpu",
-        "n_committed_hca_per_seq",
-        "n_committed_hca_per_seq_cpu",
         "context_lens",
     ):
         _slice_attr(name, bs)

@@ -19,16 +19,19 @@ if TYPE_CHECKING:
     from atom.config import Config
 
 
-def _owned(value: Any) -> Any:
+def _owned(value: Any, staged: tuple[torch.Tensor, ...] = ()) -> Any:
     """A copy the graph pool cannot re-issue.
 
-    Whole return, not the one output known to outlive its step: which that is
-    belongs to the flavor, not to this seam.
+    Outputs that alias declared staged inputs already live outside the graph
+    pool and can be handed back directly. Clone every other tensor because the
+    pool may re-issue its storage on a later replay.
     """
     if isinstance(value, torch.Tensor):
+        if any(value.data_ptr() == tensor.data_ptr() for tensor in staged):
+            return value
         return value.clone()
     if isinstance(value, tuple):
-        return tuple(_owned(v) for v in value)
+        return tuple(_owned(v, staged) for v in value)
     return value
 
 
@@ -149,6 +152,24 @@ class DraftGraph:
             role: self._stage_one(role, running_bs, src) for role, src in srcs.items()
         }
 
+    def buffer(self, role: str, bs: int) -> torch.Tensor:
+        """Return the fixed-storage view a producer may fill for the real rows.
+
+        A following :meth:`stage` still owns padding ``bs`` to ``running_bs``.
+        The caller must not mutate this view between that stage and the pass
+        consuming it.
+        """
+        assert role in self._buffers, (
+            f"{self.name} has no staged input {role!r}; "
+            f"declared roles are {sorted(self._buffers)}"
+        )
+        buf = self._buffers[role]
+        assert 0 <= bs <= buf.shape[0], (
+            f"{self.name} requested {bs} rows from draft input {role!r}, "
+            f"whose capacity is {buf.shape[0]}"
+        )
+        return buf[:bs]
+
     def _stage_one(self, role: str, running_bs: int, src: torch.Tensor | None):
         """Copy ``src`` into this input's fixed buffer, tail-repeating its last row.
 
@@ -175,7 +196,15 @@ class DraftGraph:
             f"the case that reaches here"
         )
         scheduled_bs = src.shape[0]
-        out[:scheduled_bs].copy_(src)
+        dst = out[:scheduled_bs]
+        assert src.shape == dst.shape, (
+            f"draft input '{role}' of {self.name} arrived as {tuple(src.shape)}, "
+            f"but its fixed storage expects {tuple(dst.shape)}"
+        )
+        # A producer may have written straight into this exact fixed-storage
+        # view. Do not turn that into a self-copy launch.
+        if src.data_ptr() != dst.data_ptr() or src.stride() != dst.stride():
+            dst.copy_(src)
         if running_bs > scheduled_bs:
             out[scheduled_bs:].copy_(src[-1])  # broadcasts; no expand needed
         return out
@@ -225,7 +254,7 @@ class DraftGraph:
             graph, out = captured
             graph.replay()
             if self.capture_epilogue:
-                out = _owned(out)
+                out = _owned(out, tuple(staged.values()))
         return (
             out
             if self.capture_epilogue

@@ -353,7 +353,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             )
 
         if self._reqs_need_recv or self._reqs_need_save:
-            logger.info(
+            logger.debug(
                 "[SCHEDULER] build_connector_meta: %d recv, %d save, " "id_map=%s",
                 len(self._reqs_need_recv),
                 len(self._reqs_need_save),
@@ -399,7 +399,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             elif not seq.has_per_req_cache and self.hash_block_size > 0:
                 num_computed_blocks = seq.num_cached_tokens // self.hash_block_size
             params["num_computed_blocks"] = num_computed_blocks
-            logger.info(
+            logger.debug(
                 "[SCHEDULER-CONSUMER] Queued req %s for remote KV recv "
                 "(%d blocks, %d locally cached, slot=%d), transfer_id=%s, "
                 "remote_host=%s, remote_handshake_port=%s",
@@ -919,7 +919,7 @@ class MooncakeConnector(KVConnectorBase):
                         "slot_index": meta.local_slot_index,
                     }
                     self._completed_prefills_cv.notify_all()
-                logger.info(
+                logger.debug(
                     "[PRODUCER] Cached %d prefill blocks (slot=%d) for req %s",
                     len(meta.local_block_ids),
                     meta.local_slot_index,
@@ -931,7 +931,7 @@ class MooncakeConnector(KVConnectorBase):
         if not metadata.reqs_to_recv:
             return
 
-        logger.info(
+        logger.debug(
             "[CONSUMER] start_load_kv: %d reqs_to_recv, id_map=%s",
             len(metadata.reqs_to_recv),
             metadata.request_id_to_transfer_id,
@@ -1046,7 +1046,7 @@ class MooncakeConnector(KVConnectorBase):
                             self.tp_size,
                         )
                 self._send_on_socket(remote_addr, [MSG_WRITE_REQUEST, write_request])
-                logger.info(
+                logger.debug(
                     "[CONSUMER] write_request sent for req %s (transfer_id=%s) "
                     "to stage %d/%d at %s, off=%d, dst_block_ids=%s",
                     req_id,
@@ -1102,7 +1102,7 @@ class MooncakeConnector(KVConnectorBase):
             self.done_sending.clear()
             self.done_recving.clear()
         if ds or dr:
-            logger.info(
+            logger.debug(
                 "[%s] get_finished: sending=%s, recving=%s",
                 "PRODUCER" if self.is_producer else "CONSUMER",
                 ds,
@@ -1138,7 +1138,7 @@ class MooncakeConnector(KVConnectorBase):
 
                 elif msg_type == MSG_WRITE_REQUEST:
                     request_data = msgpack.loads(parts[2])
-                    logger.info(
+                    logger.debug(
                         "[PRODUCER] Received write_request for req %s "
                         "(transfer_id=%s, consumer=%s:%s)",
                         request_data["request_id"],
@@ -1180,7 +1180,7 @@ class MooncakeConnector(KVConnectorBase):
             self.done_sending.add(transfer_id)
         with self._completed_prefills_lock:
             self._completed_prefills.pop(transfer_id, None)
-        logger.info(
+        logger.debug(
             "[PRODUCER] All %d decode ranks released transfer_id=%s; page freed",
             consumer_tp_size,
             transfer_id,
@@ -1205,7 +1205,7 @@ class MooncakeConnector(KVConnectorBase):
             write_nonce = request_data.get("write_nonce", 0)
             has_slot_data = request_data.get("has_slot_regions", False)
 
-            logger.info(
+            logger.debug(
                 "[PRODUCER] _execute_transfer: req_id=%s, transfer_id=%s, "
                 "consumer=%s:%s, dst_blocks=%d, has_slot_data=%s",
                 req_id,
@@ -1329,7 +1329,7 @@ class MooncakeConnector(KVConnectorBase):
                     # PP-prefill: this stage's write is done, but stage-0 must not
                     # reuse the shared page until ALL stages finish. Freeing is
                     # deferred to _record_release (driven by consumer releases).
-                    logger.info(
+                    logger.debug(
                         "[PRODUCER] stage pp_rank=%d served %d consumers for "
                         "transfer_id=%s; awaiting release",
                         self.pp_rank,
@@ -1341,7 +1341,7 @@ class MooncakeConnector(KVConnectorBase):
                         self.done_sending.add(transfer_id)
                     with self._completed_prefills_lock:
                         self._completed_prefills.pop(transfer_id, None)
-                    logger.info(
+                    logger.debug(
                         "[PRODUCER] All %d consumers served for transfer_id=%s",
                         consumers_per_rank,
                         transfer_id,
@@ -1439,7 +1439,7 @@ class MooncakeConnector(KVConnectorBase):
                 dst_addrs.append(dst_base + db * bpb)
                 sizes.append(bpb)
 
-        logger.info(
+        logger.debug(
             "[PRODUCER] block RDMA write: req=%s, %d regions × %d blocks, "
             "total_bytes=%d",
             req_id,
@@ -1519,7 +1519,7 @@ class MooncakeConnector(KVConnectorBase):
                 block_dst.append(dst_region.unit_addr(db))
                 block_sizes.append(src_region.unit_bytes)
 
-        logger.info(
+        logger.debug(
             "[PRODUCER] block RDMA: req=%s, %d regions × %d blocks, " "total_bytes=%d",
             req_id,
             len(self._block_regions),
@@ -1535,7 +1535,7 @@ class MooncakeConnector(KVConnectorBase):
 
         # ---- Phase 2: Slot transfer ----
         if src_slot < 0 or dst_slot < 0:
-            logger.info(
+            logger.debug(
                 "[PRODUCER] slot transfer skipped (src_slot=%d, dst_slot=%d)",
                 src_slot,
                 dst_slot,
@@ -1573,7 +1573,7 @@ class MooncakeConnector(KVConnectorBase):
             slot_dst.append(consumer_staging_addr)
             slot_sizes.append(self._staging_slot_bytes)
 
-        logger.info(
+        logger.debug(
             "[PRODUCER] slot RDMA: req=%s, %d entries, "
             "src_slot=%d → dst_slot=%d, total_bytes=%d",
             req_id,
@@ -1715,7 +1715,7 @@ class MooncakeConnector(KVConnectorBase):
             }
         )
         self._send_on_socket(path, [MSG_WRITE_DONE, notification], repeat=3)
-        logger.info("[PRODUCER] write-done sent for req %s", req_id)
+        logger.debug("[PRODUCER] write-done sent for req %s", req_id)
 
     # -----------------------------------------------------------------
     # Consumer: notification listener (ZMQ ROUTER)
@@ -1795,7 +1795,7 @@ class MooncakeConnector(KVConnectorBase):
             stages = self._pending_recv_stages.setdefault(req_id, set())
             stages.add((pp_rank, tp_rank))
             if len(stages) < expected:
-                logger.info(
+                logger.debug(
                     "[CONSUMER] Write-done req %s rank (%d,%d) (%d/%d)",
                     req_id,
                     pp_rank,
@@ -1821,7 +1821,7 @@ class MooncakeConnector(KVConnectorBase):
         with self._completion_lock:
             self.done_recving.add(req_id)
             self._pending_recv.discard(req_id)
-        logger.info(
+        logger.debug(
             "[CONSUMER] Write-done received for req %s (all stages), "
             "done_recving now: %s",
             req_id,

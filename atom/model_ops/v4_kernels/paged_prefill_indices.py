@@ -12,9 +12,9 @@ per-fwd index buffers consumed by `sparse_attn_v4_paged_prefill`:
                                   slice TAIL; the CSA topk HEAD section is filled
                                   per layer by ``csa_translate_pack`` (head-CSA /
                                   tail-SWA convention, matching decode, #1116).
-  - ``kv_indices_prefix_hca``   : HCA path — SWA prefix segment + HCA
-                                  all-committed compress section, both fully
-                                  written.
+  - ``kv_indices_prefix_hca``   : HCA path — SWA prefix segment + the HCA
+                                  groups closed at or before the token's own
+                                  position, both fully written.
 
 Replaces the CPU numpy build in
 ``DeepseekV4AttentionMetadataBuilder._build_paged_prefill_meta`` (per-fwd
@@ -73,7 +73,6 @@ def _v4_paged_prefill_indices_kernel(
     chunk_start_per_seq_ptr,  # [bs] int — current chunk's absolute start position
     cu_seqlens_q_per_seq_ptr,  # [bs] int — per-seq prefix sum start in per-fwd kv tensor
     state_slot_per_seq_ptr,  # [bs] int — per-seq SWA ring slot
-    n_committed_hca_per_seq_ptr,  # [bs] int — per-seq HCA compress entry count
     block_tables_ptr,  # [bs, MAX_BLOCKS] int — compressed pool block ids (HCA)
     bt_stride_bs,  # row stride of block_tables
     # Indptrs (already cumsum'd by caller, all length [T+1]).
@@ -129,15 +128,11 @@ def _v4_paged_prefill_indices_kernel(
     pos = tl.load(positions_ptr + t)
     chunk_start = tl.load(chunk_start_per_seq_ptr + bid)
     cu_q = tl.load(cu_seqlens_q_per_seq_ptr + bid)
-    # Per-token CAUSAL HCA visibility: token at `pos` may see only the
-    # `(pos+1)//HCA_RATIO` compressed groups committed up to its own position
-    # (matches the reference `get_compress_topk_idxs` prefill mask, and mirrors
-    # the CSA `(pos+1)//4` cap). Without this cap every token saw the per-seq
-    # `n_committed_hca = ctx_end//128`, which over-reads FUTURE groups and makes
-    # a token's output depend on the forward's total length (chunked != single).
-    n_hca = tl.minimum(
-        (pos + 1) // HCA_RATIO, tl.load(n_committed_hca_per_seq_ptr + bid)
-    )
+    # Per-token causal HCA visibility (see `v4_pool_geometry`; matches the
+    # reference `get_compress_topk_idxs` prefill mask). Here specifically, the
+    # sequence's `ctx_end//128` would make a token's output depend on the
+    # forward's total length -- chunked and single-shot would disagree.
+    n_hca = (pos + 1) // HCA_RATIO
 
     # Per-token derived quantities (single-pass arithmetic).
     token_pos_in_chunk = pos - chunk_start
@@ -248,7 +243,6 @@ def write_v4_paged_prefill_indices(
     chunk_start_per_seq: torch.Tensor,
     cu_seqlens_q_per_seq: torch.Tensor,
     state_slot_per_seq: torch.Tensor,
-    n_committed_hca_per_seq: torch.Tensor,
     block_tables: torch.Tensor,
     extend_indptr: torch.Tensor,
     prefix_swa_indptr: torch.Tensor,
@@ -296,7 +290,6 @@ def write_v4_paged_prefill_indices(
                                             — caller passes the leading
                                             ``bs`` entries).
       state_slot_per_seq:        ``[bs]``   int — per-seq SWA ring slot.
-      n_committed_hca_per_seq:   ``[bs]``   int — per-seq HCA compress count.
       block_tables:              ``[bs, mnbs]`` int — per-seq paged blocks.
       extend_indptr:             ``[T+1]``  int.
       prefix_swa_indptr:         ``[T+1]``  int.
@@ -328,7 +321,6 @@ def write_v4_paged_prefill_indices(
     assert chunk_start_per_seq.dim() == 1
     assert cu_seqlens_q_per_seq.dim() == 1
     assert state_slot_per_seq.dim() == 1
-    assert n_committed_hca_per_seq.dim() == 1
     assert block_tables.dim() == 2
     for idp in (extend_indptr, prefix_swa_indptr, prefix_csa_indptr, prefix_hca_indptr):
         assert idp.dim() == 1 and idp.shape[0] >= T + 1
@@ -363,7 +355,6 @@ def write_v4_paged_prefill_indices(
         chunk_start_per_seq,
         cu_seqlens_q_per_seq,
         state_slot_per_seq,
-        n_committed_hca_per_seq,
         block_tables,
         block_tables.stride(0),
         extend_indptr,
@@ -396,7 +387,6 @@ def write_v4_paged_prefill_indices_reference(
     chunk_start_per_seq: torch.Tensor,
     cu_seqlens_q_per_seq: torch.Tensor,
     state_slot_per_seq: torch.Tensor,
-    n_committed_hca_per_seq: torch.Tensor,
     block_tables: torch.Tensor,
     extend_indptr: torch.Tensor,
     prefix_swa_indptr: torch.Tensor,
@@ -430,7 +420,6 @@ def write_v4_paged_prefill_indices_reference(
     pos_cpu = positions[:T].cpu().tolist()
     cs_per_seq_cpu = chunk_start_per_seq.cpu().tolist()
     cu_q_cpu = cu_seqlens_q_per_seq.cpu().tolist()
-    n_hca_cpu = n_committed_hca_per_seq.cpu().tolist()
     block_tables_cpu = block_tables.cpu()
     ext_indptr_cpu = extend_indptr.cpu().tolist()
     swa_indptr_cpu = prefix_swa_indptr.cpu().tolist()
@@ -443,8 +432,9 @@ def write_v4_paged_prefill_indices_reference(
         pos = pos_cpu[t]
         chunk_start = cs_per_seq_cpu[bid]
         cu_q = cu_q_cpu[bid]
-        # Per-token causal HCA cap (mirrors kernel + reference get_compress_topk_idxs).
-        n_hca = min((pos + 1) // hca_ratio, n_hca_cpu[bid])
+        # Per-token causal HCA visibility (mirrors kernel + reference
+        # get_compress_topk_idxs).
+        n_hca = (pos + 1) // hca_ratio
 
         token_pos_in_chunk = pos - chunk_start
         swa_low = max(pos - win + 1, 0)

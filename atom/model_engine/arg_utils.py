@@ -60,6 +60,9 @@ class EngineArgs:
     state_checkpoint_interval_tokens: int = 8192
     state_checkpoint_demand: bool = True
     enable_chunked_prefill: bool = True
+    enable_log_stats: bool = True
+    throughput_log_interval: float = 10.0
+    cache_hit_rate_window: int = 1000
     scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
     gpu_memory_utilization: float = 0.9
@@ -446,6 +449,34 @@ class EngineArgs:
             default=True,
             help="Enable chunked prefill (default: enabled). "
             "Use --no-enable_chunked_prefill to disable.",
+        )
+        parser.add_argument(
+            "--enable-log-stats",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="Log the periodic engine-status line (running/waiting reqs, "
+            "KV cache usage, prefix cache hit rate, prompt/generation "
+            "throughput; default: enabled). Use --no-enable-log-stats to "
+            "disable. Applies to offline LLM(...) as well as to the server. "
+            "Scoped to that line only: the [MTP Stats] and "
+            "[Cache Stats] lines have their own gates (--method mtp and "
+            "--enable-prefix-caching) and keep their own cadences.",
+        )
+        parser.add_argument(
+            "--throughput-log-interval",
+            type=float,
+            default=10.0,
+            help="Seconds between engine-status lines (default: 10, matching "
+            "vLLM). Must be > 0. Ignored when --no-enable-log-stats.",
+        )
+        parser.add_argument(
+            "--cache-hit-rate-window",
+            type=int,
+            default=1000,
+            help="Requests in the sliding window behind the engine-status "
+            "line's prefix cache hit rate (default: 1000, matching vLLM). "
+            "Must be > 0. Only the status line is windowed; /metrics and "
+            "[Cache Stats] stay cumulative.",
         )
         parser.add_argument(
             "--max-num-seqs",

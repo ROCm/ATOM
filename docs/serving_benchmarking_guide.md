@@ -1032,6 +1032,8 @@ script using `EngineArgs.add_cli_args`):
 | `--data-parallel-size`, `-dp` | `1` | Data parallel size |
 | `--enforce-eager` | `False` | Disable CUDA graph capture; use eager execution |
 | `--enable_prefix_caching` | `False` | Enable prefix caching |
+| `--enable-log-stats` / `--no-enable-log-stats` | `True` | Emit the periodic engine-status line (throughput, running/waiting reqs, KV usage, prefix-cache hit rate) |
+| `--throughput-log-interval` | `10.0` | Seconds between engine-status lines |
 | `--port` | `8006` | Internal engine communication port |
 | `--kv_cache_dtype` | `bf16` | KV cache dtype: `bf16` or `fp8` |
 | `--block-size` | `16` | KV cache block size |

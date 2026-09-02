@@ -518,7 +518,7 @@ class BlockManager:
         # `_gated_hit` settles the two gates jointly; neither can be applied to
         # the other's answer.
         num_cached_blocks = self._gated_hit(seq, compressed_hit, block_hashes)
-        # Instrumentation: the pre-gate hit, so CacheStats can separate reuse
+        # Instrumentation: the pre-gate hit, so EngineStats can separate reuse
         # the gates declined (compressed_hit - num_cached_blocks) from reuse
         # lost to compressed eviction (everything above compressed_hit).
         seq.num_compressed_hit_blocks = compressed_hit
@@ -884,7 +884,7 @@ class BlockManager:
         second time with every ladder dense: how far would it have reached? What
         that recovers is reuse being declined only because nobody checkpointed
         there. What it does not recover is gone whatever anybody stores. The two
-        land in `num_wanted_hit_blocks` (which `CacheStats` splits the declined
+        land in `num_wanted_hit_blocks` (which `EngineStats` splits the declined
         reuse by) and `checkpoint_demand_pos` (which the ladder acts on).
 
         The demand is a rung of this seq's own, off the interval grid, and the

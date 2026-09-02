@@ -63,7 +63,7 @@
   {
     "model_name": "DeepSeek-V4-Pro EPLB r0",
     "model_path": "deepseek-ai/DeepSeek-V4-Pro",
-    "extraArgs": "--kv_cache_dtype fp8 --index_cache_dtype fp4 -tp 8 --enable-dp-attention --enable-expert-parallel --eplb-enable --eplb-config '{\"num_redundant_experts\": 0, \"placement_policy\": \"naive\", \"rebalance_interval\": 200, \"load_window_size\": 200, \"rebalance_min_balancedness\": 2.0}'",
+    "extraArgs": "--kv_cache_dtype fp8 --index_cache_dtype fp4 -tp 8 --enable-dp-attention --enable-expert-parallel --eplb-enable --eplb-config '{\"num_redundant_experts\": 0, \"placement_policy\": \"naive\", \"rebalance_interval\": 10, \"load_window_size\": 10, \"rebalance_min_balancedness\": 2.0}'",
     "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1",
     "runner": "linux-atom-do-mi350x-8",
     "test_level": "nightly",
@@ -75,7 +75,7 @@
   {
     "model_name": "DeepSeek-V4-Pro EPLB r64 naive",
     "model_path": "deepseek-ai/DeepSeek-V4-Pro",
-    "extraArgs": "--kv_cache_dtype fp8 --index_cache_dtype fp4 -tp 8 --enable-dp-attention --enable-expert-parallel --eplb-enable --eplb-config '{\"num_redundant_experts\": 64, \"placement_policy\": \"naive\", \"rebalance_interval\": 200, \"load_window_size\": 200, \"rebalance_min_balancedness\": 2.0}'",
+    "extraArgs": "--kv_cache_dtype fp8 --index_cache_dtype fp4 -tp 8 --enable-dp-attention --enable-expert-parallel --eplb-enable --eplb-config '{\"num_redundant_experts\": 64, \"placement_policy\": \"naive\", \"rebalance_interval\": 10, \"load_window_size\": 10, \"rebalance_min_balancedness\": 2.0}'",
     "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1",
     "runner": "linux-atom-do-mi350x-8",
     "test_level": "nightly",
@@ -87,7 +87,7 @@
   {
     "model_name": "DeepSeek-V4-Pro EPLB r64 biased",
     "model_path": "deepseek-ai/DeepSeek-V4-Pro",
-    "extraArgs": "--kv_cache_dtype fp8 --index_cache_dtype fp4 -tp 8 --enable-dp-attention --enable-expert-parallel --eplb-enable --eplb-config '{\"num_redundant_experts\": 64, \"placement_policy\": \"biased\", \"rebalance_interval\": 200, \"load_window_size\": 200, \"rebalance_min_balancedness\": 2.0}'",
+    "extraArgs": "--kv_cache_dtype fp8 --index_cache_dtype fp4 -tp 8 --enable-dp-attention --enable-expert-parallel --eplb-enable --eplb-config '{\"num_redundant_experts\": 64, \"placement_policy\": \"biased\", \"rebalance_interval\": 10, \"load_window_size\": 10, \"rebalance_min_balancedness\": 2.0}'",
     "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1",
     "runner": "linux-atom-do-mi350x-8",
     "test_level": "nightly",

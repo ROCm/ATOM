@@ -82,11 +82,11 @@ def _csa_translate_pack_kernel(
     # Per-token valid_k is derived from the indptr delta we already need to
     # load anyway:
     #   kv_indptr_csa[t+1] - kv_indptr_csa[t] = skip[t] + valid_k[t]
-    # (CPU builder packs `(prefix_swa_count_or_actual_swa) + csa_valid_k`
-    # per token — see `_attach_v4_paged_decode_meta` / `_build_paged_prefill_meta`).
+    # (both builders pack `(prefix_swa_count_or_actual_swa) + csa_valid_k` per
+    # token — `build_v4_paged_decode_indptr` on the device for decode,
+    # `_build_paged_prefill_meta` on the host for prefill).
     # Reading the delta replaces the previous chain
-    # `min(min((pos+1)//ratio, n_csa_seq), index_topk)` — eliminates the
-    # `n_csa_seq` load and the `(pos+1)//ratio` compute, and stays
+    # `min((pos+1)//ratio, index_topk)` — eliminates that compute, and stays
     # CORRECT under the aiter `top_k_per_row_*` contract which only writes
     # `[0, min(k, row_length))` (the tail is uninitialized garbage from
     # `torch.empty`, never -1 — aiter tests confirm via `compare_topk_results`
@@ -158,9 +158,10 @@ def csa_translate_pack(
 
     Per-token `valid_k` is recovered from `kv_indptr_csa[t+1] - kv_indptr_csa[t]
     - skip[t]`, which equals the Indexer's per-row visibility
-    (`min((pos+1)//ratio, n_committed_csa[bid], index_topk)`) by construction
-    of the CPU-side indptr builders (see `_attach_v4_paged_decode_meta`,
-    `_build_paged_prefill_meta`). aiter's `top_k_per_row_*` writes only
+    (`min((pos+1)//ratio, index_topk)`) by construction of the indptr builders
+    (`build_v4_paged_decode_indptr` on the device for decode,
+    `_build_paged_prefill_meta` on the host for prefill). aiter's
+    `top_k_per_row_*` writes only
     `[0, valid_k)` and leaves the tail UNINITIALIZED (`torch.empty`, no
     `-1` fill), so the explicit `k_offs < valid_k` mask is what keeps the
     kernel correct — the previous `topk >= 0` check would NOT have been a

@@ -16,6 +16,8 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 
+from atom.model_ops.attentions.v4_pool_geometry import visible_csa, visible_hca
+
 ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME = "model.layers.0.atom_deepseek_v4_proxy"
 ATOM_DEEPSEEK_V4_DRAFT_PROXY_LAYER_PREFIX = "atom_deepseek_v4_draft_proxy"
 ATOM_DEEPSEEK_V4_BLOCK_SIZE = 128
@@ -793,13 +795,12 @@ class _V4DecodeMetaBuffers:
         self.state_slot_in = i32(S)
         self.state_slot_out = i32(S)
         self.n_csa = i32(S)
-        self.n_hca = i32(S)
         # Per-token mapping (sized to padded token count). int32: accepted by
         # torch advanced-indexing AND by the fused flydsl SWA scatter (which
         # loads batch_id as int32); matches the in-tree model_runner path.
         self.batch_id = CpuGpuBuffer(T, dtype=torch.int32, device=device)
         self.swa_dest_rows = {ratio: i32(T) for ratio in _V4_SWA_DEST_RATIOS}
-        self.n_committed_per_token = i32(T)
+        self.csa_n_committed_per_token = i32(T)
         self.block_tables_per_token = i32(T, self.max_blocks)
         # Ragged cumsums (T + 1) and ragged index pools (worst-case per-token
         # slot counts): SWA = win, CSA = win + index_topk, HCA = win + hca.
@@ -1449,10 +1450,7 @@ def build_atom_v4_attention_metadata(
     md.reset_slots = {md.pool_geometry.physical_slot(int(slot)) for slot in reset_slots}
 
     n_csa_cpu = (seq_np // 4).astype(np.int32)
-    n_hca_cpu = (seq_np // 128).astype(np.int32)
     md.n_committed_csa_per_seq_cpu = n_csa_cpu
-    md.n_committed_hca_per_seq_cpu = n_hca_cpu
-    md.batch_id_per_token_cpu = batch_np
     index_topk = int(md.index_topk)
 
     if decode_persistent:
@@ -1477,9 +1475,7 @@ def build_atom_v4_attention_metadata(
         bufs.n_csa.np[:num_reqs] = n_csa_cpu
         if num_reqs > scheduled_bs:
             bufs.n_csa.np[scheduled_bs:num_reqs] = index_topk
-        bufs.n_hca.np[:num_reqs] = n_hca_cpu
         md.n_committed_csa_per_seq = bufs.n_csa.copy_to_gpu(num_reqs)
-        md.n_committed_hca_per_seq = bufs.n_hca.copy_to_gpu(num_reqs)
         md.compress_plans = _make_decode_compress_plans(
             lens[:scheduled_bs], seq_np[:scheduled_bs], bufs
         )
@@ -1497,10 +1493,10 @@ def build_atom_v4_attention_metadata(
             pos_np = np.zeros(0, dtype=np.int32)
         visible_np = np.zeros(T_pad, dtype=np.int32)
         if total:
-            visible_np[:total] = np.minimum(
-                (pos_np + 1) // 4, n_csa_cpu[batch_np]
-            ).astype(np.int32)
-        md.n_committed_per_token = bufs.stage(bufs.n_committed_per_token, visible_np)
+            visible_np[:total] = visible_csa(pos_np).astype(np.int32)
+        md.csa_n_committed_per_token = bufs.stage(
+            bufs.csa_n_committed_per_token, visible_np
+        )
         block_cols = int(common_attn_metadata.block_table_tensor.shape[1])
         block_rows = bufs.block_tables_per_token.gpu[:T_pad, :block_cols]
         safe_batch_ids = md.batch_id_per_token[:T_pad].clamp_min(0).long()
@@ -1514,10 +1510,8 @@ def build_atom_v4_attention_metadata(
         _populate_decode_persistent(
             md,
             common_attn_metadata,
-            batch_np,
             pos_np,
             bufs,
-            scheduled_bs,
             total,
             T_pad,
             positions,
@@ -1557,7 +1551,6 @@ def build_atom_v4_attention_metadata(
     md.state_slot_mapping_cpu = physical_slot_arr
     md.batch_id_per_token = torch.from_numpy(batch_np).to(device)
     md.n_committed_csa_per_seq = torch.from_numpy(n_csa_cpu).to(device)
-    md.n_committed_hca_per_seq = torch.from_numpy(n_hca_cpu).to(device)
     md.compress_plans = _make_compress_plans(
         lens, seq_np, [(4, True), (128, False)], device, is_decode
     )
@@ -1566,8 +1559,8 @@ def build_atom_v4_attention_metadata(
         positions = torch.arange(total, dtype=torch.int64, device=device)
     pos_np = positions[:total].detach().cpu().numpy().astype(np.int32)
     if is_decode:
-        visible_np = np.minimum((pos_np + 1) // 4, n_csa_cpu[batch_np]).astype(np.int32)
-        md.n_committed_per_token = torch.from_numpy(visible_np).to(device)
+        visible_np = visible_csa(pos_np).astype(np.int32)
+        md.csa_n_committed_per_token = torch.from_numpy(visible_np).to(device)
         batch_ids = torch.from_numpy(batch_np).to(device=device, dtype=torch.long)
         md.block_tables_per_token = common_attn_metadata.block_table_tensor[batch_ids]
         _populate_decode(md, common_attn_metadata, batch_np, pos_np, positions)
@@ -1654,9 +1647,7 @@ def _make_decode_compress_plans(extend_lens_cpu, context_lens_cpu, bufs):
     )
 
 
-def _populate_decode_persistent(
-    md, common, batch_np, pos_np, bufs, scheduled_bs, total, T_pad, positions_gpu
-):
+def _populate_decode_persistent(md, common, pos_np, bufs, total, T_pad, positions_gpu):
     """Decode index/indptr build into persistent fixed-address buffers.
 
     Faithful port of ATOM's ``_attach_v4_paged_decode_meta`` for plugin mode:
@@ -1674,15 +1665,11 @@ def _populate_decode_persistent(
 
     win = int(md.swa_window)
     index_topk = int(md.index_topk)
-    n_csa_cpu = md.n_committed_csa_per_seq_cpu
-    n_hca_cpu = md.n_committed_hca_per_seq_cpu
 
     # Per-token slot counts over the real tokens [0:total].
     actual_swa = np.minimum(pos_np + 1, win).astype(np.int32)
-    csa_valid_k = np.minimum(
-        np.minimum((pos_np + 1) // 4, n_csa_cpu[batch_np]), index_topk
-    ).astype(np.int32)
-    n_h_per_token = n_hca_cpu[batch_np].astype(np.int32)
+    csa_valid_k = np.minimum(visible_csa(pos_np), index_topk).astype(np.int32)
+    n_h_per_token = visible_hca(pos_np).astype(np.int32)
 
     def _indptr(counts):
         out = np.zeros(T_pad + 1, dtype=np.int32)
@@ -1729,7 +1716,6 @@ def _populate_decode_persistent(
         batch_id_per_token=md.batch_id_per_token,
         positions=positions_gpu,
         hca_indptr=hca_indptr_gpu,
-        n_committed_hca_per_seq=md.n_committed_hca_per_seq,
         block_tables=common.block_table_tensor,
         hca_indices=bufs.idx_hca.gpu,
         T=total,
@@ -1773,12 +1759,9 @@ def _populate_indexer(
     bid = (md.batch_id_per_token[num_decode_tokens:] - num_decodes).to(
         md.batch_id_per_token.dtype
     )
-    n_committed_pref = md.n_committed_csa_per_seq[num_decodes:]
     pos_pref = positions[num_decode_tokens:]
     base = cu_gpu[bid].to(torch.int32)
-    end = base + torch.minimum((pos_pref + 1) // 4, n_committed_pref[bid]).to(
-        torch.int32
-    )
+    end = base + visible_csa(pos_pref).to(torch.int32)
     md.indexer_meta = {
         "total_committed": int(cu[-1]),
         "cu_committed_gpu": cu_gpu,
@@ -1871,17 +1854,10 @@ def _populate_prefill(md, common, batch_np, pos_np, q_np, positions_gpu):
     swa_low = np.maximum(pos_np - win + 1, 0)
     extend_count = np.minimum(token_pos_in_chunk + 1, win).astype(np.int32)
     prefix_swa_count = np.maximum(chunk_start_pt - swa_low, 0).astype(np.int32)
-    n_csa_pt = md.n_committed_csa_per_seq_cpu[batch_np]
-    csa_valid_k = np.minimum(
-        np.minimum((pos_np + 1) // 4, n_csa_pt), index_topk
-    ).astype(np.int32)
-    # Per-token causal cap, mirroring CSA above and the kernel
-    # (write_v4_paged_prefill_indices: n_hca = min((pos+1)//128, committed)).
-    # Without it the indptr reserves `committed` HCA slots but the kernel only
-    # writes min((pos+1)//128, committed), leaving uninitialized tail garbage.
-    n_hca_pt = np.minimum(
-        (pos_np + 1) // 128, md.n_committed_hca_per_seq_cpu[batch_np]
-    ).astype(np.int32)
+    # These SIZE each slice; `write_v4_paged_prefill_indices` FILLS it from the
+    # same two counts. Reserve exactly what it writes or the tail is garbage.
+    csa_valid_k = np.minimum(visible_csa(pos_np), index_topk).astype(np.int32)
+    n_hca_pt = visible_hca(pos_np).astype(np.int32)
 
     ext_indptr_np = _counts_to_indptr(extend_count)
     swa_indptr_np = _counts_to_indptr(prefix_swa_count)
@@ -1910,16 +1886,12 @@ def _populate_prefill(md, common, batch_np, pos_np, q_np, positions_gpu):
         np.ascontiguousarray(md.chunk_start_per_seq_cpu[:num_reqs])
     ).to(device)
     cu_q_g = torch.from_numpy(np.ascontiguousarray(q_np[:num_reqs])).to(device)
-    n_hca_seq_g = torch.from_numpy(
-        np.ascontiguousarray(md.n_committed_hca_per_seq_cpu[:num_reqs])
-    ).to(device)
     write_v4_paged_prefill_indices(
         positions=positions_gpu[:T].to(torch.int32),
         bid_per_token=md.batch_id_per_token[:T],
         chunk_start_per_seq=chunk_start_g,
         cu_seqlens_q_per_seq=cu_q_g,
         state_slot_per_seq=md.state_slot_out[:num_reqs],
-        n_committed_hca_per_seq=n_hca_seq_g,
         block_tables=common.block_table_tensor[:num_reqs],
         extend_indptr=ext_indptr,
         prefix_swa_indptr=swa_indptr,
@@ -1951,11 +1923,8 @@ def _populate_decode(md, common, batch_np, pos_np, positions_gpu):
     win = int(md.swa_window)
     index_topk = int(md.index_topk)
     swa_counts = np.minimum(pos_np + 1, win).astype(np.int32)
-    csa_counts = np.minimum(
-        np.minimum((pos_np + 1) // 4, index_topk),
-        md.n_committed_csa_per_seq_cpu[batch_np],
-    ).astype(np.int32)
-    hca_counts = md.n_committed_hca_per_seq_cpu[batch_np].astype(np.int32)
+    csa_counts = np.minimum(visible_csa(pos_np), index_topk).astype(np.int32)
+    hca_counts = visible_hca(pos_np).astype(np.int32)
     swa_indptr_np = _counts_to_indptr(swa_counts)
     csa_indptr_np = _counts_to_indptr(swa_counts + csa_counts)
     hca_indptr_np = _counts_to_indptr(swa_counts + hca_counts)
@@ -1999,7 +1968,6 @@ def _populate_decode(md, common, batch_np, pos_np, positions_gpu):
         batch_id_per_token=md.batch_id_per_token,
         positions=positions_gpu,
         hca_indptr=hca_indptr,
-        n_committed_hca_per_seq=md.n_committed_hca_per_seq,
         block_tables=common.block_table_tensor,
         hca_indices=hca_indices,
         T=T,

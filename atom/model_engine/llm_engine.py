@@ -406,7 +406,7 @@ class LLMEngine:
         # `reusable`, not `full`: a request's trailing block is never a reuse
         # candidate (prefill must forward one block for logits), so `full`
         # charges both pools for tokens neither was offered and caps every
-        # rate below 100%. See `CacheStats.total_reusable_tokens`.
+        # rate below 100%. See `EngineStats.total_reusable_tokens`.
         reusable = totals["reusable_tokens"]
 
         def rate(num: int, den: int = reusable) -> float:
@@ -428,7 +428,7 @@ class LLMEngine:
             # wrong pool. `compressed_hit` above is already the paged pool's
             # half of the same split and the two multiply back to `hit`, so a
             # `paged_hit` alias for it was a second name for one number.
-            # See `CacheStats.paged_hit_rate` / `state_hit_rate`.
+            # See `EngineStats.paged_hit_rate` / `state_hit_rate`.
             "state_hit": rate(totals["cached_tokens"], compressed),
             "state_recoverable_loss": rate(
                 totals["wanted_tokens"] - totals["cached_tokens"], compressed
@@ -450,6 +450,17 @@ class LLMEngine:
 
         def summed(key: str) -> int:
             return sum(int(stats.get(key, 0)) for stats in rank_stats)
+
+        # Queue depths cannot be summed across a P/D pair: one in-flight
+        # request sits in the prefill rank's `running` and the decode rank's
+        # `prefill_waiting` at once. The decode side's four queues already
+        # span the whole lifetime, so it alone is the full picture. Falls back
+        # to every rank when no decode rank reported — non-P/D, or before the
+        # decode engine's first push, where nothing is duplicated yet.
+        queue_stats = [s for s in rank_stats if s.get("role") == "decode"] or rank_stats
+
+        def summed_queues(key: str) -> int:
+            return sum(int(stats.get(key, 0)) for stats in queue_stats)
 
         kv_total = summed("kv_blocks_total")
         kv_used = summed("kv_blocks_used")
@@ -499,6 +510,10 @@ class LLMEngine:
             key: sum(int(stats.get(key, 0)) for stats in cache_rank_stats)
             for key in cache_keys
         }
+        # NOTE: `full`, while `get_cache_statistics` divides by `reusable`, so
+        # this endpoint reads lower for the same engine — `full` counts the
+        # trailing block no cache is offered, and that fixed size weighs more
+        # on shorter prompts. Pre-existing; don't compare the two endpoints.
         cache_full = cache_totals["full_tokens"]
         offload_rank_stats = [
             stats.get("offload", {}) for stats in rank_stats if stats.get("offload")
@@ -519,8 +534,8 @@ class LLMEngine:
 
         return {
             "enabled": bool(rank_stats),
-            "requests_running": summed("requests_running"),
-            "requests_waiting": summed("requests_waiting"),
+            "requests_running": summed_queues("requests_running"),
+            "requests_waiting": summed_queues("requests_waiting"),
             "requests_parked_kv_load": summed("requests_parked_kv_load"),
             "requests_partial_prefill": summed("requests_partial_prefill"),
             "requests_finished": summed("requests_finished"),

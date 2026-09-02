@@ -140,7 +140,7 @@ class BlockPool:
     def eviction_stats(self) -> dict[str, int]:
         """Content this pool destroyed, and the headroom it has left.
 
-        Counters, not rates, for the same reason `CacheStats.get_statistics`
+        Counters, not rates, for the same reason `EngineStats.cache_statistics`
         hands back counts: a rate cannot be summed across DP ranks that saw
         different traffic.
         """

@@ -7,6 +7,7 @@ ATOM (AiTer Optimized Model) uses a prefill-first scheduler with paged KV cache 
 | Class | File | Purpose |
 |---|---|---|
 | `Scheduler` | `atom/model_engine/scheduler.py` | Orchestrates prefill/decode scheduling, preemption, and postprocessing |
+| `EngineStats` | `atom/model_engine/engine_stats.py` | MTP acceptance, prefix-cache hit, and throughput statistics |
 | `ScheduledBatch` | `atom/model_engine/scheduler.py` | Immutable snapshot of a scheduled batch sent to the model runner |
 | `ScheduledBatchOutput` | `atom/model_engine/scheduler.py` | Holds sampled token IDs and draft token IDs returned from forward pass |
 | `BlockManager` | `atom/model_engine/block_manager.py` | Manages paged KV cache blocks with allocation, deallocation, and prefix caching |
@@ -741,7 +742,8 @@ def num_tokens(self, value):
 
 | File | Description |
 |---|---|
-| `atom/model_engine/scheduler.py` | `Scheduler`, `ScheduledBatch`, `ScheduledBatchOutput` — scheduling algorithm, postprocessing, speculative decode stats |
+| `atom/model_engine/scheduler.py` | `Scheduler`, `ScheduledBatch`, `ScheduledBatchOutput` — scheduling algorithm, postprocessing |
+| `atom/model_engine/engine_stats.py` | `EngineStats` — speculative-decode acceptance, prefix-cache hit, and throughput statistics |
 | `atom/model_engine/block_manager.py` | `Block`, `BlockManager` — paged KV cache block pool, allocation/deallocation, prefix caching with xxhash64 |
 | `atom/model_engine/sequence.py` | `Sequence`, `SequenceStatus`, `SequenceType` — request lifecycle, token management, timing |
 | `atom/model_engine/request.py` | `RequestOutput` — streaming output dataclass with `request_id`, `output_tokens`, `finished`, `finish_reason` |

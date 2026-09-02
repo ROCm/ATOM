@@ -37,6 +37,41 @@ def _pcp_active_for_draft_model(draft_model: nn.Module) -> bool:
     return _pcp_active_v4()
 
 
+def _pcp_split_draft_inputs(
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    hidden_states: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+    """Split a draft prefill onto this rank's 1/pcp query shard.
+
+    A draft prefill reuses the target's attn_metadata, already reindexed to
+    1/pcp by the builder, so its q rows must be split to match or aiter aborts
+    on `kv_indptr_prefix length must be N+1`. Both draft prefill entry points
+    need this: `propose()`'s i==0 step and `precompute_context_kv`.
+
+    Callers gate on `_pcp_active_for_draft_model` first. Returns the shards
+    plus (n_global, pcp_ws) for callers that must all-gather back.
+
+    Assumes 1-D positions: MRoPE's `[3, N]` layout puts the token axis last,
+    which the pad-and-split below would corrupt. No MRoPE model can reach the
+    PCP draft path today.
+    """
+    pcp_ws = get_pcp_world_size()
+    n_global = input_ids.shape[0]
+    assert positions.shape[0] == n_global and hidden_states.shape[0] == n_global, (
+        f"draft PCP split needs row-aligned inputs: ids={n_global} "
+        f"pos={positions.shape[0]} hidden={hidden_states.shape[0]}"
+    )
+    n_pad = pcp_pad_len(n_global, pcp_ws) - n_global
+    return (
+        pcp_round_robin_split(pcp_pad_dense(input_ids, n_pad), pcp_ws),
+        pcp_round_robin_split(pcp_pad_dense(positions, n_pad), pcp_ws),
+        pcp_round_robin_split(pcp_pad_dense(hidden_states, n_pad), pcp_ws),
+        n_global,
+        pcp_ws,
+    )
+
+
 class EagleProposer(Drafter):
     """Serial speculative drafter: plain MTP and EAGLE3.
 
@@ -93,6 +128,7 @@ class EagleProposer(Drafter):
         if self.runner.use_mrope or self.mtp_k < 2:
             # mtp_k == 1 has no step 1+, so warming one would capture a graph
             # `propose` can never reach.
+            self._reuse_step_buffers = False
             return ()
         draft_hf = self.speculative_config.draft_model_hf_config
         # DeepSeek-V4 carries the mHC residual, so its hidden is [N, hc, dim]
@@ -115,6 +151,11 @@ class EagleProposer(Drafter):
                 dtype=self.dtype,
             ),
         }
+        # Keep this capability at the non-compiled call site. DeepSeekMTPModel
+        # has the two-dimensional hidden-state and shared-head contracts needed
+        # to feed its fixed graph inputs directly; other draft architectures
+        # remain on the owned-output path.
+        self._reuse_step_buffers = draft_hf.architectures[0] == "DeepSeekMTPModel"
         self.step = DraftGraph(
             forward=self._step_forward,
             epilogue=self._step_head,
@@ -139,7 +180,7 @@ class EagleProposer(Drafter):
             input_ids=input_ids, positions=positions, hidden_states=hidden_states
         )
 
-    def _step_head(self, out, running_bs, **_):
+    def _step_head(self, out, running_bs, *, input_ids, hidden_states, **_):
         """The mid-step's draft ids, recorded with the backbone that made them.
 
         Both come back because the next mid-step reads the hidden states and
@@ -147,6 +188,10 @@ class EagleProposer(Drafter):
         `[:scheduled_bs]`: a capture bakes the length it was made at. Slicing
         is the caller's, on the way out.
         """
+        if self._reuse_step_buffers:
+            hidden_states.copy_(out[:running_bs])
+            self.model.compute_draft_ids(hidden_states, out=input_ids)
+            return hidden_states, input_ids
         return out, self.model.compute_draft_ids(out)
 
     def _build_draft_model(self, model_class) -> nn.Module:
@@ -306,13 +351,25 @@ class EagleProposer(Drafter):
         input_ids = self.runner.tokenID_processor.input_ids.gpu[1 : num_tokens + 1]
         input_ids.scatter_(0, last_token_indices, anchor_ids)
 
+        d_input_ids = input_ids
+        d_positions = positions[:num_tokens] + 1
+        d_hidden = draft_hidden
+        # Same split as propose()'s i==0 step: this pass reuses the same
+        # 1/pcp-reindexed attn_metadata. Only q is sharded -- attention
+        # all-gathers K/V back to full order before writing, so every rank still
+        # ends up with the whole draft KV.
+        if _pcp_active_for_draft_model(self.model):
+            d_input_ids, d_positions, d_hidden, _, _ = _pcp_split_draft_inputs(
+                d_input_ids, d_positions, d_hidden
+            )
+
         was_draft = context.is_draft
         context.is_draft = True
         try:
             self.model(
-                input_ids=input_ids,
-                positions=positions[:num_tokens] + 1,
-                hidden_states=draft_hidden,
+                input_ids=d_input_ids,
+                positions=d_positions,
+                hidden_states=d_hidden,
             )
         finally:
             context.is_draft = was_draft
@@ -550,18 +607,13 @@ class EagleProposer(Drafter):
                 # full `last_token_indices`) is unchanged.
                 pcp_draft_prefill = i == 0 and _pcp_active_for_draft_model(self.model)
                 if pcp_draft_prefill:
-                    pcp_ws = get_pcp_world_size()
-                    n_global_draft = input_ids.shape[0]
-                    n_pad = pcp_pad_len(n_global_draft, pcp_ws) - n_global_draft
-                    d_input_ids = pcp_round_robin_split(
-                        pcp_pad_dense(input_ids, n_pad), pcp_ws
-                    )
-                    d_positions = pcp_round_robin_split(
-                        pcp_pad_dense(positions, n_pad), pcp_ws
-                    )
-                    d_hidden = pcp_round_robin_split(
-                        pcp_pad_dense(hidden_states, n_pad), pcp_ws
-                    )
+                    (
+                        d_input_ids,
+                        d_positions,
+                        d_hidden,
+                        n_global_draft,
+                        pcp_ws,
+                    ) = _pcp_split_draft_inputs(input_ids, positions, hidden_states)
                 else:
                     d_input_ids, d_positions, d_hidden = (
                         input_ids,
@@ -600,11 +652,26 @@ class EagleProposer(Drafter):
                 # Step 0 gathers one row per sequence out of the token stream;
                 # steps 1+ already are one row per sequence -- sliced back off
                 # the padded batch, so nothing downstream sees a pad row.
-                sample_hidden_states = (
-                    torch.index_select(ret_hidden_states, 0, last_token_indices)
-                    if i == 0
-                    else ret_hidden_states[:scheduled_bs]
-                )
+                if i == 0:
+                    hidden_out = (
+                        self.step.buffer("hidden_states", scheduled_bs)
+                        if self._reuse_step_buffers
+                        else None
+                    )
+                    sample_hidden_states = (
+                        torch.index_select(
+                            ret_hidden_states,
+                            0,
+                            last_token_indices,
+                            out=hidden_out,
+                        )
+                        if hidden_out is not None
+                        else torch.index_select(
+                            ret_hidden_states, 0, last_token_indices
+                        )
+                    )
+                else:
+                    sample_hidden_states = ret_hidden_states[:scheduled_bs]
                 # Only step 0 and a flavor with no declared pass land here; a
                 # recorded mid-step produced its ids inside the graph.
                 # Every draft model EagleProposer can build implements this --
@@ -615,11 +682,30 @@ class EagleProposer(Drafter):
                 # compute_logits().argmax(-1) here because is_draft suppresses
                 # the LM head's prefill last-token slice. How the ids are
                 # produced stays the model's business, not this loop's.
-                new_draft_ids = (
-                    graphed_ids[:scheduled_bs]
-                    if graphed_ids is not None
-                    else self.model.compute_draft_ids(sample_hidden_states)
+                ids_out = (
+                    self.step.buffer("input_ids", scheduled_bs)
+                    if self._reuse_step_buffers
+                    and graphed_ids is None
+                    and i + 1 < self.mtp_k
+                    else None
                 )
+                if graphed_ids is not None:
+                    next_input_ids = graphed_ids[:scheduled_bs]
+                    # The fixed ids feed the next replay, but exported draft ids
+                    # need owned storage that a later replay cannot overwrite
+                    # while their assembled matrix is copied to the host.
+                    new_draft_ids = (
+                        next_input_ids.clone()
+                        if self._reuse_step_buffers
+                        else next_input_ids
+                    )
+                else:
+                    new_draft_ids = (
+                        self.model.compute_draft_ids(sample_hidden_states, out=ids_out)
+                        if ids_out is not None
+                        else self.model.compute_draft_ids(sample_hidden_states)
+                    )
+                    next_input_ids = new_draft_ids
                 draft_token_ids[:, i] = new_draft_ids
 
                 if i < self.mtp_k - 1:
@@ -720,7 +806,7 @@ class EagleProposer(Drafter):
                     if running_bs > scheduled_bs:
                         attn_metadata.slot_mapping[scheduled_bs:] = -1
 
-                    input_ids = new_draft_ids
+                    input_ids = next_input_ids
                     hidden_states = sample_hidden_states
 
         # self.runner.debug(f"final {draft_token_ids=}")

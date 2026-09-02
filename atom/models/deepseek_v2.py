@@ -89,8 +89,7 @@ from atom.model_ops.attention_mla import (
 )
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.dcp_ops import (
-    dcp_decode_candidate_exchange,
-    triton_filter_and_convert_dcp_index,
+    dcp_decode_candidate_exchange_fused,
     triton_filter_and_convert_dcp_index_prefill,
 )
 from atom.model_ops.embed_head import (
@@ -1662,53 +1661,58 @@ def sparse_attn_indexer(
         batch_size, next_n, _heads, _ = padded_q_fp8_decode_tokens.shape
         num_rows = batch_size * next_n
         dcp_world_size = get_dcp_world_size()
-        logits = None
+        assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
         if dcp_world_size > 1:
-            dcp_rank = get_dcp_rank()
-            dcp_decode_candidate_exchange(
+            # The fused exchange scores this rank's own shard and writes the KV
+            # slots it owns -- ownership filter, slot localize and compaction all
+            # inside the op -- straight into sparse_kv_indices_buffer and
+            # dcp_sparse_kv_indptr_buffer. So there is no global logits plane
+            # left to rank and no topk_indices left to convert: everything the
+            # non-DCP path does below has already happened, and we return here.
+            dcp_decode_candidate_exchange_fused(
                 attn_metadata,
                 padded_q_fp8_decode_tokens,
                 kv_cache,
                 weights,
-                topk_indices,
-                dcp_rank,
+                get_dcp_rank(),
                 num_decode_tokens,
                 topk_tokens,
                 max_model_len,
                 runner_block_size,
                 stable_topk,
                 cp_kv_cache_interleave_size,
+                out_kv_indices=sparse_kv_indices_buffer,
+                out_kv_indptr=dcp_sparse_kv_indptr_buffer,
+                owned_counts=dcp_owned_counts_buffer,
             )
-        else:
-            logits = torch.empty(
-                [num_rows, max_model_len], dtype=torch.float32, device="cuda"
-            )
-            deepgemm_fp8_paged_mqa_logits(
-                padded_q_fp8_decode_tokens,
-                kv_cache,
-                weights[:num_padded_tokens],
-                logits,
-                decode_metadata.context_lens,
-                attn_metadata.block_tables,
-                max_model_len,
-                KVBlockSize=runner_block_size,
-                Preshuffle=True,
-            )
-        assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
-        if logits is not None:
-            # Non-DCP: one rank holds the whole plane, so top-k is already
-            # global. The DCP branch produced topk_indices_decode itself.
-            topk_indices_decode = topk_indices[:num_decode_tokens, :topk_tokens]
-            top_k_per_row_decode(
-                logits,
-                next_n,
-                decode_metadata.context_lens,
-                topk_indices_decode,
-                num_rows,
-                logits.stride(0),
-                logits.stride(1),
-                stable=stable_topk,
-            )
+            return weights
+        # Non-DCP: this rank holds the whole plane, so its top-k is already the
+        # global one.
+        logits = torch.empty(
+            [num_rows, max_model_len], dtype=torch.float32, device="cuda"
+        )
+        deepgemm_fp8_paged_mqa_logits(
+            padded_q_fp8_decode_tokens,
+            kv_cache,
+            weights[:num_padded_tokens],
+            logits,
+            decode_metadata.context_lens,
+            attn_metadata.block_tables,
+            max_model_len,
+            KVBlockSize=runner_block_size,
+            Preshuffle=True,
+        )
+        topk_indices_decode = topk_indices[:num_decode_tokens, :topk_tokens]
+        top_k_per_row_decode(
+            logits,
+            next_n,
+            decode_metadata.context_lens,
+            topk_indices_decode,
+            num_rows,
+            logits.stride(0),
+            logits.stride(1),
+            stable=stable_topk,
+        )
         if attn_metadata.max_seqlen_q > 1:
             triton_gather_kv_indices_sparse(
                 attn_metadata.sparse_kv_indptr,
@@ -1718,27 +1722,6 @@ def sparse_attn_indexer(
                 attn_metadata.kv_indptr,
                 NUM_TOPK_TOKENS=topk_tokens,
                 out=sparse_kv_indices_buffer,
-            )
-        elif dcp_world_size > 1:
-            # topk_indices now hold GLOBAL positions. Keep only this rank's owned
-            # tokens ((p//S)%W == r), de-interleave to the local index, map to the
-            # local main-KV slot, and COMPACT them to the front -- non-owned
-            # positions are dropped, not marked with -1, because holes break
-            # aiter's lse output. The compacted per-request lengths are written
-            # into dcp_sparse_kv_indptr_buffer for this layer's attention.
-            triton_filter_and_convert_dcp_index(
-                attn_metadata.cu_seqlens_q,
-                attn_metadata.g_kv_indptr,
-                attn_metadata.block_tables,
-                topk_indices,
-                dcp_rank,
-                dcp_world_size,
-                runner_block_size,
-                out_kv_indptr=dcp_sparse_kv_indptr_buffer,
-                owned_counts=dcp_owned_counts_buffer,
-                NUM_TOPK_TOKENS=topk_tokens,
-                out=sparse_kv_indices_buffer,
-                cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
             )
         else:
             triton_convert_req_index_to_global_index(
