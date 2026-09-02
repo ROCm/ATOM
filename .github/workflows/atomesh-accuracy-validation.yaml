@@ -44,6 +44,7 @@ env:
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id || github.sha }}
   # workflow_dispatch: inputs.aiter_branch; otherwise main (matches previous default-branch shallow clone)
   AITER_GIT_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.aiter_branch || 'main' }}
+  AITER_PER_QUERY_CONTEXT_COMMIT: 8e350562c823a3a1de2eb4e82f2561a7e231fa44
 
 jobs:
   check-signal:
@@ -226,6 +227,10 @@ jobs:
           RUN rm -rf /app/aiter-test
           RUN git clone --filter=blob:none -b ${{ env.AITER_GIT_REF }} https://github.com/ROCm/aiter.git /app/aiter-test && \\
               cd /app/aiter-test && \\
+              git fetch origin ${{ env.AITER_PER_QUERY_CONTEXT_COMMIT }} && \\
+              if ! git merge-base --is-ancestor ${{ env.AITER_PER_QUERY_CONTEXT_COMMIT }} HEAD; then \\
+                git -c user.name=ATOM-CI -c user.email=atom-ci@amd.com cherry-pick ${{ env.AITER_PER_QUERY_CONTEXT_COMMIT }}; \\
+              fi && \\
               git submodule sync && git submodule update --init --recursive && \\
               MAX_JOBS=64 PREBUILD_KERNELS=0 GPU_ARCHS=gfx950 python3 setup.py develop
           RUN echo "=== Aiter version AFTER installation ===" && pip show amd-aiter || true
