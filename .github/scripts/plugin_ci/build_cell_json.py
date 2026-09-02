@@ -46,7 +46,7 @@ def main():
         "runner": {
             "slurm_submit_runner": os.environ.get(
                 "PLUGIN_CI_SLURM_SUBMIT_RUNNER",
-                "atom-mi355-8gpu-vllm-sgl-ci",
+                "spur-runner-mi355x-8gpu",
             ),
             "slurm_account": os.environ.get("PLUGIN_CI_SLURM_ACCOUNT", "amd-aifw-dev"),
             "slurm_partition": os.environ.get("PLUGIN_CI_SLURM_PARTITION", "amd-spur"),

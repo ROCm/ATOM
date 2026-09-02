@@ -88,7 +88,7 @@ def q(value):
     return shlex.quote(str(shell_value(value)))
 
 slurm_submit_runner = runner.get(
-    "slurm_submit_runner", "atom-mi355-8gpu-vllm-sgl-ci"
+    "slurm_submit_runner", "spur-runner-mi355x-8gpu"
 )
 
 default_spur_accounting_addr = "http://crs-m2m-cpu-spur-005.crusoe.amd.com:6819"
