@@ -229,6 +229,7 @@ EOF
     -v "${RUN_DIR}":/run_logs/slurm_job-"${JOB_ID}"
     -v /mnt:/mnt
     -v /data:/data
+    -v /home/junyyang/models:/home/junyyang/models:ro
   )
   if [[ -d /shared_nfs ]]; then
     docker_args+=(-v /shared_nfs:/shared_nfs)
@@ -618,6 +619,7 @@ for execution_phase in "${EXECUTION_PHASES[@]}"; do
         -v /mnt:/mnt \
         -v /data:/data \
         -v /it-share:/it-share \
+        -v /home/junyyang/models:/home/junyyang/models:ro \
         "${nested_docker_args[@]}" \
         "'"${DOCKER_IMAGE}"'" \
         bash -lc "cd /workspace/ATOM && bash .github/scripts/atomesh/pd_server_atom.sh" \
