@@ -71,14 +71,11 @@ class EagleProposer(Drafter):
         return self.speculative_config.num_speculative_tokens or 0
 
     def _declare_draft_graphs(self):
-        """The V4 first step and the generic mid-step pass.
+        """The generic mid-step pass: draft steps 1..k-1, one row per sequence.
 
-        DeepSeek-V4's capture builder now produces the exact synthetic decode
-        rectangle step 0 needs: ``bs * (mtp_k + 1)`` rows, with persistent
-        metadata buffers shared by runtime decode.  Capture that path so its
-        three tiny TP all-reduces are launched together on every rank.  Keep it
-        deliberately narrow for now: V4 plain MTP, no MRoPE, TP-only (DP=1).
-        Prefill and any non-rectangular serving step still take the eager path.
+        Step 0 counts tokens, not sequences, and its layout is model-specific.
+        The common proposer leaves it eager; a model-specific proposer may
+        declare a graph for it through the step-0 hooks below.
 
         Unlike DSpark's block, this pass does not carry its own metadata; it
         reads the target's, which ``_enter_decode_metadata`` rewrites to one row
@@ -91,47 +88,13 @@ class EagleProposer(Drafter):
         capture a ONE-dimensional-positions shape that serving never runs --
         graphs nobody replays, paid for at every startup.
         """
-        self.first_step = None
         self.step = None
-        graphs = []
         draft_hf = self.speculative_config.draft_model_hf_config
-        hc = getattr(draft_hf, "hc_mult", None)
-        is_v4_mtp = self.model.__class__.__name__ == "DeepseekV4MTP"
-        parallel = self.config.parallel_config
-        if (
-            is_v4_mtp
-            and not self.runner.use_mrope
-            and parallel.data_parallel_size == 1
-            and getattr(parallel, "decode_context_parallel_size", 1) == 1
-            and getattr(self.config, "prefill_context_parallel_size", 1) == 1
-            and not getattr(self.config, "enable_tbo", False)
-            and not getattr(self.config, "enable_expert_parallel", False)
-            and not getattr(self, "_share_mtp_indices", False)
-            and hc is not None
-        ):
-            q = self.mtp_k + 1
-            self.first_step = DraftGraph(
-                forward=self._first_step_forward,
-                epilogue=self._first_step_head,
-                capture_epilogue=True,
-                tokens_per_seq=q,
-                inputs={
-                    "input_ids": StagedInput(shape=(q,), dtype=torch.int32),
-                    "positions": StagedInput(shape=(q,), dtype=torch.int64),
-                    "hidden_states": StagedInput(
-                        shape=(q, hc, draft_hf.hidden_size), dtype=self.dtype
-                    ),
-                    "last_token_indices": StagedInput(dtype=torch.int32),
-                },
-                warmup_inputs=self._first_step_warmup_inputs,
-            )
-            graphs.append(self.first_step)
-
         if self.runner.use_mrope or self.mtp_k < 2:
             # mtp_k == 1 has no step 1+, so warming one would capture a graph
             # `propose` can never reach.
             self._reuse_step_buffers = False
-            return tuple(graphs)
+            return ()
         # DeepSeek-V4 carries the mHC residual, so its hidden is [N, hc, dim]
         # rather than [N, dim]. `hc_mult` is absent on every architecture that
         # does not, which is exactly the two-dimensional case.
@@ -164,36 +127,25 @@ class EagleProposer(Drafter):
             inputs=inputs,
             warmup_inputs=self._step_warmup_inputs,
         )
-        graphs.append(self.step)
-        return tuple(graphs)
+        return (self.step,)
 
-    def _first_step_forward(
-        self, running_bs, *, input_ids, positions, hidden_states, **_
+    def _select_step0_graph(
+        self, scheduled_bs, input_ids, positions, hidden_states, last_token_indices
+    ) -> DraftGraph | None:
+        """Return a replayable model-specific step-0 graph, if one exists."""
+        return None
+
+    def _stage_step0_graph_inputs(
+        self,
+        graph,
+        running_bs,
+        input_ids,
+        positions,
+        hidden_states,
+        last_token_indices,
     ):
-        """V4 step 0 over the target's full rectangular decode stream."""
-        return self.model(
-            input_ids=input_ids.flatten(0, 1),
-            positions=positions.flatten(0, 1),
-            hidden_states=hidden_states.flatten(0, 1),
-        )
-
-    def _first_step_head(self, out, running_bs, *, last_token_indices, **_):
-        """Keep only the per-sequence row that feeds step 1 and the LM head."""
-        sample_hidden = torch.index_select(out, 0, last_token_indices)
-        return sample_hidden, self.model.compute_draft_ids(sample_hidden)
-
-    def _first_step_warmup_inputs(
-        self, running_bs, *, positions, last_token_indices, **_
-    ):
-        """Seed the recording with the same positions as a full-q decode."""
-        q = self.mtp_k + 1
-        fc = get_forward_context()
-        positions.copy_(fc.context.positions[: running_bs * q].view(running_bs, q) + 1)
-        last_token_indices.copy_(
-            torch.arange(
-                q - 1, running_bs * q, q, device=self.device, dtype=torch.int32
-            )
-        )
+        """Stage model-specific step-0 inputs after `_select_step0_graph`."""
+        raise NotImplementedError
 
     def _step_forward(self, running_bs, *, input_ids, positions, hidden_states):
         """One mid-step draft forward at ``running_bs`` rows.
@@ -403,23 +355,6 @@ class EagleProposer(Drafter):
             "positions": positions,
         }
 
-    def _stage_first_step_inputs(
-        self, running_bs, input_ids, positions, hidden_states, last_token_indices
-    ):
-        """Group the flat target rectangle by sequence and stage step 0."""
-        q = self.mtp_k + 1
-        return self.first_step.stage(
-            running_bs,
-            {
-                "input_ids": input_ids.view(running_bs, q),
-                "positions": positions.view(running_bs, q),
-                "hidden_states": hidden_states.view(
-                    running_bs, q, *hidden_states.shape[1:]
-                ),
-                "last_token_indices": last_token_indices,
-            },
-        )
-
     def _step_warmup_inputs(self, running_bs, **staged):
         """Put the warmup context into the shape a mid-step sees.
 
@@ -602,31 +537,16 @@ class EagleProposer(Drafter):
         # every iteration (used at i>=1 too, even though i==0 sets it).
         has_flat_kv = "kv_indices" in var
 
-        # V4 step 0 replays only for the exact full-q decode rectangle it was
-        # recorded at.  Anything dynamic (prefill/ragged/DP padding/layout or
-        # dtype mismatch) stays on the established eager path.
-        q = self.mtp_k + 1
-        first_step_graphed = (
-            self.first_step is not None
-            and self.first_step.is_captured(scheduled_bs)
-            and not context.is_prefill
-            and scheduled_bs == context.running_bs
-            and input_ids.shape == (scheduled_bs * q,)
-            and positions.shape == (scheduled_bs * q,)
-            and hidden_states.shape[0] == scheduled_bs * q
-            and last_token_indices.shape == (scheduled_bs,)
-            and input_ids.dtype == torch.int32
-            and positions.dtype == torch.int64
-            and hidden_states.dtype == self.dtype
-            and last_token_indices.dtype == torch.int32
-            and input_ids.is_contiguous()
-            and positions.is_contiguous()
-            and hidden_states.is_contiguous()
-            and attn_metadata.max_seqlen_q == q
+        step0_graph = self._select_step0_graph(
+            scheduled_bs,
+            input_ids,
+            positions,
+            hidden_states,
+            last_token_indices,
         )
         step0_label = (
-            self.first_step.label(scheduled_bs, scheduled_bs)
-            if first_step_graphed
+            step0_graph.label(scheduled_bs, scheduled_bs)
+            if step0_graph is not None
             else f"bs={scheduled_bs}"
         )
         mid_label = (
@@ -688,14 +608,11 @@ class EagleProposer(Drafter):
                 # steps 1+ skip it and read the compacted sparse_kv buffer.
                 if self._share_mtp_indices and i == 0:
                     self.model.model.set_skip_topk(False)
-                if i == 0 and first_step_graphed:
-                    # The full step -- backbone, last-row gather, and argmax
-                    # collectives -- was recorded together.  Returning only the
-                    # selected rows avoids copying the full-q hidden tensor out
-                    # of the graph pool.
-                    sample_hidden_states, graphed_ids = self.first_step.run(
+                if i == 0 and step0_graph is not None:
+                    sample_hidden_states, graphed_ids = step0_graph.run(
                         scheduled_bs,
-                        **self._stage_first_step_inputs(
+                        **self._stage_step0_graph_inputs(
+                            step0_graph,
                             scheduled_bs,
                             d_input_ids,
                             d_positions,
@@ -732,7 +649,7 @@ class EagleProposer(Drafter):
                 # Step 0 gathers one row per sequence out of the token stream;
                 # steps 1+ already are one row per sequence -- sliced back off
                 # the padded batch, so nothing downstream sees a pad row.
-                if not (i == 0 and first_step_graphed):
+                if not (i == 0 and step0_graph is not None):
                     if i == 0:
                         hidden_out = (
                             self.step.buffer("hidden_states", scheduled_bs)
