@@ -587,9 +587,11 @@ def _fake_head(batch):
         pp_transport=MagicMock(),
         scheduler=MagicMock(),
         _poll_kv_transfer_progress=MagicMock(),
+        _poll_dynamic_chunking_calibration=MagicMock(),
     )
     head.scheduler.schedule.side_effect = [(batch, {}), None]
     head.scheduler.take_rejected.return_value = None
+    head.pp_transport.recv_completion.return_value = None
     head._dispatch_connector_only_batch = (
         PPEngineCoreProc._dispatch_connector_only_batch.__get__(head)
     )

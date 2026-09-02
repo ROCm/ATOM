@@ -31,6 +31,11 @@ import numpy as np
 from atom.config import Config
 from atom.kv_transfer.disaggregation import KVConnectorOutput
 from atom.model_engine.block_manager import BlockManager
+from atom.model_engine.dynamic_chunking import (
+    CALIBRATION_SWEEP_RATIO,
+    ChunkSizePredictor,
+    has_sole_prefill,
+)
 from atom.model_engine.engine_stats import EngineStats
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import (
@@ -47,6 +52,8 @@ from atom.model_engine.state_runtime import (
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
+
+_DYNAMIC_CHUNKING_SUPPLY_WINDOW = 16
 
 
 def _prompt_tokens_of(result) -> int:
@@ -505,8 +512,25 @@ class Scheduler:
         self._detailed_annotation_enabled = envs.ATOM_ENABLE_DETAILED_ANNOTATION
 
         self.enable_chunked_prefill = config.enable_chunked_prefill
-        # Running seqs currently mid-prefill; counter lets schedule() skip the
-        # running-queue scan on pure-decode steps.
+        self.pipeline_parallel_size = getattr(config, "pipeline_parallel_size", 1)
+        self.dynamic_chunking_smooth_factor = getattr(
+            config, "dynamic_chunking_smooth_factor", 0.75
+        )
+        self.dynamic_chunking_min_chunk_size = getattr(
+            config, "dynamic_chunking_min_chunk_size", 4096
+        )
+        self.enable_dynamic_chunking = getattr(config, "enable_dynamic_chunking", False)
+        # Installed after runtime calibration; None keeps fixed/sweep chunking.
+        self.dynamic_chunk_predictor: ChunkSizePredictor | None = None
+        self._calibrating = self.enable_dynamic_chunking
+        # Alternate calibration base size per request.
+        self._calibration_sweep_alternate = False
+        # Suppress dynamic sizing after recent multi-prefill supply.
+        self._recent_prefill_supply: deque[int] = deque(
+            maxlen=_DYNAMIC_CHUNKING_SUPPLY_WINDOW
+        )
+        # Prefix-cache SWA correctness is enforced by BlockManager.
+        # Count partial prefills to skip queue scans on decode-only steps.
         self._partial_prefill_count: int = 0
         self._schedule_tick: int = 0
 
@@ -981,6 +1005,12 @@ class Scheduler:
         decoding already-running sequences.
         """
         self._schedule_tick += 1
+        if self.enable_dynamic_chunking:
+            # Sampled before the queues move, so `_dynamic_chunk_limit` sees how
+            # much prefill work the pipeline has had, not just what is left now.
+            self._recent_prefill_supply.append(
+                self._partial_prefill_count + len(self.waiting)
+            )
         # Sources borrowed by the previous batch: its forward has been issued,
         # so they can go back on the free list.
         self.block_manager.complete_previous_state_batch()
@@ -1040,7 +1070,11 @@ class Scheduler:
                     remaining = self.long_prefill_token_threshold
                 budget_remaining = self.max_num_batched_tokens - num_batched_tokens
                 chunk = self._chunked_prefill_size(
-                    remaining, budget_remaining, num_batched_tokens
+                    remaining,
+                    budget_remaining,
+                    num_batched_tokens,
+                    history_len=seq.num_cached_tokens,
+                    already_prefilling=True,
                 )
                 if chunk:
                     chunk = self._finalize_prefill_chunk(
@@ -1116,7 +1150,10 @@ class Scheduler:
                 num_new_tokens = seq.num_prompt_tokens - seq.num_cached_tokens
                 budget_remaining = self.max_num_batched_tokens - num_batched_tokens
                 chunk = self._prefill_chunk_for_budget(
-                    num_new_tokens, budget_remaining, num_batched_tokens
+                    num_new_tokens,
+                    budget_remaining,
+                    num_batched_tokens,
+                    history_len=seq.num_cached_tokens,
                 )
                 if chunk is None:
                     self.waiting.appendleft(seq)
@@ -1183,7 +1220,10 @@ class Scheduler:
                 num_new_tokens = self.long_prefill_token_threshold
             budget_remaining = self.max_num_batched_tokens - num_batched_tokens
             chunk = self._prefill_chunk_for_budget(
-                num_new_tokens, budget_remaining, num_batched_tokens
+                num_new_tokens,
+                budget_remaining,
+                num_batched_tokens,
+                history_len=(num_cached_blocks * self.block_manager.hash_block_size),
             )
             if chunk is None or (atomic_prefill and chunk < num_new_tokens):
                 self.waiting.appendleft(seq)
@@ -1624,8 +1664,102 @@ class Scheduler:
         )
         self.running.append(seq)
 
+    def install_chunk_latency_model(self, predictor: ChunkSizePredictor) -> bool:
+        """Install a useful calibrated model and end the calibration sweep.
+
+        A model that cannot shrink after one base-size prefix is rejected, leaving
+        fixed chunking enabled.
+        """
+        self._calibrating = False
+        if not predictor.predicts_useful_shrink(
+            base_chunk_size=self.max_num_batched_tokens,
+            history_len=self.max_num_batched_tokens,
+        ):
+            logger.warning(
+                "Ignoring dynamic chunking calibration a=%.3e b=%.3e gamma=%.3e: "
+                "it predicts no useful shrink after a %d-token prefix, so "
+                "chunking stays fixed",
+                predictor.quadratic_coeff,
+                predictor.linear_coeff,
+                predictor.prefix_coeff,
+                self.max_num_batched_tokens,
+            )
+            return False
+        first = self.dynamic_chunk_predictor is None
+        self.dynamic_chunk_predictor = predictor
+        logger.log(
+            logging.INFO if first else logging.DEBUG,
+            "Dynamic chunking latency model %s: a=%.3e b=%.3e c=%.3e gamma=%.3e",
+            "installed" if first else "refreshed",
+            predictor.quadratic_coeff,
+            predictor.linear_coeff,
+            predictor.constant_coeff,
+            predictor.prefix_coeff,
+        )
+        return True
+
+    def abandon_chunk_latency_calibration(self) -> None:
+        """End the calibration sweep without a model, leaving chunking fixed."""
+        self._calibrating = False
+        logger.warning(
+            "Dynamic chunking calibration gave up; chunking stays fixed at %d tokens",
+            self.max_num_batched_tokens,
+        )
+
+    def _dynamic_chunk_limit(
+        self, history_len: int, *, already_prefilling: bool = False
+    ) -> int | None:
+        """Return the dynamic chunk ceiling, or None for fixed chunking.
+
+        Dynamic sizing requires sole-prefill supply. Before calibration completes,
+        it returns the sweep size; ``already_prefilling`` avoids double-counting
+        the current request.
+        """
+        if not self.enable_dynamic_chunking:
+            return None
+        prefill_sources = (
+            self._partial_prefill_count
+            + len(self.waiting)
+            + (0 if already_prefilling else 1)
+        )
+        if not has_sole_prefill(prefill_sources, self._recent_prefill_supply):
+            return None
+        if self.dynamic_chunk_predictor is None:
+            if not self._calibrating:
+                return None
+            return self._calibration_sweep_chunk(already_prefilling)
+        return self.dynamic_chunk_predictor.predict(
+            history_len=history_len,
+            base_chunk_size=self.max_num_batched_tokens,
+            smooth_factor=self.dynamic_chunking_smooth_factor,
+            alignment=max(self.block_manager.block_size, 64),
+            max_chunk_size=self.max_num_batched_tokens,
+            min_chunk_size=self.dynamic_chunking_min_chunk_size,
+        )
+
+    def _calibration_sweep_chunk(self, already_prefilling: bool) -> int | None:
+        """Select one of two per-request chunk sizes for an identifiable fit.
+
+        Requests alternate between the full budget (None) and its
+        ``CALIBRATION_SWEEP_RATIO`` fraction.
+        """
+        if not already_prefilling:
+            self._calibration_sweep_alternate = not self._calibration_sweep_alternate
+        if not self._calibration_sweep_alternate:
+            return None
+        return max(
+            self.max_num_batched_tokens // CALIBRATION_SWEEP_RATIO,
+            self.dynamic_chunking_min_chunk_size,
+        )
+
     def _chunked_prefill_size(
-        self, num_new_tokens: int, budget_remaining: int, num_batched_tokens: int
+        self,
+        num_new_tokens: int,
+        budget_remaining: int,
+        num_batched_tokens: int,
+        *,
+        history_len: int = 0,
+        already_prefilling: bool = False,
     ) -> int:
         """Tokens to forward this step, or 0 to leave the request for the next.
 
@@ -1640,19 +1774,36 @@ class Scheduler:
         Never 0 for an empty batch: something has to go out each step, or a
         `max_num_batched_tokens` below the alignment would stall forever.
         """
-        chunk = min(num_new_tokens, budget_remaining)
+        dynamic_limit = self._dynamic_chunk_limit(
+            history_len, already_prefilling=already_prefilling
+        )
+        chunk = min(
+            num_new_tokens,
+            budget_remaining,
+            dynamic_limit if dynamic_limit is not None else num_new_tokens,
+        )
         if chunk >= num_new_tokens:
             return chunk
         aligned = chunk - chunk % max(self.block_manager.block_size, 64)
         return aligned or (0 if num_batched_tokens else chunk)
 
     def _prefill_chunk_for_budget(
-        self, num_new_tokens: int, budget_remaining: int, num_batched_tokens: int
+        self,
+        num_new_tokens: int,
+        budget_remaining: int,
+        num_batched_tokens: int,
+        *,
+        history_len: int = 0,
+        already_prefilling: bool = False,
     ) -> int | None:
         if self.enable_chunked_prefill:
             return (
                 self._chunked_prefill_size(
-                    num_new_tokens, budget_remaining, num_batched_tokens
+                    num_new_tokens,
+                    budget_remaining,
+                    num_batched_tokens,
+                    history_len=history_len,
+                    already_prefilling=already_prefilling,
                 )
                 or None
             )

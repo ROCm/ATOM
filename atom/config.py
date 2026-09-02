@@ -1545,6 +1545,11 @@ class Config:
     index_cache_dtype: str | None = None
     enable_prefix_caching: bool = True
     enable_chunked_prefill: bool = True
+    enable_dynamic_chunking: bool = False
+    dynamic_chunking_smooth_factor: float = 0.75
+    # Floor for solved chunks. Every extra chunk re-pays the cached-prefix
+    # rebuild, so the floor is what bounds that amplification.
+    dynamic_chunking_min_chunk_size: int = 4096
     enable_log_stats: bool = True
     # Seconds between engine-status lines. Validated > 0 by EngineStats.
     throughput_log_interval: float = 10.0
@@ -1804,6 +1809,17 @@ class Config:
                 )
                 self.dcp_config.enable_query_replication = False
         assert 1 <= self.pipeline_parallel_size
+        if not 0.0 <= self.dynamic_chunking_smooth_factor <= 1.0:
+            raise ValueError("dynamic_chunking_smooth_factor must be in [0, 1]")
+        if self.dynamic_chunking_min_chunk_size <= 0:
+            raise ValueError("dynamic_chunking_min_chunk_size must be positive")
+        if self.enable_dynamic_chunking:
+            if self.pipeline_parallel_size <= 1:
+                raise ValueError("Dynamic chunking requires pipeline_parallel_size > 1")
+            if not self.enable_chunked_prefill:
+                raise ValueError(
+                    "Dynamic chunking requires enable_chunked_prefill=True"
+                )
         self.hf_config = get_hf_config(
             self.model, trust_remote_code=self.trust_remote_code
         )
