@@ -388,6 +388,10 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
 
         `limit` caps how many rows are taken, for callers scheduling fewer
         sequences than the batch carries.
+
+        Packs the CPU side only. Freshness is tracked at `copy_to_gpu`, since
+        that is what a consumer reading `.gpu` actually depends on -- and not
+        every caller of this method goes on to upload (`gdn_attn.py:1020`).
         """
         var = self.model_runner.forward_vars
         rows = batch.block_tables if limit is None else batch.block_tables[:limit]
@@ -654,6 +658,12 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             self.execute_paged_state_copies(
                 state_ops.checkpoint_stores, state_ops.checkpoint_restores
             )
+        # Opens a step: block_tables' GPU copy is last batch's until someone
+        # uploads. Sole path into prepare_*, and every upload goes through
+        # CpuGpuBuffer.copy_to_gpu, which sets the flag again.
+        bt = self.model_runner.forward_vars.get("block_tables")
+        if bt is not None:
+            bt.gpu_is_current = False
         is_prefill = batch.total_tokens_num_prefill > 0
         if is_prefill:
             return self.prepare_prefill(batch, running_bs)
