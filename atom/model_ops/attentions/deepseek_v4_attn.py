@@ -433,6 +433,14 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
     def __init__(self, model_runner):
         super().__init__(model_runner)
+        # Decode publishes views of stable forward_vars buffers into the
+        # CUDAGraph metadata. Rebuilding the same prefix views every step sends
+        # dozens of tiny slice/as_strided ops through the dispatcher after the
+        # DP metadata wait. Keep one view per backing slot and prefix shape;
+        # the storage is persistent and its contents are refreshed in place.
+        # Including the root tensor and storage offset keeps arena-packed
+        # buffers and the pipeline forward_vars ring distinct.
+        self._decode_prefix_view_cache: dict[tuple, torch.Tensor] = {}
         hf = model_runner.config.hf_config
         ratios = list(getattr(hf, "compress_ratios", ()))
         assert ratios, "deepseek_v4 hf_config must define compress_ratios"
@@ -2086,14 +2094,18 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # n_committed is running_bs-long (index_topk pad sentinels); slice to `_rbs`
         # so its length matches cu_seq_q (else the binary search over cu_seq_q
         # reads OOB / maps real rows onto sentinel pad seqs).
-        _ncmt = attn_metadata.n_committed_csa_per_seq[:_rbs]
+        _ncmt = self._cached_decode_prefix(attn_metadata.n_committed_csa_per_seq, _rbs)
         _padded = int(positions_gpu.shape[0])
-        _rtb = self._v4_fp4_ragged_row_to_batch[:_padded]
-        _ls = self._v4_fp4_ragged_local_starts[:_padded]
-        _le = self._v4_fp4_ragged_local_ends[:_padded]
+        _rtb = self._cached_decode_prefix(self._v4_fp4_ragged_row_to_batch, _padded)
+        _ls = self._cached_decode_prefix(self._v4_fp4_ragged_local_starts, _padded)
+        _le = self._cached_decode_prefix(self._v4_fp4_ragged_local_ends, _padded)
         compute_varqlen_windows(cu_seq_q, _ncmt, _padded, out=(_rtb, _ls, _le))
         if attn_metadata.csa_n_committed_per_token is not None:
-            _le.copy_(attn_metadata.csa_n_committed_per_token[:_padded])
+            _le.copy_(
+                self._cached_decode_prefix(
+                    attn_metadata.csa_n_committed_per_token, _padded
+                )
+            )
         # Fixed logits width (max_model_len_idx) → the scorer's [padded, W] buffer
         # is a static shape (CG-capturable), same as the rectangular decode path.
         compute_prefill_schedule(
@@ -2200,9 +2212,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 # Single-kernel schedule written straight into the fixed-address
                 # buffer (no intermediate alloc + copy). ~50 tiny torch launches
                 # -> 1 Triton launch (~300us -> ~40us per decode step).
-                _ncmt_sched = attn_metadata.csa_n_committed_per_token[
-                    : positions_gpu.shape[0]
-                ]
+                _ncmt_sched = self._cached_decode_prefix(
+                    attn_metadata.csa_n_committed_per_token,
+                    positions_gpu.shape[0],
+                )
                 if not fp4_schedule_prepared:
                     compute_varctx_schedule(
                         _ncmt_sched,
@@ -2833,12 +2846,20 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         state_slot_np = host_preparation.state_slot_np
         # ---- join the uploads submitted before the DP wait ----
         current_stream = torch.cuda.current_stream()
-        positions = host_preparation.positions_gpu[:sum_scheduled_tokens_padded]
-        cu_seqlens_q_gpu = host_preparation.cu_seqlens_q_gpu[: running_bs + 1]
+        positions = self._cached_decode_prefix(
+            host_preparation.positions_gpu, sum_scheduled_tokens_padded
+        )
+        cu_seqlens_q_gpu = self._cached_decode_prefix(
+            host_preparation.cu_seqlens_q_gpu, running_bs + 1
+        )
         context_lens_gpu = host_preparation.context_lens_gpu
         block_tables_gpu = host_preparation.block_tables_gpu
-        state_slot_gpu = host_preparation.state_slot_gpu[:running_bs]
-        state_slot_in_gpu = host_preparation.state_slot_in_gpu[:running_bs]
+        state_slot_gpu = self._cached_decode_prefix(
+            host_preparation.state_slot_gpu, running_bs
+        )
+        state_slot_in_gpu = self._cached_decode_prefix(
+            host_preparation.state_slot_in_gpu, running_bs
+        )
 
         extend_lens_np = host_preparation.extend_lens_np
         compress_plans = self._slice_staged_compress_plans(
@@ -2881,8 +2902,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             pad_to = self._dspark_ragged_lens_pad_to(running_bs)
             ragged_rows = scheduled_bs if pad_to is None else pad_to
             assert host_preparation.dspark_ragged_lens_gpu is not None
-            attn_metadata.dspark_ragged_lens_gpu = (
-                host_preparation.dspark_ragged_lens_gpu[:ragged_rows]
+            attn_metadata.dspark_ragged_lens_gpu = self._cached_decode_prefix(
+                host_preparation.dspark_ragged_lens_gpu, ragged_rows
             )
             attn_metadata.dspark_full_q = int(full_q)
 
@@ -3746,9 +3767,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 f"{buf_prefix_ubatch}v4_batch_id_per_token", batch_id_per_token_np
             )
         else:
-            attn_metadata.batch_id_per_token = host_preparation.batch_id_per_token_gpu[
-                :padded_total_tokens
-            ]
+            attn_metadata.batch_id_per_token = self._cached_decode_prefix(
+                host_preparation.batch_id_per_token_gpu, padded_total_tokens
+            )
         # Stage n_committed to GPU. For CG-replay safety: aiter
         # `top_k_per_row_decode` iterates the CAPTURED grid (= running_bs *
         # next_n rows) and reads `rowEnds[batch_id]` for every row. Its
@@ -3768,8 +3789,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 if is_pure_decode and running_bs is not None
                 else scheduled_bs
             )
-            attn_metadata.n_committed_csa_per_seq = (
-                host_preparation.n_committed_csa_per_seq_gpu[:n_csa_rows]
+            attn_metadata.n_committed_csa_per_seq = self._cached_decode_prefix(
+                host_preparation.n_committed_csa_per_seq_gpu, n_csa_rows
             )
         else:
             n_csa_buf = var[f"{buf_prefix_ubatch}v4_n_committed_csa_per_seq"]
@@ -3900,7 +3921,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             # already staged for this forward.
             mqa_rows = T_pad
             mqa_valid_rows = T
-            mqa_row_to_batch_gpu = batch_id_per_token_gpu[:T]
+            mqa_row_to_batch_gpu = self._cached_decode_prefix(batch_id_per_token_gpu, T)
 
         # A `[:n]` slice past the end truncates silently, so the bounds are
         # checked rather than relied on — `_stage` used to carry them. Two host
@@ -3929,12 +3950,26 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # The three ragged cumsums and the CSA per-token visibility, in one
         # launch off buffers already resident, replacing three numpy cumsums and
         # four H2D copies of arrays whose inputs never left the device.
-        swa_indptr_gpu = var[f"{buf_prefix_ubatch}v4_kv_indptr_swa"][: T_pad + 1]
-        csa_indptr_gpu = var[f"{buf_prefix_ubatch}v4_kv_indptr_csa"][: T_pad + 1]
-        hca_indptr_gpu = var[f"{buf_prefix_ubatch}v4_kv_indptr_hca"][: T_pad + 1]
-        csa_ncmt_gpu = var[f"{buf_prefix_ubatch}v4_csa_n_committed_per_token"][
-            :mqa_rows
-        ]
+        if host_preparation is not None:
+            swa_indptr_gpu = self._cached_decode_prefix(
+                host_preparation.swa_indptr_gpu, T_pad + 1
+            )
+            csa_indptr_gpu = self._cached_decode_prefix(
+                host_preparation.csa_indptr_gpu, T_pad + 1
+            )
+            hca_indptr_gpu = self._cached_decode_prefix(
+                host_preparation.hca_indptr_gpu, T_pad + 1
+            )
+            csa_ncmt_gpu = self._cached_decode_prefix(
+                host_preparation.csa_n_committed_per_token_gpu, mqa_rows
+            )
+        else:
+            swa_indptr_gpu = var[f"{buf_prefix_ubatch}v4_kv_indptr_swa"][: T_pad + 1]
+            csa_indptr_gpu = var[f"{buf_prefix_ubatch}v4_kv_indptr_csa"][: T_pad + 1]
+            hca_indptr_gpu = var[f"{buf_prefix_ubatch}v4_kv_indptr_hca"][: T_pad + 1]
+            csa_ncmt_gpu = var[f"{buf_prefix_ubatch}v4_csa_n_committed_per_token"][
+                :mqa_rows
+            ]
         if host_preparation is None:
             build_v4_paged_decode_indptr(
                 batch_id_per_token=batch_id_per_token_gpu,
@@ -3960,7 +3995,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # index are both on the device, so the gather runs there instead of the
         # host shipping the expansion; the rows it skips are the tail.
         mqa_bt = var[f"{buf_prefix_ubatch}v4_block_tables_per_token"]
-        block_tables_per_token_gpu = mqa_bt[:mqa_rows]
+        block_tables_per_token_gpu = (
+            self._cached_decode_prefix(
+                host_preparation.block_tables_per_token_gpu, mqa_rows
+            )
+            if host_preparation is not None
+            else mqa_bt[:mqa_rows]
+        )
         if host_preparation is None:
             torch.index_select(
                 var[f"{buf_prefix_ubatch}block_tables"].gpu,
@@ -4071,7 +4112,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # like the kv_indptr pad tail. Per-token, so correct for MTP too.
         if self._kv_fp8 and host_preparation is not None:
             assert host_preparation.qo_indptr_gpu is not None
-            attn_metadata.qo_indptr = host_preparation.qo_indptr_gpu[: T_pad + 1]
+            attn_metadata.qo_indptr = self._cached_decode_prefix(
+                host_preparation.qo_indptr_gpu, T_pad + 1
+            )
         elif self._kv_fp8:
             qo_indptr_np = np.empty(T_pad + 1, dtype=np.int32)
             qo_indptr_np[: T + 1] = np.arange(T + 1, dtype=np.int32)
@@ -4369,14 +4412,54 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             assert plan.num_compress <= compress_rows <= plan.compress_plan_gpu.shape[0]
             assert plan.num_write <= write_rows <= plan.write_plan_gpu.shape[0]
             narrowed[ratio] = CompressPlan(
-                compress_plan_gpu=plan.compress_plan_gpu[:compress_rows],
-                write_plan_gpu=plan.write_plan_gpu[:write_rows],
+                compress_plan_gpu=self._cached_decode_prefix(
+                    plan.compress_plan_gpu, compress_rows
+                ),
+                write_plan_gpu=self._cached_decode_prefix(
+                    plan.write_plan_gpu, write_rows
+                ),
                 num_compress=plan.num_compress,
                 num_write=plan.num_write,
                 cu_compress_cpu=plan.cu_compress_cpu,
                 compress_plan_cpu=plan.compress_plan_cpu,
             )
         return narrowed
+
+    def _cached_decode_prefix(self, tensor: torch.Tensor, rows: int) -> torch.Tensor:
+        """Return a reusable ``tensor[:rows]`` view for steady decode.
+
+        The buffer contents change each step, but the storage, offset, shape,
+        and stride do not. Caching only the view therefore removes dispatcher
+        work without caching any dynamic metadata values.
+        """
+
+        rows = int(rows)
+        if rows < 0 or rows > tensor.shape[0]:
+            raise ValueError(
+                f"decode prefix rows={rows} outside tensor extent {tensor.shape[0]}"
+            )
+        if rows == tensor.shape[0]:
+            return tensor
+
+        root = tensor
+        while root._base is not None:
+            root = root._base
+        key = (
+            id(root),
+            tensor.storage_offset(),
+            tensor.dtype,
+            rows,
+            tuple(tensor.shape[1:]),
+            tensor.stride(),
+        )
+        cache = getattr(self, "_decode_prefix_view_cache", None)
+        if cache is None:
+            cache = self._decode_prefix_view_cache = {}
+        view = cache.get(key)
+        if view is None:
+            view = tensor[:rows]
+            cache[key] = view
+        return view
 
     def _populate_block_tables(
         self, batch: ScheduledBatch, scheduled_bs: int

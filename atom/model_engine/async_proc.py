@@ -236,13 +236,17 @@ class AsyncIOProc:
             return None
         # A deferred-output ModelRunner can make the scheduler-visible result
         # available before it finishes enqueueing this step's draft work. Arm
-        # that fast path only for the top-level ``forward`` RPC: helpers such as
-        # ``dummy_execution`` call forward internally and must not leave an
-        # unsolicited object in the primary output queue.
+        # that fast path for both scheduler-visible forwards and the DPA
+        # dummy RPC.  A real forward publishes its ScheduledBatchOutput; a
+        # dummy publishes the RPC's ``True`` completion before its MTP tail is
+        # enqueued.  That lets EngineCore run the next CPU/Gloo state sync and
+        # queue the next RPC while this worker is still submitting the current
+        # proposal, without inventing an unsolicited model output for a dummy.
         set_output_sink = getattr(runner, "_set_forward_output_sink", None)
         output_sink = (
             self.io_queues[1].put_nowait
-            if func_name == "forward" and self.io_addrs[1] is not None
+            if func_name in ("forward", "dummy_execution")
+            and self.io_addrs[1] is not None
             else None
         )
         if set_output_sink is not None:

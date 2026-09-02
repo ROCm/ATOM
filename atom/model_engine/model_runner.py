@@ -681,10 +681,10 @@ class ModelRunner:
         self.tp_world_size = config.tp_world_size
         self.rank = rank
         self.label = f"Model Runner{rank}/{self.tp_world_size}"
-        # AsyncIOProc arms this only while servicing a top-level ``forward``
-        # RPC on the output-producing TP rank.  Deferred-output decoding can
-        # then release generation N-1 to the scheduler before it finishes
-        # enqueueing generation N's draft pass.
+        # AsyncIOProc arms this while servicing a top-level ``forward`` or
+        # ``dummy_execution`` RPC on the output-producing TP rank. Deferred
+        # decoding can then release generation N-1 (or acknowledge the dummy)
+        # before it finishes enqueueing generation N's draft pass.
         self._forward_output_sink = None
         self._forward_output_published_early = False
         self.hf_text_config = get_hf_text_config(hf_config)
@@ -1263,7 +1263,10 @@ class ModelRunner:
         logger.debug(
             f"{self.label}: dummy batch executed with {dummy_batch.total_tokens_num} tokens"
         )
-        return True
+        # With device metadata sync, postprocess may already have acknowledged
+        # this RPC before enqueueing the dummy's MTP tail.  Returning None keeps
+        # AsyncIOProc from sending a duplicate completion after forward exits.
+        return None if self._forward_output_published_early else True
 
     def warmup_model(self):
         start_time = time.time()
@@ -3355,26 +3358,46 @@ class ModelRunner:
                 publish_early = self._can_publish_forward_output_early()
 
                 if publish_early:
-                    # Everything the scheduler consumes belongs to generation
-                    # N-1 and is already available now. Publish it before
-                    # enqueueing generation N's MTP proposal so EngineCore can
-                    # schedule the next batch while that proposal runs.
-                    draft_token_ids = self.tokenID_processor.take_draft_output()
-                    verify_scheduler = getattr(self.drafter, "verify_scheduler", None)
-                    if verify_scheduler is not None:
-                        dspark_ell = verify_scheduler.ell_nonblocking()
-                    fwd_output = ScheduledBatchOutput(
-                        req_ids=req_ids_out,
-                        token_ids=token_ids_out,
-                        draft_token_ids=draft_token_ids,
-                        is_deferred_out=True,
-                        num_rejected=prev_rejected_num,
-                        num_bonus=prev_bonus_num,
-                        logprobs=logprobs_map,
-                        dspark_ell=dspark_ell,
-                    )
-                    with record_function("scheduler_output.publish_before_draft"):
-                        self._publish_forward_output_early(fwd_output)
+                    if batch.is_dummy_run:
+                        # The DPA coordinator waits for a boolean completion,
+                        # not a model output. Release that control dependency
+                        # before the dummy proposal tail so it can perform the
+                        # next CPU-group state sync and queue the next worker
+                        # RPC. AsyncIOProc preserves FIFO execution, therefore
+                        # the next device collective still cannot overtake this
+                        # forward's proposal collectives.
+                        #
+                        # Still consume generation N-1's staged draft here.
+                        # The legacy dummy path did that inside
+                        # prepare_draft_ids(); skipping the pop shifts the FIFO
+                        # by one generation, so a later multi-request real batch
+                        # can receive the dummy's one-row draft.
+                        self.tokenID_processor.take_draft_output()
+                        with record_function("dummy_execution.publish_before_draft"):
+                            self._publish_forward_output_early(True)
+                    else:
+                        # Everything the scheduler consumes belongs to generation
+                        # N-1 and is already available now. Publish it before
+                        # enqueueing generation N's MTP proposal so EngineCore can
+                        # schedule the next batch while that proposal runs.
+                        draft_token_ids = self.tokenID_processor.take_draft_output()
+                        verify_scheduler = getattr(
+                            self.drafter, "verify_scheduler", None
+                        )
+                        if verify_scheduler is not None:
+                            dspark_ell = verify_scheduler.ell_nonblocking()
+                        fwd_output = ScheduledBatchOutput(
+                            req_ids=req_ids_out,
+                            token_ids=token_ids_out,
+                            draft_token_ids=draft_token_ids,
+                            is_deferred_out=True,
+                            num_rejected=prev_rejected_num,
+                            num_bonus=prev_bonus_num,
+                            logprobs=logprobs_map,
+                            dspark_ell=dspark_ell,
+                        )
+                        with record_function("scheduler_output.publish_before_draft"):
+                            self._publish_forward_output_early(fwd_output)
 
                 self.tokenID_processor.send_mtp_status_to_cpu_async(
                     num_reject_tokens, next_token_locs, self.forward_done_event
@@ -3459,8 +3482,10 @@ class ModelRunner:
             and getattr(self, "_forward_output_sink", None) is not None
         )
 
-    def _publish_forward_output_early(self, output: ScheduledBatchOutput) -> bool:
-        """Release a complete deferred output while this forward keeps enqueueing."""
+    def _publish_forward_output_early(
+        self, output: ScheduledBatchOutput | bool
+    ) -> bool:
+        """Release model output or dummy completion before the draft enqueue tail."""
 
         sink = self._forward_output_sink
         assert sink is not None
