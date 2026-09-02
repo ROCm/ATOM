@@ -817,6 +817,49 @@ class TestSchedule:
         assert failed in sched.running
         assert sched._num_parked_remote_kv == 0
 
+    def test_a_resumed_offload_prefill_reports_the_hit_the_load_gave_it(
+        self, seq_factory
+    ):
+        """`cached_tokens` must count the tokens LMCache brought back.
+
+        The load is the entire point of parking: `_mark_offload_load_ready`
+        raises `num_cached_tokens` from the pre-park HBM-only hit to the
+        post-load one. But the resume branch `continue`s before either
+        `prefix_cache_hit_tokens` assignment, so the field keeps the pre-park
+        value while `CacheStats` is fed the fresh `num_cached_tokens` in
+        `_schedule_prefill_seq`. The two then disagree about the same request,
+        and the one the user sees is the one that undercounts -- making the
+        offload tier look like it did nothing.
+        """
+        sched = Scheduler(
+            MockConfig(
+                max_num_seqs=2,
+                max_num_batched_tokens=64,
+                num_kvcache_blocks=100,
+            )
+        )
+        sched.kv_connector = SimpleNamespace(
+            is_offload=True,
+            build_connector_meta=lambda: None,
+        )
+
+        seq = seq_factory(list(range(8)))
+        seq.num_cached_tokens = 2  # the HBM-only hit, before the load
+        seq.prefix_cache_hit_tokens = 2
+        seq.block_table = [0]
+        seq.offload_loaded_tokens = 6  # LMCache returned four more
+        sched._park_for_remote_load(seq, deque())
+        sched._count_inflight_load(seq)
+        sched.finished_recving_kv_req_ids.append(seq.id)
+        assert sched._resolve_waiting_remote_kv(seq, deque()) is False
+        sched.waiting.append(seq)
+
+        sched.schedule()
+
+        assert seq in sched.running, "precondition: the resume must be admitted"
+        assert seq.num_cached_tokens == 6, "precondition: the load was applied"
+        assert seq.prefix_cache_hit_tokens == 6
+
     def test_partial_prefill_ready_for_offload_load_moves_to_waiting(self):
         class _Connector:
             def should_park_partial_prefill_for_load(self, seq):
@@ -1724,3 +1767,190 @@ class TestComputeDetailedAggregates:
         assert batch.detailed_sqsq == 9  # 3^2
         assert batch.detailed_sqsk == 300  # 3 * 100
         assert batch.detailed_sk == 100
+
+
+class TestStalledOffloadSaveReclaim:
+    """`_reconcile_stalled_deferred_saves`: the way out for a save nobody answers.
+
+    LMCache's pin monitor force-unpins a stalled transfer without emitting a
+    completion, so `should_defer_free` stays True forever, `has_pending_kv_work()`
+    never clears, and the engine busy-loops with every GPU idle. Reproduced on
+    the k3-dev line as a hard hang under a tight pool.
+    """
+
+    @staticmethod
+    def _sched(monkeypatch, deferred):
+        import atom.model_engine.scheduler as sched_mod
+
+        # The window is memoised as a process constant; tests choose their own.
+        monkeypatch.setattr(sched_mod, "_SAVE_ABANDON_TIMEOUT_S", 100.0)
+        s = object.__new__(sched_mod.Scheduler)
+        s.deferred_free_blocks = {seq.id: seq for seq in deferred}
+        s._abandoned_saves = 0
+        s._next_save_reconcile_at = 0.0
+        # Production always sets this (possibly None); reclaim now notifies it.
+        s.kv_connector = None
+        freed: list[int] = []
+        s.block_manager = SimpleNamespace(deallocate=lambda q: freed.append(q.id))
+        return s, freed
+
+    def test_a_save_past_the_window_gets_its_blocks_back(self, monkeypatch):
+        import time as _time
+
+        now = _time.monotonic()
+        stale = SimpleNamespace(id=1, _deferred_save_at=now - 500.0)
+        fresh = SimpleNamespace(id=2, _deferred_save_at=now)
+        s, freed = self._sched(monkeypatch, [stale, fresh])
+
+        assert s._reconcile_stalled_deferred_saves() == 1
+        assert freed == [1], "only the stalled save is reclaimed"
+        assert 2 in s.deferred_free_blocks, "a save still inside its window is kept"
+        assert s._abandoned_saves == 1
+
+    def test_reclaim_notifies_the_connector_to_drop_the_save(self, monkeypatch):
+        """Freeing blocks is not enough: without `abandon_save` the connector's
+        `_save_inflight` keeps the request, `has_pending_kv_work()` never clears,
+        and the engine busy-loops (review finding #4)."""
+        import time as _time
+
+        now = _time.monotonic()
+        stale = SimpleNamespace(id=1, _deferred_save_at=now - 500.0)
+        s, freed = self._sched(monkeypatch, [stale])
+        abandoned: list = []
+        s.kv_connector = SimpleNamespace(abandon_save=lambda sid: abandoned.append(sid))
+
+        assert s._reconcile_stalled_deferred_saves() == 1
+        assert freed == [1]
+        # Notified with the string request id, matching the connector's sid keys.
+        assert abandoned == ["1"]
+
+    def test_it_self_throttles_so_a_1ms_poll_is_cheap(self, monkeypatch):
+        import time as _time
+
+        stale = SimpleNamespace(id=1, _deferred_save_at=_time.monotonic() - 500.0)
+        s, freed = self._sched(monkeypatch, [stale])
+
+        assert s._reconcile_stalled_deferred_saves() == 1
+        # Second call inside the throttle interval must not rescan.
+        s.deferred_free_blocks = {
+            9: SimpleNamespace(id=9, _deferred_save_at=_time.monotonic() - 500.0)
+        }
+        assert s._reconcile_stalled_deferred_saves() == 0
+        assert freed == [1]
+
+    def test_a_non_positive_window_restores_wait_forever(self, monkeypatch):
+        import time as _time
+
+        import atom.model_engine.scheduler as sched_mod
+
+        monkeypatch.setattr(sched_mod, "_SAVE_ABANDON_TIMEOUT_S", 0.0)
+        s = object.__new__(sched_mod.Scheduler)
+        s.deferred_free_blocks = {
+            1: SimpleNamespace(id=1, _deferred_save_at=_time.monotonic() - 1e6)
+        }
+        s._abandoned_saves = 0
+        s._next_save_reconcile_at = 0.0
+        s.block_manager = SimpleNamespace(deallocate=lambda q: pytest.fail("reclaimed"))
+
+        assert s._reconcile_stalled_deferred_saves() == 0
+
+    def test_the_window_sits_above_lmcaches_own_pin_timeout(self, monkeypatch):
+        """Deriving it from LMCache's knob IS the safety argument.
+
+        Two independent env vars would let ours be set below the timeout it has
+        to exceed, and nothing would say so.
+        """
+        import atom.model_engine.scheduler as sched_mod
+
+        monkeypatch.setattr(sched_mod, "_SAVE_ABANDON_TIMEOUT_S", None)
+        monkeypatch.setenv("LMCACHE_EC_PIN_TIMEOUT_SEC", "900")
+        assert sched_mod._offload_save_abandon_timeout_s() == 930.0
+
+        monkeypatch.setattr(sched_mod, "_SAVE_ABANDON_TIMEOUT_S", None)
+        monkeypatch.delenv("LMCACHE_EC_PIN_TIMEOUT_SEC", raising=False)
+        assert sched_mod._offload_save_abandon_timeout_s() == 330.0
+
+
+class TestTheTierSplitPartitionsServedReuse:
+    """`[Cache Tiers]` exists to answer "what does the CPU tier buy", so its two
+    halves have to be two halves of one thing.
+
+    `cached` and `offload` are that: `cached` is what the HBM walk actually
+    handed over, `offload` is what the tier added on top, and they sum to
+    `num_cached`. `compressed` is NOT -- it is how far the walk reached before
+    the state gates cut it, so it counts reuse nobody got.
+    """
+
+    @staticmethod
+    def stats(**kw):
+        from atom.model_engine.engine_stats import EngineStats
+
+        s = EngineStats(enable_prefix_caching=True)
+        s.update_cache(**kw)
+        return s
+
+    def test_the_two_halves_sum_to_the_end_to_end_rate(self):
+        s = self.stats(
+            num_cached_tokens=300,
+            num_full_tokens=1200,
+            num_compressed_tokens=800,
+            num_wanted_tokens=300,
+            num_reusable_tokens=1000,
+            num_offload_tokens=700,
+        )
+        assert s.cache_hit_rate + s.lmcache_hit_rate == pytest.approx(1.0)
+
+    def test_the_halves_never_exceed_the_denominator(self):
+        """K3's ordinary anchor-only shape: the walk reaches 8 blocks, the only
+        resumable rung is at 3, the joint boundary lands at 10. Pairing
+        `compressed` against `offload` prints 80% + 70% here -- 150% of a
+        denominator that is the ceiling."""
+        s = self.stats(
+            num_cached_tokens=300,  # the gate cut the walk from 800 to 300
+            num_full_tokens=1200,
+            num_compressed_tokens=800,
+            num_wanted_tokens=300,
+            num_reusable_tokens=1000,
+            num_offload_tokens=700,
+        )
+        assert s.paged_hit_rate + s.lmcache_hit_rate > 1.0, (
+            "precondition: this is the shape that makes the wrong pairing "
+            "exceed 100%, so the assertion below is not vacuous"
+        )
+        assert s.cache_hit_rate + s.lmcache_hit_rate <= 1.0
+
+    def test_the_line_reports_cached_not_compressed(self, caplog):
+        """Reads the emitted text: swapping `hit_rate` back for
+        `paged_hit_rate` has to be what fails here."""
+        import logging
+
+        s = self.stats(
+            num_cached_tokens=300,
+            num_full_tokens=1200,
+            num_compressed_tokens=800,
+            num_wanted_tokens=300,
+            num_reusable_tokens=1000,
+            num_offload_tokens=700,
+        )
+        with caplog.at_level(logging.INFO, logger="atom"):
+            s._log_pools()
+        line = next(
+            r.getMessage() for r in caplog.records if "[Cache Tiers]" in r.getMessage()
+        )
+        assert "300/1000" in line, f"HBM half must be `cached`, got: {line}"
+        assert "800/1000" not in line, f"`compressed` is reach, not served: {line}"
+        assert "700/1000" in line
+
+    def test_no_tier_attached_emits_no_tier_line(self, caplog):
+        import logging
+
+        s = self.stats(
+            num_cached_tokens=300,
+            num_full_tokens=1200,
+            num_compressed_tokens=800,
+            num_wanted_tokens=300,
+            num_reusable_tokens=1000,
+        )
+        with caplog.at_level(logging.INFO, logger="atom"):
+            s._log_pools()
+        assert not any("[Cache Tiers]" in r.getMessage() for r in caplog.records)

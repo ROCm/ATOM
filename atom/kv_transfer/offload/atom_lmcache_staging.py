@@ -33,7 +33,11 @@ class _StagingBuffer:
 
 
 def _env_flag(name: str, default: str = "0") -> bool:
-    return os.environ.get(name, default).lower() not in ("0", "false", "no", "off")
+    # Stripped, and empty reads as off: `VAR=` is how a shell script clears a
+    # flag inline, and a bare membership test reads the empty string as ON --
+    # the opposite of what the operator wrote. `VAR="off "` did the same.
+    raw = os.environ.get(name, default).strip().lower()
+    return bool(raw) and raw not in ("0", "false", "no", "off")
 
 
 def _env_int(name: str, default: int, *, min_value: int = 1) -> int:

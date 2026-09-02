@@ -7,7 +7,8 @@ The public connector name stays stable while the implementation is selected on
 both the scheduler and worker from configuration alone:
 
 * ``dense`` stores ordinary token-indexed KV chunks;
-* ``hybrid`` stores DSV4 compressed PAGE chunks plus complete SLOT sidecars.
+* ``hybrid`` stores DSV4 compressed PAGE chunks plus complete SLOT sidecars;
+* ``kimi_k3`` stores dense MLA KV plus a KDA per-request state tier.
 
 Keeping selection config-only is important because the scheduler process does
 not have access to the worker's transfer tensors.
@@ -42,6 +43,13 @@ def _build_worker(config):
 
         return DSV4OffloadConnector(config)
 
+    if variant == "kimi_k3":
+        from atom.kv_transfer.offload.hybrid.kimi_k3.connector import (
+            KimiK3OffloadConnector,
+        )
+
+        return KimiK3OffloadConnector(config)
+
     from atom.kv_transfer.offload.dense.connector import DenseOffloadConnector
 
     return DenseOffloadConnector(config)
@@ -57,6 +65,13 @@ def _build_scheduler(config):
 
         return DSV4OffloadScheduler(config)
 
+    if variant == "kimi_k3":
+        from atom.kv_transfer.offload.hybrid.kimi_k3.connector import (
+            KimiK3OffloadScheduler,
+        )
+
+        return KimiK3OffloadScheduler(config)
+
     from atom.kv_transfer.offload.dense.connector import DenseOffloadScheduler
 
     return DenseOffloadScheduler(config)
@@ -69,6 +84,21 @@ class LMCacheOffloadConnector(KVConnectorBase):
 
     def __init__(self, config) -> None:
         self._impl = _build_worker(config)
+
+    @property
+    def _state_tier(self):
+        """Expose the implementation's KDA state tier through the shell.
+
+        `MultiConnector._adopt_state_tier` probes `_state_tier` on each
+        sub-connector to find the one offload backend that built a state tier.
+        Under the `multi` shell the sub IS this object, not the `kimi_k3` impl
+        behind `_impl`, so without this forwarder the probe reads None on every
+        member and the composite never adopts the tier that was actually built
+        -- state spills silently go nowhere. Mirrors the scheduler shell's
+        `chunk_size` forwarder and the "every probed member appears on the
+        shell" contract on `LMCacheOffloadConnectorScheduler`.
+        """
+        return getattr(self._impl, "_state_tier", None)
 
     def register_kv_caches(
         self, kv_caches, transfer_tensors=None, num_blocks=None
@@ -86,13 +116,53 @@ class LMCacheOffloadConnector(KVConnectorBase):
 
 
 class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
-    """Scheduler-side shell delegating to the selected implementation."""
+    """Scheduler-side shell delegating to the selected implementation.
+
+    **Every member `Scheduler` reads off `self.kv_connector` has to appear here**,
+    because `self.kv_connector` IS this object -- the implementation behind
+    `_impl` is invisible from outside. A member the scheduler probes with
+    `getattr(..., default)` and this class does not define does not raise; it
+    silently takes the default forever, which is how `enqueue_state_stores`
+    refused every state store from the day it was written. `tests/
+    test_lmcache_offload_connector.py` sweeps for the gap rather than trusting
+    this comment.
+    """
 
     is_producer = False
     is_offload = True
 
     def __init__(self, config) -> None:
         self._impl = _build_scheduler(config)
+
+    @property
+    def has_state_tier(self) -> bool:
+        """True when the selected impl actually hosts the KDA state tier.
+
+        This shell defines the whole state face (`enqueue_state_stores`,
+        `enqueue_state_loads`, `take_state_reports`,
+        `take_state_source_releases`) unconditionally, delegating through
+        `getattr` to `_impl` and returning the no-tier default when the impl
+        does not implement a method. So method *presence on the shell* cannot
+        tell a tier-hosting `kimi_k3` impl from a `dense`/`hybrid` impl that has
+        none -- which is exactly how `MultiConnector._first_with`, selecting by
+        attribute presence, routed every state call to a dense offload shell
+        whose `_impl` silently returns the no-tier defaults. Probe the impl for
+        the store entry point instead: the real state face lives there (only
+        `KimiK3OffloadScheduler` defines `enqueue_state_stores`).
+        """
+        return getattr(self._impl, "enqueue_state_stores", None) is not None
+
+    @property
+    def chunk_size(self) -> int | None:
+        """The KV leg's transfer grid, in tokens.
+
+        Read by `Scheduler._resolve_waiting_remote_kv` to stamp
+        `seq.offload_kv_chunk_tokens`, which is `_joint_kv_boundary`'s fallback
+        when `BlockManager` could not read the LMCache config at startup.
+        Without this forwarder that fallback was dead -- `getattr` returned its
+        0 default and the joint path refused with `no_chunk_size`.
+        """
+        return getattr(self._impl, "chunk_size", None)
 
     def get_num_new_matched_tokens(self, seq):
         return self._impl.get_num_new_matched_tokens(seq)
@@ -118,6 +188,9 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
     def save_finished(self, req_id) -> None:
         self._impl.save_finished(req_id)
 
+    def abandon_save(self, req_id) -> None:
+        self._impl.abandon_save(req_id)
+
     def load_failed(self, req_id):
         return self._impl.load_failed(req_id)
 
@@ -140,6 +213,36 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
 
     def process_completions(self, output):
         return self._impl.process_completions(output)
+
+    def enqueue_state_loads(self, loads) -> bool:
+        callback = getattr(self._impl, "enqueue_state_loads", None)
+        return bool(callback(loads)) if callback is not None else False
+
+    def enqueue_state_stores(self, stores) -> bool:
+        callback = getattr(self._impl, "enqueue_state_stores", None)
+        return bool(callback(stores)) if callback is not None else False
+
+    def take_state_reports(self):
+        # Contract is a 2-tuple (indexed, failed) -- matched by the kimi_k3 impl
+        # and by the sole caller `indexed, failed = take()` in
+        # scheduler._update_from_kv_xfer_finished. The no-tier fallback returned
+        # a 3-tuple, so any offload variant whose _impl lacks take_state_reports
+        # (e.g. dense/hybrid non-k3) but still exposes state_offload crashed the
+        # engine mid-run with "too many values to unpack (expected 2)", wedging
+        # all TP workers on the next collective. Return the 2-tuple empty set.
+        callback = getattr(self._impl, "take_state_reports", None)
+        return callback() if callback is not None else (set(), set())
+
+    def take_state_source_releases(self) -> set:
+        """Stores whose PAGE units the GPU has finished reading.
+
+        Its own forwarder rather than a third element of `take_state_reports`,
+        for the reason recorded above: that tuple's arity is a contract with
+        the caller, and widening it is exactly the change that wedged the pool
+        once already. An impl without a state tier releases nothing.
+        """
+        callback = getattr(self._impl, "take_state_source_releases", None)
+        return callback() if callback is not None else set()
 
     def get_statistics(self) -> dict[str, int]:
         return self._impl.get_statistics()

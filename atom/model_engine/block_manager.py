@@ -4,6 +4,7 @@
 import array
 import logging
 from math import inf, isinf
+from time import monotonic
 
 import numpy as np
 import xxhash
@@ -157,6 +158,32 @@ class BlockManager:
                 "the only checkpoint placement."
             )
         checkpoint_spec = state_runtime.checkpoint_spec
+        # Read here rather than beside `state_offload` below, because the
+        # coordinator has to know at construction whether anything can carry a
+        # store: without a sink it must nominate nothing, since a pin nobody
+        # releases holds a whole image out of the pool forever.
+        from atom.model_engine.state_offload import state_tier_capability
+
+        # A capability derived from the whole config, not the connector's name.
+        # The name only says which class is constructed; whether that class
+        # builds a `StateOffloadTier` also depends on the layout it resolves,
+        # the pipeline depth, and its role. Installing an index against a
+        # worker that will refuse the tier is what left stores emitted with
+        # nowhere to go.
+        self.state_tier_capability = state_tier_capability(config)
+        kv_offload_enabled = self.state_tier_capability.hosts_state_tier
+        # Only worth saying for a model that has state to offload. Every dense
+        # engine would otherwise announce at startup that a tier it could never
+        # use is off, which is true and useless.
+        if (
+            not kv_offload_enabled
+            and checkpoint_spec is not None
+            and self.state_tier_capability.reason
+        ):
+            logger.info(
+                "[State Cache] CPU state tier off: %s.",
+                self.state_tier_capability.reason,
+            )
         self.paged_state_checkpoints: PagedStateCheckpointCoordinator | None = None
         if checkpoint_spec is not None:
             enabled = self.enable_prefix_caching and self.num_state_slots > 0
@@ -217,6 +244,79 @@ class BlockManager:
         # moment it stops forking (see the state-cache protocol).
         self.state_caches: tuple[StateCache, ...] = (self._state_checkpoint_cache,)
 
+        # Class names already warned about in `state_checkpoint_fates`. See
+        # there for why the warning latches.
+        self._warned_no_checkpoint_fates: set[str] = set()
+        from atom.model_engine.state_offload import StateOffloadIndex
+
+        # Joint boundaries, split by what the state leg cost: `hbm` forked a
+        # resident checkpoint, `tier` paid an entry-sized H2D and a park. Almost
+        # all `tier` means the state pool is too small for the concurrency.
+        self.joint_boundaries = 0
+        self.state_hbm = 0
+        # The number that says the tier is doing anything at all. Every other
+        # counter here can be non-zero with the CPU tier switched off; this one
+        # cannot, which makes it the only honest test of "did this feature run".
+        self.state_tier = 0
+        # Admissions whose gated boundary neither tier could produce by the time
+        # `allocate` ran. Non-zero is expected under pressure (the CPU index is
+        # optimistic, and an HBM checkpoint can be unindexed inside the same
+        # pass); a large fraction of `joint_boundaries` means the gate is
+        # accepting boundaries that do not survive to attach.
+        self.state_gate_lost_boundary = 0
+        # Why the rest got none, keyed by the gate that stopped them.
+        self.joint_skips: dict[str, int] = {}
+        # The LMCache chunk size in tokens, read where the config is rather than
+        # off the connector object.
+        self._joint_chunk_tokens = 0
+        # Only when a joint KV load is possible at all. Reading it reaches into
+        # LMCache, an optional dependency: probing on an engine that hosts no
+        # state tier logged a full `ModuleNotFoundError` traceback at WARNING
+        # on every start, for a number that engine has no use for. The
+        # capability above is the same gate the tier itself uses.
+        if kv_offload_enabled:
+            self._joint_chunk_tokens = self._read_joint_chunk_tokens(config)
+        self.state_offload: StateOffloadIndex | None = None
+        # (req_id, hash, target_group) admitted this pass and not yet handed to
+        # the connector. Kept here rather than in the index because the slot
+        # is this object's fact.
+        self._state_loads: list[tuple] = []
+        # req_id -> slot, for loads whose request was deallocated before the
+        # bytes landed. The slot is off the free list until the report comes
+        # back; see `deallocate`.
+        self._orphan_load_slots: dict = {}
+        # req_id -> monotonic stamp, parallel to `_orphan_load_slots`. The hold
+        # above trusts `settle_state_load` to "always come": it does not, if the
+        # worker that owed the report crashed or its completion was dropped. Then
+        # the slot sits off the free list forever and the state gate in
+        # `can_allocate` wedges the pool once every slot is stranded. This stamps
+        # the wait so `reconcile_orphan_load_slots` can reclaim it after the same
+        # abandon window the store pins use -- the load-side twin of
+        # `reclaim_stale_state_store_pins`.
+        self._orphan_load_slots_at: dict = {}
+        self._orphan_load_slots_reclaimed: int = 0
+        # `kv_offload_enabled` is the whole switch: without a connector to
+        # carry a transfer there is nothing beneath the pool, and a hash whose
+        # KV left HBM could not be resumed from anyway.
+        #
+        # The index no longer reaches into `StateSlotPool`. A K3 checkpoint is
+        # a PAGE image in the KV pool (#2045), so the spill source is a set of
+        # units the coordinator owns, not a slot the pool is about to hand
+        # away -- which is what the staging ring existed to rescue.
+        if kv_offload_enabled:
+            self.state_offload = StateOffloadIndex(
+                can_store=self.state_tier_capability.can_store_state,
+                can_load=self.state_tier_capability.can_load_state,
+            )
+            # Attached rather than passed at construction: the coordinator is
+            # built before the switch is read (it needs `checkpoint_spec`,
+            # which comes off `state_runtime`). One object, two uses -- the
+            # coordinator votes off `hashes` and drains stores into it.
+            if self.paged_state_checkpoints is not None:
+                self.paged_state_checkpoints.attach_offload(
+                    self.state_offload,
+                    sink=self.state_tier_capability.can_store_state,
+                )
         # The demand funnel: recorded at admission, cut for when a prefill
         # chunk is shortened to land on it, kept when the state pool files it.
         # Counted at all three because a gap between any two is a different
@@ -261,6 +361,32 @@ class BlockManager:
             checkpoint_restores=restores,
         )
 
+    def state_checkpoint_fates(self) -> dict[str, int]:
+        """Summed fates across every state class, for the periodic stats line.
+
+        Accumulates whatever each class's ``checkpoint_fates()`` returns, so a
+        new counter appears here with no change to this method. A class without
+        the method is skipped with a warning, latched per class: the caller is a
+        periodic stats line and the omission is a static property of the build.
+        """
+        totals: dict[str, int] = {}
+        for cache in self.state_caches:
+            fates_fn = getattr(cache, "checkpoint_fates", None)
+            if fates_fn is None:
+                name = type(cache).__name__
+                if name not in self._warned_no_checkpoint_fates:
+                    self._warned_no_checkpoint_fates.add(name)
+                    logger.warning(
+                        "state_checkpoint_fates: %s does not implement "
+                        "checkpoint_fates(); its counters are excluded from "
+                        "totals",
+                        name,
+                    )
+                continue
+            for k, v in fates_fn().items():
+                totals[k] = totals.get(k, 0) + v
+        return totals
+
     def _record_evicted(self, h: int) -> None:
         """A hash the block pool just dropped: report it, and settle the state.
 
@@ -298,6 +424,48 @@ class BlockManager:
         block_id = self.kv.pop()
         self.kv.allocate(block_id)
         return block_id
+
+    def disown_claimed_prefix(self, seq: Sequence, keep_blocks: int = 0) -> bool:
+        """Make this seq's claimed canonical prefix private, in place.
+
+        A disown sets ``num_cached_tokens = 0`` so the forward recomputes from
+        token 0, but ``block_table`` still points at the hash-indexed blocks
+        this seq took with ``kv.claim`` -- blocks another sequence may be
+        decoding out of. Recomputing writes KV in place into those shared
+        blocks and tears the other holder's values (non-reproducible
+        corruption -- this is review finding #2). This hands each claimed
+        prefix block in ``block_table[keep_blocks:]`` back (``kv.free``) and
+        drops a fresh private block (``_fresh_block``) into the same slot, so
+        the table length and every other position's mapping are unchanged. The
+        fresh tail (``hash == -1``) is already private and is left untouched;
+        so is a still-shared block below ``keep_blocks``.
+
+        Returns ``False`` when the pool cannot back the private copies -- the
+        caller must then abandon this admission (deallocate + requeue) rather
+        than run a forward over shared blocks. Only blocks still shared at
+        ``ref_count > 1`` cost a net PAGE unit here (``free`` releases nothing
+        while another holder remains), and ``can_allocate`` never reserved them
+        (it subtracts already-used hit blocks from ``num_new_blocks``); those
+        are reserved up front. ``ref_count == 1`` blocks recycle their own unit
+        and never fail.
+        """
+        if not self.enable_prefix_caching:
+            return True
+        table = seq.block_table
+        n_shared = sum(
+            1
+            for i in range(keep_blocks, len(table))
+            if self.kv.block(table[i]).hash != -1
+            and self.kv.block(table[i]).ref_count > 1
+        )
+        if n_shared and not self._ensure_page_units(n_shared):
+            return False
+        for i in range(keep_blocks, len(table)):
+            if self.kv.block(table[i]).hash == -1:
+                continue  # already-private fresh tail (or a prior disown)
+            self.kv.free(table[i])
+            table[i] = self._fresh_block()
+        return True
 
     def _checkpoint_has_room(
         self, live_blocks: int = 0, protected_hash: int | None = None
@@ -466,8 +634,153 @@ class BlockManager:
             "evicted_total": self.total_evicted_blocks,
         }
 
-    def can_allocate(self, seq: Sequence) -> int:
+    def _joint_kv_boundary(
+        self,
+        seq: Sequence,
+        hbm_boundary: int,
+        block_hashes: list[int],
+        record: bool = True,
+    ) -> int:
+        """Boundary above the HBM hit that BOTH legs can reach, 0 if none.
+
+        `record` is `False` for a pure fit probe (`can_allocate` asked only
+        "does this seq fit?", not admitted): the seq's joint fields are still
+        set -- a later real `can_allocate` overwrites them anyway -- but the
+        `joint_boundaries` / `state_hbm` / `state_tier` / `joint_skips` funnel
+        counters are left alone, so a probe that never admits anything does not
+        inflate the operator-visible checkpoint funnel. (The demand counters are
+        already per-seq idempotent and need no such guard.)
+
+        `can_allocate` walks the HBM prefix cache and nothing else, so an
+        evicted prefix stops at the first miss even when LMCache holds every
+        block. This looks past that: the KV leg fetches `[hbm, B)` from LMCache
+        while the state leg fetches B's checkpoint from the tier, and the two
+        land on one boundary or neither runs.
+
+        The grids do not line up -- a state rung is a hash-block boundary, the
+        KV leg moves whole chunks. Rather than discard every unaligned rung, the
+        KV leg is aimed at the chunk *covering* B while the request claims only
+        B: overshooting costs one chunk into blocks the forward is about to
+        rewrite, undershooting would be silent wrong output.
+        """
+        seq.state_joint_boundary_tokens = 0
+        seq.state_joint_boundary_hash = -1
+        seq.state_joint_kv_tokens = 0
+        seq.state_joint_claim_tokens = 0
+        if self.state_offload is None:
+            return self._no_joint("off", record)
+        # PAGE is now the served class, not the excluded one. This used to
+        # read `is not None` and refuse -- correct while a K3 checkpoint was an
+        # Active Slot the tier spilled out of `StateSlotPool`. #2045 moved the
+        # image into the KV pool, and with it the whole reason the joint path
+        # exists: HBM's `state ⊆ KV` (`_record_evicted` unindexes a checkpoint
+        # the instant its boundary block is spent) means a checkpoint can no
+        # longer outlive its KV in HBM -- so when LMCache hands the KV back,
+        # nothing hands the state back unless the two are fetched together.
+        if not seq.has_per_req_cache or self.paged_state_checkpoints is None:
+            return self._no_joint("no_paged_checkpoints", record)
+        hbs = self._hash_block_size()
+        # From the connector's config, not the connector object: the scheduler
+        # holds whatever `get_kvconnector` returned, and one without
+        # `chunk_size` would zero this and disable the feature silently.
+        chunk = self._joint_chunk_tokens or int(
+            getattr(seq, "offload_kv_chunk_tokens", 0) or 0
+        )
+        lmc_tokens = int(getattr(seq, "offload_kv_prefix_tokens", 0) or 0)
+        if chunk <= 0:
+            return self._no_joint("no_chunk_size", record)
+        # Floored to the grid everything below compares against, so the
+        # covering-chunk check becomes true by construction rather than by
+        # luck. (`get_num_new_matched_tokens` withholds one token on a
+        # full-prompt hit, which takes the lookup off the grid.)
+        lmc_tokens = (lmc_tokens // chunk) * chunk
+        if lmc_tokens <= hbm_boundary * hbs:
+            return self._no_joint("lmcache_within_hbm", record)
+        # The KV leg moves whole chunks and the blocks below the HBM prefix are
+        # shared, so an unaligned start cannot be rounded down.
+        if (hbm_boundary * hbs) % chunk != 0:
+            return self._no_joint("hbm_off_chunk_grid", record)
+        cap = min(lmc_tokens // hbs, self._n_hash_blocks(seq) - 1)
+        if cap <= hbm_boundary:
+            return self._no_joint("no_room_above_hbm", record)
+        chain = self._chain_to(seq, block_hashes, cap)
+        # One scan: `_gated_hit` already returns the rightmost rung
+        # `_resumable_from` accepts, so a decrement-and-rescan walk would spend
+        # a fixpoint pass per rung to reach the same answer.
+        candidate = self._gated_hit(seq, cap, chain)
+        if candidate <= hbm_boundary:
+            return self._no_joint("no_rung_above_hbm", record)
+        tokens = candidate * hbs
+        h = chain[candidate - 1]
+        # Cannot fail given the two premises above; kept as their assertion.
+        kv_tokens = -(-tokens // chunk) * chunk
+        if kv_tokens > lmc_tokens:
+            return self._no_joint("covering_chunk_beyond_lookup", record)
+        seq.state_joint_boundary_tokens = tokens
+        seq.state_joint_boundary_hash = h
+        seq.state_joint_kv_tokens = kv_tokens
+        # Everything up to the compressed hit is this prompt's KV and is still
+        # in the pool -- what `_gated_hit` cut was resumability, not residency.
+        # Below the joint boundary those blocks are read-only for this request
+        # (the forward starts at the boundary), so claiming them is free, and
+        # it is the difference between the KV leg fetching `[hit, B)` and
+        # fetching `[0, B)` with the front half already sitting in HBM.
+        #
+        # `candidate > hbm_boundary` and `hbm_boundary` is the RIGHTMOST rung
+        # `<= compressed_hit`, so the boundary is always past the compressed
+        # hit and this min is always the compressed hit. Written as a min
+        # anyway: the invariant belongs to `_gated_hit`, not here.
+        claim_blocks = min(len(block_hashes), candidate)
+        # Floored to the chunk grid so the KV leg starts aligned and writes
+        # only into blocks below it that nobody else can be reading.
+        claim_tokens = ((claim_blocks * hbs) // chunk) * chunk
+        seq.state_joint_claim_tokens = max(claim_tokens, hbm_boundary * hbs)
+        if record:
+            self.joint_boundaries += 1
+            # Which tier the STATE leg came from. The KV leg's own tier is
+            # decided separately by `_decide_load_after_alloc`, which is why
+            # these are not named for the boundary as a whole.
+            if self.paged_state_checkpoints.contains(h):
+                self.state_hbm += 1
+            else:
+                self.state_tier += 1
+        return candidate
+
+    def _no_joint(self, reason: str, record: bool = True) -> int:
+        """Record why this admission got no joint boundary, and return 0.
+        Every reason is counted, including "this build is not even trying",
+        because a silent zero is indistinguishable from a feature that ran and
+        found nothing. `record=False` is the fit-probe path (see
+        `_joint_kv_boundary`): compute the answer without touching the funnel.
+        """
+        if record:
+            self.joint_skips[reason] = self.joint_skips.get(reason, 0) + 1
+        return 0
+
+    def _chain_to(
+        self, seq: Sequence, block_hashes: list[int], blocks: int
+    ) -> list[int]:
+        """`block_hashes` continued to `blocks` entries, hashes only.
+        A chained hash is a function of the prompt alone, so it is computable
+        past where the HBM cache stops -- which is what makes an LMCache-only
+        boundary addressable. Resumes from the last APPENDED hash: on a miss the
+        caller's loop variable holds a hash that is not in the chain.
+        """
+        chain = list(block_hashes)
+        h = chain[-1] if chain else -1
+        for i in range(len(chain), blocks):
+            h = self.compute_hash(self._hash_block_tokens(seq, i), h)
+            chain.append(h)
+        return chain
+
+    def can_allocate(self, seq: Sequence, record: bool = True) -> int:
         """Return number of cache-hit blocks (>=0) if seq fits, else -1.
+
+        `record=False` marks a pure fit probe -- a caller asking only whether
+        the seq *could* be admitted, not admitting it. The answer is identical;
+        it just does not move the joint-boundary funnel counters, so a probe
+        that never admits anything cannot inflate operator metrics (see
+        `_joint_kv_boundary`).
 
         The hit count is the contiguous run of cache hits starting at the
         prompt's first block. On the first miss we break: subsequent blocks
@@ -518,6 +831,11 @@ class BlockManager:
         # `_gated_hit` settles the two gates jointly; neither can be applied to
         # the other's answer.
         num_cached_blocks = self._gated_hit(seq, compressed_hit, block_hashes)
+        # A boundary LMCache and the tier can jointly reach, above this hit.
+        # Recorded on the seq rather than returned: what `allocate` claims from
+        # HBM is still `num_cached_blocks`, and the joint boundary only decides
+        # where the two loads are aimed.
+        self._joint_kv_boundary(seq, num_cached_blocks, block_hashes, record=record)
         # Instrumentation: the pre-gate hit, so EngineStats can separate reuse
         # the gates declined (compressed_hit - num_cached_blocks) from reuse
         # lost to compressed eviction (everything above compressed_hit).
@@ -560,7 +878,7 @@ class BlockManager:
         self._extend_hash_chain(seq, block_hashes)
         return num_cached_blocks
 
-    def allocate(self, seq: Sequence, num_cached_blocks: int = 0):
+    def allocate(self, seq: Sequence, num_cached_blocks: int = 0) -> bool:
         """Allocate blocks for `seq`. `num_cached_blocks` is the hit count
         returned by `can_allocate` (0 if caller didn't call it).
 
@@ -569,21 +887,89 @@ class BlockManager:
         KV. This keeps the manager correct under future chunked-prefill
         scheduling: a block spanning multiple steps must not be published as
         a hash until fully filled.
+
+        Returns ``True`` on success. Returns ``False`` only when a state-less
+        joint boundary had to be disowned (finding #2) and the pool could not
+        back the private prefix copies; the caller must then deallocate and
+        requeue the seq rather than run a forward over shared blocks.
         """
         assert not seq.block_table
+        # Two extents, and they are not the same number. `num_cached_blocks` is
+        # what the request may call cached -- it needs a resumable state behind
+        # it. `claim_blocks` is what it may point its block table at: every
+        # block the prefix walk matched, whether or not a checkpoint sits there.
+        # The gap between them is real reuse that the state gate declined, and
+        # taking it costs nothing: those blocks are below the joint boundary the
+        # forward will start from, so nobody writes them.
+        #
+        # Only a joint boundary widens it -- without one there is nothing above
+        # `num_cached_blocks` this request will ever treat as computed, and
+        # claiming further would pin blocks the forward is about to overwrite.
+        hbs = self._hash_block_size()
+        claim_blocks = max(
+            num_cached_blocks,
+            int(getattr(seq, "state_joint_claim_tokens", 0) or 0) // hbs,
+        )
         h = -1
-        for i in range(num_cached_blocks):
+        hit_hash = -1
+        for i in range(claim_blocks):
             token_ids = self._hash_block_tokens(seq, i)
             h = self.compute_hash(token_ids, h)
             block_id = self.kv.lookup(h)
+            if block_id == -1:
+                # Evicted between `can_allocate` and here. For the widened joint
+                # tail this is expected -- LMCache or the state tier still holds
+                # it and the forward refetches. For the cached range it should be
+                # unreachable (nothing evicts inside one admission), but an
+                # `assert i >= num_cached_blocks` vanishes under `python -O`, and
+                # the old fall-through then recorded `num_cached_blocks * hbs` as
+                # cached over a prefix it could not claim, left `hit_hash`
+                # unassigned (cold-start state exit), and clamped only
+                # `state_joint_claim_tokens` while `boundary`/`kv` stayed above
+                # the claimed region -- silent wrong output on both counts. Use
+                # real control flow instead: never treat more than the `i` blocks
+                # actually claimed as cached, and drop any joint boundary that
+                # sits above them so the KV leg cannot resume over a gap.
+                claimed_tokens = i * hbs
+                num_cached_blocks = min(num_cached_blocks, i)
+                if (
+                    int(getattr(seq, "state_joint_boundary_tokens", 0) or 0)
+                    > claimed_tokens
+                ):
+                    seq.state_joint_boundary_tokens = 0
+                    seq.state_joint_boundary_hash = -1
+                    seq.state_joint_kv_tokens = 0
+                seq.state_joint_claim_tokens = min(
+                    int(getattr(seq, "state_joint_claim_tokens", 0) or 0),
+                    claimed_tokens,
+                )
+                break
             self.kv.claim(block_id)
             seq.block_table.append(block_id)
+            if i + 1 == num_cached_blocks:
+                hit_hash = h
         # Pin the restore before fresh blocks can evict its checkpoint.
+        state_holds = True
         if seq.has_per_req_cache and self.paged_state_checkpoints is not None:
-            self._attach_state_slots(seq, h if num_cached_blocks > 0 else -1)
-        for _ in range(num_cached_blocks, self.num_pool_blocks(len(seq))):
+            # The joint boundary, when there is one -- the same rule the fork
+            # branch below already used, and the PAGE branch did not.
+            #
+            # `hit_hash` is the hash at the HBM hit, and a joint boundary sits
+            # strictly above it by construction. Two ways that went wrong here:
+            # with `num_cached_blocks == 0` the loop never assigned `hit_hash`
+            # at all, so this took the `-1` cold-start exit and requested no
+            # state whatsoever; with a non-zero hit it restored the checkpoint
+            # covering `[0, hbm)`. Either way the KV leg then loaded to the
+            # joint boundary and `_claim_after_load` raised `num_cached_tokens`
+            # to it, so the forward resumed over a prefix the state does not
+            # cover. Silent wrong output, no exception.
+            joint_hash = seq.state_joint_boundary_hash
+            state_holds = self._attach_state_slots(
+                seq, joint_hash if joint_hash != -1 else hit_hash
+            )
+        for _ in range(len(seq.block_table), self.num_pool_blocks(len(seq))):
             seq.block_table.append(self._fresh_block())
-        seq.num_cached_tokens = num_cached_blocks * self._hash_block_size()
+        seq.num_cached_tokens = num_cached_blocks * hbs
 
         # Per-request cache: claim this seq's slot indices from the
         # pre-allocated state tensor (e.g. GDN mamba_k_cache, the V4 compressor
@@ -592,16 +978,126 @@ class BlockManager:
         # paged-block cost. The state pool's free list is the sole admission
         # bound for state cache.
         if seq.has_per_req_cache and self.paged_state_checkpoints is None:
-            self._attach_state_slots(seq, h if num_cached_blocks > 0 else -1)
+            # A joint load aims the state leg at its own boundary, which is
+            # above the HBM hit by construction. `num_cached_tokens` stays at
+            # the HBM prefix until the KV leg lands, so the forward covers
+            # `[hbm, num_prompt)` if anything goes wrong from here.
+            joint_hash = seq.state_joint_boundary_hash
+            state_holds = self._attach_state_slots(
+                seq, joint_hash if joint_hash != -1 else hit_hash
+            )
         if seq.has_per_req_cache:
             seq._state_initialized_after_alloc = False
+        # A claimed joint boundary must have a state leg behind it. The two
+        # decisions are made in different places -- `can_allocate` picks the
+        # boundary, `_attach_state_slots` secures the state -- and every way
+        # they have disagreed so far ends the same way: the KV leg loads to the
+        # boundary, `_claim_after_load` claims it, and the forward runs over a
+        # prefix no state covers. This is the backstop that turns any such
+        # disagreement into a recompute instead, and it is deliberately a
+        # separate check from `state_holds` rather than folded into it: it
+        # holds even if the code above stops asking the right question.
+        if (
+            state_holds
+            and seq.has_per_req_cache
+            and seq.state_joint_boundary_hash != -1
+            and not self._state_leg_secured(seq)
+        ):
+            self.state_gate_lost_boundary += 1
+            logger.warning(
+                "state offload: a joint boundary was admitted for request %s "
+                "with no state restore or load behind it; disowning it. This "
+                "is a bug in the joint gate, not a cache miss.",
+                seq.id,
+            )
+            state_holds = False
+        if not state_holds:
+            # No state behind the boundary means it is not this request's
+            # history. Disown it -- the forward recomputes from 0. Privatise the
+            # claimed prefix first (finding #2): recomputing over the shared
+            # canonical blocks would tear another sequence's decode. Keeping the
+            # boundary is silent wrong output too, since `has_initial_state`
+            # (`gdn_attn.py`) is `num_cached_tokens > 0`.
+            if not self.disown_claimed_prefix(seq):
+                # Pool cannot back the private copies; signal the caller to
+                # deallocate and requeue for a clean recompute next pass.
+                return False
+            seq.num_cached_tokens = 0
+            seq.state_joint_boundary_tokens = 0
+            seq.state_joint_boundary_hash = -1
+        return True
 
-    def _attach_state_slots(self, seq: Sequence, hit_hash: int) -> None:
+    @staticmethod
+    def _read_joint_chunk_tokens(config) -> int:
+        """The LMCache chunk size in tokens, or 0 if it cannot be read.
+
+        Read from the config rather than off the connector object, because the
+        scheduler holds whatever `get_kvconnector` returned and one without
+        `chunk_size` would zero this and disable the joint load silently.
+
+        Called only when the capability says a state tier is hosted; see the
+        caller.
+        """
+        try:
+            from atom.kv_transfer.offload import config as offcfg
+            from atom.model_engine.state_offload import _offload_subconfig
+
+            kvcfg = getattr(config, "kv_transfer_config", None) or {}
+            # Under `multi` the lmcache.* keys (chunk_size, offload_layout) live
+            # on the offload SUB-connector, not the composite. Passing the raw
+            # composite here read a zero chunk grid, and `_joint_kv_boundary`
+            # then refused every joint KV load with `no_chunk_size`. Unwrap the
+            # sub the same way `state_tier_capability` does, so the gate's chunk
+            # size and the tier the capability check builds stay consistent.
+            if isinstance(kvcfg, dict) and kvcfg.get("kv_connector") == "multi":
+                sub, _why = _offload_subconfig(kvcfg)
+                if sub is not None:
+                    kvcfg = sub
+            return int(offcfg.build_lmcache_config(kvcfg).chunk_size)
+        except Exception:
+            # Blind on purpose: this runs at model load, the import reaches a
+            # third-party package that may be absent entirely, and the only
+            # consequence of not knowing the chunk size is that the joint KV
+            # load stays off. Refusing to start would be worse. Reached only
+            # when the tier is on, so a traceback here is worth printing.
+            logger.warning(
+                "state offload: could not read the LMCache chunk size; the "
+                "joint KV load needs it and stays off",
+                exc_info=True,
+            )
+            return 0
+
+    def _state_leg_secured(self, seq: Sequence) -> bool:
+        """Whether something will really put state behind this seq's boundary.
+
+        Exactly three ways that can be true, and they are the three exits
+        `_attach_state_slots` takes when it returns True with a boundary
+        claimed: a PAGE restore was queued, a fork source was adopted or read,
+        or a CPU load was requested. A cold start is not one of them -- it
+        returns True as well, which is correct with no boundary and wrong with
+        one.
+        """
+        if getattr(seq, "state_load_hash", -1) != -1:
+            return True  # a CPU load is in flight for it
+        if getattr(seq, "state_fork_src", -1) != -1:
+            return True  # a fork checkpoint is its source
+        if self.paged_state_checkpoints is None:
+            return False
+        return self.paged_state_checkpoints.restore_queued_for(seq.state_slot)
+
+    def _attach_state_slots(self, seq: Sequence, hit_hash: int) -> bool:
         """Give `seq` its state slots, resuming from a checkpoint when one exists.
 
+        Returns whether `hit_hash`'s state is really the one `seq` now holds.
+        False means the caller must drop the boundary; see `allocate`.
         `hit_hash` is the content hash of the last reused block (-1 for a cold
-        start). `can_allocate` already shrank the hit to a boundary that carries
-        a checkpoint, so a lookup miss here just means the pool is off.
+        start). `can_allocate` already shrank the hit to a boundary that
+        `_resumable_from` accepted, and that is not the same as "in HBM": the
+        tier votes too. So a hash whose slot went to LMCache arrives as a miss
+        and becomes a load (`_request_state_load`), and so does one whose bytes
+        LMCache's own LRU has since dropped — which the tier cannot know until
+        the fetch misses. The two are told apart by whether the tier still
+        holds the hash, because only one of them may keep the boundary.
 
         A seq takes `state_slots_per_req` slots — one committed state plus a
         rollback slot per speculated token — however it starts. The checkpoint
@@ -632,22 +1128,44 @@ class BlockManager:
         width = self.state_slots_per_req
         if self.paged_state_checkpoints is not None:
             seq.state_slots = self.state.pop_many(width)
-            if hit_hash != -1 and not self.paged_state_checkpoints.begin_restore(
-                hit_hash, seq.state_slot
-            ):
-                self.state.release_many(seq.state_slots)
-                seq.state_slots = []
-                raise RuntimeError(
-                    "gated PAGE checkpoint disappeared before state attach"
-                )
             seq.state_fork_src = -1
-            return
+            if hit_hash == -1:
+                return True  # cold start: nothing claimed, nothing to restore
+            if self.paged_state_checkpoints.begin_restore(hit_hash, seq.state_slot):
+                # Queued for the next batch, which gathers the image out of its
+                # PAGE units into the committed slot. What the caller holds is
+                # what it asked for.
+                return True
+            # HBM does not have it. That used to be an invariant violation and
+            # this used to raise -- `can_allocate` had shrunk the hit to a
+            # boundary the HBM index carried, so a miss here meant the gate and
+            # the store disagreed.
+            #
+            # It is a normal path now, and it has to be: the gate consults the
+            # CPU tier too, so a hash it accepted may live only there. Leaving
+            # the raise in would take the engine down on the first request that
+            # actually used the tier.
+            if self._request_state_load(seq, hit_hash):
+                return True
+            # Neither tier can produce it. Reachable rather than defensive:
+            # the tier's index is optimistic (`hashes` means "was stored once"),
+            # and an HBM checkpoint can be unindexed between `can_allocate` and
+            # here by another seq's `_fresh_block` in the same pass. Disown the
+            # boundary -- blocks stay claimed and the forward recomputes.
+            self.state_gate_lost_boundary += 1
+            return False
 
         src = self.state.lookup(hit_hash) if hit_hash != -1 else -1
         if src < 0:
+            wants_load = self._tier_can_serve(hit_hash)
             seq.state_slots = self.state.pop_many(width)
             seq.state_fork_src = -1
-            return
+            if wants_load and self._request_state_load(seq, hit_hash):
+                return True
+            # A fresh slot holds the previous occupant's bytes. That is fine
+            # for a cold start (nothing claims otherwise) and wrong for a hit,
+            # so the hit only survives if there was none to begin with.
+            return hit_hash == -1
         # Being resumed from is the evidence a guessed position was right, so a
         # checkpoint that pays off stops being spent first — see
         # `StateSlotPool.mark_speculative`. Here rather than in `claim`, which
@@ -661,7 +1179,7 @@ class BlockManager:
             seq.state_fork_src = src
             # Held off the free list until the forward that reads it is issued.
             self.state.pin(src)
-            return
+            return True
         # `can_allocate` admitted this seq against a free list holding at least
         # `width`, and nothing else has run since, so the list can only be short
         # here if this seq's own `claim` above took the slot that made up the
@@ -671,6 +1189,237 @@ class BlockManager:
         self.state.invalidate(src)
         seq.state_slots = [src] + self.state.pop_many(width - 1)
         seq.state_fork_src = -1
+        return True
+
+    def _tier_can_serve(self, hit_hash: int) -> bool:
+        """Whether the tier believes it holds `hit_hash`.
+
+        Asked twice per admission -- once by `_attach_state_slots` to decide
+        whether to try a load at all, and again inside `_request_state_load`.
+        One predicate so the two cannot drift.
+        """
+        return (
+            hit_hash != -1
+            and self.state_offload is not None
+            and hit_hash in self.state_offload.hashes
+        )
+
+    def _request_state_load(self, seq: Sequence, hit_hash: int) -> bool:
+        """Ask the tier to fetch `hit_hash` into the slot `seq` just took.
+
+        Only reached when the HBM index missed -- the case the tier exists for.
+        The bytes land in the committed slot, where the resuming forward reads
+        them.
+
+        `state_fork_src` stays -1. The loaded slot *is* the incoming state, and
+        naming a source would send the forward to a different slot than the one
+        being filled.
+
+        False means the tier cannot serve it. `request_load` refuses an unknown
+        hash because a load is resolved only by a report, so offering one for
+        bytes no `get` can produce would park the request forever. The caller
+        then disowns the boundary -- the pre-tier answer.
+        """
+        if not self._tier_can_serve(hit_hash):
+            return False
+        if not self.state_offload.request_load(seq.id, hit_hash):
+            return False
+        seq.state_load_hash = hit_hash
+        self._state_loads.append((seq.id, hit_hash, seq.state_slot))
+        return True
+
+    def cancel_state_load(self, seq: Sequence) -> bool:
+        """Withdraw a load requested this pass, before anything was issued.
+        Only legal before `take_state_loads` handed it over; afterwards the
+        bytes are on their way and the slot must be held. The boundary is
+        disowned exactly as `allocate` would have -- including privatising the
+        claimed prefix (finding #2) so the recompute cannot tear a shared
+        decode.
+
+        Returns ``False`` when the pool cannot back the private copies; the
+        caller must abandon this admission rather than resume over the shared
+        prefix. ``True`` when there was nothing to cancel or the disown held.
+        """
+        if seq.state_load_hash == -1:
+            return True
+        self._state_loads = [e for e in self._state_loads if e[0] != seq.id]
+        if self.state_offload is not None:
+            self.state_offload.abandon_load(seq.id)
+        seq.state_load_hash = -1
+        disowned = self.disown_claimed_prefix(seq)
+        seq.num_cached_tokens = 0
+        return disowned
+
+    def abandon_state_load(self, req_id) -> None:
+        """Give up on a load without blaming the bytes for it.
+        For a load nothing could carry. `settle_state_load(ok=False)` would
+        `forget` the hash on a miss that never happened, erasing the index one
+        request at a time and inflating its false-positive counter.
+        """
+        if self.state_offload is None:
+            return
+        self.state_offload.abandon_load(req_id)
+        slot = self._orphan_load_slots.pop(req_id, None)
+        self._orphan_load_slots_at.pop(req_id, None)
+        if slot is not None:
+            self.state.release(slot)
+
+    def settle_state_load(self, req_id, ok: bool) -> None:
+        """Apply one worker load report. Keyed by request, like the KV load.
+
+        Called for every `finished_loading`/`failed_loading` id, including the
+        many that are plain KV loads -- a no-op for those, which keeps the
+        scheduler from having to know which leg a report belongs to. An
+        abandoned load is already out of the index, but its slot is still being
+        written and comes back here, and only here.
+        """
+        if self.state_offload is None:
+            return
+        if ok:
+            self.state_offload.complete_load(req_id)
+        else:
+            self.state_offload.fail_load(req_id)
+        slot = self._orphan_load_slots.pop(req_id, None)
+        self._orphan_load_slots_at.pop(req_id, None)
+        if slot is not None:
+            self.state.release(slot)
+
+    def take_state_stores(self, max_inflight: int) -> list[tuple]:
+        """`(operation, unit_ids)` for checkpoints to hand the CPU tier.
+
+        Pins each as it hands it over; `settle_state_store` releases. Empty
+        without a coordinator (the fork backends), which is correct rather than
+        a gap: a fork checkpoint is a state slot, and #2045 is what moved K3's
+        into the KV pool where a set of units can be read without being
+        rescued first.
+        """
+        if self.paged_state_checkpoints is None or self.state_offload is None:
+            return []
+        if not self.state_offload.can_store:
+            # A load-only role. Handing over a store pins units against a
+            # report the worker's save half will never produce.
+            return []
+        out = self.paged_state_checkpoints.take_offload_stores(max_inflight)
+        self.state_offload.stores_attempted += len(out)
+        return out
+
+    def settle_state_store(self, op, ok: bool, attempted: bool = True) -> None:
+        """One store reported. Release the units, and index the hash if it landed.
+
+        Success and failure release the pin identically -- it existed to keep
+        the bytes still during the copy, and the copy is over either way.
+        Only the indexing differs, because only a hash whose bytes are really
+        there may be voted for.
+
+        `attempted` is `False` for a store a connector *refused* to carry: the
+        pin still has to be released here, but the copy never reached a worker,
+        so it is not a `stores_failed` -- the caller counts the refusal once as
+        `stores_refused`, and bumping `stores_failed` too would double-count the
+        same event under two names.
+
+        `op` is a `StateStoreOperationId`: the pin is released for that exact
+        generation, so a late report from a superseded attempt settles nothing.
+        The index is keyed by hash, because what a resume asks is whether the
+        prefix is in LMCache -- not which attempt put it there.
+        """
+        reclaimed = False
+        if self.paged_state_checkpoints is not None:
+            reclaimed = self.paged_state_checkpoints.was_reclaimed(op)
+            # Idempotent: normally the source release already returned these
+            # units, and this is the backstop for a store that failed before
+            # it ever read them.
+            self.paged_state_checkpoints.settle_offload_store(op)
+        if self.state_offload is None:
+            return
+        if ok and reclaimed:
+            # The stale reclaimer took this store's units back before it
+            # reported, and nothing can say whether the worker had stopped
+            # reading them. If it had not, the pool may have handed them to
+            # another request whose writes the gather picked up, making the CPU
+            # image a mix of two prefixes filed under the first one's hash --
+            # and a resume onto that is silent wrong output. The bytes may well
+            # be fine; there is no way to know, so they are forfeited.
+            self.state_offload.stores_untrusted += 1
+            logger.warning(
+                "state offload: %s reported stored, but its units were "
+                "reclaimed while it ran; refusing to index it.",
+                op,
+            )
+            return
+        if ok:
+            self.state_offload.stores_completed += 1
+            self.state_offload.note_stored(int(op.prefix_hash))
+        elif attempted:
+            self.state_offload.stores_failed += 1
+
+    def release_state_store_source(self, op) -> None:
+        """The GPU has finished reading this store's PAGE units; hand them back.
+
+        Separate from `settle_state_store` because the two answer different
+        questions: the units are the KV pool's and are free as soon as the D2H
+        drains, while whether the CPU put succeeded is decided afterwards and
+        cannot touch them. Holding an image out of the pool across that would
+        cost reuse for nothing.
+        """
+        if self.paged_state_checkpoints is not None:
+            self.paged_state_checkpoints.settle_offload_store(op)
+
+    def reclaim_stale_state_store_pins(self, timeout_s: float) -> int:
+        """Release store pins whose report never came. See the store."""
+        if self.paged_state_checkpoints is None:
+            return 0
+        return self.paged_state_checkpoints.reclaim_stale_offload_pins(timeout_s)
+
+    def reconcile_orphan_load_slots(self, timeout_s: float) -> int:
+        """Free load slots whose `settle_state_load` never came, after `timeout_s`.
+
+        The load-side twin of `reclaim_stale_state_store_pins`. `deallocate`
+        parks a slot in `_orphan_load_slots` when it tears down a request whose
+        state load is still in flight, on the promise that the worker reports
+        every load and `settle_state_load` will hand it back. A crashed worker
+        or a dropped completion breaks that promise, and the slot then sits off
+        the free list forever -- `can_allocate`'s state gate refuses new
+        per-request work once enough slots are stranded, wedging the pool with
+        no fault to point at.
+
+        **This is a last resort and cannot tell a lost report from a slow
+        worker still writing the slot** -- the same limitation the store-pin
+        twin documents. Reclaiming under a live H2D hands the next request a
+        buffer someone else is filling, with `has_initial_state` already true
+        over it. So the window must be the abandon timeout, not a tight one:
+        long enough that a report still in flight has already arrived. The
+        index leg was abandoned back in `deallocate`, so nothing here touches
+        it; a late report finds the slot already popped and releases nothing.
+        """
+        if timeout_s <= 0 or not self._orphan_load_slots_at:
+            return 0
+        cutoff = monotonic() - timeout_s
+        stale = [
+            req_id for req_id, at in self._orphan_load_slots_at.items() if at <= cutoff
+        ]
+        for req_id in stale:
+            self._orphan_load_slots_at.pop(req_id, None)
+            slot = self._orphan_load_slots.pop(req_id, None)
+            if slot is not None:
+                self.state.release(slot)
+            # The index leg was already abandoned in `deallocate` when the slot
+            # was parked; only the slot itself outlived the report. Do not touch
+            # the index again here -- a second `abandon_load` would double-count
+            # the miss. A late report that still calls in finds the slot popped
+            # and releases nothing.
+            self._orphan_load_slots_reclaimed += 1
+        return len(stale)
+
+    def take_state_loads(self) -> list[tuple]:
+        """`(req_id, hash, target_slot)` for loads admitted since the last call.
+        Drained once per pass by the scheduler, which hands them to the
+        connector. Draining rather than reading is what keeps a load from being
+        submitted twice into a slot the first transfer is already filling.
+        """
+        if self.state_offload is None:
+            return []
+        out, self._state_loads = self._state_loads, []
+        return out
 
     def _chain_parent_hash(self, seq: Sequence, start: int) -> int | None:
         """Return the chained hash of block ``start - 1``, or ``None`` on a gap.
@@ -1266,13 +2015,21 @@ class BlockManager:
         Assembled here because the stages live in two objects — the ladder
         decides what to ask for, the pool decides what survives — and a reader
         needs them side by side to tell which stage lost it.
+        Pool-level fates are collected via ``state_checkpoint_fates()`` so that
+        a second state class is automatically included — calling
+        ``self.state.checkpoint_fates()`` directly would miss it.
         """
         return {
             "demands_recorded": self.demands_recorded,
             "demands_declined_no_room": self.demands_declined_no_room,
             "chunks_cut_for_demand": self.chunks_cut_for_demand,
             "chunks_cut_for_end": self.chunks_cut_for_end,
-        } | self._state_checkpoint_cache.checkpoint_fates()
+            "joint_boundaries": self.joint_boundaries,
+            "state_hbm": self.state_hbm,
+            "state_tier": self.state_tier,
+            "state_gate_lost_boundary": self.state_gate_lost_boundary,
+            "orphan_load_slots_reclaimed": self._orphan_load_slots_reclaimed,
+        } | self.state_checkpoint_fates()
 
     def pool_pressure(self) -> dict[str, int]:
         """Both pools' eviction counts and occupancy, side by side.
@@ -1283,19 +2040,26 @@ class BlockManager:
         comparison: paged evicting while state sits mostly vacant means the
         split is wrong, both evicting means the budget is.
 
-        The fates come from `_state_checkpoint_cache`, not from `self.state`.
-        Under PAGE the two are different objects — `self.state` is built with
-        `StateTransfer.none()` and never sees a `checkpoint()` — so reading it
-        here printed four zeros for the life of the server while
-        `checkpoint_funnel` reported the real numbers from the coordinator. Two
-        outputs with the same metric names disagreeing is how a tuning session
-        concludes checkpointing never fires. Occupancy stays on `self.state`:
-        that is the slot pool either way, and the coordinator has none.
+        The fates come from `state_checkpoint_fates()`, the aggregator, not
+        from `self.state` and not from a single `_state_checkpoint_cache`.
+        Under PAGE `self.state` is built with `StateTransfer.none()` and never
+        sees a `checkpoint()`, so reading it here printed four zeros for the
+        life of the server; and reading `_state_checkpoint_cache` alone omits
+        any second state class the aggregator folds in. Either way the number
+        disagreed with the `checkpoint_funnel` line -- which already goes
+        through the aggregator -- and two outputs with the same metric names
+        disagreeing is how a tuning session concludes checkpointing never
+        fires. Occupancy stays on `self.state`: that is the slot pool either
+        way, and the coordinator has none.
         """
+        # `state_checkpoint_fates()`, matching `checkpoint_funnel`: it sums
+        # every state class, so a build with a second class is not silently
+        # undercounted here while the funnel line reports the full total.
+        # `occupancy()` stays on the pool, which is the thing that has slots.
         return (
             self.kv.eviction_stats()
             | self.state.occupancy()
-            | self._state_checkpoint_cache.checkpoint_fates()
+            | self.state_checkpoint_fates()
         )
 
     def checkpointers_at(
@@ -1619,11 +2383,28 @@ class BlockManager:
             # dropped here rather than left to `release_state_pins`, because the
             # forward that owed the read is not going to happen and the slot
             # should not sit out a pass for a reader that no longer exists.
-            self.state.release_many(seq.state_slots)
+            # Unless a state load is in flight into the committed slot -- a
+            # worker is writing it, so handing it back now would give the next
+            # request a buffer someone else is filling, with `has_initial_state`
+            # already true over it. Held until `settle_state_load`, which always
+            # comes: the worker reports every load either way. The rollback
+            # scratch is nobody's destination and goes back regardless.
+            if seq.state_load_hash != -1 and self.state_offload is not None:
+                self._orphan_load_slots[seq.id] = seq.state_slot
+                self._orphan_load_slots_at[seq.id] = monotonic()
+                # Abandoned, not failed: an abort says nothing about the bytes,
+                # and forgetting the hash would cost the next request over this
+                # prefix a full recompute.
+                self.state_offload.abandon_load(seq.id)
+                self.state.release_many(seq.state_slots[1:])
+            else:
+                self.state.release_many(seq.state_slots)
             # No next forward will read a pending fork source after deallocation.
             self.state.drop_reader(seq.state_fork_src)
             seq.state_slots = []
             seq.state_fork_src = -1
+
+        seq.state_load_hash = -1
 
     def can_append(self, seq: Sequence, num_new_tokens: int = 1) -> bool:
         seq_len = len(seq)

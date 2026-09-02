@@ -38,6 +38,11 @@ Merge strategy mirrors vLLM's ``MultiConnector``, adapted to ATOM's
   index in ``start_load_kv``.
 * ``get_finished`` — union the completion sets, **but** see the send/save
   pairing below.
+* ``_state_tier`` — the state offload tier, if a sub built one, re-exposed on
+  the composite by ``_adopt_state_tier`` at ``register_kv_caches`` time (which
+  also refuses a config that lists two offload subs). Mirroring the sub's tier
+  on the composite keeps the attribute defined, so a probe for it resolves to
+  the real tier instead of raising ``AttributeError``.
 
 Send/save pairing (the one tricky correctness point)
 ----------------------------------------------------
@@ -67,7 +72,9 @@ from atom.kv_transfer.disaggregation.types import (
     ConnectorMetadata,
     KVConnectorOutput,
     SaveCompletionId,
+    StateStoreOperationId,
     completion_req_key,
+    connector_metadata_has_work,
 )
 
 logger = logging.getLogger("atom")
@@ -160,6 +167,20 @@ class MultiConnectorMetadata(ConnectorMetadata):
         super().__init__()
         self.metas = list(metas)
 
+    def has_work(self) -> bool:
+        """Ask the subs; this wrapper holds none of the work itself.
+
+        Its own base fields are always empty -- everything lives in `metas` --
+        so answering from them alone drops every step whose only work belongs
+        to a sub. Delegating rather than mirroring the subs' fields is the
+        point: the aggregating properties below exist for the idle-dispatch
+        path and have to name each field, and `state_loads` was missed there,
+        which silently parked every state-only load run under `multi`.
+        """
+        return super().has_work() or any(
+            connector_metadata_has_work(m) for m in self.metas
+        )
+
     @property
     def requests(self):
         """Aggregate of sub-metas' ``requests`` (offload uses this attribute).
@@ -221,6 +242,11 @@ class MultiConnector(KVConnectorBase):
         self._pending_save_ops: dict[str, set[SaveCompletionId]] = {}
         self._sent: dict[str, Any] = {}
         self._saved: dict[str, set[SaveCompletionId]] = {}
+        # The state tier of whichever sub owns one. Adopted in
+        # `register_kv_caches` via `_adopt_state_tier`; set to None here so the
+        # attribute exists before the subs register -- a probe for it must
+        # resolve, not raise `AttributeError`.
+        self._state_tier = None
 
     @property
     def _pairs_send_and_save(self) -> bool:
@@ -240,6 +266,29 @@ class MultiConnector(KVConnectorBase):
     ) -> None:
         for c in self._connectors:
             c.register_kv_caches(kv_caches, transfer_tensors, num_blocks)
+        self._adopt_state_tier()
+
+    def _adopt_state_tier(self) -> None:
+        """Take over the one sub-connector's state tier, or refuse two.
+
+        Nothing in ``_build_subconnectors`` stops a config from listing
+        ``lmcache_offload`` twice, which would leave two live tiers and no
+        answer to "which one packs this spill". Picking the first is wrong
+        rather than arbitrary: a hash could be reported indexed by a tier that
+        never stored it, then fetched from one that cannot produce it. Raising
+        at model load costs nothing and is loud.
+        """
+        tiers = [
+            c for c in self._connectors if getattr(c, "_state_tier", None) is not None
+        ]
+        if len(tiers) > 1:
+            names = [type(c).__name__ for c in tiers]
+            raise ValueError(
+                f"multi connector: {len(tiers)} sub-connectors built a state "
+                f"offload tier ({names}); exactly one may. List the offload "
+                "backend once in kv_transfer_config.connectors."
+            )
+        self._state_tier = tiers[0]._state_tier if tiers else None
 
     def start_load_kv(self, metadata: ConnectorMetadata) -> None:
         metas = getattr(metadata, "metas", None)
@@ -304,7 +353,19 @@ class MultiConnector(KVConnectorBase):
         # Pair each request's send and save before releasing either.
         for r in send_now:
             self._sent[str(r)] = r
+        # State-tier store completions (`StateStoreOperationId`: a
+        # (prefix_hash, generation) pair) have no send counterpart to pair
+        # against. Parking them in `self._saved` leaked for the life of the
+        # process -- their key never enters `self._sent`, so the pop below never
+        # fired. They are terminal on their own: release immediately. Match on
+        # the exact type, not `hasattr(r, "req_id")` -- a bare `ReqId` save
+        # completion (a plain str/int) has no `req_id` attribute either and must
+        # still go through send/save pairing on a producer node.
+        state_saves: set = set()
         for r in save_now:
+            if isinstance(r, StateStoreOperationId):
+                state_saves.add(r)
+                continue
             key = completion_req_key(r)
             self._saved.setdefault(key, set()).add(r)
             pending_ops = self._pending_save_ops.get(key)
@@ -323,7 +384,7 @@ class MultiConnector(KVConnectorBase):
             rel_save.update(self._saved.pop(key, set()))
 
         out.finished_sending = rel_send
-        out.finished_saving = rel_save
+        out.finished_saving = rel_save | state_saves
         return out
 
     def get_finished_recv_blocks(self) -> list[int]:
@@ -350,16 +411,76 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         # offload backend (Scheduler._is_offload_connector reads this).
         self.is_offload = any(getattr(c, "is_offload", False) for c in self._connectors)
 
+    def _state_tier_sub(self):
+        """The one sub-connector that actually hosts the state offload tier.
+
+        Selection is by real capability (`has_state_tier`), never by method
+        presence: `LMCacheOffloadConnectorScheduler` defines the entire state
+        face on every layout, so `_first_with(..., "enqueue_state_stores")`
+        picks a dense offload shell -- whose `_impl` has no tier and returns
+        False / empty for every state call -- ahead of the `kimi_k3` shell that
+        owns the tier. The result was that, under
+        `connectors: [lmcache_offload(dense), lmcache_offload(kimi_k3)]`, stores
+        settled failed, loads were abandoned and recomputed, and the real
+        reports were never drained. `_adopt_state_tier` (worker side) already
+        refuses a config with two tiers, so "first" here is "only"; returns
+        None when no sub hosts a tier (state forwarders then fall to their
+        no-tier defaults).
+        """
+        for c in self._connectors:
+            if getattr(c, "has_state_tier", False):
+                return c
+        return None
+
     # -- base interface -----------------------------------------------------
 
     def get_num_new_matched_tokens(self, seq: Any) -> tuple[int, bool]:
-        """First-hit-wins: the first sub that reports a match owns the load."""
+        """First-hit-wins, and undo the losers' armed loads.
+
+        A sub's lookup is not side-effect-free: an offload sub arms a KV load
+        for any prefix it matches -- it takes an LMCache lookup pin, records a
+        `_load_specs` entry and a `_lookup_in_step` id, so `update_state_after_
+        alloc` (which the composite fans to *every* sub) later flips
+        `can_load=True` and recv-queues that request. Only the first matching
+        sub owns the load. If a second sub also matched -- moriio winning ahead
+        of the offload tier, or a dense offload shell ahead of the kimi_k3 one
+        -- the loser's armed load fires into the same block table on
+        `update_state_after_alloc`: a second writer over the winner's KV, plus a
+        `finished_loading` the scheduler never accounted. So once a winner is
+        chosen, cancel every other sub's pending load. `cancel_pending_load` is
+        idempotent and guarded by `_load_lifecycles`, so a sub that armed
+        nothing (a miss, or moriio which has no such method) is a no-op.
+        """
         result = (0, False)
+        winner = None
         for c in self._connectors:
             toks, needs_load = c.get_num_new_matched_tokens(seq)
-            if result[0] == 0 and toks > 0:
+            if winner is None and toks > 0:
                 result = (toks, needs_load)
+                winner = c
+        if winner is not None:
+            for c in self._connectors:
+                if c is not winner:
+                    fn = getattr(c, "cancel_pending_load", None)
+                    if callable(fn):
+                        fn(seq)
         return result
+
+    def cancel_pending_load(self, seq: Any) -> None:
+        """Forward a load cancellation to every sub that arms loads.
+
+        The scheduler calls this on `self.kv_connector` -- the composite under
+        `multi` -- when a parked load is abandoned (park timeout, request
+        finished before its transfer). Only offload subs implement it, and the
+        composite had no forwarder, so under `multi` the cancel never reached
+        the offload sub: its `_load_specs`/`_reqs_need_recv`/lookup pin leaked
+        and the abandoned request stayed recv-queued. Idempotent per sub (the
+        `_load_lifecycles` guard), so fanning to all is safe.
+        """
+        for c in self._connectors:
+            fn = getattr(c, "cancel_pending_load", None)
+            if callable(fn):
+                fn(seq)
 
     def build_connector_meta(self) -> MultiConnectorMetadata:
         return MultiConnectorMetadata(
@@ -375,9 +496,40 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             if hasattr(c, "request_finished"):
                 c.request_finished(seq)
 
+    def abandon_save(self, req_id: Any) -> None:
+        # Reclamation of a stalled offload save (see
+        # `DenseOffloadConnector.abandon_save`). Only the offload sub tracks
+        # `_save_inflight`; forward to whichever sub implements it. Idempotent
+        # (pop-with-default), so fanning to all is harmless.
+        for c in self._connectors:
+            fn = getattr(c, "abandon_save", None)
+            if callable(fn):
+                fn(req_id)
+
     # -- offload-specific methods, forwarded to the owning sub --------------
     # The scheduler guards every one of these with hasattr(), so MultiConnector
     # only needs to expose them when a sub-connector implements them.
+
+    @property
+    def chunk_size(self) -> int | None:
+        """The offload sub's KV transfer grid, in tokens.
+
+        `Scheduler._resolve_waiting_remote_kv` stamps
+        `seq.offload_kv_chunk_tokens` from `getattr(self.kv_connector,
+        "chunk_size", 0)`, and under `multi` `self.kv_connector` IS this
+        composite. Without this forwarder the getattr default (0) wins, so
+        `_joint_kv_boundary` sees a zero chunk grid and refuses every joint KV
+        load with `no_chunk_size` -- the K3 state tier's KV leg is silently off
+        under `kv_connector: multi`.
+
+        Prefer the state-tier sub's grid: `_joint_kv_boundary` aligns against
+        it, and with two offload subs (dense + kimi_k3) `_first_with` would have
+        handed back the dense sub's grid. Fall back to any offload sub's grid
+        when no tier is configured, so a plain `[moriio, lmcache_offload(dense)]`
+        still gets its dense KV chunk size.
+        """
+        c = self._state_tier_sub() or _first_with(self._connectors, "chunk_size")
+        return getattr(c, "chunk_size", None) if c is not None else None
 
     def should_park_for_load_after_alloc(self, seq: Any) -> bool:
         c = _first_with(self._connectors, "should_park_for_load_after_alloc")
@@ -388,6 +540,75 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         return (
             c.adjust_prefill_chunk_after_alloc(seq, chunk) if c is not None else chunk
         )
+
+    def enqueue_state_loads(self, loads) -> bool:
+        """First sub that can carry them owns them; False if none can.
+
+        Only one sub may host the tier (the worker raises at model load when
+        two do), so "first" is also "only".
+
+        The False is not a formality: every load here belongs to a parked
+        request only a report can wake, and the caller's `hasattr` guard cannot
+        catch a swallowed one because this method always exists.
+
+        Select by `has_state_tier`, not method presence -- see
+        `_state_tier_sub`.
+        """
+        c = self._state_tier_sub()
+        if c is None:
+            return False
+        return bool(c.enqueue_state_loads(loads))
+
+    def enqueue_state_stores(self, stores) -> bool:
+        """Symmetric to `enqueue_state_loads`: the one sub that hosts the tier
+        owns the stores; False if none can.
+
+        Without this forwarder the engine's `getattr(connector,
+        "enqueue_state_stores")` misses on the shell, so it takes the "did not
+        carry" branch and releases each store's PAGE units *before* the D2H --
+        the CPU tier can never fill under `kv_connector: multi`, even with an
+        offload sub-connector configured. `_adopt_state_tier` already guarantees
+        at most one tier, so "first" is "only" here too.
+
+        Select by `has_state_tier`, not method presence -- see
+        `_state_tier_sub`.
+        """
+        c = self._state_tier_sub()
+        if c is None:
+            return False
+        return bool(c.enqueue_state_stores(stores))
+
+    def take_state_reports(self):
+        """`(indexed, failed)` from the tier sub, else two empty sets.
+
+        The engine unpacks exactly this 2-tuple (`indexed, failed = take()` in
+        `scheduler._update_from_kv_xfer_finished`). Missing here, the engine
+        never drains store reports, so pins never settle and stored hashes are
+        never indexed -- the CPU tier fills but nothing can be found in it.
+
+        Select by `has_state_tier`, not method presence -- see
+        `_state_tier_sub`.
+        """
+        c = self._state_tier_sub()
+        if c is None:
+            return set(), set()
+        return c.take_state_reports()
+
+    def take_state_source_releases(self) -> set:
+        """Stores whose PAGE units the GPU has finished reading, from the tier
+        sub; empty set if none.
+
+        Its own forwarder rather than a third element of `take_state_reports`,
+        for the reason the offload connector records: that tuple's arity is a
+        contract with the caller, and widening it once already wedged the pool.
+
+        Select by `has_state_tier`, not method presence -- see
+        `_state_tier_sub`.
+        """
+        c = self._state_tier_sub()
+        if c is None:
+            return set()
+        return c.take_state_source_releases()
 
     def should_park_partial_prefill_for_load(self, seq: Any) -> bool:
         c = _first_with(self._connectors, "should_park_partial_prefill_for_load")

@@ -838,6 +838,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         )
         return StateTransfer.copy(layout_id)
 
+    def state_entry_views(self, slot: int) -> list[torch.Tensor]:
+        """One contiguous slice per plane: a V4 slot is one row per plane."""
+        return self._slot_views()[slot]
+
     def relocate_state_slots(self, pairs: Sequence[tuple[int, int]]) -> None:
         """Relocate a request's whole Active Slot."""
         views = self._slot_views()

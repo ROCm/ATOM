@@ -228,6 +228,102 @@ class _KimiMLAGDNCommon(GDNStateMixin):
         """Bytes in each destination segment of an image of `units` units."""
         return np.tile(self._page_unit_regions()[1], units)
 
+    def page_unit_views(self, unit_ids: Sequence[int]) -> list[torch.Tensor]:
+        """Tensor-view counterpart of `_page_unit_regions`, for the CPU tier.
+
+        `_page_unit_regions` gives raw addresses for the Triton descriptor; the
+        LMCache packer takes `list[torch.Tensor]`, so the same bytes need naming
+        as views. This is the tier's only new seam -- a load writes the Active
+        Slot directly and reuses `state_entry_views`.
+
+        Order is the contract: unit major, row minor, the same ravel as
+        `_page_unit_bases`. Cross-build safety is `layout_id` in
+        `StateByteCodec.key`, not this order.
+
+        `unit_ids` carries *logical* block ids while `kv_cache` is shaped in
+        *physical* ones (K3's ratio is 128). Flattening the two block axes and
+        indexing by `unit * block_size` is that conversion -- the same
+        arithmetic `_page_unit_bases` does in addresses, so the two cannot
+        drift. Range-checked against the logical count for the same reason.
+
+        `_page_unit_regions` runs first for its side effect: the contiguity and
+        granularity checks live there.
+        """
+        _base, _stride = self._page_unit_regions()
+        cache = self.model_runner.kv_cache
+        rows, entry = cache.shape[0], cache.shape[3]
+        block = self.model_runner.block_size
+        # Logical blocks the pool holds, which is what a unit id indexes.
+        # Range-checked against THIS count, not the physical one: the physical
+        # count is `block_ratio` times smaller, so checking it would pass ids
+        # that address past the end of the tensor.
+        logical_blocks = (cache.shape[1] * cache.shape[2]) // block
+        planes = [cache[row].view(-1, entry) for row in range(rows)]
+        views: list[torch.Tensor] = []
+        for unit in unit_ids:
+            unit = int(unit)
+            if not 0 <= unit < logical_blocks:
+                raise IndexError(
+                    f"PAGE unit {unit} outside the pool's {logical_blocks} "
+                    "logical blocks"
+                )
+            lo = unit * block
+            views.extend(plane[lo : lo + block] for plane in planes)
+
+        # ---- cut the padding tail off the final unit ----
+        #
+        # An image is `image_bytes`, but it occupies `ceil(image_bytes /
+        # page_unit_bytes)` WHOLE units, so the last one is mostly padding: at
+        # K3's 2,138,112 B unit and 58,079,232 B image that is 28 units =
+        # 59,867,136 B, of which 1,787,904 belong to no image.
+        #
+        # `_checkpoint_copy_plan` already knows this -- it hands
+        # `plan_segmented_copy` the unit stream *and* `spec.image_bytes`, so the
+        # HBM copy writes only the leading `image_bytes` and leaves the tail
+        # alone. Gathering whole units for the CPU tier skipped that argument
+        # and asked the packer for the padding too, against a MemoryObj
+        # `StateByteCodec.put` sizes at `entry_bytes` -- which IS `image_bytes`.
+        # Every store died with "MemoryObj tensor is too small for 59867136
+        # bytes; got 58079232".
+        #
+        # The trim is byte-exact rather than view-aligned because the image does
+        # not end on one: 58,079,232 leaves 350,208 B of the last unit in use,
+        # which is 20.96 rows of it. That view is reinterpreted as `uint8` and
+        # sliced; the packer sizes segments as `numel * element_size`, so it
+        # costs nothing to accept. The load side needs no counterpart -- it
+        # scatters into `state_entry_views`, which sums to `entry_bytes`.
+        #
+        # Inline rather than a helper method: the unit tests drive this function
+        # with a `SimpleNamespace` stand-in for `self`, so a second attribute
+        # would have to be stubbed by every one of them.
+        runtime = getattr(self.model_runner, "state_runtime", None)
+        spec = None if runtime is None else runtime.checkpoint_spec
+        # `getattr`: a fork build carries no spec, and the unit tests hand this
+        # a stand-in that carries no `image_bytes`. Either way there is no image
+        # size to trim against, and the whole-unit stream is the right answer.
+        budget = int(getattr(spec, "image_bytes", 0) or 0) if spec else 0
+        if not budget:
+            return views
+        out: list[torch.Tensor] = []
+        for view in views:
+            nbytes = view.numel() * view.element_size()
+            if budget >= nbytes:
+                out.append(view)
+                budget -= nbytes
+                continue
+            if budget > 0:
+                out.append(view.reshape(-1).view(torch.uint8)[:budget])
+                budget = 0
+            break
+        if budget:
+            raise RuntimeError(
+                f"a checkpoint image is {spec.image_bytes} B but its "
+                f"{len(views)} unit views hold "
+                f"{int(spec.image_bytes) - budget} B; "
+                "the unit geometry and the image size disagree"
+            )
+        return out
+
     def build_kv_cache_tensor(self, layer_id: int, module):
         from atom.config import KVCacheTensor
 
@@ -243,6 +339,10 @@ class _KimiMLAGDNCommon(GDNStateMixin):
                 replay_buf_k=(runner.replayssm_buf_k[row] if self.replayssm else None),
                 replay_buf_u=(runner.replayssm_buf_u[row] if self.replayssm else None),
                 replay_buf_g=(runner.replayssm_buf_g[row] if self.replayssm else None),
+                # KDA recurrent state: slot-addressed, not paged. Registered
+                # because the forward reads it from `kv_cache_data`, but
+                # excluded from every block-addressed transfer.
+                per_request_state=True,
             )
 
         if hasattr(module, "base_attention") and getattr(module, "use_mla", False):

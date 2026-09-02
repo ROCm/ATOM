@@ -823,6 +823,28 @@ class GDNStateMixin:
         )
         launch_copy_descriptor(staging.copy_to_gpu(plan.num_spans), plan)
 
+    def state_entry_views(self, slot: int) -> list[torch.Tensor]:
+        """One contiguous slice per (cache, layer) — the slot's whole state.
+
+        Both caches are layer-major with the slot on axis 1, so one slot's rows
+        are strided and there is no single range covering them. Slicing per
+        layer makes each piece contiguous, which is what the staging packer
+        requires; `relocate_state_slots` keeps its own strided views because
+        `_foreach_copy_` has no such constraint and one launch beats `LAYERS`.
+
+        One slot, not a request's whole set: a checkpoint is exactly the
+        committed state (#2045), and the speculation scratch beside it is this
+        request's own and resumable by nobody.
+        """
+        views = []
+        for cache in (
+            self.model_runner.mamba_k_cache,
+            self.model_runner.mamba_v_cache,
+        ):
+            for layer in range(cache.shape[0]):
+                views.append(cache[layer, slot : slot + 1])
+        return views
+
     def relocate_state_slots(self, pairs: Sequence[tuple[int, int]]) -> None:
         """Relocate a live GDN state slot between Active Slot positions.
 
@@ -1413,6 +1435,10 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
                 replay_buf_g=(
                     runner.replayssm_buf_g[gdn_idx] if self.replayssm else None
                 ),
+                # Slot-addressed recurrent state, not paged KV. It has to be
+                # registered (the linear-attention forward reads its state out
+                # of `kv_cache_data`), but no block-addressed mover may touch it.
+                per_request_state=True,
             )
         return super().build_kv_cache_tensor(layer_id, module)
 
