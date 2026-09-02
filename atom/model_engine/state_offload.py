@@ -281,6 +281,14 @@ class _SubConnectorView:
         self.kv_transfer_config = sub
 
     def __getattr__(self, name):
+        # __getattr__ only fires for names normal lookup misses, so if `_config`
+        # itself is unbound -- a pickle/deepcopy probe, or a raise between
+        # `__new__` and the assignment in `__init__` -- reading `self._config`
+        # here re-enters __getattr__ for "_config" and recurses to
+        # RecursionError. This view is built at `BlockManager.__init__`, so that
+        # blast radius is engine startup. Fail as an ordinary missing attribute.
+        if name == "_config":
+            raise AttributeError(name)
         return getattr(self._config, name)
 
 
