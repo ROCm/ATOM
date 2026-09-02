@@ -53,6 +53,7 @@ from atom.model_ops.mamba_ops.causal_conv1d import (
 )
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.rotary_embedding import RotaryEmbedding
+from atom.model_ops.triton_fused_sigmoid_mul_quant import fused_sigmoid_mul_maybe_quant
 from atom.model_ops.utils import atom_parameter
 from atom.models.utils import (
     IntermediateTensors,
@@ -201,15 +202,28 @@ class _NoPositionalRotaryEmbedding(RotaryEmbedding):
 
 
 class SituAndMul(nn.Module):
-    def __init__(self, beta: float = 1.0, linear_beta: float | None = None):
+    def __init__(
+        self,
+        beta: float = 1.0,
+        linear_beta: float | None = None,
+        fused_quant: bool = False,
+    ):
         super().__init__()
         self.beta = beta
         self.linear_beta = linear_beta
+        # Fuse per-token FP8 quant into the activation only when the consuming
+        # down_proj runs a8w8 per-token FP8 AND linear_beta is set (the aiter
+        # kernel always applies the linear-beta tanh to the up half).
+        self.fused_quant = fused_quant and linear_beta is not None
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        from atom.model_ops.kimi_k3 import situ_and_mul
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        from atom.model_ops.kimi_k3 import situ_and_mul_maybe_quant
 
-        return situ_and_mul(x, self.beta, self.linear_beta)
+        # Always (activation, scale): (fp8, scale) when fused, else (bf16, None),
+        # so KimiMLP takes the same down_proj(x_scale=) call site.
+        return situ_and_mul_maybe_quant(
+            x, self.beta, self.linear_beta, quant=self.fused_quant
+        )
 
 
 class KimiRMSNormGated(nn.Module):
@@ -280,9 +294,19 @@ class KimiMLP(nn.Module):
         )
         if config.hidden_act != "situ":
             raise ValueError(f"Unsupported Kimi-K3 activation: {config.hidden_act}")
+        # Fuse SiTUv2 + activation quant when down_proj is a8w8 per-token FP8
+        # (ptpc_fp8): the fused kernel emits (fp8, scale) so down_proj skips its
+        # standalone quant. gate_up/down share a scheme, so probe down_proj.
+        down_type, down_dtype = _effective_layer_quant(
+            quant_config, f"{prefix}.down_proj"
+        )
+        self._fuse_act_quant = (
+            down_type == QuantType.per_Token and down_dtype == dtypes.fp8
+        )
         self.act_fn = SituAndMul(
             beta=getattr(config, "activation_situ_beta", None) or 1.0,
             linear_beta=getattr(config, "activation_situ_linear_beta", None),
+            fused_quant=self._fuse_act_quant,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -291,7 +315,10 @@ class KimiMLP(nn.Module):
         x_scale = None
         if isinstance(x, tuple):
             x, x_scale = x
-        return self.down_proj(self.act_fn(self.gate_up_proj(x, x_scale)))
+        # act_fn always returns (activation, scale): (fp8, scale) when it fused the
+        # down_proj activation quant, else (bf16, None) so down_proj self-quantizes.
+        act, act_scale = self.act_fn(self.gate_up_proj(x, x_scale))
+        return self.down_proj(act, x_scale=act_scale)
 
 
 class KimiSparseMoeBlock(nn.Module):
@@ -437,29 +464,53 @@ class KimiSparseMoeBlock(nn.Module):
             if envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0 and not tbo_active:
                 self._use_dual_stream = True
         if self._use_dual_stream:
-            # Register self so `maybe_dual_stream_forward` can look this module up
+            # Register self so `maybe_dual_stream_split_forward` can look this module up
             # by prefix from static_forward_context (the op is Dynamo-opaque).
             cc = get_current_atom_config().compilation_config
             cc.static_forward_context[self.prefix] = self
 
+        # Whether the routed + shared add can be deferred past this module, i.e.
+        # whether both branches are already full-rank when they are handed back.
+        # Static (config only), so the dispatch below never branches on anything
+        # a traced graph can see. See `split_moe_forward` for the two cases:
+        # the latent path all-reduces each branch separately BEFORE the add, and
+        # at tp_size 1 there is no collective at all. The remaining case --
+        # non-latent with TP -- must sum before its single deferred all-reduce,
+        # and deferring there would cost a second collective to save one add.
+        self._defer_shared_add = self.shared_experts is not None and (
+            self.use_latent_moe or self.tp_size == 1
+        )
+
     def forward(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Returns ``(routed, shared)``, left unsummed.
+        """Returns ``(first, shared)``, where ``shared`` may be None.
 
-        The caller's next apply_attn_res folds both into its prefix on-load, so
-        deferring the add here removes a whole [T, H] elementwise kernel and its
-        HBM round-trip per MoE layer. ``shared`` is None when there are no shared
-        experts, when the two branches had to be summed before a collective (see
-        `split_moe_forward`), or when the dual-stream path ran.
+        When ``shared`` is a tensor the two branches are left unsummed and
+        ``first`` is the routed branch alone: the caller's next apply_attn_res
+        folds both into its prefix on-load, so deferring the add removes a whole
+        [T, H] elementwise kernel and its HBM round-trip per MoE layer.
+
+        When ``shared`` is None, ``first`` is the module's *complete* output --
+        either because there are no shared experts, or because the two branches
+        were summed inside this module (the non-latent TP path must sum before
+        its single deferred all-reduce; see `split_moe_forward`). Callers must
+        therefore treat ``first`` as the whole result and not as a routed
+        partial that is still owed a shared add.
         """
         if self._use_dual_stream:
-            # maybe_dual_stream_forward is a registered custom op, and torch's
-            # schema inference has no representation for a tuple return, so the
-            # deferred add can't cross that boundary. Both dispatch targets sum
-            # internally and the pair collapses to (summed, None). Cheap to give
-            # up: dual-stream only engages at <= ATOM_DUAL_STREAM_MOE_TOKEN_
-            # THRESHOLD tokens, where the [T, H] add it costs us is small.
+            if self._defer_shared_add:
+                # maybe_dual_stream_split_forward hands both branches back unsummed,
+                # so the deferral survives the custom-op boundary and the next
+                # layer's attn_res absorbs the add. (The single-tensor op cannot:
+                # torch's schema inference has no representation for the
+                # optional second tensor, which is why this second op exists.)
+                return torch.ops.aiter.maybe_dual_stream_split_forward(
+                    hidden_states, self.prefix
+                )
+            # Nothing to defer -- either no shared branch, or the branches must
+            # be summed before their collective. Both dispatch targets of the
+            # single-tensor op sum internally.
             summed = torch.ops.aiter.maybe_dual_stream_forward(
                 hidden_states, self.prefix
             )
@@ -506,6 +557,33 @@ class KimiSparseMoeBlock(nn.Module):
         routed, shared = self.split_moe_forward(hidden_states)
         return routed if shared is None else routed + shared
 
+    def single_stream_split_moe_forward(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Unsummed dispatch target for `maybe_dual_stream_split_forward`.
+
+        The split op reaches this whenever dual-stream is gated OFF for a given
+        call (above the token threshold, under TBO, mid piecewise capture), so
+        it has to defer exactly like the dual-stream target -- otherwise the
+        deferral would silently stop above the threshold, where the [T, H] add
+        it saves is largest.
+        """
+        return self._assert_split(self.split_moe_forward(hidden_states))
+
+    @staticmethod
+    def _assert_split(
+        pair: tuple[torch.Tensor, torch.Tensor | None],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Both returns of the split op must be real tensors (its schema has no
+        optional). `_defer_shared_add` gates every call, so a None here means
+        that flag and `split_moe_forward` have drifted apart."""
+        routed, shared = pair
+        assert shared is not None, (
+            "maybe_dual_stream_split_forward requires an unsummed shared output, but "
+            "the MoE summed it; _defer_shared_add disagrees with split_moe_forward"
+        )
+        return routed, shared
+
     def split_moe_forward(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -541,6 +619,25 @@ class KimiSparseMoeBlock(nn.Module):
         return routed_output, None
 
     def dual_stream_moe_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Summed dual-stream dispatch target, for callers that cannot defer."""
+        routed, shared = self._dual_stream_split(hidden_states)
+        return routed if shared is None else routed + shared
+
+    def dual_stream_split_moe_forward(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Unsummed dual-stream dispatch target for `maybe_dual_stream_split_forward`."""
+        return self._assert_split(self._dual_stream_split(hidden_states))
+
+    def _dual_stream_split(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Dual-stream MoE, branches unsummed where deferring is legal.
+
+        Mirrors `split_moe_forward`'s contract (and its reasoning about which
+        collectives allow the add to be deferred); the difference here is only
+        that the shared branch runs on `alt_stream`.
+        """
         # Queue routed pre-AR work first on the current stream, then run the
         # shared-expert path on alt_stream. The latent path keeps both all-reduces
         # on their respective streams while preserving shared AR -> routed AR
@@ -579,15 +676,26 @@ class KimiSparseMoeBlock(nn.Module):
 
             if self.tp_size == 1:
                 current.wait_stream(alt)
+            # shared_output was produced on alt but is consumed on `current`
+            # (here, or -- when the add is deferred -- by the next layer's
+            # attn_res, which also runs on `current`). Either way the allocator
+            # must not recycle it while that consumer is still pending.
             shared_output.record_stream(current)
-            return routed_output + shared_output
+            # Both branches are full-rank after their own all-reduce, so the add
+            # between them is deferrable: hand them back for the next layer's
+            # attn_res to fold into its on-load.
+            return routed_output, shared_output
 
-        # Non-latent: shared has no AR yet; single deferred AR over the sum.
+        # Non-latent: shared has no AR yet.
         current.wait_stream(alt)
-        routed_output = routed_output + shared_output
-        if self.tp_size > 1:
-            routed_output = tensor_model_parallel_all_reduce(routed_output)
-        return routed_output
+        shared_output.record_stream(current)
+        if self.tp_size == 1:
+            # No collective to batch, so the add is free to defer.
+            return routed_output, shared_output
+        # With TP both branches are partial and a single deferred AR covers
+        # their sum, so they must be summed BEFORE it (see split_moe_forward).
+        routed_output = tensor_model_parallel_all_reduce(routed_output + shared_output)
+        return routed_output, None
 
 
 class KimiFullAttention(nn.Module):
@@ -714,6 +822,19 @@ class KimiFullAttention(nn.Module):
             a_scheme[0] in _RMS_FUSABLE_QUANT_TYPES and a_scheme == g_scheme
         )
         self.input_quant_prefix = f"{prefix}.fused_qkv_a_proj"
+        # Fuse sigmoid(g_proj) * attn_out + activation quant into one triton kernel
+        # when o_proj runs FP8 in a scheme the fused kernel emits: per-token
+        # (ptpc_fp8) or per-1x128 block.
+        o_type, o_dtype = _effective_layer_quant(quant_config, f"{prefix}.o_proj")
+        self.fuse_sigmoid_mul_quant = o_dtype == dtypes.fp8 and o_type in (
+            QuantType.per_Token,
+            QuantType.per_1x128,
+        )
+        # .value, like qknorm_quant_type_value above: comparing the pybind11
+        # QuantType inside forward() graph-breaks Dynamo.
+        self.o_proj_quant_type_value = (
+            o_type.value if self.fuse_sigmoid_mul_quant else QuantType.No.value
+        )
 
     def forward(
         self, positions: torch.Tensor, hidden_states: torch.Tensor
@@ -761,10 +882,16 @@ class KimiFullAttention(nn.Module):
             transpose_scale=True,
         )
         attn_out = self.attn(q, kv, k_rope, positions, q_scale=q_scale)
-        attn_out = attn_out * torch.sigmoid(
-            self.g_proj(hidden_states, hidden_states_scale)
+        gate = self.g_proj(hidden_states, hidden_states_scale)
+        # sigmoid(gate) * attn_out, fused with fp8 quant when o_proj runs fp8
+        # (per-token ptpc_fp8 or per-1x128 block).
+        attn_out, attn_scale = fused_sigmoid_mul_maybe_quant(
+            attn_out,
+            gate,
+            quant=self.fuse_sigmoid_mul_quant,
+            quant_type_value=self.o_proj_quant_type_value,
         )
-        return self.o_proj(attn_out)
+        return self.o_proj(attn_out, x_scale=attn_scale)
 
 
 def _kda_attention_with_output_fake(
@@ -939,6 +1066,18 @@ class KimiKDAAttention(nn.Module):
         self.fuse_input_norm_quant = in_proj_type in _RMS_FUSABLE_QUANT_TYPES
         self.input_quant_prefix = f"{prefix}.in_proj"
 
+        # f_a is a column slice of the fused in_proj output, so it needs a
+        # row-contiguous copy before f_b_proj's GEMM. When f_b_proj runs
+        # per-token FP8 it would then ALSO quantize that copy -- two [T, head_dim]
+        # round-trips. Decided by f_b_proj's own resolved scheme (the consuming
+        # GEMM is what dictates the activation layout): under ptpc the slice is
+        # gathered and quantized by one kernel instead, and under any other
+        # scheme this stays False and the plain .contiguous() path runs.
+        f_b_type, f_b_dtype = _effective_layer_quant(quant_config, f"{prefix}.f_b_proj")
+        self.fuse_f_a_quant = (
+            f_b_type == QuantType.per_Token and f_b_dtype == dtypes.fp8
+        )
+
     def get_streaming_deferred_modules(self) -> tuple[nn.Module, ...]:
         """Children that must remain unquantized until KDA fuses their weights."""
         return self.in_proj, self.f_a_proj
@@ -1106,10 +1245,21 @@ class KimiKDAAttention(nn.Module):
         # beta is widened to fp32 inside _run_kda (see the note there): the KDA
         # delta-rule write strength must stay fp32 for accuracy.
         beta = fused_in[..., 4 * lp : 4 * lp + nlh].unsqueeze(0)
-        # f_a feeds a second GEMM (f_b_proj); make it contiguous so tgemm sees a
-        # unit row stride rather than the fused output's N_fused stride.
-        f_a = fused_in[..., 4 * lp + nlh : 4 * lp + nlh + hd].contiguous()
-        gate = self.f_b_proj(f_a)
+        # f_a feeds a second GEMM (f_b_proj) and is a column slice of the fused
+        # output, so it needs a unit row stride rather than the fused N_fused one.
+        # Under a per-token FP8 f_b_proj that copy would be followed by a quant
+        # of the same [T, head_dim]; strided_per_token_quant does the gather AND the
+        # quant in one kernel, so only the quantized result is ever written.
+        # Otherwise the plain contiguous copy runs and f_b_proj quantizes (or
+        # not) exactly as before.
+        f_a_view = fused_in[..., 4 * lp + nlh : 4 * lp + nlh + hd]
+        if self.fuse_f_a_quant:
+            from atom.model_ops.kimi_k3 import strided_per_token_quant
+
+            f_a, f_a_scale = strided_per_token_quant(f_a_view, dtypes.fp8)
+            gate = self.f_b_proj(f_a, x_scale=f_a_scale)
+        else:
+            gate = self.f_b_proj(f_a_view.contiguous())
         gate = rearrange(gate, "t (h d) -> 1 t h d", d=self.head_dim)
         # Allocate from fused_in (bf16), not hidden_states, which may be fp8.
         out = fused_in.new_empty(
