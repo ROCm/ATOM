@@ -75,23 +75,28 @@ slurm_job_in_queue() {
 }
 
 select_random_idle_slurm_nodes() {
-  local want_count="$1"
-  shift
+  local min_count="$1"
+  local max_count="$2"
+  shift 2
   local -a candidates=("$@")
   local -a sinfo_cmd=(sinfo -h -N)
   local -a idle_nodes=()
   local -a selected=()
-  local node state state_upper
+  local node state state_upper select_count
   local wait_seconds="${SLURM_IDLE_NODE_WAIT_SECONDS:-1800}"
   local poll_interval="${SLURM_IDLE_NODE_POLL_INTERVAL:-30}"
   local deadline=$(( $(date +%s) + wait_seconds ))
 
-  if [[ "${want_count}" -lt 1 ]]; then
-    echo "ERROR: select_random_idle_slurm_nodes requires a positive node count" >&2
+  if [[ "${min_count}" -lt 1 ]]; then
+    echo "ERROR: select_random_idle_slurm_nodes requires min_count >= 1" >&2
     return 1
   fi
-  if [[ "${#candidates[@]}" -lt "${want_count}" ]]; then
-    echo "ERROR: only ${#candidates[@]} candidate node(s) provided, need ${want_count}" >&2
+  if [[ "${max_count}" -lt "${min_count}" ]]; then
+    echo "ERROR: select_random_idle_slurm_nodes requires max_count >= min_count" >&2
+    return 1
+  fi
+  if [[ "${#candidates[@]}" -lt "${min_count}" ]]; then
+    echo "ERROR: only ${#candidates[@]} candidate node(s) provided, need at least ${min_count}" >&2
     return 1
   fi
   if ! command -v sinfo >/dev/null 2>&1; then
@@ -113,20 +118,25 @@ select_random_idle_slurm_nodes() {
       fi
     done
 
-    if [[ "${#idle_nodes[@]}" -ge "${want_count}" ]]; then
+    if [[ "${#idle_nodes[@]}" -ge "${min_count}" ]]; then
       break
     fi
 
     if [[ "$(date +%s)" -ge "${deadline}" ]]; then
-      echo "ERROR: only ${#idle_nodes[@]} idle node(s) available among candidates (${candidates[*]}) after ${wait_seconds}s, need ${want_count}" >&2
+      echo "ERROR: only ${#idle_nodes[@]} idle node(s) available among candidates (${candidates[*]}) after ${wait_seconds}s, need at least ${min_count}" >&2
       return 1
     fi
 
-    echo "=== waiting for ${want_count} idle node(s): ${#idle_nodes[@]} currently idle among ${#candidates[@]} candidates; retrying in ${poll_interval}s (timeout ${wait_seconds}s) ===" >&2
+    echo "=== waiting for at least ${min_count} idle node(s) (up to ${max_count}): ${#idle_nodes[@]} currently idle among ${#candidates[@]} candidates; retrying in ${poll_interval}s (timeout ${wait_seconds}s) ===" >&2
     sleep "${poll_interval}"
   done
 
-  mapfile -t selected < <(printf '%s\n' "${idle_nodes[@]}" | shuf | head -n "${want_count}")
+  select_count="${#idle_nodes[@]}"
+  if [[ "${select_count}" -gt "${max_count}" ]]; then
+    select_count="${max_count}"
+  fi
+
+  mapfile -t selected < <(printf '%s\n' "${idle_nodes[@]}" | shuf | head -n "${select_count}")
   (IFS=,; echo "${selected[*]}")
 }
 

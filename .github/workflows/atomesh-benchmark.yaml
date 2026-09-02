@@ -443,7 +443,8 @@ jobs:
 
           nodes="${RDMA_SMOKE_NODES:-${ATOMESH_1P1D_NODES:-}}"
           nodes="${nodes// /}"
-          RDMA_SMOKE_TARGET_NODE_COUNT=2
+          RDMA_SMOKE_MIN_NODE_COUNT=1
+          RDMA_SMOKE_MAX_NODE_COUNT=2
           USES_SPUR_CONTROLLER=0
           SPUR_CONTROLLER_ADDR=""
           SPUR_ACCOUNTING_ADDR=""
@@ -461,16 +462,16 @@ jobs:
 
           if [[ -n "${nodes}" ]]; then
             IFS=',' read -r -a node_list <<< "${nodes}"
-            if [[ "${#node_list[@]}" -gt "${RDMA_SMOKE_TARGET_NODE_COUNT}" ]]; then
-              echo "=== selecting ${RDMA_SMOKE_TARGET_NODE_COUNT} idle node(s) from ${#node_list[@]} candidates ==="
-              nodes="$(select_random_idle_slurm_nodes "${RDMA_SMOKE_TARGET_NODE_COUNT}" "${node_list[@]}")"
+            if [[ "${#node_list[@]}" -gt "${RDMA_SMOKE_MIN_NODE_COUNT}" ]]; then
+              echo "=== selecting up to ${RDMA_SMOKE_MAX_NODE_COUNT} idle node(s) (min ${RDMA_SMOKE_MIN_NODE_COUNT}) from ${#node_list[@]} candidates ==="
+              nodes="$(select_random_idle_slurm_nodes "${RDMA_SMOKE_MIN_NODE_COUNT}" "${RDMA_SMOKE_MAX_NODE_COUNT}" "${node_list[@]}")"
               echo "selected_nodes=${nodes}"
               IFS=',' read -r -a node_list <<< "${nodes}"
             fi
             node_count="${#node_list[@]}"
           else
-            # Allocate two nodes by default so both local and cross-node GDR are validated.
-            node_count="${RDMA_SMOKE_TARGET_NODE_COUNT}"
+            # Allocate up to two nodes when available so both local and cross-node GDR are validated.
+            node_count="${RDMA_SMOKE_MAX_NODE_COUNT}"
           fi
           if [[ "${node_count}" -lt 1 ]]; then
             echo "::error::GPUDirect RDMA smoke testing requires at least one Slurm node."
