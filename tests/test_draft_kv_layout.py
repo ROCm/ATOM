@@ -5,13 +5,16 @@
 (`tests/conftest.py`), and `eagle3_kv_builder` does `from aiter import dtypes`
 at import time, so a test reaching the predicate through the builder is skipped
 -- on the very CI whose OOM this fixes. `atom.spec_decode.draft_kv_layout` does
-not need aiter, so it imports here and both halves of the decision, the shape
-test *and* the env read, are covered.
+not need aiter, so it imports here.
+
+Scope: the shape terms of the decision. The env read that feeds it now lives in
+`PagedAttentionImpl.__init__` as `use_triton_attn`, behind the aiter barrier, so
+here it is an input rather than something these tests cover.
 
 Getting the decision wrong is silent both ways: every layout holds the same
 element count, so a mismatched pool reads transposed data without faulting. A
-draft that today gets a working SHUFFLE V (no force-triton, head_dim 128, no
-sliding window -- the Kimi-K2.5 shape) must keep it.
+draft that today gets a working SHUFFLE V (not on the Triton path -- the
+Kimi-K2.5 shape) must keep it.
 
 The last test guards something else: `block_tables` freshness is tracked in
 `CpuGpuBuffer.copy_to_gpu`, which is only sound while every upload goes through
@@ -35,26 +38,16 @@ from atom.spec_decode.draft_kv_layout import use_flash_layout
 _ROOT = Path(__file__).resolve().parents[1]
 
 
-def _impl(*, rotary=True, qk_norm=False, sliding_window=-1, head_dim=128):
+def _impl(*, rotary=True, qk_norm=False, triton=False):
+    """`use_triton_attn` is set in PagedAttentionImpl.__init__ from the env,
+    the sliding window and head_dim; the predicate only reads the result."""
     norm = object() if qk_norm else None
     return SimpleNamespace(
         rotary_emb=object() if rotary else None,
         q_norm=norm,
         k_norm=norm,
-        sliding_window=sliding_window,
-        head_dim=head_dim,
+        use_triton_attn=triton,
     )
-
-
-@pytest.fixture
-def force_triton(monkeypatch):
-    """`envs` reads os.environ through __getattr__ on every access, so setting
-    the variable is enough -- there is no import-time value to patch."""
-
-    def _set(on: bool):
-        monkeypatch.setenv("ATOM_FORCE_ATTN_TRITON", "1" if on else "0")
-
-    return _set
 
 
 def test_the_predicate_imports_without_aiter(tmp_path):
@@ -86,54 +79,47 @@ def test_the_predicate_imports_without_aiter(tmp_path):
 # --- the decision ------------------------------------------------------------
 
 
-def test_minimax_m3_draft_gets_flash(force_triton):
-    """force-triton is what sends rope_cache down the 4D-V writer."""
-    force_triton(True)
-    assert use_flash_layout(_impl()) is True
+def test_minimax_m3_draft_gets_flash():
+    """use_triton_attn is what sends rope_cache down the 4D-V writer."""
+    assert use_flash_layout(_impl(triton=True)) is True
 
 
-def test_kimi_k25_draft_keeps_its_layout(force_triton):
-    """head_dim 128, no sliding window, no force-triton: already a working
-    SHUFFLE V from reshape_and_cache(asm_layout=True)."""
-    force_triton(False)
-    assert use_flash_layout(_impl()) is False
+def test_kimi_k25_draft_keeps_its_layout():
+    """Not on the Triton path: already a working SHUFFLE V from
+    reshape_and_cache(asm_layout=True), and a flash pool would break it."""
+    assert use_flash_layout(_impl(triton=False)) is False
 
 
-@pytest.mark.parametrize(
-    "kwargs",
-    [
-        pytest.param({"sliding_window": 4096}, id="sliding_window"),
-        pytest.param({"head_dim": 64}, id="head_dim_not_128"),
-    ],
-)
-def test_use_triton_attn_without_the_env(force_triton, kwargs):
-    """`use_triton_attn` is an OR of three terms; the env is only one."""
-    force_triton(False)
-    assert use_flash_layout(_impl(**kwargs)) is True
+def test_a_sparse_impl_is_classified_by_its_own_flag():
+    """SparseMHAPagedAttentionImpl sets `use_triton_attn = False` in `__init__`
+    and hardcodes SHUFFLE in its `rope_cache` override.
+
+    `qk_norm=False` on purpose: with both norms the early return above fires
+    first and the flag is never read, so the case would pass whatever the flag
+    said -- which is the thing being checked.
+    """
+    assert use_flash_layout(_impl(triton=False, qk_norm=False)) is False
 
 
-def test_qk_norm_draft_is_left_alone(force_triton):
+def test_qk_norm_draft_is_left_alone():
     """rope_cache's first branch re-views V to SHUFFLE on its own, so this
     module never sees the 4D V and must not be handed a flash pool."""
-    force_triton(True)
-    assert use_flash_layout(_impl(qk_norm=True)) is False
+    assert use_flash_layout(_impl(triton=True, qk_norm=True)) is False
 
 
-def test_only_one_norm_still_counts_as_the_4d_writer(force_triton):
+def test_only_one_norm_still_counts_as_the_4d_writer():
     """rope_cache's first branch needs BOTH norms; one alone falls through."""
-    force_triton(True)
-    impl = _impl()
+    impl = _impl(triton=True)
     impl.q_norm = object()  # k_norm stays None
     assert use_flash_layout(impl) is True
 
 
-def test_non_attention_module(force_triton):
+def test_non_attention_module():
     """build_kv_cache_tensor passes getattr(module, "impl", None)."""
-    force_triton(True)
     assert use_flash_layout(None) is False
 
 
-def test_rope_less_draft_is_a_known_gap(force_triton):
+def test_rope_less_draft_is_a_known_gap():
     """A KNOWN GAP, pinned so it is not mistaken for a deliberate choice.
 
     Without rotary_emb this returns False, which is right on its own -- but not
@@ -145,8 +131,7 @@ def test_rope_less_draft_is_a_known_gap(force_triton):
     recorded rather than fixed. If you are here because a rope-less draft OOMs
     on a whole-pool convert: this assertion is the bug, not the contract.
     """
-    force_triton(True)
-    assert use_flash_layout(_impl(rotary=False)) is False
+    assert use_flash_layout(_impl(rotary=False, triton=True)) is False
 
 
 # --- the invariant the freshness guard rests on ------------------------------

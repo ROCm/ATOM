@@ -115,6 +115,15 @@ class PagedAttentionImpl(nn.Module):
         self.rotary_emb = rotary_emb
         self.q_norm = q_norm
         self.k_norm = k_norm
+        # Fall back to Triton/Gluon for layouts unsupported by AITer PA ASM.
+        # Set here rather than only in `rope_cache` so it is readable at KV bind
+        # time, which runs before any forward. `rope_cache`, `_dispatch_decode`
+        # and the Eagle3 draft builder all read it, so it has one definition.
+        self.use_triton_attn = (
+            envs.ATOM_FORCE_ATTN_TRITON
+            or self.sliding_window != -1
+            or self.head_dim != 128
+        )
         # Pool is flash (4D) [num_blocks, block_size, num_kv_heads, head_dim]
         # rather than 5D SHUFFLE. Set at bind time by whichever builder allocates
         # it; Eagle3DraftBuilder is the only one that sets True today. A builder
@@ -230,13 +239,7 @@ class PagedAttentionImpl(nn.Module):
         k_scale = kv_cache_data[f"layer_{self.layer_num}"].k_scale
         v_scale = kv_cache_data[f"layer_{self.layer_num}"].v_scale
 
-        # Fall back to Triton/Gluon for layouts unsupported by AITer PA ASM.
-        use_triton_attn = (
-            envs.ATOM_FORCE_ATTN_TRITON
-            or self.sliding_window != -1
-            or self.head_dim != 128
-        )
-        self.use_triton_attn = use_triton_attn
+        use_triton_attn = self.use_triton_attn
 
         if (
             self.rotary_emb is not None
@@ -1023,6 +1026,10 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             k_norm=k_norm,
             **kwargs,
         )
+        # M3 sparse attention is fixed to head_dim == 128 and the AITER fused
+        # path; no Triton fallback. Set here as well as in `rope_cache` so the
+        # KV binder, which runs before any forward, reads the right value.
+        self.use_triton_attn = False
         # Indexer submodules + top-k parameters (impl-local state).
         self.index_q_norm = index_q_norm
         self.index_k_norm = index_k_norm

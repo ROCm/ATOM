@@ -4,13 +4,10 @@
 Split out of `eagle3_kv_builder` so it can be tested: that module does
 `from aiter import dtypes` at import time, and CI has no aiter, so a test
 reaching the predicate through it is skipped -- on the very CI whose OOM this
-fixes. Nothing else here needs aiter, so this module is importable there and the
-env read stays inside it, where a test can reach it too.
+fixes. This module needs nothing that pulls aiter, so it imports there.
 """
 
 from __future__ import annotations
-
-from atom.utils import envs
 
 
 def use_flash_layout(impl) -> bool:
@@ -28,9 +25,10 @@ def use_flash_layout(impl) -> bool:
     whole-pool convert. Not fixed here: that writer is `reshape_and_cache`,
     with its own blast radius. See test_rope_less_draft_is_a_known_gap.
 
-    NOTE: this mirrors the *base* `rope_cache`. `SparseMHAPagedAttentionImpl`
-    overrides it wholesale and hardcodes SHUFFLE; that impl is safe today only
-    because it always carries both norms, which returns False here anyway.
+    `SparseMHAPagedAttentionImpl` overrides `rope_cache` wholesale and hardcodes
+    SHUFFLE; it sets `use_triton_attn = False` in `__init__` too, so reading the
+    flag classifies it correctly at bind time rather than relying on its q/k
+    norms to trip the early return above.
     """
     if impl is None or getattr(impl, "rotary_emb", None) is None:
         return False
@@ -40,7 +38,6 @@ def use_flash_layout(impl) -> bool:
         and getattr(impl, "k_norm", None) is not None
     ):
         return False
-    # rope_cache's `use_triton_attn`: the env is one of three terms, not all.
-    return bool(
-        envs.ATOM_FORCE_ATTN_TRITON or impl.sliding_window != -1 or impl.head_dim != 128
-    )
+    # The same flag `rope_cache` branches on, set in PagedAttentionImpl.__init__
+    # so it is readable here -- KV binding runs before any forward.
+    return bool(impl.use_triton_attn)
