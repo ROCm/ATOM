@@ -82,6 +82,9 @@ select_random_idle_slurm_nodes() {
   local -a idle_nodes=()
   local -a selected=()
   local node state state_upper
+  local wait_seconds="${SLURM_IDLE_NODE_WAIT_SECONDS:-1800}"
+  local poll_interval="${SLURM_IDLE_NODE_POLL_INTERVAL:-30}"
+  local deadline=$(( $(date +%s) + wait_seconds ))
 
   if [[ "${want_count}" -lt 1 ]]; then
     echo "ERROR: select_random_idle_slurm_nodes requires a positive node count" >&2
@@ -100,18 +103,28 @@ select_random_idle_slurm_nodes() {
     sinfo_cmd+=(--controller "${SPUR_CONTROLLER_ADDR}")
   fi
 
-  for node in "${candidates[@]}"; do
-    state="$("${sinfo_cmd[@]}" --nodelist "${node}" --format="%T" 2>/dev/null | awk 'NF { print $1; exit }' || true)"
-    state_upper="${state^^}"
-    if [[ "${state_upper}" == "IDLE" || "${state_upper}" == IDLE* ]]; then
-      idle_nodes+=("${node}")
-    fi
-  done
+  while true; do
+    idle_nodes=()
+    for node in "${candidates[@]}"; do
+      state="$("${sinfo_cmd[@]}" --nodelist "${node}" --format="%T" 2>/dev/null | awk 'NF { print $1; exit }' || true)"
+      state_upper="${state^^}"
+      if [[ "${state_upper}" == "IDLE" || "${state_upper}" == IDLE* ]]; then
+        idle_nodes+=("${node}")
+      fi
+    done
 
-  if [[ "${#idle_nodes[@]}" -lt "${want_count}" ]]; then
-    echo "ERROR: only ${#idle_nodes[@]} idle node(s) available among candidates (${candidates[*]}), need ${want_count}" >&2
-    return 1
-  fi
+    if [[ "${#idle_nodes[@]}" -ge "${want_count}" ]]; then
+      break
+    fi
+
+    if [[ "$(date +%s)" -ge "${deadline}" ]]; then
+      echo "ERROR: only ${#idle_nodes[@]} idle node(s) available among candidates (${candidates[*]}) after ${wait_seconds}s, need ${want_count}" >&2
+      return 1
+    fi
+
+    echo "=== waiting for ${want_count} idle node(s): ${#idle_nodes[@]} currently idle among ${#candidates[@]} candidates; retrying in ${poll_interval}s (timeout ${wait_seconds}s) ===" >&2
+    sleep "${poll_interval}"
+  done
 
   mapfile -t selected < <(printf '%s\n' "${idle_nodes[@]}" | shuf | head -n "${want_count}")
   (IFS=,; echo "${selected[*]}")
