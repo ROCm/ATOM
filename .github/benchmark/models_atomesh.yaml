@@ -391,7 +391,7 @@ models:
         kv_cache_dtype: fp8
         block_size: 16
         enable_prefix_caching: false
-        gpu_memory_utilization: 0.8
+        gpu_memory_utilization: 0.9
         max_num_seqs: 256
         max_num_batched_tokens: 32768
         max_model_len: 32768
