@@ -2481,8 +2481,15 @@ class ModelRunner:
         is_prefill = batch.total_tokens_num_prefill > 0
         scheduled_bs = batch.total_seqs_num
         scheduled_tokens = batch.total_tokens_num
-        num_scheduled_tokens = np.asarray(batch.num_scheduled_tokens)
-        cu_seqlens_q, _arange = self._get_cumsum_and_arange(num_scheduled_tokens)
+        if attn_host_preparation is None:
+            num_scheduled_tokens = np.asarray(batch.num_scheduled_tokens)
+            cu_seqlens_q, _arange = self._get_cumsum_and_arange(num_scheduled_tokens)
+        else:
+            # DSV4 early decode prep already built both arrays before the DP
+            # wait. Re-running repeat/cumsum/arange here put pure NumPy work
+            # back on the graph-launch critical path.
+            num_scheduled_tokens = attn_host_preparation.extend_lens_np
+            cu_seqlens_q = self.forward_vars["cu_seqlens_q"].np[1 : scheduled_bs + 1]
         sync = forward_mode.sync
         num_tokens_across_dp = None if sync is None else sync.num_tokens_across_dp
         tbo_collective_active = forward_mode.tbo_collective_active
@@ -2764,6 +2771,14 @@ class ModelRunner:
             temperatures, top_ks, top_ps, all_greedy, needs_independent_noise = (
                 self.prepare_sample(batch)
             )
+            if attn_host_preparation is not None:
+                join_decode_host_preparation = getattr(
+                    self.attn_metadata_builder,
+                    "join_decode_host_preparation",
+                    None,
+                )
+                if join_decode_host_preparation is not None:
+                    join_decode_host_preparation(attn_host_preparation)
             with record_function("dp_metadata.finish_wait"):
                 sync = finish_sync_dp_metadata(preparation.dp_sync)
             forward_mode = _decide(sync)

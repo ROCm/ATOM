@@ -150,6 +150,7 @@ def test_device_metadata_wait_is_hidden_by_local_input_staging():
     input_ids = _attribute_calls(device_body, "prepare_input_ids")
     decode_host = _name_calls(device_body, "prepare_decode_host")
     spec_decode = _attribute_calls(device_body, "calc_spec_decode_metadata")
+    join_decode_host = _name_calls(device_body, "join_decode_host_preparation")
     finish = _name_calls(device_body, "finish_sync_dp_metadata")
     decide = _name_calls(device_body, "_decide")
 
@@ -158,6 +159,7 @@ def test_device_metadata_wait_is_hidden_by_local_input_staging():
         == len(input_ids)
         == len(decode_host)
         == len(spec_decode)
+        == len(join_decode_host)
         == len(finish)
         == len(decide)
         == 1
@@ -167,6 +169,7 @@ def test_device_metadata_wait_is_hidden_by_local_input_staging():
         < decode_host[0].lineno
         < spec_decode[0].lineno
         < sample[0].lineno
+        < join_decode_host[0].lineno
         < finish[0].lineno
         < decide[0].lineno
     )
@@ -179,6 +182,9 @@ def test_deferred_scheduler_output_precedes_current_draft_submission():
     publish = _attribute_calls(postprocess, "_publish_forward_output_early")
     propose = _attribute_calls(postprocess, "propose_draft_token_ids")
 
-    assert len(publish) == 1
+    # Real forwards publish the previous generation's output, while dummy
+    # forwards publish their completion acknowledgement.  Both branches must
+    # release the scheduler before the shared proposal submission below.
+    assert len(publish) == 2
     assert len(propose) == 2  # deferred and ordinary/non-deferred paths
-    assert publish[0].lineno < min(call.lineno for call in propose)
+    assert max(call.lineno for call in publish) < min(call.lineno for call in propose)

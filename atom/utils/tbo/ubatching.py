@@ -22,8 +22,8 @@ class DPMetadataBuffers:
     tensor one scalar at a time turns each assignment into a synchronous H2D
     runtime call.  Keep both directions pinned and reuse one device pair so a
     step is exactly one H2D, one collective, and one D2H on an independent
-    stream.  The final stream synchronization is required because Python
-    consumes the gathered values immediately.
+    stream.  A completion event fences the trailing D2H before Python consumes
+    the gathered values.
     """
 
     dp_size: int
@@ -32,7 +32,9 @@ class DPMetadataBuffers:
     gathered_device: torch.Tensor
     gathered_cpu: torch.Tensor
     local_numpy: np.ndarray
+    gathered_numpy: np.ndarray
     stream: torch.cuda.Stream
+    completion_event: torch.cuda.Event
 
     @classmethod
     def allocate(cls, dp_size: int, device: torch.device | str) -> "DPMetadataBuffers":
@@ -61,7 +63,12 @@ class DPMetadataBuffers:
             gathered_device=torch.empty_like(gathered_cpu, device=device),
             gathered_cpu=gathered_cpu,
             local_numpy=local_cpu.numpy(),
+            gathered_numpy=gathered_cpu.numpy(),
             stream=torch.cuda.Stream(device=device),
+            # A non-blocking event uses the runtime's active-wait completion
+            # path.  Synchronizing the whole stream added a sizeable host wake
+            # delay after the tiny metadata D2H had already completed.
+            completion_event=torch.cuda.Event(enable_timing=False, blocking=False),
         )
 
 
@@ -272,6 +279,8 @@ class PendingDPMetadataSync:
     tbo_on: bool
     dspark_on: bool
     completion_stream: torch.cuda.Stream | None
+    completion_event: torch.cuda.Event | None
+    sync_numpy: np.ndarray | None
     clone_rank_tokens: bool
     result: DPSyncResult | None = None
 
@@ -349,6 +358,8 @@ def begin_sync_dp_metadata(
             tbo_on=tbo_on,
             dspark_on=max_seqlen_q is not None,
             completion_stream=None,
+            completion_event=None,
+            sync_numpy=None,
             clone_rank_tokens=False,
         )
 
@@ -375,12 +386,15 @@ def begin_sync_dp_metadata(
             gathered_device, local_device, group=dp_group
         )
         gathered_cpu.copy_(gathered_device, non_blocking=True)
+        buffers.completion_event.record()
 
     return PendingDPMetadataSync(
         sync=gathered_cpu.view(dp_size, n_fields).T,
         tbo_on=tbo_on,
         dspark_on=max_seqlen_q is not None,
         completion_stream=buffers.stream,
+        completion_event=buffers.completion_event,
+        sync_numpy=buffers.gathered_numpy[:required_numel].reshape(dp_size, n_fields).T,
         clone_rank_tokens=True,
     )
 
@@ -390,18 +404,28 @@ def finish_sync_dp_metadata(pending: PendingDPMetadataSync) -> DPSyncResult:
 
     if pending.result is not None:
         return pending.result
-    if pending.completion_stream is not None:
+    if pending.completion_event is not None:
+        pending.completion_event.synchronize()
+    elif pending.completion_stream is not None:
         pending.completion_stream.synchronize()
 
     sync = pending.sync
-    sync_np = sync.numpy()
+    sync_np = pending.sync_numpy if pending.sync_numpy is not None else sync.numpy()
     tbo_on = pending.tbo_on
     dspark_on = pending.dspark_on
 
     # Device sync reuses its host landing buffer next step. Preserve the old
     # result-ownership contract for callers that retain the ForwardMode.
-    num_tokens_across_dp = sync[0].clone() if pending.clone_rank_tokens else sync[0]
-    rank_tokens_np = num_tokens_across_dp.numpy()
+    if pending.clone_rank_tokens:
+        # Keep result ownership without routing an eight-element copy through
+        # the PyTorch dispatcher.  The NumPy allocation is owned by the tensor
+        # returned from ``from_numpy`` and cannot be overwritten when the
+        # pinned landing buffer is reused on the next step.
+        rank_tokens_np = sync_np[0].copy()
+        num_tokens_across_dp = torch.from_numpy(rank_tokens_np)
+    else:
+        num_tokens_across_dp = sync[0]
+        rank_tokens_np = sync_np[0]
     max_tokens_index = int(np.argmax(rank_tokens_np))
     max_tokens_across_dp = int(rank_tokens_np[max_tokens_index])
     max_tokens_across_dp_cpu = num_tokens_across_dp[max_tokens_index]

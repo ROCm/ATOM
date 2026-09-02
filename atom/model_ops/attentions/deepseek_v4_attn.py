@@ -131,6 +131,8 @@ class _V4DecodeHostPreparation:
     scheduled_bs: int
     sum_scheduled_tokens: int
     full_q: int
+    max_context_len: int
+    total_kv: int
     context_lens_np: np.ndarray
     positions_np: np.ndarray
     state_slot_np: np.ndarray
@@ -441,6 +443,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # Including the root tensor and storage offset keeps arena-packed
         # buffers and the pipeline forward_vars ring distinct.
         self._decode_prefix_view_cache: dict[tuple, torch.Tensor] = {}
+        # A graph bucket publishes the same fixed-address tensor views on every
+        # steady decode. Cache the assembled object as well as its individual
+        # views; each step refreshes the few host-valued fields below.
+        self._decode_metadata_cache: dict[
+            tuple, tuple[dict[str, Any], torch.Tensor]
+        ] = {}
         hf = model_runner.config.hf_config
         ratios = list(getattr(hf, "compress_ratios", ()))
         assert ratios, "deepseek_v4 hf_config must define compress_ratios"
@@ -1094,6 +1102,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         self._checkpoint_plan_cache = None
         self._checkpoint_slot_base_cache = None
         self._checkpoint_descriptor = None
+        getattr(self, "_decode_prefix_view_cache", {}).clear()
+        getattr(self, "_decode_metadata_cache", {}).clear()
 
     def warmup_per_req_cache(self) -> None:
         """Run one checkpoint copy now, so the first real one is only a copy.
@@ -2593,6 +2603,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             np.arange(scheduled_bs, dtype=np.int32), extend_lens_np
         )
         n_committed_csa_per_seq_np = context_lens_np // 4
+        max_context_len = int(context_lens_np.max()) if context_lens_np.size else 1
+        total_kv = int(context_lens_np.sum())
 
         # Queue all shape-independent uploads behind the in-flight compute
         # stream. Use maximum decode extents so the DP result only selects
@@ -2779,6 +2791,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             scheduled_bs=scheduled_bs,
             sum_scheduled_tokens=sum_scheduled_tokens,
             full_q=full_q,
+            max_context_len=max_context_len,
+            total_kv=total_kv,
             context_lens_np=context_lens_np,
             positions_np=positions_np,
             state_slot_np=state_slot_np,
@@ -2805,6 +2819,19 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             fp4_schedule_prepared=fp4_schedule_prepared,
         )
 
+    def join_decode_host_preparation(
+        self, host_preparation: _V4DecodeHostPreparation
+    ) -> None:
+        """Join early decode prep after all independent main-stream uploads.
+
+        ModelRunner calls this after input/spec/sampling H2Ds but before the DP
+        wait.  The command is therefore hidden from the launch tail without
+        serializing those independent copies behind the prep stream.
+        """
+
+        del host_preparation  # documents that the one reusable event is the join
+        torch.cuda.current_stream().wait_event(self._decode_prep_done_event)
+
     def prepare_decode(
         self,
         batch: ScheduledBatch,
@@ -2821,14 +2848,16 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         shape wait. This method only selects views for the agreed graph bucket
         and joins ``prep_stream`` before publishing them.
         """
-        if (
+        host_preparation_needs_join = (
             host_preparation is None
             or host_preparation.batch_identity != id(batch)
             or host_preparation.max_seqlen_q != max_seqlen_q
             or host_preparation.scheduled_bs != batch.total_seqs_num_decode
             or host_preparation.sum_scheduled_tokens != batch.total_tokens_num_decode
-        ):
+        )
+        if host_preparation_needs_join:
             host_preparation = self.prepare_decode_host(batch, max_seqlen_q)
+            self.join_decode_host_preparation(host_preparation)
 
         scheduled_bs = host_preparation.scheduled_bs
         context_lens_np = host_preparation.context_lens_np
@@ -2842,51 +2871,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # rectangular step's `running_bs * q` are the same field.
         graph_cap_tokens = int(running_tokens)
         sum_scheduled_tokens_padded = max(graph_cap_tokens, sum_scheduled_tokens)
+        running_bs = int(running_bs)
 
         state_slot_np = host_preparation.state_slot_np
-        # ---- join the uploads submitted before the DP wait ----
-        current_stream = torch.cuda.current_stream()
-        positions = self._cached_decode_prefix(
-            host_preparation.positions_gpu, sum_scheduled_tokens_padded
-        )
-        cu_seqlens_q_gpu = self._cached_decode_prefix(
-            host_preparation.cu_seqlens_q_gpu, running_bs + 1
-        )
-        context_lens_gpu = host_preparation.context_lens_gpu
-        block_tables_gpu = host_preparation.block_tables_gpu
-        state_slot_gpu = self._cached_decode_prefix(
-            host_preparation.state_slot_gpu, running_bs
-        )
-        state_slot_in_gpu = self._cached_decode_prefix(
-            host_preparation.state_slot_in_gpu, running_bs
-        )
-
-        extend_lens_np = host_preparation.extend_lens_np
-        compress_plans = self._slice_staged_compress_plans(
-            host_preparation.staged_compress_plans,
-            running_bs=running_bs,
-            max_q_len=max_seqlen_q,
-        )
-        current_stream.wait_event(self._decode_prep_done_event)
-
-        attn_metadata = AttentionMetaData_DSV4(
-            cu_seqlens_q=cu_seqlens_q_gpu,
-            cu_seqlens_k=None,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=int(context_lens_np.max()) if len(context_lens_np) else 1,
-            min_seqlen_q=0,
-            dropout_p=0.0,
-            has_cached=False,
-            total_kv=int(context_lens_np.sum()),
-            num_cached_tokens=None,
-            block_tables=block_tables_gpu,
-            context_lens=context_lens_gpu,
-            state=AttnState.DECODE,
-        )
-        attn_metadata.state_slot_out = state_slot_gpu
-        attn_metadata.state_slot_in = state_slot_in_gpu
-        attn_metadata.state_slot_out_cpu = state_slot_np
-        attn_metadata.compress_plans = compress_plans
         # DSpark RAGGED: pass per-seq verify lengths + full_q to the (rectangular-
         # only) decode indexer so it can pad Q back to [running_bs, full_q].
         _drafter = getattr(self.model_runner, "drafter", None)
@@ -2895,37 +2882,113 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             and _drafter is not None
             and _drafter.uses_confidence_schedule
         )
-        if ragged_lens is not None or _dspark_ragged_graph:
-            # The maximum-width pinned buffer was included in the packed upload
-            # before the DP wait. Only its public view depends on the agreed
-            # graph bucket.
-            pad_to = self._dspark_ragged_lens_pad_to(running_bs)
-            ragged_rows = scheduled_bs if pad_to is None else pad_to
-            assert host_preparation.dspark_ragged_lens_gpu is not None
-            attn_metadata.dspark_ragged_lens_gpu = self._cached_decode_prefix(
-                host_preparation.dspark_ragged_lens_gpu, ragged_rows
-            )
-            attn_metadata.dspark_full_q = int(full_q)
+        cacheable = ragged_lens is None and not _dspark_ragged_graph
+        cache_key = (
+            id(self.model_runner.forward_vars),
+            scheduled_bs,
+            running_bs,
+            sum_scheduled_tokens_padded,
+            int(max_seqlen_q),
+        )
+        cached = self._decode_metadata_cache.get(cache_key) if cacheable else None
 
-        running_bs = int(running_bs)
-        self._attach_v4_per_fwd_meta(
-            attn_metadata,
-            extend_lens_np,  # = np.full(scheduled_bs, max_seqlen_q) for decode
-            state_slot_np,
-            scheduled_bs,
-            sum_scheduled_tokens,
-            running_bs=running_bs,
-            max_q_len=max_seqlen_q,
-            running_tokens=sum_scheduled_tokens_padded,
-            host_preparation=host_preparation,
-        )
-        self._attach_v4_indexer_meta(
-            attn_metadata,
-            scheduled_bs,
-            sum_scheduled_tokens,
-            positions_gpu=positions,
-            fp4_schedule_prepared=host_preparation.fp4_schedule_prepared,
-        )
+        if cached is not None:
+            template, positions = cached
+            # The MTP proposer temporarily rewrites the target metadata for its
+            # one-row draft steps.  Return a fresh shell so those mutations can
+            # never leak back into the next target forward; the expensive
+            # tensor views and dictionaries remain shared and fixed-address.
+            attn_metadata = self._clone_decode_metadata(template)
+            # Every tensor published by the cached object is a view of the
+            # current forward_vars slot. prepare_decode_host refreshed those
+            # buffers on prep_stream; only host-valued fields vary per step.
+            attn_metadata.max_seqlen_k = host_preparation.max_context_len
+            attn_metadata.total_kv = host_preparation.total_kv
+            attn_metadata.state = AttnState.DECODE
+            attn_metadata.state_slot_out_cpu = state_slot_np
+            attn_metadata.n_committed_csa_per_seq_cpu = (
+                host_preparation.n_committed_csa_per_seq_np
+            )
+            assert attn_metadata.compress_plans is not None
+            self._refresh_staged_compress_plans(
+                attn_metadata.compress_plans,
+                host_preparation.staged_compress_plans,
+            )
+        else:
+            positions = self._cached_decode_prefix(
+                host_preparation.positions_gpu, sum_scheduled_tokens_padded
+            )
+            cu_seqlens_q_gpu = self._cached_decode_prefix(
+                host_preparation.cu_seqlens_q_gpu, running_bs + 1
+            )
+            context_lens_gpu = host_preparation.context_lens_gpu
+            block_tables_gpu = host_preparation.block_tables_gpu
+            state_slot_gpu = self._cached_decode_prefix(
+                host_preparation.state_slot_gpu, running_bs
+            )
+            state_slot_in_gpu = self._cached_decode_prefix(
+                host_preparation.state_slot_in_gpu, running_bs
+            )
+            extend_lens_np = host_preparation.extend_lens_np
+            compress_plans = self._slice_staged_compress_plans(
+                host_preparation.staged_compress_plans,
+                running_bs=running_bs,
+                max_q_len=max_seqlen_q,
+            )
+
+            attn_metadata = AttentionMetaData_DSV4(
+                cu_seqlens_q=cu_seqlens_q_gpu,
+                cu_seqlens_k=None,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=host_preparation.max_context_len,
+                min_seqlen_q=0,
+                dropout_p=0.0,
+                has_cached=False,
+                total_kv=host_preparation.total_kv,
+                num_cached_tokens=None,
+                block_tables=block_tables_gpu,
+                context_lens=context_lens_gpu,
+                state=AttnState.DECODE,
+            )
+            attn_metadata.state_slot_out = state_slot_gpu
+            attn_metadata.state_slot_in = state_slot_in_gpu
+            attn_metadata.state_slot_out_cpu = state_slot_np
+            attn_metadata.compress_plans = compress_plans
+            if ragged_lens is not None or _dspark_ragged_graph:
+                # The maximum-width pinned buffer was included in the packed
+                # upload before the DP wait. Only its public view depends on
+                # the agreed graph bucket.
+                pad_to = self._dspark_ragged_lens_pad_to(running_bs)
+                ragged_rows = scheduled_bs if pad_to is None else pad_to
+                assert host_preparation.dspark_ragged_lens_gpu is not None
+                attn_metadata.dspark_ragged_lens_gpu = self._cached_decode_prefix(
+                    host_preparation.dspark_ragged_lens_gpu, ragged_rows
+                )
+                attn_metadata.dspark_full_q = int(full_q)
+
+            self._attach_v4_per_fwd_meta(
+                attn_metadata,
+                extend_lens_np,  # uniform max_seqlen_q for rectangular decode
+                state_slot_np,
+                scheduled_bs,
+                sum_scheduled_tokens,
+                running_bs=running_bs,
+                max_q_len=max_seqlen_q,
+                running_tokens=sum_scheduled_tokens_padded,
+                host_preparation=host_preparation,
+            )
+            self._attach_v4_indexer_meta(
+                attn_metadata,
+                scheduled_bs,
+                sum_scheduled_tokens,
+                positions_gpu=positions,
+                fp4_schedule_prepared=host_preparation.fp4_schedule_prepared,
+            )
+            if cacheable:
+                self._decode_metadata_cache[cache_key] = (
+                    attn_metadata.__dict__.copy(),
+                    positions,
+                )
 
         self._ubatch_decode_meta = None
         if (
@@ -2941,7 +3004,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 state_slot_np=state_slot_np,
                 state_slot_in_np=host_preparation.state_slot_in_np,
                 positions_np=positions_np,
-                extend_lens_np=extend_lens_np,
+                extend_lens_np=host_preparation.extend_lens_np,
                 dspark_ragged=ragged_lens is not None or _dspark_ragged_graph,
                 full_q=int(full_q),
             )
@@ -4424,6 +4487,41 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 compress_plan_cpu=plan.compress_plan_cpu,
             )
         return narrowed
+
+    @staticmethod
+    def _clone_decode_metadata(
+        template: dict[str, Any],
+    ) -> AttentionMetaData_DSV4:
+        """Clone the metadata shell while sharing its fixed tensor views."""
+
+        metadata = object.__new__(AttentionMetaData_DSV4)
+        metadata.__dict__ = template.copy()
+        return metadata
+
+    @staticmethod
+    def _refresh_staged_compress_plans(
+        cached: dict[int, CompressPlan], staged: dict[int, CompressPlan]
+    ) -> None:
+        """Refresh dynamic host fields on cached decode compression plans.
+
+        The cached tensor views are fixed by the graph bucket and still point
+        at the CpuGpuBuffers uploaded by ``prepare_decode_host``. Counts and
+        NumPy mirrors describe one scheduler step, so refresh those on every
+        reuse rather than carrying stale plan state across forwards.
+        """
+
+        if cached.keys() != staged.keys():
+            raise ValueError("cached and staged compression-plan ratios differ")
+        for ratio, plan in cached.items():
+            current = staged[ratio]
+            if current.num_compress > plan.compress_plan_gpu.shape[0]:
+                raise ValueError("compression-plan count exceeds cached bucket")
+            if current.num_write > plan.write_plan_gpu.shape[0]:
+                raise ValueError("write-plan count exceeds cached bucket")
+            plan.num_compress = current.num_compress
+            plan.num_write = current.num_write
+            plan.cu_compress_cpu = current.cu_compress_cpu
+            plan.compress_plan_cpu = current.compress_plan_cpu
 
     def _cached_decode_prefix(self, tensor: torch.Tensor, rows: int) -> torch.Tensor:
         """Return a reusable ``tensor[:rows]`` view for steady decode.

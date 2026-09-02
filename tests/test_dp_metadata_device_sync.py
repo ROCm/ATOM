@@ -29,7 +29,19 @@ def test_device_sync_submission_defers_host_wait(monkeypatch):
         def synchronize(self):
             self.synchronize_calls += 1
 
+    class FakeEvent:
+        def __init__(self):
+            self.record_calls = 0
+            self.synchronize_calls = 0
+
+        def record(self):
+            self.record_calls += 1
+
+        def synchronize(self):
+            self.synchronize_calls += 1
+
     stream = FakeStream()
+    completion_event = FakeEvent()
     local_cpu = torch.empty(DP_METADATA_MAX_FIELDS, dtype=torch.int32)
     gathered_cpu = torch.empty(2 * DP_METADATA_MAX_FIELDS, dtype=torch.int32)
     buffers = SimpleNamespace(
@@ -39,7 +51,9 @@ def test_device_sync_submission_defers_host_wait(monkeypatch):
         gathered_device=torch.empty_like(gathered_cpu),
         gathered_cpu=gathered_cpu,
         local_numpy=local_cpu.numpy(),
+        gathered_numpy=gathered_cpu.numpy(),
         stream=stream,
+        completion_event=completion_event,
     )
 
     monkeypatch.setattr(torch.cuda, "stream", lambda unused: nullcontext())
@@ -72,7 +86,9 @@ def test_device_sync_submission_defers_host_wait(monkeypatch):
     assert buffers.local_device.tolist() == [11, 2, 1, 0, 1, 5, 6, 4]
 
     result = finish_sync_dp_metadata(pending)
-    assert stream.synchronize_calls == 1
+    assert stream.synchronize_calls == 0
+    assert completion_event.record_calls == 1
+    assert completion_event.synchronize_calls == 1
     assert result.num_tokens_across_dp.tolist() == [11, 17]
     assert result.max_tokens_across_dp_cpu.item() == 17
     assert result.cu_tokens_across_dp_cpu.tolist() == [11, 28]
@@ -85,7 +101,8 @@ def test_device_sync_submission_defers_host_wait(monkeypatch):
 
     # Finishing twice is harmless and never adds a second host wait.
     assert finish_sync_dp_metadata(pending) is result
-    assert stream.synchronize_calls == 1
+    assert stream.synchronize_calls == 0
+    assert completion_event.synchronize_calls == 1
 
 
 def _device_sync_worker(rank: int, world_size: int, init_file: str) -> None:

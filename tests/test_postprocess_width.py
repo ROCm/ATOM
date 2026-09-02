@@ -395,3 +395,54 @@ def test_decode_prefix_view_cache_distinguishes_storage_offsets():
     assert left_prefix.data_ptr() != right_prefix.data_ptr()
     assert left_prefix.tolist() == backing[:2].tolist()
     assert right_prefix.tolist() == backing[2:4].tolist()
+
+
+def test_cached_decode_plan_keeps_views_but_refreshes_host_values():
+    builder = object.__new__(v4_mod.DeepseekV4AttentionMetadataBuilder)
+    compress_view = torch.empty(8, 4, dtype=torch.int32)
+    write_view = torch.empty(16, 4, dtype=torch.int32)
+    old_cu = np.array([0, 1], dtype=np.int32)
+    new_cu = np.array([0, 2, 3], dtype=np.int32)
+    new_rows = np.arange(12, dtype=np.int32).reshape(3, 4)
+    cached_plan = types.SimpleNamespace(
+        compress_plan_gpu=compress_view,
+        write_plan_gpu=write_view,
+        num_compress=1,
+        num_write=1,
+        cu_compress_cpu=old_cu,
+        compress_plan_cpu=None,
+    )
+    staged_plan = types.SimpleNamespace(
+        num_compress=3,
+        num_write=7,
+        cu_compress_cpu=new_cu,
+        compress_plan_cpu=new_rows,
+    )
+
+    builder._refresh_staged_compress_plans({4: cached_plan}, {4: staged_plan})
+
+    assert cached_plan.compress_plan_gpu is compress_view
+    assert cached_plan.write_plan_gpu is write_view
+    assert cached_plan.num_compress == 3
+    assert cached_plan.num_write == 7
+    assert cached_plan.cu_compress_cpu is new_cu
+    assert cached_plan.compress_plan_cpu is new_rows
+
+
+def test_cached_decode_metadata_shell_isolated_from_mtp_rewrites():
+    positions = torch.arange(8, dtype=torch.int32)
+    original = v4_mod.AttentionMetaData_DSV4(
+        cu_seqlens_q=positions[:3],
+        max_seqlen_q=4,
+    )
+    template = original.__dict__.copy()
+
+    first = v4_mod.DeepseekV4AttentionMetadataBuilder._clone_decode_metadata(template)
+    first.max_seqlen_q = 1
+    first.slot_mapping = positions[:1]
+    second = v4_mod.DeepseekV4AttentionMetadataBuilder._clone_decode_metadata(template)
+
+    assert second is not first
+    assert second.max_seqlen_q == 4
+    assert second.slot_mapping is None
+    assert second.cu_seqlens_q is original.cu_seqlens_q
