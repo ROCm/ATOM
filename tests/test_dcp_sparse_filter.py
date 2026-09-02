@@ -3,7 +3,7 @@
 
 Both halves of the same kernel family in ``atom/model_ops/dcp_ops.py``:
 
-  * decode  -- ``triton_filter_and_convert_dcp_index``
+  * decode  -- replicated-index-cache fallback only
   * prefill -- ``triton_filter_and_convert_dcp_index_prefill``
 
 Why the checks go past "it does not crash": ``cp_lse_ag_out_rs`` rebuilds a
