@@ -114,6 +114,9 @@ support_model_arch_dict = {
     "GlmMoeDsaForCausalLM": "atom.models.deepseek_v2.GlmMoeDsaForCausalLM",
     "Glm4MoeForCausalLM": "atom.models.glm4_moe.Glm4MoeForCausalLM",
     "Qwen3NextForCausalLM": "atom.models.qwen3_next.Qwen3NextForCausalLM",
+    "Qwen4ExpForConditionalGeneration": (
+        "atom.models.qwen3_8_flash_next.Qwen3_8FlashNextForConditionalGeneration"
+    ),
     "Qwen3_5ForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5MultimodalModel",
     "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5MoeMultimodalModel",
     "Qwen3_5MoeForCausalLM": "atom.models.qwen3_5.Qwen3_5MoeForCausalLM",
@@ -655,6 +658,7 @@ class ModelRunner:
         ]:
             os.environ["AITER_QUICK_REDUCE_QUANTIZATION"] = "INT4"
         self.use_mla = self.is_deepseek_mla()
+        self.use_qwen3_8_flash_next = self.is_qwen3_8_flash_next()
         self.use_gdn = self.is_qwen_next()
         self.use_v4 = self.is_deepseek_v4()
         self.use_kimi_mla = self.is_kimi_linear()
@@ -706,6 +710,7 @@ class ModelRunner:
             use_gdn=self.use_gdn,
             use_v4=self.use_v4,
             use_kimi_mla=self.use_kimi_mla,
+            use_qwen3_8_flash_next=self.use_qwen3_8_flash_next,
         )
         use_spec = bool(self.config.speculative_config) and get_pp_group().is_last_rank
         self.num_spec_tokens = (
@@ -898,9 +903,14 @@ class ModelRunner:
             "qwen3_next_mtp",
             "qwen3_5_text",
             "qwen3_5_moe_text",
+            "qwen4_exp_text",
         ):
             return True
         return False
+
+    def is_qwen3_8_flash_next(self) -> bool:
+        """Qwen3.8-Flash-Next: a GDN hybrid, but with QSA on its full-attention layers."""
+        return getattr(self.hf_text_config, "model_type", None) == "qwen4_exp_text"
 
     def is_kimi_linear(self) -> bool:
         return getattr(self.hf_text_config, "model_type", None) == "kimi_linear"
