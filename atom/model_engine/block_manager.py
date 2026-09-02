@@ -1877,15 +1877,15 @@ class BlockManager:
         if not self.state.readable_midstep or not self.state.applies(seq):
             seq.block_hashes = []
             return
-        full = list(block_hashes)
-        # Resume from the last APPENDED hash, not from the loop's `h`: on a miss
-        # that holds the hash of the block that failed to match, which was never
-        # appended and is not part of this chain.
-        h = full[-1] if full else -1
-        for i in range(len(full), self._n_hash_blocks(seq)):
-            h = self.compute_hash(self._hash_block_tokens(seq, i), h)
-            full.append(h)
-        seq.block_hashes = full
+        # The continuation itself -- resume from the last APPENDED hash (on a
+        # miss the loop's `h` holds the hash of the block that failed to match,
+        # which was never appended and is not part of this chain) -- is exactly
+        # `_chain_to`, run to the full prompt width. Delegate rather than
+        # duplicate the loop; the only thing local to this path is the midstep
+        # gate above and writing the result to `seq`.
+        seq.block_hashes = self._chain_to(
+            seq, block_hashes, self._n_hash_blocks(seq)
+        )
 
     def midstep_positions(self, seq: Sequence, start: int, end: int) -> list[tuple]:
         """`(position, hash)` for every checkpoint a forward over `(start, end]`
