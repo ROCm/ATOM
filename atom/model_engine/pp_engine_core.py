@@ -196,7 +196,7 @@ class PPEngineCoreProc(EngineCore):
             self._pp_kv_aggregator is not None and self._pp_kv_aggregator.has_pending()
         )
 
-    def _dispatch_idle_offload_work(self) -> None:
+    def _dispatch_idle_offload_work(self, dispatch_new: bool = True) -> None:
         """Override: fan the idle connector metadata out to every PP stage.
 
         ``Scheduler.schedule()`` returns None once waiting and running are
@@ -204,7 +204,13 @@ class PPEngineCoreProc(EngineCore):
         materializes while draining. Build the metadata directly instead, and
         ship it downstream too — otherwise the stages never save their layers
         and ``PPKVAggregator`` cannot reach a quorum.
+
+        ``dispatch_new`` exists only to match the base signature the shutdown
+        drain calls through: this override never publishes new state loads/
+        stores (the state tier refuses ``pp_size > 1`` outright, so there are
+        none), so it has nothing to gate and the flag is inert here.
         """
+        del dispatch_new
         if not self.kv_transfer_enabled:
             return
         connector = getattr(self.scheduler, "kv_connector", None)

@@ -488,14 +488,16 @@ class EngineCore:
             return False
         return bool(connector.has_pending_work())
 
-    def _advance_idle_kv_transfer(self) -> None:
+    def _advance_idle_kv_transfer(self, dispatch_new: bool = True) -> None:
         # No forward batch will run this tick, but offload load/save work may
         # still need to be dispatched or reported back to the scheduler.
+        # `dispatch_new=False` on the shutdown drain: report in-flight work
+        # back, but start no new transfers (see `_dispatch_idle_offload_work`).
         now = time.monotonic()
         if now < self._next_idle_kv_drain:
             return
         self._next_idle_kv_drain = now + KV_IDLE_DRAIN_INTERVAL_S
-        self._dispatch_idle_offload_work()
+        self._dispatch_idle_offload_work(dispatch_new=dispatch_new)
         self._poll_kv_transfer_progress()
 
     def _drain_kv_work_at_exit(self) -> None:
@@ -504,6 +506,12 @@ class EngineCore:
         The loop exits as soon as its queues are empty, so a save dispatched
         by the final batch would otherwise be abandoned with its completion
         unrecorded and its blocks still deferred.
+
+        Drains with `dispatch_new=False`: it must let already-dispatched
+        transfers finish and report, but must not publish new state loads/stores.
+        A fresh store dispatched here spills bytes nothing will read back, and --
+        worse -- keeps `has_pending_kv_work()` True, so this very loop could
+        manufacture its own work and never converge before the deadline.
         """
         if not self.kv_transfer_enabled:
             return
@@ -517,7 +525,7 @@ class EngineCore:
                         KV_SHUTDOWN_DRAIN_TIMEOUT_S,
                     )
                     break
-                self._advance_idle_kv_transfer()
+                self._advance_idle_kv_transfer(dispatch_new=False)
                 time.sleep(KV_IDLE_DRAIN_INTERVAL_S)
         except Exception:
             logger.exception("KV transfer drain during shutdown failed")
@@ -534,7 +542,7 @@ class EngineCore:
         if callable(reconcile):
             reconcile()
 
-    def _dispatch_idle_offload_work(self) -> None:
+    def _dispatch_idle_offload_work(self, dispatch_new: bool = True) -> None:
         if not self.kv_transfer_enabled:
             return
         connector = getattr(self.scheduler, "kv_connector", None)
@@ -543,10 +551,18 @@ class EngineCore:
         # getattr for the same reason as `kv_connector` above: this path is
         # reached with scheduler doubles that implement only the connector
         # surface.
-        for name in ("_publish_state_loads", "_publish_state_stores"):
-            publish = getattr(self.scheduler, name, None)
-            if publish is not None:
-                publish()
+        #
+        # `dispatch_new=False` on the shutdown drain: publishing new state
+        # loads/stores there hands the connector work whose bytes nothing will
+        # read back, and -- worse -- each fresh store keeps `has_pending_kv_work`
+        # True, so the drain loop that waits on it manufactures its own exit
+        # condition and never converges. Still build/process the meta so
+        # already-dispatched transfers finish and report.
+        if dispatch_new:
+            for name in ("_publish_state_loads", "_publish_state_stores"):
+                publish = getattr(self.scheduler, name, None)
+                if publish is not None:
+                    publish()
         meta = connector.build_connector_meta()
         if not connector_metadata_has_work(meta):
             return
