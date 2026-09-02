@@ -1872,18 +1872,6 @@ class ModelRunner:
         }
 
     def allocate_kv_cache(self, num_kvcache_blocks):
-        # NCCL/RCCL communicators are created lazily on the first collective
-        # and allocate scratch via hipMalloc (not the PyTorch caching
-        # allocator). Do that collective before packing the GPU with KV,
-        # otherwise the post-allocation barrier can OOM.
-        if (
-            torch.distributed.is_initialized()
-            and torch.distributed.get_world_size() > 1
-        ):
-            warmup = torch.zeros(1, device="cuda", dtype=torch.float32)
-            torch.distributed.all_reduce(warmup)
-            del warmup
-
         pre_alloc = torch.cuda.memory_stats()["allocated_bytes.all.current"]
 
         config = self.config
@@ -2078,8 +2066,10 @@ class ModelRunner:
                     f"diff={diff_pct:.1%}"
                 )
 
-        # Align ranks after KV is resident. Communicator scratch was allocated
-        # by the pre-allocation all-reduce, so this barrier should not hipMalloc.
+        # Skip on single-rank: a world_size==1 barrier is a no-op but still
+        # forces lazy NCCL communicator creation (CUDA-allocs its buffers),
+        # which can OOM/fail on single-card runs. The process group stays
+        # initialized so get_tp_group() and friends keep working.
         if (
             torch.distributed.is_initialized()
             and torch.distributed.get_world_size() > 1
