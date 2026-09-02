@@ -422,6 +422,13 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
     # -- completions -------------------------------------------------------
     def get_finished(self):
         out = super().get_finished()
+        # Sweep parks whose report never came before draining this step's, on
+        # every path including no-tier (finding #3). Cheap: `_armed_at` holds
+        # only in-flight joint loads and is usually empty. Ordering-independent
+        # -- a park stale enough to evict is one whose window already elapsed, so
+        # a report arriving this same step for it is exactly the late-report case
+        # `reclaim_stale_parks` is built to pass through harmlessly.
+        self._reclaim_stale_parks()
         # No-tier store failures must reach the engine even when the tier never
         # built -- the engine pinned their PAGE units and is holding them
         # against a report. Emit the tier's own failure pairing: index-failed so
@@ -522,6 +529,43 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
                 ConnectorCompletion(
                     STATE_LOAD_DISPOSITION_CHANNEL, key, bool(state_intact)
                 )
+            )
+
+    def _reclaim_stale_parks(self) -> None:
+        """Evict joint parks whose report never came (finding #3).
+
+        A joint park is released only by both legs reporting. Three cases leave
+        one leg forever unreported: the request is aborted mid-load (the KV leg
+        is cancelled scheduler-side and never reports, while the state tier's leg
+        still lands -- half a report cannot release the pair), a worker thread is
+        killed mid-transfer, or a completion is dropped between worker and
+        engine. Without an exit the key -- and the `_alias`/`_alias_of` under it
+        -- sits in `_need` for the life of the process, and worse, `_settle_
+        joint` swallows every later KV completion that reuses the stale `kv_id`,
+        wedging that request in WAITING_FOR_REMOTE_KVS with its blocks held.
+
+        The park is worker-side, so it is swept here -- `get_finished` is its one
+        per-step worker driver. The abort signal itself is scheduler-side
+        (`request_finished`/`cancel_pending_load` on the scheduler connector,
+        which cannot reach this object), so an expiry sweep, not a synchronous
+        abort call, is what closes the gap; the same-request re-admission shape
+        is already handled by `arm`'s pre-file `_purge`. The window is LMCache's
+        own save-abandon timeout -- the same clock the engine's pin and orphan-
+        slot reconcilers use -- and shares their caveat: a report that truly
+        arrives after it finds the key gone and passes through `_settle_joint`
+        harmlessly for the long-departed request. `<= 0` disables reclamation
+        (the operator turned the pin timeout off), matching those reconcilers.
+        """
+        window = offload_save_abandon_timeout_s()
+        if window <= 0:
+            return
+        reclaimed = self._joint_park.reclaim_stale_parks(window)
+        if reclaimed:
+            logger.warning(
+                "kimi_k3 offload: reclaimed %d joint load park(s) whose report "
+                "never came (aborted request, killed worker, or dropped "
+                "completion); those requests recompute.",
+                reclaimed,
             )
 
 

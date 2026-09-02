@@ -5691,6 +5691,143 @@ class TestJointLegsShareOneCompletionIdentity:
         assert failed == {req.load_operation}
 
 
+class TestJointParkExpiry:
+    """`_JointPark`'s abort/expiry/eviction exit (finding #3).
+
+    A joint park is released only by both legs reporting. Three cases leave one
+    leg forever unreported: the request is aborted mid-load (the KV leg is
+    cancelled scheduler-side and never reports, while the state tier's leg still
+    lands -- half a report cannot release the pair), a worker thread is killed
+    mid-transfer, or a completion is dropped. Without an exit the key -- with its
+    `_alias`/`_alias_of` -- sat in `_need` for the process's life, and worse,
+    `_settle_joint` swallowed every later KV completion reusing the stale
+    `kv_id`. The abort signal is scheduler-side and cannot reach this worker-side
+    park, so `reclaim_stale_parks` (swept from `get_finished`, on LMCache's
+    save-abandon window) is the exit; re-admission is handled by `arm`'s purge.
+    """
+
+    def test_reclaim_evicts_parks_past_the_window_and_spares_fresh_ones(
+        self, monkeypatch
+    ):
+        clock = {"t": 1000.0}
+        monkeypatch.setattr(
+            "atom.kv_transfer.offload.hybrid.kimi_k3.state_tier.monotonic",
+            lambda: clock["t"],
+        )
+        park = _JointPark()
+        old = LoadOperationId("old", 0)
+        park.arm("old", needs_kv=True, needs_state=True, kv_id=old)
+        clock["t"] = 1100.0  # 100s later
+        fresh = LoadOperationId("fresh", 0)
+        park.arm("fresh", needs_kv=True, needs_state=True, kv_id=fresh)
+
+        clock["t"] = 1100.0 + 30.0  # 130s: old is 130s stale, fresh 30s
+        evicted = park.reclaim_stale_parks(60.0)
+
+        assert evicted == 1
+        assert not park.waits_for(old)
+        assert park.waits_for(fresh)
+        # Eviction, not settlement: no ready/failed manufactured for `old`.
+        assert park.take_ready() == (set(), set())
+        assert "old" not in park._alias and old not in park._alias_of
+
+    def test_a_report_after_reclaim_passes_through_instead_of_wedging(
+        self, monkeypatch
+    ):
+        clock = {"t": 500.0}
+        monkeypatch.setattr(
+            "atom.kv_transfer.offload.hybrid.kimi_k3.state_tier.monotonic",
+            lambda: clock["t"],
+        )
+        park = _JointPark()
+        kv_id = LoadOperationId("r1", 0)
+        park.arm("r1", needs_kv=True, needs_state=True, kv_id=kv_id)
+        clock["t"] = 500.0 + 120.0
+        assert park.reclaim_stale_parks(60.0) == 1
+
+        # The lost report finally lands: the key is gone, so it is not held.
+        assert not park.waits_for("r1")
+
+    def test_reclaim_lets_a_reused_kv_id_wake_a_new_load(self, monkeypatch):
+        """The wedge finding #3 names: a stranded park swallowing later loads.
+
+        Age a park past the window and reclaim it, then let a fresh load reuse
+        the same `LoadOperationId`. Its KV completion must pass through as a real
+        wake, not be absorbed by a surviving `waits_for` from the lost load.
+        """
+        clock = {"t": 0.0}
+        monkeypatch.setattr(
+            "atom.kv_transfer.offload.hybrid.kimi_k3.state_tier.monotonic",
+            lambda: clock["t"],
+        )
+        worker = _k3_worker()
+        req = _k3_load_req("r1")
+        worker._arm_joint_loads(
+            SimpleNamespace(state_loads=[("r1", 99, 0)], requests=[req])
+        )
+        assert worker._joint_park.waits_for(req.load_operation)
+
+        clock["t"] = 999.0  # long past any window
+        assert worker._joint_park.reclaim_stale_parks(60.0) == 1
+        assert not worker._joint_park.waits_for(req.load_operation)
+
+        # A later load reuses the same operation id (id reuse across admissions).
+        done, failed = worker._settle_joint({req.load_operation}, set(), set(), set())
+        assert done == {req.load_operation}, "reused kv_id must not be swallowed"
+        assert failed == set()
+
+    def test_worker_reclaim_uses_the_save_abandon_window(self, monkeypatch):
+        """`get_finished`'s sweep derives its window from LMCache's own
+        save-abandon timeout, not a hardcoded constant."""
+        clock = {"t": 0.0}
+        monkeypatch.setattr(
+            "atom.kv_transfer.offload.hybrid.kimi_k3.state_tier.monotonic",
+            lambda: clock["t"],
+        )
+        monkeypatch.setattr(
+            "atom.kv_transfer.offload.hybrid.kimi_k3.connector."
+            "offload_save_abandon_timeout_s",
+            lambda: 60.0,
+        )
+        worker = _k3_worker()
+        req = _k3_load_req("r1")
+        worker._arm_joint_loads(
+            SimpleNamespace(state_loads=[("r1", 99, 0)], requests=[req])
+        )
+
+        clock["t"] = 30.0  # inside the window: spared
+        worker._reclaim_stale_parks()
+        assert worker._joint_park.waits_for(req.load_operation)
+
+        clock["t"] = 90.0  # past the 60s window: evicted
+        worker._reclaim_stale_parks()
+        assert not worker._joint_park.waits_for(req.load_operation)
+
+    def test_worker_reclaim_is_disabled_when_the_window_is_nonpositive(
+        self, monkeypatch
+    ):
+        """`<= 0` means the operator turned the pin timeout off; matching the
+        engine's pin/orphan-slot reconcilers, the sweep then does nothing."""
+        clock = {"t": 0.0}
+        monkeypatch.setattr(
+            "atom.kv_transfer.offload.hybrid.kimi_k3.state_tier.monotonic",
+            lambda: clock["t"],
+        )
+        monkeypatch.setattr(
+            "atom.kv_transfer.offload.hybrid.kimi_k3.connector."
+            "offload_save_abandon_timeout_s",
+            lambda: 0.0,
+        )
+        worker = _k3_worker()
+        req = _k3_load_req("r1")
+        worker._arm_joint_loads(
+            SimpleNamespace(state_loads=[("r1", 99, 0)], requests=[req])
+        )
+        clock["t"] = 10_000.0  # arbitrarily old
+        worker._reclaim_stale_parks()
+        assert worker._joint_park.waits_for(req.load_operation)
+
+
 class _RecordingExecutor:
     def __init__(self, log: list, name: str) -> None:
         self._log = log

@@ -313,6 +313,14 @@ class _JointPark:
         # bare id onto it so a state report can find its own park.
         self._alias: dict = {}
         self._alias_of: dict = {}
+        # Monotonic stamp per armed key, for `reclaim_stale_parks` (finding #3).
+        # A park is only ever released by both legs reporting; a report lost to
+        # an aborted request, a killed worker thread, or a dropped completion
+        # would otherwise leave the key in `_need`/`_alias`/`_alias_of` for the
+        # life of the process -- and `_settle_joint` would swallow every later
+        # KV completion that reuses the stale `kv_id`. `abort` is the prompt
+        # exit; this stamp is the backstop the reconciler sweeps.
+        self._armed_at: dict = {}
 
     def arm(
         self,
@@ -347,6 +355,7 @@ class _JointPark:
             need.add("state")
         key = req_id if kv_id is None else kv_id
         self._need[key] = need
+        self._armed_at[key] = monotonic()
         if key != req_id:
             self._alias[req_id] = key
             self._alias_of[key] = req_id
@@ -363,6 +372,7 @@ class _JointPark:
         if key is None or key not in self._need:
             return
         self._need.pop(key, None)
+        self._armed_at.pop(key, None)
         bare = self._alias_of.pop(key, None)
         if bare is not None:
             self._alias.pop(bare, None)
@@ -371,6 +381,35 @@ class _JointPark:
         self._ready.discard(key)
         self._ready_failed.discard(key)
         self._dispositions.pop(key, None)
+
+    def reclaim_stale_parks(self, max_age_s: float) -> int:
+        """Evict parks armed longer than `max_age_s` ago; return the count.
+
+        The park's abort/expiry/eviction exit (finding #3). A joint park is
+        released only by both legs reporting; a report lost to an aborted request
+        (the KV leg cancelled scheduler-side, never reporting, while the state
+        tier's leg still lands -- half a report cannot release the pair), a
+        worker thread killed mid-transfer, or a completion dropped between worker
+        and engine would otherwise leave the key in `_need` (with its
+        `_alias`/`_alias_of`) forever, and `_settle_joint` would swallow every
+        later KV completion reusing that stale `kv_id`. The abort signal is
+        scheduler-side and cannot reach this worker-side park synchronously, so
+        expiry, not a synchronous abort call, is the exit; the same-request
+        re-admission shape is separately handled by `arm`'s pre-file `_purge`.
+
+        Like the engine's pin and orphan-slot reconcilers it cannot tell a lost
+        report from a merely slow one, so the caller passes the same
+        save-abandon window; a park that outlives it is treated as never going
+        to complete. Eviction (no ready/failed) is safe: a load whose report
+        truly arrives after this finds its key gone and passes through
+        `_settle_joint` as an unarmed id, which the engine drops for the
+        long-departed request rather than manufacturing a restore.
+        """
+        cutoff = monotonic() - max_age_s
+        stale = [key for key, at in self._armed_at.items() if at <= cutoff]
+        for key in stale:
+            self._purge(key)
+        return len(stale)
 
     def settle_kv(self, ident, ok: bool) -> None:
         self._settle(ident, "kv", ok)
@@ -402,6 +441,7 @@ class _JointPark:
 
     def _release(self, key) -> None:
         self._need.pop(key, None)
+        self._armed_at.pop(key, None)
         bare = self._alias_of.pop(key, None)
         if bare is not None:
             self._alias.pop(bare, None)
