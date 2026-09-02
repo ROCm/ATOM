@@ -63,6 +63,7 @@ curl -X POST http://127.0.0.1:8000/stop_profile
 
 - Trace output directory: set via `ATOM_TORCH_PROFILER_DIR` env var
 - Detailed profiling: set `ATOM_PROFILER_MORE=1` (enables `record_shapes`, `with_stack`, `profile_memory`)
+- Bounded window: launch the server with `--profiler-delay-iters N --profiler-max-iters M` to skip N engine steps after `start_profile` and stop after M recorded ones, so a long benchmark still yields a readable trace and `stop_profile` becomes optional
 - Offline profiling: `python -m atom.examples.profile_offline --model <model> --kv_cache_dtype fp8`
 
 ## Key Metrics

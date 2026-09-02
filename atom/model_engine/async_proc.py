@@ -19,6 +19,7 @@ import pickle
 import queue
 import threading
 import weakref
+from collections.abc import Callable
 from contextlib import ExitStack
 from threading import Thread
 from typing import ClassVar
@@ -275,6 +276,16 @@ class AsyncIOProcManager:
         *args: Additional arguments forwarded to the runner constructor.
     """
 
+    # RPCs that execute a model forward. Every engine variant -- base, DP, PP
+    # head/downstream, disagg prefill/decode -- dispatches through call_func,
+    # so this is the only place all of them can be observed at once.
+    # tests/test_profiler_window.py fails if a new engine RPC is unclassified.
+    _FORWARD_FUNCS: ClassVar[set[str]] = {
+        "forward",
+        "prefill_forward",
+        "dummy_execution",
+    }
+
     def __init__(self, finalizer, proc_num: int, runner: str, *args):
         self.parent_finalizer = finalizer
         self.proc_num = proc_num
@@ -296,6 +307,9 @@ class AsyncIOProcManager:
         atexit.register(self._cleanup_shared_memory)
         self.all_ranks_barrier = ctx.Barrier(proc_num)
         init_exit_handler(self)
+
+        # Set by EngineCore to observe forward completions; see _FORWARD_FUNCS.
+        self.on_forward_end: Callable[[], None] | None = None
 
         # KV output aggregation infrastructure
         self.kv_output_aggregator: KVOutputAggregator | None = None
@@ -431,6 +445,10 @@ class AsyncIOProcManager:
             ret = self.outputs_queue.get()
             if isinstance(ret, SystemExit):
                 raise ret
+            # Only the waiting path knows the forward is over; without
+            # wait_out this has merely been enqueued.
+            if self.on_forward_end is not None and func_name in self._FORWARD_FUNCS:
+                self.on_forward_end()
             return ret
 
     def call_func_with_aggregation(self, func_name: str, *args, timeout: float = 10.0):

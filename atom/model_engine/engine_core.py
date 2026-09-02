@@ -183,7 +183,10 @@ class EngineCore:
             self.output_queue,
             label=self.label,
             scheduler=self.scheduler,
+            profiler_delay_iters=config.profiler_delay_iters,
+            profiler_max_iters=config.profiler_max_iters,
         )
+        self.runner_mgr.on_forward_end = self.utility_handler.profiler_step
 
         # KV cache allocated, graphs captured, BlockPool built: everything this
         # process holds for its lifetime exists, and the next thing is traffic.

@@ -1555,6 +1555,10 @@ class Config:
     torch_profiler_dir: str | None = field(
         default_factory=lambda: envs.ATOM_TORCH_PROFILER_DIR
     )
+    # Engine steps to skip after /start_profile before the profiler records,
+    # and steps to record before it stops itself. 0 = no delay / no limit.
+    profiler_delay_iters: int = 0
+    profiler_max_iters: int = 0
     compilation_config: CompilationConfig = field(default_factory=CompilationConfig)
     quant_config: QuantizationConfig = field(init=False)
     asyncio_mode: bool = False
@@ -1888,6 +1892,11 @@ class Config:
             assert self.torch_profiler_dir is None or os.path.isdir(
                 self.torch_profiler_dir
             ), f"torch_profiler_dir {self.torch_profiler_dir} is not a valid directory"
+            if min(self.profiler_delay_iters, self.profiler_max_iters) < 0:
+                raise ValueError(
+                    "profiler_delay_iters and profiler_max_iters must be >= 0, "
+                    f"got {self.profiler_delay_iters} and {self.profiler_max_iters}"
+                )
 
         # only for server mode or plugin mode(vllm)
         # for torch compile policy, plugin mode(vllm) uses the ATOM compile policy
