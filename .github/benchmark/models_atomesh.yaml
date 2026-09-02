@@ -380,12 +380,7 @@ models:
                 {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
             decode:
               HIP_VISIBLE_DEVICES: "4,5,6,7"
-              # Decode-only: the sharded index cache reaches its global top-k
-              # through a candidate all-gather that only handles qlen=1, so MTP's
-              # 4-token verify aborts on it. Replicating the index cache removes
-              # that exchange. Setting it on prefill instead raises at startup --
-              # prefill runs pp4/dcp1 and the layout rejects both.
-              ATOM_DCP_REPLICATE_INDEX_CACHE: "1"
+              ATOM_DCP_REPLICATE_INDEX_CACHE: "0"
               DECODE_KV_TRANSFER_CONFIG: >-
                 {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
 
