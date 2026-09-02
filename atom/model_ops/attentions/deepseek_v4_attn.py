@@ -416,8 +416,39 @@ class _MixedDecodeView:
         self.num_spec_step = batch.num_spec_step
 
     def __getattr__(self, name):
-        # Anything not explicitly sliced above falls through to the real batch.
-        return getattr(self._batch, name)
+        # Batch-wide values fall through unchanged; PER-ROW arrays must not.
+        #
+        # A permissive fallthrough here is what turned a field rename into a
+        # silent 13-point GSM8K loss: `per_req_cache_groups` became
+        # `state_slots_committed`, this view kept slicing the old name, and the
+        # consumer's `batch.<field>[:scheduled_bs]` quietly took the FIRST
+        # n_decode rows of the whole batch -- the prefill rows' slots. No
+        # exception, plausible output norms, damage proportional to the decode
+        # row count.
+        #
+        # Rather than maintain a list of per-row field names (which goes stale
+        # the same way), decide by length: anything as long as the batch is one
+        # entry per row, so a decode view that has not sliced it is a bug. The
+        # next rename then fails loudly at the first mixed batch instead of
+        # degrading accuracy.
+        if name.startswith("_"):
+            # Never route the view's own internals through this check --
+            # `self._batch` would recurse before __init__ has bound it.
+            raise AttributeError(name)
+        val = getattr(self._batch, name)
+        if (
+            self._np
+            and isinstance(val, (list, tuple, np.ndarray))
+            and len(val) == self._batch.total_seqs_num
+        ):
+            raise AttributeError(
+                f"_MixedDecodeView does not slice `{name}`, but the batch holds "
+                f"one entry per row ({len(val)} == total_seqs_num). A decode "
+                "view must slice per-row arrays or the consumer reads the "
+                "prefill rows. Slice it in __init__ -- a rename upstream looks "
+                "exactly like this."
+            )
+        return val
 
 
 class DeepseekV4Backend(AttentionBackend):
