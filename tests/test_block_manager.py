@@ -915,16 +915,22 @@ def test_a_consumer_role_votes_but_never_hands_over_a_store(monkeypatch):
 def test_a_multi_listing_two_offload_connectors_is_refused(monkeypatch):
     """The tier's bytes ride one connector's worker half and its completions
     ride that connector's `get_finished`, so two providers would each hold half
-    an answer."""
-    bm = _bm_with_state_tier(
-        monkeypatch,
-        {
-            "kv_connector": "multi",
-            "connectors": [_OFFLOAD_KVC, dict(_OFFLOAD_KVC)],
-        },
-    )
-    assert bm.state_offload is None
-    assert "expected one" in bm.state_tier_capability.reason
+    an answer. Refused *loudly* at startup, not degraded to a no-tier fallback:
+    the silent fallback left the KV load path live over a block table the other
+    sub was writing (review round 5, finding 0)."""
+    try:
+        _bm_with_state_tier(
+            monkeypatch,
+            {
+                "kv_connector": "multi",
+                "connectors": [_OFFLOAD_KVC, dict(_OFFLOAD_KVC)],
+            },
+        )
+    except ValueError as exc:
+        assert "offload connectors" in str(exc)
+        assert "at most one" in str(exc)
+    else:
+        raise AssertionError("two offload sub-connectors must raise at startup")
 
 
 def test_the_index_is_built_for_a_multi_that_lists_the_offload_backend(

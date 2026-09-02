@@ -241,13 +241,31 @@ def _offload_subconfig(cfg: dict) -> tuple[dict | None, str]:
     half and its completions ride that connector's `get_finished`, so two
     providers would each hold half an answer and a request parked on the wrong
     one would never be reported.
+
+    Two offload sub-connectors (e.g. `[lmcache_offload(dense),
+    lmcache_offload(kimi_k3)]`) is refused *loudly* here, the one place the
+    composite is inspected, rather than degraded to a no-tier fallback. A silent
+    fallback disabled the state tier but left the KV load path live: dense won
+    `get_num_new_matched_tokens` and queued its H2D, the tier never armed, and
+    the prefill forward ran over the block table dense's worker was still
+    writing -- torn KV, silent wrong output, and a `finished_loading` the
+    scheduler never accounted (review round 5, finding 0). Making it a startup
+    `ValueError` keeps that half-configured composite unreachable and names the
+    cause where the operator can act on it. A composite with *no* offload sub is
+    still a soft no-tier (`None`), the legal `[producer]`-only shape.
     """
     subs = [s for s in (cfg.get("connectors") or ()) if isinstance(s, dict)]
     offload = [s for s in subs if s.get("kv_connector") in _STATE_TIER_BACKENDS]
     if not offload:
         return None, "multi lists no offload connector"
     if len(offload) > 1:
-        return None, f"multi lists {len(offload)} offload connectors; expected one"
+        raise ValueError(
+            f"kv_transfer_config: `multi` lists {len(offload)} offload "
+            "connectors, but the state tier's bytes and completions ride one "
+            "connector's worker half -- two would each hold half an answer and "
+            "a request parked on the wrong one would never be reported. Use at "
+            "most one `lmcache_offload` sub-connector."
+        )
     return offload[0], ""
 
 

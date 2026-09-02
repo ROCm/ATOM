@@ -61,7 +61,6 @@ analogue of vLLM's ``_extra_async_saves`` refcount.
 from __future__ import annotations
 
 import copy
-import dataclasses
 import logging
 from typing import Any
 
@@ -426,6 +425,30 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         # Opt into the scheduler's offload suffix-prefill path if any sub is the
         # offload backend (Scheduler._is_offload_connector reads this).
         self.is_offload = any(getattr(c, "is_offload", False) for c in self._connectors)
+        # The sub that won `get_num_new_matched_tokens` for each in-flight
+        # request, keyed by `seq.id`. The load-side decisions
+        # (`should_park_for_load_after_alloc` and the two chunk/partial-prefill
+        # siblings) belong to whichever sub armed the load, not to whichever sub
+        # hosts the state tier -- see `_load_owner` (review round 5, finding 1).
+        self._load_winner: dict = {}
+
+    def _load_owner(self, seq: Any):
+        """The sub that armed this request's KV load, or None.
+
+        Recorded at `get_num_new_matched_tokens` time (first-hit-wins, losers
+        cancelled). The three load-side questions below --
+        `should_park_for_load_after_alloc`, `adjust_prefill_chunk_after_alloc`,
+        `should_park_partial_prefill_for_load` -- ask "is there a load in flight
+        for this sequence, and must the forward wait for it?" That answer is the
+        winner's alone. Routing them through `_state_tier_sub()` instead (an
+        earlier fix) named the tier sub even when a *different* sub won the load
+        -- e.g. moriio winning ahead of `kimi_k3` under `[moriio, kimi_k3]`: the
+        tier sub armed nothing, its `_load_specs.get(sid)` was None, so it
+        answered "don't park" and the prefill ran over moriio's in-flight KV.
+        The tier sub still owns the state-face forwarders; only these three
+        load-side questions follow the load's owner.
+        """
+        return self._load_winner.get(getattr(seq, "id", None))
 
     def _state_tier_sub(self):
         """The one sub-connector that actually hosts the state offload tier.
@@ -433,15 +456,18 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         Selection is by real capability (`has_state_tier`), never by method
         presence: `LMCacheOffloadConnectorScheduler` defines the entire state
         face on every layout, so `_first_with(..., "enqueue_state_stores")`
-        picks a dense offload shell -- whose `_impl` has no tier and returns
-        False / empty for every state call -- ahead of the `kimi_k3` shell that
-        owns the tier. The result was that, under
-        `connectors: [lmcache_offload(dense), lmcache_offload(kimi_k3)]`, stores
-        settled failed, loads were abandoned and recomputed, and the real
-        reports were never drained. `_adopt_state_tier` (worker side) already
-        refuses a config with two tiers, so "first" here is "only"; returns
-        None when no sub hosts a tier (state forwarders then fall to their
-        no-tier defaults).
+        would pick a non-tier offload shell -- whose `_impl` has no tier and
+        returns False / empty for every state call -- ahead of the shell that
+        owns the tier. At most one sub can host the tier: two `lmcache_offload`
+        sub-connectors are refused at startup (`_offload_subconfig`), so "first"
+        here is "only". Returns None when no sub hosts a tier -- the legal
+        `[producer]`-only shape -- and the state-face forwarders then fall to
+        their no-tier defaults.
+
+        This selects the tier owner for the *state-face* forwarders only
+        (`enqueue_state_*`, `take_state_*`, `save_abandon_timeout_s`). The
+        load-side questions route through `_load_owner` instead -- the sub that
+        armed the load, which need not be the tier owner.
         """
         for c in self._connectors:
             if getattr(c, "has_state_tier", False):
@@ -458,14 +484,19 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         `_load_specs` entry and a `_lookup_in_step` id, so `update_state_after_
         alloc` (which the composite fans to *every* sub) later flips
         `can_load=True` and recv-queues that request. Only the first matching
-        sub owns the load. If a second sub also matched -- moriio winning ahead
-        of the offload tier, or a dense offload shell ahead of the kimi_k3 one
-        -- the loser's armed load fires into the same block table on
-        `update_state_after_alloc`: a second writer over the winner's KV, plus a
-        `finished_loading` the scheduler never accounted. So once a winner is
-        chosen, cancel every other sub's pending load. `cancel_pending_load` is
-        idempotent and guarded by `_load_lifecycles`, so a sub that armed
-        nothing (a miss, or moriio which has no such method) is a no-op.
+        sub owns the load. If a second sub also matched -- e.g. moriio winning
+        ahead of an offload sub -- the loser's armed load fires into the same
+        block table on `update_state_after_alloc`: a second writer over the
+        winner's KV, plus a `finished_loading` the scheduler never accounted. So
+        once a winner is chosen, cancel every other sub's pending load.
+        `cancel_pending_load` is idempotent and guarded by `_load_lifecycles`,
+        so a sub that armed nothing (a miss, or moriio which has no such method)
+        is a no-op.
+
+        Record the winner under `seq.id`: the load-side decisions
+        (`should_park_for_load_after_alloc` and siblings) belong to it, not to
+        the tier sub (finding 1). Cleared by `request_finished` /
+        `cancel_pending_load`.
         """
         result = (0, False)
         winner = None
@@ -474,12 +505,16 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             if winner is None and toks > 0:
                 result = (toks, needs_load)
                 winner = c
+        sid = getattr(seq, "id", None)
         if winner is not None:
+            self._load_winner[sid] = winner
             for c in self._connectors:
                 if c is not winner:
                     fn = getattr(c, "cancel_pending_load", None)
                     if callable(fn):
                         fn(seq)
+        else:
+            self._load_winner.pop(sid, None)
         return result
 
     def cancel_pending_load(self, seq: Any) -> None:
@@ -493,6 +528,7 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         and the abandoned request stayed recv-queued. Idempotent per sub (the
         `_load_lifecycles` guard), so fanning to all is safe.
         """
+        self._load_winner.pop(getattr(seq, "id", None), None)
         for c in self._connectors:
             fn = getattr(c, "cancel_pending_load", None)
             if callable(fn):
@@ -508,6 +544,7 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             c.update_state_after_alloc(seq)
 
     def request_finished(self, seq: Any) -> None:
+        self._load_winner.pop(getattr(seq, "id", None), None)
         for c in self._connectors:
             if hasattr(c, "request_finished"):
                 c.request_finished(seq)
@@ -527,26 +564,26 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
     # only needs to expose them when a sub-connector implements them.
 
     def should_park_for_load_after_alloc(self, seq: Any) -> bool:
-        # Prefer the state-tier sub, then any offload sub: this is a load
-        # decision routed through `_decide_load_after_alloc`, which kimi_k3
-        # overrides with a joint-boundary clamp. With two offload subs
-        # (dense + kimi_k3) plain `_first_with` hands back the dense sub and the
-        # clamp is silently skipped.
-        c = self._state_tier_sub() or _first_with(
-            self._connectors, "should_park_for_load_after_alloc"
-        )
-        return c.should_park_for_load_after_alloc(seq) if c is not None else False
+        # Route to the sub that armed this request's load (`_load_owner`), not
+        # the tier sub: the question is whether the forward must wait for the
+        # in-flight load, and only its owner knows. An offload owner refines via
+        # `_decide_load_after_alloc` (kimi_k3's joint-boundary clamp); an owner
+        # that armed a load but does not refine (a P/D producer) parks -- the
+        # scheduler's own absent-hook default -- so the forward waits rather than
+        # running over the load's blocks. No owner means no load: don't park.
+        c = self._load_owner(seq)
+        if c is not None and hasattr(c, "should_park_for_load_after_alloc"):
+            return c.should_park_for_load_after_alloc(seq)
+        return c is not None
 
     def adjust_prefill_chunk_after_alloc(self, seq: Any, chunk: int) -> int:
-        # State-tier sub first, for the reason in `should_park_for_load_after_alloc`:
-        # the prefill chunk kimi_k3 hands back is sized to the joint load it will
-        # arm, and the dense sub would answer with the unclamped chunk.
-        c = self._state_tier_sub() or _first_with(
-            self._connectors, "adjust_prefill_chunk_after_alloc"
-        )
-        return (
-            c.adjust_prefill_chunk_after_alloc(seq, chunk) if c is not None else chunk
-        )
+        # The prefill chunk is sized to the load its owner armed (kimi_k3 clamps
+        # it to the joint boundary); a sub that armed nothing must not resize it.
+        # Route to the load owner; unchanged if it does not resize.
+        c = self._load_owner(seq)
+        if c is not None and hasattr(c, "adjust_prefill_chunk_after_alloc"):
+            return c.adjust_prefill_chunk_after_alloc(seq, chunk)
+        return chunk
 
     def enqueue_state_loads(self, loads) -> bool:
         """First sub that can carry them owns them; False if none can.
@@ -636,13 +673,13 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         return c.take_state_source_releases()
 
     def should_park_partial_prefill_for_load(self, seq: Any) -> bool:
-        # State-tier sub first, for the reason in `should_park_for_load_after_alloc`:
-        # parking a partial prefill for its load is the state tier's decision, and
-        # a second offload sub must not answer it in the tier sub's place.
-        c = self._state_tier_sub() or _first_with(
-            self._connectors, "should_park_partial_prefill_for_load"
-        )
-        return c.should_park_partial_prefill_for_load(seq) if c is not None else False
+        # Called for every running sequence, so most have no load owner -> False
+        # (don't park). Parking a partial prefill to await its load is the
+        # load owner's decision; a sub that armed nothing must not answer it.
+        c = self._load_owner(seq)
+        if c is not None and hasattr(c, "should_park_partial_prefill_for_load"):
+            return c.should_park_partial_prefill_for_load(seq)
+        return False
 
     def should_defer_free(self, seq: Any) -> bool:
         # Defer if ANY sub wants to defer (so neither a pending save nor a
@@ -663,26 +700,28 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         )
 
     def process_completions(self, output: KVConnectorOutput) -> KVConnectorOutput:
-        """Let every offload sub apply its own completions and normalize output.
+        """Let the one offload sub apply its own completions and normalize output.
 
         Only offload defines this. Without the fan-out its save/load
         bookkeeping never clears and raw operation ids reach the scheduler,
         which looks requests up by bare id.
 
-        `OffloadSchedulerMixin.process_completions` is *destructive*: it
-        replaces `finished_loading`/`failed_loading`/`finished_saving` with only
-        the operations it recognises and `.clear()`s `connector_completions`
-        wholesale. Fanning one shared `output` through the subs in sequence
-        therefore lets the first offload sub drop the loads and clear the
-        completion channels the later subs own -- so a `[dense, kimi_k3]`
-        composite silently loses every K3 state completion: the parked request
-        never wakes, `settle_state_store` never runs, and the PAGE units stay
-        pinned until the stale reclaimer marks the image untrusted.
+        `OffloadSchedulerMixin.process_completions` is *destructive* and cannot
+        partition: it replaces `finished_loading`/`failed_loading`/
+        `finished_saving` with only the operations it recognises and `.clear()`s
+        `connector_completions` wholesale, over the full sets it is handed. Two
+        offload subs would each be handed the other's completions -- one sub
+        retiring the other's `_save_inflight` (both key by `str(seq.id)`), whose
+        `_maybe_release_deferred` then frees blocks the other is still reading,
+        plus a WARNING per foreign completion at steady state. There is no shared
+        key by which the composite could split the sets per sub.
 
-        Give each offload sub a private copy of the mutated sets and merge the
-        results, so a sub only ever consumes what it owns. The single-offload
-        case (the common `[producer, offload]` shape) keeps the direct call --
-        no copy, byte-for-byte the old behaviour.
+        That case is now unrepresentable: `_offload_subconfig` refuses two
+        `lmcache_offload` sub-connectors at startup, and only `lmcache_offload`
+        subs define `process_completions`, so `handlers` is 0 or 1. The direct
+        call is byte-for-byte the single-offload (`[producer, offload]`)
+        behaviour. `>1` is guarded loudly in case that refusal is ever bypassed
+        -- silently corrupting saves is the worse failure.
         """
         handlers = [
             handler
@@ -691,33 +730,13 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         ]
         if not handlers:
             return output
-        if len(handlers) == 1:
-            return handlers[0](output)
-
-        merged_loading: set = set()
-        merged_failed_loading: set = set()
-        merged_saving: set = set()
-        merged_completions: set = set()
-        for handler in handlers:
-            # Only the four fields the mixin rewrites need isolating; the rest
-            # (sending/recving) it never touches, so they stay shared.
-            sub_out = dataclasses.replace(
-                output,
-                finished_loading=set(output.finished_loading),
-                failed_loading=set(output.failed_loading),
-                finished_saving=set(output.finished_saving),
-                connector_completions=set(output.connector_completions),
+        if len(handlers) > 1:
+            raise RuntimeError(
+                "multi has >1 offload sub-connector with process_completions; "
+                "their completion sets cannot be partitioned per sub and this "
+                "composite is refused at startup (_offload_subconfig)."
             )
-            sub_out = handler(sub_out)
-            merged_loading |= sub_out.finished_loading
-            merged_failed_loading |= sub_out.failed_loading
-            merged_saving |= sub_out.finished_saving
-            merged_completions |= sub_out.connector_completions
-        output.finished_loading = merged_loading
-        output.failed_loading = merged_failed_loading
-        output.finished_saving = merged_saving
-        output.connector_completions = merged_completions
-        return output
+        return handlers[0](output)
 
     def save_finished(self, req_id: Any) -> None:
         for c in self._connectors:
@@ -773,7 +792,9 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         guard and renders `{}` when it is absent -- so under `multi` the whole
         offload metrics block silently reads empty. Sum overlapping int keys
         across every sub that reports (only offload subs do), rather than
-        first-hit, so a `[dense, kimi_k3]` composite reports both legs' totals.
+        first-hit. At most one offload sub is legal (`_offload_subconfig`), but
+        summing stays correct for that one and for any future producer that
+        grows int counters.
         """
         merged: dict[str, int] = {}
         for c in self._connectors:

@@ -230,6 +230,7 @@ def _sched(connectors):
     obj._connectors = connectors
     obj.is_producer = any(getattr(c, "is_producer", False) for c in connectors)
     obj.is_offload = any(getattr(c, "is_offload", False) for c in connectors)
+    obj._load_winner = {}
     return obj
 
 
@@ -370,14 +371,18 @@ def test_role_attrs_aggregate():
 
 
 def test_offload_methods_forwarded_to_owning_sub():
-    moriio = FakeSchedSub(is_producer=True)  # no offload methods
-    off = FakeSchedSub(is_offload=True, offload_methods=True)
+    # The load-side decisions route to the sub that armed the load, recorded at
+    # `get_num_new_matched_tokens` time. Here the offload sub is the sole match,
+    # so it owns the load and answers all three.
+    moriio = FakeSchedSub(is_producer=True)  # no offload methods, no match
+    off = FakeSchedSub(is_offload=True, offload_methods=True, match=(4, True))
     off.park = True
     off.partial_park = True
     off.defer = True
     off.chunk_ret = 7
     sched = _sched([moriio, off])
-    seq = object()
+    seq = SimpleNamespace(id="s1")
+    assert sched.get_num_new_matched_tokens(seq) == (4, True)  # off owns the load
     assert sched.should_park_for_load_after_alloc(seq) is True
     assert sched.should_park_partial_prefill_for_load(seq) is True
     assert sched.should_defer_free(seq) is True
@@ -386,6 +391,35 @@ def test_offload_methods_forwarded_to_owning_sub():
     sched.load_failed("r2")
     assert off.saved == ["r1"]
     assert off.load_failed_ids == ["r2"]
+
+
+def test_load_side_methods_follow_the_load_owner_not_the_tier_sub():
+    """Finding 1. The load-side questions belong to whichever sub armed the
+    load, which need not be the tier sub.
+
+    `[moriio, kimi_k3]`: moriio matches first and owns the KV load; kimi_k3
+    hosts the state tier but armed nothing (its load was cancelled). Routing
+    `should_park_for_load_after_alloc` through the tier sub asked kimi_k3, whose
+    `_load_specs.get(sid)` is empty, so it answered "don't park" and the prefill
+    ran over moriio's in-flight KV. It must route to moriio -- the load owner --
+    which does not refine parking, so the composite parks (the scheduler's own
+    absent-hook default) and the forward waits.
+    """
+    moriio = FakeSchedSub(is_producer=True, match=(5, True))  # wins, no offload API
+    k3 = FakeSchedSub(
+        is_offload=True, offload_methods=True, has_state_tier=True, match=(4, True)
+    )
+    k3.park = False  # the tier sub would say "don't park"
+    sched = _sched([moriio, k3])
+    seq = SimpleNamespace(id="s2")
+
+    assert sched.get_num_new_matched_tokens(seq) == (5, True)  # moriio owns it
+    assert k3.cancelled == [seq]  # kimi_k3's armed load was undone
+    assert k3.pending_load is False
+    # Routes to moriio (owner), which lacks the hook -> park, NOT to k3's False.
+    assert sched.should_park_for_load_after_alloc(seq) is True
+    # And the tier sub still owns the state face regardless of load ownership.
+    assert sched._state_tier_sub() is k3
 
 
 def test_process_completions_reaches_the_offload_sub():
@@ -404,36 +438,22 @@ def test_process_completions_reaches_the_offload_sub():
     assert out.finished_saving == {9}
 
 
-def test_process_completions_isolates_each_offload_sub():
-    # [dense, kimi_k3]: BOTH subs define process_completions, and each one is
-    # destructive — it filters finished_loading down to its own and .clear()s
-    # every completion channel. Fanning one mutable output through them in
-    # sequence lets the first sub eat the loads and completion channels the
-    # second owns, so a K3 state completion silently vanishes and the parked
-    # request never wakes. Each sub must operate on a private copy; the union
-    # of their results is what reaches the scheduler.
+def test_process_completions_refuses_two_offload_subs():
+    # [dense, kimi_k3]: BOTH subs define process_completions, and the mixin is
+    # destructive over the FULL sets it is handed -- it cannot partition. There
+    # is no shared key by which the composite could split the completions per
+    # sub, so one sub would retire the other's saves and clear its channels.
+    # That composite is refused at startup (`_offload_subconfig`); reaching this
+    # method with two offload handlers is a should-never-happen guarded loudly,
+    # because silently corrupting saves is the worse failure.
     dense = DestructiveSub(owned_load="dense_load", owned_channel="dense_ch")
     k3 = DestructiveSub(owned_load="k3_load", owned_channel="k3_state_index")
     sched = _sched([dense, k3])
 
-    out = sched.process_completions(
-        KVConnectorOutput(
-            finished_loading={"dense_load", "k3_load"},
-            connector_completions={
-                ConnectorCompletion("dense_ch", SaveOperationId(1, 0), True),
-                ConnectorCompletion("k3_state_index", SaveOperationId(2, 0), True),
-            },
+    with pytest.raises(RuntimeError, match="cannot be partitioned"):
+        sched.process_completions(
+            KVConnectorOutput(finished_loading={"dense_load", "k3_load"})
         )
-    )
-
-    # Both loads survive the fan-out (sequential fan would drop k3_load)...
-    assert out.finished_loading == {"dense_load", "k3_load"}
-    # ...and each sub settled exactly its own channel (sequential fan would
-    # leave k3.settled_channels empty — dense cleared them first).
-    assert dense.settled_channels == ["dense_ch"]
-    assert k3.settled_channels == ["k3_state_index"]
-    # Every completion channel was consumed by its owner; none leak onward.
-    assert out.connector_completions == set()
 
 
 def test_process_completions_single_offload_sub_is_called_directly():
@@ -613,6 +633,10 @@ def test_state_calls_route_by_tier_ownership_not_method_presence():
     tier), not method presence. Here the dense-like shell is first and carries
     no tier; the kimi_k3-like shell is second and does. Every state call must
     land on the second.
+
+    A two-offload composite is refused at startup (`_offload_subconfig`, finding
+    0), so this shape does not reach a running engine; the test exercises the
+    selector directly to keep it robust if that refusal is ever bypassed.
     """
     dense = FakeSchedSub(is_offload=True, offload_methods=True, has_state_tier=False)
     k3 = FakeSchedSub(is_offload=True, offload_methods=True, has_state_tier=True)
