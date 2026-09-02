@@ -284,7 +284,19 @@ class StagedTransfer:
 
     @staticmethod
     def _handoff(state: _ThreadTransferState, producer, consumer) -> None:
-        """Record the producer event and make the consumer stream wait on it."""
+        """Record the producer event and make the consumer stream wait on it.
+
+        No-op on a non-CUDA device: `_ThreadTransferState` leaves both streams
+        and `_StagingBuffer.ready_event` at None there (see
+        `atom_lmcache_staging.py`), and every copy on this path already ran
+        synchronously on the calling thread, so there is nothing to fence. The
+        event is created iff `use_cuda`, so `ready_event is None` is the exact
+        non-CUDA test. Guarding here keeps `unpack`'s general path -- whose H2D
+        leg is a plain `copy_` that succeeds on CPU -- from dereferencing that
+        None and masking the meaningful `fused_unpack_chunk_major` (Triton needs
+        CUDA) error that follows."""
+        if state.staging_buffer.ready_event is None:
+            return
         state.staging_buffer.ready_event.record(producer)
         consumer.wait_event(state.staging_buffer.ready_event)
 
@@ -296,5 +308,11 @@ class StagedTransfer:
         Unlike `run_staged_pipeline`, this path does not hand a `free_event`
         to a later consumer -- `producer.synchronize()` is the whole fence -- so
         it deliberately leaves the shared buffer's `free_event`/
-        `free_event_valid` untouched."""
+        `free_event_valid` untouched.
+
+        No-op when `producer` is None (non-CUDA: `_ThreadTransferState` has no
+        streams), matching `_handoff` -- the copies already completed
+        synchronously, so there is nothing to drain."""
+        if producer is None:
+            return
         producer.synchronize()
