@@ -1,7 +1,6 @@
 # Rust
 /target/
 **/target/
-Cargo.lock
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
