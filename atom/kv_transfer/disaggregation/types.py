@@ -121,8 +121,9 @@ class ConnectorCompletion:
         return self.channel, self.operation_id
 
 
-# Region roles the DCP relayout dispatches on: an MLA latent region is always
-# interleave-sharded, a DSA index region may instead be replicated whole.
+# Region roles used for producer-to-DCP-consumer relayout. The consumer stores
+# both MLA and DSA index caches interleave-sharded; producer MLA bytes are
+# token-contiguous, while producer preshuffled DSA index bytes require staging.
 MLA_KV_ROLE = "mla.kv"
 INDEX_CACHE_ROLE = "dsa.index_cache"
 
