@@ -647,6 +647,7 @@ class InputOutputProcessor:
                 "qwen3_5_text",
                 "qwen3_5_moe_text",
                 "kimi_linear",
+                "glm5_next_text",
                 "deepseek_v4",
             }
         )

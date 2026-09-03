@@ -70,6 +70,7 @@ class TestPageUnitAddressesAreArithmetic:
         )
         stub = SimpleNamespace(model_runner=runner, _page_unit_region_cache=None)
         for name in (
+            "_page_unit_index_cache",
             "_page_unit_regions",
             "_page_unit_bases",
             "_page_unit_stream_sizes",

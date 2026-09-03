@@ -52,7 +52,7 @@ from atom.model_ops.mamba_ops.causal_conv1d import (
     causal_conv1d_update,
 )
 from atom.model_ops.moe import FusedMoE
-from atom.model_ops.rotary_embedding import RotaryEmbedding
+from atom.model_ops.rotary_embedding import NoPositionalRotaryEmbedding
 from atom.model_ops.triton_fused_sigmoid_mul_quant import fused_sigmoid_mul_maybe_quant
 from atom.model_ops.utils import atom_parameter
 from atom.models.utils import (
@@ -177,28 +177,6 @@ def _effective_layer_quant(
         if not should_skip_online_quant(cfg.quant_type, cfg.quant_dtype, online_cfg):
             cfg = online_cfg
     return cfg.quant_type, cfg.quant_dtype
-
-
-class _NoPositionalRotaryEmbedding(RotaryEmbedding):
-    def _compute_cos_sin_cache(self) -> tuple[torch.Tensor, torch.Tensor]:
-        cache_shape = (
-            self.max_position_embeddings,
-            1,
-            1,
-            self.rotary_dim // 2,
-        )
-        return (
-            torch.ones(cache_shape, dtype=torch.float32),
-            torch.zeros(cache_shape, dtype=torch.float32),
-        )
-
-    def forward(
-        self,
-        positions: torch.Tensor,
-        query: torch.Tensor,
-        key: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return query, key
 
 
 class SituAndMul(nn.Module):
@@ -771,7 +749,7 @@ class KimiFullAttention(nn.Module):
         rope_max_position = int(
             _text_max_pos or getattr(atom_config, "max_model_len", None) or 16384
         )
-        self.rotary_emb = _NoPositionalRotaryEmbedding(
+        self.rotary_emb = NoPositionalRotaryEmbedding(
             head_size=self.qk_rope_head_dim,
             rotary_dim=self.qk_rope_head_dim,
             max_position_embeddings=rope_max_position,

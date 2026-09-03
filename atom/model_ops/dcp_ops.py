@@ -600,6 +600,56 @@ def dcp_gather_compressed_kv(
     return gathered.reshape(slot_ids.shape[0], -1)
 
 
+def dcp_reorg_row_indices(
+    padded_local_chunk_seq_lens: np.ndarray,
+    real_local_chunk_lens: np.ndarray,
+) -> np.ndarray:
+    """The reorg of an AllGathered compressed-KV chunk, as a row map.
+
+    Same reordering ``reorg_kvcache`` performs by slicing and concatenating,
+    expressed as ``dst_row -> src_row`` so a kernel can apply it in one gather.
+    ``reorg_kvcache`` walks the (seq, rank) segments in Python on every layer;
+    this walks them once per step in the metadata builder, and the gather then
+    rides along with the ``kv_b_proj`` decompress instead of costing two
+    ``cat``s of its own.
+
+    Args:
+        padded_local_chunk_seq_lens: [bs] per-seq padded local chunk length.
+            Uniform across ranks, so it also gives each rank's AllGather block
+            size (``toks = sum``) and each seq's offset inside a block.
+        real_local_chunk_lens: [bs, dcp] per-(seq, rank) REAL local chunk
+            length. Where it falls short of the padded length is exactly the
+            padding this map drops.
+
+    Returns:
+        int32 [``real_local_chunk_lens.sum()``] rows into the
+        ``[toks * dcp, d]`` AllGather buffer, per-seq contiguous and rank-major
+        within a seq -- the layout ``cu_seqlens_k`` describes.
+    """
+    padded = np.asarray(padded_local_chunk_seq_lens, dtype=np.int64).reshape(-1)
+    lens = np.asarray(real_local_chunk_lens, dtype=np.int64)
+    bs, dcp = lens.shape
+    assert padded.shape[0] == bs, (padded.shape, lens.shape)
+
+    toks = int(padded.sum())
+    seq_base = np.zeros(bs, dtype=np.int64)
+    np.cumsum(padded[:-1], out=seq_base[1:])
+    # Rank r's block starts at r * toks, and seq i sits at the same offset
+    # inside every block because the padded length is rank-invariant.
+    starts = (
+        seq_base[:, None] + np.arange(dcp, dtype=np.int64)[None, :] * toks
+    ).reshape(-1)
+
+    lens = lens.reshape(-1)  # (seq, rank) row-major == reorg's walk order
+    seg_base = np.zeros(lens.shape[0], dtype=np.int64)
+    np.cumsum(lens[:-1], out=seg_base[1:])
+    # Row `seg_base[s] + j` of the output is row `starts[s] + j` of the input,
+    # so a single arange carries the per-segment offset j.
+    total = int(lens.sum())
+    rows = np.repeat(starts - seg_base, lens) + np.arange(total, dtype=np.int64)
+    return rows.astype(np.int32)
+
+
 def reorg_kvcache(
     allgatered_kv_c_normed: torch.Tensor,
     allgatered_k_pe: torch.Tensor,

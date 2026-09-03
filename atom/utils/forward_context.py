@@ -601,6 +601,7 @@ class AttentionMetaData:
     # for prefix cache
     has_cached: bool = False
     total_kv: int | None = None
+    kpool_total_pools: int | None = None
     num_cached_tokens: torch.Tensor | None = None
     seq_starts: torch.Tensor | None = None
 
@@ -636,11 +637,13 @@ class AttentionMetaData:
         token_to_seq_idxs: torch.Tensor | None = None,
         has_cached: bool = False,
         total_kv: int | None = None,
+        kpool_total_pools: int | None = None,
         num_cached_tokens: torch.Tensor | None = None,
         seq_starts: torch.Tensor | None = None,
     ):
         self.has_cached = has_cached
         self.total_kv = total_kv
+        self.kpool_total_pools = kpool_total_pools
         self.num_cached_tokens = num_cached_tokens
         self.seq_starts = seq_starts
         self.cu_seqlens_q = cu_seqlens_q

@@ -28,6 +28,16 @@ class PageUnitGeometryMixin:
     aiter, no CUDA -- the concrete K3 builder supplies the pool.
     """
 
+    def _page_unit_index_cache(self) -> torch.Tensor | None:
+        """The sparse-indexer cache that rides this PAGE unit, or `None`.
+
+        Plain MLA owns only its KV rows, so the generic geometry has no index
+        cache. A sparse-indexer model (`runner.is_deepseek_v32`) overrides this
+        to return `runner.index_cache`, whose layers `_page_unit_regions`
+        appends after the MLA rows.
+        """
+        return None
+
     def _page_unit_regions(self) -> tuple[np.ndarray, np.ndarray]:
         """Base address and per-unit stride of every region a PAGE id owns.
 
@@ -43,6 +53,7 @@ class PageUnitGeometryMixin:
         """
         runner = self.model_runner
         cache = runner.kv_cache
+        index_cache = self._page_unit_index_cache()
         # Key on the full layout, not `data_ptr()` alone. `model_runner.kv_cache`
         # is reassigned in two places -- the P/D IPC import
         # (`model_runner.py:4472`) and the rollout sleep/wake path
@@ -56,11 +67,27 @@ class PageUnitGeometryMixin:
         # `row_stride`. Keying on `(data_ptr, shape, stride, element_size)` makes
         # any of those changing a cache miss that rebuilds. Mirrors the DSV4
         # sibling (`deepseek_v4_attn.py`), which keys on the same evidence.
+        #
+        # A sparse-indexer model (`runner.is_deepseek_v32`) rides its index cache
+        # in the same PAGE unit, appended after the MLA rows. Its layout is part
+        # of the identity too -- key on it (or `None`) so a reallocated or
+        # resized index cache is a miss that rebuilds, exactly like the MLA pool.
+        index_owner = (
+            None
+            if index_cache is None
+            else (
+                index_cache.data_ptr(),
+                tuple(index_cache.shape),
+                tuple(index_cache.stride()),
+                index_cache.element_size(),
+            )
+        )
         owner = (
             cache.data_ptr(),
             tuple(cache.shape),
             tuple(cache.stride()),
             cache.element_size(),
+            index_owner,
         )
         cached = getattr(self, "_page_unit_region_cache", None)
         if cached is not None and cached[0] == owner:
@@ -75,20 +102,42 @@ class PageUnitGeometryMixin:
         region = runner.block_size * entry * item
         row_stride = cache.stride(0) * item
 
+        base_addr = cache.data_ptr()
+        bases = [base_addr + row * row_stride for row in range(rows)]
+        sizes = [region] * rows
+
+        index_layers = 0
+        index_region = 0
+        if index_cache is not None:
+            if not index_cache.is_contiguous():
+                raise RuntimeError("the index cache must be contiguous to be copied")
+            index_item = index_cache.element_size()
+            index_layers = index_cache.shape[0]
+            layer_stride = index_cache.stride(0) * index_item
+            index_region = index_cache.stride(1) * index_item
+            bases += [
+                index_cache.data_ptr() + layer * layer_stride
+                for layer in range(index_layers)
+            ]
+            sizes += [index_region] * index_layers
+
         runtime = getattr(runner, "state_runtime", None)
         spec = None if runtime is None else runtime.checkpoint_spec
-        page_unit_bytes = spec.page_unit_bytes if spec is not None else rows * region
-        if rows * region != page_unit_bytes:
+        owned = sum(sizes)
+        page_unit_bytes = spec.page_unit_bytes if spec is not None else owned
+        if owned != page_unit_bytes:
+            gives = f"{rows} rows x {region} B"
+            if index_cache is not None:
+                gives += f" + {index_layers} index layers x {index_region} B"
             raise RuntimeError(
                 f"a PAGE unit is {page_unit_bytes} B but this pool gives a "
-                f"logical block {rows} rows x {region} B = {rows * region} B; "
-                "the two disagree about block granularity"
+                f"logical block {gives} = {owned} B; the two disagree about "
+                "block granularity"
             )
-        base_addr = cache.data_ptr()
-        base = np.array(
-            [base_addr + row * row_stride for row in range(rows)], dtype=np.int64
+        regions = (
+            np.array(bases, dtype=np.int64),
+            np.array(sizes, dtype=np.int64),
         )
-        regions = (base, np.full(rows, region, dtype=np.int64))
         self._page_unit_region_cache = (owner, regions)
         return regions
 
