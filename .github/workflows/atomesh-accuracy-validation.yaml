@@ -565,6 +565,13 @@ jobs:
           echo "=== Generated entries ==="
           cat accuracy-benchmark-input.json
 
+      - name: Prepare existing dashboard data
+        if: hashFiles('accuracy-benchmark-input.json') != ''
+        id: prepare_dashboard_data
+        uses: ./.github/actions/prepare-dashboard-data
+        with:
+          data-path: atomesh-accuracy-dashboard/data.js
+
       - name: Store Atomesh accuracy data
         if: hashFiles('accuracy-benchmark-input.json') != ''
         uses: benchmark-action/github-action-benchmark@v1
@@ -573,7 +580,18 @@ jobs:
           output-file-path: accuracy-benchmark-input.json
           gh-pages-branch: gh-pages
           benchmark-data-dir-path: atomesh-accuracy-dashboard
-          auto-push: true
+          auto-push: false
           max-items-in-chart: 300
           github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Validate dashboard data after write
+        if: hashFiles('accuracy-benchmark-input.json') != ''
+        uses: ./.github/actions/validate-dashboard-data
+        with:
+          data-path: atomesh-accuracy-dashboard/data.js
+          min-entries: ${{ steps.prepare_dashboard_data.outputs.entry_count }}
+
+      - name: Push dashboard data
+        if: hashFiles('accuracy-benchmark-input.json') != ''
+        run: git push origin gh-pages
 

@@ -587,9 +587,15 @@ class AttentionMetaData:
     # prefill/MTP-verify and per seq in decode. Separate from kv_last_page_lens
     # (the dense per-seq buffer) so the two never clobber each other.
     sparse_kv_last_page_lens: torch.Tensor | None = None
-    # Precomputed per-rank context lengths for qlen=1 sparse DSA + DCP decode.
+    # Per-rank KV length of each query token's causal window, for the sparse
+    # DSA + DCP indexer: MTP verify gives each draft position its own window.
     # The padded running-width buffer is shared by eager, graph and TBO paths.
     dcp_local_context_lens: torch.Tensor | None = None
+    # Block-table row per query token, for the same indexer -- both aiter ops
+    # address the table by row. Aliases block_tables at one query per sequence.
+    # Every producer that rewrites block_tables must rewrite this too: a stale
+    # one has the right length and the wrong rows.
+    dcp_token_block_tables: torch.Tensor | None = None
 
     work_meta_data: torch.Tensor | None = None
     work_indptr: torch.Tensor | None = None
@@ -601,6 +607,7 @@ class AttentionMetaData:
     # for prefix cache
     has_cached: bool = False
     total_kv: int | None = None
+    kpool_total_pools: int | None = None
     num_cached_tokens: torch.Tensor | None = None
     seq_starts: torch.Tensor | None = None
 
@@ -636,11 +643,13 @@ class AttentionMetaData:
         token_to_seq_idxs: torch.Tensor | None = None,
         has_cached: bool = False,
         total_kv: int | None = None,
+        kpool_total_pools: int | None = None,
         num_cached_tokens: torch.Tensor | None = None,
         seq_starts: torch.Tensor | None = None,
     ):
         self.has_cached = has_cached
         self.total_kv = total_kv
+        self.kpool_total_pools = kpool_total_pools
         self.num_cached_tokens = num_cached_tokens
         self.seq_starts = seq_starts
         self.cu_seqlens_q = cu_seqlens_q

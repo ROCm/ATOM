@@ -6,6 +6,7 @@ from torch import nn
 from torch.profiler import record_function
 
 from atom.config import CompilationLevel
+from atom.distributed.dcp_utils import get_dcp_world_size
 from atom.distributed.pcp_utils import (
     get_pcp_world_size,
     pcp_allgather_rerange,
@@ -37,6 +38,41 @@ def _pcp_active_for_draft_model(draft_model: nn.Module) -> bool:
     return _pcp_active_v4()
 
 
+def _pcp_split_draft_inputs(
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    hidden_states: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+    """Split a draft prefill onto this rank's 1/pcp query shard.
+
+    A draft prefill reuses the target's attn_metadata, already reindexed to
+    1/pcp by the builder, so its q rows must be split to match or aiter aborts
+    on `kv_indptr_prefix length must be N+1`. Both draft prefill entry points
+    need this: `propose()`'s i==0 step and `precompute_context_kv`.
+
+    Callers gate on `_pcp_active_for_draft_model` first. Returns the shards
+    plus (n_global, pcp_ws) for callers that must all-gather back.
+
+    Assumes 1-D positions: MRoPE's `[3, N]` layout puts the token axis last,
+    which the pad-and-split below would corrupt. No MRoPE model can reach the
+    PCP draft path today.
+    """
+    pcp_ws = get_pcp_world_size()
+    n_global = input_ids.shape[0]
+    assert positions.shape[0] == n_global and hidden_states.shape[0] == n_global, (
+        f"draft PCP split needs row-aligned inputs: ids={n_global} "
+        f"pos={positions.shape[0]} hidden={hidden_states.shape[0]}"
+    )
+    n_pad = pcp_pad_len(n_global, pcp_ws) - n_global
+    return (
+        pcp_round_robin_split(pcp_pad_dense(input_ids, n_pad), pcp_ws),
+        pcp_round_robin_split(pcp_pad_dense(positions, n_pad), pcp_ws),
+        pcp_round_robin_split(pcp_pad_dense(hidden_states, n_pad), pcp_ws),
+        n_global,
+        pcp_ws,
+    )
+
+
 class EagleProposer(Drafter):
     """Serial speculative drafter: plain MTP and EAGLE3.
 
@@ -52,6 +88,10 @@ class EagleProposer(Drafter):
         # Gated on method=mtp, DSA index_topk and the config flag, so other
         # draft backends are unchanged. (DSpark is DSparkProposer, not this
         # class, so it cannot reach here.)
+        #
+        # Not under DCP: the reuse gathers indices at a fixed stride, while DCP
+        # compacts each rank's owned slots to a data-dependent length recorded
+        # in dcp_sparse_kv_indptr_buffer.
         draft_hf = self.speculative_config.draft_model_hf_config
         mtp_inner = getattr(self.model, "model", None)
         self._share_mtp_indices = (
@@ -60,6 +100,7 @@ class EagleProposer(Drafter):
             and hasattr(draft_hf, "index_topk")
             and mtp_inner is not None
             and hasattr(mtp_inner, "set_skip_topk")
+            and get_dcp_world_size() == 1
         )
         if self._share_mtp_indices:
             logger.info(
@@ -316,13 +357,25 @@ class EagleProposer(Drafter):
         input_ids = self.runner.tokenID_processor.input_ids.gpu[1 : num_tokens + 1]
         input_ids.scatter_(0, last_token_indices, anchor_ids)
 
+        d_input_ids = input_ids
+        d_positions = positions[:num_tokens] + 1
+        d_hidden = draft_hidden
+        # Same split as propose()'s i==0 step: this pass reuses the same
+        # 1/pcp-reindexed attn_metadata. Only q is sharded -- attention
+        # all-gathers K/V back to full order before writing, so every rank still
+        # ends up with the whole draft KV.
+        if _pcp_active_for_draft_model(self.model):
+            d_input_ids, d_positions, d_hidden, _, _ = _pcp_split_draft_inputs(
+                d_input_ids, d_positions, d_hidden
+            )
+
         was_draft = context.is_draft
         context.is_draft = True
         try:
             self.model(
-                input_ids=input_ids,
-                positions=positions[:num_tokens] + 1,
-                hidden_states=draft_hidden,
+                input_ids=d_input_ids,
+                positions=d_positions,
+                hidden_states=d_hidden,
             )
         finally:
             context.is_draft = was_draft
@@ -419,6 +472,10 @@ class EagleProposer(Drafter):
         # block_tables, context_lens, and sparse_kv_indptr are
         # needed by both MHA and MLA+sparse attention
         attn_metadata.block_tables = var["block_tables"].gpu[:running_bs]
+        if attn_metadata.dcp_token_block_tables is not None:
+            # One query per sequence, so the per-token table is block_tables
+            # itself; the verify step's has the right row count, wrong rows.
+            attn_metadata.dcp_token_block_tables = attn_metadata.block_tables
         attn_metadata.context_lens = var["context_lens"].gpu[:running_bs]
         if "sparse_kv_indptr" in var:
             attn_metadata.sparse_kv_indptr = var["sparse_kv_indptr"].gpu[
@@ -560,18 +617,13 @@ class EagleProposer(Drafter):
                 # full `last_token_indices`) is unchanged.
                 pcp_draft_prefill = i == 0 and _pcp_active_for_draft_model(self.model)
                 if pcp_draft_prefill:
-                    pcp_ws = get_pcp_world_size()
-                    n_global_draft = input_ids.shape[0]
-                    n_pad = pcp_pad_len(n_global_draft, pcp_ws) - n_global_draft
-                    d_input_ids = pcp_round_robin_split(
-                        pcp_pad_dense(input_ids, n_pad), pcp_ws
-                    )
-                    d_positions = pcp_round_robin_split(
-                        pcp_pad_dense(positions, n_pad), pcp_ws
-                    )
-                    d_hidden = pcp_round_robin_split(
-                        pcp_pad_dense(hidden_states, n_pad), pcp_ws
-                    )
+                    (
+                        d_input_ids,
+                        d_positions,
+                        d_hidden,
+                        n_global_draft,
+                        pcp_ws,
+                    ) = _pcp_split_draft_inputs(input_ids, positions, hidden_states)
                 else:
                     d_input_ids, d_positions, d_hidden = (
                         input_ids,
