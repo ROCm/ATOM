@@ -5319,6 +5319,10 @@ def test_every_member_the_scheduler_reads_is_reachable_through_the_shell():
         "enqueue_state_stores",
         "take_state_reports",
         "take_state_source_releases",
+        # Added when the state load leg was fused onto the KV load's own
+        # request: it is the one state-face member whose read is NEW, so it is
+        # the one most likely to be hidden again by a later refactor.
+        "take_missed_state_hashes",
         "is_offload",
         # Read through the `conn` alias in `_state_store_pending_cap`; only the
         # alias-aware sweep above sees it, so anchor it so a regression to a
