@@ -33,6 +33,41 @@ def test_global_index_cache_layout_without_schedule_is_unchanged():
     assert aiter_mla._global_index_cache_layer_ids(None, 4, 1) == (0, 1, 2, 3, 4)
 
 
+@pytest.mark.parametrize(
+    "kv_transfer_config, expected",
+    [
+        (None, False),
+        ({}, False),
+        ({"kv_connector": "mooncake", "kv_role": "kv_producer"}, True),
+        ({"kv_connector": "mooncake", "kv_role": "kv_consumer"}, False),
+        ({"kv_connector": "lmcache_offload", "kv_role": "offload"}, False),
+        (
+            {
+                "kv_connector": "multi",
+                "connectors": [
+                    {"kv_connector": "mooncake", "kv_role": "kv_producer"},
+                    {"kv_connector": "lmcache_offload", "kv_role": "offload"},
+                ],
+            },
+            True,
+        ),
+        (
+            {
+                "kv_connector": "multi",
+                "connectors": [
+                    {"kv_connector": "mooncake", "kv_role": "kv_consumer"},
+                    {"kv_connector": "lmcache_offload", "kv_role": "offload"},
+                ],
+            },
+            False,
+        ),
+    ],
+)
+def test_index_staging_requires_mooncake_producer(kv_transfer_config, expected):
+    config = SimpleNamespace(kv_transfer_config=kv_transfer_config)
+    assert aiter_mla._mooncake_producer_transfer_configured(config) is expected
+
+
 def test_padded_prefill_mla_rows_have_empty_initialized_kv_ranges():
     kv_indptr = torch.tensor([0, 3, 7, 101, 202], dtype=torch.int32)
     kv_last_page_lens = np.array([3, 4, 9, 9], dtype=np.int32)
