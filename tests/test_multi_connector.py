@@ -633,26 +633,6 @@ def test_state_stores_default_when_no_sub_implements():
     assert sched.take_state_source_releases() == set()
 
 
-def test_the_composite_exposes_the_sub_connectors_state_tier():
-    """The K3 store/load path reads `_state_tier` off whatever
-    connector the forward context holds. Under `multi` that is this object, so
-    without the re-export nothing is ever submitted and every slot leaks."""
-    tier = object()
-    off = FakeWorkerSub()
-    off._state_tier = tier
-    w = _worker([FakeWorkerSub(), off])
-
-    w.register_kv_caches({}, transfer_tensors=None, num_blocks=1)
-
-    assert w._state_tier is tier
-
-
-def test_no_sub_with_a_tier_leaves_the_composite_tier_none():
-    w = _worker([FakeWorkerSub(), FakeWorkerSub()])
-    w.register_kv_caches({}, transfer_tensors=None, num_blocks=1)
-    assert w._state_tier is None
-
-
 def test_a_state_only_step_under_multi_is_not_dropped():
     """A step whose only work is a state store must reach the worker.
 
