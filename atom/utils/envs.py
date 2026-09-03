@@ -378,6 +378,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_LM_HEAD_MODE": lambda: os.getenv(
         "ATOM_DP_LM_HEAD_MODE", "all2all"
     ).lower(),
+    # Pure-DP draft greedy argmax: shard the draft lm_head vocab across the DP
+    # group so each rank reads [H, V/dp] instead of the full [H, V], exchanging
+    # only the packed [N, 2]. Active only for a unified (rectangular) pure-DP
+    # draft step; everything else falls back to the replicated local argmax.
+    "ATOM_DP_DRAFT_ARGMAX": lambda: os.getenv("ATOM_DP_DRAFT_ARGMAX", "1").lower()
+    in ("1", "true"),
+    # Row count (running_tokens) above which it falls back: the hidden gather
+    # grows with rows, so the shard only pays at small M. ~256 is the V4-Pro
+    # crossover.
+    "ATOM_DP_DRAFT_ARGMAX_MAX_ROWS": lambda: int(
+        os.getenv("ATOM_DP_DRAFT_ARGMAX_MAX_ROWS", "256")
+    ),
     "ATOM_USE_FLYDSL_GDR": lambda: os.getenv("ATOM_USE_FLYDSL_GDR", "0").lower() == "1",
     # Capture each declared draft pass into a per-captured-size CUDAGraph as it is
     # warmed, so the draft replays instead of relaunching every kernel. 0 drafts
