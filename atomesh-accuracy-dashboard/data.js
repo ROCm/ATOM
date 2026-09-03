@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1788407633613,
+  "lastUpdate": 1788421862998,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -2467,6 +2467,42 @@ window.BENCHMARK_DATA = {
             "value": 0.7491,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/33710971199 | Threshold: 0.73 | Baseline: 0.75 | BaselineModel: meta-llama/Meta-Llama-3-8B-Instruct | BaselineNote: HF reports 0.796 but 8-shot CoT; CI uses 3-shot, not comparable | Docker: rocm/atom-dev:nightly_202609021444 | GPU: AMD Instinct MI355X | VRAM: 252GB | ROCm: 7.2.4 | strict-match: 0.7506 | fewshot: 3 | Model: /models/meta-llama/Meta-Llama-3-8B-Instruct"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "junyyang@amd.com",
+            "name": "junyyang-amd",
+            "username": "junyyang-amd"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "db725f422c39cb5d0dfcc4ff90416ef2f7c4b9c2",
+          "message": "ci: prevent benchmark dashboard history loss (#2099)\n\n* ci: prevent benchmark dashboard history loss\n\nValidate and normalize existing dashboard data before every benchmark action so parser failures cannot replace history with a single result.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* fix(ci): resolve dashboard helper lint failures\n\nUse Python 3.10 type annotations, correct type exceptions, mark the helper executable, and replace the deprecated reviewdog failure option.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* fix(ci): make dashboard publishing race-safe\n\nSynchronize gh-pages from the remote, validate data before publishing, and reject history shrinkage before any dashboard push.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* style: format dashboard data test\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* ci: kill leftover GPU occupants in vLLM/SGLang plugin preflight\n\nAccuracy jobs were failing HIP smoke tests on leftover VRAM; opt-in occupant kill for plugin CI only, leaving ATOM native preflight unchanged.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* Revert \"ci: kill leftover GPU occupants in vLLM/SGLang plugin preflight\"\n\nPID kill could not signal leftover KFD processes across namespaces, so revert it in favor of docker-level cleanup.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* ci: kill leftover docker containers in vLLM/SGLang plugin preflight\n\nReplace host PID signaling with docker kill of other running containers, keeping the current job container and leaving ATOM native CI unchanged.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n---------\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\nCo-authored-by: Junyan Yang <junyyang@crs-m2m-cpu-spur-v2-009.us-east2-a.compute.internal>",
+          "timestamp": "2026-09-03T14:29:45+08:00",
+          "tree_id": "1dcd6cd7c63c6512e9129e02ce78bbd0c949e0b2",
+          "url": "https://github.com/ROCm/ATOM/commit/db725f422c39cb5d0dfcc4ff90416ef2f7c4b9c2"
+        },
+        "date": 1788421862160,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.9492,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/33723474050 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202609021444 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9477 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::Meta-Llama-3-8B-Instruct accuracy (GSM8K)",
+            "value": 0.7089,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/33723474050 | Threshold: 0.73 | Baseline: 0.75 | BaselineModel: meta-llama/Meta-Llama-3-8B-Instruct | BaselineNote: HF reports 0.796 but 8-shot CoT; CI uses 3-shot, not comparable | Docker: rocm/atom-dev:nightly_202609021444 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.6619 | fewshot: 3 | Model: /models/meta-llama/Meta-Llama-3-8B-Instruct"
           }
         ]
       }
