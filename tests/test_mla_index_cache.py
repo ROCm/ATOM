@@ -18,6 +18,8 @@ try:
     from atom.model_ops.attentions.aiter_mla import (
         AiterMLAMetadataBuilder,
         _pad_prefill_mla_draft_tail,
+        gather_dcp_preshuffled_index_pages,
+        prepare_dcp_index_gather_indices,
     )
 except (ImportError, RuntimeError) as exc:
     pytest.skip(f"aiter MLA backend unavailable: {exc}", allow_module_level=True)
@@ -66,6 +68,113 @@ def test_global_index_cache_layout_without_schedule_is_unchanged():
 def test_index_staging_requires_mooncake_producer(kv_transfer_config, expected):
     config = SimpleNamespace(kv_transfer_config=kv_transfer_config)
     assert aiter_mla._mooncake_producer_transfer_configured(config) is expected
+
+
+def test_dcp_mooncake_producer_is_rejected_before_transfer_planning():
+    builder = object.__new__(AiterMLAMetadataBuilder)
+    builder.dcp_world_size = 2
+    builder.model_runner = SimpleNamespace(
+        kv_cache=object(),
+        config=SimpleNamespace(
+            kv_transfer_config={
+                "kv_connector": "mooncake",
+                "kv_role": "kv_producer",
+            }
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="unsharded producer"):
+        builder.get_kv_transfer_tensors()
+
+
+def test_preshuffled_index_gather_reorganizes_pages_and_zeros_tail():
+    from atom.kv_transfer.disaggregation.sharded_transfer import (
+        build_dcp_shard_plan,
+    )
+
+    scheduler_block_size = 16
+    source_page_size = 4
+    block_ratio = scheduler_block_size // source_page_size
+    index_head_dim = 128
+    aligned_index_dim = 144
+    scales_per_token = 1
+    num_source_blocks = 5
+    page_bytes = scheduler_block_size * aligned_index_dim
+
+    source_pages = torch.zeros(num_source_blocks, page_bytes, dtype=torch.uint8)
+    source_keys = source_pages[:, : scheduler_block_size * index_head_dim].view(
+        num_source_blocks, 1, index_head_dim // 16, 16, 16
+    )
+    source_scales = source_pages[
+        :,
+        scheduler_block_size
+        * index_head_dim : scheduler_block_size
+        * (index_head_dim + 4 * scales_per_token),
+    ].view(torch.float32)
+    for block_id in range(num_source_blocks):
+        for token in range(scheduler_block_size):
+            for dim in range(index_head_dim):
+                source_keys[block_id, 0, dim // 16, token, dim % 16] = (
+                    block_id * 37 + token * 11 + dim
+                ) % 251
+            source_scales[block_id, token] = block_id * 1000 + token
+    source = source_pages.view(
+        num_source_blocks * block_ratio,
+        source_page_size,
+        aligned_index_dim,
+    )
+
+    src_block_ids = [2, 0, 4, 1, 3]
+    plan = build_dcp_shard_plan(
+        src_block_ids,
+        block_size=scheduler_block_size,
+        dcp_size=4,
+        dcp_rank=3,
+    )
+    indices = prepare_dcp_index_gather_indices(plan, torch.device("cpu"))
+    staging = torch.full(
+        (plan.dst_pages, page_bytes),
+        0xFF,
+        dtype=torch.uint8,
+    )
+
+    pages = gather_dcp_preshuffled_index_pages(
+        source,
+        staging,
+        indices,
+        index_head_dim,
+        scheduler_block_size,
+        block_ratio,
+    )
+
+    output_keys = staging[:, : scheduler_block_size * index_head_dim].view(
+        plan.dst_pages, 1, index_head_dim // 16, 16, 16
+    )
+    output_scales = staging[
+        :,
+        scheduler_block_size
+        * index_head_dim : scheduler_block_size
+        * (index_head_dim + 4 * scales_per_token),
+    ].view(torch.float32)
+    for local_token in range(plan.dst_pages * scheduler_block_size):
+        dst_page, dst_token = divmod(local_token, scheduler_block_size)
+        global_token = local_token * plan.dcp_size + plan.dcp_rank
+        src_ordinal, src_token = divmod(global_token, scheduler_block_size)
+        valid = src_ordinal < len(src_block_ids)
+        for dim in range(index_head_dim):
+            actual = output_keys[dst_page, 0, dim // 16, dst_token, dim % 16].item()
+            expected = (
+                (src_block_ids[src_ordinal] * 37 + src_token * 11 + dim) % 251
+                if valid
+                else 0
+            )
+            assert actual == expected
+        expected_scale = src_block_ids[src_ordinal] * 1000 + src_token if valid else 0
+        assert output_scales[dst_page, dst_token].item() == expected_scale
+
+    payload_bytes = scheduler_block_size * (index_head_dim + 4 * scales_per_token)
+    assert pages == plan.dst_pages
+    assert not staging[:, payload_bytes:].any()
 
 
 def test_padded_prefill_mla_rows_have_empty_initialized_kv_ranges():
@@ -163,11 +272,13 @@ def _builder(
             ),
         ),
         block_size=16,
+        aligned_index_dim=(index_head_dim + 4 + 15) // 16 * 16,
         is_deepseek_v32=True,
         _get_total_num_layers=lambda: total_local_layers,
     )
     builder = object.__new__(AiterMLAMetadataBuilder)
     builder.model_runner = runner
+    builder.dcp_world_size = 1
     return builder, runner
 
 

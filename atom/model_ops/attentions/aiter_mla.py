@@ -1380,6 +1380,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         runner = self.model_runner
         if not hasattr(runner, "kv_cache"):
             return None
+        mooncake_producer = _mooncake_producer_transfer_configured(runner.config)
+        if mooncake_producer and self.dcp_world_size > 1:
+            raise RuntimeError(
+                "Mooncake P/D transfer requires an unsharded producer because "
+                "the DCP transfer plan assumes producer blocks contain the "
+                "global contiguous token order"
+            )
 
         block_regions: list[KVTransferRegion] = []
         num_layers = runner.kv_cache.shape[0]
@@ -1509,7 +1516,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         if (
             hasattr(runner, "index_cache")
             and self.dcp_world_size == 1
-            and _mooncake_producer_transfer_configured(runner.config)
+            and mooncake_producer
         ):
             # Mooncake's producer workers can receive requests from a DCP
             # consumer whose index cache is sharded below one MFMA tile. Keep a
