@@ -635,25 +635,44 @@ jobs:
           fi
           echo "Visible ROCm GPUs: ${gpu_count}"
 
-          rdma_context="/app/mooncake/mooncake-transfer-engine/src/transport/rdma_transport/rdma_context.cpp"
-          python3 - "${rdma_context}" <<'PY'
+          validator_source="/app/mooncake/mooncake-transfer-engine/example/transfer_engine_validator.cpp"
+          python3 - "${validator_source}" <<'PY'
           import pathlib
           import sys
 
           path = pathlib.Path(sys.argv[1])
           source = path.read_text()
 
-          old = "            uint32_t init = 16;"
-          new = "            uint32_t init = max_dest_rd_atomic_;"
+          replacements = {
+              """            fillData(thread_id, addr, seed);
+                      submitRequestSync(engine, segment_id, thread_id, addr, remote_base,
+                                        TransferRequest::WRITE);
+                      fillData(thread_id, addr, 0);
+                      submitRequestSync(engine, segment_id, thread_id, addr, remote_base,
+                                        TransferRequest::READ);
+                      checkData(thread_id, addr, seed);""":
+              """            fillData(thread_id, addr, seed);
+                      submitRequestSync(engine, segment_id, thread_id, addr, remote_base,
+                                        TransferRequest::WRITE);""",
+              """            submitRequestSync(engine, segment_id, thread_id, addr, remote_base,
+                                        TransferRequest::WRITE);
+                      submitRequestSync(engine, segment_id, thread_id, addr, remote_base,
+                                        TransferRequest::READ);""":
+              """            submitRequestSync(engine, segment_id, thread_id, addr, remote_base,
+                                        TransferRequest::WRITE);""",
+              'LOG(INFO) << "Worker " << thread_id << " stopped! Data validation passed";':
+              'LOG(INFO) << "Worker " << thread_id << " stopped! RDMA WRITE transfers completed";',
+          }
+          for old, new in replacements.items():
+              if source.count(old) != 1:
+                  raise RuntimeError(
+                      f"Expected exactly one validator WRITE/READ sequence, "
+                      f"found {source.count(old)} in {path}"
+                  )
+              source = source.replace(old, new)
 
-          if source.count(old) != 1:
-              raise RuntimeError(
-                  f"Expected exactly one Mooncake RDMA atomic setting, "
-                  f"found {source.count(old)} in {path}"
-              )
-
-          path.write_text(source.replace(old, new))
-          print(f"Patched Mooncake RDMA atomic limits in {path}")
+          path.write_text(source)
+          print(f"Patched {path} to exercise production WRITE-only transfers")
           PY
 
           build_dir="/tmp/mooncake-rdma-smoke-build"
@@ -874,10 +893,10 @@ jobs:
             set -e
 
             if [[ "${transfer_rc}" -ne 0 ]] ||
-               ! grep -q "Data validation passed" "${initiator_log}"; then
+               ! grep -q "RDMA WRITE transfers completed" "${initiator_log}"; then
               cat "${initiator_log}" >&2
               cat "${target_log}" >&2
-              echo "ERROR: GPUDirect RDMA data validation failed from prefill GPU ${prefill_gpu_id} (${prefill_rdma_device}) to decode GPU ${decode_gpu_id} (${decode_device_csv})" >&2
+              echo "ERROR: GPUDirect RDMA WRITE failed from prefill GPU ${prefill_gpu_id} (${prefill_rdma_device}) to decode GPU ${decode_gpu_id} (${decode_device_csv})" >&2
               exit 1
             fi
             expected_peer_device="$(expected_decode_peer_device "${prefill_gpu_id}" "${decode_gpu_id}")"
@@ -1065,7 +1084,7 @@ jobs:
                 transfer_rc="${PIPESTATUS[0]}"
                 set -e
                 if [[ "${transfer_rc}" -eq 0 ]] &&
-                   grep -q "Data validation passed" "${initiator_log}"; then
+                   grep -q "RDMA WRITE transfers completed" "${initiator_log}"; then
                   result=0
                 else
                   result=1
@@ -1086,7 +1105,7 @@ jobs:
                 mv "${result_file}.tmp" "${result_file}"
                 if [[ "${result}" -ne 0 ]]; then
                   cat "${target_log}" >&2 || true
-                  echo "ERROR: cross-node GPUDirect RDMA data validation failed from prefill GPU ${prefill_gpu_id} to decode GPU ${decode_gpu_id}" >&2
+                  echo "ERROR: cross-node GPUDirect RDMA WRITE failed from prefill GPU ${prefill_gpu_id} to decode GPU ${decode_gpu_id}" >&2
                   exit 1
                 fi
                 echo "Cross-node GPUDirect RDMA passed from prefill GPU ${prefill_gpu_id}"
