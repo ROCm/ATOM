@@ -5920,61 +5920,64 @@ def test_worker_close_is_a_noop_when_no_tier_was_built():
         ("load", "shutdown", True),
     ]
 
-    def test_the_park_does_not_leak_an_entry_per_joint_load(self):
-        worker = _k3_worker()
-        for i in range(4):
-            req = _k3_load_req(f"r{i}")
-            worker._arm_joint_loads(
-                SimpleNamespace(state_loads=[(req.req_id, 99, 0)], requests=[req])
-            )
-            worker._settle_joint({req.load_operation}, set(), {req.req_id}, set())
-        park = worker._joint_park
-        assert park._need == {}
-        assert park._alias == {}
-        assert park._alias_of == {}
 
-    def test_with_no_tier_the_joint_load_fails_for_recompute(self):
-        """No tier means the state leg cannot be served, so the pair must reach
-        the engine as `failed_loading` (recompute), never as a phantom success.
+def test_the_park_does_not_leak_an_entry_per_joint_load():
+    worker = _k3_worker()
+    for i in range(4):
+        req = _k3_load_req(f"r{i}")
+        worker._arm_joint_loads(
+            SimpleNamespace(state_loads=[(req.req_id, 99, 0)], requests=[req])
+        )
+        worker._settle_joint({req.load_operation}, set(), {req.req_id}, set())
+    park = worker._joint_park
+    assert park._need == {}
+    assert park._alias == {}
+    assert park._alias_of == {}
 
-        Arming a joint load with no tier and then failing its state leg
-        (`_fail_state_loads`) leaves the park owing only the KV leg; when the KV
-        completion lands, `_settle_joint` releases the pair into `failed_loading`
-        -- and the park does not leak the entry, because that same KV completion
-        is what releases it. Skipping the arm instead let the KV leg pass through
-        as `finished_loading`, which `Scheduler._settle_state_load(ok=True)`
-        miscounts as a state restore that never happened."""
-        worker = _k3_worker(tier=False)
-        req = _k3_load_req("r1")
-        meta = SimpleNamespace(state_loads=[("r1", 99, 0)], requests=[req])
-        worker._arm_joint_loads(meta)
-        assert worker._joint_park.waits_for(req.load_operation)
 
-        # `_start_state_loads` on the no-tier path fails the state leg.
-        worker._start_state_loads(meta)
-        # The KV leg has not landed yet: the pair is still held, not passed.
-        done, failed = worker._settle_joint(set(), set(), set(), set())
-        assert done == set()
-        assert failed == set()
-        assert worker._joint_park.waits_for(req.load_operation)
+def test_with_no_tier_the_joint_load_fails_for_recompute():
+    """No tier means the state leg cannot be served, so the pair must reach
+    the engine as `failed_loading` (recompute), never as a phantom success.
 
-        # KV completion lands -> the pair resolves to failed, and nothing leaks.
-        done, failed = worker._settle_joint({req.load_operation}, set(), set(), set())
-        assert done == set(), "no phantom finished_loading with no tier"
-        assert failed == {req.load_operation}
-        assert not worker._joint_park.waits_for(req.load_operation)
-        assert worker._joint_park._need == {}
-        assert worker._joint_park._alias == {}
-        assert worker._joint_park._alias_of == {}
+    Arming a joint load with no tier and then failing its state leg
+    (`_fail_state_loads`) leaves the park owing only the KV leg; when the KV
+    completion lands, `_settle_joint` releases the pair into `failed_loading`
+    -- and the park does not leak the entry, because that same KV completion
+    is what releases it. Skipping the arm instead let the KV leg pass through
+    as `finished_loading`, which `Scheduler._settle_state_load(ok=True)`
+    miscounts as a state restore that never happened."""
+    worker = _k3_worker(tier=False)
+    req = _k3_load_req("r1")
+    meta = SimpleNamespace(state_loads=[("r1", 99, 0)], requests=[req])
+    worker._arm_joint_loads(meta)
+    assert worker._joint_park.waits_for(req.load_operation)
 
-    def test_a_single_leg_request_still_passes_straight_through(self):
-        """Nothing armed it, so neither channel may be held back."""
-        worker = _k3_worker()
-        kv_only = LoadOperationId("r9", 0)
-        done, _failed = worker._settle_joint({kv_only}, set(), set(), set())
-        assert done == {kv_only}
-        done, _failed = worker._settle_joint(set(), set(), {"r8"}, set())
-        assert done == {"r8"}
+    # `_start_state_loads` on the no-tier path fails the state leg.
+    worker._start_state_loads(meta)
+    # The KV leg has not landed yet: the pair is still held, not passed.
+    done, failed = worker._settle_joint(set(), set(), set(), set())
+    assert done == set()
+    assert failed == set()
+    assert worker._joint_park.waits_for(req.load_operation)
+
+    # KV completion lands -> the pair resolves to failed, and nothing leaks.
+    done, failed = worker._settle_joint({req.load_operation}, set(), set(), set())
+    assert done == set(), "no phantom finished_loading with no tier"
+    assert failed == {req.load_operation}
+    assert not worker._joint_park.waits_for(req.load_operation)
+    assert worker._joint_park._need == {}
+    assert worker._joint_park._alias == {}
+    assert worker._joint_park._alias_of == {}
+
+
+def test_a_single_leg_request_still_passes_straight_through():
+    """Nothing armed it, so neither channel may be held back."""
+    worker = _k3_worker()
+    kv_only = LoadOperationId("r9", 0)
+    done, _failed = worker._settle_joint({kv_only}, set(), set(), set())
+    assert done == {kv_only}
+    done, _failed = worker._settle_joint(set(), set(), {"r8"}, set())
+    assert done == {"r8"}
 
 
 # ── kimi_k3: a re-stored prefix must survive the aggregator's tombstone ────
