@@ -861,11 +861,25 @@ jobs:
           }
 
           echo "Decode HCA diagnostic mode: ${SMOKE_DECODE_HCA_MODE}"
-          for ((prefill_gpu_id = 0; prefill_gpu_id < 4; prefill_gpu_id++)); do
-            decode_gpu_id=$((prefill_gpu_id + 4))
-            if [[ "${SMOKE_DECODE_HCA_MODE}" == "same-gpu" ]]; then
-              decode_gpu_id="${prefill_gpu_id}"
-            fi
+          local_prefill_gpu_ids=()
+          local_decode_gpu_ids=()
+          if [[ "${SMOKE_DECODE_HCA_MODE}" == "same-gpu" ]]; then
+            for ((gpu_id = 0; gpu_id < gpu_count; gpu_id++)); do
+              local_prefill_gpu_ids+=("${gpu_id}")
+              local_decode_gpu_ids+=("${gpu_id}")
+            done
+          else
+            for ((prefill_gpu_id = 0; prefill_gpu_id < gpu_count - 1; prefill_gpu_id++)); do
+              for ((decode_gpu_id = prefill_gpu_id + 1; decode_gpu_id < gpu_count; decode_gpu_id++)); do
+                local_prefill_gpu_ids+=("${prefill_gpu_id}")
+                local_decode_gpu_ids+=("${decode_gpu_id}")
+              done
+            done
+          fi
+
+          for ((pair_index = 0; pair_index < ${#local_prefill_gpu_ids[@]}; pair_index++)); do
+            prefill_gpu_id="${local_prefill_gpu_ids[pair_index]}"
+            decode_gpu_id="${local_decode_gpu_ids[pair_index]}"
             prefill_rdma_device="${rdma_devices[prefill_gpu_id]}"
             decode_rdma_device="${rdma_devices[decode_gpu_id]}"
             decode_device_csv="$(select_decode_ib_devices "${prefill_gpu_id}" "${decode_gpu_id}")"
@@ -939,7 +953,7 @@ jobs:
             stop_target_process
             echo "GPUDirect RDMA passed from prefill GPU ${prefill_gpu_id} to decode GPU ${decode_gpu_id} via decode HCAs ${decode_device_csv}"
           done
-          echo "Node-local GPUDirect RDMA passed for all four prefill/decode GPU pairs"
+          echo "Node-local GPUDirect RDMA passed for all ${#local_prefill_gpu_ids[@]} prefill/decode GPU pairs"
 
           if [[ "${SMOKE_NODE_COUNT}" -lt 2 ]]; then
             echo "Single-node GPUDirect RDMA smoke test passed"
@@ -1017,8 +1031,18 @@ jobs:
           fi
 
           if [[ "${SMOKE_RANK}" -eq 0 || "${SMOKE_RANK}" -eq 1 ]]; then
-            cross_prefill_gpu_ids=(0 1 2 3 4 5 6 7 0 1 2 3)
-            cross_decode_gpu_ids=(0 1 2 3 4 5 6 7 4 5 6 7)
+            cross_prefill_gpu_ids=()
+            cross_decode_gpu_ids=()
+            for ((gpu_id = 0; gpu_id < gpu_count; gpu_id++)); do
+              cross_prefill_gpu_ids+=("${gpu_id}")
+              cross_decode_gpu_ids+=("${gpu_id}")
+            done
+            for ((prefill_gpu_id = 0; prefill_gpu_id < gpu_count - 1; prefill_gpu_id++)); do
+              for ((decode_gpu_id = prefill_gpu_id + 1; decode_gpu_id < gpu_count; decode_gpu_id++)); do
+                cross_prefill_gpu_ids+=("${prefill_gpu_id}")
+                cross_decode_gpu_ids+=("${decode_gpu_id}")
+              done
+            done
             for ((pair_index = 0; pair_index < ${#cross_prefill_gpu_ids[@]}; pair_index++)); do
               prefill_gpu_id="${cross_prefill_gpu_ids[pair_index]}"
               decode_gpu_id="${cross_decode_gpu_ids[pair_index]}"
@@ -1138,13 +1162,13 @@ jobs:
                   echo "ERROR: cross-node GPUDirect RDMA WRITE failed from prefill GPU ${prefill_gpu_id} to decode GPU ${decode_gpu_id}" >&2
                   exit 1
                 fi
-                echo "Cross-node GPUDirect RDMA passed from prefill GPU ${prefill_gpu_id}"
+                echo "Cross-node GPUDirect RDMA passed from prefill GPU ${prefill_gpu_id} to decode GPU ${decode_gpu_id}"
               fi
             done
           fi
 
           if [[ "${SMOKE_RANK}" -eq 0 ]]; then
-            echo "Mooncake cross-node GPUDirect RDMA passed for same-index GPU pairs 0-7 and prefill GPUs 0-3 to decode GPUs 4-7"
+            echo "Mooncake cross-node GPUDirect RDMA passed for same-index GPU pairs 0-7 and all cross-rail pairs i < j"
           fi
           CONTAINER_SCRIPT
           docker_rc=$?
@@ -1284,33 +1308,60 @@ jobs:
           {
             echo "## Mooncake RDMA smoke test"
             echo
-            echo "- Result: ${outcome_icon} \`${RDMA_SMOKE_OUTCOME}\`"
+            echo "- Workflow result: ${outcome_icon} \`${RDMA_SMOKE_OUTCOME}\`"
             echo "- Image: \`${RDMA_SMOKE_IMAGE}\`"
             echo "- Requested nodes: \`${RDMA_SMOKE_NODE_COUNT}\`"
             echo "- Decode HCA mode: \`${RDMA_SMOKE_DECODE_HCA_MODE}\`"
             echo "- Slurm job: \`${job_id:-not submitted}\`"
             echo
 
-            echo "### Node-local RDMA WRITE"
-            if [[ "${#log_files[@]}" -gt 0 ]] &&
-               grep -h "^GPUDirect RDMA passed from prefill GPU" "${log_files[@]}" 2>/dev/null |
-                 sort -u |
-                 awk '{ print "- ✅ " $0; found = 1 } END { exit(found ? 0 : 1) }'; then
-              :
-            else
-              echo "- No completed node-local RDMA WRITE pairs."
-            fi
-            echo
+            echo "### RDMA WRITE results"
+            python3 - "${log_files[@]}" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
 
-            echo "### Cross-node RDMA WRITE"
-            if [[ "${#log_files[@]}" -gt 0 ]] &&
-               grep -h "^Cross-node GPUDirect RDMA passed from prefill GPU" "${log_files[@]}" 2>/dev/null |
-                 sort -u |
-                 awk '{ print "- ✅ " $0; found = 1 } END { exit(found ? 0 : 1) }'; then
-              :
-            else
-              echo "- No completed cross-node RDMA WRITE pairs."
-            fi
+          log_text = ""
+          for raw_path in sys.argv[1:]:
+              path = Path(raw_path)
+              try:
+                  log_text += path.read_text(encoding="utf-8", errors="replace")
+              except OSError:
+                  pass
+
+          node_local_pairs = {
+              (int(src), int(dst))
+              for src, dst in re.findall(
+                  r"^GPUDirect RDMA passed from prefill GPU (\d+) "
+                  r"to decode GPU (\d+)",
+                  log_text,
+                  re.MULTILINE,
+              )
+          }
+          cross_node_pairs = {
+              (int(src), int(dst))
+              for src, dst in re.findall(
+                  r"^Cross-node GPUDirect RDMA passed from prefill GPU (\d+) "
+                  r"to decode GPU (\d+)",
+                  log_text,
+                  re.MULTILINE,
+              )
+          }
+
+          cross_rail_pairs = {(src, dst) for src in range(7) for dst in range(src + 1, 8)}
+          same_index_pairs = {(gpu, gpu) for gpu in range(8)}
+          pair_label = "GPU" + "、".join(
+              f"{src}→{dst}" for src, dst in sorted(cross_rail_pairs)
+          )
+
+          node_local_icon = "✅" if cross_rail_pairs <= node_local_pairs else "❌"
+          same_index_icon = "✅" if same_index_pairs <= cross_node_pairs else "❌"
+          cross_rail_icon = "✅" if cross_rail_pairs <= cross_node_pairs else "❌"
+
+          print(f"Node-local {pair_label} {node_local_icon}")
+          print(f"Cross-node same-index GPU0–7 {same_index_icon}")
+          print(f"Cross-node cross-rail {pair_label} {cross_rail_icon}")
+          PY
             echo
 
             echo "### Errors"
