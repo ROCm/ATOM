@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-from collections.abc import Sequence
-
 import numpy as np
 import torch
 from aiter import dtypes
@@ -26,6 +24,7 @@ from .aiter_mla import (
 )
 from .backends import AttentionBackend
 from .gdn_attn import GDNStateMixin
+from .page_unit_geometry import PageUnitGeometryMixin
 from .sub_pool_spec import SubPoolSpec, page_pool, state_pool
 from .triton_mla import TritonMLAMetadataBuilder
 
@@ -46,7 +45,7 @@ class KimiMLAGDNBackend(AttentionBackend):
         return MLAAttention
 
 
-class _KimiMLAGDNCommon(GDNStateMixin):
+class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
     def __init__(self, model_runner):
         super().__init__(model_runner=model_runner)
         self.mla_idx_by_layer = {
@@ -385,113 +384,6 @@ class _KimiMLAGDNCommon(GDNStateMixin):
             return None
         return getattr(runner, "index_cache", None)
 
-    def _page_unit_regions(self) -> tuple[np.ndarray, np.ndarray]:
-        """Base address and per-unit stride of every region a PAGE id owns.
-
-        The destination side of a checkpoint copy. `GDNStateMixin` knows where
-        a state slot's bytes are; this knows where a KV block's are, because
-        this class owns the paged pool.
-
-        `kv_cache` is `(rows, physical_blocks, physical_block_size, entry)`,
-        so a block owns one contiguous region per row and the rows are a fixed
-        stride apart. Affine in the block id, and a property of the pool rather
-        than of any block, so it is worked out once.
-
-        A block owns more than the MLA pool once the model has a sparse
-        indexer. GLM-5.3-Flash's index cache rides this same paged pool and
-        `sub_pool_specs` prices a unit with those bytes in it, so they are
-        named here too -- as DSV4 names its indexer pools, and for the same
-        reason: `units_per_checkpoint` is `ceil(image / page_unit_bytes)`, so
-        regions that cover less than a unit was priced for leave the tail of
-        every image with nowhere to land. That cache is `(layers,
-        scheduler_blocks, rows_per_block, aligned_dim)`, indexed by the
-        logical block a unit id already names, so a unit owns one contiguous
-        region per indexer layer and the layers are a fixed stride apart --
-        the same shape of answer the MLA rows give.
-
-        The units are the trap. `unit_ids` carries **logical** block ids -- what
-        `BlockPool` hands out and what `sub_pool_specs` priced -- while the MLA
-        tensor is shaped in **physical** blocks, and K3's `block_ratio` is 128.
-        So a region there is `runner.block_size` tokens wide, not
-        `physical_block_size`, and the two differ by exactly that ratio. The
-        index cache needs no such conversion; its block axis is logical
-        already. The assertion below is what makes a mix-up a startup error
-        rather than 127 blocks of scrambled state: it is the one relation that
-        cannot hold if the granularity is wrong.
-        """
-        runner = self.model_runner
-        cache = runner.kv_cache
-        index_cache = self._page_unit_index_cache()
-        owner = (
-            cache.data_ptr(),
-            None if index_cache is None else index_cache.data_ptr(),
-        )
-        cached = getattr(self, "_page_unit_region_cache", None)
-        if cached is not None and cached[0] == owner:
-            return cached[1]
-
-        if not cache.is_contiguous():
-            raise RuntimeError("the MLA pool must be contiguous to be copied")
-        item = cache.element_size()
-        entry = cache.shape[3]
-        rows = cache.shape[0]
-        # One logical block's bytes inside one row.
-        region = runner.block_size * entry * item
-        row_stride = cache.stride(0) * item
-        bases = [cache.data_ptr() + row * row_stride for row in range(rows)]
-        sizes = [region] * rows
-
-        index_layers, index_region = 0, 0
-        if index_cache is not None:
-            if not index_cache.is_contiguous():
-                raise RuntimeError("the index cache must be contiguous to be copied")
-            index_item = index_cache.element_size()
-            index_layers = index_cache.shape[0]
-            layer_stride = index_cache.stride(0) * index_item
-            index_region = index_cache.stride(1) * index_item
-            bases += [
-                index_cache.data_ptr() + layer * layer_stride
-                for layer in range(index_layers)
-            ]
-            sizes += [index_region] * index_layers
-
-        runtime = getattr(runner, "state_runtime", None)
-        spec = None if runtime is None else runtime.checkpoint_spec
-        owned = sum(sizes)
-        page_unit_bytes = spec.page_unit_bytes if spec is not None else owned
-        if owned != page_unit_bytes:
-            gives = f"{rows} rows x {region} B"
-            if index_cache is not None:
-                gives += f" + {index_layers} index layers x {index_region} B"
-            raise RuntimeError(
-                f"a PAGE unit is {page_unit_bytes} B but this pool gives a "
-                f"logical block {gives} = {owned} B; the two disagree about "
-                "block granularity"
-            )
-        regions = (
-            np.array(bases, dtype=np.int64),
-            np.array(sizes, dtype=np.int64),
-        )
-        self._page_unit_region_cache = (owner, regions)
-        return regions
-
-    def _page_unit_bases(self, unit_ids: Sequence[Sequence[int]]) -> np.ndarray:
-        """Start address of every destination segment, one row per image.
-
-        `unit_ids` is `(images, units_per_checkpoint)`. A unit's regions are
-        each at `base + id * stride`, so one image's worth is an outer product
-        and a batch's is the same product with an image axis in front. Unit
-        major, region minor -- the order `_checkpoint_copy_plan` built the
-        destination stream in.
-        """
-        base, stride = self._page_unit_regions()
-        ids = np.asarray(unit_ids, dtype=np.int64)
-        return (base + ids[..., None] * stride).reshape(len(ids), -1)
-
-    def _page_unit_stream_sizes(self, units: int) -> np.ndarray:
-        """Bytes in each destination segment of an image of `units` units."""
-        return np.tile(self._page_unit_regions()[1], units)
-
     def build_kv_cache_tensor(self, layer_id: int, module):
         from atom.config import KVCacheTensor
 
@@ -507,6 +399,10 @@ class _KimiMLAGDNCommon(GDNStateMixin):
                 replay_buf_k=(runner.replayssm_buf_k[row] if self.replayssm else None),
                 replay_buf_u=(runner.replayssm_buf_u[row] if self.replayssm else None),
                 replay_buf_g=(runner.replayssm_buf_g[row] if self.replayssm else None),
+                # KDA recurrent state: slot-addressed, not paged. Registered
+                # because the forward reads it from `kv_cache_data`, but
+                # excluded from every block-addressed transfer.
+                per_request_state=True,
             )
 
         if hasattr(module, "base_attention") and getattr(module, "use_mla", False):

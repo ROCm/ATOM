@@ -15,7 +15,7 @@ from .glm4_moe import (
     Glm4MoeDecoderLayer,
     get_spec_layer_idx_from_weight_name,
 )
-from .utils import maybe_prefix
+from .utils import mask_pos0_inputs_embeds, maybe_prefix
 
 
 class SharedHead(nn.Module):
@@ -124,6 +124,8 @@ class Glm4MoeMultiTokenPredictor(nn.Module):
             config.vocab_size,
             config.hidden_size,
         )
+        # Set by the vLLM plugin only; see mask_pos0_inputs_embeds.
+        self.mask_pos0_inputs_embeds = False
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -138,6 +140,8 @@ class Glm4MoeMultiTokenPredictor(nn.Module):
     ) -> torch.Tensor:
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
+        if self.mask_pos0_inputs_embeds:
+            inputs_embeds = mask_pos0_inputs_embeds(inputs_embeds, positions)
         current_step_idx = spec_step_idx % self.num_mtp_layers
         return self.layers[str(self.mtp_start_layer_idx + current_step_idx)](
             input_ids,

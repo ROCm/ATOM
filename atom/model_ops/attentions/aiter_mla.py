@@ -350,7 +350,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             and self.dcp_world_size > 1
             and dcp_persistent
             and self.block_size == 1
-            and config.speculative_config is None
         )
         if self.dcp_world_size > 1 and dcp_persistent:
             self.persistent_num_heads = mla_dcp_kernel_num_heads(
@@ -423,10 +422,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             "kv_last_page_lens": CpuGpuBuffer(self.max_bs, **i32_kwargs),
         }
         if self._publishes_dcp_local_lens:
-            # Layer-invariant qlen=1 sparse-DSA indexer metadata. It is derived
-            # from context_lens once per step and reused by every full layer.
+            # Layer-invariant sparse-DSA indexer metadata: one row per query
+            # token, derived once per step and reused by every full layer.
             mla_metadata["dcp_local_context_lens"] = CpuGpuBuffer(
-                self.max_bs, **i32_kwargs
+                self.max_bs * max_seqlen_qo, **i32_kwargs
             )
         mla_metadata["kv_last_page_lens"].cpu.fill_(1)
         mla_metadata["kv_last_page_lens"].copy_to_gpu()
@@ -469,6 +468,18 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 self.max_num_batched_tokens,
                 dtype=torch.int32,
                 device=self.device,
+            )
+            # One block-table row per query token; only MTP verify needs a
+            # copy. Built once per step, not in the indexer, where every
+            # full-index layer would allocate one into the CUDAGraph pool.
+            self._dcp_token_block_tables_gpu = (
+                torch.empty(
+                    self.max_bs * max_seqlen_qo,
+                    self.block_table_cols,
+                    **i32_kwargs,
+                )
+                if self.dcp_world_size > 1 and max_seqlen_qo > 1
+                else None
             )
             sparse_prefill_num_heads = (
                 self.persistent_num_heads
@@ -514,6 +525,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # Allocate a second set of persistent work buffers for sparse MTP
             # per-token layout: max_bs*max_seqlen_qo virtual seqs, each q_len=1.
             smt_max_bs = self.max_bs * max_seqlen_qo
+            # Same widening as sparse prefill: the DCP rebuild regenerates these
+            # for the gathered query width, not for a single rank's heads.
+            sparse_mtp_num_heads = (
+                self.persistent_num_heads
+                if self.sparse_dcp_metadata_rebuild
+                else self.padded_num_attention_heads
+            )
             (
                 (smt_wmd_size, smt_wmd_type),
                 (smt_wi_size, smt_wi_type),
@@ -524,7 +542,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             ) = get_mla_metadata_info_v1(
                 smt_max_bs,
                 1,  # max_seqlen_qo=1 for per-token
-                self.padded_num_attention_heads,
+                sparse_mtp_num_heads,
                 self.dtype_q,
                 self.dtype_kv,
                 is_sparse=True,
@@ -967,14 +985,20 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # i0_max_seqlen_q for its incremental-update fast path — DCP always
         # needs a full local-shard rebuild, no incremental variant exists).
         dcp_local_rebuild = self.dcp_world_size > 1 and not self.is_sparse
-        if dcp_local_rebuild:
-            assert self.block_size == 1
+        if dcp_local_rebuild or self._publishes_dcp_local_lens:
             W = self.dcp_world_size
             r = self.dcp_rank
             ctx_g = var["context_lens"].gpu[:running_bs].to(torch.int64)
             base = ctx_g // W
             remainder = (ctx_g - base * W - r).clamp_(0, 1)
             local_ctx = (base + remainder).to(torch.int32)  # local KV tokens/blocks
+        if self._publishes_dcp_local_lens:
+            # A draft step runs one query per sequence, so this is already the
+            # per-token map. The verify step's copy is stale after
+            # context_lens += 1, and a short length drops the newest tokens.
+            var["dcp_local_context_lens"].gpu[:running_bs] = local_ctx
+        if dcp_local_rebuild:
+            assert self.block_size == 1
             kv_indptr[0] = 0
             kv_indptr[1 : running_bs + 1] = torch.cumsum(
                 local_ctx, dim=0, dtype=torch.int32
@@ -1924,6 +1948,24 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             + dcp_local_index(pos, W, S) % block_size
         )
 
+    def _publish_dcp_token_block_tables(
+        self, attn_metadata, running_bs: int, max_seqlen_q: int
+    ) -> None:
+        """Give the DCP sparse indexer one block-table row per query token.
+
+        Both aiter ops it drives address the table by row. A step with one query
+        per sequence already has that table, so only MTP verify copies.
+        """
+        if not (self.is_sparse and self.dcp_world_size > 1):
+            return
+        block_tables = attn_metadata.block_tables
+        if max_seqlen_q == 1:
+            attn_metadata.dcp_token_block_tables = block_tables
+            return
+        rows = self._dcp_token_block_tables_gpu[: running_bs * max_seqlen_q]
+        rows.view(running_bs, max_seqlen_q, -1).copy_(block_tables.unsqueeze(1))
+        attn_metadata.dcp_token_block_tables = rows
+
     def prepare_decode(
         self,
         batch: ScheduledBatch,
@@ -1991,7 +2033,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         var["context_lens"].np[scheduled_bs:running_bs] = 0
 
         if self.dcp_world_size > 1:
-            from atom.model_ops.dcp_ops import get_dcp_local_seq_lens
+            from atom.model_ops.dcp_ops import (
+                get_dcp_local_seq_lens,
+                get_dcp_local_window_lens,
+            )
 
             local_context_lens = get_dcp_local_seq_lens(
                 context_lens,
@@ -2001,9 +2046,21 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             )
             if self._publishes_dcp_local_lens:
                 # Publish once per step instead of launching 7 elementwise
-                # kernels in every full sparse-indexer layer.
-                var["dcp_local_context_lens"].np[:scheduled_bs] = local_context_lens
-                var["dcp_local_context_lens"].np[scheduled_bs:running_bs] = 0
+                # kernels in every full sparse-indexer layer. One row per query
+                # token: a draft position's extra token lands on a single rank,
+                # so a per-request length is only right for the last position.
+                var["dcp_local_context_lens"].np[:sum_scheduled_tokens] = (
+                    get_dcp_local_window_lens(
+                        context_lens,
+                        max_seqlen_q,
+                        self.dcp_world_size,
+                        self.dcp_rank,
+                        self.cp_kv_cache_interleave_size,
+                    )
+                )
+                var["dcp_local_context_lens"].np[
+                    sum_scheduled_tokens:running_tokens
+                ] = 0
             num_blocks_per_seq = cdiv(local_context_lens, self.block_size)
         elif any(batch.is_first_decode_without_local_prefill):
             num_blocks_per_seq = [
@@ -2058,7 +2115,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             ("block_tables", running_bs),
         ]
         if self._publishes_dcp_local_lens:
-            vars_used.append(("dcp_local_context_lens", running_bs))
+            vars_used.append(("dcp_local_context_lens", running_tokens))
         metadata_deps = {
             "cu_seqlens_q",
             "kv_last_page_lens",
@@ -2219,6 +2276,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             attn_metadata.sparse_kv_last_page_lens = var[
                 "sparse_kv_last_page_lens"
             ].gpu[:running_bs]
+        self._publish_dcp_token_block_tables(attn_metadata, running_bs, max_seqlen_q)
 
         # running_bs, not scheduled_bs: the padded rows have to be split into the
         # ubatches too, or accuracy drifts.
@@ -2462,9 +2520,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         dcp_local_context_lens = None
         if self._publishes_dcp_local_lens:
             # The warmup forward reads this buffer before replay overwrites it.
-            # One local token matches the synthetic capture KV metadata above.
-            var["dcp_local_context_lens"].np[:bs] = 1
-            dcp_local_context_lens = var["dcp_local_context_lens"].copy_to_gpu(bs)
+            # One local token matches the synthetic capture KV metadata above;
+            # one row per query token, as prepare_decode publishes it.
+            var["dcp_local_context_lens"].np[:sum_tokens] = 1
+            dcp_local_context_lens = var["dcp_local_context_lens"].copy_to_gpu(
+                sum_tokens
+            )
         if is_sparse_mtp:
             # Two sets: normal for dense layers, sparse_mtp for sparse layers
             ctx_mla_ps = self.set_mla_persistent_worker_buffers(bs, max_q_len)
@@ -2519,6 +2580,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             attn_matadata.sparse_kv_last_page_lens = var[
                 "sparse_kv_last_page_lens"
             ].gpu[:bs]
+        self._publish_dcp_token_block_tables(attn_matadata, bs, max_q_len)
         positions = var["positions"].copy_to_gpu(sum_tokens)
         context = Context(
             positions=positions,
@@ -2591,6 +2653,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             if self.dcp_world_size > 1
             else None
         )
+        if self.is_sparse and self.dcp_world_size > 1:
+            # Config refuses decode TBO together with speculative decode under
+            # DCP, so a ubatch always runs one query per sequence.
+            assert max_q_len == 1
+            attn.dcp_token_block_tables = attn.block_tables
         return attn
 
     def build_ubatch_prefill_metadata(

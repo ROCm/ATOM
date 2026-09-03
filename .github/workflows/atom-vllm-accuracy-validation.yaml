@@ -1570,6 +1570,9 @@ jobs:
       - oot-model-accuracy-priority-2
       - oot-model-accuracy-priority-3
     if: ${{ always() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.upload_accuracy_to_dashboard)) }}
+    concurrency:
+      group: gh-pages-deploy
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -1616,6 +1619,13 @@ jobs:
           echo "=== Generated entries ==="
           cat accuracy-benchmark-input.json
 
+      - name: Prepare existing dashboard data
+        if: steps.downloaded.outputs.json_count != '0'
+        id: prepare_dashboard_data
+        uses: ./.github/actions/prepare-dashboard-data
+        with:
+          data-path: benchmark-dashboard/data.js
+
       - name: Store OOT accuracy result to dashboard
         if: steps.downloaded.outputs.json_count != '0'
         uses: benchmark-action/github-action-benchmark@v1
@@ -1624,6 +1634,17 @@ jobs:
           output-file-path: accuracy-benchmark-input.json
           gh-pages-branch: gh-pages
           benchmark-data-dir-path: benchmark-dashboard
-          auto-push: true
+          auto-push: false
           max-items-in-chart: 300
           github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Validate dashboard data after write
+        if: steps.downloaded.outputs.json_count != '0'
+        uses: ./.github/actions/validate-dashboard-data
+        with:
+          data-path: benchmark-dashboard/data.js
+          min-entries: ${{ steps.prepare_dashboard_data.outputs.entry_count }}
+
+      - name: Push dashboard data
+        if: steps.downloaded.outputs.json_count != '0'
+        run: git push origin gh-pages
