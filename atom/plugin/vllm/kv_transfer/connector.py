@@ -129,7 +129,31 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
         """
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
-        return self._worker.get_finished(finished_req_ids)
+        """Translate ATOM's four completion sets into vLLM's two.
+
+        ``finished_saving`` HAS to surface as vLLM's ``finished_sending``:
+        ``request_finished`` defers freeing while a save is in flight, and vLLM
+        only releases those blocks once the id appears here. ATOM's own worker
+        deliberately reports an empty ``finished_sending`` because ITS scheduler
+        reads that as a P/D producer handoff -- a different contract from
+        vLLM's, so the mapping is done here rather than by changing ATOM.
+
+        A failed load is reported as finished too: the request is parked
+        waiting on it, and the alternative to waking it is a hang. vLLM then
+        recomputes the tokens it had counted as externally supplied.
+        """
+        out = self._worker.get_finished()
+
+        finished_recving = {_req_id_of(c) for c in out.finished_loading}
+        failed = {_req_id_of(c) for c in out.failed_loading}
+        if failed:
+            logger.warning(
+                "ATOM LMCache offload: load failed for %s; recomputing", sorted(failed)
+            )
+            finished_recving |= failed
+
+        finished_sending = {_req_id_of(c) for c in out.finished_saving}
+        return finished_sending, finished_recving
 
     def shutdown(self) -> None:
         for side in (self._worker, self._scheduler):
@@ -179,6 +203,11 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
                 return True, None
             self._seqs.drop(request.request_id)
         return False, None
+
+
+def _req_id_of(completion_id) -> str:
+    """Completion ids are a bare request id, or one tagged with a generation."""
+    return str(getattr(completion_id, "req_id", completion_id))
 
 
 def _block_ids(blocks) -> list[int]:
