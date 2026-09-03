@@ -71,6 +71,15 @@ _GDN_LINEAR_MODEL_TYPES = frozenset(
     {"qwen3_next", "qwen3_next_mtp", "qwen3_5_text", "qwen3_5_moe_text"}
 )
 
+# Layouts that own a tier for a model's per-request *recurrent* state. Today only
+# `kimi_k3` (the kimi_linear KDA state); `hybrid` (DSV4 sparse-attention
+# checkpoints) is not recurrent-state and dense<->hybrid is a legitimate operator
+# override for namespace separation. An explicit `offload_layout` override may not
+# downgrade a recurrent-state model to a layout that owns no tier for it (silent
+# wrong output) -- see `select_offload_layout`. GDN/linear model types are refused
+# outright in `_layout_from_model`, so no override can resurrect them.
+_STATE_OWNING_LAYOUTS = frozenset({"kimi_k3"})
+
 logger = logging.getLogger("atom")
 
 
@@ -96,17 +105,44 @@ def select_offload_layout(config) -> str:
 
     kvc = getattr(config, "kv_transfer_config", {}) or {}
     override = kvc.get("offload_layout")
-    if override is not None:
-        mapped = (
-            _OFFLOAD_LAYOUT_ALIASES.get(override) if isinstance(override, str) else None
-        )
-        if mapped is not None:
-            return mapped
+    # Inspect the model *first*, always -- even with an override present. An
+    # override returning before this ran let `offload_layout: dense` on a
+    # kimi_linear/Qwen3.5 checkpoint skip the GDN refusal below and restore a KV
+    # prefix over stale recurrent state (silent wrong output). The natural layout
+    # is also what an override is validated against.
+    natural = _layout_from_model(config)
+    if override is None:
+        return natural
+    mapped = (
+        _OFFLOAD_LAYOUT_ALIASES.get(override) if isinstance(override, str) else None
+    )
+    if mapped is None:
         raise ValueError(
             f"lmcache_offload: unknown offload_layout={override!r}; "
             f"expected one of {sorted(_OFFLOAD_LAYOUT_ALIASES)}"
         )
+    # An override may pick between compatible layouts, but it may not strip a
+    # state-owning model down to a layout with no tier for its per-request state
+    # -- the same silent-wrong-output the GDN refusal pre-empts, reached by a
+    # different door (an explicit `dense` rather than a fall-through).
+    if natural in _STATE_OWNING_LAYOUTS and mapped not in _STATE_OWNING_LAYOUTS:
+        raise ValueError(
+            f"lmcache_offload: offload_layout={override!r} would run a "
+            f"{natural!r}-family model (per-request recurrent state) on the "
+            f"{mapped!r} layout, which owns no tier for that state -- its KV "
+            "prefix would be restored over stale state (silent wrong output). "
+            "Drop the override, or disable offload for this model."
+        )
+    return mapped
 
+
+def _layout_from_model(config) -> str:
+    """The dense/hybrid/kimi_k3 layout the model itself implies (no override).
+
+    May raise: a GDN/linear model that no layout owns a state tier for is
+    refused here (the message names the cause) rather than left to die deep in
+    `register_kv_caches` as a byte-layout mismatch.
+    """
     hf_config = getattr(config, "hf_config", None)
     if hf_config is None:
         return "dense"
