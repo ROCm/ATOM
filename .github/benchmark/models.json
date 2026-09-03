@@ -107,7 +107,7 @@
         {
           "label": "MegaMoE",
           "suffix": "-mega",
-          "extra_args": "--eplb-config '{\"num_redundant_experts\": 0, \"placement_policy\": \"naive\", \"rebalance_interval\": 800, \"load_window_size\": 800, \"rebalance_min_balancedness\": 2.0}'",
+          "extra_args": "--eplb-config '{\"num_redundant_experts\": 0, \"placement_policy\": \"naive\", \"rebalance_interval\": 200, \"load_window_size\": 200, \"rebalance_min_balancedness\": 2.0}' --gpu-memory-utilization 0.85",
           "bench_args": "--num-prompts 20480 --num-warmups 256",
           "conc_min": 4096,
           "conc_max": 4096

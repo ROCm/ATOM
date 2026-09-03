@@ -15,6 +15,7 @@ Usage:
 import asyncio
 import base64
 import binascii
+import contextlib
 import io
 import json
 import logging
@@ -105,6 +106,7 @@ from .serving_completion import (
 )
 from .sse import event_frame
 from .streaming_dispatch import (
+    SYNTHETIC_TOKEN_TEXT,
     FrameWait,
     StreamBatchDispatcher,
     StreamOutputCollector,
@@ -156,6 +158,33 @@ _stream_loops: dict[str, AbstractEventLoop] = {}
 _request_start_times: dict[str, float] = {}
 _request_logger: logging.Logger | None = None
 _stream_batch_dispatcher: StreamBatchDispatcher | None = None
+# `SYNTHETIC_TOKEN_TEXT` while a run's own text is meaningless, None otherwise.
+# One switch for both delivery modes: they decode in different places, and a
+# response that read differently depending on `stream` is the asymmetry the
+# reasoning and tool-call readers were unified to remove.
+synthetic_token_text: str | None = None
+
+
+def delivered_text(token_ids, stop_truncate_to: int = -1) -> str:
+    """The text a non-streaming response carries for these tokens.
+
+    Decoded even when the answer is thrown away: the runs that stand their text
+    in are measuring throughput, and skipping the work the measured server does
+    would flatter it. The streaming half of this lives in
+    `StreamingTextState.update`.
+
+    ``stop_truncate_to`` is where a stop string matched. A stop string is
+    defined over the text, so the cut is applied to the text -- the token that
+    carried the match may hold characters on both sides of it, which no
+    token-level trim could separate. A run that stands its text in has no such
+    offset to honour: the cut was measured against text it does not deliver.
+    """
+    decoded = tokenizer.decode(token_ids, skip_special_tokens=True)
+    if synthetic_token_text is not None:
+        return synthetic_token_text * len(token_ids)
+    if stop_truncate_to >= 0:
+        return decoded[:stop_truncate_to]
+    return decoded
 
 
 def reasoning_channel(
@@ -930,18 +959,11 @@ async def generate_async(
         #      forever). Streaming pops via cleanup_stream instead.
         if seq is not None:
             if not _finished_ok:
-                try:
+                with contextlib.suppress(Exception):
                     engine.core_mgr.abort_request(seq.id)
-                except Exception:
-                    pass
             engine.io_processor.requests.pop(seq.id, None)
 
-    text = tokenizer.decode(all_token_ids, skip_special_tokens=True)
-    # A stop string is defined over the text, so the cut is applied to the
-    # text -- the token that carried the match may hold characters on both
-    # sides of it, which no token-level trim could separate.
-    if stop_truncate_to >= 0:
-        text = text[:stop_truncate_to]
+    text = delivered_text(all_token_ids, stop_truncate_to)
     num_tokens_input = (
         seq.num_prompt_tokens if seq is not None else len(tokenizer.encode(prompt))
     )
@@ -1045,18 +1067,11 @@ async def generate_async_multimodal(
         # See generate_async: abort on early exit, always pop to avoid leak.
         if seq is not None:
             if not _finished_ok:
-                try:
+                with contextlib.suppress(Exception):
                     engine.core_mgr.abort_request(seq.id)
-                except Exception:
-                    pass
             engine.io_processor.requests.pop(seq.id, None)
 
-    text = tokenizer.decode(all_token_ids, skip_special_tokens=True)
-    # A stop string is defined over the text, so the cut is applied to the
-    # text -- the token that carried the match may hold characters on both
-    # sides of it, which no token-level trim could separate.
-    if stop_truncate_to >= 0:
-        text = text[:stop_truncate_to]
+    text = delivered_text(all_token_ids, stop_truncate_to)
     num_tokens_output = len(all_token_ids)
     finished_at = time.time()
     ttft = (first_token_at - started_at) if first_token_at is not None else 0.0
@@ -1206,9 +1221,7 @@ async def generate_async_fanout(
             and num_tokens_output > 1
             else 0.0
         )
-        text = tokenizer.decode(per_tokens[i], skip_special_tokens=True)
-        if per_stop_truncate_to[i] >= 0:
-            text = text[: per_stop_truncate_to[i]]
+        text = delivered_text(per_tokens[i], per_stop_truncate_to[i])
         output = {
             "text": text,
             "token_ids": per_tokens[i],
@@ -2500,7 +2513,7 @@ def main():
     """Main entry point for the server."""
     global engine, tokenizer, model_name, default_chat_template_kwargs, _request_logger
     global tool_call_parser_cls, model_starts_in_reasoning, reasoning_toggle
-    global reasoning_dialect
+    global reasoning_dialect, synthetic_token_text
     global custom_message_encoder, _stream_batch_dispatcher
 
     parser = FlexibleArgumentParser(description="ATOM OpenAI API Server")
@@ -2633,7 +2646,31 @@ def main():
     )
 
     engine = engine_args.create_engine(tokenizer=tokenizer)
-    _stream_batch_dispatcher = StreamBatchDispatcher(tokenizer)
+    # Forced acceptance emits draft tokens that nothing verified, and once the
+    # context is long enough those degenerate into the dialect's own channel
+    # framing and nothing else -- read as structure, correctly, that leaves a
+    # response with no content at all. The mode already announces that its text is
+    # meaningless, so stand in for it rather than parse it.
+    synthetic_token_text = (
+        SYNTHETIC_TOKEN_TEXT
+        if (
+            args.spec_decode_acceptance_length is not None
+            or args.spec_decode_acceptance_rate is not None
+        )
+        else None
+    )
+    if synthetic_token_text is not None:
+        logger.warning(
+            "Forced speculative acceptance is on, so every generated token is "
+            "delivered as %r instead of its decoded text. Token counts, timings "
+            "and throughput are unaffected; the text was already meaningless. "
+            "Unset --spec-decode-acceptance-length / --spec-decode-acceptance-rate "
+            "to read the model's own output again.",
+            SYNTHETIC_TOKEN_TEXT,
+        )
+    _stream_batch_dispatcher = StreamBatchDispatcher(
+        tokenizer, synthetic_text=synthetic_token_text
+    )
 
     # Wire the batched stream-flush hook: per-seq stream callbacks only buffer
     # their chunks into a thread-local; the engine core manager's output thread

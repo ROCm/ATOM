@@ -587,6 +587,15 @@ class AttentionMetaData:
     # prefill/MTP-verify and per seq in decode. Separate from kv_last_page_lens
     # (the dense per-seq buffer) so the two never clobber each other.
     sparse_kv_last_page_lens: torch.Tensor | None = None
+    # Per-rank KV length of each query token's causal window, for the sparse
+    # DSA + DCP indexer: MTP verify gives each draft position its own window.
+    # The padded running-width buffer is shared by eager, graph and TBO paths.
+    dcp_local_context_lens: torch.Tensor | None = None
+    # Block-table row per query token, for the same indexer -- both aiter ops
+    # address the table by row. Aliases block_tables at one query per sequence.
+    # Every producer that rewrites block_tables must rewrite this too: a stale
+    # one has the right length and the wrong rows.
+    dcp_token_block_tables: torch.Tensor | None = None
 
     work_meta_data: torch.Tensor | None = None
     work_indptr: torch.Tensor | None = None
@@ -598,6 +607,7 @@ class AttentionMetaData:
     # for prefix cache
     has_cached: bool = False
     total_kv: int | None = None
+    kpool_total_pools: int | None = None
     num_cached_tokens: torch.Tensor | None = None
     seq_starts: torch.Tensor | None = None
 
@@ -621,6 +631,8 @@ class AttentionMetaData:
         cu_seqlen_ks: torch.Tensor | None = None,
         cu_seqlen_ke: torch.Tensor | None = None,
         sparse_kv_indptr: torch.Tensor | None = None,
+        sparse_kv_last_page_lens: torch.Tensor | None = None,
+        dcp_local_context_lens: torch.Tensor | None = None,
         work_meta_data: torch.Tensor | None = None,
         work_indptr: torch.Tensor | None = None,
         work_info_set: torch.Tensor | None = None,
@@ -631,11 +643,13 @@ class AttentionMetaData:
         token_to_seq_idxs: torch.Tensor | None = None,
         has_cached: bool = False,
         total_kv: int | None = None,
+        kpool_total_pools: int | None = None,
         num_cached_tokens: torch.Tensor | None = None,
         seq_starts: torch.Tensor | None = None,
     ):
         self.has_cached = has_cached
         self.total_kv = total_kv
+        self.kpool_total_pools = kpool_total_pools
         self.num_cached_tokens = num_cached_tokens
         self.seq_starts = seq_starts
         self.cu_seqlens_q = cu_seqlens_q
@@ -656,6 +670,8 @@ class AttentionMetaData:
         self.cu_seqlen_ks = cu_seqlen_ks
         self.cu_seqlen_ke = cu_seqlen_ke
         self.sparse_kv_indptr = sparse_kv_indptr
+        self.sparse_kv_last_page_lens = sparse_kv_last_page_lens
+        self.dcp_local_context_lens = dcp_local_context_lens
         self.work_meta_data = work_meta_data
         self.work_indptr = work_indptr
         self.work_info_set = work_info_set
@@ -676,6 +692,23 @@ class AttentionMetaData:
             for field in fields(self)
             if field.name not in skip_fields
         }
+
+
+def get_published_dcp_local_context_lens(
+    attn_metadata: AttentionMetaData, num_rows: int
+) -> torch.Tensor | None:
+    """Return the valid prefix of a published sparse-DCP local-length buffer.
+
+    Metadata is allocated at the engine's padded running width while PIECEWISE
+    eager execution may score only the scheduled rows. The real requests are
+    always the prefix and the producer zero-fills the padded tail.
+    """
+    local_ctx = attn_metadata.dcp_local_context_lens
+    if local_ctx is None or local_ctx.shape[0] < num_rows:
+        return None
+    if local_ctx.shape[0] == num_rows:
+        return local_ctx
+    return local_ctx[:num_rows]
 
 
 @dataclass

@@ -430,7 +430,11 @@ def test_dispatcher_keeps_no_per_stream_state():
         )
     dispatcher.flush()
 
-    assert vars(dispatcher).keys() == {"tokenizer", "_thread_local"}
+    assert vars(dispatcher).keys() == {
+        "tokenizer",
+        "synthetic_text",
+        "_thread_local",
+    }
 
 
 def test_each_stream_gets_its_own_detokenizer():

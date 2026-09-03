@@ -34,6 +34,13 @@ _WAITING_SINCE: dict[int, float] = {}
 # merging this way hands them what reading each chunk separately would have.
 _LATEST_WINS = ("finish_reason", "kv_transfer_params", "num_cached_tokens")
 
+# Stands in for the decoded text of one token when the run has declared its own
+# output meaningless -- forced speculative acceptance, today. It says what it is,
+# so a dump of such a run cannot be mistaken for something the model wrote, and
+# it carries no marker any dialect or tool-call format intercepts, so it reaches
+# the client whatever the model is.
+SYNTHETIC_TOKEN_TEXT = "synthetic "
+
 
 def merge_chunk(into: dict, new: dict) -> None:
     """Fold ``new`` into the chunk already waiting. ``into`` is modified.
@@ -195,13 +202,16 @@ class StreamBatchDispatcher:
     remember to remove.
     """
 
-    def __init__(self, tokenizer: Any):
+    def __init__(self, tokenizer: Any, synthetic_text: str | None = None):
         self.tokenizer = tokenizer
+        self.synthetic_text = synthetic_text
         self._thread_local = threading.local()
 
     def new_state(self, stop_strings: list[str] | None = None) -> StreamingTextState:
         """Make the detokenizer for one stream, for its callback to hold."""
-        return StreamingTextState(self.tokenizer, stop_strings)
+        return StreamingTextState(
+            self.tokenizer, stop_strings, synthetic_text=self.synthetic_text
+        )
 
     def enqueue(
         self,

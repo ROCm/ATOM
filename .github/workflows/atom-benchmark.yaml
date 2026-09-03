@@ -261,6 +261,12 @@ jobs:
             --default-backend ATOM \
             --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
+      - name: Prepare existing dashboard data
+        id: prepare_dashboard_data
+        uses: ./.github/actions/prepare-dashboard-data
+        with:
+          data-path: benchmark-dashboard/data.js
+
       - name: Store benchmark result to dashboard
         uses: benchmark-action/github-action-benchmark@v1
         with:
@@ -274,6 +280,12 @@ jobs:
           fail-on-alert: false
           max-items-in-chart: 300
           github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Validate dashboard data after write
+        uses: ./.github/actions/validate-dashboard-data
+        with:
+          data-path: benchmark-dashboard/data.js
+          min-entries: ${{ steps.prepare_dashboard_data.outputs.entry_count }}
 
       - name: Deploy custom dashboard to gh-pages
         run: |

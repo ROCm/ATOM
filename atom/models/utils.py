@@ -241,6 +241,20 @@ def maybe_prefix(prefix: str, name: str) -> str:
     return name if not prefix else f"{prefix}.{name}"
 
 
+def mask_pos0_inputs_embeds(
+    inputs_embeds: torch.Tensor, positions: torch.Tensor
+) -> torch.Tensor:
+    """Zero an MTP draft's token embedding on the rows at sequence position 0.
+
+    vLLM-plugin-only behaviour, carried over verbatim from the per-layer
+    ``forward`` wrapper it replaces (see the plugin's
+    ``ATOMModelBase._enable_mtp_input_masking_for_vllm``). MTP predictors apply
+    it only when the plugin turns the flag on, so ATOM's native runner is
+    unaffected.
+    """
+    return torch.where(positions.unsqueeze(-1) == 0, 0, inputs_embeds)
+
+
 def ckpt_has_tensor_suffix(model_path: str, suffix: str) -> bool:
     """Return True if the checkpoint at ``model_path`` contains a tensor whose
     key ends with ``suffix``.

@@ -98,14 +98,23 @@ class StreamingTextState:
     requiring text already sent to the client to be retracted.
     """
 
-    __slots__ = ("detokenizer", "emitted_chars", "stops")
+    __slots__ = ("detokenizer", "emitted_chars", "stops", "synthetic_text")
 
-    def __init__(self, tokenizer: Any, stops: list[str] | None = None):
+    def __init__(
+        self,
+        tokenizer: Any,
+        stops: list[str] | None = None,
+        *,
+        synthetic_text: str | None = None,
+    ):
         self.stops = tuple(stop for stop in (stops or ()) if stop)
         self.detokenizer = IncrementalDetokenizer(
             tokenizer, track_text=bool(self.stops)
         )
         self.emitted_chars = 0
+        # Emitted once per token in place of the decoded text, for runs whose
+        # text is a byproduct rather than an answer. See `SYNTHETIC_TOKEN_TEXT`.
+        self.synthetic_text = synthetic_text
 
     @property
     def tokens(self):
@@ -118,6 +127,12 @@ class StreamingTextState:
         truncate_to: int = -1,
     ) -> str:
         delta = self.detokenizer.update(token_ids, finished)
+        if self.synthetic_text is not None:
+            # Decoded and thrown away: the run is measuring throughput, and
+            # skipping the work would make the server look faster than the one
+            # being measured. The stop-string hold-back below is skipped with
+            # it -- it holds back text this run does not deliver.
+            return self.synthetic_text * len(token_ids)
         if not self.stops:
             return delta
 

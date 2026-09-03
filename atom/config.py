@@ -54,6 +54,15 @@ class KVCacheTensor:
     replay_buf_k: torch.Tensor = None
     replay_buf_u: torch.Tensor = None
     replay_buf_g: torch.Tensor = None
+    # True when the tensors above are a hybrid's PER-REQUEST state (GDN/KDA
+    # recurrent state) rather than paged KV. Only the GDN and KDA linear-attn
+    # forwards set it (`gdn_attn.py`, `kimi_mla_gdn_attn.py`, and the rtpllm/
+    # sglang plugin twins); no DeepSeek-V4 path does. They belong
+    # in ``kv_cache_data`` -- the linear-attention forward reads them from there
+    # -- but are addressed by request slot, so no block-addressed mover may
+    # touch them. The dense codec skips them; the state tier reaches the same
+    # bytes through ``state_entry_views``.
+    per_request_state: bool = False
 
 
 @dataclass
@@ -607,6 +616,29 @@ class QuantizationConfig:
             self.apply_exclude_name_mapping(quant_exclude_name_mapping)
 
 
+# Rows per block that `deepgemm_fp8_paged_mqa_logits` requires to stay in its
+# preshuffled layout, which is the only layout it computes correctly -- with
+# `Preshuffle=False` it disagrees with the flat `fp8_mqa_logits` kernel by ~100%
+# at every block size, and aiter's assert guards only the preshuffle side. Any
+# cache that kernel pages over must therefore hold a multiple of this many rows
+# per block. Sizing constants belong to whoever enforces them, and the block
+# size is set here.
+_MQA_LOGITS_PRESHUFFLE_ROWS = 16
+
+
+def glm5_kpool_block_size(index_kpool: int) -> int:
+    """Tokens per KV block that lets GLM-5.3's pooled index cache be exact.
+
+    A block of B tokens needs ``B // index_kpool`` index rows, and that count
+    must be a multiple of `_MQA_LOGITS_PRESHUFFLE_ROWS`. The smallest B that
+    satisfies it is the product, and the smallest is what we want: a larger
+    block only adds paging waste, while a smaller one forces the cache to be
+    padded back up to one row per token -- which is the whole cost being
+    removed here.
+    """
+    return index_kpool * _MQA_LOGITS_PRESHUFFLE_ROWS
+
+
 _CONFIG_REGISTRY: dict[str, str] = {
     "deepseek_v32": "deepseek_v3",
     "deepseek_v4": "deepseek_v3",  # V4 reuses V3 schema; V4-specific fields
@@ -630,7 +662,15 @@ _MULTIMODAL_MODEL_TYPES: dict[str, str] = {
     "qwen3_5": "text_config",
     "qwen3_5_moe": "text_config",
     "mistral3": "text_config",
+    "glm5_next": "text_config",  # GLM-5.3-Flash: text-only hybrid KDA/DSA runtime
 }
+
+# Text sub-config model_types that this image's transformers has no class for.
+# Loaded as a bare PretrainedConfig; the ATOM model normalizes the aliases it
+# needs at construction time.
+_PLAIN_TEXT_CONFIG_MODEL_TYPES: frozenset[str] = frozenset(
+    {"kimi_linear", "glm5_next_text"}
+)
 
 # multimodal models fully supported by plugin mode
 _PLUGIN_SUPPORTED_MULTIMODAL_MODELS: set[str] = {
@@ -675,10 +715,11 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
         ):
             text_config_dict["quantization_config"] = config_dict["quantization_config"]
         text_model_type = text_config_dict.get("model_type", "deepseek_v3")
-        if text_model_type == "kimi_linear":
-            # Transformers does not ship KimiLinearConfig yet in this image.
-            # Keep the remote-code fields as plain PretrainedConfig attrs; the
-            # ATOM model normalizes the aliases it needs at construction time.
+        if text_model_type in _PLAIN_TEXT_CONFIG_MODEL_TYPES:
+            # Transformers does not ship a config class for these in this image
+            # (KimiLinearConfig, Glm5NextTextConfig). Keep the fields as plain
+            # PretrainedConfig attrs; the ATOM model normalizes the aliases it
+            # needs at construction time.
             hf_config = PretrainedConfig.from_dict(text_config_dict)
         else:
             mapped_type = _CONFIG_REGISTRY.get(text_model_type, text_model_type)
@@ -701,7 +742,11 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
                 model, trust_remote_code=trust_remote_code
             )
             hf_config._multimodal_config = full_config
-        except Exception:
+        except Exception:  # noqa: BLE001 - transformers raises anything here
+            # Consumers use None to report that their full multimodal config
+            # could not be loaded. A partial generic object can bypass those
+            # checks and run with default token IDs. GLM-5.3 is text-only here,
+            # so it has no reason to weaken that contract.
             hf_config._multimodal_config = None
         return hf_config
 
@@ -1761,6 +1806,14 @@ class Config:
                     f"the persistent cprr MLA kernel); got {gfx}. Disable DCP or "
                     f"speculative decode on this GPU."
                 )
+                # TBO slices its ubatch work buffers by request, while the
+                # sparse DCP indexer indexes them by query token. The two agree
+                # only at one query per sequence.
+                assert not self.enable_tbo_decode, (
+                    "Decode TBO (--enable-tbo all) combined with speculative "
+                    "decode and DCP is unverified. Use --enable-tbo (prefill "
+                    "only), or drop DCP or speculative decode."
+                )
         # DCP KV-cache interleave granularity S. S=1 (default) = token-level
         # round-robin (unchanged). S>1 = block-level interleave; must divide the
         # KV block so each physical block holds an integer number of S-groups
@@ -1985,6 +2038,65 @@ class Config:
             v4_block_size = 256
             if self.kv_cache_block_size != v4_block_size:
                 self.kv_cache_block_size = v4_block_size
+
+        # GLM-5.3-Flash's indexer caches one pooled key per `index_kpool`
+        # tokens, so a KV block of B tokens needs only B // index_kpool index
+        # rows. Those rows are what `deepgemm_fp8_paged_mqa_logits` pages over,
+        # and it is correct only in its preshuffled layout, which requires the
+        # row count per block to be a multiple of 16. B = 16 would give 4 rows
+        # and force the index cache to be padded to one row per TOKEN, wasting
+        # `index_kpool - 1` of every `index_kpool` rows. B = 64 gives exactly
+        # 16. Same reasoning and same mechanism as the V4 override above: the
+        # BlockManager and slot_mapping assume one global block size, so it is
+        # set here and the attention builder sizes the index cache from it.
+        is_glm5_next = any("Glm5Next" in str(a) for a in arches)
+        if is_glm5_next:
+            unsupported_features = []
+            if self.prefill_context_parallel_size > 1:
+                unsupported_features.append("PCP")
+            if self.decode_context_parallel_size > 1:
+                unsupported_features.append("DCP")
+            if self.speculative_config is not None:
+                unsupported_features.append("speculative decoding")
+            if self.enable_tbo or self.enable_tbo_decode:
+                unsupported_features.append("TBO")
+            if unsupported_features:
+                raise ValueError(
+                    "GLM-5.3-Flash text serving does not yet support "
+                    f"{', '.join(unsupported_features)}"
+                )
+            index_kpool = int(getattr(self.hf_config, "index_kpool", 1) or 1)
+            if index_kpool > 1:
+                glm5_block_size = glm5_kpool_block_size(index_kpool)
+                if self.kv_cache_block_size != glm5_block_size:
+                    self.kv_cache_block_size = glm5_block_size
+
+                # Turning sparsity off is an exact A/B only at or below
+                # `index_topk`; past it the dense/token-granular fallback is a
+                # DIFFERENT answer, not a slower one. Validate that at startup
+                # rather than per forward: `max_model_len` already bounds
+                # `max_seqlen_k`, so one check here replaces a branch on a
+                # 45-layer hot path, and it fails the launch cleanly instead of
+                # raising inside the model and taking the engine down with it
+                # mid-batch -- which is what both `envs.py` and
+                # `docs/environment_variables.md` describe as refusing the
+                # request.
+                index_topk = int(getattr(self.hf_config, "index_topk", 0) or 0)
+                sparsity_off = []
+                if not envs.ATOM_GLM5_KPOOL:
+                    sparsity_off.append("ATOM_GLM5_KPOOL=0")
+                if envs.ATOM_GLM5_FORCE_DENSE_MLA:
+                    sparsity_off.append("ATOM_GLM5_FORCE_DENSE_MLA=1")
+                if sparsity_off and index_topk and self.max_model_len > index_topk:
+                    raise ValueError(
+                        f"GLM-5.3-Flash: {', '.join(sparsity_off)} turns the "
+                        "pooled sparse selection off, which matches the pooled "
+                        f"path only while sequences stay at or below "
+                        f"index_topk={index_topk}. max_model_len is "
+                        f"{self.max_model_len}. Lower --max-model-len to "
+                        f"{index_topk} for the comparison, or drop the "
+                        "override."
+                    )
 
         # Keep ``None`` intact until the model architecture is known so an
         # omitted index-cache option remains distinguishable from an explicit

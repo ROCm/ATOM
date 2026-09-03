@@ -86,6 +86,61 @@ def test_staged_tail_repeats_a_real_row_rather_than_zero_filling():
     assert g._buffers["row"].data_ptr() == ptr
 
 
+def test_a_producer_can_fill_fixed_storage_without_a_self_copy():
+    """Direct producers must not launch a redundant copy back onto themselves."""
+    g = _graph()
+    produced = g.buffer("row", 3)
+    produced.copy_(torch.tensor([7, 8, 9], dtype=torch.int32))
+    version_after_produce = g._buffers["row"]._version
+
+    staged = g.stage(3, {"row": produced})["row"]
+
+    assert staged.data_ptr() == produced.data_ptr()
+    assert staged.tolist() == [7, 8, 9]
+    assert g._buffers["row"]._version == version_after_produce
+
+
+def test_direct_fixed_storage_still_gets_a_repeated_pad_tail():
+    """Only real rows are producer-owned; stage still fabricates coherent pads."""
+    g = _graph()
+    produced = g.buffer("row", 2)
+    produced.copy_(torch.tensor([7, 8], dtype=torch.int32))
+
+    staged = g.stage(5, {"row": produced})["row"]
+
+    assert staged.tolist() == [7, 8, 8, 8, 8]
+
+
+def test_fixed_input_and_exported_snapshot_have_separate_lifetimes():
+    """The next replay reuses fixed ids while an owned snapshot may leave the GPU."""
+    g = _graph()
+    fixed_ids = g.buffer("row", 2)
+    fixed_ids.copy_(torch.tensor([7, 8], dtype=torch.int32))
+    exported_ids = fixed_ids.clone()
+
+    staged = g.stage(2, {"row": fixed_ids})["row"]
+    staged.copy_(torch.tensor([9, 10], dtype=torch.int32))
+
+    assert staged.data_ptr() == fixed_ids.data_ptr()
+    assert exported_ids.tolist() == [7, 8]
+    assert staged.tolist() == [9, 10]
+
+
+def test_fixed_storage_accessor_checks_role_and_capacity():
+    g = _graph()
+    with pytest.raises(AssertionError, match="no staged input"):
+        g.buffer("missing", 1)
+    with pytest.raises(AssertionError, match="capacity"):
+        g.buffer("row", 257)
+
+
+def test_staging_rejects_a_wrong_trailing_shape_before_identity_check():
+    g = _graph(inputs={"row": StagedInput(shape=(4,), dtype=torch.int32)})
+    wrong = g._buffers["row"][:2, :1]
+    with pytest.raises(AssertionError, match="fixed storage expects"):
+        g._stage_one("row", 2, wrong)
+
+
 def test_staging_a_wrong_dtype_fails_loudly():
     g = _graph()
     with pytest.raises(AssertionError, match="baked"):
@@ -163,6 +218,30 @@ def test_warmup_inputs_sees_the_pass_own_buffers(monkeypatch):
     g = _graph(warmup_inputs=lambda running_bs, **rows: rows["row"].fill_(7))
     g.warmup(4)
     assert g._buffers["row"][:4].tolist() == [7, 7, 7, 7]
+
+
+def test_a_captured_epilogue_can_feed_output_back_to_fixed_input(monkeypatch):
+    """Serial passes may make the next replay consume the previous output."""
+    monkeypatch.setenv("ATOM_DRAFT_CUDAGRAPH", "0")  # exercise eager equivalent
+
+    def epilogue(out, running_bs, *, row):
+        row.copy_(out[:running_bs])
+        return row
+
+    g = _graph(
+        forward=lambda running_bs, *, row: row + 1,
+        epilogue=epilogue,
+        capture_epilogue=True,
+    )
+    produced = g.buffer("row", 2)
+    produced.copy_(torch.tensor([10, 20], dtype=torch.int32))
+
+    first = g.run(2, **g.stage(2, {"row": produced}))
+    second = g.run(2, **g.stage(2, {"row": first}))
+
+    assert first.data_ptr() == produced.data_ptr()
+    assert second.data_ptr() == produced.data_ptr()
+    assert second.tolist() == [12, 22]
 
 
 def test_run_replays_the_recording_instead_of_the_forward():

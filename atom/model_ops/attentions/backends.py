@@ -237,6 +237,19 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         """
         return None
 
+    def state_entry_views(self, slot: int) -> list["torch.Tensor"]:
+        """Contiguous views covering the whole of `slot`'s per-request state.
+
+        The byte-level counterpart of `relocate_state_slots`, so the offload
+        tier can read or write the same bytes. Every view must be contiguous --
+        the Triton packer refuses a strided one -- so a class whose slot is
+        strided (GDN, slot on axis 1) returns one view per layer.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} owns per-request state but does not "
+            "implement state_entry_views"
+        )
+
     def relocate_state_slots(self, pairs: Sequence[tuple[int, int]]) -> None:
         """Move live state between contiguous Active Slots."""
         raise NotImplementedError(
