@@ -553,16 +553,15 @@ class EngineCore:
         # surface.
         #
         # `dispatch_new=False` on the shutdown drain: publishing new state
-        # loads/stores there hands the connector work whose bytes nothing will
-        # read back, and -- worse -- each fresh store keeps `has_pending_kv_work`
+        # stores there hands the connector work whose bytes nothing will read
+        # back, and -- worse -- each fresh store keeps `has_pending_kv_work`
         # True, so the drain loop that waits on it manufactures its own exit
         # condition and never converges. Still build/process the meta so
         # already-dispatched transfers finish and report.
         if dispatch_new:
-            for name in ("_publish_state_loads", "_publish_state_stores"):
-                publish = getattr(self.scheduler, name, None)
-                if publish is not None:
-                    publish()
+            publish = getattr(self.scheduler, "_publish_state_stores", None)
+            if publish is not None:
+                publish()
         meta = connector.build_connector_meta()
         if not connector_metadata_has_work(meta):
             return

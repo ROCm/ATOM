@@ -278,13 +278,13 @@ class StateOffloadFace(ABC):
     explicit type: only `KimiK3OffloadScheduler` inherits it, so
     `isinstance(impl, StateOffloadFace)` is the honest predicate.
 
-    Narrow on purpose -- only the four tier methods. Other impl attributes the
+    Narrow on purpose -- only the three tier methods. Other impl attributes the
     scheduler reads (e.g. `max_pending_saves`) stay plain shell forwards rather
     than joining this face, which is exclusively the KDA state-tier contract.
+    The load leg is deliberately absent: it rides the KV load's own request
+    metadata, so there is nothing for a router to dispatch separately.
     """
 
-    @abstractmethod
-    def enqueue_state_loads(self, loads) -> bool: ...
     @abstractmethod
     def enqueue_state_stores(self, stores) -> bool: ...
     @abstractmethod

@@ -290,7 +290,7 @@ class PPEngineCoreProc(EngineCore):
             or kvoutput.failed_loading
             or kvoutput.finished_saving
             # connector_completions are offload channel events (kimi_k3 state
-            # dispositions, dsv4 checkpoint boundaries). They too span all PP
+            # index reports, dsv4 checkpoint boundaries). They too span all PP
             # stages, so they must reach the aggregator rather than the
             # scheduler directly -- and count as "offload work" so this poll
             # does not early-return and strand them.

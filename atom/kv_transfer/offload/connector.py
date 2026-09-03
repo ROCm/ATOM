@@ -156,8 +156,8 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         """True when the selected impl actually hosts the KDA state tier.
 
         This shell defines the whole state face (`enqueue_state_stores`,
-        `enqueue_state_loads`, `take_state_reports`,
-        `take_state_source_releases`) unconditionally, delegating through
+        `take_state_reports`, `take_state_source_releases`) unconditionally,
+        delegating through
         `getattr` to `_impl` and returning the no-tier default when the impl
         does not implement a method. So method *presence on the shell* cannot
         tell a tier-hosting `kimi_k3` impl from a `dense`/`hybrid` impl that has
@@ -227,10 +227,6 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
     def process_completions(self, output):
         return self._impl.process_completions(output)
 
-    def enqueue_state_loads(self, loads) -> bool:
-        callback = getattr(self._impl, "enqueue_state_loads", None)
-        return bool(callback(loads)) if callback is not None else False
-
     def enqueue_state_stores(self, stores) -> bool:
         callback = getattr(self._impl, "enqueue_state_stores", None)
         return bool(callback(stores)) if callback is not None else False
@@ -246,16 +242,16 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         callback = getattr(self._impl, "take_state_reports", None)
         return callback() if callback is not None else (set(), set())
 
-    def take_state_load_survived(self) -> set:
-        """Requests whose state bytes outlived a failed joint load.
+    def take_missed_state_hashes(self) -> set:
+        """Hashes whose state `get` missed, and which the index must forget.
 
         `Scheduler._update_from_kv_xfer_finished` reads this off the SHELL, so
-        without the forwarder the `getattr(..., None)` default won and every
-        survivor settled as a failure -- forgetting a hash whose bytes are
-        present, which is the opposite of what the channel exists to do. An
-        impl that does not advertise the channel survives nothing.
+        without the forwarder the `getattr(..., None)` default wins and a hash
+        LMCache has dropped stays advertised -- parking every later request over
+        that prefix against a `get` that must miss. An impl with no state tier
+        misses nothing.
         """
-        callback = getattr(self._impl, "take_state_load_survived", None)
+        callback = getattr(self._impl, "take_missed_state_hashes", None)
         return callback() if callback is not None else set()
 
     def take_state_source_releases(self) -> set:

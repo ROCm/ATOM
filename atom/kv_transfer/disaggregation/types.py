@@ -401,7 +401,6 @@ def completion_req_key(completion: ConnectorCompletionId) -> str:
 #: deliberately not the place to register a new field.
 _DUCK_TYPED_WORK_FIELDS = (
     "requests",
-    "state_loads",
     "state_stores",
     "lookup_requests_in_step",
     "reqs_to_recv",
