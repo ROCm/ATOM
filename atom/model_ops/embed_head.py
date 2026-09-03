@@ -272,11 +272,18 @@ class ParallelLMHead(VocabParallelEmbedding):
 
         For greedy speculative drafting only the argmax is needed, so each rank
         reduces its own vocab shard to ``(max_val, global_idx)`` and we all-gather
-        just those ``[N, 2]`` (tp small) instead of the O(vocab) logits. Token
-        selection is identical to a full-logits ``argmax``: the values compared
-        are the same bf16 logits (fp32-packed exactly), and tie-breaking matches
-        the lowest global index — ``torch.max`` picks the lowest local index, and
-        ``argmax`` over ranks picks the lowest rank (== lowest vocab range).
+        just those ``[N, 2]`` (tp small) instead of the O(vocab) logits.
+
+        On the TP path the GEMM is unchanged, so this is bitwise-identical to a
+        full-logits ``argmax`` -- the values compared are the same bf16 logits
+        (fp32-packed exactly), and tie-breaking matches the lowest global index
+        (``torch.max`` picks the lowest local index, ``argmax`` over ranks the
+        lowest rank == lowest vocab range). The DP path (``ATOM_DP_DRAFT_ARGMAX``,
+        via ``_dp_sharded_logits(mode="argmax")``) reshapes the GEMM ([M, V] ->
+        [dp*M, V/dp]), which ``tgemm`` may tile differently, so its logits are not
+        bitwise-identical to the replicated ones and a near-tie can flip. The pick
+        itself is still exact over whatever logits it is given; only the GEMM's
+        rounding differs.
         """
         if out is not None:
             assert out.shape == x.shape[:-1], (
@@ -287,10 +294,13 @@ class ParallelLMHead(VocabParallelEmbedding):
                 out.dtype == torch.long and out.device == x.device
             ), "argmax out must be an int64 tensor on the input device"
         # Pure-DP draft: shard the vocab across the DP group instead of a
-        # replicated full-vocab GEMM. Env first so a disabled build skips the
-        # context lookup.
-        if envs.ATOM_DP_DRAFT_ARGMAX and self._can_use_dp_sharded_argmax(
-            get_forward_context().context
+        # replicated full-vocab GEMM. Skip plugin mode -- its caller decides the
+        # collective count per chunk (a mismatch would deadlock DP) -- and skip
+        # the context lookup entirely when the env is off.
+        if (
+            envs.ATOM_DP_DRAFT_ARGMAX
+            and not is_plugin_mode()
+            and self._can_use_dp_sharded_argmax(get_forward_context().context)
         ):
             return self._dp_sharded_logits(x, "argmax", out)
         logits = tgemm.mm(x, self.weight, self.bias)  # [N, vocab/tp]
@@ -444,19 +454,30 @@ class ParallelLMHead(VocabParallelEmbedding):
     def _can_use_dp_sharded_argmax(self, context) -> bool:
         """Whether a draft step may run the DP-sharded argmax.
 
-        Every DP rank must reach the same verdict, so every gated value is
-        DP-agreed. `running_tokens_are_unified` marks a rectangular draft (a
-        ragged one falls back); `running_tokens` is bounded because the hidden
-        gather outgrows the weight-read saving past ATOM_DP_DRAFT_ARGMAX_MAX_ROWS.
+        Total predicate -- returns False, never raises, outside a DP-reduced
+        rectangular pure-DP draft. Every DP rank must reach the same verdict, so
+        every gated value is DP-agreed: `running_tokens_are_unified` marks a
+        rectangular draft, `running_tokens` is bounded past
+        ATOM_DP_DRAFT_ARGMAX_MAX_ROWS (the gather outgrows the weight-read win),
+        and `dp_metadata is not None` is the proof `running_tokens` was actually
+        reduced across DP -- absent under SGLang dp-attention (where aiter's DP
+        group is >1 but ATOM's data_parallel_size is 1) and single-GPU. That
+        check also gates the raising `get_dp_group()`: dp_metadata is built via
+        the DP group, so its presence means the group exists.
         """
-        if not envs.ATOM_DP_DRAFT_ARGMAX or self.tp_size != 1:
+        if not envs.ATOM_DP_DRAFT_ARGMAX or is_plugin_mode() or self.tp_size != 1:
+            return False
+        fc = get_forward_context()
+        if (
+            context is None
+            or fc.dp_metadata is None
+            or not getattr(context, "is_draft", False)
+            or getattr(context, "is_prefill", False)
+            or not getattr(context, "running_tokens_are_unified", False)
+            or int(context.running_tokens) > envs.ATOM_DP_DRAFT_ARGMAX_MAX_ROWS
+        ):
             return False
         dp_group = get_dp_group()
-        if dp_group.world_size <= 1 or self.num_embeddings % dp_group.world_size != 0:
-            return False
         return (
-            context is not None
-            and getattr(context, "is_draft", False)
-            and getattr(context, "running_tokens_are_unified", False)
-            and int(context.running_tokens) <= envs.ATOM_DP_DRAFT_ARGMAX_MAX_ROWS
+            dp_group.world_size > 1 and self.num_embeddings % dp_group.world_size == 0
         )

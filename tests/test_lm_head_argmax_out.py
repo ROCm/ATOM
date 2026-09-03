@@ -14,9 +14,6 @@ def _tp1_head(logits: torch.Tensor, monkeypatch) -> embed_head.ParallelLMHead:
     head.tp_size = 1
     head.weight = torch.nn.Parameter(torch.empty(1), requires_grad=False)
     head.bias = None
-    # Exercise the replicated argmax path; the DP-sharded draft path needs an
-    # initialized DP group, which this unit test does not stand up.
-    monkeypatch.setattr(embed_head.envs, "ATOM_DP_DRAFT_ARGMAX", False)
     monkeypatch.setattr(embed_head.tgemm, "mm", lambda *_args, **_kwargs: logits)
     return head
 
