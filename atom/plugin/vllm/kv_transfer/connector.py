@@ -60,7 +60,10 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1):
     """Drives ``atom.kv_transfer.offload`` from vLLM's connector API."""
 
     def __init__(self, vllm_config, role: KVConnectorRole, kv_cache_config=None):
-        super().__init__(vllm_config, role)
+        # kv_cache_config is required of out-of-tree v1 connectors: the factory
+        # rejects the 2-argument signature outright, and the base class stores
+        # it for the group-aware paths.
+        super().__init__(vllm_config, role, kv_cache_config)
         self._config = build_offload_config(vllm_config)
         self._worker = None
         self._scheduler = None
